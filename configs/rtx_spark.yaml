@@ -4,7 +4,7 @@
 
 hardware:
   name: RTX Spark
-  arch: sm_100
+  arch: sm_121
   unified_memory_gb: 128
   # LPDDR5X bandwidth is lower than GDDR7 — this is the key constraint
   bandwidth_gbps: ~273   # LPDDR5X-8533 x 256-bit estimated

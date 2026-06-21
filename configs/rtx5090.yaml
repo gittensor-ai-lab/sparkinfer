@@ -3,7 +3,7 @@
 
 hardware:
   name: RTX 5090
-  arch: sm_100
+  arch: sm_120
   vram_gb: 32
   bandwidth_tbps: 1.79
   cuda_cores: 21760
