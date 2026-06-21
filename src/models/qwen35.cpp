@@ -196,9 +196,13 @@ int Qwen35Model::forward_token(int token_id, int position) {
     }
 
     kernels::launch_rmsnorm(s.x, s.w.final_norm, s.xn, 1, H, c.rms_eps, st);
+#ifdef SPARKINFER_SKIP_LMHEAD
+    cudaMemsetAsync(s.d_out_id, 0, sizeof(int), st);  // ablation
+#else
     if (s.gguf) kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
     else        kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
+#endif
 
     cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
     cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
