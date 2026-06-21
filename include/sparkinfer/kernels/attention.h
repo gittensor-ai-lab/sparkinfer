@@ -64,6 +64,19 @@ void launch_flash_decode_local_hd256(
     float scale, cudaStream_t stream = nullptr
 );
 
+// Flash-decoding (KV-split) for decode: one block per (seq, q_head, split) for
+// high SM occupancy and long-context scaling, then a combine pass. Fixed grid
+// (seq_len read in-kernel) so it is CUDA-graph capturable. head_dim=128.
+//   part_m/part_l: [num_seqs*num_q_heads*n_splits] (fp32 scratch)
+//   part_acc:      [num_seqs*num_q_heads*n_splits*head_dim] (fp32 scratch)
+void launch_flash_decode_split(
+    const void* q, const void* k_pool, const void* v_pool,
+    const int* block_table, const int* seq_lens, void* out,
+    float* part_m, float* part_l, float* part_acc,
+    int num_seqs, int num_q_heads, int num_kv_heads, int head_dim,
+    int block_size, int max_blocks, int n_splits, float scale,
+    cudaStream_t stream = nullptr);
+
 // Flash decode for GLOBAL layers: full context, head_dim=512, GQA 8:1.
 // Two-phase dot product splits 512-dim head into two 256-dim halves.
 // NOTE: No public FlashInfer/vLLM kernel handles head_dim=512 — this is novel.
