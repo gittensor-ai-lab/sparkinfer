@@ -9,14 +9,17 @@ framework — just `index.html` + `data.js`.
 Open `dashboard/index.html` in a browser (it loads `dashboard/data.js`).
 
 ## Update the data
-Everything is driven by `window.SPARKINFER` in **`data.js`**:
-- `status` — current frontier tok/s, reference (llama.cpp), accuracy, VRAM.
-- `passes` — the optimization journey (bars).
-- `weights` / `labels` — emission weights and the eval verdict legend.
-- `prs` — appended per evaluated PR: `{num, title, areas:[], label, tps, delta_pct, url}`.
+Canonical data is **`data.json`**; **`data.js`** is generated from it
+(`window.SPARKINFER = <data.json>`) so the page can load it on `file://` and Pages. Edit
+`data.json`, then regenerate `data.js`:
+```bash
+python3 -c "import json;d=json.load(open('dashboard/data.json'));open('dashboard/data.js','w').write('window.SPARKINFER = '+json.dumps(d,indent=2)+';\n')"
+```
 
-The eval bot (`eval/pr_eval_bot.py`) can write `prs[]` and bump `status.frontier_tps` after each
-run, so the page stays live with zero rebuild.
+**The eval bot does this automatically.** After each evaluated PR, `eval/pr_eval_bot.py` upserts the
+verdict into `prs[]` (`{num,title,areas,label,tps,delta_pct,url}`), **ratchets**
+`status.frontier_tps`, regenerates `data.js`, and pushes — so the live page updates with every PR,
+no manual step.
 
 ## Deploy (GitHub Pages)
 It's plain static files. Enable Pages (Settings → Pages → deploy from `main`, root) and it serves at
