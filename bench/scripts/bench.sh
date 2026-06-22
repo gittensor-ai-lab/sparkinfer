@@ -23,12 +23,17 @@ esac; shift; done
 [ -z "$GGUF" ] && GGUF="$MODELS_DIR/$MODEL_FILE"
 
 ARCH="$(detect_arch)"; echo ">> GPU arch: sm_$ARCH"
-ensure_sparkinfer "$ARCH"
+resolve_runner "$ARCH"     # prebuilt binaries if available, else build from source
 [ "$GGUF" = "$MODELS_DIR/$MODEL_FILE" ] && ensure_model
 [ -f "$GGUF" ] || { echo "!! GGUF not found: $GGUF  (pass a path or use --download)"; exit 1; }
 
 echo; echo "=== sparkinfer — decode (n=$TOKENS, bs=1) ==="
-"$ROOT/build/runtime/qwen3_gguf_bench" "$GGUF" "$TOKENS"
+out="$(si_run qwen3_gguf_bench "$GGUF" "$TOKENS" 2>&1)" || true
+echo "$out"
+if ! echo "$out" | grep -q "decode tg"; then   # prebuilt incompatible (arch/driver/glibc) -> rebuild
+  fallback_build "$ARCH"
+  si_run qwen3_gguf_bench "$GGUF" "$TOKENS"
+fi
 
 if [ "$COMPARE" = 1 ]; then
   ensure_llamacpp "$ARCH"

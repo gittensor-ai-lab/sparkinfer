@@ -48,3 +48,38 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server (one-time, 
         -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF >/dev/null 2>&1
   cmake --build "$LLAMACPP_DIR/build" -j"$(nproc)" --target llama-bench llama-server >/dev/null 2>&1
 }
+
+# ---- prebuilt binaries (GitHub release) with source-build fallback ----
+PREBUILT_TAG="${PREBUILT_TAG:-v0.1.0}"
+PREBUILT_TGZ="${PREBUILT_TGZ:-sparkinfer-v0.1.0-linux-x86_64-cuda13-sm120.tar.gz}"
+PREBUILT_URL="${PREBUILT_URL:-https://github.com/gittensor-ai-lab/sparkinfer/releases/download/$PREBUILT_TAG/$PREBUILT_TGZ}"
+PREBUILT_DIR="$ROOT/.prebuilt/sparkinfer-bin"
+SI_BIN=""; SI_LD=""   # set by resolve_runner: binary dir + LD_LIBRARY_PATH
+
+try_prebuilt() {   # download+extract the release bundle; sets SI_BIN/SI_LD; returns 1 if unavailable
+  [ "${NO_PREBUILT:-0}" = 1 ] && return 1
+  if [ ! -x "$PREBUILT_DIR/bin/qwen3_gguf_bench" ]; then
+    command -v curl >/dev/null || return 1
+    echo ">> fetching prebuilt $PREBUILT_TGZ ..." >&2
+    mkdir -p "$ROOT/.prebuilt"
+    curl -fsSL "$PREBUILT_URL" -o "$ROOT/.prebuilt/$PREBUILT_TGZ" 2>/dev/null || { echo ">> prebuilt download failed" >&2; return 1; }
+    tar xzf "$ROOT/.prebuilt/$PREBUILT_TGZ" -C "$ROOT/.prebuilt" 2>/dev/null || return 1
+  fi
+  SI_BIN="$PREBUILT_DIR/bin"; SI_LD="$PREBUILT_DIR/lib"; return 0
+}
+
+resolve_runner() {   # $1=arch. Prefer an existing local build, else prebuilt, else build from source.
+  if [ -x "$ROOT/build/runtime/qwen3_gguf_bench" ]; then SI_BIN="$ROOT/build/runtime"; SI_LD=""; echo ">> using local build" >&2; return; fi
+  if try_prebuilt; then echo ">> using prebuilt binaries (will fall back to source build if incompatible)" >&2; return; fi
+  ensure_sparkinfer "$1"; SI_BIN="$ROOT/build/runtime"; SI_LD=""
+}
+
+fallback_build() {   # $1=arch. Switch the runner to a fresh source build (prebuilt didn't work here).
+  echo ">> prebuilt unusable on this box — building from source ..." >&2
+  ensure_sparkinfer "$1"; SI_BIN="$ROOT/build/runtime"; SI_LD=""
+}
+
+si_run() {   # si_run <tool> <args...>  — run a sparkinfer binary with the resolved lib path
+  if [ -n "$SI_LD" ]; then LD_LIBRARY_PATH="$SI_LD:${LD_LIBRARY_PATH:-}" "$SI_BIN/$1" "${@:2}"
+  else "$SI_BIN/$1" "${@:2}"; fi
+}

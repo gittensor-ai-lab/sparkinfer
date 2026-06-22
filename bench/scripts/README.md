@@ -25,6 +25,21 @@ Use your own model instead of `--download`:
 bench/scripts/bench.sh /path/to/model.gguf --tokens 256 --compare
 ```
 
+## Prebuilt binaries (no toolkit needed)
+
+To avoid compiling, the scripts first try the **prebuilt binaries** from the
+[v0.1.0 release](https://github.com/gittensor-ai-lab/sparkinfer/releases/tag/v0.1.0)
+(sm_120 / CUDA 13 / glibc 2.39 — RTX 5090 & PRO 6000). If the prebuilt is
+incompatible with your box (different arch like sm_121, older driver/CUDA, older
+glibc), they **automatically fall back to a source build** — so it just works either
+way. Order of preference: existing local `build/` → prebuilt → source build.
+
+Force a source build with `NO_PREBUILT=1`. Manual use of the bundle:
+```bash
+tar xzf sparkinfer-v0.1.0-linux-x86_64-cuda13-sm120.tar.gz
+./sparkinfer-bin/run qwen3_gguf_bench model.gguf 128
+```
+
 ## What you get
 
 `bench.sh` → sparkinfer decode tok/s + VRAM (and, with `--compare`, the llama.cpp
@@ -56,6 +71,7 @@ build/runtime/qwen3_gguf_score model.gguf 20 <token-ids...>   # compare argmax +
 | `MODELS_DIR` | `./models` | where the GGUF + tokenizer live |
 | `MODEL_REPO` / `MODEL_FILE` | Qwen3-30B-A3B GGUF | model to fetch |
 | `LLAMACPP_DIR` | `./.llamacpp` | reuse an existing llama.cpp checkout/build |
+| `NO_PREBUILT` | `0` | set `1` to skip prebuilt binaries and build from source |
 
 Files: `bench.sh`, `accuracy.sh`, `accuracy_compare.py`, `eval_text.txt`, `_common.sh`.
 Results from reference runs live in [`../results/`](../results).

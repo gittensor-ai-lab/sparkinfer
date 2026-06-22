@@ -19,7 +19,7 @@ esac; shift; done
 [ -z "$GGUF" ] && GGUF="$MODELS_DIR/$MODEL_FILE"
 
 ARCH="$(detect_arch)"
-ensure_sparkinfer "$ARCH"
+resolve_runner "$ARCH"     # prebuilt binaries if available, else build from source
 [ "$GGUF" = "$MODELS_DIR/$MODEL_FILE" ] && ensure_model
 ensure_tokenizer
 ensure_llamacpp "$ARCH"
@@ -29,7 +29,11 @@ IDS="$(python3 -c "from tokenizers import Tokenizer; print(' '.join(map(str, Tok
 echo ">> eval tokens: $(echo "$IDS" | wc -w)"
 
 echo ">> sparkinfer teacher-forced score ..."
-"$ROOT/build/runtime/qwen3_gguf_score" "$GGUF" 20 $IDS > /tmp/spark_score.txt 2>/dev/null
+si_run qwen3_gguf_score "$GGUF" 20 $IDS > /tmp/spark_score.txt 2>/dev/null || true
+if ! grep -q "^PPL" /tmp/spark_score.txt; then   # prebuilt incompatible -> rebuild
+  fallback_build "$ARCH"
+  si_run qwen3_gguf_score "$GGUF" 20 $IDS > /tmp/spark_score.txt 2>/dev/null
+fi
 
 echo ">> starting llama.cpp server (reference) ..."
 "$LLAMACPP_DIR/build/bin/llama-server" -m "$GGUF" -ngl 99 -c 2048 --port 8081 >/tmp/llama_srv.log 2>&1 &

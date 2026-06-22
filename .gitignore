@@ -5,3 +5,7 @@ build/
 __pycache__/
 .DS_Store
 *.swp
+.prebuilt/
+.llamacpp/
+models/
+dist/
