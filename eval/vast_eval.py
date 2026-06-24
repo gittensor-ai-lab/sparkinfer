@@ -58,6 +58,16 @@ def save_instance(iid):
         with open(INSTANCE_FILE, "w") as f: f.write(str(iid))
     except Exception: pass
 
+def funds():
+    """Usable vast funds in USD = balance + CREDIT. Credit is spent first and is the field that
+    actually matters — a $0 'balance' with positive credit can still rent. None if unreadable."""
+    try:
+        out = subprocess.run(["vastai", "show", "user", "--raw"], capture_output=True, text=True, timeout=30).stdout
+        u = json.loads(out)
+        return float(u.get("balance") or 0) + float(u.get("credit") or 0)
+    except Exception:
+        return None
+
 def bring_up(v, iid, deadline_s):
     """Start the instance if needed and wait until SSH-reachable, within deadline_s.
     Returns (host, port), or None if it never comes up (treat the box as dead/stuck)."""
@@ -91,8 +101,15 @@ def provision(v, args):
         print(">> no matching offers"); return None
     off = offers[0]
     print(f">> creating instance on offer {off['id']} {off.get('gpu_name')} ${off.get('dph_total'):.3f}/hr")
-    inst = v.create_instance(id=off["id"], image=args.image, disk=120, ssh=True, direct=True)
-    return inst.get("new_contract") or inst.get("id")
+    # The SDK's create_instance has no ssh/direct kwargs (those are CLI flags). Use the CLI so we
+    # get the DIRECT SSH endpoint the rest of this script expects; --raw returns {success, new_contract}.
+    out = subprocess.run(["vastai", "create", "instance", str(off["id"]), "--image", args.image,
+                          "--disk", "120", "--ssh", "--direct", "--raw"],
+                         capture_output=True, text=True, timeout=120).stdout
+    try: res = json.loads(out)
+    except Exception: print(">> create failed:", out[:300]); return None
+    if not res.get("success"): print(">> create failed:", str(res)[:300]); return None
+    return res.get("new_contract")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -111,6 +128,8 @@ def main():
 
     v = VastAI(); created = False; iid = args.reuse
     host = port = None
+    bal = funds()
+    if bal is not None: print(f">> vast funds: ${bal:.2f} (balance + credit)")
 
     # 1) Try to bring up the reused box within a bounded window (default 5 min).
     if iid:
