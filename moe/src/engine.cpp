@@ -45,6 +45,14 @@ public:
 
     void forward(const void* input, void* output, int num_tokens, int layer,
                  cudaStream_t stream) override {
+        if (num_tokens <= 0) return;
+        if (num_tokens > max_tokens_) {
+            // Router/top-k scratch is sized for max_tokens_; a larger batch would
+            // overflow d_logits_/d_ids_/d_weights_ (OOB device writes). Refuse instead.
+            fprintf(stderr, "[moe] forward: num_tokens %d exceeds scratch capacity %d — skipping\n",
+                    num_tokens, max_tokens_);
+            return;
+        }
         const LayerWeights& w = weights_[layer];
         const int E = cfg_.num_experts, K = cfg_.top_k;
         const int H = cfg_.hidden_dim, F = cfg_.ffn_dim;
