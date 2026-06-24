@@ -92,7 +92,17 @@ bool GGUF::open(const std::string& path) {
     std::vector<Info> infos; infos.reserve(n_tensors);
     for (uint64_t i = 0; i < n_tensors && c.ok; i++) {
         Info in; in.name = c.rd_str();
-        uint32_t nd = c.rd<uint32_t>(); in.t.n_dims = nd;
+        uint32_t nd = c.rd<uint32_t>();
+        // n_dims is file-controlled; GGUFTensor::dims is a fixed 4-element array
+        // (ggml's GGML_MAX_DIMS). A declared count > 4 (corrupt/malicious/future
+        // format) would write past dims[4] — overwriting the adjacent n_values/
+        // n_bytes/data members and desyncing the cursor 8 bytes per extra dim.
+        // Fail loudly instead, consistent with the unknown-value-type metadata path.
+        if (!c.ok || nd > 4) {
+            fprintf(stderr, "[gguf] tensor %s has invalid n_dims=%u (max 4)\n", in.name.c_str(), nd);
+            return false;
+        }
+        in.t.n_dims = nd;
         long nv = 1;
         for (uint32_t d = 0; d < nd; d++) { long e = (long)c.rd<uint64_t>(); in.t.dims[d] = e; nv *= e; }
         in.t.ggml_type = c.rd<uint32_t>();
