@@ -98,6 +98,7 @@ __global__ void transpose3d_kernel(const __nv_bfloat16* __restrict__ src, __nv_b
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/quant.h"
+#include <cstdio>
 
 void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_values, cudaStream_t stream) {
     auto* d = reinterpret_cast<__nv_bfloat16*>(dst_bf16);
@@ -107,7 +108,8 @@ void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_
     else if (ggml_type == GGML_Q6_K) { long nb = n_values/256; deq_q6k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_Q8_0) { long nb = n_values/32;  deq_q8_0_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_F16)  { deq_f16_kernel<<<(n_values+T-1)/T,T,0,stream>>>(s,d,n_values); }
-    else /* F32 */                   { deq_f32_kernel<<<(n_values+T-1)/T,T,0,stream>>>(reinterpret_cast<const float*>(src),d,n_values); }
+    else if (ggml_type == GGML_F32)  { deq_f32_kernel<<<(n_values+T-1)/T,T,0,stream>>>(reinterpret_cast<const float*>(src),d,n_values); }
+    else { fprintf(stderr, "[gguf] launch_gguf_dequant: unsupported ggml type %d — no decoder (e.g. Q5_K=13); refusing to reinterpret as F32\n", ggml_type); }
 }
 
 void launch_transpose_bf16(const void* src, void* dst, int rows, int cols, cudaStream_t stream) {
