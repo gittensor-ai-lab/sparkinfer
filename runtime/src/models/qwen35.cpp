@@ -32,6 +32,21 @@ inline void cu(cudaError_t e, const char* what) {
     if (e != cudaSuccess) fprintf(stderr, "[qwen35] %s: %s\n", what, cudaGetErrorString(e));
 }
 using bf16 = unsigned short;
+
+// launch_gguf_dequant only implements F32/F16/Q8_0/Q4_K/Q6_K. Reject anything
+// else at load time so Q5_K (etc.) cannot silently fall through as F32.
+bool ggml_dequant_supported(int ggml_type) {
+    switch (ggml_type) {
+        case 0:  // F32
+        case 1:  // F16
+        case 8:  // Q8_0
+        case 12: // Q4_K
+        case 14: // Q6_K
+            return true;
+        default:
+            return false;
+    }
+}
 }
 
 struct Qwen35Model::Impl {
@@ -327,6 +342,10 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dev_quant = [&](const std::string& name, int& qtype) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
+        if (!ggml_dequant_supported(t->ggml_type)) {
+            fprintf(stderr, "[gguf] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());
+            return nullptr;
+        }
         qtype = t->ggml_type;
         void* d = nullptr;
         if (cudaMalloc(&d, t->n_bytes) != cudaSuccess) return nullptr;
@@ -338,6 +357,10 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dense = [&](const std::string& name, bool transpose) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
+        if (!ggml_dequant_supported(t->ggml_type)) {
+            fprintf(stderr, "[gguf] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());
+            return nullptr;
+        }
         void* dq = nullptr; cudaMalloc(&dq, t->n_bytes);
         cudaMemcpy(dq, t->data, t->n_bytes, cudaMemcpyHostToDevice);
         void* tmp = nullptr; cudaMalloc(&tmp, (size_t)t->n_values * 2);
