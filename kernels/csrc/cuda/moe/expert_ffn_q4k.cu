@@ -103,6 +103,7 @@ __global__ void gate_up_q4k_kernel(
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
     float* __restrict__ h_scratch, int H, int F, int top_k, int gate_type, int up_type
 ) {
+    si_pdl_lc();   // PDL: release the dependent split-K down kernel on Blackwell decode
     extern __shared__ float s_x[];           // s_x[H]
     const int ts = blockIdx.x, tok = ts / top_k;
     const int e = expert_ids[ts];
@@ -287,6 +288,27 @@ __global__ void down_q6k_splitk_kernel(
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
 
+namespace {
+
+// Env flags are tri-state: unset -> default_on, "0" -> off, "1" -> force on.
+int env_tri(const char* name, int default_on) {
+    const char* v = std::getenv(name);
+    if (!v || !v[0]) return default_on;
+    if (v[0] == '0') return 0;
+    if (v[0] == '1') return 1;
+    return default_on;
+}
+
+bool pdl_capable_device() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
+    return prop.major >= 9;   // Hopper+ (Blackwell sm_120/121 included)
+}
+
+} // namespace
+
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
     int gate_type, int up_type, int down_type,
@@ -317,10 +339,13 @@ void launch_moe_expert_ffn_q4k(
             expert_ids, h_scratch, hidden, ffn, top_k, gate_type, up_type);
     }
 
+    // Split-K down is the decode occupancy lever (README / ncu). Default on; opt out with
+    // SPARKINFER_SPLITK=0. PDL overlaps gate_up->down on Hopper+ (incl. Blackwell);
+    // default on when split-K is active; opt out with SPARKINFER_PDL=0.
     static int splitk = -1;
-    if (splitk < 0) { const char* sv = getenv("SPARKINFER_SPLITK"); splitk = (sv && sv[0] == '1') ? 1 : 0; }
+    if (splitk < 0) splitk = env_tri("SPARKINFER_SPLITK", 1);
     static int pdl = -1;
-    if (pdl < 0) { const char* pv = getenv("SPARKINFER_PDL"); pdl = (pv && pv[0] == '1') ? 1 : 0; }
+    if (pdl < 0) pdl = env_tri("SPARKINFER_PDL", splitk && pdl_capable_device() ? 1 : 0);
     if (splitk) {   // split-K down: 4 warps/row -> 4x warps in flight (occupancy lever)
         const int RPB = WPB / 4;
         dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
