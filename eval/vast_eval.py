@@ -31,9 +31,11 @@ TEMPLATE_HASH = os.environ.get("EVAL_TEMPLATE_HASH", "")  # "" = use EVAL_IMAGE 
 SSH_KEY = os.path.expanduser(os.environ.get("SSH_KEY", "~/.ssh/id_ed25519"))
 LLAMACPP_DIR = os.environ.get("LLAMACPP_DIR", "/workspace/.llamacpp")            # persists across stop/start
 INSTANCE_FILE = os.path.expanduser(os.environ.get("VAST_INSTANCE_FILE", "~/.sparkinfer_vast_instance"))  # self-healed id
-# Comma-separated IPs of hosts known to be permanently broken (image pull hangs, SSH unreachable).
-# Set VAST_SKIP_HOSTS env or extend the default list here.
-SKIP_HOSTS_PERMANENT = set(filter(None, os.environ.get("VAST_SKIP_HOSTS", "94.177.17.69").split(",")))
+# IPs of hosts that repeatedly hang on image pull or never expose direct SSH, despite high vast
+# "reliability" scores (which track uptime, not image-pull / direct-SSH success). Whack-a-mole, but
+# the offending set is small and recurring. Override/extend via VAST_SKIP_HOSTS (comma-separated).
+_DEFAULT_SKIP = "94.177.17.69,120.238.149.205,192.3.91.246"
+SKIP_HOSTS_PERMANENT = set(filter(None, os.environ.get("VAST_SKIP_HOSTS", _DEFAULT_SKIP).split(",")))
 
 def sh(host, port, cmd, timeout=3600):
     try:
@@ -87,8 +89,14 @@ def funds():
     except Exception:
         return None
 
-LOADING_TIMEOUT = 300   # bail if stuck in "loading" longer than this (image pull hung)
-SSH_CONNECT_TIMEOUT = 300  # bail if instance is "running" but SSH won't connect after 5 min
+LOADING_TIMEOUT = 300   # bail if stuck in "loading" longer than this. The ~5GB CUDA-devel image
+                        # legitimately takes 3-5 min to pull on many hosts; 180s abandoned healthy
+                        # boxes mid-pull. The host blacklist (not a tight timeout) handles the
+                        # persistently-hung offenders.
+SSH_CONNECT_TIMEOUT = 120  # bail if "running" but SSH won't connect. A healthy box accepts SSH
+                           # within one poll of going "running"; a host that reports a phantom
+                           # "running" at 0s with no sshd never recovers — abandon it fast (2 min)
+                           # and let the provision-retry loop try another host.
 
 def bring_up(v, iid, deadline_s):
     """Start the instance if needed and wait until SSH-reachable, within deadline_s.
@@ -198,7 +206,9 @@ def main():
     # 2) No working box yet → create one, retrying on different hosts if needed.
     if not iid:
         skip = {stuck_host} if 'stuck_host' in dir() and stuck_host else set()
-        for attempt in range(1, 4):   # up to 3 provision attempts
+        MAX_ATTEMPTS = 5   # ~half of cheap offers are phantom-running hosts; each bad one now
+                           # costs only ~2 min (SSH_CONNECT_TIMEOUT), so try more before erroring
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             iid = provision(v, args, skip_hosts=skip)
             if not iid: sys.exit("could not provision an instance")
             created = True
@@ -211,7 +221,7 @@ def main():
             except Exception as e: print("  destroy:", str(e)[:150])
             if bad_host: skip.add(bad_host)
             iid = 0
-            if attempt == 3: sys.exit("all 3 provision attempts failed — giving up")
+            if attempt == MAX_ATTEMPTS: sys.exit(f"all {MAX_ATTEMPTS} provision attempts failed — giving up")
 
     save_instance(iid)                              # persist the working id (the bot reuses it next run)
     if args.reuse and iid != args.reuse:
