@@ -264,6 +264,39 @@ static double test_add_rmsnorm2_seq(int cols) {
     return err;  // expect 0: scalar and 8-wide grouping are bit-identical here
 }
 
+// ---------------------------------------------------------------------------
+// argmax two-pass (decode): the multi-block scan + final reduce must return the
+// SAME index as a serial argmax, including the smallest-index tie-break.
+// ---------------------------------------------------------------------------
+static double test_argmax_twopass(int vocab, int nblocks, bool ties) {
+    vector<float> L(vocab);
+    for (auto& v : L) v = frand();
+    if (ties) { for (auto& v : L) v = 0.f; for (int i : {1000 % vocab, 5, 77777 % vocab, 250}) L[i] = 7.f; }
+
+    auto merge = [](float& bv, int& bi, float ov, int oi) {
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    };
+    // serial ground truth (smallest index on ties)
+    float gv = -1e30f; int gi = 0;
+    for (int v = 0; v < vocab; v++) merge(gv, gi, L[v], v);
+
+    // pass 1: nblocks grid-stride partials, each block 256 threads
+    const int BT = 256;
+    vector<float> pv(nblocks); vector<int> pi(nblocks);
+    for (int b = 0; b < nblocks; b++) {
+        float bbv = -1e30f; int bbi = 0;
+        vector<float> tv(BT, -1e30f); vector<int> ti(BT, 0);
+        for (int t = 0; t < BT; t++)
+            for (int v = b * BT + t; v < vocab; v += BT * nblocks) merge(tv[t], ti[t], L[v], v);
+        for (int t = 0; t < BT; t++) merge(bbv, bbi, tv[t], ti[t]);
+        pv[b] = bbv; pi[b] = bbi;
+    }
+    // pass 2: reduce partials
+    float rv = -1e30f; int ri = 0;
+    for (int b = 0; b < nblocks; b++) merge(rv, ri, pv[b], pi[b]);
+    return (double)std::abs(ri - gi);   // expect 0: same index as serial argmax
+}
+
 int main() {
     printf("sparkinfer kernel algorithm correctness (CPU reference)\n");
     check("attention hd128 kv1",   test_attention(128, 1),    1e-4);
@@ -281,6 +314,9 @@ int main() {
     check("rmsnorm vec8 cols128",  test_rmsnorm_vec8(128),    1e-4);
     check("add_rmsnorm2 seq c2048",test_add_rmsnorm2_seq(2048),1e-9);
     check("add_rmsnorm2 seq c1536",test_add_rmsnorm2_seq(1536),1e-9);
+    check("argmax 2pass qwen vocab",test_argmax_twopass(151936, 512, false), 0.0);
+    check("argmax 2pass gemma vocab",test_argmax_twopass(262144, 512, false), 0.0);
+    check("argmax 2pass tie-break",  test_argmax_twopass(151936, 512, true),  0.0);
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }
