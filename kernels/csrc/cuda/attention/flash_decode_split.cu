@@ -10,6 +10,8 @@
 // kernel), so it stays CUDA-graph capturable.
 //
 // One warp per block; head_dim=128 (Qwen3). Portable CUDA — sm_89 .. sm_120/121.
+// K/V heads are loaded with 128-bit uint4 transactions (16 lanes x 8 bf16) and
+// warp-shuffle broadcast — same online-softmax math, fewer global loads per token.
 
 #include <cuda_bf16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
@@ -24,6 +26,48 @@ __device__ __forceinline__ float fa_wsum(float v) {
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffff, v, m);
     return v;
+}
+
+// head_dim=128: lanes 0..15 each ld.global.v4 8 bf16; all lanes extract their
+// lane+e*32 element via shfl from the owning lane. Math-identical to scalar loads.
+__device__ __forceinline__ float fa_head128_elem(
+    const uint4& pack, int owner, int sub
+) {
+    const unsigned int w0 = __shfl_sync(0xffffffffu, pack.x, owner);
+    const unsigned int w1 = __shfl_sync(0xffffffffu, pack.y, owner);
+    const unsigned int w2 = __shfl_sync(0xffffffffu, pack.z, owner);
+    const unsigned int w3 = __shfl_sync(0xffffffffu, pack.w, owner);
+    const uint4 p4 = {w0, w1, w2, w3};
+    const __nv_bfloat16* hb = reinterpret_cast<const __nv_bfloat16*>(&p4);
+    return fa_to_f(hb[sub]);
+}
+
+__device__ __forceinline__ float fa_dot_k128(
+    const float qr[4], const __nv_bfloat16* __restrict__ kb, int lane
+) {
+    uint4 kpack{0, 0, 0, 0};
+    if (lane < 16) kpack = __ldg(reinterpret_cast<const uint4*>(kb) + lane);
+    float p = 0.f;
+    #pragma unroll
+    for (int e = 0; e < 4; e++) {
+        const int idx = lane + e * 32;
+        p = __fmaf_rn(qr[e], fa_head128_elem(kpack, idx >> 3, idx & 7), p);
+    }
+    return p;
+}
+
+__device__ __forceinline__ void fa_acc_v128(
+    float acc[4], float pe, float corr,
+    const __nv_bfloat16* __restrict__ vb, int lane
+) {
+    uint4 vpack{0, 0, 0, 0};
+    if (lane < 16) vpack = __ldg(reinterpret_cast<const uint4*>(vb) + lane);
+    #pragma unroll
+    for (int e = 0; e < 4; e++) {
+        const int idx = lane + e * 32;
+        const float ve = fa_head128_elem(vpack, idx >> 3, idx & 7);
+        acc[e] = __fmaf_rn(pe, ve, acc[e] * corr);
+    }
 }
 
 template <int HEAD_DIM>
@@ -44,7 +88,7 @@ __global__ void fa_split_kernel(
     float qr[ELEMS];
     const __nv_bfloat16* qp = q + (size_t)(seq * num_q_heads + qh) * HEAD_DIM;
     #pragma unroll
-    for (int e = 0; e < ELEMS; e++) qr[e] = fa_to_f(qp[lane + e * 32]);
+    for (int e = 0; e < ELEMS; e++) qr[e] = fa_to_f(__ldg(qp + lane + e * 32));
 
     const int sl    = seq_lens[seq];
     const int chunk = (sl + n_splits - 1) / n_splits;
@@ -57,16 +101,15 @@ __global__ void fa_split_kernel(
 
     for (int t = start; t < end; t++) {
         const int blk = t / block_size, within = t % block_size;
-        const int phys = block_table[seq * max_blocks + blk];
+        const int phys = __ldg(&block_table[seq * max_blocks + blk]);
         const size_t base = ((size_t)(phys * block_size + within) * num_kv_heads + kvh) * HEAD_DIM;
-        float p = 0.f;
-        #pragma unroll
-        for (int e = 0; e < ELEMS; e++) p += qr[e] * fa_to_f(k_pool[base + lane + e * 32]);
-        const float score = fa_wsum(p) * scale;
+        const __nv_bfloat16* kb = k_pool + base;
+        const __nv_bfloat16* vb = v_pool + base;
+
+        const float score = fa_wsum(fa_dot_k128(qr, kb, lane)) * scale;
         const float mn = fmaxf(m, score), corr = __expf(m - mn), pe = __expf(score - mn);
-        l = l * corr + pe;
-        #pragma unroll
-        for (int e = 0; e < ELEMS; e++) acc[e] = acc[e] * corr + pe * fa_to_f(v_pool[base + lane + e * 32]);
+        l = __fmaf_rn(l, corr, pe);
+        fa_acc_v128(acc, pe, corr, vb, lane);
         m = mn;
     }
 
@@ -87,16 +130,19 @@ __global__ void fa_combine_kernel(
     const int idxbase = (seq * num_q_heads + qh) * n_splits;
 
     float gm = -1e30f;
-    for (int s = 0; s < n_splits; s++) gm = fmaxf(gm, part_m[idxbase + s]);
+    for (int s = 0; s < n_splits; s++) gm = fmaxf(gm, __ldg(&part_m[idxbase + s]));
     float gl = 0.f, acc[ELEMS];
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
     for (int s = 0; s < n_splits; s++) {
-        const float ms = part_m[idxbase + s], ls = part_l[idxbase + s];
+        const float ms = __ldg(&part_m[idxbase + s]), ls = __ldg(&part_l[idxbase + s]);
         const float sc = __expf(ms - gm);
-        gl += ls * sc;
+        gl = __fmaf_rn(ls, sc, gl);   // gl += ls * sc
         #pragma unroll
-        for (int e = 0; e < ELEMS; e++) acc[e] += sc * part_acc[(size_t)(idxbase + s) * HEAD_DIM + lane + e * 32];
+        for (int e = 0; e < ELEMS; e++) {
+            const float pv = __ldg(&part_acc[(size_t)(idxbase + s) * HEAD_DIM + lane + e * 32]);
+            acc[e] = __fmaf_rn(sc, pv, acc[e]);   // acc[e] += sc * pv
+        }
     }
     const float inv = (gl > 0.f) ? (1.f / gl) : 0.f;
     __nv_bfloat16* op = out + (size_t)(seq * num_q_heads + qh) * HEAD_DIM;
