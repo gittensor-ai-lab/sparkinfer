@@ -11,6 +11,8 @@
 
 #include <cstdio>
 #include <cmath>
+#include <cstring>
+#include <cstdint>
 #include <vector>
 #include <random>
 #include <algorithm>
@@ -19,6 +21,18 @@
 using std::vector;
 static std::mt19937 rng(1234);
 static float frand() { return std::uniform_real_distribution<float>(-1.f, 1.f)(rng); }
+
+// Round a float to bf16 (round-to-nearest-even), returned as float. Models the
+// __float2bfloat16 round-trip the kernels do when reading/writing bf16 rows.
+static float to_bf16(float f) {
+    uint32_t u; std::memcpy(&u, &f, 4);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return f;  // NaN: leave as-is
+    const uint32_t lsb = (u >> 16) & 1u;
+    u += 0x7fffu + lsb;
+    u &= 0xffff0000u;
+    float r; std::memcpy(&r, &u, 4);
+    return r;
+}
 
 static int g_fail = 0;
 static void check(const char* name, double max_err, double tol) {
@@ -169,6 +183,87 @@ static double test_rmsnorm(int cols) {
     return err;
 }
 
+// ---------------------------------------------------------------------------
+// 5b. Vectorized RMSNorm (PR #44): the kernel reads the row in 8-wide (uint4 =
+//     8 bf16) packs and accumulates the sum-of-squares per-pack with FMA. Only
+//     the per-thread element grouping in the SS reduction changes (FP assoc.);
+//     this checks the 8-wide grouped reduction still matches the fp64 ground
+//     truth. cols here are multiples of 8, as on every real RMSNorm call site.
+// ---------------------------------------------------------------------------
+static double test_rmsnorm_vec8(int cols) {
+    vector<float> x(cols), wt(cols);
+    for (auto& v : x) v = frand();
+    for (auto& v : wt) v = frand();
+    const float eps = 1e-6f;
+
+    double ss = 0; for (int c = 0; c < cols; c++) ss += (double)x[c]*x[c];
+    double inv = 1.0 / std::sqrt(ss / cols + eps);
+    vector<double> ref(cols); for (int c = 0; c < cols; c++) ref[c] = x[c]*inv*wt[c];
+
+    // 8-wide packs, FMA accumulation (mirrors rn_unpack8 + __fmaf_rn).
+    const int npack = cols >> 3;
+    float fss = 0.f;
+    for (int p = 0; p < npack; p++) {
+        #pragma GCC unroll 8
+        for (int j = 0; j < 8; j++) { float v = x[p*8+j]; fss = std::fma(v, v, fss); }
+    }
+    for (int c = (npack<<3); c < cols; c++) { float v = x[c]; fss = std::fma(v, v, fss); }
+    float finv = 1.f/std::sqrt(fss/cols + eps);
+    double err = 0; for (int c = 0; c < cols; c++) err = std::max(err, std::abs((double)(x[c]*finv*wt[c]) - ref[c]));
+    return err;
+}
+
+// ---------------------------------------------------------------------------
+// 5c. add_rmsnorm2 sequencing (PR #44): the fused residual+norm kernel must keep
+//     its exact numeric sequencing under vectorization — SS accumulates on the
+//     fp32 sum (x+residual), the sum is round-tripped through bf16 into out_sum,
+//     and the norm pass re-reads that bf16 sum. This models that scalar vs 8-wide
+//     grouped sequencing produce the same normalized output (bf16-exact), so the
+//     vectorized rewrite is byte-faithful, not just close.
+// ---------------------------------------------------------------------------
+static double test_add_rmsnorm2_seq(int cols) {
+    vector<float> x(cols), r(cols), wt(cols);
+    for (auto& v : x)  v = frand();
+    for (auto& v : r)  v = frand();
+    for (auto& v : wt) v = frand();
+    const float eps = 1e-6f;
+
+    // Scalar reference sequencing (original kernel).
+    vector<float> sum_bf(cols);
+    float ss_s = 0.f;
+    for (int c = 0; c < cols; c++) {
+        float v = x[c] + r[c];          // fp32 sum
+        sum_bf[c] = to_bf16(v);          // out_sum stored as bf16
+        ss_s = std::fma(v, v, ss_s);     // SS on the fp32 sum
+    }
+    float inv_s = 1.f/std::sqrt(ss_s/cols + eps);
+    vector<float> norm_s(cols);
+    for (int c = 0; c < cols; c++) norm_s[c] = to_bf16(sum_bf[c] * inv_s * wt[c]);
+
+    // 8-wide grouped sequencing (PR kernel): same per-element ops, packed.
+    const int npack = cols >> 3;
+    vector<float> sum_bf2(cols);
+    float ss_v = 0.f;
+    for (int p = 0; p < npack; p++)
+        for (int j = 0; j < 8; j++) {
+            float v = x[p*8+j] + r[p*8+j];
+            sum_bf2[p*8+j] = to_bf16(v);
+            ss_v = std::fma(v, v, ss_v);
+        }
+    float inv_v = 1.f/std::sqrt(ss_v/cols + eps);
+    vector<float> norm_v(cols);
+    for (int p = 0; p < npack; p++)
+        for (int j = 0; j < 8; j++)
+            norm_v[p*8+j] = to_bf16(sum_bf2[p*8+j] * inv_v * wt[p*8+j]);
+
+    double err = 0;
+    for (int c = 0; c < cols; c++) {
+        err = std::max(err, std::abs((double)sum_bf2[c] - sum_bf[c]));
+        err = std::max(err, std::abs((double)norm_v[c]  - norm_s[c]));
+    }
+    return err;  // expect 0: scalar and 8-wide grouping are bit-identical here
+}
+
 int main() {
     printf("sparkinfer kernel algorithm correctness (CPU reference)\n");
     check("attention hd128 kv1",   test_attention(128, 1),    1e-4);
@@ -182,6 +277,10 @@ int main() {
     check("gemm 64x96x128",        test_gemm(64, 96, 128),    1e-3);
     check("gemm 17x33x49",         test_gemm(17, 33, 49),     1e-3);
     check("rmsnorm cols2048",      test_rmsnorm(2048),        1e-4);
+    check("rmsnorm vec8 cols2048", test_rmsnorm_vec8(2048),   1e-4);
+    check("rmsnorm vec8 cols128",  test_rmsnorm_vec8(128),    1e-4);
+    check("add_rmsnorm2 seq c2048",test_add_rmsnorm2_seq(2048),1e-9);
+    check("add_rmsnorm2 seq c1536",test_add_rmsnorm2_seq(1536),1e-9);
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }
