@@ -103,6 +103,7 @@ __global__ void gate_up_q4k_kernel(
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
     float* __restrict__ h_scratch, int H, int F, int top_k, int gate_type, int up_type
 ) {
+    si_pdl_lc();   // PDL: release the dependent split-K down kernel on Hopper+ decode
     extern __shared__ float s_x[];           // s_x[H]
     const int ts = blockIdx.x, tok = ts / top_k;
     const int e = expert_ids[ts];
@@ -287,6 +288,27 @@ __global__ void down_q6k_splitk_kernel(
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
 
+namespace {
+
+// Env flags are tri-state: unset -> default_on, "0" -> off, "1" -> force on.
+int env_tri(const char* name, int default_on) {
+    const char* v = std::getenv(name);
+    if (!v || !v[0]) return default_on;
+    if (v[0] == '0') return 0;
+    if (v[0] == '1') return 1;
+    return default_on;
+}
+
+bool pdl_capable_device() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
+    return prop.major >= 9;   // Hopper+ (Blackwell sm_120/121 included)
+}
+
+} // namespace
+
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
     int gate_type, int up_type, int down_type,
@@ -296,9 +318,9 @@ void launch_moe_expert_ffn_q4k(
 ) {
     (void)out_scratch;
     // SPARKINFER_MMVQ=1 selects the int8 dp4a path for Q4_K gate/up (decode parity
-    // with llama.cpp's MMVQ). bf16 dequant-GEMV stays the default; down is unchanged.
+    // with llama.cpp's MMVQ). Default on for Q4_K MoE decode; opt out with SPARKINFER_MMVQ=0.
     static int mmvq = -1;
-    if (mmvq < 0) { const char* ev = getenv("SPARKINFER_MMVQ"); mmvq = (ev && ev[0] == '1') ? 1 : 0; }
+    if (mmvq < 0) mmvq = env_tri("SPARKINFER_MMVQ", 1);
 
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
@@ -318,9 +340,9 @@ void launch_moe_expert_ffn_q4k(
     }
 
     static int splitk = -1;
-    if (splitk < 0) { const char* sv = getenv("SPARKINFER_SPLITK"); splitk = (sv && sv[0] == '1') ? 1 : 0; }
+    if (splitk < 0) splitk = env_tri("SPARKINFER_SPLITK", 1);
     static int pdl = -1;
-    if (pdl < 0) { const char* pv = getenv("SPARKINFER_PDL"); pdl = (pv && pv[0] == '1') ? 1 : 0; }
+    if (pdl < 0) pdl = env_tri("SPARKINFER_PDL", splitk && pdl_capable_device() ? 1 : 0);
     if (splitk) {   // split-K down: 4 warps/row -> 4x warps in flight (occupancy lever)
         const int RPB = WPB / 4;
         dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
