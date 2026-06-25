@@ -24,6 +24,11 @@ __global__ void kv_append_kernel(
 
     const int pos    = write_pos[seq];
     const int blk    = pos / block_size;
+    // write_pos is driven by the decode loop; a position at/beyond this sequence's
+    // allocated capacity (max_blocks_per_seq * block_size tokens) would index past the
+    // sequence's block-table row — reading a neighbouring/uninitialized physical block
+    // id and writing K/V out of bounds. Refuse rather than corrupt the pool.
+    if (blk >= max_blocks_per_seq) return;
     const int within = pos % block_size;
     const int phys   = block_table[seq * max_blocks_per_seq + blk];
     const size_t dst = ((size_t)(phys * block_size + within) * num_kv_heads + h) * head_dim + d;
