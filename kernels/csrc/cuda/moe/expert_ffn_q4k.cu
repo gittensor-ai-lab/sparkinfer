@@ -295,10 +295,11 @@ void launch_moe_expert_ffn_q4k(
     int num_tokens, int top_k, int hidden, int ffn, cudaStream_t stream
 ) {
     (void)out_scratch;
-    // SPARKINFER_MMVQ=1 selects the int8 dp4a path for Q4_K gate/up (decode parity
-    // with llama.cpp's MMVQ). bf16 dequant-GEMV stays the default; down is unchanged.
+    // int8 dp4a path for Q4_K gate/up (decode parity with llama.cpp's MMVQ). Default
+    // ON — the largest single decode cost; down stays on the fp path (Q6_K). Set
+    // SPARKINFER_MMVQ=0 to fall back to the bf16 dequant-GEMV.
     static int mmvq = -1;
-    if (mmvq < 0) { const char* ev = getenv("SPARKINFER_MMVQ"); mmvq = (ev && ev[0] == '1') ? 1 : 0; }
+    if (mmvq < 0) { const char* ev = getenv("SPARKINFER_MMVQ"); mmvq = (ev && ev[0] == '0') ? 0 : 1; }
 
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
