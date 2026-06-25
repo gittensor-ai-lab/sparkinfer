@@ -62,6 +62,11 @@ DecodeRunner::~DecodeRunner() {
 
 void DecodeRunner::begin_step(const std::vector<int>& seq_lens_before) {
     const int n = (int)seq_lens_before.size();
+    if (n <= 0 || n > p_->max_batch) {
+        fprintf(stderr, "[decode] begin_step: num_seqs %d out of range (max_batch=%d)\n",
+                n, p_->max_batch);
+        return;
+    }
     std::vector<int> after(n);
     for (int i = 0; i < n; i++) after[i] = seq_lens_before[i] + 1;   // include the new token
     cu(cudaMemcpy(p_->d_write_pos, seq_lens_before.data(), n * sizeof(int), cudaMemcpyHostToDevice), "wpos");
@@ -71,6 +76,12 @@ void DecodeRunner::begin_step(const std::vector<int>& seq_lens_before) {
 void DecodeRunner::decode_layer(int layer, void* x, int num_seqs,
                                 const TransformerLayerWeights& w, cudaStream_t stream) {
     Impl& s = *p_;
+    if (num_seqs <= 0) return;
+    if (num_seqs > s.max_batch) {
+        fprintf(stderr, "[decode] decode_layer: num_seqs %d exceeds max_batch %d — skipping\n",
+                num_seqs, s.max_batch);
+        return;
+    }
     const int H = s.hidden, Q = s.qdim, KV = s.kvdim;
     kernels::GemmConfig gc{};
 
