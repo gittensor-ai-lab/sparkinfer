@@ -88,6 +88,30 @@ public:
     // Run one token at `position`, return the argmax next-token id.
     int forward_token(int token_id, int position);
 
+    // Allocate the fixed-size scratch (and CUDA graph) used by
+    // forward_tokens_batch() / generate_speculative(). Must be called before
+    // either; `k` is the verification batch width and cannot change afterward
+    // (the graph is captured once for this shape, like forward_token's).
+    void enable_speculative(int k);
+
+    // Run `n` tokens (n == the `k` passed to enable_speculative) starting at
+    // `start_position` in one batched forward pass -- the speculative-decoding
+    // verification step. `tokens[i]` is fed at position start_position+i;
+    // out_argmax[i] receives the model's greedy next-token prediction after
+    // having seen tokens[0..i]. KV for all n positions is appended whether or
+    // not the caller ends up accepting them; positions beyond the last
+    // accepted token are simply overwritten by the next call, so no rollback
+    // is needed. Returns false if enable_speculative() was not called first.
+    bool forward_tokens_batch(const int* tokens, int n, int start_position, int* out_argmax);
+
+    // Prompt-lookup speculative greedy generate: drafts up to (draft_k - 1)
+    // tokens per round from repeats in the token history (no second model),
+    // verifies them with one forward_tokens_batch() call, and accepts the
+    // longest matching prefix -- producing the identical token sequence
+    // generate() would, in fewer forward passes when the draft hits. Calls
+    // enable_speculative(draft_k) internally on first use.
+    std::vector<int> generate_speculative(const std::vector<int>& prompt_ids, int max_new_tokens, int draft_k = 4);
+
     // Copy the most recent step's logits (vocab floats) to host. Valid after a
     // forward_token() call. Used for teacher-forced scoring (perplexity / KL).
     void copy_logits(float* host_logits) const;
