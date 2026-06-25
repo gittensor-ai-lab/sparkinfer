@@ -28,7 +28,13 @@ ScheduleBatch Scheduler::schedule() {
     std::sort(ordered.begin(), ordered.end(),
               [](const SequenceGroup* a, const SequenceGroup* b) { return a->priority > b->priority; });
     for (auto* g : ordered) {
-        if (batch.total_tokens + g->num_seqs > impl_->max_tokens_per_batch) break;
+        // Skip a group that doesn't fit and keep packing smaller ones (greedy
+        // bin-packing, per "pack ... until the token budget is hit" above). Using
+        // break here head-of-line-blocks every lower-priority group behind an
+        // oversized one, and a single group with num_seqs > max_tokens_per_batch
+        // would return an empty batch forever (starvation). continue keeps the
+        // batch filled up to the budget.
+        if (batch.total_tokens + g->num_seqs > impl_->max_tokens_per_batch) continue;
         for (int i = 0; i < g->num_seqs; i++) batch.decode_seq_ids.push_back(g->group_id);
         batch.total_tokens += g->num_seqs;
     }
