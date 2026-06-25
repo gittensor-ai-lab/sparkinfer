@@ -24,4 +24,5 @@ target_link_libraries(sparkinfer_moe PUBLIC sparkinfer_kernels CUDA::cudart)
 
 if(BUILD_TESTS)
     enable_testing()
+    add_subdirectory(tests)
 endif()
