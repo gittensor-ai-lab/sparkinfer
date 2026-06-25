@@ -318,10 +318,15 @@ void launch_moe_expert_ffn_q4k(
             expert_ids, h_scratch, hidden, ffn, top_k, gate_type, up_type);
     }
 
+    // split-K down: 4 warps/row -> 4x warps in flight (occupancy lever at bs=1).
+    // Default ON — accuracy-safe (same fp math, only reduction order). Opt out:
+    // SPARKINFER_SPLITK=0.
     static int splitk = -1;
-    if (splitk < 0) { const char* sv = getenv("SPARKINFER_SPLITK"); splitk = (sv && sv[0] == '1') ? 1 : 0; }
+    if (splitk < 0) { const char* sv = getenv("SPARKINFER_SPLITK"); splitk = (sv && sv[0] == '0') ? 0 : 1; }
+    // PDL: overlap down grid spin-up with gate_up tail. Default ON with split-K.
+    // Opt out: SPARKINFER_PDL=0. CUDA-graph safe on the qwen3 decode path.
     static int pdl = -1;
-    if (pdl < 0) { const char* pv = getenv("SPARKINFER_PDL"); pdl = (pv && pv[0] == '1') ? 1 : 0; }
+    if (pdl < 0) { const char* pv = getenv("SPARKINFER_PDL"); pdl = (pv && pv[0] == '0') ? 0 : 1; }
     if (splitk) {   // split-K down: 4 warps/row -> 4x warps in flight (occupancy lever)
         const int RPB = WPB / 4;
         dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
