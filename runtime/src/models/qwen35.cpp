@@ -82,6 +82,15 @@ struct Qwen35Model::Impl {
 Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine)
     : p_(new Impl()) {
     p_->cfg = cfg; p_->kv = kv; p_->engine = engine;
+    // Flash-decode KV-split count is occupancy tuning only (math is identical for any
+    // value — empty splits contribute zero), and it's baked into the decode CUDA graph
+    // at construction. 16 over-subscribes the GPU for short context (32 q_heads * 16 =
+    // 512 single-warp blocks); SPARKINFER_NSPLITS lets the scored regime be tuned/swept
+    // without a rebuild. Clamp to [1, 64]; buffers below are sized from it.
+    if (const char* ns = getenv("SPARKINFER_NSPLITS")) {
+        int v = atoi(ns); if (v < 1) v = 1; if (v > 64) v = 64; p_->n_splits = v;
+        fprintf(stderr, "[nsplits] flash-decode splits = %d (env override)\n", v);
+    }
     p_->qdim = cfg.n_q_heads * cfg.head_dim;
     p_->kvdim = cfg.n_kv_heads * cfg.head_dim;
     cudaStreamCreate(&p_->stream);
@@ -380,11 +389,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         return result;
     };
 
-    // SPARKINFER_QATTN=1: keep attention/lm_head weights quantized in VRAM and decode
-    // them on-read (launch_gemv_q, full-precision activation) instead of dequantizing
-    // to bf16 at load — ~4x less decode memory traffic, token-match preserved.
-    const bool qattn = []{ const char* a = getenv("SPARKINFER_QATTN"); const char* m = getenv("SPARKINFER_MMVQ");
-                           return (a && a[0] == '1') || (m && m[0] == '1'); }();
+    // Keep attention/lm_head weights quantized in VRAM and decode them on-read
+    // (Q4_K -> int8 dp4a, Q6_K -> fp32 dequant) instead of expanding to bf16 at load.
+    // Default ON: it feeds the dp4a GEMV path (~27% faster decode, gate-passing) and
+    // uses ~1.5 GB less VRAM. Set SPARKINFER_QATTN=0 to load dense bf16 instead.
+    const bool qattn = []{ const char* a = getenv("SPARKINFER_QATTN");
+                           return !(a && a[0] == '0'); }();
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);

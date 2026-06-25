@@ -189,10 +189,12 @@ template __global__ void gemv_q_dp4a_kernel<float>(const __nv_bfloat16*, const u
 #include "sparkinfer/kernels/gemm.h"
 #include <cstdlib>
 
-// SPARKINFER_MMVQ=1 -> faithful int8 dp4a for Q4_K GEMVs (matches llama.cpp).
+// int8 dp4a for Q4_K GEMVs (faithful to llama.cpp's mul_mat_vec_q). Default ON —
+// ~27% faster decode than the fp32-dequant path and still clears the accuracy gate
+// (top1 0.97, KL 0.15 vs llama.cpp). Set SPARKINFER_MMVQ=0 to fall back to fp32.
 static bool gemv_mmvq() {
     static int v = -1;
-    if (v < 0) { const char* e = getenv("SPARKINFER_MMVQ"); v = (e && e[0] == '1') ? 1 : 0; }
+    if (v < 0) { const char* e = getenv("SPARKINFER_MMVQ"); v = (e && e[0] == '0') ? 0 : 1; }
     return v;
 }
 
