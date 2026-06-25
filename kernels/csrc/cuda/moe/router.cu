@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
+#include <cstdio>
 #endif
 
 namespace sparkinfer {
@@ -94,6 +95,13 @@ void launch_moe_router(
     int normalize, cudaStream_t stream
 ) {
     if (num_tokens <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts) return;
+    // moe_router_kernel stages the selection in fixed per-thread arrays
+    // sel_logit[16]/sel_id[16]; top_k is file-controlled (GGUF expert_used_count), so a
+    // value beyond 16 would overrun those local arrays on the device. Reject it loudly.
+    if (top_k > 16) {
+        fprintf(stderr, "[moe] router: top_k %d exceeds max supported 16\n", top_k);
+        return;
+    }
     size_t smem = (size_t)num_experts * sizeof(float);
     moe_router_kernel<<<num_tokens, 32, smem, stream>>>(
         logits, expert_ids, expert_weights, tokens_per_expert,
