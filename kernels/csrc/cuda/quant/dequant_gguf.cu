@@ -10,6 +10,7 @@
 #include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
+#include <cstdio>
 #endif
 
 namespace sparkinfer {
@@ -98,7 +99,6 @@ __global__ void transpose3d_kernel(const __nv_bfloat16* __restrict__ src, __nv_b
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/quant.h"
-#include <cstdio>
 
 void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_values, cudaStream_t stream) {
     auto* d = reinterpret_cast<__nv_bfloat16*>(dst_bf16);
