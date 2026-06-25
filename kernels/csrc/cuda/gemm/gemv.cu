@@ -190,9 +190,15 @@ template __global__ void gemv_q_dp4a_kernel<float>(const __nv_bfloat16*, const u
 #include <cstdlib>
 
 // SPARKINFER_MMVQ=1 -> faithful int8 dp4a for Q4_K GEMVs (matches llama.cpp).
+// Default on for decode: avoids bf16 dequant round-trips on the memory-bound path.
 static bool gemv_mmvq() {
     static int v = -1;
-    if (v < 0) { const char* e = getenv("SPARKINFER_MMVQ"); v = (e && e[0] == '1') ? 1 : 0; }
+    if (v < 0) {
+        const char* e = std::getenv("SPARKINFER_MMVQ");
+        if (!e || !e[0]) v = 1;
+        else if (e[0] == '0') v = 0;
+        else v = 1;
+    }
     return v;
 }
 
