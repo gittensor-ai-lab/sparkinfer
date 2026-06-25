@@ -22,12 +22,15 @@ __global__ void embedding_kernel(const int* __restrict__ ids,
 }
 
 // out_id[r] = argmax_v logits[r, v]   (greedy).  One block per row.
+// Decode runs a single row over a ~152k vocab, so size the block wide (1024 threads):
+// at bs=1 there is only one row, so more warps per block — not more blocks — is what
+// hides the global-load latency of the scan. ~165us -> tens of us.
 __global__ void argmax_kernel(const float* __restrict__ logits, int* __restrict__ out_id,
                               int vocab) {
     const int row = blockIdx.x;
     const float* L = logits + (size_t)row * vocab;
-    __shared__ float s_val[256];
-    __shared__ int   s_idx[256];
+    __shared__ float s_val[1024];
+    __shared__ int   s_idx[1024];
 
     float best = -1e30f; int bi = 0;
     for (int v = threadIdx.x; v < vocab; v += blockDim.x)
@@ -59,7 +62,7 @@ void launch_embedding(const int* ids, const void* table, void* out,
 }
 
 void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab, cudaStream_t stream) {
-    argmax_kernel<<<n_rows, 256, 0, stream>>>(logits, out_id, vocab);
+    argmax_kernel<<<n_rows, 1024, 0, stream>>>(logits, out_id, vocab);
 }
 #endif
 
