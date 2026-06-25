@@ -62,6 +62,7 @@ struct Qwen35Model::Impl {
     cudaGraph_t cu_graph{};
     cudaGraphExec_t cu_exec{};
     bool graph_ready = false;
+    bool rope_ready = false;
 
     // scratch (bf16)
     bf16 *x, *xn, *q, *k, *v, *attn, *ao, *h, *hn, *routed, *shared;
@@ -159,6 +160,11 @@ int Qwen35Model::forward_token(int token_id, int position) {
     cu(cudaMemcpyAsync(s.d_writepos, &position, sizeof(int), cudaMemcpyHostToDevice, st), "wpos");
     cu(cudaMemcpyAsync(s.d_seqlen, &seqlen, sizeof(int), cudaMemcpyHostToDevice, st), "slen");
 
+    if (!s.rope_ready) {
+        kernels::upload_rope_inv_freq(c.rope_theta, c.head_dim, st);
+        s.rope_ready = true;
+    }
+
     // Capture the decode compute into a CUDA graph on the first token, then
     // replay it every token (per-token inputs live in the d_tok/pos/seqlen/
     // writepos device buffers uploaded above, so replay produces fresh results).
@@ -182,12 +188,17 @@ int Qwen35Model::forward_token(int token_id, int position) {
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         if (s.gguf) {   // GGUF dense weights are native [out,in] -> coalesced GEMV
-            if (w.wq_type) kernels::launch_gemv_q(s.xn, w.wq, w.wq_type, s.q, s.qdim,  H, st);
-            else           kernels::launch_gemv(s.xn, w.wq, s.q, s.qdim,  H, st);
-            if (w.wk_type) kernels::launch_gemv_q(s.xn, w.wk, w.wk_type, s.k, s.kvdim, H, st);
-            else           kernels::launch_gemv(s.xn, w.wk, s.k, s.kvdim, H, st);
-            if (w.wv_type) kernels::launch_gemv_q(s.xn, w.wv, w.wv_type, s.v, s.kvdim, H, st);
-            else           kernels::launch_gemv(s.xn, w.wv, s.v, s.kvdim, H, st);
+            if (w.wq_type == 12 && w.wk_type == 12 && w.wv_type == 12) {
+                kernels::launch_gemv_q_qkv(s.xn, w.wq, w.wk, w.wv, s.q, s.k, s.v,
+                                           s.qdim, s.kvdim, s.kvdim, H, st);
+            } else {
+                if (w.wq_type) kernels::launch_gemv_q(s.xn, w.wq, w.wq_type, s.q, s.qdim,  H, st);
+                else           kernels::launch_gemv(s.xn, w.wq, s.q, s.qdim,  H, st);
+                if (w.wk_type) kernels::launch_gemv_q(s.xn, w.wk, w.wk_type, s.k, s.kvdim, H, st);
+                else           kernels::launch_gemv(s.xn, w.wk, s.k, s.kvdim, H, st);
+                if (w.wv_type) kernels::launch_gemv_q(s.xn, w.wv, w.wv_type, s.v, s.kvdim, H, st);
+                else           kernels::launch_gemv(s.xn, w.wv, s.v, s.kvdim, H, st);
+            }
         } else {
             kernels::launch_gemm(s.xn, w.wq, s.q, 1, s.qdim,  H, 1.f, 0.f, gc, st);
             kernels::launch_gemm(s.xn, w.wk, s.k, 1, s.kvdim, H, 1.f, 0.f, gc, st);
@@ -214,8 +225,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
 
         if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
             kernels::launch_gemv_f32(s.hn, w.router_w, s.mf_logits, c.n_experts, c.hidden, st);  // router_w native [E,H]
-            cu(cudaMemsetAsync(s.mf_counts, 0, c.n_experts * sizeof(int), st), "mf counts");
-            kernels::launch_moe_router(s.mf_logits, s.mf_ids, s.mf_weights, s.mf_counts,
+            kernels::launch_moe_router(s.mf_logits, s.mf_ids, s.mf_weights, nullptr,
                                        1, c.n_experts, c.top_k, 1, st);
             kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,

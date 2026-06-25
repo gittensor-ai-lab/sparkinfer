@@ -55,4 +55,11 @@ void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int 
 void launch_gemv_q_f32(const void* x, const void* W, int wtype, float* y, int N, int K,
                        cudaStream_t stream = nullptr);
 
+// Fused Q+K+V Q4_K MMVQ: one Q8_1 quant + one launch for all three projections.
+void launch_gemv_q_qkv(const void* x,
+                       const void* Wq, const void* Wk, const void* Wv,
+                       void* yq, void* yk, void* yv,
+                       int Nq, int Nk, int Nv, int K,
+                       cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

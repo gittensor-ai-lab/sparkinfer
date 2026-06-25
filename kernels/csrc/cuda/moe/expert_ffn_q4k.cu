@@ -24,7 +24,7 @@
 namespace sparkinfer {
 namespace kernels {
 
-static constexpr int WPB = 8;   // warps per block
+static constexpr int WPB = 20;   // warps per block (tuned for 5090 occupancy at bs=1)
 
 // Programmatic Dependent Launch (PDL): overlap a kernel's grid spin-up with its
 // predecessor's tail to hide bs=1 decode launch latency (the ncu-confirmed bottleneck).

@@ -15,7 +15,7 @@
 namespace sparkinfer {
 namespace kernels {
 
-static constexpr int GEMV_WPB = 8;   // warps (output rows) per block
+static constexpr int GEMV_WPB = 16;   // warps (output rows) per block — tuned for 5090 decode
 
 __device__ __forceinline__ void gemv_write(float* p, float v) { *p = v; }
 __device__ __forceinline__ void gemv_write(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
@@ -185,6 +185,86 @@ __global__ void gemv_q_dp4a_kernel(const __nv_bfloat16* __restrict__ x,
 template __global__ void gemv_q_dp4a_kernel<__nv_bfloat16>(const __nv_bfloat16*, const unsigned char*, __nv_bfloat16*, int, int);
 template __global__ void gemv_q_dp4a_kernel<float>(const __nv_bfloat16*, const unsigned char*, float*, int, int);
 
+// dp4a dot for one Q4_K output row against a Q8_1 activation already in smem.
+__device__ __forceinline__ float gemv_q4k_dp4a_row(
+    const signed char* s_xq8, const float* s_xd, const float* s_xs,
+    const unsigned char* Wrow, int K, int lane) {
+    const int nsb = K >> 5;
+    float acc = 0.f;
+    for (int sb = lane; sb < nsb; sb += 32) {
+        const int super = sb >> 3, sib = sb & 7;
+        const int* aint = reinterpret_cast<const int*>(s_xq8 + (sb << 5));
+        const float xd = s_xd[sb], xs = s_xs[sb];
+        const unsigned char* blk = Wrow + (size_t)super * 144;
+        float d = gq_h2f(blk), dmin = gq_h2f(blk + 2);
+        int scd, scm; gq_scale_min(sib, blk + 4, &scd, &scm);
+        const int* q = reinterpret_cast<const int*>(blk + 16 + (sib >> 1) * 32);
+        const bool hi = sib & 1;
+        int sumi = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int w = hi ? ((q[k] >> 4) & 0x0F0F0F0F) : (q[k] & 0x0F0F0F0F);
+            sumi = __dp4a(w, aint[k], sumi);
+        }
+        acc += d * (float)scd * xd * (float)sumi - dmin * (float)scm * xs;
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+    return acc;
+}
+
+// Fused Q+K+V MMVQ: quantize xn -> Q8_1 once per CTA, then emit up to WPB rows
+// from each of Q/K/V in the same block. Grid covers max(Nq,Nk,Nv) row-blocks so
+// K/V finish in the first few blocks while Q continues — 3x fewer activation
+// quants and 2 fewer kernel launches vs three separate gemv_q_dp4a calls.
+__global__ void gemv_q_qkv_dp4a_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const unsigned char* __restrict__ Wq, const unsigned char* __restrict__ Wk,
+    const unsigned char* __restrict__ Wv,
+    __nv_bfloat16* __restrict__ yq, __nv_bfloat16* __restrict__ yk, __nv_bfloat16* __restrict__ yv,
+    int Nq, int Nk, int Nv, int K) {
+    extern __shared__ char smemq[];
+    float* s_xd = reinterpret_cast<float*>(smemq);
+    float* s_xs = s_xd + (K >> 5);
+    signed char* s_xq8 = reinterpret_cast<signed char*>(s_xs + (K >> 5));
+    const int warpId = threadIdx.x >> 5, lane = threadIdx.x & 31, nsb = K >> 5;
+
+    for (int b = warpId; b < nsb; b += GEMV_WPB) {
+        float xv = __bfloat162float(x[b * 32 + lane]);
+        float a = fabsf(xv);
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+        float d = a / 127.0f;
+        int qi = (a == 0.0f) ? 0 : (int)roundf(xv / d);
+        s_xq8[b * 32 + lane] = (signed char)qi;
+        int sm = qi;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, m);
+        if (lane == 0) { s_xd[b] = d; s_xs[b] = d * (float)sm; }
+    }
+    __syncthreads();
+
+    const int row0 = blockIdx.x * GEMV_WPB;
+    const int n = row0 + warpId;
+    const int nsuper_bytes = (K >> 8) * 144;
+
+    if (n < Nq) {
+        const unsigned char* base = Wq + (size_t)n * nsuper_bytes;
+        float acc = gemv_q4k_dp4a_row(s_xq8, s_xd, s_xs, base, K, lane);
+        if (lane == 0) yq[n] = __float2bfloat16(acc);
+    }
+    if (n < Nk) {
+        const unsigned char* base = Wk + (size_t)n * nsuper_bytes;
+        float acc = gemv_q4k_dp4a_row(s_xq8, s_xd, s_xs, base, K, lane);
+        if (lane == 0) yk[n] = __float2bfloat16(acc);
+    }
+    if (n < Nv) {
+        const unsigned char* base = Wv + (size_t)n * nsuper_bytes;
+        float acc = gemv_q4k_dp4a_row(s_xq8, s_xd, s_xs, base, K, lane);
+        if (lane == 0) yv[n] = __float2bfloat16(acc);
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/gemm.h"
 #include <cstdlib>
@@ -234,6 +314,30 @@ void launch_gemv_q_f32(const void* x, const void* W, int wtype, float* y, int N,
         gemv_q_kernel<float><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(W), y, N, K, wtype);
     }
+}
+
+void launch_gemv_q_qkv(const void* x,
+                       const void* Wq, const void* Wk, const void* Wv,
+                       void* yq, void* yk, void* yv,
+                       int Nq, int Nk, int Nv, int K, cudaStream_t stream) {
+    if (!gemv_mmvq()) {
+        launch_gemv_q(x, Wq, 12, yq, Nq, K, stream);
+        launch_gemv_q(x, Wk, 12, yk, Nk, K, stream);
+        launch_gemv_q(x, Wv, 12, yv, Nv, K, stream);
+        return;
+    }
+    const int Nmax = Nq > Nk ? (Nq > Nv ? Nq : Nv) : (Nk > Nv ? Nk : Nv);
+    dim3 grid((Nmax + GEMV_WPB - 1) / GEMV_WPB);
+    size_t sm = 2 * (size_t)(K >> 5) * sizeof(float) + (size_t)K;
+    gemv_q_qkv_dp4a_kernel<<<grid, GEMV_WPB * 32, sm, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<const unsigned char*>(Wq),
+        reinterpret_cast<const unsigned char*>(Wk),
+        reinterpret_cast<const unsigned char*>(Wv),
+        reinterpret_cast<__nv_bfloat16*>(yq),
+        reinterpret_cast<__nv_bfloat16*>(yk),
+        reinterpret_cast<__nv_bfloat16*>(yv),
+        Nq, Nk, Nv, K);
 }
 #endif
 
