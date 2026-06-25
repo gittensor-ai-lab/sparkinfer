@@ -12,6 +12,7 @@
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
 #include <cstdlib>
+#include <cstdio>
 #endif
 
 namespace sparkinfer {
@@ -149,6 +150,10 @@ void launch_moe_router(
     int normalize, cudaStream_t stream
 ) {
     if (num_tokens <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts) return;
+    if (top_k > 16) {
+        fprintf(stderr, "[moe] router: top_k %d exceeds max supported 16\n", top_k);
+        return;
+    }
     size_t smem = (size_t)num_experts * sizeof(float);
     // Default ON: single-pass rank-select top-k (one thread/expert). SPARKINFER_ROUTER2=0
     // restores the k-pass single-warp kernel. Falls back automatically if num_experts > 1024.

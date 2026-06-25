@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <climits>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
@@ -116,7 +117,16 @@ bool GGUF::open(const std::string& path) {
         if (!c.ok || nd > 4) { fprintf(stderr, "[gguf] tensor %s has invalid n_dims=%u (max 4)\n", in.name.c_str(), nd); return false; }
         in.t.n_dims = nd;
         long nv = 1;
-        for (uint32_t d = 0; d < nd; d++) { long e = (long)c.rd<uint64_t>(); in.t.dims[d] = e; nv *= e; }
+        bool dims_ok = true;
+        for (uint32_t d = 0; d < nd; d++) {
+            long e = (long)c.rd<uint64_t>(); in.t.dims[d] = e;
+            if (e <= 0 || nv > LONG_MAX / e) dims_ok = false;
+            else nv *= e;
+        }
+        if (!c.ok || !dims_ok) {
+            fprintf(stderr, "[gguf] tensor %s has invalid dimensions\n", in.name.c_str());
+            return false;
+        }
         in.t.ggml_type = c.rd<uint32_t>();
         in.offset = c.rd<uint64_t>();
         in.t.n_values = nv;

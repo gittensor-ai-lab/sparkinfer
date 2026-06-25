@@ -66,6 +66,10 @@ bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
     if ((int)impl_->free_list.size() < need || impl_->free_slots.empty()) return false;
     if (need > kMaxBlocksPerSeq) return false;
 
+    auto existing = impl_->seq_blocks.find(seq_id);
+    const int have = (existing != impl_->seq_blocks.end()) ? (int)existing->second.size() : 0;
+    if (have + need > kMaxBlocksPerSeq) return false;
+
     auto& blocks = impl_->seq_blocks[seq_id];
     for (int i = 0; i < need; i++) { blocks.push_back(impl_->free_list.back()); impl_->free_list.pop_back(); }
 
