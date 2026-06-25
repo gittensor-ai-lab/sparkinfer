@@ -40,3 +40,7 @@ shadowing them to maximize merged-PR count rather than contributing distinct wor
 **Action:** both accounts added to `blocked-contributors.txt`. Open PRs labeled
 `flagged:gaming` and closed. Future PRs from either account are auto-flagged, closed,
 and not evaluated by the bot. Merged PR #11's emission cannot be reversed; logged here.
+
+## 2026-06-25 — `kiannidev` (auto-blocked)
+
+Auto-blocked after 2 copycat PRs (#54, #57).

@@ -19,5 +19,11 @@
     "original": 53,
     "date": "2026-06-25",
     "note": "maintainer-flagged: same default split-K + PDL decode change as #53 (eval:none); below auto containment threshold but a duplicate attempt"
+  },
+  {
+    "pr": 57,
+    "author": "kiannidev",
+    "original": 56,
+    "date": "2026-06-25"
   }
 ]
