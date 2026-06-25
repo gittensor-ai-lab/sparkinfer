@@ -267,7 +267,16 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         return out;
     }
     int next = -1;
-    for (size_t i = 0; i < prompt.size(); i++) next = forward_token(prompt[i], (int)i);
+    for (size_t i = 0; i < prompt.size(); i++) {
+        const int t = prompt[i];
+        if (t < 0 || t >= s.cfg.vocab) {
+            fprintf(stderr, "[qwen35] prompt token %d at index %zu out of range [0,%d)\n",
+                    t, i, s.cfg.vocab);
+            s.kv->free(s.seq_id);
+            return out;
+        }
+        next = forward_token(t, (int)i);
+    }
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);
         if (next == s.cfg.eos_id) break;

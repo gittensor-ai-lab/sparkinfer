@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
+#include <cstdio>
 #endif
 
 namespace sparkinfer {
@@ -94,6 +95,10 @@ void launch_moe_router(
     int normalize, cudaStream_t stream
 ) {
     if (num_tokens <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts) return;
+    if (top_k > 16) {
+        fprintf(stderr, "[moe] router: top_k %d exceeds max supported 16\n", top_k);
+        return;
+    }
     size_t smem = (size_t)num_experts * sizeof(float);
     moe_router_kernel<<<num_tokens, 32, smem, stream>>>(
         logits, expert_ids, expert_weights, tokens_per_expert,
