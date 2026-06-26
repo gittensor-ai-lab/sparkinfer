@@ -73,7 +73,13 @@ struct Qwen35Model::Impl {
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
     int   *mf_ids = nullptr, *mf_counts = nullptr;
     // flash-decoding (KV-split) attention partials
-    int n_splits = 16;
+    // Default tuned for the decode regime: short context. 16 splits over a short KV
+    // (32 q_heads * 16 = 512 single-warp blocks) over-subscribes the GPU and pays a
+    // 16-way combine for only a few KV entries per split. 8 splits (256 blocks) still
+    // exceeds the SM count on Blackwell (full occupancy) while halving the combine and
+    // launch overhead. Math is identical for any value (empty splits contribute zero);
+    // SPARKINFER_NSPLITS still overrides for long-context sweeps.
+    int n_splits = 8;
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
