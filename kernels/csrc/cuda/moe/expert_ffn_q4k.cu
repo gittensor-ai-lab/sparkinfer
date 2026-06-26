@@ -376,6 +376,47 @@ __global__ void down_q6k_mmvq_kernel(
     if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
 }
 
+// split-K dp4a down: NW warps cooperate per output row over the top_k experts. The #65
+// 1-warp version is grid-limited to H/WPB=256 blocks (~25% occ) and — now that dp4a made
+// the math nearly free (ALU ~9%) — latency-bound. NW warps -> NW x more blocks fills the
+// register-limited slots (~25%->~80% occ) to hide the Q6_K weight-load latency.
+template <int NW>
+__global__ void down_q6k_mmvq_sk_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k
+) {
+    const int token = blockIdx.x;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int grp = warp / NW, sub = warp % NW;
+    const int hh = blockIdx.y * (WPB / NW) + grp;
+    if (hh >= H) return;
+    const int nblk = F >> 8, q8pb = F >> 5;
+    float acc = 0.f;
+    for (int j = sub; j < top_k; j += NW) {                 // this warp's slice of the experts
+        const int ts = token * top_k + j;
+        const int e = expert_ids[ts];
+        const float w = expert_weights[ts];
+        const unsigned char* drow = down_q + ((size_t)e * H + hh) * nblk * 210;
+        const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+        float t = 0.f;
+        for (int kbx = 0; kbx < nblk; kbx++)
+            t += si_vec_dot_q6_K(drow + (size_t)kbx * 210, h8 + (size_t)kbx * 8, lane);
+        acc += w * t;
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    __shared__ float s[WPB];
+    if (lane == 0) s[warp] = acc;
+    __syncthreads();
+    if (sub == 0 && lane == 0) {                            // one warp/row sums the NW partials
+        float sum = 0.f;
+        #pragma unroll
+        for (int k = 0; k < NW; k++) sum += s[grp * NW + k];
+        output[(size_t)token * H + hh] = __float2bfloat16(sum);
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
@@ -423,6 +464,19 @@ void launch_moe_expert_ffn_q4k(
         const int qthreads = 256;
         quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
             h_scratch, hq8, nqb);
+        static int dsk = -1;   // default ON: split-K hides the dp4a down's load latency (+3.4%)
+        if (dsk < 0) { const char* d = getenv("SPARKINFER_DOWNSK"); dsk = (d && d[0] == '0') ? 0 : 1; }
+        if (dsk) {                          // split-K: NW warps/row -> NW x blocks -> hide latency
+            static int nw = -1;
+            if (nw < 0) { const char* e = getenv("SPARKINFER_DOWNNW"); nw = e ? atoi(e) : 4; }
+            #define SI_DOWNSK(NW) do { dim3 dnm(num_tokens, (hidden + (WPB/(NW)) - 1) / (WPB/(NW))); \
+                down_q6k_mmvq_sk_kernel<(NW)><<<dnm, WPB * 32, 0, stream>>>( \
+                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8, \
+                    reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k); } while (0)
+            if (nw == 2) SI_DOWNSK(2); else if (nw == 8) SI_DOWNSK(8); else SI_DOWNSK(4);
+            #undef SI_DOWNSK
+            return;
+        }
         dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
         down_q6k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
             reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
