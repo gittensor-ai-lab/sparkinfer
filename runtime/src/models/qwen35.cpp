@@ -73,7 +73,7 @@ struct Qwen35Model::Impl {
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
     int   *mf_ids = nullptr, *mf_counts = nullptr;
     // flash-decoding (KV-split) attention partials
-    int n_splits = 16;
+    int n_splits = 32;
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
     signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
