@@ -4,7 +4,7 @@
 
 ## Proven
 
-Qwen3-30B-A3B (Q4_K_M GGUF) runs end-to-end on an RTX PRO 6000 (sm_120), decode optimized **0.60 → 134 tok/s (≈220×)** across 6 source-verifiable passes, output verified correct, **21.7 GB** resident (experts kept quantized). Independently verified on an **RTX 5090** (CUDA 13): **100% top-1 token agreement** with llama.cpp (KL ≈ 0.14 nats), **163.88 tok/s** — see the [accuracy](bench/results/accuracy_qwen3-30b-a3b_q4km.md) and [RTX 5090](bench/results/qwen3-30b-a3b_q4km_rtx5090.md) results.
+Qwen3-30B-A3B (Q4_K_M GGUF) runs end-to-end on an RTX PRO 6000 (sm_120), decode optimized **0.60 → 134 tok/s (≈220×)** across 6 source-verifiable passes, output verified correct, **21.7 GB** resident (experts kept quantized). Independently verified on an **RTX 5090** (CUDA 13): community optimizations have ratcheted the decode frontier to **285.32 tok/s** (≈0.78× llama.cpp) at **≥96% top-1 token agreement** with llama.cpp (KL ≈ 0.14 nats) — see the live [dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/), [accuracy](bench/results/accuracy_qwen3-30b-a3b_q4km.md), and [RTX 5090](bench/results/qwen3-30b-a3b_q4km_rtx5090.md) results.
 
 ## Why a custom engine
 
@@ -82,7 +82,7 @@ llama.cpp), benchmarks **decode speed**, and posts a comment with an **`eval:<la
 
 | label | meaning |
 |---|---|
-| `XL · L · M · S · XS` | verified speedup over the live frontier (by fraction of headroom closed) |
+| `XL · L · M · S · XS` | verified speedup over the live frontier, by **% gain** (`XS` 2–3.5% … `XL` >18%) |
 | `none` | correct, but no verified improvement (within the significance gate) |
 | `REJECT` | failed the correctness gate — the output changed |
 | `BASELINE` | first verified entry; establishes the frontier |

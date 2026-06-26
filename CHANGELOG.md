@@ -3,6 +3,62 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.2.2] — 2026-06-26
+
+A day of rapid frontier progress (**+52% decode**), a copycat caught gaming the eval, and a
+hardened auto-eval pipeline that now runs reliably on a 30-minute schedule.
+
+### Performance — RTX 5090 frontier 187.61 → 285.32 tok/s (+52%) in a day
+Five verified speedups landed since v0.2.0, each paid only for its **marginal gain over the
+previous frontier** (correctness-gated, top-1 ≥ 96% vs llama.cpp throughout):
+
+| PR | optimization | → frontier | label |
+|----|--------------|-----------:|:-----:|
+| #44 | vectorized fused RMSNorm (128-bit bf16×8 loads) | 197.22 | `M` |
+| #50 | decode dp4a (MMVQ) default + argmax widen | 240.11 | `XL` |
+| #52 | two-pass multi-block decode argmax (1 SM → all SMs) | 262.17 | `L` |
+| #59 | llama.cpp Q4_K `mul_mat_vec_q` for attention GEMVs | 279.11 | `L` |
+| #63 | parallelized flash-decode combine + `n_splits=32` | 285.32 | `M` |
+
+The llama.cpp gap closed to **0.78×** (285.32 vs 365.73 tok/s).
+
+### Security (anti-gaming)
+- **Copycat-to-bypass capture + 5-day penalty.** Caught a PR that re-submitted an earlier
+  author's diff with a few extra lines bolted on to look original and slip past the eval — the
+  diff-containment fingerprint flags these even with cosmetic additions. A first copycat strike
+  now **freezes the author's evaluations for 5 days** (`penalty` label, skipped; already-scored
+  PRs keep their result); a **2nd strike auto-blocks**. Logged in `.github/copycats.json` /
+  `COPYCATS.md`.
+- **No manual eval override.** Removed the `force-eval` bypass entirely — every PR is evaluated
+  on a real RTX 5090 **only** after it legitimately passes the gate (box ticked **and** a real
+  before<after decode table). Nothing skips the benchmark.
+
+### Fixed — stabilized 30-minute auto-evaluation
+- **Google Drive model source.** HuggingFace was throttling the 18.6 GB GGUF to ~0.2–5 KB/s on
+  many vast.ai hosts (effectively stalled). The eval now fetches it from Google Drive via `gdown`
+  (measured **20–74 MB/s**), with HF/curl as fallback — the model lands in minutes, not never.
+- **Pinned stable instance (reuse-first, never destroy).** The eval reuses one known-good box
+  with the cached model by default instead of provisioning fresh each run. On bring-up failure it
+  retries on the next run (~30 min) up to twice before provisioning a new box — and **never
+  destroys the pinned one**. Eliminates the re-download / re-provision churn between runs.
+- **Dud-host skip-list + cron lock.** Blacklist hosts whose entire network is dead (not just HF);
+  a `flock` lock prevents overlapping cron ticks. Together these make the 30-minute auto-eval reliable.
+- **Dashboard.** Optimization-journey x-axis labels rotated 45° so the (now 12) bars no longer collide.
+
+### Changed
+- **Label tiers are now bands of % speedup over the frontier** (`XS` 2–3.5%, `S` 3.5–6%, `M` 6–10%,
+  `L` 10–18%, `XL` >18%; <2% is within noise → `none`) — same denominator as the significance gate.
+  The previous *fraction-of-headroom* rule collapsed `XS`/`S` once the frontier neared the ceiling
+  (the 2% noise floor alone exceeded their headroom bands); the new bands keep all five tiers
+  reachable and scale with decode speed.
+
+### Verified
+- **RTX 5090** frontier **285.32 tok/s**, top-1 0.96 vs llama.cpp (KL ≈ 0.14 nats), 21.4 GB resident.
+
+### Contributors
+- **@James-CUDA** — #50 (`XL`), #59 (`L`), #63 (`M`)
+- **@kiannidev** — #44 (`M`), #52 (`L`)
+
 ## [0.2.0] — 2026-06-25
 
 Evaluation-pipeline hardening, anti-gaming controls, and the live frontier dashboard.

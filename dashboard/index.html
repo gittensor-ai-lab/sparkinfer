@@ -238,21 +238,21 @@
     const live = (D.landed||[]).map(l=>({name:l.name, sub:"PR #"+l.pr+" · "+l.date, tps:l.tps, live:true}));
     const pts = hist.concat(live);
     $("passes-hint").textContent = `${pts[0].tps} → ${s.frontier_tps} tok/s · history + live`;
-    const W=760,H=300,padL=12,padR=12,padT=30,padB=54, cw=W-padL-padR, ch=H-padT-padB;
+    const W=760,H=336,padL=12,padR=12,padT=30,padB=106, cw=W-padL-padR, ch=H-padT-padB;
     const maxT=Math.max(...pts.map(p=>p.tps)), slot=cw/pts.length, bw=Math.min(slot*0.56,60);
     const esc=t=>String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-    const trunc=t=> t.length>14 ? t.slice(0,13)+"…" : t;
+    const trunc=t=> t.length>20 ? t.slice(0,19)+"…" : t;
     const bars=pts.map((p,i)=>{
       const cx=padL+slot*i+slot/2, bh=Math.max(2,p.tps/maxT*ch), y=padT+ch-bh;
       const fill=p.live?"url(#gLive)":"url(#gHist)";
       return `<g><title>${esc(p.name)} — ${esc(p.sub)} · ${p.tps} tok/s</title>`+
         `<rect x="${(cx-bw/2).toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="4" fill="${fill}"/>`+
         `<text x="${cx.toFixed(1)}" y="${(y-7).toFixed(1)}" text-anchor="middle" font-size="12" font-weight="700" fill="#06050B">${p.tps}</text>`+
-        `<text x="${cx.toFixed(1)}" y="${(padT+ch+17).toFixed(1)}" text-anchor="middle" font-size="10.5" fill="#5b5b66">${esc(trunc(p.name))}</text></g>`;
+        `<text x="${cx.toFixed(1)}" y="${(padT+ch+14).toFixed(1)}" text-anchor="end" transform="rotate(-45 ${cx.toFixed(1)} ${(padT+ch+14).toFixed(1)})" font-size="10.5" fill="#5b5b66">${esc(trunc(p.name))}</text></g>`;
     }).join("");
     const axis=`<line x1="${padL}" y1="${padT+ch}" x2="${W-padR}" y2="${padT+ch}" stroke="#E7E7EE"/>`;
     $("passes").innerHTML =
-      `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;font-family:Sora,sans-serif" role="img" aria-label="Optimization journey chart">`+
+      `<svg viewBox="-44 0 ${W+44} ${H}" style="width:100%;height:auto;display:block;font-family:Sora,sans-serif" role="img" aria-label="Optimization journey chart">`+
         `<defs>`+
           `<linearGradient id="gHist" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7B5DFF"/><stop offset="1" stop-color="#a78bff"/></linearGradient>`+
           `<linearGradient id="gLive" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0E8A16"/><stop offset="1" stop-color="#5DA271"/></linearGradient>`+

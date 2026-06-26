@@ -35,33 +35,67 @@ bench/scripts/accuracy.sh --download
 - **mean KL ≈ 0** (the next-token distributions barely move).
 
 (`accuracy.sh` also compares against llama.cpp; the implementation bar there is ≥ 90%
-top-1, which we currently meet at 100%.) If `compute-sanitizer` is available, your kernels
+top-1, currently met at ~96–99%.) If `compute-sanitizer` is available, your kernels
 must be clean (0 errors).
 
 ## How rewards work (SN74)
 
 **Speedup-only.** You're paid for the **verified marginal speedup** your PR adds over the
-current best ("frontier"), not your rank — so "copy the leader + ε" pays ≈ ε. The eval loop
+current best ("frontier"), not your rank — so "copy the leader + ε" pays ≈ ε. Both **current
+`main` and your PR are built and benchmarked on the same RTX 5090** in one run and scored on the
+delta between them, so speed differences between eval machines can't inflate or hide your result.
+
+**Competing PRs (per-round merge workflow).** A run grades every queued PR against the *same*
+`main`, so two independent optimizations each get their true gain. The bot then labels the round's
+biggest one [`merge-first`](../../labels/merge-first) and the rest
+[`needs-rebase`](../../labels/needs-rebase). The `merge-first` winner is **auto-merged** once it
+clears every guard — verified speedup, clean CI, no conflicts, author in good standing, and it
+touches only `kernels`/`runtime`/`moe` (never the maintainer-owned paths); a maintainer can stop
+that with a `hold` label. Once the `merge-first` PR is merged, the others are
+flagged [`re-evaluate`](../../labels/re-evaluate) — **rebase onto the new `main`** and the bot
+re-runs your eval against the new frontier, so you're credited for the **marginal** gain on top of
+what merged (independent wins stack and keep scoring; a change the merge already captured drops to
+`none`). Keep your branch rebased on `main`. The eval loop
 labels each PR **XL / L / M / S / XS** from the measured delta (or **BASELINE** for the first
 verified entry on a new model/target) — never by hand — and that tier is the payout. A speedup
 is scored the same wherever it lands (`kernels/`, `runtime/`, `moe/`); there is **no
-per-subsystem budget**. Tiers are maturity-adaptive (they rebalance toward smaller gains as the
-runtime nears the hardware ceiling). See the [org reward model](https://github.com/gittensor-ai-lab).
+per-subsystem budget**. Tiers are bands of **% speedup over the frontier** — `XS` 2–3.5%, `S`
+3.5–6%, `M` 6–10%, `L` 10–18%, `XL` >18% (a gain under 2% is within measurement noise → `none`).
+Because they scale with the frontier, every tier stays reachable as decode speed grows. See the
+[org reward model](https://github.com/gittensor-ai-lab).
 
 **Non-speedup PRs are welcome — but score 0.** Bug fixes, refactors, tests, benchmarks, docs,
 and tooling are appreciated and we'll review and merge good ones, but SN74 emits only for
 verified speedups, so they earn no reward. (The eval/scoring harness is maintainer-owned — see
 *Maintainer-owned paths* below.)
 
-**Evaluation is opt-in — check the box.** The RTX 5090 eval runs only once the
-**`- [x] Tested on RTX 5090`** box in the PR template is ticked. When it is, the bot greenlights
-the PR (adds **`test-on-5090`**) and evaluates it on the next poll; until then it marks the PR
-**`not-tested`** and does not evaluate. So fill in the template and tick the box when your PR is
-ready to be measured. (A maintainer can also add the `test-on-5090` label manually.)
+**Evaluation is opt-in and proof-gated.** The RTX 5090 eval runs only when **both** hold: you tick
+**`- [x] Tested on RTX 5090`** *and* fill the template's **decode tok/s** table with a real
+end-to-end improvement (`after > before`, from `bench/scripts/bench.sh` — not an isolated-kernel
+microbenchmark). Then the bot greenlights it (**`test-on-5090`**) and evaluates on the next poll.
+- Box ticked but the decode table empty / placeholder / no gain → **`needs-benchmark`**, not evaluated
+  (fill in real numbers and it greenlights automatically).
+- Box not ticked → **`not-tested`**, not evaluated.
+There is **no override** — every PR is evaluated on a real RTX 5090 only after it legitimately
+passes the gate (box ticked + real before<after decode numbers).
 
 > ⚠️ Tick that box **only if you actually ran it on an RTX 5090** and pasted the benchmark log.
 > Checking it without testing is false attestation — it is treated as gaming and the account will
-> be **blocked** (added to the denylist), the same as copycatting or sybil farming.
+> be **blocked** (added to the denylist), the same as sybil farming.
+
+### Anti-gaming (how submissions are kept honest)
+
+The bot evaluates PRs **oldest-first** and fingerprints each diff, so gaming is caught automatically:
+
+- **Copycatting.** Re-submitting an earlier PR's diff — *even with a few extra lines bolted on to
+  look original or slip past the evaluator* — is flagged by diff-containment fingerprint. A first
+  copycat strike **freezes all your evaluations for 5 days** (`penalty` label, skipped; PRs already
+  scored keep their result); a **second strike blocks** the account. Logged in
+  [`.github/copycats.json`](.github/copycats.json) / [`COPYCATS.md`](.github/COPYCATS.md).
+- **Sybil / duplicate-account farming** (one operator pushing under multiple GitHub identities, or
+  shadowing others' work) is blocked outright; evidence is recorded in [`.github/FLAGGED.md`](.github/FLAGGED.md).
+- **No override.** There is no way to force-evaluate around the gate — not even for a maintainer.
+  Real, original, frontier-advancing work is the only thing that scores.
 
 ## Maintainer-owned paths (eval, scoring & governance)
 

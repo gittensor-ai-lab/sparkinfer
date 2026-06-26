@@ -1,14 +1,14 @@
 {
-  "updated": "2026-06-25",
+  "updated": "2026-06-26",
   "status": {
     "gpu": "RTX 5090 · sm_120 · CUDA 13",
     "model": "Qwen3-30B-A3B · Q4_K_M",
-    "frontier_tps": 187.61,
+    "frontier_tps": 291.58,
     "ref_name": "llama.cpp",
     "ref_tps": 365.73,
     "vram_gb": 21.4,
-    "token_match": 0.98,
-    "kl": 0.1434
+    "token_match": 0.99,
+    "kl": 0.1455
   },
   "passes_gpu": "RTX PRO 6000",
   "passes": [
@@ -46,32 +46,32 @@
   "labels": [
     {
       "l": "XL",
-      "d": "> 25% of remaining headroom",
+      "d": "> 18% over frontier",
       "c": "#0E8A16"
     },
     {
       "l": "L",
-      "d": "10–25%",
+      "d": "10–18% over frontier",
       "c": "#1D76DB"
     },
     {
       "l": "M",
-      "d": "3–10%",
+      "d": "6–10% over frontier",
       "c": "#8250DF"
     },
     {
       "l": "S",
-      "d": "1–3%",
+      "d": "3.5–6% over frontier",
       "c": "#B8860B"
     },
     {
       "l": "XS",
-      "d": "< 1%",
+      "d": "2–3.5% over frontier",
       "c": "#8A93A0"
     },
     {
       "l": "none",
-      "d": "within noise — no verified gain",
+      "d": "≤ 2% — within noise, no verified gain",
       "c": "#9AA6B2"
     },
     {
@@ -81,6 +81,188 @@
     }
   ],
   "prs": [
+    {
+      "num": 70,
+      "title": "int8 mmvq for the last fp32-path GEMVs: attn-V + LM head (Q6_K) + gate/up (Q4_K) (+4.3%)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 313.14,
+      "delta_pct": 5.3,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/70"
+    },
+    {
+      "num": 67,
+      "title": "perf(moe): mmvq down split-K occupancy for M-tier decode",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 309.34,
+      "delta_pct": 4.0,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/67"
+    },
+    {
+      "num": 69,
+      "title": "Split-K the int8 dp4a MoE down GEMV (+3.4% decode)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "none",
+      "tps": 293.62,
+      "delta_pct": 0.7,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/69"
+    },
+    {
+      "num": 65,
+      "title": "perf(moe): int8 dp4a MMVQ for the Q6_K MoE down (+4% decode)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "XS",
+      "tps": 291.58,
+      "delta_pct": 2.2,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/65"
+    },
+    {
+      "num": 64,
+      "title": "perf(moe): __ldg quantized weight reads in expert FFN decode (+1.3%)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "none",
+      "tps": 289.55,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/64"
+    },
+    {
+      "num": 63,
+      "title": "Parallelize flash-decode combine + n_splits=32 (+2.7% decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "M",
+      "tps": 285.32,
+      "delta_pct": 2.2,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/63"
+    },
+    {
+      "num": 60,
+      "title": "perf(runtime): keep lm_head native-quantized, decode on-read (cut the largest decode read)",
+      "areas": [
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 256.7,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/60"
+    },
+    {
+      "num": 59,
+      "title": "Adopt llama.cpp Q4_K mul_mat_vec_q for attention GEMVs (+9.3% decode, top-1 0.99)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "L",
+      "tps": 279.11,
+      "delta_pct": 6.5,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/59"
+    },
+    {
+      "num": 58,
+      "title": "perf(attention): flash_decode_split ldg + n_splits=16 combine fast path",
+      "areas": [
+        "kernels"
+      ],
+      "label": "none",
+      "tps": 258.53,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/58"
+    },
+    {
+      "num": 53,
+      "title": "Enable split-K down projection by default (+6% decode)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "none",
+      "tps": 260.69,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/53"
+    },
+    {
+      "num": 52,
+      "title": "perf(kernels): two-pass multi-block decode argmax (1 SM -> all SMs)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "L",
+      "tps": 262.17,
+      "delta_pct": 9.2,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/52"
+    },
+    {
+      "num": 50,
+      "title": "Decode dp4a (MMVQ) default + argmax widen: 180.4 → 235.4 tok/s (+30.5%) on RTX 5090",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "XL",
+      "tps": 240.11,
+      "delta_pct": 21.7,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/50"
+    },
+    {
+      "num": 48,
+      "title": "perf(kernels): multi-token register tiling in flash_decode_split (hd=128)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "none",
+      "tps": 185.28,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/48"
+    },
+    {
+      "num": 45,
+      "title": "perf(kernels): CUDA-graph-safe RoPE __constant__ inv_freq table",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 183.4,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/45"
+    },
+    {
+      "num": 44,
+      "title": "perf(kernels): vectorize fused RMSNorm with 128-bit bf16x8 loads",
+      "areas": [
+        "kernels"
+      ],
+      "label": "M",
+      "tps": 197.22,
+      "delta_pct": 5.1,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/44"
+    },
+    {
+      "num": 43,
+      "title": "perf(kernels): vectorized K/V loads in flash_decode_split (hd=128)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "none",
+      "tps": 187.96,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/43"
+    },
     {
       "num": 9,
       "title": "fix(runtime/gguf): reject malformed metadata arrays instead of desyncing the parse cursor",
@@ -287,6 +469,42 @@
       "tps": 187.61,
       "pr": 8,
       "date": "2026-06-24"
+    },
+    {
+      "name": "vectorize fused RMSNorm with",
+      "tps": 197.22,
+      "pr": 44,
+      "date": "2026-06-25"
+    },
+    {
+      "name": "Decode dp4a (MMVQ) default +",
+      "tps": 240.11,
+      "pr": 50,
+      "date": "2026-06-25"
+    },
+    {
+      "name": "two-pass multi-block decode ",
+      "tps": 262.17,
+      "pr": 52,
+      "date": "2026-06-25"
+    },
+    {
+      "name": "Adopt llama.cpp Q4_K mul_mat",
+      "tps": 279.11,
+      "pr": 59,
+      "date": "2026-06-26"
+    },
+    {
+      "name": "Parallelize flash-decode com",
+      "tps": 285.32,
+      "pr": 63,
+      "date": "2026-06-26"
+    },
+    {
+      "name": "int8 dp4a MMVQ for the Q6_K ",
+      "tps": 291.58,
+      "pr": 65,
+      "date": "2026-06-26"
     }
   ]
 }

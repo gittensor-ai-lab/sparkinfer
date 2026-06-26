@@ -58,12 +58,12 @@ python eval/pr_eval_bot.py --instance 42134865 --frontier 164 --ceiling 366   # 
 python eval/pr_eval_bot.py --instance 42134865 --dry-run                       # eval but don't post
 ```
 
-**Schedule it every 30 minutes** (the wrapper gives cron a sane env + refreshes the evaluator):
+**Schedule it every 2 hours** (the wrapper gives cron a sane env + refreshes the evaluator):
 ```bash
-crontab -l 2>/dev/null; echo "*/30 * * * * $PWD/eval/run_bot_cron.sh >> /tmp/sparkinfer_bot.log 2>&1" | crontab -
+crontab -l 2>/dev/null; echo "0 */2 * * * $PWD/eval/run_bot_cron.sh >> /tmp/sparkinfer_bot.log 2>&1" | crontab -
 ```
-Each run: start the (stopped) instance → evaluate new PR commits → **stop it again** → label +
-comment. Disable with `crontab -e`. Needs `gh` authenticated and the vast key saved (`vastai set api-key`).
+Each run: reuse the pinned instance if it survived, else provision fresh (Google Drive model) →
+evaluate new PR commits → **stop it again** → label + comment. Disable with `crontab -e`. Needs `gh` authenticated and the vast key saved (`vastai set api-key`).
 
 (For a Claude-agent flavor instead of system cron — e.g. to add LLM anti-gaming triage of the diff
 before labeling — schedule a recurring agent that shells out to `pr_eval_bot.py`; the numeric label
