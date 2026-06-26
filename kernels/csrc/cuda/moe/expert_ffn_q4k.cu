@@ -455,6 +455,43 @@ __global__ void gate_up_mmvq2_kernel(
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
 }
 
+// int8 dp4a MMVQ down (Q4_K). The Q4_K-quantized down rows in Q4_K_M were the last MoE GEMV
+// still on the fp register-dequant path (Q6_K down + gate/up + attention already run int8).
+// Reuses the Q8_1-quantized activation and the faithful vec_dot_q4_K_q8_1, one warp per
+// (token,hh) folding the top_k experts. Each 256-superblock has 16 vdr=2 positions; the warp
+// strides those (nblk*16 items) so the dp4a math matches the gate/up path exactly.
+__global__ void down_q4k_mmvq_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k
+) {
+    const int token = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int hh = blockIdx.y * WPB + (threadIdx.x >> 5);
+    if (hh >= H) return;
+    const int nblk = F >> 8;        // 256-superblocks per row
+    const int q8pb = F >> 5;        // Q8_1 blocks per expert activation row
+    const int work = nblk * 16;     // vdr=2 positions per superblock
+    float acc = 0.f;
+    for (int j = 0; j < top_k; j++) {
+        const int ts = token * top_k + j;
+        const int e = expert_ids[ts];
+        const float w = expert_weights[ts];
+        const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
+            down_q + ((size_t)e * H + hh) * nblk * 144);
+        const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+        float t = 0.f;
+        for (int wi = lane; wi < work; wi += 32) {
+            const int kbx = wi >> 4, kqs = (wi & 15) << 1;
+            t += si_vec_dot_q4_K(drow + kbx, h8 + (size_t)kbx * 8, kqs);
+        }
+        acc += w * t;
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
@@ -514,6 +551,23 @@ void launch_moe_expert_ffn_q4k(
             h_scratch, hq8, nqb);
         dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
         down_q6k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
+            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+        return;
+    }
+
+    // int8 dp4a MMVQ down (Q4_K) — default ON; SPARKINFER_DOWN_Q4K=0 restores the fp dequant
+    // down for the Q4_K rows. Same quantize-once + faithful vec_dot path as the Q6_K down.
+    static int down_q4k = -1;
+    if (down_q4k < 0) { const char* qv = getenv("SPARKINFER_DOWN_Q4K"); down_q4k = (qv && qv[0] == '0') ? 0 : 1; }
+    if (down_mmvq && down_q4k && down_type == 12) {   // 12 = ggml Q4_K
+        si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);
+        const int nqb = num_tokens * top_k * (ffn >> 5);
+        const int qthreads = 256;
+        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
+            h_scratch, hq8, nqb);
+        dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
+        down_q4k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
             reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
             reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
         return;
