@@ -376,6 +376,50 @@ __global__ void down_q6k_mmvq_kernel(
     if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
 }
 
+// split-K int8 MMVQ down (Q6_K) — composes the two proven decode levers that did not
+// previously compose: the int8 dp4a MMVQ math (down_q6k_mmvq_kernel) and the split-K
+// occupancy fix (down_q6k_splitk_kernel, which only existed on the fp register-dequant
+// path). The plain MMVQ down is one warp per output row -> only H warps in flight at
+// bs=1; here S warps cooperate per row (each strides a slice of the top_k*nblk work),
+// putting S*H warps in flight on the occupancy-bound decode. Accuracy-safe: identical
+// dp4a integer math and per-lane partials, only the cross-split reduction order changes
+// (an fp add reassociation that leaves top-1 unchanged and KL within the gate).
+__global__ void down_q6k_mmvq_splitk_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k
+) {
+    constexpr int S = 4, RPB = WPB / S;     // splits per row, rows per block
+    __shared__ float s_part[RPB][S];
+    const int token = blockIdx.x, lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    const int nblk = F >> 8;        // 256-superblocks per row
+    const int q8pb = F >> 5;        // Q8_1 blocks per expert activation row
+    float acc = 0.f;
+    if (hh < H) {
+        const int total = top_k * nblk;
+        for (int wi = split; wi < total; wi += S) {
+            const int j = wi / nblk, kbx = wi % nblk;
+            const int ts = token * top_k + j, e = expert_ids[ts];
+            const float w = expert_weights[ts];
+            const unsigned char* drow = down_q + ((size_t)e * H + hh) * nblk * 210;
+            const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+            acc += w * si_vec_dot_q6_K(drow + (size_t)kbx * 210, h8 + (size_t)kbx * 8, lane);
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (lane == 0) s_part[hh_local][split] = acc;
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[hh_local][s];
+        output[(size_t)token * H + hh] = __float2bfloat16(o);
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
@@ -417,16 +461,29 @@ void launch_moe_expert_ffn_q4k(
     // it, faithful to llama.cpp vec_dot_q6_K_q8_1.
     static int down_mmvq = -1;
     if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_DOWN_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
+    // split-K on the MMVQ down: S=4 warps per output row -> 4x warps in flight on the
+    // occupancy-bound bs=1 down (the same lever as the fp split-K, now on the int8 path).
+    // Default ON; SPARKINFER_DOWN_SPLITK=0 falls back to the one-warp-per-row MMVQ down.
+    static int down_splitk = -1;
+    if (down_splitk < 0) { const char* dsv = getenv("SPARKINFER_DOWN_SPLITK"); down_splitk = (dsv && dsv[0] == '0') ? 0 : 1; }
     if (down_mmvq && down_type == 14) {   // 14 = ggml Q6_K
         si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);   // <= hidden floats; fits
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
             h_scratch, hq8, nqb);
-        dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
-        down_q6k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
-            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
-            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+        if (down_splitk) {
+            const int RPB = WPB / 4;
+            dim3 dnm(num_tokens, (hidden + RPB - 1) / RPB);
+            down_q6k_mmvq_splitk_kernel<<<dnm, WPB * 32, 0, stream>>>(
+                reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+        } else {
+            dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
+            down_q6k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
+                reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+        }
         return;
     }
 
