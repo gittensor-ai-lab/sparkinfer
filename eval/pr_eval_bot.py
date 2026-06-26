@@ -367,15 +367,17 @@ def record_merge(repo, num):
     if any(m.get("pr") == num for m in data.get("landed", [])): return       # already recorded
     e = next((p for p in data.get("prs", []) if p.get("num") == num), None)
     if not e or e.get("label") not in SPEEDUP_LABELS: return                 # only verified speedups
-    old_f = data["status"].get("frontier_tps") or 0
-    gain = (e.get("delta_pct") or 0) / 100.0
-    new_f = round(old_f * (1 + gain), 2) if old_f else round(e.get("tps") or 0, 2)
+    # The journey is in measured tok/s (each step is the merged PR's actual decode rate). Use the
+    # PR's measured tps; max() keeps the headline monotonic if a box happened to be slower. (Scoring
+    # is still hardware-independent — it's the same-box delta — this is just the achieved-number display.)
+    raw = round(e.get("tps") or 0, 2)
+    new_f = max(round(data["status"].get("frontier_tps") or 0, 2), raw)
     data["status"]["frontier_tps"] = new_f
     if e.get("top1") is not None: data["status"]["token_match"] = round(e["top1"], 4)
     if e.get("kl") is not None:   data["status"]["kl"] = round(e["kl"], 4)
     short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]      # strip "area(x): " prefix
     landed = [m for m in data.get("landed", []) if m.get("pr") != num]
-    landed.append({"name": short or f"PR #{num}", "tps": new_f, "pr": num,
+    landed.append({"name": short or f"PR #{num}", "tps": raw, "pr": num,
                    "date": datetime.date.today().isoformat()})
     data["landed"] = sorted(landed, key=lambda m: m["tps"])
     data["updated"] = datetime.date.today().isoformat()
@@ -445,14 +447,17 @@ def reconcile_merge_labels(repo):
         for num, labs in open_labels.items():
             if NEEDS_REBASE_LABEL in labs and REEVALUATE_LABEL not in labs:
                 add_label(repo, num, REEVALUATE_LABEL)
+                labs.add(REEVALUATE_LABEL)        # keep the snapshot fresh so step 2 excludes it
                 gh(["pr", "comment", str(num), "-R", repo, "--body",
                     "<!-- sparkinfer-reeval -->\nThe round's `merge-first` PR was just merged. Please "
                     "**rebase this branch onto `main`** — the bot will re-evaluate it against the new "
                     "frontier (so you're credited for the *marginal* gain on top of what merged)."])
 
-    # 2) Rank open verified-speedup PRs; biggest → merge-first, rest → needs-rebase.
+    # 2) Rank open verified-speedup PRs; biggest → merge-first, rest → needs-rebase. Skip PRs tagged
+    #    re-evaluate — their score is stale (graded vs an older main); they must rebase + re-eval first.
     scored = sorted(((num, by_num[num].get("delta_pct") or 0) for num in open_labels
-                     if num in by_num and by_num[num].get("label") in SPEEDUP_LABELS),
+                     if num in by_num and by_num[num].get("label") in SPEEDUP_LABELS
+                     and REEVALUATE_LABEL not in open_labels.get(num, set())),
                     key=lambda x: x[1], reverse=True)
     if not scored: return
     winner = scored[0][0]
