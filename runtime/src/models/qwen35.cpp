@@ -404,7 +404,20 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
     s.w.final_norm   = dense("output_norm.weight", false);
     const char* lm = g.tensor("output.weight") ? "output.weight" : "token_embd.weight";  // tied fallback
-    s.w.lm_head = attn_w(lm, s.w.lm_head_type);               // native [vocab,hidden] for GEMV
+    // lm_head is the single largest weight read each token (vocab x hidden). Keep it in
+    // its native quantized form and decode it on-read with the GEMV-q kernel, instead of
+    // expanding it to bf16 at load: that is ~2.4x less decode memory traffic on the
+    // largest tensor, using the same byte-exact on-read decode the QATTN path already
+    // uses (token-match preserved). Decode is memory-bound at batch 1, so cutting the
+    // dominant read is a direct tok/s win. Only the on-read GEMV handles Q4_K/Q6_K, so
+    // fall back to the dense bf16 path for an F32/F16 output tensor.
+    const GGUFTensor* lmt = g.tensor(lm);
+    if (lmt && (lmt->ggml_type == 12 || lmt->ggml_type == 14)) {
+        s.w.lm_head = dev_quant(lm, s.w.lm_head_type);       // native [vocab,hidden], gemv_q on-read
+    } else {
+        s.w.lm_head_type = 0;
+        s.w.lm_head = dense(lm, false);                      // bf16 fallback for non-k-quant lm_head
+    }
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
 
     s.w.layers.resize(c.n_layers);
