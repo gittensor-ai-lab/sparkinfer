@@ -283,6 +283,99 @@ __global__ void down_q6k_splitk_kernel(
     }
 }
 
+// ---- int8 dp4a MMVQ down (Q6_K) — SPARKINFER_DOWN_MMVQ=1 -----------------------
+// The MoE down projection (Q6_K [E,H,F]) is the single biggest decode kernel and the
+// only major GEMV still on the fp register-dequant path (gate/up + attention already
+// run int8 MMVQ). This ports llama.cpp's vec_dot_q6_K_q8_1 faithfully: the down
+// activation h (per token*expert, F floats) is quantized to Q8_1 once, then the Q6_K
+// weight is dp4a'd against it. Lower register pressure than the fp dequant -> more
+// warps resident on the occupancy-bound bs=1 down, plus integer dp4a math.
+struct si_block_q8_1 { __half2 ds; signed char qs[32]; };   // 36 B / 32 values (llama layout)
+
+// Quantize the down activation h (fp32, n_blocks*32 values) to Q8_1 in natural element
+// order (block ib covers elements [ib*32, ib*32+32)). One 32-value block per warp.
+__global__ void quant_h_q8_1_kernel(const float* __restrict__ h,
+                                    si_block_q8_1* __restrict__ y, int n_blocks) {
+    const int warpsPB = blockDim.x >> 5;
+    const int ib = blockIdx.x * warpsPB + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (ib >= n_blocks) return;
+    float xv = h[(size_t)ib * 32 + lane], a = fabsf(xv);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    float d = a / 127.0f;
+    int qi = (a == 0.0f) ? 0 : (int)roundf(xv / d);
+    y[ib].qs[lane] = (signed char)qi;
+    int s = qi;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+    if (lane == 0) y[ib].ds = __floats2half2_rn(d, d * (float)s);
+}
+
+// Faithful llama.cpp vec_dot_q6_K_q8_1 for one 256-superblock at quant-index iqs (0..31).
+// bq6 -> ggml block_q6_K (ql[128], qh[64], int8 scales[16], fp16 d); bq8 -> that
+// superblock's 8 Q8_1 activation blocks.
+// Unaligned 32-bit load from a >=2-byte-aligned byte array (Q6_K blocks are 210 B,
+// only even-aligned), faithful to llama.cpp's get_int_b2.
+__device__ __forceinline__ int si_get_int_b2(const void* x, int i32) {
+    const unsigned short* x16 = reinterpret_cast<const unsigned short*>(x);
+    return (int)x16[2 * i32] | ((int)x16[2 * i32 + 1] << 16);
+}
+
+__device__ __forceinline__ float si_vec_dot_q6_K(const unsigned char* __restrict__ bq6,
+                                                 const si_block_q8_1* __restrict__ bq8, int iqs) {
+    const signed char* scales = reinterpret_cast<const signed char*>(bq6 + 192);
+    const float d = q4kf_h2f(bq6 + 208);
+    const int bq8_offset   = 4 * (iqs / 16) + (iqs % 16) / 8;
+    const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+    const int vh_shift     = 2 * ((iqs % 16) / 8);
+    const int vl = si_get_int_b2(bq6, iqs);                                  // ql[128]
+    const int vh = si_get_int_b2(bq6 + 128, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;  // qh[64]
+    const signed char* sc = scales + scale_offset;
+    float sumf = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const si_block_q8_1* b8 = bq8 + bq8_offset + 2 * i;
+        const int u = reinterpret_cast<const int*>(b8->qs)[iqs % 8];
+        const float d8 = __low2float(b8->ds);
+        const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
+        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+        const int vi  = __vsubss4((vil | vih), 0x20202020);   // (vil|vih) - 32
+        sumf += d8 * (__dp4a(vi, u, 0) * (int)sc[4 * i]);
+    }
+    return d * sumf;
+}
+
+// down (MMVQ): out[token,hh] = sum_j w_j * <h_j, down[e_j,hh]>. one warp per (token,hh),
+// loops top_k experts and dp4a's Q6_K weights against the pre-quantized Q8_1 activation.
+__global__ void down_q6k_mmvq_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k
+) {
+    const int token = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int hh = blockIdx.y * WPB + (threadIdx.x >> 5);
+    if (hh >= H) return;
+    const int nblk = F >> 8;        // 256-superblocks per row
+    const int q8pb = F >> 5;        // Q8_1 blocks per expert activation row
+    float acc = 0.f;
+    for (int j = 0; j < top_k; j++) {
+        const int ts = token * top_k + j;
+        const int e = expert_ids[ts];
+        const float w = expert_weights[ts];
+        const unsigned char* drow = down_q + ((size_t)e * H + hh) * nblk * 210;
+        const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+        float t = 0.f;
+        for (int kbx = 0; kbx < nblk; kbx++)
+            t += si_vec_dot_q6_K(drow + (size_t)kbx * 210, h8 + (size_t)kbx * 8, lane);
+        acc += w * t;
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
@@ -294,7 +387,6 @@ void launch_moe_expert_ffn_q4k(
     float* h_scratch, float* out_scratch,
     int num_tokens, int top_k, int hidden, int ffn, cudaStream_t stream
 ) {
-    (void)out_scratch;
     // int8 dp4a path for Q4_K gate/up (decode parity with llama.cpp's MMVQ). Default
     // ON — the largest single decode cost; down stays on the fp path (Q6_K). Set
     // SPARKINFER_MMVQ=0 to fall back to the bf16 dequant-GEMV.
@@ -316,6 +408,26 @@ void launch_moe_expert_ffn_q4k(
             reinterpret_cast<const unsigned char*>(gate_q),
             reinterpret_cast<const unsigned char*>(up_q),
             expert_ids, h_scratch, hidden, ffn, top_k, gate_type, up_type);
+    }
+
+    // int8 dp4a MMVQ down (Q6_K) — default ON; SPARKINFER_DOWN_MMVQ=0 falls back to the
+    // fp register-dequant down. The MoE down is the last major decode GEMV still on the
+    // fp path (gate/up + attention already run int8 MMVQ): quantize the activation h to
+    // Q8_1 once (into the otherwise-unused out_scratch) and dp4a the Q6_K weights against
+    // it, faithful to llama.cpp vec_dot_q6_K_q8_1.
+    static int down_mmvq = -1;
+    if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_DOWN_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
+    if (down_mmvq && down_type == 14) {   // 14 = ggml Q6_K
+        si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);   // <= hidden floats; fits
+        const int nqb = num_tokens * top_k * (ffn >> 5);
+        const int qthreads = 256;
+        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
+            h_scratch, hq8, nqb);
+        dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
+        down_q6k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
+            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+        return;
     }
 
     static int splitk = -1;
