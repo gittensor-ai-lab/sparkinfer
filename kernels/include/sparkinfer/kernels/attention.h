@@ -27,6 +27,13 @@ void launch_rope(
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     float theta, cudaStream_t stream = nullptr);
 
+// Single-token decode fast path: q_norm + k_norm + rope(q) + rope(k) fused into one
+// kernel (one block per head). Output is bit-identical to the separate kernels.
+void launch_qknorm_rope(
+    void* q, void* k, const void* q_norm_w, const void* k_norm_w,
+    const int* positions, int n_q_heads, int n_kv_heads,
+    int head_dim, float eps, float theta, cudaStream_t stream = nullptr);
+
 // Flash prefill: full causal attention for prompt processing.
 // q/k/v:  [batch, seqlen, num_heads, head_dim]
 // out:    same shape as q
