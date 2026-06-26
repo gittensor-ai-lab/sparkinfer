@@ -60,8 +60,8 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server (one-time, 
 }
 
 # ---- prebuilt binaries (GitHub release) with source-build fallback ----
-PREBUILT_TAG="${PREBUILT_TAG:-v0.1.0}"
-PREBUILT_TGZ="${PREBUILT_TGZ:-sparkinfer-v0.1.0-linux-x86_64-cuda13-sm120.tar.gz}"
+PREBUILT_TAG="${PREBUILT_TAG:-v0.2.0}"
+PREBUILT_TGZ="${PREBUILT_TGZ:-sparkinfer-v0.2.0-linux-x86_64-cuda13-sm120.tar.gz}"
 PREBUILT_URL="${PREBUILT_URL:-https://github.com/gittensor-ai-lab/sparkinfer/releases/download/$PREBUILT_TAG/$PREBUILT_TGZ}"
 PREBUILT_DIR="$ROOT/.prebuilt/sparkinfer-bin"
 SI_BIN=""; SI_LD=""   # set by resolve_runner: binary dir + LD_LIBRARY_PATH

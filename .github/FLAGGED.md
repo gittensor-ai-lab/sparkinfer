@@ -40,3 +40,20 @@ shadowing them to maximize merged-PR count rather than contributing distinct wor
 **Action:** both accounts added to `blocked-contributors.txt`. Open PRs labeled
 `flagged:gaming` and closed. Future PRs from either account are auto-flagged, closed,
 and not evaluated by the bot. Merged PR #11's emission cannot be reversed; logged here.
+
+## 2026-06-25 — `kiannidev` (auto-blocked, later overridden)
+
+Auto-blocked after 2 copycat strikes (#54, #57). #57←#56 is a near-verbatim copy
+(109/110 added lines identical); #54←#53 was a weaker maintainer-flagged duplicate.
+
+## 2026-06-26 — `kiannidev` block overridden by maintainer decision
+
+Maintainer decision: lift the block and drop the **#57** strike, keeping only the #54
+strike. Mechanics: `copycat` / `flagged:gaming` cleared from #57, #57 **kept closed**,
+#57 removed from `copycats.json`, and `kiannidev` removed from `blocked-contributors.txt`.
+The 5-day eval penalty from the #54 strike still stands (window ends 2026-06-30).
+
+Note: #57 is objectively a copy, so the auto-detector **re-flags it whenever the PR is open**
+(this is exactly what happened on a re-run after it was briefly reopened). For this override to
+hold, #57 must stay **closed** (or be added to an explicit copycat exception). This entry
+supersedes the auto-block records above.

@@ -24,18 +24,35 @@ from vastai import VastAI
 
 REPO    = os.environ.get("EVAL_REPO",  "https://github.com/gittensor-ai-lab/sparkinfer")
 IMAGE   = os.environ.get("EVAL_IMAGE", "nvidia/cuda:12.8.0-devel-ubuntu24.04")   # needs nvcc for sm_120
-# Default to the raw CUDA image + `--ssh --direct` (proven path): template 1ea6ef1d8cc4ad95e710c4c1daed378c
-# provisions boxes that reach "running" but never expose direct SSH with our key, so wait_ssh always
-# times out (every cron run failed all 3 attempts). Set EVAL_TEMPLATE_HASH to opt back into a template.
-TEMPLATE_HASH = os.environ.get("EVAL_TEMPLATE_HASH", "")  # "" = use EVAL_IMAGE with --ssh --direct
+# Provision from a maintainer-vetted vast template that reliably exposes direct SSH. (The earlier
+# default 1ea6ef1d8cc4ad95e710c4c1daed378c brought boxes to "running" with no working SSH; the raw
+# image worked but vast's --ssh injection was flaky host-to-host. This template is the vetted fix.)
+# Set EVAL_TEMPLATE_HASH="" to fall back to the raw EVAL_IMAGE + --ssh --direct path.
+TEMPLATE_HASH = os.environ.get("EVAL_TEMPLATE_HASH", "7f806603ccd0de9b7370266673c0a32d")
 SSH_KEY = os.path.expanduser(os.environ.get("SSH_KEY", "~/.ssh/id_ed25519"))
 LLAMACPP_DIR = os.environ.get("LLAMACPP_DIR", "/workspace/.llamacpp")            # persists across stop/start
 INSTANCE_FILE = os.path.expanduser(os.environ.get("VAST_INSTANCE_FILE", "~/.sparkinfer_vast_instance"))  # self-healed id
 # IPs of hosts that repeatedly hang on image pull or never expose direct SSH, despite high vast
 # "reliability" scores (which track uptime, not image-pull / direct-SSH success). Whack-a-mole, but
 # the offending set is small and recurring. Override/extend via VAST_SKIP_HOSTS (comma-separated).
-_DEFAULT_SKIP = "94.177.17.69,120.238.149.205,192.3.91.246"
+_DEFAULT_SKIP = "94.177.17.69,120.238.149.205,192.3.91.246,47.253.144.202,175.121.93.64,180.70.178.129"
 SKIP_HOSTS_PERMANENT = set(filter(None, os.environ.get("VAST_SKIP_HOSTS", _DEFAULT_SKIP).split(",")))
+
+# --pinned: reuse a stable, known-good box (cached model, good download speed) as the default and
+# NEVER destroy it. If it can't be brought up within --reuse-timeout (5 min), don't provision a new
+# box immediately — leave the pinned box intact and exit PINNED_RETRY_RC so the next scheduled run
+# (on the next scheduled run) retries. Only after REUSE_MAX_RETRIES consecutive misses do we provision a fresh
+# box (the pinned one is still kept). Counter persists in REUSE_RETRY_FILE across runs.
+REUSE_RETRY_FILE = os.path.expanduser(os.environ.get("VAST_REUSE_RETRY_FILE", "~/.sparkinfer_reuse_retries"))
+REUSE_MAX_RETRIES = int(os.environ.get("VAST_REUSE_MAX_RETRIES", "2"))
+PINNED_RETRY_RC = 75   # distinct exit code: "pinned box not up; retry on the next run" (not an error)
+def _reuse_retries():
+    try: return int(open(REUSE_RETRY_FILE).read().strip())
+    except Exception: return 0
+def _set_reuse_retries(n):
+    try:
+        with open(REUSE_RETRY_FILE, "w") as f: f.write(str(n))
+    except Exception: pass
 
 def sh(host, port, cmd, timeout=3600):
     try:
@@ -93,10 +110,10 @@ LOADING_TIMEOUT = 300   # bail if stuck in "loading" longer than this. The ~5GB 
                         # legitimately takes 3-5 min to pull on many hosts; 180s abandoned healthy
                         # boxes mid-pull. The host blacklist (not a tight timeout) handles the
                         # persistently-hung offenders.
-SSH_CONNECT_TIMEOUT = 120  # bail if "running" but SSH won't connect. A healthy box accepts SSH
-                           # within one poll of going "running"; a host that reports a phantom
-                           # "running" at 0s with no sshd never recovers — abandon it fast (2 min)
-                           # and let the provision-retry loop try another host.
+SSH_CONNECT_TIMEOUT = 180  # bail if "running" but SSH won't connect. Healthy boxes connect within
+                           # a poll or two of "running"; a phantom-"running" host never does. 180s
+                           # gives a slow-but-real box a little more slack than 120 before we give
+                           # up and let the retry loop try another host.
 
 def bring_up(v, iid, deadline_s):
     """Start the instance if needed and wait until SSH-reachable, within deadline_s.
@@ -142,18 +159,23 @@ def bring_up(v, iid, deadline_s):
     return None
 
 def provision(v, args, skip_hosts=None):
-    """Create a fresh instance via the vast API. Returns the new instance id, or None."""
-    offers = v.search_offers(query=f"gpu_name={args.gpu} num_gpus=1 cuda_vers>=12.8 inet_down>=100",
-                             order="dph_total", limit=10)
+    """Create a fresh instance via the vast API. Returns the new instance id, or None.
+    Prefers higher-reliability hosts among the cheapest offers (reliability doesn't fully predict
+    the phantom-"running" failure, but it screens out the genuinely flaky); the SSH timeout +
+    blacklist + retry loop handle the rest."""
+    base = f"gpu_name={args.gpu} num_gpus=1 cuda_vers>=12.8 inet_down>=100"
+    offers = v.search_offers(query=f"{base} reliability>0.97", order="dph_total", limit=25)
+    if not offers:   # reliability filter too strict / API quirk → fall back to the unfiltered search
+        offers = v.search_offers(query=base, order="dph_total", limit=25)
     if not offers:
         print(">> no matching offers"); return None
-    # Exclude permanently blacklisted hosts + any session-level skip_hosts.
+    # Exclude blacklisted + already-tried hosts, then from the cheapest dozen pick the MOST reliable.
     all_skip = SKIP_HOSTS_PERMANENT | (skip_hosts or set())
-    pool = [o for o in offers[:5] if o.get("public_ipaddr") not in all_skip]
-    if not pool: pool = [o for o in offers if o.get("public_ipaddr") not in all_skip]
-    if not pool: print(">> all offers are on blacklisted hosts"); return None
-    off = random.choice(pool)
-    print(f">> creating instance on offer {off['id']} {off.get('gpu_name')} ${off.get('dph_total'):.3f}/hr host={off.get('public_ipaddr','?')}")
+    cands = [o for o in offers if o.get("public_ipaddr") not in all_skip]
+    if not cands: print(">> all offers are on blacklisted/skipped hosts"); return None
+    off = max(cands[:12], key=lambda o: o.get("reliability2", 0))   # cheapest-12, best reliability
+    print(f">> creating instance on offer {off['id']} {off.get('gpu_name')} ${off.get('dph_total'):.3f}/hr "
+          f"host={off.get('public_ipaddr','?')} rel={off.get('reliability2','?')}")
     # Create via the CLI: the SDK's create_instance has no ssh/direct kwargs (those are CLI flags),
     # and --template_hash applies a preconfigured image+env. --raw returns {success, new_contract}.
     cmd = ["vastai", "create", "instance", str(off["id"]), "--disk", "120", "--ssh", "--direct", "--raw"]
@@ -180,6 +202,7 @@ def main():
     ap.add_argument("--reuse-timeout", type=int, default=300, help="seconds to wait for a reused box before recreating (default 300 = 5 min; a cold start of a stopped cached box can take minutes — destroying it prematurely wastes the 17GB cache)")
     ap.add_argument("--new-timeout", type=int, default=480, help="seconds to wait for a freshly created box (default 480 = 8 min)")
     ap.add_argument("--no-recreate", action="store_true", help="on reuse failure, error out instead of provisioning a new box")
+    ap.add_argument("--pinned", action="store_true", help="the --reuse box is the stable default: NEVER destroy it; on bring-up failure exit PINNED_RETRY_RC for up to REUSE_MAX_RETRIES runs before provisioning a new box (pinned kept)")
     ap.add_argument("--destroy-on-error", action="store_true", help="destroy (not just stop) the instance if the eval produces no result")
     args = ap.parse_args()
 
@@ -193,8 +216,30 @@ def main():
         ep = bring_up(v, iid, args.reuse_timeout)
         if ep:
             host, port = ep
+            if args.pinned: _set_reuse_retries(0)   # pinned box is back up — clear the miss counter
         elif args.no_recreate:
             sys.exit(f"instance {iid} never came up (--no-recreate)")
+        elif args.pinned:
+            # PINNED: never destroy the stable box. Two failure modes:
+            #  - box GONE (vast reclaimed it — common for stopped boxes): retrying is pointless,
+            #    provision a fresh one NOW (the bot then auto-re-pins to it).
+            #  - box EXISTS but won't resume (host busy): retry on the next run, provision only
+            #    after REUSE_MAX_RETRIES misses.
+            if info_of(v, iid) is None:
+                print(f">> pinned instance {iid} no longer exists (vast reclaimed it) — "
+                      f"provisioning a fresh box now.")
+                _set_reuse_retries(0); iid = 0
+            else:
+                n = _reuse_retries() + 1
+                if n <= REUSE_MAX_RETRIES:
+                    _set_reuse_retries(n)
+                    print(f">> pinned instance {iid} exists but not SSH-ready within {args.reuse_timeout}s "
+                          f"(miss {n}/{REUSE_MAX_RETRIES}) — leaving it intact; retry on the next scheduled run.")
+                    sys.exit(PINNED_RETRY_RC)
+                _set_reuse_retries(0)
+                print(f">> pinned instance {iid} unavailable after {REUSE_MAX_RETRIES} retries — "
+                      f"provisioning a NEW box (pinned {iid} kept, NOT destroyed).")
+                iid = 0
         else:
             # Destroy the stuck box (can't SSH → no value in keeping disk) and provision a fresh one.
             stuck_host = (info_of(v, iid) or {}).get("public_ipaddr")
@@ -206,8 +251,8 @@ def main():
     # 2) No working box yet → create one, retrying on different hosts if needed.
     if not iid:
         skip = {stuck_host} if 'stuck_host' in dir() and stuck_host else set()
-        MAX_ATTEMPTS = 5   # ~half of cheap offers are phantom-running hosts; each bad one now
-                           # costs only ~2 min (SSH_CONNECT_TIMEOUT), so try more before erroring
+        MAX_ATTEMPTS = 8   # ~half of cheap offers are phantom-running hosts; each bad one is bounded
+                           # by SSH_CONNECT_TIMEOUT, so try plenty of distinct hosts before erroring
         for attempt in range(1, MAX_ATTEMPTS + 1):
             iid = provision(v, args, skip_hosts=skip)
             if not iid: sys.exit("could not provision an instance")
@@ -230,6 +275,10 @@ def main():
 
     MODEL_PATH = "/workspace/models/Qwen3-30B-A3B-Q4_K_M.gguf"
     MODEL_READY = "/tmp/sparkinfer_model_ready"
+    # HuggingFace is throttled to ~KB/s from many vast hosts, so pull the GGUF from Google Drive
+    # first (gdown handles the large-file confirm token), then fall back to HF/curl. Override the
+    # Drive file id with MODEL_GDRIVE_ID="" to disable and use HF only.
+    MODEL_GDRIVE_ID = os.environ.get("MODEL_GDRIVE_ID", "1BSLqKBs_Bo6up7YlFqwvRXuuQ4z0GcQf")
 
     def wait_model(host, port, timeout=2700):
         """Poll until the model file is fully downloaded (sentinel file appears)."""
@@ -277,8 +326,16 @@ def main():
             f"elif [ -f '{MODEL_READY}' ]; then echo already_running; "
             f"else mkdir -p /workspace/models && rm -f '{MODEL_READY}'; "
             f"nohup bash -c '"
-            f"  HF_HUB_DISABLE_XET=1 hf download Qwen/Qwen3-30B-A3B-GGUF "
-            f"    Qwen3-30B-A3B-Q4_K_M.gguf --local-dir /workspace/models >>/tmp/dl.log 2>&1 "
+            f"  gid=\"{MODEL_GDRIVE_ID}\"; "
+            f"  if [ -n \"$gid\" ]; then pip install -q gdown 2>>/tmp/dl.log; "
+            f"    gdown --no-cookies -q \"$gid\" -O {MODEL_PATH}.part >>/tmp/dl.log 2>&1; "
+            f"    sz=$(stat -c%s {MODEL_PATH}.part 2>/dev/null || echo 0); "
+            f"    if [ \"$sz\" -gt 10000000000 ]; then mv -f {MODEL_PATH}.part {MODEL_PATH}; "
+            f"    else echo \"gdrive failed (sz=$sz) -> HF\" >>/tmp/dl.log; rm -f {MODEL_PATH}.part; fi; "
+            f"  fi; "
+            f"  [ -f {MODEL_PATH} ] "
+            f"  || HF_HUB_DISABLE_XET=1 hf download Qwen/Qwen3-30B-A3B-GGUF "
+            f"       Qwen3-30B-A3B-Q4_K_M.gguf --local-dir /workspace/models >>/tmp/dl.log 2>&1 "
             f"  || curl -fL -C - https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
             f"       -o {MODEL_PATH} >>/tmp/dl.log 2>&1; "
             f"  [ -f {MODEL_PATH} ] && touch {MODEL_READY}"

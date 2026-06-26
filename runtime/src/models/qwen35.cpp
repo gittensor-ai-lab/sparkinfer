@@ -73,8 +73,14 @@ struct Qwen35Model::Impl {
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
     int   *mf_ids = nullptr, *mf_counts = nullptr;
     // flash-decoding (KV-split) attention partials
-    int n_splits = 16;
+    int n_splits = 32;
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
+    // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
+    signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
+    bool use_pq = true;   // SPARKINFER_PQ=0 disables the pre-quantized GEMV path
+    void* aq81 = nullptr; // block_q8_1 activation for the faithful llama mmvq port
+    bool use_llama = true; // default ON: faithful llama mmvq for Q4_K attn GEMVs (+9.7%, top1 0.99). =0 disables
+    bool use_q6mmvq = true;  // default ON: int8 Q6_K mmvq for attn-V upgrades + LM head. =0 disables
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -82,6 +88,15 @@ struct Qwen35Model::Impl {
 Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine)
     : p_(new Impl()) {
     p_->cfg = cfg; p_->kv = kv; p_->engine = engine;
+    // Flash-decode KV-split count is occupancy tuning only (math is identical for any
+    // value — empty splits contribute zero), and it's baked into the decode CUDA graph
+    // at construction. 16 over-subscribes the GPU for short context (32 q_heads * 16 =
+    // 512 single-warp blocks); SPARKINFER_NSPLITS lets the scored regime be tuned/swept
+    // without a rebuild. Clamp to [1, 64]; buffers below are sized from it.
+    if (const char* ns = getenv("SPARKINFER_NSPLITS")) {
+        int v = atoi(ns); if (v < 1) v = 1; if (v > 64) v = 64; p_->n_splits = v;
+        fprintf(stderr, "[nsplits] flash-decode splits = %d (env override)\n", v);
+    }
     p_->qdim = cfg.n_q_heads * cfg.head_dim;
     p_->kvdim = cfg.n_kv_heads * cfg.head_dim;
     cudaStreamCreate(&p_->stream);
@@ -111,6 +126,14 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->fa_m   = p_->alloc<float>(fa_n);
     p_->fa_l   = p_->alloc<float>(fa_n);
     p_->fa_acc = p_->alloc<float>(fa_n * cfg.head_dim);
+    const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
+    p_->aq8   = p_->alloc<signed char>(kmax);
+    p_->aq8_d = p_->alloc<float>(kmax >> 5);
+    p_->aq8_s = p_->alloc<float>(kmax >> 5);
+    p_->aq81  = p_->alloc<char>(kernels::llama_q8_1_bytes(kmax));
+    if (const char* e = getenv("SPARKINFER_PQ"))    p_->use_pq    = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_LLAMA")) p_->use_llama = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_Q6MMVQ")) p_->use_q6mmvq = !(e[0] == '0');
 }
 
 Qwen35Model::~Qwen35Model() {
@@ -123,6 +146,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->mf_logits); cudaFree(p_->mf_weights); cudaFree(p_->mf_h); cudaFree(p_->mf_out);
     cudaFree(p_->mf_ids); cudaFree(p_->mf_counts);
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
+    cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
     cudaStreamDestroy(p_->stream);
     delete p_;
@@ -173,12 +197,28 @@ int Qwen35Model::forward_token(int token_id, int position) {
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         if (s.gguf) {   // GGUF dense weights are native [out,in] -> coalesced GEMV
-            if (w.wq_type) kernels::launch_gemv_q(s.xn, w.wq, w.wq_type, s.q, s.qdim,  H, st);
-            else           kernels::launch_gemv(s.xn, w.wq, s.q, s.qdim,  H, st);
-            if (w.wk_type) kernels::launch_gemv_q(s.xn, w.wk, w.wk_type, s.k, s.kvdim, H, st);
-            else           kernels::launch_gemv(s.xn, w.wk, s.k, s.kvdim, H, st);
-            if (w.wv_type) kernels::launch_gemv_q(s.xn, w.wv, w.wv_type, s.v, s.kvdim, H, st);
-            else           kernels::launch_gemv(s.xn, w.wv, s.v, s.kvdim, H, st);
+            // Q/K/V all read xn: quantize it to Q8_1 ONCE, then dp4a each Q4_K proj against it
+            // (no per-block, per-GEMV re-quant). Q6_K/bf16 weights keep their existing path.
+            const bool any_q4k = (w.wq_type == 12 || w.wk_type == 12 || w.wv_type == 12);
+            const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
+            if (s.use_pq && s.use_llama && (any_q4k || any_q6k))
+                kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);   // shared Q8_1(xn) for Q4_K + Q6_K mmvq
+            else if (s.use_pq && any_q4k)
+                kernels::launch_quantize_q8_1(s.xn, s.aq8, s.aq8_d, s.aq8_s, H, st);
+            auto proj = [&](const void* W, int t, void* y, int N) {
+                if (s.use_pq && t == 12) {
+                    if (s.use_llama) kernels::launch_mmvq_q4k(s.aq81, W, y, N, H, st);
+                    else             kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, W, y, N, H, st);
+                }
+                else if (s.use_q6mmvq && t == 14)
+                    kernels::launch_mmvq_q6k(s.aq81, W, y, N, H, st);        // Q6_K mmvq (attn-V upgrades); reuses aq81
+
+                else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, st);
+                else        kernels::launch_gemv(s.xn, W, y, N, H, st);
+            };
+            proj(w.wq, w.wq_type, s.q, s.qdim);
+            proj(w.wk, w.wk_type, s.k, s.kvdim);
+            proj(w.wv, w.wv_type, s.v, s.kvdim);
         } else {
             kernels::launch_gemm(s.xn, w.wq, s.q, 1, s.qdim,  H, 1.f, 0.f, gc, st);
             kernels::launch_gemm(s.xn, w.wk, s.k, 1, s.kvdim, H, 1.f, 0.f, gc, st);
@@ -196,7 +236,16 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                            s.fa_m, s.fa_l, s.fa_acc, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
                                            s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
                                            1.f / sqrtf((float)c.head_dim), st);
-        if (s.gguf && w.wo_type) kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, s.qdim, st);
+        if (s.gguf && s.use_pq && w.wo_type == 12) {   // O proj reads attn: quantize once + dp4a
+            if (s.use_llama) {
+                kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
+                kernels::launch_mmvq_q4k(s.aq81, w.wo, s.ao, H, s.qdim, st);
+            } else {
+                kernels::launch_quantize_q8_1(s.attn, s.aq8, s.aq8_d, s.aq8_s, s.qdim, st);
+                kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, w.wo, s.ao, H, s.qdim, st);
+            }
+        }
+        else if (s.gguf && w.wo_type) kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, s.qdim, st);
         else if (s.gguf)         kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
         else                     kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
 
@@ -227,7 +276,11 @@ int Qwen35Model::forward_token(int token_id, int position) {
         kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
     }
     // xn now holds RMSNorm(x_final, final_norm)
-    if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
+    if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
+        kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
+        kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
+    }
+    else if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
     else if (s.gguf)                kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
     else        kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
@@ -380,11 +433,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         return result;
     };
 
-    // SPARKINFER_QATTN=1: keep attention/lm_head weights quantized in VRAM and decode
-    // them on-read (launch_gemv_q, full-precision activation) instead of dequantizing
-    // to bf16 at load — ~4x less decode memory traffic, token-match preserved.
-    const bool qattn = []{ const char* a = getenv("SPARKINFER_QATTN"); const char* m = getenv("SPARKINFER_MMVQ");
-                           return (a && a[0] == '1') || (m && m[0] == '1'); }();
+    // Keep attention/lm_head weights quantized in VRAM and decode them on-read
+    // (Q4_K -> int8 dp4a, Q6_K -> fp32 dequant) instead of expanding to bf16 at load.
+    // Default ON: it feeds the dp4a GEMV path (~27% faster decode, gate-passing) and
+    // uses ~1.5 GB less VRAM. Set SPARKINFER_QATTN=0 to load dense bf16 instead.
+    const bool qattn = []{ const char* a = getenv("SPARKINFER_QATTN");
+                           return !(a && a[0] == '0'); }();
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
