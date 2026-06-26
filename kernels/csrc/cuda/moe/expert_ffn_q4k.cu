@@ -66,7 +66,12 @@ __device__ __forceinline__ float q4kf_silu(float x) { return x / (1.f + __expf(-
 // Dequant a 256-block in registers and return THIS lane's partial dot with sx[0..255]
 // (8 weights/lane). No shared round-trip — caller warp-reduces the accumulated partials
 // once at the end. Same math as warp_deq + the shared dot, just fused and register-resident.
+// Quantized weight bytes go through __ldg (read-only cache). GlobalH=true additionally
+// routes the activation reads through __ldg — used by the down pass, whose activation
+// (h_scratch) lives in global memory, not shared.
+template <bool GlobalH = false>
 __device__ __forceinline__ float q4kf_deq_dot(int t, const unsigned char* b, const float* sx, int lane) {
+    auto hx = [&](int i) -> float { return GlobalH ? __ldg(sx + i) : sx[i]; };
     float p = 0.f;
     if (t == 14) {   // Q6_K
         const unsigned char* ql = b; const unsigned char* qh = b + 128;
@@ -79,10 +84,10 @@ __device__ __forceinline__ float q4kf_deq_dot(int t, const unsigned char* b, con
             int q2 = (int)((q4kf_ldg_u8(qln + lane+32) & 0xF) | (((q4kf_ldg_u8(qhn + lane) >> 2) & 3) << 4)) - 32;
             int q3 = (int)((q4kf_ldg_u8(qln + lane)    >> 4)  | (((q4kf_ldg_u8(qhn + lane) >> 4) & 3) << 4)) - 32;
             int q4 = (int)((q4kf_ldg_u8(qln + lane+32) >> 4)  | (((q4kf_ldg_u8(qhn + lane) >> 6) & 3) << 4)) - 32;
-            p += d * (float)q4kf_ldg_i8(scn + is+0) * q1 * sx[nn*128 + lane];
-            p += d * (float)q4kf_ldg_i8(scn + is+2) * q2 * sx[nn*128 + lane + 32];
-            p += d * (float)q4kf_ldg_i8(scn + is+4) * q3 * sx[nn*128 + lane + 64];
-            p += d * (float)q4kf_ldg_i8(scn + is+6) * q4 * sx[nn*128 + lane + 96];
+            p += d * (float)q4kf_ldg_i8(scn + is+0) * q1 * hx(nn*128 + lane);
+            p += d * (float)q4kf_ldg_i8(scn + is+2) * q2 * hx(nn*128 + lane + 32);
+            p += d * (float)q4kf_ldg_i8(scn + is+4) * q3 * hx(nn*128 + lane + 64);
+            p += d * (float)q4kf_ldg_i8(scn + is+6) * q4 * hx(nn*128 + lane + 96);
         }
     } else {         // Q4_K
         float d = q4kf_h2f_ldg(b), dmin = q4kf_h2f_ldg(b + 2);
@@ -93,8 +98,8 @@ __device__ __forceinline__ float q4kf_deq_dot(int t, const unsigned char* b, con
             q4kf_scale_min_ldg(2*g, sc, &s1, &m1); q4kf_scale_min_ldg(2*g+1, sc, &s2, &m2);
             float d1 = d*s1, mm1 = dmin*m1, d2 = d*s2, mm2 = dmin*m2;
             unsigned char qb = q4kf_ldg_u8(qs + g*32 + lane);
-            p += (d1 * (qb & 0xF) - mm1) * sx[g*64 + lane];
-            p += (d2 * (qb >> 4)  - mm2) * sx[g*64 + 32 + lane];
+            p += (d1 * (qb & 0xF) - mm1) * hx(g*64 + lane);
+            p += (d2 * (qb >> 4)  - mm2) * hx(g*64 + 32 + lane);
         }
     }
     return p;
@@ -113,7 +118,7 @@ __global__ void gate_up_q4k_kernel(
     extern __shared__ float s_x[];           // s_x[H]
     const int ts = blockIdx.x, tok = ts / top_k;
     const int e = expert_ids[ts];
-    for (int i = threadIdx.x; i < H; i += blockDim.x) s_x[i] = __bfloat162float(input[(size_t)tok * H + i]);
+    for (int i = threadIdx.x; i < H; i += blockDim.x) s_x[i] = __bfloat162float(__ldg(input + (size_t)tok * H + i));
     __syncthreads();
 
     const int lane = threadIdx.x % 32;
@@ -161,7 +166,7 @@ __global__ void gate_up_q4k_mmvq_kernel(
 
     // quantize activation -> Q8_1, one 32-block per warp-iteration (lane = element)
     for (int b = warpId; b < nsb; b += WPB) {
-        float xv = __bfloat162float(input[(size_t)tok * H + b * 32 + lane]);
+        float xv = __bfloat162float(__ldg(input + (size_t)tok * H + b * 32 + lane));
         float a = fabsf(xv);
         #pragma unroll
         for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
@@ -239,12 +244,12 @@ __global__ void down_q6k_kernel(
     float acc = 0.f;   // sum_j w_j * <h_j, down[e_j, hh]> ; fold w into the per-lane partials
     for (int j = 0; j < top_k; j++) {
         const int ts = token * top_k + j;
-        const int e = expert_ids[ts];
-        const float w = expert_weights[ts];
+        const int e = __ldg(expert_ids + ts);
+        const float w = __ldg(expert_weights + ts);
         const unsigned char* dbase = down_q + ((size_t)e * H + hh) * nblk * dbb;
         const float* hbase = h_scratch + (size_t)ts * F;
         for (int blk = 0; blk < nblk; blk++)
-            acc += w * q4kf_deq_dot(down_type, dbase + (size_t)blk * dbb, hbase + blk*256, lane);
+            acc += w * q4kf_deq_dot<true>(down_type, dbase + (size_t)blk * dbb, hbase + blk*256, lane);
     }
     acc = q4kf_wsum(acc);
     if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
@@ -275,8 +280,8 @@ __global__ void down_q6k_splitk_kernel(
             const int ts = token * top_k + j, e = expert_ids[ts];
             const float w = expert_weights[ts];
             const unsigned char* drow = down_q + ((size_t)e * H + hh) * nblk * dbb;
-            acc += w * q4kf_deq_dot(down_type, drow + (size_t)blk * dbb,
-                                    h_scratch + (size_t)ts * F + blk * 256, lane);
+            acc += w * q4kf_deq_dot<true>(down_type, drow + (size_t)blk * dbb,
+                                          h_scratch + (size_t)ts * F + blk * 256, lane);
         }
         acc = q4kf_wsum(acc);
         if (lane == 0) s_part[hh_local][split] = acc;
