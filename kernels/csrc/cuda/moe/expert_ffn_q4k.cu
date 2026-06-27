@@ -492,9 +492,135 @@ __global__ void down_q4k_mmvq_kernel(
     if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
 }
 
+// ---- split-K int8 MMVQ down (Q6_K / Q4_K) -------------------------------------
+// The default MMVQ down kernels above are one-warp-per-row: at bs=1 that's only H
+// warps in flight (~19% occupancy on the 5090 — the same occupancy wall the fp
+// down hit before split-K). The int8 dp4a math recovered most of the bandwidth,
+// but the down GEMV stayed launch/occupancy-bound. This applies the proven split-K
+// lever (down_q6k_splitk_kernel) to the MMVQ path: S warps cooperate per output
+// row, each striding a slice of the flattened (top_k * superblock) work, then the
+// S partials sum in shared. S*H warps in flight hides the bs=1 latency. The expert
+// weight w is folded per (expert,block) item so a split spanning experts is exact;
+// only the float reduction order changes vs the one-warp kernel — accuracy-safe.
+template <int S>
+__global__ void down_q6k_mmvq_splitk_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k
+) {
+    constexpr int RPB = WPB / S;            // output rows per block
+    __shared__ float s_part[RPB][S];
+    const int token = blockIdx.x, lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    const int nblk = F >> 8;                 // 256-superblocks per row
+    const int q8pb = F >> 5;                 // Q8_1 blocks per expert activation row
+    float acc = 0.f;
+    if (hh < H) {
+        const int total = top_k * nblk;      // flattened (expert, superblock) work items
+        for (int wi = split; wi < total; wi += S) {
+            const int j = wi / nblk, kbx = wi % nblk;
+            const int ts = token * top_k + j, e = expert_ids[ts];
+            const float w = expert_weights[ts];
+            const unsigned char* drow = down_q + ((size_t)e * H + hh) * nblk * 210;
+            const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+            acc += w * si_vec_dot_q6_K(drow + (size_t)kbx * 210, h8 + (size_t)kbx * 8, lane);
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (lane == 0) s_part[hh_local][split] = acc;
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[hh_local][s];
+        output[(size_t)token * H + hh] = __float2bfloat16(o);
+    }
+}
+
+template <int S>
+__global__ void down_q4k_mmvq_splitk_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k
+) {
+    constexpr int RPB = WPB / S;
+    __shared__ float s_part[RPB][S];
+    const int token = blockIdx.x, lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    const int nblk = F >> 8;
+    const int q8pb = F >> 5;
+    const int work = nblk * 16;              // vdr=2 positions per superblock
+    float acc = 0.f;
+    if (hh < H) {
+        // flatten (expert, vdr-position) so S warps split the whole row evenly
+        const int total = top_k * work;
+        for (int wi = split * 32 + lane; wi < total; wi += S * 32) {
+            const int j = wi / work, r = wi % work;
+            const int kbx = r >> 4, kqs = (r & 15) << 1;
+            const int ts = token * top_k + j, e = expert_ids[ts];
+            const float w = expert_weights[ts];
+            const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
+                down_q + ((size_t)e * H + hh) * nblk * 144);
+            const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+            acc += w * si_vec_dot_q4_K(drow + kbx, h8 + (size_t)kbx * 8, kqs);
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (lane == 0) s_part[hh_local][split] = acc;
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[hh_local][s];
+        output[(size_t)token * H + hh] = __float2bfloat16(o);
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
+
+// Split count for the split-K MMVQ down (SPARKINFER_DOWN_SPLITK_S, default 2).
+// Swept on the RTX 5090 / Qwen3-30B-A3B: S=2 is the decode optimum (S=2 ≈ S=8 >
+// S=4 > one-warp); S=2 wins on the least cross-split reduction overhead. 0 or 1
+// disables split-K and restores the one-warp-per-row MMVQ down.
+static inline int down_splitk_s() {
+    static int s = -2;
+    if (s == -2) { const char* v = getenv("SPARKINFER_DOWN_SPLITK_S"); s = v ? atoi(v) : 2; }
+    return s;
+}
+
+// Dispatch the templated split-K MMVQ down on the runtime split count. WPB=8, so
+// S in {1,2,4,8} keeps RPB=WPB/S a positive divisor. Returns false (no launch) when
+// split-K is disabled or S is unsupported, so the caller runs the one-warp kernel.
+static inline bool launch_down_q6k_mmvq_splitk(
+    int S, dim3 grid, const unsigned char* down_q, const int* expert_ids,
+    const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
+    int H, int F, int top_k, cudaStream_t stream
+) {
+    switch (S) {
+        case 2: down_q6k_mmvq_splitk_kernel<2><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        case 4: down_q6k_mmvq_splitk_kernel<4><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        case 8: down_q6k_mmvq_splitk_kernel<8><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        default: return false;
+    }
+}
+static inline bool launch_down_q4k_mmvq_splitk(
+    int S, dim3 grid, const unsigned char* down_q, const int* expert_ids,
+    const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
+    int H, int F, int top_k, cudaStream_t stream
+) {
+    switch (S) {
+        case 2: down_q4k_mmvq_splitk_kernel<2><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        case 4: down_q4k_mmvq_splitk_kernel<4><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        case 8: down_q4k_mmvq_splitk_kernel<8><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        default: return false;
+    }
+}
 
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
@@ -549,6 +675,17 @@ void launch_moe_expert_ffn_q4k(
         const int qthreads = 256;
         quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
             h_scratch, hq8, nqb);
+        // split-K MMVQ down (default S=4): S warps/row -> S*H warps in flight, hiding
+        // the bs=1 occupancy stall the one-warp kernel hits. Falls back to one-warp if disabled.
+        const int S = down_splitk_s();
+        if (S > 1) {
+            const int RPB = WPB / S;
+            dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
+            if (launch_down_q6k_mmvq_splitk(S, dns,
+                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                    reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, stream))
+                return;
+        }
         dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
         down_q6k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
             reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
@@ -566,6 +703,15 @@ void launch_moe_expert_ffn_q4k(
         const int qthreads = 256;
         quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
             h_scratch, hq8, nqb);
+        const int S = down_splitk_s();
+        if (S > 1) {
+            const int RPB = WPB / S;
+            dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
+            if (launch_down_q4k_mmvq_splitk(S, dns,
+                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                    reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, stream))
+                return;
+        }
         dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
         down_q4k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
             reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
