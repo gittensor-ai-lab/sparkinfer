@@ -346,6 +346,40 @@ __device__ __forceinline__ float si_vec_dot_q6_K(const unsigned char* __restrict
     return d * sumf;
 }
 
+// Split of si_vec_dot_q6_K into a load phase (issues all the global reads for one
+// superblock into registers) and a compute phase (dp4a only). Lets the down kernel
+// software-pipeline: prefetch the next superblock's loads while the current dp4a runs,
+// keeping several weight reads in flight per warp. Values and math are identical to
+// si_vec_dot_q6_K above, so the dot is bit-exact.
+struct q6k_dot_in { int vl, vh, u0, u1, sc0, sc1; float d, d80, d81; };
+__device__ __forceinline__ q6k_dot_in si_load_q6_K(const unsigned char* __restrict__ bq6,
+                                                   const si_block_q8_1* __restrict__ bq8, int iqs) {
+    q6k_dot_in r;
+    const signed char* scales = reinterpret_cast<const signed char*>(bq6 + 192);
+    r.d = q4kf_h2f(bq6 + 208);
+    const int bq8_offset   = 4 * (iqs / 16) + (iqs % 16) / 8;
+    const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+    const int vh_shift     = 2 * ((iqs % 16) / 8);
+    r.vl = si_get_int_b2(bq6, iqs);
+    r.vh = si_get_int_b2(bq6 + 128, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;
+    const signed char* sc = scales + scale_offset;
+    r.sc0 = (int)sc[0];
+    r.sc1 = (int)sc[4];
+    const si_block_q8_1* b80 = bq8 + bq8_offset;
+    const si_block_q8_1* b81 = bq8 + bq8_offset + 2;
+    r.u0 = reinterpret_cast<const int*>(b80->qs)[iqs % 8]; r.d80 = __low2float(b80->ds);
+    r.u1 = reinterpret_cast<const int*>(b81->qs)[iqs % 8]; r.d81 = __low2float(b81->ds);
+    return r;
+}
+__device__ __forceinline__ float si_compute_q6_K(const q6k_dot_in& r) {
+    const int vil0 = (r.vl) & 0x0F0F0F0F, vih0 = ((r.vh) << 4) & 0x30303030;
+    const int vi0  = __vsubss4(vil0 | vih0, 0x20202020);
+    const int vil1 = (r.vl >> 4) & 0x0F0F0F0F, vih1 = ((r.vh >> 4) << 4) & 0x30303030;
+    const int vi1  = __vsubss4(vil1 | vih1, 0x20202020);
+    float sumf = r.d80 * (__dp4a(vi0, r.u0, 0) * r.sc0) + r.d81 * (__dp4a(vi1, r.u1, 0) * r.sc1);
+    return r.d * sumf;
+}
+
 // down (MMVQ): out[token,hh] = sum_j w_j * <h_j, down[e_j,hh]>. one warp per (token,hh),
 // loops top_k experts and dp4a's Q6_K weights against the pre-quantized Q8_1 activation.
 __global__ void down_q6k_mmvq_kernel(
@@ -370,6 +404,50 @@ __global__ void down_q6k_mmvq_kernel(
         for (int kbx = 0; kbx < nblk; kbx++)
             t += si_vec_dot_q6_K(drow + (size_t)kbx * 210, h8 + (size_t)kbx * 8, lane);
         acc += w * t;
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
+}
+
+// Software-pipelined Q6_K down: issue ALL of an expert's NBLK superblock loads at once and
+// prefetch the NEXT expert's loads while the current expert's dp4a runs, so the occupancy-light
+// bs=1 down keeps ~2*NBLK HBM reads in flight per warp. Distinct from the split-K occupancy
+// lever (no extra warps) — hides memory latency via per-warp MLP. Per-expert accumulation, so
+// the result is bit-exact vs the plain down_q6k_mmvq_kernel. NBLK is the superblock count.
+template <int NBLK>
+__global__ void down_q6k_mmvq_pipe_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k
+) {
+    const int token = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int hh = blockIdx.y * WPB + (threadIdx.x >> 5);
+    if (hh >= H) return;
+    const int q8pb = F >> 5;        // Q8_1 blocks per expert activation row
+    auto load_expert = [&](int j, q6k_dot_in d[NBLK], float& w) {
+        const int ts = token * top_k + j;
+        const int e = expert_ids[ts];
+        const unsigned char* dr = down_q + ((size_t)e * H + hh) * NBLK * 210;
+        const si_block_q8_1*  h  = hq8 + (size_t)ts * q8pb;
+        w = expert_weights[ts];
+        #pragma unroll
+        for (int k = 0; k < NBLK; k++) d[k] = si_load_q6_K(dr + (size_t)k * 210, h + (size_t)k * 8, lane);
+    };
+    q6k_dot_in cur[NBLK], nxt[NBLK];
+    float wcur, wnxt = 0.f;
+    load_expert(0, cur, wcur);
+    float acc = 0.f;
+    for (int j = 0; j < top_k; j++) {
+        if (j + 1 < top_k) load_expert(j + 1, nxt, wnxt);   // prefetch next expert's loads
+        float t = 0.f;
+        #pragma unroll
+        for (int k = 0; k < NBLK; k++) t += si_compute_q6_K(cur[k]);
+        acc += wcur * t;
+        #pragma unroll
+        for (int k = 0; k < NBLK; k++) cur[k] = nxt[k];
+        wcur = wnxt;
     }
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
@@ -424,6 +502,43 @@ __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4, const
     float2 dm4f = __half22float2(bq4->dm);
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
 }
+
+// Load/compute split of si_vec_dot_q4_K so the down can software-pipeline (prefetch the next
+// expert's loads while the current dp4a runs). Same values + math -> bit-exact dot.
+struct q4k_dot_in { int v0, v1, u0, u1, u2, u3, sc0, sc1, m0, m1; float d80, d81, dmx, dmy; };
+__device__ __forceinline__ q4k_dot_in si_load_q4_K(const si_block_q4_K* bq4,
+                                                   const si_block_q8_1* bq8_1, int iqs) {
+    q4k_dot_in r;
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    const int* q4 = (const int*)(bq4->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+    r.v0 = q4[0]; r.v1 = q4[4];
+    const unsigned short* scales = (const unsigned short*)bq4->scales;
+    unsigned short aux[2]; const int jj = bq8_offset / 2;
+    if (jj < 2) { aux[0] = scales[jj] & 0x3f3f; aux[1] = scales[jj + 2] & 0x3f3f; }
+    else { aux[0] = ((scales[jj + 2] >> 0) & 0x0f0f) | ((scales[jj - 2] & 0xc0c0) >> 2);
+           aux[1] = ((scales[jj + 2] >> 4) & 0x0f0f) | ((scales[jj]     & 0xc0c0) >> 2); }
+    const unsigned char* sc = (const unsigned char*)aux; const unsigned char* m = sc + 2;
+    r.sc0 = sc[0]; r.sc1 = sc[1]; r.m0 = m[0]; r.m1 = m[1];
+    const si_block_q8_1* b0 = bq8_1 + bq8_offset;
+    const si_block_q8_1* b1 = bq8_1 + bq8_offset + 1;
+    r.d80 = __low2float(b0->ds); const int* q80 = (const int*)b0->qs + ((iqs / 2) % 4); r.u0 = q80[0]; r.u1 = q80[4];
+    r.d81 = __low2float(b1->ds); const int* q81 = (const int*)b1->qs + ((iqs / 2) % 4); r.u2 = q81[0]; r.u3 = q81[4];
+    float2 dm = __half22float2(bq4->dm); r.dmx = dm.x; r.dmy = dm.y;
+    return r;
+}
+__device__ __forceinline__ float si_compute_q4_K(const q4k_dot_in& r) {
+    float sumf_d = 0.f, sumf_m = 0.f;
+    { const int v0i = (r.v0) & 0x0F0F0F0F, v1i = (r.v1) & 0x0F0F0F0F;
+      const int dot1 = __dp4a(v1i, r.u1, __dp4a(v0i, r.u0, 0));
+      const int dot2 = __dp4a(0x01010101, r.u1, __dp4a(0x01010101, r.u0, 0));
+      sumf_d += r.d80 * (dot1 * r.sc0); sumf_m += r.d80 * (dot2 * r.m0); }
+    { const int v0i = (r.v0 >> 4) & 0x0F0F0F0F, v1i = (r.v1 >> 4) & 0x0F0F0F0F;
+      const int dot1 = __dp4a(v1i, r.u3, __dp4a(v0i, r.u2, 0));
+      const int dot2 = __dp4a(0x01010101, r.u3, __dp4a(0x01010101, r.u2, 0));
+      sumf_d += r.d81 * (dot1 * r.sc1); sumf_m += r.d81 * (dot2 * r.m1); }
+    return r.dmx * sumf_d - r.dmy * sumf_m;
+}
+
 __global__ void gate_up_mmvq2_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
@@ -492,6 +607,55 @@ __global__ void down_q4k_mmvq_kernel(
     if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
 }
 
+// Software-pipelined Q4_K down (same lever as the Q6_K pipe): each lane loads all of an
+// expert's vdr=2 positions at once and prefetches the next expert while the current dp4a
+// runs -> more HBM reads in flight per warp on the occupancy-light bs=1 down. Per-expert
+// accumulation, so bit-exact vs down_q4k_mmvq_kernel. NBLK = superblocks per row.
+template <int NBLK>
+__global__ void down_q4k_mmvq_pipe_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k
+) {
+    const int token = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int hh = blockIdx.y * WPB + (threadIdx.x >> 5);
+    if (hh >= H) return;
+    const int q8pb = F >> 5;
+    constexpr int work = NBLK * 16;          // vdr=2 positions per superblock
+    constexpr int POS  = (work + 31) / 32;   // positions this lane handles (last may be inactive)
+    auto load_expert = [&](int jj, q4k_dot_in d[POS], bool valid[POS], float& w) {
+        const int ts = token * top_k + jj;
+        const int e = expert_ids[ts];
+        const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
+            down_q + ((size_t)e * H + hh) * NBLK * 144);
+        const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+        w = expert_weights[ts];
+        #pragma unroll
+        for (int p = 0; p < POS; p++) {
+            const int wi = lane + p * 32; valid[p] = (wi < work);
+            if (valid[p]) { const int kbx = wi >> 4, kqs = (wi & 15) << 1;
+                            d[p] = si_load_q4_K(drow + kbx, h8 + (size_t)kbx * 8, kqs); }
+        }
+    };
+    q4k_dot_in cur[POS], nxt[POS]; bool vcur[POS], vnxt[POS]; float wcur, wnxt = 0.f;
+    load_expert(0, cur, vcur, wcur);
+    float acc = 0.f;
+    for (int j = 0; j < top_k; j++) {
+        if (j + 1 < top_k) load_expert(j + 1, nxt, vnxt, wnxt);
+        float t = 0.f;
+        #pragma unroll
+        for (int p = 0; p < POS; p++) if (vcur[p]) t += si_compute_q4_K(cur[p]);
+        acc += wcur * t;
+        #pragma unroll
+        for (int p = 0; p < POS; p++) { cur[p] = nxt[p]; vcur[p] = vnxt[p]; }
+        wcur = wnxt;
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
@@ -543,6 +707,11 @@ void launch_moe_expert_ffn_q4k(
     // it, faithful to llama.cpp vec_dot_q6_K_q8_1.
     static int down_mmvq = -1;
     if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_DOWN_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
+    // Software-pipelined down (default ON): prefetch the next superblock's loads while the
+    // current dp4a runs -> more weight reads in flight per warp on the occupancy-light bs=1
+    // down. SPARKINFER_DOWN_PIPE=0 restores the plain one-load-at-a-time down.
+    static int down_pipe = -1;
+    if (down_pipe < 0) { const char* pp = getenv("SPARKINFER_DOWN_PIPE"); down_pipe = (pp && pp[0] == '0') ? 0 : 1; }
     if (down_mmvq && down_type == 14) {   // 14 = ggml Q6_K
         si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);   // <= hidden floats; fits
         const int nqb = num_tokens * top_k * (ffn >> 5);
@@ -550,9 +719,20 @@ void launch_moe_expert_ffn_q4k(
         quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
             h_scratch, hq8, nqb);
         dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
-        down_q6k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
-            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
-            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+        const int nblk = ffn >> 8;
+        #define SI_Q6K_PIPE(NB) down_q6k_mmvq_pipe_kernel<NB><<<dnm, WPB * 32, 0, stream>>>( \
+            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8, \
+            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k)
+        if      (down_pipe && nblk == 3) SI_Q6K_PIPE(3);
+        else if (down_pipe && nblk == 2) SI_Q6K_PIPE(2);
+        else if (down_pipe && nblk == 4) SI_Q6K_PIPE(4);
+        else if (down_pipe && nblk == 6) SI_Q6K_PIPE(6);
+        else if (down_pipe && nblk == 8) SI_Q6K_PIPE(8);
+        else
+            down_q6k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
+                reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+        #undef SI_Q6K_PIPE
         return;
     }
 
@@ -567,9 +747,20 @@ void launch_moe_expert_ffn_q4k(
         quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
             h_scratch, hq8, nqb);
         dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
-        down_q4k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
-            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
-            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+        const int nblk = ffn >> 8;
+        #define SI_Q4K_PIPE(NB) down_q4k_mmvq_pipe_kernel<NB><<<dnm, WPB * 32, 0, stream>>>( \
+            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8, \
+            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k)
+        if      (down_pipe && nblk == 3) SI_Q4K_PIPE(3);
+        else if (down_pipe && nblk == 2) SI_Q4K_PIPE(2);
+        else if (down_pipe && nblk == 4) SI_Q4K_PIPE(4);
+        else if (down_pipe && nblk == 6) SI_Q4K_PIPE(6);
+        else if (down_pipe && nblk == 8) SI_Q4K_PIPE(8);
+        else
+            down_q4k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
+                reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+        #undef SI_Q4K_PIPE
         return;
     }
 
