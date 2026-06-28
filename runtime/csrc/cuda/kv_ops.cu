@@ -24,6 +24,7 @@ __global__ void kv_append_kernel(
 
     const int pos    = write_pos[seq];
     const int blk    = pos / block_size;
+    if (blk >= max_blocks_per_seq) return;
     const int within = pos % block_size;
     const int phys   = block_table[seq * max_blocks_per_seq + blk];
     const size_t dst = ((size_t)(phys * block_size + within) * num_kv_heads + h) * head_dim + d;
