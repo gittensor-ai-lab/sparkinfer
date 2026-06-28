@@ -54,6 +54,49 @@ __global__ void gemv_kernel(const __nv_bfloat16* __restrict__ x,
 template __global__ void gemv_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int);
 template __global__ void gemv_kernel<float>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int);
 
+// split-K bf16 GEMV for small N (the router projection: N = n_experts). One-warp-per-row leaves
+// the GPU idle at N=128, so the read runs far below the bandwidth roofline. S warps cooperate per
+// output row (each sums a 1/S stride of the K reduction, S-way shared reduce). The activation is
+// read straight from L2 (no shared staging + __syncthreads, which dominates at this size). RPB =
+// GEMV_WPB/S rows per block. Faithful: only the fp reduction order changes.
+template <typename OutT, int S>
+__global__ void gemv_f32_sk_kernel(const __nv_bfloat16* __restrict__ x,
+                                   const __nv_bfloat16* __restrict__ W,
+                                   OutT* __restrict__ y, int N, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float s_part[RPB][S];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n = blockIdx.x * RPB + row_local;
+    float acc = 0.f;
+    if (n < N) {
+        const uint4* row4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+        const uint4* x4 = reinterpret_cast<const uint4*>(x);
+        const int n4 = K / 8;                          // 8 bf16 per uint4
+        for (int i = split * 32 + lane; i < n4; i += S * 32) {
+            uint4 wv = row4[i], xv = x4[i];
+            const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float2 wf = __bfloat1622float2(wh[j]), xf = __bfloat1622float2(xh[j]);
+                acc += wf.x * xf.x + wf.y * xf.y;
+            }
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+        if (lane == 0) s_part[row_local][split] = acc;
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[row_local][s];
+        gemv_write(y + n, o);
+    }
+}
+template __global__ void gemv_f32_sk_kernel<float, 4>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int);
+
 // ---- quantized on-read GEMV (W = GGUF-native Q4_K/Q6_K [N,K]) -----------------
 // Dequantizes each 256-block in registers and dots with a full-precision (fp32)
 // activation — reads the quantized weight bytes (~4x less than bf16) with NO int8
@@ -484,7 +527,22 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K, cudaStream
         reinterpret_cast<__nv_bfloat16*>(y), N, K);
 }
 
+// split-K occupancy for the f32-output bf16 GEMV. Default ON: at decode this path serves the
+// router projection (N = n_experts is tiny), where one-warp-per-row idles the GPU.
+// SPARKINFER_ROUTER_SK=0 restores the plain one-warp-per-row kernel. Needs K a multiple of 8.
+static int gemv_f32_splitk() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPARKINFER_ROUTER_SK"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K, cudaStream_t stream) {
+    if (gemv_f32_splitk() && (K & 7) == 0) {
+        constexpr int S = 4, RPB = GEMV_WPB / S;
+        dim3 grid((N + RPB - 1) / RPB);
+        gemv_f32_sk_kernel<float, S><<<grid, GEMV_WPB * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);
+        return;
+    }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_kernel<float><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);
