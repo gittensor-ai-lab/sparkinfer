@@ -10,6 +10,7 @@
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/kv_ops.h"
 #include "sparkinfer/gguf.h"
+#include "sparkinfer/spec_decode.h"
 #include "sparkinfer/kernels/attention.h"
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/fused.h"
@@ -83,6 +84,28 @@ struct Qwen35Model::Impl {
     bool use_q6mmvq = true;  // default ON: int8 Q6_K mmvq for attn-V upgrades + LM head. =0 disables
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
+
+    // --- speculative decoding (opt-in; see enable_speculative / forward_tokens_batch) ---
+    // Batched verification scratch, fixed-width K = spec_k. The single-token
+    // path above (x/xn/q/k/.../graph_ready) is untouched by any of this.
+    int spec_k = 0;
+    bool spec_ready = false;
+    cudaGraph_t spec_graph{};
+    cudaGraphExec_t spec_exec{};
+    bool spec_graph_ready = false;
+    bf16 *sk_x=nullptr, *sk_xn=nullptr, *sk_q=nullptr, *sk_k=nullptr, *sk_v=nullptr, *sk_attn=nullptr,
+         *sk_ao=nullptr, *sk_h=nullptr, *sk_hn=nullptr, *sk_routed=nullptr, *sk_shared=nullptr;
+    float* sk_logits = nullptr;
+    int *sk_tok=nullptr, *sk_pos=nullptr, *sk_seqlen=nullptr, *sk_out_id=nullptr;
+    int* sk_shared_ids = nullptr; float* sk_shared_w = nullptr;
+    float *sk_mf_logits=nullptr, *sk_mf_weights=nullptr, *sk_mf_h=nullptr, *sk_mf_out=nullptr;
+    int *sk_mf_ids=nullptr, *sk_mf_counts=nullptr;
+    // Per-layer transposed copies of GGUF-native [out,in] dense weights, used
+    // only by the batched verification path (forward_token's GEMV-on-read
+    // path keeps using the original [out,in] copies). Empty for the non-GGUF
+    // (load_weights) path, which already stores dense weights [in,out].
+    std::vector<const void*> spec_wq, spec_wk, spec_wv, spec_wo, spec_router_w;
+    const void* spec_lm_head = nullptr;
 };
 
 Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine)
@@ -148,6 +171,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
+    if (p_->spec_graph_ready) { cudaGraphExecDestroy(p_->spec_exec); cudaGraphDestroy(p_->spec_graph); }
     cudaStreamDestroy(p_->stream);
     delete p_;
 }
@@ -475,6 +499,257 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;
+}
+
+// ----- speculative decoding: batched verification + prompt-lookup draft loop -----
+//
+// forward_token() above is single-token (batch=1) and CUDA-graph-captured for
+// that fixed shape. Speculative decoding needs a *second*, separately-captured
+// graph for a fixed verification width K: draft up to K-1 tokens, run all K
+// through one batched forward pass, and accept the longest prefix that agrees
+// with the real (greedy) model output. Every kernel below already takes a
+// batch/row count in its signature (it was just always called with 1); the one
+// piece that does NOT already exist is a batched GEMM over GGUF's native
+// [out,in] dense weight layout (only a single-row GEMV-on-read kernel does),
+// so enable_speculative() pre-transposes one extra [in,out] bf16 copy per dense
+// weight, once, and forward_tokens_batch() uses the existing launch_gemm /
+// launch_linear_f32 / launch_moe_router_gemm against those copies. The
+// per-token attention step still appends KV and runs flash-decode one row at a
+// time (sequentially dependent within a layer -- token i's keys must already
+// be in the cache before token i+1 can attend to them), but that is cheap
+// relative to the weight reads the batching is meant to amortize.
+//
+// KV cache entries are appended for all K speculative positions whether or
+// not they end up accepted; no rollback is needed because future calls always
+// pass the correct (smaller) seq_len, so a rejected tail is simply never read,
+// and gets overwritten the next time a real token lands on that position.
+
+void Qwen35Model::enable_speculative(int k) {
+    Impl& s = *p_;
+    if (s.spec_ready) return;   // idempotent; k is fixed for the lifetime of the graph
+    if (k < 2) { fprintf(stderr, "[qwen35] enable_speculative: k must be >= 2\n"); return; }
+    const Qwen35Config& c = s.cfg;
+    const int H = c.hidden;
+
+    if (s.gguf) {
+        for (const auto& w : s.w.layers) {
+            if (w.wq_type || w.wk_type || w.wv_type || w.wo_type) {
+                fprintf(stderr, "[qwen35] enable_speculative: SPARKINFER_QATTN on-read-quantized "
+                                "attention weights are not supported by the batched verification path "
+                                "yet; reload without SPARKINFER_QATTN to use speculative decoding.\n");
+                return;
+            }
+        }
+        if (s.w.lm_head_type) {
+            fprintf(stderr, "[qwen35] enable_speculative: quantized lm_head is not supported by the "
+                            "batched verification path yet.\n");
+            return;
+        }
+    }
+
+    auto alloc = [&](size_t bytes) { void* p=nullptr; cu(cudaMalloc(&p, bytes), "spec malloc"); s.owned.push_back(p); return p; };
+    s.sk_x      = (bf16*)alloc((size_t)k*H*2);          s.sk_xn     = (bf16*)alloc((size_t)k*H*2);
+    s.sk_q      = (bf16*)alloc((size_t)k*s.qdim*2);     s.sk_k      = (bf16*)alloc((size_t)k*s.kvdim*2);
+    s.sk_v      = (bf16*)alloc((size_t)k*s.kvdim*2);    s.sk_attn   = (bf16*)alloc((size_t)k*s.qdim*2);
+    s.sk_ao     = (bf16*)alloc((size_t)k*H*2);          s.sk_h      = (bf16*)alloc((size_t)k*H*2);
+    s.sk_hn     = (bf16*)alloc((size_t)k*H*2);          s.sk_routed = (bf16*)alloc((size_t)k*H*2);
+    s.sk_shared = (bf16*)alloc((size_t)k*H*2);
+    s.sk_logits = (float*)alloc((size_t)k*c.vocab*sizeof(float));
+    s.sk_tok    = (int*)alloc((size_t)k*sizeof(int));   s.sk_pos    = (int*)alloc((size_t)k*sizeof(int));
+    s.sk_seqlen = (int*)alloc((size_t)k*sizeof(int));   s.sk_out_id = (int*)alloc((size_t)k*sizeof(int));
+    s.sk_shared_ids = (int*)alloc((size_t)k*sizeof(int));
+    s.sk_shared_w   = (float*)alloc((size_t)k*sizeof(float));
+    s.sk_mf_logits  = (float*)alloc((size_t)k*c.n_experts*sizeof(float));
+    s.sk_mf_ids     = (int*)alloc((size_t)k*c.top_k*sizeof(int));
+    s.sk_mf_weights = (float*)alloc((size_t)k*c.top_k*sizeof(float));
+    s.sk_mf_counts  = (int*)alloc((size_t)c.n_experts*sizeof(int));
+    s.sk_mf_h       = (float*)alloc((size_t)k*c.top_k*c.moe_ffn*sizeof(float));
+    s.sk_mf_out     = (float*)alloc((size_t)k*H*sizeof(float));
+
+    std::vector<int> zeros(k, 0);
+    std::vector<float> ones(k, 1.f);
+    cu(cudaMemcpy(s.sk_shared_ids, zeros.data(), k*sizeof(int), cudaMemcpyHostToDevice), "sk shared ids");
+    cu(cudaMemcpy(s.sk_shared_w, ones.data(), k*sizeof(float), cudaMemcpyHostToDevice), "sk shared w");
+
+    if (s.gguf) {
+        // [out,in] -> [in,out], once per dense weight, so the batched path can
+        // use the plain row-major GEMM kernel (see launch_gemm's [K,N] B layout).
+        auto transpose = [&](const void* src, int out, int in) -> const void* {
+            void* dst = alloc((size_t)out*in*2);
+            kernels::launch_transpose_bf16(src, dst, out, in, s.stream);
+            return dst;
+        };
+        s.spec_wq.resize(c.n_layers); s.spec_wk.resize(c.n_layers);
+        s.spec_wv.resize(c.n_layers); s.spec_wo.resize(c.n_layers);
+        s.spec_router_w.resize(c.n_layers);
+        for (int L = 0; L < c.n_layers; L++) {
+            const Qwen35LayerWeights& w = s.w.layers[L];
+            s.spec_wq[L]        = transpose(w.wq,        s.qdim,      H);
+            s.spec_wk[L]        = transpose(w.wk,        s.kvdim,     H);
+            s.spec_wv[L]        = transpose(w.wv,        s.kvdim,     H);
+            s.spec_wo[L]        = transpose(w.wo,        H,           s.qdim);
+            s.spec_router_w[L]  = transpose(w.router_w,  c.n_experts, H);
+        }
+        s.spec_lm_head = transpose(s.w.lm_head, c.vocab, H);
+        cu(cudaStreamSynchronize(s.stream), "spec transpose sync");
+    }
+
+    s.spec_k = k;
+    s.spec_ready = true;
+}
+
+bool Qwen35Model::forward_tokens_batch(const int* tokens, int n, int start_position, int* out_argmax) {
+    Impl& s = *p_;
+    if (!s.spec_ready || n != s.spec_k) {
+        fprintf(stderr, "[qwen35] forward_tokens_batch: enable_speculative(%d) not called, or n=%d mismatch\n", n, n);
+        return false;
+    }
+    const Qwen35Config& c = s.cfg;
+    const int H = c.hidden, K = s.spec_k;
+    kernels::GemmConfig gc{};
+    cudaStream_t st = s.stream;
+
+    std::vector<int> h_pos(K), h_seqlen(K);
+    for (int i = 0; i < K; i++) { h_pos[i] = start_position + i; h_seqlen[i] = start_position + i + 1; }
+    cu(cudaMemcpyAsync(s.sk_tok, tokens, K*sizeof(int), cudaMemcpyHostToDevice, st), "sk tok");
+    cu(cudaMemcpyAsync(s.sk_pos, h_pos.data(), K*sizeof(int), cudaMemcpyHostToDevice, st), "sk pos");
+    cu(cudaMemcpyAsync(s.sk_seqlen, h_seqlen.data(), K*sizeof(int), cudaMemcpyHostToDevice, st), "sk seqlen");
+
+    if (s.spec_graph_ready) {
+        cu(cudaGraphLaunch(s.spec_exec, st), "spec graph launch");
+        cu(cudaMemcpyAsync(out_argmax, s.sk_out_id, K*sizeof(int), cudaMemcpyDeviceToHost, st), "sk out");
+        cu(cudaStreamSynchronize(st), "sk sync");
+        return true;
+    }
+    cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "sk begin capture");
+
+    int* btable = s.kv->block_table(s.seq_id);
+    kernels::launch_embedding(s.sk_tok, s.w.embed_tokens, s.sk_x, K, H, st);
+    kernels::launch_rmsnorm(s.sk_x, s.w.layers[0].input_norm, s.sk_xn, K, H, c.rms_eps, st);
+
+    for (int L = 0; L < c.n_layers; L++) {
+        const Qwen35LayerWeights& w = s.w.layers[L];
+        const void* wq_g = s.gguf ? s.spec_wq[L] : w.wq;
+        const void* wk_g = s.gguf ? s.spec_wk[L] : w.wk;
+        const void* wv_g = s.gguf ? s.spec_wv[L] : w.wv;
+        const void* wo_g = s.gguf ? s.spec_wo[L] : w.wo;
+        kernels::launch_gemm(s.sk_xn, wq_g, s.sk_q, K, s.qdim,  H, 1.f, 0.f, gc, st);
+        kernels::launch_gemm(s.sk_xn, wk_g, s.sk_k, K, s.kvdim, H, 1.f, 0.f, gc, st);
+        kernels::launch_gemm(s.sk_xn, wv_g, s.sk_v, K, s.kvdim, H, 1.f, 0.f, gc, st);
+
+        kernels::launch_rmsnorm(s.sk_q, w.q_norm, s.sk_q, K * c.n_q_heads,  c.head_dim, c.rms_eps, st);
+        kernels::launch_rmsnorm(s.sk_k, w.k_norm, s.sk_k, K * c.n_kv_heads, c.head_dim, c.rms_eps, st);
+        kernels::launch_rope(s.sk_q, s.sk_k, s.sk_pos, K, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, st);
+
+        bf16* kpool = (bf16*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems();
+        bf16* vpool = (bf16*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems();
+        // Sequential across the K speculative positions within this layer:
+        // token i's K/V must be in the cache before token i+1 attends to it.
+        // Cheap relative to the batched weight reads above/below.
+        for (int i = 0; i < K; i++) {
+            launch_kv_append(kpool, vpool, s.sk_k + (size_t)i*s.kvdim, s.sk_v + (size_t)i*s.kvdim,
+                             btable, s.sk_pos + i, 1, c.n_kv_heads, c.head_dim,
+                             s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+            kernels::launch_flash_decode_split(s.sk_q + (size_t)i*s.qdim, kpool, vpool, btable, s.sk_seqlen + i,
+                                               s.sk_attn + (size_t)i*s.qdim, s.fa_m, s.fa_l, s.fa_acc,
+                                               1, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                                               s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
+                                               1.f / sqrtf((float)c.head_dim), st);
+        }
+        kernels::launch_gemm(s.sk_attn, wo_g, s.sk_ao, K, H, s.qdim, 1.f, 0.f, gc, st);
+        kernels::launch_add_rmsnorm2(s.sk_x, s.sk_ao, w.post_attn_norm, s.sk_h, s.sk_hn, K, H, c.rms_eps, st);
+
+        if (w.gate_q) {
+            const void* router_g = s.gguf ? s.spec_router_w[L] : w.router_w;
+            kernels::launch_moe_router_gemm(s.sk_hn, router_g, s.sk_mf_logits, K, c.hidden, c.n_experts, st);
+            cu(cudaMemsetAsync(s.sk_mf_counts, 0, c.n_experts * sizeof(int), st), "sk mf counts");
+            kernels::launch_moe_router(s.sk_mf_logits, s.sk_mf_ids, s.sk_mf_weights, s.sk_mf_counts,
+                                       K, c.n_experts, c.top_k, 1, st);
+            kernels::launch_moe_expert_ffn_q4k(s.sk_hn, w.gate_q, w.up_q, w.down_q,
+                                               w.gate_qtype, w.up_qtype, w.down_qtype,
+                                               s.sk_mf_ids, s.sk_mf_weights, s.sk_routed, s.sk_mf_h, s.sk_mf_out,
+                                               K, c.top_k, c.hidden, c.moe_ffn, st);
+        } else {
+            s.engine->set_layer_weights(L, {w.router_w, w.gate, w.up, w.down});
+            s.engine->forward(s.sk_hn, s.sk_routed, K, L, st);
+        }
+        if (c.n_shared > 0) {
+            kernels::launch_moe_expert_ffn(s.sk_hn, w.shared_gate, w.shared_up, w.shared_down,
+                                           s.sk_shared_ids, s.sk_shared_w, s.sk_shared,
+                                           K, 1, 1, H, c.moe_ffn, st);
+            launch_residual_add(s.sk_routed, s.sk_shared, s.sk_routed, K * H, st);
+        }
+        const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
+        kernels::launch_add_rmsnorm2(s.sk_h, s.sk_routed, nextnorm, s.sk_x, s.sk_xn, K, H, c.rms_eps, st);
+    }
+    const void* lmw = s.gguf ? s.spec_lm_head : s.w.lm_head;
+    kernels::launch_linear_f32(s.sk_xn, lmw, s.sk_logits, K, c.vocab, H, st);
+    kernels::launch_argmax(s.sk_logits, s.sk_out_id, K, c.vocab, st);
+
+    cu(cudaStreamEndCapture(st, &s.spec_graph), "sk end capture");
+    cu(cudaGraphInstantiate(&s.spec_exec, s.spec_graph, 0), "sk graph instantiate");
+    s.spec_graph_ready = true;
+    cu(cudaGraphLaunch(s.spec_exec, st), "sk graph launch (first)");
+
+    cu(cudaMemcpyAsync(out_argmax, s.sk_out_id, K*sizeof(int), cudaMemcpyDeviceToHost, st), "sk out (first)");
+    cu(cudaStreamSynchronize(st), "sk sync (first)");
+    return true;
+}
+
+std::vector<int> Qwen35Model::generate_speculative(const std::vector<int>& prompt, int max_new, int draft_k) {
+    Impl& s = *p_;
+    std::vector<int> out;
+    if (prompt.empty() || draft_k < 2) return out;
+    if (!s.spec_ready) enable_speculative(draft_k);
+    if (!s.spec_ready || s.spec_k != draft_k) {
+        fprintf(stderr, "[qwen35] generate_speculative: enable_speculative(%d) unavailable; "
+                        "falling back to non-speculative generate()\n", draft_k);
+        return generate(prompt, max_new);
+    }
+    if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
+        fprintf(stderr, "[qwen35] generate_speculative: KV allocate failed\n");
+        return out;
+    }
+
+    std::vector<int> committed = prompt;
+    int next = -1;
+    for (size_t i = 0; i < prompt.size(); i++) next = forward_token(prompt[i], (int)i);
+    int cur = next;
+    int pos = (int)prompt.size() - 1;
+
+    long rounds = 0, total_drafted = 0, total_accepted = 0;
+    bool stop = false;
+    while (!stop && (int)out.size() < max_new) {
+        std::vector<int> draft = propose_draft(committed, draft_k - 1);
+        std::vector<int> batch_in; batch_in.reserve(draft_k);
+        batch_in.push_back(cur);
+        for (int d : draft) batch_in.push_back(d);
+        while ((int)batch_in.size() < draft_k) batch_in.push_back(cur);   // pad to the fixed graph width
+
+        std::vector<int> verified(draft_k);
+        if (!forward_tokens_batch(batch_in.data(), draft_k, pos + 1, verified.data())) break;   // enable_speculative() above guarantees this doesn't happen
+
+        AcceptResult r = accept_draft(draft, verified);
+        rounds++; total_drafted += (long)draft.size();
+
+        out.push_back(cur); committed.push_back(cur); pos++;
+        stop = (cur == s.cfg.eos_id);
+        for (int i = 0; i < r.accepted && !stop && (int)out.size() < max_new; i++) {
+            out.push_back(draft[i]); committed.push_back(draft[i]); pos++;
+            total_accepted++;
+            stop = (draft[i] == s.cfg.eos_id);
+        }
+        cur = r.bonus_token;
+    }
+    if (rounds > 0) {
+        fprintf(stderr, "[qwen35] speculative decode: %ld forward passes for %zu tokens, "
+                        "draft accept rate %.1f%% (%ld/%ld)\n",
+                rounds, out.size(), total_drafted ? 100.0 * total_accepted / total_drafted : 0.0,
+                total_accepted, total_drafted);
+    }
+    if ((int)out.size() > max_new) out.resize(max_new);
+    s.kv->free(s.seq_id);
+    return out;
 }
 
 } // namespace sparkinfer
