@@ -26,6 +26,17 @@ file(GLOB_RECURSE RUNTIME_SRC "src/*.cpp" "csrc/cuda/*.cu")
 add_library(sparkinfer_runtime SHARED ${RUNTIME_SRC})
 target_include_directories(sparkinfer_runtime PUBLIC include)
 target_link_libraries(sparkinfer_runtime PUBLIC sparkinfer_moe sparkinfer_kernels CUDA::cudart)
+
+# GPU observability (heat/power/clock) uses NVML when available; VRAM works without it. NVML ships
+# with the CUDA toolkit as CUDA::nvml — link + flag it when present so the build degrades cleanly
+# on boxes/toolkits without the NVML stub.
+if(TARGET CUDA::nvml)
+    target_link_libraries(sparkinfer_runtime PUBLIC CUDA::nvml)
+    target_compile_definitions(sparkinfer_runtime PRIVATE SPARKINFER_HAVE_NVML)
+    message(STATUS "sparkinfer: NVML found — GPU temperature/power observability enabled")
+else()
+    message(STATUS "sparkinfer: NVML not found — GPU observability limited to VRAM")
+endif()
 target_compile_options(sparkinfer_runtime PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;-lineinfo>)
 set_target_properties(sparkinfer_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -39,7 +50,8 @@ if(BUILD_EXAMPLES)
     add_executable(qwen35_generate examples/qwen35_generate.cpp)
     target_link_libraries(qwen35_generate PRIVATE sparkinfer_runtime CUDA::cudart)
     add_executable(qwen3_gguf_generate examples/qwen3_gguf_generate.cpp)
-    target_link_libraries(qwen3_gguf_generate PRIVATE sparkinfer_runtime CUDA::cudart)
+    find_package(Threads REQUIRED)   # background GPU-observability sampler uses std::thread
+    target_link_libraries(qwen3_gguf_generate PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
     add_executable(qwen3_gguf_bench examples/qwen3_gguf_bench.cpp)
     target_link_libraries(qwen3_gguf_bench PRIVATE sparkinfer_runtime CUDA::cudart)
     add_executable(qwen3_gguf_score examples/qwen3_gguf_score.cpp)

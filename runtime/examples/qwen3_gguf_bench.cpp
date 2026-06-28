@@ -73,9 +73,16 @@ int main(int argc, char** argv) {
     size_t freeb=0, totb=0; cudaMemGetInfo(&freeb,&totb);
 
     double toks = model.bench_decode(8, n_tokens);
+    auto gpu = sparkinfer::query_gpu_stats();   // sampled right after the decode loop — near peak heat
     printf("\n=== sparkinfer bench (%s) ===\n", gguf_mode ? "Q4_K_M native" : "bf16");
     printf("model        : Qwen3-30B-A3B  (%d layers, %d experts top-%d)\n", cfg.n_layers, cfg.n_experts, cfg.top_k);
     printf("VRAM used    : %.1f GB\n", (totb - freeb) / 1e9);
     printf("decode tg    : %.2f tok/s  (%.1f ms/token, n=%d, bs=1)\n", toks, 1000.0 / toks, n_tokens);
+    if (gpu.valid && gpu.temp_c >= 0) {
+        printf("GPU          : %d°C", gpu.temp_c);
+        if (gpu.power_w      >= 0) printf(" · %d W", gpu.power_w);
+        if (gpu.sm_clock_mhz >= 0) printf(" · %d MHz", gpu.sm_clock_mhz);
+        printf(" (peak under load)\n");
+    }
     return 0;
 }
