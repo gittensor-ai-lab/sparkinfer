@@ -64,7 +64,14 @@ KVCacheManager::~KVCacheManager() {
 bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
     const int need = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
     if ((int)impl_->free_list.size() < need || impl_->free_slots.empty()) return false;
-    if (need > kMaxBlocksPerSeq) return false;
+    // Bound the CUMULATIVE per-seq block count, not just this request. A
+    // re-allocate (grow) for an existing seq appends to its row, and each row in
+    // d_block_tables is exactly kMaxBlocksPerSeq wide — so checking only `need`
+    // lets blocks.size() exceed the row, and the cudaMemcpy below would then
+    // write past it into the adjacent sequence's block table (OOB device write).
+    auto existing = impl_->seq_blocks.find(seq_id);
+    const int have = (existing != impl_->seq_blocks.end()) ? (int)existing->second.size() : 0;
+    if (have + need > kMaxBlocksPerSeq) return false;
 
     auto& blocks = impl_->seq_blocks[seq_id];
     for (int i = 0; i < need; i++) { blocks.push_back(impl_->free_list.back()); impl_->free_list.pop_back(); }
