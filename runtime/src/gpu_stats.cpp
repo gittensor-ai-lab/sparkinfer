@@ -26,11 +26,21 @@ static bool nvml_ready() {
 std::string GpuStats::str() const {
     if (!valid) return "GPU stats unavailable";
     char buf[192];
-    int n = snprintf(buf, sizeof buf, "%d°C · %.1f/%.1f GB VRAM",
-                     temp_c, vram_used_gb(), vram_total_gb());
-    if (power_w      >= 0) n += snprintf(buf + n, sizeof buf - n, " · %d W", power_w);
-    if (sm_clock_mhz >= 0) n += snprintf(buf + n, sizeof buf - n, " · %d MHz", sm_clock_mhz);
-    return std::string(buf, n > 0 ? n : 0);
+    const int cap = (int)sizeof buf;
+    // snprintf returns the length it WOULD have written; on truncation that exceeds the
+    // buffer, so advancing `buf + n` with `cap - n` (size_t) would point past the buffer
+    // and underflow the size. Append() clamps the cursor to what was actually written.
+    int n = 0;
+    auto append = [&](const char* fmt, auto... args) {
+        if (n >= cap - 1) return;
+        int m = snprintf(buf + n, (size_t)(cap - n), fmt, args...);
+        if (m < 0) return;
+        n += (m < cap - 1 - n) ? m : cap - 1 - n;   // clamp to bytes actually written
+    };
+    append("%d°C · %.1f/%.1f GB VRAM", temp_c, vram_used_gb(), vram_total_gb());
+    if (power_w      >= 0) append(" · %d W", power_w);
+    if (sm_clock_mhz >= 0) append(" · %d MHz", sm_clock_mhz);
+    return std::string(buf, n);
 }
 
 GpuStats query_gpu_stats(int device_id) {
