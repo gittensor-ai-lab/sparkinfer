@@ -8,6 +8,7 @@
 // autoregressive greedy decoding fundamentally requires.
 
 #include "sparkinfer/models/qwen35.h"
+#include "sparkinfer/thermal_governor.h"
 #include "sparkinfer/kv_ops.h"
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/kernels/attention.h"
@@ -311,7 +312,7 @@ double Qwen35Model::bench_decode(int warmup, int n) {
     return n / secs;
 }
 
-std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new) {
+std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
     Impl& s = *p_;
     std::vector<int> out;
     if (prompt.empty()) return out;
@@ -325,6 +326,7 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         out.push_back(next);
         if (next == s.cfg.eos_id) break;
         next = forward_token(next, (int)prompt.size() + i);
+        if (gov) gov->pace();   // thermally-adaptive decode pacing (accuracy-preserving; no-op if disabled)
     }
     s.kv->free(s.seq_id);
     return out;

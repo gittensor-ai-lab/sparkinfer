@@ -11,6 +11,7 @@
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
+#include "sparkinfer/thermal_governor.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -97,12 +98,30 @@ int main(int argc, char** argv) {
         }
     });
 
-    auto out = model.generate(prompt, max_new);
+    // Thermally-adaptive decode pacing (opt-in via SPARKINFER_THERMAL=1). Accuracy-preserving —
+    // it only slows token emission when the GPU runs hot. Thresholds/paces overridable via env.
+    auto envi = [](const char* k, int d){ const char* v = getenv(k); return v ? atoi(v) : d; };
+    sparkinfer::ThermalGovernor::Config tg;
+    tg.enabled         = envi("SPARKINFER_THERMAL", 0) != 0;
+    tg.balanced_c      = envi("SPARKINFER_THERMAL_BALANCED_C", tg.balanced_c);
+    tg.safe_c          = envi("SPARKINFER_THERMAL_SAFE_C",     tg.safe_c);
+    tg.emergency_c     = envi("SPARKINFER_THERMAL_EMERGENCY_C", tg.emergency_c);
+    tg.log_transitions = true;
+    sparkinfer::ThermalGovernor gov(tg);
+    if (tg.enabled)
+        printf("thermal: ON (turbo<%d°C, balanced≥%d, safe≥%d, emergency≥%d)\n",
+               tg.balanced_c, tg.balanced_c, tg.safe_c, tg.emergency_c);
+
+    auto out = model.generate(prompt, max_new, tg.enabled ? &gov : nullptr);
     sampling.store(false, std::memory_order_relaxed);
     sampler.join();
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { printf("[FAIL] cuda: %s\n", cudaGetErrorString(e)); return 1; }
     printf("GPU peak under load: %s\n", peak.str().c_str());
+    if (tg.enabled)
+        printf("thermal: final mode=%s, peak %d°C, %llu/%d tokens throttled\n",
+               sparkinfer::ThermalGovernor::mode_name(gov.mode()), gov.peak_temp_c(),
+               (unsigned long long)gov.throttled_tokens(), (int)out.size());
 
     printf("OUTPUT_IDS:");
     for (int id : out) printf(" %d", id);

@@ -10,6 +10,7 @@ option(BUILD_TESTS    "Build unit / integration tests" ON)
 option(BUILD_EXAMPLES "Build example programs"          ON)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)   # thermal governor's inter-token pace uses std::this_thread
 
 # This repo is the integrator: pull in sparkinfer-kernels and sparkinfer-moe.
 # In a superbuild the targets may already exist; standalone, add the siblings.
@@ -25,7 +26,7 @@ include_directories(include)
 file(GLOB_RECURSE RUNTIME_SRC "src/*.cpp" "csrc/cuda/*.cu")
 add_library(sparkinfer_runtime SHARED ${RUNTIME_SRC})
 target_include_directories(sparkinfer_runtime PUBLIC include)
-target_link_libraries(sparkinfer_runtime PUBLIC sparkinfer_moe sparkinfer_kernels CUDA::cudart)
+target_link_libraries(sparkinfer_runtime PUBLIC sparkinfer_moe sparkinfer_kernels CUDA::cudart Threads::Threads)
 
 # GPU observability (heat/power/clock) uses NVML when available; VRAM works without it. NVML ships
 # with the CUDA toolkit as CUDA::nvml — link + flag it when present so the build degrades cleanly
