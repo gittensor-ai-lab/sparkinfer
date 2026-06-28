@@ -164,8 +164,41 @@ __global__ void add_rmsnorm2_kernel(const __nv_bfloat16* __restrict__ x,
         out_norm[base + c] = __float2bfloat16(__bfloat162float(out_sum[base + c]) * inv_rms * __bfloat162float(weight[c]));
 }
 
+// Fused per-head Q-norm + K-norm: ONE kernel over (n_q_heads + n_kv_heads) heads
+// (each block normalizes one head), vs two launch_rmsnorm calls. 1 graph node saved.
+__global__ void rmsnorm_qk_kernel(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k,
+                                  const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+                                  int n_q_heads, int head_dim, float eps) {
+    const int hh = blockIdx.x;
+    __nv_bfloat16* x; const __nv_bfloat16* w; int head;
+    if (hh < n_q_heads) { x = q; w = q_w; head = hh; }
+    else                { x = k; w = k_w; head = hh - n_q_heads; }
+    const size_t base = (size_t)head * head_dim;
+    __shared__ float s_warp[32];
+    const int t = threadIdx.x;
+    const float v = (t < head_dim) ? __bfloat162float(x[base + t]) : 0.f;
+    float ss = rn_warp_sum(v * v);
+    if ((t & 31) == 0) s_warp[t >> 5] = ss;
+    __syncthreads();
+    if (t < 32) {
+        float vv = (t < (blockDim.x + 31) / 32) ? s_warp[t] : 0.f;
+        vv = rn_warp_sum(vv);
+        if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+    }
+    __syncthreads();
+    if (t < head_dim) x[base + t] = __float2bfloat16(v * s_warp[0] * __bfloat162float(w[t]));
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
+
+void launch_rmsnorm_qk(void* q, void* k, const void* q_w, const void* k_w,
+                       int n_q_heads, int n_kv_heads, int head_dim, float eps, cudaStream_t stream) {
+    rmsnorm_qk_kernel<<<n_q_heads + n_kv_heads, head_dim, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+        n_q_heads, head_dim, eps);
+}
 
 void launch_rmsnorm(const void* x, const void* weight, void* out,
                     int rows, int cols, float eps, cudaStream_t stream) {
