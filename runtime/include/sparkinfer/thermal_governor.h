@@ -41,6 +41,12 @@ public:
         int predict_horizon_ms = 1500;
 
         bool log_transitions = false;   // print a line on each mode change (observability)
+
+        // Testing/benchmark override: when `forced` is set, apply `forced_mode` every token and
+        // ignore temperature — lets a sweep measure each mode's power/heat/throughput
+        // deterministically. Temperature is still sampled for observability.
+        bool forced      = false;
+        Mode forced_mode = Mode::Turbo;
     };
 
     explicit ThermalGovernor(const Config& cfg) : cfg_(cfg) {}

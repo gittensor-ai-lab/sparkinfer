@@ -64,15 +64,17 @@ double ThermalGovernor::pace() {
         started_ = true;
     }
 
-    if (last_temp_ < 0) return 0.0;   // no sensor → never throttle
-
-    // Predictive: tier on max(measured, projected) so a fast rise throttles before crossing.
-    int eff = last_temp_;
-    if (cfg_.predict_horizon_ms > 0 && slope_ > 0.0)
-        eff = last_temp_ + (int)(slope_ * cfg_.predict_horizon_ms / 1000.0);
-
     const Mode prev = mode_;
-    mode_ = classify(cfg_, eff);
+    int eff = last_temp_;
+    if (cfg_.forced) {
+        mode_ = cfg_.forced_mode;            // deterministic sweep: temperature ignored
+    } else {
+        if (last_temp_ < 0) return 0.0;      // auto mode + no sensor → never throttle
+        // Predictive: tier on max(measured, projected) so a fast rise throttles before crossing.
+        if (cfg_.predict_horizon_ms > 0 && slope_ > 0.0)
+            eff = last_temp_ + (int)(slope_ * cfg_.predict_horizon_ms / 1000.0);
+        mode_ = classify(cfg_, eff);
+    }
     const double ms = pace_ms_for(cfg_, mode_);
 
     if (cfg_.log_transitions && mode_ != prev)
