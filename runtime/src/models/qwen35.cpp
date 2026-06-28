@@ -224,9 +224,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
             kernels::launch_gemm(s.xn, w.wk, s.k, 1, s.kvdim, H, 1.f, 0.f, gc, st);
             kernels::launch_gemm(s.xn, w.wv, s.v, 1, s.kvdim, H, 1.f, 0.f, gc, st);
         }
-        kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
-        kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
-        kernels::launch_rope(s.q, s.k, s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, st);
+        // Fused q_norm + k_norm + RoPE (one kernel vs four) — cuts bs=1 launch latency,
+        // output bit-identical to the separate rmsnorm/rope kernels.
+        kernels::launch_qknorm_rope(s.q, s.k, w.q_norm, w.k_norm, s.d_pos,
+                                    c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, c.rope_theta, st);
 
         bf16* kpool = (bf16*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems();
         bf16* vpool = (bf16*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems();
