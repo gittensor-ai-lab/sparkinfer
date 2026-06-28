@@ -59,9 +59,14 @@ GpuStats query_gpu_stats(int device_id) {
         nvmlDevice_t h{};
         if (nvmlDeviceGetHandleByPciBusId_v2(pci, &h) == NVML_SUCCESS) {
             unsigned t = 0, p = 0, c = 0;
+            // These NVML getters are marked deprecated in CUDA 13's nvml.h but remain the portable
+            // way to read temp/power across CUDA 12 and 13 — silence the deprecation note.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             if (nvmlDeviceGetTemperature(h, NVML_TEMPERATURE_GPU, &t) == NVML_SUCCESS) s.temp_c = (int)t;
             if (nvmlDeviceGetPowerUsage(h, &p) == NVML_SUCCESS)                        s.power_w = (int)(p / 1000); // mW→W
             if (nvmlDeviceGetClockInfo(h, NVML_CLOCK_SM, &c) == NVML_SUCCESS)          s.sm_clock_mhz = (int)c;
+#pragma GCC diagnostic pop
             s.valid = true;
         }
     }

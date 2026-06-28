@@ -82,8 +82,12 @@ int main(int argc, char** argv) {
 
     for (int k = 0; k < 4; k++) {
         G::Config tc; tc.enabled = true; tc.forced = true; tc.forced_mode = MODES[k].m;
-        G gov(tc);
 
+        // Per-mode warmup (untimed, unsampled): run this mode long enough to reach its steady
+        // clock/power state, so the measured average isn't dragged by the ramp-up transient.
+        { G warm(tc); model.generate(prompt, n_tokens / 4 + 16, &warm); }
+
+        G gov(tc);
         // Background sampler: GPU power + temperature every 100 ms while this mode decodes.
         std::atomic<bool> run{true};
         long sum_pw=0, sum_t=0, cnt=0; int pk_pw=0, pk_t=0;
