@@ -56,8 +56,12 @@ def main():
     )
     # vocab from token_embd if metadata missing
     ten = {t.name: t for t in r.tensors}
-    if "token_embd.weight" in ten:
-        cfg["vocab"] = int(ten["token_embd.weight"].shape[-1]) if False else cfg["vocab"]
+    if not meta(A + "vocab_size") and "token_embd.weight" in ten:
+        # token_embd.weight is [vocab, hidden] (see embed_tokens write below), so the
+        # vocab axis is shape[0]. The previous `... if False else cfg["vocab"]` made this
+        # fallback a no-op, leaving cfg["vocab"] at the hardcoded 151936 default whenever
+        # the GGUF lacks <arch>.vocab_size — which mis-sizes the LM head for such models.
+        cfg["vocab"] = int(ten["token_embd.weight"].shape[0])
 
     with open(os.path.join(out, "config.txt"), "w") as f:
         for k, v in cfg.items():
