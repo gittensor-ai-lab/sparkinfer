@@ -19,6 +19,12 @@ void launch_add_rmsnorm2(const void* x_bf16, const void* residual_bf16, const vo
                          void* out_sum_bf16, void* out_norm_bf16,
                          int rows, int cols, float eps, cudaStream_t stream = nullptr);
 
+// add_rmsnorm2 that additionally emits a Q8_1 quantization of out_norm (si_block_q8_1),
+// so the downstream int8 GEMV skips its own quantize node. rows==1, cols % 256 == 0.
+void launch_add_rmsnorm2_q8(const void* x_bf16, const void* residual_bf16, const void* weight_bf16,
+                            void* out_sum_bf16, void* out_norm_bf16, void* out_q8,
+                            int cols, float eps, cudaStream_t stream = nullptr);
+
 // Fused per-head Q-norm + K-norm in one kernel (1 graph node vs 2). In-place on q/k.
 void launch_rmsnorm_qk(void* q, void* k, const void* q_w, const void* k_w,
                        int n_q_heads, int n_kv_heads, int head_dim, float eps, cudaStream_t stream = nullptr);
