@@ -16,6 +16,11 @@
 namespace sparkinfer {
 namespace kernels {
 
+// Upper bound on top_k. The per-token selection holds the chosen logits/ids in
+// fixed-size registers (sel_logit/sel_id below), so top_k must not exceed this —
+// the launcher rejects larger values instead of overrunning those arrays.
+static constexpr int MOE_ROUTER_MAX_TOPK = 16;
+
 // Warp arg-max: returns the max value across the warp; *idx is set on every lane
 // to the index that owns it (ties resolved to the lowest index).
 __device__ __forceinline__ float warp_argmax(float val, int& idx) {
@@ -44,8 +49,8 @@ __global__ void moe_router_kernel(
     for (int e = lane; e < num_experts; e += 32) s_logits[e] = row[e];
     __syncwarp();
 
-    float sel_logit[16];                   // top_k <= 16
-    int   sel_id[16];
+    float sel_logit[MOE_ROUTER_MAX_TOPK];  // top_k <= MOE_ROUTER_MAX_TOPK (launcher-enforced)
+    int   sel_id[MOE_ROUTER_MAX_TOPK];
 
     for (int j = 0; j < top_k; j++) {
         float best = -1e30f; int best_i = -1;
@@ -94,6 +99,7 @@ void launch_moe_router(
     int normalize, cudaStream_t stream
 ) {
     if (num_tokens <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts) return;
+    if (top_k > MOE_ROUTER_MAX_TOPK) return;   // sel_logit/sel_id are sized to MOE_ROUTER_MAX_TOPK
     size_t smem = (size_t)num_experts * sizeof(float);
     moe_router_kernel<<<num_tokens, 32, smem, stream>>>(
         logits, expert_ids, expert_weights, tokens_per_expert,
