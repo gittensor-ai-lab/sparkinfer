@@ -83,6 +83,8 @@ struct Qwen35Model::Impl {
     bool use_llama = true; // default ON: faithful llama mmvq for Q4_K attn GEMVs (+9.7%, top1 0.99). =0 disables
     bool use_q6mmvq = true;  // default ON: int8 Q6_K mmvq for attn-V upgrades + LM head. =0 disables
     bool use_qkfuse = true;// default ON: fused per-head Q-norm + K-norm (1 kernel). =0 disables
+    bool use_fnq = true;   // default ON: post-MoE add_rmsnorm2 also emits Q8_1(xn), deleting the
+                           // next layer's standalone QKV-input quantize node. =0 disables
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -137,6 +139,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_LLAMA")) p_->use_llama = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_Q6MMVQ")) p_->use_q6mmvq = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_QKFUSE")) p_->use_qkfuse = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_FNQ"))    p_->use_fnq   = !(e[0] == '0');
 }
 
 Qwen35Model::~Qwen35Model() {
@@ -197,6 +200,11 @@ int Qwen35Model::forward_token(int token_id, int position) {
     // per-layer input RMSNorm + two residual-adds collapse into two fused kernels.
     kernels::launch_rmsnorm(s.x, s.w.layers[0].input_norm, s.xn, 1, H, c.rms_eps, st);
 
+    // When the fused norm+quant path is on, each layer's post-MoE add_rmsnorm2 also emits
+    // Q8_1(xn) into aq81, so the next layer's QKV-input quantize (and the LM-head quantize)
+    // are already done. Only the prime norm above still needs the standalone quant (layer 0).
+    const bool fnq = s.gguf && s.use_fnq && s.use_pq && s.use_llama;
+
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         if (s.gguf) {   // GGUF dense weights are native [out,in] -> coalesced GEMV
@@ -204,7 +212,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
             // (no per-block, per-GEMV re-quant). Q6_K/bf16 weights keep their existing path.
             const bool any_q4k = (w.wq_type == 12 || w.wk_type == 12 || w.wv_type == 12);
             const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
-            if (s.use_pq && s.use_llama && (any_q4k || any_q6k))
+            if (fnq && L > 0) { /* aq81 = Q8_1(xn) already emitted by layer L-1's post-MoE norm */ }
+            else if (s.use_pq && s.use_llama && (any_q4k || any_q6k))
                 kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);   // shared Q8_1(xn) for Q4_K + Q6_K mmvq
             else if (s.use_pq && any_q4k)
                 kernels::launch_quantize_q8_1(s.xn, s.aq8, s.aq8_d, s.aq8_s, H, st);
@@ -256,8 +265,12 @@ int Qwen35Model::forward_token(int token_id, int position) {
         else if (s.gguf)         kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
         else                     kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
 
-        // fused: h = x + ao ; hn = RMSNorm(h, post_attn_norm)
-        kernels::launch_add_rmsnorm2(s.x, s.ao, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
+        // fused: h = x + ao ; hn = RMSNorm(h, post_attn_norm). When fnq, also emit Q8_1(hn) into
+        // aq81 so the MoE gate/up mmvq skips its own quantize node (the router below reads bf16 hn).
+        if (fnq)
+            kernels::launch_add_rmsnorm2_q8(s.x, s.ao, w.post_attn_norm, s.h, s.hn, s.aq81, H, c.rms_eps, st);
+        else
+            kernels::launch_add_rmsnorm2(s.x, s.ao, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
 
         if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
             kernels::launch_gemv_f32(s.hn, w.router_w, s.mf_logits, c.n_experts, c.hidden, st);  // router_w native [E,H]
@@ -275,7 +288,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
             kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
-                                               1, c.top_k, c.hidden, c.moe_ffn, st);
+                                               1, c.top_k, c.hidden, c.moe_ffn,
+                                               fnq ? s.aq81 : nullptr, st);
         } else {
             s.engine->set_layer_weights(L, {w.router_w, w.gate, w.up, w.down});
             s.engine->forward(s.hn, s.routed, 1, L, st);
@@ -288,11 +302,14 @@ int Qwen35Model::forward_token(int token_id, int position) {
         }
         // fused: x = h + routed ; xn = RMSNorm(x, next input_norm or final_norm)
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+        if (fnq)
+            kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
+        else
+            kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
     }
     // xn now holds RMSNorm(x_final, final_norm)
     if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
-        kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
+        if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
         kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
     }
     else if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
