@@ -136,13 +136,14 @@ def block_account(login, reason):
 # ---- copycat detection (a later PR that re-submits an earlier PR's diff) ----
 # A PR is a copycat if its added lines are largely contained in an EARLIER PR touching the same
 # file(s). Copycats are labeled `copycat`, commented (citing the original), and NOT evaluated.
-# Logged to .github/copycats.json; a 2nd copycat by the same author auto-adds them to the denylist.
+# Logged to .github/copycats.json; ANY copycat immediately blocks the author and closes the PR
+# (zero tolerance — no penalty period, no strike threshold).
 FLAG_FILE = os.path.join(ROOT, ".github", "FLAGGED.md")
 COPYCAT_LABEL = "copycat"
 COPYCAT_LOG = os.path.join(ROOT, ".github", "copycats.json")
 COPYCAT_CONTAINMENT = 0.80   # ≥80% of the copy's added lines also appear in the original
-COPYCAT_STRIKES = 2          # this many copycats by one author -> denylist (permanent block)
-PENALTY_DAYS = 5             # every copycat strike freezes the author's evals for this long
+COPYCAT_STRIKES = 1          # zero tolerance: the FIRST copycat denylists the author + closes the PR
+PENALTY_DAYS = 5             # (legacy; copycats now block immediately, so no penalty period applies)
 PENALTY_LABEL = "penalty"    # applied to a penalized author's PRs instead of greenlighting them
 
 def author_penalty_until(author):
@@ -202,9 +203,9 @@ def flag_copycat(repo, num, original, author):
     add_label(repo, num, COPYCAT_LABEL)
     body = (f"<!-- sparkinfer-copycat -->\n## 🐈 Flagged: copycat\n\n"
             f"This PR re-submits substantially the same diff as the earlier #{original}. "
-            f"Duplicating an existing PR's work does not earn a score — copycats are **not "
-            f"evaluated or merged**.\n\nRepeated copycatting (≥{COPYCAT_STRIKES}) results in an "
-            f"automatic block. See [`.github/COPYCATS.md`](../blob/main/.github/COPYCATS.md).")
+            f"Duplicating another contributor's work is treated as gaming the SN74 emission "
+            f"mechanism. The account has been **blocked** and this PR **closed** — zero tolerance, "
+            f"no warning. See [`.github/COPYCATS.md`](../blob/main/.github/COPYCATS.md).")
     gh(["pr", "comment", str(num), "-R", repo, "--body", body])
 
 def evaluated_commits(repo, num):
@@ -583,8 +584,9 @@ def main():
             print(f"PR #{num}: BLOCKED (denylisted: {', '.join(sorted(hits))}) — flag + close, no eval")
             if not args.dry_run: close_blocked_pr(args.repo, num, hits)
             continue
-        # Gate 2 — copycat: re-submits a DIFFERENT author's earlier diff. Label, log, skip eval;
-        # 2nd strike -> block. (Self-resubmissions are excluded by find_original.)
+        # Gate 2 — copycat: re-submits a DIFFERENT author's earlier diff. Zero tolerance — flag,
+        # block the author, and close the PR immediately (no eval, no penalty, no strike threshold).
+        # (Self-resubmissions are excluded by find_original.)
         original = find_original(num)
         if original is not None:
             author = pr_author.get(num, "?")
