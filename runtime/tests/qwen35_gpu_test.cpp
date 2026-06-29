@@ -88,5 +88,20 @@ int main() {
     printf("[PASS] qwen35_gpu_test: generated 8 tokens:");
     for (int id : out) printf(" %d", id);
     printf("\n");
+
+    int invalid_pos_neg = model.forward_token(1, -1);
+    if (invalid_pos_neg != cfg.eos_id) {
+        printf("[FAIL] expected forward_token(1, -1) to return eos_id=%d, got %d\n", cfg.eos_id, invalid_pos_neg);
+        return 1;
+    }
+
+    int invalid_pos_oob = model.forward_token(1, cfg.max_seq);
+    if (invalid_pos_oob != cfg.eos_id) {
+        printf("[FAIL] expected forward_token(1, max_seq) to return eos_id=%d, got %d\n", cfg.eos_id, invalid_pos_oob);
+        return 1;
+    }
+
+    printf("[PASS] qwen35_gpu_test: forward_token rejects out-of-range positions\n");
+
     return 0;
 }
