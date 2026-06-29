@@ -88,5 +88,20 @@ int main() {
     printf("[PASS] qwen35_gpu_test: generated 8 tokens:");
     for (int id : out) printf(" %d", id);
     printf("\n");
+
+    sparkinfer::Qwen35Config clipped_cfg = cfg;
+    clipped_cfg.max_seq = 4;
+    sparkinfer::KVCacheManager clipped_kv(kvc, 128ull<<20);
+    sparkinfer::Qwen35Model clipped_model(clipped_cfg, &clipped_kv, engine.get());
+    clipped_model.set_weights(w);
+
+    std::vector<int> short_prompt = {2, 8};
+    auto clipped = clipped_model.generate(short_prompt, 8);
+    if ((int)clipped.size() != 2) {
+        printf("[FAIL] expected clipped output 2 tokens, got %zu\n", clipped.size());
+        return 1;
+    }
+
+    printf("[PASS] qwen35_gpu_test: output clipping honors max_seq budget (max_new=8, max_seq=4, prompt_len=2 => 2 tokens)\n");
     return 0;
 }

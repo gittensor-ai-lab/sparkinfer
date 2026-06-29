@@ -373,6 +373,26 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     Impl& s = *p_;
     std::vector<int> out;
     if (prompt.empty()) return out;
+
+    const int prompt_len = (int)prompt.size();
+    if (s.cfg.max_seq <= 0) {
+        fprintf(stderr, "[qwen35] generate: max_seq must be > 0 (got %d)\n", s.cfg.max_seq);
+        return out;
+    }
+
+    if (max_new <= 0) return out;
+
+    if (prompt_len >= s.cfg.max_seq) {
+        fprintf(stderr, "[qwen35] generate: prompt length %d exceeds or equals max_seq %d\n", prompt_len, s.cfg.max_seq);
+        return out;
+    }
+
+    int max_allow = s.cfg.max_seq - prompt_len;
+    if (max_new > max_allow) {
+        fprintf(stderr, "[qwen35] generate: max_new clipped from %d to %d to fit max_seq=%d\n", max_new, max_allow, s.cfg.max_seq);
+        max_new = max_allow;
+    }
+
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
         fprintf(stderr, "[qwen35] KV allocate failed (pool too small for max_seq=%d)\n", s.cfg.max_seq);
         return out;
