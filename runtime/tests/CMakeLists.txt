@@ -13,6 +13,12 @@ target_link_libraries(thermal_governor_cpu_test PRIVATE sparkinfer_runtime)
 set_target_properties(thermal_governor_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME thermal_governor_cpu_test COMMAND thermal_governor_cpu_test)
 
+# Continuous-batching scheduler — pure host policy (no GPU).
+add_executable(scheduler_cpu_test scheduler_cpu_test.cpp)
+target_link_libraries(scheduler_cpu_test PRIVATE sparkinfer_runtime)
+set_target_properties(scheduler_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME scheduler_cpu_test COMMAND scheduler_cpu_test)
+
 # GPU integration tests — run the real device path; skip without a device.
 add_executable(decode_runner_gpu_test decode_runner_gpu_test.cpp)
 target_link_libraries(decode_runner_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
