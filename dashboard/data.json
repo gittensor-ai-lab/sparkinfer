@@ -1,17 +1,17 @@
 {
-  "updated": "2026-06-28",
+  "updated": "2026-06-29",
   "status": {
     "gpu": "RTX 5090 · sm_120 · CUDA 13",
     "model": "Qwen3-30B-A3B · Q4_K_M",
-    "frontier_tps": 394.45,
+    "frontier_tps": 410.85,
     "ref_name": "llama.cpp",
-    "ref_tps": 372,
+    "ref_tps": 366,
     "vram_gb": 21.4,
     "token_match": 0.97,
     "kl": 0.1417,
     "ref_note": "128-tok decode, same RTX 5090"
   },
-  "passes_gpu": "RTX PRO 6000",
+  "passes_gpu": "RTX 5090",
   "passes": [
     {
       "name": "baseline",
@@ -83,17 +83,49 @@
   ],
   "prs": [
     {
-      "num": 83,
-      "title": "perf(moe): requantize the Q6_K MoE down to Q4_K at load (+2.6% decode)",
+      "num": 87,
+      "title": "perf(attn): fuse Q/K/V Q4_K MMVQ into one launch (+3% decode)",
       "areas": [
+        "kernels",
         "runtime"
       ],
-      "label": "REJECT",
-      "tps": 404.06,
-      "delta_pct": null,
-      "top1": 0.95,
-      "kl": 0.2104,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/83"
+      "label": "S",
+      "tps": 408.73,
+      "delta_pct": 3.7,
+      "top1": 0.97,
+      "kl": 0.1417,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/87",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0087-0fb1fe1"
+    },
+    {
+      "num": 86,
+      "title": "perf(decode): single-pass MoE top-k + fused RoPE/KV-append (+3.2% decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 408.23,
+      "delta_pct": 3.6,
+      "top1": 0.97,
+      "kl": 0.1417,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/86",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0086-1fafcc2"
+    },
+    {
+      "num": 83,
+      "title": "perf(decode): emit Q8_1 from the residual RMSNorm to drop the per-layer activation quantize (+2.7% decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 410.85,
+      "delta_pct": 4.3,
+      "top1": 0.97,
+      "kl": 0.1417,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/83",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0083-9bf0803"
     },
     {
       "num": 72,
@@ -106,7 +138,8 @@
       "delta_pct": 3.5,
       "top1": 0.97,
       "kl": 0.1417,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/72"
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/72",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0072-d459d58"
     },
     {
       "num": 73,
@@ -636,6 +669,12 @@
       "tps": 394.45,
       "pr": 72,
       "date": "2026-06-28"
+    },
+    {
+      "name": "emit Q8_1 from the residual ",
+      "tps": 410.85,
+      "pr": 83,
+      "date": "2026-06-29"
     }
   ]
 }

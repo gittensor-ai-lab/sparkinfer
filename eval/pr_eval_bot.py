@@ -339,7 +339,50 @@ def push_dash(msg):
     subprocess.run(["git", "-C", ROOT, "pull", "-q", "--rebase", "origin", "main"], capture_output=True)
     subprocess.run(["git", "-C", ROOT, "push", "-q", "origin", "main"], capture_output=True)
 
-def update_dashboard(repo, pr, areas, res):
+LOG_REPO  = os.environ.get("SPARKINFER_LOG_REPO", "https://github.com/gittensor-ai-lab/sparkinfer-log.git")
+LOG_DIR   = os.path.expanduser(os.environ.get("SPARKINFER_LOG_DIR", "~/.sparkinfer_log_checkout"))
+LOG_PAGE  = "https://gittensor-ai-lab.github.io/sparkinfer-log/?run="
+
+def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
+    """Commit this eval's raw log + result to the public sparkinfer-log repo (immutable record),
+    rendered at a unique per-run URL. Best-effort: never blocks the eval. Returns the page URL."""
+    try:
+        rid = f"{int(num):04d}-{oid[:7]}"
+        if not os.path.isdir(os.path.join(LOG_DIR, ".git")):
+            subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
+        else:
+            subprocess.run(["git", "-C", LOG_DIR, "pull", "-q", "--rebase"], check=False)
+        rundir = os.path.join(LOG_DIR, "runs", rid); os.makedirs(rundir, exist_ok=True)
+        result = {"id": rid, "pr": int(num), "title": title,
+                  "url": f"https://github.com/{repo}/pull/{num}", "commit": oid[:7],
+                  "label": res.get("label"), "tps": res.get("tps"),
+                  "baseline_tps": round(baseline, 2) if baseline else None,
+                  "delta_pct": res.get("pct_over_frontier"), "delta_tps": res.get("delta_tps"),
+                  "top1": res.get("top1"), "kl": res.get("kl"),
+                  "gpu": "RTX 5090 (sm_120) · vast.ai", "date": datetime.date.today().isoformat(),
+                  "frontier": res.get("frontier_tps")}
+        json.dump(result, open(os.path.join(rundir, "result.json"), "w"), indent=2)
+        clean = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "<ip>", log_text or "")   # scrub host IPs
+        open(os.path.join(rundir, "log.txt"), "w").write(clean)
+        ipath = os.path.join(LOG_DIR, "index.json")
+        idx = json.load(open(ipath)) if os.path.exists(ipath) else []
+        idx = [e for e in idx if e.get("id") != rid]
+        idx.append({"id": rid, "pr": int(num), "title": title, "label": res.get("label"),
+                    "delta_pct": res.get("pct_over_frontier"), "tps": res.get("tps"), "date": result["date"]})
+        idx.sort(key=lambda x: x["id"])
+        json.dump(idx, open(ipath, "w"), indent=2)
+        subprocess.run(["git", "-C", LOG_DIR, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", LOG_DIR, "commit", "-q", "-m",
+                        f"eval: #{num} {oid[:7]} -> eval:{res.get('label')}"], check=False)
+        subprocess.run(["git", "-C", LOG_DIR, "push", "-q"], check=False)
+        url = LOG_PAGE + rid
+        print(f">> eval log: {url}")
+        return url
+    except Exception as e:
+        print(f">> eval-log upload skipped: {e}")
+        return None
+
+def update_dashboard(repo, pr, areas, res, proof_url=None):
     """Upsert the PR's eval verdict into the dashboard TABLE (`prs`) only. The frontier and the
     journey (`landed`) advance only when a PR is actually MERGED — see record_merge() — so the
     chart shows shipped code, never unmerged evals or a losing rival in the same round."""
@@ -351,6 +394,7 @@ def update_dashboard(repo, pr, areas, res):
              "delta_pct": res.get("pct_over_frontier"),
              "top1": res.get("top1"), "kl": res.get("kl"),
              "url": f"https://github.com/{repo}/pull/{num}"}
+    if proof_url: entry["proof_url"] = proof_url
     data["prs"] = [p for p in data.get("prs", []) if p.get("num") != num]
     data["prs"].insert(0, entry)
     data["prs"] = data["prs"][:50]
@@ -721,7 +765,9 @@ def main():
                 add_label(args.repo, num, REEVALUATE_LABEL)
         gh(["pr", "comment", str(num), "-R", args.repo, "--body", body])
         print(f"PR #{num}: posted {'eval:'+label if label else 'error'} — NOT merged.")
-        if res: update_dashboard(args.repo, pr, areas, res)
+        if res:
+            proof = upload_eval_log(args.repo, num, pr.get("title", ""), oid, res, r.stdout + r.stderr, run_baseline)
+            update_dashboard(args.repo, pr, areas, res, proof_url=proof)
         # NB: run_baseline is NOT ratcheted here — every PR is graded against merged origin/main, so
         # independent optimizations each get their true gain (the frontier advances on MERGE, not eval).
 

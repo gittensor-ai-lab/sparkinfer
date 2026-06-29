@@ -627,7 +627,7 @@ void launch_moe_expert_ffn_q4k(
     int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
-    int num_tokens, int top_k, int hidden, int ffn, cudaStream_t stream
+    int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream
 ) {
     // int8 dp4a path for Q4_K gate/up (decode parity with llama.cpp's MMVQ). Default
     // ON — the largest single decode cost; down stays on the fp path (Q6_K). Set
@@ -639,10 +639,16 @@ void launch_moe_expert_ffn_q4k(
     if (gu2 < 0) { const char* g2 = getenv("SPARKINFER_GU2"); gu2 = (g2 && g2[0] == '0') ? 0 : 1; }
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
-        si_block_q8_1* q = reinterpret_cast<si_block_q8_1*>(out_scratch);    // Q8_1(hn) once
-        const int nqb = num_tokens * (hidden >> 5);
-        si_quant_bf16_q8_1<<<nqb, 32, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(input), q, num_tokens * hidden);
+        const si_block_q8_1* q;
+        if (input_q8) {   // pre-quantized Q8_1(hn) from the fused norm: skip the quantize node
+            q = reinterpret_cast<const si_block_q8_1*>(input_q8);
+        } else {
+            si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(out_scratch);  // Q8_1(hn) once
+            const int nqb = num_tokens * (hidden >> 5);
+            si_quant_bf16_q8_1<<<nqb, 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
+            q = qbuf;
+        }
         gate_up_mmvq2_kernel<<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
             q, reinterpret_cast<const unsigned char*>(gate_q),
             reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hidden, ffn, top_k);
