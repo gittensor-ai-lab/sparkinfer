@@ -89,6 +89,8 @@ struct Qwen35Model::Impl {
     bool use_ropekv = true;// default ON: fused RoPE + KV-append (1 kernel vs 2). =0 disables
     bool use_fnq = true;   // default ON: post-MoE add_rmsnorm2 also emits Q8_1(xn), deleting the
                            // next layer's standalone QKV-input quantize node. =0 disables
+    bool use_attnq8 = true;// default ON: the flash-decode combine emits Q8_1(attn), deleting the
+                           // O-proj's standalone activation quantize node (1 kernel/layer). =0 disables
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -149,6 +151,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_QKFUSE")) p_->use_qkfuse = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ROPEKV")) p_->use_ropekv = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_FNQ"))    p_->use_fnq   = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_ATTNQ8")) p_->use_attnq8 = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_QKVSTREAM")) p_->use_qkvstream = !(e[0] == '0');
 }
 
@@ -281,13 +284,19 @@ int Qwen35Model::forward_token(int token_id, int position) {
             launch_kv_append(kpool, vpool, s.k, s.v, btable, s.d_writepos, 1,
                              c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
         }
+        // When the O-proj takes the llama Q4_K MMVQ path (reads a Q8_1 of attn), emit that Q8_1
+        // straight from the flash-decode combine — bit-identical to quantizing attn afterwards —
+        // and drop the standalone quantize node. Needs head_dim==128 (the only split instantiation).
+        const bool attnq8 = s.gguf && s.use_pq && s.use_llama && s.use_attnq8
+                            && (w.wo_type == 12) && (c.head_dim == 128);
         kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,
                                            s.fa_m, s.fa_l, s.fa_acc, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
                                            s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
-                                           1.f / sqrtf((float)c.head_dim), st);
+                                           1.f / sqrtf((float)c.head_dim), attnq8 ? s.aq81 : nullptr, st);
         if (s.gguf && s.use_pq && w.wo_type == 12) {   // O proj reads attn: quantize once + dp4a
             if (s.use_llama) {
-                kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
+                if (!attnq8) kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
+                // else: s.aq81 already holds Q8_1(s.attn), emitted by the combine pass above
                 kernels::launch_mmvq_q4k(s.aq81, w.wo, s.ao, H, s.qdim, st);
             } else {
                 kernels::launch_quantize_q8_1(s.attn, s.aq8, s.aq8_d, s.aq8_s, s.qdim, st);

@@ -12,12 +12,18 @@
 // One warp per block; head_dim=128 (Qwen3). Portable CUDA — sm_89 .. sm_120/121.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
 #endif
 
 namespace sparkinfer {
 namespace kernels {
+
+// Activation Q8_1 block, layout-identical to gemm.cu's si_block_q8_1 (the format the
+// llama-port Q4_K/Q6_K MMVQ kernels read). The combine kernel can emit it directly so the
+// O-projection's standalone activation quantize is deleted from the per-layer decode chain.
+struct fa_q8_block { __half2 ds; signed char qs[32]; };   // 36 B / 32 values
 
 __device__ __forceinline__ float fa_to_f(__nv_bfloat16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ float fa_wsum(float v) {
@@ -84,6 +90,7 @@ template <int HEAD_DIM, int DG, int NW>
 __global__ void fa_combine_kernel(
     const float* __restrict__ part_m, const float* __restrict__ part_l,
     const float* __restrict__ part_acc, __nv_bfloat16* __restrict__ out,
+    fa_q8_block* __restrict__ out_q8,   // optional: Q8_1(out) for the O-proj MMVQ (nullptr = skip)
     int num_q_heads, int n_splits
 ) {
     constexpr int ELEMS = HEAD_DIM / (32 * DG);
@@ -127,8 +134,34 @@ __global__ void fa_combine_kernel(
     }
     const float inv = (gl > 0.f) ? (1.f / gl) : 0.f;
     __nv_bfloat16* op = out + (size_t)(seq * num_q_heads + qh) * HEAD_DIM;
+
+    // Each (qh, dg) block runs ONE warp (warp 0) over 32 lanes, and for each ELEMS step the
+    // 32 lanes write a contiguous 32-element slice of head qh: doff = dg*(HEAD_DIM/DG)+lane,
+    // so {lane, lane+32, ...} cover head-elements [(dg*ELEMS+e)*32 .. +32). That slice is
+    // EXACTLY one si_block_q8_1, so when out_q8 is given we quantize it here (warp amax/sum
+    // over the same 32 lanes) — bit-identical to running si_quantize_q8_1_blocks on `out`
+    // afterwards (same bf16-rounded value, d=amax/127, qi=round(v/d), ds=(d, d*sum)) — and the
+    // runtime drops that per-layer kernel. Works for any DG: each e is its own 32-block.
+    const int bph = HEAD_DIM >> 5;   // 32-element blocks per head
     #pragma unroll
-    for (int e = 0; e < ELEMS; e++) op[doff + e * 32] = __float2bfloat16(acc[e] * inv);
+    for (int e = 0; e < ELEMS; e++) {
+        const __nv_bfloat16 ob = __float2bfloat16(acc[e] * inv);
+        op[doff + e * 32] = ob;
+        if (out_q8 != nullptr) {
+            const float bv = __bfloat162float(ob);   // bf16-rounded value, as the standalone reads back
+            float a = fabsf(bv);
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+            const float d = a / 127.0f;
+            const int qi = (a == 0.0f) ? 0 : (int)roundf(bv / d);
+            int qsum = qi;
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) qsum += __shfl_xor_sync(0xffffffffu, qsum, m);
+            const int ib = (seq * num_q_heads + qh) * bph + dg * ELEMS + e;   // 32-block index in out
+            out_q8[ib].qs[lane] = (signed char)qi;
+            if (lane == 0) out_q8[ib].ds = __floats2half2_rn(d, d * (float)qsum);
+        }
+    }
 }
 
 #ifndef FA_COMBINE_DG
@@ -139,7 +172,7 @@ __global__ void fa_combine_kernel(
 #endif
 template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
-template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int);
+template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, fa_q8_block*, int, int);
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/attention.h"
@@ -149,7 +182,7 @@ void launch_flash_decode_split(
     const int* block_table, const int* seq_lens, void* out,
     float* part_m, float* part_l, float* part_acc,
     int num_seqs, int num_q_heads, int num_kv_heads, int head_dim,
-    int block_size, int max_blocks, int n_splits, float scale, cudaStream_t stream
+    int block_size, int max_blocks, int n_splits, float scale, void* out_q8, cudaStream_t stream
 ) {
     dim3 g1(num_q_heads * n_splits, num_seqs);
     fa_split_kernel<128><<<g1, 32, 0, stream>>>(
@@ -158,7 +191,8 @@ void launch_flash_decode_split(
         part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
     dim3 g2(num_q_heads * FA_COMBINE_DG, num_seqs);
     fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW><<<g2, FA_COMBINE_NW * 32, 0, stream>>>(
-        part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits);
+        part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+        reinterpret_cast<fa_q8_block*>(out_q8), num_q_heads, n_splits);
     (void)head_dim;
 }
 #endif
