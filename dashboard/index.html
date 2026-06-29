@@ -200,7 +200,7 @@
 
   <section>
     <div class="sec-h"><h2>Evaluated PRs</h2><span class="hint">bot labels + comments · never auto-merges</span></div>
-    <div class="card"><table><thead><tr><th>PR</th><th>area</th><th>label</th><th>decode</th><th>vs frontier</th></tr></thead><tbody id="prs"></tbody></table></div>
+    <div class="card"><table><thead><tr><th>PR</th><th>area</th><th>label</th><th>decode</th><th>vs frontier</th><th>proof</th></tr></thead><tbody id="prs"></tbody></table></div>
   </section>
 
   <footer>
@@ -223,10 +223,12 @@
   $("updated").textContent = "updated " + D.updated;
   $("hero-acc").textContent = (s.token_match*100).toFixed(0)+"%";   // live frontier accuracy, not hardcoded
 
-  const gapx = (s.ref_tps/s.frontier_tps).toFixed(1);
+  const ahead = s.frontier_tps >= s.ref_tps;
+  const pct   = 100*(s.frontier_tps - s.ref_tps)/s.ref_tps;   // +ve when sparkinfer leads
+  const gapx  = (s.ref_tps/s.frontier_tps).toFixed(2);
   $("kpis").innerHTML = [
-    {lab:"Frontier decode", val:s.frontier_tps, unit:"tok/s", note:"single-stream, bs=1"},
-    {lab:"Gap to "+s.ref_name, val:gapx+"×", unit:"", note:`${s.ref_name} ${s.ref_tps} tok/s`},
+    {lab:"Frontier decode", val:s.frontier_tps, unit:"tok/s", note:"single-stream, bs=1 · 128-tok"},
+    {lab:(ahead?"vs ":"Gap to ")+s.ref_name, val:(ahead?"+"+pct.toFixed(1)+"%":gapx+"×"), unit:"", note:`${s.ref_name} ${s.ref_tps} tok/s · 128-tok`},
     {lab:"Accuracy", val:(s.token_match*100).toFixed(0)+"%", unit:"top-1", note:`KL ${s.kl} vs ${s.ref_name}`},
     {lab:"VRAM resident", val:s.vram_gb, unit:"GB", note:"experts kept quantized"},
   ].map(k=>`<div class="kpi"><div class="lab">${k.lab}</div><div class="val">${k.val} <span>${k.unit}</span></div><div class="note">${k.note}</div></div>`).join("");
@@ -238,36 +240,38 @@
     const live = (D.landed||[]).map(l=>({name:l.name, sub:"PR #"+l.pr+" · "+l.date, tps:l.tps, live:true}));
     const pts = hist.concat(live);
     $("passes-hint").textContent = `${pts[0].tps} → ${s.frontier_tps} tok/s · history + live`;
-    const W=760,H=300,padL=12,padR=12,padT=30,padB=54, cw=W-padL-padR, ch=H-padT-padB;
+    const W=760,H=336,padL=12,padR=12,padT=30,padB=106, cw=W-padL-padR, ch=H-padT-padB;
     const maxT=Math.max(...pts.map(p=>p.tps)), slot=cw/pts.length, bw=Math.min(slot*0.56,60);
     const esc=t=>String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-    const trunc=t=> t.length>14 ? t.slice(0,13)+"…" : t;
+    const trunc=t=> t.length>20 ? t.slice(0,19)+"…" : t;
     const bars=pts.map((p,i)=>{
       const cx=padL+slot*i+slot/2, bh=Math.max(2,p.tps/maxT*ch), y=padT+ch-bh;
       const fill=p.live?"url(#gLive)":"url(#gHist)";
       return `<g><title>${esc(p.name)} — ${esc(p.sub)} · ${p.tps} tok/s</title>`+
         `<rect x="${(cx-bw/2).toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="4" fill="${fill}"/>`+
-        `<text x="${cx.toFixed(1)}" y="${(y-7).toFixed(1)}" text-anchor="middle" font-size="12" font-weight="700" fill="#06050B">${p.tps}</text>`+
-        `<text x="${cx.toFixed(1)}" y="${(padT+ch+17).toFixed(1)}" text-anchor="middle" font-size="10.5" fill="#5b5b66">${esc(trunc(p.name))}</text></g>`;
+        `<text x="${cx.toFixed(1)}" y="${(y-7).toFixed(1)}" text-anchor="middle" font-size="12" font-weight="700" fill="#06050B">${p.tps<1?p.tps:Math.round(p.tps)}</text>`+
+        `<text x="${cx.toFixed(1)}" y="${(padT+ch+14).toFixed(1)}" text-anchor="end" transform="rotate(-45 ${cx.toFixed(1)} ${(padT+ch+14).toFixed(1)})" font-size="10.5" fill="#5b5b66">${esc(trunc(p.name))}</text></g>`;
     }).join("");
     const axis=`<line x1="${padL}" y1="${padT+ch}" x2="${W-padR}" y2="${padT+ch}" stroke="#E7E7EE"/>`;
     $("passes").innerHTML =
-      `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;font-family:Sora,sans-serif" role="img" aria-label="Optimization journey chart">`+
+      `<svg viewBox="-44 0 ${W+44} ${H}" style="width:100%;height:auto;display:block;font-family:Sora,sans-serif" role="img" aria-label="Optimization journey chart">`+
         `<defs>`+
           `<linearGradient id="gHist" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7B5DFF"/><stop offset="1" stop-color="#a78bff"/></linearGradient>`+
           `<linearGradient id="gLive" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0E8A16"/><stop offset="1" stop-color="#5DA271"/></linearGradient>`+
         `</defs>${axis}${bars}</svg>`+
       `<div style="display:flex;gap:18px;justify-content:center;margin-top:12px;font-size:12px;color:var(--body)">`+
         `<span style="display:flex;align-items:center;gap:6px"><span style="width:11px;height:11px;border-radius:3px;background:#7B5DFF"></span>recorded passes · ${D.passes_gpu}</span>`+
-        `<span style="display:flex;align-items:center;gap:6px"><span style="width:11px;height:11px;border-radius:3px;background:#0E8A16"></span>landed on frontier (live)</span>`+
+        `<span style="display:flex;align-items:center;gap:6px"><span style="width:11px;height:11px;border-radius:3px;background:#0E8A16"></span>landed on frontier · RTX 5090 (live)</span>`+
       `</div>`;
   })();
 
   const cmax = Math.max(s.frontier_tps, s.ref_tps);
   $("compare").innerHTML = `
     <div class="bar-row"><div class="nm">sparkinfer</div><div class="track"><div class="fill us" style="width:${(s.frontier_tps/cmax*100).toFixed(1)}%"></div></div><div class="v">${s.frontier_tps}</div></div>
-    <div class="bar-row"><div class="nm">${s.ref_name}</div><div class="track"><div class="fill them" style="width:100%"></div></div><div class="v">${s.ref_tps}</div></div>
-    <div style="margin-top:14px;text-align:center"><span class="gap">${gapx}×</span> <span style="color:var(--muted);font-size:13px">to close — launch-bound; fusion is the lever</span></div>`;
+    <div class="bar-row"><div class="nm">${s.ref_name}</div><div class="track"><div class="fill them" style="width:${(s.ref_tps/cmax*100).toFixed(1)}%"></div></div><div class="v">${s.ref_tps}</div></div>
+    <div style="margin-top:14px;text-align:center">${ahead
+      ? `<span class="gap">+${pct.toFixed(1)}%</span> <span style="color:var(--muted);font-size:13px">faster than ${s.ref_name} at 128-tok decode · ~parity at long context</span>`
+      : `<span class="gap">${gapx}×</span> <span style="color:var(--muted);font-size:13px">to close — launch-bound; fusion is the lever</span>`}</div>`;
 
   $("labels").innerHTML = D.labels.map(x=>`<span class="lg"><span class="dot" style="background:${x.c}"></span><b style="color:var(--title)">${x.l}</b> — ${x.d}</span>`).join("");
 
@@ -276,8 +280,9 @@
     <tr><td><a href="${p.url||'#'}">#${p.num}</a> ${p.title||''}</td>
     <td>${(p.areas||[]).map(a=>`<span class="area">${a}</span>`).join("")||"—"}</td>
     <td><span class="tag" style="background:${lc[p.label]||'#888'}">${p.label}</span></td>
-    <td>${p.tps??"—"}</td><td>${p.delta_pct!=null?(p.delta_pct>0?"+":"")+p.delta_pct+"%":"—"}</td></tr>`).join("")
-    : `<tr><td colspan="5" class="empty">No PRs evaluated yet — open one and the bot posts an <code>eval:&lt;label&gt;</code> within ~30 min.</td></tr>`;
+    <td>${p.tps??"—"}</td><td>${p.delta_pct!=null?(p.delta_pct>0?"+":"")+p.delta_pct+"%":"—"}</td>
+    <td>${p.proof_url?`<a href="${p.proof_url}" target="_blank" title="verifiable eval log">🔒 log</a>`:"—"}</td></tr>`).join("")
+    : `<tr><td colspan="6" class="empty">No PRs evaluated yet — open one and the bot posts an <code>eval:&lt;label&gt;</code> within ~30 min.</td></tr>`;
 </script>
 </body>
 </html>

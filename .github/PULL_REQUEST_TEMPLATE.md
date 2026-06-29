@@ -5,26 +5,30 @@
 
 ## Proof of speedup
 
-> ⚠️ **Tick the box only if you actually ran this on an RTX 5090** and pasted the benchmark log
-> below. Ticking the box triggers the on-device evaluation. Checking it **without** testing is
-> false attestation — it wastes GPU time and is treated as gaming: the account will be **blocked**
-> (added to [`.github/blocked-contributors.txt`](blocked-contributors.txt)), the same as copycatting
-> or sybil farming.
+> ⚠️ **The on-device eval runs only when BOTH are true:** (1) the box below is ticked, and
+> (2) the **decode tok/s** table shows a **real end-to-end improvement** (`after > before`,
+> filled from `bench/scripts/bench.sh` — *not* an isolated-kernel microbenchmark). A ticked box
+> with an empty/placeholder table gets `needs-benchmark` and is **not** evaluated (no point spending
+> a GPU when there's no claimed decode gain).
+>
+> Tick the box **only if you actually ran it on an RTX 5090**. False attestation is treated as
+> gaming — the account is **blocked** ([`.github/blocked-contributors.txt`](blocked-contributors.txt)),
+> same as copycatting or sybil farming.
 
 - [ ] Tested on **RTX 5090** (`sm_120`)
 
-<!-- Back any speed/perf claim with a benchmark log (before -> after). A docs-only or
-     non-perf PR can write "N/A". -->
-
-**Benchmark log** (before → after):
-
-```text
-# paste the benchmark output here (baseline -> this PR)
-```
+**Decode tok/s** (end-to-end, from `bench/scripts/bench.sh` — required for evaluation):
 
 | | decode tok/s |
 |---|--:|
-| before |  |
-| after  |  |
+| before (main) |  |
+| after (this PR) |  |
+
+<!-- Paste the bench output backing the numbers above (baseline -> this PR). Isolated-kernel
+     microbenchmarks are welcome as extra evidence but do NOT count as the decode before/after. -->
+
+```text
+# paste bench/scripts/bench.sh output here (before -> after)
+```
 
 <!-- More checklist items will be added here later. -->

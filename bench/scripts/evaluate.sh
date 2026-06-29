@@ -45,6 +45,11 @@ ensure_model
 ensure_llamacpp "$ARCH"
 
 echo ">> [2/3] speed — median of 3 bench runs ..." >&2
+# Warmup: the from-source build (CPU-bound, minutes) leaves the GPU idle so its clocks fall to
+# base. Run one UNTIMED bench to spin clocks back to boost before timing — otherwise the first
+# measured build (the same-box main baseline) reads cold/low and inflates every PR's delta. This
+# is the cold-clock artifact that once mislabeled minor PRs as XL above the hardware ceiling.
+si_run qwen3_gguf_bench "$GGUF" 192 >/dev/null 2>&1 || true
 ts=()
 for _ in 1 2 3; do
   t=$(si_run qwen3_gguf_bench "$GGUF" 128 2>/dev/null | sed -n 's/.*decode tg *: *\([0-9.][0-9.]*\).*/\1/p' || true)

@@ -12,6 +12,7 @@
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
+#include "sparkinfer/gpu_stats.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -85,11 +86,18 @@ int main(int argc, char** argv) {
 
     double toks = spec ? model.bench_decode_speculative(8, n_tokens, draft_k) : model.bench_decode(8, n_tokens);
     if (toks < 0) { printf("[FAIL] benchmark\n"); return 1; }
+    auto gpu = sparkinfer::query_gpu_stats();   // sampled right after the decode loop — near peak heat
     printf("\n=== sparkinfer bench (%s%s) ===\n", gguf_mode ? "Q4_K_M native" : "bf16",
            spec ? ", prompt-lookup speculative" : "");
     printf("model        : Qwen3-30B-A3B  (%d layers, %d experts top-%d)\n", cfg.n_layers, cfg.n_experts, cfg.top_k);
     if (spec) printf("spec decode  : draft_k=%d\n", draft_k);
     printf("VRAM used    : %.1f GB\n", (totb - freeb) / 1e9);
     printf("decode tg    : %.2f tok/s  (%.1f ms/token, n=%d, bs=1)\n", toks, 1000.0 / toks, n_tokens);
+    if (gpu.valid && gpu.temp_c >= 0) {
+        printf("GPU          : %d°C", gpu.temp_c);
+        if (gpu.power_w      >= 0) printf(" · %d W", gpu.power_w);
+        if (gpu.sm_clock_mhz >= 0) printf(" · %d MHz", gpu.sm_clock_mhz);
+        printf(" (peak under load)\n");
+    }
     return 0;
 }

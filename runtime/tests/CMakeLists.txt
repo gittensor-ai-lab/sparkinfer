@@ -14,6 +14,12 @@ target_include_directories(spec_decode_cpu_test PRIVATE ../include)
 set_target_properties(spec_decode_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME spec_decode_cpu_test COMMAND spec_decode_cpu_test)
 
+# Thermal governor — pure tiering policy (no GPU); links the runtime for classify()/pace() symbols.
+add_executable(thermal_governor_cpu_test thermal_governor_cpu_test.cpp)
+target_link_libraries(thermal_governor_cpu_test PRIVATE sparkinfer_runtime)
+set_target_properties(thermal_governor_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME thermal_governor_cpu_test COMMAND thermal_governor_cpu_test)
+
 # GPU integration tests — run the real device path; skip without a device.
 add_executable(decode_runner_gpu_test decode_runner_gpu_test.cpp)
 target_link_libraries(decode_runner_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)

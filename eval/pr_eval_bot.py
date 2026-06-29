@@ -25,16 +25,58 @@ def current_instance(default):
     try: return int(open(INSTANCE_FILE).read().strip())
     except Exception: return default
 
+# Pinned default box: a stable, known-good instance (cached model, good download speed) that we
+# reuse first on every run and NEVER destroy. vast_eval.py is invoked with --pinned for it, so on
+# bring-up failure it retries on later scheduled runs instead of provisioning immediately;
+# only after VAST_REUSE_MAX_RETRIES misses does it spin up a new box (the pinned one is kept).
+# Set VAST_DEFAULT_INSTANCE="" to disable the pin and always provision fresh.
+# The pin id lives in a file so it can self-heal: when the pinned box is reclaimed and the eval
+# provisions a fresh one, we re-pin to that fresh box (write its id here). Seed/override via
+# VAST_DEFAULT_INSTANCE; set it to "" to disable pinning entirely (always provision fresh).
+PIN_FILE = os.path.expanduser(os.environ.get("VAST_PIN_FILE", "~/.sparkinfer_pinned_instance"))
+def _read_pin():
+    try:
+        v = open(PIN_FILE).read().strip()
+        if v: return v
+    except Exception: pass
+    return os.environ.get("VAST_DEFAULT_INSTANCE", "42682383").strip()
+def _write_pin(iid):
+    try:
+        with open(PIN_FILE, "w") as f: f.write(str(iid))
+    except Exception: pass
+PINNED_INSTANCE = _read_pin()
+PINNED_RETRY_RC = 75   # must match vast_eval.PINNED_RETRY_RC
+
 # Subsystem buckets for the deterministic area:<name> label (from a PR's top-level changed
 # dirs — no AI). Categorization/display only: SN74 scoring is speedup-only (the eval:* tier),
 # NOT a per-subsystem budget.
 AREAS = {"kernels", "runtime", "moe", "bench"}
 
-# RTX 5090 evaluation is OPT-IN: a maintainer reviews a PR and adds EVAL_GATE_LABEL to greenlight it
-# for the (expensive) on-device eval. PRs without it get NOT_TESTED_LABEL and are NOT evaluated — this
-# stops the bot burning GPU on unvetted / spam / gaming PRs before a human has looked at them.
-EVAL_GATE_LABEL = "test-on-5090"
-NOT_TESTED_LABEL = "not-tested"
+# RTX 5090 evaluation is OPT-IN *and* proof-gated. A PR is only evaluated if it ticks the
+# "Tested on RTX 5090" box AND fills the decode before/after table with real numbers showing a
+# clear improvement (after > before) — checking the box alone is not enough (it wasted GPU on PRs
+# whose decode table was still the placeholder). States: greenlit -> test-on-5090 (eval); box
+# ticked but no valid before<after -> needs-benchmark (skip + ask for numbers); box unticked ->
+# not-tested (skip). There is NO manual override — every eval must pass the gate on real RTX 5090
+# before/after numbers; nothing bypasses the benchmark check.
+EVAL_GATE_LABEL  = "test-on-5090"     # bot-set marker: greenlit, will be evaluated
+NOT_TESTED_LABEL = "not-tested"       # box not ticked
+NEEDS_BENCH_LABEL = "needs-benchmark" # box ticked but decode before/after missing/invalid/no-gain
+# Per-round merge workflow (all queued PRs graded vs the same-box main in one round):
+MERGE_FIRST_LABEL  = "merge-first"    # the round's biggest verified speedup — merge this one first
+NEEDS_REBASE_LABEL = "needs-rebase"   # also a verified speedup, but not the round winner
+REEVALUATE_LABEL   = "re-evaluate"    # winner merged → rebase onto new main; bot re-evals on push
+HOLD_LABEL         = "hold"           # maintainer override: never auto-merge this PR
+
+# Auto-merge the round's merge-first winner — OFF unless SPARKINFER_AUTOMERGE=1. Heavily guarded:
+# the eval only verifies speed + token-match, so auto-merge is gated on labels, author standing,
+# changed paths, and branch protection (gh refuses if checks/reviews aren't satisfied).
+AUTO_MERGE_FIRST = os.environ.get("SPARKINFER_AUTOMERGE", "0") == "1"
+# Auto-merge is BLOCKED if the PR carries any of these labels:
+AUTOMERGE_BLOCK_LABELS = {"copycat", "flagged:gaming", "penalty", "needs-benchmark", "not-tested",
+                          NEEDS_REBASE_LABEL, REEVALUATE_LABEL, HOLD_LABEL}
+# ...or touches any maintainer-owned / governance path (contributor speedups live in kernels|runtime|moe):
+AUTOMERGE_SENSITIVE = ("eval/", "bench/scripts/", ".gittensor/", ".github/", "dashboard/", "CODEOWNERS")
 
 def gh(args):
     return subprocess.run(["gh"] + args, capture_output=True, text=True)
@@ -94,12 +136,33 @@ def block_account(login, reason):
 # ---- copycat detection (a later PR that re-submits an earlier PR's diff) ----
 # A PR is a copycat if its added lines are largely contained in an EARLIER PR touching the same
 # file(s). Copycats are labeled `copycat`, commented (citing the original), and NOT evaluated.
-# Logged to .github/copycats.json; a 2nd copycat by the same author auto-adds them to the denylist.
+# Logged to .github/copycats.json; ANY copycat immediately blocks the author and closes the PR
+# (zero tolerance — no penalty period, no strike threshold).
 FLAG_FILE = os.path.join(ROOT, ".github", "FLAGGED.md")
 COPYCAT_LABEL = "copycat"
 COPYCAT_LOG = os.path.join(ROOT, ".github", "copycats.json")
 COPYCAT_CONTAINMENT = 0.80   # ≥80% of the copy's added lines also appear in the original
-COPYCAT_STRIKES = 2          # this many copycats by one author -> denylist
+COPYCAT_STRIKES = 1          # zero tolerance: the FIRST copycat denylists the author + closes the PR
+PENALTY_DAYS = 5             # (legacy; copycats now block immediately, so no penalty period applies)
+PENALTY_LABEL = "penalty"    # applied to a penalized author's PRs instead of greenlighting them
+
+def author_penalty_until(author):
+    """If `author` has an active copycat strike, return the date the penalty lifts, else None.
+    Each strike lifts at its date + its own `penalty_days` (default PENALTY_DAYS); a strike entry
+    may override `penalty_days` for leniency (e.g. a first-time contributor's first mistake). The
+    author is penalized until the latest lift date. Applies from the FIRST strike onward."""
+    if not author: return None
+    lifts = []
+    for e in load_copycat_log():
+        if str(e.get("author", "")).lower() == author.lower():
+            try:
+                d = datetime.date.fromisoformat(e["date"])
+                days = int(e.get("penalty_days", PENALTY_DAYS))
+                lifts.append(d + datetime.timedelta(days=days))
+            except Exception: pass
+    if not lifts: return None
+    until = max(lifts)
+    return until if datetime.date.today() <= until else None
 
 def pr_fingerprint(repo, num):
     """(changed files, normalized non-empty added lines) from the PR's unified diff."""
@@ -140,9 +203,9 @@ def flag_copycat(repo, num, original, author):
     add_label(repo, num, COPYCAT_LABEL)
     body = (f"<!-- sparkinfer-copycat -->\n## 🐈 Flagged: copycat\n\n"
             f"This PR re-submits substantially the same diff as the earlier #{original}. "
-            f"Duplicating an existing PR's work does not earn a score — copycats are **not "
-            f"evaluated or merged**.\n\nRepeated copycatting (≥{COPYCAT_STRIKES}) results in an "
-            f"automatic block. See [`.github/COPYCATS.md`](../blob/main/.github/COPYCATS.md).")
+            f"Duplicating another contributor's work is treated as gaming the SN74 emission "
+            f"mechanism. The account has been **blocked** and this PR **closed** — zero tolerance, "
+            f"no warning. See [`.github/COPYCATS.md`](../blob/main/.github/COPYCATS.md).")
     gh(["pr", "comment", str(num), "-R", repo, "--body", body])
 
 def evaluated_commits(repo, num):
@@ -158,12 +221,43 @@ def areas_for_pr(repo, num):
     files = json.loads(gh(["pr", "view", str(num), "-R", repo, "--json", "files"]).stdout or "{}").get("files", [])
     return {f["path"].split("/", 1)[0] for f in files} & set(AREAS)
 
-def pr_checkbox_tested(repo, num):
-    """True if the PR body has the template's 'Tested on RTX 5090' checkbox ticked
-    (a markdown '[x]' on a line mentioning 5090). Self-attested greenlight for eval."""
+def _decode_val(body, key):
+    """Pull a numeric decode tok/s out of the template table row '| before|after | <n> |'.
+    Returns the float, or None if the cell is the placeholder / non-numeric / absent."""
+    for ln in body.splitlines():
+        m = re.match(rf"\s*\|\s*{key}\b[^|]*\|\s*([^|]*?)\s*\|", ln, re.I)
+        if not m: continue
+        num = re.search(r"[-+]?\d+\.?\d*", m.group(1))
+        try: return float(num.group(0)) if num else None
+        except ValueError: return None
+    return None
+
+def greenlight_status(repo, num, pr_labels):
+    """Decide whether a PR may be evaluated. Returns (status, reason):
+      'ok'        — greenlit: box ticked + real before<after decode numbers (no override exists)
+      'no-bench'  — box ticked but the decode before/after table is missing/placeholder/no-gain
+      'unchecked' — the 'Tested on RTX 5090' box is not ticked
+    Checking the box is necessary but NOT sufficient — a clear decode improvement must be claimed."""
     body = (json.loads(gh(["pr", "view", str(num), "-R", repo, "--json", "body"]).stdout or "{}")
             .get("body") or "")
-    return any(re.search(r"\[\s*[xX]\s*\]", ln) and "5090" in ln for ln in body.splitlines())
+    if not any(re.search(r"\[\s*[xX]\s*\]", ln) and "5090" in ln for ln in body.splitlines()):
+        return "unchecked", "RTX-5090 box unchecked"
+    before, after = _decode_val(body, "before"), _decode_val(body, "after")
+    if before is None or after is None:
+        return "no-bench", "box ticked but decode before/after not filled with real numbers"
+    if after <= before:
+        return "no-bench", f"claimed decode before={before} ≥ after={after} (no improvement)"
+    return "ok", f"ticked + decode {before}→{after} tok/s (+{after - before:.1f})"
+
+def post_needs_bench_comment(repo, num):
+    body = ("<!-- sparkinfer-needs-bench -->\n## ⏳ Needs a benchmark to be evaluated\n\n"
+            "You ticked **Tested on RTX 5090** but the decode **before → after tok/s** table is still "
+            "empty / placeholder (or shows no gain). The on-device eval won't run until it shows a real "
+            "improvement.\n\nFill it from the **end-to-end** decode bench (not an isolated-kernel "
+            "microbench):\n```bash\nbench/scripts/bench.sh --download            # baseline (before)\n"
+            "bench/scripts/bench.sh --download            # your branch (after)\n```\n"
+            "Then the bot greenlights it on the next poll and evaluates it on an RTX 5090.")
+    gh(["pr", "comment", str(num), "-R", repo, "--body", body])
 
 def _owner_repo(repo):
     parts = repo.split("/"); return parts[0], parts[1]
@@ -195,16 +289,23 @@ def apply_area_labels(repo, num, areas):
 def render(res, oid):
     label = res.get("label", "?")
     icon = {"REJECT": "❌", "none": "⚪", "BASELINE": "📊"}.get(label, "✅")
+    # A passing speedup (XL/L/M/S/XS) clears the significance gate, so its tps becomes the NEW frontier.
+    advanced = label in {"XL", "L", "M", "S", "XS"} and res.get("pass")
     rows = [f"| **label** | `eval:{label}` |",
             f"| decode | {res.get('tps','?')} tok/s |",
             f"| correctness | top-1 {res.get('top1',0)*100:.1f}% · KL {res.get('kl','?')} |"]
     if "frontier_tps" in res and res["frontier_tps"]:
-        rows.insert(2, f"| vs frontier | {res['frontier_tps']} tok/s → "
+        # Label it "prior frontier" when this PR superseded it, so the old value isn't mistaken
+        # for the current live frontier (which is now this PR's tps).
+        rows.insert(2, f"| {'vs prior frontier' if advanced else 'vs frontier'} | {res['frontier_tps']} tok/s → "
                        f"{res.get('pct_over_frontier', 0):+.1f}% ({res.get('delta_tps',0):+.1f}) |")
+    if advanced:
+        rows.insert(3, f"| **→ new frontier** | **{res.get('tps')} tok/s** |")
     note = {"REJECT": f"Failed the correctness gate: {res.get('reason','')}. Not a valid submission.",
             "none": "Within the significance gate — no *verified* speedup over the current frontier.",
             "BASELINE": "No frontier was set; this run establishes it."
-            }.get(label, "Verified speedup over the live frontier.")
+            }.get(label, f"Verified speedup — **sets the new frontier to {res.get('tps')} tok/s** "
+                         f"(was {res.get('frontier_tps','?')}).")
     return (f"<!-- sparkinfer-eval:{oid} -->\n"
             f"## {icon} sparkinfer auto-eval — `{oid}`\n\n"
             f"| metric | value |\n|---|---|\n" + "\n".join(rows) + "\n\n"
@@ -216,6 +317,7 @@ def render(res, oid):
 DASH = os.path.join(ROOT, "dashboard")
 DATA_JSON = os.path.join(DASH, "data.json")
 FRONTIER_LABELS = {"XL", "L", "M", "S", "XS", "BASELINE"}
+SPEEDUP_LABELS = {"XL", "L", "M", "S", "XS"}   # verified speedup over main (BASELINE excluded)
 
 def load_dash():
     try:
@@ -238,35 +340,188 @@ def push_dash(msg):
     subprocess.run(["git", "-C", ROOT, "pull", "-q", "--rebase", "origin", "main"], capture_output=True)
     subprocess.run(["git", "-C", ROOT, "push", "-q", "origin", "main"], capture_output=True)
 
-def update_dashboard(repo, pr, areas, res):
-    """Upsert the PR's verdict into the dashboard, ratchet the frontier, regenerate + push."""
+LOG_REPO  = os.environ.get("SPARKINFER_LOG_REPO", "https://github.com/gittensor-ai-lab/sparkinfer-log.git")
+LOG_DIR   = os.path.expanduser(os.environ.get("SPARKINFER_LOG_DIR", "~/.sparkinfer_log_checkout"))
+LOG_PAGE  = "https://gittensor-ai-lab.github.io/sparkinfer-log/?run="
+
+def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
+    """Commit this eval's raw log + result to the public sparkinfer-log repo (immutable record),
+    rendered at a unique per-run URL. Best-effort: never blocks the eval. Returns the page URL."""
+    try:
+        rid = f"{int(num):04d}-{oid[:7]}"
+        if not os.path.isdir(os.path.join(LOG_DIR, ".git")):
+            subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
+        else:
+            subprocess.run(["git", "-C", LOG_DIR, "pull", "-q", "--rebase"], check=False)
+        rundir = os.path.join(LOG_DIR, "runs", rid); os.makedirs(rundir, exist_ok=True)
+        result = {"id": rid, "pr": int(num), "title": title,
+                  "url": f"https://github.com/{repo}/pull/{num}", "commit": oid[:7],
+                  "label": res.get("label"), "tps": res.get("tps"),
+                  "baseline_tps": round(baseline, 2) if baseline else None,
+                  "delta_pct": res.get("pct_over_frontier"), "delta_tps": res.get("delta_tps"),
+                  "top1": res.get("top1"), "kl": res.get("kl"),
+                  "gpu": "RTX 5090 (sm_120) · vast.ai", "date": datetime.date.today().isoformat(),
+                  "frontier": res.get("frontier_tps")}
+        json.dump(result, open(os.path.join(rundir, "result.json"), "w"), indent=2)
+        clean = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "<ip>", log_text or "")   # scrub host IPs
+        open(os.path.join(rundir, "log.txt"), "w").write(clean)
+        ipath = os.path.join(LOG_DIR, "index.json")
+        idx = json.load(open(ipath)) if os.path.exists(ipath) else []
+        idx = [e for e in idx if e.get("id") != rid]
+        idx.append({"id": rid, "pr": int(num), "title": title, "label": res.get("label"),
+                    "delta_pct": res.get("pct_over_frontier"), "tps": res.get("tps"), "date": result["date"]})
+        idx.sort(key=lambda x: x["id"])
+        json.dump(idx, open(ipath, "w"), indent=2)
+        subprocess.run(["git", "-C", LOG_DIR, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", LOG_DIR, "commit", "-q", "-m",
+                        f"eval: #{num} {oid[:7]} -> eval:{res.get('label')}"], check=False)
+        subprocess.run(["git", "-C", LOG_DIR, "push", "-q"], check=False)
+        url = LOG_PAGE + rid
+        print(f">> eval log: {url}")
+        return url
+    except Exception as e:
+        print(f">> eval-log upload skipped: {e}")
+        return None
+
+def update_dashboard(repo, pr, areas, res, proof_url=None):
+    """Upsert the PR's eval verdict into the dashboard TABLE (`prs`) only. The frontier and the
+    journey (`landed`) advance only when a PR is actually MERGED — see record_merge() — so the
+    chart shows shipped code, never unmerged evals or a losing rival in the same round."""
     data = load_dash()
     if data is None: return
     num = pr["number"]
     entry = {"num": num, "title": pr.get("title", ""), "areas": sorted(areas),
              "label": res.get("label"), "tps": res.get("tps"),
              "delta_pct": res.get("pct_over_frontier"),
+             "top1": res.get("top1"), "kl": res.get("kl"),
              "url": f"https://github.com/{repo}/pull/{num}"}
+    if proof_url: entry["proof_url"] = proof_url
     data["prs"] = [p for p in data.get("prs", []) if p.get("num") != num]
     data["prs"].insert(0, entry)
     data["prs"] = data["prs"][:50]
-    if (res.get("pass") and res.get("label") in FRONTIER_LABELS
-            and (res.get("tps") or 0) > data["status"].get("frontier_tps", 0)):
-        data["status"]["frontier_tps"] = res["tps"]            # ratchet the live frontier
-        # Accuracy shown on the dashboard is the FRONTIER's accuracy — refresh it from the same
-        # eval that just set the frontier, so token-match/KL never go stale (they used to be a
-        # manual seed the bot never touched).
-        if res.get("top1") is not None: data["status"]["token_match"] = round(res["top1"], 4)
-        if res.get("kl") is not None:   data["status"]["kl"] = round(res["kl"], 4)
-        # Record the landed optimization for the journey chart (live continuation of `passes`).
-        short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", pr.get("title", ""))[:28]   # strip "area(x): " prefix
-        landed = [m for m in data.get("landed", []) if m.get("pr") != num]      # dedupe by PR
-        landed.append({"name": short or f"PR #{num}", "tps": round(res["tps"], 2),
-                       "pr": num, "date": datetime.date.today().isoformat()})
-        data["landed"] = sorted(landed, key=lambda m: m["tps"])
     data["updated"] = datetime.date.today().isoformat()
     write_dash(data)
     push_dash(f"dashboard: PR #{num} -> eval:{res.get('label')} ({res.get('tps')} tok/s)")
+
+def record_merge(repo, num):
+    """A frontier-advancing PR was MERGED → advance the displayed frontier by its verified same-box
+    relative gain and add it to the journey (`landed`). Hardware-independent and merged-only;
+    idempotent (dedupe by PR). Reads the PR's stored eval from `prs`."""
+    data = load_dash()
+    if data is None: return
+    if any(m.get("pr") == num for m in data.get("landed", [])): return       # already recorded
+    e = next((p for p in data.get("prs", []) if p.get("num") == num), None)
+    if not e or e.get("label") not in SPEEDUP_LABELS: return                 # only verified speedups
+    # The journey is in measured tok/s (each step is the merged PR's actual decode rate). Use the
+    # PR's measured tps; max() keeps the headline monotonic if a box happened to be slower. (Scoring
+    # is still hardware-independent — it's the same-box delta — this is just the achieved-number display.)
+    raw = round(e.get("tps") or 0, 2)
+    new_f = max(round(data["status"].get("frontier_tps") or 0, 2), raw)
+    data["status"]["frontier_tps"] = new_f
+    if e.get("top1") is not None: data["status"]["token_match"] = round(e["top1"], 4)
+    if e.get("kl") is not None:   data["status"]["kl"] = round(e["kl"], 4)
+    short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]      # strip "area(x): " prefix
+    landed = [m for m in data.get("landed", []) if m.get("pr") != num]
+    landed.append({"name": short or f"PR #{num}", "tps": raw, "pr": num,
+                   "date": datetime.date.today().isoformat()})
+    data["landed"] = sorted(landed, key=lambda m: m["tps"])
+    data["updated"] = datetime.date.today().isoformat()
+    write_dash(data)
+    push_dash(f"dashboard: PR #{num} merged -> frontier {new_f} tok/s")
+
+def auto_merge_ok(repo, num):
+    """Guardrails for auto-merging the merge-first winner. Returns (ok, reason)."""
+    info = json.loads(gh(["pr", "view", str(num), "-R", repo, "--json",
+                          "state,isDraft,labels,author,mergeable,files"]).stdout or "{}")
+    if info.get("state") != "OPEN" or info.get("isDraft"):
+        return False, "not an open, non-draft PR"
+    labs = {l["name"] for l in info.get("labels", [])}
+    eval_tiers = {l.split(":", 1)[1] for l in labs if l.startswith("eval:")}
+    if not (eval_tiers & SPEEDUP_LABELS):
+        return False, "no verified eval:speedup label"
+    blocked = labs & AUTOMERGE_BLOCK_LABELS
+    if blocked:
+        return False, f"blocking label(s): {', '.join(sorted(blocked))}"
+    author = (info.get("author") or {}).get("login", "")
+    if author.lower() in load_denylist():
+        return False, f"author {author} is blocked"
+    if author_penalty_until(author):
+        return False, f"author {author} is under penalty"
+    sens = [f["path"] for f in info.get("files", []) if any(f["path"].startswith(p) for p in AUTOMERGE_SENSITIVE)]
+    if sens:
+        return False, f"touches protected paths: {', '.join(sens[:3])}"
+    if info.get("mergeable") != "MERGEABLE":
+        return False, f"not cleanly mergeable ({info.get('mergeable')})"
+    return True, "ok"
+
+def try_auto_merge(repo, num):
+    """Auto-merge the merge-first winner iff all guardrails pass. gh still enforces branch protection
+    (required checks/reviews) and refuses otherwise — a safe backstop. Returns True if merged."""
+    ok, reason = auto_merge_ok(repo, num)
+    if not ok:
+        print(f">> auto-merge SKIP #{num}: {reason}"); return False
+    r = gh(["pr", "merge", str(num), "-R", repo, "--squash"])
+    if r.returncode == 0:
+        print(f">> AUTO-MERGED #{num} (merge-first winner)")
+        gh(["pr", "comment", str(num), "-R", repo, "--body",
+            "<!-- sparkinfer-automerge -->\n✅ Auto-merged as the round's `merge-first` winner — "
+            "verified same-box speedup over `main`, all checks green. Thanks for the contribution!"])
+        return True
+    print(f">> auto-merge BLOCKED #{num} (branch protection/checks): {(r.stderr or r.stdout).strip()[:200]}")
+    return False
+
+def reconcile_merge_labels(repo):
+    """Per-round merge workflow. After all queued PRs are graded against the same-box main:
+      1. If a `merge-first` PR has since MERGED, its rivals are stale → tag them `re-evaluate` and
+         ask them to rebase onto the new main (the bot re-evals automatically on the rebased commit).
+      2. Among the still-open PRs with a verified speedup, label the biggest `merge-first` and the
+         rest `needs-rebase`. Ranking uses the same-box % gain over main (data.json `delta_pct`)."""
+    data = load_dash() or {}
+    by_num = {p["num"]: p for p in data.get("prs", [])}
+    open_prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open",
+                              "--json", "number,labels", "--limit", "80"]).stdout or "[]")
+    open_labels = {p["number"]: {l["name"] for l in p["labels"]} for p in open_prs}
+
+    # 1) A merge-first PR that merged → its rivals must rebase + re-eval against the new main.
+    merged_first = json.loads(gh(["pr", "list", "-R", repo, "--state", "merged", "--label",
+                                  MERGE_FIRST_LABEL, "--json", "number", "--limit", "10"]).stdout or "[]")
+    if merged_first:
+        for m in merged_first:
+            record_merge(repo, m["number"])      # advance the journey/frontier for the merged winner
+            remove_label(repo, m["number"], MERGE_FIRST_LABEL)
+        # Rivals stay `needs-rebase` (they have NOT rebased yet — that's exactly why `re-evaluate`
+        # would be wrong here). Just nudge them to rebase; the eval re-runs on the rebased commit.
+        for num, labs in open_labels.items():
+            if NEEDS_REBASE_LABEL in labs:
+                gh(["pr", "comment", str(num), "-R", repo, "--body",
+                    "<!-- sparkinfer-rebase -->\nThe round's `merge-first` PR was just merged. Please "
+                    "**rebase this branch onto `main`** — once you push the rebase the bot re-evaluates "
+                    "it against the new frontier (crediting your *marginal* gain on top of what merged)."])
+
+    # 2) Rank the open verified-speedup PRs that are FRESH (graded vs the CURRENT main) — i.e. NOT
+    #    `needs-rebase`. A needs-rebase PR's score is stale (an older main), so it can't be this
+    #    round's winner until it rebases and the bot re-grades it (which clears needs-rebase).
+    scored = sorted(((num, by_num[num].get("delta_pct") or 0) for num in open_labels
+                     if num in by_num and by_num[num].get("label") in SPEEDUP_LABELS
+                     and NEEDS_REBASE_LABEL not in open_labels.get(num, set())),
+                    key=lambda x: x[1], reverse=True)
+    if not scored: return
+    winner = scored[0][0]
+    add_label(repo, winner, MERGE_FIRST_LABEL)
+    for L in (NEEDS_REBASE_LABEL, REEVALUATE_LABEL): remove_label(repo, winner, L)
+    for num, _ in scored[1:]:
+        add_label(repo, num, NEEDS_REBASE_LABEL)
+        for L in (MERGE_FIRST_LABEL, REEVALUATE_LABEL): remove_label(repo, num, L)
+    print(f">> round labels: merge-first #{winner}; needs-rebase {[n for n,_ in scored[1:]] or 'none'}")
+
+    # Optionally auto-merge the winner (guarded). Rivals keep needs-rebase + a rebase nudge.
+    if AUTO_MERGE_FIRST and try_auto_merge(repo, winner):
+        record_merge(repo, winner)               # merged now → advance the journey/frontier
+        for num, _ in scored[1:]:
+            gh(["pr", "comment", str(num), "-R", repo, "--body",
+                "<!-- sparkinfer-rebase -->\nThe round's `merge-first` PR was just merged. Please "
+                "**rebase this branch onto `main`** — the bot re-evaluates it on push (crediting your "
+                "*marginal* gain on top of what merged)."])
 
 def main():
     ap = argparse.ArgumentParser()
@@ -282,7 +537,7 @@ def main():
     # OLDEST-FIRST: evaluate ascending by PR number so the original of any duplicate is seen before
     # its copy, and the earliest submitter is graded first (fairness + copycat attribution).
     prs = json.loads(gh(["pr", "list", "-R", args.repo, "--state", "open",
-                         "--json", "number,headRefName,headRefOid,title,isCrossRepository,labels"]).stdout or "[]")
+                         "--json", "number,headRefName,headRefOid,title,isCrossRepository,labels,isDraft"]).stdout or "[]")
     prs.sort(key=lambda p: p["number"])
     if not prs:
         print("no open PRs"); return
@@ -318,14 +573,20 @@ def main():
     for pr in prs:
         num, branch, oid = pr["number"], pr["headRefName"], pr["headRefOid"][:7]
         ref = f"pull/{num}/head" if pr.get("isCrossRepository") else branch
+        # Gate 0 — draft PRs are work-in-progress: never evaluate them. Skip entirely (no greenlight,
+        # no labels). The bot picks them up once they're marked "Ready for review".
+        if pr.get("isDraft"):
+            print(f"PR #{num}: draft — skip (not evaluated until marked ready for review)")
+            continue
         # Gate 1 — blocked contributor: never spend GPU on a flagged/sybil PR.
         hits = pr_involved_logins(args.repo, num) & denylist
         if hits:
             print(f"PR #{num}: BLOCKED (denylisted: {', '.join(sorted(hits))}) — flag + close, no eval")
             if not args.dry_run: close_blocked_pr(args.repo, num, hits)
             continue
-        # Gate 2 — copycat: re-submits a DIFFERENT author's earlier diff. Label, log, skip eval;
-        # 2nd strike -> block. (Self-resubmissions are excluded by find_original.)
+        # Gate 2 — copycat: re-submits a DIFFERENT author's earlier diff. Zero tolerance — flag,
+        # block the author, and close the PR immediately (no eval, no penalty, no strike threshold).
+        # (Self-resubmissions are excluded by find_original.)
         original = find_original(num)
         if original is not None:
             author = pr_author.get(num, "?")
@@ -348,57 +609,139 @@ def main():
         if not args.dry_run: apply_area_labels(args.repo, num, areas)
         if oid in evaluated_commits(args.repo, num):
             print(f"PR #{num} @ {oid}: already evaluated — skip eval"); continue
-        # Gate 3 — greenlight: a PR is evaluated only if the contributor checked the
-        # "Tested on RTX 5090" box in the PR template, OR a maintainer added `test-on-5090`
-        # (manual override). A checked box auto-applies the label. Otherwise -> `not-tested`,
-        # skip (no GPU). Re-checking the box / adding the label triggers eval on the next poll.
-        pr_labels = {l["name"] for l in pr.get("labels", [])}
-        greenlit = (EVAL_GATE_LABEL in pr_labels) or pr_checkbox_tested(args.repo, num)
-        if not greenlit:
-            print(f"PR #{num}: not greenlit (RTX-5090 box unchecked, no {EVAL_GATE_LABEL}) "
-                  f"— mark not-tested, skip eval")
-            if not args.dry_run and NOT_TESTED_LABEL not in pr_labels:
-                add_label(args.repo, num, NOT_TESTED_LABEL)
+        # Gate 2.5 — copycat penalty: a copycat strike freezes the author's evaluations for
+        # PENALTY_DAYS (from the first strike). During the window the bot does NOT greenlight any of
+        # their PRs — it applies `penalty` and skips, instead of `test-on-5090`.
+        pen_until = author_penalty_until(pr_author.get(num, "?"))
+        if pen_until:
+            print(f"PR #{num}: author {pr_author.get(num,'?')} under copycat penalty until {pen_until} "
+                  f"— {PENALTY_LABEL}, skip eval")
+            if not args.dry_run:
+                cur = {l["name"] for l in pr.get("labels", [])}
+                if PENALTY_LABEL not in cur: add_label(args.repo, num, PENALTY_LABEL)
+                for L in (EVAL_GATE_LABEL, NOT_TESTED_LABEL, NEEDS_BENCH_LABEL):
+                    if L in cur: remove_label(args.repo, num, L)
             continue
-        print(f"PR #{num}: greenlit for RTX 5090 eval")
-        if not args.dry_run:
-            if EVAL_GATE_LABEL not in pr_labels: add_label(args.repo, num, EVAL_GATE_LABEL)
-            if NOT_TESTED_LABEL in pr_labels: remove_label(args.repo, num, NOT_TESTED_LABEL)
-        pending.append((pr, num, branch, oid, ref, areas))
+        # Gate 3 — greenlight (proof-gated): evaluate only if the PR ticks the RTX-5090 box AND
+        # fills the decode before/after table with a real improvement. No override exists.
+        # Reconcile labels each poll so a stale test-on-5090 can't keep a no-benchmark PR in the queue.
+        pr_labels = {l["name"] for l in pr.get("labels", [])}
+        def _reconcile(keep, drop):
+            if args.dry_run: return
+            if keep not in pr_labels: add_label(args.repo, num, keep)
+            for L in drop:
+                if L in pr_labels: remove_label(args.repo, num, L)
+        status, reason = greenlight_status(args.repo, num, pr_labels)
+        if status == "ok":
+            print(f"PR #{num}: greenlit ({reason})")
+            _reconcile(EVAL_GATE_LABEL, [NOT_TESTED_LABEL, NEEDS_BENCH_LABEL])
+            pending.append((pr, num, branch, oid, ref, areas))
+        elif status == "no-bench":
+            print(f"PR #{num}: NOT greenlit ({reason}) — needs-benchmark, skip eval")
+            first_time = NEEDS_BENCH_LABEL not in pr_labels
+            _reconcile(NEEDS_BENCH_LABEL, [EVAL_GATE_LABEL, NOT_TESTED_LABEL])
+            if first_time and not args.dry_run: post_needs_bench_comment(args.repo, num)
+        else:  # unchecked
+            print(f"PR #{num}: not greenlit ({reason}) — mark not-tested, skip eval")
+            _reconcile(NOT_TESTED_LABEL, [EVAL_GATE_LABEL, NEEDS_BENCH_LABEL])
 
     if not args.dry_run and state_changed:
         save_copycat_log(copy_log)
         push_github_state("eval: record copycat detections + any auto-blocks")
 
     if not pending:
+        # No new commits to grade, but still run the merge workflow: auto-merge a standing
+        # `merge-first` winner from a previous round and flag rivals of a just-merged winner.
+        if not args.dry_run:
+            reconcile_merge_labels(args.repo)
         print("done — no merges (manual)."); return
 
     if args.dry_run:
         print("--- dry-run: would evaluate (oldest-first): " +
               ", ".join(f"#{n}" for _, n, *_ in pending)); return
 
+    # Reuse the pinned stable box first (cached model, good download speed). Reset the pointer to it
+    # at the start of each run so the pin is always tried before any fallback box left from a prior run.
+    if PINNED_INSTANCE:
+        with open(INSTANCE_FILE, "w") as f: f.write(PINNED_INSTANCE)
+
+    # --- Same-box baseline -------------------------------------------------------------------------
+    # vast boxes vary in speed, so comparing a PR's tok/s against a frontier measured on a DIFFERENT
+    # box leaks hardware variance into the delta. Build+bench origin/main on THIS box first and grade
+    # every PR against that same-box number (+ any PR that lands earlier in this run). Measured ONCE
+    # per run, not per PR — otherwise two PRs targeting the same optimization could both "beat" main.
+    base_iid = current_instance(args.instance)
+    bcmd = [sys.executable, os.path.join(HERE, "vast_eval.py"), "--reuse", str(base_iid),
+            "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling), "--keep"]
+    if PINNED_INSTANCE and str(base_iid) == PINNED_INSTANCE: bcmd.append("--pinned")
+    print(f">> measuring same-box baseline (origin/main) on instance {base_iid} ...")
+    br = subprocess.run(bcmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
+    if br.returncode == PINNED_RETRY_RC:
+        tail = next((l for l in reversed((br.stdout + br.stderr).splitlines()) if l.strip()), "")
+        print(f">> {tail}\n>> aborting this run — next scheduled run retries the pinned box."); return
+    for l in br.stdout.splitlines():
+        if l.startswith("NEW_INSTANCE_ID "):
+            try:
+                nid = int(l.split()[1])
+                with open(INSTANCE_FILE, "w") as f: f.write(str(nid))
+                if PINNED_INSTANCE: _write_pin(nid)
+                print(f"  (instance updated to {nid}{'; re-pinned' if PINNED_INSTANCE else ''})")
+            except Exception: pass
+    bline = next((l for l in br.stdout.splitlines() if l.startswith("RESULT_JSON")), None)
+    bres = json.loads(bline[len("RESULT_JSON "):]) if bline else {}
+    if not bres.get("pass") or not bres.get("tps"):
+        log = (br.stdout + br.stderr)[-1200:]
+        print(f">> same-box baseline (origin/main) failed ({bres.get('label','no result')}) — "
+              f"aborting; no PRs graded.\n{log}"); return
+    run_baseline = bres["tps"]
+    print(f">> same-box baseline: origin/main = {run_baseline} tok/s on this box")
+    # Sanity guard: origin/main IS the merged frontier code, so on a healthy box it should measure
+    # within ~10% of the known frontier. A baseline well below that means the box is cold/throttling
+    # or degraded — grading PRs against it inflates every delta (the cold-clock artifact that once
+    # mislabeled minor PRs as XL above the ceiling). Abort rather than post bogus labels.
+    SANITY_FRAC = float(os.environ.get("SPARKINFER_BASELINE_SANITY", "0.90"))
+    known_frontier = float(args.frontier or 0)
+    if known_frontier > 0 and run_baseline < SANITY_FRAC * known_frontier:
+        print(f">> baseline {run_baseline} < {SANITY_FRAC:.0%} of known frontier {known_frontier} "
+              f"(= {SANITY_FRAC*known_frontier:.1f}) — box underperforming (cold/throttling/degraded). "
+              f"Aborting; NO PRs graded. Re-run on a warm, stable box.")
+        return
+
     # Run all pending evals on the SAME instance: pass --keep so vast_eval.py never stops/destroys
     # the box mid-queue. The bot stops the instance once after ALL PRs finish (or if the instance
     # dies, subsequent PRs self-heal by provisioning a new one).
     for i, (pr, num, branch, oid, ref, areas) in enumerate(pending):
-        # Re-read the frontier each iteration: a PR that passed earlier in THIS run may have
-        # ratcheted it (update_dashboard writes data.json), and later PRs must be graded against
-        # the new best — otherwise two PRs could both "beat" the same stale baseline.
-        d = load_dash()
-        cur_frontier = d["status"]["frontier_tps"] if d else frontier
-        print(f"PR #{num} @ {oid}: evaluating '{ref}' (frontier={cur_frontier}) ...")
-        r = subprocess.run([sys.executable, os.path.join(HERE, "vast_eval.py"),
-                            "--reuse", str(current_instance(args.instance)), "--ref", ref,
-                            "--frontier", str(cur_frontier), "--ceiling", str(args.ceiling),
-                            "--keep"],          # keep instance alive — bot stops it after all PRs
-                           cwd=ROOT, capture_output=True, text=True, timeout=14400)
-        # If vast_eval self-healed to a new instance, track the new id for the next PR.
+        # Grade against the same-box baseline = MERGED origin/main (measured above). Every PR in the
+        # run is graded against main, NOT against other PRs in the run — #67 and #70 are independent
+        # branches off main, so each must get its own gain over main (the old within-run ratchet made
+        # whichever ran second look like "none"). The frontier advances when you MERGE; to see if two
+        # optimizations STACK, re-evaluate the second after merging the first. Literal duplicates are
+        # caught by copycat detection; emission only pays MERGED PRs, so the maintainer's merge choice
+        # (not eval order) decides what counts.
+        cur_frontier = run_baseline
+        cur_iid = current_instance(args.instance)
+        cmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
+               "--reuse", str(cur_iid), "--ref", ref,
+               "--frontier", str(cur_frontier), "--ceiling", str(args.ceiling),
+               "--keep"]            # keep instance alive — bot stops it after all PRs
+        if PINNED_INSTANCE and str(cur_iid) == PINNED_INSTANCE:
+            cmd.append("--pinned")  # never destroy the pin; retry-then-fallback on bring-up failure
+        pinned = "--pinned" in cmd
+        print(f"PR #{num} @ {oid}: evaluating '{ref}' (frontier={cur_frontier}) on instance "
+              f"{cur_iid}{' [pinned]' if pinned else ''} ...")
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
+        if r.returncode == PINNED_RETRY_RC:
+            tail = next((l for l in reversed((r.stdout + r.stderr).splitlines()) if l.strip()), "")
+            print(f">> {tail}\n>> aborting this run — the next scheduled run retries the "
+                  f"pinned box. No PRs evaluated this tick."); return
+        # If vast_eval self-healed/fell back to a new instance, track the new id for the next PR.
         for l in r.stdout.splitlines():
             if l.startswith("NEW_INSTANCE_ID "):
                 try:
                     new_id = int(l.split()[1])
                     with open(INSTANCE_FILE, "w") as f: f.write(str(new_id))
-                    print(f"  (instance updated to {new_id})")
+                    if PINNED_INSTANCE: _write_pin(new_id)   # self-heal: re-pin to the fresh box
+                    print(f"  (instance updated to {new_id}{'; re-pinned' if PINNED_INSTANCE else ''})")
                 except Exception: pass
         line = next((l for l in r.stdout.splitlines() if l.startswith("RESULT_JSON")), None)
         if not line:
@@ -413,12 +756,27 @@ def main():
         if args.dry_run:
             print("--- dry-run, not posting ---\n" + body); continue
         if label:
-            for lab in {l for l in labels_on(args.repo, num) if l.startswith("eval:")}:
+            cur = labels_on(args.repo, num)
+            for lab in {l for l in cur if l.startswith("eval:")}:
                 remove_label(args.repo, num, lab)
             add_label(args.repo, num, f"eval:{label}")
+            # This was just graded against the CURRENT main, so it's no longer stale: clear
+            # needs-rebase. If it carried needs-rebase, it was a post-rebase re-eval → tag re-evaluate.
+            if NEEDS_REBASE_LABEL in cur:
+                remove_label(args.repo, num, NEEDS_REBASE_LABEL)
+                add_label(args.repo, num, REEVALUATE_LABEL)
         gh(["pr", "comment", str(num), "-R", args.repo, "--body", body])
         print(f"PR #{num}: posted {'eval:'+label if label else 'error'} — NOT merged.")
-        if res: update_dashboard(args.repo, pr, areas, res)
+        if res:
+            proof = upload_eval_log(args.repo, num, pr.get("title", ""), oid, res, r.stdout + r.stderr, run_baseline)
+            update_dashboard(args.repo, pr, areas, res, proof_url=proof)
+        # NB: run_baseline is NOT ratcheted here — every PR is graded against merged origin/main, so
+        # independent optimizations each get their true gain (the frontier advances on MERGE, not eval).
+
+    # Per-round merge workflow: among the PRs graded this round, label the biggest verified speedup
+    # `merge-first` and the rest `needs-rebase`; if a prior winner merged, flag its rivals `re-evaluate`.
+    if not args.dry_run:
+        reconcile_merge_labels(args.repo)
 
     # Stop (not destroy) the instance after all PRs — disk/model cache persists for next run.
     final_iid = current_instance(args.instance)

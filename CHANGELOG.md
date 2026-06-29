@@ -3,6 +3,220 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.3.1] — 2026-06-29
+
+The lead over llama.cpp widens to **double digits — and now holds at every context length** — and the
+evaluation becomes **publicly verifiable**: a hardware trust model plus an immutable, per-run public log.
+
+### Performance — RTX 5090 frontier 388.68 → 410.85 tok/s (+5.7%); now **10%+ past llama.cpp**
+Two verified kernel optimizations merged (top-1 0.97, KL ≈ 0.14):
+- **#72** — split-K the router projection GEMV for decode occupancy → 394.45 (@Dexterity104)
+- **#83** — emit Q8_1 from the residual RMSNorm, dropping the per-layer activation quantize → 410.85 (@fansilas)
+
+Same RTX 5090, same Q4_K_M GGUF, warm & interleaved vs `llama-bench`:
+
+| decode length | sparkinfer | llama.cpp |   |
+|---|---|---|---|
+| **128 tok** | **410.2** | 366.0 | **+12.1%** |
+| **256 tok** | **402.2** | 365.8 | **+10.0%** |
+| **512 tok** | **386.6** | 362.5 | **+6.7%** |
+
+sparkinfer is now **ahead at every length** — v0.3.0 was ~parity at 512; the recent decode-path work
+(residual Q8_1, router split-K) lifted the long-context number too.
+
+### Added — trustless, publicly-verifiable evaluation
+- **[`EVAL-TRUST.md`](EVAL-TRUST.md)** — the eval trust model: **reproducible from source today**, the
+  attested-eval roadmap (CPU-TEE scoring receipts → multi-validator consensus), and the honest boundary
+  (a consumer RTX 5090 has **no GPU Confidential Computing**, so the speed number is trusted via
+  **reproduction + consensus**, not a GPU enclave — by design, since we optimize the hardware people own).
+- **[sparkinfer-log](https://github.com/gittensor-ai-lab/sparkinfer-log)** — every eval is now committed
+  **immutably** to a public repo (raw `log.txt` + `result.json`, host IPs scrubbed) and rendered at a
+  **unique, verifiable URL per run** (GitHub Pages). The dashboard links each verdict to its proof.
+
+### Changed — accuracy gate tightened
+- **KL hard-reject at 0.20** (preferred ≤ 0.15): a speedup that erodes parity with llama.cpp now
+  `REJECT`s regardless of tok/s. In practice #83 first regressed KL to 0.21 → `REJECT`, the author
+  reworked it to KL 0.14 → clean `S` → merged. The gate forced a better PR.
+
+### Fixed — eval stability
+- **Warm-up before the baseline**, **fresh same-box checkout** on reused boxes (`FETCH_HEAD`, not a
+  stale `origin/main`), and a **baseline sanity guard** — so cold clocks and stale builds can't skew a
+  verdict.
+
+### Verified
+- **RTX 5090** frontier **410.85 tok/s** (128-tok), top-1 **0.97** vs llama.cpp (KL ≈ 0.14) —
+  **+12.1% @128 / +10.0% @256 / +6.7% @512** over llama.cpp, same-box, warm, interleaved.
+
+### Contributors
+- **@fansilas** — #83 (emit Q8_1 from the residual RMSNorm)
+- **@Dexterity104** — #72 (split-K router projection GEMV)
+
+## [0.3.0] — 2026-06-28
+
+The milestone release: sparkinfer's CUDA kernels **overtake llama.cpp** on Qwen3-MoE single-stream
+decode — at the **kernel level**, same model, same Q4_K_M precision, same greedy `bs=1` decode. No
+speculative decoding (EAGLE-3 / Medusa), no draft model, no flash-decoding accuracy trade — just
+faster kernels. Plus the first **production-readiness** feature: a thermal-safe inference governor.
+
+### Performance — RTX 5090 frontier 313.14 → 388.68 tok/s (+24%)
+Four verified kernel optimizations merged (top-1 0.95–0.98 vs llama.cpp, KL ≈ 0.145):
+- **#71** — int8 dp4a MMVQ for the Q4_K MoE down projection → 333.75 (@Dexterity104)
+- **#74** — split-K MMVQ down for M-tier decode occupancy → 339.59 (@jaso0n0818)
+- **#76** — fuse per-head Q/K-norm + Q/K rope into single kernels → 371.27 (@James-CUDA)
+- **#73** — skip the unused per-expert token-count pass in single-token decode → 388.68 (@Dexterity104)
+
+### 🏁 First to beat llama.cpp — at the kernel level
+Same RTX 5090, same Qwen3-30B-A3B Q4_K_M GGUF, head-to-head vs `llama-bench`, warm & controlled:
+
+| decode length | sparkinfer | llama.cpp |   |
+|---|---|---|---|
+| **128 tok** | **388.7** | 372.0 | **+4.5%** |
+| 256 tok | 381.5 | 371.7 | +2.6% |
+| 512 tok | 367.3 | 368.6 | ~parity |
+
+A **genuine kernel win** — identical weights, precision, and greedy single-stream decode; the
+speedup lives in the CUDA kernels (fused quantized MoE FFN, int8 dp4a MMVQ across every decode GEMV,
+split-K occupancy, fused attention norms), **not** in algorithmic shortcuts. The lead is largest at
+short generations and narrows to parity at long context — the per-token attention/KV path is the
+next frontier.
+
+### Added — production-readiness: thermal-safe inference (#77, @ai-hpc)
+- **`ThermalGovernor`** — a DVFS-style decode governor that throttles **throughput** when the GPU
+  runs hot (turbo / balanced / safe / emergency tiers, predictive), **preserving correctness
+  exactly**: it only paces token emission and never touches weights, precision, logits, or sampling,
+  so output is **bit-identical** to an un-paced run. Opt-in; zero overhead when off. Forcing the
+  tiers on a real RTX 5090 traded throughput for power **309 W → 87 W (3.5×)** with *identical token
+  ids* across every mode.
+- **GPU observability** — engine-level `query_gpu_stats()` / `Runtime::gpu_stats()` (heat, VRAM,
+  power, SM clock via NVML, mapped to the CUDA device by PCI bus id).
+
+### Changed — evaluation hardened against thermal & caching effects
+- **Warm-up before the baseline.** The from-source build leaves the GPU idle for minutes, so the
+  first timed build (the same-box baseline) was read on **cold clocks** and inflated every PR's
+  delta. The bench now spins clocks to boost before timing.
+- **Fresh same-box baseline on reused boxes.** The baseline checkout ran `git fetch origin origin/main`
+  — which silently fails (the branch is `main`) — and on a **reused** box left a *stale* checkout, so
+  it built **pre-merge** code and a just-merged gain was double-counted into the next PRs. Now it
+  fetches the real branch and checks out `FETCH_HEAD` (guaranteed fresh).
+- **Baseline sanity guard.** A run aborts if the same-box `main` baseline reads < 90 % of the known
+  frontier (cold / throttling / degraded box) instead of grading against a bogus-low baseline.
+
+### Verified
+- **RTX 5090** frontier **388.68 tok/s** (128-tok decode), top-1 **0.98** vs llama.cpp (KL ≈ 0.145),
+  **21.4 GB** resident — **+4.5 % over llama.cpp** at 128-tok, ~parity at 512-tok. Same-box, warm,
+  llama-anchored, controlled measurement.
+
+### Contributors
+- **@Dexterity104** — #71 (int8 dp4a Q4_K MoE down), #73 (skip per-expert token count)
+- **@jaso0n0818** — #74 (split-K MMVQ down)
+- **@James-CUDA** — #76 (fuse Q/K-norm + Q/K rope)
+- **@ai-hpc** — #77 (thermal governor + GPU observability)
+
+## [0.2.3] — 2026-06-26
+
+A performance jump **and** a fairer, more trustworthy evaluation: every PR is now measured against
+`main` on the **same GPU**, scored on the same-box delta, and worked through a per-round merge
+workflow that can auto-merge the winner.
+
+### Performance — RTX 5090 frontier 285.32 → 313.14 tok/s (+9.7%)
+Two verified MMVQ int8 quantized-read optimizations merged (top-1 0.99 vs llama.cpp, KL ≈ 0.15):
+- **#65** — int8 dp4a MMVQ for the Q6_K MoE down projection → 291.58 (@bohdansolovie)
+- **#70** — int8 MMVQ for the last fp32-path GEMVs (attn-V + LM head + gate/up) → 313.14 (@James-CUDA)
+
+The llama.cpp gap closed to **0.86×** (313.14 vs 365.73 tok/s).
+
+### Changed — fairer, hardware-independent scoring
+- **Same-box baseline.** Each eval builds **current `main` and the PR on the same RTX 5090** and
+  scores the **delta between them**, so speed differences between eval machines can't inflate or
+  hide a result. (Previously a PR's tok/s was compared to a frontier measured on a *different* box.)
+- **No within-run ratchet — independent PRs each score.** Every queued PR is graded against `main`,
+  not against the other PRs in the run. Before, whichever PR was graded first ratcheted the frontier
+  and made the next — a *different* optimization — look like `eval:none`.
+- **Label tiers are now bands of % over the frontier** (`XS` 2–3.5% … `XL` >18%), so all five stay
+  reachable as decode speed grows (the old fraction-of-headroom rule collapsed the small tiers).
+
+### Added — per-round merge workflow (+ guarded auto-merge)
+- A round grades the whole queue against the same `main`, labels the biggest verified speedup
+  **`merge-first`** and the rest **`needs-rebase`**. After the winner merges, rivals **rebase onto
+  the new `main`** and the bot re-evaluates them for their *marginal* gain on top — so independent
+  wins stack and an overlapping one correctly drops to `none` (`re-evaluate` tags the re-grade).
+- **Auto-merge (opt-in, heavily guarded).** The `merge-first` winner auto-merges only with a verified
+  speedup, no `copycat`/`flagged:gaming`/`penalty`/`hold`, author in good standing, changes confined
+  to `kernels`/`runtime`/`moe`, clean CI, and no conflicts. A `hold` label or `SPARKINFER_AUTOMERGE=0`
+  stops it; branch protection is still enforced.
+
+### Fixed
+- **Dashboard journey is merged-only.** The frontier and the optimization journey advance only when a
+  PR is **merged** (by its measured tok/s), not on eval — so unmerged or losing-rival evals no longer
+  pollute the chart.
+- **Self-healing eval box.** Stopped vast.ai boxes get reclaimed, so the pinned box can vanish between
+  runs; the bot now reuses it if it survived, else provisions a fresh one (Google Drive model fetch)
+  immediately and re-pins — no wasted retries.
+
+### Verified
+- **RTX 5090** frontier **313.14 tok/s**, top-1 0.99 vs llama.cpp (KL ≈ 0.15 nats), 21.4 GB resident.
+  Auto-evaluation runs on a 2-hour schedule.
+
+### Contributors
+- **@James-CUDA** — #70 (int8 MMVQ for the fp32-path GEMVs)
+- **@bohdansolovie** — #65 (int8 dp4a MMVQ for the Q6_K MoE down)
+
+## [0.2.2] — 2026-06-26
+
+A day of rapid frontier progress (**+52% decode**), a copycat caught gaming the eval, and a
+hardened auto-eval pipeline that now runs reliably on a 30-minute schedule.
+
+### Performance — RTX 5090 frontier 187.61 → 285.32 tok/s (+52%) in a day
+Five verified speedups landed since v0.2.0, each paid only for its **marginal gain over the
+previous frontier** (correctness-gated, top-1 ≥ 96% vs llama.cpp throughout):
+
+| PR | optimization | → frontier | label |
+|----|--------------|-----------:|:-----:|
+| #44 | vectorized fused RMSNorm (128-bit bf16×8 loads) | 197.22 | `M` |
+| #50 | decode dp4a (MMVQ) default + argmax widen | 240.11 | `XL` |
+| #52 | two-pass multi-block decode argmax (1 SM → all SMs) | 262.17 | `L` |
+| #59 | llama.cpp Q4_K `mul_mat_vec_q` for attention GEMVs | 279.11 | `L` |
+| #63 | parallelized flash-decode combine + `n_splits=32` | 285.32 | `M` |
+
+The llama.cpp gap closed to **0.78×** (285.32 vs 365.73 tok/s).
+
+### Security (anti-gaming)
+- **Copycat-to-bypass capture + 5-day penalty.** Caught a PR that re-submitted an earlier
+  author's diff with a few extra lines bolted on to look original and slip past the eval — the
+  diff-containment fingerprint flags these even with cosmetic additions. A first copycat strike
+  now **freezes the author's evaluations for 5 days** (`penalty` label, skipped; already-scored
+  PRs keep their result); a **2nd strike auto-blocks**. Logged in `.github/copycats.json` /
+  `COPYCATS.md`.
+- **No manual eval override.** Removed the `force-eval` bypass entirely — every PR is evaluated
+  on a real RTX 5090 **only** after it legitimately passes the gate (box ticked **and** a real
+  before<after decode table). Nothing skips the benchmark.
+
+### Fixed — stabilized 30-minute auto-evaluation
+- **Google Drive model source.** HuggingFace was throttling the 18.6 GB GGUF to ~0.2–5 KB/s on
+  many vast.ai hosts (effectively stalled). The eval now fetches it from Google Drive via `gdown`
+  (measured **20–74 MB/s**), with HF/curl as fallback — the model lands in minutes, not never.
+- **Pinned stable instance (reuse-first, never destroy).** The eval reuses one known-good box
+  with the cached model by default instead of provisioning fresh each run. On bring-up failure it
+  retries on the next run (~30 min) up to twice before provisioning a new box — and **never
+  destroys the pinned one**. Eliminates the re-download / re-provision churn between runs.
+- **Dud-host skip-list + cron lock.** Blacklist hosts whose entire network is dead (not just HF);
+  a `flock` lock prevents overlapping cron ticks. Together these make the 30-minute auto-eval reliable.
+- **Dashboard.** Optimization-journey x-axis labels rotated 45° so the (now 12) bars no longer collide.
+
+### Changed
+- **Label tiers are now bands of % speedup over the frontier** (`XS` 2–3.5%, `S` 3.5–6%, `M` 6–10%,
+  `L` 10–18%, `XL` >18%; <2% is within noise → `none`) — same denominator as the significance gate.
+  The previous *fraction-of-headroom* rule collapsed `XS`/`S` once the frontier neared the ceiling
+  (the 2% noise floor alone exceeded their headroom bands); the new bands keep all five tiers
+  reachable and scale with decode speed.
+
+### Verified
+- **RTX 5090** frontier **285.32 tok/s**, top-1 0.96 vs llama.cpp (KL ≈ 0.14 nats), 21.4 GB resident.
+
+### Contributors
+- **@James-CUDA** — #50 (`XL`), #59 (`L`), #63 (`M`)
+- **@kiannidev** — #44 (`M`), #52 (`L`)
+
 ## [0.2.0] — 2026-06-25
 
 Evaluation-pipeline hardening, anti-gaming controls, and the live frontier dashboard.

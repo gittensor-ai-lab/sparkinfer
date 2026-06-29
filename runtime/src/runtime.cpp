@@ -35,6 +35,7 @@ public:
     void shutdown() override { cudaDeviceSynchronize(); }
     float memory_bandwidth_gbps() const override { return bandwidth_gbps_; }
     int   num_sms() const override { return num_sms_; }
+    GpuStats gpu_stats() const override { return query_gpu_stats(cfg_.device_id); }
 
 private:
     RuntimeConfig cfg_;
