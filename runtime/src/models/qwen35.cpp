@@ -282,6 +282,57 @@ double Qwen35Model::bench_decode(int warmup, int n) {
     return n / secs;
 }
 
+double Qwen35Model::bench_decode_speculative(int warmup, int n, int draft_k) {
+    Impl& s = *p_;
+    if (draft_k < 2) draft_k = 4;
+    if (!s.spec_ready) enable_speculative(draft_k);
+    if (!s.spec_ready || s.spec_k != draft_k) {
+        fprintf(stderr, "[bench] speculative decode unavailable (draft_k=%d)\n", draft_k);
+        return -1;
+    }
+    if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) { fprintf(stderr, "[bench] kv allocate failed\n"); return -1; }
+
+    std::vector<int> committed;
+    int pos = 0, tok = 100;
+    for (int i = 0; i < warmup; i++) {
+        tok = forward_token(tok, pos++);
+        if (tok < 0 || tok >= s.cfg.vocab) tok = 100;
+        committed.push_back(tok);
+    }
+    int cur = tok;
+
+    cudaDeviceSynchronize();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int generated = 0;
+    while (generated < n) {
+        std::vector<int> draft = propose_draft(committed, draft_k - 1);
+        std::vector<int> batch_in;
+        batch_in.reserve(draft_k);
+        batch_in.push_back(cur);
+        for (int d : draft) batch_in.push_back(d);
+        while ((int)batch_in.size() < draft_k) batch_in.push_back(cur);
+
+        std::vector<int> verified(draft_k);
+        if (!forward_tokens_batch(batch_in.data(), draft_k, pos + 1, verified.data())) break;
+
+        AcceptResult r = accept_draft(draft, verified);
+        committed.push_back(cur); pos++; generated++;
+        for (int i = 0; i < r.accepted && generated < n; i++) {
+            committed.push_back(draft[i]); pos++; generated++;
+        }
+        cur = r.bonus_token;
+    }
+    cudaDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    s.kv->free(s.seq_id);
+    if (generated < n) {
+        fprintf(stderr, "[bench] speculative decode stopped early (%d/%d tokens)\n", generated, n);
+        return -1;
+    }
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+    return n / secs;
+}
+
 std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new) {
     Impl& s = *p_;
     std::vector<int> out;

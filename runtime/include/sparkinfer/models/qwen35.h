@@ -120,6 +120,10 @@ public:
     // steps then times `n_tokens` more. Returns tokens/sec. Requires weights.
     double bench_decode(int warmup, int n_tokens);
 
+    // Same timing protocol as bench_decode(), but times prompt-lookup speculative
+    // decode (generate_speculative's inner loop) instead of forward_token().
+    double bench_decode_speculative(int warmup, int n_tokens, int draft_k = 4);
+
     const Qwen35Config& config() const;
 
 private:

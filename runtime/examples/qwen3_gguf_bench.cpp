@@ -2,9 +2,10 @@
 // Reports steady-state single-stream generation tokens/sec, to compare against
 // llama.cpp's `llama-bench` tg number on the same model + GPU.
 //
-// Usage: qwen3_gguf_bench <model.gguf | weight_dir> [n_tokens]
+// Usage: qwen3_gguf_bench <model.gguf | weight_dir> [n_tokens] [--spec [draft_k]]
 //   *.gguf  -> native load (experts kept quantized, Q4_K_M-sized)
 //   dir     -> bf16 weights from convert_gguf.py (reads config.txt)
+//   --spec  -> benchmark prompt-lookup speculative decode (default draft_k=4)
 
 #include "sparkinfer/runtime.h"
 #include "sparkinfer/kv_cache.h"
@@ -24,11 +25,21 @@ static bool ends_with(const std::string& s, const std::string& suf) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { printf("usage: %s <model.gguf|weight_dir> [n_tokens]\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s <model.gguf|weight_dir> [n_tokens] [--spec [draft_k]]\n", argv[0]); return 2; }
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
     const std::string path = argv[1];
-    const int n_tokens = argc > 2 ? atoi(argv[2]) : 64;
+    int n_tokens = 64;
+    bool spec = false;
+    int draft_k = 4;
+    for (int i = 2; i < argc; i++) {
+        if (std::string(argv[i]) == "--spec") {
+            spec = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') draft_k = atoi(argv[++i]);
+        } else if (argv[i][0] != '-') {
+            n_tokens = atoi(argv[i]);
+        }
+    }
     const bool gguf_mode = ends_with(path, ".gguf");
 
     sparkinfer::Qwen35Config cfg;
@@ -72,9 +83,12 @@ int main(int argc, char** argv) {
     if (!ok) { printf("[FAIL] load\n"); return 1; }
     size_t freeb=0, totb=0; cudaMemGetInfo(&freeb,&totb);
 
-    double toks = model.bench_decode(8, n_tokens);
-    printf("\n=== sparkinfer bench (%s) ===\n", gguf_mode ? "Q4_K_M native" : "bf16");
+    double toks = spec ? model.bench_decode_speculative(8, n_tokens, draft_k) : model.bench_decode(8, n_tokens);
+    if (toks < 0) { printf("[FAIL] benchmark\n"); return 1; }
+    printf("\n=== sparkinfer bench (%s%s) ===\n", gguf_mode ? "Q4_K_M native" : "bf16",
+           spec ? ", prompt-lookup speculative" : "");
     printf("model        : Qwen3-30B-A3B  (%d layers, %d experts top-%d)\n", cfg.n_layers, cfg.n_experts, cfg.top_k);
+    if (spec) printf("spec decode  : draft_k=%d\n", draft_k);
     printf("VRAM used    : %.1f GB\n", (totb - freeb) / 1e9);
     printf("decode tg    : %.2f tok/s  (%.1f ms/token, n=%d, bs=1)\n", toks, 1000.0 / toks, n_tokens);
     return 0;
