@@ -28,12 +28,19 @@ commit   = sys.argv[6]
 # reproduce at the same clock + prompt seed. Does not affect the deterministic scoring above.
 prov     = json.loads(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else {}
 
-# Correctness gate (governance-tunable). KL_BAR is the HARD reject ceiling; KL_PREFER is the soft
-# target — a pass above it is accepted but flagged. Accuracy parity with llama.cpp is the moat, so a
-# speedup that pushes KL past 0.20 is rejected outright regardless of how fast it is.
-TOP1_BAR  = float(os.environ.get("SPARKINFER_TOP1_BAR",  "0.90"))
-KL_BAR    = float(os.environ.get("SPARKINFER_KL_BAR",    "0.20"))
-KL_PREFER = float(os.environ.get("SPARKINFER_KL_PREFER", "0.15"))
+# Correctness gate (governance-tunable). Accuracy parity with llama.cpp is the moat: a speedup that
+# erodes it is REJECTed regardless of speed. top-1 token agreement is the PRIMARY gate — it's what
+# greedy decode actually emits, and it's stable across prompts. KL is a secondary distributional
+# backstop that scales with prompt difficulty, so it gets a wider band.
+#
+# Thresholds are calibrated to the HELD-OUT prompt regime (H1). On a multi-seed sweep of current main
+# vs llama over diverse held-out prompts, top-1 held 0.96–0.98 on EVERY seed while KL ranged 0.14
+# (easy prose) to 0.33 (hardest, where llama's own PPL hit ~21). The old KL_BAR=0.20 was an artifact
+# of one easy fixed prompt — it would REJECT a known-good main on a hard held-out slice. These bars
+# keep the same ~0.07 margin over the worst known-good main but in the held-out regime.
+TOP1_BAR  = float(os.environ.get("SPARKINFER_TOP1_BAR",  "0.93"))   # worst held-out main 0.96 -> 0.93 floor
+KL_BAR    = float(os.environ.get("SPARKINFER_KL_BAR",    "0.40"))   # worst held-out main 0.33 + margin
+KL_PREFER = float(os.environ.get("SPARKINFER_KL_PREFER", "0.30"))   # soft warn above typical held-out KL
 SIG = 0.02                                              # noise floor: gain must beat 2% of frontier
 # min relative speedup (delta/frontier) for each tier; XS starts at the noise floor SIG.
 BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]

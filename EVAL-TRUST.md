@@ -18,15 +18,31 @@ How sparkinfer's SN74 evaluation is made trustworthy — what you can verify **t
 ## What the evaluator does
 
 For each PR commit, on one RTX 5090, in one run:
+0. **Verify the baseline reference** before anything is scored: the Q4_K_M weights are checked against
+   a pinned **sha256** and re-fetched if they don't match, and **llama.cpp is rebuilt from a pinned
+   commit** with a clean tree — so a tampered persisted copy on a reused box can't skew the verdict.
+   ([`bench/scripts/reference.lock`](bench/scripts/reference.lock).)
 1. **Build `main` and the PR from source** on the same box.
-2. **Warm up** the GPU to saturate clocks (cold clocks otherwise skew the first measurement).
+2. **Warm up** the GPU and **pin/record the graphics clock** — pinned via `nvidia-smi -lgc` where the
+   box permits (bare-metal/datacenter), otherwise the observed clock (and its spread) is recorded with
+   the result, so the absolute tok/s is reproducible and clock-checkable, not just same-box-cancelled.
 3. **Bench decode** for both, **interleaved**, and score the **same-box delta %** — so box-to-box
    hardware variance (~2%) cancels and the score is hardware-independent.
-4. **Gate correctness**: top-1 token agreement ≥ 0.90 and **KL ≤ 0.20** (preferred ≤ 0.15) vs
-   llama.cpp on the same GGUF. A speedup that erodes accuracy is `REJECT`ed regardless of how fast it
-   is — accuracy is the moat.
+4. **Gate correctness on a held-out prompt**: **top-1 token agreement ≥ 0.93** (the primary gate — it's
+   what greedy decode actually emits, and it holds 0.96–0.98 across prompts) and a distributional
+   backstop **KL ≤ 0.40** (preferred ≤ 0.30) vs llama.cpp on the same GGUF. The prompt is **chosen by a
+   fresh, unpredictable per-eval seed** (a random window of a multi-domain corpus + fuzzed length), so a
+   submission can't overfit a fixed in-repo prompt; the seed is logged so the exact prompt is
+   reproducible. The bars are calibrated to this held-out regime — diverse prompts raise KL (0.14 on easy
+   prose to ~0.33 on hard text), so a fixed-prompt KL bar would falsely reject a known-good build. A
+   speedup that erodes accuracy is `REJECT`ed regardless of how fast it is — accuracy is the moat.
 5. **Label** = a **deterministic function of the measurements** (`XS … XL`, `none`, `BASELINE`,
-   `REJECT`), so independent validators converge on the same verdict.
+   `REJECT`), so independent validators converge on the same verdict. The verdict carries its
+   **provenance** (clock, prompt seed, reference pins) so the immutable log is self-describing.
+
+Every frontier advance is also appended to an **immutable, GitHub-timestamped frontier ledger**
+(`ledger.jsonl` in the eval-log repo): `(date, PR, author, commit, Δ%, prev→new frontier, proof)` —
+append-only, so the frontier history is auditable line-by-line against the per-run logs.
 
 The bot runs the same code you can: [`eval/`](eval) (`pr_eval_bot.py`, `vast_eval.py`), with the
 scoring math in [`bench/scripts/label.py`](bench/scripts/label.py).
