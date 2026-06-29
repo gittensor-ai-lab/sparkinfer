@@ -34,6 +34,14 @@ int main(int argc, char** argv) {
     auto rt = sparkinfer::Runtime::create({});
     rt->initialize();
 
+    sparkinfer::RuntimeConfig rtcfg;
+    rtcfg.device_id = 0;
+    // Optional: SPARKINFER_EXPERT_CACHE_MB limits GPU-resident MoE layer expert tensors.
+    if (const char* mb = std::getenv("SPARKINFER_EXPERT_CACHE_MB")) {
+        const size_t n = (size_t)std::max(0, atoi(mb));
+        rtcfg.expert_cache_bytes = n * 1024u * 1024u;
+    }
+
     sparkinfer::Qwen35Config cfg;          // full Qwen3.5-35B-A3B defaults
     cfg.max_seq = 2048;
 
@@ -45,7 +53,7 @@ int main(int argc, char** argv) {
     sparkinfer::moe::MoEConfig mc;
     mc.num_experts = cfg.n_experts; mc.top_k = cfg.top_k; mc.hidden_dim = cfg.hidden;
     mc.ffn_dim = cfg.moe_ffn; mc.num_layers = cfg.n_layers;
-    auto engine = sparkinfer::moe::MoEEngine::create(mc);
+    auto engine = sparkinfer::moe::MoEEngine::create(mc, rtcfg.expert_cache_bytes);
 
     sparkinfer::Qwen35Model model(cfg, &kv, engine.get());
     if (!model.load_weights(dir)) { printf("[FAIL] could not load weights from %s\n", dir.c_str()); return 1; }

@@ -24,4 +24,13 @@ target_link_libraries(sparkinfer_moe PUBLIC sparkinfer_kernels CUDA::cudart)
 
 if(BUILD_TESTS)
     enable_testing()
+    add_executable(expert_cache_cpu_test tests/expert_cache_cpu_test.cpp)
+    target_include_directories(expert_cache_cpu_test PRIVATE include)
+    target_link_libraries(expert_cache_cpu_test PRIVATE sparkinfer_moe)
+    add_test(NAME expert_cache_cpu_test COMMAND expert_cache_cpu_test)
+
+    add_executable(expert_cache_gpu_test tests/expert_cache_gpu_test.cpp)
+    target_include_directories(expert_cache_gpu_test PRIVATE include)
+    target_link_libraries(expert_cache_gpu_test PRIVATE sparkinfer_moe CUDA::cudart)
+    add_test(NAME expert_cache_gpu_test COMMAND expert_cache_gpu_test)
 endif()

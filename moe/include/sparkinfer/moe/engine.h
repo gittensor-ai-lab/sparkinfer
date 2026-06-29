@@ -7,6 +7,14 @@
 
 namespace sparkinfer { namespace moe {
 
+struct ExpertCacheStats {
+    uint64_t layer_hits   = 0;
+    uint64_t layer_misses = 0;
+    uint64_t expert_loads = 0;
+    uint64_t prefetches   = 0;
+    int      max_resident_layers = 0;
+};
+
 struct MoEConfig {
     int num_experts;
     int top_k;
@@ -20,6 +28,9 @@ struct MoEConfig {
 
     // Prefetch next-layer experts while current layer executes
     bool async_expert_prefetch = true;
+
+    // How many layers ahead to prefetch expert slices after routing (default 2).
+    int async_prefetch_depth = 2;
 
     // Normalize routing weights after top-k selection
     bool normalize_expert_weights = true;
@@ -45,6 +56,7 @@ struct LayerWeights {
 class MoEEngine {
 public:
     static std::unique_ptr<MoEEngine> create(const MoEConfig& cfg);
+    static std::unique_ptr<MoEEngine> create(const MoEConfig& cfg, size_t expert_cache_bytes);
     virtual ~MoEEngine() = default;
 
     // Register device weight pointers for a layer.
@@ -65,6 +77,13 @@ public:
     virtual const int* tokens_per_expert() const = 0;
 
     virtual const MoEConfig& config() const = 0;
+
+    // Expert cache observability (zeros when cache is inactive).
+    virtual ExpertCacheStats cache_stats() const = 0;
 };
+
+// Build MoEConfig with residency derived from RuntimeConfig::expert_cache_bytes.
+MoEConfig make_moe_config(int num_experts, int top_k, int hidden_dim, int ffn_dim,
+                          int num_layers, size_t expert_cache_bytes = 0);
 
 }} // namespace sparkinfer::moe
