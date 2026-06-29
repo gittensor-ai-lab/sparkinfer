@@ -88,5 +88,21 @@ int main() {
     printf("[PASS] qwen35_gpu_test: generated 8 tokens:");
     for (int id : out) printf(" %d", id);
     printf("\n");
+
+    const int eos = cfg.eos_id;
+    int invalid_neg = model.forward_token(-1, 0);
+    if (invalid_neg != eos) {
+        printf("[FAIL] expected forward_token(-1, ...) to return eos_id=%d, got %d\n", eos, invalid_neg);
+        return 1;
+    }
+
+    int invalid_oob = model.forward_token(cfg.vocab, 0);
+    if (invalid_oob != eos) {
+        printf("[FAIL] expected forward_token(vocab, ...) to return eos_id=%d, got %d\n", eos, invalid_oob);
+        return 1;
+    }
+
+    printf("[PASS] qwen35_gpu_test: forward_token rejects out-of-range token ids\n");
+
     return 0;
 }

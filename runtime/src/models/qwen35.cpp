@@ -180,6 +180,12 @@ void Qwen35Model::copy_logits(float* host_logits) const {
 int Qwen35Model::forward_token(int token_id, int position) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
+
+    if (token_id < 0 || token_id >= c.vocab) {
+        fprintf(stderr, "[qwen35] forward_token: token %d out of range [0, %d)\n", token_id, c.vocab);
+        return c.eos_id;
+    }
+
     const int H = c.hidden;
     kernels::GemmConfig gc{};
     int seqlen = position + 1;
