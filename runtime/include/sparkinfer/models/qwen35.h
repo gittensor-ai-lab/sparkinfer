@@ -7,6 +7,8 @@
 
 namespace sparkinfer {
 
+class ThermalGovernor;   // optional decode-time thermal pacing (thermal_governor.h)
+
 // Qwen3.5-35B-A3B architecture.
 //   40 layers, hidden 2048, 16 Q / 2 KV heads (8:1 GQA), head_dim 128,
 //   256 routed experts (top-8) + 1 shared expert, moe ffn 512,
@@ -82,8 +84,10 @@ public:
     // dequantized per-layer at decode time (Q4_K_M-sized resident footprint).
     bool load_gguf(const std::string& path);
 
-    // Greedy generate: prompt token ids -> generated token ids (host).
-    std::vector<int> generate(const std::vector<int>& prompt_ids, int max_new_tokens);
+    // Greedy generate: prompt token ids -> generated token ids (host). An optional ThermalGovernor
+    // paces decode under thermal pressure (accuracy-preserving); nullptr = full speed, no overhead.
+    std::vector<int> generate(const std::vector<int>& prompt_ids, int max_new_tokens,
+                              ThermalGovernor* gov = nullptr);
 
     // Run one token at `position`, return the argmax next-token id.
     int forward_token(int token_id, int position);

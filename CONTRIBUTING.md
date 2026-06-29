@@ -41,7 +41,22 @@ must be clean (0 errors).
 ## How rewards work (SN74)
 
 **Speedup-only.** You're paid for the **verified marginal speedup** your PR adds over the
-current best ("frontier"), not your rank — so "copy the leader + ε" pays ≈ ε. The eval loop
+current best ("frontier"), not your rank — so "copy the leader + ε" pays ≈ ε. Both **current
+`main` and your PR are built and benchmarked on the same RTX 5090** in one run and scored on the
+delta between them, so speed differences between eval machines can't inflate or hide your result.
+
+**Competing PRs (per-round merge workflow).** A run grades every queued PR against the *same*
+`main`, so two independent optimizations each get their true gain. The bot then labels the round's
+biggest one [`merge-first`](../../labels/merge-first) and the rest
+[`needs-rebase`](../../labels/needs-rebase). The `merge-first` winner is **auto-merged** once it
+clears every guard — verified speedup, clean CI, no conflicts, author in good standing, and it
+touches only `kernels`/`runtime`/`moe` (never the maintainer-owned paths); a maintainer can stop
+that with a `hold` label. Once the `merge-first` PR is merged, the others **stay `needs-rebase`** —
+**rebase your branch onto the new `main`** and push; the bot then re-runs your eval against the new
+frontier (briefly tagging [`re-evaluate`](../../labels/re-evaluate) during the re-grade), so you're
+credited for the **marginal** gain on top of what merged (independent wins stack and keep scoring; a
+change the merge already captured drops to `none`). A `needs-rebase` PR can't win the next round
+until you actually rebase + it re-evals. Keep your branch rebased on `main`. The eval loop
 labels each PR **XL / L / M / S / XS** from the measured delta (or **BASELINE** for the first
 verified entry on a new model/target) — never by hand — and that tier is the payout. A speedup
 is scored the same wherever it lands (`kernels/`, `runtime/`, `moe/`); there is **no

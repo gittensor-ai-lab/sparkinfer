@@ -57,3 +57,7 @@ Note: #57 is objectively a copy, so the auto-detector **re-flags it whenever the
 (this is exactly what happened on a re-run after it was briefly reopened). For this override to
 hold, #57 must stay **closed** (or be added to an explicit copycat exception). This entry
 supersedes the auto-block records above.
+
+## 2026-06-29 — `ai-engram` (auto-blocked)
+
+Auto-blocked: copycat of #83 (fansilas) re-submitted as PR #88. Zero-tolerance copycat policy.

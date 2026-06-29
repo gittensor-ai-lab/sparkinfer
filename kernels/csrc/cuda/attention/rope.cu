@@ -40,12 +40,116 @@ __global__ void rope_kernel(
     x[base + i + half] = __float2bfloat16(x1 * c + x0 * s);
 }
 
+// Fused Q+K rope: ONE kernel over all (n_q_heads + n_kv_heads) heads with a flat
+// 256-thread layout — 1 graph node instead of 2, and better occupancy than the
+// head_dim/2-thread blocks. Mirrors llama's single rope_neox launch.
+__global__ void rope_qk_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k,
+    const int* __restrict__ positions, int n_q_heads, int n_kv_heads, int head_dim, float theta
+) {
+    const int tok  = blockIdx.y;
+    const int half = head_dim >> 1;
+    const int total = (n_q_heads + n_kv_heads) * half;     // rotated pairs across Q|K
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total) return;
+    const int hh = gid / half, i = gid - hh * half;
+    __nv_bfloat16* x; int head, nh;
+    if (hh < n_q_heads) { x = q; head = hh;             nh = n_q_heads; }
+    else                { x = k; head = hh - n_q_heads; nh = n_kv_heads; }
+    const float p = (float)positions[tok];
+    const float freq = __powf(theta, -2.f * (float)i / (float)head_dim);
+    const float ang = p * freq;
+    const float c = __cosf(ang), s = __sinf(ang);
+    const size_t base = ((size_t)(tok * nh + head)) * head_dim;
+    const float x0 = __bfloat162float(x[base + i]);
+    const float x1 = __bfloat162float(x[base + i + half]);
+    x[base + i]        = __float2bfloat16(x0 * c - x1 * s);
+    x[base + i + half] = __float2bfloat16(x1 * c + x0 * s);
+}
+
+// Fused RoPE + KV-append: ropes Q in place, ropes K and writes it STRAIGHT into the paged
+// KV cache, and copies V into the cache — one kernel replacing rope_qk + kv_append (one graph
+// node instead of two, and no s.k round-trip). The roped Q/K are bit-identical to rope_qk and
+// the cached V is identical to kv_append. On the decode path positions == write_pos (the
+// token's absolute slot), so one pointer drives both the rope angle and the cache slot.
+__global__ void rope_kv_append_kernel(
+    __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, float theta,
+    int block_size, int max_blocks_per_seq
+) {
+    const int tok  = blockIdx.y;
+    const int half = head_dim >> 1;
+    const int nq = n_q_heads  * half;        // Q rotated pairs
+    const int nk = n_kv_heads * half;        // K rotated pairs
+    const int nv = n_kv_heads * head_dim;    // V elements (no rope)
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= nq + nk + nv) return;
+
+    const int pos    = positions[tok];
+    const int blk    = pos / block_size;
+    const int within = pos % block_size;
+    const int phys   = block_table[tok * max_blocks_per_seq + blk];
+    const size_t ctok = (size_t)(phys * block_size + within);   // cache token slot
+
+    if (gid < nq) {                          // Q: rope in place
+        const int hh = gid / half, i = gid - hh * half;
+        const float freq = __powf(theta, -2.f * (float)i / (float)head_dim);
+        const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+        const size_t base = ((size_t)(tok * n_q_heads + hh)) * head_dim;
+        const float x0 = __bfloat162float(q[base + i]), x1 = __bfloat162float(q[base + i + half]);
+        q[base + i]        = __float2bfloat16(x0 * c - x1 * s);
+        q[base + i + half] = __float2bfloat16(x1 * c + x0 * s);
+    } else if (gid < nq + nk) {              // K: rope, write straight to the cache
+        const int g = gid - nq, hh = g / half, i = g - hh * half;
+        const float freq = __powf(theta, -2.f * (float)i / (float)head_dim);
+        const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+        const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+        const float x0 = __bfloat162float(k[base + i]), x1 = __bfloat162float(k[base + i + half]);
+        k_pool[dst + i]        = __float2bfloat16(x0 * c - x1 * s);
+        k_pool[dst + i + half] = __float2bfloat16(x1 * c + x0 * s);
+    } else {                                 // V: copy to the cache (no rope)
+        const int g = gid - nq - nk, hh = g / head_dim, d = g - hh * head_dim;
+        const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+        v_pool[dst + d] = v[base + d];
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/attention.h"
+#include <cstdlib>
+
+void launch_rope_kv_append(void* q, const void* k, const void* v, void* k_pool, void* v_pool,
+                           const int* block_table, const int* positions,
+                           int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, float theta,
+                           int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+    const int half = head_dim >> 1;
+    const int total = n_q_heads * half + n_kv_heads * half + n_kv_heads * head_dim;
+    dim3 grid((total + 255) / 256, n_tokens);
+    rope_kv_append_kernel<<<grid, 256, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, theta, block_size, max_blocks_per_seq);
+}
 
 void launch_rope(void* q, void* k, const int* positions,
                  int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
                  float theta, cudaStream_t stream) {
+    static int fuse = -1;   // default ON: fused Q+K rope (1 kernel). SPARKINFER_ROPEFUSE=0 disables
+    if (fuse < 0) { const char* e = getenv("SPARKINFER_ROPEFUSE"); fuse = (e && e[0] == '0') ? 0 : 1; }
+    if (fuse) {
+        const int total = (n_q_heads + n_kv_heads) * (head_dim >> 1);
+        dim3 grid((total + 255) / 256, n_tokens);
+        rope_qk_kernel<<<grid, 256, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            positions, n_q_heads, n_kv_heads, head_dim, theta);
+        return;
+    }
     const int half = head_dim / 2;
     dim3 gq(n_tokens, n_q_heads);
     rope_kernel<<<gq, half, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(q), positions, n_q_heads, head_dim, theta);

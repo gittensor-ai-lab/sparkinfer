@@ -54,6 +54,49 @@ __global__ void gemv_kernel(const __nv_bfloat16* __restrict__ x,
 template __global__ void gemv_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int);
 template __global__ void gemv_kernel<float>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int);
 
+// split-K bf16 GEMV for small N (the router projection: N = n_experts). One-warp-per-row leaves
+// the GPU idle at N=128, so the read runs far below the bandwidth roofline. S warps cooperate per
+// output row (each sums a 1/S stride of the K reduction, S-way shared reduce). The activation is
+// read straight from L2 (no shared staging + __syncthreads, which dominates at this size). RPB =
+// GEMV_WPB/S rows per block. Faithful: only the fp reduction order changes.
+template <typename OutT, int S>
+__global__ void gemv_f32_sk_kernel(const __nv_bfloat16* __restrict__ x,
+                                   const __nv_bfloat16* __restrict__ W,
+                                   OutT* __restrict__ y, int N, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float s_part[RPB][S];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n = blockIdx.x * RPB + row_local;
+    float acc = 0.f;
+    if (n < N) {
+        const uint4* row4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+        const uint4* x4 = reinterpret_cast<const uint4*>(x);
+        const int n4 = K / 8;                          // 8 bf16 per uint4
+        for (int i = split * 32 + lane; i < n4; i += S * 32) {
+            uint4 wv = row4[i], xv = x4[i];
+            const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float2 wf = __bfloat1622float2(wh[j]), xf = __bfloat1622float2(xh[j]);
+                acc += wf.x * xf.x + wf.y * xf.y;
+            }
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+        if (lane == 0) s_part[row_local][split] = acc;
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[row_local][s];
+        gemv_write(y + n, o);
+    }
+}
+template __global__ void gemv_f32_sk_kernel<float, 4>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int);
+
 // ---- quantized on-read GEMV (W = GGUF-native Q4_K/Q6_K [N,K]) -----------------
 // Dequantizes each 256-block in registers and dots with a full-precision (fp32)
 // activation — reads the quantized weight bytes (~4x less than bf16) with NO int8
@@ -385,6 +428,85 @@ __global__ void si_mmvq_q4k_kernel(const si_block_q8_1* __restrict__ vy, const u
 template __global__ void si_mmvq_q4k_kernel<__nv_bfloat16>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
 template __global__ void si_mmvq_q4k_kernel<float>(const si_block_q8_1*, const unsigned char*, float*, int, int);
 
+// ===== faithful llama Q6_K mmvq for the fp32-path GEMVs (attn-V upgrades + LM head) =====
+// Same 4-warp-per-row structure as the Q4_K mmvq, with vec_dot_q6_K_q8_1 (coalesced
+// ql/qh int loads + __vsubss4 reconstruct + dp4a). Mirrors the #65 MoE-down dot.
+__device__ __forceinline__ int si_get_int_b2(const void* x, int i32) {
+    const unsigned short* x16 = reinterpret_cast<const unsigned short*>(x);
+    return (int)x16[2 * i32] | ((int)x16[2 * i32 + 1] << 16);
+}
+__device__ __forceinline__ float si_vec_dot_q6_K(const unsigned char* __restrict__ bq6,
+                                                 const si_block_q8_1* __restrict__ bq8, int iqs) {
+    const signed char* scales = reinterpret_cast<const signed char*>(bq6 + 192);
+    const float d = gq_h2f(bq6 + 208);
+    const int bq8_offset   = 4 * (iqs / 16) + (iqs % 16) / 8;
+    const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+    const int vh_shift     = 2 * ((iqs % 16) / 8);
+    const int vl = si_get_int_b2(bq6, iqs);
+    const int vh = si_get_int_b2(bq6 + 128, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;
+    const signed char* sc = scales + scale_offset;
+    float sumf = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const si_block_q8_1* b8 = bq8 + bq8_offset + 2 * i;
+        const int u = reinterpret_cast<const int*>(b8->qs)[iqs % 8];
+        const float d8 = __low2float(b8->ds);
+        const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
+        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+        const int vi  = __vsubss4((vil | vih), 0x20202020);
+        sumf += d8 * (__dp4a(vi, u, 0) * (int)sc[4 * i]);
+    }
+    return d * sumf;
+}
+
+template <typename OutT>
+__global__ void si_mmvq_q6k_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
+                                   OutT* __restrict__ y, int N, int K) {
+    constexpr int NW = 4, WS = 32, vdr = 1, qi = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const unsigned char* x_row = W + (size_t)row * (K >> 8) * 210;   // Q6_K: 210 B / 256-superblock
+    const int blocks_per_row = K >> 8;
+    const int blocks_per_iter = vdr * NW * WS / qi;                  // = 4
+    float tmp = 0.0f;
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const int kby = kbx * 8;                                    // q8_1 blocks per superblock
+        const int kqs = vdr * (tid % (qi / vdr));                   // = lane
+        tmp += si_vec_dot_q6_K(x_row + (size_t)kbx * 210, vy + kby, kqs);
+    }
+    __shared__ float tmp_shared[NW - 1][WS];
+    if (warp > 0) tmp_shared[warp - 1][lane] = tmp;
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) tmp += tmp_shared[l][lane];
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, m);
+    if (lane == 0) gemv_write(y + row, tmp);
+}
+template __global__ void si_mmvq_q6k_kernel<__nv_bfloat16>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q6k_kernel<float>(const si_block_q8_1*, const unsigned char*, float*, int, int);
+
+// 1-warp-per-row Q6_K dp4a GEMV: keeps the fp32 gemv_q block structure (GEMV_WPB rows/block,
+// well-occupied for large N like the LM head's 151936 rows) but dp4a instead of fp32 dequant.
+// The 4-warp si_mmvq is right for small-N rows (attn-V); this is right for the huge LM head.
+template <typename OutT>
+__global__ void gemv_q6k_dp4a_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
+                                     OutT* __restrict__ y, int N, int K) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * GEMV_WPB + warp;
+    if (row >= N) return;
+    const unsigned char* x_row = W + (size_t)row * (K >> 8) * 210;
+    const int nsuper = K >> 8;
+    float acc = 0.f;
+    for (int kbx = 0; kbx < nsuper; kbx++)
+        acc += si_vec_dot_q6_K(x_row + (size_t)kbx * 210, vy + (size_t)kbx * 8, lane);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+    if (lane == 0) gemv_write(y + row, acc);
+}
+template __global__ void gemv_q6k_dp4a_kernel<float>(const si_block_q8_1*, const unsigned char*, float*, int, int);
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/gemm.h"
 #include <cstdlib>
@@ -405,7 +527,22 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K, cudaStream
         reinterpret_cast<__nv_bfloat16*>(y), N, K);
 }
 
+// split-K occupancy for the f32-output bf16 GEMV. Default ON: at decode this path serves the
+// router projection (N = n_experts is tiny), where one-warp-per-row idles the GPU.
+// SPARKINFER_ROUTER_SK=0 restores the plain one-warp-per-row kernel. Needs K a multiple of 8.
+static int gemv_f32_splitk() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPARKINFER_ROUTER_SK"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K, cudaStream_t stream) {
+    if (gemv_f32_splitk() && (K & 7) == 0) {
+        constexpr int S = 4, RPB = GEMV_WPB / S;
+        dim3 grid((N + RPB - 1) / RPB);
+        gemv_f32_sk_kernel<float, S><<<grid, GEMV_WPB * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);
+        return;
+    }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_kernel<float><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);
@@ -493,6 +630,20 @@ void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cuda
 }
 void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
     si_mmvq_q4k_kernel<float><<<N, 4 * 32, 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
+}
+void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream) {
+    si_mmvq_q6k_kernel<__nv_bfloat16><<<N, 4 * 32, 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
+        reinterpret_cast<__nv_bfloat16*>(y), N, K);
+}
+void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
+    si_mmvq_q6k_kernel<float><<<N, 4 * 32, 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
+}
+void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
+    dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
+    gemv_q6k_dp4a_kernel<float><<<grid, GEMV_WPB * 32, 0, stream>>>(
         reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
 }
 #endif

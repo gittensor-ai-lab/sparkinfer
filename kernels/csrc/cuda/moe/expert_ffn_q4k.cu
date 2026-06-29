@@ -424,12 +424,50 @@ __global__ void down_q6k_mmvq_splitk_kernel(
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
 
+// Split count for the split-K MMVQ down (SPARKINFER_DOWN_SPLITK_S, default 2).
+// Swept on the RTX 5090 / Qwen3-30B-A3B: S=2 is the decode optimum (S=2 ≈ S=8 >
+// S=4 > one-warp); S=2 wins on the least cross-split reduction overhead. 0 or 1
+// disables split-K and restores the one-warp-per-row MMVQ down.
+static inline int down_splitk_s() {
+    static int s = -2;
+    if (s == -2) { const char* v = getenv("SPARKINFER_DOWN_SPLITK_S"); s = v ? atoi(v) : 2; }
+    return s;
+}
+
+// Dispatch the templated split-K MMVQ down on the runtime split count. WPB=8, so
+// S in {1,2,4,8} keeps RPB=WPB/S a positive divisor. Returns false (no launch) when
+// split-K is disabled or S is unsupported, so the caller runs the one-warp kernel.
+static inline bool launch_down_q6k_mmvq_splitk(
+    int S, dim3 grid, const unsigned char* down_q, const int* expert_ids,
+    const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
+    int H, int F, int top_k, cudaStream_t stream
+) {
+    switch (S) {
+        case 2: down_q6k_mmvq_splitk_kernel<2><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        case 4: down_q6k_mmvq_splitk_kernel<4><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        case 8: down_q6k_mmvq_splitk_kernel<8><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        default: return false;
+    }
+}
+static inline bool launch_down_q4k_mmvq_splitk(
+    int S, dim3 grid, const unsigned char* down_q, const int* expert_ids,
+    const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
+    int H, int F, int top_k, cudaStream_t stream
+) {
+    switch (S) {
+        case 2: down_q4k_mmvq_splitk_kernel<2><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        case 4: down_q4k_mmvq_splitk_kernel<4><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        case 8: down_q4k_mmvq_splitk_kernel<8><<<grid, WPB*32, 0, stream>>>(down_q, expert_ids, expert_weights, hq8, output, H, F, top_k); return true;
+        default: return false;
+    }
+}
+
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
     int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
-    int num_tokens, int top_k, int hidden, int ffn, cudaStream_t stream
+    int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream
 ) {
     // int8 dp4a path for Q4_K gate/up (decode parity with llama.cpp's MMVQ). Default
     // ON — the largest single decode cost; down stays on the fp path (Q6_K). Set
@@ -437,8 +475,24 @@ void launch_moe_expert_ffn_q4k(
     static int mmvq = -1;
     if (mmvq < 0) { const char* ev = getenv("SPARKINFER_MMVQ"); mmvq = (ev && ev[0] == '0') ? 0 : 1; }
 
+    static int gu2 = -1;   // default ON: faithful 4-warp Q4_K mmvq gate/up. =0 falls back to #50 path
+    if (gu2 < 0) { const char* g2 = getenv("SPARKINFER_GU2"); gu2 = (g2 && g2[0] == '0') ? 0 : 1; }
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
-    if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
+    if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
+        const si_block_q8_1* q;
+        if (input_q8) {   // pre-quantized Q8_1(hn) from the fused norm: skip the quantize node
+            q = reinterpret_cast<const si_block_q8_1*>(input_q8);
+        } else {
+            si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(out_scratch);  // Q8_1(hn) once
+            const int nqb = num_tokens * (hidden >> 5);
+            si_quant_bf16_q8_1<<<nqb, 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
+            q = qbuf;
+        }
+        gate_up_mmvq2_kernel<<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
+            q, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hidden, ffn, top_k);
+    } else if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
         size_t sm = 2 * (size_t)(hidden >> 5) * sizeof(float) + (size_t)hidden;  // s_xd+s_xs+s_xq8
         gate_up_q4k_mmvq_kernel<<<gu, WPB * 32, sm, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(input),
@@ -484,6 +538,32 @@ void launch_moe_expert_ffn_q4k(
                 reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
                 reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
         }
+        return;
+    }
+
+    // int8 dp4a MMVQ down (Q4_K) — default ON; SPARKINFER_DOWN_Q4K=0 restores the fp dequant
+    // down for the Q4_K rows. Same quantize-once + faithful vec_dot path as the Q6_K down.
+    static int down_q4k = -1;
+    if (down_q4k < 0) { const char* qv = getenv("SPARKINFER_DOWN_Q4K"); down_q4k = (qv && qv[0] == '0') ? 0 : 1; }
+    if (down_mmvq && down_q4k && down_type == 12) {   // 12 = ggml Q4_K
+        si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);
+        const int nqb = num_tokens * top_k * (ffn >> 5);
+        const int qthreads = 256;
+        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
+            h_scratch, hq8, nqb);
+        const int S = down_splitk_s();
+        if (S > 1) {
+            const int RPB = WPB / S;
+            dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
+            if (launch_down_q4k_mmvq_splitk(S, dns,
+                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                    reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, stream))
+                return;
+        }
+        dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
+        down_q4k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
+            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
         return;
     }
 

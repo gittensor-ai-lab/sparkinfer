@@ -8,6 +8,7 @@
 // autoregressive greedy decoding fundamentally requires.
 
 #include "sparkinfer/models/qwen35.h"
+#include "sparkinfer/thermal_governor.h"
 #include "sparkinfer/kv_ops.h"
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/kernels/attention.h"
@@ -55,6 +56,8 @@ struct Qwen35Model::Impl {
     moe::MoEEngine* engine;
     Qwen35Weights w;
     cudaStream_t stream{};
+    cudaStream_t stream_k{}, stream_v{};         // side streams for concurrent K/V projection
+    cudaEvent_t ev_qkv{}, ev_k{}, ev_v{};        // fork/join events (captured into the decode graph)
     uint64_t seq_id = 0;
     int qdim, kvdim;
     bool gguf = false;   // true after load_gguf: dense weights are native [out,in], use GEMV
@@ -80,6 +83,12 @@ struct Qwen35Model::Impl {
     bool use_pq = true;   // SPARKINFER_PQ=0 disables the pre-quantized GEMV path
     void* aq81 = nullptr; // block_q8_1 activation for the faithful llama mmvq port
     bool use_llama = true; // default ON: faithful llama mmvq for Q4_K attn GEMVs (+9.7%, top1 0.99). =0 disables
+    bool use_q6mmvq = true;  // default ON: int8 Q6_K mmvq for attn-V upgrades + LM head. =0 disables
+    bool use_qkvstream = true; // default ON: run Q/K/V projections on concurrent streams. =0 disables
+    bool use_qkfuse = true;// default ON: fused per-head Q-norm + K-norm (1 kernel). =0 disables
+    bool use_ropekv = true;// default ON: fused RoPE + KV-append (1 kernel vs 2). =0 disables
+    bool use_fnq = true;   // default ON: post-MoE add_rmsnorm2 also emits Q8_1(xn), deleting the
+                           // next layer's standalone QKV-input quantize node. =0 disables
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -99,6 +108,10 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->qdim = cfg.n_q_heads * cfg.head_dim;
     p_->kvdim = cfg.n_kv_heads * cfg.head_dim;
     cudaStreamCreate(&p_->stream);
+    cudaStreamCreate(&p_->stream_k); cudaStreamCreate(&p_->stream_v);
+    cudaEventCreateWithFlags(&p_->ev_qkv, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&p_->ev_k, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&p_->ev_v, cudaEventDisableTiming);
     const int H = cfg.hidden;
     p_->x=p_->alloc<bf16>(H); p_->xn=p_->alloc<bf16>(H);
     p_->q=p_->alloc<bf16>(p_->qdim); p_->k=p_->alloc<bf16>(p_->kvdim); p_->v=p_->alloc<bf16>(p_->kvdim);
@@ -132,6 +145,11 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->aq81  = p_->alloc<char>(kernels::llama_q8_1_bytes(kmax));
     if (const char* e = getenv("SPARKINFER_PQ"))    p_->use_pq    = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_LLAMA")) p_->use_llama = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_Q6MMVQ")) p_->use_q6mmvq = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_QKFUSE")) p_->use_qkfuse = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_ROPEKV")) p_->use_ropekv = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_FNQ"))    p_->use_fnq   = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_QKVSTREAM")) p_->use_qkvstream = !(e[0] == '0');
 }
 
 Qwen35Model::~Qwen35Model() {
@@ -146,6 +164,8 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
+    cudaEventDestroy(p_->ev_qkv); cudaEventDestroy(p_->ev_k); cudaEventDestroy(p_->ev_v);
+    cudaStreamDestroy(p_->stream_v); cudaStreamDestroy(p_->stream_k);
     cudaStreamDestroy(p_->stream);
     delete p_;
 }
@@ -192,40 +212,75 @@ int Qwen35Model::forward_token(int token_id, int position) {
     // per-layer input RMSNorm + two residual-adds collapse into two fused kernels.
     kernels::launch_rmsnorm(s.x, s.w.layers[0].input_norm, s.xn, 1, H, c.rms_eps, st);
 
+    // When the fused norm+quant path is on, each layer's post-MoE add_rmsnorm2 also emits
+    // Q8_1(xn) into aq81, so the next layer's QKV-input quantize (and the LM-head quantize)
+    // are already done. Only the prime norm above still needs the standalone quant (layer 0).
+    const bool fnq = s.gguf && s.use_fnq && s.use_pq && s.use_llama;
+
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         if (s.gguf) {   // GGUF dense weights are native [out,in] -> coalesced GEMV
             // Q/K/V all read xn: quantize it to Q8_1 ONCE, then dp4a each Q4_K proj against it
             // (no per-block, per-GEMV re-quant). Q6_K/bf16 weights keep their existing path.
-            const bool qkv_q4k = s.use_pq && (w.wq_type == 12 || w.wk_type == 12 || w.wv_type == 12);
-            if (qkv_q4k) {
-                if (s.use_llama) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
-                else             kernels::launch_quantize_q8_1(s.xn, s.aq8, s.aq8_d, s.aq8_s, H, st);
-            }
-            auto proj = [&](const void* W, int t, void* y, int N) {
+            const bool any_q4k = (w.wq_type == 12 || w.wk_type == 12 || w.wv_type == 12);
+            const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
+            if (fnq && L > 0) { /* aq81 = Q8_1(xn) already emitted by layer L-1's post-MoE norm */ }
+            else if (s.use_pq && s.use_llama && (any_q4k || any_q6k))
+                kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);   // shared Q8_1(xn) for Q4_K + Q6_K mmvq
+            else if (s.use_pq && any_q4k)
+                kernels::launch_quantize_q8_1(s.xn, s.aq8, s.aq8_d, s.aq8_s, H, st);
+            auto proj = [&](const void* W, int t, void* y, int N, cudaStream_t pst) {
                 if (s.use_pq && t == 12) {
-                    if (s.use_llama) kernels::launch_mmvq_q4k(s.aq81, W, y, N, H, st);
-                    else             kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, W, y, N, H, st);
+                    if (s.use_llama) kernels::launch_mmvq_q4k(s.aq81, W, y, N, H, pst);
+                    else             kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, W, y, N, H, pst);
                 }
-                else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, st);
-                else        kernels::launch_gemv(s.xn, W, y, N, H, st);
+                else if (s.use_q6mmvq && t == 14)
+                    kernels::launch_mmvq_q6k(s.aq81, W, y, N, H, pst);       // Q6_K mmvq (attn-V upgrades); reuses aq81
+
+                else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
+                else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             };
-            proj(w.wq, w.wq_type, s.q, s.qdim);
-            proj(w.wk, w.wk_type, s.k, s.kvdim);
-            proj(w.wv, w.wv_type, s.v, s.kvdim);
+            if (s.use_qkvstream) {
+                // Each Q/K/V GEMV under-occupies the GPU at bs=1 (latency-bound); run them
+                // concurrently on 3 streams so their memory traffic overlaps. Fork after the
+                // shared activation quantize, join before QK-norm. Captured into the decode graph.
+                cudaEventRecord(s.ev_qkv, st);
+                cudaStreamWaitEvent(s.stream_k, s.ev_qkv, 0);
+                cudaStreamWaitEvent(s.stream_v, s.ev_qkv, 0);
+                proj(w.wq, w.wq_type, s.q, s.qdim, st);
+                proj(w.wk, w.wk_type, s.k, s.kvdim, s.stream_k);
+                proj(w.wv, w.wv_type, s.v, s.kvdim, s.stream_v);
+                cudaEventRecord(s.ev_k, s.stream_k);
+                cudaEventRecord(s.ev_v, s.stream_v);
+                cudaStreamWaitEvent(st, s.ev_k, 0);
+                cudaStreamWaitEvent(st, s.ev_v, 0);
+            } else {
+                proj(w.wq, w.wq_type, s.q, s.qdim, st);
+                proj(w.wk, w.wk_type, s.k, s.kvdim, st);
+                proj(w.wv, w.wv_type, s.v, s.kvdim, st);
+            }
         } else {
             kernels::launch_gemm(s.xn, w.wq, s.q, 1, s.qdim,  H, 1.f, 0.f, gc, st);
             kernels::launch_gemm(s.xn, w.wk, s.k, 1, s.kvdim, H, 1.f, 0.f, gc, st);
             kernels::launch_gemm(s.xn, w.wv, s.v, 1, s.kvdim, H, 1.f, 0.f, gc, st);
         }
-        kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
-        kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
-        kernels::launch_rope(s.q, s.k, s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, st);
-
+        if (s.use_qkfuse)
+            kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+        else {
+            kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
+            kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+        }
         bf16* kpool = (bf16*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems();
         bf16* vpool = (bf16*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems();
-        launch_kv_append(kpool, vpool, s.k, s.v, btable, s.d_writepos, 1,
-                         c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+        if (s.use_ropekv) {   // fused rope(Q in place) + rope(K)->cache + V->cache (1 node vs 2)
+            kernels::launch_rope_kv_append(s.q, s.k, s.v, kpool, vpool, btable, s.d_pos, 1,
+                                           c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
+                                           s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+        } else {
+            kernels::launch_rope(s.q, s.k, s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, st);
+            launch_kv_append(kpool, vpool, s.k, s.v, btable, s.d_writepos, 1,
+                             c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+        }
         kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,
                                            s.fa_m, s.fa_l, s.fa_acc, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
                                            s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
@@ -243,18 +298,31 @@ int Qwen35Model::forward_token(int token_id, int position) {
         else if (s.gguf)         kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
         else                     kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
 
-        // fused: h = x + ao ; hn = RMSNorm(h, post_attn_norm)
-        kernels::launch_add_rmsnorm2(s.x, s.ao, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
+        // fused: h = x + ao ; hn = RMSNorm(h, post_attn_norm). When fnq, also emit Q8_1(hn) into
+        // aq81 so the MoE gate/up mmvq skips its own quantize node (the router below reads bf16 hn).
+        if (fnq)
+            kernels::launch_add_rmsnorm2_q8(s.x, s.ao, w.post_attn_norm, s.h, s.hn, s.aq81, H, c.rms_eps, st);
+        else
+            kernels::launch_add_rmsnorm2(s.x, s.ao, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
 
         if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
             kernels::launch_gemv_f32(s.hn, w.router_w, s.mf_logits, c.n_experts, c.hidden, st);  // router_w native [E,H]
-            cu(cudaMemsetAsync(s.mf_counts, 0, c.n_experts * sizeof(int), st), "mf counts");
-            kernels::launch_moe_router(s.mf_logits, s.mf_ids, s.mf_weights, s.mf_counts,
+            // The per-expert token counts only feed the batched-dispatch sort; the single-token
+            // decode expert FFN reads ids/weights directly and never touches them. Zeroing that
+            // buffer is a per-layer memset node in the replayed decode graph whose fixed cost far
+            // outweighs the handful of atomics that fill it, so skip the count on this path.
+            // SPARKINFER_MOE_COUNTS=1 restores the memset + on-device counting.
+            static int moe_counts = -1;
+            if (moe_counts < 0) { const char* mc = getenv("SPARKINFER_MOE_COUNTS"); moe_counts = (mc && mc[0] == '1') ? 1 : 0; }
+            if (moe_counts) cu(cudaMemsetAsync(s.mf_counts, 0, c.n_experts * sizeof(int), st), "mf counts");
+            kernels::launch_moe_router(s.mf_logits, s.mf_ids, s.mf_weights,
+                                       moe_counts ? s.mf_counts : nullptr,
                                        1, c.n_experts, c.top_k, 1, st);
             kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
-                                               1, c.top_k, c.hidden, c.moe_ffn, st);
+                                               1, c.top_k, c.hidden, c.moe_ffn,
+                                               fnq ? s.aq81 : nullptr, st);
         } else {
             s.engine->set_layer_weights(L, {w.router_w, w.gate, w.up, w.down});
             s.engine->forward(s.hn, s.routed, 1, L, st);
@@ -267,10 +335,17 @@ int Qwen35Model::forward_token(int token_id, int position) {
         }
         // fused: x = h + routed ; xn = RMSNorm(x, next input_norm or final_norm)
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+        if (fnq)
+            kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
+        else
+            kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
     }
     // xn now holds RMSNorm(x_final, final_norm)
-    if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
+    if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
+        if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
+        kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
+    }
+    else if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
     else if (s.gguf)                kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
     else        kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
@@ -301,7 +376,7 @@ double Qwen35Model::bench_decode(int warmup, int n) {
     return n / secs;
 }
 
-std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new) {
+std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
     Impl& s = *p_;
     std::vector<int> out;
     if (prompt.empty()) return out;
@@ -315,6 +390,7 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         out.push_back(next);
         if (next == s.cfg.eos_id) break;
         next = forward_token(next, (int)prompt.size() + i);
+        if (gov) gov->pace();   // thermally-adaptive decode pacing (accuracy-preserving; no-op if disabled)
     }
     s.kv->free(s.seq_id);
     return out;

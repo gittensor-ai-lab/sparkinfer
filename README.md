@@ -4,7 +4,9 @@
 
 ## Proven
 
-Qwen3-30B-A3B (Q4_K_M GGUF) runs end-to-end on an RTX PRO 6000 (sm_120), decode optimized **0.60 → 134 tok/s (≈220×)** across 6 source-verifiable passes, output verified correct, **21.7 GB** resident (experts kept quantized). Independently verified on an **RTX 5090** (CUDA 13): community optimizations have ratcheted the decode frontier to **285.32 tok/s** (≈0.78× llama.cpp) at **≥96% top-1 token agreement** with llama.cpp (KL ≈ 0.14 nats) — see the live [dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/), [accuracy](bench/results/accuracy_qwen3-30b-a3b_q4km.md), and [RTX 5090](bench/results/qwen3-30b-a3b_q4km_rtx5090.md) results.
+Qwen3-30B-A3B (Q4_K_M GGUF) runs end-to-end on an RTX PRO 6000 (sm_120), decode optimized **0.60 → 134 tok/s (≈220×)** across 6 source-verifiable passes, output verified correct, **21.7 GB** resident (experts kept quantized). Independently verified on an **RTX 5090** (CUDA 13): community optimizations have ratcheted the decode frontier to **453.70 tok/s** — **20%+ past llama.cpp** (**+24.0% at 128-tok, +21.6% at 256, +17.6% at 512** — ahead at *every* context length), a kernel-level win (same GGUF, same Q4_K_M precision, same greedy bs=1 decode — no speculative decoding or attention shortcut) — at **97% top-1 token agreement** with llama.cpp (KL ≈ 0.14 nats). Each PR is built and benchmarked against `main` on the *same* RTX 5090 so the score is hardware-independent, and **every eval is reproducible from source + immutably logged** ([EVAL-TRUST.md](EVAL-TRUST.md) · [eval log](https://github.com/gittensor-ai-lab/sparkinfer-log)). See the live [dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/), [accuracy](bench/results/accuracy_qwen3-30b-a3b_q4km.md), and [RTX 5090](bench/results/qwen3-30b-a3b_q4km_rtx5090.md) results.
+
+> **Strategy:** we deliberately focus on one model — Qwen3-30B-A3B — to maximize decode speed before broadening, and every optimization must pass a strict accuracy gate (top-1 / KL vs llama.cpp) so speed never costs correctness.
 
 ## Why a custom engine
 
@@ -92,6 +94,15 @@ validators. The bot also tags the PR's **subsystem** — `area:kernels` / `runti
 `bench` — from its changed paths (categorization only — scoring is speedup-only; deterministic, no AI).
 The bot **never merges** — merging is manual after review. Runs the same evaluator you can run
 yourself: [`eval/`](eval) (`vast_eval.py`, `pr_eval_bot.py`).
+
+### Trust & verifiability
+
+Results are **reproducible from source today** — build `main` and the PR on the same RTX 5090 and you
+get the same same-box delta (already independently reproduced by the community on a rented 5090). We're
+hardening it toward **attested, multi-source eval**: CPU-TEE-signed scoring receipts (Intel TDX),
+immutable run logs, and independent-validator consensus. Consumer 5090s have **no GPU Confidential
+Computing**, so the *speed number* is trusted via **reproduction + consensus**, not a GPU enclave — by
+design, since we optimize the hardware people actually own. → **[EVAL-TRUST.md](EVAL-TRUST.md)**
 
 ## License
 

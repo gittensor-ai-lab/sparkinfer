@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
+#include <cstdlib>
 #endif
 
 namespace sparkinfer {
@@ -87,6 +88,60 @@ __global__ void moe_router_kernel(
     }
 }
 
+// Single-pass top-k: one thread per expert. Each thread counts how many experts
+// outrank it (higher logit, or equal logit with a lower index — identical tie-break
+// to moe_router_kernel's k-pass arg-max), giving its rank directly. Experts with
+// rank < top_k are the selection, placed at slot == rank, so the output order
+// (descending logit) and the softmax weights are bit-identical to the k-pass kernel,
+// but the 8 serial arg-max passes collapse to one parallel comparison sweep.
+__global__ void moe_router_kernel2(
+    const float* __restrict__ logits, int* __restrict__ expert_ids,
+    float* __restrict__ expert_weights, int* __restrict__ tokens_per_expert,
+    int num_tokens, int num_experts, int top_k, int normalize
+) {
+    const int tok = blockIdx.x;
+    const int e   = threadIdx.x;                 // one thread per expert
+    if (tok >= num_tokens) return;
+    extern __shared__ float s_logits[];          // [num_experts]
+    __shared__ int   s_sel_id[16];               // top_k <= 16
+    __shared__ float s_sel_logit[16];
+    const float* rowp = logits + (size_t)tok * num_experts;
+    if (e < num_experts) s_logits[e] = rowp[e];
+    __syncthreads();
+
+    if (e < num_experts) {
+        const float my = s_logits[e];
+        int rank = 0;
+        for (int f = 0; f < num_experts; f++) {
+            const float v = s_logits[f];
+            if (v > my || (v == my && f < e)) rank++;
+        }
+        if (rank < top_k) { s_sel_id[rank] = e; s_sel_logit[rank] = my; }
+    }
+    __syncthreads();
+
+    if (e == 0) {
+        float denom = 1.f, mx = s_sel_logit[0];
+        if (normalize) {
+            for (int j = 1; j < top_k; j++) mx = fmaxf(mx, s_sel_logit[j]);
+            denom = 0.f;
+            for (int j = 0; j < top_k; j++) denom += __expf(s_sel_logit[j] - mx);
+        }
+        for (int j = 0; j < top_k; j++) {
+            expert_ids[tok * top_k + j]     = s_sel_id[j];
+            expert_weights[tok * top_k + j] = normalize ? __expf(s_sel_logit[j] - mx) / denom
+                                                        : s_sel_logit[j];
+        }
+    }
+    if (tokens_per_expert && e < num_experts) {
+        // recompute membership cheaply (rank already known above only in the branch)
+        const float my = s_logits[e]; int rank = 0;
+        for (int f = 0; f < num_experts; f++) { const float v = s_logits[f];
+            if (v > my || (v == my && f < e)) rank++; }
+        if (rank < top_k) atomicAdd(&tokens_per_expert[e], 1);
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 void launch_moe_router(
     const float* logits, int* expert_ids, float* expert_weights,
@@ -95,6 +150,17 @@ void launch_moe_router(
 ) {
     if (num_tokens <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts) return;
     size_t smem = (size_t)num_experts * sizeof(float);
+    // Default ON: single-pass rank-select top-k (one thread/expert). SPARKINFER_ROUTER2=0
+    // restores the k-pass single-warp kernel. Falls back automatically if num_experts > 1024.
+    static int r2 = -1;
+    if (r2 < 0) { const char* e = getenv("SPARKINFER_ROUTER2"); r2 = (e && e[0] == '0') ? 0 : 1; }
+    if (r2 && top_k <= 16 && num_experts <= 1024) {
+        const int bd = ((num_experts + 31) / 32) * 32;     // round up to a warp multiple
+        moe_router_kernel2<<<num_tokens, bd, smem, stream>>>(
+            logits, expert_ids, expert_weights, tokens_per_expert,
+            num_tokens, num_experts, top_k, normalize);
+        return;
+    }
     moe_router_kernel<<<num_tokens, 32, smem, stream>>>(
         logits, expert_ids, expert_weights, tokens_per_expert,
         num_tokens, num_experts, top_k, normalize);

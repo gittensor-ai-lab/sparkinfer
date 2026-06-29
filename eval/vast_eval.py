@@ -39,12 +39,13 @@ _DEFAULT_SKIP = "94.177.17.69,120.238.149.205,192.3.91.246,47.253.144.202,175.12
 SKIP_HOSTS_PERMANENT = set(filter(None, os.environ.get("VAST_SKIP_HOSTS", _DEFAULT_SKIP).split(",")))
 
 # --pinned: reuse a stable, known-good box (cached model, good download speed) as the default and
-# NEVER destroy it. If it can't be brought up within --reuse-timeout (5 min), don't provision a new
-# box immediately — leave the pinned box intact and exit PINNED_RETRY_RC so the next scheduled run
-# (~30 min later) retries. Only after REUSE_MAX_RETRIES consecutive misses do we provision a fresh
-# box (the pinned one is still kept). Counter persists in REUSE_RETRY_FILE across runs.
+# NEVER destroy it. If it exists but can't be brought up within --reuse-timeout, provision a fresh
+# box right away (default REUSE_MAX_RETRIES=0) and re-pin — stopped vast boxes that won't resume
+# (host busy) would otherwise STALL a manual run, which has no scheduled retry to fall back on. Set
+# VAST_REUSE_MAX_RETRIES>0 to instead wait across that-many scheduled runs before provisioning.
+# Counter persists in REUSE_RETRY_FILE across runs.
 REUSE_RETRY_FILE = os.path.expanduser(os.environ.get("VAST_REUSE_RETRY_FILE", "~/.sparkinfer_reuse_retries"))
-REUSE_MAX_RETRIES = int(os.environ.get("VAST_REUSE_MAX_RETRIES", "2"))
+REUSE_MAX_RETRIES = int(os.environ.get("VAST_REUSE_MAX_RETRIES", "0"))
 PINNED_RETRY_RC = 75   # distinct exit code: "pinned box not up; retry on the next run" (not an error)
 def _reuse_retries():
     try: return int(open(REUSE_RETRY_FILE).read().strip())
@@ -220,18 +221,26 @@ def main():
         elif args.no_recreate:
             sys.exit(f"instance {iid} never came up (--no-recreate)")
         elif args.pinned:
-            # PINNED: never destroy the stable box. Leave it intact and retry on the next run;
-            # only provision a new box after REUSE_MAX_RETRIES consecutive misses.
-            n = _reuse_retries() + 1
-            if n <= REUSE_MAX_RETRIES:
-                _set_reuse_retries(n)
-                print(f">> pinned instance {iid} not SSH-ready within {args.reuse_timeout}s "
-                      f"(miss {n}/{REUSE_MAX_RETRIES}) — leaving it intact; retry on the next run (~30 min).")
-                sys.exit(PINNED_RETRY_RC)
-            _set_reuse_retries(0)
-            print(f">> pinned instance {iid} unavailable after {REUSE_MAX_RETRIES} retries — "
-                  f"provisioning a NEW box (pinned {iid} kept, NOT destroyed).")
-            iid = 0
+            # PINNED: never destroy the stable box. Two failure modes:
+            #  - box GONE (vast reclaimed it — common for stopped boxes): retrying is pointless,
+            #    provision a fresh one NOW (the bot then auto-re-pins to it).
+            #  - box EXISTS but won't resume (host busy): retry on the next run, provision only
+            #    after REUSE_MAX_RETRIES misses.
+            if info_of(v, iid) is None:
+                print(f">> pinned instance {iid} no longer exists (vast reclaimed it) — "
+                      f"provisioning a fresh box now.")
+                _set_reuse_retries(0); iid = 0
+            else:
+                n = _reuse_retries() + 1
+                if n <= REUSE_MAX_RETRIES:
+                    _set_reuse_retries(n)
+                    print(f">> pinned instance {iid} exists but not SSH-ready within {args.reuse_timeout}s "
+                          f"(miss {n}/{REUSE_MAX_RETRIES}) — leaving it intact; retry on the next scheduled run.")
+                    sys.exit(PINNED_RETRY_RC)
+                _set_reuse_retries(0)
+                print(f">> pinned instance {iid} unavailable after {REUSE_MAX_RETRIES} retries — "
+                      f"provisioning a NEW box (pinned {iid} kept, NOT destroyed).")
+                iid = 0
         else:
             # Destroy the stuck box (can't SSH → no value in keeping disk) and provision a fresh one.
             stuck_host = (info_of(v, iid) or {}).get("public_ipaddr")
@@ -296,7 +305,13 @@ def main():
         if args.ref.startswith("pull/") and args.ref.endswith("/head"):
             checkout = f"{reset}; git fetch -q origin '{args.ref}' && git checkout -qf FETCH_HEAD"
         else:
-            checkout = f"{reset}; git fetch -q origin '{args.ref}' 2>/dev/null || true && git checkout -qf '{args.ref}'"
+            # Branch ref (e.g. 'main' or 'origin/main'): fetch the BRANCH by name and check out
+            # exactly what was fetched (FETCH_HEAD). Fetching the literal 'origin/main' fails (no such
+            # ref on the remote — the branch is 'main'); the old `|| true` then silently checked out a
+            # STALE local tracking ref, so on a REUSED box the same-box baseline built pre-merge code
+            # (e.g. it measured main WITHOUT a just-merged PR). Strip any 'origin/' to the branch name.
+            branch = args.ref.split("origin/", 1)[-1]
+            checkout = f"{reset}; git fetch -q origin '{branch}' && git checkout -qf FETCH_HEAD"
         # g++-12: nvcc 12.8 breaks against Ubuntu 24.04's GCC 13.3 libstdc++ (cstdio /__gnu_cxx
         # errors). The build pins CMAKE_CUDA_HOST_COMPILER=g++-12, so it must be present.
         setup = ("export DEBIAN_FRONTEND=noninteractive; "

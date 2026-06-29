@@ -27,6 +27,14 @@ void launch_rope(
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     float theta, cudaStream_t stream = nullptr);
 
+// Fused RoPE + paged KV-append: ropes Q in place, ropes K straight into k_pool, copies V into
+// v_pool — one kernel replacing launch_rope + launch_kv_append. positions == write_pos (decode).
+void launch_rope_kv_append(
+    void* q, const void* k, const void* v, void* k_pool, void* v_pool,
+    const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, float theta,
+    int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
+
 // Flash prefill: full causal attention for prompt processing.
 // q/k/v:  [batch, seqlen, num_heads, head_dim]
 // out:    same shape as q

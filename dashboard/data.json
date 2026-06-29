@@ -1,16 +1,17 @@
 {
-  "updated": "2026-06-26",
+  "updated": "2026-06-29",
   "status": {
     "gpu": "RTX 5090 · sm_120 · CUDA 13",
     "model": "Qwen3-30B-A3B · Q4_K_M",
-    "frontier_tps": 291.58,
+    "frontier_tps": 453.7,
     "ref_name": "llama.cpp",
-    "ref_tps": 365.73,
+    "ref_tps": 365.85,
     "vram_gb": 21.4,
-    "token_match": 0.96,
-    "kl": 0.1482
+    "token_match": 0.97,
+    "kl": 0.1417,
+    "ref_note": "128-tok decode, same RTX 5090 (warm, interleaved head-to-head)"
   },
-  "passes_gpu": "RTX PRO 6000",
+  "passes_gpu": "RTX 5090",
   "passes": [
     {
       "name": "baseline",
@@ -81,6 +82,196 @@
     }
   ],
   "prs": [
+    {
+      "num": 87,
+      "title": "perf(attn): fuse Q/K/V Q4_K MMVQ into one launch (+3% decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 437.3,
+      "delta_pct": 0.2,
+      "top1": 0.97,
+      "kl": 0.1417,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/87",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0087-b7562da"
+    },
+    {
+      "num": 86,
+      "title": "perf(decode): single-pass MoE top-k + fused RoPE/KV-append (+3.2% decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 454.41,
+      "delta_pct": 4.2,
+      "top1": 0.97,
+      "kl": 0.1417,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/86",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0086-4e45ed9"
+    },
+    {
+      "num": 89,
+      "title": "perf(decode): run Q/K/V projections on concurrent CUDA streams (+5.7% decode)",
+      "areas": [
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 443.38,
+      "delta_pct": 5.7,
+      "top1": 0.97,
+      "kl": 0.1417,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/89",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0089-4e13546"
+    },
+    {
+      "num": 51,
+      "title": "runtime: prompt-lookup speculative decoding for bs=1 MoE decode",
+      "areas": [
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 419.68,
+      "delta_pct": 0.0,
+      "top1": 0.97,
+      "kl": 0.1417,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/51",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0051-d7824bf"
+    },
+    {
+      "num": 83,
+      "title": "perf(decode): emit Q8_1 from the residual RMSNorm to drop the per-layer activation quantize (+2.7% decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 410.85,
+      "delta_pct": 4.3,
+      "top1": 0.97,
+      "kl": 0.1417,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/83",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0083-9bf0803"
+    },
+    {
+      "num": 72,
+      "title": "perf(gemm): split-K the router projection GEMV for decode occupancy (+3% decode)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "S",
+      "tps": 394.45,
+      "delta_pct": 3.5,
+      "top1": 0.97,
+      "kl": 0.1417,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/72",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0072-d459d58"
+    },
+    {
+      "num": 73,
+      "title": "perf(moe): skip the unused per-expert token count in single-token decode (+6% decode)",
+      "areas": [
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 388.68,
+      "delta_pct": 4.8,
+      "top1": 0.98,
+      "kl": 0.1453,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/73"
+    },
+    {
+      "num": 76,
+      "title": "perf(attn): fuse per-head Q/K-norm and Q/K rope into single kernels (+4.1% decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 371.27,
+      "delta_pct": 4.4,
+      "top1": 0.98,
+      "kl": 0.1453,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/76"
+    },
+    {
+      "num": 67,
+      "title": "perf(moe): mmvq down split-K occupancy for M-tier decode",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 348.06,
+      "delta_pct": 0.0,
+      "top1": 0.95,
+      "kl": 0.1415,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/67"
+    },
+    {
+      "num": 75,
+      "title": "perf(moe): software-pipeline the int8 MoE down decode (+4% decode on RTX 5090)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "S",
+      "tps": 334.58,
+      "delta_pct": 4.3,
+      "top1": 0.98,
+      "kl": 0.1502,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/75"
+    },
+    {
+      "num": 74,
+      "title": "perf(moe): split-K MMVQ down — +8% Qwen3-MoE decode on RTX 5090",
+      "areas": [
+        "kernels"
+      ],
+      "label": "S",
+      "tps": 339.59,
+      "delta_pct": 5.9,
+      "top1": 0.95,
+      "kl": 0.1415,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/74"
+    },
+    {
+      "num": 71,
+      "title": "perf(moe): int8 dp4a MMVQ for the Q4_K MoE down projection (+5% decode)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "M",
+      "tps": 333.75,
+      "delta_pct": 9.1,
+      "top1": 0.97,
+      "kl": 0.1507,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/71"
+    },
+    {
+      "num": 70,
+      "title": "int8 mmvq for the last fp32-path GEMVs: attn-V + LM head (Q6_K) + gate/up (Q4_K) (+4.3%)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 313.14,
+      "delta_pct": 5.3,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/70"
+    },
+    {
+      "num": 69,
+      "title": "Split-K the int8 dp4a MoE down GEMV (+3.4% decode)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "none",
+      "tps": 293.62,
+      "delta_pct": 0.7,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/69"
+    },
     {
       "num": 65,
       "title": "perf(moe): int8 dp4a MMVQ for the Q6_K MoE down (+4% decode)",
@@ -470,6 +661,60 @@
       "tps": 291.58,
       "pr": 65,
       "date": "2026-06-26"
+    },
+    {
+      "name": "int8 mmvq for the last fp32-",
+      "tps": 313.14,
+      "pr": 70,
+      "date": "2026-06-26"
+    },
+    {
+      "name": "int8 dp4a MMVQ for the Q4_K ",
+      "tps": 333.75,
+      "pr": 71,
+      "date": "2026-06-27"
+    },
+    {
+      "name": "split-K MMVQ down — +8% Qwen",
+      "tps": 339.59,
+      "pr": 74,
+      "date": "2026-06-28"
+    },
+    {
+      "name": "fuse per-head Q/K-norm and Q",
+      "tps": 371.27,
+      "pr": 76,
+      "date": "2026-06-28"
+    },
+    {
+      "name": "skip the unused per-expert t",
+      "tps": 388.68,
+      "pr": 73,
+      "date": "2026-06-28"
+    },
+    {
+      "name": "split-K the router projectio",
+      "tps": 394.45,
+      "pr": 72,
+      "date": "2026-06-28"
+    },
+    {
+      "name": "emit Q8_1 from the residual ",
+      "tps": 410.85,
+      "pr": 83,
+      "date": "2026-06-29"
+    },
+    {
+      "name": "run Q/K/V projections on con",
+      "tps": 435.41,
+      "pr": 89,
+      "date": "2026-06-29"
+    },
+    {
+      "name": "single-pass MoE top-k + fuse",
+      "tps": 453.7,
+      "pr": 86,
+      "date": "2026-06-29"
     }
   ]
 }

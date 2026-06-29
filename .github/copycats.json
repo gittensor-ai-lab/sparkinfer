@@ -20,5 +20,11 @@
     "date": "2026-06-25",
     "penalty_days": 2,
     "note": "maintainer-flagged: same default split-K + PDL decode change as #53 (eval:none); below auto containment threshold but a duplicate attempt. Reduced to a 2-day penalty (default is 5): first-time contributor, first mistake, and a genuine contributor of real speedups (#44, #52)."
+  },
+  {
+    "pr": 88,
+    "author": "ai-engram",
+    "original": 83,
+    "date": "2026-06-29"
   }
 ]
