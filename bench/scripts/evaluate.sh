@@ -45,23 +45,40 @@ ensure_model
 ensure_llamacpp "$ARCH"
 
 echo ">> [2/3] speed — median of 3 bench runs ..." >&2
-# Warmup: the from-source build (CPU-bound, minutes) leaves the GPU idle so its clocks fall to
-# base. Run one UNTIMED bench to spin clocks back to boost before timing — otherwise the first
-# measured build (the same-box main baseline) reads cold/low and inflates every PR's delta. This
-# is the cold-clock artifact that once mislabeled minor PRs as XL above the hardware ceiling.
+# M1: pin the GPU clock so the absolute tok/s is reproducible (not just same-box-cancelled). Best-
+# effort; reset on exit no matter how we leave. Warmup still runs as the fallback when pinning is
+# refused, and to spin clocks up before the first timed build (the cold-clock artifact that once
+# mislabeled minor PRs as XL above the ceiling).
+pin_clocks
+trap 'unpin_clocks' EXIT
 si_run qwen3_gguf_bench "$GGUF" 192 >/dev/null 2>&1 || true
-ts=()
+ts=(); gclks=()
 for _ in 1 2 3; do
   t=$(si_run qwen3_gguf_bench "$GGUF" 128 2>/dev/null | sed -n 's/.*decode tg *: *\([0-9.][0-9.]*\).*/\1/p' || true)
   ts+=("${t:-0}")
+  gclks+=("$(nvidia-smi --query-gpu=clocks.gr --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')")
 done
 TPS=$(printf '%s\n' "${ts[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+# M1: record the graphics clock the number was produced at — the reproducibility anchor. Equals the
+# pin target where -lgc is permitted (bare-metal/datacenter); on a restricted container (vast lacks
+# cap_sys_admin) it's the OBSERVED median, so the absolute tok/s stays interpretable and a verifier
+# can confirm they reproduced at the same clock. clock_spread exposes how stable it was.
+GCLK=$(printf '%s\n' "${gclks[@]}" | sort -n | awk 'NF{a[++n]=$1} END{print (n?a[int((n+1)/2)]:0)}')
+GSPREAD=$(printf '%s\n' "${gclks[@]}" | sort -n | awk 'NF{a[++n]=$1} END{print (n?a[n]-a[1]:0)}')
 
-echo ">> [3/3] correctness — token-match / KL vs llama.cpp ..." >&2
-acc=$("$HERE/accuracy.sh" "$GGUF" 2>/dev/null || true)
+echo ">> [3/3] correctness — token-match / KL vs llama.cpp (held-out prompt) ..." >&2
+# H1: the accuracy gate scores a held-out / fuzzed prompt chosen by EVAL_SEED (set by the bot to a
+# fresh, unpredictable value each eval), so a submission can't overfit the in-repo prompt. The seed
+# is recorded below so any verifier reproduces the exact token stream.
+EVAL_SEED="${SPARKINFER_EVAL_SEED:-fixed}"
+acc=$(SPARKINFER_EVAL_SEED="$EVAL_SEED" "$HERE/accuracy.sh" "$GGUF" 2>/dev/null || true)
 # parse the unambiguous METRIC line (not the human-readable text, which contains "bar >= 0.90")
 TOP1=$(printf '%s\n' "$acc" | sed -n 's/.*METRIC .*top1=\([0-9.][0-9.]*\).*/\1/p' | head -1)
 KL=$(printf   '%s\n' "$acc" | sed -n 's/.*METRIC .*kl=\([0-9.][0-9.]*\).*/\1/p' | head -1)
 TOP1="${TOP1:-0}"; KL="${KL:-99}"
 
-python3 "$HERE/label.py" "$TPS" "$FRONTIER" "$CEILING" "$TOP1" "$KL" "$COMMIT"
+# Provenance merged into the verdict (M1 clock, H1 seed, C2 reference pins) — non-scoring, for the log.
+[ "$GPU_CLOCKS_PINNED" = 1 ] && CP=true || CP=false
+[ -n "${MODEL_SHA256:-}" ] && MP=true || MP=false
+PROV="{\"clocks_pinned\":$CP,\"clock_mhz\":\"${GCLK}\",\"clock_spread_mhz\":\"${GSPREAD}\",\"pin_target_mhz\":\"${PINNED_GCLK}\",\"eval_seed\":\"${EVAL_SEED}\",\"model_sha_pinned\":$MP,\"llama_commit\":\"${LLAMACPP_COMMIT:-unpinned}\"}"
+python3 "$HERE/label.py" "$TPS" "$FRONTIER" "$CEILING" "$TOP1" "$KL" "$COMMIT" "$PROV"

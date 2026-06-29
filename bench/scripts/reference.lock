@@ -1,0 +1,17 @@
+# Reference manifest — C2: reference quarantine.
+#
+# Pins the baseline artifacts (model weights + llama.cpp) so a tampered PERSISTED copy can't skew a
+# verdict. The eval reuses /workspace/models and /workspace/.llamacpp across runs; a malicious PR
+# build runs as root and could corrupt the baseline weights (to depress llama's score and inflate its
+# own relative gain) or tamper the llama-bench binary. Before scoring, the harness verifies these
+# against the values below and re-fetches / rebuilds from a clean, pinned source on any mismatch.
+#
+# Sourced by _common.sh. Maintainer-only (CODEOWNERS + sensitive-paths-guard cover bench/scripts/).
+# An EMPTY value means "warn-only" (compute + log, don't enforce) — used until a value is pinned.
+
+# sha256 of the Q4_K_M GGUF baseline weights. Verified before every eval; mismatch -> re-download.
+MODEL_SHA256="0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5"
+
+# llama.cpp commit the reference is pinned to. HEAD of master drifts run-to-run (non-reproducible and
+# unpinnable); we check out exactly this commit, verify a clean tree, and rebuild if either differs.
+LLAMACPP_COMMIT="6f4f53f2b7da54fcdbbecaaa734337c337ad6176"

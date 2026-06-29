@@ -18,7 +18,14 @@ URL  = sys.argv[4] if len(sys.argv) > 4 else "http://localhost:8081"
 TOPK = int(sys.argv[5]) if len(sys.argv) > 5 else 40
 FLOOR = -20.0
 
-ids = Tokenizer.from_file(tok_path).encode(open(text_path).read().strip()).ids
+# 3rd arg is either a file of space-separated token ids (the EXACT prompt scored — produced by
+# gen_eval_prompt.py so sparkinfer and llama see the identical sequence) or, legacy, plain text.
+_raw = open(text_path).read().strip()
+_toks = _raw.split()
+if _toks and all(t.lstrip("-").isdigit() for t in _toks):
+    ids = [int(t) for t in _toks]
+else:
+    ids = Tokenizer.from_file(tok_path).encode(_raw).ids
 
 def llama_dist(prefix):
     req = {"prompt": prefix, "n_predict": 1, "n_probs": TOPK, "temperature": 0, "cache_prompt": True}

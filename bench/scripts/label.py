@@ -23,6 +23,10 @@ ceiling  = float(sys.argv[3])   # roofline / strong-reference cap (display only)
 top1     = float(sys.argv[4])   # token-match vs reference, 0..1
 kl       = float(sys.argv[5])   # mean KL vs reference (nats)
 commit   = sys.argv[6]
+# Optional 7th arg: M1/H1/C2 provenance (clocks_pinned, clock_mhz, eval_seed, llama_commit, ...)
+# merged verbatim into the verdict so the immutable log is self-describing and a verifier can
+# reproduce at the same clock + prompt seed. Does not affect the deterministic scoring above.
+prov     = json.loads(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else {}
 
 # Correctness gate (governance-tunable). KL_BAR is the HARD reject ceiling; KL_PREFER is the soft
 # target — a pass above it is accepted but flagged. Accuracy parity with llama.cpp is the moat, so a
@@ -61,4 +65,5 @@ if res.get("label") != "REJECT" and kl > KL_PREFER:
 
 # JSON keys can't be "pass" via kwarg; normalize
 res["pass"] = res.pop("pass_", True)
+res.update(prov)                                       # M1/H1/C2 provenance (non-scoring)
 print("RESULT_JSON " + json.dumps(res))

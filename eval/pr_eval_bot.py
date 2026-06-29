@@ -430,6 +430,35 @@ def record_merge(repo, num):
     data["updated"] = datetime.date.today().isoformat()
     write_dash(data)
     push_dash(f"dashboard: PR #{num} merged -> frontier {new_f} tok/s")
+    append_frontier_ledger(repo, num, e, old_f, new_f)                        # H2: immutable ledger
+
+def append_frontier_ledger(repo, num, e, prev_f, new_f):
+    """H2 (verifiable frontier ledger): append an immutable, GitHub-timestamped line to the public
+    ledger for every frontier advance — (date, pr, author, merge commit, same-box delta%, prev->new
+    frontier, eval-log proof URL). The append-only commit history IS the signature: the frontier
+    history is independently auditable line-by-line against the per-run eval logs, so no advance can
+    be silently inserted or rewritten. Best-effort; never blocks the merge."""
+    try:
+        info = json.loads(gh(["pr", "view", str(num), "-R", repo, "--json",
+                              "author,mergeCommit"]).stdout or "{}")
+        author = (info.get("author") or {}).get("login", "?")
+        commit = ((info.get("mergeCommit") or {}).get("oid") or "")[:9]
+        if not os.path.isdir(os.path.join(LOG_DIR, ".git")):
+            subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
+        else:
+            subprocess.run(["git", "-C", LOG_DIR, "pull", "-q", "--rebase"], check=False)
+        entry = {"date": datetime.date.today().isoformat(), "pr": int(num), "author": author,
+                 "commit": commit, "delta_pct": e.get("delta_pct"),
+                 "prev_frontier": prev_f, "new_frontier": new_f, "proof": e.get("proof_url")}
+        with open(os.path.join(LOG_DIR, "ledger.jsonl"), "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        subprocess.run(["git", "-C", LOG_DIR, "add", "ledger.jsonl"], check=True)
+        subprocess.run(["git", "-C", LOG_DIR, "commit", "-q", "-m",
+                        f"ledger: #{num} {commit} frontier {prev_f} -> {new_f} (+{entry['delta_pct']}%)"], check=False)
+        subprocess.run(["git", "-C", LOG_DIR, "push", "-q"], check=False)
+        print(f">> frontier ledger += #{num} ({prev_f} -> {new_f} tok/s)")
+    except Exception as ex:
+        print(f">> ledger append skipped: {ex}")
 
 def auto_merge_ok(repo, num):
     """Guardrails for auto-merging the merge-first winner. Returns (ok, reason)."""

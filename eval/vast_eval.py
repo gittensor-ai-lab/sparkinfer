@@ -364,8 +364,12 @@ def main():
         # Trust: grade with the harness from the protected default branch, not the submission's copy.
         # The build still measures the PR's kernels/runtime/moe; only bench/scripts (the scoring code,
         # incl. label.py + accuracy*) is pinned to origin/main. Fail-closed (&&): no trusted harness -> no eval.
+        # H1: a fresh, UNPREDICTABLE held-out prompt seed per eval so a PR can't overfit the in-repo
+        # prompt. The seed is echoed into the verdict (eval_seed) so the prompt stays reproducible.
+        eval_seed = os.urandom(8).hex()
+        print(f">> held-out eval prompt seed: {eval_seed}")
         ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
-              f"SI_NO_CHECKOUT=1 MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
+              f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
               f"bench/scripts/evaluate.sh --ref {args.ref} --frontier {args.frontier} --ceiling {args.ceiling}")
         got_result = False
         r = sh(host, port, ev, timeout=10800)
