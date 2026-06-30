@@ -75,6 +75,7 @@ struct Qwen35Model::Impl {
     // GGUF fused-expert decode scratch (allocated by load_gguf)
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
     int   *mf_ids = nullptr, *mf_counts = nullptr;
+    int   *mf_qrelease = nullptr;   // release counters for the fused gate/up Q8_1(h) emission (self-clearing)
     // flash-decoding (KV-split) attention partials
     int n_splits = 32;
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
@@ -134,6 +135,12 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->mf_counts  = p_->alloc<int>(cfg.n_experts);
     p_->mf_h       = p_->alloc<float>((size_t)cfg.top_k * cfg.moe_ffn);
     p_->mf_out     = p_->alloc<float>(cfg.hidden);
+    // Release counters for the fused gate/up Q8_1(h) emission: one per (expert-slot, 32-wide
+    // ffn block). Zeroed once here (before any graph capture); the kernel self-clears it back
+    // to 0 every layer, so no per-token memset is needed.
+    const size_t mf_qrel_n = (size_t)cfg.top_k * ((cfg.moe_ffn + 31) >> 5);
+    p_->mf_qrelease = p_->alloc<int>(mf_qrel_n ? mf_qrel_n : 1);
+    cu(cudaMemset(p_->mf_qrelease, 0, (mf_qrel_n ? mf_qrel_n : 1) * sizeof(int)), "mf_qrelease zero");
     const size_t fa_n = (size_t)cfg.n_q_heads * p_->n_splits;
     p_->fa_m   = p_->alloc<float>(fa_n);
     p_->fa_l   = p_->alloc<float>(fa_n);
@@ -160,7 +167,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->d_tok); cudaFree(p_->d_out_id); cudaFree(p_->d_pos);
     cudaFree(p_->d_seqlen); cudaFree(p_->d_writepos); cudaFree(p_->d_shared_ids); cudaFree(p_->d_shared_w);
     cudaFree(p_->mf_logits); cudaFree(p_->mf_weights); cudaFree(p_->mf_h); cudaFree(p_->mf_out);
-    cudaFree(p_->mf_ids); cudaFree(p_->mf_counts);
+    cudaFree(p_->mf_ids); cudaFree(p_->mf_counts); cudaFree(p_->mf_qrelease);
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
@@ -322,7 +329,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
                                                1, c.top_k, c.hidden, c.moe_ffn,
-                                               fnq ? s.aq81 : nullptr, st);
+                                               fnq ? s.aq81 : nullptr, s.mf_qrelease, st);
         } else {
             s.engine->set_layer_weights(L, {w.router_w, w.gate, w.up, w.down});
             s.engine->forward(s.hn, s.routed, 1, L, st);

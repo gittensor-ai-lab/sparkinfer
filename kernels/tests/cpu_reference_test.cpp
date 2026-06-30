@@ -297,6 +297,49 @@ static double test_argmax_twopass(int vocab, int nblocks, bool ties) {
     return (double)std::abs(ri - gi);   // expect 0: same index as serial argmax
 }
 
+// ---------------------------------------------------------------------------
+// Fused gate/up Q8_1(h) emission: gate_up_mmvq2_q8_kernel emits the down GEMV's
+// Q8_1 activation directly (deleting the standalone quant_h node). A Q8_1 block
+// spans 32 consecutive ffn columns produced by 32 sibling CUDA blocks; the last
+// to arrive quantizes the block. This checks that the fused per-(ts,f) indexing
+// reconstructs a byte-identical hq8 to the standalone quant_h_q8_1_kernel, which
+// quantizes the flat h array one block per ib = h[ib*32 + lane].
+// ---------------------------------------------------------------------------
+static double test_fused_hq8(int TS, int F) {
+    const int QPB = F / 32, NB = TS * QPB;
+    vector<float> h((size_t)TS * F);
+    for (auto& x : h) x = frand() * 6.f;
+    for (int r = 0; r < 32; r++) { h[2 * 32 + r] = 0.f;              // amax==0 block
+                                   h[5 * 32 + r] = 1e-30f * ((r & 1) ? 1 : -1); }
+    // one 32-wide block -> (scale d, int8 qs[32], d*sum), identical math to the kernel
+    auto quant32 = [](const float* b, float& d, vector<int>& qs, float& dsum) {
+        float a = 0.f; for (int r = 0; r < 32; r++) a = std::max(a, std::fabs(b[r]));
+        d = a / 127.f; int s = 0; qs.resize(32);
+        for (int r = 0; r < 32; r++) { int qi = (a == 0.f) ? 0 : (int)std::lround(b[r] / d); qs[r] = qi; s += qi; }
+        dsum = d * (float)s;
+    };
+    // Path A: standalone quant_h over the flat array (one block per ib).
+    vector<float> dA(NB), dsA(NB); vector<vector<int>> qA(NB);
+    for (int ib = 0; ib < NB; ib++) quant32(&h[(size_t)ib * 32], dA[ib], qA[ib], dsA[ib]);
+    // Path B: fused emission — the 32nd arrival of block ib=ts*QPB+f/32 quantizes
+    // h[ts*F + (f&~31) + 0..31]; arrivals must total exactly 32 per block.
+    vector<float> dB(NB), dsB(NB); vector<vector<int>> qB(NB); vector<int> arr(NB, 0);
+    for (int ts = 0; ts < TS; ts++) for (int f = 0; f < F; f++) {
+        int ib = ts * QPB + (f >> 5);
+        if (arr[ib]++ == 31) { float blk[32];
+            for (int r = 0; r < 32; r++) blk[r] = h[(size_t)ts * F + (f & ~31) + r];
+            quant32(blk, dB[ib], qB[ib], dsB[ib]); }
+    }
+    double err = 0;
+    for (int ib = 0; ib < NB; ib++) {
+        if (arr[ib] != 32) err = std::max(err, 1.0);
+        err = std::max(err, (double)std::abs(dA[ib] - dB[ib]));
+        err = std::max(err, (double)std::abs(dsA[ib] - dsB[ib]));
+        for (int r = 0; r < 32; r++) err = std::max(err, (double)std::abs(qA[ib][r] - qB[ib][r]));
+    }
+    return err;   // expect exactly 0: fused emission == standalone quant_h
+}
+
 int main() {
     printf("sparkinfer kernel algorithm correctness (CPU reference)\n");
     check("attention hd128 kv1",   test_attention(128, 1),    1e-4);
@@ -317,6 +360,8 @@ int main() {
     check("argmax 2pass qwen vocab",test_argmax_twopass(151936, 512, false), 0.0);
     check("argmax 2pass gemma vocab",test_argmax_twopass(262144, 512, false), 0.0);
     check("argmax 2pass tie-break",  test_argmax_twopass(151936, 512, true),  0.0);
+    check("fused hq8 TS8 F768",      test_fused_hq8(8, 768),    0.0);
+    check("fused hq8 TS8 F1536",     test_fused_hq8(8, 1536),   0.0);
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

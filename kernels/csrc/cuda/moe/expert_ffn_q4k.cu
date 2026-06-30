@@ -455,6 +455,72 @@ __global__ void gate_up_mmvq2_kernel(
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
 }
 
+// gate_up_mmvq2 that ALSO emits the Q8_1(h) block for the down GEMV, deleting the standalone
+// quant_h_q8_1_kernel node (the last unfused activation-quantize in the dominant MoE chain;
+// cf. the fnq/attnq8 fusions). Same per-(ts,f) GEMV as gate_up_mmvq2_kernel — so the dominant
+// gate/up GEMV keeps its exact 6144-block, 4-warp layout and occupancy (a one-block-per-32f
+// rewrite would collapse to ~192 blocks and regress). A Q8_1 block spans 32 consecutive f's
+// living in 32 sibling blocks, so they cooperate via a threadfence release-counter: each block
+// publishes its h_scratch[f] (fence) and bumps qrelease[ib]; the 32nd arrival sees all 32 h's
+// and quantizes the block — byte-identical to quant_h_q8_1_kernel (same amax/round/sum). The
+// last block self-clears qrelease[ib] to 0, so no per-layer memset node is needed (the buffer
+// is zeroed once at startup and round-trips back to 0 every layer).
+__global__ void gate_up_mmvq2_q8_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, si_block_q8_1* __restrict__ hq8, int* __restrict__ qrelease,
+    int H, int F, int top_k
+) {
+    si_pdl_lc();
+    constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
+    const int row = blockIdx.x, ts = row / F, f = row % F, tok = ts / top_k;
+    const int e = expert_ids[ts];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
+    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
+    const int blocks_per_row = H >> 8, blocks_per_iter = vdr * NW * WS / qi;   // = 8
+    float tg = 0.f, tu = 0.f;
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const int kby = kbx * 8, kqs = vdr * (tid % (qi / vdr));
+        tg += si_vec_dot_q4_K(g_row + kbx, vrow + kby, kqs);
+        tu += si_vec_dot_q4_K(u_row + kbx, vrow + kby, kqs);
+    }
+    __shared__ float sg[NW - 1][WS], su[NW - 1][WS];
+    if (warp > 0) { sg[warp - 1][lane] = tg; su[warp - 1][lane] = tu; }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) { tg += sg[l][lane]; tu += su[l][lane]; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+
+    // 1. publish this f's activation, then signal arrival (fence-before-atomic, so the block
+    //    that observes the 32nd arrival is guaranteed to see all 32 h_scratch writes).
+    const int ib = ts * (F >> 5) + (f >> 5);   // global Q8_1 block index (== quant_h's ib)
+    if (lane == 0) {
+        h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+        __threadfence();
+    }
+    int prev = (lane == 0) ? atomicAdd(&qrelease[ib], 1) : 0;
+    prev = __shfl_sync(0xffffffffu, prev, 0);
+    if (prev != 31) return;                     // not the last of the 32 f's in this block
+
+    // 2. last arrival: quantize the 32-wide block to Q8_1 (identical math to quant_h_q8_1_kernel),
+    //    then reset the counter to 0 for the next layer / next decoded token.
+    const float xv = h_scratch[(size_t)ts * F + (f & ~31) + lane];
+    float a = fabsf(xv);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    const float d = a / 127.0f;
+    const int qv = (a == 0.0f) ? 0 : (int)roundf(xv / d);
+    hq8[ib].qs[lane] = (signed char)qv;
+    int s = qv;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+    if (lane == 0) { hq8[ib].ds = __floats2half2_rn(d, d * (float)s); qrelease[ib] = 0; }
+}
+
 // int8 dp4a MMVQ down (Q4_K). The Q4_K-quantized down rows in Q4_K_M were the last MoE GEMV
 // still on the fp register-dequant path (Q6_K down + gate/up + attention already run int8).
 // Reuses the Q8_1-quantized activation and the faithful vec_dot_q4_K_q8_1, one warp per
@@ -627,7 +693,7 @@ void launch_moe_expert_ffn_q4k(
     int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
-    int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream
+    int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, int* gu_qrelease, cudaStream_t stream
 ) {
     // int8 dp4a path for Q4_K gate/up (decode parity with llama.cpp's MMVQ). Default
     // ON — the largest single decode cost; down stays on the fp path (Q6_K). Set
@@ -637,6 +703,25 @@ void launch_moe_expert_ffn_q4k(
 
     static int gu2 = -1;   // default ON: faithful 4-warp Q4_K mmvq gate/up. =0 falls back to #50 path
     if (gu2 < 0) { const char* g2 = getenv("SPARKINFER_GU2"); gu2 = (g2 && g2[0] == '0') ? 0 : 1; }
+
+    // Default ON: the gate/up kernel emits Q8_1(h) directly (deleting the standalone quant_h node)
+    // when the down GEMV consumes it (int8 MMVQ down). SPARKINFER_GUQ8=0 restores the separate node.
+    static int guq8 = -1;
+    if (guq8 < 0) { const char* gq = getenv("SPARKINFER_GUQ8"); guq8 = (gq && gq[0] == '0') ? 0 : 1; }
+    static int down_mmvq = -1;
+    if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_DOWN_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
+    static int down_q4k = -1;
+    if (down_q4k < 0) { const char* qv = getenv("SPARKINFER_DOWN_Q4K"); down_q4k = (qv && qv[0] == '0') ? 0 : 1; }
+    // The down kernel reads hq8 only on the int8 MMVQ path (Q6_K, or Q4_K when DOWN_Q4K is on);
+    // only then is fusing the quantize worthwhile. (ffn % 32 == 0 is guaranteed: hidden,ffn % 256 == 0.)
+    // input_q8 must be present: otherwise the gate/up input Q8_1(hn) is staged in out_scratch, which
+    // is also the hq8 output buffer — fusing there would clobber the input mid-kernel. On the eval
+    // path input_q8 is always supplied by the fused norm (fnq), so fusion stays active.
+    const bool down_reads_hq8 = down_mmvq && (down_type == 14 || (down_q4k && down_type == 12));
+    const bool fuse_guq8 = guq8 && gu_qrelease && input_q8 && mmvq && gu2
+                           && gate_type == 12 && up_type == 12 && down_reads_hq8;
+    si_block_q8_1* const hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);
+
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
         const si_block_q8_1* q;
@@ -649,9 +734,18 @@ void launch_moe_expert_ffn_q4k(
                 reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
             q = qbuf;
         }
-        gate_up_mmvq2_kernel<<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
-            q, reinterpret_cast<const unsigned char*>(gate_q),
-            reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hidden, ffn, top_k);
+        // fuse_guq8 ⇒ input_q8 != null (q points at the fnq buffer, distinct from out_scratch/hq8),
+        // so the fused gate/up reads vy=q and writes hq8 without aliasing.
+        if (fuse_guq8) {
+            gate_up_mmvq2_q8_kernel<<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hq8, gu_qrelease,
+                hidden, ffn, top_k);
+        } else {
+            gate_up_mmvq2_kernel<<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hidden, ffn, top_k);
+        }
     } else if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
         size_t sm = 2 * (size_t)(hidden >> 5) * sizeof(float) + (size_t)hidden;  // s_xd+s_xs+s_xq8
         gate_up_q4k_mmvq_kernel<<<gu, WPB * 32, sm, stream>>>(
@@ -672,15 +766,14 @@ void launch_moe_expert_ffn_q4k(
     // fp register-dequant down. The MoE down is the last major decode GEMV still on the
     // fp path (gate/up + attention already run int8 MMVQ): quantize the activation h to
     // Q8_1 once (into the otherwise-unused out_scratch) and dp4a the Q6_K weights against
-    // it, faithful to llama.cpp vec_dot_q6_K_q8_1.
-    static int down_mmvq = -1;
-    if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_DOWN_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
+    // it, faithful to llama.cpp vec_dot_q6_K_q8_1. When fuse_guq8 is on, the gate/up kernel
+    // already wrote hq8, so the standalone quantize node is skipped.
     if (down_mmvq && down_type == 14) {   // 14 = ggml Q6_K
-        si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);   // <= hidden floats; fits
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb);
+        if (!fuse_guq8)
+            quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
+                h_scratch, hq8, nqb);
         // split-K MMVQ down (default S=4): S warps/row -> S*H warps in flight, hiding
         // the bs=1 occupancy stall the one-warp kernel hits. Falls back to one-warp if disabled.
         const int S = down_splitk_s();
@@ -701,14 +794,12 @@ void launch_moe_expert_ffn_q4k(
 
     // int8 dp4a MMVQ down (Q4_K) — default ON; SPARKINFER_DOWN_Q4K=0 restores the fp dequant
     // down for the Q4_K rows. Same quantize-once + faithful vec_dot path as the Q6_K down.
-    static int down_q4k = -1;
-    if (down_q4k < 0) { const char* qv = getenv("SPARKINFER_DOWN_Q4K"); down_q4k = (qv && qv[0] == '0') ? 0 : 1; }
     if (down_mmvq && down_q4k && down_type == 12) {   // 12 = ggml Q4_K
-        si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb);
+        if (!fuse_guq8)
+            quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
+                h_scratch, hq8, nqb);
         const int S = down_splitk_s();
         if (S > 1) {
             const int RPB = WPB / S;
