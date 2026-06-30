@@ -57,6 +57,8 @@ if(BUILD_EXAMPLES)
     target_link_libraries(qwen3_gguf_bench PRIVATE sparkinfer_runtime CUDA::cudart)
     add_executable(qwen3_gguf_score examples/qwen3_gguf_score.cpp)
     target_link_libraries(qwen3_gguf_score PRIVATE sparkinfer_runtime CUDA::cudart)
+    add_executable(qwen35_ttft_bench examples/qwen35_ttft_bench.cpp)
+    target_link_libraries(qwen35_ttft_bench PRIVATE sparkinfer_runtime CUDA::cudart)
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
 endif()
