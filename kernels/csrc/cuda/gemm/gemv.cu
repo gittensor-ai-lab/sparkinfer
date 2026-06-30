@@ -428,6 +428,47 @@ __global__ void si_mmvq_q4k_kernel(const si_block_q8_1* __restrict__ vy, const u
 template __global__ void si_mmvq_q4k_kernel<__nv_bfloat16>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
 template __global__ void si_mmvq_q4k_kernel<float>(const si_block_q8_1*, const unsigned char*, float*, int, int);
 
+// Q+K+V Q4_K MMVQ in one launch (shared Q8_1 activation): drops 2 graph nodes/layer
+// vs three separate si_mmvq_q4k launches when concurrent streams are unavailable.
+template <typename OutT>
+__global__ void si_mmvq_q4k_qkv_kernel(
+    const si_block_q8_1* __restrict__ vy,
+    const unsigned char* __restrict__ WQ, const unsigned char* __restrict__ WK,
+    const unsigned char* __restrict__ WV,
+    OutT* __restrict__ yq, OutT* __restrict__ yk, OutT* __restrict__ yv,
+    int qdim, int kvdim, int K) {
+    constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
+    const int bid = blockIdx.x;
+    const unsigned char* W;
+    OutT* y;
+    int row;
+    if (bid < qdim) { W = WQ; y = yq; row = bid; }
+    else if (bid < qdim + kvdim) { row = bid - qdim; W = WK; y = yk; }
+    else { row = bid - qdim - kvdim; W = WV; y = yv; }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const si_block_q4_K* x_row = (const si_block_q4_K*)(W + (size_t)row * (K >> 8) * 144);
+    const int blocks_per_row = K >> 8;
+    const int blocks_per_iter = vdr * NW * WS / qi;
+    float tmp = 0.f;
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const int kby = kbx * 8, kqs = vdr * (tid % (qi / vdr));
+        tmp += si_vec_dot_q4_K(x_row + kbx, vy + kby, kqs);
+    }
+    __shared__ float tmp_shared[NW - 1][WS];
+    if (warp > 0) tmp_shared[warp - 1][lane] = tmp;
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) tmp += tmp_shared[l][lane];
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, m);
+    if (lane == 0) gemv_write(y + row, tmp);
+}
+template __global__ void si_mmvq_q4k_qkv_kernel<__nv_bfloat16>(const si_block_q8_1*, const unsigned char*,
+    const unsigned char*, const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int, int, int);
+template __global__ void si_mmvq_q4k_qkv_kernel<float>(const si_block_q8_1*, const unsigned char*,
+    const unsigned char*, const unsigned char*, float*, float*, float*, int, int, int);
+
 // ===== faithful llama Q6_K mmvq for the fp32-path GEMVs (attn-V upgrades + LM head) =====
 // Same 4-warp-per-row structure as the Q4_K mmvq, with vec_dot_q6_K_q8_1 (coalesced
 // ql/qh int loads + __vsubss4 reconstruct + dp4a). Mirrors the #65 MoE-down dot.
@@ -631,6 +672,15 @@ void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cuda
 void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
     si_mmvq_q4k_kernel<float><<<N, 4 * 32, 0, stream>>>(
         reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
+}
+void launch_mmvq_q4k_qkv(const void* q81, const void* WQ, const void* WK, const void* WV,
+                         void* yq, void* yk, void* yv, int qdim, int kvdim, int K, cudaStream_t stream) {
+    si_mmvq_q4k_qkv_kernel<__nv_bfloat16><<<qdim + 2 * kvdim, 4 * 32, 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81),
+        reinterpret_cast<const unsigned char*>(WQ), reinterpret_cast<const unsigned char*>(WK),
+        reinterpret_cast<const unsigned char*>(WV),
+        reinterpret_cast<__nv_bfloat16*>(yq), reinterpret_cast<__nv_bfloat16*>(yk),
+        reinterpret_cast<__nv_bfloat16*>(yv), qdim, kvdim, K);
 }
 void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream) {
     si_mmvq_q6k_kernel<__nv_bfloat16><<<N, 4 * 32, 0, stream>>>(

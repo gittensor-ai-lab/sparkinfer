@@ -296,6 +296,7 @@ struct si_block_q8_1 { __half2 ds; signed char qs[32]; };   // 36 B / 32 values 
 // order (block ib covers elements [ib*32, ib*32+32)). One 32-value block per warp.
 __global__ void quant_h_q8_1_kernel(const float* __restrict__ h,
                                     si_block_q8_1* __restrict__ y, int n_blocks) {
+    si_pdl_sync();   // PDL: wait for gate_up h_scratch writes when launched programmatically
     const int warpsPB = blockDim.x >> 5;
     const int ib = blockIdx.x * warpsPB + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
@@ -453,6 +454,7 @@ __global__ void gate_up_mmvq2_kernel(
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    si_pdl_lc();   // PDL: allow quant_h grid spin-up to overlap this block's tail
 }
 
 // int8 dp4a MMVQ down (Q4_K). The Q4_K-quantized down rows in Q4_K_M were the last MoE GEMV
@@ -622,6 +624,27 @@ static inline bool launch_down_q4k_mmvq_splitk(
     }
 }
 
+static inline int gu_pdl_enabled() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPARKINFER_GU_PDL"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
+static inline void launch_quant_h_q8_1(const float* h, si_block_q8_1* hq8, int nqb,
+                                       cudaStream_t stream, bool programmatic) {
+    const int qthreads = 256;
+    const dim3 grid((nqb + (qthreads >> 5) - 1) / (qthreads >> 5));
+    if (programmatic) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = grid; cfg.blockDim = dim3(qthreads); cfg.stream = stream;
+        cudaLaunchAttribute attr; attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr.val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = &attr; cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, quant_h_q8_1_kernel, h, hq8, nqb);
+    } else {
+        quant_h_q8_1_kernel<<<grid, qthreads, 0, stream>>>(h, hq8, nqb);
+    }
+}
+
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
     int gate_type, int up_type, int down_type,
@@ -637,6 +660,7 @@ void launch_moe_expert_ffn_q4k(
 
     static int gu2 = -1;   // default ON: faithful 4-warp Q4_K mmvq gate/up. =0 falls back to #50 path
     if (gu2 < 0) { const char* g2 = getenv("SPARKINFER_GU2"); gu2 = (g2 && g2[0] == '0') ? 0 : 1; }
+    bool gu2_launched = false;
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
         const si_block_q8_1* q;
@@ -652,6 +676,7 @@ void launch_moe_expert_ffn_q4k(
         gate_up_mmvq2_kernel<<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
             q, reinterpret_cast<const unsigned char*>(gate_q),
             reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hidden, ffn, top_k);
+        gu2_launched = true;
     } else if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
         size_t sm = 2 * (size_t)(hidden >> 5) * sizeof(float) + (size_t)hidden;  // s_xd+s_xs+s_xq8
         gate_up_q4k_mmvq_kernel<<<gu, WPB * 32, sm, stream>>>(
@@ -678,9 +703,7 @@ void launch_moe_expert_ffn_q4k(
     if (down_mmvq && down_type == 14) {   // 14 = ggml Q6_K
         si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);   // <= hidden floats; fits
         const int nqb = num_tokens * top_k * (ffn >> 5);
-        const int qthreads = 256;
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb);
+        launch_quant_h_q8_1(h_scratch, hq8, nqb, stream, gu2_launched && gu_pdl_enabled());
         // split-K MMVQ down (default S=4): S warps/row -> S*H warps in flight, hiding
         // the bs=1 occupancy stall the one-warp kernel hits. Falls back to one-warp if disabled.
         const int S = down_splitk_s();
@@ -706,9 +729,7 @@ void launch_moe_expert_ffn_q4k(
     if (down_mmvq && down_q4k && down_type == 12) {   // 12 = ggml Q4_K
         si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);
         const int nqb = num_tokens * top_k * (ffn >> 5);
-        const int qthreads = 256;
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb);
+        launch_quant_h_q8_1(h_scratch, hq8, nqb, stream, gu2_launched && gu_pdl_enabled());
         const int S = down_splitk_s();
         if (S > 1) {
             const int RPB = WPB / S;

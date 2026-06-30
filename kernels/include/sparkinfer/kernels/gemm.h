@@ -70,6 +70,9 @@ void launch_gemv_q_dp4a_pq_f32(const void* q8, const float* ad, const float* as,
 size_t llama_q8_1_bytes(int K);
 void launch_quantize_q8_1_blocks(const void* x, void* y, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
+void launch_mmvq_q4k_qkv(const void* q81, const void* WQ, const void* WK, const void* WV,
+                         void* yq, void* yk, void* yv, int qdim, int kvdim, int K,
+                         cudaStream_t stream = nullptr);
 void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
 // Same, for Q6_K weights (attn-V upgrades + LM head). q81 = block_q8_1(activation).
 void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
