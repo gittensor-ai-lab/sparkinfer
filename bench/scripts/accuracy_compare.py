@@ -15,7 +15,10 @@ from tokenizers import Tokenizer
 
 score_path, tok_path, text_path = sys.argv[1], sys.argv[2], sys.argv[3]
 URL  = sys.argv[4] if len(sys.argv) > 4 else "http://localhost:8081"
-TOPK = int(sys.argv[5]) if len(sys.argv) > 5 else 40
+# llama top-k to query per position. MUST be <= sparkinfer's dump depth (accuracy.sh dumps 128) so
+# every token llama gives mass to is present in sparkinfer's distribution — otherwise it gets FLOOR'd
+# and KL is inflated by a truncation artifact (the metric bug that read 0.14-0.33 instead of ~0.02).
+TOPK = int(sys.argv[5]) if len(sys.argv) > 5 else 64
 FLOOR = -20.0
 
 # 3rd arg is either a file of space-separated token ids (the EXACT prompt scored — produced by

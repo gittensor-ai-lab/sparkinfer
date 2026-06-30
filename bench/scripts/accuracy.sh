@@ -36,10 +36,14 @@ IDS="$(cat "$IDS_FILE")"
 echo ">> eval prompt: seed=$SEED tokens=$(echo "$IDS" | wc -w)"
 
 echo ">> sparkinfer teacher-forced score ..."
-si_run qwen3_gguf_score "$GGUF" 20 $IDS > /tmp/spark_score.txt 2>/dev/null || true
+# Dump top-128 (>= the llama top-k queried in accuracy_compare). A shallow dump made the KL a
+# truncation artifact: any llama-tail token outside sparkinfer's dump was floored (exp(-20)) and
+# massively over-penalized, inflating KL to 0.14-0.33 on flat distributions. With the dump covering
+# llama's query, KL reflects the true ~0.01-0.03 divergence. Scoring-only — no decode-speed impact.
+si_run qwen3_gguf_score "$GGUF" 128 $IDS > /tmp/spark_score.txt 2>/dev/null || true
 if ! grep -q "^PPL" /tmp/spark_score.txt; then   # prebuilt incompatible -> rebuild
   fallback_build "$ARCH"
-  si_run qwen3_gguf_score "$GGUF" 20 $IDS > /tmp/spark_score.txt 2>/dev/null
+  si_run qwen3_gguf_score "$GGUF" 128 $IDS > /tmp/spark_score.txt 2>/dev/null
 fi
 
 echo ">> starting llama.cpp server (reference) ..."

@@ -28,14 +28,14 @@ For each PR commit, on one RTX 5090, in one run:
    the result, so the absolute tok/s is reproducible and clock-checkable, not just same-box-cancelled.
 3. **Bench decode** for both, **interleaved**, and score the **same-box delta %** — so box-to-box
    hardware variance (~2%) cancels and the score is hardware-independent.
-4. **Gate correctness on a held-out prompt**: **top-1 token agreement ≥ 0.93** (the primary gate — it's
-   what greedy decode actually emits, and it holds 0.96–0.98 across prompts) and a distributional
-   backstop **KL ≤ 0.40** (preferred ≤ 0.30) vs llama.cpp on the same GGUF. The prompt is **chosen by a
-   fresh, unpredictable per-eval seed** (a random window of a multi-domain corpus + fuzzed length), so a
-   submission can't overfit a fixed in-repo prompt; the seed is logged so the exact prompt is
-   reproducible. The bars are calibrated to this held-out regime — diverse prompts raise KL (0.14 on easy
-   prose to ~0.33 on hard text), so a fixed-prompt KL bar would falsely reject a known-good build. A
-   speedup that erodes accuracy is `REJECT`ed regardless of how fast it is — accuracy is the moat.
+4. **Gate correctness on a held-out prompt**: top-1 token agreement ≥ 0.90 and **KL ≤ 0.20**
+   (preferred ≤ 0.15) vs llama.cpp on the same GGUF — strict bars that hold even on hard held-out text.
+   The prompt is **chosen by a fresh, unpredictable per-eval seed** (a random window of a multi-domain
+   corpus + fuzzed length), so a submission can't overfit a fixed in-repo prompt; the seed is logged so
+   the exact prompt is reproducible. The KL is measured at matched top-k depth (sparkinfer dumps a deep
+   top-k so llama's tail isn't floored) — the true divergence is ~0.01–0.03 (top-1 0.96–0.98), so the
+   strict 0.20 holds with large margin. A speedup that erodes accuracy is `REJECT`ed regardless of how
+   fast it is — accuracy is the moat.
 5. **Label** = a **deterministic function of the measurements** (`XS … XL`, `none`, `BASELINE`,
    `REJECT`), so independent validators converge on the same verdict. The verdict carries its
    **provenance** (clock, prompt seed, reference pins) so the immutable log is self-describing.
