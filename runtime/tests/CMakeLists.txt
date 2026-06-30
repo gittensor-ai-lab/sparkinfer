@@ -7,6 +7,12 @@ add_executable(qwen35_cpu_test qwen35_cpu_test.cpp)
 set_target_properties(qwen35_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME qwen35_cpu_test COMMAND qwen35_cpu_test)
 
+# GGUF reader tensor-table parsing — pure host C++ (no GPU); compiles the reader source directly.
+add_executable(gguf_cpu_test gguf_cpu_test.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/gguf.cpp)
+target_include_directories(gguf_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+set_target_properties(gguf_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME gguf_cpu_test COMMAND gguf_cpu_test)
+
 # Thermal governor — pure tiering policy (no GPU); links the runtime for classify()/pace() symbols.
 add_executable(thermal_governor_cpu_test thermal_governor_cpu_test.cpp)
 target_link_libraries(thermal_governor_cpu_test PRIVATE sparkinfer_runtime)
