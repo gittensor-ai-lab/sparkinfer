@@ -361,7 +361,11 @@ def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
                   "delta_pct": res.get("pct_over_frontier"), "delta_tps": res.get("delta_tps"),
                   "top1": res.get("top1"), "kl": res.get("kl"),
                   "gpu": "RTX 5090 (sm_120) · vast.ai", "date": datetime.date.today().isoformat(),
-                  "frontier": res.get("frontier_tps")}
+                  "frontier": res.get("frontier_tps"),
+                  # M1/H1/C2 provenance — makes the immutable log self-describing + reproducible
+                  "clocks_pinned": res.get("clocks_pinned"), "clock_mhz": res.get("clock_mhz"),
+                  "clock_spread_mhz": res.get("clock_spread_mhz"), "eval_seed": res.get("eval_seed"),
+                  "model_sha_pinned": res.get("model_sha_pinned"), "llama_commit": res.get("llama_commit")}
         json.dump(result, open(os.path.join(rundir, "result.json"), "w"), indent=2)
         clean = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "<ip>", log_text or "")   # scrub host IPs
         open(os.path.join(rundir, "log.txt"), "w").write(clean)
