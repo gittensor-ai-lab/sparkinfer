@@ -100,11 +100,18 @@ public:
     // steps then times `n_tokens` more. Returns tokens/sec. Requires weights.
     double bench_decode(int warmup, int n_tokens);
 
+    // Time-to-first-token benchmark: ingests `prompt` then samples once.
+    // Returns milliseconds for prompt ingestion + first argmax. Requires weights.
+    double bench_ttft(const std::vector<int>& prompt);
+
     const Qwen35Config& config() const;
 
 private:
     struct Impl;
     Impl* p_;
+
+    // prefill_only skips LM head + argmax and never captures/replays the decode graph.
+    int forward_token_impl(int token_id, int position, bool prefill_only);
 };
 
 } // namespace sparkinfer
