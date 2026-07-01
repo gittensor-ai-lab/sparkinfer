@@ -368,8 +368,12 @@ def main():
         # prompt. The seed is echoed into the verdict (eval_seed) so the prompt stays reproducible.
         eval_seed = os.urandom(8).hex()
         print(f">> held-out eval prompt seed: {eval_seed}")
+        # Difficulty compensation ON (Option B): as the frontier pulls past llama.cpp each further %
+        # gain is harder, so label.py scales the label tier up (raw % + significance gate unchanged).
+        # Governance-tunable via SPARKINFER_DIFFICULTY_{K,REF,MAX}; applies from new evals onward.
         ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
-              f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
+              f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} SPARKINFER_DIFFICULTY_BOOST=1 "
+              f"MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
               f"bench/scripts/evaluate.sh --ref {args.ref} --frontier {args.frontier} --ceiling {args.ceiling}")
         got_result = False
         r = sh(host, port, ev, timeout=10800)

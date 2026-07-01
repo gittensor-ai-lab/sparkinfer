@@ -44,6 +44,23 @@ SIG = 0.02                                              # noise floor: gain must
 # min relative speedup (delta/frontier) for each tier; XS starts at the noise floor SIG.
 BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 
+# ---- Optional difficulty compensation (Option B — opt-in, governance-tunable) ----
+# As the frontier pulls past a mature reference (llama.cpp), each further % gain is harder; scale the
+# LABEL up so a late-game hard PR scores like the effort it took. D = 1 for a frontier at/below the
+# reference (the cold-start era is untouched — no retroactive inflation), grows with distance past it,
+# and is bounded by DIFF_MAX so nothing runs away to XL. Crucially the boost multiplies the *label*
+# only: the significance gate stays on the RAW delta (so noise is never boosted) and pct_over_frontier
+# still reports the true measured speedup. OFF by default.
+DIFF_BOOST = os.environ.get("SPARKINFER_DIFFICULTY_BOOST", "0") == "1"
+DIFF_K     = float(os.environ.get("SPARKINFER_DIFFICULTY_K",   "8"))
+DIFF_REF   = float(os.environ.get("SPARKINFER_DIFFICULTY_REF", "365.85"))  # llama.cpp 128-tok tok/s
+DIFF_MAX   = float(os.environ.get("SPARKINFER_DIFFICULTY_MAX", "4"))
+
+def difficulty_mult(frontier):
+    if not DIFF_BOOST or DIFF_REF <= 0:
+        return 1.0
+    return min(1.0 + DIFF_K * max(0.0, frontier / DIFF_REF - 1.0), DIFF_MAX)
+
 res = {"commit": commit, "tps": round(tps, 2), "top1": round(top1, 4),
        "kl": round(kl, 4), "frontier_tps": round(frontier, 2)}
 
@@ -60,10 +77,15 @@ else:
                    pct_over_frontier=round(100 * g, 1),
                    note="within significance gate — not a verified improvement")
     else:
-        label = next(l for thr, l in BUCKETS if g >= thr)
+        D = difficulty_mult(frontier)
+        g_eff = g * D                                   # boost the label tier, not the raw % or the gate
+        label = next(l for thr, l in BUCKETS if g_eff >= thr)
         res.update(pass_=True, label=label, delta_tps=round(delta, 2),
-                   pct_over_frontier=round(100 * g, 1),
+                   pct_over_frontier=round(100 * g, 1),   # RAW measured speedup (honest reporting)
                    pct_of_ceiling=round(100 * tps / ceiling, 1) if ceiling > 0 else None)
+        if D != 1.0:                                    # transparency: expose the boost in the verdict
+            res["difficulty_mult"] = round(D, 2)
+            res["effective_pct"] = round(100 * g_eff, 1)
 
 # Soft accuracy flag: passed the gate but above the preferred KL ceiling — accepted, margin is thin.
 if res.get("label") != "REJECT" and kl > KL_PREFER:

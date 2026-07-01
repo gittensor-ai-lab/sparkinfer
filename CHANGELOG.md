@@ -3,6 +3,20 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased]
+
+### Changed — difficulty-compensated scoring (perpetual-progress incentive)
+As the frontier pulls past llama.cpp, each further % gain gets much harder (near the roofline the
+easy headroom is gone), so a fixed %-band scale under-rewards late-game work — a hard +4% now took
+more than an easy +20% at cold start. `label.py` now scales the **label tier** by a difficulty
+multiplier `D = 1 + K·max(0, frontier/ref − 1)` (K=8, ref = llama.cpp 365.85, capped at 4×): a gain
+scores like the effort it took relative to a mature baseline. Safeguards: the boost multiplies the
+**label only** — `pct_over_frontier` still reports the true measured speedup, the significance gate
+stays on the **raw** delta (noise is never boosted), and the cold-start era (frontier ≤ ref) is
+untouched (D=1, no retroactive inflation). Applied from new evals onward. On the real history #83/#89/#86
+move S→M/L; everything below llama is unchanged. Governance-tunable (`SPARKINFER_DIFFICULTY_{BOOST,K,REF,MAX}`);
+replay with [`eval/sim_difficulty.py`](eval/sim_difficulty.py).
+
 ## [0.3.2] — 2026-06-30
 
 The lead over llama.cpp **doubles to ~24%**, and the evaluation that proves it is **substantially
