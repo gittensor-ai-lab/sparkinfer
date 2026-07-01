@@ -18,6 +18,9 @@ bench/scripts/bench.sh --download --compare
 
 # 3) Accuracy gate vs llama.cpp (token-match / KL / perplexity)
 bench/scripts/accuracy.sh --download
+
+# 4) Qwen3.6-35B-A3B head-to-head at the requested decode sizes
+bench/scripts/qwen36_compare_128_512.sh
 ```
 
 Use your own model instead of `--download`:
@@ -45,6 +48,10 @@ tar xzf sparkinfer-v0.1.0-linux-x86_64-cuda13-sm120.tar.gz
 `bench.sh` → sparkinfer decode tok/s + VRAM (and, with `--compare`, the llama.cpp
 `tg128` number on the same card).
 
+`qwen36_compare_128_512.sh` → same-GGUF Qwen3.6-35B-A3B comparison against
+llama.cpp at `n=128` and `n=512`, using
+`unsloth/Qwen3.6-35B-A3B-GGUF` / `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` by default.
+
 `accuracy.sh` → the correctness gate:
 ```
 token-match (top-1)   : 100/100 = 1.000   (bar >= 0.90)
@@ -69,9 +76,9 @@ build/runtime/qwen3_gguf_score model.gguf 20 <token-ids...>   # compare argmax +
 |---|---|---|
 | `ARCH` | auto (`compute_cap`) | CUDA arch, e.g. `121` for RTX Spark |
 | `MODELS_DIR` | `./models` | where the GGUF + tokenizer live |
-| `MODEL_REPO` / `MODEL_FILE` | Qwen3-30B-A3B GGUF | model to fetch |
+| `MODEL_REPO` / `MODEL_FILE` | Qwen3-30B-A3B GGUF, or Qwen3.6 in `qwen36_compare_128_512.sh` | model to fetch |
 | `LLAMACPP_DIR` | `./.llamacpp` | reuse an existing llama.cpp checkout/build |
 | `NO_PREBUILT` | `0` | set `1` to skip prebuilt binaries and build from source |
 
-Files: `bench.sh`, `accuracy.sh`, `accuracy_compare.py`, `eval_text.txt`, `_common.sh`.
+Files: `bench.sh`, `qwen36_compare_128_512.sh`, `accuracy.sh`, `accuracy_compare.py`, `eval_text.txt`, `_common.sh`.
 Results from reference runs live in [`../results/`](../results).

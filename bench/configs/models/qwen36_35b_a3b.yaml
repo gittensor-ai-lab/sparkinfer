@@ -85,9 +85,13 @@ derived:
   router_dim: 256
 
 runtime:
-  sparkinfer_native_decode: false
-  missing_runtime_work:
+  sparkinfer_native_decode: true
+  implemented_runtime_work:
     - gated_deltanet_linear_attention_decode
     - linear_attention_recurrent_state_cache
-    - qwen3_5_moe_mrope_partial_rotary
+    - hybrid_layer_scheduler
+    - qwen3_5_moe_partial_rotary_decode
+  pending_validation:
+    - cuda_build_on_sm120_or_sm121
+    - qwen3_5_moe_mrope_parity_against_llama_cpp
     - multimodal_token_and_vision_plumbing

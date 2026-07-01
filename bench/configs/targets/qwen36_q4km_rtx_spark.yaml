@@ -16,9 +16,9 @@ decode:
   context_lens: [2048, 8192, 32768, 131072, 262144]
   dtype: bfloat16
 
-  # Native sparkinfer decode is intentionally disabled until the Gated DeltaNet
-  # stack exists. External GB10/vLLM FP8 runs are useful baselines, but this
-  # target is for the GGUF path and should be remeasured once native support lands.
+  # Native sparkinfer decode exists for the hybrid Gated DeltaNet stack. These
+  # slots remain null until the sm_120/sm_121 build and benchmark are rerun on
+  # the pinned GGUF with the same-box llama.cpp baseline.
   baseline_toks_per_sec:
     bs1_ctx2k: null
     bs1_ctx32k: null
@@ -30,12 +30,12 @@ decode:
     bs1_ctx262k: 60
 
 runtime:
-  sparkinfer_native_decode: false
+  sparkinfer_native_decode: true
   required_work:
-    - gated_deltanet_linear_attention_decode
-    - recurrent_linear_attention_state_cache
-    - hybrid_layer_scheduler
-    - qwen3_5_moe_mrope_partial_rotary
+    - cuda_build_validation
+    - llama_cpp_same_gguf_baseline_128_512
+    - sparkinfer_same_gguf_baseline_128_512
+    - qwen3_5_moe_mrope_parity_validation
 
 memory:
   expert_eviction_needed: false
