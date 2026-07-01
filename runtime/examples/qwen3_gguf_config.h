@@ -1,7 +1,7 @@
 #pragma once
 
 #include "sparkinfer/gguf.h"
-#include "sparkinfer/models/qwen35.h"
+#include "sparkinfer/models/qwen_config.h"
 
 #include <limits>
 #include <string>
@@ -48,6 +48,7 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
     cfg.rms_eps    = (float)qwen3_meta_float(g, "attention.layer_norm_rms_epsilon", cfg.rms_eps);
     cfg.eos_id     = (int)g.meta_int("tokenizer.ggml.eos_token_id", cfg.eos_id);
     cfg.n_shared   = g.tensor("blk.0.ffn_gate_shexp.weight") ? 1 : 0;
+    cfg.vocab      = (int)qwen3_meta_int(g, "vocab_size", cfg.vocab);
     const sparkinfer::GGUFTensor* emb = g.tensor("token_embd.weight");
     if (emb && emb->n_dims >= 2) cfg.vocab = (int)emb->dims[1];
 

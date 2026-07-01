@@ -640,6 +640,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (s.cfg.linear_conv_kernel <= 0) s.cfg.linear_conv_kernel = 4;
     }
     const Qwen35Config& c = s.cfg;
+    const int H = c.hidden;
     s.gguf = true;   // dense weights kept native [out,in]; forward uses GEMV
 
     // Shared-expert tensors are optional in GGUF (Qwen3-30B-A3B has none). The
@@ -717,6 +718,28 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {
         return g.tensor(name) ? dense(name, transpose) : nullptr;
     };
+    auto expect_dims = [&](const std::string& name, std::initializer_list<long> dims) -> bool {
+        const GGUFTensor* t = g.tensor(name);
+        if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return false; }
+        if (t->n_dims != (int)dims.size()) {
+            fprintf(stderr, "[gguf] bad rank for %s: got %d want %zu\n",
+                    name.c_str(), t->n_dims, dims.size());
+            return false;
+        }
+        int i = 0;
+        for (long want : dims) {
+            if (t->dims[i] != want) {
+                fprintf(stderr, "[gguf] bad shape for %s dim%d: got %ld want %ld\n",
+                        name.c_str(), i, t->dims[i], want);
+                return false;
+            }
+            i++;
+        }
+        return true;
+    };
+    auto expect_dims_opt = [&](const std::string& name, std::initializer_list<long> dims) -> bool {
+        return !g.tensor(name) || expect_dims(name, dims);
+    };
 
     s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
     s.w.final_norm   = dense("output_norm.weight", false);
@@ -729,8 +752,18 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         std::string b = "blk." + std::to_string(i) + ".";
         Qwen35LayerWeights& w = s.w.layers[i];
         w.linear_attn = is_linear_layer(c, i);
+        if (!expect_dims(b + "attn_norm.weight", {H})) return false;
         w.input_norm = dense(b + "attn_norm.weight", false);
         if (w.linear_attn) {
+            if (!expect_dims(b + "attn_qkv.weight", {H, s.linear_qkvdim}) ||
+                !expect_dims(b + "attn_gate.weight", {H, s.linear_vdim}) ||
+                !expect_dims(b + "ssm_conv1d.weight", {c.linear_conv_kernel, s.linear_qkvdim}) ||
+                !expect_dims(b + "ssm_dt.bias", {c.linear_v_heads}) ||
+                !expect_dims(b + "ssm_a", {c.linear_v_heads}) ||
+                !expect_dims(b + "ssm_beta.weight", {H, c.linear_v_heads}) ||
+                !expect_dims(b + "ssm_alpha.weight", {H, c.linear_v_heads}) ||
+                !expect_dims(b + "ssm_norm.weight", {c.linear_head_dim}) ||
+                !expect_dims(b + "ssm_out.weight", {s.linear_vdim, H})) return false;
             w.wqkv = attn_w(b + "attn_qkv.weight", w.wqkv_type);
             w.wqkv_gate = attn_w(b + "attn_gate.weight", w.wqkv_gate_type);
             w.ssm_conv = dense(b + "ssm_conv1d.weight", false);
@@ -742,6 +775,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             w.ssm_out = attn_w(b + "ssm_out.weight", w.ssm_out_type);
         } else {
             w.q_has_gate = c.hybrid;
+            const int q_out = w.q_has_gate ? s.qdim * 2 : s.qdim;
+            if (!expect_dims(b + "attn_q.weight", {H, q_out}) ||
+                !expect_dims(b + "attn_k.weight", {H, s.kvdim}) ||
+                !expect_dims(b + "attn_v.weight", {H, s.kvdim}) ||
+                !expect_dims(b + "attn_output.weight", {s.qdim, H}) ||
+                !expect_dims(b + "attn_q_norm.weight", {c.head_dim}) ||
+                !expect_dims(b + "attn_k_norm.weight", {c.head_dim})) return false;
             w.wq = attn_w(b + "attn_q.weight", w.wq_type);
             w.wk = attn_w(b + "attn_k.weight", w.wk_type);
             w.wv = attn_w(b + "attn_v.weight", w.wv_type);
@@ -749,6 +789,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             w.q_norm = dense(b + "attn_q_norm.weight", false);
             w.k_norm = dense(b + "attn_k_norm.weight", false);
         }
+        if (!expect_dims_opt(b + "attn_post_norm.weight", {H}) ||
+            !expect_dims_opt(b + "ffn_norm.weight", {H}) ||
+            !expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
         w.post_attn_norm = dense_opt(b + "attn_post_norm.weight", false);
         if (!w.post_attn_norm) w.post_attn_norm = dense(b + "ffn_norm.weight", false);
         w.router_w = dense(b + "ffn_gate_inp.weight", false);   // native [E,H] for GEMV
@@ -756,6 +799,10 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
         w.down_q = dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
         if (s.cfg.n_shared > 0) {
+            if (!expect_dims(b + "ffn_gate_shexp.weight", {H, c.moe_ffn}) ||
+                !expect_dims(b + "ffn_up_shexp.weight", {H, c.moe_ffn}) ||
+                !expect_dims(b + "ffn_down_shexp.weight", {c.moe_ffn, H}) ||
+                !expect_dims_opt(b + "ffn_gate_inp_shexp.weight", {H})) return false;
             w.shared_gate = dense(b + "ffn_gate_shexp.weight", true);
             w.shared_up   = dense(b + "ffn_up_shexp.weight", true);
             w.shared_down = dense(b + "ffn_down_shexp.weight", true);
