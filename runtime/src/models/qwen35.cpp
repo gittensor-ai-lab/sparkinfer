@@ -61,10 +61,18 @@ struct Qwen35Model::Impl {
     uint64_t seq_id = 0;
     int qdim, kvdim;
     bool gguf = false;   // true after load_gguf: dense weights are native [out,in], use GEMV
-    // CUDA-graph capture of the decode compute (captured once, replayed each token)
-    cudaGraph_t cu_graph{};
-    cudaGraphExec_t cu_exec{};
+    // CUDA-graph capture of the decode compute (captured once, replayed each token).
+    // Two graphs are captured with different flash-decode split counts: `cu_exec` (n_splits
+    // = split_lo) fills the GPU best for short context, `cu_exec_hi` (split_hi) for long
+    // context (more splits = more parallel blocks once each KV chunk is large). Each token
+    // replays whichever matches its current seqlen (>= split_thresh -> hi). Split count is
+    // occupancy tuning only (the same accuracy-neutral knob SPARKINFER_NSPLITS already
+    // exposes): it changes the fp reduction order of the softmax combine, not the attention
+    // math — within the fp noise the concurrent-stream decode path already has run-to-run.
+    cudaGraph_t cu_graph{}, cu_graph_hi{};
+    cudaGraphExec_t cu_exec{}, cu_exec_hi{};
     bool graph_ready = false;
+    int split_lo = 32, split_hi = 64, split_thresh = 224;
 
     // scratch (bf16)
     bf16 *x, *xn, *q, *k, *v, *attn, *ao, *h, *hn, *routed, *shared;
@@ -101,9 +109,21 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // at construction. 16 over-subscribes the GPU for short context (32 q_heads * 16 =
     // 512 single-warp blocks); SPARKINFER_NSPLITS lets the scored regime be tuned/swept
     // without a rebuild. Clamp to [1, 64]; buffers below are sized from it.
-    if (const char* ns = getenv("SPARKINFER_NSPLITS")) {
-        int v = atoi(ns); if (v < 1) v = 1; if (v > 64) v = 64; p_->n_splits = v;
-        fprintf(stderr, "[nsplits] flash-decode splits = %d (env override)\n", v);
+    // Context-adaptive flash-decode split counts. split_lo fills the GPU best when the KV is
+    // short; split_hi (more parallel blocks) wins once each split's KV chunk is large. Both are
+    // captured as separate decode graphs; each token replays the one matching its seqlen. Swept
+    // on RTX 5090 / Qwen3-30B-A3B: lo=32 (=128-tok optimum), hi=64 (+2.8% @512, +0.85% @256),
+    // crossover ~224. Setting SPARKINFER_NSPLITS forces a single fixed count (disables adaptive).
+    auto clampi = [](int v, int lo, int hi){ return v < lo ? lo : (v > hi ? hi : v); };
+    if (const char* ns = getenv("SPARKINFER_NSPLITS")) {          // fixed override (no adaptive)
+        int v = clampi(atoi(ns), 1, 256); p_->split_lo = p_->split_hi = v; p_->n_splits = v;
+        fprintf(stderr, "[nsplits] flash-decode splits = %d (fixed, env override)\n", v);
+    } else {
+        if (const char* e = getenv("SPARKINFER_NSPLITS_LO"))     p_->split_lo     = clampi(atoi(e), 1, 256);
+        if (const char* e = getenv("SPARKINFER_NSPLITS_HI"))     p_->split_hi     = clampi(atoi(e), 1, 256);
+        if (const char* e = getenv("SPARKINFER_NSPLITS_THRESH")) p_->split_thresh = clampi(atoi(e), 1, 1<<20);
+        if (p_->split_hi < p_->split_lo) p_->split_hi = p_->split_lo;
+        p_->n_splits = p_->split_hi;                             // buffers sized for the larger count
     }
     p_->qdim = cfg.n_q_heads * cfg.head_dim;
     p_->kvdim = cfg.n_kv_heads * cfg.head_dim;
@@ -163,7 +183,12 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->mf_ids); cudaFree(p_->mf_counts);
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
-    if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
+    if (p_->graph_ready) {
+        cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph);
+        if (p_->cu_exec_hi && p_->cu_exec_hi != p_->cu_exec) {
+            cudaGraphExecDestroy(p_->cu_exec_hi); cudaGraphDestroy(p_->cu_graph_hi);
+        }
+    }
     cudaEventDestroy(p_->ev_qkv); cudaEventDestroy(p_->ev_k); cudaEventDestroy(p_->ev_v);
     cudaStreamDestroy(p_->stream_v); cudaStreamDestroy(p_->stream_k);
     cudaStreamDestroy(p_->stream);
@@ -196,14 +221,17 @@ int Qwen35Model::forward_token(int token_id, int position) {
     // replay it every token (per-token inputs live in the d_tok/pos/seqlen/
     // writepos device buffers uploaded above, so replay produces fresh results).
     if (s.graph_ready) {
-        cu(cudaGraphLaunch(s.cu_exec, st), "graph launch");
+        // Replay the graph whose split count matches this token's context length.
+        cudaGraphExec_t g = (seqlen >= s.split_thresh) ? s.cu_exec_hi : s.cu_exec;
+        cu(cudaGraphLaunch(g, st), "graph launch");
         int out_id = 0;
         cu(cudaMemcpyAsync(&out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
         cu(cudaStreamSynchronize(st), "sync");
         return out_id;
     }
-    cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture");
-
+    // First token: record the decode compute into a lambda so it can be captured into two
+    // graphs (split_lo / split_hi). launch_flash_decode_split reads s.n_splits at record time.
+    auto record = [&]() {
     kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
 
     int* btable = s.kv->block_table(s.seq_id);
@@ -349,11 +377,28 @@ int Qwen35Model::forward_token(int token_id, int position) {
     else if (s.gguf)                kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
     else        kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
+    };  // end record lambda
 
-    cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
-    cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
+    // Capture graph #1 (short-context split count). Capture only records — no kernel runs —
+    // so recording twice does not touch the KV cache or any device state.
+    s.n_splits = s.split_lo;
+    cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture lo");
+    record();
+    cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture lo");
+    cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate lo");
+    // Capture graph #2 (long-context split count), unless it's the same as lo (fixed override).
+    if (s.split_hi != s.split_lo) {
+        s.n_splits = s.split_hi;
+        cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture hi");
+        record();
+        cu(cudaStreamEndCapture(st, &s.cu_graph_hi), "end capture hi");
+        cu(cudaGraphInstantiate(&s.cu_exec_hi, s.cu_graph_hi, 0), "graph instantiate hi");
+    } else {
+        s.cu_exec_hi = s.cu_exec;   // aliased; destructor guards against double-free
+    }
     s.graph_ready = true;
-    cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
+    cudaGraphExec_t g0 = (seqlen >= s.split_thresh) ? s.cu_exec_hi : s.cu_exec;
+    cu(cudaGraphLaunch(g0, st), "graph launch (first)");
 
     int out_id = 0;
     cu(cudaMemcpyAsync(&out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
