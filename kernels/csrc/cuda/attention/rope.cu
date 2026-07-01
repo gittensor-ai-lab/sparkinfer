@@ -119,6 +119,63 @@ __global__ void rope_kv_append_kernel(
     }
 }
 
+__global__ void rope_kv_append_partial_kernel(
+    __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta,
+    int block_size, int max_blocks_per_seq
+) {
+    const int tok  = blockIdx.y;
+    const int rhalf = rotary_dim >> 1;
+    const int nq = n_q_heads  * rhalf;
+    const int nk = n_kv_heads * rhalf;
+    const int ktail = n_kv_heads * (head_dim - rotary_dim);
+    const int nv = n_kv_heads * head_dim;
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= nq + nk + ktail + nv) return;
+
+    const int pos    = positions[tok];
+    const int blk    = pos / block_size;
+    const int within = pos % block_size;
+    const int phys   = block_table[tok * max_blocks_per_seq + blk];
+    const size_t ctok = (size_t)(phys * block_size + within);
+
+    if (gid < nq) {
+        const int hh = gid / rhalf, i = gid - hh * rhalf;
+        const float freq = __powf(theta, -2.f * (float)i / (float)rotary_dim);
+        const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+        const size_t base = ((size_t)(tok * n_q_heads + hh)) * head_dim;
+        const float x0 = __bfloat162float(q[base + i]);
+        const float x1 = __bfloat162float(q[base + i + rhalf]);
+        q[base + i]         = __float2bfloat16(x0 * c - x1 * s);
+        q[base + i + rhalf] = __float2bfloat16(x1 * c + x0 * s);
+    } else if (gid < nq + nk) {
+        const int g = gid - nq, hh = g / rhalf, i = g - hh * rhalf;
+        const float freq = __powf(theta, -2.f * (float)i / (float)rotary_dim);
+        const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+        const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+        const float x0 = __bfloat162float(k[base + i]);
+        const float x1 = __bfloat162float(k[base + i + rhalf]);
+        k_pool[dst + i]         = __float2bfloat16(x0 * c - x1 * s);
+        k_pool[dst + i + rhalf] = __float2bfloat16(x1 * c + x0 * s);
+    } else if (gid < nq + nk + ktail) {
+        const int g = gid - nq - nk;
+        const int hh = g / (head_dim - rotary_dim);
+        const int d = rotary_dim + (g - hh * (head_dim - rotary_dim));
+        const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+        k_pool[dst + d] = k[base + d];
+    } else {
+        const int g = gid - nq - nk - ktail, hh = g / head_dim, d = g - hh * head_dim;
+        const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+        v_pool[dst + d] = v[base + d];
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/attention.h"
 #include <cstdlib>
@@ -135,6 +192,30 @@ void launch_rope_kv_append(void* q, const void* k, const void* v, void* k_pool, 
         reinterpret_cast<const __nv_bfloat16*>(v),
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
         block_table, positions, n_q_heads, n_kv_heads, head_dim, theta, block_size, max_blocks_per_seq);
+}
+
+void launch_rope_kv_append_partial(void* q, const void* k, const void* v, void* k_pool, void* v_pool,
+                                   const int* block_table, const int* positions,
+                                   int n_tokens, int n_q_heads, int n_kv_heads,
+                                   int head_dim, int rotary_dim, float theta,
+                                   int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+    if (rotary_dim <= 0 || rotary_dim >= head_dim) {
+        launch_rope_kv_append(q, k, v, k_pool, v_pool, block_table, positions,
+                              n_tokens, n_q_heads, n_kv_heads, head_dim, theta,
+                              block_size, max_blocks_per_seq, stream);
+        return;
+    }
+    const int rhalf = rotary_dim >> 1;
+    const int total = n_q_heads * rhalf + n_kv_heads * rhalf +
+                      n_kv_heads * (head_dim - rotary_dim) +
+                      n_kv_heads * head_dim;
+    dim3 grid((total + 255) / 256, n_tokens);
+    rope_kv_append_partial_kernel<<<grid, 256, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
+        block_size, max_blocks_per_seq);
 }
 
 void launch_rope(void* q, void* k, const int* positions,

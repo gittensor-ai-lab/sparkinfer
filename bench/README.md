@@ -21,6 +21,7 @@ Part of [gittensor-ai-lab](https://github.com/orgs/gittensor-ai-lab) — SN74.
 | Model | Quant | Size | Benchmark targets |
 |---|---|---|---|
 | Qwen3.5-35B-A3B | Q4_K_M | ~20 GB | 130 tok/s @ RTX 5090, bs=1, ctx=2K |
+| Qwen3.6-35B-A3B | Q4_K_M | ~35B / 3B active | RTX Spark hybrid-attention target; native sparkinfer decode gated until Gated DeltaNet support lands |
 | Gemma 4 26B-A4B | Q4_K_M | ~14.6 GB | 256K context on RTX 5090 without OOM |
 
 ---
@@ -40,10 +41,12 @@ benchmarks/
 configs/
 ├── models/
 │   ├── qwen35_35b_a3b.yaml       # arch spec, derived memory requirements
+│   ├── qwen36_35b_a3b.yaml       # hybrid Gated DeltaNet + full attention target
 │   └── gemma4_26b_a4b.yaml       # interleaved 5L:1G attention, hd256/hd512
 ├── targets/
 │   ├── qwen35_q4km_rtx5090.yaml  # baseline 80 tok/s, target 130 tok/s
 │   ├── qwen35_q4km_rtx_spark.yaml
+│   ├── qwen36_q4km_rtx_spark.yaml
 │   ├── gemma4_q4km_rtx5090.yaml  # 20.2 GB @ 256K ctx
 │   └── gemma4_q4km_rtx_spark.yaml
 ├── rtx5090.yaml                  # hardware spec: 32 GB, 1.79 TB/s, sm_120

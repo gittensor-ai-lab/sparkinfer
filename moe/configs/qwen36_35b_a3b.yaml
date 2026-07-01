@@ -1,0 +1,39 @@
+# MoE engine configuration for Qwen3.6-35B-A3B
+# Attention is hybrid Gated DeltaNet + full attention; this file only captures
+# the per-layer MoE shape used after both attention types.
+
+num_experts: 256
+top_k: 8
+shared_expert: true
+hidden_dim: 2048
+ffn_dim: 512
+num_layers: 40
+
+router:
+  type: softmax_top_k
+  normalize_weights: true
+  aux_loss_coeff: 0.001
+
+expert_cache:
+  # RTX Spark / GB10 class: all experts fit in unified memory. RTX 5090-class
+  # cards need quantized residency and careful eviction/prefetch.
+  strategy: lru
+  prefetch: true
+  async_prefetch_depth: 2
+
+gemm:
+  strategy: skinny_grouped
+  min_tokens_for_batching: 4
+  use_gemv_for_single_token: true
+
+architecture_notes:
+  text_layers: 40
+  linear_attention_layers: 30
+  full_attention_layers: 10
+  full_attention_interval: 4
+  full_attention_heads: 16
+  full_attention_kv_heads: 2
+  full_attention_head_dim: 256
+  linear_attention_qk_heads: 16
+  linear_attention_value_heads: 32
+  linear_attention_head_dim: 128

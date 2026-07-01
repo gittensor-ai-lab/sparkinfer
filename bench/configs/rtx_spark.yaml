@@ -45,6 +45,11 @@ model_targets:
   - name: Qwen3-8B
     params_b: 8
     type: dense
+  - name: Qwen3.6-35B-A3B
+    params_b: 35
+    type: moe
+    active_params_b: 3
+    attention: hybrid_gated_deltanet
   - name: DeepSeek-V3-lite (hypothetical)
     params_b: 37
     type: moe

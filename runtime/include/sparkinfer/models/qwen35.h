@@ -3,35 +3,17 @@
 #include <vector>
 #include <string>
 #include "sparkinfer/kv_cache.h"
+#include "sparkinfer/models/qwen_config.h"
 #include "sparkinfer/moe/engine.h"
 
 namespace sparkinfer {
 
 class ThermalGovernor;   // optional decode-time thermal pacing (thermal_governor.h)
 
-// Qwen3.5-35B-A3B architecture.
-//   40 layers, hidden 2048, 16 Q / 2 KV heads (8:1 GQA), head_dim 128,
-//   256 routed experts (top-8) + 1 shared expert, moe ffn 512,
-//   RoPE + per-head QK-norm, RMSNorm, SwiGLU.
-struct Qwen35Config {
-    int   vocab       = 151936;
-    int   hidden      = 2048;
-    int   n_layers    = 40;
-    int   n_q_heads   = 16;
-    int   n_kv_heads  = 2;
-    int   head_dim    = 128;
-    int   n_experts   = 256;
-    int   top_k       = 8;
-    int   n_shared    = 1;
-    int   moe_ffn     = 512;
-    float rope_theta  = 1000000.f;
-    float rms_eps     = 1e-6f;
-    int   max_seq     = 4096;   // KV-cache cap for a sequence
-    int   eos_id      = 151645;
-};
-
 // Device (bf16) weight pointers for one layer.
 struct Qwen35LayerWeights {
+    bool linear_attn = false;
+    bool q_has_gate = false;
     const void* input_norm   = nullptr;  // [hidden]
     const void* wq = nullptr;            // [hidden, n_q_heads*head_dim]
     const void* wk = nullptr;            // [hidden, n_kv_heads*head_dim]
@@ -47,6 +29,18 @@ struct Qwen35LayerWeights {
     const void* shared_gate = nullptr;   // [hidden, moe_ffn]
     const void* shared_up   = nullptr;   // [hidden, moe_ffn]
     const void* shared_down = nullptr;   // [moe_ffn, hidden]
+    const void* shared_gate_inp = nullptr;// [hidden] -> scalar shared-expert gate
+
+    // Qwen3.5/Qwen3.6 Gated DeltaNet tensors (linear-attention layers only).
+    const void* wqkv = nullptr;           // [hidden, q+k+v]
+    const void* wqkv_gate = nullptr;      // [hidden, value_dim]
+    const void* ssm_conv = nullptr;       // [conv_kernel, q+k+v]
+    const void* ssm_dt = nullptr;         // [value_heads]
+    const void* ssm_a = nullptr;          // [value_heads]
+    const void* ssm_beta = nullptr;       // [hidden, value_heads]
+    const void* ssm_alpha = nullptr;      // [hidden, value_heads]
+    const void* ssm_norm = nullptr;       // [linear_head_dim]
+    const void* ssm_out = nullptr;        // [value_dim, hidden]
 
     // GGUF path: experts kept quantized in VRAM (gguf-native [E,out,in] layout).
     // When gate_q != nullptr the model dequantizes these per-layer into scratch
@@ -56,6 +50,8 @@ struct Qwen35LayerWeights {
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
     // 14=Q6_K) -> weights kept quantized in VRAM, decoded on-read by launch_gemv_q.
     int wq_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;
+    int wqkv_type = 0, wqkv_gate_type = 0, ssm_beta_type = 0, ssm_alpha_type = 0, ssm_out_type = 0;
+    int shared_gate_inp_type = 0;
 };
 
 struct Qwen35Weights {
@@ -66,7 +62,7 @@ struct Qwen35Weights {
     std::vector<Qwen35LayerWeights> layers;
 };
 
-// Single-sequence (batch=1) greedy decoder for Qwen3.5. Owns scratch buffers and
+// Single-sequence (batch=1) greedy decoder for Qwen MoE. Owns scratch buffers and
 // drives embed -> N layers -> final norm -> LM head -> argmax per token.
 class Qwen35Model {
 public:
