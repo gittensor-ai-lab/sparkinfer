@@ -59,4 +59,8 @@ if(BUILD_EXAMPLES)
     target_link_libraries(qwen3_gguf_score PRIVATE sparkinfer_runtime CUDA::cudart)
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
+    add_executable(gemma4_gguf_bench examples/gemma4_gguf_bench.cpp)
+    target_link_libraries(gemma4_gguf_bench PRIVATE sparkinfer_runtime CUDA::cudart)
+    add_executable(gemma4_gguf_generate examples/gemma4_gguf_generate.cpp)
+    target_link_libraries(gemma4_gguf_generate PRIVATE sparkinfer_runtime CUDA::cudart)
 endif()
