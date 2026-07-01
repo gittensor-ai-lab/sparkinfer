@@ -25,6 +25,7 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <limits>
 
 namespace sparkinfer {
 
@@ -47,6 +48,37 @@ bool ggml_dequant_supported(int ggml_type) {
         default:
             return false;
     }
+}
+
+long qwen_moe_meta_int(const GGUF& g, const std::string& key, long def) {
+    const long missing = std::numeric_limits<long>::min();
+    long v = g.meta_int("qwen3moe." + key, missing);
+    if (v != missing) return v;
+    v = g.meta_int("qwen3_5_moe." + key, missing);
+    return v != missing ? v : def;
+}
+
+bool is_qwen35_or_qwen36_hybrid_moe(const GGUF& g) {
+    const std::string name = g.meta_str("general.name");
+    if (name.find("Qwen3.5-35B-A3B") != std::string::npos ||
+        name.find("Qwen3.6-35B-A3B") != std::string::npos)
+        return true;
+
+    const GGUFTensor* emb = g.tensor("token_embd.weight");
+    const long vocab = emb ? emb->dims[1] : qwen_moe_meta_int(g, "vocab_size", -1);
+    const bool hybrid_tensor_layout =
+        g.tensor("blk.0.attn_q.weight") == nullptr &&
+        g.tensor("blk.3.attn_q.weight") != nullptr;
+    return qwen_moe_meta_int(g, "block_count", -1) == 40 &&
+           qwen_moe_meta_int(g, "embedding_length", -1) == 2048 &&
+           qwen_moe_meta_int(g, "attention.head_count", -1) == 16 &&
+           qwen_moe_meta_int(g, "attention.head_count_kv", -1) == 2 &&
+           qwen_moe_meta_int(g, "attention.key_length", -1) == 256 &&
+           qwen_moe_meta_int(g, "expert_count", -1) == 256 &&
+           qwen_moe_meta_int(g, "expert_used_count", -1) == 8 &&
+           qwen_moe_meta_int(g, "expert_feed_forward_length", -1) == 512 &&
+           vocab == 248320 &&
+           hybrid_tensor_layout;
 }
 }
 
@@ -463,9 +495,18 @@ bool Qwen35Model::load_weights(const std::string& dir) {
 bool Qwen35Model::load_gguf(const std::string& path) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
-    s.gguf = true;   // dense weights kept native [out,in]; forward uses GEMV
     GGUF g;
     if (!g.open(path)) return false;
+    if (is_qwen35_or_qwen36_hybrid_moe(g)) {
+        fprintf(stderr,
+                "[qwen35] unsupported GGUF architecture: Qwen3.5/Qwen3.6 "
+                "35B-A3B uses a hybrid Gated DeltaNet + full-attention stack "
+                "(30 linear-attention layers, 10 full-attention layers, "
+                "head_dim=256). This runtime implements the older full-attention "
+                "Qwen3-MoE path only; refusing to mis-load it.\n");
+        return false;
+    }
+    s.gguf = true;   // dense weights kept native [out,in]; forward uses GEMV
 
     // Shared-expert tensors are optional in GGUF (Qwen3-30B-A3B has none). The
     // default config sets n_shared=1, so clamp it to what the file actually
