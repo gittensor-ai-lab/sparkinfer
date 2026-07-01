@@ -76,7 +76,10 @@ struct Qwen35Model::Impl {
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
     int   *mf_ids = nullptr, *mf_counts = nullptr;
     // flash-decoding (KV-split) attention partials
+    static constexpr int MAX_NSPLITS = 256;   // partials sized for this; adaptive n_splits <= this
     int n_splits = 32;
+    bool adaptive_splits = true;              // scale n_splits with seq_len (decode graph re-captured on change)
+    int split_chunk = 256;                    // target serial KV per split (SPARKINFER_SPLIT_CHUNK)
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
     signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
@@ -102,9 +105,11 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // 512 single-warp blocks); SPARKINFER_NSPLITS lets the scored regime be tuned/swept
     // without a rebuild. Clamp to [1, 64]; buffers below are sized from it.
     if (const char* ns = getenv("SPARKINFER_NSPLITS")) {
-        int v = atoi(ns); if (v < 1) v = 1; if (v > 64) v = 64; p_->n_splits = v;
-        fprintf(stderr, "[nsplits] flash-decode splits = %d (env override)\n", v);
+        int v = atoi(ns); if (v < 1) v = 1; if (v > Impl::MAX_NSPLITS) v = Impl::MAX_NSPLITS; p_->n_splits = v;
+        p_->adaptive_splits = false;   // fixed n_splits (A/B/sweeps)
+        fprintf(stderr, "[nsplits] flash-decode splits = %d (fixed env override)\n", v);
     }
+    if (const char* c = getenv("SPARKINFER_SPLIT_CHUNK")) { int v = atoi(c); if (v > 0) p_->split_chunk = v; }
     p_->qdim = cfg.n_q_heads * cfg.head_dim;
     p_->kvdim = cfg.n_kv_heads * cfg.head_dim;
     cudaStreamCreate(&p_->stream);
@@ -134,7 +139,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->mf_counts  = p_->alloc<int>(cfg.n_experts);
     p_->mf_h       = p_->alloc<float>((size_t)cfg.top_k * cfg.moe_ffn);
     p_->mf_out     = p_->alloc<float>(cfg.hidden);
-    const size_t fa_n = (size_t)cfg.n_q_heads * p_->n_splits;
+    const size_t fa_n = (size_t)cfg.n_q_heads * Impl::MAX_NSPLITS;   // sized for the adaptive max
     p_->fa_m   = p_->alloc<float>(fa_n);
     p_->fa_l   = p_->alloc<float>(fa_n);
     p_->fa_acc = p_->alloc<float>(fa_n * cfg.head_dim);
@@ -191,6 +196,23 @@ int Qwen35Model::forward_token(int token_id, int position) {
     cu(cudaMemcpyAsync(s.d_pos, &position, sizeof(int), cudaMemcpyHostToDevice, st), "pos");
     cu(cudaMemcpyAsync(s.d_writepos, &position, sizeof(int), cudaMemcpyHostToDevice, st), "wpos");
     cu(cudaMemcpyAsync(s.d_seqlen, &seqlen, sizeof(int), cudaMemcpyHostToDevice, st), "slen");
+
+    // Depth-adaptive KV-split: scale n_splits with seq_len so each split's SERIAL KV chunk stays
+    // bounded (~split_chunk). With a fixed n_splits the split kernel collapses at long context (at
+    // 32k each of 32 splits streams ~1024 KV serially on <=1024 blocks -> latency-bound, ~6x below
+    // roofline). Quantized to powers of two from 32, so the decode graph is re-captured only ~log2
+    // times over a generation. Off when SPARKINFER_NSPLITS pins a fixed value. Partials are sized for
+    // MAX_NSPLITS, and the online-softmax combine is exact for any split count (accuracy unchanged).
+    if (s.adaptive_splits) {
+        int want = 32;                                  // preserve the short-context sweet spot
+        while (want < Impl::MAX_NSPLITS && (long)want * s.split_chunk < seqlen) want <<= 1;
+        if (want != s.n_splits) {                       // changed -> invalidate the captured graph
+            s.n_splits = want;
+            if (s.graph_ready) {
+                cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false;
+            }
+        }
+    }
 
     // Capture the decode compute into a CUDA graph on the first token, then
     // replay it every token (per-token inputs live in the d_tok/pos/seqlen/
