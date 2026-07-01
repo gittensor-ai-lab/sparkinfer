@@ -92,6 +92,13 @@ __global__ void argmax_p2_kernel(int* __restrict__ out_id) {
     if (t == 0) out_id[0] = s_idx[0];
 }
 
+// Increment decode step counters on device (one block) after each graph replay.
+__global__ void decode_step_bump_kernel(int* pos, int* writepos, int* seqlen) {
+    if (threadIdx.x == 0) {
+        pos[0]++; writepos[0]++; seqlen[0]++;
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
 
@@ -109,6 +116,10 @@ void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab, cuda
     } else {
         argmax_kernel<<<n_rows, 1024, 0, stream>>>(logits, out_id, vocab);
     }
+}
+
+void launch_decode_step_bump(int* d_pos, int* d_writepos, int* d_seqlen, cudaStream_t stream) {
+    decode_step_bump_kernel<<<1, 1, 0, stream>>>(d_pos, d_writepos, d_seqlen);
 }
 #endif
 

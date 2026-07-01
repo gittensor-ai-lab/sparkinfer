@@ -90,6 +90,24 @@ struct Qwen35Model::Impl {
     bool use_fnq = true;   // default ON: post-MoE add_rmsnorm2 also emits Q8_1(xn), deleting the
                            // next layer's standalone QKV-input quantize node. =0 disables
 
+    void reset_decode_step(cudaStream_t st) {
+        int z = 0, one = 1;
+        cu(cudaMemcpyAsync(d_pos, &z, sizeof(int), cudaMemcpyHostToDevice, st), "pos reset");
+        cu(cudaMemcpyAsync(d_writepos, &z, sizeof(int), cudaMemcpyHostToDevice, st), "wpos reset");
+        cu(cudaMemcpyAsync(d_seqlen, &one, sizeof(int), cudaMemcpyHostToDevice, st), "slen reset");
+    }
+
+    void reset_decode_session(cudaStream_t st) {
+        if (graph_ready) {
+            cu(cudaGraphExecDestroy(cu_exec), "graph exec destroy");
+            cu(cudaGraphDestroy(cu_graph), "graph destroy");
+            graph_ready = false;
+            cu_graph = {};
+            cu_exec = {};
+        }
+        reset_decode_step(st);
+    }
+
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
 
@@ -179,7 +197,13 @@ void Qwen35Model::copy_logits(float* host_logits) const {
     cudaMemcpy(host_logits, p_->logits, (size_t)p_->cfg.vocab * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
+// prefill_only: teacher-forced prompt ingestion — skip LM head + argmax and never
+// touch the decode CUDA graph. The graph is captured on the first sampled step.
 int Qwen35Model::forward_token(int token_id, int position) {
+    return forward_token_impl(token_id, position, false);
+}
+
+int Qwen35Model::forward_token_impl(int token_id, int position, bool prefill_only) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
@@ -187,22 +211,23 @@ int Qwen35Model::forward_token(int token_id, int position) {
     int seqlen = position + 1;
     cudaStream_t st = s.stream;
 
-    cu(cudaMemcpyAsync(s.d_tok, &token_id, sizeof(int), cudaMemcpyHostToDevice, st), "tok");
-    cu(cudaMemcpyAsync(s.d_pos, &position, sizeof(int), cudaMemcpyHostToDevice, st), "pos");
-    cu(cudaMemcpyAsync(s.d_writepos, &position, sizeof(int), cudaMemcpyHostToDevice, st), "wpos");
-    cu(cudaMemcpyAsync(s.d_seqlen, &seqlen, sizeof(int), cudaMemcpyHostToDevice, st), "slen");
-
-    // Capture the decode compute into a CUDA graph on the first token, then
-    // replay it every token (per-token inputs live in the d_tok/pos/seqlen/
-    // writepos device buffers uploaded above, so replay produces fresh results).
-    if (s.graph_ready) {
+    // Graph replay: only the token id changes; pos/seqlen advance on-device (see bump below).
+    if (!prefill_only && s.graph_ready) {
+        cu(cudaMemcpyAsync(s.d_tok, &token_id, sizeof(int), cudaMemcpyHostToDevice, st), "tok");
         cu(cudaGraphLaunch(s.cu_exec, st), "graph launch");
         int out_id = 0;
         cu(cudaMemcpyAsync(&out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
         cu(cudaStreamSynchronize(st), "sync");
         return out_id;
     }
-    cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture");
+
+    cu(cudaMemcpyAsync(s.d_tok, &token_id, sizeof(int), cudaMemcpyHostToDevice, st), "tok");
+    cu(cudaMemcpyAsync(s.d_pos, &position, sizeof(int), cudaMemcpyHostToDevice, st), "pos");
+    cu(cudaMemcpyAsync(s.d_writepos, &position, sizeof(int), cudaMemcpyHostToDevice, st), "wpos");
+    cu(cudaMemcpyAsync(s.d_seqlen, &seqlen, sizeof(int), cudaMemcpyHostToDevice, st), "slen");
+
+    if (!prefill_only)
+        cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture");
 
     kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
 
@@ -341,6 +366,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
     }
     // xn now holds RMSNorm(x_final, final_norm)
+    if (prefill_only) {
+        cu(cudaStreamSynchronize(st), "sync prefill");
+        return -1;
+    }
     if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
         if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
         kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
@@ -349,6 +378,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
     else if (s.gguf)                kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
     else        kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
+    kernels::launch_decode_step_bump(s.d_pos, s.d_writepos, s.d_seqlen, st);
 
     cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
     cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
@@ -364,6 +394,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
 double Qwen35Model::bench_decode(int warmup, int n) {
     Impl& s = *p_;
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) { fprintf(stderr, "[bench] kv allocate failed\n"); return -1; }
+    s.reset_decode_session(s.stream);
     int pos = 0, tok = 100;
     for (int i = 0; i < warmup; i++) { tok = forward_token(tok, pos++); if (tok < 0 || tok >= s.cfg.vocab) tok = 100; }
     cudaDeviceSynchronize();
@@ -384,8 +415,11 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         fprintf(stderr, "[qwen35] KV allocate failed (pool too small for max_seq=%d)\n", s.cfg.max_seq);
         return out;
     }
-    int next = -1;
-    for (size_t i = 0; i < prompt.size(); i++) next = forward_token(prompt[i], (int)i);
+    s.reset_decode_session(s.stream);
+    // Teacher-forced prompt tokens only populate KV; skip the vocab-sized LM head.
+    for (size_t i = 0; i + 1 < prompt.size(); i++)
+        forward_token_impl(prompt[i], (int)i, true);
+    int next = forward_token_impl(prompt.back(), (int)prompt.size() - 1, false);
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);
         if (next == s.cfg.eos_id) break;
@@ -394,6 +428,26 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     }
     s.kv->free(s.seq_id);
     return out;
+}
+
+double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
+    Impl& s = *p_;
+    if (prompt.empty()) return -1.;
+    if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
+        fprintf(stderr, "[bench] kv allocate failed\n");
+        return -1.;
+    }
+    s.reset_decode_session(s.stream);
+    cudaDeviceSynchronize();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i + 1 < prompt.size(); i++)
+        forward_token_impl(prompt[i], (int)i, true);
+    forward_token_impl(prompt.back(), (int)prompt.size() - 1, false);
+    cudaDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    s.kv->free(s.seq_id);
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    return ms;
 }
 
 // ----- weight loading from a sparkinfer weight directory -----

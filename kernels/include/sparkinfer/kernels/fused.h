@@ -39,4 +39,9 @@ void launch_embedding(const int* ids, const void* table, void* out,
 void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab,
                    cudaStream_t stream = nullptr);
 
+// After a captured decode step: pos++, writepos++, seqlen++ (CUDA-graph safe).
+// Lets graph replay upload only the next token id instead of four int buffers.
+void launch_decode_step_bump(int* d_pos, int* d_writepos, int* d_seqlen,
+                             cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels
