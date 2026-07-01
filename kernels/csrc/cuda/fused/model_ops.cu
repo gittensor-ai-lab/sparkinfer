@@ -92,6 +92,14 @@ __global__ void argmax_p2_kernel(int* __restrict__ out_id) {
     if (t == 0) out_id[0] = s_idx[0];
 }
 
+__global__ void decode_feedback_kernel(int* __restrict__ scalars,
+                                       const int* __restrict__ out_id) {
+    scalars[0] = out_id[0];
+    scalars[1] += 1;
+    scalars[2] += 1;
+    scalars[3] += 1;
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
 
@@ -109,6 +117,10 @@ void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab, cuda
     } else {
         argmax_kernel<<<n_rows, 1024, 0, stream>>>(logits, out_id, vocab);
     }
+}
+
+void launch_decode_feedback(int* scalars, const int* out_id, cudaStream_t stream) {
+    decode_feedback_kernel<<<1, 1, 0, stream>>>(scalars, out_id);
 }
 #endif
 

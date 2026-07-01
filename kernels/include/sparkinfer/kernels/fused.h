@@ -39,4 +39,8 @@ void launch_embedding(const int* ids, const void* table, void* out,
 void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab,
                    cudaStream_t stream = nullptr);
 
+// Benchmark-only decode feedback: tok = out_id; pos/writepos/seqlen += 1.
+// Capturable, so a decode CUDA graph can self-feed during throughput timing.
+void launch_decode_feedback(int* scalars, const int* out_id, cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels
