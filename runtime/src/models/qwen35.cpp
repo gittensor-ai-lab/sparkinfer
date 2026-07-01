@@ -90,6 +90,7 @@ struct Qwen35Model::Impl {
     bool use_qkvstream = true; // default ON: run Q/K/V projections on concurrent streams. =0 disables
     bool use_qkfuse = true;// default ON: fused per-head Q-norm + K-norm (1 kernel). =0 disables
     bool use_ropekv = true;// default ON: fused RoPE + KV-append (1 kernel vs 2). =0 disables
+    bool use_attnin = true;// default ON: single fused QK-norm+RoPE+KV-append (1 kernel vs qkfuse+ropekv=2). =0 disables
     bool use_fnq = true;   // default ON: post-MoE add_rmsnorm2 also emits Q8_1(xn), deleting the
                            // next layer's standalone QKV-input quantize node. =0 disables
 
@@ -155,6 +156,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_ROPEKV")) p_->use_ropekv = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_FNQ"))    p_->use_fnq   = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_QKVSTREAM")) p_->use_qkvstream = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_ATTNIN")) p_->use_attnin = !(e[0] == '0');
 }
 
 Qwen35Model::~Qwen35Model() {
@@ -286,14 +288,20 @@ int Qwen35Model::forward_token(int token_id, int position) {
             kernels::launch_gemm(s.xn, w.wk, s.k, 1, s.kvdim, H, 1.f, 0.f, gc, st);
             kernels::launch_gemm(s.xn, w.wv, s.v, 1, s.kvdim, H, 1.f, 0.f, gc, st);
         }
+        bf16* kpool = (bf16*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems();
+        bf16* vpool = (bf16*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems();
+        if (s.use_attnin) {   // fused QK-norm + RoPE + KV-append: 1 node vs qk-norm + rope-kv (2)
+            kernels::launch_qknorm_rope_kv_append(s.q, s.k, s.v, w.q_norm, w.k_norm, kpool, vpool,
+                                                  btable, s.d_pos, 1, c.n_q_heads, c.n_kv_heads,
+                                                  c.head_dim, c.rope_theta, c.rms_eps,
+                                                  s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+        } else {
         if (s.use_qkfuse)
             kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
         else {
             kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
             kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
         }
-        bf16* kpool = (bf16*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems();
-        bf16* vpool = (bf16*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems();
         if (s.use_ropekv) {   // fused rope(Q in place) + rope(K)->cache + V->cache (1 node vs 2)
             kernels::launch_rope_kv_append(s.q, s.k, s.v, kpool, vpool, btable, s.d_pos, 1,
                                            c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
@@ -303,13 +311,18 @@ int Qwen35Model::forward_token(int token_id, int position) {
             launch_kv_append(kpool, vpool, s.k, s.v, btable, s.d_writepos, 1,
                              c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
         }
+        }
+        // When the O-projection takes the Q4_K int8 MMVQ path, let the flash-decode combine emit
+        // Q8_1(attn) straight into aq81 (deleting the standalone attn-quantize node below).
+        const bool emit_attn_q8 = s.use_attnin && s.gguf && s.use_pq && s.use_llama && w.wo_type == 12;
         kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,
                                            s.fa_m, s.fa_l, s.fa_acc, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
                                            s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
-                                           1.f / sqrtf((float)c.head_dim), st);
+                                           1.f / sqrtf((float)c.head_dim), st,
+                                           emit_attn_q8 ? s.aq81 : nullptr);
         if (s.gguf && s.use_pq && w.wo_type == 12) {   // O proj reads attn: quantize once + dp4a
             if (s.use_llama) {
-                kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
+                if (!emit_attn_q8) kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
                 kernels::launch_mmvq_q4k(s.aq81, w.wo, s.ao, H, s.qdim, st);
             } else {
                 kernels::launch_quantize_q8_1(s.attn, s.aq8, s.aq8_d, s.aq8_s, s.qdim, st);
