@@ -427,32 +427,41 @@ __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4, const
 __global__ void gate_up_mmvq2_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
-    float* __restrict__ h_scratch, int H, int F, int top_k
+    float* __restrict__ h_scratch, int H, int F, int top_k, int n_rows
 ) {
     si_pdl_lc();
-    constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
-    const int row = blockIdx.x, ts = row / F, f = row % F, tok = ts / top_k;
-    const int e = expert_ids[ts];
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
-    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
-    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
-    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
-    const int blocks_per_row = H >> 8, blocks_per_iter = vdr * NW * WS / qi;   // = 8
+    constexpr int NW = 4, WS = 32, vdr = 2, qi = 32, RPB = 8;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / NW, wloc = warp % NW;
+    const int tid_row = row_local * (NW * WS) + wloc * WS + lane;
+    const int row = blockIdx.x * RPB + row_local;
+    const bool active = row < n_rows;
     float tg = 0.f, tu = 0.f;
-    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
-        const int kby = kbx * 8, kqs = vdr * (tid % (qi / vdr));
-        tg += si_vec_dot_q4_K(g_row + kbx, vrow + kby, kqs);
-        tu += si_vec_dot_q4_K(u_row + kbx, vrow + kby, kqs);
+    if (active) {
+        const int ts = row / F, f = row % F, tok = ts / top_k;
+        const int e = expert_ids[ts];
+        const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+        const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
+        const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
+        const int blocks_per_row = H >> 8, blocks_per_iter = vdr * NW * WS / qi;
+        for (int kbx = tid_row / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+            const int kby = kbx * 8, kqs = vdr * (tid_row % (qi / vdr));
+            tg += si_vec_dot_q4_K(g_row + kbx, vrow + kby, kqs);
+            tu += si_vec_dot_q4_K(u_row + kbx, vrow + kby, kqs);
+        }
     }
-    __shared__ float sg[NW - 1][WS], su[NW - 1][WS];
-    if (warp > 0) { sg[warp - 1][lane] = tg; su[warp - 1][lane] = tu; }
+    __shared__ float sg[RPB][NW - 1][WS], su[RPB][NW - 1][WS];
+    if (active && wloc > 0) { sg[row_local][wloc - 1][lane] = tg; su[row_local][wloc - 1][lane] = tu; }
     __syncthreads();
-    if (warp > 0) return;
+    if (!active || wloc > 0) return;
     #pragma unroll
-    for (int l = 0; l < NW - 1; l++) { tg += sg[l][lane]; tu += su[l][lane]; }
+    for (int l = 0; l < NW - 1; l++) { tg += sg[row_local][l][lane]; tu += su[row_local][l][lane]; }
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
-    if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    if (lane == 0) {
+        const int ts = row / F, f = row % F;
+        h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    }
 }
 
 // int8 dp4a MMVQ down (Q4_K). The Q4_K-quantized down rows in Q4_K_M were the last MoE GEMV
@@ -649,9 +658,11 @@ void launch_moe_expert_ffn_q4k(
                 reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
             q = qbuf;
         }
-        gate_up_mmvq2_kernel<<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
+        constexpr int GU_RPB = 8;
+        const int n_gu_rows = num_tokens * top_k * ffn;
+        gate_up_mmvq2_kernel<<<(n_gu_rows + GU_RPB - 1) / GU_RPB, GU_RPB * 4 * 32, 0, stream>>>(
             q, reinterpret_cast<const unsigned char*>(gate_q),
-            reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hidden, ffn, top_k);
+            reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hidden, ffn, top_k, n_gu_rows);
     } else if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
         size_t sm = 2 * (size_t)(hidden >> 5) * sizeof(float) + (size_t)hidden;  // s_xd+s_xs+s_xq8
         gate_up_q4k_mmvq_kernel<<<gu, WPB * 32, sm, stream>>>(
