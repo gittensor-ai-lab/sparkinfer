@@ -140,6 +140,9 @@ __global__ void fa_combine_kernel(
 template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int);
+template __global__ void fa_split_kernel<256>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
+template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int);
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/attention.h"
@@ -152,14 +155,22 @@ void launch_flash_decode_split(
     int block_size, int max_blocks, int n_splits, float scale, cudaStream_t stream
 ) {
     dim3 g1(num_q_heads * n_splits, num_seqs);
-    fa_split_kernel<128><<<g1, 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
-        reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, seq_lens,
-        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
     dim3 g2(num_q_heads * FA_COMBINE_DG, num_seqs);
-    fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW><<<g2, FA_COMBINE_NW * 32, 0, stream>>>(
-        part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits);
-    (void)head_dim;
+    if (head_dim == 256) {
+        fa_split_kernel<256><<<g1, 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
+            reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, seq_lens,
+            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
+        fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW><<<g2, FA_COMBINE_NW * 32, 0, stream>>>(
+            part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits);
+    } else {
+        fa_split_kernel<128><<<g1, 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
+            reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, seq_lens,
+            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
+        fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW><<<g2, FA_COMBINE_NW * 32, 0, stream>>>(
+            part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits);
+    }
 }
 #endif
 

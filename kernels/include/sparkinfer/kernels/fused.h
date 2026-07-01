@@ -39,4 +39,30 @@ void launch_embedding(const int* ids, const void* table, void* out,
 void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab,
                    cudaStream_t stream = nullptr);
 
+// Qwen3.5/Qwen3.6 hybrid Gated DeltaNet helpers.
+void launch_qwen36_split_q_gate(const void* qg_bf16, void* q_bf16, void* gate_bf16,
+                                int n_heads, int head_dim, cudaStream_t stream = nullptr);
+
+void launch_qwen36_mul_sigmoid(void* x_bf16, const void* gate_bf16, int n,
+                               cudaStream_t stream = nullptr);
+
+void launch_qwen36_sigmoid_scalar(const void* x_bf16, float* out_f32,
+                                  cudaStream_t stream = nullptr);
+
+void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
+                                 void* conv_state_bf16, void* q_bf16, void* k_bf16,
+                                 void* v_bf16, int q_heads, int v_heads, int head_dim,
+                                 int conv_kernel, float eps, cudaStream_t stream = nullptr);
+
+void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
+                          const void* alpha_bf16, const void* beta_bf16,
+                          const void* dt_bf16, const void* a_bf16,
+                          float* state_f32, void* out_bf16,
+                          int q_heads, int v_heads, int head_dim, cudaStream_t stream = nullptr);
+
+void launch_qwen36_gated_norm(const void* x_bf16, const void* z_bf16,
+                              const void* weight_bf16, void* out_bf16,
+                              int v_heads, int head_dim, float eps,
+                              cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

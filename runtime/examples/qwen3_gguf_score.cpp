@@ -12,6 +12,7 @@
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
+#include "qwen3_gguf_config.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -34,23 +35,8 @@ int main(int argc, char** argv) {
 
     sparkinfer::GGUF g;
     if (!g.open(path)) { printf("[FAIL] cannot open %s\n", path.c_str()); return 1; }
-    const char* A = "qwen3moe.";
-    auto mi = [&](const std::string& k, long d){ return g.meta_int(A + k, d); };
     sparkinfer::Qwen35Config cfg;
-    cfg.n_layers   = (int)mi("block_count", 48);
-    cfg.hidden     = (int)mi("embedding_length", 2048);
-    cfg.n_q_heads  = (int)mi("attention.head_count", 32);
-    cfg.n_kv_heads = (int)mi("attention.head_count_kv", 4);
-    cfg.head_dim   = (int)mi("attention.key_length", 128);
-    cfg.n_experts  = (int)mi("expert_count", 128);
-    cfg.top_k      = (int)mi("expert_used_count", 8);
-    cfg.moe_ffn    = (int)mi("expert_feed_forward_length", 768);
-    cfg.rope_theta = (float)g.meta_float(std::string(A) + "rope.freq_base", 1e6);
-    cfg.rms_eps    = (float)g.meta_float(std::string(A) + "attention.layer_norm_rms_epsilon", 1e-6);
-    cfg.eos_id     = (int)g.meta_int("tokenizer.ggml.eos_token_id", 151645);
-    cfg.n_shared   = 0;
-    const sparkinfer::GGUFTensor* emb = g.tensor("token_embd.weight");
-    cfg.vocab      = emb ? (int)emb->dims[1] : 151936;
+    qwen3_config_from_gguf(g, cfg);
     cfg.max_seq    = 2048;
 
     auto rt = sparkinfer::Runtime::create({}); rt->initialize();

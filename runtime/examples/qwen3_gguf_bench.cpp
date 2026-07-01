@@ -11,6 +11,7 @@
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
+#include "qwen3_gguf_config.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -34,16 +35,7 @@ int main(int argc, char** argv) {
     sparkinfer::Qwen35Config cfg;
     if (gguf_mode) {
         sparkinfer::GGUF g; if (!g.open(path)) { printf("[FAIL] open gguf\n"); return 1; }
-        const char* A = "qwen3moe.";
-        auto mi = [&](const std::string& k, long d){ return (int)g.meta_int(A + k, d); };
-        cfg.n_layers=mi("block_count",48); cfg.hidden=mi("embedding_length",2048);
-        cfg.n_q_heads=mi("attention.head_count",32); cfg.n_kv_heads=mi("attention.head_count_kv",4);
-        cfg.head_dim=mi("attention.key_length",128); cfg.n_experts=mi("expert_count",128);
-        cfg.top_k=mi("expert_used_count",8); cfg.moe_ffn=mi("expert_feed_forward_length",768);
-        cfg.rope_theta=(float)g.meta_float(std::string(A)+"rope.freq_base",1e6);
-        cfg.rms_eps=(float)g.meta_float(std::string(A)+"attention.layer_norm_rms_epsilon",1e-6);
-        cfg.n_shared=0; const sparkinfer::GGUFTensor* e=g.tensor("token_embd.weight");
-        cfg.vocab = e ? (int)e->dims[1] : 151936;
+        qwen3_config_from_gguf(g, cfg);
     } else {
         std::ifstream f(path + "/config.txt"); std::string line;
         std::unordered_map<std::string,std::string> m;
@@ -75,7 +67,8 @@ int main(int argc, char** argv) {
     double toks = model.bench_decode(8, n_tokens);
     auto gpu = sparkinfer::query_gpu_stats();   // sampled right after the decode loop — near peak heat
     printf("\n=== sparkinfer bench (%s) ===\n", gguf_mode ? "Q4_K_M native" : "bf16");
-    printf("model        : Qwen3-30B-A3B  (%d layers, %d experts top-%d)\n", cfg.n_layers, cfg.n_experts, cfg.top_k);
+    printf("model        : %s  (%d layers, %d experts top-%d)\n",
+           qwen3_model_label(cfg), cfg.n_layers, cfg.n_experts, cfg.top_k);
     printf("VRAM used    : %.1f GB\n", (totb - freeb) / 1e9);
     printf("decode tg    : %.2f tok/s  (%.1f ms/token, n=%d, bs=1)\n", toks, 1000.0 / toks, n_tokens);
     if (gpu.valid && gpu.temp_c >= 0) {
