@@ -84,6 +84,92 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 121,
+      "title": "perf: optimize qwen decode kernels",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 467.8,
+      "delta_pct": 1.3,
+      "top1": 0.9771,
+      "kl": 0.0128,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/121",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0121-cebd768"
+    },
+    {
+      "num": 120,
+      "title": "perf: batch-8 MMVQ launch reduction + quant_h→down PDL overlap",
+      "areas": [
+        "kernels"
+      ],
+      "label": "REJECT",
+      "tps": 491.73,
+      "delta_pct": null,
+      "top1": 0.0,
+      "kl": 18.1017,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/120",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0120-391d961"
+    },
+    {
+      "num": 119,
+      "title": "perf: batch-8 MMVQ rows per CTA — MoE gate/up + attn Q/K/V/O",
+      "areas": [
+        "kernels"
+      ],
+      "label": "REJECT",
+      "tps": 492.8,
+      "delta_pct": null,
+      "top1": 0.0,
+      "kl": 18.8005,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/119",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0119-be85922"
+    },
+    {
+      "num": 117,
+      "title": "perf(moe): batch 8 gate/up MMVQ rows per CTA — fewer decode graph nodes",
+      "areas": [
+        "kernels"
+      ],
+      "label": "REJECT",
+      "tps": 475.07,
+      "delta_pct": null,
+      "top1": 0.0177,
+      "kl": 13.9592,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/117",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0117-2c0848b"
+    },
+    {
+      "num": 116,
+      "title": "perf(moe): PDL overlap on gate_up -> quant_h -> down MMVQ chain",
+      "areas": [
+        "kernels"
+      ],
+      "label": "none",
+      "tps": 464.51,
+      "delta_pct": 0.6,
+      "top1": 0.978,
+      "kl": 0.0055,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/116",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0116-dbcb3bb"
+    },
+    {
+      "num": 91,
+      "title": "feat(moe): LRU expert cache + async layer-ahead prefetch",
+      "areas": [
+        "moe",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 0,
+      "delta_pct": null,
+      "top1": 0,
+      "kl": 99,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/91",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0091-cf9803d"
+    },
+    {
       "num": 114,
       "title": "perf(runtime): context-adaptive flash-decode split count",
       "areas": [
@@ -617,50 +703,6 @@ window.SPARKINFER = {
       "tps": 184.58,
       "delta_pct": null,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/11"
-    },
-    {
-      "num": 12,
-      "title": "fix(runtime): make GGUF load safe when shared-expert tensors are absent",
-      "areas": [
-        "runtime"
-      ],
-      "label": "none",
-      "tps": 184.61,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/12"
-    },
-    {
-      "num": 13,
-      "title": "fix(runtime/gguf): reject tensor n_dims > 4 instead of overflowing dims[4]",
-      "areas": [
-        "runtime"
-      ],
-      "label": "none",
-      "tps": 184.61,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/13"
-    },
-    {
-      "num": 14,
-      "title": "fix(kernels/attention): offset flash_prefill causal mask by seqlen_kv - seqlen_q",
-      "areas": [
-        "kernels"
-      ],
-      "label": "none",
-      "tps": 184.71,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/14"
-    },
-    {
-      "num": 8,
-      "title": "moe: PDL on the decode gate_up->down pair (gated SPARKINFER_PDL) [POC]",
-      "areas": [
-        "kernels"
-      ],
-      "label": "L",
-      "tps": 187.61,
-      "delta_pct": 14.5,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/8"
     }
   ],
   "landed": [
