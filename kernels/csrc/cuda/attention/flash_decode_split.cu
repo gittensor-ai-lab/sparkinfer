@@ -127,12 +127,16 @@ __global__ void fa_split_gqa_kernel(
             s_rowbase[threadIdx.x] = ((size_t)(phys * block_size + wb) * num_kv_heads + kvh) * HEAD_DIM;
         }
         __syncthreads();
-        // Vectorized load: uint4 (8×bf16) via __ldg into bf16 smem.
-        for (int i = threadIdx.x * 8; i < valid * HEAD_DIM; i += blockDim.x * 8) {
-            const int within = i / HEAD_DIM, d = i % HEAD_DIM;
+        // Vectorized load: 128-bit (uint4 = 8 bf16) global loads + smem stores.
+        // Bit-identical (same bf16 data). Aligned: s_rowbase is a multiple of HEAD_DIM(128)
+        // elems and the smem base is 16-byte aligned; d steps by 8 elems (16 bytes).
+        constexpr int V4 = HEAD_DIM / 8;   // uint4s (8 bf16) per head-dim row
+        for (int i = threadIdx.x; i < valid * V4; i += blockDim.x) {
+            const int within = i / V4, d = (i % V4) * 8;
             const size_t base = s_rowbase[within] + d;
-            *reinterpret_cast<uint4*>(s_k + i) = __ldg(reinterpret_cast<const uint4*>(k_pool + base));
-            *reinterpret_cast<uint4*>(s_v + i) = __ldg(reinterpret_cast<const uint4*>(v_pool + base));
+            const int soff = within * HEAD_DIM + d;
+            *reinterpret_cast<uint4*>(&s_k[soff]) = *reinterpret_cast<const uint4*>(k_pool + base);
+            *reinterpret_cast<uint4*>(&s_v[soff]) = *reinterpret_cast<const uint4*>(v_pool + base);
         }
         __syncthreads();
         for (int tt = 0; tt < valid; tt++) {
