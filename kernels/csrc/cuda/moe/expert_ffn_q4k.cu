@@ -519,6 +519,40 @@ __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
 }
 
+template <int H, int F, int TOPK>
+__global__ void gate_up_mmvq2_pack2_qwen_2d_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch
+) {
+    si_pdl_lc();
+    constexpr int NW = 4, WS = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int group = warp >> 2, group_warp = warp & 3;
+    const int ts = blockIdx.y;
+    const int f = blockIdx.x * 2 + group;
+    if (f >= F) return;
+    const int tok = ts / TOPK;
+    const int e = expert_ids[ts];
+    const int tid4 = group_warp * WS + lane;
+    const int kbx = tid4 >> 4;
+    const int kqs = 2 * (tid4 & 15);
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
+    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
+    float tg = si_vec_dot_q4_K(g_row + kbx, vrow + (size_t)kbx * 8, kqs);
+    float tu = si_vec_dot_q4_K(u_row + kbx, vrow + (size_t)kbx * 8, kqs);
+    __shared__ float sg[2][NW - 1][WS], su[2][NW - 1][WS];
+    if (group_warp > 0) { sg[group][group_warp - 1][lane] = tg; su[group][group_warp - 1][lane] = tu; }
+    __syncthreads();
+    if (group_warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) { tg += sg[group][l][lane]; tu += su[group][l][lane]; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+    if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+}
+
 // int8 dp4a MMVQ down (Q4_K). The Q4_K-quantized down rows in Q4_K_M were the last MoE GEMV
 // still on the fp register-dequant path (Q6_K down + gate/up + attention already run int8).
 // Reuses the Q8_1-quantized activation and the faithful vec_dot_q4_K_q8_1, one warp per
@@ -870,9 +904,9 @@ void launch_moe_expert_ffn_q4k(
             q = qbuf;
         }
         if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
-            gate_up_mmvq2_pack2_qwen_kernel<2048, 768, 8><<<(num_tokens * top_k * ffn + 1) / 2, 8 * 32, 0, stream>>>(
+            gate_up_mmvq2_pack2_qwen_2d_kernel<2048, 768, 8><<<dim3((ffn + 1) / 2, num_tokens * top_k), 8 * 32, 0, stream>>>(
                 q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, num_tokens * top_k * ffn);
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch);
         else if (gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
             gate_up_mmvq2_qwen_kernel<2048, 768, 8><<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
                 q, reinterpret_cast<const unsigned char*>(gate_q),

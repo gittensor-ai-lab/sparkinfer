@@ -66,6 +66,7 @@ struct Qwen35Model::Impl {
     cudaGraphExec_t cu_exec{};
     bool graph_ready = false;
     bool bench_feedback_graph = false;
+    int graph_kv_contiguous_base = -2;
 
     // scratch (bf16)
     bf16 *x, *xn, *q, *k, *v, *attn, *ao, *h, *hn, *routed, *shared;
@@ -221,8 +222,15 @@ int Qwen35Model::forward_token(int token_id, int position) {
             s.n_splits = want;
             if (s.graph_ready) {
                 cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false;
+                s.graph_kv_contiguous_base = -2;
             }
         }
+    }
+
+    const int kv_contiguous_base = s.kv->contiguous_block_base(s.seq_id);
+    if (s.graph_ready && s.graph_kv_contiguous_base != kv_contiguous_base) {
+        cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false;
+        s.graph_kv_contiguous_base = -2;
     }
 
     // Capture the decode compute into a CUDA graph on the first token, then
@@ -327,7 +335,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                            s.fa_m, s.fa_l, s.fa_acc, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
                                            s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
                                            1.f / sqrtf((float)c.head_dim), st,
-                                           emit_attn_q8 ? s.aq81 : nullptr);
+                                           emit_attn_q8 ? s.aq81 : nullptr, kv_contiguous_base);
         if (s.gguf && s.use_pq && w.wo_type == 12) {   // O proj reads attn: quantize once + dp4a
             if (s.use_llama) {
                 if (!emit_attn_q8) kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
@@ -397,6 +405,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
     cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
     cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
     s.graph_ready = true;
+    s.graph_kv_contiguous_base = kv_contiguous_base;
     cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
 
     cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");

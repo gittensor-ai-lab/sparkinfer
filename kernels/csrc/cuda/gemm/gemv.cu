@@ -518,6 +518,37 @@ __global__ void si_mmvq_q6k_kernel(const si_block_q8_1* __restrict__ vy, const u
 template __global__ void si_mmvq_q6k_kernel<__nv_bfloat16>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
 template __global__ void si_mmvq_q6k_kernel<float>(const si_block_q8_1*, const unsigned char*, float*, int, int);
 
+template <typename OutT, int NSUPER>
+__global__ void si_mmvq_q6k_kfixed_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
+                                          OutT* __restrict__ y, int N) {
+    constexpr int NW = 4, WS = 32, vdr = 1, qi = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const unsigned char* x_row = W + (size_t)row * NSUPER * 210;    // Q6_K: 210 B / 256-superblock
+    const int blocks_per_iter = vdr * NW * WS / qi;                 // = 4
+    float tmp = 0.0f;
+    #pragma unroll
+    for (int kbx = tid / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
+        const int kby = kbx * 8;                                    // q8_1 blocks per superblock
+        const int kqs = vdr * (tid % (qi / vdr));                   // = lane
+        tmp += si_vec_dot_q6_K(x_row + (size_t)kbx * 210, vy + kby, kqs);
+    }
+    __shared__ float tmp_shared[NW - 1][WS];
+    if (warp > 0) tmp_shared[warp - 1][lane] = tmp;
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) tmp += tmp_shared[l][lane];
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, m);
+    if (lane == 0) gemv_write(y + row, tmp);
+}
+
+template __global__ void si_mmvq_q6k_kfixed_kernel<__nv_bfloat16, 8>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
+template __global__ void si_mmvq_q6k_kfixed_kernel<__nv_bfloat16, 16>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
+template __global__ void si_mmvq_q6k_kfixed_kernel<float, 8>(const si_block_q8_1*, const unsigned char*, float*, int);
+template __global__ void si_mmvq_q6k_kfixed_kernel<float, 16>(const si_block_q8_1*, const unsigned char*, float*, int);
+
 // 1-warp-per-row Q6_K dp4a GEMV: keeps the fp32 gemv_q block structure (GEMV_WPB rows/block,
 // well-occupied for large N like the LM head's 151936 rows) but dp4a instead of fp32 dequant.
 // The 4-warp si_mmvq is right for small-N rows (attn-V); this is right for the huge LM head.
@@ -690,13 +721,19 @@ void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K,
     else                si_mmvq_q4k_kernel<float><<<N, 4 * 32, 0, stream>>>(q, w, y, N, K);
 }
 void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream) {
-    si_mmvq_q6k_kernel<__nv_bfloat16><<<N, 4 * 32, 0, stream>>>(
-        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
-        reinterpret_cast<__nv_bfloat16*>(y), N, K);
+    const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const unsigned char* w = reinterpret_cast<const unsigned char*>(W);
+    __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(y);
+    if (K == 2048)      si_mmvq_q6k_kfixed_kernel<__nv_bfloat16, 8><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
+    else if (K == 4096) si_mmvq_q6k_kfixed_kernel<__nv_bfloat16, 16><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
+    else                si_mmvq_q6k_kernel<__nv_bfloat16><<<N, 4 * 32, 0, stream>>>(q, w, out, N, K);
 }
 void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
-    si_mmvq_q6k_kernel<float><<<N, 4 * 32, 0, stream>>>(
-        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
+    const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const unsigned char* w = reinterpret_cast<const unsigned char*>(W);
+    if (K == 2048)      si_mmvq_q6k_kfixed_kernel<float, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
+    else if (K == 4096) si_mmvq_q6k_kfixed_kernel<float, 16><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
+    else                si_mmvq_q6k_kernel<float><<<N, 4 * 32, 0, stream>>>(q, w, y, N, K);
 }
 void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
     static int wpb = -1;
