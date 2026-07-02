@@ -215,7 +215,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
     // MAX_NSPLITS, and the online-softmax combine is exact for any split count (accuracy unchanged).
     if (s.adaptive_splits) {
         int want = 32;                                  // preserve the short-context sweet spot
-        while (want < Impl::MAX_NSPLITS && (long)want * s.split_chunk < seqlen) want <<= 1;
+        const int target_chunk = (seqlen > 8192 && s.split_chunk > 1) ? (s.split_chunk >> 1) : s.split_chunk;
+        while (want < Impl::MAX_NSPLITS && (long)want * target_chunk < seqlen) want <<= 1;
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
             if (s.graph_ready) {
