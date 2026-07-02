@@ -22,7 +22,7 @@ window.SPARKINFER = {
       "label": "512",
       "color": "#7B5DFF",
       "tokens": 128,
-      "sparkinfer_tps": 402.39,
+      "sparkinfer_tps": 411.06,
       "llamacpp_note": "pending llama-batched-bench decode-at-context remeasure"
     },
     {
@@ -30,7 +30,7 @@ window.SPARKINFER = {
       "label": "4k",
       "color": "#0E8A16",
       "tokens": 128,
-      "sparkinfer_tps": 193.83,
+      "sparkinfer_tps": 196.87,
       "llamacpp_note": "pending llama-batched-bench decode-at-context remeasure"
     },
     {
@@ -38,7 +38,7 @@ window.SPARKINFER = {
       "label": "16k",
       "color": "#B8860B",
       "tokens": 128,
-      "sparkinfer_tps": 167.89,
+      "sparkinfer_tps": 248.64,
       "llamacpp_note": "pending llama-batched-bench decode-at-context remeasure"
     }
   ],
