@@ -233,7 +233,7 @@ __global__ void fa_combine_kernel(
 #define FA_COMBINE_NW 4     // warps/block folding the split stripes; sweepable
 #endif
 #ifndef FA_GQA_TILE
-#define FA_GQA_TILE 16      // KV tokens staged per shared-memory tile; sweepable
+#define FA_GQA_TILE 8       // KV tokens staged per shared-memory tile; sweepable
 #endif
 template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
