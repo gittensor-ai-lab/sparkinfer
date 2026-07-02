@@ -52,6 +52,10 @@ int main(int argc, char** argv) {
     const sparkinfer::GGUFTensor* emb = g.tensor("token_embd.weight");
     cfg.vocab      = emb ? (int)emb->dims[1] : 151936;
     cfg.max_seq    = 2048;
+    if (const char* e = getenv("SPARKINFER_SCORE_MAX_SEQ")) {
+        int v = atoi(e);
+        if (v > cfg.max_seq) cfg.max_seq = v;
+    }
 
     auto rt = sparkinfer::Runtime::create({}); rt->initialize();
     sparkinfer::KVCacheConfig kvc;

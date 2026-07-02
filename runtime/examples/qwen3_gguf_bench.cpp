@@ -58,6 +58,10 @@ int main(int argc, char** argv) {
         cfg.moe_ffn=gi("moe_ffn",768); cfg.rope_theta=gf("rope_theta",1e6f); cfg.rms_eps=gf("rms_eps",1e-6f);
     }
     cfg.max_seq = std::max(2048, context_tokens + n_tokens + 16);
+    if (const char* e = getenv("SPARKINFER_BENCH_MAX_SEQ")) {
+        int v = atoi(e);
+        if (v > cfg.max_seq) cfg.max_seq = v;
+    }
 
     auto rt = sparkinfer::Runtime::create({}); rt->initialize();
     sparkinfer::KVCacheConfig kvc;
@@ -79,6 +83,7 @@ int main(int argc, char** argv) {
     printf("\n=== sparkinfer bench (%s) ===\n", gguf_mode ? "Q4_K_M native" : "bf16");
     printf("model        : Qwen3-30B-A3B  (%d layers, %d experts top-%d)\n", cfg.n_layers, cfg.n_experts, cfg.top_k);
     printf("VRAM used    : %.1f GB\n", (totb - freeb) / 1e9);
+    printf("max seq      : %d\n", cfg.max_seq);
     printf("decode tg    : %.2f tok/s  (%.1f ms/token, n=%d, ctx=%d, bs=1)\n",
            toks, 1000.0 / toks, n_tokens, context_tokens);
     if (gpu.valid && gpu.temp_c >= 0) {
