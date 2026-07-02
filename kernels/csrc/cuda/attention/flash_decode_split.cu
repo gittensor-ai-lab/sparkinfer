@@ -97,10 +97,23 @@ __global__ void fa_split_gqa_kernel(
     const int lane  = threadIdx.x & 31;
     const int qh    = kvh * GQA + warp;
 
+    // Each lane owns PAIRS bf16x2 groups of head-dims: group pr covers the two
+    // consecutive dims {2*lane + pr*PSTRIDE, +1}. Reading the staged KV tile as
+    // bf16x2 (4B) instead of scalar bf16 makes the hot inner-loop smem loads
+    // conflict-free — 32 lanes hit 32 distinct 4B banks — and halves the load count.
+    // (The scalar s_k[lane + e*32] read had 32 lanes hit 16 banks: a 2-way conflict.)
+    // Orthogonal to #130's uint4 global→smem staging, which is kept as-is below.
+    constexpr int PAIRS   = ELEMS / 2;         // bf16x2 groups per lane (HEAD_DIM/64)
+    constexpr int PSTRIDE = HEAD_DIM / PAIRS;  // gap between a lane's groups
+    const int d0 = 2 * lane;                   // this lane's first dim (per group + pr*PSTRIDE)
+
     float qr[ELEMS];
     const __nv_bfloat16* qp = q + (size_t)(seq * num_q_heads + qh) * HEAD_DIM;
     #pragma unroll
-    for (int e = 0; e < ELEMS; e++) qr[e] = fa_to_f(qp[lane + e * 32]);
+    for (int pr = 0; pr < PAIRS; pr++) {
+        const __nv_bfloat162 q2 = *reinterpret_cast<const __nv_bfloat162*>(qp + d0 + pr * PSTRIDE);
+        qr[2 * pr] = fa_to_f(q2.x); qr[2 * pr + 1] = fa_to_f(q2.y);
+    }
 
     const int sl    = seq_lens[seq];
     const int chunk = (sl + n_splits - 1) / n_splits;
@@ -136,14 +149,22 @@ __global__ void fa_split_gqa_kernel(
         }
         __syncthreads();
         for (int tt = 0; tt < valid; tt++) {
+            const int row = tt * HEAD_DIM + d0;
             float p = 0.f;
             #pragma unroll
-            for (int e = 0; e < ELEMS; e++) p += qr[e] * fa_to_f(s_k[tt * HEAD_DIM + lane + e * 32]);
+            for (int pr = 0; pr < PAIRS; pr++) {
+                const __nv_bfloat162 k2 = *reinterpret_cast<const __nv_bfloat162*>(&s_k[row + pr * PSTRIDE]);
+                p += qr[2 * pr] * fa_to_f(k2.x) + qr[2 * pr + 1] * fa_to_f(k2.y);
+            }
             const float score = fa_wsum(p) * scale;
             const float mn = fmaxf(m, score), corr = __expf(m - mn), pe = __expf(score - mn);
             l = l * corr + pe;
             #pragma unroll
-            for (int e = 0; e < ELEMS; e++) acc[e] = acc[e] * corr + pe * fa_to_f(s_v[tt * HEAD_DIM + lane + e * 32]);
+            for (int pr = 0; pr < PAIRS; pr++) {
+                const __nv_bfloat162 v2 = *reinterpret_cast<const __nv_bfloat162*>(&s_v[row + pr * PSTRIDE]);
+                acc[2 * pr]     = acc[2 * pr]     * corr + pe * fa_to_f(v2.x);
+                acc[2 * pr + 1] = acc[2 * pr + 1] * corr + pe * fa_to_f(v2.y);
+            }
             m = mn;
         }
         __syncthreads();
@@ -152,7 +173,10 @@ __global__ void fa_split_gqa_kernel(
     const int idx = (seq * num_q_heads + qh) * n_splits + split;
     if (lane == 0) { part_m[idx] = m; part_l[idx] = l; }
     #pragma unroll
-    for (int e = 0; e < ELEMS; e++) part_acc[(size_t)idx * HEAD_DIM + lane + e * 32] = acc[e];
+    for (int pr = 0; pr < PAIRS; pr++) {
+        part_acc[(size_t)idx * HEAD_DIM + d0 + pr * PSTRIDE]     = acc[2 * pr];
+        part_acc[(size_t)idx * HEAD_DIM + d0 + pr * PSTRIDE + 1] = acc[2 * pr + 1];
+    }
 }
 
 // llama Q8_1 activation block (matches si_block_q8_1 used by the int8 MMVQ O-projection).
