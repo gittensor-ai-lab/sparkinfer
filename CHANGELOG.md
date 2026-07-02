@@ -3,6 +3,37 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.3.4] — 2026-07-02
+
+This release closes the **first round of decode optimization** and marks it as a working proof of
+concept: contributors can move the RTX 5090 Qwen3-MoE frontier quickly, the eval loop can verify it,
+and the dashboard can carry the public proof trail. The headline 128-token frontier is now
+**484.79 tok/s** on Qwen3-30B-A3B Q4_K_M — **32.5% faster than llama.cpp** on the same RTX 5090
+128-token decode target — with top-1 **0.9612** and KL **0.0175** vs llama.cpp.
+
+![sparkinfer v0.3.4 RTX 5090 decode frontier](docs/releases/v0.3.4.png)
+
+### Performance — first decode-optimization round lands at 484.79 tok/s
+The round merged the final short-context decode pass:
+- **#121** — optimize Qwen decode kernels; evaluated at **468.10 tok/s** (`eval:none`) and merged as
+  useful implementation groundwork.
+- **#122** — fuse QK-norm + RoPE + KV append and emit Q8_1 attention data in the flash combine path;
+  evaluated at **479.83 tok/s** (`eval:L`) and advanced the public frontier.
+
+After merging, a final `origin/main` benchmark on the cached RTX 5090 measured **484.79 tok/s** at the
+same 128-token decode target, versus llama.cpp at **365.85 tok/s**: **+32.5% faster than llama.cpp**.
+This is the last optimization of the first short-decode round: enough to prove the path, not the end
+of the project.
+
+### Next — compete at long context
+The published milestone remains the next focus: **16k and 32k context**. v0.3.3 showed the long-context
+proof of concept; v0.3.4 finishes the short-decode momentum and points contributors at the next
+competition surface: long-context flash decode, paged/KV read efficiency, KV quantization, and stable
+eval dimensions for 16k/32k.
+
+### Thanks
+Thanks to everyone who contributed, evaluated, reviewed, and kept the loop moving with momentum.
+
 ## [0.3.3] — 2026-07-01
 
 Two things this release: scoring that **rewards late-game effort** (so it stays worth optimizing as the

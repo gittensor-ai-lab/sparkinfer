@@ -4,7 +4,9 @@
 
 ## Proven
 
-Qwen3-30B-A3B (Q4_K_M GGUF) runs end-to-end on an RTX PRO 6000 (sm_120), decode optimized **0.60 → 134 tok/s (≈220×)** across 6 source-verifiable passes, output verified correct, **21.7 GB** resident (experts kept quantized). Independently verified on an **RTX 5090** (CUDA 13): community optimizations have ratcheted the decode frontier to **453.70 tok/s** — **20%+ past llama.cpp** (**+24.0% at 128-tok, +21.6% at 256, +17.6% at 512** — ahead at *every* context length), a kernel-level win (same GGUF, same Q4_K_M precision, same greedy bs=1 decode — no speculative decoding or attention shortcut) — at **97% top-1 token agreement** with llama.cpp (KL ≈ 0.14 nats). Each PR is built and benchmarked against `main` on the *same* RTX 5090 so the score is hardware-independent, and **every eval is reproducible from source + immutably logged** ([EVAL-TRUST.md](EVAL-TRUST.md) · [eval log](https://github.com/gittensor-ai-lab/sparkinfer-log)). See the live [dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/), [accuracy](bench/results/accuracy_qwen3-30b-a3b_q4km.md), and [RTX 5090](bench/results/qwen3-30b-a3b_q4km_rtx5090.md) results.
+Qwen3-30B-A3B (Q4_K_M GGUF) runs end-to-end on an RTX PRO 6000 (sm_120), decode optimized **0.60 → 134 tok/s (≈220×)** across 6 source-verifiable passes, output verified correct, **21.7 GB** resident (experts kept quantized). Independently verified on an **RTX 5090** (CUDA 13): community optimizations have ratcheted the 128-token decode frontier to **484.79 tok/s** — **32.5% faster than llama.cpp** on the same GPU and GGUF (**365.85 tok/s**), a kernel-level win (same Q4_K_M precision, same greedy bs=1 decode — no speculative decoding or attention shortcut) — at **96.12% top-1 token agreement** with llama.cpp (KL **0.0175**). Each PR is built and benchmarked against `main` on the *same* RTX 5090 so the score is hardware-independent, and **every eval is reproducible from source + immutably logged** ([EVAL-TRUST.md](EVAL-TRUST.md) · [eval log](https://github.com/gittensor-ai-lab/sparkinfer-log)). See the live [dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/), [accuracy](bench/results/accuracy_qwen3-30b-a3b_q4km.md), and [RTX 5090](bench/results/qwen3-30b-a3b_q4km_rtx5090.md) results.
+
+![sparkinfer v0.3.4 RTX 5090 decode frontier](docs/releases/v0.3.4.png)
 
 > **Strategy:** we deliberately focus on one model — Qwen3-30B-A3B — to maximize decode speed before broadening, and every optimization must pass a strict accuracy gate (top-1 / KL vs llama.cpp) so speed never costs correctness.
 
@@ -80,13 +82,14 @@ frozen reference, validated on both basket models (Qwen + Gemma). See
 
 Open a PR and a bot evaluates it automatically (polls every ~30 min). For each new commit it
 builds your branch **from source** on an RTX 5090, gates **correctness** (token-match / KL vs
-llama.cpp), benchmarks **decode speed**, and posts a comment with an **`eval:<label>`** verdict:
+llama.cpp), checks that **2k-context decode does not regress**, scores **16k-context decode speed**,
+reports **32k telemetry**, and posts a comment with an **`eval:<label>`** verdict:
 
 | label | meaning |
 |---|---|
 | `XL · L · M · S · XS` | verified speedup over the live frontier, by **% gain** (`XS` 2–3.5% … `XL` >18%) |
 | `none` | correct, but no verified improvement (within the significance gate) |
-| `REJECT` | failed the correctness gate — the output changed |
+| `REJECT` | failed correctness, or regressed below the 2k no-regression guard |
 | `BASELINE` | first verified entry; establishes the frontier |
 
 The label is a **deterministic function of the measurements**, so it's reproducible across

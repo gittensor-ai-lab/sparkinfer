@@ -93,6 +93,11 @@
   .cmp .fill.us{background:linear-gradient(90deg,var(--theme),#a78bff)}
   .cmp .fill.them{background:linear-gradient(90deg,#2a2540,#555)}
   .gap{font-family:"Sora";font-weight:800;font-size:34px;color:var(--theme)}
+  .ctx-head{display:grid;grid-template-columns:92px 1fr 72px;gap:12px;margin-top:18px;padding-top:16px;border-top:1px solid var(--line);font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  .ctx-group{margin-top:10px}
+  .ctx-title{font-family:"Sora";font-weight:800;color:var(--title);font-size:13px;margin:10px 0 5px}
+  .ctx-title span{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:7px}
+  .ctx-note{margin-top:12px;text-align:center;color:var(--muted);font-size:13px}
 
   /* labels legend */
   .legend{display:flex;flex-wrap:wrap;gap:10px}
@@ -265,13 +270,24 @@
       `</div>`;
   })();
 
+  const ctxRows = (D.context_baselines||[]);
+  const ctxMax = ctxRows.length ? Math.max(...ctxRows.map(x=>x.sparkinfer_tps)) : 0;
+  const ctxHtml = ctxRows.length ? `
+    <div class="ctx-head"><div>Context</div><div>Decode speed</div><div style="text-align:right">tok/s</div></div>
+    ${ctxRows.map(x=>`
+      <div class="ctx-group">
+        <div class="ctx-title"><span style="background:${x.color}"></span>${x.label} context</div>
+        <div class="bar-row"><div class="nm">sparkinfer<small>${x.tokens}-tok decode</small></div><div class="track"><div class="fill" style="width:${(x.sparkinfer_tps/ctxMax*100).toFixed(1)}%;background:linear-gradient(90deg,${x.color},#a78bff)"></div></div><div class="v">${x.sparkinfer_tps}</div></div>
+      </div>`).join("")}
+    <div class="ctx-note">512 / 4k / 16k context-decode baselines · same RTX 5090 · same Q4_K_M model</div>` : "";
   const cmax = Math.max(s.frontier_tps, s.ref_tps);
   $("compare").innerHTML = `
     <div class="bar-row"><div class="nm">sparkinfer</div><div class="track"><div class="fill us" style="width:${(s.frontier_tps/cmax*100).toFixed(1)}%"></div></div><div class="v">${s.frontier_tps}</div></div>
     <div class="bar-row"><div class="nm">${s.ref_name}</div><div class="track"><div class="fill them" style="width:${(s.ref_tps/cmax*100).toFixed(1)}%"></div></div><div class="v">${s.ref_tps}</div></div>
     <div style="margin-top:14px;text-align:center">${ahead
-      ? `<span class="gap">+${pct.toFixed(1)}%</span> <span style="color:var(--muted);font-size:13px">faster than ${s.ref_name} at 128-tok decode · ~parity at long context</span>`
-      : `<span class="gap">${gapx}×</span> <span style="color:var(--muted);font-size:13px">to close — launch-bound; fusion is the lever</span>`}</div>`;
+      ? `<span class="gap">+${pct.toFixed(1)}%</span> <span style="color:var(--muted);font-size:13px">faster than ${s.ref_name} at 128-tok decode</span>`
+      : `<span class="gap">${gapx}×</span> <span style="color:var(--muted);font-size:13px">to close — launch-bound; fusion is the lever</span>`}</div>
+    ${ctxHtml}`;
 
   $("labels").innerHTML = D.labels.map(x=>`<span class="lg"><span class="dot" style="background:${x.c}"></span><b style="color:var(--title)">${x.l}</b> — ${x.d}</span>`).join("");
 

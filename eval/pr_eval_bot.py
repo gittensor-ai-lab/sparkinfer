@@ -292,8 +292,15 @@ def render(res, oid):
     # A passing speedup (XL/L/M/S/XS) clears the significance gate, so its tps becomes the NEW frontier.
     advanced = label in {"XL", "L", "M", "S", "XS"} and res.get("pass")
     rows = [f"| **label** | `eval:{label}` |",
-            f"| decode | {res.get('tps','?')} tok/s |",
+            f"| scored decode ({res.get('score_context', 128)} ctx) | {res.get('tps','?')} tok/s |",
             f"| correctness | top-1 {res.get('top1',0)*100:.1f}% · KL {res.get('kl','?')} |"]
+    if res.get("ctx_2048_tps") is not None:
+        gate = "pass" if res.get("guard_2k_pass", True) else "fail"
+        base = res.get("guard_2k_baseline") or 0
+        rows.append(f"| 2k no-regression gate | {res.get('ctx_2048_tps')} tok/s"
+                    f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
+    if res.get("ctx_32768_tps") is not None:
+        rows.append(f"| 32k telemetry | {res.get('ctx_32768_tps')} tok/s |")
     if "frontier_tps" in res and res["frontier_tps"]:
         # Label it "prior frontier" when this PR superseded it, so the old value isn't mistaken
         # for the current live frontier (which is now this PR's tps).
@@ -306,11 +313,13 @@ def render(res, oid):
             "BASELINE": "No frontier was set; this run establishes it."
             }.get(label, f"Verified speedup — **sets the new frontier to {res.get('tps')} tok/s** "
                          f"(was {res.get('frontier_tps','?')}).")
+    target_note = ("2k no-regression gate · 16k scored frontier · 32k telemetry"
+                   if res.get("eval_mode") == "longctx" else "128-token decode frontier")
     return (f"<!-- sparkinfer-eval:{oid} -->\n"
             f"## {icon} sparkinfer auto-eval — `{oid}`\n\n"
             f"| metric | value |\n|---|---|\n" + "\n".join(rows) + "\n\n"
             f"{note}\n\n"
-            f"_RTX 5090 (sm_120) · built from source · correctness vs llama.cpp. "
+            f"_RTX 5090 (sm_120) · {target_note} · built from source · correctness vs llama.cpp. "
             f"Automated — **not merged**; merge manually after review._")
 
 # ---- live dashboard: data.json is canonical; data.js is generated for the page ----
@@ -362,6 +371,12 @@ def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
                   "top1": res.get("top1"), "kl": res.get("kl"),
                   "gpu": "RTX 5090 (sm_120) · vast.ai", "date": datetime.date.today().isoformat(),
                   "frontier": res.get("frontier_tps"),
+                  "eval_mode": res.get("eval_mode"), "score_context": res.get("score_context"),
+                  "ctx_2048_tps": res.get("ctx_2048_tps"), "ctx_16384_tps": res.get("ctx_16384_tps"),
+                  "ctx_32768_tps": res.get("ctx_32768_tps"),
+                  "guard_2k_baseline": res.get("guard_2k_baseline"),
+                  "guard_2k_ratio": res.get("guard_2k_ratio"),
+                  "guard_2k_pass": res.get("guard_2k_pass"),
                   # M1/H1/C2 provenance — makes the immutable log self-describing + reproducible
                   "clocks_pinned": res.get("clocks_pinned"), "clock_mhz": res.get("clock_mhz"),
                   "clock_spread_mhz": res.get("clock_spread_mhz"), "eval_seed": res.get("eval_seed"),
@@ -373,7 +388,8 @@ def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
         idx = json.load(open(ipath)) if os.path.exists(ipath) else []
         idx = [e for e in idx if e.get("id") != rid]
         idx.append({"id": rid, "pr": int(num), "title": title, "label": res.get("label"),
-                    "delta_pct": res.get("pct_over_frontier"), "tps": res.get("tps"), "date": result["date"]})
+                    "delta_pct": res.get("pct_over_frontier"), "tps": res.get("tps"),
+                    "score_context": res.get("score_context"), "date": result["date"]})
         idx.sort(key=lambda x: x["id"])
         json.dump(idx, open(ipath, "w"), indent=2)
         subprocess.run(["git", "-C", LOG_DIR, "add", "-A"], check=True)
@@ -399,6 +415,10 @@ def update_dashboard(repo, pr, areas, res, proof_url=None):
              "delta_pct": res.get("pct_over_frontier"),
              "top1": res.get("top1"), "kl": res.get("kl"),
              "url": f"https://github.com/{repo}/pull/{num}"}
+    for k in ("eval_mode", "score_context", "ctx_2048_tps", "ctx_16384_tps", "ctx_32768_tps",
+              "guard_2k_baseline", "guard_2k_ratio", "guard_2k_pass"):
+        if res.get(k) is not None:
+            entry[k] = res.get(k)
     if proof_url: entry["proof_url"] = proof_url
     data["prs"] = [p for p in data.get("prs", []) if p.get("num") != num]
     data["prs"].insert(0, entry)
@@ -413,9 +433,29 @@ def record_merge(repo, num):
     idempotent (dedupe by PR). Reads the PR's stored eval from `prs`."""
     data = load_dash()
     if data is None: return
-    if any(m.get("pr") == num for m in data.get("landed", [])): return       # already recorded
     e = next((p for p in data.get("prs", []) if p.get("num") == num), None)
     if not e or e.get("label") not in SPEEDUP_LABELS: return                 # only verified speedups
+    if e.get("eval_mode") == "longctx" and int(e.get("score_context") or 0) == 16384:
+        if any(m.get("pr") == num for m in data.get("landed_longctx", [])): return
+        old_f = round(data["status"].get("longctx_16k_tps") or e.get("frontier_tps") or 0, 2)
+        gain = (e.get("delta_pct") or 0) / 100.0
+        new_f = round(old_f * (1 + gain), 2) if old_f and gain > 0 else round(e.get("tps") or 0, 2)
+        data["status"]["longctx_16k_tps"] = new_f
+        if e.get("ctx_2048_tps") is not None:  data["status"]["longctx_2k_tps"] = round(e["ctx_2048_tps"], 2)
+        if e.get("ctx_32768_tps") is not None: data["status"]["longctx_32k_tps"] = round(e["ctx_32768_tps"], 2)
+        if e.get("top1") is not None: data["status"]["longctx_token_match"] = round(e["top1"], 4)
+        if e.get("kl") is not None:   data["status"]["longctx_kl"] = round(e["kl"], 4)
+        short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
+        landed = [m for m in data.get("landed_longctx", []) if m.get("pr") != num]
+        landed.append({"name": short or f"PR #{num}", "tps": new_f, "pr": num,
+                       "ctx": 16384, "date": datetime.date.today().isoformat()})
+        data["landed_longctx"] = sorted(landed, key=lambda m: m["tps"])
+        data["updated"] = datetime.date.today().isoformat()
+        write_dash(data)
+        push_dash(f"dashboard: PR #{num} merged -> 16k frontier {new_f} tok/s")
+        return
+
+    if any(m.get("pr") == num for m in data.get("landed", [])): return       # already recorded
     # Advance by the VERIFIED SAME-BOX RELATIVE GAIN (delta_pct), NOT the raw measured tps. Raw tok/s
     # zig-zags ±2% with whichever box ran (hot vs cool) and breaks the journey's monotonicity; applying
     # the same-box gain to the displayed frontier keeps the headline hardware-independent and the journey
@@ -707,7 +747,8 @@ def main():
     # per run, not per PR — otherwise two PRs targeting the same optimization could both "beat" main.
     base_iid = current_instance(args.instance)
     bcmd = [sys.executable, os.path.join(HERE, "vast_eval.py"), "--reuse", str(base_iid),
-            "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling), "--keep"]
+            "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling),
+            "--eval-mode", "longctx", "--keep"]
     if PINNED_INSTANCE and str(base_iid) == PINNED_INSTANCE: bcmd.append("--pinned")
     print(f">> measuring same-box baseline (origin/main) on instance {base_iid} ...")
     br = subprocess.run(bcmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
@@ -729,13 +770,21 @@ def main():
         print(f">> same-box baseline (origin/main) failed ({bres.get('label','no result')}) — "
               f"aborting; no PRs graded.\n{log}"); return
     run_baseline = bres["tps"]
-    print(f">> same-box baseline: origin/main = {run_baseline} tok/s on this box")
+    run_guard_2k = float(bres.get("ctx_2048_tps") or 0)
+    score_ctx = int(bres.get("score_context") or 128)
+    if score_ctx == 128:
+        print(f">> same-box baseline: origin/main = {run_baseline} tok/s on this box")
+    else:
+        print(f">> same-box baseline: origin/main @ {score_ctx} ctx = {run_baseline} tok/s; "
+              f"2k guard = {run_guard_2k} tok/s")
     # Sanity guard: origin/main IS the merged frontier code, so on a healthy box it should measure
     # within ~10% of the known frontier. A baseline well below that means the box is cold/throttling
     # or degraded — grading PRs against it inflates every delta (the cold-clock artifact that once
     # mislabeled minor PRs as XL above the ceiling). Abort rather than post bogus labels.
     SANITY_FRAC = float(os.environ.get("SPARKINFER_BASELINE_SANITY", "0.90"))
-    known_frontier = float(args.frontier or 0)
+    # Dashboard frontier is currently the 128-token headline. Long-context eval establishes a fresh
+    # same-box 16k frontier every run, so do not compare the 16k baseline to the 128-token dashboard.
+    known_frontier = float(args.frontier or 0) if score_ctx == 128 else 0
     if known_frontier > 0 and run_baseline < SANITY_FRAC * known_frontier:
         print(f">> baseline {run_baseline} < {SANITY_FRAC:.0%} of known frontier {known_frontier} "
               f"(= {SANITY_FRAC*known_frontier:.1f}) — box underperforming (cold/throttling/degraded). "
@@ -758,6 +807,7 @@ def main():
         cmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
                "--reuse", str(cur_iid), "--ref", ref,
                "--frontier", str(cur_frontier), "--ceiling", str(args.ceiling),
+               "--eval-mode", "longctx", "--guard-2k-baseline", str(run_guard_2k),
                "--keep"]            # keep instance alive — bot stops it after all PRs
         if PINNED_INSTANCE and str(cur_iid) == PINNED_INSTANCE:
             cmd.append("--pinned")  # never destroy the pin; retry-then-fallback on bring-up failure

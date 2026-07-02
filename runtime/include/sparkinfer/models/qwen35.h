@@ -96,9 +96,10 @@ public:
     // forward_token() call. Used for teacher-forced scoring (perplexity / KL).
     void copy_logits(float* host_logits) const;
 
-    // Steady-state decode throughput benchmark: runs `warmup` untimed decode
-    // steps then times `n_tokens` more. Returns tokens/sec. Requires weights.
-    double bench_decode(int warmup, int n_tokens);
+    // Steady-state decode throughput benchmark at a target KV depth: runs untimed
+    // prefill to `context_tokens`, then `warmup` untimed decode steps, then times
+    // `n_tokens` more. Returns tokens/sec. Requires weights.
+    double bench_decode(int warmup, int n_tokens, int context_tokens = 0);
 
     const Qwen35Config& config() const;
 

@@ -119,9 +119,104 @@ __global__ void rope_kv_append_kernel(
     }
 }
 
+// Fused per-head QK-norm + RoPE + KV-append: ONE kernel replacing rmsnorm_qk + rope_kv_append.
+// grid = (n_q_heads + 2*n_kv_heads, n_tokens); blockDim = head_dim (one block per head).
+//   blocks [0, n_q_heads)                 : Q head -> RMSNorm(q_w) + RoPE in place
+//   blocks [n_q_heads, +n_kv_heads)       : K head -> RMSNorm(k_w) + RoPE + write k_pool
+//   blocks [.., +n_kv_heads)              : V head -> copy to v_pool (no norm/rope)
+// The normed head is staged in shared so RoPE can pair element i with i+half. The roped/normed
+// q,k are value-identical to rmsnorm_qk followed by rope_kv_append (same per-head RMS, same
+// bf16 rounding, same rope angle); the cached V is identical to kv_append. positions == write_pos.
+__global__ void qknorm_rope_kv_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, float theta,
+    int block_size, int max_blocks_per_seq, float eps
+) {
+    const int tok  = blockIdx.y;
+    const int b    = blockIdx.x;
+    const int t    = threadIdx.x;                 // 0 .. head_dim-1
+    const int half = head_dim >> 1;
+    const int pos  = positions[tok];
+    const int blk = pos / block_size, within = pos % block_size;
+    const size_t ctok = (size_t)((size_t)block_table[tok * max_blocks_per_seq + blk] * block_size + within);
+
+    const bool is_v = (b >= n_q_heads + n_kv_heads);
+    if (is_v) {                                    // V: copy head straight to the cache (no norm/rope)
+        const int hh = b - n_q_heads - n_kv_heads;
+        const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+        v_pool[dst + t] = v[base + t];
+        return;
+    }
+
+    const bool is_q = (b < n_q_heads);
+    __nv_bfloat16* x        = is_q ? q : k;
+    const __nv_bfloat16* w  = is_q ? q_w : k_w;
+    const int head          = is_q ? b : (b - n_q_heads);
+    const int nh            = is_q ? n_q_heads : n_kv_heads;
+    const size_t base       = ((size_t)(tok * nh + head)) * head_dim;
+
+    extern __shared__ float s_h[];                 // normed head (head_dim floats)
+    __shared__ float s_warp[32];
+    const float xv = __bfloat162float(x[base + t]);
+    float ss = xv * xv;                            // per-head RMS over head_dim
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+    if ((t & 31) == 0) s_warp[t >> 5] = ss;
+    __syncthreads();
+    if (t < 32) {
+        float vv = (t < (head_dim + 31) / 32) ? s_warp[t] : 0.f;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) vv += __shfl_xor_sync(0xffffffff, vv, m);
+        if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+    }
+    __syncthreads();
+    // Normed value, bf16-rounded exactly as rmsnorm_qk writes it (so RoPE sees identical inputs).
+    s_h[t] = __bfloat162float(__float2bfloat16(xv * s_warp[0] * __bfloat162float(w[t])));
+    __syncthreads();
+
+    // RoPE (HF rotate-half): pair (i, i+half). Threads [0,half) own a pair and write both halves.
+    if (t < half) {
+        const float freq = __powf(theta, -2.f * (float)t / (float)head_dim);
+        const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+        const float x0 = s_h[t], x1 = s_h[t + half];
+        const __nv_bfloat16 o0 = __float2bfloat16(x0 * c - x1 * s);
+        const __nv_bfloat16 o1 = __float2bfloat16(x1 * c + x0 * s);
+        if (is_q) {                                // Q: rope in place
+            q[base + t] = o0; q[base + t + half] = o1;
+        } else {                                   // K: rope straight into the paged cache
+            const size_t dst = (ctok * n_kv_heads + head) * head_dim;
+            k_pool[dst + t] = o0; k_pool[dst + t + half] = o1;
+        }
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/attention.h"
+#include "sparkinfer/kernels/fused.h"
 #include <cstdlib>
+
+// Fused QK-norm + RoPE + KV-append (SPARKINFER_ATTNIN, default on). One kernel replaces
+// launch_rmsnorm_qk + launch_rope_kv_append, deleting a graph node and the intermediate
+// normed-q/k global round-trip. Falls back (caller keeps the two kernels) when disabled.
+void launch_qknorm_rope_kv_append(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, float theta,
+    float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream
+) {
+    dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
+    qknorm_rope_kv_kernel<<<grid, head_dim, head_dim * sizeof(float), stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, theta,
+        block_size, max_blocks_per_seq, eps);
+}
 
 void launch_rope_kv_append(void* q, const void* k, const void* v, void* k_pool, void* v_pool,
                            const int* block_table, const int* positions,

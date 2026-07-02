@@ -490,11 +490,11 @@ template __global__ void si_mmvq_q6k_kernel<float>(const si_block_q8_1*, const u
 // 1-warp-per-row Q6_K dp4a GEMV: keeps the fp32 gemv_q block structure (GEMV_WPB rows/block,
 // well-occupied for large N like the LM head's 151936 rows) but dp4a instead of fp32 dequant.
 // The 4-warp si_mmvq is right for small-N rows (attn-V); this is right for the huge LM head.
-template <typename OutT>
+template <typename OutT, int WPB>
 __global__ void gemv_q6k_dp4a_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
                                      OutT* __restrict__ y, int N, int K) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row = blockIdx.x * GEMV_WPB + warp;
+    const int row = blockIdx.x * WPB + warp;
     if (row >= N) return;
     const unsigned char* x_row = W + (size_t)row * (K >> 8) * 210;
     const int nsuper = K >> 8;
@@ -505,7 +505,27 @@ __global__ void gemv_q6k_dp4a_kernel(const si_block_q8_1* __restrict__ vy, const
     for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
     if (lane == 0) gemv_write(y + row, acc);
 }
-template __global__ void gemv_q6k_dp4a_kernel<float>(const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void gemv_q6k_dp4a_kernel<float, 8>(const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void gemv_q6k_dp4a_kernel<float, 16>(const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void gemv_q6k_dp4a_kernel<float, 32>(const si_block_q8_1*, const unsigned char*, float*, int, int);
+
+template <typename OutT, int WPB, int NSUPER>
+__global__ void gemv_q6k_dp4a_kfixed_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
+                                            OutT* __restrict__ y, int N) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WPB + warp;
+    if (row >= N) return;
+    const unsigned char* x_row = W + (size_t)row * NSUPER * 210;
+    float acc = 0.f;
+    #pragma unroll
+    for (int kbx = 0; kbx < NSUPER; kbx++)
+        acc += si_vec_dot_q6_K(x_row + (size_t)kbx * 210, vy + (size_t)kbx * 8, lane);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+    if (lane == 0) gemv_write(y + row, acc);
+}
+template __global__ void gemv_q6k_dp4a_kfixed_kernel<float, 8, 8>(const si_block_q8_1*, const unsigned char*, float*, int);
+template __global__ void gemv_q6k_dp4a_kfixed_kernel<float, 16, 8>(const si_block_q8_1*, const unsigned char*, float*, int);
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/gemm.h"
@@ -642,9 +662,33 @@ void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K,
         reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
 }
 void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
-    dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
-    gemv_q6k_dp4a_kernel<float><<<grid, GEMV_WPB * 32, 0, stream>>>(
-        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
+    static int wpb = -1;
+    if (wpb < 0) {
+        const char* e = getenv("SPARKINFER_Q6K_WPB");
+        wpb = e ? atoi(e) : 16;
+        if (!(wpb == 8 || wpb == 16 || wpb == 32)) wpb = 16;
+    }
+    if (K == 2048 && wpb == 16) {
+        dim3 grid((N + 15) / 16);
+        gemv_q6k_dp4a_kfixed_kernel<float, 16, 8><<<grid, 16 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N);
+    } else if (K == 2048 && wpb == 8) {
+        dim3 grid((N + 7) / 8);
+        gemv_q6k_dp4a_kfixed_kernel<float, 8, 8><<<grid, 8 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N);
+    } else if (wpb == 32) {
+        dim3 grid((N + 31) / 32);
+        gemv_q6k_dp4a_kernel<float, 32><<<grid, 32 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
+    } else if (wpb == 16) {
+        dim3 grid((N + 15) / 16);
+        gemv_q6k_dp4a_kernel<float, 16><<<grid, 16 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
+    } else {
+        dim3 grid((N + 7) / 8);
+        gemv_q6k_dp4a_kernel<float, 8><<<grid, 8 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
+    }
 }
 #endif
 

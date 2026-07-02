@@ -2,7 +2,7 @@
 // Reports steady-state single-stream generation tokens/sec, to compare against
 // llama.cpp's `llama-bench` tg number on the same model + GPU.
 //
-// Usage: qwen3_gguf_bench <model.gguf | weight_dir> [n_tokens]
+// Usage: qwen3_gguf_bench <model.gguf | weight_dir> [n_tokens] [context_tokens]
 //   *.gguf  -> native load (experts kept quantized, Q4_K_M-sized)
 //   dir     -> bf16 weights from convert_gguf.py (reads config.txt)
 
@@ -18,17 +18,19 @@
 #include <string>
 #include <fstream>
 #include <unordered_map>
+#include <algorithm>
 
 static bool ends_with(const std::string& s, const std::string& suf) {
     return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { printf("usage: %s <model.gguf|weight_dir> [n_tokens]\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s <model.gguf|weight_dir> [n_tokens] [context_tokens]\n", argv[0]); return 2; }
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
     const std::string path = argv[1];
     const int n_tokens = argc > 2 ? atoi(argv[2]) : 64;
+    const int context_tokens = argc > 3 ? atoi(argv[3]) : 0;
     const bool gguf_mode = ends_with(path, ".gguf");
 
     sparkinfer::Qwen35Config cfg;
@@ -55,7 +57,7 @@ int main(int argc, char** argv) {
         cfg.n_experts=gi("n_experts",128); cfg.top_k=gi("top_k",8); cfg.n_shared=gi("n_shared",0);
         cfg.moe_ffn=gi("moe_ffn",768); cfg.rope_theta=gf("rope_theta",1e6f); cfg.rms_eps=gf("rms_eps",1e-6f);
     }
-    cfg.max_seq = 2048;
+    cfg.max_seq = std::max(2048, context_tokens + n_tokens + 16);
 
     auto rt = sparkinfer::Runtime::create({}); rt->initialize();
     sparkinfer::KVCacheConfig kvc;
@@ -72,12 +74,13 @@ int main(int argc, char** argv) {
     if (!ok) { printf("[FAIL] load\n"); return 1; }
     size_t freeb=0, totb=0; cudaMemGetInfo(&freeb,&totb);
 
-    double toks = model.bench_decode(8, n_tokens);
+    double toks = model.bench_decode(8, n_tokens, context_tokens);
     auto gpu = sparkinfer::query_gpu_stats();   // sampled right after the decode loop — near peak heat
     printf("\n=== sparkinfer bench (%s) ===\n", gguf_mode ? "Q4_K_M native" : "bf16");
     printf("model        : Qwen3-30B-A3B  (%d layers, %d experts top-%d)\n", cfg.n_layers, cfg.n_experts, cfg.top_k);
     printf("VRAM used    : %.1f GB\n", (totb - freeb) / 1e9);
-    printf("decode tg    : %.2f tok/s  (%.1f ms/token, n=%d, bs=1)\n", toks, 1000.0 / toks, n_tokens);
+    printf("decode tg    : %.2f tok/s  (%.1f ms/token, n=%d, ctx=%d, bs=1)\n",
+           toks, 1000.0 / toks, n_tokens, context_tokens);
     if (gpu.valid && gpu.temp_c >= 0) {
         printf("GPU          : %d°C", gpu.temp_c);
         if (gpu.power_w      >= 0) printf(" · %d W", gpu.power_w);

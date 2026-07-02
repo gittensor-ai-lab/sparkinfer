@@ -5,7 +5,7 @@ Provision (or reuse) a Blackwell GPU on vast.ai, build a sparkinfer submission, 
 
 ```
 submission (git ref) ─► build from source ─► correctness gate (token-match / KL vs llama.cpp)
-                     ─► speed (median bench) ─► LABEL (significance gate + headroom bucket)
+                     ─► 2k no-regression gate ─► 16k speed score ─► LABEL
 ```
 
 The numeric label is a **deterministic function of measurements** (`bench/scripts/label.py`) so
@@ -33,8 +33,15 @@ python eval/vast_eval.py --ref <git-ref> --frontier 164 --ceiling 366 --destroy
 and cached weights (`/workspace/models`) persist, so the next `--reuse` run starts fast.
 `--keep` leaves it running; `--destroy` frees the disk too.
 
-`--frontier` = current best tok/s · `--ceiling` = roofline (or a reference such as llama.cpp's
-tok/s). Reuse mode assumes the weights are cached at `/workspace/models`.
+`--frontier` = current best tok/s for the scored target · `--ceiling` = roofline/reference display
+value. Reuse mode assumes the weights are cached at `/workspace/models`.
+
+The default eval target is now long-context decode:
+- **2k context**: no-regression guard. A PR must keep at least 98% of same-box `origin/main` 2k speed.
+- **16k context**: scored frontier. Labels are based on verified 16k speedup over same-box `origin/main`.
+- **32k context**: telemetry only for now. It is published in the verdict/log but does not score yet.
+
+Set `SPARKINFER_EVAL_MODE=short` or pass `--eval-mode short` to keep the legacy 128-token scoring path.
 
 ## Verdict (stdout)
 
@@ -42,8 +49,13 @@ tok/s). Reuse mode assumes the weights are cached at `/workspace/models`.
 { "commit": "abc1234", "tps": 165.2, "top1": 1.0, "kl": 0.14, "frontier_tps": 164,
   "pass": true, "label": "none", "delta_tps": 1.2, "pct_over_frontier": 0.7 }
 ```
-Labels: **REJECT** (failed correctness) · **none** (within the significance gate) ·
+Labels: **REJECT** (failed correctness or the 2k no-regression gate) · **none** (within the significance gate) ·
 **XS · S · M · L · XL** (verified speedup bucket, by fraction of remaining headroom closed).
+
+Policy tests:
+```bash
+python3 bench/scripts/test_label.py
+```
 
 ## PR auto-evaluation bot
 
