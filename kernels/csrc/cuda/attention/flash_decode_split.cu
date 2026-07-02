@@ -111,6 +111,7 @@ __global__ void fa_split_gqa_kernel(
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
 
+    // bf16 staging halves smem vs float, so TILE=16 matches float TILE=8 footprint.
     extern __shared__ __nv_bfloat16 s_kv[];
     __nv_bfloat16* s_k = s_kv;
     __nv_bfloat16* s_v = s_kv + (size_t)TILE * HEAD_DIM;
@@ -243,7 +244,7 @@ __global__ void fa_combine_kernel(
 #define FA_COMBINE_NW 4     // warps/block folding the split stripes; sweepable
 #endif
 #ifndef FA_GQA_TILE
-#define FA_GQA_TILE 12      // bf16 smem sweet spot at n_splits=256 (~64 tok/chunk)
+#define FA_GQA_TILE 16      // bf16 smem: same footprint as float TILE=8 (#126 used 12)
 #endif
 template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
