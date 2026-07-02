@@ -127,14 +127,12 @@ __global__ void fa_split_gqa_kernel(
             s_rowbase[threadIdx.x] = ((size_t)(phys * block_size + wb) * num_kv_heads + kvh) * HEAD_DIM;
         }
         __syncthreads();
-        // Vectorized load: bf16x2 into bf16 smem (halves load instructions vs per-element).
-        for (int i = threadIdx.x * 2; i < valid * HEAD_DIM; i += blockDim.x * 2) {
+        // Vectorized load: uint4 (8×bf16) via __ldg into bf16 smem.
+        for (int i = threadIdx.x * 8; i < valid * HEAD_DIM; i += blockDim.x * 8) {
             const int within = i / HEAD_DIM, d = i % HEAD_DIM;
             const size_t base = s_rowbase[within] + d;
-            const __nv_bfloat162 k2 = *reinterpret_cast<const __nv_bfloat162*>(k_pool + base);
-            const __nv_bfloat162 v2 = *reinterpret_cast<const __nv_bfloat162*>(v_pool + base);
-            s_k[i] = k2.x; s_k[i + 1] = k2.y;
-            s_v[i] = v2.x; s_v[i + 1] = v2.y;
+            *reinterpret_cast<uint4*>(s_k + i) = __ldg(reinterpret_cast<const uint4*>(k_pool + base));
+            *reinterpret_cast<uint4*>(s_v + i) = __ldg(reinterpret_cast<const uint4*>(v_pool + base));
         }
         __syncthreads();
         for (int tt = 0; tt < valid; tt++) {
@@ -243,7 +241,7 @@ __global__ void fa_combine_kernel(
 #define FA_COMBINE_NW 4     // warps/block folding the split stripes; sweepable
 #endif
 #ifndef FA_GQA_TILE
-#define FA_GQA_TILE 12      // bf16 smem sweet spot at n_splits=256 (~64 tok/chunk)
+#define FA_GQA_TILE 14      // bf16 smem + uint4 ldg sweet spot at n_splits=128
 #endif
 template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
