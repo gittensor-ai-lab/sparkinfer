@@ -207,15 +207,22 @@ int Qwen35Model::forward_token(int token_id, int position) {
     s.h_scalars[3] = seqlen;
     cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 4 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
-    // Depth-adaptive KV-split: keep 32 splits for the short-context sweet spot, then jump to
-    // the 128-split occupancy plateau on RTX 5090. The split grid is num_kv_heads*n_splits CTAs,
-    // so 64 splits still underfills mid-context decode; 128 improves 512/2k/4k. Past the 16k
-    // knee, use MAX_NSPLITS to keep each split's serial KV chunk bounded. Partials are sized for
-    // MAX_NSPLITS, and the online-softmax combine is exact for any split count (accuracy unchanged).
+    // Occupancy-first KV-split count for bs=1 flash-decode. The split grid is
+    // num_kv_heads*n_splits CTAs (num_kv=4 for Qwen3-30B-A3B), so a low n_splits
+    // starves the ~170 SMs: the old "32 until 8192" schedule left the split+combine
+    // 1.2-1.4x below the sweet spot from ~0.75k to 16k context. Measured on RTX 5090
+    // (sm_120, bf16 TILE=14): the optimum is 32 up to a small occupancy floor, a wide
+    // 64-split plateau, then MAX at long context (128 is never optimal here -- its
+    // extra combine/partials cost outweighs the shorter serial chunk). split_chunk
+    // (default 256, SPARKINFER_SPLIT_CHUNK) scales both knees. n_splits only
+    // repartitions the KV reduction; the online-softmax combine is exact for any
+    // count, so attention output -- and the accuracy gate -- is unchanged. Monotonic
+    // in seqlen -> at most two graph re-captures per generation.
     if (s.adaptive_splits) {
-        int want = 32;
-        if ((long)seqlen > 2L * s.split_chunk) want = 128;
-        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
+        int want;
+        if      (seqlen <=  2 * s.split_chunk) want = 32;                // <=512 default
+        else if (seqlen <= 24 * s.split_chunk) want = 64;               // <=6144 default
+        else                                   want = Impl::MAX_NSPLITS; // 256
         if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
