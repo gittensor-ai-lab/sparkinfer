@@ -114,17 +114,28 @@ __global__ void fa_split_gqa_kernel(
     extern __shared__ float s_kv[];
     float* s_k = s_kv;
     float* s_v = s_kv + TILE * HEAD_DIM;
+    __shared__ size_t s_rowbase[TILE];   // per-token global row base, resolved once (not per head-dim)
 
     for (int t0 = start; t0 < end; t0 += TILE) {
         const int valid = min(TILE, end - t0);
-        for (int i = threadIdx.x; i < valid * HEAD_DIM; i += blockDim.x) {
-            const int within = i / HEAD_DIM, d = i % HEAD_DIM;
-            const int t = t0 + within;
+        // Hoist the block-table lookup + address math to ONCE per token (was redundantly
+        // recomputed by all HEAD_DIM threads of a token). Byte-identical: same base offsets.
+        if ((int)threadIdx.x < valid) {
+            const int t = t0 + threadIdx.x;
             const int blk = t / block_size, wb = t % block_size;
             const int phys = block_table[seq * max_blocks + blk];
-            const size_t base = ((size_t)(phys * block_size + wb) * num_kv_heads + kvh) * HEAD_DIM + d;
-            s_k[i] = fa_to_f(k_pool[base]);
-            s_v[i] = fa_to_f(v_pool[base]);
+            s_rowbase[threadIdx.x] = ((size_t)(phys * block_size + wb) * num_kv_heads + kvh) * HEAD_DIM;
+        }
+        __syncthreads();
+        // Vectorized load: each thread reads two consecutive head-dims as one 32-bit bf16x2
+        // (halves the load instructions vs per-element). d is even -> 4-byte aligned.
+        for (int i = threadIdx.x * 2; i < valid * HEAD_DIM; i += blockDim.x * 2) {
+            const int within = i / HEAD_DIM, d = i % HEAD_DIM;
+            const size_t base = s_rowbase[within] + d;
+            const __nv_bfloat162 k2 = *reinterpret_cast<const __nv_bfloat162*>(k_pool + base);
+            const __nv_bfloat162 v2 = *reinterpret_cast<const __nv_bfloat162*>(v_pool + base);
+            s_k[i] = fa_to_f(k2.x); s_k[i + 1] = fa_to_f(k2.y);
+            s_v[i] = fa_to_f(v2.x); s_v[i + 1] = fa_to_f(v2.y);
         }
         __syncthreads();
         for (int tt = 0; tt < valid; tt++) {
@@ -233,7 +244,7 @@ __global__ void fa_combine_kernel(
 #define FA_COMBINE_NW 4     // warps/block folding the split stripes; sweepable
 #endif
 #ifndef FA_GQA_TILE
-#define FA_GQA_TILE 8       // KV tokens staged per shared-memory tile; sweepable
+#define FA_GQA_TILE 6       // KV tokens staged per shared-memory tile; sweepable
 #endif
 template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
