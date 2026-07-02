@@ -103,4 +103,15 @@ int    KVCacheManager::max_blocks_per_seq() const { return kMaxBlocksPerSeq; }
 int    KVCacheManager::num_free_blocks() const { return (int)impl_->free_list.size(); }
 int    KVCacheManager::num_total_blocks() const { return impl_->total_blocks; }
 
+int KVCacheManager::contiguous_block_base(uint64_t seq_id) const {
+    auto it = impl_->seq_blocks.find(seq_id);
+    if (it == impl_->seq_blocks.end() || it->second.empty()) return -1;
+    const std::vector<int>& blocks = it->second;
+    const int base = blocks[0];
+    for (size_t i = 1; i < blocks.size(); i++) {
+        if (blocks[i] != base + (int)i) return -1;
+    }
+    return base;
+}
+
 } // namespace sparkinfer

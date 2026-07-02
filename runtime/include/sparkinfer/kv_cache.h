@@ -50,6 +50,11 @@ public:
     int num_free_blocks() const;
     int num_total_blocks() const;
 
+    // Returns the first physical block when seq_id owns one linear block run
+    // (base, base+1, ...), otherwise -1. Kernels can use this to skip page-table
+    // lookups without changing correctness for fragmented allocations.
+    int contiguous_block_base(uint64_t seq_id) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -94,7 +94,7 @@ void launch_flash_decode_split(
     float* part_m, float* part_l, float* part_acc,
     int num_seqs, int num_q_heads, int num_kv_heads, int head_dim,
     int block_size, int max_blocks, int n_splits, float scale,
-    cudaStream_t stream = nullptr, void* out_q8 = nullptr);
+    cudaStream_t stream = nullptr, void* out_q8 = nullptr, int kv_contiguous_base = -1);
 
 // Flash decode for GLOBAL layers: full context, head_dim=512, GQA 8:1.
 // Two-phase dot product splits 512-dim head into two 256-dim halves.
