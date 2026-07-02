@@ -111,9 +111,9 @@ __global__ void fa_split_gqa_kernel(
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
 
-    extern __shared__ float s_kv[];
-    float* s_k = s_kv;
-    float* s_v = s_kv + TILE * HEAD_DIM;
+    extern __shared__ __nv_bfloat16 s_kv[];
+    __nv_bfloat16* s_k = s_kv;
+    __nv_bfloat16* s_v = s_kv + (size_t)TILE * HEAD_DIM;
     __shared__ size_t s_rowbase[TILE];   // per-token global row base, resolved once (not per head-dim)
 
     for (int t0 = start; t0 < end; t0 += TILE) {
@@ -127,26 +127,25 @@ __global__ void fa_split_gqa_kernel(
             s_rowbase[threadIdx.x] = ((size_t)(phys * block_size + wb) * num_kv_heads + kvh) * HEAD_DIM;
         }
         __syncthreads();
-        // Vectorized load: each thread reads two consecutive head-dims as one 32-bit bf16x2
-        // (halves the load instructions vs per-element). d is even -> 4-byte aligned.
+        // Vectorized load: bf16x2 into bf16 smem (halves load instructions vs per-element).
         for (int i = threadIdx.x * 2; i < valid * HEAD_DIM; i += blockDim.x * 2) {
             const int within = i / HEAD_DIM, d = i % HEAD_DIM;
             const size_t base = s_rowbase[within] + d;
             const __nv_bfloat162 k2 = *reinterpret_cast<const __nv_bfloat162*>(k_pool + base);
             const __nv_bfloat162 v2 = *reinterpret_cast<const __nv_bfloat162*>(v_pool + base);
-            s_k[i] = fa_to_f(k2.x); s_k[i + 1] = fa_to_f(k2.y);
-            s_v[i] = fa_to_f(v2.x); s_v[i + 1] = fa_to_f(v2.y);
+            s_k[i] = k2.x; s_k[i + 1] = k2.y;
+            s_v[i] = v2.x; s_v[i + 1] = v2.y;
         }
         __syncthreads();
         for (int tt = 0; tt < valid; tt++) {
             float p = 0.f;
             #pragma unroll
-            for (int e = 0; e < ELEMS; e++) p += qr[e] * s_k[tt * HEAD_DIM + lane + e * 32];
+            for (int e = 0; e < ELEMS; e++) p += qr[e] * fa_to_f(s_k[tt * HEAD_DIM + lane + e * 32]);
             const float score = fa_wsum(p) * scale;
             const float mn = fmaxf(m, score), corr = __expf(m - mn), pe = __expf(score - mn);
             l = l * corr + pe;
             #pragma unroll
-            for (int e = 0; e < ELEMS; e++) acc[e] = acc[e] * corr + pe * s_v[tt * HEAD_DIM + lane + e * 32];
+            for (int e = 0; e < ELEMS; e++) acc[e] = acc[e] * corr + pe * fa_to_f(s_v[tt * HEAD_DIM + lane + e * 32]);
             m = mn;
         }
         __syncthreads();
@@ -244,16 +243,39 @@ __global__ void fa_combine_kernel(
 #define FA_COMBINE_NW 4     // warps/block folding the split stripes; sweepable
 #endif
 #ifndef FA_GQA_TILE
-#define FA_GQA_TILE 6       // KV tokens staged per shared-memory tile; sweepable
+#define FA_GQA_TILE 12      // bf16 smem sweet spot at n_splits=256 (~64 tok/chunk)
 #endif
 template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
 template __global__ void fa_split_gqa_kernel<128, 8, FA_GQA_TILE>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
+template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, 8>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
+template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, 16>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/attention.h"
+
+template <int NW>
+static inline void fa_launch_combine(
+    const float* part_m, const float* part_l, const float* part_acc,
+    __nv_bfloat16* out, int num_q_heads, int n_splits, fa_block_q8_1* out_q8,
+    int num_seqs, cudaStream_t stream
+) {
+    dim3 g(num_q_heads * FA_COMBINE_DG, num_seqs);
+    fa_combine_kernel<128, FA_COMBINE_DG, NW><<<g, NW * 32, 0, stream>>>(
+        part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8);
+}
+
+static inline void fa_launch_combine_dispatch(
+    const float* part_m, const float* part_l, const float* part_acc,
+    __nv_bfloat16* out, int num_q_heads, int n_splits, fa_block_q8_1* out_q8,
+    int num_seqs, cudaStream_t stream
+) {
+    if (n_splits >= 128)      fa_launch_combine<16>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
+    else if (n_splits >= 64)  fa_launch_combine<8>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
+    else                      fa_launch_combine<FA_COMBINE_NW>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
+}
 
 void launch_flash_decode_split(
     const void* q, const void* k_pool, const void* v_pool,
@@ -272,15 +294,13 @@ void launch_flash_decode_split(
     if (use_gqa && num_kv_heads > 0 && num_q_heads == num_kv_heads * 8) {
         constexpr int GQA = 8, TILE = FA_GQA_TILE;
         dim3 gq(num_kv_heads * n_splits, num_seqs);
-        size_t smem = (size_t)2 * TILE * 128 * sizeof(float);
+        size_t smem = (size_t)2 * TILE * 128 * sizeof(__nv_bfloat16);
         fa_split_gqa_kernel<128, GQA, TILE><<<gq, GQA * 32, smem, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
             reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, seq_lens,
             part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
-        dim3 g2g(num_q_heads * FA_COMBINE_DG, num_seqs);
-        fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW><<<g2g, FA_COMBINE_NW * 32, 0, stream>>>(
-            part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
-            reinterpret_cast<fa_block_q8_1*>(out_q8));
+        fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                   num_q_heads, n_splits, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
         (void)head_dim;
         return;
     }
@@ -289,10 +309,8 @@ void launch_flash_decode_split(
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
         reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, seq_lens,
         part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
-    dim3 g2(num_q_heads * FA_COMBINE_DG, num_seqs);
-    fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW><<<g2, FA_COMBINE_NW * 32, 0, stream>>>(
-        part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
-        reinterpret_cast<fa_block_q8_1*>(out_q8));
+    fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                               num_q_heads, n_splits, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
     (void)head_dim;
 }
 #endif
