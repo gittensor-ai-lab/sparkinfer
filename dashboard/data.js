@@ -110,6 +110,27 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 116,
+      "title": "perf(moe): PDL overlap on gate_up -> quant_h -> down MMVQ chain",
+      "areas": [
+        "kernels"
+      ],
+      "label": "none",
+      "tps": 168.6,
+      "delta_pct": -24.0,
+      "top1": 0.9776,
+      "kl": 0.0142,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/116",
+      "eval_mode": "longctx",
+      "score_context": 16384,
+      "ctx_2048_tps": 275.69,
+      "ctx_16384_tps": 168.6,
+      "guard_2k_baseline": 276.3,
+      "guard_2k_ratio": 0.9978,
+      "guard_2k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0116-c02db45"
+    },
+    {
       "num": 123,
       "title": "Optimize 16k long-context GQA flash decode",
       "areas": [
@@ -203,20 +224,6 @@ window.SPARKINFER = {
       "kl": 13.9592,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/117",
       "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0117-2c0848b"
-    },
-    {
-      "num": 116,
-      "title": "perf(moe): PDL overlap on gate_up -> quant_h -> down MMVQ chain",
-      "areas": [
-        "kernels"
-      ],
-      "label": "none",
-      "tps": 464.51,
-      "delta_pct": 0.6,
-      "top1": 0.978,
-      "kl": 0.0055,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/116",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0116-dbcb3bb"
     },
     {
       "num": 91,
