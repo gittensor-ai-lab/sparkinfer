@@ -63,15 +63,26 @@ KVCacheManager::~KVCacheManager() {
 
 bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
     const int need = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
-    if ((int)impl_->free_list.size() < need || impl_->free_slots.empty()) return false;
     if (need > kMaxBlocksPerSeq) return false;
 
+    // `need` is the TOTAL blocks the sequence must own for num_tokens. Grow only by the
+    // delta over what it already holds -- the seq_slot reuse branch below is designed to
+    // re-allocate an existing seq_id, and appending `need` blocks unconditionally would
+    // (a) leak the blocks it already held and (b) push seq_blocks past kMaxBlocksPerSeq,
+    // making the cudaMemcpy of blocks.data() overrun the fixed-width device table row into
+    // the next sequence. A fresh seq_id has have==0, so this is identical to the old path.
     auto& blocks = impl_->seq_blocks[seq_id];
-    for (int i = 0; i < need; i++) { blocks.push_back(impl_->free_list.back()); impl_->free_list.pop_back(); }
+    const int have = (int)blocks.size();
+    const int add  = need - have;
+    auto it = impl_->seq_slot.find(seq_id);
+    const bool need_new_slot = (it == impl_->seq_slot.end());
+    // Check every precondition before mutating any free-list / slot state (fail clean).
+    if (add > 0 && (int)impl_->free_list.size() < add) return false;
+    if (need_new_slot && impl_->free_slots.empty()) return false;
+    for (int i = 0; i < add; i++) { blocks.push_back(impl_->free_list.back()); impl_->free_list.pop_back(); }
 
     int slot;
-    auto it = impl_->seq_slot.find(seq_id);
-    if (it != impl_->seq_slot.end()) slot = it->second;
+    if (!need_new_slot) slot = it->second;
     else { slot = impl_->free_slots.back(); impl_->free_slots.pop_back(); impl_->seq_slot[seq_id] = slot; }
 
     cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * kMaxBlocksPerSeq, blocks.data(),
