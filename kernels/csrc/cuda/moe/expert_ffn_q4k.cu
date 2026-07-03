@@ -855,8 +855,12 @@ void launch_moe_expert_ffn_q4k(
     if (gu2 < 0) { const char* g2 = getenv("SPARKINFER_GU2"); gu2 = (g2 && g2[0] == '0') ? 0 : 1; }
     static int gu_spec = -1;
     if (gu_spec < 0) { const char* gs = getenv("SPARKINFER_GU_SPEC"); gu_spec = (gs && gs[0] == '0') ? 0 : 1; }
+    // gate/up row-packing (2 rows/block, 8 warps). Default OFF: on RTX 5090 (sm_120) the
+    // 1-row-per-block gate_up_mmvq2_qwen_kernel is measurably faster than the packed variant
+    // — same 4 warps/row and identical math, but a smaller reduction footprint (sg/su[3][32]
+    // vs sg/su[2][3][32]) and no group indexing. Set SPARKINFER_GU_PACK2=1 to re-enable packing.
     static int gu_pack2 = -1;
-    if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
+    if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '1') ? 1 : 0; }
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
         const si_block_q8_1* q;
