@@ -46,16 +46,28 @@ public:
     void forward(const void* input, void* output, int num_tokens, int layer,
                  cudaStream_t stream) override {
         if (num_tokens <= 0) return;
+        const int H = cfg_.hidden_dim;
+        if (layer < 0 || layer >= (int)weights_.size()) {
+            fprintf(stderr, "[moe] forward: layer %d out of range [0, %zu)\n",
+                    layer, weights_.size());
+            return;
+        }
         if (num_tokens > max_tokens_) {
             // Router/top-k scratch is sized for max_tokens_; a larger batch would
             // overflow d_logits_/d_ids_/d_weights_ (OOB device writes). Refuse instead.
             fprintf(stderr, "[moe] forward: num_tokens %d exceeds scratch capacity %d — skipping\n",
                     num_tokens, max_tokens_);
+            cu(cudaMemsetAsync(output, 0, (size_t)num_tokens * H * sizeof(unsigned short), stream), "zero out");
             return;
         }
         const LayerWeights& w = weights_[layer];
+        if (!w.router_w || !w.gate_w || !w.up_w || !w.down_w) {
+            fprintf(stderr, "[moe] forward: layer %d has unset weight pointers — skipping\n", layer);
+            cu(cudaMemsetAsync(output, 0, (size_t)num_tokens * H * sizeof(unsigned short), stream), "zero out");
+            return;
+        }
         const int E = cfg_.num_experts, K = cfg_.top_k;
-        const int H = cfg_.hidden_dim, F = cfg_.ffn_dim;
+        const int F = cfg_.ffn_dim;
 
         // 1. router projection -> logits [num_tokens, E]
         kernels::launch_moe_router_gemm(input, w.router_w, d_logits_, num_tokens, H, E, stream);
