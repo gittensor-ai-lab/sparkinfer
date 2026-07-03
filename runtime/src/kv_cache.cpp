@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <unordered_map>
+#include <cstring>
 #include <cstdio>
 
 namespace sparkinfer {
@@ -22,6 +23,7 @@ inline void cu(cudaError_t e, const char* what) {
 }
 constexpr int kMaxSeqs = 256;
 constexpr int kMaxBlocksPerSeq = 4096;   // 4096 * block_size tokens per sequence
+constexpr int kInvalidBlock = -1;        // sentinel for unmapped logical blocks
 }
 
 struct KVCacheManager::Impl {
@@ -51,6 +53,7 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
     cu(cudaMalloc(&impl_->k_pool, pool_elems * sizeof(unsigned short)), "malloc k_pool");
     cu(cudaMalloc(&impl_->v_pool, pool_elems * sizeof(unsigned short)), "malloc v_pool");
     cu(cudaMalloc(&impl_->d_block_tables, (size_t)kMaxSeqs * kMaxBlocksPerSeq * sizeof(int)), "malloc tables");
+    cu(cudaMemset(impl_->d_block_tables, 0xFF, (size_t)kMaxSeqs * kMaxBlocksPerSeq * sizeof(int)), "init tables");
 
     impl_->free_list.reserve(impl_->total_blocks);
     for (int i = impl_->total_blocks - 1; i >= 0; --i) impl_->free_list.push_back(i);
@@ -62,31 +65,49 @@ KVCacheManager::~KVCacheManager() {
 }
 
 bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
+    if (num_tokens <= 0) return false;
     const int need = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
-    if ((int)impl_->free_list.size() < need || impl_->free_slots.empty()) return false;
     if (need > kMaxBlocksPerSeq) return false;
 
     auto& blocks = impl_->seq_blocks[seq_id];
-    for (int i = 0; i < need; i++) { blocks.push_back(impl_->free_list.back()); impl_->free_list.pop_back(); }
+    const int have = (int)blocks.size();
+    const int grow = need - have;
+    if (grow > 0) {
+        if ((int)impl_->free_list.size() < grow) return false;
+        if (have == 0 && impl_->free_slots.empty()) return false;
+        for (int i = 0; i < grow; i++) {
+            blocks.push_back(impl_->free_list.back());
+            impl_->free_list.pop_back();
+        }
+    }
+    if (blocks.empty()) return false;
 
     int slot;
     auto it = impl_->seq_slot.find(seq_id);
     if (it != impl_->seq_slot.end()) slot = it->second;
     else { slot = impl_->free_slots.back(); impl_->free_slots.pop_back(); impl_->seq_slot[seq_id] = slot; }
 
-    cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * kMaxBlocksPerSeq, blocks.data(),
-                  blocks.size() * sizeof(int), cudaMemcpyHostToDevice), "copy block table");
+    // Upload the full row: tail slots must not retain stale mappings from slot reuse.
+    std::vector<int> row(kMaxBlocksPerSeq, kInvalidBlock);
+    std::memcpy(row.data(), blocks.data(), blocks.size() * sizeof(int));
+    int* dst = impl_->d_block_tables + (size_t)slot * kMaxBlocksPerSeq;
+    cu(cudaMemcpy(dst, row.data(), (size_t)kMaxBlocksPerSeq * sizeof(int), cudaMemcpyHostToDevice), "copy block table");
     return true;
 }
 
 void KVCacheManager::free(uint64_t seq_id) {
+    auto s = impl_->seq_slot.find(seq_id);
+    if (s != impl_->seq_slot.end()) {
+        int* row = impl_->d_block_tables + (size_t)s->second * kMaxBlocksPerSeq;
+        cu(cudaMemset(row, 0xFF, (size_t)kMaxBlocksPerSeq * sizeof(int)), "clear block table");
+        impl_->free_slots.push_back(s->second);
+        impl_->seq_slot.erase(s);
+    }
     auto it = impl_->seq_blocks.find(seq_id);
     if (it != impl_->seq_blocks.end()) {
         for (int b : it->second) impl_->free_list.push_back(b);
         impl_->seq_blocks.erase(it);
     }
-    auto s = impl_->seq_slot.find(seq_id);
-    if (s != impl_->seq_slot.end()) { impl_->free_slots.push_back(s->second); impl_->seq_slot.erase(s); }
 }
 
 int* KVCacheManager::block_table(uint64_t seq_id) const {

@@ -92,6 +92,7 @@ __global__ void rope_kv_append_kernel(
     const int blk    = pos / block_size;
     const int within = pos % block_size;
     const int phys   = block_table[tok * max_blocks_per_seq + blk];
+    if (phys < 0) return;
     const size_t ctok = (size_t)(phys * block_size + within);   // cache token slot
 
     if (gid < nq) {                          // Q: rope in place
@@ -141,10 +142,12 @@ __global__ void qknorm_rope_kv_kernel(
     const int half = head_dim >> 1;
     const int pos  = positions[tok];
     const int blk = pos / block_size, within = pos % block_size;
-    const size_t ctok = (size_t)((size_t)block_table[tok * max_blocks_per_seq + blk] * block_size + within);
+    const int phys = block_table[tok * max_blocks_per_seq + blk];
+    const size_t ctok = (phys >= 0) ? (size_t)(phys * block_size + within) : 0;
 
     const bool is_v = (b >= n_q_heads + n_kv_heads);
     if (is_v) {                                    // V: copy head straight to the cache (no norm/rope)
+        if (phys < 0) return;
         const int hh = b - n_q_heads - n_kv_heads;
         const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
         const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
@@ -187,7 +190,7 @@ __global__ void qknorm_rope_kv_kernel(
         const __nv_bfloat16 o1 = __float2bfloat16(x1 * c + x0 * s);
         if (is_q) {                                // Q: rope in place
             q[base + t] = o0; q[base + t + half] = o1;
-        } else {                                   // K: rope straight into the paged cache
+        } else if (phys >= 0) {                  // K: rope straight into the paged cache
             const size_t dst = (ctok * n_kv_heads + head) * head_dim;
             k_pool[dst + t] = o0; k_pool[dst + t + half] = o1;
         }

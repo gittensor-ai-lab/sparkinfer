@@ -58,6 +58,7 @@ __global__ void fa_split_kernel(
     for (int t = start; t < end; t++) {
         const int blk = t / block_size, within = t % block_size;
         const int phys = block_table[seq * max_blocks + blk];
+        if (phys < 0) continue;
         const size_t base = ((size_t)(phys * block_size + within) * num_kv_heads + kvh) * HEAD_DIM;
         float p = 0.f;
         #pragma unroll
