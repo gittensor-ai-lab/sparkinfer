@@ -528,12 +528,16 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     GGUF g;
     if (!g.open(path)) return false;
 
-    // Shared-expert tensors are optional in GGUF (Qwen3-30B-A3B has none). The
-    // default config sets n_shared=1, so clamp it to what the file actually
-    // contains before forward_token can launch a null-weight FFN.
+    // Shared-expert tensors are optional in GGUF (Qwen3-30B-A3B has none; Qwen3.5-35B-A3B
+    // and Gemma4 have one). Clamp down when absent; auto-enable when present so callers
+    // that hardcode n_shared=0 (all GGUF examples) still run the correct graph.
     const bool gguf_has_shared =
         g.tensor("blk.0.ffn_gate_shexp.weight") != nullptr;
-    if (c.n_shared > 0 && !gguf_has_shared) {
+    if (gguf_has_shared && s.cfg.n_shared == 0) {
+        fprintf(stderr,
+                "[gguf] shared-expert tensors present; enabling n_shared=1\n");
+        s.cfg.n_shared = 1;
+    } else if (s.cfg.n_shared > 0 && !gguf_has_shared) {
         fprintf(stderr,
                 "[gguf] no shared-expert tensors; forcing n_shared=0 "
                 "(safe for models without a shared FFN)\n");
