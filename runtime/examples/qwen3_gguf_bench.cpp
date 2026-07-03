@@ -65,7 +65,11 @@ int main(int argc, char** argv) {
 
     auto rt = sparkinfer::Runtime::create({}); rt->initialize();
     sparkinfer::KVCacheConfig kvc;
-    kvc.num_layers=cfg.n_layers; kvc.num_kv_heads=cfg.n_kv_heads; kvc.head_dim=cfg.head_dim; kvc.block_size=16; kvc.int8_kv = !(getenv("SPARKINFER_KV_INT8") && getenv("SPARKINFER_KV_INT8")[0]=='0');
+    kvc.num_layers=cfg.n_layers; kvc.num_kv_heads=cfg.n_kv_heads; kvc.head_dim=cfg.head_dim; kvc.block_size=16;
+    // int8 KV pays off only once the halved long-context read outweighs its fixed per-token write cost,
+    // so enable it context-adaptively (>= 8k) by default; short contexts stay bf16 (no regression).
+    // SPARKINFER_KV_INT8=1/0 forces it on/off regardless.
+    { const char* e8 = getenv("SPARKINFER_KV_INT8"); kvc.int8_kv = e8 ? (e8[0] != '0') : (context_tokens >= 8192); }
     const size_t epb=(size_t)16*cfg.n_kv_heads*cfg.head_dim, blocks=(cfg.max_seq+15)/16+8;
     sparkinfer::KVCacheManager kv(kvc, (size_t)cfg.n_layers*2*epb*2*blocks);
     sparkinfer::moe::MoEConfig mc;
