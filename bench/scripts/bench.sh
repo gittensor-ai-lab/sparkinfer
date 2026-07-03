@@ -14,12 +14,15 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 GGUF=""; TOKENS=128; CTX=0; COMPARE=0
+# require a non-negative integer value for a flag: need_num <flag> <value>
+need_num() { case "${2:-}" in ''|*[!0-9]*) echo "!! $1 needs a non-negative integer (got '${2:-}')"; exit 2 ;; esac; }
 while [ $# -gt 0 ]; do case "$1" in
   --download) GGUF="$MODELS_DIR/$MODEL_FILE" ;;
-  --tokens)   shift; TOKENS="$1" ;;
-  --ctx)      shift; CTX="$1" ;;
+  --tokens)   need_num "$1" "${2:-}"; TOKENS="$2"; shift ;;
+  --ctx)      need_num "$1" "${2:-}"; CTX="$2"; shift ;;
   --compare)  COMPARE=1 ;;
   -h|--help)  sed -n '2,9p' "$0"; exit 0 ;;
+  --*)        echo "!! unknown option: $1  (see --help)"; exit 2 ;;
   *)          GGUF="$1" ;;
 esac; shift; done
 [ -z "$GGUF" ] && GGUF="$MODELS_DIR/$MODEL_FILE"
