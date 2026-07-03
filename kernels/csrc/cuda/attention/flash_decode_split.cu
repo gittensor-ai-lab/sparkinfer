@@ -288,7 +288,7 @@ void launch_flash_decode_split(
         const char* e = getenv("SPARKINFER_FAGQA");
         fagqa = e ? ((e[0] == '0') ? 0 : 1) : -2;   // -2 = auto: long-context only
     }
-    const bool use_gqa = (fagqa == 1) || (fagqa == -2 && n_splits >= 64);
+    const bool use_gqa = (fagqa == 1) || (fagqa == -2 && n_splits >= 32);
     if (use_gqa && num_kv_heads > 0 && num_q_heads == num_kv_heads * 8) {
         constexpr int GQA = 8, TILE = FA_GQA_TILE;
         dim3 gq(num_kv_heads * n_splits, num_seqs);
