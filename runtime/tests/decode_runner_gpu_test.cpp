@@ -44,7 +44,7 @@ int main() {
 
     const int H = 2048, nkv = 2, nq = 16, hd = 128;        // gqa8 / Qwen3.5 attention
     const int E = 8, K = 2, F = 64, layers = 2, seqs = 2;
-    AttnConfig ac{nq, nkv, hd, 1.f / std::sqrt((float)hd)};
+    AttnConfig ac{nq, nkv, hd, 1.f / std::sqrt((float)hd), 1e6f, 1e-6f};
 
     KVCacheConfig kvc; kvc.num_layers = layers; kvc.num_kv_heads = nkv; kvc.head_dim = hd; kvc.block_size = 16;
     KVCacheManager kv(kvc, 64ull * 1024 * 1024);
@@ -61,6 +61,8 @@ int main() {
         w[l].wk = dev_rand_bf16((size_t)H * KVd, 0.05f);
         w[l].wv = dev_rand_bf16((size_t)H * KVd, 0.05f);
         w[l].wo = dev_rand_bf16((size_t)Q * H, 0.05f);
+        w[l].q_norm = dev_rand_bf16(hd, 0.5f);
+        w[l].k_norm = dev_rand_bf16(hd, 0.5f);
         w[l].ffn_norm = dev_rand_bf16(H, 0.5f);
         w[l].moe.router_w = dev_rand_bf16((size_t)H * E, 0.1f);
         w[l].moe.gate_w = dev_rand_bf16((size_t)E * H * F, 0.05f);

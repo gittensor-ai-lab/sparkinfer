@@ -83,23 +83,36 @@ void DecodeRunner::decode_layer(int layer, void* x, int num_seqs,
         return;
     }
     const int H = s.hidden, Q = s.qdim, KV = s.kvdim;
+    const float eps = s.attn.rms_eps;
     kernels::GemmConfig gc{};
 
     // 1. pre-attention norm
-    kernels::launch_rmsnorm(x, w.attn_norm, s.xn, num_seqs, H, 1e-6f, stream);
+    kernels::launch_rmsnorm(x, w.attn_norm, s.xn, num_seqs, H, eps, stream);
 
     // 2. Q/K/V projections
     kernels::launch_gemm(s.xn, w.wq, s.q, num_seqs, Q,  H, 1.f, 0.f, gc, stream);
     kernels::launch_gemm(s.xn, w.wk, s.k, num_seqs, KV, H, 1.f, 0.f, gc, stream);
     kernels::launch_gemm(s.xn, w.wv, s.v, num_seqs, KV, H, 1.f, 0.f, gc, stream);
 
-    // 3. append new K/V into the paged cache for this layer
+    // 3. per-head QK-norm + RoPE + paged KV append (matches Qwen35Model::forward_token)
     bf16* kpool = (bf16*)s.kv->k_pool() + (size_t)layer * s.kv->layer_stride_elems();
     bf16* vpool = (bf16*)s.kv->v_pool() + (size_t)layer * s.kv->layer_stride_elems();
     int* btable = s.kv->block_table(0);   // batch occupies slots 0..num_seqs-1
-    launch_kv_append(kpool, vpool, s.k, s.v, btable, s.d_write_pos,
-                     num_seqs, s.attn.num_kv_heads, s.attn.head_dim,
-                     s.kv->block_size(), s.kv->max_blocks_per_seq(), stream);
+    if (w.q_norm && w.k_norm) {
+        kernels::launch_qknorm_rope_kv_append(
+            s.q, s.k, s.v, w.q_norm, w.k_norm, kpool, vpool, btable, s.d_write_pos,
+            num_seqs, s.attn.num_q_heads, s.attn.num_kv_heads, s.attn.head_dim,
+            s.attn.rope_theta, eps, s.kv->block_size(), s.kv->max_blocks_per_seq(), stream);
+    } else if (s.attn.rope_theta > 0.f) {
+        kernels::launch_rope_kv_append(
+            s.q, s.k, s.v, kpool, vpool, btable, s.d_write_pos,
+            num_seqs, s.attn.num_q_heads, s.attn.num_kv_heads, s.attn.head_dim,
+            s.attn.rope_theta, s.kv->block_size(), s.kv->max_blocks_per_seq(), stream);
+    } else {
+        launch_kv_append(kpool, vpool, s.k, s.v, btable, s.d_write_pos,
+                         num_seqs, s.attn.num_kv_heads, s.attn.head_dim,
+                         s.kv->block_size(), s.kv->max_blocks_per_seq(), stream);
+    }
 
     // 4. GQA flash decode over the paged cache
     kernels::launch_flash_decode_gqa8(s.q, kpool, vpool, btable, s.d_seq_lens, s.attnout,
@@ -110,7 +123,7 @@ void DecodeRunner::decode_layer(int layer, void* x, int num_seqs,
     // 5. output projection + residual + post-attention norm
     kernels::launch_gemm(s.attnout, w.wo, s.ao, num_seqs, H, Q, 1.f, 0.f, gc, stream);
     launch_residual_add(x, s.ao, s.h, num_seqs * H, stream);          // h = x + attn
-    kernels::launch_rmsnorm(s.h, w.ffn_norm, s.hn, num_seqs, H, 1e-6f, stream);
+    kernels::launch_rmsnorm(s.h, w.ffn_norm, s.hn, num_seqs, H, eps, stream);
 
     // 6. sync-free MoE FFN + residual
     s.moe->set_layer_weights(layer, w.moe);

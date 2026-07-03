@@ -11,7 +11,9 @@ struct AttnConfig {
     int num_q_heads;
     int num_kv_heads;
     int head_dim;
-    float scale;     // 1/sqrt(head_dim)
+    float scale;        // 1/sqrt(head_dim)
+    float rope_theta = 1e6f;
+    float rms_eps    = 1e-6f;
 };
 
 // Device weight pointers (bf16) for one MoE transformer layer.
@@ -21,12 +23,14 @@ struct TransformerLayerWeights {
     const void* wk = nullptr;          // [hidden, num_kv_heads*head_dim]
     const void* wv = nullptr;          // [hidden, num_kv_heads*head_dim]
     const void* wo = nullptr;          // [num_q_heads*head_dim, hidden]
+    const void* q_norm = nullptr;      // [head_dim] per-head Q RMSNorm (Qwen3; null = skip)
+    const void* k_norm = nullptr;      // [head_dim] per-head K RMSNorm (Qwen3; null = skip)
     const void* ffn_norm = nullptr;    // [hidden]
     moe::LayerWeights moe;             // router_w, gate_w, up_w, down_w
 };
 
 // Drives a batch of single-token decode steps through the full stack:
-//   RMSNorm -> Q/K/V proj -> KV append -> GQA flash decode -> O proj
+//   RMSNorm -> Q/K/V proj -> QK-norm + RoPE + KV append -> GQA flash decode -> O proj
 //   -> residual+RMSNorm -> sync-free MoE -> residual.
 // Attention uses the gqa8 kernel (Qwen3.5-35B-A3B: 16 Q / 2 KV heads, hd=128).
 class DecodeRunner {
