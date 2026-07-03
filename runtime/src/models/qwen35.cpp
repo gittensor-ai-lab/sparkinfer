@@ -95,8 +95,18 @@ struct Qwen35Model::Impl {
     bool use_attnin = true;// default ON: single fused QK-norm+RoPE+KV-append (1 kernel vs qkfuse+ropekv=2). =0 disables
     bool use_fnq = true;   // default ON: post-MoE add_rmsnorm2 also emits Q8_1(xn), deleting the
                            // next layer's standalone QKV-input quantize node. =0 disables
+    bool runtime_ok = true;
 
-    template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
+    template <class T> T* alloc(size_t n) {
+        void* p = nullptr;
+        cudaError_t e = cudaMalloc(&p, n * sizeof(T));
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[qwen35] malloc %zu elems: %s\n", n, cudaGetErrorString(e));
+            runtime_ok = false;
+            return nullptr;
+        }
+        return (T*)p;
+    }
 };
 
 Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine)
@@ -163,6 +173,10 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_FNQ"))    p_->use_fnq   = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_QKVSTREAM")) p_->use_qkvstream = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ATTNIN")) p_->use_attnin = !(e[0] == '0');
+    if (!p_->x || !p_->q || !p_->k || !p_->v || !p_->attn || !p_->logits || !p_->fa_acc || !p_->runtime_ok) {
+        fprintf(stderr, "[qwen35] constructor: device scratch allocation failed\n");
+        p_->runtime_ok = false;
+    }
 }
 
 Qwen35Model::~Qwen35Model() {
@@ -195,6 +209,10 @@ void Qwen35Model::copy_logits(float* host_logits) const {
 
 int Qwen35Model::forward_token(int token_id, int position) {
     Impl& s = *p_;
+    if (!s.runtime_ok) {
+        fprintf(stderr, "[qwen35] forward_token: model scratch not allocated\n");
+        return -1;
+    }
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
     kernels::GemmConfig gc{};
