@@ -673,13 +673,19 @@ __global__ void down_q6k_mmvq_splitk_qwen_kernel(
         }
         #pragma unroll
         for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
-        if (lane == 0) s_part[hh_local][split] = acc;
+        // split==0's partial is read back from `acc` below, so only split>0 warps need to
+        // publish to shared (their cells are the cross-warp inputs to the split==0 reducer).
+        if (lane == 0 && split != 0) s_part[hh_local][split] = acc;
     }
     __syncthreads();
     if (hh < H && split == 0 && lane == 0) {
+        // acc still holds this thread's own partial (== the old s_part[hh_local][0]); read it
+        // from the register instead of shared. Keep the leading `0.0f +` so the fp add sequence
+        // — and its -0.0f/NaN sign behavior — stays bit-identical to the all-shared reduction.
         float o = 0.f;
+        o += acc;
         #pragma unroll
-        for (int s = 0; s < S; s++) o += s_part[hh_local][s];
+        for (int s = 1; s < S; s++) o += s_part[hh_local][s];
         output[(size_t)token * H + hh] = __float2bfloat16(o);
     }
 }
