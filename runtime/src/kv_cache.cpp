@@ -45,6 +45,10 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
     // pool_bytes covers K and V across all layers.
     const size_t denom = (size_t)cfg.num_layers * 2 * bytes_per_block;
     impl_->total_blocks = denom ? (int)(pool_bytes / denom) : 0;
+    if (impl_->total_blocks < 1) {
+        fprintf(stderr, "[kv] pool_bytes=%zu too small for config (0 blocks; need >= %zu bytes)\n",
+                pool_bytes, denom);
+    }
     impl_->layer_stride = (size_t)impl_->total_blocks * elems_per_block;
 
     const size_t pool_elems = (size_t)cfg.num_layers * impl_->layer_stride;
