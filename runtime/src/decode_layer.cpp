@@ -82,6 +82,11 @@ void DecodeRunner::decode_layer(int layer, void* x, int num_seqs,
                 num_seqs, s.max_batch);
         return;
     }
+    if (!w.attn_norm || !w.wq || !w.wk || !w.wv || !w.wo || !w.ffn_norm
+        || !w.moe.router_w || !w.moe.gate_w || !w.moe.up_w || !w.moe.down_w) {
+        fprintf(stderr, "[decode] decode_layer: layer %d has unset weight pointers — skipping\n", layer);
+        return;
+    }
     const int H = s.hidden, Q = s.qdim, KV = s.kvdim;
     kernels::GemmConfig gc{};
 
@@ -97,6 +102,10 @@ void DecodeRunner::decode_layer(int layer, void* x, int num_seqs,
     bf16* kpool = (bf16*)s.kv->k_pool() + (size_t)layer * s.kv->layer_stride_elems();
     bf16* vpool = (bf16*)s.kv->v_pool() + (size_t)layer * s.kv->layer_stride_elems();
     int* btable = s.kv->block_table(0);   // batch occupies slots 0..num_seqs-1
+    if (!btable) {
+        fprintf(stderr, "[decode] decode_layer: seq 0 has no KV block table — skipping\n");
+        return;
+    }
     launch_kv_append(kpool, vpool, s.k, s.v, btable, s.d_write_pos,
                      num_seqs, s.attn.num_kv_heads, s.attn.head_dim,
                      s.kv->block_size(), s.kv->max_blocks_per_seq(), stream);
