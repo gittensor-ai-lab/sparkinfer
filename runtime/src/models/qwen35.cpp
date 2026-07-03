@@ -370,7 +370,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
             s.engine->set_layer_weights(L, {w.router_w, w.gate, w.up, w.down});
             s.engine->forward(s.hn, s.routed, 1, L, st);
         }
-        if (c.n_shared > 0) {
+        if (c.n_shared > 0 && w.shared_gate && w.shared_up && w.shared_down) {
             kernels::launch_moe_expert_ffn(s.hn, w.shared_gate, w.shared_up, w.shared_down,
                                            s.d_shared_ids, s.d_shared_w, s.shared,
                                            1, 1, 1, H, c.moe_ffn, st);
@@ -514,6 +514,7 @@ bool Qwen35Model::load_weights(const std::string& dir) {
         w.gate = L(pfx + "gate"); w.up = L(pfx + "up"); w.down = L(pfx + "down");
         if (s.cfg.n_shared > 0) {
             w.shared_gate = L(pfx + "shared_gate"); w.shared_up = L(pfx + "shared_up"); w.shared_down = L(pfx + "shared_down");
+            if (!w.shared_gate || !w.shared_up || !w.shared_down) return false;
         }
         if (!w.wq || !w.gate || !w.router_w) return false;
     }
