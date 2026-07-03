@@ -196,6 +196,16 @@ void Qwen35Model::copy_logits(float* host_logits) const {
 int Qwen35Model::forward_token(int token_id, int position) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
+    if (position < 0 || position >= c.max_seq) {
+        fprintf(stderr, "[qwen35] forward_token: position %d out of range [0, %d)\n",
+                position, c.max_seq);
+        return -1;
+    }
+    if (token_id < 0 || token_id >= c.vocab) {
+        fprintf(stderr, "[qwen35] forward_token: token_id %d out of range [0, %d)\n",
+                token_id, c.vocab);
+        return -1;
+    }
     const int H = c.hidden;
     kernels::GemmConfig gc{};
     int seqlen = position + 1;
@@ -394,8 +404,18 @@ int Qwen35Model::forward_token(int token_id, int position) {
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
-    cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
-    cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
+    cudaError_t cap_err = cudaStreamEndCapture(st, &s.cu_graph);
+    if (cap_err != cudaSuccess) {
+        fprintf(stderr, "[qwen35] cudaStreamEndCapture: %s\n", cudaGetErrorString(cap_err));
+        return -1;
+    }
+    cudaError_t inst_err = cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0);
+    if (inst_err != cudaSuccess) {
+        fprintf(stderr, "[qwen35] cudaGraphInstantiate: %s\n", cudaGetErrorString(inst_err));
+        cudaGraphDestroy(s.cu_graph);
+        s.cu_graph = nullptr;
+        return -1;
+    }
     s.graph_ready = true;
     cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
 
@@ -467,12 +487,25 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         fprintf(stderr, "[qwen35] KV allocate failed (pool too small for max_seq=%d)\n", s.cfg.max_seq);
         return out;
     }
+    const int last_pos = (int)prompt.size() + max_new - 1;
+    if (last_pos >= s.cfg.max_seq) {
+        fprintf(stderr,
+                "[qwen35] prompt (%zu) + generation (%d) needs position %d; max_seq=%d\n",
+                prompt.size(), max_new, last_pos, s.cfg.max_seq);
+        s.kv->free(s.seq_id);
+        return out;
+    }
     int next = -1;
-    for (size_t i = 0; i < prompt.size(); i++) next = forward_token(prompt[i], (int)i);
+    for (size_t i = 0; i < prompt.size(); i++) {
+        next = forward_token(prompt[i], (int)i);
+        if (next < 0) { s.kv->free(s.seq_id); return out; }
+    }
     for (int i = 0; i < max_new; i++) {
+        if (next < 0) break;
         out.push_back(next);
         if (next == s.cfg.eos_id) break;
         next = forward_token(next, (int)prompt.size() + i);
+        if (next < 0) break;
         if (gov) gov->pace();   // thermally-adaptive decode pacing (accuracy-preserving; no-op if disabled)
     }
     s.kv->free(s.seq_id);
