@@ -35,8 +35,13 @@ public:
                  int max_batch = 256);
     ~DecodeRunner();
 
-    // Begin a decode step: set the new-token position for each sequence
-    // (host seq_lens = length BEFORE this token). Uploads positions to device.
+    // Begin a decode step: set the new-token position for each batch row and
+    // gather each sequence's paged block table into batch-indexed device layout
+    // (seq_lens = length BEFORE this token; seq_ids[b] = KV owner for batch row b).
+    void begin_step(const std::vector<uint64_t>& seq_ids,
+                    const std::vector<int>& seq_lens_before);
+
+    // Convenience when batch row b maps to KV sequence id b.
     void begin_step(const std::vector<int>& seq_lens_before);
 
     // Run one layer in-place on x: [num_seqs, hidden] (bf16, device).

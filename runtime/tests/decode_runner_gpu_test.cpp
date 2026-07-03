@@ -73,7 +73,8 @@ int main() {
 
     cudaStream_t stream; cudaStreamCreate(&stream);
     std::vector<int> lens(seqs, 7);                 // 7 tokens already cached
-    runner.begin_step(lens);
+    std::vector<uint64_t> seq_ids = {0, 1};
+    runner.begin_step(seq_ids, lens);               // pack per-seq slots -> batch rows
     for (int l = 0; l < layers; l++) runner.decode_layer(l, x, seqs, w[l], stream);
     cudaStreamSynchronize(stream);
 
