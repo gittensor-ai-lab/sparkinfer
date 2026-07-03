@@ -17,9 +17,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from sparkinfer_cutedsl.moe_swiglu import build_routed_swiglu_kernel
+from sparkinfer_cutedsl.moe_swiglu import build_routed_swiglu_launcher
 from sparkinfer_cutedsl.reference import router_gemm_reference, routed_swiglu_reference
-from sparkinfer_cutedsl.router_gemm import build_router_gemm_kernel
+from sparkinfer_cutedsl.router_gemm import build_router_gemm_launcher
 
 
 def _assert_close(got: list[float], want: list[float], tol: float = 1e-6) -> None:
@@ -85,9 +85,9 @@ def main() -> None:
     print("[cutedsl] CPU reference checks passed")
 
     if args.require_dsl:
-        build_router_gemm_kernel()
-        build_routed_swiglu_kernel()
-        print("[cutedsl] CuTe DSL package import/JIT construction passed")
+        build_router_gemm_launcher()
+        build_routed_swiglu_launcher()
+        print("[cutedsl] CuTe DSL package import/compile construction passed")
     else:
         print("[cutedsl] skipped CuTe DSL import; pass --require-dsl on a CUDA node")
 

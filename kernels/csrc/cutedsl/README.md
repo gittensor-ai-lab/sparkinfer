@@ -34,7 +34,7 @@ python3 -m pip install nvidia-cutlass-dsl
 The official CUTLASS DSL quick start states that `nvidia-cutlass-dsl[cu13]` is
 the CUDA 13.1 wheel and that Python 3.10-3.14 on Linux is supported.
 
-## Smoke test
+## Smoke test and benchmark
 
 The local smoke test exercises the CPU references even without a CUDA toolkit:
 
@@ -49,6 +49,25 @@ CuTe DSL package is missing:
 python3 kernels/csrc/cutedsl/run_smoke.py --require-dsl
 ```
 
+Run the executable CuTe DSL benchmark:
+
+```bash
+python3 kernels/csrc/cutedsl/bench_cutedsl.py \
+  --hidden 2048 --experts 256 --ffn 768 --iters 30 --warmup 5
+```
+
+RTX 5090 / CUDA 13.0 / CUTLASS DSL 4.6.0 result from Vast instance `43634439`:
+
+| kernel | shape | time | throughput | max abs error |
+|---|---:|---:|---:|---:|
+| `router_gemm_cutedsl` | tokens=1, hidden=2048, experts=256 | 0.0440 ms | 23.83 GFLOP/s | 6.3e-8 |
+| `routed_swiglu_cutedsl` | tokens=1, top_k=8, hidden=2048, ffn=768 | 0.2615 ms | 192.45 GFLOP/s | 2.0e-9 |
+
+These are scalar CuTe DSL baselines, not final tensor-core kernels. They prove
+that the isolated branch can install, JIT, execute, validate, and time real CuTe
+DSL kernels on RTX 5090. The next optimization step is to replace the scalar
+per-output CTA mapping with tiled reductions and then grouped tensor-core GEMM.
+
 ## Integration rule
 
 Do not call these kernels from the runtime until all of the following are true:
@@ -58,4 +77,3 @@ Do not call these kernels from the runtime until all of the following are true:
 2. Same-box RTX 5090 benchmarks beat or match the handwritten CUDA kernel for
    the target surface.
 3. The production path keeps a build flag fallback to handwritten CUDA.
-
