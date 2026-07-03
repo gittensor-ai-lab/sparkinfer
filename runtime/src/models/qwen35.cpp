@@ -620,6 +620,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             if (!w.shared_gate || !w.shared_up || !w.shared_down) return false;
         }
         if (!w.wq || !w.router_w || !w.gate_q || !w.up_q || !w.down_q) return false;
+        if (!w.input_norm || !w.post_attn_norm) return false;
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
