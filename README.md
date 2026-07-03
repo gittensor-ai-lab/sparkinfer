@@ -4,13 +4,13 @@
 
 **Fastest MoE/LLM inference runtime for consumer and edge Blackwell GPUs.**
 
-SP⚡RKINFER is a Blackwell-native inference runtime built for high-speed, power-optimized local AI on NVIDIA RTX 5090, RTX PRO 6000, RTX Spark, and Jetson Thor.
+**SPARKINFER** is a _Blackwell-native_ inference runtime built for **high-speed**, **power-optimized** **local AI** on **NVIDIA RTX 50xx**, **RTX PRO 6000**, **RTX Spark**, and **Jetson Thor**.
 
-It is designed for the next generation of personal agents, local copilots, robotics, and edge AI systems where inference speed, memory efficiency, and power efficiency decide how usable local intelligence feels.
+_It is designed for the next generation of personal agents like **Openclaw**, local copilots, **robotics**, and edge AI systems where inference speed, memory efficiency, and power efficiency decide how usable local intelligence feels._
 
-SP⚡RKINFER is continuously optimized through [Gittensor competition](https://gittensor.io/) and proprietary Kernel Design Agents, turning frontier CUDA improvements into faster, power-optimized local MoE/LLM decode on real Blackwell hardware.
+**SPARKINFER** is continuously optimized through [**SN74 Gittensor** competition](https://gittensor.io/) and **proprietary Kernel Design Agents**, turning frontier CUDA improvements into faster, power-optimized local MoE/LLM decode on real Blackwell hardware. _([Live dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/))_
 
-## Current progress
+## Benchmark
 
 Live RTX 5090 frontier, same Q4_K_M GGUF, 128 generated tokens:
 
