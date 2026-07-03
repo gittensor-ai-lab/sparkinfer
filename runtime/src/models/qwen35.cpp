@@ -516,6 +516,7 @@ bool Qwen35Model::load_weights(const std::string& dir) {
             w.shared_gate = L(pfx + "shared_gate"); w.shared_up = L(pfx + "shared_up"); w.shared_down = L(pfx + "shared_down");
         }
         if (!w.wq || !w.gate || !w.router_w) return false;
+        if (!w.input_norm || !w.post_attn_norm) return false;
     }
     return true;
 }
