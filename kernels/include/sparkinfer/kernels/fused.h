@@ -32,7 +32,7 @@ void launch_rmsnorm_qk(void* q, void* k, const void* q_w, const void* k_w,
 // Token embedding gather: out[t,:] = table[ids[t],:]  (bf16).
 //   ids: [n_tokens] (int32), table: [vocab, hidden], out: [n_tokens, hidden]
 void launch_embedding(const int* ids, const void* table, void* out,
-                      int n_tokens, int hidden, cudaStream_t stream = nullptr);
+                      int n_tokens, int hidden, int vocab, cudaStream_t stream = nullptr);
 
 // Greedy argmax over each row of logits.  logits: [n_rows, vocab] (fp32),
 // out_id: [n_rows] (int32).

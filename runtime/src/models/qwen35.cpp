@@ -236,7 +236,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
     }
     cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture");
 
-    kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
+    kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, c.vocab, st);
 
     int* btable = s.kv->block_table(s.seq_id);
     // Prime: xn = RMSNorm(x, layer0.input_norm). Each layer's tail then fuses the

@@ -11,12 +11,15 @@ namespace sparkinfer {
 namespace kernels {
 
 // out[t, :] = table[ids[t], :]   grid = n_tokens, threads over hidden.
+// ids outside [0, vocab) clamp to 0 — CUDA-graph replay and decode_feedback
+// can reach this kernel without a host-side token check on every path.
 __global__ void embedding_kernel(const int* __restrict__ ids,
                                  const __nv_bfloat16* __restrict__ table,
                                  __nv_bfloat16* __restrict__ out,
-                                 int hidden) {
+                                 int hidden, int vocab) {
     const int t  = blockIdx.x;
-    const int id = ids[t];
+    const int raw = ids[t];
+    const int id = (raw >= 0 && raw < vocab) ? raw : 0;
     for (int h = threadIdx.x; h < hidden; h += blockDim.x)
         out[(size_t)t * hidden + h] = table[(size_t)id * hidden + h];
 }
@@ -104,10 +107,10 @@ __global__ void decode_feedback_kernel(int* __restrict__ scalars,
 #include "sparkinfer/kernels/fused.h"
 
 void launch_embedding(const int* ids, const void* table, void* out,
-                      int n_tokens, int hidden, cudaStream_t stream) {
+                      int n_tokens, int hidden, int vocab, cudaStream_t stream) {
     embedding_kernel<<<n_tokens, 256, 0, stream>>>(
         ids, reinterpret_cast<const __nv_bfloat16*>(table),
-        reinterpret_cast<__nv_bfloat16*>(out), hidden);
+        reinterpret_cast<__nv_bfloat16*>(out), hidden, vocab);
 }
 
 void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab, cudaStream_t stream) {
