@@ -97,6 +97,17 @@ struct Qwen35Model::Impl {
                            // next layer's standalone QKV-input quantize node. =0 disables
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
+
+    // Drop a captured decode graph when weights, KV layout, or capture mode change.
+    // Without this, replay keeps stale kernel args (old weight pointers, block-table
+    // rows, or the bench-only decode_feedback node baked into the graph).
+    void invalidate_decode_graph() {
+        if (graph_ready) {
+            cudaGraphExecDestroy(cu_exec);
+            cudaGraphDestroy(cu_graph);
+            graph_ready = false;
+        }
+    }
 };
 
 Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine)
@@ -184,7 +195,10 @@ Qwen35Model::~Qwen35Model() {
     delete p_;
 }
 
-void Qwen35Model::set_weights(const Qwen35Weights& w) { p_->w = w; }
+void Qwen35Model::set_weights(const Qwen35Weights& w) {
+    p_->invalidate_decode_graph();
+    p_->w = w;
+}
 const Qwen35Config& Qwen35Model::config() const { return p_->cfg; }
 
 void Qwen35Model::copy_logits(float* host_logits) const {
@@ -219,9 +233,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
         if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
-            if (s.graph_ready) {
-                cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false;
-            }
+            s.invalidate_decode_graph();
         }
     }
 
@@ -406,6 +418,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
 
 double Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
     Impl& s = *p_;
+    s.invalidate_decode_graph();   // re-capture with/without bench_feedback as needed
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) { fprintf(stderr, "[bench] kv allocate failed\n"); return -1; }
     int start_pos = context_tokens;
     if (const char* e = getenv("SPARKINFER_BENCH_START_POS")) {
@@ -445,6 +458,7 @@ double Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
         auto t1 = std::chrono::high_resolution_clock::now();
         s.kv->free(s.seq_id);
         s.bench_feedback_graph = false;
+        s.invalidate_decode_graph();
         double secs = std::chrono::duration<double>(t1 - t0).count();
         return n / secs;
     }
@@ -455,6 +469,7 @@ double Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
     auto t1 = std::chrono::high_resolution_clock::now();
     s.kv->free(s.seq_id);
     s.bench_feedback_graph = false;
+    s.invalidate_decode_graph();
     double secs = std::chrono::duration<double>(t1 - t0).count();
     return n / secs;
 }
@@ -463,6 +478,7 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     Impl& s = *p_;
     std::vector<int> out;
     if (prompt.empty()) return out;
+    s.invalidate_decode_graph();
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
         fprintf(stderr, "[qwen35] KV allocate failed (pool too small for max_seq=%d)\n", s.cfg.max_seq);
         return out;
@@ -497,6 +513,7 @@ void* load_bin(const std::string& path, std::vector<void*>& owned) {
 
 bool Qwen35Model::load_weights(const std::string& dir) {
     Impl& s = *p_;
+    s.invalidate_decode_graph();
     auto L = [&](const std::string& n) { return load_bin(dir + "/" + n + ".bin", s.owned); };
     s.w.embed_tokens = L("embed_tokens");
     s.w.final_norm   = L("final_norm");
@@ -523,6 +540,7 @@ bool Qwen35Model::load_weights(const std::string& dir) {
 // ----- native GGUF load: dense -> bf16 (dequant + transpose), experts kept quantized -----
 bool Qwen35Model::load_gguf(const std::string& path) {
     Impl& s = *p_;
+    s.invalidate_decode_graph();
     const Qwen35Config& c = s.cfg;
     s.gguf = true;   // dense weights kept native [out,in]; forward uses GEMV
     GGUF g;
