@@ -1,4 +1,4 @@
-# sparkinfer
+# SP⚡RKINFER
 
 **Blackwell-native MoE/LLM inference runtime for SN74 on Gittensor.**
 
