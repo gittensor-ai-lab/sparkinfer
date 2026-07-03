@@ -26,6 +26,18 @@ __device__ __forceinline__ float fa_wsum(float v) {
     return v;
 }
 
+// cp.async helpers (sm_80+; all of sm_89..sm_121 support it). Inline PTX so this stays
+// header-free and safe under any compile mode (incl. NVRTC device-only). The 16-byte
+// (uint4 = 8xbf16) .cg copies match the existing vectorized KV staging granularity and
+// go global->shared directly, bypassing L1 and the register round-trip.
+__device__ __forceinline__ void fa_cp_async_cg16(void* smem, const void* gmem) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
+}
+__device__ __forceinline__ void fa_cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
+__device__ __forceinline__ void fa_cp_async_wait_1() { asm volatile("cp.async.wait_group 1;\n"); }
+__device__ __forceinline__ void fa_cp_async_wait_0() { asm volatile("cp.async.wait_group 0;\n"); }
+
 template <int HEAD_DIM>
 __global__ void fa_split_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
@@ -155,6 +167,117 @@ __global__ void fa_split_gqa_kernel(
     for (int e = 0; e < ELEMS; e++) part_acc[(size_t)idx * HEAD_DIM + lane + e * 32] = acc[e];
 }
 
+// Double-buffered (cp.async) variant of fa_split_gqa_kernel. Identical math and
+// byte-identical partials — the ONLY change is how each KV tile reaches shared memory:
+// tile N+1 is prefetched with cp.async into a second smem buffer while tile N is being
+// reduced, so the long-context KV global-load latency overlaps the QK/softmax/V compute
+// instead of stalling the warps at a load barrier. Two smem buffers (K,V) x2 = 4x the
+// per-tile smem of the single-buffer path (still tiny: 4*TILE*128*2B). Correctness is
+// unchanged by construction, so the top-1 / KL gate is unaffected.
+template <int HEAD_DIM, int GQA, int TILE>
+__global__ void fa_split_gqa_pipe_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
+    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens,
+    float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+    float scale, int num_q_heads, int num_kv_heads, int block_size, int max_blocks, int n_splits
+) {
+    constexpr int ELEMS = HEAD_DIM / 32;
+    constexpr int BUF   = TILE * HEAD_DIM;   // bf16 elems per K (or V) buffer
+    const int seq   = blockIdx.y;
+    const int split = blockIdx.x % n_splits;
+    const int kvh   = blockIdx.x / n_splits;
+    const int warp  = threadIdx.x >> 5;
+    const int lane  = threadIdx.x & 31;
+    const int qh    = kvh * GQA + warp;
+
+    float qr[ELEMS];
+    const __nv_bfloat16* qp = q + (size_t)(seq * num_q_heads + qh) * HEAD_DIM;
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) qr[e] = fa_to_f(qp[lane + e * 32]);
+
+    const int sl     = seq_lens[seq];
+    const int chunk  = (sl + n_splits - 1) / n_splits;
+    const int start  = split * chunk;
+    const int end    = min(sl, start + chunk);
+    const int ntiles = (end > start) ? (end - start + TILE - 1) / TILE : 0;
+
+    float m = -1e30f, l = 0.f, acc[ELEMS];
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
+
+    extern __shared__ __nv_bfloat16 s_kv[];
+    __nv_bfloat16* s_k[2] = { s_kv,       s_kv + 2 * BUF };
+    __nv_bfloat16* s_v[2] = { s_kv + BUF, s_kv + 3 * BUF };
+    __shared__ size_t s_rowbase[2][TILE];
+
+    if (ntiles > 0) {
+        // Prologue: resolve row bases + prefetch tile 0 into buffer 0.
+        {
+            const int valid = min(TILE, end - start);
+            if ((int)threadIdx.x < valid) {
+                const int t = start + threadIdx.x;
+                const int blk = t / block_size, wb = t % block_size;
+                const int phys = block_table[seq * max_blocks + blk];
+                s_rowbase[0][threadIdx.x] = ((size_t)(phys * block_size + wb) * num_kv_heads + kvh) * HEAD_DIM;
+            }
+            __syncthreads();
+            for (int i = threadIdx.x * 8; i < valid * HEAD_DIM; i += blockDim.x * 8) {
+                const int within = i / HEAD_DIM, d = i % HEAD_DIM;
+                const size_t base = s_rowbase[0][within] + d;
+                fa_cp_async_cg16(s_k[0] + i, k_pool + base);
+                fa_cp_async_cg16(s_v[0] + i, v_pool + base);
+            }
+            fa_cp_async_commit();
+        }
+
+        for (int ti = 0; ti < ntiles; ti++) {
+            const int cur = ti & 1, nxt = (ti + 1) & 1;
+            if (ti + 1 < ntiles) {
+                // Prefetch tile ti+1 into the other buffer while tile ti is still in flight.
+                const int t0n = start + (ti + 1) * TILE;
+                const int validn = min(TILE, end - t0n);
+                if ((int)threadIdx.x < validn) {
+                    const int t = t0n + threadIdx.x;
+                    const int blk = t / block_size, wb = t % block_size;
+                    const int phys = block_table[seq * max_blocks + blk];
+                    s_rowbase[nxt][threadIdx.x] = ((size_t)(phys * block_size + wb) * num_kv_heads + kvh) * HEAD_DIM;
+                }
+                __syncthreads();   // rowbase[nxt] visible AND prior compute of buffer nxt is done (WAR-safe)
+                for (int i = threadIdx.x * 8; i < validn * HEAD_DIM; i += blockDim.x * 8) {
+                    const int within = i / HEAD_DIM, d = i % HEAD_DIM;
+                    const size_t base = s_rowbase[nxt][within] + d;
+                    fa_cp_async_cg16(s_k[nxt] + i, k_pool + base);
+                    fa_cp_async_cg16(s_v[nxt] + i, v_pool + base);
+                }
+                fa_cp_async_commit();
+                fa_cp_async_wait_1();   // drain to <=1 group in flight: tile ti (cur) has arrived, ti+1 stays async
+            } else {
+                fa_cp_async_wait_0();   // last tile: drain all
+            }
+            __syncthreads();   // cur buffer fully populated + visible to all lanes
+
+            const int valid = min(TILE, end - (start + ti * TILE));
+            for (int tt = 0; tt < valid; tt++) {
+                float p = 0.f;
+                #pragma unroll
+                for (int e = 0; e < ELEMS; e++) p += qr[e] * fa_to_f(s_k[cur][tt * HEAD_DIM + lane + e * 32]);
+                const float score = fa_wsum(p) * scale;
+                const float mn = fmaxf(m, score), corr = __expf(m - mn), pe = __expf(score - mn);
+                l = l * corr + pe;
+                #pragma unroll
+                for (int e = 0; e < ELEMS; e++) acc[e] = acc[e] * corr + pe * fa_to_f(s_v[cur][tt * HEAD_DIM + lane + e * 32]);
+                m = mn;
+            }
+        }
+    }
+
+    const int idx = (seq * num_q_heads + qh) * n_splits + split;
+    if (lane == 0) { part_m[idx] = m; part_l[idx] = l; }
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) part_acc[(size_t)idx * HEAD_DIM + lane + e * 32] = acc[e];
+}
+
 // llama Q8_1 activation block (matches si_block_q8_1 used by the int8 MMVQ O-projection).
 struct fa_block_q8_1 { __half2 ds; signed char qs[32]; };
 
@@ -247,6 +370,8 @@ template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const __nv_b
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
 template __global__ void fa_split_gqa_kernel<128, 8, FA_GQA_TILE>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
+template __global__ void fa_split_gqa_pipe_kernel<128, 8, FA_GQA_TILE>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, 8>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, 16>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
@@ -292,11 +417,26 @@ void launch_flash_decode_split(
     if (use_gqa && num_kv_heads > 0 && num_q_heads == num_kv_heads * 8) {
         constexpr int GQA = 8, TILE = FA_GQA_TILE;
         dim3 gq(num_kv_heads * n_splits, num_seqs);
-        size_t smem = (size_t)2 * TILE * 128 * sizeof(__nv_bfloat16);
-        fa_split_gqa_kernel<128, GQA, TILE><<<gq, GQA * 32, smem, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
-            reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, seq_lens,
-            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
+        // cp.async double-buffered KV staging is the default (overlaps the KV load with
+        // compute); SPARKINFER_FAPIPE=0 falls back to the single-buffer path for A/B.
+        static int fapipe = -1;
+        if (fapipe < 0) {
+            const char* e = getenv("SPARKINFER_FAPIPE");
+            fapipe = e ? ((e[0] == '0') ? 0 : 1) : 1;
+        }
+        if (fapipe) {
+            size_t smem = (size_t)4 * TILE * 128 * sizeof(__nv_bfloat16);
+            fa_split_gqa_pipe_kernel<128, GQA, TILE><<<gq, GQA * 32, smem, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
+                reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, seq_lens,
+                part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
+        } else {
+            size_t smem = (size_t)2 * TILE * 128 * sizeof(__nv_bfloat16);
+            fa_split_gqa_kernel<128, GQA, TILE><<<gq, GQA * 32, smem, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
+                reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, seq_lens,
+                part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
+        }
         fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
                                    num_q_heads, n_splits, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
         (void)head_dim;
