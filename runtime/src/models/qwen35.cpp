@@ -563,14 +563,25 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             fprintf(stderr, "[gguf] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());
             return nullptr;
         }
-        void* dq = nullptr; cudaMalloc(&dq, t->n_bytes);
+        void* dq = nullptr;
+        if (cudaMalloc(&dq, t->n_bytes) != cudaSuccess) return nullptr;
         cudaMemcpy(dq, t->data, t->n_bytes, cudaMemcpyHostToDevice);
-        void* tmp = nullptr; cudaMalloc(&tmp, (size_t)t->n_values * 2);
+        void* tmp = nullptr;
+        if (cudaMalloc(&tmp, (size_t)t->n_values * 2) != cudaSuccess) {
+            cudaFree(dq);
+            return nullptr;
+        }
         kernels::launch_gguf_dequant(t->ggml_type, dq, tmp, t->n_values, s.stream);
         const void* result;
         if (transpose) {
             const int in = (int)t->dims[0], out = (int)t->dims[1];   // ggml ne0=in, ne1=out
-            void* dst = nullptr; cudaMalloc(&dst, (size_t)t->n_values * 2); s.owned.push_back(dst);
+            void* dst = nullptr;
+            if (cudaMalloc(&dst, (size_t)t->n_values * 2) != cudaSuccess) {
+                cudaFree(tmp);
+                cudaFree(dq);
+                return nullptr;
+            }
+            s.owned.push_back(dst);
             kernels::launch_transpose_bf16(tmp, dst, out, in, s.stream);   // [out,in]->[in,out]
             cudaStreamSynchronize(s.stream); cudaFree(tmp); cudaFree(dq);
             result = dst;
