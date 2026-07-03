@@ -209,13 +209,18 @@ int Qwen35Model::forward_token(int token_id, int position) {
 
     // Depth-adaptive KV-split: keep 32 splits for the short-context sweet spot, then jump to
     // the 128-split occupancy plateau on RTX 5090. The split grid is num_kv_heads*n_splits CTAs,
-    // so 64 splits still underfills mid-context decode; 128 improves 512/2k/4k. Past the 16k
-    // knee, use MAX_NSPLITS to keep each split's serial KV chunk bounded. Partials are sized for
-    // MAX_NSPLITS, and the online-softmax combine is exact for any split count (accuracy unchanged).
+    // so 64 splits still underfills mid-context decode; 128 improves 512/2k/4k. Deeper in, each
+    // 128-split chunk grows serial (128 KV tokens/split at 16k) and the fa-split kernel — by then
+    // ~34% of decode — falls off the bandwidth roofline; jumping to MAX_NSPLITS (256) halves the
+    // chunk and doubles the grid. Measured on RTX 5090 (sm_120): the 256-split crossover is ~8k
+    // (128 wins to 6k, 256 wins from 8k: +1.6% @8k, +6.3% @12k), so switch at 28*split_chunk
+    // (=7168) rather than the old 64* (=16384) — which left the whole 8k-16k band on 128.
+    // Partials are sized for MAX_NSPLITS, and the online-softmax combine is exact for any split
+    // count (accuracy unchanged). >256 splits was measured slower at 16k (combine overhead wins).
     if (s.adaptive_splits) {
         int want = 32;
         if ((long)seqlen > 2L * s.split_chunk) want = 128;
-        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
+        if ((long)seqlen > 28L * s.split_chunk) want = Impl::MAX_NSPLITS;
         if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
