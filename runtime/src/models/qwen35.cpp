@@ -207,15 +207,16 @@ int Qwen35Model::forward_token(int token_id, int position) {
     s.h_scalars[3] = seqlen;
     cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 4 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
-    // Depth-adaptive KV-split: keep 32 splits for the short-context sweet spot, then jump to
-    // the 128-split occupancy plateau on RTX 5090. The split grid is num_kv_heads*n_splits CTAs,
-    // so 64 splits still underfills mid-context decode; 128 improves 512/2k/4k. Past the 16k
-    // knee, use MAX_NSPLITS to keep each split's serial KV chunk bounded. Partials are sized for
-    // MAX_NSPLITS, and the online-softmax combine is exact for any split count (accuracy unchanged).
+    // Depth-adaptive KV-split: occupancy-first plateaus keyed off split_chunk (default 256).
+    // #138 jumped 32→128 at mid-context; a 64-split step between 512 and 6k fills SMs without
+    // the extra combine/partials cost of 128 at 2k–4k. 128 through 16k, then MAX_NSPLITS beyond.
+    // Partials are sized for MAX_NSPLITS; the online-softmax combine is exact for any split count.
     if (s.adaptive_splits) {
-        int want = 32;
-        if ((long)seqlen > 2L * s.split_chunk) want = 128;
-        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
+        int want;
+        if      (seqlen <=  2 * s.split_chunk) want = 32;
+        else if (seqlen <= 24 * s.split_chunk) want = 64;
+        else if (seqlen <= 64 * s.split_chunk) want = 128;
+        else                                   want = Impl::MAX_NSPLITS;
         if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
