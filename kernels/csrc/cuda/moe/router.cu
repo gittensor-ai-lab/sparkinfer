@@ -84,7 +84,10 @@ __global__ void moe_router_kernel(
     }
 
     if (tokens_per_expert && lane == 0) {
-        for (int j = 0; j < top_k; j++) atomicAdd(&tokens_per_expert[sel_id[j]], 1);
+        for (int j = 0; j < top_k; j++) {
+            const int id = sel_id[j];
+            if (id >= 0 && id < num_experts) atomicAdd(&tokens_per_expert[id], 1);
+        }
     }
 }
 
