@@ -196,6 +196,15 @@ void Qwen35Model::copy_logits(float* host_logits) const {
 int Qwen35Model::forward_token(int token_id, int position) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
+    if (!s.w.embed_tokens || s.w.layers.empty() || !s.w.layers[0].input_norm) {
+        fprintf(stderr, "[qwen35] forward_token: weights not loaded\n");
+        return -1;
+    }
+    if (!s.kv->block_table(s.seq_id)) {
+        fprintf(stderr, "[qwen35] forward_token: KV not allocated for seq %llu\n",
+                (unsigned long long)s.seq_id);
+        return -1;
+    }
     const int H = c.hidden;
     kernels::GemmConfig gc{};
     int seqlen = position + 1;
