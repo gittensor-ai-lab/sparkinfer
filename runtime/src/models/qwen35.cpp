@@ -90,6 +90,7 @@ struct Qwen35Model::Impl {
     bool use_llama = true; // default ON: faithful llama mmvq for Q4_K attn GEMVs (+9.7%, top1 0.99). =0 disables
     bool use_q6mmvq = true;  // default ON: int8 Q6_K mmvq for attn-V upgrades + LM head. =0 disables
     bool use_qkvstream = true; // default ON: run Q/K/V projections on concurrent streams. =0 disables
+    bool use_qkv_fuse = false; // SPARKINFER_QKV_FUSE=1: fused Q+K+V mmvq (experimental; default off)
     bool use_qkfuse = true;// default ON: fused per-head Q-norm + K-norm (1 kernel). =0 disables
     bool use_ropekv = true;// default ON: fused RoPE + KV-append (1 kernel vs 2). =0 disables
     bool use_attnin = true;// default ON: single fused QK-norm+RoPE+KV-append (1 kernel vs qkfuse+ropekv=2). =0 disables
@@ -162,6 +163,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_ROPEKV")) p_->use_ropekv = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_FNQ"))    p_->use_fnq   = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_QKVSTREAM")) p_->use_qkvstream = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_QKV_FUSE")) p_->use_qkv_fuse = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ATTNIN")) p_->use_attnin = !(e[0] == '0');
 }
 
@@ -272,7 +274,11 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             };
-            if (s.use_qkvstream) {
+            const bool qkv_q4k = s.use_pq && s.use_llama && w.wq_type == 12 && w.wk_type == 12 && w.wv_type == 12;
+            if (qkv_q4k && s.use_qkv_fuse && H == 2048) {
+                kernels::launch_mmvq_q4k_qkv_fused(s.aq81, w.wq, w.wk, w.wv, s.q, s.k, s.v,
+                                                   s.qdim, s.kvdim, s.kvdim, H, st);
+            } else if (s.use_qkvstream) {
                 // Each Q/K/V GEMV under-occupies the GPU at bs=1 (latency-bound); run them
                 // concurrently on 3 streams so their memory traffic overlaps. Fork after the
                 // shared activation quantize, join before QK-norm. Captured into the decode graph.

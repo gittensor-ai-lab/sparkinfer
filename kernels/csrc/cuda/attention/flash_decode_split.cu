@@ -247,6 +247,10 @@ template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const __nv_b
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
 template __global__ void fa_split_gqa_kernel<128, 8, FA_GQA_TILE>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
+template __global__ void fa_split_gqa_kernel<128, 8, 8>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
+template __global__ void fa_split_gqa_kernel<128, 8, 16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int);
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, 8>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, 16>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
@@ -275,6 +279,37 @@ static inline void fa_launch_combine_dispatch(
     else                      fa_launch_combine<FA_COMBINE_NW>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
 }
 
+template <int TILE>
+static inline void fa_launch_gqa_split(
+    const __nv_bfloat16* q, const __nv_bfloat16* k_pool, const __nv_bfloat16* v_pool,
+    const int* block_table, const int* seq_lens,
+    float* part_m, float* part_l, float* part_acc,
+    float scale, int num_q_heads, int num_kv_heads, int block_size, int max_blocks,
+    int n_splits, int num_kv_heads_g, int num_seqs, cudaStream_t stream
+) {
+    constexpr int GQA = 8;
+    dim3 gq(num_kv_heads_g * n_splits, num_seqs);
+    size_t smem = (size_t)2 * TILE * 128 * sizeof(__nv_bfloat16);
+    fa_split_gqa_kernel<128, GQA, TILE><<<gq, GQA * 32, smem, stream>>>(
+        q, k_pool, v_pool, block_table, seq_lens,
+        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
+}
+
+static inline int fa_gqa_tile(int n_splits) {
+    static int tile128 = -1, tile256 = -1;
+    if (tile128 < 0) {
+        const char* e = getenv("SPARKINFER_FA_TILE");
+        tile128 = e ? atoi(e) : 8;
+        if (!(tile128 == 8 || tile128 == 12 || tile128 == 14 || tile128 == 16)) tile128 = 8;
+    }
+    if (tile256 < 0) {
+        const char* e = getenv("SPARKINFER_FA_TILE_256");
+        tile256 = e ? atoi(e) : 8;
+        if (!(tile256 == 8 || tile256 == 12 || tile256 == 14 || tile256 == 16)) tile256 = 8;
+    }
+    return n_splits >= 256 ? tile256 : tile128;
+}
+
 void launch_flash_decode_split(
     const void* q, const void* k_pool, const void* v_pool,
     const int* block_table, const int* seq_lens, void* out,
@@ -290,13 +325,13 @@ void launch_flash_decode_split(
     }
     const bool use_gqa = (fagqa == 1) || (fagqa == -2 && n_splits >= 32);
     if (use_gqa && num_kv_heads > 0 && num_q_heads == num_kv_heads * 8) {
-        constexpr int GQA = 8, TILE = FA_GQA_TILE;
-        dim3 gq(num_kv_heads * n_splits, num_seqs);
-        size_t smem = (size_t)2 * TILE * 128 * sizeof(__nv_bfloat16);
-        fa_split_gqa_kernel<128, GQA, TILE><<<gq, GQA * 32, smem, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
-            reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, seq_lens,
-            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits);
+        const int tile = fa_gqa_tile(n_splits);
+        const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(q);
+        const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(k_pool);
+        const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(v_pool);
+        if (tile == 8)      fa_launch_gqa_split<8>(qb, kb, vb, block_table, seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, num_kv_heads, num_seqs, stream);
+        else if (tile == 16) fa_launch_gqa_split<16>(qb, kb, vb, block_table, seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, num_kv_heads, num_seqs, stream);
+        else                 fa_launch_gqa_split<FA_GQA_TILE>(qb, kb, vb, block_table, seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, num_kv_heads, num_seqs, stream);
         fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
                                    num_q_heads, n_splits, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
         (void)head_dim;
