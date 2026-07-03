@@ -76,6 +76,14 @@ int main(int argc, char** argv) {
     printf("loading %s (%s) ...\n", path.c_str(), gguf_mode ? "native GGUF, experts quantized" : "bf16");
     bool ok = gguf_mode ? model.load_gguf(path) : model.load_weights(path);
     if (!ok) { printf("[FAIL] load\n"); return 1; }
+    constexpr int warmup = 8;
+    if (context_tokens < 0) context_tokens = 0;
+    if (n_tokens < 0) { printf("[FAIL] n_tokens must be non-negative\n"); return 1; }
+    if ((long)context_tokens + warmup + n_tokens > cfg.max_seq) {
+        printf("[FAIL] context=%d + warmup=%d + n=%d exceeds max_seq=%d\n",
+               context_tokens, warmup, n_tokens, cfg.max_seq);
+        return 1;
+    }
     size_t freeb=0, totb=0; cudaMemGetInfo(&freeb,&totb);
 
     double toks = model.bench_decode(8, n_tokens, context_tokens);
