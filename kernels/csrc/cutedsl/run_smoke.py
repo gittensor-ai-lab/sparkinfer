@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import subprocess
 import sys
 from pathlib import Path
 
@@ -87,7 +88,24 @@ def main() -> None:
     if args.require_dsl:
         build_router_gemm_launcher()
         build_routed_swiglu_launcher()
-        print("[cutedsl] CuTe DSL package import/compile construction passed")
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "bench_cutedsl.py"),
+                "--hidden",
+                "32",
+                "--experts",
+                "4",
+                "--ffn",
+                "8",
+                "--iters",
+                "1",
+                "--warmup",
+                "1",
+            ],
+            check=True,
+        )
+        print("[cutedsl] CuTe DSL package import, JIT, GPU launch, and correctness passed")
     else:
         print("[cutedsl] skipped CuTe DSL import; pass --require-dsl on a CUDA node")
 

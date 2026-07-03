@@ -19,7 +19,20 @@ future expert layouts, then it can be benchmarked against the quantized path.
 
 ## Install
 
-CUDA 13.1 machines:
+Fresh CUDA 13.x GPU node:
+
+```bash
+kernels/csrc/cutedsl/run_all.sh
+```
+
+The script creates `kernels/csrc/cutedsl/.venv`, installs dependencies, runs a
+real GPU smoke test, then writes:
+
+```text
+kernels/csrc/cutedsl/cutedsl_bench_qwen_shape.json
+```
+
+Manual CUDA 13.1 install:
 
 ```bash
 python3 -m pip install -r kernels/csrc/cutedsl/requirements-cu13.txt
@@ -43,7 +56,7 @@ python3 kernels/csrc/cutedsl/run_smoke.py
 ```
 
 On an RTX 5090 node with the DSL installed, pass `--require-dsl` to fail if the
-CuTe DSL package is missing:
+CuTe DSL package is missing or if a real GPU kernel launch fails:
 
 ```bash
 python3 kernels/csrc/cutedsl/run_smoke.py --require-dsl

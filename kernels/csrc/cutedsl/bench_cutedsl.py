@@ -70,6 +70,7 @@ def bench_router(args) -> dict:
         "time_ms": ms,
         "gflop_s": flops / (ms * 1.0e6),
         "max_abs_err": err,
+        "correct": bool(math.isfinite(err) and err <= args.tolerance),
     }
 
 
@@ -133,6 +134,7 @@ def bench_swiglu(args) -> dict:
         "time_ms": ms,
         "gflop_s": flops / (ms * 1.0e6),
         "max_abs_err": err,
+        "correct": bool(math.isfinite(err) and err <= args.tolerance),
     }
 
 
@@ -148,6 +150,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--input-scale", type=float, default=0.02)
     parser.add_argument("--weight-scale", type=float, default=0.02)
+    parser.add_argument("--tolerance", type=float, default=2e-3)
+    parser.add_argument("--output", type=Path, help="optional path to write benchmark JSON")
     args = parser.parse_args()
 
     if args.tokens * args.top_k * args.ffn * args.hidden > 50_000_000:
@@ -155,9 +159,24 @@ def main() -> None:
         raise SystemExit(2)
 
     results = [bench_router(args), bench_swiglu(args)]
-    print(json.dumps(results, indent=2))
+    payload = {
+        "device": cp.cuda.runtime.getDeviceProperties(0)["name"].decode("utf-8"),
+        "cuda_runtime": cp.cuda.runtime.runtimeGetVersion(),
+        "shape": {
+            "tokens": args.tokens,
+            "hidden": args.hidden,
+            "experts": args.experts,
+            "top_k": args.top_k,
+            "ffn": args.ffn,
+        },
+        "results": results,
+    }
+    text = json.dumps(payload, indent=2)
+    print(text)
+    if args.output:
+        args.output.write_text(text + "\n")
     for r in results:
-        if not math.isfinite(r["max_abs_err"]) or r["max_abs_err"] > 2e-3:
+        if not r["correct"]:
             raise SystemExit(f"{r['kernel']} correctness failed: max_abs_err={r['max_abs_err']}")
 
 
