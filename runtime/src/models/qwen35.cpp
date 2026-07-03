@@ -467,6 +467,20 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         fprintf(stderr, "[qwen35] KV allocate failed (pool too small for max_seq=%d)\n", s.cfg.max_seq);
         return out;
     }
+    if ((int)prompt.size() + max_new > s.cfg.max_seq) {
+        fprintf(stderr, "[qwen35] generate: prompt_len=%zu + max_new=%d exceeds max_seq=%d\n",
+                prompt.size(), max_new, s.cfg.max_seq);
+        s.kv->free(s.seq_id);
+        return out;
+    }
+    for (size_t i = 0; i < prompt.size(); i++) {
+        if (prompt[i] < 0 || prompt[i] >= s.cfg.vocab) {
+            fprintf(stderr, "[qwen35] generate: invalid prompt token %d at %zu (vocab=%d)\n",
+                    prompt[i], i, s.cfg.vocab);
+            s.kv->free(s.seq_id);
+            return out;
+        }
+    }
     int next = -1;
     for (size_t i = 0; i < prompt.size(); i++) next = forward_token(prompt[i], (int)i);
     for (int i = 0; i < max_new; i++) {
