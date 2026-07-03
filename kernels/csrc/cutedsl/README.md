@@ -69,12 +69,13 @@ python3 kernels/csrc/cutedsl/bench_cutedsl.py \
   --hidden 2048 --experts 256 --ffn 768 --iters 30 --warmup 5
 ```
 
-RTX 5090 / CUDA 13.0 / CUTLASS DSL 4.6.0 result from Vast instance `43634439`:
+Fresh-clone RTX 5090 / CUDA 13.2 runtime / CUTLASS DSL 4.6.0 result from Vast
+instance `43695003`:
 
 | kernel | shape | time | throughput | max abs error |
 |---|---:|---:|---:|---:|
-| `router_gemm_cutedsl` | tokens=1, hidden=2048, experts=256 | 0.0440 ms | 23.83 GFLOP/s | 6.3e-8 |
-| `routed_swiglu_cutedsl` | tokens=1, top_k=8, hidden=2048, ffn=768 | 0.2615 ms | 192.45 GFLOP/s | 2.0e-9 |
+| `router_gemm_cutedsl` | tokens=1, hidden=2048, experts=256 | 0.0462 ms | 22.71 GFLOP/s | 6.3e-8 |
+| `routed_swiglu_cutedsl` | tokens=1, top_k=8, hidden=2048, ffn=768 | 0.2645 ms | 190.32 GFLOP/s | 2.0e-9 |
 
 These are scalar CuTe DSL baselines, not final tensor-core kernels. They prove
 that the isolated branch can install, JIT, execute, validate, and time real CuTe
