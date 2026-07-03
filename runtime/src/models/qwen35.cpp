@@ -25,6 +25,7 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <algorithm>
 
 namespace sparkinfer {
 
@@ -145,7 +146,10 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->mf_weights = p_->alloc<float>(cfg.top_k);
     p_->mf_counts  = p_->alloc<int>(cfg.n_experts);
     p_->mf_h       = p_->alloc<float>((size_t)cfg.top_k * cfg.moe_ffn);
-    p_->mf_out     = p_->alloc<float>(cfg.hidden);
+    // MoE down MMVQ reuses mf_out as Q8_1 scratch: top_k * (ffn/32) blocks * 36 B each.
+    const size_t mf_q8_bytes = (size_t)cfg.top_k * ((cfg.moe_ffn + 31) / 32) * 36;
+    const size_t mf_out_bytes = std::max((size_t)cfg.hidden * sizeof(float), mf_q8_bytes);
+    p_->mf_out     = p_->alloc<float>((mf_out_bytes + sizeof(float) - 1) / sizeof(float));
     const size_t fa_n = (size_t)cfg.n_q_heads * Impl::MAX_NSPLITS;   // sized for the adaptive max
     p_->fa_m   = p_->alloc<float>(fa_n);
     p_->fa_l   = p_->alloc<float>(fa_n);
