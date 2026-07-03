@@ -24,6 +24,14 @@
 namespace sparkinfer {
 namespace kernels {
 
+// Clamp corrupted router output before any Q4K/Q6K weight indexing (GGUF decode path).
+__global__ void sanitize_expert_ids_kernel(int* __restrict__ ids, int n, int num_experts) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || num_experts <= 0) return;
+    const int e = ids[i];
+    if (e < 0 || e >= num_experts) ids[i] = 0;
+}
+
 static constexpr int WPB = 8;   // warps per block
 
 // Programmatic Dependent Launch (PDL): overlap a kernel's grid spin-up with its
@@ -843,8 +851,13 @@ void launch_moe_expert_ffn_q4k(
     int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
-    int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream
+    int num_tokens, int top_k, int hidden, int ffn, int num_experts,
+    const void* input_q8, cudaStream_t stream
 ) {
+    if (num_tokens <= 0 || top_k <= 0 || num_experts <= 0) return;
+    const int n_ids = num_tokens * top_k;
+    sanitize_expert_ids_kernel<<<(n_ids + 255) / 256, 256, 0, stream>>>(
+        const_cast<int*>(expert_ids), n_ids, num_experts);
     // int8 dp4a path for Q4_K gate/up (decode parity with llama.cpp's MMVQ). Default
     // ON — the largest single decode cost; down stays on the fp path (Q6_K). Set
     // SPARKINFER_MMVQ=0 to fall back to the bf16 dequant-GEMV.

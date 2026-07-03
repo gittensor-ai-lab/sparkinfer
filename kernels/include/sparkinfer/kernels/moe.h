@@ -63,7 +63,7 @@ void launch_moe_expert_ffn_q4k(
     int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
-    int num_tokens, int top_k, int hidden, int ffn,
+    int num_tokens, int top_k, int hidden, int ffn, int num_experts,
     const void* input_q8 = nullptr,   // pre-quantized Q8_1(input) from the fused norm; nullptr = quantize internally
     cudaStream_t stream = nullptr);
 
