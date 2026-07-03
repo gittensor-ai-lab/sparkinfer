@@ -207,16 +207,16 @@ int Qwen35Model::forward_token(int token_id, int position) {
     s.h_scalars[3] = seqlen;
     cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 4 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
-    // Depth-adaptive KV-split: scale n_splits with seq_len so each split's SERIAL KV chunk stays
-    // bounded (~split_chunk). With a fixed n_splits the split kernel collapses at long context (at
-    // 32k each of 32 splits streams ~1024 KV serially on <=1024 blocks -> latency-bound, ~6x below
-    // roofline). Quantized to powers of two from 32, so the decode graph is re-captured only ~log2
-    // times over a generation. Off when SPARKINFER_NSPLITS pins a fixed value. Partials are sized for
+    // Depth-adaptive KV-split: keep 32 splits for the short-context sweet spot, then jump to
+    // the 128-split occupancy plateau on RTX 5090. The split grid is num_kv_heads*n_splits CTAs,
+    // so 64 splits still underfills mid-context decode; 128 improves 512/2k/4k. Past the 16k
+    // knee, use MAX_NSPLITS to keep each split's serial KV chunk bounded. Partials are sized for
     // MAX_NSPLITS, and the online-softmax combine is exact for any split count (accuracy unchanged).
     if (s.adaptive_splits) {
-        int want = 32;                                  // preserve the short-context sweet spot
-        const int target_chunk = (seqlen > 8192 && s.split_chunk > 1) ? (s.split_chunk >> 1) : s.split_chunk;
-        while (want < Impl::MAX_NSPLITS && (long)want * target_chunk < seqlen) want <<= 1;
+        int want = 32;
+        if ((long)seqlen > 2L * s.split_chunk) want = 128;
+        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
+        if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
             if (s.graph_ready) {
