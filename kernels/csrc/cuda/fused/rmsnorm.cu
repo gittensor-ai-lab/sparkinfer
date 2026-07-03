@@ -204,11 +204,15 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
     __syncthreads();
     const float inv_rms = s_warp[0];
 
-    // Re-read the bf16-rounded residual sum (exactly as add_rmsnorm2_kernel does), so out_norm
-    // is bit-identical to the unfused path; then derive Q8_1 from the bf16-rounded out_norm.
+    // The bf16-rounded residual sum is already in registers (sv, just stored to out_sum):
+    // round it in-place instead of reloading osum4[t]. bf16(sv) is bit-identical to the
+    // store+reload rn_pack8/rn_unpack8 round-trip, so out_norm/Q8_1 stay bit-identical to
+    // the unfused path — but the dependent global load (right after the store, on this
+    // single-block latency-bound kernel) is removed from the critical path.
     const uint4* w4 = reinterpret_cast<const uint4*>(weight);
-    const uint4* osum4r = reinterpret_cast<const uint4*>(out_sum);
-    float svb[8], wv[8]; rn_unpack8(__ldg(osum4r + t), svb); rn_unpack8(__ldg(w4 + t), wv);
+    float svb[8], wv[8]; rn_unpack8(__ldg(w4 + t), wv);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) svb[j] = __bfloat162float(__float2bfloat16(sv[j]));
     float ov[8], bv[8];
     #pragma unroll
     for (int j = 0; j < 8; j++) { ov[j] = svb[j] * inv_rms * wv[j]; bv[j] = __bfloat162float(__float2bfloat16(ov[j])); }
