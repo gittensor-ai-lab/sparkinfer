@@ -33,7 +33,7 @@ __global__ void moe_expert_ffn_kernel(
     const int*   __restrict__ expert_ids,       // [num_tokens, top_k]
     const float* __restrict__ expert_weights,   // [num_tokens, top_k]
     __nv_bfloat16* __restrict__ output,         // [num_tokens, hidden]
-    int num_tokens, int top_k, int hidden, int ffn
+    int num_tokens, int top_k, int hidden, int ffn, int num_experts
 ) {
     const int tok = blockIdx.x;
     if (tok >= num_tokens) return;
@@ -53,6 +53,7 @@ __global__ void moe_expert_ffn_kernel(
 
     for (int j = 0; j < top_k; j++) {
         const int   e = expert_ids[tok * top_k + j];
+        if (e < 0 || e >= num_experts) continue;
         const float w = expert_weights[tok * top_k + j];
         const __nv_bfloat16* gptr = gate_w + (size_t)e * hidden * ffn;
         const __nv_bfloat16* uptr = up_w   + (size_t)e * hidden * ffn;
@@ -90,7 +91,6 @@ void launch_moe_expert_ffn(
     int num_tokens, int top_k, int num_experts,
     int hidden_dim, int ffn_dim, cudaStream_t stream
 ) {
-    (void)num_experts;
     size_t smem = (size_t)(2 * hidden_dim + ffn_dim) * sizeof(float);
     static size_t cur = 0;
     if (smem > 48 * 1024 && smem != cur) {
@@ -105,7 +105,7 @@ void launch_moe_expert_ffn(
         reinterpret_cast<const __nv_bfloat16*>(up_w),
         reinterpret_cast<const __nv_bfloat16*>(down_w),
         expert_ids, expert_weights, reinterpret_cast<__nv_bfloat16*>(output),
-        num_tokens, top_k, hidden_dim, ffn_dim);
+        num_tokens, top_k, hidden_dim, ffn_dim, num_experts);
 }
 #endif
 
