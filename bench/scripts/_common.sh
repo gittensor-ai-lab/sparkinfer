@@ -112,27 +112,101 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
 }
 
 # ---- prebuilt binaries (GitHub release) with source-build fallback ----
-PREBUILT_TAG="${PREBUILT_TAG:-v0.2.0}"
-PREBUILT_TGZ="${PREBUILT_TGZ:-sparkinfer-v0.2.0-linux-x86_64-cuda13-sm120.tar.gz}"
-PREBUILT_URL="${PREBUILT_URL:-https://github.com/gittensor-ai-lab/sparkinfer/releases/download/$PREBUILT_TAG/$PREBUILT_TGZ}"
-PREBUILT_DIR="$ROOT/.prebuilt/sparkinfer-bin"
+PREBUILT_REPO="${PREBUILT_REPO:-gittensor-ai-lab/sparkinfer}"
+PREBUILT_TAG="${PREBUILT_TAG:-latest}"  # latest = newest release that carries a matching binary asset
+PREBUILT_TGZ="${PREBUILT_TGZ:-}"
+PREBUILT_URL="${PREBUILT_URL:-}"
+PREBUILT_DIR=""
 SI_BIN=""; SI_LD=""   # set by resolve_runner: binary dir + LD_LIBRARY_PATH
 
+resolve_prebuilt_release() {   # $1=arch. Sets PREBUILT_TAG/PREBUILT_TGZ/PREBUILT_URL/PREBUILT_DIR.
+  local arch="$1" tag="$PREBUILT_TAG" asset="" url="" cache_tag=""
+
+  if [ -n "$PREBUILT_URL" ]; then
+    asset="${PREBUILT_TGZ:-$(basename "${PREBUILT_URL%%\?*}")}"
+    cache_tag="${tag:-custom}"
+  elif [ -n "$PREBUILT_TGZ" ]; then
+    asset="$PREBUILT_TGZ"
+    if [ "$tag" = "latest" ]; then
+      if [[ "$asset" =~ ^sparkinfer-(v[0-9][^-]*)- ]]; then
+        tag="${BASH_REMATCH[1]}"
+        url="https://github.com/$PREBUILT_REPO/releases/download/$tag/$asset"
+      else
+        url="https://github.com/$PREBUILT_REPO/releases/latest/download/$asset"
+      fi
+    else
+      url="https://github.com/$PREBUILT_REPO/releases/download/$tag/$asset"
+    fi
+    cache_tag="$tag"
+  elif [ "$tag" = "latest" ]; then
+    command -v python3 >/dev/null || return 1
+    local resolved
+    resolved="$(python3 - "$PREBUILT_REPO" "$arch" <<'PY'
+import json
+import sys
+import urllib.request
+
+repo, arch = sys.argv[1], sys.argv[2]
+needle = f"linux-x86_64-cuda13-sm{arch}"
+api = f"https://api.github.com/repos/{repo}/releases?per_page=20"
+req = urllib.request.Request(
+    api,
+    headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "sparkinfer-bench-scripts",
+    },
+)
+with urllib.request.urlopen(req, timeout=20) as resp:
+    releases = json.load(resp)
+
+for release in releases:
+    if release.get("draft") or release.get("prerelease"):
+        continue
+    tag = release.get("tag_name", "")
+    for asset in release.get("assets", []):
+        name = asset.get("name", "")
+        if name.startswith("sparkinfer-") and needle in name and name.endswith(".tar.gz"):
+            print(f"{tag}\t{name}\t{asset['browser_download_url']}")
+            raise SystemExit(0)
+
+raise SystemExit(f"no sparkinfer prebuilt asset found for {needle}")
+PY
+)" || { echo ">> prebuilt release lookup failed" >&2; return 1; }
+    IFS=$'\t' read -r tag asset url <<< "$resolved"
+    cache_tag="$tag"
+  else
+    asset="sparkinfer-$tag-linux-x86_64-cuda13-sm${arch}.tar.gz"
+    url="https://github.com/$PREBUILT_REPO/releases/download/$tag/$asset"
+    cache_tag="$tag"
+  fi
+
+  [ -n "$url" ] || url="$PREBUILT_URL"
+  [ -n "$asset" ] && [ -n "$url" ] || return 1
+  PREBUILT_TAG="$tag"
+  PREBUILT_TGZ="$asset"
+  PREBUILT_URL="$url"
+  PREBUILT_DIR="$ROOT/.prebuilt/${cache_tag}-sm${arch}/sparkinfer-bin"
+}
+
 try_prebuilt() {   # download+extract the release bundle; sets SI_BIN/SI_LD; returns 1 if unavailable
+  local arch="$1" cache_root tgz_path
   [ "${NO_PREBUILT:-0}" = 1 ] && return 1
+  resolve_prebuilt_release "$arch" || return 1
+  cache_root="$(dirname "$PREBUILT_DIR")"
+  tgz_path="$cache_root/$PREBUILT_TGZ"
   if [ ! -x "$PREBUILT_DIR/bin/qwen3_gguf_bench" ]; then
     command -v curl >/dev/null || return 1
-    echo ">> fetching prebuilt $PREBUILT_TGZ ..." >&2
-    mkdir -p "$ROOT/.prebuilt"
-    curl -fsSL "$PREBUILT_URL" -o "$ROOT/.prebuilt/$PREBUILT_TGZ" 2>/dev/null || { echo ">> prebuilt download failed" >&2; return 1; }
-    tar xzf "$ROOT/.prebuilt/$PREBUILT_TGZ" -C "$ROOT/.prebuilt" 2>/dev/null || return 1
+    echo ">> fetching prebuilt $PREBUILT_TGZ from $PREBUILT_TAG ..." >&2
+    mkdir -p "$cache_root"
+    curl -fsSL "$PREBUILT_URL" -o "$tgz_path" 2>/dev/null || { echo ">> prebuilt download failed" >&2; return 1; }
+    tar xzf "$tgz_path" -C "$cache_root" 2>/dev/null || return 1
   fi
   SI_BIN="$PREBUILT_DIR/bin"; SI_LD="$PREBUILT_DIR/lib"; return 0
 }
 
 resolve_runner() {   # $1=arch. Prefer an existing local build, else prebuilt, else build from source.
   if [ -x "$ROOT/build/runtime/qwen3_gguf_bench" ]; then SI_BIN="$ROOT/build/runtime"; SI_LD=""; echo ">> using local build" >&2; return; fi
-  if try_prebuilt; then echo ">> using prebuilt binaries (will fall back to source build if incompatible)" >&2; return; fi
+  if try_prebuilt "$1"; then echo ">> using prebuilt binaries (will fall back to source build if incompatible)" >&2; return; fi
   ensure_sparkinfer "$1"; SI_BIN="$ROOT/build/runtime"; SI_LD=""
 }
 
