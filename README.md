@@ -9,7 +9,7 @@
 _It is designed for the next generation of personal agents like **Openclaw**, local copilots, **robotics**, and edge AI systems where inference speed, memory efficiency, privacy, and power efficiency decide how usable local intelligence feels._
 
 **Built through [SN74 on Gittensor](https://gittensor.io/).** Gittensor helps power
-(SPARKINFER)[https://gittensor.io/miners/repository?name=gittensor-ai-lab%2Fsparkinfer] by **funding** the source-built evaluation loop: contributors submit PRs,
+[SPARKINFER](https://gittensor.io/miners/repository?name=gittensor-ai-lab%2Fsparkinfer) by **funding** the source-built evaluation loop: contributors submit PRs,
 the bot verifies correctness and speed on real RTX 5090 hardware, and SN74 rewards
 verified marginal speedups. **SPARKINFER** is also continuously optimized by
 proprietary Kernel Design Agents, turning frontier CUDA improvements into faster,
