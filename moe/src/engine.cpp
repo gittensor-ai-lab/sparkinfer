@@ -56,6 +56,10 @@ public:
         const LayerWeights& w = weights_[layer];
         const int E = cfg_.num_experts, K = cfg_.top_k;
         const int H = cfg_.hidden_dim, F = cfg_.ffn_dim;
+        if (!w.router_w || !w.gate_w || !w.up_w || !w.down_w) {
+            fprintf(stderr, "[moe] forward: layer %d weights not set\n", layer);
+            return;
+        }
 
         // 1. router projection -> logits [num_tokens, E]
         kernels::launch_moe_router_gemm(input, w.router_w, d_logits_, num_tokens, H, E, stream);
