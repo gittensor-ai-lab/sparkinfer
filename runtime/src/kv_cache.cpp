@@ -62,11 +62,18 @@ KVCacheManager::~KVCacheManager() {
 }
 
 bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
-    const int need = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
-    if ((int)impl_->free_list.size() < need || impl_->free_slots.empty()) return false;
-    if (need > kMaxBlocksPerSeq) return false;
+    const int want = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
+    if (want > kMaxBlocksPerSeq) return false;
 
     auto& blocks = impl_->seq_blocks[seq_id];
+    const int have = (int)blocks.size();
+    const int need = want - have;
+    if (need <= 0) return true;  // already sufficient (including exact fit)
+
+    const bool new_seq = impl_->seq_slot.find(seq_id) == impl_->seq_slot.end();
+    if (new_seq && impl_->free_slots.empty()) return false;
+    if ((int)impl_->free_list.size() < need) return false;
+
     for (int i = 0; i < need; i++) { blocks.push_back(impl_->free_list.back()); impl_->free_list.pop_back(); }
 
     int slot;
