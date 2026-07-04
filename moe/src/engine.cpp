@@ -53,6 +53,10 @@ public:
                     num_tokens, max_tokens_);
             return;
         }
+        if (layer < 0 || layer >= (int)weights_.size()) {
+            fprintf(stderr, "[moe] forward: layer %d out of range [0, %zu)\n", layer, weights_.size());
+            return;
+        }
         const LayerWeights& w = weights_[layer];
         const int E = cfg_.num_experts, K = cfg_.top_k;
         const int H = cfg_.hidden_dim, F = cfg_.ffn_dim;
