@@ -16,7 +16,7 @@ namespace sparkinfer {
 namespace kernels {
 
 // ggml type ids
-enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q6_K = 14 };
+enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14 };
 
 __device__ __forceinline__ float gg_h2f(const unsigned char* p) {
     __half h; *((unsigned short*)&h) = *(const unsigned short*)p; return __half2float(h);
@@ -44,6 +44,26 @@ __global__ void deq_q4k_kernel(const unsigned char* __restrict__ src, __nv_bfloa
         for (int l = 0; l < 32; l++) yy[j + l]      = __float2bfloat16(d1 * (q[l] & 0xF) - m1);
         for (int l = 0; l < 32; l++) yy[j + 32 + l] = __float2bfloat16(d2 * (q[l] >> 4)  - m2);
         q += 32; is += 2;
+    }
+}
+
+// Q5_K: 176-byte super-block of 256 — d, dmin (fp16), 6-bit scales+mins (12B, like Q4_K),
+// qh 1 high bit/quant (32B), qs 4 low bits/quant (128B). Byte-exact match to the ggml reference.
+__global__ void deq_q5k_kernel(const unsigned char* __restrict__ src, __nv_bfloat16* __restrict__ y, long nblocks) {
+    long b = (long)blockIdx.x * blockDim.x + threadIdx.x; if (b >= nblocks) return;
+    const unsigned char* blk = src + b * 176;
+    float d = gg_h2f(blk), dmin = gg_h2f(blk + 2);
+    const unsigned char* sc = blk + 4;    // scales + mins (6-bit packed)
+    const unsigned char* qh = blk + 16;   // high bit per quant
+    const unsigned char* ql = blk + 48;   // low 4 bits per quant
+    __nv_bfloat16* yy = y + b * 256; int is = 0; unsigned char u1 = 1, u2 = 2;
+    for (int j = 0; j < 256; j += 64) {
+        int s, m;
+        gg_scale_min_k4(is,   sc, &s, &m); float d1 = d * s, m1 = dmin * m;
+        gg_scale_min_k4(is+1, sc, &s, &m); float d2 = d * s, m2 = dmin * m;
+        for (int l = 0; l < 32; l++) yy[j + l]      = __float2bfloat16(d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1);
+        for (int l = 0; l < 32; l++) yy[j + 32 + l] = __float2bfloat16(d2 * ((ql[l] >> 4)  + ((qh[l] & u2) ? 16 : 0)) - m2);
+        ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
     }
 }
 
@@ -104,6 +124,7 @@ void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_
     auto* s = reinterpret_cast<const unsigned char*>(src);
     const int T = 256;
     if (ggml_type == GGML_Q4_K) { long nb = n_values/256; deq_q4k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
+    else if (ggml_type == GGML_Q5_K) { long nb = n_values/256; deq_q5k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_Q6_K) { long nb = n_values/256; deq_q6k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_Q8_0) { long nb = n_values/32;  deq_q8_0_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_F16)  { deq_f16_kernel<<<(n_values+T-1)/T,T,0,stream>>>(s,d,n_values); }

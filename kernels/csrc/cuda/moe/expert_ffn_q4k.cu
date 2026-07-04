@@ -77,6 +77,22 @@ __device__ __forceinline__ float q4kf_deq_dot(int t, const unsigned char* b, con
             p += d * scn[is+4] * q3 * sx[nn*128 + lane + 64];
             p += d * scn[is+6] * q4 * sx[nn*128 + lane + 96];
         }
+    } else if (t == 13) {   // Q5_K, 176 B/256 — 4-bit ql (b+48) + 1 high bit/quant (qh, b+16).
+        float d = q4kf_h2f(b), dmin = q4kf_h2f(b + 2);
+        const unsigned char* sc = b + 4; const unsigned char* qh = b + 16; const unsigned char* ql = b + 48;
+        const unsigned char hb = qh[lane];
+        #pragma unroll
+        for (int g = 0; g < 4; g++) {
+            int s1, m1, s2, m2;
+            q4kf_scale_min(2*g, sc, &s1, &m1); q4kf_scale_min(2*g+1, sc, &s2, &m2);
+            float d1 = d*s1, mm1 = dmin*m1, d2 = d*s2, mm2 = dmin*m2;
+            unsigned char qb = ql[g*32 + lane];
+            const unsigned char u1 = (unsigned char)(1u << (2*g)), u2 = (unsigned char)(2u << (2*g));
+            int v_lo = (qb & 0xF) + ((hb & u1) ? 16 : 0);
+            int v_hi = (qb >> 4)  + ((hb & u2) ? 16 : 0);
+            p += (d1 * v_lo - mm1) * sx[g*64 + lane];
+            p += (d2 * v_hi - mm2) * sx[g*64 + 32 + lane];
+        }
     } else {         // Q4_K
         float d = q4kf_h2f(b), dmin = q4kf_h2f(b + 2);
         const unsigned char* sc = b + 4; const unsigned char* qs = b + 16;
@@ -93,8 +109,8 @@ __device__ __forceinline__ float q4kf_deq_dot(int t, const unsigned char* b, con
     return p;
 }
 
-// ggml types: Q4_K=12 (144 B/256), Q6_K=14 (210 B/256). Q4_K_M mixes them per tensor.
-__device__ __forceinline__ int q_block_bytes(int t) { return t == 14 ? 210 : 144; }
+// ggml types: Q4_K=12 (144 B/256), Q5_K=13 (176 B/256), Q6_K=14 (210 B/256). UD quants mix them per tensor.
+__device__ __forceinline__ int q_block_bytes(int t) { return t == 14 ? 210 : (t == 13 ? 176 : 144); }
 
 // gate_up: h[ts,f] = SiLU(<x, gate[e,f]>) * <x, up[e,f]>.  one warp per f.
 // grid=(num_tokens*top_k, ffn/WPB), block=WPB*32. smem: s_x[hidden] + WPB*256.

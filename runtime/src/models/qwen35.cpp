@@ -45,6 +45,7 @@ bool ggml_dequant_supported(int ggml_type) {
         case 1:  // F16
         case 8:  // Q8_0
         case 12: // Q4_K
+        case 13: // Q5_K (UD / dynamic quants mix this in)
         case 14: // Q6_K
             return true;
         default:
@@ -876,9 +877,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             w.k_norm = dense(b + "attn_k_norm.weight", false);
         }
         if (!expect_dims_opt(b + "attn_post_norm.weight", {H}) ||
+            !expect_dims_opt(b + "post_attention_norm.weight", {H}) ||
             !expect_dims_opt(b + "ffn_norm.weight", {H}) ||
             !expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
+        // pre-MoE norm: Qwen3-MoE = "ffn_norm"; Qwen3.6 GGUFs name it "post_attention_norm".
         w.post_attn_norm = dense_opt(b + "attn_post_norm.weight", false);
+        if (!w.post_attn_norm) w.post_attn_norm = dense_opt(b + "post_attention_norm.weight", false);
         if (!w.post_attn_norm) w.post_attn_norm = dense(b + "ffn_norm.weight", false);
         w.router_w = dense(b + "ffn_gate_inp.weight", false);   // native [E,H] for GEMV
         w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized

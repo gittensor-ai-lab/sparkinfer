@@ -12,6 +12,7 @@
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
 #include "sparkinfer/thermal_governor.h"
+#include "qwen3_gguf_config.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -35,32 +36,19 @@ int main(int argc, char** argv) {
     // read architecture from GGUF metadata
     sparkinfer::GGUF g;
     if (!g.open(path)) { printf("[FAIL] cannot open %s\n", path.c_str()); return 1; }
-    const char* A = "qwen3moe.";
-    auto mi = [&](const std::string& k, long d){ return g.meta_int(A + k, d); };
     sparkinfer::Qwen35Config cfg;
-    cfg.n_layers   = (int)mi("block_count", 48);
-    cfg.hidden     = (int)mi("embedding_length", 2048);
-    cfg.n_q_heads  = (int)mi("attention.head_count", 32);
-    cfg.n_kv_heads = (int)mi("attention.head_count_kv", 4);
-    cfg.head_dim   = (int)mi("attention.key_length", 128);
-    cfg.n_experts  = (int)mi("expert_count", 128);
-    cfg.top_k      = (int)mi("expert_used_count", 8);
-    cfg.moe_ffn    = (int)mi("expert_feed_forward_length", 768);
-    cfg.rope_theta = (float)g.meta_float(std::string(A) + "rope.freq_base", 1e6);
-    cfg.rms_eps    = (float)g.meta_float(std::string(A) + "attention.layer_norm_rms_epsilon", 1e-6);
-    cfg.eos_id     = (int)g.meta_int("tokenizer.ggml.eos_token_id", 151645);
-    cfg.n_shared   = 0;
-    const sparkinfer::GGUFTensor* emb = g.tensor("token_embd.weight");
-    cfg.vocab      = emb ? (int)emb->dims[1] : 151936;
+    qwen3_config_from_gguf(g, cfg);
     cfg.max_seq    = 2048;
-    printf("arch: %d layers, hidden %d, %dQ/%dKV hd%d, %d experts top-%d, ffn %d, vocab %d\n",
-           cfg.n_layers, cfg.hidden, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim,
-           cfg.n_experts, cfg.top_k, cfg.moe_ffn, cfg.vocab);
+    printf("arch: %s, %d layers, hidden %d, %dQ/%dKV hd%d, %d experts top-%d, ffn %d, vocab %d\n",
+           qwen3_model_label(cfg), cfg.n_layers, cfg.hidden, cfg.n_q_heads,
+           cfg.n_kv_heads, cfg.head_dim, cfg.n_experts, cfg.top_k, cfg.moe_ffn, cfg.vocab);
 
     auto rt = sparkinfer::Runtime::create({}); rt->initialize();
 
     sparkinfer::KVCacheConfig kvc;
-    kvc.num_layers = cfg.n_layers; kvc.num_kv_heads = cfg.n_kv_heads; kvc.head_dim = cfg.head_dim; kvc.block_size = 16; kvc.int8_kv = !(getenv("SPARKINFER_KV_INT8") && getenv("SPARKINFER_KV_INT8")[0]=='0');
+    kvc.num_layers = cfg.n_layers; kvc.num_kv_heads = cfg.n_kv_heads; kvc.head_dim = cfg.head_dim; kvc.block_size = 16;
+    // int8 KV is the Qwen3-MoE head_dim=128 tensor-core path; Qwen3.6 attention (gated, head_dim=256) writes bf16 KV.
+    kvc.int8_kv = !cfg.hybrid && !(getenv("SPARKINFER_KV_INT8") && getenv("SPARKINFER_KV_INT8")[0]=='0');
     const size_t epb = (size_t)16 * cfg.n_kv_heads * cfg.head_dim;
     const size_t blocks = (cfg.max_seq + 15) / 16 + 8;
     sparkinfer::KVCacheManager kv(kvc, (size_t)cfg.n_layers * 2 * epb * 2 * blocks);
