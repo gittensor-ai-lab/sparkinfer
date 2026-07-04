@@ -32,6 +32,9 @@ public:
     // Returns number of available CUDA SMs
     virtual int num_sms() const = 0;
 
+    virtual int compute_capability_major() const = 0;
+    virtual int compute_capability_minor() const = 0;
+
     // Engine-level GPU observability: a live sample of heat (°C) + VRAM (+ power/clock) on this
     // runtime's device. Safe to poll periodically (e.g. while decoding) to watch thermals/throttle.
     virtual GpuStats gpu_stats() const = 0;
