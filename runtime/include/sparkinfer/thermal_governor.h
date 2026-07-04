@@ -57,6 +57,8 @@ public:
 
     // Pure temperature→mode mapping (no hardware, no sleep) — the tiering policy, unit-testable.
     static Mode classify(const Config& cfg, int temp_c);
+    // Predictive tiering input: project temp forward when slope > 0.
+    static int effective_temp_c(const Config& cfg, int temp_c, double slope_c_per_s);
     static const char* mode_name(Mode m);
 
     Mode   mode()          const { return mode_; }

@@ -38,6 +38,13 @@ int main() {
     CHECK(std::string(G::mode_name(G::Mode::Turbo))     == "turbo");
     CHECK(std::string(G::mode_name(G::Mode::Emergency)) == "emergency");
 
+    // Predictive projection bumps effective temp before crossing a threshold.
+    G::Config cp;
+    cp.balanced_c = 65; cp.predict_horizon_ms = 1500;
+    CHECK(G::effective_temp_c(cp, 60, 0.0) == 60);
+    CHECK(G::effective_temp_c(cp, 60, 4.0) == 66);   // 60 + 4*1.5
+    CHECK(G::classify(cp, G::effective_temp_c(cp, 60, 4.0)) == G::Mode::Balanced);
+
     printf("thermal_governor_cpu_test: OK\n");
     return 0;
 }

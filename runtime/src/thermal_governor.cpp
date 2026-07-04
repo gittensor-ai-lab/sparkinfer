@@ -27,6 +27,14 @@ const char* ThermalGovernor::mode_name(Mode m) {
     return "?";
 }
 
+int ThermalGovernor::effective_temp_c(const Config& c, int temp_c, double slope_c_per_s) {
+    if (temp_c < 0) return temp_c;
+    int eff = temp_c;
+    if (c.predict_horizon_ms > 0 && slope_c_per_s > 0.0)
+        eff = temp_c + (int)(slope_c_per_s * c.predict_horizon_ms / 1000.0);
+    return eff;
+}
+
 ThermalGovernor::Mode ThermalGovernor::classify(const Config& c, int temp_c) {
     if (temp_c >= c.emergency_c) return Mode::Emergency;
     if (temp_c >= c.safe_c)      return Mode::Safe;
@@ -70,9 +78,7 @@ double ThermalGovernor::pace() {
         mode_ = cfg_.forced_mode;            // deterministic sweep: temperature ignored
     } else {
         if (last_temp_ < 0) return 0.0;      // auto mode + no sensor → never throttle
-        // Predictive: tier on max(measured, projected) so a fast rise throttles before crossing.
-        if (cfg_.predict_horizon_ms > 0 && slope_ > 0.0)
-            eff = last_temp_ + (int)(slope_ * cfg_.predict_horizon_ms / 1000.0);
+        eff = effective_temp_c(cfg_, last_temp_, slope_);
         mode_ = classify(cfg_, eff);
     }
     const double ms = pace_ms_for(cfg_, mode_);
