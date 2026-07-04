@@ -387,30 +387,33 @@ __global__ void fa_split_gqa_mma_i8_kernel(
             store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, HEAD_DIM, mem_row_major);
         }
         __syncthreads();
-        for (int i = tid; i < 16 * 128; i += blockDim.x) {
-            const int m = i >> 7, col = i & 127;
-            if (col < gblk * 16) s_s[i] = (float)reinterpret_cast<int*>(s_s)[i] * s_qs[m] * s_ks[col];
-        }
-        __syncthreads();
+        // Fuse per-row/per-token QK scales into the softmax pass instead of materializing a
+        // full 16x128 float tile in shared memory — drops one __syncthreads per KV tile group.
+        const int* s_si = reinterpret_cast<const int*>(s_s);
 
         // Online softmax; fold V scale into P', quantize P' per-row into s_pi.
         #pragma unroll
         for (int rr = 0; rr < 2; rr++) {
             const int r = warp * 2 + rr;
-            float mx = -1e30f;
-            for (int t = lane; t < gblk * 16; t += 32) {
-                const int gtok = gbase + t;
-                if (gtok >= start && gtok < end) mx = fmaxf(mx, s_s[r * 128 + t] * scale);
+            // Hold each lane's four scaled logits in registers for max + exp (no double smem read).
+            float sc[4], mx = -1e30f;
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const int t = lane + u * 32, gtok = gbase + t;
+                sc[u] = (t < gblk * 16 && gtok >= start && gtok < end)
+                        ? (float)s_si[r * 128 + t] * s_qs[r] * s_ks[t] * scale : -1e30f;
+                mx = fmaxf(mx, sc[u]);
             }
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
             const float m_old = s_m[r], m_new = fmaxf(m_old, mx), corr = __expf(m_old - m_new);
             float sum = 0.f, pamax = 0.f;
-            for (int t = lane; t < 128; t += 32) {
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const int t = lane + u * 32;
                 float pv = 0.f;
-                const int gtok = gbase + t;
-                if (t < gblk * 16 && gtok >= start && gtok < end) {
-                    const float p = __expf(s_s[r * 128 + t] * scale - m_new);
+                if (sc[u] > -1e29f) {
+                    const float p = __expf(sc[u] - m_new);
                     sum += p; pv = p * s_vs[t]; pamax = fmaxf(pamax, fabsf(pv));
                 }
                 s_s[r * 128 + t] = pv;   // stash P' (score no longer needed for this row)
@@ -419,7 +422,8 @@ __global__ void fa_split_gqa_mma_i8_kernel(
             for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xffffffff, sum, o); pamax = fmaxf(pamax, __shfl_xor_sync(0xffffffff, pamax, o)); }
             const float pd = pamax / 127.0f;
             if (lane == 0) { s_m[r] = m_new; s_l[r] = s_l[r] * corr + sum; s_ps[r] = pd; }
-            for (int t = lane; t < 128; t += 32)
+            // Quantize only the P' columns consumed by the PV mma (ks < gblk).
+            for (int t = lane; t < gblk * 16; t += 32)
                 s_pi[r * 128 + t] = (signed char)((pamax == 0.f) ? 0 : (int)roundf(s_s[r * 128 + t] / pd));
             for (int c = lane; c < HEAD_DIM; c += 32) s_o[r * HEAD_DIM + c] *= corr;
         }
@@ -441,7 +445,8 @@ __global__ void fa_split_gqa_mma_i8_kernel(
             store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, HEAD_DIM, mem_row_major);
         }
         __syncthreads();
-        for (int i = tid; i < 16 * 128; i += blockDim.x) s_o[i] += (float)reinterpret_cast<int*>(s_s)[i] * s_ps[i >> 7];
+        // wmma M is padded 8->16; accumulate only the GQA live head rows into s_o.
+        for (int i = tid; i < GQA * 128; i += blockDim.x) s_o[i] += (float)reinterpret_cast<int*>(s_s)[i] * s_ps[i >> 7];
         __syncthreads();
     }
 
