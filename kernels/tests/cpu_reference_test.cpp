@@ -116,6 +116,43 @@ static double test_router(int E, int K) {
     return err;
 }
 
+
+// ---------------------------------------------------------------------------
+// 2b. Router top-k (kernel2): rank-select algorithm vs sort-based reference.
+// ---------------------------------------------------------------------------
+static double test_router2(int E, int K) {
+    vector<float> logits(E); for (auto& x : logits) x = frand();
+
+    vector<int> idx(E); for (int i = 0; i < E; i++) idx[i] = i;
+    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
+        return logits[a] > logits[b] || (logits[a] == logits[b] && a < b); });
+    vector<int> ref_id(idx.begin(), idx.begin() + K);
+    double rmx = logits[ref_id[0]], rden = 0;
+    for (int j = 0; j < K; j++) rden += std::exp((double)logits[ref_id[j]] - rmx);
+    vector<double> ref_w(K);
+    for (int j = 0; j < K; j++) ref_w[j] = std::exp((double)logits[ref_id[j]] - rmx) / rden;
+
+    vector<int> sel(K); vector<float> sl(K);
+    for (int e = 0; e < E; e++) {
+        const float my = logits[e];
+        int rank = 0;
+        for (int f = 0; f < E; f++) {
+            const float v = logits[f];
+            if (v > my || (v == my && f < e)) rank++;
+        }
+        if (rank < K) { sel[rank] = e; sl[rank] = my; }
+    }
+    float kmx = sl[0]; for (int j = 1; j < K; j++) kmx = std::max(kmx, sl[j]);
+    float kden = 0; for (int j = 0; j < K; j++) kden += std::exp(sl[j] - kmx);
+
+    double err = 0;
+    for (int j = 0; j < K; j++) {
+        if (sel[j] != ref_id[j]) err = std::max(err, 1.0);
+        err = std::max(err, std::abs(std::exp(sl[j] - kmx) / kden - ref_w[j]));
+    }
+    return err;
+}
+
 // ---------------------------------------------------------------------------
 // 3. SwiGLU expert FFN: kernel math (float) vs double ground truth.
 // ---------------------------------------------------------------------------
@@ -305,6 +342,8 @@ int main() {
     check("attention hd512 kv777", test_attention(512, 777),  2e-4);
     check("router E256 k8",        test_router(256, 8),       1e-6);
     check("router E128 k8",        test_router(128, 8),       1e-6);
+    check("router2 E256 k8",     test_router2(256, 8),      1e-6);
+    check("router2 E128 k8",     test_router2(128, 8),      1e-6);
     check("swiglu H2048 F512",     test_swiglu(2048, 512),    1e-3);
     check("swiglu H512 F1536",     test_swiglu(512, 1536),    1e-3);
     check("gemm 64x96x128",        test_gemm(64, 96, 128),    1e-3);
