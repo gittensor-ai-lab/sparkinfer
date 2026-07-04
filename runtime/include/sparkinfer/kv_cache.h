@@ -39,6 +39,10 @@ public:
     // Shape: [num_layers, max_blocks_per_seq]
     int* block_table(uint64_t seq_id) const;
 
+    // Full device block-table array [kMaxSeqs, max_blocks_per_seq].
+    // Batched decode uses row i for batch index i (seq_id i allocated with slot i).
+    int* block_tables_device() const;
+
     // Device pointers to K and V storage pools (base = layer 0).
     // Per-layer pointer = (bf16*)k_pool() + layer * layer_stride_elems().
     void* k_pool() const;

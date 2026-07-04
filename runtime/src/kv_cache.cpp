@@ -89,6 +89,8 @@ void KVCacheManager::free(uint64_t seq_id) {
     if (s != impl_->seq_slot.end()) { impl_->free_slots.push_back(s->second); impl_->seq_slot.erase(s); }
 }
 
+int* KVCacheManager::block_tables_device() const { return impl_->d_block_tables; }
+
 int* KVCacheManager::block_table(uint64_t seq_id) const {
     auto it = impl_->seq_slot.find(seq_id);
     if (it == impl_->seq_slot.end()) return nullptr;
