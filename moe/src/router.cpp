@@ -12,6 +12,10 @@
 namespace sparkinfer {
 namespace moe {
 
+namespace {
+constexpr int kMaxRouteTokens = 4096;
+}
+
 struct Router::Impl {
     RouterConfig cfg;
 };
@@ -22,6 +26,10 @@ Router::~Router() = default;
 void Router::route(const float* router_logits, int* expert_ids, float* expert_weights,
                    int* tokens_per_expert, int num_tokens, cudaStream_t stream) {
     if (num_tokens <= 0) return;
+    if (num_tokens > kMaxRouteTokens) {
+        fprintf(stderr, "[moe] route: num_tokens %d exceeds max %d\n", num_tokens, kMaxRouteTokens);
+        return;
+    }
     const int E = impl_->cfg.num_experts, K = impl_->cfg.top_k;
     if (E <= 0 || K <= 0 || K > E) {
         fprintf(stderr, "[moe] route: invalid config (num_experts=%d top_k=%d)\n", E, K);
