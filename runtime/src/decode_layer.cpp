@@ -68,7 +68,13 @@ void DecodeRunner::begin_step(const std::vector<int>& seq_lens_before) {
         return;
     }
     std::vector<int> after(n);
-    for (int i = 0; i < n; i++) after[i] = seq_lens_before[i] + 1;   // include the new token
+    for (int i = 0; i < n; i++) {
+        if (seq_lens_before[i] < 0) {
+            fprintf(stderr, "[decode] begin_step: seq_lens_before[%d]=%d invalid\n", i, seq_lens_before[i]);
+            return;
+        }
+        after[i] = seq_lens_before[i] + 1;   // include the new token
+    }
     cu(cudaMemcpy(p_->d_write_pos, seq_lens_before.data(), n * sizeof(int), cudaMemcpyHostToDevice), "wpos");
     cu(cudaMemcpy(p_->d_seq_lens,  after.data(),           n * sizeof(int), cudaMemcpyHostToDevice), "slens");
 }
