@@ -112,6 +112,57 @@ __global__ void l2_norm_heads_kernel(__nv_bfloat16* __restrict__ x,
     if (t < head_dim) x[base + t] = __float2bfloat16(xv * sw[0]);
 }
 
+// Fused causal short-conv + per-head L2-norm. One block per head (the q_heads q-heads, then the
+// q_heads k-heads, then the v_heads v-heads), head_dim threads. Computes the SiLU short-conv output
+// for each element exactly as conv_split_kernel, writes the v heads straight out, and for the q/k
+// heads applies the same per-head L2 normalization in-block. This drops the two extra l2-norm launches
+// AND the write-then-reread of q,k through global that the split path did (conv wrote q,k, then each
+// l2-norm re-read and re-wrote them). Byte-identical to conv_split_kernel + two l2_norm_heads_kernel:
+// the norm consumes the same bf16-rounded SiLU output and uses the same warp-tree reduction.
+__global__ void conv_split_l2_fused_kernel(const __nv_bfloat16* __restrict__ qkv,
+                                           const __nv_bfloat16* __restrict__ conv_w,
+                                           __nv_bfloat16* __restrict__ conv_state,
+                                           __nv_bfloat16* __restrict__ q,
+                                           __nv_bfloat16* __restrict__ k,
+                                           __nv_bfloat16* __restrict__ v,
+                                           int q_heads, int v_heads, int head_dim,
+                                           int q_dim, int qkv_dim, int conv_kernel, float eps) {
+    const int head = blockIdx.x;
+    const int t = threadIdx.x;
+    int region, local, d;                                     // region 0=q, 1=k, 2=v; local = index in output
+    if (head < q_heads)          { region = 0; local = head * head_dim + t;                 d = local; }
+    else if (head < 2 * q_heads) { region = 1; local = (head - q_heads) * head_dim + t;     d = q_dim + local; }
+    else                         { region = 2; local = (head - 2 * q_heads) * head_dim + t; d = 2 * q_dim + local; }
+
+    float y = 0.f;
+    for (int c = 0; c < conv_kernel - 1; c++)
+        y += q36_to_f(conv_state[(size_t)c * qkv_dim + d]) *
+             q36_to_f(conv_w[(size_t)d * conv_kernel + c]);
+    y += q36_to_f(qkv[d]) * q36_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
+
+    for (int c = 0; c < conv_kernel - 2; c++)
+        conv_state[(size_t)c * qkv_dim + d] = conv_state[(size_t)(c + 1) * qkv_dim + d];
+    if (conv_kernel > 1)
+        conv_state[(size_t)(conv_kernel - 2) * qkv_dim + d] = qkv[d];
+
+    const __nv_bfloat16 oy = __float2bfloat16(q36_silu(y));
+    if (region == 2) { v[local] = oy; return; }               // v heads: no norm (whole block returns together)
+
+    const float xv = q36_to_f(oy);
+    __shared__ float sw[32];
+    float ss = q36_wsum(xv * xv);
+    if ((t & 31) == 0) sw[t >> 5] = ss;
+    __syncthreads();
+    if (t < 32) {
+        float vv = (t < (blockDim.x + 31) / 32) ? sw[t] : 0.f;
+        vv = q36_wsum(vv);
+        if (t == 0) sw[0] = rsqrtf(vv + eps);
+    }
+    __syncthreads();
+    const __nv_bfloat16 no = __float2bfloat16(xv * sw[0]);
+    if (region == 0) q[local] = no; else k[local] = no;
+}
+
 __global__ void gdn_ar_kernel(const __nv_bfloat16* __restrict__ q,
                               const __nv_bfloat16* __restrict__ k,
                               const __nv_bfloat16* __restrict__ v,
@@ -281,6 +332,22 @@ void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
     const int q_dim = q_heads * head_dim;
     const int v_dim = v_heads * head_dim;
     const int qkv_dim = 2 * q_dim + v_dim;
+    // Fused conv + per-head L2-norm (one block per head). Byte-identical to the split path below;
+    // SPARKINFER_CONV_FUSED=0 restores it. head_dim is the block width, so it must fit a CUDA block.
+    static int fused = -1;
+    if (fused < 0) { const char* e = getenv("SPARKINFER_CONV_FUSED"); fused = (e && e[0] == '0') ? 0 : 1; }
+    if (fused && head_dim <= 1024) {
+        const int n_heads = 2 * q_heads + v_heads;
+        conv_split_l2_fused_kernel<<<n_heads, head_dim, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(qkv_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
+            reinterpret_cast<__nv_bfloat16*>(conv_state_bf16),
+            reinterpret_cast<__nv_bfloat16*>(q_bf16),
+            reinterpret_cast<__nv_bfloat16*>(k_bf16),
+            reinterpret_cast<__nv_bfloat16*>(v_bf16),
+            q_heads, v_heads, head_dim, q_dim, qkv_dim, conv_kernel, eps);
+        return;
+    }
     conv_split_kernel<<<(qkv_dim + 255) / 256, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(qkv_bf16),
         reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
