@@ -811,14 +811,43 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // uses ~1.5 GB less VRAM. Set SPARKINFER_QATTN=0 to load dense bf16 instead.
     const bool qattn = []{ const char* a = getenv("SPARKINFER_QATTN");
                            return !(a && a[0] == '0'); }();
+    // SPARKINFER_PROJ_Q6K (default ON): requantize the Q8_0 attention/GDN projection weights
+    // (q/k/v/o, wqkv, gate, ssm_out) DOWN to Q6_K at load instead of expanding them to dense bf16.
+    // The decode GEMV then moves 0.82 vs 2.0 bytes/weight (near-lossless: 6.5 vs 8 bit) via the
+    // existing t==14 mmvq_q6k / gemv_q dispatch. =0 restores the exact dense-bf16 path.
+    const bool proj_q6k = []{ const char* a = getenv("SPARKINFER_PROJ_Q6K");
+                              return !(a && a[0] == '0'); }();
+    auto requant_q6k = [&](const std::string& name, int& type) -> const void* {
+        const GGUFTensor* t = g.tensor(name);
+        if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
+        const long n = t->n_values;
+        if (n % 256 != 0) return nullptr;                        // caller falls back to dense
+        void* src_d = nullptr;
+        if (cudaMalloc(&src_d, t->n_bytes) != cudaSuccess) return nullptr;
+        cudaMemcpy(src_d, t->data, t->n_bytes, cudaMemcpyHostToDevice);
+        void* bf = nullptr; cudaMalloc(&bf, (size_t)n * 2);      // Q8_0 -> bf16 scratch
+        kernels::launch_gguf_dequant(t->ggml_type, src_d, bf, n, s.stream);
+        void* q6 = nullptr; const size_t q6bytes = (size_t)(n / 256) * 210;
+        if (cudaMalloc(&q6, q6bytes) != cudaSuccess) { cudaFree(bf); cudaFree(src_d); return nullptr; }
+        kernels::launch_gguf_requant_q6k(bf, q6, n, s.stream);   // bf16 -> Q6_K
+        cudaStreamSynchronize(s.stream);
+        cudaFree(bf); cudaFree(src_d);
+        s.owned.push_back(q6);
+        type = 14;                                               // GGML_Q6_K
+        return q6;
+    };
+    // c.hybrid gates the requant to Qwen3.5/Qwen3.6 only (the models whose UD quant stores these
+    // projections as Q8_0); non-hybrid models (e.g. Qwen3-30B) never enter this path -> byte-identical.
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
+        if (proj_q6k && c.hybrid && qattn && t && t->ggml_type == 8) { if (const void* p = requant_q6k(name, type)) return p; }
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
         type = 0; return dense(name, false);
     };
     auto attn_w_opt = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { type = 0; return nullptr; }
+        if (proj_q6k && c.hybrid && qattn && t->ggml_type == 8) { if (const void* p = requant_q6k(name, type)) return p; }
         if (qattn && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
         type = 0; return dense(name, false);
     };

@@ -96,6 +96,82 @@ __global__ void deq_q8_0_kernel(const unsigned char* __restrict__ src, __nv_bflo
     for (int l = 0; l < 32; l++) yy[l] = __float2bfloat16(d * q[l]);
 }
 
+// ---- bf16 -> Q6_K requantize (exact inverse of deq_q6k_kernel above) ------------------
+// Ports ggml quantize_row_q6_K_ref + make_qx_quants (rmse_type=1, nmax=32): each 256-value
+// superblock is 16 sub-blocks of 16; each sub-block gets an int8 scale, the superblock a fp16 d.
+// Used to re-quantize the Q8_0 projection weights (attn/GDN q/k/v/o/qkv/gate/out) DOWN to Q6_K
+// at load, so the decode GEMV moves 0.82 vs 2.0 bytes/weight; near-lossless (6.5 vs 8 bit).
+__device__ __forceinline__ int q6_nearest_int(float f) { return __float2int_rn(f); }
+
+// best scale for 16 values into L[0..16) (unsigned 6-bit, +32 bias), weighting error by x^2
+__device__ float q6_make_qx_quants16(const float* x, signed char* L) {
+    float amax = 0.f, vmax = 0.f;
+    for (int i = 0; i < 16; ++i) { float ax = fabsf(x[i]); if (ax > amax) { amax = ax; vmax = x[i]; } }
+    if (amax < 1e-30f) { for (int i = 0; i < 16; ++i) L[i] = 0; return 0.f; }
+    float iscale = -32.f / vmax;
+    float sumlx = 0.f, suml2 = 0.f;
+    for (int i = 0; i < 16; ++i) {
+        int l = q6_nearest_int(iscale * x[i]); l = max(-32, min(31, l)); L[i] = (signed char)(l + 32);
+        float w = x[i] * x[i]; sumlx += w * x[i] * l; suml2 += w * (float)l * l;
+    }
+    float scale = suml2 > 0.f ? sumlx / suml2 : 0.f;
+    float best = scale * sumlx;
+    for (int is = -9; is <= 9; ++is) {
+        if (is == 0) continue;
+        float is2 = -(32.f + 0.1f * is) / vmax;
+        float slx = 0.f, sl2 = 0.f;
+        for (int i = 0; i < 16; ++i) {
+            int l = max(-32, min(31, q6_nearest_int(is2 * x[i])));
+            float w = x[i] * x[i]; slx += w * x[i] * l; sl2 += w * (float)l * l;
+        }
+        if (sl2 > 0.f && slx * slx > best * sl2) {
+            for (int i = 0; i < 16; ++i) {
+                int l = max(-32, min(31, q6_nearest_int(is2 * x[i]))); L[i] = (signed char)(l + 32);
+            }
+            scale = slx / sl2; best = scale * slx;
+        }
+    }
+    return scale;
+}
+
+__global__ void quant_q6k_kernel(const __nv_bfloat16* __restrict__ src, unsigned char* __restrict__ dst, long nblocks) {
+    long b = (long)blockIdx.x * blockDim.x + threadIdx.x; if (b >= nblocks) return;
+    const __nv_bfloat16* xb = src + b * 256;
+    float x[256];
+    for (int i = 0; i < 256; ++i) x[i] = __bfloat162float(xb[i]);
+    signed char L[256]; float scales[16];
+    float max_scale = 0.f, max_abs = 0.f;
+    for (int ib = 0; ib < 16; ++ib) {
+        float s = q6_make_qx_quants16(x + 16 * ib, L + 16 * ib);
+        scales[ib] = s; float a = fabsf(s);
+        if (a > max_abs) { max_abs = a; max_scale = s; }
+    }
+    unsigned char* blk = dst + b * 210;
+    if (max_abs < 1e-30f) { for (int i = 0; i < 210; ++i) blk[i] = 0; return; }
+    unsigned char* ql = blk; unsigned char* qh = blk + 128; signed char* sc = (signed char*)(blk + 192);
+    float iscale = -128.f / max_scale;
+    __half dh = __float2half(1.f / iscale);
+    *reinterpret_cast<unsigned short*>(blk + 208) = *reinterpret_cast<unsigned short*>(&dh);
+    for (int ib = 0; ib < 16; ++ib) { int si = q6_nearest_int(iscale * scales[ib]); sc[ib] = (signed char)min(127, si); }
+    float d_sb = __half2float(dh);
+    for (int j = 0; j < 16; ++j) {
+        float d = d_sb * sc[j];
+        if (d == 0.f) continue;                                   // sub-block dequants to 0; keep make_qx_quants L
+        for (int ii = 0; ii < 16; ++ii) {
+            int l = max(-32, min(31, q6_nearest_int(x[16 * j + ii] / d))); L[16 * j + ii] = (signed char)(l + 32);
+        }
+    }
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; ++l) {
+            unsigned char q1 = L[n + l] & 0xF, q2 = L[n + l + 32] & 0xF, q3 = L[n + l + 64] & 0xF, q4 = L[n + l + 96] & 0xF;
+            ql[l]      = q1 | (q3 << 4);
+            ql[l + 32] = q2 | (q4 << 4);
+            qh[l] = (L[n + l] >> 4) | ((L[n + l + 32] >> 4) << 2) | ((L[n + l + 64] >> 4) << 4) | ((L[n + l + 96] >> 4) << 6);
+        }
+        ql += 64; qh += 32;
+    }
+}
+
 __global__ void deq_f16_kernel(const unsigned char* __restrict__ src, __nv_bfloat16* __restrict__ y, long n) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
     y[i] = __float2bfloat16(gg_h2f(src + i * 2));
@@ -129,6 +205,16 @@ void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_
     else if (ggml_type == GGML_Q8_0) { long nb = n_values/32;  deq_q8_0_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_F16)  { deq_f16_kernel<<<(n_values+T-1)/T,T,0,stream>>>(s,d,n_values); }
     else /* F32 */                   { deq_f32_kernel<<<(n_values+T-1)/T,T,0,stream>>>(reinterpret_cast<const float*>(src),d,n_values); }
+}
+
+// Requantize a bf16 weight tensor to GGUF-native Q6_K (210 B / 256-value superblock). n_values
+// must be a multiple of 256. dst holds (n_values/256)*210 bytes.
+void launch_gguf_requant_q6k(const void* src_bf16, void* dst_q6k, long n_values, cudaStream_t stream) {
+    long nb = n_values / 256;
+    const int T = 64;
+    quant_q6k_kernel<<<(nb + T - 1) / T, T, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(src_bf16),
+        reinterpret_cast<unsigned char*>(dst_q6k), nb);
 }
 
 void launch_transpose_bf16(const void* src, void* dst, int rows, int cols, cudaStream_t stream) {

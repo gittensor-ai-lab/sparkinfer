@@ -27,6 +27,11 @@ void launch_dequant_int4_block(const unsigned char* packed, const void* scales_b
 void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_values,
                          cudaStream_t stream = nullptr);
 
+// Requantize a bf16 weight tensor to GGUF-native Q6_K (n_values multiple of 256; dst holds
+// (n_values/256)*210 bytes). Used to lower the Q8_0 projection weights to Q6_K at load.
+void launch_gguf_requant_q6k(const void* src_bf16, void* dst_q6k, long n_values,
+                             cudaStream_t stream = nullptr);
+
 // bf16 transposes used to relayout GGUF [out,in] -> our [in,out].
 void launch_transpose_bf16(const void* src, void* dst, int rows, int cols,
                            cudaStream_t stream = nullptr);          // [rows,cols]->[cols,rows]
