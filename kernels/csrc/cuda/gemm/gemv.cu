@@ -440,7 +440,7 @@ template __global__ void si_mmvq_q4k_kernel<float>(const si_block_q8_1*, const u
 // so there is no Q8_1 offset term -> dot = d_w * d_a * sum(w_i * a_i). Q8_0 blocks are 34 B (2-byte
 // aligned only), so the weight ints are read 2-byte-aligned like the Q6_K path.
 struct si_block_q8_0 { __half d; signed char qs[32]; };                  // 34 B / 32 values
-__device__ __forceinline__ int si_get_int_b2(const void* p, int i32) {
+__device__ __forceinline__ int si_q80_get_int_b2(const void* p, int i32) {
     const unsigned short* u = reinterpret_cast<const unsigned short*>(p);
     return (int)u[2 * i32] | ((int)u[2 * i32 + 1] << 16);
 }
@@ -448,7 +448,7 @@ __device__ __forceinline__ float si_vec_dot_q8_0(const si_block_q8_0* bw, const 
     const int* a = reinterpret_cast<const int*>(ba->qs);   // q8_1 qs is 4-byte aligned (follows half2 ds)
     int sumi = 0;
     #pragma unroll
-    for (int i = 0; i < 8; i++) sumi = __dp4a(si_get_int_b2(bw->qs, i), a[i], sumi);
+    for (int i = 0; i < 8; i++) sumi = __dp4a(si_q80_get_int_b2(bw->qs, i), a[i], sumi);
     return __half2float(bw->d) * __low2float(ba->ds) * (float)sumi;
 }
 template <typename OutT>
