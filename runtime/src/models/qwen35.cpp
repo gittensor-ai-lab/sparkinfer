@@ -355,10 +355,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         bool xn_q8_ready = fnq && L > 0;
-        auto prepare_xn_quant = [&](bool any_q4k, bool any_q6k) {
+        auto prepare_xn_quant = [&](bool any_q4k, bool any_q6k, bool any_q80) {
             if (!s.gguf || !s.use_pq) return;
             if (xn_q8_ready) return;
-            if (s.use_llama && (any_q4k || (s.use_q6mmvq && any_q6k))) {
+            if (s.use_llama && (any_q4k || any_q80 || (s.use_q6mmvq && any_q6k))) {
                 kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
                 xn_q8_ready = true;
             } else if (any_q4k) {
@@ -373,6 +373,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 }
                 else if (s.use_pq && s.use_llama && s.use_q6mmvq && t == 14)
                     kernels::launch_mmvq_q6k(s.aq81, W, y, N, H, pst);
+                else if (s.use_pq && s.use_llama && t == 8)
+                    kernels::launch_mmvq_q80(s.aq81, W, y, N, H, pst);
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -392,6 +394,9 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 } else if (s.use_pq && s.use_llama && s.use_q6mmvq && t == 14) {
                     kernels::launch_quantize_q8_1_blocks(x, s.aq81, K, st);
                     kernels::launch_mmvq_q6k(s.aq81, W, y, N, K, st);
+                } else if (s.use_pq && s.use_llama && t == 8) {
+                    kernels::launch_quantize_q8_1_blocks(x, s.aq81, K, st);
+                    kernels::launch_mmvq_q80(s.aq81, W, y, N, K, st);
                 } else if (t) kernels::launch_gemv_q(x, W, t, y, N, K, st);
                 else          kernels::launch_gemv(x, W, y, N, K, st);
             } else {
@@ -404,7 +409,9 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                   w.ssm_alpha_type == 12 || w.ssm_beta_type == 12);
             const bool any_q6k = (w.wqkv_type == 14 || w.wqkv_gate_type == 14 ||
                                   w.ssm_alpha_type == 14 || w.ssm_beta_type == 14);
-            prepare_xn_quant(any_q4k, any_q6k);
+            const bool any_q80 = (w.wqkv_type == 8 || w.wqkv_gate_type == 8 ||
+                                  w.ssm_alpha_type == 8 || w.ssm_beta_type == 8);
+            prepare_xn_quant(any_q4k, any_q6k, any_q80);
             const bool gdn_pipelined = s.gguf && s.use_gdn_pipe;
             if (gdn_pipelined) {
                 cudaEventRecord(s.ev_pipe_fork, st);
@@ -447,7 +454,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
             if (s.gguf) {
                 const bool any_q4k = (w.wq_type == 12 || w.wk_type == 12 || w.wv_type == 12);
                 const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
-                prepare_xn_quant(any_q4k, any_q6k);
+                const bool any_q80 = (w.wq_type == 8 || w.wk_type == 8 || w.wv_type == 8);
+                prepare_xn_quant(any_q4k, any_q6k, any_q80);
                 if (s.use_qkvstream) {
                     cudaEventRecord(s.ev_qkv, st);
                     cudaStreamWaitEvent(s.stream_k, s.ev_qkv, 0);
@@ -530,6 +538,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     kernels::launch_quantize_q8_1(s.attn, s.aq8, s.aq8_d, s.aq8_s, s.qdim, st);
                     kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, w.wo, s.ao, H, s.qdim, st);
                 }
+            }
+            else if (s.gguf && s.use_pq && s.use_llama && w.wo_type == 8) {   // Q8_0 O-proj (UD-quant)
+                kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
+                kernels::launch_mmvq_q80(s.aq81, w.wo, s.ao, H, s.qdim, st);
             }
             else if (s.gguf && w.wo_type) kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, s.qdim, st);
             else if (s.gguf)         kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
@@ -906,15 +918,17 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // uses ~1.5 GB less VRAM. Set SPARKINFER_QATTN=0 to load dense bf16 instead.
     const bool qattn = []{ const char* a = getenv("SPARKINFER_QATTN");
                            return !(a && a[0] == '0'); }();
+    // Q8_0 (8) joins Q4_K/Q6_K on the keep-raw dp4a path: the Qwen3.6 UD-quant stores attention/GDN
+    // projections as Q8_0, which otherwise expand to bf16 and run the slow generic GEMV (~60% of decode).
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
+        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) return dev_quant(name, type);
         type = 0; return dense(name, false);
     };
     auto attn_w_opt = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { type = 0; return nullptr; }
-        if (qattn && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
+        if (qattn && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) return dev_quant(name, type);
         type = 0; return dense(name, false);
     };
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {

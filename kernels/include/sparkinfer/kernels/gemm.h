@@ -74,6 +74,9 @@ void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K,
 // Same, for Q6_K weights (attn-V upgrades + LM head). q81 = block_q8_1(activation).
 void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
+// Q8_0 x Q8_1 dp4a mmvq (Q8_0 weights kept int8; the Qwen3.6 UD-quant attention/GDN/shared projections)
+void launch_mmvq_q80(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
+void launch_mmvq_q80_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
 // 1-warp-per-row Q6_K dp4a GEMV (large-N, e.g. LM head): GEMV_WPB rows/block.
 void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
 
