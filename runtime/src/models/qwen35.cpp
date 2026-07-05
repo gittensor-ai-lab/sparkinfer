@@ -556,14 +556,21 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
             }
             if (s.gguf) {
-                // Shared expert as three coalesced GEMVs (one warp/row, full grid) instead of
-                // the single-block moe_expert_ffn kernel (1 SM, ~961us/layer -> the decode wall).
-                // gate/up: [ffn]=hn@shared_{gate,up}^T; SwiGLU folds the gate scalar d_shared_w;
-                // down: [H]=h@shared_down^T. GGUF-native [out,in] layout (see load_gguf).
-                kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
-                kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
-                kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w, s.sh_h, c.moe_ffn, st);
-                kernels::launch_gemv(s.sh_h, w.shared_down, s.shared, H, c.moe_ffn, st);
+                const bool qmoe = w.shared_gate_q && w.shared_up_q && w.shared_down_q
+                               && w.shared_gate_qtype == 8 && c.hidden == 2048 && c.moe_ffn == 512;
+                if (qmoe) {
+                    // Q8_0 int8 dp4a MMVQ: reuses FNQ Q8_1(hn), fuses gate+up+swiglu, dp4a down.
+                    kernels::launch_shared_expert_q8_mmvq(
+                        s.hn, fnq ? s.aq81 : nullptr,
+                        w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                        w.shared_gate_inp ? s.d_shared_w : nullptr,
+                        s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st);
+                } else {
+                    kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
+                    kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
+                    kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w, s.sh_h, c.moe_ffn, st);
+                    kernels::launch_gemv(s.sh_h, w.shared_down, s.shared, H, c.moe_ffn, st);
+                }
             } else {
                 // set_weights path: shared weights are [hidden,ffn]/[ffn,hidden] dense.
                 kernels::launch_moe_expert_ffn(s.hn, w.shared_gate, w.shared_up, w.shared_down,
@@ -915,11 +922,23 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 !expect_dims_opt(b + "ffn_gate_inp_shexp.weight", {H})) return false;
             // GGUF-native [out,in] layout (no transpose) so the shared expert runs as
             // three fast one-warp-per-row GEMVs instead of the single-block dense kernel.
-            w.shared_gate = dense(b + "ffn_gate_shexp.weight", false);   // [ffn, H]
-            w.shared_up   = dense(b + "ffn_up_shexp.weight", false);     // [ffn, H]
-            w.shared_down = dense(b + "ffn_down_shexp.weight", false);   // [H, ffn]
+            const bool qmoe = []{ const char* a = getenv("SPARKINFER_QMOE");
+                                   return !(a && a[0] == '0'); }();
+            if (qmoe) {
+                w.shared_gate_q = dev_quant(b + "ffn_gate_shexp.weight", w.shared_gate_qtype);
+                w.shared_up_q   = dev_quant(b + "ffn_up_shexp.weight",   w.shared_up_qtype);
+                w.shared_down_q = dev_quant(b + "ffn_down_shexp.weight", w.shared_down_qtype);
+            }
+            if (!qmoe || !w.shared_gate_q || !w.shared_up_q || !w.shared_down_q ||
+                w.shared_gate_qtype != 8) {
+                w.shared_gate = dense(b + "ffn_gate_shexp.weight", false);
+                w.shared_up   = dense(b + "ffn_up_shexp.weight", false);
+                w.shared_down = dense(b + "ffn_down_shexp.weight", false);
+            }
             w.shared_gate_inp = attn_w_opt(b + "ffn_gate_inp_shexp.weight", w.shared_gate_inp_type);
-            if (!w.shared_gate || !w.shared_up || !w.shared_down) return false;
+            const bool have_shared_q = w.shared_gate_q && w.shared_up_q && w.shared_down_q;
+            const bool have_shared_d = w.shared_gate && w.shared_up && w.shared_down;
+            if (!have_shared_q && !have_shared_d) return false;
         }
         const bool have_attn = w.linear_attn
             ? (w.wqkv && w.wqkv_gate && w.ssm_conv && w.ssm_dt && w.ssm_a &&

@@ -26,10 +26,13 @@ struct Qwen35LayerWeights {
     const void* gate = nullptr;          // [n_experts, hidden, moe_ffn]
     const void* up   = nullptr;          // [n_experts, hidden, moe_ffn]
     const void* down = nullptr;          // [n_experts, moe_ffn, hidden]
-    const void* shared_gate = nullptr;   // [hidden, moe_ffn]
-    const void* shared_up   = nullptr;   // [hidden, moe_ffn]
-    const void* shared_down = nullptr;   // [moe_ffn, hidden]
+    const void* shared_gate = nullptr;   // bf16 dense fallback
+    const void* shared_up   = nullptr;
+    const void* shared_down = nullptr;
     const void* shared_gate_inp = nullptr;// [hidden] -> scalar shared-expert gate
+    // Qwen3.6 UD: shared expert stored as Q8_0 (on-read GEMV, ~2x less weight BW vs bf16).
+    const void* shared_gate_q = nullptr; const void* shared_up_q = nullptr; const void* shared_down_q = nullptr;
+    int shared_gate_qtype = 0, shared_up_qtype = 0, shared_down_qtype = 0;
 
     // Qwen3.5/Qwen3.6 Gated DeltaNet tensors (linear-attention layers only).
     const void* wqkv = nullptr;           // [hidden, q+k+v]
