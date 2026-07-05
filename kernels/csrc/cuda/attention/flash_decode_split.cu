@@ -290,9 +290,11 @@ template __global__ void fa_split_gqa_kernel<128, 8, FA_GQA_TILE, true>(const __
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, 8>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, 16>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
-// Qwen3.6 full-attention head_dim=256 (bf16 KV): scalar split only (int8/GQA paths are hd=128-only).
+// Qwen3.6 full-attention head_dim=256 (bf16 KV): GQA-8 split + scalar fallback.
 template __global__ void fa_split_kernel<256>(const __nv_bfloat16*, const void*, const void*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*, int);
+template __global__ void fa_split_gqa_kernel<256, 8, FA_GQA_TILE, false>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
 template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
@@ -502,14 +504,25 @@ void launch_flash_decode_split(
     int block_size, int max_blocks, int n_splits, float scale, cudaStream_t stream,
     void* out_q8, int seqlen, const void* k_scale, const void* v_scale, int int8_kv
 ) {
-    // Qwen3.6 full-attention layers run head_dim=256 (bf16 KV). The GQA-8 / int8 tensor-core paths
-    // below are head_dim=128-specialized, so 256 takes the generic scalar split + combine.
+    // Qwen3.6 full-attention layers run head_dim=256 (bf16 KV). Use the GQA-8 shared-KV tile
+    // path (same 8:1 grouping as Qwen3 hd=128) — cuts KV global reads ~8x vs one-warp-per-q-head.
     if (head_dim == 256) {
-        dim3 g1(num_q_heads * n_splits, num_seqs), g2(num_q_heads * FA_COMBINE_DG, num_seqs);
-        fa_split_kernel<256><<<g1, 32, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
-            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-            reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale), int8_kv);
+        dim3 g2(num_q_heads * FA_COMBINE_DG, num_seqs);
+        if (num_kv_heads > 0 && num_q_heads == num_kv_heads * 8) {
+            constexpr int GQA = 8, TILE = FA_GQA_TILE;
+            dim3 gq(num_kv_heads * n_splits, num_seqs);
+            const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
+            fa_split_gqa_kernel<256, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+        } else {
+            dim3 g1(num_q_heads * n_splits, num_seqs);
+            fa_split_kernel<256><<<g1, 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale), int8_kv);
+        }
         fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW><<<g2, FA_COMBINE_NW * 32, 0, stream>>>(
             part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
             reinterpret_cast<fa_block_q8_1*>(out_q8));
