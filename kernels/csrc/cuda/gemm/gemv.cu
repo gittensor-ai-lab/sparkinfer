@@ -439,17 +439,24 @@ template __global__ void si_mmvq_q4k_kernel<float>(const si_block_q8_1*, const u
 // simplest mmvq (no 4-bit unpack) and byte-faithful to llama.cpp vec_dot_q8_0_q8_1: Q8_0 is symmetric
 // so there is no Q8_1 offset term -> dot = d_w * d_a * sum(w_i * a_i). Q8_0 blocks are 34 B (2-byte
 // aligned only), so the weight ints are read 2-byte-aligned like the Q6_K path.
-struct si_block_q8_0 { __half d; signed char qs[32]; };                  // 34 B / 32 values
-__device__ __forceinline__ int si_q80_get_int_b2(const void* p, int i32) {
+// A Q8_0 block is 34 B ([fp16 d][int8 qs[32]]) and only 2-byte aligned, so read it via explicit byte
+// offsets + a copy-based fp16 read (like the Q6_K path's gq_h2f / si_get_int_b2) — a typed __half load
+// or a struct stride would assume 4-byte alignment and read garbage.
+__device__ __forceinline__ float si_q80_h2f(const unsigned char* p) {
+    __half h; *reinterpret_cast<unsigned short*>(&h) = *reinterpret_cast<const unsigned short*>(p);
+    return __half2float(h);
+}
+__device__ __forceinline__ int si_q80_get_int_b2(const unsigned char* p, int i32) {
     const unsigned short* u = reinterpret_cast<const unsigned short*>(p);
     return (int)u[2 * i32] | ((int)u[2 * i32 + 1] << 16);
 }
-__device__ __forceinline__ float si_vec_dot_q8_0(const si_block_q8_0* bw, const si_block_q8_1* ba) {
+__device__ __forceinline__ float si_vec_dot_q8_0(const unsigned char* bw, const si_block_q8_1* ba) {
+    const float dw = si_q80_h2f(bw);                       // fp16 scale @ block offset 0
     const int* a = reinterpret_cast<const int*>(ba->qs);   // q8_1 qs is 4-byte aligned (follows half2 ds)
     int sumi = 0;
     #pragma unroll
-    for (int i = 0; i < 8; i++) sumi = __dp4a(si_q80_get_int_b2(bw->qs, i), a[i], sumi);
-    return __half2float(bw->d) * __low2float(ba->ds) * (float)sumi;
+    for (int i = 0; i < 8; i++) sumi = __dp4a(si_q80_get_int_b2(bw + 2, i), a[i], sumi);  // qs @ offset 2
+    return dw * __low2float(ba->ds) * (float)sumi;
 }
 template <typename OutT>
 __global__ void si_mmvq_q80_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
@@ -458,10 +465,10 @@ __global__ void si_mmvq_q80_kernel(const si_block_q8_1* __restrict__ vy, const u
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
     const int row = blockIdx.x;
     const int nb = K >> 5;                                                // 32-weight Q8_0 blocks per row
-    const si_block_q8_0* w_row = reinterpret_cast<const si_block_q8_0*>(W + (size_t)row * nb * 34);
+    const unsigned char* w_row = W + (size_t)row * nb * 34;               // explicit 34-byte block stride
     float tmp = 0.0f;
     for (int kb = tid; kb < nb; kb += NW * WS)
-        tmp += si_vec_dot_q8_0(w_row + kb, vy + kb);
+        tmp += si_vec_dot_q8_0(w_row + (size_t)kb * 34, vy + kb);
     __shared__ float tmp_shared[NW - 1][WS];
     if (warp > 0) tmp_shared[warp - 1][lane] = tmp;
     __syncthreads();
