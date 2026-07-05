@@ -310,41 +310,52 @@ def render(res, oid):
     # A passing speedup (XL/L/M/S/XS) clears the significance gate, so its tps becomes the NEW frontier.
     advanced = label in {"XL", "L", "M", "S", "XS"} and res.get("pass")
     ctx_label = res.get("best_context_label")
+    # Dual-model runs carry a "guard" block (Qwen3-30B) + "model" (the scored target, Qwen3.6). The
+    # verdict can REJECT on the GUARD even when every scored-model gate passes, so the guard's own
+    # per-context results must be shown — otherwise the table reads "all pass" next to a REJECT.
+    guard = res.get("guard") or {}
+    scored_model = res.get("model")
+    dual = bool(guard) and bool(scored_model)
+    short = scored_model.split("-")[0] if scored_model else ""       # "Qwen3.6"
+    gname = res.get("guard_model", "Qwen3-30B")
     rows = [f"| **label** | `eval:{label}` |",
-            f"| scored decode ({res.get('score_context', 128)} ctx{f' · {ctx_label}' if ctx_label else ''}) | {res.get('tps','?')} tok/s |",
-            f"| correctness | top-1 {res.get('top1',0)*100:.1f}% · KL {res.get('kl','?')} |"]
-    if res.get("ctx_128_tps") is not None:
-        gate = "pass" if res.get("guard_128_pass", True) else "fail"
-        base = res.get("guard_128_baseline") or 0
-        rows.append(f"| 128-token no-regression gate | {res.get('ctx_128_tps')} tok/s"
-                    f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
-    if res.get("ctx_512_tps") is not None:
-        gate = "pass" if res.get("guard_512_pass", True) else "fail"
-        base = res.get("guard_512_baseline") or 0
-        rows.append(f"| 512-context no-regression gate | {res.get('ctx_512_tps')} tok/s"
-                    f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
-    if res.get("ctx_4096_tps") is not None:
-        gate = "pass" if res.get("guard_4k_pass", True) else "fail"
-        base = res.get("guard_4k_baseline") or 0
-        rows.append(f"| 4k-context no-regression gate | {res.get('ctx_4096_tps')} tok/s"
-                    f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
-    if res.get("ctx_16384_tps") is not None:
-        gate = "pass" if res.get("guard_16k_pass", True) else "fail"
-        base = res.get("guard_16k_baseline") or res.get("frontier_tps") or 0
-        rows.append(f"| 16k-context no-regression gate | {res.get('ctx_16384_tps')} tok/s"
-                    f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
-    if res.get("ctx_32768_tps") is not None:
-        gate = "pass" if res.get("guard_32k_pass", True) else "fail"
-        base = res.get("guard_32k_baseline") or 0
-        rows.append(f"| 32k-context no-regression gate | {res.get('ctx_32768_tps')} tok/s"
+            f"| scored decode ({res.get('score_context', 128)} ctx{f' · {ctx_label}' if ctx_label else ''}{f' · {short}' if dual else ''}) | {res.get('tps','?')} tok/s |",
+            f"| correctness{f' ({short} vs llama.cpp)' if dual else ''} | top-1 {res.get('top1',0)*100:.1f}% · KL {res.get('kl','?')} |"]
+    # scored-model per-context no-regression gates — SKIP contexts not measured (tps 0/None) so a
+    # deliberately-skipped 16k/32k never renders a misleading "0.0 tok/s · pass".
+    for key, gkey, bkey, lbl in [("ctx_128_tps", "guard_128_pass", "guard_128_baseline", "128-token"),
+                                 ("ctx_512_tps", "guard_512_pass", "guard_512_baseline", "512-context"),
+                                 ("ctx_4096_tps", "guard_4k_pass", "guard_4k_baseline", "4k-context"),
+                                 ("ctx_16384_tps", "guard_16k_pass", "guard_16k_baseline", "16k-context"),
+                                 ("ctx_32768_tps", "guard_32k_pass", "guard_32k_baseline", "32k-context")]:
+        tps = res.get(key)
+        if not tps:
+            continue
+        gate = "pass" if res.get(gkey, True) else "fail"
+        base = res.get(bkey) or (res.get("frontier_tps") if key == "ctx_16384_tps" else 0) or 0
+        rows.append(f"| {f'{short} ' if dual else ''}{lbl} no-regression gate | {tps} tok/s"
                     f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
     if res.get("ctx_2048_tps") is not None and res.get("ctx_512_tps") is None:
         gate = "pass" if res.get("guard_2k_pass", True) else "fail"
         base = res.get("guard_2k_baseline") or 0
         rows.append(f"| legacy 2k no-regression gate | {res.get('ctx_2048_tps')} tok/s"
                     f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
-    if res.get("regression_labels"):
-        rows.append(f"| regressions | {', '.join(res.get('regression_labels') or [])} |")
+    # The Qwen3-30B no-regression guard — the check that actually gates a dual verdict.
+    if dual:
+        acc_ok = "pass" if guard.get("accuracy_ok", True) else "**FAIL**"
+        rows.append(f"| **{gname} guard — accuracy** | top-1 {guard.get('top1',0)*100:.1f}% · KL {guard.get('kl','?')} · {acc_ok} |")
+        for key, gkey, lbl in [("ctx_128_tps", "guard_128_pass", "128-token"),
+                               ("ctx_512_tps", "guard_512_pass", "512-context"),
+                               ("ctx_4096_tps", "guard_4k_pass", "4k-context"),
+                               ("ctx_16384_tps", "guard_16k_pass", "16k-context"),
+                               ("ctx_32768_tps", "guard_32k_pass", "32k-context")]:
+            tps = guard.get(key)
+            if not tps:
+                continue
+            rows.append(f"| {gname} guard — {lbl} | {tps} tok/s · {'pass' if guard.get(gkey, True) else '**fail**'} |")
+    if res.get("regression_labels") or res.get("guard_regression_labels"):
+        allregs = (res.get("regression_labels") or []) + (res.get("guard_regression_labels") or [])
+        rows.append(f"| regressions | {', '.join(allregs)} |")
     if "frontier_tps" in res and res["frontier_tps"]:
         # Label it "prior frontier" when this PR superseded it, so the old value isn't mistaken
         # for the current live frontier (which is now this PR's tps).
@@ -352,7 +363,7 @@ def render(res, oid):
                        f"{res.get('pct_over_frontier', 0):+.1f}% ({res.get('delta_tps',0):+.1f}) |")
     if advanced:
         rows.insert(3, f"| **→ new frontier** | **{res.get('tps')} tok/s** |")
-    note = {"REJECT": f"Failed the correctness gate: {res.get('reason','')}. Not a valid submission.",
+    note = {"REJECT": f"**Rejected** — {res.get('reason','')}.",
             "none": "Within the significance gate — no *verified* speedup over the current frontier.",
             "BASELINE": "No frontier was set; this run establishes it."
             }.get(label, f"Verified speedup — **sets the new frontier to {res.get('tps')} tok/s** "
