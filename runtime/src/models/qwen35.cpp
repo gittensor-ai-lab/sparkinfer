@@ -560,8 +560,13 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 // the single-block moe_expert_ffn kernel (1 SM, ~961us/layer -> the decode wall).
                 // gate/up: [ffn]=hn@shared_{gate,up}^T; SwiGLU folds the gate scalar d_shared_w;
                 // down: [H]=h@shared_down^T. GGUF-native [out,in] layout (see load_gguf).
-                kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
-                kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
+                static int shfuse=-1; if(shfuse<0){const char*e=getenv("SPARKINFER_SHFUSE");shfuse=(e&&e[0]=='0')?0:1;}
+                if (shfuse) {
+                    kernels::launch_gemv2(s.hn, w.shared_gate, w.shared_up, s.sh_gate, s.sh_up, c.moe_ffn, H, st);
+                } else {
+                    kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
+                    kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
+                }
                 kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w, s.sh_h, c.moe_ffn, st);
                 kernels::launch_gemv(s.sh_h, w.shared_down, s.shared, H, c.moe_ffn, st);
             } else {

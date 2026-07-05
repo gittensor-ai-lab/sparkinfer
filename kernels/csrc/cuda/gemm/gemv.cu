@@ -647,6 +647,48 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K, cudaStream
         reinterpret_cast<__nv_bfloat16*>(y), N, K);
 }
 
+// Two GEMVs sharing one input x (e.g. shared-expert gate + up). One launch computes both weight
+// matrices' N rows (2N warps), so x is staged once and the grid is 2x wider -> fills the GPU when N
+// alone underfills it (gate/up N=ffn=512 -> 64 blocks each; fused -> 128 blocks, one launch, one x load).
+__global__ void gemv2_kernel(const __nv_bfloat16* __restrict__ x,
+                             const __nv_bfloat16* __restrict__ W0, const __nv_bfloat16* __restrict__ W1,
+                             __nv_bfloat16* __restrict__ y0, __nv_bfloat16* __restrict__ y1, int N, int K) {
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < K; i += blockDim.x) s_x[i] = __bfloat162float(x[i]);
+    __syncthreads();
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int g = blockIdx.x * GEMV_WPB + warp;    // 0..2N-1
+    if (g >= 2 * N) return;
+    const bool up = (g >= N);
+    const int n = up ? g - N : g;
+    const __nv_bfloat16* W = up ? W1 : W0;
+    const uint4* row4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+    const int n4 = K / 8;
+    float acc = 0.f;
+    for (int i = lane; i < n4; i += 32) {
+        uint4 v = row4[i];
+        const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&v);
+        const int base = i * 8;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 f = __bfloat1622float2(h2[j]);
+            acc += f.x * s_x[base + 2*j] + f.y * s_x[base + 2*j + 1];
+        }
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+    if (lane == 0) (up ? y1 : y0)[n] = __float2bfloat16(acc);
+}
+
+void launch_gemv2(const void* x, const void* W0, const void* W1, void* y0, void* y1,
+                  int N, int K, cudaStream_t stream) {
+    dim3 grid((2 * N + GEMV_WPB - 1) / GEMV_WPB);
+    gemv2_kernel<<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<const __nv_bfloat16*>(W0), reinterpret_cast<const __nv_bfloat16*>(W1),
+        reinterpret_cast<__nv_bfloat16*>(y0), reinterpret_cast<__nv_bfloat16*>(y1), N, K);
+}
+
 // split-K occupancy for the f32-output bf16 GEMV. Default ON: at decode this path serves the
 // router projection (N = n_experts is tiny), where one-warp-per-row idles the GPU.
 // SPARKINFER_ROUTER_SK=0 restores the plain one-warp-per-row kernel. Needs K a multiple of 8.

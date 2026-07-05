@@ -45,6 +45,9 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K,
                  cudaStream_t stream = nullptr);
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K,
                      cudaStream_t stream = nullptr);
+// Two GEMVs over one shared input x -> y0 = x@W0^T, y1 = x@W1^T (both [N,K]). One launch, one x load.
+void launch_gemv2(const void* x, const void* W0, const void* W1, void* y0, void* y1,
+                  int N, int K, cudaStream_t stream = nullptr);
 
 // Quantized on-read GEMV: same as launch_gemv but W is GGUF-native Q4_K/Q6_K
 // [N,K] (wtype = ggml type id, 12=Q4_K / 14=Q6_K). Dequantizes each block in
