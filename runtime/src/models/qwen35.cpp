@@ -811,9 +811,16 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // uses ~1.5 GB less VRAM. Set SPARKINFER_QATTN=0 to load dense bf16 instead.
     const bool qattn = []{ const char* a = getenv("SPARKINFER_QATTN");
                            return !(a && a[0] == '0'); }();
+    // Keep Q8_0 (ggml type 8) projection weights quantized in VRAM and decode them on-read
+    // (gemv_q80_kernel), instead of the load-time Q8_0->bf16 dequant + dense bf16 GEMV. Halves
+    // the weight read of the ~44%-of-decode dense GEMV and is more faithful (fp32 accumulate of
+    // the exact Q8_0 value vs a bf16-rounded weight). Default ON; SPARKINFER_QGEMV8=0 = bf16.
+    const bool q80 = []{ const char* a = getenv("SPARKINFER_QGEMV8");
+                         return !(a && a[0] == '0'); }();
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
+        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || (q80 && t->ggml_type == 8)))
+            return dev_quant(name, type);
         type = 0; return dense(name, false);
     };
     auto attn_w_opt = [&](const std::string& name, int& type) -> const void* {
