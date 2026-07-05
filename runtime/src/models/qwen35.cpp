@@ -117,7 +117,8 @@ struct Qwen35Model::Impl {
     bf16 *lin_gdn = nullptr, *lin_norm = nullptr, *shared_gate_tmp = nullptr;
     bf16 *sh_gate = nullptr, *sh_up = nullptr, *sh_h = nullptr;   // shared-expert GEMV scratch [moe_ffn]
     bf16 *lin_conv_state = nullptr;
-    float* lin_state = nullptr;
+    float* lin_state = nullptr;   // GDN recurrent state buffer (fp32-sized; reinterpreted bf16 when gdn_bf16)
+    bool gdn_bf16 = true;         // SPARKINFER_GDN_BF16 (default ON): store the GDN state in bf16
     float* logits;
     int *d_scalars, *d_tok, *d_out_id, *d_pos, *d_seqlen, *d_writepos, *d_shared_ids;
     int *h_scalars = nullptr, *h_out_id = nullptr;
@@ -231,6 +232,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_FNQ"))    p_->use_fnq   = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_QKVSTREAM")) p_->use_qkvstream = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ATTNIN")) p_->use_attnin = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_GDN_BF16")) p_->gdn_bf16 = !(e[0] == '0');
 }
 
 Qwen35Model::~Qwen35Model() {
@@ -397,13 +399,17 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                                  c.linear_q_heads, c.linear_v_heads,
                                                  c.linear_head_dim, c.linear_conv_kernel,
                                                  c.rms_eps, st);
-            float* layer_state = s.lin_state +
-                (size_t)L * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+            // One GDN state buffer, sized fp32; when gdn_bf16 the layer slice is addressed (and the
+            // kernel reads/writes it) as bf16 — half the elements, so half the HBM traffic.
+            const size_t st_stride = (size_t)c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+            void* layer_state = s.gdn_bf16
+                ? (void*)(reinterpret_cast<bf16*>(s.lin_state) + (size_t)L * st_stride)
+                : (void*)(s.lin_state + (size_t)L * st_stride);
             kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
                                           s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
                                           layer_state, s.lin_gdn,
                                           c.linear_q_heads, c.linear_v_heads,
-                                          c.linear_head_dim, st);
+                                          c.linear_head_dim, s.gdn_bf16 ? 1 : 0, st);
             kernels::launch_qwen36_gated_norm(s.lin_gdn, s.lin_z, w.ssm_norm, s.lin_norm,
                                               c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
             proj_from(s.lin_norm, w.ssm_out, w.ssm_out_type, s.ao, H, s.linear_vdim);

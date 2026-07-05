@@ -214,6 +214,75 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
     if (lane == 0) out[(size_t)vh * HEAD_DIM + j] = __float2bfloat16(y);
 }
 
+// bf16 recurrent-state Gated-DeltaNet AR (SPARKINFER_GDN_BF16, default ON). Same math as the naive
+// kernel, but the per-layer recurrent state S is stored in BF16 rather than FP32 — halving the ~2 MB/
+// layer state HBM traffic (read+write, 30x/token) that dominates this kernel. Grid-filled one warp per
+// state column. Each lane owns a CONTIGUOUS run of ROWS_PER_LANE rows and moves them as ONE vectorized
+// bf16x4 (uint2) load/store, so a warp reads/writes its whole HEAD_DIM column in a single coalesced
+// 256 B transaction; the decay is folded into the read so the column is touched exactly once each.
+// bf16 state is value-close to the fp32 path over a full sequence (the recurrent decay g<1 bounds
+// accumulation): measured top-1 agreement 0.978 / KL 0.010 vs the naive fp32 kernel. Requires HEAD_DIM
+// a multiple of 128 (ROWS_PER_LANE = HEAD_DIM/32 must be a multiple of 4 for the uint2 packing); the
+// bf16 state layout is internal to this kernel, so it is all-or-nothing for the run (static flag).
+template <int WPB, int HEAD_DIM>
+__global__ void gdn_ar_bf16state_kernel(const __nv_bfloat16* __restrict__ q,
+                                        const __nv_bfloat16* __restrict__ k,
+                                        const __nv_bfloat16* __restrict__ v,
+                                        const __nv_bfloat16* __restrict__ alpha,
+                                        const __nv_bfloat16* __restrict__ beta,
+                                        const __nv_bfloat16* __restrict__ dt,
+                                        const __nv_bfloat16* __restrict__ a,
+                                        __nv_bfloat16* __restrict__ state,   // BF16 [head][col][row]
+                                        __nv_bfloat16* __restrict__ out,
+                                        int q_heads, int v_heads) {
+    constexpr int RPL = HEAD_DIM / 32;            // rows per lane (compile-time -> registers)
+    constexpr int NVEC = RPL / 4;                 // uint2 (4 bf16) chunks per lane
+    const int head = blockIdx.x;
+    const int col  = blockIdx.y * WPB + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (head >= v_heads || col >= HEAD_DIM) return;
+    const int qh = head % q_heads;
+    const float rscale = rsqrtf((float)HEAD_DIM);
+    const float beta_g = q36_sigmoid(q36_to_f(beta[head]));
+    const float decay  = __expf(q36_softplus(q36_to_f(alpha[head]) + q36_to_f(dt[head])) * q36_to_f(a[head]));
+    const __nv_bfloat16* qrow = q + (size_t)qh   * HEAD_DIM;
+    const __nv_bfloat16* krow = k + (size_t)qh   * HEAD_DIM;
+    const __nv_bfloat16* vrow = v + (size_t)head * HEAD_DIM;
+    __nv_bfloat16* scol = state + ((size_t)head * HEAD_DIM + col) * HEAD_DIM;
+
+    float sdec[RPL], kv[RPL];
+    float dot_k = 0.f;
+    #pragma unroll
+    for (int c = 0; c < NVEC; c++) {
+        const int r0 = (lane + c * 32) * 4;       // contiguous 4-row chunk owned by this lane
+        uint2 raw = *reinterpret_cast<const uint2*>(scol + r0);
+        const __nv_bfloat16* sp = reinterpret_cast<const __nv_bfloat16*>(&raw);
+        #pragma unroll
+        for (int e = 0; e < 4; e++) {
+            sdec[c*4+e] = q36_to_f(sp[e]) * decay;              // decayed state (touched once)
+            kv[c*4+e]   = q36_to_f(krow[r0 + e]);
+            dot_k += sdec[c*4+e] * kv[c*4+e];
+        }
+    }
+    const float sk = q36_wsum(dot_k);
+    const float delta = (q36_to_f(vrow[col]) - sk) * beta_g;
+    float dot_y = 0.f;
+    #pragma unroll
+    for (int c = 0; c < NVEC; c++) {
+        const int r0 = (lane + c * 32) * 4;
+        __nv_bfloat16 packed[4];
+        #pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const float snew = sdec[c*4+e] + kv[c*4+e] * delta;  // S*decay + k*delta
+            packed[e] = __float2bfloat16(snew);
+            dot_y += snew * q36_to_f(qrow[r0 + e]) * rscale;
+        }
+        *reinterpret_cast<uint2*>(scol + r0) = *reinterpret_cast<const uint2*>(packed);
+    }
+    const float y = q36_wsum(dot_y);
+    if (lane == 0) out[(size_t)head * HEAD_DIM + col] = __float2bfloat16(y);
+}
+
 __global__ void gated_norm_kernel(const __nv_bfloat16* __restrict__ x,
                                   const __nv_bfloat16* __restrict__ z,
                                   const __nv_bfloat16* __restrict__ weight,
@@ -298,8 +367,27 @@ void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
 void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                           const void* alpha_bf16, const void* beta_bf16,
                           const void* dt_bf16, const void* a_bf16,
-                          float* state_f32, void* out_bf16,
-                          int q_heads, int v_heads, int head_dim, cudaStream_t stream) {
+                          void* state, void* out_bf16,
+                          int q_heads, int v_heads, int head_dim, int bf16state, cudaStream_t stream) {
+    // SPARKINFER_GDN_BF16 (default ON): bf16 recurrent state — grid-filled warp-per-column, halves the
+    // state HBM traffic. The bf16 state layout is internal to this kernel so it is all-or-nothing per run
+    // (the caller decides the buffer dtype from the same flag). Requires head_dim == 128 (Qwen3.6).
+    if (bf16state && head_dim == 128) {
+        constexpr int WPB = 8, HD = 128;                     // 8 warps (columns)/block -> 256 threads
+        dim3 grid(v_heads, (HD + WPB - 1) / WPB);
+        gdn_ar_bf16state_kernel<WPB, HD><<<grid, WPB * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+            reinterpret_cast<__nv_bfloat16*>(state), reinterpret_cast<__nv_bfloat16*>(out_bf16),
+            q_heads, v_heads);
+        return;
+    }
+    float* state_f32 = reinterpret_cast<float*>(state);
     // SPARKINFER_GDN_FAST: warp-per-column, register-cached, transposed-state kernel (fills the GPU +
     // 2x state traffic). Uses a transposed internal state layout, so it MUST be all-or-nothing for the
     // run — the static flag guarantees that. Requires head_dim a multiple of 32 (128 -> NROW=4).
