@@ -115,6 +115,7 @@ struct Qwen35Model::Impl {
     bf16 *lin_qkv = nullptr, *lin_q = nullptr, *lin_k = nullptr, *lin_v = nullptr;
     bf16 *lin_z = nullptr, *lin_alpha = nullptr, *lin_beta = nullptr;
     bf16 *lin_gdn = nullptr, *lin_norm = nullptr, *shared_gate_tmp = nullptr;
+    bf16 *sh_gate = nullptr, *sh_up = nullptr, *sh_h = nullptr;   // shared-expert GEMV scratch [moe_ffn]
     bf16 *lin_conv_state = nullptr;
     float* lin_state = nullptr;
     float* logits;
@@ -554,9 +555,21 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 }
                 kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
             }
-            kernels::launch_moe_expert_ffn(s.hn, w.shared_gate, w.shared_up, w.shared_down,
-                                           s.d_shared_ids, s.d_shared_w, s.shared,
-                                           1, 1, 1, H, c.moe_ffn, st);
+            if (s.gguf) {
+                // Shared expert as three coalesced GEMVs (one warp/row, full grid) instead of
+                // the single-block moe_expert_ffn kernel (1 SM, ~961us/layer -> the decode wall).
+                // gate/up: [ffn]=hn@shared_{gate,up}^T; SwiGLU folds the gate scalar d_shared_w;
+                // down: [H]=h@shared_down^T. GGUF-native [out,in] layout (see load_gguf).
+                kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
+                kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
+                kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w, s.sh_h, c.moe_ffn, st);
+                kernels::launch_gemv(s.sh_h, w.shared_down, s.shared, H, c.moe_ffn, st);
+            } else {
+                // set_weights path: shared weights are [hidden,ffn]/[ffn,hidden] dense.
+                kernels::launch_moe_expert_ffn(s.hn, w.shared_gate, w.shared_up, w.shared_down,
+                                               s.d_shared_ids, s.d_shared_w, s.shared,
+                                               1, 1, 1, H, c.moe_ffn, st);
+            }
             launch_residual_add(s.routed, s.shared, s.routed, H, st);
         }
         // fused: x = h + routed ; xn = RMSNorm(x, next input_norm or final_norm)
@@ -742,6 +755,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 "(safe for models without a shared FFN)\n");
         s.cfg.n_shared = 0;
     }
+    // Shared-expert GEMV scratch [moe_ffn]. Allocated only on the GGUF path (native
+    // [out,in] shared weights); the set_weights path keeps the moe_expert_ffn kernel.
+    if (s.cfg.n_shared > 0 && !s.sh_gate) {
+        s.sh_gate = s.alloc<bf16>(s.cfg.moe_ffn);
+        s.sh_up   = s.alloc<bf16>(s.cfg.moe_ffn);
+        s.sh_h    = s.alloc<bf16>(s.cfg.moe_ffn);
+    }
 
     // upload raw quantized blocks, keep on device (for experts)
     auto dev_quant = [&](const std::string& name, int& qtype) -> const void* {
@@ -893,9 +913,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 !expect_dims(b + "ffn_up_shexp.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_down_shexp.weight", {c.moe_ffn, H}) ||
                 !expect_dims_opt(b + "ffn_gate_inp_shexp.weight", {H})) return false;
-            w.shared_gate = dense(b + "ffn_gate_shexp.weight", true);
-            w.shared_up   = dense(b + "ffn_up_shexp.weight", true);
-            w.shared_down = dense(b + "ffn_down_shexp.weight", true);
+            // GGUF-native [out,in] layout (no transpose) so the shared expert runs as
+            // three fast one-warp-per-row GEMVs instead of the single-block dense kernel.
+            w.shared_gate = dense(b + "ffn_gate_shexp.weight", false);   // [ffn, H]
+            w.shared_up   = dense(b + "ffn_up_shexp.weight", false);     // [ffn, H]
+            w.shared_down = dense(b + "ffn_down_shexp.weight", false);   // [H, ffn]
             w.shared_gate_inp = attn_w_opt(b + "ffn_gate_inp_shexp.weight", w.shared_gate_inp_type);
             if (!w.shared_gate || !w.shared_up || !w.shared_down) return false;
         }

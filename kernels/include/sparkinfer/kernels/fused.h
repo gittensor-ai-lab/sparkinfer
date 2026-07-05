@@ -52,6 +52,11 @@ void launch_qwen36_mul_sigmoid(void* x_bf16, const void* gate_bf16, int n,
 void launch_qwen36_sigmoid_scalar(const void* x_bf16, float* out_f32,
                                   cudaStream_t stream = nullptr);
 
+// Shared-expert SwiGLU with folded gate scalar: out[i] = dw * SiLU(gate[i]) * up[i].
+void launch_qwen36_shared_swiglu(const void* gate_bf16, const void* up_bf16,
+                                 const float* dw_f32, void* out_bf16, int n,
+                                 cudaStream_t stream = nullptr);
+
 void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
                                  void* conv_state_bf16, void* q_bf16, void* k_bf16,
                                  void* v_bf16, int q_heads, int v_heads, int head_dim,

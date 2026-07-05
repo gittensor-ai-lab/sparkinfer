@@ -52,6 +52,18 @@ __global__ void sigmoid_scalar_kernel(const __nv_bfloat16* __restrict__ x,
     out[0] = q36_sigmoid(q36_to_f(x[0]));
 }
 
+// Shared-expert SwiGLU: out[i] = dw * SiLU(gate[i]) * up[i]. The shared-expert
+// gate scalar dw folds in here (down is linear, so scaling the intermediate is
+// identical to scaling the output), letting the caller finish with a plain add.
+__global__ void shared_swiglu_kernel(const __nv_bfloat16* __restrict__ gate,
+                                     const __nv_bfloat16* __restrict__ up,
+                                     const float* __restrict__ dw,
+                                     __nv_bfloat16* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __float2bfloat16((*dw) * q36_silu(q36_to_f(gate[i])) * q36_to_f(up[i]));
+}
+
 __global__ void conv_split_kernel(const __nv_bfloat16* __restrict__ qkv,
                                   const __nv_bfloat16* __restrict__ conv_w,
                                   __nv_bfloat16* __restrict__ conv_state,
@@ -167,6 +179,15 @@ __global__ void gated_norm_kernel(const __nv_bfloat16* __restrict__ x,
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
+
+void launch_qwen36_shared_swiglu(const void* gate_bf16, const void* up_bf16,
+                                 const float* dw_f32, void* out_bf16, int n,
+                                 cudaStream_t stream) {
+    shared_swiglu_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(up_bf16),
+        dw_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16), n);
+}
 
 void launch_qwen36_split_q_gate(const void* qg_bf16, void* q_bf16, void* gate_bf16,
                                 int n_heads, int head_dim, cudaStream_t stream) {
