@@ -65,6 +65,55 @@ __global__ void shared_swiglu_kernel(const __nv_bfloat16* __restrict__ gate,
     out[i] = __float2bfloat16((*dw) * q36_silu(q36_to_f(gate[i])) * q36_to_f(up[i]));
 }
 
+// Fused shared-expert gate+up GEMV + SwiGLU. For each output row n<N:
+//   g = <hn, gate[n]>,  u = <hn, up[n]>,  out[n] = dw * SiLU(g) * u.
+// One warp per row (mirrors gemv_kernel): stage hn once into shared memory, then
+// compute BOTH projections in a single pass. Replaces two launch_gemv + one
+// shared_swiglu launch (3 kernels -> 1). The per-lane reduction order matches
+// gemv_kernel, and g/u are rounded to bf16 before SwiGLU exactly as the unfused
+// path does (gemv writes sh_gate/sh_up as bf16), so the result is bit-identical.
+static constexpr int Q36_SHWPB = 8;   // warps (output rows) per block (best occupancy for N=moe_ffn)
+__global__ void shared_gate_up_swiglu_kernel(const __nv_bfloat16* __restrict__ hn,
+                                             const __nv_bfloat16* __restrict__ Wg,
+                                             const __nv_bfloat16* __restrict__ Wu,
+                                             const float* __restrict__ dw,
+                                             __nv_bfloat16* __restrict__ out,
+                                             int N, int K) {
+    extern __shared__ float s_x[];                 // K floats (hn)
+    for (int i = threadIdx.x; i < K; i += blockDim.x) s_x[i] = q36_to_f(hn[i]);
+    __syncthreads();
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int n = blockIdx.x * Q36_SHWPB + warp;
+    if (n >= N) return;
+    // 128-bit coalesced loads: each lane pulls a uint4 = 8 bf16 of each weight row.
+    const uint4* g4 = reinterpret_cast<const uint4*>(Wg + (size_t)n * K);
+    const uint4* u4 = reinterpret_cast<const uint4*>(Wu + (size_t)n * K);
+    const int n4 = K / 8;
+    float ga = 0.f, ua = 0.f;
+    for (int i = lane; i < n4; i += 32) {
+        uint4 gv = g4[i], uv = u4[i];
+        const __nv_bfloat162* gh = reinterpret_cast<const __nv_bfloat162*>(&gv);
+        const __nv_bfloat162* uh = reinterpret_cast<const __nv_bfloat162*>(&uv);
+        const int base = i * 8;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 gf = __bfloat1622float2(gh[j]);
+            float2 uf = __bfloat1622float2(uh[j]);
+            ga += gf.x * s_x[base + 2*j] + gf.y * s_x[base + 2*j + 1];
+            ua += uf.x * s_x[base + 2*j] + uf.y * s_x[base + 2*j + 1];
+        }
+    }
+    ga = q36_wsum(ga);
+    ua = q36_wsum(ua);
+    if (lane == 0) {
+        // Match the unfused path's bf16 round-trip on the projections (sh_gate/sh_up
+        // are stored bf16 before SwiGLU) so the fused result is bit-identical.
+        const float g = q36_to_f(__float2bfloat16(ga));
+        const float u = q36_to_f(__float2bfloat16(ua));
+        out[n] = __float2bfloat16((*dw) * q36_silu(g) * u);
+    }
+}
+
 __global__ void conv_split_kernel(const __nv_bfloat16* __restrict__ qkv,
                                   const __nv_bfloat16* __restrict__ conv_w,
                                   __nv_bfloat16* __restrict__ conv_state,
@@ -454,6 +503,18 @@ void launch_qwen36_shared_swiglu(const void* gate_bf16, const void* up_bf16,
         reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
         reinterpret_cast<const __nv_bfloat16*>(up_bf16),
         dw_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16), n);
+}
+
+void launch_qwen36_shared_gate_up_swiglu(const void* hn_bf16, const void* gate_bf16,
+                                         const void* up_bf16, const float* dw_f32,
+                                         void* out_bf16, int n, int k,
+                                         cudaStream_t stream) {
+    dim3 grid((n + Q36_SHWPB - 1) / Q36_SHWPB);
+    shared_gate_up_swiglu_kernel<<<grid, Q36_SHWPB * 32, (size_t)k * sizeof(float), stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(hn_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(up_bf16),
+        dw_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16), n, k);
 }
 
 void launch_qwen36_split_q_gate(const void* qg_bf16, void* q_bf16, void* gate_bf16,

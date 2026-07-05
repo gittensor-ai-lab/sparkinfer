@@ -65,6 +65,14 @@ void launch_qwen36_shared_swiglu(const void* gate_bf16, const void* up_bf16,
                                  const float* dw_f32, void* out_bf16, int n,
                                  cudaStream_t stream = nullptr);
 
+// Fused shared-expert gate+up projection + SwiGLU (replaces 2x launch_gemv + shared_swiglu,
+// 3 kernels -> 1): out[i] = dw * SiLU(<hn, gate[i]>) * <hn, up[i]>. hn is [k]; gate/up are
+// bf16 [n, k] (GGUF-native [out,in]); out is bf16 [n]. Bit-identical to the unfused path.
+void launch_qwen36_shared_gate_up_swiglu(const void* hn_bf16, const void* gate_bf16,
+                                         const void* up_bf16, const float* dw_f32,
+                                         void* out_bf16, int n, int k,
+                                         cudaStream_t stream = nullptr);
+
 void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
                                  void* conv_state_bf16, void* q_bf16, void* k_bf16,
                                  void* v_bf16, int q_heads, int v_heads, int head_dim,

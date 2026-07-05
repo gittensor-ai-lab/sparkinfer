@@ -734,9 +734,12 @@ int Qwen35Model::forward_token(int token_id, int position) {
                         w.shared_gate_inp ? s.d_shared_w : nullptr,
                         s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st);
                 } else {
-                    kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
-                    kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
-                    kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w, s.sh_h, c.moe_ffn, st);
+                    // Shared expert: gate+up projections and SwiGLU fused into ONE kernel (one warp/
+                    // row, full grid, hn staged once) instead of two GEMVs + a separate SwiGLU launch.
+                    // Cuts 3 kernel launches/layer -> 1 on the decode graph; bit-identical output.
+                    // down: [H]=h@shared_down^T. GGUF-native [out,in] layout (see load_gguf).
+                    kernels::launch_qwen36_shared_gate_up_swiglu(s.hn, w.shared_gate, w.shared_up,
+                                                                 s.d_shared_w, s.sh_h, c.moe_ffn, H, st);
                     kernels::launch_gemv(s.sh_h, w.shared_down, s.shared, H, c.moe_ffn, st);
                 }
             } else {
