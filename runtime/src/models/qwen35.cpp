@@ -130,6 +130,7 @@ struct Qwen35Model::Impl {
     float *sx_h = nullptr;   // pipelined shared-expert h_scratch (avoids racing routed mf_h)
     void  *sx_q8 = nullptr;  // pipelined shared-expert Q8_1(h) for down (avoids racing aq81)
     int   *mf_ids = nullptr, *mf_counts = nullptr;
+    unsigned int *mf_rc = nullptr;   // fused-router grid-completion counter (persistent, zero-init)
     // flash-decoding (KV-split) attention partials
     static constexpr int MAX_NSPLITS = 256;   // partials sized for this; adaptive n_splits <= this
     int n_splits = 32;
@@ -152,6 +153,8 @@ struct Qwen35Model::Impl {
     bool use_shexp_pipe = true; // default ON: overlap shared expert with routed MoE. =0 disables
     bool use_addnorm3 = true;   // default ON: fold the per-layer routed+shared residual_add into the
                                 // post-MoE add_rmsnorm (one fewer graph node/layer). =0 disables
+    bool use_router_fused = true; // default ON (256-expert path): fuse the router GEMV + bitonic top-k
+                                  // into one kernel (grid-completion), dropping the top-k launch. =0 disables
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -225,6 +228,8 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->mf_ids     = p_->alloc<int>(cfg.top_k);
     p_->mf_weights = p_->alloc<float>(cfg.top_k);
     p_->mf_counts  = p_->alloc<int>(cfg.n_experts);
+    p_->mf_rc      = p_->alloc<unsigned int>(1);
+    cu(cudaMemset(p_->mf_rc, 0, sizeof(unsigned int)), "mf_rc zero");   // grid-completion counter starts at 0
     p_->mf_h       = p_->alloc<float>((size_t)cfg.top_k * cfg.moe_ffn);
     p_->mf_out     = p_->alloc<float>(cfg.hidden);
     if (cfg.n_shared > 0) {
@@ -251,6 +256,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_GDN_PIPE")) p_->use_gdn_pipe = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_SHEXP_PIPE")) p_->use_shexp_pipe = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ADDNORM3")) p_->use_addnorm3 = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_ROUTER_FUSED")) p_->use_router_fused = !(e[0] == '0');
 }
 
 Qwen35Model::~Qwen35Model() {
@@ -270,7 +276,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->shared_gate_tmp);
     cudaFree(p_->mf_logits); cudaFree(p_->mf_weights); cudaFree(p_->mf_h); cudaFree(p_->mf_out);
     cudaFree(p_->sx_h); cudaFree(p_->sx_q8);
-    cudaFree(p_->mf_ids); cudaFree(p_->mf_counts);
+    cudaFree(p_->mf_ids); cudaFree(p_->mf_counts); cudaFree(p_->mf_rc);
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
@@ -593,7 +599,6 @@ int Qwen35Model::forward_token(int token_id, int position) {
         }
 
         if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
-            kernels::launch_gemv_f32(s.hn, w.router_w, s.mf_logits, c.n_experts, c.hidden, st);  // router_w native [E,H]
             // The per-expert token counts only feed the batched-dispatch sort; the single-token
             // decode expert FFN reads ids/weights directly and never touches them. Zeroing that
             // buffer is a per-layer memset node in the replayed decode graph whose fixed cost far
@@ -601,10 +606,18 @@ int Qwen35Model::forward_token(int token_id, int position) {
             // SPARKINFER_MOE_COUNTS=1 restores the memset + on-device counting.
             static int moe_counts = -1;
             if (moe_counts < 0) { const char* mc = getenv("SPARKINFER_MOE_COUNTS"); moe_counts = (mc && mc[0] == '1') ? 1 : 0; }
-            if (moe_counts) cu(cudaMemsetAsync(s.mf_counts, 0, c.n_experts * sizeof(int), st), "mf counts");
-            kernels::launch_moe_router(s.mf_logits, s.mf_ids, s.mf_weights,
-                                       moe_counts ? s.mf_counts : nullptr,
-                                       1, c.n_experts, c.top_k, 1, st);
+            const bool rfuse = s.use_router_fused && !moe_counts && c.n_experts == 256 && (c.hidden % 8) == 0;
+            if (rfuse) {
+                // one kernel: router GEMV -> logits scratch, then in-kernel bitonic top-8 (last block)
+                kernels::launch_router_fused(s.hn, w.router_w, s.mf_logits, s.mf_rc,
+                                             s.mf_ids, s.mf_weights, c.n_experts, c.hidden, c.top_k, 1, st);
+            } else {
+                kernels::launch_gemv_f32(s.hn, w.router_w, s.mf_logits, c.n_experts, c.hidden, st);  // router_w native [E,H]
+                if (moe_counts) cu(cudaMemsetAsync(s.mf_counts, 0, c.n_experts * sizeof(int), st), "mf counts");
+                kernels::launch_moe_router(s.mf_logits, s.mf_ids, s.mf_weights,
+                                           moe_counts ? s.mf_counts : nullptr,
+                                           1, c.n_experts, c.top_k, 1, st);
+            }
             kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,

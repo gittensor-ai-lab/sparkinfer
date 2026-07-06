@@ -30,6 +30,16 @@ void launch_moe_router(
     int normalize,
     cudaStream_t stream = nullptr);
 
+// Fused single-token router: split-K GEMV (x @ W -> logits scratch) + in-kernel bitonic top-8 in the
+// grid's last block, removing the separate top-k launch. gridctr is a persistent unsigned counter,
+// zero-initialized once by the caller; atomicInc self-resets it so it is CUDA-graph-replay safe.
+// Requires num_experts == 256 and K % 8 == 0. W is native [num_experts, K].
+void launch_router_fused(
+    const void* x, const void* W, float* logits, unsigned int* gridctr,
+    int* expert_ids, float* expert_weights,
+    int num_experts, int K, int top_k, int normalize,
+    cudaStream_t stream = nullptr);
+
 // Fused MoE expert FFN with SwiGLU activation.
 // For each token i and each of its top_k experts e (weight w):
 //   h = SiLU(X[i] @ gate_w[e]) * (X[i] @ up_w[e])     // [ffn_dim]
