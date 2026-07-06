@@ -46,10 +46,10 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K,
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K,
                      cudaStream_t stream = nullptr);
 
-// Quantized on-read GEMV: same as launch_gemv but W is GGUF-native Q4_K/Q6_K
-// [N,K] (wtype = ggml type id, 12=Q4_K / 14=Q6_K). Dequantizes each block in
+// Quantized on-read GEMV: same as launch_gemv but W is GGUF-native Q4_K/Q6_K/Q8_0
+// [N,K] (wtype = ggml type id, 12=Q4_K / 14=Q6_K / 8=Q8_0). Dequantizes each block in
 // registers with a full-precision (fp32) activation dot — reads the quantized
-// bytes (4x less than bf16) with no int8 activation, so token-match is preserved.
+// bytes (2-4x less than bf16) with no int8 activation, so token-match is preserved.
 void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int K,
                    cudaStream_t stream = nullptr);
 void launch_gemv_q_f32(const void* x, const void* W, int wtype, float* y, int N, int K,

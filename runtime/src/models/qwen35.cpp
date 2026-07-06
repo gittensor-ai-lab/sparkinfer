@@ -908,13 +908,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                            return !(a && a[0] == '0'); }();
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
+        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) return dev_quant(name, type);
         type = 0; return dense(name, false);
     };
     auto attn_w_opt = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { type = 0; return nullptr; }
-        if (qattn && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
+        if (qattn && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) return dev_quant(name, type);
         type = 0; return dense(name, false);
     };
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {
