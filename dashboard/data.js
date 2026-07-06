@@ -1511,12 +1511,12 @@ window.SPARKINFER = {
   "qwen36": {
     "model": "Qwen3.6-35B-A3B · UD-Q4_K_M",
     "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
-    "frontier_tps": 254.72,
+    "frontier_tps": 276.26,
     "baseline_tps": 23.03,
     "ref_name": "llama.cpp",
     "ref_tps": 275.81,
-    "token_match": 0.9801,
-    "kl": 0.0193,
+    "token_match": 0.9741,
+    "kl": 0.0132,
     "note": "scored vs same-box main · GDN_FAST default ON · #241 merged (split-K bf16 GEMV)",
     "ctx": [
       {
@@ -1541,12 +1541,6 @@ window.SPARKINFER = {
   },
   "landed_qwen36": [
     {
-      "name": "baseline · per-expert dequant",
-      "tps": 23.03,
-      "date": "2026-07-04",
-      "baseline": true
-    },
-    {
       "name": "shared-expert coalesced GEMVs",
       "tps": 170.84,
       "pr": 230,
@@ -1566,6 +1560,13 @@ window.SPARKINFER = {
       "pr": 241,
       "date": "2026-07-06",
       "label": "L"
+    },
+    {
+      "name": "int8 dp4a MMVQ for the Q5_K ",
+      "tps": 276.26,
+      "pr": 243,
+      "date": "2026-07-06",
+      "label": "M"
     }
   ]
 };
