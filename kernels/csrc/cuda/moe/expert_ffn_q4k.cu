@@ -41,6 +41,52 @@ __device__ __forceinline__ void si_pdl_sync() {
 #endif
 }
 
+// cp.async weight staging for the MMVQ MoE down (sm_80+). Inline PTX — header-free,
+// NVRTC-safe. 16-byte .cg copies require 16-byte-aligned global sources; Q6_K
+// blocks are 210 B so only kbx==0 tiles are cp.async-eligible — the pipe kernel
+// falls back to a warp sync-copy for misaligned tiles (same bytes, still correct).
+constexpr int MOE_Q6K_CP = 14;   // 14*16 = 224 B staging (Q6_K block is 210 B)
+constexpr int MOE_Q6K_ST = 224;
+
+__device__ __forceinline__ void moe_cp_async_cg16(void* smem, const void* gmem) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
+#else
+    (void)smem; (void)gmem;
+#endif
+}
+__device__ __forceinline__ void moe_cp_async_commit() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.commit_group;\n");
+#endif
+}
+__device__ __forceinline__ void moe_cp_async_wait_0() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group 0;\n");
+#endif
+}
+__device__ __forceinline__ bool moe_gmem16_aligned(const void* p) {
+    return (reinterpret_cast<size_t>(p) & 15) == 0;
+}
+__device__ __forceinline__ void moe_cp_q6k_block(unsigned char* dst, const unsigned char* src, int lane) {
+    if (lane < MOE_Q6K_CP) moe_cp_async_cg16(dst + lane * 16, src + lane * 16);
+}
+__device__ __forceinline__ void moe_stage_q6k_warp(unsigned char* dst, const unsigned char* src, int lane) {
+    for (int b = lane; b < 210; b += 32) dst[b] = src[b];
+    __syncwarp();
+}
+// Returns true when cp.async was issued (caller must wait before reading dst).
+__device__ __forceinline__ bool moe_stage_q6k_tile(unsigned char* dst, const unsigned char* src, int lane) {
+    if (moe_gmem16_aligned(src)) {
+        moe_cp_q6k_block(dst, src, lane);
+        moe_cp_async_commit();
+        return true;
+    }
+    moe_stage_q6k_warp(dst, src, lane);
+    return false;
+}
+
 __device__ __forceinline__ float q4kf_h2f(const unsigned char* p) {
     __half h; *((unsigned short*)&h) = *(const unsigned short*)p; return __half2float(h);
 }
@@ -621,6 +667,69 @@ __global__ void down_q6k_mmvq_splitk_kernel(
     }
 }
 
+// cp.async double-buffered variant of down_q6k_mmvq_splitk_kernel. While the warp
+// dp4a's the current (expert, superblock) Q6_K tile from shared, the next tile for
+// this warp is prefetched — hiding the global weight latency on the occupancy-bound
+// bs=1 down. Math is identical (same si_vec_dot_q6_K on the same bytes).
+template <int S>
+__global__ void down_q6k_mmvq_splitk_cp_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k, int pdl
+) {
+    if (pdl) si_pdl_sync();
+    constexpr int RPB = WPB / S;
+    __shared__ float s_part[RPB][S];
+    __shared__ __align__(16) unsigned char s_q6[WPB][2 * MOE_Q6K_ST];
+    const int token = blockIdx.x, lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    const int nblk = F >> 8, q8pb = F >> 5;
+    unsigned char* wbuf = s_q6[warpId];
+    float acc = 0.f;
+    if (hh < H) {
+        const int total = top_k * nblk;
+        const int nwi = (total - 1 - split) / S + 1;
+        bool pref_async = false;
+        for (int ii = 0; ii < nwi; ii++) {
+            const int wi = split + ii * S;
+            const int j = wi / nblk, kbx = wi % nblk;
+            const int ts = token * top_k + j, e = expert_ids[ts];
+            const float w = expert_weights[ts];
+            const unsigned char* gblk = down_q + ((size_t)e * H + hh) * nblk * 210 + (size_t)kbx * 210;
+            const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+            const int cur = ii & 1;
+            if (ii == 0) {
+                if (moe_stage_q6k_tile(wbuf + cur * MOE_Q6K_ST, gblk, lane))
+                    moe_cp_async_wait_0();
+            } else if (pref_async) {
+                moe_cp_async_wait_0();
+            }
+            acc += w * si_vec_dot_q6_K(wbuf + cur * MOE_Q6K_ST, h8 + (size_t)kbx * 8, lane);
+            if (ii + 1 < nwi) {
+                const int wi_n = wi + S, jn = wi_n / nblk, kbx_n = wi_n % nblk;
+                const int ts_n = token * top_k + jn, e_n = expert_ids[ts_n];
+                const unsigned char* gblk_n = down_q + ((size_t)e_n * H + hh) * nblk * 210 + (size_t)kbx_n * 210;
+                const int nxt = cur ^ 1;
+                pref_async = moe_stage_q6k_tile(wbuf + nxt * MOE_Q6K_ST, gblk_n, lane);
+            } else {
+                pref_async = false;
+            }
+        }
+        if (pref_async) moe_cp_async_wait_0();
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (lane == 0) s_part[hh_local][split] = acc;
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[hh_local][s];
+        output[(size_t)token * H + hh] = __float2bfloat16(o);
+    }
+}
+
 template <int S>
 __global__ void down_q4k_mmvq_splitk_kernel(
     const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
@@ -789,6 +898,17 @@ static inline int down_mmvq_pdl() {
     return v;
 }
 
+// cp.async double-buffer on MMVQ MoE down weight reads. Opt-in (SPARKINFER_DOWN_CPASYNC=1)
+// because Q6_K blocks are 210 B (only kbx==0 tiles are 16B-aligned for cp.async).
+static inline int down_cpasync() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_DOWN_CPASYNC");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 template <typename Kernel, typename... Args>
 static inline void launch_mmvq_down_kernel(
     int pdl, dim3 grid, dim3 block, cudaStream_t stream, Kernel kernel, Args... args
@@ -821,15 +941,30 @@ static inline bool launch_down_q6k_mmvq_splitk(
     static int spec = -1;
     if (spec < 0) { const char* e = getenv("SPARKINFER_DOWN_SPEC"); spec = (e && e[0] == '0') ? 0 : 1; }
     const dim3 block(WPB * 32);
-    if (spec && S == 2 && F == 768 && top_k == 8) {
+    const int cp = down_cpasync();
+    if (spec && S == 2 && F == 512 && top_k == 8 && !cp) {
+        launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_qwen_kernel<2, 2, 8>,
+            down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+        return true;
+    }
+    if (spec && S == 2 && F == 768 && top_k == 8 && !cp) {
         launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_qwen_kernel<2, 3, 8>,
             down_q, expert_ids, expert_weights, hq8, output, H, pdl);
         return true;
     }
     switch (S) {
-        case 2: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
-        case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
-        case 8: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<8>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
+        case 2:
+            if (cp) launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_cp_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
+            else      launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
+            return true;
+        case 4:
+            if (cp) launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_cp_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
+            else      launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
+            return true;
+        case 8:
+            if (cp) launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_cp_kernel<8>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
+            else      launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<8>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
+            return true;
         default: return false;
     }
 }
@@ -841,6 +976,11 @@ static inline bool launch_down_q4k_mmvq_splitk(
     static int spec = -1;
     if (spec < 0) { const char* e = getenv("SPARKINFER_DOWN_SPEC"); spec = (e && e[0] == '0') ? 0 : 1; }
     const dim3 block(WPB * 32);
+    if (spec && S == 2 && F == 512 && top_k == 8) {
+        launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<2, 2, 8>,
+            down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+        return true;
+    }
     if (spec && S == 2 && F == 768 && top_k == 8) {
         launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<2, 3, 8>,
             down_q, expert_ids, expert_weights, hq8, output, H, pdl);
