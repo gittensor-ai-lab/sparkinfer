@@ -430,6 +430,16 @@ __device__ __forceinline__ float si_vec_dot_q8_0(const unsigned char* __restrict
     for (int k = 0; k < 8; k++) sumi = __dp4a(si_ld4(qw + k * 4), si_ld4(qa + k * 4), sumi);
     return d_w * d_a * (float)sumi;
 }
+__device__ __forceinline__ int si_vec_dot_q8_0_half_i(const unsigned char* __restrict__ wblk,
+                                                      const si_block_q8_1* __restrict__ ablk,
+                                                      int half) {
+    const unsigned char* qw = wblk + 2 + half * 16;
+    const unsigned char* qa = reinterpret_cast<const unsigned char*>(ablk->qs) + half * 16;
+    int sumi = 0;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) sumi = __dp4a(si_ld4(qw + k * 4), si_ld4(qa + k * 4), sumi);
+    return sumi;
+}
 
 __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4, const si_block_q8_1* bq8_1, int iqs) {
     int v[2], u[4]; float d8[2];
@@ -580,6 +590,26 @@ __global__ void shared_down_q8_mmvq_kernel(
     float acc = 0.f;
     for (int b = lane; b < nblk; b += 32)
         acc += si_vec_dot_q8_0(dbase + (size_t)b * 34, hq8 + b);
+    acc = q4kf_wsum(acc);
+    if (lane == 0) out[h] = __float2bfloat16(acc);
+}
+
+template <int H, int F>
+__global__ void shared_down_q8_mmvq_pair_kernel(
+    const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
+    __nv_bfloat16* __restrict__ out) {
+    const int h = blockIdx.x * WPB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (h >= H) return;
+    constexpr int NBLK = F >> 5;
+    const int b = lane >> 1, half = lane & 1;
+    const unsigned char* dbase = down_q + (size_t)h * NBLK * 34;
+    float acc = 0.f;
+    if (b < NBLK) {
+        const unsigned char* wblk = dbase + (size_t)b * 34;
+        int sumi = si_vec_dot_q8_0_half_i(wblk, hq8 + b, half);
+        sumi += __shfl_xor_sync(0xffffffffu, sumi, 1);
+        if (half == 0) acc = q4kf_h2f(wblk) * __low2float(hq8[b].ds) * (float)sumi;
+    }
     acc = q4kf_wsum(acc);
     if (lane == 0) out[h] = __float2bfloat16(acc);
 }
@@ -929,6 +959,46 @@ __global__ void down_q4k_mmvq_splitk_qwen_kernel(
     }
 }
 
+template <int S, int NBLK, int TOPK>
+__global__ void down_q5k_mmvq_splitk_qwen_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int pdl
+) {
+    if (pdl) si_pdl_sync();
+    constexpr int RPB = WPB / S;
+    constexpr int Q8PB = NBLK * 8;
+    constexpr int WORK = NBLK * 16;
+    __shared__ float s_part[RPB][S];
+    const int token = blockIdx.x, lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    float acc = 0.f;
+    if (hh < H) {
+        #pragma unroll 1
+        for (int wi = split * 32 + lane; wi < TOPK * WORK; wi += S * 32) {
+            const int j = wi / WORK, r = wi - j * WORK;
+            const int kbx = r >> 4, kqs = (r & 15) << 1;
+            const int ts = token * TOPK + j, e = expert_ids[ts];
+            const float w = expert_weights[ts];
+            const si_block_q5_K* drow = reinterpret_cast<const si_block_q5_K*>(
+                down_q + ((size_t)e * H + hh) * NBLK * 176);
+            const si_block_q8_1* h8 = hq8 + (size_t)ts * Q8PB;
+            acc += w * si_vec_dot_q5_K(drow + kbx, h8 + (size_t)kbx * 8, kqs);
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (lane == 0) s_part[hh_local][split] = acc;
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[hh_local][s];
+        output[(size_t)token * H + hh] = __float2bfloat16(o);
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
@@ -1068,7 +1138,25 @@ static inline bool launch_down_q5k_mmvq_splitk(
     const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
     int H, int F, int top_k, cudaStream_t stream
 ) {
+    static int spec = -1;
+    if (spec < 0) { const char* e = getenv("SPARKINFER_DOWN_SPEC"); spec = (e && e[0] == '0') ? 0 : 1; }
     const dim3 block(WPB * 32);
+    if (spec && F == 512 && top_k == 8) {
+        switch (S) {
+            case 2: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_qwen_kernel<2, 2, 8>, down_q, expert_ids, expert_weights, hq8, output, H, pdl); return true;
+            case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_qwen_kernel<4, 2, 8>, down_q, expert_ids, expert_weights, hq8, output, H, pdl); return true;
+            case 8: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_qwen_kernel<8, 2, 8>, down_q, expert_ids, expert_weights, hq8, output, H, pdl); return true;
+            default: break;
+        }
+    }
+    if (spec && F == 768 && top_k == 8) {
+        switch (S) {
+            case 2: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_qwen_kernel<2, 3, 8>, down_q, expert_ids, expert_weights, hq8, output, H, pdl); return true;
+            case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_qwen_kernel<4, 3, 8>, down_q, expert_ids, expert_weights, hq8, output, H, pdl); return true;
+            case 8: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_qwen_kernel<8, 3, 8>, down_q, expert_ids, expert_weights, hq8, output, H, pdl); return true;
+            default: break;
+        }
+    }
     switch (S) {
         case 2: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
         case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
@@ -1286,9 +1374,17 @@ void launch_shared_expert_q8_mmvq(
     quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
         h_scratch, qbuf, nqb, 0);
     dim3 dn((hidden + WPB - 1) / WPB);
-    shared_down_q8_mmvq_kernel<2048, 512><<<dn, WPB * 32, 0, stream>>>(
-        qbuf, reinterpret_cast<const unsigned char*>(down_q),
-        reinterpret_cast<__nv_bfloat16*>(output));
+    static int pair = -1;
+    if (pair < 0) { const char* e = getenv("SPARKINFER_SX_DOWN_PAIR"); pair = (e && e[0] == '0') ? 0 : 1; }
+    if (pair) {
+        shared_down_q8_mmvq_pair_kernel<2048, 512><<<dn, WPB * 32, 0, stream>>>(
+            qbuf, reinterpret_cast<const unsigned char*>(down_q),
+            reinterpret_cast<__nv_bfloat16*>(output));
+    } else {
+        shared_down_q8_mmvq_kernel<2048, 512><<<dn, WPB * 32, 0, stream>>>(
+            qbuf, reinterpret_cast<const unsigned char*>(down_q),
+            reinterpret_cast<__nv_bfloat16*>(output));
+    }
 }
 #endif
 
