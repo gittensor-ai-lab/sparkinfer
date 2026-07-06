@@ -414,15 +414,20 @@ __global__ void si_quant_bf16_q8_1(const __nv_bfloat16* __restrict__ x, si_block
 }
 // Q8_0 weight block (34 B / 32 values) dotted against a Q8_1 activation block — the
 // faithful llama.cpp vec_dot_q8_0_q8_1 identity (no sum term; both sides are plain int8).
+__device__ __forceinline__ int si_ld4(const unsigned char* p) {
+    int v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
 __device__ __forceinline__ float si_vec_dot_q8_0(const unsigned char* __restrict__ wblk,
                                                  const si_block_q8_1* __restrict__ ablk) {
     float d_w = q4kf_h2f(wblk);
     float d_a = __low2float(ablk->ds);
-    const int* qw = (const int*)(wblk + 2);
-    const int* qa = (const int*)ablk->qs;
+    const unsigned char* qw = wblk + 2;
+    const unsigned char* qa = reinterpret_cast<const unsigned char*>(ablk->qs);
     int sumi = 0;
     #pragma unroll
-    for (int k = 0; k < 8; k++) sumi = __dp4a(qw[k], qa[k], sumi);
+    for (int k = 0; k < 8; k++) sumi = __dp4a(si_ld4(qw + k * 4), si_ld4(qa + k * 4), sumi);
     return d_w * d_a * (float)sumi;
 }
 
@@ -496,7 +501,6 @@ __global__ void shared_gate_up_q8_mmvq_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
     float* __restrict__ h_scratch) {
-    si_pdl_lc();
     constexpr int NW = 4, WS = 32;
     const int f = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
     const int nblk = H >> 5;
@@ -525,7 +529,6 @@ template <int H, int F>
 __global__ void shared_down_q8_mmvq_kernel(
     const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
     __nv_bfloat16* __restrict__ out) {
-    si_pdl_sync();
     const int h = blockIdx.x * WPB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (h >= H) return;
     const int nblk = F >> 5;
