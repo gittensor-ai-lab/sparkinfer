@@ -41,52 +41,6 @@ __device__ __forceinline__ void si_pdl_sync() {
 #endif
 }
 
-// cp.async weight staging for the MMVQ MoE down (sm_80+). Inline PTX — header-free,
-// NVRTC-safe. 16-byte .cg copies require 16-byte-aligned global sources; Q6_K
-// blocks are 210 B so only kbx==0 tiles are cp.async-eligible — the pipe kernel
-// falls back to a warp sync-copy for misaligned tiles (same bytes, still correct).
-constexpr int MOE_Q6K_CP = 14;   // 14*16 = 224 B staging (Q6_K block is 210 B)
-constexpr int MOE_Q6K_ST = 224;
-
-__device__ __forceinline__ void moe_cp_async_cg16(void* smem, const void* gmem) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
-#else
-    (void)smem; (void)gmem;
-#endif
-}
-__device__ __forceinline__ void moe_cp_async_commit() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    asm volatile("cp.async.commit_group;\n");
-#endif
-}
-__device__ __forceinline__ void moe_cp_async_wait_0() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    asm volatile("cp.async.wait_group 0;\n");
-#endif
-}
-__device__ __forceinline__ bool moe_gmem16_aligned(const void* p) {
-    return (reinterpret_cast<size_t>(p) & 15) == 0;
-}
-__device__ __forceinline__ void moe_cp_q6k_block(unsigned char* dst, const unsigned char* src, int lane) {
-    if (lane < MOE_Q6K_CP) moe_cp_async_cg16(dst + lane * 16, src + lane * 16);
-}
-__device__ __forceinline__ void moe_stage_q6k_warp(unsigned char* dst, const unsigned char* src, int lane) {
-    for (int b = lane; b < 210; b += 32) dst[b] = src[b];
-    __syncwarp();
-}
-// Returns true when cp.async was issued (caller must wait before reading dst).
-__device__ __forceinline__ bool moe_stage_q6k_tile(unsigned char* dst, const unsigned char* src, int lane) {
-    if (moe_gmem16_aligned(src)) {
-        moe_cp_q6k_block(dst, src, lane);
-        moe_cp_async_commit();
-        return true;
-    }
-    moe_stage_q6k_warp(dst, src, lane);
-    return false;
-}
-
 __device__ __forceinline__ float q4kf_h2f(const unsigned char* p) {
     __half h; *((unsigned short*)&h) = *(const unsigned short*)p; return __half2float(h);
 }
@@ -458,6 +412,25 @@ __global__ void si_quant_bf16_q8_1(const __nv_bfloat16* __restrict__ x, si_block
     for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
     if (lane == 0) y[ib].ds = __floats2half2_rn(d, d * (float)s);
 }
+// Q8_0 weight block (34 B / 32 values) dotted against a Q8_1 activation block — the
+// faithful llama.cpp vec_dot_q8_0_q8_1 identity (no sum term; both sides are plain int8).
+__device__ __forceinline__ int si_ld4(const unsigned char* p) {
+    int v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+__device__ __forceinline__ float si_vec_dot_q8_0(const unsigned char* __restrict__ wblk,
+                                                 const si_block_q8_1* __restrict__ ablk) {
+    float d_w = q4kf_h2f(wblk);
+    float d_a = __low2float(ablk->ds);
+    const unsigned char* qw = wblk + 2;
+    const unsigned char* qa = reinterpret_cast<const unsigned char*>(ablk->qs);
+    int sumi = 0;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) sumi = __dp4a(si_ld4(qw + k * 4), si_ld4(qa + k * 4), sumi);
+    return d_w * d_a * (float)sumi;
+}
+
 __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4, const si_block_q8_1* bq8_1, int iqs) {
     int v[2], u[4]; float d8[2];
     const int bq8_offset = 2 * ((iqs / 2) / 4);
@@ -517,6 +490,54 @@ __global__ void gate_up_mmvq2_kernel(
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+}
+
+// ---- Qwen3.6 shared expert (Q8_0 gate/up/down, F=512) -------------------------
+// Reuses the FNQ Q8_1(hn) buffer for gate/up dp4a (same trick as routed MoE mmvq),
+// then overwrites that scratch with Q8_1(h) for the down dp4a. One 4-warp block/row
+// for gate/up (64 Q8_0 blocks/row); one warp/row for down (2048 rows, K=512).
+template <int H, int F>
+__global__ void shared_gate_up_q8_mmvq_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
+    float* __restrict__ h_scratch) {
+    constexpr int NW = 4, WS = 32;
+    const int f = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int nblk = H >> 5;
+    const unsigned char* gbase = gate_q + (size_t)f * nblk * 34;
+    const unsigned char* ubase = up_q   + (size_t)f * nblk * 34;
+    float tg = 0.f, tu = 0.f;
+    for (int b = tid; b < nblk; b += NW * WS) {
+        tg += si_vec_dot_q8_0(gbase + (size_t)b * 34, vy + b);
+        tu += si_vec_dot_q8_0(ubase + (size_t)b * 34, vy + b);
+    }
+    __shared__ float sg[NW - 1][WS], su[NW - 1][WS];
+    if (warp > 0) { sg[warp - 1][lane] = tg; su[warp - 1][lane] = tu; }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) { tg += sg[l][lane]; tu += su[l][lane]; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+    if (lane == 0) {
+        float w = dw ? __ldg(dw) : 1.f;
+        h_scratch[f] = w * q4kf_silu(tg) * tu;
+    }
+}
+
+template <int H, int F>
+__global__ void shared_down_q8_mmvq_kernel(
+    const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
+    __nv_bfloat16* __restrict__ out) {
+    const int h = blockIdx.x * WPB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (h >= H) return;
+    const int nblk = F >> 5;
+    const unsigned char* dbase = down_q + (size_t)h * nblk * 34;
+    float acc = 0.f;
+    for (int b = lane; b < nblk; b += 32)
+        acc += si_vec_dot_q8_0(dbase + (size_t)b * 34, hq8 + b);
+    acc = q4kf_wsum(acc);
+    if (lane == 0) out[h] = __float2bfloat16(acc);
 }
 
 template <int H, int F, int TOPK>
@@ -654,69 +675,6 @@ __global__ void down_q6k_mmvq_splitk_kernel(
             const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
             acc += w * si_vec_dot_q6_K(drow + (size_t)kbx * 210, h8 + (size_t)kbx * 8, lane);
         }
-        #pragma unroll
-        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
-        if (lane == 0) s_part[hh_local][split] = acc;
-    }
-    __syncthreads();
-    if (hh < H && split == 0 && lane == 0) {
-        float o = 0.f;
-        #pragma unroll
-        for (int s = 0; s < S; s++) o += s_part[hh_local][s];
-        output[(size_t)token * H + hh] = __float2bfloat16(o);
-    }
-}
-
-// cp.async double-buffered variant of down_q6k_mmvq_splitk_kernel. While the warp
-// dp4a's the current (expert, superblock) Q6_K tile from shared, the next tile for
-// this warp is prefetched — hiding the global weight latency on the occupancy-bound
-// bs=1 down. Math is identical (same si_vec_dot_q6_K on the same bytes).
-template <int S>
-__global__ void down_q6k_mmvq_splitk_cp_kernel(
-    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
-    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
-    __nv_bfloat16* __restrict__ output, int H, int F, int top_k, int pdl
-) {
-    if (pdl) si_pdl_sync();
-    constexpr int RPB = WPB / S;
-    __shared__ float s_part[RPB][S];
-    __shared__ __align__(16) unsigned char s_q6[WPB][2 * MOE_Q6K_ST];
-    const int token = blockIdx.x, lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
-    const int hh_local = warpId / S, split = warpId % S;
-    const int hh = blockIdx.y * RPB + hh_local;
-    const int nblk = F >> 8, q8pb = F >> 5;
-    unsigned char* wbuf = s_q6[warpId];
-    float acc = 0.f;
-    if (hh < H) {
-        const int total = top_k * nblk;
-        const int nwi = (total - 1 - split) / S + 1;
-        bool pref_async = false;
-        for (int ii = 0; ii < nwi; ii++) {
-            const int wi = split + ii * S;
-            const int j = wi / nblk, kbx = wi % nblk;
-            const int ts = token * top_k + j, e = expert_ids[ts];
-            const float w = expert_weights[ts];
-            const unsigned char* gblk = down_q + ((size_t)e * H + hh) * nblk * 210 + (size_t)kbx * 210;
-            const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
-            const int cur = ii & 1;
-            if (ii == 0) {
-                if (moe_stage_q6k_tile(wbuf + cur * MOE_Q6K_ST, gblk, lane))
-                    moe_cp_async_wait_0();
-            } else if (pref_async) {
-                moe_cp_async_wait_0();
-            }
-            acc += w * si_vec_dot_q6_K(wbuf + cur * MOE_Q6K_ST, h8 + (size_t)kbx * 8, lane);
-            if (ii + 1 < nwi) {
-                const int wi_n = wi + S, jn = wi_n / nblk, kbx_n = wi_n % nblk;
-                const int ts_n = token * top_k + jn, e_n = expert_ids[ts_n];
-                const unsigned char* gblk_n = down_q + ((size_t)e_n * H + hh) * nblk * 210 + (size_t)kbx_n * 210;
-                const int nxt = cur ^ 1;
-                pref_async = moe_stage_q6k_tile(wbuf + nxt * MOE_Q6K_ST, gblk_n, lane);
-            } else {
-                pref_async = false;
-            }
-        }
-        if (pref_async) moe_cp_async_wait_0();
         #pragma unroll
         for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
         if (lane == 0) s_part[hh_local][split] = acc;
@@ -898,17 +856,6 @@ static inline int down_mmvq_pdl() {
     return v;
 }
 
-// cp.async double-buffer on MMVQ MoE down weight reads. Opt-in (SPARKINFER_DOWN_CPASYNC=1)
-// because Q6_K blocks are 210 B (only kbx==0 tiles are 16B-aligned for cp.async).
-static inline int down_cpasync() {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = getenv("SPARKINFER_DOWN_CPASYNC");
-        v = (e && e[0] == '1') ? 1 : 0;
-    }
-    return v;
-}
-
 template <typename Kernel, typename... Args>
 static inline void launch_mmvq_down_kernel(
     int pdl, dim3 grid, dim3 block, cudaStream_t stream, Kernel kernel, Args... args
@@ -941,30 +888,20 @@ static inline bool launch_down_q6k_mmvq_splitk(
     static int spec = -1;
     if (spec < 0) { const char* e = getenv("SPARKINFER_DOWN_SPEC"); spec = (e && e[0] == '0') ? 0 : 1; }
     const dim3 block(WPB * 32);
-    const int cp = down_cpasync();
-    if (spec && S == 2 && F == 512 && top_k == 8 && !cp) {
+    if (spec && S == 2 && F == 512 && top_k == 8) {
         launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_qwen_kernel<2, 2, 8>,
             down_q, expert_ids, expert_weights, hq8, output, H, pdl);
         return true;
     }
-    if (spec && S == 2 && F == 768 && top_k == 8 && !cp) {
+    if (spec && S == 2 && F == 768 && top_k == 8) {
         launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_qwen_kernel<2, 3, 8>,
             down_q, expert_ids, expert_weights, hq8, output, H, pdl);
         return true;
     }
     switch (S) {
-        case 2:
-            if (cp) launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_cp_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
-            else      launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
-            return true;
-        case 4:
-            if (cp) launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_cp_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
-            else      launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
-            return true;
-        case 8:
-            if (cp) launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_cp_kernel<8>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
-            else      launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<8>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl);
-            return true;
+        case 2: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
+        case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
+        case 8: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<8>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
         default: return false;
     }
 }
@@ -1025,7 +962,15 @@ void launch_moe_expert_ffn_q4k(
                 reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
             q = qbuf;
         }
-        if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
+        if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+            gate_up_mmvq2_pack2_qwen_kernel<2048, 512, 8><<<(num_tokens * top_k * ffn + 1) / 2, 8 * 32, 0, stream>>>(
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, num_tokens * top_k * ffn);
+        else if (gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+            gate_up_mmvq2_qwen_kernel<2048, 512, 8><<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch);
+        else if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
             gate_up_mmvq2_pack2_qwen_kernel<2048, 768, 8><<<(num_tokens * top_k * ffn + 1) / 2, 8 * 32, 0, stream>>>(
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, num_tokens * top_k * ffn);
@@ -1112,8 +1057,6 @@ void launch_moe_expert_ffn_q4k(
         return;
     }
 
-    // Split-K down (4 warps/row) fills SMs on the Q6_K expert-down GEMV — default ON after
-    // nsys showed routed MoE down under-occupies at bs=1. SPARKINFER_SPLITK=0 restores one-warp/row.
     static int splitk = -1;
     if (splitk < 0) { const char* sv = getenv("SPARKINFER_SPLITK"); splitk = (sv && sv[0] == '0') ? 0 : 1; }
     static int pdl = -1;
@@ -1143,6 +1086,34 @@ void launch_moe_expert_ffn_q4k(
             expert_ids, expert_weights, h_scratch,
             reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, down_type);
     }
+}
+
+// Qwen3.6 UD shared expert: Q8_0 weights + int8 dp4a MMVQ (reuses FNQ Q8_1(hn)).
+// input_q8 may be overwritten with Q8_1(h) after gate/up. h_scratch: [ffn] fp32.
+void launch_shared_expert_q8_mmvq(
+    const void* input, const void* input_q8,
+    const void* gate_q, const void* up_q, const void* down_q,
+    const float* dw, void* output, float* h_scratch, void* h_q8_buf,
+    int hidden, int ffn, cudaStream_t stream) {
+    const si_block_q8_1* vy;
+    si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
+    if (input_q8) {
+        vy = reinterpret_cast<const si_block_q8_1*>(input_q8);
+    } else {
+        si_quant_bf16_q8_1<<<(hidden >> 5), 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(input), qbuf, hidden);
+        vy = qbuf;
+    }
+    shared_gate_up_q8_mmvq_kernel<2048, 512><<<ffn, 4 * 32, 0, stream>>>(
+        vy, reinterpret_cast<const unsigned char*>(gate_q),
+        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    const int nqb = ffn >> 5;
+    quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
+        h_scratch, qbuf, nqb, 0);
+    dim3 dn((hidden + WPB - 1) / WPB);
+    shared_down_q8_mmvq_kernel<2048, 512><<<dn, WPB * 32, 0, stream>>>(
+        qbuf, reinterpret_cast<const unsigned char*>(down_q),
+        reinterpret_cast<__nv_bfloat16*>(output));
 }
 #endif
 

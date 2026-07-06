@@ -67,4 +67,12 @@ void launch_moe_expert_ffn_q4k(
     const void* input_q8 = nullptr,   // pre-quantized Q8_1(input) from the fused norm; nullptr = quantize internally
     cudaStream_t stream = nullptr);
 
+// Qwen3.6 UD shared expert: Q8_0 gate/up/down via int8 dp4a MMVQ. Reuses the FNQ
+// Q8_1(hn) buffer for gate/up; overwrites h_q8_buf with Q8_1(h) for down.
+void launch_shared_expert_q8_mmvq(
+    const void* input, const void* input_q8,
+    const void* gate_q, const void* up_q, const void* down_q,
+    const float* dw, void* output, float* h_scratch, void* h_q8_buf,
+    int hidden, int ffn, cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

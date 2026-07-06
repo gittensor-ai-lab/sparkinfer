@@ -112,6 +112,29 @@ __global__ void l2_norm_heads_kernel(__nv_bfloat16* __restrict__ x,
     if (t < head_dim) x[base + t] = __float2bfloat16(xv * sw[0]);
 }
 
+// Fused q/k L2 norm after conv (one launch for both head stacks).
+__global__ void l2_norm_qk_kernel(__nv_bfloat16* __restrict__ q,
+                                    __nv_bfloat16* __restrict__ k,
+                                    int q_heads, int head_dim, float eps) {
+    const int h = blockIdx.x;
+    const int t = threadIdx.x;
+    __nv_bfloat16* x = (h < q_heads) ? q : k;
+    const int hh = (h < q_heads) ? h : (h - q_heads);
+    const size_t base = (size_t)hh * head_dim;
+    const float xv = (t < head_dim) ? q36_to_f(x[base + t]) : 0.f;
+    __shared__ float sw[32];
+    float ss = q36_wsum(xv * xv);
+    if ((t & 31) == 0) sw[t >> 5] = ss;
+    __syncthreads();
+    if (t < 32) {
+        float v = (t < (blockDim.x + 31) / 32) ? sw[t] : 0.f;
+        v = q36_wsum(v);
+        if (t == 0) sw[0] = rsqrtf(v + eps);
+    }
+    __syncthreads();
+    if (t < head_dim) x[base + t] = __float2bfloat16(xv * sw[0]);
+}
+
 __global__ void gdn_ar_kernel(const __nv_bfloat16* __restrict__ q,
                               const __nv_bfloat16* __restrict__ k,
                               const __nv_bfloat16* __restrict__ v,
@@ -214,6 +237,57 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
     if (lane == 0) out[(size_t)vh * HEAD_DIM + j] = __float2bfloat16(y);
 }
 
+// Default GDN path: warp-per-state-column with native [vh][row][col] layout (no transposed
+// state). One warp owns column j; row slices live in registers; grid fills the GPU.
+template <int WARPS_PER_BLK, int HEAD_DIM>
+__global__ void gdn_ar_warpgrid_kernel(const __nv_bfloat16* __restrict__ q,
+                                       const __nv_bfloat16* __restrict__ k,
+                                       const __nv_bfloat16* __restrict__ v,
+                                       const __nv_bfloat16* __restrict__ alpha,
+                                       const __nv_bfloat16* __restrict__ beta,
+                                       const __nv_bfloat16* __restrict__ dt,
+                                       const __nv_bfloat16* __restrict__ a,
+                                       float* __restrict__ state,
+                                       __nv_bfloat16* __restrict__ out,
+                                       int q_heads, int v_heads) {
+    constexpr int NROW = HEAD_DIM / 32;
+    const int vh   = blockIdx.x;
+    const int j    = blockIdx.y * WARPS_PER_BLK + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (vh >= v_heads || j >= HEAD_DIM) return;
+
+    const int qh = vh % q_heads;
+    const float scale = rsqrtf((float)HEAD_DIM);
+    const float bb = q36_sigmoid(q36_to_f(beta[vh]));
+    const float g = __expf(q36_softplus(q36_to_f(alpha[vh]) + q36_to_f(dt[vh])) * q36_to_f(a[vh]));
+    const __nv_bfloat16* qhptr = q + (size_t)qh * HEAD_DIM;
+    const __nv_bfloat16* khptr = k + (size_t)qh * HEAD_DIM;
+    const __nv_bfloat16* vhptr = v + (size_t)vh * HEAD_DIM;
+    float* sptr = state + (size_t)vh * HEAD_DIM * HEAD_DIM;
+
+    float sloc[NROW];
+    float part_sk = 0.f;
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) {
+        const int i = lane + r * 32;
+        const float s = sptr[(size_t)i * HEAD_DIM + j];
+        sloc[r] = s;
+        part_sk += s * q36_to_f(khptr[i]);
+    }
+    const float sk = g * q36_wsum(part_sk);
+    const float delta = (q36_to_f(vhptr[j]) - sk) * bb;
+    float part_y = 0.f;
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) {
+        const int i = lane + r * 32;
+        const float s = sloc[r] * g + q36_to_f(khptr[i]) * delta;
+        sptr[(size_t)i * HEAD_DIM + j] = s;
+        part_y += s * q36_to_f(qhptr[i]) * scale;
+    }
+    const float y = q36_wsum(part_y);
+    if (lane == 0) out[(size_t)vh * HEAD_DIM + j] = __float2bfloat16(y);
+}
+
 __global__ void gated_norm_kernel(const __nv_bfloat16* __restrict__ x,
                                   const __nv_bfloat16* __restrict__ z,
                                   const __nv_bfloat16* __restrict__ weight,
@@ -289,10 +363,10 @@ void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
         reinterpret_cast<__nv_bfloat16*>(k_bf16),
         reinterpret_cast<__nv_bfloat16*>(v_bf16),
         q_dim, v_dim, qkv_dim, conv_kernel);
-    l2_norm_heads_kernel<<<q_heads, head_dim, 0, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(q_bf16), q_heads, head_dim, eps);
-    l2_norm_heads_kernel<<<q_heads, head_dim, 0, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(k_bf16), q_heads, head_dim, eps);
+    l2_norm_qk_kernel<<<q_heads * 2, head_dim, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q_bf16),
+        reinterpret_cast<__nv_bfloat16*>(k_bf16),
+        q_heads, head_dim, eps);
 }
 
 void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
@@ -309,6 +383,23 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
         constexpr int COLS = 8, HD = 128;                     // 8 warps (columns)/block -> 256 threads
         dim3 grid(v_heads, (HD + COLS - 1) / COLS);
         gdn_ar_fast_kernel<COLS, HD><<<grid, COLS * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+            state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
+            q_heads, v_heads);
+        return;
+    }
+    static int warpgrid = -1;
+    if (warpgrid < 0) { const char* e = getenv("SPARKINFER_GDN_WARPGRID"); warpgrid = (e && e[0] == '0') ? 0 : 1; }
+    if (warpgrid && head_dim == 128) {
+        constexpr int WPB = 8, HD = 128;
+        dim3 grid(v_heads, (HD + WPB - 1) / WPB);
+        gdn_ar_warpgrid_kernel<WPB, HD><<<grid, WPB * 32, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(q_bf16),
             reinterpret_cast<const __nv_bfloat16*>(k_bf16),
             reinterpret_cast<const __nv_bfloat16*>(v_bf16),
