@@ -170,6 +170,39 @@ __global__ void gemv_q_kernel(const __nv_bfloat16* __restrict__ x,
 template __global__ void gemv_q_kernel<__nv_bfloat16>(const __nv_bfloat16*, const unsigned char*, __nv_bfloat16*, int, int, int);
 template __global__ void gemv_q_kernel<float>(const __nv_bfloat16*, const unsigned char*, float*, int, int, int);
 
+// ---- Q8_0 on-read GEMV (W = GGUF-native Q8_0 [N,K]) ---------------------------
+// Q8_0 block = 34 B / 32 values: one fp16 scale d, then 32 int8. Dequant-on-read (d*int8)
+// dotted with the fp32-staged activation — reads the int8 weight bytes (~2x less than bf16)
+// with NO activation quantization. Replaces the Q8_0->bf16 load-time dequant + dense bf16
+// GEMV: this is MORE faithful (fp32 accumulate of the exact Q8_0 value, vs bf16-rounded weight)
+// and reads half the weight memory. One warp per output row (lane j owns value j of each block).
+template <typename OutT>
+__global__ void gemv_q80_kernel(const __nv_bfloat16* __restrict__ x,
+                                const unsigned char* __restrict__ W,
+                                OutT* __restrict__ y, int N, int K) {
+    extern __shared__ float s_x[];                 // K floats
+    for (int i = threadIdx.x; i < K; i += blockDim.x) s_x[i] = __bfloat162float(x[i]);
+    __syncthreads();
+
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int n = blockIdx.x * GEMV_WPB + warp;
+    if (n >= N) return;
+    const int nblk = K / 32;                        // Q8_0: 32 values / block
+    const unsigned char* base = W + (size_t)n * nblk * 34;
+    float acc = 0.f;
+    for (int blk = 0; blk < nblk; blk++) {
+        const unsigned char* b = base + (size_t)blk * 34;
+        const float d = gq_h2f(b);                  // fp16 block scale
+        const signed char q = reinterpret_cast<const signed char*>(b + 2)[lane];
+        acc += d * (float)q * s_x[blk * 32 + lane];
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+    if (lane == 0) gemv_write(y + n, acc);
+}
+template __global__ void gemv_q80_kernel<__nv_bfloat16>(const __nv_bfloat16*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void gemv_q80_kernel<float>(const __nv_bfloat16*, const unsigned char*, float*, int, int);
+
 // ---- faithful llama.cpp int8 MMVQ for a dense Q4_K [N,K] GEMV --------------------
 // Quantizes the activation to Q8_1 (int8 + per-32 scale + sum) once per token, then
 // dp4a's the Q4_K weight nibbles against it — the same vec_dot_q4_K_q8_1 math llama.cpp
@@ -637,6 +670,10 @@ void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int 
         gemv_q_dp4a_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, sm, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(W),
             reinterpret_cast<__nv_bfloat16*>(y), N, K);
+    } else if (wtype == 8) {            // Q8_0: half the weight read of the bf16 GEMV
+        gemv_q80_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(W),
+            reinterpret_cast<__nv_bfloat16*>(y), N, K);
     } else {
         gemv_q_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(W),
@@ -648,6 +685,9 @@ void launch_gemv_q_f32(const void* x, const void* W, int wtype, float* y, int N,
     if (gemv_mmvq() && wtype == 12) {
         size_t sm = 2 * (size_t)(K >> 5) * sizeof(float) + (size_t)K;
         gemv_q_dp4a_kernel<float><<<grid, GEMV_WPB * 32, sm, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(W), y, N, K);
+    } else if (wtype == 8) {            // Q8_0
+        gemv_q80_kernel<float><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(W), y, N, K);
     } else {
         gemv_q_kernel<float><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
