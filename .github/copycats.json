@@ -45,5 +45,15 @@
     "original": 221,
     "date": "2026-07-04",
     "note": "reattributed: #209 is a verbatim copy of fansilas's #221 (fansilas authored the #195 kernel; jony376 commit 11:18 > fansilas 05:23)"
+  },
+  {
+    "pr": 244,
+    "author": "cleanjunc",
+    "original": 233,
+    "date": "2026-07-06",
+    "blocked": false,
+    "penalty_days": 0,
+    "strike": 1,
+    "containment": 0.41
   }
 ]

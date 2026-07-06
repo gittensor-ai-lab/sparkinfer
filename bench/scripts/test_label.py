@@ -50,12 +50,24 @@ class LabelPolicyTest(unittest.TestCase):
         self.assertEqual(just_above["label"], "XS")
         self.assertTrue(just_above["pass"])
 
-    def test_raw_speedup_buckets_without_difficulty_boost(self):
-        env = {"SPARKINFER_DIFFICULTY_BOOST": "0"}
-        self.assertEqual(score(104.0, env=env)["label"], "S")
-        self.assertEqual(score(107.0, env=env)["label"], "M")
-        self.assertEqual(score(111.0, env=env)["label"], "L")
-        self.assertEqual(score(119.0, env=env)["label"], "XL")
+    def test_llama_anchored_buckets_without_difficulty_boost(self):
+        # The label tier is sized against the llama.cpp reference (DIFF_REF), not the frontier — so
+        # equal tok/s of work earns the same tier at any maturity. With DIFF_REF=365.85 and frontier=100
+        # (below the reference -> no boost), the S/M/L/XL thresholds (3.5/6/10/18% of llama) fall at
+        # delta ~= 12.8/22/36.6/65.9 tok/s. A verified-but-smaller gain floors at XS.
+        env = {"SPARKINFER_DIFFICULTY_BOOST": "0", "SPARKINFER_DIFFICULTY_REF": "365.85"}
+        self.assertEqual(score(105.0, env=env)["label"], "XS")   # +5: verified over frontier, < S vs llama
+        self.assertEqual(score(113.0, env=env)["label"], "S")    # +13 = 3.55% of llama
+        self.assertEqual(score(122.0, env=env)["label"], "M")    # +22 = 6.01%
+        self.assertEqual(score(137.0, env=env)["label"], "L")    # +37 = 10.11%
+        self.assertEqual(score(166.0, env=env)["label"], "XL")   # +66 = 18.04%
+
+    def test_unoptimized_model_does_not_mint_xl_from_low_hanging_fruit(self):
+        # The unfairness this policy fixes: over an un-optimized frontier a small absolute gain used to
+        # explode to XL. Sized against llama.cpp it earns a fair tier. (frontier 23, llama 190.)
+        env = {"SPARKINFER_DIFFICULTY_BOOST": "1", "SPARKINFER_DIFFICULTY_REF": "190"}
+        self.assertEqual(score(28.0, frontier=23.0, env=env)["label"], "XS")   # +5 (+22% over frontier) but 2.6% of llama
+        self.assertEqual(score(171.0, frontier=23.0, env=env)["label"], "XL")  # a real 7x IS an XL (78% of llama)
 
     def test_difficulty_boost_changes_label_but_not_raw_percent(self):
         res = score(484.79, frontier=469.13, ceiling=366.0, top1=0.9612, kl=0.0175,
@@ -96,7 +108,7 @@ class LabelPolicyTest(unittest.TestCase):
             "guard_32k_ratio": 1.125,
             "guard_32k_pass": True,
         }
-        res = score(120.0, frontier=100.0, prov=prov)
+        res = score(170.0, frontier=100.0, prov=prov)   # +70 = 19.1% of llama -> XL
         self.assertEqual(res["label"], "XL")
         self.assertEqual(res["eval_mode"], "longctx")
         self.assertEqual(res["score_context"], 16384)

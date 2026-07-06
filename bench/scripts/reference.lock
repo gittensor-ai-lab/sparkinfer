@@ -20,3 +20,11 @@ QWEN36_MODEL_SHA256="ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e
 # llama.cpp commit the reference is pinned to. HEAD of master drifts run-to-run (non-reproducible and
 # unpinnable); we check out exactly this commit, verify a clean tree, and rebuild if either differs.
 LLAMACPP_COMMIT="6f4f53f2b7da54fcdbbecaaa734337c337ad6176"
+
+# Qwen3.6-35B-A3B llama.cpp decode baselines — 3-rep median on RTX 5090, same pinned commit + GGUF
+# sha (QWEN36_MODEL_SHA256 above). These anchor the fair-label scoring (delta/llama_ref) at each
+# scored context and the difficulty-reference boost once the Qwen3.6 frontier passes them.
+# Measured 2026-07-06. Env-overridable.
+QWEN36_LLAMA_128="${QWEN36_LLAMA_128:-275.81}"
+QWEN36_LLAMA_512="${QWEN36_LLAMA_512:-275.61}"
+QWEN36_LLAMA_4K="${QWEN36_LLAMA_4K:-276.30}"

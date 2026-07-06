@@ -22,10 +22,9 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/_common.sh"
 
-REF=""; CEILING=0; PRIMARY_FRONTIER=0
+REF=""; CEILING=0
 while [ $# -gt 0 ]; do case "$1" in
-  --ref) shift; REF="$1" ;; --ceiling) shift; CEILING="$1" ;;
-  --primary-frontier) shift; PRIMARY_FRONTIER="$1" ;; *) ;;
+  --ref) shift; REF="$1" ;; --ceiling) shift; CEILING="$1" ;; *) ;;
 esac; shift; done
 
 export LLAMACPP_DIR="${LLAMACPP_DIR:-/workspace/.llamacpp}"
@@ -43,7 +42,7 @@ echo ">> [build] submission ($COMMIT) from source (sm_$ARCH) — shared by both 
 rm -rf "$ROOT/build"
 if ! NO_PREBUILT=1 ensure_sparkinfer "$ARCH"; then
   echo ">> build FAILED — submission does not compile (sm_$ARCH)" >&2
-  printf 'RESULT_JSON {"commit": "%s", "tps": 0, "top1": 0, "kl": 99, "frontier_tps": %s, "label": "REJECT", "reason": "build failed (does not compile)", "pass": false}\n' "$COMMIT" "$PRIMARY_FRONTIER"
+  printf 'RESULT_JSON {"commit": "%s", "tps": 0, "top1": 0, "kl": 99, "frontier_tps": 0, "label": "REJECT", "reason": "build failed (does not compile)", "pass": false}\n' "$COMMIT"
   exit 0
 fi
 
@@ -78,11 +77,9 @@ run_model() {  # $1=role  $2=file $3=repo $4=tok  $5=frontier  $6..=SPARKINFER_*
 # distance), mirroring the single-model eval. The guard is never scored, so no boost there.
 P_DIFF_REF="${SPARKINFER_P_LLAMA_128_BASELINE:-0}"
 
-# Qwen3.6 is scored on 128/512/4k ONLY for now — its long-context (16k/32k) decode is currently far
-# too slow (35B MoE dequant-bound) to sweep every eval. SCORE_REPS=0 skips the 16k context, GUARD_32K
-# _REPS=0 skips 32k (median_ctx returns 0 -> excluded from scoring + guards); the 3 live contexts get
-# 3-rep medians for a stable scored number. Re-enable 16k/32k by passing their reps + baselines.
-PRIMARY_JSON="$(run_model primary "$P_FILE" "$P_REPO" "$P_TOK" "$PRIMARY_FRONTIER" \
+# Qwen3.6 is scored on 128/512/4k ONLY for now — long-context is too slow to sweep every eval.
+# The 3 live contexts get 3-rep medians. Re-enable 16k/32k by passing their reps + baselines.
+PRIMARY_JSON="$(run_model primary "$P_FILE" "$P_REPO" "$P_TOK" 0 \
   MODELS_DIR="$P_DIR" MODEL_SHA256="${QWEN36_MODEL_SHA256:-}" \
   SPARKINFER_SCORE_REPS=0 SPARKINFER_GUARD_32K_REPS=0 \
   SPARKINFER_GUARD_REPS=3 SPARKINFER_GUARD_512_REPS=3 SPARKINFER_GUARD_4K_REPS=3 \

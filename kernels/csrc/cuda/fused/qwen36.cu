@@ -378,9 +378,9 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
     // 2x state traffic). Uses a transposed internal state layout, so it MUST be all-or-nothing for the
     // run — the static flag guarantees that. Requires head_dim a multiple of 32 (128 -> NROW=4).
     static int fast = -1;
-    if (fast < 0) { const char* e = getenv("SPARKINFER_GDN_FAST"); fast = (e && e[0] == '1') ? 1 : 0; }
-    if (fast && head_dim == 128) {
-        constexpr int COLS = 8, HD = 128;
+    if (fast < 0) { const char* e = getenv("SPARKINFER_GDN_FAST"); fast = (e && e[0] == '0') ? 0 : 1; }
+    if (fast && head_dim == 128) {                            // Qwen3.6 linear_head_dim; other dims -> naive
+        constexpr int COLS = 8, HD = 128;                     // 8 warps (columns)/block -> 256 threads
         dim3 grid(v_heads, (HD + COLS - 1) / COLS);
         gdn_ar_fast_kernel<COLS, HD><<<grid, COLS * 32, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(q_bf16),

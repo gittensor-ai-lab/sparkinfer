@@ -192,6 +192,12 @@ contexts = [
   {"ctx":32768, "label":"32k-context", "tps":float("$GUARD_32K_TPS"), "base":float("$GUARD_32K_BASELINE"), "llama":float("$LLAMA_32K_BASELINE")},
 ]
 for c in contexts:
+    # The scoring base is the SAME-BOX origin/main measurement — not a passed-in frontier number.
+    # The bot already measures main on this box at the start of every run and passes it as the
+    # GUARD_BASELINE. Each PR scores directly against that same-box baseline: the gain is "how
+    # much faster is this PR than main on the same box?" — hardware-independent and always current.
+    # The only exception is 16k, which falls back to the old FRONTIER if no baseline is set;
+    # for models that skip 16k (reps=0), it never enters scoring anyway.
     c["gain"] = 0.0 if c["base"] <= 0 else (c["tps"] - c["base"]) / c["base"]
 # A context measured with 0 reps (tps<=0) was intentionally skipped (e.g. Qwen3.6 runs only
 # 128/512/4k for now) — exclude it from scoring so a skipped context is never chosen or penalized.

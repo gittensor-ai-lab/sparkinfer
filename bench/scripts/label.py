@@ -9,11 +9,17 @@ Emits one line:  RESULT_JSON {...}
   REJECT (score 0). A pass with KL above the preferred 0.15 is flagged `accuracy_warn` — accuracy is
   first; a speed gain that erodes parity with llama.cpp is not worth taking.
 - Significance gate: the gain must exceed SIG (2% of the frontier, a CI/noise proxy), else "none".
-- Label = bucket of the **relative speedup over the frontier** (delta / frontier). Same denominator
-  as the significance gate, so all five tiers stay reachable as decode speed grows — a
-  fraction-of-headroom rule collapsed XS/S once the frontier neared the ceiling (the 2% noise floor
-  alone already exceeded their headroom bands). The tiers are adaptive in that the *absolute* tok/s
-  required for each grows with the frontier. Thresholds are governance-tunable.
+  A gain that clears it floors at XS (verified but small); "none" always means "not verified".
+- Label tier = bucket of the gain **sized against the llama.cpp reference** (delta / llama_ref), NOT
+  the frontier. llama.cpp is a constant maturity anchor for every model, so the same tok/s of real
+  work earns the same tier whether the model started at 23 or 493 tok/s. This fixes the unfairness of
+  delta/frontier: over an un-optimized frontier (e.g. Qwen3.6 at 23 tok/s) a small absolute gain used
+  to explode to XL, while a mature model (past llama) couldn't clear XS for equal effort. The
+  past-llama difficulty boost (Option B) still multiplies the *tier* once the frontier is beyond the
+  reference. Significance still gates on raw %-over-frontier (a gain must beat the current best);
+  pct_over_frontier reports the honest measured speedup; pct_of_llama is the tier basis.
+  llama_ref (SPARKINFER_DIFFICULTY_REF) <= 0 falls back to the legacy delta/frontier basis.
+  Thresholds are governance-tunable.
 """
 import sys, json, os
 
@@ -71,21 +77,33 @@ elif frontier <= 0:
     res.update(pass_=True, label="BASELINE", note="no frontier set; this submission becomes it")
 else:
     delta = tps - frontier
-    g = delta / frontier                                # relative speedup over the frontier
+    g = delta / frontier                                # relative speedup over the frontier — SIGNIFICANCE basis
     if g <= SIG:
         res.update(pass_=True, label="none", delta_tps=round(delta, 2),
                    pct_over_frontier=round(100 * g, 1),
                    note="within significance gate — not a verified improvement")
     else:
-        D = difficulty_mult(frontier)
-        g_eff = g * D                                   # boost the label tier, not the raw % or the gate
-        label = next(l for thr, l in BUCKETS if g_eff >= thr)
+        # FAIR label tier: size the gain against the llama.cpp reference (DIFF_REF — a constant maturity
+        # anchor for EVERY model), not the possibly-unoptimized frontier. So the same tok/s of real work
+        # earns the same tier whether the model started at 23 or 493 tok/s — an un-optimized model can no
+        # longer mint XLs from low-hanging fruit while a mature one (past llama) can't clear XS. Significance
+        # still gates on raw %-over-frontier above (a gain must beat the current best); only the TIER is
+        # llama-anchored. Past-llama difficulty boost (Option B) is unchanged. DIFF_REF<=0 -> legacy basis.
+        ref = DIFF_REF if DIFF_REF > 0 else frontier
+        g_fair = delta / ref
+        D = difficulty_mult(frontier)                   # hard-gain boost once past the reference
+        g_eff = g_fair * D
+        # A verified improvement over the frontier floors at XS (real but small); the higher tiers
+        # (S/M/L/XL) are earned by the llama-anchored size. So "none" always means "not a verified
+        # improvement", never "real but tiny".
+        label = next((l for thr, l in BUCKETS if g_eff >= thr), "XS")
         res.update(pass_=True, label=label, delta_tps=round(delta, 2),
-                   pct_over_frontier=round(100 * g, 1),   # RAW measured speedup (honest reporting)
+                   pct_over_frontier=round(100 * g, 1),      # RAW measured speedup (honest reporting)
+                   pct_of_llama=round(100 * g_fair, 1),      # gain as a fraction of llama.cpp — the label basis
                    pct_of_ceiling=round(100 * tps / ceiling, 1) if ceiling > 0 else None)
+        res["effective_pct"] = round(100 * g_eff, 1)
         if D != 1.0:                                    # transparency: expose the boost in the verdict
             res["difficulty_mult"] = round(D, 2)
-            res["effective_pct"] = round(100 * g_eff, 1)
 
 # Soft accuracy flag: passed the gate but above the preferred KL ceiling — accepted, margin is thin.
 if res.get("label") != "REJECT" and kl > KL_PREFER:
