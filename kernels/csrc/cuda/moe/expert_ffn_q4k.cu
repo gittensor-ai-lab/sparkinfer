@@ -972,8 +972,10 @@ void launch_moe_expert_ffn_q4k(
         return;
     }
 
+    // Split-K down (4 warps/row) fills SMs on the Q6_K expert-down GEMV — default ON after
+    // nsys showed routed MoE down under-occupies at bs=1. SPARKINFER_SPLITK=0 restores one-warp/row.
     static int splitk = -1;
-    if (splitk < 0) { const char* sv = getenv("SPARKINFER_SPLITK"); splitk = (sv && sv[0] == '1') ? 1 : 0; }
+    if (splitk < 0) { const char* sv = getenv("SPARKINFER_SPLITK"); splitk = (sv && sv[0] == '0') ? 0 : 1; }
     static int pdl = -1;
     if (pdl < 0) { const char* pv = getenv("SPARKINFER_PDL"); pdl = (pv && pv[0] == '1') ? 1 : 0; }
     if (splitk) {   // split-K down: 4 warps/row -> 4x warps in flight (occupancy lever)
