@@ -137,17 +137,73 @@
   ],
   "prs": [
     {
+      "num": 243,
+      "title": "perf(moe): int8 dp4a MMVQ for the Q5_K expert down projection (+6.6% Qwen3.6 decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 0,
+      "delta_pct": 0,
+      "top1": 0.97,
+      "kl": 0.02,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/243"
+    },
+    {
+      "num": 241,
+      "title": "perf(gemv): split-K the bf16 dense projection GEMV for decode occupancy (+9.5% Qwen3.6 decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 0,
+      "delta_pct": 0,
+      "top1": 0.97,
+      "kl": 0.02,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/241"
+    },
+    {
+      "num": 239,
+      "title": "perf(qwen3.6): fuse decode kernel launches — shared-expert + GDN conv/L2-norm",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 0,
+      "delta_pct": 0,
+      "top1": 0.97,
+      "kl": 0.02,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/239"
+    },
+    {
+      "num": 237,
+      "title": "perf(qwen3.6): speed up GDN and overlap decode work",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 261.31,
+      "delta_pct": 0.0,
+      "top1": 0.9885,
+      "kl": 0.0096,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/237"
+    },
+    {
       "num": 234,
       "title": "perf(qwen3.6): Q8_0 on-read GEMV for dense projections (+8.9% decode, 128/512/4k)",
       "areas": [
         "kernels",
         "runtime"
       ],
-      "label": "XL",
+      "label": "REJECT",
       "tps": 187.81,
-      "delta_pct": 708.8,
-      "top1": 0.966,
-      "kl": 0.0259,
+      "delta_pct": -26.9,
+      "top1": 0.9631,
+      "kl": 0.015,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/234",
       "model": "Qwen3.6-35B-A3B",
       "eval_mode": "longctx",
@@ -1106,51 +1162,6 @@
       "tps": 279.11,
       "delta_pct": 6.5,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/59"
-    },
-    {
-      "num": 58,
-      "title": "perf(attention): flash_decode_split ldg + n_splits=16 combine fast path",
-      "areas": [
-        "kernels"
-      ],
-      "label": "none",
-      "tps": 258.53,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/58"
-    },
-    {
-      "num": 53,
-      "title": "Enable split-K down projection by default (+6% decode)",
-      "areas": [
-        "kernels"
-      ],
-      "label": "none",
-      "tps": 260.69,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/53"
-    },
-    {
-      "num": 52,
-      "title": "perf(kernels): two-pass multi-block decode argmax (1 SM -> all SMs)",
-      "areas": [
-        "kernels"
-      ],
-      "label": "L",
-      "tps": 262.17,
-      "delta_pct": 9.2,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/52"
-    },
-    {
-      "num": 50,
-      "title": "Decode dp4a (MMVQ) default + argmax widen: 180.4 → 235.4 tok/s (+30.5%) on RTX 5090",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "XL",
-      "tps": 240.11,
-      "delta_pct": 21.7,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/50"
     }
   ],
   "landed": [
@@ -1381,32 +1392,32 @@
   },
   "qwen36": {
     "model": "Qwen3.6-35B-A3B · UD-Q4_K_M",
-    "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · head_dim 256",
-    "frontier_tps": 170.84,
+    "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
+    "frontier_tps": 261.3,
     "baseline_tps": 23.03,
     "ref_name": "llama.cpp",
-    "ref_tps": 190.0,
+    "ref_tps": 275.81,
     "token_match": 0.9779,
     "kl": 0.0183,
-    "note": "scored on 128/512/4k · Qwen3-30B guarded against regression",
+    "note": "scored vs same-box main · both #230 (shared-expert) + #229 (GDN) on main",
     "ctx": [
       {
         "label": "128",
         "color": "#7B5DFF",
-        "tps": 170.84,
-        "ref_tps": 190.0
+        "tps": 261.3,
+        "ref_tps": 275.81
       },
       {
         "label": "512",
         "color": "#0E8A16",
-        "tps": 169.44,
-        "ref_tps": 188.0
+        "tps": 258.18,
+        "ref_tps": 275.61
       },
       {
         "label": "4k",
         "color": "#B8860B",
-        "tps": 163.35,
-        "ref_tps": 176.0
+        "tps": 244.35,
+        "ref_tps": 276.3
       }
     ]
   },
@@ -1422,8 +1433,14 @@
       "tps": 170.84,
       "pr": 230,
       "date": "2026-07-05",
-      "label": "XL",
-      "pending": true
+      "label": "XL"
+    },
+    {
+      "name": "GDN fast AR state kernel",
+      "tps": 261.3,
+      "pr": 229,
+      "date": "2026-07-05",
+      "label": "XL"
     }
   ]
 }
