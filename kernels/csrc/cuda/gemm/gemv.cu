@@ -206,8 +206,9 @@ template __global__ void gemv_q80_kernel<float>(const __nv_bfloat16*, const unsi
 
 // split-K Q8_0 GEMV: S warps cooperate per output row, each summing a 1/S stride
 // of the K reduction. Same occupancy lever as the bf16 split-K kernel (gemv_f32_sk_kernel)
-// but reads Q8_0 int8 weights (2x less than bf16). No smem staging for x -- x is read
-// straight from L2 coalesced per warp. RPB = GEMV_WPB/S rows per block.
+// but reads Q8_0 int8 weights (2x less than bf16). Each lane processes 8 blocks per
+// inner iteration (same amortized throughput as bf16's uint4-per-iteration). No smem
+// staging for x -- x is read straight from L2 coalesced per warp. RPB = GEMV_WPB/S.
 template <typename OutT, int S>
 __global__ void gemv_q80_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                     const unsigned char* __restrict__ W,
@@ -221,22 +222,39 @@ __global__ void gemv_q80_sk_kernel(const __nv_bfloat16* __restrict__ x,
     if (n < N) {
         const int nblk = K / 32;
         const unsigned char* base = W + (size_t)n * nblk * 34;
-        for (int blk = split; blk < nblk; blk += S) {
-            const unsigned char* b = base + (size_t)blk * 34;
-            const float d = gq_h2f(b);
-            const signed char q = reinterpret_cast<const signed char*>(b + 2)[lane];
+        const int n_my = (nblk - split + S - 1) / S;    // blocks assigned to this split
+        const int ngroups = n_my >> 3;                    // full groups of 8
+        // Groups of 8 blocks — same amortised iteration count as bf16 uint4 path
+        for (int g = 0; g < ngroups; g++) {
+            const int blk0 = split + g * (8 * S);
+            #pragma unroll
+            for (int b = 0; b < 8; b++) {
+                const int blk = blk0 + b * S;
+                const unsigned char* bb = base + (size_t)blk * 34;
+                const float d = gq_h2f(bb);
+                const signed char q = reinterpret_cast<const signed char*>(bb + 2)[lane];
+                acc += d * (float)q * __bfloat162float(x[blk * 32 + lane]);
+            }
+        }
+        // Tail: any remaining blocks (< 8)
+        #pragma unroll
+        for (int b = ngroups * 8; b < n_my; b++) {
+            const int blk = split + b * S;
+            const unsigned char* bb = base + (size_t)blk * 34;
+            const float d = gq_h2f(bb);
+            const signed char q = reinterpret_cast<const signed char*>(bb + 2)[lane];
             acc += d * (float)q * __bfloat162float(x[blk * 32 + lane]);
         }
-    }
-    if (n < N) s_part[row_local][split] = acc;
-    __syncthreads();
-    if (n < N) {
-        acc = 0.f;
-        #pragma unroll
-        for (int s = 0; s < S; s++) acc += s_part[row_local][s];
         #pragma unroll
         for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
-        if (lane == 0) gemv_write(y + n, acc);
+        if (lane == 0) s_part[row_local][split] = acc;
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+        float o = s_part[row_local][0];
+        #pragma unroll
+        for (int s = 1; s < S; s++) o += s_part[row_local][s];
+        gemv_write(y + n, o);
     }
 }
 template __global__ void gemv_q80_sk_kernel<__nv_bfloat16, 2>(const __nv_bfloat16*, const unsigned char*, __nv_bfloat16*, int, int);
@@ -747,8 +765,8 @@ void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int 
         gemv_q_dp4a_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, sm, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(W),
             reinterpret_cast<__nv_bfloat16*>(y), N, K);
-    } else if (wtype == 8) {            // Q8_0: split-K or 1-warp-per-row
-        if (gemv_bf16_splitk() && (K & 31) == 0 && N < 16384) {
+    } else if (wtype == 8) {            // Q8_0: split-K (fill GPU) or 1-warp
+        if (gemv_bf16_splitk() && N < 16384) {
             const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
             const auto* Wp = reinterpret_cast<const unsigned char*>(W);
             auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
@@ -779,8 +797,8 @@ void launch_gemv_q_f32(const void* x, const void* W, int wtype, float* y, int N,
         size_t sm = 2 * (size_t)(K >> 5) * sizeof(float) + (size_t)K;
         gemv_q_dp4a_kernel<float><<<grid, GEMV_WPB * 32, sm, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(W), y, N, K);
-    } else if (wtype == 8) {            // Q8_0: split-K or 1-warp-per-row
-        if (gemv_bf16_splitk() && (K & 31) == 0 && N < 16384) {
+    } else if (wtype == 8) {            // Q8_0: split-K (fill GPU) or 1-warp
+        if (gemv_bf16_splitk() && N < 16384) {
             const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
             const auto* Wp = reinterpret_cast<const unsigned char*>(W);
             if (N >= 8192) {
