@@ -712,23 +712,15 @@ static int gemv_bf16_splitk() {
     return v;
 }
 void launch_gemv(const void* x, const void* W, void* y, int N, int K, cudaStream_t stream) {
-    // pick the smallest split S so N*S ~ 16384 warps fill the SMs (larger S = more reduction
-    // overhead). N < 16384 covers every Qwen3.6 launch_gemv site (projections top out at 8192 rows);
-    // huge-N callers already saturate the grid and keep the one-warp path.
+    // Qwen3.6's overlapped projection mix measured best with a light split (S=2): it keeps the
+    // large 8192/4096-row projections full while avoiding the reduction overhead that S=4/8 add to
+    // the many 2048/512/32-row dense GEMVs. Huge-N callers already saturate the one-warp grid.
     if (gemv_bf16_splitk() && (K & 7) == 0 && N < 16384) {
         const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
         const auto* Wp = reinterpret_cast<const __nv_bfloat16*>(W);
         auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
-        if (N >= 8192) {          // S=2  -> up to 16384 warps
-            constexpr int S = 2, RPB = GEMV_WPB / S;
-            gemv_f32_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, Wp, yp, N, K);
-        } else if (N >= 4096) {   // S=4
-            constexpr int S = 4, RPB = GEMV_WPB / S;
-            gemv_f32_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, Wp, yp, N, K);
-        } else {                  // S=8  (small projections: shared-expert / k,v / ssm_out)
-            constexpr int S = 8, RPB = GEMV_WPB / S;
-            gemv_f32_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, Wp, yp, N, K);
-        }
+        constexpr int S = 2, RPB = GEMV_WPB / S;
+        gemv_f32_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, Wp, yp, N, K);
         return;
     }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
