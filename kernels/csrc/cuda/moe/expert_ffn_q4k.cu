@@ -111,6 +111,7 @@ __device__ __forceinline__ float q4kf_deq_dot(int t, const unsigned char* b, con
 
 // ggml types: Q4_K=12 (144 B/256), Q5_K=13 (176 B/256), Q6_K=14 (210 B/256). UD quants mix them per tensor.
 __device__ __forceinline__ int q_block_bytes(int t) { return t == 14 ? 210 : (t == 13 ? 176 : 144); }
+template <int T> __device__ constexpr int q_block_bytes_ct() { return T == 14 ? 210 : T == 13 ? 176 : 144; }
 
 // gate_up: h[ts,f] = SiLU(<x, gate[e,f]>) * <x, up[e,f]>.  one warp per f.
 // grid=(num_tokens*top_k, ffn/WPB), block=WPB*32. smem: s_x[hidden] + WPB*256.
@@ -288,6 +289,48 @@ __global__ void down_q6k_splitk_kernel(
                                     h_scratch + (size_t)ts * F + blk * 256, lane);
         }
         acc = q4kf_wsum(acc);
+        if (lane == 0) s_part[hh_local][split] = acc;
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[hh_local][s];
+        output[(size_t)token * H + hh] = __float2bfloat16(o);
+    }
+}
+
+// Qwen-specialized fp split-K down (Q5_K F=512, NBLK=2). Same math as the generic
+// down_q6k_splitk_kernel; only the runtime dims (nblk, block-bytes, total work)
+// become compile-time constants, eliminating integer division/mod and letting the
+// compiler fully unroll the work-item loop. Follows the pattern of the existing
+// MMVQ Qwen-specialized templates but for the generic fp dequant path.
+template <int S, int NBLK, int TOPK, int DOWN_TYPE>
+__global__ void down_fp_splitk_qwen_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const float* __restrict__ h_scratch,
+    __nv_bfloat16* __restrict__ output, int H, int F
+) {
+    constexpr int RPB = WPB / S, DBB = q_block_bytes_ct<DOWN_TYPE>();
+    __shared__ float s_part[RPB][S];
+    const int token = blockIdx.x, lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    constexpr int TOTAL = TOPK * NBLK;
+    float acc = 0.f;
+    si_pdl_sync();
+    if (hh < H) {
+        #pragma unroll
+        for (int wi = split; wi < TOTAL; wi += S) {
+            const int j = wi / NBLK, kbx = wi - j * NBLK;
+            const int ts = token * TOPK + j, e = expert_ids[ts];
+            const float w = expert_weights[ts];
+            const unsigned char* drow = down_q + ((size_t)e * H + hh) * NBLK * DBB;
+            acc += w * q4kf_deq_dot(DOWN_TYPE, drow + (size_t)kbx * DBB,
+                                    h_scratch + (size_t)ts * F + kbx * 256, lane);
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
         if (lane == 0) s_part[hh_local][split] = acc;
     }
     __syncthreads();
@@ -889,8 +932,16 @@ void launch_moe_expert_ffn_q4k(
             gate_up_mmvq2_pack2_qwen_kernel<2048, 768, 8><<<(num_tokens * top_k * ffn + 1) / 2, 8 * 32, 0, stream>>>(
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, num_tokens * top_k * ffn);
+        else if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+            gate_up_mmvq2_pack2_qwen_kernel<2048, 512, 8><<<(num_tokens * top_k * ffn + 1) / 2, 8 * 32, 0, stream>>>(
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, num_tokens * top_k * ffn);
         else if (gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
             gate_up_mmvq2_qwen_kernel<2048, 768, 8><<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch);
+        else if (gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+            gate_up_mmvq2_qwen_kernel<2048, 512, 8><<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch);
         else
@@ -969,6 +1020,21 @@ void launch_moe_expert_ffn_q4k(
         launch_mmvq_down_kernel(pdl, dnm, dim3(WPB * 32), stream, down_q4k_mmvq_kernel,
             reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
             reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, pdl);
+        return;
+    }
+
+    // Qwen3.6-35B-A3B Q5_K fp split-K specialization (F=512 -> NBLK=2). Same fp math
+    // as the generic split-K path; only the runtime dims become compile-time constants
+    // (TOTAL=16, DBB=176, division by 2 is a shift). Gated on SPARKINFER_DOWN_SPEC=1.
+    static int fp_spec = -1;
+    if (fp_spec < 0) { const char* e = getenv("SPARKINFER_DOWN_SPEC"); fp_spec = (e && e[0] == '0') ? 0 : 1; }
+    if (fp_spec && down_type == 13 && ffn == 512 && top_k == 8) {
+        constexpr int S = 2;
+        const int RPB = WPB / S;
+        dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
+        down_fp_splitk_qwen_kernel<S, 2, 8, 13><<<dns, WPB * 32, 0, stream>>>(
+            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, h_scratch,
+            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn);
         return;
     }
 
