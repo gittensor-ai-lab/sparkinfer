@@ -1516,24 +1516,24 @@
     "ref_tps": 275.81,
     "token_match": 0.9741,
     "kl": 0.0132,
-    "note": "scored vs same-box main · GDN_FAST default ON · #241 merged (split-K bf16 GEMV)",
+    "note": "scored vs same-box main · GDN_FAST default ON · #241 & #243 merged",
     "ctx": [
       {
         "label": "128",
         "color": "#7B5DFF",
-        "tps": 254.72,
+        "tps": 276.26,
         "ref_tps": 275.81
       },
       {
         "label": "512",
         "color": "#0E8A16",
-        "tps": 251.87,
+        "tps": 272.93,
         "ref_tps": 275.61
       },
       {
         "label": "4k",
         "color": "#B8860B",
-        "tps": 239.0,
+        "tps": 257.73,
         "ref_tps": 276.3
       }
     ]
