@@ -1,0 +1,5 @@
+{"id": "bfcl-922", "benchmark": "bfcl", "score": 1.0, "pass": true, "detail": "name=updateUserPreferences(ok) args=ok"}
+{"id": "gsm8k-588", "benchmark": "gsm8k", "score": 1.0, "pass": true, "detail": "got=52 want=52"}
+{"id": "HumanEval-61", "benchmark": "humaneval", "score": 1.0, "pass": true, "detail": "passed"}
+{"id": "ifeval-2195", "benchmark": "ifeval", "score": 1.0, "pass": true, "detail": "bullet_count=ok"}
+{"id": "mmlupro-10638", "benchmark": "mmlu_pro", "score": 0.0, "pass": false, "detail": "chose=G want=F"}

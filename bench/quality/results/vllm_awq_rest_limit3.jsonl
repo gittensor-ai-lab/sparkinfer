@@ -1,0 +1,9 @@
+{"id": "bfcl-922", "benchmark": "bfcl", "score": 1.0, "pass": true, "detail": "name=updateUserPreferences(ok) args=ok"}
+{"id": "bfcl-558", "benchmark": "bfcl", "score": 1.0, "pass": true, "detail": "name=extract_legal_information(ok) args=ok"}
+{"id": "bfcl-76", "benchmark": "bfcl", "score": 1.0, "pass": true, "detail": "name=get_ad_performance_metrics(ok) args=ok"}
+{"id": "HumanEval-61", "benchmark": "humaneval", "score": 1.0, "pass": true, "detail": "passed"}
+{"id": "HumanEval-104", "benchmark": "humaneval", "score": 1.0, "pass": true, "detail": "passed"}
+{"id": "HumanEval-105", "benchmark": "humaneval", "score": 1.0, "pass": true, "detail": "passed"}
+{"id": "ifeval-2195", "benchmark": "ifeval", "score": 1.0, "pass": true, "detail": "bullet_count=ok"}
+{"id": "ifeval-2284", "benchmark": "ifeval", "score": 0.0, "pass": false, "detail": "word_count_min=X, placeholders_min=X, bullet_count=X"}
+{"id": "ifeval-1418", "benchmark": "ifeval", "score": 0.6666666666666666, "pass": false, "detail": "no_commas=ok, sentence_count_max=ok, sentence_count_min=X"}

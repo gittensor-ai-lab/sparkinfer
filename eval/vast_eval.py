@@ -19,7 +19,7 @@ it is stopped and a fresh box is provisioned via the vast API automatically; the
 
 Env: VAST_API_KEY, SSH_KEY (default ~/.ssh/id_ed25519), LLAMACPP_DIR, EVAL_IMAGE, EVAL_REPO, VAST_INSTANCE_FILE.
 """
-import argparse, json, os, random, subprocess, sys, time
+import argparse, json, os, random, shlex, subprocess, sys, time
 from vastai import VastAI
 
 REPO    = os.environ.get("EVAL_REPO",  "https://github.com/gittensor-ai-lab/sparkinfer")
@@ -195,6 +195,34 @@ def main():
     ap.add_argument("--ref", default="main")
     ap.add_argument("--frontier", type=float, default=0)
     ap.add_argument("--ceiling",  type=float, default=0)
+    ap.add_argument("--guard-128-baseline", type=float, default=0,
+                    help="main/origin 128-token decode tok/s used as the no-regression guard baseline")
+    ap.add_argument("--guard-512-baseline", type=float, default=0,
+                    help="main/origin 512-context decode tok/s used as the no-regression guard baseline")
+    ap.add_argument("--guard-4k-baseline", type=float, default=0,
+                    help="main/origin 4k-context decode tok/s used as the no-regression guard baseline")
+    ap.add_argument("--guard-16k-baseline", type=float, default=0,
+                    help="main/origin 16k-context decode tok/s used as the no-regression guard baseline")
+    ap.add_argument("--guard-32k-baseline", type=float, default=0,
+                    help="main/origin 32k-context decode tok/s used as the no-regression guard baseline")
+    ap.add_argument("--guard-2k-baseline", type=float, default=0, help=argparse.SUPPRESS)
+    # --- dual-model scoring: Qwen3.6 (primary, scored) + Qwen3-30B (no-regression guard) ---
+    ap.add_argument("--dual", action="store_true",
+                    help="score Qwen3.6-35B-A3B and guard Qwen3-30B-A3B against no-regression in one build "
+                         "(--guard-*-baseline are the Qwen3-30B guard; --p-* are the Qwen3.6 scored target)")
+    ap.add_argument("--p-guard-128-baseline", type=float, default=0, help="[--dual] Qwen3.6 main 128-token decode tok/s")
+    ap.add_argument("--p-guard-512-baseline", type=float, default=0, help="[--dual] Qwen3.6 main 512-context tok/s")
+    ap.add_argument("--p-guard-4k-baseline",  type=float, default=0, help="[--dual] Qwen3.6 main 4k-context tok/s")
+    ap.add_argument("--p-guard-16k-baseline", type=float, default=0, help="[--dual] Qwen3.6 main 16k-context tok/s")
+    ap.add_argument("--p-guard-32k-baseline", type=float, default=0, help="[--dual] Qwen3.6 main 32k-context tok/s")
+    ap.add_argument("--p-llama-128-baseline", type=float, default=0, help="[--dual] Qwen3.6 llama.cpp 128-token tok/s (display + difficulty ref)")
+    ap.add_argument("--p-llama-512-baseline", type=float, default=0, help="[--dual] Qwen3.6 llama.cpp 512-context tok/s")
+    ap.add_argument("--p-llama-4k-baseline",  type=float, default=0, help="[--dual] Qwen3.6 llama.cpp 4k-context tok/s")
+    ap.add_argument("--p-llama-16k-baseline", type=float, default=0, help="[--dual] Qwen3.6 llama.cpp 16k-context tok/s")
+    ap.add_argument("--p-llama-32k-baseline", type=float, default=0, help="[--dual] Qwen3.6 llama.cpp 32k-context tok/s")
+    ap.add_argument("--eval-mode", default=os.environ.get("SPARKINFER_EVAL_MODE", "longctx"),
+                    choices=["longctx", "short"],
+                    help="longctx scores 16k with a 128-token decode no-regression guard; short keeps legacy 128-token scoring")
     ap.add_argument("--reuse", type=int, default=0)
     ap.add_argument("--keep", action="store_true", help="leave the instance running after eval (default: stop it)")
     ap.add_argument("--destroy", action="store_true", help="destroy after eval instead of stopping (also frees the disk)")
@@ -311,7 +339,21 @@ def main():
             # STALE local tracking ref, so on a REUSED box the same-box baseline built pre-merge code
             # (e.g. it measured main WITHOUT a just-merged PR). Strip any 'origin/' to the branch name.
             branch = args.ref.split("origin/", 1)[-1]
-            checkout = f"{reset}; git fetch -q origin '{branch}' && git checkout -qf FETCH_HEAD"
+            # Fetch + checkout, then VERIFY the resulting HEAD matches origin/<branch>.
+            # On a reused box with a stale local tree, a silent fetch failure left the box on
+            # a previous PR's commit (not main) — the same-box baseline then inflated every
+            # subsequent evaluation. The post-checkout guard catches this: if FETCH_HEAD ≠
+            # origin/<branch>, the fetch was a no-op on a disconnected remote, and the box
+            # must be re-cloned from scratch.
+            checkout = (
+                f"{reset}; git fetch -q origin '{branch}' && git checkout -qf FETCH_HEAD && "
+                f"if [ \"$(git rev-parse HEAD)\" != \"$(git rev-parse origin/{branch})\" ]; then "
+                f"echo '!! baseline checkout mismatch: HEAD != origin/{branch} — re-cloning'; "
+                f"cd / && rm -rf /root/sparkinfer && "
+                f"git clone -q {REPO} /root/sparkinfer && cd /root/sparkinfer && "
+                f"git fetch -q origin '{branch}' && git checkout -qf FETCH_HEAD; "
+                f"fi"
+            )
         # g++-12: nvcc 12.8 breaks against Ubuntu 24.04's GCC 13.3 libstdc++ (cstdio /__gnu_cxx
         # errors). The build pins CMAKE_CUDA_HOST_COMPILER=g++-12, so it must be present.
         setup = ("export DEBIAN_FRONTEND=noninteractive; "
@@ -324,6 +366,16 @@ def main():
         if sr.returncode:
             print(f">> setup rc={sr.returncode} — stdout/stderr tail (continuing):")
             sys.stdout.write((sr.stdout or "")[-1500:]); sys.stdout.write((sr.stderr or "")[-1500:])
+
+        # HF auth: write the token (from the local HF_TOKEN env, never committed) to the box's HF
+        # token file so all hf downloads authenticate — lifts anonymous rate limits + reaches the
+        # gated Qwen tokenizer repos. Sent in its own call so it never lands in a printed error tail.
+        hf_token = os.environ.get("HF_TOKEN", "").strip()
+        if hf_token:
+            sh(host, port, "mkdir -p ~/.cache/huggingface && "
+                           f"printf %s {shlex.quote(hf_token)} > ~/.cache/huggingface/token && "
+                           "chmod 600 ~/.cache/huggingface/token", timeout=30)
+            print(">> HF token configured on box (authenticated model downloads)")
 
         # Pre-cache the model in a nohup background job so SSH drops don't abort the download.
         # If the file is already present (reused box), this is instant. Otherwise we poll for the
@@ -357,6 +409,50 @@ def main():
             if not wait_model(host, port):
                 print("!! model download timed out — evaluate.sh will retry (may add time)")
 
+        if args.dual:
+            # Dual-model needs the Qwen3.6 GGUF too. Google Drive first (gdown handles the large-file
+            # confirm token) — HF is throttled to ~KB/s from many vast hosts; HF/curl are the fallback.
+            # Override the Drive id with MODEL36_GDRIVE_ID="" to disable. Separate dir from Qwen3 (the
+            # two models have different tokenizers); evaluate_dual.sh's primary MODELS_DIR defaults to
+            # <guard dir>36 (i.e. /workspace/models -> /workspace/models36).
+            P36_DIR  = "/workspace/models36"
+            P36_PATH = f"{P36_DIR}/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            P36_READY = "/tmp/sparkinfer_model36_ready"
+            P36_GDRIVE_ID = os.environ.get("MODEL36_GDRIVE_ID", "1Ayx_DYLnl1v5aKMiSGyO4KTmwVun2mVt")
+            p36 = (
+                f"if [ -f '{P36_PATH}' ]; then touch '{P36_READY}' && echo cached; "
+                f"elif [ -f '{P36_READY}' ]; then echo already_running; "
+                f"else mkdir -p {P36_DIR} && rm -f '{P36_READY}'; "
+                f"nohup bash -c '"
+                f"  gid=\"{P36_GDRIVE_ID}\"; "
+                f"  if [ -n \"$gid\" ]; then pip install -q gdown 2>>/tmp/dl36.log; "
+                f"    gdown --no-cookies -q \"$gid\" -O {P36_PATH}.part >>/tmp/dl36.log 2>&1; "
+                f"    sz=$(stat -c%s {P36_PATH}.part 2>/dev/null || echo 0); "
+                f"    if [ \"$sz\" -gt 15000000000 ]; then mv -f {P36_PATH}.part {P36_PATH}; "
+                f"    else echo \"gdrive failed (sz=$sz) -> HF\" >>/tmp/dl36.log; rm -f {P36_PATH}.part; fi; "
+                f"  fi; "
+                f"  [ -f {P36_PATH} ] "
+                f"  || HF_HUB_DISABLE_XET=1 hf download unsloth/Qwen3.6-35B-A3B-GGUF "
+                f"       Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --local-dir {P36_DIR} >>/tmp/dl36.log 2>&1 "
+                f"  || curl -fL -C - https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+                f"       -o {P36_PATH} >>/tmp/dl36.log 2>&1; "
+                f"  [ -f {P36_PATH} ] && touch {P36_READY}"
+                f"' >/dev/null 2>&1 & echo started; fi"
+            )
+            s36 = sh(host, port, p36, timeout=30).stdout.strip()
+            if s36 == "cached":
+                print(">> Qwen3.6 model already cached — skipping download")
+            else:
+                print(f">> Qwen3.6 model download started ({s36}) — polling ...")
+                deadline = time.time() + 3000
+                while time.time() < deadline:
+                    r = sh(host, port, f"test -f '{P36_READY}' && echo yes || echo no", timeout=60)
+                    if r.returncode == 0 and r.stdout.strip() == "yes":
+                        break
+                    time.sleep(20)
+                else:
+                    print("!! Qwen3.6 download slow — evaluate_dual.sh will retry (may add time)")
+
         # Reap any leftover reference server / runner from a previous PR on this kept-alive box —
         # a leaked llama-server holding port 8081 would make this PR's accuracy.sh fail to bind.
         sh(host, port, "pkill -f llama-server 2>/dev/null; pkill -f qwen3_gguf 2>/dev/null; sleep 1; true", timeout=30)
@@ -364,9 +460,48 @@ def main():
         # Trust: grade with the harness from the protected default branch, not the submission's copy.
         # The build still measures the PR's kernels/runtime/moe; only bench/scripts (the scoring code,
         # incl. label.py + accuracy*) is pinned to origin/main. Fail-closed (&&): no trusted harness -> no eval.
-        ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
-              f"SI_NO_CHECKOUT=1 MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
-              f"bench/scripts/evaluate.sh --ref {args.ref} --frontier {args.frontier} --ceiling {args.ceiling}")
+        # H1: a fresh, UNPREDICTABLE held-out prompt seed per eval so a PR can't overfit the in-repo
+        # prompt. The seed is echoed into the verdict (eval_seed) so the prompt stays reproducible.
+        eval_seed = os.urandom(8).hex()
+        print(f">> held-out eval prompt seed: {eval_seed}")
+        # Difficulty compensation ON (Option B): as the frontier pulls past llama.cpp each further %
+        # gain is harder, so label.py scales the label tier up (raw % + significance gate unchanged).
+        # Governance-tunable via SPARKINFER_DIFFICULTY_{K,REF,MAX}; applies from new evals onward.
+        if args.dual:
+            # Dual-model: score Qwen3.6 (primary) + guard Qwen3-30B (no-regression). The existing
+            # --guard-*-baseline are the Qwen3-30B guard (G_*); --p-* carry the Qwen3.6 scored target.
+            ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
+                  f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} "
+                  f"SPARKINFER_EVAL_MODE={args.eval_mode} "
+                  f"SPARKINFER_G_GUARD_128_BASELINE={args.guard_128_baseline or args.guard_2k_baseline} "
+                  f"SPARKINFER_G_GUARD_512_BASELINE={args.guard_512_baseline} "
+                  f"SPARKINFER_G_GUARD_4K_BASELINE={args.guard_4k_baseline} "
+                  f"SPARKINFER_G_GUARD_16K_BASELINE={args.guard_16k_baseline} "
+                  f"SPARKINFER_G_GUARD_32K_BASELINE={args.guard_32k_baseline} "
+                  f"SPARKINFER_P_GUARD_128_BASELINE={args.p_guard_128_baseline} "
+                  f"SPARKINFER_P_GUARD_512_BASELINE={args.p_guard_512_baseline} "
+                  f"SPARKINFER_P_GUARD_4K_BASELINE={args.p_guard_4k_baseline} "
+                  f"SPARKINFER_P_GUARD_16K_BASELINE={args.p_guard_16k_baseline} "
+                  f"SPARKINFER_P_GUARD_32K_BASELINE={args.p_guard_32k_baseline} "
+                  f"SPARKINFER_P_LLAMA_128_BASELINE={args.p_llama_128_baseline} "
+                  f"SPARKINFER_P_LLAMA_512_BASELINE={args.p_llama_512_baseline} "
+                  f"SPARKINFER_P_LLAMA_4K_BASELINE={args.p_llama_4k_baseline} "
+                  f"SPARKINFER_P_LLAMA_16K_BASELINE={args.p_llama_16k_baseline} "
+                  f"SPARKINFER_P_LLAMA_32K_BASELINE={args.p_llama_32k_baseline} "
+                  f"MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
+                  f"bench/scripts/evaluate_dual.sh --ref {args.ref} "
+                  f"--ceiling {args.ceiling}")
+        else:
+            ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
+                  f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} SPARKINFER_DIFFICULTY_BOOST=1 "
+                  f"SPARKINFER_EVAL_MODE={args.eval_mode} "
+                  f"SPARKINFER_GUARD_128_BASELINE={args.guard_128_baseline or args.guard_2k_baseline} "
+                  f"SPARKINFER_GUARD_512_BASELINE={args.guard_512_baseline} "
+                  f"SPARKINFER_GUARD_4K_BASELINE={args.guard_4k_baseline} "
+                  f"SPARKINFER_GUARD_16K_BASELINE={args.guard_16k_baseline} "
+                  f"SPARKINFER_GUARD_32K_BASELINE={args.guard_32k_baseline} "
+                  f"MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
+                  f"bench/scripts/evaluate.sh --ref {args.ref} --frontier {args.frontier} --ceiling {args.ceiling}")
         got_result = False
         r = sh(host, port, ev, timeout=10800)
         sys.stdout.write(r.stdout[-4000:])

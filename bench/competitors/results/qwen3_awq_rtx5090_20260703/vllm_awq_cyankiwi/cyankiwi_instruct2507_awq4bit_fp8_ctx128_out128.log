@@ -1,0 +1,34 @@
+INFO 07-03 16:29:29 [api_utils.py:273] non-default args: {'trust_remote_code': True, 'kv_cache_dtype': 'fp8_e4m3', 'max_model_len': 32768, 'enable_prefix_caching': False, 'gpu_memory_utilization': 0.9, 'quantization': 'awq', 'enable_lora': None, 'reasoning_parser_plugin': '', 'model': '/workspace/qwen_awq_bench/models/qwen3-awq-cyankiwi-instruct-2507'}
+INFO 07-03 16:29:29 [model.py:606] Resolved architecture: Qwen3MoeForCausalLM
+INFO 07-03 16:29:29 [model.py:1736] Using max model len 32768
+Traceback (most recent call last):
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/bin/vllm", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/entrypoints/cli/main.py", line 95, in main
+    args.dispatch_function(args)
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/entrypoints/cli/benchmark/latency.py", line 22, in cmd
+    main(args)
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/benchmarks/latency.py", line 88, in main
+    llm = LLM.from_engine_args(engine_args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/entrypoints/llm.py", line 389, in from_engine_args
+    return cls(**vars(engine_args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/entrypoints/llm.py", line 349, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 171, in from_engine_args
+    vllm_config = engine_args.create_engine_config(usage_context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/engine/arg_utils.py", line 1844, in create_engine_config
+    model_config = self.create_model_config()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/engine/arg_utils.py", line 1608, in create_model_config
+    return ModelConfig(
+           ^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/pydantic/_internal/_dataclasses.py", line 121, in __init__
+    s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+  Value error, Quantization method specified in the model config (compressed-tensors) does not match the quantization method specified in the `quantization` argument (awq). [type=value_error, input_value=ArgsKwargs((), {'model': ...nderer_num_workers': 1}), input_type=ArgsKwargs]
+    For further information visit https://errors.pydantic.dev/2.13/v/value_error

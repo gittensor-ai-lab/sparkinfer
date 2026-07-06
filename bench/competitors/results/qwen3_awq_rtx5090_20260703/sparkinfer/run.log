@@ -1,0 +1,1839 @@
+start Fri Jul  3 15:00:53 UTC 2026
+Fri Jul  3 15:00:53 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 595.71.05              Driver Version: 595.71.05      CUDA Version: 13.2     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 5090        On  |   00000000:08:00.0 Off |                  N/A |
+| 30%   40C    P8             15W /  525W |      95MiB /  32607MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+Hit:1 http://security.ubuntu.com/ubuntu noble-security InRelease
+Hit:2 http://archive.ubuntu.com/ubuntu noble InRelease
+Hit:3 http://archive.ubuntu.com/ubuntu noble-updates InRelease
+Hit:4 https://nvidia.github.io/libnvidia-container/stable/deb/amd64  InRelease
+Hit:5 http://archive.ubuntu.com/ubuntu noble-backports InRelease
+Hit:6 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu noble InRelease
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+wget is already the newest version (1.21.4-1ubuntu4.1).
+gnupg is already the newest version (2.4.4-2ubuntu17.4).
+gnupg set to manually installed.
+build-essential is already the newest version (12.10ubuntu1).
+git is already the newest version (1:2.43.0-1ubuntu7.3).
+The following additional packages will be installed:
+  cmake-data libarchive13t64 libjsoncpp25 librhash0 libuv1t64
+Suggested packages:
+  cmake-doc cmake-format elpa-cmake-mode lrzip
+The following NEW packages will be installed:
+  cmake cmake-data git-lfs libarchive13t64 libjsoncpp25 librhash0 libuv1t64
+  ninja-build
+The following packages will be upgraded:
+  ca-certificates
+1 upgraded, 8 newly installed, 0 to remove and 53 not upgraded.
+Need to get 18.2 MB of archives.
+After this operation, 62.3 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 ca-certificates all 20260601~24.04.1 [139 kB]
+Get:2 http://archive.ubuntu.com/ubuntu noble/main amd64 libuv1t64 amd64 1.48.0-1.1build1 [97.3 kB]
+Get:3 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libarchive13t64 amd64 3.7.2-2ubuntu0.7 [382 kB]
+Get:4 http://archive.ubuntu.com/ubuntu noble/main amd64 libjsoncpp25 amd64 1.9.5-6build1 [82.8 kB]
+Get:5 http://archive.ubuntu.com/ubuntu noble/main amd64 librhash0 amd64 1.4.3-3build1 [129 kB]
+Get:6 http://archive.ubuntu.com/ubuntu noble/main amd64 cmake-data all 3.28.3-1build7 [2155 kB]
+Get:7 http://archive.ubuntu.com/ubuntu noble/main amd64 cmake amd64 3.28.3-1build7 [11.2 MB]
+Get:8 http://archive.ubuntu.com/ubuntu noble-updates/universe amd64 git-lfs amd64 3.4.1-1ubuntu0.4 [3908 kB]
+Get:9 http://archive.ubuntu.com/ubuntu noble/universe amd64 ninja-build amd64 1.11.1-2 [129 kB]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 18.2 MB in 2s (9615 kB/s)
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 24600 files and directories currently installed.)
+Preparing to unpack .../0-ca-certificates_20260601~24.04.1_all.deb ...
+Unpacking ca-certificates (20260601~24.04.1) over (20240203) ...
+Selecting previously unselected package libuv1t64:amd64.
+Preparing to unpack .../1-libuv1t64_1.48.0-1.1build1_amd64.deb ...
+Unpacking libuv1t64:amd64 (1.48.0-1.1build1) ...
+Selecting previously unselected package libarchive13t64:amd64.
+Preparing to unpack .../2-libarchive13t64_3.7.2-2ubuntu0.7_amd64.deb ...
+Unpacking libarchive13t64:amd64 (3.7.2-2ubuntu0.7) ...
+Selecting previously unselected package libjsoncpp25:amd64.
+Preparing to unpack .../3-libjsoncpp25_1.9.5-6build1_amd64.deb ...
+Unpacking libjsoncpp25:amd64 (1.9.5-6build1) ...
+Selecting previously unselected package librhash0:amd64.
+Preparing to unpack .../4-librhash0_1.4.3-3build1_amd64.deb ...
+Unpacking librhash0:amd64 (1.4.3-3build1) ...
+Selecting previously unselected package cmake-data.
+Preparing to unpack .../5-cmake-data_3.28.3-1build7_all.deb ...
+Unpacking cmake-data (3.28.3-1build7) ...
+Selecting previously unselected package cmake.
+Preparing to unpack .../6-cmake_3.28.3-1build7_amd64.deb ...
+Unpacking cmake (3.28.3-1build7) ...
+Selecting previously unselected package git-lfs.
+Preparing to unpack .../7-git-lfs_3.4.1-1ubuntu0.4_amd64.deb ...
+Unpacking git-lfs (3.4.1-1ubuntu0.4) ...
+Selecting previously unselected package ninja-build.
+Preparing to unpack .../8-ninja-build_1.11.1-2_amd64.deb ...
+Unpacking ninja-build (1.11.1-2) ...
+Setting up libuv1t64:amd64 (1.48.0-1.1build1) ...
+Setting up ninja-build (1.11.1-2) ...
+Setting up ca-certificates (20260601~24.04.1) ...
+Updating certificates in /etc/ssl/certs...
+rehash: warning: skipping ca-certificates.crt,it does not contain exactly one certificate or CRL
+14 added, 39 removed; done.
+Setting up libjsoncpp25:amd64 (1.9.5-6build1) ...
+Setting up librhash0:amd64 (1.4.3-3build1) ...
+Setting up cmake-data (3.28.3-1build7) ...
+Setting up git-lfs (3.4.1-1ubuntu0.4) ...
+Setting up libarchive13t64:amd64 (3.7.2-2ubuntu0.7) ...
+Setting up cmake (3.28.3-1build7) ...
+Processing triggers for libc-bin (2.39-0ubuntu8.7) ...
+Processing triggers for ca-certificates (20260601~24.04.1) ...
+Updating certificates in /etc/ssl/certs...
+0 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+done.
+Selecting previously unselected package cuda-keyring.
+(Reading database ... 28062 files and directories currently installed.)
+Preparing to unpack /tmp/cuda-keyring.deb ...
+Unpacking cuda-keyring (1.1-1) ...
+Setting up cuda-keyring (1.1-1) ...
+Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease
+Hit:2 http://security.ubuntu.com/ubuntu noble-security InRelease
+Hit:3 http://archive.ubuntu.com/ubuntu noble-updates InRelease
+Hit:4 https://nvidia.github.io/libnvidia-container/stable/deb/amd64  InRelease
+Get:5 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  InRelease [1581 B]
+Hit:6 http://archive.ubuntu.com/ubuntu noble-backports InRelease
+Hit:7 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu noble InRelease
+Get:8 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  Packages [1645 kB]
+Fetched 1647 kB in 2s (1062 kB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+The following additional packages will be installed:
+  adwaita-icon-theme alsa-topology-conf alsa-ucm-conf at-spi2-common
+  at-spi2-core ca-certificates-java cuda-cccl-13-0
+  cuda-command-line-tools-13-0 cuda-compiler-13-0 cuda-crt-13-0
+  cuda-cudart-13-0 cuda-cudart-dev-13-0 cuda-culibos-dev-13-0
+  cuda-cuobjdump-13-0 cuda-cupti-13-0 cuda-cupti-dev-13-0 cuda-cuxxfilt-13-0
+  cuda-documentation-13-0 cuda-driver-dev-13-0 cuda-gdb-13-0
+  cuda-libraries-13-0 cuda-libraries-dev-13-0 cuda-nsight-13-0
+  cuda-nsight-compute-13-0 cuda-nsight-systems-13-0 cuda-nvcc-13-0
+  cuda-nvdisasm-13-0 cuda-nvml-dev-13-0 cuda-nvprune-13-0 cuda-nvrtc-13-0
+  cuda-nvrtc-dev-13-0 cuda-nvtx-13-0 cuda-opencl-13-0 cuda-profiler-api-13-0
+  cuda-sandbox-dev-13-0 cuda-sanitizer-13-0 cuda-toolkit-13-0-config-common
+  cuda-toolkit-13-config-common cuda-toolkit-config-common cuda-tools-13-0
+  cuda-visual-tools-13-0 dconf-gsettings-backend dconf-service default-jre
+  default-jre-headless fontconfig fontconfig-config fonts-dejavu-core
+  fonts-dejavu-extra fonts-dejavu-mono gds-tools-13-0
+  gsettings-desktop-schemas gtk-update-icon-cache hicolor-icon-theme
+  humanity-icon-theme java-common libasound2-data libasound2t64
+  libatk-bridge2.0-0t64 libatk-wrapper-java libatk-wrapper-java-jni
+  libatk1.0-0t64 libatspi2.0-0t64 libavahi-client3 libavahi-common-data
+  libavahi-common3 libcairo-gobject2 libcairo2 libcolord2 libcublas-13-0
+  libcublas-dev-13-0 libcufft-13-0 libcufft-dev-13-0 libcufile-13-0
+  libcufile-dev-13-0 libcups2t64 libcurand-13-0 libcurand-dev-13-0
+  libcusolver-13-0 libcusolver-dev-13-0 libcusparse-13-0 libcusparse-dev-13-0
+  libdatrie1 libdconf1 libdeflate0 libegl-mesa0 libegl1 libepoxy0
+  libfontconfig1 libfreetype6 libfribidi0 libgbm1 libgdk-pixbuf-2.0-0
+  libgdk-pixbuf2.0-bin libgdk-pixbuf2.0-common libgif7 libgl1-mesa-dri
+  libglx-mesa0 libgraphite2-3 libgtk-3-0t64 libgtk-3-bin libgtk-3-common
+  libharfbuzz0b libice6 libjbig0 libjpeg-turbo8 libjpeg8 liblcms2-2 liblerc4
+  libnpp-13-0 libnpp-dev-13-0 libnspr4 libnss3 libnuma1 libnvfatbin-13-0
+  libnvfatbin-dev-13-0 libnvjitlink-13-0 libnvjitlink-dev-13-0 libnvjpeg-13-0
+  libnvjpeg-dev-13-0 libnvptxcompiler-13-0 libnvvm-13-0 libopengl0
+  libpango-1.0-0 libpangocairo-1.0-0 libpangoft2-1.0-0 libpcsclite1
+  libpixman-1-0 libpng16-16t64 librsvg2-2 librsvg2-common libsharpyuv0 libsm6
+  libthai-data libthai0 libtiff6 libwayland-client0 libwayland-cursor0
+  libwayland-egl1 libwebp7 libxaw7 libxcb-cursor0 libxcb-icccm4 libxcb-image0
+  libxcb-keysyms1 libxcb-render-util0 libxcb-render0 libxcb-shape0
+  libxcb-util1 libxcb-xinerama0 libxcb-xinput0 libxcb-xkb1 libxcomposite1
+  libxcursor1 libxdamage1 libxfixes3 libxft2 libxi6 libxinerama1
+  libxkbcommon-x11-0 libxkbcommon0 libxkbfile1 libxmu6 libxpm4 libxrandr2
+  libxrender1 libxt6t64 libxtst6 libxv1 libxxf86dga1 mesa-libgallium
+  nsight-compute-2025.3.1 nsight-systems-2025.3.2 openjdk-21-jre
+  openjdk-21-jre-headless session-migration ubuntu-mono x11-common x11-utils
+  xkb-data
+Suggested packages:
+  alsa-utils libasound2-plugins colord cups-common gvfs liblcms2-utils pcscd
+  librsvg2-bin libnss-mdns fonts-ipafont-gothic fonts-ipafont-mincho
+  fonts-wqy-microhei | fonts-wqy-zenhei fonts-indic mesa-utils
+Recommended packages:
+  luit
+The following NEW packages will be installed:
+  adwaita-icon-theme alsa-topology-conf alsa-ucm-conf at-spi2-common
+  at-spi2-core ca-certificates-java cuda-cccl-13-0
+  cuda-command-line-tools-13-0 cuda-compiler-13-0 cuda-crt-13-0
+  cuda-cudart-13-0 cuda-cudart-dev-13-0 cuda-culibos-dev-13-0
+  cuda-cuobjdump-13-0 cuda-cupti-13-0 cuda-cupti-dev-13-0 cuda-cuxxfilt-13-0
+  cuda-documentation-13-0 cuda-driver-dev-13-0 cuda-gdb-13-0
+  cuda-libraries-13-0 cuda-libraries-dev-13-0 cuda-nsight-13-0
+  cuda-nsight-compute-13-0 cuda-nsight-systems-13-0 cuda-nvcc-13-0
+  cuda-nvdisasm-13-0 cuda-nvml-dev-13-0 cuda-nvprune-13-0 cuda-nvrtc-13-0
+  cuda-nvrtc-dev-13-0 cuda-nvtx-13-0 cuda-opencl-13-0 cuda-profiler-api-13-0
+  cuda-sandbox-dev-13-0 cuda-sanitizer-13-0 cuda-toolkit-13-0
+  cuda-toolkit-13-0-config-common cuda-toolkit-13-config-common
+  cuda-toolkit-config-common cuda-tools-13-0 cuda-visual-tools-13-0
+  dconf-gsettings-backend dconf-service default-jre default-jre-headless
+  fontconfig fontconfig-config fonts-dejavu-core fonts-dejavu-extra
+  fonts-dejavu-mono gds-tools-13-0 gsettings-desktop-schemas
+  gtk-update-icon-cache hicolor-icon-theme humanity-icon-theme java-common
+  libasound2-data libasound2t64 libatk-bridge2.0-0t64 libatk-wrapper-java
+  libatk-wrapper-java-jni libatk1.0-0t64 libatspi2.0-0t64 libavahi-client3
+  libavahi-common-data libavahi-common3 libcairo-gobject2 libcairo2 libcolord2
+  libcublas-13-0 libcublas-dev-13-0 libcufft-13-0 libcufft-dev-13-0
+  libcufile-13-0 libcufile-dev-13-0 libcups2t64 libcurand-13-0
+  libcurand-dev-13-0 libcusolver-13-0 libcusolver-dev-13-0 libcusparse-13-0
+  libcusparse-dev-13-0 libdatrie1 libdconf1 libdeflate0 libegl-mesa0 libegl1
+  libepoxy0 libfontconfig1 libfreetype6 libfribidi0 libgdk-pixbuf-2.0-0
+  libgdk-pixbuf2.0-bin libgdk-pixbuf2.0-common libgif7 libgraphite2-3
+  libgtk-3-0t64 libgtk-3-bin libgtk-3-common libharfbuzz0b libice6 libjbig0
+  libjpeg-turbo8 libjpeg8 liblcms2-2 liblerc4 libnpp-13-0 libnpp-dev-13-0
+  libnspr4 libnss3 libnuma1 libnvfatbin-13-0 libnvfatbin-dev-13-0
+  libnvjitlink-13-0 libnvjitlink-dev-13-0 libnvjpeg-13-0 libnvjpeg-dev-13-0
+  libnvptxcompiler-13-0 libnvvm-13-0 libopengl0 libpango-1.0-0
+  libpangocairo-1.0-0 libpangoft2-1.0-0 libpcsclite1 libpixman-1-0
+  libpng16-16t64 librsvg2-2 librsvg2-common libsharpyuv0 libsm6 libthai-data
+  libthai0 libtiff6 libwayland-client0 libwayland-cursor0 libwayland-egl1
+  libwebp7 libxaw7 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1
+  libxcb-render-util0 libxcb-render0 libxcb-shape0 libxcb-util1
+  libxcb-xinerama0 libxcb-xinput0 libxcb-xkb1 libxcomposite1 libxcursor1
+  libxdamage1 libxfixes3 libxft2 libxi6 libxinerama1 libxkbcommon-x11-0
+  libxkbcommon0 libxkbfile1 libxmu6 libxpm4 libxrandr2 libxrender1 libxt6t64
+  libxtst6 libxv1 libxxf86dga1 nsight-compute-2025.3.1 nsight-systems-2025.3.2
+  openjdk-21-jre openjdk-21-jre-headless session-migration ubuntu-mono
+  x11-common x11-utils xkb-data
+The following packages will be upgraded:
+  libgbm1 libgl1-mesa-dri libglx-mesa0 mesa-libgallium
+4 upgraded, 177 newly installed, 0 to remove and 49 not upgraded.
+Need to get 3367 MB of archives.
+After this operation, 6792 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu noble/main amd64 libfribidi0 amd64 1.0.13-3build1 [26.1 kB]
+Get:2 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 xkb-data all 2.41-2ubuntu1.1 [397 kB]
+Get:3 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libnuma1 amd64 2.0.18-1ubuntu0.24.04.1 [23.4 kB]
+Get:4 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libpng16-16t64 amd64 1.6.43-5ubuntu0.6 [189 kB]
+Get:5 http://archive.ubuntu.com/ubuntu noble/main amd64 libxkbcommon0 amd64 1.6.0-1build1 [122 kB]
+Get:6 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libgdk-pixbuf2.0-common all 2.42.10+dfsg-3ubuntu3.3 [8302 B]
+Get:7 http://archive.ubuntu.com/ubuntu noble/main amd64 libjpeg-turbo8 amd64 2.1.5-2ubuntu2 [150 kB]
+Get:8 http://archive.ubuntu.com/ubuntu noble/main amd64 libjpeg8 amd64 8c-2ubuntu11 [2148 B]
+Get:9 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libdeflate0 amd64 1.19-1build1.1 [43.9 kB]
+Get:10 http://archive.ubuntu.com/ubuntu noble/main amd64 libjbig0 amd64 2.1-6.1ubuntu2 [29.7 kB]
+Get:11 http://archive.ubuntu.com/ubuntu noble/main amd64 liblerc4 amd64 4.0.0+ds-4ubuntu2 [179 kB]
+Get:12 http://archive.ubuntu.com/ubuntu noble/main amd64 libsharpyuv0 amd64 1.3.2-0.4build3 [15.8 kB]
+Get:13 http://archive.ubuntu.com/ubuntu noble/main amd64 libwebp7 amd64 1.3.2-0.4build3 [230 kB]
+Get:14 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libtiff6 amd64 4.5.1+git230720-4ubuntu2.5 [200 kB]
+Get:15 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libgdk-pixbuf-2.0-0 amd64 2.42.10+dfsg-3ubuntu3.3 [147 kB]
+Get:16 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 gtk-update-icon-cache amd64 3.24.41-4ubuntu1.3 [51.9 kB]
+Get:17 http://archive.ubuntu.com/ubuntu noble/main amd64 hicolor-icon-theme all 0.17-2 [9976 B]
+Get:18 http://archive.ubuntu.com/ubuntu noble/main amd64 humanity-icon-theme all 0.6.16 [1282 kB]
+Get:19 http://archive.ubuntu.com/ubuntu noble/main amd64 ubuntu-mono all 24.04-0ubuntu1 [151 kB]
+Get:20 http://archive.ubuntu.com/ubuntu noble/main amd64 adwaita-icon-theme all 46.0-1 [723 kB]
+Get:21 http://archive.ubuntu.com/ubuntu noble/main amd64 alsa-topology-conf all 1.2.5.1-2 [15.5 kB]
+Get:22 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libasound2-data all 1.2.11-1ubuntu0.2 [21.3 kB]
+Get:23 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libasound2t64 amd64 1.2.11-1ubuntu0.2 [398 kB]
+Get:24 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 alsa-ucm-conf all 1.2.10-1ubuntu5.11 [69.3 kB]
+Get:25 http://archive.ubuntu.com/ubuntu noble/main amd64 at-spi2-common all 2.52.0-1build1 [8674 B]
+Get:26 http://archive.ubuntu.com/ubuntu noble/main amd64 libxi6 amd64 2:1.8.1-1build1 [32.4 kB]
+Get:27 http://archive.ubuntu.com/ubuntu noble/main amd64 libatspi2.0-0t64 amd64 2.52.0-1build1 [80.5 kB]
+Get:28 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-cccl-13-0 13.0.85-1 [1034 kB]
+Get:29 http://archive.ubuntu.com/ubuntu noble/main amd64 x11-common all 1:7.7+23ubuntu3 [21.7 kB]
+Get:30 http://archive.ubuntu.com/ubuntu noble/main amd64 libxtst6 amd64 2:1.2.3-1.1build1 [12.6 kB]
+Get:31 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libdconf1 amd64 0.40.0-4ubuntu0.1 [39.6 kB]
+Get:32 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 dconf-service amd64 0.40.0-4ubuntu0.1 [27.6 kB]
+Get:33 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 dconf-gsettings-backend amd64 0.40.0-4ubuntu0.1 [22.1 kB]
+Get:34 http://archive.ubuntu.com/ubuntu noble/main amd64 session-migration amd64 0.3.9build1 [9034 B]
+Get:35 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 gsettings-desktop-schemas all 46.1-0ubuntu1 [35.6 kB]
+Get:36 http://archive.ubuntu.com/ubuntu noble/main amd64 at-spi2-core amd64 2.52.0-1build1 [56.6 kB]
+Get:37 http://archive.ubuntu.com/ubuntu noble/main amd64 ca-certificates-java all 20240118 [11.6 kB]
+Get:38 http://archive.ubuntu.com/ubuntu noble/main amd64 java-common all 0.75+exp1 [6798 B]
+Get:39 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 liblcms2-2 amd64 2.14-2ubuntu0.1 [161 kB]
+Get:40 http://archive.ubuntu.com/ubuntu noble/main amd64 libnspr4 amd64 2:4.35-1.1build1 [117 kB]
+Get:41 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libnss3 amd64 2:3.98-1ubuntu0.2 [1445 kB]
+Get:42 http://archive.ubuntu.com/ubuntu noble/main amd64 libpcsclite1 amd64 2.0.3-1build1 [21.4 kB]
+Get:43 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 openjdk-21-jre-headless amd64 21.0.11+10-1~24.04.2 [46.5 MB]
+Get:44 http://archive.ubuntu.com/ubuntu noble/main amd64 default-jre-headless amd64 2:1.21-75+exp1 [3094 B]
+Get:45 http://archive.ubuntu.com/ubuntu noble/main amd64 libatk1.0-0t64 amd64 2.52.0-1build1 [55.3 kB]
+Get:46 http://archive.ubuntu.com/ubuntu noble/main amd64 libatk-bridge2.0-0t64 amd64 2.52.0-1build1 [66.0 kB]
+Get:47 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libfreetype6 amd64 2.13.2+dfsg-1ubuntu0.1 [402 kB]
+Get:48 http://archive.ubuntu.com/ubuntu noble/main amd64 fonts-dejavu-mono all 2.37-8 [502 kB]
+Get:49 http://archive.ubuntu.com/ubuntu noble/main amd64 fonts-dejavu-core all 2.37-8 [835 kB]
+Get:50 http://archive.ubuntu.com/ubuntu noble/main amd64 fontconfig-config amd64 2.15.0-1.1ubuntu2 [37.3 kB]
+Get:51 http://archive.ubuntu.com/ubuntu noble/main amd64 libfontconfig1 amd64 2.15.0-1.1ubuntu2 [139 kB]
+Get:52 http://archive.ubuntu.com/ubuntu noble/main amd64 libpixman-1-0 amd64 0.42.2-1build1 [279 kB]
+Get:53 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcb-render0 amd64 1.15-1ubuntu2 [16.2 kB]
+Get:54 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-cupti-13-0 13.0.85-1 [12.1 MB]
+Get:55 http://archive.ubuntu.com/ubuntu noble/main amd64 libxrender1 amd64 1:0.9.10-1.1build1 [19.0 kB]
+Get:56 http://archive.ubuntu.com/ubuntu noble/main amd64 libcairo2 amd64 1.18.0-3build1 [566 kB]
+Get:57 http://archive.ubuntu.com/ubuntu noble/main amd64 libcairo-gobject2 amd64 1.18.0-3build1 [127 kB]
+Get:58 http://archive.ubuntu.com/ubuntu noble/main amd64 libcolord2 amd64 1.4.7-1build2 [149 kB]
+Get:59 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libavahi-common-data amd64 0.8-13ubuntu6.2 [30.1 kB]
+Get:60 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libavahi-common3 amd64 0.8-13ubuntu6.2 [23.4 kB]
+Get:61 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libavahi-client3 amd64 0.8-13ubuntu6.2 [26.8 kB]
+Get:62 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libcups2t64 amd64 2.4.7-1.2ubuntu7.14 [274 kB]
+Get:63 http://archive.ubuntu.com/ubuntu noble/main amd64 libepoxy0 amd64 1.5.10-1build1 [220 kB]
+Get:64 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libgraphite2-3 amd64 1.3.14-2ubuntu0.24.04.1 [73.4 kB]
+Get:65 http://archive.ubuntu.com/ubuntu noble/main amd64 libharfbuzz0b amd64 8.3.0-2build2 [469 kB]
+Get:66 http://archive.ubuntu.com/ubuntu noble/main amd64 fontconfig amd64 2.15.0-1.1ubuntu2 [180 kB]
+Get:67 http://archive.ubuntu.com/ubuntu noble/main amd64 libthai-data all 0.1.29-2build1 [158 kB]
+Get:68 http://archive.ubuntu.com/ubuntu noble/main amd64 libdatrie1 amd64 0.2.13-3build1 [19.0 kB]
+Get:69 http://archive.ubuntu.com/ubuntu noble/main amd64 libthai0 amd64 0.1.29-2build1 [18.9 kB]
+Get:70 http://archive.ubuntu.com/ubuntu noble/main amd64 libpango-1.0-0 amd64 1.52.1+ds-1build1 [231 kB]
+Get:71 http://archive.ubuntu.com/ubuntu noble/main amd64 libpangoft2-1.0-0 amd64 1.52.1+ds-1build1 [42.5 kB]
+Get:72 http://archive.ubuntu.com/ubuntu noble/main amd64 libpangocairo-1.0-0 amd64 1.52.1+ds-1build1 [28.8 kB]
+Get:73 http://archive.ubuntu.com/ubuntu noble/main amd64 libwayland-client0 amd64 1.22.0-2.1build1 [26.4 kB]
+Get:74 http://archive.ubuntu.com/ubuntu noble/main amd64 libwayland-cursor0 amd64 1.22.0-2.1build1 [10.4 kB]
+Get:75 http://archive.ubuntu.com/ubuntu noble/main amd64 libwayland-egl1 amd64 1.22.0-2.1build1 [5628 B]
+Get:76 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcomposite1 amd64 1:0.4.5-1build3 [6320 B]
+Get:77 http://archive.ubuntu.com/ubuntu noble/main amd64 libxfixes3 amd64 1:6.0.0-2build1 [10.8 kB]
+Get:78 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcursor1 amd64 1:1.2.1-1build1 [20.7 kB]
+Get:79 http://archive.ubuntu.com/ubuntu noble/main amd64 libxdamage1 amd64 1:1.1.6-1build1 [6150 B]
+Get:80 http://archive.ubuntu.com/ubuntu noble/main amd64 libxinerama1 amd64 2:1.1.4-3build1 [6396 B]
+Get:81 http://archive.ubuntu.com/ubuntu noble/main amd64 libxrandr2 amd64 2:1.5.2-2build1 [19.7 kB]
+Get:82 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libgtk-3-common all 3.24.41-4ubuntu1.3 [1426 kB]
+Get:83 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libgtk-3-0t64 amd64 3.24.41-4ubuntu1.3 [2913 kB]
+Get:84 http://archive.ubuntu.com/ubuntu noble/main amd64 libgif7 amd64 5.2.2-1ubuntu1 [35.2 kB]
+Get:85 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 openjdk-21-jre amd64 21.0.11+10-1~24.04.2 [232 kB]
+Get:86 http://archive.ubuntu.com/ubuntu noble/main amd64 default-jre amd64 2:1.21-75+exp1 [922 B]
+Get:87 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcb-xinerama0 amd64 1.15-1ubuntu2 [5410 B]
+Get:88 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcb-icccm4 amd64 0.4.1-1.1build3 [10.8 kB]
+Get:89 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcb-util1 amd64 0.4.0-1build3 [10.7 kB]
+Get:90 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcb-image0 amd64 0.4.0-2build1 [10.8 kB]
+Get:91 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcb-keysyms1 amd64 0.4.0-1build4 [7956 B]
+Get:92 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcb-render-util0 amd64 0.3.9-1build4 [9608 B]
+Get:93 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcb-shape0 amd64 1.15-1ubuntu2 [6100 B]
+Get:94 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcb-xkb1 amd64 1.15-1ubuntu2 [32.3 kB]
+Get:95 http://archive.ubuntu.com/ubuntu noble/main amd64 libxkbcommon-x11-0 amd64 1.6.0-1build1 [14.5 kB]
+Get:96 http://archive.ubuntu.com/ubuntu noble/main amd64 libxcb-xinput0 amd64 1.15-1ubuntu2 [33.2 kB]
+Get:97 http://archive.ubuntu.com/ubuntu noble/universe amd64 libxcb-cursor0 amd64 0.1.4-1build1 [10.7 kB]
+Get:98 http://archive.ubuntu.com/ubuntu noble/main amd64 libopengl0 amd64 1.7.0-1build1 [32.8 kB]
+Get:99 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libgl1-mesa-dri amd64 25.2.8-0ubuntu0.24.04.2 [37.9 kB]
+Get:100 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libglx-mesa0 amd64 25.2.8-0ubuntu0.24.04.2 [110 kB]
+Get:101 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libgbm1 amd64 25.2.8-0ubuntu0.24.04.2 [34.2 kB]
+Get:102 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 mesa-libgallium amd64 25.2.8-0ubuntu0.24.04.2 [10.8 MB]
+Get:103 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libegl-mesa0 amd64 25.2.8-0ubuntu0.24.04.2 [117 kB]
+Get:104 http://archive.ubuntu.com/ubuntu noble/main amd64 libegl1 amd64 1.7.0-1build1 [28.7 kB]
+Get:105 http://archive.ubuntu.com/ubuntu noble/main amd64 fonts-dejavu-extra all 2.37-8 [1947 kB]
+Get:106 http://archive.ubuntu.com/ubuntu noble/main amd64 libice6 amd64 2:1.0.10-1build3 [41.4 kB]
+Get:107 http://archive.ubuntu.com/ubuntu noble/main amd64 libsm6 amd64 2:1.2.3-1build3 [15.7 kB]
+Get:108 http://archive.ubuntu.com/ubuntu noble/main amd64 libxt6t64 amd64 1:1.2.1-1.2build1 [171 kB]
+Get:109 http://archive.ubuntu.com/ubuntu noble/main amd64 libxmu6 amd64 2:1.1.3-3build2 [47.6 kB]
+Get:110 http://archive.ubuntu.com/ubuntu noble/main amd64 libxpm4 amd64 1:3.5.17-1build2 [36.5 kB]
+Get:111 http://archive.ubuntu.com/ubuntu noble/main amd64 libxaw7 amd64 2:1.0.14-1build2 [187 kB]
+Get:112 http://archive.ubuntu.com/ubuntu noble/main amd64 libxft2 amd64 2.3.6-1build1 [45.3 kB]
+Get:113 http://archive.ubuntu.com/ubuntu noble/main amd64 libxkbfile1 amd64 1:1.1.0-1build4 [70.0 kB]
+Get:114 http://archive.ubuntu.com/ubuntu noble/main amd64 libxv1 amd64 2:1.0.11-1.1build1 [10.7 kB]
+Get:115 http://archive.ubuntu.com/ubuntu noble/main amd64 libxxf86dga1 amd64 2:1.1.5-1build1 [11.6 kB]
+Get:116 http://archive.ubuntu.com/ubuntu noble/main amd64 x11-utils amd64 7.7+6build2 [189 kB]
+Get:117 http://archive.ubuntu.com/ubuntu noble/main amd64 libatk-wrapper-java all 0.40.0-3build2 [54.3 kB]
+Get:118 http://archive.ubuntu.com/ubuntu noble/main amd64 libatk-wrapper-java-jni amd64 0.40.0-3build2 [46.4 kB]
+Get:119 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libgdk-pixbuf2.0-bin amd64 2.42.10+dfsg-3ubuntu3.3 [13.9 kB]
+Get:120 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libgtk-3-bin amd64 3.24.41-4ubuntu1.3 [73.9 kB]
+Get:121 http://archive.ubuntu.com/ubuntu noble/main amd64 librsvg2-2 amd64 2.58.0+dfsg-1build1 [2135 kB]
+Get:122 http://archive.ubuntu.com/ubuntu noble/main amd64 librsvg2-common amd64 2.58.0+dfsg-1build1 [11.8 kB]
+Get:123 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-cupti-dev-13-0 13.0.85-1 [4049 kB]
+Get:124 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-nvdisasm-13-0 13.0.85-1 [4132 kB]
+Get:125 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-cuobjdump-13-0 13.0.85-1 [247 kB]
+Get:126 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-gdb-13-0 13.0.85-1 [27.0 MB]
+Get:127 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-nvtx-13-0 13.0.85-1 [97.3 kB]
+Get:128 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-sanitizer-13-0 13.0.85-1 [11.7 MB]
+Get:129 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-command-line-tools-13-0 13.0.3-1 [2530 B]
+Get:130 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-cuxxfilt-13-0 13.0.85-1 [192 kB]
+Get:131 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-toolkit-config-common 13.3.29-1 [17.4 kB]
+Get:132 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-toolkit-13-config-common 13.3.29-1 [17.4 kB]
+Get:133 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-toolkit-13-0-config-common 13.0.96-1 [17.3 kB]
+Get:134 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-cudart-13-0 13.0.96-1 [163 kB]
+Get:135 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-culibos-dev-13-0 13.0.85-1 [23.9 kB]
+Get:136 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-driver-dev-13-0 13.0.96-1 [30.3 kB]
+Get:137 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-cudart-dev-13-0 13.0.96-1 [1393 kB]
+Get:138 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libnvvm-13-0 13.0.88-1 [43.7 MB]
+Get:139 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-crt-13-0 13.0.88-1 [82.7 kB]
+Get:140 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libnvptxcompiler-13-0 13.0.88-1 [13.8 MB]
+Get:141 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-nvcc-13-0 13.0.88-1 [26.7 MB]
+Get:142 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-nvprune-13-0 13.0.85-1 [62.3 kB]
+Get:143 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-compiler-13-0 13.0.3-1 [2530 B]
+Get:144 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-documentation-13-0 13.0.85-1 [50.8 kB]
+Get:145 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-nvrtc-13-0 13.0.88-1 [64.1 MB]
+Get:146 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-opencl-13-0 13.0.85-1 [24.8 kB]
+Get:147 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcublas-13-0 13.1.1.3-1 [392 MB]
+Get:148 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcufft-13-0 12.0.0.61-1 [177 MB]
+Get:149 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcufile-13-0 1.15.1.6-1 [902 kB]
+Get:150 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcurand-13-0 10.4.0.35-1 [43.2 MB]
+Get:151 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcusolver-13-0 12.0.4.66-1 [163 MB]
+Get:152 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcusparse-13-0 12.6.3.3-1 [138 MB]
+Get:153 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libnpp-13-0 13.0.1.2-1 [121 MB]
+Get:154 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libnvjitlink-13-0 13.0.88-1 [29.4 MB]
+Get:155 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libnvfatbin-13-0 13.0.85-1 [757 kB]
+Get:156 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libnvjpeg-13-0 13.0.1.86-1 [3271 kB]
+Get:157 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-libraries-13-0 13.0.3-1 [2610 B]
+Get:158 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-profiler-api-13-0 13.0.85-1 [19.5 kB]
+Get:159 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-nvrtc-dev-13-0 13.0.88-1 [52.5 MB]
+Get:160 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-sandbox-dev-13-0 13.0.85-1 [32.8 kB]
+Get:161 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcublas-dev-13-0 13.1.1.3-1 [447 MB]
+Get:162 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcufft-dev-13-0 12.0.0.61-1 [177 MB]
+Get:163 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcufile-dev-13-0 1.15.1.6-1 [2722 kB]
+Get:164 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcurand-dev-13-0 10.4.0.35-1 [43.3 MB]
+Get:165 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcusolver-dev-13-0 12.0.4.66-1 [104 MB]
+Get:166 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libcusparse-dev-13-0 12.6.3.3-1 [141 MB]
+Get:167 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libnpp-dev-13-0 13.0.1.2-1 [119 MB]
+Get:168 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libnvjitlink-dev-13-0 13.0.88-1 [26.3 MB]
+Get:169 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libnvfatbin-dev-13-0 13.0.85-1 [635 kB]
+Get:170 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  libnvjpeg-dev-13-0 13.0.1.86-1 [3015 kB]
+Get:171 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-libraries-dev-13-0 13.0.3-1 [2658 B]
+Get:172 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-nsight-13-0 13.0.85-1 [119 MB]
+Get:173 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  nsight-compute-2025.3.1 2025.3.1.4-1 [314 MB]
+Get:174 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-nsight-compute-13-0 13.0.3-1 [3656 B]
+Get:175 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  nsight-systems-2025.3.2 2025.3.2.474-253236389321v0 [421 MB]
+Get:176 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-nsight-systems-13-0 13.0.3-1 [3348 B]
+Get:177 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-nvml-dev-13-0 13.0.87-1 [143 kB]
+Get:178 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-visual-tools-13-0 13.0.3-1 [2930 B]
+Get:179 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  gds-tools-13-0 1.15.1.6-1 [39.0 MB]
+Get:180 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-tools-13-0 13.0.3-1 [2462 B]
+Get:181 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64  cuda-toolkit-13-0 13.0.3-1 [3444 B]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 3367 MB in 3min 7s (18.1 MB/s)
+Selecting previously unselected package libfribidi0:amd64.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 28067 files and directories currently installed.)
+Preparing to unpack .../000-libfribidi0_1.0.13-3build1_amd64.deb ...
+Unpacking libfribidi0:amd64 (1.0.13-3build1) ...
+Selecting previously unselected package xkb-data.
+Preparing to unpack .../001-xkb-data_2.41-2ubuntu1.1_all.deb ...
+Unpacking xkb-data (2.41-2ubuntu1.1) ...
+Selecting previously unselected package libnuma1:amd64.
+Preparing to unpack .../002-libnuma1_2.0.18-1ubuntu0.24.04.1_amd64.deb ...
+Unpacking libnuma1:amd64 (2.0.18-1ubuntu0.24.04.1) ...
+Selecting previously unselected package libpng16-16t64:amd64.
+Preparing to unpack .../003-libpng16-16t64_1.6.43-5ubuntu0.6_amd64.deb ...
+Unpacking libpng16-16t64:amd64 (1.6.43-5ubuntu0.6) ...
+Selecting previously unselected package libxkbcommon0:amd64.
+Preparing to unpack .../004-libxkbcommon0_1.6.0-1build1_amd64.deb ...
+Unpacking libxkbcommon0:amd64 (1.6.0-1build1) ...
+Selecting previously unselected package libgdk-pixbuf2.0-common.
+Preparing to unpack .../005-libgdk-pixbuf2.0-common_2.42.10+dfsg-3ubuntu3.3_all.deb ...
+Unpacking libgdk-pixbuf2.0-common (2.42.10+dfsg-3ubuntu3.3) ...
+Selecting previously unselected package libjpeg-turbo8:amd64.
+Preparing to unpack .../006-libjpeg-turbo8_2.1.5-2ubuntu2_amd64.deb ...
+Unpacking libjpeg-turbo8:amd64 (2.1.5-2ubuntu2) ...
+Selecting previously unselected package libjpeg8:amd64.
+Preparing to unpack .../007-libjpeg8_8c-2ubuntu11_amd64.deb ...
+Unpacking libjpeg8:amd64 (8c-2ubuntu11) ...
+Selecting previously unselected package libdeflate0:amd64.
+Preparing to unpack .../008-libdeflate0_1.19-1build1.1_amd64.deb ...
+Unpacking libdeflate0:amd64 (1.19-1build1.1) ...
+Selecting previously unselected package libjbig0:amd64.
+Preparing to unpack .../009-libjbig0_2.1-6.1ubuntu2_amd64.deb ...
+Unpacking libjbig0:amd64 (2.1-6.1ubuntu2) ...
+Selecting previously unselected package liblerc4:amd64.
+Preparing to unpack .../010-liblerc4_4.0.0+ds-4ubuntu2_amd64.deb ...
+Unpacking liblerc4:amd64 (4.0.0+ds-4ubuntu2) ...
+Selecting previously unselected package libsharpyuv0:amd64.
+Preparing to unpack .../011-libsharpyuv0_1.3.2-0.4build3_amd64.deb ...
+Unpacking libsharpyuv0:amd64 (1.3.2-0.4build3) ...
+Selecting previously unselected package libwebp7:amd64.
+Preparing to unpack .../012-libwebp7_1.3.2-0.4build3_amd64.deb ...
+Unpacking libwebp7:amd64 (1.3.2-0.4build3) ...
+Selecting previously unselected package libtiff6:amd64.
+Preparing to unpack .../013-libtiff6_4.5.1+git230720-4ubuntu2.5_amd64.deb ...
+Unpacking libtiff6:amd64 (4.5.1+git230720-4ubuntu2.5) ...
+Selecting previously unselected package libgdk-pixbuf-2.0-0:amd64.
+Preparing to unpack .../014-libgdk-pixbuf-2.0-0_2.42.10+dfsg-3ubuntu3.3_amd64.deb ...
+Unpacking libgdk-pixbuf-2.0-0:amd64 (2.42.10+dfsg-3ubuntu3.3) ...
+Selecting previously unselected package gtk-update-icon-cache.
+Preparing to unpack .../015-gtk-update-icon-cache_3.24.41-4ubuntu1.3_amd64.deb ...
+Unpacking gtk-update-icon-cache (3.24.41-4ubuntu1.3) ...
+Selecting previously unselected package hicolor-icon-theme.
+Preparing to unpack .../016-hicolor-icon-theme_0.17-2_all.deb ...
+Unpacking hicolor-icon-theme (0.17-2) ...
+Selecting previously unselected package humanity-icon-theme.
+Preparing to unpack .../017-humanity-icon-theme_0.6.16_all.deb ...
+Unpacking humanity-icon-theme (0.6.16) ...
+Selecting previously unselected package ubuntu-mono.
+Preparing to unpack .../018-ubuntu-mono_24.04-0ubuntu1_all.deb ...
+Unpacking ubuntu-mono (24.04-0ubuntu1) ...
+Selecting previously unselected package adwaita-icon-theme.
+Preparing to unpack .../019-adwaita-icon-theme_46.0-1_all.deb ...
+Unpacking adwaita-icon-theme (46.0-1) ...
+Selecting previously unselected package alsa-topology-conf.
+Preparing to unpack .../020-alsa-topology-conf_1.2.5.1-2_all.deb ...
+Unpacking alsa-topology-conf (1.2.5.1-2) ...
+Selecting previously unselected package libasound2-data.
+Preparing to unpack .../021-libasound2-data_1.2.11-1ubuntu0.2_all.deb ...
+Unpacking libasound2-data (1.2.11-1ubuntu0.2) ...
+Selecting previously unselected package libasound2t64:amd64.
+Preparing to unpack .../022-libasound2t64_1.2.11-1ubuntu0.2_amd64.deb ...
+Unpacking libasound2t64:amd64 (1.2.11-1ubuntu0.2) ...
+Selecting previously unselected package alsa-ucm-conf.
+Preparing to unpack .../023-alsa-ucm-conf_1.2.10-1ubuntu5.11_all.deb ...
+Unpacking alsa-ucm-conf (1.2.10-1ubuntu5.11) ...
+Selecting previously unselected package at-spi2-common.
+Preparing to unpack .../024-at-spi2-common_2.52.0-1build1_all.deb ...
+Unpacking at-spi2-common (2.52.0-1build1) ...
+Selecting previously unselected package libxi6:amd64.
+Preparing to unpack .../025-libxi6_2%3a1.8.1-1build1_amd64.deb ...
+Unpacking libxi6:amd64 (2:1.8.1-1build1) ...
+Selecting previously unselected package libatspi2.0-0t64:amd64.
+Preparing to unpack .../026-libatspi2.0-0t64_2.52.0-1build1_amd64.deb ...
+Unpacking libatspi2.0-0t64:amd64 (2.52.0-1build1) ...
+Selecting previously unselected package x11-common.
+Preparing to unpack .../027-x11-common_1%3a7.7+23ubuntu3_all.deb ...
+Unpacking x11-common (1:7.7+23ubuntu3) ...
+Selecting previously unselected package libxtst6:amd64.
+Preparing to unpack .../028-libxtst6_2%3a1.2.3-1.1build1_amd64.deb ...
+Unpacking libxtst6:amd64 (2:1.2.3-1.1build1) ...
+Selecting previously unselected package libdconf1:amd64.
+Preparing to unpack .../029-libdconf1_0.40.0-4ubuntu0.1_amd64.deb ...
+Unpacking libdconf1:amd64 (0.40.0-4ubuntu0.1) ...
+Selecting previously unselected package dconf-service.
+Preparing to unpack .../030-dconf-service_0.40.0-4ubuntu0.1_amd64.deb ...
+Unpacking dconf-service (0.40.0-4ubuntu0.1) ...
+Selecting previously unselected package dconf-gsettings-backend:amd64.
+Preparing to unpack .../031-dconf-gsettings-backend_0.40.0-4ubuntu0.1_amd64.deb ...
+Unpacking dconf-gsettings-backend:amd64 (0.40.0-4ubuntu0.1) ...
+Selecting previously unselected package session-migration.
+Preparing to unpack .../032-session-migration_0.3.9build1_amd64.deb ...
+Unpacking session-migration (0.3.9build1) ...
+Selecting previously unselected package gsettings-desktop-schemas.
+Preparing to unpack .../033-gsettings-desktop-schemas_46.1-0ubuntu1_all.deb ...
+Unpacking gsettings-desktop-schemas (46.1-0ubuntu1) ...
+Selecting previously unselected package at-spi2-core.
+Preparing to unpack .../034-at-spi2-core_2.52.0-1build1_amd64.deb ...
+Unpacking at-spi2-core (2.52.0-1build1) ...
+Selecting previously unselected package ca-certificates-java.
+Preparing to unpack .../035-ca-certificates-java_20240118_all.deb ...
+Unpacking ca-certificates-java (20240118) ...
+Selecting previously unselected package cuda-cccl-13-0.
+Preparing to unpack .../036-cuda-cccl-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-cccl-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-cupti-13-0.
+Preparing to unpack .../037-cuda-cupti-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-cupti-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-cupti-dev-13-0.
+Preparing to unpack .../038-cuda-cupti-dev-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-cupti-dev-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-nvdisasm-13-0.
+Preparing to unpack .../039-cuda-nvdisasm-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-nvdisasm-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-cuobjdump-13-0.
+Preparing to unpack .../040-cuda-cuobjdump-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-cuobjdump-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-gdb-13-0.
+Preparing to unpack .../041-cuda-gdb-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-gdb-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-nvtx-13-0.
+Preparing to unpack .../042-cuda-nvtx-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-nvtx-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-sanitizer-13-0.
+Preparing to unpack .../043-cuda-sanitizer-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-sanitizer-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-command-line-tools-13-0.
+Preparing to unpack .../044-cuda-command-line-tools-13-0_13.0.3-1_amd64.deb ...
+Unpacking cuda-command-line-tools-13-0 (13.0.3-1) ...
+Selecting previously unselected package cuda-cuxxfilt-13-0.
+Preparing to unpack .../045-cuda-cuxxfilt-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-cuxxfilt-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-toolkit-config-common.
+Preparing to unpack .../046-cuda-toolkit-config-common_13.3.29-1_all.deb ...
+Unpacking cuda-toolkit-config-common (13.3.29-1) ...
+Selecting previously unselected package cuda-toolkit-13-config-common.
+Preparing to unpack .../047-cuda-toolkit-13-config-common_13.3.29-1_all.deb ...
+Unpacking cuda-toolkit-13-config-common (13.3.29-1) ...
+Selecting previously unselected package cuda-toolkit-13-0-config-common.
+Preparing to unpack .../048-cuda-toolkit-13-0-config-common_13.0.96-1_all.deb ...
+Unpacking cuda-toolkit-13-0-config-common (13.0.96-1) ...
+Selecting previously unselected package cuda-cudart-13-0.
+Preparing to unpack .../049-cuda-cudart-13-0_13.0.96-1_amd64.deb ...
+Unpacking cuda-cudart-13-0 (13.0.96-1) ...
+Selecting previously unselected package cuda-culibos-dev-13-0.
+Preparing to unpack .../050-cuda-culibos-dev-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-culibos-dev-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-driver-dev-13-0.
+Preparing to unpack .../051-cuda-driver-dev-13-0_13.0.96-1_amd64.deb ...
+Unpacking cuda-driver-dev-13-0 (13.0.96-1) ...
+Selecting previously unselected package cuda-cudart-dev-13-0.
+Preparing to unpack .../052-cuda-cudart-dev-13-0_13.0.96-1_amd64.deb ...
+Unpacking cuda-cudart-dev-13-0 (13.0.96-1) ...
+Selecting previously unselected package libnvvm-13-0.
+Preparing to unpack .../053-libnvvm-13-0_13.0.88-1_amd64.deb ...
+Unpacking libnvvm-13-0 (13.0.88-1) ...
+Selecting previously unselected package cuda-crt-13-0.
+Preparing to unpack .../054-cuda-crt-13-0_13.0.88-1_amd64.deb ...
+Unpacking cuda-crt-13-0 (13.0.88-1) ...
+Selecting previously unselected package libnvptxcompiler-13-0.
+Preparing to unpack .../055-libnvptxcompiler-13-0_13.0.88-1_amd64.deb ...
+Unpacking libnvptxcompiler-13-0 (13.0.88-1) ...
+Selecting previously unselected package cuda-nvcc-13-0.
+Preparing to unpack .../056-cuda-nvcc-13-0_13.0.88-1_amd64.deb ...
+Unpacking cuda-nvcc-13-0 (13.0.88-1) ...
+Selecting previously unselected package cuda-nvprune-13-0.
+Preparing to unpack .../057-cuda-nvprune-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-nvprune-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-compiler-13-0.
+Preparing to unpack .../058-cuda-compiler-13-0_13.0.3-1_amd64.deb ...
+Unpacking cuda-compiler-13-0 (13.0.3-1) ...
+Selecting previously unselected package cuda-documentation-13-0.
+Preparing to unpack .../059-cuda-documentation-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-documentation-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-nvrtc-13-0.
+Preparing to unpack .../060-cuda-nvrtc-13-0_13.0.88-1_amd64.deb ...
+Unpacking cuda-nvrtc-13-0 (13.0.88-1) ...
+Selecting previously unselected package cuda-opencl-13-0.
+Preparing to unpack .../061-cuda-opencl-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-opencl-13-0 (13.0.85-1) ...
+Selecting previously unselected package libcublas-13-0.
+Preparing to unpack .../062-libcublas-13-0_13.1.1.3-1_amd64.deb ...
+Unpacking libcublas-13-0 (13.1.1.3-1) ...
+Selecting previously unselected package libcufft-13-0.
+Preparing to unpack .../063-libcufft-13-0_12.0.0.61-1_amd64.deb ...
+Unpacking libcufft-13-0 (12.0.0.61-1) ...
+Selecting previously unselected package libcufile-13-0.
+Preparing to unpack .../064-libcufile-13-0_1.15.1.6-1_amd64.deb ...
+Unpacking libcufile-13-0 (1.15.1.6-1) ...
+Selecting previously unselected package libcurand-13-0.
+Preparing to unpack .../065-libcurand-13-0_10.4.0.35-1_amd64.deb ...
+Unpacking libcurand-13-0 (10.4.0.35-1) ...
+Selecting previously unselected package libcusolver-13-0.
+Preparing to unpack .../066-libcusolver-13-0_12.0.4.66-1_amd64.deb ...
+Unpacking libcusolver-13-0 (12.0.4.66-1) ...
+Selecting previously unselected package libcusparse-13-0.
+Preparing to unpack .../067-libcusparse-13-0_12.6.3.3-1_amd64.deb ...
+Unpacking libcusparse-13-0 (12.6.3.3-1) ...
+Selecting previously unselected package libnpp-13-0.
+Preparing to unpack .../068-libnpp-13-0_13.0.1.2-1_amd64.deb ...
+Unpacking libnpp-13-0 (13.0.1.2-1) ...
+Selecting previously unselected package libnvjitlink-13-0.
+Preparing to unpack .../069-libnvjitlink-13-0_13.0.88-1_amd64.deb ...
+Unpacking libnvjitlink-13-0 (13.0.88-1) ...
+Selecting previously unselected package libnvfatbin-13-0.
+Preparing to unpack .../070-libnvfatbin-13-0_13.0.85-1_amd64.deb ...
+Unpacking libnvfatbin-13-0 (13.0.85-1) ...
+Selecting previously unselected package libnvjpeg-13-0.
+Preparing to unpack .../071-libnvjpeg-13-0_13.0.1.86-1_amd64.deb ...
+Unpacking libnvjpeg-13-0 (13.0.1.86-1) ...
+Selecting previously unselected package cuda-libraries-13-0.
+Preparing to unpack .../072-cuda-libraries-13-0_13.0.3-1_amd64.deb ...
+Unpacking cuda-libraries-13-0 (13.0.3-1) ...
+Selecting previously unselected package cuda-profiler-api-13-0.
+Preparing to unpack .../073-cuda-profiler-api-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-profiler-api-13-0 (13.0.85-1) ...
+Selecting previously unselected package cuda-nvrtc-dev-13-0.
+Preparing to unpack .../074-cuda-nvrtc-dev-13-0_13.0.88-1_amd64.deb ...
+Unpacking cuda-nvrtc-dev-13-0 (13.0.88-1) ...
+Selecting previously unselected package cuda-sandbox-dev-13-0.
+Preparing to unpack .../075-cuda-sandbox-dev-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-sandbox-dev-13-0 (13.0.85-1) ...
+Selecting previously unselected package libcublas-dev-13-0.
+Preparing to unpack .../076-libcublas-dev-13-0_13.1.1.3-1_amd64.deb ...
+Unpacking libcublas-dev-13-0 (13.1.1.3-1) ...
+Selecting previously unselected package libcufft-dev-13-0.
+Preparing to unpack .../077-libcufft-dev-13-0_12.0.0.61-1_amd64.deb ...
+Unpacking libcufft-dev-13-0 (12.0.0.61-1) ...
+Selecting previously unselected package libcufile-dev-13-0.
+Preparing to unpack .../078-libcufile-dev-13-0_1.15.1.6-1_amd64.deb ...
+Unpacking libcufile-dev-13-0 (1.15.1.6-1) ...
+Selecting previously unselected package libcurand-dev-13-0.
+Preparing to unpack .../079-libcurand-dev-13-0_10.4.0.35-1_amd64.deb ...
+Unpacking libcurand-dev-13-0 (10.4.0.35-1) ...
+Selecting previously unselected package libcusolver-dev-13-0.
+Preparing to unpack .../080-libcusolver-dev-13-0_12.0.4.66-1_amd64.deb ...
+Unpacking libcusolver-dev-13-0 (12.0.4.66-1) ...
+Selecting previously unselected package libcusparse-dev-13-0.
+Preparing to unpack .../081-libcusparse-dev-13-0_12.6.3.3-1_amd64.deb ...
+Unpacking libcusparse-dev-13-0 (12.6.3.3-1) ...
+Selecting previously unselected package libnpp-dev-13-0.
+Preparing to unpack .../082-libnpp-dev-13-0_13.0.1.2-1_amd64.deb ...
+Unpacking libnpp-dev-13-0 (13.0.1.2-1) ...
+Selecting previously unselected package libnvjitlink-dev-13-0.
+Preparing to unpack .../083-libnvjitlink-dev-13-0_13.0.88-1_amd64.deb ...
+Unpacking libnvjitlink-dev-13-0 (13.0.88-1) ...
+Selecting previously unselected package libnvfatbin-dev-13-0.
+Preparing to unpack .../084-libnvfatbin-dev-13-0_13.0.85-1_amd64.deb ...
+Unpacking libnvfatbin-dev-13-0 (13.0.85-1) ...
+Selecting previously unselected package libnvjpeg-dev-13-0.
+Preparing to unpack .../085-libnvjpeg-dev-13-0_13.0.1.86-1_amd64.deb ...
+Unpacking libnvjpeg-dev-13-0 (13.0.1.86-1) ...
+Selecting previously unselected package cuda-libraries-dev-13-0.
+Preparing to unpack .../086-cuda-libraries-dev-13-0_13.0.3-1_amd64.deb ...
+Unpacking cuda-libraries-dev-13-0 (13.0.3-1) ...
+Selecting previously unselected package java-common.
+Preparing to unpack .../087-java-common_0.75+exp1_all.deb ...
+Unpacking java-common (0.75+exp1) ...
+Selecting previously unselected package liblcms2-2:amd64.
+Preparing to unpack .../088-liblcms2-2_2.14-2ubuntu0.1_amd64.deb ...
+Unpacking liblcms2-2:amd64 (2.14-2ubuntu0.1) ...
+Selecting previously unselected package libnspr4:amd64.
+Preparing to unpack .../089-libnspr4_2%3a4.35-1.1build1_amd64.deb ...
+Unpacking libnspr4:amd64 (2:4.35-1.1build1) ...
+Selecting previously unselected package libnss3:amd64.
+Preparing to unpack .../090-libnss3_2%3a3.98-1ubuntu0.2_amd64.deb ...
+Unpacking libnss3:amd64 (2:3.98-1ubuntu0.2) ...
+Selecting previously unselected package libpcsclite1:amd64.
+Preparing to unpack .../091-libpcsclite1_2.0.3-1build1_amd64.deb ...
+Unpacking libpcsclite1:amd64 (2.0.3-1build1) ...
+Selecting previously unselected package openjdk-21-jre-headless:amd64.
+Preparing to unpack .../092-openjdk-21-jre-headless_21.0.11+10-1~24.04.2_amd64.deb ...
+Unpacking openjdk-21-jre-headless:amd64 (21.0.11+10-1~24.04.2) ...
+Selecting previously unselected package default-jre-headless.
+Preparing to unpack .../093-default-jre-headless_2%3a1.21-75+exp1_amd64.deb ...
+Unpacking default-jre-headless (2:1.21-75+exp1) ...
+Selecting previously unselected package libatk1.0-0t64:amd64.
+Preparing to unpack .../094-libatk1.0-0t64_2.52.0-1build1_amd64.deb ...
+Unpacking libatk1.0-0t64:amd64 (2.52.0-1build1) ...
+Selecting previously unselected package libatk-bridge2.0-0t64:amd64.
+Preparing to unpack .../095-libatk-bridge2.0-0t64_2.52.0-1build1_amd64.deb ...
+Unpacking libatk-bridge2.0-0t64:amd64 (2.52.0-1build1) ...
+Selecting previously unselected package libfreetype6:amd64.
+Preparing to unpack .../096-libfreetype6_2.13.2+dfsg-1ubuntu0.1_amd64.deb ...
+Unpacking libfreetype6:amd64 (2.13.2+dfsg-1ubuntu0.1) ...
+Selecting previously unselected package fonts-dejavu-mono.
+Preparing to unpack .../097-fonts-dejavu-mono_2.37-8_all.deb ...
+Unpacking fonts-dejavu-mono (2.37-8) ...
+Selecting previously unselected package fonts-dejavu-core.
+Preparing to unpack .../098-fonts-dejavu-core_2.37-8_all.deb ...
+Unpacking fonts-dejavu-core (2.37-8) ...
+Selecting previously unselected package fontconfig-config.
+Preparing to unpack .../099-fontconfig-config_2.15.0-1.1ubuntu2_amd64.deb ...
+Unpacking fontconfig-config (2.15.0-1.1ubuntu2) ...
+Selecting previously unselected package libfontconfig1:amd64.
+Preparing to unpack .../100-libfontconfig1_2.15.0-1.1ubuntu2_amd64.deb ...
+Unpacking libfontconfig1:amd64 (2.15.0-1.1ubuntu2) ...
+Selecting previously unselected package libpixman-1-0:amd64.
+Preparing to unpack .../101-libpixman-1-0_0.42.2-1build1_amd64.deb ...
+Unpacking libpixman-1-0:amd64 (0.42.2-1build1) ...
+Selecting previously unselected package libxcb-render0:amd64.
+Preparing to unpack .../102-libxcb-render0_1.15-1ubuntu2_amd64.deb ...
+Unpacking libxcb-render0:amd64 (1.15-1ubuntu2) ...
+Selecting previously unselected package libxrender1:amd64.
+Preparing to unpack .../103-libxrender1_1%3a0.9.10-1.1build1_amd64.deb ...
+Unpacking libxrender1:amd64 (1:0.9.10-1.1build1) ...
+Selecting previously unselected package libcairo2:amd64.
+Preparing to unpack .../104-libcairo2_1.18.0-3build1_amd64.deb ...
+Unpacking libcairo2:amd64 (1.18.0-3build1) ...
+Selecting previously unselected package libcairo-gobject2:amd64.
+Preparing to unpack .../105-libcairo-gobject2_1.18.0-3build1_amd64.deb ...
+Unpacking libcairo-gobject2:amd64 (1.18.0-3build1) ...
+Selecting previously unselected package libcolord2:amd64.
+Preparing to unpack .../106-libcolord2_1.4.7-1build2_amd64.deb ...
+Unpacking libcolord2:amd64 (1.4.7-1build2) ...
+Selecting previously unselected package libavahi-common-data:amd64.
+Preparing to unpack .../107-libavahi-common-data_0.8-13ubuntu6.2_amd64.deb ...
+Unpacking libavahi-common-data:amd64 (0.8-13ubuntu6.2) ...
+Selecting previously unselected package libavahi-common3:amd64.
+Preparing to unpack .../108-libavahi-common3_0.8-13ubuntu6.2_amd64.deb ...
+Unpacking libavahi-common3:amd64 (0.8-13ubuntu6.2) ...
+Selecting previously unselected package libavahi-client3:amd64.
+Preparing to unpack .../109-libavahi-client3_0.8-13ubuntu6.2_amd64.deb ...
+Unpacking libavahi-client3:amd64 (0.8-13ubuntu6.2) ...
+Selecting previously unselected package libcups2t64:amd64.
+Preparing to unpack .../110-libcups2t64_2.4.7-1.2ubuntu7.14_amd64.deb ...
+Unpacking libcups2t64:amd64 (2.4.7-1.2ubuntu7.14) ...
+Selecting previously unselected package libepoxy0:amd64.
+Preparing to unpack .../111-libepoxy0_1.5.10-1build1_amd64.deb ...
+Unpacking libepoxy0:amd64 (1.5.10-1build1) ...
+Selecting previously unselected package libgraphite2-3:amd64.
+Preparing to unpack .../112-libgraphite2-3_1.3.14-2ubuntu0.24.04.1_amd64.deb ...
+Unpacking libgraphite2-3:amd64 (1.3.14-2ubuntu0.24.04.1) ...
+Selecting previously unselected package libharfbuzz0b:amd64.
+Preparing to unpack .../113-libharfbuzz0b_8.3.0-2build2_amd64.deb ...
+Unpacking libharfbuzz0b:amd64 (8.3.0-2build2) ...
+Selecting previously unselected package fontconfig.
+Preparing to unpack .../114-fontconfig_2.15.0-1.1ubuntu2_amd64.deb ...
+Unpacking fontconfig (2.15.0-1.1ubuntu2) ...
+Selecting previously unselected package libthai-data.
+Preparing to unpack .../115-libthai-data_0.1.29-2build1_all.deb ...
+Unpacking libthai-data (0.1.29-2build1) ...
+Selecting previously unselected package libdatrie1:amd64.
+Preparing to unpack .../116-libdatrie1_0.2.13-3build1_amd64.deb ...
+Unpacking libdatrie1:amd64 (0.2.13-3build1) ...
+Selecting previously unselected package libthai0:amd64.
+Preparing to unpack .../117-libthai0_0.1.29-2build1_amd64.deb ...
+Unpacking libthai0:amd64 (0.1.29-2build1) ...
+Selecting previously unselected package libpango-1.0-0:amd64.
+Preparing to unpack .../118-libpango-1.0-0_1.52.1+ds-1build1_amd64.deb ...
+Unpacking libpango-1.0-0:amd64 (1.52.1+ds-1build1) ...
+Selecting previously unselected package libpangoft2-1.0-0:amd64.
+Preparing to unpack .../119-libpangoft2-1.0-0_1.52.1+ds-1build1_amd64.deb ...
+Unpacking libpangoft2-1.0-0:amd64 (1.52.1+ds-1build1) ...
+Selecting previously unselected package libpangocairo-1.0-0:amd64.
+Preparing to unpack .../120-libpangocairo-1.0-0_1.52.1+ds-1build1_amd64.deb ...
+Unpacking libpangocairo-1.0-0:amd64 (1.52.1+ds-1build1) ...
+Selecting previously unselected package libwayland-client0:amd64.
+Preparing to unpack .../121-libwayland-client0_1.22.0-2.1build1_amd64.deb ...
+Unpacking libwayland-client0:amd64 (1.22.0-2.1build1) ...
+Selecting previously unselected package libwayland-cursor0:amd64.
+Preparing to unpack .../122-libwayland-cursor0_1.22.0-2.1build1_amd64.deb ...
+Unpacking libwayland-cursor0:amd64 (1.22.0-2.1build1) ...
+Selecting previously unselected package libwayland-egl1:amd64.
+Preparing to unpack .../123-libwayland-egl1_1.22.0-2.1build1_amd64.deb ...
+Unpacking libwayland-egl1:amd64 (1.22.0-2.1build1) ...
+Selecting previously unselected package libxcomposite1:amd64.
+Preparing to unpack .../124-libxcomposite1_1%3a0.4.5-1build3_amd64.deb ...
+Unpacking libxcomposite1:amd64 (1:0.4.5-1build3) ...
+Selecting previously unselected package libxfixes3:amd64.
+Preparing to unpack .../125-libxfixes3_1%3a6.0.0-2build1_amd64.deb ...
+Unpacking libxfixes3:amd64 (1:6.0.0-2build1) ...
+Selecting previously unselected package libxcursor1:amd64.
+Preparing to unpack .../126-libxcursor1_1%3a1.2.1-1build1_amd64.deb ...
+Unpacking libxcursor1:amd64 (1:1.2.1-1build1) ...
+Selecting previously unselected package libxdamage1:amd64.
+Preparing to unpack .../127-libxdamage1_1%3a1.1.6-1build1_amd64.deb ...
+Unpacking libxdamage1:amd64 (1:1.1.6-1build1) ...
+Selecting previously unselected package libxinerama1:amd64.
+Preparing to unpack .../128-libxinerama1_2%3a1.1.4-3build1_amd64.deb ...
+Unpacking libxinerama1:amd64 (2:1.1.4-3build1) ...
+Selecting previously unselected package libxrandr2:amd64.
+Preparing to unpack .../129-libxrandr2_2%3a1.5.2-2build1_amd64.deb ...
+Unpacking libxrandr2:amd64 (2:1.5.2-2build1) ...
+Selecting previously unselected package libgtk-3-common.
+Preparing to unpack .../130-libgtk-3-common_3.24.41-4ubuntu1.3_all.deb ...
+Unpacking libgtk-3-common (3.24.41-4ubuntu1.3) ...
+Selecting previously unselected package libgtk-3-0t64:amd64.
+Preparing to unpack .../131-libgtk-3-0t64_3.24.41-4ubuntu1.3_amd64.deb ...
+Unpacking libgtk-3-0t64:amd64 (3.24.41-4ubuntu1.3) ...
+Selecting previously unselected package libgif7:amd64.
+Preparing to unpack .../132-libgif7_5.2.2-1ubuntu1_amd64.deb ...
+Unpacking libgif7:amd64 (5.2.2-1ubuntu1) ...
+Selecting previously unselected package openjdk-21-jre:amd64.
+Preparing to unpack .../133-openjdk-21-jre_21.0.11+10-1~24.04.2_amd64.deb ...
+Unpacking openjdk-21-jre:amd64 (21.0.11+10-1~24.04.2) ...
+Selecting previously unselected package default-jre.
+Preparing to unpack .../134-default-jre_2%3a1.21-75+exp1_amd64.deb ...
+Unpacking default-jre (2:1.21-75+exp1) ...
+Selecting previously unselected package cuda-nsight-13-0.
+Preparing to unpack .../135-cuda-nsight-13-0_13.0.85-1_amd64.deb ...
+Unpacking cuda-nsight-13-0 (13.0.85-1) ...
+Selecting previously unselected package nsight-compute-2025.3.1.
+Preparing to unpack .../136-nsight-compute-2025.3.1_2025.3.1.4-1_amd64.deb ...
+Unpacking nsight-compute-2025.3.1 (2025.3.1.4-1) ...
+Selecting previously unselected package cuda-nsight-compute-13-0.
+Preparing to unpack .../137-cuda-nsight-compute-13-0_13.0.3-1_amd64.deb ...
+Unpacking cuda-nsight-compute-13-0 (13.0.3-1) ...
+Selecting previously unselected package libxcb-xinerama0:amd64.
+Preparing to unpack .../138-libxcb-xinerama0_1.15-1ubuntu2_amd64.deb ...
+Unpacking libxcb-xinerama0:amd64 (1.15-1ubuntu2) ...
+Selecting previously unselected package libxcb-icccm4:amd64.
+Preparing to unpack .../139-libxcb-icccm4_0.4.1-1.1build3_amd64.deb ...
+Unpacking libxcb-icccm4:amd64 (0.4.1-1.1build3) ...
+Selecting previously unselected package libxcb-util1:amd64.
+Preparing to unpack .../140-libxcb-util1_0.4.0-1build3_amd64.deb ...
+Unpacking libxcb-util1:amd64 (0.4.0-1build3) ...
+Selecting previously unselected package libxcb-image0:amd64.
+Preparing to unpack .../141-libxcb-image0_0.4.0-2build1_amd64.deb ...
+Unpacking libxcb-image0:amd64 (0.4.0-2build1) ...
+Selecting previously unselected package libxcb-keysyms1:amd64.
+Preparing to unpack .../142-libxcb-keysyms1_0.4.0-1build4_amd64.deb ...
+Unpacking libxcb-keysyms1:amd64 (0.4.0-1build4) ...
+Selecting previously unselected package libxcb-render-util0:amd64.
+Preparing to unpack .../143-libxcb-render-util0_0.3.9-1build4_amd64.deb ...
+Unpacking libxcb-render-util0:amd64 (0.3.9-1build4) ...
+Selecting previously unselected package libxcb-shape0:amd64.
+Preparing to unpack .../144-libxcb-shape0_1.15-1ubuntu2_amd64.deb ...
+Unpacking libxcb-shape0:amd64 (1.15-1ubuntu2) ...
+Selecting previously unselected package libxcb-xkb1:amd64.
+Preparing to unpack .../145-libxcb-xkb1_1.15-1ubuntu2_amd64.deb ...
+Unpacking libxcb-xkb1:amd64 (1.15-1ubuntu2) ...
+Selecting previously unselected package libxkbcommon-x11-0:amd64.
+Preparing to unpack .../146-libxkbcommon-x11-0_1.6.0-1build1_amd64.deb ...
+Unpacking libxkbcommon-x11-0:amd64 (1.6.0-1build1) ...
+Selecting previously unselected package libxcb-xinput0:amd64.
+Preparing to unpack .../147-libxcb-xinput0_1.15-1ubuntu2_amd64.deb ...
+Unpacking libxcb-xinput0:amd64 (1.15-1ubuntu2) ...
+Selecting previously unselected package libxcb-cursor0:amd64.
+Preparing to unpack .../148-libxcb-cursor0_0.1.4-1build1_amd64.deb ...
+Unpacking libxcb-cursor0:amd64 (0.1.4-1build1) ...
+Selecting previously unselected package libopengl0:amd64.
+Preparing to unpack .../149-libopengl0_1.7.0-1build1_amd64.deb ...
+Unpacking libopengl0:amd64 (1.7.0-1build1) ...
+Preparing to unpack .../150-libgl1-mesa-dri_25.2.8-0ubuntu0.24.04.2_amd64.deb ...
+Unpacking libgl1-mesa-dri:amd64 (25.2.8-0ubuntu0.24.04.2) over (25.2.8-0ubuntu0.24.04.1) ...
+Preparing to unpack .../151-libglx-mesa0_25.2.8-0ubuntu0.24.04.2_amd64.deb ...
+Unpacking libglx-mesa0:amd64 (25.2.8-0ubuntu0.24.04.2) over (25.2.8-0ubuntu0.24.04.1) ...
+Preparing to unpack .../152-libgbm1_25.2.8-0ubuntu0.24.04.2_amd64.deb ...
+Unpacking libgbm1:amd64 (25.2.8-0ubuntu0.24.04.2) over (25.2.8-0ubuntu0.24.04.1) ...
+Preparing to unpack .../153-mesa-libgallium_25.2.8-0ubuntu0.24.04.2_amd64.deb ...
+Unpacking mesa-libgallium:amd64 (25.2.8-0ubuntu0.24.04.2) over (25.2.8-0ubuntu0.24.04.1) ...
+Selecting previously unselected package libegl-mesa0:amd64.
+Preparing to unpack .../154-libegl-mesa0_25.2.8-0ubuntu0.24.04.2_amd64.deb ...
+Unpacking libegl-mesa0:amd64 (25.2.8-0ubuntu0.24.04.2) ...
+Selecting previously unselected package libegl1:amd64.
+Preparing to unpack .../155-libegl1_1.7.0-1build1_amd64.deb ...
+Unpacking libegl1:amd64 (1.7.0-1build1) ...
+Selecting previously unselected package nsight-systems-2025.3.2.
+Preparing to unpack .../156-nsight-systems-2025.3.2_2025.3.2.474-253236389321v0_amd64.deb ...
+Unpacking nsight-systems-2025.3.2 (2025.3.2.474-253236389321v0) ...
+Selecting previously unselected package cuda-nsight-systems-13-0.
+Preparing to unpack .../157-cuda-nsight-systems-13-0_13.0.3-1_amd64.deb ...
+Unpacking cuda-nsight-systems-13-0 (13.0.3-1) ...
+Selecting previously unselected package cuda-nvml-dev-13-0.
+Preparing to unpack .../158-cuda-nvml-dev-13-0_13.0.87-1_amd64.deb ...
+Unpacking cuda-nvml-dev-13-0 (13.0.87-1) ...
+Selecting previously unselected package cuda-visual-tools-13-0.
+Preparing to unpack .../159-cuda-visual-tools-13-0_13.0.3-1_amd64.deb ...
+Unpacking cuda-visual-tools-13-0 (13.0.3-1) ...
+Selecting previously unselected package gds-tools-13-0.
+Preparing to unpack .../160-gds-tools-13-0_1.15.1.6-1_amd64.deb ...
+Unpacking gds-tools-13-0 (1.15.1.6-1) ...
+Selecting previously unselected package cuda-tools-13-0.
+Preparing to unpack .../161-cuda-tools-13-0_13.0.3-1_amd64.deb ...
+Unpacking cuda-tools-13-0 (13.0.3-1) ...
+Selecting previously unselected package cuda-toolkit-13-0.
+Preparing to unpack .../162-cuda-toolkit-13-0_13.0.3-1_amd64.deb ...
+Unpacking cuda-toolkit-13-0 (13.0.3-1) ...
+Selecting previously unselected package fonts-dejavu-extra.
+Preparing to unpack .../163-fonts-dejavu-extra_2.37-8_all.deb ...
+Unpacking fonts-dejavu-extra (2.37-8) ...
+Selecting previously unselected package libice6:amd64.
+Preparing to unpack .../164-libice6_2%3a1.0.10-1build3_amd64.deb ...
+Unpacking libice6:amd64 (2:1.0.10-1build3) ...
+Selecting previously unselected package libsm6:amd64.
+Preparing to unpack .../165-libsm6_2%3a1.2.3-1build3_amd64.deb ...
+Unpacking libsm6:amd64 (2:1.2.3-1build3) ...
+Selecting previously unselected package libxt6t64:amd64.
+Preparing to unpack .../166-libxt6t64_1%3a1.2.1-1.2build1_amd64.deb ...
+Unpacking libxt6t64:amd64 (1:1.2.1-1.2build1) ...
+Selecting previously unselected package libxmu6:amd64.
+Preparing to unpack .../167-libxmu6_2%3a1.1.3-3build2_amd64.deb ...
+Unpacking libxmu6:amd64 (2:1.1.3-3build2) ...
+Selecting previously unselected package libxpm4:amd64.
+Preparing to unpack .../168-libxpm4_1%3a3.5.17-1build2_amd64.deb ...
+Unpacking libxpm4:amd64 (1:3.5.17-1build2) ...
+Selecting previously unselected package libxaw7:amd64.
+Preparing to unpack .../169-libxaw7_2%3a1.0.14-1build2_amd64.deb ...
+Unpacking libxaw7:amd64 (2:1.0.14-1build2) ...
+Selecting previously unselected package libxft2:amd64.
+Preparing to unpack .../170-libxft2_2.3.6-1build1_amd64.deb ...
+Unpacking libxft2:amd64 (2.3.6-1build1) ...
+Selecting previously unselected package libxkbfile1:amd64.
+Preparing to unpack .../171-libxkbfile1_1%3a1.1.0-1build4_amd64.deb ...
+Unpacking libxkbfile1:amd64 (1:1.1.0-1build4) ...
+Selecting previously unselected package libxv1:amd64.
+Preparing to unpack .../172-libxv1_2%3a1.0.11-1.1build1_amd64.deb ...
+Unpacking libxv1:amd64 (2:1.0.11-1.1build1) ...
+Selecting previously unselected package libxxf86dga1:amd64.
+Preparing to unpack .../173-libxxf86dga1_2%3a1.1.5-1build1_amd64.deb ...
+Unpacking libxxf86dga1:amd64 (2:1.1.5-1build1) ...
+Selecting previously unselected package x11-utils.
+Preparing to unpack .../174-x11-utils_7.7+6build2_amd64.deb ...
+Unpacking x11-utils (7.7+6build2) ...
+Selecting previously unselected package libatk-wrapper-java.
+Preparing to unpack .../175-libatk-wrapper-java_0.40.0-3build2_all.deb ...
+Unpacking libatk-wrapper-java (0.40.0-3build2) ...
+Selecting previously unselected package libatk-wrapper-java-jni:amd64.
+Preparing to unpack .../176-libatk-wrapper-java-jni_0.40.0-3build2_amd64.deb ...
+Unpacking libatk-wrapper-java-jni:amd64 (0.40.0-3build2) ...
+Selecting previously unselected package libgdk-pixbuf2.0-bin.
+Preparing to unpack .../177-libgdk-pixbuf2.0-bin_2.42.10+dfsg-3ubuntu3.3_amd64.deb ...
+Unpacking libgdk-pixbuf2.0-bin (2.42.10+dfsg-3ubuntu3.3) ...
+Selecting previously unselected package libgtk-3-bin.
+Preparing to unpack .../178-libgtk-3-bin_3.24.41-4ubuntu1.3_amd64.deb ...
+Unpacking libgtk-3-bin (3.24.41-4ubuntu1.3) ...
+Selecting previously unselected package librsvg2-2:amd64.
+Preparing to unpack .../179-librsvg2-2_2.58.0+dfsg-1build1_amd64.deb ...
+Unpacking librsvg2-2:amd64 (2.58.0+dfsg-1build1) ...
+Selecting previously unselected package librsvg2-common:amd64.
+Preparing to unpack .../180-librsvg2-common_2.58.0+dfsg-1build1_amd64.deb ...
+Unpacking librsvg2-common:amd64 (2.58.0+dfsg-1build1) ...
+Setting up cuda-toolkit-config-common (13.3.29-1) ...
+Setting up libgraphite2-3:amd64 (1.3.14-2ubuntu0.24.04.1) ...
+Setting up liblcms2-2:amd64 (2.14-2ubuntu0.1) ...
+Setting up libpixman-1-0:amd64 (0.42.2-1build1) ...
+Setting up libsharpyuv0:amd64 (1.3.2-0.4build3) ...
+Setting up cuda-sandbox-dev-13-0 (13.0.85-1) ...
+Setting up mesa-libgallium:amd64 (25.2.8-0ubuntu0.24.04.2) ...
+Setting up session-migration (0.3.9build1) ...
+Created symlink /etc/systemd/user/graphical-session-pre.target.wants/session-migration.service → /usr/lib/systemd/user/session-migration.service.
+Setting up cuda-documentation-13-0 (13.0.85-1) ...
+Setting up libxdamage1:amd64 (1:1.1.6-1build1) ...
+Setting up cuda-nvtx-13-0 (13.0.85-1) ...
+Setting up liblerc4:amd64 (4.0.0+ds-4ubuntu2) ...
+Setting up libxpm4:amd64 (1:3.5.17-1build2) ...
+Setting up hicolor-icon-theme (0.17-2) ...
+Setting up libxi6:amd64 (2:1.8.1-1build1) ...
+Setting up java-common (0.75+exp1) ...
+Setting up libxcb-xinput0:amd64 (1.15-1ubuntu2) ...
+Setting up libxrender1:amd64 (1:0.9.10-1.1build1) ...
+Setting up libdatrie1:amd64 (0.2.13-3build1) ...
+Setting up libgbm1:amd64 (25.2.8-0ubuntu0.24.04.2) ...
+Setting up libxcb-render0:amd64 (1.15-1ubuntu2) ...
+Setting up libgl1-mesa-dri:amd64 (25.2.8-0ubuntu0.24.04.2) ...
+Setting up libgdk-pixbuf2.0-common (2.42.10+dfsg-3ubuntu3.3) ...
+Setting up libxcb-keysyms1:amd64 (0.4.0-1build4) ...
+Setting up libxcb-shape0:amd64 (1.15-1ubuntu2) ...
+Setting up x11-common (1:7.7+23ubuntu3) ...
+invoke-rc.d: could not determine current runlevel
+invoke-rc.d: policy-rc.d denied execution of start.
+Setting up libxxf86dga1:amd64 (2:1.1.5-1build1) ...
+Setting up libdeflate0:amd64 (1.19-1build1.1) ...
+Setting up libxcb-render-util0:amd64 (0.3.9-1build4) ...
+Setting up xkb-data (2.41-2ubuntu1.1) ...
+Setting up libxcb-icccm4:amd64 (0.4.1-1.1build3) ...
+Setting up cuda-nvprune-13-0 (13.0.85-1) ...
+Setting up libjbig0:amd64 (2.1-6.1ubuntu2) ...
+Setting up cuda-toolkit-13-config-common (13.3.29-1) ...
+Setting up libcolord2:amd64 (1.4.7-1build2) ...
+Setting up libopengl0:amd64 (1.7.0-1build1) ...
+Setting up libxcb-util1:amd64 (0.4.0-1build3) ...
+Setting up libxcb-xkb1:amd64 (1.15-1ubuntu2) ...
+Setting up libxcb-image0:amd64 (0.4.0-2build1) ...
+Setting up cuda-cuxxfilt-13-0 (13.0.85-1) ...
+Setting up libdconf1:amd64 (0.40.0-4ubuntu0.1) ...
+Setting up libasound2-data (1.2.11-1ubuntu0.2) ...
+Setting up cuda-cuobjdump-13-0 (13.0.85-1) ...
+Setting up cuda-nvml-dev-13-0 (13.0.87-1) ...
+Setting up nsight-compute-2025.3.1 (2025.3.1.4-1) ...
+Setting up libxcb-xinerama0:amd64 (1.15-1ubuntu2) ...
+Setting up cuda-sanitizer-13-0 (13.0.85-1) ...
+Setting up libasound2t64:amd64 (1.2.11-1ubuntu0.2) ...
+Setting up libepoxy0:amd64 (1.5.10-1build1) ...
+Setting up libnspr4:amd64 (2:4.35-1.1build1) ...
+Setting up libxfixes3:amd64 (1:6.0.0-2build1) ...
+Setting up libxcb-cursor0:amd64 (0.1.4-1build1) ...
+Setting up libavahi-common-data:amd64 (0.8-13ubuntu6.2) ...
+Setting up libatspi2.0-0t64:amd64 (2.52.0-1build1) ...
+Setting up cuda-cccl-13-0 (13.0.85-1) ...
+Setting up libfribidi0:amd64 (1.0.13-3build1) ...
+Setting up libxinerama1:amd64 (2:1.1.4-3build1) ...
+Setting up cuda-culibos-dev-13-0 (13.0.85-1) ...
+Setting up libxv1:amd64 (2:1.0.11-1.1build1) ...
+Setting up fonts-dejavu-mono (2.37-8) ...
+Setting up libpng16-16t64:amd64 (1.6.43-5ubuntu0.6) ...
+Setting up cuda-nvdisasm-13-0 (13.0.85-1) ...
+Setting up libxrandr2:amd64 (2:1.5.2-2build1) ...
+Setting up fonts-dejavu-core (2.37-8) ...
+Setting up cuda-nvrtc-13-0 (13.0.88-1) ...
+Setting up libpcsclite1:amd64 (2.0.3-1build1) ...
+Setting up libjpeg-turbo8:amd64 (2.1.5-2ubuntu2) ...
+Setting up libwebp7:amd64 (1.3.2-0.4build3) ...
+Setting up cuda-toolkit-13-0-config-common (13.0.96-1) ...
+Setting alternatives
+update-alternatives: using /usr/local/cuda-13.0 to provide /usr/local/cuda (cuda) in auto mode
+update-alternatives: using /usr/local/cuda-13.0 to provide /usr/local/cuda-13 (cuda-13) in auto mode
+Setting up libnvptxcompiler-13-0 (13.0.88-1) ...
+Setting up libgif7:amd64 (5.2.2-1ubuntu1) ...
+Setting up fonts-dejavu-extra (2.37-8) ...
+Setting up libnuma1:amd64 (2.0.18-1ubuntu0.24.04.1) ...
+Setting up cuda-cupti-13-0 (13.0.85-1) ...
+Setting up alsa-topology-conf (1.2.5.1-2) ...
+Setting up at-spi2-common (2.52.0-1build1) ...
+Setting up libthai-data (0.1.29-2build1) ...
+Setting up libwayland-egl1:amd64 (1.22.0-2.1build1) ...
+Setting up libxkbfile1:amd64 (1:1.1.0-1build4) ...
+Setting up cuda-cupti-dev-13-0 (13.0.85-1) ...
+Setting up ca-certificates-java (20240118) ...
+No JRE found. Skipping Java certificates setup.
+Setting up cuda-driver-dev-13-0 (13.0.96-1) ...
+Setting up cuda-gdb-13-0 (13.0.85-1) ...
+Setting up libxcomposite1:amd64 (1:0.4.5-1build3) ...
+Setting up libnpp-13-0 (13.0.1.2-1) ...
+Setting up libcublas-13-0 (13.1.1.3-1) ...
+Setting up libxkbcommon0:amd64 (1.6.0-1build1) ...
+Setting up cuda-profiler-api-13-0 (13.0.85-1) ...
+Setting up libwayland-client0:amd64 (1.22.0-2.1build1) ...
+Setting up libjpeg8:amd64 (8c-2ubuntu11) ...
+Setting up cuda-command-line-tools-13-0 (13.0.3-1) ...
+Setting up libnpp-dev-13-0 (13.0.1.2-1) ...
+Setting up libice6:amd64 (2:1.0.10-1build3) ...
+Setting up libglx-mesa0:amd64 (25.2.8-0ubuntu0.24.04.2) ...
+Setting up cuda-opencl-13-0 (13.0.85-1) ...
+Setting up libatk1.0-0t64:amd64 (2.52.0-1build1) ...
+Setting up libnvvm-13-0 (13.0.88-1) ...
+Setting up libcusolver-13-0 (12.0.4.66-1) ...
+Setting up alsa-ucm-conf (1.2.10-1ubuntu5.11) ...
+Setting up libnvfatbin-13-0 (13.0.85-1) ...
+Setting up fontconfig-config (2.15.0-1.1ubuntu2) ...
+Setting up libxtst6:amd64 (2:1.2.3-1.1build1) ...
+Setting up cuda-cudart-13-0 (13.0.96-1) ...
+Setting up libcufile-13-0 (1.15.1.6-1) ...
+Setting alternatives
+update-alternatives: using /usr/local/cuda-13.0/gds/cufile.json to provide /etc/cufile.json (cufile.json) in auto mode
+Setting up libxcursor1:amd64 (1:1.2.1-1build1) ...
+Setting up libavahi-common3:amd64 (0.8-13ubuntu6.2) ...
+Setting up libcurand-13-0 (10.4.0.35-1) ...
+Setting up cuda-nvrtc-dev-13-0 (13.0.88-1) ...
+Setting up dconf-service (0.40.0-4ubuntu0.1) ...
+Setting up libnss3:amd64 (2:3.98-1ubuntu0.2) ...
+Setting up cuda-nsight-compute-13-0 (13.0.3-1) ...
+Setting up libnvfatbin-dev-13-0 (13.0.85-1) ...
+Setting up libnvjpeg-13-0 (13.0.1.86-1) ...
+Setting up libthai0:amd64 (0.1.29-2build1) ...
+Setting up libcufft-13-0 (12.0.0.61-1) ...
+Setting up gds-tools-13-0 (1.15.1.6-1) ...
+Setting up libegl-mesa0:amd64 (25.2.8-0ubuntu0.24.04.2) ...
+Setting up libcublas-dev-13-0 (13.1.1.3-1) ...
+Setting up libcufile-dev-13-0 (1.15.1.6-1) ...
+Setting up libfreetype6:amd64 (2.13.2+dfsg-1ubuntu0.1) ...
+Setting up libnvjitlink-13-0 (13.0.88-1) ...
+Setting up libnvjpeg-dev-13-0 (13.0.1.86-1) ...
+Setting up libxkbcommon-x11-0:amd64 (1.6.0-1build1) ...
+Setting up libcusparse-13-0 (12.6.3.3-1) ...
+Setting up cuda-cudart-dev-13-0 (13.0.96-1) ...
+Setting up libtiff6:amd64 (4.5.1+git230720-4ubuntu2.5) ...
+Setting up libwayland-cursor0:amd64 (1.22.0-2.1build1) ...
+Setting up libegl1:amd64 (1.7.0-1build1) ...
+Setting up libharfbuzz0b:amd64 (8.3.0-2build2) ...
+Setting up libgdk-pixbuf-2.0-0:amd64 (2.42.10+dfsg-3ubuntu3.3) ...
+Setting up libsm6:amd64 (2:1.2.3-1build3) ...
+Setting up libcufft-dev-13-0 (12.0.0.61-1) ...
+Setting up libavahi-client3:amd64 (0.8-13ubuntu6.2) ...
+Setting up libcurand-dev-13-0 (10.4.0.35-1) ...
+Setting up libatk-bridge2.0-0t64:amd64 (2.52.0-1build1) ...
+Setting up libcusparse-dev-13-0 (12.6.3.3-1) ...
+Setting up gtk-update-icon-cache (3.24.41-4ubuntu1.3) ...
+Setting up libcusolver-dev-13-0 (12.0.4.66-1) ...
+Setting up openjdk-21-jre-headless:amd64 (21.0.11+10-1~24.04.2) ...
+update-alternatives: using /usr/lib/jvm/java-21-openjdk-amd64/bin/java to provide /usr/bin/java (java) in auto mode
+update-alternatives: using /usr/lib/jvm/java-21-openjdk-amd64/bin/jpackage to provide /usr/bin/jpackage (jpackage) in auto mode
+update-alternatives: using /usr/lib/jvm/java-21-openjdk-amd64/bin/keytool to provide /usr/bin/keytool (keytool) in auto mode
+update-alternatives: using /usr/lib/jvm/java-21-openjdk-amd64/bin/rmiregistry to provide /usr/bin/rmiregistry (rmiregistry) in auto mode
+update-alternatives: using /usr/lib/jvm/java-21-openjdk-amd64/lib/jexec to provide /usr/bin/jexec (jexec) in auto mode
+Setting up libnvjitlink-dev-13-0 (13.0.88-1) ...
+Setting up dconf-gsettings-backend:amd64 (0.40.0-4ubuntu0.1) ...
+Setting up cuda-libraries-13-0 (13.0.3-1) ...
+Setting up cuda-crt-13-0 (13.0.88-1) ...
+Setting up libxt6t64:amd64 (1:1.2.1-1.2build1) ...
+Setting up libgdk-pixbuf2.0-bin (2.42.10+dfsg-3ubuntu3.3) ...
+Setting up cuda-libraries-dev-13-0 (13.0.3-1) ...
+Setting up libcups2t64:amd64 (2.4.7-1.2ubuntu7.14) ...
+Setting up libgtk-3-common (3.24.41-4ubuntu1.3) ...
+Setting up gsettings-desktop-schemas (46.1-0ubuntu1) ...
+Setting up libxmu6:amd64 (2:1.1.3-3build2) ...
+Setting up cuda-nvcc-13-0 (13.0.88-1) ...
+Setting up libxaw7:amd64 (2:1.0.14-1build2) ...
+Setting up cuda-compiler-13-0 (13.0.3-1) ...
+Setting up adwaita-icon-theme (46.0-1) ...
+update-alternatives: using /usr/share/icons/Adwaita/cursor.theme to provide /usr/share/icons/default/index.theme (x-cursor-theme) in auto mode
+Setting up humanity-icon-theme (0.6.16) ...
+Setting up ubuntu-mono (24.04-0ubuntu1) ...
+Processing triggers for libglib2.0-0t64:amd64 (2.80.0-6ubuntu3.8) ...
+Setting up at-spi2-core (2.52.0-1build1) ...
+Processing triggers for sgml-base (1.31) ...
+Setting up libfontconfig1:amd64 (2.15.0-1.1ubuntu2) ...
+Setting up nsight-systems-2025.3.2 (2025.3.2.474-253236389321v0) ...
+update-alternatives: using /opt/nvidia/nsight-systems/2025.3.2/target-linux-x64/nsys to provide /usr/local/bin/nsys (nsys) in auto mode
+update-alternatives: using /opt/nvidia/nsight-systems/2025.3.2/host-linux-x64/nsys-ui to provide /usr/local/bin/nsys-ui (nsys-ui) in auto mode
+Setting up fontconfig (2.15.0-1.1ubuntu2) ...
+Regenerating fonts cache... done.
+Setting up libxft2:amd64 (2.3.6-1build1) ...
+Setting up cuda-nsight-systems-13-0 (13.0.3-1) ...
+Processing triggers for libc-bin (2.39-0ubuntu8.7) ...
+Setting up libpango-1.0-0:amd64 (1.52.1+ds-1build1) ...
+Setting up libcairo2:amd64 (1.18.0-3build1) ...
+Setting up x11-utils (7.7+6build2) ...
+Setting up libcairo-gobject2:amd64 (1.18.0-3build1) ...
+Setting up libatk-wrapper-java (0.40.0-3build2) ...
+Setting up libpangoft2-1.0-0:amd64 (1.52.1+ds-1build1) ...
+Setting up libpangocairo-1.0-0:amd64 (1.52.1+ds-1build1) ...
+Setting up libatk-wrapper-java-jni:amd64 (0.40.0-3build2) ...
+Setting up librsvg2-2:amd64 (2.58.0+dfsg-1build1) ...
+Setting up libgtk-3-0t64:amd64 (3.24.41-4ubuntu1.3) ...
+Setting up librsvg2-common:amd64 (2.58.0+dfsg-1build1) ...
+Setting up libgtk-3-bin (3.24.41-4ubuntu1.3) ...
+Processing triggers for ca-certificates-java (20240118) ...
+Adding debian:ACCVRAIZ1.pem
+Adding debian:AC_RAIZ_FNMT-RCM.pem
+Adding debian:AC_RAIZ_FNMT-RCM_SERVIDORES_SEGUROS.pem
+Adding debian:ANF_Secure_Server_Root_CA.pem
+Adding debian:Actalis_Authentication_Root_CA.pem
+Adding debian:Amazon_Root_CA_1.pem
+Adding debian:Amazon_Root_CA_2.pem
+Adding debian:Amazon_Root_CA_3.pem
+Adding debian:Amazon_Root_CA_4.pem
+Adding debian:Atos_TrustedRoot_2011.pem
+Adding debian:Atos_TrustedRoot_Root_CA_ECC_TLS_2021.pem
+Adding debian:Atos_TrustedRoot_Root_CA_RSA_TLS_2021.pem
+Adding debian:Autoridad_de_Certificacion_Firmaprofesional_CIF_A62634068.pem
+Adding debian:BJCA_Global_Root_CA1.pem
+Adding debian:BJCA_Global_Root_CA2.pem
+Adding debian:Buypass_Class_2_Root_CA.pem
+Adding debian:Buypass_Class_3_Root_CA.pem
+Adding debian:CA_Disig_Root_R2.pem
+Adding debian:CFCA_EV_ROOT.pem
+Adding debian:COMODO_ECC_Certification_Authority.pem
+Adding debian:COMODO_RSA_Certification_Authority.pem
+Adding debian:Certainly_Root_E1.pem
+Adding debian:Certainly_Root_R1.pem
+Adding debian:Certigna_Root_CA.pem
+Adding debian:Certum_EC-384_CA.pem
+Adding debian:Certum_Trusted_Network_CA.pem
+Adding debian:Certum_Trusted_Network_CA_2.pem
+Adding debian:Certum_Trusted_Root_CA.pem
+Adding debian:D-TRUST_BR_Root_CA_1_2020.pem
+Adding debian:D-TRUST_BR_Root_CA_2_2023.pem
+Adding debian:D-TRUST_EV_Root_CA_1_2020.pem
+Adding debian:D-TRUST_EV_Root_CA_2_2023.pem
+Adding debian:D-TRUST_Root_Class_3_CA_2_2009.pem
+Adding debian:D-TRUST_Root_Class_3_CA_2_EV_2009.pem
+Adding debian:DigiCert_Assured_ID_Root_G2.pem
+Adding debian:DigiCert_Assured_ID_Root_G3.pem
+Adding debian:DigiCert_Global_Root_G2.pem
+Adding debian:DigiCert_Global_Root_G3.pem
+Adding debian:DigiCert_TLS_ECC_P384_Root_G5.pem
+Adding debian:DigiCert_TLS_RSA4096_Root_G5.pem
+Adding debian:DigiCert_Trusted_Root_G4.pem
+Adding debian:Entrust_Root_Certification_Authority.pem
+Adding debian:GDCA_TrustAUTH_R5_ROOT.pem
+Adding debian:GTS_Root_R1.pem
+Adding debian:GTS_Root_R3.pem
+Adding debian:GTS_Root_R4.pem
+Adding debian:GlobalSign_ECC_Root_CA_-_R4.pem
+Adding debian:GlobalSign_ECC_Root_CA_-_R5.pem
+Adding debian:GlobalSign_Root_CA_-_R3.pem
+Adding debian:GlobalSign_Root_CA_-_R6.pem
+Adding debian:GlobalSign_Root_E46.pem
+Adding debian:GlobalSign_Root_R46.pem
+Adding debian:Go_Daddy_Root_Certificate_Authority_-_G2.pem
+Adding debian:HARICA_TLS_ECC_Root_CA_2021.pem
+Adding debian:HARICA_TLS_RSA_Root_CA_2021.pem
+Adding debian:Hellenic_Academic_and_Research_Institutions_ECC_RootCA_2015.pem
+Adding debian:Hellenic_Academic_and_Research_Institutions_RootCA_2015.pem
+Adding debian:HiPKI_Root_CA_-_G1.pem
+Adding debian:Hongkong_Post_Root_CA_3.pem
+Adding debian:ISRG_Root_X1.pem
+Adding debian:ISRG_Root_X2.pem
+Adding debian:IdenTrust_Commercial_Root_CA_1.pem
+Adding debian:IdenTrust_Public_Sector_Root_CA_1.pem
+Adding debian:Izenpe.com.pem
+Adding debian:Microsec_e-Szigno_Root_CA_2009.pem
+Adding debian:Microsoft_ECC_Root_Certificate_Authority_2017.pem
+Adding debian:Microsoft_RSA_Root_Certificate_Authority_2017.pem
+Adding debian:NAVER_Global_Root_Certification_Authority.pem
+Adding debian:NetLock_Arany_=Class_Gold=_Főtanúsítvány.pem
+Adding debian:OISTE_Server_Root_ECC_G1.pem
+Adding debian:OISTE_Server_Root_RSA_G1.pem
+Adding debian:OISTE_WISeKey_Global_Root_GB_CA.pem
+Adding debian:OISTE_WISeKey_Global_Root_GC_CA.pem
+Adding debian:QuoVadis_Root_CA_1_G3.pem
+Adding debian:QuoVadis_Root_CA_2_G3.pem
+Adding debian:QuoVadis_Root_CA_3_G3.pem
+Adding debian:SSL.com_EV_Root_Certification_Authority_ECC.pem
+Adding debian:SSL.com_EV_Root_Certification_Authority_RSA_R2.pem
+Adding debian:SSL.com_Root_Certification_Authority_ECC.pem
+Adding debian:SSL.com_Root_Certification_Authority_RSA.pem
+Adding debian:SSL.com_TLS_ECC_Root_CA_2022.pem
+Adding debian:SSL.com_TLS_RSA_Root_CA_2022.pem
+Adding debian:SZAFIR_ROOT_CA2.pem
+Adding debian:Sectigo_Public_Server_Authentication_Root_E46.pem
+Adding debian:Sectigo_Public_Server_Authentication_Root_R46.pem
+Adding debian:SecureSign_Root_CA12.pem
+Adding debian:SecureSign_Root_CA14.pem
+Adding debian:SecureSign_Root_CA15.pem
+Adding debian:Security_Communication_ECC_RootCA1.pem
+Adding debian:Security_Communication_RootCA2.pem
+Adding debian:Starfield_Root_Certificate_Authority_-_G2.pem
+Adding debian:Starfield_Services_Root_Certificate_Authority_-_G2.pem
+Adding debian:SwissSign_RSA_TLS_Root_CA_2022_-_1.pem
+Adding debian:T-TeleSec_GlobalRoot_Class_2.pem
+Adding debian:T-TeleSec_GlobalRoot_Class_3.pem
+Adding debian:TUBITAK_Kamu_SM_SSL_Kok_Sertifikasi_-_Surum_1.pem
+Adding debian:TWCA_CYBER_Root_CA.pem
+Adding debian:TWCA_Global_Root_CA.pem
+Adding debian:TWCA_Root_Certification_Authority.pem
+Adding debian:Telekom_Security_TLS_ECC_Root_2020.pem
+Adding debian:Telekom_Security_TLS_RSA_Root_2023.pem
+Adding debian:Telia_Root_CA_v2.pem
+Adding debian:TrustAsia_Global_Root_CA_G3.pem
+Adding debian:TrustAsia_Global_Root_CA_G4.pem
+Adding debian:TrustAsia_TLS_ECC_Root_CA.pem
+Adding debian:TrustAsia_TLS_RSA_Root_CA.pem
+Adding debian:TunTrust_Root_CA.pem
+Adding debian:UCA_Extended_Validation_Root.pem
+Adding debian:UCA_Global_G2_Root.pem
+Adding debian:USERTrust_ECC_Certification_Authority.pem
+Adding debian:USERTrust_RSA_Certification_Authority.pem
+Adding debian:certSIGN_Root_CA_G2.pem
+Adding debian:e-Szigno_Root_CA_2017.pem
+Adding debian:e-Szigno_TLS_Root_CA_2023.pem
+Adding debian:ePKI_Root_Certification_Authority.pem
+Adding debian:emSign_ECC_Root_CA_-_C3.pem
+Adding debian:emSign_ECC_Root_CA_-_G3.pem
+Adding debian:emSign_Root_CA_-_C1.pem
+Adding debian:emSign_Root_CA_-_G1.pem
+Adding debian:vTrus_ECC_Root_CA.pem
+Adding debian:vTrus_Root_CA.pem
+done.
+Setting up openjdk-21-jre:amd64 (21.0.11+10-1~24.04.2) ...
+Setting up default-jre-headless (2:1.21-75+exp1) ...
+Setting up default-jre (2:1.21-75+exp1) ...
+Setting up cuda-nsight-13-0 (13.0.85-1) ...
+Setting up cuda-visual-tools-13-0 (13.0.3-1) ...
+Setting up cuda-tools-13-0 (13.0.3-1) ...
+Setting up cuda-toolkit-13-0 (13.0.3-1) ...
+Processing triggers for libc-bin (2.39-0ubuntu8.7) ...
+Processing triggers for libgdk-pixbuf-2.0-0:amd64 (2.42.10+dfsg-3ubuntu3.3) ...
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2025 NVIDIA Corporation
+Built on Wed_Aug_20_01:58:59_PM_PDT_2025
+Cuda compilation tools, release 13.0, V13.0.88
+Build cuda_13.0.r13.0/compiler.36424714_0
+Cloning into 'sparkinfer'...
+From https://github.com/gittensor-ai-lab/sparkinfer
+ * branch            main       -> FETCH_HEAD
+Already on 'main'
+Your branch is up to date with 'origin/main'.
+HEAD is now at 5d1a80d Update README.md
+5d1a80d9ca65585eec70f6ddd02edc1c6a9a5313
+-- The CXX compiler identification is GNU 13.3.0
+-- The CUDA compiler identification is NVIDIA 13.0.88
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/local/cuda-13.0/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found CUDAToolkit: /usr/local/cuda-13.0/targets/x86_64-linux/include (found version "13.0.88") 
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE  
+-- sparkinfer: NVML found — GPU temperature/power observability enabled
+-- Configuring done (1.8s)
+-- Generating done (0.0s)
+-- Build files have been written to: /workspace/qwen_awq_bench/sparkinfer/build
+[1/40] Building CXX object moe/CMakeFiles/sparkinfer_moe.dir/src/router.cpp.o
+[2/40] Building CXX object moe/CMakeFiles/sparkinfer_moe.dir/src/engine.cpp.o
+[3/40] Building CXX object runtime/CMakeFiles/sparkinfer_runtime.dir/src/gpu_stats.cpp.o
+[4/40] Building CXX object runtime/CMakeFiles/sparkinfer_runtime.dir/src/decode_layer.cpp.o
+[5/40] Building CXX object runtime/CMakeFiles/sparkinfer_runtime.dir/src/kv_cache.cpp.o
+[6/40] Building CXX object runtime/CMakeFiles/sparkinfer_runtime.dir/src/runtime.cpp.o
+[7/40] Building CXX object runtime/CMakeFiles/sparkinfer_runtime.dir/src/thermal_governor.cpp.o
+[8/40] Building CXX object runtime/CMakeFiles/sparkinfer_runtime.dir/src/scheduler.cpp.o
+[9/40] Building CXX object runtime/CMakeFiles/sparkinfer_runtime.dir/src/gguf.cpp.o
+[10/40] Building CXX object runtime/CMakeFiles/qwen3_gguf_bench.dir/examples/qwen3_gguf_bench.cpp.o
+[11/40] Building CUDA object kernels/csrc/cuda/moe/CMakeFiles/si_moe.dir/router.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18moe_router_kernel2EPKfPiPfS3_iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18moe_router_kernel2EPKfPiPfS3_iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers, 128 bytes smem
+ptxas info    : Compile time = 26.926 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels17moe_router_kernelEPKfPiPfS3_iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels17moe_router_kernelEPKfPiPfS3_iiii
+    128 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 44 registers, used 0 barriers
+ptxas info    : Compile time = 57.247 ms
+[12/40] Building CUDA object runtime/CMakeFiles/sparkinfer_runtime.dir/csrc/cuda/kv_ops.cu.o
+[13/40] Building CUDA object kernels/csrc/cuda/quant/CMakeFiles/si_quant.dir/quant.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25dequant_int4_block_kernelEPKhPK13__nv_bfloat16PS3_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25dequant_int4_block_kernelEPKhPK13__nv_bfloat16PS3_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 19 registers, used 0 barriers
+ptxas info    : Compile time = 4.119 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20dequantize_i8_kernelEPKaPKfP13__nv_bfloat16i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20dequantize_i8_kernelEPKaPKfP13__nv_bfloat16i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 12 registers, used 0 barriers
+ptxas info    : Compile time = 1.722 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18quantize_i8_kernelEPK13__nv_bfloat16PaPfi' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18quantize_i8_kernelEPK13__nv_bfloat16PaPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 1 barriers, 128 bytes smem
+ptxas info    : Compile time = 4.809 ms
+[14/40] Building CUDA object kernels/csrc/cuda/attention/CMakeFiles/si_attn.dir/flash_decode_global_hd512.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels26flash_decode_global_kernelILi512ELi8ELi16EEEvPK13__nv_bfloat16S4_S4_PKiS6_PS2_fiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels26flash_decode_global_kernelILi512ELi8ELi16EEEvPK13__nv_bfloat16S4_S4_PKiS6_PS2_fiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 56 registers, used 1 barriers
+ptxas info    : Compile time = 19.971 ms
+[15/40] Building CXX object runtime/CMakeFiles/sparkinfer_runtime.dir/src/models/qwen35.cpp.o
+[16/40] Building CUDA object kernels/csrc/cuda/attention/CMakeFiles/si_attn.dir/flash_decode_gqa8.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels24flash_decode_gqa8_kernelILi128ELi8ELi16EEEvPK13__nv_bfloat16S4_S4_PKiS6_PS2_fiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels24flash_decode_gqa8_kernelILi128ELi8ELi16EEEvPK13__nv_bfloat16S4_S4_PKiS6_PS2_fiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 39 registers, used 1 barriers
+ptxas info    : Compile time = 15.637 ms
+[17/40] Building CUDA object kernels/csrc/cuda/fused/CMakeFiles/si_fused.dir/model_ops.cu.o
+ptxas info    : 4096 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels22decode_feedback_kernelEPiPKi' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels22decode_feedback_kernelEPiPKi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 14 registers, used 0 barriers
+ptxas info    : Compile time = 1.616 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels16argmax_p2_kernelEPi' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels16argmax_p2_kernelEPi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 10 registers, used 1 barriers, 4096 bytes smem
+ptxas info    : Compile time = 5.470 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels16argmax_p1_kernelEPKfi' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels16argmax_p1_kernelEPKfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 1 barriers, 2048 bytes smem
+ptxas info    : Compile time = 3.397 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels13argmax_kernelEPKfPii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels13argmax_kernelEPKfPii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 18 registers, used 1 barriers, 8192 bytes smem
+ptxas info    : Compile time = 4.433 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels16embedding_kernelEPKiPK13__nv_bfloat16PS3_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels16embedding_kernelEPKiPK13__nv_bfloat16PS3_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 18 registers, used 0 barriers
+ptxas info    : Compile time = 2.306 ms
+[18/40] Building CUDA object kernels/csrc/cuda/moe/CMakeFiles/si_moe.dir/router_gemm.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18router_gemm_kernelILi16EEEvPK13__nv_bfloat16S4_Pfiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18router_gemm_kernelILi16EEEvPK13__nv_bfloat16S4_Pfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 37 registers, used 1 barriers
+ptxas info    : Compile time = 12.989 ms
+[19/40] Building CUDA object kernels/csrc/cuda/quant/CMakeFiles/si_quant.dir/dequant_gguf.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18transpose3d_kernelEPK13__nv_bfloat16PS1_iii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18transpose3d_kernelEPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 24 registers, used 0 barriers
+ptxas info    : Compile time = 7.691 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18transpose2d_kernelEPK13__nv_bfloat16PS1_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18transpose2d_kernelEPK13__nv_bfloat16PS1_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 24 registers, used 0 barriers
+ptxas info    : Compile time = 5.379 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels14deq_f32_kernelEPKfP13__nv_bfloat16l' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels14deq_f32_kernelEPKfP13__nv_bfloat16l
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 10 registers, used 0 barriers
+ptxas info    : Compile time = 1.606 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels14deq_f16_kernelEPKhP13__nv_bfloat16l' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels14deq_f16_kernelEPKhP13__nv_bfloat16l
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 1.510 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels15deq_q8_0_kernelEPKhP13__nv_bfloat16l' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels15deq_q8_0_kernelEPKhP13__nv_bfloat16l
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 11.573 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels14deq_q6k_kernelEPKhP13__nv_bfloat16l' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels14deq_q6k_kernelEPKhP13__nv_bfloat16l
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 28 registers, used 0 barriers
+ptxas info    : Compile time = 11.726 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels14deq_q4k_kernelEPKhP13__nv_bfloat16l' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels14deq_q4k_kernelEPKhP13__nv_bfloat16l
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 31.988 ms
+[20/40] Building CUDA object kernels/csrc/cuda/gemm/CMakeFiles/si_gemm.dir/gemm.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels15gemm_f32_kernelILi16EEEvPK13__nv_bfloat16S4_Pfiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels15gemm_f32_kernelILi16EEEvPK13__nv_bfloat16S4_Pfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 37 registers, used 1 barriers
+ptxas info    : Compile time = 21.132 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels11gemm_kernelILi16EEEvPK13__nv_bfloat16S4_PS2_iiiff' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels11gemm_kernelILi16EEEvPK13__nv_bfloat16S4_PS2_iiiff
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 37 registers, used 1 barriers
+ptxas info    : Compile time = 17.149 ms
+[21/40] Linking CUDA static library kernels/csrc/cuda/quant/libsi_quant.a
+[22/40] Building CUDA object kernels/csrc/cuda/attention/CMakeFiles/si_attn.dir/flash_prefill.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20flash_prefill_kernelILi256EEEvPK13__nv_bfloat16S4_S4_PS2_fiiiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20flash_prefill_kernelILi256EEEvPK13__nv_bfloat16S4_S4_PS2_fiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 9.786 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20flash_prefill_kernelILi128EEEvPK13__nv_bfloat16S4_S4_PS2_fiiiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20flash_prefill_kernelILi128EEEvPK13__nv_bfloat16S4_S4_PS2_fiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 31 registers, used 0 barriers
+ptxas info    : Compile time = 7.257 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20flash_prefill_kernelILi64EEEvPK13__nv_bfloat16S4_S4_PS2_fiiiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20flash_prefill_kernelILi64EEEvPK13__nv_bfloat16S4_S4_PS2_fiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 10.170 ms
+[23/40] Building CUDA object kernels/csrc/cuda/attention/CMakeFiles/si_attn.dir/rope.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels21qknorm_rope_kv_kernelEP13__nv_bfloat16S2_PKS1_S4_S4_S2_S2_PKiS6_iiifiif' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels21qknorm_rope_kv_kernelEP13__nv_bfloat16S2_PKS1_S4_S4_S2_S2_PKiS6_iiifiif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 34 registers, used 1 barriers, 128 bytes smem
+ptxas info    : Compile time = 14.643 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels21rope_kv_append_kernelEP13__nv_bfloat16PKS1_S4_S2_S2_PKiS6_iiifii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels21rope_kv_append_kernelEP13__nv_bfloat16PKS1_S4_S2_S2_PKiS6_iiifii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 12.527 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels14rope_qk_kernelEP13__nv_bfloat16S2_PKiiiif' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels14rope_qk_kernelEP13__nv_bfloat16S2_PKiiiif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 18 registers, used 0 barriers
+ptxas info    : Compile time = 5.456 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels11rope_kernelEP13__nv_bfloat16PKiiif' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels11rope_kernelEP13__nv_bfloat16PKiiif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers
+ptxas info    : Compile time = 3.226 ms
+[24/40] Building CUDA object kernels/csrc/cuda/attention/CMakeFiles/si_attn.dir/flash_decode_local_hd256.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25flash_decode_local_kernelILi256ELi2ELi16EEEvPK13__nv_bfloat16S4_S4_PKiS6_PS2_fiiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25flash_decode_local_kernelILi256ELi2ELi16EEEvPK13__nv_bfloat16S4_S4_PKiS6_PS2_fiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 39 registers, used 1 barriers
+ptxas info    : Compile time = 14.900 ms
+[25/40] Building CUDA object kernels/csrc/cuda/moe/CMakeFiles/si_moe.dir/expert_ffn.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels21moe_expert_ffn_kernelEPK13__nv_bfloat16S3_S3_S3_PKiPKfPS1_iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels21moe_expert_ffn_kernelEPK13__nv_bfloat16S3_S3_S3_PKiPKfPS1_iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 47.705 ms
+[26/40] Building CUDA object kernels/csrc/cuda/attention/CMakeFiles/si_attn.dir/flash_decode.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels19flash_decode_kernelI13__nv_bfloat16Li256EEEvPKT_S5_S5_PKiS7_PS3_fiiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels19flash_decode_kernelI13__nv_bfloat16Li256EEEvPKT_S5_S5_PKiS7_PS3_fiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 39 registers, used 0 barriers
+ptxas info    : Compile time = 11.352 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels19flash_decode_kernelI13__nv_bfloat16Li128EEEvPKT_S5_S5_PKiS7_PS3_fiiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels19flash_decode_kernelI13__nv_bfloat16Li128EEEvPKT_S5_S5_PKiS7_PS3_fiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 8.332 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels19flash_decode_kernelI13__nv_bfloat16Li64EEEvPKT_S5_S5_PKiS7_PS3_fiiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels19flash_decode_kernelI13__nv_bfloat16Li64EEEvPKT_S5_S5_PKiS7_PS3_fiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 12.582 ms
+[27/40] Building CUDA object kernels/csrc/cuda/fused/CMakeFiles/si_fused.dir/rmsnorm.cu.o
+/workspace/qwen_awq_bench/sparkinfer/kernels/csrc/cuda/fused/rmsnorm.cu(184): warning #177-D: variable "base" was declared but never referenced
+      const size_t base = 0;
+                   ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels17rmsnorm_qk_kernelEP13__nv_bfloat16S2_PKS1_S4_iif' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels17rmsnorm_qk_kernelEP13__nv_bfloat16S2_PKS1_S4_iif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 22 registers, used 1 barriers, 128 bytes smem
+ptxas info    : Compile time = 8.143 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels22add_rmsnorm2_q8_kernelEPK13__nv_bfloat16S3_S3_PS1_S4_PNS0_11si_blk_q8_1Eif' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels22add_rmsnorm2_q8_kernelEPK13__nv_bfloat16S3_S3_PS1_S4_PNS0_11si_blk_q8_1Eif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 1 barriers, 128 bytes smem
+ptxas info    : Compile time = 17.352 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels19add_rmsnorm2_kernelEPK13__nv_bfloat16S3_S3_PS1_S4_iif' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels19add_rmsnorm2_kernelEPK13__nv_bfloat16S3_S3_PS1_S4_iif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 44 registers, used 1 barriers, 128 bytes smem
+ptxas info    : Compile time = 45.165 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels14rmsnorm_kernelILi1EEEvPK13__nv_bfloat16S4_S4_PS2_iif' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels14rmsnorm_kernelILi1EEEvPK13__nv_bfloat16S4_S4_PS2_iif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 43 registers, used 1 barriers
+ptxas info    : Compile time = 48.106 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels14rmsnorm_kernelILi0EEEvPK13__nv_bfloat16S4_S4_PS2_iif' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels14rmsnorm_kernelILi0EEEvPK13__nv_bfloat16S4_S4_PS2_iif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 35.280 ms
+[28/40] Linking CUDA static library kernels/csrc/cuda/fused/libsi_fused.a
+[29/40] Building CUDA object kernels/csrc/cuda/attention/CMakeFiles/si_attn.dir/flash_decode_split.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels17fa_combine_kernelILi128ELi4ELi16EEEvPKfS3_S3_P13__nv_bfloat16iiPNS0_13fa_block_q8_1E' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels17fa_combine_kernelILi128ELi4ELi16EEEvPKfS3_S3_P13__nv_bfloat16iiPNS0_13fa_block_q8_1E
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 36.466 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels17fa_combine_kernelILi128ELi4ELi8EEEvPKfS3_S3_P13__nv_bfloat16iiPNS0_13fa_block_q8_1E' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels17fa_combine_kernelILi128ELi4ELi8EEEvPKfS3_S3_P13__nv_bfloat16iiPNS0_13fa_block_q8_1E
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 29.295 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels17fa_combine_kernelILi128ELi4ELi4EEEvPKfS3_S3_P13__nv_bfloat16iiPNS0_13fa_block_q8_1E' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels17fa_combine_kernelILi128ELi4ELi4EEEvPKfS3_S3_P13__nv_bfloat16iiPNS0_13fa_block_q8_1E
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 26.484 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels19fa_split_gqa_kernelILi128ELi8ELi14EEEvPK13__nv_bfloat16S4_S4_PKiS6_PfS7_S7_fiiiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels19fa_split_gqa_kernelILi128ELi8ELi14EEEvPK13__nv_bfloat16S4_S4_PKiS6_PfS7_S7_fiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 38 registers, used 1 barriers
+ptxas info    : Compile time = 21.132 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels15fa_split_kernelILi128EEEvPK13__nv_bfloat16S4_S4_PKiS6_PfS7_S7_fiiiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels15fa_split_kernelILi128EEEvPK13__nv_bfloat16S4_S4_PKiS6_PfS7_S7_fiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 37 registers, used 0 barriers
+ptxas info    : Compile time = 13.966 ms
+[30/40] Linking CUDA static library kernels/csrc/cuda/attention/libsi_attn.a
+[31/40] Building CUDA object kernels/csrc/cuda/moe/CMakeFiles/si_moe.dir/expert_ffn_q4k.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25gate_up_mmvq2_qwen_kernelILi2048ELi768ELi8EEEvPKNS0_13si_block_q8_1EPKhS6_PKiPf' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25gate_up_mmvq2_qwen_kernelILi2048ELi768ELi8EEEvPKNS0_13si_block_q8_1EPKhS6_PKiPf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 36 registers, used 1 barriers
+ptxas info    : Compile time = 8.416 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels31gate_up_mmvq2_pack2_qwen_kernelILi2048ELi768ELi8EEEvPKNS0_13si_block_q8_1EPKhS6_PKiPfi' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels31gate_up_mmvq2_pack2_qwen_kernelILi2048ELi768ELi8EEEvPKNS0_13si_block_q8_1EPKhS6_PKiPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 38 registers, used 1 barriers
+ptxas info    : Compile time = 7.295 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels27down_q4k_mmvq_splitk_kernelILi8EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels27down_q4k_mmvq_splitk_kernelILi8EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 39 registers, used 1 barriers
+ptxas info    : Compile time = 7.699 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels27down_q4k_mmvq_splitk_kernelILi4EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels27down_q4k_mmvq_splitk_kernelILi4EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 39 registers, used 1 barriers
+ptxas info    : Compile time = 7.618 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels27down_q4k_mmvq_splitk_kernelILi2EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels27down_q4k_mmvq_splitk_kernelILi2EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 39 registers, used 1 barriers
+ptxas info    : Compile time = 7.423 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels32down_q4k_mmvq_splitk_qwen_kernelILi2ELi3ELi8EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels32down_q4k_mmvq_splitk_qwen_kernelILi2ELi3ELi8EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 6.165 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels27down_q6k_mmvq_splitk_kernelILi8EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels27down_q6k_mmvq_splitk_kernelILi8EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 7.289 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels27down_q6k_mmvq_splitk_kernelILi4EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels27down_q6k_mmvq_splitk_kernelILi4EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 7.116 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels27down_q6k_mmvq_splitk_kernelILi2EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels27down_q6k_mmvq_splitk_kernelILi2EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 7.083 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels32down_q6k_mmvq_splitk_qwen_kernelILi2ELi3ELi8EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels32down_q6k_mmvq_splitk_qwen_kernelILi2ELi3ELi8EEEvPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 47 registers, used 1 barriers
+ptxas info    : Compile time = 29.481 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20down_q4k_mmvq_kernelEPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20down_q4k_mmvq_kernelEPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 6.095 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20gate_up_mmvq2_kernelEPKNS0_13si_block_q8_1EPKhS5_PKiPfiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20gate_up_mmvq2_kernelEPKNS0_13si_block_q8_1EPKhS5_PKiPfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers, 768 bytes smem
+ptxas info    : Compile time = 10.056 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18si_quant_bf16_q8_1EPK13__nv_bfloat16PNS0_13si_block_q8_1Ei' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18si_quant_bf16_q8_1EPK13__nv_bfloat16PNS0_13si_block_q8_1Ei
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 15 registers, used 0 barriers
+ptxas info    : Compile time = 2.076 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20down_q6k_mmvq_kernelEPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20down_q6k_mmvq_kernelEPKhPKiPKfPKNS0_13si_block_q8_1EP13__nv_bfloat16iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 9.141 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels19quant_h_q8_1_kernelEPKfPNS0_13si_block_q8_1Eii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels19quant_h_q8_1_kernelEPKfPNS0_13si_block_q8_1Eii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 17 registers, used 0 barriers
+ptxas info    : Compile time = 2.225 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels22down_q6k_splitk_kernelEPKhPKiPKfS6_P13__nv_bfloat16iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels22down_q6k_splitk_kernelEPKhPKiPKfS6_P13__nv_bfloat16iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Compile time = 14.379 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels15down_q6k_kernelEPKhPKiPKfS6_P13__nv_bfloat16iiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels15down_q6k_kernelEPKhPKiPKfS6_P13__nv_bfloat16iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 11.517 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels23gate_up_q4k_mmvq_kernelEPK13__nv_bfloat16PKhS5_PKiPfiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels23gate_up_q4k_mmvq_kernelEPK13__nv_bfloat16PKhS5_PKiPfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 45 registers, used 1 barriers
+ptxas info    : Compile time = 18.553 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18gate_up_q4k_kernelEPK13__nv_bfloat16PKhS5_PKiPfiiiii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18gate_up_q4k_kernelEPK13__nv_bfloat16PKhS5_PKiPfiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 17.543 ms
+[32/40] Linking CUDA static library kernels/csrc/cuda/moe/libsi_moe.a
+[33/40] Building CUDA object kernels/csrc/cuda/gemm/CMakeFiles/si_gemm.dir/gemv.cu.o
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels27gemv_q6k_dp4a_kfixed_kernelIfLi16ELi8EEEvPKNS0_13si_block_q8_1EPKhPT_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels27gemv_q6k_dp4a_kfixed_kernelIfLi16ELi8EEEvPKNS0_13si_block_q8_1EPKhPT_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 13.030 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels27gemv_q6k_dp4a_kfixed_kernelIfLi8ELi8EEEvPKNS0_13si_block_q8_1EPKhPT_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels27gemv_q6k_dp4a_kfixed_kernelIfLi8ELi8EEEvPKNS0_13si_block_q8_1EPKhPT_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 11.560 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20gemv_q6k_dp4a_kernelIfLi32EEEvPKNS0_13si_block_q8_1EPKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20gemv_q6k_dp4a_kernelIfLi32EEEvPKNS0_13si_block_q8_1EPKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 6.772 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20gemv_q6k_dp4a_kernelIfLi16EEEvPKNS0_13si_block_q8_1EPKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20gemv_q6k_dp4a_kernelIfLi16EEEvPKNS0_13si_block_q8_1EPKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 6.700 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20gemv_q6k_dp4a_kernelIfLi8EEEvPKNS0_13si_block_q8_1EPKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20gemv_q6k_dp4a_kernelIfLi8EEEvPKNS0_13si_block_q8_1EPKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 6.672 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25si_mmvq_q6k_kfixed_kernelIfLi16EEEvPKNS0_13si_block_q8_1EPKhPT_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25si_mmvq_q6k_kfixed_kernelIfLi16EEEvPKNS0_13si_block_q8_1EPKhPT_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 34 registers, used 1 barriers
+ptxas info    : Compile time = 6.883 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25si_mmvq_q6k_kfixed_kernelIfLi8EEEvPKNS0_13si_block_q8_1EPKhPT_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25si_mmvq_q6k_kfixed_kernelIfLi8EEEvPKNS0_13si_block_q8_1EPKhPT_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 31 registers, used 1 barriers
+ptxas info    : Compile time = 4.942 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25si_mmvq_q6k_kfixed_kernelI13__nv_bfloat16Li16EEEvPKNS0_13si_block_q8_1EPKhPT_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25si_mmvq_q6k_kfixed_kernelI13__nv_bfloat16Li16EEEvPKNS0_13si_block_q8_1EPKhPT_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 34 registers, used 1 barriers
+ptxas info    : Compile time = 6.914 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25si_mmvq_q6k_kfixed_kernelI13__nv_bfloat16Li8EEEvPKNS0_13si_block_q8_1EPKhPT_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25si_mmvq_q6k_kfixed_kernelI13__nv_bfloat16Li8EEEvPKNS0_13si_block_q8_1EPKhPT_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 31 registers, used 1 barriers
+ptxas info    : Compile time = 4.850 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18si_mmvq_q6k_kernelIfEEvPKNS0_13si_block_q8_1EPKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18si_mmvq_q6k_kernelIfEEvPKNS0_13si_block_q8_1EPKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 7.849 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18si_mmvq_q6k_kernelI13__nv_bfloat16EEvPKNS0_13si_block_q8_1EPKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18si_mmvq_q6k_kernelI13__nv_bfloat16EEvPKNS0_13si_block_q8_1EPKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 7.914 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25si_mmvq_q4k_kfixed_kernelIfLi16EEEvPKNS0_13si_block_q8_1EPKhPT_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25si_mmvq_q4k_kfixed_kernelIfLi16EEEvPKNS0_13si_block_q8_1EPKhPT_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 35 registers, used 1 barriers
+ptxas info    : Compile time = 5.358 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25si_mmvq_q4k_kfixed_kernelIfLi8EEEvPKNS0_13si_block_q8_1EPKhPT_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25si_mmvq_q4k_kfixed_kernelIfLi8EEEvPKNS0_13si_block_q8_1EPKhPT_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 27 registers, used 1 barriers
+ptxas info    : Compile time = 3.859 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25si_mmvq_q4k_kfixed_kernelI13__nv_bfloat16Li16EEEvPKNS0_13si_block_q8_1EPKhPT_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25si_mmvq_q4k_kfixed_kernelI13__nv_bfloat16Li16EEEvPKNS0_13si_block_q8_1EPKhPT_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 35 registers, used 1 barriers
+ptxas info    : Compile time = 5.442 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels25si_mmvq_q4k_kfixed_kernelI13__nv_bfloat16Li8EEEvPKNS0_13si_block_q8_1EPKhPT_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels25si_mmvq_q4k_kfixed_kernelI13__nv_bfloat16Li8EEEvPKNS0_13si_block_q8_1EPKhPT_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 27 registers, used 1 barriers
+ptxas info    : Compile time = 3.925 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18si_mmvq_q4k_kernelIfEEvPKNS0_13si_block_q8_1EPKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18si_mmvq_q4k_kernelIfEEvPKNS0_13si_block_q8_1EPKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 8.948 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18si_mmvq_q4k_kernelI13__nv_bfloat16EEvPKNS0_13si_block_q8_1EPKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18si_mmvq_q4k_kernelI13__nv_bfloat16EEvPKNS0_13si_block_q8_1EPKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 9.116 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels23si_quantize_q8_1_blocksEPK13__nv_bfloat16PNS0_13si_block_q8_1Ei' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels23si_quantize_q8_1_blocksEPK13__nv_bfloat16PNS0_13si_block_q8_1Ei
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 15 registers, used 0 barriers
+ptxas info    : Compile time = 2.030 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels23gemv_q4k_dp4a_sk_kernelIfEEvPKaPKfS5_PKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels23gemv_q4k_dp4a_sk_kernelIfEEvPKaPKfS5_PKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 6.134 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels23gemv_q4k_dp4a_sk_kernelI13__nv_bfloat16EEvPKaPKfS6_PKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels23gemv_q4k_dp4a_sk_kernelI13__nv_bfloat16EEvPKaPKfS6_PKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 6.201 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels23gemv_q4k_dp4a_pq_kernelIfEEvPKaPKfS5_PKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels23gemv_q4k_dp4a_pq_kernelIfEEvPKaPKfS5_PKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 39 registers, used 0 barriers
+ptxas info    : Compile time = 5.021 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels23gemv_q4k_dp4a_pq_kernelI13__nv_bfloat16EEvPKaPKfS6_PKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels23gemv_q4k_dp4a_pq_kernelI13__nv_bfloat16EEvPKaPKfS6_PKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 39 registers, used 0 barriers
+ptxas info    : Compile time = 5.087 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels20quantize_q8_1_kernelEPK13__nv_bfloat16PaPfS5_i' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels20quantize_q8_1_kernelEPK13__nv_bfloat16PaPfS5_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 23 registers, used 0 barriers
+ptxas info    : Compile time = 3.281 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18gemv_q_dp4a_kernelIfEEvPK13__nv_bfloat16PKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18gemv_q_dp4a_kernelIfEEvPK13__nv_bfloat16PKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 12.911 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18gemv_q_dp4a_kernelI13__nv_bfloat16EEvPKS2_PKhPT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18gemv_q_dp4a_kernelI13__nv_bfloat16EEvPKS2_PKhPT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers
+ptxas info    : Compile time = 12.506 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels13gemv_q_kernelIfEEvPK13__nv_bfloat16PKhPT_iii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels13gemv_q_kernelIfEEvPK13__nv_bfloat16PKhPT_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 37 registers, used 1 barriers
+ptxas info    : Compile time = 9.231 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels13gemv_q_kernelI13__nv_bfloat16EEvPKS2_PKhPT_iii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels13gemv_q_kernelI13__nv_bfloat16EEvPKS2_PKhPT_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 37 registers, used 1 barriers
+ptxas info    : Compile time = 9.299 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels18gemv_f32_sk_kernelIfLi4EEEvPK13__nv_bfloat16S4_PT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels18gemv_f32_sk_kernelIfLi4EEEvPK13__nv_bfloat16S4_PT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 35 registers, used 1 barriers
+ptxas info    : Compile time = 5.751 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels11gemv_kernelIfEEvPK13__nv_bfloat16S4_PT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels11gemv_kernelIfEEvPK13__nv_bfloat16S4_PT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, used 1 barriers
+ptxas info    : Compile time = 12.434 ms
+ptxas info    : Compiling entry function '_ZN10sparkinfer7kernels11gemv_kernelI13__nv_bfloat16EEvPKS2_S4_PT_ii' for 'sm_120'
+ptxas info    : Function properties for _ZN10sparkinfer7kernels11gemv_kernelI13__nv_bfloat16EEvPKS2_S4_PT_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, used 1 barriers
+ptxas info    : Compile time = 12.542 ms
+[34/40] Linking CUDA static library kernels/csrc/cuda/gemm/libsi_gemm.a
+[35/40] Linking CXX shared library CMakeFiles/sparkinfer_moe.dir/cmake_device_link.o
+[36/40] Linking CXX shared library moe/libsparkinfer_moe.so
+[37/40] Linking CXX shared library CMakeFiles/sparkinfer_runtime.dir/cmake_device_link.o
+[38/40] Linking CXX shared library runtime/libsparkinfer_runtime.so
+[39/40] Linking CXX executable CMakeFiles/qwen3_gguf_bench.dir/cmake_device_link.o
+[40/40] Linking CXX executable runtime/qwen3_gguf_bench
+>> sparkinfer ctx=128
+>> GPU arch: sm_120
+>> using local build
+>> downloading Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf -> /workspace/qwen_awq_bench/sparkinfer/models (~17 GB) ...
+bench/scripts/_common.sh: line 43: hf: command not found
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'huggingface_hub'
+#=#=#                                                                           ##O#- #                                                                         ##O=#  #                                                                        ######################################################################### 100.0%#=#=-#  #                                                                        #=#=-#   #                                                                      -#O#-  #   #                                                                                                                                               0.0%                                                                            0.0%                                                                            0.0%                                                                            0.0%                                                                            0.0%                                                                            0.0%                                                                            0.0%                                                                            0.0%                                                                            0.0%                                                                            0.0%                                                                            0.0%                                                                            0.0%                                                                            0.1%                                                                            0.1%                                                                            0.1%                                                                            0.1%                                                                            0.1%                                                                            0.1%                                                                            0.1%                                                                            0.1%                                                                            0.1%                                                                            0.1%                                                                            0.2%                                                                            0.2%                                                                            0.2%                                                                            0.2%                                                                            0.2%                                                                            0.2%                                                                            0.2%                                                                            0.2%                                                                            0.2%                                                                            0.2%                                                                            0.3%                                                                            0.3%                                                                            0.3%                                                                            0.3%                                                                            0.3%                                                                            0.3%                                                                            0.3%                                                                            0.3%                                                                            0.3%                                                                            0.3%                                                                            0.4%                                                                            0.4%                                                                            0.4%                                                                            0.4%                                                                            0.4%                                                                            0.4%                                                                            0.4%                                                                            0.4%                                                                            0.4%                                                                            0.5%                                                                            0.5%                                                                            0.5%                                                                            0.5%                                                                            0.5%                                                                            0.5%                                                                            0.5%                                                                            0.5%                                                                            0.5%                                                                            0.6%                                                                            0.6%                                                                            0.6%                                                                            0.6%                                                                            0.6%                                                                            0.6%                                                                            0.6%                                                                            0.6%                                                                            0.6%                                                                            0.6%                                                                            0.7%                                                                            0.7%                                                                            0.7%                                                                            0.7%                                                                            0.7%                                                                            0.7%                                                                            0.7%                                                                            0.7%                                                                            0.7%                                                                            0.7%                                                                            0.7%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.8%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            0.9%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.0%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.1%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.2%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.3%                                                                            1.4%                                                                            1.4%                                                                            1.4%                                                                            1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.4%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.5%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.6%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.7%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.8%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           1.9%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.0%#                                                                           2.1%#                                                                           2.1%#                                                                           2.1%#                                                                           2.1%#                                                                           2.1%#                                                                           2.1%#                                                                           2.1%#                                                                           2.1%#                                                                           2.1%#                                                                           2.1%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%#                                                                           2.2%

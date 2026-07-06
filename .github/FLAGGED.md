@@ -57,3 +57,64 @@ Note: #57 is objectively a copy, so the auto-detector **re-flags it whenever the
 (this is exactly what happened on a re-run after it was briefly reopened). For this override to
 hold, #57 must stay **closed** (or be added to an explicit copycat exception). This entry
 supersedes the auto-block records above.
+
+## 2026-06-29 — `ai-engram` (auto-blocked)
+
+Auto-blocked: copycat of #83 (fansilas) re-submitted as PR #88. Zero-tolerance copycat policy.
+
+## 2026-06-30 — `carlh7777` + `thomasbaker9010251` (sybil pair)
+
+**Accounts:** `carlh7777` (PR opener), `thomasbaker9010251` (commit author/committer).
+
+**Evidence — shared git identity across two accounts (concrete):**
+PR **#112** (`perf(moe): fuse down-projection Q8_1 quantize into gate/up`) was *opened* by
+`carlh7777`, but every commit on it is *authored AND committed* by `thomasbaker9010251`
+(`Thomas B <thomas.b.901025@gmail.com>`). Opener ≠ committer, both non-collaborators (only
+`ai-hpc` has push) — one operator pushing from a single git environment under two GitHub
+identities. `thomasbaker9010251` opens no PRs of its own; it appears only as the commit author
+behind `carlh7777`'s submissions. Same signal class as the glorysr1209-png/seekmistar01 pair above.
+
+**History:** `carlh7777` — 3 PRs, none merged (#49, #99 closed `not-tested`; #112 a known
+self-reported **−4.7%** regression submitted as a "perf" PR).
+
+**Action:** both accounts added to `blocked-contributors.txt`; future PRs from either auto-flag,
+close, and skip evaluation.
+
+**NB:** an earlier draft of this entry wrongly cited `andriypolanski`/#105 as the twin because #112
+and #105 shared an identical −4.7% result. That was coincidence — `andriypolanski`'s commits are
+self-consistent (own login + email), so andriypolanski is **not** part of this sybil and is **not**
+blocked. The real link is the carlh7777 ↔ thomasbaker9010251 opener/committer split above.
+
+## 2026-07-01 — `bohdansolovie` + `kiannidev` (coordinated copycat ring + evidence-tampering)
+
+**Accounts:** `bohdansolovie` (bohdansolovie@gmail.com), `kiannidev` (kiannidev@gmail.com) — distinct git identities, coordinated (not a shared-identity sybil).
+
+**Cross-copying each other's work to double merged-PR count:**
+- **#57 (kiannidev) ← #56 (bohdansolovie):** near-verbatim, 109/110 added lines identical (prior auto-block; later maintainer-overridden, #54 strike kept).
+- **#108 (bohdansolovie) ← #104/#109 (kiannidev):** #108's original title was byte-identical to kiannidev's open #109 (`perf(moe): router→gu2 PDL chain + fused gate/up MMVQ`); body said "Supersedes closed #104 (kiannidev)".
+
+**Active cover-up (decisive):** after #108 was closed, `bohdansolovie` **renamed it to "Hello" (17:33 UTC) then force-pushed the branch to `main` (17:35 UTC)** to erase the diff. #56 was force-pushed twice as well. Legitimate work is not retitled and force-erased after being flagged.
+
+**Action:** both added to `blocked-contributors.txt`; PRs #108/#109/#104/#56 labeled `flagged:gaming`; future PRs from either auto-flag, close, skip eval. Already-merged PRs (bohdansolovie #65; kiannidev #52/#44/#23/#22/#21) predate this and cannot be reversed. kiannidev's earlier #54/#57 override is superseded — the pattern continued.
+
+## 2026-07-02 — `Daedalus-Icarus` (auto-blocked)
+
+Auto-blocked after 1 copycat PRs (#132).
+
+## 2026-07-03 — `devmixa702` (auto-blocked)
+
+Auto-blocked after 1 copycat PRs (#191).
+
+## 2026-07-04 — `jony376` (copycat) · `fansilas` UN-blocked (false attribution — reversed)
+
+The auto-block of **`fansilas`** over #221 was a **misattribution and has been reversed.**
+`fa_split_gqa_mma_i8_kernel` is fansilas's own kernel (#195, `eval:XL`, merged 03:47); #221 (fansilas,
+commit **05:23**) is their legitimate follow-up trimming its shared int32→float round-trip. #209
+(`jony376`) is a **verbatim-identical** copy of that change — same code *and* the same multi-line
+comments — but its commit is dated **11:18, ~6h after** fansilas's 05:23 (#209 was *opened* at 02:47 as an
+empty placeholder, then the copied code was force-pushed in at 11:18). The detector attributed "original"
+by earliest PR-*open* time, which inverted the real authorship.
+
+**Action:** `fansilas` removed from `blocked-contributors.txt`; #221 reopened + un-flagged. Strike
+reassigned to **`jony376`** — #209 labeled `flagged:gaming`/`copycat` + closed, `jony376` added to
+`blocked-contributors.txt`. fansilas's merged record (#195/#122/#86/#83) stands.

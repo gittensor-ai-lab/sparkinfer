@@ -1,0 +1,30 @@
+# Reference manifest — C2: reference quarantine.
+#
+# Pins the baseline artifacts (model weights + llama.cpp) so a tampered PERSISTED copy can't skew a
+# verdict. The eval reuses /workspace/models and /workspace/.llamacpp across runs; a malicious PR
+# build runs as root and could corrupt the baseline weights (to depress llama's score and inflate its
+# own relative gain) or tamper the llama-bench binary. Before scoring, the harness verifies these
+# against the values below and re-fetches / rebuilds from a clean, pinned source on any mismatch.
+#
+# Sourced by _common.sh. Maintainer-only (CODEOWNERS + sensitive-paths-guard cover bench/scripts/).
+# An EMPTY value means "warn-only" (compute + log, don't enforce) — used until a value is pinned.
+
+# sha256 of the Q4_K_M GGUF baseline weights. Verified before every eval; mismatch -> re-download.
+# Env-overridable (`:-`) so the dual-model eval can pin a DIFFERENT sha per model — the Qwen3.6
+# primary passes QWEN36_MODEL_SHA256 (below); the Qwen3-30B guard uses this default.
+MODEL_SHA256="${MODEL_SHA256:-0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5}"
+
+# sha256 of the Qwen3.6-35B-A3B UD-Q4_K_M GGUF (unsloth) — the dual-eval primary baseline weights.
+QWEN36_MODEL_SHA256="ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61"
+
+# llama.cpp commit the reference is pinned to. HEAD of master drifts run-to-run (non-reproducible and
+# unpinnable); we check out exactly this commit, verify a clean tree, and rebuild if either differs.
+LLAMACPP_COMMIT="6f4f53f2b7da54fcdbbecaaa734337c337ad6176"
+
+# Qwen3.6-35B-A3B llama.cpp decode baselines — 3-rep median on RTX 5090, same pinned commit + GGUF
+# sha (QWEN36_MODEL_SHA256 above). These anchor the fair-label scoring (delta/llama_ref) at each
+# scored context and the difficulty-reference boost once the Qwen3.6 frontier passes them.
+# Measured 2026-07-06. Env-overridable.
+QWEN36_LLAMA_128="${QWEN36_LLAMA_128:-275.81}"
+QWEN36_LLAMA_512="${QWEN36_LLAMA_512:-275.61}"
+QWEN36_LLAMA_4K="${QWEN36_LLAMA_4K:-276.30}"

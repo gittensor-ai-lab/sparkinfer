@@ -1,0 +1,104 @@
+Skipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb65b36914.nv26.02 for torchao version 0.15.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.5.4 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc20
+[07/03/2026-19:43:20] [TRT-LLM] [I] [bench] Preparing to run latency benchmark...
+Parse safetensors files:   0%|          | 0/4 [00:00<?, ?it/s]Parse safetensors files:  25%|██▌       | 1/4 [00:00<00:00,  5.09it/s]Parse safetensors files: 100%|██████████| 4/4 [00:00<00:00, 20.34it/s]
+[07/03/2026-19:43:20] [TRT-LLM] [I] [bench] 
+===========================================================
+= DATASET DETAILS
+===========================================================
+Dataset Path:         /workspace/qwen_awq_bench/results/trtllm_docker_nvfp4/dataset_ctx128_out128_max512.json
+Number of Sequences:  1
+
+-- Percentiles statistics ---------------------------------
+
+        Input              Output           Seq. Length
+-----------------------------------------------------------
+MIN:   128.0000           128.0000           256.0000
+MAX:   128.0000           128.0000           256.0000
+AVG:   128.0000           128.0000           256.0000
+P50:   128.0000           128.0000           256.0000
+P90:   128.0000           128.0000           256.0000
+P95:   128.0000           128.0000           256.0000
+P99:   128.0000           128.0000           256.0000
+===========================================================
+
+Parse safetensors files:   0%|          | 0/4 [00:00<?, ?it/s]Parse safetensors files:  25%|██▌       | 1/4 [00:00<00:01,  1.84it/s]Parse safetensors files: 100%|██████████| 4/4 [00:00<00:00,  7.05it/s]
+`torch_dtype` is deprecated! Use `dtype` instead!
+[07/03/2026-19:43:21] [TRT-LLM] [W] [quantize] Inline 'config.json.quantization_config' diverges from 'hf_quant_config.json':
+  - group_size: file=16, inline=None
+[07/03/2026-19:43:21] [TRT-LLM] [I] [_torch] Validating KV Cache config against kv_cache_dtype="auto"
+[07/03/2026-19:43:21] [TRT-LLM] [I] [_torch] KV cache quantization set to "auto". Using checkpoint KV quantization.
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Number of attention layers: 48
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Estimated engine size: 16.85 GB
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Estimated total available memory for KV cache: 15.00 GB
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Estimated total cache memory: 13.50 GB. KV cache: 13.50 GB, Extra cache: 0.00 GB
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Estimated kv cache max tokens: 294863.14
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Estimated max number of requests in KV cache memory: 1151.81
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Estimated max batch size (after fine-tune): 1280
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Estimated max num tokens (after fine-tune): 2304
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Initial settings: max_batch_size=1280 (heuristic), max_num_tokens=2304 (heuristic).
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Setting PyTorch max sequence length to 512
+[07/03/2026-19:43:21] [TRT-LLM] [I] [bench] Setting up latency benchmark.
+[07/03/2026-19:43:21] [TRT-LLM] [W] [bench] Ignore batching_type for _autodeploy backend.
+[07/03/2026-19:43:21] [TRT-LLM] [W] [bench] Ignore extended_runtime_perf_knob_config for _autodeploy backend.
+`PixtralImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `PixtralImageProcessor` instead.
+/usr/local/lib/python3.12/dist-packages/tensorrt_llm/serve/openai_protocol.py:145: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  class ResponseFormat(OpenAIBaseModel):
+[07/03/2026-19:43:23] [TRT-LLM] [I] [llmapi] Processing LLM API environment variable overrides
+[07/03/2026-19:43:23] [TRT-LLM] [I] [llmapi] Setting TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG='1'
+[07/03/2026-19:43:23] [TRT-LLM] [I] [llmapi] Setting TRTLLM_MMHA_KERNEL_BLOCK_SIZE='256'
+[07/03/2026-19:43:23] [TRT-LLM] [I] [llmapi] Setting FORCE_MULTI_BLOCK_MODE='1'
+[07/03/2026-19:43:23] [TRT-LLM] [I] [llmapi] Setting TRTLLM_ENABLE_PDL='1'
+[07/03/2026-19:43:23] [TRT-LLM] [I] [llmapi] Using LLM with AutoDeploy backend
+[07/03/2026-19:43:23] [TRT-LLM] [W] [llmapi] Using default gpus_per_node: 1
+[07/03/2026-19:43:23] [TRT-LLM] [I] [llmapi] neither checkpoint_format nor checkpoint_loader were provided, checkpoint_format will be set to HF.
+[07/03/2026-19:43:23] [TRT-LLM] [E] [llmapi] Failed to parse the arguments for the LLM constructor: 1 validation error for LlmArgs
+  Value error, The top-level `max_batch_size` (1) must be greater than or equal to `cuda_graph_config.max_batch_size` (128). [type=value_error, input_value={'transforms': {'build_mo...nch'>}, 'world_size': 1}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/value_error
+Traceback (most recent call last):
+  File "/usr/local/bin/trtllm-bench", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1485, in __call__
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1406, in main
+    rv = self.invoke(ctx)
+         ^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1873, in invoke
+    return _process_result(sub_ctx.command.invoke(sub_ctx))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1269, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 824, in invoke
+    return callback(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/decorators.py", line 46, in new_func
+    return f(get_current_context().obj, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/bench/benchmark/low_latency.py", line 337, in latency_command
+    llm = get_llm(runtime_config, kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/bench/benchmark/__init__.py", line 148, in get_llm
+    llm = llm_cls(**kwargs)
+          ^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/llm.py", line 150, in __init__
+    super().__init__(*args, **kwargs)
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/llmapi/llm.py", line 1717, in __init__
+    super().__init__(model,
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/llmapi/llm.py", line 301, in __init__
+    raise e
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/llmapi/llm.py", line 287, in __init__
+    self.args = llm_args_cls(model=model,
+                ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/pydantic_settings/main.py", line 247, in __init__
+    super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+  File "/usr/local/lib/python3.12/dist-packages/pydantic/main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+pydantic_core._pydantic_core.ValidationError: 1 validation error for LlmArgs
+  Value error, The top-level `max_batch_size` (1) must be greater than or equal to `cuda_graph_config.max_batch_size` (128). [type=value_error, input_value={'transforms': {'build_mo...nch'>}, 'world_size': 1}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/value_error

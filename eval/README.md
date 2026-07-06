@@ -5,7 +5,7 @@ Provision (or reuse) a Blackwell GPU on vast.ai, build a sparkinfer submission, 
 
 ```
 submission (git ref) ─► build from source ─► correctness gate (token-match / KL vs llama.cpp)
-                     ─► speed (median bench) ─► LABEL (significance gate + headroom bucket)
+                     ─► 128 / 512 / 4k / 16k / 32k guards ─► strongest context speed score ─► LABEL
 ```
 
 The numeric label is a **deterministic function of measurements** (`bench/scripts/label.py`) so
@@ -33,8 +33,55 @@ python eval/vast_eval.py --ref <git-ref> --frontier 164 --ceiling 366 --destroy
 and cached weights (`/workspace/models`) persist, so the next `--reuse` run starts fast.
 `--keep` leaves it running; `--destroy` frees the disk too.
 
-`--frontier` = current best tok/s · `--ceiling` = roofline (or a reference such as llama.cpp's
-tok/s). Reuse mode assumes the weights are cached at `/workspace/models`.
+`--frontier` = current best tok/s for the scored target · `--ceiling` = roofline/reference display
+value. Reuse mode assumes the weights are cached at `/workspace/models`.
+
+The default eval target is now multi-context decode:
+- **128-token, 512-context, 4k-context, 16k-context, and 32k-context decode** are all no-regression guards. A PR must keep at least 98% of same-box `origin/main` speed at every measured context.
+- The **strongest single context improvement** becomes the scored target for `eval:<label>`. Improvements are never aggregated across contexts; two sub-2% gains do not combine into a score.
+- The bot also applies a UI-only context label (`128-context`, `512-context`, `4k-context`, `16k-context`, or `32k-context`) for the context that improved most. This does not change the score.
+- If a PR has both a real context win and a regression elsewhere, it is not rejected automatically; the bot adds `regression-128`, `regression-512`, `regression-4k`, `regression-16k`, and/or `regression-32k` labels for the regressed contexts. Regression labels block auto-merge and require maintainer judgment.
+- If no single context clears the 2% significance gate and any context regresses, the bot returns `eval:REJECT` and auto-closes the PR.
+- Difficulty compensation uses the selected context's llama.cpp baseline, so late-game improvements past the mature reference get the same multiplier logic at every context.
+
+32k is intentionally sampled once by default (`SPARKINFER_GUARD_32K_REPS=1`) to keep the eval cost bounded while still making long-context regressions and wins visible.
+
+Set `SPARKINFER_EVAL_MODE=short` or pass `--eval-mode short` to keep the legacy 128-token scoring path.
+
+## Dual-model scoring: Qwen3.6 primary, Qwen3-30B no-regression guard
+
+`--dual` scores **Qwen3.6-35B-A3B** (the current optimization frontier) and, in the same build on the
+same box, **guards Qwen3-30B-A3B against regression** — an optimization that speeds up Qwen3.6 must
+not quietly break or slow the shipped Qwen3 path.
+
+```
+build once ─► PRIMARY  Qwen3.6 : 128/512/4k/16k/32k speed + token-match/KL vs llama.cpp ─► eval:<LABEL>
+           └► GUARD    Qwen3-30B: same speed sweep + accuracy gate ─► must NOT regress, else REJECT
+```
+
+- The **eval:<label>** (XS…XL / none / REJECT) is driven **only by Qwen3.6** — its strongest single
+  context improvement over the Qwen3.6 frontier, same significance/bucket/difficulty rules as above.
+- The **Qwen3-30B guard** re-runs the full 5-context speed sweep **and** the top-1/KL accuracy gate.
+  If Qwen3 drops below 98% of its own same-box `origin/main` at *any* context, **or** breaks parity
+  with llama.cpp (top-1 < 0.90 or KL > 0.20), the whole submission is **REJECTed** with a
+  `no-regression guard` reason and `regression-qwen3-<ctx>` detail — regardless of the Qwen3.6 gain.
+- Both models' measurements merge into one `RESULT_JSON`; the Qwen3 guard block is under `guard`.
+- Cost: two ~20 GB model loads + two llama.cpp accuracy passes, run **sequentially** (they don't fit
+  in VRAM together), so a dual eval is ~2× a single-model eval.
+
+```bash
+# Qwen3.6 scored, Qwen3-30B guarded (baselines are same-box origin/main tok/s per context):
+python eval/vast_eval.py --reuse <id> --dual \
+  --primary-frontier <qwen36_best_tps> --ceiling <roofline> \
+  --p-guard-128-baseline 23.2 --p-guard-512-baseline 23.2 --p-guard-4k-baseline 23.0 \
+  --p-guard-16k-baseline <..> --p-guard-32k-baseline <..> \
+  --guard-128-baseline 331 --guard-512-baseline 331 --guard-4k-baseline 322 \
+  --guard-16k-baseline 330 --guard-32k-baseline 300
+```
+
+The on-box orchestrator is `bench/scripts/evaluate_dual.sh` (builds once, calls the model-agnostic
+`evaluate.sh` twice via `SI_SKIP_BUILD=1`, merges). Qwen3.6 runs the same UD-Q4_K_M GGUF the runtime
+now loads by default (mixed Q5_K experts).
 
 ## Verdict (stdout)
 
@@ -42,8 +89,13 @@ tok/s). Reuse mode assumes the weights are cached at `/workspace/models`.
 { "commit": "abc1234", "tps": 165.2, "top1": 1.0, "kl": 0.14, "frontier_tps": 164,
   "pass": true, "label": "none", "delta_tps": 1.2, "pct_over_frontier": 0.7 }
 ```
-Labels: **REJECT** (failed correctness) · **none** (within the significance gate) ·
+Labels: **REJECT** (failed correctness or a no-regression guard) · **none** (within the significance gate) ·
 **XS · S · M · L · XL** (verified speedup bucket, by fraction of remaining headroom closed).
+
+Policy tests:
+```bash
+python3 bench/scripts/test_label.py
+```
 
 ## PR auto-evaluation bot
 

@@ -1,4 +1,7 @@
 results/
+!competitors/results/
+!competitors/results/qwen3_awq_rtx5090_20260703/
+!competitors/results/qwen3_awq_rtx5090_20260703/**
 __pycache__/
 *.pyc
 *.egg-info/

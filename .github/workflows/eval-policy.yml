@@ -1,0 +1,47 @@
+name: eval-policy
+
+on:
+  pull_request:
+    paths:
+      - "bench/scripts/**"
+      - "eval/**"
+      - ".github/workflows/eval-policy.yml"
+  push:
+    branches: [main]
+    paths:
+      - "bench/scripts/**"
+      - "eval/**"
+      - ".github/workflows/eval-policy.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          bash -n bench/scripts/evaluate.sh
+          bash -n eval/run_bot_cron.sh
+          bash -n eval/setup_labels.sh
+
+      - name: Python syntax
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            bench/scripts/label.py \
+            bench/scripts/test_label.py \
+            eval/pr_eval_bot.py \
+            eval/test_pr_eval_bot.py \
+            eval/vast_eval.py
+
+      - name: Eval policy tests
+        run: |
+          set -euo pipefail
+          python3 bench/scripts/test_label.py
+          python3 eval/test_pr_eval_bot.py

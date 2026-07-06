@@ -1,0 +1,66 @@
+# Benchmark target: Qwen3.6-35B-A3B GGUF on RTX Spark
+# RTX Spark: 128GB unified LPDDR5X, Blackwell sm_121, ~273 GB/s bandwidth.
+
+model:   configs/models/qwen36_35b_a3b.yaml
+quant:   q4_k_m
+
+hardware:
+  name: RTX Spark
+  arch: sm_121
+  unified_memory_gb: 128
+  bandwidth_gbps: 273
+  cuda_cores: 6144
+
+decode:
+  batch_sizes: [1, 2, 4, 8]
+  context_lens: [2048, 8192, 32768, 131072, 262144]
+  dtype: bfloat16
+
+  # Native sparkinfer decode exists for the hybrid Gated DeltaNet stack. These
+  # slots remain null until the sm_120/sm_121 build and benchmark are rerun on
+  # the pinned GGUF with the same-box llama.cpp baseline.
+  baseline_toks_per_sec:
+    bs1_ctx2k: null
+    bs1_ctx32k: null
+    bs1_ctx262k: null
+
+  target_toks_per_sec:
+    bs1_ctx2k: 90
+    bs1_ctx32k: 80
+    bs1_ctx262k: 60
+
+runtime:
+  sparkinfer_native_decode: true
+  required_work:
+    - cuda_build_validation
+    - llama_cpp_same_gguf_baseline_128_512
+    - sparkinfer_same_gguf_baseline_128_512
+    - qwen3_5_moe_mrope_parity_validation
+
+memory:
+  expert_eviction_needed: false
+  can_preload_all_experts: true
+  full_attention_kv_bytes_per_token: 20480
+
+attention:
+  linear_attention:
+    layers: 30
+    qk_heads: 16
+    value_heads: 32
+    head_dim: 128
+    bench_recurrent_state: true
+
+  full_attention:
+    layers: 10
+    num_kv_heads: 2
+    head_dim: 256
+    rotary_dim: 64
+    bench_full_ctx_attn: true
+
+moe:
+  bench_router_standalone: true
+  bench_expert_gemm: true
+  num_experts: 256
+  top_k: 8
+  shared_expert: true
+  expert_shape: [2048, 512]

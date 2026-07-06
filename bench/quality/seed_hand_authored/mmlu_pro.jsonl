@@ -1,0 +1,8 @@
+{"id": "m1", "benchmark": "mmlu_pro", "prompt": "Which sorting algorithm has O(n log n) average time complexity?", "choices": ["Bubble sort", "Merge sort", "Insertion sort", "Selection sort"], "answer": "B"}
+{"id": "m2", "benchmark": "mmlu_pro", "prompt": "What is the average-case time complexity of binary search on a sorted array of n elements?", "choices": ["O(n)", "O(n log n)", "O(log n)", "O(1)"], "answer": "C"}
+{"id": "m3", "benchmark": "mmlu_pro", "prompt": "Which data structure follows First-In-First-Out (FIFO) ordering?", "choices": ["Stack", "Queue", "Binary tree", "Hash map"], "answer": "B"}
+{"id": "m4", "benchmark": "mmlu_pro", "prompt": "What is the derivative of f(x) = x^2 with respect to x?", "choices": ["x", "2x", "x^2/2", "2"], "answer": "B"}
+{"id": "m5", "benchmark": "mmlu_pro", "prompt": "Which transport-layer protocol is connectionless?", "choices": ["TCP", "UDP", "HTTP", "FTP"], "answer": "B"}
+{"id": "m6", "benchmark": "mmlu_pro", "prompt": "Which gas is the primary contributor to the greenhouse effect from human activity?", "choices": ["Oxygen", "Nitrogen", "Carbon dioxide", "Argon"], "answer": "C"}
+{"id": "m7", "benchmark": "mmlu_pro", "prompt": "In Big-O notation, which describes the worst case of quicksort?", "choices": ["O(log n)", "O(n)", "O(n log n)", "O(n^2)"], "answer": "D"}
+{"id": "m8", "benchmark": "mmlu_pro", "prompt": "Which SI unit measures electric current?", "choices": ["Volt", "Ampere", "Ohm", "Watt"], "answer": "B"}

@@ -1,0 +1,6 @@
+{"id": "i1", "benchmark": "ifeval", "prompt": "Write exactly three bullet points listing benefits of local AI inference.", "instructions": [{"type": "bullet_count", "count": 3}]}
+{"id": "i2", "benchmark": "ifeval", "prompt": "Describe sparkinfer in under 30 words, all in lowercase, and include the word 'blackwell'.", "instructions": [{"type": "word_count_max", "count": 30}, {"type": "all_lowercase", "count": 0}, {"type": "keywords_include", "keywords": ["blackwell"]}]}
+{"id": "i3", "benchmark": "ifeval", "prompt": "Output a JSON object with the keys \"name\" and \"age\".", "instructions": [{"type": "json_format", "count": 0}]}
+{"id": "i4", "benchmark": "ifeval", "prompt": "Write exactly two sentences about GPUs. End your response with the word done.", "instructions": [{"type": "sentence_count", "count": 2}, {"type": "ends_with", "suffix": "done"}]}
+{"id": "i5", "benchmark": "ifeval", "prompt": "Give a product tagline. Wrap the title in double angle brackets like <<Title>> and include at least two [placeholders].", "instructions": [{"type": "title_present", "count": 0}, {"type": "placeholders_min", "count": 2}]}
+{"id": "i6", "benchmark": "ifeval", "prompt": "Answer with exactly five words and do not use any commas.", "instructions": [{"type": "word_count_exact", "count": 5}, {"type": "no_commas", "count": 0}]}

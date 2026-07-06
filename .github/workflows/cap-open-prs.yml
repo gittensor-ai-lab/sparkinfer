@@ -1,0 +1,94 @@
+name: cap-open-prs
+
+# Anti-spam: cap the number of OPEN pull requests a single contributor may have.
+# When a contributor is over the cap, their excess PRs (newest first) are auto-closed
+# with an explanatory comment. Maintainers and bots are exempt.
+#
+#  - pull_request_target(opened/reopened): enforces the cap for that author on every new PR.
+#    (pull_request_target runs in the base-repo context so the token can close FORK PRs.)
+#  - workflow_dispatch: one-off sweep over ALL authors — use it to clear an existing backlog.
+#
+# Safe by design: it never checks out or runs PR code — it only calls the GitHub API.
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+  workflow_dispatch:
+    inputs:
+      max:
+        description: "Max open PRs allowed per contributor"
+        default: "5"
+        required: false
+
+permissions:
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: cap-open-prs
+  cancel-in-progress: false
+
+jobs:
+  cap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce per-author open-PR cap
+        uses: actions/github-script@v7
+        env:
+          MAX_OPEN: ${{ github.event.inputs.max || '5' }}
+        with:
+          script: |
+            const MAX = parseInt(process.env.MAX_OPEN, 10) || 5;
+            const { owner, repo } = context.repo;
+            const isSweep = context.eventName === 'workflow_dispatch';
+
+            // Never touch these accounts.
+            const EXEMPT_LOGIN = new Set(['ai-hpc']);
+            const EXEMPT_ASSOC = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+
+            // All open PRs (author_association is included on each item).
+            const all = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+
+            // Which authors to enforce this run.
+            const authors = isSweep
+              ? [...new Set(all.map(p => p.user.login))]
+              : [context.payload.pull_request.user.login];
+
+            let closed = 0;
+            for (const author of authors) {
+              const mine = all.filter(p => p.user.login === author);
+              const sample = mine[0];
+              if (!sample) continue;
+              if (EXEMPT_LOGIN.has(author)) continue;
+              if (sample.user.type === 'Bot') continue;
+              // If any of their PRs shows maintainer association, treat them as a maintainer.
+              if (mine.some(p => EXEMPT_ASSOC.has(p.author_association))) continue;
+              if (mine.length <= MAX) continue;
+
+              // Keep the MAX oldest; close the newest excess.
+              mine.sort((a, b) => a.number - b.number);
+              const excess = mine.slice(MAX);
+              for (const p of excess) {
+                try {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: p.number,
+                    body:
+                      `Auto-closed to keep the review queue manageable.\n\n` +
+                      `**@${author}** has more than the limit of **${MAX} open pull requests** in this ` +
+                      `repository (${mine.length} open). Please get some of your open PRs reviewed, merged, ` +
+                      `or closed, then **reopen this one** — a smaller set gets reviewed much faster.\n\n` +
+                      `<sub>Automated by the per-author open-PR cap. Maintainers are exempt.</sub>`,
+                  });
+                  await github.rest.pulls.update({
+                    owner, repo, pull_number: p.number, state: 'closed',
+                  });
+                  closed++;
+                  core.info(`closed #${p.number} (@${author}, ${mine.length} open, cap ${MAX})`);
+                } catch (e) {
+                  core.warning(`#${p.number}: ${e.message}`);
+                }
+              }
+            }
+            core.notice(`cap-open-prs: closed ${closed} PR(s) over the cap of ${MAX}.`);

@@ -1,0 +1,3 @@
+max_batch_size: 1
+max_num_tokens: 512
+cuda_graph_config: null

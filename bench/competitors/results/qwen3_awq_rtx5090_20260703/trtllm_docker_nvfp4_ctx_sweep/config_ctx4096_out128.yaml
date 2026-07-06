@@ -1,0 +1,7 @@
+max_batch_size: 1
+max_num_tokens: 4224
+cuda_graph_config:
+  mode: decode
+  batch_sizes: [1]
+  max_batch_size: 1
+  enable_padding: false

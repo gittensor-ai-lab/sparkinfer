@@ -1,0 +1,31 @@
+/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 4.57.3 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[TensorRT-LLM] TensorRT LLM version: 1.2.1
+Traceback (most recent call last):
+  File "/workspace/qwen_awq_bench/trtllm-venv/bin/trtllm-bench", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/core.py", line 1569, in __call__
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/core.py", line 1490, in main
+    rv = self.invoke(ctx)
+         ^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/core.py", line 1970, in invoke
+    return _process_result(sub_ctx.command.invoke(sub_ctx))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/core.py", line 1353, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/core.py", line 907, in invoke
+    return callback(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/decorators.py", line 46, in new_func
+    return f(get_current_context().obj, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/bench/build/build.py", line 240, in build_command
+    apply_build_mode_settings(params)
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/bench/build/build.py", line 117, in apply_build_mode_settings
+    raise ValueError("Multiple engine build options detected, please "
+ValueError: Multiple engine build options detected, please choose only one engine build option. Exiting.
+>> exit=1 Fri Jul  3 18:25:27 UTC 2026

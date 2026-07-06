@@ -4,6 +4,14 @@ sparkinfer is the engineering arm of **SN74 on Gittensor**. Contributions are re
 for **real, verified inference-speed engineering** — not benchmark gaming. This guide is
 how to make a contribution that counts.
 
+## Built through Gittensor
+
+Gittensor helps power SPARKINFER through SN74: the project receives subnet emissions,
+contributors submit source PRs, the evaluator rebuilds those PRs on real RTX 5090 hardware,
+and rewards are assigned from verified marginal speedups that keep correctness intact.
+You do not need to be in Discord or understand the subnet internals to contribute, but the
+source of the incentive loop is clear: SPARKINFER is built through **SN74 on Gittensor**.
+
 ## Principles
 
 - **Source-required & reproducible.** The validator builds your PR from source. No
@@ -31,14 +39,14 @@ bench/scripts/accuracy.sh --download
 
 **Accuracy gate.** Run `bench/scripts/accuracy.sh` (or `qwen3_gguf_score`) on the build
 *before* and *after* your change. A correct optimization must keep:
-- **≥ 99–100% top-1 token agreement** vs the previous build, and
-- **mean KL ≈ 0** (the next-token distributions barely move).
+- **top-1 token agreement within the current eval threshold** vs the previous build, and
+- **low mean KL** (the next-token distributions should barely move).
 
 (`accuracy.sh` also compares against llama.cpp; the implementation bar there is ≥ 90%
 top-1, currently met at ~96–99%.) If `compute-sanitizer` is available, your kernels
 must be clean (0 errors).
 
-## How rewards work (SN74)
+## How rewards work (SN74 on Gittensor)
 
 **Speedup-only.** You're paid for the **verified marginal speedup** your PR adds over the
 current best ("frontier"), not your rank — so "copy the leader + ε" pays ≈ ε. Both **current
@@ -62,8 +70,7 @@ verified entry on a new model/target) — never by hand — and that tier is the
 is scored the same wherever it lands (`kernels/`, `runtime/`, `moe/`); there is **no
 per-subsystem budget**. Tiers are bands of **% speedup over the frontier** — `XS` 2–3.5%, `S`
 3.5–6%, `M` 6–10%, `L` 10–18%, `XL` >18% (a gain under 2% is within measurement noise → `none`).
-Because they scale with the frontier, every tier stays reachable as decode speed grows. See the
-[org reward model](https://github.com/gittensor-ai-lab).
+Because they scale with the frontier, every tier stays reachable as decode speed grows.
 
 **Non-speedup PRs are welcome — but score 0.** Bug fixes, refactors, tests, benchmarks, docs,
 and tooling are appreciated and we'll review and merge good ones, but SN74 emits only for

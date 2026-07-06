@@ -1,0 +1,37 @@
+name: copycat-guard
+# Real-time copycat detection — fires the instant a PR is opened (pull_request_target
+# runs from the BASE branch context, so it has full repo access to read all PRs, label,
+# comment, and close). Four-layer detection:
+#   L1: containment >=80% -> block+close (zero tolerance)
+#   L2: containment 70-79% -> copycat-warn + comment
+#   L3: containment 40-69% + Levenshtein>=0.70 + bigram_cosine>=0.60 -> bump to WARN
+#   L4: per-function containment 30-79% + DeepSeek LLM judge -> bump to WARN
+#   2nd warning strike (any layer) -> block+close
+
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  contents: write          # push policy files
+  pull-requests: write     # label + comment + close
+  issues: write            # PR comment
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    # Skip maintainer PRs
+    if: github.event.pull_request.author_association != 'OWNER' && github.event.pull_request.author_association != 'MEMBER' && github.event.pull_request.author_association != 'COLLABORATOR'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run copycat guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          PR_NUM="$PR_NUM" python3 eval/copycat_guard.py

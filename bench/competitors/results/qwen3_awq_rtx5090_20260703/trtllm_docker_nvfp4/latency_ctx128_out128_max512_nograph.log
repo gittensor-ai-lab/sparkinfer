@@ -1,0 +1,589 @@
+Skipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb65b36914.nv26.02 for torchao version 0.15.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.5.4 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc20
+[07/03/2026-19:46:03] [TRT-LLM] [I] [bench] Preparing to run latency benchmark...
+Parse safetensors files:   0%|          | 0/4 [00:00<?, ?it/s]Parse safetensors files:  50%|█████     | 2/4 [00:00<00:00,  9.89it/s]Parse safetensors files: 100%|██████████| 4/4 [00:00<00:00, 19.77it/s]
+[07/03/2026-19:46:04] [TRT-LLM] [I] [bench] 
+===========================================================
+= DATASET DETAILS
+===========================================================
+Dataset Path:         /workspace/qwen_awq_bench/results/trtllm_docker_nvfp4/dataset_ctx128_out128_max512_nograph.json
+Number of Sequences:  1
+
+-- Percentiles statistics ---------------------------------
+
+        Input              Output           Seq. Length
+-----------------------------------------------------------
+MIN:   128.0000           128.0000           256.0000
+MAX:   128.0000           128.0000           256.0000
+AVG:   128.0000           128.0000           256.0000
+P50:   128.0000           128.0000           256.0000
+P90:   128.0000           128.0000           256.0000
+P95:   128.0000           128.0000           256.0000
+P99:   128.0000           128.0000           256.0000
+===========================================================
+
+Parse safetensors files:   0%|          | 0/4 [00:00<?, ?it/s]Parse safetensors files:  25%|██▌       | 1/4 [00:00<00:01,  2.75it/s]Parse safetensors files:  50%|█████     | 2/4 [00:00<00:00,  4.28it/s]Parse safetensors files: 100%|██████████| 4/4 [00:00<00:00,  7.37it/s]
+`torch_dtype` is deprecated! Use `dtype` instead!
+[07/03/2026-19:46:05] [TRT-LLM] [W] [quantize] Inline 'config.json.quantization_config' diverges from 'hf_quant_config.json':
+  - group_size: file=16, inline=None
+[07/03/2026-19:46:05] [TRT-LLM] [I] [_torch] Validating KV Cache config against kv_cache_dtype="auto"
+[07/03/2026-19:46:05] [TRT-LLM] [I] [_torch] KV cache quantization set to "auto". Using checkpoint KV quantization.
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Number of attention layers: 48
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Estimated engine size: 16.85 GB
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Estimated total available memory for KV cache: 15.00 GB
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Estimated total cache memory: 13.50 GB. KV cache: 13.50 GB, Extra cache: 0.00 GB
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Estimated kv cache max tokens: 294863.14
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Estimated max number of requests in KV cache memory: 1151.81
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Estimated max batch size (after fine-tune): 1280
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Estimated max num tokens (after fine-tune): 2304
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Initial settings: max_batch_size=1280 (heuristic), max_num_tokens=2304 (heuristic).
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Setting PyTorch max sequence length to 512
+[07/03/2026-19:46:05] [TRT-LLM] [I] [bench] Setting up latency benchmark.
+[07/03/2026-19:46:05] [TRT-LLM] [W] [bench] Ignore batching_type for _autodeploy backend.
+[07/03/2026-19:46:05] [TRT-LLM] [W] [bench] Ignore extended_runtime_perf_knob_config for _autodeploy backend.
+`PixtralImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `PixtralImageProcessor` instead.
+/usr/local/lib/python3.12/dist-packages/tensorrt_llm/serve/openai_protocol.py:145: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  class ResponseFormat(OpenAIBaseModel):
+[07/03/2026-19:46:06] [TRT-LLM] [I] [llmapi] Processing LLM API environment variable overrides
+[07/03/2026-19:46:06] [TRT-LLM] [I] [llmapi] Setting TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG='1'
+[07/03/2026-19:46:06] [TRT-LLM] [I] [llmapi] Setting TRTLLM_MMHA_KERNEL_BLOCK_SIZE='256'
+[07/03/2026-19:46:06] [TRT-LLM] [I] [llmapi] Setting FORCE_MULTI_BLOCK_MODE='1'
+[07/03/2026-19:46:06] [TRT-LLM] [I] [llmapi] Setting TRTLLM_ENABLE_PDL='1'
+[07/03/2026-19:46:06] [TRT-LLM] [I] [llmapi] Using LLM with AutoDeploy backend
+[07/03/2026-19:46:06] [TRT-LLM] [W] [llmapi] Using default gpus_per_node: 1
+[07/03/2026-19:46:06] [TRT-LLM] [I] [llmapi] neither checkpoint_format nor checkpoint_loader were provided, checkpoint_format will be set to HF.
+[AUTO-DEPLOY] [WARNING] torch_dtype not found in quant_config, using default float16
+[07/03/2026-19:46:06] [TRT-LLM] [W] [quantize] Inline 'config.json.quantization_config' diverges from 'hf_quant_config.json':
+  - group_size: file=16, inline=None
+[07/03/2026-19:46:06] [TRT-LLM] [W] [executor] Orchestrator is creating IPC executor
+[33;20mrank 0 using MpiPoolSession to spawn MPI processes
+[0m[07/03/2026-19:46:06] [TRT-LLM] [I] [executor] Generating a new HMAC key for server proxy_request_queue
+[07/03/2026-19:46:06] [TRT-LLM] [I] [executor] Generating a new HMAC key for server worker_init_status_queue
+[07/03/2026-19:46:06] [TRT-LLM] [I] [executor] Generating a new HMAC key for server proxy_result_queue
+Skipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb65b36914.nv26.02 for torchao version 0.15.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+Multiple distributions found for package optimum. Picked distribution: optimum
+Multiple distributions found for package modelopt. Picked distribution: nvidia-modelopt
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.5.4 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc20
+`PixtralImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `PixtralImageProcessor` instead.
+/usr/local/lib/python3.12/dist-packages/tensorrt_llm/serve/openai_protocol.py:145: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  class ResponseFormat(OpenAIBaseModel):
+[TRT-LLM] [I] [runtime][RANK 0] Refreshed the MPI local session
+[07/03/2026-19:46:23] [TRT-LLM] [W] [executor] Worker process 2118 is affined to run on the following CPUs: [2, 14] (subset of all logical CPUs). This may harm performance if set incorrectly.
+[07/03/2026-19:46:23] [TRT-LLM] [W] [executor] Worker process 2118 has constrained CPU affinity but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. Removing CPU affinity constraints.
+[AUTO-DEPLOY] [INFO] [RANK 0] Initializing for: lib='OMPI', local_rank=0, world_size=1, port=39851
+[AUTO-DEPLOY] [INFO] [RANK 0] dist_config=world_size=1 rank=0 tp_size=1 pp_size=1 moe_tp_size=1 moe_ep_size=1 moe_cluster_size=1 enable_attention_dp=False allreduce_strategy='NCCL', dist=<tensorrt_llm._torch.distributed.communicator.MPIDist object at 0x7aaab2b03230>, port=39851
+[AUTO-DEPLOY] [WARNING] [RANK 0] torch_dtype not found in quant_config, using default float16
+[AUTO-DEPLOY] [INFO] [RANK 0] [SequenceInfo:] self.max_seq_len=512, self.max_batch_size=2, self.max_num_tokens=512, self.max_blocks_per_seq=16, self.tokens_per_block=32
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=factory, transform=build_model] [PRE-CLEANUP] skipped (disabled)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=factory, transform=build_model] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=factory, transform=build_model] [APPLY] Using custom model implementation <class 'tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_moe.Qwen3MoeForCausalLM'>
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=factory, transform=build_model] [POST-CLEANUP] graph canonicalization
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=factory, transform=build_model] [SUMMARY] matches=1 | time: 6.136s (pre=0.000s, apply=6.045s, post=0.091s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=export, transform=export_to_gm] [PRE-CLEANUP] skipped (disabled)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=export, transform=export_to_gm] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=export, transform=export_to_gm] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=export, transform=export_to_gm] [SUMMARY] matches=1 | time: 26.212s (pre=0.000s, apply=26.212s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_noop_slice] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_noop_slice] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_noop_slice] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_noop_slice] [SUMMARY] matches=0 | time: 0.021s (pre=0.000s, apply=0.021s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_noop_add] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_noop_add] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_noop_add] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_noop_add] [SUMMARY] matches=0 | time: 0.022s (pre=0.000s, apply=0.022s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_input_constraints] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_input_constraints] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_input_constraints] [POST-CLEANUP] graph canonicalization
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_export, transform=cleanup_input_constraints] [SUMMARY] matches=2 | time: 0.887s (pre=0.000s, apply=0.016s, post=0.871s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_moe_pattern] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_moe_pattern] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_moe_pattern] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_moe_pattern] [SUMMARY] matches=0 | time: 0.317s (pre=0.000s, apply=0.317s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_dense_moe_pattern] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_dense_moe_pattern] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_dense_moe_pattern] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_dense_moe_pattern] [SUMMARY] matches=0 | time: 0.092s (pre=0.000s, apply=0.092s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_bmm_moe_pattern] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_bmm_moe_pattern] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_bmm_moe_pattern] [POST-CLEANUP] graph canonicalization
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_bmm_moe_pattern] [SUMMARY] matches=0 | time: 1.198s (pre=0.000s, apply=0.323s, post=0.875s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=split_moe_fused_for_sharding] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=split_moe_fused_for_sharding] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=split_moe_fused_for_sharding] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=split_moe_fused_for_sharding] [SUMMARY] skipped | time: 0.021s (pre=0.000s, apply=0.021s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_repeat_kv] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_repeat_kv] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_repeat_kv] [POST-CLEANUP] graph canonicalization + shape_prop
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_repeat_kv] [SUMMARY] matches=0 | time: 7.442s (pre=0.000s, apply=0.053s, post=7.389s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_eager_attention] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_eager_attention] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_eager_attention] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_eager_attention] [SUMMARY] matches=0 | time: 0.210s (pre=0.000s, apply=0.210s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_sdpa_to_torch_attention] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_sdpa_to_torch_attention] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_sdpa_to_torch_attention] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_sdpa_to_torch_attention] [SUMMARY] matches=0 | time: 0.487s (pre=0.000s, apply=0.487s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_grouped_attention] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_grouped_attention] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_grouped_attention] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_grouped_attention] [SUMMARY] matches=0 | time: 0.299s (pre=0.000s, apply=0.299s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_attention_layout] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_attention_layout] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_attention_layout] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_attention_layout] [SUMMARY] matches=0 | time: 0.257s (pre=0.000s, apply=0.257s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rope_pattern] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rope_pattern] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rope_pattern] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rope_pattern] [SUMMARY] matches=0 | time: 0.163s (pre=0.000s, apply=0.163s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rope_layout] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rope_layout] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rope_layout] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rope_layout] [SUMMARY] matches=0 | time: 0.020s (pre=0.000s, apply=0.020s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rmsnorm_pattern] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rmsnorm_pattern] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rmsnorm_pattern] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_rmsnorm_pattern] [SUMMARY] matches=0 | time: 0.197s (pre=0.000s, apply=0.197s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_l2norm_pattern] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_l2norm_pattern] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_l2norm_pattern] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_l2norm_pattern] [SUMMARY] matches=0 | time: 0.134s (pre=0.000s, apply=0.134s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_moe_routing_pattern] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_moe_routing_pattern] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_moe_routing_pattern] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_moe_routing_pattern] [SUMMARY] matches=0 | time: 0.022s (pre=0.000s, apply=0.022s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=eliminate_redundant_transposes] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=eliminate_redundant_transposes] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=eliminate_redundant_transposes] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=eliminate_redundant_transposes] [SUMMARY] matches=0 | time: 0.021s (pre=0.000s, apply=0.021s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_int4_linear_from_config] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_int4_linear_from_config] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_int4_linear_from_config] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_int4_linear_from_config] [SUMMARY] skipped | time: 0.015s (pre=0.000s, apply=0.015s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_int4_gptq_linear_from_config] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_int4_gptq_linear_from_config] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_int4_gptq_linear_from_config] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_int4_gptq_linear_from_config] [SUMMARY] skipped | time: 0.015s (pre=0.000s, apply=0.014s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_linear_from_config] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_linear_from_config] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_linear_from_config] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_linear_from_config] [SUMMARY] skipped | time: 0.014s (pre=0.000s, apply=0.014s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_linear_from_config] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_linear_from_config] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_linear_from_config] [POST-CLEANUP] graph canonicalization
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_linear_from_config] [SUMMARY] matches=192 | time: 1.101s (pre=0.000s, apply=0.198s, post=0.903s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_finegrained_fp8_linear_from_config] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_finegrained_fp8_linear_from_config] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_finegrained_fp8_linear_from_config] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_finegrained_fp8_linear_from_config] [SUMMARY] skipped | time: 0.015s (pre=0.000s, apply=0.015s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_finegrained_fp8_moe] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_finegrained_fp8_moe] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_finegrained_fp8_moe] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_finegrained_fp8_moe] [SUMMARY] skipped | time: 0.015s (pre=0.000s, apply=0.015s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_bmm_from_config] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_bmm_from_config] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_bmm_from_config] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_bmm_from_config] [SUMMARY] skipped | time: 0.015s (pre=0.000s, apply=0.015s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_from_graph] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_from_graph] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_from_graph] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_from_graph] [SUMMARY] skipped | time: 0.029s (pre=0.000s, apply=0.029s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_from_graph] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_from_graph] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_from_graph] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_from_graph] [SUMMARY] skipped | time: 0.029s (pre=0.000s, apply=0.029s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_swiglu_pattern] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_swiglu_pattern] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_swiglu_pattern] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_swiglu_pattern] [SUMMARY] matches=0 | time: 0.084s (pre=0.000s, apply=0.084s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_nvfp4_swiglu_pattern] [PRE-CLEANUP] graph canonicalization + shape_prop
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_nvfp4_swiglu_pattern] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_nvfp4_swiglu_pattern] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_nvfp4_swiglu_pattern] [SUMMARY] matches=0 | time: 7.714s (pre=7.643s, apply=0.071s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_finegrained_fp8_swiglu_pattern] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_finegrained_fp8_swiglu_pattern] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_finegrained_fp8_swiglu_pattern] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=match_finegrained_fp8_swiglu_pattern] [SUMMARY] matches=0 | time: 0.043s (pre=0.000s, apply=0.042s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_moe] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_moe] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_moe] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_fp8_moe] [SUMMARY] skipped | time: 0.015s (pre=0.000s, apply=0.015s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_moe] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_moe] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_moe] [POST-CLEANUP] graph canonicalization + shape_prop
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_nvfp4_moe] [SUMMARY] matches=48 | time: 28.635s (pre=0.000s, apply=3.430s, post=25.205s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_mxfp4_moe] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_mxfp4_moe] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_mxfp4_moe] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=quantize_mxfp4_moe] [SUMMARY] skipped | time: 0.015s (pre=0.000s, apply=0.015s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=pattern_matcher, transform=detect_hidden_states_for_capture] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=detect_sharding] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=detect_sharding] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=detect_sharding] [APPLY] Using allreduce strategy: NCCL, dist backend: DistBackend.AUTO
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=detect_sharding] [APPLY] Skipping sharding for a single device setup
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=detect_sharding] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=detect_sharding] [SUMMARY] skipped | time: 0.015s (pre=0.000s, apply=0.015s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=sharding_transform_executor] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=sharding_transform_executor] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=sharding_transform_executor] [APPLY] sharding_transform_executor: gm=GraphModule, is_draft=False, TP=0, EP=0, BMM=0, RMSNorm=0
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=sharding_transform_executor] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=sharding_transform_executor] [SUMMARY] matches=0 | time: 0.023s (pre=0.000s, apply=0.022s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=apply_sharding_hints] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=pipeline_cache] [PRE-CLEANUP] skipped (disabled)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=pipeline_cache] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=pipeline_cache] [APPLY] Saved AutoDeploy pipeline cache to /root/.cache/tensorrt_llm/auto_deploy/pipeline_cache/7a6633678e101856109c0e72bec172598c541f682f92cecd5011ebda92bed893/rank_0
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=pipeline_cache] [POST-CLEANUP] skipped (disabled)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=sharding, transform=pipeline_cache] [SUMMARY] matches=1 | time: 8.709s (pre=0.000s, apply=8.709s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=strip_sharding_hints] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=strip_sharding_hints] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=strip_sharding_hints] [POST-CLEANUP] graph canonicalization
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=strip_sharding_hints] [SUMMARY] matches=480 | time: 5.713s (pre=0.000s, apply=2.521s, post=3.192s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [APPLY] Estimated parameters memory: 15.10 GB
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [APPLY] Preloading checkpoint files to CPU
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [APPLY] Loading weight file: /workspace/qwen_awq_bench/models/qwen3-nvfp4/model-00002-of-00004.safetensors
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [APPLY] Loading weight file: /workspace/qwen_awq_bench/models/qwen3-nvfp4/model-00001-of-00004.safetensors
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [APPLY] Loading weight file: /workspace/qwen_awq_bench/models/qwen3-nvfp4/model-00003-of-00004.safetensors
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [APPLY] Loading weight file: /workspace/qwen_awq_bench/models/qwen3-nvfp4/model-00004-of-00004.safetensors
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [APPLY] Loading weights into model (device: cuda:0)...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [APPLY] Checkpoint loading completed
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [CUDA MEM DIFF (EXPECTED)] free:   9.76GB (-19.74GB) | resv:  19.78GB (+19.74GB) | alloc:  16.89GB (+16.86GB) | frag:   2.88GB (+2.88GB)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=load_weights] [SUMMARY] matches=0 | time: 43.182s (pre=0.000s, apply=43.181s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=move_inputs_to_device] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=move_inputs_to_device] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=move_inputs_to_device] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=weight_load, transform=move_inputs_to_device] [SUMMARY] matches=0 | time: 0.010s (pre=0.000s, apply=0.010s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_gemms_mixed_children] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_gemms] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_fp4_gemms] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_fp8_gemms] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_fp8_linear] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_fp8_linear] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_fp8_linear] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_fp8_linear] [SUMMARY] skipped | time: 0.065s (pre=0.000s, apply=0.065s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_trtllm_attn_quant_fp8] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_linear] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_linear] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_linear] [POST-CLEANUP] graph canonicalization
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_linear] [SUMMARY] matches=192 | time: 6.573s (pre=0.000s, apply=3.360s, post=3.213s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_relu2_quant_nvfp4] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_relu2_quant_nvfp4] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_relu2_quant_nvfp4] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_relu2_quant_nvfp4] [SUMMARY] skipped | time: 0.030s (pre=0.000s, apply=0.030s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_swiglu] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_swiglu] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_swiglu] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_swiglu] [SUMMARY] matches=0 | time: 0.036s (pre=0.000s, apply=0.036s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_swiglu] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_swiglu] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_swiglu] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_swiglu] [SUMMARY] matches=0 | time: 0.036s (pre=0.000s, apply=0.035s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_linear] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_linear] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_linear] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_linear] [SUMMARY] skipped | time: 0.057s (pre=0.000s, apply=0.057s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_mxfp4_moe] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_mxfp4_moe] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_mxfp4_moe] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_mxfp4_moe] [SUMMARY] skipped | time: 0.019s (pre=0.000s, apply=0.019s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_moe] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_moe] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_moe] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_moe] [SUMMARY] matches=0 | time: 0.986s (pre=0.000s, apply=0.986s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_fp8_moe] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_fp8_moe] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_fp8_moe] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_fp8_moe] [SUMMARY] skipped | time: 0.942s (pre=0.000s, apply=0.942s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_moe] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_moe] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_moe] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_finegrained_fp8_moe] [SUMMARY] skipped | time: 0.918s (pre=0.000s, apply=0.918s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_moe] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_moe] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_moe] [APPLY] FuseNVFP4Moe: backend=cutlass, enable_trtllm_gen_internal_routing=True
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_moe] [POST-CLEANUP] graph canonicalization
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_moe] [CUDA MEM DIFF (EXPECTED)] free:  12.02GB (+2.26GB) | resv:  17.52GB (-2.26GB) | alloc:  16.88GB (-0.02GB) | frag:   0.64GB (-2.24GB)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_nvfp4_moe] [SUMMARY] matches=48 | time: 2.678s (pre=0.000s, apply=2.585s, post=0.094s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_allreduce_residual_rmsnorm] [PRE-CLEANUP] graph canonicalization + shape_prop
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_allreduce_residual_rmsnorm] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_allreduce_residual_rmsnorm] [APPLY] allreduce strategy selected = 'NCCL'
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_allreduce_residual_rmsnorm] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_allreduce_residual_rmsnorm] [SUMMARY] matches=0 | time: 0.945s (pre=0.867s, apply=0.077s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rmsnorm] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rmsnorm] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rmsnorm] [POST-CLEANUP] graph canonicalization
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rmsnorm] [SUMMARY] matches=193 | time: 0.152s (pre=0.000s, apply=0.069s, post=0.083s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rmsnorm_quant_nvfp4] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rmsnorm_quant_nvfp4] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rmsnorm_quant_nvfp4] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rmsnorm_quant_nvfp4] [SUMMARY] matches=47 | time: 0.115s (pre=0.000s, apply=0.115s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_gdn_gating] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_gdn_gating] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_gdn_gating] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_gdn_gating] [SUMMARY] matches=0 | time: 0.002s (pre=0.000s, apply=0.002s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_l2norm] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_l2norm] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_l2norm] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_l2norm] [SUMMARY] matches=0 | time: 0.002s (pre=0.000s, apply=0.002s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_silu_mul] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_silu_mul] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_silu_mul] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_silu_mul] [SUMMARY] matches=0 | time: 0.002s (pre=0.000s, apply=0.002s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_swiglu] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_add_rms_norm] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rmsnorm_quant_fp8] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=gather_logits_before_lm_head] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rope_into_trtllm_attention] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=fuse_rope_into_trtllm_mla] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=optimize_rope] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=optimize_rope] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=optimize_rope] [POST-CLEANUP] graph canonicalization
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=optimize_rope] [SUMMARY] matches=48 | time: 0.092s (pre=0.000s, apply=0.005s, post=0.087s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=post_load_fusion, transform=mlir_elementwise_fusion] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_attention] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_attention] [APPLY] applying transform...
+/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/utils/_graph.py:495: FutureWarning: `treespec.children_specs` is deprecated. Use `treespec.child(index)` to access a single child, or `treespec.children()` to get all children.
+  in_spec_for_args = in_spec.children_specs[1 if add_kwargs else 0]
+/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/utils/_graph.py:505: FutureWarning: `treespec.children_specs` is deprecated. Use `treespec.child(index)` to access a single child, or `treespec.children()` to get all children.
+  in_spec_for_args.children_specs.append(_LEAF_SPEC)
+/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/utils/_graph.py:140: FutureWarning: `treespec.children_specs` is deprecated. Use `treespec.child(index)` to access a single child, or `treespec.children()` to get all children.
+  if hasattr(spec, "children_specs"):
+/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/utils/_graph.py:141: FutureWarning: `treespec.children_specs` is deprecated. Use `treespec.child(index)` to access a single child, or `treespec.children()` to get all children.
+  for child_spec in spec.children_specs:
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_attention] [POST-CLEANUP] graph canonicalization
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_attention] [SUMMARY] matches=48 | time: 0.123s (pre=0.000s, apply=0.037s, post=0.086s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_mla_attention] [PRE-CLEANUP] graph canonicalization + shape_prop
+[AUTO-DEPLOY] [WARNING] [RANK 0] [stage=cache_init, transform=insert_cached_mla_attention] No fake tensors and no args available for shape propagation
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_mla_attention] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_mla_attention] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_mla_attention] [SUMMARY] skipped | time: 0.097s (pre=0.094s, apply=0.002s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_ssm_attention] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_ssm_attention] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_ssm_attention] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_ssm_attention] [SUMMARY] skipped | time: 0.001s (pre=0.000s, apply=0.001s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_causal_conv] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_causal_conv] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_causal_conv] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_causal_conv] [SUMMARY] skipped | time: 0.002s (pre=0.000s, apply=0.001s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_delta_rule] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_delta_rule] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_delta_rule] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_delta_rule] [SUMMARY] skipped | time: 0.001s (pre=0.000s, apply=0.001s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_gated_delta_rule] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_gated_delta_rule] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_gated_delta_rule] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_gated_delta_rule] [SUMMARY] skipped | time: 0.001s (pre=0.000s, apply=0.001s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_residual_add] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_residual_add] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_residual_add] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=insert_cached_residual_add] [SUMMARY] skipped | time: 0.001s (pre=0.000s, apply=0.001s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=initialize_mrope_delta_cache] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=initialize_cache] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=initialize_cache] [APPLY] applying transform...
+[07/03/2026-19:48:59] [TRT-LLM] [I] [_torch] max_tokens is set by kv_cache_config.max_tokens: 512
+[07/03/2026-19:48:59] [TRT-LLM] [I] [_torch] [KVCacheManager] execution_stream: <torch.cuda.Stream device=cuda:0 cuda_stream=0x43134f70>
+[07/03/2026-19:48:59] [TRT-LLM] [I] [_torch] [KVCacheManager] blocks_per_window: {512: (16, 0)}
+[TRT-LLM] [I] [batchmgr][RANK 0] Max KV cache blocks per sequence: 16 [window size=512], tokens per block=32, primary blocks=16, secondary blocks=0, max sequence length=512
+[TRT-LLM] [I] [batchmgr][RANK 0] Number of tokens per block: 32.
+[TRT-LLM] [I] [batchmgr][RANK 0] [MemUsageChange] Allocated 0.02 GiB for max tokens in paged KV cache (512).
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=initialize_cache] [APPLY] KV manager: 48 layers across 1 pool(s); pool_configurations=[PoolConfiguration(window_size=512, head_dim=128, dtype=DataType.FP8)], max_attention_window=[512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512], max_tokens=512
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=initialize_cache] [APPLY] Cache stats (total/managed): total=48/48, kv=48/48, paged_other=0, ssm=0/0, conv=0/0, state_other=0, other=0, max_tokens=512
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=initialize_cache] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=initialize_cache] [CUDA MEM DIFF (EXPECTED)] free:  11.99GB (-0.02GB) | resv:  17.52GB | alloc:  16.88GB | frag:   0.64GB
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=initialize_cache] [SUMMARY] matches=48 | time: 0.012s (pre=0.000s, apply=0.012s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=resize_kv_cache] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=resize_kv_cache] [APPLY] applying transform...
+[07/03/2026-19:49:01] [TRT-LLM] [W] [_torch] [AutoTuner] trtllm::nvfp4_gemm::gemm using the fallback tactic, due to cache miss on input shapes=(torch.Size([512, 1024]), torch.Size([4096, 1024]), torch.Size([65536]), torch.Size([4096, 128]), torch.Size([]))
+[07/03/2026-19:49:03] [TRT-LLM] [W] [_torch] [AutoTuner] trtllm::fused_moe::gemm1 using the fallback tactic, due to cache miss on input shapes=(torch.Size([512, 128]), torch.Size([128, 1536, 128]), torch.Size([0]), torch.Size([128, 2048, 48]), torch.Size([0]))
+[07/03/2026-19:49:03] [TRT-LLM] [W] [_torch] [AutoTuner] trtllm::fused_moe::gemm2 using the fallback tactic, due to cache miss on input shapes=(torch.Size([512, 128]), torch.Size([128, 1536, 128]), torch.Size([0]), torch.Size([128, 2048, 48]), torch.Size([0]))
+[07/03/2026-19:49:03] [TRT-LLM] [I] [_torch] max_tokens is set by kv_cache_config.max_tokens: 1024
+[07/03/2026-19:49:03] [TRT-LLM] [I] [_torch] [KVCacheManager] execution_stream: <torch.cuda.Stream device=cuda:0 cuda_stream=0x433f9a90>
+[07/03/2026-19:49:03] [TRT-LLM] [I] [_torch] [KVCacheManager] blocks_per_window: {512: (32, 0)}
+[TRT-LLM] [I] [batchmgr][RANK 0] Max KV cache blocks per sequence: 16 [window size=512], tokens per block=32, primary blocks=32, secondary blocks=0, max sequence length=512
+[TRT-LLM] [I] [batchmgr][RANK 0] Number of tokens per block: 32.
+[TRT-LLM] [I] [batchmgr][RANK 0] [MemUsageChange] Allocated 0.05 GiB for max tokens in paged KV cache (1024).
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=resize_kv_cache] [APPLY] KV manager: 48 layers across 1 pool(s); pool_configurations=[PoolConfiguration(window_size=512, head_dim=128, dtype=DataType.FP8)], max_attention_window=[512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512], max_tokens=1024
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=resize_kv_cache] [APPLY] Resize mem info: free_mem=11.66GB, free_gpu_memory_fraction=0.9, mem_exclude=1.15GB
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=resize_kv_cache] [APPLY] Final cache mem: max_tokens=1024, paged=9.46GB, non_paged=0.00GB, total=9.46GB
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=resize_kv_cache] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=resize_kv_cache] [CUDA MEM DIFF (EXPECTED)] free:  11.62GB (-0.38GB) | resv:  17.80GB (+0.29GB) | alloc:  17.16GB (+0.28GB) | frag:   0.64GB
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=cache_init, transform=resize_kv_cache] [SUMMARY] matches=0 | time: 4.498s (pre=0.000s, apply=4.498s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=visualize, transform=visualize_namespace] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=fuse_causal_conv_activation] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=fuse_causal_conv_activation] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=fuse_causal_conv_activation] [POST-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=fuse_causal_conv_activation] [SUMMARY] matches=0 | time: 0.004s (pre=0.000s, apply=0.004s, post=0.000s)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=multi_stream_moe] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=multi_stream_mla_attn] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=multi_stream_gemm] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=cleanup_identity_dtype_cast] [SUMMARY] disabled
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=compile_model] [PRE-CLEANUP] skipped (graph already clean)
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=compile_model] [APPLY] applying transform...
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=compile_model] [APPLY] Auto-generated piecewise_num_tokens from max_num_tokens=512: [64, 128, 256, 512]
+[AUTO-DEPLOY] [INFO] [RANK 0] [stage=compile, transform=compile_model] [APPLY] CompileModel: compiling 1 GraphModule(s): ['(root)']
+[07/03/2026-19:49:03] [TRT-LLM] [E] [executor] Failed to initialize executor on rank 0: list index out of range
+[07/03/2026-19:49:03] [TRT-LLM] [E] [executor] Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/worker.py", line 302, in worker_main
+    worker: GenerationExecutorWorker = worker_cls(
+                                       ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/worker.py", line 67, in __init__
+    self.setup_engine()
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/base_worker.py", line 286, in setup_engine
+    self.engine = _create_py_executor(
+                  ^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/base_worker.py", line 257, in _create_py_executor
+    _executor = create_executor(**args)
+                ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/shim/ad_executor.py", line 1193, in create_autodeploy_executor
+    engine = ADEngine.build_from_config(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/shim/ad_executor.py", line 417, in build_from_config
+    return cls(
+           ^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/shim/ad_executor.py", line 509, in __init__
+    self.model = get_inference_model(self.cache_seq_interface)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/optimizer.py", line 115, in __call__
+    mod = transform(mod, cm, self.factory, self.shared_config, idx)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/interface.py", line 298, in _wrapper
+    return call_fn(self, gm, cm, factory, shared_config, idx)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/interface.py", line 453, in __call__
+    mod, info_apply = self._apply_per_gm_or_whole_model(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/interface.py", line 544, in _apply_per_gm_or_whole_model
+    return self._apply_to_full_model(mod, cm, factory, shared_config)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/library/compile_model.py", line 223, in _apply_to_full_model
+    compiled_gm = _compile_one(gm, full_model=mod if gm_key else None)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/library/compile_model.py", line 200, in _compile_one
+    return compiler_backend.compile()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py", line 1239, in compile
+    monolithic.capture_graph(get_capture_args_with_warmup, self.cuda_graph_batch_sizes)
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py", line 287, in capture_graph
+    probe_bs = max(1, batch_sizes[0] - 1)
+                      ~~~~~~~~~~~^^^
+IndexError: list index out of range
+
+[07/03/2026-19:49:03] [TRT-LLM] [I] [executor] get signal from executor worker
+[07/03/2026-19:49:03] [TRT-LLM] [E] [executor] Executor worker initialization error: Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/worker.py", line 302, in worker_main
+    worker: GenerationExecutorWorker = worker_cls(
+                                       ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/worker.py", line 67, in __init__
+    self.setup_engine()
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/base_worker.py", line 286, in setup_engine
+    self.engine = _create_py_executor(
+                  ^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/base_worker.py", line 257, in _create_py_executor
+    _executor = create_executor(**args)
+                ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/shim/ad_executor.py", line 1193, in create_autodeploy_executor
+    engine = ADEngine.build_from_config(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/shim/ad_executor.py", line 417, in build_from_config
+    return cls(
+           ^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/shim/ad_executor.py", line 509, in __init__
+    self.model = get_inference_model(self.cache_seq_interface)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/optimizer.py", line 115, in __call__
+    mod = transform(mod, cm, self.factory, self.shared_config, idx)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/interface.py", line 298, in _wrapper
+    return call_fn(self, gm, cm, factory, shared_config, idx)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/interface.py", line 453, in __call__
+    mod, info_apply = self._apply_per_gm_or_whole_model(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/interface.py", line 544, in _apply_per_gm_or_whole_model
+    return self._apply_to_full_model(mod, cm, factory, shared_config)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/library/compile_model.py", line 223, in _apply_to_full_model
+    compiled_gm = _compile_one(gm, full_model=mod if gm_key else None)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/transform/library/compile_model.py", line 200, in _compile_one
+    return compiler_backend.compile()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py", line 1239, in compile
+    monolithic.capture_graph(get_capture_args_with_warmup, self.cuda_graph_batch_sizes)
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py", line 287, in capture_graph
+    probe_bs = max(1, batch_sizes[0] - 1)
+                      ~~~~~~~~~~~^^^
+IndexError: list index out of range
+
+[AUTO-DEPLOY] [INFO] [RANK 0] Destroying process group
+IndexError: list index out of range
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/usr/local/bin/trtllm-bench", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1485, in __call__
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1406, in main
+    rv = self.invoke(ctx)
+         ^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1873, in invoke
+    return _process_result(sub_ctx.command.invoke(sub_ctx))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1269, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 824, in invoke
+    return callback(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/decorators.py", line 46, in new_func
+    return f(get_current_context().obj, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/bench/benchmark/low_latency.py", line 337, in latency_command
+    llm = get_llm(runtime_config, kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/bench/benchmark/__init__.py", line 148, in get_llm
+    llm = llm_cls(**kwargs)
+          ^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/llm.py", line 150, in __init__
+    super().__init__(*args, **kwargs)
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/llmapi/llm.py", line 1717, in __init__
+    super().__init__(model,
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/llmapi/llm.py", line 349, in __init__
+    self._build_model()
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/auto_deploy/llm.py", line 198, in _build_model
+    super()._build_model()
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/llmapi/llm.py", line 1824, in _build_model
+    self._executor = self._executor_cls.create(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/executor.py", line 639, in create
+    return GenerationExecutor._create_ipc_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/executor.py", line 510, in _create_ipc_executor
+    return GenerationExecutorProxy(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/proxy.py", line 150, in __init__
+    self._start_executor_workers(worker_kwargs)
+  File "/usr/local/lib/python3.12/dist-packages/tensorrt_llm/executor/proxy.py", line 437, in _start_executor_workers
+    raise RuntimeError(
+RuntimeError: Executor worker returned error

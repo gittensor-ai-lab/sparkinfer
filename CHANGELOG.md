@@ -3,6 +3,284 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.3.6] — 2026-07-04
+
+This release breaks the long-context deficit wide open and adds a new axis of proof. sparkinfer now
+beats the llama.cpp Q4_K_M baseline by **30–36% from 128 to 16k, and ~30% (+29.8%) at 32k** on the same RTX 5090
+and GGUF — the 16k lead jumped from **+8.4% (v0.3.5) to +31%** — driven by moving long-context attention
+onto the tensor cores. And it ships the first **LLM-quality benchmark suite**, so the frontier is proven
+on real task capability, not only speed and token-agreement.
+
+### Performance — ~30% or more past llama.cpp at every context, out to 32k
+
+Same RTX 5090, same Qwen3-MoE Q4_K_M GGUF, 128 generated tokens, warm and **interleaved** (per-round
+A/B so GPU-clock drift cancels):
+
+| context | sparkinfer | llama.cpp | delta |
+|---|---:|---:|---:|
+| **128-token decode** | **489.86 tok/s** | 363.15 tok/s | **+34.9%** |
+| **512-context decode** | **471.09 tok/s** | 346.45 tok/s | **+36.0%** |
+| **4k-context decode** | **393.49 tok/s** | 295.35 tok/s | **+33.2%** |
+| **16k-context decode** | **327.31 tok/s** | 249.18 tok/s | **+31.4%** |
+| **32k-context decode** | **260.30 tok/s** | 200.52 tok/s | **+29.8%** |
+
+### Added — int8 tensor-core long-context flash decode (#195, #221)
+
+The 16k/32k gains come from the first use of **tensor cores in the decode path**:
+
+- **#195** (`eval:XL`) — a "gutted-dot" experiment showed long-context flash decode is **compute-bound**
+  on the per-token QK dot + warp reduction, not bandwidth-bound. So it batches the 8 GQA q-heads of a
+  kv-head as the M dimension: `S = Q·Kᵀ` and `O = P·V` become small **int8 `wmma` matmuls** (2× throughput,
+  int32 accumulate), and K/V are stored **int8 (Q8-style)** to **halve the KV read**. Context-adaptive
+  (engages only ≥8k) and template-specialized on a compile-time flag, so 128/512/4k stay **byte-identical**.
+- **#221** (`eval:XL`) — trims the kernel's shared-memory round-trips and raises occupancy from 4 to 5
+  resident blocks/SM (register + shared-memory limited).
+
+Together they took **16k decode 266 → 330 tok/s**, correctness held (top-1 ≥ 0.94, KL ≤ 0.04).
+
+### Added — LLM quality benchmark suite (#192)
+
+Speed and token-agreement don't prove the model still *answers well*. [`bench/quality`](bench/quality)
+scores five standard capabilities on **real data** — **IFEval, GSM8K, MMLU-Pro, HumanEval, BFCL** — with
+deterministic, stdlib-only scorers (constraint checks, final-answer extraction, unit-test `pass@1`,
+tool-call matching). A spot-check of the current frontier: **GSM8K 100%, IFEval 78%**, overall ~69% on a
+real-data subset. Because sparkinfer matches llama.cpp at **96% top-1 / KL 0.017**, these scores are at
+**parity with llama.cpp by construction** — the suite proves the optimizations preserved *capability*,
+not just the token distribution.
+
+### The proof, in three layers
+
+v0.3.6 is deliberately not "fast only." Each frontier claim now stands on three independent checks:
+
+1. **Speed** — +31–36% over llama.cpp from 128 to 16k and +29.8% at 32k, warm & interleaved on the same GPU/GGUF.
+2. **Correctness** — every kernel gated at **top-1 ≥ 0.90 / KL ≤ 0.20** vs llama.cpp (currently ~0.96 / ~0.02),
+   reproducible from source and immutably logged.
+3. **Quality** — real-task benchmarks (IFEval/GSM8K/MMLU-Pro/HumanEval/BFCL) confirm the model still
+   solves the tasks, at parity with the reference.
+
+### Momentum
+
+v0.3.5 first pushed past llama.cpp across the tracked context ladder (16k barely, +8%). v0.3.6 turns that
+into a **decisive ~30%+ lead at every length through 32k** and proves it holds on quality. The next frontier:
+deeper 32k+ work, KV-cache quantization beyond attention, and running the full quality suite in the eval gate.
+
+Thanks to everyone keeping the benchmark loop fast, public, correctness-gated — and now quality-gated.
+
+## [0.3.5] — 2026-07-03
+
+This release lands the long-context follow-through: sparkinfer now beats the llama.cpp Q4_K_M baseline
+at every tracked dashboard context size — **128, 512, 4k, and 16k** — on the same RTX 5090 and same
+GGUF. The headline is no longer only the short decode frontier; the 16k path is now ahead too.
+
+![sparkinfer v0.3.5 all tracked contexts pass llama.cpp](docs/releases/v0.3.5.png)
+
+### Performance — all tracked context sizes are past llama.cpp
+
+Same RTX 5090, same Qwen3-MoE Q4_K_M GGUF, 128 generated tokens:
+
+| context target | sparkinfer | llama.cpp | delta |
+|---|---:|---:|---:|
+| **128-token decode** | **493.56 tok/s** | 365.85 tok/s | **+34.9%** |
+| **512-context decode** | **469.58 tok/s** | 342.59 tok/s | **+37.1%** |
+| **4k-context decode** | **392.65 tok/s** | 292.99 tok/s | **+34.0%** |
+| **16k-context decode** | **266.14 tok/s** | 245.53 tok/s | **+8.4%** |
+
+### Changed — the benchmark surface is now context-aware
+
+The evaluation loop now treats **128, 512, 4k, and 16k** as first-class guard surfaces. A PR can earn
+credit for improving any one context by at least 2%, without aggregating small gains across unrelated
+contexts. Regressions are labeled by context (`regression-128`, `regression-512`, `regression-4k`,
+`regression-16k`) so contributors can see exactly where a change helped or hurt.
+
+The dashboard was updated to show the full context comparison directly against llama.cpp, including
+both card summaries and paired horizontal bars. This keeps the public frontier easy to scan while the
+project moves from short-decode wins into long-context competition.
+
+### Momentum
+
+v0.3.4 proved the first short-decode optimization round. v0.3.5 proves the next step: the same
+optimization loop can push past llama.cpp across the visible context ladder, including 16k. The next
+frontier remains deeper long-context work: 16k/32k stability, paged/KV read efficiency, KV staging, and
+continued decode-kernel occupancy work.
+
+Thanks to all contributors and reviewers keeping the benchmark loop fast, public, and competitive.
+
+## [0.3.4] — 2026-07-02
+
+This release closes the **first round of decode optimization** and marks it as a working proof of
+concept: contributors can move the RTX 5090 Qwen3-MoE frontier quickly, the eval loop can verify it,
+and the dashboard can carry the public proof trail. The headline 128-token frontier is now
+**484.79 tok/s** on Qwen3-30B-A3B Q4_K_M — **32.5% faster than llama.cpp** on the same RTX 5090
+128-token decode target — with top-1 **0.9612** and KL **0.0175** vs llama.cpp.
+
+![sparkinfer v0.3.4 RTX 5090 decode frontier](docs/releases/v0.3.4.png)
+
+### Performance — first decode-optimization round lands at 484.79 tok/s
+The round merged the final short-context decode pass:
+- **#121** — optimize Qwen decode kernels; evaluated at **468.10 tok/s** (`eval:none`) and merged as
+  useful implementation groundwork.
+- **#122** — fuse QK-norm + RoPE + KV append and emit Q8_1 attention data in the flash combine path;
+  evaluated at **479.83 tok/s** (`eval:L`) and advanced the public frontier.
+
+After merging, a final `origin/main` benchmark on the cached RTX 5090 measured **484.79 tok/s** at the
+same 128-token decode target, versus llama.cpp at **365.85 tok/s**: **+32.5% faster than llama.cpp**.
+This is the last optimization of the first short-decode round: enough to prove the path, not the end
+of the project.
+
+### Next — compete at long context
+The published milestone remains the next focus: **16k and 32k context**. v0.3.3 showed the long-context
+proof of concept; v0.3.4 finishes the short-decode momentum and points contributors at the next
+competition surface: long-context flash decode, paged/KV read efficiency, KV quantization, and stable
+eval dimensions for 16k/32k.
+
+### Thanks
+Thanks to everyone who contributed, evaluated, reviewed, and kept the loop moving with momentum.
+
+## [0.3.3] — 2026-07-01
+
+Two things this release: scoring that **rewards late-game effort** (so it stays worth optimizing as the
+frontier matures), and a **long-context proof of concept** that finds — and largely fixes — the biggest
+open opportunity, to point contributors at where the real headroom is. The 128-tok frontier is
+unchanged at **453.70 tok/s**.
+
+### Changed — difficulty-compensated scoring (#113): reward late-game effort
+As the frontier pulls past llama.cpp, each further % gain gets much harder (near the roofline the
+easy headroom is gone), so a fixed %-band scale under-rewards late-game work — a hard +4% now took
+more than an easy +20% at cold start. `label.py` now scales the **label tier** by a difficulty
+multiplier `D = 1 + K·max(0, frontier/ref − 1)` (K=8, ref = llama.cpp 365.85, capped at 4×): a gain
+scores like the effort it took relative to a mature baseline. Safeguards: the boost multiplies the
+**label only** — `pct_over_frontier` still reports the true measured speedup, the significance gate
+stays on the **raw** delta (noise is never boosted), and the cold-start era (frontier ≤ ref) is
+untouched (D=1, no retroactive inflation). Applied from new evals onward. On the real history #83/#89/#86
+move S→M/L; everything below llama is unchanged. Governance-tunable (`SPARKINFER_DIFFICULTY_{BOOST,K,REF,MAX}`);
+replay with [`eval/sim_difficulty.py`](eval/sim_difficulty.py).
+
+### Added — long-context decode: the deficit found, and a first fix (#115) — proof of concept for miners
+Our headline "+24% past llama.cpp" is measured at 128-tok; at real KV **depth** the story reverses.
+A same-box depth sweep (sparkinfer vs `llama-bench -d`) found sparkinfer's decode **collapses** with
+context — **5.2× behind llama at 32k** (37 vs 193 tok/s), running ~6× *below* the memory roofline. Root
+cause: the flash-decode split count was **fixed** (`n_splits=32`), so at 32k each split streamed a
+~1024-long serial online-softmax chunk on ≤1024 blocks (latency-bound, SMs idle).
+
+**#115 makes `n_splits` depth-adaptive** (scale with `seq_len`, target ~256 KV/split, powers of two from
+32, capped 256) so the grid fills the SMs at depth; the decode CUDA graph is re-captured only ~log₂
+times per generation. **Correctness-preserving by construction** — the online-softmax combine is an
+*exact* reduction, bit-identical for any split count (top-1/KL unchanged). Short context is untouched
+(adaptive holds 32 below ~8k), so the frontier is unaffected. Tune via `SPARKINFER_SPLIT_CHUNK`; pin a
+fixed value via `SPARKINFER_NSPLITS`.
+
+**Long-context speedup — RTX 5090, decode tok/s at KV depth:**
+
+| KV depth | before (fixed 32) | after (adaptive) | speedup | gap to llama.cpp |
+|---|---|---|---|---|
+| 128 | 442.8 | 442.7 | 1.00× | unchanged (no short-context regression) |
+| 4,096 | 194.0 | 193.8 | 1.00× | unchanged |
+| **16,384** | 70.8 | **166.2** | **2.35×** | 3.4× → **1.44×** behind |
+| **32,768** | 38.5 | **110.7** | **2.88×** | 5.0× → **1.74×** behind |
+
+This is a **proof of concept, not the finish line** — it's here to guide contributors: long-context
+flash-decode (KV-split scaling, paged-KV read efficiency, KV quantization) is where the headroom is, and
+one config fix already closed most of a 5× gap. The 128-tok eval doesn't measure it yet — a long-context
+eval dimension is the natural next step.
+
+## [0.3.2] — 2026-06-30
+
+The lead over llama.cpp **doubles to ~24%**, and the evaluation that proves it is **substantially
+hardened** — held-out prompts, reference quarantine, clock-recorded runs, an immutable frontier
+ledger, and a corrected KL metric.
+
+### Performance — RTX 5090 frontier 410.85 → 453.70 tok/s (+10.4%); now **24% past llama.cpp**
+Two verified kernel optimizations merged (top-1 0.97):
+- **#89** — run the Q/K/V projections on **concurrent CUDA streams**, overlapping latency-bound bs=1 GEMVs → 435.41, byte-identical (@James-CUDA)
+- **#86** — **single-pass MoE top-k** (one parallel rank-count vs 8 serial arg-max passes) + fused RoPE/KV-append → 453.70 (@fansilas)
+
+Same RTX 5090, same Q4_K_M GGUF, warm & interleaved vs `llama-bench`:
+
+| decode length | sparkinfer | llama.cpp |   | vs v0.3.1 |
+|---|---|---|---|---|
+| **128 tok** | **453.70** | 365.85 | **+24.0%** | was +12.1% |
+| **256 tok** | **443.53** | 364.90 | **+21.6%** | was +10.0% |
+| **512 tok** | **425.23** | 361.64 | **+17.6%** | was +6.7% |
+
+The lead grew at **every** length — the recent decode-path work cut the per-token overhead that used
+to shrink the long-context lead.
+
+### Added — trust-hardened evaluation pipeline (#102)
+Closes the remaining gaming/poisoning vectors from the eval trust-model audit:
+- **Held-out prompts (H1)** — each eval scores a fresh, unpredictable per-seed window of a diverse
+  corpus, so a submission can't overfit a fixed prompt; the seed is logged for reproduction.
+- **Reference quarantine (C2)** — the baseline weights (sha256-pinned) and llama.cpp (commit-pinned)
+  are verified/rebuilt each run, so a tampered persisted copy can't skew a verdict.
+- **Clock record (M1)** — the graphics clock each number was produced at is pinned where the box
+  permits and **always recorded**, so the absolute tok/s is reproducible.
+- **Immutable frontier ledger (H2)** — every frontier advance appends a GitHub-timestamped line
+  `(date, PR, author, commit, Δ%, prev→new)` to the public eval-log; auditable line-by-line.
+- **Provenance** (clock, seed, reference pins) is written into every verdict and immutable log.
+
+### Fixed — the KL accuracy metric (honest, strict gate kept)
+The held-out KL looked high (0.27 on hard text) — investigation found a **measurement artifact**: the
+gate dumped only sparkinfer's top-20 and floored llama's tail, over-penalizing KL on flat
+distributions. The fix dumps a deeper top-k so llama's mass is covered; the **true divergence is ~0.02**
+(top-1 0.97). Proven honest — a sensitivity test reads KL 18 on a deliberately broken build, and a
+12-prompt sweep holds KL 0.007–0.022. So the **strict `KL ≤ 0.20` gate is kept**: it holds on held-out
+text because the measurement is correct, not because it was loosened.
+
+### Verified
+- **RTX 5090** frontier **453.70 tok/s** (128-tok), top-1 **0.97** vs llama.cpp — **+24.0% @128 /
+  +21.6% @256 / +17.6% @512** over a fully-built CUDA llama.cpp, same-box, warm, interleaved.
+
+### Contributors
+- **@James-CUDA** — #89 (concurrent Q/K/V CUDA streams)
+- **@fansilas** — #86 (single-pass MoE top-k + fused RoPE/KV-append)
+
+## [0.3.1] — 2026-06-29
+
+The lead over llama.cpp widens to **double digits — and now holds at every context length** — and the
+evaluation becomes **publicly verifiable**: a hardware trust model plus an immutable, per-run public log.
+
+### Performance — RTX 5090 frontier 388.68 → 410.85 tok/s (+5.7%); now **10%+ past llama.cpp**
+Two verified kernel optimizations merged (top-1 0.97, KL ≈ 0.14):
+- **#72** — split-K the router projection GEMV for decode occupancy → 394.45 (@Dexterity104)
+- **#83** — emit Q8_1 from the residual RMSNorm, dropping the per-layer activation quantize → 410.85 (@fansilas)
+
+Same RTX 5090, same Q4_K_M GGUF, warm & interleaved vs `llama-bench`:
+
+| decode length | sparkinfer | llama.cpp |   |
+|---|---|---|---|
+| **128 tok** | **410.2** | 366.0 | **+12.1%** |
+| **256 tok** | **402.2** | 365.8 | **+10.0%** |
+| **512 tok** | **386.6** | 362.5 | **+6.7%** |
+
+sparkinfer is now **ahead at every length** — v0.3.0 was ~parity at 512; the recent decode-path work
+(residual Q8_1, router split-K) lifted the long-context number too.
+
+### Added — trustless, publicly-verifiable evaluation
+- **[`EVAL-TRUST.md`](EVAL-TRUST.md)** — the eval trust model: **reproducible from source today**, the
+  attested-eval roadmap (CPU-TEE scoring receipts → multi-validator consensus), and the honest boundary
+  (a consumer RTX 5090 has **no GPU Confidential Computing**, so the speed number is trusted via
+  **reproduction + consensus**, not a GPU enclave — by design, since we optimize the hardware people own).
+- **[sparkinfer-log](https://github.com/gittensor-ai-lab/sparkinfer-log)** — every eval is now committed
+  **immutably** to a public repo (raw `log.txt` + `result.json`, host IPs scrubbed) and rendered at a
+  **unique, verifiable URL per run** (GitHub Pages). The dashboard links each verdict to its proof.
+
+### Changed — accuracy gate tightened
+- **KL hard-reject at 0.20** (preferred ≤ 0.15): a speedup that erodes parity with llama.cpp now
+  `REJECT`s regardless of tok/s. In practice #83 first regressed KL to 0.21 → `REJECT`, the author
+  reworked it to KL 0.14 → clean `S` → merged. The gate forced a better PR.
+
+### Fixed — eval stability
+- **Warm-up before the baseline**, **fresh same-box checkout** on reused boxes (`FETCH_HEAD`, not a
+  stale `origin/main`), and a **baseline sanity guard** — so cold clocks and stale builds can't skew a
+  verdict.
+
+### Verified
+- **RTX 5090** frontier **410.85 tok/s** (128-tok), top-1 **0.97** vs llama.cpp (KL ≈ 0.14) —
+  **+12.1% @128 / +10.0% @256 / +6.7% @512** over llama.cpp, same-box, warm, interleaved.
+
+### Contributors
+- **@fansilas** — #83 (emit Q8_1 from the residual RMSNorm)
+- **@Dexterity104** — #72 (split-K router projection GEMV)
+
 ## [0.3.0] — 2026-06-28
 
 The milestone release: sparkinfer's CUDA kernels **overtake llama.cpp** on Qwen3-MoE single-stream

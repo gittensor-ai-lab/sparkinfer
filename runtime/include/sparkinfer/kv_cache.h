@@ -19,6 +19,7 @@ struct KVCacheConfig {
     int block_size = 16;        // tokens per page block
     KVLayout layout = KVLayout::PAGED;
     bool fp8_kv = false;        // FP8 KV cache compression
+    bool int8_kv = false;       // int8 (Q8-style) KV cache; halves the long-context KV read
 };
 
 // GPU-side KV block pool.
@@ -44,6 +45,14 @@ public:
     void* k_pool() const;
     void* v_pool() const;
     size_t layer_stride_elems() const;   // elements between consecutive layers' sub-pools
+
+    // int8 KV (Q8-style int8 + per-(token,kv_head) fp16 scale). When int8_kv(), k_pool/v_pool hold
+    // int8 and k_scale_pool/v_scale_pool hold one __half scale per head vector.
+    // Per-layer scale pointer = (__half*)k_scale_pool() + layer * scale_layer_stride_elems().
+    bool int8_kv() const;
+    void* k_scale_pool() const;
+    void* v_scale_pool() const;
+    size_t scale_layer_stride_elems() const;
 
     int block_size() const;
     int max_blocks_per_seq() const;

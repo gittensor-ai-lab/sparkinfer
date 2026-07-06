@@ -1,0 +1,210 @@
+tier 25 backend llama items 196 counts {'bfcl': 75, 'gsm8k': 33, 'humaneval': 5, 'ifeval': 8, 'mmlu_pro': 75}
+[001/196] bfcl       bfcl-922     PASS name=updateUserPreferences(ok) args=ok
+[002/196] bfcl       bfcl-558     PASS name=extract_legal_information(ok) args=ok
+[003/196] bfcl       bfcl-76      PASS name=get_ad_performance_metrics(ok) args=ok
+[004/196] bfcl       bfcl-853     PASS name=fetchSurveyResponses(ok) args=ok
+[005/196] bfcl       bfcl-965     fail name=create_crm_to_project_management_integration(ok) args=X
+[006/196] bfcl       bfcl-404     fail name=stratified_dataset_split(ok) args=X
+[007/196] bfcl       bfcl-535     fail name=analyze_compliance_policies(ok) args=X
+[008/196] bfcl       bfcl-400     PASS name=min_max_normalize(ok) args=ok
+[009/196] bfcl       bfcl-180     fail name=retrieve_paypal_transaction_history(ok) args=X
+[010/196] bfcl       bfcl-532     fail name=register_new_employee(ok) args=X
+[011/196] bfcl       bfcl-929     PASS name=consolidate_datasets(ok) args=ok
+[012/196] bfcl       bfcl-437     PASS name=categorize_and_assess_feedback(ok) args=ok
+[013/196] bfcl       bfcl-910     PASS name=get_mars_rover_data(ok) args=ok
+[014/196] bfcl       bfcl-1077    PASS name=extract_general_ledger_balances(ok) args=ok
+[015/196] bfcl       bfcl-953     PASS name=fetch_average_resolution_time(ok) args=ok
+[016/196] bfcl       bfcl-630     fail name=analyze_traffic_flow(ok) args=X
+[017/196] bfcl       bfcl-129     fail name=extract_audio_from_video(X) args=X
+[018/196] bfcl       bfcl-1011    fail name=summarize_document(ok) args=X
+[019/196] bfcl       bfcl-451     PASS name=initiate_vulnerability_scan(ok) args=ok
+[020/196] bfcl       bfcl-358     PASS name=create_docker_image(ok) args=ok
+[021/196] bfcl       bfcl-179     PASS name=add_bank_account(ok) args=ok
+[022/196] bfcl       bfcl-447     PASS name=fetch_snmp_metrics(ok) args=ok
+[023/196] bfcl       bfcl-915     PASS name=send_user_message(ok) args=ok
+[024/196] bfcl       bfcl-883     PASS name=fetchPoliceDepartmentMetrics(ok) args=ok
+[025/196] bfcl       bfcl-799     PASS name=evaluate_risk_profile(ok) args=ok
+[026/196] bfcl       bfcl-11      PASS name=lock_all_smart_doors(ok) args=ok
+[027/196] bfcl       bfcl-961     PASS name=get_order_details(ok) args=ok
+[028/196] bfcl       bfcl-918     PASS name=getMovieRecommendations(ok) args=ok
+[029/196] bfcl       bfcl-933     PASS name=fetchRealTimeEnergyData(ok) args=ok
+[030/196] bfcl       bfcl-329     PASS name=detect_gas_leak(ok) args=ok
+[031/196] bfcl       bfcl-746     fail name=generateWeatherForecastQuery(ok) args=X
+[032/196] bfcl       bfcl-241     fail ERROR: AttributeError("'str' object has no attribute 'get'")
+[033/196] bfcl       bfcl-735     PASS name=set_folder_permissions(ok) args=ok
+[034/196] bfcl       bfcl-520     PASS name=getCurrentLocation(ok) args=ok
+[035/196] bfcl       bfcl-478     fail name=extract_supply_chain_entities(ok) args=X
+[036/196] bfcl       bfcl-484     PASS name=extract_treatments_procedures(ok) args=ok
+[037/196] bfcl       bfcl-534     PASS name=get_order_status(ok) args=ok
+[038/196] bfcl       bfcl-104     PASS name=check_item_availability(ok) args=ok
+[039/196] bfcl       bfcl-374     PASS name=find_collaboration_tool(ok) args=ok
+[040/196] bfcl       bfcl-692     fail name=create_training_program(ok) args=X
+[041/196] bfcl       bfcl-9       PASS name=set_blind_openness(ok) args=ok
+[042/196] bfcl       bfcl-856     PASS name=fetchCollaborationHistory(ok) args=ok
+[043/196] bfcl       bfcl-116     PASS name=get_travel_insurance_plans(ok) args=ok
+[044/196] bfcl       bfcl-1016    fail name=generate_code_from_description(ok) args=X
+[045/196] bfcl       bfcl-917     PASS name=predict_customer_churn(ok) args=ok
+[046/196] bfcl       bfcl-414     PASS name=backup_database(ok) args=ok
+[047/196] bfcl       bfcl-544     PASS name=automate_error_handling(ok) args=ok
+[048/196] bfcl       bfcl-529     fail name=get_patient_health_record(ok) args=X
+[049/196] bfcl       bfcl-530     PASS name=batch_update_task_status(ok) args=ok
+[050/196] bfcl       bfcl-370     PASS name=fetch_configuration_specs(ok) args=ok
+[051/196] bfcl       bfcl-187     fail name=place_market_order(ok) args=X
+[052/196] bfcl       bfcl-341     PASS name=process_sensor_data(ok) args=ok
+[053/196] bfcl       bfcl-632     fail name=None(X) args=X
+[054/196] bfcl       bfcl-62      PASS name=extract_campaign_data(ok) args=ok
+[055/196] bfcl       bfcl-335     PASS name=fetch_market_prices(ok) args=ok
+[056/196] bfcl       bfcl-925     PASS name=add_new_product(ok) args=ok
+[057/196] bfcl       bfcl-222     PASS name=find_music_learning_app(ok) args=ok
+[058/196] bfcl       bfcl-726     PASS name=sendMessageWithAttachment(ok) args=ok
+[059/196] bfcl       bfcl-913     PASS name=initiate_transfer(ok) args=ok
+[060/196] bfcl       bfcl-254     PASS name=profileScriptExecution(ok) args=ok
+[061/196] bfcl       bfcl-930     PASS name=getAirQualityData(ok) args=ok
+[062/196] bfcl       bfcl-971     PASS name=fetch_compliance_data(ok) args=ok
+[063/196] bfcl       bfcl-814     fail no JSON tool call found
+[064/196] bfcl       bfcl-905     PASS name=getCurrentPosition(ok) args=ok
+[065/196] bfcl       bfcl-625     PASS name=findAvailableFlights(ok) args=ok
+[066/196] bfcl       bfcl-753     PASS name=transcribe_podcast(ok) args=ok
+[067/196] bfcl       bfcl-92      PASS name=optimize_container_packing(ok) args=ok
+[068/196] bfcl       bfcl-763     PASS name=transcribe_audio(ok) args=ok
+[069/196] bfcl       bfcl-607     PASS name=createGroundTransportReservation(ok) args=ok
+[070/196] bfcl       bfcl-1047    PASS name=initiate_remote_testing_session(ok) args=ok
+[071/196] bfcl       bfcl-554     fail name=automate_customer_onboarding(ok) args=X
+[072/196] bfcl       bfcl-318     fail name=forecast_storage_needs(ok) args=X
+[073/196] bfcl       bfcl-685     fail name=None(X) args=X
+[074/196] bfcl       bfcl-1040    fail name=createPhotoAlbum(ok) args=X
+[075/196] bfcl       bfcl-782     PASS name=create_insurance_policy(ok) args=ok
+[076/196] gsm8k      gsm8k-588    PASS got=52 want=52
+[077/196] gsm8k      gsm8k-1214   PASS got=5 want=5
+[078/196] gsm8k      gsm8k-57     PASS got=83 want=83
+[079/196] gsm8k      gsm8k-906    PASS got=10 want=10
+[080/196] gsm8k      gsm8k-1252   PASS got=70 want=70
+[081/196] gsm8k      gsm8k-618    PASS got=36 want=36
+[082/196] gsm8k      gsm8k-599    PASS got=48 want=48
+[083/196] gsm8k      gsm8k-289    PASS got=16 want=16
+[084/196] gsm8k      gsm8k-608    PASS got=8 want=8
+[085/196] gsm8k      gsm8k-400    PASS got=48 want=48
+[086/196] gsm8k      gsm8k-237    PASS got=90 want=90
+[087/196] gsm8k      gsm8k-616    PASS got=10 want=10
+[088/196] gsm8k      gsm8k-672    fail got=10 want=2
+[089/196] gsm8k      gsm8k-1132   PASS got=45000 want=45000
+[090/196] gsm8k      gsm8k-463    PASS got=18 want=18
+[091/196] gsm8k      gsm8k-222    PASS got=140 want=140
+[092/196] gsm8k      gsm8k-945    fail got=7 want=17
+[093/196] gsm8k      gsm8k-238    PASS got=68 want=68
+[094/196] gsm8k      gsm8k-730    PASS got=8 want=8
+[095/196] gsm8k      gsm8k-55     PASS got=14 want=14
+[096/196] gsm8k      gsm8k-772    PASS got=50 want=50
+[097/196] gsm8k      gsm8k-176    PASS got=100 want=100
+[098/196] gsm8k      gsm8k-15     PASS got=125 want=125
+[099/196] gsm8k      gsm8k-66     PASS got=48 want=48
+[100/196] gsm8k      gsm8k-479    PASS got=15400 want=15400
+[101/196] gsm8k      gsm8k-896    PASS got=250 want=250
+[102/196] gsm8k      gsm8k-1122   fail got=10 want=18
+[103/196] gsm8k      gsm8k-1005   PASS got=1490 want=1490
+[104/196] gsm8k      gsm8k-480    PASS got=11 want=11
+[105/196] gsm8k      gsm8k-187    PASS got=106 want=106
+[106/196] gsm8k      gsm8k-275    PASS got=138 want=138
+[107/196] gsm8k      gsm8k-868    PASS got=15 want=15
+[108/196] gsm8k      gsm8k-921    PASS got=4 want=4
+[109/196] humaneval  HumanEval-61 PASS passed
+[110/196] humaneval  HumanEval-104 PASS passed
+[111/196] humaneval  HumanEval-105 PASS passed
+[112/196] humaneval  HumanEval-42 PASS passed
+[113/196] humaneval  HumanEval-145 fail fail: ['AssertionError']
+[114/196] ifeval     ifeval-2195  PASS bullet_count=ok
+[115/196] ifeval     ifeval-2284  fail word_count_min=X, placeholders_min=X, bullet_count=X
+[116/196] ifeval     ifeval-1418  fail no_commas=ok, sentence_count_max=ok, sentence_count_min=X
+[117/196] ifeval     ifeval-2485  fail keywords_include=X
+[118/196] ifeval     ifeval-3367  PASS quotation=ok, multiple_sections=ok
+[119/196] ifeval     ifeval-1601  PASS highlighted_min=ok, word_count_max=ok
+[120/196] ifeval     ifeval-2957  PASS keywords_forbidden=ok
+[121/196] ifeval     ifeval-3409  fail quotation=X, highlighted_min=ok
+[122/196] mmlu_pro   mmlupro-10638 fail chose=G want=F
+[123/196] mmlu_pro   mmlupro-2338 fail chose=J want=E
+[124/196] mmlu_pro   mmlupro-967  PASS chose=C want=C
+[125/196] mmlu_pro   mmlupro-73   PASS chose=C want=C
+[126/196] mmlu_pro   mmlupro-11693 fail chose=A want=B
+[127/196] mmlu_pro   mmlupro-592  fail chose=H want=A
+[128/196] mmlu_pro   mmlupro-1159 PASS chose=B want=B
+[129/196] mmlu_pro   mmlupro-1351 fail chose=I want=H
+[130/196] mmlu_pro   mmlupro-8036 fail chose=D want=A
+[131/196] mmlu_pro   mmlupro-1913 fail chose=G want=H
+[132/196] mmlu_pro   mmlupro-11001 PASS chose=A want=A
+[133/196] mmlu_pro   mmlupro-11790 fail chose=G want=F
+[134/196] mmlu_pro   mmlupro-5190 PASS chose=D want=D
+[135/196] mmlu_pro   mmlupro-10628 fail chose=D want=B
+[136/196] mmlu_pro   mmlupro-10697 fail chose=A want=D
+[137/196] mmlu_pro   mmlupro-7430 PASS chose=G want=G
+[138/196] mmlu_pro   mmlupro-10555 PASS chose=A want=A
+[139/196] mmlu_pro   mmlupro-3022 PASS chose=B want=B
+[140/196] mmlu_pro   mmlupro-10008 fail chose=H want=A
+[141/196] mmlu_pro   mmlupro-7847 PASS chose=I want=I
+[142/196] mmlu_pro   mmlupro-10819 PASS chose=B want=B
+[143/196] mmlu_pro   mmlupro-10744 PASS chose=E want=E
+[144/196] mmlu_pro   mmlupro-8442 PASS chose=A want=A
+[145/196] mmlu_pro   mmlupro-5546 PASS chose=B want=B
+[146/196] mmlu_pro   mmlupro-3894 PASS chose=F want=F
+[147/196] mmlu_pro   mmlupro-3076 PASS chose=A want=A
+[148/196] mmlu_pro   mmlupro-8225 fail chose=E want=D
+[149/196] mmlu_pro   mmlupro-3583 fail chose=I want=B
+[150/196] mmlu_pro   mmlupro-6557 PASS chose=A want=A
+[151/196] mmlu_pro   mmlupro-5632 PASS chose=F want=F
+[152/196] mmlu_pro   mmlupro-6037 fail chose=A want=D
+[153/196] mmlu_pro   mmlupro-11217 fail chose=A want=I
+[154/196] mmlu_pro   mmlupro-6625 fail chose=C want=B
+[155/196] mmlu_pro   mmlupro-222  fail chose=A want=B
+[156/196] mmlu_pro   mmlupro-6840 PASS chose=E want=E
+[157/196] mmlu_pro   mmlupro-6804 PASS chose=J want=J
+[158/196] mmlu_pro   mmlupro-3580 fail chose=G want=A
+[159/196] mmlu_pro   mmlupro-5544 PASS chose=D want=D
+[160/196] mmlu_pro   mmlupro-9682 fail chose=C want=B
+[161/196] mmlu_pro   mmlupro-5134 PASS chose=H want=H
+[162/196] mmlu_pro   mmlupro-3649 fail chose=A want=J
+[163/196] mmlu_pro   mmlupro-8717 PASS chose=A want=A
+[164/196] mmlu_pro   mmlupro-9094 fail chose=C want=G
+[165/196] mmlu_pro   mmlupro-7359 fail chose=I want=A
+[166/196] mmlu_pro   mmlupro-2607 PASS chose=H want=H
+[167/196] mmlu_pro   mmlupro-1519 fail chose=A want=C
+[168/196] mmlu_pro   mmlupro-3208 PASS chose=D want=D
+[169/196] mmlu_pro   mmlupro-8282 PASS chose=B want=B
+[170/196] mmlu_pro   mmlupro-413  fail chose=E want=H
+[171/196] mmlu_pro   mmlupro-7390 PASS chose=F want=F
+[172/196] mmlu_pro   mmlupro-4470 PASS chose=D want=D
+[173/196] mmlu_pro   mmlupro-11478 fail chose=E want=I
+[174/196] mmlu_pro   mmlupro-5237 fail chose=A want=B
+[175/196] mmlu_pro   mmlupro-7675 fail chose=E want=F
+[176/196] mmlu_pro   mmlupro-11263 fail chose=A want=G
+[177/196] mmlu_pro   mmlupro-8937 fail chose=E want=G
+[178/196] mmlu_pro   mmlupro-675  PASS chose=F want=F
+[179/196] mmlu_pro   mmlupro-2278 fail chose=B want=I
+[180/196] mmlu_pro   mmlupro-6927 PASS chose=B want=B
+[181/196] mmlu_pro   mmlupro-1881 fail chose=D want=H
+[182/196] mmlu_pro   mmlupro-10795 fail chose=A want=C
+[183/196] mmlu_pro   mmlupro-10144 fail chose=E want=I
+[184/196] mmlu_pro   mmlupro-176  PASS chose=I want=I
+[185/196] mmlu_pro   mmlupro-5656 fail chose=D want=G
+[186/196] mmlu_pro   mmlupro-3562 fail chose=F want=I
+[187/196] mmlu_pro   mmlupro-3247 PASS chose=H want=H
+[188/196] mmlu_pro   mmlupro-942  PASS chose=E want=E
+[189/196] mmlu_pro   mmlupro-8557 fail chose=C want=G
+[190/196] mmlu_pro   mmlupro-2199 PASS chose=A want=A
+[191/196] mmlu_pro   mmlupro-2723 PASS chose=H want=H
+[192/196] mmlu_pro   mmlupro-8010 fail chose=A want=J
+[193/196] mmlu_pro   mmlupro-1304 PASS chose=A want=A
+[194/196] mmlu_pro   mmlupro-4829 fail chose=F want=G
+[195/196] mmlu_pro   mmlupro-6477 PASS chose=E want=E
+[196/196] mmlu_pro   mmlupro-6604 fail chose=B want=I
+
+======================================================
+QUALITY REPORT - backend=llama tier=25%
+======================================================
+  bfcl          72.00%   (54/75)
+  gsm8k         90.91%   (30/33)
+  humaneval     80.00%   (4/5)
+  ifeval        64.58%   (4/8)
+  mmlu_pro      48.00%   (36/75)
+  ----------------------------------
+  OVERALL       65.90%   (196 items)
+
+wrote /workspace/qwen_awq_bench/results/quality_25_20260703/llama_25pct.jsonl

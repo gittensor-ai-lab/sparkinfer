@@ -1,0 +1,18 @@
+  bfcl       bfcl-922 PASS  name=updateUserPreferences(ok) args=ok
+  gsm8k      gsm8k-588 PASS  got=52 want=52
+  humaneval  HumanEval-61 PASS  passed
+  ifeval     ifeval-2195 PASS  bullet_count=ok
+  mmlu_pro   mmlupro-10638 fail  chose=G want=F
+
+==============================================
+QUALITY REPORT  -  backend=llama
+==============================================
+  bfcl          100.0%   (1/1)
+  gsm8k         100.0%   (1/1)
+  humaneval     100.0%   (1/1)
+  ifeval        100.0%   (1/1)
+  mmlu_pro        0.0%   (0/1)
+  ------------------------------
+  OVERALL        80.0%   (5 items)
+
+wrote /workspace/qwen_awq_bench/results/quality/llama_limit1.jsonl

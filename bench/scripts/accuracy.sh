@@ -25,14 +25,25 @@ ensure_tokenizer
 ensure_llamacpp "$ARCH"
 [ -f "$GGUF" ] || { echo "!! GGUF not found: $GGUF"; exit 1; }
 
-IDS="$(python3 -c "from tokenizers import Tokenizer; print(' '.join(map(str, Tokenizer.from_file('$MODELS_DIR/tokenizer.json').encode(open('$TEXT').read().strip()).ids)))")"
-echo ">> eval tokens: $(echo "$IDS" | wc -w)"
+# H1: the prompt is held-out / fuzzed by EVAL_SEED (set by the eval bot to a fresh, unpredictable
+# value each run) so a submission can't overfit the in-repo text. seed="fixed" (the default for a
+# manual run) reproduces the legacy fixed prompt. The exact ids are written once and fed to BOTH
+# sparkinfer and llama, so they score the identical sequence; the seed is logged for reproduction.
+SEED="${SPARKINFER_EVAL_SEED:-fixed}"
+IDS_FILE="/tmp/eval_ids.txt"
+python3 "$HERE/gen_eval_prompt.py" "$SEED" "$MODELS_DIR/tokenizer.json" "$HERE/eval_corpus.txt" "$TEXT" > "$IDS_FILE"
+IDS="$(cat "$IDS_FILE")"
+echo ">> eval prompt: seed=$SEED tokens=$(echo "$IDS" | wc -w)"
 
 echo ">> sparkinfer teacher-forced score ..."
-si_run qwen3_gguf_score "$GGUF" 20 $IDS > /tmp/spark_score.txt 2>/dev/null || true
+# Dump top-128 (>= the llama top-k queried in accuracy_compare). A shallow dump made the KL a
+# truncation artifact: any llama-tail token outside sparkinfer's dump was floored (exp(-20)) and
+# massively over-penalized, inflating KL to 0.14-0.33 on flat distributions. With the dump covering
+# llama's query, KL reflects the true ~0.01-0.03 divergence. Scoring-only — no decode-speed impact.
+si_run qwen3_gguf_score "$GGUF" 128 $IDS > /tmp/spark_score.txt 2>/dev/null || true
 if ! grep -q "^PPL" /tmp/spark_score.txt; then   # prebuilt incompatible -> rebuild
   fallback_build "$ARCH"
-  si_run qwen3_gguf_score "$GGUF" 20 $IDS > /tmp/spark_score.txt 2>/dev/null
+  si_run qwen3_gguf_score "$GGUF" 128 $IDS > /tmp/spark_score.txt 2>/dev/null
 fi
 
 echo ">> starting llama.cpp server (reference) ..."
@@ -41,4 +52,4 @@ SRV=$!; trap 'kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true' EXIT   # rea
 for _ in $(seq 1 120); do curl -s http://localhost:8081/health 2>/dev/null | grep -q '"ok"' && break; sleep 2; done
 
 echo; echo "=== accuracy: sparkinfer vs llama.cpp ==="
-python3 "$HERE/accuracy_compare.py" /tmp/spark_score.txt "$MODELS_DIR/tokenizer.json" "$TEXT"
+python3 "$HERE/accuracy_compare.py" /tmp/spark_score.txt "$MODELS_DIR/tokenizer.json" "$IDS_FILE"

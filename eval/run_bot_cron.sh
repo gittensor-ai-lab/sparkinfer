@@ -26,4 +26,5 @@ python3 eval/pr_eval_bot.py \
   --instance "${VAST_INSTANCE:-42682383}" \
   --frontier "${FRONTIER:-285}" \
   --ceiling  "${CEILING:-366}" \
-  --repo     "${REPO:-gittensor-ai-lab/sparkinfer}"
+  --repo     "${REPO:-gittensor-ai-lab/sparkinfer}" \
+  ${DUAL:+--dual}                                     # DUAL=1 -> score Qwen3.6 + guard Qwen3-30B

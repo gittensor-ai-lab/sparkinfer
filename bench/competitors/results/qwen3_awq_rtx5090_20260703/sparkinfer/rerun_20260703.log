@@ -1,0 +1,72 @@
+auth gguf download Fri Jul  3 20:26:23 UTC 2026
+######################################################################### 100.0%######################################################################### 100.0%######################################################################### 100.0%
+-rw-r--r-- 1 root root 18G Jul  3 15:40 /workspace/qwen_awq_bench/sparkinfer/models/Qwen3-30B-A3B-Q4_K_M.gguf
+>> sparkinfer ctx=128 Fri Jul  3 20:26:24 UTC 2026
+>> GPU arch: sm_120
+>> using local build
+>> model sha256 OK
+
+=== sparkinfer — decode (n=128, ctx=128, bs=1) ===
+[gguf] layer 0 loaded
+[gguf] layer 47 loaded
+[runtime] NVIDIA GeForce RTX 5090  cc=12.0  SMs=170  BW=1792 GB/s
+loading /workspace/qwen_awq_bench/sparkinfer/models/Qwen3-30B-A3B-Q4_K_M.gguf (native GGUF, experts quantized) ...
+
+=== sparkinfer bench (Q4_K_M native) ===
+model        : Qwen3-30B-A3B  (48 layers, 128 experts top-8)
+VRAM used    : 20.0 GB
+max seq      : 2048
+decode tg    : 471.28 tok/s  (2.1 ms/token, n=128, ctx=128, bs=1)
+GPU          : 47°C · 208 W · 2385 MHz (peak under load)
+>> sparkinfer ctx=512 Fri Jul  3 20:26:43 UTC 2026
+>> GPU arch: sm_120
+>> using local build
+>> model sha256 OK
+
+=== sparkinfer — decode (n=128, ctx=512, bs=1) ===
+[gguf] layer 0 loaded
+[gguf] layer 47 loaded
+[runtime] NVIDIA GeForce RTX 5090  cc=12.0  SMs=170  BW=1792 GB/s
+loading /workspace/qwen_awq_bench/sparkinfer/models/Qwen3-30B-A3B-Q4_K_M.gguf (native GGUF, experts quantized) ...
+
+=== sparkinfer bench (Q4_K_M native) ===
+model        : Qwen3-30B-A3B  (48 layers, 128 experts top-8)
+VRAM used    : 20.0 GB
+max seq      : 2048
+decode tg    : 471.99 tok/s  (2.1 ms/token, n=128, ctx=512, bs=1)
+GPU          : 52°C · 404 W · 2865 MHz (peak under load)
+>> sparkinfer ctx=4096 Fri Jul  3 20:26:57 UTC 2026
+>> GPU arch: sm_120
+>> using local build
+>> model sha256 OK
+
+=== sparkinfer — decode (n=128, ctx=4096, bs=1) ===
+[gguf] layer 0 loaded
+[gguf] layer 47 loaded
+[runtime] NVIDIA GeForce RTX 5090  cc=12.0  SMs=170  BW=1792 GB/s
+loading /workspace/qwen_awq_bench/sparkinfer/models/Qwen3-30B-A3B-Q4_K_M.gguf (native GGUF, experts quantized) ...
+
+=== sparkinfer bench (Q4_K_M native) ===
+model        : Qwen3-30B-A3B  (48 layers, 128 experts top-8)
+VRAM used    : 20.2 GB
+max seq      : 4240
+decode tg    : 389.96 tok/s  (2.6 ms/token, n=128, ctx=4096, bs=1)
+GPU          : 59°C · 476 W · 2857 MHz (peak under load)
+>> sparkinfer ctx=16384 Fri Jul  3 20:27:20 UTC 2026
+>> GPU arch: sm_120
+>> using local build
+>> model sha256 OK
+
+=== sparkinfer — decode (n=128, ctx=16384, bs=1) ===
+[gguf] layer 0 loaded
+[gguf] layer 47 loaded
+[runtime] NVIDIA GeForce RTX 5090  cc=12.0  SMs=170  BW=1792 GB/s
+loading /workspace/qwen_awq_bench/sparkinfer/models/Qwen3-30B-A3B-Q4_K_M.gguf (native GGUF, experts quantized) ...
+
+=== sparkinfer bench (Q4_K_M native) ===
+model        : Qwen3-30B-A3B  (48 layers, 128 experts top-8)
+VRAM used    : 21.4 GB
+max seq      : 16528
+decode tg    : 266.26 tok/s  (3.8 ms/token, n=128, ctx=16384, bs=1)
+GPU          : 67°C · 532 W · 2835 MHz (peak under load)
+done sparkinfer Fri Jul  3 20:28:25 UTC 2026

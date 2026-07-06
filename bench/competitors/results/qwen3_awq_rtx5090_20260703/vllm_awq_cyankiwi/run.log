@@ -1,0 +1,56 @@
+>> downloading cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit Fri Jul  3 16:20:52 UTC 2026
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files:   6%|▌         | 1/17 [00:00<00:09,  1.64it/s]Fetching 17 files:  47%|████▋     | 8/17 [08:15<09:38, 64.27s/it]Fetching 17 files:  53%|█████▎    | 9/17 [08:27<07:29, 56.24s/it]Fetching 17 files: 100%|██████████| 17/17 [08:27<00:00, 29.88s/it]
+[32m✓ Downloaded[0m
+  path: /workspace/qwen_awq_bench/models/qwen3-awq-cyankiwi-instruct-2507
+total 17G
+-rw-r--r-- 1 root root  16K Jul  3 16:20 README.md
+-rw-r--r-- 1 root root  707 Jul  3 16:20 added_tokens.json
+-rw-r--r-- 1 root root 2.6K Jul  3 16:20 chat_template.jinja
+-rw-r--r-- 1 root root 3.4K Jul  3 16:20 config.json
+-rw-r--r-- 1 root root  213 Jul  3 16:20 generation_config.json
+-rw-r--r-- 1 root root 1.6M Jul  3 16:20 merges.txt
+-rw-r--r-- 1 root root 4.7G Jul  3 16:29 model-00001-of-00004.safetensors
+-rw-r--r-- 1 root root 4.7G Jul  3 16:29 model-00002-of-00004.safetensors
+-rw-r--r-- 1 root root 4.7G Jul  3 16:26 model-00003-of-00004.safetensors
+-rw-r--r-- 1 root root 2.9G Jul  3 16:27 model-00004-of-00004.safetensors
+-rw-r--r-- 1 root root 5.2M Jul  3 16:20 model.safetensors.index.json
+-rw-r--r-- 1 root root 1.3K Jul  3 16:20 recipe.yaml
+-rw-r--r-- 1 root root  613 Jul  3 16:20 special_tokens_map.json
+-rw-r--r-- 1 root root  11M Jul  3 16:21 tokenizer.json
+-rw-r--r-- 1 root root 5.3K Jul  3 16:20 tokenizer_config.json
+-rw-r--r-- 1 root root 2.7M Jul  3 16:20 vocab.json
+>> cyankiwi instruct2507 awq4bit fp8 ctx=128 Fri Jul  3 16:29:21 UTC 2026
+INFO 07-03 16:29:29 [api_utils.py:273] non-default args: {'trust_remote_code': True, 'kv_cache_dtype': 'fp8_e4m3', 'max_model_len': 32768, 'enable_prefix_caching': False, 'gpu_memory_utilization': 0.9, 'quantization': 'awq', 'enable_lora': None, 'reasoning_parser_plugin': '', 'model': '/workspace/qwen_awq_bench/models/qwen3-awq-cyankiwi-instruct-2507'}
+INFO 07-03 16:29:29 [model.py:606] Resolved architecture: Qwen3MoeForCausalLM
+INFO 07-03 16:29:29 [model.py:1736] Using max model len 32768
+Traceback (most recent call last):
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/bin/vllm", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/entrypoints/cli/main.py", line 95, in main
+    args.dispatch_function(args)
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/entrypoints/cli/benchmark/latency.py", line 22, in cmd
+    main(args)
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/benchmarks/latency.py", line 88, in main
+    llm = LLM.from_engine_args(engine_args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/entrypoints/llm.py", line 389, in from_engine_args
+    return cls(**vars(engine_args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/entrypoints/llm.py", line 349, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 171, in from_engine_args
+    vllm_config = engine_args.create_engine_config(usage_context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/engine/arg_utils.py", line 1844, in create_engine_config
+    model_config = self.create_model_config()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/vllm/engine/arg_utils.py", line 1608, in create_model_config
+    return ModelConfig(
+           ^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/vllm-awq-venv/lib/python3.12/site-packages/pydantic/_internal/_dataclasses.py", line 121, in __init__
+    s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+  Value error, Quantization method specified in the model config (compressed-tensors) does not match the quantization method specified in the `quantization` argument (awq). [type=value_error, input_value=ArgsKwargs((), {'model': ...nderer_num_workers': 1}), input_type=ArgsKwargs]
+    For further information visit https://errors.pydantic.dev/2.13/v/value_error

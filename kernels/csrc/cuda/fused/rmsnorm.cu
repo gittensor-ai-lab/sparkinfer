@@ -5,12 +5,16 @@
 // Portable CUDA — runs on sm_89 .. sm_120 (RTX 5090).
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
 #endif
 
 namespace sparkinfer {
 namespace kernels {
+
+// llama mmvq activation block (matches si_block_q8_1 used by the int8 GEMVs/MMVQ).
+struct si_blk_q8_1 { __half2 ds; signed char qs[32]; };
 
 __device__ __forceinline__ float rn_warp_sum(float v) {
     #pragma unroll
@@ -164,6 +168,70 @@ __global__ void add_rmsnorm2_kernel(const __nv_bfloat16* __restrict__ x,
         out_norm[base + c] = __float2bfloat16(__bfloat162float(out_sum[base + c]) * inv_rms * __bfloat162float(weight[c]));
 }
 
+// add_rmsnorm2 that ALSO emits a Q8_1 quantization of out_norm (si_block_q8_1), so the
+// downstream int8 GEMV/MMVQ skips its separate per-layer quantize node. Specialized to the
+// decode residual width: one row, cols a multiple of 256, exactly one 8-wide pack per thread
+// (blockDim*8 == cols), so each 32-element Q8_1 block maps to 4 consecutive threads. The Q8_1
+// is computed from the bf16-rounded out_norm, so it is bit-identical to running the standalone
+// quantizer on out_norm afterwards.
+__global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
+                                       const __nv_bfloat16* __restrict__ residual,
+                                       const __nv_bfloat16* __restrict__ weight,
+                                       __nv_bfloat16* __restrict__ out_sum,
+                                       __nv_bfloat16* __restrict__ out_norm,
+                                       si_blk_q8_1* __restrict__ out_q8,
+                                       int cols, float eps) {
+    const size_t base = 0;
+    __shared__ float s_warp[32];
+    const int t = threadIdx.x;
+    const uint4* x4 = reinterpret_cast<const uint4*>(x);
+    const uint4* r4 = reinterpret_cast<const uint4*>(residual);
+    uint4* osum4 = reinterpret_cast<uint4*>(out_sum);
+
+    float xv[8], rv[8]; rn_unpack8(__ldg(x4 + t), xv); rn_unpack8(__ldg(r4 + t), rv);
+    float sv[8]; float ss = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) { sv[j] = xv[j] + rv[j]; ss = __fmaf_rn(sv[j], sv[j], ss); }
+    osum4[t] = rn_pack8(sv);
+    ss = rn_warp_sum(ss);
+    if ((t & 31) == 0) s_warp[t >> 5] = ss;
+    __syncthreads();
+    if (t < 32) {
+        float v = (t < (blockDim.x + 31) / 32) ? s_warp[t] : 0.f;
+        v = rn_warp_sum(v);
+        if (t == 0) s_warp[0] = rsqrtf(v / cols + eps);
+    }
+    __syncthreads();
+    const float inv_rms = s_warp[0];
+
+    // Re-read the bf16-rounded residual sum (exactly as add_rmsnorm2_kernel does), so out_norm
+    // is bit-identical to the unfused path; then derive Q8_1 from the bf16-rounded out_norm.
+    const uint4* w4 = reinterpret_cast<const uint4*>(weight);
+    const uint4* osum4r = reinterpret_cast<const uint4*>(out_sum);
+    float svb[8], wv[8]; rn_unpack8(__ldg(osum4r + t), svb); rn_unpack8(__ldg(w4 + t), wv);
+    float ov[8], bv[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) { ov[j] = svb[j] * inv_rms * wv[j]; bv[j] = __bfloat162float(__float2bfloat16(ov[j])); }
+    reinterpret_cast<uint4*>(out_norm)[t] = rn_pack8(ov);
+
+    // Q8_1 of the bf16-rounded out_norm. 32-block = 4 consecutive threads (t&~3 .. +3).
+    float amax = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(bv[j]));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    const float d = amax / 127.0f;
+    const int b = t >> 2, r = t & 3;
+    int s = 0;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int qi = (amax == 0.0f) ? 0 : (int)roundf(bv[j] / d);
+        out_q8[b].qs[r * 8 + j] = (signed char)qi; s += qi;
+    }
+    s += __shfl_xor_sync(0xffffffffu, s, 1); s += __shfl_xor_sync(0xffffffffu, s, 2);
+    if (r == 0) out_q8[b].ds = __floats2half2_rn(d, d * (float)s);
+}
+
 // Fused per-head Q-norm + K-norm: ONE kernel over (n_q_heads + n_kv_heads) heads
 // (each block normalizes one head), vs two launch_rmsnorm calls. 1 graph node saved.
 __global__ void rmsnorm_qk_kernel(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k,
@@ -191,6 +259,7 @@ __global__ void rmsnorm_qk_kernel(__nv_bfloat16* __restrict__ q, __nv_bfloat16* 
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
+#include <cassert>
 
 void launch_rmsnorm_qk(void* q, void* k, const void* q_w, const void* k_w,
                        int n_q_heads, int n_kv_heads, int head_dim, float eps, cudaStream_t stream) {
@@ -226,6 +295,24 @@ void launch_add_rmsnorm2(const void* x, const void* residual, const void* weight
         reinterpret_cast<const __nv_bfloat16*>(weight),
         reinterpret_cast<__nv_bfloat16*>(out_sum),
         reinterpret_cast<__nv_bfloat16*>(out_norm), rows, cols, eps);
+}
+
+// add_rmsnorm2 that also emits Q8_1(out_norm). Requires rows==1 and cols%256==0 (decode
+// residual width); uses cols/8 threads so each thread owns one 8-wide pack.
+void launch_add_rmsnorm2_q8(const void* x, const void* residual, const void* weight,
+                            void* out_sum, void* out_norm, void* out_q8, int cols, float eps,
+                            cudaStream_t stream) {
+    // One row, one 8-wide pack per thread, a Q8_1 block = 4 consecutive threads: requires
+    // cols % 256 == 0 (every warp full, each 32-block within one warp) and cols/8 <= 1024
+    // (max block dim). The decode residual width (hidden = 2048) satisfies both.
+    assert(cols % 256 == 0 && (cols >> 3) <= 1024);
+    add_rmsnorm2_q8_kernel<<<1, cols >> 3, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<const __nv_bfloat16*>(residual),
+        reinterpret_cast<const __nv_bfloat16*>(weight),
+        reinterpret_cast<__nv_bfloat16*>(out_sum),
+        reinterpret_cast<__nv_bfloat16*>(out_norm),
+        reinterpret_cast<si_blk_q8_1*>(out_q8), cols, eps);
 }
 #endif
 

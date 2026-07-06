@@ -1,0 +1,7 @@
+[sweep] start ctx=128 out=128 max_seq_len=256
+[sweep] done ctx=128 code=0
+95 MiB, 32607 MiB, 0 %
+[sweep] start ctx=512 out=128 max_seq_len=640
+[sweep] done ctx=512 code=0
+95 MiB, 32607 MiB, 0 %
+[sweep] start ctx=4096 out=128 max_seq_len=4224

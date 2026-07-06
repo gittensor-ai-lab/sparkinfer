@@ -1,0 +1,268 @@
+tier 25 backend vllm_awq items 196 counts {'bfcl': 75, 'gsm8k': 33, 'humaneval': 5, 'ifeval': 8, 'mmlu_pro': 75}
+loading vLLM /workspace/qwen_awq_bench/models/qwen3-awq
+INFO 07-03 21:37:02 [api_utils.py:273] non-default args: {'trust_remote_code': True, 'dtype': 'float16', 'max_model_len': 4096, 'enable_prefix_caching': False, 'disable_log_stats': True, 'quantization': 'awq', 'model': '/workspace/qwen_awq_bench/models/qwen3-awq'}
+INFO 07-03 21:37:02 [model.py:606] Resolved architecture: Qwen3MoeForCausalLM
+INFO 07-03 21:37:02 [model.py:1736] Using max model len 4096
+INFO 07-03 21:37:03 [scheduler.py:252] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 07-03 21:37:03 [vllm.py:1040] Asynchronous scheduling is enabled.
+INFO 07-03 21:37:03 [kernel.py:286] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+(EngineCore pid=91314) INFO 07-03 21:37:05 [core.py:114] Initializing a V1 LLM engine (v0.23.1rc1.dev758+g978de8335) with config: model='/workspace/qwen_awq_bench/models/qwen3-awq', speculative_config=None, tokenizer='/workspace/qwen_awq_bench/models/qwen3-awq', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.float16, max_seq_len=4096, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=auto_awq, quantization_config=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/workspace/qwen_awq_bench/models/qwen3-awq, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'ir_enable_torch_wrap': True, 'splitting_ops': ['vllm::unified_attention_with_output', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::qwen_gdn_attention_core', 'vllm::gdn_attention_core_xpu', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::deepseek_v4_attention', 'vllm::hpc_rope_norm_forward', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False}, 'max_cudagraph_capture_size': 512, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=91314) INFO 07-03 21:37:05 [parallel_state.py:1588] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://172.24.0.2:54863 backend=nccl
+(EngineCore pid=91314) INFO 07-03 21:37:05 [parallel_state.py:1923] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(EngineCore pid=91314) INFO 07-03 21:37:06 [topk_topp_sampler.py:55] Using FlashInfer for top-p & top-k sampling.
+(EngineCore pid=91314) INFO 07-03 21:37:06 [gpu_model_runner.py:5170] Starting to load model /workspace/qwen_awq_bench/models/qwen3-awq...
+(EngineCore pid=91314) INFO 07-03 21:37:06 [auto_awq.py:472] Using MarlinLinearKernel for AutoAWQMarlinLinearMethod
+(EngineCore pid=91314) INFO 07-03 21:37:06 [cuda.py:476] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
+(EngineCore pid=91314) INFO 07-03 21:37:06 [flash_attn.py:718] Using FlashAttention version 2
+(EngineCore pid=91314) INFO 07-03 21:37:06 [int_wna16.py:159] Using 'MARLIN' WNA16 MoE backend.
+(EngineCore pid=91314) INFO 07-03 21:37:06 [weight_utils.py:849] Filesystem type for checkpoints: OVERLAY. Checkpoint size: 15.66 GiB. Available RAM: 58.02 GiB.
+(EngineCore pid=91314) INFO 07-03 21:37:06 [weight_utils.py:872] Auto-prefetch is disabled because the filesystem (OVERLAY) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+(EngineCore pid=91314) Loading safetensors checkpoint shards:   0% Completed | 0/4 [00:00<?, ?it/s]
+(EngineCore pid=91314) Loading safetensors checkpoint shards:  25% Completed | 1/4 [00:02<00:07,  2.56s/it]
+(EngineCore pid=91314) Loading safetensors checkpoint shards:  50% Completed | 2/4 [00:05<00:05,  2.81s/it]
+(EngineCore pid=91314) Loading safetensors checkpoint shards:  75% Completed | 3/4 [00:08<00:02,  2.89s/it]
+(EngineCore pid=91314) Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:09<00:00,  2.11s/it]
+(EngineCore pid=91314) Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:09<00:00,  2.36s/it]
+(EngineCore pid=91314) 
+(EngineCore pid=91314) INFO 07-03 21:37:16 [default_loader.py:430] Loading weights took 9.51 seconds
+(EngineCore pid=91314) INFO 07-03 21:37:16 [int_wna16.py:251] Using MoEPrepareAndFinalizeNoDPEPModular
+(EngineCore pid=91314) INFO 07-03 21:37:22 [gpu_model_runner.py:5267] Model loading took 15.68 GiB memory and 15.200733 seconds
+(EngineCore pid=91314) INFO 07-03 21:37:25 [backends.py:1089] Using cache directory: /root/.cache/vllm/torch_compile_cache/bef0509fc5/rank_0_0/backbone for vLLM's torch.compile
+(EngineCore pid=91314) INFO 07-03 21:37:25 [backends.py:1148] Dynamo bytecode transform time: 2.94 s
+(EngineCore pid=91314) INFO 07-03 21:37:28 [backends.py:292] Directly load the compiled graph(s) for compile range (1, 8192) from the cache, took 2.296 s
+(EngineCore pid=91314) INFO 07-03 21:37:28 [decorators.py:311] Directly load AOT compilation from path /root/.cache/vllm/torch_compile_cache/torch_aot_compile/7315407f30c007c5b2baae76a43b293fc831e48f52a9906c99d75d8bff7e009b/rank_0_0/model
+(EngineCore pid=91314) INFO 07-03 21:37:28 [monitor.py:53] torch.compile took 5.63 s in total
+(EngineCore pid=91314) INFO 07-03 21:37:28 [monitor.py:81] Initial profiling/warmup run took 0.20 s
+(EngineCore pid=91314) INFO 07-03 21:37:29 [gpu_model_runner.py:6495] Profiling CUDA graph memory: PIECEWISE=51 (largest=512), FULL=35 (largest=256)
+(EngineCore pid=91314) INFO 07-03 21:37:30 [gpu_model_runner.py:6600] Estimated CUDA graph memory: 0.63 GiB total
+(EngineCore pid=91314) INFO 07-03 21:37:30 [gpu_worker.py:538] Available KV cache memory: 11.17 GiB
+(EngineCore pid=91314) INFO 07-03 21:37:30 [gpu_worker.py:553] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9200 is equivalent to --gpu-memory-utilization=0.8998 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9402. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+(EngineCore pid=91314) INFO 07-03 21:37:30 [kv_cache_utils.py:2146] GPU KV cache size: 122,032 tokens
+(EngineCore pid=91314) INFO 07-03 21:37:30 [kv_cache_utils.py:2147] Maximum concurrency for 4,096 tokens per request: 29.79x
+(EngineCore pid=91314) INFO 07-03 21:37:30 [deep_gemm.py:175] deep_gemm not found in site-packages, trying vendored vllm.third_party.deep_gemm
+(EngineCore pid=91314) INFO 07-03 21:37:30 [deep_gemm.py:202] DeepGEMM PDL enabled on vllm.third_party.deep_gemm.
+(EngineCore pid=91314) INFO 07-03 21:37:30 [kernel_warmup.py:177] Using FlashInfer autotune cache file: /root/.cache/vllm/flashinfer_autotune_cache/0.6.13/120f/f48e70531920610553d4d6e7a7b563a115ae68fb5d094ebc7e980a0fdf6be9e4/autotune_configs.json
+(EngineCore pid=91314) 2026-07-03 21:37:30,733 - INFO - autotuner.py:651 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+(EngineCore pid=91314) 2026-07-03 21:37:30,777 - INFO - autotuner.py:674 - flashinfer.jit: [Autotuner]: Autotuning process ends
+(EngineCore pid=91314) WARNING 07-03 21:37:30 [kernel_warmup.py:206] No FlashInfer autotune cache entries found.Falling back to default tactics.
+(EngineCore pid=91314) INFO 07-03 21:37:30 [cutedsl_warmup.py:97] Skipping CuTeDSL warmup because no compile units were requested.
+(EngineCore pid=91314) Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):   0%|          | 0/51 [00:00<?, ?it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):   4%|▍         | 2/51 [00:00<00:03, 15.22it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):   8%|▊         | 4/51 [00:00<00:03, 15.30it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  12%|█▏        | 6/51 [00:00<00:02, 15.36it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  16%|█▌        | 8/51 [00:00<00:02, 15.08it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  20%|█▉        | 10/51 [00:00<00:02, 14.98it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  24%|██▎       | 12/51 [00:00<00:02, 14.84it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  27%|██▋       | 14/51 [00:00<00:02, 14.66it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  31%|███▏      | 16/51 [00:01<00:02, 14.59it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  35%|███▌      | 18/51 [00:01<00:02, 14.53it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  39%|███▉      | 20/51 [00:01<00:02, 14.50it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  43%|████▎     | 22/51 [00:01<00:01, 14.53it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  47%|████▋     | 24/51 [00:01<00:01, 14.29it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  51%|█████     | 26/51 [00:01<00:01, 14.35it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  55%|█████▍    | 28/51 [00:01<00:01, 14.36it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  59%|█████▉    | 30/51 [00:02<00:01, 14.37it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  63%|██████▎   | 32/51 [00:02<00:01, 13.90it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  67%|██████▋   | 34/51 [00:02<00:01, 13.99it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  71%|███████   | 36/51 [00:02<00:01, 14.13it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  75%|███████▍  | 38/51 [00:02<00:00, 14.20it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  78%|███████▊  | 40/51 [00:02<00:00, 13.87it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  82%|████████▏ | 42/51 [00:02<00:00, 14.06it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  86%|████████▋ | 44/51 [00:03<00:00, 14.24it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  90%|█████████ | 46/51 [00:03<00:00, 14.36it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  94%|█████████▍| 48/51 [00:03<00:00, 14.21it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  98%|█████████▊| 50/51 [00:03<00:00, 14.33it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE): 100%|██████████| 51/51 [00:03<00:00, 14.33it/s]
+(EngineCore pid=91314) Capturing CUDA graphs (decode, FULL):   0%|          | 0/35 [00:00<?, ?it/s]Capturing CUDA graphs (decode, FULL):   6%|▌         | 2/35 [00:00<00:02, 14.86it/s]Capturing CUDA graphs (decode, FULL):  11%|█▏        | 4/35 [00:00<00:02, 11.85it/s]Capturing CUDA graphs (decode, FULL):  17%|█▋        | 6/35 [00:00<00:02, 13.07it/s]Capturing CUDA graphs (decode, FULL):  23%|██▎       | 8/35 [00:00<00:01, 13.69it/s]Capturing CUDA graphs (decode, FULL):  29%|██▊       | 10/35 [00:00<00:01, 14.14it/s]Capturing CUDA graphs (decode, FULL):  34%|███▍      | 12/35 [00:00<00:01, 14.11it/s]Capturing CUDA graphs (decode, FULL):  40%|████      | 14/35 [00:01<00:01, 13.64it/s]Capturing CUDA graphs (decode, FULL):  46%|████▌     | 16/35 [00:01<00:01, 13.93it/s]Capturing CUDA graphs (decode, FULL):  51%|█████▏    | 18/35 [00:01<00:01, 14.18it/s]Capturing CUDA graphs (decode, FULL):  57%|█████▋    | 20/35 [00:01<00:01, 14.40it/s]Capturing CUDA graphs (decode, FULL):  63%|██████▎   | 22/35 [00:01<00:00, 14.52it/s]Capturing CUDA graphs (decode, FULL):  69%|██████▊   | 24/35 [00:01<00:00, 14.66it/s]Capturing CUDA graphs (decode, FULL):  74%|███████▍  | 26/35 [00:01<00:00, 14.78it/s]Capturing CUDA graphs (decode, FULL):  80%|████████  | 28/35 [00:01<00:00, 14.95it/s]Capturing CUDA graphs (decode, FULL):  86%|████████▌ | 30/35 [00:02<00:00, 15.01it/s]Capturing CUDA graphs (decode, FULL):  91%|█████████▏| 32/35 [00:02<00:00, 15.13it/s]Capturing CUDA graphs (decode, FULL):  97%|█████████▋| 34/35 [00:02<00:00, 15.18it/s]Capturing CUDA graphs (decode, FULL): 100%|██████████| 35/35 [00:02<00:00, 14.45it/s]
+(EngineCore pid=91314) INFO 07-03 21:37:37 [gpu_model_runner.py:6668] Graph capturing finished in 7 secs, took 0.60 GiB
+(EngineCore pid=91314) INFO 07-03 21:37:37 [gpu_worker.py:771] CUDA graph pool memory: 0.6 GiB (actual), 0.63 GiB (estimated), difference: 0.03 GiB (5.2%).
+(EngineCore pid=91314) INFO 07-03 21:37:37 [jit_monitor.py:72] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(EngineCore pid=91314) INFO 07-03 21:37:37 [core.py:337] init engine (profile, create kv cache, warmup model) took 15.68 s (compilation: 5.63 s)
+(EngineCore pid=91314) INFO 07-03 21:37:37 [kernel.py:286] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+[001/196] bfcl       bfcl-922     PASS name=updateUserPreferences(ok) args=ok
+[002/196] bfcl       bfcl-558     PASS name=extract_legal_information(ok) args=ok
+[003/196] bfcl       bfcl-76      PASS name=get_ad_performance_metrics(ok) args=ok
+[004/196] bfcl       bfcl-853     PASS name=fetchSurveyResponses(ok) args=ok
+[005/196] bfcl       bfcl-965     fail name=create_crm_to_project_management_integration(ok) args=X
+[006/196] bfcl       bfcl-404     fail name=stratified_dataset_split(ok) args=X
+[007/196] bfcl       bfcl-535     fail name=analyze_compliance_policies(ok) args=X
+[008/196] bfcl       bfcl-400     PASS name=min_max_normalize(ok) args=ok
+[009/196] bfcl       bfcl-180     fail name=retrieve_paypal_transaction_history(ok) args=X
+[010/196] bfcl       bfcl-532     fail name=register_new_employee(ok) args=X
+[011/196] bfcl       bfcl-929     PASS name=consolidate_datasets(ok) args=ok
+[012/196] bfcl       bfcl-437     PASS name=categorize_and_assess_feedback(ok) args=ok
+[013/196] bfcl       bfcl-910     PASS name=get_mars_rover_data(ok) args=ok
+[014/196] bfcl       bfcl-1077    PASS name=extract_general_ledger_balances(ok) args=ok
+[015/196] bfcl       bfcl-953     PASS name=fetch_average_resolution_time(ok) args=ok
+[016/196] bfcl       bfcl-630     fail name=analyze_traffic_flow(ok) args=X
+[017/196] bfcl       bfcl-129     PASS name=batch_extract_audio(ok) args=ok
+[018/196] bfcl       bfcl-1011    fail name=summarize_document(ok) args=X
+[019/196] bfcl       bfcl-451     PASS name=initiate_vulnerability_scan(ok) args=ok
+[020/196] bfcl       bfcl-358     PASS name=create_docker_image(ok) args=ok
+[021/196] bfcl       bfcl-179     PASS name=add_bank_account(ok) args=ok
+[022/196] bfcl       bfcl-447     PASS name=fetch_snmp_metrics(ok) args=ok
+[023/196] bfcl       bfcl-915     PASS name=send_user_message(ok) args=ok
+[024/196] bfcl       bfcl-883     PASS name=fetchPoliceDepartmentMetrics(ok) args=ok
+[025/196] bfcl       bfcl-799     PASS name=evaluate_risk_profile(ok) args=ok
+[026/196] bfcl       bfcl-11      PASS name=lock_all_smart_doors(ok) args=ok
+[027/196] bfcl       bfcl-961     PASS name=get_order_details(ok) args=ok
+[028/196] bfcl       bfcl-918     PASS name=getMovieRecommendations(ok) args=ok
+[029/196] bfcl       bfcl-933     PASS name=fetchRealTimeEnergyData(ok) args=ok
+[030/196] bfcl       bfcl-329     PASS name=detect_gas_leak(ok) args=ok
+[031/196] bfcl       bfcl-746     PASS name=generateWeatherForecastQuery(ok) args=ok
+[032/196] bfcl       bfcl-241     fail name=schedule_meetings(ok) args=X
+[033/196] bfcl       bfcl-735     PASS name=set_folder_permissions(ok) args=ok
+[034/196] bfcl       bfcl-520     PASS name=getCurrentLocation(ok) args=ok
+[035/196] bfcl       bfcl-478     fail name=extract_supply_chain_entities(ok) args=X
+[036/196] bfcl       bfcl-484     PASS name=extract_treatments_procedures(ok) args=ok
+[037/196] bfcl       bfcl-534     PASS name=get_order_status(ok) args=ok
+[038/196] bfcl       bfcl-104     PASS name=check_item_availability(ok) args=ok
+[039/196] bfcl       bfcl-374     PASS name=find_collaboration_tool(ok) args=ok
+[040/196] bfcl       bfcl-692     fail name=create_training_program(ok) args=X
+[041/196] bfcl       bfcl-9       PASS name=set_blind_openness(ok) args=ok
+[042/196] bfcl       bfcl-856     PASS name=fetchCollaborationHistory(ok) args=ok
+[043/196] bfcl       bfcl-116     PASS name=get_travel_insurance_plans(ok) args=ok
+[044/196] bfcl       bfcl-1016    fail name=generate_code_from_description(ok) args=X
+[045/196] bfcl       bfcl-917     PASS name=predict_customer_churn(ok) args=ok
+[046/196] bfcl       bfcl-414     PASS name=backup_database(ok) args=ok
+[047/196] bfcl       bfcl-544     PASS name=automate_error_handling(ok) args=ok
+[048/196] bfcl       bfcl-529     PASS name=get_patient_health_record(ok) args=ok
+[049/196] bfcl       bfcl-530     PASS name=batch_update_task_status(ok) args=ok
+[050/196] bfcl       bfcl-370     PASS name=fetch_configuration_specs(ok) args=ok
+[051/196] bfcl       bfcl-187     fail name=place_market_order(ok) args=X
+[052/196] bfcl       bfcl-341     PASS name=process_sensor_data(ok) args=ok
+[053/196] bfcl       bfcl-632     fail name=None(X) args=X
+[054/196] bfcl       bfcl-62      PASS name=extract_campaign_data(ok) args=ok
+[055/196] bfcl       bfcl-335     PASS name=fetch_market_prices(ok) args=ok
+[056/196] bfcl       bfcl-925     PASS name=add_new_product(ok) args=ok
+[057/196] bfcl       bfcl-222     PASS name=find_music_learning_app(ok) args=ok
+[058/196] bfcl       bfcl-726     PASS name=sendMessageWithAttachment(ok) args=ok
+[059/196] bfcl       bfcl-913     PASS name=initiate_transfer(ok) args=ok
+[060/196] bfcl       bfcl-254     PASS name=profileScriptExecution(ok) args=ok
+[061/196] bfcl       bfcl-930     PASS name=getAirQualityData(ok) args=ok
+[062/196] bfcl       bfcl-971     PASS name=fetch_compliance_data(ok) args=ok
+[063/196] bfcl       bfcl-814     fail no JSON tool call found
+[064/196] bfcl       bfcl-905     PASS name=getCurrentPosition(ok) args=ok
+[065/196] bfcl       bfcl-625     PASS name=findAvailableFlights(ok) args=ok
+[066/196] bfcl       bfcl-753     PASS name=transcribe_podcast(ok) args=ok
+[067/196] bfcl       bfcl-92      PASS name=optimize_container_packing(ok) args=ok
+[068/196] bfcl       bfcl-763     PASS name=transcribe_audio(ok) args=ok
+[069/196] bfcl       bfcl-607     PASS name=createGroundTransportReservation(ok) args=ok
+[070/196] bfcl       bfcl-1047    PASS name=initiate_remote_testing_session(ok) args=ok
+[071/196] bfcl       bfcl-554     fail name=automate_customer_onboarding(ok) args=X
+[072/196] bfcl       bfcl-318     fail name=forecast_storage_needs(ok) args=X
+[073/196] bfcl       bfcl-685     fail name=None(X) args=X
+[074/196] bfcl       bfcl-1040    fail name=createPhotoAlbum(ok) args=X
+[075/196] bfcl       bfcl-782     PASS name=create_insurance_policy(ok) args=ok
+[076/196] gsm8k      gsm8k-588    PASS got=52 want=52
+[077/196] gsm8k      gsm8k-1214   PASS got=5 want=5
+[078/196] gsm8k      gsm8k-57     PASS got=83 want=83
+[079/196] gsm8k      gsm8k-906    PASS got=10 want=10
+[080/196] gsm8k      gsm8k-1252   PASS got=70 want=70
+[081/196] gsm8k      gsm8k-618    PASS got=36 want=36
+[082/196] gsm8k      gsm8k-599    PASS got=48 want=48
+[083/196] gsm8k      gsm8k-289    PASS got=16 want=16
+[084/196] gsm8k      gsm8k-608    PASS got=8 want=8
+[085/196] gsm8k      gsm8k-400    PASS got=48 want=48
+[086/196] gsm8k      gsm8k-237    PASS got=90 want=90
+[087/196] gsm8k      gsm8k-616    PASS got=10 want=10
+[088/196] gsm8k      gsm8k-672    fail got=1 want=2
+[089/196] gsm8k      gsm8k-1132   PASS got=45000 want=45000
+[090/196] gsm8k      gsm8k-463    PASS got=18 want=18
+[091/196] gsm8k      gsm8k-222    PASS got=140 want=140
+[092/196] gsm8k      gsm8k-945    fail got=1 want=17
+[093/196] gsm8k      gsm8k-238    PASS got=68 want=68
+[094/196] gsm8k      gsm8k-730    PASS got=8 want=8
+[095/196] gsm8k      gsm8k-55     PASS got=14 want=14
+[096/196] gsm8k      gsm8k-772    PASS got=50 want=50
+[097/196] gsm8k      gsm8k-176    PASS got=100 want=100
+[098/196] gsm8k      gsm8k-15     PASS got=125 want=125
+[099/196] gsm8k      gsm8k-66     PASS got=48 want=48
+[100/196] gsm8k      gsm8k-479    PASS got=15400 want=15400
+[101/196] gsm8k      gsm8k-896    PASS got=250 want=250
+[102/196] gsm8k      gsm8k-1122   fail got=20 want=18
+[103/196] gsm8k      gsm8k-1005   PASS got=1490 want=1490
+[104/196] gsm8k      gsm8k-480    PASS got=11 want=11
+[105/196] gsm8k      gsm8k-187    fail got=4 want=106
+[106/196] gsm8k      gsm8k-275    fail got=48 want=138
+[107/196] gsm8k      gsm8k-868    PASS got=15 want=15
+[108/196] gsm8k      gsm8k-921    PASS got=4 want=4
+[109/196] humaneval  HumanEval-61 PASS passed
+[110/196] humaneval  HumanEval-104 PASS passed
+[111/196] humaneval  HumanEval-105 PASS passed
+[112/196] humaneval  HumanEval-42 PASS passed
+[113/196] humaneval  HumanEval-145 fail fail: ['AssertionError']
+[114/196] ifeval     ifeval-2195  PASS bullet_count=ok
+[115/196] ifeval     ifeval-2284  fail word_count_min=X, placeholders_min=X, bullet_count=X
+[116/196] ifeval     ifeval-1418  fail no_commas=ok, sentence_count_max=ok, sentence_count_min=X
+[117/196] ifeval     ifeval-2485  PASS keywords_include=ok
+[118/196] ifeval     ifeval-3367  fail quotation=X, multiple_sections=ok
+[119/196] ifeval     ifeval-1601  PASS highlighted_min=ok, word_count_max=ok
+[120/196] ifeval     ifeval-2957  PASS keywords_forbidden=ok
+[121/196] ifeval     ifeval-3409  PASS quotation=ok, highlighted_min=ok
+[122/196] mmlu_pro   mmlupro-10638 fail chose=G want=F
+[123/196] mmlu_pro   mmlupro-2338 fail chose=J want=E
+[124/196] mmlu_pro   mmlupro-967  fail chose=J want=C
+[125/196] mmlu_pro   mmlupro-73   PASS chose=C want=C
+[126/196] mmlu_pro   mmlupro-11693 PASS chose=B want=B
+[127/196] mmlu_pro   mmlupro-592  fail chose=H want=A
+[128/196] mmlu_pro   mmlupro-1159 fail chose=A want=B
+[129/196] mmlu_pro   mmlupro-1351 fail chose=C want=H
+[130/196] mmlu_pro   mmlupro-8036 fail chose=E want=A
+[131/196] mmlu_pro   mmlupro-1913 PASS chose=H want=H
+[132/196] mmlu_pro   mmlupro-11001 fail chose=I want=A
+[133/196] mmlu_pro   mmlupro-11790 fail chose=I want=F
+[134/196] mmlu_pro   mmlupro-5190 PASS chose=D want=D
+[135/196] mmlu_pro   mmlupro-10628 fail chose=D want=B
+[136/196] mmlu_pro   mmlupro-10697 fail chose=A want=D
+[137/196] mmlu_pro   mmlupro-7430 PASS chose=G want=G
+[138/196] mmlu_pro   mmlupro-10555 PASS chose=A want=A
+[139/196] mmlu_pro   mmlupro-3022 PASS chose=B want=B
+[140/196] mmlu_pro   mmlupro-10008 PASS chose=A want=A
+[141/196] mmlu_pro   mmlupro-7847 PASS chose=I want=I
+[142/196] mmlu_pro   mmlupro-10819 PASS chose=B want=B
+[143/196] mmlu_pro   mmlupro-10744 PASS chose=E want=E
+[144/196] mmlu_pro   mmlupro-8442 fail chose=F want=A
+[145/196] mmlu_pro   mmlupro-5546 PASS chose=B want=B
+[146/196] mmlu_pro   mmlupro-3894 PASS chose=F want=F
+[147/196] mmlu_pro   mmlupro-3076 PASS chose=A want=A
+[148/196] mmlu_pro   mmlupro-8225 fail chose=G want=D
+[149/196] mmlu_pro   mmlupro-3583 fail chose=D want=B
+[150/196] mmlu_pro   mmlupro-6557 PASS chose=A want=A
+[151/196] mmlu_pro   mmlupro-5632 PASS chose=F want=F
+[152/196] mmlu_pro   mmlupro-6037 fail chose=A want=D
+[153/196] mmlu_pro   mmlupro-11217 fail chose=B want=I
+[154/196] mmlu_pro   mmlupro-6625 fail chose=D want=B
+[155/196] mmlu_pro   mmlupro-222  fail chose=C want=B
+[156/196] mmlu_pro   mmlupro-6840 PASS chose=E want=E
+[157/196] mmlu_pro   mmlupro-6804 fail chose=D want=J
+[158/196] mmlu_pro   mmlupro-3580 PASS chose=A want=A
+[159/196] mmlu_pro   mmlupro-5544 PASS chose=D want=D
+[160/196] mmlu_pro   mmlupro-9682 fail chose=C want=B
+[161/196] mmlu_pro   mmlupro-5134 PASS chose=H want=H
+[162/196] mmlu_pro   mmlupro-3649 fail chose=A want=J
+[163/196] mmlu_pro   mmlupro-8717 PASS chose=A want=A
+[164/196] mmlu_pro   mmlupro-9094 fail chose=D want=G
+[165/196] mmlu_pro   mmlupro-7359 fail chose=I want=A
+[166/196] mmlu_pro   mmlupro-2607 PASS chose=H want=H
+[167/196] mmlu_pro   mmlupro-1519 PASS chose=C want=C
+[168/196] mmlu_pro   mmlupro-3208 PASS chose=D want=D
+[169/196] mmlu_pro   mmlupro-8282 PASS chose=B want=B
+[170/196] mmlu_pro   mmlupro-413  fail chose=B want=H
+[171/196] mmlu_pro   mmlupro-7390 PASS chose=F want=F
+[172/196] mmlu_pro   mmlupro-4470 fail chose=B want=D
+[173/196] mmlu_pro   mmlupro-11478 fail chose=E want=I
+[174/196] mmlu_pro   mmlupro-5237 fail chose=D want=B
+[175/196] mmlu_pro   mmlupro-7675 PASS chose=F want=F
+[176/196] mmlu_pro   mmlupro-11263 fail chose=A want=G
+[177/196] mmlu_pro   mmlupro-8937 fail chose=E want=G
+[178/196] mmlu_pro   mmlupro-675  PASS chose=F want=F
+[179/196] mmlu_pro   mmlupro-2278 fail chose=H want=I
+[180/196] mmlu_pro   mmlupro-6927 PASS chose=B want=B
+[181/196] mmlu_pro   mmlupro-1881 fail chose=D want=H
+[182/196] mmlu_pro   mmlupro-10795 fail chose=A want=C
+[183/196] mmlu_pro   mmlupro-10144 fail chose=E want=I
+[184/196] mmlu_pro   mmlupro-176  fail chose=E want=I
+[185/196] mmlu_pro   mmlupro-5656 PASS chose=G want=G
+[186/196] mmlu_pro   mmlupro-3562 fail chose=B want=I
+[187/196] mmlu_pro   mmlupro-3247 PASS chose=H want=H
+[188/196] mmlu_pro   mmlupro-942  PASS chose=E want=E
+[189/196] mmlu_pro   mmlupro-8557 fail chose=A want=G
+[190/196] mmlu_pro   mmlupro-2199 PASS chose=A want=A
+[191/196] mmlu_pro   mmlupro-2723 PASS chose=H want=H
+[192/196] mmlu_pro   mmlupro-8010 fail chose=A want=J
+[193/196] mmlu_pro   mmlupro-1304 fail chose=I want=A
+[194/196] mmlu_pro   mmlupro-4829 PASS chose=G want=G
+[195/196] mmlu_pro   mmlupro-6477 PASS chose=E want=E
+[196/196] mmlu_pro   mmlupro-6604 fail chose=B want=I
+
+======================================================
+QUALITY REPORT - backend=vllm_awq tier=25%
+======================================================
+  bfcl          76.00%   (57/75)
+  gsm8k         84.85%   (28/33)
+  humaneval     80.00%   (4/5)
+  ifeval        77.08%   (5/8)
+  mmlu_pro      48.00%   (36/75)
+  ----------------------------------
+  OVERALL       66.92%   (196 items)
+
+wrote /workspace/qwen_awq_bench/results/quality_25_20260703/vllm_awq_25pct.jsonl
+(EngineCore pid=91314) INFO 07-03 21:38:39 [core.py:1214] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=91314) INFO 07-03 21:38:39 [core.py:1333] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=91314) INFO 07-03 21:38:39 [core.py:1364] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=91314) INFO 07-03 21:38:39 [core.py:1227] [shutdown] EngineCore: exiting busy loop

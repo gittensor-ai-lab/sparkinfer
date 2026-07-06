@@ -20,5 +20,40 @@
     "date": "2026-06-25",
     "penalty_days": 2,
     "note": "maintainer-flagged: same default split-K + PDL decode change as #53 (eval:none); below auto containment threshold but a duplicate attempt. Reduced to a 2-day penalty (default is 5): first-time contributor, first mistake, and a genuine contributor of real speedups (#44, #52)."
+  },
+  {
+    "pr": 88,
+    "author": "ai-engram",
+    "original": 83,
+    "date": "2026-06-29"
+  },
+  {
+    "pr": 132,
+    "author": "Daedalus-Icarus",
+    "original": 128,
+    "date": "2026-07-02"
+  },
+  {
+    "pr": 191,
+    "author": "devmixa702",
+    "original": 188,
+    "date": "2026-07-03"
+  },
+  {
+    "pr": 209,
+    "author": "jony376",
+    "original": 221,
+    "date": "2026-07-04",
+    "note": "reattributed: #209 is a verbatim copy of fansilas's #221 (fansilas authored the #195 kernel; jony376 commit 11:18 > fansilas 05:23)"
+  },
+  {
+    "pr": 244,
+    "author": "cleanjunc",
+    "original": 233,
+    "date": "2026-07-06",
+    "blocked": false,
+    "penalty_days": 0,
+    "strike": 1,
+    "containment": 0.41
   }
 ]
