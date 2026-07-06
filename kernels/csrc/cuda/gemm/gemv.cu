@@ -96,6 +96,7 @@ __global__ void gemv_f32_sk_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 template __global__ void gemv_f32_sk_kernel<float, 4>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int);
+template __global__ void gemv_f32_sk_kernel<float, 8>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int);
 // bf16-output split-K instantiations for the dense projection GEMV (launch_gemv occupancy path).
 template __global__ void gemv_f32_sk_kernel<__nv_bfloat16, 2>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int);
 template __global__ void gemv_f32_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int);
@@ -730,7 +731,8 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K, cudaStream
 }
 
 // split-K occupancy for the f32-output bf16 GEMV. Default ON: at decode this path serves the
-// router projection (N = n_experts is tiny), where one-warp-per-row idles the GPU.
+// router projection (N = n_experts is tiny), where one-warp-per-row idles the GPU. The Qwen3.6
+// 256-expert router measured best with S=8 on RTX 5090.
 // SPARKINFER_ROUTER_SK=0 restores the plain one-warp-per-row kernel. Needs K a multiple of 8.
 static int gemv_f32_splitk() {
     static int v = -1;
@@ -739,7 +741,7 @@ static int gemv_f32_splitk() {
 }
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K, cudaStream_t stream) {
     if (gemv_f32_splitk() && (K & 7) == 0) {
-        constexpr int S = 4, RPB = GEMV_WPB / S;
+        constexpr int S = 8, RPB = GEMV_WPB / S;
         dim3 grid((N + RPB - 1) / RPB);
         gemv_f32_sk_kernel<float, S><<<grid, GEMV_WPB * 32, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);

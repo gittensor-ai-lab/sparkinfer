@@ -150,11 +150,16 @@ void launch_moe_router(
 ) {
     if (num_tokens <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts) return;
     size_t smem = (size_t)num_experts * sizeof(float);
-    // Default ON: single-pass rank-select top-k (one thread/expert). SPARKINFER_ROUTER2=0
-    // restores the k-pass single-warp kernel. Falls back automatically if num_experts > 1024.
+    // The rank-select router is still useful for larger/wider routing, but Qwen3.6 decode's
+    // single-token 256-expert/top-8 case measured faster with the older k-pass warp kernel.
+    // SPARKINFER_ROUTER2=1 forces rank-select; SPARKINFER_ROUTER2=0 forces the warp path.
     static int r2 = -1;
-    if (r2 < 0) { const char* e = getenv("SPARKINFER_ROUTER2"); r2 = (e && e[0] == '0') ? 0 : 1; }
-    if (r2 && top_k <= 16 && num_experts <= 1024) {
+    if (r2 < 0) {
+        const char* e = getenv("SPARKINFER_ROUTER2");
+        r2 = e ? ((e[0] == '0') ? 0 : 1) : 2;
+    }
+    const bool qwen36_single = (num_tokens == 1 && num_experts == 256 && top_k == 8);
+    if (r2 != 0 && !(r2 == 2 && qwen36_single) && top_k <= 16 && num_experts <= 1024) {
         const int bd = ((num_experts + 31) / 32) * 32;     // round up to a warp multiple
         moe_router_kernel2<<<num_tokens, bd, smem, stream>>>(
             logits, expert_ids, expert_weights, tokens_per_expert,

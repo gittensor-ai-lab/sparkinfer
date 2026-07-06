@@ -933,16 +933,16 @@ __global__ void down_q4k_mmvq_splitk_qwen_kernel(
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
 
-// Split count for the split-K MMVQ down (SPARKINFER_DOWN_SPLITK_S, default 2).
-// Swept on the RTX 5090 / Qwen3-30B-A3B: S=2 is the decode optimum (S=2 ≈ S=8 >
-// S=4 > one-warp); S=2 wins on the least cross-split reduction overhead. 0 or 1
-// disables split-K and restores the one-warp-per-row MMVQ down.
+// Split count for the split-K MMVQ down (SPARKINFER_DOWN_SPLITK_S, default 8).
+// On the current RTX 5090 / Qwen3.6 F=512 decode path, S=8 keeps the down-projection
+// rows better occupied than S=2 without enough extra reduction cost to lose the win.
+// 0 or 1 disables split-K and restores the one-warp-per-row MMVQ down.
 static inline int down_splitk_s() {
     static int s = -2;
     if (s == -2) {
         const char* v = getenv("SPARKINFER_DOWN_SPLITK_S");
-        s = v ? atoi(v) : 2;
-        if (!(s == 0 || s == 1 || s == 2 || s == 4 || s == 8)) s = 2;
+        s = v ? atoi(v) : 8;
+        if (!(s == 0 || s == 1 || s == 2 || s == 4 || s == 8)) s = 8;
     }
     return s;
 }
