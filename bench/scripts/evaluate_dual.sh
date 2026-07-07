@@ -81,48 +81,56 @@ run_model() {  # $1=role  $2=file $3=repo $4=tok  $5=frontier  $6..=SPARKINFER_*
 P_DIFF_REF="${SPARKINFER_DIFFICULTY_REF_OVERRIDE:-}"
 
 # When the Qwen3.6 guard baselines aren't pre-set (bot passes 0), measure Qwen3.6 main
-# speed directly on the box — a quick 3-context decode sweep against the already-built
-# origin/main. This auto-calibrates every bot run so the scoring base never goes stale.
+# speed directly on the box — a quick 5-context decode sweep against the already-built
+# origin/main (128/512/4k/16k/32k). This auto-calibrates every bot run so the scoring base never goes stale.
 if [ "${SPARKINFER_P_GUARD_128_BASELINE:-0}" = "0" ]; then
-  echo ">> measuring Qwen3.6 same-box main baseline (3-context sweep) ..." >&2
+  echo ">> measuring Qwen3.6 same-box main baseline (5-context sweep) ..." >&2
   P36_GGUF="${P_DIR}/${P_FILE}"
   SI_BIN="$ROOT/build/runtime"   # ensure si_run finds the already-built binaries
   [ -f "$P36_GGUF" ] || P36_GGUF="${MODELS_DIR:-$ROOT/models}/${P_FILE}"
   SI_BIN="$ROOT/build/runtime"   # ensure si_run finds the already-built binaries
-  for ctx in 0 512 4096; do
+  for ctx in 0 512 4096 16384 32768; do
     t="$(si_run qwen3_gguf_bench "$P36_GGUF" 128 "$ctx" 2>/dev/null | \
          sed -n 's/.*decode tg *: *\([0-9.][0-9.]*\).*/\1/p' | tail -1)"
     case "$ctx" in
-      0)    P36_128="${t:-0}" ;;
-      512)  P36_512="${t:-0}" ;;
-      4096) P36_4K="${t:-0}" ;;
+      0)     P36_128="${t:-0}" ;;
+      512)   P36_512="${t:-0}" ;;
+      4096)  P36_4K="${t:-0}" ;;
+      16384) P36_16K="${t:-0}" ;;
+      32768) P36_32K="${t:-0}" ;;
     esac
   done
-  echo ">> Qwen3.6 same-box main: 128=${P36_128} 512=${P36_512} 4k=${P36_4K} tok/s" >&2
+  echo ">> Qwen3.6 same-box main: 128=${P36_128} 512=${P36_512} 4k=${P36_4K} 16k=${P36_16K} 32k=${P36_32K} tok/s" >&2
 fi
 P36_128="${P36_128:-0}"
 P36_512="${P36_512:-0}"
 P36_4K="${P36_4K:-0}"
+P36_16K="${P36_16K:-0}"
+P36_32K="${P36_32K:-0}"
 # Fall back to the bot's config defaults if measurement produced 0
 # (use value check, not null check: P36_* is already "0" from above, which is non-empty,
 # so ${P36_128:-default} would never fire — we need an explicit zero-guard)
 [ "${P36_128}" = "0" ] && P36_128="${SPARKINFER_P_GUARD_128_BASELINE:-300.16}"
 [ "${P36_512}" = "0" ] && P36_512="${SPARKINFER_P_GUARD_512_BASELINE:-296.76}"
 [ "${P36_4K}"  = "0" ] && P36_4K="${SPARKINFER_P_GUARD_4K_BASELINE:-287.91}"
+[ "${P36_16K}" = "0" ] && P36_16K="${SPARKINFER_P_GUARD_16K_BASELINE:-338.55}"
+[ "${P36_32K}" = "0" ] && P36_32K="${SPARKINFER_P_GUARD_32K_BASELINE:-301.19}"
 
 PRIMARY_JSON="$(run_model primary "$P_FILE" "$P_REPO" "$P_TOK" 0 \
   MODELS_DIR="$P_DIR" MODEL_SHA256="${QWEN36_MODEL_SHA256:-}" \
-  SPARKINFER_SCORE_REPS=0 SPARKINFER_GUARD_32K_REPS=0 \
+  SPARKINFER_SCORE_REPS=3 SPARKINFER_GUARD_32K_REPS=1 \
   SPARKINFER_GUARD_REPS=3 SPARKINFER_GUARD_512_REPS=3 SPARKINFER_GUARD_4K_REPS=3 \
   SPARKINFER_DIFFICULTY_BOOST=1 SPARKINFER_DIFFICULTY_REF="${P_DIFF_REF:-365.85}" \
   SPARKINFER_GUARD_128_BASELINE="${P36_128}" \
   SPARKINFER_GUARD_512_BASELINE="${P36_512}" \
   SPARKINFER_GUARD_4K_BASELINE="${P36_4K}" \
-  SPARKINFER_GUARD_16K_BASELINE=0 \
-  SPARKINFER_GUARD_32K_BASELINE=0 \
+  SPARKINFER_GUARD_16K_BASELINE="${P36_16K}" \
+  SPARKINFER_GUARD_32K_BASELINE="${P36_32K}" \
   SPARKINFER_LLAMA_128_BASELINE="${SPARKINFER_P_LLAMA_128_BASELINE:-0}" \
   SPARKINFER_LLAMA_512_BASELINE="${SPARKINFER_P_LLAMA_512_BASELINE:-0}" \
-  SPARKINFER_LLAMA_4K_BASELINE="${SPARKINFER_P_LLAMA_4K_BASELINE:-0}")"
+  SPARKINFER_LLAMA_4K_BASELINE="${SPARKINFER_P_LLAMA_4K_BASELINE:-0}" \
+  SPARKINFER_LLAMA_16K_BASELINE="${SPARKINFER_P_LLAMA_16K_BASELINE:-280.66}" \
+  SPARKINFER_LLAMA_32K_BASELINE="${SPARKINFER_P_LLAMA_32K_BASELINE:-279.83}")"
 
 # Guard runs at frontier 0 (never scored). Its main-branch baselines make every context a
 # no-regression gate; the merge below fails the submission if any gate or the accuracy gate breaks.
