@@ -467,11 +467,22 @@ int Qwen35Model::forward_token(int token_id, int position) {
 
             bf16* conv_state = s.lin_conv_state +
                 (size_t)L * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
-            kernels::launch_qwen36_conv_split_l2(s.lin_qkv, w.ssm_conv, conv_state,
+            // Fused conv_split + l2_norm: one kernel instead of three (SPARKINFER_GDN_FUSE=0 restores split).
+            static int gdn_fuse = -1;
+            if (gdn_fuse < 0) { const char* e = getenv("SPARKINFER_GDN_FUSE"); gdn_fuse = (e && e[0] == '0') ? 0 : 1; }
+            if (gdn_fuse && c.linear_head_dim == 128 && c.linear_q_heads == 16 && c.linear_v_heads == 32) {
+                kernels::launch_qwen36_conv_split_l2norm_fused(s.lin_qkv, w.ssm_conv, conv_state,
                                                  s.lin_q, s.lin_k, s.lin_v,
                                                  c.linear_q_heads, c.linear_v_heads,
                                                  c.linear_head_dim, c.linear_conv_kernel,
                                                  c.rms_eps, st);
+            } else {
+                kernels::launch_qwen36_conv_split_l2(s.lin_qkv, w.ssm_conv, conv_state,
+                                                 s.lin_q, s.lin_k, s.lin_v,
+                                                 c.linear_q_heads, c.linear_v_heads,
+                                                 c.linear_head_dim, c.linear_conv_kernel,
+                                                 c.rms_eps, st);
+            }
             if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_ab, 0);
             float* layer_state = s.lin_state +
                 (size_t)L * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;

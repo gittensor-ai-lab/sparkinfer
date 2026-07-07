@@ -70,6 +70,14 @@ void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
                                  void* v_bf16, int q_heads, int v_heads, int head_dim,
                                  int conv_kernel, float eps, cudaStream_t stream = nullptr);
 
+// Fused conv_split + per-head l2_norm: one block per head, head_dim threads.
+// Eliminates the two standalone l2_norm_heads kernel launches per GDN layer.
+// SPARKINFER_GDN_FUSE=0 restores the split path for A/B.
+void launch_qwen36_conv_split_l2norm_fused(const void* qkv_bf16, const void* conv_w_bf16,
+                                 void* conv_state_bf16, void* q_bf16, void* k_bf16,
+                                 void* v_bf16, int q_heads, int v_heads, int head_dim,
+                                 int conv_kernel, float eps, cudaStream_t stream = nullptr);
+
 void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                           const void* alpha_bf16, const void* beta_bf16,
                           const void* dt_bf16, const void* a_bf16,
