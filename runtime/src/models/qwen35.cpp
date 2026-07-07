@@ -670,9 +670,20 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     kernels::launch_gemv_q(s.hn, w.shared_gate_inp, w.shared_gate_inp_type,
                                            s.shared_gate_tmp, 1, H, s.stream_k);
                 } else {
-                    kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
+                    // Fused GEMV + sigmoid for the shared-expert gate scalar:
+                    // writes fp32 sigmoid(gate) directly, eliminating the separate
+                    // 1-thread sigmoid_scalar_kernel launch. SPARKINFER_GEMV_SIGMOID=0
+                    // restores the split path for A/B.
+                    static int gemv_sigmoid = -1;
+                    if (gemv_sigmoid < 0) { const char* e = getenv("SPARKINFER_GEMV_SIGMOID");
+                        gemv_sigmoid = (e && e[0] == '0') ? 0 : 1; }
+                    if (gemv_sigmoid) {
+                        kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.d_shared_w, H, s.stream_k);
+                    } else {
+                        kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
+                        kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
+                    }
                 }
-                kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
             }
             if (qmoe) {
                 kernels::launch_shared_expert_q8_mmvq(
@@ -765,12 +776,20 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     } else if (w.shared_gate_inp_type) {
                         kernels::launch_gemv_q(s.hn, w.shared_gate_inp, w.shared_gate_inp_type, s.shared_gate_tmp, 1, H, st);
                     } else {
-                        kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
+                        static int gs2 = -1;
+                        if (gs2 < 0) { const char* e = getenv("SPARKINFER_GEMV_SIGMOID");
+                            gs2 = (e && e[0] == '0') ? 0 : 1; }
+                        if (gs2) {
+                            kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.d_shared_w, H, st);
+                        } else {
+                            kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
+                            kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
+                        }
                     }
                 } else {
                     kernels::launch_gemm(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, 1, H, 1.f, 0.f, gc, st);
+                    kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
                 }
-                kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
             }
             if (s.gguf) {
                 if (qmoe) {

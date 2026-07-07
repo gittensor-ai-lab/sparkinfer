@@ -46,6 +46,11 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K,
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K,
                      cudaStream_t stream = nullptr);
 
+// Fused GEMV + sigmoid for the shared-expert gate scalar (N=1). One warp dots
+// x @ W and applies sigmoid. SPARKINFER_GEMV_SIGMOID=0 restores the split path.
+void launch_gemv_sigmoid(const void* x, const void* W, float* y, int K,
+                         cudaStream_t stream = nullptr);
+
 // Quantized on-read GEMV: same as launch_gemv but W is GGUF-native Q4_K/Q6_K/Q8_0
 // [N,K] (wtype = ggml type id, 12=Q4_K / 14=Q6_K / 8=Q8_0). Dequantizes each block in
 // registers with a full-precision (fp32) activation dot — reads the quantized

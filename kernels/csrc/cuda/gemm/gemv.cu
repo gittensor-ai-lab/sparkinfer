@@ -774,6 +774,39 @@ static bool gemv_mmvq() {
 // occupancy lever main already uses for the f32 router GEMV (gemv_f32_sk_kernel), extended to the
 // bf16 projections. Only the fp32 reduction order changes, so it is self-consistent with the
 // one-warp path (no top-1 regression). SPARKINFER_GEMV_SK=0 restores the one-warp kernel. K % 8 == 0.
+
+// Fused GEMV + sigmoid for N=1 (shared-expert gate scalar). One warp does the
+// dot product and lane 0 applies sigmoid, eliminating the separate 1-thread
+// sigmoid_scalar_kernel launch. SPARKINFER_GEMV_SIGMOID=0 restores split path.
+__global__ void gemv_sigmoid_kernel(const __nv_bfloat16* __restrict__ x,
+                                     const __nv_bfloat16* __restrict__ W,
+                                     float* __restrict__ y, int K) {
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < K; i += blockDim.x) s_x[i] = __bfloat162float(x[i]);
+    __syncthreads();
+    float acc = 0.f;
+    const uint4* row4 = reinterpret_cast<const uint4*>(W);
+    const int n4 = K / 8;
+    for (int i = threadIdx.x; i < n4; i += 32) {
+        uint4 v = row4[i];
+        const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&v);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 f = __bfloat1622float2(h2[j]);
+            acc += f.x * s_x[i*8 + 2*j] + f.y * s_x[i*8 + 2*j + 1];
+        }
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+    if (threadIdx.x == 0) y[0] = 1.f / (1.f + __expf(-acc));
+}
+
+void launch_gemv_sigmoid(const void* x, const void* W, float* y, int K, cudaStream_t stream) {
+    gemv_sigmoid_kernel<<<1, 32, (size_t)K * sizeof(float), stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<const __nv_bfloat16*>(W), y, K);
+}
+
 static int gemv_bf16_splitk() {
     static int v = -1;
     if (v < 0) { const char* e = getenv("SPARKINFER_GEMV_SK"); v = (e && e[0] == '0') ? 0 : 1; }
