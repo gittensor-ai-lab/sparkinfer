@@ -73,4 +73,14 @@ void launch_qwen36_gated_norm(const void* x_bf16, const void* z_bf16,
                               int v_heads, int head_dim, float eps,
                               cudaStream_t stream = nullptr);
 
+// Qwen3.6 GDN megakernel: fuses conv_split + l2_norm_qk + gdn_ar into one launch. conv_state
+// is a conv_kernel-slot position ring indexed by dpos (device position scalar). Output is
+// lin_gdn (feeds gated_norm). See gdn_mega.cu.
+void launch_qwen36_gdn_mega(const void* lin_qkv_bf16, const void* conv_w_bf16,
+                            void* conv_state_bf16, const void* alpha_bf16, const void* beta_bf16,
+                            const void* dt_bf16, const void* a_bf16, float* state_f32,
+                            void* out_bf16, const int* dpos,
+                            int q_heads, int v_heads, int head_dim, int conv_kernel,
+                            float eps, cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

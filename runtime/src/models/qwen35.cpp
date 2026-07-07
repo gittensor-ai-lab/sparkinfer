@@ -201,7 +201,10 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         p_->lin_beta=p_->alloc<bf16>(cfg.linear_v_heads);
         p_->lin_gdn=p_->alloc<bf16>(p_->linear_vdim);
         p_->lin_norm=p_->alloc<bf16>(p_->linear_vdim);
-        p_->lin_conv_state=p_->alloc<bf16>((size_t)cfg.n_layers * (cfg.linear_conv_kernel - 1) * p_->linear_qkvdim);
+        // conv_kernel slots/layer (not conv_kernel-1): the GDN megakernel uses conv_state as a
+        // conv_kernel-slot position ring; the fallback conv_split uses the first conv_kernel-1
+        // slots (tap-major shift) unchanged. Extra slot is a few hundred KB total.
+        p_->lin_conv_state=p_->alloc<bf16>((size_t)cfg.n_layers * cfg.linear_conv_kernel * p_->linear_qkvdim);
         p_->lin_state=p_->alloc<float>((size_t)cfg.n_layers * cfg.linear_v_heads * cfg.linear_head_dim * cfg.linear_head_dim);
         p_->shared_gate_tmp=p_->alloc<bf16>(1);
     }
@@ -324,7 +327,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
                            (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim * sizeof(float), st),
            "linear state reset");
         cu(cudaMemsetAsync(s.lin_conv_state, 0,
-                           (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim * sizeof(bf16), st),
+                           (size_t)c.n_layers * c.linear_conv_kernel * s.linear_qkvdim * sizeof(bf16), st),
            "linear conv reset");
     }
 
@@ -424,23 +427,45 @@ int Qwen35Model::forward_token(int token_id, int position) {
             }
 
             bf16* conv_state = s.lin_conv_state +
-                (size_t)L * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
-            kernels::launch_qwen36_conv_split_l2(s.lin_qkv, w.ssm_conv, conv_state,
-                                                 s.lin_q, s.lin_k, s.lin_v,
-                                                 c.linear_q_heads, c.linear_v_heads,
-                                                 c.linear_head_dim, c.linear_conv_kernel,
-                                                 c.rms_eps, st);
-            if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_ab, 0);
+                (size_t)L * c.linear_conv_kernel * s.linear_qkvdim;
             float* layer_state = s.lin_state +
                 (size_t)L * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
-            kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
-                                          s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
-                                          layer_state, s.lin_gdn,
-                                          c.linear_q_heads, c.linear_v_heads,
-                                          c.linear_head_dim, st);
-            if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
-            kernels::launch_qwen36_gated_norm(s.lin_gdn, s.lin_z, w.ssm_norm, s.lin_norm,
-                                              c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
+            // GDN megakernel (SPARKINFER_GDN_MEGA, default ON): fuse conv_split + l2_norm_qk +
+            // gdn_ar into ONE main-stream launch, keeping q/k/v/gdn transients in shared/regs and
+            // advancing conv_state via an in-kernel position ring. Bit-identical to the fallback
+            // trio; gated_norm stays separate. Guarded to the Qwen3.6 hybrid shape (head_dim==128,
+            // conv_kernel==4) the kernel is specialized for; the Qwen3-30B path is non-hybrid and
+            // never reaches here. Set =0 to fall back to the three separate kernels.
+            static int gdn_mega = -1;
+            if (gdn_mega < 0) { const char* e = getenv("SPARKINFER_GDN_MEGA"); gdn_mega = (e && e[0] == '0') ? 0 : 1; }
+            const bool use_mega = gdn_mega && c.hybrid &&
+                                  c.linear_head_dim == 128 && c.linear_conv_kernel == 4;
+            if (use_mega) {
+                if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_ab, 0);   // alpha/beta feed the AR
+                kernels::launch_qwen36_gdn_mega(s.lin_qkv, w.ssm_conv, conv_state,
+                                                s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
+                                                layer_state, s.lin_gdn, s.d_pos,
+                                                c.linear_q_heads, c.linear_v_heads,
+                                                c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+                if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);    // gate z feeds gated_norm
+                kernels::launch_qwen36_gated_norm(s.lin_gdn, s.lin_z, w.ssm_norm, s.lin_norm,
+                                                  c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
+            } else {
+                kernels::launch_qwen36_conv_split_l2(s.lin_qkv, w.ssm_conv, conv_state,
+                                                     s.lin_q, s.lin_k, s.lin_v,
+                                                     c.linear_q_heads, c.linear_v_heads,
+                                                     c.linear_head_dim, c.linear_conv_kernel,
+                                                     c.rms_eps, st);
+                if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_ab, 0);
+                kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
+                                              s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
+                                              layer_state, s.lin_gdn,
+                                              c.linear_q_heads, c.linear_v_heads,
+                                              c.linear_head_dim, st);
+                if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
+                kernels::launch_qwen36_gated_norm(s.lin_gdn, s.lin_z, w.ssm_norm, s.lin_norm,
+                                                  c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
+            }
             proj_from(s.lin_norm, w.ssm_out, w.ssm_out_type, s.ao, H, s.linear_vdim);
         } else {
             // ---- Q/K/V projection (q_has_gate-aware; q_has_gate=false is byte-identical to Qwen3-MoE) ----
