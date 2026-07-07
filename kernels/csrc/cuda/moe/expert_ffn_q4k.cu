@@ -569,7 +569,7 @@ __global__ void shared_gate_up_q8_mmvq_kernel(
     }
 }
 
-template <int H, int F>
+template <int H, int F, bool ACCUM>
 __global__ void shared_down_q8_mmvq_kernel(
     const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
     __nv_bfloat16* __restrict__ out) {
@@ -581,7 +581,10 @@ __global__ void shared_down_q8_mmvq_kernel(
     for (int b = lane; b < nblk; b += 32)
         acc += si_vec_dot_q8_0(dbase + (size_t)b * 34, hq8 + b);
     acc = q4kf_wsum(acc);
-    if (lane == 0) out[h] = __float2bfloat16(acc);
+    if (lane == 0) {
+        if constexpr (ACCUM) acc += __bfloat162float(out[h]);
+        out[h] = __float2bfloat16(acc);
+    }
 }
 
 template <int H, int F, int TOPK>
@@ -1269,7 +1272,7 @@ void launch_shared_expert_q8_mmvq(
     const void* input, const void* input_q8,
     const void* gate_q, const void* up_q, const void* down_q,
     const float* dw, void* output, float* h_scratch, void* h_q8_buf,
-    int hidden, int ffn, cudaStream_t stream) {
+    int hidden, int ffn, cudaStream_t stream, bool accum = false) {
     const si_block_q8_1* vy;
     si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
     if (input_q8) {
@@ -1286,9 +1289,15 @@ void launch_shared_expert_q8_mmvq(
     quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
         h_scratch, qbuf, nqb, 0);
     dim3 dn((hidden + WPB - 1) / WPB);
-    shared_down_q8_mmvq_kernel<2048, 512><<<dn, WPB * 32, 0, stream>>>(
-        qbuf, reinterpret_cast<const unsigned char*>(down_q),
-        reinterpret_cast<__nv_bfloat16*>(output));
+    if (accum) {
+        shared_down_q8_mmvq_kernel<2048, 512, true><<<dn, WPB * 32, 0, stream>>>(
+            qbuf, reinterpret_cast<const unsigned char*>(down_q),
+            reinterpret_cast<__nv_bfloat16*>(output));
+    } else {
+        shared_down_q8_mmvq_kernel<2048, 512, false><<<dn, WPB * 32, 0, stream>>>(
+            qbuf, reinterpret_cast<const unsigned char*>(down_q),
+            reinterpret_cast<__nv_bfloat16*>(output));
+    }
 }
 #endif
 

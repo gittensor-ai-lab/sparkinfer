@@ -653,11 +653,17 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 }
             }
             if (qmoe) {
+                // Accumulate shared-expert output directly into routed (skip residual_add).
+                // SPARKINFER_SHEXP_ACCUM=0 restores the split path for A/B.
+                static int shexp_accum = -1;
+                if (shexp_accum < 0) { const char* e = getenv("SPARKINFER_SHEXP_ACCUM");
+                    shexp_accum = (e && e[0] == '0') ? 0 : 1; }
                 kernels::launch_shared_expert_q8_mmvq(
                     s.hn, fnq ? s.aq81 : nullptr,
                     w.shared_gate_q, w.shared_up_q, w.shared_down_q,
                     w.shared_gate_inp ? s.d_shared_w : nullptr,
-                    s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k);
+                    shexp_accum ? s.routed : s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k,
+                    shexp_accum ? true : false);
             } else {
                 kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, s.stream_k);
                 kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, s.stream_v);
@@ -671,7 +677,11 @@ int Qwen35Model::forward_token(int token_id, int position) {
         }
 
         if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
-            kernels::launch_gemv_f32(s.hn, w.router_w, s.mf_logits, c.n_experts, c.hidden, st);  // router_w native [E,H]
+            // Q8_0 router: half the weight read bandwidth vs bf16
+            if (w.router_w_type == 8)
+                kernels::launch_gemv_q_f32(s.hn, w.router_w, 8, s.mf_logits, c.n_experts, c.hidden, st);
+            else
+                kernels::launch_gemv_f32(s.hn, w.router_w, s.mf_logits, c.n_experts, c.hidden, st);  // router_w native [E,H]
             // The per-expert token counts only feed the batched-dispatch sort; the single-token
             // decode expert FFN reads ids/weights directly and never touches them. Zeroing that
             // buffer is a per-layer memset node in the replayed decode graph whose fixed cost far
@@ -696,6 +706,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
         if (c.n_shared > 0) {
             if (shexp_pipelined) {
                 cudaStreamWaitEvent(st, s.ev_sx_done, 0);
+                // (residual_add folded into add_rmsnorm3 below — #279)
                 const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
                 if (s.use_addnorm3) {
                     if (fnq)
@@ -745,11 +756,15 @@ int Qwen35Model::forward_token(int token_id, int position) {
             }
             if (s.gguf) {
                 if (qmoe) {
+                    static int shexp_accum3 = -1;
+                    if (shexp_accum3 < 0) { const char* e = getenv("SPARKINFER_SHEXP_ACCUM");
+                        shexp_accum3 = (e && e[0] == '0') ? 0 : 1; }
                     kernels::launch_shared_expert_q8_mmvq(
                         s.hn, fnq ? s.aq81 : nullptr,
                         w.shared_gate_q, w.shared_up_q, w.shared_down_q,
                         w.shared_gate_inp ? s.d_shared_w : nullptr,
-                        s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st);
+                        shexp_accum3 ? s.routed : s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st,
+                        shexp_accum3 ? true : false);
                 } else {
                     kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
                     kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
@@ -768,12 +783,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         if (shared_to_fold) {
             if (fnq)
-                kernels::launch_add_rmsnorm3_q8(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
+                kernels::launch_add_rmsnorm3_q8(s.h, s.routed, s.shared, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
             else
-                kernels::launch_add_rmsnorm3(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+                kernels::launch_add_rmsnorm3(s.h, s.routed, s.shared, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
         } else if (fnq)
-            kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
-        else
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
     }
     // xn now holds RMSNorm(x_final, final_norm)
@@ -1101,7 +1114,16 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         w.post_attn_norm = dense_opt(b + "attn_post_norm.weight", false);
         if (!w.post_attn_norm) w.post_attn_norm = dense_opt(b + "post_attention_norm.weight", false);
         if (!w.post_attn_norm) w.post_attn_norm = dense(b + "ffn_norm.weight", false);
-        w.router_w = dense(b + "ffn_gate_inp.weight", false);   // native [E,H] for GEMV
+        // Router weight: keep Q8_0 raw if present in the GGUF (half bandwidth, on-read GEMV)
+        {
+            const GGUFTensor* rt = g.tensor(b + "ffn_gate_inp.weight");
+            if (qattn && rt && rt->ggml_type == 8) {
+                w.router_w = dev_quant(b + "ffn_gate_inp.weight", w.router_w_type);
+            } else {
+                w.router_w = dense(b + "ffn_gate_inp.weight", false);
+                w.router_w_type = 0;
+            }
+        }
         w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized
         w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
         w.down_q = dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
