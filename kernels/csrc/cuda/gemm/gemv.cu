@@ -658,6 +658,79 @@ template __global__ void si_mmvq_q4k_kfixed_pack2_kernel<float, 8>(const si_bloc
 template __global__ void si_mmvq_q4k_kfixed_pack2_kernel<__nv_bfloat16, 16>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
 template __global__ void si_mmvq_q4k_kfixed_pack2_kernel<float, 16>(const si_block_q8_1*, const unsigned char*, float*, int);
 
+// Fused Q+K+V pack2: stage the full Q8_1(xn) activation in smem once per CTA, then run the
+// faithful kfixed dot loop for all three projections. Cuts 2 DRAM passes over aq81 per layer
+// (the dominant cost of three separate mmvq launches at bs=1) while halving row launches.
+template <typename OutT, int NSUPER>
+__global__ void si_mmvq_q4k_qkv_fused_pack2_kernel(
+    const si_block_q8_1* __restrict__ vy,
+    const unsigned char* __restrict__ Wq, const unsigned char* __restrict__ Wk,
+    const unsigned char* __restrict__ Wv,
+    OutT* __restrict__ yq, OutT* __restrict__ yk, OutT* __restrict__ yv,
+    int Nq, int Nk, int Nv
+) {
+    constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
+    constexpr int NVB = NSUPER * 8;
+    __shared__ si_block_q8_1 s_vy[NVB];
+    const int tid = threadIdx.x;
+    const int n4 = (NVB * (int)sizeof(si_block_q8_1)) / 16;
+    for (int i = tid; i < n4; i += blockDim.x)
+        reinterpret_cast<uint4*>(s_vy)[i] = __ldg(reinterpret_cast<const uint4*>(vy) + i);
+    __syncthreads();
+
+    const int lane = tid & 31, warp = tid >> 5;
+    const int group = warp >> 2, gw = warp & 3;
+    const int row = blockIdx.x * 2 + group;
+    const bool do_q = row < Nq, do_k = row < Nk, do_v = row < Nv;
+    if (!do_q && !do_k && !do_v) return;
+
+    const int tid4 = gw * WS + lane;
+    const si_block_q4_K* xq = do_q ? (const si_block_q4_K*)(Wq + (size_t)row * NSUPER * 144) : nullptr;
+    const si_block_q4_K* xk = do_k ? (const si_block_q4_K*)(Wk + (size_t)row * NSUPER * 144) : nullptr;
+    const si_block_q4_K* xv = do_v ? (const si_block_q4_K*)(Wv + (size_t)row * NSUPER * 144) : nullptr;
+    constexpr int blocks_per_iter = vdr * NW * WS / qi;
+    float tq = 0.f, tk = 0.f, tv = 0.f;
+    #pragma unroll
+    for (int kbx = tid4 / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
+        const int kby = kbx * 8;
+        const int kqs = vdr * (tid4 % (qi / vdr));
+        if (do_q) tq += si_vec_dot_q4_K(xq + kbx, s_vy + kby, kqs);
+        if (do_k) tk += si_vec_dot_q4_K(xk + kbx, s_vy + kby, kqs);
+        if (do_v) tv += si_vec_dot_q4_K(xv + kbx, s_vy + kby, kqs);
+    }
+    __shared__ float s_tq[2][NW - 1][WS], s_tk[2][NW - 1][WS], s_tv[2][NW - 1][WS];
+    if (gw > 0) {
+        if (do_q) s_tq[group][gw - 1][lane] = tq;
+        if (do_k) s_tk[group][gw - 1][lane] = tk;
+        if (do_v) s_tv[group][gw - 1][lane] = tv;
+    }
+    __syncthreads();
+    if (gw > 0) return;
+    if (do_q) {
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) tq += s_tq[group][l][lane];
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) tq += __shfl_xor_sync(0xffffffff, tq, m);
+        if (lane == 0) gemv_write(yq + row, tq);
+    }
+    if (do_k) {
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) tk += s_tk[group][l][lane];
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) tk += __shfl_xor_sync(0xffffffff, tk, m);
+        if (lane == 0) gemv_write(yk + row, tk);
+    }
+    if (do_v) {
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) tv += s_tv[group][l][lane];
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) tv += __shfl_xor_sync(0xffffffff, tv, m);
+        if (lane == 0) gemv_write(yv + row, tv);
+    }
+}
+template __global__ void si_mmvq_q4k_qkv_fused_pack2_kernel<__nv_bfloat16, 8>(const si_block_q8_1*, const unsigned char*, const unsigned char*, const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int, int, int);
+template __global__ void si_mmvq_q4k_qkv_fused_pack2_kernel<float, 8>(const si_block_q8_1*, const unsigned char*, const unsigned char*, const unsigned char*, float*, float*, float*, int, int, int);
+
 // ===== faithful llama Q6_K mmvq for the fp32-path GEMVs (attn-V upgrades + LM head) =====
 // Same 4-warp-per-row structure as the Q4_K mmvq, with vec_dot_q6_K_q8_1 (coalesced
 // ql/qh int loads + __vsubss4 reconstruct + dp4a). Mirrors the #65 MoE-down dot.
@@ -993,6 +1066,27 @@ void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cuda
     else if (K == 2048)      si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 8><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
     else if (K == 4096) si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 16><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
     else                si_mmvq_q4k_kernel<__nv_bfloat16><<<N, 4 * 32, 0, stream>>>(q, w, out, N, K);
+}
+void launch_mmvq_q4k_qkv_fused(const void* q81, const void* Wq, const void* Wk, const void* Wv,
+                                 void* yq, void* yk, void* yv, int Nq, int Nk, int Nv, int K,
+                                 cudaStream_t stream) {
+    if (!attn_pack2_enabled() || K != 2048) {
+        launch_mmvq_q4k(q81, Wq, yq, Nq, K, stream);
+        launch_mmvq_q4k(q81, Wk, yk, Nk, K, stream);
+        launch_mmvq_q4k(q81, Wv, yv, Nv, K, stream);
+        return;
+    }
+    const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const unsigned char* wq = reinterpret_cast<const unsigned char*>(Wq);
+    const unsigned char* wk = reinterpret_cast<const unsigned char*>(Wk);
+    const unsigned char* wv = reinterpret_cast<const unsigned char*>(Wv);
+    __nv_bfloat16* oq = reinterpret_cast<__nv_bfloat16*>(yq);
+    __nv_bfloat16* ok = reinterpret_cast<__nv_bfloat16*>(yk);
+    __nv_bfloat16* ov = reinterpret_cast<__nv_bfloat16*>(yv);
+    const int gq = (Nq + 1) / 2, gk = (Nk + 1) / 2, gv = (Nv + 1) / 2;
+    const int grid = gq > gk ? (gq > gv ? gq : gv) : (gk > gv ? gk : gv);
+    si_mmvq_q4k_qkv_fused_pack2_kernel<__nv_bfloat16, 8><<<grid, 8 * 32, 0, stream>>>(
+        q, wq, wk, wv, oq, ok, ov, Nq, Nk, Nv);
 }
 void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);

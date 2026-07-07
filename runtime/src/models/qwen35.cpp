@@ -143,6 +143,7 @@ struct Qwen35Model::Impl {
     bool use_llama = true; // default ON: faithful llama mmvq for Q4_K attn GEMVs (+9.7%, top1 0.99). =0 disables
     bool use_q6mmvq = true;  // default ON: int8 Q6_K mmvq for attn-V upgrades + LM head. =0 disables
     bool use_qkvstream = true; // default ON: run Q/K/V projections on concurrent streams. =0 disables
+    bool use_qkv_fuse = true;  // default ON: fused Q+K+V pack2 mmvq when all Q4_K. SPARKINFER_QKV_FUSE=0 disables
     bool use_qkfuse = true;// default ON: fused per-head Q-norm + K-norm (1 kernel). =0 disables
     bool use_ropekv = true;// default ON: fused RoPE + KV-append (1 kernel vs 2). =0 disables
     bool use_attnin = true;// default ON: single fused QK-norm+RoPE+KV-append (1 kernel vs qkfuse+ropekv=2). =0 disables
@@ -246,6 +247,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_ROPEKV")) p_->use_ropekv = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_FNQ"))    p_->use_fnq   = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_QKVSTREAM")) p_->use_qkvstream = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_QKV_FUSE"))  p_->use_qkv_fuse  = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ATTNIN")) p_->use_attnin = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_GDN_PIPE")) p_->use_gdn_pipe = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_SHEXP_PIPE")) p_->use_shexp_pipe = !(e[0] == '0');
@@ -482,7 +484,18 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
                 const bool any_q80 = (w.wq_type == 8 || w.wk_type == 8 || w.wv_type == 8);
                 prepare_xn_quant(any_q4k, any_q6k, any_q80);
-                if (s.use_qkvstream) {
+                const bool qkv_q4k = s.use_pq && s.use_llama && s.use_qkv_fuse && !w.q_has_gate
+                                  && w.wq_type == 12 && w.wk_type == 12 && w.wv_type == 12;
+                const bool kv_q4k = s.use_pq && s.use_llama && s.use_qkv_fuse && w.q_has_gate
+                                 && w.wk_type == 12 && w.wv_type == 12;
+                if (qkv_q4k && H == 2048) {
+                    kernels::launch_mmvq_q4k_qkv_fused(s.aq81, w.wq, w.wk, w.wv, s.q, s.k, s.v,
+                                                       s.qdim, s.kvdim, s.kvdim, H, st);
+                } else if (kv_q4k && H == 2048) {
+                    proj_xn(w.wq, w.wq_type, s.qraw, s.qdim * 2, st);
+                    kernels::launch_mmvq_q4k_qkv_fused(s.aq81, w.wk, w.wk, w.wv, s.k, s.k, s.v,
+                                                       0, s.kvdim, s.kvdim, H, st);
+                } else if (s.use_qkvstream) {
                     cudaEventRecord(s.ev_qkv, st);
                     cudaStreamWaitEvent(s.stream_k, s.ev_qkv, 0);
                     cudaStreamWaitEvent(s.stream_v, s.ev_qkv, 0);
