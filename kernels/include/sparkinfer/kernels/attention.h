@@ -37,6 +37,14 @@ void launch_qknorm_rope_kv_append(
     float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr,
     void* k_scale = nullptr, void* v_scale = nullptr, int int8_kv = 0);
 
+// Fused QK-norm + partial-RoPE + KV-append (Qwen3.6 gated full-attn layers, bf16 KV).
+void launch_qknorm_rope_kv_partial(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr,
+    void* k_scale = nullptr, void* v_scale = nullptr, int int8_kv = 0);
+
 // Fused RoPE + paged KV-append: ropes Q in place, ropes K straight into k_pool, copies V into
 // v_pool — one kernel replacing launch_rope + launch_kv_append. positions == write_pos (decode).
 void launch_rope_kv_append(

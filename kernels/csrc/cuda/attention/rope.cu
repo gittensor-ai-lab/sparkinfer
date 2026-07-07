@@ -243,6 +243,125 @@ template __global__ void qknorm_rope_kv_kernel<false>(
 template __global__ void qknorm_rope_kv_kernel<true>(
     __nv_bfloat16*, __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     void*, void*, __half*, __half*, const int*, const int*, int, int, int, float, int, int, float);
+
+// Fused QK-norm + partial-RoPE + KV-append for Qwen3.6. INT8=true stores int8 KV + fp16 scales.
+template <bool INT8>
+__global__ void qknorm_rope_kv_partial_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    void* __restrict__ k_pool, void* __restrict__ v_pool,
+    __half* __restrict__ k_scale, __half* __restrict__ v_scale,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta,
+    int block_size, int max_blocks_per_seq, float eps
+) {
+    const int tok  = blockIdx.y;
+    const int b    = blockIdx.x;
+    const int t    = threadIdx.x;
+    const int rhalf = rotary_dim >> 1;
+    const int pos  = positions[tok];
+    const int blk = pos / block_size, within = pos % block_size;
+    const size_t ctok = (size_t)((size_t)block_table[tok * max_blocks_per_seq + blk] * block_size + within);
+
+    const bool is_v = (b >= n_q_heads + n_kv_heads);
+    if (is_v) {
+        const int hh = b - n_q_heads - n_kv_heads;
+        const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+        if constexpr (!INT8) {
+            if (t < head_dim) reinterpret_cast<__nv_bfloat16*>(v_pool)[dst + t] = v[base + t];
+        } else {
+            const float val = (t < head_dim) ? __bfloat162float(v[base + t]) : 0.f;
+            __shared__ float s_red[32];
+            float amax = fabsf(val);
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, m));
+            if ((t & 31) == 0) s_red[t >> 5] = amax;
+            __syncthreads();
+            if (t < 32) {
+                float a = (t < (head_dim + 31) / 32) ? s_red[t] : 0.f;
+                #pragma unroll
+                for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+                if (t == 0) s_red[0] = a;
+            }
+            __syncthreads();
+            const float d = s_red[0] / 127.0f;
+            if (t < head_dim)
+                reinterpret_cast<signed char*>(v_pool)[dst + t] =
+                    (signed char)((s_red[0] == 0.f) ? 0 : (int)roundf(__bfloat162float(v[base + t]) / d));
+            if (t == 0) v_scale[ctok * n_kv_heads + hh] = __float2half(d);
+        }
+        return;
+    }
+
+    const bool is_q = (b < n_q_heads);
+    __nv_bfloat16* x        = is_q ? q : k;
+    const __nv_bfloat16* w  = is_q ? q_w : k_w;
+    const int head          = is_q ? b : (b - n_q_heads);
+    const int nh            = is_q ? n_q_heads : n_kv_heads;
+    const size_t base       = ((size_t)(tok * nh + head)) * head_dim;
+
+    extern __shared__ float s_h[];
+    __shared__ float s_warp[32];
+    const float xv = __bfloat162float(x[base + t]);
+    float ss = xv * xv;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+    if ((t & 31) == 0) s_warp[t >> 5] = ss;
+    __syncthreads();
+    if (t < 32) {
+        float vv = (t < (head_dim + 31) / 32) ? s_warp[t] : 0.f;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) vv += __shfl_xor_sync(0xffffffff, vv, m);
+        if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+    }
+    __syncthreads();
+    s_h[t] = __bfloat162float(__float2bfloat16(xv * s_warp[0] * __bfloat162float(w[t])));
+    __syncthreads();
+
+    if (t < rhalf) {
+        const float freq = __powf(theta, -2.f * (float)t / (float)rotary_dim);
+        const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+        const float x0 = s_h[t], x1 = s_h[t + rhalf];
+        s_h[t] = __bfloat162float(__float2bfloat16(x0 * c - x1 * s));
+        s_h[t + rhalf] = __bfloat162float(__float2bfloat16(x1 * c + x0 * s));
+    }
+    __syncthreads();
+
+    if (is_q) {
+        if (t < head_dim) q[base + t] = __float2bfloat16(s_h[t]);
+    } else if constexpr (!INT8) {
+        const size_t dst = (ctok * n_kv_heads + head) * head_dim;
+        if (t < head_dim) reinterpret_cast<__nv_bfloat16*>(k_pool)[dst + t] = __float2bfloat16(s_h[t]);
+    } else {
+        __shared__ float s_red[32];
+        float amax = (t < head_dim) ? fabsf(s_h[t]) : 0.f;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, m));
+        if ((t & 31) == 0) s_red[t >> 5] = amax;
+        __syncthreads();
+        if (t < 32) {
+            float a = (t < (head_dim + 31) / 32) ? s_red[t] : 0.f;
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+            if (t == 0) s_red[0] = a;
+        }
+        __syncthreads();
+        const float d = s_red[0] / 127.0f;
+        const size_t dst = (ctok * n_kv_heads + head) * head_dim;
+        if (t < head_dim)
+            reinterpret_cast<signed char*>(k_pool)[dst + t] =
+                (signed char)((s_red[0] == 0.f) ? 0 : (int)roundf(s_h[t] / d));
+        if (t == 0) k_scale[ctok * n_kv_heads + head] = __float2half(d);
+    }
+}
+template __global__ void qknorm_rope_kv_partial_kernel<false>(
+    __nv_bfloat16*, __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    void*, void*, __half*, __half*, const int*, const int*, int, int, int, int, float, int, int, float);
+template __global__ void qknorm_rope_kv_partial_kernel<true>(
+    __nv_bfloat16*, __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    void*, void*, __half*, __half*, const int*, const int*, int, int, int, int, float, int, int, float);
+
 __global__ void rope_kv_append_partial_kernel(
     __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
@@ -333,6 +452,33 @@ void launch_qknorm_rope_kv_append(
             reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
             k_pool, v_pool, reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
             block_table, positions, n_q_heads, n_kv_heads, head_dim, theta,
+            block_size, max_blocks_per_seq, eps);
+}
+
+void launch_qknorm_rope_kv_partial(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream,
+    void* k_scale, void* v_scale, int int8_kv
+) {
+    dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
+    const int smem = head_dim * sizeof(float);
+    if (int8_kv)
+        qknorm_rope_kv_partial_kernel<true><<<grid, head_dim, smem, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v),
+            reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+            k_pool, v_pool, reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+            block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
+            block_size, max_blocks_per_seq, eps);
+    else
+        qknorm_rope_kv_partial_kernel<false><<<grid, head_dim, smem, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v),
+            reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+            k_pool, v_pool, reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+            block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
             block_size, max_blocks_per_seq, eps);
 }
 
