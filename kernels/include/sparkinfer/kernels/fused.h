@@ -25,6 +25,14 @@ void launch_add_rmsnorm2_q8(const void* x_bf16, const void* residual_bf16, const
                             void* out_sum_bf16, void* out_norm_bf16, void* out_q8,
                             int cols, float eps, cudaStream_t stream = nullptr);
 
+// Fold residual_add(res1,res2) into add_rmsnorm2: out_sum = x + (res1 + res2).
+void launch_add_rmsnorm3(const void* x_bf16, const void* res1_bf16, const void* res2_bf16,
+                         const void* weight_bf16, void* out_sum_bf16, void* out_norm_bf16,
+                         int rows, int cols, float eps, cudaStream_t stream = nullptr);
+void launch_add_rmsnorm3_q8(const void* x_bf16, const void* res1_bf16, const void* res2_bf16,
+                            const void* weight_bf16, void* out_sum_bf16, void* out_norm_bf16,
+                            void* out_q8, int cols, float eps, cudaStream_t stream = nullptr);
+
 // Fused per-head Q-norm + K-norm in one kernel (1 graph node vs 2). In-place on q/k.
 void launch_rmsnorm_qk(void* q, void* k, const void* q_w, const void* k_w,
                        int n_q_heads, int n_kv_heads, int head_dim, float eps, cudaStream_t stream = nullptr);
@@ -72,5 +80,11 @@ void launch_qwen36_gated_norm(const void* x_bf16, const void* z_bf16,
                               const void* weight_bf16, void* out_bf16,
                               int v_heads, int head_dim, float eps,
                               cudaStream_t stream = nullptr);
+
+// Gated norm + Q8_1 emit for ssm_out MMVQ (skips bf16 lin_norm + separate quantize).
+void launch_qwen36_gated_norm_q8(const void* x_bf16, const void* z_bf16,
+                                 const void* weight_bf16, void* out_q8,
+                                 int v_heads, int head_dim, float eps,
+                                 cudaStream_t stream = nullptr);
 
 }} // namespace sparkinfer::kernels

@@ -150,6 +150,7 @@ struct Qwen35Model::Impl {
                            // next layer's standalone QKV-input quantize node. =0 disables
     bool use_gdn_pipe = true;   // default ON: overlap GDN gate/scalar projections on side streams. =0 disables
     bool use_shexp_pipe = true; // default ON: overlap shared expert with routed MoE. =0 disables
+    bool use_addnorm3 = true;   // default ON: fold routed+shared residual_add into post-MoE add_rmsnorm. =0 disables
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -248,6 +249,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_ATTNIN")) p_->use_attnin = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_GDN_PIPE")) p_->use_gdn_pipe = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_SHEXP_PIPE")) p_->use_shexp_pipe = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_ADDNORM3")) p_->use_addnorm3 = !(e[0] == '0');
 }
 
 Qwen35Model::~Qwen35Model() {
@@ -355,10 +357,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         bool xn_q8_ready = fnq && L > 0;
-        auto prepare_xn_quant = [&](bool any_q4k, bool any_q6k) {
+        auto prepare_xn_quant = [&](bool any_q4k, bool any_q6k, bool any_q80) {
             if (!s.gguf || !s.use_pq) return;
             if (xn_q8_ready) return;
-            if (s.use_llama && (any_q4k || (s.use_q6mmvq && any_q6k))) {
+            if (s.use_llama && (any_q4k || any_q80 || (s.use_q6mmvq && any_q6k))) {
                 kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
                 xn_q8_ready = true;
             } else if (any_q4k) {
@@ -373,6 +375,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 }
                 else if (s.use_pq && s.use_llama && s.use_q6mmvq && t == 14)
                     kernels::launch_mmvq_q6k(s.aq81, W, y, N, H, pst);
+                else if (s.use_pq && s.use_llama && t == 8)
+                    kernels::launch_mmvq_q80(s.aq81, W, y, N, H, pst);
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -392,6 +396,9 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 } else if (s.use_pq && s.use_llama && s.use_q6mmvq && t == 14) {
                     kernels::launch_quantize_q8_1_blocks(x, s.aq81, K, st);
                     kernels::launch_mmvq_q6k(s.aq81, W, y, N, K, st);
+                } else if (s.use_pq && s.use_llama && t == 8) {
+                    kernels::launch_quantize_q8_1_blocks(x, s.aq81, K, st);
+                    kernels::launch_mmvq_q80(s.aq81, W, y, N, K, st);
                 } else if (t) kernels::launch_gemv_q(x, W, t, y, N, K, st);
                 else          kernels::launch_gemv(x, W, y, N, K, st);
             } else {
@@ -404,7 +411,9 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                   w.ssm_alpha_type == 12 || w.ssm_beta_type == 12);
             const bool any_q6k = (w.wqkv_type == 14 || w.wqkv_gate_type == 14 ||
                                   w.ssm_alpha_type == 14 || w.ssm_beta_type == 14);
-            prepare_xn_quant(any_q4k, any_q6k);
+            const bool any_q80 = (w.wqkv_type == 8 || w.wqkv_gate_type == 8 ||
+                                  w.ssm_alpha_type == 8 || w.ssm_beta_type == 8);
+            prepare_xn_quant(any_q4k, any_q6k, any_q80);
             const bool gdn_pipelined = s.gguf && s.use_gdn_pipe;
             if (gdn_pipelined) {
                 cudaEventRecord(s.ev_pipe_fork, st);
@@ -439,15 +448,40 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                           c.linear_q_heads, c.linear_v_heads,
                                           c.linear_head_dim, st);
             if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
-            kernels::launch_qwen36_gated_norm(s.lin_gdn, s.lin_z, w.ssm_norm, s.lin_norm,
-                                              c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
-            proj_from(s.lin_norm, w.ssm_out, w.ssm_out_type, s.ao, H, s.linear_vdim);
+            const bool gdn_gn_q8 = s.gguf && s.use_pq && s.use_llama &&
+                                   (w.ssm_out_type == 12 || w.ssm_out_type == 8) &&
+                                   c.linear_head_dim == 128;
+            if (gdn_gn_q8) {
+                static int gn_q8 = -1;
+                if (gn_q8 < 0) {
+                    const char* e = getenv("SPARKINFER_GDN_GNORM_Q8");
+                    gn_q8 = (e && e[0] == '0') ? 0 : 1;
+                }
+                if (gn_q8) {
+                    kernels::launch_qwen36_gated_norm_q8(s.lin_gdn, s.lin_z, w.ssm_norm, s.aq81,
+                                                         c.linear_v_heads, c.linear_head_dim,
+                                                         c.rms_eps, st);
+                    if (w.ssm_out_type == 12)
+                        kernels::launch_mmvq_q4k(s.aq81, w.ssm_out, s.ao, H, s.linear_vdim, st);
+                    else
+                        kernels::launch_mmvq_q80(s.aq81, w.ssm_out, s.ao, H, s.linear_vdim, st);
+                } else {
+                    kernels::launch_qwen36_gated_norm(s.lin_gdn, s.lin_z, w.ssm_norm, s.lin_norm,
+                                                      c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
+                    proj_from(s.lin_norm, w.ssm_out, w.ssm_out_type, s.ao, H, s.linear_vdim);
+                }
+            } else {
+                kernels::launch_qwen36_gated_norm(s.lin_gdn, s.lin_z, w.ssm_norm, s.lin_norm,
+                                                  c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
+                proj_from(s.lin_norm, w.ssm_out, w.ssm_out_type, s.ao, H, s.linear_vdim);
+            }
         } else {
             // ---- Q/K/V projection (q_has_gate-aware; q_has_gate=false is byte-identical to Qwen3-MoE) ----
             if (s.gguf) {
                 const bool any_q4k = (w.wq_type == 12 || w.wk_type == 12 || w.wv_type == 12);
                 const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
-                prepare_xn_quant(any_q4k, any_q6k);
+                const bool any_q80 = (w.wq_type == 8 || w.wk_type == 8 || w.wv_type == 8);
+                prepare_xn_quant(any_q4k, any_q6k, any_q80);
                 if (s.use_qkvstream) {
                     cudaEventRecord(s.ev_qkv, st);
                     cudaStreamWaitEvent(s.stream_k, s.ev_qkv, 0);
@@ -489,25 +523,32 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                                       s.kv->block_size(), s.kv->max_blocks_per_seq(), st,
                                                       kscale, vscale, kv8 ? 1 : 0);
             } else {
-                // Qwen3.6 (gated / partial-rotary) or non-int8: separate norm + rope + append (bf16 KV)
-                if (s.use_qkfuse)
-                    kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
-                else {
-                    kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
-                    kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
-                }
-                if (partial_rope) {
-                    kernels::launch_rope_kv_append_partial(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
-                                                           c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim,
-                                                           c.rope_theta, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
-                } else if (s.use_ropekv) {
-                    kernels::launch_rope_kv_append(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
-                                                   c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
-                                                   s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                // Qwen3.6 (gated / partial-rotary): fuse QK-norm + partial-RoPE + KV when enabled.
+                if (partial_rope && s.use_qkfuse) {
+                    kernels::launch_qknorm_rope_kv_partial(s.q, s.k, s.v, w.q_norm, w.k_norm,
+                        (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
+                        c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim,
+                        c.rope_theta, c.rms_eps, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                 } else {
-                    kernels::launch_rope(s.q, s.k, s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, st);
-                    launch_kv_append((bf16*)kpool, (bf16*)vpool, s.k, s.v, btable, s.d_writepos, 1,
-                                     c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                    if (s.use_qkfuse)
+                        kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+                    else {
+                        kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
+                        kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+                    }
+                    if (partial_rope) {
+                        kernels::launch_rope_kv_append_partial(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
+                                                               c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim,
+                                                               c.rope_theta, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                    } else if (s.use_ropekv) {
+                        kernels::launch_rope_kv_append(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
+                                                       c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
+                                                       s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                    } else {
+                        kernels::launch_rope(s.q, s.k, s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, st);
+                        launch_kv_append((bf16*)kpool, (bf16*)vpool, s.k, s.v, btable, s.d_writepos, 1,
+                                         c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                    }
                 }
             }
 
@@ -530,6 +571,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     kernels::launch_quantize_q8_1(s.attn, s.aq8, s.aq8_d, s.aq8_s, s.qdim, st);
                     kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, w.wo, s.ao, H, s.qdim, st);
                 }
+            }
+            else if (s.gguf && s.use_pq && s.use_llama && w.wo_type == 8) {
+                kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
+                kernels::launch_mmvq_q80(s.aq81, w.wo, s.ao, H, s.qdim, st);
             }
             else if (s.gguf && w.wo_type) kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, s.qdim, st);
             else if (s.gguf)         kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
@@ -611,15 +656,23 @@ int Qwen35Model::forward_token(int token_id, int position) {
             s.engine->set_layer_weights(L, {w.router_w, w.gate, w.up, w.down});
             s.engine->forward(s.hn, s.routed, 1, L, st);
         }
+        const void* shared_to_fold = nullptr;
         if (c.n_shared > 0) {
             if (shexp_pipelined) {
                 cudaStreamWaitEvent(st, s.ev_sx_done, 0);
-                launch_residual_add(s.routed, s.shared, s.routed, H, st);
                 const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-                if (fnq)
-                    kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
-                else
-                    kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+                if (s.use_addnorm3) {
+                    if (fnq)
+                        kernels::launch_add_rmsnorm3_q8(s.h, s.routed, s.shared, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
+                    else
+                        kernels::launch_add_rmsnorm3(s.h, s.routed, s.shared, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+                } else {
+                    launch_residual_add(s.routed, s.shared, s.routed, H, st);
+                    if (fnq)
+                        kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
+                    else
+                        kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+                }
                 continue;
             }
             if (w.shared_gate_inp) {
@@ -665,11 +718,16 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                                s.d_shared_ids, s.d_shared_w, s.shared,
                                                1, 1, 1, H, c.moe_ffn, st);
             }
-            launch_residual_add(s.routed, s.shared, s.routed, H, st);
+            if (s.use_addnorm3) shared_to_fold = s.shared;
+            else launch_residual_add(s.routed, s.shared, s.routed, H, st);
         }
-        // fused: x = h + routed ; xn = RMSNorm(x, next input_norm or final_norm)
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        if (fnq)
+        if (shared_to_fold) {
+            if (fnq)
+                kernels::launch_add_rmsnorm3_q8(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
+            else
+                kernels::launch_add_rmsnorm3(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+        } else if (fnq)
             kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
         else
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);

@@ -243,6 +243,76 @@ template __global__ void qknorm_rope_kv_kernel<false>(
 template __global__ void qknorm_rope_kv_kernel<true>(
     __nv_bfloat16*, __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     void*, void*, __half*, __half*, const int*, const int*, int, int, int, float, int, int, float);
+
+// Fused QK-norm + partial-RoPE + KV-append for Qwen3.6 (rope_dim < head_dim). One kernel per head
+// replaces launch_rmsnorm_qk + launch_rope_kv_append_partial on the 10 full-attn layers.
+__global__ void qknorm_rope_kv_partial_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta,
+    int block_size, int max_blocks_per_seq, float eps
+) {
+    const int tok  = blockIdx.y;
+    const int b    = blockIdx.x;
+    const int t    = threadIdx.x;
+    const int rhalf = rotary_dim >> 1;
+    const int pos  = positions[tok];
+    const int blk = pos / block_size, within = pos % block_size;
+    const size_t ctok = (size_t)((size_t)block_table[tok * max_blocks_per_seq + blk] * block_size + within);
+
+    const bool is_v = (b >= n_q_heads + n_kv_heads);
+    if (is_v) {
+        const int hh = b - n_q_heads - n_kv_heads;
+        const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+        if (t < head_dim) v_pool[dst + t] = v[base + t];
+        return;
+    }
+
+    const bool is_q = (b < n_q_heads);
+    __nv_bfloat16* x        = is_q ? q : k;
+    const __nv_bfloat16* w  = is_q ? q_w : k_w;
+    const int head          = is_q ? b : (b - n_q_heads);
+    const int nh            = is_q ? n_q_heads : n_kv_heads;
+    const size_t base       = ((size_t)(tok * nh + head)) * head_dim;
+
+    extern __shared__ float s_h[];
+    __shared__ float s_warp[32];
+    const float xv = __bfloat162float(x[base + t]);
+    float ss = xv * xv;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+    if ((t & 31) == 0) s_warp[t >> 5] = ss;
+    __syncthreads();
+    if (t < 32) {
+        float vv = (t < (head_dim + 31) / 32) ? s_warp[t] : 0.f;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) vv += __shfl_xor_sync(0xffffffff, vv, m);
+        if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+    }
+    __syncthreads();
+    s_h[t] = __bfloat162float(__float2bfloat16(xv * s_warp[0] * __bfloat162float(w[t])));
+    __syncthreads();
+
+    if (t < rhalf) {
+        const float freq = __powf(theta, -2.f * (float)t / (float)rotary_dim);
+        const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+        const float x0 = s_h[t], x1 = s_h[t + rhalf];
+        s_h[t] = __bfloat162float(__float2bfloat16(x0 * c - x1 * s));
+        s_h[t + rhalf] = __bfloat162float(__float2bfloat16(x1 * c + x0 * s));
+    }
+    __syncthreads();
+
+    if (is_q) {
+        if (t < head_dim) q[base + t] = __float2bfloat16(s_h[t]);
+    } else {
+        const size_t dst = (ctok * n_kv_heads + head) * head_dim;
+        if (t < head_dim) k_pool[dst + t] = __float2bfloat16(s_h[t]);
+    }
+}
+
 __global__ void rope_kv_append_partial_kernel(
     __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
@@ -334,6 +404,23 @@ void launch_qknorm_rope_kv_append(
             k_pool, v_pool, reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
             block_table, positions, n_q_heads, n_kv_heads, head_dim, theta,
             block_size, max_blocks_per_seq, eps);
+}
+
+void launch_qknorm_rope_kv_partial(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream
+) {
+    dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
+    const int smem = head_dim * sizeof(float);
+    qknorm_rope_kv_partial_kernel<<<grid, head_dim, smem, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
+        block_size, max_blocks_per_seq, eps);
 }
 
 void launch_rope_kv_append(void* q, const void* k, const void* v, void* k_pool, void* v_pool,

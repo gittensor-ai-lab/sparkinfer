@@ -973,9 +973,9 @@ static inline int down_splitk_s_q5() {
     static int s = -2;
     if (s == -2) {
         const char* v = getenv("SPARKINFER_DOWN_SPLITK_S_Q5");
-        if (!v) return down_splitk_s();
+        if (!v) return 8;   // Q5_K down: S=8 wins on Qwen3.6 UD decode (5090 sweep)
         s = atoi(v);
-        if (!(s == 0 || s == 1 || s == 2 || s == 4 || s == 8)) s = down_splitk_s();
+        if (!(s == 0 || s == 1 || s == 2 || s == 4 || s == 8)) s = 8;
     }
     return s;
 }
