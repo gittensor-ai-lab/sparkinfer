@@ -471,7 +471,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 cudaEventRecord(s.ev_gdn_ab, s.stream_v);
                 kernels::launch_mmvq_gdn_qkv_z_pack2(s.aq81, w.wqkv, w.wqkv_gate,
                                                        s.lin_qkv, s.lin_z,
-                                                       s.linear_qkvdim, s.linear_vdim, st);
+                                                       s.linear_qkvdim, s.linear_vdim, H, st);
             } else if (gdn_pipelined && !gdn_fused_proj) {
                 cudaEventRecord(s.ev_pipe_fork, st);
                 cudaStreamWaitEvent(s.stream_k, s.ev_pipe_fork, 0);
@@ -485,7 +485,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
             } else if (gdn_fused_proj) {
                 kernels::launch_mmvq_gdn_qkv_z_pack2(s.aq81, w.wqkv, w.wqkv_gate,
                                                        s.lin_qkv, s.lin_z,
-                                                       s.linear_qkvdim, s.linear_vdim, st);
+                                                       s.linear_qkvdim, s.linear_vdim, H, st);
                 proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, st);
                 proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, st);
             } else {
