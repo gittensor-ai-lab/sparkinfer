@@ -522,19 +522,51 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
     // run — the static flag guarantees that. Requires head_dim a multiple of 32 (128 -> NROW=4).
     static int fast = -1;
     if (fast < 0) { const char* e = getenv("SPARKINFER_GDN_FAST"); fast = (e && e[0] == '0') ? 0 : 1; }
-    if (fast && head_dim == 128) {                            // Qwen3.6 linear_head_dim; other dims -> naive
-        constexpr int COLS = 8, HD = 128;                     // 8 warps (columns)/block -> 256 threads
-        dim3 grid(v_heads, (HD + COLS - 1) / COLS);
-        gdn_ar_fast_kernel<COLS, HD><<<grid, COLS * 32, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(q_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(k_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(v_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(a_bf16),
-            state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
-            q_heads, v_heads);
+    if (fast && head_dim == 128) {                            // Qwen3.6/Qwythos linear_head_dim=128
+        static int cols = -1;
+        if (cols < 0) {
+            const char* e = getenv("SPARKINFER_GDN_FAST_COLS");
+            if (e) cols = atoi(e);
+            else cols = (v_heads >= 32) ? 4 : 8;              // 32 v-heads -> 1024 blocks @ COLS=4
+            if (!(cols == 4 || cols == 8 || cols == 16)) cols = 8;
+        }
+        constexpr int HD = 128;
+        const int c = cols;
+        dim3 grid(v_heads, (HD + c - 1) / c);
+        if (c == 4) {
+            gdn_ar_fast_kernel<4, HD><<<grid, 4 * 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
+                q_heads, v_heads);
+        } else if (c == 16) {
+            gdn_ar_fast_kernel<16, HD><<<grid, 16 * 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
+                q_heads, v_heads);
+        } else {
+            gdn_ar_fast_kernel<8, HD><<<grid, 8 * 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
+                q_heads, v_heads);
+        }
         return;
     }
     static int warpgrid = -1;

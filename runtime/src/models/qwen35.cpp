@@ -461,9 +461,18 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     fuse = (e && e[0] == '0') ? 0 : 1; }
                 return fuse && s.gguf && s.use_pq && s.use_llama &&
                        w.wqkv_type == 12 && w.wqkv_gate_type == 12 &&
-                       H == 2048 && s.linear_qkvdim > 0 && s.linear_vdim > 0;
+                       (H == 2048 || H == 4096) && s.linear_qkvdim > 0 && s.linear_vdim > 0;
             }();
-            if (gdn_pipelined && !gdn_fused_proj) {
+            if (gdn_fused_proj && gdn_pipelined) {
+                cudaEventRecord(s.ev_pipe_fork, st);
+                cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
+                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, s.stream_v);
+                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, s.stream_v);
+                cudaEventRecord(s.ev_gdn_ab, s.stream_v);
+                kernels::launch_mmvq_gdn_qkv_z_pack2(s.aq81, w.wqkv, w.wqkv_gate,
+                                                       s.lin_qkv, s.lin_z,
+                                                       s.linear_qkvdim, s.linear_vdim, st);
+            } else if (gdn_pipelined && !gdn_fused_proj) {
                 cudaEventRecord(s.ev_pipe_fork, st);
                 cudaStreamWaitEvent(s.stream_k, s.ev_pipe_fork, 0);
                 cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
@@ -513,7 +522,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                           layer_state, s.lin_gdn,
                                           c.linear_q_heads, c.linear_v_heads,
                                           c.linear_head_dim, st);
-            if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
+            if (gdn_pipelined && !gdn_fused_proj) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
             const bool gdn_gn_q8 = s.gguf && s.use_pq && s.use_llama &&
                                    (w.ssm_out_type == 12 || w.ssm_out_type == 8) &&
                                    c.linear_head_dim == 128;
