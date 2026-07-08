@@ -559,13 +559,26 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                                s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
                                                1.f / sqrtf((float)c.head_dim), st,
                                                emit_attn_q8 ? s.aq81 : nullptr, seqlen, kscale, vscale, kv8 ? 1 : 0);
-            if (w.q_has_gate)
-                kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, s.qdim, st);
+            // When the O-proj takes the llama block-q8_1 mmvq path (wo_type Q4_K/Q8_0), fuse the
+            // Q-gate (mul_sigmoid) with that path's input Q8_1 quantize into ONE launch instead of
+            // two — bit-identical (bf16-rounded x*sigmoid(gate) -> same q8_1 blocks). Off => the
+            // original mul_sigmoid + standalone quantize_q8_1_blocks. Guard keeps Qwen3-30B (no
+            // q_has_gate) and non-mmvq wo paths on the unchanged code.
+            static int gate_q8 = -1;
+            if (gate_q8 < 0) { const char* e = getenv("SPARKINFER_GATE_Q8"); gate_q8 = (e && e[0] == '0') ? 0 : 1; }
+            const bool gate_q8_fuse = gate_q8 && w.q_has_gate && s.gguf && s.use_pq && s.use_llama &&
+                                      (w.wo_type == 12 || w.wo_type == 8) && (s.qdim % 32 == 0);
+            if (w.q_has_gate) {
+                if (gate_q8_fuse)
+                    kernels::launch_qwen36_mul_sigmoid_q8(s.attn, s.qgate, s.aq81, s.qdim, st);
+                else
+                    kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, s.qdim, st);
+            }
 
             // ---- O projection (main's int8 mmvq path) ----
             if (s.gguf && s.use_pq && w.wo_type == 12) {
                 if (s.use_llama) {
-                    if (!emit_attn_q8) kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
+                    if (!emit_attn_q8 && !gate_q8_fuse) kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
                     kernels::launch_mmvq_q4k(s.aq81, w.wo, s.ao, H, s.qdim, st);
                 } else {
                     kernels::launch_quantize_q8_1(s.attn, s.aq8, s.aq8_d, s.aq8_s, s.qdim, st);
@@ -573,7 +586,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 }
             }
             else if (s.gguf && s.use_pq && s.use_llama && w.wo_type == 8) {
-                kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
+                if (!gate_q8_fuse) kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
                 kernels::launch_mmvq_q80(s.aq81, w.wo, s.ao, H, s.qdim, st);
             }
             else if (s.gguf && w.wo_type) kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, s.qdim, st);

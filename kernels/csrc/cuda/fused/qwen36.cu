@@ -444,6 +444,34 @@ __global__ void gated_norm_q8_warp_kernel(const __nv_bfloat16* __restrict__ x,
 template __global__ void gated_norm_q8_warp_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*,
     const __nv_bfloat16*, si_blk_q8_1*, int, float);
 
+// Q-gate (x *= sigmoid(gate)) fused with the O-proj input Q8_1 quantize — bit-identical to
+// mul_sigmoid_kernel (bf16 store) followed by si_quantize_q8_1_blocks (bf16 reload + q8_1).
+// One warp owns one 32-value q8_1 block. The bf16-rounded product (__bfloat162float o
+// __float2bfloat16) reproduces mul_sigmoid's bf16 store byte-for-byte, and the amax/round/
+// scale reduction matches si_quantize_q8_1_blocks exactly. Runs on the gated-Q attention
+// layers of Qwen3.6 only; deletes one launch (the standalone quant) per such layer per token.
+__global__ void mul_sigmoid_q8_kernel(const __nv_bfloat16* __restrict__ x,
+                                      const __nv_bfloat16* __restrict__ gate,
+                                      si_blk_q8_1* __restrict__ out_q8, int n) {
+    const int warpsPB = blockDim.x >> 5;
+    const int ib = blockIdx.x * warpsPB + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (ib >= (n >> 5)) return;
+    const int idx = ib * 32 + lane;
+    const float prod = q36_to_f(x[idx]) * q36_sigmoid(q36_to_f(gate[idx]));
+    const float bv = __bfloat162float(__float2bfloat16(prod));   // bf16-round: matches mul_sigmoid store
+    float a = fabsf(bv);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    const float d = a / 127.0f;
+    const int qi = (a == 0.0f) ? 0 : (int)roundf(bv / d);
+    out_q8[ib].qs[lane] = (signed char)qi;
+    int s = qi;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+    if (lane == 0) out_q8[ib].ds = __floats2half2_rn(d, d * (float)s);
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
 
@@ -470,6 +498,16 @@ void launch_qwen36_mul_sigmoid(void* x_bf16, const void* gate_bf16, int n,
     mul_sigmoid_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(x_bf16),
         reinterpret_cast<const __nv_bfloat16*>(gate_bf16), n);
+}
+
+void launch_qwen36_mul_sigmoid_q8(const void* x_bf16, const void* gate_bf16, void* out_q8,
+                                  int n, cudaStream_t stream) {
+    const int nb = n >> 5, warpsPB = 8;                          // n must be a multiple of 32
+    dim3 grid((nb + warpsPB - 1) / warpsPB);
+    mul_sigmoid_q8_kernel<<<grid, warpsPB * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+        reinterpret_cast<si_blk_q8_1*>(out_q8), n);
 }
 
 void launch_qwen36_sigmoid_scalar(const void* x_bf16, float* out_f32,

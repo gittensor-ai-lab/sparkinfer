@@ -57,6 +57,12 @@ void launch_qwen36_split_q_gate(const void* qg_bf16, void* q_bf16, void* gate_bf
 void launch_qwen36_mul_sigmoid(void* x_bf16, const void* gate_bf16, int n,
                                cudaStream_t stream = nullptr);
 
+// Fused Q-gate + O-proj-input Q8_1 quant: out_q8 = quantize_q8_1(x * sigmoid(gate)).
+// Bit-identical to launch_qwen36_mul_sigmoid followed by launch_quantize_q8_1_blocks.
+// n must be a multiple of 32.
+void launch_qwen36_mul_sigmoid_q8(const void* x_bf16, const void* gate_bf16, void* out_q8,
+                                  int n, cudaStream_t stream = nullptr);
+
 void launch_qwen36_sigmoid_scalar(const void* x_bf16, float* out_f32,
                                   cudaStream_t stream = nullptr);
 
