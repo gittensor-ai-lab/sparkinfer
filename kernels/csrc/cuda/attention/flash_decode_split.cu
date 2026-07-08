@@ -298,6 +298,8 @@ template __global__ void fa_split_gqa_kernel<256, 8, FA_GQA_TILE, false>(const _
 template __global__ void fa_split_gqa_kernel<256, 8, FA_GQA_TILE, true>(const __nv_bfloat16*, const void*, const void*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
 template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
+template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, 8>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
+template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, 16>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/attention.h"
@@ -504,6 +506,30 @@ static inline void fa_launch_combine_dispatch(
     else                      fa_launch_combine<FA_COMBINE_NW>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
 }
 
+// hd256 combine: same NW-adaptive dispatch as hd128, scaling warps with n_splits
+// so the per-warp serial split-folding stays bounded. NW=16 at n_splits>=128
+// keeps each warp at ~8-16 splits (matching hd128 sweet spot).
+template <int NW>
+static inline void fa_launch_combine_hd256(
+    const float* part_m, const float* part_l, const float* part_acc,
+    __nv_bfloat16* out, int num_q_heads, int n_splits, fa_block_q8_1* out_q8,
+    int num_seqs, cudaStream_t stream
+) {
+    dim3 g(num_q_heads * FA_COMBINE_DG, num_seqs);
+    fa_combine_kernel<256, FA_COMBINE_DG, NW><<<g, NW * 32, 0, stream>>>(
+        part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8);
+}
+
+static inline void fa_launch_combine_dispatch_hd256(
+    const float* part_m, const float* part_l, const float* part_acc,
+    __nv_bfloat16* out, int num_q_heads, int n_splits, fa_block_q8_1* out_q8,
+    int num_seqs, cudaStream_t stream
+) {
+    if (n_splits >= 128)      fa_launch_combine_hd256<16>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
+    else if (n_splits >= 64)  fa_launch_combine_hd256<8>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
+    else                      fa_launch_combine_hd256<FA_COMBINE_NW>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
+}
+
 void launch_flash_decode_split(
     const void* q, const void* k_pool, const void* v_pool,
     const int* block_table, const int* seq_lens, void* out,
@@ -561,9 +587,9 @@ void launch_flash_decode_split(
                 part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
                 reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale), int8_kv);
         }
-        fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW><<<g2, FA_COMBINE_NW * 32, 0, stream>>>(
-            part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
-            reinterpret_cast<fa_block_q8_1*>(out_q8));
+        fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc,
+            reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
+            reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
         (void)seqlen;
         return;
     }

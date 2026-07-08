@@ -23,6 +23,7 @@ struct Qwen35LayerWeights {
     const void* k_norm = nullptr;        // [head_dim]
     const void* post_attn_norm = nullptr;// [hidden]
     const void* router_w = nullptr;      // [hidden, n_experts]
+    int router_w_type = 0;              // ggml_type when router_w is kept quantized (0 = bf16 dense)
     const void* gate = nullptr;          // [n_experts, hidden, moe_ffn]
     const void* up   = nullptr;          // [n_experts, hidden, moe_ffn]
     const void* down = nullptr;          // [n_experts, moe_ffn, hidden]
