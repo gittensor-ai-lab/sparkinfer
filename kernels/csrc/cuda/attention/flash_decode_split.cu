@@ -541,7 +541,6 @@ void launch_flash_decode_split(
     // Qwen3.6 full-attention layers run head_dim=256 (bf16 KV). Use the GQA-8 shared-KV tile
     // path (same 8:1 grouping as Qwen3 hd=128) — cuts KV global reads ~8x vs one-warp-per-q-head.
     if (head_dim == 256) {
-        dim3 g2(num_q_heads * FA_COMBINE_DG, num_seqs);
         // int8-KV tensor-core path for hd256 (long context): same gating as the hd128 MMA path
         // (block_size==16 so each warp maps to one physical block, chunk >= 2 blocks to fill the GPU).
         static int famma256 = -1;
@@ -560,9 +559,9 @@ void launch_flash_decode_split(
                     reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
                     part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
                     reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
-                fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW><<<g2, FA_COMBINE_NW * 32, 0, stream>>>(
-                    part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
-                    reinterpret_cast<fa_block_q8_1*>(out_q8));
+                fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc,
+                    reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
+                    reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
                 (void)seqlen;
                 return;
             }
