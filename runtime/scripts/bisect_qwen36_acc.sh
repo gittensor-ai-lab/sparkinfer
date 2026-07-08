@@ -2,8 +2,9 @@
 # Quick Qwen3.6 accuracy bisect: compare teacher-forced argmax top-1 vs a reference dump.
 # Usage: bisect_qwen36_acc.sh <ref_score.txt> <label> [env exports...]
 set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HERE/_common.sh"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+BENCH="$ROOT/bench/scripts"
+source "$BENCH/_common.sh"
 
 REF="${1:?ref score dump}"; LABEL="${2:?label}"; shift 2
 GGUF="${GGUF:-/workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
@@ -13,10 +14,9 @@ ensure_tokenizer
 
 SEED="${SPARKINFER_EVAL_SEED:-fixed}"
 IDS_FILE="/tmp/bisect_ids.txt"
-python3 "$HERE/gen_eval_prompt.py" "$SEED" "$MODELS_DIR/tokenizer.json" \
-  "$HERE/eval_corpus.txt" "$HERE/eval_text.txt" > "$IDS_FILE"
+python3 "$BENCH/gen_eval_prompt.py" "$SEED" "$MODELS_DIR/tokenizer.json" \
+  "$BENCH/eval_corpus.txt" "$BENCH/eval_text.txt" > "$IDS_FILE"
 IDS="$(cat "$IDS_FILE")"
-NT=$(echo "$IDS" | wc -w)
 
 OUT="/tmp/bisect_${LABEL}.txt"
 env "$@" si_run qwen3_gguf_score "$GGUF" 128 $IDS > "$OUT"
@@ -44,7 +44,6 @@ cm, cn = argmatch(cand_path)
 n = min(rn, cn)
 if n == 0:
     print(f"{label}: ERROR no positions parsed"); sys.exit(1)
-# per-position agreement with reference argmax (not tgt)
 ref_am = []
 for line in open(ref_path):
     m = re.match(r"S i=\d+ tgt=\d+ am=(\d+)", line)
