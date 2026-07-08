@@ -1207,7 +1207,7 @@ void launch_moe_expert_ffn_q4k(
     static int dense_fuse = -1;
     if (dense_fuse < 0) {
         const char* e = getenv("SPARKINFER_DENSE_FFN_FUSE");
-        dense_fuse = (e && e[0] == '1') ? 1 : 0;   // opt-in until dense pack2 path is parity-checked
+        dense_fuse = (e && e[0] == '0') ? 0 : 1;   // default on for Qwythos dense 4096x12288
     }
     if (dense_fuse && num_tokens == 1 && top_k == 1 && hidden == 4096 && ffn == 12288
         && gate_type == 12 && up_type == 12 && down_type == 14) {
