@@ -76,6 +76,10 @@ size_t llama_q8_1_bytes(int K);
 void launch_quantize_q8_1_blocks(const void* x, void* y, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
+// Fused GDN qkv+z Q4_K MMVQ (shared Q8_1 activation). K must be 4096 (NSUPER=16).
+void launch_mmvq_gdn_qkv_z_pack2(const void* q81, const void* qkv_w, const void* z_w,
+                                 void* qkv_out, void* z_out, int n_qkv, int n_z,
+                                 cudaStream_t stream = nullptr);
 // Same, for Q6_K weights (attn-V upgrades + LM head). q81 = block_q8_1(activation).
 void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
