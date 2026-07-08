@@ -840,29 +840,21 @@ template __global__ void gemv_q6k_dp4a_kfixed_kernel<float, 8, 8>(const si_block
 template __global__ void gemv_q6k_dp4a_kfixed_kernel<float, 16, 8>(const si_block_q8_1*, const unsigned char*, float*, int);
 template __global__ void gemv_q6k_dp4a_kfixed_kernel<float, 16, 16>(const si_block_q8_1*, const unsigned char*, float*, int);
 
-// pack2 LM head: two vocab rows per block (K=4096, NSUPER=16).
+// pack2 LM head: two vocab rows per block (K=4096, NSUPER=16). Matches the default
+// gemv_q6k_dp4a_kfixed_kernel math (one warp/row, lane walks all superblocks) — only
+// the grid is halved by packing two rows per CTA.
 template <int NSUPER>
 __global__ void gemv_q6k_dp4a_kfixed_pack2_kernel(const si_block_q8_1* __restrict__ vy,
                                                    const unsigned char* __restrict__ W,
                                                    float* __restrict__ y, int N) {
-    constexpr int NW = 4, WS = 32;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int group = warp >> 2, group_warp = warp & 3;
-    const int row = blockIdx.x * 2 + group;
+    const int row = (int)blockIdx.x * 2 + warp;
     if (row >= N) return;
     const unsigned char* x_row = W + (size_t)row * NSUPER * 210;
-    const int tid4 = group_warp * WS + lane;
-    const int kbx0 = tid4 >> 4;
-    const int iqs = 2 * (tid4 & 15);
     float acc = 0.f;
-    for (int kbx = kbx0; kbx < NSUPER; kbx += 8)
-        acc += si_vec_dot_q6_K(x_row + (size_t)kbx * 210, vy + (size_t)kbx * 8, iqs);
-    __shared__ float sg[2][NW - 1][WS];
-    if (group_warp > 0) sg[group][group_warp - 1][lane] = acc;
-    __syncthreads();
-    if (group_warp > 0) return;
     #pragma unroll
-    for (int l = 0; l < NW - 1; l++) acc += sg[group][l][lane];
+    for (int kbx = 0; kbx < NSUPER; kbx++)
+        acc += si_vec_dot_q6_K(x_row + (size_t)kbx * 210, vy + (size_t)kbx * 8, lane);
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
     if (lane == 0) y[row] = acc;
@@ -872,6 +864,7 @@ template __global__ void gemv_q6k_dp4a_kfixed_pack2_kernel<16>(const si_block_q8
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/gemm.h"
 #include <cstdlib>
+void launch_qwen36_sigmoid_scalar(const void* x_bf16, float* out_f32, cudaStream_t stream);
 
 // int8 dp4a for Q4_K GEMVs (faithful to llama.cpp's mul_mat_vec_q). Default ON —
 // ~27% faster decode than the fp32-dequant path and still clears the accuracy gate
@@ -892,37 +885,6 @@ static bool gemv_mmvq() {
 // occupancy lever main already uses for the f32 router GEMV (gemv_f32_sk_kernel), extended to the
 // bf16 projections. Only the fp32 reduction order changes, so it is self-consistent with the
 // one-warp path (no top-1 regression). SPARKINFER_GEMV_SK=0 restores the one-warp kernel. K % 8 == 0.
-
-// Fused GEMV + sigmoid for N=1 (shared-expert gate scalar). One warp dots
-// x @ W directly from L2 (no smem staging — 1 row doesn't repay it) and
-// lane 0 applies sigmoid, eliminating the separate sigmoid_scalar_kernel.
-__global__ void gemv_sigmoid_kernel(const __nv_bfloat16* __restrict__ x,
-                                     const __nv_bfloat16* __restrict__ W,
-                                     float* __restrict__ y, int K) {
-    float acc = 0.f;
-    const uint4* x4 = reinterpret_cast<const uint4*>(x);
-    const uint4* row4 = reinterpret_cast<const uint4*>(W);
-    const int n4 = K / 8;
-    for (int i = threadIdx.x; i < n4; i += 32) {
-        uint4 xv = x4[i], wv = row4[i];
-        const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
-        const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wv);
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            float2 wf = __bfloat1622float2(wh[j]), xf = __bfloat1622float2(xh[j]);
-            acc += wf.x * xf.x + wf.y * xf.y;
-        }
-    }
-    #pragma unroll
-    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
-    if (threadIdx.x == 0) y[0] = 1.f / (1.f + __expf(-acc));
-}
-
-void launch_gemv_sigmoid(const void* x, const void* W, float* y, int K, cudaStream_t stream) {
-    gemv_sigmoid_kernel<<<1, 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x),
-        reinterpret_cast<const __nv_bfloat16*>(W), y, K);
-}
 
 static int gemv_bf16_splitk() {
     static int v = -1;
@@ -953,6 +915,17 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K, cudaStream
     gemv_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W),
         reinterpret_cast<__nv_bfloat16*>(y), N, K);
+}
+
+// Fused GEMV + sigmoid for N=1 (shared-expert gate scalar). Delegates to the
+// faithful split-k launch_gemv + bf16-rounded sigmoid_scalar path — the single-warp
+// uint4 kernel diverged ~5pp on Qwen3.6 vs the split-k GEMV it was meant to replace.
+void launch_gemv_sigmoid(const void* x, const void* W, void* scratch_bf16, float* y, int K,
+                         cudaStream_t stream) {
+    launch_gemv(x, W, scratch_bf16, 1, K, stream);
+#ifndef SPARKINFER_NVRTC_DEVICE_ONLY
+    launch_qwen36_sigmoid_scalar(scratch_bf16, y, stream);
+#endif
 }
 
 // split-K occupancy for the f32-output bf16 GEMV. Default ON: at decode this path serves the
@@ -1165,10 +1138,10 @@ void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, i
     static int lm_pack2 = -1;
     if (lm_pack2 < 0) {
         const char* e = getenv("SPARKINFER_LM_PACK2");
-        lm_pack2 = (e && e[0] == '1') ? 1 : 0;   // opt-in: pack2 LM head needs parity proof on each model
+        lm_pack2 = (e && e[0] == '1') ? 1 : 0;   // opt-in: correct but slower than WPB=16 @ huge N
     }
     if (K == 4096 && lm_pack2) {
-        gemv_q6k_dp4a_kfixed_pack2_kernel<16><<<(N + 1) / 2, 8 * 32, 0, stream>>>(
+        gemv_q6k_dp4a_kfixed_pack2_kernel<16><<<(N + 1) / 2, 2 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N);
         return;
     }

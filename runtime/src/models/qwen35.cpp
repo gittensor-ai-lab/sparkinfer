@@ -698,9 +698,9 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     // restores the split path for A/B.
                     static int gemv_sigmoid = -1;
                     if (gemv_sigmoid < 0) { const char* e = getenv("SPARKINFER_GEMV_SIGMOID");
-                        gemv_sigmoid = (e && e[0] == '0') ? 0 : 1; }
+                        gemv_sigmoid = (e && e[0] == '1') ? 1 : 0; }   // default off: fused dot != split-k GEMV
                     if (gemv_sigmoid) {
-                        kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.d_shared_w, H, s.stream_k);
+                        kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.shared_gate_tmp, s.d_shared_w, H, s.stream_k);
                     } else {
                         kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
                         kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
@@ -708,17 +708,15 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 }
             }
             if (qmoe) {
-                // Accumulate shared-expert output directly into routed (skip residual_add).
-                // SPARKINFER_SHEXP_ACCUM=0 restores the split path for A/B.
-                static int shexp_accum = -1;
-                if (shexp_accum < 0) { const char* e = getenv("SPARKINFER_SHEXP_ACCUM");
-                    shexp_accum = (e && e[0] == '0') ? 0 : 1; }
+                // Pipelined shared overlaps stream_k with MoE on st — accum into routed here
+                // races MoE (shared finishes first, MoE overwrites routed). Always write s.shared;
+                // fold happens after both complete. SPARKINFER_SHEXP_ACCUM=1 only applies on the
+                // non-pipelined path where MoE has already landed in routed.
                 kernels::launch_shared_expert_q8_mmvq(
                     s.hn, fnq ? s.aq81 : nullptr,
                     w.shared_gate_q, w.shared_up_q, w.shared_down_q,
                     w.shared_gate_inp ? s.d_shared_w : nullptr,
-                    shexp_accum ? s.routed : s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k,
-                    shexp_accum ? true : false);
+                    s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k, false);
             } else {
                 kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, s.stream_k);
                 kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, s.stream_v);
@@ -770,10 +768,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
         }
         const void* shared_to_fold = nullptr;
         if (c.n_shared > 0) {
+            const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
             if (shexp_pipelined) {
                 cudaStreamWaitEvent(st, s.ev_sx_done, 0);
                 // (residual_add folded into add_rmsnorm3 below — #279)
-                const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
                 if (s.use_addnorm3) {
                     if (fnq)
                         kernels::launch_add_rmsnorm3_q8(s.h, s.routed, s.shared, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
@@ -807,9 +805,9 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     } else {
                         static int gs2 = -1;
                         if (gs2 < 0) { const char* e = getenv("SPARKINFER_GEMV_SIGMOID");
-                            gs2 = (e && e[0] == '0') ? 0 : 1; }
+                            gs2 = (e && e[0] == '1') ? 1 : 0; }
                         if (gs2) {
-                            kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.d_shared_w, H, st);
+                            kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.shared_gate_tmp, s.d_shared_w, H, st);
                         } else {
                             kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
                             kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
@@ -822,15 +820,24 @@ int Qwen35Model::forward_token(int token_id, int position) {
             }
             if (s.gguf) {
                 if (qmoe) {
-                    static int shexp_accum3 = -1;
-                    if (shexp_accum3 < 0) { const char* e = getenv("SPARKINFER_SHEXP_ACCUM");
-                        shexp_accum3 = (e && e[0] == '0') ? 0 : 1; }
+                    // MoE already wrote routed; safe to accum shared down into it (opt-in).
+                    static int shexp_accum = -1;
+                    if (shexp_accum < 0) { const char* e = getenv("SPARKINFER_SHEXP_ACCUM");
+                        shexp_accum = (e && e[0] == '1') ? 1 : 0; }
+                    const bool sx_accum = shexp_accum != 0;
                     kernels::launch_shared_expert_q8_mmvq(
                         s.hn, fnq ? s.aq81 : nullptr,
                         w.shared_gate_q, w.shared_up_q, w.shared_down_q,
                         w.shared_gate_inp ? s.d_shared_w : nullptr,
-                        shexp_accum3 ? s.routed : s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st,
-                        shexp_accum3 ? true : false);
+                        sx_accum ? s.routed : s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st,
+                        sx_accum);
+                    if (sx_accum) {
+                        if (fnq)
+                            kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
+                        else
+                            kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+                        continue;
+                    }
                 } else {
                     kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
                     kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
