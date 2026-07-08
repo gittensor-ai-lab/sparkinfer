@@ -1064,6 +1064,20 @@ static inline int down_splitk_s_q4() {
     return s;
 }
 
+// Shape-tuned Q4_K down split count. Dense hybrid Qwythos after #323 requant: S=8 on 5090.
+static inline int down_splitk_s_q4_ffn(int hidden, int ffn, int top_k) {
+    if (const char* v = getenv("SPARKINFER_DOWN_SPLITK_S_Q4")) {
+        int s = atoi(v);
+        if (s == 0 || s == 1 || s == 2 || s == 4 || s == 8) return s;
+    }
+    if (const char* v = getenv("SPARKINFER_DOWN_SPLITK_S")) {
+        int s = atoi(v);
+        if (s == 0 || s == 1 || s == 2 || s == 4 || s == 8) return s;
+    }
+    if (hidden == 4096 && ffn == 12288 && top_k == 1) return 8;
+    return down_splitk_s_q4();
+}
+
 static inline int down_splitk_s_q5() {
     static int s = -2;
     if (s == -2) {
@@ -1174,6 +1188,23 @@ static inline bool launch_down_q4k_mmvq_splitk(
             down_q, expert_ids, expert_weights, hq8, output, H, pdl);
         return true;
     }
+    if (spec && top_k == 1 && F == 12288) {
+        if (S == 8) {
+            launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<8, 48, 1>,
+                down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+            return true;
+        }
+        if (S == 4) {
+            launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<4, 48, 1>,
+                down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+            return true;
+        }
+        if (S == 2) {
+            launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<2, 48, 1>,
+                down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+            return true;
+        }
+    }
     switch (S) {
         case 2: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
         case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
@@ -1210,7 +1241,7 @@ void launch_moe_expert_ffn_q4k(
         dense_fuse = (e && e[0] == '0') ? 0 : 1;   // default on for Qwythos dense 4096x12288
     }
     if (dense_fuse && num_tokens == 1 && top_k == 1 && hidden == 4096 && ffn == 12288
-        && gate_type == 12 && up_type == 12 && down_type == 14) {
+        && gate_type == 12 && up_type == 12 && (down_type == 12 || down_type == 14)) {
         constexpr int H = 4096, F = 12288;
         const si_block_q8_1* vy;
         si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(out_scratch);
@@ -1228,19 +1259,31 @@ void launch_moe_expert_ffn_q4k(
         const int pdl = down_mmvq_pdl();
         quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
             h_scratch, qbuf, nqb, pdl);
-        const int S = down_splitk_s_q6_ffn(H, F, 1);
+        const int S = (down_type == 14) ? down_splitk_s_q6_ffn(H, F, 1)
+                                        : down_splitk_s_q4_ffn(H, F, 1);
         if (S > 1) {
             const int RPB = WPB / S;
             dim3 dns(1, (H + RPB - 1) / RPB);
-            if (launch_down_q6k_mmvq_splitk(S, pdl, dns,
-                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, qbuf,
-                    reinterpret_cast<__nv_bfloat16*>(output), H, F, 1, stream))
+            if (down_type == 14) {
+                if (launch_down_q6k_mmvq_splitk(S, pdl, dns,
+                        reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, qbuf,
+                        reinterpret_cast<__nv_bfloat16*>(output), H, F, 1, stream))
+                    return;
+            } else if (launch_down_q4k_mmvq_splitk(S, pdl, dns,
+                        reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, qbuf,
+                        reinterpret_cast<__nv_bfloat16*>(output), H, F, 1, stream))
                 return;
         }
         dim3 dnm(1, (H + WPB - 1) / WPB);
-        launch_mmvq_down_kernel(pdl, dnm, dim3(WPB * 32), stream, down_q6k_mmvq_kernel,
-            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, qbuf,
-            reinterpret_cast<__nv_bfloat16*>(output), H, F, 1, pdl);
+        if (down_type == 14) {
+            launch_mmvq_down_kernel(pdl, dnm, dim3(WPB * 32), stream, down_q6k_mmvq_kernel,
+                reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, qbuf,
+                reinterpret_cast<__nv_bfloat16*>(output), H, F, 1, pdl);
+        } else {
+            launch_mmvq_down_kernel(pdl, dnm, dim3(WPB * 32), stream, down_q4k_mmvq_kernel,
+                reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, qbuf,
+                reinterpret_cast<__nv_bfloat16*>(output), H, F, 1, pdl);
+        }
         return;
     }
 
