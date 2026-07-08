@@ -461,7 +461,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     fuse = (e && e[0] == '0') ? 0 : 1; }
                 return fuse && s.gguf && s.use_pq && s.use_llama &&
                        w.wqkv_type == 12 && w.wqkv_gate_type == 12 &&
-                       H == 4096 && s.linear_qkvdim > 0 && s.linear_vdim > 0;
+                       H == 2048 && s.linear_qkvdim > 0 && s.linear_vdim > 0;
             }();
             if (gdn_pipelined && !gdn_fused_proj) {
                 cudaEventRecord(s.ev_pipe_fork, st);
@@ -492,7 +492,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
             static int gdn_fuse = -1;
             if (gdn_fuse < 0) { const char* e = getenv("SPARKINFER_GDN_FUSE"); gdn_fuse = (e && e[0] == '0') ? 0 : 1; }
             if (gdn_fuse && c.linear_head_dim == 128 && c.linear_q_heads == 16 &&
-                (c.linear_v_heads == 32 || c.linear_v_heads == 16)) {
+                c.linear_v_heads == 32) {
                 kernels::launch_qwen36_conv_split_l2norm_fused(s.lin_qkv, w.ssm_conv, conv_state,
                                                  s.lin_q, s.lin_k, s.lin_v,
                                                  c.linear_q_heads, c.linear_v_heads,
@@ -849,9 +849,9 @@ int Qwen35Model::forward_token(int token_id, int position) {
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         if (shared_to_fold) {
             if (fnq)
-                kernels::launch_add_rmsnorm3_q8(s.h, s.routed, s.shared, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
+                kernels::launch_add_rmsnorm3_q8(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
             else
-                kernels::launch_add_rmsnorm3(s.h, s.routed, s.shared, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+                kernels::launch_add_rmsnorm3(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
         } else if (fnq)
             kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
         else
@@ -1280,12 +1280,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (!have_attn || !w.input_norm || !w.post_attn_norm || !have_ffn) return false;
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);
     }
-    if (dense_ffn) {
-        const int id0 = 0;
-        const float w0 = 1.f;
-        cudaMemcpy(s.mf_ids, &id0, sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(s.mf_weights, &w0, sizeof(float), cudaMemcpyHostToDevice);
-    }
+    // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;
 }
 

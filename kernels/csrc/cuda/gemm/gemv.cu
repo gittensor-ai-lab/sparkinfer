@@ -1165,7 +1165,7 @@ void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, i
     static int lm_pack2 = -1;
     if (lm_pack2 < 0) {
         const char* e = getenv("SPARKINFER_LM_PACK2");
-        lm_pack2 = (e && e[0] == '0') ? 0 : 1;
+        lm_pack2 = (e && e[0] == '1') ? 1 : 0;   // opt-in: pack2 LM head needs parity proof on each model
     }
     if (K == 4096 && lm_pack2) {
         gemv_q6k_dp4a_kfixed_pack2_kernel<16><<<(N + 1) / 2, 8 * 32, 0, stream>>>(
