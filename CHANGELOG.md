@@ -3,6 +3,56 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.3.8] — 2026-07-09
+
+This release adds **hardware-rooted trust** to the eval pipeline and locks in the Qwen3.6 speed story
+across the full context ladder. Every graded run can now ship an **Intel TDX attestation** (Polaris) that
+third parties verify offline — and Qwen3.6 stays **30%+ faster than llama.cpp at every tracked context,
+128 through 32k**, on the same RTX 5090 and UD-Q4_K_M GGUF.
+
+### 🔐 Polaris — verifiable eval receipts (Intel TDX)
+
+The benchmark loop is no longer "trust us, we ran it on a GPU." The bot can emit a **Polaris receipt**
+that binds code commit, model SHA256, eval seed, and measured tok/s to an **Intel DCAP quote**:
+
+- **#295** — Polaris TDX integration: `judge.py` assembles attestations on the eval box; the bot submits
+  scoring to Polaris and uploads signed receipts alongside eval logs
+- **#301** — production fixes: correct API wiring, Qwen3.6 model SHA pinning, stdout forwarding so
+  `POLARIS_ATTESTATION` survives SSH capture, TDX verify/hash fixes; smoke + test helper scripts
+
+Anyone can run `eval/polaris/verify.py receipt.json` — no GPU, no trust in the operator.
+
+### 🏁 Qwen3.6 — 30%+ past llama.cpp at every context
+
+Same RTX 5090, Qwen3.6-35B-A3B UD-Q4_K_M, 128 generated tokens, warm & interleaved vs `llama-bench`:
+
+| context | sparkinfer | llama.cpp | delta |
+|---|---:|---:|---:|
+| **128-token decode** | **426.0 tok/s** | 275.81 tok/s | **+54%** |
+| **512-context decode** | **419.2 tok/s** | 275.61 tok/s | **+52%** |
+| **4k-context decode** | **402.4 tok/s** | 276.30 tok/s | **+46%** |
+| **16k-context decode** | **385.2 tok/s** | 280.66 tok/s | **+37%** |
+| **32k-context decode** | **363.5 tok/s** | 279.83 tok/s | **+30%** |
+
+The frontier climbed **23 → 426 tok/s** in under a week; the long-context tail no longer lags.
+
+### Performance — landed since v0.3.7
+
+- **#282** (`eval:XL`) — fused router GEMV + bitonic top-k (grid-completion decode) — **426 tok/s @128**
+- **#284** — partial-RoPE KV fuse, GDN conv-L2, Q5 S=8, Q8_0 MMVQ, addnorm3
+- **#279** — warp-grid GDN + decode pipelining + Q8_0 shared MMVQ
+
+### The proof, in four layers
+
+v0.3.8 stacks proof the way v0.3.6 stacked speed + correctness + quality — now with **hardware attestation**:
+
+1. **Speed** — Qwen3.6 +30–54% over llama.cpp at 128/512/4k/16k/32k on the same box/GGUF.
+2. **Correctness** — top-1 **≥ 0.95**, KL **≈ 0.01** vs llama.cpp on held-out prompts.
+3. **Same-box baseline** — every PR graded against origin/main measured in-session (no hardware lottery).
+4. **Polaris TDX** — Intel-verified receipt per eval; offline verification without re-running the GPU job.
+
+**Verified:** RTX 5090, Qwen3.6 **426 tok/s** (128-tok), top-1 **0.95**, Polaris `intel_verified=True`.
+
 ## [0.3.6] — 2026-07-04
 
 This release breaks the long-context deficit wide open and adds a new axis of proof. sparkinfer now
