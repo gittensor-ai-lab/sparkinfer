@@ -435,9 +435,9 @@ def push_dash(msg):
     subprocess.run(["git", "-C", ROOT, "pull", "-q", "--rebase", "origin", "main"], capture_output=True)
     subprocess.run(["git", "-C", ROOT, "push", "-q", "origin", "main"], capture_output=True)
 
-LOG_REPO  = os.environ.get("SPARKINFER_LOG_REPO", "https://github.com/gittensor-ai-lab/sparkinfer-log.git")
+LOG_REPO  = os.environ.get("SPARKINFER_LOG_REPO", "https://github.com/gittensor-ai-lab/sparkinfer.git")
 LOG_DIR   = os.path.expanduser(os.environ.get("SPARKINFER_LOG_DIR", "~/.sparkinfer_log_checkout"))
-LOG_PAGE  = "https://gittensor-ai-lab.github.io/sparkinfer-log/?run="
+LOG_PAGE  = "https://github.com/gittensor-ai-lab/sparkinfer/blob/main/eval/logs/?run="
 
 def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
     """Commit this eval's raw log + result to the public sparkinfer-log repo (immutable record),
