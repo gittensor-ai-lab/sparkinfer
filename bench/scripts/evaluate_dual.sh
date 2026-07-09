@@ -107,14 +107,20 @@ P36_512="${P36_512:-0}"
 P36_4K="${P36_4K:-0}"
 P36_16K="${P36_16K:-0}"
 P36_32K="${P36_32K:-0}"
-# Fall back to the bot's config defaults if measurement produced 0
-# (use value check, not null check: P36_* is already "0" from above, which is non-empty,
-# so ${P36_128:-default} would never fire — we need an explicit zero-guard)
-[ "${P36_128}" = "0" ] && P36_128="${SPARKINFER_P_GUARD_128_BASELINE:-300.16}"
-[ "${P36_512}" = "0" ] && P36_512="${SPARKINFER_P_GUARD_512_BASELINE:-296.76}"
-[ "${P36_4K}"  = "0" ] && P36_4K="${SPARKINFER_P_GUARD_4K_BASELINE:-287.91}"
-[ "${P36_16K}" = "0" ] && P36_16K="${SPARKINFER_P_GUARD_16K_BASELINE:-338.55}"
-[ "${P36_32K}" = "0" ] && P36_32K="${SPARKINFER_P_GUARD_32K_BASELINE:-301.19}"
+# Fall back to the bot's config defaults if measurement produced 0.
+# Two-step: try the env var first; if it is also unset/empty/"0", use the hardcoded default.
+# A single ${VAR:-default} doesn't work because the bot passes VAR=0 explicitly, and
+# "0" is a non-empty string so the :- expansion never fires (same pitfall as P36_* above).
+[ "${P36_128}" = "0" ] && P36_128="${SPARKINFER_P_GUARD_128_BASELINE}"
+[ "${P36_128}" = "0" ] && P36_128="300.16"
+[ "${P36_512}" = "0" ] && P36_512="${SPARKINFER_P_GUARD_512_BASELINE}"
+[ "${P36_512}" = "0" ] && P36_512="296.76"
+[ "${P36_4K}"  = "0" ] && P36_4K="${SPARKINFER_P_GUARD_4K_BASELINE}"
+[ "${P36_4K}"  = "0" ] && P36_4K="287.91"
+[ "${P36_16K}" = "0" ] && P36_16K="${SPARKINFER_P_GUARD_16K_BASELINE}"
+[ "${P36_16K}" = "0" ] && P36_16K="338.55"
+[ "${P36_32K}" = "0" ] && P36_32K="${SPARKINFER_P_GUARD_32K_BASELINE}"
+[ "${P36_32K}" = "0" ] && P36_32K="301.19"
 
 PRIMARY_JSON="$(run_model primary "$P_FILE" "$P_REPO" "$P_TOK" 0 \
   MODELS_DIR="$P_DIR" MODEL_SHA256="${QWEN36_MODEL_SHA256:-}" \

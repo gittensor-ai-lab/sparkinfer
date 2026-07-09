@@ -83,6 +83,17 @@ HOLD_LABEL         = "hold"           # maintainer override: never auto-merge th
 CONTEXT_LABELS     = {"128-context", "512-context", "4k-context", "16k-context", "32k-context"}
 REGRESSION_LABELS  = {"regression-128", "regression-512", "regression-4k", "regression-16k", "regression-32k"}
 
+# Per-context guard baseline fallbacks for display when the RESULT_JSON baseline is 0.
+# Mirrors evaluate_dual.sh hardcoded defaults (used when both eval-box measurement and
+# bot env var are unavailable).
+_GUARD_BASE_FALLBACK = {
+    "guard_128_baseline": 300.16,
+    "guard_512_baseline": 296.76,
+    "guard_4k_baseline":  287.91,
+    "guard_16k_baseline": 338.55,
+    "guard_32k_baseline": 301.19,
+}
+
 # Auto-merge the round's merge-first winner — OFF unless SPARKINFER_AUTOMERGE=1. Heavily guarded:
 # the eval only verifies speed + token-match, so auto-merge is gated on labels, author standing,
 # changed paths, and branch protection (gh refuses if checks/reviews aren't satisfied).
@@ -345,7 +356,7 @@ def render(res, oid):
         if not tps:
             continue
         gate = "pass" if res.get(gkey, True) else "fail"
-        base = res.get(bkey) or (res.get("frontier_tps") if key == "ctx_16384_tps" else 0) or 0
+        base = res.get(bkey) or _GUARD_BASE_FALLBACK.get(bkey, 0)
         rows.append(f"| {f'{short} ' if dual else ''}{lbl} no-regression gate | {tps} tok/s"
                     f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
     if res.get("ctx_2048_tps") is not None and res.get("ctx_512_tps") is None:
