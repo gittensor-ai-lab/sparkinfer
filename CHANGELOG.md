@@ -38,9 +38,9 @@ The frontier climbed **23 → 426 tok/s** in under a week; the long-context tail
 
 ### Performance — landed since v0.3.7
 
-- **#282** (`eval:XL`) — fused router GEMV + bitonic top-k (grid-completion decode) — **426 tok/s @128**
-- **#284** — partial-RoPE KV fuse, GDN conv-L2, Q5 S=8, Q8_0 MMVQ, addnorm3
-- **#279** — warp-grid GDN + decode pipelining + Q8_0 shared MMVQ
+- **#282** (`eval:XL`) — fused router GEMV + bitonic top-k (grid-completion decode) — **426 tok/s at 128-ctx** (@fansilas)
+- **#279** — partial-RoPE KV fuse, GDN conv-L2, Q5 S=8, Q8_0 MMVQ, addnorm3 (@jimcody1995)
+- **#284** — int8 KV + tensor-core flash-decode for the hd256 full-attn layers (@nickmopen)
 
 ### The proof, in four layers
 
