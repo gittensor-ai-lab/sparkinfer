@@ -29,6 +29,8 @@ struct DecodeRunner::Impl {
     // scratch (bf16 unless noted)
     bf16 *xn, *q, *k, *v, *attnout, *ao, *h, *hn, *moeout;
     int *d_seq_lens, *d_write_pos;
+    int mbps = 0;                    // kv->max_blocks_per_seq(), cached at construction
+    int* d_batch_block_table = nullptr;  // [max_batch, mbps] gathered per begin_step, shared across layers
 
     template <class T> T* alloc(size_t n) { void* p = nullptr; cu(cudaMalloc(&p, n * sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -39,6 +41,7 @@ DecodeRunner::DecodeRunner(int hidden, AttnConfig attn, KVCacheManager* kv,
     p_->hidden = hidden; p_->attn = attn; p_->kv = kv; p_->moe = moe; p_->max_batch = max_batch;
     p_->qdim  = attn.num_q_heads  * attn.head_dim;
     p_->kvdim = attn.num_kv_heads * attn.head_dim;
+    p_->mbps  = kv->max_blocks_per_seq();
     const int M = max_batch;
     p_->xn      = p_->alloc<bf16>((size_t)M * hidden);
     p_->q       = p_->alloc<bf16>((size_t)M * p_->qdim);
@@ -51,26 +54,44 @@ DecodeRunner::DecodeRunner(int hidden, AttnConfig attn, KVCacheManager* kv,
     p_->moeout  = p_->alloc<bf16>((size_t)M * hidden);
     p_->d_seq_lens  = p_->alloc<int>(M);
     p_->d_write_pos = p_->alloc<int>(M);
+    p_->d_batch_block_table = p_->alloc<int>((size_t)M * p_->mbps);
 }
 
 DecodeRunner::~DecodeRunner() {
     cudaFree(p_->xn); cudaFree(p_->q); cudaFree(p_->k); cudaFree(p_->v);
     cudaFree(p_->attnout); cudaFree(p_->ao); cudaFree(p_->h); cudaFree(p_->hn); cudaFree(p_->moeout);
-    cudaFree(p_->d_seq_lens); cudaFree(p_->d_write_pos);
+    cudaFree(p_->d_seq_lens); cudaFree(p_->d_write_pos); cudaFree(p_->d_batch_block_table);
     delete p_;
 }
 
-void DecodeRunner::begin_step(const std::vector<int>& seq_lens_before) {
+void DecodeRunner::begin_step(const std::vector<uint64_t>& seq_ids,
+                              const std::vector<int>& seq_lens_before) {
     const int n = (int)seq_lens_before.size();
-    if (n <= 0 || n > p_->max_batch) {
-        fprintf(stderr, "[decode] begin_step: num_seqs %d out of range (max_batch=%d)\n",
-                n, p_->max_batch);
+    if (n <= 0 || n > p_->max_batch || (int)seq_ids.size() != n) {
+        fprintf(stderr, "[decode] begin_step: num_seqs %d (seq_ids=%zu) out of range/mismatched (max_batch=%d)\n",
+                n, seq_ids.size(), p_->max_batch);
         return;
     }
     std::vector<int> after(n);
     for (int i = 0; i < n; i++) after[i] = seq_lens_before[i] + 1;   // include the new token
     cu(cudaMemcpy(p_->d_write_pos, seq_lens_before.data(), n * sizeof(int), cudaMemcpyHostToDevice), "wpos");
     cu(cudaMemcpy(p_->d_seq_lens,  after.data(),           n * sizeof(int), cudaMemcpyHostToDevice), "slens");
+
+    // Gather each row's block table into a contiguous per-batch scratch buffer. The KV-append
+    // and flash-decode kernels index block_table[row * max_blocks_per_seq], which assumes row i
+    // lives at offset i in the source buffer — that only holds for seq_ids[i]'s *actual* physical
+    // slot, not for a fixed row==slot layout (KVCacheManager recycles slots via a LIFO free-list
+    // independent of batch position, so slot reuse breaks that assumption).
+    for (int i = 0; i < n; i++) {
+        const int* src = p_->kv->block_table(seq_ids[i]);
+        if (!src) {
+            fprintf(stderr, "[decode] begin_step: seq_id %llu has no allocated KV slot\n",
+                    (unsigned long long)seq_ids[i]);
+            return;
+        }
+        cu(cudaMemcpy(p_->d_batch_block_table + (size_t)i * p_->mbps, src,
+                      p_->mbps * sizeof(int), cudaMemcpyDeviceToDevice), "gather block table");
+    }
 }
 
 void DecodeRunner::decode_layer(int layer, void* x, int num_seqs,
@@ -96,7 +117,7 @@ void DecodeRunner::decode_layer(int layer, void* x, int num_seqs,
     // 3. append new K/V into the paged cache for this layer
     bf16* kpool = (bf16*)s.kv->k_pool() + (size_t)layer * s.kv->layer_stride_elems();
     bf16* vpool = (bf16*)s.kv->v_pool() + (size_t)layer * s.kv->layer_stride_elems();
-    int* btable = s.kv->block_table(0);   // batch occupies slots 0..num_seqs-1
+    int* btable = s.d_batch_block_table;  // gathered per-row (seq_id -> slot) in begin_step
     launch_kv_append(kpool, vpool, s.k, s.v, btable, s.d_write_pos,
                      num_seqs, s.attn.num_kv_heads, s.attn.head_dim,
                      s.kv->block_size(), s.kv->max_blocks_per_seq(), stream);

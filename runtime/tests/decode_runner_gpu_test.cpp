@@ -72,8 +72,9 @@ int main() {
     void* x = dev_rand_bf16((size_t)seqs * H, 1.f);
 
     cudaStream_t stream; cudaStreamCreate(&stream);
-    std::vector<int> lens(seqs, 7);                 // 7 tokens already cached
-    runner.begin_step(lens);
+    std::vector<uint64_t> seq_ids = {0, 1};          // matches kv.allocate(0,...), kv.allocate(1,...)
+    std::vector<int> lens(seqs, 7);                  // 7 tokens already cached
+    runner.begin_step(seq_ids, lens);
     for (int l = 0; l < layers; l++) runner.decode_layer(l, x, seqs, w[l], stream);
     cudaStreamSynchronize(stream);
 
@@ -85,5 +86,30 @@ int main() {
     for (size_t i = 0; i < hx.size(); i++) if (!std::isfinite(bf162f(hx[i]))) { printf("[FAIL] non-finite output at %zu\n", i); return 1; }
 
     printf("[PASS] decode_runner_gpu_test: %d layers x %d seqs, output finite\n", layers, seqs);
+
+    // --- Regression: KV slot reuse must not desync batch row -> physical slot -------------
+    // Free seq 1's slot and allocate a brand-new sequence (id 99) into it. Under the old
+    // block_table(0)-based code this recycled slot would silently break the row<->slot
+    // assumption; here begin_step's per-row gather keeps it correct regardless of physical
+    // slot layout. Batch order is deliberately non-slot-order: [seq 0, seq 99].
+    kv.free(1);
+    const uint64_t reused_id = 99;
+    if (!kv.allocate(reused_id, 64)) { printf("[FAIL] kv allocate (reused slot)\n"); return 1; }
+
+    void* x2 = dev_rand_bf16((size_t)seqs * H, 1.f);
+    std::vector<uint64_t> seq_ids2 = {0, reused_id};
+    std::vector<int> lens2 = {7, 0};                 // reused_id is a fresh sequence: 0 cached tokens
+    runner.begin_step(seq_ids2, lens2);
+    for (int l = 0; l < layers; l++) runner.decode_layer(l, x2, seqs, w[l], stream);
+    cudaStreamSynchronize(stream);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) { printf("[FAIL] cuda error after slot reuse: %s\n", cudaGetErrorString(err)); return 1; }
+
+    std::vector<uint16_t> hx2((size_t)seqs * H);
+    cudaMemcpy(hx2.data(), x2, hx2.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < hx2.size(); i++) if (!std::isfinite(bf162f(hx2[i]))) { printf("[FAIL] non-finite output after slot reuse at %zu\n", i); return 1; }
+
+    printf("[PASS] decode_runner_gpu_test: slot-reuse regression (free+realloc mid-stream), output finite\n");
     return 0;
 }

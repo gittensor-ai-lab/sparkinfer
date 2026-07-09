@@ -35,9 +35,12 @@ public:
                  int max_batch = 256);
     ~DecodeRunner();
 
-    // Begin a decode step: set the new-token position for each sequence
-    // (host seq_lens = length BEFORE this token). Uploads positions to device.
-    void begin_step(const std::vector<int>& seq_lens_before);
+    // Begin a decode step: bind each batch row to its sequence and set its new-token
+    // position (host seq_lens = length BEFORE this token). Uploads positions to device and
+    // gathers each seq_id's KV block table into a contiguous per-batch scratch buffer —
+    // batch row order is not guaranteed to match physical KV-slot order once sequences have
+    // been freed/reallocated, so decode_layer can no longer assume row i lives in slot i.
+    void begin_step(const std::vector<uint64_t>& seq_ids, const std::vector<int>& seq_lens_before);
 
     // Run one layer in-place on x: [num_seqs, hidden] (bf16, device).
     void decode_layer(int layer, void* x, int num_seqs,
