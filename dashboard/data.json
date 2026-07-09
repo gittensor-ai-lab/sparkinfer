@@ -137,6 +137,53 @@
   ],
   "prs": [
     {
+      "num": 283,
+      "title": "perf(qwen3.6): fuse Q-gate + O-proj Q8_1 quantize into one launch",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 415.04,
+      "delta_pct": 0.6,
+      "top1": 0.9897,
+      "kl": 0.0177,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/283",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 0.61,
+        "512-context": 0.5,
+        "4k-context": 0.56,
+        "16k-context": 0.44,
+        "32k-context": 0.23
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 415.04,
+      "ctx_512_tps": 407.28,
+      "ctx_4096_tps": 390.79,
+      "ctx_16384_tps": 357.36,
+      "ctx_32768_tps": 320.69,
+      "guard_128_baseline": 412.53,
+      "guard_128_ratio": 1.0061,
+      "guard_128_pass": true,
+      "guard_512_baseline": 405.25,
+      "guard_512_ratio": 1.005,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 388.62,
+      "guard_4k_ratio": 1.0056,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 355.78,
+      "guard_16k_ratio": 1.0044,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 319.97,
+      "guard_32k_ratio": 1.0023,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0283-f2f973a"
+    },
+    {
       "num": 282,
       "title": "perf(qwen3.6): fused router GEMV + bitonic top-k (grid-completion, decode)",
       "areas": [
@@ -1493,20 +1540,6 @@
       "kl": 0.1417,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/83",
       "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0083-9bf0803"
-    },
-    {
-      "num": 72,
-      "title": "perf(gemm): split-K the router projection GEMV for decode occupancy (+3% decode)",
-      "areas": [
-        "kernels"
-      ],
-      "label": "S",
-      "tps": 394.45,
-      "delta_pct": 3.5,
-      "top1": 0.97,
-      "kl": 0.1417,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/72",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0072-d459d58"
     }
   ],
   "landed": [
