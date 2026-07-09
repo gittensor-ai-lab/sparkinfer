@@ -19,8 +19,14 @@ it is stopped and a fresh box is provisioned via the vast API automatically; the
 
 Env: VAST_API_KEY, SSH_KEY (default ~/.ssh/id_ed25519), LLAMACPP_DIR, EVAL_IMAGE, EVAL_REPO, VAST_INSTANCE_FILE.
 """
-import argparse, json, os, random, shlex, subprocess, sys, time
+import argparse, json, os, random, shlex, shutil, subprocess, sys, time
 from vastai import VastAI
+
+# Resolve vastai CLI binary — subprocess.run doesn't always inherit the full user PATH
+# when invoked from a bot/cron context. Try shutil.which first, then known locations.
+_VASTAI_BIN = shutil.which("vastai") or os.path.expanduser("~/.local/bin/vastai")
+if not os.path.isfile(_VASTAI_BIN):
+    _VASTAI_BIN = "vastai"  # fallback: hope it's on PATH
 
 REPO    = os.environ.get("EVAL_REPO",  "https://github.com/gittensor-ai-lab/sparkinfer")
 IMAGE   = os.environ.get("EVAL_IMAGE", "nvidia/cuda:12.8.0-devel-ubuntu24.04")   # needs nvcc for sm_120
@@ -101,7 +107,7 @@ def funds():
     """Usable vast funds in USD = balance + CREDIT. Credit is spent first and is the field that
     actually matters — a $0 'balance' with positive credit can still rent. None if unreadable."""
     try:
-        out = subprocess.run(["vastai", "show", "user", "--raw"], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run([_VASTAI_BIN, "show", "user", "--raw"], capture_output=True, text=True, timeout=30).stdout
         u = json.loads(out)
         return float(u.get("balance") or 0) + float(u.get("credit") or 0)
     except Exception:
@@ -179,7 +185,7 @@ def provision(v, args, skip_hosts=None):
           f"host={off.get('public_ipaddr','?')} rel={off.get('reliability2','?')}")
     # Create via the CLI: the SDK's create_instance has no ssh/direct kwargs (those are CLI flags),
     # and --template_hash applies a preconfigured image+env. --raw returns {success, new_contract}.
-    cmd = ["vastai", "create", "instance", str(off["id"]), "--disk", "120", "--ssh", "--direct", "--raw"]
+    cmd = [_VASTAI_BIN, "create", "instance", str(off["id"]), "--disk", "120", "--ssh", "--direct", "--raw"]
     if TEMPLATE_HASH:
         cmd += ["--template_hash", TEMPLATE_HASH]; print(f">> using template {TEMPLATE_HASH}")
     else:

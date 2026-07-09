@@ -52,7 +52,7 @@ def _read_pin():
         v = open(PIN_FILE).read().strip()
         if v: return v
     except Exception: pass
-    return os.environ.get("VAST_DEFAULT_INSTANCE", "42682383").strip()
+    return os.environ.get("VAST_DEFAULT_INSTANCE", "44206573").strip()
 def _write_pin(iid):
     try:
         with open(PIN_FILE, "w") as f: f.write(str(iid))
