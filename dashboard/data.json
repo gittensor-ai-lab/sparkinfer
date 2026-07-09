@@ -137,6 +137,53 @@
   ],
   "prs": [
     {
+      "num": 282,
+      "title": "perf(qwen3.6): fused router GEMV + bitonic top-k (grid-completion, decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "XL",
+      "tps": 426.0,
+      "delta_pct": 4.2,
+      "top1": 0.9534,
+      "kl": 0.0122,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/282",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 4.17,
+        "512-context": 4.04,
+        "4k-context": 3.8,
+        "16k-context": 3.45,
+        "32k-context": 3.43
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 426.0,
+      "ctx_512_tps": 419.18,
+      "ctx_4096_tps": 402.37,
+      "ctx_16384_tps": 385.24,
+      "ctx_32768_tps": 363.48,
+      "guard_128_baseline": 408.95,
+      "guard_128_ratio": 1.0417,
+      "guard_128_pass": true,
+      "guard_512_baseline": 402.91,
+      "guard_512_ratio": 1.0404,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 387.63,
+      "guard_4k_ratio": 1.038,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 372.39,
+      "guard_16k_ratio": 1.0345,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 351.42,
+      "guard_32k_ratio": 1.0343,
+      "guard_32k_pass": true,
+      "proof_url": "https://github.com/gittensor-ai-lab/sparkinfer/blob/main/eval/logs/?run=0282-1e75ffe"
+    },
+    {
       "num": 284,
       "title": "perf(qwen3.6): int8 KV + tensor-core flash-decode for the hd256 full-attn layers (long-context)",
       "areas": [
@@ -245,53 +292,6 @@
       "guard_32k_ratio": 1.0023,
       "guard_32k_pass": true,
       "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0283-f2f973a"
-    },
-    {
-      "num": 282,
-      "title": "perf(qwen3.6): fused router GEMV + bitonic top-k (grid-completion, decode)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "XL",
-      "tps": 427.05,
-      "delta_pct": 3.5,
-      "top1": 0.9577,
-      "kl": 0.019,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/282",
-      "model": "Qwen3.6-35B-A3B",
-      "eval_mode": "longctx",
-      "score_context": 128,
-      "best_context_label": "128-context",
-      "context_gains_pct": {
-        "128-context": 3.52,
-        "512-context": 3.45,
-        "4k-context": 3.33,
-        "16k-context": 3.25,
-        "32k-context": 2.25
-      },
-      "regression_labels": [],
-      "ctx_128_tps": 427.05,
-      "ctx_512_tps": 419.23,
-      "ctx_4096_tps": 401.55,
-      "ctx_16384_tps": 367.35,
-      "ctx_32768_tps": 327.16,
-      "guard_128_baseline": 412.53,
-      "guard_128_ratio": 1.0352,
-      "guard_128_pass": true,
-      "guard_512_baseline": 405.25,
-      "guard_512_ratio": 1.0345,
-      "guard_512_pass": true,
-      "guard_4k_baseline": 388.62,
-      "guard_4k_ratio": 1.0333,
-      "guard_4k_pass": true,
-      "guard_16k_baseline": 355.78,
-      "guard_16k_ratio": 1.0325,
-      "guard_16k_pass": true,
-      "guard_32k_baseline": 319.97,
-      "guard_32k_ratio": 1.0225,
-      "guard_32k_pass": true,
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0282-bb7a2f5"
     },
     {
       "num": 272,
@@ -1574,35 +1574,6 @@
       "kl": 0.1417,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/89",
       "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0089-4e13546"
-    },
-    {
-      "num": 51,
-      "title": "runtime: prompt-lookup speculative decoding for bs=1 MoE decode",
-      "areas": [
-        "runtime"
-      ],
-      "label": "none",
-      "tps": 419.68,
-      "delta_pct": 0.0,
-      "top1": 0.97,
-      "kl": 0.1417,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/51",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0051-d7824bf"
-    },
-    {
-      "num": 83,
-      "title": "perf(decode): emit Q8_1 from the residual RMSNorm to drop the per-layer activation quantize (+2.7% decode)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "S",
-      "tps": 410.85,
-      "delta_pct": 4.3,
-      "top1": 0.97,
-      "kl": 0.1417,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/83",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0083-9bf0803"
     }
   ],
   "landed": [
@@ -1834,42 +1805,42 @@
   "qwen36": {
     "model": "Qwen3.6-35B-A3B · UD-Q4_K_M",
     "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
-    "frontier_tps": 413.09,
+    "frontier_tps": 426.0,
     "baseline_tps": 23.03,
     "ref_name": "llama.cpp",
     "ref_tps": 275.81,
-    "token_match": 0.9848,
-    "kl": 0.014,
-    "note": "scored vs same-box main · GDN_FAST default ON · #241 #243 #266 #269 #279 #284 merged",
+    "token_match": 0.9534,
+    "kl": 0.0122,
+    "note": "scored vs same-box main · GDN_FAST default ON · #241 #243 #266 #269 #279 #284 #282 merged",
     "ctx": [
       {
         "label": "128",
         "color": "#7B5DFF",
-        "tps": 413.09,
+        "tps": 426.0,
         "ref_tps": 275.81
       },
       {
         "label": "512",
         "color": "#0E8A16",
-        "tps": 405.37,
+        "tps": 419.18,
         "ref_tps": 275.61
       },
       {
         "label": "4k",
         "color": "#B8860B",
-        "tps": 389.1,
+        "tps": 402.37,
         "ref_tps": 276.3
       },
       {
         "label": "16k",
         "color": "#D14D72",
-        "tps": 367.97,
+        "tps": 385.24,
         "ref_tps": 280.66
       },
       {
         "label": "32k",
         "color": "#6F42C1",
-        "tps": 345.7,
+        "tps": 363.48,
         "ref_tps": 279.83
       }
     ]
@@ -1925,11 +1896,18 @@
       "label": "S"
     },
     {
-      "name": "int8 KV + tensor-core hd256 fl",
-      "tps": 345.7,
+      "name": "int8 KV + tensor-core flash-",
+      "tps": 413.09,
       "pr": 284,
       "date": "2026-07-09",
       "label": "M"
+    },
+    {
+      "name": "fused router GEMV + bitonic ",
+      "tps": 426.0,
+      "pr": 282,
+      "date": "2026-07-09",
+      "label": "XL"
     }
   ]
 }
