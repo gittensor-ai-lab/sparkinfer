@@ -850,11 +850,13 @@ def main():
     ap.add_argument("--polaris", action="store_true",
                     help="generate a Polaris verifiable receipt for each eval")
     args = ap.parse_args()
-    # Qwen3.6 same-box origin/main baselines (128/512/4k). Env-overridable; measured 2026-07 on RTX 5090.
+    # Qwen3.6 same-box origin/main baselines (128/512/4k/16k/32k). Env-overridable; measured on RTX 5090.
     QWEN36_BASE = {
         "128": float(os.environ.get("SPARKINFER_QWEN36_128", "300.16")),
         "512": float(os.environ.get("SPARKINFER_QWEN36_512", "296.76")),
         "4k":  float(os.environ.get("SPARKINFER_QWEN36_4K",  "287.91")),
+        "16k": float(os.environ.get("SPARKINFER_QWEN36_16K", "338.55")),
+        "32k": float(os.environ.get("SPARKINFER_QWEN36_32K", "301.19")),
         "llama128": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_128", "275.81")),
         "llama512": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_512", "275.61")),
         "llama4k":  float(os.environ.get("SPARKINFER_QWEN36_LLAMA_4K",  "276.30")),
@@ -1095,7 +1097,7 @@ def main():
         return
 
     # Dual mode: bench Qwen3.6 main directly on the box — the same build the Qwen3-30B
-    # baseline already verified. No accuracy gate, just a 3-context decode sweep.
+    # baseline already verified. No accuracy gate, just a 5-context decode sweep.
     if args.dual and _vast_sh and _vast_endpoint and _vast_info_of:
         import vastai
         v = vastai.VastAI()
@@ -1104,8 +1106,9 @@ def main():
             host, port = _vast_endpoint(info)
             M36 = "/workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
             B36 = "/root/sparkinfer/build/runtime/qwen3_gguf_bench"
-            tps128 = tps512 = tps4k = 0.0
-            for label, ctx in [("128", 0), ("512", 512), ("4096", 4096)]:
+            tps128 = tps512 = tps4k = tps16k = tps32k = 0.0
+            for label, ctx in [("128", 0), ("512", 512), ("4k", 4096),
+                               ("16k", 16384), ("32k", 32768)]:
                 cmd = f"export PATH=/usr/local/cuda/bin:$PATH; {B36} '{M36}' 128 {ctx}"
                 r = _vast_sh(host, port, cmd, timeout=600)
                 m = re.search(r"decode\s+tg\s*:\s*([0-9.]+)", r.stdout + r.stderr)
@@ -1113,15 +1116,22 @@ def main():
                 else: tps = 0.0
                 if label == "128": tps128 = tps
                 elif label == "512": tps512 = tps
-                else: tps4k = tps
+                elif label == "4k":  tps4k  = tps
+                elif label == "16k": tps16k = tps
+                else:               tps32k = tps
                 print(f"    ctx={label} tps={tps}")
             if tps128 > 0:
                 QWEN36_BASE["128"] = tps128
                 QWEN36_BASE["512"] = tps512 if tps512 > 0 else round(tps128 * 0.98, 2)
                 QWEN36_BASE["4k"]  = tps4k  if tps4k  > 0 else round(tps128 * 0.93, 2)
-                print(f"  Qwen3.6 same-box main: 128={tps128} 512={QWEN36_BASE['512']} 4k={QWEN36_BASE['4k']} tok/s")
+                QWEN36_BASE["16k"] = tps16k if tps16k > 0 else QWEN36_BASE["16k"]
+                QWEN36_BASE["32k"] = tps32k if tps32k > 0 else QWEN36_BASE["32k"]
+                print(f"  Qwen3.6 same-box main: 128={tps128} 512={QWEN36_BASE['512']} "
+                      f"4k={QWEN36_BASE['4k']} 16k={QWEN36_BASE['16k']} 32k={QWEN36_BASE['32k']} tok/s")
             else:
-                print(f"  Qwen3.6 bench failed — using defaults: {QWEN36_BASE['128']}/{QWEN36_BASE['512']}/{QWEN36_BASE['4k']}")
+                print(f"  Qwen3.6 bench failed — using defaults: "
+                      f"{QWEN36_BASE['128']}/{QWEN36_BASE['512']}/{QWEN36_BASE['4k']}/"
+                      f"{QWEN36_BASE['16k']}/{QWEN36_BASE['32k']}")
         else:
             print(f"  could not get endpoint for instance {base_iid} — using config defaults")
 
@@ -1154,6 +1164,8 @@ def main():
                 "--p-guard-128-baseline", str(QWEN36_BASE["128"]),
                 "--p-guard-512-baseline", str(QWEN36_BASE["512"]),
                 "--p-guard-4k-baseline",  str(QWEN36_BASE["4k"]),
+                "--p-guard-16k-baseline", str(QWEN36_BASE["16k"]),
+                "--p-guard-32k-baseline", str(QWEN36_BASE["32k"]),
                 "--p-llama-128-baseline", str(QWEN36_BASE["llama128"]),
                 "--p-llama-512-baseline", str(QWEN36_BASE["llama512"]),
                 "--p-llama-4k-baseline",  str(QWEN36_BASE["llama4k"])]
