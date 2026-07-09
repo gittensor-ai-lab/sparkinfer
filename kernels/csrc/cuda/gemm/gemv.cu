@@ -1073,7 +1073,7 @@ void launch_mmvq_q4k_qkv_fused(const void* q81, const void* Wq, const void* Wk, 
     if (!attn_pack2_enabled() || K != 2048) {
         launch_mmvq_q4k(q81, Wq, yq, Nq, K, stream);
         launch_mmvq_q4k(q81, Wk, yk, Nk, K, stream);
-        launch_mmvq_q4k(q81, Wv, yv, Nv, K, stream);
+        if (Nv > 0) launch_mmvq_q4k(q81, Wv, yv, Nv, K, stream);
         return;
     }
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);

@@ -416,8 +416,24 @@ int Qwen35Model::forward_token(int token_id, int position) {
             const bool any_q80 = (w.wqkv_type == 8 || w.wqkv_gate_type == 8 ||
                                   w.ssm_alpha_type == 8 || w.ssm_beta_type == 8);
             prepare_xn_quant(any_q4k, any_q6k, any_q80);
-            const bool gdn_pipelined = s.gguf && s.use_gdn_pipe;
-            if (gdn_pipelined) {
+            const bool gdn_q4k_fuse = s.gguf && s.use_pq && s.use_llama && s.use_qkv_fuse && H == 2048
+                                   && w.wqkv_type == 12 && w.wqkv_gate_type == 12;
+            const bool gdn_pipelined = s.gguf && s.use_gdn_pipe && !gdn_q4k_fuse;
+            if (gdn_q4k_fuse) {
+                if (s.use_gdn_pipe) {
+                    cudaEventRecord(s.ev_pipe_fork, st);
+                    cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
+                    proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, s.stream_v);
+                    proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, s.stream_v);
+                    cudaEventRecord(s.ev_gdn_ab, s.stream_v);
+                } else {
+                    proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, st);
+                    proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, st);
+                }
+                kernels::launch_mmvq_q4k_qkv_fused(s.aq81, w.wqkv, w.wqkv_gate, nullptr,
+                                                     s.lin_qkv, s.lin_z, nullptr,
+                                                     s.linear_qkvdim, s.linear_vdim, 0, H, st);
+            } else if (gdn_pipelined) {
                 cudaEventRecord(s.ev_pipe_fork, st);
                 cudaStreamWaitEvent(s.stream_k, s.ev_pipe_fork, 0);
                 cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
@@ -441,7 +457,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                                  c.linear_q_heads, c.linear_v_heads,
                                                  c.linear_head_dim, c.linear_conv_kernel,
                                                  c.rms_eps, st);
-            if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_ab, 0);
+            if (gdn_pipelined || (gdn_q4k_fuse && s.use_gdn_pipe))
+                cudaStreamWaitEvent(st, s.ev_gdn_ab, 0);
             float* layer_state = s.lin_state +
                 (size_t)L * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
             kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
