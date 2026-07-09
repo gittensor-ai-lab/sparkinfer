@@ -353,12 +353,16 @@ __global__ void __launch_bounds__(GQA * 32, 5) fa_split_gqa_mma_i8_kernel(
     float* s_l  = s_m + 16;                                           // [16]
 
     // Quantize Q per q-head row (warp w owns rows 2w, 2w+1; rows >= GQA are zero pad).
+    // EPT spans the whole head vector: 4 elems/lane at hd128, 8 at hd256. Hardcoding 4 left
+    // s_qi dims 128..255 uninitialized at hd256 (and computed amax over half the row), so the
+    // QK mma k-tiles 8..15 multiplied against stale shared memory.
+    constexpr int EPT = HEAD_DIM / 32;
     #pragma unroll
     for (int rr = 0; rr < 2; rr++) {
         const int r = warp * 2 + rr;
-        float qv[4], amax = 0.f;
+        float qv[EPT], amax = 0.f;
         #pragma unroll
-        for (int e = 0; e < 4; e++) {
+        for (int e = 0; e < EPT; e++) {
             qv[e] = (r < GQA) ? __bfloat162float(q[(size_t)(seq * num_q_heads + kvh * GQA + r) * HEAD_DIM + lane + e * 32]) : 0.f;
             amax = fmaxf(amax, fabsf(qv[e]));
         }
@@ -367,7 +371,7 @@ __global__ void __launch_bounds__(GQA * 32, 5) fa_split_gqa_mma_i8_kernel(
         const float d = amax / 127.0f;
         if (lane == 0) s_qs[r] = d;
         #pragma unroll
-        for (int e = 0; e < 4; e++)
+        for (int e = 0; e < EPT; e++)
             s_qi[r * HEAD_DIM + lane + e * 32] = (signed char)((amax == 0.f) ? 0 : (int)roundf(qv[e] / d));
     }
     for (int i = tid; i < GQA * HEAD_DIM; i += blockDim.x) s_o[i] = 0.f;
@@ -403,7 +407,13 @@ __global__ void __launch_bounds__(GQA * 32, 5) fa_split_gqa_mma_i8_kernel(
                 load_matrix_sync(bf, kb + ks * 16, KVLD);
                 mma_sync(cf, af, bf, cf);
             }
-            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, HEAD_DIM, mem_row_major);
+            // ldm = 128: the QK result is a [16 q-rows x up-to-128 tokens] score tile, so its row
+            // stride is the group token width (128), not HEAD_DIM — the two only coincide at
+            // hd128. With HEAD_DIM as ldm, the hd256 instantiation stored rows 256 apart while
+            // the softmax below reads them 128 apart: rows interleave with garbage, and every
+            // decoded token past the mma-engagement depth is wrong (verified: 100% argmax
+            // divergence vs the exact tile path at >16k on Qwen3.6).
+            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, 128, mem_row_major);
         }
         __syncthreads();
         // Read the raw int32 QK scores directly and apply the per-row/per-token scales inline in the
@@ -453,26 +463,32 @@ __global__ void __launch_bounds__(GQA * 32, 5) fa_split_gqa_mma_i8_kernel(
         }
         __syncthreads();
 
-        // PV int8 mma -> int32; O += int32 * p_scale[m].
-        {
+        // PV int8 mma -> int32; O += int32 * p_scale[m]. The 8 warps cover a 128-wide dim slab
+        // per pass (warp*16 each), so hd128 takes one pass and hd256 two (dh = 0, 128). The
+        // hd256 instantiation previously ran a single pass with HEAD_DIM strides: it computed
+        // only dims 0..127 of O (128..255 stayed at their zero init) and read P' rows at the
+        // wrong stride — both fixed here; ldm for the P' fragment and the int32 store is 128
+        // (the token/slab width), which coincided with HEAD_DIM only at hd128.
+        for (int dh = 0; dh < HEAD_DIM; dh += 128) {
+            fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
+            fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
             fragment<accumulator, 16, 16, 16, int> cf;
             fill_fragment(cf, 0);
             for (int ks = 0; ks < gblk; ks++) {
                 const int pb = block_table[seq * max_blocks + first_blk + g0 + ks];
-                const signed char* vb = v_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM + warp * 16;
-                fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
-                fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
-                load_matrix_sync(af, s_pi + ks * 16, HEAD_DIM);
+                const signed char* vb = v_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM + dh + warp * 16;
+                load_matrix_sync(af, s_pi + ks * 16, 128);
                 load_matrix_sync(bf, vb, KVLD);
                 mma_sync(cf, af, bf, cf);
             }
-            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, HEAD_DIM, mem_row_major);
+            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, 128, mem_row_major);
+            __syncthreads();
+            // Only the GQA real q-head rows are kept (rows GQA..15 are wmma M-padding, never
+            // written to the partials) — accumulate this 128-wide slab into s_o at its dh offset.
+            for (int i = tid; i < GQA * 128; i += blockDim.x)
+                s_o[(i >> 7) * HEAD_DIM + dh + (i & 127)] += (float)reinterpret_cast<int*>(s_s)[i] * s_ps[i >> 7];
+            __syncthreads();
         }
-        __syncthreads();
-        // Only the GQA real q-head rows are kept (rows GQA..15 are wmma M-padding, never written to
-        // the partials) — accumulate just those, halving this thread-parallel epilogue at GQA=8.
-        for (int i = tid; i < GQA * 128; i += blockDim.x) s_o[i] += (float)reinterpret_cast<int*>(s_s)[i] * s_ps[i >> 7];
-        __syncthreads();
     }
 
     for (int r = 0; r < GQA; r++) {
