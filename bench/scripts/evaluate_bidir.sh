@@ -120,12 +120,26 @@ Q36_FULL_ENVS=(
 
 # Auto-measure same-box main baselines when unset.
 resolve_runner "$ARCH"
+pin_clocks
+trap 'unpin_clocks' EXIT
+
+_bench_decode_tps() {  # $1=gguf $2=ctx — never abort the sweep on a single failed run
+  local out rc=0
+  out="$(si_run qwen3_gguf_bench "$1" 128 "$2" 2>&1)" || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo ">> WARN: bench failed (ctx=$2 rc=$rc): ${out##*$'\n'}" >&2
+    echo 0
+    return 0
+  fi
+  echo "$out" | sed -n 's/.*decode tg *: *\([0-9.][0-9.]*\).*/\1/p' | tail -1
+}
+
 if [ "${SPARKINFER_P36_GUARD_128_BASELINE:-0}" = "0" ]; then
   echo ">> measuring Qwen3.6 same-box main (5 contexts) ..." >&2
   P36_GGUF="${P36_DIR}/${P36_FILE}"
   for ctx in 0 512 4096 16384 32768; do
-    t="$(si_run qwen3_gguf_bench "$P36_GGUF" 128 "$ctx" 2>/dev/null | \
-         sed -n 's/.*decode tg *: *\([0-9.][0-9.]*\).*/\1/p' | tail -1)"
+    t="$(_bench_decode_tps "$P36_GGUF" "$ctx")"
+    t="${t:-0}"
     case "$ctx" in
       0)     B36_128="${t:-0}" ;;
       512)   B36_512="${t:-0}" ;;
@@ -141,8 +155,8 @@ if [ "${SPARKINFER_P35_GUARD_128_BASELINE:-0}" = "0" ]; then
   echo ">> measuring Qwen3.5 same-box main (128/512/4k) ..." >&2
   P35_GGUF="${P35_DIR}/${P35_FILE}"
   for ctx in 0 512 4096; do
-    t="$(si_run qwen3_gguf_bench "$P35_GGUF" 128 "$ctx" 2>/dev/null | \
-         sed -n 's/.*decode tg *: *\([0-9.][0-9.]*\).*/\1/p' | tail -1)"
+    t="$(_bench_decode_tps "$P35_GGUF" "$ctx")"
+    t="${t:-0}"
     case "$ctx" in
       0)    B35_128="${t:-0}" ;;
       512)  B35_512="${t:-0}" ;;
