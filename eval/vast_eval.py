@@ -268,6 +268,8 @@ def main():
                     help="generate a Polaris verifiable receipt (default: on)")
     ap.add_argument("--no-polaris", action="store_true",
                     help="disable Polaris TDX receipts (overrides POLARIS=1)")
+    ap.add_argument("--baseline-only", action="store_true",
+                    help="bidir: measure same-box ctx speeds only (bot baseline; skip full dual eval)")
     args = ap.parse_args()
     if args.triple or args.dual:
         args.bidir = True
@@ -588,50 +590,69 @@ def main():
         # Difficulty compensation ON (Option B): as the frontier pulls past llama.cpp each further %
         # gain is harder, so label.py scales the label tier up (raw % + significance gate unchanged).
         # Governance-tunable via SPARKINFER_DIFFICULTY_{K,REF,MAX}; applies from new evals onward.
+        baseline_flag = " --baseline-only" if args.baseline_only else ""
         if args.bidir:
-            ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
-                  f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} "
-                  f"SPARKINFER_EVAL_MODE={args.eval_mode} PRIMARY_QUANT={args.primary_quant} "
-                  f"SPARKINFER_P35_GUARD_128_BASELINE={args.p35_guard_128_baseline} "
-                  f"SPARKINFER_P35_GUARD_512_BASELINE={args.p35_guard_512_baseline} "
-                  f"SPARKINFER_P35_GUARD_4K_BASELINE={args.p35_guard_4k_baseline} "
-                  f"SPARKINFER_P36_GUARD_128_BASELINE={args.p_guard_128_baseline} "
-                  f"SPARKINFER_P36_GUARD_512_BASELINE={args.p_guard_512_baseline} "
-                  f"SPARKINFER_P36_GUARD_4K_BASELINE={args.p_guard_4k_baseline} "
-                  f"SPARKINFER_P36_GUARD_16K_BASELINE={args.p_guard_16k_baseline} "
-                  f"SPARKINFER_P36_GUARD_32K_BASELINE={args.p_guard_32k_baseline} "
-                  f"SPARKINFER_G36_GUARD_128_BASELINE={args.g36_guard_128_baseline} "
-                  f"SPARKINFER_G36_GUARD_512_BASELINE={args.g36_guard_512_baseline} "
-                  f"SPARKINFER_G36_GUARD_4K_BASELINE={args.g36_guard_4k_baseline} "
-                  f"SPARKINFER_G36_GUARD_16K_BASELINE={args.g36_guard_16k_baseline} "
-                  f"SPARKINFER_G36_GUARD_32K_BASELINE={args.g36_guard_32k_baseline} "
-                  f"SPARKINFER_G35_GUARD_128_BASELINE={args.g35_guard_128_baseline} "
-                  f"SPARKINFER_G35_GUARD_512_BASELINE={args.g35_guard_512_baseline} "
-                  f"SPARKINFER_G35_GUARD_4K_BASELINE={args.g35_guard_4k_baseline} "
-                  f"SPARKINFER_P35_LLAMA_128_BASELINE={args.p_llama_128_baseline} "
-                  f"SPARKINFER_P35_LLAMA_512_BASELINE={args.p_llama_512_baseline} "
-                  f"SPARKINFER_P35_LLAMA_4K_BASELINE={args.p_llama_4k_baseline} "
-                  f"SPARKINFER_P36_LLAMA_128_BASELINE={args.p_llama_128_baseline} "
-                  f"SPARKINFER_P36_LLAMA_512_BASELINE={args.p_llama_512_baseline} "
-                  f"SPARKINFER_P36_LLAMA_4K_BASELINE={args.p_llama_4k_baseline} "
-                  f"SPARKINFER_P36_LLAMA_16K_BASELINE={args.p_llama_16k_baseline} "
-                  f"SPARKINFER_P36_LLAMA_32K_BASELINE={args.p_llama_32k_baseline} "
-                  f"MODELS_DIR=/workspace/models36 QWYTHOS_MODELS_DIR=/workspace/models35 "
-                  f"PRIMARY36_MODELS_DIR=/workspace/models36 "
-                  f"LLAMACPP_DIR={LLAMACPP_DIR} "
-                  f"bench/scripts/evaluate_bidir.sh --ref {args.ref} "
-                  f"--ceiling {args.ceiling}")
+            eval_cmd = (f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} "
+                        f"SPARKINFER_EVAL_MODE={args.eval_mode} PRIMARY_QUANT={args.primary_quant} "
+                        f"SPARKINFER_P35_GUARD_128_BASELINE={args.p35_guard_128_baseline} "
+                        f"SPARKINFER_P35_GUARD_512_BASELINE={args.p35_guard_512_baseline} "
+                        f"SPARKINFER_P35_GUARD_4K_BASELINE={args.p35_guard_4k_baseline} "
+                        f"SPARKINFER_P36_GUARD_128_BASELINE={args.p_guard_128_baseline} "
+                        f"SPARKINFER_P36_GUARD_512_BASELINE={args.p_guard_512_baseline} "
+                        f"SPARKINFER_P36_GUARD_4K_BASELINE={args.p_guard_4k_baseline} "
+                        f"SPARKINFER_P36_GUARD_16K_BASELINE={args.p_guard_16k_baseline} "
+                        f"SPARKINFER_P36_GUARD_32K_BASELINE={args.p_guard_32k_baseline} "
+                        f"SPARKINFER_G36_GUARD_128_BASELINE={args.g36_guard_128_baseline} "
+                        f"SPARKINFER_G36_GUARD_512_BASELINE={args.g36_guard_512_baseline} "
+                        f"SPARKINFER_G36_GUARD_4K_BASELINE={args.g36_guard_4k_baseline} "
+                        f"SPARKINFER_G36_GUARD_16K_BASELINE={args.g36_guard_16k_baseline} "
+                        f"SPARKINFER_G36_GUARD_32K_BASELINE={args.g36_guard_32k_baseline} "
+                        f"SPARKINFER_G35_GUARD_128_BASELINE={args.g35_guard_128_baseline} "
+                        f"SPARKINFER_G35_GUARD_512_BASELINE={args.g35_guard_512_baseline} "
+                        f"SPARKINFER_G35_GUARD_4K_BASELINE={args.g35_guard_4k_baseline} "
+                        f"SPARKINFER_P35_LLAMA_128_BASELINE={args.p_llama_128_baseline} "
+                        f"SPARKINFER_P35_LLAMA_512_BASELINE={args.p_llama_512_baseline} "
+                        f"SPARKINFER_P35_LLAMA_4K_BASELINE={args.p_llama_4k_baseline} "
+                        f"SPARKINFER_P36_LLAMA_128_BASELINE={args.p_llama_128_baseline} "
+                        f"SPARKINFER_P36_LLAMA_512_BASELINE={args.p_llama_512_baseline} "
+                        f"SPARKINFER_P36_LLAMA_4K_BASELINE={args.p_llama_4k_baseline} "
+                        f"SPARKINFER_P36_LLAMA_16K_BASELINE={args.p_llama_16k_baseline} "
+                        f"SPARKINFER_P36_LLAMA_32K_BASELINE={args.p_llama_32k_baseline} "
+                        f"MODELS_DIR=/workspace/models36 QWYTHOS_MODELS_DIR=/workspace/models35 "
+                        f"PRIMARY36_MODELS_DIR=/workspace/models36 "
+                        f"LLAMACPP_DIR={LLAMACPP_DIR} "
+                        f"bench/scripts/evaluate_bidir.sh --ref {args.ref} "
+                        f"--ceiling {args.ceiling}{baseline_flag}")
+            p36_gguf = "/workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            qmap = {"Q4_K_M": "Qwythos-9B-Claude-Mythos-5-1M-Q4_K_M.gguf",
+                    "Q8_0": "Qwythos-9B-Claude-Mythos-5-1M-Q8_0.gguf",
+                    "BF16": "Qwythos-9B-Claude-Mythos-5-1M-BF16.gguf"}
+            p35_gguf = f"/workspace/models35/{qmap[args.primary_quant]}"
         else:
-            ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
-                  f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} SPARKINFER_DIFFICULTY_BOOST=1 "
-                  f"SPARKINFER_EVAL_MODE={args.eval_mode} "
-                  f"SPARKINFER_GUARD_128_BASELINE={args.guard_128_baseline or args.guard_2k_baseline} "
-                  f"SPARKINFER_GUARD_512_BASELINE={args.guard_512_baseline} "
-                  f"SPARKINFER_GUARD_4K_BASELINE={args.guard_4k_baseline} "
-                  f"SPARKINFER_GUARD_16K_BASELINE={args.guard_16k_baseline} "
-                  f"SPARKINFER_GUARD_32K_BASELINE={args.guard_32k_baseline} "
-                  f"MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
-                  f"bench/scripts/evaluate.sh --ref {args.ref} --frontier {args.frontier} --ceiling {args.ceiling}")
+            eval_cmd = (f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} SPARKINFER_DIFFICULTY_BOOST=1 "
+                        f"SPARKINFER_EVAL_MODE={args.eval_mode} "
+                        f"SPARKINFER_GUARD_128_BASELINE={args.guard_128_baseline or args.guard_2k_baseline} "
+                        f"SPARKINFER_GUARD_512_BASELINE={args.guard_512_baseline} "
+                        f"SPARKINFER_GUARD_4K_BASELINE={args.guard_4k_baseline} "
+                        f"SPARKINFER_GUARD_16K_BASELINE={args.guard_16k_baseline} "
+                        f"SPARKINFER_GUARD_32K_BASELINE={args.guard_32k_baseline} "
+                        f"MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
+                        f"bench/scripts/evaluate.sh --ref {args.ref} --frontier {args.frontier} --ceiling {args.ceiling}")
+            p36_gguf = f"{MODEL_PATH}"
+            p35_gguf = ""
+        harness = ("cd /root/sparkinfer && git fetch -q origin main && "
+                   "git checkout -q origin/main -- bench/scripts && ")
+        if args.polaris and not args.baseline_only:
+            guard_arg = f" --guard-model-file {p35_gguf}" if p35_gguf else ""
+            ev = (f"{harness}({eval_cmd}) > /tmp/spark_eval.log 2>&1; "
+                  f"cat /tmp/spark_eval.log; "
+                  f"python3 eval/polaris/judge.py --from-stdin "
+                  f"--model-file {p36_gguf}{guard_arg} "
+                  f"--build-dir /root/sparkinfer/build/runtime "
+                  f"--sparkinfer-root /root/sparkinfer "
+                  f"< /tmp/spark_eval.log")
+        else:
+            ev = harness + eval_cmd
         got_result = False
         if bare_metal:
             ev = BOX_CUDA_ENV + ev

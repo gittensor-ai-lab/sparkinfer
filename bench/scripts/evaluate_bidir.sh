@@ -19,9 +19,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/_common.sh"
 source "$HERE/_qwythos.sh"
 
-REF=""; CEILING=0
+REF=""; CEILING=0; BASELINE_ONLY=0
 while [ $# -gt 0 ]; do case "$1" in
-  --ref) shift; REF="$1" ;; --ceiling) shift; CEILING="$1" ;; *) ;;
+  --ref) shift; REF="$1" ;; --ceiling) shift; CEILING="$1" ;;
+  --baseline-only) BASELINE_ONLY=1 ;;
+  *) ;;
 esac; shift; done
 
 export LLAMACPP_DIR="${LLAMACPP_DIR:-/workspace/.llamacpp}"
@@ -31,14 +33,6 @@ if [ -n "$REF" ] && [ -z "${SI_NO_CHECKOUT:-}" ]; then
   git -C "$ROOT" fetch -q origin "$REF" 2>/dev/null || true; git -C "$ROOT" checkout -q "$REF"
 fi
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
-
-echo ">> [build] submission ($COMMIT) from source (sm_$ARCH) — shared by both models ..." >&2
-rm -rf "$ROOT/build"
-if ! NO_PREBUILT=1 ensure_sparkinfer "$ARCH"; then
-  echo ">> build FAILED — submission does not compile (sm_$ARCH)" >&2
-  printf 'RESULT_JSON {"commit": "%s", "tps": 0, "top1": 0, "kl": 99, "frontier_tps": 0, "label": "REJECT", "reason": "build failed (does not compile)", "pass": false, "mode": "bidir"}\n' "$COMMIT"
-  exit 0
-fi
 
 P35_FILE="$(qwythos_quant_file)"
 P35_REPO="${QWYTHOS_REPO}"
@@ -53,6 +47,18 @@ P36_DIR="${PRIMARY36_MODELS_DIR:-${MODELS_DIR:-$ROOT/models}36}"
 
 QUANT="${PRIMARY_QUANT:-Q4_K_M}"
 echo ">> bidir: Qwen3.5=$P35_FILE (quant=$QUANT, ctx=128/512/4k) + Qwen3.6=$P36_FILE (ctx=128/512/4k/16k/32k)" >&2
+
+if [ "$BASELINE_ONLY" = 1 ]; then
+  echo ">> bidir baseline-only: ctx speed sweep on origin/main (skip PR build + dual eval)" >&2
+else
+  echo ">> [build] submission ($COMMIT) from source (sm_$ARCH) — shared by both models ..." >&2
+  rm -rf "$ROOT/build"
+  if ! NO_PREBUILT=1 ensure_sparkinfer "$ARCH"; then
+    echo ">> build FAILED — submission does not compile (sm_$ARCH)" >&2
+    printf 'RESULT_JSON {"commit": "%s", "tps": 0, "top1": 0, "kl": 99, "frontier_tps": 0, "label": "REJECT", "reason": "build failed (does not compile)", "pass": false, "mode": "bidir"}\n' "$COMMIT"
+    exit 0
+  fi
+fi
 
 reap() { pkill -f llama-server 2>/dev/null || true; pkill -f qwen3_gguf 2>/dev/null || true; sleep 1; true; }
 
@@ -148,6 +154,35 @@ G35_512="${SPARKINFER_G35_GUARD_512_BASELINE:-$B35_512}"
 G35_4K="${SPARKINFER_G35_GUARD_4K_BASELINE:-$B35_4K}"
 
 P_DIFF_REF="${SPARKINFER_DIFFICULTY_REF_OVERRIDE:-365.85}"
+
+# Bot same-box baseline: one build + ctx speed sweep only (skip 4× evaluate.sh + accuracy).
+if [ "$BASELINE_ONLY" = 1 ]; then
+  echo ">> bidir baseline-only: ctx sweep complete — skipping full dual-model eval" >&2
+  B36_128="${B36_128:-0}"; B36_512="${B36_512:-0}"; B36_4K="${B36_4K:-0}"
+  B36_16K="${B36_16K:-0}"; B36_32K="${B36_32K:-0}"
+  B35_128="${B35_128:-0}"; B35_512="${B35_512:-0}"; B35_4K="${B35_4K:-0}"
+  QUANT="${PRIMARY_QUANT:-Q4_K_M}"
+  python3 - <<PY
+import json
+commit = "$COMMIT"
+quant = "$QUANT"
+def stub(tps, ctx128, ctx512, ctx4k, ctx16k=0, ctx32k=0):
+    return {"pass": True, "label": "BASELINE", "tps": float(tps or ctx128 or 0),
+            "top1": 1.0, "kl": 0.0, "ctx_128_tps": float(ctx128 or 0),
+            "ctx_512_tps": float(ctx512 or 0), "ctx_4096_tps": float(ctx4k or 0),
+            "ctx_16384_tps": float(ctx16k or 0), "ctx_32768_tps": float(ctx32k or 0),
+            "guard_128_pass": True, "guard_512_pass": True, "guard_4k_pass": True,
+            "guard_16k_pass": True, "guard_32k_pass": True}
+s35 = stub("$B35_128", "$B35_128", "$B35_512", "$B35_4K")
+s36 = stub("$B36_128", "$B36_128", "$B36_512", "$B36_4K", "$B36_16K", "$B36_32K")
+out = {"pass": True, "label": "BASELINE", "commit": commit, "mode": "bidir", "model": "bidir",
+       "tps": s36["tps"], "top1": 1.0, "kl": 0.0, "primary_quant": quant,
+       "score_qwen35": s35, "score_qwen36": s36, "pass_qwen35": True, "pass_qwen36": True,
+       "label_qwen35": "BASELINE", "label_qwen36": "BASELINE"}
+print("RESULT_JSON " + json.dumps(out))
+PY
+  exit 0
+fi
 
 # --- Direction A: optimize Qwen3.5, guard Qwen3.6 -----------------------------------------------
 PRIMARY35_JSON="$(run_model primary-qwen35 "$P35_FILE" "$P35_REPO" "$P35_TOK" 0 \
