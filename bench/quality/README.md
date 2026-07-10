@@ -46,7 +46,11 @@ python3 run_quality.py --backend sparkinfer \
     --bin ./build/qwen3_gguf_generate \
     --tokenizer /workspace/models/tokenizer.json
 
-# 3. score the llama.cpp reference the same way:
+# 3. score the llama.cpp reference (start llama-server first, then):
+python3 run_quality.py --backend llama-server --llama-url http://localhost:8082 \
+    --model /workspace/models/Qwen3-30B-A3B-Q4_K_M.gguf
+
+# or one-shot llama-cli (reloads model each item — slow for benchmark tier):
 python3 run_quality.py --backend llama \
     --model /workspace/models/Qwen3-30B-A3B-Q4_K_M.gguf \
     --llama-cli /workspace/.llamacpp/build/bin/llama-cli
@@ -69,7 +73,11 @@ diff the per-benchmark percentages. Equal scores mean the optimization is qualit
 | `--tier development` | fast pre-merge capability check | 78 |
 | `--tier benchmark` | heavier release/frontier quality check | 196 |
 
-Current `benchmark` tier comparison on RTX 5090, Qwen3-30B-A3B, greedy decode:
+Current `benchmark` tier comparison on RTX 5090, greedy decode (`bench/quality/run_quality.py --tier benchmark`):
+
+### Qwen3-30B-A3B (Q4_K_M GGUF)
+
+Model: `Qwen/Qwen3-30B-A3B-GGUF` · `Qwen3-30B-A3B-Q4_K_M.gguf`
 
 | Backend | BFCL | GSM8K | HumanEval | IFEval | MMLU-Pro | Overall |
 |---|---:|---:|---:|---:|---:|---:|
@@ -77,8 +85,20 @@ Current `benchmark` tier comparison on RTX 5090, Qwen3-30B-A3B, greedy decode:
 | llama.cpp GGUF | 72.00% | 90.91% | 80.00% | 64.58% | 48.00% | 65.90% |
 | vLLM AWQ | 76.00% | 84.85% | 80.00% | 77.08% | 48.00% | 66.92% |
 
-The vLLM row uses HF AWQ weights because vLLM does not load GGUF. The sparkinfer and llama.cpp
-rows use the same GGUF.
+vLLM uses `cognitivecomputations/Qwen3-30B-A3B-AWQ` (HF AWQ, not GGUF).
+
+### Qwen3.6-35B-A3B (UD-Q4_K_M GGUF)
+
+Model: `unsloth/Qwen3.6-35B-A3B-GGUF` · `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`  
+Orchestrator: `bench/quality/run_qwen36_benchmark.sh` (sparkinfer first on exclusive GPU, then llama-server).
+
+| Backend | BFCL | GSM8K | HumanEval | IFEval | MMLU-Pro | Overall |
+|---|---:|---:|---:|---:|---:|---:|
+| sparkinfer GGUF | 74.67% | 63.64% | 60.00% | 83.33% | 64.00% | 68.72% |
+| llama.cpp GGUF | 74.67% | 57.58% | 60.00% | 87.50% | 62.67% | 67.30% |
+
+Measured 2026-07-10 on RTX 5090 (`/tmp/qwen36_quality_rerun/`). sparkinfer and llama.cpp rows
+use the same GGUF. Do **not** run both engines resident on GPU simultaneously on 32 GB cards.
 
 ## Data - real ~10% dev samples
 

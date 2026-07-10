@@ -34,7 +34,9 @@ Runtime footprint, excluding model weights and Python launcher scripts:
 | SGLang | runtime + native kernel packages | 1.9 GB | 743x smaller |
 | TensorRT-LLM | runtime package | 3.6 GB | 1,430x smaller |
 
-LLM quality check, 25% benchmark tier, 196 items:
+LLM quality check (`bench/quality`), 25% benchmark tier, 196 items, RTX 5090, greedy decode:
+
+**Qwen3-30B-A3B** (`Qwen3-30B-A3B-Q4_K_M.gguf`):
 
 | runtime | BFCL | GSM8K | HumanEval | IFEval | MMLU-Pro | overall |
 |---|---:|---:|---:|---:|---:|---:|
@@ -42,9 +44,17 @@ LLM quality check, 25% benchmark tier, 196 items:
 | llama.cpp GGUF | 72.00% | 90.91% | 80.00% | 64.58% | 48.00% | 65.90% |
 | vLLM AWQ | 76.00% | 84.85% | 80.00% | 77.08% | 48.00% | 66.92% |
 
-sparkinfer and llama.cpp use the same GGUF on the same RTX 5090. Other runtimes cannot load
-GGUF, so the table uses their fastest successful HF quantized path: vLLM/SGLang GPTQ Int4,
-TensorRT-LLM NVFP4. Details: [`bench/competitors/latest-results.md`](bench/competitors/latest-results.md).
+**Qwen3.6-35B-A3B** (`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`):
+
+| runtime | BFCL | GSM8K | HumanEval | IFEval | MMLU-Pro | overall |
+|---|---:|---:|---:|---:|---:|---:|
+| sparkinfer GGUF | 74.67% | 63.64% | 60.00% | 83.33% | 64.00% | 68.72% |
+| llama.cpp GGUF | 74.67% | 57.58% | 60.00% | 87.50% | 62.67% | 67.30% |
+
+For each model, sparkinfer and llama.cpp use the **same GGUF** on the same RTX 5090. Other
+runtimes cannot load GGUF, so the Qwen3-30B table includes vLLM AWQ (fastest successful HF
+quant path). Details: [`bench/quality/README.md`](bench/quality/README.md) and
+[`bench/competitors/latest-results.md`](bench/competitors/latest-results.md).
 
 ## How we move fast on SN74
 
