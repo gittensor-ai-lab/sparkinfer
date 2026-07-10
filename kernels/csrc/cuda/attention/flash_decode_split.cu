@@ -281,6 +281,9 @@ __global__ void fa_combine_kernel(
 #ifndef FA_GQA_TILE
 #define FA_GQA_TILE 14      // bf16 smem + uint4 ldg sweet spot at n_splits=128
 #endif
+#ifndef FA_GQA4_TILE
+#define FA_GQA4_TILE 8     // Qwythos hd256 GQA-4 (16Q/4KV); independently sweepable
+#endif
 template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const void*, const void*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*, int);
 template __global__ void fa_split_gqa_kernel<128, 8, FA_GQA_TILE, false>(const __nv_bfloat16*, const void*, const void*,
@@ -296,6 +299,11 @@ template __global__ void fa_split_kernel<256>(const __nv_bfloat16*, const void*,
 template __global__ void fa_split_gqa_kernel<256, 8, FA_GQA_TILE, false>(const __nv_bfloat16*, const void*, const void*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
 template __global__ void fa_split_gqa_kernel<256, 8, FA_GQA_TILE, true>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+// Qwythos-9B full-attn: 16Q/4KV GQA-4 (hd256).
+template __global__ void fa_split_gqa_kernel<256, 4, FA_GQA4_TILE, false>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+template __global__ void fa_split_gqa_kernel<256, 4, FA_GQA4_TILE, true>(const __nv_bfloat16*, const void*, const void*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
 template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 
@@ -522,6 +530,29 @@ void launch_flash_decode_split(
         if (famma256 < 0) { const char* e = getenv("SPARKINFER_FAMMA"); famma256 = (e && e[0] == '0') ? 0 : 1; }
         const int mma_chunk256 = (n_splits > 0) ? (seqlen + n_splits - 1) / n_splits : 0;
         const bool mma_ok256 = famma256 && seqlen > 512 && block_size == 16 && mma_chunk256 >= 32;
+        static int fagqa4 = -1;
+        if (fagqa4 < 0) { const char* e = getenv("SPARKINFER_FAGQA4"); fagqa4 = (e && e[0] == '0') ? 0 : 1; }
+        if (fagqa4 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 4) {
+            // Qwythos-9B: 16Q/4KV full-attn was falling to scalar fa_split_kernel<256> (no KV sharing).
+            constexpr int GQA = 4, TILE = FA_GQA4_TILE;
+            dim3 gq(num_kv_heads * n_splits, num_seqs);
+            const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
+            if (int8_kv)
+                fa_split_gqa_kernel<256, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+            else
+                fa_split_gqa_kernel<256, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+            fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW><<<g2, FA_COMBINE_NW * 32, 0, stream>>>(
+                part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
+                reinterpret_cast<fa_block_q8_1*>(out_q8));
+            (void)seqlen;
+            return;
+        }
         if (num_kv_heads > 0 && num_q_heads == num_kv_heads * 8) {
             constexpr int GQA = 8, TILE = FA_GQA_TILE;
             dim3 gq(num_kv_heads * n_splits, num_seqs);
