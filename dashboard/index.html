@@ -430,12 +430,14 @@
 
   const lc = Object.fromEntries(D.labels.map(x=>[x.l,x.c]));
   const proofRun = p => p.proof_run || ((p.proof_url||"").match(/[?&]run=([^&]+)/)||[])[1] || "log";
+  const proofIcon = p => p.polaris_receipt_url ? "🛡️" : "📋";
+  const proofTitle = p => p.polaris_receipt_url ? "Polaris TDX attested eval log" : "verifiable eval log";
   $("prs").innerHTML = D.prs.length ? D.prs.map(p=>`
     <tr><td><a href="${p.url||'#'}">#${p.num}</a> ${p.title||''}</td>
     <td>${(p.areas||[]).map(a=>`<span class="area">${a}</span>`).join("")||"—"}</td>
     <td><span class="tag" style="background:${lc[p.label]||'#888'}">${p.label}</span></td>
     <td>${p.tps??"—"}</td><td>${p.delta_pct!=null?(p.delta_pct>0?"+":"")+p.delta_pct+"%":"—"}</td>
-    <td>${p.proof_url?`<a href="${p.proof_url}" target="_blank" title="verifiable eval log" class="mono">🔒 ${proofRun(p)}</a>${p.polaris_receipt_url?` <a href="${p.polaris_receipt_url}" target="_blank" title="Polaris TDX receipt" class="mono" style="color:var(--ok)">TDX</a>`:""}`:"—"}</td></tr>`).join("")
+    <td>${p.proof_url?`<a href="${p.proof_url}" target="_blank" title="${proofTitle(p)}" class="mono">${proofIcon(p)} ${proofRun(p)}</a>`:"—"}</td></tr>`).join("")
     : `<tr><td colspan="6" class="empty">No PRs evaluated yet — open one and the bot posts an <code>eval:&lt;label&gt;</code> within ~30 min.</td></tr>`;
 </script>
 </body>
