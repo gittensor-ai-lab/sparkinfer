@@ -182,7 +182,8 @@ window.SPARKINFER = {
       "guard_32k_baseline": 363.55,
       "guard_32k_ratio": 1.0003,
       "guard_32k_pass": true,
-      "proof_url": "https://github.com/gittensor-ai-lab/sparkinfer/blob/main/eval/logs/?run=0239-bffc3e7"
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0239-bffc3e7",
+      "proof_run": "0239-bffc3e7"
     },
     {
       "num": 282,
@@ -229,7 +230,8 @@ window.SPARKINFER = {
       "guard_32k_baseline": 351.42,
       "guard_32k_ratio": 1.0343,
       "guard_32k_pass": true,
-      "proof_url": "https://github.com/gittensor-ai-lab/sparkinfer/blob/main/eval/logs/?run=0282-1e75ffe"
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0282-1e75ffe",
+      "proof_run": "0282-1e75ffe"
     },
     {
       "num": 284,

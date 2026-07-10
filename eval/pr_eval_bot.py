@@ -449,7 +449,7 @@ def push_dash(msg):
 
 LOG_REPO  = os.environ.get("SPARKINFER_LOG_REPO", "https://github.com/gittensor-ai-lab/sparkinfer.git")
 LOG_DIR   = os.path.expanduser(os.environ.get("SPARKINFER_LOG_DIR", "~/.sparkinfer_log_checkout"))
-LOG_PAGE  = "https://github.com/gittensor-ai-lab/sparkinfer/blob/main/eval/logs/?run="
+LOG_PAGE  = "https://gittensor-ai-lab.github.io/sparkinfer-log/?run="
 
 def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
     """Commit this eval's raw log + result to the public sparkinfer-log repo (immutable record),
@@ -581,7 +581,11 @@ def update_dashboard(repo, pr, areas, res, proof_url=None):
               "guard_2k_baseline", "guard_2k_ratio", "guard_2k_pass"):
         if res.get(k) is not None:
             entry[k] = res.get(k)
-    if proof_url: entry["proof_url"] = proof_url
+    if proof_url:
+        entry["proof_url"] = proof_url
+        m = re.search(r"[?&]run=([^&]+)", proof_url)
+        if m:
+            entry["proof_run"] = m.group(1)
     data["prs"] = [p for p in data.get("prs", []) if p.get("num") != num]
     data["prs"].insert(0, entry)
     data["prs"] = data["prs"][:50]
