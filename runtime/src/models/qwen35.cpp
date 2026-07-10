@@ -110,6 +110,7 @@ struct Qwen35Model::Impl {
     cudaGraphExec_t cu_exec{};
     bool graph_ready = false;
     bool bench_feedback_graph = false;
+    int graph_attn_mode = -1;  // host-side flash-decode dispatch class captured in cu_graph
 
     // scratch (bf16)
     bf16 *x, *xn, *q, *k, *v, *attn, *ao, *h, *hn, *routed, *shared;
@@ -330,6 +331,28 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false;
             }
         }
+    }
+    // launch_flash_decode_split chooses its scalar-vs-MMA implementation on the host
+    // while the graph is captured. If int8 KV is enabled for a long-context run, a graph
+    // captured at a short seqlen would otherwise keep replaying the scalar int8 path after
+    // the sequence is large enough for the tensor-core path. Recapture at that mode change.
+    static int famma_graph = -1;
+    if (famma_graph < 0) {
+        const char* e = getenv("SPARKINFER_FAMMA");
+        famma_graph = (e && e[0] == '0') ? 0 : 1;
+    }
+    int attn_graph_mode = 0;
+    if (famma_graph && s.kv->int8_kv() && s.kv->block_size() == 16 &&
+        c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 8) {
+        const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
+        attn_graph_mode = (seqlen > 512 && mma_chunk >= 32) ? 2 : 1;
+    }
+    if (s.graph_ready && attn_graph_mode != s.graph_attn_mode) {
+        cu(cudaGraphExecDestroy(s.cu_exec), "graph recapture destroy exec");
+        cu(cudaGraphDestroy(s.cu_graph), "graph recapture destroy graph");
+        s.cu_exec = nullptr;
+        s.cu_graph = nullptr;
+        s.graph_ready = false;
     }
     if (c.hybrid && position == 0) {
         cu(cudaMemsetAsync(s.lin_state, 0,
@@ -785,6 +808,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
     cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
     cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
     s.graph_ready = true;
+    s.graph_attn_mode = attn_graph_mode;
     cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
 
     cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");

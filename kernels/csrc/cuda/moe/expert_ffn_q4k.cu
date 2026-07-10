@@ -989,6 +989,12 @@ static inline int down_mmvq_pdl() {
     return v;
 }
 
+static inline int dense_top1_down_splitk(int current, int top_k, const char* specific_env) {
+    if (top_k == 1 && !getenv("SPARKINFER_DOWN_SPLITK_S") && !getenv(specific_env))
+        return 8;
+    return current;
+}
+
 template <typename Kernel, typename... Args>
 static inline void launch_mmvq_down_kernel(
     int pdl, dim3 grid, dim3 block, cudaStream_t stream, Kernel kernel, Args... args
@@ -1158,9 +1164,10 @@ void launch_moe_expert_ffn_q4k(
         const int pdl = down_mmvq_pdl();
         quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
             h_scratch, hq8, nqb, pdl);
-        // split-K MMVQ down (default S=4): S warps/row -> S*H warps in flight, hiding
-        // the bs=1 occupancy stall the one-warp kernel hits. Falls back to one-warp if disabled.
-        const int S = down_splitk_s_q6();
+        // split-K MMVQ down: S warps/row -> S*H warps in flight, hiding the bs=1
+        // occupancy stall the one-warp kernel hits. Dense top-1 defaults to S=8 unless
+        // an explicit split-K env override is set; routed MoE keeps its existing default.
+        const int S = dense_top1_down_splitk(down_splitk_s_q6(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q6");
         if (S > 1) {
             const int RPB = WPB / S;
             dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
@@ -1187,7 +1194,7 @@ void launch_moe_expert_ffn_q4k(
         const int pdl = down_mmvq_pdl();
         quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
             h_scratch, hq8, nqb, pdl);
-        const int S = down_splitk_s_q4();
+        const int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
         if (S > 1) {
             const int RPB = WPB / S;
             dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
@@ -1216,7 +1223,7 @@ void launch_moe_expert_ffn_q4k(
         const int pdl = down_mmvq_pdl();
         quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
             h_scratch, hq8, nqb, pdl);
-        const int S = down_splitk_s_q5();
+        const int S = dense_top1_down_splitk(down_splitk_s_q5(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q5");
         if (S > 1) {
             const int RPB = WPB / S;
             dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
