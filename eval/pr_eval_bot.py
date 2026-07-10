@@ -98,7 +98,7 @@ def _bidir_baseline_args(q36, q35):
 
 
 def _apply_bidir_ctx_from_bres(bres, q36, q35):
-    """Fill QWEN36_BASE / QWYTHOS_BASE from bidir RESULT_JSON; return True if both models covered."""
+    """Fill QWEN36_BASE / QWYTHOS_BASE from bidir RESULT_JSON; return True if both models measured."""
     ctx_map = {
         "128": "ctx_128_tps", "512": "ctx_512_tps", "4k": "ctx_4096_tps",
         "16k": "ctx_16384_tps", "32k": "ctx_32768_tps",
@@ -107,20 +107,21 @@ def _apply_bidir_ctx_from_bres(bres, q36, q35):
     def _fill(score, store, keys):
         if not score:
             return False
-        ok = False
         for k in keys:
             v = float(score.get(ctx_map[k]) or 0)
-            if v > 0:
-                store[k] = v
-                ok = True
-        if "128" in keys and float(score.get("tps") or 0) > 0:
-            store["128"] = float(score["tps"])
-            ok = True
-        return ok
+            if v <= 0:
+                return False
+            store[k] = v
+        return True
 
     got36 = _fill(bres.get("score_qwen36"), q36, ("128", "512", "4k", "16k", "32k"))
     got35 = _fill(bres.get("score_qwen35"), q35, ("128", "512", "4k"))
     return got36 and got35
+
+
+def _bidir_baseline_sane(q36, q35):
+    """Reject dashboard stubs / failed sweeps (Qwen3.6 ~400+, Qwythos ~120+ on 5090)."""
+    return q36.get("128", 0) >= 200 and q35.get("128", 0) >= 80
 
 # Subsystem buckets for the deterministic area:<name> label (from a PR's top-level changed
 # dirs — no AI). Categorization/display only: SN74 scoring is speedup-only (the eval:* tier),
@@ -417,28 +418,56 @@ def render(res, oid):
                     f"({'pass' if res.get('pass_qwen35') else 'fail'}) |")
         rows.append(f"| Qwen3.6 score | `eval-qwen36:{res.get('label_qwen36', '?')}` "
                     f"({'pass' if res.get('pass_qwen36') else 'fail'}) |")
-    rows += [
-            f"| scored decode ({res.get('score_context', 128)} ctx{f' · {ctx_label}' if ctx_label else ''}{f' · {short}' if dual or triple or bidir else ''}) | {res.get('tps','?')} tok/s |",
-            f"| correctness{f' ({short} vs llama.cpp)' if dual or triple or bidir else ''} | top-1 {res.get('top1',0)*100:.1f}% · KL {res.get('kl','?')} |"]
-    # scored-model per-context no-regression gates — SKIP contexts not measured (tps 0/None) so a
-    # deliberately-skipped 16k/32k never renders a misleading "0.0 tok/s · pass".
-    for key, gkey, bkey, lbl in [("ctx_128_tps", "guard_128_pass", "guard_128_baseline", "128-token"),
-                                 ("ctx_512_tps", "guard_512_pass", "guard_512_baseline", "512-context"),
-                                 ("ctx_4096_tps", "guard_4k_pass", "guard_4k_baseline", "4k-context"),
-                                 ("ctx_16384_tps", "guard_16k_pass", "guard_16k_baseline", "16k-context"),
-                                 ("ctx_32768_tps", "guard_32k_pass", "guard_32k_baseline", "32k-context")]:
-        tps = res.get(key)
-        if not tps:
-            continue
-        gate = "pass" if res.get(gkey, True) else "fail"
-        base = res.get(bkey) or _GUARD_BASE_FALLBACK.get(bkey, 0)
-        rows.append(f"| {f'{short} ' if dual or triple else ''}{lbl} no-regression gate | {tps} tok/s"
-                    f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
-    if res.get("ctx_2048_tps") is not None and res.get("ctx_512_tps") is None:
-        gate = "pass" if res.get("guard_2k_pass", True) else "fail"
-        base = res.get("guard_2k_baseline") or 0
-        rows.append(f"| legacy 2k no-regression gate | {res.get('ctx_2048_tps')} tok/s"
-                    f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
+        for title, block in [("Qwen3.5", res.get("score_qwen35") or {}),
+                             ("Qwen3.6", res.get("score_qwen36") or {})]:
+            if not block:
+                continue
+            bctx = block.get("best_context_label")
+            sc = block.get("score_context", 128)
+            if block.get("frontier_tps", 0) > 0:
+                rows.append(f"| {title} vs same-box main | {block['frontier_tps']} tok/s → "
+                            f"{block.get('pct_over_frontier', 0):+.1f}% "
+                            f"({block.get('delta_tps', 0):+.1f}) |")
+            rows.append(f"| {title} scored decode ({sc} ctx"
+                        f"{f' · {bctx}' if bctx else ''}) | {block.get('tps', '?')} tok/s |")
+            rows.append(f"| {title} correctness | top-1 {block.get('top1', 0) * 100:.1f}% · "
+                        f"KL {block.get('kl', '?')} |")
+            for key, gkey, bkey, lbl in [
+                    ("ctx_128_tps", "guard_128_pass", "guard_128_baseline", "128-token"),
+                    ("ctx_512_tps", "guard_512_pass", "guard_512_baseline", "512-context"),
+                    ("ctx_4096_tps", "guard_4k_pass", "guard_4k_baseline", "4k-context"),
+                    ("ctx_16384_tps", "guard_16k_pass", "guard_16k_baseline", "16k-context"),
+                    ("ctx_32768_tps", "guard_32k_pass", "guard_32k_baseline", "32k-context")]:
+                tps = block.get(key)
+                if not tps:
+                    continue
+                gate = "pass" if block.get(gkey, True) else "fail"
+                base = block.get(bkey) or _GUARD_BASE_FALLBACK.get(bkey, 0)
+                rows.append(f"| {title} {lbl} no-regression gate | {tps} tok/s"
+                            f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
+    if not bidir:
+        rows += [
+            f"| scored decode ({res.get('score_context', 128)} ctx{f' · {ctx_label}' if ctx_label else ''}{f' · {short}' if dual or triple else ''}) | {res.get('tps','?')} tok/s |",
+            f"| correctness{f' ({short} vs llama.cpp)' if dual or triple else ''} | top-1 {res.get('top1',0)*100:.1f}% · KL {res.get('kl','?')} |"]
+        # scored-model per-context no-regression gates — SKIP contexts not measured (tps 0/None) so a
+        # deliberately-skipped 16k/32k never renders a misleading "0.0 tok/s · pass".
+        for key, gkey, bkey, lbl in [("ctx_128_tps", "guard_128_pass", "guard_128_baseline", "128-token"),
+                                     ("ctx_512_tps", "guard_512_pass", "guard_512_baseline", "512-context"),
+                                     ("ctx_4096_tps", "guard_4k_pass", "guard_4k_baseline", "4k-context"),
+                                     ("ctx_16384_tps", "guard_16k_pass", "guard_16k_baseline", "16k-context"),
+                                     ("ctx_32768_tps", "guard_32k_pass", "guard_32k_baseline", "32k-context")]:
+            tps = res.get(key)
+            if not tps:
+                continue
+            gate = "pass" if res.get(gkey, True) else "fail"
+            base = res.get(bkey) or _GUARD_BASE_FALLBACK.get(bkey, 0)
+            rows.append(f"| {f'{short} ' if dual or triple else ''}{lbl} no-regression gate | {tps} tok/s"
+                        f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
+        if res.get("ctx_2048_tps") is not None and res.get("ctx_512_tps") is None:
+            gate = "pass" if res.get("guard_2k_pass", True) else "fail"
+            base = res.get("guard_2k_baseline") or 0
+            rows.append(f"| legacy 2k no-regression gate | {res.get('ctx_2048_tps')} tok/s"
+                        f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
     # The Qwen3-30B no-regression guard — the check that actually gates a dual verdict.
     if bidir:
         for title, block in [("Qwen3.5 optimize", res.get("score_qwen35") or {}),
@@ -494,7 +523,7 @@ def render(res, oid):
     if res.get("regression_labels") or res.get("guard_regression_labels"):
         allregs = (res.get("regression_labels") or []) + (res.get("guard_regression_labels") or [])
         rows.append(f"| regressions | {', '.join(allregs)} |")
-    if "frontier_tps" in res and res.get("frontier_tps", 0) > 0:
+    if not bidir and "frontier_tps" in res and res.get("frontier_tps", 0) > 0:
         # "frontier_tps" is now the SAME-BOX origin/main baseline — the gain is measured directly
         # against main on the same GPU in the same run, not a passed-in frontier number.
         rows.insert(2, f"| vs same-box main | {res['frontier_tps']} tok/s → "
@@ -526,6 +555,12 @@ CTX_SERIES = {
     4096:  {"metric": "ctx_4096_tps",  "guard": "guard_4k_baseline",   "status": "longctx_4k_tps",   "label": "4k", "color": "#0E8A16", "llama": 292.99, "note": "llama-batched-bench npp=4096 ntg=128 npl=1"},
     16384: {"metric": "ctx_16384_tps", "guard": "guard_16k_baseline",  "status": "longctx_16k_tps",  "label": "16k", "color": "#B8860B", "llama": 245.53, "note": "llama-batched-bench npp=16384 ntg=128 npl=1"},
     32768: {"metric": "ctx_32768_tps", "guard": "guard_32k_baseline",  "status": "longctx_32k_tps",  "label": "32k", "color": "#6F42C1", "llama": 192.62, "note": "release-log llama.cpp estimate at 32k, ntg=128"},
+}
+# Qwen3.5 (Qwythos) per-context llama.cpp anchors — colors match CTX_SERIES.
+Q35_CTX_SERIES = {
+    128:  {"label": "128", "ref_tps": 224.91},
+    512:  {"label": "512", "ref_tps": 225.10},
+    4096: {"label": "4k",  "ref_tps": 224.68},
 }
 
 def load_dash():
@@ -682,6 +717,8 @@ def update_dashboard(repo, pr, areas, res, proof_url=None):
         entry["polaris_receipt_hash"] = res["polaris_receipt_hash"]
     for k in ("eval_mode", "score_context", "best_context_label", "context_gains_pct",
               "regression_labels", "auto_close",
+              "mode", "label_qwen35", "label_qwen36", "pass_qwen35", "pass_qwen36",
+              "score_qwen35", "score_qwen36",
               "ctx_128_tps", "ctx_512_tps", "ctx_2048_tps", "ctx_4096_tps",
               "ctx_16384_tps", "ctx_32768_tps",
               "guard_128_baseline", "guard_128_ratio", "guard_128_pass",
@@ -752,6 +789,34 @@ def _upsert_context_baselines(data, e):
     rows.sort(key=lambda r: int(r.get("ctx") or 0))
     return changed
 
+def _upsert_qwen35_ctx(data, sub):
+    """Refresh Qwen3.5 per-context sparkinfer bars from a merged bidir score_qwen35 block."""
+    q35 = data.setdefault("qwen35", {})
+    ctx_rows = {r.get("label"): r for r in q35.get("ctx") or []}
+    changed = False
+    for ctx, meta in Q35_CTX_SERIES.items():
+        measured = sub.get(CTX_SERIES[ctx]["metric"])
+        if measured is None:
+            continue
+        guard = sub.get(CTX_SERIES[ctx]["guard"])
+        old = (ctx_rows.get(meta["label"]) or {}).get("tps") or q35.get("frontier_tps") or 0
+        new = _scaled_context_tps(old, measured, guard) or round(float(measured), 2)
+        row = ctx_rows.get(meta["label"])
+        if row:
+            if round(float(row.get("tps") or 0), 2) < new:
+                row["tps"] = new
+                row["color"] = CTX_SERIES[ctx]["color"]
+                changed = True
+        else:
+            ctx_rows[meta["label"]] = {
+                "label": meta["label"], "color": CTX_SERIES[ctx]["color"],
+                "tps": new, "ref_tps": meta["ref_tps"],
+            }
+            changed = True
+    if changed:
+        q35["ctx"] = [ctx_rows[k] for k in ("128", "512", "4k") if k in ctx_rows]
+    return changed
+
 def record_merge(repo, num):
     """A frontier-advancing PR was MERGED → advance the displayed frontier by its verified same-box
     relative gain and add it to the journey (`landed`). Hardware-independent and merged-only;
@@ -761,7 +826,8 @@ def record_merge(repo, num):
     e = next((p for p in data.get("prs", []) if p.get("num") == num), None)
     if not e:
         return
-    if e.get("mode") == "bidir":
+    bidir = e.get("mode") == "bidir" or e.get("model") == "bidir"
+    if bidir:
         if not ((e.get("pass_qwen35") and e.get("label_qwen35") in SPEEDUP_LABELS) or
                 (e.get("pass_qwen36") and e.get("label_qwen36") in SPEEDUP_LABELS) or
                 e.get("label") in SPEEDUP_LABELS):
@@ -787,8 +853,11 @@ def record_merge(repo, num):
             old_f = round(q35.get("frontier_tps") or q35.get("baseline_tps") or 0, 2)
             new_f = round(max(old_f, sub.get("tps") or 0), 2)
             q35["frontier_tps"] = new_f
+            if not q35.get("baseline_tps") and sub.get("guard_128_baseline"):
+                q35["baseline_tps"] = round(float(sub["guard_128_baseline"]), 2)
             if sub.get("top1") is not None: q35["token_match"] = round(sub["top1"], 4)
             if sub.get("kl") is not None:   q35["kl"] = round(sub["kl"], 4)
+            _upsert_qwen35_ctx(data, sub)
             short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
             landed = [m for m in data.get("landed_qwen35", []) if m.get("pr") != num]
             landed.append({"name": short or f"PR #{num}", "tps": new_f, "pr": num,
@@ -847,6 +916,9 @@ def record_merge(repo, num):
         return
 
     if any(m.get("pr") == num for m in data.get("landed", [])): return       # already recorded
+    # Bidir PRs must not advance the Qwen3-MoE frontier — route via the bidir branch above.
+    if bidir:
+        return
     # Advance by the VERIFIED SAME-BOX RELATIVE GAIN (delta_pct), NOT the raw measured tps. Raw tok/s
     # zig-zags ±2% with whichever box ran (hot vs cool) and breaks the journey's monotonicity; applying
     # the same-box gain to the displayed frontier keeps the headline hardware-independent and the journey
@@ -1276,7 +1348,7 @@ def main():
             "--eval-mode", "longctx", "--keep"]
     if args.bidir:
         bcmd += ["--bidir", "--primary-quant", args.primary_quant, "--baseline-only"]
-        bcmd += _bidir_baseline_args(QWEN36_BASE, QWYTHOS_BASE)
+        # Do NOT pass guard baselines here — evaluate_bidir must measure fresh on-box.
     if PINNED_INSTANCE and not ssh_box_enabled() and str(base_iid) == PINNED_INSTANCE:
         bcmd.append("--pinned")
     box_label = ssh_box_arg() if ssh_box_enabled() else f"instance {base_iid}"
@@ -1302,19 +1374,23 @@ def main():
     if args.bidir and not (bres.get("pass") or bres.get("score_qwen35") or bres.get("score_qwen36")):
         log = (br.stdout + br.stderr)[-1200:]
         print(f">> bidir baseline (origin/main) failed — aborting; no PRs graded.\n{log}"); return
+    if args.bidir:
+        if not _apply_bidir_ctx_from_bres(bres, QWEN36_BASE, QWYTHOS_BASE) or not _bidir_baseline_sane(QWEN36_BASE, QWYTHOS_BASE):
+            log = (br.stdout + br.stderr)[-1200:]
+            print(f">> bidir baseline measurement invalid (need live ctx sweep, not dashboard defaults) — "
+                  f"aborting; no PRs graded.\n{log}"); return
     if not args.bidir and (not bres.get("pass") or not bres.get("tps")):
         log = (br.stdout + br.stderr)[-1200:]
         print(f">> same-box baseline (origin/main) failed ({bres.get('label','no result')}) — "
               f"aborting; no PRs graded.\n{log}"); return
     if args.bidir:
-        run_baseline = float((bres.get("score_qwen36") or {}).get("tps") or bres.get("tps") or 0)
-        s36 = bres.get("score_qwen36") or {}
-        run_guard_128 = float(s36.get("ctx_128_tps") or run_baseline)
-        run_guard_512 = float(s36.get("ctx_512_tps") or 0)
-        run_guard_4k = float(s36.get("ctx_4096_tps") or 0)
-        run_guard_16k = float(s36.get("ctx_16384_tps") or run_baseline)
-        run_guard_32k = float(s36.get("ctx_32768_tps") or 0)
-        score_ctx = int(s36.get("score_context") or bres.get("score_context") or 128)
+        run_baseline = float(QWEN36_BASE["128"])
+        run_guard_128 = float(QWEN36_BASE["128"])
+        run_guard_512 = float(QWEN36_BASE["512"])
+        run_guard_4k = float(QWEN36_BASE["4k"])
+        run_guard_16k = float(QWEN36_BASE["16k"])
+        run_guard_32k = float(QWEN36_BASE["32k"])
+        score_ctx = 128
     else:
         run_baseline = bres["tps"]
         run_guard_128 = float(bres.get("ctx_128_tps") or bres.get("tps") or 0)
@@ -1344,65 +1420,12 @@ def main():
               f"Aborting; NO PRs graded. Re-run on a warm, stable box.")
         return
 
-    # Bidir: reuse ctx speeds from the baseline RESULT_JSON (no duplicate SSH sweeps).
+    # Bidir: ctx speeds already in QWEN36_BASE / QWYTHOS_BASE from baseline RESULT_JSON.
     if args.bidir:
-        if _apply_bidir_ctx_from_bres(bres, QWEN36_BASE, QWYTHOS_BASE):
-            print(f"  Qwen3.6 same-box main: 128={QWEN36_BASE['128']} 512={QWEN36_BASE['512']} "
-                  f"4k={QWEN36_BASE['4k']} 16k={QWEN36_BASE['16k']} 32k={QWEN36_BASE['32k']} tok/s")
-            print(f"  Qwythos ({args.primary_quant}) same-box main: "
-                  f"128={QWYTHOS_BASE['128']} 512={QWYTHOS_BASE['512']} 4k={QWYTHOS_BASE['4k']} tok/s")
-        elif _vast_sh:
-            ssh_ep = ssh_box_endpoint()
-            if ssh_ep:
-                host, port = ssh_ep
-            elif _vast_endpoint and _vast_info_of:
-                import vastai
-                v = vastai.VastAI()
-                info = _vast_info_of(v, base_iid)
-                host, port = _vast_endpoint(info) if info else (None, None)
-            else:
-                host = port = None
-
-            def _ctx_sweep(host, port, gguf, label, store, ctx_list=None):
-                B = "/root/sparkinfer/build/runtime/qwen3_gguf_bench"
-                tps = {}
-                sweep = ctx_list or [("128", 0), ("512", 512), ("4k", 4096),
-                                     ("16k", 16384), ("32k", 32768)]
-                for lbl, ctx in sweep:
-                    cmd = f"export PATH=/usr/local/cuda/bin:$PATH; {B} '{gguf}' 128 {ctx}"
-                    r = _vast_sh(host, port, cmd, timeout=600)
-                    m = re.search(r"decode\s+tg\s*:\s*([0-9.]+)", r.stdout + r.stderr)
-                    tps[lbl] = float(m.group(1)) if m else 0.0
-                    print(f"    [{label}] ctx={lbl} tps={tps[lbl]}")
-                if tps.get("128", 0) > 0:
-                    store["128"] = tps["128"]
-                    if "512" in tps:
-                        store["512"] = tps["512"] if tps["512"] > 0 else round(tps["128"] * 0.98, 2)
-                    if "4k" in tps:
-                        store["4k"]  = tps["4k"]  if tps["4k"]  > 0 else round(tps["128"] * 0.93, 2)
-                    if "16k" in tps:
-                        store["16k"] = tps["16k"] if tps["16k"] > 0 else store.get("16k", 0)
-                    if "32k" in tps:
-                        store["32k"] = tps["32k"] if tps["32k"] > 0 else store.get("32k", 0)
-                    parts = " ".join(f"{k}={store[k]}" for k in ("128", "512", "4k", "16k", "32k") if k in store)
-                    print(f"  {label} same-box main: {parts} tok/s")
-                else:
-                    print(f"  {label} bench failed — using config defaults")
-
-            if host and port:
-                _ctx_sweep(host, port, "/workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
-                           "Qwen3.6", QWEN36_BASE)
-                qmap = {
-                    "Q4_K_M": "Qwythos-9B-Claude-Mythos-5-1M-Q4_K_M.gguf",
-                    "Q8_0":   "Qwythos-9B-Claude-Mythos-5-1M-Q8_0.gguf",
-                    "BF16":   "Qwythos-9B-Claude-Mythos-5-1M-BF16.gguf",
-                }
-                qfile = qmap[args.primary_quant]
-                _ctx_sweep(host, port, f"/workspace/models35/{qfile}",
-                           f"Qwythos ({args.primary_quant})", QWYTHOS_BASE,
-                           ctx_list=[("128", 0), ("512", 512), ("4k", 4096)])
-            else:
-                print(f"  could not reach eval box for model bench — using config defaults")
+        print(f"  Qwen3.6 same-box main: 128={QWEN36_BASE['128']} 512={QWEN36_BASE['512']} "
+              f"4k={QWEN36_BASE['4k']} 16k={QWEN36_BASE['16k']} 32k={QWEN36_BASE['32k']} tok/s")
+        print(f"  Qwythos ({args.primary_quant}) same-box main: "
+              f"128={QWYTHOS_BASE['128']} 512={QWYTHOS_BASE['512']} 4k={QWYTHOS_BASE['4k']} tok/s")
 
     # Run all pending evals on the SAME instance: pass --keep so vast_eval.py never stops/destroys
     # the box mid-queue. The bot stops the instance once after ALL PRs finish (or if the instance

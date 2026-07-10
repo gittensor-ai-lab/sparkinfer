@@ -63,6 +63,32 @@ def _set_reuse_retries(n):
         with open(REUSE_RETRY_FILE, "w") as f: f.write(str(n))
     except Exception: pass
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BENCH_SCRIPTS = os.path.join(ROOT, "bench", "scripts")
+
+
+def push_bench_scripts(host, port):
+    """Deploy this checkout's bench/scripts to the eval box (authoritative harness)."""
+    if not os.path.isdir(BENCH_SCRIPTS):
+        return
+    tar = subprocess.run(
+        ["tar", "-C", BENCH_SCRIPTS, "-czf", "-", "."],
+        capture_output=True, timeout=120)
+    if tar.returncode:
+        print(f">> WARN: could not pack bench/scripts (rc={tar.returncode})")
+        return
+    try:
+        subprocess.run(
+            ["ssh", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=40",
+             "-p", str(port), f"root@{host}",
+             "mkdir -p /root/sparkinfer/bench/scripts && tar -xzf - -C /root/sparkinfer/bench/scripts"],
+            input=tar.stdout, timeout=180, check=False)
+        print(">> bench/scripts synced from local checkout")
+    except subprocess.TimeoutExpired:
+        print(">> WARN: bench/scripts sync timed out — box may run stale harness")
+
+
 def sh(host, port, cmd, timeout=3600):
     try:
         return subprocess.run(
@@ -640,8 +666,8 @@ def main():
                         f"bench/scripts/evaluate.sh --ref {args.ref} --frontier {args.frontier} --ceiling {args.ceiling}")
             p36_gguf = f"{MODEL_PATH}"
             p35_gguf = ""
-        harness = ("cd /root/sparkinfer && git fetch -q origin main && "
-                   "git checkout -q origin/main -- bench/scripts && ")
+        push_bench_scripts(host, port)
+        harness = "cd /root/sparkinfer && "
         if args.polaris and not args.baseline_only:
             guard_arg = f" --guard-model-file {p35_gguf}" if p35_gguf else ""
             ev = (f"{harness}({eval_cmd}) > /tmp/spark_eval.log 2>&1; "

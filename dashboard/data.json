@@ -1,5 +1,5 @@
 {
-  "updated": "2026-07-09",
+  "updated": "2026-07-10",
   "status": {
     "gpu": "RTX 5090 · sm_120 · CUDA 13",
     "model": "Qwen3-30B-A3B · Q4_K_M",
@@ -136,6 +136,174 @@
     }
   ],
   "prs": [
+    {
+      "num": 323,
+      "title": "perf(qwen35): requantize dense FFN down Q6_K→Q4_K at load (~5% Qwythos decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 271.85,
+      "delta_pct": 5.8,
+      "top1": 0.9665,
+      "kl": 0.0261,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/323",
+      "model": "bidir",
+      "polaris_receipt_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0323-ec3d7c9",
+      "polaris_receipt_hash": "09e4375bf7c15aa7",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 5.8,
+        "512-context": 5.69,
+        "4k-context": 5.56
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 271.85,
+      "ctx_512_tps": 268.04,
+      "ctx_4096_tps": 255.55,
+      "ctx_16384_tps": 0.0,
+      "ctx_32768_tps": 0.0,
+      "guard_128_baseline": 256.95,
+      "guard_128_ratio": 1.058,
+      "guard_128_pass": true,
+      "guard_512_baseline": 253.6,
+      "guard_512_ratio": 1.0569,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 242.08,
+      "guard_4k_ratio": 1.0556,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 0.0,
+      "guard_16k_ratio": 0.0,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 0.0,
+      "guard_32k_ratio": 0.0,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0323-ec3d7c9",
+      "proof_run": "0323-ec3d7c9",
+      "mode": "bidir",
+      "label_qwen35": "S",
+      "label_qwen36": "none",
+      "pass_qwen35": true,
+      "pass_qwen36": true,
+      "score_qwen35": {
+        "tps": 271.85,
+        "top1": 0.9665,
+        "kl": 0.0261,
+        "ctx_128_tps": 271.85,
+        "ctx_512_tps": 268.04,
+        "ctx_4096_tps": 255.55,
+        "guard_128_baseline": 256.95,
+        "guard_512_baseline": 253.6,
+        "guard_4k_baseline": 242.08
+      },
+      "score_qwen36": {
+        "tps": 363.49,
+        "top1": 0.9809,
+        "kl": 0.0196,
+        "label": "none"
+      }
+    },
+    {
+      "num": 318,
+      "title": "perf: quantized dense FFN + GDN fusions + hd256 32k combine",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 363.07,
+      "delta_pct": null,
+      "top1": 0.4242,
+      "kl": 3.8672,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/318",
+      "model": "bidir",
+      "eval_mode": "longctx",
+      "score_context": 32768,
+      "best_context_label": "32k-context",
+      "context_gains_pct": {
+        "128-context": -1.22,
+        "512-context": -0.85,
+        "4k-context": -0.79,
+        "16k-context": -0.16,
+        "32k-context": -0.15
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 421.3,
+      "ctx_512_tps": 416.26,
+      "ctx_4096_tps": 399.81,
+      "ctx_16384_tps": 385.02,
+      "ctx_32768_tps": 363.07,
+      "guard_128_baseline": 426.5,
+      "guard_128_ratio": 0.9878,
+      "guard_128_pass": true,
+      "guard_512_baseline": 419.81,
+      "guard_512_ratio": 0.9915,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 403.0,
+      "guard_4k_ratio": 0.9921,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 385.65,
+      "guard_16k_ratio": 0.9984,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 363.62,
+      "guard_32k_ratio": 0.9985,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0318-560345c",
+      "proof_run": "0318-560345c"
+    },
+    {
+      "num": 294,
+      "title": "perf: Qwen3.6 +36 tok/s @12k, Qwythos 264 tok/s (beats llama.cpp 225)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 393.04,
+      "delta_pct": 1.9,
+      "top1": 0.9826,
+      "kl": 0.02,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/294",
+      "model": "bidir",
+      "polaris_receipt_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0294-06a3b7f",
+      "polaris_receipt_hash": "25532e6afc7e46f2",
+      "eval_mode": "longctx",
+      "score_context": 16384,
+      "best_context_label": "16k-context",
+      "context_gains_pct": {
+        "128-context": 0.07,
+        "512-context": 0.52,
+        "4k-context": 0.51,
+        "16k-context": 1.92,
+        "32k-context": 1.86
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 426.8,
+      "ctx_512_tps": 421.99,
+      "ctx_4096_tps": 405.07,
+      "ctx_16384_tps": 393.04,
+      "ctx_32768_tps": 370.4,
+      "guard_128_baseline": 426.5,
+      "guard_128_ratio": 1.0007,
+      "guard_128_pass": true,
+      "guard_512_baseline": 419.81,
+      "guard_512_ratio": 1.0052,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 403.0,
+      "guard_4k_ratio": 1.0051,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 385.65,
+      "guard_16k_ratio": 1.0192,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 363.62,
+      "guard_32k_ratio": 1.0186,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0294-06a3b7f",
+      "proof_run": "0294-06a3b7f"
+    },
     {
       "num": 239,
       "title": "perf(qwen3.6): fuse decode kernel launches — shared-expert + GDN conv/L2-norm",
@@ -1534,50 +1702,6 @@
       "kl": 0.0181,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/105",
       "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0105-fd67c2b"
-    },
-    {
-      "num": 87,
-      "title": "perf(attn): fuse Q/K/V Q4_K MMVQ into one launch (+3% decode)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "none",
-      "tps": 437.3,
-      "delta_pct": 0.2,
-      "top1": 0.97,
-      "kl": 0.1417,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/87",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0087-b7562da"
-    },
-    {
-      "num": 86,
-      "title": "perf(decode): single-pass MoE top-k + fused RoPE/KV-append (+3.2% decode)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "S",
-      "tps": 454.41,
-      "delta_pct": 4.2,
-      "top1": 0.97,
-      "kl": 0.1417,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/86",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0086-4e45ed9"
-    },
-    {
-      "num": 89,
-      "title": "perf(decode): run Q/K/V projections on concurrent CUDA streams (+5.7% decode)",
-      "areas": [
-        "runtime"
-      ],
-      "label": "S",
-      "tps": 443.38,
-      "delta_pct": 5.7,
-      "top1": 0.97,
-      "kl": 0.1417,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/89",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0089-4e13546"
     }
   ],
   "landed": [
@@ -1809,35 +1933,43 @@
   "qwen35": {
     "model": "Qwythos-9B (Qwen3.5-9B) · Q4_K_M",
     "arch": "dense hybrid Gated-DeltaNet + full-attn · 9B · hd256",
-    "frontier_tps": 129.53,
-    "baseline_tps": 129.53,
+    "frontier_tps": 271.85,
+    "baseline_tps": 256.95,
     "ref_name": "llama.cpp",
     "ref_tps": 224.91,
-    "token_match": 0,
-    "kl": 0,
-    "note": "main baseline RTX 5090 2026-07-10 · dense hybrid loader · eval at 128/512/4k",
+    "token_match": 0.9665,
+    "kl": 0.0261,
+    "note": "PR #323 merged · same-box main baseline + eval:S @128 ctx · RTX 5090",
     "ctx": [
       {
         "label": "128",
-        "color": "#FF6B35",
-        "tps": 129.53,
+        "color": "#D14D72",
+        "tps": 271.85,
         "ref_tps": 224.91
       },
       {
         "label": "512",
-        "color": "#00B4D8",
-        "tps": 128.98,
-        "ref_tps": 225.10
+        "color": "#7B5DFF",
+        "tps": 268.04,
+        "ref_tps": 225.1
       },
       {
         "label": "4k",
-        "color": "#9B5DE5",
-        "tps": 126.06,
+        "color": "#0E8A16",
+        "tps": 255.55,
         "ref_tps": 224.68
       }
     ]
   },
-  "landed_qwen35": [],
+  "landed_qwen35": [
+    {
+      "name": "requantize dense FFN down Q6_K→Q4_K",
+      "tps": 271.85,
+      "pr": 323,
+      "date": "2026-07-10",
+      "label": "S"
+    }
+  ],
   "qwen36": {
     "model": "Qwen3.6-35B-A3B · UD-Q4_K_M",
     "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
