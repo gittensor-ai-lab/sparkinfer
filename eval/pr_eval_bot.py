@@ -794,7 +794,12 @@ def _upsert_context_baselines(data, e):
     return changed
 
 def _upsert_qwen35_ctx(data, sub):
-    """Refresh Qwen3.5 per-context sparkinfer bars from a merged bidir score_qwen35 block."""
+    """Refresh Qwen3.5 per-context sparkinfer bars from a merged bidir score_qwen35 block.
+
+    Uses same-box measured tok/s directly (vs llama.cpp ref anchors). Unlike Qwen3.6
+    context_baselines, do not apply _scaled_context_tps — that compounded merge ratios and
+    inflated ctx bars above frontier_tps.
+    """
     q35 = data.setdefault("qwen35", {})
     ctx_rows = {r.get("label"): r for r in q35.get("ctx") or []}
     changed = False
@@ -802,12 +807,13 @@ def _upsert_qwen35_ctx(data, sub):
         measured = sub.get(CTX_SERIES[ctx]["metric"])
         if measured is None:
             continue
-        guard = sub.get(CTX_SERIES[ctx]["guard"])
-        old = (ctx_rows.get(meta["label"]) or {}).get("tps") or q35.get("frontier_tps") or 0
-        new = _scaled_context_tps(old, measured, guard) or round(float(measured), 2)
+        new = round(float(measured), 2)
+        old = round(float((ctx_rows.get(meta["label"]) or {}).get("tps") or 0), 2)
+        if old and new < old:
+            continue
         row = ctx_rows.get(meta["label"])
         if row:
-            if round(float(row.get("tps") or 0), 2) < new:
+            if old != new:
                 row["tps"] = new
                 row["color"] = CTX_SERIES[ctx]["color"]
                 changed = True

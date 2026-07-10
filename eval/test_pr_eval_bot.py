@@ -138,6 +138,35 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertEqual(out["landed_longctx"][0]["ctx"], 4096)
         self.assertFalse(out["landed"])
 
+    def test_qwen35_ctx_uses_measured_tps_without_scaling(self):
+        data = {
+            "qwen35": {
+                "frontier_tps": 281.63,
+                "ctx": [
+                    {"label": "128", "tps": 281.63, "ref_tps": 224.91},
+                    {"label": "512", "tps": 277.69, "ref_tps": 225.1},
+                    {"label": "4k", "tps": 264.06, "ref_tps": 224.68},
+                ],
+            }
+        }
+        sub = {
+            "ctx_128_tps": 284.47,
+            "ctx_512_tps": 281.34,
+            "ctx_4096_tps": 267.66,
+            "guard_128_baseline": 257.47,
+            "guard_512_baseline": 254.27,
+            "guard_4k_baseline": 242.49,
+        }
+        bot._upsert_qwen35_ctx(data, sub)
+        by = {r["label"]: r["tps"] for r in data["qwen35"]["ctx"]}
+        self.assertEqual(by["128"], 284.47)
+        self.assertEqual(by["512"], 281.34)
+        self.assertEqual(by["4k"], 267.66)
+        # Second merge with same measured must not compound ratios.
+        bot._upsert_qwen35_ctx(data, sub)
+        by2 = {r["label"]: r["tps"] for r in data["qwen35"]["ctx"]}
+        self.assertEqual(by2, by)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

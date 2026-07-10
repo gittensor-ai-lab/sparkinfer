@@ -2849,30 +2849,30 @@ window.SPARKINFER = {
   "qwen35": {
     "model": "Qwythos-9B (Qwen3.5-9B) · Q4_K_M",
     "arch": "dense hybrid Gated-DeltaNet + full-attn · 9B · hd256",
-    "frontier_tps": 281.63,
+    "frontier_tps": 272.36,
     "baseline_tps": 256.95,
     "ref_name": "llama.cpp",
     "ref_tps": 224.91,
     "token_match": 0.9613,
     "kl": 0.0141,
-    "note": "PR #323 merged · same-box main baseline + eval:S @128 ctx · RTX 5090",
+    "note": "post-main rebench 2026-07-10 (RTX 5090, 3-rep median); ctx bars corrected from inflated _scaled_context_tps compounding",
     "ctx": [
       {
         "label": "128",
         "color": "#D14D72",
-        "tps": 348.97,
+        "tps": 272.36,
         "ref_tps": 224.91
       },
       {
         "label": "512",
         "color": "#7B5DFF",
-        "tps": 343.25,
+        "tps": 270.59,
         "ref_tps": 225.1
       },
       {
         "label": "4k",
         "color": "#0E8A16",
-        "tps": 331.66,
+        "tps": 262.91,
         "ref_tps": 224.68
       }
     ]
