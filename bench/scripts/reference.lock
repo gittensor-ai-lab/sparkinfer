@@ -17,23 +17,6 @@ MODEL_SHA256="${MODEL_SHA256:-0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c6
 # sha256 of the Qwen3.6-35B-A3B UD-Q4_K_M GGUF (unsloth) — the dual-eval primary baseline weights.
 QWEN36_MODEL_SHA256="ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61"
 
-# Qwythos-9B (Qwen3.5-9B) — triple-eval primary. Empty = warn-only until pinned after first download.
-QWEN35_9B_Q4K_SHA256="${QWEN35_9B_Q4K_SHA256:-88c75f5a2684d07ac4b08e47f06cf6f65045072b1aeb29b33cf50cdae2d8cea1}"
-QWEN35_9B_Q8_SHA256="${QWEN35_9B_Q8_SHA256:-8966d06dad609fa20092a3f1c27f09836fe9e4ebb9ef9500cb86e6af543fd2a4}"
-QWEN35_9B_BF16_SHA256="${QWEN35_9B_BF16_SHA256:-fc0b8347f3d87d23ff13ac636a1989579b4cceeb25ab67979c3bae767721de02}"
-
-# Qwythos llama.cpp decode refs (RTX 5090, Q4_K_M) — 3-rep median, pinned commit 6f4f53f.
-# Measured 2026-07-10: llama-bench -m Qwythos-9B-Q4_K_M -p CTX -n 128 -ngl 99
-QWEN35_9B_LLAMA_128="${QWEN35_9B_LLAMA_128:-224.91}"
-QWEN35_9B_LLAMA_512="${QWEN35_9B_LLAMA_512:-225.10}"
-QWEN35_9B_LLAMA_4K="${QWEN35_9B_LLAMA_4K:-224.68}"
-
-# sparkinfer main baseline (RTX 5090, Q4_K_M) — qwen3_gguf_bench n=128, SPARKINFER_BENCH_DEVICE_LOOP=0.
-# Measured 2026-07-10 after dense-hybrid Qwen3.5 loader landed.
-QWEN35_SPARKINFER_128="${QWEN35_SPARKINFER_128:-129.53}"
-QWEN35_SPARKINFER_512="${QWEN35_SPARKINFER_512:-128.98}"
-QWEN35_SPARKINFER_4K="${QWEN35_SPARKINFER_4K:-126.06}"
-
 # llama.cpp commit the reference is pinned to. HEAD of master drifts run-to-run (non-reproducible and
 # unpinnable); we check out exactly this commit, verify a clean tree, and rebuild if either differs.
 LLAMACPP_COMMIT="6f4f53f2b7da54fcdbbecaaa734337c337ad6176"

@@ -8,9 +8,7 @@
 
 static long qwen3_meta_int(const sparkinfer::GGUF& g, const std::string& key, long def) {
     const long missing = std::numeric_limits<long>::min();
-    long v = g.meta_int("qwen35." + key, missing);
-    if (v != missing) return v;
-    v = g.meta_int("qwen35moe." + key, missing);
+    long v = g.meta_int("qwen35moe." + key, missing);
     if (v != missing) return v;
     v = g.meta_int("qwen3moe." + key, missing);
     if (v != missing) return v;
@@ -20,21 +18,12 @@ static long qwen3_meta_int(const sparkinfer::GGUF& g, const std::string& key, lo
 
 static double qwen3_meta_float(const sparkinfer::GGUF& g, const std::string& key, double def) {
     const double missing = -std::numeric_limits<double>::infinity();
-    double v = g.meta_float("qwen35." + key, missing);
-    if (v != missing) return v;
-    v = g.meta_float("qwen35moe." + key, missing);
+    double v = g.meta_float("qwen35moe." + key, missing);
     if (v != missing) return v;
     v = g.meta_float("qwen3moe." + key, missing);
     if (v != missing) return v;
     v = g.meta_float("qwen3_5_moe." + key, missing);
     return v != missing ? v : def;
-}
-
-static bool qwen3_is_dense_qwen35(const sparkinfer::GGUF& g) {
-    const std::string arch = g.meta_str("general.architecture");
-    if (arch != "qwen35") return false;
-    return g.tensor("blk.0.ffn_gate.weight") != nullptr &&
-           g.tensor("blk.0.ffn_gate_exps.weight") == nullptr;
 }
 
 static bool qwen3_is_hybrid_35b(const sparkinfer::GGUF& g) {
@@ -64,28 +53,6 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
     if (emb && emb->n_dims >= 2) cfg.vocab = (int)emb->dims[1];
 
     cfg.hybrid = qwen3_is_hybrid_35b(g);
-    if (qwen3_is_dense_qwen35(g)) {
-        cfg.dense_ffn = true;
-        cfg.hybrid = true;
-        cfg.n_experts = 1;
-        cfg.top_k = 1;
-        cfg.n_shared = 0;
-        cfg.moe_ffn = (int)qwen3_meta_int(g, "feed_forward_length", cfg.moe_ffn);
-        cfg.full_attn_interval = (int)qwen3_meta_int(g, "full_attention_interval", 4);
-        cfg.rope_dim = (int)qwen3_meta_int(g, "rope.dimension_count", 64);
-        cfg.linear_q_heads = cfg.n_q_heads;
-        cfg.linear_v_heads = (int)qwen3_meta_int(g, "ssm.group_count", cfg.linear_v_heads);
-        cfg.linear_head_dim = (int)qwen3_meta_int(g, "ssm.state_size", cfg.linear_head_dim);
-        cfg.linear_conv_kernel = (int)qwen3_meta_int(g, "ssm.conv_kernel", cfg.linear_conv_kernel);
-        if (const sparkinfer::GGUFTensor* qkv = g.tensor("blk.0.attn_qkv.weight")) {
-            const int qkv_out = qkv->n_dims >= 2 ? (int)qkv->dims[1] : 0;
-            const int q_dim = cfg.linear_q_heads * cfg.linear_head_dim;
-            const int v_dim = qkv_out - 2 * q_dim;
-            if (v_dim > 0 && v_dim % cfg.linear_head_dim == 0)
-                cfg.linear_v_heads = v_dim / cfg.linear_head_dim;
-        }
-        return;
-    }
     if (!cfg.hybrid) {
         cfg.rope_dim = 0;
         return;
@@ -109,6 +76,5 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
 }
 
 static const char* qwen3_model_label(const sparkinfer::Qwen35Config& cfg) {
-    if (cfg.dense_ffn) return "Qwen3.5-9B dense hybrid";
     return cfg.hybrid ? "Qwen3.5/Qwen3.6-35B-A3B hybrid" : "Qwen3-MoE";
 }

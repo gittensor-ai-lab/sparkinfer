@@ -228,27 +228,6 @@ def main():
     ap.add_argument("--p-llama-4k-baseline",  type=float, default=0, help="[--dual] Qwen3.6 llama.cpp 4k-context tok/s")
     ap.add_argument("--p-llama-16k-baseline", type=float, default=0, help="[--dual] Qwen3.6 llama.cpp 16k-context tok/s")
     ap.add_argument("--p-llama-32k-baseline", type=float, default=0, help="[--dual] Qwen3.6 llama.cpp 32k-context tok/s")
-    # --- bidirectional: Qwen3.5-9B + Qwen3.6-35B (both directions scored) ---
-    ap.add_argument("--bidir", action="store_true",
-                    help="bidirectional eval: score Qwen3.5 (128/512/4k) and Qwen3.6 (5 contexts), "
-                         "each guarding the other via evaluate_bidir.sh")
-    ap.add_argument("--p35-guard-128-baseline", type=float, default=0, help="[--bidir] Qwen3.5 main 128-token tok/s")
-    ap.add_argument("--p35-guard-512-baseline", type=float, default=0, help="[--bidir] Qwen3.5 main 512-context tok/s")
-    ap.add_argument("--p35-guard-4k-baseline",  type=float, default=0, help="[--bidir] Qwen3.5 main 4k-context tok/s")
-    ap.add_argument("--g35-guard-128-baseline", type=float, default=0, help="[--bidir] Qwen3.5 guard 128-token tok/s")
-    ap.add_argument("--g35-guard-512-baseline", type=float, default=0, help="[--bidir] Qwen3.5 guard 512-context tok/s")
-    ap.add_argument("--g35-guard-4k-baseline",  type=float, default=0, help="[--bidir] Qwen3.5 guard 4k-context tok/s")
-    # --- triple-model: legacy alias for --bidir ---
-    ap.add_argument("--triple", action="store_true",
-                    help="alias for --bidir (Qwen3.5 + Qwen3.6 only; Qwen3-30B removed)")
-    ap.add_argument("--primary-quant", default=os.environ.get("PRIMARY_QUANT", "Q4_K_M"),
-                    choices=["Q4_K_M", "Q8_0", "BF16"],
-                    help="[--triple] Qwythos GGUF quant to score (default Q4_K_M)")
-    ap.add_argument("--g36-guard-128-baseline", type=float, default=0, help="[--triple] Qwen3.6 guard 128-token tok/s")
-    ap.add_argument("--g36-guard-512-baseline", type=float, default=0, help="[--triple] Qwen3.6 guard 512-context tok/s")
-    ap.add_argument("--g36-guard-4k-baseline",  type=float, default=0, help="[--triple] Qwen3.6 guard 4k-context tok/s")
-    ap.add_argument("--g36-guard-16k-baseline", type=float, default=0, help="[--triple] Qwen3.6 guard 16k-context tok/s")
-    ap.add_argument("--g36-guard-32k-baseline", type=float, default=0, help="[--triple] Qwen3.6 guard 32k-context tok/s")
     ap.add_argument("--eval-mode", default=os.environ.get("SPARKINFER_EVAL_MODE", "longctx"),
                     choices=["longctx", "short"],
                     help="longctx scores 16k with a 128-token decode no-regression guard; short keeps legacy 128-token scoring")
@@ -267,8 +246,6 @@ def main():
     ap.add_argument("--polaris", action="store_true",
                     help="generate a Polaris verifiable receipt (unsigned attestation from eval box)")
     args = ap.parse_args()
-    if args.triple or args.dual:
-        args.bidir = True
 
     if not args.ssh and ssh_box_enabled():
         args.ssh = ssh_box_arg()
@@ -444,9 +421,7 @@ def main():
         # Pre-cache the model in a nohup background job so SSH drops don't abort the download.
         # If the file is already present (reused box), this is instant. Otherwise we poll for the
         # sentinel file created when the download completes.
-        # Pre-cache Qwen3-30B only for legacy single-model eval (not bidir).
-        if not args.bidir:
-            prefetch = (
+        prefetch = (
             f"if [ -f '{MODEL_PATH}' ]; then touch '{MODEL_READY}' && echo cached; "
             f"elif [ -f '{MODEL_READY}' ]; then echo already_running; "
             f"else mkdir -p /workspace/models && rm -f '{MODEL_READY}'; "
@@ -465,35 +440,18 @@ def main():
             f"       -o {MODEL_PATH} >>/tmp/dl.log 2>&1; "
             f"  [ -f {MODEL_PATH} ] && touch {MODEL_READY}"
             f"' >/dev/null 2>&1 & echo started; fi"
-            )
-            pr = sh(host, port, prefetch, timeout=30)
-            status = pr.stdout.strip()
-            if status == "cached":
-                print(">> model already cached — skipping download")
-            else:
-                print(f">> model download started in background ({status}) — polling for completion ...")
-                if not wait_model(host, port):
-                    print("!! model download timed out — evaluate.sh will retry (may add time)")
+        )
+        pr = sh(host, port, prefetch, timeout=30)
+        status = pr.stdout.strip()
+        if status == "cached":
+            print(">> model already cached — skipping download")
+        else:
+            print(f">> model download started in background ({status}) — polling for completion ...")
+            if not wait_model(host, port):
+                print("!! model download timed out — evaluate.sh will retry (may add time)")
 
-        def _prefetch_hf(gguf_path, hf_repo, hf_file, ready_path, log_path):
-            """Background-download a single GGUF into gguf_path; poll ready_path sentinel."""
-            d = os.path.dirname(gguf_path)
-            return (
-                f"if [ -f '{gguf_path}' ]; then touch '{ready_path}' && echo cached; "
-                f"elif [ -f '{ready_path}' ]; then echo already_running; "
-                f"else mkdir -p {d} && rm -f '{ready_path}'; "
-                f"nohup bash -c '"
-                f"  [ -f {gguf_path} ] "
-                f"  || HF_HUB_DISABLE_XET=1 hf download {hf_repo} "
-                f"       {hf_file} --local-dir {d} >>{log_path} 2>&1 "
-                f"  || curl -fL -C - https://huggingface.co/{hf_repo}/resolve/main/{hf_file}"
-                f"       -o {gguf_path} >>{log_path} 2>&1; "
-                f"  [ -f {gguf_path} ] && touch {ready_path}"
-                f"' >/dev/null 2>&1 & echo started; fi"
-            )
-
-        if args.bidir:
-            # Dual/triple needs the Qwen3.6 GGUF too. Google Drive first (gdown handles the large-file
+        if args.dual:
+            # Dual-model needs the Qwen3.6 GGUF too. Google Drive first (gdown handles the large-file
             # confirm token) — HF is throttled to ~KB/s from many vast hosts; HF/curl are the fallback.
             # Override the Drive id with MODEL36_GDRIVE_ID="" to disable. Separate dir from Qwen3 (the
             # two models have different tokenizers); evaluate_dual.sh's primary MODELS_DIR defaults to
@@ -536,38 +494,6 @@ def main():
                 else:
                     print("!! Qwen3.6 download slow — evaluate_dual.sh will retry (may add time)")
 
-        if args.bidir:
-            # Qwythos-9B (Qwen3.5) — separate dir (/workspace/models35).
-            qmap = {
-                "Q4_K_M": "Qwythos-9B-Claude-Mythos-5-1M-Q4_K_M.gguf",
-                "Q8_0":   "Qwythos-9B-Claude-Mythos-5-1M-Q8_0.gguf",
-                "BF16":   "Qwythos-9B-Claude-Mythos-5-1M-BF16.gguf",
-            }
-            qfile = qmap[args.primary_quant]
-            P35_DIR = "/workspace/models35"
-            P35_PATH = f"{P35_DIR}/{qfile}"
-            P35_READY = "/tmp/sparkinfer_model35_ready"
-            p35 = _prefetch_hf(
-                P35_PATH,
-                "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF",
-                qfile,
-                P35_READY,
-                "/tmp/dl35.log",
-            )
-            s35 = sh(host, port, p35, timeout=30).stdout.strip()
-            if s35 == "cached":
-                print(f">> Qwythos model ({args.primary_quant}) already cached — skipping download")
-            else:
-                print(f">> Qwythos model download started ({s35}) — polling ...")
-                deadline = time.time() + 3600
-                while time.time() < deadline:
-                    r = sh(host, port, f"test -f '{P35_READY}' && echo yes || echo no", timeout=60)
-                    if r.returncode == 0 and r.stdout.strip() == "yes":
-                        break
-                    time.sleep(20)
-                else:
-                    print("!! Qwythos download slow — evaluate_bidir.sh will retry (may add time)")
-
         # Reap any leftover reference server / runner from a previous PR on this kept-alive box —
         # a leaked llama-server holding port 8081 would make this PR's accuracy.sh fail to bind.
         sh(host, port, "pkill -f llama-server 2>/dev/null; pkill -f qwen3_gguf 2>/dev/null; sleep 1; true", timeout=30)
@@ -582,39 +508,60 @@ def main():
         # Difficulty compensation ON (Option B): as the frontier pulls past llama.cpp each further %
         # gain is harder, so label.py scales the label tier up (raw % + significance gate unchanged).
         # Governance-tunable via SPARKINFER_DIFFICULTY_{K,REF,MAX}; applies from new evals onward.
-        if args.bidir:
-            ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
-                  f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} "
-                  f"SPARKINFER_EVAL_MODE={args.eval_mode} PRIMARY_QUANT={args.primary_quant} "
-                  f"SPARKINFER_P35_GUARD_128_BASELINE={args.p35_guard_128_baseline} "
-                  f"SPARKINFER_P35_GUARD_512_BASELINE={args.p35_guard_512_baseline} "
-                  f"SPARKINFER_P35_GUARD_4K_BASELINE={args.p35_guard_4k_baseline} "
-                  f"SPARKINFER_P36_GUARD_128_BASELINE={args.p_guard_128_baseline} "
-                  f"SPARKINFER_P36_GUARD_512_BASELINE={args.p_guard_512_baseline} "
-                  f"SPARKINFER_P36_GUARD_4K_BASELINE={args.p_guard_4k_baseline} "
-                  f"SPARKINFER_P36_GUARD_16K_BASELINE={args.p_guard_16k_baseline} "
-                  f"SPARKINFER_P36_GUARD_32K_BASELINE={args.p_guard_32k_baseline} "
-                  f"SPARKINFER_G36_GUARD_128_BASELINE={args.g36_guard_128_baseline} "
-                  f"SPARKINFER_G36_GUARD_512_BASELINE={args.g36_guard_512_baseline} "
-                  f"SPARKINFER_G36_GUARD_4K_BASELINE={args.g36_guard_4k_baseline} "
-                  f"SPARKINFER_G36_GUARD_16K_BASELINE={args.g36_guard_16k_baseline} "
-                  f"SPARKINFER_G36_GUARD_32K_BASELINE={args.g36_guard_32k_baseline} "
-                  f"SPARKINFER_G35_GUARD_128_BASELINE={args.g35_guard_128_baseline} "
-                  f"SPARKINFER_G35_GUARD_512_BASELINE={args.g35_guard_512_baseline} "
-                  f"SPARKINFER_G35_GUARD_4K_BASELINE={args.g35_guard_4k_baseline} "
-                  f"SPARKINFER_P35_LLAMA_128_BASELINE={args.p_llama_128_baseline} "
-                  f"SPARKINFER_P35_LLAMA_512_BASELINE={args.p_llama_512_baseline} "
-                  f"SPARKINFER_P35_LLAMA_4K_BASELINE={args.p_llama_4k_baseline} "
-                  f"SPARKINFER_P36_LLAMA_128_BASELINE={args.p_llama_128_baseline} "
-                  f"SPARKINFER_P36_LLAMA_512_BASELINE={args.p_llama_512_baseline} "
-                  f"SPARKINFER_P36_LLAMA_4K_BASELINE={args.p_llama_4k_baseline} "
-                  f"SPARKINFER_P36_LLAMA_16K_BASELINE={args.p_llama_16k_baseline} "
-                  f"SPARKINFER_P36_LLAMA_32K_BASELINE={args.p_llama_32k_baseline} "
-                  f"MODELS_DIR=/workspace/models36 QWYTHOS_MODELS_DIR=/workspace/models35 "
-                  f"PRIMARY36_MODELS_DIR=/workspace/models36 "
-                  f"LLAMACPP_DIR={LLAMACPP_DIR} "
-                  f"bench/scripts/evaluate_bidir.sh --ref {args.ref} "
-                  f"--ceiling {args.ceiling}")
+        if args.dual:
+            # Dual-model: score Qwen3.6 (primary) + guard Qwen3-30B (no-regression). The existing
+            # --guard-*-baseline are the Qwen3-30B guard (G_*); --p-* carry the Qwen3.6 scored target.
+            if args.polaris:
+                # Polaris: run judge.py which wraps evaluate_dual.sh and produces an unsigned
+                # attestation (POLARIS_ATTESTATION) alongside the normal RESULT_JSON.
+                # Pin eval/polaris/ to origin/main — same trust model as bench/scripts.
+                ev = (f"cd /root/sparkinfer && git fetch -q origin main && "
+                      f"git checkout -q origin/main -- bench/scripts eval/polaris/ && "
+                      f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} "
+                      f"SPARKINFER_EVAL_MODE={args.eval_mode} "
+                      f"SPARKINFER_G_GUARD_128_BASELINE={args.guard_128_baseline or args.guard_2k_baseline} "
+                      f"SPARKINFER_G_GUARD_512_BASELINE={args.guard_512_baseline} "
+                      f"SPARKINFER_G_GUARD_4K_BASELINE={args.guard_4k_baseline} "
+                      f"SPARKINFER_G_GUARD_16K_BASELINE={args.guard_16k_baseline} "
+                      f"SPARKINFER_G_GUARD_32K_BASELINE={args.guard_32k_baseline} "
+                      f"SPARKINFER_P_GUARD_128_BASELINE={args.p_guard_128_baseline} "
+                      f"SPARKINFER_P_GUARD_512_BASELINE={args.p_guard_512_baseline} "
+                      f"SPARKINFER_P_GUARD_4K_BASELINE={args.p_guard_4k_baseline} "
+                      f"SPARKINFER_P_GUARD_16K_BASELINE={args.p_guard_16k_baseline} "
+                      f"SPARKINFER_P_GUARD_32K_BASELINE={args.p_guard_32k_baseline} "
+                      f"SPARKINFER_P_LLAMA_128_BASELINE={args.p_llama_128_baseline} "
+                      f"SPARKINFER_P_LLAMA_512_BASELINE={args.p_llama_512_baseline} "
+                      f"SPARKINFER_P_LLAMA_4K_BASELINE={args.p_llama_4k_baseline} "
+                      f"SPARKINFER_P_LLAMA_16K_BASELINE={args.p_llama_16k_baseline} "
+                      f"SPARKINFER_P_LLAMA_32K_BASELINE={args.p_llama_32k_baseline} "
+                      f"MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
+                      f"python3 eval/polaris/judge.py --ref {args.ref} "
+                      f"--ceiling {args.ceiling} --script bench/scripts/evaluate_dual.sh "
+                      f"--model-file /workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf "
+                      f"--guard-model-file /workspace/models/Qwen3-30B-A3B-Q4_K_M.gguf "
+                      f"--build-dir /root/sparkinfer/build/runtime")
+            else:
+                ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
+                      f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} "
+                      f"SPARKINFER_EVAL_MODE={args.eval_mode} "
+                      f"SPARKINFER_G_GUARD_128_BASELINE={args.guard_128_baseline or args.guard_2k_baseline} "
+                      f"SPARKINFER_G_GUARD_512_BASELINE={args.guard_512_baseline} "
+                      f"SPARKINFER_G_GUARD_4K_BASELINE={args.guard_4k_baseline} "
+                      f"SPARKINFER_G_GUARD_16K_BASELINE={args.guard_16k_baseline} "
+                      f"SPARKINFER_G_GUARD_32K_BASELINE={args.guard_32k_baseline} "
+                      f"SPARKINFER_P_GUARD_128_BASELINE={args.p_guard_128_baseline} "
+                      f"SPARKINFER_P_GUARD_512_BASELINE={args.p_guard_512_baseline} "
+                      f"SPARKINFER_P_GUARD_4K_BASELINE={args.p_guard_4k_baseline} "
+                      f"SPARKINFER_P_GUARD_16K_BASELINE={args.p_guard_16k_baseline} "
+                      f"SPARKINFER_P_GUARD_32K_BASELINE={args.p_guard_32k_baseline} "
+                      f"SPARKINFER_P_LLAMA_128_BASELINE={args.p_llama_128_baseline} "
+                      f"SPARKINFER_P_LLAMA_512_BASELINE={args.p_llama_512_baseline} "
+                      f"SPARKINFER_P_LLAMA_4K_BASELINE={args.p_llama_4k_baseline} "
+                      f"SPARKINFER_P_LLAMA_16K_BASELINE={args.p_llama_16k_baseline} "
+                      f"SPARKINFER_P_LLAMA_32K_BASELINE={args.p_llama_32k_baseline} "
+                      f"MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
+                      f"bench/scripts/evaluate_dual.sh --ref {args.ref} "
+                      f"--ceiling {args.ceiling}")
         else:
             ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
                   f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} SPARKINFER_DIFFICULTY_BOOST=1 "

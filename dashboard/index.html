@@ -231,11 +231,6 @@
   </section>
 
   <section>
-    <div class="sec-h"><h2>Qwen3.5 · optimization journey</h2><span class="hint" id="passes35-hint"></span></div>
-    <div class="card"><div id="passes35"></div></div>
-  </section>
-
-  <section>
     <div class="sec-h"><h2>Qwen3.6 · optimization journey</h2><span class="hint" id="passes36-hint"></span></div>
     <div class="card"><div id="passes36"></div></div>
   </section>
@@ -248,11 +243,6 @@
   <section>
     <div class="sec-h"><h2>Qwen3-MoE · per-context</h2><span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k</span></div>
     <div class="card" id="detail-q3"></div>
-  </section>
-
-  <section>
-    <div class="sec-h"><h2>Qwen3.5 · per-context</h2><span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k</span></div>
-    <div class="card" id="detail-q35"></div>
   </section>
 
   <section>
@@ -345,18 +335,6 @@
       legItem("#D14D72","ai-hpc v0.3.3 long-context POC")+
       legItem("#B8860B","landed on context frontier")));
   })();
-  // Qwen3.5 journey — Qwythos-9B frontier (128/512/4k only).
-  (function(){
-    const q = D.qwen35 || {}; const L = D.landed_qwen35 || [];
-    const pts = L.map(l=>({name:l.name, sub:(l.pr?"PR #"+l.pr+" · ":"")+l.date+(l.label?" · eval:"+l.label:""), tps:l.tps, baseline:!!l.baseline, live:!l.baseline}));
-    const h = $("passes35-hint");
-    if (h) {
-      if (pts.length) h.textContent = `${q.baseline_tps} → ${q.frontier_tps} tok/s · ${q.ref_tps?((q.frontier_tps/q.ref_tps)*100).toFixed(0)+'% of '+q.ref_name+' '+q.ref_tps:'—'}`;
-      else if (q.ref_tps) h.textContent = `llama.cpp ${q.ref_tps} tok/s @128 · sparkinfer ${q.frontier_tps || q.baseline_tps || 0} tok/s @128`;
-    }
-    drawJourney("passes35", pts.length ? pts : [{name:"llama.cpp baseline", sub:"RTX 5090 · Q4_K_M · 2026-07-10", tps:q.ref_tps||0, baseline:true}],
-      legWrap(legItem("#FF6B35","Qwen3.5 · Qwythos-9B")+legItem("#0E8A16","landed / eval frontier · RTX 5090")));
-  })();
   // Qwen3.6 journey — its own frontier (hybrid Gated-DeltaNet MoE, scored 128/512/4k).
   (function(){
     const q = D.qwen36 || {}; const L = D.landed_qwen36 || [];
@@ -368,35 +346,38 @@
       legItem("#0E8A16","landed / eval frontier · RTX 5090")));
   })();
 
-  // sparkinfer vs llama.cpp — three-model comparison bar chart (128-token decode)
+  // sparkinfer vs llama.cpp — two-model comparison bar chart (128-token decode)
   (function(){
     const q3 = (D.context_baselines||[]).find(x=>x.ctx===128);
-    const q35 = (D.qwen35?.ctx||[]).find(x=>x.label==="128");
     const q36 = (D.qwen36?.ctx||[]).find(x=>x.label==="128");
-    if (!q3 && !q35 && !q36) return;
+    if (!q3 && !q36) return;
     const q3sp = q3?.sparkinfer_tps || 0, q3ll = q3?.llamacpp_decode_tps || 0;
-    const q35sp = q35?.tps || 0, q35ll = q35?.ref_tps || 0;
     const q36sp = q36?.tps || 0, q36ll = q36?.ref_tps || 0;
-    const pct = (sp,ll)=> ll>0 && sp>0 ? 100*(sp-ll)/ll : null;
-    const d3 = pct(q3sp,q3ll), d35 = pct(q35sp,q35ll), d36 = pct(q36sp,q36ll);
-    const maxTPS = Math.max(q3sp, q3ll, q35sp, q35ll, q36sp, q36ll, 1);
+    const d3 = q3ll>0 ? 100*(q3sp-q3ll)/q3ll : 0, d36 = q36ll>0 ? 100*(q36sp-q36ll)/q36ll : 0;
+    const d3cls = d3>=0 ? "" : "neg", d36cls = d36>=0 ? "" : "neg";
+    const maxTPS = Math.max(q3sp, q3ll, q36sp, q36ll);
     const bar = (v)=>Math.max(3, 100*v/maxTPS);
-    const fmt = (v)=>v>0?v.toFixed(2):"pending";
-    const col = (title, color, sp, ll, d) => `
-        <div style="flex:1;min-width:280px">
-          <div style="font-family:Sora;font-weight:700;font-size:16px;color:var(--title);margin-bottom:14px">
-            <span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${color};margin-right:8px"></span>
-            ${title}
-            ${d!=null?`<span style="font-weight:600;font-size:14px;color:${d>=0?'var(--ok)':'var(--bad)'};margin-left:10px">${d>=0?'+':''}${d.toFixed(1)}%</span>`:''}
-          </div>
-          <div class="bar-row"><div class="nm">sparkinfer</div><div class="track"><div class="fill" style="width:${sp>0?bar(sp):0}%;background:linear-gradient(90deg,${color},${color}88)"></div></div><div class="v">${fmt(sp)}</div></div>
-          <div class="bar-row"><div class="nm">llama.cpp</div><div class="track"><div class="fill them" style="width:${bar(ll)}%"></div></div><div class="v">${fmt(ll)}</div></div>
-        </div>`;
+    const fmt = (v)=>v.toFixed(2);
     $("vsllama").innerHTML = `
       <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:18px">
-        ${q3?col("Qwen3-MoE 30B-A3B · Q4_K_M","#D14D72",q3sp,q3ll,d3):""}
-        ${q35?col("Qwen3.5 9B · Q4_K_M","#FF6B35",q35sp,q35ll,d35):""}
-        ${q36?col("Qwen3.6 35B-A3B · UD-Q4_K_M","#7B5DFF",q36sp,q36ll,d36):""}
+        <div style="flex:1;min-width:340px">
+          <div style="font-family:Sora;font-weight:700;font-size:16px;color:var(--title);margin-bottom:14px">
+            <span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#D14D72;margin-right:8px"></span>
+            Qwen3-MoE 30B-A3B · Q4_K_M
+            <span style="font-weight:600;font-size:14px;color:${d3>=0?'var(--ok)':'var(--bad)'};margin-left:10px">${d3>=0?'+':''}${fmt(d3)}%</span>
+          </div>
+          <div class="bar-row"><div class="nm">sparkinfer</div><div class="track"><div class="fill" style="width:${bar(q3sp)}%;background:linear-gradient(90deg,#D14D72,#F08AA7)"></div></div><div class="v">${fmt(q3sp)}</div></div>
+          <div class="bar-row"><div class="nm">llama.cpp</div><div class="track"><div class="fill them" style="width:${bar(q3ll)}%"></div></div><div class="v">${fmt(q3ll)}</div></div>
+        </div>
+        <div style="flex:1;min-width:340px">
+          <div style="font-family:Sora;font-weight:700;font-size:16px;color:var(--title);margin-bottom:14px">
+            <span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#7B5DFF;margin-right:8px"></span>
+            Qwen3.6 35B-A3B · UD-Q4_K_M
+            <span style="font-weight:600;font-size:14px;color:${d36>=0?'var(--ok)':'var(--bad)'};margin-left:10px">${d36>=0?'+':''}${fmt(d36)}%</span>
+          </div>
+          <div class="bar-row"><div class="nm">sparkinfer</div><div class="track"><div class="fill" style="width:${bar(q36sp)}%;background:linear-gradient(90deg,#7B5DFF,#a78bff)"></div></div><div class="v">${fmt(q36sp)}</div></div>
+          <div class="bar-row"><div class="nm">llama.cpp</div><div class="track"><div class="fill them" style="width:${bar(q36ll)}%"></div></div><div class="v">${fmt(q36ll)}</div></div>
+        </div>
       </div>
       <div class="ctx-note">128-token decode · same RTX 5090 · same GPU · same GGUF</div>`;
   })();
@@ -421,28 +402,6 @@
       </div>`
     }).join("");
     $("detail-q3").innerHTML = `${detailRows}<div class="ctx-note" style="margin-top:12px">sparkinfer vs llama.cpp · same GPU · same Qwen3-30B Q4_K_M GGUF</div>`;
-  })();
-
-  // Qwen3.5 per-context detail: 128 / 512 / 4k bars vs llama.cpp
-  (function(){
-    const rows = (D.qwen35?.ctx||[]).filter(x=>x.ref_tps);
-    if (!rows.length) return;
-    const maxT = Math.max(...rows.flatMap(x=>[x.tps||0, x.ref_tps]));
-    const fmt=v=>v>0?v.toFixed(2):"pending"; const bar=v=>Math.max(3, 100*v/maxT);
-    const detailRows = rows.map(x=>{
-      const d=x.tps>0?100*(x.tps-x.ref_tps)/x.ref_tps:null;
-      return `<div class="bar-row">
-        <div class="nm">${x.label}<small>${x.label==="128"?"no prefill":"128 gen tok"}</small></div>
-        <div class="track"><div class="fill" style="width:${x.tps>0?bar(x.tps):0}%;background:linear-gradient(90deg,${x.color},${x.color}88)"></div></div>
-        <div class="v" style="font-size:12px;color:var(--body);margin-left:8px">${fmt(x.tps)}</div>
-      </div>
-      <div class="bar-row">
-        <div class="nm">llama.cpp</div>
-        <div class="track"><div class="fill them" style="width:${bar(x.ref_tps)}%"></div></div>
-        <div class="v" style="font-size:12px;color:var(--body);margin-left:8px">${fmt(x.ref_tps)}${d!=null?` <span style="color:${d>=0?'var(--ok)':'var(--bad)'};font-weight:700;font-size:13px">${d>=0?'+':''}${d.toFixed(1)}%</span>`:''}</div>
-      </div>`
-    }).join("");
-    $("detail-q35").innerHTML = `${detailRows}<div class="ctx-note" style="margin-top:12px">sparkinfer vs llama.cpp · same GPU · Qwythos-9B Q4_K_M GGUF · sparkinfer pending</div>`;
   })();
 
   // Qwen3.6 per-context detail: 128 / 512 / 4k bars vs llama.cpp

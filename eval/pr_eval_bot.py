@@ -350,25 +350,13 @@ def render(res, oid):
     # verdict can REJECT on the GUARD even when every scored-model gate passes, so the guard's own
     # per-context results must be shown — otherwise the table reads "all pass" next to a REJECT.
     guard = res.get("guard") or {}
-    guard36 = res.get("guard36") or {}
-    guard3 = res.get("guard3") or {}
     scored_model = res.get("model")
-    bidir = res.get("mode") == "bidir" or bool(res.get("score_qwen35"))
-    dual = bool(guard) and bool(scored_model) and not (guard36 or guard3) and not bidir
-    triple = bool(guard36 or guard3) and bool(scored_model) and not bidir
-    short = scored_model.split("(")[0].strip() if scored_model else ""
-    if not short and scored_model:
-        short = scored_model.split("-")[0]
+    dual = bool(guard) and bool(scored_model)
+    short = scored_model.split("-")[0] if scored_model else ""       # "Qwen3.6"
     gname = res.get("guard_model", "Qwen3-30B")
-    rows = [f"| **label** | `eval:{label}` |"]
-    if bidir:
-        rows.append(f"| Qwen3.5 score | `eval-qwen35:{res.get('label_qwen35', '?')}` "
-                    f"({'pass' if res.get('pass_qwen35') else 'fail'}) |")
-        rows.append(f"| Qwen3.6 score | `eval-qwen36:{res.get('label_qwen36', '?')}` "
-                    f"({'pass' if res.get('pass_qwen36') else 'fail'}) |")
-    rows += [
-            f"| scored decode ({res.get('score_context', 128)} ctx{f' · {ctx_label}' if ctx_label else ''}{f' · {short}' if dual or triple or bidir else ''}) | {res.get('tps','?')} tok/s |",
-            f"| correctness{f' ({short} vs llama.cpp)' if dual or triple or bidir else ''} | top-1 {res.get('top1',0)*100:.1f}% · KL {res.get('kl','?')} |"]
+    rows = [f"| **label** | `eval:{label}` |",
+            f"| scored decode ({res.get('score_context', 128)} ctx{f' · {ctx_label}' if ctx_label else ''}{f' · {short}' if dual else ''}) | {res.get('tps','?')} tok/s |",
+            f"| correctness{f' ({short} vs llama.cpp)' if dual else ''} | top-1 {res.get('top1',0)*100:.1f}% · KL {res.get('kl','?')} |"]
     # scored-model per-context no-regression gates — SKIP contexts not measured (tps 0/None) so a
     # deliberately-skipped 16k/32k never renders a misleading "0.0 tok/s · pass".
     for key, gkey, bkey, lbl in [("ctx_128_tps", "guard_128_pass", "guard_128_baseline", "128-token"),
@@ -381,7 +369,7 @@ def render(res, oid):
             continue
         gate = "pass" if res.get(gkey, True) else "fail"
         base = res.get(bkey) or _GUARD_BASE_FALLBACK.get(bkey, 0)
-        rows.append(f"| {f'{short} ' if dual or triple else ''}{lbl} no-regression gate | {tps} tok/s"
+        rows.append(f"| {f'{short} ' if dual else ''}{lbl} no-regression gate | {tps} tok/s"
                     f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
     if res.get("ctx_2048_tps") is not None and res.get("ctx_512_tps") is None:
         gate = "pass" if res.get("guard_2k_pass", True) else "fail"
@@ -389,29 +377,6 @@ def render(res, oid):
         rows.append(f"| legacy 2k no-regression gate | {res.get('ctx_2048_tps')} tok/s"
                     f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
     # The Qwen3-30B no-regression guard — the check that actually gates a dual verdict.
-    if bidir:
-        for title, block in [("Qwen3.5 optimize", res.get("score_qwen35") or {}),
-                             ("Qwen3.6 optimize", res.get("score_qwen36") or {})]:
-            if not block:
-                continue
-            rows.append(f"| **{title}** | `eval:{block.get('label','?')}` · "
-                        f"{block.get('tps','?')} tok/s · {'pass' if block.get('pass') else 'fail'} |")
-            g = block.get("guard") or {}
-            gname = block.get("guard_model", "guard")
-            if g:
-                rows.append(f"| {title} — {gname} guard accuracy | "
-                            f"top-1 {g.get('top1',0)*100:.1f}% · KL {g.get('kl','?')} · "
-                            f"{'pass' if g.get('accuracy_ok', True) else '**FAIL**'} |")
-                for key, gkey, lbl in [("ctx_128_tps", "guard_128_pass", "128"),
-                                       ("ctx_512_tps", "guard_512_pass", "512"),
-                                       ("ctx_4096_tps", "guard_4k_pass", "4k"),
-                                       ("ctx_16384_tps", "guard_16k_pass", "16k"),
-                                       ("ctx_32768_tps", "guard_32k_pass", "32k")]:
-                    tps = g.get(key)
-                    if not tps:
-                        continue
-                    rows.append(f"| {title} — {gname} {lbl} | {tps} tok/s · "
-                                f"{'pass' if g.get(gkey, True) else '**fail**'} |")
     if dual:
         acc_ok = "pass" if guard.get("accuracy_ok", True) else "**FAIL**"
         rows.append(f"| **{gname} guard — accuracy** | top-1 {guard.get('top1',0)*100:.1f}% · KL {guard.get('kl','?')} · {acc_ok} |")
@@ -424,22 +389,6 @@ def render(res, oid):
             if not tps:
                 continue
             rows.append(f"| {gname} guard — {lbl} | {tps} tok/s · {'pass' if guard.get(gkey, True) else '**fail**'} |")
-    if triple:
-        for gblock, gtitle in [(guard36, res.get("guard36_model", "Qwen3.6")),
-                               (guard3, res.get("guard3_model", "Qwen3-30B"))]:
-            if not gblock:
-                continue
-            acc_ok = "pass" if gblock.get("accuracy_ok", True) else "**FAIL**"
-            rows.append(f"| **{gtitle} guard — accuracy** | top-1 {gblock.get('top1',0)*100:.1f}% · KL {gblock.get('kl','?')} · {acc_ok} |")
-            for key, gkey, lbl in [("ctx_128_tps", "guard_128_pass", "128-token"),
-                                   ("ctx_512_tps", "guard_512_pass", "512-context"),
-                                   ("ctx_4096_tps", "guard_4k_pass", "4k-context"),
-                                   ("ctx_16384_tps", "guard_16k_pass", "16k-context"),
-                                   ("ctx_32768_tps", "guard_32k_pass", "32k-context")]:
-                tps = gblock.get(key)
-                if not tps:
-                    continue
-                rows.append(f"| {gtitle} guard — {lbl} | {tps} tok/s · {'pass' if gblock.get(gkey, True) else '**fail**'} |")
     if res.get("regression_labels") or res.get("guard_regression_labels"):
         allregs = (res.get("regression_labels") or []) + (res.get("guard_regression_labels") or [])
         rows.append(f"| regressions | {', '.join(allregs)} |")
@@ -708,49 +657,7 @@ def record_merge(repo, num):
     data = load_dash()
     if data is None: return
     e = next((p for p in data.get("prs", []) if p.get("num") == num), None)
-    if not e:
-        return
-    if e.get("mode") == "bidir":
-        if not ((e.get("pass_qwen35") and e.get("label_qwen35") in SPEEDUP_LABELS) or
-                (e.get("pass_qwen36") and e.get("label_qwen36") in SPEEDUP_LABELS) or
-                e.get("label") in SPEEDUP_LABELS):
-            return
-        changed = False
-        if e.get("pass_qwen36") and e.get("label_qwen36") in SPEEDUP_LABELS:
-            sub = e.get("score_qwen36") or e
-            q36 = data.setdefault("qwen36", {})
-            old_f = round(q36.get("frontier_tps") or q36.get("baseline_tps") or 0, 2)
-            new_f = round(max(old_f, sub.get("tps") or 0), 2)
-            q36["frontier_tps"] = new_f
-            if sub.get("top1") is not None: q36["token_match"] = round(sub["top1"], 4)
-            if sub.get("kl") is not None:   q36["kl"] = round(sub["kl"], 4)
-            short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
-            landed = [m for m in data.get("landed_qwen36", []) if m.get("pr") != num and not m.get("baseline")]
-            landed.append({"name": short or f"PR #{num}", "tps": new_f, "pr": num,
-                           "date": datetime.date.today().isoformat(), "label": e.get("label_qwen36")})
-            data["landed_qwen36"] = sorted(landed, key=lambda m: m["tps"])
-            changed = True
-        if e.get("pass_qwen35") and e.get("label_qwen35") in SPEEDUP_LABELS:
-            sub = e.get("score_qwen35") or e
-            q35 = data.setdefault("qwen35", {})
-            old_f = round(q35.get("frontier_tps") or q35.get("baseline_tps") or 0, 2)
-            new_f = round(max(old_f, sub.get("tps") or 0), 2)
-            q35["frontier_tps"] = new_f
-            if sub.get("top1") is not None: q35["token_match"] = round(sub["top1"], 4)
-            if sub.get("kl") is not None:   q35["kl"] = round(sub["kl"], 4)
-            short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
-            landed = [m for m in data.get("landed_qwen35", []) if m.get("pr") != num]
-            landed.append({"name": short or f"PR #{num}", "tps": new_f, "pr": num,
-                           "date": datetime.date.today().isoformat(), "label": e.get("label_qwen35")})
-            data["landed_qwen35"] = sorted(landed, key=lambda m: m["tps"])
-            changed = True
-        if changed:
-            data["updated"] = datetime.date.today().isoformat()
-            write_dash(data)
-            push_dash(f"dashboard: PR #{num} merged -> bidir frontier update")
-        return
-    if e.get("label") not in SPEEDUP_LABELS:
-        return
+    if not e or e.get("label") not in SPEEDUP_LABELS: return                 # only verified speedups
     # A Qwen3.6 dual-eval result must advance the Qwen3.6 frontier/journey, not Qwen3-MoE's — its
     # delta_pct was measured against a different baseline (23 tok/s, +635%), and applying that gain
     # to Qwen3-MoE's 493 frontier inflates the chart 7.4× per PR. Route to landed_qwen36.
@@ -961,15 +868,8 @@ def main():
     # Dual-model: score Qwen3.6-35B-A3B (primary) and guard Qwen3-30B against no-regression.
     # Each PR is scored directly against the SAME-BOX origin/main baseline (measured once per run),
     # not a passed-in frontier number — so the gain is hardware-independent and always current.
-    ap.add_argument("--bidir", action="store_true",
-                    help="bidirectional Qwen3.5 + Qwen3.6 eval via evaluate_bidir.sh")
     ap.add_argument("--dual", action="store_true",
-                    help="legacy alias for --bidir")
-    ap.add_argument("--triple", action="store_true",
-                    help="legacy alias for --bidir")
-    ap.add_argument("--primary-quant", default=os.environ.get("PRIMARY_QUANT", "Q4_K_M"),
-                    choices=["Q4_K_M", "Q8_0", "BF16"],
-                    help="[--triple] Qwythos GGUF quant (default Q4_K_M)")
+                    help="score Qwen3.6 (primary) + guard Qwen3-30B (no-regression) via evaluate_dual.sh")
     ap.add_argument("--polaris", action="store_true",
                     help="generate a Polaris verifiable receipt for each eval")
     ap.add_argument("--only-pr", type=int, default=0,
@@ -977,11 +877,6 @@ def main():
     ap.add_argument("--reeval", action="store_true",
                     help="re-run eval even if this commit was already graded (use with --only-pr)")
     args = ap.parse_args()
-    if args.triple or args.dual:
-        args.bidir = True
-    if os.environ.get("BIDIR", "1") != "0" and not any(
-            a in sys.argv for a in ("--bidir", "--triple", "--dual")):
-        args.bidir = True
     if not ssh_box_enabled() and not args.instance:
         ap.error("--instance is required for vast.ai transport (or set EVAL_TRANSPORT=ssh + EVAL_SSH_HOST)")
     if ssh_box_enabled():
@@ -999,14 +894,6 @@ def main():
         "llama128": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_128", "275.81")),
         "llama512": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_512", "275.61")),
         "llama4k":  float(os.environ.get("SPARKINFER_QWEN36_LLAMA_4K",  "276.30")),
-    }
-    QWYTHOS_BASE = {
-        "128": float(os.environ.get("SPARKINFER_QWYTHOS_128", "0")),
-        "512": float(os.environ.get("SPARKINFER_QWYTHOS_512", "0")),
-        "4k":  float(os.environ.get("SPARKINFER_QWYTHOS_4K",  "0")),
-        "llama128": float(os.environ.get("QWEN35_9B_LLAMA_128", "0")),
-        "llama512": float(os.environ.get("QWEN35_9B_LLAMA_512", "0")),
-        "llama4k":  float(os.environ.get("QWEN35_9B_LLAMA_4K",  "0")),
     }
 
     # --- Polaris verifiable compute ---
@@ -1217,8 +1104,6 @@ def main():
             *_vast_eval_transport_args(args.instance),
             "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling),
             "--eval-mode", "longctx", "--keep"]
-    if args.bidir:
-        bcmd += ["--bidir", "--primary-quant", args.primary_quant]
     if PINNED_INSTANCE and not ssh_box_enabled() and str(base_iid) == PINNED_INSTANCE:
         bcmd.append("--pinned")
     box_label = ssh_box_arg() if ssh_box_enabled() else f"instance {base_iid}"
@@ -1237,34 +1122,17 @@ def main():
             except Exception: pass
     bline = next((l for l in br.stdout.splitlines() if l.startswith("RESULT_JSON")), None)
     bres = json.loads(bline[len("RESULT_JSON "):]) if bline else {}
-    if not bres.get("label"):
+    if not bres.get("pass") or not bres.get("tps"):
         log = (br.stdout + br.stderr)[-1200:]
         print(f">> same-box baseline (origin/main) failed ({bres.get('label','no result')}) — "
               f"aborting; no PRs graded.\n{log}"); return
-    if args.bidir and not (bres.get("pass") or bres.get("score_qwen35") or bres.get("score_qwen36")):
-        log = (br.stdout + br.stderr)[-1200:]
-        print(f">> bidir baseline (origin/main) failed — aborting; no PRs graded.\n{log}"); return
-    if not args.bidir and (not bres.get("pass") or not bres.get("tps")):
-        log = (br.stdout + br.stderr)[-1200:]
-        print(f">> same-box baseline (origin/main) failed ({bres.get('label','no result')}) — "
-              f"aborting; no PRs graded.\n{log}"); return
-    if args.bidir:
-        run_baseline = float((bres.get("score_qwen36") or {}).get("tps") or bres.get("tps") or 0)
-        s36 = bres.get("score_qwen36") or {}
-        run_guard_128 = float(s36.get("ctx_128_tps") or run_baseline)
-        run_guard_512 = float(s36.get("ctx_512_tps") or 0)
-        run_guard_4k = float(s36.get("ctx_4096_tps") or 0)
-        run_guard_16k = float(s36.get("ctx_16384_tps") or run_baseline)
-        run_guard_32k = float(s36.get("ctx_32768_tps") or 0)
-        score_ctx = int(s36.get("score_context") or bres.get("score_context") or 128)
-    else:
-        run_baseline = bres["tps"]
-        run_guard_128 = float(bres.get("ctx_128_tps") or bres.get("tps") or 0)
-        run_guard_512 = float(bres.get("ctx_512_tps") or 0)
-        run_guard_4k = float(bres.get("ctx_4096_tps") or 0)
-        run_guard_16k = float(bres.get("ctx_16384_tps") or bres.get("tps") or 0)
-        run_guard_32k = float(bres.get("ctx_32768_tps") or 0)
-        score_ctx = int(bres.get("score_context") or 128)
+    run_baseline = bres["tps"]
+    run_guard_128 = float(bres.get("ctx_128_tps") or bres.get("tps") or 0)
+    run_guard_512 = float(bres.get("ctx_512_tps") or 0)
+    run_guard_4k = float(bres.get("ctx_4096_tps") or 0)
+    run_guard_16k = float(bres.get("ctx_16384_tps") or bres.get("tps") or 0)
+    run_guard_32k = float(bres.get("ctx_32768_tps") or 0)
+    score_ctx = int(bres.get("score_context") or 128)
     if score_ctx == 128:
         print(f">> same-box baseline: origin/main = {run_baseline} tok/s on this box")
     else:
@@ -1286,8 +1154,9 @@ def main():
               f"Aborting; NO PRs graded. Re-run on a warm, stable box.")
         return
 
-    # Bidir mode: bench both model mains on the box (Qwen3.5 at 128/512/4k only).
-    if args.bidir and _vast_sh:
+    # Dual mode: bench Qwen3.6 main directly on the box — the same build the Qwen3-30B
+    # baseline already verified. No accuracy gate, just a 5-context decode sweep.
+    if args.dual and _vast_sh:
         ssh_ep = ssh_box_endpoint()
         if ssh_ep:
             host, port = ssh_ep
@@ -1298,43 +1167,37 @@ def main():
             host, port = _vast_endpoint(info) if info else (None, None)
         else:
             host = port = None
-
-        def _ctx_sweep(host, port, gguf, label, store, ctx_list=None):
-            B = "/root/sparkinfer/build/runtime/qwen3_gguf_bench"
-            tps = {}
-            sweep = ctx_list or [("128", 0), ("512", 512), ("4k", 4096),
-                                 ("16k", 16384), ("32k", 32768)]
-            for lbl, ctx in sweep:
-                cmd = f"export PATH=/usr/local/cuda/bin:$PATH; {B} '{gguf}' 128 {ctx}"
+        if host and port:
+            M36 = "/workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            B36 = "/root/sparkinfer/build/runtime/qwen3_gguf_bench"
+            tps128 = tps512 = tps4k = tps16k = tps32k = 0.0
+            for label, ctx in [("128", 0), ("512", 512), ("4k", 4096),
+                               ("16k", 16384), ("32k", 32768)]:
+                cmd = f"export PATH=/usr/local/cuda/bin:$PATH; {B36} '{M36}' 128 {ctx}"
                 r = _vast_sh(host, port, cmd, timeout=600)
                 m = re.search(r"decode\s+tg\s*:\s*([0-9.]+)", r.stdout + r.stderr)
-                tps[lbl] = float(m.group(1)) if m else 0.0
-                print(f"    [{label}] ctx={lbl} tps={tps[lbl]}")
-            if tps.get("128", 0) > 0:
-                store["128"] = tps["128"]
-                store["512"] = tps["512"] if tps["512"] > 0 else round(tps["128"] * 0.98, 2)
-                store["4k"]  = tps["4k"]  if tps["4k"]  > 0 else round(tps["128"] * 0.93, 2)
-                store["16k"] = tps["16k"] if tps["16k"] > 0 else store.get("16k", 0)
-                store["32k"] = tps["32k"] if tps["32k"] > 0 else store.get("32k", 0)
-                print(f"  {label} same-box main: 128={store['128']} 512={store['512']} "
-                      f"4k={store['4k']} 16k={store['16k']} 32k={store['32k']} tok/s")
+                if m: tps = float(m.group(1))
+                else: tps = 0.0
+                if label == "128": tps128 = tps
+                elif label == "512": tps512 = tps
+                elif label == "4k":  tps4k  = tps
+                elif label == "16k": tps16k = tps
+                else:               tps32k = tps
+                print(f"    ctx={label} tps={tps}")
+            if tps128 > 0:
+                QWEN36_BASE["128"] = tps128
+                QWEN36_BASE["512"] = tps512 if tps512 > 0 else round(tps128 * 0.98, 2)
+                QWEN36_BASE["4k"]  = tps4k  if tps4k  > 0 else round(tps128 * 0.93, 2)
+                QWEN36_BASE["16k"] = tps16k if tps16k > 0 else QWEN36_BASE["16k"]
+                QWEN36_BASE["32k"] = tps32k if tps32k > 0 else QWEN36_BASE["32k"]
+                print(f"  Qwen3.6 same-box main: 128={tps128} 512={QWEN36_BASE['512']} "
+                      f"4k={QWEN36_BASE['4k']} 16k={QWEN36_BASE['16k']} 32k={QWEN36_BASE['32k']} tok/s")
             else:
-                print(f"  {label} bench failed — using config defaults")
-
-        if host and port:
-            _ctx_sweep(host, port, "/workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
-                       "Qwen3.6", QWEN36_BASE)
-            qmap = {
-                "Q4_K_M": "Qwythos-9B-Claude-Mythos-5-1M-Q4_K_M.gguf",
-                "Q8_0":   "Qwythos-9B-Claude-Mythos-5-1M-Q8_0.gguf",
-                "BF16":   "Qwythos-9B-Claude-Mythos-5-1M-BF16.gguf",
-            }
-            qfile = qmap[args.primary_quant]
-            _ctx_sweep(host, port, f"/workspace/models35/{qfile}",
-                       f"Qwythos ({args.primary_quant})", QWYTHOS_BASE,
-                       ctx_list=[("128", 0), ("512", 512), ("4k", 4096)])
+                print(f"  Qwen3.6 bench failed — using defaults: "
+                      f"{QWEN36_BASE['128']}/{QWEN36_BASE['512']}/{QWEN36_BASE['4k']}/"
+                      f"{QWEN36_BASE['16k']}/{QWEN36_BASE['32k']}")
         else:
-            print(f"  could not reach eval box for model bench — using config defaults")
+            print(f"  could not reach eval box for Qwen3.6 bench — using config defaults")
 
     # Run all pending evals on the SAME instance: pass --keep so vast_eval.py never stops/destroys
     # the box mid-queue. The bot stops the instance once after ALL PRs finish (or if the instance
@@ -1358,26 +1221,16 @@ def main():
                "--guard-16k-baseline", str(run_guard_16k),
                "--guard-32k-baseline", str(run_guard_32k),
                "--keep"]
-        if args.bidir:
+        if args.dual:
+            # Qwen3.6 scored (128/512/4k); the --guard-*-baseline above become the Qwen3-30B guard.
+            # Scoring base = same-box origin/main baseline (the guard baselines), not a passed-in frontier.
             cmd[cmd.index("--keep"):cmd.index("--keep")] = [
-                "--bidir",
-                "--primary-quant", args.primary_quant,
-                "--p35-guard-128-baseline", str(QWYTHOS_BASE["128"]),
-                "--p35-guard-512-baseline", str(QWYTHOS_BASE["512"]),
-                "--p35-guard-4k-baseline",  str(QWYTHOS_BASE["4k"]),
+                "--dual",
                 "--p-guard-128-baseline", str(QWEN36_BASE["128"]),
                 "--p-guard-512-baseline", str(QWEN36_BASE["512"]),
                 "--p-guard-4k-baseline",  str(QWEN36_BASE["4k"]),
                 "--p-guard-16k-baseline", str(QWEN36_BASE["16k"]),
                 "--p-guard-32k-baseline", str(QWEN36_BASE["32k"]),
-                "--g36-guard-128-baseline", str(QWEN36_BASE["128"]),
-                "--g36-guard-512-baseline", str(QWEN36_BASE["512"]),
-                "--g36-guard-4k-baseline",  str(QWEN36_BASE["4k"]),
-                "--g36-guard-16k-baseline", str(QWEN36_BASE["16k"]),
-                "--g36-guard-32k-baseline", str(QWEN36_BASE["32k"]),
-                "--g35-guard-128-baseline", str(QWYTHOS_BASE["128"]),
-                "--g35-guard-512-baseline", str(QWYTHOS_BASE["512"]),
-                "--g35-guard-4k-baseline",  str(QWYTHOS_BASE["4k"]),
                 "--p-llama-128-baseline", str(QWEN36_BASE["llama128"]),
                 "--p-llama-512-baseline", str(QWEN36_BASE["llama512"]),
                 "--p-llama-4k-baseline",  str(QWEN36_BASE["llama4k"])]
@@ -1464,14 +1317,9 @@ def main():
             print("--- dry-run, not posting ---\n" + body); continue
         if label:
             cur = labels_on(args.repo, num)
-            for lab in {l for l in cur if l.startswith("eval:") or l.startswith("eval-qwen")}:
+            for lab in {l for l in cur if l.startswith("eval:")}:
                 remove_label(args.repo, num, lab)
             add_label(args.repo, num, f"eval:{label}")
-            if res and res.get("mode") == "bidir":
-                if res.get("label_qwen35"):
-                    add_label(args.repo, num, f"eval-qwen35:{res['label_qwen35']}")
-                if res.get("label_qwen36"):
-                    add_label(args.repo, num, f"eval-qwen36:{res['label_qwen36']}")
             apply_context_label(args.repo, num, cur, res.get("best_context_label"))
             apply_regression_labels(args.repo, num, cur, res.get("regression_labels"))
             # This was just graded against the CURRENT main, so it's no longer stale: clear

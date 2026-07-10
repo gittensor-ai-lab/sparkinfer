@@ -37,6 +37,6 @@ BOT_ARGS=(
 if [ "${EVAL_TRANSPORT:-vast}" != "ssh" ]; then
   BOT_ARGS+=(--instance "${VAST_INSTANCE:-42682383}")
 fi
-[ "${BIDIR:-${TRIPLE:-1}}" != "0" ] && BOT_ARGS+=(--bidir --primary-quant "${PRIMARY_QUANT:-Q4_K_M}")
+[ -n "${DUAL:-}" ] && BOT_ARGS+=(--dual)
 
 python3 eval/pr_eval_bot.py "${BOT_ARGS[@]}"

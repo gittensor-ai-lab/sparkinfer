@@ -69,35 +69,40 @@ The default eval target is now multi-context decode:
 
 Set `SPARKINFER_EVAL_MODE=short` or pass `--eval-mode short` to keep the legacy 128-token scoring path.
 
-## Bidirectional scoring: Qwen3.5 + Qwen3.6 (default)
+## Dual-model scoring: Qwen3.6 primary, Qwen3-30B no-regression guard
 
-`--bidir` (or `BIDIR=1` / legacy `TRIPLE=1` in `.env.eval`) scores **both directions** in one build:
+`--dual` scores **Qwen3.6-35B-A3B** (the current optimization frontier) and, in the same build on the
+same box, **guards Qwen3-30B-A3B against regression** — an optimization that speeds up Qwen3.6 must
+not quietly break or slow the shipped Qwen3 path.
 
 ```
-build once ─► score_qwen35  Qwythos-9B : 128/512/4k speed + accuracy ─► eval-qwen35:<LABEL>
-           │              guard Qwen3.6  : 5 contexts ─► must NOT regress
-           └► score_qwen36  Qwen3.6      : 128/512/4k/16k/32k ─► eval-qwen36:<LABEL>
-                          guard Qwen3.5  : 128/512/4k ─► must NOT regress
+build once ─► PRIMARY  Qwen3.6 : 128/512/4k/16k/32k speed + token-match/KL vs llama.cpp ─► eval:<LABEL>
+           └► GUARD    Qwen3-30B: same speed sweep + accuracy gate ─► must NOT regress, else REJECT
 ```
 
-- **Qwen3.5** (Qwythos-9B) is measured at **128, 512, 4k only** — not 16k/32k.
-- **Qwen3.6** runs the full **5-context** sweep (128/512/4k/16k/32k).
-- Each direction gets its own label: `eval-qwen35:<tier>` and `eval-qwen36:<tier>`.
-- Headline `eval:<label>` is the best verified tier among passing directions.
-- Qwen3-30B is **no longer** part of the eval pipeline.
-- `PRIMARY_QUANT` selects the Qwen3.5 GGUF: `Q4_K_M` (default), `Q8_0`, or `BF16`.
-- Models: `/workspace/models35` (Qwythos), `/workspace/models36` (Qwen3.6).
-- Orchestrator: `bench/scripts/evaluate_bidir.sh`.
+- The **eval:<label>** (XS…XL / none / REJECT) is driven **only by Qwen3.6** — its strongest single
+  context improvement over the Qwen3.6 frontier, same significance/bucket/difficulty rules as above.
+- The **Qwen3-30B guard** re-runs the full 5-context speed sweep **and** the top-1/KL accuracy gate.
+  If Qwen3 drops below 98% of its own same-box `origin/main` at *any* context, **or** breaks parity
+  with llama.cpp (top-1 < 0.90 or KL > 0.20), the whole submission is **REJECTed** with a
+  `no-regression guard` reason and `regression-qwen3-<ctx>` detail — regardless of the Qwen3.6 gain.
+- Both models' measurements merge into one `RESULT_JSON`; the Qwen3 guard block is under `guard`.
+- Cost: two ~20 GB model loads + two llama.cpp accuracy passes, run **sequentially** (they don't fit
+  in VRAM together), so a dual eval is ~2× a single-model eval.
 
 ```bash
-python eval/vast_eval.py --ssh HOST:PORT --bidir --primary-quant Q4_K_M --ref main
-./eval/run_bot.sh --bidir
+# Qwen3.6 scored, Qwen3-30B guarded (baselines are same-box origin/main tok/s per context):
+python eval/vast_eval.py --reuse <id> --dual \
+  --primary-frontier <qwen36_best_tps> --ceiling <roofline> \
+  --p-guard-128-baseline 23.2 --p-guard-512-baseline 23.2 --p-guard-4k-baseline 23.0 \
+  --p-guard-16k-baseline <..> --p-guard-32k-baseline <..> \
+  --guard-128-baseline 331 --guard-512-baseline 331 --guard-4k-baseline 322 \
+  --guard-16k-baseline 330 --guard-32k-baseline 300
 ```
 
-## Legacy dual/triple modes
-
-`--dual` and `--triple` are aliases for `--bidir`. The old Qwen3-30B guard paths
-(`evaluate_dual.sh`, `evaluate_triple.sh`) are retained for reference but no longer used by the bot.
+The on-box orchestrator is `bench/scripts/evaluate_dual.sh` (builds once, calls the model-agnostic
+`evaluate.sh` twice via `SI_SKIP_BUILD=1`, merges). Qwen3.6 runs the same UD-Q4_K_M GGUF the runtime
+now loads by default (mixed Q5_K experts).
 
 ## Verdict (stdout)
 

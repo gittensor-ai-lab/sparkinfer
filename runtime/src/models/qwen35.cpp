@@ -234,10 +234,6 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (cfg.n_shared > 0) {
         p_->sx_h  = p_->alloc<float>(cfg.moe_ffn);
         p_->sx_q8 = p_->alloc<char>(kernels::llama_q8_1_bytes(cfg.moe_ffn));
-    } else if (cfg.dense_ffn) {
-        p_->sh_gate = p_->alloc<bf16>(cfg.moe_ffn);
-        p_->sh_up   = p_->alloc<bf16>(cfg.moe_ffn);
-        p_->sh_h    = p_->alloc<bf16>(cfg.moe_ffn);
     }
     const size_t fa_n = (size_t)cfg.n_q_heads * Impl::MAX_NSPLITS;   // sized for the adaptive max
     p_->fa_m   = p_->alloc<float>(fa_n);
@@ -658,12 +654,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
             cudaEventRecord(s.ev_sx_done, s.stream_k);
         }
 
-        if (c.dense_ffn) {
-            kernels::launch_gemv(s.hn, w.gate, s.sh_gate, c.moe_ffn, H, st);
-            kernels::launch_gemv(s.hn, w.up, s.sh_up, c.moe_ffn, H, st);
-            kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w, s.sh_h, c.moe_ffn, st);
-            kernels::launch_gemv(s.sh_h, w.down, s.routed, H, c.moe_ffn, st);
-        } else if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
+        if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
             // The per-expert token counts only feed the batched-dispatch sort; the single-token
             // decode expert FFN reads ids/weights directly and never touches them. Zeroing that
             // buffer is a per-layer memset node in the replayed decode graph whose fixed cost far
@@ -910,10 +901,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     Impl& s = *p_;
     GGUF g;
     if (!g.open(path)) return false;
-    const bool dense_file = g.tensor("blk.0.ffn_gate.weight") != nullptr &&
-                            g.tensor("blk.0.ffn_gate_exps.weight") == nullptr;
-    const bool hybrid_file = is_qwen35_or_qwen36_hybrid_moe(g) || dense_file;
-    if (hybrid_file && !s.cfg.hybrid && !s.cfg.dense_ffn) {
+    const bool hybrid_file = is_qwen35_or_qwen36_hybrid_moe(g);
+    if (hybrid_file && !s.cfg.hybrid) {
         fprintf(stderr,
                 "[qwen35] Qwen3.5/Qwen3.6 hybrid GGUF requires constructing "
                 "Qwen35Model with cfg.hybrid=true and the GGUF metadata-derived "
@@ -921,9 +910,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 "cache are sized correctly.\n");
         return false;
     }
-    if (hybrid_file || s.cfg.dense_ffn) {
+    if (hybrid_file) {
         s.cfg.hybrid = true;
-        if (dense_file) s.cfg.dense_ffn = true;
         if (s.cfg.full_attn_interval <= 0) s.cfg.full_attn_interval = 4;
         if (s.cfg.rope_dim <= 0 && s.cfg.head_dim == 256) s.cfg.rope_dim = 64;
         if (s.cfg.linear_q_heads <= 0) s.cfg.linear_q_heads = 16;
@@ -950,11 +938,6 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // Shared-expert GEMV scratch [moe_ffn]. Allocated only on the GGUF path (native
     // [out,in] shared weights); the set_weights path keeps the moe_expert_ffn kernel.
     if (s.cfg.n_shared > 0 && !s.sh_gate) {
-        s.sh_gate = s.alloc<bf16>(s.cfg.moe_ffn);
-        s.sh_up   = s.alloc<bf16>(s.cfg.moe_ffn);
-        s.sh_h    = s.alloc<bf16>(s.cfg.moe_ffn);
-    }
-    if (s.cfg.dense_ffn && !s.sh_gate) {
         s.sh_gate = s.alloc<bf16>(s.cfg.moe_ffn);
         s.sh_up   = s.alloc<bf16>(s.cfg.moe_ffn);
         s.sh_h    = s.alloc<bf16>(s.cfg.moe_ffn);
@@ -1095,19 +1078,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         }
         if (!expect_dims_opt(b + "attn_post_norm.weight", {H}) ||
             !expect_dims_opt(b + "post_attention_norm.weight", {H}) ||
-            !expect_dims_opt(b + "ffn_norm.weight", {H})) return false;
+            !expect_dims_opt(b + "ffn_norm.weight", {H}) ||
+            !expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
+        // pre-MoE norm: Qwen3-MoE = "ffn_norm"; Qwen3.6 GGUFs name it "post_attention_norm".
         w.post_attn_norm = dense_opt(b + "attn_post_norm.weight", false);
         if (!w.post_attn_norm) w.post_attn_norm = dense_opt(b + "post_attention_norm.weight", false);
         if (!w.post_attn_norm) w.post_attn_norm = dense(b + "ffn_norm.weight", false);
-        if (c.dense_ffn) {
-            if (!expect_dims(b + "ffn_gate.weight", {H, c.moe_ffn}) ||
-                !expect_dims(b + "ffn_up.weight", {H, c.moe_ffn}) ||
-                !expect_dims(b + "ffn_down.weight", {c.moe_ffn, H})) return false;
-            w.gate = dense(b + "ffn_gate.weight", false);
-            w.up   = dense(b + "ffn_up.weight", false);
-            w.down = dense(b + "ffn_down.weight", false);
-        } else {
-        if (!expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
         w.router_w = dense(b + "ffn_gate_inp.weight", false);   // native [E,H] for GEMV
         w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized
         w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
@@ -1137,15 +1113,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             const bool have_shared_d = w.shared_gate && w.shared_up && w.shared_down;
             if (!have_shared_q && !have_shared_d) return false;
         }
-        }
         const bool have_attn = w.linear_attn
             ? (w.wqkv && w.wqkv_gate && w.ssm_conv && w.ssm_dt && w.ssm_a &&
                w.ssm_beta && w.ssm_alpha && w.ssm_norm && w.ssm_out)
             : (w.wq && w.wk && w.wv && w.wo && w.q_norm && w.k_norm);
-        const bool have_ffn = c.dense_ffn
-            ? (w.gate && w.up && w.down)
-            : (w.router_w && w.gate_q && w.up_q && w.down_q);
-        if (!have_attn || !w.input_norm || !w.post_attn_norm || !have_ffn) return false;
+        if (!have_attn || !w.input_norm || !w.post_attn_norm ||
+            !w.router_w || !w.gate_q || !w.up_q || !w.down_q) return false;
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.

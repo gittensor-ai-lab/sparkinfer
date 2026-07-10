@@ -10,7 +10,6 @@
 # measured artifact is the submitted code.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/_common.sh"
-[ -f "$HERE/_qwythos.sh" ] && source "$HERE/_qwythos.sh"
 
 REF=""; FRONTIER=0; CEILING=0; GGUF=""
 while [ $# -gt 0 ]; do case "$1" in
@@ -22,9 +21,6 @@ export LLAMACPP_DIR="${LLAMACPP_DIR:-/workspace/.llamacpp}"   # persist llama.cp
 # Single-model Qwen3.6 evals must pin the Qwen3.6 GGUF sha (evaluate_dual.sh does this per-model).
 case "$MODEL_FILE" in
   *Qwen3.6*) MODEL_SHA256="${MODEL_SHA256:-${QWEN36_MODEL_SHA256:-}}" ;;
-  *Qwythos*|*Qwen3.5*)
-    _qsha="$(qwythos_sha_var 2>/dev/null || true)"
-    [ -n "$_qsha" ] && MODEL_SHA256="${MODEL_SHA256:-$_qsha}" ;;
 esac
 ARCH="$(detect_arch)"
 

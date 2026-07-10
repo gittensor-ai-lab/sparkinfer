@@ -31,10 +31,6 @@ struct Qwen35Config {
     int   linear_v_heads = 32;
     int   linear_head_dim = 128;
     int   linear_conv_kernel = 4;
-
-    // Qwythos / Qwen3.5-9B dense hybrid GGUFs use a single SwiGLU FFN per layer
-    // (ffn_gate/up/down) instead of routed experts.
-    bool  dense_ffn   = false;
 };
 
 } // namespace sparkinfer

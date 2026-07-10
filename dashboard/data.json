@@ -1806,38 +1806,6 @@
       }
     ]
   },
-  "qwen35": {
-    "model": "Qwythos-9B (Qwen3.5-9B) · Q4_K_M",
-    "arch": "dense hybrid Gated-DeltaNet + full-attn · 9B · hd256",
-    "frontier_tps": 129.53,
-    "baseline_tps": 129.53,
-    "ref_name": "llama.cpp",
-    "ref_tps": 224.91,
-    "token_match": 0,
-    "kl": 0,
-    "note": "main baseline RTX 5090 2026-07-10 · dense hybrid loader · eval at 128/512/4k",
-    "ctx": [
-      {
-        "label": "128",
-        "color": "#FF6B35",
-        "tps": 129.53,
-        "ref_tps": 224.91
-      },
-      {
-        "label": "512",
-        "color": "#00B4D8",
-        "tps": 128.98,
-        "ref_tps": 225.10
-      },
-      {
-        "label": "4k",
-        "color": "#9B5DE5",
-        "tps": 126.06,
-        "ref_tps": 224.68
-      }
-    ]
-  },
-  "landed_qwen35": [],
   "qwen36": {
     "model": "Qwen3.6-35B-A3B · UD-Q4_K_M",
     "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
