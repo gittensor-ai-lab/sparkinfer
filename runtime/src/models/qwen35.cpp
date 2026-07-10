@@ -972,6 +972,30 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         s.owned.push_back(d);
         return d;
     };
+    // Dense-FFN down: keep GGUF Q6_K by default, or (SPARKINFER_DOWN_REQUANT_Q4K=1)
+    // dequant->requant to Q4_K at load so decode reads 4.5 vs 6.5 bits/weight. The
+    // Q6_K upload is freed after the requant; qtype flips to 12 on success.
+    auto dev_quant_down = [&](const std::string& name, int& qtype) -> const void* {
+        const void* q6 = dev_quant(name, qtype);
+        static int req = -1;
+        if (req < 0) { const char* e = getenv("SPARKINFER_DOWN_REQUANT_Q4K"); req = (e && e[0] == '1') ? 1 : 0; }
+        if (!req || qtype != 14 || !q6) return q6;
+        const GGUFTensor* t = g.tensor(name);
+        const long nv = t->n_values;
+        if (nv % 256 != 0) return q6;
+        void* deq = nullptr;
+        if (cudaMalloc(&deq, (size_t)nv * 2) != cudaSuccess) return q6;
+        kernels::launch_gguf_dequant(14, q6, deq, nv, s.stream);
+        void* q4 = nullptr;
+        if (cudaMalloc(&q4, (size_t)(nv / 256) * 144) != cudaSuccess) { cudaFree(deq); return q6; }
+        kernels::launch_ffn_down_requant_q4k(deq, q4, nv, s.stream);
+        cudaStreamSynchronize(s.stream);
+        cudaFree(deq);
+        if (!s.owned.empty() && s.owned.back() == q6) { s.owned.pop_back(); cudaFree((void*)q6); }
+        s.owned.push_back(q4);
+        qtype = 12;
+        return q4;
+    };
     // dense weight -> bf16 (optionally transpose [out,in] -> [in,out])
     auto dense = [&](const std::string& name, bool transpose) -> const void* {
         const GGUFTensor* t = g.tensor(name);
@@ -1102,7 +1126,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 !expect_dims(b + "ffn_down.weight", {c.moe_ffn, H})) return false;
             w.gate_q = dev_quant(b + "ffn_gate.weight", w.gate_qtype);
             w.up_q   = dev_quant(b + "ffn_up.weight", w.up_qtype);
-            w.down_q = dev_quant(b + "ffn_down.weight", w.down_qtype);
+            w.down_q = dev_quant_down(b + "ffn_down.weight", w.down_qtype);
         } else {
         if (!expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
         w.router_w = dense(b + "ffn_gate_inp.weight", false);   // native [E,H] for GEMV

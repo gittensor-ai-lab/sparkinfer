@@ -33,4 +33,9 @@ void launch_transpose_bf16(const void* src, void* dst, int rows, int cols,
 void launch_transpose3d_bf16(const void* src, void* dst, int E, int A, int B,
                              cudaStream_t stream = nullptr);        // [E,A,B]->[E,B,A]
 
+// Requantize a dense-FFN down projection bf16 -> Q4_K (ggml super-block layout consumed
+// by si_vec_dot_q4_K). Load-time only; n_values must be a multiple of 256.
+void launch_ffn_down_requant_q4k(const void* src_bf16, void* dst_q4k, long n_values,
+                                 cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels
