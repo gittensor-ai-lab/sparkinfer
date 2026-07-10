@@ -94,6 +94,25 @@ python eval/vast_eval.py --ssh HOST:PORT --bidir --primary-quant Q4_K_M --ref ma
 ./eval/run_bot.sh --bidir
 ```
 
+## Polaris TDX receipts (default)
+
+Eval runs through **Polaris** by default (`POLARIS=1`). The GPU box collects an unsigned
+attestation via `eval/polaris/judge.py`; the bot host submits it to Polaris for Intel TDX
+verification and uploads the signed receipt with the eval log.
+
+```bash
+# .env.eval
+POLARIS=1
+POLARIS_API_KEY=pi_sk_...
+POLARIS_API_BASE=https://polaris.computer
+
+./eval/run_bot.sh              # Polaris on (default)
+./eval/run_bot.sh --no-polaris # legacy unsigned path
+./eval/run_polaris_test.sh     # end-to-end smoke test
+```
+
+Set `POLARIS=0` in `.env.eval` or pass `--no-polaris` to disable.
+
 ## Legacy dual/triple modes
 
 `--dual` and `--triple` are aliases for `--bidir`. The old Qwen3-30B guard paths

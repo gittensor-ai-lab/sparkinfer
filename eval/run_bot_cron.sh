@@ -9,6 +9,7 @@
 #   EVAL_TRANSPORT=ssh   — fixed GPU box via EVAL_SSH_HOST / EVAL_SSH_PORT (no vast billing)
 export HOME="${HOME:-/home/speedy}"
 export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
 export SPARKINFER_AUTOMERGE=1   # auto-merge the round's merge-first winner (guarded). Set 0 to disable.
 
 exec 9>/tmp/sparkinfer_bot.lock
@@ -38,5 +39,10 @@ if [ "${EVAL_TRANSPORT:-vast}" != "ssh" ]; then
   BOT_ARGS+=(--instance "${VAST_INSTANCE:-42682383}")
 fi
 [ "${BIDIR:-${TRIPLE:-1}}" != "0" ] && BOT_ARGS+=(--bidir --primary-quant "${PRIMARY_QUANT:-Q4_K_M}")
+if [ "${POLARIS:-1}" = "0" ]; then
+  BOT_ARGS+=(--no-polaris)
+else
+  BOT_ARGS+=(--polaris)
+fi
 
 python3 eval/pr_eval_bot.py "${BOT_ARGS[@]}"

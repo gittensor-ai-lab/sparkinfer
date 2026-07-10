@@ -971,7 +971,9 @@ def main():
                     choices=["Q4_K_M", "Q8_0", "BF16"],
                     help="[--triple] Qwythos GGUF quant (default Q4_K_M)")
     ap.add_argument("--polaris", action="store_true",
-                    help="generate a Polaris verifiable receipt for each eval")
+                    help="generate a Polaris verifiable receipt for each eval (default: on)")
+    ap.add_argument("--no-polaris", action="store_true",
+                    help="disable Polaris TDX receipts (overrides POLARIS=1)")
     ap.add_argument("--only-pr", type=int, default=0,
                     help="evaluate only this PR number (must be open)")
     ap.add_argument("--reeval", action="store_true",
@@ -982,6 +984,10 @@ def main():
     if os.environ.get("BIDIR", "1") != "0" and not any(
             a in sys.argv for a in ("--bidir", "--triple", "--dual")):
         args.bidir = True
+    if args.no_polaris:
+        args.polaris = False
+    elif not args.polaris and os.environ.get("POLARIS", "1") != "0":
+        args.polaris = True
     if not ssh_box_enabled() and not args.instance:
         ap.error("--instance is required for vast.ai transport (or set EVAL_TRANSPORT=ssh + EVAL_SSH_HOST)")
     if ssh_box_enabled():

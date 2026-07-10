@@ -265,10 +265,16 @@ def main():
     ap.add_argument("--pinned", action="store_true", help="the --reuse box is the stable default: NEVER destroy it; on bring-up failure exit PINNED_RETRY_RC for up to REUSE_MAX_RETRIES runs before provisioning a new box (pinned kept)")
     ap.add_argument("--destroy-on-error", action="store_true", help="destroy (not just stop) the instance if the eval produces no result")
     ap.add_argument("--polaris", action="store_true",
-                    help="generate a Polaris verifiable receipt (unsigned attestation from eval box)")
+                    help="generate a Polaris verifiable receipt (default: on)")
+    ap.add_argument("--no-polaris", action="store_true",
+                    help="disable Polaris TDX receipts (overrides POLARIS=1)")
     args = ap.parse_args()
     if args.triple or args.dual:
         args.bidir = True
+    if args.no_polaris:
+        args.polaris = False
+    elif not args.polaris and os.environ.get("POLARIS", "1") != "0":
+        args.polaris = True
 
     if not args.ssh and ssh_box_enabled():
         args.ssh = ssh_box_arg()

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Run the sparkinfer PR eval bot once (interactive). Sources .env.eval for transport + secrets.
 #
-#   ./eval/run_bot.sh              # full run on SSH box (or vast if EVAL_TRANSPORT=vast)
+#   ./eval/run_bot.sh              # full run on SSH box (Polaris TDX on by default)
 #   ./eval/run_bot.sh --dry-run    # poll PRs + print plan, no GPU eval
 #   ./eval/run_bot.sh --bidir      # Qwen3.5 + Qwen3.6 bidirectional eval (default)
-#   ./eval/run_bot.sh --triple     # legacy alias for --bidir
+#   ./eval/run_bot.sh --no-polaris # skip Polaris TDX receipts
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,6 +22,7 @@ fi
 
 export SSH_KEY="${SSH_KEY:-$HOME/.ssh/speedy}"
 export PATH="/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
 
 BOT_ARGS=(
   --frontier "${FRONTIER:-285}"
@@ -36,9 +37,11 @@ if printf '%s\n' "$@" | grep -qx -- '--bidir' || \
    [ -n "${DUAL:-}" ] || printf '%s\n' "$@" | grep -qxE -- '--triple|--dual'; then
   BOT_ARGS+=(--bidir --primary-quant "${PRIMARY_QUANT:-Q4_K_M}")
 fi
-if [ -n "${POLARIS:-}" ] || printf '%s\n' "$@" | grep -qx -- '--polaris'; then
+if printf '%s\n' "$@" | grep -qx -- '--no-polaris' || [ "${POLARIS:-1}" = "0" ]; then
+  BOT_ARGS+=(--no-polaris)
+else
   BOT_ARGS+=(--polaris)
 fi
 
-echo "[$(date -u +%FT%TZ)] eval bot (EVAL_TRANSPORT=${EVAL_TRANSPORT:-vast}, SSH_KEY=$SSH_KEY)"
+echo "[$(date -u +%FT%TZ)] eval bot (EVAL_TRANSPORT=${EVAL_TRANSPORT:-vast}, POLARIS=${POLARIS:-1}, SSH_KEY=$SSH_KEY)"
 exec python3 eval/pr_eval_bot.py "${BOT_ARGS[@]}" "$@"
