@@ -874,7 +874,11 @@ int Qwen35Model::forward_token(int token_id, int position) {
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
     }
     // xn now holds RMSNorm(x_final, final_norm)
-    if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
+    if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
+        if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
+        kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
+    }
+    else if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
         if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
         kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
     }
@@ -1090,12 +1094,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         s.owned.push_back(d);
         return d;
     };
-    // Dense-FFN down: Q6_K in GGUF is requantized to Q4_K at load by default (~5% decode on
-    // Qwythos). Set SPARKINFER_DOWN_REQUANT_Q4K=0 to keep native Q6_K reads.
-    auto dev_quant_down = [&](const std::string& name, int& qtype) -> const void* {
+    // Optional Q6_K -> Q4_K requant: pay a load-time dequant+fit so decode reads
+    // 4.5 instead of 6.5 bits/weight. The source Q6_K upload is freed after the
+    // requant; qtype flips to 12 on success.
+    auto dev_quant_requant_q4k = [&](const std::string& name, int& qtype, bool req) -> const void* {
         const void* q6 = dev_quant(name, qtype);
-        static int req = -1;
-        if (req < 0) { const char* e = getenv("SPARKINFER_DOWN_REQUANT_Q4K"); req = (e && e[0] == '0') ? 0 : 1; }
         if (!req || qtype != 14 || !q6) return q6;
         const GGUFTensor* t = g.tensor(name);
         const long nv = t->n_values;
@@ -1112,6 +1115,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         s.owned.push_back(q4);
         qtype = 12;
         return q4;
+    };
+    // Dense-FFN down: Q6_K in GGUF is requantized to Q4_K at load by default (~5% decode on
+    // Qwythos). Set SPARKINFER_DOWN_REQUANT_Q4K=0 to keep native Q6_K reads.
+    auto dev_quant_down = [&](const std::string& name, int& qtype) -> const void* {
+        static int req = -1;
+        if (req < 0) { const char* e = getenv("SPARKINFER_DOWN_REQUANT_Q4K"); req = (e && e[0] == '0') ? 0 : 1; }
+        return dev_quant_requant_q4k(name, qtype, req != 0);
     };
     // dense weight -> bf16 (optionally transpose [out,in] -> [in,out])
     auto dense = [&](const std::string& name, bool transpose) -> const void* {
@@ -1146,15 +1156,126 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // uses ~1.5 GB less VRAM. Set SPARKINFER_QATTN=0 to load dense bf16 instead.
     const bool qattn = []{ const char* a = getenv("SPARKINFER_QATTN");
                            return !(a && a[0] == '0'); }();
+    auto mode_is_off = [](const std::string& v) {
+        return v.empty() || v == "0" || v == "false" || v == "FALSE" ||
+               v == "off" || v == "OFF" || v == "no" || v == "NO";
+    };
+    const bool q35_dense9b_requant_default =
+        c.dense_ffn && c.n_layers == 32 && H == 4096 && c.moe_ffn == 12288 &&
+        c.top_k == 1 && c.full_attn_interval == 4 && []{
+            const char* e = getenv("SPARKINFER_DOWN_REQUANT_Q4K");
+            return !(e && e[0] == '0');
+        }();
+    auto env_enabled = [&](const char* name, bool def) {
+        const char* v = getenv(name);
+        return v ? !mode_is_off(std::string(v)) : def;
+    };
+    const char* attn_env = getenv("SPARKINFER_ATTN_REQUANT_Q4K");
+    const std::string attn_requant_mode =
+        attn_env ? std::string(attn_env) : (q35_dense9b_requant_default ? std::string("qkv") : std::string());
+    auto mode_token = [&](const char* want) {
+        const std::string w(want);
+        size_t p = 0;
+        while (p < attn_requant_mode.size()) {
+            while (p < attn_requant_mode.size() &&
+                   (attn_requant_mode[p] == ',' || attn_requant_mode[p] == '+' ||
+                    attn_requant_mode[p] == ':' || attn_requant_mode[p] == ' '))
+                ++p;
+            size_t e = p;
+            while (e < attn_requant_mode.size() &&
+                   attn_requant_mode[e] != ',' && attn_requant_mode[e] != '+' &&
+                   attn_requant_mode[e] != ':' && attn_requant_mode[e] != ' ')
+                ++e;
+            if (e > p && attn_requant_mode.compare(p, e - p, w) == 0) return true;
+            p = e + 1;
+        }
+        return false;
+    };
+    auto has_suffix = [](const std::string& s, const char* suffix) {
+        const std::string t(suffix);
+        return s.size() >= t.size() && s.compare(s.size() - t.size(), t.size(), t) == 0;
+    };
+    auto layer_index = [](const std::string& name) {
+        if (name.compare(0, 4, "blk.") != 0) return -1;
+        int layer = 0;
+        size_t p = 4;
+        if (p >= name.size() || name[p] < '0' || name[p] > '9') return -1;
+        while (p < name.size() && name[p] >= '0' && name[p] <= '9') {
+            layer = layer * 10 + (name[p] - '0');
+            ++p;
+        }
+        return (p < name.size() && name[p] == '.') ? layer : -1;
+    };
+    auto int_list_has = [](const std::string& list, int want) {
+        if (list.empty()) return true;
+        size_t p = 0;
+        while (p < list.size()) {
+            while (p < list.size() && (list[p] == ',' || list[p] == '+' || list[p] == ':' || list[p] == ' '))
+                ++p;
+            int v = 0;
+            bool any = false;
+            while (p < list.size() && list[p] >= '0' && list[p] <= '9') {
+                v = v * 10 + (list[p] - '0');
+                any = true;
+                ++p;
+            }
+            if (any && v == want) return true;
+            while (p < list.size() && list[p] != ',' && list[p] != '+' && list[p] != ':' && list[p] != ' ')
+                ++p;
+        }
+        return false;
+    };
+    const bool req_attn_all = !mode_is_off(attn_requant_mode) &&
+        (attn_requant_mode == "1" || mode_token("all") || mode_token("true") || mode_token("TRUE") ||
+         mode_token("on") || mode_token("ON") || mode_token("yes") || mode_token("YES"));
+    // Qwythos Q4_K_M leaves twelve linear-attention QKV matrices in Q6_K. Requanting all
+    // twelve is fast but marginal on the fuzzed top-1 gate; layer 2 is the sensitive outlier.
+    const char* qkv_layers_env = getenv("SPARKINFER_ATTN_REQUANT_Q4K_QKV_LAYERS");
+    const std::string qkv_requant_layers =
+        qkv_layers_env ? std::string(qkv_layers_env)
+                       : ((q35_dense9b_requant_default && !attn_env)
+                            ? std::string("0,1,6,9,12,18,21,24,28,29,30")
+                            : std::string());
+    int qkv_requant_limit = -1;
+    if (const char* ql = getenv("SPARKINFER_ATTN_REQUANT_Q4K_QKV_LIMIT")) {
+        qkv_requant_limit = atoi(ql);
+        if (qkv_requant_limit < 0) qkv_requant_limit = -1;
+    }
+    int qkv_requant_used = 0;
+    auto req_attn_q4 = [&](const std::string& name, int ggml_type) {
+        if (mode_is_off(attn_requant_mode)) return false;
+        if (req_attn_all) return true;
+        if ((mode_token("qkv") || mode_token("linear")) && has_suffix(name, "attn_qkv.weight")) {
+            if (!int_list_has(qkv_requant_layers, layer_index(name))) return false;
+            if (ggml_type == 14 && qkv_requant_limit >= 0 && qkv_requant_used++ >= qkv_requant_limit)
+                return false;
+            return true;
+        }
+        if ((mode_token("v") || mode_token("attn_v")) && has_suffix(name, "attn_v.weight")) return true;
+        if ((mode_token("q") || mode_token("attn_q")) && has_suffix(name, "attn_q.weight")) return true;
+        if ((mode_token("k") || mode_token("attn_k")) && has_suffix(name, "attn_k.weight")) return true;
+        if ((mode_token("o") || mode_token("out") || mode_token("attn_output")) &&
+            has_suffix(name, "attn_output.weight")) return true;
+        return false;
+    };
+    const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K", q35_dense9b_requant_default);
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) return dev_quant(name, type);
+        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
+            return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
         type = 0; return dense(name, false);
     };
     auto attn_w_opt = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { type = 0; return nullptr; }
-        if (qattn && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) return dev_quant(name, type);
+        if (qattn && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
+            return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
+        type = 0; return dense(name, false);
+    };
+    auto lm_w = [&](const std::string& name, int& type) -> const void* {
+        const GGUFTensor* t = g.tensor(name);
+        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
+            return dev_quant_requant_q4k(name, type, req_lm_q4);
         type = 0; return dense(name, false);
     };
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {
@@ -1186,7 +1307,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
     s.w.final_norm   = dense("output_norm.weight", false);
     const char* lm = g.tensor("output.weight") ? "output.weight" : "token_embd.weight";  // tied fallback
-    s.w.lm_head = attn_w(lm, s.w.lm_head_type);               // native [vocab,hidden] for GEMV
+    s.w.lm_head = lm_w(lm, s.w.lm_head_type);                 // native [vocab,hidden] for GEMV
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
 
     s.w.layers.resize(c.n_layers);
