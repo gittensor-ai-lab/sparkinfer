@@ -231,13 +231,13 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     cu(cudaMemset(p_->mf_rc, 0, sizeof(unsigned int)), "mf_rc zero");   // grid-completion counter starts at 0
     p_->mf_h       = p_->alloc<float>((size_t)cfg.top_k * cfg.moe_ffn);
     p_->mf_out     = p_->alloc<float>(cfg.hidden);
+    if (cfg.dense_ffn && cfg.top_k > 0) {
+        cu(cudaMemcpy(p_->mf_ids, &zero, sizeof(int), cudaMemcpyHostToDevice), "dense expert id");
+        cu(cudaMemcpy(p_->mf_weights, &one, sizeof(float), cudaMemcpyHostToDevice), "dense expert w");
+    }
     if (cfg.n_shared > 0) {
         p_->sx_h  = p_->alloc<float>(cfg.moe_ffn);
         p_->sx_q8 = p_->alloc<char>(kernels::llama_q8_1_bytes(cfg.moe_ffn));
-    } else if (cfg.dense_ffn) {
-        p_->sh_gate = p_->alloc<bf16>(cfg.moe_ffn);
-        p_->sh_up   = p_->alloc<bf16>(cfg.moe_ffn);
-        p_->sh_h    = p_->alloc<bf16>(cfg.moe_ffn);
     }
     const size_t fa_n = (size_t)cfg.n_q_heads * Impl::MAX_NSPLITS;   // sized for the adaptive max
     p_->fa_m   = p_->alloc<float>(fa_n);
@@ -659,10 +659,13 @@ int Qwen35Model::forward_token(int token_id, int position) {
         }
 
         if (c.dense_ffn) {
-            kernels::launch_gemv(s.hn, w.gate, s.sh_gate, c.moe_ffn, H, st);
-            kernels::launch_gemv(s.hn, w.up, s.sh_up, c.moe_ffn, H, st);
-            kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w, s.sh_h, c.moe_ffn, st);
-            kernels::launch_gemv(s.sh_h, w.down, s.routed, H, c.moe_ffn, st);
+            // Qwen3.5 dense SwiGLU: keep gate/up/down quantized and run the same MMVQ
+            // expert-FFN path as MoE decode — bf16 dequant+GEMV diverged ~40pp vs llama.cpp.
+            kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
+                                               w.gate_qtype, w.up_qtype, w.down_qtype,
+                                               s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
+                                               1, c.top_k, H, c.moe_ffn,
+                                               fnq ? s.aq81 : nullptr, st);
         } else if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
             // The per-expert token counts only feed the batched-dispatch sort; the single-token
             // decode expert FFN reads ids/weights directly and never touches them. Zeroing that
@@ -954,12 +957,6 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         s.sh_up   = s.alloc<bf16>(s.cfg.moe_ffn);
         s.sh_h    = s.alloc<bf16>(s.cfg.moe_ffn);
     }
-    if (s.cfg.dense_ffn && !s.sh_gate) {
-        s.sh_gate = s.alloc<bf16>(s.cfg.moe_ffn);
-        s.sh_up   = s.alloc<bf16>(s.cfg.moe_ffn);
-        s.sh_h    = s.alloc<bf16>(s.cfg.moe_ffn);
-    }
-
     // upload raw quantized blocks, keep on device (for experts)
     auto dev_quant = [&](const std::string& name, int& qtype) -> const void* {
         const GGUFTensor* t = g.tensor(name);
@@ -1103,9 +1100,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             if (!expect_dims(b + "ffn_gate.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_up.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_down.weight", {c.moe_ffn, H})) return false;
-            w.gate = dense(b + "ffn_gate.weight", false);
-            w.up   = dense(b + "ffn_up.weight", false);
-            w.down = dense(b + "ffn_down.weight", false);
+            w.gate_q = dev_quant(b + "ffn_gate.weight", w.gate_qtype);
+            w.up_q   = dev_quant(b + "ffn_up.weight", w.up_qtype);
+            w.down_q = dev_quant(b + "ffn_down.weight", w.down_qtype);
         } else {
         if (!expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
         w.router_w = dense(b + "ffn_gate_inp.weight", false);   // native [E,H] for GEMV
@@ -1143,7 +1140,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                w.ssm_beta && w.ssm_alpha && w.ssm_norm && w.ssm_out)
             : (w.wq && w.wk && w.wv && w.wo && w.q_norm && w.k_norm);
         const bool have_ffn = c.dense_ffn
-            ? (w.gate && w.up && w.down)
+            ? (w.gate_q && w.up_q && w.down_q)
             : (w.router_w && w.gate_q && w.up_q && w.down_q);
         if (!have_attn || !w.input_norm || !w.post_attn_norm || !have_ffn) return false;
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);

@@ -47,7 +47,7 @@ if ! grep -q "^PPL" /tmp/spark_score.txt; then   # prebuilt incompatible -> rebu
 fi
 
 echo ">> starting llama.cpp server (reference) ..."
-"$LLAMACPP_DIR/build/bin/llama-server" -m "$GGUF" -ngl 99 -c 2048 --port 8081 >/tmp/llama_srv.log 2>&1 &
+"$LLAMACPP_DIR/build/bin/llama-server" -m "$GGUF" -ngl 99 -c 2048 --port 8081 --no-jinja >/tmp/llama_srv.log 2>&1 &
 SRV=$!; trap 'kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true' EXIT   # reap server (frees VRAM) before exit
 for _ in $(seq 1 120); do curl -s http://localhost:8081/health 2>/dev/null | grep -q '"ok"' && break; sleep 2; done
 

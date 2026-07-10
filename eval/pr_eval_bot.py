@@ -1318,12 +1318,16 @@ def main():
                 print(f"    [{label}] ctx={lbl} tps={tps[lbl]}")
             if tps.get("128", 0) > 0:
                 store["128"] = tps["128"]
-                store["512"] = tps["512"] if tps["512"] > 0 else round(tps["128"] * 0.98, 2)
-                store["4k"]  = tps["4k"]  if tps["4k"]  > 0 else round(tps["128"] * 0.93, 2)
-                store["16k"] = tps["16k"] if tps["16k"] > 0 else store.get("16k", 0)
-                store["32k"] = tps["32k"] if tps["32k"] > 0 else store.get("32k", 0)
-                print(f"  {label} same-box main: 128={store['128']} 512={store['512']} "
-                      f"4k={store['4k']} 16k={store['16k']} 32k={store['32k']} tok/s")
+                if "512" in tps:
+                    store["512"] = tps["512"] if tps["512"] > 0 else round(tps["128"] * 0.98, 2)
+                if "4k" in tps:
+                    store["4k"]  = tps["4k"]  if tps["4k"]  > 0 else round(tps["128"] * 0.93, 2)
+                if "16k" in tps:
+                    store["16k"] = tps["16k"] if tps["16k"] > 0 else store.get("16k", 0)
+                if "32k" in tps:
+                    store["32k"] = tps["32k"] if tps["32k"] > 0 else store.get("32k", 0)
+                parts = " ".join(f"{k}={store[k]}" for k in ("128", "512", "4k", "16k", "32k") if k in store)
+                print(f"  {label} same-box main: {parts} tok/s")
             else:
                 print(f"  {label} bench failed — using config defaults")
 
