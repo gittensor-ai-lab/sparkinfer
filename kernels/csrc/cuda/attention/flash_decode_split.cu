@@ -272,6 +272,76 @@ __global__ void fa_combine_kernel(
     }
 }
 
+// hd256 gated-Q: fold mul_sigmoid + O-proj Q8_1 quant into the combine tail (distinct from a
+// standalone mul_sigmoid_q8 kernel — gate is applied inside the split-fold, per-dim).
+template <int HEAD_DIM, int DG, int NW>
+__global__ void fa_combine_gated_q8_kernel(
+    const float* __restrict__ part_m, const float* __restrict__ part_l,
+    const float* __restrict__ part_acc, __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ gate, int num_q_heads, int n_splits,
+    fa_block_q8_1* __restrict__ out_q8
+) {
+    constexpr int ELEMS = HEAD_DIM / (32 * DG);
+    const int seq = blockIdx.y, qh = blockIdx.x / DG, dg = blockIdx.x % DG;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int idxbase = (seq * num_q_heads + qh) * n_splits;
+    const int doff = dg * (HEAD_DIM / DG) + lane;
+
+    float lm = -1e30f;
+    for (int s = warp; s < n_splits; s += NW) lm = fmaxf(lm, part_m[idxbase + s]);
+    float ll = 0.f, lacc[ELEMS];
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) lacc[e] = 0.f;
+    for (int s = warp; s < n_splits; s += NW) {
+        const float sc = __expf(part_m[idxbase + s] - lm);
+        ll += part_l[idxbase + s] * sc;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) lacc[e] += sc * part_acc[(size_t)(idxbase + s) * HEAD_DIM + doff + e * 32];
+    }
+    __shared__ float s_m[NW], s_l[NW], s_acc[NW][32 * ELEMS];
+    if (lane == 0) { s_m[warp] = lm; s_l[warp] = ll; }
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) s_acc[warp][lane * ELEMS + e] = lacc[e];
+    __syncthreads();
+    if (warp != 0) return;
+
+    float gm = -1e30f;
+    #pragma unroll
+    for (int w = 0; w < NW; w++) gm = fmaxf(gm, s_m[w]);
+    float gl = 0.f, acc[ELEMS];
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
+    #pragma unroll
+    for (int w = 0; w < NW; w++) {
+        const float sc = __expf(s_m[w] - gm);
+        gl += s_l[w] * sc;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) acc[e] += sc * s_acc[w][lane * ELEMS + e];
+    }
+    const float inv = (gl > 0.f) ? (1.f / gl) : 0.f;
+    const size_t hbase = (size_t)(seq * num_q_heads + qh) * HEAD_DIM;
+    __nv_bfloat16* op = out + hbase;
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) {
+        const int di = doff + e * 32;
+        const float gated = __bfloat162float(__float2bfloat16(acc[e] * inv))
+                          * (1.f / (1.f + __expf(-__bfloat162float(gate[hbase + di]))));
+        const float bv = __bfloat162float(__float2bfloat16(gated));
+        op[di] = __float2bfloat16(bv);
+        float amax = fabsf(bv);
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+        const float d = amax / 127.0f;
+        const int qi = (amax == 0.0f) ? 0 : (int)roundf(bv / d);
+        const int blk = (seq * num_q_heads + qh) * (HEAD_DIM / 32) + di / 32;
+        out_q8[blk].qs[lane] = (signed char)qi;
+        int ssum = qi;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ssum += __shfl_xor_sync(0xffffffffu, ssum, m);
+        if (lane == 0) out_q8[blk].ds = __floats2half2_rn(d, d * (float)ssum);
+    }
+}
+
 #ifndef FA_COMBINE_DG
 #define FA_COMBINE_DG 4     // head-dim groups (DG x blocks); sweepable
 #endif
@@ -280,9 +350,6 @@ __global__ void fa_combine_kernel(
 #endif
 #ifndef FA_GQA_TILE
 #define FA_GQA_TILE 14      // bf16 smem + uint4 ldg sweet spot at n_splits=128
-#endif
-#ifndef FA_GQA4_TILE
-#define FA_GQA4_TILE 8     // Qwythos hd256 GQA-4 (16Q/4KV); independently sweepable
 #endif
 template __global__ void fa_split_kernel<128>(const __nv_bfloat16*, const void*, const void*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*, int);
@@ -300,14 +367,15 @@ template __global__ void fa_split_gqa_kernel<256, 8, FA_GQA_TILE, false>(const _
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
 template __global__ void fa_split_gqa_kernel<256, 8, FA_GQA_TILE, true>(const __nv_bfloat16*, const void*, const void*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
-// Qwythos-9B full-attn: 16Q/4KV GQA-4 (hd256).
-template __global__ void fa_split_gqa_kernel<256, 4, FA_GQA4_TILE, false>(const __nv_bfloat16*, const void*, const void*,
-    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
-template __global__ void fa_split_gqa_kernel<256, 4, FA_GQA4_TILE, true>(const __nv_bfloat16*, const void*, const void*,
-    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
 template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, 8>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, 16>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
+template __global__ void fa_combine_gated_q8_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW>(
+    const float*, const float*, const float*, __nv_bfloat16*, const __nv_bfloat16*, int, int, fa_block_q8_1*);
+template __global__ void fa_combine_gated_q8_kernel<256, FA_COMBINE_DG, 8>(
+    const float*, const float*, const float*, __nv_bfloat16*, const __nv_bfloat16*, int, int, fa_block_q8_1*);
+template __global__ void fa_combine_gated_q8_kernel<256, FA_COMBINE_DG, 16>(
+    const float*, const float*, const float*, __nv_bfloat16*, const __nv_bfloat16*, int, int, fa_block_q8_1*);
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/attention.h"
@@ -353,16 +421,12 @@ __global__ void __launch_bounds__(GQA * 32, 5) fa_split_gqa_mma_i8_kernel(
     float* s_l  = s_m + 16;                                           // [16]
 
     // Quantize Q per q-head row (warp w owns rows 2w, 2w+1; rows >= GQA are zero pad).
-    // EPT spans the whole head vector: 4 elems/lane at hd128, 8 at hd256. Hardcoding 4 left
-    // s_qi dims 128..255 uninitialized at hd256 (and computed amax over half the row), so the
-    // QK mma k-tiles 8..15 multiplied against stale shared memory.
-    constexpr int EPT = HEAD_DIM / 32;
     #pragma unroll
     for (int rr = 0; rr < 2; rr++) {
         const int r = warp * 2 + rr;
-        float qv[EPT], amax = 0.f;
+        float qv[4], amax = 0.f;
         #pragma unroll
-        for (int e = 0; e < EPT; e++) {
+        for (int e = 0; e < 4; e++) {
             qv[e] = (r < GQA) ? __bfloat162float(q[(size_t)(seq * num_q_heads + kvh * GQA + r) * HEAD_DIM + lane + e * 32]) : 0.f;
             amax = fmaxf(amax, fabsf(qv[e]));
         }
@@ -371,7 +435,7 @@ __global__ void __launch_bounds__(GQA * 32, 5) fa_split_gqa_mma_i8_kernel(
         const float d = amax / 127.0f;
         if (lane == 0) s_qs[r] = d;
         #pragma unroll
-        for (int e = 0; e < EPT; e++)
+        for (int e = 0; e < 4; e++)
             s_qi[r * HEAD_DIM + lane + e * 32] = (signed char)((amax == 0.f) ? 0 : (int)roundf(qv[e] / d));
     }
     for (int i = tid; i < GQA * HEAD_DIM; i += blockDim.x) s_o[i] = 0.f;
@@ -407,13 +471,7 @@ __global__ void __launch_bounds__(GQA * 32, 5) fa_split_gqa_mma_i8_kernel(
                 load_matrix_sync(bf, kb + ks * 16, KVLD);
                 mma_sync(cf, af, bf, cf);
             }
-            // ldm = 128: the QK result is a [16 q-rows x up-to-128 tokens] score tile, so its row
-            // stride is the group token width (128), not HEAD_DIM — the two only coincide at
-            // hd128. With HEAD_DIM as ldm, the hd256 instantiation stored rows 256 apart while
-            // the softmax below reads them 128 apart: rows interleave with garbage, and every
-            // decoded token past the mma-engagement depth is wrong (verified: 100% argmax
-            // divergence vs the exact tile path at >16k on Qwen3.6).
-            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, 128, mem_row_major);
+            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, HEAD_DIM, mem_row_major);
         }
         __syncthreads();
         // Read the raw int32 QK scores directly and apply the per-row/per-token scales inline in the
@@ -463,32 +521,26 @@ __global__ void __launch_bounds__(GQA * 32, 5) fa_split_gqa_mma_i8_kernel(
         }
         __syncthreads();
 
-        // PV int8 mma -> int32; O += int32 * p_scale[m]. The 8 warps cover a 128-wide dim slab
-        // per pass (warp*16 each), so hd128 takes one pass and hd256 two (dh = 0, 128). The
-        // hd256 instantiation previously ran a single pass with HEAD_DIM strides: it computed
-        // only dims 0..127 of O (128..255 stayed at their zero init) and read P' rows at the
-        // wrong stride — both fixed here; ldm for the P' fragment and the int32 store is 128
-        // (the token/slab width), which coincided with HEAD_DIM only at hd128.
-        for (int dh = 0; dh < HEAD_DIM; dh += 128) {
-            fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
-            fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
+        // PV int8 mma -> int32; O += int32 * p_scale[m].
+        {
             fragment<accumulator, 16, 16, 16, int> cf;
             fill_fragment(cf, 0);
             for (int ks = 0; ks < gblk; ks++) {
                 const int pb = block_table[seq * max_blocks + first_blk + g0 + ks];
-                const signed char* vb = v_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM + dh + warp * 16;
-                load_matrix_sync(af, s_pi + ks * 16, 128);
+                const signed char* vb = v_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM + warp * 16;
+                fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
+                fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
+                load_matrix_sync(af, s_pi + ks * 16, HEAD_DIM);
                 load_matrix_sync(bf, vb, KVLD);
                 mma_sync(cf, af, bf, cf);
             }
-            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, 128, mem_row_major);
-            __syncthreads();
-            // Only the GQA real q-head rows are kept (rows GQA..15 are wmma M-padding, never
-            // written to the partials) — accumulate this 128-wide slab into s_o at its dh offset.
-            for (int i = tid; i < GQA * 128; i += blockDim.x)
-                s_o[(i >> 7) * HEAD_DIM + dh + (i & 127)] += (float)reinterpret_cast<int*>(s_s)[i] * s_ps[i >> 7];
-            __syncthreads();
+            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, HEAD_DIM, mem_row_major);
         }
+        __syncthreads();
+        // Only the GQA real q-head rows are kept (rows GQA..15 are wmma M-padding, never written to
+        // the partials) — accumulate just those, halving this thread-parallel epilogue at GQA=8.
+        for (int i = tid; i < GQA * 128; i += blockDim.x) s_o[i] += (float)reinterpret_cast<int*>(s_s)[i] * s_ps[i >> 7];
+        __syncthreads();
     }
 
     for (int r = 0; r < GQA; r++) {
@@ -530,9 +582,6 @@ static inline void fa_launch_combine_dispatch(
     else                      fa_launch_combine<FA_COMBINE_NW>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
 }
 
-// hd256 combine: same NW-adaptive dispatch as hd128, scaling warps with n_splits
-// so the per-warp serial split-folding stays bounded. NW=16 at n_splits>=128
-// keeps each warp at ~8-16 splits (matching hd128 sweet spot).
 template <int NW>
 static inline void fa_launch_combine_hd256(
     const float* part_m, const float* part_l, const float* part_acc,
@@ -543,7 +592,16 @@ static inline void fa_launch_combine_hd256(
     fa_combine_kernel<256, FA_COMBINE_DG, NW><<<g, NW * 32, 0, stream>>>(
         part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8);
 }
-
+template <int NW>
+static inline void fa_launch_combine_gated_hd256(
+    const float* part_m, const float* part_l, const float* part_acc,
+    __nv_bfloat16* out, const __nv_bfloat16* gate, int num_q_heads, int n_splits,
+    fa_block_q8_1* out_q8, int num_seqs, cudaStream_t stream
+) {
+    dim3 g(num_q_heads * FA_COMBINE_DG, num_seqs);
+    fa_combine_gated_q8_kernel<256, FA_COMBINE_DG, NW><<<g, NW * 32, 0, stream>>>(
+        part_m, part_l, part_acc, out, gate, num_q_heads, n_splits, out_q8);
+}
 static inline void fa_launch_combine_dispatch_hd256(
     const float* part_m, const float* part_l, const float* part_acc,
     __nv_bfloat16* out, int num_q_heads, int n_splits, fa_block_q8_1* out_q8,
@@ -553,6 +611,15 @@ static inline void fa_launch_combine_dispatch_hd256(
     else if (n_splits >= 64)  fa_launch_combine_hd256<8>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
     else                      fa_launch_combine_hd256<FA_COMBINE_NW>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
 }
+static inline void fa_launch_combine_gated_dispatch_hd256(
+    const float* part_m, const float* part_l, const float* part_acc,
+    __nv_bfloat16* out, const __nv_bfloat16* gate, int num_q_heads, int n_splits,
+    fa_block_q8_1* out_q8, int num_seqs, cudaStream_t stream
+) {
+    if (n_splits >= 128)      fa_launch_combine_gated_hd256<16>(part_m, part_l, part_acc, out, gate, num_q_heads, n_splits, out_q8, num_seqs, stream);
+    else if (n_splits >= 64)  fa_launch_combine_gated_hd256<8>(part_m, part_l, part_acc, out, gate, num_q_heads, n_splits, out_q8, num_seqs, stream);
+    else                      fa_launch_combine_gated_hd256<FA_COMBINE_NW>(part_m, part_l, part_acc, out, gate, num_q_heads, n_splits, out_q8, num_seqs, stream);
+}
 
 void launch_flash_decode_split(
     const void* q, const void* k_pool, const void* v_pool,
@@ -560,40 +627,30 @@ void launch_flash_decode_split(
     float* part_m, float* part_l, float* part_acc,
     int num_seqs, int num_q_heads, int num_kv_heads, int head_dim,
     int block_size, int max_blocks, int n_splits, float scale, cudaStream_t stream,
-    void* out_q8, int seqlen, const void* k_scale, const void* v_scale, int int8_kv
+    void* out_q8, int seqlen, const void* k_scale, const void* v_scale, int int8_kv,
+    const void* attn_gate
 ) {
+    const __nv_bfloat16* gate = reinterpret_cast<const __nv_bfloat16*>(attn_gate);
+    auto combine_hd256 = [&](void* oq8) {
+        if (gate && oq8)
+            fa_launch_combine_gated_dispatch_hd256(part_m, part_l, part_acc,
+                reinterpret_cast<__nv_bfloat16*>(out), gate, num_q_heads, n_splits,
+                reinterpret_cast<fa_block_q8_1*>(oq8), num_seqs, stream);
+        else
+            fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc,
+                reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
+                reinterpret_cast<fa_block_q8_1*>(oq8), num_seqs, stream);
+    };
     // Qwen3.6 full-attention layers run head_dim=256 (bf16 KV). Use the GQA-8 shared-KV tile
     // path (same 8:1 grouping as Qwen3 hd=128) — cuts KV global reads ~8x vs one-warp-per-q-head.
     if (head_dim == 256) {
+        dim3 g2(num_q_heads * FA_COMBINE_DG, num_seqs);
         // int8-KV tensor-core path for hd256 (long context): same gating as the hd128 MMA path
         // (block_size==16 so each warp maps to one physical block, chunk >= 2 blocks to fill the GPU).
         static int famma256 = -1;
         if (famma256 < 0) { const char* e = getenv("SPARKINFER_FAMMA"); famma256 = (e && e[0] == '0') ? 0 : 1; }
         const int mma_chunk256 = (n_splits > 0) ? (seqlen + n_splits - 1) / n_splits : 0;
         const bool mma_ok256 = famma256 && seqlen > 512 && block_size == 16 && mma_chunk256 >= 32;
-        static int fagqa4 = -1;
-        if (fagqa4 < 0) { const char* e = getenv("SPARKINFER_FAGQA4"); fagqa4 = (e && e[0] == '0') ? 0 : 1; }
-        if (fagqa4 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 4) {
-            // Qwythos-9B: 16Q/4KV full-attn was falling to scalar fa_split_kernel<256> (no KV sharing).
-            constexpr int GQA = 4, TILE = FA_GQA4_TILE;
-            dim3 gq(num_kv_heads * n_splits, num_seqs);
-            const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
-            if (int8_kv)
-                fa_split_gqa_kernel<256, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
-                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
-            else
-                fa_split_gqa_kernel<256, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
-                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
-            fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc,
-                reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
-                reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
-            (void)seqlen;
-            return;
-        }
         if (num_kv_heads > 0 && num_q_heads == num_kv_heads * 8) {
             constexpr int GQA = 8, TILE = FA_GQA_TILE;
             dim3 gq(num_kv_heads * n_splits, num_seqs);
@@ -606,13 +663,11 @@ void launch_flash_decode_split(
                     reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
                     part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
                     reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
-                fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc,
-                    reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
-                    reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+                combine_hd256(out_q8);
                 (void)seqlen;
                 return;
             }
-            // Scalar/tile GQA fallback (short context or MMA off). The int8 cache is resident for the
+            // Scalar/tile GQA fallback
             // whole run, so when int8_kv is on the tile kernel MUST dequant int8->bf16 in smem (the
             // <256,...,true> instantiation) — reading the int8 pool as bf16 would be garbage.
             const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
@@ -633,9 +688,7 @@ void launch_flash_decode_split(
                 part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
                 reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale), int8_kv);
         }
-        fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc,
-            reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
-            reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+        combine_hd256(out_q8);
         (void)seqlen;
         return;
     }

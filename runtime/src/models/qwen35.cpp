@@ -157,6 +157,8 @@ struct Qwen35Model::Impl {
     bool use_fnq = true;   // default ON: post-MoE add_rmsnorm2 also emits Q8_1(xn), deleting the
                            // next layer's standalone QKV-input quantize node. =0 disables
     bool use_gdn_pipe = true;   // default ON: overlap GDN gate/scalar projections on side streams. =0 disables
+    bool use_gdn_quad = false;  // default OFF: one-grid GDN Q4_K quad (H=2048). =1 enables
+    bool use_attn_qkv = true;   // default ON: one-grid full-attn QKV MMVQ (Q4_K, H=2048). =0 disables
     bool use_shexp_pipe = true; // default ON: overlap shared expert with routed MoE. =0 disables
     bool use_addnorm3 = true;   // default ON: fold routed+shared residual_add into post-MoE add_rmsnorm. =0 disables
     bool use_router_fused = true; // default ON (256-expert path): fuse the router GEMV + bitonic top-k
@@ -264,6 +266,8 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_QKVSTREAM")) p_->use_qkvstream = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ATTNIN")) p_->use_attnin = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_GDN_PIPE")) p_->use_gdn_pipe = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_GDN_QUAD")) p_->use_gdn_quad = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_ATTN_QKV")) p_->use_attn_qkv = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_SHEXP_PIPE")) p_->use_shexp_pipe = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ADDNORM3")) p_->use_addnorm3 = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ROUTER_FUSED")) p_->use_router_fused = !(e[0] == '0');
@@ -321,16 +325,15 @@ int Qwen35Model::forward_token(int token_id, int position) {
     s.h_scalars[3] = seqlen;
     cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 4 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
-    // Depth-adaptive KV-split: keep 32 splits for the short-context sweet spot, then
-    // scale to 128/256 splits as context grows. The split grid is num_kv_heads*n_splits
-    // CTAs — Qwen3.6 full-attention has only 2 KV-heads (hd=256), so 128 splits at 4k
-    // is just 256 CTAs; 256 splits at 8k+ doubles that. Per-block chunk stays in the
-    // 32-128 token range for good TILE=14 amortization.
-    // Partials are sized for MAX_NSPLITS; online-softmax combine is exact for any split count.
+    // Depth-adaptive KV-split: 32 (short) -> 128 (mid) -> 256 (long). The 8k-12k band
+    // (28*split_chunk < seqlen <= 48*split_chunk) is roofline-bound on 128 splits; promote
+    // to MAX_NSPLITS there only. Past 16k keep the original 64* knee. Math unchanged.
     if (s.adaptive_splits) {
         int want = 32;
-        if ((long)seqlen > 2L * s.split_chunk)  want = 128;
-        if ((long)seqlen > 32L * s.split_chunk) want = 256;
+        if ((long)seqlen > 2L * s.split_chunk) want = 128;
+        if ((long)seqlen > 28L * s.split_chunk && (long)seqlen <= 48L * s.split_chunk)
+            want = Impl::MAX_NSPLITS;
+        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
         if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
         // hd256/GQA-8 occupancy correction (Qwen3.6 full-attention shape specifically): the
         // generic 128/256 thresholds above were tuned around the split kernel's assumed
@@ -471,7 +474,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
             const bool any_q80 = (w.wqkv_type == 8 || w.wqkv_gate_type == 8 ||
                                   w.ssm_alpha_type == 8 || w.ssm_beta_type == 8);
             prepare_xn_quant(any_q4k, any_q6k, any_q80);
-            const bool gdn_pipelined = s.gguf && s.use_gdn_pipe;
+            const bool gdn_quad = s.use_gdn_quad && s.gguf && s.use_pq && s.use_llama && H == 2048
+                               && w.wqkv_type == 12 && w.wqkv_gate_type == 12
+                               && w.ssm_alpha_type == 12 && w.ssm_beta_type == 12;
+            const bool gdn_pipelined = !gdn_quad && s.gguf && s.use_gdn_pipe;
             const bool gdn_fused_proj = [&] {
                 static int fuse = -1;
                 if (fuse < 0) { const char* e = getenv("SPARKINFER_GDN_QKVZ_FUSE");
@@ -480,7 +486,11 @@ int Qwen35Model::forward_token(int token_id, int position) {
                        w.wqkv_type == 12 && w.wqkv_gate_type == 12 &&
                        (H == 2048 || H == 4096) && s.linear_qkvdim > 0 && s.linear_vdim > 0;
             }();
-            if (gdn_fused_proj && gdn_pipelined) {
+            if (gdn_quad) {
+                kernels::launch_gdn_quad_mmvq_q4k(s.aq81, w.wqkv, w.wqkv_gate, w.ssm_alpha, w.ssm_beta,
+                    s.lin_qkv, s.lin_z, s.lin_alpha, s.lin_beta,
+                    s.linear_qkvdim, s.linear_vdim, c.linear_v_heads, c.linear_v_heads, H, st);
+            } else if (gdn_fused_proj && gdn_pipelined) {
                 cudaEventRecord(s.ev_pipe_fork, st);
                 cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
                 proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, s.stream_v);
@@ -574,7 +584,13 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
                 const bool any_q80 = (w.wq_type == 8 || w.wk_type == 8 || w.wv_type == 8);
                 prepare_xn_quant(any_q4k, any_q6k, any_q80);
-                if (s.use_qkvstream) {
+                const int nq = w.q_has_gate ? s.qdim * 2 : s.qdim;
+                const bool attn_qkv = s.use_attn_qkv && s.use_pq && s.use_llama && H == 2048
+                                   && w.wq_type == 12 && w.wk_type == 12 && w.wv_type == 12;
+                if (attn_qkv) {
+                    kernels::launch_attn_qkv_mmvq_q4k(s.aq81, w.wq, w.wk, w.wv,
+                        w.q_has_gate ? s.qraw : s.q, s.k, s.v, nq, s.kvdim, s.kvdim, H, st);
+                } else if (s.use_qkvstream) {
                     cudaEventRecord(s.ev_qkv, st);
                     cudaStreamWaitEvent(s.stream_k, s.ev_qkv, 0);
                     cudaStreamWaitEvent(s.stream_v, s.ev_qkv, 0);
@@ -596,9 +612,6 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 kernels::launch_gemm(s.xn, w.wk, s.k, 1, s.kvdim, H, 1.f, 0.f, gc, st);
                 kernels::launch_gemm(s.xn, w.wv, s.v, 1, s.kvdim, H, 1.f, 0.f, gc, st);
             }
-            if (w.q_has_gate)
-                kernels::launch_qwen36_split_q_gate(s.qraw, s.q, s.qgate, c.n_q_heads, c.head_dim, st);
-
             // ---- QK-norm + RoPE + KV-append ----
             const bool kv8 = s.kv->int8_kv();
             const int kv_elem = kv8 ? 1 : 2;
@@ -607,6 +620,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
             void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
             void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
             const bool partial_rope = (c.rope_dim > 0 && c.rope_dim < c.head_dim);
+            const bool qkgate_fuse = w.q_has_gate && partial_rope && kv8 && s.use_qkfuse && H == 2048;
+            if (w.q_has_gate && !qkgate_fuse)
+                kernels::launch_qwen36_split_q_gate(s.qraw, s.q, s.qgate, c.n_q_heads, c.head_dim, st);
+
             if (!w.q_has_gate && !partial_rope && (s.use_attnin || kv8)) {
                 // Qwen3-MoE frontier: fused int8 QK-norm + RoPE + KV-append (unchanged vs main)
                 kernels::launch_qknorm_rope_kv_append(s.q, s.k, s.v, w.q_norm, w.k_norm, kpool, vpool,
@@ -617,19 +634,30 @@ int Qwen35Model::forward_token(int token_id, int position) {
             } else {
                 // Qwen3.6 (gated / partial-rotary): fuse QK-norm + partial-RoPE + KV when enabled.
                 if (partial_rope && kv8) {
-                    // int8 KV for the hd256 full-attn layers: QK-norm, then partial-RoPE append that
-                    // quantizes K/V to int8 (+ per-head fp16 scale) so the int8 tensor-core flash-decode
-                    // can halve the KV read. (No fused variant — the int8 append needs a per-head reduce.)
-                    if (s.use_qkfuse)
-                        kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
-                    else {
-                        kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
-                        kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+                    if (s.use_qkfuse && H == 2048) {
+                        if (qkgate_fuse) {
+                            kernels::launch_qknorm_rope_kv_partial_int8_gated(s.qraw, s.q, s.qgate, s.k, s.v,
+                                w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, btable, s.d_pos, 1,
+                                c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
+                                s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                        } else {
+                            kernels::launch_qknorm_rope_kv_partial_int8(s.q, s.k, s.v, w.q_norm, w.k_norm,
+                                kpool, vpool, kscale, vscale, btable, s.d_pos, 1,
+                                c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
+                                s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                        }
+                    } else {
+                        if (s.use_qkfuse)
+                            kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+                        else {
+                            kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
+                            kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+                        }
+                        kernels::launch_rope_kv_append_partial_int8(s.q, s.k, s.v, kpool, vpool, kscale, vscale,
+                            btable, s.d_pos, 1, c.n_q_heads, c.n_kv_heads,
+                            c.head_dim, c.rope_dim, c.rope_theta,
+                            s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                     }
-                    kernels::launch_rope_kv_append_partial_int8(s.q, s.k, s.v, kpool, vpool, kscale, vscale,
-                                                                btable, s.d_pos, 1, c.n_q_heads, c.n_kv_heads,
-                                                                c.head_dim, c.rope_dim, c.rope_theta,
-                                                                s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                 } else if (partial_rope && s.use_qkfuse) {
                     kernels::launch_qknorm_rope_kv_partial(s.q, s.k, s.v, w.q_norm, w.k_norm,
                         (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
@@ -659,19 +687,25 @@ int Qwen35Model::forward_token(int token_id, int position) {
             }
 
             // ---- attention (Q8-emit only when output is not gated: the gate mutates attn after decode) ----
+            static int attn_gq8 = -1;
+            if (attn_gq8 < 0) { const char* e = getenv("SPARKINFER_ATTN_GQ8"); attn_gq8 = (e && e[0] == '0') ? 0 : 1; }
+            const bool attn_gate_q8 = attn_gq8 && w.q_has_gate && s.gguf && s.use_pq && s.use_llama && H == 2048
+                                      && (w.wo_type == 12 || w.wo_type == 8) && (s.qdim % 32 == 0);
             const bool emit_attn_q8 = !w.q_has_gate && s.use_attnin && s.gguf && s.use_pq && s.use_llama && w.wo_type == 12;
             kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,
                                                s.fa_m, s.fa_l, s.fa_acc, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
                                                s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
                                                1.f / sqrtf((float)c.head_dim), st,
-                                               emit_attn_q8 ? s.aq81 : nullptr, seqlen, kscale, vscale, kv8 ? 1 : 0);
-            if (w.q_has_gate)
+                                               (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, seqlen,
+                                               kscale, vscale, kv8 ? 1 : 0,
+                                               attn_gate_q8 ? s.qgate : nullptr);
+            if (w.q_has_gate && !attn_gate_q8)
                 kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, s.qdim, st);
 
             // ---- O projection (main's int8 mmvq path) ----
             if (s.gguf && s.use_pq && w.wo_type == 12) {
                 if (s.use_llama) {
-                    if (!emit_attn_q8) kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
+                    if (!emit_attn_q8 && !attn_gate_q8) kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
                     kernels::launch_mmvq_q4k(s.aq81, w.wo, s.ao, H, s.qdim, st);
                 } else {
                     kernels::launch_quantize_q8_1(s.attn, s.aq8, s.aq8_d, s.aq8_s, s.qdim, st);
@@ -705,7 +739,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 if (s.use_pq && w.shared_gate_inp_type == 12) {
                     if (s.use_llama) {
                         if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, s.stream_k);
-                        kernels::launch_mmvq_q4k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
+                        if (H == 2048)
+                            kernels::launch_mmvq_q4k_sigmoid(s.aq81, w.shared_gate_inp, s.d_shared_w, H, s.stream_k);
+                        else
+                            kernels::launch_mmvq_q4k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
                     } else {
                         kernels::launch_quantize_q8_1(s.hn, s.aq8, s.aq8_d, s.aq8_s, H, s.stream_k);
                         kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s,
@@ -732,6 +769,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
                         kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
                     }
                 }
+                if (w.shared_gate_inp && !(s.use_pq && s.use_llama && w.shared_gate_inp_type == 12 && H == 2048))
+                    kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
             }
             if (qmoe) {
                 // Pipelined shared overlaps stream_k with MoE on st — accum into routed here
@@ -817,7 +856,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     if (s.use_pq && w.shared_gate_inp_type == 12) {
                         if (s.use_llama) {
                             if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, st);
-                            kernels::launch_mmvq_q4k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
+                            if (H == 2048)
+                                kernels::launch_mmvq_q4k_sigmoid(s.aq81, w.shared_gate_inp, s.d_shared_w, H, st);
+                            else
+                                kernels::launch_mmvq_q4k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
                         } else {
                             kernels::launch_quantize_q8_1(s.hn, s.aq8, s.aq8_d, s.aq8_s, H, st);
                             kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s,

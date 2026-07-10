@@ -448,6 +448,226 @@ __global__ void rope_kv_append_partial_int8_kernel(
     }
 }
 
+// Fused QK-norm + partial-RoPE + int8 KV-append for Qwen3.6 hd256 full-attn layers.
+// Replaces launch_rmsnorm_qk + launch_rope_kv_append_partial_int8 (two graph nodes).
+__global__ void qknorm_rope_kv_partial_int8_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    signed char* __restrict__ k_pool, signed char* __restrict__ v_pool,
+    __half* __restrict__ k_scale, __half* __restrict__ v_scale,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta,
+    int block_size, int max_blocks_per_seq, float eps
+) {
+    const int tok  = blockIdx.y;
+    const int unit = blockIdx.x;
+    const int t    = threadIdx.x;
+    const int rhalf = rotary_dim >> 1;
+    const int pos    = positions[tok];
+    const int blk    = pos / block_size, within = pos % block_size;
+    const int phys   = block_table[tok * max_blocks_per_seq + blk];
+    const size_t ctok = (size_t)(phys * block_size + within);
+
+    extern __shared__ float s_h[];
+    __shared__ float s_warp[32];
+    __shared__ float s_red[8];
+
+    if (unit < n_q_heads) {               // Q: RMSNorm + partial RoPE (bf16 in-place)
+        const size_t base = ((size_t)(tok * n_q_heads + unit)) * head_dim;
+        const float xv = __bfloat162float(q[base + t]);
+        float ss = xv * xv;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+        if ((t & 31) == 0) s_warp[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (head_dim + 31) / 32) ? s_warp[t] : 0.f;
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) vv += __shfl_xor_sync(0xffffffff, vv, m);
+            if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+        }
+        __syncthreads();
+        s_h[t] = __bfloat162float(__float2bfloat16(xv * s_warp[0] * __bfloat162float(q_w[t])));
+        __syncthreads();
+        if (t < rhalf) {
+            const float freq = __powf(theta, -2.f * (float)t / (float)rotary_dim);
+            const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+            const float x0 = s_h[t], x1 = s_h[t + rhalf];
+            q[base + t]         = __float2bfloat16(x0 * c - x1 * s);
+            q[base + t + rhalf] = __float2bfloat16(x1 * c + x0 * s);
+        }
+        return;
+    }
+
+    const bool is_k = unit < n_q_heads + n_kv_heads;
+    const int  hh   = is_k ? (unit - n_q_heads) : (unit - n_q_heads - n_kv_heads);
+    const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+    const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+
+    float val;
+    if (is_k) {
+        const float xv = __bfloat162float(k[base + t]);
+        float ss = xv * xv;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+        if ((t & 31) == 0) s_warp[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (head_dim + 31) / 32) ? s_warp[t] : 0.f;
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) vv += __shfl_xor_sync(0xffffffff, vv, m);
+            if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+        }
+        __syncthreads();
+        s_h[t] = __bfloat162float(__float2bfloat16(xv * s_warp[0] * __bfloat162float(k_w[t])));
+        __syncthreads();
+        if (t < rotary_dim) {
+            const int i = (t < rhalf) ? t : (t - rhalf);
+            const float freq = __powf(theta, -2.f * (float)i / (float)rotary_dim);
+            const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+            const float x0 = s_h[i], x1 = s_h[i + rhalf];
+            val = (t < rhalf) ? (x0 * c - x1 * s) : (x1 * c + x0 * s);
+        } else {
+            val = s_h[t];
+        }
+    } else {
+        val = __bfloat162float(v[base + t]);
+    }
+
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, m));
+    if ((t & 31) == 0) s_red[t >> 5] = amax;
+    __syncthreads();
+    if (t == 0) {
+        float a = 0.f;
+        for (int w = 0; w < (head_dim >> 5); w++) a = fmaxf(a, s_red[w]);
+        s_red[0] = a;
+    }
+    __syncthreads();
+    const float d  = s_red[0] / 127.0f;
+    const int   qi = (s_red[0] == 0.f) ? 0 : (int)roundf(val / d);
+    if (is_k) {
+        k_pool[dst + t] = (signed char)qi;
+        if (t == 0) k_scale[ctok * n_kv_heads + hh] = __float2half(d);
+    } else {
+        v_pool[dst + t] = (signed char)qi;
+        if (t == 0) v_scale[ctok * n_kv_heads + hh] = __float2half(d);
+    }
+}
+
+// Gated Qwen3.6 full-attn: read Q from qraw (2*head_dim interleaved), extract gate,
+// RMSNorm + partial RoPE in-place to q, then K/V int8 KV-append (same as int8 variant).
+__global__ void qknorm_rope_kv_partial_int8_gated_kernel(
+    const __nv_bfloat16* __restrict__ qraw, __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ qgate,
+    __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    signed char* __restrict__ k_pool, signed char* __restrict__ v_pool,
+    __half* __restrict__ k_scale, __half* __restrict__ v_scale,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta,
+    int block_size, int max_blocks_per_seq, float eps
+) {
+    const int tok  = blockIdx.y;
+    const int unit = blockIdx.x;
+    const int t    = threadIdx.x;
+    const int rhalf = rotary_dim >> 1;
+    const int pos    = positions[tok];
+    const int blk    = pos / block_size, within = pos % block_size;
+    const int phys   = block_table[tok * max_blocks_per_seq + blk];
+    const size_t ctok = (size_t)(phys * block_size + within);
+
+    extern __shared__ float s_h[];
+    __shared__ float s_warp[32];
+    __shared__ float s_red[8];
+
+    if (unit < n_q_heads) {
+        const size_t qbase = ((size_t)(tok * n_q_heads + unit)) * head_dim;
+        const size_t rawbase = qbase * 2;
+        if (t < head_dim) qgate[qbase + t] = qraw[rawbase + head_dim + t];
+        const float xv = __bfloat162float(qraw[rawbase + t]);
+        float ss = xv * xv;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+        if ((t & 31) == 0) s_warp[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (head_dim + 31) / 32) ? s_warp[t] : 0.f;
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) vv += __shfl_xor_sync(0xffffffff, vv, m);
+            if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+        }
+        __syncthreads();
+        s_h[t] = __bfloat162float(__float2bfloat16(xv * s_warp[0] * __bfloat162float(q_w[t])));
+        __syncthreads();
+        if (t < rhalf) {
+            const float freq = __powf(theta, -2.f * (float)t / (float)rotary_dim);
+            const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+            const float x0 = s_h[t], x1 = s_h[t + rhalf];
+            q[qbase + t]         = __float2bfloat16(x0 * c - x1 * s);
+            q[qbase + t + rhalf] = __float2bfloat16(x1 * c + x0 * s);
+        }
+        return;
+    }
+
+    const bool is_k = unit < n_q_heads + n_kv_heads;
+    const int  hh   = is_k ? (unit - n_q_heads) : (unit - n_q_heads - n_kv_heads);
+    const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+    const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+
+    float val;
+    if (is_k) {
+        const float xv = __bfloat162float(k[base + t]);
+        float ss = xv * xv;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+        if ((t & 31) == 0) s_warp[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (head_dim + 31) / 32) ? s_warp[t] : 0.f;
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) vv += __shfl_xor_sync(0xffffffff, vv, m);
+            if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+        }
+        __syncthreads();
+        s_h[t] = __bfloat162float(__float2bfloat16(xv * s_warp[0] * __bfloat162float(k_w[t])));
+        __syncthreads();
+        if (t < rotary_dim) {
+            const int i = (t < rhalf) ? t : (t - rhalf);
+            const float freq = __powf(theta, -2.f * (float)i / (float)rotary_dim);
+            const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+            const float x0 = s_h[i], x1 = s_h[i + rhalf];
+            val = (t < rhalf) ? (x0 * c - x1 * s) : (x1 * c + x0 * s);
+        } else {
+            val = s_h[t];
+        }
+    } else {
+        val = __bfloat162float(v[base + t]);
+    }
+
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, m));
+    if ((t & 31) == 0) s_red[t >> 5] = amax;
+    __syncthreads();
+    if (t == 0) {
+        float a = 0.f;
+        for (int w = 0; w < (head_dim >> 5); w++) a = fmaxf(a, s_red[w]);
+        s_red[0] = a;
+    }
+    __syncthreads();
+    const float d  = s_red[0] / 127.0f;
+    const int   qi = (s_red[0] == 0.f) ? 0 : (int)roundf(val / d);
+    if (is_k) {
+        k_pool[dst + t] = (signed char)qi;
+        if (t == 0) k_scale[ctok * n_kv_heads + hh] = __float2half(d);
+    } else {
+        v_pool[dst + t] = (signed char)qi;
+        if (t == 0) v_scale[ctok * n_kv_heads + hh] = __float2half(d);
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/attention.h"
 #include "sparkinfer/kernels/fused.h"
@@ -554,6 +774,43 @@ void launch_rope_kv_append_partial_int8(void* q, const void* k, const void* v,
         reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
         block_size, max_blocks_per_seq);
+}
+
+void launch_qknorm_rope_kv_partial_int8(void* q, void* k, const void* v, const void* q_w, const void* k_w,
+                                        void* k_pool, void* v_pool, void* k_scale, void* v_scale,
+                                        const int* block_table, const int* positions,
+                                        int n_tokens, int n_q_heads, int n_kv_heads,
+                                        int head_dim, int rotary_dim, float theta, float eps,
+                                        int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+    dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
+    const int smem = head_dim * (int)sizeof(float);
+    qknorm_rope_kv_partial_int8_kernel<<<grid, head_dim, smem, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool),
+        reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
+        block_size, max_blocks_per_seq, eps);
+}
+
+void launch_qknorm_rope_kv_partial_int8_gated(
+    const void* qraw, void* q, void* qgate, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, void* k_scale, void* v_scale,
+    const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+    dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
+    const int smem = head_dim * (int)sizeof(float);
+    qknorm_rope_kv_partial_int8_gated_kernel<<<grid, head_dim, smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qraw), reinterpret_cast<__nv_bfloat16*>(q),
+        reinterpret_cast<__nv_bfloat16*>(qgate),
+        reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool),
+        reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
+        block_size, max_blocks_per_seq, eps);
 }
 
 void launch_rope(void* q, void* k, const int* positions,

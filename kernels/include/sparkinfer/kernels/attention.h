@@ -52,6 +52,22 @@ void launch_qknorm_rope_kv_partial(
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
     float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
 
+// Fused QK-norm + partial-RoPE + int8 KV-append for Qwen3.6 hd256 full-attn layers.
+void launch_qknorm_rope_kv_partial_int8(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, void* k_scale, void* v_scale,
+    const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
+
+// Gated Qwen3.6: fused split_q_gate + QK-norm + partial-RoPE + int8 KV-append.
+void launch_qknorm_rope_kv_partial_int8_gated(
+    const void* qraw, void* q, void* qgate, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, void* k_scale, void* v_scale,
+    const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
+
 // Variant for models with partial rotary embeddings (e.g. Qwen3.6: 64 of 256
 // dimensions rotate, the remaining per-head dimensions are copied unchanged).
 void launch_rope_kv_append_partial(
@@ -117,7 +133,8 @@ void launch_flash_decode_split(
     int num_seqs, int num_q_heads, int num_kv_heads, int head_dim,
     int block_size, int max_blocks, int n_splits, float scale,
     cudaStream_t stream = nullptr, void* out_q8 = nullptr, int seqlen = -1,
-    const void* k_scale = nullptr, const void* v_scale = nullptr, int int8_kv = 0);
+    const void* k_scale = nullptr, const void* v_scale = nullptr, int int8_kv = 0,
+    const void* attn_gate = nullptr);
 
 // Flash decode for GLOBAL layers: full context, head_dim=512, GQA 8:1.
 // Two-phase dot product splits 512-dim head into two 256-dim halves.
