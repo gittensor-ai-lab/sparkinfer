@@ -13,7 +13,7 @@ commits and only spin the GPU when there's new work.
 
 Needs: `gh` authenticated, VAST_API_KEY saved (vastai), and the eval:* labels (eval/setup_labels.sh).
 """
-import argparse, datetime, hashlib, json, os, re, subprocess, sys
+import argparse, datetime, hashlib, json, os, re, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -447,19 +447,34 @@ def push_dash(msg):
     subprocess.run(["git", "-C", ROOT, "pull", "-q", "--rebase", "origin", "main"], capture_output=True)
     subprocess.run(["git", "-C", ROOT, "push", "-q", "origin", "main"], capture_output=True)
 
-LOG_REPO  = os.environ.get("SPARKINFER_LOG_REPO", "https://github.com/gittensor-ai-lab/sparkinfer.git")
+LOG_REPO  = os.environ.get("SPARKINFER_LOG_REPO", "https://github.com/gittensor-ai-lab/sparkinfer-log.git")
 LOG_DIR   = os.path.expanduser(os.environ.get("SPARKINFER_LOG_DIR", "~/.sparkinfer_log_checkout"))
 LOG_PAGE  = "https://gittensor-ai-lab.github.io/sparkinfer-log/?run="
 
-def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
-    """Commit this eval's raw log + result to the public sparkinfer-log repo (immutable record),
-    rendered at a unique per-run URL. Best-effort: never blocks the eval. Returns the page URL."""
+def _ensure_log_repo():
+    """Clone or update the public sparkinfer-log checkout."""
+    if not os.path.isdir(os.path.join(LOG_DIR, ".git")):
+        subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
+        return
+    origin = subprocess.run(
+        ["git", "-C", LOG_DIR, "remote", "get-url", "origin"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if origin.rstrip("/") != LOG_REPO.rstrip("/"):
+        shutil.rmtree(LOG_DIR)
+        subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
+        return
+    subprocess.run(["git", "-C", LOG_DIR, "pull", "-q", "--rebase"], check=False)
+
+def upload_eval_log(repo, num, title, oid, res, log_text, baseline, polaris=None):
+    """Commit eval log (+ optional Polaris receipt/attestation) to sparkinfer-log.
+
+    polaris: optional dict with keys ``receipt`` and/or ``attestation`` (JSON-serializable).
+    Best-effort: never blocks the eval. Returns the page URL only after a successful push.
+    """
     try:
         rid = f"{int(num):04d}-{oid[:7]}"
-        if not os.path.isdir(os.path.join(LOG_DIR, ".git")):
-            subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
-        else:
-            subprocess.run(["git", "-C", LOG_DIR, "pull", "-q", "--rebase"], check=False)
+        _ensure_log_repo()
         rundir = os.path.join(LOG_DIR, "runs", rid); os.makedirs(rundir, exist_ok=True)
         result = {"id": rid, "pr": int(num), "title": title,
                   "url": f"https://github.com/{repo}/pull/{num}", "commit": oid[:7],
@@ -501,54 +516,48 @@ def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
                   "clocks_pinned": res.get("clocks_pinned"), "clock_mhz": res.get("clock_mhz"),
                   "clock_spread_mhz": res.get("clock_spread_mhz"), "eval_seed": res.get("eval_seed"),
                   "model_sha_pinned": res.get("model_sha_pinned"), "llama_commit": res.get("llama_commit")}
+        if polaris and polaris.get("receipt"):
+            result["polaris"] = True
+            result["polaris_receipt_id"] = polaris["receipt"].get("receipt_id")
         json.dump(result, open(os.path.join(rundir, "result.json"), "w"), indent=2)
         clean = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "<ip>", log_text or "")   # scrub host IPs
         open(os.path.join(rundir, "log.txt"), "w").write(clean)
+        if polaris:
+            if polaris.get("attestation"):
+                json.dump(polaris["attestation"], open(os.path.join(rundir, "attestation.json"), "w"), indent=2)
+            if polaris.get("receipt"):
+                json.dump(polaris["receipt"], open(os.path.join(rundir, "receipt.json"), "w"), indent=2)
         ipath = os.path.join(LOG_DIR, "index.json")
         idx = json.load(open(ipath)) if os.path.exists(ipath) else []
         idx = [e for e in idx if e.get("id") != rid]
-        idx.append({"id": rid, "pr": int(num), "title": title, "label": res.get("label"),
-                    "delta_pct": res.get("pct_over_frontier"), "tps": res.get("tps"),
-                    "score_context": res.get("score_context"), "date": result["date"]})
+        idx_entry = {"id": rid, "pr": int(num), "title": title, "label": res.get("label"),
+                     "delta_pct": res.get("pct_over_frontier"), "tps": res.get("tps"),
+                     "score_context": res.get("score_context"), "date": result["date"]}
+        if polaris and polaris.get("receipt"):
+            idx_entry["polaris"] = True
+            idx_entry["polaris_receipt_id"] = polaris["receipt"].get("receipt_id", "")[:16]
+        idx.append(idx_entry)
         idx.sort(key=lambda x: x["id"])
         json.dump(idx, open(ipath, "w"), indent=2)
         subprocess.run(["git", "-C", LOG_DIR, "add", "-A"], check=True)
-        subprocess.run(["git", "-C", LOG_DIR, "commit", "-q", "-m",
-                        f"eval: #{num} {oid[:7]} -> eval:{res.get('label')}"], check=False)
-        subprocess.run(["git", "-C", LOG_DIR, "push", "-q"], check=False)
+        msg = f"eval: #{num} {oid[:7]} -> eval:{res.get('label')}"
+        if polaris and polaris.get("receipt"):
+            msg += f" + polaris {polaris['receipt'].get('receipt_id', '?')[:16]}"
+        commit = subprocess.run(["git", "-C", LOG_DIR, "commit", "-q", "-m", msg], check=False)
+        if commit.returncode != 0:
+            print(">> eval-log upload skipped: nothing to commit")
+            return None
+        push = subprocess.run(["git", "-C", LOG_DIR, "push", "-q"], check=False)
+        if push.returncode != 0:
+            print(f">> eval-log push failed (rc={push.returncode})")
+            return None
         url = LOG_PAGE + rid
         print(f">> eval log: {url}")
+        if polaris and polaris.get("receipt"):
+            print(f">> Polaris receipt: {url}")
         return url
     except Exception as e:
         print(f">> eval-log upload skipped: {e}")
-        return None
-
-def _upload_polaris_receipt(receipt, repo, num, oid):
-    """Upload a signed Polaris receipt to the sparkinfer-log repo alongside the eval log.
-
-    Best-effort: never blocks the eval. Returns the URL to the receipt, or None.
-    """
-    try:
-        rid = f"{int(num):04d}-{oid[:7]}"
-        if not os.path.isdir(os.path.join(LOG_DIR, ".git")):
-            subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
-        else:
-            subprocess.run(["git", "-C", LOG_DIR, "pull", "-q", "--rebase"], check=False)
-        rundir = os.path.join(LOG_DIR, "runs", rid)
-        os.makedirs(rundir, exist_ok=True)
-        receipt_path = os.path.join(rundir, "receipt.json")
-        json.dump(receipt, open(receipt_path, "w"), indent=2)
-        subprocess.run(["git", "-C", LOG_DIR, "add", os.path.join("runs", rid, "receipt.json")],
-                       check=True)
-        subprocess.run(["git", "-C", LOG_DIR, "commit", "-q", "-m",
-                        f"polaris: #{num} {oid[:7]} receipt {receipt.get('receipt_id', '?')[:16]}"],
-                       check=False)
-        subprocess.run(["git", "-C", LOG_DIR, "push", "-q"], check=False)
-        url = f"{LOG_PAGE}{rid}"
-        print(f">> Polaris receipt uploaded to {url}")
-        return url
-    except Exception as e:
-        print(f">> Polaris receipt upload skipped: {e}")
         return None
 
 def update_dashboard(repo, pr, areas, res, proof_url=None):
@@ -740,10 +749,7 @@ def append_frontier_ledger(repo, num, e, prev_f, new_f):
                               "author,mergeCommit"]).stdout or "{}")
         author = (info.get("author") or {}).get("login", "?")
         commit = ((info.get("mergeCommit") or {}).get("oid") or "")[:9]
-        if not os.path.isdir(os.path.join(LOG_DIR, ".git")):
-            subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
-        else:
-            subprocess.run(["git", "-C", LOG_DIR, "pull", "-q", "--rebase"], check=False)
+        _ensure_log_repo()
         entry = {"date": datetime.date.today().isoformat(), "pr": int(num), "author": author,
                  "commit": commit, "delta_pct": e.get("delta_pct"),
                  "prev_frontier": prev_f, "new_frontier": new_f, "proof": e.get("proof_url")}
@@ -1261,9 +1267,10 @@ def main():
             res = json.loads(line[len("RESULT_JSON "):]); label = res["label"]; body = render(res, oid)
             print(f"PR #{num}: {json.dumps(res)}")
 
-            # --- Polaris: parse unsigned attestation from eval box, attest it, upload receipt ---
+            # --- Polaris: parse unsigned attestation from eval box, attest it, upload with eval log ---
             polaris_line = next((l for l in r.stdout.splitlines()
                                  if l.startswith("POLARIS_ATTESTATION ")), None)
+            polaris_bundle = None
             if polaris_line and res:
                 try:
                     attestation = json.loads(polaris_line[len("POLARIS_ATTESTATION "):])
@@ -1298,14 +1305,8 @@ def main():
                         print(f">> Polaris Ed25519: signed with SparkInfer key")
 
                     if receipt:
-                        # Upload receipt to sparkinfer-log repo alongside the eval log
-                        receipt_url = _upload_polaris_receipt(receipt, args.repo, num, oid)
-                        if receipt_url:
-                            res["polaris_receipt_url"] = receipt_url
-                            res["polaris_receipt_hash"] = receipt["receipt_id"][:16]
-                            print(f">> Polaris receipt: {receipt_url}")
-                        else:
-                            print(">> Polaris receipt upload skipped")
+                        polaris_bundle = {"receipt": receipt, "attestation": attestation}
+                        res["polaris_receipt_hash"] = receipt["receipt_id"][:16]
                     else:
                         print(">> Polaris attestation collected but NOT attested (no key configured)")
                 except Exception as e:
@@ -1329,7 +1330,10 @@ def main():
         gh(["pr", "comment", str(num), "-R", args.repo, "--body", body])
         print(f"PR #{num}: posted {'eval:'+label if label else 'error'} — NOT merged.")
         if res:
-            proof = upload_eval_log(args.repo, num, pr.get("title", ""), oid, res, r.stdout + r.stderr, run_baseline)
+            proof = upload_eval_log(args.repo, num, pr.get("title", ""), oid, res,
+                                    r.stdout + r.stderr, run_baseline, polaris=polaris_bundle)
+            if proof and polaris_bundle:
+                res["polaris_receipt_url"] = proof
             update_dashboard(args.repo, pr, areas, res, proof_url=proof)
             # auto-close on REJECT is DISABLED — merge-first is the only automated action.
             # Rejected PRs stay open so authors can rebase and re-submit.
