@@ -138,6 +138,56 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 323,
+      "title": "perf(qwen35): requantize dense FFN down Q6_K→Q4_K at load (~5% Qwythos decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 363.43,
+      "delta_pct": -0.1,
+      "top1": 0.9743,
+      "kl": 0.0183,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/323",
+      "model": "bidir",
+      "polaris_receipt_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0323-ec3d7c9",
+      "polaris_receipt_hash": "a6408c66e0db1b9f",
+      "eval_mode": "longctx",
+      "score_context": 32768,
+      "best_context_label": "32k-context",
+      "context_gains_pct": {
+        "128-context": -0.17,
+        "512-context": -0.19,
+        "4k-context": -0.16,
+        "16k-context": -0.1,
+        "32k-context": -0.05
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 425.76,
+      "ctx_512_tps": 419.02,
+      "ctx_4096_tps": 402.36,
+      "ctx_16384_tps": 385.25,
+      "ctx_32768_tps": 363.43,
+      "guard_128_baseline": 426.5,
+      "guard_128_ratio": 0.9983,
+      "guard_128_pass": true,
+      "guard_512_baseline": 419.81,
+      "guard_512_ratio": 0.9981,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 403.0,
+      "guard_4k_ratio": 0.9984,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 385.65,
+      "guard_16k_ratio": 0.999,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 363.62,
+      "guard_32k_ratio": 0.9995,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0323-ec3d7c9",
+      "proof_run": "0323-ec3d7c9"
+    },
+    {
       "num": 318,
       "title": "perf: quantized dense FFN + GDN fusions + hd256 32k combine",
       "areas": [
@@ -1633,21 +1683,6 @@ window.SPARKINFER = {
       "kl": 0.0181,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/105",
       "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0105-fd67c2b"
-    },
-    {
-      "num": 87,
-      "title": "perf(attn): fuse Q/K/V Q4_K MMVQ into one launch (+3% decode)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "none",
-      "tps": 437.3,
-      "delta_pct": 0.2,
-      "top1": 0.97,
-      "kl": 0.1417,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/87",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0087-b7562da"
     }
   ],
   "landed": [
