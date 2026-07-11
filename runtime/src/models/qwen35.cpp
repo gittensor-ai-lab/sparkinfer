@@ -348,10 +348,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
         // KL~equal to baseline vs a real llama.cpp reference at 120 sampled 8k-32k positions).
         // Gated strictly to Qwen3.6's exact full-attention config (hd256, 8:1 GQA) so Qwythos
         // (hd256, 4:1 GQA) and Qwen3-30B (hd128) keep the untouched generic policy above.
-        if (c.head_dim == 256 && c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 8
-            && (long)seqlen > 2L * s.split_chunk) {
+        if (c.head_dim == 256 && c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 8 && want >= 128)
             want = 160;
-        }
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
             if (s.graph_ready) {
