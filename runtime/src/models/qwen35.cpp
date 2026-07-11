@@ -367,11 +367,20 @@ int Qwen35Model::forward_token(int token_id, int position) {
         const char* e = getenv("SPARKINFER_FAMMA");
         famma_graph = (e && e[0] == '0') ? 0 : 1;
     }
+    static int famma4_graph = -1;
+    if (famma4_graph < 0) {
+        const char* e = getenv("SPARKINFER_FAMMA4");
+        famma4_graph = (e && e[0] == '0') ? 0 : 1;
+    }
     int attn_graph_mode = 0;
     if (famma_graph && s.kv->int8_kv() && s.kv->block_size() == 16 &&
         c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 8) {
         const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
         attn_graph_mode = (seqlen > 512 && mma_chunk >= 32) ? 2 : 1;
+    } else if (famma4_graph && s.kv->int8_kv() && s.kv->block_size() == 16 &&
+               c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 4) {
+        const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
+        attn_graph_mode = (seqlen > 512 && mma_chunk >= 32) ? 3 : 1;
     }
     if (s.graph_ready && attn_graph_mode != s.graph_attn_mode) {
         cu(cudaGraphExecDestroy(s.cu_exec), "graph recapture destroy exec");
