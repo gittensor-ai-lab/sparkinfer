@@ -81,7 +81,7 @@
   .model-eq{font-weight:600;color:var(--muted);font-size:20px}
   .hf-model{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;color:var(--title);font-family:"Work Sans",sans-serif}
   .hf-model:hover{color:var(--theme)}
-  .hf-model img{width:20px;height:20px;border-radius:50%;object-fit:cover;border:1px solid var(--line);flex:0 0 auto;display:block}
+  .hf-model img{width:22px;height:22px;border-radius:4px;object-fit:contain;background:transparent;padding:0;border:none;flex:0 0 auto;display:block}
   .hf-model-name{line-height:1.2}
   .hf-dl{color:var(--muted);font-weight:500;font-size:12px;white-space:nowrap}
   .sec-h .hint{font-size:13px;color:var(--muted)}
@@ -263,7 +263,7 @@
       <div class="sec-title-row">
         <h2>Qwen3.5 <span class="model-eq">(Qwythos)</span> · per-context</h2>
         <a class="hf-model" id="detail-q35-hf" href="https://huggingface.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF" target="_blank" rel="noopener" title="empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF">
-          <img src="assets/img/empero-ai.webp" alt="empero-ai" width="20" height="20" loading="lazy" decoding="async">
+          <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="eager" decoding="async">
           <span class="hf-model-name">empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF</span>
           <span class="hf-dl" id="detail-q35-dl"></span>
         </a>
@@ -319,7 +319,7 @@
     const name = el.querySelector(".hf-model-name");
     if (name) name.textContent = repo;
     const img = el.querySelector("img");
-    if (img && q.hf_avatar) img.src = q.hf_avatar;
+    if (img) img.src = q.hf_avatar || "assets/img/huggingface.svg";
     const fmtDl = n => {
       if (!n) return "";
       if (n >= 1e6) return (n / 1e6).toFixed(2).replace(/\.?0+$/, "") + "M";
