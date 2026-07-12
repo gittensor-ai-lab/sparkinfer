@@ -14,6 +14,12 @@ import pr_eval_bot as bot
 
 
 class PrEvalBotPolicyTest(unittest.TestCase):
+    def test_merge_conflict_blocks_eval(self):
+        self.assertTrue(bot.pr_merge_conflict("CONFLICTING"))
+        self.assertFalse(bot.pr_merge_conflict("MERGEABLE"))
+        self.assertFalse(bot.pr_merge_conflict("UNKNOWN"))
+        self.assertFalse(bot.pr_merge_conflict(None))
+
     def test_regression_labels_block_automerge(self):
         self.assertIn("regression-128", bot.AUTOMERGE_BLOCK_LABELS)
         self.assertIn("regression-512", bot.AUTOMERGE_BLOCK_LABELS)

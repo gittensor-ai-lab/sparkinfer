@@ -343,6 +343,17 @@ def greenlight_status(repo, num, pr_labels):
         return "no-bench", f"claimed decode before={before} ≥ after={after} (no improvement)"
     return "ok", f"ticked + decode {before}→{after} tok/s (+{after - before:.1f})"
 
+def pr_merge_conflict(mergeable):
+    """True when GitHub reports the PR cannot merge cleanly into its base branch."""
+    return mergeable == "CONFLICTING"
+
+def post_merge_conflict_comment(repo, num):
+    body = ("<!-- sparkinfer-merge-conflict -->\n## ⏸ Merge conflict — rebase before eval\n\n"
+            "This branch **conflicts with `main`**, so the RTX 5090 eval is skipped until you rebase.\n\n"
+            "Please **rebase onto `main`** and push — the bot re-evaluates on the next poll once the "
+            "PR is cleanly mergeable.")
+    gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+
 def post_needs_bench_comment(repo, num):
     body = ("<!-- sparkinfer-needs-bench -->\n## ⏳ Needs a benchmark to be evaluated\n\n"
             "You ticked **Tested on RTX 5090** but the decode **before → after tok/s** table is still "
@@ -1058,6 +1069,8 @@ def auto_merge_ok(repo, num):
     sens = [f["path"] for f in info.get("files", []) if any(f["path"].startswith(p) for p in AUTOMERGE_SENSITIVE)]
     if sens:
         return False, f"touches protected paths: {', '.join(sens[:3])}"
+    if pr_merge_conflict(info.get("mergeable")):
+        return False, "merge conflict with base"
     if info.get("mergeable") != "MERGEABLE":
         return False, f"not cleanly mergeable ({info.get('mergeable')})"
     return True, "ok"
@@ -1235,7 +1248,7 @@ def main():
     # OLDEST-FIRST: evaluate ascending by PR number so the original of any duplicate is seen before
     # its copy, and the earliest submitter is graded first (fairness + copycat attribution).
     prs = json.loads(gh(["pr", "list", "-R", args.repo, "--state", "open",
-                         "--json", "number,headRefName,headRefOid,title,isCrossRepository,labels,isDraft"]).stdout or "[]")
+                         "--json", "number,headRefName,headRefOid,title,isCrossRepository,labels,isDraft,mergeable"]).stdout or "[]")
     prs.sort(key=lambda p: p["number"])
     if args.only_pr:
         prs = [p for p in prs if p["number"] == args.only_pr]
@@ -1358,6 +1371,17 @@ def main():
                 if PENALTY_LABEL not in cur: add_label(args.repo, num, PENALTY_LABEL)
                 for L in (EVAL_GATE_LABEL, NOT_TESTED_LABEL, NEEDS_BENCH_LABEL):
                     if L in cur: remove_label(args.repo, num, L)
+            continue
+        # Gate 2.6 — merge conflict: don't spend GPU until the branch rebases cleanly onto main.
+        if pr_merge_conflict(pr.get("mergeable")):
+            print(f"PR #{num}: merge conflict with base — {NEEDS_REBASE_LABEL}, skip eval")
+            if not args.dry_run:
+                cur = {l["name"] for l in pr.get("labels", [])}
+                if NEEDS_REBASE_LABEL not in cur:
+                    add_label(args.repo, num, NEEDS_REBASE_LABEL)
+                    post_merge_conflict_comment(args.repo, num)
+                if EVAL_GATE_LABEL in cur:
+                    remove_label(args.repo, num, EVAL_GATE_LABEL)
             continue
         # Gate 3 — greenlight (proof-gated): evaluate only if the PR ticks the RTX-5090 box AND
         # fills the decode before/after table with a real improvement. No override exists.

@@ -77,7 +77,7 @@ if [ "$BASELINE_ONLY" = 1 ]; then
   SPARKINFER_P35_GUARD_128_BASELINE=0
   SPARKINFER_P35_GUARD_512_BASELINE=0
   SPARKINFER_P35_GUARD_4K_BASELINE=0
-  export SPARKINFER_DOWN_REQUANT_Q4K=0
+  # Baseline must match production defaults (DOWN_REQUANT defaults ON in qwen35.cpp since v0.4.0).
 else
   echo ">> [build] submission ($COMMIT) from source (sm_$ARCH) — shared by both models ..." >&2
   rm -rf "$ROOT/build"
@@ -86,7 +86,7 @@ else
     printf 'RESULT_JSON {"commit": "%s", "tps": 0, "top1": 0, "kl": 99, "frontier_tps": 0, "label": "REJECT", "reason": "build failed (does not compile)", "pass": false, "mode": "bidir"}\n' "$COMMIT"
     exit 0
   fi
-  # Opt-in kernel features gated by env at runtime: enable for PR eval (baseline on main keeps off).
+  # Match production Qwythos path (DOWN_REQUANT defaults ON; explicit for PR builds).
   export SPARKINFER_DOWN_REQUANT_Q4K=1
 fi
 

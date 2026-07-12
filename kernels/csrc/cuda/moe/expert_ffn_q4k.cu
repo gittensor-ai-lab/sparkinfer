@@ -154,9 +154,8 @@ __global__ void gate_up_q4k_kernel(
 __global__ void gate_up_q4k_mmvq_kernel(
     const __nv_bfloat16* __restrict__ input, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
-    float* __restrict__ h_scratch, int H, int F, int top_k
+    float* __restrict__ h_scratch, int H, int F, int top_k, int pdl
 ) {
-    si_pdl_lc();   // PDL: let the dependent down kernel begin its grid spin-up now
     extern __shared__ char smem_mmvq[];
     float* s_xd = reinterpret_cast<float*>(smem_mmvq);   // [H/32] activation scales
     float* s_xs = s_xd + (H >> 5);                        // [H/32] Q8_1 sum (d*sum)
@@ -228,6 +227,7 @@ __global__ void gate_up_q4k_mmvq_kernel(
     }
     float g = q4kf_wsum(acc_g), u = q4kf_wsum(acc_u);
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(g) * u;
+    if (pdl) si_pdl_lc();   // PDL: signal quant_h/down after h_scratch is written
 }
 
 // down: out[tok,hh] = sum_j weight_j * <h[tok,j], down[e_j, hh]>.
@@ -312,7 +312,7 @@ struct si_block_q8_1 { __half2 ds; signed char qs[32]; };   // 36 B / 32 values 
 // order (block ib covers elements [ib*32, ib*32+32)). One 32-value block per warp.
 __global__ void quant_h_q8_1_kernel(const float* __restrict__ h,
                                     si_block_q8_1* __restrict__ y, int n_blocks, int pdl) {
-    if (pdl) si_pdl_lc();
+    if (pdl) si_pdl_sync();   // PDL: wait for gate_up's h_scratch writes
     const int warpsPB = blockDim.x >> 5;
     const int ib = blockIdx.x * warpsPB + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
@@ -327,6 +327,7 @@ __global__ void quant_h_q8_1_kernel(const float* __restrict__ h,
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
     if (lane == 0) y[ib].ds = __floats2half2_rn(d, d * (float)s);
+    if (pdl) si_pdl_lc();   // PDL: signal down after Q8_1(h) is ready
 }
 
 // Faithful llama.cpp vec_dot_q6_K_q8_1 for one 256-superblock at quant-index iqs (0..31).
@@ -508,9 +509,8 @@ __device__ __forceinline__ float si_vec_dot_q5_K(const si_block_q5_K* bq5, const
 __global__ void gate_up_mmvq2_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
-    float* __restrict__ h_scratch, int H, int F, int top_k
+    float* __restrict__ h_scratch, int H, int F, int top_k, int pdl
 ) {
-    si_pdl_lc();
     constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
     const int row = blockIdx.x, ts = row / F, f = row % F, tok = ts / top_k;
     const int e = expert_ids[ts];
@@ -534,6 +534,7 @@ __global__ void gate_up_mmvq2_kernel(
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
 }
 
 // ---- Qwen3.6 shared expert (Q8_0 gate/up/down, F=512) -------------------------
@@ -591,9 +592,8 @@ template <int H, int F, int TOPK>
 __global__ void gate_up_mmvq2_qwen_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
-    float* __restrict__ h_scratch
+    float* __restrict__ h_scratch, int pdl
 ) {
-    si_pdl_lc();
     constexpr int NW = 4, WS = 32;
     const int row = blockIdx.x, ts = row / F, f = row - ts * F, tok = ts / TOPK;
     const int e = expert_ids[ts];
@@ -618,15 +618,15 @@ __global__ void gate_up_mmvq2_qwen_kernel(
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
 }
 
 template <int H, int F, int TOPK>
 __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
-    float* __restrict__ h_scratch, int n_rows
+    float* __restrict__ h_scratch, int n_rows, int pdl
 ) {
-    si_pdl_lc();
     constexpr int NW = 4, WS = 32;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int group = warp >> 2, group_warp = warp & 3;
@@ -655,6 +655,7 @@ __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
 }
 
 template <int H, int F, int TOPK>
@@ -1098,6 +1099,15 @@ static inline int down_mmvq_pdl() {
     return v;
 }
 
+static inline int gu_mmvq_pdl() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_GU_PDL");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
 static inline int dense_top1_down_splitk(int current, int top_k, const char* specific_env) {
     if (top_k == 1 && !getenv("SPARKINFER_DOWN_SPLITK_S") && !getenv(specific_env))
         return 8;
@@ -1105,17 +1115,17 @@ static inline int dense_top1_down_splitk(int current, int top_k, const char* spe
 }
 
 template <typename Kernel, typename... Args>
-static inline void launch_mmvq_down_kernel(
-    int pdl, dim3 grid, dim3 block, cudaStream_t stream, Kernel kernel, Args... args
+static inline void launch_pdl_kernel(
+    int pdl, dim3 grid, dim3 block, size_t smem, cudaStream_t stream, Kernel kernel, Args... args
 ) {
     if (!pdl) {
-        kernel<<<grid, block, 0, stream>>>(args...);
+        kernel<<<grid, block, smem, stream>>>(args...);
         return;
     }
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = grid;
     cfg.blockDim = block;
-    cfg.dynamicSmemBytes = 0;
+    cfg.dynamicSmemBytes = smem;
     cfg.stream = stream;
     cudaLaunchAttribute attr{};
     attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -1123,6 +1133,13 @@ static inline void launch_mmvq_down_kernel(
     cfg.attrs = &attr;
     cfg.numAttrs = 1;
     cudaLaunchKernelEx(&cfg, kernel, args...);
+}
+
+template <typename Kernel, typename... Args>
+static inline void launch_mmvq_down_kernel(
+    int pdl, dim3 grid, dim3 block, cudaStream_t stream, Kernel kernel, Args... args
+) {
+    launch_pdl_kernel(pdl, grid, block, 0, stream, kernel, args...);
 }
 
 // Dispatch the templated split-K MMVQ down on the runtime split count. WPB=8, so
@@ -1299,6 +1316,7 @@ void launch_moe_expert_ffn_q4k(
     if (gu_spec < 0) { const char* gs = getenv("SPARKINFER_GU_SPEC"); gu_spec = (gs && gs[0] == '0') ? 0 : 1; }
     static int gu_pack2 = -1;
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
+    const int gu_pdl = gu_mmvq_pdl();
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
         const si_block_q8_1* q;
@@ -1312,40 +1330,51 @@ void launch_moe_expert_ffn_q4k(
             q = qbuf;
         }
         if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
-            gate_up_mmvq2_pack2_qwen_kernel<2048, 512, 8><<<(num_tokens * top_k * ffn + 1) / 2, 8 * 32, 0, stream>>>(
+            launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 1) / 2), dim3(8 * 32), 0, stream,
+                gate_up_mmvq2_pack2_qwen_kernel<2048, 512, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, num_tokens * top_k * ffn);
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
+                num_tokens * top_k * ffn, gu_pdl);
         else if (gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
-            gate_up_mmvq2_qwen_kernel<2048, 512, 8><<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
+            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                gate_up_mmvq2_qwen_kernel<2048, 512, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch);
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
         else if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
-            gate_up_mmvq2_pack2_qwen_kernel<2048, 768, 8><<<(num_tokens * top_k * ffn + 1) / 2, 8 * 32, 0, stream>>>(
+            launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 1) / 2), dim3(8 * 32), 0, stream,
+                gate_up_mmvq2_pack2_qwen_kernel<2048, 768, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, num_tokens * top_k * ffn);
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
+                num_tokens * top_k * ffn, gu_pdl);
         else if (gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
-            gate_up_mmvq2_qwen_kernel<2048, 768, 8><<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
+            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                gate_up_mmvq2_qwen_kernel<2048, 768, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch);
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
         else if (gu_pack2 && gu_spec && hidden == 4096 && ffn == 12288 && top_k == 1)
-            gate_up_mmvq2_pack2_qwen_kernel<4096, 12288, 1><<<(num_tokens * top_k * ffn + 1) / 2, 8 * 32, 0, stream>>>(
+            launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 1) / 2), dim3(8 * 32), 0, stream,
+                gate_up_mmvq2_pack2_qwen_kernel<4096, 12288, 1>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, num_tokens * top_k * ffn);
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
+                num_tokens * top_k * ffn, gu_pdl);
         else if (gu_spec && hidden == 4096 && ffn == 12288 && top_k == 1)
-            gate_up_mmvq2_qwen_kernel<4096, 12288, 1><<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
+            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                gate_up_mmvq2_qwen_kernel<4096, 12288, 1>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch);
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
         else
-            gate_up_mmvq2_kernel<<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
+            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                gate_up_mmvq2_kernel,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hidden, ffn, top_k);
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
+                hidden, ffn, top_k, gu_pdl);
     } else if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
         size_t sm = 2 * (size_t)(hidden >> 5) * sizeof(float) + (size_t)hidden;  // s_xd+s_xs+s_xq8
-        gate_up_q4k_mmvq_kernel<<<gu, WPB * 32, sm, stream>>>(
+        launch_pdl_kernel(gu_pdl, gu, dim3(WPB * 32), sm, stream, gate_up_q4k_mmvq_kernel,
             reinterpret_cast<const __nv_bfloat16*>(input),
             reinterpret_cast<const unsigned char*>(gate_q),
             reinterpret_cast<const unsigned char*>(up_q),
-            expert_ids, h_scratch, hidden, ffn, top_k);
+            expert_ids, h_scratch, hidden, ffn, top_k, gu_pdl);
     } else {
         size_t gu_smem = (size_t)hidden * sizeof(float);   // s_x only; s_deq is static
         gate_up_q4k_kernel<<<gu, WPB * 32, gu_smem, stream>>>(
@@ -1367,8 +1396,9 @@ void launch_moe_expert_ffn_q4k(
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb, pdl);
+        const int q_pdl = gu_pdl && pdl;
+        launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+            quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
         // split-K MMVQ down: S warps/row -> S*H warps in flight, hiding the bs=1
         // occupancy stall the one-warp kernel hits. Dense top-1 defaults to S=8 unless
         // an explicit split-K env override is set; routed MoE keeps its existing default.
@@ -1397,8 +1427,9 @@ void launch_moe_expert_ffn_q4k(
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb, pdl);
+        const int q_pdl = gu_pdl && pdl;
+        launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+            quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
         const int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
         if (S > 1) {
             const int RPB = WPB / S;
@@ -1426,8 +1457,9 @@ void launch_moe_expert_ffn_q4k(
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb, pdl);
+        const int q_pdl = gu_pdl && pdl;
+        launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+            quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
         const int S = dense_top1_down_splitk(down_splitk_s_q5(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q5");
         if (S > 1) {
             const int RPB = WPB / S;

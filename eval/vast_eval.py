@@ -68,23 +68,36 @@ BENCH_SCRIPTS = os.path.join(ROOT, "bench", "scripts")
 
 
 def push_bench_scripts(host, port):
-    """Deploy this checkout's bench/scripts to the eval box (authoritative harness)."""
-    if not os.path.isdir(BENCH_SCRIPTS):
-        return
-    tar = subprocess.run(
-        ["tar", "-C", BENCH_SCRIPTS, "-czf", "-", "."],
-        capture_output=True, timeout=120)
-    if tar.returncode:
-        print(f">> WARN: could not pack bench/scripts (rc={tar.returncode})")
+    """Deploy bench/scripts harness to the eval box (prefer origin/main)."""
+    tar_data = None
+    source = "local checkout"
+    # Prefer origin/main — local tree may be behind (stale harness skews baseline guards).
+    subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT, capture_output=True, timeout=120)
+    arch = subprocess.run(
+        ["git", "archive", "--format=tar.gz", "origin/main", "bench/scripts"],
+        cwd=ROOT, capture_output=True, timeout=120)
+    if arch.returncode == 0 and arch.stdout:
+        tar_data = arch.stdout
+        source = "origin/main"
+        extract = "mkdir -p /root/sparkinfer && tar -xzf - -C /root/sparkinfer"
+    elif os.path.isdir(BENCH_SCRIPTS):
+        tar = subprocess.run(
+            ["tar", "-C", BENCH_SCRIPTS, "-czf", "-", "."],
+            capture_output=True, timeout=120)
+        if tar.returncode:
+            print(f">> WARN: could not pack bench/scripts (rc={tar.returncode})")
+            return
+        tar_data = tar.stdout
+        extract = "mkdir -p /root/sparkinfer/bench/scripts && tar -xzf - -C /root/sparkinfer/bench/scripts"
+    else:
         return
     try:
         subprocess.run(
             ["ssh", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
              "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=40",
-             "-p", str(port), f"root@{host}",
-             "mkdir -p /root/sparkinfer/bench/scripts && tar -xzf - -C /root/sparkinfer/bench/scripts"],
-            input=tar.stdout, timeout=180, check=False)
-        print(">> bench/scripts synced from local checkout")
+             "-p", str(port), f"root@{host}", extract],
+            input=tar_data, timeout=180, check=False)
+        print(f">> bench/scripts synced from {source}")
     except subprocess.TimeoutExpired:
         print(">> WARN: bench/scripts sync timed out — box may run stale harness")
 

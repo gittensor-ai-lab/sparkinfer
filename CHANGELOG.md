@@ -25,9 +25,9 @@ Landed in a single sprint: dense-hybrid loader, FFN down Q6→Q4 requant at load
 graph capture (#324), GQA-4 shared-KV tiles (#326), and bidirectional eval against Qwen3.6 guards.
 **`SPARKINFER_DOWN_REQUANT_Q4K` now defaults ON** (set `=0` to keep native Q6_K reads).
 
-### 🏁 Three models — all ahead of llama.cpp @128
+### 🏁 Three models — all ahead of llama.cpp (128-token decode)
 
-| model | sparkinfer @128 | llama.cpp | delta |
+| model | sparkinfer (128 tok/s) | llama.cpp | delta |
 |---|---:|---:|---:|
 | **Qwen3-MoE (30B-A3B)** | **480.7 tok/s** | 365.85 tok/s | **+31%** |
 | **Qwen3.6-35B-A3B** | **424.9 tok/s** | 275.81 tok/s | **+54%** |
@@ -64,7 +64,17 @@ receipts** if `SPARKINFER_POLARIS_PRIVATE_KEY` is set — eval logs still ship a
 3. **Same-box baseline** — bidirectional Qwen3.5 + Qwen3.6 eval with per-model no-regression guards.
 4. **Polaris** — TDX receipts when available; Ed25519 fallback when the enclave API is down.
 
-**Verified:** RTX 5090 · Qwen3.5 **280 tok/s** @128 · Qwen3.6 **425 tok/s** @128 · Qwen3-MoE **481 tok/s** @128.
+**Verified:** RTX 5090 · Qwen3.5 **280 tok/s** (128-tok) · Qwen3.6 **425 tok/s** (128-tok) · Qwen3-MoE **481 tok/s** (128-tok).
+
+### Contributors
+
+- **@James-CUDA** — #323 (Qwen3.5 FFN down Q6→Q4 requant at load)
+- **@9876543210-tc-0123456789** — #324 (Qwen3.5 split-K + int8 graph capture)
+- **@inference2026** — #326 (GQA-4 shared-KV tile for Qwythos hd256)
+- **@claytonlin1110** — #331 (MoE gate_up→quant_h→down PDL chain)
+- **@Paral1995** — #318 (dense FFN + GDN fusions + hd256 32k combine)
+- **@reyanthony062001-ops** — #300 (hd256 int8-MMA flash-decode correctness)
+- **@skyrocket2026** — Qwen3.5 bidir eval infra (#315–#317, #322), Polaris Ed25519 fallback, v0.4.0 release
 
 ## [0.3.8] — 2026-07-09
 
