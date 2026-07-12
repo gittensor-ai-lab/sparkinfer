@@ -2,15 +2,15 @@
 window.SPARKINFER = {
   "updated": "2026-07-12",
   "status": {
-    "gpu": "RTX 5090 · sm_120 · CUDA 13",
-    "model": "Qwen3-30B-A3B · Q4_K_M",
+    "gpu": "RTX 5090 \u00b7 sm_120 \u00b7 CUDA 13",
+    "model": "Qwen3-30B-A3B \u00b7 Q4_K_M",
     "frontier_tps": 484.79,
     "ref_name": "llama.cpp",
     "ref_tps": 365.85,
     "vram_gb": 21.4,
     "token_match": 0.97,
     "kl": 0.02,
-    "ref_note": "128-tok decode rerun on current main, same RTX 5090 · Q4_K_M GGUF",
+    "ref_note": "128-tok decode rerun on current main, same RTX 5090 \u00b7 Q4_K_M GGUF",
     "longctx_16k_tps": 330.2,
     "longctx_2k_tps": 277.78,
     "longctx_token_match": 0.9426,
@@ -107,27 +107,27 @@ window.SPARKINFER = {
     },
     {
       "l": "L",
-      "d": "10–18% over frontier",
+      "d": "10\u201318% over frontier",
       "c": "#1D76DB"
     },
     {
       "l": "M",
-      "d": "6–10% over frontier",
+      "d": "6\u201310% over frontier",
       "c": "#8250DF"
     },
     {
       "l": "S",
-      "d": "3.5–6% over frontier",
+      "d": "3.5\u20136% over frontier",
       "c": "#B8860B"
     },
     {
       "l": "XS",
-      "d": "2–3.5% over frontier",
+      "d": "2\u20133.5% over frontier",
       "c": "#8A93A0"
     },
     {
       "l": "none",
-      "d": "≤ 2% — within noise, no verified gain",
+      "d": "\u2264 2% \u2014 within noise, no verified gain",
       "c": "#9AA6B2"
     },
     {
@@ -139,7 +139,7 @@ window.SPARKINFER = {
   "prs": [
     {
       "num": 353,
-      "title": "perf(qwen36): Q8_0→Q4_K requant of full-attention q/o projections",
+      "title": "perf(qwen36): Q8_0\u2192Q4_K requant of full-attention q/o projections",
       "areas": [
         "kernels",
         "runtime"
@@ -176,7 +176,7 @@ window.SPARKINFER = {
         "label": "none",
         "delta_tps": 1.59,
         "pct_over_frontier": 0.5,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -385,7 +385,7 @@ window.SPARKINFER = {
         "label": "none",
         "delta_tps": 1.21,
         "pct_over_frontier": 0.4,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -460,7 +460,7 @@ window.SPARKINFER = {
         "label": "none",
         "delta_tps": 0.23,
         "pct_over_frontier": 0.1,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -590,7 +590,7 @@ window.SPARKINFER = {
         "label": "none",
         "delta_tps": 2.02,
         "pct_over_frontier": 0.7,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -760,7 +760,7 @@ window.SPARKINFER = {
     },
     {
       "num": 350,
-      "title": "perf(qwen36): opt-in Q8→Q4 requant reward profile (~+6.3% @512)",
+      "title": "perf(qwen36): opt-in Q8\u2192Q4 requant reward profile (~+6.3% @512)",
       "areas": [
         "kernels",
         "runtime"
@@ -803,7 +803,7 @@ window.SPARKINFER = {
         "label": "REJECT",
         "delta_tps": 1.8,
         "pct_over_frontier": 0.6,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": false,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -1063,7 +1063,7 @@ window.SPARKINFER = {
         "label": "none",
         "delta_tps": 1.29,
         "pct_over_frontier": 0.4,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -1554,7 +1554,7 @@ window.SPARKINFER = {
         "label": "none",
         "delta_tps": -0.45,
         "pct_over_frontier": -0.1,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -1762,7 +1762,7 @@ window.SPARKINFER = {
         "label": "none",
         "delta_tps": -0.45,
         "pct_over_frontier": -0.1,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -2276,7 +2276,7 @@ window.SPARKINFER = {
     },
     {
       "num": 323,
-      "title": "perf(qwen35): requantize dense FFN down Q6_K→Q4_K at load (~5% Qwythos decode)",
+      "title": "perf(qwen35): requantize dense FFN down Q6_K\u2192Q4_K at load (~5% Qwythos decode)",
       "areas": [
         "kernels",
         "runtime"
@@ -2346,7 +2346,7 @@ window.SPARKINFER = {
     },
     {
       "num": 239,
-      "title": "perf(qwen3.6): fuse decode kernel launches — shared-expert + GDN conv/L2-norm",
+      "title": "perf(qwen3.6): fuse decode kernel launches \u2014 shared-expert + GDN conv/L2-norm",
       "areas": [
         "kernels",
         "runtime"
@@ -2740,7 +2740,7 @@ window.SPARKINFER = {
     },
     {
       "num": 269,
-      "title": "perf(qwen3.6): shared-expert MMVQ + QK-norm+RoPE+KV-append — 25% decode",
+      "title": "perf(qwen3.6): shared-expert MMVQ + QK-norm+RoPE+KV-append \u2014 25% decode",
       "areas": [
         "kernels",
         "runtime"
@@ -2800,7 +2800,7 @@ window.SPARKINFER = {
     },
     {
       "num": 266,
-      "title": "perf(qwen36): +15-20% decode — Q8 shared MMVQ, pipelining, F=512 MoE, hd256 FA",
+      "title": "perf(qwen36): +15-20% decode \u2014 Q8 shared MMVQ, pipelining, F=512 MoE, hd256 FA",
       "areas": [
         "kernels",
         "runtime"
@@ -3066,7 +3066,7 @@ window.SPARKINFER = {
     },
     {
       "num": 229,
-      "title": "feat(qwen36): add optimized Gated-DeltaNet AR state update kernel wit…",
+      "title": "feat(qwen36): add optimized Gated-DeltaNet AR state update kernel wit\u2026",
       "areas": [
         "kernels"
       ],
@@ -3109,7 +3109,7 @@ window.SPARKINFER = {
     },
     {
       "num": 230,
-      "title": "perf(qwen3.6): shared expert as coalesced GEMVs — 7.2× decode (23→167 tok/s)",
+      "title": "perf(qwen3.6): shared expert as coalesced GEMVs \u2014 7.2\u00d7 decode (23\u2192167 tok/s)",
       "areas": [
         "kernels",
         "runtime"
@@ -3670,7 +3670,7 @@ window.SPARKINFER = {
       "date": "2026-06-27"
     },
     {
-      "name": "split-K MMVQ down — +8% Qwen",
+      "name": "split-K MMVQ down \u2014 +8% Qwen",
       "tps": 339.59,
       "pr": 74,
       "date": "2026-06-28"
@@ -3841,11 +3841,11 @@ window.SPARKINFER = {
     ]
   },
   "qwen35": {
-    "model": "Qwythos-9B (Qwen3.5-9B) · Q4_K_M",
+    "model": "Qwythos-9B (Qwen3.5-9B) \u00b7 Q4_K_M",
     "hf_repo": "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF",
-    "hf_avatar": "assets/img/empero-ai.webp",
+    "hf_avatar": "assets/img/huggingface.svg",
     "hf_downloads": 1967677,
-    "arch": "dense hybrid Gated-DeltaNet + full-attn · 9B · hd256",
+    "arch": "dense hybrid Gated-DeltaNet + full-attn \u00b7 9B \u00b7 hd256",
     "frontier_tps": 303.18,
     "baseline_tps": 283.18,
     "ref_name": "llama.cpp",
@@ -3906,8 +3906,8 @@ window.SPARKINFER = {
     }
   ],
   "qwen36": {
-    "model": "Qwen3.6-35B-A3B · UD-Q4_K_M",
-    "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
+    "model": "Qwen3.6-35B-A3B \u00b7 UD-Q4_K_M",
+    "arch": "hybrid Gated-DeltaNet + full-attn MoE \u00b7 256 experts top-8 \u00b7 hd256",
     "frontier_tps": 427.54,
     "baseline_tps": 23.03,
     "ref_name": "llama.cpp",
@@ -3978,7 +3978,7 @@ window.SPARKINFER = {
       "label": "M"
     },
     {
-      "name": "+15-20% decode — Q8 shared M",
+      "name": "+15-20% decode \u2014 Q8 shared M",
       "tps": 300.16,
       "pr": 266,
       "date": "2026-07-06",
@@ -4027,7 +4027,7 @@ window.SPARKINFER = {
       "label": "S"
     },
     {
-      "name": "Q8_0→Q4_K requant of full-at",
+      "name": "Q8_0\u2192Q4_K requant of full-at",
       "tps": 427.54,
       "pr": 353,
       "date": "2026-07-12",

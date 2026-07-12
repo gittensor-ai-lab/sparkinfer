@@ -3842,7 +3842,7 @@
   "qwen35": {
     "model": "Qwythos-9B (Qwen3.5-9B) · Q4_K_M",
     "hf_repo": "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF",
-    "hf_avatar": "assets/img/empero-ai.webp",
+    "hf_avatar": "assets/img/huggingface.svg",
     "hf_downloads": 1967677,
     "arch": "dense hybrid Gated-DeltaNet + full-attn · 9B · hd256",
     "frontier_tps": 303.18,
