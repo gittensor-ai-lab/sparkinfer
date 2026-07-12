@@ -18,6 +18,7 @@
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/quant.h"
+#include "sparkinfer/kernels/proj_requant.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -1156,16 +1157,20 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // requant; qtype flips to 12 on success.
     auto dev_quant_requant_q4k = [&](const std::string& name, int& qtype, bool req) -> const void* {
         const void* q6 = dev_quant(name, qtype);
-        if (!req || qtype != 14 || !q6) return q6;
+        if (!req || (qtype != 14 && qtype != 8) || !q6) return q6;
+        const int src_type = qtype;            // 14 (Q6_K) or 8 (Q8_0) -> Q4_K
         const GGUFTensor* t = g.tensor(name);
         const long nv = t->n_values;
         if (nv % 256 != 0) return q6;
         void* deq = nullptr;
         if (cudaMalloc(&deq, (size_t)nv * 2) != cudaSuccess) return q6;
-        kernels::launch_gguf_dequant(14, q6, deq, nv, s.stream);
+        kernels::launch_gguf_dequant(src_type, q6, deq, nv, s.stream);
         void* q4 = nullptr;
         if (cudaMalloc(&q4, (size_t)(nv / 256) * 144) != cudaSuccess) { cudaFree(deq); return q6; }
-        kernels::launch_ffn_down_requant_q4k(deq, q4, nv, s.stream);
+        // Q8_0 attention projections (Qwen3.6 full-attn q/o) fit with the Lloyd-max
+        // requantizer; the Q6_K dense-FFN down path keeps its existing affine fit.
+        if (src_type == 8) kernels::launch_proj_requant_q4k_lloyd(deq, q4, nv, s.stream);
+        else               kernels::launch_ffn_down_requant_q4k(deq, q4, nv, s.stream);
         cudaStreamSynchronize(s.stream);
         cudaFree(deq);
         if (!s.owned.empty() && s.owned.back() == q6) { s.owned.pop_back(); cudaFree((void*)q6); }
@@ -1227,9 +1232,16 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         const char* v = getenv(name);
         return v ? !mode_is_off(std::string(v)) : def;
     };
+    // Qwen3.6-35B-A3B UD ships its full-attention q/o projections as Q8_0. Requantize
+    // them to Q4_K at load (Lloyd fit) so decode reads ~47% fewer bytes on those matvecs
+    // (~+3.3% decode at short context, gate-passing). On by default for the Qwen3.6
+    // fingerprint; a no-op on the dense Qwythos path (which uses its own qkv default).
+    const bool q36_ud_requant_default = is_qwen35_or_qwen36_hybrid_moe(g);
     const char* attn_env = getenv("SPARKINFER_ATTN_REQUANT_Q4K");
     const std::string attn_requant_mode =
-        attn_env ? std::string(attn_env) : (q35_dense9b_requant_default ? std::string("qkv") : std::string());
+        attn_env ? std::string(attn_env)
+                 : (q35_dense9b_requant_default ? std::string("qkv")
+                    : (q36_ud_requant_default ? std::string("attn_q,attn_output") : std::string()));
     auto mode_token = [&](const char* want) {
         const std::string w(want);
         size_t p = 0;
