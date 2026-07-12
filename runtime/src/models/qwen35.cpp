@@ -28,6 +28,8 @@
 #include <string>
 #include <fstream>
 #include <limits>
+#include <cstring>
+#include <cctype>
 
 namespace sparkinfer {
 
@@ -1113,6 +1115,129 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         qtype = 12;
         return q4;
     };
+    // Qwen3.6 UD attention/GDN projections ship as Q8_0. At short context those Q8_0
+    // MMVQ reads dominate decode (~36% of GPU time at ctx=512 on RTX 5090). Requantize
+    // Q8_0 -> Q4_K once at load (reuse the existing affine Q4_K fitter) and decode via
+    // the Q4_K int8 MMVQ path — ~47% fewer weight bytes on the hottest projections.
+    // Does NOT touch LM head (Q6_K, separate), MoE experts, or shared-expert Q8_0
+    // (those use dedicated Q8 kernels via SPARKINFER_QMOE).
+    // SPARKINFER_Q80_REQUANT_Q4K:
+    //   0/off     — keep native Q8_0 (default)
+    //   1/all     — all attn/GDN Q8_0 projections
+    //   gdn       — GDN only (attn_qkv/gate, ssm_{alpha,beta,out}); unlocks qkv+z fuse
+    //   attn      — full-attn q/k/v/o only
+    //   out       — output projections only (attn_output, ssm_out)
+    //   qkvz      — GDN qkv+gate only (minimum set that unlocks qkv+z Q4 fuse)
+    //   qkv       — GDN attn_qkv only
+    //   gate      — GDN attn_gate only
+    //   ssmab     — ssm_alpha + ssm_beta only
+    //   sout      — ssm_out only
+    //   safe      — out + ssmab + sout (Q6-friendly thin set for the KL gate)
+    auto q80_requant_mode = []() -> int {
+        // bitflags: 1=attn_qkv(in), 2=attn_out, 4=gdn_qkv, 8=gdn_gate, 16=gdn_ab, 32=gdn_out
+        const char* e = getenv("SPARKINFER_Q80_REQUANT_Q4K");
+        auto eq = [](const char* a, const char* b) {
+            if (!a || !b) return false;
+            while (*a && *b) {
+                if (std::tolower((unsigned char)*a) != std::tolower((unsigned char)*b)) return false;
+                ++a; ++b;
+            }
+            return !*a && !*b;
+        };
+        if (!e || !e[0]) {
+            const char* p = getenv("SPARKINFER_Q80_REQUANT_PROFILE");
+            if (p && p[0] && !(p[0] == '0' && !p[1]) && eq(p, "reward"))
+                return 4|8;   // qkvz — measured KL-safe on Qwen3.6 UD with LAYER_OFF=15
+        }
+        if (!e || !e[0] || e[0] == '0' || eq(e, "off")) return 0;
+        if (e[0] == '1' || eq(e, "all")) return 1|2|4|8|16|32;
+        if (eq(e, "gdn"))  return 4|8|16|32;
+        if (eq(e, "attn")) return 1|2;
+        if (eq(e, "out"))  return 2|32;
+        if (eq(e, "qkvz")) return 4|8;          // unlocks Q4 GDN qkv+z fuse
+        if (eq(e, "qkv"))  return 4;
+        if (eq(e, "gate")) return 8;
+        if (eq(e, "ssmab")) return 16;
+        if (eq(e, "sout")) return 32;
+        // "safe": output projections + α/β — prior thin scopes that stay near the KL gate with Q6.
+        if (eq(e, "safe")) return 2|16|32;
+        return 0;
+    };
+    const int q80_rq = q80_requant_mode();
+    // SPARKINFER_Q80_REQUANT_LAYER_MOD=N (default 1): only requant layers with (i % N)==REM.
+    // Halving (N=2) roughly halves KL damage and speed win — used to walk the accuracy gate.
+    // SPARKINFER_Q80_REQUANT_LAYER_REM=R (default 0): residue class for LAYER_MOD.
+    // SPARKINFER_Q80_REQUANT_LAYER_OFF=K (default 0): skip layers with i < K (protect early layers).
+    // SPARKINFER_Q80_REQUANT_PROFILE=reward: if the explicit knobs above are unset, applies the
+    // measured KL-safe Qwen3.6 UD profile (qkvz Q4, layers >=15 only — ~+6% @512 vs main).
+    static int q80_layer_mod = -1;
+    static int q80_layer_rem = -1;
+    static int q80_layer_off = -1;
+    static int q80_profile = -1;
+    if (q80_profile < 0) {
+        const char* p = getenv("SPARKINFER_Q80_REQUANT_PROFILE");
+        q80_profile = (p && p[0] && !(p[0] == '0' && !p[1])) ? 1 : 0;
+    }
+    if (q80_layer_mod < 0) {
+        const char* e = getenv("SPARKINFER_Q80_REQUANT_LAYER_MOD");
+        q80_layer_mod = e ? atoi(e) : 1;
+        if (q80_layer_mod < 1) q80_layer_mod = 1;
+    }
+    if (q80_layer_rem < 0) {
+        const char* e = getenv("SPARKINFER_Q80_REQUANT_LAYER_REM");
+        q80_layer_rem = e ? atoi(e) : 0;
+        if (q80_layer_rem < 0) q80_layer_rem = 0;
+    }
+    if (q80_layer_off < 0) {
+        const char* e = getenv("SPARKINFER_Q80_REQUANT_LAYER_OFF");
+        if (e) q80_layer_off = atoi(e);
+        else if (q80_profile) q80_layer_off = 15;
+        else q80_layer_off = 0;
+        if (q80_layer_off < 0) q80_layer_off = 0;
+    }
+    auto q80_name_allowed = [&](const std::string& name) -> bool {
+        if (!q80_rq) return false;
+        // Optional layer filters: parse blk.<i>. from the tensor name.
+        if (q80_layer_mod > 1 || q80_layer_off > 0) {
+            auto pos = name.find("blk.");
+            if (pos == std::string::npos) return false;
+            int layer_i = atoi(name.c_str() + pos + 4);
+            if (layer_i < q80_layer_off) return false;
+            if (q80_layer_mod > 1 && (layer_i % q80_layer_mod) != (q80_layer_rem % q80_layer_mod))
+                return false;
+        }
+        const bool is_attn_q = name.find("attn_q.weight") != std::string::npos;
+        const bool is_attn_k = name.find("attn_k.weight") != std::string::npos;
+        const bool is_attn_v = name.find("attn_v.weight") != std::string::npos;
+        const bool is_attn_o = name.find("attn_output.weight") != std::string::npos;
+        const bool is_qkv    = name.find("attn_qkv.weight") != std::string::npos;
+        const bool is_gate   = name.find("attn_gate.weight") != std::string::npos;
+        const bool is_alpha  = name.find("ssm_alpha.weight") != std::string::npos;
+        const bool is_beta   = name.find("ssm_beta.weight") != std::string::npos;
+        const bool is_sout   = name.find("ssm_out.weight") != std::string::npos;
+        if ((is_attn_q || is_attn_k || is_attn_v) && (q80_rq & 1)) return true;
+        if (is_attn_o && (q80_rq & 2)) return true;
+        if (is_qkv && (q80_rq & 4)) return true;
+        if (is_gate && (q80_rq & 8)) return true;
+        if ((is_alpha || is_beta) && (q80_rq & 16)) return true;
+        if (is_sout && (q80_rq & 32)) return true;
+        return false;
+    };
+    auto dev_quant_q80_q4k = [&](const std::string& name, int& qtype) -> const void* {
+        const void* q80 = dev_quant(name, qtype);
+        if (!q80_rq || qtype != 8 || !q80 || !q80_name_allowed(name)) return q80;
+        const GGUFTensor* t = g.tensor(name);
+        const long nv = t->n_values;
+        if (nv % 256 != 0) return q80;
+        void* q4 = nullptr;
+        if (cudaMalloc(&q4, (size_t)(nv / 256) * 144) != cudaSuccess) return q80;
+        kernels::launch_q80_requant_q4k(q80, q4, nv, s.stream);
+        cudaStreamSynchronize(s.stream);
+        if (!s.owned.empty() && s.owned.back() == q80) { s.owned.pop_back(); cudaFree((void*)q80); }
+        s.owned.push_back(q4);
+        qtype = 12;
+        return q4;
+    };
     // dense weight -> bf16 (optionally transpose [out,in] -> [in,out])
     auto dense = [&](const std::string& name, bool transpose) -> const void* {
         const GGUFTensor* t = g.tensor(name);
@@ -1148,13 +1273,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                            return !(a && a[0] == '0'); }();
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) return dev_quant(name, type);
+        if (qattn && t && t->ggml_type == 8) return dev_quant_q80_q4k(name, type);
+        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
         type = 0; return dense(name, false);
     };
     auto attn_w_opt = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { type = 0; return nullptr; }
-        if (qattn && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) return dev_quant(name, type);
+        if (qattn && t->ggml_type == 8) return dev_quant_q80_q4k(name, type);
+        if (qattn && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
         type = 0; return dense(name, false);
     };
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {
