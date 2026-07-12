@@ -3908,42 +3908,42 @@ window.SPARKINFER = {
   "qwen36": {
     "model": "Qwen3.6-35B-A3B · UD-Q4_K_M",
     "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
-    "frontier_tps": 426.0,
+    "frontier_tps": 427.54,
     "baseline_tps": 23.03,
     "ref_name": "llama.cpp",
     "ref_tps": 275.81,
-    "token_match": 0.9823,
-    "kl": 0.0117,
+    "token_match": 0.9471,
+    "kl": 0.0208,
     "note": "post-#300 hd256 MMA correctness rebench 2026-07-10 (RTX 5090, 3-rep median); 16k/32k corrected down from inflated broken-MMA frontier",
     "ctx": [
       {
         "label": "128",
-        "color": "#7B5DFF",
-        "tps": 423.77,
+        "color": "#D14D72",
+        "tps": 427.54,
         "ref_tps": 275.81
       },
       {
         "label": "512",
-        "color": "#0E8A16",
-        "tps": 420.23,
+        "color": "#7B5DFF",
+        "tps": 432.23,
         "ref_tps": 275.61
       },
       {
         "label": "4k",
-        "color": "#B8860B",
-        "tps": 403.22,
+        "color": "#0E8A16",
+        "tps": 414.9,
         "ref_tps": 276.3
       },
       {
         "label": "16k",
         "color": "#B8860B",
-        "tps": 398.58,
+        "tps": 409.12,
         "ref_tps": 280.66
       },
       {
         "label": "32k",
         "color": "#6F42C1",
-        "tps": 382.25,
+        "tps": 391.48,
         "ref_tps": 279.83
       }
     ]
@@ -4025,6 +4025,13 @@ window.SPARKINFER = {
       "pr": 294,
       "date": "2026-07-12",
       "label": "S"
+    },
+    {
+      "name": "Q8_0→Q4_K requant of full-at",
+      "tps": 427.54,
+      "pr": 353,
+      "date": "2026-07-12",
+      "label": "XL"
     }
   ]
 };
