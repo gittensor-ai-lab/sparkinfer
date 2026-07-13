@@ -38,9 +38,9 @@ scores **128 / 4k / 32k / 64k / 128k** with no-regression guards. Qwen3.6 keeps 
 
 ### Performance — landed since v0.4.0
 
-- **#267** (`eval:XL`) — Q8_0→Q4_K requant of GDN input projections (attn_qkv + attn_gate) — **+11.5% @128**
+- **#267** (`eval:XL`) — Q8_0→Q4_K requant of GDN input projections (attn_qkv + attn_gate) — **+11.5% at 128**
 - **#353** (`eval:XL`) — Q8_0→Q4_K requant of full-attention q/o projections
-- **#294** (`eval:S`) — decode fuses + FAGQA4 restore (+3.5% @32k)
+- **#294** (`eval:S`) — decode fuses + FAGQA4 restore (+3.5% at 32k)
 - **#338** (`eval:S`) — hd256/GQA-8 occupancy-corrected KV-split count (+2.8–5.1% @8k–32k)
 - **#366** (`eval:L`) — Qwythos GQA-4 int8 MMA flash-decode + tiered KV splits (+4% @64k)
 - **#329** (`eval:M`) — Q4_K requant for Qwythos Q6 decode reads
@@ -58,9 +58,9 @@ scores **128 / 4k / 32k / 64k / 128k** with no-regression guards. Qwen3.6 keeps 
 
 | headline | v0.4.0 | v0.4.1 | shift |
 |---|---:|---:|---|
-| Qwen3.6 @128 | 424.9 tok/s (+54%) | **473.3 tok/s (+71%)** | **+48 tok/s** |
-| Qwen3.5 @128 | 279.8 tok/s (+24%) | **301.1 tok/s (+36%)** | **+21 tok/s** |
-| Qwen3-MoE @128 | 480.7 tok/s (+31%) | **493.6 tok/s (+35%)** | **+13 tok/s** |
+| Qwen3.6 at 128 | 424.9 tok/s (+54%) | **473.3 tok/s (+71%)** | **+48 tok/s** |
+| Qwen3.5 at 128 | 279.8 tok/s (+24%) | **301.1 tok/s (+36%)** | **+21 tok/s** |
+| Qwen3-MoE at 128 | 480.7 tok/s (+31%) | **493.6 tok/s (+35%)** | **+13 tok/s** |
 
 **Verified:** RTX 5090 · Qwen3.6 **473 tok/s** (128-tok, SOTA) · Qwen3.5 **301 tok/s** · Qwen3-MoE **494 tok/s** ·
 long-context guards through **128k** (Qwythos) / **32k** (Qwen3.6).
