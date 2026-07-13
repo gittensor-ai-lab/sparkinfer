@@ -1,5 +1,5 @@
 // Sink + sliding-window sparse-KV for Qwythos GQA-4 hd256 full-attention decode.
-// [Paral1995] 2026-07-13. Env-gated SPARKINFER_SPARSE_KV (default OFF); int8-KV only.
+// [Paral1995] 2026-07-13. SPARKINFER_SPARSE_KV=0 disables; default ON for Qwythos GQA-4 hd256 int8-KV.
 //
 // Per full-attn layer after int8 KV append:
 //   (1) fa_kv_window_select — sink block 0 + last W logical blocks (StreamingLLM-style)

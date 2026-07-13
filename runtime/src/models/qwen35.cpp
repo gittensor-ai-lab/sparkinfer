@@ -145,7 +145,7 @@ struct Qwen35Model::Impl {
     bool adaptive_splits = true;              // scale n_splits with seq_len (decode graph re-captured on change)
     int split_chunk = 256;                    // target serial KV per split (SPARKINFER_SPLIT_CHUNK)
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
-    // Sink + sliding-window sparse-KV (SPARKINFER_SPARSE_KV). Per-kv_head block list scratch.
+    // Sink + sliding-window sparse-KV. Default on; SPARKINFER_SPARSE_KV=0 disables. Per-kv_head block list.
     int*   sparse_sel = nullptr;
     int    sparse_budget = 0;      // max sel slots = 1 + window
     int    sparse_window = 256;    // recent window in KV blocks (16 tokens/block)
@@ -259,21 +259,23 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->fa_m   = p_->alloc<float>(fa_n);
     p_->fa_l   = p_->alloc<float>(fa_n);
     p_->fa_acc = p_->alloc<float>(fa_n * cfg.head_dim);
-    if (const char* se = getenv("SPARKINFER_SPARSE_KV")) {
-        if (se[0] && se[0] != '0' && cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4) {
-            p_->sparse_window = 256;
-            if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
-            // Legacy aliases from the Quest prototype (blocks, not tokens).
-            if (const char* rw = getenv("SPARKINFER_SPARSE_RECENT")) { int v = atoi(rw); if (v > 0) p_->sparse_window = v; }
-            if (const char* b = getenv("SPARKINFER_SPARSE_BUDGET")) {
-                int v = atoi(b); if (v > 1) p_->sparse_window = v - 1;   // budget included sink
-            }
-            if (const char* mc = getenv("SPARKINFER_SPARSE_MIN_CTX")) { int v = atoi(mc); if (v > 0) p_->sparse_min_ctx = v; }
-            p_->sparse_budget = 1 + p_->sparse_window;
-            p_->sparse_sel = p_->alloc<int>((size_t)cfg.n_kv_heads * p_->sparse_budget);
-            fprintf(stderr, "[sparse-kv] sliding-window: window=%d blocks (%d tokens) min_ctx=%d\n",
-                    p_->sparse_window, p_->sparse_window * kv->block_size(), p_->sparse_min_ctx);
+    // Sink + sliding-window sparse KV: default ON for Qwythos GQA-4 hd256 (int8 KV).
+    // SPARKINFER_SPARSE_KV=0 restores dense full-context flash-decode.
+    bool sparse_enable = true;
+    if (const char* se = getenv("SPARKINFER_SPARSE_KV")) sparse_enable = (se[0] != '0');
+    if (sparse_enable && cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4) {
+        p_->sparse_window = 256;
+        if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
+        // Legacy aliases from the Quest prototype (blocks, not tokens).
+        if (const char* rw = getenv("SPARKINFER_SPARSE_RECENT")) { int v = atoi(rw); if (v > 0) p_->sparse_window = v; }
+        if (const char* b = getenv("SPARKINFER_SPARSE_BUDGET")) {
+            int v = atoi(b); if (v > 1) p_->sparse_window = v - 1;   // budget included sink
         }
+        if (const char* mc = getenv("SPARKINFER_SPARSE_MIN_CTX")) { int v = atoi(mc); if (v > 0) p_->sparse_min_ctx = v; }
+        p_->sparse_budget = 1 + p_->sparse_window;
+        p_->sparse_sel = p_->alloc<int>((size_t)cfg.n_kv_heads * p_->sparse_budget);
+        fprintf(stderr, "[sparse-kv] sliding-window (default on): window=%d blocks (%d tokens) min_ctx=%d\n",
+                p_->sparse_window, p_->sparse_window * kv->block_size(), p_->sparse_min_ctx);
     }
     const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
     p_->aq8   = p_->alloc<signed char>(kmax);
