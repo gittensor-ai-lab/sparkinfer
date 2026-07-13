@@ -86,4 +86,12 @@ void launch_shared_expert_q8_mmvq(
     int hidden, int ffn, cudaStream_t stream = nullptr,
     bool accum = false);
 
+// Same as launch_shared_expert_q8_mmvq but for gate/up/down requantized Q8_0->Q4_K at load.
+void launch_shared_expert_q4k_mmvq(
+    const void* input, const void* input_q8,
+    const void* gate_q, const void* up_q, const void* down_q,
+    const float* dw, void* output, float* h_scratch, void* h_q8_buf,
+    int hidden, int ffn, cudaStream_t stream = nullptr,
+    bool accum = false);
+
 }} // namespace sparkinfer::kernels
