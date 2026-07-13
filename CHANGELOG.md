@@ -26,9 +26,9 @@ Top-1 **0.953**, KL **0.031** vs llama.cpp on held-out prompts.
 
 ### 📏 Long context — measured through 128k
 
-KV cache cap raised to **163,840 tokens** (`kMaxBlocksPerSeq=10240`) so Qwen3.5 bidirectional eval now
-scores **128 / 4k / 32k / 64k / 128k** with no-regression guards. Qwen3.6 keeps the **5-context** ladder
-(128 → 32k); Qwen3-MoE long-context baselines unchanged.
+KV cache cap raised to **128k context** (`kMaxBlocksPerSeq=10240`; 131,072 prompt tokens plus decode
+headroom) so Qwen3.5 bidirectional eval now scores **128 / 4k / 32k / 64k / 128k** with no-regression
+guards. Qwen3.6 keeps the **5-context** ladder (128 → 32k); Qwen3-MoE long-context baselines unchanged.
 
 | model | longest tracked ctx | sparkinfer @ longest | llama.cpp | notes |
 |---|---|---:|---:|---|
