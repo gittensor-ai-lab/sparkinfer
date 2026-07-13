@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lightweight dashboard merge-sync (NO GPU). Records merged `merge-first` PRs onto the dashboard
+# Lightweight dashboard merge-sync (NO GPU). Records recently merged PRs onto the dashboard
 # (frontier + optimization journey) and reconciles the round labels, so a MANUAL merge shows up
 # within minutes — even while the heavy 2-hour eval cron is paused for manual work. It never
 # evaluates and never auto-merges (it just reflects what's already merged).

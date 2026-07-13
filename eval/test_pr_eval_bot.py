@@ -150,24 +150,24 @@ class PrEvalBotPolicyTest(unittest.TestCase):
                 "frontier_tps": 281.63,
                 "ctx": [
                     {"label": "128", "tps": 281.63, "ref_tps": 224.91},
-                    {"label": "512", "tps": 277.69, "ref_tps": 225.1},
                     {"label": "4k", "tps": 264.06, "ref_tps": 224.68},
+                    {"label": "32k", "tps": 200.0, "ref_tps": 0},
                 ],
             }
         }
         sub = {
             "ctx_128_tps": 284.47,
-            "ctx_512_tps": 281.34,
             "ctx_4096_tps": 267.66,
+            "ctx_32768_tps": 205.5,
             "guard_128_baseline": 257.47,
-            "guard_512_baseline": 254.27,
             "guard_4k_baseline": 242.49,
+            "guard_32k_baseline": 198.0,
         }
         bot._upsert_qwen35_ctx(data, sub)
         by = {r["label"]: r["tps"] for r in data["qwen35"]["ctx"]}
         self.assertEqual(by["128"], 284.47)
-        self.assertEqual(by["512"], 281.34)
         self.assertEqual(by["4k"], 267.66)
+        self.assertEqual(by["32k"], 205.5)
         # Second merge with same measured must not compound ratios.
         bot._upsert_qwen35_ctx(data, sub)
         by2 = {r["label"]: r["tps"] for r in data["qwen35"]["ctx"]}
@@ -230,6 +230,74 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         receipt = bot.build_polaris_receipt_from_attestation(att, api_key="", privkey=priv)
         self.assertIsNotNone(receipt.get("signature"))
         self.assertNotIn("tdx", receipt)
+
+    def test_merge_recorded_bidir_qwen36(self):
+        data = {
+            "prs": [{"num": 353, "mode": "bidir", "pass_qwen36": True, "label_qwen36": "XL"}],
+            "landed_qwen36": [{"pr": 353, "tps": 427.54}],
+            "landed_qwen35": [],
+        }
+        e = data["prs"][0]
+        self.assertTrue(bot._merge_recorded(data, 353, e))
+        self.assertFalse(bot._merge_recorded(data, 999, {"label": "XL"}))
+
+    def test_sync_merged_dashboard_records_manual_merge(self):
+        data = {
+            "updated": "2026-07-12",
+            "status": {"frontier_tps": 400.0},
+            "qwen36": {"frontier_tps": 400.0, "baseline_tps": 23.0, "ctx": []},
+            "prs": [{
+                "num": 353,
+                "title": "perf(qwen36): test",
+                "mode": "bidir",
+                "pass_qwen36": True,
+                "label_qwen36": "XL",
+                "label": "XL",
+                "tps": 427.54,
+                "score_qwen36": {
+                    "tps": 427.54,
+                    "top1": 0.97,
+                    "kl": 0.02,
+                    "ctx_128_tps": 427.54,
+                    "ctx_512_tps": 420.0,
+                    "ctx_4096_tps": 410.0,
+                    "ctx_16384_tps": 390.0,
+                    "ctx_32768_tps": 380.0,
+                },
+            }],
+            "landed_qwen36": [],
+            "landed_qwen35": [],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            dash = os.path.join(td, "dashboard")
+            os.mkdir(dash)
+            path = os.path.join(dash, "data.json")
+            with open(path, "w") as f:
+                json.dump(data, f)
+            gh_out = json.dumps([{"number": 353}])
+            pushes = []
+            with mock.patch.object(bot, "DASH", dash), \
+                 mock.patch.object(bot, "DATA_JSON", path), \
+                 mock.patch.object(bot, "gh", return_value=mock.Mock(stdout=gh_out)), \
+                 mock.patch.object(bot, "push_dash", side_effect=lambda m: pushes.append(m)):
+                bot.sync_merged_dashboard("gittensor-ai-lab/sparkinfer")
+            with open(path) as f:
+                out = json.load(f)
+        self.assertEqual(out["qwen36"]["frontier_tps"], 427.54)
+        self.assertEqual(out["landed_qwen36"][0]["pr"], 353)
+        self.assertTrue(any("merged" in m for m in pushes))
+
+    def test_sync_merged_dashboard_skips_already_recorded(self):
+        data = {
+            "prs": [{"num": 353, "mode": "bidir", "pass_qwen36": True, "label_qwen36": "XL",
+                     "score_qwen36": {"tps": 427.54}}],
+            "landed_qwen36": [{"pr": 353, "tps": 427.54}],
+        }
+        with mock.patch.object(bot, "load_dash", return_value=data), \
+             mock.patch.object(bot, "gh", return_value=mock.Mock(stdout=json.dumps([{"number": 353}]))), \
+             mock.patch.object(bot, "record_merge") as rm:
+            bot.sync_merged_dashboard("gittensor-ai-lab/sparkinfer")
+        rm.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -74,7 +74,7 @@ Set `SPARKINFER_EVAL_MODE=short` or pass `--eval-mode short` to keep the legacy 
 `--bidir` (or `BIDIR=1` / legacy `TRIPLE=1` in `.env.eval`) scores **both directions** in one build:
 
 ```
-build once ─► score_qwen35  Qwythos-9B : 128/512/4k speed + accuracy ─► eval-qwen35:<LABEL>
+build once ─► score_qwen35  Qwythos-9B : 128/4k/32k/64k/128k speed + accuracy ─► eval-qwen35:<LABEL>
            │              guard Qwen3.6  : 5 contexts ─► must NOT regress
            └► score_qwen36  Qwen3.6      : 128/512/4k/16k/32k ─► eval-qwen36:<LABEL>
                           guard Qwen3.5  : 128/512/4k ─► must NOT regress
@@ -156,10 +156,11 @@ crontab -l 2>/dev/null; echo "0 */2 * * * $PWD/eval/run_bot_cron.sh >> /tmp/spar
 Each run: reuse the pinned instance if it survived, else provision fresh (Google Drive model) →
 evaluate new PR commits → **stop it again** → label + comment. Disable with `crontab -e`. Needs `gh` authenticated and the vast key saved (`vastai set api-key`).
 
-**Dashboard merge-sync (no GPU).** The heavy eval cron records a merge only on its next tick, so a
-*manual* merge leaves the dashboard stale while it's paused. Run `run_sync_cron.sh` every 15 min
-alongside it — it just records merged `merge-first` PRs onto the frontier/journey and reconciles
-labels (never evaluates, never merges), sharing the eval lock so the two never overlap:
+**Dashboard merge-sync (no GPU).** The heavy eval cron may not run for hours, and `record_merge()`
+only used to fire for merged PRs that still had `merge-first`. Run `run_sync_cron.sh` every 15 min
+alongside it — it syncs **any recently merged PR** that has dashboard eval data onto the
+frontier/journey and reconciles round labels (never evaluates, never merges), sharing the eval lock
+so the two never overlap:
 ```bash
 crontab -l 2>/dev/null; echo "*/15 * * * * $PWD/eval/run_sync_cron.sh >> /tmp/sparkinfer_sync.log 2>&1" | crontab -
 ```

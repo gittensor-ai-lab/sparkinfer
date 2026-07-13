@@ -76,8 +76,10 @@ def _bidir_baseline_args(q36, q35):
     """Guard baseline CLI args for vast_eval.py bidir runs."""
     return [
         "--p35-guard-128-baseline", str(q35["128"]),
-        "--p35-guard-512-baseline", str(q35["512"]),
         "--p35-guard-4k-baseline",  str(q35["4k"]),
+        "--p35-guard-32k-baseline", str(q35["32k"]),
+        "--p35-guard-64k-baseline", str(q35["64k"]),
+        "--p35-guard-128k-baseline", str(q35["128k"]),
         "--p-guard-128-baseline", str(q36["128"]),
         "--p-guard-512-baseline", str(q36["512"]),
         "--p-guard-4k-baseline",  str(q36["4k"]),
@@ -89,8 +91,10 @@ def _bidir_baseline_args(q36, q35):
         "--g36-guard-16k-baseline", str(q36["16k"]),
         "--g36-guard-32k-baseline", str(q36["32k"]),
         "--g35-guard-128-baseline", str(q35["128"]),
-        "--g35-guard-512-baseline", str(q35["512"]),
         "--g35-guard-4k-baseline",  str(q35["4k"]),
+        "--g35-guard-32k-baseline", str(q35["32k"]),
+        "--g35-guard-64k-baseline", str(q35["64k"]),
+        "--g35-guard-128k-baseline", str(q35["128k"]),
         "--p-llama-128-baseline", str(q36["llama128"]),
         "--p-llama-512-baseline", str(q36["llama512"]),
         "--p-llama-4k-baseline",  str(q36["llama4k"]),
@@ -102,6 +106,7 @@ def _apply_bidir_ctx_from_bres(bres, q36, q35):
     ctx_map = {
         "128": "ctx_128_tps", "512": "ctx_512_tps", "4k": "ctx_4096_tps",
         "16k": "ctx_16384_tps", "32k": "ctx_32768_tps",
+        "64k": "ctx_65536_tps", "128k": "ctx_131072_tps",
     }
 
     def _fill(score, store, keys):
@@ -115,7 +120,7 @@ def _apply_bidir_ctx_from_bres(bres, q36, q35):
         return True
 
     got36 = _fill(bres.get("score_qwen36"), q36, ("128", "512", "4k", "16k", "32k"))
-    got35 = _fill(bres.get("score_qwen35"), q35, ("128", "512", "4k"))
+    got35 = _fill(bres.get("score_qwen35"), q35, ("128", "4k", "32k", "64k", "128k"))
     return got36 and got35
 
 
@@ -143,8 +148,10 @@ MERGE_FIRST_LABEL  = "merge-first"    # the round's biggest verified speedup —
 NEEDS_REBASE_LABEL = "needs-rebase"   # also a verified speedup, but not the round winner
 REEVALUATE_LABEL   = "re-evaluate"    # winner merged → rebase onto new main; bot re-evals on push
 HOLD_LABEL         = "hold"           # maintainer override: never auto-merge this PR
-CONTEXT_LABELS     = {"128-context", "512-context", "4k-context", "16k-context", "32k-context"}
-REGRESSION_LABELS  = {"regression-128", "regression-512", "regression-4k", "regression-16k", "regression-32k"}
+CONTEXT_LABELS     = {"128-context", "512-context", "4k-context", "16k-context", "32k-context",
+                      "64k-context", "128k-context"}
+REGRESSION_LABELS  = {"regression-128", "regression-512", "regression-4k", "regression-16k",
+                      "regression-32k", "regression-64k", "regression-128k"}
 
 # Per-context guard baseline fallbacks for display when the RESULT_JSON baseline is 0.
 # Mirrors evaluate_dual.sh hardcoded defaults (used when both eval-box measurement and
@@ -452,7 +459,9 @@ def render(res, oid):
                     ("ctx_512_tps", "guard_512_pass", "guard_512_baseline", "512-context"),
                     ("ctx_4096_tps", "guard_4k_pass", "guard_4k_baseline", "4k-context"),
                     ("ctx_16384_tps", "guard_16k_pass", "guard_16k_baseline", "16k-context"),
-                    ("ctx_32768_tps", "guard_32k_pass", "guard_32k_baseline", "32k-context")]:
+                    ("ctx_32768_tps", "guard_32k_pass", "guard_32k_baseline", "32k-context"),
+                    ("ctx_65536_tps", "guard_64k_pass", "guard_64k_baseline", "64k-context"),
+                    ("ctx_131072_tps", "guard_128k_pass", "guard_128k_baseline", "128k-context")]:
                 tps = block.get(key)
                 if not tps:
                     continue
@@ -470,7 +479,9 @@ def render(res, oid):
                                      ("ctx_512_tps", "guard_512_pass", "guard_512_baseline", "512-context"),
                                      ("ctx_4096_tps", "guard_4k_pass", "guard_4k_baseline", "4k-context"),
                                      ("ctx_16384_tps", "guard_16k_pass", "guard_16k_baseline", "16k-context"),
-                                     ("ctx_32768_tps", "guard_32k_pass", "guard_32k_baseline", "32k-context")]:
+                                     ("ctx_32768_tps", "guard_32k_pass", "guard_32k_baseline", "32k-context"),
+                                     ("ctx_65536_tps", "guard_64k_pass", "guard_64k_baseline", "64k-context"),
+                                     ("ctx_131072_tps", "guard_128k_pass", "guard_128k_baseline", "128k-context")]:
             tps = res.get(key)
             if not tps:
                 continue
@@ -501,7 +512,9 @@ def render(res, oid):
                                        ("ctx_512_tps", "guard_512_pass", "512"),
                                        ("ctx_4096_tps", "guard_4k_pass", "4k"),
                                        ("ctx_16384_tps", "guard_16k_pass", "16k"),
-                                       ("ctx_32768_tps", "guard_32k_pass", "32k")]:
+                                       ("ctx_32768_tps", "guard_32k_pass", "32k"),
+                                       ("ctx_65536_tps", "guard_64k_pass", "64k"),
+                                       ("ctx_131072_tps", "guard_128k_pass", "128k")]:
                     tps = g.get(key)
                     if not tps:
                         continue
@@ -514,7 +527,9 @@ def render(res, oid):
                                ("ctx_512_tps", "guard_512_pass", "512-context"),
                                ("ctx_4096_tps", "guard_4k_pass", "4k-context"),
                                ("ctx_16384_tps", "guard_16k_pass", "16k-context"),
-                               ("ctx_32768_tps", "guard_32k_pass", "32k-context")]:
+                               ("ctx_32768_tps", "guard_32k_pass", "32k-context"),
+                               ("ctx_65536_tps", "guard_64k_pass", "64k-context"),
+                               ("ctx_131072_tps", "guard_128k_pass", "128k-context")]:
             tps = guard.get(key)
             if not tps:
                 continue
@@ -530,7 +545,9 @@ def render(res, oid):
                                    ("ctx_512_tps", "guard_512_pass", "512-context"),
                                    ("ctx_4096_tps", "guard_4k_pass", "4k-context"),
                                    ("ctx_16384_tps", "guard_16k_pass", "16k-context"),
-                                   ("ctx_32768_tps", "guard_32k_pass", "32k-context")]:
+                                   ("ctx_32768_tps", "guard_32k_pass", "32k-context"),
+                                   ("ctx_65536_tps", "guard_64k_pass", "64k-context"),
+                                   ("ctx_131072_tps", "guard_128k_pass", "128k-context")]:
                 tps = gblock.get(key)
                 if not tps:
                     continue
@@ -570,12 +587,17 @@ CTX_SERIES = {
     4096:  {"metric": "ctx_4096_tps",  "guard": "guard_4k_baseline",   "status": "longctx_4k_tps",   "label": "4k", "color": "#0E8A16", "llama": 292.99, "note": "llama-batched-bench npp=4096 ntg=128 npl=1"},
     16384: {"metric": "ctx_16384_tps", "guard": "guard_16k_baseline",  "status": "longctx_16k_tps",  "label": "16k", "color": "#B8860B", "llama": 245.53, "note": "llama-batched-bench npp=16384 ntg=128 npl=1"},
     32768: {"metric": "ctx_32768_tps", "guard": "guard_32k_baseline",  "status": "longctx_32k_tps",  "label": "32k", "color": "#6F42C1", "llama": 192.62, "note": "release-log llama.cpp estimate at 32k, ntg=128"},
+    65536: {"metric": "ctx_65536_tps", "guard": "guard_64k_baseline",  "status": "longctx_64k_tps",  "label": "64k", "color": "#E67E22", "llama": 0, "note": "Qwythos long-context decode at 64k, ntg=128"},
+    131072: {"metric": "ctx_131072_tps", "guard": "guard_128k_baseline", "status": "longctx_128k_tps", "label": "128k", "color": "#17A2B8", "llama": 0, "note": "Qwythos long-context decode at 128k, ntg=128"},
 }
 # Qwen3.5 (Qwythos) per-context llama.cpp anchors — colors match CTX_SERIES.
+Q35_CTX_ORDER = ("128", "4k", "32k", "64k", "128k")
 Q35_CTX_SERIES = {
-    128:  {"label": "128", "ref_tps": 224.91},
-    512:  {"label": "512", "ref_tps": 225.10},
-    4096: {"label": "4k",  "ref_tps": 224.68},
+    128:    {"label": "128",  "ref_tps": 224.91},
+    4096:   {"label": "4k",   "ref_tps": 224.68},
+    32768:  {"label": "32k",  "ref_tps": 0},
+    65536:  {"label": "64k",  "ref_tps": 0},
+    131072: {"label": "128k", "ref_tps": 0},
 }
 Q36_CTX_ORDER = ("128", "512", "4k", "16k", "32k")
 # Qwen3.6-35B-A3B llama.cpp decode refs (RTX 5090) — pinned in bench/scripts/reference.lock
@@ -759,6 +781,65 @@ def update_dashboard(repo, pr, areas, res, proof_url=None):
     write_dash(data)
     push_dash(f"dashboard: PR #{num} -> eval:{res.get('label')} ({res.get('tps')} tok/s)")
 
+def _merge_recorded(data, num, e):
+    """True if PR #num's merge is already reflected in dashboard journey/frontier."""
+    if not e:
+        return False
+    bidir = e.get("mode") == "bidir" or e.get("model") == "bidir"
+    if bidir:
+        q36 = bool(e.get("pass_qwen36") and e.get("label_qwen36") in SPEEDUP_LABELS)
+        q35 = bool(e.get("pass_qwen35") and e.get("label_qwen35") in SPEEDUP_LABELS)
+        in36 = any(m.get("pr") == num for m in data.get("landed_qwen36", []))
+        in35 = any(m.get("pr") == num for m in data.get("landed_qwen35", []))
+        if q36 and q35:
+            return in36 and in35
+        if q36:
+            return in36
+        if q35:
+            return in35
+        return False
+    if e.get("label") not in SPEEDUP_LABELS:
+        return True
+    if str(e.get("model") or "").startswith("Qwen3.6"):
+        return any(m.get("pr") == num for m in data.get("landed_qwen36", []))
+    score_ctx = int(e.get("score_context") or 0)
+    if e.get("eval_mode") == "longctx" and score_ctx in CTX_SERIES:
+        return any(m.get("pr") == num for m in data.get("landed_longctx", []))
+    return any(m.get("pr") == num for m in data.get("landed", []))
+
+def sync_merged_dashboard(repo, limit=40):
+    """Advance dashboard frontier/journey for recently MERGED PRs with eval rows.
+
+    Eval grades upsert `prs` immediately; `record_merge()` used to run only when a merged PR
+    still carried `merge-first`, so manual merges (or label cleanup before sync) left the public
+    dashboard stale. This syncs any merged PR that has dashboard eval data but is not yet on
+    the journey charts — idempotent and safe to run every cron tick."""
+    data = load_dash()
+    if data is None:
+        return
+    by_num = {p["num"]: p for p in data.get("prs", [])}
+    if not by_num:
+        return
+    try:
+        merged = json.loads(gh(["pr", "list", "-R", repo, "--state", "merged",
+                                "--json", "number", "--limit", str(limit)]).stdout or "[]")
+    except Exception as ex:
+        print(f">> sync_merged_dashboard: gh list failed: {ex}")
+        return
+    synced = 0
+    for pr in merged:
+        num = pr.get("number")
+        e = by_num.get(num)
+        if e is None or _merge_recorded(data, num, e):
+            continue
+        print(f">> sync merged PR #{num} -> dashboard frontier/journey")
+        record_merge(repo, num)
+        synced += 1
+        data = load_dash() or data
+        by_num = {p["num"]: p for p in data.get("prs", [])}
+    if synced:
+        print(f">> sync_merged_dashboard: applied {synced} merge(s)")
+
 def _scaled_context_tps(old_tps, measured_tps, guard_tps):
     if measured_tps is None:
         return None
@@ -886,7 +967,7 @@ def _upsert_qwen35_ctx(data, sub):
             }
             changed = True
     if changed:
-        q35["ctx"] = [ctx_rows[k] for k in ("128", "512", "4k") if k in ctx_rows]
+        q35["ctx"] = [ctx_rows[k] for k in Q35_CTX_ORDER if k in ctx_rows]
     return changed
 
 def _upsert_qwen36_ctx(data, sub):
@@ -998,7 +1079,7 @@ def record_merge(repo, num):
         write_dash(data)
         push_dash(f"dashboard: PR #{num} merged -> Qwen3.6 frontier {new_f} tok/s")
         return
-    if e.get("eval_mode") == "longctx" and int(e.get("score_context") or 0) in (512, 4096, 16384, 32768):
+    if e.get("eval_mode") == "longctx" and int(e.get("score_context") or 0) in (512, 4096, 16384, 32768, 65536, 131072):
         if any(m.get("pr") == num for m in data.get("landed_longctx", [])): return
         score_ctx = int(e.get("score_context") or 0)
         old_f = round((next((r.get("sparkinfer_tps") for r in data.get("context_baselines", [])
@@ -1131,10 +1212,12 @@ def try_auto_merge(repo, num):
 
 def reconcile_merge_labels(repo):
     """Per-round merge workflow. After all queued PRs are graded against the same-box main:
+      0. Sync recently merged PRs onto the dashboard (manual merges, not only merge-first).
       1. If a `merge-first` PR has since MERGED, its rivals are stale → tag them `re-evaluate` and
          ask them to rebase onto the new main (the bot re-evals automatically on the rebased commit).
       2. Among the still-open PRs with a verified speedup, label the biggest `merge-first` and the
          rest `needs-rebase`. Ranking uses the same-box % gain over main (data.json `delta_pct`)."""
+    sync_merged_dashboard(repo)
     data = load_dash() or {}
     by_num = {p["num"]: p for p in data.get("prs", [])}
     open_prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open",
@@ -1146,7 +1229,7 @@ def reconcile_merge_labels(repo):
                                   MERGE_FIRST_LABEL, "--json", "number", "--limit", "10"]).stdout or "[]")
     if merged_first:
         for m in merged_first:
-            record_merge(repo, m["number"])      # advance the journey/frontier for the merged winner
+            record_merge(repo, m["number"])      # idempotent; sync_merged_dashboard usually did this
             remove_label(repo, m["number"], MERGE_FIRST_LABEL)
         # Rivals stay `needs-rebase` (they have NOT rebased yet — that's exactly why `re-evaluate`
         # would be wrong here). Just nudge them to rebase; the eval re-runs on the rebased commit.
@@ -1240,11 +1323,15 @@ def main():
     }
     QWYTHOS_BASE = {
         "128": float(os.environ.get("SPARKINFER_QWYTHOS_128", "0")),
-        "512": float(os.environ.get("SPARKINFER_QWYTHOS_512", "0")),
         "4k":  float(os.environ.get("SPARKINFER_QWYTHOS_4K",  "0")),
+        "32k": float(os.environ.get("SPARKINFER_QWYTHOS_32K", "0")),
+        "64k": float(os.environ.get("SPARKINFER_QWYTHOS_64K", "0")),
+        "128k": float(os.environ.get("SPARKINFER_QWYTHOS_128K", "0")),
         "llama128": float(os.environ.get("QWEN35_9B_LLAMA_128", "0")),
-        "llama512": float(os.environ.get("QWEN35_9B_LLAMA_512", "0")),
         "llama4k":  float(os.environ.get("QWEN35_9B_LLAMA_4K",  "0")),
+        "llama32k": float(os.environ.get("QWEN35_9B_LLAMA_32K", "0")),
+        "llama64k": float(os.environ.get("QWEN35_9B_LLAMA_64K", "0")),
+        "llama128k": float(os.environ.get("QWEN35_9B_LLAMA_128K", "0")),
     }
 
     # --- Polaris verifiable compute ---
@@ -1548,7 +1635,9 @@ def main():
         print(f"  Qwen3.6 same-box main: 128={QWEN36_BASE['128']} 512={QWEN36_BASE['512']} "
               f"4k={QWEN36_BASE['4k']} 16k={QWEN36_BASE['16k']} 32k={QWEN36_BASE['32k']} tok/s")
         print(f"  Qwythos ({args.primary_quant}) same-box main: "
-              f"128={QWYTHOS_BASE['128']} 512={QWYTHOS_BASE['512']} 4k={QWYTHOS_BASE['4k']} tok/s")
+              f"128={QWYTHOS_BASE['128']} 4k={QWYTHOS_BASE['4k']} "
+              f"32k={QWYTHOS_BASE['32k']} 64k={QWYTHOS_BASE['64k']} "
+              f"128k={QWYTHOS_BASE['128k']} tok/s")
 
     # Run all pending evals on the SAME instance: pass --keep so vast_eval.py never stops/destroys
     # the box mid-queue. The bot stops the instance once after ALL PRs finish (or if the instance
