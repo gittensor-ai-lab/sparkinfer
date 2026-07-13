@@ -104,8 +104,11 @@ public:
     // prompt starts with the cached tokens (only the suffix is prefilled).
     double bench_ttft(const std::vector<int>& prompt);
 
-    // Run one token at `position`, return the argmax next-token id.
-    int forward_token(int token_id, int position);
+    // Run one token at `position`. When sample=false (prefill), runs embed→layers→final
+    // norm without LM head/argmax and without CUDA-graph capture — teacher-forced ingestion.
+    // When sample=true (decode / last prompt token), runs the full path and may capture/replay
+    // the decode graph. Returns argmax next-token id when sample=true, else token_id.
+    int forward_token(int token_id, int position, bool sample = true);
 
     // Copy the most recent step's logits (vocab floats) to host. Valid after a
     // forward_token() call. Used for teacher-forced scoring (perplexity / KL).
@@ -117,6 +120,10 @@ public:
     };
     // Benchmark at a target KV depth: timed prefill, untimed warmup decode, timed decode.
     BenchDecodeResult bench_decode(int warmup, int n_tokens, int context_tokens = 0);
+
+    // Time-to-first-token: ingest `prompt` with prefill (no LM head on interior tokens),
+    // then one sampled forward for the first output token. Returns seconds (lower = better).
+    double bench_ttft(const std::vector<int>& prompt);
 
     const Qwen35Config& config() const;
 

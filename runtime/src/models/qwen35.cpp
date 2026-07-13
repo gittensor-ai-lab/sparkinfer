@@ -116,6 +116,10 @@ struct Qwen35Model::Impl {
     cudaGraph_t cu_graph{};
     cudaGraphExec_t cu_exec{};
     bool graph_ready = false;
+    cudaGraph_t cu_prefill_graph{};
+    cudaGraphExec_t cu_prefill_exec{};
+    bool graph_prefill_ready = false;
+    int graph_prefill_attn_mode = -1;
     bool bench_feedback_graph = false;
     int graph_attn_mode = -1;  // host-side flash-decode dispatch class captured in cu_graph
 
@@ -326,6 +330,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->sparse_sel);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
+    if (p_->graph_prefill_ready) { cudaGraphExecDestroy(p_->cu_prefill_exec); cudaGraphDestroy(p_->cu_prefill_graph); }
     cudaEventDestroy(p_->ev_qkv); cudaEventDestroy(p_->ev_k); cudaEventDestroy(p_->ev_v);
     cudaEventDestroy(p_->ev_pipe_fork); cudaEventDestroy(p_->ev_gdn_z); cudaEventDestroy(p_->ev_gdn_ab);
     cudaEventDestroy(p_->ev_sx_gate); cudaEventDestroy(p_->ev_sx_done);
@@ -343,7 +348,7 @@ void Qwen35Model::copy_logits(float* host_logits) const {
     cudaMemcpy(host_logits, p_->logits, (size_t)p_->cfg.vocab * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
-int Qwen35Model::forward_token(int token_id, int position) {
+int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
@@ -395,6 +400,11 @@ int Qwen35Model::forward_token(int token_id, int position) {
             if (s.graph_ready) {
                 cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false;
             }
+            if (s.graph_prefill_ready) {
+                cudaGraphExecDestroy(s.cu_prefill_exec); cudaGraphDestroy(s.cu_prefill_graph);
+                s.cu_prefill_exec = nullptr; s.cu_prefill_graph = nullptr;
+                s.graph_prefill_ready = false; s.graph_prefill_attn_mode = -1;
+            }
         }
     }
     // launch_flash_decode_split chooses its scalar-vs-MMA implementation on the host
@@ -436,6 +446,14 @@ int Qwen35Model::forward_token(int token_id, int position) {
         cu(cudaGraphDestroy(s.cu_graph), "sparse recapture destroy graph");
         s.cu_exec = nullptr; s.cu_graph = nullptr; s.graph_ready = false;
     }
+    if (s.graph_prefill_ready && attn_graph_mode != s.graph_prefill_attn_mode) {
+        cu(cudaGraphExecDestroy(s.cu_prefill_exec), "prefill graph recapture destroy exec");
+        cu(cudaGraphDestroy(s.cu_prefill_graph), "prefill graph recapture destroy graph");
+        s.cu_prefill_exec = nullptr;
+        s.cu_prefill_graph = nullptr;
+        s.graph_prefill_ready = false;
+        s.graph_prefill_attn_mode = -1;
+    }
     if (c.hybrid && position == 0) {
         cu(cudaMemsetAsync(s.lin_state, 0,
                            (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim * sizeof(float), st),
@@ -445,16 +463,27 @@ int Qwen35Model::forward_token(int token_id, int position) {
            "linear conv reset");
     }
 
-    // Capture the decode compute into a CUDA graph on the first token, then
-    // replay it every token (per-token inputs live in the d_tok/pos/seqlen/
-    // writepos device buffers uploaded above, so replay produces fresh results).
-    if (s.graph_ready) {
+    // Prefill graph: embed→layers→final norm (no LM head). Decode graph: full path + argmax.
+    if (!sample && s.graph_prefill_ready) {
+        cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch");
+        cu(cudaStreamSynchronize(st), "prefill graph sync");
+        return token_id;
+    }
+    if (sample && s.graph_ready) {
         cu(cudaGraphLaunch(s.cu_exec, st), "graph launch");
         cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
         cu(cudaStreamSynchronize(st), "sync");
         return *s.h_out_id;
     }
-    cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture");
+    if (sample && s.graph_prefill_ready) {
+        cu(cudaGraphExecDestroy(s.cu_prefill_exec), "drop prefill graph for decode");
+        cu(cudaGraphDestroy(s.cu_prefill_graph), "drop prefill graph for decode");
+        s.cu_prefill_exec = nullptr;
+        s.cu_prefill_graph = nullptr;
+        s.graph_prefill_ready = false;
+        s.graph_prefill_attn_mode = -1;
+    }
+    cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
 
     kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
 
@@ -1000,6 +1029,15 @@ int Qwen35Model::forward_token(int token_id, int position) {
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
     }
     // xn now holds RMSNorm(x_final, final_norm)
+    if (!sample) {
+        cu(cudaStreamEndCapture(st, &s.cu_prefill_graph), "end prefill capture");
+        cu(cudaGraphInstantiate(&s.cu_prefill_exec, s.cu_prefill_graph, 0), "prefill graph instantiate");
+        s.graph_prefill_ready = true;
+        s.graph_prefill_attn_mode = attn_graph_mode;
+        cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch (first)");
+        cu(cudaStreamSynchronize(st), "prefill sync");
+        return token_id;
+    }
     if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
         if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
         kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
@@ -1036,6 +1074,17 @@ int Qwen35Model::forward_token(int token_id, int position) {
     return *s.h_out_id;
 }
 
+namespace {
+bool prefill_samples_lmhead() {
+    static int legacy = -1;
+    if (legacy < 0) {
+        const char* e = getenv("SPARKINFER_PREFILL_LEGACY");
+        legacy = (e && e[0] == '1') ? 1 : 0;
+    }
+    return legacy != 0;
+}
+} // namespace
+
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
     BenchDecodeResult out{};
     Impl& s = *p_;
@@ -1069,12 +1118,18 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     int pos = 0, tok = 100;
     if (start_pos > 0) {
         auto p0 = std::chrono::high_resolution_clock::now();
-        for (; pos < start_pos; pos++) { tok = forward_token(tok, pos); if (tok < 0 || tok >= s.cfg.vocab) tok = 100; }
+        for (; pos < start_pos; pos++) {
+            tok = forward_token(tok, pos, prefill_samples_lmhead());
+            if (tok < 0 || tok >= s.cfg.vocab) tok = 100;
+        }
         cudaDeviceSynchronize();
         auto p1 = std::chrono::high_resolution_clock::now();
         out.prefill_pp = start_pos / std::chrono::duration<double>(p1 - p0).count();
     }
-    for (int i = 0; i < warmup; i++) { tok = forward_token(tok, pos++); if (tok < 0 || tok >= s.cfg.vocab) tok = 100; }
+    for (int i = 0; i < warmup; i++) {
+        tok = forward_token(tok, pos++, true);
+        if (tok < 0 || tok >= s.cfg.vocab) tok = 100;
+    }
     if (s.graph_ready) cu(cudaGraphUpload(s.cu_exec, s.stream), "bench graph upload");
     cudaDeviceSynchronize();
 
@@ -1099,7 +1154,10 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     }
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < n; i++) { tok = forward_token(tok, pos++); if (tok < 0 || tok >= s.cfg.vocab) tok = 100; }
+    for (int i = 0; i < n; i++) {
+        tok = forward_token(tok, pos++, true);
+        if (tok < 0 || tok >= s.cfg.vocab) tok = 100;
+    }
     cudaDeviceSynchronize();
     auto t1 = std::chrono::high_resolution_clock::now();
     s.kv->free(s.seq_id);
@@ -1139,8 +1197,15 @@ bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
     invalidate_decode_graph();
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) return false;
     int next = -1;
-    for (size_t i = 0; i < tokens.size(); i++)
-        next = forward_token(tokens[i], (int)i);
+    if (prefill_samples_lmhead()) {
+        for (size_t i = 0; i < tokens.size(); i++)
+            next = forward_token(tokens[i], (int)i, true);
+    } else {
+        for (size_t i = 0; i + 1 < tokens.size(); i++)
+            forward_token(tokens[i], (int)i, false);
+        if (!tokens.empty())
+            next = forward_token(tokens.back(), (int)tokens.size() - 1, true);
+    }
     cudaDeviceSynchronize();
     s.prefix_tokens = tokens;
     s.prefix_len = (int)tokens.size();
@@ -1178,15 +1243,43 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
     if (getenv("SPARKINFER_DEBUG_PREFIX"))
         fprintf(stderr, "[prefix] ttft n=%zu start=%d reuse=%d cached=%d\n",
                 prompt.size(), start, (int)reuse, s.prefix_len);
+    s.bench_feedback_graph = false;
+    cudaDeviceSynchronize();
     auto t0 = std::chrono::high_resolution_clock::now();
-    for (size_t i = (size_t)start; i < prompt.size(); i++) {
-        (void)forward_token(prompt[i], (int)i);
-        cudaDeviceSynchronize();
+    if (prefill_samples_lmhead()) {
+        for (size_t i = (size_t)start; i < prompt.size(); i++) {
+            (void)forward_token(prompt[i], (int)i, true);
+            cudaDeviceSynchronize();
+        }
+    } else {
+        for (size_t i = (size_t)start; i + 1 < prompt.size(); i++) {
+            forward_token(prompt[i], (int)i, false);
+            cudaDeviceSynchronize();
+        }
+        if (prompt.size() > (size_t)start) {
+            (void)forward_token(prompt.back(), (int)prompt.size() - 1, true);
+            cudaDeviceSynchronize();
+        }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     if (!reuse) {
         s.kv->free(s.seq_id);
         invalidate_decode_graph();
+        if (s.graph_ready) {
+            cu(cudaGraphExecDestroy(s.cu_exec), "ttft graph destroy exec");
+            cu(cudaGraphDestroy(s.cu_graph), "ttft graph destroy");
+            s.cu_exec = nullptr;
+            s.cu_graph = nullptr;
+            s.graph_ready = false;
+        }
+        if (s.graph_prefill_ready) {
+            cu(cudaGraphExecDestroy(s.cu_prefill_exec), "ttft prefill graph destroy exec");
+            cu(cudaGraphDestroy(s.cu_prefill_graph), "ttft prefill graph destroy");
+            s.cu_prefill_exec = nullptr;
+            s.cu_prefill_graph = nullptr;
+            s.graph_prefill_ready = false;
+            s.graph_prefill_attn_mode = -1;
+        }
     }
     return std::chrono::duration<double>(t1 - t0).count();
 }
@@ -1208,16 +1301,22 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         fprintf(stderr, "[qwen35] KV allocate failed (pool too small for max_seq=%d)\n", s.cfg.max_seq);
         return out;
     }
-
     int next = reuse ? s.prefix_next : -1;
     const int start = reuse ? s.prefix_len : 0;
-    for (size_t i = (size_t)start; i < prompt.size(); i++)
-        next = forward_token(prompt[i], (int)i);
-
+    const size_t n = prompt.size();
+    if (prefill_samples_lmhead()) {
+        for (size_t i = (size_t)start; i < n; i++)
+            next = forward_token(prompt[i], (int)i, true);
+    } else {
+        for (size_t i = (size_t)start; i + 1 < n; i++)
+            forward_token(prompt[i], (int)i, false);
+        if (n > (size_t)start)
+            next = forward_token(prompt.back(), (int)n - 1, true);
+    }
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);
         if (next == s.cfg.eos_id) break;
-        next = forward_token(next, (int)prompt.size() + i);
+        next = forward_token(next, (int)prompt.size() + i, true);
         if (gov) gov->pace();
     }
 

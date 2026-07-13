@@ -171,6 +171,16 @@ static int run_single(const std::string& path, int n_tokens, int context_tokens)
                cold, context_tokens, warm, (int)prefix.size(), suffix_len);
         if (warm > 0. && cold > 0.)
             printf("prefix_speedup: %.1fx TTFT on cached prefix\n", cold / warm);
+    } else {
+        const bool bench_ttft = context_tokens > 0 &&
+            (getenv("SPARKINFER_BENCH_TTFT") || context_tokens >= 512);
+        if (bench_ttft) {
+            std::vector<int> prompt((size_t)context_tokens, 100);
+            double ttft = model.bench_ttft(prompt);
+            if (ttft > 0.)
+                printf("ttft         : %.3f s  (%.1f tok/s prefill, prompt=%d)\n",
+                       ttft, context_tokens / ttft, context_tokens);
+        }
     }
 
     auto bench = s.model->bench_decode(8, n_tokens, context_tokens);
