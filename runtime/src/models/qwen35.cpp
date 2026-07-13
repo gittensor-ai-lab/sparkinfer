@@ -728,7 +728,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
             kernels::launch_add_rmsnorm2(s.x, s.ao, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
 
         const bool qmoe = w.shared_gate_q && w.shared_up_q && w.shared_down_q
-                       && w.shared_gate_qtype == 8 && c.hidden == 2048 && c.moe_ffn == 512;
+                       && (w.shared_gate_qtype == 8 || w.shared_gate_qtype == 12)
+                       && c.hidden == 2048 && c.moe_ffn == 512;
         const bool shexp_pipelined = (c.n_shared > 0) && s.gguf && s.use_shexp_pipe;
         if (shexp_pipelined) {
             cudaEventRecord(s.ev_pipe_fork, st);
@@ -776,11 +777,18 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 // races MoE (shared finishes first, MoE overwrites routed). Always write s.shared;
                 // fold happens after both complete. SPARKINFER_SHEXP_ACCUM=1 only applies on the
                 // non-pipelined path where MoE has already landed in routed.
-                kernels::launch_shared_expert_q8_mmvq(
-                    s.hn, fnq ? s.aq81 : nullptr,
-                    w.shared_gate_q, w.shared_up_q, w.shared_down_q,
-                    w.shared_gate_inp ? s.d_shared_w : nullptr,
-                    s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k, false);
+                if (w.shared_gate_qtype == 12)   // Q8_0->Q4_K requant (Qwen3.6): new Q4_K shared kernels
+                    kernels::launch_shared_expert_q4k_mmvq(
+                        s.hn, fnq ? s.aq81 : nullptr,
+                        w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                        w.shared_gate_inp ? s.d_shared_w : nullptr,
+                        s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k, false);
+                else
+                    kernels::launch_shared_expert_q8_mmvq(
+                        s.hn, fnq ? s.aq81 : nullptr,
+                        w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                        w.shared_gate_inp ? s.d_shared_w : nullptr,
+                        s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k, false);
             } else {
                 kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, s.stream_k);
                 kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, s.stream_v);
@@ -892,12 +900,20 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     if (shexp_accum < 0) { const char* e = getenv("SPARKINFER_SHEXP_ACCUM");
                         shexp_accum = (e && e[0] == '1') ? 1 : 0; }
                     const bool sx_accum = shexp_accum != 0;
-                    kernels::launch_shared_expert_q8_mmvq(
-                        s.hn, fnq ? s.aq81 : nullptr,
-                        w.shared_gate_q, w.shared_up_q, w.shared_down_q,
-                        w.shared_gate_inp ? s.d_shared_w : nullptr,
-                        sx_accum ? s.routed : s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st,
-                        sx_accum);
+                    if (w.shared_gate_qtype == 12)   // Q8_0->Q4_K requant (Qwen3.6): new Q4_K shared kernels
+                        kernels::launch_shared_expert_q4k_mmvq(
+                            s.hn, fnq ? s.aq81 : nullptr,
+                            w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                            w.shared_gate_inp ? s.d_shared_w : nullptr,
+                            sx_accum ? s.routed : s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st,
+                            sx_accum);
+                    else
+                        kernels::launch_shared_expert_q8_mmvq(
+                            s.hn, fnq ? s.aq81 : nullptr,
+                            w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                            w.shared_gate_inp ? s.d_shared_w : nullptr,
+                            sx_accum ? s.routed : s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st,
+                            sx_accum);
                     if (sx_accum) {
                         if (fnq)
                             kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
@@ -1157,8 +1173,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // requant; qtype flips to 12 on success.
     auto dev_quant_requant_q4k = [&](const std::string& name, int& qtype, bool req) -> const void* {
         const void* q6 = dev_quant(name, qtype);
-        if (!req || (qtype != 14 && qtype != 8) || !q6) return q6;
-        const int src_type = qtype;            // 14 (Q6_K) or 8 (Q8_0) -> Q4_K
+        if (!req || (qtype != 14 && qtype != 13 && qtype != 8) || !q6) return q6;
+        const int src_type = qtype;            // 14 (Q6_K), 13 (Q5_K) or 8 (Q8_0) -> Q4_K
         const GGUFTensor* t = g.tensor(name);
         const long nv = t->n_values;
         if (nv % 256 != 0) return q6;
@@ -1184,6 +1200,30 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         static int req = -1;
         if (req < 0) { const char* e = getenv("SPARKINFER_DOWN_REQUANT_Q4K"); req = (e && e[0] == '0') ? 0 : 1; }
         return dev_quant_requant_q4k(name, qtype, req != 0);
+    };
+    // Qwen3.6-35B-A3B UD ships the always-on shared expert (ffn_{gate,up,down}_shexp)
+    // as Q8_0 (34 B/block) on a read that fires every layer, every token. Requantize it
+    // to Q4_K at load (~47% fewer weight bytes) so it decodes through the Q4_K shared-expert
+    // MMVQ kernels. On by default for the Qwen3.6 fingerprint; SPARKINFER_SHEXP_REQUANT_Q4K=0
+    // restores native Q8_0. Strict no-op on non-matching models.
+    const bool q36_shexp_requant = is_qwen35_or_qwen36_hybrid_moe(g) && [] {
+        const char* e = getenv("SPARKINFER_SHEXP_REQUANT_Q4K");
+        return !(e && e[0] == '0');
+    }();
+    auto dev_quant_shexp = [&](const std::string& name, int& qtype) -> const void* {
+        return dev_quant_requant_q4k(name, qtype, q36_shexp_requant);
+    };
+    // Routed-expert down (ffn_down_exps) stays at Q5_K in the UD Q4_K_M while gate/up are
+    // already Q4_K. That down read sits in the same decode-critical FFN stage, so requantize
+    // Q5_K->Q4_K at load and route it through the pre-existing Q4_K routed-down MMVQ dispatch
+    // (down_type == 12). On by default for the Qwen3.6 fingerprint; SPARKINFER_ROUTED_DOWN_REQUANT_Q4K=0
+    // restores native Q5_K reads.
+    const bool q36_routed_down_requant = is_qwen35_or_qwen36_hybrid_moe(g) && [] {
+        const char* e = getenv("SPARKINFER_ROUTED_DOWN_REQUANT_Q4K");
+        return !(e && e[0] == '0');
+    }();
+    auto dev_quant_routed_down = [&](const std::string& name, int& qtype) -> const void* {
+        return dev_quant_requant_q4k(name, qtype, q36_routed_down_requant);
     };
     // dense weight -> bf16 (optionally transpose [out,in] -> [in,out])
     auto dense = [&](const std::string& name, bool transpose) -> const void* {
@@ -1448,7 +1488,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             }
             w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized
             w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
-            w.down_q = dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
+            w.down_q = dev_quant_routed_down(b + "ffn_down_exps.weight", w.down_qtype);  // Q5_K->Q4_K (Qwen3.6)
             if (s.cfg.n_shared > 0) {
             if (!expect_dims(b + "ffn_gate_shexp.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_up_shexp.weight", {H, c.moe_ffn}) ||
@@ -1459,12 +1499,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             const bool qmoe = []{ const char* a = getenv("SPARKINFER_QMOE");
                                    return !(a && a[0] == '0'); }();
             if (qmoe) {
-                w.shared_gate_q = dev_quant(b + "ffn_gate_shexp.weight", w.shared_gate_qtype);
-                w.shared_up_q   = dev_quant(b + "ffn_up_shexp.weight",   w.shared_up_qtype);
-                w.shared_down_q = dev_quant(b + "ffn_down_shexp.weight", w.shared_down_qtype);
+                w.shared_gate_q = dev_quant_shexp(b + "ffn_gate_shexp.weight", w.shared_gate_qtype);
+                w.shared_up_q   = dev_quant_shexp(b + "ffn_up_shexp.weight",   w.shared_up_qtype);
+                w.shared_down_q = dev_quant_shexp(b + "ffn_down_shexp.weight", w.shared_down_qtype);
             }
             if (!qmoe || !w.shared_gate_q || !w.shared_up_q || !w.shared_down_q ||
-                w.shared_gate_qtype != 8) {
+                (w.shared_gate_qtype != 8 && w.shared_gate_qtype != 12)) {
                 w.shared_gate = dense(b + "ffn_gate_shexp.weight", false);
                 w.shared_up   = dense(b + "ffn_up_shexp.weight", false);
                 w.shared_down = dense(b + "ffn_down_shexp.weight", false);

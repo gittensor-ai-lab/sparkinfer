@@ -86,4 +86,14 @@ void launch_shared_expert_q8_mmvq(
     int hidden, int ffn, cudaStream_t stream = nullptr,
     bool accum = false);
 
+// Qwen3.6 UD shared expert: Q4_K gate/up/down via int8 dp4a MMVQ (same pipeline as
+// the Q8_0 variant). Fed by a load-time Q8_0->Q4_K requant of ffn_{gate,up,down}_shexp,
+// so decode reads ~47% fewer weight bytes on the always-on shared FFN.
+void launch_shared_expert_q4k_mmvq(
+    const void* input, const void* input_q8,
+    const void* gate_q, const void* up_q, const void* down_q,
+    const float* dw, void* output, float* h_scratch, void* h_q8_buf,
+    int hidden, int ffn, cudaStream_t stream = nullptr,
+    bool accum = false);
+
 }} // namespace sparkinfer::kernels
