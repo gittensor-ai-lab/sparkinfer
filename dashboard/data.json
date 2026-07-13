@@ -16,7 +16,10 @@
     "longctx_kl": 0.0368,
     "longctx_512_tps": 469.58,
     "longctx_4k_tps": 392.65,
-    "longctx_32k_tps": 260.3
+    "longctx_32k_tps": 260.3,
+    "hf_repo": "Qwen/Qwen3-30B-A3B-GGUF",
+    "hf_avatar": "assets/img/huggingface.svg",
+    "hf_downloads": 85521
   },
   "context_baselines": [
     {
@@ -4097,6 +4100,9 @@
   ],
   "qwen36": {
     "model": "Qwen3.6-35B-A3B · UD-Q4_K_M",
+    "hf_repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+    "hf_avatar": "assets/img/huggingface.svg",
+    "hf_downloads": 854407,
     "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
     "frontier_tps": 473.27,
     "baseline_tps": 427.54,

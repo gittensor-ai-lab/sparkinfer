@@ -254,7 +254,17 @@
   </section>
 
   <section>
-    <div class="sec-h"><h2>Qwen3-MoE · per-context</h2><span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k</span></div>
+    <div class="sec-h">
+      <div class="sec-title-row">
+        <h2>Qwen3-MoE · per-context</h2>
+        <a class="hf-model" id="detail-q3-hf" href="https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF" target="_blank" rel="noopener" title="Qwen/Qwen3-30B-A3B-GGUF">
+          <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="eager" decoding="async">
+          <span class="hf-model-name">Qwen/Qwen3-30B-A3B-GGUF</span>
+          <span class="hf-dl" id="detail-q3-dl"></span>
+        </a>
+      </div>
+      <span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k</span>
+    </div>
     <div class="card" id="detail-q3"></div>
   </section>
 
@@ -274,7 +284,17 @@
   </section>
 
   <section>
-    <div class="sec-h"><h2>Qwen3.6 · per-context</h2><span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k</span></div>
+    <div class="sec-h">
+      <div class="sec-title-row">
+        <h2>Qwen3.6 · per-context</h2>
+        <a class="hf-model" id="detail-q36-hf" href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF" target="_blank" rel="noopener" title="unsloth/Qwen3.6-35B-A3B-GGUF">
+          <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="eager" decoding="async">
+          <span class="hf-model-name">unsloth/Qwen3.6-35B-A3B-GGUF</span>
+          <span class="hf-dl" id="detail-q36-dl"></span>
+        </a>
+      </div>
+      <span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k</span>
+    </div>
     <div class="card" id="detail-q36"></div>
   </section>
 
@@ -309,26 +329,30 @@
   const ctxColor = ctx => CTX_COLOR[ctx] || "#7B5DFF";
   const LLAMA_FILL = "linear-gradient(90deg,#A9A9B4,#C8C8D4)";
 
-  (function(){
-    const q = D.qwen35 || {};
-    const repo = q.hf_repo || "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF";
-    const el = $("detail-q35-hf");
-    if (!el) return;
+  const fmtDl = n => {
+    if (!n) return "";
+    if (n >= 1e6) return (n / 1e6).toFixed(2).replace(/\.?0+$/, "") + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+    return String(n);
+  };
+  const wireHfModel = (elId, dlId, cfg, fallbackRepo) => {
+    const q = cfg || {};
+    const repo = q.hf_repo || fallbackRepo;
+    const el = $(elId);
+    if (!el || !repo) return;
     el.href = `https://huggingface.co/${repo}`;
     el.title = repo;
     const name = el.querySelector(".hf-model-name");
     if (name) name.textContent = repo;
     const img = el.querySelector("img");
     if (img) img.src = q.hf_avatar || "assets/img/huggingface.svg";
-    const fmtDl = n => {
-      if (!n) return "";
-      if (n >= 1e6) return (n / 1e6).toFixed(2).replace(/\.?0+$/, "") + "M";
-      if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
-      return String(n);
-    };
-    const dl = $("detail-q35-dl");
+    const dl = dlId ? $(dlId) : null;
     if (dl && q.hf_downloads) dl.textContent = `· ${fmtDl(q.hf_downloads)} downloads`;
-  })();
+  };
+
+  wireHfModel("detail-q3-hf", "detail-q3-dl", D.status, "Qwen/Qwen3-30B-A3B-GGUF");
+  wireHfModel("detail-q35-hf", "detail-q35-dl", D.qwen35, "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF");
+  wireHfModel("detail-q36-hf", "detail-q36-dl", D.qwen36, "unsloth/Qwen3.6-35B-A3B-GGUF");
 
   $("hero-meta").innerHTML = `GPU <b>${s.gpu}</b> &nbsp;·&nbsp; model <b>${s.model}</b>`;
   $("updated").textContent = "updated " + D.updated;
