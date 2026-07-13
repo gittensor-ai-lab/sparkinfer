@@ -239,31 +239,21 @@
   </section>
 
   <section>
-    <div class="sec-h"><h2>Target models</h2><span class="hint">primary SOTA target <b>Qwen3.6-35B-A3B</b> + architecturally distinct guards — a win must generalize, not overfit</span></div>
+    <div class="sec-h"><h2>Target models</h2><span class="hint">primary SOTA target <b>Qwen3.6-35B-A3B</b> + <b>Gemma 4</b> generality guard — a win must generalize, not overfit</span></div>
     <div class="grid2">
       <div class="tcard sota"><img class="tcard-img tall" src="assets/img/qwen.jpg" alt="Qwen3.6-35B-A3B" loading="lazy"><h4>Qwen3.6-35B-A3B<span class="badge-sota">SOTA</span></h4>
         <div class="role">primary model · state-of-the-art MoE</div>
         <p>Hybrid <b>Gated-DeltaNet + full attention</b> MoE — 256 experts top-8, head_dim 256. The frontier model sparkinfer is built for: <b><span id="q36-frontier">—</span> tok/s</b> decode with <b><span id="q36-acc">—</span> top-1</b> vs llama.cpp on RTX 5090.</p>
-        <div class="spec" id="q36-arch-spec">UD-Q4_K_M · bidirectional eval guard on every PR</div></div>
-      <div class="tcard"><img class="tcard-img tall" src="assets/img/qwen.jpg" alt="Qwen3-MoE" loading="lazy"><h4>Qwen3-MoE<span class="arch" style="color:var(--ok);background:rgba(14,138,22,.14);border-color:rgba(14,138,22,.3)">proven</span></h4>
-        <div class="role">guard model #1 · legacy frontier</div>
-        <p>Qwen3-30B-A3B — 128 experts top-8, GQA head_dim 128, uniform full attention. Long-running optimization baseline with <b><span id="hero-acc">—</span> token-match</b> vs llama.cpp.</p>
-        <div class="spec">Q4_K_M · experts kept quantized · verified on RTX 5090 + PRO 6000</div></div>
-    </div>
-    <div class="grid2" style="margin-top:18px">
-      <div class="tcard"><img class="tcard-img tall" src="assets/img/gemma-4.jpg" alt="Gemma 4" loading="lazy"><h4>Gemma 4<span class="arch" style="color:var(--warn);background:rgba(184,134,11,.14);border-color:rgba(184,134,11,.35)">wiring</span></h4>
-        <div class="role">guard model #2 · the generality test</div>
-        <p>Gemma 4 26B-A4B — 128 experts top-8 + shared, interleaved local-SWA / global attention, <b>head_dim 512</b>, dual RoPE. Deliberately unlike Qwen, so an optimization can't overfit one architecture.</p>
-        <div class="spec">distinct attention + routing → the anti-overfit guard for the basket</div></div>
-      <div class="tcard" style="display:flex;flex-direction:column;justify-content:center;background:linear-gradient(135deg,#fbfbfd 0%,#f3f0ff 100%)">
-        <div class="role">why Qwen3.6?</div>
-        <p style="margin-top:10px">Latest-generation open MoE with hybrid linear + full attention — the class of models agentic on-device stacks are racing to ship. sparkinfer tracks it as the <b>SOTA reference</b>: every PR is scored bidirectionally against Qwen3.6 with no-regression guards at 128/512/4k/16k/32k.</p>
-        <a class="hf-model" id="target-q36-hf" href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF" target="_blank" rel="noopener" style="margin-top:14px">
+        <div class="spec" id="q36-arch-spec">UD-Q4_K_M · bidirectional eval guard on every PR</div>
+        <a class="hf-model" id="target-q36-hf" href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF" target="_blank" rel="noopener" style="margin-top:12px">
           <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="lazy">
           <span class="hf-model-name">unsloth/Qwen3.6-35B-A3B-GGUF</span>
           <span class="hf-dl" id="target-q36-dl"></span>
-        </a>
-      </div>
+        </a></div>
+      <div class="tcard"><img class="tcard-img tall" src="assets/img/gemma-4.jpg" alt="Gemma 4" loading="lazy"><h4>Gemma 4<span class="arch" style="color:var(--warn);background:rgba(184,134,11,.14);border-color:rgba(184,134,11,.35)">wiring</span></h4>
+        <div class="role">generality guard · the anti-overfit test</div>
+        <p>Gemma 4 26B-A4B — 128 experts top-8 + shared, interleaved local-SWA / global attention, <b>head_dim 512</b>, dual RoPE. Deliberately unlike Qwen, so an optimization can't overfit one architecture.</p>
+        <div class="spec">distinct attention + routing → the generality guard for the basket</div></div>
     </div>
   </section>
 
@@ -400,7 +390,6 @@
 
   $("hero-meta").innerHTML = `GPU <b>${s.gpu}</b> &nbsp;·&nbsp; SOTA target <b>Qwen3.6-35B-A3B</b> &nbsp;·&nbsp; guard <b>${s.model}</b>`;
   $("updated").textContent = "updated " + D.updated;
-  $("hero-acc").textContent = (s.token_match*100).toFixed(0)+"%";   // live frontier accuracy, not hardcoded
   if ($("q36-frontier")) $("q36-frontier").textContent = q36.frontier_tps || q36ctx128?.tps || "—";
   if ($("q36-acc")) $("q36-acc").textContent = q36.token_match ? (q36.token_match*100).toFixed(1)+"%" : "—";
   if ($("q36-arch-spec") && q36.arch) $("q36-arch-spec").textContent = q36.arch + " · UD-Q4_K_M · bidirectional eval guard on every PR";
