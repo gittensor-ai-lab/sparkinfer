@@ -300,6 +300,10 @@ class PrEvalBotPolicyTest(unittest.TestCase):
             bot.sync_merged_dashboard("gittensor-ai-lab/sparkinfer")
         rm.assert_not_called()
 
+    def test_qwen36_journey_tps_prefers_128_ctx(self):
+        sub = {"tps": 456.42, "ctx_128_tps": 463.27}
+        self.assertEqual(bot._qwen36_journey_tps(sub), 463.27)
+
     def test_pr_inactive_days_from_updated_at(self):
         now = datetime.datetime(2026, 7, 13, 12, 0, tzinfo=datetime.timezone.utc)
         pr = {"updatedAt": "2026-07-10T12:00:00Z"}

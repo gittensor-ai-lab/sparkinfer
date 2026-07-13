@@ -1,15 +1,15 @@
 {
   "updated": "2026-07-13",
   "status": {
-    "gpu": "RTX 5090 · sm_120 · CUDA 13",
-    "model": "Qwen3-30B-A3B · Q4_K_M",
+    "gpu": "RTX 5090 \u00b7 sm_120 \u00b7 CUDA 13",
+    "model": "Qwen3-30B-A3B \u00b7 Q4_K_M",
     "frontier_tps": 484.79,
     "ref_name": "llama.cpp",
     "ref_tps": 365.85,
     "vram_gb": 21.4,
     "token_match": 0.97,
     "kl": 0.02,
-    "ref_note": "128-tok decode rerun on current main, same RTX 5090 · Q4_K_M GGUF",
+    "ref_note": "128-tok decode rerun on current main, same RTX 5090 \u00b7 Q4_K_M GGUF",
     "longctx_16k_tps": 330.2,
     "longctx_2k_tps": 277.78,
     "longctx_token_match": 0.9426,
@@ -106,27 +106,27 @@
     },
     {
       "l": "L",
-      "d": "10–18% over frontier",
+      "d": "10\u201318% over frontier",
       "c": "#1D76DB"
     },
     {
       "l": "M",
-      "d": "6–10% over frontier",
+      "d": "6\u201310% over frontier",
       "c": "#8250DF"
     },
     {
       "l": "S",
-      "d": "3.5–6% over frontier",
+      "d": "3.5\u20136% over frontier",
       "c": "#B8860B"
     },
     {
       "l": "XS",
-      "d": "2–3.5% over frontier",
+      "d": "2\u20133.5% over frontier",
       "c": "#8A93A0"
     },
     {
       "l": "none",
-      "d": "≤ 2% — within noise, no verified gain",
+      "d": "\u2264 2% \u2014 within noise, no verified gain",
       "c": "#9AA6B2"
     },
     {
@@ -137,8 +137,216 @@
   ],
   "prs": [
     {
+      "num": 267,
+      "title": "perf(qwen36): Q8_0\u2192Q4_K requant of GDN input projections (attn_qkv + attn_gate) (+11.5% @128)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "XL",
+      "tps": 456.42,
+      "delta_pct": 11.0,
+      "top1": 0.9529,
+      "kl": 0.031,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/267",
+      "model": "bidir",
+      "eval_mode": "longctx",
+      "score_context": 512,
+      "best_context_label": "512-context",
+      "context_gains_pct": {
+        "128-context": 10.96,
+        "512-context": 11.01,
+        "4k-context": 10.2,
+        "16k-context": 10.07,
+        "32k-context": 9.82
+      },
+      "regression_labels": [],
+      "mode": "bidir",
+      "label_qwen35": "none",
+      "label_qwen36": "XL",
+      "pass_qwen35": true,
+      "pass_qwen36": true,
+      "score_qwen35": {
+        "commit": "ca7028c",
+        "tps": 294.39,
+        "top1": 0.9348,
+        "kl": 0.0353,
+        "frontier_tps": 294.23,
+        "label": "none",
+        "delta_tps": 0.16,
+        "pct_over_frontier": 0.1,
+        "note": "within significance gate \u2014 not a verified improvement",
+        "pass": true,
+        "clocks_pinned": true,
+        "clock_mhz": "0",
+        "clock_spread_mhz": "0",
+        "pin_target_mhz": "2550",
+        "eval_seed": "20f16f3360cb36e5",
+        "model_sha_pinned": true,
+        "llama_commit": "6f4f53f2b7da54fcdbbecaaa734337c337ad6176",
+        "eval_mode": "longctx",
+        "decode_tokens": 128,
+        "score_context": 128,
+        "best_context_label": "128-context",
+        "context_gains_pct": {
+          "128-context": 0.05,
+          "512-context": -0.01,
+          "4k-context": 0.02
+        },
+        "regression_labels": [],
+        "guard_context": 0,
+        "ctx_128_tps": 294.39,
+        "ctx_512_tps": 291.62,
+        "ctx_4096_tps": 282.74,
+        "ctx_16384_tps": 0.0,
+        "ctx_32768_tps": 0.0,
+        "guard_128_baseline": 294.23,
+        "guard_128_ratio": 1.0005,
+        "guard_128_tol": 0.98,
+        "guard_128_pass": true,
+        "guard_512_baseline": 291.66,
+        "guard_512_ratio": 0.9999,
+        "guard_512_tol": 0.98,
+        "guard_512_pass": true,
+        "guard_4k_baseline": 282.68,
+        "guard_4k_ratio": 1.0002,
+        "guard_4k_tol": 0.98,
+        "guard_4k_pass": true,
+        "guard_16k_baseline": 0.0,
+        "guard_16k_ratio": 0.0,
+        "guard_16k_tol": 0.98,
+        "guard_16k_pass": true,
+        "guard_32k_baseline": 0.0,
+        "guard_32k_ratio": 0.0,
+        "guard_32k_tol": 0.98,
+        "guard_32k_pass": true,
+        "model": "Qwythos-9B (Q4_K_M)",
+        "guard_model": "Qwen3.6-35B-A3B",
+        "guard": {
+          "pass": true,
+          "top1": 0.9529,
+          "kl": 0.031,
+          "label": "L",
+          "ctx_128_tps": 463.25,
+          "ctx_512_tps": 456.36,
+          "ctx_4096_tps": 435.14,
+          "ctx_16384_tps": 432.18,
+          "ctx_32768_tps": 413.21,
+          "guard_128_pass": true,
+          "guard_512_pass": true,
+          "guard_4k_pass": true,
+          "guard_16k_pass": true,
+          "guard_32k_pass": true,
+          "speed_ok": true,
+          "accuracy_ok": true
+        }
+      },
+      "score_qwen36": {
+        "commit": "ca7028c",
+        "tps": 456.42,
+        "top1": 0.9529,
+        "kl": 0.031,
+        "frontier_tps": 411.16,
+        "label": "XL",
+        "delta_tps": 45.26,
+        "pct_over_frontier": 11.0,
+        "pct_of_llama": 16.4,
+        "pct_of_ceiling": 124.7,
+        "effective_pct": 32.8,
+        "difficulty_mult": 2.0,
+        "pass": true,
+        "clocks_pinned": true,
+        "clock_mhz": "0",
+        "clock_spread_mhz": "0",
+        "pin_target_mhz": "2550",
+        "eval_seed": "20f16f3360cb36e5",
+        "model_sha_pinned": true,
+        "llama_commit": "6f4f53f2b7da54fcdbbecaaa734337c337ad6176",
+        "eval_mode": "longctx",
+        "decode_tokens": 128,
+        "score_context": 512,
+        "best_context_label": "512-context",
+        "context_gains_pct": {
+          "128-context": 10.96,
+          "512-context": 11.01,
+          "4k-context": 10.2,
+          "16k-context": 10.07,
+          "32k-context": 9.82
+        },
+        "regression_labels": [],
+        "guard_context": 0,
+        "ctx_128_tps": 463.27,
+        "ctx_512_tps": 456.42,
+        "ctx_4096_tps": 435.14,
+        "ctx_16384_tps": 432.1,
+        "ctx_32768_tps": 413.14,
+        "guard_128_baseline": 417.52,
+        "guard_128_ratio": 1.1096,
+        "guard_128_tol": 0.98,
+        "guard_128_pass": true,
+        "guard_512_baseline": 411.16,
+        "guard_512_ratio": 1.1101,
+        "guard_512_tol": 0.98,
+        "guard_512_pass": true,
+        "guard_4k_baseline": 394.87,
+        "guard_4k_ratio": 1.102,
+        "guard_4k_tol": 0.98,
+        "guard_4k_pass": true,
+        "guard_16k_baseline": 392.58,
+        "guard_16k_ratio": 1.1007,
+        "guard_16k_tol": 0.98,
+        "guard_16k_pass": true,
+        "guard_32k_baseline": 376.21,
+        "guard_32k_ratio": 1.0982,
+        "guard_32k_tol": 0.98,
+        "guard_32k_pass": true,
+        "model": "Qwen3.6-35B-A3B",
+        "guard_model": "Qwythos-9B (Q4_K_M)",
+        "guard": {
+          "pass": true,
+          "top1": 0.9348,
+          "kl": 0.0353,
+          "label": "none",
+          "ctx_128_tps": 294.36,
+          "ctx_512_tps": 291.64,
+          "ctx_4096_tps": 282.75,
+          "ctx_16384_tps": 0.0,
+          "ctx_32768_tps": 0.0,
+          "guard_128_pass": true,
+          "guard_512_pass": true,
+          "guard_4k_pass": true,
+          "guard_16k_pass": true,
+          "guard_32k_pass": true,
+          "speed_ok": true,
+          "accuracy_ok": true
+        }
+      },
+      "ctx_128_tps": 463.27,
+      "ctx_512_tps": 456.42,
+      "ctx_4096_tps": 435.14,
+      "ctx_16384_tps": 432.1,
+      "ctx_32768_tps": 413.14,
+      "guard_128_baseline": 417.52,
+      "guard_128_ratio": 1.1096,
+      "guard_128_pass": true,
+      "guard_512_baseline": 411.16,
+      "guard_512_ratio": 1.1101,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 394.87,
+      "guard_4k_ratio": 1.102,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 392.58,
+      "guard_16k_ratio": 1.1007,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 376.21,
+      "guard_32k_ratio": 1.0982,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0267-ca7028c",
+      "proof_run": "0267-ca7028c"
+    },
+    {
       "num": 353,
-      "title": "perf(qwen36): Q8_0→Q4_K requant of full-attention q/o projections",
+      "title": "perf(qwen36): Q8_0\u2192Q4_K requant of full-attention q/o projections",
       "areas": [
         "kernels",
         "runtime"
@@ -175,7 +383,7 @@
         "label": "none",
         "delta_tps": 1.59,
         "pct_over_frontier": 0.5,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -384,7 +592,7 @@
         "label": "none",
         "delta_tps": 1.21,
         "pct_over_frontier": 0.4,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -459,7 +667,7 @@
         "label": "none",
         "delta_tps": 0.23,
         "pct_over_frontier": 0.1,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -589,7 +797,7 @@
         "label": "none",
         "delta_tps": 2.02,
         "pct_over_frontier": 0.7,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -759,7 +967,7 @@
     },
     {
       "num": 350,
-      "title": "perf(qwen36): opt-in Q8→Q4 requant reward profile (~+6.3% @512)",
+      "title": "perf(qwen36): opt-in Q8\u2192Q4 requant reward profile (~+6.3% @512)",
       "areas": [
         "kernels",
         "runtime"
@@ -802,7 +1010,7 @@
         "label": "REJECT",
         "delta_tps": 1.8,
         "pct_over_frontier": 0.6,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": false,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -1062,7 +1270,7 @@
         "label": "none",
         "delta_tps": 1.29,
         "pct_over_frontier": 0.4,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -1553,7 +1761,7 @@
         "label": "none",
         "delta_tps": -0.45,
         "pct_over_frontier": -0.1,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -1761,7 +1969,7 @@
         "label": "none",
         "delta_tps": -0.45,
         "pct_over_frontier": -0.1,
-        "note": "within significance gate — not a verified improvement",
+        "note": "within significance gate \u2014 not a verified improvement",
         "pass": true,
         "clocks_pinned": false,
         "clock_mhz": "0",
@@ -2275,7 +2483,7 @@
     },
     {
       "num": 323,
-      "title": "perf(qwen35): requantize dense FFN down Q6_K→Q4_K at load (~5% Qwythos decode)",
+      "title": "perf(qwen35): requantize dense FFN down Q6_K\u2192Q4_K at load (~5% Qwythos decode)",
       "areas": [
         "kernels",
         "runtime"
@@ -2345,7 +2553,7 @@
     },
     {
       "num": 239,
-      "title": "perf(qwen3.6): fuse decode kernel launches — shared-expert + GDN conv/L2-norm",
+      "title": "perf(qwen3.6): fuse decode kernel launches \u2014 shared-expert + GDN conv/L2-norm",
       "areas": [
         "kernels",
         "runtime"
@@ -2739,7 +2947,7 @@
     },
     {
       "num": 269,
-      "title": "perf(qwen3.6): shared-expert MMVQ + QK-norm+RoPE+KV-append — 25% decode",
+      "title": "perf(qwen3.6): shared-expert MMVQ + QK-norm+RoPE+KV-append \u2014 25% decode",
       "areas": [
         "kernels",
         "runtime"
@@ -2753,53 +2961,8 @@
       "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0269-666110e"
     },
     {
-      "num": 267,
-      "title": "perf(moe): Q5_K fp split-K Qwen specialization + gate_up F=512 dispatch (+4.3% Qwen3.6 decode)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "M",
-      "tps": 278.76,
-      "delta_pct": 9.4,
-      "top1": 0.9767,
-      "kl": 0.0165,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/267",
-      "model": "Qwen3.6-35B-A3B",
-      "eval_mode": "longctx",
-      "score_context": 128,
-      "best_context_label": "128-context",
-      "context_gains_pct": {
-        "128-context": 9.44,
-        "512-context": 9.23,
-        "4k-context": 8.46
-      },
-      "regression_labels": [],
-      "ctx_128_tps": 278.76,
-      "ctx_512_tps": 275.13,
-      "ctx_4096_tps": 259.22,
-      "ctx_16384_tps": 0.0,
-      "ctx_32768_tps": 0.0,
-      "guard_128_baseline": 254.72,
-      "guard_128_ratio": 1.0944,
-      "guard_128_pass": true,
-      "guard_512_baseline": 251.87,
-      "guard_512_ratio": 1.0923,
-      "guard_512_pass": true,
-      "guard_4k_baseline": 239.0,
-      "guard_4k_ratio": 1.0846,
-      "guard_4k_pass": true,
-      "guard_16k_baseline": 0.0,
-      "guard_16k_ratio": 0.0,
-      "guard_16k_pass": true,
-      "guard_32k_baseline": 0.0,
-      "guard_32k_ratio": 0.0,
-      "guard_32k_pass": true,
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0267-c42844c"
-    },
-    {
       "num": 266,
-      "title": "perf(qwen36): +15-20% decode — Q8 shared MMVQ, pipelining, F=512 MoE, hd256 FA",
+      "title": "perf(qwen36): +15-20% decode \u2014 Q8 shared MMVQ, pipelining, F=512 MoE, hd256 FA",
       "areas": [
         "kernels",
         "runtime"
@@ -3065,7 +3228,7 @@
     },
     {
       "num": 229,
-      "title": "feat(qwen36): add optimized Gated-DeltaNet AR state update kernel wit…",
+      "title": "feat(qwen36): add optimized Gated-DeltaNet AR state update kernel wit\u2026",
       "areas": [
         "kernels"
       ],
@@ -3108,7 +3271,7 @@
     },
     {
       "num": 230,
-      "title": "perf(qwen3.6): shared expert as coalesced GEMVs — 7.2× decode (23→167 tok/s)",
+      "title": "perf(qwen3.6): shared expert as coalesced GEMVs \u2014 7.2\u00d7 decode (23\u2192167 tok/s)",
       "areas": [
         "kernels",
         "runtime"
@@ -3669,7 +3832,7 @@
       "date": "2026-06-27"
     },
     {
-      "name": "split-K MMVQ down — +8% Qwen",
+      "name": "split-K MMVQ down \u2014 +8% Qwen",
       "tps": 339.59,
       "pr": 74,
       "date": "2026-06-28"
@@ -3840,11 +4003,11 @@
     ]
   },
   "qwen35": {
-    "model": "Qwythos-9B (Qwen3.5-9B) · Q4_K_M",
+    "model": "Qwythos-9B (Qwen3.5-9B) \u00b7 Q4_K_M",
     "hf_repo": "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF",
     "hf_avatar": "assets/img/huggingface.svg",
     "hf_downloads": 1967677,
-    "arch": "dense hybrid Gated-DeltaNet + full-attn · 9B · hd256",
+    "arch": "dense hybrid Gated-DeltaNet + full-attn \u00b7 9B \u00b7 hd256",
     "frontier_tps": 298.27,
     "baseline_tps": 298.27,
     "ref_name": "llama.cpp",
@@ -3917,14 +4080,14 @@
     }
   ],
   "qwen36": {
-    "model": "Qwen3.6-35B-A3B · UD-Q4_K_M",
-    "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
+    "model": "Qwen3.6-35B-A3B \u00b7 UD-Q4_K_M",
+    "arch": "hybrid Gated-DeltaNet + full-attn MoE \u00b7 256 experts top-8 \u00b7 hd256",
     "frontier_tps": 473.27,
-    "baseline_tps": 473.27,
+    "baseline_tps": 427.54,
     "ref_name": "llama.cpp",
     "ref_tps": 275.81,
-    "token_match": 0.9471,
-    "kl": 0.0208,
+    "token_match": 0.9529,
+    "kl": 0.031,
     "note": "same-box baseline 91.224.44.227 (origin/main 6e963a7, 2026-07-13)",
     "ctx": [
       {
@@ -3989,7 +4152,7 @@
       "label": "M"
     },
     {
-      "name": "+15-20% decode — Q8 shared M",
+      "name": "+15-20% decode \u2014 Q8 shared M",
       "tps": 300.16,
       "pr": 266,
       "date": "2026-07-06",
@@ -4038,10 +4201,17 @@
       "label": "S"
     },
     {
-      "name": "Q8_0→Q4_K requant of full-at",
+      "name": "Q8_0\u2192Q4_K requant of full-at",
       "tps": 427.54,
       "pr": 353,
       "date": "2026-07-12",
+      "label": "XL"
+    },
+    {
+      "name": "Q8_0\u2192Q4_K requant of GDN inp",
+      "tps": 463.27,
+      "pr": 267,
+      "date": "2026-07-13",
       "label": "XL"
     }
   ]

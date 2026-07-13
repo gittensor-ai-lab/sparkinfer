@@ -1066,6 +1066,11 @@ def _upsert_qwen36_ctx(data, sub):
         q36["ctx"] = [ctx_rows[k] for k in Q36_CTX_ORDER if k in ctx_rows]
     return changed
 
+def _qwen36_journey_tps(sub):
+    """128-token headline for Qwen3.6 journey steps (matches chart hint + landed history)."""
+    return float(sub.get("ctx_128_tps") or sub.get("tps") or 0)
+
+
 def record_merge(repo, num):
     """A frontier-advancing PR was MERGED → advance the displayed frontier by its verified same-box
     relative gain and add it to the journey (`landed`). Hardware-independent and merged-only;
@@ -1086,14 +1091,15 @@ def record_merge(repo, num):
             sub = e.get("score_qwen36") or e
             q36 = data.setdefault("qwen36", {})
             old_f = round(q36.get("frontier_tps") or q36.get("baseline_tps") or 0, 2)
-            new_f = round(max(old_f, sub.get("tps") or 0), 2)
+            step = round(_qwen36_journey_tps(sub), 2)
+            new_f = round(max(old_f, step), 2)
             q36["frontier_tps"] = new_f
             if sub.get("top1") is not None: q36["token_match"] = round(sub["top1"], 4)
             if sub.get("kl") is not None:   q36["kl"] = round(sub["kl"], 4)
             _upsert_qwen36_ctx(data, sub)
             short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
             landed = [m for m in data.get("landed_qwen36", []) if m.get("pr") != num and not m.get("baseline")]
-            landed.append({"name": short or f"PR #{num}", "tps": new_f, "pr": num,
+            landed.append({"name": short or f"PR #{num}", "tps": step, "pr": num,
                            "date": datetime.date.today().isoformat(), "label": e.get("label_qwen36")})
             data["landed_qwen36"] = sorted(landed, key=lambda m: m["tps"])
             changed = True
@@ -1128,13 +1134,14 @@ def record_merge(repo, num):
     if scored_qwen36:
         q36 = data.setdefault("qwen36", {})
         old_f = round(q36.get("frontier_tps") or q36.get("baseline_tps") or 0, 2)
-        new_f = round(max(old_f, e.get("tps") or 0), 2)          # Qwen3.6 frontier: take the max tps seen
+        step = round(_qwen36_journey_tps(e), 2)
+        new_f = round(max(old_f, step), 2)          # Qwen3.6 frontier: take the max 128-tok tps seen
         q36["frontier_tps"] = new_f
         if e.get("top1") is not None: q36["token_match"] = round(e["top1"], 4)
         if e.get("kl") is not None:   q36["kl"] = round(e["kl"], 4)
         short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
         landed = [m for m in data.get("landed_qwen36", []) if m.get("pr") != num and not m.get("baseline")]
-        landed.append({"name": short or f"PR #{num}", "tps": new_f, "pr": num,
+        landed.append({"name": short or f"PR #{num}", "tps": step, "pr": num,
                        "date": datetime.date.today().isoformat(), "label": e.get("label")})
         data["landed_qwen36"] = sorted(landed, key=lambda m: m["tps"])
         data["updated"] = datetime.date.today().isoformat()
