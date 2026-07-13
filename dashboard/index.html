@@ -623,7 +623,7 @@
     }
     const maxT = Math.max(...rows.flatMap(x=>[x.pp||0, x.ref_pp]));
     const fmt=v=>v>0?v.toFixed(2):"pending"; const bar=v=>Math.max(3, 100*v/maxT);
-    const ppColor = lbl => ({4k:"#0E8A16", "32k":"#6F42C1", "64k":"#E67E22", "128k":"#17A2B8"}[lbl]||"#7B5DFF");
+    const ppColor = lbl => ({"4k":"#0E8A16", "32k":"#6F42C1", "64k":"#E67E22", "128k":"#17A2B8"}[lbl]||"#7B5DFF");
     const detailRows = rows.map(x=>{
       const d=x.pp>0?100*(x.pp-x.ref_pp)/x.ref_pp:null;
       const col=x.color||ppColor(x.label);
