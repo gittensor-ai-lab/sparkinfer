@@ -3,6 +3,77 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.4.1] — 2026-07-13
+
+sparkinfer now leads **llama.cpp by 70%+ on Qwen3.6-35B-A3B** — the project's primary **SOTA** open MoE —
+while extending **long-context decode** through **128k** on Qwen3.5 (Qwythos) and holding verified gains on
+Qwen3.6 through **32k**. Same RTX 5090, same UD-Q4_K_M / Q4_K_M GGUFs, Polaris-attested eval logs.
+
+### 🏆 Qwen3.6-35B-A3B (SOTA) — **+71%** past llama.cpp at 128-token decode
+
+Hybrid Gated-DeltaNet + full-attention MoE · 256 experts top-8 · hd256. Frontier climbed **425 → 473 tok/s**
+since v0.4.0; every tracked context from 128 through 32k stays **50%+ ahead** of llama.cpp on the same box.
+
+| context | sparkinfer | llama.cpp | delta |
+|---|---:|---:|---:|
+| **128-token decode** | **473.3 tok/s** | 275.81 tok/s | **+71%** |
+| **512-context decode** | **480.9 tok/s** | 275.61 tok/s | **+74%** |
+| **4k-context decode** | **459.6 tok/s** | 276.30 tok/s | **+66%** |
+| **16k-context decode** | **450.0 tok/s** | 280.66 tok/s | **+60%** |
+| **32k-context decode** | **427.6 tok/s** | 279.83 tok/s | **+53%** |
+
+Top-1 **0.953**, KL **0.031** vs llama.cpp on held-out prompts.
+
+### 📏 Long context — measured through 128k
+
+KV cache cap raised to **163,840 tokens** (`kMaxBlocksPerSeq=10240`) so Qwen3.5 bidirectional eval now
+scores **128 / 4k / 32k / 64k / 128k** with no-regression guards. Qwen3.6 keeps the **5-context** ladder
+(128 → 32k); Qwen3-MoE long-context baselines unchanged.
+
+| model | longest tracked ctx | sparkinfer @ longest | llama.cpp | notes |
+|---|---|---:|---:|---|
+| **Qwen3.6-35B-A3B** | 32k | **427.6 tok/s** | 279.83 tok/s | **+53%** · primary SOTA target |
+| **Qwen3.5-9B (Qwythos)** | 128k | **159.2 tok/s** | 220.58 tok/s | decode verified to 128k |
+| **Qwen3-MoE (30B-A3B)** | 32k | **260.3 tok/s** | 192.62 tok/s | **+35%** |
+
+### Performance — landed since v0.4.0
+
+- **#267** (`eval:XL`) — Q8_0→Q4_K requant of GDN input projections (attn_qkv + attn_gate) — **+11.5% @128**
+- **#353** (`eval:XL`) — Q8_0→Q4_K requant of full-attention q/o projections
+- **#294** (`eval:S`) — decode fuses + FAGQA4 restore (+3.5% @32k)
+- **#338** (`eval:S`) — hd256/GQA-8 occupancy-corrected KV-split count (+2.8–5.1% @8k–32k)
+- **#366** (`eval:L`) — Qwythos GQA-4 int8 MMA flash-decode + tiered KV splits (+4% @64k)
+- **#329** (`eval:M`) — Q4_K requant for Qwythos Q6 decode reads
+- **#327** (`eval:XS`) — GQA-4 shared-KV tile for Qwythos hd256 full-attn decode
+- **#365** — raise KV block cap to 128k context + refresh Qwen3.5/3.6 baselines
+
+### Eval & dashboard
+
+- **#361** — sync dashboard frontier/journey on any merged PR with eval data (not only `merge-first`)
+- **#364** — auto-close open PRs inactive for 2+ days
+- **#369 / #370** — Qwen3.5 bidir harness aligned to 128/4k/32k/64k/128k policy on vast_eval
+- Dashboard: Qwen3.6 featured as **SOTA** primary target; HF model links + Polaris TDX proof icons
+
+### What changed since v0.4.0
+
+| headline | v0.4.0 | v0.4.1 | shift |
+|---|---:|---:|---|
+| Qwen3.6 @128 | 424.9 tok/s (+54%) | **473.3 tok/s (+71%)** | **+48 tok/s** |
+| Qwen3.5 @128 | 279.8 tok/s (+24%) | **301.1 tok/s (+36%)** | **+21 tok/s** |
+| Qwen3-MoE @128 | 480.7 tok/s (+31%) | **493.6 tok/s (+35%)** | **+13 tok/s** |
+
+**Verified:** RTX 5090 · Qwen3.6 **473 tok/s** (128-tok, SOTA) · Qwen3.5 **301 tok/s** · Qwen3-MoE **494 tok/s** ·
+long-context guards through **128k** (Qwythos) / **32k** (Qwen3.6).
+
+### Contributors
+
+- **@inference2026** — #267 (GDN input Q8→Q4 requant), #338 (hd256 KV-split occupancy)
+- **@blinkeye-lcm** — #353 (full-attn q/o Q8→Q4 requant)
+- **@jimcody1995** — #294 (decode fuses + FAGQA4 restore)
+- **@James-CUDA** — #366 (Qwythos GQA-4 int8 MMA flash-decode + tiered KV)
+- **@9876543210-tc-0123456789** — #329 (Qwythos Q6→Q4 requant at decode)
+- **@skyrocket2026** — #327 (Qwythos GQA-4 shared-KV tile), #365 (128k KV cap), bidir longctx harness (#369–#370), eval bot (#361, #364), v0.4.1 release
+
 ## [0.4.0] — 2026-07-11
 
 This release adds **Qwen3.5-9B (Qwythos)** as a first-class target and locks in **three-model** decode:
