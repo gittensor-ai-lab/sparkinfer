@@ -77,5 +77,15 @@
     "strike": 0,
     "containment": 1.0,
     "note": "false positive cleared: 3-line GQA-4 g2 build fix; 100% literal overlap with #318 call-site boilerplate; same diff as #336 (merged first)"
+  },
+  {
+    "pr": 379,
+    "author": "Paral1995",
+    "original": 223,
+    "date": "2026-07-13",
+    "blocked": false,
+    "penalty_days": 0,
+    "strike": 1,
+    "containment": 0.75
   }
 ]
