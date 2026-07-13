@@ -148,6 +148,8 @@ MERGE_FIRST_LABEL  = "merge-first"    # the round's biggest verified speedup —
 NEEDS_REBASE_LABEL = "needs-rebase"   # also a verified speedup, but not the round winner
 REEVALUATE_LABEL   = "re-evaluate"    # winner merged → rebase onto new main; bot re-evals on push
 HOLD_LABEL         = "hold"           # maintainer override: never auto-merge this PR
+STALE_PR_DAYS      = int(os.environ.get("SPARKINFER_STALE_PR_DAYS", "2"))
+STALE_CLOSE_SKIP_LABELS = {HOLD_LABEL, MERGE_FIRST_LABEL}  # protected from auto-close
 CONTEXT_LABELS     = {"128-context", "512-context", "4k-context", "16k-context", "32k-context",
                       "64k-context", "128k-context"}
 REGRESSION_LABELS  = {"regression-128", "regression-512", "regression-4k", "regression-16k",
@@ -206,6 +208,66 @@ def pr_involved_logins(repo, num):
     for l in (out.stdout or "").splitlines():
         if l.strip(): logins.add(l.strip().lower())
     return logins
+
+def _parse_github_time(ts):
+    """Parse GitHub ISO-8601 timestamp to UTC datetime."""
+    if not ts:
+        return None
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    return datetime.datetime.fromisoformat(ts)
+
+
+def pr_inactive_days(pr, now=None):
+    """Days since the PR's last activity (updatedAt), or None if unknown."""
+    updated = _parse_github_time(pr.get("updatedAt"))
+    if not updated:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=datetime.timezone.utc)
+    return (now - updated).total_seconds() / 86400.0
+
+
+def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False):
+    """Close open PRs with no GitHub activity for more than `days` days.
+
+    Uses PR updatedAt (commits, comments, reviews, label changes). Skips PRs labeled
+    `hold` or `merge-first`. Returns the set of PR numbers closed (or would-close in dry-run).
+  """
+    if days <= 0:
+        return set()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open",
+                         "--json", "number,title,updatedAt,labels"]).stdout or "[]")
+    closed = set()
+    for pr in prs:
+        num = pr["number"]
+        labels = {l["name"] for l in pr.get("labels", [])}
+        if labels & STALE_CLOSE_SKIP_LABELS:
+            continue
+        inactive = pr_inactive_days(pr, now)
+        if inactive is None or inactive <= days:
+            continue
+        days_idle = int(inactive)
+        print(f"PR #{num}: stale — no activity for {days_idle}d (limit {days}d)"
+              f"{' — would close' if dry_run else ' — closing'}")
+        if dry_run:
+            closed.add(num)
+            continue
+        body = ("<!-- sparkinfer-stale -->\n"
+                f"## Closed: no activity for {days}+ days\n\n"
+                f"This PR has had no updates (commits, comments, reviews, or label changes) "
+                f"for **{days_idle} days** (threshold: {days} days).\n\n"
+                "Reopen this PR or open a fresh one when you're ready to continue.")
+        gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+        if gh(["pr", "close", str(num), "-R", repo]).returncode == 0:
+            closed.add(num)
+    if closed:
+        print(f">> close_stale_prs: {'would close' if dry_run else 'closed'} {len(closed)} PR(s): "
+              f"{sorted(closed)}")
+    return closed
+
 
 def close_blocked_pr(repo, num, hits):
     """Label flagged:gaming, comment with the reason, and close the PR. Returns True on close."""
@@ -1373,8 +1435,12 @@ def main():
     # OLDEST-FIRST: evaluate ascending by PR number so the original of any duplicate is seen before
     # its copy, and the earliest submitter is graded first (fairness + copycat attribution).
     prs = json.loads(gh(["pr", "list", "-R", args.repo, "--state", "open",
-                         "--json", "number,headRefName,headRefOid,title,isCrossRepository,labels,isDraft,mergeable"]).stdout or "[]")
+                         "--json", "number,headRefName,headRefOid,title,isCrossRepository,labels,isDraft,mergeable,updatedAt"]).stdout or "[]")
     prs.sort(key=lambda p: p["number"])
+    if not args.only_pr:
+        stale_closed = close_stale_prs(args.repo, days=STALE_PR_DAYS, dry_run=args.dry_run)
+        if stale_closed:
+            prs = [p for p in prs if p["number"] not in stale_closed]
     if args.only_pr:
         prs = [p for p in prs if p["number"] == args.only_pr]
         if not prs:

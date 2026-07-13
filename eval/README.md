@@ -143,6 +143,10 @@ applies an `eval:<LABEL>` label, and posts the result as a PR comment. **It neve
 manually after review. Idempotent: each commit is evaluated once (tracked by a hidden marker in the
 bot's comment), so it only spins the GPU when there's new work.
 
+Each bot run also **closes open PRs with no GitHub activity for 2+ days** (`updatedAt` — commits,
+comments, reviews, label changes). PRs labeled `hold` or `merge-first` are skipped. Override with
+`SPARKINFER_STALE_PR_DAYS=0` to disable, or set a different threshold.
+
 ```bash
 eval/setup_labels.sh                                   # one-time: create the eval:* labels
 python eval/pr_eval_bot.py --instance 42134865 --frontier 164 --ceiling 366   # one poll

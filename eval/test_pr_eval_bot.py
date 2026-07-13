@@ -7,6 +7,7 @@ Run from the repo root:
 import unittest
 import json
 import os
+import datetime
 import tempfile
 from unittest import mock
 
@@ -298,6 +299,58 @@ class PrEvalBotPolicyTest(unittest.TestCase):
              mock.patch.object(bot, "record_merge") as rm:
             bot.sync_merged_dashboard("gittensor-ai-lab/sparkinfer")
         rm.assert_not_called()
+
+    def test_pr_inactive_days_from_updated_at(self):
+        now = datetime.datetime(2026, 7, 13, 12, 0, tzinfo=datetime.timezone.utc)
+        pr = {"updatedAt": "2026-07-10T12:00:00Z"}
+        self.assertAlmostEqual(bot.pr_inactive_days(pr, now), 3.0, places=5)
+
+    def test_close_stale_prs_closes_inactive(self):
+        stale = {
+            "number": 42,
+            "title": "old PR",
+            "updatedAt": "2026-07-01T00:00:00Z",
+            "labels": [{"name": "not-tested"}],
+        }
+        fresh = {
+            "number": 43,
+            "title": "active PR",
+            "updatedAt": "2026-07-12T00:00:00Z",
+            "labels": [],
+        }
+        gh_calls = []
+
+        def fake_gh(args):
+            gh_calls.append(args)
+            if args[:3] == ["pr", "list", "-R"]:
+                return mock.Mock(stdout=json.dumps([stale, fresh]))
+            return mock.Mock(returncode=0)
+
+        now = datetime.datetime(2026, 7, 13, 0, 0, tzinfo=datetime.timezone.utc)
+        with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+             mock.patch.object(bot, "pr_inactive_days", side_effect=lambda pr, _now=None: 5.0 if pr["number"] == 42 else 1.0):
+            closed = bot.close_stale_prs("gittensor-ai-lab/sparkinfer", days=2, dry_run=False)
+        self.assertEqual(closed, {42})
+        self.assertTrue(any(c[:3] == ["pr", "close", "42"] for c in gh_calls))
+
+    def test_close_stale_prs_skips_hold_and_merge_first(self):
+        prs = [
+            {"number": 1, "updatedAt": "2026-01-01T00:00:00Z", "labels": [{"name": "hold"}]},
+            {"number": 2, "updatedAt": "2026-01-01T00:00:00Z", "labels": [{"name": "merge-first"}]},
+        ]
+        with mock.patch.object(bot, "gh", return_value=mock.Mock(stdout=json.dumps(prs))), \
+             mock.patch.object(bot, "pr_inactive_days", return_value=10.0):
+            closed = bot.close_stale_prs("gittensor-ai-lab/sparkinfer", days=2)
+        self.assertEqual(closed, set())
+
+    def test_close_stale_prs_dry_run(self):
+        prs = [{"number": 99, "updatedAt": "2026-01-01T00:00:00Z", "labels": []}]
+        gh_mock = mock.Mock(return_value=mock.Mock(stdout=json.dumps(prs)))
+        with mock.patch.object(bot, "gh", gh_mock), \
+             mock.patch.object(bot, "pr_inactive_days", return_value=10.0):
+            closed = bot.close_stale_prs("gittensor-ai-lab/sparkinfer", days=2, dry_run=True)
+        self.assertEqual(closed, {99})
+        gh_mock.assert_called_once()
 
 
 if __name__ == "__main__":
