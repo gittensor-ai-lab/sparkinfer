@@ -85,7 +85,8 @@
     "date": "2026-07-13",
     "blocked": false,
     "penalty_days": 0,
-    "strike": 1,
-    "containment": 0.75
+    "strike": 0,
+    "containment": 0.07,
+    "note": "false positive cleared: per-function skv_wsum warp-shuffle matched #223 boilerplate at 94%; PR-level overlap 7%. Independent sparse-KV feature (sparse_kv.cu)."
   }
 ]
