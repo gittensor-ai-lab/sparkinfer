@@ -60,7 +60,7 @@ BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 DIFF_BOOST = os.environ.get("SPARKINFER_DIFFICULTY_BOOST", "0") == "1"
 DIFF_K     = float(os.environ.get("SPARKINFER_DIFFICULTY_K",   "8"))
 DIFF_REF   = float(os.environ.get("SPARKINFER_DIFFICULTY_REF", "365.85"))  # llama.cpp 128-tok tok/s
-DIFF_MAX   = float(os.environ.get("SPARKINFER_DIFFICULTY_MAX", "4"))
+DIFF_MAX   = float(os.environ.get("SPARKINFER_DIFFICULTY_MAX", "2"))
 
 def difficulty_mult(frontier):
     if not DIFF_BOOST or DIFF_REF <= 0:

@@ -11,7 +11,7 @@ journey from origin/main's dashboard/data.json.
 import json, subprocess, sys
 
 REF = 365.85          # llama.cpp 128-tok reference (SPARKINFER_DIFFICULTY_REF)
-DIFF_MAX = 4.0        # cap (SPARKINFER_DIFFICULTY_MAX)
+DIFF_MAX = 2.0        # cap (SPARKINFER_DIFFICULTY_MAX)
 SIG = 0.02
 BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 
