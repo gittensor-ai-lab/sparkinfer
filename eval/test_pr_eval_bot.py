@@ -215,6 +215,36 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         by2 = {r["label"]: r["tps"] for r in data["qwen35"]["ctx"]}
         self.assertEqual(by2, by)
 
+    def test_qwen35_pp_uses_measured_pp_without_scaling(self):
+        data = {
+            "qwen35": {
+                "prefill_frontier_pp": 290.57,
+                "pp": [
+                    {"label": "4k", "pp": 290.57, "ref_pp": 11104.62},
+                    {"label": "32k", "pp": 272.07, "ref_pp": 9772.31},
+                ],
+            }
+        }
+        sub = {
+            "ctx_4096_pp_tps": 295.0,
+            "ctx_32768_pp_tps": 278.5,
+            "ctx_65536_pp_tps": 260.0,
+            "ctx_131072_pp_tps": 230.0,
+            "prefill_tps": 295.0,
+            "prefill_label": "M",
+        }
+        bot._upsert_qwen35_pp(data, sub)
+        by = {r["label"]: r["pp"] for r in data["qwen35"]["pp"]}
+        self.assertEqual(by["4k"], 295.0)
+        self.assertEqual(by["32k"], 278.5)
+        self.assertEqual(by["64k"], 260.0)
+        self.assertEqual(by["128k"], 230.0)
+        self.assertEqual(data["qwen35"]["prefill_frontier_pp"], 295.0)
+        self.assertEqual(data["qwen35"]["prefill_label"], "M")
+        bot._upsert_qwen35_pp(data, sub)
+        by2 = {r["label"]: r["pp"] for r in data["qwen35"]["pp"]}
+        self.assertEqual(by2, by)
+
     def test_qwen36_ctx_uses_measured_tps_without_scaling(self):
         data = {
             "qwen36": {

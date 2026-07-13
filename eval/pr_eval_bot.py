@@ -713,6 +713,14 @@ Q35_CTX_SERIES = {
     65536:  {"label": "64k",  "ref_tps": 220.54},
     131072: {"label": "128k", "ref_tps": 220.58},
 }
+# Qwen3.5 prefill pp anchors — pinned in bench/scripts/reference.lock (RTX 5090).
+Q35_PP_ORDER = ("4k", "32k", "64k", "128k")
+Q35_PP_SERIES = {
+    4096:   {"label": "4k",   "metric": "ctx_4096_pp_tps",  "ref_pp": 11104.62, "color": "#0E8A16"},
+    32768:  {"label": "32k",  "metric": "ctx_32768_pp_tps", "ref_pp": 9772.31,  "color": "#6F42C1"},
+    65536:  {"label": "64k",  "metric": "ctx_65536_pp_tps", "ref_pp": 8153.53,  "color": "#E67E22"},
+    131072: {"label": "128k", "metric": "ctx_131072_pp_tps", "ref_pp": 5999.59, "color": "#17A2B8"},
+}
 Q36_CTX_ORDER = ("128", "512", "4k", "16k", "32k")
 # Qwen3.6-35B-A3B llama.cpp decode refs (RTX 5090) — pinned in bench/scripts/reference.lock
 Q36_LLAMA_REF = {128: 275.81, 512: 275.61, 4096: 276.3, 16384: 280.66, 32768: 279.83}
@@ -1084,6 +1092,49 @@ def _upsert_qwen35_ctx(data, sub):
         q35["ctx"] = [ctx_rows[k] for k in Q35_CTX_ORDER if k in ctx_rows]
     return changed
 
+def _upsert_qwen35_pp(data, sub):
+    """Refresh Qwen3.5 per-context prefill pp bars from a merged bidir score_qwen35 block."""
+    q35 = data.setdefault("qwen35", {})
+    pp_rows = {r.get("label"): r for r in q35.get("pp") or []}
+    changed = False
+    for ctx, meta in Q35_PP_SERIES.items():
+        measured = sub.get(meta["metric"])
+        if measured is None:
+            continue
+        new = round(float(measured), 2)
+        old = round(float((pp_rows.get(meta["label"]) or {}).get("pp") or 0), 2)
+        if old and new < old:
+            continue
+        row = pp_rows.get(meta["label"])
+        if row:
+            if old != new:
+                row["pp"] = new
+                row["color"] = meta["color"]
+                changed = True
+        else:
+            pp_rows[meta["label"]] = {
+                "label": meta["label"], "color": meta["color"],
+                "pp": new, "ref_pp": meta["ref_pp"],
+            }
+            changed = True
+    if changed:
+        q35["pp"] = [pp_rows[k] for k in Q35_PP_ORDER if k in pp_rows]
+    scored = sub.get("prefill_tps")
+    if scored is not None:
+        old_f = round(float(q35.get("prefill_frontier_pp") or 0), 2)
+        new_f = round(max(old_f, float(scored)), 2)
+        if new_f != old_f:
+            q35["prefill_frontier_pp"] = new_f
+            changed = True
+    elif changed and q35.get("pp"):
+        peak = max(float(r.get("pp") or 0) for r in q35["pp"])
+        old_f = round(float(q35.get("prefill_frontier_pp") or 0), 2)
+        if peak > old_f:
+            q35["prefill_frontier_pp"] = round(peak, 2)
+    if sub.get("prefill_label"):
+        q35["prefill_label"] = sub["prefill_label"]
+    return changed
+
 def _upsert_qwen36_ctx(data, sub):
     """Refresh Qwen3.6 per-context sparkinfer bars from a merged bidir score_qwen36 block.
 
@@ -1166,6 +1217,7 @@ def record_merge(repo, num):
             if sub.get("top1") is not None: q35["token_match"] = round(sub["top1"], 4)
             if sub.get("kl") is not None:   q35["kl"] = round(sub["kl"], 4)
             _upsert_qwen35_ctx(data, sub)
+            _upsert_qwen35_pp(data, sub)
             short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
             landed = [m for m in data.get("landed_qwen35", []) if m.get("pr") != num]
             landed.append({"name": short or f"PR #{num}", "tps": new_f, "pr": num,

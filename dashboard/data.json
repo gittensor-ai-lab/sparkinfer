@@ -4453,6 +4453,34 @@
         "tps": 159.19,
         "ref_tps": 220.58
       }
+    ],
+    "prefill_frontier_pp": 290.57,
+    "prefill_label": "XL",
+    "pp": [
+      {
+        "label": "4k",
+        "color": "#0E8A16",
+        "pp": 290.57,
+        "ref_pp": 11104.62
+      },
+      {
+        "label": "32k",
+        "color": "#6F42C1",
+        "pp": 272.07,
+        "ref_pp": 9772.31
+      },
+      {
+        "label": "64k",
+        "color": "#E67E22",
+        "pp": 256.23,
+        "ref_pp": 8153.53
+      },
+      {
+        "label": "128k",
+        "color": "#17A2B8",
+        "pp": 227.87,
+        "ref_pp": 5999.59
+      }
     ]
   },
   "landed_qwen35": [
