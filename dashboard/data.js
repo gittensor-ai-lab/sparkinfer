@@ -343,7 +343,9 @@ window.SPARKINFER = {
       "guard_32k_ratio": 1.0982,
       "guard_32k_pass": true,
       "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0267-ca7028c",
-      "proof_run": "0267-ca7028c"
+      "proof_run": "0267-ca7028c",
+      "polaris_receipt_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0267-ca7028c",
+      "polaris_receipt_hash": "f6e61cd0534f2779"
     },
     {
       "num": 353,

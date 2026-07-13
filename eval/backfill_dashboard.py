@@ -30,6 +30,24 @@ def _parse_result_log(text: str) -> dict:
     raise ValueError("RESULT_JSON not found in log")
 
 
+def _polaris_fields(run: str | None) -> dict:
+    """Attach dashboard polaris receipt links when sparkinfer-log has a TDX receipt."""
+    if not run:
+        return {}
+    try:
+        with urllib.request.urlopen(f"{LOG_BASE}/{run}/receipt.json", timeout=60) as resp:
+            receipt = json.load(resp)
+    except Exception:
+        return {}
+    if not (receipt.get("tdx") or receipt.get("attestation_type") == "tdx-quote"):
+        return {}
+    rid = receipt.get("receipt_id") or ""
+    return {
+        "polaris_receipt_url": f"https://gittensor-ai-lab.github.io/sparkinfer-log/?run={run}",
+        "polaris_receipt_hash": rid[:16] if rid else None,
+    }
+
+
 def _load_result(run: str | None, result_path: str | None) -> dict:
     if result_path:
         with open(result_path) as f:
@@ -69,6 +87,7 @@ def apply(pr_num: int, res: dict, *, merge: bool, proof_run: str | None, title: 
         proof = f"https://gittensor-ai-lab.github.io/sparkinfer-log/?run={res['id']}"
 
     bot.push_dash = lambda _msg: None  # noqa: ARG005 — local backfill only
+    res = {**res, **{k: v for k, v in _polaris_fields(proof_run or res.get("id")).items() if v}}
     bot.update_dashboard(repo, pr, areas, res, proof_url=proof)
     if merge:
         bot.record_merge(repo, pr_num)
