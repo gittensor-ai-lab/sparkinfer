@@ -81,6 +81,19 @@ class LabelPolicyTest(unittest.TestCase):
         self.assertGreaterEqual(res["effective_pct"], 10.0)
         self.assertLess(res["effective_pct"], 18.0)
 
+    def test_difficulty_boost_default_cap_is_two_x(self):
+        # Default SPARKINFER_DIFFICULTY_MAX=2: same raw gain as above, but capped boost -> lower tier.
+        res = score(484.79, frontier=469.13, ceiling=366.0, top1=0.9612, kl=0.0175,
+                    commit="c30bf58",
+                    env={"SPARKINFER_DIFFICULTY_BOOST": "1",
+                         "SPARKINFER_DIFFICULTY_REF": "365.85",
+                         "SPARKINFER_DIFFICULTY_K": "8"})
+        self.assertEqual(res["label"], "M")
+        self.assertEqual(res["difficulty_mult"], 2.0)
+        self.assertEqual(res["pct_over_frontier"], 3.3)
+        self.assertGreaterEqual(res["effective_pct"], 6.0)
+        self.assertLess(res["effective_pct"], 10.0)
+
     def test_long_context_metadata_is_preserved_in_verdict(self):
         prov = {
             "eval_mode": "longctx",
