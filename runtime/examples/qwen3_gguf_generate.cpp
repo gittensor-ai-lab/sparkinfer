@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
     if (!g.open(path)) { printf("[FAIL] cannot open %s\n", path.c_str()); return 1; }
     sparkinfer::Qwen35Config cfg;
     qwen3_config_from_gguf(g, cfg);
-    cfg.max_seq    = 2048;
+    cfg.max_seq    = std::max(2048, (int)prompt.size() + max_new + 16);
     printf("arch: %s, %d layers, hidden %d, %dQ/%dKV hd%d, %d experts top-%d, ffn %d, vocab %d\n",
            qwen3_model_label(cfg), cfg.n_layers, cfg.hidden, cfg.n_q_heads,
            cfg.n_kv_heads, cfg.head_dim, cfg.n_experts, cfg.top_k, cfg.moe_ffn, cfg.vocab);
@@ -100,6 +100,17 @@ int main(int argc, char** argv) {
     if (tg.enabled)
         printf("thermal: ON (turbo<%d°C, balanced≥%d, safe≥%d, emergency≥%d)\n",
                tg.balanced_c, tg.balanced_c, tg.safe_c, tg.emergency_c);
+
+    if (const char* pl = getenv("SPARKINFER_PREFIX_CACHE_LEN")) {
+        int n = atoi(pl);
+        if (n > 0 && n < (int)prompt.size()) {
+            std::vector<int> prefix(prompt.begin(), prompt.begin() + n);
+            if (!model.cache_prefix(prefix))
+                printf("[FAIL] cache_prefix(%d)\n", n);
+            else
+                printf("prefix_cache: installed %d / %zu prompt tokens\n", n, prompt.size());
+        }
+    }
 
     auto out = model.generate(prompt, max_new, tg.enabled ? &gov : nullptr);
     sampling.store(false, std::memory_order_relaxed);
