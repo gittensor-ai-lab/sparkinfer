@@ -18,7 +18,7 @@ it is stopped and a fresh box is provisioned via the vast API automatically; the
 
 Env: VAST_API_KEY, SSH_KEY, EVAL_TRANSPORT (vast|ssh), EVAL_SSH_HOST, EVAL_SSH_PORT, EVAL_REPO, VAST_INSTANCE_FILE.
 """
-import argparse, json, os, random, shlex, shutil, subprocess, sys, time
+import argparse, json, os, random, shlex, shutil, subprocess, sys, tempfile, time
 
 from ssh_box import ssh_box_arg, ssh_box_enabled
 
@@ -71,6 +71,7 @@ def push_bench_scripts(host, port):
     """Deploy bench/scripts harness to the eval box (prefer origin/main)."""
     tar_data = None
     source = "local checkout"
+    extract_root = "/root/sparkinfer/bench/scripts"
     # Prefer origin/main — local tree may be behind (stale harness skews baseline guards).
     subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT, capture_output=True, timeout=120)
     arch = subprocess.run(
@@ -79,7 +80,7 @@ def push_bench_scripts(host, port):
     if arch.returncode == 0 and arch.stdout:
         tar_data = arch.stdout
         source = "origin/main"
-        extract = "mkdir -p /root/sparkinfer && tar -xzf - -C /root/sparkinfer"
+        extract_root = "/root/sparkinfer"
     elif os.path.isdir(BENCH_SCRIPTS):
         tar = subprocess.run(
             ["tar", "-C", BENCH_SCRIPTS, "-czf", "-", "."],
@@ -88,18 +89,46 @@ def push_bench_scripts(host, port):
             print(f">> WARN: could not pack bench/scripts (rc={tar.returncode})")
             return
         tar_data = tar.stdout
-        extract = "mkdir -p /root/sparkinfer/bench/scripts && tar -xzf - -C /root/sparkinfer/bench/scripts"
     else:
         return
+    verify_marker = b"LLAMA_BUILD_UI=OFF"
+    tmp_path = ""
     try:
-        subprocess.run(
-            ["ssh", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
-             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=40",
-             "-p", str(port), f"root@{host}", extract],
-            input=tar_data, timeout=180, check=False)
+        with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
+            tmp.write(tar_data)
+            tmp_path = tmp.name
+        scp = subprocess.run(
+            ["scp", "-P", str(port), "-i", SSH_KEY, "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "BatchMode=yes", tmp_path, f"root@{host}:/tmp/si_bench_scripts.tgz"],
+            capture_output=True, text=True, timeout=180)
+        if scp.returncode != 0:
+            print(f">> WARN: bench/scripts scp failed (rc={scp.returncode}): {scp.stderr[-500:]}")
+            return
+        extract = (
+            f"mkdir -p {shlex.quote(extract_root)} && "
+            "tar -xzf /tmp/si_bench_scripts.tgz "
+            f"-C {shlex.quote(extract_root)} && rm -f /tmp/si_bench_scripts.tgz"
+        )
+        r = sh(host, port, extract, timeout=120)
+        if r.returncode != 0:
+            print(f">> WARN: bench/scripts extract failed (rc={r.returncode}): {(r.stdout + r.stderr)[-500:]}")
+            return
+        if verify_marker in tar_data:
+            chk = sh(host, port,
+                     "grep -c 'LLAMA_BUILD_UI=OFF' /root/sparkinfer/bench/scripts/_common.sh",
+                     timeout=30)
+            if chk.returncode != 0 or not chk.stdout.strip().isdigit() or int(chk.stdout.strip()) < 1:
+                print(">> WARN: bench/scripts sync verify failed — box may run stale harness")
+                return
         print(f">> bench/scripts synced from {source}")
     except subprocess.TimeoutExpired:
         print(">> WARN: bench/scripts sync timed out — box may run stale harness")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def sh(host, port, cmd, timeout=3600):

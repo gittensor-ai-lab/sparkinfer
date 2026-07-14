@@ -87,10 +87,31 @@ _llamacpp_clean() {  # $1=llama-bench  $2=sentinel
   [ -f "$2" ] && [ "$(sha256_of "$1")" = "$(cat "$2" 2>/dev/null)" ]
 }
 
+_llamacpp_binary_ok() {  # headless llama-bench is multi-MB; partial links are ~17KB
+  local f="$1" sz
+  [ -x "$f" ] || return 1
+  sz="$(stat -c%s "$f" 2>/dev/null || wc -c <"$f" 2>/dev/null || echo 0)"
+  [ "${sz:-0}" -gt 500000 ]
+}
+
+_llamacpp_purge_stale_build() {  # $1=bdir — drop UI tree when headless server build is required
+  local bdir="$1"
+  if [ -d "$bdir/tools/ui" ]; then
+    echo ">> llama.cpp purge stale UI build tree (headless server) ..." >&2
+    rm -rf "$bdir"
+    return 0
+  fi
+  if [ -f "$bdir/CMakeCache.txt" ] && ! grep -q 'LLAMA_BUILD_UI:BOOL=OFF' "$bdir/CMakeCache.txt" 2>/dev/null; then
+    echo ">> llama.cpp reconfigure (LLAMA_BUILD_UI=OFF for headless server) ..." >&2
+    rm -rf "$bdir"
+  fi
+}
+
 ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + tamper-checked (C2)
   local bench="$LLAMACPP_DIR/build/bin/llama-bench" srv="$LLAMACPP_DIR/build/bin/llama-server"
   local sentinel="$LLAMACPP_DIR/.si_refhash"
   local arch="$1" bdir="$LLAMACPP_DIR/build"
+  [ -x "$bench" ] && ! _llamacpp_binary_ok "$bench" && { echo ">> WARN: llama-bench looks truncated — rebuild" >&2; rm -f "$bench"; }
   [ -x "$bench" ] && [ -x "$srv" ] && _llamacpp_clean "$bench" "$sentinel" && return 0
   echo ">> (re)building llama.cpp reference (CUDA sm_$arch) ..." >&2
   if [ -n "${LLAMACPP_COMMIT:-}" ]; then
@@ -113,10 +134,7 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
     echo ">> llama.cpp NOT pinned (warn-only) — HEAD $(git -C "$LLAMACPP_DIR" rev-parse --short HEAD 2>/dev/null); set LLAMACPP_COMMIT in reference.lock" >&2
     rm -rf "$bdir"
   fi
-  if [ -f "$bdir/CMakeCache.txt" ] && ! grep -q 'LLAMA_BUILD_UI:BOOL=OFF' "$bdir/CMakeCache.txt" 2>/dev/null; then
-    echo ">> llama.cpp reconfigure (LLAMA_BUILD_UI=OFF for headless server) ..." >&2
-    rm -f "$bdir/CMakeCache.txt"
-  fi
+  _llamacpp_purge_stale_build "$bdir"
   if [ ! -f "$bdir/CMakeCache.txt" ]; then
     : > /tmp/llama_build.log
     if ! cmake -S "$LLAMACPP_DIR" -B "$bdir" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$arch" \
