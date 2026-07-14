@@ -702,6 +702,29 @@ class OnlyPrsAndBaselineCacheTest(unittest.TestCase):
                 self.assertEqual(loaded["bres"], bres)
                 self.assertIsNone(bot._load_baseline_cache("ssh:other:22"))
 
+    def test_baseline_cache_valid_rejects_stale_main(self):
+        cache = {"bres": {"commit": "abc1234", "pass": True, "tps": 300.0,
+                          "score_qwen36": {"ctx_128_tps": 300, "ctx_512_tps": 290,
+                                           "ctx_4096_tps": 280, "ctx_16384_tps": 270,
+                                           "ctx_32768_tps": 260},
+                          "score_qwen35": {"ctx_128_tps": 200, "ctx_4096_tps": 190,
+                                           "ctx_32768_tps": 180, "ctx_65536_tps": 170}}}
+        q36, q35 = {"128": 0}, {"128": 0}
+        self.assertFalse(bot._baseline_cache_valid(cache, True, q36, q35, "def5678"))
+
+    def test_baseline_cache_valid_accepts_matching_main(self):
+        bres = {
+            "commit": "abc1234", "pass": True,
+            "score_qwen36": {"ctx_128_tps": 300, "ctx_512_tps": 290, "ctx_4096_tps": 280,
+                             "ctx_16384_tps": 270, "ctx_32768_tps": 260},
+            "score_qwen35": {"ctx_128_tps": 200, "ctx_4096_tps": 190, "ctx_32768_tps": 180,
+                             "ctx_65536_tps": 170,
+                             "ctx_4096_pp_tps": 100, "ctx_32768_pp_tps": 90, "ctx_65536_pp_tps": 80},
+        }
+        cache = {"bres": bres}
+        q36, q35 = {"128": 0}, {"128": 0}
+        self.assertTrue(bot._baseline_cache_valid(cache, True, q36, q35, "abc1234"))
+
 
 class ExhaustedEvalCloseTest(unittest.TestCase):
     def test_eval_verdict_from_comment(self):

@@ -166,6 +166,28 @@ def _save_baseline_cache(box_id, q36, q35, bres):
         pass
 
 
+def _origin_main_short():
+    """Short SHA of origin/main for baseline cache invalidation after merges."""
+    r = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "origin/main"],
+                       capture_output=True, text=True)
+    return (r.stdout or "").strip() or None
+
+
+def _baseline_cache_valid(cache, bidir, q36, q35, main_commit=None):
+    """Return True when a loaded baseline cache entry is safe to reuse."""
+    if not cache:
+        return False
+    bres = cache.get("bres") or {}
+    cached_commit = bres.get("commit")
+    if main_commit and cached_commit and cached_commit != main_commit:
+        return False
+    if bidir:
+        probe36, probe35 = dict(q36), dict(q35)
+        return (_apply_bidir_ctx_from_bres(bres, probe36, probe35)
+                and _bidir_baseline_sane(probe36, probe35))
+    return bool(bres.get("pass") and bres.get("tps"))
+
+
 def _load_baseline_cache(box_id, max_age_hours=12):
     try:
         with open(BASELINE_CACHE_FILE) as f:
@@ -1787,7 +1809,7 @@ def main():
     ap.add_argument("--only-prs", default="",
                     help="comma-separated PR numbers — one baseline, then eval each (e.g. 387,389)")
     ap.add_argument("--skip-baseline", action="store_true",
-                    help="reuse cached same-box baseline from this run's first measure (≤12h, same box)")
+                    help="require cached same-box baseline (≤12h, same box, same origin/main); abort if missing")
     ap.add_argument("--reeval", action="store_true",
                     help="re-run eval even if this commit was already graded (use with --only-pr)")
     args = ap.parse_args()
@@ -2071,17 +2093,23 @@ def main():
     # --- Same-box baseline (once per bot run; reused for every PR in pending) ----------------------
     base_iid = current_instance(args.instance) if args.instance else 0
     box_id = _baseline_box_id(base_iid)
+    main_commit = _origin_main_short()
     bres = {}
-    use_baseline_cache = args.skip_baseline or (args.reeval and targeted)
-    cache = _load_baseline_cache(box_id) if use_baseline_cache else None
-    if cache and _apply_bidir_ctx_from_bres(cache.get("bres", {}), QWEN36_BASE, QWYTHOS_BASE):
-        QWEN36_BASE.update(cache["q36"])
-        QWYTHOS_BASE.update(cache["q35"])
+    cache = _load_baseline_cache(box_id)
+    cache_ok = cache and _baseline_cache_valid(cache, args.bidir, QWEN36_BASE, QWYTHOS_BASE, main_commit)
+    if cache_ok:
+        if args.bidir:
+            QWEN36_BASE.update(cache["q36"])
+            QWYTHOS_BASE.update(cache["q35"])
         bres = cache["bres"]
-        print(f">> reusing cached same-box baseline from {cache['ts']} ({box_id})")
+        print(f">> reusing cached same-box baseline from {cache['ts']} ({box_id}, main={main_commit or '?'})")
+    elif args.skip_baseline:
+        print(f">> --skip-baseline: no valid cache for {box_id} — aborting")
+        return
     else:
-        if args.skip_baseline:
-            print(f">> --skip-baseline: no valid cache for {box_id} — measuring fresh baseline")
+        if cache and main_commit and (cache.get("bres") or {}).get("commit") not in (None, main_commit):
+            print(f">> baseline cache stale (cached main={(cache.get('bres') or {}).get('commit')} "
+                  f"!= origin/main={main_commit}) — remeasuring")
         bcmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
                 *_vast_eval_transport_args(args.instance),
                 "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling),
