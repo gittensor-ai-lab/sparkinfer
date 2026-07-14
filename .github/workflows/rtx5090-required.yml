@@ -70,12 +70,23 @@ jobs:
                 core.info(`#${pr.number}: exempt — skip rtx5090 gate`);
                 return false;
               }
-              if (!rtx5090ShouldClose(pr.body)) {
+              const labels = (pr.labels || []).map(l => l.name);
+              const legacyNotTested = labels.includes('not-tested');
+              if (!legacyNotTested && !rtx5090ShouldClose(pr.body)) {
                 core.info(`#${pr.number}: no unticked RTX 5090 checkbox — ok`);
                 return false;
               }
 
               const { owner, repo } = context.repo;
+              if (legacyNotTested) {
+                for (const lab of ['test-on-5090', 'not-tested', 'needs-benchmark']) {
+                  if (labels.includes(lab)) {
+                    await github.rest.issues.removeLabel({
+                      owner, repo, issue_number: pr.number, name: lab,
+                    }).catch(() => {});
+                  }
+                }
+              }
               await github.rest.issues.createComment({
                 owner, repo, issue_number: pr.number,
                 body:

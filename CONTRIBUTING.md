@@ -83,7 +83,7 @@ end-to-end improvement (`after > before`, from `bench/scripts/bench.sh` — not 
 microbenchmark). Then the bot greenlights it (**`test-on-5090`**) and evaluates on the next poll.
 - Box ticked but the decode table empty / placeholder / no gain → **`needs-benchmark`**, not evaluated
   (fill in real numbers and it greenlights automatically).
-- Box not ticked → **`not-tested`**, not evaluated.
+- Box not ticked → **auto-closed** (same as `rtx5090-required` CI). Tick the box, fill tables, and reopen to submit.
 There is **no override** — every PR is evaluated on a real RTX 5090 only after it legitimately
 passes the gate (box ticked + real before<after decode numbers).
 

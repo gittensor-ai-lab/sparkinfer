@@ -577,6 +577,84 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertEqual(closed, {99})
         gh_mock.assert_called_once()
 
+    def _unchecked_pr(self, num, body=None, labels=None, **extra):
+        body = body or self._TEMPLATE_DECODE.format(db=300, da=320).replace("[x]", "[ ]")
+        pr = {
+            "number": num,
+            "title": f"PR {num}",
+            "labels": [{"name": n} for n in (labels or [])],
+            "isDraft": False,
+            "author": {"login": "contrib"},
+            "authorAssociation": "CONTRIBUTOR",
+        }
+        pr.update(extra)
+        return pr, body
+
+    def test_close_unchecked_closes_unticked_checkbox(self):
+        pr, body = self._unchecked_pr(10)
+        gh_calls = []
+
+        def fake_gh(args):
+            gh_calls.append(args)
+            if args[:3] == ["pr", "list", "-R"]:
+                return mock.Mock(stdout=json.dumps([pr]))
+            if args[:4] == ["pr", "view", "10", "-R"]:
+                return mock.Mock(stdout=json.dumps({"body": body}))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+             mock.patch.object(bot, "close_rtx5090_unchecked_pr") as close_one:
+            closed = bot.close_unchecked_rtx5090_prs("gittensor-ai-lab/sparkinfer")
+        self.assertEqual(closed, {10})
+        close_one.assert_called_once_with("gittensor-ai-lab/sparkinfer", 10)
+
+    def test_close_unchecked_legacy_not_tested_label(self):
+        ticked = self._TEMPLATE_DECODE.format(db=300, da=320)
+        pr, body = self._unchecked_pr(11, body=ticked, labels=["not-tested"])
+
+        def fake_gh(args):
+            if args[:3] == ["pr", "list", "-R"]:
+                return mock.Mock(stdout=json.dumps([pr]))
+            if args[:4] == ["pr", "view", "11", "-R"]:
+                return mock.Mock(stdout=json.dumps({"body": body}))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+             mock.patch.object(bot, "close_rtx5090_unchecked_pr") as close_one:
+            closed = bot.close_unchecked_rtx5090_prs("gittensor-ai-lab/sparkinfer")
+        self.assertEqual(closed, {11})
+        close_one.assert_called_once_with("gittensor-ai-lab/sparkinfer", 11)
+
+    def test_close_unchecked_skips_exempt_and_no_checkbox(self):
+        unchecked_body = self._TEMPLATE_DECODE.format(db=300, da=320).replace("[x]", "[ ]")
+        prs = [
+            self._unchecked_pr(20, isDraft=True)[0],
+            self._unchecked_pr(21, labels=["hold"])[0],
+            self._unchecked_pr(22, author={"login": "ai-hpc"})[0],
+            self._unchecked_pr(23, authorAssociation="MEMBER")[0],
+            self._unchecked_pr(24, body="docs-only, no checkbox")[0],
+            self._unchecked_pr(25)[0],
+        ]
+
+        def fake_gh(args):
+            if args[:3] == ["pr", "list", "-R"]:
+                return mock.Mock(stdout=json.dumps(prs))
+            num = args[2]
+            if args[:4] == ["pr", "view", num, "-R"]:
+                pr = next(p for p in prs if str(p["number"]) == num)
+                body = unchecked_body if pr["number"] == 25 else "docs-only"
+                return mock.Mock(stdout=json.dumps({"body": body}))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+             mock.patch.object(bot, "close_rtx5090_unchecked_pr") as close_one:
+            closed = bot.close_unchecked_rtx5090_prs("gittensor-ai-lab/sparkinfer", dry_run=True)
+        self.assertEqual(closed, {25})
+        close_one.assert_not_called()
+
+    def test_not_tested_not_in_automerge_block(self):
+        self.assertNotIn(bot.NOT_TESTED_LABEL, bot.AUTOMERGE_BLOCK_LABELS)
+
     def test_evaluated_commit_from_comment_accepts_verdict(self):
         body = bot.render({"label": "S", "pass": True, "tps": 200.0, "top1": 1.0, "kl": 0.0}, "df74674")
         self.assertEqual(bot._evaluated_commit_from_comment(body), "df74674")

@@ -204,16 +204,19 @@ AREAS = {"kernels", "runtime", "moe", "bench"}
 # real numbers showing a clear improvement (after > before) on at least one metric — checking the
 # box alone is not enough (it wasted GPU on PRs whose tables were still placeholder). States:
 # greenlit -> test-on-5090 (eval); box ticked but no valid before<after gain ->
-# needs-benchmark (skip + ask for numbers); box unticked -> not-tested (skip). There is NO manual
-# override — every eval must pass the gate on real RTX 5090 before/after numbers.
+# needs-benchmark (skip + ask for numbers); box unticked -> auto-close (rtx5090-required).
+# There is NO manual override — every eval must pass the gate on real RTX 5090 before/after numbers.
 EVAL_GATE_LABEL  = "test-on-5090"     # bot-set marker: greenlit, will be evaluated
-NOT_TESTED_LABEL = "not-tested"       # box not ticked
+NOT_TESTED_LABEL = "not-tested"       # legacy label — removed on close; no longer applied
 NEEDS_BENCH_LABEL = "needs-benchmark" # box ticked but decode/prefill tables missing/invalid/no-gain
 # Per-round merge workflow (all queued PRs graded vs the same-box main in one round):
 MERGE_FIRST_LABEL  = "merge-first"    # the round's biggest verified speedup — merge this one first
 NEEDS_REBASE_LABEL = "needs-rebase"   # also a verified speedup, but not the round winner
 REEVALUATE_LABEL   = "re-evaluate"    # winner merged → rebase onto new main; bot re-evals on push
 HOLD_LABEL         = "hold"           # maintainer override: never auto-merge this PR
+RTX5090_CLOSE_SKIP_LABELS = {HOLD_LABEL}
+RTX5090_EXEMPT_LOGINS = {"ai-hpc"}
+RTX5090_EXEMPT_ASSOC = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 STALE_PR_DAYS      = int(os.environ.get("SPARKINFER_STALE_PR_DAYS", "2"))
 STALE_CLOSE_SKIP_LABELS = {HOLD_LABEL, MERGE_FIRST_LABEL}  # protected from auto-close
 EXHAUSTED_EVAL_MAX = int(os.environ.get("SPARKINFER_EXHAUSTED_EVAL_MAX", "2"))
@@ -240,7 +243,7 @@ _GUARD_BASE_FALLBACK = {
 # changed paths, and branch protection (gh refuses if checks/reviews aren't satisfied).
 AUTO_MERGE_FIRST = os.environ.get("SPARKINFER_AUTOMERGE", "0") == "1"
 # Auto-merge is BLOCKED if the PR carries any of these labels:
-AUTOMERGE_BLOCK_LABELS = {"copycat", "copycat-warn", "flagged:gaming", "penalty", "needs-benchmark", "not-tested",
+AUTOMERGE_BLOCK_LABELS = {"copycat", "copycat-warn", "flagged:gaming", "penalty", "needs-benchmark",
                           NEEDS_REBASE_LABEL, REEVALUATE_LABEL, HOLD_LABEL, *REGRESSION_LABELS}
 # ...or touches any maintainer-owned / governance path (contributor speedups live in kernels|runtime|moe):
 AUTOMERGE_SENSITIVE = ("eval/", "bench/scripts/", ".gittensor/", ".github/", "dashboard/", "CODEOWNERS")
@@ -335,6 +338,86 @@ def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False):
     if closed:
         print(f">> close_stale_prs: {'would close' if dry_run else 'closed'} {len(closed)} PR(s): "
               f"{sorted(closed)}")
+    return closed
+
+
+def rtx5090_close_exempt(pr):
+    """Skip auto-close for drafts, hold, maintainers, and trusted bots."""
+    if pr.get("isDraft"):
+        return True
+    labels = {l["name"] for l in pr.get("labels", [])}
+    if labels & RTX5090_CLOSE_SKIP_LABELS:
+        return True
+    login = (pr.get("author") or {}).get("login", "")
+    if login in RTX5090_EXEMPT_LOGINS:
+        return True
+    if pr.get("authorAssociation") in RTX5090_EXEMPT_ASSOC:
+        return True
+    return False
+
+
+def post_rtx5090_unchecked_comment(repo, num):
+    owner, r = _owner_repo(repo)
+    body = (
+        "<!-- sparkinfer-rtx5090-required -->\n"
+        "## Closed — RTX 5090 checkbox not ticked\n\n"
+        "This PR was auto-closed because the template includes **Tested on RTX 5090** "
+        "as `- [ ]` (unchecked). Evaluation is opt-in — tick the box only after a real "
+        "5090 run.\n\n"
+        "To submit for review:\n\n"
+        "1. **Edit this PR description** (you can edit while closed): change to "
+        "`- [x] Tested on RTX 5090`\n"
+        "2. Fill the decode and/or prefill **before → after** tables with real "
+        "`bench/scripts/bench.sh` numbers showing improvement\n"
+        "3. **Reopen** this PR\n\n"
+        "If this PR does not need GPU eval (e.g. docs-only), remove the proof-of-speedup "
+        "section from the description instead of leaving an unchecked box.\n\n"
+        f"[CONTRIBUTING.md](https://github.com/{owner}/{r}/blob/main/CONTRIBUTING.md)\n\n"
+        "<sub>Automated by eval bot / rtx5090-required CI.</sub>"
+    )
+    gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+
+
+def close_rtx5090_unchecked_pr(repo, num, dry_run=False):
+    """Close one PR with unticked RTX 5090 checkbox (or legacy not-tested label)."""
+    if dry_run:
+        return True
+    for lab in (EVAL_GATE_LABEL, NOT_TESTED_LABEL, NEEDS_BENCH_LABEL):
+        if lab in labels_on(repo, num):
+            remove_label(repo, num, lab)
+    post_rtx5090_unchecked_comment(repo, num)
+    gh(["pr", "close", str(num), "-R", repo, "-c", "closed"])
+    return True
+
+
+def close_unchecked_rtx5090_prs(repo, dry_run=False):
+    """Close open PRs with unticked RTX 5090 checkbox or legacy not-tested label.
+
+    Docs-only PRs without the template checkbox are left open. Returns PR numbers closed.
+    """
+    prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open",
+                         "--json", "number,title,labels,isDraft,author,authorAssociation"]).stdout or "[]")
+    closed = set()
+    for pr in prs:
+        num = pr["number"]
+        if rtx5090_close_exempt(pr):
+            continue
+        labels = {l["name"] for l in pr.get("labels", [])}
+        legacy = NOT_TESTED_LABEL in labels
+        body = (json.loads(gh(["pr", "view", str(num), "-R", repo, "--json", "body"]).stdout or "{}")
+                .get("body") or "")
+        if not legacy and not rtx5090_should_close(body):
+            continue
+        print(f"PR #{num}: RTX 5090 unchecked{' (legacy not-tested)' if legacy else ''}"
+              f"{' — would close' if dry_run else ' — closing'}")
+        if dry_run:
+            closed.add(num)
+            continue
+        close_rtx5090_unchecked_pr(repo, num)
+        closed.add(num)
+    if closed:
+        print(f">> close_unchecked_rtx5090: {'would close' if dry_run else 'closed'} "
+              f"{len(closed)} PR(s): {sorted(closed)}")
     return closed
 
 
@@ -1805,6 +1888,9 @@ def main():
         stale_closed = close_stale_prs(args.repo, days=STALE_PR_DAYS, dry_run=args.dry_run)
         if stale_closed:
             prs = [p for p in prs if p["number"] not in stale_closed]
+        unchecked_closed = close_unchecked_rtx5090_prs(args.repo, dry_run=args.dry_run)
+        if unchecked_closed:
+            prs = [p for p in prs if p["number"] not in unchecked_closed]
     if only_set:
         prs = [p for p in prs if p["number"] in only_set]
         if not prs:
@@ -1960,8 +2046,10 @@ def main():
             _reconcile(NEEDS_BENCH_LABEL, [EVAL_GATE_LABEL, NOT_TESTED_LABEL])
             if first_time and not args.dry_run: post_needs_bench_comment(args.repo, num)
         else:  # unchecked
-            print(f"PR #{num}: not greenlit ({reason}) — mark not-tested, skip eval")
-            _reconcile(NOT_TESTED_LABEL, [EVAL_GATE_LABEL, NEEDS_BENCH_LABEL])
+            print(f"PR #{num}: not greenlit ({reason}) — close (RTX 5090 unchecked)")
+            if not args.dry_run:
+                close_rtx5090_unchecked_pr(args.repo, num)
+            continue
 
     if not args.dry_run and state_changed:
         save_copycat_log(copy_log)
