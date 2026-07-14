@@ -1,0 +1,49 @@
+name: close-stale-prs
+
+# Close open PRs with no GitHub activity for 2+ days (commits, comments, reviews, labels).
+# Skips PRs labeled `hold` or `merge-first`. Same policy as eval/pr_eval_bot.py close_stale_prs().
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Inactive days before auto-close"
+        default: "2"
+        required: false
+
+permissions:
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: close-stale-prs
+  cancel-in-progress: false
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Close stale open PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPARKINFER_STALE_PR_DAYS: ${{ github.event.inputs.days || '2' }}
+          REPO: gittensor-ai-lab/sparkinfer
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "eval")
+          import pr_eval_bot as bot
+
+          repo = os.environ.get("REPO", "gittensor-ai-lab/sparkinfer")
+          days = int(os.environ.get("SPARKINFER_STALE_PR_DAYS", "2"))
+          closed = bot.close_stale_prs(repo, days=days)
+          print(f">> close-stale-prs: closed {len(closed)} PR(s): {sorted(closed)}")
+          PY
