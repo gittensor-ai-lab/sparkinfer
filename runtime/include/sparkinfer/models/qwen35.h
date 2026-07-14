@@ -100,8 +100,9 @@ public:
     // Length of the currently cached prefix (0 if none).
     int prefix_cached_len() const;
 
-    // Time-to-first-token: prefill `prompt` then one sampled step. Reuses cache_prefix when the
-    // prompt starts with the cached tokens (only the suffix is prefilled).
+    // Time-to-first-token: ingest `prompt` with prefill (no LM head on interior tokens when
+    // not legacy), then one sampled forward. Reuses cache_prefix when the prompt starts with
+    // the cached tokens (only the suffix is prefilled). Returns seconds.
     double bench_ttft(const std::vector<int>& prompt);
 
     // Run one token at `position`. When sample=false (prefill), runs embed→layers→final
@@ -120,10 +121,6 @@ public:
     };
     // Benchmark at a target KV depth: timed prefill, untimed warmup decode, timed decode.
     BenchDecodeResult bench_decode(int warmup, int n_tokens, int context_tokens = 0);
-
-    // Time-to-first-token: ingest `prompt` with prefill (no LM head on interior tokens),
-    // then one sampled forward for the first output token. Returns seconds (lower = better).
-    double bench_ttft(const std::vector<int>& prompt);
 
     const Qwen35Config& config() const;
 
