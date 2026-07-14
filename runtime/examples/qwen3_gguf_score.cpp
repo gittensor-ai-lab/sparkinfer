@@ -65,13 +65,23 @@ int main(int argc, char** argv) {
     // seq_id); generate() allocates it — do the same here before scoring.
     if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] KV allocate\n"); return 1; }
 
+    int prefix_len = 0;
+    if (const char* pl = getenv("SPARKINFER_PREFIX_CACHE_LEN")) {
+        prefix_len = atoi(pl);
+        if (prefix_len > 0 && prefix_len < (int)toks.size()) {
+            std::vector<int> prefix(toks.begin(), toks.begin() + prefix_len);
+            if (!model.cache_prefix(prefix)) { printf("[FAIL] cache_prefix(%d)\n", prefix_len); return 1; }
+        } else prefix_len = 0;
+    }
+
     const int V = cfg.vocab;
     std::vector<float> lg(V);
     std::vector<int> idx(V);
     double nll = 0.0; int scored = 0, ammatch = 0;
     const int K = std::min(topk, V);
+    const size_t i0 = prefix_len > 0 ? (size_t)prefix_len - 1 : 0;
 
-    for (size_t i = 0; i + 1 < toks.size(); i++) {
+    for (size_t i = i0; i + 1 < toks.size(); i++) {
         int am = model.forward_token(toks[i], (int)i);   // logits predict token i+1
         model.copy_logits(lg.data());
         float mx = lg[0];
