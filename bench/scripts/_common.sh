@@ -90,25 +90,42 @@ _llamacpp_clean() {  # $1=llama-bench  $2=sentinel
 ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + tamper-checked (C2)
   local bench="$LLAMACPP_DIR/build/bin/llama-bench" srv="$LLAMACPP_DIR/build/bin/llama-server"
   local sentinel="$LLAMACPP_DIR/.si_refhash"
-  [ -x "$bench" ] && [ -x "$srv" ] && _llamacpp_clean "$bench" "$sentinel" && return
-  echo ">> (re)building llama.cpp reference (CUDA sm_$1) ..." >&2
+  local arch="$1"
+  [ -x "$bench" ] && [ -x "$srv" ] && _llamacpp_clean "$bench" "$sentinel" && return 0
+  echo ">> (re)building llama.cpp reference (CUDA sm_$arch) ..." >&2
   if [ -n "${LLAMACPP_COMMIT:-}" ]; then
-    # Reproducible + tamper-proof: a fresh shallow fetch of EXACTLY the pinned commit, not a drifting
-    # (or possibly-tampered) persisted tree. GitHub serves any reachable sha to `fetch --depth 1`.
-    rm -rf "$LLAMACPP_DIR"; mkdir -p "$LLAMACPP_DIR"
-    git -C "$LLAMACPP_DIR" init -q
-    git -C "$LLAMACPP_DIR" remote add origin "$LLAMACPP_REPO"
-    git -C "$LLAMACPP_DIR" fetch -q --depth 1 origin "$LLAMACPP_COMMIT" >&2 || { echo ">> FATAL: cannot fetch pinned llama commit $LLAMACPP_COMMIT" >&2; return 1; }
-    git -C "$LLAMACPP_DIR" checkout -q FETCH_HEAD
+    local head_ok=0
+    if [ -d "$LLAMACPP_DIR/.git" ]; then
+      [ "$(git -C "$LLAMACPP_DIR" rev-parse HEAD 2>/dev/null)" = \
+        "$(git -C "$LLAMACPP_DIR" rev-parse "$LLAMACPP_COMMIT^{commit}" 2>/dev/null)" ] && head_ok=1
+    fi
+    if [ "$head_ok" != 1 ]; then
+      rm -rf "$LLAMACPP_DIR"; mkdir -p "$LLAMACPP_DIR"
+      git -C "$LLAMACPP_DIR" init -q
+      git -C "$LLAMACPP_DIR" remote add origin "$LLAMACPP_REPO"
+      git -C "$LLAMACPP_DIR" fetch -q --depth 1 origin "$LLAMACPP_COMMIT" >&2 || {
+        echo ">> FATAL: cannot fetch pinned llama commit $LLAMACPP_COMMIT" >&2; return 1; }
+      git -C "$LLAMACPP_DIR" checkout -q FETCH_HEAD
+    fi
   else
     [ -d "$LLAMACPP_DIR/.git" ] || git clone --depth=1 "$LLAMACPP_REPO" "$LLAMACPP_DIR" >&2
     echo ">> llama.cpp NOT pinned (warn-only) — HEAD $(git -C "$LLAMACPP_DIR" rev-parse --short HEAD 2>/dev/null); set LLAMACPP_COMMIT in reference.lock" >&2
   fi
   rm -rf "$LLAMACPP_DIR/build"
-  cmake -S "$LLAMACPP_DIR" -B "$LLAMACPP_DIR/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$1" \
-        -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF $CUDA_HOST_FLAG >/dev/null 2>&1
-  cmake --build "$LLAMACPP_DIR/build" -j4 --target llama-bench llama-server >/dev/null 2>&1
-  sha256_of "$bench" > "$sentinel" 2>/dev/null || true   # record provenance for the reuse tamper-check
+  if ! cmake -S "$LLAMACPP_DIR" -B "$LLAMACPP_DIR/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$arch" \
+        -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF $CUDA_HOST_FLAG >&2; then
+    echo ">> FATAL: llama.cpp cmake configure failed" >&2; return 1
+  fi
+  # CUDA build is long (~30–45 min). Stream progress (hidden builds look like hung SSH evals).
+  if ! cmake --build "$LLAMACPP_DIR/build" -j2 --target llama-bench llama-server 2>&1 \
+        | tee /tmp/llama_build.log | awk 'NR<=5 || NR%40==0 || /Built target|error:|FAILED|fatal error/' >&2; then
+    echo ">> FATAL: llama.cpp build failed" >&2
+    tail -40 /tmp/llama_build.log >&2 || true
+    return 1
+  fi
+  [ -x "$bench" ] && [ -x "$srv" ] || { echo ">> FATAL: llama binaries missing after build" >&2; return 1; }
+  sha256_of "$bench" > "$sentinel" 2>/dev/null || true
+  echo ">> llama.cpp reference ready ($(git -C "$LLAMACPP_DIR" rev-parse --short HEAD 2>/dev/null))" >&2
 }
 
 # ---- prebuilt binaries (GitHub release) with source-build fallback ----

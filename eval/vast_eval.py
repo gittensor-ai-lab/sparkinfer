@@ -696,6 +696,16 @@ def main():
             p36_gguf = f"{MODEL_PATH}"
             p35_gguf = ""
         push_bench_scripts(host, port)
+        if args.bidir:
+            wr = sh(host, port,
+                    "cd /root/sparkinfer && LLAMACPP_DIR=/workspace/.llamacpp "
+                    "bash bench/scripts/warm_llamacpp.sh",
+                    timeout=7200)
+            if wr.returncode:
+                print(">> WARN: warm_llamacpp failed — eval will retry inline")
+                sys.stdout.write((wr.stdout + wr.stderr)[-2000:])
+            else:
+                print(">> llama.cpp reference warm on box")
         harness = "cd /root/sparkinfer && "
         if args.polaris and not args.baseline_only:
             guard_arg = f" --guard-model-file {p35_gguf}" if p35_gguf else ""

@@ -31,6 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           bash -n bench/scripts/evaluate.sh
+          bash -n bench/scripts/warm_llamacpp.sh
           bash -n eval/run_bot_cron.sh
           bash -n eval/setup_labels.sh
 
