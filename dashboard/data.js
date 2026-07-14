@@ -5306,66 +5306,72 @@ window.SPARKINFER = {
   "landed_qwen35": [
     {
       "name": "requantize dense FFN down Q6",
-      "tps": 271.85,
       "pr": 323,
       "date": "2026-07-10",
-      "label": "S"
+      "label": "S",
+      "tps": 271.85
     },
     {
       "name": "tune dense split-K and int8 ",
-      "tps": 281.63,
       "pr": 324,
       "date": "2026-07-10",
-      "label": "M"
+      "label": "M",
+      "tps": 281.63
     },
     {
       "name": "GQA-4 shared-KV tile for Qwy",
-      "tps": 272.63,
       "pr": 326,
       "date": "2026-07-10",
-      "label": "XS"
+      "label": "XS",
+      "tps": 281.63,
+      "raw_tps": 272.63
     },
     {
       "name": "Q4_K requant for Qwythos Q6 ",
-      "tps": 303.18,
       "pr": 329,
       "date": "2026-07-11",
-      "label": "M"
+      "label": "M",
+      "tps": 303.18
     },
     {
       "name": "GQA-4 shared-KV tile for Qwy",
-      "tps": 272.63,
       "pr": 327,
       "date": "2026-07-13",
-      "label": "XS"
+      "label": "XS",
+      "tps": 303.18,
+      "raw_tps": 272.63
     },
     {
       "name": "complete gate_up->quant_h->d",
-      "tps": 281.88,
       "pr": 331,
       "date": "2026-07-13",
-      "label": "XS"
+      "label": "XS",
+      "tps": 303.18,
+      "raw_tps": 281.88
     },
     {
       "name": "GQA-4 int8 MMA flash-decode ",
-      "tps": 301.07,
       "pr": 366,
       "date": "2026-07-13",
-      "label": "L"
+      "label": "L",
+      "tps": 303.18,
+      "raw_tps": 301.07
     },
     {
       "name": "tune hd256 combine for 160-s",
-      "tps": 301.24,
       "pr": 363,
       "date": "2026-07-14",
-      "label": "S"
+      "label": "S",
+      "tps": 303.18,
+      "raw_tps": 301.24
     },
     {
       "name": "sink + sliding-window sparse",
-      "tps": 300.43,
       "pr": 379,
       "date": "2026-07-14",
-      "label": "XL"
+      "label": "XL",
+      "tps": 303.18,
+      "raw_tps": 300.43
     }
   ],
   "qwen36": {

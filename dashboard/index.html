@@ -495,7 +495,11 @@
     const pts = [];
     const base = q.baseline_tps;
     if (base) pts.push({name:"origin/main", sub:"same-box baseline · 128-tok decode", tps:base, baseline:true});
-    pts.push(...L.filter(l=>!l.baseline).map(l=>({name:l.name, sub:(l.pr?"PR #"+l.pr+" · ":"")+l.date+(l.label?" · eval:"+l.label:""), tps:l.tps, live:true})));
+    pts.push(...L.filter(l=>!l.baseline).map(l=>{
+      let sub=(l.pr?"PR #"+l.pr+" · ":"")+l.date+(l.label?" · eval:"+l.label:"");
+      if(l.raw_tps && l.raw_tps!==l.tps) sub+=" · measured "+l.raw_tps;
+      return {name:l.name, sub, tps:l.tps, live:true};
+    }));
     const h = $("passes35-hint");
     if (h) {
       const f = q.frontier_tps || Math.max(0, ...L.map(l=>l.tps), base||0);

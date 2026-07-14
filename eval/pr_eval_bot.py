@@ -1252,31 +1252,45 @@ def _qwen35_baseline_from_prs(data):
     return round(guard, 2) if guard is not None else None
 
 def _rebuild_qwen35_journey(data):
-    """Recompute landed_qwen35 + baseline/frontier from stored prs rows (merge-chronological)."""
+    """Recompute landed_qwen35 + baseline/frontier from stored prs rows (merge-chronological).
+
+    Each bar is the running 128-tok frontier after that merge (monotonic ratchet), not the raw
+    same-box measurement for that PR. Raw tok/s zig-zags with box state and with PRs that target
+    long-context only; the ratchet matches Qwen3-MoE journey semantics and the headline frontier.
+    """
     existing_dates = {m["pr"]: m.get("date") for m in data.get("landed_qwen35", []) if m.get("pr")}
-    landed = []
+    pending = []
     for e in data.get("prs", []):
         if not (e.get("pass_qwen35") and e.get("label_qwen35") in SPEEDUP_LABELS):
             continue
         num = e["num"]
         sub = e.get("score_qwen35") or e
-        step = round(_qwen35_journey_tps(sub), 2)
+        raw = round(_qwen35_journey_tps(sub), 2)
         short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
-        landed.append({
+        pending.append({
             "name": short or f"PR #{num}",
-            "tps": step,
+            "raw_tps": raw,
             "pr": num,
             "date": existing_dates.get(num) or datetime.date.today().isoformat(),
             "label": e.get("label_qwen35"),
         })
-    landed.sort(key=lambda m: (m.get("date", ""), m.get("pr", 0)))
-    data["landed_qwen35"] = landed
+    pending.sort(key=lambda m: (m.get("date", ""), m.get("pr", 0)))
     q35 = data.setdefault("qwen35", {})
     bl = _qwen35_baseline_from_prs(data)
     if bl is not None:
         q35["baseline_tps"] = bl
+    running = round(float(bl or 0), 2)
+    landed = []
+    for ent in pending:
+        raw = ent.pop("raw_tps")
+        running = round(max(running, raw), 2)
+        ent["tps"] = running
+        if raw != running:
+            ent["raw_tps"] = raw
+        landed.append(ent)
+    data["landed_qwen35"] = landed
     if landed:
-        q35["frontier_tps"] = round(max(m["tps"] for m in landed), 2)
+        q35["frontier_tps"] = running
 
 def record_merge(repo, num):
     """A frontier-advancing PR was MERGED → advance the displayed frontier by its verified same-box
