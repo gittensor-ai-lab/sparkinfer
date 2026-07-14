@@ -150,7 +150,8 @@ void launch_flash_decode_global_hd512(
 );
 
 void launch_fa_combine_hd256(const float* part_m, const float* part_l, const float* part_acc,
-    void* out, int num_q_heads, int n_splits, void* out_q8, cudaStream_t stream = nullptr);
+    void* out, int num_q_heads, int n_splits, void* out_q8, cudaStream_t stream = nullptr,
+    const void* attn_gate = nullptr);
 
 // Sink + sliding-window sparse-KV (Qwythos GQA-4 hd256). Default on; SPARKINFER_SPARSE_KV=0 disables.
 void launch_fa_kv_window_select(const int* seq_lens, int* sel_blk, int num_kv_heads,

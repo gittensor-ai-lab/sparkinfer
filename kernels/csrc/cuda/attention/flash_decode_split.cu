@@ -637,13 +637,22 @@ static inline void fa_launch_combine_gated_dispatch_hd256(
 }
 
 // Standalone hd256 combine (sparse-KV path: split then combine). num_seqs=1 (decode).
+// attn_gate: optional per-element sigmoid output gate — same contract as the gated combine
+// inside launch_flash_decode_split (gate && out_q8 selects the gated kernel).
 void launch_fa_combine_hd256(
     const float* part_m, const float* part_l, const float* part_acc, void* out,
-    int num_q_heads, int n_splits, void* out_q8, cudaStream_t stream
+    int num_q_heads, int n_splits, void* out_q8, cudaStream_t stream,
+    const void* attn_gate
 ) {
-    fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc,
-        reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
-        reinterpret_cast<fa_block_q8_1*>(out_q8), 1, stream);
+    const __nv_bfloat16* gate = reinterpret_cast<const __nv_bfloat16*>(attn_gate);
+    if (gate && out_q8)
+        fa_launch_combine_gated_dispatch_hd256(part_m, part_l, part_acc,
+            reinterpret_cast<__nv_bfloat16*>(out), gate, num_q_heads, n_splits,
+            reinterpret_cast<fa_block_q8_1*>(out_q8), 1, stream);
+    else
+        fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc,
+            reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
+            reinterpret_cast<fa_block_q8_1*>(out_q8), 1, stream);
 }
 
 void launch_flash_decode_split(
