@@ -36,11 +36,17 @@ def main():
         if f.types[0] == GT.STRING: return bytes(f.parts[f.data[0]]).decode()
         return f.parts[f.data[-1]][0]
 
+    def meta_or(k, default):
+        # `meta(k) or default` would also replace a legitimate-but-falsy value (e.g. a
+        # token id of 0) with `default`; only fall back when the key is truly absent.
+        v = meta(k)
+        return default if v is None else v
+
     A = "qwen3moe."
     arch = meta("general.architecture")
     assert arch == "qwen3moe", f"expected qwen3moe arch, got {arch}"
     cfg = dict(
-        vocab=int(meta(A + "vocab_size") or 151936),
+        vocab=int(meta_or(A + "vocab_size", 151936)),
         hidden=int(meta(A + "embedding_length")),
         n_layers=int(meta(A + "block_count")),
         n_q_heads=int(meta(A + "attention.head_count")),
@@ -52,7 +58,7 @@ def main():
         moe_ffn=int(meta(A + "expert_feed_forward_length")),
         rope_theta=float(meta(A + "rope.freq_base")),
         rms_eps=float(meta(A + "attention.layer_norm_rms_epsilon")),
-        eos_id=int(meta("tokenizer.ggml.eos_token_id") or 151645),
+        eos_id=int(meta_or("tokenizer.ggml.eos_token_id", 151645)),
     )
     # vocab from token_embd if metadata missing
     ten = {t.name: t for t in r.tensors}
