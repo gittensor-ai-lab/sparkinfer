@@ -82,16 +82,26 @@ KVCacheManager::~KVCacheManager() {
 }
 
 bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
-    const int need = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
-    if ((int)impl_->free_list.size() < need || impl_->free_slots.empty()) return false;
-    if (need > kMaxBlocksPerSeq) return false;
+    // `want` is the TOTAL blocks this sequence needs for num_tokens. A sequence that
+    // already holds blocks (a re-allocate to grow a paged sequence) only needs the delta
+    // topped up. Sizing and bounding off the cumulative count — not the per-call request —
+    // is what keeps a re-allocate from double-allocating blocks and, worse, from pushing
+    // blocks.size() past kMaxBlocksPerSeq and overrunning the fixed device block-table row
+    // into the next sequence's row in the cudaMemcpy below.
+    const int want = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
+    if (want > kMaxBlocksPerSeq) return false;            // bound the TOTAL, not the delta
 
     auto& blocks = impl_->seq_blocks[seq_id];
+    const int have = (int)blocks.size();
+    const int need = (want > have) ? (want - have) : 0;   // only the additional blocks
+    const bool new_seq = impl_->seq_slot.find(seq_id) == impl_->seq_slot.end();
+    if ((int)impl_->free_list.size() < need) return false;
+    if (new_seq && impl_->free_slots.empty()) return false;  // a re-allocate already owns its slot
+
     for (int i = 0; i < need; i++) { blocks.push_back(impl_->free_list.back()); impl_->free_list.pop_back(); }
 
     int slot;
-    auto it = impl_->seq_slot.find(seq_id);
-    if (it != impl_->seq_slot.end()) slot = it->second;
+    if (!new_seq) slot = impl_->seq_slot[seq_id];
     else { slot = impl_->free_slots.back(); impl_->free_slots.pop_back(); impl_->seq_slot[seq_id] = slot; }
 
     cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * kMaxBlocksPerSeq, blocks.data(),

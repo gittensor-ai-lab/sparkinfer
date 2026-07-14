@@ -25,3 +25,7 @@ add_test(NAME decode_runner_gpu_test COMMAND decode_runner_gpu_test)
 add_executable(qwen35_gpu_test qwen35_gpu_test.cpp)
 target_link_libraries(qwen35_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME qwen35_gpu_test COMMAND qwen35_gpu_test)
+
+add_executable(kv_cache_gpu_test kv_cache_gpu_test.cpp)
+target_link_libraries(kv_cache_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME kv_cache_gpu_test COMMAND kv_cache_gpu_test)
