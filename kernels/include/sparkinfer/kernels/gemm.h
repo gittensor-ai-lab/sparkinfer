@@ -46,8 +46,8 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K,
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K,
                      cudaStream_t stream = nullptr);
 
-// Fused GEMV + sigmoid for the shared-expert gate scalar (N=1). Uses scratch_bf16
-// for the bf16 dot (same as launch_gemv) then sigmoid_scalar. SPARKINFER_GEMV_SIGMOID=1 enables.
+// Fused GEMV + sigmoid for the Qwen3.6 shared-expert gate scalar (N=1). The exact
+// K=2048 path preserves launch_gemv's bf16 rounding before sigmoid.
 void launch_gemv_sigmoid(const void* x, const void* W, void* scratch_bf16, float* y, int K,
                          cudaStream_t stream = nullptr);
 

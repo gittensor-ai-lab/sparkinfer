@@ -796,13 +796,20 @@ int Qwen35Model::forward_token(int token_id, int position) {
             cudaEventRecord(s.ev_pipe_fork, st);
             cudaStreamWaitEvent(s.stream_k, s.ev_pipe_fork, 0);
             cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
+            static int single_shared_gate_sigmoid = -1;
+            if (single_shared_gate_sigmoid < 0) {
+                const char* e = getenv("SPARKINFER_SHEXP_SINGLE_SIGMOID");
+                single_shared_gate_sigmoid = (e && e[0] == '0') ? 0 : 1;
+            }
+            bool shared_gate_sigmoid_ready = false;
             if (w.shared_gate_inp) {
                 if (s.use_pq && w.shared_gate_inp_type == 12) {
                     if (s.use_llama) {
                         if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, s.stream_k);
-                        if (H == 2048)
+                        if (H == 2048) {
                             kernels::launch_mmvq_q4k_sigmoid(s.aq81, w.shared_gate_inp, s.d_shared_w, H, s.stream_k);
-                        else
+                            shared_gate_sigmoid_ready = true;
+                        } else
                             kernels::launch_mmvq_q4k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
                     } else {
                         kernels::launch_quantize_q8_1(s.hn, s.aq8, s.aq8_d, s.aq8_s, H, s.stream_k);
@@ -816,21 +823,23 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     kernels::launch_gemv_q(s.hn, w.shared_gate_inp, w.shared_gate_inp_type,
                                            s.shared_gate_tmp, 1, H, s.stream_k);
                 } else {
-                    // Fused GEMV + sigmoid for the shared-expert gate scalar:
-                    // writes fp32 sigmoid(gate) directly, eliminating the separate
-                    // 1-thread sigmoid_scalar_kernel launch. SPARKINFER_GEMV_SIGMOID=0
-                    // restores the split path for A/B.
+                    // Qwen3.6's K=2048 scalar gate can retain the GEMV bf16
+                    // rounding and apply sigmoid in its reduction kernel.
+                    // SPARKINFER_GEMV_SIGMOID=0 restores the separate launch.
                     static int gemv_sigmoid = -1;
                     if (gemv_sigmoid < 0) { const char* e = getenv("SPARKINFER_GEMV_SIGMOID");
-                        gemv_sigmoid = (e && e[0] == '1') ? 1 : 0; }   // default off: fused dot != split-k GEMV
-                    if (gemv_sigmoid) {
+                        gemv_sigmoid = (e && e[0] == '0') ? 0 : 1; }
+                    if (gemv_sigmoid && qmoe && single_shared_gate_sigmoid) {
                         kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.shared_gate_tmp, s.d_shared_w, H, s.stream_k);
+                        shared_gate_sigmoid_ready = true;
                     } else {
                         kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
-                        kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
                     }
                 }
-                if (w.shared_gate_inp && !(s.use_pq && s.use_llama && w.shared_gate_inp_type == 12 && H == 2048))
+                if (!shared_gate_sigmoid_ready)
+                    kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
+                if (!single_shared_gate_sigmoid &&
+                    !(s.use_pq && s.use_llama && w.shared_gate_inp_type == 12 && H == 2048))
                     kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
             }
             if (qmoe) {
@@ -912,14 +921,16 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 }
                 continue;
             }
+            bool shared_gate_sigmoid_ready = false;
             if (w.shared_gate_inp) {
                 if (s.gguf) {
                     if (s.use_pq && w.shared_gate_inp_type == 12) {
                         if (s.use_llama) {
                             if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, st);
-                            if (H == 2048)
+                            if (H == 2048) {
                                 kernels::launch_mmvq_q4k_sigmoid(s.aq81, w.shared_gate_inp, s.d_shared_w, H, st);
-                            else
+                                shared_gate_sigmoid_ready = true;
+                            } else
                                 kernels::launch_mmvq_q4k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
                         } else {
                             kernels::launch_quantize_q8_1(s.hn, s.aq8, s.aq8_d, s.aq8_s, H, st);
@@ -934,18 +945,19 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     } else {
                         static int gs2 = -1;
                         if (gs2 < 0) { const char* e = getenv("SPARKINFER_GEMV_SIGMOID");
-                            gs2 = (e && e[0] == '1') ? 1 : 0; }
-                        if (gs2) {
+                            gs2 = (e && e[0] == '0') ? 0 : 1; }
+                        if (gs2 && qmoe) {
                             kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.shared_gate_tmp, s.d_shared_w, H, st);
+                            shared_gate_sigmoid_ready = true;
                         } else {
                             kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
-                            kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
                         }
                     }
                 } else {
                     kernels::launch_gemm(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, 1, H, 1.f, 0.f, gc, st);
-                    kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
                 }
+                if (!shared_gate_sigmoid_ready)
+                    kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
             }
             if (s.gguf) {
                 if (qmoe) {

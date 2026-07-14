@@ -213,15 +213,15 @@ __device__ __forceinline__ void si_warp_bitonic_top8(
 // CUDA-graph replay); the last block to arrive reads all 256 logits and runs the same bitonic top-8
 // in-kernel. Removes the separate top-k launch and its dependent-load gap from the decode critical
 // path. Byte-identical logits + selection to gemv_f32 + kernel6. Requires num_experts==256, K%8==0.
-template <int SPL>
+template <int SPL, int RPB>
 __global__ void moe_router_fused_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ W,
     float* __restrict__ logits, unsigned int* __restrict__ gridctr,
     int* __restrict__ expert_ids, float* __restrict__ expert_weights,
     int N, int K, int top_k, int normalize)
 {
-    constexpr int RPB = 8 / SPL;
-    __shared__ float s_part[8 / SPL][SPL];
+    static_assert(RPB > 0 && RPB * SPL <= 32, "invalid router block shape");
+    __shared__ float s_part[RPB][SPL];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row_local = warp / SPL, split = warp % SPL;
     const int n = blockIdx.x * RPB + row_local;
@@ -299,11 +299,29 @@ void launch_moe_router(
 void launch_router_fused(const void* x, const void* W, float* logits, unsigned int* gridctr,
                          int* expert_ids, float* expert_weights,
                          int num_experts, int K, int top_k, int normalize, cudaStream_t stream) {
-    constexpr int SPL = 4, RPB = 8 / SPL;              // GEMV_WPB = 8, matches gemv_f32_sk<float,4>
-    dim3 grid((num_experts + RPB - 1) / RPB);
-    moe_router_fused_kernel<SPL><<<grid, 8 * 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W),
-        logits, gridctr, expert_ids, expert_weights, num_experts, K, top_k, normalize);
+    constexpr int SPL = 4;
+    static int rpb = -1;
+    if (rpb < 0) {
+        const char* e = getenv("SPARKINFER_ROUTER_RPB");
+        rpb = e ? atoi(e) : 4;
+        if (!(rpb == 1 || rpb == 2 || rpb == 4)) rpb = 4;
+    }
+    if (rpb == 1) {
+        dim3 grid(num_experts);
+        moe_router_fused_kernel<SPL, 1><<<grid, SPL * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W),
+            logits, gridctr, expert_ids, expert_weights, num_experts, K, top_k, normalize);
+    } else if (rpb == 4) {
+        dim3 grid((num_experts + 3) / 4);
+        moe_router_fused_kernel<SPL, 4><<<grid, 4 * SPL * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W),
+            logits, gridctr, expert_ids, expert_weights, num_experts, K, top_k, normalize);
+    } else {
+        dim3 grid((num_experts + 1) / 2);
+        moe_router_fused_kernel<SPL, 2><<<grid, 2 * SPL * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W),
+            logits, gridctr, expert_ids, expert_weights, num_experts, K, top_k, normalize);
+    }
 }
 #endif
 

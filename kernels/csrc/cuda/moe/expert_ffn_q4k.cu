@@ -463,6 +463,51 @@ __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4, const
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
 }
 
+// The fixed Qwen3.6 gate/up mapping provides L directly in [0, 15]. Keep the
+// generic Q4_K helper's dot and floating-point accumulation order while
+// removing its temporary arrays and iqs reconstruction.
+__device__ __forceinline__ float si_vec_dot_q4_K_qwen(
+    const si_block_q4_K* bq4, const si_block_q8_1* bq8_1, int L
+) {
+    const int bq8_offset = (L >> 2) << 1;
+    const int qpos = L & 3;
+    const int* q4 = reinterpret_cast<const int*>(bq4->qs + 16 * bq8_offset + 4 * qpos);
+    const int v0 = q4[0], v1 = q4[4];
+    const unsigned short* scales = reinterpret_cast<const unsigned short*>(bq4->scales);
+    const int j = L >> 2;
+    unsigned short aux0, aux1;
+    if (j < 2) {
+        aux0 = scales[j] & 0x3f3f;
+        aux1 = scales[j + 2] & 0x3f3f;
+    } else {
+        aux0 = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+        aux1 = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2);
+    }
+
+    const si_block_q8_1* bq80 = bq8_1 + bq8_offset;
+    const si_block_q8_1* bq81 = bq80 + 1;
+    const int* q80 = reinterpret_cast<const int*>(bq80->qs) + qpos;
+    const int* q81 = reinterpret_cast<const int*>(bq81->qs) + qpos;
+    const int u00 = q80[0], u01 = q80[4];
+    const int u10 = q81[0], u11 = q81[4];
+    const float d0 = __low2float(bq80->ds), d1 = __low2float(bq81->ds);
+
+    const int v00 = v0 & 0x0F0F0F0F, v10 = v1 & 0x0F0F0F0F;
+    const int dot10 = __dp4a(v10, u01, __dp4a(v00, u00, 0));
+    const int dot20 = __dp4a(0x01010101, u01, __dp4a(0x01010101, u00, 0));
+    float sumf_d = 0.f, sumf_m = 0.f;
+    sumf_d += d0 * (dot10 * (aux0 & 0xff));
+    sumf_m += d0 * (dot20 * (aux1 & 0xff));
+
+    const int v01 = (v0 >> 4) & 0x0F0F0F0F, v11 = (v1 >> 4) & 0x0F0F0F0F;
+    const int dot11 = __dp4a(v11, u11, __dp4a(v01, u10, 0));
+    const int dot21 = __dp4a(0x01010101, u11, __dp4a(0x01010101, u10, 0));
+    sumf_d += d1 * (dot11 * ((aux0 >> 8) & 0xff));
+    sumf_m += d1 * (dot21 * ((aux1 >> 8) & 0xff));
+    const float2 dm4f = __half22float2(bq4->dm);
+    return dm4f.x * sumf_d - dm4f.y * sumf_m;
+}
+
 // Q5_K int8 dp4a vec-dot for the MoE down. Q5_K is Q4_K plus one high bit per quant (qh[32]), so
 // this reuses the faithful Q4_K vec_dot structure (same qs / scales / activation indexing, same
 // iqs = 2*L convention as si_vec_dot_q4_K) and only widens each 4-bit weight to 5 bits. The qh bit
@@ -506,6 +551,57 @@ __device__ __forceinline__ float si_vec_dot_q5_K(const si_block_q5_K* bq5, const
     float2 dm5f = __half22float2(bq5->dm);
     return dm5f.x * sumf_d - dm5f.y * sumf_m;
 }
+
+// The fixed Qwen3.6 Q5_K path uses one 32-lane dot per selected expert.
+// This retains the generic helper's arithmetic order while avoiding its small
+// temporary arrays and loop-index reconstruction.
+__device__ __forceinline__ float si_vec_dot_q5_K_qwen(
+    const si_block_q5_K* bq5, const si_block_q8_1* bq8_1, int L
+) {
+    const int bq8_offset = (L >> 2) << 1;
+    const int qpos = L & 3;
+    const int* q4 = reinterpret_cast<const int*>(bq5->qs + 16 * bq8_offset + 4 * qpos);
+    const int v0 = q4[0], v1 = q4[4];
+    const int* qhp = reinterpret_cast<const int*>(bq5->qh + 4 * qpos);
+    const int qh0 = qhp[0], qh1 = qhp[4];
+    const unsigned short* scales = reinterpret_cast<const unsigned short*>(bq5->scales);
+    const int j = L >> 2;
+    unsigned short aux0, aux1;
+    if (j < 2) {
+        aux0 = scales[j] & 0x3f3f;
+        aux1 = scales[j + 2] & 0x3f3f;
+    } else {
+        aux0 = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+        aux1 = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2);
+    }
+
+    const si_block_q8_1* bq80 = bq8_1 + bq8_offset;
+    const si_block_q8_1* bq81 = bq80 + 1;
+    const int* q80 = reinterpret_cast<const int*>(bq80->qs) + qpos;
+    const int* q81 = reinterpret_cast<const int*>(bq81->qs) + qpos;
+    const int u00 = q80[0], u01 = q80[4];
+    const int u10 = q81[0], u11 = q81[4];
+    const float d0 = __low2float(bq80->ds), d1 = __low2float(bq81->ds);
+    const int hs0 = bq8_offset;
+    const int v00 = (v0 & 0x0F0F0F0F) | (((qh0 >> hs0) & 0x01010101) << 4);
+    const int v10 = (v1 & 0x0F0F0F0F) | (((qh1 >> hs0) & 0x01010101) << 4);
+    const int dot10 = __dp4a(v00, u00, __dp4a(v10, u01, 0));
+    const int dot20 = __dp4a(0x01010101, u00, __dp4a(0x01010101, u01, 0));
+    float sumf_d = 0.f, sumf_m = 0.f;
+    sumf_d += d0 * (dot10 * (aux0 & 0xff));
+    sumf_m += d0 * (dot20 * (aux1 & 0xff));
+
+    const int hs1 = bq8_offset + 1;
+    const int v01 = ((v0 >> 4) & 0x0F0F0F0F) | (((qh0 >> hs1) & 0x01010101) << 4);
+    const int v11 = ((v1 >> 4) & 0x0F0F0F0F) | (((qh1 >> hs1) & 0x01010101) << 4);
+    const int dot11 = __dp4a(v01, u10, __dp4a(v11, u11, 0));
+    const int dot21 = __dp4a(0x01010101, u10, __dp4a(0x01010101, u11, 0));
+    sumf_d += d1 * (dot11 * ((aux0 >> 8) & 0xff));
+    sumf_m += d1 * (dot21 * ((aux1 >> 8) & 0xff));
+    float2 dm5f = __half22float2(bq5->dm);
+    return dm5f.x * sumf_d - dm5f.y * sumf_m;
+}
+
 __global__ void gate_up_mmvq2_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
@@ -539,14 +635,14 @@ __global__ void gate_up_mmvq2_kernel(
 
 // ---- Qwen3.6 shared expert (Q8_0 gate/up/down, F=512) -------------------------
 // Reuses the FNQ Q8_1(hn) buffer for gate/up dp4a (same trick as routed MoE mmvq),
-// then overwrites that scratch with Q8_1(h) for the down dp4a. One 4-warp block/row
-// for gate/up (64 Q8_0 blocks/row); one warp/row for down (2048 rows, K=512).
-template <int H, int F>
+// then overwrites that scratch with Q8_1(h) for the down dp4a. Qwen3.6 has 64 Q8_0
+// blocks/row, so the specialized two-warp launch keeps every lane productive.
+template <int H, int F, int NW>
 __global__ void shared_gate_up_q8_mmvq_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
     float* __restrict__ h_scratch) {
-    constexpr int NW = 4, WS = 32;
+    constexpr int WS = 32;
     const int f = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
     const int nblk = H >> 5;
     const unsigned char* gbase = gate_q + (size_t)f * nblk * 34;
@@ -627,6 +723,7 @@ __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
     float* __restrict__ h_scratch, int n_rows, int pdl
 ) {
+    if (pdl) si_pdl_lc();
     constexpr int NW = 4, WS = 32;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int group = warp >> 2, group_warp = warp & 3;
@@ -655,7 +752,48 @@ __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+}
+
+// Qwen3.6's routed FFN is always H=2048, F=512, TOPK=8. Its pack-two
+// grid has exactly 2048 CTAs per token, so every subgroup maps to a valid
+// row. Keep the same lane-to-Q4_K mapping and reduction order as pack2 while
+// removing its dynamic row tail and shape arithmetic.
+template <bool QWEN_DOT>
+__global__ void gate_up_mmvq2_pack2_qwen_2048_512_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int pdl
+) {
     if (pdl) si_pdl_lc();
+    constexpr int NW = 4, WS = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int group = warp >> 2, group_warp = warp & 3;
+    const int row = blockIdx.x * 2 + group;
+    const int ts = row >> 9, f = row & 511, tok = ts >> 3;
+    const int e = expert_ids[ts];
+    const int tid4 = group_warp * WS + lane;
+    const int kbx = tid4 >> 4;
+    const int kqs = 2 * (tid4 & 15);
+    const si_block_q8_1* vrow = vy + (size_t)tok * 64;
+    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * 512 + f) * 8 * 144);
+    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * 512 + f) * 8 * 144);
+    float tg, tu;
+    if constexpr (QWEN_DOT) {
+        tg = si_vec_dot_q4_K_qwen(g_row + kbx, vrow + (size_t)kbx * 8, kqs >> 1);
+        tu = si_vec_dot_q4_K_qwen(u_row + kbx, vrow + (size_t)kbx * 8, kqs >> 1);
+    } else {
+        tg = si_vec_dot_q4_K(g_row + kbx, vrow + (size_t)kbx * 8, kqs);
+        tu = si_vec_dot_q4_K(u_row + kbx, vrow + (size_t)kbx * 8, kqs);
+    }
+    __shared__ float sg[2][NW - 1][WS], su[2][NW - 1][WS];
+    if (group_warp > 0) { sg[group][group_warp - 1][lane] = tg; su[group][group_warp - 1][lane] = tu; }
+    __syncthreads();
+    if (group_warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) { tg += sg[group][l][lane]; tu += su[group][l][lane]; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+    if (lane == 0) h_scratch[(size_t)ts * 512 + f] = q4kf_silu(tg) * tu;
 }
 
 template <int H, int F, int TOPK>
@@ -931,6 +1069,47 @@ __global__ void down_q5k_mmvq_splitk_kernel(
         #pragma unroll
         for (int s = 0; s < S; s++) o += s_part[hh_local][s];
         output[(size_t)token * H + hh] = __float2bfloat16(o);
+    }
+}
+
+// Qwen3.6 UD's routed down path is always H=2048, F=512, top_k=8. At its
+// measured S=8 split each warp owns one selected expert and its 32 Q5_K dot
+// lanes (two superblocks). Specializing that mapping removes the generic
+// flattened-work divide/modulo and shape-dependent address math without
+// changing the dot or reduction order.
+template <int H>
+__global__ void down_q5k_mmvq_splitk_qwen_s8_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int pdl
+) {
+    if (pdl) si_pdl_sync();
+    constexpr int S = 8, NBLK = 2, Q8PB = NBLK * 8;
+    __shared__ float s_part[S];
+    const int token = blockIdx.x, lane = threadIdx.x & 31;
+    const int split = threadIdx.x >> 5;
+    const int hh = blockIdx.y;
+    float acc = 0.f;
+    if (hh < H) {
+        const int ts = token * 8 + split;
+        const int e = expert_ids[ts];
+        const int kbx = lane >> 4;
+        const int L = lane & 15;
+        const si_block_q5_K* drow = reinterpret_cast<const si_block_q5_K*>(
+            down_q + ((size_t)e * H + hh) * NBLK * 176);
+        const si_block_q8_1* h8 = hq8 + (size_t)ts * Q8PB;
+        acc = expert_weights[ts] * si_vec_dot_q5_K_qwen(drow + kbx, h8 + (size_t)kbx * 8, L);
+
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (lane == 0) s_part[split] = acc;
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+        float out = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) out += s_part[s];
+        output[(size_t)token * H + hh] = __float2bfloat16(out);
     }
 }
 
@@ -1235,6 +1414,11 @@ static inline bool launch_down_q5k_mmvq_splitk(
     int H, int F, int top_k, cudaStream_t stream
 ) {
     const dim3 block(WPB * 32);
+    if (S == 8 && H == 2048 && F == 512 && top_k == 8) {
+        launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_qwen_s8_kernel<2048>,
+            down_q, expert_ids, expert_weights, hq8, output, pdl);
+        return true;
+    }
     switch (S) {
         case 2: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
         case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
@@ -1316,6 +1500,10 @@ void launch_moe_expert_ffn_q4k(
     if (gu_spec < 0) { const char* gs = getenv("SPARKINFER_GU_SPEC"); gu_spec = (gs && gs[0] == '0') ? 0 : 1; }
     static int gu_pack2 = -1;
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
+    static int gu_qwen_static = -1;
+    if (gu_qwen_static < 0) { const char* gqs = getenv("SPARKINFER_GU_QWEN_STATIC"); gu_qwen_static = (gqs && gqs[0] == '0') ? 0 : 1; }
+    static int gu_q4dot_qwen = -1;
+    if (gu_q4dot_qwen < 0) { const char* gqd = getenv("SPARKINFER_GU_Q4DOT_QWEN"); gu_q4dot_qwen = (gqd && gqd[0] == '0') ? 0 : 1; }
     const int gu_pdl = gu_mmvq_pdl();
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
@@ -1329,7 +1517,19 @@ void launch_moe_expert_ffn_q4k(
                 reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
             q = qbuf;
         }
-        if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+        if (gu_pack2 && gu_spec && gu_qwen_static && hidden == 2048 && ffn == 512 && top_k == 8) {
+            if (gu_q4dot_qwen)
+                launch_pdl_kernel(gu_pdl, dim3(num_tokens * 2048), dim3(8 * 32), 0, stream,
+                    gate_up_mmvq2_pack2_qwen_2048_512_kernel<true>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+            else
+                launch_pdl_kernel(gu_pdl, dim3(num_tokens * 2048), dim3(8 * 32), 0, stream,
+                    gate_up_mmvq2_pack2_qwen_2048_512_kernel<false>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+        }
+        else if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
             launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 1) / 2), dim3(8 * 32), 0, stream,
                 gate_up_mmvq2_pack2_qwen_kernel<2048, 512, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
@@ -1523,9 +1723,21 @@ void launch_shared_expert_q8_mmvq(
             reinterpret_cast<const __nv_bfloat16*>(input), qbuf, hidden);
         vy = qbuf;
     }
-    shared_gate_up_q8_mmvq_kernel<2048, 512><<<ffn, 4 * 32, 0, stream>>>(
-        vy, reinterpret_cast<const unsigned char*>(gate_q),
-        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    static int gu_warps = -1;
+    if (gu_warps < 0) {
+        const char* e = getenv("SPARKINFER_SHEXP_GU_WARPS");
+        gu_warps = e ? atoi(e) : 2;
+        if (!(gu_warps == 2 || gu_warps == 4)) gu_warps = 2;
+    }
+    if (gu_warps == 4) {
+        shared_gate_up_q8_mmvq_kernel<2048, 512, 4><<<ffn, 4 * 32, 0, stream>>>(
+            vy, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    } else {
+        shared_gate_up_q8_mmvq_kernel<2048, 512, 2><<<ffn, 2 * 32, 0, stream>>>(
+            vy, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    }
     const int nqb = ffn >> 5;
     quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
         h_scratch, qbuf, nqb, 0);
