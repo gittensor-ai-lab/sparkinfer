@@ -31,6 +31,22 @@ jobs:
         with:
           ref: main
 
+      - name: Close PRs with unticked RTX 5090 checkbox
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: gittensor-ai-lab/sparkinfer
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "eval")
+          import pr_eval_bot as bot
+
+          repo = os.environ.get("REPO", "gittensor-ai-lab/sparkinfer")
+          closed = bot.close_unchecked_rtx5090_prs(repo)
+          print(f">> close-unchecked-rtx5090: closed {len(closed)} PR(s): {sorted(closed)}")
+          PY
+
       - name: Close stale open PRs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
