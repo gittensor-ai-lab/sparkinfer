@@ -147,6 +147,53 @@ def _bidir_baseline_sane(q36, q35):
     """Reject dashboard stubs / failed sweeps (Qwen3.6 ~400+, Qwythos ~120+ on 5090)."""
     return q36.get("128", 0) >= 200 and q35.get("128", 0) >= 80
 
+BASELINE_CACHE_FILE = os.path.join(HERE, ".baseline_cache.json")
+
+
+def _baseline_box_id(instance=0):
+    if ssh_box_enabled():
+        h, p = ssh_box_endpoint()
+        return f"ssh:{h}:{p}"
+    return f"vast:{instance or current_instance(0)}"
+
+
+def _save_baseline_cache(box_id, q36, q35, bres):
+    try:
+        with open(BASELINE_CACHE_FILE, "w") as f:
+            json.dump({"box": box_id, "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                       "q36": q36, "q35": q35, "bres": bres}, f)
+    except OSError:
+        pass
+
+
+def _load_baseline_cache(box_id, max_age_hours=12):
+    try:
+        with open(BASELINE_CACHE_FILE) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("box") != box_id:
+        return None
+    try:
+        ts = datetime.datetime.fromisoformat(data["ts"].replace("Z", "+00:00"))
+        age_h = (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds() / 3600
+        if age_h > max_age_hours:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return data
+
+
+def _parse_only_prs(only_pr, only_prs):
+    out = set()
+    if only_pr:
+        out.add(int(only_pr))
+    for part in (only_prs or "").split(","):
+        part = part.strip()
+        if part:
+            out.add(int(part))
+    return out
+
 # Subsystem buckets for the deterministic area:<name> label (from a PR's top-level changed
 # dirs — no AI). Categorization/display only: SN74 scoring is speedup-only (the eval:* tier),
 # NOT a per-subsystem budget.
@@ -169,6 +216,8 @@ REEVALUATE_LABEL   = "re-evaluate"    # winner merged → rebase onto new main; 
 HOLD_LABEL         = "hold"           # maintainer override: never auto-merge this PR
 STALE_PR_DAYS      = int(os.environ.get("SPARKINFER_STALE_PR_DAYS", "2"))
 STALE_CLOSE_SKIP_LABELS = {HOLD_LABEL, MERGE_FIRST_LABEL}  # protected from auto-close
+EXHAUSTED_EVAL_MAX = int(os.environ.get("SPARKINFER_EXHAUSTED_EVAL_MAX", "2"))
+FAIL_VERDICT_LABELS = frozenset({"none", "REJECT"})
 CONTEXT_LABELS     = {"128-context", "512-context", "4k-context", "16k-context", "32k-context",
                       "64k-context", "128k-context"}
 REGRESSION_LABELS  = {"regression-128", "regression-512", "regression-4k", "regression-16k",
@@ -286,6 +335,64 @@ def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False):
     if closed:
         print(f">> close_stale_prs: {'would close' if dry_run else 'closed'} {len(closed)} PR(s): "
               f"{sorted(closed)}")
+    return closed
+
+
+def _eval_verdict_from_comment(body):
+    """Return eval tier label from a completed auto-eval comment, or None."""
+    if _evaluated_commit_from_comment(body) is None:
+        return None
+    m = re.search(r"\|\s*\*\*label\*\*\s*\|\s*`eval:([^`]+)`", body)
+    return m.group(1) if m else None
+
+
+def none_reject_eval_count(repo, num):
+    """Count completed auto-eval comments whose verdict is none or REJECT."""
+    r = gh(["pr", "view", str(num), "-R", repo, "--json", "comments"])
+    n = 0
+    for c in json.loads(r.stdout or "{}").get("comments", []):
+        if _eval_verdict_from_comment(c.get("body", "")) in FAIL_VERDICT_LABELS:
+            n += 1
+    return n
+
+
+def close_exhausted_eval_prs(repo, max_none_reject=EXHAUSTED_EVAL_MAX, dry_run=False):
+    """Close open PRs with more than `max_none_reject` completed none/REJECT evals.
+
+    Default max is 2 — a third none or REJECT triggers auto-close. Skips `hold`, `merge-first`,
+    and draft PRs. Returns PR numbers closed (or would-close in dry-run).
+    """
+    if max_none_reject < 0:
+        return set()
+    prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open",
+                         "--json", "number,title,labels,isDraft"]).stdout or "[]")
+    closed = set()
+    for pr in prs:
+        num = pr["number"]
+        if pr.get("isDraft"):
+            continue
+        labels = {l["name"] for l in pr.get("labels", [])}
+        if labels & STALE_CLOSE_SKIP_LABELS:
+            continue
+        count = none_reject_eval_count(repo, num)
+        if count <= max_none_reject:
+            continue
+        print(f"PR #{num}: {count} none/REJECT eval(s) (limit >{max_none_reject})"
+              f"{' — would close' if dry_run else ' — closing'}")
+        if dry_run:
+            closed.add(num)
+            continue
+        body = ("<!-- sparkinfer-exhausted -->\n"
+                f"## Closed: {count} evaluations with no verified speedup or rejection\n\n"
+                f"This PR received **{count}** completed sparkinfer auto-evaluations labeled "
+                f"`eval:none` or `eval:REJECT` (limit: more than {max_none_reject}).\n\n"
+                "Open a fresh PR if you have a new optimization to try.")
+        gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+        if gh(["pr", "close", str(num), "-R", repo]).returncode == 0:
+            closed.add(num)
+    if closed:
+        print(f">> close_exhausted_eval_prs: {'would close' if dry_run else 'closed'} "
+              f"{len(closed)} PR(s): {sorted(closed)}")
     return closed
 
 
@@ -1596,6 +1703,10 @@ def main():
                     help="disable Polaris TDX receipts (overrides POLARIS=1)")
     ap.add_argument("--only-pr", type=int, default=0,
                     help="evaluate only this PR number (must be open)")
+    ap.add_argument("--only-prs", default="",
+                    help="comma-separated PR numbers — one baseline, then eval each (e.g. 387,389)")
+    ap.add_argument("--skip-baseline", action="store_true",
+                    help="reuse cached same-box baseline from this run's first measure (≤12h, same box)")
     ap.add_argument("--reeval", action="store_true",
                     help="re-run eval even if this commit was already graded (use with --only-pr)")
     args = ap.parse_args()
@@ -1688,14 +1799,16 @@ def main():
     prs = json.loads(gh(["pr", "list", "-R", args.repo, "--state", "open",
                          "--json", "number,headRefName,headRefOid,title,isCrossRepository,labels,isDraft,mergeable,updatedAt"]).stdout or "[]")
     prs.sort(key=lambda p: p["number"])
-    if not args.only_pr:
+    only_set = _parse_only_prs(args.only_pr, args.only_prs)
+    targeted = bool(only_set)
+    if not targeted:
         stale_closed = close_stale_prs(args.repo, days=STALE_PR_DAYS, dry_run=args.dry_run)
         if stale_closed:
             prs = [p for p in prs if p["number"] not in stale_closed]
-    if args.only_pr:
-        prs = [p for p in prs if p["number"] == args.only_pr]
+    if only_set:
+        prs = [p for p in prs if p["number"] in only_set]
         if not prs:
-            print(f"PR #{args.only_pr} not open"); return
+            print(f"PR(s) {sorted(only_set)} not open"); return
     if not prs:
         print("no open PRs"); return
 
@@ -1834,7 +1947,10 @@ def main():
             for L in drop:
                 if L in pr_labels: remove_label(args.repo, num, L)
         status, reason = greenlight_status(args.repo, num, pr_labels)
-        if status == "ok":
+        if targeted:
+            print(f"PR #{num}: maintainer-targeted eval (greenlight: {status} — {reason})")
+            pending.append((pr, num, branch, oid, ref, areas))
+        elif status == "ok":
             print(f"PR #{num}: greenlit ({reason})")
             _reconcile(EVAL_GATE_LABEL, [NOT_TESTED_LABEL, NEEDS_BENCH_LABEL])
             pending.append((pr, num, branch, oid, ref, areas))
@@ -1866,49 +1982,59 @@ def main():
     if PINNED_INSTANCE and not ssh_box_enabled():
         with open(INSTANCE_FILE, "w") as f: f.write(PINNED_INSTANCE)
 
-    # --- Same-box baseline -------------------------------------------------------------------------
+    # --- Same-box baseline (once per bot run; reused for every PR in pending) ----------------------
     base_iid = current_instance(args.instance) if args.instance else 0
-    bcmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
-            *_vast_eval_transport_args(args.instance),
-            "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling),
-            "--eval-mode", "longctx", "--keep"]
-    if args.bidir:
-        bcmd += ["--bidir", "--primary-quant", args.primary_quant, "--baseline-only"]
-        # Do NOT pass guard baselines here — evaluate_bidir must measure fresh on-box.
-    if PINNED_INSTANCE and not ssh_box_enabled() and str(base_iid) == PINNED_INSTANCE:
-        bcmd.append("--pinned")
-    box_label = ssh_box_arg() if ssh_box_enabled() else f"instance {base_iid}"
-    print(f">> measuring same-box baseline (origin/main) on {box_label} ...")
-    br = subprocess.run(bcmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
-    if br.returncode == PINNED_RETRY_RC:
-        tail = next((l for l in reversed((br.stdout + br.stderr).splitlines()) if l.strip()), "")
-        print(f">> {tail}\n>> aborting this run — next scheduled run retries the pinned box."); return
-    for l in br.stdout.splitlines():
-        if l.startswith("NEW_INSTANCE_ID "):
-            try:
-                nid = int(l.split()[1])
-                with open(INSTANCE_FILE, "w") as f: f.write(str(nid))
-                if PINNED_INSTANCE: _write_pin(nid)
-                print(f"  (instance updated to {nid}{'; re-pinned' if PINNED_INSTANCE else ''})")
-            except Exception: pass
-    bline = next((l for l in br.stdout.splitlines() if l.startswith("RESULT_JSON")), None)
-    bres = json.loads(bline[len("RESULT_JSON "):]) if bline else {}
-    if not bres.get("label"):
-        log = (br.stdout + br.stderr)[-1200:]
-        print(f">> same-box baseline (origin/main) failed ({bres.get('label','no result')}) — "
-              f"aborting; no PRs graded.\n{log}"); return
-    if args.bidir and not (bres.get("pass") or bres.get("score_qwen35") or bres.get("score_qwen36")):
-        log = (br.stdout + br.stderr)[-1200:]
-        print(f">> bidir baseline (origin/main) failed — aborting; no PRs graded.\n{log}"); return
-    if args.bidir:
-        if not _apply_bidir_ctx_from_bres(bres, QWEN36_BASE, QWYTHOS_BASE) or not _bidir_baseline_sane(QWEN36_BASE, QWYTHOS_BASE):
+    box_id = _baseline_box_id(base_iid)
+    bres = {}
+    use_baseline_cache = args.skip_baseline or (args.reeval and targeted)
+    cache = _load_baseline_cache(box_id) if use_baseline_cache else None
+    if cache and _apply_bidir_ctx_from_bres(cache.get("bres", {}), QWEN36_BASE, QWYTHOS_BASE):
+        QWEN36_BASE.update(cache["q36"])
+        QWYTHOS_BASE.update(cache["q35"])
+        bres = cache["bres"]
+        print(f">> reusing cached same-box baseline from {cache['ts']} ({box_id})")
+    else:
+        if args.skip_baseline:
+            print(f">> --skip-baseline: no valid cache for {box_id} — measuring fresh baseline")
+        bcmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
+                *_vast_eval_transport_args(args.instance),
+                "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling),
+                "--eval-mode", "longctx", "--keep"]
+        if args.bidir:
+            bcmd += ["--bidir", "--primary-quant", args.primary_quant, "--baseline-only"]
+        if PINNED_INSTANCE and not ssh_box_enabled() and str(base_iid) == PINNED_INSTANCE:
+            bcmd.append("--pinned")
+        box_label = ssh_box_arg() if ssh_box_enabled() else f"instance {base_iid}"
+        print(f">> measuring same-box baseline (origin/main) on {box_label} ...")
+        br = subprocess.run(bcmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
+        if br.returncode == PINNED_RETRY_RC:
+            tail = next((l for l in reversed((br.stdout + br.stderr).splitlines()) if l.strip()), "")
+            print(f">> {tail}\n>> aborting this run — next scheduled run retries the pinned box."); return
+        for l in br.stdout.splitlines():
+            if l.startswith("NEW_INSTANCE_ID "):
+                try:
+                    nid = int(l.split()[1])
+                    with open(INSTANCE_FILE, "w") as f: f.write(str(nid))
+                    if PINNED_INSTANCE: _write_pin(nid)
+                    print(f"  (instance updated to {nid}{'; re-pinned' if PINNED_INSTANCE else ''})")
+                except Exception: pass
+        bline = next((l for l in br.stdout.splitlines() if l.startswith("RESULT_JSON")), None)
+        bres = json.loads(bline[len("RESULT_JSON "):]) if bline else {}
+        if not bres.get("label"):
             log = (br.stdout + br.stderr)[-1200:]
-            print(f">> bidir baseline measurement invalid (need live ctx sweep, not dashboard defaults) — "
+            print(f">> same-box baseline (origin/main) failed ({bres.get('label','no result')}) — "
                   f"aborting; no PRs graded.\n{log}"); return
-    if not args.bidir and (not bres.get("pass") or not bres.get("tps")):
-        log = (br.stdout + br.stderr)[-1200:]
-        print(f">> same-box baseline (origin/main) failed ({bres.get('label','no result')}) — "
-              f"aborting; no PRs graded.\n{log}"); return
+        if args.bidir and not (bres.get("pass") or bres.get("score_qwen35") or bres.get("score_qwen36")):
+            log = (br.stdout + br.stderr)[-1200:]
+            print(f">> bidir baseline (origin/main) failed — aborting; no PRs graded.\n{log}"); return
+        if args.bidir:
+            if not _apply_bidir_ctx_from_bres(bres, QWEN36_BASE, QWYTHOS_BASE) or not _bidir_baseline_sane(QWEN36_BASE, QWYTHOS_BASE):
+                log = (br.stdout + br.stderr)[-1200:]
+                print(f">> bidir baseline measurement invalid — aborting; no PRs graded.\n{log}"); return
+        if not args.bidir and (not bres.get("pass") or not bres.get("tps")):
+            log = (br.stdout + br.stderr)[-1200:]
+            print(f">> same-box baseline (origin/main) failed — aborting; no PRs graded.\n{log}"); return
+        _save_baseline_cache(box_id, dict(QWEN36_BASE), dict(QWYTHOS_BASE), bres)
     if args.bidir:
         run_baseline = float(QWEN36_BASE["128"])
         run_guard_128 = float(QWEN36_BASE["128"])
