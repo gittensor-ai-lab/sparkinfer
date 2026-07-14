@@ -83,20 +83,41 @@ KVCacheManager::~KVCacheManager() {
 
 bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
     const int need = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
-    if ((int)impl_->free_list.size() < need || impl_->free_slots.empty()) return false;
     if (need > kMaxBlocksPerSeq) return false;
 
     auto& blocks = impl_->seq_blocks[seq_id];
-    for (int i = 0; i < need; i++) { blocks.push_back(impl_->free_list.back()); impl_->free_list.pop_back(); }
+    const int have = (int)blocks.size();
+    if (have >= need) {
+        auto it = impl_->seq_slot.find(seq_id);
+        return it != impl_->seq_slot.end();
+    }
+    const int grow = need - have;
+    if ((int)impl_->free_list.size() < grow) return false;
 
     int slot;
     auto it = impl_->seq_slot.find(seq_id);
     if (it != impl_->seq_slot.end()) slot = it->second;
-    else { slot = impl_->free_slots.back(); impl_->free_slots.pop_back(); impl_->seq_slot[seq_id] = slot; }
+    else {
+        if (impl_->free_slots.empty()) return false;
+        slot = impl_->free_slots.back();
+        impl_->free_slots.pop_back();
+        impl_->seq_slot[seq_id] = slot;
+    }
+
+    for (int i = 0; i < grow; i++) {
+        blocks.push_back(impl_->free_list.back());
+        impl_->free_list.pop_back();
+    }
 
     cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * kMaxBlocksPerSeq, blocks.data(),
                   blocks.size() * sizeof(int), cudaMemcpyHostToDevice), "copy block table");
     return true;
+}
+
+int KVCacheManager::allocated_tokens(uint64_t seq_id) const {
+    auto it = impl_->seq_blocks.find(seq_id);
+    if (it == impl_->seq_blocks.end()) return 0;
+    return (int)it->second.size() * impl_->cfg.block_size;
 }
 
 void KVCacheManager::free(uint64_t seq_id) {

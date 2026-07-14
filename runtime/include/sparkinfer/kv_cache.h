@@ -30,8 +30,12 @@ public:
     explicit KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes);
     ~KVCacheManager();
 
-    // Allocate physical blocks for a new sequence; returns false if OOM
+    // Allocate physical blocks for a sequence (grows if already allocated).
+    // Returns false if OOM. Idempotent when num_tokens fits existing allocation.
     bool allocate(uint64_t seq_id, int num_tokens);
+
+    // Tokens already covered by the current block allocation for seq_id (0 if none).
+    int allocated_tokens(uint64_t seq_id) const;
 
     // Free all blocks owned by a sequence
     void free(uint64_t seq_id);

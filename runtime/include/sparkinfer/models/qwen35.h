@@ -86,8 +86,23 @@ public:
 
     // Greedy generate: prompt token ids -> generated token ids (host). An optional ThermalGovernor
     // paces decode under thermal pressure (accuracy-preserving); nullptr = full speed, no overhead.
+    // When a prefix cache is installed (cache_prefix), skips re-prefilling the matching prefix.
     std::vector<int> generate(const std::vector<int>& prompt_ids, int max_new_tokens,
                               ThermalGovernor* gov = nullptr);
+
+    // Prefill `tokens` and retain KV + hybrid recurrent state for reuse on the next request
+    // whose prompt starts with the same token sequence. Returns false on allocation failure.
+    bool cache_prefix(const std::vector<int>& tokens);
+
+    // Drop the installed prefix cache and free its KV blocks.
+    void clear_prefix_cache();
+
+    // Length of the currently cached prefix (0 if none).
+    int prefix_cached_len() const;
+
+    // Time-to-first-token: prefill `prompt` then one sampled step. Reuses cache_prefix when the
+    // prompt starts with the cached tokens (only the suffix is prefilled).
+    double bench_ttft(const std::vector<int>& prompt);
 
     // Run one token at `position`, return the argmax next-token id.
     int forward_token(int token_id, int position);
@@ -106,6 +121,9 @@ public:
     const Qwen35Config& config() const;
 
 private:
+    void invalidate_decode_graph();
+    bool prompt_matches_prefix(const std::vector<int>& prompt) const;
+
     struct Impl;
     Impl* p_;
 };

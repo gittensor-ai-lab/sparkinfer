@@ -152,8 +152,29 @@ static bool init_session(BenchSession& s, const std::string& path, int max_ctx, 
 static int run_single(const std::string& path, int n_tokens, int context_tokens) {
     BenchSession s;
     if (!init_session(s, path, context_tokens, n_tokens)) return 1;
+
+    const int suffix_len = (context_tokens > 0 && getenv("SPARKINFER_BENCH_PREFIX_TTFT"))
+        ? std::max(0, atoi(getenv("SPARKINFER_BENCH_PREFIX_TTFT")))
+        : 0;
+    if (suffix_len > 0 && context_tokens > suffix_len) {
+        std::vector<int> prefix((size_t)(context_tokens - suffix_len), 100);
+        std::vector<int> full((size_t)context_tokens, 100);
+        s.model->clear_prefix_cache();
+        double cold = s.model->bench_ttft(full);
+        if (!s.model->cache_prefix(prefix)) {
+            printf("[FAIL] cache_prefix(%d tokens)\n", (int)prefix.size());
+            return 1;
+        }
+        double warm = s.model->bench_ttft(full);
+        s.model->clear_prefix_cache();
+        printf("prefix_ttft  : cold %.3f s (full %d tok) · warm %.3f s (reuse %d + suffix %d)\n",
+               cold, context_tokens, warm, (int)prefix.size(), suffix_len);
+        if (warm > 0. && cold > 0.)
+            printf("prefix_speedup: %.1fx TTFT on cached prefix\n", cold / warm);
+    }
+
     auto bench = s.model->bench_decode(8, n_tokens, context_tokens);
-  auto gpu = sparkinfer::query_gpu_stats();
+    auto gpu = sparkinfer::query_gpu_stats();
     printf("\n=== sparkinfer bench (%s) ===\n", s.gguf_mode ? "Q4_K_M native" : "bf16");
     printf("model        : %s  (%d layers, %d experts top-%d)\n",
            qwen3_model_label(s.cfg), s.cfg.n_layers, s.cfg.n_experts, s.cfg.top_k);

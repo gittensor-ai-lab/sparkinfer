@@ -171,6 +171,12 @@ struct Qwen35Model::Impl {
     bool use_router_fused = true; // default ON (256-expert path): fuse the router GEMV + bitonic top-k
                                   // into one kernel (grid-completion), dropping the top-k launch. =0 disables
 
+    // Prefix KV reuse (Genie-style warm prompt): cache_prefix() retains KV + GDN state.
+    std::vector<int> prefix_tokens;
+    int prefix_len = 0;
+    int prefix_next = -1;
+    bool prefix_active = false;
+
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
 
@@ -1103,23 +1109,126 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     return out;
 }
 
+void Qwen35Model::invalidate_decode_graph() {
+    Impl& s = *p_;
+    if (s.graph_ready) {
+        cudaGraphExecDestroy(s.cu_exec);
+        cudaGraphDestroy(s.cu_graph);
+        s.cu_exec = nullptr;
+        s.cu_graph = nullptr;
+        s.graph_ready = false;
+        s.graph_attn_mode = -1;
+        s.graph_sparse = false;
+    }
+}
+
+bool Qwen35Model::prompt_matches_prefix(const std::vector<int>& prompt) const {
+    const Impl& s = *p_;
+    if (!s.prefix_active || s.prefix_len <= 0) return false;
+    if (prompt.size() < (size_t)s.prefix_len) return false;
+    for (int i = 0; i < s.prefix_len; i++)
+        if (prompt[(size_t)i] != s.prefix_tokens[(size_t)i]) return false;
+    return true;
+}
+
+bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
+    Impl& s = *p_;
+    clear_prefix_cache();
+    if (tokens.empty()) return false;
+    if (tokens.size() > (size_t)s.cfg.max_seq) return false;
+    invalidate_decode_graph();
+    if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) return false;
+    int next = -1;
+    for (size_t i = 0; i < tokens.size(); i++)
+        next = forward_token(tokens[i], (int)i);
+    cudaDeviceSynchronize();
+    s.prefix_tokens = tokens;
+    s.prefix_len = (int)tokens.size();
+    s.prefix_next = next;
+    s.prefix_active = true;
+    return true;
+}
+
+void Qwen35Model::clear_prefix_cache() {
+    Impl& s = *p_;
+    if (s.prefix_active || s.kv->allocated_tokens(s.seq_id) > 0) {
+        s.kv->free(s.seq_id);
+        invalidate_decode_graph();
+    }
+    s.prefix_tokens.clear();
+    s.prefix_len = 0;
+    s.prefix_next = -1;
+    s.prefix_active = false;
+}
+
+int Qwen35Model::prefix_cached_len() const { return p_->prefix_active ? p_->prefix_len : 0; }
+
+double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
+    Impl& s = *p_;
+    if (prompt.empty()) return 0.;
+    const bool reuse = prompt_matches_prefix(prompt);
+    if (!reuse) {
+        clear_prefix_cache();
+        invalidate_decode_graph();
+        if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) return -1.;
+    } else if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
+        return -1.;
+    }
+    const int start = reuse ? s.prefix_len : 0;
+    if (getenv("SPARKINFER_DEBUG_PREFIX"))
+        fprintf(stderr, "[prefix] ttft n=%zu start=%d reuse=%d cached=%d\n",
+                prompt.size(), start, (int)reuse, s.prefix_len);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (size_t i = (size_t)start; i < prompt.size(); i++) {
+        (void)forward_token(prompt[i], (int)i);
+        cudaDeviceSynchronize();
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    if (!reuse) {
+        s.kv->free(s.seq_id);
+        invalidate_decode_graph();
+    }
+    return std::chrono::duration<double>(t1 - t0).count();
+}
+
 std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
     Impl& s = *p_;
     std::vector<int> out;
     if (prompt.empty()) return out;
-    if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
+
+    const bool reuse = prompt_matches_prefix(prompt);
+    if (!reuse) {
+        clear_prefix_cache();
+        invalidate_decode_graph();
+        if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
+            fprintf(stderr, "[qwen35] KV allocate failed (pool too small for max_seq=%d)\n", s.cfg.max_seq);
+            return out;
+        }
+    } else if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
         fprintf(stderr, "[qwen35] KV allocate failed (pool too small for max_seq=%d)\n", s.cfg.max_seq);
         return out;
     }
-    int next = -1;
-    for (size_t i = 0; i < prompt.size(); i++) next = forward_token(prompt[i], (int)i);
+
+    int next = reuse ? s.prefix_next : -1;
+    const int start = reuse ? s.prefix_len : 0;
+    for (size_t i = (size_t)start; i < prompt.size(); i++)
+        next = forward_token(prompt[i], (int)i);
+
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);
         if (next == s.cfg.eos_id) break;
         next = forward_token(next, (int)prompt.size() + i);
-        if (gov) gov->pace();   // thermally-adaptive decode pacing (accuracy-preserving; no-op if disabled)
+        if (gov) gov->pace();
     }
+
     s.kv->free(s.seq_id);
+    if (reuse) {
+        s.prefix_tokens.clear();
+        s.prefix_len = 0;
+        s.prefix_next = -1;
+        s.prefix_active = false;
+        invalidate_decode_graph();
+    }
     return out;
 }
 
