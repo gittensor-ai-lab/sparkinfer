@@ -488,22 +488,21 @@
       legItem("#D14D72","ai-hpc v0.3.3 long-context POC")+
       legItem("#B8860B","landed on context frontier")));
   })();
-  // Qwen3.5 journey — Qwythos-9B frontier (128/512/4k only).
+  // Qwen3.5 journey — Qwythos-9B 128-tok decode frontier (merge-chronological).
   (function(){
-    const q = D.qwen35 || {}; const L = D.landed_qwen35 || [];
+    const q = D.qwen35 || {};
+    const L = [...(D.landed_qwen35 || [])].sort((a,b)=>(a.date||"").localeCompare(b.date||"")||(a.pr||0)-(b.pr||0));
     const pts = [];
-    const base = q.baseline_tps || q.guard_128_baseline;
-    if (base) pts.push({name:"origin/main", sub:"same-box baseline · RTX 5090", tps:base, baseline:true});
+    const base = q.baseline_tps;
+    if (base) pts.push({name:"origin/main", sub:"same-box baseline · 128-tok decode", tps:base, baseline:true});
     pts.push(...L.filter(l=>!l.baseline).map(l=>({name:l.name, sub:(l.pr?"PR #"+l.pr+" · ":"")+l.date+(l.label?" · eval:"+l.label:""), tps:l.tps, live:true})));
     const h = $("passes35-hint");
     if (h) {
-      const f = q.frontier_tps || (pts.length ? pts[pts.length-1].tps : 0);
-      const b = base || f;
+      const f = q.frontier_tps || Math.max(0, ...L.map(l=>l.tps), base||0);
+      const b = base || (pts.length ? pts[0].tps : f);
       if (b && f) {
-      let t = `${b} → ${f} tok/s · ${q.ref_tps?((f/q.ref_tps)*100).toFixed(0)+'% of '+q.ref_name+' '+q.ref_tps:'—'}`;
-      if (q.prefill_frontier_pp) t += ` · prefill ${q.prefill_frontier_pp} pp tok/s${q.prefill_label?' (eval-prefill:'+q.prefill_label+')':''}`;
-      h.textContent = t;
-    }
+        h.textContent = `${b} → ${f} tok/s · 128-tok decode · ${q.ref_tps?((f/q.ref_tps)*100).toFixed(0)+'% of '+q.ref_name+' '+q.ref_tps:'—'}`;
+      }
     }
     if (!pts.length && q.ref_tps) {
       pts.push({name:"llama.cpp", sub:"reference · 128-tok decode", tps:q.ref_tps, llama:true, fixed:true});

@@ -5234,8 +5234,8 @@
     "hf_avatar": "assets/img/huggingface.svg",
     "hf_downloads": 1985221,
     "arch": "dense hybrid Gated-DeltaNet + full-attn · 9B · hd256",
-    "frontier_tps": 298.27,
-    "baseline_tps": 298.27,
+    "frontier_tps": 303.18,
+    "baseline_tps": 256.95,
     "ref_name": "llama.cpp",
     "ref_tps": 220.84,
     "token_match": 0.9326,
@@ -5319,46 +5319,52 @@
     },
     {
       "name": "GQA-4 shared-KV tile for Qwy",
-      "tps": 281.63,
+      "tps": 272.63,
       "pr": 326,
       "date": "2026-07-10",
-      "label": "XS",
-      "attribution": "maintainer #334"
-    },
-    {
-      "name": "complete gate_up->quant_h->d",
-      "tps": 298.27,
-      "pr": 331,
-      "date": "2026-07-13",
       "label": "XS"
     },
     {
+      "name": "Q4_K requant for Qwythos Q6 ",
+      "tps": 303.18,
+      "pr": 329,
+      "date": "2026-07-11",
+      "label": "M"
+    },
+    {
       "name": "GQA-4 shared-KV tile for Qwy",
-      "tps": 298.27,
+      "tps": 272.63,
       "pr": 327,
       "date": "2026-07-13",
       "label": "XS"
     },
     {
+      "name": "complete gate_up->quant_h->d",
+      "tps": 281.88,
+      "pr": 331,
+      "date": "2026-07-13",
+      "label": "XS"
+    },
+    {
       "name": "GQA-4 int8 MMA flash-decode ",
-      "tps": 298.27,
+      "tps": 301.07,
       "pr": 366,
       "date": "2026-07-13",
       "label": "L"
     },
     {
+      "name": "tune hd256 combine for 160-s",
+      "tps": 301.24,
+      "pr": 363,
+      "date": "2026-07-14",
+      "label": "S"
+    },
+    {
       "name": "sink + sliding-window sparse",
-      "tps": 298.27,
+      "tps": 300.43,
       "pr": 379,
       "date": "2026-07-14",
       "label": "XL"
-    },
-    {
-      "name": "Q4_K requant for Qwythos Q6",
-      "tps": 303.18,
-      "pr": 329,
-      "date": "2026-07-11",
-      "label": "M"
     }
   ],
   "qwen36": {

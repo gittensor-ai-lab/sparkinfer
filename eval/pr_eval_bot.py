@@ -1009,6 +1009,15 @@ def sync_merged_dashboard(repo, limit=40):
         by_num = {p["num"]: p for p in data.get("prs", [])}
     if synced:
         print(f">> sync_merged_dashboard: applied {synced} merge(s)")
+    # Repair Qwen3.5 journey from prs rows (fixes stale cumulative-bar plateau / wrong sort).
+    data = load_dash()
+    if data is not None:
+        before = json.dumps(data.get("landed_qwen35", []), sort_keys=True)
+        _rebuild_qwen35_journey(data)
+        if json.dumps(data.get("landed_qwen35", []), sort_keys=True) != before:
+            data["updated"] = datetime.date.today().isoformat()
+            write_dash(data)
+            push_dash("dashboard: repair Qwen3.5 optimization journey")
 
 def _scaled_context_tps(old_tps, measured_tps, guard_tps):
     if measured_tps is None:
@@ -1221,6 +1230,53 @@ def _qwen36_journey_tps(sub):
     """128-token headline for Qwen3.6 journey steps (matches chart hint + landed history)."""
     return float(sub.get("ctx_128_tps") or sub.get("tps") or 0)
 
+def _qwen35_journey_tps(sub):
+    """128-token decode headline for Qwen3.5 journey (not longctx best-context tps)."""
+    return float(sub.get("ctx_128_tps") or sub.get("tps") or 0)
+
+def _qwen35_baseline_from_prs(data):
+    """Same-box origin/main 128-tok speed before the first landed Qwen3.5 optimization."""
+    earliest_num, guard = None, None
+    for e in data.get("prs", []):
+        if not (e.get("pass_qwen35") and e.get("label_qwen35") in SPEEDUP_LABELS):
+            continue
+        num = e.get("num")
+        if num is None:
+            continue
+        sub = e.get("score_qwen35") or e
+        g = sub.get("guard_128_baseline")
+        if g is None:
+            continue
+        if earliest_num is None or num < earliest_num:
+            earliest_num, guard = num, float(g)
+    return round(guard, 2) if guard is not None else None
+
+def _rebuild_qwen35_journey(data):
+    """Recompute landed_qwen35 + baseline/frontier from stored prs rows (merge-chronological)."""
+    existing_dates = {m["pr"]: m.get("date") for m in data.get("landed_qwen35", []) if m.get("pr")}
+    landed = []
+    for e in data.get("prs", []):
+        if not (e.get("pass_qwen35") and e.get("label_qwen35") in SPEEDUP_LABELS):
+            continue
+        num = e["num"]
+        sub = e.get("score_qwen35") or e
+        step = round(_qwen35_journey_tps(sub), 2)
+        short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
+        landed.append({
+            "name": short or f"PR #{num}",
+            "tps": step,
+            "pr": num,
+            "date": existing_dates.get(num) or datetime.date.today().isoformat(),
+            "label": e.get("label_qwen35"),
+        })
+    landed.sort(key=lambda m: (m.get("date", ""), m.get("pr", 0)))
+    data["landed_qwen35"] = landed
+    q35 = data.setdefault("qwen35", {})
+    bl = _qwen35_baseline_from_prs(data)
+    if bl is not None:
+        q35["baseline_tps"] = bl
+    if landed:
+        q35["frontier_tps"] = round(max(m["tps"] for m in landed), 2)
 
 def record_merge(repo, num):
     """A frontier-advancing PR was MERGED → advance the displayed frontier by its verified same-box
@@ -1257,20 +1313,11 @@ def record_merge(repo, num):
         if e.get("pass_qwen35") and e.get("label_qwen35") in SPEEDUP_LABELS:
             sub = e.get("score_qwen35") or e
             q35 = data.setdefault("qwen35", {})
-            old_f = round(q35.get("frontier_tps") or q35.get("baseline_tps") or 0, 2)
-            new_f = round(max(old_f, sub.get("tps") or 0), 2)
-            q35["frontier_tps"] = new_f
-            if not q35.get("baseline_tps") and sub.get("guard_128_baseline"):
-                q35["baseline_tps"] = round(float(sub["guard_128_baseline"]), 2)
             if sub.get("top1") is not None: q35["token_match"] = round(sub["top1"], 4)
             if sub.get("kl") is not None:   q35["kl"] = round(sub["kl"], 4)
             _upsert_qwen35_ctx(data, sub)
             _upsert_qwen35_pp(data, sub)
-            short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
-            landed = [m for m in data.get("landed_qwen35", []) if m.get("pr") != num]
-            landed.append({"name": short or f"PR #{num}", "tps": new_f, "pr": num,
-                           "date": datetime.date.today().isoformat(), "label": e.get("label_qwen35")})
-            data["landed_qwen35"] = sorted(landed, key=lambda m: m["tps"])
+            _rebuild_qwen35_journey(data)
             changed = True
         if changed:
             data["updated"] = datetime.date.today().isoformat()

@@ -342,6 +342,25 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         by2 = {r["label"]: r["pp"] for r in data["qwen35"]["pp"]}
         self.assertEqual(by2, by)
 
+    def test_qwen35_journey_tps_prefers_ctx_128(self):
+        self.assertEqual(bot._qwen35_journey_tps({"tps": 283.28, "ctx_128_tps": 300.43}), 300.43)
+
+    def test_rebuild_qwen35_journey(self):
+        data = {
+            "prs": [
+                {"num": 323, "title": "perf(qwen35): first", "pass_qwen35": True, "label_qwen35": "S",
+                 "score_qwen35": {"ctx_128_tps": 271.85, "guard_128_baseline": 256.95, "tps": 271.85}},
+                {"num": 379, "title": "perf(attn): long", "pass_qwen35": True, "label_qwen35": "XL",
+                 "score_qwen35": {"ctx_128_tps": 300.43, "tps": 283.28, "guard_128_baseline": 301.01}},
+            ],
+            "landed_qwen35": [{"pr": 379, "tps": 298.27, "name": "wrong", "date": "2026-07-14"}],
+            "qwen35": {"frontier_tps": 298.27, "baseline_tps": 298.27},
+        }
+        bot._rebuild_qwen35_journey(data)
+        self.assertEqual(data["qwen35"]["baseline_tps"], 256.95)
+        self.assertEqual(data["qwen35"]["frontier_tps"], 300.43)
+        self.assertEqual([m["tps"] for m in data["landed_qwen35"]], [271.85, 300.43])
+
     def test_qwen36_ctx_uses_measured_tps_without_scaling(self):
         data = {
             "qwen36": {
