@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     std::vector<int> idx(V);
     double nll = 0.0; int scored = 0, ammatch = 0;
     const int K = std::min(topk, V);
-    const size_t i0 = prefix_len > 0 ? (size_t)prefix_len - 1 : 0;
+    const size_t i0 = prefix_len > 0 ? (size_t)prefix_len : 0;
 
     for (size_t i = i0; i + 1 < toks.size(); i++) {
         int am = model.forward_token(toks[i], (int)i);   // logits predict token i+1
