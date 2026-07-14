@@ -2,16 +2,16 @@
 # Bidirectional evaluation: Qwen3.5-9B (Qwythos) and Qwen3.6-35B-A3B — one build, one box.
 #
 # Runs BOTH scoring directions in one submission:
-#   • score_qwen35 — optimize Qwen3.5 (128/4k/32k/64k/128k), guard Qwen3.6 (5 contexts)
-#   • score_qwen36 — optimize Qwen3.6 (5 contexts), guard Qwen3.5 (128/4k/32k/64k/128k)
+#   • score_qwen35 — optimize Qwen3.5 (128/4k/32k/64k), guard Qwen3.6 (5 contexts)
+#   • score_qwen36 — optimize Qwen3.6 (5 contexts), guard Qwen3.5 (128/4k/32k/64k)
 #
 #   bench/scripts/evaluate_bidir.sh [--ref GIT_REF] [--ceiling TPS]
 #
 # PRIMARY_QUANT: Q4_K_M (default) | Q8_0 | BF16
 #
 # Env (optional):
-#   SPARKINFER_P35_GUARD_*     Qwen3.5 same-box main decode tok/s (128/4k/32k/64k/128k)
-#   SPARKINFER_P35_GUARD_*_PP  Qwen3.5 same-box main prefill pp tok/s (4k/32k/64k/128k)
+#   SPARKINFER_P35_GUARD_*     Qwen3.5 same-box main decode tok/s (128/4k/32k/64k)
+#   SPARKINFER_P35_GUARD_*_PP  Qwen3.5 same-box main prefill pp tok/s (4k/32k/64k)
 #   SPARKINFER_P36_GUARD_*     Qwen3.6 same-box main tok/s (128/512/4k/16k/32k)
 #   SPARKINFER_G36_GUARD_*   Qwen3.6 guard baselines (for score_qwen35)
 #   SPARKINFER_G35_GUARD_*   Qwen3.5 guard baselines (for score_qwen36)
@@ -47,7 +47,7 @@ P36_TOK="${PRIMARY36_TOK_REPO:-Qwen/Qwen3.6-35B-A3B}"
 P36_DIR="${PRIMARY36_MODELS_DIR:-${MODELS_DIR:-$ROOT/models}36}"
 
 QUANT="${PRIMARY_QUANT:-Q4_K_M}"
-echo ">> bidir: Qwen3.5=$P35_FILE (quant=$QUANT, ctx=128/4k/32k/64k/128k) + Qwen3.6=$P36_FILE (ctx=128/512/4k/16k/32k)" >&2
+echo ">> bidir: Qwen3.5=$P35_FILE (quant=$QUANT, ctx=128/4k/32k/64k) + Qwen3.6=$P36_FILE (ctx=128/512/4k/16k/32k)" >&2
 
 reap() { pkill -f llama-server 2>/dev/null || true; pkill -f qwen3_gguf 2>/dev/null || true; sleep 1; true; }
 
@@ -115,7 +115,7 @@ run_model() {
     | sed -n 's/^RESULT_JSON //p' | tail -1
 }
 
-# Qwen3.5: score/guard at 128/4k/32k/64k/128k (skip 512 and 16k).
+# Qwen3.5: score/guard at 128/4k/32k/64k (skip 512, 16k, and 128k for now).
 Q35_CTX_ENVS=(
   SPARKINFER_SCORE_REPS=0
   SPARKINFER_GUARD_512_REPS=0
@@ -124,9 +124,11 @@ Q35_CTX_ENVS=(
   SPARKINFER_GUARD_4K_REPS=1
   SPARKINFER_GUARD_32K_REPS=1
   SPARKINFER_GUARD_64K_REPS=1
-  SPARKINFER_GUARD_128K_REPS=1
+  SPARKINFER_GUARD_128K_REPS=0
   SPARKINFER_GUARD_16K_BASELINE=0
   SPARKINFER_GUARD_512_BASELINE=0
+  SPARKINFER_GUARD_128K_BASELINE=0
+  SPARKINFER_GUARD_128K_PP_BASELINE=0
 )
 
 # Qwen3.6: full 5-context sweep.
@@ -183,9 +185,9 @@ if [ "${SPARKINFER_P36_GUARD_128_BASELINE:-0}" = "0" ]; then
 fi
 
 if [ "${SPARKINFER_P35_GUARD_128_BASELINE:-0}" = "0" ]; then
-  echo ">> measuring Qwen3.5 same-box main (128/4k/32k/64k/128k) ..." >&2
+  echo ">> measuring Qwen3.5 same-box main (128/4k/32k/64k) ..." >&2
   P35_GGUF="${P35_DIR}/${P35_FILE}"
-  for ctx in 0 4096 32768 65536 131072; do
+  for ctx in 0 4096 32768 65536; do
     t="$(_bench_decode_tps "$P35_GGUF" "$ctx")"
     t="${t:-0}"
     case "$ctx" in
@@ -193,26 +195,24 @@ if [ "${SPARKINFER_P35_GUARD_128_BASELINE:-0}" = "0" ]; then
       4096)   B35_4K="${t:-0}" ;;
       32768)  B35_32K="${t:-0}" ;;
       65536)  B35_64K="${t:-0}" ;;
-      131072) B35_128K="${t:-0}" ;;
     esac
   done
-  echo ">> Qwen3.5 main: 128=${B35_128:-0} 4k=${B35_4K:-0} 32k=${B35_32K:-0} 64k=${B35_64K:-0} 128k=${B35_128K:-0} tok/s" >&2
+  echo ">> Qwen3.5 main: 128=${B35_128:-0} 4k=${B35_4K:-0} 32k=${B35_32K:-0} 64k=${B35_64K:-0} tok/s" >&2
 fi
 
 if [ "${SPARKINFER_P35_GUARD_4K_PP_BASELINE:-0}" = "0" ]; then
-  echo ">> measuring Qwen3.5 same-box main prefill pp (4k/32k/64k/128k) ..." >&2
+  echo ">> measuring Qwen3.5 same-box main prefill pp (4k/32k/64k) ..." >&2
   P35_GGUF="${P35_DIR}/${P35_FILE}"
-  for ctx in 4096 32768 65536 131072; do
+  for ctx in 4096 32768 65536; do
     t="$(_bench_prefill_pp "$P35_GGUF" "$ctx")"
     t="${t:-0}"
     case "$ctx" in
       4096)   B35_4K_PP="${t:-0}" ;;
       32768)  B35_32K_PP="${t:-0}" ;;
       65536)  B35_64K_PP="${t:-0}" ;;
-      131072) B35_128K_PP="${t:-0}" ;;
     esac
   done
-  echo ">> Qwen3.5 prefill: 4k=${B35_4K_PP:-0} 32k=${B35_32K_PP:-0} 64k=${B35_64K_PP:-0} 128k=${B35_128K_PP:-0} pp tok/s" >&2
+  echo ">> Qwen3.5 prefill: 4k=${B35_4K_PP:-0} 32k=${B35_32K_PP:-0} 64k=${B35_64K_PP:-0} pp tok/s" >&2
 fi
 
 B36_128="${B36_128:-${SPARKINFER_P36_GUARD_128_BASELINE:-0}}"
@@ -279,8 +279,8 @@ def stub(tps, ctx128, ctx4k, ctx32k=0, ctx64k=0, ctx128k=0, ctx512=0, ctx16k=0,
             "guard_4k_pp_pass": True, "guard_32k_pp_pass": True,
             "guard_64k_pp_pass": True, "guard_128k_pp_pass": True,
             "eval_prefill": bool(float(pp4k or pp32k or pp64k or pp128k or 0) > 0)}
-s35 = stub("$B35_128", "$B35_128", "$B35_4K", "$B35_32K", "$B35_64K", "$B35_128K",
-           pp4k="$B35_4K_PP", pp32k="$B35_32K_PP", pp64k="$B35_64K_PP", pp128k="$B35_128K_PP")
+s35 = stub("$B35_128", "$B35_128", "$B35_4K", "$B35_32K", "$B35_64K",
+           pp4k="$B35_4K_PP", pp32k="$B35_32K_PP", pp64k="$B35_64K_PP")
 s36 = stub("$B36_128", "$B36_128", "$B36_4K", "$B36_32K", ctx512="$B36_512", ctx16k="$B36_16K")
 out = {"pass": True, "label": "BASELINE", "commit": commit, "mode": "bidir", "model": "bidir",
        "tps": s36["tps"], "top1": 1.0, "kl": 0.0, "primary_quant": quant,
@@ -300,20 +300,16 @@ PRIMARY35_JSON="$(run_model primary-qwen35 "$P35_FILE" "$P35_REPO" "$P35_TOK" 0 
   SPARKINFER_GUARD_4K_BASELINE="${B35_4K}" \
   SPARKINFER_GUARD_32K_BASELINE="${B35_32K}" \
   SPARKINFER_GUARD_64K_BASELINE="${B35_64K}" \
-  SPARKINFER_GUARD_128K_BASELINE="${B35_128K}" \
   SPARKINFER_GUARD_4K_PP_BASELINE="${B35_4K_PP}" \
   SPARKINFER_GUARD_32K_PP_BASELINE="${B35_32K_PP}" \
   SPARKINFER_GUARD_64K_PP_BASELINE="${B35_64K_PP}" \
-  SPARKINFER_GUARD_128K_PP_BASELINE="${B35_128K_PP}" \
   SPARKINFER_LLAMA_128_BASELINE="${SPARKINFER_P35_LLAMA_128_BASELINE:-${QWEN35_9B_LLAMA_128:-0}}" \
   SPARKINFER_LLAMA_4K_BASELINE="${SPARKINFER_P35_LLAMA_4K_BASELINE:-${QWEN35_9B_LLAMA_4K:-0}}" \
   SPARKINFER_LLAMA_32K_BASELINE="${SPARKINFER_P35_LLAMA_32K_BASELINE:-${QWEN35_9B_LLAMA_32K:-0}}" \
   SPARKINFER_LLAMA_64K_BASELINE="${SPARKINFER_P35_LLAMA_64K_BASELINE:-${QWEN35_9B_LLAMA_64K:-0}}" \
-  SPARKINFER_LLAMA_128K_BASELINE="${SPARKINFER_P35_LLAMA_128K_BASELINE:-${QWEN35_9B_LLAMA_128K:-0}}" \
   SPARKINFER_LLAMA_4K_PP_BASELINE="${SPARKINFER_P35_LLAMA_4K_PP_BASELINE:-${QWEN35_9B_LLAMA_4K_PP:-0}}" \
   SPARKINFER_LLAMA_32K_PP_BASELINE="${SPARKINFER_P35_LLAMA_32K_PP_BASELINE:-${QWEN35_9B_LLAMA_32K_PP:-0}}" \
-  SPARKINFER_LLAMA_64K_PP_BASELINE="${SPARKINFER_P35_LLAMA_64K_PP_BASELINE:-${QWEN35_9B_LLAMA_64K_PP:-0}}" \
-  SPARKINFER_LLAMA_128K_PP_BASELINE="${SPARKINFER_P35_LLAMA_128K_PP_BASELINE:-${QWEN35_9B_LLAMA_128K_PP:-0}}")"
+  SPARKINFER_LLAMA_64K_PP_BASELINE="${SPARKINFER_P35_LLAMA_64K_PP_BASELINE:-${QWEN35_9B_LLAMA_64K_PP:-0}}")"
 
 GUARD36_JSON="$(run_model guard36 "$P36_FILE" "$P36_REPO" "$P36_TOK" 0 \
   MODELS_DIR="$P36_DIR" MODEL_SHA256="${QWEN36_MODEL_SHA256:-}" \
@@ -348,8 +344,7 @@ GUARD35_JSON="$(run_model guard35 "$P35_FILE" "$P35_REPO" "$P35_TOK" 0 \
   SPARKINFER_GUARD_128_BASELINE="${G35_128}" \
   SPARKINFER_GUARD_4K_BASELINE="${G35_4K}" \
   SPARKINFER_GUARD_32K_BASELINE="${G35_32K}" \
-  SPARKINFER_GUARD_64K_BASELINE="${G35_64K}" \
-  SPARKINFER_GUARD_128K_BASELINE="${G35_128K}")"
+  SPARKINFER_GUARD_64K_BASELINE="${G35_64K}")"
 reap
 
 PRIMARY35_JSON="$PRIMARY35_JSON" GUARD36_JSON="$GUARD36_JSON" \

@@ -74,7 +74,7 @@ Set `SPARKINFER_EVAL_MODE=short` or pass `--eval-mode short` to keep the legacy 
 `--bidir` (or `BIDIR=1` / legacy `TRIPLE=1` in `.env.eval`) scores **both directions** in one build:
 
 ```
-build once ─► score_qwen35  Qwythos-9B : 128/4k/32k/64k/128k speed + accuracy ─► eval-qwen35:<LABEL>
+build once ─► score_qwen35  Qwythos-9B : 128/4k/32k/64k speed + prefill pp ─► eval-qwen35:<LABEL>
            │              guard Qwen3.6  : 5 contexts ─► must NOT regress
            └► score_qwen36  Qwen3.6      : 128/512/4k/16k/32k ─► eval-qwen36:<LABEL>
                           guard Qwen3.5  : 128/512/4k ─► must NOT regress

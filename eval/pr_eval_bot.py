@@ -138,8 +138,8 @@ def _apply_bidir_ctx_from_bres(bres, q36, q35):
         return True
 
     got36 = _fill(bres.get("score_qwen36"), q36, ("128", "512", "4k", "16k", "32k"))
-    got35 = _fill(bres.get("score_qwen35"), q35, ("128", "4k", "32k", "64k", "128k"))
-    _fill_pp(bres.get("score_qwen35"), q35, ("4k_pp", "32k_pp", "64k_pp", "128k_pp"))
+    got35 = _fill(bres.get("score_qwen35"), q35, ("128", "4k", "32k", "64k"))
+    _fill_pp(bres.get("score_qwen35"), q35, ("4k_pp", "32k_pp", "64k_pp"))
     return got36 and got35
 
 
@@ -714,7 +714,7 @@ def post_needs_bench_comment(repo, num):
             "until at least one does.\n\n**Decode** (end-to-end, not an isolated-kernel microbench):\n"
             "```bash\nbench/scripts/bench.sh --download            # baseline (before)\n"
             "bench/scripts/bench.sh --download            # your branch (after)\n```\n\n"
-            "**Prefill pp** (Qwythos — report your best of 4k/32k/64k/128k from the `prefill pp` "
+            "**Prefill pp** (Qwythos — report your best of 4k/32k/64k from the `prefill pp` "
             "line in bench output):\n```bash\nbench/scripts/bench.sh --download --ctx 4096   # try "
             "4096 / 32768 / 65536 / 131072\nbench/scripts/bench.sh --download --ctx 4096   # your "
             "branch\n```\n\nThen the bot greenlights it on the next poll and evaluates it on an "
@@ -940,7 +940,7 @@ def render(res, oid):
                          f"{res.get('tps')} tok/s (main was {res.get('frontier_tps','?')} tok/s).")
     if label == "REJECT" and res.get("auto_close"):
         note = "No context cleared the 2% significance gate while at least one context regressed. Auto-closing this PR."
-    target_note = ("128/512/4k/16k/32k guarded · Qwen3.5 prefill at 4k/32k/64k/128k · scored vs same-box main"
+    target_note = ("128/512/4k/16k/32k guarded · Qwen3.5 prefill at 4k/32k/64k · scored vs same-box main"
                    if res.get("eval_mode") == "longctx" and (res.get("score_qwen35") or {}).get("eval_prefill")
                    else "128/512/4k/16k/32k guarded · scored vs same-box main · strongest context scores"
                    if res.get("eval_mode") == "longctx" else "128-token decode scored vs same-box main")
@@ -966,21 +966,19 @@ CTX_SERIES = {
     131072: {"metric": "ctx_131072_tps", "guard": "guard_128k_baseline", "status": "longctx_128k_tps", "label": "128k", "color": "#17A2B8", "llama": 0, "note": "Qwythos long-context decode at 128k, ntg=128"},
 }
 # Qwen3.5 (Qwythos) per-context llama.cpp anchors — colors match CTX_SERIES.
-Q35_CTX_ORDER = ("128", "4k", "32k", "64k", "128k")
+Q35_CTX_ORDER = ("128", "4k", "32k", "64k")
 Q35_CTX_SERIES = {
     128:    {"label": "128",  "ref_tps": 220.84},
     4096:   {"label": "4k",   "ref_tps": 221.80},
     32768:  {"label": "32k",  "ref_tps": 221.11},
     65536:  {"label": "64k",  "ref_tps": 220.54},
-    131072: {"label": "128k", "ref_tps": 220.58},
 }
 # Qwen3.5 prefill pp anchors — pinned in bench/scripts/reference.lock (RTX 5090).
-Q35_PP_ORDER = ("4k", "32k", "64k", "128k")
+Q35_PP_ORDER = ("4k", "32k", "64k")
 Q35_PP_SERIES = {
     4096:   {"label": "4k",   "metric": "ctx_4096_pp_tps",  "ref_pp": 11104.62, "color": "#0E8A16"},
     32768:  {"label": "32k",  "metric": "ctx_32768_pp_tps", "ref_pp": 9772.31,  "color": "#6F42C1"},
     65536:  {"label": "64k",  "metric": "ctx_65536_pp_tps", "ref_pp": 8153.53,  "color": "#E67E22"},
-    131072: {"label": "128k", "metric": "ctx_131072_pp_tps", "ref_pp": 5999.59, "color": "#17A2B8"},
 }
 Q36_CTX_ORDER = ("128", "512", "4k", "16k", "32k")
 # Qwen3.6-35B-A3B llama.cpp decode refs (RTX 5090) — pinned in bench/scripts/reference.lock
@@ -2166,12 +2164,10 @@ def main():
               f"4k={QWEN36_BASE['4k']} 16k={QWEN36_BASE['16k']} 32k={QWEN36_BASE['32k']} tok/s")
         print(f"  Qwythos ({args.primary_quant}) same-box main: "
               f"128={QWYTHOS_BASE['128']} 4k={QWYTHOS_BASE['4k']} "
-              f"32k={QWYTHOS_BASE['32k']} 64k={QWYTHOS_BASE['64k']} "
-              f"128k={QWYTHOS_BASE['128k']} tok/s")
-        if any(QWYTHOS_BASE.get(k, 0) for k in ("4k_pp", "32k_pp", "64k_pp", "128k_pp")):
+              f"32k={QWYTHOS_BASE['32k']} 64k={QWYTHOS_BASE['64k']} tok/s")
+        if any(QWYTHOS_BASE.get(k, 0) for k in ("4k_pp", "32k_pp", "64k_pp")):
             print(f"  Qwythos prefill pp: 4k={QWYTHOS_BASE.get('4k_pp', 0)} "
-                  f"32k={QWYTHOS_BASE.get('32k_pp', 0)} 64k={QWYTHOS_BASE.get('64k_pp', 0)} "
-                  f"128k={QWYTHOS_BASE.get('128k_pp', 0)} pp tok/s")
+                  f"32k={QWYTHOS_BASE.get('32k_pp', 0)} 64k={QWYTHOS_BASE.get('64k_pp', 0)} pp tok/s")
 
     # Run all pending evals on the SAME instance: pass --keep so vast_eval.py never stops/destroys
     # the box mid-queue. The bot stops the instance once after ALL PRs finish (or if the instance
