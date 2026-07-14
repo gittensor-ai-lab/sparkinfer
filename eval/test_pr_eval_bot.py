@@ -21,6 +21,68 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertFalse(bot.pr_merge_conflict("UNKNOWN"))
         self.assertFalse(bot.pr_merge_conflict(None))
 
+    _TEMPLATE_DECODE = """
+- [x] Tested on **RTX 5090** (`sm_120`)
+| | decode tok/s |
+|---|--:|
+| before (main) | {db} |
+| after (this PR) | {da} |
+"""
+    _TEMPLATE_PREFILL = """
+- [x] Tested on **RTX 5090** (`sm_120`)
+| | prefill pp tok/s |
+|---|--:|
+| before prefill (main) | {pb} |
+| after prefill (this PR) | {pa} |
+"""
+    _TEMPLATE_BOTH = """
+- [x] Tested on **RTX 5090** (`sm_120`)
+| | decode tok/s |
+|---|--:|
+| before (main) | {db} |
+| after (this PR) | {da} |
+| | prefill pp tok/s |
+|---|--:|
+| before prefill (main) | {pb} |
+| after prefill (this PR) | {pa} |
+"""
+
+    def _greenlight(self, body):
+        with mock.patch.object(bot, "gh", return_value=mock.Mock(stdout=json.dumps({"body": body}))):
+            return bot.greenlight_status("gittensor-ai-lab/sparkinfer", 1, set())
+
+    def test_greenlight_decode_only(self):
+        status, reason = self._greenlight(self._TEMPLATE_DECODE.format(db=300, da=320))
+        self.assertEqual(status, "ok")
+        self.assertIn("decode 300.0→320.0", reason)
+
+    def test_greenlight_prefill_only(self):
+        status, reason = self._greenlight(self._TEMPLATE_PREFILL.format(pb=250, pa=280))
+        self.assertEqual(status, "ok")
+        self.assertIn("prefill 250.0→280.0", reason)
+        self.assertIn("pp tok/s", reason)
+
+    def test_greenlight_prefill_skips_decode_flat(self):
+        body = self._TEMPLATE_BOTH.format(db=300, da=300, pb=250, pa=275)
+        status, reason = self._greenlight(body)
+        self.assertEqual(status, "ok")
+        self.assertIn("prefill", reason)
+
+    def test_greenlight_no_bench_when_flat(self):
+        status, _ = self._greenlight(self._TEMPLATE_DECODE.format(db=300, da=300))
+        self.assertEqual(status, "no-bench")
+
+    def test_greenlight_unchecked_box(self):
+        body = self._TEMPLATE_DECODE.format(db=300, da=320).replace("[x]", "[ ]")
+        status, reason = self._greenlight(body)
+        self.assertEqual(status, "unchecked")
+        self.assertIn("unchecked", reason)
+
+    def test_decode_val_ignores_prefill_rows(self):
+        body = self._TEMPLATE_BOTH.format(db=301, da=310, pb=250, pa=260)
+        self.assertEqual(bot._decode_val(body, "before"), 301.0)
+        self.assertEqual(bot._prefill_val(body, "before"), 250.0)
+
     def test_regression_labels_block_automerge(self):
         self.assertIn("regression-128", bot.AUTOMERGE_BLOCK_LABELS)
         self.assertIn("regression-512", bot.AUTOMERGE_BLOCK_LABELS)

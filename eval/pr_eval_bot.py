@@ -153,15 +153,15 @@ def _bidir_baseline_sane(q36, q35):
 AREAS = {"kernels", "runtime", "moe", "bench"}
 
 # RTX 5090 evaluation is OPT-IN *and* proof-gated. A PR is only evaluated if it ticks the
-# "Tested on RTX 5090" box AND fills the decode before/after table with real numbers showing a
-# clear improvement (after > before) — checking the box alone is not enough (it wasted GPU on PRs
-# whose decode table was still the placeholder). States: greenlit -> test-on-5090 (eval); box
-# ticked but no valid before<after -> needs-benchmark (skip + ask for numbers); box unticked ->
-# not-tested (skip). There is NO manual override — every eval must pass the gate on real RTX 5090
-# before/after numbers; nothing bypasses the benchmark check.
+# "Tested on RTX 5090" box AND fills the decode and/or Qwen3.5 prefill before/after tables with
+# real numbers showing a clear improvement (after > before) on at least one metric — checking the
+# box alone is not enough (it wasted GPU on PRs whose tables were still placeholder). States:
+# greenlit -> test-on-5090 (eval); box ticked but no valid before<after gain ->
+# needs-benchmark (skip + ask for numbers); box unticked -> not-tested (skip). There is NO manual
+# override — every eval must pass the gate on real RTX 5090 before/after numbers.
 EVAL_GATE_LABEL  = "test-on-5090"     # bot-set marker: greenlit, will be evaluated
 NOT_TESTED_LABEL = "not-tested"       # box not ticked
-NEEDS_BENCH_LABEL = "needs-benchmark" # box ticked but decode before/after missing/invalid/no-gain
+NEEDS_BENCH_LABEL = "needs-benchmark" # box ticked but decode/prefill tables missing/invalid/no-gain
 # Per-round merge workflow (all queued PRs graded vs the same-box main in one round):
 MERGE_FIRST_LABEL  = "merge-first"    # the round's biggest verified speedup — merge this one first
 NEEDS_REBASE_LABEL = "needs-rebase"   # also a verified speedup, but not the round winner
@@ -416,33 +416,72 @@ def areas_for_pr(repo, num):
     files = json.loads(gh(["pr", "view", str(num), "-R", repo, "--json", "files"]).stdout or "{}").get("files", [])
     return {f["path"].split("/", 1)[0] for f in files} & set(AREAS)
 
-def _decode_val(body, key):
-    """Pull a numeric decode tok/s out of the template table row '| before|after | <n> |'.
-    Returns the float, or None if the cell is the placeholder / non-numeric / absent."""
+def _table_val(body, key, metric="decode"):
+    """Pull a numeric tok/s from a PR template table row '| before… | <n> |'.
+
+    metric='decode' skips prefill rows; metric='prefill' requires 'prefill' in the row label."""
     for ln in body.splitlines():
+        low = ln.lower()
+        if metric == "decode" and "prefill" in low:
+            continue
+        if metric == "prefill" and "prefill" not in low:
+            continue
         m = re.match(rf"\s*\|\s*{key}\b[^|]*\|\s*([^|]*?)\s*\|", ln, re.I)
-        if not m: continue
+        if not m:
+            continue
         num = re.search(r"[-+]?\d+\.?\d*", m.group(1))
-        try: return float(num.group(0)) if num else None
-        except ValueError: return None
+        try:
+            return float(num.group(0)) if num else None
+        except ValueError:
+            return None
     return None
+
+def _decode_val(body, key):
+    """Decode tok/s from the template decode table (not the prefill table)."""
+    return _table_val(body, key, metric="decode")
+
+def _prefill_val(body, key):
+    """Qwythos prefill pp tok/s from the template prefill table."""
+    return _table_val(body, key, metric="prefill")
+
+def _claimed_gain(before, after):
+    """True when both numbers are present and after > before."""
+    return before is not None and after is not None and after > before
 
 def greenlight_status(repo, num, pr_labels):
     """Decide whether a PR may be evaluated. Returns (status, reason):
-      'ok'        — greenlit: box ticked + real before<after decode numbers (no override exists)
-      'no-bench'  — box ticked but the decode before/after table is missing/placeholder/no-gain
+      'ok'        — greenlit: box ticked + real decode and/or prefill before<after gain
+      'no-bench'  — box ticked but neither table shows a claimed improvement
       'unchecked' — the 'Tested on RTX 5090' box is not ticked
-    Checking the box is necessary but NOT sufficient — a clear decode improvement must be claimed."""
+    Checking the box is necessary but NOT sufficient — decode or prefill gain must be claimed."""
     body = (json.loads(gh(["pr", "view", str(num), "-R", repo, "--json", "body"]).stdout or "{}")
             .get("body") or "")
     if not any(re.search(r"\[\s*[xX]\s*\]", ln) and "5090" in ln for ln in body.splitlines()):
         return "unchecked", "RTX-5090 box unchecked"
-    before, after = _decode_val(body, "before"), _decode_val(body, "after")
-    if before is None or after is None:
-        return "no-bench", "box ticked but decode before/after not filled with real numbers"
-    if after <= before:
-        return "no-bench", f"claimed decode before={before} ≥ after={after} (no improvement)"
-    return "ok", f"ticked + decode {before}→{after} tok/s (+{after - before:.1f})"
+    d_before, d_after = _decode_val(body, "before"), _decode_val(body, "after")
+    p_before, p_after = _prefill_val(body, "before"), _prefill_val(body, "after")
+    decode_ok = _claimed_gain(d_before, d_after)
+    prefill_ok = _claimed_gain(p_before, p_after)
+    if decode_ok and prefill_ok:
+        return ("ok", f"ticked + decode {d_before}→{d_after} tok/s (+{d_after - d_before:.1f}); "
+                f"prefill {p_before}→{p_after} pp tok/s (+{p_after - p_before:.1f})")
+    if decode_ok:
+        return "ok", f"ticked + decode {d_before}→{d_after} tok/s (+{d_after - d_before:.1f})"
+    if prefill_ok:
+        return "ok", (f"ticked + prefill {p_before}→{p_after} pp tok/s "
+                      f"(+{p_after - p_before:.1f})")
+    if d_before is not None and d_after is not None and d_after <= d_before:
+        if p_before is not None and p_after is not None and p_after <= p_before:
+            return ("no-bench",
+                    f"claimed decode {d_before}≥{d_after} and prefill {p_before}≥{p_after} (no improvement)")
+        return "no-bench", f"claimed decode before={d_before} ≥ after={d_after} (no improvement)"
+    if p_before is not None and p_after is not None and p_after <= p_before:
+        return ("no-bench",
+                f"claimed prefill before={p_before} ≥ after={p_after} (no improvement)")
+    if (d_before is None or d_after is None) and (p_before is None or p_after is None):
+        return ("no-bench",
+                "box ticked but decode and/or prefill before/after not filled with real numbers")
+    return "no-bench", "box ticked but no claimed decode or prefill improvement"
 
 def pr_merge_conflict(mergeable):
     """True when GitHub reports the PR cannot merge cleanly into its base branch."""
@@ -457,12 +496,16 @@ def post_merge_conflict_comment(repo, num):
 
 def post_needs_bench_comment(repo, num):
     body = ("<!-- sparkinfer-needs-bench -->\n## ⏳ Needs a benchmark to be evaluated\n\n"
-            "You ticked **Tested on RTX 5090** but the decode **before → after tok/s** table is still "
-            "empty / placeholder (or shows no gain). The on-device eval won't run until it shows a real "
-            "improvement.\n\nFill it from the **end-to-end** decode bench (not an isolated-kernel "
-            "microbench):\n```bash\nbench/scripts/bench.sh --download            # baseline (before)\n"
-            "bench/scripts/bench.sh --download            # your branch (after)\n```\n"
-            "Then the bot greenlights it on the next poll and evaluates it on an RTX 5090.")
+            "You ticked **Tested on RTX 5090** but neither the decode **nor** the Qwen3.5 prefill "
+            "**before → after** table shows a real claimed improvement. The on-device eval won't run "
+            "until at least one does.\n\n**Decode** (end-to-end, not an isolated-kernel microbench):\n"
+            "```bash\nbench/scripts/bench.sh --download            # baseline (before)\n"
+            "bench/scripts/bench.sh --download            # your branch (after)\n```\n\n"
+            "**Prefill pp** (Qwythos — report your best of 4k/32k/64k/128k from the `prefill pp` "
+            "line in bench output):\n```bash\nbench/scripts/bench.sh --download --ctx 4096   # try "
+            "4096 / 32768 / 65536 / 131072\nbench/scripts/bench.sh --download --ctx 4096   # your "
+            "branch\n```\n\nThen the bot greenlights it on the next poll and evaluates it on an "
+            "RTX 5090.")
     gh(["pr", "comment", str(num), "-R", repo, "--body", body])
 
 def _owner_repo(repo):
@@ -1694,7 +1737,7 @@ def main():
                     remove_label(args.repo, num, EVAL_GATE_LABEL)
             continue
         # Gate 3 — greenlight (proof-gated): evaluate only if the PR ticks the RTX-5090 box AND
-        # fills the decode before/after table with a real improvement. No override exists.
+        # claims a real decode and/or Qwen3.5 prefill improvement in the template tables.
         # Reconcile labels each poll so a stale test-on-5090 can't keep a no-benchmark PR in the queue.
         pr_labels = {l["name"] for l in pr.get("labels", [])}
         def _reconcile(keep, drop):
