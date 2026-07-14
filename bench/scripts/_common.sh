@@ -113,10 +113,15 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
     echo ">> llama.cpp NOT pinned (warn-only) — HEAD $(git -C "$LLAMACPP_DIR" rev-parse --short HEAD 2>/dev/null); set LLAMACPP_COMMIT in reference.lock" >&2
     rm -rf "$bdir"
   fi
+  if [ -f "$bdir/CMakeCache.txt" ] && ! grep -q 'LLAMA_BUILD_UI:BOOL=OFF' "$bdir/CMakeCache.txt" 2>/dev/null; then
+    echo ">> llama.cpp reconfigure (LLAMA_BUILD_UI=OFF for headless server) ..." >&2
+    rm -f "$bdir/CMakeCache.txt"
+  fi
   if [ ! -f "$bdir/CMakeCache.txt" ]; then
     : > /tmp/llama_build.log
     if ! cmake -S "$LLAMACPP_DIR" -B "$bdir" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$arch" \
-          -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=ON $CUDA_HOST_FLAG >&2; then
+          -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF \
+          $CUDA_HOST_FLAG >&2; then
       echo ">> FATAL: llama.cpp cmake configure failed" >&2; return 1
     fi
   fi
