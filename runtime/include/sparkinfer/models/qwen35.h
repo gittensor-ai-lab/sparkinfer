@@ -124,6 +124,13 @@ public:
 
     const Qwen35Config& config() const;
 
+    // Batched prompt prefill (Qwen3.5 dense-hybrid only): process all `n` prompt tokens in one
+    // pass, filling the paged KV cache and Gated-DeltaNet recurrent/conv state for positions
+    // 0..n-1 so a subsequent decode is faithful to the forward_token loop. Returns the argmax at
+    // the last prompt position (seed for the first decode step), or -1 if the batched path is
+    // unsupported for this model/config. Implemented in qwen35_prefill.cpp.
+    int prefill_batched(const int* prompt_ids, int n);
+
 private:
     void invalidate_decode_graph();
     bool prompt_matches_prefix(const std::vector<int>& prompt) const;

@@ -10,6 +10,7 @@
 // autoregressive greedy decoding fundamentally requires.
 
 #include "sparkinfer/models/qwen35.h"
+#include "qwen35_prefill.h"
 #include "sparkinfer/thermal_governor.h"
 #include "sparkinfer/kv_ops.h"
 #include "sparkinfer/gguf.h"
@@ -1116,7 +1117,35 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     }
     s.bench_feedback_graph = bench_device_loop != 0;
     int pos = 0, tok = 100;
+    // Batched prefill: one weight-amortized GEMM pass fills the KV cache + Gated-DeltaNet state, then
+    // decode continues from start_pos. Default ON for the dense hybrid; SPARKINFER_PREFILL_BATCHED=0
+    // (or ctx > SPARKINFER_PREFILL_BATCHED_MAXCTX, default 64k — the O(N^2) prefill attention is still
+    // naive) falls back to the token loop below, which is left byte-identical to main on purpose.
+    bool batched_done = false;
     if (start_pos > 0) {
+        static int want_batched = -1, batched_maxctx = -1;
+        if (want_batched < 0) {
+            const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
+            want_batched = (e && e[0] == '0') ? 0 : 1;
+            const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
+            batched_maxctx = mc ? atoi(mc) : 65536;
+        }
+        if (want_batched && s.gguf && s.cfg.hybrid && s.cfg.dense_ffn && start_pos <= batched_maxctx) {
+            std::vector<int> ids(start_pos);
+            for (int i = 0; i < start_pos; i++) ids[i] = 100 + (i % 20000);   // deterministic pseudo-prompt
+            auto pb0 = std::chrono::high_resolution_clock::now();
+            int seed = prefill_batched(ids.data(), start_pos);
+            cudaDeviceSynchronize();
+            auto pb1 = std::chrono::high_resolution_clock::now();
+            if (seed >= 0) {
+                out.prefill_pp = start_pos / std::chrono::duration<double>(pb1 - pb0).count();
+                pos = start_pos;
+                tok = (seed < s.cfg.vocab) ? seed : 100;
+                batched_done = true;
+            }
+        }
+    }
+    if (start_pos > 0 && !batched_done) {
         auto p0 = std::chrono::high_resolution_clock::now();
         for (; pos < start_pos; pos++) {
             tok = forward_token(tok, pos, prefill_samples_lmhead());
@@ -1282,6 +1311,16 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
         }
     }
     return std::chrono::duration<double>(t1 - t0).count();
+}
+
+// Thin adapter: hand the batched-prefill orchestration (qwen35_prefill.cpp) exactly the scratch
+// buffers, streams and config it needs, so Impl stays private to this file.
+int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
+    Impl& s = *p_;
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.seq_id, s.lin_state, s.lin_conv_state,
+                          s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim };
+    return prefill_batched_run(ctx, prompt_ids, n);
 }
 
 std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
