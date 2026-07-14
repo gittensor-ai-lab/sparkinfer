@@ -603,5 +603,82 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertEqual(done, {"abc1234"})
 
 
+class OnlyPrsAndBaselineCacheTest(unittest.TestCase):
+    def test_parse_only_prs(self):
+        self.assertEqual(bot._parse_only_prs(387, ""), {387})
+        self.assertEqual(bot._parse_only_prs(0, "387, 389"), {387, 389})
+        self.assertEqual(bot._parse_only_prs(387, "389"), {387, 389})
+
+    def test_baseline_cache_roundtrip(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = os.path.join(td, ".baseline_cache.json")
+            with mock.patch.object(bot, "BASELINE_CACHE_FILE", cache_path):
+                q36 = {"128": 200.0, "512": 195.0}
+                q35 = {"128": 150.0, "4k": 140.0}
+                bres = {"pass": True, "score_qwen36": 200.0}
+                bot._save_baseline_cache("ssh:host:22", q36, q35, bres)
+                loaded = bot._load_baseline_cache("ssh:host:22")
+                self.assertIsNotNone(loaded)
+                self.assertEqual(loaded["q36"], q36)
+                self.assertEqual(loaded["q35"], q35)
+                self.assertEqual(loaded["bres"], bres)
+                self.assertIsNone(bot._load_baseline_cache("ssh:other:22"))
+
+
+class ExhaustedEvalCloseTest(unittest.TestCase):
+    def test_eval_verdict_from_comment(self):
+        none_body = bot.render({"label": "none", "pass": True, "tps": 300.0, "top1": 0.97, "kl": 0.02,
+                                "frontier_tps": 298.0}, "abc1234")
+        self.assertEqual(bot._eval_verdict_from_comment(none_body), "none")
+        reject_body = bot.render({"label": "REJECT", "pass": False, "reason": "regression",
+                                  "tps": 280.0, "top1": 0.97, "kl": 0.02, "frontier_tps": 300.0},
+                                 "def5678")
+        self.assertEqual(bot._eval_verdict_from_comment(reject_body), "REJECT")
+        pass_body = bot.render({"label": "S", "pass": True, "tps": 320.0, "top1": 0.97, "kl": 0.02,
+                                "frontier_tps": 300.0, "pct_over_frontier": 6.7, "delta_tps": 20.0},
+                               "fed9012")
+        self.assertEqual(bot._eval_verdict_from_comment(pass_body), "S")
+        self.assertIsNone(bot._eval_verdict_from_comment("<!-- sparkinfer-eval:abc -->\nno verdict"))
+
+    def test_none_reject_eval_count(self):
+        comments = [
+            {"body": bot.render({"label": "none", "pass": True, "tps": 300.0, "top1": 0.97, "kl": 0.02,
+                                 "frontier_tps": 298.0}, "aaa1111")},
+            {"body": bot.render({"label": "REJECT", "pass": False, "reason": "x", "tps": 0,
+                                 "top1": 0, "kl": 0, "frontier_tps": 300.0}, "bbb2222")},
+            {"body": bot.render({"label": "M", "pass": True, "tps": 330.0, "top1": 0.97, "kl": 0.02,
+                                 "frontier_tps": 300.0, "pct_over_frontier": 10.0, "delta_tps": 30.0},
+                                "ccc3333")},
+        ]
+        gh_mock = mock.Mock(return_value=mock.Mock(stdout=json.dumps({"comments": comments})))
+        with mock.patch.object(bot, "gh", gh_mock):
+            self.assertEqual(bot.none_reject_eval_count("gittensor-ai-lab/sparkinfer", 42), 2)
+
+    def test_close_exhausted_eval_prs(self):
+        prs = [
+            {"number": 10, "title": "ok", "labels": [], "isDraft": False},
+            {"number": 11, "title": "exhausted", "labels": [], "isDraft": False},
+            {"number": 12, "title": "hold", "labels": [{"name": "hold"}], "isDraft": False},
+        ]
+        list_mock = mock.Mock(return_value=mock.Mock(stdout=json.dumps(prs)))
+        close_mock = mock.Mock(return_value=mock.Mock(returncode=0))
+        comment_mock = mock.Mock(return_value=mock.Mock(returncode=0))
+
+        def gh_side_effect(args, *a, **kw):
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "list":
+                return list_mock(*a, **kw)
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "close":
+                return close_mock(*a, **kw)
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "comment":
+                return comment_mock(*a, **kw)
+            return mock.Mock(stdout=json.dumps({"comments": []}))
+
+        with mock.patch.object(bot, "gh", side_effect=gh_side_effect), \
+             mock.patch.object(bot, "none_reject_eval_count", side_effect=lambda _r, n: {10: 2, 11: 3, 12: 5}[n]):
+            closed = bot.close_exhausted_eval_prs("gittensor-ai-lab/sparkinfer", max_none_reject=2)
+        self.assertEqual(closed, {11})
+        close_mock.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -11,10 +11,13 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_DIR"
 
 # Harness + eval code must match origin/main (vast_eval syncs bench/scripts from there).
-git fetch -q origin main 2>/dev/null || true
-if git rev-parse --verify origin/main >/dev/null 2>&1; then
-  git checkout -q main 2>/dev/null || true
-  git reset --hard origin/main
+# Set EVAL_SKIP_GIT_SYNC=1 to run local eval/ changes without resetting to origin/main.
+if [ "${EVAL_SKIP_GIT_SYNC:-0}" != "1" ]; then
+  git fetch -q origin main 2>/dev/null || true
+  if git rev-parse --verify origin/main >/dev/null 2>&1; then
+    git checkout -q main 2>/dev/null || true
+    git reset --hard origin/main
+  fi
 fi
 
 if [ -f "$REPO_DIR/.env.eval" ]; then

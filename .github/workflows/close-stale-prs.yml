@@ -1,7 +1,8 @@
 name: close-stale-prs
 
 # Close open PRs with no GitHub activity for 2+ days (commits, comments, reviews, labels).
-# Skips PRs labeled `hold` or `merge-first`. Same policy as eval/pr_eval_bot.py close_stale_prs().
+# Also close PRs with more than 2 completed eval:none / eval:REJECT verdicts.
+# Skips PRs labeled `hold` or `merge-first`. Same policy as eval/pr_eval_bot.py.
 
 on:
   schedule:
@@ -46,4 +47,22 @@ jobs:
           days = int(os.environ.get("SPARKINFER_STALE_PR_DAYS", "2"))
           closed = bot.close_stale_prs(repo, days=days)
           print(f">> close-stale-prs: closed {len(closed)} PR(s): {sorted(closed)}")
+          PY
+
+      - name: Close PRs exhausted by none/REJECT evals
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPARKINFER_EXHAUSTED_EVAL_MAX: "2"
+          REPO: gittensor-ai-lab/sparkinfer
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "eval")
+          import pr_eval_bot as bot
+
+          repo = os.environ.get("REPO", "gittensor-ai-lab/sparkinfer")
+          limit = int(os.environ.get("SPARKINFER_EXHAUSTED_EVAL_MAX", "2"))
+          closed = bot.close_exhausted_eval_prs(repo, max_none_reject=limit)
+          print(f">> close-exhausted-evals: closed {len(closed)} PR(s): {sorted(closed)}")
           PY
