@@ -6,5 +6,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/_common.sh"
 export LLAMACPP_DIR="${LLAMACPP_DIR:-/workspace/.llamacpp}"
 ARCH="$(detect_arch)"
+exec 9>/tmp/llamacpp_build.lock
+flock -n 9 || { echo ">> warm_llamacpp: another build holds /tmp/llamacpp_build.lock — skip" >&2; exit 0; }
 ensure_llamacpp "$ARCH"
 echo ">> warm_llamacpp: ready (sm_$ARCH)"

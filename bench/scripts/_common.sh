@@ -90,7 +90,7 @@ _llamacpp_clean() {  # $1=llama-bench  $2=sentinel
 ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + tamper-checked (C2)
   local bench="$LLAMACPP_DIR/build/bin/llama-bench" srv="$LLAMACPP_DIR/build/bin/llama-server"
   local sentinel="$LLAMACPP_DIR/.si_refhash"
-  local arch="$1"
+  local arch="$1" bdir="$LLAMACPP_DIR/build"
   [ -x "$bench" ] && [ -x "$srv" ] && _llamacpp_clean "$bench" "$sentinel" && return 0
   echo ">> (re)building llama.cpp reference (CUDA sm_$arch) ..." >&2
   if [ -n "${LLAMACPP_COMMIT:-}" ]; then
@@ -106,22 +106,38 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
       git -C "$LLAMACPP_DIR" fetch -q --depth 1 origin "$LLAMACPP_COMMIT" >&2 || {
         echo ">> FATAL: cannot fetch pinned llama commit $LLAMACPP_COMMIT" >&2; return 1; }
       git -C "$LLAMACPP_DIR" checkout -q FETCH_HEAD
+      rm -rf "$bdir"
     fi
   else
     [ -d "$LLAMACPP_DIR/.git" ] || git clone --depth=1 "$LLAMACPP_REPO" "$LLAMACPP_DIR" >&2
     echo ">> llama.cpp NOT pinned (warn-only) — HEAD $(git -C "$LLAMACPP_DIR" rev-parse --short HEAD 2>/dev/null); set LLAMACPP_COMMIT in reference.lock" >&2
+    rm -rf "$bdir"
   fi
-  rm -rf "$LLAMACPP_DIR/build"
-  if ! cmake -S "$LLAMACPP_DIR" -B "$LLAMACPP_DIR/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$arch" \
-        -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF $CUDA_HOST_FLAG >&2; then
-    echo ">> FATAL: llama.cpp cmake configure failed" >&2; return 1
+  if [ ! -f "$bdir/CMakeCache.txt" ]; then
+    : > /tmp/llama_build.log
+    if ! cmake -S "$LLAMACPP_DIR" -B "$bdir" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$arch" \
+          -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=ON $CUDA_HOST_FLAG >&2; then
+      echo ">> FATAL: llama.cpp cmake configure failed" >&2; return 1
+    fi
   fi
-  # CUDA build is long (~30–45 min). Stream progress (hidden builds look like hung SSH evals).
-  if ! cmake --build "$LLAMACPP_DIR/build" -j2 --target llama-bench llama-server 2>&1 \
-        | tee /tmp/llama_build.log | awk 'NR<=5 || NR%40==0 || /Built target|error:|FAILED|fatal error/' >&2; then
-    echo ">> FATAL: llama.cpp build failed" >&2
-    tail -40 /tmp/llama_build.log >&2 || true
-    return 1
+  # Build targets sequentially — parallel llama-bench + llama-server races on shared ggml objects.
+  if [ ! -x "$bench" ]; then
+    echo ">> building llama-bench ..." >&2
+    if ! cmake --build "$bdir" -j2 --target llama-bench 2>&1 \
+          | tee -a /tmp/llama_build.log | awk 'NR<=5 || NR%40==0 || /Built target|error:|FAILED|fatal error/' >&2; then
+      echo ">> FATAL: llama-bench build failed" >&2
+      grep -iE 'error:|fatal error:' /tmp/llama_build.log | tail -20 >&2 || tail -40 /tmp/llama_build.log >&2
+      return 1
+    fi
+  fi
+  if [ ! -x "$srv" ]; then
+    echo ">> building llama-server (single-threaded) ..." >&2
+    if ! cmake --build "$bdir" -j1 --target llama-server 2>&1 \
+          | tee -a /tmp/llama_build.log | awk 'NR<=5 || NR%20==0 || /Built target|error:|FAILED|fatal error/' >&2; then
+      echo ">> FATAL: llama-server build failed" >&2
+      grep -iE 'error:|fatal error:' /tmp/llama_build.log | tail -20 >&2 || tail -40 /tmp/llama_build.log >&2
+      return 1
+    fi
   fi
   [ -x "$bench" ] && [ -x "$srv" ] || { echo ">> FATAL: llama binaries missing after build" >&2; return 1; }
   sha256_of "$bench" > "$sentinel" 2>/dev/null || true
