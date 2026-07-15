@@ -27,7 +27,7 @@ int scalar_size(uint32_t t) {
 struct Cursor {
     const uint8_t* p; size_t off, size; bool ok = true;
     template <class T> T rd() { T v{}; if (off + sizeof(T) > size) { ok=false; return v; } memcpy(&v, p+off, sizeof(T)); off += sizeof(T); return v; }
-    std::string rd_str() { uint64_t n = rd<uint64_t>(); if (!ok || off+n>size) { ok=false; return {}; } std::string s((const char*)(p+off), n); off += n; return s; }
+    std::string rd_str() { uint64_t n = rd<uint64_t>(); if (!ok || n>size-off) { ok=false; return {}; } std::string s((const char*)(p+off), n); off += n; return s; }
     void skip(size_t n) { off += n; if (off > size) ok = false; }
 };
 
