@@ -51,6 +51,49 @@ QUANT="${PRIMARY_QUANT:-Q4_K_M}"
 echo ">> bidir: Qwen3.5=$P35_FILE (quant=$QUANT, ctx=128/4k/32k/64k) + Qwen3.6=$P36_FILE (ctx=128/512/4k/16k/32k)" >&2
 
 reap() { pkill -f llama-server 2>/dev/null || true; pkill -f qwen3_gguf 2>/dev/null || true; sleep 1; true; }
+reap_bench() { pkill -f qwen3_gguf 2>/dev/null || true; sleep 1; true; }
+
+declare -A _ACC_TOP1 _ACC_KL
+_LAST_GGUF=""
+
+_models_dir_from_args() {
+  local file="$1"; shift
+  local mdir="${MODELS_DIR:-$ROOT/models}"
+  local a
+  for a in "$@"; do
+    case "$a" in MODELS_DIR=*) mdir="${a#MODELS_DIR=}" ;; esac
+  done
+  echo "${mdir}/${file}"
+}
+
+run_model() {
+  local role="$1" file="$2" repo="$3" tok="$4" frontier="$5"; shift 5
+  local gguf skip_env=() json
+  gguf="$(_models_dir_from_args "$file" "$@")"
+  if [ -n "${_ACC_TOP1[$gguf]:-}" ]; then
+    skip_env=(SPARKINFER_SKIP_ACCURACY=1
+              SPARKINFER_ACCURACY_TOP1="${_ACC_TOP1[$gguf]}"
+              SPARKINFER_ACCURACY_KL="${_ACC_KL[$gguf]}")
+    echo ">> [$role] reusing cached accuracy for $file (top1=${_ACC_TOP1[$gguf]}, kl=${_ACC_KL[$gguf]})" >&2
+    if [ "$gguf" = "$_LAST_GGUF" ]; then reap_bench; else reap; fi
+  else
+    reap
+  fi
+  echo ">> [$role] model $file ..." >&2
+  json="$(env SI_SKIP_BUILD=1 SI_NO_CHECKOUT=1 \
+      MODEL_FILE="$file" MODEL_REPO="$repo" TOK_REPO="$tok" \
+      "${skip_env[@]}" \
+      "$@" \
+      "$HERE/evaluate.sh" --ref "$REF" --frontier "$frontier" --ceiling "$CEILING" \
+    | sed -n 's/^RESULT_JSON //p' | tail -1)"
+  if [ -z "${_ACC_TOP1[$gguf]:-}" ] && [ -n "$json" ]; then
+    read -r _t _k < <(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("top1",0), d.get("kl",99))' "$json")
+    _ACC_TOP1[$gguf]="$_t"
+    _ACC_KL[$gguf]="$_k"
+  fi
+  _LAST_GGUF="$gguf"
+  echo "$json"
+}
 
 if [ "$BASELINE_ONLY" = 1 ]; then
   echo ">> bidir baseline-only: ctx speed sweep on origin/main (skip PR build + dual eval)" >&2
@@ -104,17 +147,6 @@ else
   fi
   export SPARKINFER_DOWN_REQUANT_Q4K=1
 fi
-
-run_model() {
-  local role="$1" file="$2" repo="$3" tok="$4" frontier="$5"; shift 5
-  reap
-  echo ">> [$role] model $file ..." >&2
-  env SI_SKIP_BUILD=1 SI_NO_CHECKOUT=1 \
-      MODEL_FILE="$file" MODEL_REPO="$repo" TOK_REPO="$tok" \
-      "$@" \
-      "$HERE/evaluate.sh" --ref "$REF" --frontier "$frontier" --ceiling "$CEILING" \
-    | sed -n 's/^RESULT_JSON //p' | tail -1
-}
 
 # Qwen3.5: score/guard at 128/4k/32k/64k (skip 512, 16k, and 128k for now).
 Q35_CTX_ENVS=(

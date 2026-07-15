@@ -441,12 +441,20 @@ echo ">> [3/3] correctness — token-match / KL vs llama.cpp (held-out prompt) .
 # H1: the accuracy gate scores a held-out / fuzzed prompt chosen by EVAL_SEED (set by the bot to a
 # fresh, unpredictable value each eval), so a submission can't overfit the in-repo prompt. The seed
 # is recorded below so any verifier reproduces the exact token stream.
+# evaluate_bidir.sh may set SPARKINFER_SKIP_ACCURACY=1 when the same GGUF was already scored on this
+# build + seed (primary and guard passes share one model each).
 EVAL_SEED="${SPARKINFER_EVAL_SEED:-fixed}"
-acc=$(SPARKINFER_EVAL_SEED="$EVAL_SEED" "$HERE/accuracy.sh" "$GGUF" 2>/dev/null || true)
-# parse the unambiguous METRIC line (not the human-readable text, which contains "bar >= 0.90")
-TOP1=$(printf '%s\n' "$acc" | sed -n 's/.*METRIC .*top1=\([0-9.][0-9.]*\).*/\1/p' | head -1)
-KL=$(printf   '%s\n' "$acc" | sed -n 's/.*METRIC .*kl=\([0-9.][0-9.]*\).*/\1/p' | head -1)
-TOP1="${TOP1:-0}"; KL="${KL:-99}"
+if [ "${SPARKINFER_SKIP_ACCURACY:-0}" = "1" ] && [ -n "${SPARKINFER_ACCURACY_TOP1:-}" ]; then
+  echo ">> reusing cached accuracy (top1=${SPARKINFER_ACCURACY_TOP1}, kl=${SPARKINFER_ACCURACY_KL:-99})" >&2
+  TOP1="${SPARKINFER_ACCURACY_TOP1}"
+  KL="${SPARKINFER_ACCURACY_KL:-99}"
+else
+  acc=$(SPARKINFER_EVAL_SEED="$EVAL_SEED" "$HERE/accuracy.sh" "$GGUF" 2>/dev/null || true)
+  # parse the unambiguous METRIC line (not the human-readable text, which contains "bar >= 0.90")
+  TOP1=$(printf '%s\n' "$acc" | sed -n 's/.*METRIC .*top1=\([0-9.][0-9.]*\).*/\1/p' | head -1)
+  KL=$(printf   '%s\n' "$acc" | sed -n 's/.*METRIC .*kl=\([0-9.][0-9.]*\).*/\1/p' | head -1)
+  TOP1="${TOP1:-0}"; KL="${KL:-99}"
+fi
 
 # Provenance merged into the verdict (M1 clock, H1 seed, C2 reference pins) — non-scoring, for the log.
 [ "$GPU_CLOCKS_PINNED" = 1 ] && CP=true || CP=false
