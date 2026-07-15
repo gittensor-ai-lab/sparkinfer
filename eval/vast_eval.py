@@ -91,7 +91,8 @@ def push_bench_scripts(host, port):
             print(f">> WARN: could not pack bench/scripts (rc={tar.returncode})")
             return
         tar_data = tar.stdout
-    else:
+    if tar_data is None:
+        print(">> WARN: no bench/scripts archive — box may run stale harness")
         return
     verify_marker = b"LLAMA_BUILD_UI=OFF"
     tmp_path = ""
