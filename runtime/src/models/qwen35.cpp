@@ -1555,7 +1555,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     const std::string attn_requant_mode =
         attn_env ? std::string(attn_env)
                  : (q35_dense9b_requant_default ? std::string("qkv,v")
-                    : (q36_ud_requant_default ? std::string("attn_q,attn_output,qkv,attn_gate")
+                    : (q36_ud_requant_default ? std::string("attn_q,attn_output,qkv,attn_gate,ssm_out")
                                               : std::string()));
     auto mode_token = [&](const char* want) {
         const std::string w(want);
@@ -1626,6 +1626,14 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (qkv_requant_limit < 0) qkv_requant_limit = -1;
     }
     int qkv_requant_used = 0;
+    // Qwen3.6 GDN ssm_out projections ship Q8_0; requant them to Q4_K by default (all
+    // thirty out-projections). SPARKINFER_ATTN_REQUANT_Q4K_SSM_MINLAYER pins a lower
+    // bound on the layer index — the early GDN layers seed the recurrent state and are
+    // the most precision-sensitive, so raising this trades a little decode speed for a
+    // higher fuzzed top-1 margin.
+    int ssm_out_min_layer = 0;
+    if (const char* e = getenv("SPARKINFER_ATTN_REQUANT_Q4K_SSM_MINLAYER"))
+        ssm_out_min_layer = atoi(e);
     auto req_attn_q4 = [&](const std::string& name, int ggml_type) {
         if (mode_is_off(attn_requant_mode)) return false;
         if (req_attn_all) return true;
@@ -1645,6 +1653,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // both to Q4_K so they route through the existing Q4_K fused GDN qkv+z kernel (~47% fewer
         // bytes). SPARKINFER_ATTN_REQUANT_Q4K=attn_q,attn_output restores the #353-only behavior.
         if (mode_token("attn_gate") && has_suffix(name, "attn_gate.weight")) return true;
+        if (mode_token("ssm_out") && has_suffix(name, "ssm_out.weight"))
+            return layer_index(name) >= ssm_out_min_layer;
         return false;
     };
     const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K", q35_dense9b_requant_default);
