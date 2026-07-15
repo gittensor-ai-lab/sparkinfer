@@ -1031,11 +1031,12 @@ Q35_CTX_SERIES = {
     65536:  {"label": "64k",  "ref_tps": 220.54},
 }
 # Qwen3.5 prefill pp anchors — pinned in bench/scripts/reference.lock (RTX 5090).
-Q35_PP_ORDER = ("4k", "32k", "64k")
+Q35_PP_ORDER = ("4k", "32k", "64k", "128k")
 Q35_PP_SERIES = {
     4096:   {"label": "4k",   "metric": "ctx_4096_pp_tps",  "ref_pp": 11104.62, "color": "#0E8A16"},
     32768:  {"label": "32k",  "metric": "ctx_32768_pp_tps", "ref_pp": 9772.31,  "color": "#6F42C1"},
     65536:  {"label": "64k",  "metric": "ctx_65536_pp_tps", "ref_pp": 8153.53,  "color": "#E67E22"},
+    131072: {"label": "128k", "metric": "ctx_131072_pp_tps", "ref_pp": 5999.59, "color": "#17A2B8"},
 }
 Q36_CTX_ORDER = ("128", "512", "4k", "16k", "32k")
 # Qwen3.6-35B-A3B llama.cpp decode refs (RTX 5090) — pinned in bench/scripts/reference.lock

@@ -5241,7 +5241,7 @@ window.SPARKINFER = {
     "ref_tps": 220.84,
     "token_match": 0.9326,
     "kl": 0.0274,
-    "note": "same-box baseline 91.224.44.227 (KV cap fix, origin/main 6981821, 2026-07-14)",
+    "note": "same-box baseline 91.224.44.227 · prefill pp refs from reference.lock (2026-07-13, RTX 5090)",
     "ctx": [
       {
         "label": "128",
@@ -5372,6 +5372,14 @@ window.SPARKINFER = {
       "label": "XL",
       "tps": 303.18,
       "raw_tps": 300.43
+    },
+    {
+      "name": "skip LM head on prefill + ",
+      "pr": 387,
+      "date": "2026-07-15",
+      "label": "L",
+      "tps": 294.96,
+      "raw_tps": 320.33
     }
   ],
   "qwen36": {
