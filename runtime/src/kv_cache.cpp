@@ -84,9 +84,14 @@ KVCacheManager::~KVCacheManager() {
 bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
     const int need = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
     if ((int)impl_->free_list.size() < need || impl_->free_slots.empty()) return false;
-    if (need > kMaxBlocksPerSeq) return false;
 
     auto& blocks = impl_->seq_blocks[seq_id];
+    // allocate() is additive — it extends the sequence — so the cap must bound the
+    // CUMULATIVE block count, not just this call's `need`. Checking only `need` let a
+    // second allocate() for the same seq_id grow `blocks` past kMaxBlocksPerSeq and
+    // memcpy past its block-table row into the next sequence's row (cudaMemcpy below).
+    if ((int)blocks.size() + need > kMaxBlocksPerSeq) return false;
+
     for (int i = 0; i < need; i++) { blocks.push_back(impl_->free_list.back()); impl_->free_list.pop_back(); }
 
     int slot;
