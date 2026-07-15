@@ -176,7 +176,7 @@ static int run_single(const std::string& path, int n_tokens, int context_tokens)
             (getenv("SPARKINFER_BENCH_TTFT") || context_tokens >= 512);
         if (bench_ttft) {
             std::vector<int> prompt((size_t)context_tokens, 100);
-            double ttft = model.bench_ttft(prompt);
+            double ttft = s.model->bench_ttft(prompt);
             if (ttft > 0.)
                 printf("ttft         : %.3f s  (%.1f tok/s prefill, prompt=%d)\n",
                        ttft, context_tokens / ttft, context_tokens);
