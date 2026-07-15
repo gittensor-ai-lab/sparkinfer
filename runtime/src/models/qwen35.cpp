@@ -593,22 +593,37 @@ int Qwen35Model::forward_token(int token_id, int position) {
             if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_ab, 0);
             float* layer_state = s.lin_state +
                 (size_t)L * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
-            kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
-                                          s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
-                                          layer_state, s.lin_gdn,
-                                          c.linear_q_heads, c.linear_v_heads,
-                                          c.linear_head_dim, st);
-            if (gdn_pipelined && !gdn_fused_proj) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
             const bool gdn_gn_q8 = s.gguf && s.use_pq && s.use_llama &&
                                    (w.ssm_out_type == 12 || w.ssm_out_type == 8) &&
                                    c.linear_head_dim == 128;
+            // Fuse AR+gated_norm_q8 when z is already on `st`. If z runs on a side
+            // stream (pipelined && !fused_proj), keep the split path so AR can overlap z.
+            const bool z_ready_on_st = !(gdn_pipelined && !gdn_fused_proj);
             if (gdn_gn_q8) {
                 static int gn_q8 = -1;
                 if (gn_q8 < 0) {
                     const char* e = getenv("SPARKINFER_GDN_GNORM_Q8");
                     gn_q8 = (e && e[0] == '0') ? 0 : 1;
                 }
-                if (gn_q8) {
+                if (gn_q8 && z_ready_on_st) {
+                    // Fused AR + gated_norm_q8 (SPARKINFER_GDN_AR_GNORM=0 restores split).
+                    kernels::launch_qwen36_gdn_ar_gated_norm_q8(
+                        s.lin_q, s.lin_k, s.lin_v, s.lin_z,
+                        s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a, w.ssm_norm,
+                        layer_state, s.lin_gdn, s.aq81,
+                        c.linear_q_heads, c.linear_v_heads, c.linear_head_dim,
+                        c.rms_eps, st);
+                    if (w.ssm_out_type == 12)
+                        kernels::launch_mmvq_q4k(s.aq81, w.ssm_out, s.ao, H, s.linear_vdim, st);
+                    else
+                        kernels::launch_mmvq_q80(s.aq81, w.ssm_out, s.ao, H, s.linear_vdim, st);
+                } else if (gn_q8) {
+                    kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
+                                                  s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
+                                                  layer_state, s.lin_gdn,
+                                                  c.linear_q_heads, c.linear_v_heads,
+                                                  c.linear_head_dim, st);
+                    cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
                     kernels::launch_qwen36_gated_norm_q8(s.lin_gdn, s.lin_z, w.ssm_norm, s.aq81,
                                                          c.linear_v_heads, c.linear_head_dim,
                                                          c.rms_eps, st);
@@ -617,11 +632,23 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     else
                         kernels::launch_mmvq_q80(s.aq81, w.ssm_out, s.ao, H, s.linear_vdim, st);
                 } else {
+                    kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
+                                                  s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
+                                                  layer_state, s.lin_gdn,
+                                                  c.linear_q_heads, c.linear_v_heads,
+                                                  c.linear_head_dim, st);
+                    if (!z_ready_on_st) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
                     kernels::launch_qwen36_gated_norm(s.lin_gdn, s.lin_z, w.ssm_norm, s.lin_norm,
                                                       c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
                     proj_from(s.lin_norm, w.ssm_out, w.ssm_out_type, s.ao, H, s.linear_vdim);
                 }
             } else {
+                kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
+                                              s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
+                                              layer_state, s.lin_gdn,
+                                              c.linear_q_heads, c.linear_v_heads,
+                                              c.linear_head_dim, st);
+                if (!z_ready_on_st) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
                 kernels::launch_qwen36_gated_norm(s.lin_gdn, s.lin_z, w.ssm_norm, s.lin_norm,
                                                   c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
                 proj_from(s.lin_norm, w.ssm_out, w.ssm_out_type, s.ao, H, s.linear_vdim);

@@ -95,4 +95,17 @@ void launch_qwen36_gated_norm_q8(const void* x_bf16, const void* z_bf16,
                                  int v_heads, int head_dim, float eps,
                                  cudaStream_t stream = nullptr);
 
+// Fused GDN AR + gated RMSNorm + Q8_1 emit: one CTA per V-head, skips lin_gdn.
+// Uses the same transposed state layout as SPARKINFER_GDN_FAST.
+// scratch_bf16 is lin_gdn — unused on the fused path; used when
+// SPARKINFER_GDN_AR_GNORM=0 (or non-fast / non-128) restores the split path.
+void launch_qwen36_gdn_ar_gated_norm_q8(const void* q_bf16, const void* k_bf16,
+                                        const void* v_bf16, const void* z_bf16,
+                                        const void* alpha_bf16, const void* beta_bf16,
+                                        const void* dt_bf16, const void* a_bf16,
+                                        const void* weight_bf16, float* state_f32,
+                                        void* scratch_bf16, void* out_q8,
+                                        int q_heads, int v_heads, int head_dim,
+                                        float eps, cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

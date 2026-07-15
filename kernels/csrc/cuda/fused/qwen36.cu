@@ -444,6 +444,107 @@ __global__ void gated_norm_q8_warp_kernel(const __nv_bfloat16* __restrict__ x,
 template __global__ void gated_norm_q8_warp_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*,
     const __nv_bfloat16*, si_blk_q8_1*, int, float);
 
+// Fused GDN AR (transposed GDN_FAST state) + gated RMSNorm + Q8_1 emit.
+// One CTA per V-head: COLS warps cover all HEAD_DIM columns (looping), stage y in
+// shared memory, then run the same Q8 epilogue as gated_norm_q8_warp_kernel.
+// Removes the lin_gdn global write/read and the second kernel launch per GDN layer.
+template <int COLS, int HEAD_DIM>
+__global__ void gdn_ar_gated_norm_q8_fast_kernel(const __nv_bfloat16* __restrict__ q,
+                                                 const __nv_bfloat16* __restrict__ k,
+                                                 const __nv_bfloat16* __restrict__ v,
+                                                 const __nv_bfloat16* __restrict__ z,
+                                                 const __nv_bfloat16* __restrict__ alpha,
+                                                 const __nv_bfloat16* __restrict__ beta,
+                                                 const __nv_bfloat16* __restrict__ dt,
+                                                 const __nv_bfloat16* __restrict__ a,
+                                                 const __nv_bfloat16* __restrict__ weight,
+                                                 float* __restrict__ state,  // TRANSPOSED [vh][col][row]
+                                                 si_blk_q8_1* __restrict__ out_q8,
+                                                 int q_heads, int v_heads, float eps) {
+    constexpr int NROW = HEAD_DIM / 32;
+    __shared__ float y_sh[HEAD_DIM];
+
+    const int vh = blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (vh >= v_heads) return;
+
+    const int qh = vh % q_heads;
+    const float scale = rsqrtf((float)HEAD_DIM);
+    const float bb = q36_sigmoid(q36_to_f(beta[vh]));
+    const float g = __expf(q36_softplus(q36_to_f(alpha[vh]) + q36_to_f(dt[vh])) * q36_to_f(a[vh]));
+    const __nv_bfloat16* qhptr = q + (size_t)qh * HEAD_DIM;
+    const __nv_bfloat16* khptr = k + (size_t)qh * HEAD_DIM;
+    const __nv_bfloat16* vhptr = v + (size_t)vh * HEAD_DIM;
+
+    for (int j = warp; j < HEAD_DIM; j += COLS) {
+        float* col = state + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+        float sloc[NROW];
+        float part_sk = 0.f;
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            const float s = col[i];
+            sloc[r] = s;
+            part_sk += s * q36_to_f(khptr[i]);
+        }
+        const float sk = g * q36_wsum(part_sk);
+        const float delta = (q36_to_f(vhptr[j]) - sk) * bb;
+        float part_y = 0.f;
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            const float s_new = sloc[r] * g + q36_to_f(khptr[i]) * delta;
+            col[i] = s_new;
+            part_y += s_new * q36_to_f(qhptr[i]) * scale;
+        }
+        const float y = q36_wsum(part_y);
+        if (lane == 0) y_sh[j] = y;
+    }
+    __syncthreads();
+
+    // Epilogue: one warp per head (warp 0). Bit-identical Q8 pack to gated_norm_q8_warp_kernel
+    // when y_sh matches the bf16-rounded AR outputs of the split path.
+    if (warp != 0) return;
+    const size_t base = (size_t)vh * HEAD_DIM;
+    const int qbase = vh * NROW;
+    float ss = 0.f;
+    float xv[NROW], zv[NROW], wv[NROW];
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) {
+        const int t = lane + r * 32;
+        // Match split path: AR stores bf16, gated_norm reads bf16 → promote.
+        xv[r] = __bfloat162float(__float2bfloat16(y_sh[t]));
+        zv[r] = q36_to_f(z[base + t]);
+        wv[r] = q36_to_f(weight[t]);
+        ss += xv[r] * xv[r];
+    }
+    const float inv = rsqrtf(q36_wsum(ss) / HEAD_DIM + eps);
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) {
+        const float y = xv[r] * inv * wv[r] * q36_silu(zv[r]);
+        const float bv = __bfloat162float(__float2bfloat16(y));
+        float amax = fabsf(bv);
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+        const float d = amax / 127.0f;
+        const int qi = (amax == 0.0f) ? 0 : (int)roundf(bv / d);
+        out_q8[qbase + r].qs[lane] = (signed char)qi;
+        int s = qi;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+        if (lane == 0) out_q8[qbase + r].ds = __floats2half2_rn(d, d * (float)s);
+    }
+}
+template __global__ void gdn_ar_gated_norm_q8_fast_kernel<8, 128>(
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const __nv_bfloat16*, float*, si_blk_q8_1*, int, int, float);
+template __global__ void gdn_ar_gated_norm_q8_fast_kernel<16, 128>(
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const __nv_bfloat16*, float*, si_blk_q8_1*, int, int, float);
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
 
@@ -635,6 +736,70 @@ void launch_qwen36_gated_norm_q8(const void* x_bf16, const void* z_bf16,
         reinterpret_cast<const __nv_bfloat16*>(weight_bf16),
         reinterpret_cast<si_blk_q8_1*>(out_q8),
         v_heads, eps);
+}
+
+void launch_qwen36_gdn_ar_gated_norm_q8(const void* q_bf16, const void* k_bf16,
+                                        const void* v_bf16, const void* z_bf16,
+                                        const void* alpha_bf16, const void* beta_bf16,
+                                        const void* dt_bf16, const void* a_bf16,
+                                        const void* weight_bf16, float* state_f32,
+                                        void* scratch_bf16, void* out_q8,
+                                        int q_heads, int v_heads, int head_dim,
+                                        float eps, cudaStream_t stream) {
+    // Only the GDN_FAST transposed-state path is fused (default for Qwen3.6 decode).
+    // SPARKINFER_GDN_AR_GNORM=0 or non-fast / non-128 restores AR + gated_norm_q8.
+    static int fuse = -1;
+    if (fuse < 0) {
+        const char* e = getenv("SPARKINFER_GDN_AR_GNORM");
+        fuse = (e && e[0] == '0') ? 0 : 1;
+    }
+    static int fast = -1;
+    if (fast < 0) {
+        const char* e = getenv("SPARKINFER_GDN_FAST");
+        fast = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (fuse && fast && head_dim == 128) {
+        static int cols = -1;
+        if (cols < 0) {
+            const char* e = getenv("SPARKINFER_GDN_AR_GNORM_COLS");
+            if (e) cols = atoi(e);
+            else cols = (v_heads >= 32) ? 16 : 8;  // 16 warps × 8 cols = cover HD=128
+            if (!(cols == 8 || cols == 16)) cols = 16;
+        }
+        constexpr int HD = 128;
+        if (cols == 8) {
+            gdn_ar_gated_norm_q8_fast_kernel<8, HD><<<v_heads, 8 * 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(z_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(weight_bf16),
+                state_f32, reinterpret_cast<si_blk_q8_1*>(out_q8),
+                q_heads, v_heads, eps);
+        } else {
+            gdn_ar_gated_norm_q8_fast_kernel<16, HD><<<v_heads, 16 * 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(z_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(weight_bf16),
+                state_f32, reinterpret_cast<si_blk_q8_1*>(out_q8),
+                q_heads, v_heads, eps);
+        }
+        return;
+    }
+    launch_qwen36_gdn_ar(q_bf16, k_bf16, v_bf16, alpha_bf16, beta_bf16, dt_bf16, a_bf16,
+                         state_f32, scratch_bf16, q_heads, v_heads, head_dim, stream);
+    launch_qwen36_gated_norm_q8(scratch_bf16, z_bf16, weight_bf16, out_q8,
+                                v_heads, head_dim, eps, stream);
 }
 #endif
 
