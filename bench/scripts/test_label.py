@@ -156,6 +156,13 @@ class LabelPolicyTest(unittest.TestCase):
         self.assertEqual(res["label"], "BASELINE")
         self.assertTrue(res["pass"])
 
+    def test_prefill_frontier_scale_scores_L_at_eleven_pct(self):
+        # PR #387-shaped: ~11% sequential prefill pp over same-box main; llama-batched ref is wrong scale.
+        res = score(320.28, frontier=288.21, top1=0.94, kl=0.03,
+                    env={"SPARKINFER_DIFFICULTY_REF": "0", "SPARKINFER_DIFFICULTY_BOOST": "1"})
+        self.assertEqual(res["label"], "L")
+        self.assertGreater(res["pct_over_frontier"], 10.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

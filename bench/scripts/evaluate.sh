@@ -606,13 +606,36 @@ PY
   echo "$DECODE_LINE"
   exit 0
 fi
-PREFILL_LINE="$(SPARKINFER_DIFFICULTY_REF="$PREFILL_SELECTED_LLAMA_REF" python3 "$HERE/label.py" "$PREFILL_SELECTED_TPS" "$PREFILL_SELECTED_FRONTIER" "$CEILING" "$TOP1" "$KL" "$COMMIT" "{}")"
+PREFILL_LINE="$(SPARKINFER_DIFFICULTY_REF="$(python3 - <<PY
+# llama-batched pp refs (~11k) are not comparable to sparkinfer sequential pp (~300).
+# Tier on same-box frontier when the llama ref is the wrong scale (label.py uses frontier if DIFF_REF<=0).
+tps=float("${PREFILL_SELECTED_TPS:-0}")
+llama=float("${PREFILL_SELECTED_LLAMA_REF:-0}")
+print(llama if llama > 0 and tps > 0 and llama < tps * 50 else 0)
+PY
+)" SPARKINFER_DIFFICULTY_BOOST="${SPARKINFER_DIFFICULTY_BOOST:-1}" \
+  python3 "$HERE/label.py" "$PREFILL_SELECTED_TPS" "$PREFILL_SELECTED_FRONTIER" "$CEILING" "$TOP1" "$KL" "$COMMIT" "{}")"
 DECODE_LINE="$DECODE_LINE" PREFILL_LINE="$PREFILL_LINE" python3 - <<'PY'
 import json, os
+
+TIER_RANK = {"XL": 6, "L": 5, "M": 4, "S": 3, "XS": 2, "none": 1, "BASELINE": 0, "REJECT": -1}
+
+def tier_rank(label):
+    return TIER_RANK.get(label or "none", -1)
+
+def copy_scoring_fields(dst, src):
+    for key in ("label", "tps", "frontier_tps", "delta_tps", "pct_over_frontier",
+                "pct_of_llama", "effective_pct", "note"):
+        if key in src and src[key] is not None:
+            dst[key] = src[key]
+    if src.get("difficulty_mult") is not None:
+        dst["difficulty_mult"] = src["difficulty_mult"]
+
 decode_line = os.environ.get("DECODE_LINE", "").strip()
 prefill_raw = os.environ.get("PREFILL_LINE", "").strip()
 if not decode_line.startswith("RESULT_JSON "):
-    print(decode_line); raise SystemExit(0)
+    print(decode_line)
+    raise SystemExit(0)
 res = json.loads(decode_line[len("RESULT_JSON "):])
 if prefill_raw.startswith("RESULT_JSON "):
     pf = json.loads(prefill_raw[len("RESULT_JSON "):])
@@ -625,5 +648,11 @@ if prefill_raw.startswith("RESULT_JSON "):
     res["prefill_effective_pct"] = pf.get("effective_pct")
     if pf.get("difficulty_mult") is not None:
         res["prefill_difficulty_mult"] = pf["difficulty_mult"]
+    if tier_rank(pf.get("label")) > tier_rank(res.get("label")):
+        res["decode_label"] = res.get("label")
+        copy_scoring_fields(res, pf)
+        res["score_metric"] = "prefill"
+    else:
+        res["score_metric"] = "decode"
 print("RESULT_JSON " + json.dumps(res))
 PY
