@@ -1558,6 +1558,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                     w.router_w_type = 0;
                 }
             }
+            // Expert axis is the slowest dim; the FFN kernels stride by it with
+            // (hidden x moe_ffn) taken from metadata, so a mismatch here reads OOB.
+            if (!expect_dims(b + "ffn_gate_exps.weight", {H, c.moe_ffn, c.n_experts}) ||
+                !expect_dims(b + "ffn_up_exps.weight", {H, c.moe_ffn, c.n_experts}) ||
+                !expect_dims(b + "ffn_down_exps.weight", {c.moe_ffn, H, c.n_experts})) return false;
             w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized
             w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
             w.down_q = dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
