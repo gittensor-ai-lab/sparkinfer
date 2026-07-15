@@ -227,7 +227,8 @@ AREAS = {"kernels", "runtime", "moe", "bench"}
 # box alone is not enough (it wasted GPU on PRs whose tables were still placeholder). States:
 # greenlit -> test-on-5090 (eval); box ticked but no valid before<after gain ->
 # needs-benchmark (skip + ask for numbers); box unticked -> auto-close (rtx5090-required).
-# There is NO manual override — every eval must pass the gate on real RTX 5090 before/after numbers.
+# PRs touching runtime/ must tick the box even when the proof section was removed — non-speed
+# runtime fixes stay out of the open queue until greenlit or exempted via hold/maintainer.
 EVAL_GATE_LABEL  = "test-on-5090"     # bot-set marker: greenlit, will be evaluated
 NOT_TESTED_LABEL = "not-tested"       # legacy label — removed on close; no longer applied
 NEEDS_BENCH_LABEL = "needs-benchmark" # box ticked but decode/prefill tables missing/invalid/no-gain
@@ -378,44 +379,67 @@ def rtx5090_close_exempt(pr):
     return False
 
 
-def post_rtx5090_unchecked_comment(repo, num):
+def post_rtx5090_unchecked_comment(repo, num, runtime=False):
     owner, r = _owner_repo(repo)
+    if runtime:
+        reason = (
+            "This PR touches **`runtime/`** and was auto-closed because **Tested on RTX 5090** "
+            "is not ticked (`- [x]`). Runtime changes must show a real 5090 before/after benchmark "
+            "to enter the eval queue."
+        )
+        reopen = (
+            "1. **Edit this PR description** (you can edit while closed): add or restore the "
+            "proof-of-speedup section and tick `- [x] Tested on RTX 5090`\n"
+            "2. Fill the decode and/or prefill **before → after** tables with real "
+            "`bench/scripts/bench.sh` numbers\n"
+            "3. **Reopen** this PR\n\n"
+            "Non-speed runtime fixes that should not be evaluated need a maintainer `hold` label."
+        )
+    else:
+        reason = (
+            "This PR was auto-closed because the template includes **Tested on RTX 5090** "
+            "as `- [ ]` (unchecked). Evaluation is opt-in — tick the box only after a real "
+            "5090 run."
+        )
+        reopen = (
+            "1. **Edit this PR description** (you can edit while closed): change to "
+            "`- [x] Tested on RTX 5090`\n"
+            "2. Fill the decode and/or prefill **before → after** tables with real "
+            "`bench/scripts/bench.sh` numbers showing improvement\n"
+            "3. **Reopen** this PR\n\n"
+            "If this PR does not need GPU eval (e.g. docs-only), remove the proof-of-speedup "
+            "section from the description instead of leaving an unchecked box."
+        )
     body = (
         "<!-- sparkinfer-rtx5090-required -->\n"
-        "## Closed — RTX 5090 checkbox not ticked\n\n"
-        "This PR was auto-closed because the template includes **Tested on RTX 5090** "
-        "as `- [ ]` (unchecked). Evaluation is opt-in — tick the box only after a real "
-        "5090 run.\n\n"
+        f"## Closed — RTX 5090 checkbox not ticked\n\n"
+        f"{reason}\n\n"
         "To submit for review:\n\n"
-        "1. **Edit this PR description** (you can edit while closed): change to "
-        "`- [x] Tested on RTX 5090`\n"
-        "2. Fill the decode and/or prefill **before → after** tables with real "
-        "`bench/scripts/bench.sh` numbers showing improvement\n"
-        "3. **Reopen** this PR\n\n"
-        "If this PR does not need GPU eval (e.g. docs-only), remove the proof-of-speedup "
-        "section from the description instead of leaving an unchecked box.\n\n"
+        f"{reopen}\n\n"
         f"[CONTRIBUTING.md](https://github.com/{owner}/{r}/blob/main/CONTRIBUTING.md)\n\n"
         "<sub>Automated by eval bot / rtx5090-required CI.</sub>"
     )
     gh(["pr", "comment", str(num), "-R", repo, "--body", body])
 
 
-def close_rtx5090_unchecked_pr(repo, num, dry_run=False):
+def close_rtx5090_unchecked_pr(repo, num, dry_run=False, runtime=False):
     """Close one PR with unticked RTX 5090 checkbox (or legacy not-tested label)."""
     if dry_run:
         return True
     for lab in (EVAL_GATE_LABEL, NOT_TESTED_LABEL, NEEDS_BENCH_LABEL):
         if lab in labels_on(repo, num):
             remove_label(repo, num, lab)
-    post_rtx5090_unchecked_comment(repo, num)
+    post_rtx5090_unchecked_comment(repo, num, runtime=runtime)
     gh(["pr", "close", str(num), "-R", repo, "-c", "closed"])
     return True
 
 
 def close_unchecked_rtx5090_prs(repo, dry_run=False):
-    """Close open PRs with unticked RTX 5090 checkbox or legacy not-tested label.
+    """Close open PRs with unticked RTX 5090 checkbox, legacy not-tested label, or runtime/
+    changes without a ticked box.
 
-    Docs-only PRs without the template checkbox are left open. Returns PR numbers closed.
+    Docs-only PRs outside runtime/ without the template checkbox are left open.
+    Returns PR numbers closed.
     """
     prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open",
                          "--json", "number,title,labels,isDraft,author,authorAssociation"]).stdout or "[]")
@@ -428,14 +452,18 @@ def close_unchecked_rtx5090_prs(repo, dry_run=False):
         legacy = NOT_TESTED_LABEL in labels
         body = (json.loads(gh(["pr", "view", str(num), "-R", repo, "--json", "body"]).stdout or "{}")
                 .get("body") or "")
-        if not legacy and not rtx5090_should_close(body):
+        areas = areas_for_pr(repo, num)
+        runtime_gate = "runtime" in areas
+        if not legacy and not rtx5090_should_close(body, areas):
             continue
-        print(f"PR #{num}: RTX 5090 unchecked{' (legacy not-tested)' if legacy else ''}"
+        why = "legacy not-tested" if legacy else ("runtime without ticked box" if runtime_gate
+                                                    else "unchecked checkbox")
+        print(f"PR #{num}: RTX 5090 gate ({why})"
               f"{' — would close' if dry_run else ' — closing'}")
         if dry_run:
             closed.add(num)
             continue
-        close_rtx5090_unchecked_pr(repo, num)
+        close_rtx5090_unchecked_pr(repo, num, runtime=runtime_gate and not legacy)
         closed.add(num)
     if closed:
         print(f">> close_unchecked_rtx5090: {'would close' if dry_run else 'closed'} "
@@ -679,9 +707,15 @@ def rtx5090_box_checked(body):
         for ln in (body or "").splitlines()
     )
 
-def rtx5090_should_close(body):
-    """True when the 5090 checkbox is present in the PR body but not ticked."""
-    return rtx5090_has_checkbox(body) and not rtx5090_box_checked(body)
+def rtx5090_should_close(body, areas=None):
+    """True when the 5090 box is not ticked and either the template checkbox is present
+    unchecked, or the PR touches runtime/ (runtime changes require greenlight)."""
+    if rtx5090_box_checked(body):
+        return False
+    areas = areas or set()
+    if "runtime" in areas:
+        return True
+    return rtx5090_has_checkbox(body)
 
 def greenlight_status(repo, num, pr_labels):
     """Decide whether a PR may be evaluated. Returns (status, reason):
@@ -1912,6 +1946,9 @@ def main():
         unchecked_closed = close_unchecked_rtx5090_prs(args.repo, dry_run=args.dry_run)
         if unchecked_closed:
             prs = [p for p in prs if p["number"] not in unchecked_closed]
+        exhausted_closed = close_exhausted_eval_prs(args.repo, dry_run=args.dry_run)
+        if exhausted_closed:
+            prs = [p for p in prs if p["number"] not in exhausted_closed]
     if only_set:
         prs = [p for p in prs if p["number"] in only_set]
         if not prs:
