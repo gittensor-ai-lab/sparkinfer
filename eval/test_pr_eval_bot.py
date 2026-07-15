@@ -183,6 +183,72 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertIn("not measured (0 pp tok/s on all contexts)", body)
         self.assertIn("4k prefill no-regression gate | 0.0 pp tok/s vs main 289.26 pp tok/s · fail", body)
 
+    def test_bidir_optimize_rows_use_scored_model_not_guard(self):
+        q35 = "Qwythos-9B (Q4_K_M)"
+        q36 = "Qwen3.6-35B-A3B"
+        res = {
+            "mode": "bidir",
+            "label": "REJECT",
+            "pass": False,
+            "label_qwen35": "REJECT",
+            "label_qwen36": "REJECT",
+            "pass_qwen35": False,
+            "pass_qwen36": False,
+            "score_qwen35": {
+                "label": "REJECT",
+                "pass": False,
+                "model": q35,
+                "guard_model": q36,
+                "tps": 283.6,
+                "top1": 0.922,
+                "kl": 0.0407,
+                "ctx_128_tps": 295.0,
+                "ctx_65536_tps": 283.45,
+                "guard_128_pass": True,
+                "guard_64k_pass": True,
+                "guard": {
+                    "top1": 0.927,
+                    "kl": 0.0457,
+                    "accuracy_ok": True,
+                    "ctx_128_tps": 465.24,
+                    "ctx_65536_tps": 403.7,
+                    "guard_128_pass": True,
+                    "guard_64k_pass": False,
+                },
+            },
+            "score_qwen36": {
+                "label": "REJECT",
+                "pass": False,
+                "model": q36,
+                "guard_model": q35,
+                "tps": 441.47,
+                "top1": 0.927,
+                "kl": 0.0457,
+                "ctx_128_tps": 465.15,
+                "ctx_32768_tps": 403.75,
+                "guard_128_pass": True,
+                "guard_32k_pass": False,
+                "guard": {
+                    "top1": 0.922,
+                    "kl": 0.0407,
+                    "accuracy_ok": True,
+                    "ctx_128_tps": 294.79,
+                    "ctx_65536_tps": 283.16,
+                    "guard_128_pass": True,
+                    "guard_64k_pass": True,
+                },
+            },
+        }
+        body = bot.render(res, "99ae7d5")
+        self.assertIn(f"Qwen3.5 optimize — {q36} guard accuracy", body)
+        self.assertIn(f"Qwen3.6 optimize — {q35} guard accuracy", body)
+        self.assertIn(f"Qwen3.5 optimize — {q35} 128 | 295.0 tok/s", body)
+        self.assertIn(f"Qwen3.5 optimize — {q35} 64k | 283.45 tok/s", body)
+        self.assertIn(f"Qwen3.6 optimize — {q36} 128 | 465.15 tok/s", body)
+        self.assertIn(f"Qwen3.6 optimize — {q36} 32k | 403.75 tok/s", body)
+        self.assertNotIn(f"Qwen3.5 optimize — {q36} 128 | 465.24", body)
+        self.assertNotIn(f"Qwen3.6 optimize — {q35} 64k | 283.16", body)
+
     def test_mixed_win_render_keeps_eval_label_and_shows_regression(self):
         res = {
             "label": "S",

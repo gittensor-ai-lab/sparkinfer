@@ -899,6 +899,7 @@ def render(res, oid):
                         f"{block.get('tps','?')} tok/s · {'pass' if block.get('pass') else 'fail'} |")
             g = block.get("guard") or {}
             gname = block.get("guard_model", "guard")
+            mname = block.get("model", title.replace(" optimize", ""))
             if g:
                 rows.append(f"| {title} — {gname} guard accuracy | "
                             f"top-1 {g.get('top1',0)*100:.1f}% · KL {g.get('kl','?')} · "
@@ -910,11 +911,11 @@ def render(res, oid):
                                        ("ctx_32768_tps", "guard_32k_pass", "32k"),
                                        ("ctx_65536_tps", "guard_64k_pass", "64k"),
                                        ("ctx_131072_tps", "guard_128k_pass", "128k")]:
-                    tps = g.get(key)
+                    tps = block.get(key)
                     if not tps:
                         continue
-                    rows.append(f"| {title} — {gname} {lbl} | {tps} tok/s · "
-                                f"{'pass' if g.get(gkey, True) else '**fail**'} |")
+                    rows.append(f"| {title} — {mname} {lbl} | {tps} tok/s · "
+                                f"{'pass' if block.get(gkey, True) else '**fail**'} |")
     if dual:
         acc_ok = "pass" if guard.get("accuracy_ok", True) else "**FAIL**"
         rows.append(f"| **{gname} guard — accuracy** | top-1 {guard.get('top1',0)*100:.1f}% · KL {guard.get('kl','?')} · {acc_ok} |")
