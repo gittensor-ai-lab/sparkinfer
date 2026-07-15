@@ -19,4 +19,4 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_DIR" || exit 1
 git pull -q origin main 2>/dev/null || true        # keep the bot + dashboard current
 echo "[$(date -u +%FT%TZ)] sparkinfer dashboard sync"
-python3 -c "import sys; sys.path.insert(0,'eval'); import pr_eval_bot as b; b.reconcile_merge_labels('${REPO:-gittensor-ai-lab/sparkinfer}')"
+python3 -c "import sys; sys.path.insert(0,'eval'); import pr_eval_bot as b; r='${REPO:-gittensor-ai-lab/sparkinfer}'; b.close_exhausted_eval_prs(r); b.reconcile_merge_labels(r)"

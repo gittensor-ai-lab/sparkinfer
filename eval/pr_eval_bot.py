@@ -529,6 +529,43 @@ def close_exhausted_eval_prs(repo, max_none_reject=EXHAUSTED_EVAL_MAX, dry_run=F
     return closed
 
 
+def run_poll_auto_closes(repo, dry_run=False):
+    """Stale / unchecked-5090 / exhausted-eval sweeps — run at each bot poll tick."""
+    closed = set()
+    for got in (
+        close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=dry_run),
+        close_unchecked_rtx5090_prs(repo, dry_run=dry_run),
+        close_exhausted_eval_prs(repo, dry_run=dry_run),
+    ):
+        closed |= got
+    return closed
+
+
+def maybe_close_exhausted_pr(repo, num, dry_run=False):
+    """Close one PR if it just crossed the none/REJECT exhaustion threshold."""
+    r = gh(["pr", "view", str(num), "-R", repo, "--json", "labels,isDraft"])
+    pr = json.loads(r.stdout or "{}")
+    if pr.get("isDraft"):
+        return False
+    labels = {l["name"] for l in pr.get("labels", [])}
+    if labels & STALE_CLOSE_SKIP_LABELS:
+        return False
+    count = none_reject_eval_count(repo, num)
+    if count <= EXHAUSTED_EVAL_MAX:
+        return False
+    print(f"PR #{num}: {count} none/REJECT eval(s) (limit >{EXHAUSTED_EVAL_MAX})"
+          f"{' — would close' if dry_run else ' — closing'}")
+    if dry_run:
+        return True
+    body = ("<!-- sparkinfer-exhausted -->\n"
+            f"## Closed: {count} evaluations with no verified speedup or rejection\n\n"
+            f"This PR received **{count}** completed sparkinfer auto-evaluations labeled "
+            f"`eval:none` or `eval:REJECT` (limit: more than {EXHAUSTED_EVAL_MAX}).\n\n"
+            "Open a fresh PR if you have a new optimization to try.")
+    gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+    return gh(["pr", "close", str(num), "-R", repo]).returncode == 0
+
+
 def close_blocked_pr(repo, num, hits):
     """Label flagged:gaming, comment with the reason, and close the PR. Returns True on close."""
     add_label(repo, num, FLAG_LABEL)
@@ -1941,15 +1978,9 @@ def main():
     only_set = _parse_only_prs(args.only_pr, args.only_prs)
     targeted = bool(only_set)
     if not targeted:
-        stale_closed = close_stale_prs(args.repo, days=STALE_PR_DAYS, dry_run=args.dry_run)
-        if stale_closed:
-            prs = [p for p in prs if p["number"] not in stale_closed]
-        unchecked_closed = close_unchecked_rtx5090_prs(args.repo, dry_run=args.dry_run)
-        if unchecked_closed:
-            prs = [p for p in prs if p["number"] not in unchecked_closed]
-        exhausted_closed = close_exhausted_eval_prs(args.repo, dry_run=args.dry_run)
-        if exhausted_closed:
-            prs = [p for p in prs if p["number"] not in exhausted_closed]
+        auto_closed = run_poll_auto_closes(args.repo, dry_run=args.dry_run)
+        if auto_closed:
+            prs = [p for p in prs if p["number"] not in auto_closed]
     if only_set:
         prs = [p for p in prs if p["number"] in only_set]
         if not prs:
@@ -2339,6 +2370,8 @@ def main():
                 add_label(args.repo, num, REEVALUATE_LABEL)
         gh(["pr", "comment", str(num), "-R", args.repo, "--body", body])
         print(f"PR #{num}: posted {'eval:'+label if label else 'error'} — NOT merged.")
+        if label in FAIL_VERDICT_LABELS and not targeted:
+            maybe_close_exhausted_pr(args.repo, num, dry_run=args.dry_run)
         if res:
             proof = upload_eval_log(args.repo, num, pr.get("title", ""), oid, res,
                                     r.stdout + r.stderr, run_baseline, polaris=polaris_bundle)
@@ -2349,6 +2382,10 @@ def main():
             # Rejected PRs stay open so authors can rebase and re-submit.
         # NB: run_baseline is NOT ratcheted here — every PR is graded against merged origin/main, so
         # independent optimizations each get their true gain (the frontier advances on MERGE, not eval).
+
+    # Re-scan exhausted PRs after grading — a none/REJECT posted this round may cross the limit.
+    if not targeted and not args.dry_run:
+        run_poll_auto_closes(args.repo)
 
     # Per-round merge workflow: among the PRs graded this round, label the biggest verified speedup
     # `merge-first` and the rest `needs-rebase`; if a prior winner merged, flag its rivals `re-evaluate`.

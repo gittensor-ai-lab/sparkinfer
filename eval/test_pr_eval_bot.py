@@ -874,6 +874,33 @@ class ExhaustedEvalCloseTest(unittest.TestCase):
         self.assertEqual(closed, {11})
         close_mock.assert_called_once()
 
+    def test_run_poll_auto_closes(self):
+        with mock.patch.object(bot, "close_stale_prs", return_value={1}), \
+             mock.patch.object(bot, "close_unchecked_rtx5090_prs", return_value={2}), \
+             mock.patch.object(bot, "close_exhausted_eval_prs", return_value={3}):
+            closed = bot.run_poll_auto_closes("gittensor-ai-lab/sparkinfer")
+        self.assertEqual(closed, {1, 2, 3})
+
+    def test_maybe_close_exhausted_pr(self):
+        view_mock = mock.Mock(return_value=mock.Mock(
+            stdout=json.dumps({"labels": [], "isDraft": False})))
+        close_mock = mock.Mock(return_value=mock.Mock(returncode=0))
+        comment_mock = mock.Mock(return_value=mock.Mock(returncode=0))
+
+        def gh_side_effect(args, *a, **kw):
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "view":
+                return view_mock(*a, **kw)
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "close":
+                return close_mock(*a, **kw)
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "comment":
+                return comment_mock(*a, **kw)
+            return mock.Mock(stdout="{}")
+
+        with mock.patch.object(bot, "gh", side_effect=gh_side_effect), \
+             mock.patch.object(bot, "none_reject_eval_count", return_value=3):
+            self.assertTrue(bot.maybe_close_exhausted_pr("gittensor-ai-lab/sparkinfer", 99))
+        close_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
