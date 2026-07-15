@@ -545,7 +545,7 @@ template <int H, int F>
 __global__ void shared_gate_up_q8_mmvq_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
-    float* __restrict__ h_scratch) {
+    float* __restrict__ h_scratch, int pdl) {
     constexpr int NW = 4, WS = 32;
     const int f = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
     const int nblk = H >> 5;
@@ -568,12 +568,14 @@ __global__ void shared_gate_up_q8_mmvq_kernel(
         float w = dw ? __ldg(dw) : 1.f;
         h_scratch[f] = w * q4kf_silu(tg) * tu;
     }
+    if (pdl) si_pdl_lc();   // PDL: signal quant_h/down after h_scratch is written
 }
 
 template <int H, int F, bool ACCUM>
 __global__ void shared_down_q8_mmvq_kernel(
     const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
-    __nv_bfloat16* __restrict__ out) {
+    __nv_bfloat16* __restrict__ out, int pdl) {
+    if (pdl) si_pdl_sync();   // PDL: wait for quant_h's Q8_1(h) before reading it
     const int h = blockIdx.x * WPB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (h >= H) return;
     const int nblk = F >> 5;
@@ -1523,21 +1525,27 @@ void launch_shared_expert_q8_mmvq(
             reinterpret_cast<const __nv_bfloat16*>(input), qbuf, hidden);
         vy = qbuf;
     }
-    shared_gate_up_q8_mmvq_kernel<2048, 512><<<ffn, 4 * 32, 0, stream>>>(
+    const int gu_pdl = gu_mmvq_pdl();
+    const int down_pdl = down_mmvq_pdl();
+    const int q_pdl = gu_pdl && down_pdl;
+    launch_pdl_kernel(gu_pdl, dim3(ffn), dim3(4 * 32), 0, stream,
+        shared_gate_up_q8_mmvq_kernel<2048, 512>,
         vy, reinterpret_cast<const unsigned char*>(gate_q),
-        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch, gu_pdl);
     const int nqb = ffn >> 5;
-    quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
-        h_scratch, qbuf, nqb, 0);
+    launch_pdl_kernel(q_pdl, dim3((nqb + 7) / 8), dim3(8 * 32), 0, stream,
+        quant_h_q8_1_kernel, h_scratch, qbuf, nqb, q_pdl);
     dim3 dn((hidden + WPB - 1) / WPB);
     if (accum) {
-        shared_down_q8_mmvq_kernel<2048, 512, true><<<dn, WPB * 32, 0, stream>>>(
+        launch_mmvq_down_kernel(down_pdl, dn, dim3(WPB * 32), stream,
+            shared_down_q8_mmvq_kernel<2048, 512, true>,
             qbuf, reinterpret_cast<const unsigned char*>(down_q),
-            reinterpret_cast<__nv_bfloat16*>(output));
+            reinterpret_cast<__nv_bfloat16*>(output), down_pdl);
     } else {
-        shared_down_q8_mmvq_kernel<2048, 512, false><<<dn, WPB * 32, 0, stream>>>(
+        launch_mmvq_down_kernel(down_pdl, dn, dim3(WPB * 32), stream,
+            shared_down_q8_mmvq_kernel<2048, 512, false>,
             qbuf, reinterpret_cast<const unsigned char*>(down_q),
-            reinterpret_cast<__nv_bfloat16*>(output));
+            reinterpret_cast<__nv_bfloat16*>(output), down_pdl);
     }
 }
 #endif
