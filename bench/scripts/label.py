@@ -16,8 +16,9 @@ Emits one line:  RESULT_JSON {...}
   delta/frontier: over an un-optimized frontier (e.g. Qwen3.6 at 23 tok/s) a small absolute gain used
   to explode to XL, while a mature model (past llama) couldn't clear XS for equal effort. The
   past-llama difficulty boost (Option B) still multiplies the *tier* once the frontier is beyond the
-  reference. Significance still gates on raw %-over-frontier (a gain must beat the current best);
-  pct_over_frontier reports the honest measured speedup; pct_of_llama is the tier basis.
+  reference, then caps tier credit at 2× the measured %-over-frontier. Significance still gates on raw
+  %-over-frontier (a gain must beat the current best); pct_over_frontier reports the honest measured
+  speedup; pct_of_llama is the tier basis.
   llama_ref (SPARKINFER_DIFFICULTY_REF) <= 0 falls back to the legacy delta/frontier basis.
   Thresholds are governance-tunable.
 """
@@ -54,13 +55,15 @@ BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 # As the frontier pulls past a mature reference (llama.cpp), each further % gain is harder; scale the
 # LABEL up so a late-game hard PR scores like the effort it took. D = 1 for a frontier at/below the
 # reference (the cold-start era is untouched — no retroactive inflation), grows with distance past it,
-# and is bounded by DIFF_MAX so nothing runs away to XL. Crucially the boost multiplies the *label*
-# only: the significance gate stays on the RAW delta (so noise is never boosted) and pct_over_frontier
-# still reports the true measured speedup. OFF by default.
+# and is bounded by DIFF_MAX so nothing runs away to XL. Tier credit is then capped at 2× the measured
+# %-over-frontier (g) so a low per-context llama ref cannot inflate the label past twice the real
+# speedup. Crucially the boost multiplies the *label* only: the significance gate stays on the RAW
+# delta (so noise is never boosted) and pct_over_frontier reports the true measured speedup. OFF by
+# default.
 DIFF_BOOST = os.environ.get("SPARKINFER_DIFFICULTY_BOOST", "0") == "1"
 DIFF_K     = float(os.environ.get("SPARKINFER_DIFFICULTY_K",   "8"))
 DIFF_REF   = float(os.environ.get("SPARKINFER_DIFFICULTY_REF", "365.85"))  # llama.cpp 128-tok tok/s
-DIFF_MAX   = float(os.environ.get("SPARKINFER_DIFFICULTY_MAX", "2"))
+DIFF_MAX   = float(os.environ.get("SPARKINFER_DIFFICULTY_MAX", "1.5"))
 
 def difficulty_mult(frontier):
     if not DIFF_BOOST or DIFF_REF <= 0:
@@ -92,7 +95,7 @@ else:
         ref = DIFF_REF if DIFF_REF > 0 else frontier
         g_fair = delta / ref
         D = difficulty_mult(frontier)                   # hard-gain boost once past the reference
-        g_eff = g_fair * D
+        g_eff = min(g_fair * D, 2 * g)                  # strict cap: tier credit ≤ 2× measured speedup
         # A verified improvement over the frontier floors at XS (real but small); the higher tiers
         # (S/M/L/XL) are earned by the llama-anchored size. So "none" always means "not a verified
         # improvement", never "real but tiny".

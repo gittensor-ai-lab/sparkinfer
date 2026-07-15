@@ -69,28 +69,41 @@ class LabelPolicyTest(unittest.TestCase):
         self.assertEqual(score(28.0, frontier=23.0, env=env)["label"], "XS")   # +5 (+22% over frontier) but 2.6% of llama
         self.assertEqual(score(171.0, frontier=23.0, env=env)["label"], "XL")  # a real 7x IS an XL (78% of llama)
 
-    def test_difficulty_boost_changes_label_but_not_raw_percent(self):
+    def test_difficulty_boost_high_cap_still_capped_at_twice_raw_speedup(self):
+        # Even with a generous DIFF_MAX, g_eff cannot exceed 2× pct_over_frontier.
         res = score(484.79, frontier=469.13, ceiling=366.0, top1=0.9612, kl=0.0175,
                     commit="c30bf58",
                     env={"SPARKINFER_DIFFICULTY_BOOST": "1",
                          "SPARKINFER_DIFFICULTY_REF": "365.85",
                          "SPARKINFER_DIFFICULTY_K": "8",
                          "SPARKINFER_DIFFICULTY_MAX": "4"})
-        self.assertEqual(res["label"], "L")
+        self.assertEqual(res["label"], "M")
         self.assertEqual(res["pct_over_frontier"], 3.3)
-        self.assertGreaterEqual(res["effective_pct"], 10.0)
-        self.assertLess(res["effective_pct"], 18.0)
+        self.assertGreaterEqual(res["effective_pct"], 6.0)
+        self.assertLess(res["effective_pct"], 10.0)
 
-    def test_difficulty_boost_default_cap_is_two_x(self):
-        # Default SPARKINFER_DIFFICULTY_MAX=2: same raw gain as above, but capped boost -> lower tier.
+    def test_difficulty_boost_default_cap_is_one_point_five_x(self):
+        # Default SPARKINFER_DIFFICULTY_MAX=1.5 with strict 2× raw cap.
         res = score(484.79, frontier=469.13, ceiling=366.0, top1=0.9612, kl=0.0175,
                     commit="c30bf58",
                     env={"SPARKINFER_DIFFICULTY_BOOST": "1",
                          "SPARKINFER_DIFFICULTY_REF": "365.85",
                          "SPARKINFER_DIFFICULTY_K": "8"})
         self.assertEqual(res["label"], "M")
-        self.assertEqual(res["difficulty_mult"], 2.0)
+        self.assertEqual(res["difficulty_mult"], 1.5)
         self.assertEqual(res["pct_over_frontier"], 3.3)
+        self.assertGreaterEqual(res["effective_pct"], 6.0)
+        self.assertLess(res["effective_pct"], 10.0)
+
+    def test_strict_cap_limits_per_context_llama_ref_inflation(self):
+        # Qwen3.6 @ 128: a low per-context llama ref must not push a ~3% raw gain to L.
+        res = score(479.96, frontier=465.41, ceiling=366.0, top1=0.967, kl=0.0281,
+                    commit="d12766f",
+                    env={"SPARKINFER_DIFFICULTY_BOOST": "1",
+                         "SPARKINFER_DIFFICULTY_REF": "275.81",
+                         "SPARKINFER_DIFFICULTY_K": "8"})
+        self.assertEqual(res["label"], "M")
+        self.assertEqual(res["pct_over_frontier"], 3.1)
         self.assertGreaterEqual(res["effective_pct"], 6.0)
         self.assertLess(res["effective_pct"], 10.0)
 
