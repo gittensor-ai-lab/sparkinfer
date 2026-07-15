@@ -672,10 +672,11 @@ class PrEvalBotPolicyTest(unittest.TestCase):
             return mock.Mock(returncode=0)
 
         with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+             mock.patch.object(bot, "areas_for_pr", return_value=set()), \
              mock.patch.object(bot, "close_rtx5090_unchecked_pr") as close_one:
             closed = bot.close_unchecked_rtx5090_prs("gittensor-ai-lab/sparkinfer")
         self.assertEqual(closed, {10})
-        close_one.assert_called_once_with("gittensor-ai-lab/sparkinfer", 10)
+        close_one.assert_called_once_with("gittensor-ai-lab/sparkinfer", 10, runtime=False)
 
     def test_close_unchecked_legacy_not_tested_label(self):
         ticked = self._TEMPLATE_DECODE.format(db=300, da=320)
@@ -689,10 +690,33 @@ class PrEvalBotPolicyTest(unittest.TestCase):
             return mock.Mock(returncode=0)
 
         with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+             mock.patch.object(bot, "areas_for_pr", return_value=set()), \
              mock.patch.object(bot, "close_rtx5090_unchecked_pr") as close_one:
             closed = bot.close_unchecked_rtx5090_prs("gittensor-ai-lab/sparkinfer")
         self.assertEqual(closed, {11})
-        close_one.assert_called_once_with("gittensor-ai-lab/sparkinfer", 11)
+        close_one.assert_called_once_with("gittensor-ai-lab/sparkinfer", 11, runtime=False)
+
+    def test_close_unchecked_closes_runtime_without_checkbox(self):
+        pr, body = self._unchecked_pr(30, body="runtime correctness fix — no proof section")
+
+        def fake_gh(args):
+            if args[:3] == ["pr", "list", "-R"]:
+                return mock.Mock(stdout=json.dumps([pr]))
+            if args[:4] == ["pr", "view", "30", "-R"]:
+                return mock.Mock(stdout=json.dumps({"body": body}))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+             mock.patch.object(bot, "areas_for_pr", return_value={"runtime"}), \
+             mock.patch.object(bot, "close_rtx5090_unchecked_pr") as close_one:
+            closed = bot.close_unchecked_rtx5090_prs("gittensor-ai-lab/sparkinfer")
+        self.assertEqual(closed, {30})
+        close_one.assert_called_once_with("gittensor-ai-lab/sparkinfer", 30, runtime=True)
+
+    def test_rtx5090_should_close_runtime_without_checkbox(self):
+        self.assertTrue(bot.rtx5090_should_close("no checkbox", {"runtime"}))
+        self.assertFalse(bot.rtx5090_should_close("no checkbox", {"kernels"}))
+        self.assertFalse(bot.rtx5090_should_close("docs only", set()))
 
     def test_close_unchecked_skips_exempt_and_no_checkbox(self):
         unchecked_body = self._TEMPLATE_DECODE.format(db=300, da=320).replace("[x]", "[ ]")
@@ -716,6 +740,7 @@ class PrEvalBotPolicyTest(unittest.TestCase):
             return mock.Mock(returncode=0)
 
         with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+             mock.patch.object(bot, "areas_for_pr", return_value=set()), \
              mock.patch.object(bot, "close_rtx5090_unchecked_pr") as close_one:
             closed = bot.close_unchecked_rtx5090_prs("gittensor-ai-lab/sparkinfer", dry_run=True)
         self.assertEqual(closed, {25})
