@@ -703,12 +703,78 @@ __global__ void conv_split_l2norm_fused_kernel(
     }
 }
 
+// Qwen3.6 GDN conv is fixed at 16 Q heads, 32 V heads, head_dim 128, 4-tap filter.
+// Specialize away runtime shape arithmetic while preserving accumulation order.
+__global__ void conv_split_l2norm_qwen_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ conv_w,
+    __nv_bfloat16* __restrict__ conv_state,
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    __nv_bfloat16* __restrict__ v,
+    float eps)
+{
+    constexpr int QH = 16, VH = 32, HD = 128, QDIM = QH * HD, QKVDIM = (2 * QH + VH) * HD;
+    const int h = blockIdx.x;
+    const int t = threadIdx.x;
+    const int d = h * HD + t;
+    const bool do_norm = h < 2 * QH;
+    __nv_bfloat16* out = h < QH ? q + d : h < 2 * QH ? k + d - QDIM : v + d - 2 * QDIM;
+
+    const __nv_bfloat16 x0 = conv_state[d];
+    const __nv_bfloat16 x1 = conv_state[QKVDIM + d];
+    const __nv_bfloat16 x2 = conv_state[2 * QKVDIM + d];
+    const __nv_bfloat16 x3 = qkv[d];
+    const __nv_bfloat16* w = conv_w + (size_t)d * 4;
+    float y = 0.f;
+    y += q36_to_f(x0) * q36_to_f(w[0]);
+    y += q36_to_f(x1) * q36_to_f(w[1]);
+    y += q36_to_f(x2) * q36_to_f(w[2]);
+    y += q36_to_f(x3) * q36_to_f(w[3]);
+
+    conv_state[d] = x1;
+    conv_state[QKVDIM + d] = x2;
+    conv_state[2 * QKVDIM + d] = x3;
+
+    const float oy = q36_silu(y);
+    if (do_norm) {
+        const float ss = q36_wsum(oy * oy);
+        __shared__ float sw[32];
+        if ((t & 31) == 0) sw[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = t < 4 ? sw[t] : 0.f;
+            vv = q36_wsum(vv);
+            if (t == 0) sw[0] = rsqrtf(vv + eps);
+        }
+        __syncthreads();
+        out[0] = __float2bfloat16(oy * sw[0]);
+    } else {
+        out[0] = __float2bfloat16(oy);
+    }
+}
+
 void launch_qwen36_conv_split_l2norm_fused(
     const void* qkv_bf16, const void* conv_w_bf16,
     void* conv_state_bf16, void* q_bf16, void* k_bf16,
     void* v_bf16, int q_heads, int v_heads, int head_dim,
     int conv_kernel, float eps, cudaStream_t stream)
 {
+    static int qwen_special = -1;
+    if (qwen_special < 0) {
+        const char* e = getenv("SPARKINFER_GDN_CONV_SPECIAL");
+        qwen_special = !(e && e[0] == '0');
+    }
+    if (qwen_special && q_heads == 16 && v_heads == 32 && head_dim == 128 && conv_kernel == 4) {
+        conv_split_l2norm_qwen_kernel<<<64, 128, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(qkv_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
+            reinterpret_cast<__nv_bfloat16*>(conv_state_bf16),
+            reinterpret_cast<__nv_bfloat16*>(q_bf16),
+            reinterpret_cast<__nv_bfloat16*>(k_bf16),
+            reinterpret_cast<__nv_bfloat16*>(v_bf16), eps);
+        return;
+    }
     conv_split_l2norm_fused_kernel<<<2 * q_heads + v_heads, head_dim, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(qkv_bf16),
         reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
