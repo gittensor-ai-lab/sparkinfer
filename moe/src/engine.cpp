@@ -53,7 +53,20 @@ public:
                     num_tokens, max_tokens_);
             return;
         }
+        if (layer < 0 || layer >= (int)weights_.size()) {
+            // weights_ is sized to cfg.num_layers; set_layer_weights() already range-checks,
+            // so an out-of-range read here would be UB on the vector.
+            fprintf(stderr, "[moe] forward: layer %d out of range [0, %d) — skipping\n",
+                    layer, (int)weights_.size());
+            return;
+        }
         const LayerWeights& w = weights_[layer];
+        if (!w.router_w || !w.gate_w || !w.up_w || !w.down_w) {
+            // LayerWeights defaults to all-null, so a layer whose set_layer_weights()
+            // was skipped would launch the kernels on null device pointers.
+            fprintf(stderr, "[moe] forward: layer %d weights unset — skipping\n", layer);
+            return;
+        }
         const int E = cfg_.num_experts, K = cfg_.top_k;
         const int H = cfg_.hidden_dim, F = cfg_.ffn_dim;
 
