@@ -112,6 +112,12 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
   local sentinel="$LLAMACPP_DIR/.si_refhash"
   local arch="$1" bdir="$LLAMACPP_DIR/build"
   [ -x "$bench" ] && ! _llamacpp_binary_ok "$bench" && { echo ">> WARN: llama-bench looks truncated — rebuild" >&2; rm -f "$bench"; }
+  # Stale partial trees (UI assets, old CMakeCache) leave llama-server broken while llama-bench exists.
+  if [ ! -x "$srv" ] && { [ -d "$bdir/tools/ui" ] || [ -f "$bdir/CMakeCache.txt" ]; }; then
+    echo ">> llama.cpp llama-server missing — purging stale build tree ..." >&2
+    rm -rf "$bdir"
+    rm -f "$sentinel"
+  fi
   [ -x "$bench" ] && [ -x "$srv" ] && _llamacpp_clean "$bench" "$sentinel" && return 0
   echo ">> (re)building llama.cpp reference (CUDA sm_$arch) ..." >&2
   if [ -n "${LLAMACPP_COMMIT:-}" ]; then
