@@ -23,6 +23,12 @@ detect_arch() {
   echo "${ARCH:-${cc:-120}}"
 }
 
+# Bare-metal SSH boxes often install nvcc outside default PATH (non-interactive ssh).
+for _cuda in /usr/local/cuda-12.8 /usr/local/cuda-13.0 /usr/local/cuda; do
+  [ -x "$_cuda/bin/nvcc" ] && export PATH="$_cuda/bin:$PATH" && export CUDA_HOME="$_cuda" && break
+done
+unset _cuda
+
 # nvcc 12.8 fails against Ubuntu 24.04's GCC 13.3 libstdc++ (cstdio / __gnu_cxx errors). Pin the
 # CUDA host compiler to g++-12 (a fully supported combo) when it's available.
 CUDA_HOST_FLAG=""
@@ -101,9 +107,12 @@ _llamacpp_purge_stale_build() {  # $1=bdir — drop UI tree when headless server
     rm -rf "$bdir"
     return 0
   fi
-  if [ -f "$bdir/CMakeCache.txt" ] && ! grep -q 'LLAMA_BUILD_UI:BOOL=OFF' "$bdir/CMakeCache.txt" 2>/dev/null; then
-    echo ">> llama.cpp reconfigure (LLAMA_BUILD_UI=OFF for headless server) ..." >&2
-    rm -rf "$bdir"
+  if [ -f "$bdir/CMakeCache.txt" ]; then
+    if ! grep -q 'LLAMA_BUILD_UI:BOOL=OFF' "$bdir/CMakeCache.txt" 2>/dev/null || \
+       ! grep -q 'LLAMA_USE_PREBUILT_UI:BOOL=OFF' "$bdir/CMakeCache.txt" 2>/dev/null; then
+      echo ">> llama.cpp reconfigure (headless server, no prebuilt UI) ..." >&2
+      rm -rf "$bdir"
+    fi
   fi
 }
 
@@ -111,7 +120,6 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
   local bench="$LLAMACPP_DIR/build/bin/llama-bench" srv="$LLAMACPP_DIR/build/bin/llama-server"
   local sentinel="$LLAMACPP_DIR/.si_refhash"
   local arch="$1" bdir="$LLAMACPP_DIR/build"
-  [ -x "$bench" ] && ! _llamacpp_binary_ok "$bench" && { echo ">> WARN: llama-bench looks truncated — rebuild" >&2; rm -f "$bench"; }
   # Stale partial trees (UI assets, old CMakeCache) leave llama-server broken while llama-bench exists.
   if [ ! -x "$srv" ] && { [ -d "$bdir/tools/ui" ] || [ -f "$bdir/CMakeCache.txt" ]; }; then
     echo ">> llama.cpp llama-server missing — purging stale build tree ..." >&2
@@ -144,7 +152,8 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
   if [ ! -f "$bdir/CMakeCache.txt" ]; then
     : > /tmp/llama_build.log
     if ! cmake -S "$LLAMACPP_DIR" -B "$bdir" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$arch" \
-          -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF \
+          -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=ON \
+          -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
           $CUDA_HOST_FLAG >&2; then
       echo ">> FATAL: llama.cpp cmake configure failed" >&2; return 1
     fi

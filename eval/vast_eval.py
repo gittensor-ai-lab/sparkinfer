@@ -73,15 +73,17 @@ def push_bench_scripts(host, port):
     source = "local checkout"
     extract_root = "/root/sparkinfer/bench/scripts"
     # Prefer origin/main — local tree may be behind (stale harness skews baseline guards).
-    subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT, capture_output=True, timeout=120)
-    arch = subprocess.run(
-        ["git", "archive", "--format=tar.gz", "origin/main", "bench/scripts"],
-        cwd=ROOT, capture_output=True, timeout=120)
-    if arch.returncode == 0 and arch.stdout:
-        tar_data = arch.stdout
-        source = "origin/main"
-        extract_root = "/root/sparkinfer"
-    elif os.path.isdir(BENCH_SCRIPTS):
+    use_local = os.environ.get("SPARKINFER_USE_LOCAL_BENCH", "").strip().lower() in ("1", "true", "yes")
+    if not use_local:
+        subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT, capture_output=True, timeout=120)
+        arch = subprocess.run(
+            ["git", "archive", "--format=tar.gz", "origin/main", "bench/scripts"],
+            cwd=ROOT, capture_output=True, timeout=120)
+        if arch.returncode == 0 and arch.stdout:
+            tar_data = arch.stdout
+            source = "origin/main"
+            extract_root = "/root/sparkinfer"
+    if tar_data is None and os.path.isdir(BENCH_SCRIPTS):
         tar = subprocess.run(
             ["tar", "-C", BENCH_SCRIPTS, "-czf", "-", "."],
             capture_output=True, timeout=120)
@@ -724,10 +726,13 @@ def main():
                         f"bench/scripts/evaluate.sh --ref {args.ref} --frontier {args.frontier} --ceiling {args.ceiling}")
             p36_gguf = f"{MODEL_PATH}"
             p35_gguf = ""
-        push_bench_scripts(host, port)
+        if os.environ.get("SPARKINFER_SKIP_BENCH_SYNC", "").strip() not in ("1", "true", "yes"):
+            push_bench_scripts(host, port)
+        else:
+            print(">> skip bench/scripts sync (SPARKINFER_SKIP_BENCH_SYNC)")
         if args.bidir:
             wr = sh(host, port,
-                    "cd /root/sparkinfer && LLAMACPP_DIR=/workspace/.llamacpp "
+                    BOX_CUDA_ENV + "cd /root/sparkinfer && LLAMACPP_DIR=/workspace/.llamacpp "
                     "bash bench/scripts/warm_llamacpp.sh",
                     timeout=7200)
             if wr.returncode:
