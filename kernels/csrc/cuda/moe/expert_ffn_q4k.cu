@@ -545,7 +545,7 @@ template <int H, int F>
 __global__ void shared_gate_up_q8_mmvq_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
-    float* __restrict__ h_scratch) {
+    float* __restrict__ h_scratch, int pdl) {
     constexpr int NW = 4, WS = 32;
     const int f = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
     const int nblk = H >> 5;
@@ -568,12 +568,51 @@ __global__ void shared_gate_up_q8_mmvq_kernel(
         float w = dw ? __ldg(dw) : 1.f;
         h_scratch[f] = w * q4kf_silu(tg) * tu;
     }
+    if (pdl) si_pdl_lc();
+}
+
+// Pack2: one 8-warp CTA owns two F rows (grid F/2). Race-safe PDL: both rows write
+// h_scratch, then a single si_pdl_lc from thread 0 (per-group lc lets quant_h race).
+template <int H, int F>
+__global__ void shared_gate_up_q8_pack2_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
+    float* __restrict__ h_scratch, int pdl) {
+    constexpr int NW = 4, WS = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int group = warp >> 2, group_warp = warp & 3;
+    const int f = blockIdx.x * 2 + group;
+    const int tid4 = group_warp * WS + lane;
+    const int nblk = H >> 5;
+    const unsigned char* gbase = gate_q + (size_t)f * nblk * 34;
+    const unsigned char* ubase = up_q   + (size_t)f * nblk * 34;
+    float tg = 0.f, tu = 0.f;
+    for (int b = tid4; b < nblk; b += NW * WS) {
+        tg += si_vec_dot_q8_0(gbase + (size_t)b * 34, vy + b);
+        tu += si_vec_dot_q8_0(ubase + (size_t)b * 34, vy + b);
+    }
+    __shared__ float sg[2][NW - 1][WS], su[2][NW - 1][WS];
+    if (group_warp > 0) { sg[group][group_warp - 1][lane] = tg; su[group][group_warp - 1][lane] = tu; }
+    __syncthreads();
+    if (group_warp == 0) {
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) { tg += sg[group][l][lane]; tu += su[group][l][lane]; }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+        if (lane == 0) {
+            float w = dw ? __ldg(dw) : 1.f;
+            h_scratch[f] = w * q4kf_silu(tg) * tu;
+        }
+    }
+    __syncthreads();   // both F-rows committed before dependent quant_h/down spin up
+    if (pdl && threadIdx.x == 0) si_pdl_lc();
 }
 
 template <int H, int F, bool ACCUM>
 __global__ void shared_down_q8_mmvq_kernel(
     const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
-    __nv_bfloat16* __restrict__ out) {
+    __nv_bfloat16* __restrict__ out, int pdl) {
+    if (pdl) si_pdl_sync();
     const int h = blockIdx.x * WPB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (h >= H) return;
     const int nblk = F >> 5;
@@ -1108,6 +1147,24 @@ static inline int gu_mmvq_pdl() {
     return v;
 }
 
+static inline int shexp_mmvq_pdl() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_SHEXP_PDL");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
+static inline int shexp_pack2() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_SHEXP_PACK2");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
 static inline int dense_top1_down_splitk(int current, int top_k, const char* specific_env) {
     if (top_k == 1 && !getenv("SPARKINFER_DOWN_SPLITK_S") && !getenv(specific_env))
         return 8;
@@ -1523,22 +1580,34 @@ void launch_shared_expert_q8_mmvq(
             reinterpret_cast<const __nv_bfloat16*>(input), qbuf, hidden);
         vy = qbuf;
     }
-    shared_gate_up_q8_mmvq_kernel<2048, 512><<<ffn, 4 * 32, 0, stream>>>(
-        vy, reinterpret_cast<const unsigned char*>(gate_q),
-        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    // Pack2 halves gate/up CTAs (512→256). PDL overlaps gate_up→quant_h→down launches.
+    // Default ON for Qwen3.6 fingerprint; SPARKINFER_SHEXP_PACK2=0 / SHEXP_PDL=0 restore plain path.
+    const int pdl = shexp_mmvq_pdl();
+    const int pack2 = shexp_pack2() && hidden == 2048 && ffn == 512;
+    if (pack2)
+        launch_pdl_kernel(pdl, dim3((ffn + 1) / 2), dim3(8 * 32), 0, stream,
+            shared_gate_up_q8_pack2_kernel<2048, 512>,
+            vy, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch, pdl);
+    else
+        launch_pdl_kernel(pdl, dim3(ffn), dim3(4 * 32), 0, stream,
+            shared_gate_up_q8_mmvq_kernel<2048, 512>,
+            vy, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch, pdl);
     const int nqb = ffn >> 5;
-    quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
-        h_scratch, qbuf, nqb, 0);
+    launch_pdl_kernel(pdl, dim3((nqb + 7) / 8), dim3(8 * 32), 0, stream,
+        quant_h_q8_1_kernel, h_scratch, qbuf, nqb, pdl);
     dim3 dn((hidden + WPB - 1) / WPB);
-    if (accum) {
-        shared_down_q8_mmvq_kernel<2048, 512, true><<<dn, WPB * 32, 0, stream>>>(
+    if (accum)
+        launch_pdl_kernel(pdl, dn, dim3(WPB * 32), 0, stream,
+            shared_down_q8_mmvq_kernel<2048, 512, true>,
             qbuf, reinterpret_cast<const unsigned char*>(down_q),
-            reinterpret_cast<__nv_bfloat16*>(output));
-    } else {
-        shared_down_q8_mmvq_kernel<2048, 512, false><<<dn, WPB * 32, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(output), pdl);
+    else
+        launch_pdl_kernel(pdl, dn, dim3(WPB * 32), 0, stream,
+            shared_down_q8_mmvq_kernel<2048, 512, false>,
             qbuf, reinterpret_cast<const unsigned char*>(down_q),
-            reinterpret_cast<__nv_bfloat16*>(output));
-    }
+            reinterpret_cast<__nv_bfloat16*>(output), pdl);
 }
 #endif
 
