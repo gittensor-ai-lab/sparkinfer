@@ -370,7 +370,10 @@ class PrEvalBotPolicyTest(unittest.TestCase):
                 {"num": 379, "title": "perf(attn): long", "pass_qwen35": True, "label_qwen35": "XL",
                  "score_qwen35": {"ctx_128_tps": 300.43, "tps": 283.28, "guard_128_baseline": 301.01}},
             ],
-            "landed_qwen35": [{"pr": 379, "tps": 298.27, "name": "wrong", "date": "2026-07-14"}],
+            "landed_qwen35": [
+                {"pr": 323, "tps": 271.85, "name": "first", "date": "2026-07-10"},
+                {"pr": 379, "tps": 298.27, "name": "wrong", "date": "2026-07-14"},
+            ],
             "qwen35": {"frontier_tps": 298.27, "baseline_tps": 298.27},
         }
         bot._rebuild_qwen35_journey(data)
