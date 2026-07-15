@@ -18,6 +18,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/_common.sh"
+source "$HERE/_eval_speed.sh"
 source "$HERE/_qwythos.sh"
 
 REF=""; CEILING=0; BASELINE_ONLY=0
@@ -168,50 +169,71 @@ _bench_prefill_pp() {
 }
 
 if [ "${SPARKINFER_P36_GUARD_128_BASELINE:-0}" = "0" ]; then
-  echo ">> measuring Qwen3.6 same-box main (5 contexts) ..." >&2
+  echo ">> measuring Qwen3.6 same-box main (5 contexts, one load) ..." >&2
   P36_GGUF="${P36_DIR}/${P36_FILE}"
-  for ctx in 0 512 4096 16384 32768; do
-    t="$(_bench_decode_tps "$P36_GGUF" "$ctx")"
-    t="${t:-0}"
-    case "$ctx" in
-      0)     B36_128="${t:-0}" ;;
-      512)   B36_512="${t:-0}" ;;
-      4096)  B36_4K="${t:-0}" ;;
-      16384) B36_16K="${t:-0}" ;;
-      32768) B36_32K="${t:-0}" ;;
-    esac
-  done
+  if bench_sweep_enabled && bench_sweep_run "$P36_GGUF" 128 0 1 512 1 4096 1 16384 1 32768 1; then
+    B36_128="$(_bench_sweep_get 0 decode_tps)"
+    B36_512="$(_bench_sweep_get 512 decode_tps)"
+    B36_4K="$(_bench_sweep_get 4096 decode_tps)"
+    B36_16K="$(_bench_sweep_get 16384 decode_tps)"
+    B36_32K="$(_bench_sweep_get 32768 decode_tps)"
+  else
+    for ctx in 0 512 4096 16384 32768; do
+      t="$(_bench_decode_tps "$P36_GGUF" "$ctx")"
+      t="${t:-0}"
+      case "$ctx" in
+        0)     B36_128="${t:-0}" ;;
+        512)   B36_512="${t:-0}" ;;
+        4096)  B36_4K="${t:-0}" ;;
+        16384) B36_16K="${t:-0}" ;;
+        32768) B36_32K="${t:-0}" ;;
+      esac
+    done
+  fi
   echo ">> Qwen3.6 main: 128=${B36_128:-0} 512=${B36_512:-0} 4k=${B36_4K:-0} 16k=${B36_16K:-0} 32k=${B36_32K:-0} tok/s" >&2
 fi
 
-if [ "${SPARKINFER_P35_GUARD_128_BASELINE:-0}" = "0" ]; then
-  echo ">> measuring Qwen3.5 same-box main (128/4k/32k/64k) ..." >&2
+if [ "${SPARKINFER_P35_GUARD_128_BASELINE:-0}" = "0" ] || [ "${SPARKINFER_P35_GUARD_4K_PP_BASELINE:-0}" = "0" ]; then
+  echo ">> measuring Qwen3.5 same-box main (decode + prefill, one load) ..." >&2
   P35_GGUF="${P35_DIR}/${P35_FILE}"
-  for ctx in 0 4096 32768 65536; do
-    t="$(_bench_decode_tps "$P35_GGUF" "$ctx")"
-    t="${t:-0}"
-    case "$ctx" in
-      0)      B35_128="${t:-0}" ;;
-      4096)   B35_4K="${t:-0}" ;;
-      32768)  B35_32K="${t:-0}" ;;
-      65536)  B35_64K="${t:-0}" ;;
-    esac
-  done
+  if bench_sweep_enabled && bench_sweep_run "$P35_GGUF" 128 0 1 4096 1 32768 1 65536 1; then
+    if [ "${SPARKINFER_P35_GUARD_128_BASELINE:-0}" = "0" ]; then
+      B35_128="$(_bench_sweep_get 0 decode_tps)"
+      B35_4K="$(_bench_sweep_get 4096 decode_tps)"
+      B35_32K="$(_bench_sweep_get 32768 decode_tps)"
+      B35_64K="$(_bench_sweep_get 65536 decode_tps)"
+    fi
+    if [ "${SPARKINFER_P35_GUARD_4K_PP_BASELINE:-0}" = "0" ]; then
+      B35_4K_PP="$(_bench_sweep_get 4096 prefill_pp)"
+      B35_32K_PP="$(_bench_sweep_get 32768 prefill_pp)"
+      B35_64K_PP="$(_bench_sweep_get 65536 prefill_pp)"
+    fi
+  else
+    if [ "${SPARKINFER_P35_GUARD_128_BASELINE:-0}" = "0" ]; then
+      for ctx in 0 4096 32768 65536; do
+        t="$(_bench_decode_tps "$P35_GGUF" "$ctx")"
+        t="${t:-0}"
+        case "$ctx" in
+          0)      B35_128="${t:-0}" ;;
+          4096)   B35_4K="${t:-0}" ;;
+          32768)  B35_32K="${t:-0}" ;;
+          65536)  B35_64K="${t:-0}" ;;
+        esac
+      done
+    fi
+    if [ "${SPARKINFER_P35_GUARD_4K_PP_BASELINE:-0}" = "0" ]; then
+      for ctx in 4096 32768 65536; do
+        t="$(_bench_prefill_pp "$P35_GGUF" "$ctx")"
+        t="${t:-0}"
+        case "$ctx" in
+          4096)   B35_4K_PP="${t:-0}" ;;
+          32768)  B35_32K_PP="${t:-0}" ;;
+          65536)  B35_64K_PP="${t:-0}" ;;
+        esac
+      done
+    fi
+  fi
   echo ">> Qwen3.5 main: 128=${B35_128:-0} 4k=${B35_4K:-0} 32k=${B35_32K:-0} 64k=${B35_64K:-0} tok/s" >&2
-fi
-
-if [ "${SPARKINFER_P35_GUARD_4K_PP_BASELINE:-0}" = "0" ]; then
-  echo ">> measuring Qwen3.5 same-box main prefill pp (4k/32k/64k) ..." >&2
-  P35_GGUF="${P35_DIR}/${P35_FILE}"
-  for ctx in 4096 32768 65536; do
-    t="$(_bench_prefill_pp "$P35_GGUF" "$ctx")"
-    t="${t:-0}"
-    case "$ctx" in
-      4096)   B35_4K_PP="${t:-0}" ;;
-      32768)  B35_32K_PP="${t:-0}" ;;
-      65536)  B35_64K_PP="${t:-0}" ;;
-    esac
-  done
   echo ">> Qwen3.5 prefill: 4k=${B35_4K_PP:-0} 32k=${B35_32K_PP:-0} 64k=${B35_64K_PP:-0} pp tok/s" >&2
 fi
 

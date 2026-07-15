@@ -1033,6 +1033,15 @@ int Qwen35Model::forward_token(int token_id, int position) {
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
     BenchDecodeResult out{};
     Impl& s = *p_;
+    static int last_bench_ctx = -1;
+    if (context_tokens != last_bench_ctx && s.graph_ready) {
+        cudaGraphExecDestroy(s.cu_exec);
+        cudaGraphDestroy(s.cu_graph);
+        s.cu_exec = nullptr;
+        s.cu_graph = nullptr;
+        s.graph_ready = false;
+    }
+    last_bench_ctx = context_tokens;
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) { fprintf(stderr, "[bench] kv allocate failed\n"); return out; }
     int start_pos = context_tokens;
     if (const char* e = getenv("SPARKINFER_BENCH_START_POS")) {

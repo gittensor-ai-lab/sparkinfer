@@ -141,21 +141,46 @@ else
   else
     echo ">> context policy: ${DECODE_TOKENS}-token decode at 128/512/4k/16k/32k/64k/128k (as configured); all measured contexts guarded; best context scores" >&2
   fi
-  si_run qwen3_gguf_bench "$GGUF" 64 "$GUARD_CTX" >/dev/null 2>&1 || true
-  GUARD_TPS="$(median_ctx "$GUARD_CTX" "$GUARD_REPS")"
-  GUARD_512_TPS="$(median_ctx "$GUARD_512_CTX" "$GUARD_512_REPS")"
-  GUARD_4K_TPS="$(median_ctx "$GUARD_4K_CTX" "$GUARD_4K_REPS")"
-  TPS="$(median_ctx "$SCORE_CTX" "$SCORE_REPS")"
-  GUARD_32K_TPS="$(median_ctx "$GUARD_32K_CTX" "$GUARD_32K_REPS")"
-  GUARD_64K_TPS="$(median_ctx "$GUARD_64K_CTX" "$GUARD_64K_REPS")"
-  GUARD_128K_TPS="$(median_ctx "$GUARD_128K_CTX" "$GUARD_128K_REPS")"
-  if [ "$EVAL_PREFILL" = "1" ]; then
-    GUARD_4K_PP_TPS="$(median_ctx_pp "$GUARD_4K_CTX" "$GUARD_4K_REPS")"
-    GUARD_32K_PP_TPS="$(median_ctx_pp "$GUARD_32K_CTX" "$GUARD_32K_REPS")"
-    GUARD_64K_PP_TPS="$(median_ctx_pp "$GUARD_64K_CTX" "$GUARD_64K_REPS")"
-    GUARD_128K_PP_TPS="$(median_ctx_pp "$GUARD_128K_CTX" "$GUARD_128K_REPS")"
+  if bench_sweep_enabled && bench_sweep_run "$GGUF" "$DECODE_TOKENS" \
+      "$GUARD_CTX" "$GUARD_REPS" \
+      "$GUARD_512_CTX" "$GUARD_512_REPS" \
+      "$GUARD_4K_CTX" "$GUARD_4K_REPS" \
+      "$SCORE_CTX" "$SCORE_REPS" \
+      "$GUARD_32K_CTX" "$GUARD_32K_REPS" \
+      "$GUARD_64K_CTX" "$GUARD_64K_REPS" \
+      "$GUARD_128K_CTX" "$GUARD_128K_REPS"; then
+    GUARD_TPS="$(_bench_sweep_get "$GUARD_CTX" decode_tps)"
+    GUARD_512_TPS="$(_bench_sweep_get "$GUARD_512_CTX" decode_tps)"
+    GUARD_4K_TPS="$(_bench_sweep_get "$GUARD_4K_CTX" decode_tps)"
+    TPS="$(_bench_sweep_get "$SCORE_CTX" decode_tps)"
+    GUARD_32K_TPS="$(_bench_sweep_get "$GUARD_32K_CTX" decode_tps)"
+    GUARD_64K_TPS="$(_bench_sweep_get "$GUARD_64K_CTX" decode_tps)"
+    GUARD_128K_TPS="$(_bench_sweep_get "$GUARD_128K_CTX" decode_tps)"
+    if [ "$EVAL_PREFILL" = "1" ]; then
+      GUARD_4K_PP_TPS="$(_bench_sweep_get "$GUARD_4K_CTX" prefill_pp)"
+      GUARD_32K_PP_TPS="$(_bench_sweep_get "$GUARD_32K_CTX" prefill_pp)"
+      GUARD_64K_PP_TPS="$(_bench_sweep_get "$GUARD_64K_CTX" prefill_pp)"
+      GUARD_128K_PP_TPS="$(_bench_sweep_get "$GUARD_128K_CTX" prefill_pp)"
+    else
+      GUARD_4K_PP_TPS=0; GUARD_32K_PP_TPS=0; GUARD_64K_PP_TPS=0; GUARD_128K_PP_TPS=0
+    fi
   else
-    GUARD_4K_PP_TPS=0; GUARD_32K_PP_TPS=0; GUARD_64K_PP_TPS=0; GUARD_128K_PP_TPS=0
+    si_run qwen3_gguf_bench "$GGUF" 64 "$GUARD_CTX" >/dev/null 2>&1 || true
+    GUARD_TPS="$(median_ctx "$GUARD_CTX" "$GUARD_REPS")"
+    GUARD_512_TPS="$(median_ctx "$GUARD_512_CTX" "$GUARD_512_REPS")"
+    GUARD_4K_TPS="$(median_ctx "$GUARD_4K_CTX" "$GUARD_4K_REPS")"
+    TPS="$(median_ctx "$SCORE_CTX" "$SCORE_REPS")"
+    GUARD_32K_TPS="$(median_ctx "$GUARD_32K_CTX" "$GUARD_32K_REPS")"
+    GUARD_64K_TPS="$(median_ctx "$GUARD_64K_CTX" "$GUARD_64K_REPS")"
+    GUARD_128K_TPS="$(median_ctx "$GUARD_128K_CTX" "$GUARD_128K_REPS")"
+    if [ "$EVAL_PREFILL" = "1" ]; then
+      GUARD_4K_PP_TPS="$(median_ctx_pp "$GUARD_4K_CTX" "$GUARD_4K_REPS")"
+      GUARD_32K_PP_TPS="$(median_ctx_pp "$GUARD_32K_CTX" "$GUARD_32K_REPS")"
+      GUARD_64K_PP_TPS="$(median_ctx_pp "$GUARD_64K_CTX" "$GUARD_64K_REPS")"
+      GUARD_128K_PP_TPS="$(median_ctx_pp "$GUARD_128K_CTX" "$GUARD_128K_REPS")"
+    else
+      GUARD_4K_PP_TPS=0; GUARD_32K_PP_TPS=0; GUARD_64K_PP_TPS=0; GUARD_128K_PP_TPS=0
+    fi
   fi
   GUARD_RATIO="$(python3 - <<PY
 base=float("$GUARD_BASELINE")

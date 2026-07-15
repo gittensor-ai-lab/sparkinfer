@@ -1,6 +1,57 @@
 # Shared decode + prefill speed helpers for evaluate.sh (sourced, not executed).
 # median_bench_metric CTX REPS PATTERN — median tok/s from qwen3_gguf_bench output lines.
 
+_BENCH_SWEEP_JSON=""
+
+bench_sweep_enabled() {
+  [ "${SPARKINFER_BENCH_SWEEP:-1}" != "0" ]
+}
+
+# Read decode_tps or prefill_pp for one context from cached SWEEP_JSON.
+_bench_sweep_get() {
+  local ctx="$1" field="$2"
+  python3 - "$ctx" "$field" "$_BENCH_SWEEP_JSON" <<'PY'
+import json, sys
+ctx, field, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    d = json.loads(raw)
+    row = d.get(str(ctx), {})
+    v = row.get(field, 0)
+    print(v if v else 0)
+except Exception:
+    print(0)
+PY
+}
+
+# One model load, many contexts. Args: GGUF N_TOKENS (CTX REPS)+
+bench_sweep_run() {
+  local gguf="$1" n_tokens="$2"
+  shift 2
+  local ctxs=() ctx reps max_reps=1
+  while [ $# -ge 2 ]; do
+    ctx="$1"; reps="$2"; shift 2
+    [ "${reps:-0}" -le 0 ] && continue
+    ctxs+=("$ctx")
+    [ "$reps" -gt "$max_reps" ] && max_reps="$reps"
+  done
+  [ ${#ctxs[@]} -eq 0 ] && { _BENCH_SWEEP_JSON=""; return 1; }
+  local csv
+  csv="$(printf '%s\n' "${ctxs[@]}" | sort -nu | paste -sd,)"
+  local out rc=0
+  export SPARKINFER_BENCH_SWEEP_CTXS="$csv"
+  export SPARKINFER_BENCH_SWEEP_REPS="$max_reps"
+  out="$(si_run qwen3_gguf_bench "$gguf" "$n_tokens" sweep 2>&1)" || rc=$?
+  _BENCH_SWEEP_JSON="$(printf '%s\n' "$out" | sed -n 's/^SWEEP_JSON //p' | tail -1)"
+  if [ "$rc" != 0 ] || [ -z "$_BENCH_SWEEP_JSON" ]; then
+    echo ">> WARN: bench sweep failed (rc=$rc): ${out##*$'\n'}" >&2
+    _BENCH_SWEEP_JSON=""
+    return 1
+  fi
+  gclks+=("$(nvidia-smi --query-gpu=clocks.gr --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')")
+  echo ">> bench sweep ok (${csv})" >&2
+  return 0
+}
+
 median_bench_metric() {
   local ctx="$1" reps="$2" pat="$3"
   local vals=() t rc out
