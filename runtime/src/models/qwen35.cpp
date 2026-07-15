@@ -1657,7 +1657,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return layer_index(name) >= ssm_out_min_layer;
         return false;
     };
-    const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K", q35_dense9b_requant_default);
+    // LM-head (output projection) ships Q6_K on the Qwen3.6-35B-A3B UD build and is the single
+    // largest per-token weight read (vocab 248320 x H 2048 ~= 255 MB HBM/token, ~13% of decode).
+    // Requant it to Q4_K at load so decode routes through the faithful llama Q4_K mmvq GEMV
+    // (~1/3 fewer bytes; the path already exists via use_pq+use_llama). Default ON for the Qwen3.6
+    // fingerprint AND the Qwythos dense fingerprint; SPARKINFER_LMHEAD_REQUANT_Q4K=0 keeps native Q6_K.
+    const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K",
+                                       q35_dense9b_requant_default || q36_ud_requant_default);
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
