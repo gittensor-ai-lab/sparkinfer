@@ -473,8 +473,18 @@ def pick_best(a, b):
         return a if ra > rb else b
     return a if float(a.get("tps") or 0) >= float(b.get("tps") or 0) else b
 
-passing = [s for s in (score35, score36) if s.get("pass")]
-best = pick_best(score35, score36) if passing else pick_best(score35, score36)
+def pick_headline(a, b):
+    """Headline verdict: a failing optimize run must not lose to the other's none."""
+    if not a.get("pass") or not b.get("pass"):
+        for s in (a, b):
+            if not s.get("pass") and s.get("label") == "REJECT":
+                return dict(s)
+        for s in (a, b):
+            if not s.get("pass"):
+                return dict(s)
+    return pick_best(a, b)
+
+best = pick_headline(score35, score36)
 
 final = dict(best)
 final["commit"] = commit
