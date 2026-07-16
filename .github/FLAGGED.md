@@ -133,3 +133,7 @@ removed `g2`; added lines matched #318's existing call-site pattern at 100% (tin
 literal rule). Independent convergent fix with #336 (merged ~14 min earlier).
 Maintainer cleared: label `copycat-cleared`, #338 reopened. Account was not on
 `blocked-contributors.txt`.
+
+## 2026-07-15 — `jimcody1995` (auto-blocked)
+
+#436 ≥85% copycat of #403 (90%). Maintainer confirmed block on 2026-07-16.

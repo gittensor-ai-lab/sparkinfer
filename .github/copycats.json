@@ -88,5 +88,13 @@
     "strike": 0,
     "containment": 0.07,
     "note": "false positive cleared: per-function skv_wsum warp-shuffle matched #223 boilerplate at 94%; PR-level overlap 7%. Independent sparse-KV feature (sparse_kv.cu)."
+  },
+  {
+    "pr": 436,
+    "author": "jimcody1995",
+    "original": 403,
+    "date": "2026-07-15",
+    "blocked": true,
+    "containment": 0.90
   }
 ]
