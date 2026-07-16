@@ -41,11 +41,19 @@ __global__ void residual_add_kernel(const __nv_bfloat16* __restrict__ a,
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kv_ops.h"
+#include <cstdio>
 
 void launch_kv_append(void* k_pool, void* v_pool, const void* k_new, const void* v_new,
                       const int* block_table, const int* write_pos,
                       int num_seqs, int num_kv_heads, int head_dim,
                       int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+    // CUDA limits blockDim.x to 1024; launching with head_dim > 1024 is invalid.
+    if (head_dim <= 0 || head_dim > 1024 || num_seqs <= 0 || num_kv_heads <= 0) {
+        fprintf(stderr, "[kv] launch_kv_append: invalid dims (num_seqs=%d num_kv_heads=%d head_dim=%d)
+",
+                num_seqs, num_kv_heads, head_dim);
+        return;
+    }
     dim3 grid(num_seqs, num_kv_heads);
     kv_append_kernel<<<grid, head_dim, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
