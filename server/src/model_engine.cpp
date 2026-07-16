@@ -164,8 +164,10 @@ std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_
     // (interior tokens skip LM head), hybrid recurrent-state reset at position 0,
     // and kv->free() before the next request.
     impl_->model->clear_prefix_cache();
-    std::vector<int> out =
-        impl_->model->generate(prompt_ids, max_new_tokens, nullptr, on_token);
+    std::vector<int> out = impl_->model->generate(prompt_ids, max_new_tokens, nullptr);
+    if (on_token) {
+        for (int t : out) on_token(t);
+    }
 
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
