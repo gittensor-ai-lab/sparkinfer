@@ -144,8 +144,9 @@ manually after review. Idempotent: each commit is evaluated once (tracked by a h
 bot's comment), so it only spins the GPU when there's new work.
 
 Each bot run also **closes open PRs with no GitHub activity for 2+ days** (`updatedAt` — commits,
-comments, reviews, label changes). PRs labeled `hold` or `merge-first` are skipped. Override with
-`SPARKINFER_STALE_PR_DAYS=0` to disable, or set a different threshold.
+comments, reviews, label changes). **Draft PRs** use a separate **4-day** threshold (still skipped
+for evaluation). PRs labeled `hold` or `merge-first` are skipped. Override with
+`SPARKINFER_STALE_PR_DAYS=0` / `SPARKINFER_DRAFT_STALE_DAYS=0` to disable, or set different thresholds.
 
 ```bash
 eval/setup_labels.sh                                   # one-time: create the eval:* labels

@@ -241,6 +241,7 @@ RTX5090_CLOSE_SKIP_LABELS = {HOLD_LABEL}
 RTX5090_EXEMPT_LOGINS = {"ai-hpc"}
 RTX5090_EXEMPT_ASSOC = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 STALE_PR_DAYS      = int(os.environ.get("SPARKINFER_STALE_PR_DAYS", "2"))
+DRAFT_STALE_DAYS   = int(os.environ.get("SPARKINFER_DRAFT_STALE_DAYS", "4"))
 STALE_CLOSE_SKIP_LABELS = {HOLD_LABEL, MERGE_FIRST_LABEL}  # protected from auto-close
 EXHAUSTED_EVAL_MAX = int(os.environ.get("SPARKINFER_EXHAUSTED_EVAL_MAX", "2"))
 FAIL_VERDICT_LABELS = frozenset({"none", "REJECT"})
@@ -324,20 +325,27 @@ def pr_inactive_days(pr, now=None):
     return (now - updated).total_seconds() / 86400.0
 
 
-def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False):
+def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False, *, drafts_only=None):
     """Close open PRs with no GitHub activity for more than `days` days.
 
     Uses PR updatedAt (commits, comments, reviews, label changes). Skips PRs labeled
-    `hold` or `merge-first`. Returns the set of PR numbers closed (or would-close in dry-run).
-  """
+    `hold` or `merge-first`. When `drafts_only` is False, draft PRs are skipped (they are
+    handled by close_stale_draft_prs). Returns the set of PR numbers closed (or would-close
+    in dry-run).
+    """
     if days <= 0:
         return set()
     now = datetime.datetime.now(datetime.timezone.utc)
     prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open",
-                         "--json", "number,title,updatedAt,labels"]).stdout or "[]")
+                         "--json", "number,title,updatedAt,labels,isDraft"]).stdout or "[]")
     closed = set()
     for pr in prs:
         num = pr["number"]
+        is_draft = bool(pr.get("isDraft"))
+        if drafts_only is True and not is_draft:
+            continue
+        if drafts_only is False and is_draft:
+            continue
         labels = {l["name"] for l in pr.get("labels", [])}
         if labels & STALE_CLOSE_SKIP_LABELS:
             continue
@@ -345,23 +353,38 @@ def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False):
         if inactive is None or inactive <= days:
             continue
         days_idle = int(inactive)
-        print(f"PR #{num}: stale — no activity for {days_idle}d (limit {days}d)"
+        kind = "draft stale" if is_draft else "stale"
+        print(f"PR #{num}: {kind} — no activity for {days_idle}d (limit {days}d)"
               f"{' — would close' if dry_run else ' — closing'}")
         if dry_run:
             closed.add(num)
             continue
-        body = ("<!-- sparkinfer-stale -->\n"
-                f"## Closed: no activity for {days}+ days\n\n"
-                f"This PR has had no updates (commits, comments, reviews, or label changes) "
-                f"for **{days_idle} days** (threshold: {days} days).\n\n"
-                "Reopen this PR or open a fresh one when you're ready to continue.")
+        marker = "<!-- sparkinfer-stale-draft -->" if is_draft else "<!-- sparkinfer-stale -->"
+        if is_draft:
+            body = (f"{marker}\n"
+                    f"## Closed: draft inactive for {days}+ days\n\n"
+                    f"This **draft** PR has had no updates (commits, comments, reviews, or label "
+                    f"changes) for **{days_idle} days** (draft threshold: {days} days).\n\n"
+                    "Mark ready for review or reopen when you're ready to continue.")
+        else:
+            body = (f"{marker}\n"
+                    f"## Closed: no activity for {days}+ days\n\n"
+                    f"This PR has had no updates (commits, comments, reviews, or label changes) "
+                    f"for **{days_idle} days** (threshold: {days} days).\n\n"
+                    "Reopen this PR or open a fresh one when you're ready to continue.")
         gh(["pr", "comment", str(num), "-R", repo, "--body", body])
         if gh(["pr", "close", str(num), "-R", repo]).returncode == 0:
             closed.add(num)
     if closed:
-        print(f">> close_stale_prs: {'would close' if dry_run else 'closed'} {len(closed)} PR(s): "
+        tag = "close_stale_draft_prs" if drafts_only else "close_stale_prs"
+        print(f">> {tag}: {'would close' if dry_run else 'closed'} {len(closed)} PR(s): "
               f"{sorted(closed)}")
     return closed
+
+
+def close_stale_draft_prs(repo, days=DRAFT_STALE_DAYS, dry_run=False):
+    """Close draft PRs with no GitHub activity for more than `days` days (default 4)."""
+    return close_stale_prs(repo, days=days, dry_run=dry_run, drafts_only=True)
 
 
 def rtx5090_close_exempt(pr):
@@ -530,10 +553,11 @@ def close_exhausted_eval_prs(repo, max_none_reject=EXHAUSTED_EVAL_MAX, dry_run=F
 
 
 def run_poll_auto_closes(repo, dry_run=False):
-    """Stale / unchecked-5090 / exhausted-eval sweeps — run at each bot poll tick."""
+    """Stale / draft-stale / unchecked-5090 / exhausted-eval sweeps — run at each bot poll tick."""
     closed = set()
     for got in (
-        close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=dry_run),
+        close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=dry_run, drafts_only=False),
+        close_stale_draft_prs(repo, dry_run=dry_run),
         close_unchecked_rtx5090_prs(repo, dry_run=dry_run),
         close_exhausted_eval_prs(repo, dry_run=dry_run),
     ):
