@@ -289,6 +289,56 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
     if (lane == 0) out[(size_t)vh * HEAD_DIM + j] = __float2bfloat16(y);
 }
 
+// Qwen3.6 GDN AR is fixed at 16 Q heads / 32 V heads / hd128. Specialize away the runtime
+// q_heads/v_heads arguments and replace vh%q_heads with a mask so the hot path stays in
+// registers without a bounds check on vh (grid is exactly VH).
+template <int COLS, int HEAD_DIM, int QH, int VH>
+__global__ void gdn_ar_fast_qwen_kernel(const __nv_bfloat16* __restrict__ q,
+                                        const __nv_bfloat16* __restrict__ k,
+                                        const __nv_bfloat16* __restrict__ v,
+                                        const __nv_bfloat16* __restrict__ alpha,
+                                        const __nv_bfloat16* __restrict__ beta,
+                                        const __nv_bfloat16* __restrict__ dt,
+                                        const __nv_bfloat16* __restrict__ a,
+                                        float* __restrict__ state,
+                                        __nv_bfloat16* __restrict__ out) {
+    constexpr int NROW = HEAD_DIM / 32;
+    const int vh   = blockIdx.x;
+    const int j    = blockIdx.y * COLS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (j >= HEAD_DIM) return;
+    const int qh   = vh & (QH - 1);   // QH=16 → mask
+    const float scale = rsqrtf((float)HEAD_DIM);
+    const float bb = q36_sigmoid(q36_to_f(beta[vh]));
+    const float g  = __expf(q36_softplus(q36_to_f(alpha[vh]) + q36_to_f(dt[vh])) * q36_to_f(a[vh]));
+    const __nv_bfloat16* qhptr = q + (size_t)qh * HEAD_DIM;
+    const __nv_bfloat16* khptr = k + (size_t)qh * HEAD_DIM;
+    const __nv_bfloat16* vhptr = v + (size_t)vh * HEAD_DIM;
+    float* col = state + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+
+    float sloc[NROW];
+    float part_sk = 0.f;
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) {
+        const int i = lane + r * 32;
+        const float s = col[i];
+        sloc[r] = s;
+        part_sk += s * q36_to_f(khptr[i]);
+    }
+    const float sk = g * q36_wsum(part_sk);
+    const float delta = (q36_to_f(vhptr[j]) - sk) * bb;
+    float part_y = 0.f;
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) {
+        const int i = lane + r * 32;
+        const float s_new = sloc[r] * g + q36_to_f(khptr[i]) * delta;
+        col[i] = s_new;
+        part_y += s_new * q36_to_f(qhptr[i]) * scale;
+    }
+    const float y = q36_wsum(part_y);
+    if (lane == 0) out[(size_t)vh * HEAD_DIM + j] = __float2bfloat16(y);
+}
+
 // Default GDN path: warp-per-state-column with native [vh][row][col] layout (no transposed
 // state). One warp owns column j; row slices live in registers; grid fills the GPU.
 template <int WARPS_PER_BLK, int HEAD_DIM>
@@ -530,9 +580,48 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
             else cols = (v_heads >= 32) ? 4 : 8;              // 32 v-heads -> 1024 blocks @ COLS=4
             if (!(cols == 4 || cols == 8 || cols == 16)) cols = 8;
         }
+        static int qwen_ar = -1;
+        if (qwen_ar < 0) {
+            const char* e = getenv("SPARKINFER_GDN_AR_SPECIAL");
+            qwen_ar = !(e && e[0] == '0');
+        }
         constexpr int HD = 128;
         const int c = cols;
         dim3 grid(v_heads, (HD + c - 1) / c);
+        if (qwen_ar && q_heads == 16 && v_heads == 32) {
+            if (c == 4) {
+                gdn_ar_fast_qwen_kernel<4, HD, 16, 32><<<grid, 4 * 32, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                    state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16));
+            } else if (c == 16) {
+                gdn_ar_fast_qwen_kernel<16, HD, 16, 32><<<grid, 16 * 32, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                    state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16));
+            } else {
+                gdn_ar_fast_qwen_kernel<8, HD, 16, 32><<<grid, 8 * 32, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                    reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                    state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16));
+            }
+            return;
+        }
         if (c == 4) {
             gdn_ar_fast_kernel<4, HD><<<grid, 4 * 32, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q_bf16),

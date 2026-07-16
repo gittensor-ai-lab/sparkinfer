@@ -1710,10 +1710,21 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
         type = 0; return dense(name, false);
     };
+    // Qwen3.6-35B-A3B UD ships output.weight as Q6_K (~255 MB/token). Requant to Q4_K inside
+    // the loader so decode uses the existing llama Q4_K mmvq path (~1/3 fewer bytes). This is
+    // gated on the hybrid-MoE fingerprint + Q6_K source (not a flip of SPARKINFER_LMHEAD_REQUANT_Q4K's
+    // default), and SPARKINFER_LMHEAD_REQUANT_Q4K=0 still disables it.
     auto lm_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
-            return dev_quant_requant_q4k(name, type, req_lm_q4);
+        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) {
+            const bool q36_q6_lm =
+                q36_ud_requant_default && t->ggml_type == 14 &&
+                (name == "output.weight" || has_suffix(name, "output.weight"));
+            const bool do_q4 = req_lm_q4 || q36_q6_lm;
+            const char* force_off = getenv("SPARKINFER_LMHEAD_REQUANT_Q4K");
+            const bool disabled = force_off && force_off[0] == '0';
+            return dev_quant_requant_q4k(name, type, do_q4 && !disabled);
+        }
         type = 0; return dense(name, false);
     };
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {
