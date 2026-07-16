@@ -691,7 +691,7 @@ void launch_flash_decode_split(
     int num_seqs, int num_q_heads, int num_kv_heads, int head_dim,
     int block_size, int max_blocks, int n_splits, float scale, cudaStream_t stream,
     void* out_q8, int seqlen, const void* k_scale, const void* v_scale, int int8_kv,
-    const void* attn_gate
+    const void* attn_gate, bool prefill_attn
 ) {
     const __nv_bfloat16* gate = reinterpret_cast<const __nv_bfloat16*>(attn_gate);
     auto combine_hd256 = [&](void* oq8) {
@@ -713,7 +713,18 @@ void launch_flash_decode_split(
         static int famma256 = -1;
         if (famma256 < 0) { const char* e = getenv("SPARKINFER_FAMMA"); famma256 = (e && e[0] == '0') ? 0 : 1; }
         const int mma_chunk256 = (n_splits > 0) ? (seqlen + n_splits - 1) / n_splits : 0;
-        const bool mma_ok256 = famma256 && seqlen > 512 && block_size == 16 && mma_chunk256 >= 32;
+        bool mma_ok256 = famma256 && seqlen > 512 && block_size == 16 && mma_chunk256 >= 32;
+        // Batched prefill replays N flash-decode launches back-to-back; the hd256 int8 MMA path
+        // diverges from the token loop there (KV/state garbage past ~5k). Default OFF for prefill
+        // attention only; decode keeps SPARKINFER_FAMMA. SPARKINFER_PREFILL_FAMMA=1 re-enables.
+        if (prefill_attn) {
+            static int pf_famma = -2;
+            if (pf_famma == -2) {
+                const char* e = getenv("SPARKINFER_PREFILL_FAMMA");
+                pf_famma = (e && e[0] != '0') ? 1 : 0;
+            }
+            if (!pf_famma) mma_ok256 = false;
+        }
         static int fagqa4 = -1;
         if (fagqa4 < 0) { const char* e = getenv("SPARKINFER_FAGQA4"); fagqa4 = (e && e[0] == '0') ? 0 : 1; }
         if (fagqa4 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 4) {

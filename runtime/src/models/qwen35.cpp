@@ -423,11 +423,19 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         famma4_graph = (e && e[0] == '0') ? 0 : 1;
     }
     int attn_graph_mode = 0;
-    if (famma_graph && s.kv->int8_kv() && s.kv->block_size() == 16 &&
+    if (!sample) {
+        static int pf_famma = -2;
+        if (pf_famma == -2) {
+            const char* e = getenv("SPARKINFER_PREFILL_FAMMA");
+            pf_famma = (e && e[0] != '0') ? 1 : 0;
+        }
+        if (!pf_famma) attn_graph_mode = 1;
+    }
+    if (attn_graph_mode == 0 && famma_graph && s.kv->int8_kv() && s.kv->block_size() == 16 &&
         c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 8) {
         const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
         attn_graph_mode = (seqlen > 512 && mma_chunk >= 32) ? 2 : 1;
-    } else if (famma4_graph && s.kv->int8_kv() && s.kv->block_size() == 16 &&
+    } else if (attn_graph_mode == 0 && famma4_graph && s.kv->int8_kv() && s.kv->block_size() == 16 &&
                c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 4) {
         const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
         attn_graph_mode = (seqlen > 512 && mma_chunk >= 32) ? 3 : 1;
@@ -465,7 +473,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     }
 
     // Prefill graph: embed→layers→final norm (no LM head). Decode graph: full path + argmax.
-    if (!sample && s.graph_prefill_ready) {
+    static int prefill_graph = -1;
+    if (prefill_graph < 0) {
+        const char* e = getenv("SPARKINFER_PREFILL_GRAPH");
+        prefill_graph = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (!sample && prefill_graph && s.graph_prefill_ready) {
         cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch");
         cu(cudaStreamSynchronize(st), "prefill graph sync");
         return token_id;
@@ -484,7 +497,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.graph_prefill_ready = false;
         s.graph_prefill_attn_mode = -1;
     }
-    cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
+    const bool do_capture = sample || prefill_graph;
+    if (do_capture)
+        cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal),
+            sample ? "begin decode capture" : "begin prefill capture");
 
     kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
 
@@ -794,7 +810,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                                                1.f / sqrtf((float)c.head_dim), st,
                                                (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, seqlen,
                                                kscale, vscale, kv8 ? 1 : 0,
-                                               attn_gate_q8 ? s.qgate : nullptr);
+                                               attn_gate_q8 ? s.qgate : nullptr, !sample);
             }
             if (w.q_has_gate && !attn_gate_q8)
                 kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, s.qdim, st);
@@ -1031,12 +1047,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     }
     // xn now holds RMSNorm(x_final, final_norm)
     if (!sample) {
-        cu(cudaStreamEndCapture(st, &s.cu_prefill_graph), "end prefill capture");
-        cu(cudaGraphInstantiate(&s.cu_prefill_exec, s.cu_prefill_graph, 0), "prefill graph instantiate");
-        s.graph_prefill_ready = true;
-        s.graph_prefill_attn_mode = attn_graph_mode;
-        cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch (first)");
-        cu(cudaStreamSynchronize(st), "prefill sync");
+        if (prefill_graph) {
+            cu(cudaStreamEndCapture(st, &s.cu_prefill_graph), "end prefill capture");
+            cu(cudaGraphInstantiate(&s.cu_prefill_exec, s.cu_prefill_graph, 0), "prefill graph instantiate");
+            s.graph_prefill_ready = true;
+            s.graph_prefill_attn_mode = attn_graph_mode;
+            cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch (first)");
+            cu(cudaStreamSynchronize(st), "prefill sync");
+        } else {
+            cu(cudaStreamSynchronize(st), "prefill sync");
+        }
         return token_id;
     }
     if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
@@ -1084,6 +1104,24 @@ bool prefill_samples_lmhead() {
     }
     return legacy != 0;
 }
+
+// Batched prefill (dense hybrid or Phase-1 MoE hybrid). SPARKINFER_PREFILL_BATCHED=0 disables;
+// MoE additionally respects SPARKINFER_PREFILL_MOE_BATCHED=0.
+bool prefill_batched_enabled(bool gguf, const Qwen35Config& cfg, int ctx_len) {
+    static int want = -1, maxctx = -1, want_moe = -1;
+    if (want < 0) {
+        const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
+        want = (e && e[0] == '0') ? 0 : 1;
+        const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
+        maxctx = mc ? atoi(mc) : 65536;
+        const char* me = getenv("SPARKINFER_PREFILL_MOE_BATCHED");
+        want_moe = (me && me[0] == '0') ? 0 : 1;
+    }
+    if (!want || !gguf || !cfg.hybrid || ctx_len <= 0 || ctx_len > maxctx) return false;
+    if (cfg.dense_ffn) return true;
+    return want_moe && !cfg.dense_ffn
+        && cfg.n_experts == 256 && (cfg.hidden % 8) == 0;
+}
 } // namespace
 
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
@@ -1123,14 +1161,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     // naive) falls back to the token loop below, which is left byte-identical to main on purpose.
     bool batched_done = false;
     if (start_pos > 0) {
-        static int want_batched = -1, batched_maxctx = -1;
-        if (want_batched < 0) {
-            const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
-            want_batched = (e && e[0] == '0') ? 0 : 1;
-            const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
-            batched_maxctx = mc ? atoi(mc) : 65536;
-        }
-        if (want_batched && s.gguf && s.cfg.hybrid && s.cfg.dense_ffn && start_pos <= batched_maxctx) {
+        if (prefill_batched_enabled(s.gguf, s.cfg, start_pos)) {
             std::vector<int> ids(start_pos);
             for (int i = 0; i < start_pos; i++) ids[i] = 100 + (i % 20000);   // deterministic pseudo-prompt
             auto pb0 = std::chrono::high_resolution_clock::now();
@@ -1275,19 +1306,29 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
     s.bench_feedback_graph = false;
     cudaDeviceSynchronize();
     auto t0 = std::chrono::high_resolution_clock::now();
-    if (prefill_samples_lmhead()) {
-        for (size_t i = (size_t)start; i < prompt.size(); i++) {
-            (void)forward_token(prompt[i], (int)i, true);
-            cudaDeviceSynchronize();
-        }
-    } else {
-        for (size_t i = (size_t)start; i + 1 < prompt.size(); i++) {
-            forward_token(prompt[i], (int)i, false);
-            cudaDeviceSynchronize();
-        }
-        if (prompt.size() > (size_t)start) {
-            (void)forward_token(prompt.back(), (int)prompt.size() - 1, true);
-            cudaDeviceSynchronize();
+    const int prefill_n = (int)prompt.size() - start;
+    bool batched_prefill = false;
+    if (prefill_n > 0 && prefill_batched_enabled(s.gguf, s.cfg, prefill_n)) {
+        std::vector<int> ids(prompt.begin() + start, prompt.end());
+        int seed = prefill_batched(ids.data(), prefill_n);
+        cudaDeviceSynchronize();
+        if (seed >= 0) batched_prefill = true;
+    }
+    if (!batched_prefill) {
+        if (prefill_samples_lmhead()) {
+            for (size_t i = (size_t)start; i < prompt.size(); i++) {
+                (void)forward_token(prompt[i], (int)i, true);
+                cudaDeviceSynchronize();
+            }
+        } else {
+            for (size_t i = (size_t)start; i + 1 < prompt.size(); i++) {
+                forward_token(prompt[i], (int)i, false);
+                cudaDeviceSynchronize();
+            }
+            if (prompt.size() > (size_t)start) {
+                (void)forward_token(prompt.back(), (int)prompt.size() - 1, true);
+                cudaDeviceSynchronize();
+            }
         }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -1318,9 +1359,12 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     Impl& s = *p_;
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.seq_id, s.lin_state, s.lin_conv_state,
-                          s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.logits, s.d_out_id, s.h_out_id, s.d_scalars, s.d_seqlen,
+                          s.fa_m, s.fa_l, s.fa_acc, s.gguf,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim };
-    return prefill_batched_run(ctx, prompt_ids, n);
+    int seed = prefill_batched_run(ctx, prompt_ids, n);
+    if (seed >= 0) return seed;
+    return prefill_batched_moe_run(ctx, prompt_ids, n);
 }
 
 std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
@@ -1343,14 +1387,25 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     int next = reuse ? s.prefix_next : -1;
     const int start = reuse ? s.prefix_len : 0;
     const size_t n = prompt.size();
-    if (prefill_samples_lmhead()) {
-        for (size_t i = (size_t)start; i < n; i++)
-            next = forward_token(prompt[i], (int)i, true);
-    } else {
-        for (size_t i = (size_t)start; i + 1 < n; i++)
-            forward_token(prompt[i], (int)i, false);
-        if (n > (size_t)start)
-            next = forward_token(prompt.back(), (int)n - 1, true);
+    bool batched_prefill = false;
+    if (n > (size_t)start && prefill_batched_enabled(s.gguf, s.cfg, (int)(n - (size_t)start))) {
+        std::vector<int> ids(prompt.begin() + start, prompt.end());
+        int seed = prefill_batched(ids.data(), (int)ids.size());
+        if (seed >= 0) {
+            next = seed;
+            batched_prefill = true;
+        }
+    }
+    if (!batched_prefill) {
+        if (prefill_samples_lmhead()) {
+            for (size_t i = (size_t)start; i < n; i++)
+                next = forward_token(prompt[i], (int)i, true);
+        } else {
+            for (size_t i = (size_t)start; i + 1 < n; i++)
+                forward_token(prompt[i], (int)i, false);
+            if (n > (size_t)start)
+                next = forward_token(prompt.back(), (int)n - 1, true);
+        }
     }
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);

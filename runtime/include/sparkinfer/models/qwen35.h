@@ -124,7 +124,7 @@ public:
 
     const Qwen35Config& config() const;
 
-    // Batched prompt prefill (Qwen3.5 dense-hybrid only): process all `n` prompt tokens in one
+    // Batched prompt prefill (Qwen3.5 dense-hybrid or Qwen3.6 MoE hybrid Phase 1): process all `n` prompt tokens in one
     // pass, filling the paged KV cache and Gated-DeltaNet recurrent/conv state for positions
     // 0..n-1 so a subsequent decode is faithful to the forward_token loop. Returns the argmax at
     // the last prompt position (seed for the first decode step), or -1 if the batched path is

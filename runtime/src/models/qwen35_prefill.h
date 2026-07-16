@@ -23,6 +23,11 @@ struct Qwen35PrefillCtx {
     float*               logits;           // vocab scratch for the seed argmax
     int*                 d_out_id;         // device argmax slot
     int*                 h_out_id;         // pinned host argmax slot
+    int*                 d_scalars;        // packed tok/pos/writepos/seqlen (decode scalars)
+    int*                 d_seqlen;         // device seq len (aliases d_scalars[3])
+    float*               fa_m;             // flash-decode partials (reuse decode buffers for parity)
+    float*               fa_l;
+    float*               fa_acc;
     bool                 gguf;             // native GGUF load (quantized weights)
     int                  qdim, kvdim;                       // full-attn q / kv dims
     int                  linear_qdim, linear_vdim, linear_qkvdim;  // GDN dims
@@ -32,5 +37,9 @@ struct Qwen35PrefillCtx {
 // Returns the argmax at the last prompt position (seed for the first decode step), or -1 if the
 // batched path is unsupported for this model/config (caller falls back to the token loop).
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n);
+
+// Phase-1 MoE hybrid: batched Q/K/V/O + GDN + int8 KV attention; per-token routed MoE FFN.
+// SPARKINFER_PREFILL_MOE_BATCHED=0 disables. Returns -1 when unsupported.
+int prefill_batched_moe_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n);
 
 } // namespace sparkinfer

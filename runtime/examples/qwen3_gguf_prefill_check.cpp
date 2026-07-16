@@ -47,6 +47,9 @@ static double kl(const std::vector<float>& la, const std::vector<float>& lb) {
 
 int main(int argc, char** argv) {
     if (argc < 2) { printf("usage: %s <model.gguf> [prefix_len] [cont_len]\n", argv[0]); return 2; }
+    // MMA int8 flash-decode diverges in the batched N-launch prefill loop past ~5k when enabled;
+    // scalar flash matches the token-loop prefill reference (see SPARKINFER_PREFILL_FAMMA).
+    if (!getenv("SPARKINFER_PREFILL_GRAPH")) setenv("SPARKINFER_PREFILL_GRAPH", "0", 0);
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
     const std::string path = argv[1];
@@ -83,20 +86,28 @@ int main(int argc, char** argv) {
 
     // ---- TOKEN path (reference) ----
     if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv allocate\n"); return 1; }
-    for (int i = 0; i < P; i++) model.forward_token(prompt[i], i);
-    for (int j = 0; j < C; j++) { amA[j] = model.forward_token(cont[j], P + j); model.copy_logits(LA[j].data()); }
+    // Reference prefill uses sample=false (no LM head); teacher-forced continuation samples logits.
+    for (int i = 0; i < P; i++) model.forward_token(prompt[i], i, false);
+    for (int j = 0; j < C; j++) {
+        amA[j] = model.forward_token(cont[j], P + j, true);
+        model.copy_logits(LA[j].data());
+    }
     kv.free(0);
 
     // ---- BATCHED path ----
     if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv allocate\n"); return 1; }
     int seed = model.prefill_batched(prompt.data(), P);
     if (seed < 0) { printf("[FAIL] prefill_batched unsupported (seed=%d)\n", seed); return 1; }
-    for (int j = 0; j < C; j++) { amB[j] = model.forward_token(cont[j], P + j); model.copy_logits(LB[j].data()); }
+    for (int j = 0; j < C; j++) {
+        amB[j] = model.forward_token(cont[j], P + j, true);
+        model.copy_logits(LB[j].data());
+    }
     kv.free(0);
 
     int top1 = 0; double sumkl = 0;
     for (int j = 0; j < C; j++) {
         if (argmax(LA[j]) == argmax(LB[j])) top1++;
+        else fprintf(stderr, "[prefill-check] top1 miss at cont[%d] token=%d\n", j, cont[j]);
         sumkl += kl(LA[j], LB[j]);
     }
     printf("prefix=%d cont=%d int8_kv=%d\n", P, C, kvc.int8_kv ? 1 : 0);
