@@ -240,7 +240,7 @@ __global__ void win_prefill_windowed_kernel(
 // the caller should run its own attention (e.g. head_dim != 256, or the window
 // and tiling are both disabled). Env knobs:
 //   SPARKINFER_PREFILL_ATTN_WINDOW  (default 256) : window size in KV blocks; 0 disables.
-//   SPARKINFER_PREFILL_ATTN_TILED   (default 0)   : use the smem-tiled full kernel when window off.
+//   SPARKINFER_PREFILL_ATTN_TILED   (default 1)   : smem-tiled full kernel when window off; 0 = naive.
 // ----------------------------------------------------------------------------
 bool launch_prefill_attn_windowed(
     const void* q, const signed char* k_pool, const signed char* v_pool,
@@ -276,7 +276,8 @@ bool launch_prefill_attn_windowed(
 
     static int tiled = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_TILED");
-        return (e && e[0] == '1') ? 1 : 0;
+        if (!e) return 1;   // default on: ~10% faster full O(N^2) prefill at 32k vs naive fallback
+        return (e[0] == '1' || e[0] == 'y' || e[0] == 'Y') ? 1 : 0;
     }();
     if (tiled) {
         static int cfg = 0;

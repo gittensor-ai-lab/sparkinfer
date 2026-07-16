@@ -23,7 +23,7 @@ namespace kernels {
 //
 // Env knobs:
 //   SPARKINFER_PREFILL_ATTN_WINDOW  (default 256) window size in KV blocks; 0 disables windowing.
-//   SPARKINFER_PREFILL_ATTN_TILED   (default 0)   smem-tiled full attention when windowing is off.
+//   SPARKINFER_PREFILL_ATTN_TILED   (default 1)   smem-tiled full attention when windowing is off.
 bool launch_prefill_attn_windowed(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
