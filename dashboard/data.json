@@ -6307,6 +6307,14 @@
       "label": "XL",
       "tps": 303.18,
       "raw_tps": 294.92
+    },
+    {
+      "name": "int8 tensor-core prefill GEM",
+      "pr": 422,
+      "date": "2026-07-16",
+      "label": "XL",
+      "tps": 303.18,
+      "raw_tps": 294.93
     }
   ],
   "qwen36": {
