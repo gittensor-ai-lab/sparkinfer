@@ -24,9 +24,16 @@ def merge_decode_prefill(decode, prefill):
     res["prefill_tps"] = pf.get("tps")
     if tier_rank(pf.get("label")) > tier_rank(res.get("label")):
         res["decode_label"] = res.get("label")
+        res["decode_tps"] = res.get("tps")
+        res["decode_score_context"] = res.get("score_context")
+        res["decode_best_context_label"] = res.get("best_context_label")
         for key in ("label", "tps", "frontier_tps", "delta_tps", "pct_over_frontier"):
             if key in pf:
                 res[key] = pf[key]
+        if pf.get("score_prefill_context"):
+            res["score_context"] = pf["score_prefill_context"]
+        if pf.get("best_prefill_context_label"):
+            res["best_context_label"] = pf["best_prefill_context_label"]
         res["score_metric"] = "prefill"
     else:
         res["score_metric"] = "decode"
@@ -64,14 +71,19 @@ class PrefillLabelMergeTest(unittest.TestCase):
 
     def test_prefill_L_beats_decode_none(self):
         out = merge_decode_prefill(
-            {"label": "none", "tps": 283.16, "frontier_tps": 283.28},
+            {"label": "none", "tps": 283.16, "frontier_tps": 283.28,
+             "score_context": 65536, "best_context_label": "64k-context"},
             {"label": "L", "tps": 320.28, "frontier_tps": 288.21,
-             "delta_tps": 32.07, "pct_over_frontier": 11.1},
+             "delta_tps": 32.07, "pct_over_frontier": 11.1,
+             "score_prefill_context": 4096, "best_prefill_context_label": "4k-context"},
         )
         self.assertEqual(out["label"], "L")
         self.assertEqual(out["decode_label"], "none")
         self.assertEqual(out["score_metric"], "prefill")
         self.assertEqual(out["prefill_label"], "L")
+        self.assertEqual(out["score_context"], 4096)
+        self.assertEqual(out["best_context_label"], "4k-context")
+        self.assertEqual(out["decode_tps"], 283.16)
 
     def test_decode_XS_beats_prefill_none(self):
         out = merge_decode_prefill(
@@ -80,6 +92,21 @@ class PrefillLabelMergeTest(unittest.TestCase):
         )
         self.assertEqual(out["label"], "XS")
         self.assertEqual(out["score_metric"], "decode")
+
+
+class PrefillDifficultyRefTest(unittest.TestCase):
+    @staticmethod
+    def prefill_diff_ref(tps, llama, frontier):
+        use_frontier = tps <= 0 or llama <= 0 or llama >= tps * 50
+        if not use_frontier and frontier > 0 and llama >= 2 * frontier:
+            use_frontier = True
+        return 0 if use_frontier else llama
+
+    def test_sequential_pp_uses_frontier(self):
+        self.assertEqual(self.prefill_diff_ref(320.28, 11104.62, 288.21), 0)
+
+    def test_batched_pp_uses_frontier(self):
+        self.assertEqual(self.prefill_diff_ref(6062.59, 11104.62, 4151.38), 0)
 
 
 if __name__ == "__main__":

@@ -607,11 +607,15 @@ PY
   exit 0
 fi
 PREFILL_LINE="$(SPARKINFER_DIFFICULTY_REF="$(python3 - <<PY
-# llama-batched pp refs (~11k) are not comparable to sparkinfer sequential pp (~300).
-# Tier on same-box frontier when the llama ref is the wrong scale (label.py uses frontier if DIFF_REF<=0).
+# llama-batched pp refs (~11k) are not comparable to sparkinfer sequential pp (~300) or
+# batched sparkinfer pp (~4k-6k) vs same-box main — tier on frontier when DIFF_REF<=0.
 tps=float("${PREFILL_SELECTED_TPS:-0}")
 llama=float("${PREFILL_SELECTED_LLAMA_REF:-0}")
-print(llama if llama > 0 and tps > 0 and llama < tps * 50 else 0)
+frontier=float("${PREFILL_SELECTED_FRONTIER:-0}")
+use_frontier = tps <= 0 or llama <= 0 or llama >= tps * 50
+if not use_frontier and frontier > 0 and llama >= 2 * frontier:
+    use_frontier = True
+print(0 if use_frontier else llama)
 PY
 )" SPARKINFER_DIFFICULTY_BOOST="${SPARKINFER_DIFFICULTY_BOOST:-1}" \
   python3 "$HERE/label.py" "$PREFILL_SELECTED_TPS" "$PREFILL_SELECTED_FRONTIER" "$CEILING" "$TOP1" "$KL" "$COMMIT" "{}")"
@@ -650,7 +654,14 @@ if prefill_raw.startswith("RESULT_JSON "):
         res["prefill_difficulty_mult"] = pf["difficulty_mult"]
     if tier_rank(pf.get("label")) > tier_rank(res.get("label")):
         res["decode_label"] = res.get("label")
+        res["decode_tps"] = res.get("tps")
+        res["decode_score_context"] = res.get("score_context")
+        res["decode_best_context_label"] = res.get("best_context_label")
         copy_scoring_fields(res, pf)
+        if res.get("score_prefill_context"):
+            res["score_context"] = res["score_prefill_context"]
+        if res.get("best_prefill_context_label"):
+            res["best_context_label"] = res["best_prefill_context_label"]
         res["score_metric"] = "prefill"
     else:
         res["score_metric"] = "decode"

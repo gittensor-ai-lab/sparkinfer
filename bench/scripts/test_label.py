@@ -163,6 +163,13 @@ class LabelPolicyTest(unittest.TestCase):
         self.assertEqual(res["label"], "L")
         self.assertGreater(res["pct_over_frontier"], 10.0)
 
+    def test_batched_prefill_frontier_scale_scores_XL_at_forty_six_pct(self):
+        # PR #422-shaped: batched sparkinfer pp ~6k vs same-box main ~4151; llama ~11k understates tier.
+        res = score(6062.59, frontier=4151.38, top1=0.94, kl=0.03,
+                    env={"SPARKINFER_DIFFICULTY_REF": "0", "SPARKINFER_DIFFICULTY_BOOST": "1"})
+        self.assertEqual(res["label"], "XL")
+        self.assertGreater(res["pct_over_frontier"], 40.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

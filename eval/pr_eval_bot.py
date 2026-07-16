@@ -909,8 +909,15 @@ def render(res, oid):
                 rows.append(f"| {title} vs same-box main | {block['frontier_tps']} tok/s → "
                             f"{block.get('pct_over_frontier', 0):+.1f}% "
                             f"({block.get('delta_tps', 0):+.1f}) |")
-            rows.append(f"| {title} scored decode ({sc} ctx"
-                        f"{f' · {bctx}' if bctx else ''}) | {block.get('tps', '?')} tok/s |")
+            if block.get("score_metric") == "prefill":
+                dsc = block.get("decode_score_context", sc)
+                dbctx = block.get("decode_best_context_label", bctx)
+                dtps = block.get("decode_tps", block.get("tps", "?"))
+                rows.append(f"| {title} scored decode ({dsc} ctx"
+                            f"{f' · {dbctx}' if dbctx else ''}) | {dtps} tok/s |")
+            else:
+                rows.append(f"| {title} scored decode ({sc} ctx"
+                            f"{f' · {bctx}' if bctx else ''}) | {block.get('tps', '?')} tok/s |")
             if block.get("prefill_label"):
                 pctx = block.get("score_prefill_context", 0)
                 plbl = block.get("best_prefill_context_label", "")
