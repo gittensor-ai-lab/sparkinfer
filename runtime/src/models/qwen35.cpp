@@ -1711,14 +1711,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         type = 0; return dense(name, false);
     };
     // Qwen3.6-35B-A3B UD ships output.weight as Q6_K (~255 MB/token). Requant to Q4_K inside
-    // the loader so decode uses the existing llama Q4_K mmvq path (~1/3 fewer bytes). This is
-    // gated on the hybrid-MoE fingerprint + Q6_K source (not a flip of SPARKINFER_LMHEAD_REQUANT_Q4K's
-    // default), and SPARKINFER_LMHEAD_REQUANT_Q4K=0 still disables it.
+    // the loader so decode uses the existing llama Q4_K mmvq path (~1/3 fewer bytes). Gate
+    // strictly to the routed-MoE Qwen3.6 fingerprint — NOT Qwythos dense hybrid (dense_ffn),
+    // which shares the same 40-layer hybrid metadata but must keep native Q6_K LM head.
     auto lm_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) {
+            const bool q36_routed_moe = !c.dense_ffn && c.top_k == 8 && c.n_experts == 256;
             const bool q36_q6_lm =
-                q36_ud_requant_default && t->ggml_type == 14 &&
+                q36_routed_moe && t->ggml_type == 14 &&
                 (name == "output.weight" || has_suffix(name, "output.weight"));
             const bool do_q4 = req_lm_q4 || q36_q6_lm;
             const char* force_off = getenv("SPARKINFER_LMHEAD_REQUANT_Q4K");

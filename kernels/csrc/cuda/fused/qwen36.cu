@@ -582,8 +582,10 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
         }
         static int qwen_ar = -1;
         if (qwen_ar < 0) {
+            // Default OFF: the specialized kernel is not self-consistent with the generic
+            // gdn_ar_fast path at long context (16k gate failed in eval). Opt in with =1.
             const char* e = getenv("SPARKINFER_GDN_AR_SPECIAL");
-            qwen_ar = !(e && e[0] == '0');
+            qwen_ar = (e && e[0] == '1') ? 1 : 0;
         }
         constexpr int HD = 128;
         const int c = cols;
