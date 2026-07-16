@@ -89,6 +89,78 @@ __global__ void deq_q6k_kernel(const unsigned char* __restrict__ src, __nv_bfloa
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fused GGUF -> per-row-int8 dequant for the int8 prefill GEMM. Replaces the
+// dequant-to-bf16 + pf_quantize_rows_i8 round trip (write 2B + read 2B per
+// value) with one pass that decodes the superblocks twice (rows are L2-hot:
+// a 12288-wide Q4_K row is ~7 KB) and writes 1B per value:
+//   pass 1: block-wide amax of the exactly-dequantized row
+//   pass 2: q = round(v / (amax/127)), matching pf_quantize_rows_i8
+// One block (256 threads) per row; thread t decodes value t of each superblock.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float deq_q4k_val(const unsigned char* blk, int t) {
+    const float d = gg_h2f(blk), dmin = gg_h2f(blk + 2);
+    const unsigned char* sc = blk + 4; const unsigned char* qs = blk + 16;
+    const int j64 = t >> 6, r = t & 63, l = r & 31, hi = r >> 5;
+    const unsigned char byte = qs[j64 * 32 + l];
+    const int nib = hi ? (byte >> 4) : (byte & 0xF);
+    int s, m; gg_scale_min_k4(2 * j64 + hi, sc, &s, &m);
+    return d * s * nib - dmin * m;
+}
+__device__ __forceinline__ float deq_q6k_val(const unsigned char* blk, int t) {
+    const int half = t >> 7, r = t & 127, quad = r >> 5, l = r & 31;
+    const unsigned char* ql = blk + half * 64;
+    const unsigned char* qh = blk + 128 + half * 32;
+    const signed char* sc = (const signed char*)(blk + 192) + half * 8;
+    const float d = gg_h2f(blk + 208);
+    const int is = l / 16;
+    int qv;
+    if (quad == 0)      qv = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+    else if (quad == 1) qv = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+    else if (quad == 2) qv = (int)((ql[l]      >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+    else                qv = (int)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+    return d * sc[is + 2 * quad] * qv;
+}
+
+template <int QT>   // 12 = Q4_K (144B/superblock), 14 = Q6_K (210B/superblock)
+__global__ void deq_rows_i8_kernel(const unsigned char* __restrict__ src,
+                                   signed char* __restrict__ q, float* __restrict__ scale,
+                                   int cols) {
+    constexpr int BS = (QT == 12) ? 144 : 210;
+    const int row = blockIdx.x, t = threadIdx.x;
+    const int nsb = cols >> 8;
+    const unsigned char* rbase = src + (size_t)row * nsb * BS;
+
+    float amax = 0.f;
+    for (int sb = 0; sb < nsb; sb++) {
+        const unsigned char* blk = rbase + (size_t)sb * BS;
+        const float v = (QT == 12) ? deq_q4k_val(blk, t) : deq_q6k_val(blk, t);
+        amax = fmaxf(amax, fabsf(v));
+    }
+    __shared__ float swarp[8];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((t & 31) == 0) swarp[t >> 5] = amax;
+    __syncthreads();
+    if (t < 32) {
+        float v = (t < 8) ? swarp[t] : 0.f;
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (t == 0) swarp[0] = v;
+    }
+    __syncthreads();
+    const float d = swarp[0] / 127.f;
+    if (t == 0) scale[row] = d;
+    const float inv = (d > 0.f) ? (1.f / d) : 0.f;
+
+    signed char* qrow = q + (size_t)row * cols;
+    for (int sb = 0; sb < nsb; sb++) {
+        const unsigned char* blk = rbase + (size_t)sb * BS;
+        const float v = (QT == 12) ? deq_q4k_val(blk, t) : deq_q6k_val(blk, t);
+        qrow[sb * 256 + t] = (signed char)(int)roundf(v * inv);
+    }
+}
+
 __global__ void deq_q8_0_kernel(const unsigned char* __restrict__ src, __nv_bfloat16* __restrict__ y, long nblocks) {
     long b = (long)blockIdx.x * blockDim.x + threadIdx.x; if (b >= nblocks) return;
     const unsigned char* blk = src + b * 34; float d = gg_h2f(blk);
@@ -129,6 +201,16 @@ void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_
     else if (ggml_type == GGML_Q8_0) { long nb = n_values/32;  deq_q8_0_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_F16)  { deq_f16_kernel<<<(n_values+T-1)/T,T,0,stream>>>(s,d,n_values); }
     else /* F32 */                   { deq_f32_kernel<<<(n_values+T-1)/T,T,0,stream>>>(reinterpret_cast<const float*>(src),d,n_values); }
+}
+
+bool launch_gguf_dequant_rows_i8(int ggml_type, const void* src, signed char* q, float* scale,
+                                 int rows, int cols, cudaStream_t stream) {
+    if ((cols & 255) != 0) return false;
+    auto* s = reinterpret_cast<const unsigned char*>(src);
+    if (ggml_type == GGML_Q4_K)      deq_rows_i8_kernel<12><<<rows, 256, 0, stream>>>(s, q, scale, cols);
+    else if (ggml_type == GGML_Q6_K) deq_rows_i8_kernel<14><<<rows, 256, 0, stream>>>(s, q, scale, cols);
+    else return false;
+    return true;
 }
 
 void launch_transpose_bf16(const void* src, void* dst, int rows, int cols, cudaStream_t stream) {

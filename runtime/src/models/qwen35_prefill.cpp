@@ -90,17 +90,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     bf16* ffh  = a.alloc<bf16>((size_t)N * ffn);         // ffn silu(gate)*up
     bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
     int*  d_ids = a.alloc<int>((size_t)N);
+    if (!a.ok) { a.free_all(); fprintf(stderr, "[prefill] scratch alloc failed (ctx=%d) -> fallback\n", N); return -1; }
     // int8 tensor-core projections (prefill_gemm_i8): ~2x the bf16 GEMM at int8==bf16 output fidelity
     // (GGUF weights are already Q4_K/Q6_K -> int8 weight-quant is lossless vs what's stored). Default
-    // ON; SPARKINFER_PREFILL_I8=0 disables (A/B). Gated to low context: the extra int8 scratch is only
-    // spent where prefill_pp is highest (best-context scored); larger contexts fall through to bf16.
+    // ON at every batched context; SPARKINFER_PREFILL_I8=0 disables (A/B). The int8 scratch lives in
+    // its own arena so an alloc failure at huge N degrades to the bf16 GEMMs, not to the token loop.
     const char* _pi8 = getenv("SPARKINFER_PREFILL_I8");
-    const bool use_i8 = !(_pi8 && _pi8[0] == '0') && (N <= 8192);
-    signed char* A_i8 = use_i8 ? a.alloc<signed char>((size_t)N * ffn) : nullptr;
-    signed char* W_i8 = use_i8 ? a.alloc<signed char>(maxw) : nullptr;
-    float* sx = use_i8 ? a.alloc<float>((size_t)N) : nullptr;
-    float* sw = use_i8 ? a.alloc<float>((size_t)ffn) : nullptr;
-    if (!a.ok) { a.free_all(); fprintf(stderr, "[prefill] scratch alloc failed (ctx=%d) -> fallback\n", N); return -1; }
+    bool use_i8 = !(_pi8 && _pi8[0] == '0');
+    Arena a8;
+    signed char* A_i8 = use_i8 ? a8.alloc<signed char>((size_t)N * ffn) : nullptr;
+    signed char* W_i8 = use_i8 ? a8.alloc<signed char>(maxw) : nullptr;
+    float* sx = use_i8 ? a8.alloc<float>((size_t)N) : nullptr;
+    float* sw = use_i8 ? a8.alloc<float>((size_t)ffn) : nullptr;
+    if (use_i8 && !a8.ok) { a8.free_all(); use_i8 = false; }
 
     pf_cu(cudaMemcpyAsync(d_ids, prompt_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "prefill ids");
 
@@ -112,17 +114,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     };
     // C[N,n_out] = A[N,K] @ W^T  (W native quantized [n_out,K]).
     auto proj = [&](const bf16* A, const void* W, int wtype, bf16* C, int n_out, int K) {
-        const void* wb = dq(W, wtype, n_out, K);
         // int8 only for the big weight-bound projections; keep the tiny per-v-head gate
         // projections (ssm_alpha/ssm_beta, n_out == v_heads) in bf16 — they feed the GDN
         // sigmoid gates, where per-row int8 quant of a 32-wide weight costs more accuracy
         // than the negligible time it saves.
         if (use_i8 && n_out >= 128) {
             kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, N, K, st);
-            kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
+            // fused Q4_K/Q6_K -> int8 rows skips the dequant-to-bf16 scratch round trip
+            if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st)) {
+                const void* wb = dq(W, wtype, n_out, K);
+                kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
+            }
             kernels::launch_prefill_gemm_i8(A_i8, W_i8, sx, sw, C, N, n_out, K, st);
         } else {
-            kernels::launch_prefill_gemm(A, wb, C, N, n_out, K, st);
+            kernels::launch_prefill_gemm(A, dq(W, wtype, n_out, K), C, N, n_out, K, st);
         }
     };
 
@@ -165,7 +170,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             signed char* vpool = (signed char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
             void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
             void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
-            if (!kv8) { a.free_all(); fprintf(stderr, "[prefill] batched prefill requires int8 KV\n"); return -1; }
+            if (!kv8) { a.free_all(); a8.free_all(); fprintf(stderr, "[prefill] batched prefill requires int8 KV\n"); return -1; }
             kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
                 kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
                 rope_dim, rope_theta, eps, bs, mbs, st);
@@ -203,6 +208,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     int seed = *s.h_out_id;
 
     a.free_all();
+    a8.free_all();
     return seed;
 }
 

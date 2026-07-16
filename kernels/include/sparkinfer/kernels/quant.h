@@ -27,6 +27,13 @@ void launch_dequant_int4_block(const unsigned char* packed, const void* scales_b
 void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_values,
                          cudaStream_t stream = nullptr);
 
+// Fused GGUF dequant -> per-row symmetric int8 (for launch_prefill_gemm_i8):
+// q[r,c] = round(v[r,c] / scale[r]), scale[r] = max_c|v[r,c]| / 127, with v the
+// exact fp32 dequant. Skips the bf16 scratch round-trip of dequant + row-quantize.
+// Q4_K/Q6_K only; returns false (nothing launched) for other types.
+bool launch_gguf_dequant_rows_i8(int ggml_type, const void* src, signed char* q, float* scale,
+                                 int rows, int cols, cudaStream_t stream = nullptr);
+
 // bf16 transposes used to relayout GGUF [out,in] -> our [in,out].
 void launch_transpose_bf16(const void* src, void* dst, int rows, int cols,
                            cudaStream_t stream = nullptr);          // [rows,cols]->[cols,rows]

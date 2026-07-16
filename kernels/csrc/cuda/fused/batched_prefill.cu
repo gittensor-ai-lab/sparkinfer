@@ -16,6 +16,8 @@
 #include <cuda_pipeline.h>
 #include <mma.h>
 
+#include <cstdlib>
+
 #include "sparkinfer/kernels/prefill.h"
 #include "sparkinfer/kernels/prefill_attn_mma.h"
 #include "sparkinfer/kernels/prefill_attn_window.h"
@@ -232,6 +234,70 @@ __global__ void pf_gdn_conv_kernel(const __nv_bfloat16* __restrict__ qkv,
     #pragma unroll
     for (int c = 0; c < 7; c++)
         if (c < conv_kernel - 1) conv_state[(size_t)c * qkv_dim + d] = __float2bfloat16(hist[c]);
+}
+
+// ============================================================================
+// Token-parallel variant of pf_gdn_conv_kernel. The causal conv needs only the
+// conv_kernel-1 previous RAW qkv rows, which are all in the input buffer (the
+// prompt starts at position 0, so the incoming conv state is zero) — the token
+// loop above is a needless serialization. One block per (token, output head);
+// same taps, SiLU, and L2-norm math, same conv_state layout on exit.
+// Token on grid.x (grid.y stays under the 65535 cap at any context).
+// ============================================================================
+__global__ void pf_gdn_conv_par_kernel(const __nv_bfloat16* __restrict__ qkv,
+                                       const __nv_bfloat16* __restrict__ conv_w,
+                                       __nv_bfloat16* __restrict__ conv_state,
+                                       __nv_bfloat16* __restrict__ q,
+                                       __nv_bfloat16* __restrict__ k,
+                                       __nv_bfloat16* __restrict__ v,
+                                       int n_tokens, int q_heads, int v_heads,
+                                       int head_dim, int qkv_dim, int conv_kernel, float eps) {
+    const int q_dim = q_heads * head_dim;
+    const int v_dim = v_heads * head_dim;
+    const int tok = blockIdx.x;
+    const int blk = blockIdx.y;                    // output head
+    const int t   = threadIdx.x;                   // channel within head
+    int d; __nv_bfloat16* out; int out_dim; int hh; bool do_norm;
+    if (blk < q_heads)            { hh = blk;                d = hh * head_dim + t;               out = q; out_dim = q_dim; do_norm = true;  }
+    else if (blk < 2 * q_heads)   { hh = blk - q_heads;      d = q_dim + hh * head_dim + t;       out = k; out_dim = q_dim; do_norm = true;  }
+    else                          { hh = blk - 2 * q_heads;  d = 2 * q_dim + hh * head_dim + t;   out = v; out_dim = v_dim; do_norm = false; }
+
+    float y = 0.f;
+    #pragma unroll
+    for (int c = 0; c < 8; c++) {
+        if (c >= conv_kernel) break;
+        const int src = tok - (conv_kernel - 1) + c;
+        if (src >= 0)
+            y += pf_to_f(conv_w[(size_t)d * conv_kernel + c]) * pf_to_f(qkv[(size_t)src * qkv_dim + d]);
+    }
+
+    float cval = pf_silu(y);
+    if (do_norm) {
+        __shared__ float sw[32];
+        const int nwarp = (blockDim.x + 31) / 32;
+        float ss = pf_wsum(cval * cval);
+        if ((t & 31) == 0) sw[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < nwarp) ? sw[t] : 0.f;
+            vv = pf_wsum(vv);
+            if (t == 0) sw[0] = rsqrtf(vv + eps);
+        }
+        __syncthreads();
+        cval *= sw[0];
+    }
+    out[(size_t)tok * out_dim + hh * head_dim + t] = __float2bfloat16(cval);
+
+    // persist the conv window (last conv_kernel-1 raw qkv) in the decode layout.
+    if (tok == n_tokens - 1) {
+        #pragma unroll
+        for (int c = 0; c < 7; c++) {
+            if (c >= conv_kernel - 1) break;
+            const int src = n_tokens - 1 - (conv_kernel - 2 - c);
+            conv_state[(size_t)c * qkv_dim + d] =
+                (src >= 0) ? qkv[(size_t)src * qkv_dim + d] : __float2bfloat16(0.f);
+        }
+    }
 }
 
 // ============================================================================
@@ -536,6 +602,19 @@ void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_sta
                              int head_dim, int conv_kernel, float eps, cudaStream_t stream) {
     const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
     const int blocks = 2 * q_heads + v_heads;
+    static int seq = [] {   // SPARKINFER_PREFILL_GDN_CONV_SEQ=1 restores the token-loop kernel
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_SEQ");
+        return (e && e[0] == '1') ? 1 : 0;
+    }();
+    if (!seq) {
+        dim3 grid(n_tokens, blocks);
+        pf_gdn_conv_par_kernel<<<grid, head_dim, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
+            reinterpret_cast<__nv_bfloat16*>(conv_state), reinterpret_cast<__nv_bfloat16*>(q),
+            reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),
+            n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps);
+        return;
+    }
     pf_gdn_conv_kernel<<<blocks, head_dim, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
         reinterpret_cast<__nv_bfloat16*>(conv_state), reinterpret_cast<__nv_bfloat16*>(q),
