@@ -325,6 +325,39 @@ def pr_inactive_days(pr, now=None):
     return (now - updated).total_seconds() / 86400.0
 
 
+def pr_draft_since(repo, pr):
+    """When the PR's current draft period began.
+
+    Uses the latest ``converted_to_draft`` timeline event when present; otherwise
+    ``createdAt`` for PRs opened as draft.
+    """
+    owner, r = _owner_repo(repo)
+    num = pr["number"]
+    latest_convert = None
+    out = gh(["api", f"repos/{owner}/{r}/issues/{num}/timeline"])
+    if out.returncode == 0:
+        for e in json.loads(out.stdout or "[]"):
+            if e.get("event") != "converted_to_draft":
+                continue
+            ts = _parse_github_time(e.get("created_at"))
+            if ts and (latest_convert is None or ts > latest_convert):
+                latest_convert = ts
+    if latest_convert:
+        return latest_convert
+    return _parse_github_time(pr.get("createdAt"))
+
+
+def pr_draft_days(repo, pr, now=None, *, draft_since=None):
+    """Days the PR has been in draft status (activity ignored), or None if unknown."""
+    since = draft_since if draft_since is not None else pr_draft_since(repo, pr)
+    if not since:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=datetime.timezone.utc)
+    return (now - since).total_seconds() / 86400.0
+
+
 def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False, *, drafts_only=None):
     """Close open PRs with no GitHub activity for more than `days` days.
 
@@ -383,8 +416,45 @@ def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False, *, drafts_only=None
 
 
 def close_stale_draft_prs(repo, days=DRAFT_STALE_DAYS, dry_run=False):
-    """Close draft PRs with no GitHub activity for more than `days` days (default 4)."""
-    return close_stale_prs(repo, days=days, dry_run=dry_run, drafts_only=True)
+    """Close draft PRs that have remained in draft status for more than `days` days.
+
+    Uses draft duration (createdAt or latest converted_to_draft), not updatedAt —
+    activity does not reset the clock. Skips `hold` and `merge-first`.
+    """
+    if days <= 0:
+        return set()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open", "--draft",
+                         "--json", "number,title,createdAt,labels,isDraft"]).stdout or "[]")
+    closed = set()
+    for pr in prs:
+        if not pr.get("isDraft"):
+            continue
+        num = pr["number"]
+        labels = {l["name"] for l in pr.get("labels", [])}
+        if labels & STALE_CLOSE_SKIP_LABELS:
+            continue
+        drafted = pr_draft_days(repo, pr, now)
+        if drafted is None or drafted <= days:
+            continue
+        days_drafted = int(drafted)
+        print(f"PR #{num}: draft age — in draft for {days_drafted}d (limit {days}d)"
+              f"{' — would close' if dry_run else ' — closing'}")
+        if dry_run:
+            closed.add(num)
+            continue
+        body = ("<!-- sparkinfer-stale-draft -->\n"
+                f"## Closed: draft open for {days}+ days\n\n"
+                f"This PR has remained a **draft** for **{days_drafted} days** "
+                f"(threshold: {days} days). Recent commits or comments do not reset this timer.\n\n"
+                "Mark ready for review or reopen when you're ready to continue.")
+        gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+        if gh(["pr", "close", str(num), "-R", repo]).returncode == 0:
+            closed.add(num)
+    if closed:
+        print(f">> close_stale_draft_prs: {'would close' if dry_run else 'closed'} "
+              f"{len(closed)} PR(s): {sorted(closed)}")
+    return closed
 
 
 def rtx5090_close_exempt(pr):

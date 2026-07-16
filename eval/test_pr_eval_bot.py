@@ -690,11 +690,25 @@ class PrEvalBotPolicyTest(unittest.TestCase):
                                          dry_run=True, drafts_only=False)
         self.assertEqual(closed, {51})
 
-    def test_close_stale_draft_prs_closes_inactive_drafts(self):
-        prs = [
-            {"number": 60, "updatedAt": "2026-01-01T00:00:00Z", "labels": [], "isDraft": True},
-            {"number": 61, "updatedAt": "2026-01-01T00:00:00Z", "labels": [], "isDraft": False},
-        ]
+    def test_pr_draft_days_from_created_at(self):
+        now = datetime.datetime(2026, 7, 16, 12, 0, tzinfo=datetime.timezone.utc)
+        pr = {"number": 1, "createdAt": "2026-07-10T12:00:00Z", "isDraft": True}
+        with mock.patch.object(bot, "pr_draft_since", return_value=bot._parse_github_time("2026-07-10T12:00:00Z")):
+            self.assertAlmostEqual(bot.pr_draft_days("r/o", pr, now), 6.0, places=5)
+
+    def test_pr_draft_since_uses_latest_convert(self):
+        pr = {"number": 2, "createdAt": "2026-07-01T00:00:00Z", "isDraft": True}
+        timeline = json.dumps([
+            {"event": "converted_to_draft", "created_at": "2026-07-10T00:00:00Z"},
+            {"event": "ready_for_review", "created_at": "2026-07-12T00:00:00Z"},
+            {"event": "converted_to_draft", "created_at": "2026-07-14T00:00:00Z"},
+        ])
+        with mock.patch.object(bot, "gh", return_value=mock.Mock(returncode=0, stdout=timeline)):
+            since = bot.pr_draft_since("gittensor-ai-lab/sparkinfer", pr)
+        self.assertEqual(since.isoformat(), "2026-07-14T00:00:00+00:00")
+
+    def test_close_stale_draft_prs_closes_old_drafts(self):
+        prs = [{"number": 60, "createdAt": "2026-01-01T00:00:00Z", "labels": [], "isDraft": True}]
         gh_calls = []
 
         def fake_gh(args):
@@ -704,16 +718,25 @@ class PrEvalBotPolicyTest(unittest.TestCase):
             return mock.Mock(returncode=0)
 
         with mock.patch.object(bot, "gh", side_effect=fake_gh), \
-             mock.patch.object(bot, "pr_inactive_days", return_value=10.0):
+             mock.patch.object(bot, "pr_draft_days", return_value=10.0):
             closed = bot.close_stale_draft_prs("gittensor-ai-lab/sparkinfer", days=4, dry_run=False)
         self.assertEqual(closed, {60})
         self.assertTrue(any(c[:3] == ["pr", "close", "60"] for c in gh_calls))
 
+    def test_close_stale_draft_prs_ignores_recent_activity(self):
+        """Draft age is not reset by updatedAt — only time in draft status matters."""
+        prs = [{"number": 61, "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-07-16T00:00:00Z", "labels": [], "isDraft": True}]
+        with mock.patch.object(bot, "gh", return_value=mock.Mock(stdout=json.dumps(prs))), \
+             mock.patch.object(bot, "pr_draft_days", return_value=10.0):
+            closed = bot.close_stale_draft_prs("gittensor-ai-lab/sparkinfer", days=4, dry_run=True)
+        self.assertEqual(closed, {61})
+
     def test_close_stale_draft_prs_skips_hold(self):
-        prs = [{"number": 70, "updatedAt": "2026-01-01T00:00:00Z",
+        prs = [{"number": 70, "createdAt": "2026-01-01T00:00:00Z",
                 "labels": [{"name": "hold"}], "isDraft": True}]
         with mock.patch.object(bot, "gh", return_value=mock.Mock(stdout=json.dumps(prs))), \
-             mock.patch.object(bot, "pr_inactive_days", return_value=10.0):
+             mock.patch.object(bot, "pr_draft_days", return_value=10.0):
             closed = bot.close_stale_draft_prs("gittensor-ai-lab/sparkinfer", days=4)
         self.assertEqual(closed, set())
 
