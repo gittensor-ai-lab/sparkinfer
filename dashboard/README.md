@@ -1,26 +1,44 @@
 # sparkinfer dashboard
 
-Static, self-contained status page — current **frontier**, the **optimization journey**, **vs
-llama.cpp**, **emission weights**, the **auto-eval labels**, and **evaluated PRs**. Styled in the
-org's template identity (purple `#7B5DFF` / lime `#D4FF12`, Sora + Work Sans). No build step, no
-framework — just `index.html` + `data.js`.
+Static frontier status page for **SP⚡RKINFER · Powered by SN74** — optimization journey, per-context benchmarks, auto-eval labels, and evaluated PRs. Styled in the org identity (purple `#9D7CFF` / lime `#D4FF12`). No build step — `index.html` + `data.js`.
 
-## View
-Open `dashboard/index.html` in a browser (it loads `dashboard/data.js`).
+**Live:** [gittensor-ai-lab.github.io/sparkinfer/dashboard/](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/)
+
+Companion surfaces:
+
+| Surface | What |
+|---|---|
+| **This dashboard** | Frontier charts, PR eval history, optimization journey |
+| **[sparkinfer-web](https://github.com/gittensor-ai-lab/sparkinfer-web)** | Landing page + SparkInfer Chat UI |
+| **[sparkinfer](https://github.com/gittensor-ai-lab/sparkinfer)** | Runtime, kernels, bench, SN74 eval loop |
+
+## What it shows
+
+- **Target GPUs** — RTX Spark, DGX Spark, RTX 5090, RTX PRO 6000 (`sm_120` / `sm_121`)
+- **Target models** — Qwen3.6-35B-A3B SOTA, Gemma 4 generality guard, Qwythos
+- **Optimization journey** — tok/s per landed kernel optimization
+- **vs llama.cpp** — same GGUF, per-context decode on RTX 5090
+- **Evaluated PRs** — bot labels, never auto-merges
+
+Current frontier (v0.4.1, Qwen3.6 SOTA): **473 tok/s @ 128 ctx · +71%** vs llama.cpp.
+
+## View locally
+
+Open `dashboard/index.html` in a browser (loads `dashboard/data.js`).
 
 ## Update the data
+
 Canonical data is **`data.json`**; **`data.js`** is generated from it
-(`window.SPARKINFER = <data.json>`) so the page can load it on `file://` and Pages. Edit
-`data.json`, then regenerate `data.js`:
+(`window.SPARKINFER = <data.json>`) so the page works on `file://` and GitHub Pages.
+
 ```bash
 python3 -c "import json;d=json.load(open('dashboard/data.json'));open('dashboard/data.js','w').write('window.SPARKINFER = '+json.dumps(d,indent=2)+';\n')"
 ```
 
 **The eval bot does this automatically.** After each evaluated PR, `eval/pr_eval_bot.py` upserts the
-verdict into `prs[]` (`{num,title,areas,label,tps,delta_pct,url}`), **ratchets**
-`status.frontier_tps`, regenerates `data.js`, and pushes — so the live page updates with every PR,
-no manual step.
+verdict into `prs[]`, ratchets `status.frontier_tps`, regenerates `data.js`, and pushes.
 
 ## Deploy (GitHub Pages)
-It's plain static files. Enable Pages (Settings → Pages → deploy from `main`, root) and it serves at
+
+Enable Pages (Settings → Pages → deploy from `main`, root). Serves at
 `https://gittensor-ai-lab.github.io/sparkinfer/dashboard/`.
