@@ -45,6 +45,10 @@ void launch_moe_router_gemm(
     const void* input, const void* router_w, float* logits,
     int num_tokens, int hidden_dim, int num_experts, cudaStream_t stream
 ) {
+    // Match launch_moe_router: refuse invalid dims instead of launching a bad grid.
+    if (num_tokens <= 0 || hidden_dim <= 0 || num_experts <= 0 || !input || !router_w || !logits) {
+        return;
+    }
     constexpr int TILE = 16;
     dim3 block(TILE, TILE);
     dim3 grid((num_experts + TILE - 1) / TILE, (num_tokens + TILE - 1) / TILE);
