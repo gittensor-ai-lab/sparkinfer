@@ -67,6 +67,14 @@ void DecodeRunner::begin_step(const std::vector<int>& seq_lens_before) {
                 n, p_->max_batch);
         return;
     }
+    for (int i = 0; i < n; i++) {
+        if (seq_lens_before[i] < 0) {
+            fprintf(stderr, "[decode] begin_step: negative seq_lens_before[%d]=%d — rejecting
+",
+                    i, seq_lens_before[i]);
+            return;
+        }
+    }
     std::vector<int> after(n);
     for (int i = 0; i < n; i++) after[i] = seq_lens_before[i] + 1;   // include the new token
     cu(cudaMemcpy(p_->d_write_pos, seq_lens_before.data(), n * sizeof(int), cudaMemcpyHostToDevice), "wpos");
