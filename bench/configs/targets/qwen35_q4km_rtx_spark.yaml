@@ -1,0 +1,48 @@
+# Benchmark target: Qwen3.5-35B-A3B Q4_K_M on RTX Spark
+# RTX Spark: 128GB unified LPDDR5X, Blackwell GPU, ~273 GB/s bandwidth
+# Key difference from RTX 5090: much lower bandwidth, but 128GB fits everything
+
+model:   configs/models/qwen35_35b_a3b.yaml
+quant:   q4_k_m
+
+hardware:
+  name: RTX Spark
+  arch: sm_121
+  unified_memory_gb: 128
+  bandwidth_gbps: 273     # LPDDR5X — 6-7× slower than RTX 5090 GDDR7
+  cuda_cores: 6144
+
+decode:
+  batch_sizes: [1, 2, 4, 8]
+  context_lens: [2048, 8192, 32768, 131072, 262144]
+  dtype: bfloat16
+
+  # RTX Spark baseline (estimated vs llama.cpp)
+  baseline_toks_per_sec:
+    bs1_ctx2k:   15    # bandwidth-limited: 273GB/s vs 1790GB/s on RTX 5090
+    bs1_ctx32k:  12
+    bs1_ctx262k: 8
+
+  target_toks_per_sec:
+    bs1_ctx2k:   25    # 1.6× — same relative gain target
+    bs1_ctx32k:  20
+    bs1_ctx262k: 15
+
+# RTX Spark advantage: ALL expert weights fit easily in 128GB
+# 21GB model + 24.6GB expert weights + 5.4GB KV at 262K = ~51GB total
+# 77GB of headroom — enables expert pre-loading, speculative prefetch, etc.
+memory:
+  total_footprint_at_max_ctx_gb: 51
+  free_after_load_gb: 77
+  expert_eviction_needed: false   # unlike RTX 5090, no eviction required
+  # This unlocks a key optimization: pre-load all 256 expert weights at startup
+  can_preload_all_experts: true
+  # Expert prefetch from unified memory is always in-VRAM — no PCIe bottleneck
+  expert_prefetch_latency_us: 0   # experts already in GPU-accessible unified memory
+
+moe:
+  bench_router_standalone: true
+  bench_expert_gemm: true
+  # Key research question: how to optimally schedule 256 experts across 6144 CUDA cores
+  # vs RTX 5090's 21760 cores
+  expert_parallelism_target: 8   # run 8 experts in parallel when possible

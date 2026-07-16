@@ -1,0 +1,37 @@
+# RTX 5090 benchmark profile
+# Blackwell GB202, 32GB GDDR7, ~1.79 TB/s peak bandwidth
+
+hardware:
+  name: RTX 5090
+  arch: sm_120
+  vram_gb: 32
+  bandwidth_tbps: 1.79
+  cuda_cores: 21760
+  tensor_cores_gen: 5   # Blackwell 5th-gen
+
+attention:
+  batch_sizes: [1, 4, 16, 64, 256]
+  context_lens: [512, 2048, 8192, 32768]
+  num_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  dtype: bfloat16
+  # bandwidth target: >80% of peak (1.43 TB/s)
+  bandwidth_target_tbps: 1.43
+
+moe:
+  token_counts: [1, 16, 64, 256, 1024]
+  num_experts: [64, 256]
+  top_k: [6, 8]
+  hidden_dim: 4096
+  ffn_dim: 1408
+  dtype: bfloat16
+
+gemm:
+  # Square and non-square shapes relevant to LLM inference
+  shapes:
+    - [1, 4096, 4096]    # single token
+    - [16, 4096, 4096]   # small batch
+    - [256, 4096, 4096]  # decode batch
+    - [4096, 4096, 4096] # prefill
+  dtype: bfloat16

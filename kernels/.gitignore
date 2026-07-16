@@ -1,0 +1,12 @@
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.so
+*.o
+*.a
+*.d
+.cache/
+compile_commands.json
+_deps/

@@ -1,0 +1,10 @@
+{"id": "gsm8k-588", "benchmark": "gsm8k", "score": 1.0, "pass": true, "detail": "got=52 want=52"}
+{"id": "gsm8k-1214", "benchmark": "gsm8k", "score": 1.0, "pass": true, "detail": "got=5 want=5"}
+{"id": "gsm8k-57", "benchmark": "gsm8k", "score": 1.0, "pass": true, "detail": "got=83 want=83"}
+{"id": "gsm8k-906", "benchmark": "gsm8k", "score": 1.0, "pass": true, "detail": "got=10 want=10"}
+{"id": "gsm8k-1252", "benchmark": "gsm8k", "score": 1.0, "pass": true, "detail": "got=70 want=70"}
+{"id": "mmlupro-10638", "benchmark": "mmlu_pro", "score": 0.0, "pass": false, "detail": "chose=G want=F"}
+{"id": "mmlupro-2338", "benchmark": "mmlu_pro", "score": 0.0, "pass": false, "detail": "chose=J want=E"}
+{"id": "mmlupro-967", "benchmark": "mmlu_pro", "score": 1.0, "pass": true, "detail": "chose=C want=C"}
+{"id": "mmlupro-73", "benchmark": "mmlu_pro", "score": 1.0, "pass": true, "detail": "chose=C want=C"}
+{"id": "mmlupro-11693", "benchmark": "mmlu_pro", "score": 0.0, "pass": false, "detail": "chose=A want=B"}

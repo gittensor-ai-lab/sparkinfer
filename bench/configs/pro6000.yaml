@@ -1,0 +1,52 @@
+# RTX PRO 6000 Blackwell benchmark profile
+# Blackwell GB202 (same die family as RTX 5090), 96GB GDDR7 ECC, ~1.79 TB/s.
+# The no-compromise single-card target: datacenter-class capacity AND bandwidth.
+# Same arch as RTX 5090 (sm_120) — kernels run unchanged; the win is 96GB VRAM,
+# so a full 35B MoE + all experts + large KV cache stay resident with headroom.
+
+hardware:
+  name: RTX PRO 6000 Blackwell
+  arch: sm_120
+  vram_gb: 96
+  bandwidth_tbps: 1.79
+  cuda_cores: 24064
+  tensor_cores_gen: 5   # Blackwell 5th-gen
+  ecc: true
+
+attention:
+  batch_sizes: [1, 4, 16, 64, 256]
+  context_lens: [512, 2048, 8192, 32768, 131072]   # 96GB allows long context
+  num_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  dtype: bfloat16
+  bandwidth_target_tbps: 1.43   # >80% of peak
+
+moe:
+  token_counts: [1, 16, 64, 256, 1024]
+  num_experts: [64, 256]
+  top_k: [6, 8]
+  hidden_dim: 4096
+  ffn_dim: 1408
+  dtype: bfloat16
+  # 96GB: all experts resident, no paging needed even for 35B-class MoE
+  expert_paging: false
+
+gemm:
+  shapes:
+    - [1, 4096, 4096]    # single token
+    - [16, 4096, 4096]   # small batch
+    - [256, 4096, 4096]  # decode batch
+    - [4096, 4096, 4096] # prefill
+  dtype: bfloat16
+
+model_targets:
+  # Models that fit comfortably in 96GB at Q4_K_M / bf16
+  - name: Qwen3.5-35B-A3B
+    params_b: 35
+    type: moe
+    active_params_b: 3
+  - name: Gemma 4 26B-A4B
+    params_b: 26
+    type: moe
+    active_params_b: 4

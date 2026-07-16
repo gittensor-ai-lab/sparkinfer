@@ -1,0 +1,6 @@
+# SparkInfer Polaris eval bot — Ed25519 public key
+# This key signs all eval receipts. Verifiers use this as the trust anchor.
+# Private key: SPARKINFER_POLARIS_PRIVATE_KEY (base64, 32 bytes)
+# Generated: 2026-07-08
+# Rotation: commit new key here, old receipts carry their own key so remain verifiable.
+Wf+zAcqX5IswqbCDDgiwEi0H+9Tj5jdGsqDhhvKgMy8=

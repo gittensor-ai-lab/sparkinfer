@@ -1,0 +1,1 @@
+{"run_name": "default", "batch_size": 1, "input_len": 16384, "output_len": 128, "prefill_latency": 1.021763787000964, "prefill_throughput": 16035.017298948904, "median_decode_latency": 0.00442248499894049, "median_decode_throughput": 226.11721695824258, "total_latency": 1.5825345269913669, "overall_throughput": 10433.89557597316}

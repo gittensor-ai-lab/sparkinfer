@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sparkinfer · SN74 — Blackwell inference frontier</title>
+<link rel="icon" type="image/png" href="assets/img/favicon.png">
+<link rel="apple-touch-icon" href="assets/img/favicon.png">
+<meta name="description" content="Live status for sparkinfer on SN74: Blackwell MoE/LLM inference frontier, optimization passes, accuracy, and auto-evaluated PRs.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Work+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --theme:#7B5DFF; --theme2:#D4FF12; --title:#06050B; --body:#5b5b66;
+    --bg:#F5F5F7; --card:#ffffff; --line:#E7E7EE; --muted:#8A8AA0;
+    --ok:#0E8A16; --warn:#B8860B; --bad:#B60205;
+    --shadow:0 6px 24px rgba(20,16,50,.06);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{overflow-x:hidden;max-width:100%}
+  body{font-family:"Work Sans",sans-serif;color:var(--body);background:var(--bg);line-height:1.5;-webkit-font-smoothing:antialiased}
+  h1,h2,h3,h4,.mono-t{font-family:"Sora",sans-serif;color:var(--title)}
+  a{color:var(--theme);text-decoration:none}
+  code,.mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  .wrap{max-width:1120px;margin:0 auto;padding:0 22px}
+  .pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;line-height:1.6}
+
+  /* hero */
+  header.hero{position:relative;overflow:hidden;background:radial-gradient(1200px 400px at 80% -10%, rgba(123,93,255,.35), transparent 60%), linear-gradient(135deg,#0c0a18 0%,#171033 60%,#241653 100%);color:#fff;padding:30px 0 92px}
+  .nav{display:flex;align-items:center;justify-content:space-between}
+  .brand{font-family:"Sora";font-weight:800;font-size:20px;color:#fff;letter-spacing:.2px}
+  .brand b{color:var(--theme2)}
+  .nav .links a{color:#cfc9e6;margin-left:18px;font-size:14px}
+  .nav .links a:hover{color:#fff}
+  .hero h1{color:#fff;font-size:42px;font-weight:800;line-height:1.1;margin-top:48px;max-width:760px}
+  .hero h1 .hl{color:var(--theme2)}
+  .hero p.sub{color:#b9b2d6;max-width:620px;margin-top:16px;font-size:17px}
+  .hero .meta{margin-top:18px;color:#9a93bd;font-size:13px}
+  .hero .meta b{color:#fff}
+  /* animated banner */
+  .aurora{position:absolute;inset:0;background:radial-gradient(600px 300px at 15% 20%,rgba(123,93,255,.45),transparent 60%),radial-gradient(520px 280px at 85% 6%,rgba(212,255,18,.15),transparent 55%),radial-gradient(720px 420px at 60% 125%,rgba(93,160,255,.30),transparent 60%);animation:drift 16s ease-in-out infinite alternate;pointer-events:none}
+  @keyframes drift{from{transform:translate3d(-2%,-1%,0) scale(1)}to{transform:translate3d(3%,2%,0) scale(1.08)}}
+  .grid-ov{position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.045) 1px,transparent 1px);background-size:46px 46px;-webkit-mask-image:radial-gradient(circle at 50% 15%,#000 35%,transparent 78%);mask-image:radial-gradient(circle at 50% 15%,#000 35%,transparent 78%);pointer-events:none}
+  .hero .wrap{position:relative;z-index:1}
+  .eyebrow{display:inline-block;font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--theme2);border:1px solid rgba(212,255,18,.35);border-radius:999px;padding:5px 14px;margin-top:6px}
+  .chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px}
+  .chip-d{display:flex;align-items:center;gap:8px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.13);color:#e8e4f7;border-radius:999px;padding:8px 14px;font-size:13.5px;font-weight:600}
+  /* target device cards */
+  .targets{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+  .tcard{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:var(--shadow);position:relative;overflow:hidden}
+  .tcard::before{content:"";position:absolute;left:0;right:0;top:0;height:3px;background:linear-gradient(90deg,var(--theme),var(--theme2))}
+  .tcard .ic{font-size:22px}
+  .tcard h4{font-size:16px;margin-top:10px;display:flex;align-items:center;gap:8px}
+  .tcard .role{color:var(--theme);font-size:12px;font-weight:700;margin-top:2px}
+  .tcard p{font-size:13px;margin-top:8px}
+  .tcard .spec{font-family:"Sora";font-size:11.5px;color:var(--muted);margin-top:10px}
+  .tcard a{font-size:12.5px;font-weight:600;margin-top:10px;display:inline-block}
+  .arch{margin-left:auto;font-family:"Sora";font-size:10.5px;font-weight:700;color:var(--theme);background:rgba(123,93,255,.12);border:1px solid rgba(123,93,255,.35);border-radius:6px;padding:2px 7px;letter-spacing:.02em;white-space:nowrap}
+  .badge-sota{display:inline-block;font-family:"Sora";font-size:10.5px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:#1a1500;background:linear-gradient(135deg,var(--theme2),#e8ff6a);border:1px solid rgba(212,255,18,.55);border-radius:6px;padding:3px 9px;vertical-align:middle}
+  .sota-stack{display:grid;gap:14px;margin-top:28px}
+  .sota-spotlight{position:relative;overflow:hidden;background:linear-gradient(135deg,#0c0a18 0%,#1a1238 55%,#241653 100%);border:1px solid rgba(123,93,255,.35);border-radius:18px;padding:26px 28px;color:#e8e4f7;box-shadow:0 14px 40px rgba(123,93,255,.18)}
+  .sota-secondary{position:relative;overflow:hidden;background:linear-gradient(135deg,#12101c 0%,#1a1628 100%);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:18px 22px;color:#e8e4f7;display:grid;grid-template-columns:1.35fr 1fr;gap:18px;align-items:center}
+  .sota-secondary h4{color:#fff;font-size:20px;font-weight:800;line-height:1.2;margin-top:6px}
+  .sota-secondary p{font-size:13.5px;color:#b9b2d6;margin-top:8px}
+  .sota-secondary .sota-stats{grid-template-columns:repeat(3,1fr)}
+  .sota-secondary .sota-stat .n{font-size:20px}
+  .sota-spotlight::before{content:"";position:absolute;inset:0;background:radial-gradient(520px 220px at 88% 0%,rgba(212,255,18,.14),transparent 60%),radial-gradient(420px 200px at 8% 100%,rgba(123,93,255,.28),transparent 55%);pointer-events:none}
+  .sota-spotlight .inner{position:relative;z-index:1;display:grid;grid-template-columns:1.35fr 1fr;gap:24px;align-items:center}
+  .sota-eyebrow{font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--theme2)}
+  .sota-spotlight h3{color:#fff;font-size:28px;font-weight:800;line-height:1.15;margin-top:8px}
+  .sota-spotlight h3 .hl{color:var(--theme2)}
+  .sota-spotlight p{font-size:14.5px;color:#b9b2d6;margin-top:10px;max-width:560px}
+  .sota-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  .sota-stat{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:14px}
+  .sota-stat .n{font-family:"Sora";font-weight:800;font-size:24px;color:#fff;line-height:1}
+  .sota-stat .n span{font-size:12px;color:#9a93bd;font-weight:600}
+  .sota-stat .l{font-size:11.5px;color:#9a93bd;margin-top:6px;text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+  .tcard.sota{border-color:rgba(212,255,18,.35);box-shadow:0 10px 32px rgba(123,93,255,.12)}
+  .tcard.sota::before{background:linear-gradient(90deg,var(--theme2),var(--theme))}
+  .cmp-card.sota{border-color:rgba(212,255,18,.45);background:linear-gradient(180deg,#fffef5 0%,#fbfbfd 100%);box-shadow:0 8px 24px rgba(184,134,11,.08)}
+  .sec-sota .sec-title-row h2{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  @media(max-width:820px){.sota-spotlight .inner,.sota-secondary{grid-template-columns:1fr}.sota-stats{grid-template-columns:1fr 1fr}}
+  details.collapse-sec > summary{list-style:none;cursor:pointer;display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+  details.collapse-sec > summary::-webkit-details-marker{display:none}
+  details.collapse-sec > summary::after{content:"▸";color:var(--muted);font-size:15px;font-weight:700;flex:0 0 auto;transition:transform .15s ease}
+  details.collapse-sec[open] > summary::after{transform:rotate(90deg)}
+  details.collapse-sec:not([open]) > summary{margin-bottom:0}
+  details.collapse-sec .sec-h{margin-bottom:0;flex:1}
+  details.collapse-sec .sec-h h2{font-size:22px}
+  section:has(> details.collapse-sec:not([open])){padding:18px 0}
+  /* hero image + card thumbnails (NVIDIA / MediaTek product imagery) */
+  .hero-grid{display:grid;grid-template-columns:1.25fr 1fr;gap:34px;align-items:center;margin-top:26px}
+  .hero-text .eyebrow{margin-top:0}
+  .hero-text h1{margin-top:14px}
+  .hero-media img{width:100%;border-radius:16px;border:1px solid rgba(255,255,255,.12);box-shadow:0 24px 70px rgba(123,93,255,.40);display:block}
+  .tcard-img{width:100%;height:124px;object-fit:cover;border-radius:10px;border:1px solid var(--line);margin-bottom:4px;background:#0c0a18}
+  .tcard-img.tall{height:320px}
+  @media(max-width:820px){.targets{grid-template-columns:1fr 1fr}.hero-grid{grid-template-columns:1fr;gap:18px}.hero-media{display:none}}
+
+  /* KPI cards pulled up over the hero */
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:-62px;position:relative;z-index:2}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:var(--shadow)}
+  .kpi .lab{font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+  .kpi .val{font-family:"Sora";font-weight:800;font-size:30px;color:var(--title);margin-top:6px;line-height:1}
+  .kpi .val span{font-size:15px;color:var(--muted);font-weight:600}
+  .kpi .note{font-size:12.5px;color:var(--body);margin-top:7px}
+
+  section{padding:42px 0}
+  .sec-h{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:18px;gap:12px;flex-wrap:wrap}
+  .sec-h h2{font-size:24px;font-weight:700}
+  .sec-title-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .model-eq{font-weight:600;color:var(--muted);font-size:20px}
+  .hf-model{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;color:var(--title);font-family:"Work Sans",sans-serif}
+  .hf-model:hover{color:var(--theme)}
+  .hf-model img{width:22px;height:22px;border-radius:4px;object-fit:contain;background:transparent;padding:0;border:none;flex:0 0 auto;display:block}
+  .hf-model-name{line-height:1.2}
+  .hf-dl{color:var(--muted);font-weight:500;font-size:12px;white-space:nowrap}
+  .sec-h .hint{font-size:13px;color:var(--muted)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:var(--shadow)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+
+  /* bars */
+  .bar-row{display:grid;grid-template-columns:150px 1fr 70px;align-items:center;gap:12px;margin:9px 0}
+  .bar-row .nm{font-size:13.5px;color:var(--title);font-weight:600}
+  .bar-row .nm small{display:block;color:var(--muted);font-weight:400;font-size:11.5px}
+  .track{background:#eceaf5;border-radius:999px;height:14px;overflow:hidden}
+  .fill{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--theme),#a78bff)}
+  .bar-row .v{text-align:right;font-family:"Sora";font-weight:700;font-size:14px;color:var(--title)}
+
+  /* compare */
+  .cmp .fill.us{background:linear-gradient(90deg,var(--theme),#a78bff)}
+  .fill.them{background:linear-gradient(90deg,#A9A9B4,#C8C8D4)}
+  .gap{font-family:"Sora";font-weight:800;font-size:34px;color:var(--theme)}
+  .anchor-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}
+  .anchor{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfbfd}
+  .anchor-top{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:10px}
+  .anchor-title{font-family:"Sora";font-weight:800;color:var(--title);font-size:14px}
+  .anchor-delta{font-family:"Sora";font-weight:800;font-size:13px;color:var(--theme)}
+  .anchor-delta.neg{color:var(--bad)}
+  .anchor .bar-row{grid-template-columns:108px 1fr 64px;margin:7px 0}
+  .anchor .bar-row .nm{font-size:12.5px}
+  .anchor .bar-row .nm small{font-size:10.5px}
+  .anchor .bar-row .v{font-size:12.5px}
+  .ctx-head{display:grid;grid-template-columns:92px 1fr 72px;gap:12px;margin-top:18px;padding-top:16px;border-top:1px solid var(--line);font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  .ctx-group{margin-top:10px}
+  .ctx-title{font-family:"Sora";font-weight:800;color:var(--title);font-size:13px;margin:10px 0 5px}
+  .ctx-title span{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:7px}
+  .ctx-note{margin-top:12px;text-align:center;color:var(--muted);font-size:13px}
+  .cmp-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  .cmp-grid-3{grid-template-columns:repeat(3,1fr)}
+  .cmp-card{border:1px solid var(--line);border-radius:12px;padding:16px;background:#fbfbfd;display:flex;flex-direction:column;gap:13px;min-width:0}
+  .cmp-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+  .cmp-title{font-family:"Sora";font-weight:800;color:var(--title);font-size:14px;line-height:1.15}
+  .cmp-sub{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.3}
+  .cmp-delta{font-family:"Sora";font-weight:800;font-size:16px;color:var(--theme);white-space:nowrap}
+  .cmp-delta.neg{color:var(--bad)}
+  .cmp-metric{border-top:1px solid var(--line);padding-top:10px}
+  .cmp-name{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+  .cmp-dot{width:10px;height:10px;border-radius:3px;display:inline-block;flex:0 0 auto}
+  .cmp-val{font-family:"Sora";font-weight:800;color:var(--title);font-size:24px;margin-top:4px;line-height:1}
+  .cmp-val span{font-size:12px;color:var(--muted);font-weight:600}
+  .cmp-bars{margin-top:18px;padding-top:18px;border-top:1px solid var(--line);display:grid;gap:14px}
+  .cmp-bar-row{display:grid;grid-template-columns:128px 1fr 86px;gap:14px;align-items:center}
+  .cmp-bar-label{min-width:0}
+  .cmp-bar-title{font-family:"Sora";font-weight:800;color:var(--title);font-size:13px;line-height:1.2}
+  .cmp-bar-sub{font-size:11.5px;color:var(--muted);margin-top:3px}
+  .cmp-bar-stack{display:grid;gap:6px;min-width:0}
+  .cmp-bar-line{display:grid;grid-template-columns:78px 1fr 72px;gap:9px;align-items:center}
+  .cmp-bar-name{font-size:11.5px;color:var(--muted);font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .cmp-bar-track{height:12px;background:#eceaf5;border-radius:999px;overflow:hidden}
+  .cmp-bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--theme),#a78bff)}
+  .cmp-bar-fill.ref{background:linear-gradient(90deg,#A9A9B4,#C8C8D4)}
+  .cmp-bar-val{text-align:right;font-family:"Sora";font-size:12px;font-weight:800;color:var(--title)}
+  .cmp-bar-delta{text-align:right;font-family:"Sora";font-size:15px;font-weight:800;color:var(--theme)}
+  .cmp-bar-delta.neg{color:var(--bad)}
+
+  /* labels legend */
+  .legend{display:flex;flex-wrap:wrap;gap:10px}
+  .lg{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:13px}
+  .dot{width:12px;height:12px;border-radius:3px;display:inline-block}
+
+  /* table */
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line)}
+  th{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600}
+  .empty{text-align:center;color:var(--muted);padding:30px;font-size:14px}
+  .tag{font-size:11.5px;font-weight:700;color:#fff;padding:2px 8px;border-radius:6px}
+  .area{font-size:11.5px;border:1px solid var(--line);color:var(--body);padding:2px 8px;border-radius:6px;margin-right:4px}
+
+  footer{margin-top:44px;padding:26px 0 44px;border-top:1px solid var(--line);color:var(--muted);font-size:13px;display:flex;flex-wrap:wrap;gap:9px;justify-content:center;align-items:center;text-align:center}
+  footer a{color:var(--body)}
+  footer a:hover{color:var(--theme)}
+  .f-brand{font-family:"Sora",sans-serif;font-weight:700;color:var(--title)}
+  .f-brand b{color:var(--theme)}
+  .f-sep{color:var(--line)}
+  @media(max-width:820px){.kpis{grid-template-columns:1fr 1fr}.grid2,.anchor-grid{grid-template-columns:1fr}.cmp-grid,.cmp-grid-3{grid-template-columns:1fr}.cmp-bar-row{grid-template-columns:1fr}.cmp-bar-delta{text-align:left}.hero h1{font-size:32px}.bar-row{grid-template-columns:110px 1fr 56px}}
+  @media(max-width:560px){.cmp-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="aurora"></div><div class="grid-ov"></div>
+  <div class="wrap">
+    <div class="nav">
+      <div class="brand">spark<b>infer</b> <span style="font-weight:400;font-size:13px;color:#9a93bd">· SN74 on Gittensor</span></div>
+      <div class="links">
+        <a href="https://github.com/gittensor-ai-lab/sparkinfer">Repo</a>
+        <a href="https://gittensor-ai-lab.github.io/sparkinfer-log/">Eval loop</a>
+        <a href="https://gittensor.io/miners/repository?name=gittensor-ai-lab%2Fsparkinfer">Powered by SN74</a>
+      </div>
+    </div>
+    <div class="hero-grid">
+      <div class="hero-text">
+        <span class="eyebrow">Agentic AI · on-device · all Blackwell</span>
+        <h1>Agentic AI is moving <span class="hl">on-device</span>.<br>sparkinfer makes every Blackwell GPU fast for it.</h1>
+        <p class="sub">The inference runtime for the age of personal agents — reproducible, source-verified MoE/LLM decode across consumer &amp; edge Blackwell: from RTX Spark on your desk to DGX Spark in the workstation.</p>
+        <div class="meta" id="hero-meta"></div>
+      </div>
+      <div class="hero-media"><img src="assets/img/rtx-spark.jpg" alt="NVIDIA RTX Spark — personal AI computer for the age of agents" loading="lazy"></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="kpis" id="kpis"></div>
+  <div class="sota-stack" id="sota-stack" aria-label="Primary eval targets"></div>
+
+  <section>
+    <div class="sec-h"><h2>Target GPUs</h2><span class="hint">NVIDIA Blackwell, on-device — consumer <code>sm_120</code> + edge <code>sm_121</code> (not datacenter sm_100)</span></div>
+    <div class="targets">
+      <div class="tcard"><img class="tcard-img" src="assets/img/rtx-spark.jpg" alt="NVIDIA RTX Spark" loading="lazy"><h4>RTX Spark <span style="font-weight:400;color:var(--muted);font-size:12px">GB10</span><span class="arch">sm_121</span></h4>
+        <div class="role">Personal AI PC · flagship target</div>
+        <p>"A new class of processor for the age of personal agents." Run agents locally and privately on a Windows PC.</p>
+        <div class="spec">128 GB unified · 1 PFLOP FP4 · 120B-param LLMs</div>
+        <a href="https://nvidianews.nvidia.com/news/nvidia-microsoft-windows-pcs-agents-rtx-spark" target="_blank" rel="noopener">NVIDIA × Microsoft ↗</a></div>
+      <div class="tcard"><img class="tcard-img" src="assets/img/dgx-spark.jpg" alt="NVIDIA DGX Spark" loading="lazy"><h4>DGX Spark<span class="arch">sm_121</span></h4>
+        <div class="role">AI workstation</div>
+        <p>Desk-side Blackwell GB10 workstation — the same agentic inference stack, scaled for builders and teams.</p>
+        <div class="spec">Blackwell GB10 · unified memory</div>
+        <a href="https://www.nvidia.com/en-us/products/workstations/dgx-spark/" target="_blank" rel="noopener">DGX Spark ↗</a></div>
+      <div class="tcard"><img class="tcard-img" src="assets/img/rtx-5090.jpg" alt="NVIDIA GeForce RTX 5090" loading="lazy"><h4>RTX 5090<span class="arch">sm_120</span></h4>
+        <div class="role">Consumer Blackwell · current dev GPU</div>
+        <p>Desktop flagship — big-model local inference on a 32 GB card. Where the frontier is measured today.</p>
+        <div class="spec">32 GB GDDR7 · ~1.79 TB/s</div>
+        <a href="https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/" target="_blank" rel="noopener">RTX 5090 ↗</a></div>
+      <div class="tcard"><img class="tcard-img" src="assets/img/rtx-pro-6000.jpg" alt="NVIDIA RTX PRO 6000 Blackwell" loading="lazy"><h4>RTX PRO 6000<span class="arch">sm_120</span></h4>
+        <div class="role">Workstation flagship</div>
+        <p>96 GB Blackwell — a full MoE plus all experts and a large KV cache stay resident, no paging.</p>
+        <div class="spec">96 GB GDDR7 · ~1.79 TB/s</div>
+        <a href="https://www.nvidia.com/en-us/products/workstations/" target="_blank" rel="noopener">RTX PRO ↗</a></div>
+    </div>
+  </section>
+
+  <section class="sec-sota">
+    <div class="sec-h">
+      <div class="sec-title-row">
+        <h2>Qwen3.6-35B-A3B <span class="badge-sota">SOTA</span> · optimization journey</h2>
+      </div>
+      <span class="hint" id="passes36-hint"></span>
+    </div>
+    <div class="card"><div id="passes36"></div></div>
+  </section>
+
+  <section>
+  <details class="collapse-sec">
+    <summary>
+      <div class="sec-h"><h2>Qwen3-MoE 30B-A3B · optimization journey</h2><span class="hint" id="passes-hint"></span></div>
+    </summary>
+    <div class="card"><div id="passes"></div></div>
+  </details>
+  </section>
+
+  <section>
+    <div class="sec-h"><h2>Qwen3.5 · prefill optimization journey</h2><span class="hint" id="passes35-hint"></span></div>
+    <div class="card"><div id="passes35"></div></div>
+  </section>
+
+  <section>
+    <div class="sec-h"><h2>sparkinfer vs llama.cpp</h2><span class="hint">same GPU · same GGUF · 128-token decode</span></div>
+    <div class="card" id="vsllama"></div>
+  </section>
+
+  <section class="sec-sota">
+    <div class="sec-h">
+      <div class="sec-title-row">
+        <h2>Qwen3.6-35B-A3B <span class="badge-sota">SOTA</span> · per-context</h2>
+        <a class="hf-model" id="detail-q36-hf" href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF" target="_blank" rel="noopener" title="unsloth/Qwen3.6-35B-A3B-GGUF">
+          <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="eager" decoding="async">
+          <span class="hf-model-name">unsloth/Qwen3.6-35B-A3B-GGUF</span>
+          <span class="hf-dl" id="detail-q36-dl"></span>
+        </a>
+      </div>
+      <span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k</span>
+    </div>
+    <div class="card" id="detail-q36"></div>
+  </section>
+
+  <section>
+  <details class="collapse-sec">
+    <summary>
+      <div class="sec-h">
+        <div class="sec-title-row">
+          <h2>Qwen3-MoE 30B-A3B · per-context</h2>
+          <a class="hf-model" id="detail-q3-hf" href="https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF" target="_blank" rel="noopener" title="Qwen/Qwen3-30B-A3B-GGUF" onclick="event.stopPropagation()">
+            <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="eager" decoding="async">
+            <span class="hf-model-name">Qwen/Qwen3-30B-A3B-GGUF</span>
+            <span class="hf-dl" id="detail-q3-dl"></span>
+          </a>
+        </div>
+        <span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k</span>
+      </div>
+    </summary>
+    <div class="card" id="detail-q3"></div>
+  </details>
+  </section>
+
+  <section>
+    <div class="sec-h">
+      <div class="sec-title-row">
+        <h2>Qwen3.5 <span class="model-eq">(Qwythos)</span> · per-context</h2>
+        <a class="hf-model" id="detail-q35-hf" href="https://huggingface.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF" target="_blank" rel="noopener" title="empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF">
+          <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="eager" decoding="async">
+          <span class="hf-model-name">empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF</span>
+          <span class="hf-dl" id="detail-q35-dl"></span>
+        </a>
+      </div>
+      <span class="hint">sparkinfer vs llama.cpp · 128 / 4k / 32k / 64k / 128k decode</span>
+    </div>
+    <div class="card" id="detail-q35"></div>
+  </section>
+
+  <section>
+    <div class="sec-h">
+      <h2>Qwen3.5 <span class="model-eq">(Qwythos)</span> · prefill</h2>
+      <span class="hint" id="detail-q35-pp-hint">sparkinfer vs llama.cpp · 4k / 32k / 64k context</span>
+    </div>
+    <div class="card" id="detail-q35-pp"></div>
+  </section>
+
+  <section>
+    <div class="sec-h"><h2>Auto-eval labels</h2><span class="hint">deterministic — from verified speedup over same-box main</span></div>
+    <div class="card"><div class="legend" id="labels"></div></div>
+  </section>
+
+  <section>
+    <div class="sec-h"><h2>Evaluated PRs</h2><span class="hint">bot labels + comments · never auto-merges</span></div>
+    <div class="card"><table><thead><tr><th>PR</th><th>area</th><th>label</th><th>decode</th><th>vs frontier</th><th>proof</th></tr></thead><tbody id="prs"></tbody></table></div>
+  </section>
+
+  <footer>
+    <span class="f-brand">spark<b>infer</b></span>
+    <span class="f-sep">·</span>
+    <span>the engineering arm of SN74 on Gittensor</span>
+    <span class="f-sep">·</span>
+    <a href="https://github.com/gittensor-ai-lab/sparkinfer">github.com/gittensor-ai-lab/sparkinfer</a>
+    <span class="f-sep">·</span>
+    <span id="updated"></span>
+  </footer>
+</div>
+
+<script src="data.js"></script>
+<script>
+  const D = window.SPARKINFER, $ = id => document.getElementById(id);
+  const s = D.status, maxPass = Math.max(...D.passes.map(p=>p.tps));
+  // Shared context colors — same ctx size → same hue on every chart.
+  const CTX_COLOR = {128:"#D14D72",512:"#7B5DFF",4096:"#0E8A16",16384:"#B8860B",32768:"#6F42C1"};
+  const CTX_LABEL = {128:"128",512:"512",4096:"4k",16384:"16k",32768:"32k"};
+  const ctxColor = ctx => CTX_COLOR[ctx] || "#7B5DFF";
+  const LLAMA_FILL = "linear-gradient(90deg,#A9A9B4,#C8C8D4)";
+
+  const fmtDl = n => {
+    if (!n) return "";
+    if (n >= 1e6) return (n / 1e6).toFixed(2).replace(/\.?0+$/, "") + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+    return String(n);
+  };
+  const wireHfModel = (elId, dlId, cfg, fallbackRepo) => {
+    const q = cfg || {};
+    const repo = q.hf_repo || fallbackRepo;
+    const el = $(elId);
+    if (!el || !repo) return;
+    el.href = `https://huggingface.co/${repo}`;
+    el.title = repo;
+    const name = el.querySelector(".hf-model-name");
+    if (name) name.textContent = repo;
+    const img = el.querySelector("img");
+    if (img) img.src = q.hf_avatar || "assets/img/huggingface.svg";
+    const dl = dlId ? $(dlId) : null;
+    if (dl && q.hf_downloads) dl.textContent = `· ${fmtDl(q.hf_downloads)} downloads`;
+  };
+
+  wireHfModel("detail-q3-hf", "detail-q3-dl", D.status, "Qwen/Qwen3-30B-A3B-GGUF");
+  wireHfModel("detail-q35-hf", "detail-q35-dl", D.qwen35, "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF");
+  wireHfModel("detail-q36-hf", "detail-q36-dl", D.qwen36, "unsloth/Qwen3.6-35B-A3B-GGUF");
+
+  const q36 = D.qwen36 || {};
+  const q36ctx128 = (q36.ctx||[]).find(x=>x.label==="128");
+  const q36ctx512 = (q36.ctx||[]).find(x=>x.label==="512");
+  const q36Lead = q36ctx128 && q36ctx128.ref_tps ? 100*(q36ctx128.tps - q36ctx128.ref_tps)/q36ctx128.ref_tps : null;
+
+  const q35 = D.qwen35 || {};
+  const q35ctx128 = (q35.ctx||[]).find(x=>x.label==="128");
+  const q35Lead = q35ctx128 && q35ctx128.ref_tps ? 100*(q35ctx128.tps - q35ctx128.ref_tps)/q35ctx128.ref_tps : null;
+
+  $("hero-meta").innerHTML = `GPU <b>${s.gpu}</b> &nbsp;·&nbsp; SOTA target <b>Qwen3.6-35B-A3B</b> &nbsp;·&nbsp; guard <b>${s.model}</b>`;
+  $("updated").textContent = "updated " + D.updated;
+
+  const sotaStack = $("sota-stack");
+  if (sotaStack && q36.frontier_tps) {
+    const pctLlama = q36Lead != null ? (q36Lead>=0?"+":"")+q36Lead.toFixed(0)+"%" : "—";
+    const pctAll = q36.ref_tps ? ((q36.frontier_tps/q36.ref_tps)*100).toFixed(0)+"%" : "—";
+    const q35PctLlama = q35Lead != null ? (q35Lead>=0?"+":"")+q35Lead.toFixed(0)+"%" : "—";
+    sotaStack.innerHTML = `<div class="sota-spotlight"><div class="inner">
+      <div>
+        <div class="sota-eyebrow">Primary eval target</div>
+        <h3><span class="badge-sota">SOTA</span> Qwen3.6-35B-A3B</h3>
+        <p>${q36.arch || "Hybrid Gated-DeltaNet + full-attention MoE"}. sparkinfer optimizes for this state-of-the-art open model — every merged PR is verified on the same RTX 5090 box with Polaris-attested logs and no-regression guards across 128→32k context.</p>
+        <a class="hf-model" href="https://huggingface.co/${q36.hf_repo||"unsloth/Qwen3.6-35B-A3B-GGUF"}" target="_blank" rel="noopener" style="margin-top:14px;color:#e8e4f7">
+          <img src="${q36.hf_avatar||"assets/img/huggingface.svg"}" alt="Hugging Face" width="22" height="22">
+          <span class="hf-model-name" style="color:#fff">${q36.hf_repo||"unsloth/Qwen3.6-35B-A3B-GGUF"}</span>
+          ${q36.hf_downloads ? `<span class="hf-dl" style="color:#9a93bd">· ${fmtDl(q36.hf_downloads)} downloads</span>` : ""}
+        </a>
+      </div>
+      <div class="sota-stats">
+        <div class="sota-stat"><div class="n">${q36.frontier_tps} <span>tok/s</span></div><div class="l">128-tok frontier</div></div>
+        <div class="sota-stat"><div class="n">${pctLlama}</div><div class="l">vs ${q36.ref_name||"llama.cpp"} at 128</div></div>
+        <div class="sota-stat"><div class="n">${pctAll}</div><div class="l">of ${q36.ref_name||"llama.cpp"} speed</div></div>
+      </div>
+    </div></div>`+
+    (q35.frontier_tps ? `<div class="sota-secondary">
+      <div>
+        <div class="sota-eyebrow">Prefill &amp; decode target</div>
+        <h4>Qwen3.5 9B <span class="model-eq" style="font-size:16px;color:#b9b2d6">(Qwythos)</span></h4>
+        <p>${q35.arch || "dense hybrid Gated-DeltaNet + full-attn · 9B"}. Long-context prefill frontier and decode benchmarks on the same eval box.</p>
+        <a class="hf-model" href="https://huggingface.co/${q35.hf_repo||"empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF"}" target="_blank" rel="noopener" style="margin-top:10px;color:#e8e4f7">
+          <img src="${q35.hf_avatar||"assets/img/huggingface.svg"}" alt="Hugging Face" width="20" height="20">
+          <span class="hf-model-name" style="color:#fff;font-size:13px">${q35.hf_repo||"empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF"}</span>
+          ${q35.hf_downloads ? `<span class="hf-dl" style="color:#9a93bd">· ${fmtDl(q35.hf_downloads)} downloads</span>` : ""}
+        </a>
+      </div>
+      <div class="sota-stats">
+        <div class="sota-stat"><div class="n">${q35.frontier_tps} <span>tok/s</span></div><div class="l">128-tok decode</div></div>
+        <div class="sota-stat"><div class="n">${q35.prefill_frontier_pp ? Math.round(q35.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">32k prefill</div></div>
+        <div class="sota-stat"><div class="n">${q35PctLlama}</div><div class="l">vs ${q35.ref_name||"llama.cpp"} decode</div></div>
+      </div>
+    </div>` : "");
+  }
+
+  const kpiTps = q36ctx512?.tps || q36.frontier_tps || s.frontier_tps;
+  const kpiRef = q36ctx512?.ref_tps || q36.ref_tps || s.ref_tps;
+  const kpiRefName = q36.ref_name || s.ref_name;
+  const kpiTm = q36.token_match ?? s.token_match;
+  const kpiKl = q36.kl ?? s.kl;
+  const kpiVram = q36.vram_gb ?? s.vram_gb;
+  const ahead = kpiTps >= kpiRef;
+  const pct   = kpiRef > 0 ? 100*(kpiTps - kpiRef)/kpiRef : 0;
+  const gapx  = kpiTps > 0 ? (kpiRef/kpiTps).toFixed(2) : "—";
+  $("kpis").innerHTML = [
+    {lab:"Frontier decode", val:kpiTps, unit:"tok/s", note:"single-stream, bs=1 · 512-context · 128-tok · Qwen3.6-35B-A3B"},
+    {lab:(ahead?"vs ":"Gap to ")+kpiRefName, val:(ahead?"+"+pct.toFixed(1)+"%":gapx+"×"), unit:"", note:`${kpiRefName} ${kpiRef} tok/s · 512-context`},
+    {lab:"Accuracy", val:(kpiTm*100).toFixed(0)+"%", unit:"top-1", note:`KL ${kpiKl} vs ${kpiRefName}`},
+    {lab:"VRAM resident", val:kpiVram, unit:"GB", note:"experts kept quantized"},
+  ].map(k=>`<div class="kpi"><div class="lab">${k.lab}</div><div class="val">${k.val} <span>${k.unit}</span></div><div class="note">${k.note}</div></div>`).join("");
+
+  // Optimization-journey chart: recorded passes (history) + live optimizations that have LANDED
+  // on the 128-token frontier and guarded long-context frontiers.
+  // Reusable optimization-journey bar chart — each scored model (Qwen3-MoE, Qwen3.6) gets its own.
+  const legItem=(c,t)=>`<span style="display:flex;align-items:center;gap:6px"><span style="width:11px;height:11px;border-radius:3px;background:${c}"></span>${t}</span>`;
+  const legWrap=items=>`<div style="display:flex;gap:18px;justify-content:center;margin-top:12px;font-size:12px;color:var(--body);flex-wrap:wrap">${items}</div>`;
+  function drawJourney(elId, pts, legendHtml, unit="tok/s"){
+    if(!pts.length){ return; }
+    const W=760,H=336,padL=12,padR=12,padT=30,padB=106, cw=W-padL-padR, ch=H-padT-padB;
+    const maxT=Math.max(...pts.map(p=>p.tps)), slot=cw/pts.length, bw=Math.min(slot*0.56,60);
+    const esc=t=>String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    const trunc=t=> t.length>20 ? t.slice(0,19)+"…" : t;
+    const bars=pts.map((p,i)=>{
+      const cx=padL+slot*i+slot/2, bh=Math.max(2,p.tps/maxT*ch), y=padT+ch-bh;
+      const fill=p.fixed?"url(#gFixed)":(p.llama?"url(#gLlama)":(p.baseline?"url(#gPoc)":(p.long?"url(#gLong)":(p.live?"url(#gLive)":"url(#gHist)"))));
+      return `<g><title>${esc(p.name)} — ${esc(p.sub)} · ${p.tps} ${unit}</title>`+
+        `<rect x="${(cx-bw/2).toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="4" fill="${fill}"/>`+
+        `<text x="${cx.toFixed(1)}" y="${(y-7).toFixed(1)}" text-anchor="middle" font-size="12" font-weight="700" fill="#06050B">${p.tps<1?p.tps:Math.round(p.tps)}</text>`+
+        `<text x="${cx.toFixed(1)}" y="${(padT+ch+14).toFixed(1)}" text-anchor="end" transform="rotate(-45 ${cx.toFixed(1)} ${(padT+ch+14).toFixed(1)})" font-size="10.5" fill="#5b5b66">${esc(trunc(p.name))}</text></g>`;
+    }).join("");
+    const axis=`<line x1="${padL}" y1="${padT+ch}" x2="${W-padR}" y2="${padT+ch}" stroke="#E7E7EE"/>`;
+    document.getElementById(elId).innerHTML =
+      `<svg viewBox="-44 0 ${W+44} ${H}" style="width:100%;height:auto;display:block;font-family:Sora,sans-serif" role="img" aria-label="Optimization journey chart">`+
+        `<defs>`+
+          `<linearGradient id="gHist" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7B5DFF"/><stop offset="1" stop-color="#a78bff"/></linearGradient>`+
+          `<linearGradient id="gLive" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0E8A16"/><stop offset="1" stop-color="#5DA271"/></linearGradient>`+
+          `<linearGradient id="gLong" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#B8860B"/><stop offset="1" stop-color="#E3B341"/></linearGradient>`+
+          `<linearGradient id="gPoc" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#D14D72"/><stop offset="1" stop-color="#F08AA7"/></linearGradient>`+
+          `<linearGradient id="gFixed" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6E6E7A"/><stop offset="1" stop-color="#A9A9B4"/></linearGradient>`+
+          `<linearGradient id="gLlama" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#A9A9B4"/><stop offset="1" stop-color="#D8D8E2"/></linearGradient>`+
+        `</defs>${axis}${bars}</svg>`+ legendHtml;
+  }
+  // Qwen3-MoE journey — recorded passes + landed 128-tok + landed long-context frontiers.
+  (function(){
+    const ctxName = ctx => ctx===128 ? "128" : ctx===512 ? "512" : ctx===4096 ? "4k" : ctx===16384 ? "16k" : (ctx ? `${ctx}` : "ctx");
+    const hist = D.passes.map(p=>({name:p.name, sub:p.what, tps:p.tps, live:false}));
+    const live = (D.landed||[]).map(l=>({name:l.name, sub:"PR #"+l.pr+" · "+l.date, tps:l.tps, live:true}));
+    const long = (D.landed_longctx||[]).map(l=>({name:l.name, sub:(l.release?`${l.release} · ${l.author||"ai-hpc"} · `:"PR #"+l.pr+" · ")+ctxName(l.ctx)+" · "+l.date, tps:l.tps, long:true, baseline:!!l.baseline, fixed:!!l.fixed_baseline}));
+    const pts = hist.concat(live, long);
+    $("passes-hint").textContent = `${pts[0].tps} → ${s.frontier_tps} tok/s · 4k ${s.longctx_4k_tps||"—"} · 16k ${s.longctx_16k_tps||"—"} tok/s`;
+    drawJourney("passes", pts, legWrap(
+      legItem("#7B5DFF","recorded passes · "+D.passes_gpu)+
+      legItem("#0E8A16","landed on frontier · RTX 5090 (live)")+
+      legItem("#6E6E7A","fixed split before v0.3.3")+
+      legItem("#D14D72","ai-hpc v0.3.3 long-context POC")+
+      legItem("#B8860B","landed on context frontier")));
+  })();
+  // Qwen3.5 prefill journey — scored prefill pp tok/s (merge-chronological ratchet).
+  (function(){
+    const q = D.qwen35 || {};
+    const L = [...(D.landed_qwen35_pp || [])].sort((a,b)=>(a.date||"").localeCompare(b.date||"")||(a.pr||0)-(b.pr||0));
+    const refPp = (q.pp||[]).find(x=>x.label==="32k")?.ref_pp || 0;
+    const pts = [];
+    const base = q.baseline_pp;
+    if (base) pts.push({name:"origin/main", sub:"same-box baseline · scored prefill", tps:base, baseline:true});
+    pts.push(...L.filter(l=>!l.baseline).map(l=>{
+      let sub=(l.pr?"PR #"+l.pr+" · ":"")+l.date+(l.label?" · eval:"+l.label:"");
+      if(l.raw_tps && l.raw_tps!==l.tps) sub+=" · measured "+l.raw_tps;
+      return {name:l.name, sub, tps:l.tps, live:true};
+    }));
+    const h = $("passes35-hint");
+    if (h) {
+      const f = q.prefill_frontier_pp || Math.max(0, ...L.map(l=>l.tps), base||0);
+      const b = base || (pts.length ? pts[0].tps : f);
+      if (b && f) {
+        h.textContent = `${b} → ${f} pp tok/s · 32k prefill · ${refPp?((f/refPp)*100).toFixed(0)+'% of '+q.ref_name+' '+refPp:'—'}`;
+      }
+    }
+    if (!pts.length && refPp) {
+      pts.push({name:"llama.cpp", sub:"reference · 32k prefill", tps:refPp, llama:true, fixed:true});
+    }
+    drawJourney("passes35", pts,
+      legWrap(legItem("#D14D72","origin/main baseline")+
+              legItem("#0E8A16","landed / eval frontier · RTX 5090")),
+      "pp tok/s");
+  })();
+  // Qwen3.6 journey — its own frontier (hybrid Gated-DeltaNet MoE, scored 128/512/4k).
+  (function(){
+    const q = D.qwen36 || {}; const L = D.landed_qwen36 || [];
+    const pts = L.map(l=>({name:l.name, sub:(l.pr?"PR #"+l.pr+" · ":"")+l.date+(l.label?" · eval:"+l.label:""), tps:l.tps, baseline:!!l.baseline, live:!l.baseline}));
+    const h = $("passes36-hint");
+    if (h && pts.length) h.textContent = `${q.baseline_tps} → ${q.frontier_tps} tok/s · ${((q.frontier_tps/q.ref_tps)*100).toFixed(0)}% of ${q.ref_name} ${q.ref_tps} · top-1 ${(q.token_match*100).toFixed(1)}%`;
+    drawJourney("passes36", pts, legWrap(
+      legItem("#D14D72","baseline · unoptimized main")+
+      legItem("#0E8A16","landed / eval frontier · RTX 5090")));
+  })();
+
+  // sparkinfer vs llama.cpp — three-model comparison (128-token decode, per-model scale)
+  (function(){
+    const C128 = ctxColor(128);
+    const models = [
+      {key:"q36", title:"Qwen3.6-35B-A3B", sub:"SOTA · UD-Q4_K_M · 128-tok decode", sota:true,
+       sp:(D.qwen36?.ctx||[]).find(x=>x.label==="128")?.tps||0,
+       ll:(D.qwen36?.ctx||[]).find(x=>x.label==="128")?.ref_tps||0},
+      {key:"q3", title:"Qwen3-MoE 30B-A3B", sub:"Q4_K_M · 128-tok decode",
+       sp:(D.context_baselines||[]).find(x=>x.ctx===128)?.sparkinfer_tps||0,
+       ll:(D.context_baselines||[]).find(x=>x.ctx===128)?.llamacpp_decode_tps||0},
+      {key:"q35", title:"Qwen3.5 9B", sub:"Qwythos · Q4_K_M · 128-tok decode",
+       sp:(D.qwen35?.ctx||[]).find(x=>x.label==="128")?.tps||0,
+       ll:(D.qwen35?.ctx||[]).find(x=>x.label==="128")?.ref_tps||0},
+    ].filter(m=>m.sp>0||m.ll>0);
+    if (!models.length) return;
+    const pct = (sp,ll)=> ll>0 && sp>0 ? 100*(sp-ll)/ll : null;
+    const card = m=>{
+      const d=pct(m.sp,m.ll), max=Math.max(m.sp,m.ll,1);
+      const bar=v=>Math.max(4,100*v/max);
+      const fmt=v=>v>0?v.toFixed(2):"—";
+      return `<div class="cmp-card${m.sota?" sota":""}">
+        <div class="cmp-top">
+          <div>
+            <div class="cmp-title"><span class="cmp-dot" style="background:${C128}"></span>${m.title}${m.sota?` <span class="badge-sota">SOTA</span>`:""}</div>
+            <div class="cmp-sub">${m.sub}</div>
+          </div>
+          ${d!=null?`<div class="cmp-delta${d<0?' neg':''}">${d>=0?'+':''}${d.toFixed(1)}%</div>`:''}
+        </div>
+        <div class="cmp-bars" style="margin-top:0;padding-top:0;border-top:0">
+          <div class="cmp-bar-line">
+            <div class="cmp-bar-name">sparkinfer</div>
+            <div class="cmp-bar-track"><div class="cmp-bar-fill" style="width:${bar(m.sp)}%;background:linear-gradient(90deg,${C128},${C128}88)"></div></div>
+            <div class="cmp-bar-val">${fmt(m.sp)}</div>
+          </div>
+          <div class="cmp-bar-line">
+            <div class="cmp-bar-name">llama.cpp</div>
+            <div class="cmp-bar-track"><div class="cmp-bar-fill ref" style="width:${bar(m.ll)}%;background:${LLAMA_FILL}"></div></div>
+            <div class="cmp-bar-val">${fmt(m.ll)}</div>
+          </div>
+        </div>
+      </div>`;
+    };
+    $("vsllama").innerHTML =
+      `<div class="cmp-grid cmp-grid-3">${models.map(card).join("")}</div>`+
+      `<div class="ctx-note">128-token decode · same RTX 5090 · same GPU · same GGUF</div>`;
+  })();
+
+  // Qwen3-MoE per-context detail: 128 / 512 / 4k / 16k / 32k bars vs llama.cpp
+  (function(){
+    const rows = (D.context_baselines||[]).filter(x=>x.sparkinfer_tps && x.llamacpp_decode_tps);
+    if (!rows.length) return;
+    const maxT = Math.max(...rows.flatMap(x=>[x.sparkinfer_tps, x.llamacpp_decode_tps]));
+    const fmt=v=>v.toFixed(2); const bar=v=>Math.max(3, 100*v/maxT);
+    const detailRows = rows.map(x=>{
+      const d=100*(x.sparkinfer_tps-x.llamacpp_decode_tps)/x.llamacpp_decode_tps;
+      const col=ctxColor(x.ctx);
+      return `<div class="bar-row">
+        <div class="nm">${CTX_LABEL[x.ctx]||x.ctx}<small>${x.ctx===128?"no prefill":"128 gen tok"}</small></div>
+        <div class="track"><div class="fill" style="width:${bar(x.sparkinfer_tps)}%;background:linear-gradient(90deg,${col},${col}88)"></div></div>
+        <div class="v" style="font-size:12px;color:var(--body);margin-left:8px">${fmt(x.sparkinfer_tps)}</div>
+      </div>
+      <div class="bar-row">
+        <div class="nm">llama.cpp</div>
+        <div class="track"><div class="fill them" style="width:${bar(x.llamacpp_decode_tps)}%;background:${LLAMA_FILL}"></div></div>
+        <div class="v" style="font-size:12px;color:var(--body);margin-left:8px">${fmt(x.llamacpp_decode_tps)} <span style="color:${d>=0?'var(--ok)':'var(--bad)'};font-weight:700;font-size:13px">${d>=0?'+':''}${d.toFixed(1)}%</span></div>
+      </div>`
+    }).join("");
+    $("detail-q3").innerHTML = `${detailRows}<div class="ctx-note" style="margin-top:12px">sparkinfer vs llama.cpp · same GPU · same Qwen3-30B Q4_K_M GGUF</div>`;
+  })();
+
+  // Qwen3.5 per-context detail: 128 / 512 / 4k bars vs llama.cpp
+  (function(){
+    const rows = (D.qwen35?.ctx||[]).filter(x=>x.ref_tps);
+    if (!rows.length) return;
+    const maxT = Math.max(...rows.flatMap(x=>[x.tps||0, x.ref_tps]));
+    const fmt=v=>v>0?v.toFixed(2):"pending"; const bar=v=>Math.max(3, 100*v/maxT);
+    const detailRows = rows.map(x=>{
+      const d=x.tps>0?100*(x.tps-x.ref_tps)/x.ref_tps:null;
+      const col=ctxColor(x.label==="4k"?4096:parseInt(x.label,10)||128);
+      return `<div class="bar-row">
+        <div class="nm">${x.label}<small>${x.label==="128"?"no prefill":"128 gen tok"}</small></div>
+        <div class="track"><div class="fill" style="width:${x.tps>0?bar(x.tps):0}%;background:linear-gradient(90deg,${col},${col}88)"></div></div>
+        <div class="v" style="font-size:12px;color:var(--body);margin-left:8px">${fmt(x.tps)}</div>
+      </div>
+      <div class="bar-row">
+        <div class="nm">llama.cpp</div>
+        <div class="track"><div class="fill them" style="width:${bar(x.ref_tps)}%;background:${LLAMA_FILL}"></div></div>
+        <div class="v" style="font-size:12px;color:var(--body);margin-left:8px">${fmt(x.ref_tps)}${d!=null?` <span style="color:${d>=0?'var(--ok)':'var(--bad)'};font-weight:700;font-size:13px">${d>=0?'+':''}${d.toFixed(1)}%</span>`:''}</div>
+      </div>`
+    }).join("");
+    $("detail-q35").innerHTML = `${detailRows}<div class="ctx-note" style="margin-top:12px">sparkinfer vs llama.cpp · same GPU · Qwythos-9B Q4_K_M GGUF · decode</div>`;
+  })();
+
+  // Qwen3.5 prefill detail: 4k / 32k / 64k pp vs llama.cpp
+  (function(){
+    const q = D.qwen35 || {};
+    const rows = (q.pp||[]).filter(x=>x.ref_pp);
+    const hint = $("detail-q35-pp-hint");
+    if (hint && q.prefill_frontier_pp) {
+      hint.textContent = `frontier ${q.prefill_frontier_pp} pp tok/s${q.prefill_label?' · eval-prefill:'+q.prefill_label:''} · 4k / 32k / 64k context`;
+    }
+    if (!rows.length) {
+      if ($("detail-q35-pp")) $("detail-q35-pp").innerHTML = `<div class="ctx-note">Prefill baselines pending — bidir eval with SPARKINFER_EVAL_PREFILL=1 populates this chart.</div>`;
+      return;
+    }
+    const maxT = Math.max(...rows.flatMap(x=>[x.pp||0, x.ref_pp]));
+    const fmt=v=>v>0?v.toFixed(2):"pending"; const bar=v=>Math.max(3, 100*v/maxT);
+    const ppColor = lbl => ({"4k":"#0E8A16", "32k":"#6F42C1", "64k":"#E67E22"}[lbl]||"#7B5DFF");
+    const detailRows = rows.map(x=>{
+      const d=x.pp>0?100*(x.pp-x.ref_pp)/x.ref_pp:null;
+      const col=x.color||ppColor(x.label);
+      return `<div class="bar-row">
+        <div class="nm">${x.label}<small>prefill pp</small></div>
+        <div class="track"><div class="fill" style="width:${x.pp>0?bar(x.pp):0}%;background:linear-gradient(90deg,${col},${col}88)"></div></div>
+        <div class="v" style="font-size:12px;color:var(--body);margin-left:8px">${fmt(x.pp)}</div>
+      </div>
+      <div class="bar-row">
+        <div class="nm">llama.cpp</div>
+        <div class="track"><div class="fill them" style="width:${bar(x.ref_pp)}%;background:${LLAMA_FILL}"></div></div>
+        <div class="v" style="font-size:12px;color:var(--body);margin-left:8px">${fmt(x.ref_pp)}${d!=null?` <span style="color:${d>=0?'var(--ok)':'var(--bad)'};font-weight:700;font-size:13px">${d>=0?'+':''}${d.toFixed(1)}%</span>`:''}</div>
+      </div>`
+    }).join("");
+    $("detail-q35-pp").innerHTML = `${detailRows}<div class="ctx-note" style="margin-top:12px">sparkinfer vs llama.cpp · same GPU · Qwythos-9B Q4_K_M GGUF · prefill throughput (pp tok/s)</div>`;
+  })();
+
+  // Qwen3.6 per-context detail: 128 / 512 / 4k bars vs llama.cpp
+  (function(){
+    const rows = (D.qwen36?.ctx||[]).filter(x=>x.tps && x.ref_tps);
+    if (!rows.length) return;
+    const maxT = Math.max(...rows.flatMap(x=>[x.tps, x.ref_tps]));
+    const fmt=v=>v.toFixed(2); const bar=v=>Math.max(3, 100*v/maxT);
+    const detailRows = rows.map(x=>{
+      const d=100*(x.tps-x.ref_tps)/x.ref_tps;
+      const col=ctxColor(x.label==="4k"?4096:x.label==="16k"?16384:x.label==="32k"?32768:parseInt(x.label,10)||128);
+      return `<div class="bar-row">
+        <div class="nm">${x.label}<small>${x.label==="128"?"no prefill":"128 gen tok"}</small></div>
+        <div class="track"><div class="fill" style="width:${bar(x.tps)}%;background:linear-gradient(90deg,${col},${col}88)"></div></div>
+        <div class="v" style="font-size:12px;color:var(--body);margin-left:8px">${fmt(x.tps)}</div>
+      </div>
+      <div class="bar-row">
+        <div class="nm">llama.cpp</div>
+        <div class="track"><div class="fill them" style="width:${bar(x.ref_tps)}%;background:${LLAMA_FILL}"></div></div>
+        <div class="v" style="font-size:12px;color:var(--body);margin-left:8px">${fmt(x.ref_tps)}${d!=null?` <span style="color:${d>=0?'var(--ok)':'var(--bad)'};font-weight:700;font-size:13px">${d>=0?'+':''}${d.toFixed(1)}%</span>`:''}</div>
+      </div>`
+    }).join("");
+    $("detail-q36").innerHTML = `${detailRows}<div class="ctx-note" style="margin-top:12px">sparkinfer vs llama.cpp · same GPU · same Qwen3.6-35B-A3B UD-Q4_K_M GGUF</div>`;
+  })();
+
+  $("labels").innerHTML = D.labels.map(x=>`<span class="lg"><span class="dot" style="background:${x.c}"></span><b style="color:var(--title)">${x.l}</b> — ${x.d}</span>`).join("");
+
+  const lc = Object.fromEntries(D.labels.map(x=>[x.l,x.c]));
+  const proofRun = p => p.proof_run || ((p.proof_url||"").match(/[?&]run=([^&]+)/)||[])[1] || "log";
+  const proofIcon = p => p.polaris_receipt_url ? "🛡️" : "📋";
+  const proofTitle = p => p.polaris_receipt_url ? "Polaris TDX attested eval log" : "verifiable eval log";
+  $("prs").innerHTML = D.prs.length ? D.prs.map(p=>`
+    <tr><td><a href="${p.url||'#'}">#${p.num}</a> ${p.title||''}</td>
+    <td>${(p.areas||[]).map(a=>`<span class="area">${a}</span>`).join("")||"—"}</td>
+    <td><span class="tag" style="background:${lc[p.label]||'#888'}">${p.label}</span></td>
+    <td>${p.tps??"—"}</td><td>${p.delta_pct!=null?(p.delta_pct>0?"+":"")+p.delta_pct+"%":"—"}</td>
+    <td>${p.proof_url?`<a href="${p.proof_url}" target="_blank" title="${proofTitle(p)}" class="mono">${proofIcon(p)} ${proofRun(p)}</a>`:"—"}</td></tr>`).join("")
+    : `<tr><td colspan="6" class="empty">No PRs evaluated yet — open one and the bot posts an <code>eval:&lt;label&gt;</code> within ~30 min.</td></tr>`;
+</script>
+</body>
+</html>

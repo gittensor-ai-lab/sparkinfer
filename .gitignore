@@ -1,0 +1,14 @@
+build/
+*.o
+*.so
+*.cubin
+__pycache__/
+.DS_Store
+*.swp
+.prebuilt/
+.llamacpp/
+/models/
+dist/
+.claude
+.env.eval
+eval/.baseline_cache.json

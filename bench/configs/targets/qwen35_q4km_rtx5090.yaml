@@ -1,0 +1,68 @@
+# Benchmark target: Qwen3.5-35B-A3B Q4_K_M on RTX 5090
+# Primary optimization target for SN74 / gittensor-ai-lab
+
+model:   configs/models/qwen35_35b_a3b.yaml
+quant:   q4_k_m
+
+hardware:
+  name: RTX 5090
+  arch: sm_120         # Blackwell (RTX 5090 / PRO 6000)
+  vram_gb: 32
+  bandwidth_tbps: 1.79
+  cuda_cores: 21760
+
+# --- Decode latency (batch=1, per-token) ---
+decode:
+  batch_sizes: [1, 4, 8, 16, 32, 64]
+  context_lens: [2048, 8192, 32768, 131072, 262144]
+  dtype: bfloat16
+
+  # Baseline targets (what we want to beat)
+  # llama.cpp Q4_K_M on RTX 5090 estimated: ~80 tok/s @ bs=1, ctx=2K
+  baseline_toks_per_sec:
+    bs1_ctx2k:   80
+    bs1_ctx32k:  65
+    bs1_ctx262k: 30   # memory pressure from KV cache at 262K
+
+  # SN74 optimization target
+  target_toks_per_sec:
+    bs1_ctx2k:   130   # 1.6× over baseline
+    bs1_ctx32k:  110
+    bs1_ctx262k: 55
+
+# --- Prefill throughput ---
+prefill:
+  seq_lens: [512, 2048, 8192, 32768]
+  batch_size: 1
+  dtype: bfloat16
+  # Prefill is more compute-bound; gains from fused attention + expert dispatch
+
+# --- MoE-specific ---
+moe:
+  # Measure routing overhead separately (256-expert softmax + top-8 select)
+  bench_router_standalone: true
+  # Measure grouped GEMM for 2048x512 expert shapes
+  bench_expert_gemm: true
+  # Test expert cache hit rate vs miss cost under RTX 5090's 32GB budget
+  bench_expert_cache: true
+  # Expert paging: since 40.96GB fp16 expert weights > 32GB VRAM,
+  # some experts must be evicted. At Q4_K_M: ~256*40*4*0.6 ≈ 24.6GB for experts
+  # (rough: 4.8 bits * 2 * 2048 * 512 / 8 * 256 * 40 / 1e9)
+  expert_weights_q4km_gb: 24.6
+  # With model base (non-expert): ~21 - 24.6 estimate... actually need to verify
+  # Key question: can all expert weights live in VRAM at Q4_K_M on RTX 5090?
+
+# --- Memory system benchmarks ---
+memory:
+  # KV cache bandwidth at varying context lengths
+  kv_cache_bw_bench: true
+  # With only 2 KV heads, KV footprint is tiny — measure effect on attention BW
+  kv_bytes_per_token: 40960   # ~40KB — much smaller than most MoE models
+
+# --- Attention-specific ---
+attention:
+  # 8:1 GQA (16 Q heads / 2 KV heads) — unusual ratio
+  # Flash decode should be highly BW-efficient given tiny KV
+  gqa_ratio: 8
+  # Long context: verify correctness + performance at 131K and 262K
+  test_long_context: true

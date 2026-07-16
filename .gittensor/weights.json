@@ -1,0 +1,25 @@
+{
+  "_comment": "sparkinfer scoring intent for SN74 / Gittensor. SN74 pays VERIFIED SPEEDUP ONLY. This file is documentation — the live payout is fixed_base_score x label_multiplier from the org config (master_repositories.json), not this file.",
+  "model": "speedup-only",
+  "scoring": "Each merged PR scores fixed_base_score (1.0) x its eval:* speedup tier (XL/L/M/S/XS, or BASELINE for the first verified entry on a new model/target), set by the deterministic eval loop. A verified speedup is scored the same wherever it lands (kernels / runtime / moe) — there is no per-subsystem emission budget.",
+  "non_speedup_prs": "Welcome, but score 0. Correct-but-not-faster (eval:none), tooling, benchmarks, docs, and refactors earn no SN74 emission. The eval/scoring harness is maintainer-owned (see CONTRIBUTING.md).",
+  "areas": {
+    "_comment": "Categorization only — drives the deterministic area:* labels for display, NOT emission weights.",
+    "kernels": "CUDA kernels",
+    "runtime": "scheduler / paged KV cache / CUDA-graph decode / model forward",
+    "moe": "MoE router + expert dispatch",
+    "bench": "benchmarks + eval harness (harness scripts are maintainer-owned)"
+  },
+  "notes": "Tiers are maturity-adaptive: as the runtime nears the hardware ceiling, improvement is scored vs remaining headroom (roofline %). Full reward model: https://github.com/gittensor-ai-lab",
+  "attribution_overrides": [
+    {
+      "date": "2026-07-10",
+      "issue": 334,
+      "credit_pr": 326,
+      "void_pr": 327,
+      "author": "inference2026",
+      "label": "XS",
+      "reason": "#327 merged then reverted (#332); false copycat close on #326. Emission credited to #326; #327 voided in dashboard."
+    }
+  ]
+}

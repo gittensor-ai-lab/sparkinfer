@@ -1,0 +1,55 @@
+# RTX Spark benchmark profile
+# Blackwell SoC: 6144 CUDA cores, 128GB unified LPDDR5X, ~1 PFLOP AI compute
+# Key difference from discrete GPU: unified memory (CPU+GPU share same pool)
+
+hardware:
+  name: RTX Spark
+  arch: sm_121
+  unified_memory_gb: 128
+  # LPDDR5X bandwidth is lower than GDDR7 — this is the key constraint
+  bandwidth_gbps: ~273   # LPDDR5X-8533 x 256-bit estimated
+  cuda_cores: 6144
+  arm_cores: 20
+  tensor_cores_gen: 5
+
+attention:
+  batch_sizes: [1, 4, 16, 64]
+  context_lens: [2048, 8192, 32768, 131072]   # long context matters more here
+  num_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  dtype: bfloat16
+  # Lower bandwidth target vs RTX 5090 — unified memory is slower
+  bandwidth_target_gbps: 220
+
+moe:
+  token_counts: [1, 4, 16, 64]
+  num_experts: [64, 256]
+  top_k: [6, 8]
+  hidden_dim: 4096
+  ffn_dim: 1408
+  dtype: bfloat16
+  # Expert paging from CPU memory is expected here
+  expert_paging: true
+
+memory:
+  # Unified memory microbenchmarks
+  # Measure actual achieved bandwidth for GPU→CPU and CPU→GPU transfers
+  transfer_sizes_mb: [1, 4, 16, 64, 256, 1024]
+  # Expert prefetch: simulate loading E experts from CPU into GPU cache
+  expert_prefetch_sizes: [1, 4, 8, 16]
+  expert_size_mb: 32   # typical MoE expert weight size
+
+model_targets:
+  # Models realistic on RTX Spark (128GB unified)
+  - name: Qwen3-8B
+    params_b: 8
+    type: dense
+  - name: DeepSeek-V3-lite (hypothetical)
+    params_b: 37
+    type: moe
+    active_params_b: 3.7
+  - name: Mixtral-8x7B
+    params_b: 46.7
+    type: moe
+    active_params_b: 12.9

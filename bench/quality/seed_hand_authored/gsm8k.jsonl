@@ -1,0 +1,8 @@
+{"id": "g1", "benchmark": "gsm8k", "prompt": "Tom has 12 apples. He gives away 5 and then buys 9 more. How many apples does he have now?", "target": 16}
+{"id": "g2", "benchmark": "gsm8k", "prompt": "A store sells pencils for 25 cents each. Maria buys 8 pencils. How many dollars does she spend?", "target": 2}
+{"id": "g3", "benchmark": "gsm8k", "prompt": "A train travels at 60 miles per hour for 2.5 hours. How many miles does it travel?", "target": 150}
+{"id": "g4", "benchmark": "gsm8k", "prompt": "Sarah has 3 boxes with 12 eggs each. She uses 7 eggs. How many eggs are left?", "target": 29}
+{"id": "g5", "benchmark": "gsm8k", "prompt": "Jack reads 15 pages every day for one week. How many pages does he read in total?", "target": 105}
+{"id": "g6", "benchmark": "gsm8k", "prompt": "A shirt costs 40 dollars and is on sale for 25 percent off. What is the sale price in dollars?", "target": 30}
+{"id": "g7", "benchmark": "gsm8k", "prompt": "Five friends share a bill of 85 dollars plus a 15 dollar tip, split evenly. How much does each pay in dollars?", "target": 20}
+{"id": "g8", "benchmark": "gsm8k", "prompt": "A tank holds 240 liters. It is 3/4 full. How many liters of water are in the tank?", "target": 180}

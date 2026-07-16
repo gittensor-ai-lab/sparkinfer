@@ -1,0 +1,60 @@
+# Benchmark target: Gemma 4 26B-A4B Q4_K_M on RTX Spark
+# RTX Spark: 128GB unified LPDDR5X, Blackwell sm_121, ~273 GB/s bandwidth
+
+model:   configs/models/gemma4_26b_a4b.yaml
+quant:   q4_k_m
+
+hardware:
+  name: RTX Spark
+  arch: sm_121
+  unified_memory_gb: 128
+  bandwidth_gbps: 273
+  cuda_cores: 6144
+
+decode:
+  batch_sizes: [1, 2, 4, 8]
+  context_lens: [2048, 8192, 32768, 131072, 262144]
+  dtype: bfloat16
+
+  baseline_toks_per_sec:
+    bs1_ctx2k:   12
+    bs1_ctx32k:  10
+    bs1_ctx262k:  6
+
+  target_toks_per_sec:
+    bs1_ctx2k:   20
+    bs1_ctx32k:  16
+    bs1_ctx262k: 12
+
+  memory_at_max_ctx_gb: 20.2
+  rtx_spark_headroom_gb: 107.8
+
+memory:
+  expert_eviction_needed: false
+  can_preload_all_experts: true
+
+attention:
+  local:
+    num_layers: 25
+    sliding_window: 1024
+    num_kv_heads: 8
+    head_dim: 256
+    bench_sw_attn: true
+    kv_tokens_always: 1024
+
+  global:
+    num_layers: 5
+    sliding_window: null
+    num_kv_heads: 2
+    head_dim: 512
+    bench_full_ctx_attn: true
+    ecosystem_gap: true
+
+moe:
+  bench_router_standalone: true
+  bench_expert_gemm: true
+  num_experts: 128
+  top_k: 8
+  expert_shape: [2112, 704]
+
+compare_against: configs/targets/gemma4_q4km_rtx5090.yaml

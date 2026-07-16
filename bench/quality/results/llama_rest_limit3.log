@@ -1,0 +1,20 @@
+  bfcl       bfcl-922 PASS  name=updateUserPreferences(ok) args=ok
+  bfcl       bfcl-558 PASS  name=extract_legal_information(ok) args=ok
+  bfcl       bfcl-76 PASS  name=get_ad_performance_metrics(ok) args=ok
+  humaneval  HumanEval-61 PASS  passed
+  humaneval  HumanEval-104 PASS  passed
+  humaneval  HumanEval-105 PASS  passed
+  ifeval     ifeval-2195 PASS  bullet_count=ok
+  ifeval     ifeval-2284 fail  word_count_min=X, placeholders_min=X, bullet_count=X
+  ifeval     ifeval-1418 fail  no_commas=ok, sentence_count_max=ok, sentence_count_min=X
+
+==============================================
+QUALITY REPORT  -  backend=llama
+==============================================
+  bfcl          100.0%   (3/3)
+  humaneval     100.0%   (3/3)
+  ifeval         55.6%   (1/3)
+  ------------------------------
+  OVERALL        85.2%   (9 items)
+
+wrote /workspace/qwen_awq_bench/results/quality/llama_rest_limit3.jsonl

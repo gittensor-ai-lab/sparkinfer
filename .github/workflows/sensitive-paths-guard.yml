@@ -1,0 +1,55 @@
+name: sensitive-paths-guard
+
+# Blocks any NON-maintainer pull request that modifies scoring / eval / governance paths.
+#
+# Uses pull_request_target so the workflow ALWAYS runs the version on the protected base
+# branch (main) — a fork PR cannot weaken this guard by editing the workflow in its head.
+# The job only READS the changed-file list and the PR author (via the API); it never checks
+# out or executes PR code, so the elevated pull_request_target token is safe here.
+#
+# Pair with a branch ruleset on `main` that requires this check to pass.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Block non-maintainer edits to sensitive paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          ASSOC: ${{ github.event.pull_request.author_association }}
+        run: |
+          set -euo pipefail
+
+          # Maintainer allowlist (explicit), plus OWNER/MEMBER association as a fallback.
+          MAINTAINERS="ai-hpc"
+
+          # Verdict-determining / governance paths. Keep in sync with .github/CODEOWNERS.
+          SENSITIVE='^(eval/|bench/scripts/|\.github/|\.gittensor/|dashboard/data\.json$)'
+
+          # Read-only: the changed-file list from the API. Never runs PR code.
+          FILES="$(gh pr diff "$NUM" -R "$REPO" --name-only)"
+          echo "PR #$NUM by $AUTHOR ($ASSOC)"; echo "--- changed files ---"; echo "$FILES"
+
+          HITS="$(printf '%s\n' "$FILES" | grep -E "$SENSITIVE" || true)"
+          if [ -z "$HITS" ]; then
+            echo "No sensitive paths touched — OK."; exit 0
+          fi
+          echo "--- sensitive paths touched ---"; echo "$HITS"
+
+          if printf ' %s ' "$MAINTAINERS" | grep -q " $AUTHOR " || [ "$ASSOC" = "OWNER" ] || [ "$ASSOC" = "MEMBER" ]; then
+            echo "Author $AUTHOR ($ASSOC) is a maintainer — allowed."; exit 0
+          fi
+
+          echo "::error::PR #$NUM by $AUTHOR ($ASSOC) modifies maintainer-only paths (scoring / eval / governance). Only maintainers may change these. Blocked."
+          exit 1

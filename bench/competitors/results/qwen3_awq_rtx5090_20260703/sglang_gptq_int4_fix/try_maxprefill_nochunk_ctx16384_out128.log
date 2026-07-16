@@ -1,0 +1,26 @@
+Multi-thread loading shards:   0% Completed | 0/1 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 1/1 [00:07<00:00,  7.49s/it]Multi-thread loading shards: 100% Completed | 1/1 [00:07<00:00,  7.49s/it]
+[2026-07-03 18:36:18 TP0] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0. This may lead to less accurate results!
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank0]:   File "<frozen runpy>", line 88, in _run_code
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 1017, in <module>
+[rank0]:     main(server_args, bench_args)
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 979, in main
+[rank0]:     work_func(server_args, port_args, bench_args, 0, 0)
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 860, in latency_test
+[rank0]:     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
+[rank0]:                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 326, in load_model
+[rank0]:     model_runner.alloc_memory_pool()
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner.py", line 813, in alloc_memory_pool
+[rank0]:     self.init_memory_pool(self.pre_model_load_memory)
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner_kv_cache_mixin.py", line 1084, in init_memory_pool
+[rank0]:     self.memory_pool_config = self._resolve_memory_pool_config(
+[rank0]:                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner_kv_cache_mixin.py", line 1059, in _resolve_memory_pool_config
+[rank0]:     available_bytes = self._profile_available_bytes(pre_model_load_memory)
+[rank0]:                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner_kv_cache_mixin.py", line 110, in _profile_available_bytes
+[rank0]:     raise ValueError(
+[rank0]: ValueError: Loaded weights leave no GPU memory for the KV cache under --mem-fraction-static=0.225. Raise --mem-fraction-static above 0.521 (minimum viable = 1 - available/pre = 0.5206). If using speculative decoding, draft weights are now counted.
+[rank0]:[W703 18:36:18.481986767 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

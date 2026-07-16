@@ -1,0 +1,30 @@
+The history of artificial intelligence began in antiquity, with myths and stories of artificial beings endowed with intelligence by master craftsmen. Modern artificial intelligence research was founded at a workshop held on the campus of Dartmouth College during the summer of 1956. Those who attended would become the leaders of AI research for decades. Many of them predicted that a machine as intelligent as a human being would exist within a single generation. The field experienced several cycles of optimism followed by disappointment and the loss of funding, periods later named AI winters by the researchers who lived through them.
+
+A transformer processes a sequence of tokens by computing, for every position, a weighted sum over all other positions. The weights come from scaled dot-product attention: queries and keys are projected from the hidden state, their dot products are divided by the square root of the head dimension, and a softmax turns them into a distribution. The values are then averaged under that distribution. Stacking many such layers, interleaved with position-wise feed-forward networks and residual connections, lets the model build increasingly abstract representations of the input.
+
+def quicksort(items):
+    if len(items) <= 1:
+        return items
+    pivot = items[len(items) // 2]
+    left = [x for x in items if x < pivot]
+    middle = [x for x in items if x == pivot]
+    right = [x for x in items if x > pivot]
+    return quicksort(left) + middle + quicksort(right)
+
+The fundamental theorem of calculus links the two central operations of the subject. If a function is continuous on a closed interval, then the function defined by its integral from a fixed lower limit is differentiable, and its derivative recovers the original function. As a consequence, a definite integral can be evaluated by finding any antiderivative and taking the difference of its values at the two endpoints. This duality between differentiation and integration is what makes the calculus a single coherent theory rather than two unrelated techniques.
+
+In a mixture-of-experts layer, a small router network assigns each token to a few of many expert sub-networks. Only the selected experts are evaluated, so the model can have very many parameters while keeping the per-token computation small. The challenge at inference time is that different tokens route to different experts, producing irregular, data-dependent work that is awkward for the dense, regular kernels GPUs prefer. Efficient implementations keep the routing counts on the device and dispatch the experts without stalling the pipeline.
+
+Photosynthesis converts light energy into chemical energy stored in glucose. In the light-dependent reactions, chlorophyll in the thylakoid membranes absorbs photons and uses their energy to split water, releasing oxygen and generating the energy carriers needed downstream. In the Calvin cycle, those carriers drive the fixation of carbon dioxide into sugar. The overall process underpins nearly every food chain on the planet and is responsible for the oxygen that most living things breathe.
+
+The terms of this Agreement shall be governed by and construed in accordance with the laws of the jurisdiction in which the Disclosing Party maintains its principal place of business, without regard to its conflict-of-laws provisions. Any dispute arising out of or relating to this Agreement shall be resolved by binding arbitration, and the prevailing party shall be entitled to recover its reasonable attorneys' fees and costs. The failure of either party to enforce any provision shall not constitute a waiver of that provision.
+
+She had not expected the letter, and certainly not its contents. For a long moment she stood in the doorway with the envelope in her hand, watching the rain trace slow lines down the window, unwilling to break the seal and let whatever was inside become real. Outside, the street had emptied; only a single lamp burned at the corner, and its light fell across the wet stones like something spilled. When at last she opened it, the handwriting was the last thing she had ever thought she would see again.
+
+Quantum mechanics describes the behaviour of matter and energy at the smallest scales. A particle is represented not by a definite position and momentum but by a wavefunction whose squared magnitude gives the probability of finding it in a given state. Measurement collapses this distribution to a single outcome, and pairs of complementary quantities such as position and momentum cannot both be known with arbitrary precision. These features, strange as they seem, have been confirmed by experiment to extraordinary accuracy.
+
+Market prices aggregate the dispersed knowledge of countless individuals, each acting on information that no central planner could ever collect. When a good becomes scarce, its price rises, signalling producers to make more of it and consumers to economise, without anyone needing to issue a command. This coordination through prices is, in the view of many economists, the central reason decentralized markets can allocate resources more effectively than a single directing authority operating with incomplete information.
+
+Les voyageurs arrivèrent au village à la tombée de la nuit, fatigués par la longue marche à travers la montagne. Le ciel, encore clair à l'ouest, virait lentement au pourpre, et les premières lumières s'allumaient aux fenêtres. On les accueillit avec du pain, du fromage et un vin rude qui sentait la pierre et le soleil. Personne ne posa de questions ce soir-là; les questions, disait-on dans ces vallées, pouvaient toujours attendre le matin.
+
+The garden in late summer is a study in controlled excess. Tomato vines spill over their cages, heavy with fruit that splits if you wait a day too long. Bees move without hurry from squash blossom to squash blossom, and the basil, if you do not keep cutting it, bolts to flower in the heat. There is a particular hour in the evening, just before the light goes, when everything seems to pause and hold its colour a moment longer than it should.

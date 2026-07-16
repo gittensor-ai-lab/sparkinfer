@@ -1,0 +1,20 @@
+  gsm8k      gsm8k-588 PASS  got=52 want=52
+  gsm8k      gsm8k-1214 PASS  got=5 want=5
+  gsm8k      gsm8k-57 PASS  got=83 want=83
+  gsm8k      gsm8k-906 PASS  got=10 want=10
+  gsm8k      gsm8k-1252 PASS  got=70 want=70
+  mmlu_pro   mmlupro-10638 fail  chose=G want=F
+  mmlu_pro   mmlupro-2338 fail  chose=J want=E
+  mmlu_pro   mmlupro-967 PASS  chose=C want=C
+  mmlu_pro   mmlupro-73 PASS  chose=C want=C
+  mmlu_pro   mmlupro-11693 fail  chose=A want=B
+
+==============================================
+QUALITY REPORT  -  backend=llama
+==============================================
+  gsm8k         100.0%   (5/5)
+  mmlu_pro       40.0%   (2/5)
+  ------------------------------
+  OVERALL        70.0%   (10 items)
+
+wrote /workspace/qwen_awq_bench/results/quality/llama_gsm8k_mmlu_limit5.jsonl

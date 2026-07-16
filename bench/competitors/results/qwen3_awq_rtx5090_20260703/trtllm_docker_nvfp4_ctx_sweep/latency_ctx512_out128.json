@@ -1,0 +1,128 @@
+{
+    "engine": {
+        "model": "nvidia/Qwen3-30B-A3B-NVFP4",
+        "model_path": "/workspace/qwen_awq_bench/models/qwen3-nvfp4",
+        "engine_dir": "None",
+        "revision": null,
+        "version": "1.2",
+        "backend": "Pytorch",
+        "dtype": "bfloat16",
+        "kv_cache_dtype": "FP8",
+        "quantization": "NVFP4"
+    },
+    "machine": {
+        "name": "NVIDIA GeForce RTX 5090",
+        "memory.total": 31.35052490234375,
+        "clocks.mem": 14.001
+    },
+    "world_info": {
+        "tp_size": 1,
+        "pp_size": 1,
+        "ep_size": null,
+        "world_size": 1,
+        "max_batch_size": 1,
+        "max_num_tokens": 640,
+        "scheduling_policy": "GUARANTEED_NO_EVICT",
+        "kv_cache_percentage": 0.9,
+        "issue_rate": 1.1508521273333332e+18
+    },
+    "request_info": {
+        "num_requests": 6,
+        "avg_num_concurrent_requests": 0.9998966309699112,
+        "avg_input_length": 512.0,
+        "avg_output_length": 128.0
+    },
+    "performance": {
+        "total_latency_ms": 7789.905731999999,
+        "avg_request_latency_ms": 1298.1834161666666,
+        "request_throughput_req_s": 0.770227549141284,
+        "system_output_throughput_tok_s": 98.58912629008435,
+        "batch_full_output_throughput_tok_s": 98.59931840599539,
+        "system_total_throughput_tok_s": 492.94563145042173,
+        "output_throughput_per_user_tok_s": 116.95642558636254,
+        "output_throughput_per_gpu_tok_s": 98.58912629008435,
+        "request_latency_percentiles_ms": {
+            "p50": 886.347679,
+            "p90": 2247.144773,
+            "p95": 2247.144773,
+            "p99": 2247.144773,
+            "minimum": 875.5054339999999,
+            "maximum": 2247.144773,
+            "average": 1298.1834161666666
+        }
+    },
+    "energy": {
+        "total_energy_j": 1312.208,
+        "output_tps_per_w": 0.5852730664650726,
+        "average_gpu_power": 168.44979196726433
+    },
+    "streaming_metrics": {
+        "token_output_speed_tok_s": 17632.380723435654,
+        "avg_ttft_ms": 400.4781776666667,
+        "avg_tpot_ms": 7.06854518503937,
+        "tpot_percentiles": {
+            "p50": 6.3618996377952755,
+            "p90": 17.089241551181104,
+            "p95": 17.089241551181104,
+            "p99": 17.089241551181104,
+            "minimum": 0.009514417322834645,
+            "maximum": 17.089241551181104,
+            "average": 7.06854518503937
+        },
+        "ttft_percentiles": {
+            "p50": 76.83171399999999,
+            "p90": 2018.0269369999999,
+            "p95": 2018.0269369999999,
+            "p99": 2018.0269369999999,
+            "minimum": 76.299105,
+            "maximum": 2018.0269369999999,
+            "average": 400.4781776666667
+        },
+        "gen_tps_percentiles": {
+            "p50": 158.79460739014849,
+            "p90": 105103.65123463687,
+            "p95": 105103.65123463687,
+            "p99": 105103.65123463687,
+            "minimum": 58.51634766850646,
+            "maximum": 105103.65123463687,
+            "average": 17632.380723435654
+        }
+    },
+    "dataset": {
+        "isl_stats": {
+            "p50": 512.0,
+            "p90": 512.0,
+            "p95": 512.0,
+            "p99": 512.0,
+            "minimum": 512.0,
+            "maximum": 512.0,
+            "average": 512.0
+        },
+        "osl_stats": {
+            "p50": 128.0,
+            "p90": 128.0,
+            "p95": 128.0,
+            "p99": 128.0,
+            "minimum": 128.0,
+            "maximum": 128.0,
+            "average": 128.0
+        },
+        "seq_len_stats": {
+            "p50": 640.0,
+            "p90": 640.0,
+            "p95": 640.0,
+            "p99": 640.0,
+            "minimum": 640.0,
+            "maximum": 640.0,
+            "average": 640.0
+        },
+        "num_requests": 6,
+        "dataset_path": "/workspace/qwen_awq_bench/results/trtllm_docker_nvfp4_ctx_sweep/dataset_ctx512_out128.json",
+        "max_isl": 512,
+        "max_osl": 128,
+        "max_sequence_length": 640,
+        "avg_isl": 512,
+        "avg_osl": 128,
+        "avg_sequence_length": 640
+    }
+}

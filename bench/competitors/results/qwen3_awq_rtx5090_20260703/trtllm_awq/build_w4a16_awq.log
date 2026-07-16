@@ -1,0 +1,74 @@
+/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 4.57.3 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[TensorRT-LLM] TensorRT LLM version: 1.2.1
+Parse safetensors files:   0%|          | 0/4 [00:00<?, ?it/s]Parse safetensors files:  25%|██▌       | 1/4 [00:00<00:01,  2.90it/s]Parse safetensors files: 100%|██████████| 4/4 [00:00<00:00, 10.66it/s]
+[07/03/2026-18:26:38] [TRT-LLM] [I] Use user-provided max batch size and max num tokens for engine build and benchmark.
+[07/03/2026-18:26:38] [TRT-LLM] [I] Set PluginConfig.dtype to float16.
+[07/03/2026-18:26:38] [TRT-LLM] [I] Set PluginConfig.multiple_profiles to True.
+[07/03/2026-18:26:38] [TRT-LLM] [I] Set PluginConfig.use_paged_context_fmha to True.
+[07/03/2026-18:26:38] [TRT-LLM] [I] Using LLM with TensorRT backend
+[07/03/2026-18:26:38] [TRT-LLM] [W] Using default gpus_per_node: 1
+[07/03/2026-18:26:38] [TRT-LLM] [I] Set PluginConfig.nccl_plugin to None.
+`torch_dtype` is deprecated! Use `dtype` instead!
+[07/03/2026-18:26:38] [TRT-LLM] [I] Specified dtype 'auto'; inferred dtype 'float16'.
+[07/03/2026-18:26:38] [TRT-LLM] [W] Implicitly setting QWenConfig.seq_length = 8192
+[07/03/2026-18:26:38] [TRT-LLM] [W] Implicitly setting QWenConfig.qwen_type = qwen3_moe
+[07/03/2026-18:26:38] [TRT-LLM] [W] Implicitly setting QWenConfig.moe_intermediate_size = 768
+[07/03/2026-18:26:38] [TRT-LLM] [W] Implicitly setting QWenConfig.moe_shared_expert_intermediate_size = 0
+[07/03/2026-18:26:38] [TRT-LLM] [W] Implicitly setting QWenConfig.tie_word_embeddings = False
+Loading Model: [1;32m[1/2]	[0mLoading HF model to memory
+[07/03/2026-18:26:38] [TRT-LLM] [I] Found quantization_config field in /workspace/qwen_awq_bench/models/qwen3-awq/config.json, pre-quantized checkpoint is used.
+Traceback (most recent call last):
+  File "/workspace/qwen_awq_bench/trtllm-venv/bin/trtllm-bench", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/core.py", line 1569, in __call__
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/core.py", line 1490, in main
+    rv = self.invoke(ctx)
+         ^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/core.py", line 1970, in invoke
+    return _process_result(sub_ctx.command.invoke(sub_ctx))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/core.py", line 1353, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/core.py", line 907, in invoke
+    return callback(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/click/decorators.py", line 46, in new_func
+    return f(get_current_context().obj, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/bench/build/build.py", line 326, in build_command
+    llm = LLM(checkpoint_path,
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm.py", line 899, in __init__
+    super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm.py", line 236, in __init__
+    self._build_model()
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm.py", line 933, in _build_model
+    super()._build_model()
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm.py", line 768, in _build_model
+    self._engine_dir, self._hf_model_dir = model_loader()
+                                           ^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_utils.py", line 706, in __call__
+    return self._build_model(), self._hf_model_dir
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_utils.py", line 845, in _build_model
+    build_task(self.get_engine_dir())
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_utils.py", line 799, in build_task
+    model_loader(engine_dir=engine_dir)
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_utils.py", line 255, in __call__
+    pipeline()
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_utils.py", line 195, in __call__
+    self.step_forward()
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_utils.py", line 224, in step_forward
+    self.step_handlers[self.counter]()
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_utils.py", line 431, in _load_model_from_hf
+    prequantized = self._update_from_hf_quant_config()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/qwen_awq_bench/trtllm-venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_utils.py", line 414, in _update_from_hf_quant_config
+    raise NotImplementedError(
+NotImplementedError: Unsupported quantization_config: {'bits': 4, 'group_size': 128, 'modules_to_not_convert': ['mlp.gate', 'lm_head'], 'quant_method': 'awq', 'version': 'gemm', 'zero_point': True}.
+>> exit=1 Fri Jul  3 18:26:40 UTC 2026

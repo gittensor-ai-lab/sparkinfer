@@ -1,0 +1,23 @@
+Multi-thread loading shards:   0% Completed | 0/1 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 1/1 [00:07<00:00,  7.40s/it]Multi-thread loading shards: 100% Completed | 1/1 [00:07<00:00,  7.40s/it]
+[2026-07-03 18:37:34 TP0] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0. This may lead to less accurate results!
+  0%|          | 0/7 [00:00<?, ?it/s]Capturing batches (bs=24 avail_mem=3.76 GB):   0%|          | 0/7 [00:00<?, ?it/s]Capturing batches (bs=24 avail_mem=3.76 GB):  14%|█▍        | 1/7 [00:01<00:08,  1.37s/it]Capturing batches (bs=16 avail_mem=3.72 GB):  14%|█▍        | 1/7 [00:01<00:08,  1.37s/it]Capturing batches (bs=16 avail_mem=3.72 GB):  29%|██▊       | 2/7 [00:01<00:03,  1.50it/s]Capturing batches (bs=12 avail_mem=3.70 GB):  29%|██▊       | 2/7 [00:01<00:03,  1.50it/s]Capturing batches (bs=12 avail_mem=3.70 GB):  43%|████▎     | 3/7 [00:01<00:01,  2.43it/s]Capturing batches (bs=8 avail_mem=3.69 GB):  43%|████▎     | 3/7 [00:01<00:01,  2.43it/s] Capturing batches (bs=8 avail_mem=3.69 GB):  57%|█████▋    | 4/7 [00:01<00:00,  3.42it/s]Capturing batches (bs=4 avail_mem=3.67 GB):  57%|█████▋    | 4/7 [00:01<00:00,  3.42it/s]Capturing batches (bs=4 avail_mem=3.67 GB):  71%|███████▏  | 5/7 [00:01<00:00,  4.42it/s]Capturing batches (bs=2 avail_mem=3.67 GB):  71%|███████▏  | 5/7 [00:01<00:00,  4.42it/s]Capturing batches (bs=2 avail_mem=3.67 GB):  86%|████████▌ | 6/7 [00:01<00:00,  5.37it/s]Capturing batches (bs=1 avail_mem=3.65 GB):  86%|████████▌ | 6/7 [00:01<00:00,  5.37it/s]Capturing batches (bs=1 avail_mem=3.65 GB): 100%|██████████| 7/7 [00:02<00:00,  6.03it/s]Capturing batches (bs=1 avail_mem=3.65 GB): 100%|██████████| 7/7 [00:02<00:00,  3.33it/s]
+max_total_num_tokens=220580
+Warmup ...
+Prefill. latency: 1.09265 s, throughput:  14994.76 token/s
+Decode 0. Batch size: 1, latency: 0.00707 s, throughput:    141.40 token/s
+Decode 1. Batch size: 1, latency: 0.00442 s, throughput:    226.12 token/s
+Decode 2. Batch size: 1, latency: 0.00439 s, throughput:    228.05 token/s
+Decode 3. Batch size: 1, latency: 0.00438 s, throughput:    228.46 token/s
+Decode 4. Batch size: 1, latency: 0.00438 s, throughput:    228.56 token/s
+Decode.  median latency: 0.00436 s, median throughput:    229.12 token/s
+Total. latency:  1.231 s, throughput:  13338.37 token/s
+Benchmark ...
+Prefill. latency: 1.02176 s, throughput:  16035.02 token/s
+Decode 0. Batch size: 1, latency: 0.00442 s, throughput:    226.22 token/s
+Decode 1. Batch size: 1, latency: 0.00438 s, throughput:    228.34 token/s
+Decode 2. Batch size: 1, latency: 0.00438 s, throughput:    228.39 token/s
+Decode 3. Batch size: 1, latency: 0.00436 s, throughput:    229.10 token/s
+Decode 4. Batch size: 1, latency: 0.00436 s, throughput:    229.10 token/s
+Decode.  median latency: 0.00442 s, median throughput:    226.12 token/s
+Total. latency:  1.583 s, throughput:  10433.90 token/s
+[rank0]:[W703 18:37:41.959974876 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

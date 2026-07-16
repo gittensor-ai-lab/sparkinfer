@@ -1,0 +1,108 @@
+[
+  {
+    "pr": 9,
+    "author": "glorysr1209-png",
+    "original": 6,
+    "date": "2026-06-25",
+    "note": "seed/historical; account already blocked as sybil (see FLAGGED.md)"
+  },
+  {
+    "pr": 14,
+    "author": "glorysr1209-png",
+    "original": 4,
+    "date": "2026-06-25",
+    "note": "seed/historical; account already blocked as sybil (see FLAGGED.md)"
+  },
+  {
+    "pr": 54,
+    "author": "kiannidev",
+    "original": 53,
+    "date": "2026-06-25",
+    "penalty_days": 2,
+    "note": "maintainer-flagged: same default split-K + PDL decode change as #53 (eval:none); below auto containment threshold but a duplicate attempt. Reduced to a 2-day penalty (default is 5): first-time contributor, first mistake, and a genuine contributor of real speedups (#44, #52)."
+  },
+  {
+    "pr": 88,
+    "author": "ai-engram",
+    "original": 83,
+    "date": "2026-06-29"
+  },
+  {
+    "pr": 132,
+    "author": "Daedalus-Icarus",
+    "original": 128,
+    "date": "2026-07-02"
+  },
+  {
+    "pr": 191,
+    "author": "devmixa702",
+    "original": 188,
+    "date": "2026-07-03"
+  },
+  {
+    "pr": 209,
+    "author": "jony376",
+    "original": 221,
+    "date": "2026-07-04",
+    "note": "reattributed: #209 is a verbatim copy of fansilas's #221 (fansilas authored the #195 kernel; jony376 commit 11:18 > fansilas 05:23). GitHub login renamed to james3773 (jony376 404 as of 2026-07-16)."
+  },
+  {
+    "pr": 244,
+    "author": "cleanjunc",
+    "original": 233,
+    "date": "2026-07-06",
+    "blocked": false,
+    "penalty_days": 0,
+    "strike": 1,
+    "containment": 0.41
+  },
+  {
+    "pr": 326,
+    "author": "inference2026",
+    "original": 195,
+    "date": "2026-07-10",
+    "blocked": false,
+    "penalty_days": 0,
+    "strike": 0,
+    "containment": 0.27,
+    "note": "false positive cleared: per-function template-launch matched #195 at 100%; PR-level overlap 27%"
+  },
+  {
+    "pr": 338,
+    "author": "inference2026",
+    "original": 318,
+    "date": "2026-07-10",
+    "blocked": false,
+    "penalty_days": 0,
+    "strike": 0,
+    "containment": 1.0,
+    "note": "false positive cleared: 3-line GQA-4 g2 build fix; 100% literal overlap with #318 call-site boilerplate; same diff as #336 (merged first)"
+  },
+  {
+    "pr": 379,
+    "author": "Paral1995",
+    "original": 223,
+    "date": "2026-07-13",
+    "blocked": false,
+    "penalty_days": 0,
+    "strike": 0,
+    "containment": 0.07,
+    "note": "false positive cleared: per-function skv_wsum warp-shuffle matched #223 boilerplate at 94%; PR-level overlap 7%. Independent sparse-KV feature (sparse_kv.cu)."
+  },
+  {
+    "pr": 436,
+    "author": "jimcody1995",
+    "original": 403,
+    "date": "2026-07-15",
+    "blocked": true,
+    "containment": 0.90
+  },
+  {
+    "pr": 298,
+    "author": "jsdevninja",
+    "original": 121,
+    "date": "2026-07-09",
+    "blocked": true,
+    "note": "real-time copycat guard; ≥85% vs #121. Block persisted 2026-07-16."
+  }
+]

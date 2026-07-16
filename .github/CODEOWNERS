@@ -1,0 +1,15 @@
+# Sensitive / scoring-governance paths — only maintainers may change these.
+#
+# CODEOWNERS requests maintainer review automatically. The hard enforcement is the
+# `sensitive-paths-guard` status check (see .github/workflows/sensitive-paths-guard.yml)
+# plus the branch ruleset on `main` that requires it. These files decide SN74 scoring,
+# so a change here by a non-maintainer must never merge or be trusted by the evaluator.
+
+# The PR-evaluation pipeline (bot, vast runner) and the on-box scoring harness
+/eval/                              @ai-hpc
+/bench/scripts/                     @ai-hpc
+
+# Emission weights, the frontier ledger, and CI/governance itself
+/.gittensor/                        @ai-hpc
+/dashboard/data.json                @ai-hpc
+/.github/                           @ai-hpc

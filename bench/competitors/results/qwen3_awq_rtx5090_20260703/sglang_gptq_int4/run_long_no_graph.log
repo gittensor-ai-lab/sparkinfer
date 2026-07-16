@@ -1,0 +1,51 @@
+>> sglang gptq int4 fp8 no-graph ctx=4096 Fri Jul  3 18:16:44 UTC 2026
+[1;33m'--disable-cuda-graph' is deprecated and will be removed in a future release. Use '--cuda-graph-backend-{decode,prefill}=disabled' instead.[0m
+Multi-thread loading shards:   0% Completed | 0/1 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 1/1 [00:07<00:00,  7.62s/it]Multi-thread loading shards: 100% Completed | 1/1 [00:07<00:00,  7.62s/it]
+[2026-07-03 18:17:01 TP0] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0. This may lead to less accurate results!
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank0]:   File "<frozen runpy>", line 88, in _run_code
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 1017, in <module>
+[rank0]:     main(server_args, bench_args)
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 979, in main
+[rank0]:     work_func(server_args, port_args, bench_args, 0, 0)
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 869, in latency_test
+[rank0]:     latency_test_run_once(
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 747, in latency_test_run_once
+[rank0]:     next_token_ids, _, batch = model_runner.extend(reqs)
+[rank0]:                                ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 529, in extend
+[rank0]:     return extend(reqs, self.torch_runner)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+[rank0]:     return func(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 486, in extend
+[rank0]:     logits_output = model_runner.forward(forward_batch).logits_output
+[rank0]:                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner.py", line 2939, in forward
+[rank0]:     output = self._forward_raw(
+[rank0]:              ^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner.py", line 3065, in _forward_raw
+[rank0]:     ret = self.eager_runner.execute(
+[rank0]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/runner/eager_runner.py", line 197, in execute
+[rank0]:     return self._execute_extend(forward_batch, pp_proxy_tensors)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/runner/eager_runner.py", line 255, in _execute_extend
+[rank0]:     forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+[rank0]:                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/runner/eager_runner.py", line 174, in load_batch
+[rank0]:     registry.fill_from(
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/cuda_graph_buffer_registry.py", line 461, in fill_from
+[rank0]:     _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/cuda_graph_buffer_registry.py", line 65, in _grouped_foreach_copy_
+[rank0]:     _foreach_copy(group_dsts, group_srcs)
+[rank0]:   File "/workspace/qwen_awq_bench/sglang-venv/lib/python3.12/site-packages/sglang/srt/model_executor/cuda_graph_buffer_registry.py", line 52, in _foreach_copy
+[rank0]:     torch._foreach_copy_(group_dsts, group_srcs)
+[rank0]: RuntimeError: The size of tensor a (3812) must match the size of tensor b (4096) at non-singleton dimension 0
+max_total_num_tokens=244016
+Warmup ...
+[rank0]:[W703 18:17:03.967612719 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+>> exit=1 ctx=4096 Fri Jul  3 18:17:04 UTC 2026
+done sglang gptq int4 fp8 no-graph Fri Jul  3 18:17:04 UTC 2026

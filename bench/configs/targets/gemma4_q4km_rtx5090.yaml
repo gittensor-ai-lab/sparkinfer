@@ -1,0 +1,73 @@
+# Benchmark target: Gemma 4 26B-A4B Q4_K_M on RTX 5090
+
+model:   configs/models/gemma4_26b_a4b.yaml
+quant:   q4_k_m
+
+hardware:
+  name: RTX 5090
+  arch: sm_120
+  vram_gb: 32
+  bandwidth_tbps: 1.79
+
+decode:
+  batch_sizes: [1, 4, 8, 16, 32, 64]
+  context_lens: [1024, 4096, 16384, 65536, 131072, 262144]
+  dtype: bfloat16
+
+  # Memory breakdown at 256K context on RTX 5090:
+  #   model Q4_K_M:    14.6 GB
+  #   local KV (capped at window=1024):  0.2 GB (fixed)
+  #   global KV (5 layers, full ctx):    5.4 GB
+  #   total:          20.2 GB  →  11.8 GB headroom
+  memory_at_max_ctx_gb: 20.2
+  rtx5090_headroom_gb: 11.8
+
+  # Baseline targets (llama.cpp Q4_K_M estimated)
+  baseline_toks_per_sec:
+    bs1_ctx1k:   110
+    bs1_ctx32k:   90
+    bs1_ctx262k:  55
+
+  # SN74 optimization target
+  target_toks_per_sec:
+    bs1_ctx1k:   175   # 1.6×
+    bs1_ctx32k:  145
+    bs1_ctx262k:  90
+
+prefill:
+  seq_lens: [512, 2048, 8192, 32768]
+  batch_size: 1
+  dtype: bfloat16
+
+# --- Attention-specific benchmarks (key differentiators from Qwen3.5) ---
+attention:
+  # Local layers: sliding window, head_dim=256, GQA 2:1
+  local:
+    num_layers: 25
+    sliding_window: 1024
+    num_kv_heads: 8
+    head_dim: 256
+    bench_sw_attn: true
+    # KV size is constant regardless of total seq_len — important perf characteristic
+    kv_tokens_always: 1024
+
+  # Global layers: full context, head_dim=512, GQA 8:1
+  # THIS IS THE ECOSYSTEM GAP — no public kernel handles head_dim=512
+  global:
+    num_layers: 5
+    sliding_window: null
+    num_kv_heads: 2
+    head_dim: 512
+    bench_full_ctx_attn: true
+    ecosystem_gap: true
+    note: "No FlashInfer/vLLM/FlashAttention kernel supports head_dim=512 as of 2026-06"
+
+moe:
+  bench_router_standalone: true   # 128-expert softmax + top-8
+  bench_expert_gemm: true         # 2112×704 shape (more square than Qwen3.5's 2048×512)
+  num_experts: 128
+  top_k: 8
+  expert_shape: [2112, 704]
+
+# Compare against Qwen3.5-35B-A3B on same hardware
+compare_against: configs/targets/qwen35_q4km_rtx5090.yaml

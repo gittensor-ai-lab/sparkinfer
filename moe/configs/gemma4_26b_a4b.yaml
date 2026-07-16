@@ -1,0 +1,37 @@
+# MoE engine configuration for Gemma 4 26B-A4B
+
+num_experts: 128
+top_k: 8
+shared_expert: true
+hidden_dim: 2112
+ffn_dim: 704           # moe_intermediate_size — more square than Qwen3.5's 512
+num_layers: 30         # but only MoE layers; Gemma4 applies MoE to all FFN layers
+
+router:
+  type: softmax_top_k
+  normalize_weights: true
+  aux_loss_coeff: 0.001
+
+expert_cache:
+  # RTX 5090 (32GB): model~14.6GB → ~17.4GB free for KV + expert cache
+  # Expert weight per layer per expert (Q4_K_M): 2 × 2112 × 704 × 0.6 bytes ≈ 1.79 MB
+  # 128 experts × 30 layers × 1.79MB = 6.87 GB — all experts fit in VRAM easily
+  all_experts_fit_in_vram: true
+  strategy: full            # preload all experts, no eviction needed
+  prefetch: false           # not needed when all experts resident
+
+gemm:
+  # Expert shape [T, 2112] × [2112, 704] — aspect ratio ~3:1, more square than Qwen3.5
+  # Standard CUTLASS tiles work better here than for Qwen3.5's 4:1 ratio
+  strategy: grouped_cutlass
+  min_tokens_for_batching: 2
+  use_gemv_for_single_token: true
+
+# Kernel work vs Qwen3.5-35B-A3B:
+# Qwen3.5: 256 experts (harder routing), shape 2048→512 (more skinny)
+# Gemma4:  128 experts (half), shape 2112→704 (more square, CUTLASS-friendly)
+# Gemma4 MoE is less novel but the attention kernels are more novel
+notes:
+  moe_complexity: moderate          # vs Qwen3.5 which is high
+  attention_complexity: very_high   # head_dim=512 global — no existing kernel
+  primary_optimization_target: attention

@@ -1,0 +1,41 @@
+# MoE engine configuration for Qwen3.5-35B-A3B
+# Load with: MoEEngine::create(MoEConfig::from_yaml("configs/qwen35_35b_a3b.yaml"))
+
+num_experts: 256
+top_k: 8
+shared_expert: true          # 1 additional always-active expert
+hidden_dim: 2048
+ffn_dim: 512                 # moe_intermediate_size
+num_layers: 40
+
+# Routing
+router:
+  type: softmax_top_k
+  normalize_weights: true
+  aux_loss_coeff: 0.001      # Qwen3 load-balance coefficient
+
+# Expert cache (for hardware where not all experts fit in VRAM)
+expert_cache:
+  # RTX 5090 (32GB): model ~21GB, leaves ~11GB for expert cache
+  # Expert weight per layer per expert (Q4_K_M): 2 * 2048 * 512 * 0.6 bytes ≈ 1.23 MB
+  # 256 experts * 40 layers * 1.23MB = 12.6GB — fits just barely on RTX 5090
+  strategy: lru              # evict least recently used experts
+  prefetch: true             # async prefetch next-layer experts during current layer
+  async_prefetch_depth: 2    # prefetch 2 layers ahead
+
+# Grouped GEMM strategy for 2048→512 shape (tall-skinny)
+gemm:
+  # Standard square-tile GEMM underperforms on 2048×512
+  # Use skinny-GEMM strategy: tile along M (tokens), keep N=512 full
+  strategy: skinny_grouped
+  min_tokens_for_batching: 4  # below this, per-expert sequential is faster
+  # For decode (bs=1): 8+1 expert GEMMs of shape [1, 2048] x [2048, 512]
+  # → vector * matrix, use GEMV kernel not GEMM
+  use_gemv_for_single_token: true
+
+# Key optimization opportunities identified for this model:
+# 1. Router: softmax over 256 values — try fused softmax+topk kernel
+# 2. Expert GEMMs: shape [T, 2048] x [2048, 512] — not square, needs skinny tiling
+# 3. Shared expert: always runs — can fuse into main compute stream, never skip
+# 4. GQA 8:1: flash decode attention with 2 KV heads is nearly free bandwidth-wise
+# 5. 262K context: flash attention must handle block-sparse long sequences

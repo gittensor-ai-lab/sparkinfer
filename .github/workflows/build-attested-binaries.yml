@@ -1,0 +1,144 @@
+name: build-attested-binaries
+
+# Build qwen3_gguf_bench for Linux + Windows, attest with GitHub Artifact Attestations,
+# and upload versioned release bundles. Compile-only (no GPU on hosted runners).
+#
+# Verify locally after download:
+#   gh attestation verify dist/sparkinfer-linux-amd64/qwen3_gguf_bench -R OWNER/REPO
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "CMakeLists.txt"
+      - "kernels/**"
+      - "moe/**"
+      - "runtime/**"
+      - ".github/workflows/build-attested-binaries.yml"
+  push:
+    tags: ["v*"]
+    branches: [main]
+    paths:
+      - "CMakeLists.txt"
+      - "kernels/**"
+      - "moe/**"
+      - "runtime/**"
+      - ".github/workflows/build-attested-binaries.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      OUT: dist/sparkinfer-linux-amd64
+      CUDA_ARCH: "120"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.8.1"
+          use-github-cache: false
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)" --target qwen3_gguf_bench
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUT}"
+          install -m755 build/runtime/qwen3_gguf_bench "${OUT}/"
+          find build/runtime build/moe -maxdepth 1 \( -name 'libsparkinfer_runtime.so*' -o -name 'libsparkinfer_moe.so*' \) -exec install -m755 {} "${OUT}/" \;
+          (cd dist && sha256sum sparkinfer-linux-amd64/* > sparkinfer-linux-amd64/SHA256SUMS)
+          ls -la "${OUT}"
+
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: "${{ env.OUT }}/**/*"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: sparkinfer-linux-amd64
+          path: dist/sparkinfer-linux-amd64/
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      OUT: dist/sparkinfer-windows-amd64
+      CUDA_ARCH: "120"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.8.1"
+          use-github-cache: false
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_ARCH }}" `
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared `
+            -DBUILD_TESTS=OFF `
+            -DBUILD_EXAMPLES=ON
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release -j --target qwen3_gguf_bench
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:OUT | Out-Null
+          Copy-Item build/runtime/Release/qwen3_gguf_bench.exe $env:OUT/
+          foreach ($pat in @(
+            "$env:CUDA_PATH/bin/cudart64_*.dll",
+            "$env:CUDA_PATH/bin/cublas64_*.dll",
+            "$env:CUDA_PATH/bin/cublasLt64_*.dll"
+          )) {
+            Get-ChildItem $pat -ErrorAction SilentlyContinue | Copy-Item -Destination $env:OUT/
+          }
+          Get-ChildItem $env:OUT
+
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: "${{ env.OUT }}/**/*"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: sparkinfer-windows-amd64
+          path: dist/sparkinfer-windows-amd64/
+          if-no-files-found: error
