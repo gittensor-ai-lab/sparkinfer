@@ -183,6 +183,39 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertIn("not measured (0 pp tok/s on all contexts)", body)
         self.assertIn("4k prefill no-regression gate | 0.0 pp tok/s vs main 289.26 pp tok/s · fail", body)
 
+    def test_bidir_prefill_render_without_label_shows_measured_pp(self):
+        res = {
+            "mode": "bidir",
+            "label": "none",
+            "pass": True,
+            "eval_mode": "longctx",
+            "label_qwen35": "none",
+            "label_qwen36": "none",
+            "pass_qwen35": True,
+            "pass_qwen36": True,
+            "score_qwen35": {
+                "label": "none",
+                "pass": True,
+                "tps": 283.24,
+                "frontier_tps": 283.16,
+                "top1": 0.903,
+                "kl": 0.0417,
+                "score_context": 65536,
+                "best_context_label": "64k-context",
+                "eval_prefill": True,
+                "score_prefill_context": 4096,
+                "best_prefill_context_label": "4k-context",
+                "ctx_4096_pp_tps": 4150.42,
+                "ctx_32768_pp_tps": 2109.42,
+                "guard_4k_pp_baseline": 320.45,
+                "guard_4k_pp_pass": True,
+            },
+            "score_qwen36": {"label": "none", "pass": True, "tps": 473.14, "top1": 0.927, "kl": 0.0404},
+        }
+        body = bot.render(res, "9786172")
+        self.assertIn("scored prefill (4096 ctx · 4k-context) | 4150.42 pp tok/s", body)
+        self.assertNotIn("not measured (0 pp tok/s on all contexts)", body)
+
     def test_bidir_optimize_rows_use_scored_model_not_guard(self):
         q35 = "Qwythos-9B (Q4_K_M)"
         q36 = "Qwen3.6-35B-A3B"

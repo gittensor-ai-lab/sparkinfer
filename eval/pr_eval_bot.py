@@ -857,6 +857,22 @@ def apply_regression_labels(repo, num, cur, labels):
     for lab in want - cur:
         add_label(repo, num, lab)
 
+_PREFILL_CTX_METRICS = (
+    ("ctx_4096_pp_tps", 4096, "4k-context"),
+    ("ctx_32768_pp_tps", 32768, "32k-context"),
+    ("ctx_65536_pp_tps", 65536, "64k-context"),
+    ("ctx_131072_pp_tps", 131072, "128k-context"),
+)
+
+def _best_prefill_measurement(block):
+    """Return (tps, ctx, label) for the highest measured prefill context, if any."""
+    best = None
+    for key, ctx, lbl in _PREFILL_CTX_METRICS:
+        tps = float(block.get(key) or 0)
+        if tps > 0 and (best is None or tps > best[0]):
+            best = (tps, ctx, lbl)
+    return best
+
 def render(res, oid):
     label = res.get("label", "?")
     icon = {"REJECT": "❌", "none": "⚪", "BASELINE": "📊"}.get(label, "✅")
@@ -902,7 +918,15 @@ def render(res, oid):
                             f"{f' · {plbl}' if plbl else ''}) | {block.get('prefill_tps', '?')} pp tok/s · "
                             f"`eval-prefill:{block.get('prefill_label')}` |")
             elif block.get("eval_prefill"):
-                rows.append(f"| {title} scored prefill | not measured (0 pp tok/s on all contexts) |")
+                best_pp = _best_prefill_measurement(block)
+                if best_pp:
+                    pp_tps, pp_ctx, pp_lbl = best_pp
+                    pctx = block.get("score_prefill_context") or pp_ctx
+                    plbl = block.get("best_prefill_context_label") or pp_lbl
+                    rows.append(f"| {title} scored prefill ({pctx} ctx"
+                                f"{f' · {plbl}' if plbl else ''}) | {pp_tps} pp tok/s |")
+                else:
+                    rows.append(f"| {title} scored prefill | not measured (0 pp tok/s on all contexts) |")
             rows.append(f"| {title} correctness | top-1 {block.get('top1', 0) * 100:.1f}% · "
                         f"KL {block.get('kl', '?')} |")
             for key, gkey, bkey, lbl in [

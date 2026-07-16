@@ -119,20 +119,15 @@ PY
 }
 
 # Build SCORE_SELECT JSON for Qwen3.5 prefill pp (4k/32k/64k/128k only).
+# Uses bash expansion (not os.environ) so callers need not export GUARD_*_PP_*.
 build_pp_score_select() {
-  python3 - <<'PY'
-import json, os
-def f(k, d=0.0):
-    v = os.environ.get(k, "")
-    try:
-        return float(v) if v else d
-    except ValueError:
-        return d
+  python3 - <<PY
+import json
 contexts = [
-  {"ctx":4096, "label":"4k-context", "tps":f("GUARD_4K_PP_TPS"), "base":f("GUARD_4K_PP_BASELINE"), "llama":f("LLAMA_4K_PP")},
-  {"ctx":32768, "label":"32k-context", "tps":f("GUARD_32K_PP_TPS"), "base":f("GUARD_32K_PP_BASELINE"), "llama":f("LLAMA_32K_PP")},
-  {"ctx":65536, "label":"64k-context", "tps":f("GUARD_64K_PP_TPS"), "base":f("GUARD_64K_PP_BASELINE"), "llama":f("LLAMA_64K_PP")},
-  {"ctx":131072, "label":"128k-context", "tps":f("GUARD_128K_PP_TPS"), "base":f("GUARD_128K_PP_BASELINE"), "llama":f("LLAMA_128K_PP")},
+  {"ctx":4096, "label":"4k-context", "tps":float("$GUARD_4K_PP_TPS"), "base":float("$GUARD_4K_PP_BASELINE"), "llama":float("$LLAMA_4K_PP")},
+  {"ctx":32768, "label":"32k-context", "tps":float("$GUARD_32K_PP_TPS"), "base":float("$GUARD_32K_PP_BASELINE"), "llama":float("$LLAMA_32K_PP")},
+  {"ctx":65536, "label":"64k-context", "tps":float("$GUARD_64K_PP_TPS"), "base":float("$GUARD_64K_PP_BASELINE"), "llama":float("$LLAMA_64K_PP")},
+  {"ctx":131072, "label":"128k-context", "tps":float("$GUARD_128K_PP_TPS"), "base":float("$GUARD_128K_PP_BASELINE"), "llama":float("$LLAMA_128K_PP")},
 ]
 for c in contexts:
     c["gain"] = 0.0 if c["base"] <= 0 else (c["tps"] - c["base"]) / c["base"]
