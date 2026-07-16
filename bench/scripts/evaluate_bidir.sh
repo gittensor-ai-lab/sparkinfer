@@ -434,7 +434,7 @@ def merge_primary(primary, guard, scored_model, guard_model, guard_prefix):
     if not primary:
         return {"label": "REJECT", "pass": False,
                 "reason": f"primary ({scored_model}) produced no verdict (infra error)"}
-    speed_ok, regressed, _, acc_ok = guard_ok(guard)
+    _, regressed, speed_ok, acc_ok = guard_ok(guard)
     out = dict(primary)
     out["model"] = scored_model
     out["guard_model"] = guard_model
