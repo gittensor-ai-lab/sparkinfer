@@ -44,7 +44,7 @@
     "author": "jony376",
     "original": 221,
     "date": "2026-07-04",
-    "note": "reattributed: #209 is a verbatim copy of fansilas's #221 (fansilas authored the #195 kernel; jony376 commit 11:18 > fansilas 05:23)"
+    "note": "reattributed: #209 is a verbatim copy of fansilas's #221 (fansilas authored the #195 kernel; jony376 commit 11:18 > fansilas 05:23). GitHub login renamed to james3773 (jony376 404 as of 2026-07-16)."
   },
   {
     "pr": 244,
@@ -96,5 +96,13 @@
     "date": "2026-07-15",
     "blocked": true,
     "containment": 0.90
+  },
+  {
+    "pr": 298,
+    "author": "jsdevninja",
+    "original": 121,
+    "date": "2026-07-09",
+    "blocked": true,
+    "note": "real-time copycat guard; ≥85% vs #121. Block persisted 2026-07-16."
   }
 ]

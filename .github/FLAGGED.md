@@ -137,3 +137,15 @@ Maintainer cleared: label `copycat-cleared`, #338 reopened. Account was not on
 ## 2026-07-15 — `jimcody1995` (auto-blocked)
 
 #436 ≥85% copycat of #403 (90%). Maintainer confirmed block on 2026-07-16.
+
+## 2026-07-09 — `jsdevninja` (auto-blocked)
+
+Real-time copycat guard closed #298 (≥85% containment vs #121). Block comment posted
+but entry never landed on `main`. Maintainer confirmed block on 2026-07-16.
+
+## 2026-07-04 — `james3773` (rename of blocked `jony376`)
+
+`jony376` was blocked for verbatim copycat of fansilas's #221 via #209. GitHub login
+`jony376` no longer exists (404); flagged PRs #209/#142 are under **`james3773`**. Added
+`james3773` to `blocked-contributors.txt` on 2026-07-16; kept `jony376` for historical
+commit-author matching.
