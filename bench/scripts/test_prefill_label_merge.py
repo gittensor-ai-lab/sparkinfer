@@ -100,6 +100,8 @@ class PrefillDifficultyRefTest(unittest.TestCase):
         use_frontier = tps <= 0 or llama <= 0 or llama >= tps * 50
         if not use_frontier and frontier > 0 and llama >= 2 * frontier:
             use_frontier = True
+        if not use_frontier and frontier > 0 and tps >= 1000:
+            use_frontier = True
         return 0 if use_frontier else llama
 
     def test_sequential_pp_uses_frontier(self):
@@ -107,6 +109,10 @@ class PrefillDifficultyRefTest(unittest.TestCase):
 
     def test_batched_pp_uses_frontier(self):
         self.assertEqual(self.prefill_diff_ref(6062.59, 11104.62, 4151.38), 0)
+
+    def test_batched_pp_uses_frontier_when_main_caught_up(self):
+        """64k batched pp ~5.5k vs main ~5.1k: llama < 2×frontier but still tier on main."""
+        self.assertEqual(self.prefill_diff_ref(5511.53, 8153.53, 5127.34), 0)
 
 
 if __name__ == "__main__":

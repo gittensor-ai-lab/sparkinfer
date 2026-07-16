@@ -445,18 +445,23 @@ def merge_primary(primary, guard, scored_model, guard_model, guard_prefix):
         "guard_64k_pass", "guard_128k_pass") if k in guard}
     out["guard"]["speed_ok"] = speed_ok
     out["guard"]["accuracy_ok"] = acc_ok
-    if not speed_ok or not acc_ok:
+    if not speed_ok:
         reasons = []
         if regressed:
             reasons.append(f"{guard_model} decode regressed at: " + ", ".join(regressed))
-        if not acc_ok and guard:
-            reasons.append(f"{guard_model} accuracy broke (top1={guard.get('top1')}, kl={guard.get('kl')})")
         if not guard:
             reasons.append(f"{guard_model} guard produced no verdict")
         out["label"] = "REJECT"
         out["pass"] = False
         out["reason"] = "no-regression guard: " + "; ".join(reasons or ["guard failed"])
         out["guard_regression_labels"] = [f"regression-{guard_prefix}-" + c for c in regressed]
+    elif not acc_ok:
+        reasons = []
+        if not acc_ok and guard:
+            reasons.append(f"{guard_model} accuracy broke (top1={guard.get('top1')}, kl={guard.get('kl')})")
+        out["pass"] = False
+        out["reason"] = "no-regression guard: " + "; ".join(reasons or ["guard failed"])
+        # Keep primary speed tier (e.g. eval-qwen35:M) — guard accuracy fail is pass=false, not tier REJECT.
     return out
 
 commit = os.environ["COMMIT"]

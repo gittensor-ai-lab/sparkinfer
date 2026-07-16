@@ -41,6 +41,14 @@ class BidirHeadlineTest(unittest.TestCase):
         out = pick_headline(q35, q36)
         self.assertEqual(out["label"], "L")
 
+    def test_headline_reject_when_other_side_rejects(self):
+        """Qwen3.5 keeps speed tier M but pass=false; headline follows Qwen3.6 REJECT."""
+        q35 = {"label": "M", "pass": False, "tps": 5511.53,
+               "reason": "no-regression guard: Qwen3.6 accuracy broke"}
+        q36 = {"label": "REJECT", "pass": False, "tps": 482.53}
+        out = pick_headline(q35, q36)
+        self.assertEqual(out["label"], "REJECT")
+
 
 if __name__ == "__main__":
     unittest.main()
