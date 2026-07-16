@@ -6159,8 +6159,8 @@ window.SPARKINFER = {
     "baseline_tps": 256.95,
     "ref_name": "llama.cpp",
     "ref_tps": 220.84,
-    "token_match": 0.9028,
-    "kl": 0.0417,
+    "token_match": 0.9036,
+    "kl": 0.0378,
     "note": "same-box baseline 91.224.44.227 · prefill pp refs from reference.lock (2026-07-13, RTX 5090)",
     "ctx": [
       {
@@ -6194,25 +6194,25 @@ window.SPARKINFER = {
         "ref_tps": 220.58
       }
     ],
-    "prefill_frontier_pp": 4150.42,
+    "prefill_frontier_pp": 6096.4,
     "prefill_label": "XL",
     "pp": [
       {
         "label": "4k",
         "color": "#0E8A16",
-        "pp": 4150.42,
+        "pp": 6096.4,
         "ref_pp": 11104.62
       },
       {
         "label": "32k",
         "color": "#6F42C1",
-        "pp": 2109.42,
+        "pp": 4380.93,
         "ref_pp": 9772.31
       },
       {
         "label": "64k",
         "color": "#E67E22",
-        "pp": 1266.38,
+        "pp": 4393.59,
         "ref_pp": 8153.53
       },
       {
