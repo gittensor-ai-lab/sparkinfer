@@ -17,6 +17,7 @@
 #include <mma.h>
 
 #include "sparkinfer/kernels/prefill.h"
+#include "sparkinfer/kernels/prefill_attn_window.h"
 
 namespace sparkinfer {
 namespace kernels {
@@ -593,6 +594,12 @@ void launch_prefill_attn_int8_paged(
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    // Sink + sliding-window sparse prefill attention (StreamingLLM, matches the merged decode
+    // sparse-KV #379): O(N*window) instead of O(N^2) at long context. Default on; returns false
+    // (SPARKINFER_PREFILL_ATTN_WINDOW=0, or head_dim != 256) to fall through to full attention.
+    if (launch_prefill_attn_windowed(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+            n_tokens, n_q_heads, n_kv_heads, head_dim, block_size, max_blocks_per_seq, scale, stream))
+        return;
     dim3 grid(n_tokens, n_q_heads);   // token on grid.x
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
     auto ks = reinterpret_cast<const __half*>(k_scale);
