@@ -54,6 +54,11 @@ public:
             return;
         }
         const LayerWeights& w = weights_[layer];
+        if (!w.router_w || !w.gate_w || !w.up_w || !w.down_w) {
+            fprintf(stderr, "[moe] forward: layer %d weights unset — call set_layer_weights first\n",
+                    layer);
+            return;
+        }
         const int E = cfg_.num_experts, K = cfg_.top_k;
         const int H = cfg_.hidden_dim, F = cfg_.ffn_dim;
 
