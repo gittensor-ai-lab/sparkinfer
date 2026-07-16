@@ -200,7 +200,7 @@
       <div class="hero-text">
         <span class="eyebrow">Agentic AI · on-device · all Blackwell</span>
         <h1>Agentic AI is moving <span class="hl">on-device</span>.<br>sparkinfer makes every Blackwell GPU fast for it.</h1>
-        <p class="sub">The inference runtime for the age of personal agents — reproducible, source-verified MoE/LLM decode across consumer &amp; edge Blackwell: from RTX Spark on your desk to Jetson Thor in the robot.</p>
+        <p class="sub">The inference runtime for the age of personal agents — reproducible, source-verified MoE/LLM decode across consumer &amp; edge Blackwell: from RTX Spark on your desk to DGX Spark in the workstation.</p>
         <div class="meta" id="hero-meta"></div>
       </div>
       <div class="hero-media"><img src="assets/img/rtx-spark.jpg" alt="NVIDIA RTX Spark — personal AI computer for the age of agents" loading="lazy"></div>
@@ -220,11 +220,11 @@
         <p>"A new class of processor for the age of personal agents." Run agents locally and privately on a Windows PC.</p>
         <div class="spec">128 GB unified · 1 PFLOP FP4 · 120B-param LLMs</div>
         <a href="https://nvidianews.nvidia.com/news/nvidia-microsoft-windows-pcs-agents-rtx-spark" target="_blank" rel="noopener">NVIDIA × Microsoft ↗</a></div>
-      <div class="tcard"><img class="tcard-img" src="assets/img/jetson-thor.jpg" alt="NVIDIA Jetson Thor" loading="lazy"><h4>Jetson Thor<span class="arch">sm_121</span></h4>
-        <div class="role">Physical AI &amp; robotics</div>
-        <p>"The ultimate platform for physical AI and robotics" — agentic reasoning at the edge, in humanoid robots.</p>
-        <div class="spec">2,070 FP4 TFLOPS · 128 GB LPDDR5X</div>
-        <a href="https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-thor/" target="_blank" rel="noopener">Jetson Thor ↗</a></div>
+      <div class="tcard"><img class="tcard-img" src="assets/img/dgx-spark.jpg" alt="NVIDIA DGX Spark" loading="lazy"><h4>DGX Spark<span class="arch">sm_121</span></h4>
+        <div class="role">AI workstation</div>
+        <p>Desk-side Blackwell GB10 workstation — the same agentic inference stack, scaled for builders and teams.</p>
+        <div class="spec">Blackwell GB10 · unified memory</div>
+        <a href="https://www.nvidia.com/en-us/products/workstations/dgx-spark/" target="_blank" rel="noopener">DGX Spark ↗</a></div>
       <div class="tcard"><img class="tcard-img" src="assets/img/rtx-5090.jpg" alt="NVIDIA GeForce RTX 5090" loading="lazy"><h4>RTX 5090<span class="arch">sm_120</span></h4>
         <div class="role">Consumer Blackwell · current dev GPU</div>
         <p>Desktop flagship — big-model local inference on a 32 GB card. Where the frontier is measured today.</p>
@@ -235,25 +235,6 @@
         <p>96 GB Blackwell — a full MoE plus all experts and a large KV cache stay resident, no paging.</p>
         <div class="spec">96 GB GDDR7 · ~1.79 TB/s</div>
         <a href="https://www.nvidia.com/en-us/products/workstations/" target="_blank" rel="noopener">RTX PRO ↗</a></div>
-    </div>
-  </section>
-
-  <section>
-    <div class="sec-h"><h2>Target models</h2><span class="hint">primary SOTA target <b>Qwen3.6-35B-A3B</b> + <b>Gemma 4</b> generality guard — a win must generalize, not overfit</span></div>
-    <div class="grid2">
-      <div class="tcard sota"><img class="tcard-img tall" src="assets/img/qwen.jpg" alt="Qwen3.6-35B-A3B" loading="lazy"><h4>Qwen3.6-35B-A3B<span class="badge-sota">SOTA</span></h4>
-        <div class="role">primary model · state-of-the-art MoE</div>
-        <p>Hybrid <b>Gated-DeltaNet + full attention</b> MoE — 256 experts top-8, head_dim 256. The frontier model sparkinfer is built for: <b><span id="q36-frontier">—</span> tok/s</b> decode with <b><span id="q36-acc">—</span> top-1</b> vs llama.cpp on RTX 5090.</p>
-        <div class="spec" id="q36-arch-spec">UD-Q4_K_M · bidirectional eval guard on every PR</div>
-        <a class="hf-model" id="target-q36-hf" href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF" target="_blank" rel="noopener" style="margin-top:12px">
-          <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="lazy">
-          <span class="hf-model-name">unsloth/Qwen3.6-35B-A3B-GGUF</span>
-          <span class="hf-dl" id="target-q36-dl"></span>
-        </a></div>
-      <div class="tcard"><img class="tcard-img tall" src="assets/img/gemma-4.jpg" alt="Gemma 4" loading="lazy"><h4>Gemma 4<span class="arch" style="color:var(--warn);background:rgba(184,134,11,.14);border-color:rgba(184,134,11,.35)">wiring</span></h4>
-        <div class="role">generality guard · the anti-overfit test</div>
-        <p>Gemma 4 26B-A4B — 128 experts top-8 + shared, interleaved local-SWA / global attention, <b>head_dim 512</b>, dual RoPE. Deliberately unlike Qwen, so an optimization can't overfit one architecture.</p>
-        <div class="spec">distinct attention + routing → the generality guard for the basket</div></div>
     </div>
   </section>
 
@@ -390,7 +371,6 @@
   wireHfModel("detail-q3-hf", "detail-q3-dl", D.status, "Qwen/Qwen3-30B-A3B-GGUF");
   wireHfModel("detail-q35-hf", "detail-q35-dl", D.qwen35, "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF");
   wireHfModel("detail-q36-hf", "detail-q36-dl", D.qwen36, "unsloth/Qwen3.6-35B-A3B-GGUF");
-  wireHfModel("target-q36-hf", "target-q36-dl", D.qwen36, "unsloth/Qwen3.6-35B-A3B-GGUF");
 
   const q36 = D.qwen36 || {};
   const q36ctx128 = (q36.ctx||[]).find(x=>x.label==="128");
@@ -399,9 +379,6 @@
 
   $("hero-meta").innerHTML = `GPU <b>${s.gpu}</b> &nbsp;·&nbsp; SOTA target <b>Qwen3.6-35B-A3B</b> &nbsp;·&nbsp; guard <b>${s.model}</b>`;
   $("updated").textContent = "updated " + D.updated;
-  if ($("q36-frontier")) $("q36-frontier").textContent = q36.frontier_tps || q36ctx128?.tps || "—";
-  if ($("q36-acc")) $("q36-acc").textContent = q36.token_match ? (q36.token_match*100).toFixed(1)+"%" : "—";
-  if ($("q36-arch-spec") && q36.arch) $("q36-arch-spec").textContent = q36.arch + " · UD-Q4_K_M · bidirectional eval guard on every PR";
 
   const sotaEl = $("sota-spotlight");
   if (sotaEl && q36.frontier_tps) {

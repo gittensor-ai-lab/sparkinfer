@@ -15,7 +15,7 @@ Companion surfaces:
 ## What it shows
 
 - **Target GPUs** — RTX Spark, DGX Spark, RTX 5090, RTX PRO 6000 (`sm_120` / `sm_121`)
-- **Target models** — Qwen3.6-35B-A3B SOTA, Gemma 4 generality guard, Qwythos
+- **SOTA spotlight** — Qwen3.6-35B-A3B frontier stats at the top
 - **Optimization journey** — tok/s per landed kernel optimization
 - **vs llama.cpp** — same GGUF, per-context decode on RTX 5090
 - **Evaluated PRs** — bot labels, never auto-merges
