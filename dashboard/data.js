@@ -7544,12 +7544,6 @@ window.SPARKINFER = {
         "color": "#E67E22",
         "pp": 14149.94,
         "ref_pp": 8153.53
-      },
-      {
-        "label": "128k",
-        "color": "#17A2B8",
-        "pp": 227.87,
-        "ref_pp": 5999.59
       }
     ]
   },
