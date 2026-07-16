@@ -671,13 +671,51 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertEqual(closed, set())
 
     def test_close_stale_prs_dry_run(self):
-        prs = [{"number": 99, "updatedAt": "2026-01-01T00:00:00Z", "labels": []}]
+        prs = [{"number": 99, "updatedAt": "2026-01-01T00:00:00Z", "labels": [], "isDraft": False}]
         gh_mock = mock.Mock(return_value=mock.Mock(stdout=json.dumps(prs)))
         with mock.patch.object(bot, "gh", gh_mock), \
              mock.patch.object(bot, "pr_inactive_days", return_value=10.0):
             closed = bot.close_stale_prs("gittensor-ai-lab/sparkinfer", days=2, dry_run=True)
         self.assertEqual(closed, {99})
         gh_mock.assert_called_once()
+
+    def test_close_stale_prs_skips_drafts_when_non_draft_only(self):
+        prs = [
+            {"number": 50, "updatedAt": "2026-01-01T00:00:00Z", "labels": [], "isDraft": True},
+            {"number": 51, "updatedAt": "2026-01-01T00:00:00Z", "labels": [], "isDraft": False},
+        ]
+        with mock.patch.object(bot, "gh", return_value=mock.Mock(stdout=json.dumps(prs))), \
+             mock.patch.object(bot, "pr_inactive_days", return_value=10.0):
+            closed = bot.close_stale_prs("gittensor-ai-lab/sparkinfer", days=2,
+                                         dry_run=True, drafts_only=False)
+        self.assertEqual(closed, {51})
+
+    def test_close_stale_draft_prs_closes_inactive_drafts(self):
+        prs = [
+            {"number": 60, "updatedAt": "2026-01-01T00:00:00Z", "labels": [], "isDraft": True},
+            {"number": 61, "updatedAt": "2026-01-01T00:00:00Z", "labels": [], "isDraft": False},
+        ]
+        gh_calls = []
+
+        def fake_gh(args):
+            gh_calls.append(args)
+            if args[:3] == ["pr", "list", "-R"]:
+                return mock.Mock(stdout=json.dumps(prs))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+             mock.patch.object(bot, "pr_inactive_days", return_value=10.0):
+            closed = bot.close_stale_draft_prs("gittensor-ai-lab/sparkinfer", days=4, dry_run=False)
+        self.assertEqual(closed, {60})
+        self.assertTrue(any(c[:3] == ["pr", "close", "60"] for c in gh_calls))
+
+    def test_close_stale_draft_prs_skips_hold(self):
+        prs = [{"number": 70, "updatedAt": "2026-01-01T00:00:00Z",
+                "labels": [{"name": "hold"}], "isDraft": True}]
+        with mock.patch.object(bot, "gh", return_value=mock.Mock(stdout=json.dumps(prs))), \
+             mock.patch.object(bot, "pr_inactive_days", return_value=10.0):
+            closed = bot.close_stale_draft_prs("gittensor-ai-lab/sparkinfer", days=4)
+        self.assertEqual(closed, set())
 
     def _unchecked_pr(self, num, body=None, labels=None, **extra):
         body = body or self._TEMPLATE_DECODE.format(db=300, da=320).replace("[x]", "[ ]")
@@ -909,10 +947,11 @@ class ExhaustedEvalCloseTest(unittest.TestCase):
 
     def test_run_poll_auto_closes(self):
         with mock.patch.object(bot, "close_stale_prs", return_value={1}), \
+             mock.patch.object(bot, "close_stale_draft_prs", return_value={4}), \
              mock.patch.object(bot, "close_unchecked_rtx5090_prs", return_value={2}), \
              mock.patch.object(bot, "close_exhausted_eval_prs", return_value={3}):
             closed = bot.run_poll_auto_closes("gittensor-ai-lab/sparkinfer")
-        self.assertEqual(closed, {1, 2, 3})
+        self.assertEqual(closed, {1, 2, 3, 4})
 
     def test_maybe_close_exhausted_pr(self):
         view_mock = mock.Mock(return_value=mock.Mock(
