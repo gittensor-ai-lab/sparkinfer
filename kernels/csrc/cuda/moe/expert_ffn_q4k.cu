@@ -308,8 +308,24 @@ __global__ void down_q6k_splitk_kernel(
 // warps resident on the occupancy-bound bs=1 down, plus integer dp4a math.
 struct si_block_q8_1 { __half2 ds; signed char qs[32]; };   // 36 B / 32 values (llama layout)
 
+// Pack one float (this lane of a 32-wide block) into llama-layout Q8_1. Same math as
+// quant_h_q8_1_kernel — keep bit-identical so MMVQ down stays matching.
+__device__ __forceinline__ void si_pack_q8_1_lane(float xv, si_block_q8_1* __restrict__ y, int lane) {
+    float a = fabsf(xv);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    float d = a / 127.0f;
+    int qi = (a == 0.0f) ? 0 : (int)roundf(xv / d);
+    y->qs[lane] = (signed char)qi;
+    int s = qi;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+    if (lane == 0) y->ds = __floats2half2_rn(d, d * (float)s);
+}
+
 // Quantize the down activation h (fp32, n_blocks*32 values) to Q8_1 in natural element
 // order (block ib covers elements [ib*32, ib*32+32)). One 32-value block per warp.
+// Kept for SPARKINFER_GU_EMIT_Q8=0 (legacy 3-kernel path).
 __global__ void quant_h_q8_1_kernel(const float* __restrict__ h,
                                     si_block_q8_1* __restrict__ y, int n_blocks, int pdl) {
     if (pdl) si_pdl_sync();   // PDL: wait for gate_up's h_scratch writes
@@ -317,16 +333,7 @@ __global__ void quant_h_q8_1_kernel(const float* __restrict__ h,
     const int ib = blockIdx.x * warpsPB + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (ib >= n_blocks) return;
-    float xv = h[(size_t)ib * 32 + lane], a = fabsf(xv);
-    #pragma unroll
-    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
-    float d = a / 127.0f;
-    int qi = (a == 0.0f) ? 0 : (int)roundf(xv / d);
-    y[ib].qs[lane] = (signed char)qi;
-    int s = qi;
-    #pragma unroll
-    for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
-    if (lane == 0) y[ib].ds = __floats2half2_rn(d, d * (float)s);
+    si_pack_q8_1_lane(h[(size_t)ib * 32 + lane], y + ib, lane);
     if (pdl) si_pdl_lc();   // PDL: signal down after Q8_1(h) is ready
 }
 
@@ -728,6 +735,152 @@ __global__ void dense_gate_up_q4k_pack2_kernel(
     if (lane == 0) h_scratch[f] = q4kf_silu(tg) * tu;
 }
 
+// ---- gate_up emit Q8_1 (SPARKINFER_GU_EMIT_Q8, default ON) ----------------------
+// Fuse the separate quant_h launch into gate_up: one CTA owns 32 consecutive FFN dims
+// (one si_block_q8_1). 32 warps x 1-row MMVQ keeps total warps ~ the old 4-warpxF grid,
+// then packs Q8_1 in-place and skips the fp32 h_scratch round-trip.
+
+template <int H, int F, int TOPK>
+__global__ void gate_up_mmvq2_qwen_emit_q8_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    si_block_q8_1* __restrict__ hq8, int pdl
+) {
+    constexpr int Q8PB = F >> 5, NB = H >> 8, WS = 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;   // 0..31 = FFN dim within this Q8 block
+    const int qb = blockIdx.x;
+    const int ts = qb / Q8PB, ib = qb - ts * Q8PB;
+    const int f = ib * 32 + warp;
+    const int tok = ts / TOPK;
+    const int e = expert_ids[ts];
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * NB * 144);
+    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * NB * 144);
+    float tg = 0.f, tu = 0.f;
+    const int work = NB * 16;
+    for (int wi = lane; wi < work; wi += WS) {
+        const int kbx = wi >> 4, kqs = (wi & 15) << 1;
+        tg += si_vec_dot_q4_K(g_row + kbx, vrow + (size_t)kbx * 8, kqs);
+        tu += si_vec_dot_q4_K(u_row + kbx, vrow + (size_t)kbx * 8, kqs);
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        tg += __shfl_xor_sync(0xffffffff, tg, m);
+        tu += __shfl_xor_sync(0xffffffff, tu, m);
+    }
+    __shared__ float s_h[32];
+    if (lane == 0) s_h[warp] = q4kf_silu(tg) * tu;
+    __syncthreads();
+    if (warp == 0) si_pack_q8_1_lane(s_h[lane], hq8 + qb, lane);
+    if (pdl) si_pdl_lc();
+}
+
+__global__ void gate_up_mmvq2_emit_q8_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    si_block_q8_1* __restrict__ hq8, int H, int F, int top_k, int pdl
+) {
+    constexpr int WS = 32;
+    const int Q8PB = F >> 5, NB = H >> 8;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int qb = blockIdx.x;
+    const int ts = qb / Q8PB, ib = qb - ts * Q8PB;
+    const int f = ib * 32 + warp;
+    const int tok = ts / top_k;
+    const int e = expert_ids[ts];
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * NB * 144);
+    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * NB * 144);
+    float tg = 0.f, tu = 0.f;
+    const int work = NB * 16;
+    for (int wi = lane; wi < work; wi += WS) {
+        const int kbx = wi >> 4, kqs = (wi & 15) << 1;
+        tg += si_vec_dot_q4_K(g_row + kbx, vrow + (size_t)kbx * 8, kqs);
+        tu += si_vec_dot_q4_K(u_row + kbx, vrow + (size_t)kbx * 8, kqs);
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        tg += __shfl_xor_sync(0xffffffff, tg, m);
+        tu += __shfl_xor_sync(0xffffffff, tu, m);
+    }
+    __shared__ float s_h[32];
+    if (lane == 0) s_h[warp] = q4kf_silu(tg) * tu;
+    __syncthreads();
+    if (warp == 0) si_pack_q8_1_lane(s_h[lane], hq8 + qb, lane);
+    if (pdl) si_pdl_lc();
+}
+
+template <int H, int F>
+__global__ void dense_gate_up_q4k_emit_q8_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, si_block_q8_1* __restrict__ hq8, int pdl
+) {
+    constexpr int NB = H >> 8, WS = 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int qb = blockIdx.x;
+    const int f = qb * 32 + warp;
+    float hv = 0.f;
+    if (f < F) {
+        const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + (size_t)f * NB * 144);
+        const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + (size_t)f * NB * 144);
+        float tg = 0.f, tu = 0.f;
+        const int work = NB * 16;
+        for (int wi = lane; wi < work; wi += WS) {
+            const int kbx = wi >> 4, kqs = (wi & 15) << 1;
+            tg += si_vec_dot_q4_K(g_row + kbx, vy + (size_t)kbx * 8, kqs);
+            tu += si_vec_dot_q4_K(u_row + kbx, vy + (size_t)kbx * 8, kqs);
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            tg += __shfl_xor_sync(0xffffffff, tg, m);
+            tu += __shfl_xor_sync(0xffffffff, tu, m);
+        }
+        hv = q4kf_silu(tg) * tu;
+    }
+    __shared__ float s_h[32];
+    if (lane == 0) s_h[warp] = hv;
+    __syncthreads();
+    if (warp == 0) si_pack_q8_1_lane(s_h[lane], hq8 + qb, lane);
+    if (pdl) si_pdl_lc();
+}
+
+template <int H, int F>
+__global__ void shared_gate_up_q8_mmvq_emit_q8_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
+    si_block_q8_1* __restrict__ hq8
+) {
+    constexpr int WS = 32, nblk = H >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int qb = blockIdx.x;
+    const int f = qb * 32 + warp;
+    float hv = 0.f;
+    if (f < F) {
+        const unsigned char* gbase = gate_q + (size_t)f * nblk * 34;
+        const unsigned char* ubase = up_q   + (size_t)f * nblk * 34;
+        float tg = 0.f, tu = 0.f;
+        for (int b = lane; b < nblk; b += WS) {
+            tg += si_vec_dot_q8_0(gbase + (size_t)b * 34, vy + b);
+            tu += si_vec_dot_q8_0(ubase + (size_t)b * 34, vy + b);
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            tg += __shfl_xor_sync(0xffffffff, tg, m);
+            tu += __shfl_xor_sync(0xffffffff, tu, m);
+        }
+        float w = dw ? __ldg(dw) : 1.f;
+        hv = w * q4kf_silu(tg) * tu;
+    }
+    __shared__ float s_h[32];
+    if (lane == 0) s_h[warp] = hv;
+    __syncthreads();
+    if (warp == 0) si_pack_q8_1_lane(s_h[lane], hq8 + qb, lane);
+}
+
 // int8 dp4a MMVQ down (Q4_K). The Q4_K-quantized down rows in Q4_K_M were the last MoE GEMV
 // still on the fp register-dequant path (Q6_K down + gate/up + attention already run int8).
 // Reuses the Q8_1-quantized activation and the faithful vec_dot_q4_K_q8_1, one warp per
@@ -1108,6 +1261,17 @@ static inline int gu_mmvq_pdl() {
     return v;
 }
 
+// Fuse gate_up -> Q8_1 and skip quant_h. Default ON; SPARKINFER_GU_EMIT_Q8=0 restores
+// the legacy gate_up -> quant_h -> down 3-kernel path.
+static inline int gu_emit_q8() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_GU_EMIT_Q8");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
 static inline int dense_top1_down_splitk(int current, int top_k, const char* specific_env) {
     if (top_k == 1 && !getenv("SPARKINFER_DOWN_SPLITK_S") && !getenv(specific_env))
         return 8;
@@ -1262,20 +1426,35 @@ void launch_moe_expert_ffn_q4k(
         constexpr int H = 4096, F = 12288;
         const si_block_q8_1* vy;
         si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(out_scratch);
+        const int nqb = F >> 5;
+        const int pdl = down_mmvq_pdl();
+        const int emit = gu_emit_q8();
         if (input_q8) {
             vy = reinterpret_cast<const si_block_q8_1*>(input_q8);
+        } else if (emit) {
+            // Stage Q8_1(hn) in h_scratch so emit can write hq8 into out_scratch.
+            si_quant_bf16_q8_1<<<(H >> 5), 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input),
+                reinterpret_cast<si_block_q8_1*>(h_scratch), H);
+            vy = reinterpret_cast<const si_block_q8_1*>(h_scratch);
         } else {
             si_quant_bf16_q8_1<<<(H >> 5), 32, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(input), qbuf, H);
             vy = qbuf;
         }
-        dense_gate_up_q4k_pack2_kernel<H, F><<<(F + 1) / 2, 8 * 32, 0, stream>>>(
-            vy, reinterpret_cast<const unsigned char*>(gate_q),
-            reinterpret_cast<const unsigned char*>(up_q), h_scratch);
-        const int nqb = F >> 5;
-        const int pdl = down_mmvq_pdl();
-        quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
-            h_scratch, qbuf, nqb, pdl);
+        if (emit) {
+            const int chain = gu_mmvq_pdl() && pdl;
+            launch_pdl_kernel(chain, dim3(nqb), dim3(32 * 32), 0, stream,
+                dense_gate_up_q4k_emit_q8_kernel<H, F>,
+                vy, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), qbuf, chain);
+        } else {
+            dense_gate_up_q4k_pack2_kernel<H, F><<<(F + 1) / 2, 8 * 32, 0, stream>>>(
+                vy, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), h_scratch);
+            quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
+                h_scratch, qbuf, nqb, pdl);
+        }
         const int S = (down_type == 14) ? down_splitk_s_q6_ffn(H, F, 1)
                                         : down_splitk_s_q4_ffn(H, F, 1);
         if (S > 1) {
@@ -1317,19 +1496,53 @@ void launch_moe_expert_ffn_q4k(
     static int gu_pack2 = -1;
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
     const int gu_pdl = gu_mmvq_pdl();
+    const int emit_q8 = gu_emit_q8();
+    int emitted_q8 = 0;   // gate_up already wrote Q8_1(h) into out_scratch
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
         const si_block_q8_1* q;
+        si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);
         if (input_q8) {   // pre-quantized Q8_1(hn) from the fused norm: skip the quantize node
             q = reinterpret_cast<const si_block_q8_1*>(input_q8);
+        } else if (emit_q8) {
+            // Stage hn Q8 in h_scratch; emit kernel writes hq8 into out_scratch.
+            const int nqb_in = num_tokens * (hidden >> 5);
+            si_quant_bf16_q8_1<<<nqb_in, 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input),
+                reinterpret_cast<si_block_q8_1*>(h_scratch), num_tokens * hidden);
+            q = reinterpret_cast<const si_block_q8_1*>(h_scratch);
         } else {
-            si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(out_scratch);  // Q8_1(hn) once
-            const int nqb = num_tokens * (hidden >> 5);
-            si_quant_bf16_q8_1<<<nqb, 32, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
-            q = qbuf;
+            const int nqb_in = num_tokens * (hidden >> 5);
+            si_quant_bf16_q8_1<<<nqb_in, 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input), hq8, num_tokens * hidden);
+            q = hq8;
         }
-        if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+        if (emit_q8) {
+            const int n_q8 = num_tokens * top_k * (ffn >> 5);
+            const int chain = gu_pdl && down_mmvq_pdl();
+            if (gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+                launch_pdl_kernel(chain, dim3(n_q8), dim3(32 * 32), 0, stream,
+                    gate_up_mmvq2_qwen_emit_q8_kernel<2048, 512, 8>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, hq8, chain);
+            else if (gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
+                launch_pdl_kernel(chain, dim3(n_q8), dim3(32 * 32), 0, stream,
+                    gate_up_mmvq2_qwen_emit_q8_kernel<2048, 768, 8>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, hq8, chain);
+            else if (gu_spec && hidden == 4096 && ffn == 12288 && top_k == 1)
+                launch_pdl_kernel(chain, dim3(n_q8), dim3(32 * 32), 0, stream,
+                    gate_up_mmvq2_qwen_emit_q8_kernel<4096, 12288, 1>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, hq8, chain);
+            else
+                launch_pdl_kernel(chain, dim3(n_q8), dim3(32 * 32), 0, stream,
+                    gate_up_mmvq2_emit_q8_kernel,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, hq8,
+                    hidden, ffn, top_k, chain);
+            emitted_q8 = 1;
+        } else if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
             launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 1) / 2), dim3(8 * 32), 0, stream,
                 gate_up_mmvq2_pack2_qwen_kernel<2048, 512, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
@@ -1389,6 +1602,7 @@ void launch_moe_expert_ffn_q4k(
     // fp path (gate/up + attention already run int8 MMVQ): quantize the activation h to
     // Q8_1 once (into the otherwise-unused out_scratch) and dp4a the Q6_K weights against
     // it, faithful to llama.cpp vec_dot_q6_K_q8_1.
+    // When SPARKINFER_GU_EMIT_Q8=1, gate_up already wrote hq8 — skip quant_h.
     static int down_mmvq = -1;
     if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_DOWN_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
     if (down_mmvq && down_type == 14) {   // 14 = ggml Q6_K
@@ -1396,9 +1610,11 @@ void launch_moe_expert_ffn_q4k(
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        const int q_pdl = gu_pdl && pdl;
-        launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
-            quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        if (!emitted_q8) {
+            const int q_pdl = gu_pdl && pdl;
+            launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+                quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        }
         // split-K MMVQ down: S warps/row -> S*H warps in flight, hiding the bs=1
         // occupancy stall the one-warp kernel hits. Dense top-1 defaults to S=8 unless
         // an explicit split-K env override is set; routed MoE keeps its existing default.
@@ -1427,9 +1643,11 @@ void launch_moe_expert_ffn_q4k(
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        const int q_pdl = gu_pdl && pdl;
-        launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
-            quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        if (!emitted_q8) {
+            const int q_pdl = gu_pdl && pdl;
+            launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+                quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        }
         const int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
         if (S > 1) {
             const int RPB = WPB / S;
@@ -1457,9 +1675,11 @@ void launch_moe_expert_ffn_q4k(
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        const int q_pdl = gu_pdl && pdl;
-        launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
-            quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        if (!emitted_q8) {
+            const int q_pdl = gu_pdl && pdl;
+            launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+                quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        }
         const int S = dense_top1_down_splitk(down_splitk_s_q5(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q5");
         if (S > 1) {
             const int RPB = WPB / S;
@@ -1516,19 +1736,35 @@ void launch_shared_expert_q8_mmvq(
     int hidden, int ffn, cudaStream_t stream, bool accum = false) {
     const si_block_q8_1* vy;
     si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
+    // Emit needs distinct vy vs hq8 buffers. Callers sometimes pass aq81 for both
+    // (post-MoE shared fold) — keep the legacy 3-kernel path in that case.
+    const int emit = (hidden == 2048 && ffn == 512
+                      && !(input_q8 && input_q8 == static_cast<const void*>(h_q8_buf)))
+                     ? gu_emit_q8() : 0;
     if (input_q8) {
         vy = reinterpret_cast<const si_block_q8_1*>(input_q8);
+    } else if (emit) {
+        si_quant_bf16_q8_1<<<(hidden >> 5), 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(input),
+            reinterpret_cast<si_block_q8_1*>(h_scratch), hidden);
+        vy = reinterpret_cast<const si_block_q8_1*>(h_scratch);
     } else {
         si_quant_bf16_q8_1<<<(hidden >> 5), 32, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(input), qbuf, hidden);
         vy = qbuf;
     }
-    shared_gate_up_q8_mmvq_kernel<2048, 512><<<ffn, 4 * 32, 0, stream>>>(
-        vy, reinterpret_cast<const unsigned char*>(gate_q),
-        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
     const int nqb = ffn >> 5;
-    quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
-        h_scratch, qbuf, nqb, 0);
+    if (emit) {
+        shared_gate_up_q8_mmvq_emit_q8_kernel<2048, 512><<<nqb, 32 * 32, 0, stream>>>(
+            vy, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), dw, qbuf);
+    } else {
+        shared_gate_up_q8_mmvq_kernel<2048, 512><<<ffn, 4 * 32, 0, stream>>>(
+            vy, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+        quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
+            h_scratch, qbuf, nqb, 0);
+    }
     dim3 dn((hidden + WPB - 1) / WPB);
     if (accum) {
         shared_down_q8_mmvq_kernel<2048, 512, true><<<dn, WPB * 32, 0, stream>>>(
