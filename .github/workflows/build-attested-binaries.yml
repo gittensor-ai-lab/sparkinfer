@@ -123,10 +123,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:OUT | Out-Null
           Copy-Item build/runtime/Release/qwen3_gguf_bench.exe $env:OUT/
           foreach ($pat in @(
-            "build/runtime/Release/sparkinfer_runtime.dll",
-            "build/moe/Release/sparkinfer_moe.dll"
+            "$env:CUDA_PATH/bin/cudart64_*.dll",
+            "$env:CUDA_PATH/bin/cublas64_*.dll",
+            "$env:CUDA_PATH/bin/cublasLt64_*.dll"
           )) {
-            if (Test-Path $pat) { Copy-Item $pat $env:OUT/ }
+            Get-ChildItem $pat -ErrorAction SilentlyContinue | Copy-Item -Destination $env:OUT/
           }
           Get-ChildItem $env:OUT
 
