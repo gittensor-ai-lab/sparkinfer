@@ -451,7 +451,7 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertEqual(by["4k"], 295.0)
         self.assertEqual(by["32k"], 278.5)
         self.assertEqual(by["64k"], 260.0)
-        self.assertNotIn("128k", by)
+        self.assertEqual(by["128k"], 230.0)
         self.assertEqual(data["qwen35"]["prefill_frontier_pp"], 295.0)
         self.assertEqual(data["qwen35"]["prefill_label"], "M")
         bot._upsert_qwen35_pp(data, sub)
