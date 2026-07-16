@@ -22,6 +22,14 @@ Router::~Router() = default;
 void Router::route(const float* router_logits, int* expert_ids, float* expert_weights,
                    int* tokens_per_expert, int num_tokens, cudaStream_t stream) {
     if (num_tokens <= 0) return;
+    // MoEEngine scratch is sized for 4096 tokens; keep standalone Router in sync.
+    constexpr int kMaxTokens = 4096;
+    if (num_tokens > kMaxTokens) {
+        fprintf(stderr, "[moe] route: num_tokens %d exceeds cap %d — skipping
+",
+                num_tokens, kMaxTokens);
+        return;
+    }
     const int E = impl_->cfg.num_experts, K = impl_->cfg.top_k;
     if (E <= 0 || K <= 0 || K > E) {
         fprintf(stderr, "[moe] route: invalid config (num_experts=%d top_k=%d)\n", E, K);
