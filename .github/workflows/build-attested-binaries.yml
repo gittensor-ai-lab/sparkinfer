@@ -115,7 +115,7 @@ jobs:
 
       - name: Build
         shell: pwsh
-        run: cmake --build build --config Release -j --target qwen3_gguf_bench
+        run: cmake --build build --config Release -j 2 --target qwen3_gguf_bench
 
       - name: Package
         shell: pwsh

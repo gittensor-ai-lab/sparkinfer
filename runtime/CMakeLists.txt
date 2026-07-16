@@ -27,6 +27,9 @@ file(GLOB_RECURSE RUNTIME_SRC "src/*.cpp" "csrc/cuda/*.cu")
 add_library(sparkinfer_runtime SHARED ${RUNTIME_SRC})
 target_include_directories(sparkinfer_runtime PUBLIC include)
 target_link_libraries(sparkinfer_runtime PUBLIC sparkinfer_moe sparkinfer_kernels CUDA::cudart Threads::Threads)
+if(WIN32)
+  set_target_properties(sparkinfer_runtime PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 
 # GPU observability (heat/power/clock) uses NVML when available; VRAM works without it. NVML ships
 # with the CUDA toolkit as CUDA::nvml — link + flag it when present so the build degrades cleanly
