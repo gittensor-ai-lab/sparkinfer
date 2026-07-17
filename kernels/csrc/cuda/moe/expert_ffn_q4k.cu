@@ -728,6 +728,53 @@ __global__ void dense_gate_up_q4k_pack2_kernel(
     if (lane == 0) h_scratch[f] = q4kf_silu(tg) * tu;
 }
 
+// Multi-token dense gate/up pack2 (MTP batched draft verify): each thread dots its gate/up
+// weight slice against all NT activation rows (vy_all + c*(H/32) blocks), so the quantized
+// weights are read from HBM once for the whole draft batch. Per-(token,f) accumulation order
+// is bit-identical to dense_gate_up_q4k_pack2_kernel, so a batched verify reproduces the
+// single-token decode FFN exactly. h_all: [NT, F].
+template <int H, int F, int NT>
+__global__ void dense_gate_up_q4k_pack2_nt_kernel(
+    const si_block_q8_1* __restrict__ vy_all, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, float* __restrict__ h_all) {
+    si_pdl_lc();
+    constexpr int NW = 4, WS = 32, NB = H >> 8, VYS = H >> 5;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int group = warp >> 2, group_warp = warp & 3;
+    const int f = blockIdx.x * 2 + group;
+    if (f >= F) return;
+    const int tid4 = group_warp * WS + lane;
+    const int kbx0 = tid4 >> 4;
+    const int kqs = 2 * (tid4 & 15);
+    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + (size_t)f * NB * 144);
+    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + (size_t)f * NB * 144);
+    float tg[NT], tu[NT];
+    #pragma unroll
+    for (int c = 0; c < NT; c++) { tg[c] = 0.f; tu[c] = 0.f; }
+    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+        #pragma unroll
+        for (int c = 0; c < NT; c++) {
+            tg[c] += si_vec_dot_q4_K(g_row + kbx, vy_all + (size_t)c * VYS + (size_t)kbx * 8, kqs);
+            tu[c] += si_vec_dot_q4_K(u_row + kbx, vy_all + (size_t)c * VYS + (size_t)kbx * 8, kqs);
+        }
+    }
+    __shared__ float sg[2][NT][NW - 1][WS], su[2][NT][NW - 1][WS];
+    if (group_warp > 0) {
+        #pragma unroll
+        for (int c = 0; c < NT; c++) { sg[group][c][group_warp - 1][lane] = tg[c]; su[group][c][group_warp - 1][lane] = tu[c]; }
+    }
+    __syncthreads();
+    if (group_warp > 0) return;
+    #pragma unroll
+    for (int c = 0; c < NT; c++) {
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) { tg[c] += sg[group][c][l][lane]; tu[c] += su[group][c][l][lane]; }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) { tg[c] += __shfl_xor_sync(0xffffffff, tg[c], m); tu[c] += __shfl_xor_sync(0xffffffff, tu[c], m); }
+        if (lane == 0) h_all[(size_t)c * F + f] = q4kf_silu(tg[c]) * tu[c];
+    }
+}
+
 // int8 dp4a MMVQ down (Q4_K). The Q4_K-quantized down rows in Q4_K_M were the last MoE GEMV
 // still on the fp register-dequant path (Q6_K down + gate/up + attention already run int8).
 // Reuses the Q8_1-quantized activation and the faithful vec_dot_q4_K_q8_1, one warp per
@@ -968,6 +1015,99 @@ __global__ void down_q6k_mmvq_splitk_qwen_kernel(
         #pragma unroll
         for (int s = 0; s < S; s++) o += s_part[hh_local][s];
         output[(size_t)token * H + hh] = __float2bfloat16(o);
+    }
+}
+
+// Multi-token dense (top_k==1, expert 0) split-K MMVQ down for the MTP batched draft verify:
+// each warp reads its down-row weight blocks once and dots them against all NT activation
+// rows. Per-(token,hh) accumulation order matches the *_splitk_qwen_kernel<S,NBLK,1> that
+// single-token decode uses (the folded expert weight is exactly 1.f there), so results are
+// bit-identical per token. hq8: NT rows, row stride NBLK*8 blocks. output: [NT, H].
+template <int S, int NBLK, int NT>
+__global__ void down_q6k_mmvq_splitk_dense_nt_kernel(
+    const unsigned char* __restrict__ down_q, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int pdl
+) {
+    if (pdl) si_pdl_sync();
+    constexpr int RPB = WPB / S;
+    constexpr int Q8PB = NBLK * 8;
+    __shared__ float s_part[NT][RPB][S];
+    const int lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    float acc[NT];
+    #pragma unroll
+    for (int c = 0; c < NT; c++) acc[c] = 0.f;
+    if (hh < H) {
+        const unsigned char* drow = down_q + (size_t)hh * NBLK * 210;
+        #pragma unroll
+        for (int kbx = split; kbx < NBLK; kbx += S) {
+            #pragma unroll
+            for (int c = 0; c < NT; c++)
+                acc[c] += si_vec_dot_q6_K(drow + (size_t)kbx * 210,
+                                          hq8 + (size_t)c * Q8PB + (size_t)kbx * 8, lane);
+        }
+        #pragma unroll
+        for (int c = 0; c < NT; c++) {
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) acc[c] += __shfl_xor_sync(0xffffffffu, acc[c], m);
+            if (lane == 0) s_part[c][hh_local][split] = acc[c];
+        }
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+        #pragma unroll
+        for (int c = 0; c < NT; c++) {
+            float o = 0.f;
+            #pragma unroll
+            for (int s = 0; s < S; s++) o += s_part[c][hh_local][s];
+            output[(size_t)c * H + hh] = __float2bfloat16(o);
+        }
+    }
+}
+
+template <int S, int NBLK, int NT>
+__global__ void down_q4k_mmvq_splitk_dense_nt_kernel(
+    const unsigned char* __restrict__ down_q, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int pdl
+) {
+    if (pdl) si_pdl_sync();
+    constexpr int RPB = WPB / S;
+    constexpr int Q8PB = NBLK * 8;
+    constexpr int WORK = NBLK * 16;   // vdr=2 positions per superblock
+    __shared__ float s_part[NT][RPB][S];
+    const int lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    float acc[NT];
+    #pragma unroll
+    for (int c = 0; c < NT; c++) acc[c] = 0.f;
+    if (hh < H) {
+        const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
+            down_q + (size_t)hh * NBLK * 144);
+        for (int wi = split * 32 + lane; wi < WORK; wi += S * 32) {
+            const int kbx = wi >> 4, kqs = (wi & 15) << 1;
+            #pragma unroll
+            for (int c = 0; c < NT; c++)
+                acc[c] += si_vec_dot_q4_K(drow + kbx,
+                                          hq8 + (size_t)c * Q8PB + (size_t)kbx * 8, kqs);
+        }
+        #pragma unroll
+        for (int c = 0; c < NT; c++) {
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) acc[c] += __shfl_xor_sync(0xffffffffu, acc[c], m);
+            if (lane == 0) s_part[c][hh_local][split] = acc[c];
+        }
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+        #pragma unroll
+        for (int c = 0; c < NT; c++) {
+            float o = 0.f;
+            #pragma unroll
+            for (int s = 0; s < S; s++) o += s_part[c][hh_local][s];
+            output[(size_t)c * H + hh] = __float2bfloat16(o);
+        }
     }
 }
 
@@ -1240,6 +1380,96 @@ static inline bool launch_down_q5k_mmvq_splitk(
         case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
         case 8: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<8>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
         default: return false;
+    }
+}
+
+// Multi-token dense SwiGLU FFN (Qwythos 4096x12288, gate/up Q4_K, down Q4_K/Q6_K) for the MTP
+// batched draft verify: nt tokens share one gate/up/down weight pass. Bit-identical per token to
+// the num_tokens==1 dense fast path in launch_moe_expert_ffn_q4k (same kernels/split count, the
+// split S is forced to the top_k==1 choice). input_q8: nt rows of Q8_1(hn), row stride H/32
+// blocks. h_scratch: [nt,F] fp32. hq8_scratch: [nt,F/32] si_block_q8_1. expert_ids/weights:
+// nt entries of {0, 1.f}. output: [nt,H] bf16.
+// Dispatch the NT-templated dense split-K down (S=8 path used by the Qwythos shape).
+template <int NT>
+static inline bool launch_down_dense_nt(
+    int S, int down_type, int pdl, const unsigned char* down_q, const si_block_q8_1* qbuf,
+    __nv_bfloat16* output, int H, cudaStream_t stream
+) {
+    if (S != 8) return false;
+    constexpr int NBLK = 48;   // F=12288 -> 48 superblocks per down row
+    const int RPB = WPB / 8;
+    dim3 dns(1, (H + RPB - 1) / RPB);
+    const dim3 block(WPB * 32);
+    if (down_type == 14)
+        launch_mmvq_down_kernel(pdl, dns, block, stream, down_q6k_mmvq_splitk_dense_nt_kernel<8, NBLK, NT>,
+                                down_q, qbuf, output, H, pdl);
+    else
+        launch_mmvq_down_kernel(pdl, dns, block, stream, down_q4k_mmvq_splitk_dense_nt_kernel<8, NBLK, NT>,
+                                down_q, qbuf, output, H, pdl);
+    return true;
+}
+
+void launch_dense_ffn_q4k_nt(
+    const void* input_q8, const void* gate_q, const void* up_q, const void* down_q,
+    int down_type, const int* expert_ids, const float* expert_weights,
+    void* output, float* h_scratch, void* hq8_scratch, int nt, cudaStream_t stream
+) {
+    constexpr int H = 4096, F = 12288;
+    const si_block_q8_1* vy = reinterpret_cast<const si_block_q8_1*>(input_q8);
+    si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(hq8_scratch);
+    dim3 gu((F + 1) / 2);
+    switch (nt) {
+        case 2: dense_gate_up_q4k_pack2_nt_kernel<H, F, 2><<<gu, 8 * 32, 0, stream>>>(
+                    vy, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), h_scratch); break;
+        case 3: dense_gate_up_q4k_pack2_nt_kernel<H, F, 3><<<gu, 8 * 32, 0, stream>>>(
+                    vy, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), h_scratch); break;
+        default: dense_gate_up_q4k_pack2_nt_kernel<H, F, 4><<<gu, 8 * 32, 0, stream>>>(
+                    vy, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), h_scratch); break;
+    }
+    const int nqb = nt * (F >> 5);
+    const int pdl = down_mmvq_pdl();
+    quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(h_scratch, qbuf, nqb, pdl);
+    const int S = (down_type == 14) ? down_splitk_s_q6_ffn(H, F, 1)
+                                    : down_splitk_s_q4_ffn(H, F, 1);
+    bool done = false;
+    switch (nt) {
+        case 2: done = launch_down_dense_nt<2>(S, down_type, pdl,
+                    reinterpret_cast<const unsigned char*>(down_q), qbuf,
+                    reinterpret_cast<__nv_bfloat16*>(output), H, stream); break;
+        case 3: done = launch_down_dense_nt<3>(S, down_type, pdl,
+                    reinterpret_cast<const unsigned char*>(down_q), qbuf,
+                    reinterpret_cast<__nv_bfloat16*>(output), H, stream); break;
+        default: done = launch_down_dense_nt<4>(S, down_type, pdl,
+                    reinterpret_cast<const unsigned char*>(down_q), qbuf,
+                    reinterpret_cast<__nv_bfloat16*>(output), H, stream); break;
+    }
+    if (done) return;
+    // non-default split count (env A/B): fall back to the token-per-block generic kernels
+    if (S > 1) {
+        const int RPB = WPB / S;
+        dim3 dns(nt, (H + RPB - 1) / RPB);
+        if (down_type == 14) {
+            if (launch_down_q6k_mmvq_splitk(S, pdl, dns,
+                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, qbuf,
+                    reinterpret_cast<__nv_bfloat16*>(output), H, F, 1, stream))
+                return;
+        } else if (launch_down_q4k_mmvq_splitk(S, pdl, dns,
+                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, qbuf,
+                    reinterpret_cast<__nv_bfloat16*>(output), H, F, 1, stream))
+            return;
+    }
+    dim3 dnm(nt, (H + WPB - 1) / WPB);
+    if (down_type == 14) {
+        launch_mmvq_down_kernel(pdl, dnm, dim3(WPB * 32), stream, down_q6k_mmvq_kernel,
+            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, qbuf,
+            reinterpret_cast<__nv_bfloat16*>(output), H, F, 1, pdl);
+    } else {
+        launch_mmvq_down_kernel(pdl, dnm, dim3(WPB * 32), stream, down_q4k_mmvq_kernel,
+            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, qbuf,
+            reinterpret_cast<__nv_bfloat16*>(output), H, F, 1, pdl);
     }
 }
 

@@ -77,6 +77,16 @@ void launch_moe_expert_ffn_q4k(
     const void* input_q8 = nullptr,   // pre-quantized Q8_1(input) from the fused norm; nullptr = quantize internally
     cudaStream_t stream = nullptr);
 
+// Multi-token dense SwiGLU FFN for MTP batched draft verify (Qwythos 4096x12288 only;
+// gate/up Q4_K, down_type 12 or 14). nt tokens share one weight pass; per-token results are
+// bit-identical to the num_tokens==1 dense fast path. input_q8: nt rows of Q8_1(hn) with row
+// stride hidden/32 blocks; h_scratch [nt,ffn] fp32; hq8_scratch [nt,ffn/32] si_block_q8_1;
+// expert_ids/expert_weights: nt entries of {0, 1.f}; output [nt,hidden] bf16.
+void launch_dense_ffn_q4k_nt(
+    const void* input_q8, const void* gate_q, const void* up_q, const void* down_q,
+    int down_type, const int* expert_ids, const float* expert_weights,
+    void* output, float* h_scratch, void* hq8_scratch, int nt, cudaStream_t stream = nullptr);
+
 // Qwen3.6 UD shared expert: Q8_0 gate/up/down via int8 dp4a MMVQ. Reuses the FNQ
 // Q8_1(hn) buffer for gate/up; overwrites h_q8_buf with Q8_1(h) for down.
 void launch_shared_expert_q8_mmvq(

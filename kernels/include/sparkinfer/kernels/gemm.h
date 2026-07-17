@@ -101,4 +101,16 @@ void launch_attn_qkv_mmvq_q4k(const void* q81,
 // 1-warp-per-row Q6_K dp4a GEMV (large-N, e.g. LM head): GEMV_WPB rows/block.
 void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
 
+// ---- multi-token MMVQ (MTP batched draft verify): nc activation rows (2..4) share one
+// weight pass. q81 = nc rows of block_q8_1, row stride vy_stride_blocks blocks; outputs at
+// y + c*y_stride. Per-column accumulation order is bit-identical to the single-row kernels.
+void launch_mmvq_q4k_nc(const void* q81, int vy_stride_blocks, const void* W, void* y,
+                        int y_stride, int nc, int N, int K, cudaStream_t stream = nullptr);
+void launch_mmvq_q6k_nc(const void* q81, int vy_stride_blocks, const void* W, void* y,
+                        int y_stride, int nc, int N, int K, cudaStream_t stream = nullptr);
+void launch_mmvq_q4k_nc_f32(const void* q81, int vy_stride_blocks, const void* W, float* y,
+                            int y_stride, int nc, int N, int K, cudaStream_t stream = nullptr);
+void launch_gemv_q6k_dp4a_nc_f32(const void* q81, int vy_stride_blocks, const void* W, float* y,
+                                 int y_stride, int nc, int N, int K, cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

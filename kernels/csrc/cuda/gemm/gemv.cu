@@ -962,6 +962,130 @@ __global__ void gemv_q6k_dp4a_kfixed_kernel(const si_block_q8_1* __restrict__ vy
 template __global__ void gemv_q6k_dp4a_kfixed_kernel<float, 8, 8>(const si_block_q8_1*, const unsigned char*, float*, int);
 template __global__ void gemv_q6k_dp4a_kfixed_kernel<float, 16, 8>(const si_block_q8_1*, const unsigned char*, float*, int);
 
+// ===== multi-token (NC activation columns) MMVQ for MTP batched draft verify =====
+// Same 4-warp-per-row structure and per-column kbx/kqs striding as si_mmvq_q4k_kernel /
+// si_mmvq_q6k_kernel, so each column's accumulation order is BIT-IDENTICAL to the single-row
+// kernels the decode path uses — required for SPEC_AGREE==1.0 (batched verify must reproduce
+// the exact greedy argmax of the per-token decode). The quantized weight row is read from HBM
+// once and dotted against all NC activation rows (vy + c*vy_stride), which is the whole win:
+// verifying N drafts costs ~one weight pass instead of N.
+template <typename OutT, int NC>
+__global__ void si_mmvq_q4k_nc_kernel(const si_block_q8_1* __restrict__ vy, int vy_stride,
+                                      const unsigned char* __restrict__ W,
+                                      OutT* __restrict__ y, int y_stride, int N, int K) {
+    constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const si_block_q4_K* x_row = (const si_block_q4_K*)(W + (size_t)row * (K >> 8) * 144);
+    const int blocks_per_row = K >> 8;
+    const int blocks_per_iter = vdr * NW * WS / qi;
+    float tmp[NC];
+    #pragma unroll
+    for (int c = 0; c < NC; c++) tmp[c] = 0.0f;
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const int kby = kbx * 8;
+        const int kqs = vdr * (tid % (qi / vdr));
+        #pragma unroll
+        for (int c = 0; c < NC; c++)
+            tmp[c] += si_vec_dot_q4_K(x_row + kbx, vy + (size_t)c * vy_stride + kby, kqs);
+    }
+    __shared__ float tmp_shared[NC][NW - 1][WS];
+    if (warp > 0) {
+        #pragma unroll
+        for (int c = 0; c < NC; c++) tmp_shared[c][warp - 1][lane] = tmp[c];
+    }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int c = 0; c < NC; c++) {
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) tmp[c] += tmp_shared[c][l][lane];
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) tmp[c] += __shfl_xor_sync(0xffffffff, tmp[c], m);
+        if (lane == 0) gemv_write(y + (size_t)c * y_stride + row, tmp[c]);
+    }
+}
+template __global__ void si_mmvq_q4k_nc_kernel<__nv_bfloat16, 2>(const si_block_q8_1*, int, const unsigned char*, __nv_bfloat16*, int, int, int);
+template __global__ void si_mmvq_q4k_nc_kernel<__nv_bfloat16, 3>(const si_block_q8_1*, int, const unsigned char*, __nv_bfloat16*, int, int, int);
+template __global__ void si_mmvq_q4k_nc_kernel<__nv_bfloat16, 4>(const si_block_q8_1*, int, const unsigned char*, __nv_bfloat16*, int, int, int);
+template __global__ void si_mmvq_q4k_nc_kernel<float, 2>(const si_block_q8_1*, int, const unsigned char*, float*, int, int, int);
+template __global__ void si_mmvq_q4k_nc_kernel<float, 3>(const si_block_q8_1*, int, const unsigned char*, float*, int, int, int);
+template __global__ void si_mmvq_q4k_nc_kernel<float, 4>(const si_block_q8_1*, int, const unsigned char*, float*, int, int, int);
+
+template <typename OutT, int NC>
+__global__ void si_mmvq_q6k_nc_kernel(const si_block_q8_1* __restrict__ vy, int vy_stride,
+                                      const unsigned char* __restrict__ W,
+                                      OutT* __restrict__ y, int y_stride, int N, int K) {
+    constexpr int NW = 4, WS = 32, vdr = 1, qi = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const unsigned char* x_row = W + (size_t)row * (K >> 8) * 210;
+    const int blocks_per_row = K >> 8;
+    const int blocks_per_iter = vdr * NW * WS / qi;
+    float tmp[NC];
+    #pragma unroll
+    for (int c = 0; c < NC; c++) tmp[c] = 0.0f;
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const int kby = kbx * 8;
+        const int kqs = vdr * (tid % (qi / vdr));
+        #pragma unroll
+        for (int c = 0; c < NC; c++)
+            tmp[c] += si_vec_dot_q6_K(x_row + (size_t)kbx * 210, vy + (size_t)c * vy_stride + kby, kqs);
+    }
+    __shared__ float tmp_shared[NC][NW - 1][WS];
+    if (warp > 0) {
+        #pragma unroll
+        for (int c = 0; c < NC; c++) tmp_shared[c][warp - 1][lane] = tmp[c];
+    }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int c = 0; c < NC; c++) {
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) tmp[c] += tmp_shared[c][l][lane];
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) tmp[c] += __shfl_xor_sync(0xffffffff, tmp[c], m);
+        if (lane == 0) gemv_write(y + (size_t)c * y_stride + row, tmp[c]);
+    }
+}
+template __global__ void si_mmvq_q6k_nc_kernel<__nv_bfloat16, 2>(const si_block_q8_1*, int, const unsigned char*, __nv_bfloat16*, int, int, int);
+template __global__ void si_mmvq_q6k_nc_kernel<__nv_bfloat16, 3>(const si_block_q8_1*, int, const unsigned char*, __nv_bfloat16*, int, int, int);
+template __global__ void si_mmvq_q6k_nc_kernel<__nv_bfloat16, 4>(const si_block_q8_1*, int, const unsigned char*, __nv_bfloat16*, int, int, int);
+template __global__ void si_mmvq_q6k_nc_kernel<float, 2>(const si_block_q8_1*, int, const unsigned char*, float*, int, int, int);
+template __global__ void si_mmvq_q6k_nc_kernel<float, 3>(const si_block_q8_1*, int, const unsigned char*, float*, int, int, int);
+template __global__ void si_mmvq_q6k_nc_kernel<float, 4>(const si_block_q8_1*, int, const unsigned char*, float*, int, int, int);
+
+// Multi-token variant of gemv_q6k_dp4a_kernel (1 warp per weight row, sequential kbx):
+// per-column accumulation order bit-identical to the single-row LM-head kernel.
+template <int WPBK, int NC>
+__global__ void gemv_q6k_dp4a_nc_kernel(const si_block_q8_1* __restrict__ vy, int vy_stride,
+                                        const unsigned char* __restrict__ W,
+                                        float* __restrict__ y, int y_stride, int N, int K) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WPBK + warp;
+    if (row >= N) return;
+    const unsigned char* x_row = W + (size_t)row * (K >> 8) * 210;
+    const int nsuper = K >> 8;
+    float acc[NC];
+    #pragma unroll
+    for (int c = 0; c < NC; c++) acc[c] = 0.f;
+    for (int kbx = 0; kbx < nsuper; kbx++) {
+        #pragma unroll
+        for (int c = 0; c < NC; c++)
+            acc[c] += si_vec_dot_q6_K(x_row + (size_t)kbx * 210,
+                                      vy + (size_t)c * vy_stride + (size_t)kbx * 8, lane);
+    }
+    #pragma unroll
+    for (int c = 0; c < NC; c++) {
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc[c] += __shfl_xor_sync(0xffffffff, acc[c], m);
+        if (lane == 0) y[(size_t)c * y_stride + row] = acc[c];
+    }
+}
+template __global__ void gemv_q6k_dp4a_nc_kernel<16, 2>(const si_block_q8_1*, int, const unsigned char*, float*, int, int, int);
+template __global__ void gemv_q6k_dp4a_nc_kernel<16, 3>(const si_block_q8_1*, int, const unsigned char*, float*, int, int, int);
+template __global__ void gemv_q6k_dp4a_nc_kernel<16, 4>(const si_block_q8_1*, int, const unsigned char*, float*, int, int, int);
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/gemm.h"
 #include <cstdlib>
@@ -1275,6 +1399,69 @@ void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, i
         dim3 grid((N + 7) / 8);
         gemv_q6k_dp4a_kernel<float, 8><<<grid, 8 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
+    }
+}
+// ---- multi-token MMVQ launchers (MTP batched verify; nc = draft rows, 2..4) ----
+// q81: nc activation rows, row stride vy_stride_blocks si_block_q8_1 blocks (K/32 for a
+// contiguous [nc,K] quantize). y: [nc, y_stride] with the row result at y + c*y_stride.
+void launch_mmvq_q4k_nc(const void* q81, int vy_stride_blocks, const void* W, void* y,
+                        int y_stride, int nc, int N, int K, cudaStream_t stream) {
+    const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const unsigned char* w = reinterpret_cast<const unsigned char*>(W);
+    __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(y);
+    switch (nc) {
+        case 2: si_mmvq_q4k_nc_kernel<__nv_bfloat16, 2><<<N, 4 * 32, 0, stream>>>(q, vy_stride_blocks, w, out, y_stride, N, K); break;
+        case 3: si_mmvq_q4k_nc_kernel<__nv_bfloat16, 3><<<N, 4 * 32, 0, stream>>>(q, vy_stride_blocks, w, out, y_stride, N, K); break;
+        case 4: si_mmvq_q4k_nc_kernel<__nv_bfloat16, 4><<<N, 4 * 32, 0, stream>>>(q, vy_stride_blocks, w, out, y_stride, N, K); break;
+        default:
+            for (int c = 0; c < nc; c++)
+                launch_mmvq_q4k(reinterpret_cast<const char*>(q81) + (size_t)c * vy_stride_blocks * sizeof(si_block_q8_1),
+                                W, out + (size_t)c * y_stride, N, K, stream);
+    }
+}
+void launch_mmvq_q6k_nc(const void* q81, int vy_stride_blocks, const void* W, void* y,
+                        int y_stride, int nc, int N, int K, cudaStream_t stream) {
+    const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const unsigned char* w = reinterpret_cast<const unsigned char*>(W);
+    __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(y);
+    switch (nc) {
+        case 2: si_mmvq_q6k_nc_kernel<__nv_bfloat16, 2><<<N, 4 * 32, 0, stream>>>(q, vy_stride_blocks, w, out, y_stride, N, K); break;
+        case 3: si_mmvq_q6k_nc_kernel<__nv_bfloat16, 3><<<N, 4 * 32, 0, stream>>>(q, vy_stride_blocks, w, out, y_stride, N, K); break;
+        case 4: si_mmvq_q6k_nc_kernel<__nv_bfloat16, 4><<<N, 4 * 32, 0, stream>>>(q, vy_stride_blocks, w, out, y_stride, N, K); break;
+        default:
+            for (int c = 0; c < nc; c++)
+                launch_mmvq_q6k(reinterpret_cast<const char*>(q81) + (size_t)c * vy_stride_blocks * sizeof(si_block_q8_1),
+                                W, out + (size_t)c * y_stride, N, K, stream);
+    }
+}
+void launch_mmvq_q4k_nc_f32(const void* q81, int vy_stride_blocks, const void* W, float* y,
+                            int y_stride, int nc, int N, int K, cudaStream_t stream) {
+    const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const unsigned char* w = reinterpret_cast<const unsigned char*>(W);
+    switch (nc) {
+        case 2: si_mmvq_q4k_nc_kernel<float, 2><<<N, 4 * 32, 0, stream>>>(q, vy_stride_blocks, w, y, y_stride, N, K); break;
+        case 3: si_mmvq_q4k_nc_kernel<float, 3><<<N, 4 * 32, 0, stream>>>(q, vy_stride_blocks, w, y, y_stride, N, K); break;
+        case 4: si_mmvq_q4k_nc_kernel<float, 4><<<N, 4 * 32, 0, stream>>>(q, vy_stride_blocks, w, y, y_stride, N, K); break;
+        default:
+            for (int c = 0; c < nc; c++)
+                launch_mmvq_q4k_f32(reinterpret_cast<const char*>(q81) + (size_t)c * vy_stride_blocks * sizeof(si_block_q8_1),
+                                    W, y + (size_t)c * y_stride, N, K, stream);
+    }
+}
+// LM-head multi-token Q6_K (matches gemv_q6k_dp4a_kernel<float,16> per column).
+void launch_gemv_q6k_dp4a_nc_f32(const void* q81, int vy_stride_blocks, const void* W, float* y,
+                                 int y_stride, int nc, int N, int K, cudaStream_t stream) {
+    const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const unsigned char* w = reinterpret_cast<const unsigned char*>(W);
+    dim3 grid((N + 15) / 16);
+    switch (nc) {
+        case 2: gemv_q6k_dp4a_nc_kernel<16, 2><<<grid, 16 * 32, 0, stream>>>(q, vy_stride_blocks, w, y, y_stride, N, K); break;
+        case 3: gemv_q6k_dp4a_nc_kernel<16, 3><<<grid, 16 * 32, 0, stream>>>(q, vy_stride_blocks, w, y, y_stride, N, K); break;
+        case 4: gemv_q6k_dp4a_nc_kernel<16, 4><<<grid, 16 * 32, 0, stream>>>(q, vy_stride_blocks, w, y, y_stride, N, K); break;
+        default:
+            for (int c = 0; c < nc; c++)
+                launch_gemv_q6k_dp4a_f32(reinterpret_cast<const char*>(q81) + (size_t)c * vy_stride_blocks * sizeof(si_block_q8_1),
+                                         W, y + (size_t)c * y_stride, N, K, stream);
     }
 }
 void launch_gdn_quad_mmvq_q4k(const void* q81,

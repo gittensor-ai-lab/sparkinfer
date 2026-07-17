@@ -197,10 +197,48 @@ struct Qwen35Model::Impl {
     uint64_t mtp_stats_accepted = 0;
     uint64_t mtp_stats_proposed = 0;
     bool mtp_decode = false;
+    int  mtp_force = -1;            // set_mtp_decode override: -1 = follow SPARKINFER_MTP env
     bool mtp_spec_verify = false;   // true during target verify forwards (no CUDA graph)
     bool mtp_graph_ok = true;       // SPARKINFER_MTP_GRAPH=0 disables decode graph while MTP on
 
     bf16* mtp_chain_h = nullptr;
+
+    // ---- MTP batched draft verify (steady-state speculative decode) ----
+    // One multi-token target pass verifies all drafts: the quantized weights stream from HBM
+    // once per batch instead of once per draft, which is where speculative decode's speedup
+    // comes from. Buffers hold `spec_nt` rows; the whole pass is captured as a CUDA graph.
+    struct SpecBatch {
+        bool supported = false;   // model/config/weight-types admit the batched pass
+        bool ready = false;       // buffers allocated
+        int  nt = 0;              // rows per batch (== draft_max)
+        bf16 *x=nullptr, *xn=nullptr, *h=nullptr, *ao=nullptr, *routed=nullptr;
+        bf16 *qraw=nullptr, *q=nullptr, *qgate=nullptr, *k=nullptr, *v=nullptr, *attn=nullptr;
+        bf16 *lqkv=nullptr, *lq=nullptr, *lk=nullptr, *lv=nullptr, *lz=nullptr;
+        bf16 *la=nullptr, *lb=nullptr, *lgdn=nullptr, *lnorm=nullptr;
+        void *aq81=nullptr;       // [nt, H/32]  si_block_q8_1 activation rows
+        void *ffn_q8=nullptr;     // [nt, F/32]  Q8_1(h) for the FFN down
+        float *ffn_h=nullptr;     // [nt, F]
+        float *logits=nullptr;    // [nt, vocab]
+        int *d_scalars=nullptr;   // [nt*4] {tok,pos,writepos,seqlen} per row
+        int *d_tokens=nullptr;    // [nt]
+        int *d_preds=nullptr;     // [nt]
+        int *d_eids=nullptr;      // [nt] zeros (dense FFN "expert 0")
+        float *d_ews=nullptr;     // [nt] ones
+        int *h_pin=nullptr;       // pinned: [nt*4 scalars][nt tokens][nt preds]
+        // GDN rollback checkpoints: state after batch row r (rows 0..nt-2), per layer.
+        float *ckpt_lin=nullptr;  // [(nt-1), n_layers, vh*hd*hd]
+        bf16  *ckpt_conv=nullptr; // [(nt-1), n_layers, (conv_k-1)*lqkvdim]
+        cudaGraph_t graph{};
+        cudaGraphExec_t exec{};
+        bool graph_ready = false;
+        int cap_splits[8] = {0,0,0,0,0,0,0,0};   // per-row n_splits the graph was captured with
+    };
+    SpecBatch sb;
+    bool spec_supported() const;         // model/config/weight types admit the batched pass
+    void spec_alloc();                   // allocate SpecBatch buffers (nt = mtp_draft_max)
+    void spec_record(int pos0, const int* row_splits);   // enqueue the batched pass (run under graph capture)
+    void spec_restore_ckpt(int row);     // roll GDN state back to the checkpoint after batch row `row`
+    void spec_free();
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -352,6 +390,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
     if (p_->graph_prefill_ready) { cudaGraphExecDestroy(p_->cu_prefill_exec); cudaGraphDestroy(p_->cu_prefill_graph); }
+    p_->spec_free();
     cudaEventDestroy(p_->ev_qkv); cudaEventDestroy(p_->ev_k); cudaEventDestroy(p_->ev_v);
     cudaEventDestroy(p_->ev_pipe_fork); cudaEventDestroy(p_->ev_gdn_z); cudaEventDestroy(p_->ev_gdn_ab);
     cudaEventDestroy(p_->ev_sx_gate); cudaEventDestroy(p_->ev_sx_done);
@@ -368,6 +407,33 @@ void Qwen35Model::copy_logits(float* host_logits) const {
     // stream before returning, so it is valid to read here.
     cudaMemcpy(host_logits, p_->logits, (size_t)p_->cfg.vocab * sizeof(float), cudaMemcpyDeviceToHost);
 }
+
+namespace {
+// Depth-adaptive KV-split policy (see the call site in forward_token for history).
+// hd256/GQA occupancy correction: fa_split_gqa_mma_i8_kernel<HEAD_DIM,GQA> is one template
+// shared by hd128 and hd256 under the same __launch_bounds__(GQA*32, 5) hint — hd256's smem
+// footprint is ~1.9x hd128's, so its real occupancy is lower than the generic policy assumes.
+// Re-measured flat tiers (RTX 5090 same-box A/B): GQA-8 flat 160 through 32k; GQA-4 same,
+// promoted at 64k (192) and 128k (128). Split count is accuracy-safe (online-softmax combine).
+constexpr int kMaxNSplits = 256;   // == Impl::MAX_NSPLITS
+int decode_want_splits_impl(int split_chunk, const Qwen35Config& c, long seqlen) {
+    int want = 32;
+    if (seqlen > 2L * split_chunk) want = 128;
+    if (seqlen > 28L * split_chunk && seqlen <= 48L * split_chunk) want = kMaxNSplits;
+    if (seqlen > 64L * split_chunk) want = kMaxNSplits;
+    if (want > kMaxNSplits) want = kMaxNSplits;
+    if (c.head_dim == 256 && c.n_kv_heads > 0 && want >= 128) {
+        if (c.n_q_heads == c.n_kv_heads * 8)
+            want = 160;
+        else if (c.n_q_heads == c.n_kv_heads * 4) {
+            if (seqlen > 98304L)           want = 128;  // 128k decode (seqlen ~131k)
+            else if (seqlen > 65536L)      want = 192;  // 64k decode band
+            else                           want = 160;
+        }
+    }
+    return want;
+}
+} // namespace
 
 int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     Impl& s = *p_;
@@ -386,36 +452,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // Depth-adaptive KV-split: 32 (short) -> 128 (mid) -> 256 (long). The 8k-12k band
     // (28*split_chunk < seqlen <= 48*split_chunk) is roofline-bound on 128 splits; promote
     // to MAX_NSPLITS there only. Past 16k keep the original 64* knee. Math unchanged.
+    // (Formula in decode_want_splits, shared with the MTP batched-verify pass.)
     if (s.adaptive_splits) {
-        int want = 32;
-        if ((long)seqlen > 2L * s.split_chunk) want = 128;
-        if ((long)seqlen > 28L * s.split_chunk && (long)seqlen <= 48L * s.split_chunk)
-            want = Impl::MAX_NSPLITS;
-        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
-        if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
-        // hd256/GQA-8 occupancy correction (Qwen3.6 full-attention shape specifically): the
-        // generic 128/256 thresholds above were tuned around the split kernel's assumed
-        // occupancy, but fa_split_gqa_mma_i8_kernel<HEAD_DIM,GQA> is a single template shared
-        // by hd128 and hd256 under the SAME __launch_bounds__(GQA*32, 5) hint — hd256's smem
-        // footprint is ~1.9x hd128's (i8_smem ~33KB vs ~17KB for GQA=8), so its REAL achieved
-        // occupancy is lower than the 5 blocks/SM the generic policy assumes, meaning the split
-        // grid is systematically over-subscribed at this shape. Empirically re-measured (RTX
-        // 5090, same-box A/B, 4k/8k/16k/32k): a flat 160 beats both the 128 and 256 tiers at
-        // every measured point (+2.8% @16k, +4.9% @32k, +3.2% @8k, tied @4k), confirmed
-        // byte-safe (online-softmax combine is exact for any split count; verified top-1=100%,
-        // KL~equal to baseline vs a real llama.cpp reference at 120 sampled 8k-32k positions).
-        // GQA-8 (Qwen3.6): flat 160 through 32k (4k–32k A/B on RTX 5090).
-        // GQA-4 (Qwythos): same through 32k; promote splits at 64k/128k so per-split MMA
-        // chunks do not outgrow occupancy (64k: 192, 128k: 128 — same-box sweeps).
-        if (c.head_dim == 256 && c.n_kv_heads > 0 && want >= 128) {
-            if (c.n_q_heads == c.n_kv_heads * 8)
-                want = 160;
-            else if (c.n_q_heads == c.n_kv_heads * 4) {
-                if ((long)seqlen > 98304L)           want = 128;  // 128k decode (seqlen ~131k)
-                else if ((long)seqlen > 65536L)      want = 192;  // 64k decode band
-                else                                 want = 160;
-            }
-        }
+        const int want = decode_want_splits_impl(s.split_chunk, c, (long)seqlen);
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
             if (s.graph_ready) {
@@ -1143,28 +1182,10 @@ int mtp_draft_max_cfg() {
     return v;
 }
 
-bool mtp_cooldown_enabled() {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = getenv("SPARKINFER_MTP_COOLDOWN");
-        v = (e && e[0] == '0') ? 0 : 1;
-    }
-    return v != 0;
-}
-
 bool mtp_graph_enabled() {
     static int v = -1;
     if (v < 0) {
         const char* e = getenv("SPARKINFER_MTP_GRAPH");
-        v = (e && e[0] == '0') ? 0 : 1;
-    }
-    return v != 0;
-}
-
-bool mtp_adaptive_drafts_enabled() {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = getenv("SPARKINFER_MTP_ADAPTIVE");
         v = (e && e[0] == '0') ? 0 : 1;
     }
     return v != 0;
@@ -1180,81 +1201,329 @@ int mtp_warmup_tokens() {
     return v;
 }
 
-int mtp_effective_draft_max(int draft_max, uint64_t accepted, uint64_t proposed) {
-    if (!mtp_adaptive_drafts_enabled() || proposed < 16)
-        return draft_max;
-    static int min_drafts = -1;
-    if (min_drafts < 0) {
-        const char* e = getenv("SPARKINFER_MTP_MIN_DRAFTS");
-        min_drafts = e ? atoi(e) : 1;
-        if (min_drafts < 1) min_drafts = 1;
+bool mtp_batch_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_MTP_BATCH");
+        v = (e && e[0] == '0') ? 0 : 1;
     }
-    const double rate = (double)accepted / (double)proposed;
-    int dm = draft_max;
-    if (rate < 0.20) dm = min_drafts;
-    else if (rate < 0.45) dm = dm > 2 ? 2 : dm;
-    return dm;
+    return v != 0;
+}
+
+// default-on env flag (mirrors the decode-path `(e && e[0]=='0') ? 0 : 1` convention)
+bool env_flag_on(const char* name) {
+    const char* e = getenv(name);
+    return !(e && e[0] == '0');
 }
 
 } // namespace
 
-// After forward_token(emit, pos) produced `next`, run MTP draft+verify.
-int Qwen35Model::mtp_speculate_step(int pos, int& next, ThermalGovernor* gov,
-                                    const Qwen35GenerateHooks* hooks,
-                                    std::vector<int>* extra_out) {
+// ===================== MTP batched draft verify =====================
+// One multi-token pass over nd = draft_max rows (tokens[r] at position pos0+r) that is
+// bit-identical per row to the per-token decode path: every weight-bound projection uses a
+// multi-row kernel whose per-column accumulation order matches the single-row kernel decode
+// uses (mmvq_*_nc / dense_ffn_nt / gemv_q6k_dp4a_nc), stateful kernels (GDN conv/scan, RoPE
+// +KV-append, flash decode) run per row with the exact decode kernels, and the norm/quantize
+// fusions decompose into their documented bit-identical unfused forms. This is what makes
+// speculative decode actually fast: the weights stream from HBM once per batch instead of
+// once per draft. The whole pass is captured as a CUDA graph (tokens/positions are device
+// inputs), so its ~900 kernel launches replay with graph overhead instead of eager overhead.
+
+bool Qwen35Model::Impl::spec_supported() const {
+    const Qwen35Config& c = cfg;
+    if (!gguf || !c.hybrid || !c.dense_ffn) return false;
+    if (c.hidden != 4096 || c.moe_ffn != 12288 || c.head_dim != 256) return false;
+    if (c.linear_head_dim != 128 || c.linear_q_heads != 16 || c.linear_v_heads != 32) return false;
+    if (c.linear_conv_kernel != 4 || linear_qkvdim != 8192 || linear_vdim != 4096) return false;
+    if (!(c.rope_dim > 0 && c.rope_dim < c.head_dim)) return false;
+    if (!use_pq || !use_llama || !use_q6mmvq || !use_qkfuse) return false;
+    if (!(w.lm_head_type == 12 || w.lm_head_type == 14)) return false;
+    // non-default env switches change which decode kernels run — refuse (sequential fallback)
+    if (!env_flag_on("SPARKINFER_DENSE_FFN_FUSE")) return false;
+    for (int L = 0; L < c.n_layers; L++) {
+        const Qwen35LayerWeights& lw = w.layers[L];
+        if (lw.linear_attn) {
+            if (!(lw.wqkv_type == 12 || lw.wqkv_type == 14)) return false;
+            if (!(lw.wqkv_gate_type == 12 || lw.wqkv_gate_type == 14)) return false;
+            if (!(lw.ssm_alpha_type == 12 || lw.ssm_alpha_type == 14)) return false;
+            if (!(lw.ssm_beta_type == 12 || lw.ssm_beta_type == 14)) return false;
+            if (lw.ssm_out_type != 12 && lw.ssm_out_type != 14) return false;
+        } else {
+            if (!lw.q_has_gate) return false;
+            if (!(lw.wq_type == 12 || lw.wq_type == 14)) return false;
+            if (!(lw.wk_type == 12 || lw.wk_type == 14)) return false;
+            if (!(lw.wv_type == 12 || lw.wv_type == 14)) return false;
+            if (lw.wo_type != 12) return false;   // flash gate+Q8 emit -> wo mmvq path
+        }
+        if (lw.gate_qtype != 12 || lw.up_qtype != 12) return false;
+        if (!(lw.down_qtype == 12 || lw.down_qtype == 14)) return false;
+    }
+    return true;
+}
+
+void Qwen35Model::Impl::spec_alloc() {
+    SpecBatch& b = sb;
+    if (b.ready) return;
+    const Qwen35Config& c = cfg;
+    const int H = c.hidden, F = c.moe_ffn, nt = b.nt;
+    if (nt < 2 || nt > 8) return;
+    b.x   = alloc<bf16>((size_t)nt * H);
+    b.xn  = alloc<bf16>((size_t)nt * H);
+    b.h   = alloc<bf16>((size_t)nt * H);
+    b.ao  = alloc<bf16>((size_t)nt * H);
+    b.routed = alloc<bf16>((size_t)nt * H);
+    b.qraw  = alloc<bf16>((size_t)nt * qdim * 2);
+    b.q     = alloc<bf16>((size_t)nt * qdim);
+    b.qgate = alloc<bf16>((size_t)nt * qdim);
+    b.k     = alloc<bf16>((size_t)nt * kvdim);
+    b.v     = alloc<bf16>((size_t)nt * kvdim);
+    b.attn  = alloc<bf16>((size_t)nt * qdim);
+    b.lqkv  = alloc<bf16>((size_t)nt * linear_qkvdim);
+    b.lq    = alloc<bf16>((size_t)nt * linear_qdim);
+    b.lk    = alloc<bf16>((size_t)nt * linear_qdim);
+    b.lv    = alloc<bf16>((size_t)nt * linear_vdim);
+    b.lz    = alloc<bf16>((size_t)nt * linear_vdim);
+    b.la    = alloc<bf16>((size_t)nt * c.linear_v_heads);
+    b.lb    = alloc<bf16>((size_t)nt * c.linear_v_heads);
+    b.lgdn  = alloc<bf16>((size_t)nt * linear_vdim);
+    b.lnorm = alloc<bf16>((size_t)nt * linear_vdim);
+    b.aq81  = alloc<char>((size_t)nt * kernels::llama_q8_1_bytes(H));
+    b.ffn_q8 = alloc<char>((size_t)nt * kernels::llama_q8_1_bytes(F));
+    b.ffn_h  = alloc<float>((size_t)nt * F);
+    b.logits = alloc<float>((size_t)nt * c.vocab);
+    b.d_scalars = alloc<int>((size_t)nt * 4);
+    b.d_tokens  = alloc<int>(nt);
+    b.d_preds   = alloc<int>(nt);
+    b.d_eids    = alloc<int>(nt);
+    b.d_ews     = alloc<float>(nt);
+    const size_t state_elems = (size_t)c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+    const size_t conv_elems  = (size_t)(c.linear_conv_kernel - 1) * linear_qkvdim;
+    b.ckpt_lin  = alloc<float>((size_t)(nt - 1) * c.n_layers * state_elems);
+    b.ckpt_conv = alloc<bf16>((size_t)(nt - 1) * c.n_layers * conv_elems);
+    cu(cudaMallocHost((void**)&b.h_pin, (size_t)nt * 6 * sizeof(int)), "spec pinned");
+    std::vector<int> zid(nt, 0);
+    std::vector<float> onew(nt, 1.f);
+    cu(cudaMemcpy(b.d_eids, zid.data(), nt * sizeof(int), cudaMemcpyHostToDevice), "spec eids");
+    cu(cudaMemcpy(b.d_ews, onew.data(), nt * sizeof(float), cudaMemcpyHostToDevice), "spec ews");
+    b.ready = true;
+}
+
+void Qwen35Model::Impl::spec_free() {
+    SpecBatch& b = sb;
+    if (b.graph_ready) { cudaGraphExecDestroy(b.exec); cudaGraphDestroy(b.graph); b.graph_ready = false; }
+    if (!b.ready) return;
+    void* bufs[] = { b.x, b.xn, b.h, b.ao, b.routed, b.qraw, b.q, b.qgate, b.k, b.v, b.attn,
+                     b.lqkv, b.lq, b.lk, b.lv, b.lz, b.la, b.lb, b.lgdn, b.lnorm,
+                     b.aq81, b.ffn_q8, b.ffn_h, b.logits,
+                     b.d_scalars, b.d_tokens, b.d_preds, b.d_eids, b.d_ews,
+                     b.ckpt_lin, b.ckpt_conv };
+    for (void* p : bufs) cudaFree(p);
+    cudaFreeHost(b.h_pin);
+    b.ready = false;
+}
+
+void Qwen35Model::Impl::spec_record(int pos0, const int* row_splits) {
+    SpecBatch& b = sb;
+    const Qwen35Config& c = cfg;
+    const int H = c.hidden, nt = b.nt;
+    const int q8b_h = (int)(kernels::llama_q8_1_bytes(H) / 36);   // Q8_1 blocks per H row (=H/32)
+    cudaStream_t st = stream;
+    const bool kv8 = kv->int8_kv();
+    const int kv_elem = kv8 ? 1 : 2;
+    int* btable = kv->block_table(seq_id);
+    const bool gdn_fuse = env_flag_on("SPARKINFER_GDN_FUSE");
+    const bool gn_q8_on = env_flag_on("SPARKINFER_GDN_GNORM_Q8");
+    const bool attn_gq8_on = env_flag_on("SPARKINFER_ATTN_GQ8");
+    const size_t state_elems = (size_t)c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+    const size_t conv_elems  = (size_t)(c.linear_conv_kernel - 1) * linear_qkvdim;
+    auto aq81_row = [&](int r) -> void* { return (char*)b.aq81 + (size_t)r * q8b_h * 36; };
+    // batched projection matching the decode-path kernel for this weight type
+    auto proj_nc = [&](const void* W, int t, void* y, int n_out, int K) {
+        if (t == 12)      kernels::launch_mmvq_q4k_nc(b.aq81, q8b_h, W, y, n_out, nt, n_out, K, st);
+        else /* t==14 */  kernels::launch_mmvq_q6k_nc(b.aq81, q8b_h, W, y, n_out, nt, n_out, K, st);
+    };
+
+    kernels::launch_embedding(b.d_tokens, w.embed_tokens, b.x, nt, H, st);
+    kernels::launch_rmsnorm(b.x, w.layers[0].input_norm, b.xn, nt, H, c.rms_eps, st);
+    kernels::launch_quantize_q8_1_blocks(b.xn, b.aq81, nt * H, st);
+
+    for (int L = 0; L < c.n_layers; L++) {
+        const Qwen35LayerWeights& lw = w.layers[L];
+        if (lw.linear_attn) {
+            proj_nc(lw.wqkv, lw.wqkv_type, b.lqkv, linear_qkvdim, H);
+            proj_nc(lw.wqkv_gate, lw.wqkv_gate_type, b.lz, linear_vdim, H);
+            proj_nc(lw.ssm_alpha, lw.ssm_alpha_type, b.la, c.linear_v_heads, H);
+            proj_nc(lw.ssm_beta, lw.ssm_beta_type, b.lb, c.linear_v_heads, H);
+            bf16* conv_state = lin_conv_state + (size_t)L * conv_elems;
+            float* layer_state = lin_state + (size_t)L * state_elems;
+            for (int r = 0; r < nt; r++) {
+                const bf16* qkv_r = b.lqkv + (size_t)r * linear_qkvdim;
+                bf16* lq_r = b.lq + (size_t)r * linear_qdim;
+                bf16* lk_r = b.lk + (size_t)r * linear_qdim;
+                bf16* lv_r = b.lv + (size_t)r * linear_vdim;
+                if (gdn_fuse)
+                    kernels::launch_qwen36_conv_split_l2norm_fused(qkv_r, lw.ssm_conv, conv_state,
+                        lq_r, lk_r, lv_r, c.linear_q_heads, c.linear_v_heads,
+                        c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+                else
+                    kernels::launch_qwen36_conv_split_l2(qkv_r, lw.ssm_conv, conv_state,
+                        lq_r, lk_r, lv_r, c.linear_q_heads, c.linear_v_heads,
+                        c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+                kernels::launch_qwen36_gdn_ar(lq_r, lk_r, lv_r,
+                    b.la + (size_t)r * c.linear_v_heads, b.lb + (size_t)r * c.linear_v_heads,
+                    lw.ssm_dt, lw.ssm_a, layer_state, b.lgdn + (size_t)r * linear_vdim,
+                    c.linear_q_heads, c.linear_v_heads, c.linear_head_dim, st);
+                if (r < nt - 1) {
+                    cu(cudaMemcpyAsync(b.ckpt_lin + ((size_t)r * c.n_layers + L) * state_elems,
+                                       layer_state, state_elems * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, st), "spec ckpt lin");
+                    cu(cudaMemcpyAsync(b.ckpt_conv + ((size_t)r * c.n_layers + L) * conv_elems,
+                                       conv_state, conv_elems * sizeof(bf16),
+                                       cudaMemcpyDeviceToDevice, st), "spec ckpt conv");
+                }
+                if (gn_q8_on)
+                    kernels::launch_qwen36_gated_norm_q8(b.lgdn + (size_t)r * linear_vdim,
+                        b.lz + (size_t)r * linear_vdim, lw.ssm_norm, aq81_row(r),
+                        c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
+                else
+                    kernels::launch_qwen36_gated_norm(b.lgdn + (size_t)r * linear_vdim,
+                        b.lz + (size_t)r * linear_vdim, lw.ssm_norm,
+                        b.lnorm + (size_t)r * linear_vdim,
+                        c.linear_v_heads, c.linear_head_dim, c.rms_eps, st);
+            }
+            if (!gn_q8_on)
+                kernels::launch_quantize_q8_1_blocks(b.lnorm, b.aq81, nt * linear_vdim, st);
+            proj_nc(lw.ssm_out, lw.ssm_out_type, b.ao, H, linear_vdim);
+        } else {
+            proj_nc(lw.wq, lw.wq_type, b.qraw, qdim * 2, H);
+            proj_nc(lw.wk, lw.wk_type, b.k, kvdim, H);
+            proj_nc(lw.wv, lw.wv_type, b.v, kvdim, H);
+            // rows are head-contiguous, so nt rows split as nt*n_q_heads heads in one launch
+            kernels::launch_qwen36_split_q_gate(b.qraw, b.q, b.qgate, nt * c.n_q_heads, c.head_dim, st);
+            void* kpool = (char*)kv->k_pool() + (size_t)L * kv->layer_stride_elems() * kv_elem;
+            void* vpool = (char*)kv->v_pool() + (size_t)L * kv->layer_stride_elems() * kv_elem;
+            void* kscale = kv8 ? (char*)kv->k_scale_pool() + (size_t)L * kv->scale_layer_stride_elems() * 2 : nullptr;
+            void* vscale = kv8 ? (char*)kv->v_scale_pool() + (size_t)L * kv->scale_layer_stride_elems() * 2 : nullptr;
+            for (int r = 0; r < nt; r++) {
+                bf16* q_r = b.q + (size_t)r * qdim;
+                bf16* k_r = b.k + (size_t)r * kvdim;
+                bf16* v_r = b.v + (size_t)r * kvdim;
+                const int* pos_r = b.d_scalars + r * 4 + 1;
+                if (kv8) {
+                    kernels::launch_rmsnorm_qk(q_r, k_r, lw.q_norm, lw.k_norm,
+                        c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+                    kernels::launch_rope_kv_append_partial_int8(q_r, k_r, v_r, kpool, vpool,
+                        kscale, vscale, btable, pos_r, 1, c.n_q_heads, c.n_kv_heads,
+                        c.head_dim, c.rope_dim, c.rope_theta,
+                        kv->block_size(), kv->max_blocks_per_seq(), st);
+                } else {
+                    kernels::launch_qknorm_rope_kv_partial(q_r, k_r, v_r, lw.q_norm, lw.k_norm,
+                        (bf16*)kpool, (bf16*)vpool, btable, pos_r, 1,
+                        c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim,
+                        c.rope_theta, c.rms_eps, kv->block_size(), kv->max_blocks_per_seq(), st);
+                }
+                kernels::launch_flash_decode_split(q_r, kpool, vpool, btable,
+                    b.d_scalars + r * 4 + 3, b.attn + (size_t)r * qdim,
+                    fa_m, fa_l, fa_acc, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                    kv->block_size(), kv->max_blocks_per_seq(), row_splits[r],
+                    1.f / sqrtf((float)c.head_dim), st,
+                    attn_gq8_on ? aq81_row(r) : nullptr, pos0 + r + 1,
+                    kscale, vscale, kv8 ? 1 : 0,
+                    attn_gq8_on ? b.qgate + (size_t)r * qdim : nullptr);
+            }
+            if (!attn_gq8_on) {
+                kernels::launch_qwen36_mul_sigmoid(b.attn, b.qgate, nt * qdim, st);
+                kernels::launch_quantize_q8_1_blocks(b.attn, b.aq81, nt * qdim, st);
+            }
+            proj_nc(lw.wo, lw.wo_type, b.ao, H, qdim);
+        }
+        // h = x + ao ; hn(->xn) = RMSNorm(h, post_attn_norm); Q8_1(hn) for gate/up
+        kernels::launch_add_rmsnorm2(b.x, b.ao, lw.post_attn_norm, b.h, b.xn, nt, H, c.rms_eps, st);
+        kernels::launch_quantize_q8_1_blocks(b.xn, b.aq81, nt * H, st);
+        kernels::launch_dense_ffn_q4k_nt(b.aq81, lw.gate_q, lw.up_q, lw.down_q, lw.down_qtype,
+                                         b.d_eids, b.d_ews, b.routed, b.ffn_h, b.ffn_q8, nt, st);
+        const void* nextnorm = (L + 1 < c.n_layers) ? w.layers[L + 1].input_norm : w.final_norm;
+        kernels::launch_add_rmsnorm2(b.h, b.routed, nextnorm, b.x, b.xn, nt, H, c.rms_eps, st);
+        kernels::launch_quantize_q8_1_blocks(b.xn, b.aq81, nt * H, st);
+    }
+    // b.x rows now hold the pre-final-norm hidden (MTP eh_proj hnorm input); b.aq81 = Q8_1(final xn)
+    if (w.lm_head_type == 12)
+        kernels::launch_mmvq_q4k_nc_f32(b.aq81, q8b_h, w.lm_head, b.logits, c.vocab, nt, c.vocab, H, st);
+    else
+        kernels::launch_gemv_q6k_dp4a_nc_f32(b.aq81, q8b_h, w.lm_head, b.logits, c.vocab, nt, c.vocab, H, st);
+    // per-row two-phase argmax (the multi-row argmax_kernel is single-block and ~16x slower)
+    for (int r = 0; r < nt; r++)
+        kernels::launch_argmax(b.logits + (size_t)r * c.vocab, b.d_preds + r, 1, c.vocab, st);
+}
+
+void Qwen35Model::Impl::spec_restore_ckpt(int row) {
+    SpecBatch& b = sb;
+    const Qwen35Config& c = cfg;
+    const size_t state_elems = (size_t)c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+    const size_t conv_elems  = (size_t)(c.linear_conv_kernel - 1) * linear_qkvdim;
+    for (int L = 0; L < c.n_layers; L++) {
+        if (!w.layers[L].linear_attn) continue;
+        cu(cudaMemcpyAsync(lin_state + (size_t)L * state_elems,
+                           b.ckpt_lin + ((size_t)row * c.n_layers + L) * state_elems,
+                           state_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream),
+           "spec restore lin");
+        cu(cudaMemcpyAsync(lin_conv_state + (size_t)L * conv_elems,
+                           b.ckpt_conv + ((size_t)row * c.n_layers + L) * conv_elems,
+                           conv_elems * sizeof(bf16), cudaMemcpyDeviceToDevice, stream),
+           "spec restore conv");
+    }
+}
+
+bool Qwen35Model::mtp_spec_batch(const int* tokens, int nd, int pos0, int* preds) {
     Impl& s = *p_;
-    if (!s.mtp_decode || !s.mtp_w.loaded || s.mtp_cooldown) {
-        s.mtp_cooldown = false;
-        return 0;
-    }
-    save_spec_snapshot();
-    s.spec_kv_blocks = s.kv->num_blocks(s.seq_id);
-    mtp::reset(s.mtp_s);
+    Impl::SpecBatch& b = s.sb;
+    if (!b.supported || nd != b.nt) return false;
+    // sparse KV selection would change the captured attention path — sequential fallback there
+    const bool sparse_avail = s.sparse_budget > 0 && s.kv->int8_kv() && s.cfg.head_dim == 256 &&
+                              s.cfg.n_q_heads == s.cfg.n_kv_heads * 4;
+    if (sparse_avail && pos0 + nd + 1 >= s.sparse_min_ctx) return false;
+    if (!b.ready) s.spec_alloc();
+    if (!b.ready) return false;
 
-    std::vector<int> drafts;
-    drafts.push_back(next);
-    int chain_tok = next;
-    int mtp_pos = pos + 1;
-    const int draft_lim = mtp_effective_draft_max(s.mtp_draft_max, s.mtp_stats_accepted, s.mtp_stats_proposed);
-    const void* draft_h = s.trunk_hidden;
-    for (int d = 1; d < draft_lim; d++) {
-        const int dt = mtp::forward_step(s.mtp_s, s.cfg, chain_tok, draft_h,
-                                           s.w.embed_tokens, s.w.lm_head, s.w.lm_head_type,
-                                           mtp_pos, s.mtp_chain_h);
-        if (dt < 0) break;
-        drafts.push_back(dt);
-        s.mtp_stats_proposed++;
-        chain_tok = dt;
-        mtp_pos++;
-        draft_h = s.mtp_chain_h;
+    int splits[8];
+    bool recapture = !b.graph_ready;
+    for (int r = 0; r < nd; r++) {
+        splits[r] = s.adaptive_splits ? decode_want_splits_impl(s.split_chunk, s.cfg, (long)pos0 + r + 1)
+                                      : s.n_splits;
+        if (splits[r] != b.cap_splits[r]) recapture = true;
     }
+    int* hp = b.h_pin;
+    for (int r = 0; r < nd; r++) {
+        hp[r * 4 + 0] = tokens[r];
+        hp[r * 4 + 1] = pos0 + r;
+        hp[r * 4 + 2] = pos0 + r;
+        hp[r * 4 + 3] = pos0 + r + 1;
+        hp[nd * 4 + r] = tokens[r];
+    }
+    cu(cudaMemcpyAsync(b.d_scalars, hp, (size_t)nd * 4 * sizeof(int), cudaMemcpyHostToDevice, s.stream), "spec scalars");
+    cu(cudaMemcpyAsync(b.d_tokens, hp + nd * 4, (size_t)nd * sizeof(int), cudaMemcpyHostToDevice, s.stream), "spec tokens");
+    if (recapture) {
+        if (b.graph_ready) {
+            cu(cudaGraphExecDestroy(b.exec), "spec graph exec destroy");
+            cu(cudaGraphDestroy(b.graph), "spec graph destroy");
+            b.graph_ready = false;
+        }
+        cu(cudaStreamBeginCapture(s.stream, cudaStreamCaptureModeThreadLocal), "spec begin capture");
+        s.spec_record(pos0, splits);
+        cu(cudaStreamEndCapture(s.stream, &b.graph), "spec end capture");
+        cu(cudaGraphInstantiate(&b.exec, b.graph, 0), "spec instantiate");
+        b.graph_ready = true;
+        for (int r = 0; r < nd; r++) b.cap_splits[r] = splits[r];
+    }
+    cu(cudaGraphLaunch(b.exec, s.stream), "spec graph launch");
+    cu(cudaMemcpyAsync(hp + nd * 5, b.d_preds, (size_t)nd * sizeof(int), cudaMemcpyDeviceToHost, s.stream), "spec preds");
+    cu(cudaStreamSynchronize(s.stream), "spec sync");
+    for (int r = 0; r < nd; r++) preds[r] = hp[nd * 5 + r];
+    return true;
+}
 
-    int accepted = 0;
-    for (int d = 1; d < (int)drafts.size(); d++) {
-        s.mtp_spec_verify = true;
-        const int pred = forward_token(drafts[d - 1], pos + d, true);
-        s.mtp_spec_verify = false;
-        if (pred != drafts[d]) {
-            restore_spec_snapshot();
-            s.kv->truncate_blocks(s.seq_id, s.spec_kv_blocks);
-            s.mtp_cooldown = mtp_cooldown_enabled();
-            break;
-        }
-        accepted++;
-        s.mtp_stats_accepted++;
-        if (extra_out) extra_out->push_back(drafts[d]);
-        if (hooks && hooks->on_token) hooks->on_token(drafts[d]);
-        if (hooks && hooks->accept) hooks->accept(drafts[d]);
-        if (drafts[d] == s.cfg.eos_id) {
-            next = pred;
-            mtp::reset(s.mtp_s);
-            return accepted;
-        }
-        next = pred;
-        if (gov) gov->pace();
-    }
-    if (accepted > 0) mtp::reset(s.mtp_s);
-    return accepted;
+void Qwen35Model::mtp_spec_rollback(int row) {
+    p_->spec_restore_ckpt(row);
 }
 
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
@@ -1337,20 +1606,60 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
         s.mtp_graph_ok = mtp_graph_enabled();
         s.mtp_cooldown = false;
         s.mtp_stats_accepted = s.mtp_stats_proposed = 0;
-        invalidate_decode_graph();
+        const bool use_batch = mtp_batch_enabled() && s.sb.supported;
+        if (!use_batch) invalidate_decode_graph();
         int cur_pos = pos;
         int next_pred = tok;
         int produced = 0;
+        bool hidden_ok = false;
         auto t0 = std::chrono::high_resolution_clock::now();
         while (produced < n) {
             const int emit = next_pred;
             produced++;
+            if (hidden_ok && s.mtp_w.loaded) {
+                const int nt = s.sb.nt;
+                int drafts[8], preds[8];
+                drafts[0] = emit;
+                const void* dh = s.trunk_hidden;
+                int nd = 1;
+                for (int dj = 1; dj < nt; dj++) {
+                    const int dt = mtp::forward_step(s.mtp_s, s.cfg, drafts[dj - 1], dh,
+                        s.w.embed_tokens, s.w.lm_head, s.w.lm_head_type, cur_pos + dj - 1, s.mtp_chain_h);
+                    if (dt < 0) break;
+                    drafts[nd++] = dt;
+                    s.mtp_stats_proposed++;
+                    dh = s.mtp_chain_h;
+                }
+                if (nd >= 2) {
+                    int j = 0;
+                    if (use_batch && nd == nt && mtp_spec_batch(drafts, nd, cur_pos, preds)) {
+                        while (j < nd - 1 && produced < n && preds[j] == drafts[j + 1]) {
+                            produced++;
+                            s.mtp_stats_accepted++;
+                            j++;
+                        }
+                        if (j < nd - 1) mtp_spec_rollback(j);
+                        cu(cudaMemcpyAsync(s.trunk_hidden, s.sb.x + (size_t)j * s.cfg.hidden,
+                                           (size_t)s.cfg.hidden * sizeof(bf16), cudaMemcpyDeviceToDevice,
+                                           s.stream), "spec hidden");
+                        next_pred = preds[j];
+                    } else {
+                        int pred = forward_token(drafts[0], cur_pos, true);
+                        while (j < nd - 1 && produced < n && pred == drafts[j + 1]) {
+                            produced++;
+                            s.mtp_stats_accepted++;
+                            j++;
+                            pred = forward_token(drafts[j], cur_pos + j, true);
+                        }
+                        next_pred = pred;
+                    }
+                    cur_pos += 1 + j;
+                    continue;
+                }
+            }
             next_pred = forward_token(emit, cur_pos, true);
-            std::vector<int> extras;
-            const int extra = mtp_speculate_step(cur_pos, next_pred, nullptr, nullptr, &extras);
-            produced += extra;
-            cur_pos += 1 + extra;
-            if (extra > 0 && extras.back() == s.cfg.eos_id) break;
+            hidden_ok = s.mtp_w.loaded;
+            cur_pos += 1;
         }
         cudaDeviceSynchronize();
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -1581,17 +1890,25 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
                 next = forward_token(prompt.back(), (int)n - 1, true);
         }
     }
-    s.mtp_decode = mtp_decode_enabled(s.cfg, s.mtp_w.loaded);
+    s.mtp_decode = s.mtp_force >= 0 ? (s.mtp_force != 0 && s.mtp_w.loaded)
+                                    : mtp_decode_enabled(s.cfg, s.mtp_w.loaded);
     if (s.mtp_decode) {
         s.mtp_graph_ok = mtp_graph_enabled();
         if (!s.mtp_graph_ok) invalidate_decode_graph();
         mtp::reset(s.mtp_s);
         s.mtp_cooldown = false;
     }
+    // Steady-state batched speculative decode: once trunk_hidden is live, each iteration is
+    // [MTP draft chain] -> [one batched target pass verifying all drafts AND producing the
+    // next prediction + hidden] — no separate per-token main forward at all. The sequential
+    // draft+verify path remains for unsupported configs / SPARKINFER_MTP_BATCH=0.
+    const bool use_batch = s.mtp_decode && mtp_batch_enabled() && s.sb.supported;
+    bool hidden_ok = false;   // trunk_hidden matches the last processed position
     for (int i = 0; i < max_new; ) {
         int emit = next;
+        bool forced = false;
         if (hooks && hooks->forced_emit) {
-            if (auto forced = hooks->forced_emit()) emit = *forced;
+            if (auto f = hooks->forced_emit()) { forced = (*f != emit); emit = *f; }
         }
         out.push_back(emit);
         if (hooks && hooks->on_token) hooks->on_token(emit);
@@ -1599,7 +1916,69 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         if (emit == s.cfg.eos_id) break;
 
         const int pos = (int)prompt.size() + i;
+        if (s.mtp_decode && s.mtp_w.loaded && !forced && hidden_ok && i >= mtp_warmup_tokens()) {
+            const int nt = s.sb.nt;
+            int drafts[8], preds[8];
+            drafts[0] = emit;   // row 0 re-derives the AR prediction after `emit`
+            // no mtp::reset here: keep the draft head's KV allocated across iterations
+            // (re-allocating block tables is a synchronous memcpy = device-wide stall,
+            // and past drafts at their positions are better draft context than garbage)
+            const void* dh = s.trunk_hidden;
+            int nd = 1;
+            for (int dj = 1; dj < nt; dj++) {
+                const int dt = mtp::forward_step(s.mtp_s, s.cfg, drafts[dj - 1], dh,
+                                                 s.w.embed_tokens, s.w.lm_head, s.w.lm_head_type,
+                                                 pos + dj - 1, s.mtp_chain_h);
+                if (dt < 0) break;
+                drafts[nd++] = dt;
+                s.mtp_stats_proposed++;
+                dh = s.mtp_chain_h;
+            }
+            if (nd >= 2) {
+                int j = 0;
+                bool eos_hit = false;
+                if (use_batch && nd == nt && mtp_spec_batch(drafts, nd, pos, preds)) {
+                    // preds[r] = greedy argmax at pos+r == the token for out index i+r+1
+                    while (j < nd - 1 && i + 1 + j < max_new && preds[j] == drafts[j + 1]) {
+                        out.push_back(drafts[j + 1]);
+                        if (hooks && hooks->on_token) hooks->on_token(drafts[j + 1]);
+                        if (hooks && hooks->accept) hooks->accept(drafts[j + 1]);
+                        s.mtp_stats_accepted++;
+                        j++;
+                        if (drafts[j] == s.cfg.eos_id) { eos_hit = true; break; }
+                    }
+                    if (eos_hit) break;
+                    if (j < nd - 1) mtp_spec_rollback(j);   // drop GDN state from rejected rows
+                    cu(cudaMemcpyAsync(s.trunk_hidden, s.sb.x + (size_t)j * s.cfg.hidden,
+                                       (size_t)s.cfg.hidden * sizeof(bf16), cudaMemcpyDeviceToDevice,
+                                       s.stream), "spec hidden");
+                    next = preds[j];   // bonus token on full accept, free correction on reject
+                } else {
+                    // Incremental sequential verify (fallback): identical accept semantics, one
+                    // target forward per row. Each forward only ever processes an already-
+                    // verified token (we stop before forwarding a rejected draft), so no state
+                    // snapshot or rollback is needed and trunk_hidden stays valid throughout.
+                    int pred = forward_token(drafts[0], pos, true);
+                    while (j < nd - 1 && i + 1 + j < max_new && pred == drafts[j + 1]) {
+                        out.push_back(drafts[j + 1]);
+                        if (hooks && hooks->on_token) hooks->on_token(drafts[j + 1]);
+                        if (hooks && hooks->accept) hooks->accept(drafts[j + 1]);
+                        s.mtp_stats_accepted++;
+                        j++;
+                        if (drafts[j] == s.cfg.eos_id) { eos_hit = true; break; }
+                        pred = forward_token(drafts[j], pos + j, true);
+                    }
+                    if (eos_hit) break;
+                    next = pred;
+                }
+                i += 1 + j;
+                if (gov) gov->pace();
+                continue;
+            }
+            // draft chain unavailable this step — fall through to the per-token path
+        }
         next = forward_token(emit, pos, true);
+        hidden_ok = s.mtp_w.loaded;   // forward_token refreshed trunk_hidden
         if (gov) gov->pace();
 
         if (const char* dbg = getenv("SPARKINFER_MTP_DEBUG")) {
@@ -1611,20 +1990,7 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
                         pos, pos + 1, next, pos + 2, mtp1);
             }
         }
-
-        if (!s.mtp_decode || !s.mtp_w.loaded || s.mtp_cooldown) {
-            s.mtp_cooldown = false;
-            i++;
-            continue;
-        }
-        if (i < mtp_warmup_tokens()) {
-            i++;
-            continue;
-        }
-
-        const int accepted = mtp_speculate_step(pos, next, gov, hooks, &out);
-        i += 1 + accepted;
-        if (accepted > 0 && out.back() == s.cfg.eos_id) break;
+        i++;
     }
 
     s.kv->free(s.seq_id);
@@ -2208,10 +2574,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             s.spec_conv_snap = s.alloc<bf16>((size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim);
         }
         const int fast = s.mtp_s.vocab_trim > 0 ? s.mtp_s.vocab_trim : s.cfg.vocab;
-        fprintf(stderr, "[mtp] loaded blk.%d NextN head (draft_max=%d, fast_vocab=%d, adaptive=%s, SPARKINFER_MTP=%s)\n",
+        fprintf(stderr, "[mtp] loaded blk.%d NextN head (draft_max=%d, fast_vocab=%d, SPARKINFER_MTP=%s)\n",
                 mi, s.mtp_draft_max, fast,
-                mtp_adaptive_drafts_enabled() ? "on" : "off",
                 mtp_decode_enabled(s.cfg, true) ? "on" : "off");
+        s.sb.nt = s.mtp_draft_max < 2 ? 2 : (s.mtp_draft_max > 8 ? 8 : s.mtp_draft_max);
+        s.sb.supported = mtp_batch_enabled() && s.spec_supported();
+        fprintf(stderr, "[mtp] batched verify %s (rows=%d)\n",
+                s.sb.supported ? "on" : "off — sequential fallback", s.sb.nt);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;
@@ -2278,6 +2647,7 @@ bool Qwen35Model::ensure_kv() { return p_->kv->allocate(p_->seq_id, p_->cfg.max_
 
 void Qwen35Model::set_mtp_decode(bool enable) {
     Impl& s = *p_;
+    s.mtp_force = enable ? 1 : 0;   // authoritative: generate() must not re-enable from env
     s.mtp_decode = enable && s.mtp_w.loaded;
     if (s.mtp_decode) {
         s.mtp_graph_ok = mtp_graph_enabled();

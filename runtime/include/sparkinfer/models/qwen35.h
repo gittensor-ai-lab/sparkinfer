@@ -184,9 +184,13 @@ private:
     void invalidate_decode_graph();
     bool prompt_matches_prefix(const std::vector<int>& prompt) const;
 
-    // MTP speculative verify after forward_token at `pos` produced `next`.
-    int mtp_speculate_step(int pos, int& next, ThermalGovernor* gov,
-                           const Qwen35GenerateHooks* hooks, std::vector<int>* extra_out);
+    // MTP batched draft verify: one multi-token target pass over `nd` rows
+    // (tokens[r] processed at position pos0+r), bit-identical per row to the
+    // per-token decode. preds[r] = greedy argmax at pos0+r. Returns false if the
+    // batched path is unavailable (caller falls back to the sequential verify).
+    bool mtp_spec_batch(const int* tokens, int nd, int pos0, int* preds);
+    // Restore GDN recurrent/conv state to the checkpoint taken after batch row `row`.
+    void mtp_spec_rollback(int row);
 
     struct Impl;
     Impl* p_;
