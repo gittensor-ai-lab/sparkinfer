@@ -20,6 +20,17 @@ namespace sparkinfer { namespace kernels {
 // Per-row symmetric int8 quantization: scale[r] = max_c|x[r,c]| / 127,
 // q[r,c] = round(x[r,c] / scale[r]).  x: [rows,cols] bf16 -> q: [rows,cols] int8, scale: [rows] fp32.
 // One warp per row. Used for both the per-token activation A and (once, resident) the weight W.
+// Fused elementwise->int8 producers (prefill_fused_q8.cu): emit the SAME per-row int8 + per-row
+// float scale as launch_prefill_quantize_rows_i8, but straight from the producer, skipping the bf16
+// round-trip that pf_quantize_rows_i8 re-reads twice (once for the row amax, once to quantize).
+// swiglu_q8 never writes ffh at all -- only the int8 GEMM consumes it. Return false if the row will
+// not stage in shared -> caller falls back to the unfused pair.
+bool launch_prefill_swiglu_q8(const void* gate, const void* up, signed char* q, float* scale,
+                              int rows, int cols, cudaStream_t stream = nullptr);
+bool launch_prefill_rmsnorm_q8(const void* x, const void* w, void* out, signed char* q, float* scale,
+                               int rows, int cols, float eps, cudaStream_t stream = nullptr);
+bool prefill_fused_q8_enabled();
+
 void launch_prefill_quantize_rows_i8(const void* x_bf16, signed char* q, float* scale,
                                      int rows, int cols, cudaStream_t stream = nullptr);
 

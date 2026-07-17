@@ -89,6 +89,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     bf16* ffu  = a.alloc<bf16>((size_t)N * ffn);         // ffn up
     bf16* ffh  = a.alloc<bf16>((size_t)N * ffn);         // ffn silu(gate)*up
     bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
+    // xn feeds 2-3 int8 projections and hn feeds 2 -- today each re-quantizes byte-identical data.
+    // Quantize once with the STOCK kernel and reuse => bit-identical. ffh_i8 replaces bf16 ffh.
+    const bool fq8 = kernels::prefill_fused_q8_enabled();
+    signed char* xn_i8  = fq8 ? a.alloc<signed char>((size_t)N * H)   : nullptr;
+    float*       xn_sx  = fq8 ? a.alloc<float>((size_t)N)             : nullptr;
+    signed char* hn_i8  = fq8 ? a.alloc<signed char>((size_t)N * H)   : nullptr;
+    float*       hn_sx  = fq8 ? a.alloc<float>((size_t)N)             : nullptr;
+    signed char* ffh_i8 = fq8 ? a.alloc<signed char>((size_t)N * ffn) : nullptr;
+    float*       ffh_sx = fq8 ? a.alloc<float>((size_t)N)             : nullptr;
     int*  d_ids = a.alloc<int>((size_t)N);
     if (!a.ok) { a.free_all(); fprintf(stderr, "[prefill] scratch alloc failed (ctx=%d) -> fallback\n", N); return -1; }
     // int8 tensor-core projections (prefill_gemm_i8): ~2x the bf16 GEMM at int8==bf16 output fidelity
@@ -113,19 +122,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         return wbuf;
     };
     // C[N,n_out] = A[N,K] @ W^T  (W native quantized [n_out,K]).
-    auto proj = [&](const bf16* A, const void* W, int wtype, bf16* C, int n_out, int K) {
+    auto proj = [&](const bf16* A, const void* W, int wtype, bf16* C, int n_out, int K,
+                    const signed char* Apre = nullptr, const float* sxpre = nullptr) {
         // int8 only for the big weight-bound projections; keep the tiny per-v-head gate
         // projections (ssm_alpha/ssm_beta, n_out == v_heads) in bf16 — they feed the GDN
         // sigmoid gates, where per-row int8 quant of a 32-wide weight costs more accuracy
         // than the negligible time it saves.
         if (use_i8 && n_out >= 128) {
-            kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, N, K, st);
+            const signed char* Aq = Apre; const float* Asx = sxpre;
+            if (!Aq) { kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, N, K, st); Aq = A_i8; Asx = sx; }
             // fused Q4_K/Q6_K -> int8 rows skips the dequant-to-bf16 scratch round trip
             if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st)) {
                 const void* wb = dq(W, wtype, n_out, K);
                 kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
             }
-            kernels::launch_prefill_gemm_i8(A_i8, W_i8, sx, sw, C, N, n_out, K, st);
+            kernels::launch_prefill_gemm_i8(Aq, W_i8, Asx, sw, C, N, n_out, K, st);
         } else {
             kernels::launch_prefill_gemm(A, dq(W, wtype, n_out, K), C, N, n_out, K, st);
         }
@@ -137,19 +148,44 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool kv8 = s.kv->int8_kv();
     const int  kv_elem = kv8 ? 1 : 2;
     const float rope_theta = c.rope_theta, eps = c.rms_eps;
+    // Upstream rmsnorm stays byte-for-byte (its packed-8 __fmaf_rn order is the reference -- a
+    // re-implementation drifts KL 0.01433 -> 0.01520). The win is not fusing the norm: it is
+    // quantizing its output ONCE with the stock kernel instead of 2-3x inside each projection.
+    auto norm_q8 = [&](const bf16* src, const void* wn, bf16* dst, signed char* dq, float* dsx) -> bool {
+        kernels::launch_rmsnorm(src, wn, dst, N, H, eps, st);
+        if (!fq8) return false;
+        kernels::launch_prefill_quantize_rows_i8(dst, dq, dsx, N, H, st);
+        return true;
+    };
+    // residual-add + RMSNorm as ONE upstream kernel (launch_add_rmsnorm2), which emits out_sum too --
+    // hbuf is still materialized for the second residual. Replaces pf_add + rmsnorm (2 passes -> 1).
+    auto add_norm_q8 = [&](const bf16* xs, const bf16* res, const void* wn, bf16* osum, bf16* onorm,
+                           signed char* dq, float* dsx) -> bool {
+        if (!fq8) {
+            kernels::launch_prefill_add(xs, res, osum, (long)N * H, st);
+            kernels::launch_rmsnorm(osum, wn, onorm, N, H, eps, st);
+            return false;
+        }
+        kernels::launch_add_rmsnorm2(xs, res, wn, osum, onorm, N, H, eps, st);
+        kernels::launch_prefill_quantize_rows_i8(onorm, dq, dsx, N, H, st);
+        return true;
+    };
     const int rope_dim = (c.rope_dim > 0) ? c.rope_dim : c.head_dim;
     const float attn_scale = 1.f / sqrtf((float)c.head_dim);
 
     // embed -> x, prime xn = RMSNorm(x, layer0.input_norm)
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
-    kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, eps, st);
+    bool hnq = false;
+    bool xnq = norm_q8(x, s.w.layers[0].input_norm, xn, xn_i8, xn_sx);
+    #define XN_PRE (xnq ? xn_i8 : nullptr), (xnq ? xn_sx : nullptr)
+    #define HN_PRE (hnq ? hn_i8 : nullptr), (hnq ? hn_sx : nullptr)
 
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         if (w.linear_attn) {
             // ---- Gated DeltaNet linear-attention layer ----
-            proj(xn, w.wqkv,      w.wqkv_type,      b8, lqkv,  H);   // qkv
-            proj(xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H);   // z gate
+            proj(xn, w.wqkv,      w.wqkv_type,      b8, lqkv,  H, XN_PRE);   // qkv
+            proj(xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H, XN_PRE);   // z gate
             proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
             proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
             bf16* conv_state = lin_conv_state + (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
@@ -162,9 +198,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
         } else {
             // ---- full softmax-attention layer (q_has_gate, partial RoPE, int8 KV) ----
-            proj(xn, w.wq, w.wq_type, b8, wide,  H);                 // qraw = [q|gate] per head
-            proj(xn, w.wk, w.wk_type, kf, kvdim, H);
-            proj(xn, w.wv, w.wv_type, vf, kvdim, H);
+            proj(xn, w.wq, w.wq_type, b8, wide,  H, XN_PRE);         // qraw = [q|gate] per head
+            proj(xn, w.wk, w.wk_type, kf, kvdim, H, XN_PRE);
+            proj(xn, w.wv, w.wv_type, vf, kvdim, H, XN_PRE);
             kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
             signed char* kpool = (signed char*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
             signed char* vpool = (signed char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
@@ -182,18 +218,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
         // h = x + ao ; hn = RMSNorm(h, post_attn_norm)
         kernels::launch_prefill_add(x, ao, hbuf, (long)N * H, st);
-        kernels::launch_rmsnorm(hbuf, w.post_attn_norm, hn, N, H, eps, st);
+        hnq = norm_q8(hbuf, w.post_attn_norm, hn, hn_i8, hn_sx);
 
         // dense SwiGLU FFN
-        proj(hn, w.gate_q, w.gate_qtype, ffg, ffn, H);
-        proj(hn, w.up_q,   w.up_qtype,   ffu, ffn, H);
-        kernels::launch_prefill_swiglu(ffg, ffu, ffh, (long)N * ffn, st);
-        proj(ffh, w.down_q, w.down_qtype, ao, H, ffn);
+        proj(hn, w.gate_q, w.gate_qtype, ffg, ffn, H, HN_PRE);
+        proj(hn, w.up_q,   w.up_qtype,   ffu, ffn, H, HN_PRE);
+        // swiglu -> int8 directly: ffh is consumed ONLY by the int8 down-proj (n_out=H>=128), so
+        // its bf16 form is never read. Same silu/mul + bf16 staging => bit-identical.
+        bool fhq = fq8 && kernels::launch_prefill_swiglu_q8(ffg, ffu, ffh_i8, ffh_sx, N, ffn, st);
+        if (!fhq) kernels::launch_prefill_swiglu(ffg, ffu, ffh, (long)N * ffn, st);
+        proj(ffh, w.down_q, w.down_qtype, ao, H, ffn,
+             fhq ? ffh_i8 : nullptr, fhq ? ffh_sx : nullptr);
 
         // x = h + ffn_out ; xn = RMSNorm(x, next_input_norm)  (final_norm on the last layer)
         kernels::launch_prefill_add(hbuf, ao, x, (long)N * H, st);
         const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
+        xnq = norm_q8(x, next_norm, xn, xn_i8, xn_sx);
     }
 
     // Seed for the first decode step: argmax at the last prompt position (xn already = final norm).
