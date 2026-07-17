@@ -63,9 +63,9 @@ echo ">> eval prompt: seed=$SEED tokens=$(echo "$IDS" | wc -w)"
 # builds:
 #     metric   correct 3-seed range   broken 3-seed range   bar     false-reject / false-accept
 #     top-1     [0.870, 0.974]         [0.568, 0.786]        >=0.85       0/560   /   0/165
-#     KL        [0.215, 1.367]         [1.444, 2.461]        <=1.5        0/560   /   0/165
+#     KL        [0.215, 1.367]         [1.444, 2.461]        <=1.0        0/560   /   0/165
 # Single-seed the two KL distributions OVERLAP (correct up to 1.66, broken down to 1.25) and no KL
-# bar works — averaging LONG_SEEDS is what opens the gap. The KL bar (1.5) is far looser than the
+# bar works — averaging LONG_SEEDS is what opens the gap. The KL bar (1.0) is far looser than the
 # short pass's (0.20) precisely to allow int8's honest quantization loss: reading that loss as
 # "corruption" and tightening the bar is what turned this probe off in #227 and created the blind
 # spot. In this data top-1 alone already separates cleanly (broken tops out at 0.786), so the KL
@@ -77,7 +77,7 @@ LONG_N="${SPARKINFER_EVAL_LONGCTX_TOKENS:-8448}"
 LONG_TAIL="${SPARKINFER_EVAL_LONGCTX_TAIL:-128}"
 LONG_SEEDS="${SPARKINFER_EVAL_LONGCTX_SEEDS:-3}"
 LONG_TOP1_BAR="${SPARKINFER_EVAL_LONGCTX_TOP1_BAR:-0.85}"
-LONG_KL_BAR="${SPARKINFER_EVAL_LONGCTX_KL_BAR:-1.5}"
+LONG_KL_BAR="${SPARKINFER_EVAL_LONGCTX_KL_BAR:-1.0}"
 if [ "$LONGCTX" = "1" ]; then
   for j in $(seq 0 $((LONG_SEEDS - 1))); do
     python3 "$HERE/gen_eval_prompt.py" "${SEED}:L${j}" "$MODELS_DIR/tokenizer.json" "$HERE/eval_corpus.txt" \
@@ -140,7 +140,7 @@ echo
 LONG_TOP1_BAR="$LONG_TOP1_BAR" LONG_KL_BAR="$LONG_KL_BAR" python3 - /tmp/acc_short.txt /tmp/acc_long.txt <<'PY'
 import re, sys, os
 t1_bar = float(os.environ.get("LONG_TOP1_BAR", "0.85"))
-kl_bar = float(os.environ.get("LONG_KL_BAR", "1.5"))
+kl_bar = float(os.environ.get("LONG_KL_BAR", "1.0"))
 def grab_short(path):
     for line in open(path):
         m = re.match(r'^METRIC_SHORT top1=([\d.]+) kl=([\d.]+)', line)
