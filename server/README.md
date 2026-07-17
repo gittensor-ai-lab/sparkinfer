@@ -79,19 +79,24 @@ With API key (optional):
 curl ... -H 'Authorization: Bearer secret'
 ```
 
-## Request isolation
+## Request isolation & continuous batching
 
-Each `/v1/chat/completions` call runs through `Qwen35Model::generate()`:
+Each `/v1/chat/completions` call is submitted to `ContinuousBatchEngine`, which:
 
-- Fresh KV allocation per request (`kv->allocate` / `kv->free` inside `generate()`)
-- Hybrid Gated-DeltaNet recurrent state reset at position 0 on cold prompts
-- Correct prefill path (interior prompt tokens skip LM head unless `SPARKINFER_PREFILL_LEGACY=1`)
-- Optional **shared prefix cache**: set `SPARKINFER_SERVER_PREFIX_TOKEN_FILE` (JSON array of token ids)
-  or `SPARKINFER_SERVER_PREFIX_TOKEN_IDS` (comma-separated). When the chat prompt starts with those
-  tokens, the server calls `cache_prefix()` (batched prefill) before `generate()`, which only
-  token-loops the suffix.
+- Allocates a **per-request `seq_id`** with **right-sized KV** (`prompt + max_tokens + headroom`, not `max_seq`)
+- Runs prefill then interleaves decode steps across concurrent requests via the runtime `Scheduler`
+- Frees KV blocks when the request finishes (no cross-request KV leakage)
+- Uses per-request hybrid Gated-DeltaNet recurrent buffers when the model is hybrid
 
-Prior requests cannot leak decode context into later ones (KV is freed after each `generate()`).
+Shared prefix cache still works: when the chat prompt starts with configured prefix tokens,
+`cache_prefix()` warms session 0 and only the suffix is prefilled per request.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SPARKINFER_BATCH_TOKENS` | `64` | Scheduler decode token budget per step |
+| `SPARKINFER_SCHED_POLICY` | `continuous` | `continuous`, `chunked` (CHUNKED_PREFILL), or `priority` |
+
+Prior requests cannot leak decode context into later ones (KV is freed after each completion).
 
 ## Env
 
@@ -103,4 +108,4 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_TOKENIZER_URL` | Qwen3-30B tokenizer | Override tokenizer download |
 | `SPARKINFER_SERVER_PREFIX_TOKEN_FILE` | — | JSON `[id,...]` warmed via `cache_prefix` each request |
 | `SPARKINFER_SERVER_PREFIX_TOKEN_IDS` | — | Comma-separated token ids (same as above) |
-| `SPARKINFER_PREFILL_BATCHED` | `1` | Batched prefill in `cache_prefix` / cold `generate` |
+| `SPARKINFER_PREFILL_BATCHED` | `1` | Batched prefill in `cache_prefix` / cold prompts |

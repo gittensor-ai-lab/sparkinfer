@@ -23,6 +23,8 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <atomic>
+#include <unordered_map>
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
@@ -99,6 +101,11 @@ bool is_linear_layer(const Qwen35Config& c, int layer) {
 }
 }
 
+struct SessionBuffers {
+    float* lin_state = nullptr;
+    bf16* lin_conv_state = nullptr;
+};
+
 struct Qwen35Model::Impl {
     Qwen35Config cfg;
     KVCacheManager* kv;
@@ -109,7 +116,9 @@ struct Qwen35Model::Impl {
     cudaEvent_t ev_qkv{}, ev_k{}, ev_v{};        // fork/join events (captured into the decode graph)
     cudaEvent_t ev_pipe_fork{}, ev_gdn_z{}, ev_gdn_ab{};
     cudaEvent_t ev_sx_gate{}, ev_sx_done{};
-    uint64_t seq_id = 0;
+    uint64_t active_seq_id = 0;
+    std::atomic<uint64_t> next_session_id{1};
+    std::unordered_map<uint64_t, SessionBuffers> sessions;
     int qdim, kvdim;
     int linear_qdim = 0, linear_vdim = 0, linear_qkvdim = 0;
     bool gguf = false;   // true after load_gguf: dense weights are native [out,in], use GEMV
@@ -307,6 +316,12 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_SHEXP_PIPE")) p_->use_shexp_pipe = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ADDNORM3")) p_->use_addnorm3 = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ROUTER_FUSED")) p_->use_router_fused = !(e[0] == '0');
+    if (cfg.hybrid) {
+        SessionBuffers d;
+        d.lin_state = p_->lin_state;
+        d.lin_conv_state = p_->lin_conv_state;
+        p_->sessions[0] = d;
+    }
 }
 
 Qwen35Model::~Qwen35Model() {
@@ -330,6 +345,11 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->sparse_sel);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
+    for (auto& kv : p_->sessions) {
+        if (kv.first == 0) continue;
+        if (kv.second.lin_state) cudaFree(kv.second.lin_state);
+        if (kv.second.lin_conv_state) cudaFree(kv.second.lin_conv_state);
+    }
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
     if (p_->graph_prefill_ready) { cudaGraphExecDestroy(p_->cu_prefill_exec); cudaGraphDestroy(p_->cu_prefill_graph); }
     cudaEventDestroy(p_->ev_qkv); cudaEventDestroy(p_->ev_k); cudaEventDestroy(p_->ev_v);
@@ -488,7 +508,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
 
     kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
 
-    int* btable = s.kv->block_table(s.seq_id);
+    int* btable = s.kv->block_table(s.active_seq_id);
     // Prime: xn = RMSNorm(x, layer0.input_norm). Each layer's tail then fuses the
     // post-MoE residual with the NEXT layer's input norm (or final_norm), so the
     // per-layer input RMSNorm + two residual-adds collapse into two fused kernels.
@@ -1113,7 +1133,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
         s.graph_ready = false;
     }
     last_bench_ctx = context_tokens;
-    if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) { fprintf(stderr, "[bench] kv allocate failed\n"); return out; }
+    if (!s.kv->allocate(s.active_seq_id, s.cfg.max_seq)) { fprintf(stderr, "[bench] kv allocate failed\n"); return out; }
     int start_pos = context_tokens;
     if (const char* e = getenv("SPARKINFER_BENCH_START_POS")) {
         start_pos = atoi(e);
@@ -1122,7 +1142,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     if (start_pos + warmup + n > s.cfg.max_seq) {
         fprintf(stderr, "[bench] requested ctx=%d warmup=%d n=%d exceeds max_seq=%d\n",
                 start_pos, warmup, n, s.cfg.max_seq);
-        s.kv->free(s.seq_id);
+        s.kv->free(s.active_seq_id);
         return out;
     }
     static int bench_device_loop = -1;
@@ -1183,7 +1203,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
         cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, s.stream), "bench final out");
         cu(cudaStreamSynchronize(s.stream), "bench sync");
         auto t1 = std::chrono::high_resolution_clock::now();
-        s.kv->free(s.seq_id);
+        s.kv->free(s.active_seq_id);
         s.bench_feedback_graph = false;
         double secs = std::chrono::duration<double>(t1 - t0).count();
         out.decode_tps = n / secs;
@@ -1197,7 +1217,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     }
     cudaDeviceSynchronize();
     auto t1 = std::chrono::high_resolution_clock::now();
-    s.kv->free(s.seq_id);
+    s.kv->free(s.active_seq_id);
     s.bench_feedback_graph = false;
     double secs = std::chrono::duration<double>(t1 - t0).count();
     out.decode_tps = n / secs;
@@ -1253,11 +1273,11 @@ bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
     if (tokens.empty()) return false;
     if (tokens.size() > (size_t)s.cfg.max_seq) return false;
     invalidate_decode_graph();
-    if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) return false;
+    if (!s.kv->allocate(s.active_seq_id, s.cfg.max_seq)) return false;
     const int n = (int)tokens.size();
     int next = ingest_prompt_range(tokens.data(), 0, n);
     if (next < 0 || next >= s.cfg.vocab) {
-        s.kv->free(s.seq_id);
+        s.kv->free(s.active_seq_id);
         return false;
     }
     cudaDeviceSynchronize();
@@ -1270,8 +1290,8 @@ bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
 
 void Qwen35Model::clear_prefix_cache() {
     Impl& s = *p_;
-    if (s.prefix_active || s.kv->allocated_tokens(s.seq_id) > 0) {
-        s.kv->free(s.seq_id);
+    if (s.prefix_active || s.kv->allocated_tokens(s.active_seq_id) > 0) {
+        s.kv->free(s.active_seq_id);
         invalidate_decode_graph();
     }
     s.prefix_tokens.clear();
@@ -1282,6 +1302,11 @@ void Qwen35Model::clear_prefix_cache() {
 
 int Qwen35Model::prefix_cached_len() const { return p_->prefix_active ? p_->prefix_len : 0; }
 
+int Qwen35Model::prefix_seed_token() const {
+    const Impl& s = *p_;
+    return (s.prefix_active && s.prefix_next >= 0) ? s.prefix_next : -1;
+}
+
 double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
     Impl& s = *p_;
     if (prompt.empty()) return 0.;
@@ -1289,8 +1314,8 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
     if (!reuse) {
         clear_prefix_cache();
         invalidate_decode_graph();
-        if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) return -1.;
-    } else if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
+        if (!s.kv->allocate(s.active_seq_id, s.cfg.max_seq)) return -1.;
+    } else if (!s.kv->allocate(s.active_seq_id, s.cfg.max_seq)) {
         return -1.;
     }
     const int start = reuse ? s.prefix_len : 0;
@@ -1304,7 +1329,7 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
     cudaDeviceSynchronize();
     auto t1 = std::chrono::high_resolution_clock::now();
     if (!reuse) {
-        s.kv->free(s.seq_id);
+        s.kv->free(s.active_seq_id);
         invalidate_decode_graph();
         if (s.graph_ready) {
             cu(cudaGraphExecDestroy(s.cu_exec), "ttft graph destroy exec");
@@ -1329,11 +1354,80 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 // buffers, streams and config it needs, so Impl stays private to this file.
 int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     Impl& s = *p_;
-    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.seq_id, s.lin_state, s.lin_conv_state,
+    auto it = s.sessions.find(s.active_seq_id);
+    float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;
+    bf16* lin_conv = (it != s.sessions.end()) ? it->second.lin_conv_state : s.lin_conv_state;
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.active_seq_id, lin_state, lin_conv,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim };
     return prefill_batched_run(ctx, prompt_ids, n);
 }
+
+int Qwen35Model::session_token_budget(size_t prompt_len, int max_new, int max_seq) {
+    const long need = (long)prompt_len + max_new + 16;
+    if (need <= 0) return 16;
+    if (need > max_seq) return max_seq;
+    return (int)need;
+}
+
+uint64_t Qwen35Model::open_session(int num_tokens) {
+    Impl& s = *p_;
+    if (num_tokens <= 0) return 0;
+    const uint64_t seq_id = s.next_session_id.fetch_add(1);
+    if (!s.kv->allocate(seq_id, num_tokens)) return 0;
+    if (s.cfg.hybrid) {
+        SessionBuffers buf;
+        buf.lin_state = s.alloc<float>((size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
+                                       s.cfg.linear_head_dim * s.cfg.linear_head_dim);
+        buf.lin_conv_state = s.alloc<bf16>((size_t)s.cfg.n_layers *
+                                           (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim);
+        if (!buf.lin_state || !buf.lin_conv_state) {
+            s.kv->free(seq_id);
+            if (buf.lin_state) cudaFree(buf.lin_state);
+            if (buf.lin_conv_state) cudaFree(buf.lin_conv_state);
+            return 0;
+        }
+        s.sessions[seq_id] = buf;
+    }
+    return seq_id;
+}
+
+void Qwen35Model::close_session(uint64_t seq_id) {
+    Impl& s = *p_;
+    if (seq_id == 0) return;
+    s.kv->free(seq_id);
+    auto it = s.sessions.find(seq_id);
+    if (it != s.sessions.end()) {
+        if (it->second.lin_state && it->second.lin_state != s.lin_state)
+            cudaFree(it->second.lin_state);
+        if (it->second.lin_conv_state && it->second.lin_conv_state != s.lin_conv_state)
+            cudaFree(it->second.lin_conv_state);
+        s.sessions.erase(it);
+    }
+    if (s.active_seq_id == seq_id) activate_session(0);
+}
+
+void Qwen35Model::activate_session(uint64_t seq_id) {
+    Impl& s = *p_;
+    if (s.active_seq_id == seq_id) return;
+    s.active_seq_id = seq_id;
+    auto it = s.sessions.find(seq_id);
+    if (s.cfg.hybrid) {
+        if (it != s.sessions.end()) {
+            s.lin_state = it->second.lin_state;
+            s.lin_conv_state = it->second.lin_conv_state;
+        } else if (seq_id == 0) {
+            auto z = s.sessions.find(0);
+            if (z != s.sessions.end()) {
+                s.lin_state = z->second.lin_state;
+                s.lin_conv_state = z->second.lin_conv_state;
+            }
+        }
+    }
+    invalidate_decode_graph();
+}
+
+uint64_t Qwen35Model::active_session() const { return p_->active_seq_id; }
 
 std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
     Impl& s = *p_;
@@ -1341,23 +1435,32 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     if (prompt.empty()) return out;
 
     const bool reuse = prompt_matches_prefix(prompt);
+    const int budget = session_token_budget(prompt.size(), max_new, s.cfg.max_seq);
+    uint64_t sid = 0;
     if (!reuse) {
         clear_prefix_cache();
         invalidate_decode_graph();
-        if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
-            fprintf(stderr, "[qwen35] KV allocate failed (pool too small for max_seq=%d)\n", s.cfg.max_seq);
+        sid = open_session(budget);
+        if (!sid) {
+            fprintf(stderr, "[qwen35] KV allocate failed (need %d tokens)\n", budget);
             return out;
         }
-    } else if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) {
-        fprintf(stderr, "[qwen35] KV allocate failed (pool too small for max_seq=%d)\n", s.cfg.max_seq);
-        return out;
+        activate_session(sid);
+    } else {
+        sid = s.active_seq_id;
+        if (!s.kv->allocate(sid, budget)) {
+            fprintf(stderr, "[qwen35] KV allocate failed (need %d tokens)\n", budget);
+            return out;
+        }
+        activate_session(sid);
     }
     const int start = reuse ? s.prefix_len : 0;
     const size_t n = prompt.size();
     int next = (start >= (int)n && reuse) ? s.prefix_next
                                             : ingest_prompt_range(prompt.data(), start, (int)n);
     if (next < 0 || next >= s.cfg.vocab) {
-        s.kv->free(s.seq_id);
+        if (sid != 0) close_session(sid);
+        else s.kv->free(sid);
         fprintf(stderr, "[qwen35] prompt prefill failed (start=%d n=%zu)\n", start, n);
         return out;
     }
@@ -1368,7 +1471,8 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         if (gov) gov->pace();
     }
 
-    s.kv->free(s.seq_id);
+    if (sid != 0) close_session(sid);
+    else s.kv->free(sid);
     if (reuse) {
         // KV is gone; keep prefix_tokens/len so the next cache_prefix()+generate() pair can
         // re-warm the shared prefix and only prefill the suffix.

@@ -1,6 +1,7 @@
 #include "model_engine.hpp"
 
 #include "sparkinfer/gguf.h"
+#include "sparkinfer/inference_engine.h"
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
@@ -21,6 +22,15 @@ bool prompt_starts_with(const std::vector<int>& prompt, const std::vector<int>& 
     return std::equal(prefix.begin(), prefix.end(), prompt.begin());
 }
 
+int batch_tokens_per_step() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_BATCH_TOKENS");
+        v = e ? std::max(1, atoi(e)) : 64;
+    }
+    return v;
+}
+
 }  // namespace
 
 struct ModelEngine::Impl {
@@ -30,6 +40,7 @@ struct ModelEngine::Impl {
     std::unique_ptr<sparkinfer::KVCacheManager> kv;
     std::unique_ptr<sparkinfer::moe::MoEEngine> engine;
     std::unique_ptr<sparkinfer::Qwen35Model> model;
+    std::unique_ptr<sparkinfer::ContinuousBatchEngine> batch_engine;
     std::vector<int> prefix_tokens;
     bool ready = false;
 };
@@ -40,6 +51,7 @@ ModelEngine::~ModelEngine() = default;
 bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     std::lock_guard<std::mutex> lock(mu_);
     impl_->ready = false;
+    impl_->batch_engine.reset();
     impl_->model.reset();
     impl_->engine.reset();
     impl_->kv.reset();
@@ -75,8 +87,6 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     kvc.num_kv_heads = impl_->cfg.n_kv_heads;
     kvc.head_dim = impl_->cfg.head_dim;
     kvc.block_size = 16;
-    // Match qwen3_gguf_bench / qwen3_gguf_generate: hybrid Qwen3.6 uses int8 KV at ctx>=4k
-    // (halves KV read bandwidth — the 32k decode win on 5090/PRO 6000). Override via env.
     { const char* e = getenv("SPARKINFER_KV_INT8");
       kvc.int8_kv = e ? (e[0] != '0')
                       : (impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
@@ -106,8 +116,18 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
         return false;
     }
 
+    sparkinfer::SchedulePolicy policy = sparkinfer::SchedulePolicy::CONTINUOUS_BATCHING;
+    if (const char* p = getenv("SPARKINFER_SCHED_POLICY")) {
+        if (p[0] == 'c' || p[0] == 'C') policy = sparkinfer::SchedulePolicy::CHUNKED_PREFILL;
+        else if (p[0] == 'p' || p[0] == 'P') policy = sparkinfer::SchedulePolicy::PRIORITY;
+    }
+    impl_->batch_engine = std::make_unique<sparkinfer::ContinuousBatchEngine>(
+        impl_->model.get(), impl_->kv.get(), batch_tokens_per_step(), policy);
+
     impl_->path = gguf_path;
     impl_->ready = true;
+    fprintf(stderr, "[sparkinfer-server] continuous batching enabled (policy=%d, batch=%d)\n",
+            (int)policy, batch_tokens_per_step());
     fprintf(stderr, "[sparkinfer-server] model ready: %s\n", gguf_path.c_str());
     return true;
 }
@@ -159,46 +179,61 @@ std::vector<int> ModelEngine::complete(const std::vector<int>& prompt_ids, int m
 std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_ids,
                                                  int max_new_tokens,
                                                  const std::function<void(int)>& on_token) {
-    std::lock_guard<std::mutex> lock(mu_);
-    last_error_.clear();
-    if (!impl_->ready || !impl_->model) {
-        last_error_ = "model not loaded";
-        return {};
-    }
-    if (prompt_ids.empty()) {
-        last_error_ = "empty prompt";
-        return {};
-    }
-    if (max_new_tokens <= 0) {
-        last_error_ = "max_new_tokens must be positive";
-        return {};
-    }
-    if ((int)prompt_ids.size() + max_new_tokens > impl_->cfg.max_seq) {
-        last_error_ = "prompt + max_tokens exceeds context limit (" +
-                      std::to_string(impl_->cfg.max_seq) + ")";
-        fprintf(stderr, "[sparkinfer-server] context overflow: prompt=%zu max_new=%d max_seq=%d\n",
-                prompt_ids.size(), max_new_tokens, impl_->cfg.max_seq);
-        return {};
+    sparkinfer::ContinuousBatchEngine::Request req;
+    req.prompt = prompt_ids;
+    req.max_new_tokens = max_new_tokens;
+
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        last_error_.clear();
+        if (!impl_->ready || !impl_->model || !impl_->batch_engine) {
+            last_error_ = "model not loaded";
+            return {};
+        }
+        if (prompt_ids.empty()) {
+            last_error_ = "empty prompt";
+            return {};
+        }
+        if (max_new_tokens <= 0) {
+            last_error_ = "max_new_tokens must be positive";
+            return {};
+        }
+        if ((int)prompt_ids.size() + max_new_tokens > impl_->cfg.max_seq) {
+            last_error_ = "prompt + max_tokens exceeds context limit (" +
+                          std::to_string(impl_->cfg.max_seq) + ")";
+            fprintf(stderr, "[sparkinfer-server] context overflow: prompt=%zu max_new=%d max_seq=%d\n",
+                    prompt_ids.size(), max_new_tokens, impl_->cfg.max_seq);
+            return {};
+        }
+
+        // Shared prefix KV (session 0) is only safe when no other request is in-flight.
+        const bool prefix_match = !impl_->prefix_tokens.empty() &&
+                                  prompt_starts_with(prompt_ids, impl_->prefix_tokens);
+        const bool prefix_exclusive = impl_->batch_engine->num_active() == 0;
+        if (prefix_match && prefix_exclusive) {
+            if (impl_->model->prefix_cached_len() != (int)impl_->prefix_tokens.size()) {
+                if (!impl_->model->cache_prefix(impl_->prefix_tokens)) {
+                    last_error_ = "cache_prefix failed (KV alloc or batched prefill)";
+                    fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
+                    return {};
+                }
+            }
+            req.prefill_start = (int)impl_->prefix_tokens.size();
+            req.use_prefix_session = true;
+        } else {
+            if (!prefix_match) impl_->model->clear_prefix_cache();
+            req.prefill_start = 0;
+            req.use_prefix_session = false;
+        }
     }
 
-    // Warm a shared prefix with batched prefill when configured; generate() reuses it for the
-    // matching leading tokens and only token-loops the suffix.
-    if (!impl_->prefix_tokens.empty()) {
-        if (prompt_starts_with(prompt_ids, impl_->prefix_tokens)) {
-            if (!impl_->model->cache_prefix(impl_->prefix_tokens)) {
-                last_error_ = "cache_prefix failed (KV alloc or batched prefill)";
-                fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
-                return {};
-            }
-        } else {
-            impl_->model->clear_prefix_cache();
-        }
-    } else {
-        impl_->model->clear_prefix_cache();
-    }
-    std::vector<int> out = impl_->model->generate(prompt_ids, max_new_tokens, nullptr);
-    if (on_token) {
-        for (int t : out) on_token(t);
+    auto result = impl_->batch_engine->complete_streaming(req, on_token);
+
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!result.error.empty()) {
+        last_error_ = result.error;
+        fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
+        return {};
     }
 
     cudaError_t e = cudaGetLastError();
@@ -207,9 +242,9 @@ std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_
         fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
         return {};
     }
-    if (out.empty() && max_new_tokens > 0 && last_error_.empty())
+    if (result.tokens.empty() && max_new_tokens > 0)
         last_error_ = "generate returned no tokens (KV alloc failure?)";
-    return out;
+    return result.tokens;
 }
 
 }  // namespace sparkinfer_server

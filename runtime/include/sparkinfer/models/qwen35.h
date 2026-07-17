@@ -100,6 +100,9 @@ public:
     // Length of the currently cached prefix (0 if none).
     int prefix_cached_len() const;
 
+    // Argmax seed after cache_prefix(); -1 if no active prefix cache.
+    int prefix_seed_token() const;
+
     // True when `prompt` begins with the installed prefix token sequence (requires active cache).
     bool prompt_matches_prefix(const std::vector<int>& prompt) const;
 
@@ -133,6 +136,17 @@ public:
     // the last prompt position (seed for the first decode step), or -1 if the batched path is
     // unsupported for this model/config. Implemented in qwen35_prefill.cpp.
     int prefill_batched(const int* prompt_ids, int n);
+
+    // Per-request session lifecycle for continuous batching / serving.
+    // open_session() allocates right-sized KV blocks (+ hybrid recurrent state when needed).
+    // activate_session() binds forward_token / prefill to that seq_id. Returns 0 on OOM.
+    uint64_t open_session(int num_tokens);
+    void close_session(uint64_t seq_id);
+    void activate_session(uint64_t seq_id);
+    uint64_t active_session() const;
+
+    // Token budget for KV allocation: prompt + decode headroom, capped at max_seq.
+    static int session_token_budget(size_t prompt_len, int max_new, int max_seq);
 
 private:
     void invalidate_decode_graph();

@@ -17,6 +17,15 @@ target_link_libraries(thermal_governor_cpu_test PRIVATE sparkinfer_runtime)
 set_target_properties(thermal_governor_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME thermal_governor_cpu_test COMMAND thermal_governor_cpu_test)
 
+add_executable(scheduler_cpu_test scheduler_cpu_test.cpp)
+target_link_libraries(scheduler_cpu_test PRIVATE sparkinfer_runtime)
+set_target_properties(scheduler_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME scheduler_cpu_test COMMAND scheduler_cpu_test)
+
+add_executable(batch_engine_gpu_test batch_engine_gpu_test.cpp)
+target_link_libraries(batch_engine_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME batch_engine_gpu_test COMMAND batch_engine_gpu_test)
+
 # GPU integration tests — run the real device path; skip without a device.
 add_executable(decode_runner_gpu_test decode_runner_gpu_test.cpp)
 target_link_libraries(decode_runner_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
