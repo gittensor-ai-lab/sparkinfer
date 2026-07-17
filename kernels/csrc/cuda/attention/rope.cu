@@ -492,13 +492,22 @@ __global__ void qknorm_rope_kv_partial_int8_kernel(
         __syncthreads();
         s_h[t] = __bfloat162float(__float2bfloat16(xv * s_warp[0] * __bfloat162float(q_w[t])));
         __syncthreads();
+        // Rotate in place in s_h, then write back the WHOLE head vector. Writing only the
+        // rotated dims (t < rhalf, i.e. 0..rope_dim-1) left dims rope_dim..head_dim-1 holding
+        // the raw wq projection output — missing both the RMS scale and the q_norm weight —
+        // because s_h above norms all head_dim dims but only rope_dim of them were stored.
+        // At hd256/rope_dim=64 that is 192 of 256 dims (75% of Q) un-normalized on every
+        // int8-KV decode step. Mirrors qknorm_rope_kv_partial_kernel (the bf16 path), which
+        // rotates into s_h and then writes all t < head_dim.
         if (t < rhalf) {
             const float freq = __powf(theta, -2.f * (float)t / (float)rotary_dim);
             const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
             const float x0 = s_h[t], x1 = s_h[t + rhalf];
-            q[base + t]         = __float2bfloat16(x0 * c - x1 * s);
-            q[base + t + rhalf] = __float2bfloat16(x1 * c + x0 * s);
+            s_h[t]         = __bfloat162float(__float2bfloat16(x0 * c - x1 * s));
+            s_h[t + rhalf] = __bfloat162float(__float2bfloat16(x1 * c + x0 * s));
         }
+        __syncthreads();
+        if (t < head_dim) q[base + t] = __float2bfloat16(s_h[t]);
         return;
     }
 
@@ -604,13 +613,20 @@ __global__ void qknorm_rope_kv_partial_int8_gated_kernel(
         __syncthreads();
         s_h[t] = __bfloat162float(__float2bfloat16(xv * s_warp[0] * __bfloat162float(q_w[t])));
         __syncthreads();
+        // Same defect as qknorm_rope_kv_partial_int8_kernel, and worse here: this variant reads
+        // qraw[] and writes a DISTINCT q[] buffer, so storing only t < rhalf left q dims
+        // rope_dim..head_dim-1 not merely un-normalized but STALE — never written by this
+        // kernel, retaining whatever the q arena last held (the previous layer's Q, in
+        // forward_token's launch order). Rotate in s_h, then write the whole head vector.
         if (t < rhalf) {
             const float freq = __powf(theta, -2.f * (float)t / (float)rotary_dim);
             const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
             const float x0 = s_h[t], x1 = s_h[t + rhalf];
-            q[qbase + t]         = __float2bfloat16(x0 * c - x1 * s);
-            q[qbase + t + rhalf] = __float2bfloat16(x1 * c + x0 * s);
+            s_h[t]         = __bfloat162float(__float2bfloat16(x0 * c - x1 * s));
+            s_h[t + rhalf] = __bfloat162float(__float2bfloat16(x1 * c + x0 * s));
         }
+        __syncthreads();
+        if (t < head_dim) q[qbase + t] = __float2bfloat16(s_h[t]);
         return;
     }
 

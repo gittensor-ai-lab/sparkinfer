@@ -439,13 +439,19 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
         __syncthreads();
         s_h[t] = pf_to_f(__float2bfloat16(xv * s_warp[0] * pf_to_f(q_w[t])));
         __syncthreads();
+        // Rotate in s_h, then write the whole head vector — see qknorm_rope_kv_partial_int8_kernel
+        // (rope.cu). Storing only t < rhalf left dims rope_dim..head_dim-1 (192 of 256 at
+        // hd256/rope_dim=64) holding the raw wq output, un-normalized. The K branch below already
+        // does this correctly via its `else { val = s_h[t]; }` arm; Q was asymmetric with it.
         if (t < rhalf) {
             const float freq = __powf(theta, -2.f * (float)t / (float)rotary_dim);
             const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
             const float x0 = s_h[t], x1 = s_h[t + rhalf];
-            q[base + t]         = __float2bfloat16(x0 * c - x1 * s);
-            q[base + t + rhalf] = __float2bfloat16(x1 * c + x0 * s);
+            s_h[t]         = pf_to_f(__float2bfloat16(x0 * c - x1 * s));
+            s_h[t + rhalf] = pf_to_f(__float2bfloat16(x1 * c + x0 * s));
         }
+        __syncthreads();
+        if (t < head_dim) q[base + t] = __float2bfloat16(s_h[t]);
         return;
     }
 
