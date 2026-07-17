@@ -108,6 +108,10 @@
 
   section{padding:42px 0}
   .journey-stack{display:grid;grid-template-columns:1fr;gap:28px}
+  .journey-stack .model-ctx-collapse{border-radius:16px}
+  .journey-stack .model-ctx-collapse summary{padding:16px 18px 0}
+  .journey-stack .model-ctx-collapse summary .sec-h{flex-direction:column;align-items:flex-start;gap:6px}
+  .journey-stack .model-ctx-collapse summary .hint{display:block;width:100%}
   .journey-panel .sec-h{margin-bottom:12px}
   .journey-panel .card{padding:20px}
   .journey-split{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}
@@ -115,6 +119,12 @@
   .journey-subtitle{font-family:Sora,sans-serif;font-size:14.5px;font-weight:700;color:var(--title);margin:0 0 10px}
   .journey-line{width:100%;height:auto;display:block;font-family:Sora,sans-serif}
   .model-ctx-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;align-items:start}
+  .model-ctx-collapse{grid-column:1/-1;border:1px solid var(--line);border-radius:16px;background:var(--card);box-shadow:var(--shadow)}
+  .model-ctx-collapse summary{cursor:pointer;list-style:none;padding:16px 18px 0}
+  .model-ctx-collapse summary::-webkit-details-marker{display:none}
+  .model-ctx-collapse .collapse-body{padding:0 18px 18px}
+  .model-ctx-collapse .collapse-chevron{color:var(--muted);font-size:13px;margin-left:8px}
+  .model-ctx-collapse[open] .collapse-chevron{transform:rotate(90deg);display:inline-block}
   .model-ctx-cell{min-width:0}
   .model-ctx-cell .sec-h{margin-bottom:12px}
   .model-ctx-cell .sec-h h2{font-size:20px;line-height:1.25}
@@ -300,28 +310,32 @@
 
       <div class="journey-panel">
         <div class="sec-h">
-          <h2>Qwen3-MoE 30B-A3B · optimization journey</h2>
-          <span class="hint" id="passes-hint"></span>
-        </div>
-        <div class="card journey-split">
-          <div>
-            <div class="journey-subtitle">128-tok decode · 0.6 → 485 tok/s</div>
-            <div id="passes"></div>
-          </div>
-          <div>
-            <div class="journey-subtitle">long-context · 71 → 393 tok/s</div>
-            <div id="passes-longctx"></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="journey-panel">
-        <div class="sec-h">
           <h2>Qwen3.5 · prefill optimization journey</h2>
           <span class="hint" id="passes35-hint"></span>
         </div>
         <div class="card"><div id="passes35"></div></div>
       </div>
+
+      <details class="journey-panel model-ctx-collapse">
+        <summary>
+          <div class="sec-h" style="margin-bottom:0">
+            <h2>Qwen3-MoE 30B-A3B · optimization journey <span class="collapse-chevron">▸</span></h2>
+            <span class="hint" id="passes-hint"></span>
+          </div>
+        </summary>
+        <div class="collapse-body">
+          <div class="card journey-split">
+            <div>
+              <div class="journey-subtitle">128-tok decode · 0.6 → 485 tok/s</div>
+              <div id="passes"></div>
+            </div>
+            <div>
+              <div class="journey-subtitle">long-context · 71 → 393 tok/s</div>
+              <div id="passes-longctx"></div>
+            </div>
+          </div>
+        </div>
+      </details>
     </div>
   </section>
 
@@ -332,10 +346,31 @@
 
   <section>
     <div class="model-ctx-grid">
+      <details class="model-ctx-collapse">
+        <summary>
+          <div class="sec-h sec-h--stack" style="margin-bottom:0">
+            <div class="sec-title-row sec-title-row--stack">
+              <h2>Qwen3-MoE 30B-A3B · per-context decode <span class="collapse-chevron">▸</span></h2>
+              <a class="hf-model hf-model--stack" id="detail-q3-hf" href="https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF" target="_blank" rel="noopener" title="Qwen/Qwen3-30B-A3B-GGUF" onclick="event.stopPropagation()">
+                <span class="hf-model-line">
+                  <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="eager" decoding="async">
+                  <span class="hf-model-name">Qwen/Qwen3-30B-A3B-GGUF</span>
+                </span>
+                <span class="hf-dl" id="detail-q3-dl"></span>
+              </a>
+            </div>
+            <span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k decode</span>
+          </div>
+        </summary>
+        <div class="collapse-body">
+          <div class="card" id="detail-q3"></div>
+        </div>
+      </details>
+
       <div class="model-ctx-cell sec-sota">
         <div class="sec-h sec-h--stack">
           <div class="sec-title-row sec-title-row--stack">
-            <h2>Qwen3.6-35B-A3B <span class="badge-sota">SOTA</span> · per-context</h2>
+            <h2>Qwen3.6-35B-A3B <span class="badge-sota">SOTA</span> · decode</h2>
             <a class="hf-model hf-model--stack" id="detail-q36-hf" href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF" target="_blank" rel="noopener" title="unsloth/Qwen3.6-35B-A3B-GGUF">
               <span class="hf-model-line">
                 <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="eager" decoding="async">
@@ -344,26 +379,26 @@
               <span class="hf-dl" id="detail-q36-dl"></span>
             </a>
           </div>
-          <span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k</span>
+          <span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k decode</span>
         </div>
         <div class="card" id="detail-q36"></div>
       </div>
 
-      <div class="model-ctx-cell">
+      <div class="model-ctx-cell sec-sota">
         <div class="sec-h sec-h--stack">
           <div class="sec-title-row sec-title-row--stack">
-            <h2>Qwen3-MoE 30B-A3B · per-context</h2>
-            <a class="hf-model hf-model--stack" id="detail-q3-hf" href="https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF" target="_blank" rel="noopener" title="Qwen/Qwen3-30B-A3B-GGUF">
+            <h2>Qwen3.6-35B-A3B <span class="badge-sota">SOTA</span> · prefill</h2>
+            <a class="hf-model hf-model--stack" id="detail-q36-pp-hf" href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF" target="_blank" rel="noopener" title="unsloth/Qwen3.6-35B-A3B-GGUF">
               <span class="hf-model-line">
                 <img src="assets/img/huggingface.svg" alt="Hugging Face" width="22" height="22" loading="eager" decoding="async">
-                <span class="hf-model-name">Qwen/Qwen3-30B-A3B-GGUF</span>
+                <span class="hf-model-name">unsloth/Qwen3.6-35B-A3B-GGUF</span>
               </span>
-              <span class="hf-dl" id="detail-q3-dl"></span>
+              <span class="hf-dl" id="detail-q36-pp-dl"></span>
             </a>
           </div>
-          <span class="hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k</span>
+          <span class="hint" id="detail-q36-pp-hint">sparkinfer vs llama.cpp · 128 / 512 / 4k / 16k / 32k prefill</span>
         </div>
-        <div class="card" id="detail-q3"></div>
+        <div class="card" id="detail-q36-pp"></div>
       </div>
 
       <div class="model-ctx-cell model-ctx-cell--q35">
@@ -486,6 +521,7 @@
   wireHfModel("detail-q35-hf", "detail-q35-dl", D.qwen35, "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF");
   wireHfModel("detail-q35-pp-hf", "detail-q35-pp-dl", D.qwen35, "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF");
   wireHfModel("detail-q36-hf", "detail-q36-dl", D.qwen36, "unsloth/Qwen3.6-35B-A3B-GGUF");
+  wireHfModel("detail-q36-pp-hf", "detail-q36-pp-dl", D.qwen36, "unsloth/Qwen3.6-35B-A3B-GGUF");
 
   const q36 = D.qwen36 || {};
   const q36ctx128 = (q36.ctx||[]).find(x=>x.label==="128");
@@ -516,9 +552,9 @@
         </a>
       </div>
       <div class="sota-stats">
-        <div class="sota-stat"><div class="n">${q36.frontier_tps} <span>tok/s</span></div><div class="l">128-tok frontier</div></div>
-        <div class="sota-stat"><div class="n">${pctLlama}</div><div class="l">vs ${q36.ref_name||"llama.cpp"} at 128</div></div>
-        <div class="sota-stat"><div class="n">${pctAll}</div><div class="l">of ${q36.ref_name||"llama.cpp"} speed</div></div>
+        <div class="sota-stat"><div class="n">${q36.frontier_tps} <span>tok/s</span></div><div class="l">128-tok decode</div></div>
+        <div class="sota-stat"><div class="n">${q36.prefill_frontier_pp ? Math.round(q36.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">128 prefill baseline</div></div>
+        <div class="sota-stat"><div class="n">${pctLlama}</div><div class="l">vs ${q36.ref_name||"llama.cpp"} decode</div></div>
       </div>
     </div></div>`+
     (q35.frontier_tps ? `<div class="sota-secondary">
@@ -739,20 +775,20 @@
     $("detail-q35").innerHTML = detailRows + splitNote("sparkinfer vs llama.cpp", "same GPU · Qwythos-9B Q4_K_M GGUF · decode");
   })();
 
-  // Qwen3.5 prefill detail: 4k / 32k / 64k pp vs llama.cpp
+  // Qwen3.5 prefill detail: 4k / 32k / 64k / 128k pp vs llama.cpp
   (function(){
     const q = D.qwen35 || {};
     const rows = (q.pp||[]).filter(x=>x.ref_pp);
     const hint = $("detail-q35-pp-hint");
     if (hint && q.prefill_frontier_pp) {
       const evalTag = q.prefill_label ? ` · eval-prefill:${q.prefill_label}` : "";
-      hint.textContent = `frontier ${q.prefill_frontier_pp} pp tok/s${evalTag} · 4k / 32k / 64k context`;
+      hint.textContent = `frontier ${q.prefill_frontier_pp} pp tok/s${evalTag} · 4k / 32k / 64k / 128k context`;
     }
     if (!rows.length) {
       if ($("detail-q35-pp")) $("detail-q35-pp").innerHTML = `<div class="ctx-note">Prefill baselines pending — bidir eval with SPARKINFER_EVAL_PREFILL=1 populates this chart.</div>`;
       return;
     }
-    const ppColor = lbl => ({"4k":"#0E8A16", "32k":"#6F42C1", "64k":"#E67E22"}[lbl]||"#7B5DFF");
+    const ppColor = lbl => ({"128":"#D14D72","512":"#7B5DFF","4k":"#0E8A16","16k":"#B8860B","32k":"#6F42C1","64k":"#E67E22","128k":"#17A2B8"}[lbl]||"#7B5DFF");
     const detailRows = renderDetailCompare(rows, {
       sp: x => x.pp || 0,
       ref: x => x.ref_pp,
@@ -763,7 +799,7 @@
     $("detail-q35-pp").innerHTML = detailRows + splitNote("sparkinfer vs llama.cpp", "same GPU · Qwythos-9B Q4_K_M GGUF · prefill throughput (pp tok/s)");
   })();
 
-  // Qwen3.6 per-context detail: 128 / 512 / 4k bars vs llama.cpp
+  // Qwen3.6 decode detail: 128 / 512 / 4k / 16k / 32k vs llama.cpp
   (function(){
     const rows = (D.qwen36?.ctx||[]).filter(x=>x.tps && x.ref_tps);
     if (!rows.length) return;
@@ -774,7 +810,30 @@
       sub: x => x.label === "128" ? "no prefill" : "128 gen tok",
       color: x => ctxColor(x.label === "4k" ? 4096 : x.label === "16k" ? 16384 : x.label === "32k" ? 32768 : parseInt(x.label, 10) || 128),
     });
-    $("detail-q36").innerHTML = detailRows + splitNote("sparkinfer vs llama.cpp", "same GPU · same Qwen3.6-35B-A3B UD-Q4_K_M GGUF");
+    $("detail-q36").innerHTML = detailRows + splitNote("sparkinfer vs llama.cpp", "same GPU · Qwen3.6-35B-A3B UD-Q4_K_M GGUF · decode");
+  })();
+
+  // Qwen3.6 prefill detail: 128 / 512 / 4k / 16k / 32k pp vs llama.cpp
+  (function(){
+    const q = D.qwen36 || {};
+    const rows = (q.pp||[]).filter(x=>x.ref_pp);
+    const hint = $("detail-q36-pp-hint");
+    if (hint && q.prefill_frontier_pp) {
+      hint.textContent = `main baseline ${q.prefill_frontier_pp} pp tok/s · 128 / 512 / 4k / 16k / 32k prefill`;
+    }
+    if (!rows.length) {
+      if ($("detail-q36-pp")) $("detail-q36-pp").innerHTML = `<div class="ctx-note">Qwen3.6 prefill baselines pending.</div>`;
+      return;
+    }
+    const ppColor = lbl => ({"128":"#D14D72","512":"#7B5DFF","4k":"#0E8A16","16k":"#B8860B","32k":"#6F42C1"}[lbl]||"#7B5DFF");
+    const detailRows = renderDetailCompare(rows, {
+      sp: x => x.pp || 0,
+      ref: x => x.ref_pp,
+      label: x => x.label,
+      sub: () => "prefill pp",
+      color: x => x.color || ppColor(x.label),
+    });
+    $("detail-q36-pp").innerHTML = detailRows + splitNote("sparkinfer vs llama.cpp", "same GPU · Qwen3.6-35B-A3B UD-Q4_K_M GGUF · prefill throughput (pp tok/s)");
   })();
 
   $("labels").innerHTML = D.labels.map(x=>`<span class="lg"><span class="dot" style="background:${x.c}"></span><b style="color:var(--title)">${x.l}</b> — ${x.d}</span>`).join("");

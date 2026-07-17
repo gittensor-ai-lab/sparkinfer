@@ -1,5 +1,5 @@
 {
-  "updated": "2026-07-17",
+  "updated": "2026-07-18",
   "status": {
     "gpu": "RTX 5090 · sm_120 · CUDA 13",
     "model": "Qwen3-30B-A3B · Q4_K_M",
@@ -7721,7 +7721,7 @@
     "ref_tps": 220.84,
     "token_match": 0.9036,
     "kl": 0.0378,
-    "note": "same-box baseline 91.224.44.227 · prefill pp refs from reference.lock (2026-07-13, RTX 5090)",
+    "note": "RTX 5090 instance 45189654 · sparkinfer main baseline 2026-07-18 · llama.cpp 6f4f53f",
     "ctx": [
       {
         "label": "128",
@@ -7755,22 +7755,28 @@
         "label": "4k",
         "color": "#0E8A16",
         "pp": 16083.38,
-        "ref_pp": 11104.62
+        "ref_pp": 11628.84
       },
       {
         "label": "32k",
         "color": "#6F42C1",
         "pp": 17631.43,
-        "ref_pp": 9772.31
+        "ref_pp": 10243.88
       },
       {
         "label": "64k",
         "color": "#E67E22",
         "pp": 17772.48,
-        "ref_pp": 8153.53
+        "ref_pp": 8564.83
+      },
+      {
+        "label": "128k",
+        "color": "#17A2B8",
+        "pp": 288.54,
+        "ref_pp": 5999.59
       }
     ],
-    "baseline_pp": 288.16
+    "baseline_pp": 288.54
   },
   "landed_qwen35": [
     {
@@ -7920,7 +7926,7 @@
     "token_match": 0.9529,
     "kl": 0.031,
     "vram_gb": 22.1,
-    "note": "same-box baseline 91.224.44.227 (origin/main 6981821, 2026-07-14)",
+    "note": "RTX 5090 instance 45189654 · sparkinfer + llama.cpp baselines 2026-07-18 · commit 6f4f53f",
     "ctx": [
       {
         "label": "128",
@@ -7951,6 +7957,40 @@
         "color": "#6F42C1",
         "tps": 427.55,
         "ref_tps": 279.83
+      }
+    ],
+    "prefill_frontier_pp": 536.72,
+    "baseline_pp": 536.72,
+    "pp": [
+      {
+        "label": "128",
+        "color": "#D14D72",
+        "pp": 536.72,
+        "ref_pp": 3264.11
+      },
+      {
+        "label": "512",
+        "color": "#7B5DFF",
+        "pp": 531.86,
+        "ref_pp": 8737.39
+      },
+      {
+        "label": "4k",
+        "color": "#0E8A16",
+        "pp": 519.76,
+        "ref_pp": 8726.13
+      },
+      {
+        "label": "16k",
+        "color": "#B8860B",
+        "pp": 504.46,
+        "ref_pp": 8389.7
+      },
+      {
+        "label": "32k",
+        "color": "#6F42C1",
+        "pp": 484.18,
+        "ref_pp": 7984.07
       }
     ]
   },
