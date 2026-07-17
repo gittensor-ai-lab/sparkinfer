@@ -21,6 +21,8 @@
 #include "sparkinfer/kernels/prefill.h"
 #include "sparkinfer/kernels/prefill_attn_mma.h"
 #include "sparkinfer/kernels/prefill_attn_window.h"
+#include "sparkinfer/kernels/prefill_gdn_chunk.h"
+#include "sparkinfer/kernels/prefill_gemm_skinny.h"
 
 namespace sparkinfer {
 namespace kernels {
@@ -571,6 +573,9 @@ __global__ void pf_attn_int8_paged_kernel(
 // ============================================================================
 void launch_prefill_gemm(const void* A, const void* W, void* C,
                          int M, int N, int K, cudaStream_t stream) {
+    // Narrow n_out (the GDN gate projections) wastes most of a 128-wide tile and grids to only
+    // 32 blocks; hand those to a tensor-core kernel with a full grid. =0 restores the tiled GEMM.
+    if (launch_prefill_gemm_skinny(A, W, C, M, N, K, stream)) return;
     dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
     pf_gemm_kernel<<<grid, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(A), reinterpret_cast<const __nv_bfloat16*>(W),
@@ -632,6 +637,10 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              const void* alpha, const void* beta, const void* dt, const void* a,
                              float* state, void* out, int n_tokens, int q_heads, int v_heads,
                              int head_dim, cudaStream_t stream) {
+    // Chunk-parallel (WY/UT transform) scan: shortens the serial chain N -> N/C. Falls through to
+    // the sequential scan below when disabled (SPARKINFER_PREFILL_GDN_CHUNK=0) or shape-unsupported.
+    if (launch_prefill_gdn_chunk(q, k, v, alpha, beta, dt, a, state, out,
+                                 n_tokens, q_heads, v_heads, head_dim, stream)) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);

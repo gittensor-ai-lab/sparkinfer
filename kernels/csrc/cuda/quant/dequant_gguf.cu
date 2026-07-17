@@ -10,6 +10,8 @@
 #include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
+#include "sparkinfer/kernels/dequant_gguf_fast.h"
+#include "sparkinfer/kernels/dequant_rows_i8_fast.h"
 #endif
 
 namespace sparkinfer {
@@ -192,6 +194,9 @@ __global__ void transpose3d_kernel(const __nv_bfloat16* __restrict__ src, __nv_b
 #include "sparkinfer/kernels/quant.h"
 
 void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_values, cudaStream_t stream) {
+    // Coalesced Q4_K path (warp per super-block, 16-byte stores; byte-exact). Falls through to the
+    // scalar kernels below for other types or when SPARKINFER_DEQUANT_COALESCED=0.
+    if (launch_gguf_dequant_fast(ggml_type, src, dst_bf16, n_values, stream)) return;
     auto* d = reinterpret_cast<__nv_bfloat16*>(dst_bf16);
     auto* s = reinterpret_cast<const unsigned char*>(src);
     const int T = 256;
@@ -205,6 +210,9 @@ void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_
 
 bool launch_gguf_dequant_rows_i8(int ggml_type, const void* src, signed char* q, float* scale,
                                  int rows, int cols, cudaStream_t stream) {
+    // Vector-store path: 4 consecutive values per thread => 4-byte stores, 128 B per warp, and the
+    // decoded row stays in registers. Bit-identical; =0 restores the byte-store kernel below.
+    if (launch_gguf_dequant_rows_i8_fast(ggml_type, src, q, scale, rows, cols, stream)) return true;
     if ((cols & 255) != 0) return false;
     auto* s = reinterpret_cast<const unsigned char*>(src);
     if (ggml_type == GGML_Q4_K)      deq_rows_i8_kernel<12><<<rows, 256, 0, stream>>>(s, q, scale, cols);
