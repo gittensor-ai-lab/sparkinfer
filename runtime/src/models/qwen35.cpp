@@ -10,6 +10,7 @@
 // autoregressive greedy decoding fundamentally requires.
 
 #include "sparkinfer/models/qwen35.h"
+#include "sparkinfer/models/qwen35_mtp.h"
 #include "qwen35_prefill.h"
 #include "sparkinfer/thermal_governor.h"
 #include "sparkinfer/kv_ops.h"
@@ -29,6 +30,7 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <memory>
 #include <limits>
 
 namespace sparkinfer {
@@ -181,6 +183,24 @@ struct Qwen35Model::Impl {
     int prefix_len = 0;
     int prefix_next = -1;
     bool prefix_active = false;
+
+    // MTP speculative decode (Qwythos / Qwen3.5 NextN head in GGUF).
+    mtp::Weights mtp_w;
+    mtp::State mtp_s;
+    std::unique_ptr<KVCacheManager> mtp_kv;
+    bf16* trunk_hidden = nullptr;
+    float* spec_lin_snap = nullptr;
+    bf16* spec_conv_snap = nullptr;
+    int mtp_draft_max = 3;
+    bool mtp_cooldown = false;
+    int spec_kv_blocks = 0;
+    uint64_t mtp_stats_accepted = 0;
+    uint64_t mtp_stats_proposed = 0;
+    bool mtp_decode = false;
+    bool mtp_spec_verify = false;   // true during target verify forwards (no CUDA graph)
+    bool mtp_graph_ok = true;       // SPARKINFER_MTP_GRAPH=0 disables decode graph while MTP on
+
+    bf16* mtp_chain_h = nullptr;
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -470,7 +490,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         cu(cudaStreamSynchronize(st), "prefill graph sync");
         return token_id;
     }
-    if (sample && s.graph_ready) {
+    if (sample && s.graph_ready && s.mtp_graph_ok && !s.mtp_spec_verify) {
         cu(cudaGraphLaunch(s.cu_exec, st), "graph launch");
         cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
         cu(cudaStreamSynchronize(st), "sync");
@@ -1029,7 +1049,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         else
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
     }
-    // xn now holds RMSNorm(x_final, final_norm)
+    // xn = RMSNorm(h+routed, final_norm); x = h+routed (pre-final-norm sum for MTP hnorm input)
+    if (sample && s.mtp_w.loaded && s.trunk_hidden)
+        cu(cudaMemcpyAsync(s.trunk_hidden, s.x, (size_t)H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+           "mtp trunk hidden");
     if (!sample) {
         cu(cudaStreamEndCapture(st, &s.cu_prefill_graph), "end prefill capture");
         cu(cudaGraphInstantiate(&s.cu_prefill_exec, s.cu_prefill_graph, 0), "prefill graph instantiate");
@@ -1084,7 +1107,155 @@ bool prefill_samples_lmhead() {
     }
     return legacy != 0;
 }
+
+// Qwythos dense-hybrid batched prefill (prefill_batched_run). Default ON; SPARKINFER_PREFILL_BATCHED=0
+// disables. Prefix-reuse paths still use the token loop (batched kernel fills from pos 0 only).
+bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
+    static int want_batched = -1, batched_maxctx = -1;
+    if (want_batched < 0) {
+        const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
+        want_batched = (e && e[0] == '0') ? 0 : 1;
+        const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
+        batched_maxctx = mc ? atoi(mc) : 65536;
+    }
+    return want_batched && gguf && cfg.hybrid && cfg.dense_ffn && n_tokens > 0 &&
+           n_tokens <= batched_maxctx;
+}
+
+bool mtp_decode_enabled(const Qwen35Config& cfg, bool mtp_loaded) {
+    if (!mtp_loaded || cfg.n_nextn_layers <= 0) return false;
+    static int want = -1;
+    if (want < 0) {
+        const char* e = getenv("SPARKINFER_MTP");
+        want = (e && e[0] == '0') ? 0 : 1;
+    }
+    return want != 0;
+}
+
+int mtp_draft_max_cfg() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_MTP_DRAFT_MAX");
+        v = e ? atoi(e) : 3;
+        if (v < 1) v = 1;
+        if (v > 8) v = 8;
+    }
+    return v;
+}
+
+bool mtp_cooldown_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_MTP_COOLDOWN");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v != 0;
+}
+
+bool mtp_graph_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_MTP_GRAPH");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v != 0;
+}
+
+bool mtp_adaptive_drafts_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_MTP_ADAPTIVE");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v != 0;
+}
+
+int mtp_warmup_tokens() {
+    static int v = -2;
+    if (v == -2) {
+        const char* e = getenv("SPARKINFER_MTP_WARMUP");
+        v = e ? atoi(e) : 2;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+
+int mtp_effective_draft_max(int draft_max, uint64_t accepted, uint64_t proposed) {
+    if (!mtp_adaptive_drafts_enabled() || proposed < 16)
+        return draft_max;
+    static int min_drafts = -1;
+    if (min_drafts < 0) {
+        const char* e = getenv("SPARKINFER_MTP_MIN_DRAFTS");
+        min_drafts = e ? atoi(e) : 1;
+        if (min_drafts < 1) min_drafts = 1;
+    }
+    const double rate = (double)accepted / (double)proposed;
+    int dm = draft_max;
+    if (rate < 0.20) dm = min_drafts;
+    else if (rate < 0.45) dm = dm > 2 ? 2 : dm;
+    return dm;
+}
+
 } // namespace
+
+// After forward_token(emit, pos) produced `next`, run MTP draft+verify.
+int Qwen35Model::mtp_speculate_step(int pos, int& next, ThermalGovernor* gov,
+                                    const Qwen35GenerateHooks* hooks,
+                                    std::vector<int>* extra_out) {
+    Impl& s = *p_;
+    if (!s.mtp_decode || !s.mtp_w.loaded || s.mtp_cooldown) {
+        s.mtp_cooldown = false;
+        return 0;
+    }
+    save_spec_snapshot();
+    s.spec_kv_blocks = s.kv->num_blocks(s.seq_id);
+    mtp::reset(s.mtp_s);
+
+    std::vector<int> drafts;
+    drafts.push_back(next);
+    int chain_tok = next;
+    int mtp_pos = pos + 1;
+    const int draft_lim = mtp_effective_draft_max(s.mtp_draft_max, s.mtp_stats_accepted, s.mtp_stats_proposed);
+    const void* draft_h = s.trunk_hidden;
+    for (int d = 1; d < draft_lim; d++) {
+        const int dt = mtp::forward_step(s.mtp_s, s.cfg, chain_tok, draft_h,
+                                           s.w.embed_tokens, s.w.lm_head, s.w.lm_head_type,
+                                           mtp_pos, s.mtp_chain_h);
+        if (dt < 0) break;
+        drafts.push_back(dt);
+        s.mtp_stats_proposed++;
+        chain_tok = dt;
+        mtp_pos++;
+        draft_h = s.mtp_chain_h;
+    }
+
+    int accepted = 0;
+    for (int d = 1; d < (int)drafts.size(); d++) {
+        s.mtp_spec_verify = true;
+        const int pred = forward_token(drafts[d - 1], pos + d, true);
+        s.mtp_spec_verify = false;
+        if (pred != drafts[d]) {
+            restore_spec_snapshot();
+            s.kv->truncate_blocks(s.seq_id, s.spec_kv_blocks);
+            s.mtp_cooldown = mtp_cooldown_enabled();
+            break;
+        }
+        accepted++;
+        s.mtp_stats_accepted++;
+        if (extra_out) extra_out->push_back(drafts[d]);
+        if (hooks && hooks->on_token) hooks->on_token(drafts[d]);
+        if (hooks && hooks->accept) hooks->accept(drafts[d]);
+        if (drafts[d] == s.cfg.eos_id) {
+            next = pred;
+            mtp::reset(s.mtp_s);
+            return accepted;
+        }
+        next = pred;
+        if (gov) gov->pace();
+    }
+    if (accepted > 0) mtp::reset(s.mtp_s);
+    return accepted;
+}
 
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
     BenchDecodeResult out{};
@@ -1123,14 +1294,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     // naive) falls back to the token loop below, which is left byte-identical to main on purpose.
     bool batched_done = false;
     if (start_pos > 0) {
-        static int want_batched = -1, batched_maxctx = -1;
-        if (want_batched < 0) {
-            const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
-            want_batched = (e && e[0] == '0') ? 0 : 1;
-            const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
-            batched_maxctx = mc ? atoi(mc) : 65536;
-        }
-        if (want_batched && s.gguf && s.cfg.hybrid && s.cfg.dense_ffn && start_pos <= batched_maxctx) {
+        if (batched_prefill_enabled(s.gguf, s.cfg, start_pos)) {
             std::vector<int> ids(start_pos);
             for (int i = 0; i < start_pos; i++) ids[i] = 100 + (i % 20000);   // deterministic pseudo-prompt
             auto pb0 = std::chrono::high_resolution_clock::now();
@@ -1161,6 +1325,46 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     }
     if (s.graph_ready) cu(cudaGraphUpload(s.cu_exec, s.stream), "bench graph upload");
     cudaDeviceSynchronize();
+
+    static int bench_mtp = -1;
+    if (bench_mtp < 0) {
+        const char* e = getenv("SPARKINFER_BENCH_MTP");
+        bench_mtp = (e && e[0] == '1') ? 1 : 0;
+    }
+    const bool use_mtp_bench = bench_mtp && mtp_decode_enabled(s.cfg, s.mtp_w.loaded);
+    if (use_mtp_bench) {
+        s.mtp_decode = true;
+        s.mtp_graph_ok = mtp_graph_enabled();
+        s.mtp_cooldown = false;
+        s.mtp_stats_accepted = s.mtp_stats_proposed = 0;
+        invalidate_decode_graph();
+        int cur_pos = pos;
+        int next_pred = tok;
+        int produced = 0;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        while (produced < n) {
+            const int emit = next_pred;
+            produced++;
+            next_pred = forward_token(emit, cur_pos, true);
+            std::vector<int> extras;
+            const int extra = mtp_speculate_step(cur_pos, next_pred, nullptr, nullptr, &extras);
+            produced += extra;
+            cur_pos += 1 + extra;
+            if (extra > 0 && extras.back() == s.cfg.eos_id) break;
+        }
+        cudaDeviceSynchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        s.kv->free(s.seq_id);
+        s.bench_feedback_graph = false;
+        if (s.mtp_stats_proposed > 0) {
+            fprintf(stderr, "[mtp] acceptance %.1f%% (%llu/%llu extra drafts)\n",
+                    100.0 * (double)s.mtp_stats_accepted / (double)s.mtp_stats_proposed,
+                    (unsigned long long)s.mtp_stats_accepted,
+                    (unsigned long long)s.mtp_stats_proposed);
+        }
+        out.decode_tps = produced / std::chrono::duration<double>(t1 - t0).count();
+        return out;
+    }
 
     if (bench_device_loop && s.graph_ready) {
         s.h_scalars[0] = tok;
@@ -1226,14 +1430,22 @@ bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
     invalidate_decode_graph();
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) return false;
     int next = -1;
-    if (prefill_samples_lmhead()) {
-        for (size_t i = 0; i < tokens.size(); i++)
-            next = forward_token(tokens[i], (int)i, true);
-    } else {
-        for (size_t i = 0; i + 1 < tokens.size(); i++)
-            forward_token(tokens[i], (int)i, false);
-        if (!tokens.empty())
-            next = forward_token(tokens.back(), (int)tokens.size() - 1, true);
+    const int n = (int)tokens.size();
+    bool batched_done = false;
+    if (batched_prefill_enabled(s.gguf, s.cfg, n)) {
+        next = prefill_batched(tokens.data(), n);
+        batched_done = next >= 0 && next < s.cfg.vocab;
+    }
+    if (!batched_done) {
+        if (prefill_samples_lmhead()) {
+            for (size_t i = 0; i < tokens.size(); i++)
+                next = forward_token(tokens[i], (int)i, true);
+        } else {
+            for (size_t i = 0; i + 1 < tokens.size(); i++)
+                forward_token(tokens[i], (int)i, false);
+            if (!tokens.empty())
+                next = forward_token(tokens.back(), (int)tokens.size() - 1, true);
+        }
     }
     cudaDeviceSynchronize();
     s.prefix_tokens = tokens;
@@ -1275,19 +1487,28 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
     s.bench_feedback_graph = false;
     cudaDeviceSynchronize();
     auto t0 = std::chrono::high_resolution_clock::now();
-    if (prefill_samples_lmhead()) {
-        for (size_t i = (size_t)start; i < prompt.size(); i++) {
-            (void)forward_token(prompt[i], (int)i, true);
-            cudaDeviceSynchronize();
-        }
-    } else {
-        for (size_t i = (size_t)start; i + 1 < prompt.size(); i++) {
-            forward_token(prompt[i], (int)i, false);
-            cudaDeviceSynchronize();
-        }
-        if (prompt.size() > (size_t)start) {
-            (void)forward_token(prompt.back(), (int)prompt.size() - 1, true);
-            cudaDeviceSynchronize();
+    bool batched_done = false;
+    if (start == 0 && batched_prefill_enabled(s.gguf, s.cfg, (int)prompt.size())) {
+        const int seed = prefill_batched(prompt.data(), (int)prompt.size());
+        cudaDeviceSynchronize();
+        batched_done = seed >= 0;
+        (void)seed;
+    }
+    if (!batched_done) {
+        if (prefill_samples_lmhead()) {
+            for (size_t i = (size_t)start; i < prompt.size(); i++) {
+                (void)forward_token(prompt[i], (int)i, true);
+                cudaDeviceSynchronize();
+            }
+        } else {
+            for (size_t i = (size_t)start; i + 1 < prompt.size(); i++) {
+                forward_token(prompt[i], (int)i, false);
+                cudaDeviceSynchronize();
+            }
+            if (prompt.size() > (size_t)start) {
+                (void)forward_token(prompt.back(), (int)prompt.size() - 1, true);
+                cudaDeviceSynchronize();
+            }
         }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -1323,7 +1544,8 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     return prefill_batched_run(ctx, prompt_ids, n);
 }
 
-std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
+std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov,
+                                       const Qwen35GenerateHooks* hooks) {
     Impl& s = *p_;
     std::vector<int> out;
     if (prompt.empty()) return out;
@@ -1343,23 +1565,75 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     int next = reuse ? s.prefix_next : -1;
     const int start = reuse ? s.prefix_len : 0;
     const size_t n = prompt.size();
-    if (prefill_samples_lmhead()) {
-        for (size_t i = (size_t)start; i < n; i++)
-            next = forward_token(prompt[i], (int)i, true);
-    } else {
-        for (size_t i = (size_t)start; i + 1 < n; i++)
-            forward_token(prompt[i], (int)i, false);
-        if (n > (size_t)start)
-            next = forward_token(prompt.back(), (int)n - 1, true);
+    bool batched_done = false;
+    if (start == 0 && batched_prefill_enabled(s.gguf, s.cfg, (int)n)) {
+        next = prefill_batched(prompt.data(), (int)n);
+        batched_done = next >= 0 && next < s.cfg.vocab;
     }
-    for (int i = 0; i < max_new; i++) {
-        out.push_back(next);
-        if (next == s.cfg.eos_id) break;
-        next = forward_token(next, (int)prompt.size() + i, true);
+    if (!batched_done) {
+        if (prefill_samples_lmhead()) {
+            for (size_t i = (size_t)start; i < n; i++)
+                next = forward_token(prompt[i], (int)i, true);
+        } else {
+            for (size_t i = (size_t)start; i + 1 < n; i++)
+                forward_token(prompt[i], (int)i, false);
+            if (n > (size_t)start)
+                next = forward_token(prompt.back(), (int)n - 1, true);
+        }
+    }
+    s.mtp_decode = mtp_decode_enabled(s.cfg, s.mtp_w.loaded);
+    if (s.mtp_decode) {
+        s.mtp_graph_ok = mtp_graph_enabled();
+        if (!s.mtp_graph_ok) invalidate_decode_graph();
+        mtp::reset(s.mtp_s);
+        s.mtp_cooldown = false;
+    }
+    for (int i = 0; i < max_new; ) {
+        int emit = next;
+        if (hooks && hooks->forced_emit) {
+            if (auto forced = hooks->forced_emit()) emit = *forced;
+        }
+        out.push_back(emit);
+        if (hooks && hooks->on_token) hooks->on_token(emit);
+        if (hooks && hooks->accept) hooks->accept(emit);
+        if (emit == s.cfg.eos_id) break;
+
+        const int pos = (int)prompt.size() + i;
+        next = forward_token(emit, pos, true);
         if (gov) gov->pace();
+
+        if (const char* dbg = getenv("SPARKINFER_MTP_DEBUG")) {
+            if (dbg[0] != '0' && s.mtp_w.loaded) {
+                mtp::reset(s.mtp_s);
+                const int mtp1 = mtp::forward_step(s.mtp_s, s.cfg, next, s.trunk_hidden,
+                    s.w.embed_tokens, s.w.lm_head, s.w.lm_head_type, pos + 1);
+                fprintf(stderr, "[mtp] pos=%d main_next@%d=%d mtp_draft@%d=%d\n",
+                        pos, pos + 1, next, pos + 2, mtp1);
+            }
+        }
+
+        if (!s.mtp_decode || !s.mtp_w.loaded || s.mtp_cooldown) {
+            s.mtp_cooldown = false;
+            i++;
+            continue;
+        }
+        if (i < mtp_warmup_tokens()) {
+            i++;
+            continue;
+        }
+
+        const int accepted = mtp_speculate_step(pos, next, gov, hooks, &out);
+        i += 1 + accepted;
+        if (accepted > 0 && out.back() == s.cfg.eos_id) break;
     }
 
     s.kv->free(s.seq_id);
+    if (s.mtp_decode && s.mtp_stats_proposed > 0) {
+        fprintf(stderr, "[mtp] acceptance %.1f%% (%llu/%llu extra drafts)\n",
+                100.0 * (double)s.mtp_stats_accepted / (double)s.mtp_stats_proposed,
+                (unsigned long long)s.mtp_stats_accepted,
+                (unsigned long long)s.mtp_stats_proposed);
+    }
     if (reuse) {
         s.prefix_tokens.clear();
         s.prefix_len = 0;
@@ -1416,6 +1690,18 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     Impl& s = *p_;
     GGUF g;
     if (!g.open(path)) return false;
+    const int nextn_meta = (int)qwen_moe_meta_int(g, "nextn_predict_layers", 0);
+    if (nextn_meta > 0) {
+        const int blocks = (int)qwen_moe_meta_int(g, "block_count", s.cfg.n_layers);
+        if (s.cfg.n_layers + nextn_meta == blocks) {
+            s.cfg.n_nextn_layers = nextn_meta;
+        } else if (s.cfg.n_layers == blocks) {
+            s.cfg.n_layers = blocks - nextn_meta;
+            s.cfg.n_nextn_layers = nextn_meta;
+        } else {
+            s.cfg.n_nextn_layers = nextn_meta;
+        }
+    }
     const bool dense_file = g.tensor("blk.0.ffn_gate.weight") != nullptr &&
                             g.tensor("blk.0.ffn_gate_exps.weight") == nullptr;
     const bool hybrid_file = is_qwen35_or_qwen36_hybrid_moe(g) || dense_file;
@@ -1854,8 +2140,215 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (!have_attn || !w.input_norm || !w.post_attn_norm || !have_ffn) return false;
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);
     }
+    if (s.cfg.n_nextn_layers > 0) {
+        if (s.cfg.n_nextn_layers != 1) {
+            fprintf(stderr, "[mtp] only nextn_predict_layers=1 is supported\n");
+            return false;
+        }
+        const int mi = c.n_layers;
+        std::string b = "blk." + std::to_string(mi) + ".";
+        Qwen35LayerWeights& mw = s.mtp_w.layer;
+        mw.linear_attn = false;
+        mw.q_has_gate = true;
+        if (!expect_dims(b + "nextn.eh_proj.weight", {H * 2, H}) ||
+            !expect_dims(b + "nextn.enorm.weight", {H}) ||
+            !expect_dims(b + "nextn.hnorm.weight", {H}) ||
+            !expect_dims(b + "nextn.shared_head_norm.weight", {H}) ||
+            !expect_dims(b + "attn_norm.weight", {H}) ||
+            !expect_dims(b + "attn_q.weight", {H, s.qdim * 2}) ||
+            !expect_dims(b + "attn_k.weight", {H, s.kvdim}) ||
+            !expect_dims(b + "attn_v.weight", {H, s.kvdim}) ||
+            !expect_dims(b + "attn_output.weight", {s.qdim, H}) ||
+            !expect_dims(b + "attn_q_norm.weight", {c.head_dim}) ||
+            !expect_dims(b + "attn_k_norm.weight", {c.head_dim}) ||
+            !expect_dims(b + "post_attention_norm.weight", {H}) ||
+            !expect_dims(b + "ffn_gate.weight", {H, c.moe_ffn}) ||
+            !expect_dims(b + "ffn_up.weight", {H, c.moe_ffn}) ||
+            !expect_dims(b + "ffn_down.weight", {c.moe_ffn, H})) return false;
+        s.mtp_w.eh_proj = dev_quant_requant_q4k(b + "nextn.eh_proj.weight", s.mtp_w.eh_proj_type, true);
+        s.mtp_w.enorm = dense(b + "nextn.enorm.weight", false);
+        s.mtp_w.hnorm = dense(b + "nextn.hnorm.weight", false);
+        s.mtp_w.shared_head_norm = dense(b + "nextn.shared_head_norm.weight", false);
+        mw.input_norm = dense(b + "attn_norm.weight", false);
+        mw.wq = attn_w(b + "attn_q.weight", mw.wq_type);
+        mw.wk = attn_w(b + "attn_k.weight", mw.wk_type);
+        mw.wv = attn_w(b + "attn_v.weight", mw.wv_type);
+        mw.wo = attn_w(b + "attn_output.weight", mw.wo_type);
+        mw.q_norm = dense(b + "attn_q_norm.weight", false);
+        mw.k_norm = dense(b + "attn_k_norm.weight", false);
+        mw.post_attn_norm = dense(b + "post_attention_norm.weight", false);
+        mw.gate_q = dev_quant_requant_q4k(b + "ffn_gate.weight", mw.gate_qtype, true);
+        mw.up_q = dev_quant_requant_q4k(b + "ffn_up.weight", mw.up_qtype, true);
+        mw.down_q = dev_quant_down(b + "ffn_down.weight", mw.down_qtype);
+        if (!s.mtp_w.eh_proj || !s.mtp_w.enorm || !s.mtp_w.hnorm || !s.mtp_w.shared_head_norm ||
+            !mw.wq || !mw.wk || !mw.wv || !mw.wo || !mw.gate_q || !mw.up_q || !mw.down_q) {
+            fprintf(stderr, "[mtp] failed to load blk.%d NextN tensors\n", mi);
+            return false;
+        }
+        s.mtp_w.loaded = true;
+        KVCacheConfig mkvc{};
+        mkvc.num_layers = 1;
+        mkvc.num_kv_heads = c.n_kv_heads;
+        mkvc.head_dim = c.head_dim;
+        mkvc.block_size = 16;
+        mkvc.int8_kv = false;  // MTP head: bf16 KV for now (int8 path still being tuned)
+        const size_t epb = (size_t)mkvc.block_size * c.n_kv_heads * c.head_dim;
+        const size_t blocks = (c.max_seq + 15) / 16 + 8;
+        s.mtp_kv = std::make_unique<KVCacheManager>(mkvc, 2 * epb * 2 * blocks);
+        mtp::init_state(s.mtp_s, s.cfg, s.mtp_kv.get(), s.stream);
+        s.mtp_s.w = s.mtp_w;
+        s.mtp_draft_max = mtp_draft_max_cfg();
+        s.mtp_graph_ok = mtp_graph_enabled();
+        if (!s.trunk_hidden)
+            s.trunk_hidden = s.alloc<bf16>(H);
+        if (!s.mtp_chain_h)
+            s.mtp_chain_h = s.alloc<bf16>(H);
+        if (c.hybrid && !s.spec_lin_snap) {
+            s.spec_lin_snap = s.alloc<float>((size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim);
+            s.spec_conv_snap = s.alloc<bf16>((size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim);
+        }
+        const int fast = s.mtp_s.vocab_trim > 0 ? s.mtp_s.vocab_trim : s.cfg.vocab;
+        fprintf(stderr, "[mtp] loaded blk.%d NextN head (draft_max=%d, fast_vocab=%d, adaptive=%s, SPARKINFER_MTP=%s)\n",
+                mi, s.mtp_draft_max, fast,
+                mtp_adaptive_drafts_enabled() ? "on" : "off",
+                mtp_decode_enabled(s.cfg, true) ? "on" : "off");
+    }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;
+}
+
+void Qwen35Model::save_spec_snapshot() {
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    if (!s.spec_lin_snap || !c.hybrid) return;
+    const size_t ls = (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+    const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
+    cu(cudaMemcpyAsync(s.spec_lin_snap, s.lin_state, ls * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
+       "spec snap lin");
+    cu(cudaMemcpyAsync(s.spec_conv_snap, s.lin_conv_state, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
+       "spec snap conv");
+    cu(cudaStreamSynchronize(s.stream), "spec snap sync");
+}
+
+void Qwen35Model::restore_spec_snapshot() {
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    if (!s.spec_lin_snap || !c.hybrid) return;
+    const size_t ls = (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+    const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
+    cu(cudaMemcpyAsync(s.lin_state, s.spec_lin_snap, ls * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
+       "spec restore lin");
+    cu(cudaMemcpyAsync(s.lin_conv_state, s.spec_conv_snap, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
+       "spec restore conv");
+    cu(cudaStreamSynchronize(s.stream), "spec restore sync");
+    invalidate_decode_graph();
+}
+
+bool Qwen35Model::batched_forward(const int*, int, int, bool, int*, const void*) { return false; }
+
+const void* Qwen35Model::embed_weights() const { return p_->w.embed_tokens; }
+
+const void* Qwen35Model::lm_head_weights() const { return p_->w.lm_head; }
+
+int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
+
+void Qwen35Model::set_dflash_capture(bool, const std::vector<int>&, int) {}
+
+void Qwen35Model::set_dflash_capture_row(int) {}
+
+void Qwen35Model::dflash_stash_capture(int) {}
+
+const void* Qwen35Model::dflash_hidden_buffer() const { return nullptr; }
+
+const void* Qwen35Model::dflash_context_buffer() const { return nullptr; }
+
+int Qwen35Model::dflash_hidden_row_stride() const { return 0; }
+
+int Qwen35Model::last_argmax() const {
+    std::vector<float> row(p_->cfg.vocab);
+    copy_logits(row.data());
+    int best = 0;
+    float bv = row[0];
+    for (int i = 1; i < p_->cfg.vocab; ++i)
+        if (row[i] > bv) { bv = row[i]; best = i; }
+    return best;
+}
+
+bool Qwen35Model::ensure_kv() { return p_->kv->allocate(p_->seq_id, p_->cfg.max_seq); }
+
+void Qwen35Model::set_mtp_decode(bool enable) {
+    Impl& s = *p_;
+    s.mtp_decode = enable && s.mtp_w.loaded;
+    if (s.mtp_decode) {
+        s.mtp_graph_ok = mtp_graph_enabled();
+        if (!s.mtp_graph_ok) invalidate_decode_graph();
+        mtp::reset(s.mtp_s);
+        s.mtp_cooldown = false;
+    }
+}
+
+Qwen35Model::MtpDraftMetrics Qwen35Model::mtp_draft_check(const std::vector<int>& tokens, int warmup) {
+    MtpDraftMetrics out{};
+    Impl& s = *p_;
+    if (!s.mtp_w.loaded || tokens.size() < 3) return out;
+    if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) return out;
+
+    const int V = s.cfg.vocab;
+    std::vector<float> main_lg(V), mtp_lg(V);
+    const int W = std::max(0, warmup);
+
+    for (size_t i = 0; i + 2 < tokens.size(); i++) {
+        if ((int)i < W) {
+            (void)forward_token(tokens[i], (int)i, true);
+            continue;
+        }
+        const int main_next = forward_token(tokens[i], (int)i, true);
+
+        save_spec_snapshot();
+        const int kv_blocks = s.kv->num_blocks(s.seq_id);
+        const int main_verify = forward_token(main_next, (int)i + 1, true);
+        copy_logits(main_lg.data());
+        restore_spec_snapshot();
+        s.kv->truncate_blocks(s.seq_id, kv_blocks);
+
+        mtp::reset(s.mtp_s);
+        const int mtp_draft = mtp::forward_step(s.mtp_s, s.cfg, main_next, s.trunk_hidden,
+            s.w.embed_tokens, s.w.lm_head, s.w.lm_head_type, (int)i + 1, nullptr);
+        const int mtp_vocab = mtp::copy_logits(s.mtp_s, s.cfg, mtp_lg.data());
+
+        out.positions++;
+        if (main_next == tokens[i + 1]) out.main_top1++;
+        if (mtp_draft == main_verify) out.draft_top1++;
+
+        const int Vk = std::min(V, mtp_vocab > 0 ? mtp_vocab : V);
+        double mx = -20.0;
+        for (int v = 0; v < Vk; v++) {
+            mx = std::max(mx, (double)main_lg[v]);
+            mx = std::max(mx, (double)mtp_lg[v]);
+        }
+        double sp = 0.0, sq = 0.0;
+        for (int v = 0; v < Vk; v++) {
+            sp += std::exp(main_lg[v] - mx);
+            sq += std::exp(mtp_lg[v] - mx);
+        }
+        const double lsp = mx + std::log(sp);
+        const double lsq = mx + std::log(sq);
+        double kl = 0.0;
+        for (int v = 0; v < Vk; v++) {
+            const double pp = std::exp(main_lg[v] - lsp);
+            const double qq = std::exp(mtp_lg[v] - lsq);
+            if (pp > 0.0) kl += pp * std::log(pp / std::max(qq, 1e-12));
+        }
+        out.mean_kl += kl;
+    }
+    s.kv->free(s.seq_id);
+    if (out.positions > 0) out.mean_kl /= out.positions;
+    return out;
+}
+
+void Qwen35Model::release_kv() {
+    p_->kv->free(p_->seq_id);
+    invalidate_decode_graph();
 }
 
 } // namespace sparkinfer

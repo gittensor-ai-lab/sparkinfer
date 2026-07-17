@@ -65,8 +65,11 @@ static void print_bench_block(const sparkinfer::Qwen35Config& cfg, bool gguf_mod
                               size_t vram_used, int n_tokens, const SweepRow& row) {
     printf("\n=== sparkinfer bench (%s) sweep ctx=%d ===\n",
            gguf_mode ? "Q4_K_M native" : "bf16", row.ctx);
-    printf("model        : %d layers, %d experts top-%d\n",
+    printf("model        : %d layers, %d experts top-%d",
            cfg.n_layers, cfg.n_experts, cfg.top_k);
+    if (cfg.n_nextn_layers > 0)
+        printf(" (+ %d MTP)", cfg.n_nextn_layers);
+    printf("\n");
     printf("VRAM used    : %.1f GB\n", vram_used / 1e9);
     printf("max seq      : %d\n", cfg.max_seq);
     printf("decode tg    : %.2f tok/s  (n=%d, ctx=%d, bs=1)\n",

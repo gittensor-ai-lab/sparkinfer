@@ -1,7 +1,9 @@
 #pragma once
 #include <cstdint>
-#include <vector>
+#include <functional>
+#include <optional>
 #include <string>
+#include <vector>
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/models/qwen_config.h"
 #include "sparkinfer/moe/engine.h"
@@ -9,6 +11,13 @@
 namespace sparkinfer {
 
 class ThermalGovernor;   // optional decode-time thermal pacing (thermal_governor.h)
+
+// Optional hooks for server-side reasoning budget / streaming.
+struct Qwen35GenerateHooks {
+    std::function<void(int)> on_token;
+    std::function<std::optional<int>()> forced_emit;
+    std::function<void(int)> accept;
+};
 
 // Device (bf16) weight pointers for one layer.
 struct Qwen35LayerWeights {
@@ -88,7 +97,8 @@ public:
     // paces decode under thermal pressure (accuracy-preserving); nullptr = full speed, no overhead.
     // When a prefix cache is installed (cache_prefix), skips re-prefilling the matching prefix.
     std::vector<int> generate(const std::vector<int>& prompt_ids, int max_new_tokens,
-                              ThermalGovernor* gov = nullptr);
+                              ThermalGovernor* gov = nullptr,
+                              const Qwen35GenerateHooks* hooks = nullptr);
 
     // Prefill `tokens` and retain KV + hybrid recurrent state for reuse on the next request
     // whose prompt starts with the same token sequence. Returns false on allocation failure.
@@ -124,16 +134,59 @@ public:
 
     const Qwen35Config& config() const;
 
-    // Batched prompt prefill (Qwen3.5 dense-hybrid only): process all `n` prompt tokens in one
+    // Batched prompt prefill (Qwen3.5 dense-hybrid and Qwen3.6 MoE hybrid): process all `n` prompt tokens in one
     // pass, filling the paged KV cache and Gated-DeltaNet recurrent/conv state for positions
     // 0..n-1 so a subsequent decode is faithful to the forward_token loop. Returns the argmax at
     // the last prompt position (seed for the first decode step), or -1 if the batched path is
     // unsupported for this model/config. Implemented in qwen35_prefill.cpp.
     int prefill_batched(const int* prompt_ids, int n);
 
+    // Batched forward for DFlash block verify / prompt prefill with hidden capture.
+    bool batched_forward(const int* token_ids, int n, int start_pos, bool resume_gdn,
+                         int* out_argmax, const void* dflash_capture_dst = nullptr);
+
+    // Shared weights for DFlash draft (embed + lm_head come from target).
+    const void* embed_weights() const;
+    const void* lm_head_weights() const;
+    int lm_head_quant_type() const;
+
+    // DFlash: capture concat hidden states at target_layer_ids per forward step.
+    void set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows = 16);
+    void set_dflash_capture_row(int row);
+    void dflash_stash_capture(int global_pos);
+    const void* dflash_hidden_buffer() const;   // scratch rows from last verify block
+    const void* dflash_context_buffer() const;  // accumulated prefill hiddens
+    int dflash_hidden_row_stride() const;  // elements (bf16) per row = n_capture * hidden
+
+    // Snapshot hybrid recurrent state for speculative rollback.
+    void save_spec_snapshot();
+    void restore_spec_snapshot();
+
+    // Greedy argmax from last forward_token() logits (host).
+    int last_argmax() const;
+
+    bool ensure_kv();
+    void release_kv();
+
+    // Test hook: force speculative decode on/off (no-op if MTP weights not loaded).
+    void set_mtp_decode(bool enable);
+
+    struct MtpDraftMetrics {
+        int positions = 0;
+        int main_top1 = 0;   // main argmax == teacher next
+        int draft_top1 = 0;  // MTP draft == main verify argmax
+        double mean_kl = 0.0; // KL(main || mtp) over full vocab
+    };
+    // Teacher-forced: at each position compare main greedy vs MTP first draft + logits KL.
+    MtpDraftMetrics mtp_draft_check(const std::vector<int>& tokens, int warmup = 2);
+
 private:
     void invalidate_decode_graph();
     bool prompt_matches_prefix(const std::vector<int>& prompt) const;
+
+    // MTP speculative verify after forward_token at `pos` produced `next`.
+    int mtp_speculate_step(int pos, int& next, ThermalGovernor* gov,
+                           const Qwen35GenerateHooks* hooks, std::vector<int>* extra_out);
 
     struct Impl;
     Impl* p_;

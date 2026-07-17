@@ -47,7 +47,10 @@ static bool qwen3_is_hybrid_35b(const sparkinfer::GGUF& g) {
 }
 
 static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35Config& cfg) {
-    cfg.n_layers   = (int)qwen3_meta_int(g, "block_count", cfg.n_layers);
+    const int block_count = (int)qwen3_meta_int(g, "block_count", cfg.n_layers);
+    const int nextn = (int)qwen3_meta_int(g, "nextn_predict_layers", 0);
+    cfg.n_nextn_layers = nextn;
+    cfg.n_layers = block_count - (nextn > 0 ? nextn : 0);
     cfg.hidden     = (int)qwen3_meta_int(g, "embedding_length", cfg.hidden);
     cfg.n_q_heads  = (int)qwen3_meta_int(g, "attention.head_count", cfg.n_q_heads);
     cfg.n_kv_heads = (int)qwen3_meta_int(g, "attention.head_count_kv", cfg.n_kv_heads);

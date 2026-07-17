@@ -35,6 +35,10 @@ struct Qwen35Config {
     // Qwythos / Qwen3.5-9B dense hybrid GGUFs use a single SwiGLU FFN per layer
     // (ffn_gate/up/down) instead of routed experts.
     bool  dense_ffn   = false;
+
+    // Multi-Token Prediction (NextN) layers appended after the trunk in MTP GGUFs.
+    // n_layers counts trunk blocks only; MTP weights live in blk.{n_layers..}.
+    int   n_nextn_layers = 0;
 };
 
 } // namespace sparkinfer
