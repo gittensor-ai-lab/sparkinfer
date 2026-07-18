@@ -77,6 +77,18 @@ struct SamplingConfig {
     int top_k = 0;                   // 0 = no top-k truncation (full vocab)
     float repetition_penalty = 1.0f; // 1 = no penalty
     uint64_t seed = 0;               // 0 = seed from std::random_device
+
+    // Optional think/answer token budget split. Disabled unless reasoning_budget>0
+    // and both ids are valid (>=0). When enabled, generate() counts tokens emitted
+    // between think_open_id and think_close_id; once that count reaches
+    // reasoning_budget without think_close_id having appeared naturally, it
+    // force-injects think_close_id so the remaining max_new_tokens budget is
+    // guaranteed to be available for the answer instead of being consumed by
+    // reasoning. No effect if the model never emits think_open_id (e.g. thinking
+    // disabled for the request).
+    int reasoning_budget = 0;
+    int think_open_id = -1;
+    int think_close_id = -1;
 };
 
 // Single-sequence (batch=1) greedy decoder for Qwen MoE. Owns scratch buffers and

@@ -24,6 +24,9 @@ public:
     std::string decode(const std::vector<int>& ids) const;
     std::string decode_delta(std::vector<int>& acc, int new_id) const;
 
+    // Vocab id for `token`, or -1 if it isn't in the loaded tokenizer.
+    int token_id(const std::string& token) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

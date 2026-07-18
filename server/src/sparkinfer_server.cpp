@@ -28,6 +28,10 @@ constexpr int kSlotWaitMs = 30000;
 std::string g_api_key;
 std::string g_model_name = "qwen3.6-35b-a3b";
 sparkinfer_server::ChatTokenizer g_tokenizer;
+// Looked up once from the loaded tokenizer at startup (see main()); -1 if this
+// tokenizer has no such token, which disables reasoning-budget enforcement.
+int g_think_open_id = -1;
+int g_think_close_id = -1;
 // Real, enforced concurrency gate — the KV cache pool in model_engine.cpp is
 // sized for exactly this many concurrent full-length sequences (same env
 // var, read independently there), so this isn't just a request throttle,
@@ -224,6 +228,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[sparkinfer-server] %s\n", tok_err.c_str());
         return 1;
     }
+    g_think_open_id = g_tokenizer.token_id("<think>");
+    g_think_close_id = g_tokenizer.token_id("</think>");
 
     sparkinfer_server::ModelEngine engine;
     if (!engine.load(model_path, ctx > 0 ? ctx : 0)) return 1;
@@ -306,6 +312,23 @@ int main(int argc, char** argv) {
                  sampling.top_p = (float)json_get_double(req.body, "top_p", 1.0);
                  sampling.top_k = json_get_int(req.body, "top_k", 0);
                  sampling.repetition_penalty = (float)json_get_double(req.body, "repetition_penalty", 1.0);
+
+                 // thinking_budget_tokens reserves room for the answer: once this many
+                 // tokens have been generated inside <think>...</think>, force-close
+                 // reasoning so max_tokens - budget is guaranteed available for the
+                 // answer instead of being silently consumed by reasoning (see
+                 // SamplingConfig::reasoning_budget in qwen35.h). No-op when thinking
+                 // is disabled for this request, or when this tokenizer has no
+                 // <think>/</think> tokens.
+                 if (enable_thinking && g_think_open_id >= 0 && g_think_close_id >= 0) {
+                     int budget = json_get_int(req.body, "thinking_budget_tokens", 0);
+                     if (budget > 0) {
+                         if (budget >= max_tokens) budget = max_tokens > 1 ? max_tokens - 1 : 0;
+                         sampling.reasoning_budget = budget;
+                         sampling.think_open_id = g_think_open_id;
+                         sampling.think_close_id = g_think_close_id;
+                     }
+                 }
 
                  std::vector<int> prompt_ids;
                  std::string err;

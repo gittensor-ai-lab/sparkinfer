@@ -451,4 +451,9 @@ std::string ChatTokenizer::decode_delta(std::vector<int>& acc, int new_id) const
     return full;
 }
 
+int ChatTokenizer::token_id(const std::string& token) const {
+    if (!impl_->tok) return -1;
+    return impl_->tok->TokenToId(token);
+}
+
 }  // namespace sparkinfer_server

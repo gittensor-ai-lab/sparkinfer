@@ -1437,15 +1437,37 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     std::vector<float> logits_host;
     if (do_sample) logits_host.resize((size_t)s.cfg.vocab);
 
+    // Think/answer budget enforcement (see SamplingConfig::reasoning_budget):
+    // tracked purely by token-id comparison against the just-pushed token, no
+    // text decoding needed. seen_open latches once <think> is emitted so a
+    // request with thinking disabled (which never emits it) is untouched.
+    const bool enforce_budget = sampling != nullptr && sampling->reasoning_budget > 0 &&
+                                 sampling->think_open_id >= 0 && sampling->think_close_id >= 0;
+    bool seen_open = false;
+    bool seen_close = false;
+    int reasoning_tokens = 0;
+
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);
         if (next == s.cfg.eos_id) break;
+        if (enforce_budget) {
+            if (next == sampling->think_open_id) seen_open = true;
+            else if (next == sampling->think_close_id) seen_close = true;
+            else if (seen_open && !seen_close) reasoning_tokens++;
+        }
         const int argmax_next = forward_token(next, (int)prompt.size() + i, true);
         if (do_sample) {
             copy_logits(logits_host.data());
             next = sample_token_from_logits(logits_host, *sampling, out, rng);
         } else {
             next = argmax_next;
+        }
+        if (enforce_budget && seen_open && !seen_close && reasoning_tokens >= sampling->reasoning_budget) {
+            // Force-close reasoning: inject </think> in place of the naturally
+            // predicted token so the remaining budget goes to the answer. The
+            // model sees this injected id as its own output on the next step,
+            // same as teacher-forcing any other token.
+            next = sampling->think_close_id;
         }
         if (gov) gov->pace();
     }
