@@ -128,6 +128,29 @@ def push_bench_scripts(host, port):
                 pass
 
 
+def ensure_box_deps(host, port):
+    """Install build + accuracy deps on the eval box; fail closed if verification fails."""
+    setup = (
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "git config --global --add safe.directory /root/sparkinfer 2>/dev/null || true; "
+        "apt-get update -q; "
+        "apt-get install -y -q git curl cmake build-essential libisl23 python3-pip gcc-12 g++-12; "
+        "if ! command -v nvcc >/dev/null 2>&1; then "
+        "  apt-get install -y -q cuda-nvcc-12-8 cuda-cudart-dev-12-8 libcublas-dev-12-8 cuda-nvml-dev-12-8; "
+        "fi; "
+        "python3 -m pip install -q --break-system-packages -U pip; "
+        "python3 -m pip install -q --break-system-packages "
+        "huggingface_hub 'huggingface-hub[cli]' tokenizers; "
+        "python3 -c 'import tokenizers; print(\"tokenizers ok\")'; "
+        "command -v cmake; command -v g++-12; nvcc --version | head -1"
+    )
+    r = sh(host, port, setup, timeout=1800)
+    if r.returncode != 0:
+        tail = ((r.stdout or "") + (r.stderr or ""))[-1500:]
+        sys.exit(f"box setup failed (missing cmake/tokenizers/build deps):\n{tail}")
+    print(">> box deps verified (cmake, g++-12, nvcc, tokenizers)")
+
+
 def sh(host, port, cmd, timeout=3600):
     try:
         return subprocess.run(
@@ -502,14 +525,10 @@ def main():
                 f"git fetch -q origin '{branch}' && git checkout -qf FETCH_HEAD; "
                 f"fi"
             )
+        ensure_box_deps(host, port)
         # g++-12: nvcc 12.8 breaks against Ubuntu 24.04's GCC 13.3 libstdc++ (cstdio /__gnu_cxx
         # errors). The build pins CMAKE_CUDA_HOST_COMPILER=g++-12, so it must be present.
-        setup = ("export DEBIAN_FRONTEND=noninteractive; "
-                 "git config --global --add safe.directory /root/sparkinfer 2>/dev/null || true; "
-                 "(command -v git >/dev/null && command -v cmake >/dev/null && dpkg -s libisl23 >/dev/null 2>&1 && dpkg -s python3-pip >/dev/null 2>&1 && dpkg -s g++-12 >/dev/null 2>&1) "
-                 "|| (apt-get update -q && apt-get install -y -q git curl cmake build-essential libisl23 python3-pip gcc-12 g++-12); "
-                 "python3 -m pip install -q --break-system-packages huggingface_hub 'huggingface-hub[cli]' tokenizers >/dev/null 2>&1 || true; "
-                 f"if [ -d /root/sparkinfer/.git ]; then cd /root/sparkinfer && {checkout}; "
+        setup = (f"if [ -d /root/sparkinfer/.git ]; then cd /root/sparkinfer && {checkout}; "
                  f"else git clone -q {REPO} /root/sparkinfer && cd /root/sparkinfer && {checkout}; fi")
         sr = sh(host, port, setup, timeout=1800)
         if sr.returncode:

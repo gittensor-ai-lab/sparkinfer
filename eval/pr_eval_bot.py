@@ -251,6 +251,7 @@ DRAFT_STALE_DAYS   = int(os.environ.get("SPARKINFER_DRAFT_STALE_DAYS", "4"))
 STALE_CLOSE_SKIP_LABELS = {HOLD_LABEL, MERGE_FIRST_LABEL}  # protected from auto-close
 EXHAUSTED_EVAL_MAX = int(os.environ.get("SPARKINFER_EXHAUSTED_EVAL_MAX", "2"))
 FAIL_VERDICT_LABELS = frozenset({"none", "REJECT"})
+INFRA_LABEL = "infra-error"
 CONTEXT_LABELS     = {"128-context", "512-context", "4k-context", "16k-context", "32k-context",
                       "64k-context", "128k-context"}
 REGRESSION_LABELS  = {"regression-128", "regression-512", "regression-4k", "regression-16k",
@@ -577,6 +578,13 @@ def _eval_verdict_from_comment(body):
         return None
     m = re.search(r"\|\s*\*\*label\*\*\s*\|\s*`eval:([^`]+)`", body)
     return m.group(1) if m else None
+
+
+def _public_eval_label(res):
+    """GitHub label tier for a verdict — infra failures are not scored REJECTs."""
+    if res and res.get("infra_error"):
+        return INFRA_LABEL
+    return res.get("label") if res else None
 
 
 def none_reject_eval_count(repo, num):
@@ -1008,7 +1016,11 @@ def _best_prefill_measurement(block):
 
 def render(res, oid):
     label = res.get("label", "?")
-    icon = {"REJECT": "❌", "none": "⚪", "BASELINE": "📊"}.get(label, "✅")
+    display_label = _public_eval_label(res) or label
+    if res.get("infra_error"):
+        icon = "⚠️"
+    else:
+        icon = {"REJECT": "❌", "none": "⚪", "BASELINE": "📊"}.get(label, "✅")
     # A passing speedup (XL/L/M/S/XS) clears the significance gate, so its tps becomes the NEW frontier.
     advanced = label in {"XL", "L", "M", "S", "XS"} and res.get("pass")
     ctx_label = res.get("best_context_label")
@@ -1026,14 +1038,20 @@ def render(res, oid):
     if not short and scored_model:
         short = scored_model.split("-")[0]
     gname = res.get("guard_model", "Qwen3-30B")
-    rows = [f"| **label** | `eval:{label}` |"]
+    rows = [f"| **label** | `eval:{display_label}` |"]
     if bidir:
-        rows.append(f"| Qwen3.5 score | `eval-qwen35:{res.get('label_qwen35', '?')}` "
-                    f"({'pass' if res.get('pass_qwen35') else 'fail'}) |")
-        rows.append(f"| Qwen3.6 score | `eval-qwen36:{res.get('label_qwen36', '?')}` "
-                    f"({'pass' if res.get('pass_qwen36') else 'fail'}) |")
+        if res.get("infra_error"):
+            rows.append("| Qwen3.5 score | infra error (not graded) |")
+            rows.append("| Qwen3.6 score | infra error (not graded) |")
+        else:
+            rows.append(f"| Qwen3.5 score | `eval-qwen35:{res.get('label_qwen35', '?')}` "
+                        f"({'pass' if res.get('pass_qwen35') else 'fail'}) |")
+            rows.append(f"| Qwen3.6 score | `eval-qwen36:{res.get('label_qwen36', '?')}` "
+                        f"({'pass' if res.get('pass_qwen36') else 'fail'}) |")
         for title, block in [("Qwen3.5", res.get("score_qwen35") or {}),
                              ("Qwen3.6", res.get("score_qwen36") or {})]:
+            if res.get("infra_error"):
+                continue
             if not block:
                 continue
             bctx = block.get("best_context_label")
@@ -1121,7 +1139,7 @@ def render(res, oid):
             rows.append(f"| legacy 2k no-regression gate | {res.get('ctx_2048_tps')} tok/s"
                         f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
     # The Qwen3-30B no-regression guard — the check that actually gates a dual verdict.
-    if bidir:
+    if bidir and not res.get("infra_error"):
         for title, block in [("Qwen3.5 optimize", res.get("score_qwen35") or {}),
                              ("Qwen3.6 optimize", res.get("score_qwen36") or {})]:
             if not block:
@@ -1195,7 +1213,9 @@ def render(res, oid):
     if label == "REJECT" and res.get("auto_close") and not res.get("infra_error"):
         note = "No context cleared the 2% significance gate while at least one context regressed. Auto-closing this PR."
     if res.get("infra_error") or str(res.get("reason") or "").startswith("infra error"):
-        note = "Infra failure during eval (not a verified PR regression) — re-run recommended."
+        reason = str(res.get("reason") or "infra error").removeprefix("infra error: ").strip()
+        note = ("Infra failure during eval (not a verified PR regression) — re-run recommended."
+                + (f"\n\n`{reason}`" if reason else ""))
     target_note = ("128/512/4k/16k/32k guarded · Qwen3.5 prefill at 4k/32k/64k/128k · "
                    "Qwen3.6 prefill at 128/512/4k/16k/32k · scored vs same-box main"
                    if res.get("eval_mode") == "longctx" and res.get("mode") == "bidir"
@@ -2611,7 +2631,9 @@ def main():
                     f"— re-run manually.\n\n<details><summary>log tail</summary>\n\n```\n{log}\n```\n</details>")
             res, label = None, None
         else:
-            res = json.loads(line[len("RESULT_JSON "):]); label = res["label"]; body = render(res, oid)
+            res = json.loads(line[len("RESULT_JSON "):])
+            label = _public_eval_label(res)
+            body = render(res, oid)
             print(f"PR #{num}: {json.dumps(res)}")
 
             # --- Polaris: parse unsigned attestation from eval box, attest it, upload with eval log ---
@@ -2643,11 +2665,13 @@ def main():
             for lab in {l for l in cur if l.startswith("eval:") or l.startswith("eval-qwen")}:
                 remove_label(args.repo, num, lab)
             add_label(args.repo, num, f"eval:{label}")
-            if res and res.get("mode") == "bidir":
+            if res and res.get("mode") == "bidir" and not res.get("infra_error"):
                 if res.get("label_qwen35"):
                     add_label(args.repo, num, f"eval-qwen35:{res['label_qwen35']}")
                 if res.get("label_qwen36"):
                     add_label(args.repo, num, f"eval-qwen36:{res['label_qwen36']}")
+            elif res and res.get("infra_error"):
+                add_label(args.repo, num, REEVALUATE_LABEL)
             apply_context_label(args.repo, num, cur, res.get("best_context_label"))
             apply_regression_labels(args.repo, num, cur, res.get("regression_labels"))
             # This was just graded against the CURRENT main, so it's no longer stale: clear

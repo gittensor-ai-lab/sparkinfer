@@ -865,6 +865,33 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         body = bot.render({"label": "S", "pass": True, "tps": 200.0, "top1": 1.0, "kl": 0.0}, "df74674")
         self.assertEqual(bot._evaluated_commit_from_comment(body), "df74674")
 
+    def test_infra_error_public_label_and_render(self):
+        res = {
+            "label": "REJECT", "pass": False, "infra_error": True, "mode": "bidir",
+            "reason": "infra error: accuracy check produced no METRIC (ModuleNotFoundError: No module named 'tokenizers')",
+            "score_qwen35": {"tps": 0, "top1": 0, "kl": 99, "label": "REJECT", "pass": False, "infra_error": True},
+            "score_qwen36": {"tps": 0, "top1": 0, "kl": 99, "label": "REJECT", "pass": False, "infra_error": True},
+            "label_qwen35": "REJECT", "label_qwen36": "REJECT",
+        }
+        self.assertEqual(bot._public_eval_label(res), "infra-error")
+        body = bot.render(res, "e2d829a")
+        self.assertIn("`eval:infra-error`", body)
+        self.assertIn("infra error (not graded)", body)
+        self.assertNotIn("eval-qwen35:REJECT", body)
+        self.assertNotIn("Qwen3.5 optimize", body)
+        self.assertIn("tokenizers", body)
+
+    def test_none_reject_eval_count_ignores_infra_error(self):
+        infra_body = bot.render({
+            "label": "REJECT", "pass": False, "infra_error": True, "mode": "bidir",
+            "reason": "infra error: missing tokenizers",
+            "score_qwen35": {}, "score_qwen36": {},
+        }, "abc1234")
+        comments = [{"body": infra_body}]
+        gh_mock = mock.Mock(return_value=mock.Mock(stdout=json.dumps({"comments": comments})))
+        with mock.patch.object(bot, "gh", gh_mock):
+            self.assertEqual(bot.none_reject_eval_count("gittensor-ai-lab/sparkinfer", 531), 0)
+
     def test_evaluated_commit_from_comment_rejects_error_marker(self):
         body = ("<!-- sparkinfer-eval:df74674 -->\n"
                 "⚠️ **sparkinfer auto-eval errored** for `df74674` — re-run manually.")
