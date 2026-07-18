@@ -1,4 +1,5 @@
 #include "model_engine.hpp"
+#include "request_slots.hpp"
 
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/kv_cache.h"
@@ -80,13 +81,25 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     { const char* e = getenv("SPARKINFER_KV_INT8");
       kvc.int8_kv = e ? (e[0] != '0')
                       : (impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
+    // generate() reserves a full max_seq worth of blocks per request up front
+    // (Qwen35Model::generate -> kv->allocate(seq_id, cfg.max_seq)), not sized
+    // to the actual prompt/response length — so a pool sized for exactly one
+    // sequence can only ever serve one request at a time; a second concurrent
+    // request's allocate() call fails once the first has claimed the pool.
+    // Scale by the same slot count RequestSlots gates concurrency to (same env
+    // var, read independently here so the pool and the gate can't drift out
+    // of sync) so real concurrent requests actually have room, not just a
+    // gate that lets them in and then fails them.
+    const int max_concurrent = RequestSlots::from_env();
     const size_t epb = (size_t)16 * impl_->cfg.n_kv_heads * impl_->cfg.head_dim;
-    const size_t blocks = (size_t)impl_->cfg.max_seq / 16 + 8;
+    const size_t blocks_per_seq = (size_t)impl_->cfg.max_seq / 16 + 8;
+    const size_t blocks = blocks_per_seq * (size_t)max_concurrent;
     impl_->kv = std::make_unique<sparkinfer::KVCacheManager>(
         kvc, (size_t)impl_->cfg.n_layers * 2 * epb * 2 * blocks);
 
-    fprintf(stderr, "[sparkinfer-server] kv_cache: int8=%d blocks=%zu pool_budget=%.1f GiB\n",
-            kvc.int8_kv ? 1 : 0, blocks,
+    fprintf(stderr,
+            "[sparkinfer-server] kv_cache: int8=%d blocks=%zu (%d slots x %zu) pool_budget=%.1f GiB\n",
+            kvc.int8_kv ? 1 : 0, blocks, max_concurrent, blocks_per_seq,
             (double)impl_->cfg.n_layers * 2.0 * epb * 2.0 * blocks / (1024.0 * 1024.0 * 1024.0));
 
     sparkinfer::moe::MoEConfig mc;

@@ -1,5 +1,6 @@
 #include "chat_tokenizer.hpp"
 #include "model_engine.hpp"
+#include "request_slots.hpp"
 
 // Do not define CPPHTTPLIB_OPENSSL_SUPPORT — even `= 0` enables OpenSSL in httplib.
 #include "../third_party/httplib.h"
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -16,12 +18,22 @@
 
 namespace {
 
-constexpr int kMaxOutputTokens = 4096;
-constexpr int kMaxInputContext = 32768;
+constexpr int kMaxOutputTokens = 16384;
+constexpr int kMaxInputContext = 65536;
+// How long a request waits for a free concurrency slot before giving up and
+// returning 503 — bounded so a burst of requests queues briefly rather than
+// piling up httplib worker threads indefinitely.
+constexpr int kSlotWaitMs = 30000;
 
 std::string g_api_key;
 std::string g_model_name = "qwen3.6-35b-a3b";
 sparkinfer_server::ChatTokenizer g_tokenizer;
+// Real, enforced concurrency gate — the KV cache pool in model_engine.cpp is
+// sized for exactly this many concurrent full-length sequences (same env
+// var, read independently there), so this isn't just a request throttle,
+// it's what makes concurrent requests actually able to allocate KV space
+// instead of the 2nd+ one failing.
+sparkinfer_server::RequestSlots g_slots(sparkinfer_server::RequestSlots::from_env());
 
 std::string repo_root() {
     const char* env = getenv("SPARKINFER_ROOT");
@@ -285,7 +297,7 @@ int main(int argc, char** argv) {
                  const bool enable_thinking = sparkinfer_server::parse_enable_thinking(req.body, false);
                  int max_tokens = json_get_int(req.body, "max_tokens", 256);
                  if (max_tokens <= 0) max_tokens = 256;
-                 if (max_tokens > 4096) max_tokens = 4096;
+                 if (max_tokens > kMaxOutputTokens) max_tokens = kMaxOutputTokens;
 
                  // temperature<=0 (the default when the field is absent) keeps the original
                  // greedy-argmax decode path exactly as before — see SamplingConfig in qwen35.h.
@@ -313,6 +325,25 @@ int main(int argc, char** argv) {
                      return;
                  }
 
+                 // Real capacity gate, not just a throttle — the KV cache pool is sized for
+                 // exactly this many concurrent full-length sequences (model_engine.cpp), so
+                 // this is what makes a 2nd/3rd concurrent request able to actually allocate
+                 // KV space rather than failing once the 1st has claimed the whole pool.
+                 if (!g_slots.acquire(kSlotWaitMs)) {
+                     res.status = 503;
+                     res.set_content(
+                         "{\"error\":{\"message\":\"server busy — max concurrent requests (" +
+                         std::to_string(g_slots.max_slots()) + ") reached, try again shortly\"}}",
+                         "application/json");
+                     return;
+                 }
+                 // shared_ptr, not a bare SlotLease, because it needs to be captured into the
+                 // streaming lambda below, which httplib stores in a std::function — that
+                 // requires the target to be copy-constructible even though it's only ever
+                 // invoked from one place. The underlying slot still releases exactly once,
+                 // when the last copy (here or inside the lambda) is destroyed.
+                 auto lease = std::make_shared<sparkinfer_server::SlotLease>(&g_slots);
+
                  const std::string cid = random_id();
                  const auto created = (long long)std::chrono::duration_cast<std::chrono::seconds>(
                                         std::chrono::system_clock::now().time_since_epoch())
@@ -321,8 +352,8 @@ int main(int argc, char** argv) {
                  if (stream) {
                      res.set_chunked_content_provider(
                          "text/event-stream",
-                         [&engine, prompt_ids, max_tokens, cid, created, enable_thinking, sampling](size_t offset,
-                                                                                          httplib::DataSink& sink) {
+                         [&engine, prompt_ids, max_tokens, cid, created, enable_thinking, sampling,
+                          lease](size_t offset, httplib::DataSink& sink) {
                              if (offset > 0) {
                                  sink.done();
                                  return true;
