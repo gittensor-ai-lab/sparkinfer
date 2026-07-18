@@ -215,7 +215,10 @@ def _load_baseline_cache(box_id, max_age_hours=12):
 def _parse_only_prs(only_pr, only_prs):
     out = set()
     if only_pr:
-        out.add(int(only_pr))
+        for part in str(only_pr).split(","):
+            part = part.strip()
+            if part:
+                out.add(int(part))
     for part in (only_prs or "").split(","):
         part = part.strip()
         if part:
@@ -2182,8 +2185,8 @@ def main():
                     help="generate a Polaris verifiable receipt for each eval (default: on)")
     ap.add_argument("--no-polaris", action="store_true",
                     help="disable Polaris TDX receipts (overrides POLARIS=1)")
-    ap.add_argument("--only-pr", type=int, default=0,
-                    help="evaluate only this PR number (must be open)")
+    ap.add_argument("--only-pr", default="",
+                    help="evaluate only this PR number (comma-separated list ok, e.g. 531,511,530)")
     ap.add_argument("--only-prs", default="",
                     help="comma-separated PR numbers — one baseline, then eval each (e.g. 387,389)")
     ap.add_argument("--skip-baseline", action="store_true",

@@ -917,6 +917,7 @@ class PrEvalBotPolicyTest(unittest.TestCase):
 class OnlyPrsAndBaselineCacheTest(unittest.TestCase):
     def test_parse_only_prs(self):
         self.assertEqual(bot._parse_only_prs(387, ""), {387})
+        self.assertEqual(bot._parse_only_prs("531,511,530", ""), {531, 511, 530})
         self.assertEqual(bot._parse_only_prs(0, "387, 389"), {387, 389})
         self.assertEqual(bot._parse_only_prs(387, "389"), {387, 389})
 
