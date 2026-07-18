@@ -152,13 +152,15 @@ const std::string& ModelEngine::last_error() const {
     return last_error_;
 }
 
-std::vector<int> ModelEngine::complete(const std::vector<int>& prompt_ids, int max_new_tokens) {
-    return complete_streaming(prompt_ids, max_new_tokens, nullptr);
+std::vector<int> ModelEngine::complete(const std::vector<int>& prompt_ids, int max_new_tokens,
+                                       const sparkinfer::SamplingConfig* sampling) {
+    return complete_streaming(prompt_ids, max_new_tokens, nullptr, sampling);
 }
 
 std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_ids,
                                                  int max_new_tokens,
-                                                 const std::function<void(int)>& on_token) {
+                                                 const std::function<void(int)>& on_token,
+                                                 const sparkinfer::SamplingConfig* sampling) {
     std::lock_guard<std::mutex> lock(mu_);
     last_error_.clear();
     if (!impl_->ready || !impl_->model) {
@@ -196,7 +198,7 @@ std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_
     } else {
         impl_->model->clear_prefix_cache();
     }
-    std::vector<int> out = impl_->model->generate(prompt_ids, max_new_tokens, nullptr);
+    std::vector<int> out = impl_->model->generate(prompt_ids, max_new_tokens, nullptr, sampling);
     if (on_token) {
         for (int t : out) on_token(t);
     }

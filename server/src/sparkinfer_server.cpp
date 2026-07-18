@@ -65,6 +65,15 @@ int json_get_int(const std::string& body, const std::string& key, int def) {
     return atoi(body.c_str() + p + 1);
 }
 
+double json_get_double(const std::string& body, const std::string& key, double def) {
+    const std::string needle = "\"" + key + "\"";
+    size_t p = body.find(needle);
+    if (p == std::string::npos) return def;
+    p = body.find(':', p);
+    if (p == std::string::npos) return def;
+    return atof(body.c_str() + p + 1);
+}
+
 std::string json_escape(const std::string& s) {
     std::ostringstream o;
     for (unsigned char c : s) {
@@ -278,6 +287,14 @@ int main(int argc, char** argv) {
                  if (max_tokens <= 0) max_tokens = 256;
                  if (max_tokens > 4096) max_tokens = 4096;
 
+                 // temperature<=0 (the default when the field is absent) keeps the original
+                 // greedy-argmax decode path exactly as before — see SamplingConfig in qwen35.h.
+                 sparkinfer::SamplingConfig sampling;
+                 sampling.temperature = (float)json_get_double(req.body, "temperature", 0.0);
+                 sampling.top_p = (float)json_get_double(req.body, "top_p", 1.0);
+                 sampling.top_k = json_get_int(req.body, "top_k", 0);
+                 sampling.repetition_penalty = (float)json_get_double(req.body, "repetition_penalty", 1.0);
+
                  std::vector<int> prompt_ids;
                  std::string err;
                  if (!encode_messages(req.body, prompt_ids, enable_thinking, err)) {
@@ -304,7 +321,7 @@ int main(int argc, char** argv) {
                  if (stream) {
                      res.set_chunked_content_provider(
                          "text/event-stream",
-                         [&engine, prompt_ids, max_tokens, cid, created, enable_thinking](size_t offset,
+                         [&engine, prompt_ids, max_tokens, cid, created, enable_thinking, sampling](size_t offset,
                                                                                           httplib::DataSink& sink) {
                              if (offset > 0) {
                                  sink.done();
@@ -319,7 +336,7 @@ int main(int argc, char** argv) {
                                  write_stream_delta(sink, cid, created, "reasoning_content", delta.reasoning_content);
                                  write_stream_delta(sink, cid, created, "content", delta.content);
                              };
-                             engine.complete_streaming(prompt_ids, max_tokens, on_tok);
+                             engine.complete_streaming(prompt_ids, max_tokens, on_tok, &sampling);
                              sparkinfer_server::ThinkingStreamSplitter::Delta flush;
                              splitter.finish(flush);
                              write_stream_delta(sink, cid, created, "reasoning_content", flush.reasoning_content);
@@ -350,7 +367,7 @@ int main(int argc, char** argv) {
                      return;
                  }
 
-                 std::vector<int> gen = engine.complete(prompt_ids, max_tokens);
+                 std::vector<int> gen = engine.complete(prompt_ids, max_tokens, &sampling);
                  std::string text;
                  if (!engine.last_error().empty()) {
                      res.status = 400;

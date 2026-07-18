@@ -66,6 +66,19 @@ struct Qwen35Weights {
     std::vector<Qwen35LayerWeights> layers;
 };
 
+// Optional decode-time sampling. temperature <= 0 means "unset" — generate()
+// keeps its default deterministic argmax path untouched (eval/accuracy-gate
+// callers depend on that reproducibility) and none of the rest of this struct
+// is consulted. Only when temperature > 0 does generate() switch to CPU-side
+// temperature -> repetition-penalty -> top-k -> top-p -> multinomial sampling.
+struct SamplingConfig {
+    float temperature = 0.0f;
+    float top_p = 1.0f;              // 1 = no nucleus truncation
+    int top_k = 0;                   // 0 = no top-k truncation (full vocab)
+    float repetition_penalty = 1.0f; // 1 = no penalty
+    uint64_t seed = 0;               // 0 = seed from std::random_device
+};
+
 // Single-sequence (batch=1) greedy decoder for Qwen MoE. Owns scratch buffers and
 // drives embed -> N layers -> final norm -> LM head -> argmax per token.
 class Qwen35Model {
@@ -84,11 +97,14 @@ public:
     // dequantized per-layer at decode time (Q4_K_M-sized resident footprint).
     bool load_gguf(const std::string& path);
 
-    // Greedy generate: prompt token ids -> generated token ids (host). An optional ThermalGovernor
+    // Generate: prompt token ids -> generated token ids (host). An optional ThermalGovernor
     // paces decode under thermal pressure (accuracy-preserving); nullptr = full speed, no overhead.
     // When a prefix cache is installed (cache_prefix), skips re-prefilling the matching prefix.
+    // `sampling` is optional — nullptr (or temperature<=0) keeps the original greedy-argmax
+    // path exactly as before; a non-null config with temperature>0 switches to sampled decode.
     std::vector<int> generate(const std::vector<int>& prompt_ids, int max_new_tokens,
-                              ThermalGovernor* gov = nullptr);
+                              ThermalGovernor* gov = nullptr,
+                              const SamplingConfig* sampling = nullptr);
 
     // Prefill `tokens` and retain KV + hybrid recurrent state for reuse on the next request
     // whose prompt starts with the same token sequence. Returns false on allocation failure.

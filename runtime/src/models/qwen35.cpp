@@ -22,10 +22,12 @@
 #include "sparkinfer/kernels/proj_requant.h"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
+#include <random>
 #include <vector>
 #include <string>
 #include <fstream>
@@ -1335,7 +1337,74 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     return prefill_batched_run(ctx, prompt_ids, n);
 }
 
-std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
+namespace {
+
+// CPU-side temperature -> repetition-penalty -> top-k -> top-p -> multinomial
+// sample, given one step's full logit vector. Only reached when the caller
+// opted in with SamplingConfig::temperature > 0 (see generate()) — the
+// default argmax path never touches this. `logits` is mutated in place
+// (scratch reused each call from a caller-owned buffer); `recent` is the
+// tokens generated so far this request, used (bounded to the last 64) for
+// the repetition penalty.
+int sample_token_from_logits(std::vector<float>& logits, const SamplingConfig& cfg,
+                              const std::vector<int>& recent, std::mt19937_64& rng) {
+    const int vocab = (int)logits.size();
+
+    // Repetition penalty (llama.cpp/HF convention): positive logits are
+    // divided (pushed toward zero -> less likely), negative logits are
+    // multiplied (pushed more negative -> less likely). Bounded window so
+    // this stays cheap regardless of how long the generation has run.
+    if (cfg.repetition_penalty != 1.0f && !recent.empty()) {
+        constexpr int kRepeatWindow = 64;
+        const int start = (int)recent.size() > kRepeatWindow ? (int)recent.size() - kRepeatWindow : 0;
+        for (int i = start; i < (int)recent.size(); i++) {
+            const int tid = recent[(size_t)i];
+            if (tid < 0 || tid >= vocab) continue;
+            float& v = logits[(size_t)tid];
+            v = v > 0.0f ? v / cfg.repetition_penalty : v * cfg.repetition_penalty;
+        }
+    }
+
+    const float temp = cfg.temperature > 0.0f ? cfg.temperature : 1.0f;
+    for (float& v : logits) v /= temp;
+
+    // Top-k: partial_sort leaves the k highest logits in order[0..k), sorted
+    // descending — exactly the order the nucleus (top-p) pass below needs.
+    std::vector<int> order((size_t)vocab);
+    for (int i = 0; i < vocab; i++) order[(size_t)i] = i;
+    const int k = (cfg.top_k > 0 && cfg.top_k < vocab) ? cfg.top_k : vocab;
+    std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                       [&](int a, int b) { return logits[(size_t)a] > logits[(size_t)b]; });
+
+    // Softmax over the top-k survivors only (numerically stable: subtract max).
+    const float max_logit = logits[(size_t)order[0]];
+    std::vector<float> probs((size_t)k);
+    double sum = 0.0;
+    for (int i = 0; i < k; i++) {
+        probs[(size_t)i] = std::exp(logits[(size_t)order[(size_t)i]] - max_logit);
+        sum += probs[(size_t)i];
+    }
+    for (int i = 0; i < k; i++) probs[(size_t)i] = (float)(probs[(size_t)i] / sum);
+
+    // Top-p (nucleus): probs is already sorted descending, so this is just
+    // "keep the smallest prefix whose cumulative probability >= top_p".
+    int keep = k;
+    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+        double cum = 0.0;
+        for (int i = 0; i < k; i++) {
+            cum += probs[(size_t)i];
+            if (cum >= (double)cfg.top_p) { keep = i + 1; break; }
+        }
+    }
+
+    std::discrete_distribution<int> dist(probs.begin(), probs.begin() + keep);
+    return order[(size_t)dist(rng)];
+}
+
+}  // namespace
+
+std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov,
+                                        const SamplingConfig* sampling) {
     Impl& s = *p_;
     std::vector<int> out;
     if (prompt.empty()) return out;
@@ -1361,10 +1430,23 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         fprintf(stderr, "[qwen35] prompt prefill failed (start=%d n=%zu)\n", start, n);
         return out;
     }
+
+    const bool do_sample = sampling != nullptr && sampling->temperature > 0.0f;
+    std::mt19937_64 rng(do_sample && sampling->seed != 0 ? sampling->seed
+                                                          : std::random_device{}());
+    std::vector<float> logits_host;
+    if (do_sample) logits_host.resize((size_t)s.cfg.vocab);
+
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);
         if (next == s.cfg.eos_id) break;
-        next = forward_token(next, (int)prompt.size() + i, true);
+        const int argmax_next = forward_token(next, (int)prompt.size() + i, true);
+        if (do_sample) {
+            copy_logits(logits_host.data());
+            next = sample_token_from_logits(logits_host, *sampling, out, rng);
+        } else {
+            next = argmax_next;
+        }
         if (gov) gov->pace();
     }
 
