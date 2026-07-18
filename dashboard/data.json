@@ -140,6 +140,25 @@
   ],
   "prs": [
     {
+      "num": 511,
+      "title": "perf(qwen35): chunk-parallel GDN scan + vector-store int8 dequant + single-pass row quantize + skinny GEMM (+23% prefill pp)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "REJECT",
+      "tps": 0,
+      "delta_pct": null,
+      "top1": 0,
+      "kl": 99,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/511",
+      "model": "",
+      "polaris_receipt_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0511-74bafab",
+      "polaris_receipt_hash": "247ef62f151f6710",
+      "mode": "bidir",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0511-74bafab",
+      "proof_run": "0511-74bafab"
+    },
+    {
       "num": 474,
       "title": "perf(qwen35): int8-native prefill GEMM (mma.sync m16n8k32) for Qwythos",
       "areas": [
@@ -7436,51 +7455,6 @@
       "kl": 0.0096,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/237",
       "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0237-e490d89"
-    },
-    {
-      "num": 234,
-      "title": "perf(qwen3.6): Q8_0 on-read GEMV for dense projections (+8.9% decode, 128/512/4k)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "REJECT",
-      "tps": 187.81,
-      "delta_pct": -26.9,
-      "top1": 0.9631,
-      "kl": 0.015,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/234",
-      "model": "Qwen3.6-35B-A3B",
-      "eval_mode": "longctx",
-      "score_context": 128,
-      "best_context_label": "128-context",
-      "context_gains_pct": {
-        "128-context": 708.83,
-        "512-context": 703.84,
-        "4k-context": 676.25
-      },
-      "regression_labels": [],
-      "ctx_128_tps": 187.81,
-      "ctx_512_tps": 186.17,
-      "ctx_4096_tps": 178.77,
-      "ctx_16384_tps": 0.0,
-      "ctx_32768_tps": 0.0,
-      "guard_128_baseline": 23.22,
-      "guard_128_ratio": 8.0883,
-      "guard_128_pass": true,
-      "guard_512_baseline": 23.16,
-      "guard_512_ratio": 8.0384,
-      "guard_512_pass": true,
-      "guard_4k_baseline": 23.03,
-      "guard_4k_ratio": 7.7625,
-      "guard_4k_pass": true,
-      "guard_16k_baseline": 0.0,
-      "guard_16k_ratio": 0.0,
-      "guard_16k_pass": true,
-      "guard_32k_baseline": 0.0,
-      "guard_32k_ratio": 0.0,
-      "guard_32k_pass": true,
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0234-511c10e"
     }
   ],
   "landed": [
