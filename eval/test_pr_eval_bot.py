@@ -944,7 +944,21 @@ class OnlyPrsAndBaselineCacheTest(unittest.TestCase):
                           "score_qwen35": {"ctx_128_tps": 200, "ctx_4096_tps": 190,
                                            "ctx_32768_tps": 180, "ctx_65536_tps": 170}}}
         q36, q35 = {"128": 0}, {"128": 0}
-        self.assertFalse(bot._baseline_cache_valid(cache, True, q36, q35, "def5678"))
+        with mock.patch.object(bot, "_bench_harness_changed_between", return_value=True):
+            self.assertFalse(bot._baseline_cache_valid(cache, True, q36, q35, "def5678"))
+
+    def test_baseline_cache_valid_keeps_cache_when_only_eval_changed(self):
+        cache = {"bres": {"commit": "abc1234", "pass": True, "tps": 300.0,
+                          "score_qwen36": {"ctx_128_tps": 300, "ctx_512_tps": 290,
+                                           "ctx_4096_tps": 280, "ctx_16384_tps": 270,
+                                           "ctx_32768_tps": 260},
+                          "score_qwen35": {"ctx_128_tps": 200, "ctx_4096_tps": 190,
+                                           "ctx_32768_tps": 180, "ctx_65536_tps": 170,
+                                           "ctx_4096_pp_tps": 100, "ctx_32768_pp_tps": 90,
+                                           "ctx_65536_pp_tps": 80}}}
+        q36, q35 = {"128": 0}, {"128": 0}
+        with mock.patch.object(bot, "_bench_harness_changed_between", return_value=False):
+            self.assertTrue(bot._baseline_cache_valid(cache, True, q36, q35, "def5678"))
 
     def test_baseline_cache_valid_accepts_matching_main(self):
         bres = {

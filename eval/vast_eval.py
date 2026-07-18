@@ -137,6 +137,8 @@ def ensure_box_deps(host, port):
         "apt-get install -y -q git curl cmake build-essential libisl23 python3-pip gcc-12 g++-12; "
         "if ! command -v nvcc >/dev/null 2>&1; then "
         "  apt-get install -y -q cuda-nvcc-12-8 cuda-cudart-dev-12-8 libcublas-dev-12-8 cuda-nvml-dev-12-8; "
+        "elif [ ! -f /usr/local/cuda/include/nvml.h ] && [ ! -f /usr/local/cuda-12.8/include/nvml.h ]; then "
+        "  apt-get install -y -q cuda-nvml-dev-12-8; "
         "fi; "
         "python3 -m pip install -q --break-system-packages -U pip; "
         "python3 -m pip install -q --break-system-packages "

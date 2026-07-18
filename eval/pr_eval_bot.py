@@ -179,6 +179,16 @@ def _origin_main_short():
     return (r.stdout or "").strip() or None
 
 
+def _bench_harness_changed_between(old_commit, new_commit):
+    """True when bench/scripts differs between two main commits (needs fresh baseline)."""
+    if not old_commit or not new_commit or old_commit == new_commit:
+        return False
+    r = subprocess.run(
+        ["git", "-C", ROOT, "diff", "--quiet", f"{old_commit}..{new_commit}", "--", "bench/scripts"],
+        capture_output=True, text=True)
+    return r.returncode != 0
+
+
 def _baseline_cache_valid(cache, bidir, q36, q35, main_commit=None):
     """Return True when a loaded baseline cache entry is safe to reuse."""
     if not cache:
@@ -186,7 +196,8 @@ def _baseline_cache_valid(cache, bidir, q36, q35, main_commit=None):
     bres = cache.get("bres") or {}
     cached_commit = bres.get("commit")
     if main_commit and cached_commit and cached_commit != main_commit:
-        return False
+        if _bench_harness_changed_between(cached_commit, main_commit):
+            return False
     if bidir:
         probe36, probe35 = dict(q36), dict(q35)
         return (_apply_bidir_ctx_from_bres(bres, probe36, probe35)
@@ -2490,9 +2501,12 @@ def main():
         print(f">> --skip-baseline: no valid cache for {box_id} — aborting")
         return
     else:
-        if cache and main_commit and (cache.get("bres") or {}).get("commit") not in (None, main_commit):
-            print(f">> baseline cache stale (cached main={(cache.get('bres') or {}).get('commit')} "
-                  f"!= origin/main={main_commit}) — remeasuring")
+        if cache and main_commit:
+            cached_commit = (cache.get("bres") or {}).get("commit")
+            if (cached_commit and cached_commit != main_commit
+                    and _bench_harness_changed_between(cached_commit, main_commit)):
+                print(f">> baseline cache stale (bench/scripts changed {cached_commit}..{main_commit}) "
+                      f"— remeasuring")
         bcmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
                 *_vast_eval_transport_args(args.instance),
                 "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling),
