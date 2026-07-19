@@ -19,8 +19,14 @@ sha256_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 
 # compute capability -> CUDA arch (12.0 -> 120). RTX 5090 / PRO 6000 = 120, Spark/Thor = 121.
 detect_arch() {
-  local cc; cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')"
-  echo "${ARCH:-${cc:-120}}"
+  local cc arch="${ARCH:-}"
+  cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:].')"
+  if [[ ! "$cc" =~ ^[0-9]+$ ]]; then cc=120; fi
+  if [[ -n "$arch" && "$arch" =~ ^[0-9]+$ ]]; then
+    echo "$arch"
+  else
+    echo "$cc"
+  fi
 }
 
 # Bare-metal SSH boxes often install nvcc outside default PATH (non-interactive ssh).
