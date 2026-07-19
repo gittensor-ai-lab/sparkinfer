@@ -8867,8 +8867,8 @@ window.SPARKINFER = {
     "baseline_tps": 256.95,
     "ref_name": "llama.cpp",
     "ref_tps": 220.84,
-    "token_match": 0.9444,
-    "kl": 0.0405,
+    "token_match": 0.9298,
+    "kl": 0.0353,
     "note": "RTX 5090 instance 45189654 · sparkinfer main baseline 2026-07-18 · llama.cpp 6f4f53f",
     "ctx": [
       {
@@ -9083,19 +9083,19 @@ window.SPARKINFER = {
     "hf_avatar": "assets/img/huggingface.svg",
     "hf_downloads": 844561,
     "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
-    "frontier_tps": 473.27,
+    "frontier_tps": 476.54,
     "baseline_tps": 427.54,
     "ref_name": "llama.cpp",
     "ref_tps": 275.81,
-    "token_match": 0.9529,
-    "kl": 0.031,
+    "token_match": 0.9256,
+    "kl": 0.0366,
     "vram_gb": 22.1,
     "note": "RTX 5090 instance 45189654 · sparkinfer + llama.cpp baselines 2026-07-18 · commit 6f4f53f",
     "ctx": [
       {
         "label": "128",
         "color": "#D14D72",
-        "tps": 473.27,
+        "tps": 476.54,
         "ref_tps": 275.81
       },
       {
@@ -9123,7 +9123,7 @@ window.SPARKINFER = {
         "ref_tps": 279.83
       }
     ],
-    "prefill_frontier_pp": 536.72,
+    "prefill_frontier_pp": 1282.41,
     "baseline_pp": 536.72,
     "pp": [
       {
@@ -9141,22 +9141,23 @@ window.SPARKINFER = {
       {
         "label": "4k",
         "color": "#0E8A16",
-        "pp": 519.76,
+        "pp": 985.98,
         "ref_pp": 8726.13
       },
       {
         "label": "16k",
         "color": "#B8860B",
-        "pp": 504.46,
+        "pp": 1230.93,
         "ref_pp": 8389.7
       },
       {
         "label": "32k",
         "color": "#6F42C1",
-        "pp": 484.18,
+        "pp": 1282.41,
         "ref_pp": 7984.07
       }
-    ]
+    ],
+    "prefill_label": "XL"
   },
   "landed_qwen36": [
     {
@@ -9255,6 +9256,13 @@ window.SPARKINFER = {
       "tps": 463.27,
       "pr": 267,
       "date": "2026-07-13",
+      "label": "XL"
+    },
+    {
+      "name": "batched weight-amortized MoE",
+      "tps": 476.54,
+      "pr": 530,
+      "date": "2026-07-20",
       "label": "XL"
     }
   ],
