@@ -121,13 +121,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // (GGUF weights are already Q4_K/Q6_K -> int8 weight-quant is lossless vs what's stored). Default
     // ON at every batched context; SPARKINFER_PREFILL_I8=0 disables (A/B). The int8 scratch lives in
     // its own arena so an alloc failure at huge N degrades to the bf16 GEMMs, not to the token loop.
+    // Dense: int8 projections default ON. MoE: default OFF — the discrete top-k router amplifies the
+    // per-token int8 projection error into different expert selections, which diverges from the
+    // token-by-token path far more than in the dense FFN; bf16 projections keep the batched prefill
+    // faithful to the decode path. SPARKINFER_PREFILL_I8 overrides either way.
     const char* _pi8 = getenv("SPARKINFER_PREFILL_I8");
-    bool use_i8 = !(_pi8 && _pi8[0] == '0');
-    // Long-context fidelity: the near-1-decay GDN recurrence amplifies the per-row int8
+    // Dense: int8 projections default ON. MoE: default OFF — the discrete top-k router amplifies the
+    // per-token int8 projection error into different expert selections, which diverges from the
+    // token-by-token path far more than in the dense FFN; bf16 projections keep the batched MoE
+    // prefill faithful to the decode path. SPARKINFER_PREFILL_I8 overrides either way.
+    bool use_i8 = _pi8 ? (_pi8[0] != '0') : !moe;
+    // Long-context fidelity (dense): the near-1-decay GDN recurrence amplifies the per-row int8
     // activation-quant error across the sequence, so int8 prefill diverges from the token-by-token
     // path past ~96k (128k: top1 0.31 / KL 0.18). Above bf16_minctx (default 96k) fall back to bf16
-    // projections, which stay faithful (128k: top1 0.69 / KL 0.04) at ~half the prefill throughput —
-    // still ~26x the sequential token loop. Short/mid contexts keep int8 (full speed, unchanged).
+    // projections, which stay faithful (128k: top1 0.69 / KL 0.04) at ~half the prefill throughput.
     // SPARKINFER_PREFILL_BF16_MINCTX overrides the threshold.
     static int bf16_minctx = []{ const char* e = getenv("SPARKINFER_PREFILL_BF16_MINCTX"); return e ? atoi(e) : 98304; }();
     if (N > bf16_minctx) use_i8 = false;
