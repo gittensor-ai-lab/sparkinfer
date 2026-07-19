@@ -29,6 +29,13 @@ void launch_prefill_swiglu(const void* gate, const void* up, void* h, long n,
 void launch_prefill_add(const void* a, const void* b, void* out, long n,
                         cudaStream_t stream = nullptr);
 
+// MoE prefill finalize for the dequant-on-read routed path (bf16 routed accumulator):
+//   out[t,h] = routed[t,h] + dsw[t] * shared[t,h].  shared / dsw may be null; dsw is
+// already sigmoid-applied. See prefill_moe_finalize.cu.
+void launch_prefill_moe_finalize(const void* routed, const void* shared, const float* dsw,
+                                 void* out, int n_tokens, int hidden,
+                                 cudaStream_t stream = nullptr);
+
 // Split interleaved-per-head [q|gate]: qraw[N, 2*n_heads*hd] (each head is hd q then hd gate)
 // -> q[N, n_heads*hd], gate[N, n_heads*hd]. Matches split_q_gate_kernel, batched over tokens.
 void launch_prefill_split_q_gate(const void* qraw, void* q, void* gate,
