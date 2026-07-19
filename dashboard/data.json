@@ -8866,8 +8866,8 @@
     "baseline_tps": 256.95,
     "ref_name": "llama.cpp",
     "ref_tps": 220.84,
-    "token_match": 0.9036,
-    "kl": 0.0378,
+    "token_match": 0.9444,
+    "kl": 0.0405,
     "note": "RTX 5090 instance 45189654 · sparkinfer main baseline 2026-07-18 · llama.cpp 6f4f53f",
     "ctx": [
       {
@@ -8919,11 +8919,11 @@
       {
         "label": "128k",
         "color": "#17A2B8",
-        "pp": 288.54,
+        "pp": 6888.0,
         "ref_pp": 5999.59
       }
     ],
-    "baseline_pp": 288.54
+    "baseline_pp": 288.16
   },
   "landed_qwen35": [
     {
@@ -9058,6 +9058,22 @@
       "label": "XL",
       "tps": 303.18,
       "raw_tps": 296.27
+    },
+    {
+      "name": "batched weight-amortized MoE",
+      "pr": 530,
+      "date": "2026-07-20",
+      "label": "XL",
+      "tps": 303.18,
+      "raw_tps": 293.89
+    },
+    {
+      "name": "faithful batched prefill to ",
+      "pr": 531,
+      "date": "2026-07-20",
+      "label": "XL",
+      "tps": 303.18,
+      "raw_tps": 294.05
     }
   ],
   "qwen36": {
@@ -9300,6 +9316,22 @@
       "date": "2026-07-17",
       "label": "XL",
       "tps": 16083.38
+    },
+    {
+      "name": "batched weight-amortized MoE",
+      "pr": 530,
+      "date": "2026-07-20",
+      "label": "XL",
+      "tps": 16083.38,
+      "raw_tps": 6886.48
+    },
+    {
+      "name": "faithful batched prefill to ",
+      "pr": 531,
+      "date": "2026-07-20",
+      "label": "XL",
+      "tps": 16083.38,
+      "raw_tps": 6888.0
     }
   ]
 }
