@@ -44,12 +44,14 @@ __global__ void moe_scatter_kernel(const int* __restrict__ ids, const float* __r
     perm_w[pos]   = w[p];
 }
 
-// gather: x_perm[p,:] = src[perm_src[p],:]
+// gather: x_perm[p,:] = src[perm_src[p],:].  P on grid.x (up to 2^31) — grid.y max is only 65535 and
+// P = N*top_k exceeds it for N >= 8192.
 __global__ void moe_gather_kernel(const bf16* __restrict__ src, const int* __restrict__ perm_src,
                                   bf16* __restrict__ x_perm, int P, int dim) {
-    const int p = blockIdx.y;
+    const int p = blockIdx.x;
+    if (p >= P) return;
     const int t = perm_src[p];
-    for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < dim; d += blockDim.x * gridDim.x)
+    for (int d = blockIdx.y * blockDim.x + threadIdx.x; d < dim; d += blockDim.x * gridDim.y)
         x_perm[(size_t)p * dim + d] = src[(size_t)t * dim + d];
 }
 
@@ -73,10 +75,11 @@ __global__ void moe_sched_kernel(const int* __restrict__ offsets, int* __restric
 __global__ void moe_scatter_weighted_kernel(const bf16* __restrict__ y, const int* __restrict__ perm_src,
                                             const float* __restrict__ perm_w, float* __restrict__ out,
                                             int P, int H) {
-    const int p = blockIdx.y;
+    const int p = blockIdx.x;                 // P on grid.x (grid.y max 65535 < P for N >= 8192)
+    if (p >= P) return;
     const int t = perm_src[p];
     const float w = perm_w[p];
-    for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < H; d += blockDim.x * gridDim.x)
+    for (int d = blockIdx.y * blockDim.x + threadIdx.x; d < H; d += blockDim.x * gridDim.y)
         atomicAdd(&out[(size_t)t * H + d], w * b2f(y[(size_t)p * H + d]));
 }
 
@@ -229,7 +232,7 @@ void launch_moe_prefill_permute(const int* expert_ids, const float* expert_weigh
 
 void launch_moe_prefill_gather(const void* src, const int* perm_src, void* x_perm,
                                int P, int dim, cudaStream_t stream) {
-    dim3 grid((dim + 255) / 256, P);
+    dim3 grid(P, (dim + 255) / 256);
     moe_gather_kernel<<<grid, 256, 0, stream>>>(
         reinterpret_cast<const bf16*>(src), perm_src, reinterpret_cast<bf16*>(x_perm), P, dim);
 }
@@ -259,7 +262,7 @@ void launch_moe_prefill_swiglu(const void* gate, const void* up, void* h, long n
 
 void launch_moe_prefill_scatter_weighted(const void* y, const int* perm_src, const float* perm_w,
                                          void* out, int P, int H, cudaStream_t stream) {
-    dim3 grid((H + 255) / 256, P);
+    dim3 grid(P, (H + 255) / 256);
     moe_scatter_weighted_kernel<<<grid, 256, 0, stream>>>(
         reinterpret_cast<const bf16*>(y), perm_src, perm_w, reinterpret_cast<float*>(out), P, H);
 }
