@@ -163,6 +163,12 @@ crontab -l 2>/dev/null; echo "0 */2 * * * $PWD/eval/run_bot_cron.sh >> /tmp/spar
 Each run: reuse the pinned `--reuse` instance → evaluate new PR commits → label + comment (instance
 stays running). Disable with `crontab -e`. Needs `gh` authenticated and a vast instance id (`VAST_INSTANCE`).
 
+**Dashboard.** Eval verdicts and frontier updates are committed to
+[`gittensor-ai-lab/sparkinfer-web`](https://github.com/gittensor-ai-lab/sparkinfer-web)
+(`public/dashboard/data.json`), not to this repo's `dashboard/`. Override with
+`SPARKINFER_WEB_REPO` / `SPARKINFER_WEB_DIR` / `SPARKINFER_WEB_BRANCH` (default branch:
+`feat/landing-page`).
+
 **Dashboard merge-sync (no GPU).** The heavy eval cron may not run for hours, and `record_merge()`
 only used to fire for merged PRs that still had `merge-first`. Run `run_sync_cron.sh` every 15 min
 alongside it — it syncs **any recently merged PR** that has dashboard eval data onto the

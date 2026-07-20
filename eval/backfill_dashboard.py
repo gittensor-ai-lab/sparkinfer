@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Apply a stored eval RESULT_JSON to dashboard/data.json (no git push).
+"""Apply a stored eval RESULT_JSON to sparkinfer-web public/dashboard/data.json (no git push).
+
+Writes into the local SPARKINFER_WEB_DIR checkout (default ~/.sparkinfer_web_checkout).
+Push is disabled here — use the eval bot, or commit/push the web repo manually.
 
 Usage:
   python3 eval/backfill_dashboard.py --pr 294 --run 0294-cf2fd83
