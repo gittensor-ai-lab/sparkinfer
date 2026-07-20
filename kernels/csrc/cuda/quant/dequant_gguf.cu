@@ -133,10 +133,58 @@ __device__ __forceinline__ float deq_q6k_val(const unsigned char* blk, int t) {
     return d * sc[is + 2 * quad] * qv;
 }
 
-template <int QT>   // 12 = Q4_K (144B), 13 = Q5_K (176B), 14 = Q6_K (210B) per superblock
+// Single-pass Q→i8 for cols ≤ 2048 (Qwen3.6 MoE H/mffn). Values live in registers
+// (templated NSB) so the int8 rows are bit-identical to the two-pass kernel — same
+// dequant, same amax reduce, same roundf — while skipping the second decode pass.
+// Wider rows (Qwythos attn K=4096, FFN K=12288) keep two-pass so we never reject the
+// i8 path (the previous cols>4096 early-return regressed Qwythos @4k prefill ~10%).
+static constexpr int kDeqRowsI8MaxNsb = 8;
+
+template <int QT, int NSB>   // QT: 12=Q4_K, 13=Q5_K, 14=Q6_K; NSB = cols/256
 __global__ void deq_rows_i8_kernel(const unsigned char* __restrict__ src,
                                    signed char* __restrict__ q, float* __restrict__ scale,
                                    int cols) {
+    constexpr int BS = (QT == 12) ? 144 : (QT == 13) ? 176 : 210;
+    const int row = blockIdx.x, t = threadIdx.x;
+    const unsigned char* rbase = src + (size_t)row * NSB * BS;
+
+    float vals[NSB];
+    float amax = 0.f;
+    #pragma unroll
+    for (int sb = 0; sb < NSB; sb++) {
+        const unsigned char* blk = rbase + (size_t)sb * BS;
+        const float v = (QT == 12) ? deq_q4k_val(blk, t)
+                      : (QT == 13) ? deq_q5k_val(blk, t) : deq_q6k_val(blk, t);
+        vals[sb] = v;
+        amax = fmaxf(amax, fabsf(v));
+    }
+    __shared__ float swarp[8];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((t & 31) == 0) swarp[t >> 5] = amax;
+    __syncthreads();
+    if (t < 32) {
+        float v = (t < 8) ? swarp[t] : 0.f;
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (t == 0) swarp[0] = v;
+    }
+    __syncthreads();
+    const float d = swarp[0] / 127.f;
+    if (t == 0) scale[row] = d;
+    const float inv = (d > 0.f) ? (1.f / d) : 0.f;
+
+    signed char* qrow = q + (size_t)row * cols;
+    #pragma unroll
+    for (int sb = 0; sb < NSB; sb++)
+        qrow[sb * 256 + t] = (signed char)(int)roundf(vals[sb] * inv);
+}
+
+// Two-pass fallback for cols > 2048 (Qwythos projections). Same math as above.
+template <int QT>
+__global__ void deq_rows_i8_twopass_kernel(const unsigned char* __restrict__ src,
+                                           signed char* __restrict__ q, float* __restrict__ scale,
+                                           int cols) {
     constexpr int BS = (QT == 12) ? 144 : (QT == 13) ? 176 : 210;
     const int row = blockIdx.x, t = threadIdx.x;
     const int nsb = cols >> 8;
@@ -220,10 +268,34 @@ bool launch_gguf_dequant_rows_i8(int ggml_type, const void* src, signed char* q,
                                  int rows, int cols, cudaStream_t stream) {
     if ((cols & 255) != 0) return false;
     auto* s = reinterpret_cast<const unsigned char*>(src);
-    if (ggml_type == GGML_Q4_K)      deq_rows_i8_kernel<12><<<rows, 256, 0, stream>>>(s, q, scale, cols);
-    else if (ggml_type == GGML_Q5_K) deq_rows_i8_kernel<13><<<rows, 256, 0, stream>>>(s, q, scale, cols);
-    else if (ggml_type == GGML_Q6_K) deq_rows_i8_kernel<14><<<rows, 256, 0, stream>>>(s, q, scale, cols);
-    else return false;
+    const int nsb = cols >> 8;
+    if (nsb > 0 && nsb <= kDeqRowsI8MaxNsb) {
+        // Explicit NSB instantiations keep vals[] in registers (bit-same as two-pass).
+        #define SI_LAUNCH(QT, NSB) deq_rows_i8_kernel<QT, NSB><<<rows, 256, 0, stream>>>(s, q, scale, cols)
+        #define SI_BY_NSB(QT) \
+            switch (nsb) { \
+                case 1: SI_LAUNCH(QT, 1); break; \
+                case 2: SI_LAUNCH(QT, 2); break; \
+                case 3: SI_LAUNCH(QT, 3); break; \
+                case 4: SI_LAUNCH(QT, 4); break; \
+                case 5: SI_LAUNCH(QT, 5); break; \
+                case 6: SI_LAUNCH(QT, 6); break; \
+                case 7: SI_LAUNCH(QT, 7); break; \
+                default: SI_LAUNCH(QT, 8); break; \
+            }
+        if (ggml_type == GGML_Q4_K)      { SI_BY_NSB(12); }
+        else if (ggml_type == GGML_Q5_K) { SI_BY_NSB(13); }
+        else if (ggml_type == GGML_Q6_K) { SI_BY_NSB(14); }
+        else return false;
+        #undef SI_BY_NSB
+        #undef SI_LAUNCH
+    } else {
+        // Qwythos attn/FFN: keep two-pass so i8 GEMM still engages (do not return false).
+        if (ggml_type == GGML_Q4_K)      deq_rows_i8_twopass_kernel<12><<<rows, 256, 0, stream>>>(s, q, scale, cols);
+        else if (ggml_type == GGML_Q5_K) deq_rows_i8_twopass_kernel<13><<<rows, 256, 0, stream>>>(s, q, scale, cols);
+        else if (ggml_type == GGML_Q6_K) deq_rows_i8_twopass_kernel<14><<<rows, 256, 0, stream>>>(s, q, scale, cols);
+        else return false;
+    }
     return true;
 }
 
