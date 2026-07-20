@@ -881,6 +881,21 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertNotIn("Qwen3.5 optimize", body)
         self.assertIn("tokenizers", body)
 
+    def test_bidir_public_label_reject_beats_passing_xl(self):
+        """PR #555: Qwen3.5 REJECT must headline over Qwen3.6 XL."""
+        res = {
+            "mode": "bidir", "label": "XL", "pass": True,
+            "label_qwen35": "REJECT", "pass_qwen35": False,
+            "label_qwen36": "XL", "pass_qwen36": True,
+            "score_qwen35": {"label": "REJECT", "pass": False, "tps": 283.06},
+            "score_qwen36": {"label": "XL", "pass": True, "tps": 3388.88},
+        }
+        self.assertEqual(bot._public_eval_label(res), "REJECT")
+        body = bot.render(res, "dc22645")
+        self.assertIn("`eval:REJECT`", body)
+        self.assertIn("eval-qwen35:REJECT", body)
+        self.assertIn("eval-qwen36:XL", body)
+
     def test_none_reject_eval_count_ignores_infra_error(self):
         infra_body = bot.render({
             "label": "REJECT", "pass": False, "infra_error": True, "mode": "bidir",

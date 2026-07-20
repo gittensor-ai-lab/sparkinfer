@@ -59,6 +59,17 @@ class BidirHeadlineTest(unittest.TestCase):
         self.assertEqual(out["label"], "REJECT")
         self.assertFalse(out["pass"])
 
+    def test_reject_beats_passing_xl(self):
+        """PR #555-shaped: Qwen3.6 XL must not headline over Qwen3.5 REJECT (128k-pp regression)."""
+        q35 = {"label": "REJECT", "pass": False, "tps": 283.06,
+               "reason": "128k-context prefill no-regression gate"}
+        q36 = {"label": "XL", "pass": True, "tps": 3388.88}
+        out = pick_headline(q35, q36)
+        self.assertEqual(out["label"], "REJECT")
+        self.assertFalse(out["pass"])
+        out_swap = pick_headline(q36, q35)
+        self.assertEqual(out_swap["label"], "REJECT")
+
     def test_both_pass_picks_best_tier(self):
         q35 = {"label": "none", "pass": True, "tps": 283.0}
         q36 = {"label": "L", "pass": True, "tps": 480.0}

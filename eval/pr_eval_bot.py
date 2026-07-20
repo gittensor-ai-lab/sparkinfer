@@ -598,10 +598,28 @@ def _eval_verdict_from_comment(body):
 
 
 def _public_eval_label(res):
-    """GitHub label tier for a verdict — infra failures are not scored REJECTs."""
-    if res and res.get("infra_error"):
+    """GitHub label tier for a verdict — infra failures are not scored REJECTs.
+
+    Bidir: either-side fail headlines from the failing side (REJECT preferred), so a passing
+    Qwen3.6 XL cannot paper over a Qwen3.5 regression (PR #555).
+    """
+    if not res:
+        return None
+    if res.get("infra_error"):
         return INFRA_LABEL
-    return res.get("label") if res else None
+    if res.get("mode") == "bidir" or res.get("score_qwen35") or res.get("score_qwen36"):
+        sides = (
+            res.get("score_qwen35") or {"label": res.get("label_qwen35"), "pass": res.get("pass_qwen35")},
+            res.get("score_qwen36") or {"label": res.get("label_qwen36"), "pass": res.get("pass_qwen36")},
+        )
+        if any(s.get("pass") is False for s in sides):
+            for s in sides:
+                if s.get("pass") is False and s.get("label") == "REJECT":
+                    return "REJECT"
+            for s in sides:
+                if s.get("pass") is False and s.get("label"):
+                    return s["label"]
+    return res.get("label")
 
 
 def none_reject_eval_count(repo, num):
@@ -2723,6 +2741,11 @@ def main():
         else:
             res = json.loads(line[len("RESULT_JSON "):])
             label = _public_eval_label(res)
+            # Keep RESULT_JSON fields consistent with the public headline (bidir either-side REJECT).
+            if label and res.get("label") != label:
+                res["label"] = label
+                if label == "REJECT":
+                    res["pass"] = False
             body = render(res, oid)
             print(f"PR #{num}: {json.dumps(res)}")
 

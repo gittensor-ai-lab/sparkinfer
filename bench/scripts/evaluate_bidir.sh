@@ -542,11 +542,7 @@ def pick_best(a, b):
     return a if float(a.get("tps") or 0) >= float(b.get("tps") or 0) else b
 
 def pick_headline(a, b):
-    """Headline verdict: a failing optimize run must not lose to the other's none."""
-    if a.get("pass") and not b.get("pass"):
-        return dict(a)
-    if b.get("pass") and not a.get("pass"):
-        return dict(b)
+    """Headline verdict: either-side fail blocks merge; REJECT beats a passing XL/L/… from the other model."""
     if not a.get("pass") or not b.get("pass"):
         for s in (a, b):
             if s.get("infra_error"):
