@@ -117,7 +117,7 @@ score. These paths are protected:
 | `eval/` | the PR-evaluation bot + GPU runner |
 | `bench/scripts/` | the on-box scoring harness (`evaluate.sh`, `label.py`, `accuracy*`, `_common.sh`, the eval prompt) |
 | `.gittensor/` | intra-repo emission weights |
-| `dashboard/data.json` | the live frontier ledger |
+| `sparkinfer-web` `public/dashboard/data.json` | the live frontier ledger (eval bot pushes here; in-repo `dashboard/` is legacy) |
 | `.github/` | CI, `CODEOWNERS`, and this guard |
 
 **Enforcement.** A required **`sensitive-paths-guard`** check automatically fails any PR from a
