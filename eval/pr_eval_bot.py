@@ -1445,6 +1445,8 @@ def update_dashboard(repo, pr, areas, res, proof_url=None):
               "regression_labels", "auto_close",
               "mode", "label_qwen35", "label_qwen36", "pass_qwen35", "pass_qwen36",
               "score_qwen35", "score_qwen36",
+              # Headline metric so the dashboard can split Evaluated PRs into decode vs prefill.
+              "score_metric", "prefill_label", "prefill_tps", "decode_label", "decode_tps",
               "ctx_128_tps", "ctx_512_tps", "ctx_2048_tps", "ctx_4096_tps",
               "ctx_16384_tps", "ctx_32768_tps",
               "guard_128_baseline", "guard_128_ratio", "guard_128_pass",

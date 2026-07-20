@@ -228,6 +228,11 @@
   th{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600}
   .prs-table-wrap{max-height:440px;overflow:auto;-webkit-overflow-scrolling:touch}
   .prs-table-wrap thead th{position:sticky;top:0;background:var(--card);z-index:1;box-shadow:0 1px 0 var(--line)}
+  .prs-group{margin-top:18px}
+  .prs-group:first-of-type{margin-top:0}
+  .prs-group-h{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 0 10px}
+  .prs-group-h h3{font-family:"Sora",sans-serif;font-size:15px;font-weight:800;color:var(--title);margin:0}
+  .prs-group-h .hint{font-size:12px;color:var(--muted)}
   .empty{text-align:center;color:var(--muted);padding:30px;font-size:14px}
   .tag{font-size:11.5px;font-weight:700;color:#fff;padding:2px 8px;border-radius:6px}
   .area{font-size:11.5px;border:1px solid var(--line);color:var(--body);padding:2px 8px;border-radius:6px;margin-right:4px}
@@ -443,8 +448,15 @@
   </section>
 
   <section>
-    <div class="sec-h"><h2>Evaluated PRs</h2><span class="hint">bot labels + comments · never auto-merges</span></div>
-    <div class="card prs-table-wrap"><table><thead><tr><th>PR</th><th>area</th><th>label</th><th>decode</th><th>vs frontier</th><th>proof</th></tr></thead><tbody id="prs"></tbody></table></div>
+    <div class="sec-h"><h2>Evaluated PRs</h2><span class="hint">bot labels + comments · never auto-merges · split by scored metric</span></div>
+    <div class="prs-group">
+      <div class="prs-group-h"><h3>Decode</h3><span class="hint" id="prs-decode-count">tok/s · strongest decode context</span></div>
+      <div class="card prs-table-wrap"><table><thead><tr><th>PR</th><th>area</th><th>label</th><th>tok/s</th><th>vs frontier</th><th>proof</th></tr></thead><tbody id="prs-decode"></tbody></table></div>
+    </div>
+    <div class="prs-group">
+      <div class="prs-group-h"><h3>Prefill</h3><span class="hint" id="prs-prefill-count">pp tok/s · strongest prefill context</span></div>
+      <div class="card prs-table-wrap"><table><thead><tr><th>PR</th><th>area</th><th>label</th><th>pp tok/s</th><th>vs frontier</th><th>proof</th></tr></thead><tbody id="prs-prefill"></tbody></table></div>
+    </div>
   </section>
 
   <footer>
@@ -842,22 +854,61 @@
   const proofRun = p => p.proof_run || ((p.proof_url||"").match(/[?&]run=([^&]+)/)||[])[1] || "log";
   const proofIcon = p => p.polaris_receipt_url ? "🛡️" : "📋";
   const proofTitle = p => p.polaris_receipt_url ? "Polaris TDX attested eval log" : "verifiable eval log";
-  $("prs").innerHTML = D.prs.length ? D.prs.map(p=>`
+  // Classify by the metric that actually set the headline label (decode tok/s vs prefill pp).
+  const prScoreMetric = p => {
+    if (p.score_metric === "prefill" || p.score_metric === "decode") return p.score_metric;
+    const blocks = [p.score_qwen35, p.score_qwen36].filter(Boolean);
+    const SPEED = new Set(["XL", "L", "M", "S", "XS"]);
+    // Prefer Prefill when either model verified (or annotated) a prefill speed tier — even if the
+    // headline is REJECT from the other direction's decode correctness gate.
+    if (blocks.some(b => b.score_metric === "prefill" && (SPEED.has(b.label) || SPEED.has(b.prefill_label))))
+      return "prefill";
+    if (blocks.some(b => SPEED.has(b.prefill_label))) return "prefill";
+    const byTps = blocks.find(b => b.tps != null && p.tps != null && Math.abs(Number(b.tps) - Number(p.tps)) < 0.05);
+    if (byTps && (byTps.score_metric === "prefill" || byTps.score_metric === "decode")) return byTps.score_metric;
+    const byLabel = blocks.find(b => b.label === p.label && (b.score_metric === "prefill" || b.score_metric === "decode"));
+    if (byLabel) return byLabel.score_metric;
+    if (blocks.some(b => b.score_metric === "prefill") && Number(p.tps || 0) >= 800) return "prefill";
+    if (/prefill/i.test(p.title || "")) return "prefill";
+    return "decode";
+  };
+  const prSpeed = (p, metric) => {
+    if (metric === "prefill") {
+      const blocks = [p.score_qwen35, p.score_qwen36].filter(Boolean);
+      const pf = blocks.find(b => b.score_metric === "prefill" && b.tps != null)
+        || blocks.find(b => b.prefill_tps != null);
+      if (pf?.score_metric === "prefill" && pf.tps != null) return { tps: pf.tps, delta: pf.pct_over_frontier, label: pf.label };
+      if (pf?.prefill_tps != null) return { tps: pf.prefill_tps, delta: pf.prefill_pct_over_frontier, label: pf.prefill_label || p.label };
+    }
+    return { tps: p.tps, delta: p.delta_pct, label: p.label };
+  };
+  const prRow = (p, metric) => {
+    const speed = prSpeed(p, metric);
+    const label = speed.label || p.label;
+    return `
     <tr><td><a href="${p.url||'#'}">#${p.num}</a> ${p.title||''}</td>
     <td>${(p.areas||[]).map(a=>`<span class="area">${a}</span>`).join("")||"—"}</td>
-    <td><span class="tag" style="background:${lc[p.label]||'#888'}">${p.label}</span></td>
-    <td>${p.tps??"—"}</td><td>${p.delta_pct!=null?(p.delta_pct>0?"+":"")+p.delta_pct+"%":"—"}</td>
-    <td>${p.proof_url?`<a href="${p.proof_url}" target="_blank" title="${proofTitle(p)}" class="mono">${proofIcon(p)} ${proofRun(p)}</a>`:"—"}</td></tr>`).join("")
-    : `<tr><td colspan="6" class="empty">No PRs evaluated yet — open one and the bot posts an <code>eval:&lt;label&gt;</code> within ~30 min.</td></tr>`;
-  (function(){
-    const wrap = document.querySelector(".prs-table-wrap");
-    const rows = wrap?.querySelectorAll("tbody tr");
-    if (!wrap || !rows?.length || rows.length <= 10) return;
+    <td><span class="tag" style="background:${lc[label]||'#888'}">${label}</span></td>
+    <td>${speed.tps??"—"}</td><td>${speed.delta!=null?(speed.delta>0?"+":"")+speed.delta+"%":"—"}</td>
+    <td>${p.proof_url?`<a href="${p.proof_url}" target="_blank" title="${proofTitle(p)}" class="mono">${proofIcon(p)} ${proofRun(p)}</a>`:"—"}</td></tr>`;
+  };
+  const emptyRow = kind =>
+    `<tr><td colspan="6" class="empty">No ${kind} PRs evaluated yet — open one and the bot posts an <code>eval:&lt;label&gt;</code> within ~30 min.</td></tr>`;
+  const decodePrs = [], prefillPrs = [];
+  for (const p of (D.prs || [])) (prScoreMetric(p) === "prefill" ? prefillPrs : decodePrs).push(p);
+  $("prs-decode").innerHTML = decodePrs.length ? decodePrs.map(p => prRow(p, "decode")).join("") : emptyRow("decode");
+  $("prs-prefill").innerHTML = prefillPrs.length ? prefillPrs.map(p => prRow(p, "prefill")).join("") : emptyRow("prefill");
+  const decodeHint = $("prs-decode-count"), prefillHint = $("prs-prefill-count");
+  if (decodeHint) decodeHint.textContent = `${decodePrs.length} PR${decodePrs.length===1?"":"s"} · tok/s · strongest decode context`;
+  if (prefillHint) prefillHint.textContent = `${prefillPrs.length} PR${prefillPrs.length===1?"":"s"} · pp tok/s · strongest prefill context`;
+  document.querySelectorAll(".prs-table-wrap").forEach(wrap => {
+    const rows = wrap.querySelectorAll("tbody tr");
+    if (!rows.length || rows.length <= 10) return;
     const head = wrap.querySelector("thead");
     let h = head ? head.offsetHeight : 0;
     for (let i = 0; i < 10; i++) h += rows[i].offsetHeight;
     wrap.style.maxHeight = h + "px";
-  })();
+  });
 </script>
 </body>
 </html>

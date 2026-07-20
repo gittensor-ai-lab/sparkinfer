@@ -18,7 +18,7 @@ Companion surfaces:
 - **SOTA spotlight** — Qwen3.6-35B-A3B frontier stats at the top
 - **Optimization journey** — tok/s per landed kernel optimization
 - **vs llama.cpp** — same GGUF, per-context decode on RTX 5090
-- **Evaluated PRs** — bot labels, never auto-merges
+- **Evaluated PRs** — bot labels, split into **Decode** vs **Prefill** tables (by scored metric)
 
 Current frontier (v0.4.1, Qwen3.6 SOTA): **473 tok/s @ 128 ctx · +71%** vs llama.cpp.
 
