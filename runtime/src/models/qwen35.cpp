@@ -1106,11 +1106,10 @@ bool prefill_samples_lmhead() {
     return legacy != 0;
 }
 
-// Batched prefill (prefill_batched_run). Default ON; SPARKINFER_PREFILL_BATCHED=0 disables. Supports
-// the Qwythos dense-hybrid AND the Qwen3.6-35B-A3B MoE hybrid (dense_ffn=false, n_experts>0) — both
-// share the GDN + attention batched kernels; only the FFN differs. From position 0 only.
+// Qwythos dense-hybrid batched prefill (prefill_batched_run). Default ON; SPARKINFER_PREFILL_BATCHED=0
+// disables. Batched fill runs from position 0 only; suffix-only reuse uses the token loop.
 bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
-    static int want_batched = -1, batched_maxctx = -1;
+    static int want_batched = -1, batched_maxctx = -1, want_moe = -1;
     if (want_batched < 0) {
         const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
         want_batched = (e && e[0] == '0') ? 0 : 1;
@@ -1119,10 +1118,14 @@ bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
         // (vs the ~300 pp sequential fallback). Raised from 64k. SPARKINFER_PREFILL_BATCHED_MAXCTX overrides.
         const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
         batched_maxctx = mc ? atoi(mc) : 131072;
+        const char* me = getenv("SPARKINFER_PREFILL_MOE");   // grouped MoE prefill (Qwen3.6)
+        want_moe = (me && me[0] == '0') ? 0 : 1;
     }
-    const bool ffn_ok = cfg.dense_ffn || cfg.n_experts > 0;
-    return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
-           n_tokens <= batched_maxctx;
+    // Qwen3.6-35B-A3B MoE hybrid: grouped int8 expert FFN path in prefill_batched_run.
+    const bool moe_ok = want_moe && !cfg.dense_ffn && cfg.n_experts == 256 &&
+                        cfg.top_k == 8 && cfg.moe_ffn == 512 && cfg.hidden == 2048;
+    return want_batched && gguf && cfg.hybrid && n_tokens > 0 && n_tokens <= batched_maxctx &&
+           (cfg.dense_ffn || moe_ok);
 }
 } // namespace
 
