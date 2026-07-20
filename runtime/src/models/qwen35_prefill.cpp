@@ -136,10 +136,6 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // (GGUF weights are already Q4_K/Q6_K -> int8 weight-quant is lossless vs what's stored). Default
     // ON at every batched context; SPARKINFER_PREFILL_I8=0 disables (A/B). The int8 scratch lives in
     // its own arena so an alloc failure at huge N degrades to the bf16 GEMMs, not to the token loop.
-    // Dense: int8 projections default ON. MoE: default OFF — the discrete top-k router amplifies the
-    // per-token int8 projection error into different expert selections, which diverges from the
-    // token-by-token path far more than in the dense FFN; bf16 projections keep the batched prefill
-    // faithful to the decode path. SPARKINFER_PREFILL_I8 overrides either way.
     const char* _pi8 = getenv("SPARKINFER_PREFILL_I8");
     // Dense: int8 projections default ON. MoE: default OFF — the discrete top-k router amplifies the
     // per-token int8 projection error into different expert selections, which diverges from the
