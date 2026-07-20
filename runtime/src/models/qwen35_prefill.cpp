@@ -207,9 +207,40 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // `use_i8` flag, which upstream defaults OFF for MoE (it governs only the bf16-vs-int8 choice of
     // the attention/GDN/shared projections routed through `proj`). Full-N shared-expert buffers
     // (sfg/sfu/sfh) are dedicated here because the outer ffg/ffu are FC-chunked (dense path only).
+    //
     const int E = moe ? c.n_experts : 0, topk = moe ? c.top_k : 0, mffn = moe ? c.moe_ffn : 0;
     const int P = moe ? N * topk : 0;                          // routed (token, expert) pairs
-    const int max_tiles = moe ? (P + 127) / 128 + E : 0;       // per-expert 128-row GEMM tiles
+    // Short-N: BM=16 fills the tile (avg pairs/expert = N*8/256 = N/32; at 512 → 16).
+    // Long-N: BM=128. Override with SPARKINFER_PREFILL_MOE_BM={16,128}.
+    const int moe_bm = [&]{
+        if (!moe) return 128;
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_BM");
+        if (e) { int v = atoi(e); return (v == 16) ? 16 : 128; }
+        return (N <= 512) ? 16 : 128;
+    }();
+    const int max_tiles = moe ? (P + moe_bm - 1) / moe_bm + E : 0;
+    // Opt-in fused QK path (experimental; currently slower than int8 materialize).
+    const bool moe_fused = [&]{
+        if (!moe) return false;
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_FUSED");
+        return e && e[0] == '1';
+    }();
+    // Expert-group L2 path: dequant G experts (~G*3 MB) then GEMM that group while hot in
+    // L2. Wins at short-N (N<=512, G=32 → +5% @512); bulk is faster once tiles fill. Default
+    // ON for N<=512. SPARKINFER_PREFILL_MOE_SERIAL=0/1 overrides; GROUP default 32.
+    const bool moe_serial = [&]{
+        if (!moe || moe_fused) return false;
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_SERIAL");
+        if (e) return e[0] != '0';
+        return N <= 512;
+    }();
+    const int moe_group = [&]{
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_GROUP");
+        int g = e ? atoi(e) : 32;
+        if (g < 1) g = 1;
+        if (g > 64) g = 64;
+        return g;
+    }();
     Arena am;
     signed char *Wg_i8 = nullptr, *Wu_i8 = nullptr, *Wd_i8 = nullptr, *h_i8 = nullptr, *mA_i8 = nullptr;
     float *swg = nullptr, *swu = nullptr, *swd = nullptr, *sh = nullptr, *msx = nullptr;
@@ -218,12 +249,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     int *pair_tok = nullptr, *tilemap = nullptr, *d_ntiles = nullptr;
     bf16 *hg = nullptr, *hu = nullptr, *hh = nullptr, *sfg = nullptr, *sfu = nullptr, *sfh = nullptr;
     if (moe) {
-        Wg_i8 = am.alloc<signed char>((size_t)E * mffn * H);
-        Wu_i8 = am.alloc<signed char>((size_t)E * mffn * H);
-        Wd_i8 = am.alloc<signed char>((size_t)E * H * mffn);
-        swg = am.alloc<float>((size_t)E * mffn);
-        swu = am.alloc<float>((size_t)E * mffn);
-        swd = am.alloc<float>((size_t)E * H);
+        if (!moe_fused) {
+            // Serial groups: scratch for moe_group experts. Bulk: full E stack.
+            const int ew = moe_serial ? moe_group : E;
+            Wg_i8 = am.alloc<signed char>((size_t)ew * mffn * H);
+            Wu_i8 = am.alloc<signed char>((size_t)ew * mffn * H);
+            Wd_i8 = am.alloc<signed char>((size_t)ew * H * mffn);
+            swg = am.alloc<float>((size_t)ew * mffn);
+            swu = am.alloc<float>((size_t)ew * mffn);
+            swd = am.alloc<float>((size_t)ew * H);
+        }
         mlogits = am.alloc<float>((size_t)N * E);
         mids = am.alloc<int>((size_t)P);
         mweights = am.alloc<float>((size_t)P);
@@ -391,25 +426,121 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_pfm_router_logits(hn, rw, mlogits, N, E, H, st);
             pf_cu(cudaMemsetAsync(mcounts, 0, E * sizeof(int), st), "moe counts zero");
             kernels::launch_moe_router(mlogits, mids, mweights, mcounts, N, E, topk, 1, st);
-            kernels::launch_pfm_bucket_pairs(mids, mweights, mcounts, moffsets, mcursors,
-                                             pair_tok, pair_w, tilemap, d_ntiles, N, E, topk, st);
-            // Expert weights -> int8 rows ONCE per layer (one launch covers all 256 experts).
-            kernels::launch_gguf_dequant_rows_i8(w.gate_qtype, w.gate_q, Wg_i8, swg, E * mffn, H, st);
-            kernels::launch_gguf_dequant_rows_i8(w.up_qtype,   w.up_q,   Wu_i8, swu, E * mffn, H, st);
-            kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q, Wd_i8, swd, E * H, mffn, st);
+            kernels::launch_pfm_bucket_pairs_bm(mids, mweights, mcounts, moffsets, mcursors,
+                                                pair_tok, pair_w, tilemap, d_ntiles, N, E, topk, moe_bm, st);
             kernels::launch_prefill_quantize_rows_i8(hn, mA_i8, msx, N, H, st);
-            kernels::launch_pfm_moe_gemm_i8(mA_i8, msx, Wg_i8, swg, pair_tok, pair_w, moffsets,
-                                            tilemap, d_ntiles, hg, nullptr, mffn, H, max_tiles,
-                                            /*a_indirect=*/true, /*c_scatter=*/false, st);
-            kernels::launch_pfm_moe_gemm_i8(mA_i8, msx, Wu_i8, swu, pair_tok, pair_w, moffsets,
-                                            tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles,
-                                            true, false, st);
-            kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, st);
-            kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, st);
-            pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
-            kernels::launch_pfm_moe_gemm_i8(h_i8, sh, Wd_i8, swd, pair_tok, pair_w, moffsets,
-                                            tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles,
-                                            /*a_indirect=*/false, /*c_scatter=*/true, st);
+            if (moe_fused) {
+                // On-the-fly Q→bf16 B staging — no full-expert int8 materialize (experimental).
+                kernels::launch_pfm_moe_gemm_qk(mA_i8, msx, w.gate_q, w.gate_qtype, pair_tok, pair_w,
+                                                moffsets, tilemap, d_ntiles, hg, nullptr, mffn, H, max_tiles,
+                                                /*a_indirect=*/true, /*c_scatter=*/false, st);
+                kernels::launch_pfm_moe_gemm_qk(mA_i8, msx, w.up_q, w.up_qtype, pair_tok, pair_w,
+                                                moffsets, tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles,
+                                                true, false, st);
+                kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, st);
+                kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, st);
+                pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
+                kernels::launch_pfm_moe_gemm_qk(h_i8, sh, w.down_q, w.down_qtype, pair_tok, pair_w,
+                                                moffsets, tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles,
+                                                /*a_indirect=*/false, /*c_scatter=*/true, st);
+            } else if (moe_serial) {
+                // Expert-group L2 path: dequant G experts into scratch, one grouped GEMM per
+                // stage so the ~G*3 MB working set stays L2-hot (5090 L2 ≈ 96 MB).
+                auto q_row_bytes = [](int qtype, int cols) -> size_t {
+                    const int bs = (qtype == 12) ? 144 : (qtype == 13) ? 176 : 210;
+                    return (size_t)(cols >> 8) * (size_t)bs;
+                };
+                int h_counts[256];
+                pf_cu(cudaMemcpyAsync(h_counts, mcounts, (size_t)E * sizeof(int),
+                                      cudaMemcpyDeviceToHost, st), "moe counts D2H");
+                pf_cu(cudaStreamSynchronize(st), "moe serial sync");
+                pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
+                const size_t g_rb = q_row_bytes(w.gate_qtype, H);
+                const size_t u_rb = q_row_bytes(w.up_qtype, H);
+                const size_t d_rb = q_row_bytes(w.down_qtype, mffn);
+                const int G = moe_group;
+                // Host tilemap for one group (worst case: every expert has pairs).
+                int h_tm[2 * 256];   // enough for G<=64 with several tiles each
+                for (int base = 0; base < E; base += G) {
+                    const int n_in = (E - base < G) ? (E - base) : G;
+                    int ntm = 0, any = 0;
+                    for (int le = 0; le < n_in; le++) {
+                        const int e = base + le;
+                        const int cnt = h_counts[e];
+                        if (cnt <= 0) continue;
+                        any = 1;
+                        const int nt = (cnt + moe_bm - 1) / moe_bm;
+                        for (int mt = 0; mt < nt; mt++) {
+                            h_tm[2 * ntm] = e;
+                            h_tm[2 * ntm + 1] = mt;
+                            ntm++;
+                        }
+                    }
+                    if (!any) continue;
+                    const void* ge = (const char*)w.gate_q + (size_t)base * (size_t)mffn * g_rb;
+                    const void* ue = (const char*)w.up_q   + (size_t)base * (size_t)mffn * u_rb;
+                    kernels::launch_gguf_dequant_rows_i8(w.gate_qtype, ge, Wg_i8, swg, n_in * mffn, H, st);
+                    kernels::launch_gguf_dequant_rows_i8(w.up_qtype,   ue, Wu_i8, swu, n_in * mffn, H, st);
+                    pf_cu(cudaMemcpyAsync(tilemap, h_tm, (size_t)2 * ntm * sizeof(int),
+                                          cudaMemcpyHostToDevice, st), "moe group tilemap");
+                    pf_cu(cudaMemcpyAsync(d_ntiles, &ntm, sizeof(int),
+                                          cudaMemcpyHostToDevice, st), "moe group ntiles");
+                    kernels::launch_pfm_moe_gemm_i8_bm_base(
+                        mA_i8, msx, Wg_i8, swg, pair_tok, pair_w, moffsets, tilemap, d_ntiles,
+                        hg, nullptr, mffn, H, ntm, moe_bm, base,
+                        /*a_indirect=*/true, /*c_scatter=*/false, st);
+                    kernels::launch_pfm_moe_gemm_i8_bm_base(
+                        mA_i8, msx, Wu_i8, swu, pair_tok, pair_w, moffsets, tilemap, d_ntiles,
+                        hu, nullptr, mffn, H, ntm, moe_bm, base, true, false, st);
+                }
+                // One SwiGLU over all pairs, then group-serial down GEMM (L2-resident).
+                kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, st);
+                kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, st);
+                for (int base = 0; base < E; base += G) {
+                    const int n_in = (E - base < G) ? (E - base) : G;
+                    int ntm = 0, any = 0;
+                    for (int le = 0; le < n_in; le++) {
+                        const int e = base + le;
+                        const int cnt = h_counts[e];
+                        if (cnt <= 0) continue;
+                        any = 1;
+                        const int nt = (cnt + moe_bm - 1) / moe_bm;
+                        for (int mt = 0; mt < nt; mt++) {
+                            h_tm[2 * ntm] = e;
+                            h_tm[2 * ntm + 1] = mt;
+                            ntm++;
+                        }
+                    }
+                    if (!any) continue;
+                    const void* de = (const char*)w.down_q + (size_t)base * (size_t)H * d_rb;
+                    kernels::launch_gguf_dequant_rows_i8(w.down_qtype, de, Wd_i8, swd, n_in * H, mffn, st);
+                    pf_cu(cudaMemcpyAsync(tilemap, h_tm, (size_t)2 * ntm * sizeof(int),
+                                          cudaMemcpyHostToDevice, st), "moe down tilemap");
+                    pf_cu(cudaMemcpyAsync(d_ntiles, &ntm, sizeof(int),
+                                          cudaMemcpyHostToDevice, st), "moe down ntiles");
+                    kernels::launch_pfm_moe_gemm_i8_bm_base(
+                        h_i8, sh, Wd_i8, swd, pair_tok, pair_w, moffsets, tilemap, d_ntiles,
+                        nullptr, routed_f32, H, mffn, ntm, moe_bm, base,
+                        /*a_indirect=*/false, /*c_scatter=*/true, st);
+                }
+            } else {
+                // Bulk: expert weights -> int8 rows ONCE per layer (all 256 experts).
+                kernels::launch_gguf_dequant_rows_i8(w.gate_qtype, w.gate_q, Wg_i8, swg, E * mffn, H, st);
+                kernels::launch_gguf_dequant_rows_i8(w.up_qtype,   w.up_q,   Wu_i8, swu, E * mffn, H, st);
+                kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q, Wd_i8, swd, E * H, mffn, st);
+                kernels::launch_pfm_moe_gemm_i8_bm(mA_i8, msx, Wg_i8, swg, pair_tok, pair_w, moffsets,
+                                                   tilemap, d_ntiles, hg, nullptr, mffn, H, max_tiles, moe_bm,
+                                                   /*a_indirect=*/true, /*c_scatter=*/false, st);
+                kernels::launch_pfm_moe_gemm_i8_bm(mA_i8, msx, Wu_i8, swu, pair_tok, pair_w, moffsets,
+                                                   tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles, moe_bm,
+                                                   true, false, st);
+                kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, st);
+                kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, st);
+                pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
+                kernels::launch_pfm_moe_gemm_i8_bm(h_i8, sh, Wd_i8, swd, pair_tok, pair_w, moffsets,
+                                                   tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles, moe_bm,
+                                                   /*a_indirect=*/false, /*c_scatter=*/true, st);
+            }
             // Shared expert (Qwen3.6 UD): out scaled by sigmoid(hn . gate_inp) per token.
             bf16* shared_out = nullptr;
             const void* sg = w.shared_gate_q ? w.shared_gate_q : w.shared_gate;

@@ -32,6 +32,15 @@ void launch_pfm_bucket_pairs(const int* expert_ids, const float* expert_weights,
                              int* tilemap, int* d_ntiles,
                              int n_tokens, int n_experts, int top_k, cudaStream_t stream);
 
+// Same as above but with explicit GEMM row-tile size (16 or 128). Short-N prefill
+// uses bm=16 so underfilled experts don't pad to 128 WMMA rows.
+void launch_pfm_bucket_pairs_bm(const int* expert_ids, const float* expert_weights,
+                                const int* counts, int* offsets, int* cursors,
+                                int* pair_tok, float* pair_w,
+                                int* tilemap, int* d_ntiles,
+                                int n_tokens, int n_experts, int top_k, int bm,
+                                cudaStream_t stream);
+
 // Grouped int8 GEMM over expert-partitioned pair tiles (BM=128, BN=128, BK=32, 8 warps).
 //   A_i8/sx: per-row int8 activations + scales. A_INDIRECT: A row for pair p is
 //   A_i8[pair_tok[p]*K ..] (gate/up: activations are per TOKEN); else A rows are the
@@ -40,8 +49,48 @@ void launch_pfm_bucket_pairs(const int* expert_ids, const float* expert_weights,
 //   C_SCATTER=false: C[p*N_out+n] = bf16(acc*sx*sw)  (pair-major h output).
 //   C_SCATTER=true : atomicAdd(out_f32[pair_tok[p]*N_out+n], acc*sx*sw*pair_w[p]).
 //   Launch bound: grid.y = max_tiles (host upper bound); tiles >= d_ntiles[0] exit.
+//   bm: 128 (default) or 16 (short-N); must match launch_pfm_bucket_pairs_bm.
 void launch_pfm_moe_gemm_i8(const signed char* A_i8, const float* sx,
                             const signed char* W_i8, const float* sw,
+                            const int* pair_tok, const float* pair_w,
+                            const int* offsets, const int* tilemap, const int* d_ntiles,
+                            void* C_bf16, float* out_f32,
+                            int N_out, int K, int max_tiles,
+                            bool a_indirect, bool c_scatter, cudaStream_t stream);
+void launch_pfm_moe_gemm_i8_bm(const signed char* A_i8, const float* sx,
+                               const signed char* W_i8, const float* sw,
+                               const int* pair_tok, const float* pair_w,
+                               const int* offsets, const int* tilemap, const int* d_ntiles,
+                               void* C_bf16, float* out_f32,
+                               int N_out, int K, int max_tiles, int bm,
+                               bool a_indirect, bool c_scatter, cudaStream_t stream);
+// Like _bm but W_i8/sw hold a contiguous expert group starting at e_base (tilemap still
+// stores global expert ids; W is indexed as e - e_base).
+void launch_pfm_moe_gemm_i8_bm_base(const signed char* A_i8, const float* sx,
+                                    const signed char* W_i8, const float* sw,
+                                    const int* pair_tok, const float* pair_w,
+                                    const int* offsets, const int* tilemap, const int* d_ntiles,
+                                    void* C_bf16, float* out_f32,
+                                    int N_out, int K, int max_tiles, int bm, int e_base,
+                                    bool a_indirect, bool c_scatter, cudaStream_t stream);
+
+// Single-expert GEMM: W_i8/sw already point at one expert's rows (no e-stride).
+// grid.y = n_tiles = ceil(counts[expert]/bm). Used by the expert-serial L2 path
+// (dequant one expert → GEMM while ~3 MB stays L2-hot).
+void launch_pfm_moe_gemm_i8_one(const signed char* A_i8, const float* sx,
+                                const signed char* W_i8, const float* sw,
+                                const int* pair_tok, const float* pair_w,
+                                const int* offsets, int expert_id, int n_tiles,
+                                void* C_bf16, float* out_f32,
+                                int N_out, int K, int bm,
+                                bool a_indirect, bool c_scatter, cudaStream_t stream);
+
+// Short-N fused path: same tilemap/pair API as launch_pfm_moe_gemm_i8, but B is read
+// on-the-fly from GGUF Q4_K/Q5_K/Q6_K (ggml_type 12/13/14) into smem — no full-expert
+// int8 materialize. A is still per-row int8+scale. Preferred when N is small enough that
+// the ~768 MiB/layer int8 write dominates (see SPARKINFER_PREFILL_MOE_FUSED).
+void launch_pfm_moe_gemm_qk(const signed char* A_i8, const float* sx,
+                            const void* W_q, int wtype,
                             const int* pair_tok, const float* pair_w,
                             const int* offsets, const int* tilemap, const int* d_ntiles,
                             void* C_bf16, float* out_f32,
