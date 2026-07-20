@@ -15,6 +15,7 @@
 #include "sparkinfer/kernels/prefill.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
+#include "sparkinfer/kernels/expert_row_scale_i8.h"
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/prefill_i8.h"
 #include "sparkinfer/kernels/prefill_moe.h"
@@ -320,20 +321,32 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_pfm_bucket_pairs(mids, mweights, mcounts, moffsets, mcursors,
                                              pair_tok, pair_w, tilemap, d_ntiles, N, E, topk, st);
             // Expert weights -> int8 rows ONCE per layer (one launch covers all 256 experts).
-            kernels::launch_gguf_dequant_rows_i8(w.gate_qtype, w.gate_q, Wg_i8, swg, E * mffn, H, st);
-            kernels::launch_gguf_dequant_rows_i8(w.up_qtype,   w.up_q,   Wu_i8, swu, E * mffn, H, st);
-            kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q, Wd_i8, swd, E * H, mffn, st);
+            // With load-time scales the row amax is already known, so each weight element is
+            // decoded once here instead of twice; the emitted int8 rows are identical either way.
+            const float* csg = s.exp_scale_gate ? s.exp_scale_gate + (size_t)L * E * mffn : nullptr;
+            const float* csu = s.exp_scale_up   ? s.exp_scale_up   + (size_t)L * E * mffn : nullptr;
+            const float* csd = s.exp_scale_down ? s.exp_scale_down + (size_t)L * E * H    : nullptr;
+            if (csg && csu && csd) {
+                kernels::launch_expert_rows_i8_scaled(w.gate_qtype, w.gate_q, Wg_i8, csg, E * mffn, H, st);
+                kernels::launch_expert_rows_i8_scaled(w.up_qtype,   w.up_q,   Wu_i8, csu, E * mffn, H, st);
+                kernels::launch_expert_rows_i8_scaled(w.down_qtype, w.down_q, Wd_i8, csd, E * H, mffn, st);
+            } else {
+                kernels::launch_gguf_dequant_rows_i8(w.gate_qtype, w.gate_q, Wg_i8, swg, E * mffn, H, st);
+                kernels::launch_gguf_dequant_rows_i8(w.up_qtype,   w.up_q,   Wu_i8, swu, E * mffn, H, st);
+                kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q, Wd_i8, swd, E * H, mffn, st);
+                csg = swg; csu = swu; csd = swd;
+            }
             kernels::launch_prefill_quantize_rows_i8(hn, mA_i8, msx, N, H, st);
-            kernels::launch_pfm_moe_gemm_i8(mA_i8, msx, Wg_i8, swg, pair_tok, pair_w, moffsets,
+            kernels::launch_pfm_moe_gemm_i8(mA_i8, msx, Wg_i8, csg, pair_tok, pair_w, moffsets,
                                             tilemap, d_ntiles, hg, nullptr, mffn, H, max_tiles,
                                             /*a_indirect=*/true, /*c_scatter=*/false, st);
-            kernels::launch_pfm_moe_gemm_i8(mA_i8, msx, Wu_i8, swu, pair_tok, pair_w, moffsets,
+            kernels::launch_pfm_moe_gemm_i8(mA_i8, msx, Wu_i8, csu, pair_tok, pair_w, moffsets,
                                             tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles,
                                             true, false, st);
             kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, st);
             kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, st);
             pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
-            kernels::launch_pfm_moe_gemm_i8(h_i8, sh, Wd_i8, swd, pair_tok, pair_w, moffsets,
+            kernels::launch_pfm_moe_gemm_i8(h_i8, sh, Wd_i8, csd, pair_tok, pair_w, moffsets,
                                             tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles,
                                             /*a_indirect=*/false, /*c_scatter=*/true, st);
             // Shared expert (Qwen3.6 UD): out scaled by sigmoid(hn . gate_inp) per token.

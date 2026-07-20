@@ -19,6 +19,7 @@
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/quant.h"
+#include "sparkinfer/kernels/expert_row_scale_i8.h"
 #include "sparkinfer/kernels/proj_requant.h"
 
 #include <cuda_runtime.h>
@@ -152,6 +153,10 @@ struct Qwen35Model::Impl {
     float *sx_h = nullptr;   // pipelined shared-expert h_scratch (avoids racing routed mf_h)
     void  *sx_q8 = nullptr;  // pipelined shared-expert Q8_1(h) for down (avoids racing aq81)
     int   *mf_ids = nullptr, *mf_counts = nullptr;
+    // Batched-prefill expert int8 row scales, precomputed once at load (see load_gguf). The MoE
+    // prefill re-quantizes all 256 experts of every layer on each pass; caching the scales lets
+    // that pass decode each weight once instead of twice. Layer-major, ~126 MB for Qwen3.6-35B.
+    float *pf_exp_sg = nullptr, *pf_exp_su = nullptr, *pf_exp_sd = nullptr;
     unsigned int *mf_rc = nullptr;   // fused-router grid-completion counter (persistent, zero-init)
     // flash-decoding (KV-split) attention partials
     static constexpr int MAX_NSPLITS = 256;   // partials sized for this; adaptive n_splits <= this
@@ -1367,7 +1372,8 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     bf16* lin_conv = (it != s.sessions.end()) ? it->second.lin_conv_state : s.lin_conv_state;
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.active_seq_id, lin_state, lin_conv,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
-                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim };
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.pf_exp_sg, s.pf_exp_su, s.pf_exp_sd };
     return prefill_batched_run(ctx, prompt_ids, n);
 }
 
@@ -1974,6 +1980,39 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             : (w.router_w && w.gate_q && w.up_q && w.down_q);
         if (!have_attn || !w.input_norm || !w.post_attn_norm || !have_ffn) return false;
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);
+    }
+    // ---- Precompute the batched-prefill expert int8 row scales (static weights -> static scales).
+    // Skipped silently on alloc failure or an unsupported expert qtype; prefill then falls back to
+    // the self-contained two-pass dequant, so this is a pure fast path.
+    if (!c.dense_ffn && c.n_experts > 0 && c.moe_ffn > 0) {
+        const size_t ng = (size_t)c.n_layers * c.n_experts * c.moe_ffn;   // gate/up rows, all layers
+        const size_t nd = (size_t)c.n_layers * c.n_experts * H;           // down rows, all layers
+        void *pg = nullptr, *pu = nullptr, *pd = nullptr;
+        const bool alloc_ok =
+            cudaMalloc(&pg, ng * sizeof(float)) == cudaSuccess &&
+            cudaMalloc(&pu, ng * sizeof(float)) == cudaSuccess &&
+            cudaMalloc(&pd, nd * sizeof(float)) == cudaSuccess;
+        bool ok = alloc_ok;
+        if (ok) {
+            for (int i = 0; i < c.n_layers && ok; i++) {
+                const Qwen35LayerWeights& w = s.w.layers[i];
+                const size_t og = (size_t)i * c.n_experts * c.moe_ffn, od = (size_t)i * c.n_experts * H;
+                ok = kernels::launch_expert_row_scales_i8(w.gate_qtype, w.gate_q, (float*)pg + og,
+                                                        c.n_experts * c.moe_ffn, H, s.stream)
+                  && kernels::launch_expert_row_scales_i8(w.up_qtype, w.up_q, (float*)pu + og,
+                                                        c.n_experts * c.moe_ffn, H, s.stream)
+                  && kernels::launch_expert_row_scales_i8(w.down_qtype, w.down_q, (float*)pd + od,
+                                                        c.n_experts * H, c.moe_ffn, s.stream);
+            }
+            if (ok) ok = cudaStreamSynchronize(s.stream) == cudaSuccess;
+        }
+        if (ok) {
+            s.pf_exp_sg = (float*)pg; s.pf_exp_su = (float*)pu; s.pf_exp_sd = (float*)pd;
+            s.owned.push_back(pg); s.owned.push_back(pu); s.owned.push_back(pd);
+        } else {
+            cudaFree(pg); cudaFree(pu); cudaFree(pd);
+            fprintf(stderr, "[gguf] expert row-scale precompute unavailable -> prefill uses the two-pass dequant\n");
+        }
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;

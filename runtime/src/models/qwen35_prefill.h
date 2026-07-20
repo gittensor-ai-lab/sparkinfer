@@ -26,6 +26,11 @@ struct Qwen35PrefillCtx {
     bool                 gguf;             // native GGUF load (quantized weights)
     int                  qdim, kvdim;                       // full-attn q / kv dims
     int                  linear_qdim, linear_vdim, linear_qkvdim;  // GDN dims
+    // Expert int8 row scales precomputed at load, layer-major (gate/up: [n_layers,E*moe_ffn],
+    // down: [n_layers,E*hidden]). Null when unavailable -> the two-pass dequant is used instead.
+    const float*         exp_scale_gate;
+    const float*         exp_scale_up;
+    const float*         exp_scale_down;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
