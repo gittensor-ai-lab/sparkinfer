@@ -54,6 +54,15 @@ __device__ __forceinline__ void pf_cp16(void* dst, const void* src, bool pred) {
     if (pred) __pipeline_memcpy_async(dst, src, 16);
     else      *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
 }
+// bf16-element XOR swizzle (8 bf16 = one 16B chunk): element e of row r lives at element
+// (((e>>3) ^ (r&3)) << 3) | (e&7). Mirrors the int8 GEMM's 16B-granularity swizzle so the 4B
+// mma operand loads (2 bf16) spread across banks; rows 0..3 land on disjoint banks.
+__device__ __forceinline__ int pf_swz_e(int e, int row) {
+    return (((e >> 3) ^ (row & 3)) << 3) | (e & 7);
+}
+__device__ __forceinline__ unsigned pf_lds32b(const __nv_bfloat16* p) {
+    return *reinterpret_cast<const unsigned*>(p);   // load 2 contiguous bf16 as one 32b operand
+}
 __global__ void pf_gemm_kernel(const __nv_bfloat16* __restrict__ A,
                                const __nv_bfloat16* __restrict__ W,
                                __nv_bfloat16* __restrict__ C, int M, int N, int K) {
@@ -127,6 +136,119 @@ __global__ void pf_gemm_kernel(const __nv_bfloat16* __restrict__ A,
                 if (rm < M && rn < N) C[(size_t)rm * N + rn] = __float2bfloat16(Cs[warp][r][cc]);
             }
             __syncwarp();
+        }
+    }
+}
+
+// ============================================================================
+// bf16 tensor-core GEMM, mma.sync m16n8k16 variant. Same C[M,N] = A[M,K] @ W[N,K]^T as
+// pf_gemm_kernel, but shaped like the int8 GEMM (prefill_gemm_i8.cu) instead of the wmma path:
+// direct mma.sync (register accumulators, no shared-memory epilogue staging), an XOR-swizzled
+// smem layout so the 4B operand loads avoid bank conflicts, and a register->global bf16 store.
+// The wmma path stages fp32 fragments through smem and loads unswizzled, which caps it near ~60%
+// of the bf16 tensor roofline; this reaches ~the int8 kernel's efficiency at half the MAC rate.
+// fp32 accumulate, so it stays bf16-faithful (KL parity with the wmma GEMM).
+__global__ __launch_bounds__(256, 2) void pf_gemm_bf16_mma_kernel(
+        const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ W,
+        __nv_bfloat16* __restrict__ C, int M, int N, int K) {
+    constexpr int MFRAG = 2;          // 32 rows per warp / 16
+    constexpr int NFRAG = 8;          // 64 cols per warp / 8
+    __shared__ __nv_bfloat16 As[2][PF_BM][PF_BK];
+    __shared__ __nv_bfloat16 Bs[2][PF_BN][PF_BK];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int grp  = lane >> 2;                       // 0..7
+    const int tig  = lane & 3;                        // thread-in-group
+    const int wm   = warp & 3;                        // rows [wm*32, +32)
+    const int wn   = warp >> 2;                       // cols [wn*64, +64)
+    const int m0   = blockIdx.y * PF_BM;
+    const int n0   = blockIdx.x * PF_BN;
+    const int nk   = (K + PF_BK - 1) / PF_BK;
+
+    float acc[MFRAG][NFRAG][4];
+    #pragma unroll
+    for (int i = 0; i < MFRAG; i++)
+        #pragma unroll
+        for (int j = 0; j < NFRAG; j++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) acc[i][j][e] = 0.f;
+
+    // 128 rows x 32 bf16 (64B) = 512 16B chunks per tile; 256 threads stage 2 chunks each for A and B.
+    auto stage = [&](int buf, int k0) {
+        #pragma unroll
+        for (int s = tid; s < 512; s += 256) {
+            const int r = s >> 2, c = s & 3, e = c << 3;   // 8 bf16 per 16B chunk
+            const int gm = m0 + r, gn = n0 + r, gk = k0 + e;
+            pf_cp16(&As[buf][r][pf_swz_e(e, r)], &A[(size_t)gm * K + gk], gm < M && gk < K);
+            pf_cp16(&Bs[buf][r][pf_swz_e(e, r)], &W[(size_t)gn * K + gk], gn < N && gk < K);
+        }
+        __pipeline_commit();
+    };
+
+    stage(0, 0);
+    int buf = 0;
+    for (int t = 0; t < nk; t++) {
+        if (t + 1 < nk) stage(buf ^ 1, (t + 1) * PF_BK);
+        __pipeline_wait_prior(t + 1 < nk ? 1 : 0);
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < PF_BK; kk += 16) {          // two m16n8k16 sub-steps per BK=32 tile
+            const int kb = kk + tig * 2;
+            unsigned af[MFRAG][4], bf[NFRAG][2];
+            #pragma unroll
+            for (int i = 0; i < MFRAG; i++) {
+                const int rlo = wm * 32 + i * 16 + grp, rhi = rlo + 8;
+                af[i][0] = pf_lds32b(&As[buf][rlo][pf_swz_e(kb,     rlo)]);
+                af[i][1] = pf_lds32b(&As[buf][rhi][pf_swz_e(kb,     rhi)]);
+                af[i][2] = pf_lds32b(&As[buf][rlo][pf_swz_e(kb + 8, rlo)]);
+                af[i][3] = pf_lds32b(&As[buf][rhi][pf_swz_e(kb + 8, rhi)]);
+            }
+            #pragma unroll
+            for (int j = 0; j < NFRAG; j++) {
+                const int col = wn * 64 + j * 8 + grp;
+                bf[j][0] = pf_lds32b(&Bs[buf][col][pf_swz_e(kb,     col)]);
+                bf[j][1] = pf_lds32b(&Bs[buf][col][pf_swz_e(kb + 8, col)]);
+            }
+            #pragma unroll
+            for (int i = 0; i < MFRAG; i++)
+                #pragma unroll
+                for (int j = 0; j < NFRAG; j++)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                        : "+f"(acc[i][j][0]), "+f"(acc[i][j][1]), "+f"(acc[i][j][2]), "+f"(acc[i][j][3])
+                        : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
+                          "r"(bf[j][0]), "r"(bf[j][1]));
+        }
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    // Registers straight to global: c0/c1 (and c2/c3) are adjacent columns -> one bf16x2 store each.
+    #pragma unroll
+    for (int i = 0; i < MFRAG; i++) {
+        #pragma unroll
+        for (int j = 0; j < NFRAG; j++) {
+            const int gn = n0 + wn * 64 + j * 8 + tig * 2;
+            if (gn + 1 >= N) {                            // tail: scalar path
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int gm = m0 + wm * 32 + i * 16 + grp + (e >> 1) * 8;
+                    const int cn = gn + (e & 1);
+                    if (gm < M && cn < N) C[(size_t)gm * N + cn] = __float2bfloat16(acc[i][j][e]);
+                }
+                continue;
+            }
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int gm = m0 + wm * 32 + i * 16 + grp + h * 8;
+                if (gm >= M) continue;
+                const __nv_bfloat162 v = __floats2bfloat162_rn(acc[i][j][h * 2], acc[i][j][h * 2 + 1]);
+                *reinterpret_cast<__nv_bfloat162*>(&C[(size_t)gm * N + gn]) = v;
+            }
         }
     }
 }
@@ -572,9 +694,17 @@ __global__ void pf_attn_int8_paged_kernel(
 void launch_prefill_gemm(const void* A, const void* W, void* C,
                          int M, int N, int K, cudaStream_t stream) {
     dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
-    pf_gemm_kernel<<<grid, 256, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A), reinterpret_cast<const __nv_bfloat16*>(W),
-        reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+    // The mma.sync path reaches ~the int8 GEMM's efficiency (vs the wmma path's ~60% of the bf16
+    // roofline) and is the default; SPARKINFER_PREFILL_BF16_WMMA=1 selects the legacy wmma kernel (A/B).
+    static int wmma = []{ const char* e = getenv("SPARKINFER_PREFILL_BF16_WMMA"); return e && e[0] != '0' ? 1 : 0; }();
+    if (wmma)
+        pf_gemm_kernel<<<grid, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(A), reinterpret_cast<const __nv_bfloat16*>(W),
+            reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+    else
+        pf_gemm_bf16_mma_kernel<<<grid, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(A), reinterpret_cast<const __nv_bfloat16*>(W),
+            reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
 }
 
 void launch_prefill_swiglu(const void* gate, const void* up, void* h, long n, cudaStream_t stream) {
