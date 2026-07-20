@@ -336,9 +336,29 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
     pf_cu(cudaMemcpyAsync(d_ids, prompt_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "prefill ids");
 
-    // Dequantize a native GGUF weight [n_out,K] to bf16 scratch; return a bf16 [n_out,K] ptr.
+    // Dequantize a native GGUF weight [n_out,K] to bf16; return a bf16 [n_out,K] ptr. With a weight
+    // cache active (Qwen3.6 MoE, whose projections are bf16 GEMMs re-run every pass), the first call
+    // for a given static weight dequantizes into a persistent buffer and every later call returns it,
+    // so the dequant is paid once at warm-up instead of per prefill. Same values either way — the
+    // cached buffer holds exactly what the scratch dequant would. A 6 GB cap + graceful fallback to
+    // the shared scratch keep it from ever growing VRAM without bound.
+    constexpr size_t kWCacheCapBytes = 6ull << 30;
     auto dq = [&](const void* W, int wtype, int n_out, int K) -> const void* {
         if (wtype == 0) return W;   // already bf16 dense
+        if (s.wcache && !s.wcache->disabled) {
+            auto it = s.wcache->map.find(W);
+            if (it != s.wcache->map.end()) return it->second;
+            const size_t sz = (size_t)n_out * K * sizeof(bf16);
+            void* buf = nullptr;
+            if (s.wcache->bytes + sz <= kWCacheCapBytes && cudaMalloc(&buf, sz) == cudaSuccess) {
+                kernels::launch_gguf_dequant(wtype, W, buf, (long)n_out * K, st);
+                s.wcache->map[W] = buf;
+                s.wcache->owned.push_back(buf);
+                s.wcache->bytes += sz;
+                return buf;
+            }
+            s.wcache->disabled = true;   // out of room -> stop caching, use the scratch path below
+        }
         kernels::launch_gguf_dequant(wtype, W, wbuf, (long)n_out * K, st);
         return wbuf;
     };

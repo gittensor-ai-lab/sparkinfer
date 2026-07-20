@@ -147,6 +147,7 @@ struct Qwen35Model::Impl {
     int *h_scalars = nullptr, *h_out_id = nullptr;
     float* d_shared_w;
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
+    PrefillWeightCache prefill_wcache;   // persistent bf16 projection weights for Qwen3.6 batched prefill
     // GGUF fused-expert decode scratch (allocated by load_gguf)
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
     float *sx_h = nullptr;   // pipelined shared-expert h_scratch (avoids racing routed mf_h)
@@ -326,6 +327,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
 
 Qwen35Model::~Qwen35Model() {
     for (void* b : p_->owned) cudaFree(b);
+    for (void* b : p_->prefill_wcache.owned) cudaFree(b);
     cudaFree(p_->x); cudaFree(p_->xn); cudaFree(p_->q); cudaFree(p_->k); cudaFree(p_->v);
     cudaFree(p_->attn); cudaFree(p_->ao); cudaFree(p_->h); cudaFree(p_->hn);
     cudaFree(p_->routed); cudaFree(p_->shared); cudaFree(p_->logits);
@@ -1365,10 +1367,16 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     auto it = s.sessions.find(s.active_seq_id);
     float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;
     bf16* lin_conv = (it != s.sessions.end()) ? it->second.lin_conv_state : s.lin_conv_state;
+    // Cache the bf16 projection weights only for the Qwen3.6 MoE hybrid, whose projections run as
+    // per-pass bf16 dequant+GEMM; the dense Qwythos path uses the cached-int8 GEMM instead, so dq()
+    // is barely on its critical path there. SPARKINFER_PREFILL_WCACHE=0 forces the per-pass dequant.
+    const bool moe = !s.cfg.dense_ffn && s.cfg.n_experts > 0;
+    static const bool wcache_on = []{ const char* e = getenv("SPARKINFER_PREFILL_WCACHE"); return !(e && e[0]=='0'); }();
+    PrefillWeightCache* wc = (moe && wcache_on) ? &s.prefill_wcache : nullptr;
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
                           lin_state, lin_conv,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
-                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim };
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim, wc };
     return prefill_batched_run(ctx, prompt_ids, n);
 }
 
@@ -1975,6 +1983,49 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             : (w.router_w && w.gate_q && w.up_q && w.down_q);
         if (!have_attn || !w.input_norm || !w.post_attn_norm || !have_ffn) return false;
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);
+    }
+
+    // ---- Eager-populate the batched-prefill bf16 projection cache (Qwen3.6 MoE only).
+    // The scored sweep times each context ONCE with the smallest (512) first, so a lazily-filled
+    // cache would populate during the very pass it is meant to speed up. Dequantizing the static
+    // projection weights here, at load, means the first timed prefill already hits the cache. Each
+    // entry is keyed by the quantized weight pointer, exactly as prefill's dq() looks it up; missing
+    // or unsupported ones fall through to the per-pass dequant, so this is a pure warm-up.
+    if (!c.dense_ffn && c.n_experts > 0) {
+        const int H = c.hidden, qd = p_->qdim, kvd = p_->kvdim;
+        const int lqkv = p_->linear_qkvdim, lvd = p_->linear_vdim, mffn = c.moe_ffn, E = c.n_experts;
+        PrefillWeightCache& wc = p_->prefill_wcache;
+        auto warm = [&](const void* W, int wtype, long n_elems) {
+            if (!W || wtype == 0 || wc.disabled || wc.map.count(W)) return;
+            const size_t sz = (size_t)n_elems * sizeof(bf16);
+            void* buf = nullptr;
+            if (wc.bytes + sz > (6ull << 30) || cudaMalloc(&buf, sz) != cudaSuccess) { wc.disabled = true; return; }
+            kernels::launch_gguf_dequant(wtype, W, buf, n_elems, p_->stream);
+            wc.map[W] = buf; wc.owned.push_back(buf); wc.bytes += sz;
+        };
+        for (int i = 0; i < c.n_layers; i++) {
+            const Qwen35LayerWeights& w = s.w.layers[i];
+            if (w.linear_attn) {
+                warm(w.wqkv,      w.wqkv_type,      (long)lqkv * H);
+                warm(w.wqkv_gate, w.wqkv_gate_type, (long)lvd  * H);
+                warm(w.ssm_out,   w.ssm_out_type,   (long)H    * lvd);
+            } else {
+                warm(w.wq, w.wq_type, (long)(2 * qd) * H);
+                warm(w.wk, w.wk_type, (long)kvd * H);
+                warm(w.wv, w.wv_type, (long)kvd * H);
+                warm(w.wo, w.wo_type, (long)H   * qd);
+            }
+            warm(w.shared_gate_q, w.shared_gate_qtype, (long)mffn * H);
+            warm(w.shared_up_q,   w.shared_up_qtype,   (long)mffn * H);
+            warm(w.shared_down_q, w.shared_down_qtype, (long)H    * mffn);
+            warm(w.shared_gate_inp, w.shared_gate_inp_type, (long)H);
+            warm(w.router_w, w.router_w_type, (long)E * H);
+        }
+        cudaStreamSynchronize(p_->stream);
+        if (wc.bytes)
+            fprintf(stderr, "[gguf] prefill bf16 projection cache: %.2f GB across %zu weights%s\n",
+                    wc.bytes / (1024.0 * 1024.0 * 1024.0), wc.map.size(),
+                    wc.disabled ? " (capped -> rest dequant per pass)" : "");
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;
