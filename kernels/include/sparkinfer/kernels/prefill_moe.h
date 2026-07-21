@@ -41,6 +41,12 @@ void launch_pfm_bucket_pairs_bm(const int* expert_ids, const float* expert_weigh
                                 int n_tokens, int n_experts, int top_k, int bm,
                                 cudaStream_t stream);
 
+// Build tilemap + d_ntiles for experts [e_base, e_base+n_in) from device counts.
+// Used by the short-N L2-serial / dual-stream path to avoid D2H counts sync.
+void launch_pfm_group_tilemap(const int* counts, int* tilemap, int* d_ntiles,
+                              int e_base, int n_in, int bm, int max_tiles,
+                              cudaStream_t stream);
+
 // Grouped int8 GEMM over expert-partitioned pair tiles (BM=128, BN=128, BK=32, 8 warps).
 //   A_i8/sx: per-row int8 activations + scales. A_INDIRECT: A row for pair p is
 //   A_i8[pair_tok[p]*K ..] (gate/up: activations are per TOKEN); else A rows are the

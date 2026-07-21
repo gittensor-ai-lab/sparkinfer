@@ -84,6 +84,29 @@ __global__ void pfm_scatter_kernel(const int* __restrict__ expert_ids,
     pair_w[slot]   = expert_weights[p];
 }
 
+// Device-side tilemap for one expert group [e_base, e_base+n_in). Replaces the host
+// D2H counts + H2D tilemap sync in the short-N L2-serial path so dequant can be
+// pipelined on a side stream without stalling the main GEMM stream.
+__global__ void pfm_group_tilemap_kernel(const int* __restrict__ counts,
+                                         int* __restrict__ tilemap, int* __restrict__ d_ntiles,
+                                         int e_base, int n_in, int bm, int max_tiles) {
+    if (threadIdx.x != 0) return;
+    int nt = 0;
+    for (int le = 0; le < n_in; le++) {
+        const int e = e_base + le;
+        const int cnt = counts[e];
+        if (cnt <= 0) continue;
+        const int tiles = (cnt + bm - 1) / bm;
+        for (int mt = 0; mt < tiles; mt++) {
+            if (nt >= max_tiles) break;
+            tilemap[2 * nt] = e;
+            tilemap[2 * nt + 1] = mt;
+            nt++;
+        }
+    }
+    d_ntiles[0] = nt;
+}
+
 // ---- grouped int8 GEMM over expert-partitioned pair tiles ----
 #define PM_BN 128
 #define PM_BK 32
@@ -687,6 +710,13 @@ void launch_pfm_bucket_pairs_bm(const int* expert_ids, const float* expert_weigh
     const int P = n_tokens * top_k;
     pfm_scatter_kernel<<<(P + 255) / 256, 256, 0, stream>>>(
         expert_ids, expert_weights, offsets, cursors, pair_tok, pair_w, P, top_k);
+}
+
+void launch_pfm_group_tilemap(const int* counts, int* tilemap, int* d_ntiles,
+                              int e_base, int n_in, int bm, int max_tiles,
+                              cudaStream_t stream) {
+    pfm_group_tilemap_kernel<<<1, 1, 0, stream>>>(counts, tilemap, d_ntiles,
+                                                  e_base, n_in, bm, max_tiles);
 }
 
 void launch_pfm_moe_gemm_i8(const signed char* A_i8, const float* sx,
