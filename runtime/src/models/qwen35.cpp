@@ -160,9 +160,21 @@ struct Qwen35Model::Impl {
     int split_chunk = 256;                    // target serial KV per split (SPARKINFER_SPLIT_CHUNK)
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
     // Sink + sliding-window sparse-KV. Default on; SPARKINFER_SPARSE_KV=0 disables. Per-kv_head block list.
+    //
+    // Layer-tapered window (GQA-8 / Qwen3.6 hybrid only): the model has only 10 of 40 layers
+    // doing exact full attention (every 4th), interleaved with 30 Gated-DeltaNet layers that
+    // carry a fixed-size recurrent state. The *first* full-attn layer is the only exact-recall
+    // checkpoint anything downstream can lean on yet, so it keeps the widest, safest window; by
+    // the *last* full-attn layer the stack has already passed through several such checkpoints,
+    // so a narrower window (same value already proven safe for Qwythos/GQA-4) is used there.
+    // Window is linearly interpolated between the two across the 10 full-attn layers. GQA-4
+    // (Qwythos) keeps the original single uniform window — untouched, unchanged behavior.
     int*   sparse_sel = nullptr;
-    int    sparse_budget = 0;      // max sel slots = 1 + window
-    int    sparse_window = 256;    // recent window in KV blocks (16 tokens/block)
+    int    sparse_budget = 0;        // buffer alloc size = 1 + max window actually used
+    int    sparse_window = 256;      // GQA-4 uniform window (blocks, 16 tokens/block)
+    int    sparse_window_hi = 512;   // GQA-8 taper: window at the first full-attn layer
+    int    sparse_window_lo = 256;   // GQA-8 taper: window at the last full-attn layer
+    int    sparse_gqa = 0;           // 4 or 8; 0 = sparse KV not engaged for this model
     int    sparse_min_ctx = 8192;
     bool   graph_sparse = false;
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
@@ -279,23 +291,42 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->fa_m   = p_->alloc<float>(fa_n);
     p_->fa_l   = p_->alloc<float>(fa_n);
     p_->fa_acc = p_->alloc<float>(fa_n * cfg.head_dim);
-    // Sink + sliding-window sparse KV: default ON for Qwythos GQA-4 hd256 (int8 KV).
+    // Sink + sliding-window sparse KV: default ON for hd256 GQA-4 (Qwythos, uniform window) and
+    // GQA-8 (Qwen3.6, layer-tapered window — see field comments above). int8 KV only.
     // SPARKINFER_SPARSE_KV=0 restores dense full-context flash-decode.
     bool sparse_enable = true;
     if (const char* se = getenv("SPARKINFER_SPARSE_KV")) sparse_enable = (se[0] != '0');
-    if (sparse_enable && cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4) {
-        p_->sparse_window = 256;
-        if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
-        // Legacy aliases from the Quest prototype (blocks, not tokens).
-        if (const char* rw = getenv("SPARKINFER_SPARSE_RECENT")) { int v = atoi(rw); if (v > 0) p_->sparse_window = v; }
-        if (const char* b = getenv("SPARKINFER_SPARSE_BUDGET")) {
-            int v = atoi(b); if (v > 1) p_->sparse_window = v - 1;   // budget included sink
+    const bool sparse_gqa4 = cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4;
+    const bool sparse_gqa8 = cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 8;
+    if (sparse_enable && (sparse_gqa4 || sparse_gqa8)) {
+        p_->sparse_gqa = sparse_gqa8 ? 8 : 4;
+        p_->sparse_min_ctx = sparse_gqa8 ? 16384 : 8192;   // GQA-8: stay above the H2 probe (8448)
+        if (sparse_gqa8) {
+            p_->sparse_window_hi = 512;
+            p_->sparse_window_lo = 256;
+            if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) {
+                // Uniform override for A/B comparison against the tapered default.
+                int v = atoi(w); if (v > 0) { p_->sparse_window_hi = v; p_->sparse_window_lo = v; }
+            }
+            if (const char* wh = getenv("SPARKINFER_SPARSE_WINDOW_HI")) { int v = atoi(wh); if (v > 0) p_->sparse_window_hi = v; }
+            if (const char* wl = getenv("SPARKINFER_SPARSE_WINDOW_LO")) { int v = atoi(wl); if (v > 0) p_->sparse_window_lo = v; }
+            p_->sparse_window = p_->sparse_window_hi;   // widest value; used only for buffer sizing below
+        } else {
+            p_->sparse_window = 256;
+            if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
+            // Legacy aliases from the Quest prototype (blocks, not tokens).
+            if (const char* rw = getenv("SPARKINFER_SPARSE_RECENT")) { int v = atoi(rw); if (v > 0) p_->sparse_window = v; }
+            if (const char* b = getenv("SPARKINFER_SPARSE_BUDGET")) {
+                int v = atoi(b); if (v > 1) p_->sparse_window = v - 1;   // budget included sink
+            }
+            p_->sparse_window_hi = p_->sparse_window_lo = p_->sparse_window;
         }
         if (const char* mc = getenv("SPARKINFER_SPARSE_MIN_CTX")) { int v = atoi(mc); if (v > 0) p_->sparse_min_ctx = v; }
         p_->sparse_budget = 1 + p_->sparse_window;
         p_->sparse_sel = p_->alloc<int>((size_t)cfg.n_kv_heads * p_->sparse_budget);
-        fprintf(stderr, "[sparse-kv] sliding-window (default on): window=%d blocks (%d tokens) min_ctx=%d\n",
-                p_->sparse_window, p_->sparse_window * kv->block_size(), p_->sparse_min_ctx);
+        fprintf(stderr, "[sparse-kv] %s (default on): gqa=%d window=%d..%d blocks min_ctx=%d\n",
+                sparse_gqa8 ? "layer-tapered" : "uniform",
+                p_->sparse_gqa, p_->sparse_window_hi, p_->sparse_window_lo, p_->sparse_min_ctx);
     }
     const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
     p_->aq8   = p_->alloc<signed char>(kmax);
@@ -460,8 +491,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.graph_ready = false;
     }
     const bool sparse_avail = s.sparse_budget > 0 && s.kv->int8_kv() &&
-                              c.head_dim == 256 && c.n_q_heads == c.n_kv_heads * 4;
-    const bool sparse_on = sparse_avail && seqlen >= s.sparse_min_ctx;
+                              c.head_dim == 256 &&
+                              (c.n_q_heads == c.n_kv_heads * 4 || c.n_q_heads == c.n_kv_heads * 8);
+    // Decode only: sparse must never be baked into the prefill CUDA graph. Prefill needs exact
+    // attention to build a correct KV cache and correct next-token distribution over the prompt;
+    // windowing it (not just decode) silently corrupts every downstream token, not just long-tail
+    // recall -- this is what turns a bounded accuracy dip into a full correctness break.
+    const bool sparse_on = sample && sparse_avail && seqlen >= s.sparse_min_ctx;
     if (s.graph_ready && s.graph_sparse != sparse_on) {
         cu(cudaGraphExecDestroy(s.cu_exec), "sparse recapture destroy exec");
         cu(cudaGraphDestroy(s.cu_graph), "sparse recapture destroy graph");
@@ -799,14 +835,32 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                                       && (w.wo_type == 12 || w.wo_type == 8) && (s.qdim % 32 == 0);
             const bool emit_attn_q8 = !w.q_has_gate && s.use_attnin && s.gguf && s.use_pq && s.use_llama && w.wo_type == 12;
             if (sparse_on) {
+                // Layer-tapered window for GQA-8 (Qwen3.6): linearly interpolate from
+                // sparse_window_hi at the first full-attn layer to sparse_window_lo at the
+                // last, over the model's `full_attn_interval`-spaced full-attn layers. GQA-4
+                // (Qwythos) has sparse_window_hi == sparse_window_lo, so this is a no-op there
+                // (layer_window == s.sparse_window for every layer, byte-identical to before).
+                int layer_window = s.sparse_window;
+                if (s.sparse_gqa == 8 && c.full_attn_interval > 0) {
+                    const int n_attn_layers = c.n_layers / c.full_attn_interval;
+                    const int pos = (L + 1) / c.full_attn_interval - 1;   // 0 .. n_attn_layers-1
+                    if (n_attn_layers > 1 && pos >= 0) {
+                        layer_window = s.sparse_window_hi -
+                            (s.sparse_window_hi - s.sparse_window_lo) * pos / (n_attn_layers - 1);
+                    } else {
+                        layer_window = s.sparse_window_hi;
+                    }
+                }
+                const int layer_budget = 1 + layer_window;   // <= s.sparse_budget (buffer is sized for the max)
+                const int layer_splits = (s.n_splits < layer_budget) ? s.n_splits : layer_budget;
                 kernels::launch_fa_kv_window_select(s.d_seqlen, s.sparse_sel, c.n_kv_heads,
-                    s.kv->block_size(), s.sparse_budget, s.sparse_window, st);
+                    s.kv->block_size(), layer_budget, layer_window, st);
                 kernels::launch_flash_decode_split_sparse(s.q, kpool, vpool, btable, s.d_seqlen,
                     s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                    s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits, s.sparse_budget,
+                    s.kv->block_size(), s.kv->max_blocks_per_seq(), layer_splits, layer_budget,
                     1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
                 kernels::launch_fa_combine_hd256(s.fa_m, s.fa_l, s.fa_acc, s.attn, c.n_q_heads,
-                    s.n_splits, (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, st,
+                    layer_splits, (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, st,
                     attn_gate_q8 ? s.qgate : nullptr);
             } else {
             kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,

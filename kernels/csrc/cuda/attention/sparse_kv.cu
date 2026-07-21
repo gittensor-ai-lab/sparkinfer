@@ -141,16 +141,28 @@ void launch_flash_decode_split_sparse(
     int n_splits, int n_sel, float scale,
     const void* k_scale_layer, const void* v_scale_layer, cudaStream_t stream
 ) {
-    if (head_dim != 256 || num_q_heads != num_kv_heads * 4) return;
+    if (head_dim != 256) return;
+    const bool gqa4 = num_q_heads == num_kv_heads * 4;
+    const bool gqa8 = num_q_heads == num_kv_heads * 8;
+    if (!gqa4 && !gqa8) return;
     dim3 grid(num_kv_heads * n_splits, 1);
-    fa_split_gqa_sparse<256, 4><<<grid, 4 * 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q),
-        reinterpret_cast<const signed char*>(k_pool_layer),
-        reinterpret_cast<const signed char*>(v_pool_layer),
-        block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
-        num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, n_sel,
-        reinterpret_cast<const __half*>(k_scale_layer),
-        reinterpret_cast<const __half*>(v_scale_layer));
+    const auto* qp = reinterpret_cast<const __nv_bfloat16*>(q);
+    const auto* kp = reinterpret_cast<const signed char*>(k_pool_layer);
+    const auto* vp = reinterpret_cast<const signed char*>(v_pool_layer);
+    const auto* ks = reinterpret_cast<const __half*>(k_scale_layer);
+    const auto* vs = reinterpret_cast<const __half*>(v_scale_layer);
+    if (gqa8) {
+        // Qwen3.6 hybrid full-attn layers: 8 query heads per kv head (vs Qwythos's 4). One warp
+        // per query head, same shared-memory K/V tile reused across all 8 -- only the warp count
+        // (block dim) and the GQA template parameter change relative to the GQA-4 launch below.
+        fa_split_gqa_sparse<256, 8><<<grid, 8 * 32, 0, stream>>>(
+            qp, kp, vp, block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
+            num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, n_sel, ks, vs);
+    } else {
+        fa_split_gqa_sparse<256, 4><<<grid, 4 * 32, 0, stream>>>(
+            qp, kp, vp, block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
+            num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, n_sel, ks, vs);
+    }
 }
 #endif
 
