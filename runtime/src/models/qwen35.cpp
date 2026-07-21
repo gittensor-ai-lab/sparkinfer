@@ -283,17 +283,18 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // SPARKINFER_SPARSE_KV=0 restores dense full-context flash-decode.
     //
     // Qwen3.6 (GQA-8) defaults differ from Qwythos on purpose:
-    //   • min_ctx=16384 — above the H2 accuracy probe (8448 toks), so the long-context
-    //     int8 gate stays on dense attention and matches llama.cpp.
-    //   • window=512 (~8k toks) — when sparse does engage at 16k/32k, keep a wider recent
-    //     window than Qwythos's 256 so the MoE hybrid's few full-attn layers stay stable.
+    //   • min_ctx=32768 — below that, dense int8-MMA flash-decode is FASTER than the
+    //     scalar sparse walk (RTX 5090 A/B: sparse@16k 419 tok/s vs dense 438), and the
+    //     H2 accuracy probe (8448 toks) also stays dense so it matches llama.cpp.
+    //   • window=256 (~4k toks, same as Qwythos) — at 32k+ the fixed-cost scalar window
+    //     beats dense MMA over the full cache; the narrower window keeps that fixed cost low.
     bool sparse_enable = true;
     if (const char* se = getenv("SPARKINFER_SPARSE_KV")) sparse_enable = (se[0] != '0');
     const bool sparse_gqa4 = cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4;
     const bool sparse_gqa8 = cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 8;
     if (sparse_enable && (sparse_gqa4 || sparse_gqa8)) {
-        p_->sparse_window  = sparse_gqa8 ? 512 : 256;
-        p_->sparse_min_ctx = sparse_gqa8 ? 16384 : 8192;
+        p_->sparse_window  = 256;
+        p_->sparse_min_ctx = sparse_gqa8 ? 32768 : 8192;
         if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
         // Legacy aliases from the Quest prototype (blocks, not tokens).
         if (const char* rw = getenv("SPARKINFER_SPARSE_RECENT")) { int v = atoi(rw); if (v > 0) p_->sparse_window = v; }
