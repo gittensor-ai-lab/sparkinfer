@@ -8,6 +8,12 @@
 
 namespace sparkinfer_server {
 
+struct CompletionTiming {
+    double ttft_ms = -1.0;
+    double generation_ms = -1.0;
+    double decode_tps = -1.0;
+};
+
 // Thread-safe wrapper around sparkinfer::Qwen35Model + GGUF load.
 class ModelEngine {
 public:
@@ -39,12 +45,14 @@ public:
                                         const std::function<void(int)>& on_token);
 
     const std::string& last_error() const;
+    const CompletionTiming& last_timing() const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     mutable std::mutex mu_;
     std::string last_error_;
+    CompletionTiming last_timing_;
 };
 
 }  // namespace sparkinfer_server

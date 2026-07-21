@@ -167,6 +167,10 @@ int ModelEngine::prefix_token_len() const {
     return (int)impl_->prefix_tokens.size();
 }
 
+const CompletionTiming& ModelEngine::last_timing() const {
+    return last_timing_;
+}
+
 const std::string& ModelEngine::last_error() const {
     std::lock_guard<std::mutex> lock(mu_);
     return last_error_;
@@ -230,6 +234,9 @@ std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_
     auto result = impl_->batch_engine->complete_streaming(req, on_token);
 
     std::lock_guard<std::mutex> lock(mu_);
+    last_timing_.ttft_ms = result.ttft_ms;
+    last_timing_.generation_ms = result.generation_ms;
+    last_timing_.decode_tps = result.decode_tps;
     if (!result.error.empty()) {
         last_error_ = result.error;
         fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
