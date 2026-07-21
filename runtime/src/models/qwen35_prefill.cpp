@@ -143,6 +143,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // token-by-token path far more than in the dense FFN; bf16 projections keep the batched MoE
     // prefill faithful to the decode path. SPARKINFER_PREFILL_I8 overrides either way.
     bool use_i8 = _pi8 ? (_pi8[0] != '0') : !moe;
+    // MoE: optional int8 for shared-expert GEMMs only (attn/GDN/router stay bf16 — those feed
+    // the top-k router). Distinct from full PREFILL_I8=1, #555 bf16 weight cache, and #566
+    // live-expert coalesce/pair dequant. Env SPARKINFER_PREFILL_MOE_SHARED_I8=0 disables (A/B).
+    bool moe_shared_i8 = moe && !use_i8 && [&]{
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_SHARED_I8");
+        if (e) return e[0] == '1';
+        return true;
+    }();
     // Long-context fidelity (dense): the near-1-decay GDN recurrence amplifies the per-row int8
     // activation-quant error across the sequence, so int8 prefill diverges from the token-by-token
     // path past ~96k (128k: top1 0.31 / KL 0.18). Above bf16_minctx (default 96k) fall back to bf16
@@ -163,12 +171,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // A_i8 holds the quantized activation. Dense full-i8: non-FFN projs quantize N rows x K(<=H);
     // chunked FFN quantizes at most FC rows x ffn. Long-ctx selective: N*H if attn-i8 else FC*ffn.
     // MoE: no chunked FFN; projections quantize N rows x maxAK.
-    const bool need_i8 = use_i8 || use_i8_ffn || use_i8_attn;
+    const bool need_i8 = use_i8 || use_i8_ffn || use_i8_attn || moe_shared_i8;
     const size_t a_i8_sz = moe ? (size_t)N * maxAK
                                : ((use_i8 || use_i8_attn)
                                   ? (((size_t)N * H > (size_t)FC * ffn) ? (size_t)N * H : (size_t)FC * ffn)
                                   : (size_t)FC * ffn);
-    const size_t sx_n = (use_i8 || use_i8_attn) ? (size_t)N : (size_t)FC;
+    const size_t sx_n = (use_i8 || use_i8_attn || moe_shared_i8) ? (size_t)N : (size_t)FC;
     signed char* A_i8 = need_i8 ? a8.alloc<signed char>(a_i8_sz) : nullptr;
     signed char* W_i8 = need_i8 ? a8.alloc<signed char>(maxw) : nullptr;
     float* sx = need_i8 ? a8.alloc<float>(sx_n) : nullptr;
@@ -178,6 +186,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         use_i8 = false;
         use_i8_ffn = false;
         use_i8_attn = false;
+        moe_shared_i8 = false;
         A_i8 = W_i8 = nullptr;
         sx = sw = nullptr;
     }
@@ -560,10 +569,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         ? dq(w.shared_gate_inp, w.shared_gate_inp_type, 1, H) : w.shared_gate_inp;
                     kernels::launch_pfm_shared_gate(hn, gi, dw, N, H, st);
                 }
+                const bool restore_i8_sh = use_i8;
+                if (moe_shared_i8) use_i8 = true;
                 proj(hn, sg, sgt, sfg, mffn, H);
                 proj(hn, su, sut, sfu, mffn, H);
                 kernels::launch_pfm_shared_swiglu(sfg, sfu, has_gi ? dw : nullptr, sfh, N, mffn, st);
                 proj(sfh, sd, sdt, ao, H, mffn);
+                use_i8 = restore_i8_sh;
                 shared_out = ao;
             }
             // x = x + routed + shared (fp32 math); x already holds the post-attn residual, so this
