@@ -42,8 +42,9 @@ __global__ void fa_kv_window_select(
 }
 
 // (2) Sparse flash split. Walks n_sel selected blocks instead of a contiguous chunk.
+// launch_bounds: GQA-8 is 256 threads; keep regs bounded so the CTA always launches.
 template <int HEAD_DIM, int GQA>
-__global__ void fa_split_gqa_sparse(
+__global__ void __launch_bounds__(GQA * 32, 2) fa_split_gqa_sparse(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const int* __restrict__ block_table,
     const int* __restrict__ seq_lens, const int* __restrict__ sel_blk,
@@ -72,48 +73,57 @@ __global__ void fa_split_gqa_sparse(
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
 
+    // KV block_size is 16 for the shipped paged cache; keep the tile fixed.
     __shared__ __nv_bfloat16 s_k[16 * HEAD_DIM], s_v[16 * HEAD_DIM];
     __shared__ size_t s_rowbase[16];
     __shared__ float s_ksc[16], s_vsc[16];
 
     for (int i = bstart; i < bend; i++) {
         const int lblk = sel[i];
-        if (lblk < 0) continue;
-        const int phys  = block_table[lblk];
-        const int valid = min(block_size, sl - lblk * block_size);
-        if (valid <= 0) continue;
-        if ((int)threadIdx.x < valid) {
+        // Block-uniform early-outs (all warps see the same sel[i]). Skip OOB logical
+        // blocks so a stale/partial block_table never becomes an illegal global load.
+        int valid = 0, phys = -1;
+        if (lblk >= 0 && lblk < max_blocks) {
+            phys  = block_table[lblk];
+            valid = min(block_size, sl - lblk * block_size);
+            if (valid < 0 || phys < 0) valid = 0;
+        }
+        if (valid > 0 && (int)threadIdx.x < valid) {
             const size_t tokrow = (size_t)(phys * block_size + threadIdx.x) * num_kv_heads + kvh;
             s_rowbase[threadIdx.x] = tokrow * HEAD_DIM;
             s_ksc[threadIdx.x] = __half2float(k_scale[tokrow]);
             s_vsc[threadIdx.x] = __half2float(v_scale[tokrow]);
         }
         __syncthreads();
-        for (int j = threadIdx.x * 8; j < valid * HEAD_DIM; j += blockDim.x * 8) {
-            const int within = j / HEAD_DIM;
-            const size_t base = s_rowbase[within] + (j % HEAD_DIM);
-            const float ks = s_ksc[within], vs = s_vsc[within];
-            const int2 kr = __ldg(reinterpret_cast<const int2*>(k_pool + base));
-            const int2 vr = __ldg(reinterpret_cast<const int2*>(v_pool + base));
-            const signed char* kc = reinterpret_cast<const signed char*>(&kr);
-            const signed char* vc = reinterpret_cast<const signed char*>(&vr);
-            #pragma unroll
-            for (int t = 0; t < 8; t++) {
-                s_k[j + t] = __float2bfloat16((float)kc[t] * ks);
-                s_v[j + t] = __float2bfloat16((float)vc[t] * vs);
+        if (valid > 0) {
+            for (int j = threadIdx.x * 8; j < valid * HEAD_DIM; j += blockDim.x * 8) {
+                const int within = j / HEAD_DIM;
+                const size_t base = s_rowbase[within] + (j % HEAD_DIM);
+                const float ks = s_ksc[within], vs = s_vsc[within];
+                const int2 kr = __ldg(reinterpret_cast<const int2*>(k_pool + base));
+                const int2 vr = __ldg(reinterpret_cast<const int2*>(v_pool + base));
+                const signed char* kc = reinterpret_cast<const signed char*>(&kr);
+                const signed char* vc = reinterpret_cast<const signed char*>(&vr);
+                #pragma unroll
+                for (int t = 0; t < 8; t++) {
+                    s_k[j + t] = __float2bfloat16((float)kc[t] * ks);
+                    s_v[j + t] = __float2bfloat16((float)vc[t] * vs);
+                }
             }
         }
         __syncthreads();
-        for (int tt = 0; tt < valid; tt++) {
-            float p = 0.f;
-            #pragma unroll
-            for (int e = 0; e < ELEMS; e++) p += qr[e] * skv_to_f(s_k[tt * HEAD_DIM + lane + e * 32]);
-            const float score = skv_wsum(p) * scale;
-            const float mn = fmaxf(m, score), corr = __expf(m - mn), pe = __expf(score - mn);
-            l = l * corr + pe;
-            #pragma unroll
-            for (int e = 0; e < ELEMS; e++) acc[e] = acc[e] * corr + pe * skv_to_f(s_v[tt * HEAD_DIM + lane + e * 32]);
-            m = mn;
+        if (valid > 0) {
+            for (int tt = 0; tt < valid; tt++) {
+                float p = 0.f;
+                #pragma unroll
+                for (int e = 0; e < ELEMS; e++) p += qr[e] * skv_to_f(s_k[tt * HEAD_DIM + lane + e * 32]);
+                const float score = skv_wsum(p) * scale;
+                const float mn = fmaxf(m, score), corr = __expf(m - mn), pe = __expf(score - mn);
+                l = l * corr + pe;
+                #pragma unroll
+                for (int e = 0; e < ELEMS; e++) acc[e] = acc[e] * corr + pe * skv_to_f(s_v[tt * HEAD_DIM + lane + e * 32]);
+                m = mn;
+            }
         }
         __syncthreads();
     }
