@@ -164,6 +164,7 @@ struct Qwen35Model::Impl {
     int    sparse_budget = 0;      // max sel slots = 1 + window
     int    sparse_window = 256;    // recent window in KV blocks (16 tokens/block)
     int    sparse_min_ctx = 8192;
+    bool   sparse_mma = true;      // GQA-8: wmma int8 sparse split (SPARKINFER_SPARSE_MMA=0 -> scalar)
     bool   graph_sparse = false;
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
     signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
@@ -282,19 +283,24 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // Sink + sliding-window sparse KV: default ON for hd256 GQA-4 (Qwythos) and GQA-8 (Qwen3.6), int8 KV.
     // SPARKINFER_SPARSE_KV=0 restores dense full-context flash-decode.
     //
-    // Qwen3.6 (GQA-8) defaults differ from Qwythos on purpose:
-    //   • min_ctx=32768 — below that, dense int8-MMA flash-decode is FASTER than the
-    //     scalar sparse walk (RTX 5090 A/B: sparse@16k 419 tok/s vs dense 438), and the
-    //     H2 accuracy probe (8448 toks) also stays dense so it matches llama.cpp.
-    //   • window=256 (~4k toks, same as Qwythos) — at 32k+ the fixed-cost scalar window
-    //     beats dense MMA over the full cache; the narrower window keeps that fixed cost low.
+    // Qwen3.6 (GQA-8) engagement policy (RTX 5090 eval A/B history on PR #560):
+    //   • The SCALAR sparse walk regressed 16k (419 vs dense-MMA 438) and only won at 32k
+    //     (+2.2%) — the dense path is already int8 tensor-core, so a scalar O(window) walk
+    //     needs a ~8x read advantage to break even.
+    //   • The wmma int8 sparse kernel (launch_flash_decode_split_sparse_mma) removes that
+    //     penalty: same O(window) read, same tensor-core math as dense. With it, sparse
+    //     engages from 16k (window 256 = 4k toks reads ~4x less than dense at 16k, ~8x at
+    //     32k). The H2 accuracy probe (8448 toks) stays below min_ctx and runs dense.
+    //   • SPARKINFER_SPARSE_MMA=0 falls back to the scalar sparse kernel AND the
+    //     conservative 32k engagement, preserving the measured-safe scalar configuration.
     bool sparse_enable = true;
     if (const char* se = getenv("SPARKINFER_SPARSE_KV")) sparse_enable = (se[0] != '0');
+    if (const char* sm = getenv("SPARKINFER_SPARSE_MMA")) p_->sparse_mma = (sm[0] != '0');
     const bool sparse_gqa4 = cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4;
     const bool sparse_gqa8 = cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 8;
     if (sparse_enable && (sparse_gqa4 || sparse_gqa8)) {
         p_->sparse_window  = 256;
-        p_->sparse_min_ctx = sparse_gqa8 ? 32768 : 8192;
+        p_->sparse_min_ctx = sparse_gqa8 ? (p_->sparse_mma ? 16384 : 32768) : 8192;
         if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
         // Legacy aliases from the Quest prototype (blocks, not tokens).
         if (const char* rw = getenv("SPARKINFER_SPARSE_RECENT")) { int v = atoi(rw); if (v > 0) p_->sparse_window = v; }
@@ -304,8 +310,9 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         if (const char* mc = getenv("SPARKINFER_SPARSE_MIN_CTX")) { int v = atoi(mc); if (v > 0) p_->sparse_min_ctx = v; }
         p_->sparse_budget = 1 + p_->sparse_window;
         p_->sparse_sel = p_->alloc<int>((size_t)cfg.n_kv_heads * p_->sparse_budget);
-        fprintf(stderr, "[sparse-kv] sliding-window (default on): gqa=%d window=%d blocks (%d tokens) min_ctx=%d\n",
-                sparse_gqa8 ? 8 : 4, p_->sparse_window, p_->sparse_window * kv->block_size(), p_->sparse_min_ctx);
+        fprintf(stderr, "[sparse-kv] sliding-window (default on): gqa=%d window=%d blocks (%d tokens) min_ctx=%d mma=%d\n",
+                sparse_gqa8 ? 8 : 4, p_->sparse_window, p_->sparse_window * kv->block_size(),
+                p_->sparse_min_ctx, (sparse_gqa8 && p_->sparse_mma) ? 1 : 0);
     }
     const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
     p_->aq8   = p_->alloc<signed char>(kmax);
@@ -812,14 +819,28 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             const bool emit_attn_q8 = !w.q_has_gate && s.use_attnin && s.gguf && s.use_pq && s.use_llama && w.wo_type == 12;
             if (sparse_on) {
                 // Cap splits to the selected-block budget so empty partials stay rare and
-                // combine sees the same n_splits the sparse kernel wrote.
-                const int sparse_splits = (s.n_splits < s.sparse_budget) ? s.n_splits : s.sparse_budget;
+                // combine sees the same n_splits the sparse kernel wrote. The MMA kernel
+                // walks 8-block groups per split iteration, so give it fewer, fatter splits.
+                const int budget_splits = (s.n_splits < s.sparse_budget) ? s.n_splits : s.sparse_budget;
+                const int mma_splits = ((s.sparse_budget + 7) / 8 < budget_splits)
+                                       ? (s.sparse_budget + 7) / 8 : budget_splits;
                 kernels::launch_fa_kv_window_select(s.d_seqlen, s.sparse_sel, c.n_kv_heads,
                     s.kv->block_size(), s.sparse_budget, s.sparse_window, st);
-                kernels::launch_flash_decode_split_sparse(s.q, kpool, vpool, btable, s.d_seqlen,
-                    s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                    s.kv->block_size(), s.kv->max_blocks_per_seq(), sparse_splits, s.sparse_budget,
-                    1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
+                int sparse_splits = budget_splits;
+                bool mma_done = false;
+                if (s.sparse_mma) {
+                    mma_done = kernels::launch_flash_decode_split_sparse_mma(s.q, kpool, vpool,
+                        btable, s.d_seqlen, s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc,
+                        c.n_q_heads, c.n_kv_heads, c.head_dim, s.kv->block_size(),
+                        s.kv->max_blocks_per_seq(), mma_splits, s.sparse_budget,
+                        1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
+                    if (mma_done) sparse_splits = mma_splits;
+                }
+                if (!mma_done)
+                    kernels::launch_flash_decode_split_sparse(s.q, kpool, vpool, btable, s.d_seqlen,
+                        s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                        s.kv->block_size(), s.kv->max_blocks_per_seq(), sparse_splits, s.sparse_budget,
+                        1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
                 kernels::launch_fa_combine_hd256(s.fa_m, s.fa_l, s.fa_acc, s.attn, c.n_q_heads,
                     sparse_splits, (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, st,
                     attn_gate_q8 ? s.qgate : nullptr);

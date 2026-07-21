@@ -161,5 +161,13 @@ void launch_flash_decode_split_sparse(const void* q, const void* k_pool_layer, c
     float* part_acc, int num_q_heads, int num_kv_heads, int head_dim, int block_size, int max_blocks,
     int n_splits, int n_sel, float scale, const void* k_scale_layer, const void* v_scale_layer,
     cudaStream_t stream = nullptr);
+// Tensor-core (wmma int8) sparse split — same block list / partials as the scalar sparse
+// kernel but S=Q·Kᵀ and O=P·V on int8 tensor cores (hd256 GQA-8, block_size 16). Returns
+// false when the shape is unsupported so the caller falls back to the scalar sparse kernel.
+bool launch_flash_decode_split_sparse_mma(const void* q, const void* k_pool_layer,
+    const void* v_pool_layer, const int* block_table, const int* seq_lens, const int* sel_blk,
+    float* part_m, float* part_l, float* part_acc, int num_q_heads, int num_kv_heads, int head_dim,
+    int block_size, int max_blocks, int n_splits, int n_sel, float scale,
+    const void* k_scale_layer, const void* v_scale_layer, cudaStream_t stream = nullptr);
 
 }} // namespace sparkinfer::kernels
