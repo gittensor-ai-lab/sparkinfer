@@ -19,6 +19,7 @@
 #include "sparkinfer/kernels/prefill_i8.h"
 #include "sparkinfer/kernels/prefill_fp8.h"
 #include "sparkinfer/kernels/prefill_moe.h"
+#include "sparkinfer/kernels/prefill_moe_mmq.h"
 #include "sparkinfer/kernels/moe.h"
 
 #include <cuda_runtime.h>
@@ -231,10 +232,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     //
     const int E = moe ? c.n_experts : 0, topk = moe ? c.top_k : 0, mffn = moe ? c.moe_ffn : 0;
     const int P = moe ? N * topk : 0;                          // routed (token, expert) pairs
+    // Direct-4-bit MMQ MoE FFN: at small token counts the per-expert GEMM is tiny and the
+    // layer is bound by the weight-DRAM traffic of the int8 dequant materialize, so read the
+    // Q4_K/Q5_K experts directly (dp4a with Q8_1 activations) instead. Default ON for N<=512
+    // (the 128/512 prefill contexts); at large N the int8 tensor-core path is faster, so it is
+    // left untouched. SPARKINFER_PREFILL_MOE_MMQ=0/1 overrides; MAXN sets the auto threshold.
+    const int moe_mmq_maxn = [&]{
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_MMQ_MAXN");
+        return e ? atoi(e) : 256;   // measured crossover: MMQ wins for N<=256 (few tokens/expert)
+    }();
+    const bool moe_mmq = [&]{
+        if (!moe) return false;
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_MMQ");
+        if (e) return e[0] != '0';
+        return N <= moe_mmq_maxn;
+    }();
     // Short-N: BM=16 fills the tile (avg pairs/expert = N*8/256 = N/32; at 512 → 16).
-    // Long-N: BM=128. Override with SPARKINFER_PREFILL_MOE_BM={16,128}.
+    // Long-N: BM=128. Override with SPARKINFER_PREFILL_MOE_BM={16,128}. MMQ requires BM=16.
     const int moe_bm = [&]{
         if (!moe) return 128;
+        if (moe_mmq) return 16;
         const char* e = getenv("SPARKINFER_PREFILL_MOE_BM");
         if (e) { int v = atoi(e); return (v == 16) ? 16 : 128; }
         return (N <= 512) ? 16 : 128;
@@ -292,6 +309,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     int *mids = nullptr, *mcounts = nullptr, *moffsets = nullptr, *mcursors = nullptr;
     int *pair_tok = nullptr, *tilemap = nullptr, *d_ntiles = nullptr, *d_live_le = nullptr;
     bf16 *hg = nullptr, *hu = nullptr, *hh = nullptr, *sfg = nullptr, *sfu = nullptr, *sfh = nullptr;
+    unsigned char *aq_gate = nullptr, *aq_down = nullptr;   // Q8_1 activations for the MMQ path
     if (moe) {
         if (!moe_fused) {
             // Serial: moe_slots * moe_group experts (ping-pong when piped). Bulk: full E.
@@ -327,6 +345,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         sfg = am.alloc<bf16>((size_t)N * mffn);                // shared-expert gate/up/hidden (full N)
         sfu = am.alloc<bf16>((size_t)N * mffn);
         sfh = am.alloc<bf16>((size_t)N * mffn);
+        if (moe_mmq) {                                         // Q8_1 activations (36 B / 32 vals)
+            aq_gate = am.alloc<unsigned char>((size_t)N * (H / 32) * 36);       // gate/up A (per token)
+            aq_down = am.alloc<unsigned char>((size_t)P * (mffn / 32) * 36);    // down A (per pair)
+        }
         if (!am.ok) {
             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
             fprintf(stderr, "[prefill] MoE scratch alloc failed (ctx=%d) -> fallback\n", N);
@@ -512,9 +534,28 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_moe_router(mlogits, mids, mweights, mcounts, N, E, topk, 1, st);
             kernels::launch_pfm_bucket_pairs_bm(mids, mweights, mcounts, moffsets, mcursors,
                                                 pair_tok, pair_w, tilemap, d_ntiles, N, E, topk, moe_bm, st);
-            kernels::launch_prefill_quantize_rows_i8(hn, mA_i8, msx, N, H, st);
+            // Direct-4-bit MMQ path for Q4_K gate/up + Q5_K down (the common UD layout); other
+            // qtypes (e.g. Q6_K down) fall through to the int8 materialize path below.
+            const bool layer_mmq = moe_mmq && w.gate_qtype == 12 && w.up_qtype == 12 && w.down_qtype == 13;
+            if (!layer_mmq)
+                kernels::launch_prefill_quantize_rows_i8(hn, mA_i8, msx, N, H, st);
             bool sg_hid = false;  // shared-gate scalar already on stream_k
-            if (moe_fused) {
+            if (layer_mmq) {
+                // Read Q4_K/Q5_K experts directly (dp4a) — no int8 dequant materialize.
+                kernels::launch_prefill_quantize_rows_q8_1(hn, aq_gate, N, H, st);
+                kernels::launch_pfm_moe_mmq(aq_gate, w.gate_q, w.gate_qtype, pair_tok, pair_w,
+                                            moffsets, tilemap, d_ntiles, hg, nullptr, mffn, H, max_tiles,
+                                            0, /*a_indirect=*/true, /*c_scatter=*/false, st);
+                kernels::launch_pfm_moe_mmq(aq_gate, w.up_q, w.up_qtype, pair_tok, pair_w,
+                                            moffsets, tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles,
+                                            0, true, false, st);
+                kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, st);
+                kernels::launch_prefill_quantize_rows_q8_1(hh, aq_down, P, mffn, st);
+                pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
+                kernels::launch_pfm_moe_mmq(aq_down, w.down_q, w.down_qtype, pair_tok, pair_w,
+                                            moffsets, tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles,
+                                            0, /*a_indirect=*/false, /*c_scatter=*/true, st);
+            } else if (moe_fused) {
                 // On-the-fly Q→bf16 B staging — no full-expert int8 materialize (experimental).
                 kernels::launch_pfm_moe_gemm_qk(mA_i8, msx, w.gate_q, w.gate_qtype, pair_tok, pair_w,
                                                 moffsets, tilemap, d_ntiles, hg, nullptr, mffn, H, max_tiles,
