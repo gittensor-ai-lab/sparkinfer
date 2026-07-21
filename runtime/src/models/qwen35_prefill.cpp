@@ -262,22 +262,35 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (g > 64) g = 64;
         return g;
     }();
-    // Dual-stream MoE aids (created when serial path is live):
-    //   - aux stream: H2D tilemap || dequant overlap (always on for serial)
-    //   - PIPE=1: also ping-pong dequant of group i+1 while GEMMing i (2 weight slots).
-    // SPARKINFER_PREFILL_MOE_PIPE=1 enables weight ping-pong. Default OFF until decode-safe.
+    // Optional dual-stream weight ping-pong (env). Default OFF.
     const bool moe_pipe = [&]{
         if (!moe_serial) return false;
         const char* e = getenv("SPARKINFER_PREFILL_MOE_PIPE");
         return e && e[0] == '1';
     }();
     const int moe_slots = (moe_serial && moe_pipe) ? 2 : 1;
+    // Opt-in MoE dequant overlap on stream_k/v. Default OFF: side-stream ops that write
+    // ≳8KB permanently regress subsequent decode (~0.92×). SPARKINFER_PREFILL_MOE_OVERLAP=1
+    // for experiments only.
+    const bool moe_overlap = [&]{
+        if (!moe_serial || !s.stream_k || !s.stream_v) return false;
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_OVERLAP");
+        return e && e[0] == '1';
+    }();
+    // Hide shared-gate scalar behind MoE on stream_k. Default OFF: even a tiny side-stream
+    // write + WaitEvent onto s.stream permanently slows decode graph replay (~0.92×).
+    // SPARKINFER_PREFILL_HIDE_SG=1 for experiments only.
+    const bool moe_hide_sg = [&]{
+        if (!moe_serial || moe_overlap || !s.stream_k) return false;
+        const char* e = getenv("SPARKINFER_PREFILL_HIDE_SG");
+        return e && e[0] == '1';
+    }();
     Arena am;
     signed char *Wg_i8 = nullptr, *Wu_i8 = nullptr, *Wd_i8 = nullptr, *h_i8 = nullptr, *mA_i8 = nullptr;
     float *swg = nullptr, *swu = nullptr, *swd = nullptr, *sh = nullptr, *msx = nullptr;
     float *mlogits = nullptr, *mweights = nullptr, *pair_w = nullptr, *routed_f32 = nullptr, *dw = nullptr;
     int *mids = nullptr, *mcounts = nullptr, *moffsets = nullptr, *mcursors = nullptr;
-    int *pair_tok = nullptr, *tilemap = nullptr, *d_ntiles = nullptr;
+    int *pair_tok = nullptr, *tilemap = nullptr, *d_ntiles = nullptr, *d_live_le = nullptr;
     bf16 *hg = nullptr, *hu = nullptr, *hh = nullptr, *sfg = nullptr, *sfu = nullptr, *sfh = nullptr;
     if (moe) {
         if (!moe_fused) {
@@ -298,9 +311,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         mcursors = am.alloc<int>(E);
         pair_tok = am.alloc<int>((size_t)P);
         pair_w = am.alloc<float>((size_t)P);
-        // Serial: dual tilemap buffers so H2D of group i+1 overlaps GEMM of i.
+        // Serial: packed tilemaps for all groups live in this buffer ([tm...][ntiles...]).
         tilemap = am.alloc<int>((size_t)2 * 2 * max_tiles);
         d_ntiles = am.alloc<int>(2);
+        if (moe_serial) d_live_le = am.alloc<int>(E > 0 ? E : 256);
         hg = am.alloc<bf16>((size_t)P * mffn);
         hu = am.alloc<bf16>((size_t)P * mffn);
         hh = am.alloc<bf16>((size_t)P * mffn);
@@ -396,23 +410,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, eps, st);
 
-    // MoE aux stream: H2D tilemap overlaps dequant; optional ping-pong when PIPE=1.
-    // Created once for all layers. Full device sync before destroy so decode isn't poisoned.
-    cudaStream_t moe_st_aux = nullptr;
-    cudaEvent_t moe_ev_h2d{}, moe_ev_gemm[2]{}, moe_ev_dq[2]{}, moe_ev_done[2]{}, moe_ev_ready{};
-    if (moe_serial) {
-        pf_cu(cudaStreamCreateWithFlags(&moe_st_aux, cudaStreamNonBlocking), "moe aux stream");
-        pf_cu(cudaEventCreateWithFlags(&moe_ev_h2d, cudaEventDisableTiming), "moe ev_h2d");
-        pf_cu(cudaEventCreateWithFlags(&moe_ev_gemm[0], cudaEventDisableTiming), "moe ev_gemm0");
-        pf_cu(cudaEventCreateWithFlags(&moe_ev_gemm[1], cudaEventDisableTiming), "moe ev_gemm1");
+    // MoE aux events: overlap path and/or tiny shared-gate hide on stream_k.
+    cudaEvent_t moe_ev_up{}, moe_ev_down0{}, moe_ev_ready{}, moe_ev_sg{};
+    if (moe_overlap) {
+        pf_cu(cudaEventCreateWithFlags(&moe_ev_up, cudaEventDisableTiming), "moe ev_up");
+        pf_cu(cudaEventCreateWithFlags(&moe_ev_down0, cudaEventDisableTiming), "moe ev_down0");
         pf_cu(cudaEventCreateWithFlags(&moe_ev_ready, cudaEventDisableTiming), "moe ev_ready");
-        if (moe_pipe) {
-            for (int sidx = 0; sidx < moe_slots; sidx++) {
-                pf_cu(cudaEventCreateWithFlags(&moe_ev_dq[sidx], cudaEventDisableTiming), "moe ev_dq");
-                pf_cu(cudaEventCreateWithFlags(&moe_ev_done[sidx], cudaEventDisableTiming), "moe ev_done");
-            }
-        }
     }
+    if (moe_hide_sg)
+        pf_cu(cudaEventCreateWithFlags(&moe_ev_sg, cudaEventDisableTiming), "moe ev_sg");
 
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
@@ -507,6 +513,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_pfm_bucket_pairs_bm(mids, mweights, mcounts, moffsets, mcursors,
                                                 pair_tok, pair_w, tilemap, d_ntiles, N, E, topk, moe_bm, st);
             kernels::launch_prefill_quantize_rows_i8(hn, mA_i8, msx, N, H, st);
+            bool sg_hid = false;  // shared-gate scalar already on stream_k
             if (moe_fused) {
                 // On-the-fly Q→bf16 B staging — no full-expert int8 materialize (experimental).
                 kernels::launch_pfm_moe_gemm_qk(mA_i8, msx, w.gate_q, w.gate_qtype, pair_tok, pair_w,
@@ -522,43 +529,58 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                                 moffsets, tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles,
                                                 /*a_indirect=*/false, /*c_scatter=*/true, st);
             } else if (moe_serial) {
-                // Expert-group L2 path on top of main(#561):
+                // Expert-group L2 path on top of main(#561), tuned for N≈512:
                 //   - D2H counts, skip empty groups, exact-ntm GEMM grids
-                //   - hybrid sparse dequant when ≤50% of a group is live (big @128 win)
-                //   - dual tilemap buffers: H2D overlaps prior GEMM; tilemaps reused for down
-                //   - optional PIPE=1 weight ping-pong (usually slower — leave off)
+                //   - coalesce live-expert dequant runs (skip empty weight rows)
+                //   - one-shot packed tilemap H2D
+                //   - optional gate∥up on private streams (decode-unsafe; env)
                 auto q_row_bytes = [](int qtype, int cols) -> size_t {
                     const int bs = (qtype == 12) ? 144 : (qtype == 13) ? 176 : 210;
                     return (size_t)(cols >> 8) * (size_t)bs;
                 };
-                int h_counts[256];
+                int h_counts_stack[256];
+                int* h_counts = h_counts_stack;
+                // Pinned counts make the D2H sync cheaper (pageable stalls the GPU).
+                static thread_local int* pinned_counts = nullptr;
+                if (!pinned_counts) {
+                    if (cudaMallocHost(&pinned_counts, 256 * sizeof(int)) != cudaSuccess)
+                        pinned_counts = nullptr;
+                }
+                if (pinned_counts) h_counts = pinned_counts;
                 pf_cu(cudaMemcpyAsync(h_counts, mcounts, (size_t)E * sizeof(int),
                                       cudaMemcpyDeviceToHost, st), "moe counts D2H");
                 pf_cu(cudaStreamSynchronize(st), "moe serial sync");
-                pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
                 const size_t g_rb = q_row_bytes(w.gate_qtype, H);
                 const size_t u_rb = q_row_bytes(w.up_qtype, H);
                 const size_t d_rb = q_row_bytes(w.down_qtype, mffn);
                 const int G = moe_group;
-                const size_t slot_g = (size_t)G * (size_t)mffn * (size_t)H;
-                const size_t slot_gs = (size_t)G * (size_t)mffn;
-                const size_t slot_d = (size_t)G * (size_t)H * (size_t)mffn;
-                const size_t slot_ds = (size_t)G * (size_t)H;
 
-                struct ActiveGroup { int base, n_in, ntm; std::vector<int> tm; };
+                struct ActiveGroup {
+                    int base, n_in, ntm, tm_off, n_live, live_off;
+                    std::vector<int> tm;
+                    std::vector<int> live;
+                };
                 std::vector<ActiveGroup> active;
                 active.reserve((size_t)((E + G - 1) / G));
+                int tm_total = 0;
+                int live_total = 0;
                 for (int base = 0; base < E; base += G) {
                     const int n_in = (E - base < G) ? (E - base) : G;
                     ActiveGroup ag;
                     ag.base = base;
                     ag.n_in = n_in;
                     ag.ntm = 0;
+                    ag.tm_off = tm_total;
+                    ag.n_live = 0;
+                    ag.live_off = live_total;
                     ag.tm.reserve((size_t)2 * 64);
+                    ag.live.reserve((size_t)n_in);
                     for (int le = 0; le < n_in; le++) {
                         const int e = base + le;
                         const int cnt = h_counts[e];
                         if (cnt <= 0) continue;
+                        ag.live.push_back(le);
+                        ag.n_live++;
                         const int nt = (cnt + moe_bm - 1) / moe_bm;
                         for (int mt = 0; mt < nt; mt++) {
                             if (ag.ntm >= max_tiles) break;
@@ -567,185 +589,246 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                             ag.ntm++;
                         }
                     }
-                    if (ag.ntm > 0) active.push_back(std::move(ag));
+                    if (ag.ntm > 0) {
+                        tm_total += ag.ntm;
+                        live_total += ag.n_live;
+                        active.push_back(std::move(ag));
+                    }
                 }
                 const int n_active = (int)active.size();
 
-                auto slot_w = [&](int slot, signed char*& g, signed char*& u, signed char*& d,
-                                  float*& sg, float*& su, float*& sd) {
-                    g = Wg_i8 + (size_t)slot * slot_g;
-                    u = Wu_i8 + (size_t)slot * slot_g;
-                    d = Wd_i8 + (size_t)slot * slot_d;
-                    sg = swg + (size_t)slot * slot_gs;
-                    su = swu + (size_t)slot * slot_gs;
-                    sd = swd + (size_t)slot * slot_ds;
+                std::vector<int> h_tm_all((size_t)2 * std::max(tm_total, 1));
+                std::vector<int> h_nt_all((size_t)std::max(n_active, 1));
+                std::vector<int> h_live_all((size_t)std::max(live_total, 1));
+                for (int gi = 0; gi < n_active; gi++) {
+                    const ActiveGroup& ag = active[(size_t)gi];
+                    h_nt_all[(size_t)gi] = ag.ntm;
+                    for (int t = 0; t < ag.ntm; t++) {
+                        h_tm_all[(size_t)2 * (ag.tm_off + t)]     = ag.tm[(size_t)2 * t];
+                        h_tm_all[(size_t)2 * (ag.tm_off + t) + 1] = ag.tm[(size_t)2 * t + 1];
+                    }
+                    for (int i = 0; i < ag.n_live; i++)
+                        h_live_all[(size_t)ag.live_off + i] = ag.live[(size_t)i];
+                }
+                const bool pack_fit = (tm_total <= 2 * max_tiles) && (n_active <= 64) &&
+                                     (2 * tm_total + n_active <= 4 * max_tiles);
+
+                // Reuse decode stream_k (=sa) / stream_v (=sb) for MoE; host-join so s.stream
+                // never accumulates cross-stream WaitEvents from the group loop.
+                cudaStream_t sa = moe_overlap ? s.stream_k : st;
+                cudaStream_t sb = moe_overlap ? s.stream_v : st;
+                if (moe_overlap) {
+                    pf_cu(cudaEventRecord(moe_ev_ready, st), "moe fork");
+                    pf_cu(cudaStreamWaitEvent(sa, moe_ev_ready, 0), "moe sa wait");
+                    pf_cu(cudaStreamWaitEvent(sb, moe_ev_ready, 0), "moe sb wait");
+                }
+                pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), sa), "routed zero");
+
+                int* d_nt_pack = nullptr;
+                if (pack_fit && n_active > 0) {
+                    d_nt_pack = tilemap + 2 * tm_total;
+                    pf_cu(cudaMemcpyAsync(tilemap, h_tm_all.data(),
+                                          (size_t)2 * tm_total * sizeof(int),
+                                          cudaMemcpyHostToDevice, sa), "moe all tm H2D");
+                    pf_cu(cudaMemcpyAsync(d_nt_pack, h_nt_all.data(),
+                                          (size_t)n_active * sizeof(int),
+                                          cudaMemcpyHostToDevice, sa), "moe all nt H2D");
+                }
+                // One-shot live-expert index upload (stable for all group gathers — no per-group race).
+                if (d_live_le && live_total > 0) {
+                    pf_cu(cudaMemcpyAsync(d_live_le, h_live_all.data(),
+                                          (size_t)live_total * sizeof(int),
+                                          cudaMemcpyHostToDevice, sa), "moe all live H2D");
+                }
+
+                auto dq_gateup = [&](const ActiveGroup& ag) {
+                    const int n_live = ag.n_live;
+                    if (n_live <= 0) return;
+                    const void* ge0 = (const char*)w.gate_q +
+                        (size_t)ag.base * (size_t)mffn * g_rb;
+                    const void* ue0 = (const char*)w.up_q +
+                        (size_t)ag.base * (size_t)mffn * u_rb;
+                    const size_t g_eb = (size_t)mffn * g_rb;
+                    const size_t u_eb = (size_t)mffn * u_rb;
+                    // Full group live + same type: one fused contiguous pair launch.
+                    if (n_live == ag.n_in && !moe_overlap && w.gate_qtype == w.up_qtype) {
+                        if (kernels::launch_gguf_dequant_rows_i8_pair(
+                                w.gate_qtype, ge0, Wg_i8, swg, ue0, Wu_i8, swu,
+                                ag.n_in * mffn, H, sa))
+                            return;
+                    }
+                    if (n_live == ag.n_in && !moe_overlap) {
+                        kernels::launch_gguf_dequant_rows_i8(
+                            w.gate_qtype, ge0, Wg_i8, swg, ag.n_in * mffn, H, sa);
+                        kernels::launch_gguf_dequant_rows_i8(
+                            w.up_qtype, ue0, Wu_i8, swu, ag.n_in * mffn, H, sa);
+                        return;
+                    }
+                    // Sparse: optional one-shot gather (SPARKINFER_PREFILL_MOE_GATHER=1).
+                    // Default OFF: gather still needs accuracy bake-off; coalesce+pair is the win.
+                    static const int use_gather = [] {
+                        const char* e = getenv("SPARKINFER_PREFILL_MOE_GATHER");
+                        return (e && e[0] == '1') ? 1 : 0;
+                    }();
+                    const int* d_live = d_live_le + ag.live_off;
+                    const int* h_live = ag.live.data();
+                    if (use_gather && !moe_overlap && w.gate_qtype == w.up_qtype && d_live_le &&
+                        kernels::launch_gguf_dequant_rows_i8_gather_pair(
+                            w.gate_qtype, ge0, Wg_i8, swg, ue0, Wu_i8, swu,
+                            d_live, n_live, mffn, H, g_eb, u_eb, sa))
+                        return;
+                    // Pair each contiguous live run (same-type gate+up) — big @512 win vs serial.
+                    if (!moe_overlap && w.gate_qtype == w.up_qtype) {
+                        int i = 0;
+                        while (i < n_live) {
+                            int le0 = h_live[i], run = 1;
+                            while (i + run < n_live && h_live[i + run] == le0 + run) run++;
+                            const void* ge = (const char*)ge0 + (size_t)le0 * g_eb;
+                            const void* ue = (const char*)ue0 + (size_t)le0 * u_eb;
+                            if (!kernels::launch_gguf_dequant_rows_i8_pair(
+                                    w.gate_qtype, ge, Wg_i8 + (size_t)le0 * mffn * H,
+                                    swg + (size_t)le0 * mffn,
+                                    ue, Wu_i8 + (size_t)le0 * mffn * H,
+                                    swu + (size_t)le0 * mffn, run * mffn, H, sa)) {
+                                kernels::launch_gguf_dequant_rows_i8(
+                                    w.gate_qtype, ge, Wg_i8 + (size_t)le0 * mffn * H,
+                                    swg + (size_t)le0 * mffn, run * mffn, H, sa);
+                                kernels::launch_gguf_dequant_rows_i8(
+                                    w.up_qtype, ue, Wu_i8 + (size_t)le0 * mffn * H,
+                                    swu + (size_t)le0 * mffn, run * mffn, H, sa);
+                            }
+                            i += run;
+                        }
+                        return;
+                    }
+                    auto dq_g = [&](int qtype, const void* src0, signed char* dst, float* sc,
+                                    size_t eb, cudaStream_t ds) {
+                        if (use_gather && d_live_le &&
+                            kernels::launch_gguf_dequant_rows_i8_gather(
+                                qtype, src0, dst, sc, d_live, n_live, mffn, H, eb, ds))
+                            return;
+                        int i = 0;
+                        while (i < n_live) {
+                            int le0 = h_live[i], run = 1;
+                            while (i + run < n_live && h_live[i + run] == le0 + run) run++;
+                            const void* src = (const char*)src0 + (size_t)le0 * eb;
+                            kernels::launch_gguf_dequant_rows_i8(
+                                qtype, src, dst + (size_t)le0 * mffn * H,
+                                sc + (size_t)le0 * mffn, run * mffn, H, ds);
+                            i += run;
+                        }
+                    };
+                    dq_g(w.gate_qtype, ge0, Wg_i8, swg, g_eb, sa);
+                    if (moe_overlap) {
+                        dq_g(w.up_qtype, ue0, Wu_i8, swu, u_eb, sb);
+                        pf_cu(cudaEventRecord(moe_ev_up, sb), "moe up done");
+                        pf_cu(cudaStreamWaitEvent(sa, moe_ev_up, 0), "moe sa wait up");
+                    } else {
+                        dq_g(w.up_qtype, ue0, Wu_i8, swu, u_eb, sa);
+                    }
+                };
+                auto dq_down = [&](const ActiveGroup& ag, cudaStream_t ds) {
+                    const int n_live = ag.n_live;
+                    if (n_live <= 0) return;
+                    const void* de0 = (const char*)w.down_q +
+                        (size_t)ag.base * (size_t)H * d_rb;
+                    const size_t d_eb = (size_t)H * d_rb;
+                    if (n_live == ag.n_in) {
+                        kernels::launch_gguf_dequant_rows_i8(
+                            w.down_qtype, de0, Wd_i8, swd, ag.n_in * H, mffn, ds);
+                        return;
+                    }
+                    const int* d_live = d_live_le + ag.live_off;
+                    const int* h_live = ag.live.data();
+                    static const int use_gather_dn = [] {
+                        const char* e = getenv("SPARKINFER_PREFILL_MOE_GATHER");
+                        return (e && e[0] == '1') ? 1 : 0;
+                    }();
+                    if (use_gather_dn && d_live_le &&
+                        kernels::launch_gguf_dequant_rows_i8_gather(
+                            w.down_qtype, de0, Wd_i8, swd, d_live, n_live, H, mffn, d_eb, ds))
+                        return;
+                    int i = 0;
+                    while (i < n_live) {
+                        int le0 = h_live[i], run = 1;
+                        while (i + run < n_live && h_live[i + run] == le0 + run) run++;
+                        const void* de = (const char*)de0 + (size_t)le0 * d_eb;
+                        kernels::launch_gguf_dequant_rows_i8(
+                            w.down_qtype, de, Wd_i8 + (size_t)le0 * H * mffn,
+                            swd + (size_t)le0 * H, run * H, mffn, ds);
+                        i += run;
+                    }
                 };
 
-                // Dual tilemap buffers: H2D into free buf while GEMM reads the other.
-                int tm_buf = 0;
-                bool tm_used[2] = {false, false};
-                auto upload_tm = [&](const ActiveGroup& ag) {
-                    if (tm_used[tm_buf])
-                        pf_cu(cudaStreamWaitEvent(moe_st_aux, moe_ev_gemm[tm_buf], 0),
-                              "moe h2d wait old buf");
-                    int* tm = tilemap + (size_t)tm_buf * 2 * max_tiles;
-                    int* nt = d_ntiles + tm_buf;
-                    pf_cu(cudaMemcpyAsync(tm, ag.tm.data(), (size_t)2 * ag.ntm * sizeof(int),
-                                          cudaMemcpyHostToDevice, moe_st_aux), "moe tm H2D");
-                    pf_cu(cudaMemcpyAsync(nt, &ag.ntm, sizeof(int),
-                                          cudaMemcpyHostToDevice, moe_st_aux), "moe ntm H2D");
-                    pf_cu(cudaEventRecord(moe_ev_h2d, moe_st_aux), "moe h2d done");
-                };
-                auto dequant_gateup = [&](int slot, const ActiveGroup& ag, cudaStream_t s) {
-                    signed char *Wg_s, *Wu_s, *Wd_s; float *swg_s, *swu_s, *swd_s;
-                    slot_w(slot, Wg_s, Wu_s, Wd_s, swg_s, swu_s, swd_s);
-                    (void)Wd_s; (void)swd_s;
-                    int n_live = 0;
-                    for (int le = 0; le < ag.n_in; le++)
-                        if (h_counts[ag.base + le] > 0) n_live++;
-                    // Sparse only when enough empties to beat one contiguous launch.
-                    if (n_live > 0 && n_live * 2 <= ag.n_in) {
-                        for (int le = 0; le < ag.n_in; le++) {
-                            const int e = ag.base + le;
-                            if (h_counts[e] <= 0) continue;
-                            const void* ge = (const char*)w.gate_q + (size_t)e * (size_t)mffn * g_rb;
-                            const void* ue = (const char*)w.up_q   + (size_t)e * (size_t)mffn * u_rb;
-                            kernels::launch_gguf_dequant_rows_i8(
-                                w.gate_qtype, ge, Wg_s + (size_t)le * mffn * H,
-                                swg_s + (size_t)le * mffn, mffn, H, s);
-                            kernels::launch_gguf_dequant_rows_i8(
-                                w.up_qtype, ue, Wu_s + (size_t)le * mffn * H,
-                                swu_s + (size_t)le * mffn, mffn, H, s);
-                        }
+                // Kick tiny shared-gate scalar on stream_k (≈2KB write) behind MoE.
+                // Only when gate_inp is already float — quantized dq() would trash MoE scratch.
+                if (moe_hide_sg && c.n_shared > 0 && w.shared_gate_inp &&
+                    !w.shared_gate_inp_type &&
+                    (w.shared_gate_q || w.shared_gate)) {
+                    kernels::launch_pfm_shared_gate(
+                        hn, w.shared_gate_inp, dw, N, H, s.stream_k);
+                    pf_cu(cudaEventRecord(moe_ev_sg, s.stream_k), "moe sg done");
+                    sg_hid = true;
+                }
+
+                for (int gi = 0; gi < n_active; gi++) {
+                    const ActiveGroup& ag = active[(size_t)gi];
+                    int* tm;
+                    int* nt;
+                    if (pack_fit) {
+                        tm = tilemap + 2 * ag.tm_off;
+                        nt = d_nt_pack + gi;
                     } else {
-                        const void* ge = (const char*)w.gate_q + (size_t)ag.base * (size_t)mffn * g_rb;
-                        const void* ue = (const char*)w.up_q   + (size_t)ag.base * (size_t)mffn * u_rb;
-                        kernels::launch_gguf_dequant_rows_i8(
-                            w.gate_qtype, ge, Wg_s, swg_s, ag.n_in * mffn, H, s);
-                        kernels::launch_gguf_dequant_rows_i8(
-                            w.up_qtype, ue, Wu_s, swu_s, ag.n_in * mffn, H, s);
+                        tm = tilemap;
+                        nt = d_ntiles;
+                        pf_cu(cudaMemcpyAsync(tm, ag.tm.data(),
+                                              (size_t)2 * ag.ntm * sizeof(int),
+                                              cudaMemcpyHostToDevice, sa), "moe tm H2D");
+                        pf_cu(cudaMemcpyAsync(nt, &ag.ntm, sizeof(int),
+                                              cudaMemcpyHostToDevice, sa), "moe ntm H2D");
                     }
-                    if (moe_pipe) pf_cu(cudaEventRecord(moe_ev_dq[slot], s), "moe gateup dq");
-                };
-                auto gemm_gateup = [&](int slot, const ActiveGroup& ag, cudaStream_t s) {
-                    signed char *Wg_s, *Wu_s, *Wd_s; float *swg_s, *swu_s, *swd_s;
-                    slot_w(slot, Wg_s, Wu_s, Wd_s, swg_s, swu_s, swd_s);
-                    (void)Wd_s; (void)swd_s;
-                    int* tm = tilemap + (size_t)tm_buf * 2 * max_tiles;
-                    int* nt = d_ntiles + tm_buf;
-                    if (moe_pipe) pf_cu(cudaStreamWaitEvent(s, moe_ev_dq[slot], 0), "moe wait dq");
-                    pf_cu(cudaStreamWaitEvent(s, moe_ev_h2d, 0), "moe wait h2d");
+                    dq_gateup(ag);
                     kernels::launch_pfm_moe_gemm_i8_bm_base(
-                        mA_i8, msx, Wg_s, swg_s, pair_tok, pair_w, moffsets, tm, nt,
+                        mA_i8, msx, Wg_i8, swg, pair_tok, pair_w, moffsets, tm, nt,
                         hg, nullptr, mffn, H, ag.ntm, moe_bm, ag.base,
-                        /*a_indirect=*/true, /*c_scatter=*/false, s);
+                        /*a_indirect=*/true, /*c_scatter=*/false, sa);
                     kernels::launch_pfm_moe_gemm_i8_bm_base(
-                        mA_i8, msx, Wu_s, swu_s, pair_tok, pair_w, moffsets, tm, nt,
-                        hu, nullptr, mffn, H, ag.ntm, moe_bm, ag.base, true, false, s);
-                    pf_cu(cudaEventRecord(moe_ev_gemm[tm_buf], s), "moe gemm done");
-                    if (moe_pipe) pf_cu(cudaEventRecord(moe_ev_done[slot], s), "moe gateup done");
-                    tm_used[tm_buf] = true;
-                    tm_buf ^= 1;
-                };
-
-                if (moe_pipe && n_active > 0) {
-                    pf_cu(cudaEventRecord(moe_ev_ready, st), "moe ready");
-                    pf_cu(cudaStreamWaitEvent(moe_st_aux, moe_ev_ready, 0), "moe aux wait ready");
-                    dequant_gateup(0, active[0], moe_st_aux);
+                        mA_i8, msx, Wu_i8, swu, pair_tok, pair_w, moffsets, tm, nt,
+                        hu, nullptr, mffn, H, ag.ntm, moe_bm, ag.base, true, false, sa);
                 }
+
+                // down0∥SwiGLU disabled: full-group down dequant on a side stream exceeds the
+                // ~4KB/op decode-poison threshold.
+                kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, sa);
+                kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, sa);
+
                 for (int gi = 0; gi < n_active; gi++) {
-                    const int slot = moe_pipe ? (gi & 1) : 0;
                     const ActiveGroup& ag = active[(size_t)gi];
-                    if (!moe_pipe) {
-                        upload_tm(ag);
-                        dequant_gateup(slot, ag, st);
-                        gemm_gateup(slot, ag, st);
+                    int* tm;
+                    int* nt;
+                    if (pack_fit) {
+                        tm = tilemap + 2 * ag.tm_off;
+                        nt = d_nt_pack + gi;
                     } else {
-                        upload_tm(ag);
-                        if (gi + 1 < n_active) {
-                            const int ns = (gi + 1) & 1;
-                            if (gi >= 1)
-                                pf_cu(cudaStreamWaitEvent(moe_st_aux, moe_ev_done[ns], 0),
-                                      "moe dq wait slot");
-                            dequant_gateup(ns, active[(size_t)gi + 1], moe_st_aux);
-                        }
-                        gemm_gateup(slot, ag, st);
+                        tm = tilemap;
+                        nt = d_ntiles;
+                        pf_cu(cudaMemcpyAsync(tm, ag.tm.data(),
+                                              (size_t)2 * ag.ntm * sizeof(int),
+                                              cudaMemcpyHostToDevice, sa), "moe down tm");
+                        pf_cu(cudaMemcpyAsync(nt, &ag.ntm, sizeof(int),
+                                              cudaMemcpyHostToDevice, sa), "moe down ntm");
                     }
-                }
-                if (moe_pipe && n_active > 0)
-                    pf_cu(cudaStreamWaitEvent(st, moe_ev_done[(n_active - 1) & 1], 0), "moe gateup join");
-
-                kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, st);
-                kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, st);
-
-                auto dequant_down = [&](int slot, const ActiveGroup& ag, cudaStream_t s) {
-                    signed char *Wg_s, *Wu_s, *Wd_s; float *swg_s, *swu_s, *swd_s;
-                    slot_w(slot, Wg_s, Wu_s, Wd_s, swg_s, swu_s, swd_s);
-                    (void)Wg_s; (void)Wu_s; (void)swg_s; (void)swu_s;
-                    int n_live = 0;
-                    for (int le = 0; le < ag.n_in; le++)
-                        if (h_counts[ag.base + le] > 0) n_live++;
-                    if (n_live > 0 && n_live * 2 <= ag.n_in) {
-                        for (int le = 0; le < ag.n_in; le++) {
-                            const int e = ag.base + le;
-                            if (h_counts[e] <= 0) continue;
-                            const void* de = (const char*)w.down_q + (size_t)e * (size_t)H * d_rb;
-                            kernels::launch_gguf_dequant_rows_i8(
-                                w.down_qtype, de, Wd_s + (size_t)le * H * mffn,
-                                swd_s + (size_t)le * H, H, mffn, s);
-                        }
-                    } else {
-                        const void* de = (const char*)w.down_q + (size_t)ag.base * (size_t)H * d_rb;
-                        kernels::launch_gguf_dequant_rows_i8(
-                            w.down_qtype, de, Wd_s, swd_s, ag.n_in * H, mffn, s);
-                    }
-                    if (moe_pipe) pf_cu(cudaEventRecord(moe_ev_dq[slot], s), "moe down dq");
-                };
-                auto gemm_down = [&](int slot, const ActiveGroup& ag, cudaStream_t s) {
-                    signed char *Wg_s, *Wu_s, *Wd_s; float *swg_s, *swu_s, *swd_s;
-                    slot_w(slot, Wg_s, Wu_s, Wd_s, swg_s, swu_s, swd_s);
-                    (void)Wg_s; (void)Wu_s; (void)swg_s; (void)swu_s;
-                    int* tm = tilemap + (size_t)tm_buf * 2 * max_tiles;
-                    int* nt = d_ntiles + tm_buf;
-                    if (moe_pipe) pf_cu(cudaStreamWaitEvent(s, moe_ev_dq[slot], 0), "moe down wait dq");
-                    pf_cu(cudaStreamWaitEvent(s, moe_ev_h2d, 0), "moe down wait h2d");
+                    dq_down(ag, sa);
                     kernels::launch_pfm_moe_gemm_i8_bm_base(
-                        h_i8, sh, Wd_s, swd_s, pair_tok, pair_w, moffsets, tm, nt,
+                        h_i8, sh, Wd_i8, swd, pair_tok, pair_w, moffsets, tm, nt,
                         nullptr, routed_f32, H, mffn, ag.ntm, moe_bm, ag.base,
-                        /*a_indirect=*/false, /*c_scatter=*/true, s);
-                    pf_cu(cudaEventRecord(moe_ev_gemm[tm_buf], s), "moe down gemm done");
-                    if (moe_pipe) pf_cu(cudaEventRecord(moe_ev_done[slot], s), "moe down done");
-                    tm_used[tm_buf] = true;
-                    tm_buf ^= 1;
-                };
-
-                if (moe_pipe && n_active > 0) {
-                    pf_cu(cudaEventRecord(moe_ev_ready, st), "moe down ready");
-                    pf_cu(cudaStreamWaitEvent(moe_st_aux, moe_ev_ready, 0), "moe aux down ready");
-                    if (n_active > 1)
-                        pf_cu(cudaStreamWaitEvent(moe_st_aux, moe_ev_done[0], 0), "moe down slot0");
-                    dequant_down(0, active[0], moe_st_aux);
+                        /*a_indirect=*/false, /*c_scatter=*/true, sa);
                 }
-                for (int gi = 0; gi < n_active; gi++) {
-                    const int slot = moe_pipe ? (gi & 1) : 0;
-                    const ActiveGroup& ag = active[(size_t)gi];
-                    if (!moe_pipe) {
-                        upload_tm(ag);
-                        dequant_down(slot, ag, st);
-                        gemm_down(slot, ag, st);
-                    } else {
-                        upload_tm(ag);
-                        if (gi + 1 < n_active) {
-                            const int ns = (gi + 1) & 1;
-                            pf_cu(cudaStreamWaitEvent(moe_st_aux, moe_ev_done[ns], 0),
-                                  "moe down dq wait");
-                            dequant_down(ns, active[(size_t)gi + 1], moe_st_aux);
-                        }
-                        gemm_down(slot, ag, st);
-                    }
+                if (moe_overlap) {
+                    // Host-join private streams — do NOT cudaStreamWaitEvent onto s.stream
+                    // (cross-stream waits on the decode stream permanently slow graph replay).
+                    pf_cu(cudaStreamSynchronize(sa), "moe sa join");
                 }
-                if (moe_pipe && n_active > 0)
-                    pf_cu(cudaStreamWaitEvent(st, moe_ev_done[(n_active - 1) & 1], 0), "moe down join");
             } else {
                 // Bulk: expert weights -> int8 rows ONCE per layer (all 256 experts).
                 kernels::launch_gguf_dequant_rows_i8(w.gate_qtype, w.gate_q, Wg_i8, swg, E * mffn, H, st);
@@ -775,9 +858,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 const int sdt = w.shared_down_q ? w.shared_down_qtype : 0;
                 const bool has_gi = w.shared_gate_inp != nullptr;
                 if (has_gi) {
-                    const void* gi = w.shared_gate_inp_type
-                        ? dq(w.shared_gate_inp, w.shared_gate_inp_type, 1, H) : w.shared_gate_inp;
-                    kernels::launch_pfm_shared_gate(hn, gi, dw, N, H, st);
+                    if (sg_hid) {
+                        // Join tiny stream_k write before dw is consumed on st.
+                        pf_cu(cudaStreamWaitEvent(st, moe_ev_sg, 0), "moe wait sg");
+                    } else {
+                        const void* gi = w.shared_gate_inp_type
+                            ? dq(w.shared_gate_inp, w.shared_gate_inp_type, 1, H)
+                            : w.shared_gate_inp;
+                        kernels::launch_pfm_shared_gate(hn, gi, dw, N, H, st);
+                    }
                 }
                 const bool restore_i8_sh = use_i8;
                 if (moe_shared_i8) use_i8 = true;
@@ -797,21 +886,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
     }
 
-    if (moe_serial) {
-        // Drain aux work so a subsequent decode bench isn't scheduled against leftover cmds.
-        pf_cu(cudaStreamSynchronize(moe_st_aux), "moe aux sync");
-        if (moe_pipe) {
-            for (int sidx = 0; sidx < moe_slots; sidx++) {
-                cudaEventDestroy(moe_ev_dq[sidx]);
-                cudaEventDestroy(moe_ev_done[sidx]);
-            }
-        }
-        cudaEventDestroy(moe_ev_h2d);
-        cudaEventDestroy(moe_ev_gemm[0]);
-        cudaEventDestroy(moe_ev_gemm[1]);
+    if (moe_overlap) {
+        pf_cu(cudaStreamSynchronize(s.stream_k), "moe sk sync");
+        pf_cu(cudaStreamSynchronize(s.stream_v), "moe sv sync");
+        cudaEventDestroy(moe_ev_up);
+        cudaEventDestroy(moe_ev_down0);
         cudaEventDestroy(moe_ev_ready);
-        cudaStreamDestroy(moe_st_aux);
     }
+    if (moe_hide_sg)
+        cudaEventDestroy(moe_ev_sg);
 
     // Seed for the first decode step: argmax at the last prompt position (xn already = final norm).
     const bf16* xn_last = xn + (size_t)(N - 1) * H;

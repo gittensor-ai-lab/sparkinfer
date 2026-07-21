@@ -1365,7 +1365,8 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     auto it = s.sessions.find(s.active_seq_id);
     float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;
     bf16* lin_conv = (it != s.sessions.end()) ? it->second.lin_conv_state : s.lin_conv_state;
-    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.active_seq_id, lin_state, lin_conv,
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
+                          lin_state, lin_conv,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim };
     return prefill_batched_run(ctx, prompt_ids, n);

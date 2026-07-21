@@ -147,6 +147,258 @@ bool dispatch(const unsigned char* s, signed char* q, float* scale, int rows, in
     return true;
 }
 
+// Dual-tensor: grid = 2*rows. which = blockIdx.x / rows selects src/dst.
+template <int QT, int NG>
+__global__ __launch_bounds__(DQR_BLOCK) void deq_rows_i8_vec_pair_kernel(
+        const unsigned char* __restrict__ src0, signed char* __restrict__ q0, float* __restrict__ scale0,
+        const unsigned char* __restrict__ src1, signed char* __restrict__ q1, float* __restrict__ scale1,
+        int rows, int cols) {
+    constexpr int BS = (QT == DQR_Q4_K) ? 144 : 210;
+    constexpr int GSPAN = DQR_BLOCK * DQR_VEC;
+    const int which = (int)(blockIdx.x / (unsigned)rows);
+    const int row = (int)(blockIdx.x - (unsigned)which * (unsigned)rows);
+    const unsigned char* src = which ? src1 : src0;
+    signed char* q = which ? q1 : q0;
+    float* scale = which ? scale1 : scale0;
+
+    const int t = threadIdx.x;
+    const int nsb = cols >> 8;
+    const unsigned char* rbase = src + (size_t)row * nsb * BS;
+
+    float v[NG][DQR_VEC];
+    float amax = 0.f;
+    #pragma unroll
+    for (int g = 0; g < NG; g++) {
+        const int base = g * GSPAN + t * DQR_VEC;
+        if (base < cols) {
+            const unsigned char* blk = rbase + (size_t)(base >> 8) * BS;
+            const int off = base & 255;
+            #pragma unroll
+            for (int i = 0; i < DQR_VEC; i++) {
+                v[g][i] = (QT == DQR_Q4_K) ? dqr_q4k_val(blk, off + i) : dqr_q6k_val(blk, off + i);
+                amax = fmaxf(amax, fabsf(v[g][i]));
+            }
+        }
+    }
+
+    __shared__ float swarp[DQR_BLOCK / 32];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((t & 31) == 0) swarp[t >> 5] = amax;
+    __syncthreads();
+    if (t < 32) {
+        float w = (t < DQR_BLOCK / 32) ? swarp[t] : 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) w = fmaxf(w, __shfl_xor_sync(0xffffffffu, w, o));
+        if (t == 0) swarp[0] = w;
+    }
+    __syncthreads();
+    const float d = swarp[0] / 127.f;
+    if (t == 0) scale[row] = d;
+    const float inv = (d > 0.f) ? (1.f / d) : 0.f;
+
+    signed char* qrow = q + (size_t)row * cols;
+    #pragma unroll
+    for (int g = 0; g < NG; g++) {
+        const int base = g * GSPAN + t * DQR_VEC;
+        if (base < cols) {
+            signed char o[DQR_VEC];
+            #pragma unroll
+            for (int i = 0; i < DQR_VEC; i++) o[i] = (signed char)(int)roundf(v[g][i] * inv);
+            *reinterpret_cast<unsigned*>(&qrow[base]) = *reinterpret_cast<const unsigned*>(o);
+        }
+    }
+}
+
+template <int QT>
+bool dispatch_pair(const unsigned char* s0, signed char* q0, float* sc0,
+                   const unsigned char* s1, signed char* q1, float* sc1,
+                   int rows, int cols, cudaStream_t stream) {
+    const int ng = (cols + DQR_BLOCK * DQR_VEC - 1) / (DQR_BLOCK * DQR_VEC);
+    const int grid = 2 * rows;
+    if (ng <= 4)
+        deq_rows_i8_vec_pair_kernel<QT, 4><<<grid, DQR_BLOCK, 0, stream>>>(s0, q0, sc0, s1, q1, sc1, rows, cols);
+    else if (ng <= 8)
+        deq_rows_i8_vec_pair_kernel<QT, 8><<<grid, DQR_BLOCK, 0, stream>>>(s0, q0, sc0, s1, q1, sc1, rows, cols);
+    else if (ng <= 12)
+        deq_rows_i8_vec_pair_kernel<QT, 12><<<grid, DQR_BLOCK, 0, stream>>>(s0, q0, sc0, s1, q1, sc1, rows, cols);
+    else return false;
+    return true;
+}
+
+// Sparse gather: blockIdx.x = live_i * rows_per_expert + row_in_expert.
+template <int QT, int NG>
+__global__ __launch_bounds__(DQR_BLOCK) void deq_rows_i8_vec_gather_kernel(
+        const unsigned char* __restrict__ src0, signed char* __restrict__ q0,
+        float* __restrict__ scale0, const int* __restrict__ live_le,
+        int rows_per_expert, int cols, size_t expert_bytes) {
+    constexpr int BS = (QT == DQR_Q4_K) ? 144 : 210;
+    constexpr int GSPAN = DQR_BLOCK * DQR_VEC;
+    const int live_i = (int)(blockIdx.x / (unsigned)rows_per_expert);
+    const int row_in = (int)(blockIdx.x - (unsigned)live_i * (unsigned)rows_per_expert);
+    const int le = live_le[live_i];
+    const int t = threadIdx.x;
+    const int nsb = cols >> 8;
+    const size_t row_bytes = (size_t)nsb * (size_t)BS;
+    const unsigned char* rbase = src0 + (size_t)le * expert_bytes + (size_t)row_in * row_bytes;
+    float* scale = scale0 + (size_t)le * (size_t)rows_per_expert + (size_t)row_in;
+    signed char* qrow = q0 + ((size_t)le * (size_t)rows_per_expert + (size_t)row_in) * (size_t)cols;
+
+    float v[NG][DQR_VEC];
+    float amax = 0.f;
+    #pragma unroll
+    for (int g = 0; g < NG; g++) {
+        const int base = g * GSPAN + t * DQR_VEC;
+        if (base < cols) {
+            const unsigned char* blk = rbase + (size_t)(base >> 8) * BS;
+            const int off = base & 255;
+            #pragma unroll
+            for (int i = 0; i < DQR_VEC; i++) {
+                v[g][i] = (QT == DQR_Q4_K) ? dqr_q4k_val(blk, off + i) : dqr_q6k_val(blk, off + i);
+                amax = fmaxf(amax, fabsf(v[g][i]));
+            }
+        }
+    }
+
+    __shared__ float swarp[DQR_BLOCK / 32];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((t & 31) == 0) swarp[t >> 5] = amax;
+    __syncthreads();
+    if (t < 32) {
+        float w = (t < DQR_BLOCK / 32) ? swarp[t] : 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) w = fmaxf(w, __shfl_xor_sync(0xffffffffu, w, o));
+        if (t == 0) swarp[0] = w;
+    }
+    __syncthreads();
+    const float d = swarp[0] / 127.f;
+    if (t == 0) *scale = d;
+    const float inv = (d > 0.f) ? (1.f / d) : 0.f;
+
+    #pragma unroll
+    for (int g = 0; g < NG; g++) {
+        const int base = g * GSPAN + t * DQR_VEC;
+        if (base < cols) {
+            signed char o[DQR_VEC];
+            #pragma unroll
+            for (int i = 0; i < DQR_VEC; i++) o[i] = (signed char)(int)roundf(v[g][i] * inv);
+            *reinterpret_cast<unsigned*>(&qrow[base]) = *reinterpret_cast<const unsigned*>(o);
+        }
+    }
+}
+
+template <int QT, int NG>
+__global__ __launch_bounds__(DQR_BLOCK) void deq_rows_i8_vec_gather_pair_kernel(
+        const unsigned char* __restrict__ src0, signed char* __restrict__ q0, float* __restrict__ scale0,
+        const unsigned char* __restrict__ src1, signed char* __restrict__ q1, float* __restrict__ scale1,
+        const int* __restrict__ live_le, int n_rows, int rows_per_expert, int cols,
+        size_t expert_bytes0, size_t expert_bytes1) {
+    constexpr int BS = (QT == DQR_Q4_K) ? 144 : 210;
+    constexpr int GSPAN = DQR_BLOCK * DQR_VEC;
+    const int which = (int)(blockIdx.x / (unsigned)n_rows);
+    const int flat = (int)(blockIdx.x - (unsigned)which * (unsigned)n_rows);
+    const int live_i = flat / rows_per_expert;
+    const int row_in = flat - live_i * rows_per_expert;
+    const int le = live_le[live_i];
+    const int t = threadIdx.x;
+    const int nsb = cols >> 8;
+    const size_t row_bytes = (size_t)nsb * (size_t)BS;
+    const unsigned char* src = which ? src1 : src0;
+    const size_t expert_bytes = which ? expert_bytes1 : expert_bytes0;
+    signed char* q0b = which ? q1 : q0;
+    float* scale0b = which ? scale1 : scale0;
+    const unsigned char* rbase = src + (size_t)le * expert_bytes + (size_t)row_in * row_bytes;
+    float* scale = scale0b + (size_t)le * (size_t)rows_per_expert + (size_t)row_in;
+    signed char* qrow = q0b + ((size_t)le * (size_t)rows_per_expert + (size_t)row_in) * (size_t)cols;
+
+    float v[NG][DQR_VEC];
+    float amax = 0.f;
+    #pragma unroll
+    for (int g = 0; g < NG; g++) {
+        const int base = g * GSPAN + t * DQR_VEC;
+        if (base < cols) {
+            const unsigned char* blk = rbase + (size_t)(base >> 8) * BS;
+            const int off = base & 255;
+            #pragma unroll
+            for (int i = 0; i < DQR_VEC; i++) {
+                v[g][i] = (QT == DQR_Q4_K) ? dqr_q4k_val(blk, off + i) : dqr_q6k_val(blk, off + i);
+                amax = fmaxf(amax, fabsf(v[g][i]));
+            }
+        }
+    }
+
+    __shared__ float swarp[DQR_BLOCK / 32];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((t & 31) == 0) swarp[t >> 5] = amax;
+    __syncthreads();
+    if (t < 32) {
+        float w = (t < DQR_BLOCK / 32) ? swarp[t] : 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) w = fmaxf(w, __shfl_xor_sync(0xffffffffu, w, o));
+        if (t == 0) swarp[0] = w;
+    }
+    __syncthreads();
+    const float d = swarp[0] / 127.f;
+    if (t == 0) *scale = d;
+    const float inv = (d > 0.f) ? (1.f / d) : 0.f;
+
+    #pragma unroll
+    for (int g = 0; g < NG; g++) {
+        const int base = g * GSPAN + t * DQR_VEC;
+        if (base < cols) {
+            signed char o[DQR_VEC];
+            #pragma unroll
+            for (int i = 0; i < DQR_VEC; i++) o[i] = (signed char)(int)roundf(v[g][i] * inv);
+            *reinterpret_cast<unsigned*>(&qrow[base]) = *reinterpret_cast<const unsigned*>(o);
+        }
+    }
+}
+
+template <int QT>
+bool dispatch_gather(const unsigned char* src0, signed char* q0, float* scale0,
+                     const int* live_le, int n_live, int rows_per_expert, int cols,
+                     size_t expert_bytes, cudaStream_t stream) {
+    const int ng = (cols + DQR_BLOCK * DQR_VEC - 1) / (DQR_BLOCK * DQR_VEC);
+    const int grid = n_live * rows_per_expert;
+    if (ng <= 4)
+        deq_rows_i8_vec_gather_kernel<QT, 4><<<grid, DQR_BLOCK, 0, stream>>>(
+            src0, q0, scale0, live_le, rows_per_expert, cols, expert_bytes);
+    else if (ng <= 8)
+        deq_rows_i8_vec_gather_kernel<QT, 8><<<grid, DQR_BLOCK, 0, stream>>>(
+            src0, q0, scale0, live_le, rows_per_expert, cols, expert_bytes);
+    else if (ng <= 12)
+        deq_rows_i8_vec_gather_kernel<QT, 12><<<grid, DQR_BLOCK, 0, stream>>>(
+            src0, q0, scale0, live_le, rows_per_expert, cols, expert_bytes);
+    else return false;
+    return true;
+}
+
+template <int QT>
+bool dispatch_gather_pair(const unsigned char* src0, signed char* q0, float* scale0,
+                          const unsigned char* src1, signed char* q1, float* scale1,
+                          const int* live_le, int n_live, int rows_per_expert, int cols,
+                          size_t expert_bytes0, size_t expert_bytes1, cudaStream_t stream) {
+    const int ng = (cols + DQR_BLOCK * DQR_VEC - 1) / (DQR_BLOCK * DQR_VEC);
+    const int n_rows = n_live * rows_per_expert;
+    const int grid = 2 * n_rows;
+    if (ng <= 4)
+        deq_rows_i8_vec_gather_pair_kernel<QT, 4><<<grid, DQR_BLOCK, 0, stream>>>(
+            src0, q0, scale0, src1, q1, scale1, live_le, n_rows, rows_per_expert, cols,
+            expert_bytes0, expert_bytes1);
+    else if (ng <= 8)
+        deq_rows_i8_vec_gather_pair_kernel<QT, 8><<<grid, DQR_BLOCK, 0, stream>>>(
+            src0, q0, scale0, src1, q1, scale1, live_le, n_rows, rows_per_expert, cols,
+            expert_bytes0, expert_bytes1);
+    else if (ng <= 12)
+        deq_rows_i8_vec_gather_pair_kernel<QT, 12><<<grid, DQR_BLOCK, 0, stream>>>(
+            src0, q0, scale0, src1, q1, scale1, live_le, n_rows, rows_per_expert, cols,
+            expert_bytes0, expert_bytes1);
+    else return false;
+    return true;
+}
+
 }  // namespace
 
 bool launch_gguf_dequant_rows_i8_fast(int ggml_type, const void* src, signed char* q, float* scale,
@@ -161,6 +413,71 @@ bool launch_gguf_dequant_rows_i8_fast(int ggml_type, const void* src, signed cha
     auto s = reinterpret_cast<const unsigned char*>(src);
     if (ggml_type == DQR_Q4_K) return dispatch<DQR_Q4_K>(s, q, scale, rows, cols, stream);
     if (ggml_type == DQR_Q6_K) return dispatch<DQR_Q6_K>(s, q, scale, rows, cols, stream);
+    return false;
+}
+
+bool launch_gguf_dequant_rows_i8_fast_pair(int ggml_type,
+                                           const void* src0, signed char* q0, float* scale0,
+                                           const void* src1, signed char* q1, float* scale1,
+                                           int rows, int cols, cudaStream_t stream) {
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_DEQUANT_ROWS_I8_FAST");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!enabled || rows <= 0 || cols <= 0 || (cols % (DQR_BLOCK * DQR_VEC)) != 0) return false;
+    auto s0 = reinterpret_cast<const unsigned char*>(src0);
+    auto s1 = reinterpret_cast<const unsigned char*>(src1);
+    if (ggml_type == DQR_Q4_K)
+        return dispatch_pair<DQR_Q4_K>(s0, q0, scale0, s1, q1, scale1, rows, cols, stream);
+    if (ggml_type == DQR_Q6_K)
+        return dispatch_pair<DQR_Q6_K>(s0, q0, scale0, s1, q1, scale1, rows, cols, stream);
+    return false;
+}
+
+bool launch_gguf_dequant_rows_i8_fast_gather(
+    int ggml_type, const void* src0, signed char* q0, float* scale0,
+    const int* live_le, int n_live, int rows_per_expert, int cols,
+    size_t expert_bytes, cudaStream_t stream) {
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_DEQUANT_ROWS_I8_FAST");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!enabled || !live_le || n_live <= 0 || rows_per_expert <= 0 || cols <= 0 ||
+        (cols % (DQR_BLOCK * DQR_VEC)) != 0)
+        return false;
+    auto s = reinterpret_cast<const unsigned char*>(src0);
+    if (ggml_type == DQR_Q4_K)
+        return dispatch_gather<DQR_Q4_K>(s, q0, scale0, live_le, n_live, rows_per_expert, cols,
+                                         expert_bytes, stream);
+    if (ggml_type == DQR_Q6_K)
+        return dispatch_gather<DQR_Q6_K>(s, q0, scale0, live_le, n_live, rows_per_expert, cols,
+                                         expert_bytes, stream);
+    return false;
+}
+
+bool launch_gguf_dequant_rows_i8_fast_gather_pair(
+    int ggml_type,
+    const void* src0, signed char* q0, float* scale0,
+    const void* src1, signed char* q1, float* scale1,
+    const int* live_le, int n_live, int rows_per_expert, int cols,
+    size_t expert_bytes0, size_t expert_bytes1, cudaStream_t stream) {
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_DEQUANT_ROWS_I8_FAST");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!enabled || !live_le || n_live <= 0 || rows_per_expert <= 0 || cols <= 0 ||
+        (cols % (DQR_BLOCK * DQR_VEC)) != 0)
+        return false;
+    auto s0 = reinterpret_cast<const unsigned char*>(src0);
+    auto s1 = reinterpret_cast<const unsigned char*>(src1);
+    if (ggml_type == DQR_Q4_K)
+        return dispatch_gather_pair<DQR_Q4_K>(s0, q0, scale0, s1, q1, scale1, live_le, n_live,
+                                              rows_per_expert, cols, expert_bytes0, expert_bytes1,
+                                              stream);
+    if (ggml_type == DQR_Q6_K)
+        return dispatch_gather_pair<DQR_Q6_K>(s0, q0, scale0, s1, q1, scale1, live_le, n_live,
+                                              rows_per_expert, cols, expert_bytes0, expert_bytes1,
+                                              stream);
     return false;
 }
 

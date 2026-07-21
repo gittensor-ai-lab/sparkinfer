@@ -30,5 +30,28 @@ namespace kernels {
 bool launch_gguf_dequant_rows_i8_fast(int ggml_type, const void* src, signed char* q, float* scale,
                                       int rows, int cols, cudaStream_t stream = nullptr);
 
+// One-grid gate+up (or any two same-type tensors): blockIdx.x < rows → tensor0, else tensor1.
+// Same bit-identical decode as the single-tensor fast path. Used to fill SMs on one stream
+// without a second CUDA stream (multi-stream MoE prefill poisons decode graphs on this runtime).
+bool launch_gguf_dequant_rows_i8_fast_pair(int ggml_type,
+                                           const void* src0, signed char* q0, float* scale0,
+                                           const void* src1, signed char* q1, float* scale1,
+                                           int rows, int cols, cudaStream_t stream = nullptr);
+
+// Sparse MoE: dequant only live experts listed in live_le[n_live] (group-local indices).
+// src0/q0/scale0 are group bases (expert 0 of the group). expert_bytes = rows_per_expert * row_bytes.
+// One grid of n_live * rows_per_expert blocks — avoids thousands of tiny contiguous launches.
+bool launch_gguf_dequant_rows_i8_fast_gather(
+    int ggml_type, const void* src0, signed char* q0, float* scale0,
+    const int* live_le, int n_live, int rows_per_expert, int cols,
+    size_t expert_bytes, cudaStream_t stream = nullptr);
+
+bool launch_gguf_dequant_rows_i8_fast_gather_pair(
+    int ggml_type,
+    const void* src0, signed char* q0, float* scale0,
+    const void* src1, signed char* q1, float* scale1,
+    const int* live_le, int n_live, int rows_per_expert, int cols,
+    size_t expert_bytes0, size_t expert_bytes1, cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace sparkinfer

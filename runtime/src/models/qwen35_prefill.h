@@ -17,6 +17,8 @@ struct Qwen35PrefillCtx {
     const Qwen35Weights& w;
     KVCacheManager*      kv;
     cudaStream_t         stream;
+    cudaStream_t         stream_k;         // reuse decode side streams for MoE overlap
+    cudaStream_t         stream_v;
     uint64_t             seq_id;
     float*               lin_state;        // Gated-DeltaNet recurrent state (per layer)
     void*                lin_conv_state;   // bf16 causal-conv window (per layer)
