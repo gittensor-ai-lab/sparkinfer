@@ -3,6 +3,89 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.4.3] — 2026-07-21
+
+sparkinfer's **prefill stack is the headline of this release**: Qwythos (Qwen3.5) is now
+**+183.6% faster than llama.cpp at 128k prefill**, and Qwen3.6 is **+82.7% faster at 32k prefill** —
+both on the same RTX 5090 / pinned llama.cpp commit (`6f4f53f`). The live chat at
+**[sparkinfer.com/chat](https://sparkinfer.com/chat)** now serves **Qwen3.6**.
+
+### ⚡ Prefill — the main story
+
+Dense + MoE prefill landed a chain of weight-amortized and int8 tensor-core wins since v0.4.2.
+Long-context prompt processing is where agents feel latency first — this release closes that gap
+past llama.cpp at the lengths that matter.
+
+#### Qwythos (Qwen3.5-9B) · Q4_K_M · RTX 5090
+
+| context | sparkinfer (pp tok/s) | llama.cpp (pp tok/s) | vs llama |
+|---|---:|---:|---:|
+| **4k prefill** | **~19,580** | 11,105 | **~+76%** |
+| **32k prefill** | **~20,170** | 9,772 | **~+106%** |
+| **64k prefill** | **~20,150** | 8,154 | **~+147%** |
+| **128k prefill** | **~17,015** | 6,000 | **+183.6%** |
+
+Headline: **128k prefill +183.6% vs llama.cpp** (17,015 vs 5,999.59 pp tok/s; #557).
+
+#### Qwen3.6-35B-A3B · UD-Q4_K_M · RTX 5090
+
+Expert-grouped int8 MoE prefill (#530 → #537 → #548 → #553) lifts long-prompt MoE far past the
+v0.4.2 decode-focused frontier.
+
+| context | sparkinfer (pp tok/s) | llama.cpp (pp tok/s) | vs llama |
+|---|---:|---:|---:|
+| **512 prefill** | **~3,510** | 8,737 | (short-N still climbing) |
+| **4k prefill** | **~11,580** | 8,726 | **~+33%** |
+| **16k prefill** | **~14,160** | 8,390 | **~+69%** |
+| **32k prefill** | **~14,587** | 7,984 | **+82.7%** |
+
+Headline: **32k prefill +82.7% vs llama.cpp** (14,587 vs 7,984 pp tok/s).
+
+### 🌐 Chat — Qwen3.6 on sparkinfer.com
+
+| | |
+|---|---|
+| **Chat** | [sparkinfer.com/chat](https://sparkinfer.com/chat) — now includes **Qwen3.6** |
+| **Website** | [sparkinfer.com](https://sparkinfer.com/) |
+| **Demo API** | [api.sparkinfer.com](https://api.sparkinfer.com/) — OpenAI-compatible |
+
+### Prefill optimizations landed since v0.4.2
+
+- **#531** (`eval:XL`) — faithful batched Qwythos prefill through 128k
+- **#530** (`eval:XL`) — batched weight-amortized MoE prefill for Qwen3.6
+- **#537** (`eval:XL`) — expert-grouped int8 MoE prefill (large long-ctx jump)
+- **#552** (`eval:L`) — `mma.sync` bf16 prefill GEMM for dense long-ctx
+- **#548** (`eval:XL`) — chunk-parallel GDN scan + faster prefill dequant/GEMM
+- **#557** (`eval:XL`) — selective int8 FFN+attn at long ctx — **128k +183.6% vs llama**
+- **#553** (`eval:XL`) — single-pass Q→i8 row dequant for Qwen3.6 short-N
+- **#561** (`eval:XS`) — expert-group L2 MoE prefill for short-N (N≤512)
+
+### Eval harness & trust
+
+- **#529** — bidir prefill scoring for Qwen3.5 and Qwen3.6
+- **#564** — REJECT when any no-regression gate fails
+- **#567** — tighter H2 long-context bars (top1≥0.90, KL≤0.5)
+- **#568** — copycat guard: skip main-shared tiny helpers
+
+### What changed since v0.4.2
+
+| headline | v0.4.2 | v0.4.3 | shift |
+|---|---:|---:|---|
+| Qwythos prefill at 128k | ~6,888 pp/s (~+15% vs llama) | **~17,015 pp/s (+183.6% vs llama)** | **~2.5×** |
+| Qwen3.6 prefill at 32k | ~1,282 pp/s (behind llama) | **~14,587 pp/s (+82.7% vs llama)** | **~11×** |
+| Live chat | Qwythos-focused demo | **Qwen3.6 on [sparkinfer.com/chat](https://sparkinfer.com/chat)** | new |
+
+**Verified:** RTX 5090 · Qwythos prefill **~17,015 pp/s at 128k (+183.6% vs llama)** · Qwen3.6 prefill
+**~14,587 pp/s at 32k (+82.7% vs llama)** · Polaris-attested eval logs · llama.cpp `6f4f53f`.
+
+### Contributors
+
+- **@Paral1995** — #531 (batched Qwythos to 128k), #552 (bf16 `mma.sync` GEMM), #557 (int8 long-ctx FFN+attn)
+- **@James-CUDA** — #537 (expert-grouped int8 MoE), #561 (short-N L2 MoE groups)
+- **@inference2026** — #530 (weight-amortized MoE prefill), #553 (Q→i8 row dequant)
+- **@fansilas** — #548 (chunk-parallel GDN + prefill dequant/GEMM)
+- **@skyrocket2026** — #529 (bidir prefill scoring), #564/#567/#568 (eval gates + copycat), dashboard + release
+
 ## [0.4.2] — 2026-07-17
 
 sparkinfer now **beats llama.cpp on Qwythos prefill at every tracked context** — climbing from **290 → 16,083 pp tok/s**
