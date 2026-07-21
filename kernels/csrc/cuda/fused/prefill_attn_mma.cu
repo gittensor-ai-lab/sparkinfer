@@ -183,11 +183,6 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
                 for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
                 const float m_old = s_m[r], m_new = fmaxf(m_old, mx), corr = __expf(m_old - m_new);
                 float sum = 0.f, pamax = 0.f;
-                // P' stays in registers. The quantize below walks exactly the t this lane owns here
-                // (t = lane + u*32), so bouncing P' through s_s and reading it straight back was a
-                // round trip to shared memory for a value the thread already holds. sc[] is dead
-                // once its P' is formed, so it doubles as the register buffer and costs nothing --
-                // which matters, the kernel is at its register cap.
                 #pragma unroll
                 for (int u = 0; u < GN / 32; u++) {
                     const int t = lane + u * 32;
@@ -196,7 +191,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
                         const float p = __expf(sc[u] - m_new);
                         sum += p; pv = p * s_vs[t]; pamax = fmaxf(pamax, fabsf(pv));
                     }
-                    sc[u] = pv;
+                    s_s[r * GN + t] = pv;
                 }
                 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) {
@@ -205,21 +200,10 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
                 }
                 const float pd = pamax / 127.0f;
                 if (lane == 0) { s_m[r] = m_new; s_l[r] = s_l[r] * corr + sum; s_ps[r] = pd; }
-                // Columns past gblk*16 are never read by the PV mma (it walks ks < gblk), exactly as
-                // before -- the old loop bounded t the same way.
-                #pragma unroll
-                for (int u = 0; u < GN / 32; u++) {
-                    const int t = lane + u * 32;
-                    if (t < gblk * 16)
-                        s_pi[r * GN + t] =
-                            (signed char)((pamax == 0.f) ? 0 : (int)roundf(sc[u] / pd));
-                }
-                // Rescaling the running O is HEAD_DIM smem read-modify-writes per row per group, and
-                // it is a no-op whenever the row's running max did not move -- corr is then exactly
-                // 1.0f and x * 1.0f == x for every float. Scanning keys causally, the max settles
-                // early, so most groups skip this entirely. Bit-identical either way.
-                if (corr != 1.0f)
-                    for (int c = lane; c < HEAD_DIM; c += 32) s_o[r * HEAD_DIM + c] *= corr;
+                for (int t = lane; t < gblk * 16; t += 32)
+                    s_pi[r * GN + t] =
+                        (signed char)((pamax == 0.f) ? 0 : (int)roundf(s_s[r * GN + t] / pd));
+                for (int c = lane; c < HEAD_DIM; c += 32) s_o[r * HEAD_DIM + c] *= corr;
             }
             __syncthreads();
 
@@ -240,19 +224,15 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
                     mma_sync(cf, af, bf, cf);
                 }
                 // s_pv aliases s_s, which is dead once P' is quantized into s_pi. Each warp owns a
-                // disjoint 256-int slice, so reusing it across d-tiles is a warp-local hazard and a
-                // warp fence covers it; only the next group's QK -- which overwrites the whole
-                // aliased buffer -- needs the block-wide barrier, so that one is hoisted out of this
-                // loop. Each warp also owns a disjoint column range of s_o (d-tiles w*DPW..), so the
-                // accumulate below needs no cross-warp ordering either.
-                __syncwarp();
+                // disjoint 256-int slice, so the store needs only a warp fence; the __syncthreads
+                // below is what lets the next d-tile (and the next group's QK) reuse the buffer.
                 store_matrix_sync(s_pv + warp * 256, cf, 16, mem_row_major);
                 __syncwarp();
                 for (int i = lane; i < 256; i += 32)
                     s_o[(i >> 4) * HEAD_DIM + dt * 16 + (i & 15)] +=
                         (float)s_pv[warp * 256 + i] * s_ps[i >> 4];
+                __syncthreads();
             }
-            __syncthreads();
         }
     };
 
