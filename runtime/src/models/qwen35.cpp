@@ -407,6 +407,19 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         // GQA-8 (Qwen3.6): flat 160 through 32k (4k–32k A/B on RTX 5090).
         // GQA-4 (Qwythos): same through 32k; promote splits at 64k/128k so per-split MMA
         // chunks do not outgrow occupancy (64k: 192, 128k: 128 — same-box sweeps).
+        // hd128/GQA-8 (Qwen3-MoE, e.g. Qwen3-30B-A3B): the same over-subscription applies to
+        // the 256 tier on this shape, which the hd256 correction below never covered — the
+        // generic long-context tier is chosen by depth alone, not by achieved occupancy of
+        // fa_split_gqa_mma_i8_kernel<128, 8>. Same-box A/B on an RTX 5090 (interleaved with
+        // main, 3 rounds per point, best-of-run, Q4_K_M): vs the 256 tier at 32k, 160 is the
+        // clear optimum (+12.4% median; 96 +5.6%, 128 +5.1%, 192 +9.1%, 224 -0.2%), and 160
+        // holds at 16k (+8.1%). Only the MAX_NSPLITS tier is corrected: the 128 tier (4k) is
+        // already optimal there and forcing 160 onto it measured -7.1%, so it is left alone.
+        // The online-softmax combine is exact for any split count, so this is speed-only.
+        if (c.head_dim == 128 && c.n_kv_heads > 0 && want >= Impl::MAX_NSPLITS &&
+            c.n_q_heads == c.n_kv_heads * 8) {
+            want = 160;
+        }
         if (c.head_dim == 256 && c.n_kv_heads > 0 && want >= 128) {
             if (c.n_q_heads == c.n_kv_heads * 8)
                 want = 160;
