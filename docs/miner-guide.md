@@ -54,8 +54,9 @@ Do not trade accuracy for speed. Accuracy is part of the benchmark.
 
 ## Regression Labels
 
-A PR can improve one context and regress another. The bot makes this explicit
-with context-specific labels:
+Any guarded context that regresses fails the no-regression gate — a gain at
+another context does **not** excuse it. The bot still annotates which contexts
+regressed:
 
 | label | meaning |
 |---|---|
@@ -64,9 +65,9 @@ with context-specific labels:
 | `regression-4k` | 4k-context decode regressed |
 | `regression-16k` | 16k-context decode regressed |
 | `regression-32k` | 32k-context decode regressed |
+| `regression-*-pp` | prefill pp at that context regressed |
 
-If no context improves by at least 2% and any guarded context regresses, the PR
-is rejected and may be auto-closed.
+If any guarded context regresses, the PR is `eval:REJECT`.
 
 ## Speed Labels
 

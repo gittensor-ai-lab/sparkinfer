@@ -158,7 +158,6 @@ if [ "$EVAL_MODE" = "short" ]; then
   SELECTED_TPS="$TPS"; SELECTED_FRONTIER="$FRONTIER"; SELECTED_CTX=128
   SELECTED_CONTEXT_LABEL="128-context"; BEST_CONTEXT_LABEL="128-context"; SELECTED_LLAMA_REF="$LLAMA_128_BASELINE"
   SELECTED_GAIN=0; CONTEXT_GAINS_JSON='{}'; REGRESSION_LABELS_JSON='[]'
-  HAS_VERIFIED_CONTEXT_GAIN=false
   PREFILL_SELECTED_TPS=0; PREFILL_SELECTED_FRONTIER=0; PREFILL_SELECTED_CTX=0
   PREFILL_SELECTED_LABEL=""; PREFILL_SELECTED_LLAMA_REF=0; PREFILL_SELECTED_GAIN=0
   PREFILL_CONTEXT_GAINS_JSON='{}'
@@ -513,12 +512,6 @@ if "$EVAL_PREFILL" == "1":
 print("true" if all(x == "true" for x in decode + pp) else "false")
 PY
 )"
-  HAS_VERIFIED_CONTEXT_GAIN="$(python3 - <<PY
-decode_gain = float("$SELECTED_GAIN")
-pp_gain = float("$PREFILL_SELECTED_GAIN") if "$EVAL_PREFILL" == "1" else 0.0
-print("true" if decode_gain > 0.02 or pp_gain > 0.02 else "false")
-PY
-)"
 fi
 # M1: record the graphics clock the number was produced at — the reproducibility anchor. Equals the
 # pin target where -lgc is permitted (bare-metal/datacenter); on a restricted container (vast lacks
@@ -657,7 +650,9 @@ if "$EVAL_MODE" != "short":
 print(json.dumps(data, separators=(",", ":")))
 PY
 )"
-if [ "$EVAL_MODE" != "short" ] && [ "$ALL_GUARDS_PASS" != "true" ] && [ "$HAS_VERIFIED_CONTEXT_GAIN" != "true" ]; then
+# Any failed no-regression gate rejects — a gain at another context (e.g. +14% @64k pp)
+# must not excuse a collapse elsewhere (PR #562: 128k pp 287 vs main 17020 still scored L).
+if [ "$EVAL_MODE" != "short" ] && [ "$ALL_GUARDS_PASS" != "true" ]; then
   PROV="$PROV" python3 - <<PY
 import json, os
 tps=float("$SELECTED_TPS"); frontier=float("$SELECTED_FRONTIER"); guard=float("$GUARD_TPS")
