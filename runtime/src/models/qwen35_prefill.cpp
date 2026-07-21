@@ -262,13 +262,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (g > 64) g = 64;
         return g;
     }();
-    // Dual-stream: dequant group i+1 on a side stream while GEMMing group i (default ON
-    // with serial). SPARKINFER_PREFILL_MOE_PIPE=0 disables (single-stream + device tilemap).
+    // Dual-stream: dequant group i+1 on a side stream while GEMMing group i.
+    // Default OFF — PIPE=1 is correct for prefill but regresses short-ctx decode ~8% on
+    // 5090 (side-stream residue). SPARKINFER_PREFILL_MOE_PIPE=1 enables.
     const bool moe_pipe = [&]{
         if (!moe_serial) return false;
         const char* e = getenv("SPARKINFER_PREFILL_MOE_PIPE");
-        if (e) return e[0] != '0';
-        return true;
+        return e && e[0] == '1';
     }();
     const int moe_slots = (moe_serial && moe_pipe) ? 2 : 1;
     Arena am;
@@ -297,11 +297,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         mcursors = am.alloc<int>(E);
         pair_tok = am.alloc<int>((size_t)P);
         pair_w = am.alloc<float>((size_t)P);
-        // Serial needs per-slot tilemaps for dual-stream; bulk uses one full map.
-        const int tm_cap = moe_serial
-            ? moe_slots * std::max((P + moe_bm - 1) / moe_bm + moe_group, 1)
-            : max_tiles;
-        tilemap = am.alloc<int>((size_t)2 * tm_cap);
+        // Serial needs per-slot tilemaps for dual-stream; bulk bucket_pairs also writes a
+        // full-E tilemap into the same buffer before the serial path runs — size for both.
+        const int max_group_tiles = moe_serial
+            ? std::max((P + moe_bm - 1) / moe_bm + moe_group, 1) : 0;
+        const int tm_count = moe_serial
+            ? std::max(moe_slots * max_group_tiles, max_tiles) : max_tiles;
+        tilemap = am.alloc<int>((size_t)2 * std::max(tm_count, 1));
         d_ntiles = am.alloc<int>(moe_serial ? moe_slots : 1);
         hg = am.alloc<bf16>((size_t)P * mffn);
         hu = am.alloc<bf16>((size_t)P * mffn);
@@ -397,6 +399,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // embed -> x, prime xn = RMSNorm(x, layer0.input_norm)
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, eps, st);
+
+    // MoE dual-stream resources: create once for all layers (per-layer create/destroy was
+    // dominating short-N and racing with incomplete dequant → TOP1=0 / fake tok/s).
+    cudaStream_t moe_st_dq = nullptr;
+    cudaEvent_t moe_ev_dq[2]{}, moe_ev_done[2]{}, moe_ev_ready{};
+    if (moe_pipe) {
+        pf_cu(cudaStreamCreateWithFlags(&moe_st_dq, cudaStreamNonBlocking), "moe dq stream");
+        pf_cu(cudaEventCreateWithFlags(&moe_ev_ready, cudaEventDisableTiming), "moe ev_ready");
+        for (int sidx = 0; sidx < moe_slots; sidx++) {
+            pf_cu(cudaEventCreateWithFlags(&moe_ev_dq[sidx], cudaEventDisableTiming), "moe ev_dq");
+            pf_cu(cudaEventCreateWithFlags(&moe_ev_done[sidx], cudaEventDisableTiming), "moe ev_done");
+        }
+    }
 
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
@@ -525,16 +540,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 const size_t slot_d = (size_t)G * (size_t)H * (size_t)mffn;
                 const size_t slot_ds = (size_t)G * (size_t)H;
 
-                cudaStream_t st_dq = st;
-                cudaEvent_t ev_dq[2]{}, ev_done[2]{};
-                bool own_dq = false;
+                cudaStream_t st_dq = moe_pipe ? moe_st_dq : st;
+                // Side stream must see mcounts / pair buckets / routed zero before first prep.
                 if (moe_pipe) {
-                    pf_cu(cudaStreamCreateWithFlags(&st_dq, cudaStreamNonBlocking), "moe dq stream");
-                    own_dq = true;
-                    for (int s = 0; s < moe_slots; s++) {
-                        pf_cu(cudaEventCreateWithFlags(&ev_dq[s], cudaEventDisableTiming), "moe ev_dq");
-                        pf_cu(cudaEventCreateWithFlags(&ev_done[s], cudaEventDisableTiming), "moe ev_done");
-                    }
+                    pf_cu(cudaEventRecord(moe_ev_ready, st), "moe ready");
+                    pf_cu(cudaStreamWaitEvent(st_dq, moe_ev_ready, 0), "moe dq wait ready");
                 }
 
                 auto slot_ptrs = [&](int slot, signed char*& g, signed char*& u, signed char*& d,
@@ -561,13 +571,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     const void* ue = (const char*)w.up_q   + (size_t)base * (size_t)mffn * u_rb;
                     kernels::launch_gguf_dequant_rows_i8(w.gate_qtype, ge, Wg_s, swg_s, n_in * mffn, H, s);
                     kernels::launch_gguf_dequant_rows_i8(w.up_qtype,   ue, Wu_s, swu_s, n_in * mffn, H, s);
-                    if (moe_pipe) pf_cu(cudaEventRecord(ev_dq[slot], s), "moe gateup dq record");
+                    if (moe_pipe) pf_cu(cudaEventRecord(moe_ev_dq[slot], s), "moe gateup dq record");
                 };
                 auto gemm_gateup = [&](int slot, int base, cudaStream_t s) {
                     signed char *Wg_s, *Wu_s, *Wd_s; float *swg_s, *swu_s, *swd_s; int *tm, *nt;
                     slot_ptrs(slot, Wg_s, Wu_s, Wd_s, swg_s, swu_s, swd_s, tm, nt);
                     (void)Wd_s; (void)swd_s;
-                    if (moe_pipe) pf_cu(cudaStreamWaitEvent(s, ev_dq[slot], 0), "moe gateup wait dq");
+                    if (moe_pipe) pf_cu(cudaStreamWaitEvent(s, moe_ev_dq[slot], 0), "moe gateup wait dq");
                     kernels::launch_pfm_moe_gemm_i8_bm_base(
                         mA_i8, msx, Wg_s, swg_s, pair_tok, pair_w, moffsets, tm, nt,
                         hg, nullptr, mffn, H, max_group_tiles, moe_bm, base,
@@ -575,7 +585,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     kernels::launch_pfm_moe_gemm_i8_bm_base(
                         mA_i8, msx, Wu_s, swu_s, pair_tok, pair_w, moffsets, tm, nt,
                         hu, nullptr, mffn, H, max_group_tiles, moe_bm, base, true, false, s);
-                    if (moe_pipe) pf_cu(cudaEventRecord(ev_done[slot], s), "moe gateup done");
+                    if (moe_pipe) pf_cu(cudaEventRecord(moe_ev_done[slot], s), "moe gateup done");
                 };
 
                 if (moe_pipe && n_groups > 0) prep_gateup(0, 0, st_dq);
@@ -586,12 +596,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         prep_gateup(slot, base, st);
                         gemm_gateup(slot, base, st);
                     } else {
-                        if (gi + 1 < n_groups) prep_gateup((gi + 1) & 1, (gi + 1) * G, st_dq);
+                        // Do not overwrite slot ns while its prior GEMM still reads W/tilemap.
+                        if (gi + 1 < n_groups) {
+                            const int ns = (gi + 1) & 1;
+                            if (gi >= 1)
+                                pf_cu(cudaStreamWaitEvent(st_dq, moe_ev_done[ns], 0),
+                                      "moe gateup dq wait slot");
+                            prep_gateup(ns, (gi + 1) * G, st_dq);
+                        }
                         gemm_gateup(slot, base, st);
                     }
                 }
                 if (moe_pipe && n_groups > 0)
-                    pf_cu(cudaStreamWaitEvent(st, ev_done[(n_groups - 1) & 1], 0), "moe gateup join");
+                    pf_cu(cudaStreamWaitEvent(st, moe_ev_done[(n_groups - 1) & 1], 0), "moe gateup join");
 
                 kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, st);
                 kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, st);
@@ -606,21 +623,29 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                                       max_group_tiles, s);
                     const void* de = (const char*)w.down_q + (size_t)base * (size_t)H * d_rb;
                     kernels::launch_gguf_dequant_rows_i8(w.down_qtype, de, Wd_s, swd_s, n_in * H, mffn, s);
-                    if (moe_pipe) pf_cu(cudaEventRecord(ev_dq[slot], s), "moe down dq record");
+                    if (moe_pipe) pf_cu(cudaEventRecord(moe_ev_dq[slot], s), "moe down dq record");
                 };
                 auto gemm_down = [&](int slot, int base, cudaStream_t s) {
                     signed char *Wg_s, *Wu_s, *Wd_s; float *swg_s, *swu_s, *swd_s; int *tm, *nt;
                     slot_ptrs(slot, Wg_s, Wu_s, Wd_s, swg_s, swu_s, swd_s, tm, nt);
                     (void)Wg_s; (void)Wu_s; (void)swg_s; (void)swu_s;
-                    if (moe_pipe) pf_cu(cudaStreamWaitEvent(s, ev_dq[slot], 0), "moe down wait dq");
+                    if (moe_pipe) pf_cu(cudaStreamWaitEvent(s, moe_ev_dq[slot], 0), "moe down wait dq");
                     kernels::launch_pfm_moe_gemm_i8_bm_base(
                         h_i8, sh, Wd_s, swd_s, pair_tok, pair_w, moffsets, tm, nt,
                         nullptr, routed_f32, H, mffn, max_group_tiles, moe_bm, base,
                         /*a_indirect=*/false, /*c_scatter=*/true, s);
-                    if (moe_pipe) pf_cu(cudaEventRecord(ev_done[slot], s), "moe down done");
+                    if (moe_pipe) pf_cu(cudaEventRecord(moe_ev_done[slot], s), "moe down done");
                 };
 
-                if (moe_pipe && n_groups > 0) prep_down(0, 0, st_dq);
+                // Down prep may overlap swiglu/quantize (weight-only); GEMM stays on st after them.
+                if (moe_pipe && n_groups > 0) {
+                    pf_cu(cudaEventRecord(moe_ev_ready, st), "moe down ready");
+                    pf_cu(cudaStreamWaitEvent(st_dq, moe_ev_ready, 0), "moe dq wait down ready");
+                    // Slot 0 was last used by gateup; wait before reusing for down.
+                    if (n_groups > 1)
+                        pf_cu(cudaStreamWaitEvent(st_dq, moe_ev_done[0], 0), "moe down dq wait slot0");
+                    prep_down(0, 0, st_dq);
+                }
                 for (int gi = 0; gi < n_groups; gi++) {
                     const int slot = moe_pipe ? (gi & 1) : 0;
                     const int base = gi * G;
@@ -628,20 +653,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         prep_down(slot, base, st);
                         gemm_down(slot, base, st);
                     } else {
-                        if (gi + 1 < n_groups) prep_down((gi + 1) & 1, (gi + 1) * G, st_dq);
+                        if (gi + 1 < n_groups) {
+                            const int ns = (gi + 1) & 1;
+                            // First refill of slot1 after gateup, or later ping-pong reuse.
+                            pf_cu(cudaStreamWaitEvent(st_dq, moe_ev_done[ns], 0),
+                                  "moe down dq wait slot");
+                            prep_down(ns, (gi + 1) * G, st_dq);
+                        }
                         gemm_down(slot, base, st);
                     }
                 }
                 if (moe_pipe && n_groups > 0)
-                    pf_cu(cudaStreamWaitEvent(st, ev_done[(n_groups - 1) & 1], 0), "moe down join");
-
-                if (own_dq) {
-                    for (int s = 0; s < moe_slots; s++) {
-                        cudaEventDestroy(ev_dq[s]);
-                        cudaEventDestroy(ev_done[s]);
-                    }
-                    cudaStreamDestroy(st_dq);
-                }
+                    pf_cu(cudaStreamWaitEvent(st, moe_ev_done[(n_groups - 1) & 1], 0), "moe down join");
             } else {
                 // Bulk: expert weights -> int8 rows ONCE per layer (all 256 experts).
                 kernels::launch_gguf_dequant_rows_i8(w.gate_qtype, w.gate_q, Wg_i8, swg, E * mffn, H, st);
@@ -691,6 +714,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
         const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
+    }
+
+    if (moe_pipe) {
+        for (int sidx = 0; sidx < moe_slots; sidx++) {
+            cudaEventDestroy(moe_ev_dq[sidx]);
+            cudaEventDestroy(moe_ev_done[sidx]);
+        }
+        cudaEventDestroy(moe_ev_ready);
+        cudaStreamDestroy(moe_st_dq);
     }
 
     // Seed for the first decode step: argmax at the last prompt position (xn already = final norm).
