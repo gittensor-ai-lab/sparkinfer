@@ -50,6 +50,8 @@ void launch_pfm_bucket_pairs_bm(const int* expert_ids, const float* expert_weigh
 //   C_SCATTER=true : atomicAdd(out_f32[pair_tok[p]*N_out+n], acc*sx*sw*pair_w[p]).
 //   Launch bound: grid.y = max_tiles (host upper bound); tiles >= d_ntiles[0] exit.
 //   bm: 128 (default) or 16 (short-N); must match launch_pfm_bucket_pairs_bm.
+//   Short-N (bm=16) defaults to mma.sync.m16n8k32 + BK=64 (SPARKINFER_PREFILL_MOE_MMA=0
+//   restores the legacy wmma.m16n16k16 / BK=32 path).
 void launch_pfm_moe_gemm_i8(const signed char* A_i8, const float* sx,
                             const signed char* W_i8, const float* sw,
                             const int* pair_tok, const float* pair_w,

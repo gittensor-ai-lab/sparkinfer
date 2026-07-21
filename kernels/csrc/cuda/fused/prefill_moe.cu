@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <cuda_pipeline.h>
 #include <mma.h>
+#include <cstdlib>
 
 #include "sparkinfer/kernels/prefill_moe.h"
 
@@ -195,21 +196,21 @@ __global__ void pfm_moe_gemm_i8_kernel(const signed char* __restrict__ A_i8,
     }
 }
 
-// Short-N variant: BM=16 so avg-16-pair experts fill the tile (vs 12.5% fill at BM=128).
-// 8 warps each own one 16x16 along N (BN=128). Same BN/BK/int8 WMMA as the long path.
+// Short-N BM=16 legacy path: wmma.m16n16k16 (half the int8 MAC rate of mma.sync.k32).
+// Kept for SPARKINFER_PREFILL_MOE_MMA=0 A/B; default launcher uses the mma path below.
 template <bool A_INDIRECT, bool C_SCATTER>
-__global__ void pfm_moe_gemm_i8_bm16_kernel(const signed char* __restrict__ A_i8,
-                                            const float* __restrict__ sx,
-                                            const signed char* __restrict__ W_i8,
-                                            const float* __restrict__ sw,
-                                            const int* __restrict__ pair_tok,
-                                            const float* __restrict__ pair_w,
-                                            const int* __restrict__ offsets,
-                                            const int* __restrict__ tilemap,
-                                            const int* __restrict__ d_ntiles,
-                                            __nv_bfloat16* __restrict__ C,
-                                            float* __restrict__ out_f32,
-                                            int N, int K, int e_base) {
+__global__ void pfm_moe_gemm_i8_bm16_wmma_kernel(const signed char* __restrict__ A_i8,
+                                                 const float* __restrict__ sx,
+                                                 const signed char* __restrict__ W_i8,
+                                                 const float* __restrict__ sw,
+                                                 const int* __restrict__ pair_tok,
+                                                 const float* __restrict__ pair_w,
+                                                 const int* __restrict__ offsets,
+                                                 const int* __restrict__ tilemap,
+                                                 const int* __restrict__ d_ntiles,
+                                                 __nv_bfloat16* __restrict__ C,
+                                                 float* __restrict__ out_f32,
+                                                 int N, int K, int e_base) {
     using namespace nvcuda;
     constexpr int BM = PM_BM_SHORT;
     const int tile = blockIdx.y;
@@ -240,14 +241,12 @@ __global__ void pfm_moe_gemm_i8_bm16_kernel(const signed char* __restrict__ A_i8
     wmma::fill_fragment(cf, 0);
 
     auto stage = [&](int buf, int k0) {
-        // A: BM=16 rows × BK=32 — 16 threads × 2 × 16B covers it with spare capacity
         for (int idx = tid; idx < BM * 2; idx += blockDim.x) {
             const int r = idx >> 1, c16 = (idx & 1) * 16;
             const int gk = k0 + c16;
             const int arow = s_tok[r];
             pm_cp16(&As[buf][r][c16], &A_i8[(size_t)max(arow, 0) * K + gk], arow >= 0 && gk < K);
         }
-        // B: same as long path — 256 threads × 16B = BN×BK
         {
             const int r = tid >> 1, c16 = (tid & 1) * 16;
             const int gk = k0 + c16;
@@ -289,6 +288,135 @@ __global__ void pfm_moe_gemm_i8_bm16_kernel(const signed char* __restrict__ A_i8
                                 * sx[A_INDIRECT ? s_tok[rm] : p] * swe[rn];
                 if (C_SCATTER) atomicAdd(&out_f32[(size_t)pair_tok[p] * N + rn], v * pair_w[p]);
                 else           C[(size_t)p * N + rn] = __float2bfloat16(v);
+            }
+        }
+    }
+}
+
+// Short-N BM=16 mma.sync path (default). Same tile/API as the wmma kernel above, but:
+//   - mma.sync.m16n8k32 (int8's native shape; wmma only exposes k16 → half the MAC rate)
+//   - BK=64 (half the main-loop barriers vs BK=32)
+//   - XOR-swizzled LDS so the 4B operand loads spread across banks
+//   - register→global epilogue (no Cs smem bounce)
+// Bit-identical to wmma: int8×int8 accumulate in int32 without overflow at these shapes
+// (|sum| ≤ 127*127*4096 ≈ 6.6e7 < 2^31), so integer accumulation is order-independent and the
+// sx*sw epilogue is unchanged.
+constexpr int PM_BK_MMA = 64;
+constexpr int PM_NFRAG_BM16 = 2;   // 16 cols / warp / 8
+
+__device__ __forceinline__ int pm_swz(int k, int row) {
+    return (((k >> 4) ^ (row & 3)) << 4) | (k & 15);
+}
+__device__ __forceinline__ unsigned pm_lds32(const signed char* p) {
+    return *reinterpret_cast<const unsigned*>(p);
+}
+
+template <bool A_INDIRECT, bool C_SCATTER>
+__global__ __launch_bounds__(256, 2) void pfm_moe_gemm_i8_bm16_mma_kernel(
+        const signed char* __restrict__ A_i8, const float* __restrict__ sx,
+        const signed char* __restrict__ W_i8, const float* __restrict__ sw,
+        const int* __restrict__ pair_tok, const float* __restrict__ pair_w,
+        const int* __restrict__ offsets, const int* __restrict__ tilemap,
+        const int* __restrict__ d_ntiles, __nv_bfloat16* __restrict__ C,
+        float* __restrict__ out_f32, int N, int K, int e_base) {
+    constexpr int BM = PM_BM_SHORT;
+    const int tile = blockIdx.y;
+    if (tile >= d_ntiles[0]) return;
+    const int e   = tilemap[2 * tile];
+    const int mt  = tilemap[2 * tile + 1];
+    const int p0  = offsets[e] + mt * BM;
+    const int cnt = offsets[e + 1] - offsets[e];
+    const int M   = min(BM, cnt - mt * BM);
+    const int n0  = blockIdx.x * PM_BN;
+
+    __shared__ signed char As[2][BM][PM_BK_MMA];
+    __shared__ signed char Bs[2][PM_BN][PM_BK_MMA];
+    __shared__ int s_tok[BM];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wn   = warp;                 // 0..7 → 16 output cols
+    const int grp  = lane >> 2;            // 0..7
+    const int tig  = lane & 3;             // thread-in-group
+    const signed char* We = W_i8 + (size_t)(e - e_base) * N * K;
+    const float*       swe = sw + (size_t)(e - e_base) * N;
+
+    for (int r = tid; r < BM; r += blockDim.x)
+        s_tok[r] = (r < M) ? (A_INDIRECT ? pair_tok[p0 + r] : (p0 + r)) : -1;
+    __syncthreads();
+
+    int acc[PM_NFRAG_BM16][4];
+#pragma unroll
+    for (int j = 0; j < PM_NFRAG_BM16; j++)
+#pragma unroll
+        for (int e4 = 0; e4 < 4; e4++) acc[j][e4] = 0;
+
+    // A: 16×64 = 64 × 16B; B: 128×64 = 512 × 16B. 256 threads cover B in one pass and A with spare.
+    auto stage = [&](int buf, int k0) {
+        for (int s = tid; s < 64; s += 256) {
+            const int r = s >> 2, c = s & 3, k = c << 4;
+            const int gk = k0 + k, arow = s_tok[r];
+            pm_cp16(&As[buf][r][pm_swz(k, r)], &A_i8[(size_t)max(arow, 0) * K + gk],
+                    arow >= 0 && gk < K);
+        }
+#pragma unroll
+        for (int s = tid; s < 512; s += 256) {
+            const int r = s >> 2, c = s & 3, k = c << 4;
+            const int gk = k0 + k, gn = n0 + r;
+            pm_cp16(&Bs[buf][r][pm_swz(k, r)], &We[(size_t)gn * K + gk], gn < N && gk < K);
+        }
+        __pipeline_commit();
+    };
+
+    stage(0, 0);
+    const int nk = (K + PM_BK_MMA - 1) / PM_BK_MMA;
+    int buf = 0;
+    for (int t = 0; t < nk; t++) {
+        if (t + 1 < nk) stage(buf ^ 1, (t + 1) * PM_BK_MMA);
+        __pipeline_wait_prior(t + 1 < nk ? 1 : 0);
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < PM_BK_MMA; kk += 32) {
+            const int ka = kk + tig * 4;
+            unsigned af[4], bf[PM_NFRAG_BM16][2];
+            const int rlo = grp, rhi = grp + 8;
+            af[0] = pm_lds32(&As[buf][rlo][pm_swz(ka,      rlo)]);
+            af[1] = pm_lds32(&As[buf][rhi][pm_swz(ka,      rhi)]);
+            af[2] = pm_lds32(&As[buf][rlo][pm_swz(ka + 16, rlo)]);
+            af[3] = pm_lds32(&As[buf][rhi][pm_swz(ka + 16, rhi)]);
+#pragma unroll
+            for (int j = 0; j < PM_NFRAG_BM16; j++) {
+                const int col = wn * 16 + j * 8 + grp;
+                bf[j][0] = pm_lds32(&Bs[buf][col][pm_swz(ka,      col)]);
+                bf[j][1] = pm_lds32(&Bs[buf][col][pm_swz(ka + 16, col)]);
+            }
+#pragma unroll
+            for (int j = 0; j < PM_NFRAG_BM16; j++)
+                asm volatile(
+                    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+r"(acc[j][0]), "+r"(acc[j][1]), "+r"(acc[j][2]), "+r"(acc[j][3])
+                    : "r"(af[0]), "r"(af[1]), "r"(af[2]), "r"(af[3]),
+                      "r"(bf[j][0]), "r"(bf[j][1]));
+        }
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    // Registers straight to global / atomic (same sx*sw*pair_w math as the wmma epilogue).
+#pragma unroll
+    for (int j = 0; j < PM_NFRAG_BM16; j++) {
+        const int gn = n0 + wn * 16 + j * 8 + tig * 2;
+#pragma unroll
+        for (int e4 = 0; e4 < 4; e4++) {
+            const int gm = grp + (e4 >> 1) * 8;
+            const int cn = gn + (e4 & 1);
+            if (gm < M && cn < N) {
+                const int p = p0 + gm;
+                const float v = (float)acc[j][e4]
+                                * sx[A_INDIRECT ? s_tok[gm] : p] * swe[cn];
+                if (C_SCATTER) atomicAdd(&out_f32[(size_t)pair_tok[p] * N + cn], v * pair_w[p]);
+                else           C[(size_t)p * N + cn] = __float2bfloat16(v);
             }
         }
     }
@@ -723,18 +851,39 @@ void launch_pfm_moe_gemm_i8_bm_base(const signed char* A_i8, const float* sx,
     dim3 grid((N_out + PM_BN - 1) / PM_BN, max_tiles);
     auto* C = reinterpret_cast<__nv_bfloat16*>(C_bf16);
     if (bm == PM_BM_SHORT) {
-        if (a_indirect && !c_scatter)
-            pfm_moe_gemm_i8_bm16_kernel<true, false><<<grid, 256, 0, stream>>>(
-                A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
-        else if (!a_indirect && c_scatter)
-            pfm_moe_gemm_i8_bm16_kernel<false, true><<<grid, 256, 0, stream>>>(
-                A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
-        else if (a_indirect && c_scatter)
-            pfm_moe_gemm_i8_bm16_kernel<true, true><<<grid, 256, 0, stream>>>(
-                A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
-        else
-            pfm_moe_gemm_i8_bm16_kernel<false, false><<<grid, 256, 0, stream>>>(
-                A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
+        // Default: mma.sync.m16n8k32 (+BK=64, register epilogue). SPARKINFER_PREFILL_MOE_MMA=0
+        // restores the legacy wmma.m16n16k16 path for A/B.
+        static int use_mma = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_MOE_MMA");
+            return (e && e[0] == '0') ? 0 : 1;
+        }();
+        if (use_mma) {
+            if (a_indirect && !c_scatter)
+                pfm_moe_gemm_i8_bm16_mma_kernel<true, false><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
+            else if (!a_indirect && c_scatter)
+                pfm_moe_gemm_i8_bm16_mma_kernel<false, true><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
+            else if (a_indirect && c_scatter)
+                pfm_moe_gemm_i8_bm16_mma_kernel<true, true><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
+            else
+                pfm_moe_gemm_i8_bm16_mma_kernel<false, false><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
+        } else {
+            if (a_indirect && !c_scatter)
+                pfm_moe_gemm_i8_bm16_wmma_kernel<true, false><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
+            else if (!a_indirect && c_scatter)
+                pfm_moe_gemm_i8_bm16_wmma_kernel<false, true><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
+            else if (a_indirect && c_scatter)
+                pfm_moe_gemm_i8_bm16_wmma_kernel<true, true><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
+            else
+                pfm_moe_gemm_i8_bm16_wmma_kernel<false, false><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
+        }
         return;
     }
     if (a_indirect && !c_scatter)
