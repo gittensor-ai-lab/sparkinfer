@@ -114,6 +114,11 @@ __device__ __forceinline__ void pm_cp16(void* dst, const void* src, bool pred) {
     if (pred) __pipeline_memcpy_async(dst, src, 16);
     else      *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
 }
+// Sync 16B staging for kernels that stage once per K-tile without cp.async double-buffer.
+__device__ __forceinline__ void pm_ld16(void* dst, const void* src, bool pred) {
+    if (pred) *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+    else      *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
+}
 
 template <bool A_INDIRECT, bool C_SCATTER>
 __global__ void pfm_moe_gemm_i8_kernel(const signed char* __restrict__ A_i8,
@@ -372,14 +377,14 @@ __global__ void pfm_moe_gemm_i8_gate_up_bm16_kernel(const signed char* __restric
             const int r = idx >> 1, c16 = (idx & 1) * 16;
             const int gk = k0 + c16;
             const int arow = s_tok[r];
-            pm_cp16(&As[r][c16], &A_i8[(size_t)max(arow, 0) * K + gk], arow >= 0 && gk < K);
+            pm_ld16(&As[r][c16], &A_i8[(size_t)max(arow, 0) * K + gk], arow >= 0 && gk < K);
         }
         for (int idx = tid; idx < PM_BN * 2; idx += blockDim.x) {
             const int r = idx >> 1, c16 = (idx & 1) * 16;
             const int gk = k0 + c16;
             const int gn = n0 + r;
-            pm_cp16(&Bsg[r][c16], &Wge[(size_t)gn * K + gk], gn < N && gk < K);
-            pm_cp16(&Bsu[r][c16], &Wue[(size_t)gn * K + gk], gn < N && gk < K);
+            pm_ld16(&Bsg[r][c16], &Wge[(size_t)gn * K + gk], gn < N && gk < K);
+            pm_ld16(&Bsu[r][c16], &Wue[(size_t)gn * K + gk], gn < N && gk < K);
         }
         __syncthreads();
 #pragma unroll
