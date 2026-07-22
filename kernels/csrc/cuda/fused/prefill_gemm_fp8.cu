@@ -52,8 +52,14 @@ __device__ __forceinline__ int fp8_swz(int k, int row) {
     return (((k >> 4) ^ (row & 3)) << 4) | (k & 15);
 }
 
-__device__ __forceinline__ unsigned fp8_lds32(const __nv_fp8_e4m3* p) {
-    return *reinterpret_cast<const unsigned*>(p);
+// ldmatrix.x4 operand staging, same as the int8 GEMM: one instruction per four 8x8 tiles instead
+// of four scalar lds.32, so fragment loads stop competing with the mma issue rate. e4m3 and s8 are
+// both 1-byte k32 operand types, so the m16n8k32 fragment layout (and this mapping) is identical.
+__device__ __forceinline__ void fp8_ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
+                                           const __nv_fp8_e4m3* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
 }
 
 // Per-row symmetric fp8 quantize (amax -> FP8_TGT), one warp per row. Input bf16.
@@ -86,6 +92,8 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
     const int lane = tid & 31;
     const int grp  = lane >> 2;                       // 0..7
     const int tig  = lane & 3;                        // thread-in-group
+    const int sub  = lane >> 3;                       // ldmatrix tile this thread addresses (0..3)
+    const int lrow = lane & 7;                        // row within that tile
     const int wm   = warp & 3;                        // rows [wm*32, +32)
     const int wn   = warp >> 2;                       // cols [wn*64, +64)
     const int m0   = blockIdx.y * FP8_BM;
@@ -128,21 +136,20 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
 
         #pragma unroll
         for (int kk = 0; kk < FP8_BK; kk += 32) {
-            const int ka = kk + tig * 4;
             unsigned af[FP8_MFRAG][4], bf[FP8_NFRAG][2];
+            // A fragment i: tiles {rows lo,k0} {rows hi,k0} {rows lo,k16} {rows hi,k16} -> af[i][0..3]
             #pragma unroll
             for (int i = 0; i < FP8_MFRAG; i++) {
-                const int rlo = wm * 32 + i * 16 + grp, rhi = rlo + 8;
-                af[i][0] = fp8_lds32(&As[buf][rlo][fp8_swz(ka,      rlo)]);
-                af[i][1] = fp8_lds32(&As[buf][rhi][fp8_swz(ka,      rhi)]);
-                af[i][2] = fp8_lds32(&As[buf][rlo][fp8_swz(ka + 16, rlo)]);
-                af[i][3] = fp8_lds32(&As[buf][rhi][fp8_swz(ka + 16, rhi)]);
+                const int row = wm * 32 + i * 16 + (sub & 1) * 8 + lrow;
+                fp8_ldm_x4(af[i][0], af[i][1], af[i][2], af[i][3],
+                           &As[buf][row][fp8_swz(kk + (sub >> 1) * 16, row)]);
             }
+            // B pair (j, j+1): tiles {cols j,k0} {cols j,k16} {cols j+1,k0} {cols j+1,k16}
             #pragma unroll
-            for (int j = 0; j < FP8_NFRAG; j++) {
-                const int col = wn * 64 + j * 8 + grp;
-                bf[j][0] = fp8_lds32(&Bs[buf][col][fp8_swz(ka,      col)]);
-                bf[j][1] = fp8_lds32(&Bs[buf][col][fp8_swz(ka + 16, col)]);
+            for (int jp = 0; jp < FP8_NFRAG; jp += 2) {
+                const int col = wn * 64 + (jp + (sub >> 1)) * 8 + lrow;
+                fp8_ldm_x4(bf[jp][0], bf[jp][1], bf[jp + 1][0], bf[jp + 1][1],
+                           &Bs[buf][col][fp8_swz(kk + (sub & 1) * 16, col)]);
             }
             #pragma unroll
             for (int i = 0; i < FP8_MFRAG; i++)

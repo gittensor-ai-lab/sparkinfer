@@ -425,6 +425,90 @@ __global__ void pf_gdn_conv_par_kernel(const __nv_bfloat16* __restrict__ qkv,
 }
 
 // ============================================================================
+// Token-tiled variant of pf_gdn_conv_par_kernel. That kernel launches one block per (token, head),
+// so every raw qkv row is re-read from DRAM by the conv_kernel overlapping token blocks -- a ~4x
+// read amplification of the largest input (measured at its DRAM roofline *including* that
+// amplification). One block per (16-token tile, head) instead: each thread seeds a register
+// window with its channel's conv_kernel-1 boundary rows and slides it across the tile, so the
+// tile reads 16+conv_kernel-1 rows for 16 outputs (~1.2x). Tap order, SiLU, and the two-stage
+// L2-norm reduction are unchanged, and the boundary "add w*0" equals the parallel kernel's
+// predicated skip exactly -- output is bit-identical.
+// ============================================================================
+constexpr int PF_CONV_TT = 16;                     // tokens per block
+__global__ void pf_gdn_conv_tile_kernel(const __nv_bfloat16* __restrict__ qkv,
+                                        const __nv_bfloat16* __restrict__ conv_w,
+                                        __nv_bfloat16* __restrict__ conv_state,
+                                        __nv_bfloat16* __restrict__ q,
+                                        __nv_bfloat16* __restrict__ k,
+                                        __nv_bfloat16* __restrict__ v,
+                                        int n_tokens, int q_heads, int v_heads,
+                                        int head_dim, int qkv_dim, int conv_kernel, float eps) {
+    const int q_dim = q_heads * head_dim;
+    const int v_dim = v_heads * head_dim;
+    const int tok0 = blockIdx.x * PF_CONV_TT;
+    const int blk = blockIdx.y;                    // output head
+    const int t   = threadIdx.x;                   // channel within head
+    int d; __nv_bfloat16* out; int out_dim; int hh; bool do_norm;
+    if (blk < q_heads)            { hh = blk;                d = hh * head_dim + t;               out = q; out_dim = q_dim; do_norm = true;  }
+    else if (blk < 2 * q_heads)   { hh = blk - q_heads;      d = q_dim + hh * head_dim + t;       out = k; out_dim = q_dim; do_norm = true;  }
+    else                          { hh = blk - 2 * q_heads;  d = 2 * q_dim + hh * head_dim + t;   out = v; out_dim = v_dim; do_norm = false; }
+
+    float w[8];                                    // conv taps (conv_kernel <= 8)
+    #pragma unroll
+    for (int c = 0; c < 8; c++) w[c] = (c < conv_kernel) ? pf_to_f(conv_w[(size_t)d * conv_kernel + c]) : 0.f;
+    float hist[7];                                 // rolling raw-qkv window for this channel (<=7)
+    #pragma unroll
+    for (int c = 0; c < 7; c++) {
+        const int src = tok0 - (conv_kernel - 1) + c;
+        hist[c] = (c < conv_kernel - 1 && src >= 0) ? pf_to_f(qkv[(size_t)src * qkv_dim + d]) : 0.f;
+    }
+
+    __shared__ float sw[32];
+    const int nwarp = (blockDim.x + 31) / 32;
+    #pragma unroll
+    for (int tt = 0; tt < PF_CONV_TT; tt++) {
+        const int tok = tok0 + tt;
+        if (tok >= n_tokens) break;                // uniform across the block
+        const float cur = pf_to_f(qkv[(size_t)tok * qkv_dim + d]);
+        float y = 0.f;
+        #pragma unroll
+        for (int c = 0; c < 7; c++)
+            if (c < conv_kernel - 1) y += w[c] * hist[c];
+        y += w[conv_kernel - 1] * cur;
+        #pragma unroll
+        for (int c = 0; c < 6; c++)
+            if (c < conv_kernel - 2) hist[c] = hist[c + 1];
+        if (conv_kernel >= 2) hist[conv_kernel - 2] = cur;
+
+        float cval = pf_silu(y);
+        if (do_norm) {
+            float ss = pf_wsum(cval * cval);
+            if ((t & 31) == 0) sw[t >> 5] = ss;
+            __syncthreads();
+            if (t < 32) {
+                float vv = (t < nwarp) ? sw[t] : 0.f;
+                vv = pf_wsum(vv);
+                if (t == 0) sw[0] = rsqrtf(vv + eps);
+            }
+            __syncthreads();
+            cval *= sw[0];
+        }
+        out[(size_t)tok * out_dim + hh * head_dim + t] = __float2bfloat16(cval);
+    }
+
+    // persist the conv window (last conv_kernel-1 raw qkv) in the decode layout.
+    if (tok0 <= n_tokens - 1 && n_tokens - 1 < tok0 + PF_CONV_TT) {
+        #pragma unroll
+        for (int c = 0; c < 7; c++) {
+            if (c >= conv_kernel - 1) break;
+            const int src = n_tokens - 1 - (conv_kernel - 2 - c);
+            conv_state[(size_t)c * qkv_dim + d] =
+                (src >= 0) ? qkv[(size_t)src * qkv_dim + d] : __float2bfloat16(0.f);
+        }
+    }
+}
+
+// ============================================================================
 // Gated-DeltaNet sequential recurrence, scanned over N tokens in one launch.
 // Warp-per-state-column, register-cached column, transposed final state layout —
 // bit-identical to running gdn_ar_fast (the SPARKINFER_GDN_FAST default) N times.
@@ -749,6 +833,19 @@ void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_sta
         const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_SEQ");
         return (e && e[0] == '1') ? 1 : 0;
     }();
+    static int tile = [] {  // SPARKINFER_PREFILL_GDN_CONV_TILE=0 restores the token-parallel kernel
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_TILE");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!seq && tile && conv_kernel <= 8) {
+        dim3 grid((n_tokens + PF_CONV_TT - 1) / PF_CONV_TT, blocks);
+        pf_gdn_conv_tile_kernel<<<grid, head_dim, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
+            reinterpret_cast<__nv_bfloat16*>(conv_state), reinterpret_cast<__nv_bfloat16*>(q),
+            reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),
+            n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps);
+        return;
+    }
     if (!seq) {
         dim3 grid(n_tokens, blocks);
         pf_gdn_conv_par_kernel<<<grid, head_dim, 0, stream>>>(

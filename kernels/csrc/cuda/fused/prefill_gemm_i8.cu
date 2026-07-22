@@ -35,8 +35,16 @@ __device__ __forceinline__ int pf_swz(int k, int row) {
     return (((k >> 4) ^ (row & 3)) << 4) | (k & 15);
 }
 
-__device__ __forceinline__ unsigned pf_lds32(const signed char* p) {
-    return *reinterpret_cast<const unsigned*>(p);
+// ldmatrix.x4: one instruction moves all four 8x8 operand tiles of an mma fragment through the
+// LDS pipe (the four scalar lds.32 it replaces issued 1:1 against the mma pipe and were the
+// staging bottleneck). Thread t supplies the shared-memory address of row (t&7) of tile (t>>3);
+// the XOR swizzle still applies per row address, so the smem layout is unchanged and the loaded
+// registers are identical to the lds.32 path.
+__device__ __forceinline__ void pf_ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
+                                          const signed char* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
 }
 
 // Per-row symmetric int8 quantize, one warp per row.
@@ -56,10 +64,14 @@ __global__ void pf_quantize_rows_i8(const __nv_bfloat16* __restrict__ x, signed 
 
 // The 2 in __launch_bounds__ is required, not decorative: left to itself nvcc picks 131 registers,
 // and 2 * 256 * 131 exceeds the 65536-register file, so only one block per SM would be resident.
+// RESID folds the residual add into the store: C[m,n] = bf16(C[m,n] + bf16(acc*sx*sw)) -- the same
+// two-step rounding as the pf_add kernel it replaces, reading and writing through the ONE C
+// pointer (no second aliased argument), so the fused path stays bit-identical to GEMM-then-add.
+template <bool RESID>
 __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
         const signed char* __restrict__ A, const signed char* __restrict__ W,
         const float* __restrict__ sx, const float* __restrict__ sw,
-        __nv_bfloat16* __restrict__ C, int M, int N, int K) {
+        __nv_bfloat16* C, int M, int N, int K) {
     __shared__ signed char As[2][PF_BM][PF_BK];
     __shared__ signed char Bs[2][PF_BN][PF_BK];
 
@@ -68,6 +80,8 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
     const int lane = tid & 31;
     const int grp  = lane >> 2;                       // 0..7
     const int tig  = lane & 3;                        // thread-in-group
+    const int sub  = lane >> 3;                       // ldmatrix tile this thread addresses (0..3)
+    const int lrow = lane & 7;                        // row within that tile
     const int wm   = warp & 3;                        // rows [wm*32, +32)
     const int wn   = warp >> 2;                       // cols [wn*64, +64)
     const int m0   = blockIdx.y * PF_BM;
@@ -103,21 +117,20 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
 
         #pragma unroll
         for (int kk = 0; kk < PF_BK; kk += 32) {
-            const int ka = kk + tig * 4;
             unsigned af[PF_MFRAG][4], bf[PF_NFRAG][2];
+            // A fragment i: tiles {rows lo,k0} {rows hi,k0} {rows lo,k16} {rows hi,k16} -> af[i][0..3]
             #pragma unroll
             for (int i = 0; i < PF_MFRAG; i++) {
-                const int rlo = wm * 32 + i * 16 + grp, rhi = rlo + 8;
-                af[i][0] = pf_lds32(&As[buf][rlo][pf_swz(ka,      rlo)]);
-                af[i][1] = pf_lds32(&As[buf][rhi][pf_swz(ka,      rhi)]);
-                af[i][2] = pf_lds32(&As[buf][rlo][pf_swz(ka + 16, rlo)]);
-                af[i][3] = pf_lds32(&As[buf][rhi][pf_swz(ka + 16, rhi)]);
+                const int row = wm * 32 + i * 16 + (sub & 1) * 8 + lrow;
+                pf_ldm_x4(af[i][0], af[i][1], af[i][2], af[i][3],
+                          &As[buf][row][pf_swz(kk + (sub >> 1) * 16, row)]);
             }
+            // B pair (j, j+1): tiles {cols j,k0} {cols j,k16} {cols j+1,k0} {cols j+1,k16}
             #pragma unroll
-            for (int j = 0; j < PF_NFRAG; j++) {
-                const int col = wn * 64 + j * 8 + grp;
-                bf[j][0] = pf_lds32(&Bs[buf][col][pf_swz(ka,      col)]);
-                bf[j][1] = pf_lds32(&Bs[buf][col][pf_swz(ka + 16, col)]);
+            for (int jp = 0; jp < PF_NFRAG; jp += 2) {
+                const int col = wn * 64 + (jp + (sub >> 1)) * 8 + lrow;
+                pf_ldm_x4(bf[jp][0], bf[jp][1], bf[jp + 1][0], bf[jp + 1][1],
+                          &Bs[buf][col][pf_swz(kk + (sub & 1) * 16, col)]);
             }
             #pragma unroll
             for (int i = 0; i < PF_MFRAG; i++)
@@ -146,8 +159,13 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
                 for (int e = 0; e < 4; e++) {
                     const int gm = m0 + wm * 32 + i * 16 + grp + (e >> 1) * 8;
                     const int cn = gn + (e & 1);
-                    if (gm < M && cn < N)
-                        C[(size_t)gm * N + cn] = __float2bfloat16((float)acc[i][j][e] * sx[gm] * sw[cn]);
+                    if (gm < M && cn < N) {
+                        __nv_bfloat16 v = __float2bfloat16((float)acc[i][j][e] * sx[gm] * sw[cn]);
+                        if (RESID)
+                            v = __float2bfloat16(__bfloat162float(C[(size_t)gm * N + cn]) +
+                                                 __bfloat162float(v));
+                        C[(size_t)gm * N + cn] = v;
+                    }
                 }
                 continue;
             }
@@ -157,9 +175,15 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
                 const int gm = m0 + wm * 32 + i * 16 + grp + h * 8;
                 if (gm >= M) continue;
                 const float s = sx[gm];
-                const __nv_bfloat162 v = __floats2bfloat162_rn((float)acc[i][j][h * 2] * s * w0,
-                                                               (float)acc[i][j][h * 2 + 1] * s * w1);
-                *reinterpret_cast<__nv_bfloat162*>(&C[(size_t)gm * N + gn]) = v;
+                __nv_bfloat162 v = __floats2bfloat162_rn((float)acc[i][j][h * 2] * s * w0,
+                                                         (float)acc[i][j][h * 2 + 1] * s * w1);
+                __nv_bfloat162* cp = reinterpret_cast<__nv_bfloat162*>(&C[(size_t)gm * N + gn]);
+                if (RESID) {
+                    const __nv_bfloat162 r = *cp;
+                    v = __floats2bfloat162_rn(__bfloat162float(r.x) + __bfloat162float(v.x),
+                                              __bfloat162float(r.y) + __bfloat162float(v.y));
+                }
+                *cp = v;
             }
         }
     }
@@ -179,7 +203,17 @@ void launch_prefill_gemm_i8(const signed char* A, const signed char* W,
                             const float* sx, const float* sw, void* C,
                             int M, int N, int K, cudaStream_t stream) {
     dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
-    pf_gemm_i8_kernel<<<grid, 256, 0, stream>>>(
+    pf_gemm_i8_kernel<false><<<grid, 256, 0, stream>>>(
+        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+}
+
+// Residual-fused variant: C[m,n] += bf16(acc*sx*sw) with pf_add's rounding. Passing the residual
+// tensor AS C removes the ao scratch round-trip and the separate full-tensor add launch.
+void launch_prefill_gemm_i8_resid(const signed char* A, const signed char* W,
+                                  const float* sx, const float* sw, void* C,
+                                  int M, int N, int K, cudaStream_t stream) {
+    dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
+    pf_gemm_i8_kernel<true><<<grid, 256, 0, stream>>>(
         A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
 }
 

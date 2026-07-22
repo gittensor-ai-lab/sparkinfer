@@ -30,4 +30,11 @@ void launch_prefill_gemm_i8(const signed char* A, const signed char* W,
                             const float* sx, const float* sw, void* C,
                             int M, int N, int K, cudaStream_t stream = nullptr);
 
+// Residual-fused int8 GEMM: C[m,n] = bf16(C[m,n] + bf16(acc*sx*sw)) -- pass the residual tensor as
+// C to fold the post-projection "x += out" into the store (same two-step rounding as the separate
+// add kernel, so the result is bit-identical while skipping the ao scratch round-trip + add pass).
+void launch_prefill_gemm_i8_resid(const signed char* A, const signed char* W,
+                                  const float* sx, const float* sw, void* C,
+                                  int M, int N, int K, cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

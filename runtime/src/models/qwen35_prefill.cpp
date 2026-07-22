@@ -342,6 +342,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         kernels::launch_gguf_dequant(wtype, W, wbuf, (long)n_out * K, st);
         return wbuf;
     };
+    // int8 activation memo: consecutive int8 projections of the SAME input (wq/wk/wv on xn,
+    // wqkv/wqkv_gate on xn, FFN gate/up on the same chunk) re-quantize identical values into
+    // A_i8/sx each call. Remember what A_i8 currently holds and skip the repeat quantize --
+    // bit-identical, it reuses the exact bytes the first call produced. The memo is reset at
+    // every layer top (xn/hn refresh in place) and wherever A_i8 is written outside proj().
+    const bf16* a_q = nullptr; int a_qR = 0, a_qK = 0;
+    auto quant_a_i8 = [&](const bf16* A, int R, int K) {
+        if (a_q == A && a_qR == R && a_qK == K) return;
+        kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, R, K, st);
+        a_q = A; a_qR = R; a_qK = K;
+    };
     // C[N,n_out] = A[N,K] @ W^T  (W native quantized [n_out,K]).
     auto proj = [&](const bf16* A, const void* W, int wtype, bf16* C, int n_out, int K, int rows = 0) {
         const int R = rows > 0 ? rows : N;   // rows (M) to process; chunked FFN passes a sub-N count
@@ -350,7 +361,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         // sigmoid gates, where per-row int8 quant of a 32-wide weight costs more accuracy
         // than the negligible time it saves.
         if (use_i8 && n_out >= 128) {
-            kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, R, K, st);
+            quant_a_i8(A, R, K);
             // fused Q4_K/Q6_K -> int8 rows skips the dequant-to-bf16 scratch round trip
             if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st)) {
                 const void* wb = dq(W, wtype, n_out, K);
@@ -360,6 +371,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         } else if (use_fp8_gdn && n_out >= 128) {
             // fp8 (e4m3) tensor-core path for the long-ctx GDN projections. A_i8/W_i8 (1 byte) hold
             // the e4m3 operands; dequant the weight to bf16 scratch, then row/channel fp8-quantize.
+            a_q = nullptr;                              // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, R, K, st);
             const void* wb = dq(W, wtype, n_out, K);
             kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, n_out, K, st);
@@ -375,6 +387,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         }
     };
 
+    // Residual-fused output projection: when the projection takes the int8 tensor-core path, run
+    // it with the residual-fused GEMM straight into x (C[m,n] += dequant, pf_add's rounding), so
+    // the ao scratch write + full-tensor add pass disappear. Returns false when the int8 path
+    // would not be taken -- the caller falls back to proj() + launch_prefill_add, unchanged.
+    // Bit-identical to the two-step path. SPARKINFER_PREFILL_RESID_FUSE=0 disables (A/B).
+    const char* _prfuse = getenv("SPARKINFER_PREFILL_RESID_FUSE");
+    const bool resid_fuse = !_prfuse || _prfuse[0] != '0';
+    auto proj_resid = [&](const bf16* A, const void* W, int wtype, bf16* Cx, int n_out, int K,
+                          int rows = 0) -> bool {
+        if (!resid_fuse || !use_i8 || n_out < 128) return false;
+        const int R = rows > 0 ? rows : N;
+        quant_a_i8(A, R, K);
+        if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st)) {
+            const void* wb = dq(W, wtype, n_out, K);
+            kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
+        }
+        kernels::launch_prefill_gemm_i8_resid(A_i8, W_i8, sx, sw, Cx, R, n_out, K, st);
+        return true;
+    };
+
     // GDN wqkv + wqkv_gate both project the same input xn, so on the fp8 path quantize xn to e4m3
     // ONCE and share it across both GEMMs (proj() would otherwise re-quantize xn per projection --
     // a full redundant read of xn and rewrite of the e4m3 activation each layer). Bit-identical to
@@ -384,6 +416,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool fp8_shareq = use_fp8_gdn && (!_pshareq || _pshareq[0] != '0');
     auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w) {
         if (fp8_shareq) {
+            a_q = nullptr;                              // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);   // xn -> e4m3 once
             const void* wb = dq(w.wqkv, w.wqkv_type, lqkv, H);
             kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lqkv, H, st);
@@ -422,6 +455,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
+        a_q = nullptr;                                 // xn/hn are refreshed in place each layer
+        bool attn_fused = false;                       // post-attn residual folded into the proj?
         if (w.linear_attn) {
             // ---- Gated DeltaNet linear-attention layer ----
             gdn_qkv_z(xn, w);                                       // qkv + z gate (fp8: fused)
@@ -434,7 +469,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
                 layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim, st);
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
-            proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+            attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
+            if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
         } else {
             // ---- full softmax-attention layer (q_has_gate, partial RoPE, int8 KV) ----
             // Long-ctx: optionally keep Q/K/V/O on int8 (no GDN recurrence here).
@@ -455,12 +491,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_prefill_attn_int8_paged(qb, kpool, vpool, kscale, vscale, btable, att,
                 N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
             kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
-            proj(att, w.wo, w.wo_type, ao, H, qdim);
+            attn_fused = proj_resid(att, w.wo, w.wo_type, x, H, qdim);
+            if (!attn_fused) proj(att, w.wo, w.wo_type, ao, H, qdim);
             use_i8 = restore_i8;
         }
 
-        // x += ao (post-attn residual, in-place) ; hn = RMSNorm(x, post_attn_norm)
-        kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
+        // x += ao (post-attn residual, in-place; skipped when folded into the output proj)
+        // hn = RMSNorm(x, post_attn_norm)
+        if (!attn_fused) kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
         kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
 
         if (!moe) {
@@ -480,26 +518,55 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 dequant_w_i8(w.up_qtype,   w.up_q,   ffn_Wu_i8, ffn_swu, ffn, H);
                 dequant_w_i8(w.down_qtype, w.down_q, ffn_Wd_i8, ffn_swd, H, ffn);
             }
+            // The down projection takes the int8 path on both branches whenever ffn_i8 or use_i8,
+            // so the FFN residual can ride the residual-fused GEMM straight into x per chunk.
+            const bool ffn_fused = resid_fuse && (ffn_i8 || use_i8);
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
                 if (ffn_i8) {
+                    a_q = nullptr;                     // this branch writes A_i8/sx directly
                     kernels::launch_prefill_quantize_rows_i8(hn_c, A_i8, sx, fn, H, st);
                     kernels::launch_prefill_gemm_i8(A_i8, ffn_Wg_i8, sx, ffn_swg, ffg, fn, ffn, H, st);
                     kernels::launch_prefill_gemm_i8(A_i8, ffn_Wu_i8, sx, ffn_swu, ffu, fn, ffn, H, st);
                     // fused SwiGLU + int8 quantize for the down input (skips the ffg DRAM round-trip)
                     kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st);
-                    kernels::launch_prefill_gemm_i8(A_i8, ffn_Wd_i8, sx, ffn_swd,
-                                                    ao + (size_t)fo * H, fn, H, ffn, st);
+                    if (ffn_fused)
+                        kernels::launch_prefill_gemm_i8_resid(A_i8, ffn_Wd_i8, sx, ffn_swd,
+                                                              x + (size_t)fo * H, fn, H, ffn, st);
+                    else
+                        kernels::launch_prefill_gemm_i8(A_i8, ffn_Wd_i8, sx, ffn_swd,
+                                                        ao + (size_t)fo * H, fn, H, ffn, st);
                 } else {
                     proj(hn_c, w.gate_q, w.gate_qtype, ffg, ffn, H, fn);
                     proj(hn_c, w.up_q,   w.up_qtype,   ffu, ffn, H, fn);
-                    kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
-                    proj(ffg, w.down_q, w.down_qtype, ao + (size_t)fo * H, H, ffn, fn);
+                    if (use_i8) {
+                        // Same fused SwiGLU + per-row int8 quantize the long-ctx ffn_i8 branch
+                        // runs (bit-identical to swiglu-then-quantize; both bf16-round first) --
+                        // skips the ffg store + reload that proj()'s internal quantize would pay.
+                        a_q = nullptr;                 // swiglu_quant writes A_i8/sx directly
+                        kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st);
+                        if (!kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q,
+                                                                  W_i8, sw, H, ffn, st)) {
+                            const void* wb = dq(w.down_q, w.down_qtype, H, ffn);
+                            kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, H, ffn, st);
+                        }
+                        if (ffn_fused)
+                            kernels::launch_prefill_gemm_i8_resid(A_i8, W_i8, sx, sw,
+                                                                  x + (size_t)fo * H, fn, H, ffn, st);
+                        else
+                            kernels::launch_prefill_gemm_i8(A_i8, W_i8, sx, sw,
+                                                            ao + (size_t)fo * H, fn, H, ffn, st);
+                    } else {
+                        kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
+                        if (!ffn_fused || !proj_resid(ffg, w.down_q, w.down_qtype,
+                                                      x + (size_t)fo * H, H, ffn, fn))
+                            proj(ffg, w.down_q, w.down_qtype, ao + (size_t)fo * H, H, ffn, fn);
+                    }
                 }
             }
-            // x += ffn_out (post-attn residual already folded into x above)
-            kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
+            // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk)
+            if (!ffn_fused) kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
         } else {
             // ---- expert-grouped 256-expert int8 MoE FFN (this PR): route -> bucket routed
             // (token, expert) pairs by expert -> per-expert int8 tensor-core GEMMs, so each expert's

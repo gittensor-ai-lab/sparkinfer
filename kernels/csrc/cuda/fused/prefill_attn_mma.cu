@@ -82,16 +82,31 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
     signed char* s_qi = reinterpret_cast<signed char*>(mma_smem);   // [BM][HEAD_DIM]
     signed char* s_pi = s_qi + BM * HEAD_DIM;                       // [BM][GN]
     float* s_s  = reinterpret_cast<float*>(s_pi + BM * GN);         // [BM][GN] scores / P'
-    float* s_o  = s_s + BM * GN;                                    // [BM][HEAD_DIM] running O
+    float* s_o  = s_s + BM * GN;                                    // [BM][HEAD_DIM] O (epilogue only)
     float* s_ks = s_o + BM * HEAD_DIM;                              // [GN]
     float* s_vs = s_ks + GN;                                        // [GN]
     float* s_qs = s_vs + GN;                                        // [BM]
     float* s_ps = s_qs + BM;                                        // [BM]
     float* s_m  = s_ps + BM;                                        // [BM]
     float* s_l  = s_m + BM;                                         // [BM]
-    // PV int32 landing zone, one 16x16 tile per warp. Aliases s_s: the scores/P' floats are dead
-    // once P' has been quantized into s_pi, and WARPS*256 ints == BM*GN floats exactly.
-    int* s_pv = reinterpret_cast<int*>(s_s);
+    float* s_corr = s_l + BM;                                       // [BM] per-group rescale
+
+    // The running O lives in per-warp accumulator fragments (warp w owns d-tiles w*DPW..+DPW),
+    // not in shared memory: the old path bounced every PV tile through a smem int landing zone
+    // and rescaled all BM*HEAD_DIM floats of s_o through smem each group, at two extra
+    // __syncthreads per group. Element rows for the rescale come from an index fragment loaded
+    // once from a per-warp smem tile (value (row<<8)|col), so no accumulator-layout assumption
+    // is made. All arithmetic keeps the old per-element op/rounding sequence -> bit-identical.
+    fragment<accumulator, 16, 16, 16, float> ofr[DPW];
+    fragment<accumulator, 16, 16, 16, int> idxf;
+    {
+        int* tile = reinterpret_cast<int*>(s_s) + warp * 256;       // disjoint per warp
+        for (int i = lane; i < 256; i += 32) tile[i] = ((i >> 4) << 8) | (i & 15);
+        __syncwarp();
+        load_matrix_sync(idxf, tile, 16, mem_row_major);
+    }
+    #pragma unroll
+    for (int dd = 0; dd < DPW; dd++) fill_fragment(ofr[dd], 0.f);
 
     // ---- load + quantize Q rows (warp w owns rows 2w, 2w+1 at WARPS=8) ----
     #pragma unroll
@@ -115,7 +130,6 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
             s_qi[r * HEAD_DIM + lane + e * 32] =
                 (signed char)((amax == 0.f) ? 0 : (int)roundf(qv[e] / d));
     }
-    for (int i = tid; i < BM * HEAD_DIM; i += blockDim.x) s_o[i] = 0.f;
     if (tid < BM) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
     __syncthreads();
 
@@ -199,15 +213,18 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
                     pamax  = fmaxf(pamax, __shfl_xor_sync(0xffffffffu, pamax, o));
                 }
                 const float pd = pamax / 127.0f;
-                if (lane == 0) { s_m[r] = m_new; s_l[r] = s_l[r] * corr + sum; s_ps[r] = pd; }
+                if (lane == 0) { s_m[r] = m_new; s_l[r] = s_l[r] * corr + sum;
+                                 s_ps[r] = pd; s_corr[r] = corr; }
                 for (int t = lane; t < gblk * 16; t += 32)
                     s_pi[r * GN + t] =
                         (signed char)((pamax == 0.f) ? 0 : (int)roundf(s_s[r * GN + t] / pd));
-                for (int c = lane; c < HEAD_DIM; c += 32) s_o[r * HEAD_DIM + c] *= corr;
             }
             __syncthreads();
 
-            // ---- PV: int8 mma -> int32, O += int32 * per-row P' scale ----
+            // ---- PV: int8 mma -> int32, O = O*corr + int32 * per-row P' scale, in registers ----
+            // No smem landing zone and no trailing barriers: the next group's after-QK barrier
+            // already orders every cross-warp reuse (softmax g+1 writes s_pi/s_ps/s_corr only
+            // after all warps passed it, i.e. after they finished this PV).
             #pragma unroll
             for (int dd = 0; dd < DPW; dd++) {
                 const int dt = warp * DPW + dd;
@@ -223,21 +240,28 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
                     load_matrix_sync(bf, vb, KVLD);
                     mma_sync(cf, af, bf, cf);
                 }
-                // s_pv aliases s_s, which is dead once P' is quantized into s_pi. Each warp owns a
-                // disjoint 256-int slice, so the store needs only a warp fence; the __syncthreads
-                // below is what lets the next d-tile (and the next group's QK) reuse the buffer.
-                store_matrix_sync(s_pv + warp * 256, cf, 16, mem_row_major);
-                __syncwarp();
-                for (int i = lane; i < 256; i += 32)
-                    s_o[(i >> 4) * HEAD_DIM + dt * 16 + (i & 15)] +=
-                        (float)s_pv[warp * 256 + i] * s_ps[i >> 4];
-                __syncthreads();
+                // Rounding matches the old smem path exactly: the *= corr rescale was a separate
+                // rounded multiply, while the += pv*ps accumulate compiled to an FMA -- so it is
+                // __fmaf_rn over a rounded product here (verified bit-exact against the old
+                // kernel; a plain mul+add differs).
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int r = idxf.x[e] >> 8;
+                    ofr[dd].x[e] = __fmaf_rn((float)cf.x[e], s_ps[r],
+                                             __fmul_rn(ofr[dd].x[e], s_corr[r]));
+                }
             }
         }
     };
 
     if (split_sink) run_range(0, block_size);
     run_range(split_sink ? blk_rs : 0, last_q + 1);
+
+    // Land the register O tiles in s_o once, so the epilogue below stays coalesced + unchanged.
+    #pragma unroll
+    for (int dd = 0; dd < DPW; dd++)
+        store_matrix_sync(s_o + (warp * DPW + dd) * 16, ofr[dd], HEAD_DIM, mem_row_major);
+    __syncthreads();
 
     // ---- epilogue ----
     for (int r = 0; r < BM; r++) {
@@ -281,8 +305,8 @@ bool launch_prefill_attn_mma(
     const size_t sm = (size_t)BM * HD                 // s_qi (int8)
                     + (size_t)BM * GN                 // s_pi (int8)
                     + (size_t)(BM * GN) * sizeof(float)      // s_s
-                    + (size_t)(BM * HD) * sizeof(float)      // s_o
-                    + (size_t)(2 * GN + 4 * BM) * sizeof(float);  // scales + m/l
+                    + (size_t)(BM * HD) * sizeof(float)      // s_o (epilogue landing)
+                    + (size_t)(2 * GN + 5 * BM) * sizeof(float);  // scales + m/l/corr
 
     static int cfg = 0;
     if (!cfg) {
