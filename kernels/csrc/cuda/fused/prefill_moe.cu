@@ -114,11 +114,6 @@ __device__ __forceinline__ void pm_cp16(void* dst, const void* src, bool pred) {
     if (pred) __pipeline_memcpy_async(dst, src, 16);
     else      *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
 }
-// Sync 16B staging for kernels that stage once per K-tile without cp.async double-buffer.
-__device__ __forceinline__ void pm_ld16(void* dst, const void* src, bool pred) {
-    if (pred) *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
-    else      *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
-}
 
 template <bool A_INDIRECT, bool C_SCATTER>
 __global__ void pfm_moe_gemm_i8_kernel(const signed char* __restrict__ A_i8,
@@ -348,9 +343,9 @@ __global__ void pfm_moe_gemm_i8_gate_up_bm16_kernel(const signed char* __restric
     const int M   = min(BM, cnt - mt * BM);
     const int n0  = blockIdx.x * PM_BN;
 
-    __shared__ signed char As[BM][PM_BK];
-    __shared__ signed char Bsg[PM_BN][PM_BK];
-    __shared__ signed char Bsu[PM_BN][PM_BK];
+    __shared__ signed char As[2][BM][PM_BK];
+    __shared__ signed char Bsg[2][PM_BN][PM_BK];
+    __shared__ signed char Bsu[2][PM_BN][PM_BK];
     __shared__ int Cs[8][16][16];
     __shared__ int s_tok[BM];
 
@@ -370,40 +365,48 @@ __global__ void pfm_moe_gemm_i8_gate_up_bm16_kernel(const signed char* __restric
     wmma::fill_fragment(cf_g, 0);
     wmma::fill_fragment(cf_u, 0);
 
-    const int nk = (K + PM_BK - 1) / PM_BK;
-    for (int t = 0; t < nk; t++) {
-        const int k0 = t * PM_BK;
+    auto stage = [&](int buf, int k0) {
         for (int idx = tid; idx < BM * 2; idx += blockDim.x) {
             const int r = idx >> 1, c16 = (idx & 1) * 16;
             const int gk = k0 + c16;
             const int arow = s_tok[r];
-            pm_ld16(&As[r][c16], &A_i8[(size_t)max(arow, 0) * K + gk], arow >= 0 && gk < K);
+            pm_cp16(&As[buf][r][c16], &A_i8[(size_t)max(arow, 0) * K + gk], arow >= 0 && gk < K);
         }
-        for (int idx = tid; idx < PM_BN * 2; idx += blockDim.x) {
-            const int r = idx >> 1, c16 = (idx & 1) * 16;
+        {
+            const int r = tid >> 1, c16 = (tid & 1) * 16;
             const int gk = k0 + c16;
             const int gn = n0 + r;
-            pm_ld16(&Bsg[r][c16], &Wge[(size_t)gn * K + gk], gn < N && gk < K);
-            pm_ld16(&Bsu[r][c16], &Wue[(size_t)gn * K + gk], gn < N && gk < K);
+            pm_cp16(&Bsg[buf][r][c16], &Wge[(size_t)gn * K + gk], gn < N && gk < K);
+            pm_cp16(&Bsu[buf][r][c16], &Wue[(size_t)gn * K + gk], gn < N && gk < K);
         }
+        __pipeline_commit();
+    };
+
+    const int nk = (K + PM_BK - 1) / PM_BK;
+    stage(0, 0);
+    int buf = 0;
+    for (int t = 0; t < nk; t++) {
+        if (t + 1 < nk) stage(buf ^ 1, (t + 1) * PM_BK);
+        __pipeline_wait_prior(t + 1 < nk ? 1 : 0);
         __syncthreads();
 #pragma unroll
         for (int kk = 0; kk < PM_BK; kk += 16) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf;
-            wmma::load_matrix_sync(af, &As[0][kk], PM_BK);
-            wmma::load_matrix_sync(bf, &Bsg[wn * 16][kk], PM_BK);
+            wmma::load_matrix_sync(af, &As[buf][0][kk], PM_BK);
+            wmma::load_matrix_sync(bf, &Bsg[buf][wn * 16][kk], PM_BK);
             wmma::mma_sync(cf_g, af, bf, cf_g);
         }
 #pragma unroll
         for (int kk = 0; kk < PM_BK; kk += 16) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf;
-            wmma::load_matrix_sync(af, &As[0][kk], PM_BK);
-            wmma::load_matrix_sync(bf, &Bsu[wn * 16][kk], PM_BK);
+            wmma::load_matrix_sync(af, &As[buf][0][kk], PM_BK);
+            wmma::load_matrix_sync(bf, &Bsu[buf][wn * 16][kk], PM_BK);
             wmma::mma_sync(cf_u, af, bf, cf_u);
         }
         __syncthreads();
+        buf ^= 1;
     }
 
     auto store_tile = [&](const wmma::fragment<wmma::accumulator, 16, 16, 16, int>& cf,

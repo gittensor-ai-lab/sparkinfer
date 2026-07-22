@@ -595,7 +595,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 kernels::launch_pfm_moe_gemm_qk(mA_i8, msx, w.up_q, w.up_qtype, pair_tok, pair_w,
                                                 moffsets, tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles,
                                                 true, false, st);
-                kernels::launch_prefill_swiglu_quant_i8(hg, hu, h_i8, sh, P, mffn, st);
+                kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, st);
+                kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, st);
                 pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
                 kernels::launch_pfm_moe_gemm_qk(h_i8, sh, w.down_q, w.down_qtype, pair_tok, pair_w,
                                                 moffsets, tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles,
@@ -881,7 +882,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     }
                 }
 
-                kernels::launch_prefill_swiglu_quant_i8(hg, hu, h_i8, sh, P, mffn, sa);
+                kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, sa);
+                kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, sa);
 
                 for (int gi = 0; gi < n_active; gi++) {
                     const ActiveGroup& ag = active[(size_t)gi];
@@ -927,7 +929,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                                        tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles, moe_bm,
                                                        true, false, st);
                 }
-                kernels::launch_prefill_swiglu_quant_i8(hg, hu, h_i8, sh, P, mffn, st);
+                kernels::launch_prefill_swiglu(hg, hu, hh, (long)P * mffn, st);
+                kernels::launch_prefill_quantize_rows_i8(hh, h_i8, sh, P, mffn, st);
                 pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
                 kernels::launch_pfm_moe_gemm_i8_bm(h_i8, sh, Wd_i8, swd, pair_tok, pair_w, moffsets,
                                                    tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles, moe_bm,
