@@ -735,21 +735,44 @@ PY
   echo "$DECODE_LINE"
   exit 0
 fi
-PREFILL_LINE="$(SPARKINFER_DIFFICULTY_REF="$(python3 - <<PY
+PREFILL_LINE="$(python3 - <<PY
+# Derive TTFT from selected prefill pp (TTFT ≈ ctx / pp_tps) and tier by TTFT reduction vs main.
 # llama-batched pp refs (~11k) are not comparable to sparkinfer sequential pp (~300) or
 # batched sparkinfer pp (~4k-6k) vs same-box main — tier on frontier when DIFF_REF<=0.
-tps=float("${PREFILL_SELECTED_TPS:-0}")
-llama=float("${PREFILL_SELECTED_LLAMA_REF:-0}")
-frontier=float("${PREFILL_SELECTED_FRONTIER:-0}")
-use_frontier = tps <= 0 or llama <= 0 or llama >= tps * 50
-if not use_frontier and frontier > 0 and llama >= 2 * frontier:
+import json, os, subprocess
+tps = float("${PREFILL_SELECTED_TPS:-0}")
+llama_pp = float("${PREFILL_SELECTED_LLAMA_REF:-0}")
+frontier = float("${PREFILL_SELECTED_FRONTIER:-0}")
+ctx = float("${PREFILL_SELECTED_CTX:-0}")
+use_frontier = tps <= 0 or llama_pp <= 0 or llama_pp >= tps * 50
+if not use_frontier and frontier > 0 and llama_pp >= 2 * frontier:
     use_frontier = True
 if not use_frontier and frontier > 0 and tps >= 1000:
     use_frontier = True  # batched sparkinfer pp — tier on same-box main, not llama anchor
-print(0 if use_frontier else llama)
+ttft = ctx / tps if tps > 0 and ctx > 0 else 0.0
+frontier_ttft = ctx / frontier if frontier > 0 and ctx > 0 else 0.0
+llama_ttft = 0.0 if use_frontier or llama_pp <= 0 or ctx <= 0 else ctx / llama_pp
+env = os.environ.copy()
+env["SPARKINFER_LABEL_LOWER_IS_BETTER"] = "1"
+env["SPARKINFER_DIFFICULTY_REF"] = str(llama_ttft)
+env["SPARKINFER_DIFFICULTY_BOOST"] = os.environ.get("SPARKINFER_DIFFICULTY_BOOST", "1")
+# ceiling unused for latency (pass 0)
+cmd = ["python3", "${HERE}/label.py", str(ttft), str(frontier_ttft), "0",
+       "${TOP1}", "${KL}", "${COMMIT}", "{}"]
+out = subprocess.check_output(cmd, env=env, text=True).strip()
+# Rewrite display fields: keep label/pct from TTFT path; expose pp tok/s for dashboards.
+if out.startswith("RESULT_JSON "):
+    pf = json.loads(out[len("RESULT_JSON "):])
+    pf["prefill_ttft_s"] = round(ttft, 6)
+    pf["prefill_frontier_ttft_s"] = round(frontier_ttft, 6)
+    pf["tps"] = round(tps, 2)
+    pf["frontier_tps"] = round(frontier, 2)
+    pf["delta_tps"] = round(tps - frontier, 2) if frontier > 0 else None
+    # pct_over_frontier / effective_pct / speed_label stay TTFT-reduction based
+    out = "RESULT_JSON " + json.dumps(pf)
+print(out)
 PY
-)" SPARKINFER_DIFFICULTY_BOOST="${SPARKINFER_DIFFICULTY_BOOST:-1}" \
-  python3 "$HERE/label.py" "$PREFILL_SELECTED_TPS" "$PREFILL_SELECTED_FRONTIER" "$CEILING" "$TOP1" "$KL" "$COMMIT" "{}")"
+)"
 DECODE_LINE="$DECODE_LINE" PREFILL_LINE="$PREFILL_LINE" python3 - <<'PY'
 import json, os
 
@@ -765,6 +788,10 @@ def copy_scoring_fields(dst, src):
             dst[key] = src[key]
     if src.get("difficulty_mult") is not None:
         dst["difficulty_mult"] = src["difficulty_mult"]
+    if src.get("prefill_ttft_s") is not None:
+        dst["prefill_ttft_s"] = src["prefill_ttft_s"]
+    if src.get("prefill_frontier_ttft_s") is not None:
+        dst["prefill_frontier_ttft_s"] = src["prefill_frontier_ttft_s"]
 
 decode_line = os.environ.get("DECODE_LINE", "").strip()
 prefill_raw = os.environ.get("PREFILL_LINE", "").strip()
@@ -780,9 +807,13 @@ if prefill_raw.startswith("RESULT_JSON "):
     # but real prefill gains still get annotated (eval-prefill:XL).
     res["prefill_label"] = pf.get("speed_label") or pf.get("label")
     res["prefill_delta_tps"] = pf.get("delta_tps")
-    res["prefill_pct_over_frontier"] = pf.get("pct_over_frontier")
+    res["prefill_pct_over_frontier"] = pf.get("pct_over_frontier")  # TTFT reduction %
     res["prefill_pct_of_llama"] = pf.get("pct_of_llama")
     res["prefill_effective_pct"] = pf.get("effective_pct")
+    if pf.get("prefill_ttft_s") is not None:
+        res["prefill_ttft_s"] = pf["prefill_ttft_s"]
+    if pf.get("prefill_frontier_ttft_s") is not None:
+        res["prefill_frontier_ttft_s"] = pf["prefill_frontier_ttft_s"]
     if pf.get("difficulty_mult") is not None:
         res["prefill_difficulty_mult"] = pf["difficulty_mult"]
     # Never promote prefill over a correctness REJECT headline (pass=false stays merge-blocking).

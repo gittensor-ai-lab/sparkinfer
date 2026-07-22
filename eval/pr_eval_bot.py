@@ -1107,8 +1107,11 @@ def render(res, oid):
             if block.get("prefill_label"):
                 pctx = block.get("score_prefill_context", 0)
                 plbl = block.get("best_prefill_context_label", "")
+                ttft_pct = block.get("prefill_pct_over_frontier")
+                ttft_note = (f" · TTFT −{ttft_pct}%" if ttft_pct is not None else "")
                 rows.append(f"| {title} scored prefill ({pctx} ctx"
-                            f"{f' · {plbl}' if plbl else ''}) | {block.get('prefill_tps', '?')} pp tok/s · "
+                            f"{f' · {plbl}' if plbl else ''}) | {block.get('prefill_tps', '?')} pp tok/s"
+                            f"{ttft_note} · "
                             f"`eval-prefill:{block.get('prefill_label')}` |")
             elif block.get("eval_prefill"):
                 best_pp = _best_prefill_measurement(block)

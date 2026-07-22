@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Eval-loop label = deterministic function of measurements (so validators converge).
 
-  label.py <tps> <frontier_tps> <ceiling_tps> <top1> <kl> <commit>
+  label.py <value> <frontier> <ceiling> <top1> <kl> <commit> [prov_json]
 
 Emits one line:  RESULT_JSON {...}
 
@@ -20,13 +20,16 @@ Emits one line:  RESULT_JSON {...}
   %-over-frontier (a gain must beat the current best); pct_over_frontier reports the honest measured
   speedup; pct_of_llama is the tier basis.
   llama_ref (SPARKINFER_DIFFICULTY_REF) <= 0 falls back to the legacy delta/frontier basis.
+- SPARKINFER_LABEL_LOWER_IS_BETTER=1: value/frontier are latencies (e.g. TTFT seconds). Gain is the
+  reduction fraction (frontier - value) / frontier; pct_over_frontier is % reduced. Prefill scoring
+  uses this so tiers reflect time-to-first-token cuts vs same-box main.
   Thresholds are governance-tunable.
 """
 import sys, json, os
 
-tps      = float(sys.argv[1])   # measured median tok/s of the submission
-frontier = float(sys.argv[2])   # current best verified tok/s (0 = none yet)
-ceiling  = float(sys.argv[3])   # roofline / strong-reference cap (display only)
+tps      = float(sys.argv[1])   # measured median tok/s (or TTFT seconds when lower-is-better)
+frontier = float(sys.argv[2])   # current best verified tok/s / TTFT (0 = none yet)
+ceiling  = float(sys.argv[3])   # roofline / strong-reference cap (display only; unused if 0)
 top1     = float(sys.argv[4])   # token-match vs reference, 0..1
 kl       = float(sys.argv[5])   # mean KL vs reference (nats)
 commit   = sys.argv[6]
@@ -50,6 +53,8 @@ KL_PREFER = float(os.environ.get("SPARKINFER_KL_PREFER", "0.15"))
 SIG = 0.02                                              # noise floor: gain must beat 2% of frontier
 # min relative speedup (delta/frontier) for each tier; XS starts at the noise floor SIG.
 BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
+# Prefill / TTFT: score latency reduction instead of throughput increase.
+LOWER_IS_BETTER = os.environ.get("SPARKINFER_LABEL_LOWER_IS_BETTER", "0") == "1"
 
 # ---- Optional difficulty compensation (Option B — opt-in, governance-tunable) ----
 # As the frontier pulls past a mature reference (llama.cpp), each further % gain is harder; scale the
@@ -66,12 +71,18 @@ DIFF_REF   = float(os.environ.get("SPARKINFER_DIFFICULTY_REF", "365.85"))  # lla
 DIFF_MAX   = float(os.environ.get("SPARKINFER_DIFFICULTY_MAX", "1.5"))
 
 def difficulty_mult(frontier):
-    if not DIFF_BOOST or DIFF_REF <= 0:
+    if not DIFF_BOOST or DIFF_REF <= 0 or frontier <= 0:
         return 1.0
+    if LOWER_IS_BETTER:
+        # Latency: past-llama when frontier TTFT is *below* llama TTFT (faster).
+        return min(1.0 + DIFF_K * max(0.0, DIFF_REF / frontier - 1.0), DIFF_MAX)
     return min(1.0 + DIFF_K * max(0.0, frontier / DIFF_REF - 1.0), DIFF_MAX)
 
-res = {"commit": commit, "tps": round(tps, 2), "top1": round(top1, 4),
-       "kl": round(kl, 4), "frontier_tps": round(frontier, 2)}
+res = {"commit": commit, "tps": round(tps, 6 if LOWER_IS_BETTER else 2),
+       "top1": round(top1, 4), "kl": round(kl, 4),
+       "frontier_tps": round(frontier, 6 if LOWER_IS_BETTER else 2)}
+if LOWER_IS_BETTER:
+    res["lower_is_better"] = True
 
 
 def _speed_tier_fields(tps, frontier, ceiling):
@@ -81,12 +92,18 @@ def _speed_tier_fields(tps, frontier, ceiling):
     if frontier <= 0:
         out["label"] = "BASELINE"
         return out
-    delta = tps - frontier
-    g = delta / frontier                                # relative speedup over the frontier — SIGNIFICANCE basis
+    if LOWER_IS_BETTER:
+        delta = frontier - tps                          # seconds saved (positive when faster)
+        g = delta / frontier                            # TTFT reduction fraction
+    else:
+        delta = tps - frontier
+        g = delta / frontier                            # relative speedup — SIGNIFICANCE basis
     if g <= SIG:
-        out.update(label="none", delta_tps=round(delta, 2),
+        out.update(label="none", delta_tps=round(delta, 6 if LOWER_IS_BETTER else 2),
                    pct_over_frontier=round(100 * g, 1),
-                   note="within significance gate — not a verified improvement")
+                   note=("within significance gate — not a verified TTFT reduction"
+                         if LOWER_IS_BETTER else
+                         "within significance gate — not a verified improvement"))
         return out
     # FAIR label tier: size the gain against the llama.cpp reference (DIFF_REF — a constant maturity
     # anchor for EVERY model), not the possibly-unoptimized frontier. So the same tok/s of real work
@@ -95,17 +112,21 @@ def _speed_tier_fields(tps, frontier, ceiling):
     # still gates on raw %-over-frontier above (a gain must beat the current best); only the TIER is
     # llama-anchored. Past-llama difficulty boost (Option B) is unchanged. DIFF_REF<=0 -> legacy basis.
     ref = DIFF_REF if DIFF_REF > 0 else frontier
-    g_fair = delta / ref
+    if LOWER_IS_BETTER:
+        # Latency: fair gain = how much of llama's TTFT we cut vs llama (ref - value) / ref.
+        g_fair = (ref - tps) / ref if ref > 0 else g
+    else:
+        g_fair = delta / ref
     D = difficulty_mult(frontier)                       # hard-gain boost once past the reference
     g_eff = min(g_fair * D, 2 * g)                      # strict cap: tier credit ≤ 2× measured speedup
     # A verified improvement over the frontier floors at XS (real but small); the higher tiers
     # (S/M/L/XL) are earned by the llama-anchored size. So "none" always means "not a verified
     # improvement", never "real but tiny".
     label = next((l for thr, l in BUCKETS if g_eff >= thr), "XS")
-    out.update(label=label, delta_tps=round(delta, 2),
-               pct_over_frontier=round(100 * g, 1),      # RAW measured speedup (honest reporting)
-               pct_of_llama=round(100 * g_fair, 1),      # gain as a fraction of llama.cpp — the label basis
-               pct_of_ceiling=round(100 * tps / ceiling, 1) if ceiling > 0 else None)
+    out.update(label=label, delta_tps=round(delta, 6 if LOWER_IS_BETTER else 2),
+               pct_over_frontier=round(100 * g, 1),      # RAW measured speedup / TTFT reduction
+               pct_of_llama=round(100 * g_fair, 1),      # gain vs llama — the label basis
+               pct_of_ceiling=round(100 * tps / ceiling, 1) if ceiling > 0 and not LOWER_IS_BETTER else None)
     out["effective_pct"] = round(100 * g_eff, 1)
     if D != 1.0:                                        # transparency: expose the boost in the verdict
         out["difficulty_mult"] = round(D, 2)
