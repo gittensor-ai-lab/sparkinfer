@@ -84,6 +84,10 @@ build/runtime/qwen3_gguf_score model.gguf 20 <token-ids...>   # compare argmax +
 | `NO_PREBUILT` | `0` | set `1` to skip prebuilt binaries and build from source |
 | `PREBUILT_TAG` | `latest` | newest matching prebuilt release; set a tag like `v0.2.0` to pin |
 | `PREBUILT_URL` | auto | override with an exact prebuilt tarball URL |
+| `SPARKINFER_EVAL_PREFILL_CHECK` | `1` | H3: batched vs token-loop prefill fidelity veto (`qwen3_gguf_prefill_check`) |
+| `SPARKINFER_EVAL_PREFILL_CHECK_PREFIX` | `512` | prefix length for H3 |
+| `SPARKINFER_EVAL_PREFILL_CHECK_TOP1_BAR` | `0.80` | H3 veto if TOP1 below this |
+| `SPARKINFER_EVAL_PREFILL_CHECK_KL_BAR` | `0.05` | H3 veto if mean KL above this |
 
 ## Automatic PR evaluation
 

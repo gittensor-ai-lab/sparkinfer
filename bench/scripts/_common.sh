@@ -41,11 +41,22 @@ CUDA_HOST_FLAG=""
 [ -x /usr/bin/g++-12 ] && CUDA_HOST_FLAG="-DCMAKE_CUDA_HOST_COMPILER=g++-12"
 
 ensure_sparkinfer() {  # $1 = arch
-  [ -x "$ROOT/build/runtime/qwen3_gguf_bench" ] && [ -x "$ROOT/build/runtime/qwen3_gguf_score" ] && return
+  [ -x "$ROOT/build/runtime/qwen3_gguf_bench" ] && [ -x "$ROOT/build/runtime/qwen3_gguf_score" ] \
+    && [ -x "$ROOT/build/runtime/qwen3_gguf_prefill_check" ] && return
   echo ">> building sparkinfer (sm_$1) ..." >&2
   cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_CUDA_ARCHITECTURES="$1" -DCMAKE_BUILD_TYPE=Release $CUDA_HOST_FLAG >/dev/null
   # Cap at 2 parallel jobs — cc1plus for sm_120 uses ~2-3 GB RAM each; -j4 OOMs on 64GB eval boxes.
   cmake --build "$ROOT/build" -j2 >/dev/null
+}
+
+# H3: batched-vs-token prefill fidelity binary (not always in release tarballs).
+ensure_prefill_check() {  # $1 = arch
+  if [ -x "$ROOT/build/runtime/qwen3_gguf_prefill_check" ]; then return 0; fi
+  if [ -n "${SI_BIN:-}" ] && [ -x "$SI_BIN/qwen3_gguf_prefill_check" ]; then return 0; fi
+  echo ">> building qwen3_gguf_prefill_check (sm_$1) ..." >&2
+  cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_CUDA_ARCHITECTURES="$1" -DCMAKE_BUILD_TYPE=Release $CUDA_HOST_FLAG >/dev/null
+  cmake --build "$ROOT/build" -j2 --target qwen3_gguf_prefill_check >/dev/null
+  [ -x "$ROOT/build/runtime/qwen3_gguf_prefill_check" ]
 }
 
 _download_model() {

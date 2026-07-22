@@ -98,6 +98,78 @@ if ! grep -q "^PPL" /tmp/spark_score.txt; then   # prebuilt incompatible -> rebu
   si_run qwen3_gguf_score "$GGUF" 128 $IDS > /tmp/spark_score.txt 2>/dev/null
 fi
 
+# H3 (batched prefill fidelity): #586 — accuracy vs llama only exercises forward_token /
+# qwen3_gguf_score, while prefill tok/s (and the server) use prefill_batched(). Prefill-only
+# bugs (#583 GPU MoE tilemap) shipped with a green short gate. qwen3_gguf_prefill_check compares
+# batched vs token-loop KV/logits inside sparkinfer (no llama). Bars from RTX 5090 A/B on
+# Qwen3.6 @512 cont=16:
+#     config                         TOP1      KL
+#     broken (MOE_GPU default-on)    0.44–0.56  ~0.34
+#     host tilemap / defaults-fixed  0.875–0.94 ~0.006
+# Reject on EITHER bar. Runs BEFORE llama-server so a fail-fast veto frees the box early and
+# avoids OOM (35B + llama together). Env-overridable; SPARKINFER_EVAL_PREFILL_CHECK=0 disables.
+PFCHECK="${SPARKINFER_EVAL_PREFILL_CHECK:-1}"
+PFCHECK_N="${SPARKINFER_EVAL_PREFILL_CHECK_PREFIX:-512}"
+PFCHECK_C="${SPARKINFER_EVAL_PREFILL_CHECK_CONT:-16}"
+PFCHECK_TOP1_BAR="${SPARKINFER_EVAL_PREFILL_CHECK_TOP1_BAR:-0.80}"
+PFCHECK_KL_BAR="${SPARKINFER_EVAL_PREFILL_CHECK_KL_BAR:-0.05}"
+if [ "$PFCHECK" = "1" ]; then
+  echo ">> batched prefill fidelity check (prefix=$PFCHECK_N cont=$PFCHECK_C, int8_kv=1) ..."
+  if ensure_prefill_check "$ARCH"; then
+    PFCHECK_BIN="$ROOT/build/runtime/qwen3_gguf_prefill_check"
+    [ -x "$PFCHECK_BIN" ] || PFCHECK_BIN="$SI_BIN/qwen3_gguf_prefill_check"
+    # Prefer source-build binary (prebuilt release bundles may omit prefill_check).
+    if [ -n "$SI_LD" ] && [ "$PFCHECK_BIN" = "$SI_BIN/qwen3_gguf_prefill_check" ]; then
+      SPARKINFER_KV_INT8=1 LD_LIBRARY_PATH="$SI_LD:${LD_LIBRARY_PATH:-}" \
+        "$PFCHECK_BIN" "$GGUF" "$PFCHECK_N" "$PFCHECK_C" > /tmp/prefill_check.txt 2>&1 || true
+    else
+      SPARKINFER_KV_INT8=1 \
+        "$PFCHECK_BIN" "$GGUF" "$PFCHECK_N" "$PFCHECK_C" > /tmp/prefill_check.txt 2>&1 || true
+    fi
+    if ! grep -q '^TOP1' /tmp/prefill_check.txt; then
+      echo "!! prefill_check produced no TOP1 — skipping H3 veto"
+      cat /tmp/prefill_check.txt | tail -20 || true
+      PFCHECK=0
+    else
+      grep -E '^(prefix|TOP1|KL|seed)' /tmp/prefill_check.txt || true
+      set +e
+      PFCHECK_TOP1_BAR="$PFCHECK_TOP1_BAR" PFCHECK_KL_BAR="$PFCHECK_KL_BAR" \
+        python3 - /tmp/prefill_check.txt <<'PY'
+import re, sys, os
+t1_bar = float(os.environ.get("PFCHECK_TOP1_BAR", "0.80"))
+kl_bar = float(os.environ.get("PFCHECK_KL_BAR", "0.05"))
+top1 = kl = None
+for line in open(sys.argv[1]):
+    m = re.match(r'^TOP1\s+\d+/\d+\s+([\d.]+)', line)
+    if m: top1 = float(m.group(1))
+    m = re.match(r'^KL\s+([\d.]+)', line)
+    if m: kl = float(m.group(1))
+if top1 is None or kl is None:
+    print("!! could not parse prefill_check TOP1/KL — skipping H3 veto"); sys.exit(0)
+reasons = []
+if top1 < t1_bar: reasons.append(f"top1 {top1:.4f} < {t1_bar:.2f}")
+if kl > kl_bar: reasons.append(f"KL {kl:.5f} > {kl_bar:.2f}")
+print(f"  batched-vs-token  top1={top1:.4f} kl={kl:.5f}   (veto if top1<{t1_bar:.2f} or KL>{kl_bar:.2f})"
+      + ("  -> VETO" if reasons else ""))
+if reasons:
+    print(f"=== H3 prefill fidelity veto: prefill_batched diverges from token loop ({'; '.join(reasons)}) ===")
+    print(f"METRIC top1=0.000000 kl={kl:.6f} ppl_spark=0 ppl_llama=0")
+    sys.exit(42)
+print("=== H3 prefill fidelity OK ===")
+PY
+      pf_rc=$?
+      set -e
+      if [ "$pf_rc" = "42" ]; then
+        exit 0   # METRIC already printed; evaluate.sh treats top1=0 as REJECT
+      elif [ "$pf_rc" != "0" ]; then
+        echo "!! H3 parse failed (rc=$pf_rc) — continuing without prefill veto"
+      fi
+    fi
+  else
+    echo "!! qwen3_gguf_prefill_check unavailable — skipping H3 veto"
+  fi
+fi
+
 if [ "$LONGCTX" = "1" ]; then
   for j in $(seq 0 $((LONG_SEEDS - 1))); do
     echo ">> sparkinfer long-context score — int8 KV, seed L${j} ..."
