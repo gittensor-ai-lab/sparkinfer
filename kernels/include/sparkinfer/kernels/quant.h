@@ -53,6 +53,18 @@ bool launch_gguf_dequant_rows_i8_gather_pair(
     const int* live_le, int n_live, int rows_per_expert, int cols,
     size_t expert_bytes0, size_t expert_bytes1, cudaStream_t stream = nullptr);
 
+bool launch_gguf_dequant_rows_i8_mask(
+    int ggml_type, const void* src0, signed char* q0, float* scale0,
+    const int* counts, int e_base, int n_in, int rows_per_expert, int cols,
+    size_t expert_bytes, cudaStream_t stream = nullptr);
+
+bool launch_gguf_dequant_rows_i8_mask_pair(
+    int ggml_type,
+    const void* src0, signed char* q0, float* scale0,
+    const void* src1, signed char* q1, float* scale1,
+    const int* counts, int e_base, int n_in, int rows_per_expert, int cols,
+    size_t expert_bytes0, size_t expert_bytes1, cudaStream_t stream = nullptr);
+
 // bf16 transposes used to relayout GGUF [out,in] -> our [in,out].
 void launch_transpose_bf16(const void* src, void* dst, int rows, int cols,
                            cudaStream_t stream = nullptr);          // [rows,cols]->[cols,rows]

@@ -348,6 +348,32 @@ bool launch_gguf_dequant_rows_i8_gather_pair(
     return true;
 }
 
+bool launch_gguf_dequant_rows_i8_mask(
+    int ggml_type, const void* src0, signed char* q0, float* scale0,
+    const int* counts, int e_base, int n_in, int rows_per_expert, int cols,
+    size_t expert_bytes, cudaStream_t stream) {
+    return launch_gguf_dequant_rows_i8_fast_mask(
+        ggml_type, src0, q0, scale0, counts, e_base, n_in, rows_per_expert, cols, expert_bytes,
+        stream);
+}
+
+bool launch_gguf_dequant_rows_i8_mask_pair(
+    int ggml_type,
+    const void* src0, signed char* q0, float* scale0,
+    const void* src1, signed char* q1, float* scale1,
+    const int* counts, int e_base, int n_in, int rows_per_expert, int cols,
+    size_t expert_bytes0, size_t expert_bytes1, cudaStream_t stream) {
+    if (launch_gguf_dequant_rows_i8_fast_mask_pair(
+            ggml_type, src0, q0, scale0, src1, q1, scale1, counts, e_base, n_in, rows_per_expert,
+            cols, expert_bytes0, expert_bytes1, stream))
+        return true;
+    if (!launch_gguf_dequant_rows_i8_mask(ggml_type, src0, q0, scale0, counts, e_base, n_in,
+                                          rows_per_expert, cols, expert_bytes0, stream))
+        return false;
+    return launch_gguf_dequant_rows_i8_mask(ggml_type, src1, q1, scale1, counts, e_base, n_in,
+                                            rows_per_expert, cols, expert_bytes1, stream);
+}
+
 void launch_transpose_bf16(const void* src, void* dst, int rows, int cols, cudaStream_t stream) {
     long n = (long)rows*cols; const int T=256;
     transpose2d_kernel<<<(n+T-1)/T,T,0,stream>>>(reinterpret_cast<const __nv_bfloat16*>(src), reinterpret_cast<__nv_bfloat16*>(dst), rows, cols);
