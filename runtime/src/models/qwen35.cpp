@@ -164,7 +164,7 @@ struct Qwen35Model::Impl {
     int    sparse_budget = 0;      // max sel slots = 1 + window
     int    sparse_window = 256;    // recent window in KV blocks (16 tokens/block)
     int    sparse_min_ctx = 8192;
-    bool   sparse_mma = true;      // wmma int8 sparse split; SPARKINFER_SPARSE_MMA=0 -> scalar kernel
+    bool   sparse_mma = false;     // wmma int8 sparse; default ON for GQA-8 only (see ctor)
     bool   graph_sparse = false;
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
     signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
@@ -280,13 +280,29 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->fa_m   = p_->alloc<float>(fa_n);
     p_->fa_l   = p_->alloc<float>(fa_n);
     p_->fa_acc = p_->alloc<float>(fa_n * cfg.head_dim);
-    // Sink + sliding-window sparse KV: default ON for Qwythos GQA-4 hd256 (int8 KV).
-    // SPARKINFER_SPARSE_KV=0 restores dense full-context flash-decode.
+    // Sink + sliding-window sparse KV: default ON for hd256 GQA-4 (Qwythos, scalar) and
+    // GQA-8 (Qwen3.6, wmma int8). SPARKINFER_SPARSE_KV=0 restores dense full-context flash-decode.
+    //
+    // Qwen3.6 (GQA-8) engagement (RTX 5090 bot history on PR #560 / cd94c07):
+    //   • Scalar sparse alone: +2.2% @32k, but regressed 16k vs dense-MMA (419 vs 438).
+    //   • wmma int8 sparse: +8.6% @32k (445.4 vs 410.1), 16k also passes; accuracy pass.
+    //   • min_ctx=16384 — H2 accuracy probe (8448 toks) stays dense; 16k+ engages sparse.
+    //   • window=256 (~4k toks) — O(window) KV read vs dense full-cache MMA.
+    //   • Decode-only (sample &&) — never bake into prefill CUDA graphs (avoids pp@512 collateral).
+    //   • SPARKINFER_SPARSE_MMA=0 → scalar @ min_ctx=32768 (conservative fallback).
+    //
+    // Qwythos GQA-4: keep #379 scalar sparse (window=256, min_ctx=8192). Same-window
+    // scalar→MMA only changes compute; measured +0.3% (within noise) — MMA default OFF.
     bool sparse_enable = true;
     if (const char* se = getenv("SPARKINFER_SPARSE_KV")) sparse_enable = (se[0] != '0');
+    const bool sparse_gqa4 = cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4;
+    const bool sparse_gqa8 = cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 8;
+    // Default MMA on for GQA-8 only; env can force either way.
+    p_->sparse_mma = sparse_gqa8;
     if (const char* sm = getenv("SPARKINFER_SPARSE_MMA")) p_->sparse_mma = (sm[0] != '0');
-    if (sparse_enable && cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4) {
-        p_->sparse_window = 256;
+    if (sparse_enable && (sparse_gqa4 || sparse_gqa8)) {
+        p_->sparse_window  = 256;
+        p_->sparse_min_ctx = sparse_gqa8 ? (p_->sparse_mma ? 16384 : 32768) : 8192;
         if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
         // Legacy aliases from the Quest prototype (blocks, not tokens).
         if (const char* rw = getenv("SPARKINFER_SPARSE_RECENT")) { int v = atoi(rw); if (v > 0) p_->sparse_window = v; }
@@ -296,8 +312,9 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         if (const char* mc = getenv("SPARKINFER_SPARSE_MIN_CTX")) { int v = atoi(mc); if (v > 0) p_->sparse_min_ctx = v; }
         p_->sparse_budget = 1 + p_->sparse_window;
         p_->sparse_sel = p_->alloc<int>((size_t)cfg.n_kv_heads * p_->sparse_budget);
-        fprintf(stderr, "[sparse-kv] sliding-window (default on): window=%d blocks (%d tokens) min_ctx=%d mma=%d\n",
-                p_->sparse_window, p_->sparse_window * kv->block_size(), p_->sparse_min_ctx, p_->sparse_mma ? 1 : 0);
+        fprintf(stderr, "[sparse-kv] sliding-window (default on): gqa=%d window=%d blocks (%d tokens) min_ctx=%d mma=%d\n",
+                sparse_gqa8 ? 8 : 4, p_->sparse_window, p_->sparse_window * kv->block_size(),
+                p_->sparse_min_ctx, (sparse_gqa8 && p_->sparse_mma) ? 1 : 0);
     }
     const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
     p_->aq8   = p_->alloc<signed char>(kmax);
@@ -462,8 +479,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.graph_ready = false;
     }
     const bool sparse_avail = s.sparse_budget > 0 && s.kv->int8_kv() &&
-                              c.head_dim == 256 && c.n_q_heads == c.n_kv_heads * 4;
-    const bool sparse_on = sparse_avail && seqlen >= s.sparse_min_ctx;
+                              c.head_dim == 256 &&
+                              (c.n_q_heads == c.n_kv_heads * 4 || c.n_q_heads == c.n_kv_heads * 8);
+    // Decode-only: never engage sparse during prefill graph capture (sample=false). Prefill
+    // attention has its own windowed/MMA path; baking sparse into the prefill graph caused
+    // pp@512 collateral on #560 before decode-only gating.
+    const bool sparse_on = sample && sparse_avail && seqlen >= s.sparse_min_ctx;
     if (s.graph_ready && s.graph_sparse != sparse_on) {
         cu(cudaGraphExecDestroy(s.cu_exec), "sparse recapture destroy exec");
         cu(cudaGraphDestroy(s.cu_graph), "sparse recapture destroy graph");
@@ -803,32 +824,26 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             if (sparse_on) {
                 kernels::launch_fa_kv_window_select(s.d_seqlen, s.sparse_sel, c.n_kv_heads,
                     s.kv->block_size(), s.sparse_budget, s.sparse_window, st);
-                // Use the SAME n_splits the scalar sparse kernel and the dense MMA kernel already
-                // run with (s.n_splits, adaptively tuned per context length -- e.g. 160 at 32k for
-                // this exact hd256 GQA-4 shape, see the occupancy note above). This decode is bs=1
-                // and latency-bound, not FLOP-bound: capping splits to the "natural" 8-block-group
-                // count (~33 at window=256) collapses the grid from ~160*n_kv_heads blocks to
-                // ~33*n_kv_heads and starves the GPU's SMs of parallelism, which erases the
-                // tensor-core compute win (measured net +0.3% -- within noise -- when capped).
-                // Uncapped, most splits see fewer than 8 selected blocks (often 1-2), so most
-                // warps in the QK step of any given split go idle -- but there are ~5x more splits
-                // running concurrently to hide that, matching the occupancy the scalar kernel and
-                // the dense MMA kernel both already rely on at this shape.
+                // Use s.n_splits (adaptively tuned, e.g. 160 at 32k for hd256). Do NOT cap to
+                // ceil(budget/8): bs=1 decode is latency-bound; starving the grid of parallel
+                // blocks erased the MMA win on Qwythos (#580 v1 → +0.3%). Cap only to the
+                // selected-block budget so empty partials stay rare for the combine kernel.
+                const int sparse_splits = (s.n_splits < s.sparse_budget) ? s.n_splits : s.sparse_budget;
                 bool mma_done = false;
                 if (s.sparse_mma) {
                     mma_done = kernels::launch_flash_decode_split_sparse_mma(s.q, kpool, vpool,
                         btable, s.d_seqlen, s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc,
                         c.n_q_heads, c.n_kv_heads, c.head_dim, s.kv->block_size(),
-                        s.kv->max_blocks_per_seq(), s.n_splits, s.sparse_budget,
+                        s.kv->max_blocks_per_seq(), sparse_splits, s.sparse_budget,
                         1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
                 }
                 if (!mma_done)
                     kernels::launch_flash_decode_split_sparse(s.q, kpool, vpool, btable, s.d_seqlen,
                         s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                        s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits, s.sparse_budget,
+                        s.kv->block_size(), s.kv->max_blocks_per_seq(), sparse_splits, s.sparse_budget,
                         1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
                 kernels::launch_fa_combine_hd256(s.fa_m, s.fa_l, s.fa_acc, s.attn, c.n_q_heads,
-                    s.n_splits, (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, st,
+                    sparse_splits, (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, st,
                     attn_gate_q8 ? s.qgate : nullptr);
             } else {
             kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,

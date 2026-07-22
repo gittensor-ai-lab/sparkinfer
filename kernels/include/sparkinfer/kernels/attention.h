@@ -153,7 +153,7 @@ void launch_fa_combine_hd256(const float* part_m, const float* part_l, const flo
     void* out, int num_q_heads, int n_splits, void* out_q8, cudaStream_t stream = nullptr,
     const void* attn_gate = nullptr);
 
-// Sink + sliding-window sparse-KV (Qwythos GQA-4 hd256). Default on; SPARKINFER_SPARSE_KV=0 disables.
+// Sink + sliding-window sparse-KV (hd256 GQA-4/GQA-8). Default on; SPARKINFER_SPARSE_KV=0 disables.
 void launch_fa_kv_window_select(const int* seq_lens, int* sel_blk, int num_kv_heads,
     int block_size, int n_sel, int window_w, cudaStream_t stream = nullptr);
 void launch_flash_decode_split_sparse(const void* q, const void* k_pool_layer, const void* v_pool_layer,
@@ -162,8 +162,8 @@ void launch_flash_decode_split_sparse(const void* q, const void* k_pool_layer, c
     int n_splits, int n_sel, float scale, const void* k_scale_layer, const void* v_scale_layer,
     cudaStream_t stream = nullptr);
 // Tensor-core (wmma int8) twin of launch_flash_decode_split_sparse — same sink+window block
-// list and partials layout, but QK/PV run on int8 tensor cores. hd256 GQA-4, block_size 16
-// only; returns false otherwise so the caller falls back to the scalar sparse kernel above.
+// list and partials layout, but QK/PV run on int8 tensor cores. hd256 GQA-8 (Qwen3.6) primary;
+// GQA-4 accepted. Returns false otherwise so the caller falls back to the scalar sparse kernel.
 bool launch_flash_decode_split_sparse_mma(const void* q, const void* k_pool_layer,
     const void* v_pool_layer, const int* block_table, const int* seq_lens, const int* sel_blk,
     float* part_m, float* part_l, float* part_acc, int num_q_heads, int num_kv_heads, int head_dim,

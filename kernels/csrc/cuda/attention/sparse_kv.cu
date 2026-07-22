@@ -1,11 +1,13 @@
-// Sink + sliding-window sparse-KV for Qwythos GQA-4 hd256 full-attention decode.
-// [Paral1995] 2026-07-13. SPARKINFER_SPARSE_KV=0 disables; default ON for Qwythos GQA-4 hd256 int8-KV.
+// Sink + sliding-window sparse-KV for hd256 GQA-4 (Qwythos) and GQA-8 (Qwen3.6) decode.
+// [Paral1995] 2026-07-13 GQA-4; extended GQA-8 + int8 wmma sparse.
+// SPARKINFER_SPARSE_KV=0 disables; default ON for matching shapes with int8 KV.
 //
 // Per full-attn layer after int8 KV append:
 //   (1) fa_kv_window_select      — sink block 0 + last W logical blocks (StreamingLLM-style)
 //   (2) fa_split_gqa_sparse      — scalar flash-split over the selected blocks only
 //   (2') fa_split_gqa_mma_i8_sparse — int8 tensor-core twin of (2); same block list and
-//        partials, run on wmma instead of scalar FMA (SPARKINFER_SPARSE_MMA=0 to disable)
+//        partials, run on wmma instead of scalar FMA (GQA-8 default; SPARKINFER_SPARSE_MMA=0
+//        falls back to scalar)
 // Positions/seqlen read from DEVICE pointers for CUDA-graph replay safety.
 
 #include <cuda_bf16.h>
@@ -45,7 +47,7 @@ __global__ void fa_kv_window_select(
 
 // (2) Sparse flash split. Walks n_sel selected blocks instead of a contiguous chunk.
 template <int HEAD_DIM, int GQA>
-__global__ void fa_split_gqa_sparse(
+__global__ void __launch_bounds__(GQA * 32, 2) fa_split_gqa_sparse(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const int* __restrict__ block_table,
     const int* __restrict__ seq_lens, const int* __restrict__ sel_blk,
@@ -77,13 +79,23 @@ __global__ void fa_split_gqa_sparse(
     __shared__ __nv_bfloat16 s_k[16 * HEAD_DIM], s_v[16 * HEAD_DIM];
     __shared__ size_t s_rowbase[16];
     __shared__ float s_ksc[16], s_vsc[16];
+    __shared__ int s_valid;
 
     for (int i = bstart; i < bend; i++) {
-        const int lblk = sel[i];
-        if (lblk < 0) continue;
-        const int phys  = block_table[lblk];
-        const int valid = min(block_size, sl - lblk * block_size);
-        if (valid <= 0) continue;
+        // Block-uniform early-outs: every thread in the CTA must agree on whether to
+        // skip, otherwise __syncthreads below would hang. Clamp OOB logical blocks.
+        int lblk = sel[i];
+        if (lblk < 0 || lblk >= max_blocks) lblk = -1;
+        const int phys = (lblk >= 0) ? block_table[lblk] : -1;
+        int valid = 0;
+        if (lblk >= 0 && phys >= 0)
+            valid = min(block_size, sl - lblk * block_size);
+        if (valid < 0) valid = 0;
+        if (lane == 0 && warp == 0) s_valid = valid;
+        __syncthreads();
+        valid = s_valid;
+        if (valid <= 0) continue;   // uniform across the CTA (all read the same s_valid)
+
         if ((int)threadIdx.x < valid) {
             const size_t tokrow = (size_t)(phys * block_size + threadIdx.x) * num_kv_heads + kvh;
             s_rowbase[threadIdx.x] = tokrow * HEAD_DIM;
@@ -143,49 +155,58 @@ void launch_flash_decode_split_sparse(
     int n_splits, int n_sel, float scale,
     const void* k_scale_layer, const void* v_scale_layer, cudaStream_t stream
 ) {
-    if (head_dim != 256 || num_q_heads != num_kv_heads * 4) return;
+    if (head_dim != 256) return;
     dim3 grid(num_kv_heads * n_splits, 1);
-    fa_split_gqa_sparse<256, 4><<<grid, 4 * 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q),
-        reinterpret_cast<const signed char*>(k_pool_layer),
-        reinterpret_cast<const signed char*>(v_pool_layer),
-        block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
-        num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, n_sel,
-        reinterpret_cast<const __half*>(k_scale_layer),
-        reinterpret_cast<const __half*>(v_scale_layer));
+    if (num_q_heads == num_kv_heads * 4) {
+        fa_split_gqa_sparse<256, 4><<<grid, 4 * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q),
+            reinterpret_cast<const signed char*>(k_pool_layer),
+            reinterpret_cast<const signed char*>(v_pool_layer),
+            block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
+            num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, n_sel,
+            reinterpret_cast<const __half*>(k_scale_layer),
+            reinterpret_cast<const __half*>(v_scale_layer));
+    } else if (num_q_heads == num_kv_heads * 8) {
+        fa_split_gqa_sparse<256, 8><<<grid, 8 * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q),
+            reinterpret_cast<const signed char*>(k_pool_layer),
+            reinterpret_cast<const signed char*>(v_pool_layer),
+            block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
+            num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, n_sel,
+            reinterpret_cast<const __half*>(k_scale_layer),
+            reinterpret_cast<const __half*>(v_scale_layer));
+    }
 }
 
 #include <mma.h>
 
 // Tensor-core (wmma int8) sparse flash split — the MMA twin of fa_split_gqa_sparse above.
 //
-// fa_split_gqa_sparse (the scalar kernel just above) has been the live Qwythos long-decode
-// path since #379: sink block 0 + a 256-block recent window, engaged from min_ctx=8192, doing
-// QK^T/PV as per-lane FMA + a 5-shuffle warp reduction. The DENSE hd256 GQA-4 flash-decode
-// (fa_split_gqa_mma_i8_kernel, flash_decode_split.cu) has run the same math on int8 tensor
-// cores for a while now; the sparse walk never got the same treatment. This kernel closes that
-// gap for Qwythos exactly the way the dense path already proved out: identical sink+window
-// block list and identical combine-compatible partials, but S=Q·Kᵀ and O=P·V run as int8 wmma
-// tiles. Net effect: the same O(window) KV read the scalar kernel already had, minus the
-// per-key scalar-FMA compute bottleneck.
+// Motivation (RTX 5090 A/B on PR #560 / cd94c07): the SCALAR sparse walk beats dense
+// flash-decode only once the dense pass reads ≳8x the window (32k+ for Qwen3.6). Between
+// 8k and 32k the DENSE path is already on int8 tensor cores, so scanning 16k tokens with
+// wmma beats scanning a 4k window with scalar FMAs — sparse@16k measured 419 tok/s vs
+// dense 438. This kernel closes that gap: identical sink+window block list, but S=Q·Kᵀ
+// and O=P·V run as int8 wmma tiles exactly like the dense MMA kernel, so the sparse path
+// keeps the tensor-core throughput AND the O(window) KV read. Bot-verified on cd94c07:
+// Qwen3.6 @32k 445.4 vs main 410.1 (+8.6%), accuracy pass (top1 92%, KL 0.056).
 //
-// Engagement is UNCHANGED from #379 (same min_ctx, same window) — this only swaps the compute
-// kernel for an already-passing gate, so it carries none of the "when does sparse turn on"
-// risk that a min_ctx/window retune would.
+// Qwythos GQA-4 does NOT default onto this path: same-window scalar→MMA only changes
+// compute inside a fixed window and full-attn is ~1/4 of hybrid layers — measured +0.3%
+// (within noise) on PR #580. The win here is the KV-read cut vs dense full-cache MMA.
 //
-// Structure mirrors fa_split_gqa_mma_i8_kernel (same quantization, same online softmax, same
-// partials layout — byte-compatible with launch_fa_combine_hd256). Differences:
+// Structure mirrors fa_split_gqa_mma_i8_kernel (same quantization, same online softmax,
+// same partials layout — byte-compatible with launch_fa_combine_hd256). Differences:
 //   • the KV walk is indirect: groups of up to 8 blocks come from sel_blk[] instead of a
 //     contiguous logical range, so per-group physical ids are staged once into shared memory;
 //   • per-token validity is a staged mask (a selected block may be the partially-filled tail
 //     block), replacing the dense kernel's contiguous [start, end) window test;
 //   • single sequence (decode), so the M dim is the GQA q-heads of one kv head, M padded to 16.
 //
-// hd256 GQA-4 needs 8 warps (one per KV block of the group) even though only 4 q-rows are
-// live — same as the dense kernel's fa_mma_block_threads<256,4> specialization; a naive
-// GQA*32 launch would leave KV blocks 4..7 of every group uncomputed (silently wrong, not a
-// crash), so the sparse launcher below mirrors that trait rather than hardcoding GQA*32.
-// One CTA per (kv_head, split). sm_80+ (wmma int8).
+// One CTA per (kv_head, split); GQA*32 threads (8 warps at GQA-8 → one warp per KV block of
+// the group in QK, one 16-wide dim slab per warp in PV). hd256 GQA-4 needs the same 8-warp
+// launch as the dense kernel's fa_mma_block_threads<256,4> (kept as a specialization for
+// optional use). sm_80+ (wmma int8).
 template <int HEAD_DIM, int GQA> struct fa_mma_sparse_threads { static constexpr int v = GQA * 32; };
 template <> struct fa_mma_sparse_threads<256, 4> { static constexpr int v = 256; };
 
@@ -380,14 +401,17 @@ __global__ void __launch_bounds__(fa_mma_sparse_threads<HEAD_DIM, GQA>::v, 5) fa
 }
 
 #ifndef _MSC_VER
+template __global__ void fa_split_gqa_mma_i8_sparse<256, 8>(const __nv_bfloat16*, const signed char*,
+    const signed char*, const int*, const int*, const int*, float*, float*, float*, float, int, int,
+    int, int, int, const __half*, const __half*);
 template __global__ void fa_split_gqa_mma_i8_sparse<256, 4>(const __nv_bfloat16*, const signed char*,
     const signed char*, const int*, const int*, const int*, float*, float*, float*, float, int, int,
     int, int, int, const __half*, const __half*);
 #endif
 
-// MMA sparse launcher. hd256 GQA-4 (Qwythos) + block_size 16 only — the wmma tiling assumes
-// 16-token KV blocks. Returns false when the shape isn't supported so the caller falls back
-// to the scalar sparse kernel (fa_split_gqa_sparse) above.
+// MMA sparse launcher. hd256 GQA-8 (Qwen3.6) primary; GQA-4 accepted for optional A/B.
+// block_size 16 required (wmma tile == KV page). Returns false otherwise so the caller
+// falls back to the scalar sparse kernel above.
 bool launch_flash_decode_split_sparse_mma(
     const void* q, const void* k_pool_layer, const void* v_pool_layer,
     const int* block_table, const int* seq_lens, const int* sel_blk,
@@ -396,25 +420,39 @@ bool launch_flash_decode_split_sparse_mma(
     int n_splits, int n_sel, float scale,
     const void* k_scale_layer, const void* v_scale_layer, cudaStream_t stream
 ) {
-    if (head_dim != 256 || block_size != 16 || num_q_heads != num_kv_heads * 4) return false;
-    constexpr int HD = 256, GQA = 4;
-    constexpr int THREADS = fa_mma_sparse_threads<HD, GQA>::v;
-    const size_t smem = (size_t)2 * 16 * HD                       // s_qi + s_pi (int8)
-                      + (size_t)16 * 128 * sizeof(float)          // s_s score tile
-                      + (size_t)GQA * HD * sizeof(float)          // s_o
-                      + (16 + 16 + 128 + 128 + 16 + 16) * sizeof(float)
-                      + 2 * 8 * sizeof(int)                       // s_pb + s_lb
-                      + 128;                                      // s_ok
+    if (head_dim != 256 || block_size != 16 || num_kv_heads <= 0) return false;
+    constexpr int HD = 256;
     dim3 grid(num_kv_heads * n_splits, 1);
-    fa_split_gqa_mma_i8_sparse<HD, GQA><<<grid, THREADS, smem, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q),
-        reinterpret_cast<const signed char*>(k_pool_layer),
-        reinterpret_cast<const signed char*>(v_pool_layer),
-        block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
-        num_q_heads, num_kv_heads, max_blocks, n_splits, n_sel,
-        reinterpret_cast<const __half*>(k_scale_layer),
-        reinterpret_cast<const __half*>(v_scale_layer));
-    return true;
+    auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
+    auto kb = reinterpret_cast<const signed char*>(k_pool_layer);
+    auto vb = reinterpret_cast<const signed char*>(v_pool_layer);
+    auto ks = reinterpret_cast<const __half*>(k_scale_layer);
+    auto vs = reinterpret_cast<const __half*>(v_scale_layer);
+    if (num_q_heads == num_kv_heads * 8) {
+        constexpr int GQA = 8, THREADS = fa_mma_sparse_threads<HD, GQA>::v;
+        const size_t smem = (size_t)2 * 16 * HD
+                          + (size_t)16 * 128 * sizeof(float)
+                          + (size_t)GQA * HD * sizeof(float)
+                          + (16 + 16 + 128 + 128 + 16 + 16) * sizeof(float)
+                          + 2 * 8 * sizeof(int) + 128;
+        fa_split_gqa_mma_i8_sparse<HD, GQA><<<grid, THREADS, smem, stream>>>(
+            qb, kb, vb, block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
+            num_q_heads, num_kv_heads, max_blocks, n_splits, n_sel, ks, vs);
+        return true;
+    }
+    if (num_q_heads == num_kv_heads * 4) {
+        constexpr int GQA = 4, THREADS = fa_mma_sparse_threads<HD, GQA>::v;
+        const size_t smem = (size_t)2 * 16 * HD
+                          + (size_t)16 * 128 * sizeof(float)
+                          + (size_t)GQA * HD * sizeof(float)
+                          + (16 + 16 + 128 + 128 + 16 + 16) * sizeof(float)
+                          + 2 * 8 * sizeof(int) + 128;
+        fa_split_gqa_mma_i8_sparse<HD, GQA><<<grid, THREADS, smem, stream>>>(
+            qb, kb, vb, block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
+            num_q_heads, num_kv_heads, max_blocks, n_splits, n_sel, ks, vs);
+        return true;
+    }
+    return false;
 }
 #endif
 
