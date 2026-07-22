@@ -176,16 +176,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // SPARKINFER_PREFILL_FP8_GDN=0 restores the bf16 GDN projections (A/B).
     const char* _pfp8 = getenv("SPARKINFER_PREFILL_FP8_GDN");
     bool use_fp8_gdn = long_bf16 && (!_pfp8 || _pfp8[0] != '0');
-    // MoE (Qwen3.6): run the attn/GDN projections on the fp8 (e4m3) tensor cores instead of the
-    // bf16 wmma GEMM. int8 projections stay off for MoE (the top-k router amplifies the per-row
-    // int8 quant error into expert flips -- the documented reason use_i8 defaults off above), but
-    // e4m3's floating range holds the projections close to bf16 fidelity at the int8 MAC rate,
-    // the same trade the dense >96k GDN path already ships (prefill_gemm_fp8.cu). Measured
-    // batched-vs-token (prefill_check, this model, 512..32k prefixes): top1 stays inside the
-    // bf16 batched baseline's own run spread and KL tracks it within ~0.002 (short ctx) to
-    // ~0.08 (32k) absolute. SPARKINFER_PREFILL_MOE_FP8=0 restores the bf16 projections (A/B).
+    // MoE (Qwen3.6): optional fp8 (e4m3) attn/GDN projections. Default OFF — opt-in via
+    // SPARKINFER_PREFILL_MOE_FP8=1. Kept off until prefill_check fidelity is clean on main
+    // (see #586); the GPU MoE tilemap bug (#583) already corrupts batched prefill, and FP8
+    // adds further TOP1 loss on top. Dense long-ctx GDN fp8 (PREFILL_FP8_GDN) is unaffected.
     const char* _pmfp8 = getenv("SPARKINFER_PREFILL_MOE_FP8");
-    bool moe_fp8 = moe && (!_pmfp8 || _pmfp8[0] != '0');
+    bool moe_fp8 = moe && _pmfp8 && _pmfp8[0] == '1';
     Arena a8;
     // A_i8 holds the quantized activation. Dense full-i8: non-FFN projs quantize N rows x K(<=H);
     // chunked FFN quantizes at most FC rows x ffn. Long-ctx selective: N*H if attn-i8/fp8-gdn else FC*ffn.
@@ -272,11 +268,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (e) return e[0] != '0';
         return N <= 512;
     }();
-    // Device tilemap + mask dequant: skip per-layer D2H counts sync. Default ON at short-N.
+    // Device tilemap + mask dequant: skip per-layer D2H counts sync. Default OFF — opt-in via
+    // SPARKINFER_PREFILL_MOE_GPU=1. The #583 default-ON path fails prefill_check (batched vs
+    // token-loop TOP1 ~0.44–0.56 @512 vs ~0.88–0.94 with host tilemap; #586). Stale global
+    // tilemap slots past the live group count can run GEMMs for wrong experts. Re-enable only
+    // after tilemap invalidate + e<0 GEMM guards land and prefill_check passes.
     const bool moe_gpu = [&]{
         if (!moe_serial) return false;
         const char* e = getenv("SPARKINFER_PREFILL_MOE_GPU");
-        return !e || e[0] != '0';
+        return e && e[0] == '1';
     }();
     const int moe_group = [&]{
         const char* e = getenv("SPARKINFER_PREFILL_MOE_GROUP");
