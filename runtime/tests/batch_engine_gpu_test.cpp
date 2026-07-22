@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 static void* rand_bf16(size_t n, float s) {
@@ -135,13 +136,40 @@ int main() {
             return 1;
         }
 
+    // Concurrent admission: two threads complete() at once (iteration-level CB).
+    sparkinfer::ContinuousBatchEngine::Result rc, rd;
+    std::thread t1([&] {
+        sparkinfer::ContinuousBatchEngine::Request c;
+        c.prompt = {3, 7, 11};
+        c.max_new_tokens = 5;
+        rc = batch.complete(c);
+    });
+    std::thread t2([&] {
+        sparkinfer::ContinuousBatchEngine::Request d;
+        d.prompt = {4, 8, 12, 16, 20};
+        d.max_new_tokens = 5;
+        d.priority = 2;
+        rd = batch.complete(d);
+    });
+    t1.join();
+    t2.join();
+    if (!rc.error.empty() || !rd.error.empty()) {
+        printf("[FAIL] concurrent: %s | %s\n", rc.error.c_str(), rd.error.c_str());
+        return 1;
+    }
+    if ((int)rc.tokens.size() != 5 || (int)rd.tokens.size() != 5) {
+        printf("[FAIL] concurrent sizes: %zu %zu\n", rc.tokens.size(), rd.tokens.size());
+        return 1;
+    }
+
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("[FAIL] cuda error: %s\n", cudaGetErrorString(err));
         return 1;
     }
 
-    printf("[PASS] batch_engine_gpu_test: A=%zu tokens B=%zu tokens free_kv_blocks=%d\n",
-           ra.tokens.size(), rb.tokens.size(), kv.num_free_blocks());
+    printf("[PASS] batch_engine_gpu_test: A=%zu B=%zu concurrent C/D=%zu/%zu free_kv=%d\n",
+           ra.tokens.size(), rb.tokens.size(), rc.tokens.size(), rd.tokens.size(),
+           kv.num_free_blocks());
     return 0;
 }

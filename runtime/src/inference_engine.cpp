@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 
 namespace sparkinfer {
 
@@ -28,6 +29,19 @@ bool batched_prefill_enabled(const Qwen35Config& cfg, bool gguf, int n_tokens) {
            n_tokens <= batched_maxctx;
 }
 
+// Chunked-prefill budget (vLLM-style): when decode requests are waiting, only
+// advance this many prefill tokens before yielding. 0 = unlimited (full prompt).
+int prefill_chunk_tokens() {
+    static int chunk = []{
+        const char* e = getenv("SPARKINFER_PREFILL_CHUNK_TOKENS");
+        // Default 512 — large enough for batched GEMM amortization, small enough
+        // that concurrent decode keeps receiving tokens every few ms.
+        int c = e ? atoi(e) : 512;
+        return c >= 0 ? c : 512;
+    }();
+    return chunk;
+}
+
 }  // namespace
 
 struct ContinuousBatchEngine::Job {
@@ -47,7 +61,7 @@ struct ContinuousBatchEngine::Job {
 
 ContinuousBatchEngine::ContinuousBatchEngine(Qwen35Model* model, KVCacheManager* kv,
                                              int max_tokens_per_batch, SchedulePolicy policy)
-    : model_(model), kv_(kv), scheduler_(policy, max_tokens_per_batch) {
+    : model_(model), kv_(kv), scheduler_(policy, max_tokens_per_batch), policy_(policy) {
     running_ = true;
     worker_ = std::thread([this] { worker_loop(); });
 }
@@ -137,7 +151,7 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
 
 void ContinuousBatchEngine::worker_loop() {
     while (true) {
-        Job* job = nullptr;
+        std::vector<uint64_t> prefill_ids, decode_ids;
         {
             std::unique_lock<std::mutex> lock(mu_);
             if (!running_ && jobs_.empty()) return;
@@ -154,20 +168,17 @@ void ContinuousBatchEngine::worker_loop() {
                 s.tokens_in_phase = (kv.second->phase == SeqPhase::PREFILL)
                                         ? kv.second->prefill_pos
                                         : kv.second->decode_emitted;
+                s.prefill_remaining = (kv.second->phase == SeqPhase::PREFILL)
+                                          ? (int)kv.second->req.prompt.size() - kv.second->prefill_pos
+                                          : 0;
                 active.push_back(s);
             }
 
             ScheduleBatch batch = scheduler_.schedule(active);
-            uint64_t pick = 0;
-            if (!batch.prefill_request_ids.empty()) pick = batch.prefill_request_ids.front();
-            else if (!batch.decode_request_ids.empty()) pick = batch.decode_request_ids.front();
+            prefill_ids = batch.prefill_request_ids;
+            decode_ids = batch.decode_request_ids;
 
-            if (pick) {
-                auto it = jobs_.find(pick);
-                if (it != jobs_.end() && !it->second->done) job = it->second.get();
-            }
-
-            if (!job) {
+            if (prefill_ids.empty() && decode_ids.empty()) {
                 if (!running_) {
                     bool any = false;
                     for (const auto& kv : jobs_)
@@ -179,23 +190,49 @@ void ContinuousBatchEngine::worker_loop() {
             }
         }
 
-        if (job) {
-            const bool finished = step_job(*job);
-            if (finished) cv_.notify_all();
+        // vLLM V1 iteration: advance every packed decode token first (ITPS), then
+        // one prefill chunk if scheduled. Re-enter the scheduler after the step.
+        bool any_finished = false;
+        const bool mix_decode = !decode_ids.empty();
+        for (uint64_t id : decode_ids) {
+            Job* job = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                auto it = jobs_.find(id);
+                if (it != jobs_.end() && !it->second->done) job = it->second.get();
+            }
+            if (job) any_finished = step_job(*job, /*chunked=*/false) || any_finished;
         }
+        if (!prefill_ids.empty()) {
+            Job* job = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                auto it = jobs_.find(prefill_ids.front());
+                if (it != jobs_.end() && !it->second->done) job = it->second.get();
+            }
+            if (job) any_finished = step_job(*job, /*chunked=*/mix_decode ||
+                                             policy_ == SchedulePolicy::CHUNKED_PREFILL) || any_finished;
+        }
+        if (any_finished) cv_.notify_all();
     }
 }
 
-bool ContinuousBatchEngine::step_job(Job& job) {
+bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     const Qwen35Config& cfg = model_->config();
     model_->activate_session(job.seq_id);
 
     if (job.phase == SeqPhase::PREFILL) {
         const int n = (int)job.req.prompt.size();
+        const int chunk = prefill_chunk_tokens();
+        const int remain = n - job.prefill_pos;
+        // Batched GEMM prefill (Qwythos / Qwen3.6 hybrid) is ~100× faster than the
+        // token loop. Never demote it to token-loop "chunks" — that destroys ITPS under
+        // mixed load. True mid-prompt chunked batched prefill needs start_pos support
+        // in prefill_batched_run; until then, decode-first scheduling already advances
+        // waiting decodes once before this full batched pass runs.
         if (job.prefill_pos == job.req.prefill_start && job.req.prefill_start == 0 &&
-            batched_prefill_enabled(cfg, true, n - job.prefill_pos)) {
-            const int chunk = n - job.prefill_pos;
-            const int seed = model_->prefill_batched(job.req.prompt.data() + job.prefill_pos, chunk);
+            batched_prefill_enabled(cfg, true, remain)) {
+            const int seed = model_->prefill_batched(job.req.prompt.data() + job.prefill_pos, remain);
             if (seed >= 0 && seed < cfg.vocab) {
                 job.next_token = seed;
                 job.prefill_pos = n;
@@ -204,7 +241,12 @@ bool ContinuousBatchEngine::step_job(Job& job) {
                 return false;
             }
         }
-        if (job.prefill_pos < n) {
+        // Token-loop (or chunked) prefill: used when batched is unavailable (non-hybrid /
+        // disabled). Advance up to `limit` tokens then yield so decode can run.
+        int limit = remain;
+        if (chunked && chunk > 0 && remain > chunk) limit = chunk;
+        int advanced = 0;
+        while (advanced < limit && job.prefill_pos < n) {
             const bool sample = prefill_samples_lmhead() || job.prefill_pos + 1 == n;
             if (sample)
                 job.next_token = model_->forward_token(job.req.prompt[(size_t)job.prefill_pos],
@@ -212,16 +254,13 @@ bool ContinuousBatchEngine::step_job(Job& job) {
             else
                 model_->forward_token(job.req.prompt[(size_t)job.prefill_pos], job.prefill_pos, false);
             job.prefill_pos++;
-            if (job.prefill_pos >= n) {
-                if (job.next_token < 0 && job.req.use_prefix_session)
-                    job.next_token = model_->prefix_seed_token();
-                job.phase = SeqPhase::DECODE;
-            }
-            return false;
+            advanced++;
         }
-        if (job.next_token < 0 && job.req.use_prefix_session)
-            job.next_token = model_->prefix_seed_token();
-        job.phase = SeqPhase::DECODE;
+        if (job.prefill_pos >= n) {
+            if (job.next_token < 0 && job.req.use_prefix_session)
+                job.next_token = model_->prefix_seed_token();
+            job.phase = SeqPhase::DECODE;
+        }
         return false;
     }
 

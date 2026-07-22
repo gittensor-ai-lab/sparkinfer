@@ -84,7 +84,13 @@ curl ... -H 'Authorization: Bearer secret'
 Each `/v1/chat/completions` call is submitted to `ContinuousBatchEngine`, which:
 
 - Allocates a **per-request `seq_id`** with **right-sized KV** (`prompt + max_tokens + headroom`, not `max_seq`)
-- Runs prefill then interleaves decode steps across concurrent requests via the runtime `Scheduler`
+- Runs **vLLM V1-style iteration-level scheduling**: each step packs pending decode
+  requests first (up to `SPARKINFER_BATCH_TOKENS`), then admits at most one prefill into
+  the remaining budget. Prefills larger than `SPARKINFER_PREFILL_MIX_MAX` wait until
+  decode drains (hybrid batched prefill is atomic — mixing an 8k pass mid-decode would
+  spike ITL by hundreds of ms)
+- Under `chunked` (or when decode is waiting under `continuous`), non-batched models
+  advance prefills in chunks of `SPARKINFER_PREFILL_CHUNK_TOKENS` before yielding
 - Frees KV blocks when the request finishes (no cross-request KV leakage)
 - Uses per-request hybrid Gated-DeltaNet recurrent buffers when the model is hybrid
 
@@ -93,8 +99,10 @@ Shared prefix cache still works: when the chat prompt starts with configured pre
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `SPARKINFER_BATCH_TOKENS` | `64` | Scheduler decode token budget per step |
-| `SPARKINFER_SCHED_POLICY` | `continuous` | `continuous`, `chunked` (CHUNKED_PREFILL), or `priority` |
+| `SPARKINFER_BATCH_TOKENS` | `64` | Scheduler token budget per step (decode packing) |
+| `SPARKINFER_SCHED_POLICY` | `continuous` | `continuous` (pack+mix), `chunked` (CHUNKED_PREFILL), or `priority` (exclusive prefill) |
+| `SPARKINFER_PREFILL_CHUNK_TOKENS` | `512` | Token-loop prefill yield size when batched prefill is unavailable (`0` = unlimited). Hybrid models always use full batched GEMM prefill. |
+| `SPARKINFER_PREFILL_MIX_MAX` | `2048` | Max prompt tokens allowed to mix with decode in one step (`0` = always mix). Larger atomic prefills wait until decode drains to avoid ITL spikes. |
 
 Prior requests cannot leak decode context into later ones (KV is freed after each completion).
 

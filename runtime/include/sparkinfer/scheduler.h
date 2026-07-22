@@ -31,7 +31,8 @@ struct ScheduledSequence {
     uint64_t seq_id = 0;
     SeqPhase phase = SeqPhase::PREFILL;
     int priority = 0;
-    int tokens_in_phase = 0;  // prefill progress or decode tokens emitted
+    int tokens_in_phase = 0;     // prefill progress or decode tokens emitted
+    int prefill_remaining = 0;   // prompt tokens left (PREFILL only); 0 if unknown
 };
 
 struct ScheduleBatch {
@@ -46,8 +47,10 @@ public:
                        int max_tokens_per_batch = 256);
     ~Scheduler();
 
-    // Pick the next request(s) to advance one step. Prefill jobs run to completion
-    // before decode interleaving unless policy is CHUNKED_PREFILL.
+    // Pick the next request(s) to advance one step.
+    // CONTINUOUS_BATCHING / CHUNKED_PREFILL: vLLM V1 decode-first packing (up to
+    // max_tokens_per_batch), then at most one prefill in remaining budget.
+    // PRIORITY: exclusive prefill-first (no mix).
     ScheduleBatch schedule(const std::vector<ScheduledSequence>& active) const;
 
     // Legacy group API (kept for compatibility).

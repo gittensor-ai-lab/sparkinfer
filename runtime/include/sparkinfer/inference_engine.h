@@ -56,11 +56,12 @@ private:
     uint64_t submit_locked(Job job, const std::function<void(int)>& on_token);
     Result wait_locked(uint64_t request_id);
     void worker_loop();
-    bool step_job(Job& job);
+    bool step_job(Job& job, bool chunked = false);
 
     Qwen35Model* model_;
     KVCacheManager* kv_;
     Scheduler scheduler_;
+    SchedulePolicy policy_ = SchedulePolicy::CONTINUOUS_BATCHING;
     std::thread worker_;
     std::atomic<bool> running_{false};
     mutable std::mutex mu_;
