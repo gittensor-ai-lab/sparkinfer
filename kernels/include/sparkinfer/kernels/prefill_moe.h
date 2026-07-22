@@ -72,6 +72,17 @@ void launch_pfm_moe_gemm_i8_bm(const signed char* A_i8, const float* sx,
                                bool a_indirect, bool c_scatter, cudaStream_t stream);
 // Like _bm but W_i8/sw hold a contiguous expert group starting at e_base (tilemap still
 // stores global expert ids; W is indexed as e - e_base).
+// Like _bm_base but fuses gate+up GEMMs (BM=16, A_INDIRECT gate/up only) so activations
+// are staged once per K-tile. SPARKINFER_PREFILL_MOE_FUSE_GU=0 disables (A/B).
+void launch_pfm_moe_gemm_i8_gate_up_bm16(const signed char* A_i8, const float* sx,
+                                         const signed char* Wg_i8, const float* swg,
+                                         const signed char* Wu_i8, const float* swu,
+                                         const int* pair_tok,
+                                         const int* offsets, const int* tilemap, const int* d_ntiles,
+                                         void* Cg_bf16, void* Cu_bf16,
+                                         int N_out, int K, int max_tiles, int e_base,
+                                         cudaStream_t stream);
+
 void launch_pfm_moe_gemm_i8_bm_base(const signed char* A_i8, const float* sx,
                                     const signed char* W_i8, const float* sw,
                                     const int* pair_tok, const float* pair_w,

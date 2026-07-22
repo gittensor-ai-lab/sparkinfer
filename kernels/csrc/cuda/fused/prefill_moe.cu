@@ -317,6 +317,109 @@ __global__ void pfm_moe_gemm_i8_bm16_kernel(const signed char* __restrict__ A_i8
     }
 }
 
+// Fused gate+up grouped GEMM (BM=16, A_INDIRECT only): stages A once per K-tile and
+// runs two WMMA passes (gate + up) so activations are read once instead of twice.
+__global__ void pfm_moe_gemm_i8_gate_up_bm16_kernel(const signed char* __restrict__ A_i8,
+                                                    const float* __restrict__ sx,
+                                                    const signed char* __restrict__ Wg_i8,
+                                                    const float* __restrict__ swg,
+                                                    const signed char* __restrict__ Wu_i8,
+                                                    const float* __restrict__ swu,
+                                                    const int* __restrict__ pair_tok,
+                                                    const int* __restrict__ offsets,
+                                                    const int* __restrict__ tilemap,
+                                                    const int* __restrict__ d_ntiles,
+                                                    __nv_bfloat16* __restrict__ Cg,
+                                                    __nv_bfloat16* __restrict__ Cu,
+                                                    int N, int K, int e_base) {
+    using namespace nvcuda;
+    constexpr int BM = PM_BM_SHORT;
+    const int tile = blockIdx.y;
+    if (tile >= d_ntiles[0]) return;
+    const int e   = tilemap[2 * tile];
+    const int mt  = tilemap[2 * tile + 1];
+    const int p0  = offsets[e] + mt * BM;
+    const int cnt = offsets[e + 1] - offsets[e];
+    const int M   = min(BM, cnt - mt * BM);
+    const int n0  = blockIdx.x * PM_BN;
+
+    __shared__ signed char As[BM][PM_BK];
+    __shared__ signed char Bsg[PM_BN][PM_BK];
+    __shared__ signed char Bsu[PM_BN][PM_BK];
+    __shared__ int Cs[8][16][16];
+    __shared__ int s_tok[BM];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wn = warp;
+    const signed char* Wge = Wg_i8 + (size_t)(e - e_base) * N * K;
+    const signed char* Wue = Wu_i8 + (size_t)(e - e_base) * N * K;
+    const float*       swge = swg + (size_t)(e - e_base) * N;
+    const float*       swue = swu + (size_t)(e - e_base) * N;
+
+    for (int r = tid; r < BM; r += blockDim.x)
+        s_tok[r] = (r < M) ? pair_tok[p0 + r] : -1;
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> cf_g, cf_u;
+    wmma::fill_fragment(cf_g, 0);
+    wmma::fill_fragment(cf_u, 0);
+
+    const int nk = (K + PM_BK - 1) / PM_BK;
+    for (int t = 0; t < nk; t++) {
+        const int k0 = t * PM_BK;
+        for (int idx = tid; idx < BM * 2; idx += blockDim.x) {
+            const int r = idx >> 1, c16 = (idx & 1) * 16;
+            const int gk = k0 + c16;
+            const int arow = s_tok[r];
+            pm_cp16(&As[r][c16], &A_i8[(size_t)max(arow, 0) * K + gk], arow >= 0 && gk < K);
+        }
+        for (int idx = tid; idx < PM_BN * 2; idx += blockDim.x) {
+            const int r = idx >> 1, c16 = (idx & 1) * 16;
+            const int gk = k0 + c16;
+            const int gn = n0 + r;
+            pm_cp16(&Bsg[r][c16], &Wge[(size_t)gn * K + gk], gn < N && gk < K);
+            pm_cp16(&Bsu[r][c16], &Wue[(size_t)gn * K + gk], gn < N && gk < K);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < PM_BK; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, &As[0][kk], PM_BK);
+            wmma::load_matrix_sync(bf, &Bsg[wn * 16][kk], PM_BK);
+            wmma::mma_sync(cf_g, af, bf, cf_g);
+        }
+#pragma unroll
+        for (int kk = 0; kk < PM_BK; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, &As[0][kk], PM_BK);
+            wmma::load_matrix_sync(bf, &Bsu[wn * 16][kk], PM_BK);
+            wmma::mma_sync(cf_u, af, bf, cf_u);
+        }
+        __syncthreads();
+    }
+
+    auto store_tile = [&](const wmma::fragment<wmma::accumulator, 16, 16, 16, int>& cf,
+                          const float* swe, __nv_bfloat16* C) {
+        const int gn0 = n0 + wn * 16;
+        wmma::store_matrix_sync(&Cs[warp][0][0], cf, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int el = lane; el < 256; el += 32) {
+            const int r = el >> 4, cc = el & 15;
+            const int rm = r, rn = gn0 + cc;
+            if (rm < M && rn < N) {
+                const int p = p0 + rm;
+                const float v = (float)Cs[warp][r][cc] * sx[s_tok[rm]] * swe[rn];
+                C[(size_t)p * N + rn] = __float2bfloat16(v);
+            }
+        }
+    };
+    store_tile(cf_g, swge, Cg);
+    store_tile(cf_u, swue, Cu);
+}
+
 // Single-expert GEMM (W_i8 already the expert slice). blockIdx.y = local M-tile.
 template <bool A_INDIRECT, bool C_SCATTER, int BM>
 __global__ void pfm_moe_gemm_i8_one_kernel(const signed char* __restrict__ A_i8,
@@ -741,6 +844,21 @@ void launch_pfm_moe_gemm_i8_bm(const signed char* A_i8, const float* sx,
     launch_pfm_moe_gemm_i8_bm_base(A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles,
                                    C_bf16, out_f32, N_out, K, max_tiles, bm, /*e_base=*/0,
                                    a_indirect, c_scatter, stream);
+}
+
+void launch_pfm_moe_gemm_i8_gate_up_bm16(const signed char* A_i8, const float* sx,
+                                         const signed char* Wg_i8, const float* swg,
+                                         const signed char* Wu_i8, const float* swu,
+                                         const int* pair_tok,
+                                         const int* offsets, const int* tilemap, const int* d_ntiles,
+                                         void* Cg_bf16, void* Cu_bf16,
+                                         int N_out, int K, int max_tiles, int e_base,
+                                         cudaStream_t stream) {
+    dim3 grid((N_out + PM_BN - 1) / PM_BN, max_tiles);
+    pfm_moe_gemm_i8_gate_up_bm16_kernel<<<grid, 256, 0, stream>>>(
+        A_i8, sx, Wg_i8, swg, Wu_i8, swu, pair_tok, offsets, tilemap, d_ntiles,
+        reinterpret_cast<__nv_bfloat16*>(Cg_bf16), reinterpret_cast<__nv_bfloat16*>(Cu_bf16),
+        N_out, K, e_base);
 }
 
 void launch_pfm_moe_gemm_i8_bm_base(const signed char* A_i8, const float* sx,
