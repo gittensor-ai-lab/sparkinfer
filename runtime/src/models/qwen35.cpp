@@ -803,27 +803,32 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             if (sparse_on) {
                 kernels::launch_fa_kv_window_select(s.d_seqlen, s.sparse_sel, c.n_kv_heads,
                     s.kv->block_size(), s.sparse_budget, s.sparse_window, st);
-                // The MMA kernel walks the selected blocks in groups of 8, so give it fewer,
-                // fatter splits than the scalar kernel's per-key granularity wants; never more
-                // than s.n_splits (keeps the combine kernel's n_splits argument consistent).
-                const int mma_splits = std::min(s.n_splits, (s.sparse_budget + 7) / 8);
+                // Use the SAME n_splits the scalar sparse kernel and the dense MMA kernel already
+                // run with (s.n_splits, adaptively tuned per context length -- e.g. 160 at 32k for
+                // this exact hd256 GQA-4 shape, see the occupancy note above). This decode is bs=1
+                // and latency-bound, not FLOP-bound: capping splits to the "natural" 8-block-group
+                // count (~33 at window=256) collapses the grid from ~160*n_kv_heads blocks to
+                // ~33*n_kv_heads and starves the GPU's SMs of parallelism, which erases the
+                // tensor-core compute win (measured net +0.3% -- within noise -- when capped).
+                // Uncapped, most splits see fewer than 8 selected blocks (often 1-2), so most
+                // warps in the QK step of any given split go idle -- but there are ~5x more splits
+                // running concurrently to hide that, matching the occupancy the scalar kernel and
+                // the dense MMA kernel both already rely on at this shape.
                 bool mma_done = false;
-                int splits_used = s.n_splits;
                 if (s.sparse_mma) {
                     mma_done = kernels::launch_flash_decode_split_sparse_mma(s.q, kpool, vpool,
                         btable, s.d_seqlen, s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc,
                         c.n_q_heads, c.n_kv_heads, c.head_dim, s.kv->block_size(),
-                        s.kv->max_blocks_per_seq(), mma_splits, s.sparse_budget,
+                        s.kv->max_blocks_per_seq(), s.n_splits, s.sparse_budget,
                         1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
-                    if (mma_done) splits_used = mma_splits;
                 }
                 if (!mma_done)
                     kernels::launch_flash_decode_split_sparse(s.q, kpool, vpool, btable, s.d_seqlen,
                         s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                        s.kv->block_size(), s.kv->max_blocks_per_seq(), splits_used, s.sparse_budget,
+                        s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits, s.sparse_budget,
                         1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
                 kernels::launch_fa_combine_hd256(s.fa_m, s.fa_l, s.fa_acc, s.attn, c.n_q_heads,
-                    splits_used, (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, st,
+                    s.n_splits, (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, st,
                     attn_gate_q8 ? s.qgate : nullptr);
             } else {
             kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,
