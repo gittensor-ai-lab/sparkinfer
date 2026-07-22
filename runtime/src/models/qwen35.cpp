@@ -164,6 +164,7 @@ struct Qwen35Model::Impl {
     int    sparse_budget = 0;      // max sel slots = 1 + window
     int    sparse_window = 256;    // recent window in KV blocks (16 tokens/block)
     int    sparse_min_ctx = 8192;
+    bool   sparse_mma = true;      // wmma int8 sparse split; SPARKINFER_SPARSE_MMA=0 -> scalar kernel
     bool   graph_sparse = false;
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
     signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
@@ -283,6 +284,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // SPARKINFER_SPARSE_KV=0 restores dense full-context flash-decode.
     bool sparse_enable = true;
     if (const char* se = getenv("SPARKINFER_SPARSE_KV")) sparse_enable = (se[0] != '0');
+    if (const char* sm = getenv("SPARKINFER_SPARSE_MMA")) p_->sparse_mma = (sm[0] != '0');
     if (sparse_enable && cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4) {
         p_->sparse_window = 256;
         if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
@@ -294,8 +296,8 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         if (const char* mc = getenv("SPARKINFER_SPARSE_MIN_CTX")) { int v = atoi(mc); if (v > 0) p_->sparse_min_ctx = v; }
         p_->sparse_budget = 1 + p_->sparse_window;
         p_->sparse_sel = p_->alloc<int>((size_t)cfg.n_kv_heads * p_->sparse_budget);
-        fprintf(stderr, "[sparse-kv] sliding-window (default on): window=%d blocks (%d tokens) min_ctx=%d\n",
-                p_->sparse_window, p_->sparse_window * kv->block_size(), p_->sparse_min_ctx);
+        fprintf(stderr, "[sparse-kv] sliding-window (default on): window=%d blocks (%d tokens) min_ctx=%d mma=%d\n",
+                p_->sparse_window, p_->sparse_window * kv->block_size(), p_->sparse_min_ctx, p_->sparse_mma ? 1 : 0);
     }
     const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
     p_->aq8   = p_->alloc<signed char>(kmax);
@@ -801,12 +803,27 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             if (sparse_on) {
                 kernels::launch_fa_kv_window_select(s.d_seqlen, s.sparse_sel, c.n_kv_heads,
                     s.kv->block_size(), s.sparse_budget, s.sparse_window, st);
-                kernels::launch_flash_decode_split_sparse(s.q, kpool, vpool, btable, s.d_seqlen,
-                    s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                    s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits, s.sparse_budget,
-                    1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
+                // The MMA kernel walks the selected blocks in groups of 8, so give it fewer,
+                // fatter splits than the scalar kernel's per-key granularity wants; never more
+                // than s.n_splits (keeps the combine kernel's n_splits argument consistent).
+                const int mma_splits = std::min(s.n_splits, (s.sparse_budget + 7) / 8);
+                bool mma_done = false;
+                int splits_used = s.n_splits;
+                if (s.sparse_mma) {
+                    mma_done = kernels::launch_flash_decode_split_sparse_mma(s.q, kpool, vpool,
+                        btable, s.d_seqlen, s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc,
+                        c.n_q_heads, c.n_kv_heads, c.head_dim, s.kv->block_size(),
+                        s.kv->max_blocks_per_seq(), mma_splits, s.sparse_budget,
+                        1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
+                    if (mma_done) splits_used = mma_splits;
+                }
+                if (!mma_done)
+                    kernels::launch_flash_decode_split_sparse(s.q, kpool, vpool, btable, s.d_seqlen,
+                        s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                        s.kv->block_size(), s.kv->max_blocks_per_seq(), splits_used, s.sparse_budget,
+                        1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
                 kernels::launch_fa_combine_hd256(s.fa_m, s.fa_l, s.fa_acc, s.attn, c.n_q_heads,
-                    s.n_splits, (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, st,
+                    splits_used, (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, st,
                     attn_gate_q8 ? s.qgate : nullptr);
             } else {
             kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,
