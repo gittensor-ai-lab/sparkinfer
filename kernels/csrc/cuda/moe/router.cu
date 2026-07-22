@@ -267,6 +267,29 @@ __global__ void moe_router_fused_kernel(
 }
 #undef SI_CEXG
 
+// Batched warp-per-token top-k for the prefill router. One warp per token, 8 tokens per
+// block, each warp staging its 256 logits and running the SAME si_warp_bitonic_top8 the
+// fused decode router uses -- selection, output order and softmax weights are byte-
+// identical to moe_router_kernel2 (identical descending order + lower-index tie-break,
+// identical mx / ascending-denom op sequence; counts are order-free integer atomics).
+// Replaces kernel2's two serial 256-iteration rank scans per thread with ~40 warp steps.
+__global__ void moe_router_topk_warp_kernel(
+    const float* __restrict__ logits, int* __restrict__ expert_ids,
+    float* __restrict__ expert_weights, int* __restrict__ tokens_per_expert,
+    int num_tokens, int top_k, int normalize)
+{
+    __shared__ float s_lg[8][256];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tok = blockIdx.x * 8 + warp;
+    if (tok >= num_tokens) return;
+    const float* rowp = logits + (size_t)tok * 256;
+    for (int e = lane; e < 256; e += 32) s_lg[warp][e] = rowp[e];
+    __syncwarp();
+    si_warp_bitonic_top8(s_lg[warp], lane, top_k, normalize,
+                         expert_ids + (size_t)tok * top_k,
+                         expert_weights + (size_t)tok * top_k, tokens_per_expert);
+}
+
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 void launch_moe_router(
@@ -280,6 +303,17 @@ void launch_moe_router(
     // restores the k-pass single-warp kernel. Falls back automatically if num_experts > 1024.
     static int r2 = -1;
     if (r2 < 0) { const char* e = getenv("SPARKINFER_ROUTER2"); r2 = (e && e[0] == '0') ? 0 : 1; }
+    // Batched prefill path: warp-per-token bitonic top-8 (byte-identical output to
+    // kernel2 -- see moe_router_topk_warp_kernel). num_experts==256 is what the warp
+    // staging assumes; decode (num_tokens==1) keeps its existing kernels.
+    static int tw = -1;
+    if (tw < 0) { const char* e = getenv("SPARKINFER_PREFILL_TOPK_WARP"); tw = (e && e[0] == '0') ? 0 : 1; }
+    if (tw && num_tokens >= 64 && num_experts == 256 && top_k <= 8) {
+        moe_router_topk_warp_kernel<<<(num_tokens + 7) / 8, 256, 0, stream>>>(
+            logits, expert_ids, expert_weights, tokens_per_expert,
+            num_tokens, top_k, normalize);
+        return;
+    }
     if (r2 && top_k <= 16 && num_experts <= 1024) {
         const int bd = ((num_experts + 31) / 32) * 32;     // round up to a warp multiple
         moe_router_kernel2<<<num_tokens, bd, smem, stream>>>(

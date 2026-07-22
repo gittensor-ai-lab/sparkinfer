@@ -59,6 +59,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
 #include <mma.h>
 
 #include <cstdio>
@@ -205,12 +206,35 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     }
 
     // ---- W^ = T . (b_m exp(G_m) k_m) ----
-    for (int e = tid; e < C * HD; e += nthr) {
-        const int i = e / HD, d = e - i * HD;
-        float acc = 0.f;
-        for (int m = 0; m <= i; m++)
-            acc += s_A[i * (C + PAD) + m] * (s_b[m] * __expf(s_g[m]) * gc_to_f(s_k[m * (HD + PAD) + d]));
-        w_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] = __float2bfloat16(acc);
+    // m-outermost per-thread form. Each thread owns one column d and the rows
+    // i = tid/HD + 2s, so b_m exp(G_m) k[m][d] is formed ONCE per m instead of once per
+    // (i, m) -- the reference recomputed it (expf included, ~68K expf per block) for
+    // every element. s_A[i][m] and the hoisted gate product are warp-uniform broadcasts.
+    // Every acc_i still receives exactly the same products in the same ascending-m order,
+    // so the result is bit-identical to the reference loop.
+    for (int m = tid; m < C; m += nthr) s_t[m] = s_b[m] * __expf(s_g[m]);
+    __syncthreads();
+    {
+        constexpr int NTHR = 256;                 // launcher blockDim (static_asserted there)
+        constexpr int IPT = (C * HD) / NTHR;      // rows per thread
+        constexpr int ISTR = NTHR / HD;           // row stride between per-thread slots
+        const int d = tid % HD, i0 = tid / HD;
+        float acc[IPT];
+        #pragma unroll
+        for (int si = 0; si < IPT; si++) acc[si] = 0.f;
+        for (int m = 0; m < C; m++) {
+            const float bk = s_t[m] * gc_to_f(s_k[m * (HD + PAD) + d]);
+            #pragma unroll
+            for (int si = 0; si < IPT; si++) {
+                const int i = i0 + si * ISTR;
+                if (m <= i) acc[si] += s_A[i * (C + PAD) + m] * bk;
+            }
+        }
+        #pragma unroll
+        for (int si = 0; si < IPT; si++) {
+            const int i = i0 + si * ISTR;
+            w_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] = __float2bfloat16(acc[si]);
+        }
     }
     __syncthreads();
 
@@ -220,12 +244,29 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
         s_x[i * (HD + PAD) + d] = (i < len) ? v[(size_t)(t0 + i) * v_dim + h * HD + d] : __float2bfloat16(0.f);
     }
     __syncthreads();
-    for (int e = tid; e < C * HD; e += nthr) {
-        const int i = e / HD, d = e - i * HD;
-        float acc = 0.f;
-        for (int m = 0; m <= i; m++)
-            acc += s_A[i * (C + PAD) + m] * (s_b[m] * gc_to_f(s_x[m * (HD + PAD) + d]));
-        u_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] = __float2bfloat16(acc);
+    {
+        // Same m-outermost form as W^ above (b_m v[m][d] formed once per m; ascending-m
+        // order per row preserved -> bit-identical).
+        constexpr int NTHR = 256;
+        constexpr int IPT = (C * HD) / NTHR;
+        constexpr int ISTR = NTHR / HD;
+        const int d = tid % HD, i0 = tid / HD;
+        float acc[IPT];
+        #pragma unroll
+        for (int si = 0; si < IPT; si++) acc[si] = 0.f;
+        for (int m = 0; m < C; m++) {
+            const float bv = s_b[m] * gc_to_f(s_x[m * (HD + PAD) + d]);
+            #pragma unroll
+            for (int si = 0; si < IPT; si++) {
+                const int i = i0 + si * ISTR;
+                if (m <= i) acc[si] += s_A[i * (C + PAD) + m] * bv;
+            }
+        }
+        #pragma unroll
+        for (int si = 0; si < IPT; si++) {
+            const int i = i0 + si * ISTR;
+            u_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] = __float2bfloat16(acc[si]);
+        }
     }
 }
 
@@ -249,7 +290,8 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     float* s_U = s_S + (size_t)HD * JC;                                        // [C][JC]
     float* s_M = s_U + (size_t)C * JC;                                         // [C][C+PAD]
     float* s_g = s_M + (size_t)C * (C + PAD);                                  // [C]
-    float* s_Y = s_g + C;                                                      // [C][JC]  Q S staging
+    float* s_eg = s_g + C;                                                     // [C] hoisted per-row expf
+    float* s_Y = s_eg + C;                                                     // [C][JC]  Q S staging
     __nv_bfloat16* s_W =
         reinterpret_cast<__nv_bfloat16*>(s_Y + (size_t)C * JC);                // [C][HD+PAD]
     __nv_bfloat16* s_K = s_W + (size_t)C * (HD + PAD);                         // [C][HD+PAD]
@@ -271,13 +313,37 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     const float scale = rsqrtf((float)HD);
 
     for (int e = tid; e < HD * JC; e += nthr) s_S[e] = 0.f;    // fresh prefill: state starts at zero
-    __syncthreads();
+
+    // The chunk loop is the ONE serial stage left in this prefill, and every iteration used
+    // to expose the full global latency of its 25 KB W/K/Q staging before any math could
+    // start. Issue those loads with cp.async at the END of the previous iteration (the
+    // S-update sync is the last read of the old tiles), so they overlap the g/U/M stages
+    // and the loop-carried sync. Same buffers, same staged values, same math -- only WHEN
+    // the loads are issued changes. Tail rows of a short final chunk are zeroed after the
+    // wait (cp.async cannot predicate, and reading past n_tokens would fault).
+    auto stage_wkq = [&](int c2) {
+        const int t0s = c2 * C;
+        const int lens = min(C, n_tokens - t0s);
+        for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
+            const int i = e8 / (HD / 8), d = (e8 % (HD / 8)) * 8;
+            if (i < lens) {
+                __pipeline_memcpy_async(s_W + i * (HD + PAD) + d,
+                                        w_buf + ((size_t)(t0s + i) * v_heads + h) * HD + d, 16);
+                __pipeline_memcpy_async(s_K + i * (HD + PAD) + d,
+                                        k + (size_t)(t0s + i) * q_dim + qh * HD + d, 16);
+                __pipeline_memcpy_async(s_Q + i * (HD + PAD) + d,
+                                        q + (size_t)(t0s + i) * q_dim + qh * HD + d, 16);
+            }
+        }
+        __pipeline_commit();
+    };
+    if (n_chunks > 0) stage_wkq(0);
 
     for (int c = 0; c < n_chunks; c++) {
         const int t0  = c * C;
         const int len = min(C, n_tokens - t0);
 
-        // ---- stage this chunk ----
+        // ---- stage the small linear tiles; W/K/Q arrive via the early-issued cp.async ----
         for (int i = tid; i < C; i += nthr)
             s_g[i] = (i < len) ? g_buf[(size_t)(t0 + i) * v_heads + h] : 0.f;
         for (int e = tid; e < C * JC; e += nthr) {
@@ -288,12 +354,16 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
             const int i = e / C, j = e - i * C;
             s_M[i * (C + PAD) + j] = m_buf[(size_t)e + ((size_t)c * v_heads + h) * C * C];
         }
-        for (int e = tid; e < C * HD; e += nthr) {
-            const int i = e / HD, d = e - i * HD;
-            const bool live = i < len;
-            s_W[i * (HD + PAD) + d] = live ? w_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] : __float2bfloat16(0.f);
-            s_K[i * (HD + PAD) + d] = live ? k[(size_t)(t0 + i) * q_dim + qh * HD + d] : __float2bfloat16(0.f);
-            s_Q[i * (HD + PAD) + d] = live ? q[(size_t)(t0 + i) * q_dim + qh * HD + d] : __float2bfloat16(0.f);
+        __pipeline_wait_prior(0);
+        if (len < C) {
+            for (int e = tid; e < C * HD; e += nthr) {
+                const int i = e / HD, d = e - i * HD;
+                if (i >= len) {
+                    s_W[i * (HD + PAD) + d] = __float2bfloat16(0.f);
+                    s_K[i * (HD + PAD) + d] = __float2bfloat16(0.f);
+                    s_Q[i * (HD + PAD) + d] = __float2bfloat16(0.f);
+                }
+            }
         }
         __syncthreads();
 
@@ -341,21 +411,47 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         __syncthreads();
 
         // ---- Y = [diag(exp G) Y0 + M U^] * scale ----
-        for (int e = tid; e < C * JC; e += nthr) {
-            const int i = e / JC, jj = e - i * JC;
-            if (t0 + i >= n_tokens) continue;
-            float mu = 0.f;
-            for (int p = 0; p <= i; p++) mu += s_M[i * (C + PAD) + p] * s_U[p * JC + jj];
-            const float y = (__expf(s_g[i]) * s_Y[e] + mu) * scale;
-            out[(size_t)(t0 + i) * v_dim + h * HD + j0 + jj] = __float2bfloat16(y);
+        // p-outermost per-thread form (each thread: one column jj, rows i = tid/JC + 8s):
+        // s_U[p][jj] is read once per p, s_M[i][p] and the hoisted exp(G_i) are warp-
+        // uniform broadcasts, and each output still sums its p-terms in ascending order --
+        // bit-identical to the reference element loop.
+        for (int i = tid; i < C; i += nthr) s_eg[i] = __expf(s_g[i]);
+        __syncthreads();
+        {
+            constexpr int NTHR2 = 256;
+            constexpr int OPT = (C * JC) / NTHR2;
+            constexpr int ISTR2 = NTHR2 / JC;
+            const int jj = tid % JC, i0 = tid / JC;
+            float mu[OPT];
+            #pragma unroll
+            for (int si = 0; si < OPT; si++) mu[si] = 0.f;
+            for (int pp = 0; pp < C; pp++) {
+                const float u = s_U[pp * JC + jj];
+                #pragma unroll
+                for (int si = 0; si < OPT; si++) {
+                    const int i = i0 + si * ISTR2;
+                    if (pp <= i) mu[si] += s_M[i * (C + PAD) + pp] * u;
+                }
+            }
+            #pragma unroll
+            for (int si = 0; si < OPT; si++) {
+                const int i = i0 + si * ISTR2;
+                if (t0 + i >= n_tokens) continue;
+                const float y = (s_eg[i] * s_Y[i * JC + jj] + mu[si]) * scale;
+                out[(size_t)(t0 + i) * v_dim + h * HD + j0 + jj] = __float2bfloat16(y);
+            }
         }
         __syncthreads();
 
         // ---- U~[p] = exp(G_last - G_p) U^[p]  (tail rows already carry U^ = 0) ----
+        // exp(G_last - G_i) is a per-ROW value: computed once per row instead of per
+        // element (same inputs, same op, same downstream multiply -> bit-identical).
         const float g_last = s_g[C - 1];               // == s_g[len-1]: tail log-gates are 0
+        for (int i = tid; i < C; i += nthr) s_eg[i] = __expf(g_last - s_g[i]);
+        __syncthreads();
         for (int e = tid; e < C * JC; e += nthr) {
             const int i = e / JC;
-            s_U[e] *= __expf(g_last - s_g[i]);
+            s_U[e] *= s_eg[i];
         }
         __syncthreads();
 
@@ -396,6 +492,7 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
             }
         }
         __syncthreads();
+        if (c + 1 < n_chunks) stage_wkq(c + 1);   // last read of W/K/Q was above this sync
     }
 
     // ---- final state, in the transposed [v_head][col][row] layout decode expects ----
@@ -473,7 +570,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     const size_t sm_scan = (size_t)HD * JC * sizeof(float)          // s_S (fp32 carrier)
                          + (size_t)C * JC * sizeof(float)            // s_U
                          + (size_t)C * (C + PAD) * sizeof(float)     // s_M
-                         + (size_t)C * sizeof(float)                 // s_g
+                         + (size_t)2 * C * sizeof(float)             // s_g, s_eg
                          + (size_t)C * JC * sizeof(float)            // s_Y
                          + (size_t)3 * C * (HD + PAD) * sizeof(__nv_bfloat16)   // s_W, s_K, s_Q
                          + (size_t)HD * (JC + PAD) * sizeof(__nv_bfloat16)      // s_Sb
