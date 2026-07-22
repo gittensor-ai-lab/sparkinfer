@@ -2548,6 +2548,9 @@ def main():
             _reconcile(NEEDS_BENCH_LABEL, [EVAL_GATE_LABEL, NOT_TESTED_LABEL])
             if first_time and not args.dry_run: post_needs_bench_comment(args.repo, num)
         else:  # unchecked
+            if HOLD_LABEL in pr_labels:
+                print(f"PR #{num}: not greenlit ({reason}) — hold, skip close")
+                continue
             print(f"PR #{num}: not greenlit ({reason}) — close (RTX 5090 unchecked)")
             if not args.dry_run:
                 close_rtx5090_unchecked_pr(args.repo, num)
