@@ -27,6 +27,12 @@ int main(int argc, char** argv) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
 
+    // Teacher-forced scoring compares vs llama.cpp reading native GGUF quants. Speed benches
+    // may set SPARKINFER_DOWN_REQUANT_Q4K=1 (and that env also gates Qwythos dense-9B attn/lmhead
+    // requant defaults); those paths diverge from the reference and falsely fail the correctness
+    // gate (~79-83% top1). overwrite=1 so evaluate_bidir's export cannot leak into scoring.
+    setenv("SPARKINFER_DOWN_REQUANT_Q4K", "0", 1);
+
     const std::string path = argv[1];
     const int topk = atoi(argv[2]);
     std::vector<int> toks;
