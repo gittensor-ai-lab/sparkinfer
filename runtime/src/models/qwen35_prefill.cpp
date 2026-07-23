@@ -168,12 +168,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // unless SPARKINFER_PREFILL_I8_ATTN=0. GDN projections always stay bf16 above bf16_minctx.
     const char* _pi8attn = getenv("SPARKINFER_PREFILL_I8_ATTN");
     bool use_i8_attn = long_bf16 && (!_pi8attn || _pi8attn[0] != '0');
-    // Dense short-ctx: GDN recurrence amplifies per-row int8 activation error even at N=512
-    // on some dense hybrids (Qwythos H3: top1 0.6875 < 0.80). Keep GDN projections on bf16 by
-    // default; FFN/full-attn stay on the int8 tensor-core path. Opt back into GDN-int8 with
-    // SPARKINFER_PREFILL_I8_GDN=1 (A/B). Long-ctx already forces use_i8=false for GDN.
+    // Dense short prefixes: GDN recurrence amplifies per-row int8 activation error at the H3
+    // prefill_check size (N=512 → Qwythos top1 0.6875 < 0.80). Force GDN projections to bf16
+    // only for small N so mid-ctx int8 GDN speed is preserved (blanket bf16 cut 4k/32k/64k pp
+    // ~33% and failed eval no-regression). SPARKINFER_PREFILL_I8_GDN=1 keeps GDN int8 at all N;
+    // SPARKINFER_PREFILL_GDN_BF16_MAXCTX overrides the threshold (default 1024).
     const char* _pi8gdn = getenv("SPARKINFER_PREFILL_I8_GDN");
     const bool use_i8_gdn = !moe && use_i8 && _pi8gdn && _pi8gdn[0] == '1';
+    static int gdn_bf16_maxctx = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_BF16_MAXCTX");
+        return e ? atoi(e) : 1024;
+    }();
+    const bool gdn_force_bf16 = !moe && use_i8 && !use_i8_gdn && N <= gdn_bf16_maxctx;
     // GDN projections (wqkv/wqkv_gate/ssm_out) at long ctx: run them on the fp8 (e4m3) tensor cores
     // instead of bf16. int8 is off here because the near-1-decay recurrence amplifies per-row int8
     // activation-quant error (128k top1 ~0.31); e4m3's floating range holds it to bf16-like fidelity
@@ -488,9 +494,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         bool attn_fused = false;                       // post-attn residual folded into the proj?
         if (w.linear_attn) {
             // ---- Gated DeltaNet linear-attention layer ----
-            // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
+            // Small-N dense: hold GDN on bf16 (see gdn_force_bf16). Mid/long keep GDN int8/fp8.
             const bool restore_i8_gdn = use_i8;
-            if (use_i8 && !use_i8_gdn) use_i8 = false;
+            if (gdn_force_bf16) use_i8 = false;
             gdn_qkv_z(xn, w);                                       // qkv + z gate (fp8: fused)
             proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
             proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
