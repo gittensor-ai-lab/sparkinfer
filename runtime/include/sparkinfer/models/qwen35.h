@@ -87,8 +87,22 @@ public:
     // Greedy generate: prompt token ids -> generated token ids (host). An optional ThermalGovernor
     // paces decode under thermal pressure (accuracy-preserving); nullptr = full speed, no overhead.
     // When a prefix cache is installed (cache_prefix), skips re-prefilling the matching prefix.
+    // When SPARKINFER_DFLASH=1 and a draft is attached via set_dflash_draft(), uses DFlash
+    // block-diffusion speculative decoding (greedy-equivalent to AR when correct).
     std::vector<int> generate(const std::vector<int>& prompt_ids, int max_new_tokens,
                               ThermalGovernor* gov = nullptr);
+
+    // DFlash speculative generate (greedy). Requires set_dflash_draft(). Returns generated ids.
+    // Optional stats: mean acceptance length τ and wall-clock seconds for decode (post-TTFT).
+    struct DFlashStats {
+        double mean_accept = 0;   // mean tokens committed per draft step (τ)
+        double decode_s = 0;
+        double ttft_s = 0;
+        int    steps = 0;
+    };
+    std::vector<int> dflash_generate(const std::vector<int>& prompt_ids, int max_new_tokens,
+                                     DFlashStats* stats = nullptr,
+                                     ThermalGovernor* gov = nullptr);
 
     // Prefill `tokens` and retain KV + hybrid recurrent state for reuse on the next request
     // whose prompt starts with the same token sequence. Returns false on allocation failure.
@@ -148,11 +162,43 @@ public:
     // Token budget for KV allocation: prompt + decode headroom, capped at max_seq.
     static int session_token_budget(size_t prompt_len, int max_new, int max_seq);
 
+    // Shared weights for DFlash draft (embed + lm_head come from target).
+    const void* embed_weights() const;
+    const void* lm_head_weights() const;
+    int lm_head_quant_type() const;
+
+    // Attach / detach a DFlash draft model (non-owning). nullptr clears.
+    void set_dflash_draft(class DFlashDraftModel* draft);
+
+    // DFlash: capture concat hidden states at target_layer_ids per forward step.
+    // Disables CUDA-graph replay while enabled (capture needs eager layer outputs).
+    void set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows = 16);
+    void set_dflash_capture_row(int row);
+    // Append the current capture-row into the growing context buffer at global_pos.
+    void dflash_stash_capture(int global_pos);
+    const void* dflash_hidden_buffer() const;   // scratch rows from last verify block
+    const void* dflash_context_buffer() const;  // accumulated prefill/accept hiddens
+    int dflash_hidden_row_stride() const;       // bf16 elems per row = n_capture * hidden
+    int dflash_context_len() const;
+
+    // Snapshot hybrid recurrent state for speculative rollback.
+    void save_spec_snapshot();
+    void restore_spec_snapshot();
+
+    // Token-loop teacher-forced block verify with optional hidden capture.
+    // Writes argmax at each position into out_argmax[0..n). Returns false on failure.
+    bool verify_block(const int* token_ids, int n, int start_pos, int* out_argmax);
+
+    // Batched verify entry (may fall back to verify_block). Same contract as verify_block.
+    bool batched_forward(const int* token_ids, int n, int start_pos, bool resume_gdn,
+                         int* out_argmax, const void* dflash_capture_dst = nullptr);
+
 private:
     void invalidate_decode_graph();
     // Prefill prompt tokens [start, end) with batched path when start==0, else token loop.
     // Returns argmax seed at end-1 for decode, or -1 on failure.
     int ingest_prompt_range(const int* ids, int start, int end);
+    void dflash_maybe_capture_layer(int layer);
 
     struct Impl;
     Impl* p_;

@@ -40,6 +40,13 @@ public:
     // Free all blocks owned by a sequence
     void free(uint64_t seq_id);
 
+    // Speculative decode: truncate a sequence to its first keep_blocks logical blocks
+    // (returns false if seq_id is unknown). Freed physical blocks go back to the pool.
+    bool truncate_blocks(uint64_t seq_id, int keep_blocks);
+
+    // Number of logical KV blocks currently allocated for seq_id (0 if none).
+    int num_blocks(uint64_t seq_id) const;
+
     // Returns device pointer to the block table for seq_id
     // Shape: [num_layers, max_blocks_per_seq]
     int* block_table(uint64_t seq_id) const;

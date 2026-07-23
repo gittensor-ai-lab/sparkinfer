@@ -19,6 +19,10 @@ namespace sparkinfer {
 
 // Continuous-batch serving engine: queues requests, assigns per-request seq_ids,
 // right-sizes KV allocation, and interleaves decode steps via the Scheduler.
+//
+// DFlash multi-token accept in step_job() is intentionally deferred until the
+// single-stream dflash_generate path proves SPEC_AGREE=100% and a tok/s win
+// (see bench/scripts/dflash_accuracy.sh). Do not wire speculative multi-accept here yet.
 class ContinuousBatchEngine {
 public:
     struct Request {

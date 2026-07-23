@@ -120,6 +120,28 @@ int KVCacheManager::allocated_tokens(uint64_t seq_id) const {
     return (int)it->second.size() * impl_->cfg.block_size;
 }
 
+int KVCacheManager::num_blocks(uint64_t seq_id) const {
+    auto it = impl_->seq_blocks.find(seq_id);
+    return it == impl_->seq_blocks.end() ? 0 : (int)it->second.size();
+}
+
+bool KVCacheManager::truncate_blocks(uint64_t seq_id, int keep_blocks) {
+    if (keep_blocks < 0) return false;
+    auto it = impl_->seq_blocks.find(seq_id);
+    if (it == impl_->seq_blocks.end()) return false;
+    auto& blocks = it->second;
+    if ((int)blocks.size() <= keep_blocks) return true;
+    while ((int)blocks.size() > keep_blocks) {
+        impl_->free_list.push_back(blocks.back());
+        blocks.pop_back();
+    }
+    auto sit = impl_->seq_slot.find(seq_id);
+    if (sit == impl_->seq_slot.end()) return false;
+    cu(cudaMemcpy(impl_->d_block_tables + (size_t)sit->second * kMaxBlocksPerSeq, blocks.data(),
+                  blocks.size() * sizeof(int), cudaMemcpyHostToDevice), "truncate block table");
+    return true;
+}
+
 void KVCacheManager::free(uint64_t seq_id) {
     auto it = impl_->seq_blocks.find(seq_id);
     if (it != impl_->seq_blocks.end()) {

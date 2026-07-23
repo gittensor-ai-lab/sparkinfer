@@ -10,6 +10,7 @@
 // autoregressive greedy decoding fundamentally requires.
 
 #include "sparkinfer/models/qwen35.h"
+#include "sparkinfer/models/dflash_draft.h"
 #include "qwen35_prefill.h"
 #include "sparkinfer/thermal_governor.h"
 #include "sparkinfer/kv_ops.h"
@@ -32,6 +33,7 @@
 #include <string>
 #include <fstream>
 #include <limits>
+#include <algorithm>
 
 namespace sparkinfer {
 
@@ -191,6 +193,20 @@ struct Qwen35Model::Impl {
     int prefix_next = -1;
     bool prefix_active = false;
 
+    // DFlash speculative decoding (target-side primitives).
+    DFlashDraftModel* dflash_draft = nullptr;
+    bool dflash_capture = false;
+    std::vector<int> dflash_layer_ids;
+    int dflash_n_cap = 0;
+    int dflash_max_rows = 16;
+    int dflash_cap_row = 0;
+    int dflash_ctx_len = 0;
+    int dflash_ctx_cap = 0;
+    bf16* dflash_hidden = nullptr;    // [max_rows, n_cap * H]
+    bf16* dflash_context = nullptr;   // [ctx_cap, n_cap * H]
+    float* spec_lin_snap = nullptr;
+    bf16* spec_conv_snap = nullptr;
+
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
 
@@ -345,6 +361,8 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->sparse_sel);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
+    cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
+    // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
     for (auto& kv : p_->sessions) {
         if (kv.first == 0) continue;
         if (kv.second.lin_state) cudaFree(kv.second.lin_state);
@@ -369,6 +387,22 @@ void Qwen35Model::copy_logits(float* host_logits) const {
     cudaMemcpy(host_logits, p_->logits, (size_t)p_->cfg.vocab * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
+void Qwen35Model::dflash_maybe_capture_layer(int layer) {
+    Impl& s = *p_;
+    if (!s.dflash_capture || !s.dflash_hidden || s.dflash_n_cap <= 0) return;
+    int slot = -1;
+    for (int i = 0; i < s.dflash_n_cap; i++) {
+        if (s.dflash_layer_ids[i] == layer) { slot = i; break; }
+    }
+    if (slot < 0) return;
+    const int H = s.cfg.hidden;
+    const int row = s.dflash_cap_row;
+    if (row < 0 || row >= s.dflash_max_rows) return;
+    bf16* dst = s.dflash_hidden + ((size_t)row * s.dflash_n_cap + slot) * H;
+    cu(cudaMemcpyAsync(dst, s.x, (size_t)H * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
+       "dflash capture");
+}
+
 int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
@@ -376,6 +410,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     kernels::GemmConfig gc{};
     int seqlen = position + 1;
     cudaStream_t st = s.stream;
+    const bool dflash_cap = s.dflash_capture;
 
     s.h_scalars[0] = token_id;
     s.h_scalars[1] = position;
@@ -485,12 +520,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     }
 
     // Prefill graph: embed→layers→final norm (no LM head). Decode graph: full path + argmax.
-    if (!sample && s.graph_prefill_ready) {
+    // DFlash layer-hidden capture requires the eager path (graphs bake fixed destinations).
+    if (!sample && s.graph_prefill_ready && !dflash_cap) {
         cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch");
         cu(cudaStreamSynchronize(st), "prefill graph sync");
         return token_id;
     }
-    if (sample && s.graph_ready) {
+    if (sample && s.graph_ready && !dflash_cap) {
         cu(cudaGraphLaunch(s.cu_exec, st), "graph launch");
         cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
         cu(cudaStreamSynchronize(st), "sync");
@@ -504,7 +540,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.graph_prefill_ready = false;
         s.graph_prefill_attn_mode = -1;
     }
-    cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
+    const bool capturing_graph = !dflash_cap;
+    if (capturing_graph)
+        cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
 
     kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
 
@@ -967,6 +1005,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                     else
                         kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
                 }
+                dflash_maybe_capture_layer(L);
                 continue;
             }
             if (w.shared_gate_inp) {
@@ -1022,6 +1061,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                             kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
                         else
                             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+                        dflash_maybe_capture_layer(L);
                         continue;
                     }
                 } else {
@@ -1049,14 +1089,17 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
         else
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+        dflash_maybe_capture_layer(L);
     }
     // xn now holds RMSNorm(x_final, final_norm)
     if (!sample) {
-        cu(cudaStreamEndCapture(st, &s.cu_prefill_graph), "end prefill capture");
-        cu(cudaGraphInstantiate(&s.cu_prefill_exec, s.cu_prefill_graph, 0), "prefill graph instantiate");
-        s.graph_prefill_ready = true;
-        s.graph_prefill_attn_mode = attn_graph_mode;
-        cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch (first)");
+        if (capturing_graph) {
+            cu(cudaStreamEndCapture(st, &s.cu_prefill_graph), "end prefill capture");
+            cu(cudaGraphInstantiate(&s.cu_prefill_exec, s.cu_prefill_graph, 0), "prefill graph instantiate");
+            s.graph_prefill_ready = true;
+            s.graph_prefill_attn_mode = attn_graph_mode;
+            cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch (first)");
+        }
         cu(cudaStreamSynchronize(st), "prefill sync");
         return token_id;
     }
@@ -1074,22 +1117,24 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
-    cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
-    cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
-    s.graph_ready = true;
-    s.graph_attn_mode = attn_graph_mode;
-    s.graph_sparse = sparse_on;
-    static int graph_dbg = -1;
-    if (graph_dbg < 0) {
-        const char* e = getenv("SPARKINFER_GRAPH_DEBUG");
-        graph_dbg = (e && e[0] == '1') ? 1 : 0;
+    if (capturing_graph) {
+        cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
+        cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
+        s.graph_ready = true;
+        s.graph_attn_mode = attn_graph_mode;
+        s.graph_sparse = sparse_on;
+        static int graph_dbg = -1;
+        if (graph_dbg < 0) {
+            const char* e = getenv("SPARKINFER_GRAPH_DEBUG");
+            graph_dbg = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (graph_dbg) {
+            const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
+            fprintf(stderr, "[graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
+                    position, seqlen, s.n_splits, attn_graph_mode, mma_chunk, sparse_on ? 1 : 0);
+        }
+        cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
     }
-    if (graph_dbg) {
-        const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
-        fprintf(stderr, "[graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
-                position, seqlen, s.n_splits, attn_graph_mode, mma_chunk, sparse_on ? 1 : 0);
-    }
-    cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
 
     cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
     cu(cudaStreamSynchronize(st), "sync");
@@ -1440,6 +1485,10 @@ uint64_t Qwen35Model::active_session() const { return p_->active_seq_id; }
 
 std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
     Impl& s = *p_;
+    if (s.dflash_draft) {
+        const char* e = getenv("SPARKINFER_DFLASH");
+        if (e && e[0] == '1') return dflash_generate(prompt, max_new, nullptr, gov);
+    }
     std::vector<int> out;
     if (prompt.empty()) return out;
 
@@ -1489,6 +1538,246 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         s.prefix_active = false;
         invalidate_decode_graph();
     }
+    return out;
+}
+
+const void* Qwen35Model::embed_weights() const { return p_->w.embed_tokens; }
+const void* Qwen35Model::lm_head_weights() const { return p_->w.lm_head; }
+int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
+
+void Qwen35Model::set_dflash_draft(DFlashDraftModel* draft) { p_->dflash_draft = draft; }
+
+void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows) {
+    Impl& s = *p_;
+    s.dflash_capture = on;
+    s.dflash_layer_ids = target_layer_ids;
+    s.dflash_n_cap = (int)target_layer_ids.size();
+    s.dflash_max_rows = std::max(1, max_rows);
+    s.dflash_cap_row = 0;
+    s.dflash_ctx_len = 0;
+    invalidate_decode_graph();
+    if (!on) return;
+    const int H = s.cfg.hidden;
+    const size_t row_elems = (size_t)s.dflash_n_cap * H;
+    const size_t hidden_bytes = (size_t)s.dflash_max_rows * row_elems * sizeof(bf16);
+    if (s.dflash_hidden) { cudaFree(s.dflash_hidden); s.dflash_hidden = nullptr; }
+    if (s.dflash_context) { cudaFree(s.dflash_context); s.dflash_context = nullptr; }
+    s.dflash_ctx_cap = s.cfg.max_seq;
+    cu(cudaMalloc(&s.dflash_hidden, hidden_bytes), "dflash hidden");
+    cu(cudaMalloc(&s.dflash_context, (size_t)s.dflash_ctx_cap * row_elems * sizeof(bf16)), "dflash ctx");
+    if (s.cfg.hybrid && !s.spec_lin_snap) {
+        const size_t ls = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
+                          s.cfg.linear_head_dim * s.cfg.linear_head_dim;
+        const size_t cs = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim;
+        s.spec_lin_snap = s.alloc<float>(ls);
+        s.spec_conv_snap = s.alloc<bf16>(cs);
+    }
+    if (const char* e = getenv("SPARKINFER_DFLASH_CAPTURE"); e && e[0] == '1')
+        fprintf(stderr, "[dflash] capture on n_cap=%d max_rows=%d\n", s.dflash_n_cap, s.dflash_max_rows);
+}
+
+void Qwen35Model::set_dflash_capture_row(int row) { p_->dflash_cap_row = row; }
+
+void Qwen35Model::dflash_stash_capture(int global_pos) {
+    Impl& s = *p_;
+    if (!s.dflash_hidden || !s.dflash_context || s.dflash_n_cap <= 0) return;
+    if (global_pos < 0 || global_pos >= s.dflash_ctx_cap) return;
+    const int H = s.cfg.hidden;
+    const size_t row_elems = (size_t)s.dflash_n_cap * H;
+    const bf16* src = s.dflash_hidden + (size_t)s.dflash_cap_row * row_elems;
+    bf16* dst = s.dflash_context + (size_t)global_pos * row_elems;
+    cu(cudaMemcpyAsync(dst, src, row_elems * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
+       "dflash stash");
+    if (global_pos + 1 > s.dflash_ctx_len) s.dflash_ctx_len = global_pos + 1;
+}
+
+const void* Qwen35Model::dflash_hidden_buffer() const { return p_->dflash_hidden; }
+const void* Qwen35Model::dflash_context_buffer() const { return p_->dflash_context; }
+int Qwen35Model::dflash_hidden_row_stride() const {
+    return p_->dflash_n_cap * p_->cfg.hidden;
+}
+int Qwen35Model::dflash_context_len() const { return p_->dflash_ctx_len; }
+
+void Qwen35Model::save_spec_snapshot() {
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    if (!s.spec_lin_snap || !c.hybrid) return;
+    const size_t ls = (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+    const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
+    cu(cudaMemcpyAsync(s.spec_lin_snap, s.lin_state, ls * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
+       "spec snap lin");
+    cu(cudaMemcpyAsync(s.spec_conv_snap, s.lin_conv_state, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
+       "spec snap conv");
+    cu(cudaStreamSynchronize(s.stream), "spec snap sync");
+}
+
+void Qwen35Model::restore_spec_snapshot() {
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    if (!s.spec_lin_snap || !c.hybrid) return;
+    const size_t ls = (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+    const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
+    cu(cudaMemcpyAsync(s.lin_state, s.spec_lin_snap, ls * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
+       "spec restore lin");
+    cu(cudaMemcpyAsync(s.lin_conv_state, s.spec_conv_snap, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
+       "spec restore conv");
+    cu(cudaStreamSynchronize(s.stream), "spec restore sync");
+    invalidate_decode_graph();
+}
+
+bool Qwen35Model::verify_block(const int* token_ids, int n, int start_pos, int* out_argmax) {
+    if (!token_ids || !out_argmax || n <= 0) return false;
+    for (int i = 0; i < n; i++) {
+        set_dflash_capture_row(i);
+        out_argmax[i] = forward_token(token_ids[i], start_pos + i, true);
+        if (out_argmax[i] < 0) return false;
+    }
+    return true;
+}
+
+bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bool /*resume_gdn*/,
+                                  int* out_argmax, const void* /*dflash_capture_dst*/) {
+    // Phase 3 gate: true batched hybrid verify (multi-token GDN+MoE) lands only after
+    // SPEC_AGREE + single-stream speedup. Token-loop verify is correct for GDN advance.
+    // Full-block accept in dflash_generate already skips rollback when accept==B-1.
+    return verify_block(token_ids, n, start_pos, out_argmax);
+}
+
+std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, int max_new,
+                                              DFlashStats* stats, ThermalGovernor* gov) {
+    Impl& s = *p_;
+    std::vector<int> out;
+    if (!s.dflash_draft || prompt.empty() || max_new <= 0) return out;
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const DFlashDraftConfig& dc = draft.config();
+    const int B = dc.block_size;
+    const int mask_id = dc.mask_token_id;
+
+    draft.set_shared_weights(embed_weights(), lm_head_weights(), lm_head_quant_type(),
+                             s.cfg.vocab, s.cfg.hidden);
+    set_dflash_capture(true, dc.target_layer_ids, B);
+
+    const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
+    clear_prefix_cache();
+    invalidate_decode_graph();
+    uint64_t sid = open_session(budget);
+    if (!sid) {
+        fprintf(stderr, "[dflash] KV allocate failed (need %d)\n", budget);
+        set_dflash_capture(false, {}, 0);
+        return out;
+    }
+    activate_session(sid);
+
+    const int n = (int)prompt.size();
+    auto t0 = std::chrono::steady_clock::now();
+    int next = -1;
+    for (int i = 0; i < n; i++) {
+        set_dflash_capture_row(0);
+        const bool sample = (i + 1 == n);
+        int r = forward_token(prompt[i], i, sample);
+        dflash_stash_capture(i);
+        if (sample) next = r;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    if (next < 0 || next >= s.cfg.vocab) {
+        close_session(sid);
+        set_dflash_capture(false, {}, 0);
+        return out;
+    }
+
+    draft.reset();
+    int start = n;
+    double accept_sum = 0;
+    int steps = 0;
+    const void* target_hidden = dflash_context_buffer();
+    int th_len = n;
+
+    std::vector<int> block(B), posterior(B), draft_ids(B);
+    bf16* th_scratch = nullptr;
+    const int row_stride = dflash_hidden_row_stride();
+    cu(cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)), "th scratch");
+
+    auto t_decode0 = std::chrono::steady_clock::now();
+    while ((int)out.size() < max_new) {
+        block[0] = next;
+        for (int i = 1; i < B; i++) block[i] = mask_id;
+
+        if (!draft.forward_block(target_hidden, th_len, block.data(), start, draft_ids.data(), s.stream)) {
+            fprintf(stderr, "[dflash] draft forward failed at start=%d\n", start);
+            break;
+        }
+        for (int i = 1; i < B; i++) block[i] = draft_ids[i];
+
+        save_spec_snapshot();
+        const int kv_blocks = s.kv->num_blocks(s.active_seq_id);
+        if (!verify_block(block.data(), B, start, posterior.data())) {
+            fprintf(stderr, "[dflash] verify failed at start=%d\n", start);
+            break;
+        }
+        int accept = 0;
+        for (; accept < B - 1; accept++) {
+            if (block[accept + 1] != posterior[accept]) break;
+        }
+        const int keep = accept + 1;
+        cu(cudaMemcpyAsync(th_scratch, s.dflash_hidden,
+                           (size_t)keep * row_stride * sizeof(bf16),
+                           cudaMemcpyDeviceToDevice, s.stream), "th keep");
+        cu(cudaStreamSynchronize(s.stream), "th sync");
+
+        // Full-block accept: verify already left KV/GDN at start+B — skip rollback.
+        // Partial accept: restore snapshot and replay the kept prefix (Phase 0 correctness).
+        if (accept < B - 1) {
+            restore_spec_snapshot();
+            s.kv->truncate_blocks(s.active_seq_id, kv_blocks);
+            // truncate returns pages to the pool — grow the table back before replay.
+            if (!s.kv->allocate(s.active_seq_id, start + keep + B)) {
+                fprintf(stderr, "[dflash] KV re-allocate failed after truncate\n");
+                break;
+            }
+            for (int i = 0; i < keep; i++) {
+                set_dflash_capture_row(0);
+                (void)forward_token(block[i], start + i, true);
+                dflash_stash_capture(start + i);
+            }
+        } else {
+            // Verify rows already hold the accepted hiddens — stash into context by row index.
+            for (int i = 0; i < keep; i++) {
+                set_dflash_capture_row(i);
+                dflash_stash_capture(start + i);
+            }
+        }
+
+        bool stop = false;
+        for (int i = 0; i < keep && (int)out.size() < max_new; i++) {
+            out.push_back(block[i]);
+            if (block[i] == s.cfg.eos_id) { stop = true; break; }
+        }
+        if (stop) break;
+        // Bonus token becomes the next block seed (emitted on the following iteration).
+        next = posterior[accept];
+        if (next == s.cfg.eos_id) {
+            if ((int)out.size() < max_new) out.push_back(next);
+            break;
+        }
+
+        start += keep;
+        accept_sum += (double)keep;
+        steps++;
+        target_hidden = th_scratch;
+        th_len = keep;
+        if (gov) gov->pace();
+    }
+    auto t_end = std::chrono::steady_clock::now();
+    if (stats) {
+        stats->steps = steps;
+        stats->mean_accept = steps > 0 ? accept_sum / steps : 0;
+        stats->ttft_s = std::chrono::duration<double>(t1 - t0).count();
+        stats->decode_s = std::chrono::duration<double>(t_end - t_decode0).count();
+    }
+    cudaFree(th_scratch);
+    close_session(sid);
+    set_dflash_capture(false, {}, 0);
+    draft.reset();
     return out;
 }
 

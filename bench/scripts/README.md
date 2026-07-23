@@ -89,6 +89,22 @@ build/runtime/qwen3_gguf_score model.gguf 20 <token-ids...>   # compare argmax +
 | `SPARKINFER_EVAL_PREFILL_CHECK_TOP1_BAR` | `0.80` | H3 veto if TOP1 below this |
 | `SPARKINFER_EVAL_PREFILL_CHECK_KL_BAR` | `0.05` | H3 veto if mean KL above this |
 
+## DFlash speculative decode (Qwen3.6)
+
+Block-diffusion draft (`z-lab/Qwen3.6-35B-A3B-DFlash` safetensors) + target GGUF:
+
+```bash
+# Correctness: greedy DFlash must match AR (SPEC_AGREE = 100%)
+bench/scripts/dflash_accuracy.sh /path/to/Qwen3.6-35B-A3B.gguf /path/to/Qwen3.6-35B-A3B-DFlash
+
+# Throughput + mean accept τ
+build/runtime/qwen3_gguf_dflash_bench target.gguf draft_dir 64 <token-ids...>
+```
+
+Env: `SPARKINFER_DFLASH=1` selects DFlash from `generate()` when a draft is attached;
+`SPARKINFER_DFLASH_CAPTURE=1` logs capture setup. CB/server multi-accept is deferred until
+SPEC_AGREE and a decode speedup are proven on the single-stream path.
+
 ## Automatic PR evaluation
 
 `evaluate.sh` grades one submission (build → correctness → 128/512/4k/16k/32k speed → `label.py`).
