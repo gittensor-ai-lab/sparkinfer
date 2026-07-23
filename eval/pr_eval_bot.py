@@ -79,6 +79,8 @@ def _bidir_baseline_args(q36, q35):
         "--p35-guard-32k-pp-baseline", str(q35.get("32k_pp", 0)),
         "--p35-guard-64k-pp-baseline", str(q35.get("64k_pp", 0)),
         "--p35-guard-128k-pp-baseline", str(q35.get("128k_pp", 0)),
+        "--p35-guard-cb-ttft-baseline", str(q35.get("cb_ttft", 0)),
+        "--p36-guard-cb-ttft-baseline", str(q36.get("cb_ttft", 0)),
         "--p-guard-128-baseline", str(q36["128"]),
         "--p-guard-512-baseline", str(q36["512"]),
         "--p-guard-4k-baseline",  str(q36["4k"]),
@@ -149,6 +151,19 @@ def _apply_bidir_ctx_from_bres(bres, q36, q35):
     got35 = _fill(bres.get("score_qwen35"), q35, ("128", "4k", "32k", "64k"))
     _fill_pp(bres.get("score_qwen36"), q36, ("128_pp", "512_pp", "4k_pp", "16k_pp", "32k_pp"), pp_map_q36)
     _fill_pp(bres.get("score_qwen35"), q35, ("4k_pp", "32k_pp", "64k_pp", "128k_pp"), pp_map_q35)
+    # CB mixed-load TTFT (seconds) — per model from nested scores or top-level.
+    cb35 = float(bres.get("cb_ttft_s") or 0)
+    if cb35 <= 0:
+        s35 = bres.get("score_qwen35") or {}
+        cb35 = float(s35.get("cb_ttft_s") or 0)
+    if cb35 > 0:
+        q35["cb_ttft"] = cb35
+    cb36 = float(bres.get("cb_ttft_s_qwen36") or 0)
+    if cb36 <= 0:
+        s36 = bres.get("score_qwen36") or {}
+        cb36 = float(s36.get("cb_ttft_s") or 0)
+    if cb36 > 0:
+        q36["cb_ttft"] = cb36
     return got36 and got35
 
 
@@ -1108,11 +1123,18 @@ def render(res, oid):
                 pctx = block.get("score_prefill_context", 0)
                 plbl = block.get("best_prefill_context_label", "")
                 ttft_pct = block.get("prefill_pct_over_frontier")
+                src = block.get("prefill_score_source") or ""
                 ttft_note = (f" · TTFT −{ttft_pct}%" if ttft_pct is not None else "")
+                src_note = " · CB mixed" if src == "cb" else ""
                 rows.append(f"| {title} scored prefill ({pctx} ctx"
                             f"{f' · {plbl}' if plbl else ''}) | {block.get('prefill_tps', '?')} pp tok/s"
-                            f"{ttft_note} · "
+                            f"{ttft_note}{src_note} · "
                             f"`eval-prefill:{block.get('prefill_label')}` |")
+                if block.get("cb_ttft_s") is not None and src != "cb":
+                    cb_pct = block.get("cb_pct_over_frontier")
+                    cb_note = f" · TTFT −{cb_pct}%" if cb_pct is not None else ""
+                    rows.append(f"| {title} CB mixed TTFT | {block.get('cb_ttft_s')}s"
+                                f" vs main {block.get('cb_frontier_ttft_s', '?')}s{cb_note} |")
             elif block.get("eval_prefill"):
                 best_pp = _best_prefill_measurement(block)
                 if best_pp:
@@ -2327,6 +2349,7 @@ def main():
         "llama128": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_128", "275.81")),
         "llama512": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_512", "275.61")),
         "llama4k":  float(os.environ.get("SPARKINFER_QWEN36_LLAMA_4K",  "276.30")),
+        "cb_ttft": float(os.environ.get("SPARKINFER_QWEN36_CB_TTFT", "0")),
     }
     QWYTHOS_BASE = {
         "128": float(os.environ.get("SPARKINFER_QWYTHOS_128", "0")),
@@ -2347,6 +2370,7 @@ def main():
         "llama32k_pp": float(os.environ.get("QWEN35_9B_LLAMA_32K_PP", "0")),
         "llama64k_pp": float(os.environ.get("QWEN35_9B_LLAMA_64K_PP", "0")),
         "llama128k_pp": float(os.environ.get("QWEN35_9B_LLAMA_128K_PP", "0")),
+        "cb_ttft": float(os.environ.get("SPARKINFER_QWYTHOS_CB_TTFT", "0")),
     }
 
     # --- Polaris verifiable compute ---
@@ -2694,6 +2718,10 @@ def main():
             print(f"  Qwythos prefill pp: 4k={QWYTHOS_BASE.get('4k_pp', 0)} "
                   f"32k={QWYTHOS_BASE.get('32k_pp', 0)} 64k={QWYTHOS_BASE.get('64k_pp', 0)} "
                   f"128k={QWYTHOS_BASE.get('128k_pp', 0)} pp tok/s")
+        if QWYTHOS_BASE.get("cb_ttft", 0) > 0:
+            print(f"  Qwythos CB mixed TTFT: {QWYTHOS_BASE.get('cb_ttft')}s")
+        if QWEN36_BASE.get("cb_ttft", 0) > 0:
+            print(f"  Qwen3.6 CB mixed TTFT: {QWEN36_BASE.get('cb_ttft')}s")
 
     # Run all pending evals on the same vast instance (left running between PRs and after the run).
     for i, (pr, num, branch, oid, ref, areas) in enumerate(pending):

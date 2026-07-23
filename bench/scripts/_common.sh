@@ -59,6 +59,16 @@ ensure_prefill_check() {  # $1 = arch
   [ -x "$ROOT/build/runtime/qwen3_gguf_prefill_check" ]
 }
 
+# Mixed-load CB TTFT bench (prefill scoring when SPARKINFER_EVAL_PREFILL_CB=1).
+ensure_cb_bench() {  # $1 = arch
+  if [ -x "$ROOT/build/runtime/qwen3_gguf_cb_bench" ]; then return 0; fi
+  if [ -n "${SI_BIN:-}" ] && [ -x "$SI_BIN/qwen3_gguf_cb_bench" ]; then return 0; fi
+  echo ">> building qwen3_gguf_cb_bench (sm_$1) ..." >&2
+  cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_CUDA_ARCHITECTURES="$1" -DCMAKE_BUILD_TYPE=Release $CUDA_HOST_FLAG >/dev/null
+  cmake --build "$ROOT/build" -j2 --target qwen3_gguf_cb_bench >/dev/null
+  [ -x "$ROOT/build/runtime/qwen3_gguf_cb_bench" ]
+}
+
 _download_model() {
   echo ">> downloading $MODEL_REPO/$MODEL_FILE -> $MODELS_DIR (~17 GB) ..." >&2
   mkdir -p "$MODELS_DIR"

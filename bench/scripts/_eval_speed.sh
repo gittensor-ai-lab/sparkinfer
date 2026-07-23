@@ -159,3 +159,32 @@ chosen = max(scorable, key=lambda c: c["gain"]) if scorable else fallback
 print(json.dumps({"chosen": chosen, "contexts": contexts, "metric": "prefill"}, separators=(",", ":")))
 PY
 }
+
+# Mixed-load continuous-batching TTFT (Qwen3.5 / Qwen3.6 serving path).
+# Fixed recipe matches PR #585 proof: concurrency=4 prompt=256 max_new=64 long_prefill=8192.
+# Echoes: "<long_ttft_s> <long_prefill_pp>"
+run_cb_ttft() {
+  local gguf="${1:-$GGUF}"
+  local concurrency="${SPARKINFER_CB_CONCURRENCY:-4}"
+  local prompt_len="${SPARKINFER_CB_PROMPT_LEN:-256}"
+  local max_new="${SPARKINFER_CB_MAX_NEW:-64}"
+  local long_prefill="${SPARKINFER_CB_LONG_PREFILL:-8192}"
+  local out rc=0
+  out="$(SPARKINFER_SCHED_POLICY=continuous SPARKINFER_PREFILL_MIX_MAX=0 \
+    si_run qwen3_gguf_cb_bench "$gguf" "$concurrency" "$prompt_len" "$max_new" "$long_prefill" 2>&1)" || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo ">> WARN: cb_bench failed (rc=$rc): ${out##*$'\n'}" >&2
+    echo "0 0"
+    return 1
+  fi
+  local ttft pp
+  ttft=$(printf '%s\n' "$out" | sed -n 's/.*long_ttft_s=\([0-9.][0-9.]*\).*/\1/p' | tail -1)
+  pp=$(printf '%s\n' "$out" | sed -n 's/.*long_prefill_pp=\([0-9.][0-9.]*\).*/\1/p' | tail -1)
+  if [ -z "$ttft" ] || [ -z "$pp" ]; then
+    echo ">> WARN: cb_bench missing long_ttft_s/long_prefill_pp: ${out##*$'\n'}" >&2
+    echo "0 0"
+    return 1
+  fi
+  echo "$ttft $pp"
+  return 0
+}
