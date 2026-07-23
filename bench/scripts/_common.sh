@@ -59,7 +59,7 @@ ensure_prefill_check() {  # $1 = arch
   [ -x "$ROOT/build/runtime/qwen3_gguf_prefill_check" ]
 }
 
-# Mixed-load CB TTFT bench (Qwen3.5 prefill scoring when SPARKINFER_EVAL_PREFILL_CB=1).
+# Mixed-load CB TTFT bench (prefill scoring when SPARKINFER_EVAL_PREFILL_CB=1).
 ensure_cb_bench() {  # $1 = arch
   if [ -x "$ROOT/build/runtime/qwen3_gguf_cb_bench" ]; then return 0; fi
   if [ -n "${SI_BIN:-}" ] && [ -x "$SI_BIN/qwen3_gguf_cb_bench" ]; then return 0; fi

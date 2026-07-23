@@ -337,6 +337,8 @@ def main():
     ap.add_argument("--p35-guard-128k-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.5 main 128k prefill pp tok/s")
     ap.add_argument("--p35-guard-cb-ttft-baseline", type=float, default=0,
                     help="[--bidir] Qwen3.5 main CB mixed-load long_ttft_s (seconds)")
+    ap.add_argument("--p36-guard-cb-ttft-baseline", type=float, default=0,
+                    help="[--bidir] Qwen3.6 main CB mixed-load long_ttft_s (seconds)")
     ap.add_argument("--p36-guard-128-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.6 main 128 prefill pp tok/s")
     ap.add_argument("--p36-guard-512-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.6 main 512 prefill pp tok/s")
     ap.add_argument("--p36-guard-4k-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.6 main 4k prefill pp tok/s")
@@ -708,6 +710,7 @@ def main():
                         f"SPARKINFER_P35_GUARD_64K_PP_BASELINE={args.p35_guard_64k_pp_baseline} "
                         f"SPARKINFER_P35_GUARD_128K_PP_BASELINE={args.p35_guard_128k_pp_baseline} "
                         f"SPARKINFER_P35_GUARD_CB_TTFT_BASELINE={args.p35_guard_cb_ttft_baseline} "
+                        f"SPARKINFER_P36_GUARD_CB_TTFT_BASELINE={args.p36_guard_cb_ttft_baseline} "
                         f"SPARKINFER_P36_GUARD_128_PP_BASELINE={args.p36_guard_128_pp_baseline} "
                         f"SPARKINFER_P36_GUARD_512_PP_BASELINE={args.p36_guard_512_pp_baseline} "
                         f"SPARKINFER_P36_GUARD_4K_PP_BASELINE={args.p36_guard_4k_pp_baseline} "

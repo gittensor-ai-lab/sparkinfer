@@ -80,6 +80,7 @@ def _bidir_baseline_args(q36, q35):
         "--p35-guard-64k-pp-baseline", str(q35.get("64k_pp", 0)),
         "--p35-guard-128k-pp-baseline", str(q35.get("128k_pp", 0)),
         "--p35-guard-cb-ttft-baseline", str(q35.get("cb_ttft", 0)),
+        "--p36-guard-cb-ttft-baseline", str(q36.get("cb_ttft", 0)),
         "--p-guard-128-baseline", str(q36["128"]),
         "--p-guard-512-baseline", str(q36["512"]),
         "--p-guard-4k-baseline",  str(q36["4k"]),
@@ -150,13 +151,19 @@ def _apply_bidir_ctx_from_bres(bres, q36, q35):
     got35 = _fill(bres.get("score_qwen35"), q35, ("128", "4k", "32k", "64k"))
     _fill_pp(bres.get("score_qwen36"), q36, ("128_pp", "512_pp", "4k_pp", "16k_pp", "32k_pp"), pp_map_q36)
     _fill_pp(bres.get("score_qwen35"), q35, ("4k_pp", "32k_pp", "64k_pp", "128k_pp"), pp_map_q35)
-    # CB mixed-load TTFT (seconds) — top-level or nested under score_qwen35.
-    cb = float(bres.get("cb_ttft_s") or 0)
-    if cb <= 0:
+    # CB mixed-load TTFT (seconds) — per model from nested scores or top-level.
+    cb35 = float(bres.get("cb_ttft_s") or 0)
+    if cb35 <= 0:
         s35 = bres.get("score_qwen35") or {}
-        cb = float(s35.get("cb_ttft_s") or 0)
-    if cb > 0:
-        q35["cb_ttft"] = cb
+        cb35 = float(s35.get("cb_ttft_s") or 0)
+    if cb35 > 0:
+        q35["cb_ttft"] = cb35
+    cb36 = float(bres.get("cb_ttft_s_qwen36") or 0)
+    if cb36 <= 0:
+        s36 = bres.get("score_qwen36") or {}
+        cb36 = float(s36.get("cb_ttft_s") or 0)
+    if cb36 > 0:
+        q36["cb_ttft"] = cb36
     return got36 and got35
 
 
@@ -2342,6 +2349,7 @@ def main():
         "llama128": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_128", "275.81")),
         "llama512": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_512", "275.61")),
         "llama4k":  float(os.environ.get("SPARKINFER_QWEN36_LLAMA_4K",  "276.30")),
+        "cb_ttft": float(os.environ.get("SPARKINFER_QWEN36_CB_TTFT", "0")),
     }
     QWYTHOS_BASE = {
         "128": float(os.environ.get("SPARKINFER_QWYTHOS_128", "0")),
@@ -2712,6 +2720,8 @@ def main():
                   f"128k={QWYTHOS_BASE.get('128k_pp', 0)} pp tok/s")
         if QWYTHOS_BASE.get("cb_ttft", 0) > 0:
             print(f"  Qwythos CB mixed TTFT: {QWYTHOS_BASE.get('cb_ttft')}s")
+        if QWEN36_BASE.get("cb_ttft", 0) > 0:
+            print(f"  Qwen3.6 CB mixed TTFT: {QWEN36_BASE.get('cb_ttft')}s")
 
     # Run all pending evals on the same vast instance (left running between PRs and after the run).
     for i, (pr, num, branch, oid, ref, areas) in enumerate(pending):

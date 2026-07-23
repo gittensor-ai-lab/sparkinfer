@@ -154,6 +154,7 @@ if [ "$BASELINE_ONLY" = 1 ]; then
   SPARKINFER_P35_GUARD_64K_PP_BASELINE=0
   SPARKINFER_P35_GUARD_128K_PP_BASELINE=0
   SPARKINFER_P35_GUARD_CB_TTFT_BASELINE=0
+  SPARKINFER_P36_GUARD_CB_TTFT_BASELINE=0
 else
   echo ">> [build] submission ($COMMIT) from source (sm_$ARCH) — shared by both models ..." >&2
   rm -rf "$ROOT/build"
@@ -308,20 +309,31 @@ if [ "${SPARKINFER_P35_GUARD_128_BASELINE:-0}" = "0" ] || [ "${SPARKINFER_P35_GU
   echo ">> Qwen3.5 prefill: 4k=${B35_4K_PP:-0} 32k=${B35_32K_PP:-0} 64k=${B35_64K_PP:-0} 128k=${B35_128K_PP:-0} pp tok/s" >&2
 fi
 
-# CB mixed-load TTFT baseline (Qwen3.5 / Qwythos) — same fixed recipe as evaluate.sh.
+# CB mixed-load TTFT baselines (Qwen3.5 + Qwen3.6) — same fixed recipe as evaluate.sh.
 B35_CB_TTFT="${SPARKINFER_P35_GUARD_CB_TTFT_BASELINE:-0}"
-if [ "${B35_CB_TTFT}" = "0" ] && [ "${SPARKINFER_EVAL_PREFILL_CB:-1}" = "1" ]; then
+B36_CB_TTFT="${SPARKINFER_P36_GUARD_CB_TTFT_BASELINE:-0}"
+if [ "${SPARKINFER_EVAL_PREFILL_CB:-1}" = "1" ]; then
   if ensure_cb_bench "$ARCH"; then
-    echo ">> measuring Qwen3.5 CB mixed-load TTFT (4×decode + 8k interrupt) ..." >&2
-    P35_GGUF="${P35_DIR}/${P35_FILE}"
-    CB_PAIR="$(run_cb_ttft "$P35_GGUF" || true)"
-    B35_CB_TTFT="$(printf '%s\n' "$CB_PAIR" | awk '{print $1+0}')"
-    echo ">> Qwen3.5 CB TTFT main: ${B35_CB_TTFT}s" >&2
+    if [ "${B35_CB_TTFT}" = "0" ]; then
+      echo ">> measuring Qwen3.5 CB mixed-load TTFT (4×decode + 8k interrupt) ..." >&2
+      P35_GGUF="${P35_DIR}/${P35_FILE}"
+      CB_PAIR="$(run_cb_ttft "$P35_GGUF" || true)"
+      B35_CB_TTFT="$(printf '%s\n' "$CB_PAIR" | awk '{print $1+0}')"
+      echo ">> Qwen3.5 CB TTFT main: ${B35_CB_TTFT}s" >&2
+    fi
+    if [ "${B36_CB_TTFT}" = "0" ]; then
+      echo ">> measuring Qwen3.6 CB mixed-load TTFT (4×decode + 8k interrupt) ..." >&2
+      P36_GGUF="${P36_DIR}/${P36_FILE}"
+      CB_PAIR="$(run_cb_ttft "$P36_GGUF" || true)"
+      B36_CB_TTFT="$(printf '%s\n' "$CB_PAIR" | awk '{print $1+0}')"
+      echo ">> Qwen3.6 CB TTFT main: ${B36_CB_TTFT}s" >&2
+    fi
   else
-    echo ">> WARN: qwen3_gguf_cb_bench unavailable — CB TTFT baseline skipped" >&2
+    echo ">> WARN: qwen3_gguf_cb_bench unavailable — CB TTFT baselines skipped" >&2
   fi
 fi
 B35_CB_TTFT="${B35_CB_TTFT:-0}"
+B36_CB_TTFT="${B36_CB_TTFT:-0}"
 
 B36_128="${B36_128:-${SPARKINFER_P36_GUARD_128_BASELINE:-0}}"
 B36_512="${B36_512:-${SPARKINFER_P36_GUARD_512_BASELINE:-0}}"
@@ -400,11 +412,13 @@ s35 = stub("$B35_128", "$B35_128", "$B35_4K", "$B35_32K", "$B35_64K",
 s35["cb_ttft_s"] = float("${B35_CB_TTFT:-0}" or 0)
 s36 = stub("$B36_128", "$B36_128", "$B36_4K", "$B36_32K", ctx512="$B36_512", ctx16k="$B36_16K",
            pp128="$B36_128_PP", pp512="$B36_512_PP", pp4k="$B36_4K_PP", pp16k="$B36_16K_PP", pp32k="$B36_32K_PP")
+s36["cb_ttft_s"] = float("${B36_CB_TTFT:-0}" or 0)
 out = {"pass": True, "label": "BASELINE", "commit": commit, "mode": "bidir", "model": "bidir",
        "tps": s36["tps"], "top1": 1.0, "kl": 0.0, "primary_quant": quant,
        "score_qwen35": s35, "score_qwen36": s36, "pass_qwen35": True, "pass_qwen36": True,
        "label_qwen35": "BASELINE", "label_qwen36": "BASELINE",
-       "cb_ttft_s": float("${B35_CB_TTFT:-0}" or 0)}
+       "cb_ttft_s": float("${B35_CB_TTFT:-0}" or 0),
+       "cb_ttft_s_qwen36": float("${B36_CB_TTFT:-0}" or 0)}
 print("RESULT_JSON " + json.dumps(out))
 PY
   exit 0
@@ -458,6 +472,7 @@ PRIMARY36_JSON="$(run_model primary-qwen36 "$P36_FILE" "$P36_REPO" "$P36_TOK" 0 
   SPARKINFER_GUARD_4K_PP_BASELINE="${B36_4K_PP}" \
   SPARKINFER_GUARD_16K_PP_BASELINE="${B36_16K_PP}" \
   SPARKINFER_GUARD_32K_PP_BASELINE="${B36_32K_PP}" \
+  SPARKINFER_GUARD_CB_TTFT_BASELINE="${B36_CB_TTFT}" \
   SPARKINFER_LLAMA_128_BASELINE="${SPARKINFER_P36_LLAMA_128_BASELINE:-275.81}" \
   SPARKINFER_LLAMA_512_BASELINE="${SPARKINFER_P36_LLAMA_512_BASELINE:-275.61}" \
   SPARKINFER_LLAMA_4K_BASELINE="${SPARKINFER_P36_LLAMA_4K_BASELINE:-276.30}" \

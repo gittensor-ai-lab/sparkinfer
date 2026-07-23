@@ -94,8 +94,8 @@ build/runtime/qwen3_gguf_score model.gguf 20 <token-ids...>   # compare argmax +
 `evaluate.sh` grades one submission (build → correctness → 128/512/4k/16k/32k speed → `label.py`).
 Prefill `eval-prefill:{tier}` is sized by **TTFT reduction %** vs same-box main at the winning
 context (`TTFT ≈ ctx / pp_tps`; `SPARKINFER_LABEL_LOWER_IS_BETTER=1`), not raw pp %-over-frontier.
-For Qwen3.5, the headline is the **max tier** of single-seq TTFT and CB mixed-load `long_ttft_s`
-(`qwen3_gguf_cb_bench`: 4×decode + 8k interrupt). Dashboards still get `prefill_tps` as pp tok/s.
+For Qwen3.5 and Qwen3.6, the headline is the **max tier** of single-seq TTFT and CB mixed-load
+`long_ttft_s` (`qwen3_gguf_cb_bench`: 4×decode + 8k interrupt). Dashboards still get `prefill_tps` as pp tok/s.
 `evaluate_dual.sh` wraps it for **dual-model scoring**: it builds once, then scores **Qwen3.6-35B-A3B**
 (the primary target, 128/512/4k for now) and guards **Qwen3-30B-A3B** against regression (full sweep +
 accuracy) — any Qwen3 speed drop <98% of its main or broken llama.cpp parity REJECTs the submission.

@@ -160,7 +160,7 @@ print(json.dumps({"chosen": chosen, "contexts": contexts, "metric": "prefill"}, 
 PY
 }
 
-# Mixed-load continuous-batching TTFT (Qwen3.5 / Qwythos serving path).
+# Mixed-load continuous-batching TTFT (Qwen3.5 / Qwen3.6 serving path).
 # Fixed recipe matches PR #585 proof: concurrency=4 prompt=256 max_new=64 long_prefill=8192.
 # Echoes: "<long_ttft_s> <long_prefill_pp>"
 run_cb_ttft() {

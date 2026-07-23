@@ -69,9 +69,8 @@ else
   fi
 fi
 SI_BIN="$ROOT/build/runtime"; SI_LD=""
-# CB mixed-load TTFT bench for Qwen3.5 prefill scoring (skip if binary absent after warn).
-if [ "${SPARKINFER_EVAL_PREFILL:-0}" = "1" ] && [ "${SPARKINFER_PREFILL_PROFILE:-qwen35}" = "qwen35" ] \
-   && [ "${SPARKINFER_EVAL_PREFILL_CB:-1}" = "1" ]; then
+# CB mixed-load TTFT bench for Qwen3.5 / Qwen3.6 prefill scoring.
+if [ "${SPARKINFER_EVAL_PREFILL:-0}" = "1" ] && [ "${SPARKINFER_EVAL_PREFILL_CB:-1}" = "1" ]; then
   ensure_cb_bench "$ARCH" || echo ">> WARN: qwen3_gguf_cb_bench missing — CB TTFT scoring skipped" >&2
 fi
 
@@ -741,11 +740,11 @@ PY
   exit 0
 fi
 
-# Optional CB mixed-load TTFT (Qwen3.5 only): measure long_ttft_s vs same-box main baseline.
+# Optional CB mixed-load TTFT (Qwen3.5 + Qwen3.6): measure long_ttft_s vs same-box main baseline.
 CB_TTFT=0; CB_PP=0; CB_FRONTIER_TTFT="${SPARKINFER_GUARD_CB_TTFT_BASELINE:-0}"
-if [ "$PREFILL_PROFILE" = "qwen35" ] && [ "${SPARKINFER_EVAL_PREFILL_CB:-1}" = "1" ] \
+if [ "${SPARKINFER_EVAL_PREFILL_CB:-1}" = "1" ] \
    && [ -x "$SI_BIN/qwen3_gguf_cb_bench" ]; then
-  echo ">> CB mixed-load TTFT (4×decode + 8k interrupt) ..." >&2
+  echo ">> CB mixed-load TTFT (4×decode + 8k interrupt, profile=$PREFILL_PROFILE) ..." >&2
   CB_PAIR="$(run_cb_ttft "$GGUF" || true)"
   CB_TTFT="$(printf '%s\n' "$CB_PAIR" | awk '{print $1+0}')"
   CB_PP="$(printf '%s\n' "$CB_PAIR" | awk '{print $2+0}')"
