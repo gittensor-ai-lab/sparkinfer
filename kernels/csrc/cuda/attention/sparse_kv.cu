@@ -1,5 +1,6 @@
-// Sink + sliding-window sparse-KV for Qwythos GQA-4 hd256 full-attention decode.
-// [Paral1995] 2026-07-13. SPARKINFER_SPARSE_KV=0 disables; default ON for Qwythos GQA-4 hd256 int8-KV.
+// Sink + sliding-window sparse-KV for hd256 full-attention decode (GQA-4 and GQA-8).
+// [Paral1995] 2026-07-13. SPARKINFER_SPARSE_KV=0 disables; default ON for Qwythos GQA-4
+// and Qwen3.6 GQA-8 hd256 int8-KV (#559).
 //
 // Per full-attn layer after int8 KV append:
 //   (1) fa_kv_window_select — sink block 0 + last W logical blocks (StreamingLLM-style)
@@ -141,16 +142,24 @@ void launch_flash_decode_split_sparse(
     int n_splits, int n_sel, float scale,
     const void* k_scale_layer, const void* v_scale_layer, cudaStream_t stream
 ) {
-    if (head_dim != 256 || num_q_heads != num_kv_heads * 4) return;
+    if (head_dim != 256 || num_kv_heads <= 0) return;
+    const int gqa = num_q_heads / num_kv_heads;
+    if ((gqa != 4 && gqa != 8) || num_q_heads != num_kv_heads * gqa) return;
     dim3 grid(num_kv_heads * n_splits, 1);
-    fa_split_gqa_sparse<256, 4><<<grid, 4 * 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q),
-        reinterpret_cast<const signed char*>(k_pool_layer),
-        reinterpret_cast<const signed char*>(v_pool_layer),
-        block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
-        num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, n_sel,
-        reinterpret_cast<const __half*>(k_scale_layer),
-        reinterpret_cast<const __half*>(v_scale_layer));
+    const __nv_bfloat16* q_bf = reinterpret_cast<const __nv_bfloat16*>(q);
+    const signed char* k_i8 = reinterpret_cast<const signed char*>(k_pool_layer);
+    const signed char* v_i8 = reinterpret_cast<const signed char*>(v_pool_layer);
+    const __half* k_sc = reinterpret_cast<const __half*>(k_scale_layer);
+    const __half* v_sc = reinterpret_cast<const __half*>(v_scale_layer);
+    if (gqa == 4) {
+        fa_split_gqa_sparse<256, 4><<<grid, 4 * 32, 0, stream>>>(
+            q_bf, k_i8, v_i8, block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
+            num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, n_sel, k_sc, v_sc);
+    } else {
+        fa_split_gqa_sparse<256, 8><<<grid, 8 * 32, 0, stream>>>(
+            q_bf, k_i8, v_i8, block_table, seq_lens, sel_blk, part_m, part_l, part_acc, scale,
+            num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, n_sel, k_sc, v_sc);
+    }
 }
 #endif
 

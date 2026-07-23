@@ -279,11 +279,13 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->fa_m   = p_->alloc<float>(fa_n);
     p_->fa_l   = p_->alloc<float>(fa_n);
     p_->fa_acc = p_->alloc<float>(fa_n * cfg.head_dim);
-    // Sink + sliding-window sparse KV: default ON for Qwythos GQA-4 hd256 (int8 KV).
-    // SPARKINFER_SPARSE_KV=0 restores dense full-context flash-decode.
+    // Sink + sliding-window sparse KV: default ON for hd256 GQA-4 (Qwythos) and GQA-8
+    // (Qwen3.6) int8 KV. SPARKINFER_SPARSE_KV=0 restores dense full-context flash-decode.
     bool sparse_enable = true;
     if (const char* se = getenv("SPARKINFER_SPARSE_KV")) sparse_enable = (se[0] != '0');
-    if (sparse_enable && cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4) {
+    const bool sparse_gqa = cfg.n_kv_heads > 0 &&
+        (cfg.n_q_heads == cfg.n_kv_heads * 4 || cfg.n_q_heads == cfg.n_kv_heads * 8);
+    if (sparse_enable && cfg.head_dim == 256 && sparse_gqa) {
         p_->sparse_window = 256;
         if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
         // Legacy aliases from the Quest prototype (blocks, not tokens).
@@ -460,7 +462,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.graph_ready = false;
     }
     const bool sparse_avail = s.sparse_budget > 0 && s.kv->int8_kv() &&
-                              c.head_dim == 256 && c.n_q_heads == c.n_kv_heads * 4;
+                              c.head_dim == 256 && c.n_kv_heads > 0 &&
+                              (c.n_q_heads == c.n_kv_heads * 4 ||
+                               c.n_q_heads == c.n_kv_heads * 8);
     const bool sparse_on = sparse_avail && seqlen >= s.sparse_min_ctx;
     if (s.graph_ready && s.graph_sparse != sparse_on) {
         cu(cudaGraphExecDestroy(s.cu_exec), "sparse recapture destroy exec");
