@@ -32,6 +32,10 @@ public:
     struct Result {
         std::vector<int> tokens;
         std::string error;
+        // GPU-side timings (exclude SSE/on_token backpressure).
+        double ttft_ms = -1.0;
+        double generation_ms = -1.0;
+        double decode_tps = -1.0;
     };
 
     ContinuousBatchEngine(Qwen35Model* model, KVCacheManager* kv,

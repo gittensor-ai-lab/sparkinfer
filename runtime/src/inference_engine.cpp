@@ -43,6 +43,14 @@ struct ContinuousBatchEngine::Job {
     std::string error;
     std::function<void(int)> on_token;
     bool done = false;
+    std::chrono::steady_clock::time_point t_submit{};
+    std::chrono::steady_clock::time_point t_first{};
+    bool saw_first_tok = false;
+    double decode_gpu_ms = 0.0;
+    int decode_forwards = 0;
+    double ttft_ms = -1.0;
+    double generation_ms = -1.0;
+    double decode_tps = -1.0;
 };
 
 ContinuousBatchEngine::ContinuousBatchEngine(Qwen35Model* model, KVCacheManager* kv,
@@ -115,6 +123,7 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<void(
     job.seq_id = seq_id;
     job.on_token = on_token;
     job.prefill_pos = job.req.prefill_start;
+    job.t_submit = std::chrono::steady_clock::now();
     auto ptr = std::make_unique<Job>(std::move(job));
     const uint64_t rid = ptr->request_id;
     jobs_[rid] = std::move(ptr);
@@ -130,7 +139,12 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     });
     auto it = jobs_.find(request_id);
     if (it == jobs_.end()) return Result{{}, "request not found"};
-    Result out{it->second->output, it->second->error};
+    Result out;
+    out.tokens = it->second->output;
+    out.error = it->second->error;
+    out.ttft_ms = it->second->ttft_ms;
+    out.generation_ms = it->second->generation_ms;
+    out.decode_tps = it->second->decode_tps;
     jobs_.erase(it);
     return out;
 }
@@ -234,11 +248,26 @@ bool ContinuousBatchEngine::step_job(Job& job) {
         return true;
     }
 
+    // Timestamp before on_token so SSE/network backpressure never enters GPU metrics.
+    const auto t_emit = std::chrono::steady_clock::now();
+    if (!job.saw_first_tok) {
+        job.t_first = t_emit;
+        job.saw_first_tok = true;
+        job.ttft_ms = std::chrono::duration<double, std::milli>(job.t_first - job.t_submit).count();
+    }
     job.output.push_back(job.next_token);
     if (job.on_token) job.on_token(job.next_token);
     job.decode_emitted++;
 
     if (job.next_token == cfg.eos_id || job.decode_emitted >= job.req.max_new_tokens) {
+        const auto t_end = std::chrono::steady_clock::now();
+        job.generation_ms = std::chrono::duration<double, std::milli>(t_end - job.t_submit).count();
+        if (job.decode_forwards > 0 && job.decode_gpu_ms > 0.0) {
+            job.decode_tps = (double)job.decode_forwards * 1000.0 / job.decode_gpu_ms;
+        } else if (job.saw_first_tok && job.generation_ms > job.ttft_ms && job.decode_emitted > 0) {
+            const double decode_ms = std::max(job.generation_ms - job.ttft_ms, 1.0);
+            job.decode_tps = (double)job.decode_emitted * 1000.0 / decode_ms;
+        }
         job.done = true;
         if (job.seq_id != 0) model_->close_session(job.seq_id);
         else kv_->free(job.seq_id);
@@ -247,7 +276,11 @@ bool ContinuousBatchEngine::step_job(Job& job) {
     }
 
     const int prompt_len = (int)job.req.prompt.size();
+    const auto t0 = std::chrono::steady_clock::now();
     job.next_token = model_->forward_token(job.next_token, prompt_len + job.decode_emitted - 1, true);
+    job.decode_gpu_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    job.decode_forwards++;
     return false;
 }
 

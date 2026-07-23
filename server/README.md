@@ -45,7 +45,7 @@ export SPARKINFER_ROOT="$(pwd)"
 | `GET /v1/models` | OpenAI model list |
 | `GET /v1/info` | Model limits (`max_context`, `max_output_tokens`) |
 | `POST /v1/tokenize` | Token count for a chat request body |
-| `POST /v1/chat/completions` | Chat (JSON `messages`, optional `stream`, `enable_thinking`). Responses include OpenAI `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`). Streaming sends a final chunk with `choices:[]` + `usage` before `[DONE]`. |
+| `POST /v1/chat/completions` | Chat (JSON `messages`, optional `stream`, `enable_thinking`). Responses include OpenAI `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`) plus optional GPU timing fields (`ttft_ms`, `generation_ms`, `decode_tps`). Streaming sends a final chunk with `choices:[]` + `usage` before `[DONE]`. |
 
 ### RTX PRO 6000 deploy (32k / 4k)
 
