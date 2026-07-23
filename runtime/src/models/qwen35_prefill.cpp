@@ -169,14 +169,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const char* _pi8attn = getenv("SPARKINFER_PREFILL_I8_ATTN");
     bool use_i8_attn = long_bf16 && (!_pi8attn || _pi8attn[0] != '0');
     // Dense short-ctx: GDN recurrence amplifies per-row int8 activation error at the H3
-    // prefill_check size (Qwythos @512: top1 0.6875 < 0.80). Keep GDN on bf16 for N<=512 by
-    // default; FFN/full-attn stay on int8. Above 512, int8 GDN remains (CB @8k needs it).
+    // prefill_check size (Qwythos @512: top1 0.6875 < 0.80). Keep GDN on bf16 only for the
+    // exact H3 prefix (N==512). Short score prompts (200..360) stay on int8 GDN so vs-llama
+    // top1/KL clear the 0.90/0.20 bars; N>512 keeps int8 GDN for CB mid-ctx pp.
     // SPARKINFER_PREFILL_I8_GDN=1/0 forces on/off at every N (A/B).
     const char* _pi8gdn = getenv("SPARKINFER_PREFILL_I8_GDN");
     const bool use_i8_gdn = !moe && use_i8 && [&]{
         if (_pi8gdn && _pi8gdn[0] == '1') return true;
         if (_pi8gdn && _pi8gdn[0] == '0') return false;
-        return N > 512;
+        return N != 512;
     }();
     // GDN projections (wqkv/wqkv_gate/ssm_out) at long ctx: run them on the fp8 (e4m3) tensor cores
     // instead of bf16. int8 is off here because the near-1-decay recurrence amplifies per-row int8
