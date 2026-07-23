@@ -69,6 +69,11 @@ else
   fi
 fi
 SI_BIN="$ROOT/build/runtime"; SI_LD=""
+# CB mixed-load TTFT bench for Qwen3.5 prefill scoring (skip if binary absent after warn).
+if [ "${SPARKINFER_EVAL_PREFILL:-0}" = "1" ] && [ "${SPARKINFER_PREFILL_PROFILE:-qwen35}" = "qwen35" ] \
+   && [ "${SPARKINFER_EVAL_PREFILL_CB:-1}" = "1" ]; then
+  ensure_cb_bench "$ARCH" || echo ">> WARN: qwen3_gguf_cb_bench missing — CB TTFT scoring skipped" >&2
+fi
 
 # One-time setup: download model (~17 GB) and build llama.cpp if not already cached.
 # /workspace persists across vast stop/start; skipped on reuse.
@@ -735,11 +740,41 @@ PY
   echo "$DECODE_LINE"
   exit 0
 fi
+
+# Optional CB mixed-load TTFT (Qwen3.5 only): measure long_ttft_s vs same-box main baseline.
+CB_TTFT=0; CB_PP=0; CB_FRONTIER_TTFT="${SPARKINFER_GUARD_CB_TTFT_BASELINE:-0}"
+if [ "$PREFILL_PROFILE" = "qwen35" ] && [ "${SPARKINFER_EVAL_PREFILL_CB:-1}" = "1" ] \
+   && [ -x "$SI_BIN/qwen3_gguf_cb_bench" ]; then
+  echo ">> CB mixed-load TTFT (4×decode + 8k interrupt) ..." >&2
+  CB_PAIR="$(run_cb_ttft "$GGUF" || true)"
+  CB_TTFT="$(printf '%s\n' "$CB_PAIR" | awk '{print $1+0}')"
+  CB_PP="$(printf '%s\n' "$CB_PAIR" | awk '{print $2+0}')"
+  echo ">> CB TTFT: ${CB_TTFT}s (pp=${CB_PP}) vs main ${CB_FRONTIER_TTFT}s" >&2
+fi
+
 PREFILL_LINE="$(python3 - <<PY
 # Derive TTFT from selected prefill pp (TTFT ≈ ctx / pp_tps) and tier by TTFT reduction vs main.
-# llama-batched pp refs (~11k) are not comparable to sparkinfer sequential pp (~300) or
-# batched sparkinfer pp (~4k-6k) vs same-box main — tier on frontier when DIFF_REF<=0.
+# Also score measured CB mixed-load long_ttft_s when available; headline = max tier.
 import json, os, subprocess
+HERE = "${HERE}"
+TOP1, KL, COMMIT = "${TOP1}", "${KL}", "${COMMIT}"
+
+TIER_RANK = {"XL": 6, "L": 5, "M": 4, "S": 3, "XS": 2, "none": 1, "BASELINE": 0, "REJECT": -1}
+
+def tier_rank(label):
+    return TIER_RANK.get(label or "none", -1)
+
+def call_label(value, frontier, diff_ref=0.0):
+    env = os.environ.copy()
+    env["SPARKINFER_LABEL_LOWER_IS_BETTER"] = "1"
+    env["SPARKINFER_DIFFICULTY_REF"] = str(diff_ref)
+    env["SPARKINFER_DIFFICULTY_BOOST"] = os.environ.get("SPARKINFER_DIFFICULTY_BOOST", "1")
+    cmd = ["python3", f"{HERE}/label.py", str(value), str(frontier), "0", TOP1, KL, COMMIT, "{}"]
+    out = subprocess.check_output(cmd, env=env, text=True).strip()
+    assert out.startswith("RESULT_JSON "), out
+    return json.loads(out[len("RESULT_JSON "):])
+
+# --- single-seq path (pp → derived TTFT) ---
 tps = float("${PREFILL_SELECTED_TPS:-0}")
 llama_pp = float("${PREFILL_SELECTED_LLAMA_REF:-0}")
 frontier = float("${PREFILL_SELECTED_FRONTIER:-0}")
@@ -752,25 +787,47 @@ if not use_frontier and frontier > 0 and tps >= 1000:
 ttft = ctx / tps if tps > 0 and ctx > 0 else 0.0
 frontier_ttft = ctx / frontier if frontier > 0 and ctx > 0 else 0.0
 llama_ttft = 0.0 if use_frontier or llama_pp <= 0 or ctx <= 0 else ctx / llama_pp
-env = os.environ.copy()
-env["SPARKINFER_LABEL_LOWER_IS_BETTER"] = "1"
-env["SPARKINFER_DIFFICULTY_REF"] = str(llama_ttft)
-env["SPARKINFER_DIFFICULTY_BOOST"] = os.environ.get("SPARKINFER_DIFFICULTY_BOOST", "1")
-# ceiling unused for latency (pass 0)
-cmd = ["python3", "${HERE}/label.py", str(ttft), str(frontier_ttft), "0",
-       "${TOP1}", "${KL}", "${COMMIT}", "{}"]
-out = subprocess.check_output(cmd, env=env, text=True).strip()
-# Rewrite display fields: keep label/pct from TTFT path; expose pp tok/s for dashboards.
-if out.startswith("RESULT_JSON "):
-    pf = json.loads(out[len("RESULT_JSON "):])
-    pf["prefill_ttft_s"] = round(ttft, 6)
-    pf["prefill_frontier_ttft_s"] = round(frontier_ttft, 6)
-    pf["tps"] = round(tps, 2)
-    pf["frontier_tps"] = round(frontier, 2)
-    pf["delta_tps"] = round(tps - frontier, 2) if frontier > 0 else None
-    # pct_over_frontier / effective_pct / speed_label stay TTFT-reduction based
-    out = "RESULT_JSON " + json.dumps(pf)
-print(out)
+pf = call_label(ttft, frontier_ttft, llama_ttft)
+pf["prefill_ttft_s"] = round(ttft, 6)
+pf["prefill_frontier_ttft_s"] = round(frontier_ttft, 6)
+pf["tps"] = round(tps, 2)
+pf["frontier_tps"] = round(frontier, 2)
+pf["delta_tps"] = round(tps - frontier, 2) if frontier > 0 else None
+pf["prefill_score_source"] = "single"
+
+# --- CB mixed-load path (measured long_ttft_s) ---
+cb_ttft = float("${CB_TTFT:-0}")
+cb_pp = float("${CB_PP:-0}")
+cb_frontier = float("${CB_FRONTIER_TTFT:-0}")
+pf["cb_ttft_s"] = round(cb_ttft, 6) if cb_ttft > 0 else None
+pf["cb_frontier_ttft_s"] = round(cb_frontier, 6) if cb_frontier > 0 else None
+pf["cb_prefill_pp"] = round(cb_pp, 2) if cb_pp > 0 else None
+if cb_ttft > 0 and cb_frontier > 0:
+    cb = call_label(cb_ttft, cb_frontier, 0.0)
+    pf["cb_label"] = cb.get("speed_label") or cb.get("label")
+    pf["cb_pct_over_frontier"] = cb.get("pct_over_frontier")
+    # Prefer speed_label for tier comparison when correctness REJECT (same as single-seq).
+    single_tier = pf.get("speed_label") or pf.get("label")
+    cb_tier = cb.get("speed_label") or cb.get("label")
+    if tier_rank(cb_tier) > tier_rank(single_tier):
+        # Promote CB into headline prefill fields; keep single-seq pp for dashboards.
+        for k in ("label", "speed_label", "pct_over_frontier", "pct_of_llama",
+                  "effective_pct", "difficulty_mult", "note"):
+            if k in cb and cb[k] is not None:
+                pf[k] = cb[k]
+        pf["prefill_ttft_s"] = round(cb_ttft, 6)
+        pf["prefill_frontier_ttft_s"] = round(cb_frontier, 6)
+        # Display tok/s as CB long_prefill_pp when CB wins (serving path).
+        if cb_pp > 0:
+            pf["tps"] = round(cb_pp, 2)
+            main_pp = (8192.0 / cb_frontier) if cb_frontier > 0 else 0.0
+            pf["frontier_tps"] = round(main_pp, 2)
+            pf["delta_tps"] = round(cb_pp - main_pp, 2) if main_pp > 0 else None
+        pf["prefill_score_source"] = "cb"
+        pf["score_prefill_context"] = int(os.environ.get("SPARKINFER_CB_LONG_PREFILL", "8192"))
+        pf["best_prefill_context_label"] = "cb-mixed-8k"
+
+print("RESULT_JSON " + json.dumps(pf))
 PY
 )"
 DECODE_LINE="$DECODE_LINE" PREFILL_LINE="$PREFILL_LINE" python3 - <<'PY'
@@ -792,6 +849,11 @@ def copy_scoring_fields(dst, src):
         dst["prefill_ttft_s"] = src["prefill_ttft_s"]
     if src.get("prefill_frontier_ttft_s") is not None:
         dst["prefill_frontier_ttft_s"] = src["prefill_frontier_ttft_s"]
+    if src.get("prefill_score_source") is not None:
+        dst["prefill_score_source"] = src["prefill_score_source"]
+    for k in ("cb_ttft_s", "cb_frontier_ttft_s", "cb_prefill_pp", "cb_label", "cb_pct_over_frontier"):
+        if src.get(k) is not None:
+            dst[k] = src[k]
 
 decode_line = os.environ.get("DECODE_LINE", "").strip()
 prefill_raw = os.environ.get("PREFILL_LINE", "").strip()
@@ -816,6 +878,15 @@ if prefill_raw.startswith("RESULT_JSON "):
         res["prefill_frontier_ttft_s"] = pf["prefill_frontier_ttft_s"]
     if pf.get("difficulty_mult") is not None:
         res["prefill_difficulty_mult"] = pf["difficulty_mult"]
+    if pf.get("prefill_score_source") is not None:
+        res["prefill_score_source"] = pf["prefill_score_source"]
+    for k in ("cb_ttft_s", "cb_frontier_ttft_s", "cb_prefill_pp", "cb_label", "cb_pct_over_frontier"):
+        if pf.get(k) is not None:
+            res[k] = pf[k]
+    if pf.get("score_prefill_context") is not None:
+        res["score_prefill_context"] = pf["score_prefill_context"]
+    if pf.get("best_prefill_context_label") is not None:
+        res["best_prefill_context_label"] = pf["best_prefill_context_label"]
     # Never promote prefill over a correctness REJECT headline (pass=false stays merge-blocking).
     pf_pass_label = pf.get("label")
     if res.get("label") == "REJECT" or pf_pass_label == "REJECT":
