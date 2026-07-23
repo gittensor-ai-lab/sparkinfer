@@ -168,12 +168,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // unless SPARKINFER_PREFILL_I8_ATTN=0. GDN projections always stay bf16 above bf16_minctx.
     const char* _pi8attn = getenv("SPARKINFER_PREFILL_I8_ATTN");
     bool use_i8_attn = long_bf16 && (!_pi8attn || _pi8attn[0] != '0');
-    // Dense short-ctx: GDN recurrence amplifies per-row int8 activation error even at N=512
-    // on some dense hybrids (Qwythos H3: top1 0.6875 < 0.80). Keep GDN projections on bf16 by
-    // default; FFN/full-attn stay on the int8 tensor-core path. Opt back into GDN-int8 with
-    // SPARKINFER_PREFILL_I8_GDN=1 (A/B). Long-ctx already forces use_i8=false for GDN.
+    // Dense short-ctx: GDN recurrence amplifies per-row int8 activation error at the H3
+    // prefill_check size (Qwythos @512: top1 0.6875 < 0.80). Keep GDN on bf16 for N<=512 by
+    // default; FFN/full-attn stay on int8. Above 512, int8 GDN remains (CB @8k needs it).
+    // SPARKINFER_PREFILL_I8_GDN=1/0 forces on/off at every N (A/B).
     const char* _pi8gdn = getenv("SPARKINFER_PREFILL_I8_GDN");
-    const bool use_i8_gdn = !moe && use_i8 && _pi8gdn && _pi8gdn[0] == '1';
+    const bool use_i8_gdn = !moe && use_i8 && [&]{
+        if (_pi8gdn && _pi8gdn[0] == '1') return true;
+        if (_pi8gdn && _pi8gdn[0] == '0') return false;
+        return N > 512;
+    }();
     // GDN projections (wqkv/wqkv_gate/ssm_out) at long ctx: run them on the fp8 (e4m3) tensor cores
     // instead of bf16. int8 is off here because the near-1-decay recurrence amplifies per-row int8
     // activation-quant error (128k top1 ~0.31); e4m3's floating range holds it to bf16-like fidelity
