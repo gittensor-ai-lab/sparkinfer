@@ -813,11 +813,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                             w.up_qtype, ue0, Wu_i8, swu, ag.n_in * mffn, H, sa);
                         return;
                     }
-                    // Sparse: optional one-shot gather (SPARKINFER_PREFILL_MOE_GATHER=1).
-                    // Default OFF: gather still needs accuracy bake-off; coalesce+pair is the win.
+                    // Sparse: one-shot gather over live experts. Default ON — skips empty
+                    // expert weight rows in one launch (+3% pp @512 vs coalesce runs alone,
+                    // decode-flat, prefill_check matches). SPARKINFER_PREFILL_MOE_GATHER=0
+                    // reverts to contiguous-run coalesce.
                     static const int use_gather = [] {
                         const char* e = getenv("SPARKINFER_PREFILL_MOE_GATHER");
-                        return (e && e[0] == '1') ? 1 : 0;
+                        if (e) return e[0] != '0' ? 1 : 0;
+                        return 1;
                     }();
                     const int* d_live = d_live_le + ag.live_off;
                     const int* h_live = ag.live.data();
@@ -891,7 +894,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     const int* h_live = ag.live.data();
                     static const int use_gather_dn = [] {
                         const char* e = getenv("SPARKINFER_PREFILL_MOE_GATHER");
-                        return (e && e[0] == '1') ? 1 : 0;
+                        if (e) return e[0] != '0' ? 1 : 0;
+                        return 1;
                     }();
                     if (use_gather_dn && d_live_le &&
                         kernels::launch_gguf_dequant_rows_i8_gather(
