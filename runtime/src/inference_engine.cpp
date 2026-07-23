@@ -17,15 +17,19 @@ bool prefill_samples_lmhead() {
     return legacy != 0;
 }
 
+// Match Qwen35Model::batched_prefill_enabled: dense hybrid (Qwythos) OR MoE hybrid
+// (Qwen3.6). The old dense_ffn-only gate forced MoE CB onto the token loop (~300 pp),
+// which is why scored Qwen3.6 CB mixed TTFT sat at ~17s on main.
 bool batched_prefill_enabled(const Qwen35Config& cfg, bool gguf, int n_tokens) {
     static int want_batched = -1, batched_maxctx = -1;
     if (want_batched < 0) {
         const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
         want_batched = (e && e[0] == '0') ? 0 : 1;
         const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
-        batched_maxctx = mc ? atoi(mc) : 65536;
+        batched_maxctx = mc ? atoi(mc) : 131072;
     }
-    return want_batched && gguf && cfg.hybrid && cfg.dense_ffn && n_tokens > 0 &&
+    const bool ffn_ok = cfg.dense_ffn || cfg.n_experts > 0;
+    return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
            n_tokens <= batched_maxctx;
 }
 
