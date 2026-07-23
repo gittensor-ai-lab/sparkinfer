@@ -10,6 +10,7 @@
 #include "../../runtime/examples/qwen3_gguf_config.h"
 
 #include <cstdio>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <algorithm>
 
@@ -118,8 +119,12 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
 
     sparkinfer::SchedulePolicy policy = sparkinfer::SchedulePolicy::CONTINUOUS_BATCHING;
     if (const char* p = getenv("SPARKINFER_SCHED_POLICY")) {
-        if (p[0] == 'c' || p[0] == 'C') policy = sparkinfer::SchedulePolicy::CHUNKED_PREFILL;
+        // "chunked" / "chunked_prefill" → CHUNKED_PREFILL; "priority" → PRIORITY;
+        // "continuous" (default) → CONTINUOUS_BATCHING. Match full keywords so
+        // "continuous" is not misread as chunked (both start with 'c').
+        if (strncmp(p, "chunk", 5) == 0) policy = sparkinfer::SchedulePolicy::CHUNKED_PREFILL;
         else if (p[0] == 'p' || p[0] == 'P') policy = sparkinfer::SchedulePolicy::PRIORITY;
+        else policy = sparkinfer::SchedulePolicy::CONTINUOUS_BATCHING;
     }
     impl_->batch_engine = std::make_unique<sparkinfer::ContinuousBatchEngine>(
         impl_->model.get(), impl_->kv.get(), batch_tokens_per_step(), policy);
