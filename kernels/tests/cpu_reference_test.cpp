@@ -117,6 +117,137 @@ static double test_router(int E, int K) {
 }
 
 // ---------------------------------------------------------------------------
+// 2b/2c shared helpers. `ties` draws logits from a tiny value set so EQUAL
+//     logits are the common case rather than a rare accident — every selector
+//     below resolves ties by (value desc, index asc), and that rule is the part
+//     most easily broken by a rewrite.
+// ---------------------------------------------------------------------------
+static vector<float> router_logits(int E, int ties) {
+    vector<float> lg(E);
+    if (ties == 0)      for (auto& x : lg) x = frand();
+    else if (ties == 1) for (auto& x : lg) x = (float)(rng() % 3);   // many exact duplicates
+    else                for (auto& x : lg) x = 1.25f;                // all identical
+    return lg;
+}
+static vector<int> router_ref_topk(const vector<float>& lg, int K) {
+    vector<int> idx(lg.size()); for (size_t i = 0; i < idx.size(); i++) idx[i] = (int)i;
+    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
+        return lg[a] > lg[b] || (lg[a] == lg[b] && a < b); });
+    return vector<int>(idx.begin(), idx.begin() + K);
+}
+
+// ---------------------------------------------------------------------------
+// 2b. Router top-k, single-pass rank select (moe_router_kernel2) — the DEFAULT
+//     router: launch_moe_router takes this path unless SPARKINFER_ROUTER2=0, so
+//     it is what actually picks the experts for every token. test_router above
+//     models only the k-pass mask-argmax FALLBACK, leaving the live selector
+//     uncovered. Each thread counts how many experts outrank it and writes
+//     itself into slot == rank; correctness needs that map to be a bijection
+//     onto [0, top_k), otherwise a slot of s_sel_id[] is never written and the
+//     kernel emits an uninitialised expert id.
+// ---------------------------------------------------------------------------
+static double test_router_rank_select(int E, int K, int ties) {
+    const vector<float> lg = router_logits(E, ties);
+    const vector<int> ref_id = router_ref_topk(lg, K);
+
+    vector<int> sel(K, -1); vector<float> sl(K, 0.f); vector<int> written(K, 0);
+    for (int e = 0; e < E; e++) {
+        const float my = lg[e];
+        int rank = 0;
+        for (int f = 0; f < E; f++) { const float v = lg[f]; if (v > my || (v == my && f < e)) rank++; }
+        if (rank < K) { sel[rank] = e; sl[rank] = my; written[rank]++; }
+    }
+    for (int j = 0; j < K; j++)
+        if (written[j] != 1) return 1.0;      // slot unwritten or double-claimed
+
+    // Weights: softmax over the picks, exactly as the kernel computes them.
+    float mx = sl[0]; for (int j = 1; j < K; j++) mx = std::max(mx, sl[j]);
+    float den = 0.f;  for (int j = 0; j < K; j++) den += std::exp(sl[j] - mx);
+    double rmx = lg[ref_id[0]], rden = 0;
+    for (int j = 0; j < K; j++) rden += std::exp((double)lg[ref_id[j]] - rmx);
+
+    double err = 0;
+    for (int j = 0; j < K; j++) {
+        if (sel[j] != ref_id[j]) err = std::max(err, 1.0);
+        err = std::max(err, std::abs(std::exp(sl[j] - mx) / den
+                                     - std::exp((double)lg[ref_id[j]] - rmx) / rden));
+    }
+    return err;
+}
+
+// ---------------------------------------------------------------------------
+// 2c. Fused router bitonic top-8 (si_warp_bitonic_top8) — the decode fast path
+//     inside moe_router_fused_kernel, which folds the router GEMV and the top-k
+//     into one launch and claims selection "byte-identical" to the standalone
+//     kernels. It is a hand-written network (per-lane bitonic sort of 8, then a
+//     5-step shfl_down merge of sorted-8 lists), so nothing else validates it.
+//     Modelled here across all 32 lanes; lane 0 holds the final top-8.
+// ---------------------------------------------------------------------------
+#define CEXG(av, ai, bv, bi) do {                                        \
+    bool _ge = ((av) > (bv)) || ((av) == (bv) && (ai) < (bi));           \
+    if (!_ge) { float _t = (av); (av) = (bv); (bv) = _t;                 \
+                int _u = (ai); (ai) = (bi); (bi) = _u; }                 \
+  } while (0)
+static double test_router_bitonic_top8(int K, int ties) {
+    const int E = 256;                       // kernel requires num_experts == 256
+    const vector<float> lg = router_logits(E, ties);
+    const vector<int> ref_id = router_ref_topk(lg, K);
+
+    static float r[32][8]; static int ri[32][8];
+    for (int lane = 0; lane < 32; lane++)
+        for (int i = 0; i < 8; i++) { r[lane][i] = lg[lane + 32 * i]; ri[lane][i] = lane + 32 * i; }
+    for (int lane = 0; lane < 32; lane++)                    // per-lane bitonic sort -> descending
+        for (int k = 2; k <= 8; k <<= 1)
+            for (int j = k >> 1; j > 0; j >>= 1)
+                for (int i = 0; i < 8; i++) {
+                    const int l = i ^ j;
+                    if (l > i) {
+                        if ((i & k) == 0) CEXG(r[lane][i], ri[lane][i], r[lane][l], ri[lane][l]);
+                        else              CEXG(r[lane][l], ri[lane][l], r[lane][i], ri[lane][i]);
+                    }
+                }
+    for (int off = 16; off > 0; off >>= 1) {                 // reduction tree of sorted-8 merges
+        static float nr[32][8]; static int nri[32][8];
+        for (int lane = 0; lane < 32; lane++) {
+            float pr[8]; int pri[8];
+            for (int m = 0; m < 8; m++) {                    // __shfl_down_sync: OOB lane keeps own value
+                const int src = lane + off;
+                pr[m]  = (src < 32) ? r[src][m]  : r[lane][m];
+                pri[m] = (src < 32) ? ri[src][m] : ri[lane][m];
+            }
+            float cv[16]; int cci[16];
+            for (int m = 0; m < 8; m++) {
+                cv[m] = r[lane][m];      cci[m] = ri[lane][m];
+                cv[8 + m] = pr[7 - m];   cci[8 + m] = pri[7 - m];
+            }
+            for (int i = 0; i < 8; i++) CEXG(cv[i], cci[i], cv[i + 8], cci[i + 8]);
+            for (int stride = 4; stride > 0; stride >>= 1)
+                for (int i = 0; i < 8; i++) {
+                    const int l = i ^ stride;
+                    if (l > i && l < 8) CEXG(cv[i], cci[i], cv[l], cci[l]);
+                }
+            for (int m = 0; m < 8; m++) { nr[lane][m] = cv[m]; nri[lane][m] = cci[m]; }
+        }
+        for (int lane = 0; lane < 32; lane++)
+            for (int m = 0; m < 8; m++) { r[lane][m] = nr[lane][m]; ri[lane][m] = nri[lane][m]; }
+    }
+
+    float mx = r[0][0], den = 0.f;                            // lane 0 owns the result, sorted desc
+    for (int j = 0; j < K; j++) den += std::exp(r[0][j] - mx);
+    double rmx = lg[ref_id[0]], rden = 0;
+    for (int j = 0; j < K; j++) rden += std::exp((double)lg[ref_id[j]] - rmx);
+
+    double err = 0;
+    for (int j = 0; j < K; j++) {
+        if (ri[0][j] != ref_id[j]) err = std::max(err, 1.0);
+        err = std::max(err, std::abs(std::exp(r[0][j] - mx) / den
+                                     - std::exp((double)lg[ref_id[j]] - rmx) / rden));
+    }
+    return err;
+}
+#undef CEXG
+
+// ---------------------------------------------------------------------------
 // 3. SwiGLU expert FFN: kernel math (float) vs double ground truth.
 // ---------------------------------------------------------------------------
 static double test_swiglu(int H, int F) {
@@ -305,6 +436,12 @@ int main() {
     check("attention hd512 kv777", test_attention(512, 777),  2e-4);
     check("router E256 k8",        test_router(256, 8),       1e-6);
     check("router E128 k8",        test_router(128, 8),       1e-6);
+    check("router rank-select E256",  test_router_rank_select(256, 8, 0), 1e-6);
+    check("router rank-select ties",  test_router_rank_select(256, 8, 1), 1e-6);
+    check("router rank-select equal", test_router_rank_select(256, 8, 2), 1e-6);
+    check("router bitonic8 E256",     test_router_bitonic_top8(8, 0),     1e-6);
+    check("router bitonic8 ties",     test_router_bitonic_top8(8, 1),     1e-6);
+    check("router bitonic8 equal",    test_router_bitonic_top8(8, 2),     1e-6);
     check("swiglu H2048 F512",     test_swiglu(2048, 512),    1e-3);
     check("swiglu H512 F1536",     test_swiglu(512, 1536),    1e-3);
     check("gemm 64x96x128",        test_gemm(64, 96, 128),    1e-3);
