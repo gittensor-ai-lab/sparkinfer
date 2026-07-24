@@ -156,6 +156,11 @@ void launch_fa_combine_hd256(const float* part_m, const float* part_l, const flo
 // Sink + sliding-window sparse-KV (Qwythos GQA-4 hd256). Default on; SPARKINFER_SPARSE_KV=0 disables.
 void launch_fa_kv_window_select(const int* seq_lens, int* sel_blk, int num_kv_heads,
     int block_size, int n_sel, int window_w, cudaStream_t stream = nullptr);
+// Sink + sliding-window as a compacted paged-KV view (GQA-8 hd256, issue #559): writes a
+// compact block table (sink + last W logical blocks) and its view seq_len so the dense
+// flash-decode kernels run unmodified over O(window) KV. Graph-capturable (device in/out).
+void launch_fa_kv_compact_view(const int* seq_lens, const int* block_table, int* view_table,
+    int* view_len, int block_size, int window_w, int n_view, cudaStream_t stream = nullptr);
 void launch_flash_decode_split_sparse(const void* q, const void* k_pool_layer, const void* v_pool_layer,
     const int* block_table, const int* seq_lens, const int* sel_blk, float* part_m, float* part_l,
     float* part_acc, int num_q_heads, int num_kv_heads, int head_dim, int block_size, int max_blocks,

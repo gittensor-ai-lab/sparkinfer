@@ -172,6 +172,11 @@ struct Qwen35Model::Impl {
     int    sparse_window = 256;    // recent window in KV blocks (16 tokens/block)
     int    sparse_min_ctx = 8192;
     bool   graph_sparse = false;
+    // GQA-8 (Qwen3.6 full-attn) sparse rides the dense int8-MMA kernel over a compacted
+    // paged-KV view instead of a dedicated sparse walker (issue #559). Decode steps only.
+    int*   sparse_vtbl = nullptr;  // compact view block table [sparse_budget]
+    int*   sparse_vlen = nullptr;  // compact view seq_len (device scalar)
+    int    sparse_vsplits = 128;   // KV splits over the view (sized so MMA chunks >= 2 blocks)
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
     signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
     bool use_pq = true;   // SPARKINFER_PQ=0 disables the pre-quantized GEMV path
@@ -304,7 +309,13 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // SPARKINFER_SPARSE_KV=0 restores dense full-context flash-decode.
     bool sparse_enable = true;
     if (const char* se = getenv("SPARKINFER_SPARSE_KV")) sparse_enable = (se[0] != '0');
-    if (sparse_enable && cfg.head_dim == 256 && cfg.n_q_heads == cfg.n_kv_heads * 4) {
+    const bool sparse_gqa4 = cfg.head_dim == 256 && cfg.n_kv_heads > 0 &&
+                             cfg.n_q_heads == cfg.n_kv_heads * 4;
+    // GQA-8 hd256 (Qwen3.6 full-attn layers), issue #559: same sink+window policy, but
+    // realized as a compacted paged-KV view fed to the unmodified dense int8-MMA kernel.
+    const bool sparse_gqa8 = cfg.head_dim == 256 && cfg.n_kv_heads > 0 &&
+                             cfg.n_q_heads == cfg.n_kv_heads * 8;
+    if (sparse_enable && (sparse_gqa4 || sparse_gqa8)) {
         p_->sparse_window = 256;
         if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
         // Legacy aliases from the Quest prototype (blocks, not tokens).
@@ -312,11 +323,29 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         if (const char* b = getenv("SPARKINFER_SPARSE_BUDGET")) {
             int v = atoi(b); if (v > 1) p_->sparse_window = v - 1;   // budget included sink
         }
+        // GQA-8: the dense hd256 path is already int8 tensor-core, so the O(window) read
+        // only clears the dense cost decisively from ~16k context up (bot-measured on this
+        // shape: sparse under 16k is a wash-to-regression, 16k/32k are wins). Engaging at
+        // 16384 also keeps every mid-length scoring probe on the exact dense path.
+        if (sparse_gqa8) p_->sparse_min_ctx = 16384;
         if (const char* mc = getenv("SPARKINFER_SPARSE_MIN_CTX")) { int v = atoi(mc); if (v > 0) p_->sparse_min_ctx = v; }
         p_->sparse_budget = 1 + p_->sparse_window;
-        p_->sparse_sel = p_->alloc<int>((size_t)cfg.n_kv_heads * p_->sparse_budget);
-        fprintf(stderr, "[sparse-kv] sliding-window (default on): window=%d blocks (%d tokens) min_ctx=%d\n",
-                p_->sparse_window, p_->sparse_window * kv->block_size(), p_->sparse_min_ctx);
+        if (sparse_gqa8) {
+            p_->sparse_vtbl = p_->alloc<int>(p_->sparse_budget);
+            p_->sparse_vlen = p_->alloc<int>(1);
+            // Split the compact view so each MMA split still covers >= 2 KV blocks (the
+            // dense launcher's tensor-core engagement condition), capped at MAX_NSPLITS.
+            // window=256 -> 4112-token view -> 128 splits (x8 kv heads = 1024 CTAs).
+            int vs = (p_->sparse_budget * kv->block_size()) / 32;
+            if (vs > Impl::MAX_NSPLITS) vs = Impl::MAX_NSPLITS;
+            if (vs < 1) vs = 1;
+            p_->sparse_vsplits = vs;
+        } else {
+            p_->sparse_sel = p_->alloc<int>((size_t)cfg.n_kv_heads * p_->sparse_budget);
+        }
+        fprintf(stderr, "[sparse-kv] sliding-window (default on): gqa=%d window=%d blocks (%d tokens) min_ctx=%d%s\n",
+                sparse_gqa8 ? 8 : 4, p_->sparse_window, p_->sparse_window * kv->block_size(),
+                p_->sparse_min_ctx, sparse_gqa8 ? " (compact-view, decode-only)" : "");
     }
     const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
     p_->aq8   = p_->alloc<signed char>(kmax);
@@ -366,6 +395,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->moe_rs_gate); cudaFree(p_->moe_rs_up); cudaFree(p_->moe_rs_down);
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->sparse_sel);
+    cudaFree(p_->sparse_vtbl); cudaFree(p_->sparse_vlen);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
     // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
@@ -502,7 +532,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     }
     const bool sparse_avail = s.sparse_budget > 0 && s.kv->int8_kv() &&
                               c.head_dim == 256 && c.n_q_heads == c.n_kv_heads * 4;
-    const bool sparse_on = sparse_avail && seqlen >= s.sparse_min_ctx;
+    // GQA-8 compact-view sparse is decode-only (`sample`): prefill and teacher-forced
+    // scoring always run the exact dense path, and the windowed view is never baked into
+    // the prefill graph.
+    const bool sparse_view_avail = s.sparse_vtbl != nullptr && sample && s.kv->int8_kv() &&
+                                   c.head_dim == 256 && c.n_q_heads == c.n_kv_heads * 8;
+    const bool sparse_on = (sparse_avail || sparse_view_avail) && seqlen >= s.sparse_min_ctx;
     if (s.graph_ready && s.graph_sparse != sparse_on) {
         cu(cudaGraphExecDestroy(s.cu_exec), "sparse recapture destroy exec");
         cu(cudaGraphDestroy(s.cu_graph), "sparse recapture destroy graph");
@@ -553,6 +588,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
 
     int* btable = s.kv->block_table(s.active_seq_id);
+    // GQA-8 sparse: materialize the sink+window compact view once per decode step (the
+    // logical->physical block map and seq_len are shared by all full-attn layers; the
+    // per-layer K/V pool rows for this token are appended before each layer's attention
+    // as usual). Inside the capture so replays track the growing sequence.
+    if (sparse_on && s.sparse_vtbl)
+        kernels::launch_fa_kv_compact_view(s.d_seqlen, btable, s.sparse_vtbl, s.sparse_vlen,
+                                           s.kv->block_size(), s.sparse_window, s.sparse_budget, st);
     // Prime: xn = RMSNorm(x, layer0.input_norm). Each layer's tail then fuses the
     // post-MoE residual with the NEXT layer's input norm (or final_norm), so the
     // per-layer input RMSNorm + two residual-adds collapse into two fused kernels.
@@ -842,7 +884,24 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                                       && (H == 2048 || H == 4096)
                                       && (w.wo_type == 12 || w.wo_type == 8) && (s.qdim % 32 == 0);
             const bool emit_attn_q8 = !w.q_has_gate && s.use_attnin && s.gguf && s.use_pq && s.use_llama && w.wo_type == 12;
-            if (sparse_on) {
+            if (sparse_on && s.sparse_vtbl) {
+                // GQA-8 (Qwen3.6): the same dense flash-decode entry point, pointed at the
+                // per-step compact view — sink + last-window blocks, view seq_len carrying
+                // the partial tail. The tuned int8-MMA kernel and fused combine run
+                // unmodified; only the KV footprint changes (O(window) vs O(context)).
+                // Host-side hints are view-sized constants, so the captured graph is stable:
+                // max_blocks/seqlen describe the view, and sparse_vsplits keeps every MMA
+                // split at >= 2 KV blocks while filling the 5090 (8 kv heads x 128 splits).
+                kernels::launch_flash_decode_split(s.q, kpool, vpool, s.sparse_vtbl, s.sparse_vlen,
+                                                   s.attn, s.fa_m, s.fa_l, s.fa_acc, 1,
+                                                   c.n_q_heads, c.n_kv_heads, c.head_dim,
+                                                   s.kv->block_size(), s.sparse_budget, s.sparse_vsplits,
+                                                   1.f / sqrtf((float)c.head_dim), st,
+                                                   (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr,
+                                                   s.sparse_budget * s.kv->block_size(),
+                                                   kscale, vscale, kv8 ? 1 : 0,
+                                                   attn_gate_q8 ? s.qgate : nullptr);
+            } else if (sparse_on) {
                 kernels::launch_fa_kv_window_select(s.d_seqlen, s.sparse_sel, c.n_kv_heads,
                     s.kv->block_size(), s.sparse_budget, s.sparse_window, st);
                 kernels::launch_flash_decode_split_sparse(s.q, kpool, vpool, btable, s.d_seqlen,

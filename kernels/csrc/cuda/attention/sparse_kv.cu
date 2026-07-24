@@ -41,6 +41,48 @@ __global__ void fa_kv_window_select(
     for (int i = count; i < n_sel; i++) sel[i] = -1;
 }
 
+// (1b) Compacted paged-KV view for GQA-8 hd256 (Qwen3.6 full-attn) decode, issue #559.
+//
+// Instead of walking a selected-block list with a dedicated sparse kernel (the GQA-4 path
+// above), the sink + sliding window is materialized as a *compact block table*: entry 0 is
+// the sink block, entries 1..W are the last W logical blocks, and the view's seq_len is
+// 1 sink block + the window tokens. The tuned dense flash-decode kernels then run over the
+// compact view completely unmodified — they are position-agnostic (scores depend only on
+// block_table lookups and the seq_lens bound; softmax order does not matter), so the sparse
+// path inherits the dense int8-MMA kernel's math, partial-tail masking, and occupancy
+// behavior instead of reimplementing them. The table is logical-block ids only (256 ints
+// per decode step, shared by every kv head and all full-attn layers), built once per step
+// before the layer loop; K/V pool rows are appended per layer afterwards as usual.
+//
+// Reads seq_lens from a DEVICE pointer and writes the view seq_len to a DEVICE pointer, so
+// the launch is CUDA-graph-capturable and the view tracks the sequence across replays.
+__global__ void fa_kv_compact_view(
+    const int* __restrict__ seq_lens, const int* __restrict__ block_table,
+    int* __restrict__ view_table, int* __restrict__ view_len,
+    int block_size, int window_w, int n_view
+) {
+    const int sl = seq_lens[0];
+    const int n_blk = (sl + block_size - 1) / block_size;
+    if (window_w >= n_blk - 1) {
+        // Window already covers the whole sequence: the view is the identity prefix.
+        // (Engagement is gated well above this on the host; kept total for safety.)
+        for (int b = threadIdx.x; b < n_blk && b < n_view; b += blockDim.x)
+            view_table[b] = block_table[b];
+        if (threadIdx.x == 0) *view_len = (n_blk <= n_view) ? sl : n_view * block_size;
+        return;
+    }
+    const int recent_start = n_blk - window_w;   // first window block (>= 2 here)
+    if (threadIdx.x == 0) {
+        view_table[0] = block_table[0];          // attention sink
+        // Sink block is full (recent_start >= 2 implies sl > 2*block_size); the window's
+        // tail block may be partial — the view length carries that partial fill through,
+        // so the dense kernel's `token < seq_len` masking applies unchanged.
+        *view_len = block_size + (sl - recent_start * block_size);
+    }
+    for (int i = threadIdx.x; i < window_w; i += blockDim.x)
+        view_table[1 + i] = block_table[recent_start + i];
+}
+
 // (2) Sparse flash split. Walks n_sel selected blocks instead of a contiguous chunk.
 template <int HEAD_DIM, int GQA>
 __global__ void fa_split_gqa_sparse(
@@ -131,6 +173,14 @@ void launch_fa_kv_window_select(
 ) {
     fa_kv_window_select<<<num_kv_heads, 32, 0, stream>>>(
         seq_lens, sel_blk, num_kv_heads, block_size, n_sel, window_w);
+}
+
+void launch_fa_kv_compact_view(
+    const int* seq_lens, const int* block_table, int* view_table, int* view_len,
+    int block_size, int window_w, int n_view, cudaStream_t stream
+) {
+    fa_kv_compact_view<<<1, 256, 0, stream>>>(
+        seq_lens, block_table, view_table, view_len, block_size, window_w, n_view);
 }
 
 void launch_flash_decode_split_sparse(
