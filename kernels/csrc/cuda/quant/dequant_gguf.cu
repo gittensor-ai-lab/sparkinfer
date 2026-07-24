@@ -224,6 +224,58 @@ __global__ void deq_rows_i8_twopass_kernel(const unsigned char* __restrict__ src
     }
 }
 
+// Masked single-pass Q->int8 for the MoE device-tilemap (MOE_GPU) path. Correct for ANY cols
+// (the vectorized fast-mask kernel declines cols not a multiple of 1024 — e.g. the down proj
+// cols=mffn=512 — and its false return was ignored, so down weights silently stayed stale;
+// #586 corruption). grid = n_in*rows_per_expert; one block per (local expert, row); dead
+// experts (counts[e_base+le]<=0) exit. Same dequant/amax/round as deq_rows_i8_kernel.
+template <int QT>
+__global__ void deq_rows_i8_mask_slow_kernel(
+        const unsigned char* __restrict__ src0, signed char* __restrict__ q0, float* __restrict__ scale0,
+        const int* __restrict__ counts, int e_base, int n_in, int rows_per_expert, int cols,
+        size_t expert_bytes) {
+    constexpr int BS = (QT == 12) ? 144 : (QT == 13) ? 176 : 210;
+    const int flat = blockIdx.x;
+    const int le = flat / rows_per_expert;
+    const int row_in = flat - le * rows_per_expert;
+    if (le >= n_in || counts[e_base + le] <= 0) return;
+    const int t = threadIdx.x;
+    const int nsb = cols >> 8;
+    const size_t row_bytes = (size_t)nsb * (size_t)BS;
+    const unsigned char* rbase = src0 + (size_t)le * expert_bytes + (size_t)row_in * row_bytes;
+    float* srow = scale0 + (size_t)le * (size_t)rows_per_expert + (size_t)row_in;
+    signed char* qrow = q0 + ((size_t)le * (size_t)rows_per_expert + (size_t)row_in) * (size_t)cols;
+
+    // Single-pass: keep the decoded row in registers (nsb <= 8 for MoE cols <= 2048) so Q5_K is
+    // decoded once, matching the host path's deq_rows_i8_kernel. cols=512 (down) => nsb=2.
+    float vals[kDeqRowsI8MaxNsb];
+    float amax = 0.f;
+    for (int sb = 0; sb < nsb; sb++) {
+        const unsigned char* blk = rbase + (size_t)sb * BS;
+        const float v = (QT == 12) ? deq_q4k_val(blk, t)
+                      : (QT == 13) ? deq_q5k_val(blk, t) : deq_q6k_val(blk, t);
+        vals[sb] = v;
+        amax = fmaxf(amax, fabsf(v));
+    }
+    __shared__ float swarp[8];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((t & 31) == 0) swarp[t >> 5] = amax;
+    __syncthreads();
+    if (t < 32) {
+        float v = (t < 8) ? swarp[t] : 0.f;
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (t == 0) swarp[0] = v;
+    }
+    __syncthreads();
+    const float d = swarp[0] / 127.f;
+    if (t == 0) *srow = d;
+    const float inv = (d > 0.f) ? (1.f / d) : 0.f;
+    for (int sb = 0; sb < nsb; sb++)
+        qrow[sb * 256 + t] = (signed char)(int)roundf(vals[sb] * inv);
+}
+
 __global__ void deq_q8_0_kernel(const unsigned char* __restrict__ src, __nv_bfloat16* __restrict__ y, long nblocks) {
     long b = (long)blockIdx.x * blockDim.x + threadIdx.x; if (b >= nblocks) return;
     const unsigned char* blk = src + b * 34; float d = gg_h2f(blk);
@@ -352,9 +404,25 @@ bool launch_gguf_dequant_rows_i8_mask(
     int ggml_type, const void* src0, signed char* q0, float* scale0,
     const int* counts, int e_base, int n_in, int rows_per_expert, int cols,
     size_t expert_bytes, cudaStream_t stream) {
-    return launch_gguf_dequant_rows_i8_fast_mask(
-        ggml_type, src0, q0, scale0, counts, e_base, n_in, rows_per_expert, cols, expert_bytes,
-        stream);
+    if (launch_gguf_dequant_rows_i8_fast_mask(
+            ggml_type, src0, q0, scale0, counts, e_base, n_in, rows_per_expert, cols, expert_bytes,
+            stream))
+        return true;
+    // Fast path declined (e.g. down proj cols=512 not a multiple of 1024). Fall back to the
+    // correct masked slow kernel instead of silently no-opping (the #586 stale-weight bug).
+    if ((ggml_type != GGML_Q4_K && ggml_type != GGML_Q5_K && ggml_type != GGML_Q6_K) ||
+        n_in <= 0 || rows_per_expert <= 0 || (cols & 255) != 0 ||
+        (cols >> 8) > kDeqRowsI8MaxNsb)   // nsb must fit the register array
+        return false;
+    auto s = reinterpret_cast<const unsigned char*>(src0);
+    const int grid = n_in * rows_per_expert;
+    if (ggml_type == GGML_Q4_K)
+        deq_rows_i8_mask_slow_kernel<12><<<grid, 256, 0, stream>>>(s, q0, scale0, counts, e_base, n_in, rows_per_expert, cols, expert_bytes);
+    else if (ggml_type == GGML_Q5_K)
+        deq_rows_i8_mask_slow_kernel<13><<<grid, 256, 0, stream>>>(s, q0, scale0, counts, e_base, n_in, rows_per_expert, cols, expert_bytes);
+    else
+        deq_rows_i8_mask_slow_kernel<14><<<grid, 256, 0, stream>>>(s, q0, scale0, counts, e_base, n_in, rows_per_expert, cols, expert_bytes);
+    return true;
 }
 
 bool launch_gguf_dequant_rows_i8_mask_pair(
