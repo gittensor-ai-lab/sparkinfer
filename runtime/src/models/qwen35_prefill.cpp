@@ -139,11 +139,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // ON at every batched context; SPARKINFER_PREFILL_I8=0 disables (A/B). The int8 scratch lives in
     // its own arena so an alloc failure at huge N degrades to the bf16 GEMMs, not to the token loop.
     const char* _pi8 = getenv("SPARKINFER_PREFILL_I8");
-    // Dense: int8 projections default ON. MoE: default OFF — the discrete top-k router amplifies the
-    // per-token int8 projection error into different expert selections, which diverges from the
-    // token-by-token path far more than in the dense FFN; bf16 projections keep the batched MoE
-    // prefill faithful to the decode path. SPARKINFER_PREFILL_I8 overrides either way.
-    bool use_i8 = _pi8 ? (_pi8[0] != '0') : !moe;
+    // int8 tensor-core projections default ON for dense AND the Qwen3.6-256E MoE hybrid. The MoE
+    // path was historically bf16-only out of caution: the top-k router can turn per-token int8
+    // projection error into different expert picks. Measured on Qwen3.6-35B-A3B UD-Q4_K_M this stays
+    // within the prefill fidelity veto — batched-vs-token-loop TOP1 0.875 @512 / 0.94 @4k (bar 0.80),
+    // KL ~0.016 — while the scored accuracy is untouched (qwen3_gguf_score teacher-forces via the bf16
+    // decode forward_token path, which SPARKINFER_PREFILL_I8 never reaches). Net +11.6% pp @512,
+    // +18% @4k. Scoped to Qwen3.6 by the n_experts==256 batched-MoE guard above (Qwen3-30B is 128E and
+    // never enters this path). SPARKINFER_PREFILL_I8=0 restores the bf16 MoE projections (A/B).
+    bool use_i8 = _pi8 ? (_pi8[0] != '0') : true;
     // MoE: optional int8 for shared-expert GEMMs only (attn/GDN/router stay bf16 — those feed
     // the top-k router). Distinct from full PREFILL_I8=1, #555 bf16 weight cache, and #566
     // live-expert coalesce/pair dequant. Env SPARKINFER_PREFILL_MOE_SHARED_I8=0 disables (A/B).
@@ -162,6 +166,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     static int bf16_minctx = []{ const char* e = getenv("SPARKINFER_PREFILL_BF16_MINCTX"); return e ? atoi(e) : 98304; }();
     const bool long_bf16 = !moe && N > bf16_minctx;
     if (long_bf16) use_i8 = false;
+    // MoE: the GDN recurrence amplifies per-row int8 activation error over long sequences (the same
+    // drift that gates the dense path above). Keep MoE projections bf16 past bf16_minctx; all eval
+    // contexts (<=32k) stay on the int8 fast path.
+    if (moe && N > bf16_minctx) use_i8 = false;
     const char* _pi8ffn = getenv("SPARKINFER_PREFILL_I8_FFN");
     bool use_i8_ffn = long_bf16 && (!_pi8ffn || _pi8ffn[0] != '0');
     // Full-attn Q/K/V/O are also per-token (no GDN recurrence). Keep them on int8 at long ctx
