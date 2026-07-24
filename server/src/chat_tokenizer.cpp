@@ -229,15 +229,21 @@ bool parse_chat_messages(const std::string& request_json, std::vector<ChatMessag
                     // Multimodal: concatenate text parts only (images skipped for now).
                     size_t j = c;
                     while (j < obj.size()) {
-                        size_t text_key = obj.find("\"text\"", j);
-                        if (text_key == std::string::npos || text_key >= obj.size()) break;
-                        size_t dummy = 0;
+                        const size_t text_key = obj.find("\"text\"", j);
+                        if (text_key == std::string::npos) break;
+                        // Always past the match we just found, so the scan cannot rewind.
+                        j = text_key + 6;
+                        // Only a "text" KEY carries a part's payload; the "text" in
+                        // {"type":"text",...} is a value and must not be read as one.
+                        size_t v = j;
+                        while (v < obj.size() && (obj[v] == ':' || obj[v] == ' ')) v++;
+                        if (v == j || v >= obj.size() || obj[v] != '"') continue;
+                        size_t part_end = 0;
                         std::string piece;
-                        if (extract_json_string(obj, text_key + 6, dummy, piece)) {
-                            if (!msg.content.empty()) msg.content.push_back(' ');
-                            msg.content += piece;
-                        }
-                        j = dummy;
+                        if (!extract_json_string(obj, v, part_end, piece)) break;
+                        if (!msg.content.empty()) msg.content.push_back(' ');
+                        msg.content += piece;
+                        j = part_end;
                     }
                 }
             }
