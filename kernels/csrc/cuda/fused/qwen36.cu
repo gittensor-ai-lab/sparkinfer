@@ -208,19 +208,22 @@ __global__ void gdn_ar_kernel(const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* qhptr = q + (size_t)qh * head_dim;
     const __nv_bfloat16* khptr = k + (size_t)qh * head_dim;
     const __nv_bfloat16* vhptr = v + (size_t)vh * head_dim;
-    float* sptr = state + (size_t)vh * head_dim * head_dim;
+    // Transposed state layout [vh][col][row] -- the ONE layout every GDN producer and consumer
+    // uses (both batched-prefill scans write it, gdn_ar_fast_kernel reads it). S[i][j] is at
+    // state[(vh*head_dim + j)*head_dim + i]; this thread owns column j, so its rows are contiguous.
+    float* col = state + ((size_t)vh * head_dim + j) * head_dim;
 
     float sk = 0.f;
     for (int i = 0; i < head_dim; i++) {
-        float s = sptr[(size_t)i * head_dim + j] * g;
-        sptr[(size_t)i * head_dim + j] = s;
+        float s = col[i] * g;
+        col[i] = s;
         sk += s * q36_to_f(khptr[i]);
     }
     const float delta = (q36_to_f(vhptr[j]) - sk) * b;
     float y = 0.f;
     for (int i = 0; i < head_dim; i++) {
-        float s = sptr[(size_t)i * head_dim + j] + q36_to_f(khptr[i]) * delta;
-        sptr[(size_t)i * head_dim + j] = s;
+        float s = col[i] + q36_to_f(khptr[i]) * delta;
+        col[i] = s;
         y += s * q36_to_f(qhptr[i]) * scale;
     }
     out[(size_t)vh * head_dim + j] = __float2bfloat16(y);
@@ -289,8 +292,11 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
     if (lane == 0) out[(size_t)vh * HEAD_DIM + j] = __float2bfloat16(y);
 }
 
-// Default GDN path: warp-per-state-column with native [vh][row][col] layout (no transposed
-// state). One warp owns column j; row slices live in registers; grid fills the GPU.
+// Fallback GDN path (SPARKINFER_GDN_FAST=0): warp-per-state-column, row slices in registers,
+// grid fills the GPU. Uses the same transposed [vh][col][row] state layout as gdn_ar_fast_kernel
+// and both batched-prefill scans -- the state is one shared buffer, so the layout is not a
+// per-kernel choice. It differs from gdn_ar_fast_kernel only in keeping the naive kernel's
+// separate decay pass, not in how the state is addressed.
 template <int WARPS_PER_BLK, int HEAD_DIM>
 __global__ void gdn_ar_warpgrid_kernel(const __nv_bfloat16* __restrict__ q,
                                        const __nv_bfloat16* __restrict__ k,
@@ -315,14 +321,14 @@ __global__ void gdn_ar_warpgrid_kernel(const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* qhptr = q + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* khptr = k + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* vhptr = v + (size_t)vh * HEAD_DIM;
-    float* sptr = state + (size_t)vh * HEAD_DIM * HEAD_DIM;
+    float* col = state + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;   // transposed [vh][col][row]
 
     float sloc[NROW];
     float part_sk = 0.f;
     #pragma unroll
     for (int r = 0; r < NROW; r++) {
         const int i = lane + r * 32;
-        const float s = sptr[(size_t)i * HEAD_DIM + j];
+        const float s = col[i];
         sloc[r] = s;
         part_sk += s * q36_to_f(khptr[i]);
     }
@@ -333,7 +339,7 @@ __global__ void gdn_ar_warpgrid_kernel(const __nv_bfloat16* __restrict__ q,
     for (int r = 0; r < NROW; r++) {
         const int i = lane + r * 32;
         const float s = sloc[r] * g + q36_to_f(khptr[i]) * delta;
-        sptr[(size_t)i * HEAD_DIM + j] = s;
+        col[i] = s;
         part_y += s * q36_to_f(qhptr[i]) * scale;
     }
     const float y = q36_wsum(part_y);
@@ -519,9 +525,14 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
                           const void* dt_bf16, const void* a_bf16,
                           float* state_f32, void* out_bf16,
                           int q_heads, int v_heads, int head_dim, cudaStream_t stream) {
-    // SPARKINFER_GDN_FAST: warp-per-column, register-cached, transposed-state kernel (fills the GPU +
-    // 2x state traffic). Uses a transposed internal state layout, so it MUST be all-or-nothing for the
-    // run — the static flag guarantees that. Requires head_dim a multiple of 32 (128 -> NROW=4).
+    // STATE LAYOUT. `state_f32` is the SHARED Gated-DeltaNet recurrent buffer: the batched-prefill
+    // scans (pf_gdn_scan_kernel, pf_gdnc_scan_kernel) write the post-prompt state that decode then
+    // continues from. All three kernels below therefore address it in the SAME transposed
+    // [v_head][col][row] layout the prefill scans emit — the layout is a cross-kernel contract, not
+    // a per-kernel choice, so switching paths mid-run (or via the env knobs) stays correct.
+    //
+    // SPARKINFER_GDN_FAST: warp-per-column, register-cached kernel (fills the GPU + 2x state
+    // traffic). Requires head_dim a multiple of 32 (128 -> NROW=4).
     static int fast = -1;
     if (fast < 0) { const char* e = getenv("SPARKINFER_GDN_FAST"); fast = (e && e[0] == '0') ? 0 : 1; }
     if (fast && head_dim == 128) {                            // Qwen3.6/Qwythos linear_head_dim=128
