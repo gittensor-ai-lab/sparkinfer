@@ -172,9 +172,18 @@ int ModelEngine::prefix_token_len() const {
     return (int)impl_->prefix_tokens.size();
 }
 
+std::string& ModelEngine::error_slot() {
+    // Thread-local: complete_streaming() releases mu_ while the continuous-batch engine runs,
+    // so several requests are in flight at once. One shared string would let them clear each
+    // other's error, report a foreign one, and hand last_error() a reference that another
+    // thread reallocates underneath the caller. cudaGetLastError() is already per host thread,
+    // so this keeps the whole failure path consistently per-request.
+    static thread_local std::string err;
+    return err;
+}
+
 const std::string& ModelEngine::last_error() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return last_error_;
+    return error_slot();
 }
 
 std::vector<int> ModelEngine::complete(const std::vector<int>& prompt_ids, int max_new_tokens) {
@@ -190,22 +199,22 @@ std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_
 
     {
         std::lock_guard<std::mutex> lock(mu_);
-        last_error_.clear();
+        error_slot().clear();
         if (!impl_->ready || !impl_->model || !impl_->batch_engine) {
-            last_error_ = "model not loaded";
+            error_slot() = "model not loaded";
             return {};
         }
         if (prompt_ids.empty()) {
-            last_error_ = "empty prompt";
+            error_slot() = "empty prompt";
             return {};
         }
         if (max_new_tokens <= 0) {
-            last_error_ = "max_new_tokens must be positive";
+            error_slot() = "max_new_tokens must be positive";
             return {};
         }
         if ((int)prompt_ids.size() + max_new_tokens > impl_->cfg.max_seq) {
-            last_error_ = "prompt + max_tokens exceeds context limit (" +
-                          std::to_string(impl_->cfg.max_seq) + ")";
+            error_slot() = "prompt + max_tokens exceeds context limit (" +
+                           std::to_string(impl_->cfg.max_seq) + ")";
             fprintf(stderr, "[sparkinfer-server] context overflow: prompt=%zu max_new=%d max_seq=%d\n",
                     prompt_ids.size(), max_new_tokens, impl_->cfg.max_seq);
             return {};
@@ -218,8 +227,8 @@ std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_
         if (prefix_match && prefix_exclusive) {
             if (impl_->model->prefix_cached_len() != (int)impl_->prefix_tokens.size()) {
                 if (!impl_->model->cache_prefix(impl_->prefix_tokens)) {
-                    last_error_ = "cache_prefix failed (KV alloc or batched prefill)";
-                    fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
+                    error_slot() = "cache_prefix failed (KV alloc or batched prefill)";
+                    fprintf(stderr, "[sparkinfer-server] %s\n", error_slot().c_str());
                     return {};
                 }
             }
@@ -236,19 +245,19 @@ std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_
 
     std::lock_guard<std::mutex> lock(mu_);
     if (!result.error.empty()) {
-        last_error_ = result.error;
-        fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
+        error_slot() = result.error;
+        fprintf(stderr, "[sparkinfer-server] %s\n", error_slot().c_str());
         return {};
     }
 
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        last_error_ = std::string("cuda error after decode: ") + cudaGetErrorString(e);
-        fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
+        error_slot() = std::string("cuda error after decode: ") + cudaGetErrorString(e);
+        fprintf(stderr, "[sparkinfer-server] %s\n", error_slot().c_str());
         return {};
     }
     if (result.tokens.empty() && max_new_tokens > 0)
-        last_error_ = "generate returned no tokens (KV alloc failure?)";
+        error_slot() = "generate returned no tokens (KV alloc failure?)";
     return result.tokens;
 }
 

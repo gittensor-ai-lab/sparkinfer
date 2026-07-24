@@ -38,13 +38,19 @@ public:
     std::vector<int> complete_streaming(const std::vector<int>& prompt_ids, int max_new_tokens,
                                         const std::function<void(int)>& on_token);
 
+    // Failure from the calling thread's most recent complete()/complete_streaming().
+    // Per-thread by design: the HTTP server serves requests from a thread pool and the
+    // continuous-batch engine keeps several of them in flight at once, so a shared slot
+    // would let one request clear or observe another request's error.
     const std::string& last_error() const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     mutable std::mutex mu_;
-    std::string last_error_;
+
+    // Per-thread failure slot backing last_error().
+    static std::string& error_slot();
 };
 
 }  // namespace sparkinfer_server
