@@ -200,8 +200,11 @@ __global__ void win_prefill_windowed_kernel(
             __syncthreads();
             if (active) {
                 for (int kpos = k0; kpos < k0 + tk; kpos++) {
-                    // per-query membership: sink (block 0) OR recent window [my_rs, qtok]
-                    const bool insink = kpos < block_size;
+                    // per-query membership: sink (block 0) OR recent window [my_rs, qtok] — both causal.
+                    // The sink term must keep the kpos<=qtok bound too: without it, a query inside
+                    // block 0 (where my_rs==block_size makes inwin always false) would attend to the
+                    // whole of block 0, i.e. its own future tokens.
+                    const bool insink = (kpos < block_size) && (kpos <= qtok);
                     const bool inwin = (kpos >= my_rs) && (kpos <= qtok);
                     if (!insink && !inwin) continue;
                     const int kk = kpos - k0;
@@ -342,7 +345,7 @@ __global__ void win_prefill_lanepar_kernel(
 #pragma unroll
                 for (int i = 0; i < QPW; i++) {
                     if (WINDOWED) {
-                        const bool insink = kpos < block_size;
+                        const bool insink = (kpos < block_size) && (kpos <= qtok[i]);   // causal sink
                         const bool inwin = (kpos >= my_rs[i]) && (kpos <= qtok[i]);
                         in[i] = live && (insink || inwin) && (qtok[i] < n_tokens);
                     } else {
