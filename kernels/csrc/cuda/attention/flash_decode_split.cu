@@ -200,10 +200,11 @@ struct fa_block_q8_1 { __half2 ds; signed char qs[32]; };
 // original (which idled at ~2% occupancy with a serial n_splits loop). DG head-dim
 // groups -> DG x more blocks; NW warps per block each fold a 1/NW stripe of the
 // splits, then a shared-memory log-sum-exp merge across warps. grid=(heads*DG,seqs).
-// When out_q8 != nullptr AND ELEMS==1 (DG*32==HEAD_DIM), each (qh,dg) block's warp 0 also
-// emits the Q8_1 block for attn dims [qh*HEAD_DIM + dg*32, +32) from the bf16-rounded output,
-// so the O-projection MMVQ skips its standalone attn-quantize node (bit-identical to running
-// the quantizer on `out` afterwards). Q8_1 block index = qh*(HEAD_DIM/32) + dg.
+// When out_q8 != nullptr, each (qh,dg) block's warp 0 also emits the ELEMS Q8_1 blocks for
+// attn dims [qh*HEAD_DIM + dg*(HEAD_DIM/DG), +HEAD_DIM/DG) from the bf16-rounded output, so
+// the O-projection MMVQ skips its standalone attn-quantize node (bit-identical to running
+// the quantizer on `out` afterwards). Q8_1 block index = qh*(HEAD_DIM/32) + (doff + e*32)/32,
+// so the DG groups together cover all HEAD_DIM/32 blocks of the head at any ELEMS.
 template <int HEAD_DIM, int DG, int NW>
 __global__ void fa_combine_kernel(
     const float* __restrict__ part_m, const float* __restrict__ part_l,
@@ -254,21 +255,31 @@ __global__ void fa_combine_kernel(
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) op[doff + e * 32] = __float2bfloat16(acc[e] * inv);
 
-    // Fused Q8_1(attn) emit for the O-projection MMVQ (only the DG*32==HEAD_DIM layout, ELEMS==1,
-    // where warp 0's 32 lanes hold exactly the 32 elements of one Q8_1 block).
-    if (out_q8 != nullptr && ELEMS == 1) {
-        const float bv = __bfloat162float(__float2bfloat16(acc[0] * inv));   // bf16-rounded, as `out`
-        float amax = fabsf(bv);
+    // Fused Q8_1(attn) emit for the O-projection MMVQ. Lane `lane` owns head dims
+    // doff + e*32, so for a FIXED e warp 0's 32 lanes hold exactly the 32 elements of
+    // Q8_1 block (doff + e*32)/32 — one whole block per e, ELEMS blocks per (qh,dg).
+    // This used to be gated on ELEMS==1 (DG*32==HEAD_DIM, i.e. hd128), which left the
+    // hd256 instantiation emitting nothing at all while its caller — seeing a non-null
+    // out_q8 — skips the standalone launch_quantize_q8_1_blocks, so the O projection
+    // consumed a stale/uninitialized aq81. Looping over e covers every block and is
+    // bit-identical at ELEMS==1 (di/32 == dg there), matching the gated hd256 combine.
+    if (out_q8 != nullptr) {
         #pragma unroll
-        for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
-        const float d = amax / 127.0f;
-        const int qi = (amax == 0.0f) ? 0 : (int)roundf(bv / d);
-        const int blk = (seq * num_q_heads + qh) * (HEAD_DIM / 32) + dg;
-        out_q8[blk].qs[lane] = (signed char)qi;
-        int s = qi;
-        #pragma unroll
-        for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
-        if (lane == 0) out_q8[blk].ds = __floats2half2_rn(d, d * (float)s);
+        for (int e = 0; e < ELEMS; e++) {
+            const int di = doff + e * 32;
+            const float bv = __bfloat162float(__float2bfloat16(acc[e] * inv));   // bf16-rounded, as `out`
+            float amax = fabsf(bv);
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+            const float d = amax / 127.0f;
+            const int qi = (amax == 0.0f) ? 0 : (int)roundf(bv / d);
+            const int blk = (seq * num_q_heads + qh) * (HEAD_DIM / 32) + di / 32;
+            out_q8[blk].qs[lane] = (signed char)qi;
+            int s = qi;
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+            if (lane == 0) out_q8[blk].ds = __floats2half2_rn(d, d * (float)s);
+        }
     }
 }
 

@@ -297,6 +297,70 @@ static double test_argmax_twopass(int vocab, int nblocks, bool ties) {
     return (double)std::abs(ri - gi);   // expect 0: same index as serial argmax
 }
 
+// ---------------------------------------------------------------------------
+// 6. Flash-decode combine -> fused Q8_1(attn) emit (fa_combine_kernel).
+//     Whenever out_q8 is non-null the combine must fill EVERY one of the head's
+//     HEAD_DIM/32 Q8_1 blocks, because the caller then skips the standalone
+//     launch_quantize_q8_1_blocks and feeds out_q8 straight to the O-projection
+//     MMVQ. Emission is driven by the (dg, lane, e) -> head-dim mapping
+//     di = dg*(HEAD_DIM/DG) + lane + e*32, one Q8_1 block per (dg, e). This checks
+//     that mapping tiles the head exactly once and that each emitted block equals a
+//     direct Q8_1 quantize of `out`. ELEMS = HEAD_DIM/(32*DG) is 1 at hd128 and 2
+//     at hd256 (DG = 4) — the hd256 case emitted 0 of 8 blocks while the emit was
+//     gated on ELEMS == 1.
+// ---------------------------------------------------------------------------
+static double test_combine_q8_emit(int HEAD_DIM, int DG) {
+    const int ELEMS = HEAD_DIM / (32 * DG);
+    const int NBLK  = HEAD_DIM / 32;
+
+    // `out` for one head, exactly as the combine writes it (bf16-rounded).
+    vector<float> out(HEAD_DIM);
+    for (int d = 0; d < HEAD_DIM; d++) out[d] = to_bf16(frand());
+
+    // Reference: quantize `out` to Q8_1 blocks directly (what the standalone
+    // quantizer the fused emit replaces would produce).
+    vector<int> ref_q(HEAD_DIM); vector<float> ref_d(NBLK), ref_s(NBLK);
+    for (int b = 0; b < NBLK; b++) {
+        float amax = 0.f;
+        for (int i = 0; i < 32; i++) amax = std::max(amax, std::fabs(out[b * 32 + i]));
+        const float d = amax / 127.f;
+        int sum = 0;
+        for (int i = 0; i < 32; i++) {
+            const int qi = (amax == 0.f) ? 0 : (int)std::roundf(out[b * 32 + i] / d);
+            ref_q[b * 32 + i] = qi; sum += qi;
+        }
+        ref_d[b] = d; ref_s[b] = d * (float)sum;
+    }
+
+    // Kernel emit: warp 0 of each (qh, dg) block walks e = 0..ELEMS-1; for a fixed e
+    // its 32 lanes own dims di = doff + e*32 and warp-reduce amax / sum over them.
+    vector<int> got_q(HEAD_DIM, 0); vector<float> got_d(NBLK, -1.f), got_s(NBLK, -1.f);
+    vector<int> writes(NBLK, 0);
+    for (int dg = 0; dg < DG; dg++)
+        for (int e = 0; e < ELEMS; e++) {
+            const int base = dg * (HEAD_DIM / DG) + e * 32;
+            float amax = 0.f;
+            for (int lane = 0; lane < 32; lane++) amax = std::max(amax, std::fabs(out[base + lane]));
+            const float d = amax / 127.f;
+            int sum = 0;
+            for (int lane = 0; lane < 32; lane++) {
+                const int qi = (amax == 0.f) ? 0 : (int)std::roundf(out[base + lane] / d);
+                got_q[base + lane] = qi; sum += qi;
+            }
+            const int blk = base / 32;          // lane < 32, so the 32 lanes share one block
+            got_d[blk] = d; got_s[blk] = d * (float)sum; writes[blk]++;
+        }
+
+    double err = 0;
+    for (int b = 0; b < NBLK; b++) {
+        if (writes[b] != 1) return 1.0;         // block missed (or written twice) by the emit
+        err = std::max(err, (double)std::fabs(got_d[b] - ref_d[b]));
+        err = std::max(err, (double)std::fabs(got_s[b] - ref_s[b]));
+    }
+    for (int i = 0; i < HEAD_DIM; i++) err = std::max(err, (double)std::abs(got_q[i] - ref_q[i]));
+    return err;                                  // expect 0: identical to the standalone quantize
+}
+
 int main() {
     printf("sparkinfer kernel algorithm correctness (CPU reference)\n");
     check("attention hd128 kv1",   test_attention(128, 1),    1e-4);
@@ -317,6 +381,8 @@ int main() {
     check("argmax 2pass qwen vocab",test_argmax_twopass(151936, 512, false), 0.0);
     check("argmax 2pass gemma vocab",test_argmax_twopass(262144, 512, false), 0.0);
     check("argmax 2pass tie-break",  test_argmax_twopass(151936, 512, true),  0.0);
+    check("combine q8 emit hd128 dg4", test_combine_q8_emit(128, 4),          0.0);
+    check("combine q8 emit hd256 dg4", test_combine_q8_emit(256, 4),          0.0);
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }
