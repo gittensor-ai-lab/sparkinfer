@@ -656,6 +656,27 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                 kernels::launch_gemm(x, W, y, 1, N, K, 1.f, 0.f, gc, st);
             }
         };
+        // ssm_alpha/ssm_beta are both tiny (n_out == linear_v_heads) per-head gate projections of
+        // the SAME input xn, so when both stay in bf16 (the common case -- quantizing a 32-wide
+        // output weight costs more accuracy than it saves) they'd otherwise be two separate
+        // proj_xn(..., t=0) calls into launch_gemv's split-K path. At decode time each such call is
+        // launch-overhead bound (nsys: ~1.8us/call vs a sub-microsecond K-dot at this width), so
+        // fuse them into one launch_gdn_alpha_beta call -- same split-K math per output (bit-
+        // identical), just one kernel instead of two. Falls back to the separate calls whenever
+        // either weight is quantized. SPARKINFER_GDN_AB_FUSE=0 disables (A/B).
+        auto proj_gdn_ab = [&](const Qwen35LayerWeights& w, void* ya, void* yb, cudaStream_t pst) {
+            static int fuse = -1;
+            if (fuse < 0) { const char* e = getenv("SPARKINFER_GDN_AB_FUSE");
+                fuse = (e && e[0] == '0') ? 0 : 1; }
+            if (fuse && s.gguf && w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
+                c.linear_v_heads < 4096 && (H & 7) == 0) {
+                kernels::launch_gdn_alpha_beta(s.xn, w.ssm_alpha, w.ssm_beta, ya, yb,
+                                               c.linear_v_heads, H, pst);
+            } else {
+                proj_xn(w.ssm_alpha, w.ssm_alpha_type, ya, c.linear_v_heads, pst);
+                proj_xn(w.ssm_beta,  w.ssm_beta_type,  yb, c.linear_v_heads, pst);
+            }
+        };
 
         if (w.linear_attn) {
             const bool any_q4k = (w.wqkv_type == 12 || w.wqkv_gate_type == 12 ||
@@ -684,8 +705,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             } else if (gdn_fused_proj && gdn_pipelined) {
                 cudaEventRecord(s.ev_pipe_fork, st);
                 cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
-                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, s.stream_v);
-                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, s.stream_v);
+                proj_gdn_ab(w, s.lin_alpha, s.lin_beta, s.stream_v);
                 cudaEventRecord(s.ev_gdn_ab, s.stream_v);
                 kernels::launch_mmvq_gdn_qkv_z_pack2(s.aq81, w.wqkv, w.wqkv_gate,
                                                        s.lin_qkv, s.lin_z,
@@ -696,21 +716,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                 cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
                 proj_xn(w.wqkv_gate, w.wqkv_gate_type, s.lin_z, s.linear_vdim, s.stream_k);
                 cudaEventRecord(s.ev_gdn_z, s.stream_k);
-                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, s.stream_v);
-                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, s.stream_v);
+                proj_gdn_ab(w, s.lin_alpha, s.lin_beta, s.stream_v);
                 cudaEventRecord(s.ev_gdn_ab, s.stream_v);
                 proj_xn(w.wqkv, w.wqkv_type, s.lin_qkv, s.linear_qkvdim, st);
             } else if (gdn_fused_proj) {
                 kernels::launch_mmvq_gdn_qkv_z_pack2(s.aq81, w.wqkv, w.wqkv_gate,
                                                        s.lin_qkv, s.lin_z,
                                                        s.linear_qkvdim, s.linear_vdim, H, st);
-                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, st);
-                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, st);
+                proj_gdn_ab(w, s.lin_alpha, s.lin_beta, st);
             } else {
                 proj_xn(w.wqkv, w.wqkv_type, s.lin_qkv, s.linear_qkvdim, st);
                 proj_xn(w.wqkv_gate, w.wqkv_gate_type, s.lin_z, s.linear_vdim, st);
-                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, st);
-                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, st);
+                proj_gdn_ab(w, s.lin_alpha, s.lin_beta, st);
             }
 
             bf16* conv_state = s.lin_conv_state +
@@ -950,7 +967,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             kernels::launch_add_rmsnorm2(s.x, s.ao, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
 
         const bool qmoe = w.shared_gate_q && w.shared_up_q && w.shared_down_q
-                       && w.shared_gate_qtype == 8 && c.hidden == 2048 && c.moe_ffn == 512;
+                       && (w.shared_gate_qtype == 8 || w.shared_gate_qtype == 12)
+                       && c.hidden == 2048 && c.moe_ffn == 512;
+        const bool shexp_q4k = qmoe && w.shared_gate_qtype == 12;
         const bool shexp_pipelined = (c.n_shared > 0) && s.gguf && s.use_shexp_pipe;
         if (shexp_pipelined) {
             cudaEventRecord(s.ev_pipe_fork, st);
@@ -998,11 +1017,19 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                 // races MoE (shared finishes first, MoE overwrites routed). Always write s.shared;
                 // fold happens after both complete. SPARKINFER_SHEXP_ACCUM=1 only applies on the
                 // non-pipelined path where MoE has already landed in routed.
-                kernels::launch_shared_expert_q8_mmvq(
-                    s.hn, fnq ? s.aq81 : nullptr,
-                    w.shared_gate_q, w.shared_up_q, w.shared_down_q,
-                    w.shared_gate_inp ? s.d_shared_w : nullptr,
-                    s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k, false);
+                if (shexp_q4k) {
+                    kernels::launch_shared_expert_q4k_mmvq(
+                        s.hn, fnq ? s.aq81 : nullptr,
+                        w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                        w.shared_gate_inp ? s.d_shared_w : nullptr,
+                        s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k, false);
+                } else {
+                    kernels::launch_shared_expert_q8_mmvq(
+                        s.hn, fnq ? s.aq81 : nullptr,
+                        w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                        w.shared_gate_inp ? s.d_shared_w : nullptr,
+                        s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k, false);
+                }
             } else {
                 kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, s.stream_k);
                 kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, s.stream_v);
@@ -1115,12 +1142,21 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                     if (shexp_accum < 0) { const char* e = getenv("SPARKINFER_SHEXP_ACCUM");
                         shexp_accum = (e && e[0] == '1') ? 1 : 0; }
                     const bool sx_accum = shexp_accum != 0;
-                    kernels::launch_shared_expert_q8_mmvq(
-                        s.hn, fnq ? s.aq81 : nullptr,
-                        w.shared_gate_q, w.shared_up_q, w.shared_down_q,
-                        w.shared_gate_inp ? s.d_shared_w : nullptr,
-                        sx_accum ? s.routed : s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st,
-                        sx_accum);
+                    if (shexp_q4k) {
+                        kernels::launch_shared_expert_q4k_mmvq(
+                            s.hn, fnq ? s.aq81 : nullptr,
+                            w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                            w.shared_gate_inp ? s.d_shared_w : nullptr,
+                            sx_accum ? s.routed : s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st,
+                            sx_accum);
+                    } else {
+                        kernels::launch_shared_expert_q8_mmvq(
+                            s.hn, fnq ? s.aq81 : nullptr,
+                            w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                            w.shared_gate_inp ? s.d_shared_w : nullptr,
+                            sx_accum ? s.routed : s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st,
+                            sx_accum);
+                    }
                     if (sx_accum) {
                         if (fnq)
                             kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
@@ -2159,7 +2195,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return layer_index(name) >= ssm_out_min_layer;
         return false;
     };
-    const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K", q35_dense9b_requant_default);
+    // lm_head is a huge one-shot GEMV (whole vocab, every decode token) that stayed native
+    // Q6_K on the Qwen3.6 UD fingerprint -- q35_dense9b_requant_default only fires for the
+    // dense Qwythos shape, so this never defaulted on for the MoE hybrid model. Reuse the
+    // same affine-fit Q6_K->Q4_K requant already proven for FFN down (~31% fewer bytes/weight).
+    const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K",
+                                        q35_dense9b_requant_default || q36_ud_requant_default);
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
@@ -2291,12 +2332,19 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             const bool qmoe = []{ const char* a = getenv("SPARKINFER_QMOE");
                                    return !(a && a[0] == '0'); }();
             if (qmoe) {
-                w.shared_gate_q = dev_quant(b + "ffn_gate_shexp.weight", w.shared_gate_qtype);
-                w.shared_up_q   = dev_quant(b + "ffn_up_shexp.weight",   w.shared_up_qtype);
-                w.shared_down_q = dev_quant(b + "ffn_down_shexp.weight", w.shared_down_qtype);
+                // Shared expert ships Q8_0 (8.5 bits/weight) and is always active every token
+                // (unlike the routed top-k experts, already native Q4_K/Q5_K) -- requant to Q4_K
+                // at load, same Lloyd-max fit already used for attn_gate/ssm_out
+                // (dev_quant_requant_q4k dispatches on src_type==8 regardless of tensor name).
+                static int shexp_req = -1;
+                if (shexp_req < 0) { const char* e = getenv("SPARKINFER_SHEXP_REQUANT_Q4K");
+                    shexp_req = (e && e[0] == '0') ? 0 : 1; }
+                w.shared_gate_q = dev_quant_requant_q4k(b + "ffn_gate_shexp.weight", w.shared_gate_qtype, shexp_req != 0);
+                w.shared_up_q   = dev_quant_requant_q4k(b + "ffn_up_shexp.weight",   w.shared_up_qtype,   shexp_req != 0);
+                w.shared_down_q = dev_quant_requant_q4k(b + "ffn_down_shexp.weight", w.shared_down_qtype, shexp_req != 0);
             }
             if (!qmoe || !w.shared_gate_q || !w.shared_up_q || !w.shared_down_q ||
-                w.shared_gate_qtype != 8) {
+                (w.shared_gate_qtype != 8 && w.shared_gate_qtype != 12)) {
                 w.shared_gate = dense(b + "ffn_gate_shexp.weight", false);
                 w.shared_up   = dense(b + "ffn_up_shexp.weight", false);
                 w.shared_down = dense(b + "ffn_down_shexp.weight", false);

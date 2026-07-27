@@ -46,6 +46,15 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K,
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K,
                      cudaStream_t stream = nullptr);
 
+// Fused ssm_alpha + ssm_beta GDN gate GEMV: y_a[V] = x[K]@Wa^T, y_b[V] = x[K]@Wb^T in one launch.
+// Bit-identical to two launch_gemv(x, Wa, y_a, V, K) / launch_gemv(x, Wb, y_b, V, K) calls when
+// those would each take the split-K S=8 path (V < 4096, K % 8 == 0) -- only the launch count
+// drops from 2 to 1, which is what these tiny (V = linear_v_heads) decode-time GEMVs are bound by.
+// Caller must check V < 4096 && (K % 8) == 0 (true for every current GDN config); falls outside
+// that, use two separate launch_gemv calls instead.
+void launch_gdn_alpha_beta(const void* x, const void* Wa, const void* Wb, void* ya, void* yb,
+                           int V, int K, cudaStream_t stream = nullptr);
+
 // Fused GEMV + sigmoid for the shared-expert gate scalar (N=1). Uses scratch_bf16
 // for the bf16 dot (same as launch_gemv) then sigmoid_scalar. SPARKINFER_GEMV_SIGMOID=1 enables.
 void launch_gemv_sigmoid(const void* x, const void* W, void* scratch_bf16, float* y, int K,

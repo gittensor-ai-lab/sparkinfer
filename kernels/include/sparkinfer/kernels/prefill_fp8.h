@@ -36,4 +36,15 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
 void launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed char* q, float* scale,
                                     int rows, int cols, cudaStream_t stream = nullptr);
 
+// Fused gated RMSNorm + per-row fp8 (e4m3) quantize, for MoE (Qwen3.6) GDN layers whose o_proj
+// always takes the fp8 tensor-core path (moe_fp8). Numerically identical to
+// launch_prefill_gated_norm followed by launch_prefill_quantize_rows_fp8, but skips materializing
+// the bf16 intermediate in DRAM. See prefill.h for the int8 counterpart (dense/Qwythos GDN).
+//   x/z: [N, v_heads*hd]   weight: [hd]   q: [N, v_heads*hd] e4m3   scale: [N]
+// Returns false when head_dim != 128 or v_heads is not a multiple of 8.
+bool launch_prefill_gated_norm_quant_fp8(const void* x, const void* z, const void* weight,
+                                         void* q, float* scale,
+                                         int n_tokens, int v_heads, int head_dim, float eps,
+                                         cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

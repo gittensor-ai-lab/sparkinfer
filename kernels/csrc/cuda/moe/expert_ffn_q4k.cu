@@ -728,6 +728,71 @@ __global__ void dense_gate_up_q4k_pack2_kernel(
     if (lane == 0) h_scratch[f] = q4kf_silu(tg) * tu;
 }
 
+// Qwen3.6 shared expert, Q4_K weights: same row/reduction math as dense_gate_up_q4k_pack2_kernel
+// (Q4_K si_vec_dot, pack2 rows/block) with the dw gate-scalar multiply from
+// shared_gate_up_q8_mmvq_kernel folded into the store -- the shared expert ships Q8_0 by default
+// (~2x the bytes/weight of Q4_K); requantizing it at load (see launch_proj_requant_q4k_lloyd,
+// already used for attention/GDN weights) and reading it here cuts the two biggest single decode
+// kernels (shared gate/up + down GEMV) roughly in half on the memory-bound read.
+template <int H, int F>
+__global__ void shared_gate_up_q4k_pack2_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
+    float* __restrict__ h_scratch) {
+    constexpr int NW = 4, WS = 32, NB = H >> 8;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int group = warp >> 2, group_warp = warp & 3;
+    const int f = blockIdx.x * 2 + group;
+    if (f >= F) return;
+    const int tid4 = group_warp * WS + lane;
+    const int kbx0 = tid4 >> 4;
+    const int kqs = 2 * (tid4 & 15);
+    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + (size_t)f * NB * 144);
+    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + (size_t)f * NB * 144);
+    float tg = 0.f, tu = 0.f;
+    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+        tg += si_vec_dot_q4_K(g_row + kbx, vy + (size_t)kbx * 8, kqs);
+        tu += si_vec_dot_q4_K(u_row + kbx, vy + (size_t)kbx * 8, kqs);
+    }
+    __shared__ float sg[2][NW - 1][WS], su[2][NW - 1][WS];
+    if (group_warp > 0) { sg[group][group_warp - 1][lane] = tg; su[group][group_warp - 1][lane] = tu; }
+    __syncthreads();
+    if (group_warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) { tg += sg[group][l][lane]; tu += su[group][l][lane]; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+    if (lane == 0) {
+        float w = dw ? __ldg(dw) : 1.f;
+        h_scratch[f] = w * q4kf_silu(tg) * tu;
+    }
+}
+
+// Shared-expert down, Q4_K weights: same per-row math as down_q4k_mmvq_kernel with the top_k
+// expert loop removed (the shared expert is always exactly one contribution, weight already
+// folded into h_scratch above) and the ACCUM/output convention from shared_down_q8_mmvq_kernel.
+template <int H, int F, bool ACCUM>
+__global__ void shared_down_q4k_mmvq_kernel(
+    const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
+    __nv_bfloat16* __restrict__ out) {
+    const int h = blockIdx.x * WPB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (h >= H) return;
+    constexpr int NB = F >> 8;                 // 256-superblocks per row
+    constexpr int WORK = NB * 16;               // vdr=2 positions per superblock
+    const si_block_q4_K* drow = (const si_block_q4_K*)(down_q + (size_t)h * NB * 144);
+    float acc = 0.f;
+    for (int wi = lane; wi < WORK; wi += 32) {
+        const int kbx = wi >> 4, kqs = (wi & 15) << 1;
+        acc += si_vec_dot_q4_K(drow + kbx, hq8 + (size_t)kbx * 8, kqs);
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    if (lane == 0) {
+        if constexpr (ACCUM) acc += __bfloat162float(out[h]);
+        out[h] = __float2bfloat16(acc);
+    }
+}
+
 // int8 dp4a MMVQ down (Q4_K). The Q4_K-quantized down rows in Q4_K_M were the last MoE GEMV
 // still on the fp register-dequant path (Q6_K down + gate/up + attention already run int8).
 // Reuses the Q8_1-quantized activation and the faithful vec_dot_q4_K_q8_1, one warp per
@@ -1536,6 +1601,41 @@ void launch_shared_expert_q8_mmvq(
             reinterpret_cast<__nv_bfloat16*>(output));
     } else {
         shared_down_q8_mmvq_kernel<2048, 512, false><<<dn, WPB * 32, 0, stream>>>(
+            qbuf, reinterpret_cast<const unsigned char*>(down_q),
+            reinterpret_cast<__nv_bfloat16*>(output));
+    }
+}
+
+// Same as launch_shared_expert_q8_mmvq but for Q4_K-requantized shared-expert weights (see
+// shared_gate_up_q4k_pack2_kernel / shared_down_q4k_mmvq_kernel above). Activation stays Q8_1
+// either way -- only the weight read narrows from 8.5 to 4.5 bits/element.
+void launch_shared_expert_q4k_mmvq(
+    const void* input, const void* input_q8,
+    const void* gate_q, const void* up_q, const void* down_q,
+    const float* dw, void* output, float* h_scratch, void* h_q8_buf,
+    int hidden, int ffn, cudaStream_t stream, bool accum = false) {
+    const si_block_q8_1* vy;
+    si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
+    if (input_q8) {
+        vy = reinterpret_cast<const si_block_q8_1*>(input_q8);
+    } else {
+        si_quant_bf16_q8_1<<<(hidden >> 5), 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(input), qbuf, hidden);
+        vy = qbuf;
+    }
+    shared_gate_up_q4k_pack2_kernel<2048, 512><<<(ffn + 1) / 2, 8 * 32, 0, stream>>>(
+        vy, reinterpret_cast<const unsigned char*>(gate_q),
+        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    const int nqb = ffn >> 5;
+    quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
+        h_scratch, qbuf, nqb, 0);
+    dim3 dn((hidden + WPB - 1) / WPB);
+    if (accum) {
+        shared_down_q4k_mmvq_kernel<2048, 512, true><<<dn, WPB * 32, 0, stream>>>(
+            qbuf, reinterpret_cast<const unsigned char*>(down_q),
+            reinterpret_cast<__nv_bfloat16*>(output));
+    } else {
+        shared_down_q4k_mmvq_kernel<2048, 512, false><<<dn, WPB * 32, 0, stream>>>(
             qbuf, reinterpret_cast<const unsigned char*>(down_q),
             reinterpret_cast<__nv_bfloat16*>(output));
     }

@@ -111,6 +111,59 @@ template __global__ void gemv_f32_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloat1
 #ifndef _MSC_VER
 template __global__ void gemv_f32_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int);
 #endif
+// Fused ssm_alpha + ssm_beta GDN gate GEMV: one launch computes BOTH tiny [K]->[V] projections
+// that share the same input activation xn, instead of two separate gemv_f32_sk_kernel<OutT,8>
+// calls. V (= linear_v_heads, e.g. 32) is tiny, so at decode time each standalone call is
+// launch-overhead bound rather than compute bound (nsys: ~1.8us/call, far above the K/1792GB/s
+// streaming time for K in the thousands). Grid covers both weight matrices' rows in one launch
+// (blockIdx.x < V -> alpha row blockIdx.x, else -> beta row blockIdx.x - V); each row still runs
+// the identical S=8 split-K reduction gemv_f32_sk_kernel<OutT,8> uses (same lane assignment, same
+// shuffle order, same partial-sum order), so alpha and beta are each bit-identical to their
+// standalone launch -- only the launch count changes (2 -> 1).
+template <typename OutT>
+__global__ void gdn_ab_sk8_kernel(const __nv_bfloat16* __restrict__ x,
+                                  const __nv_bfloat16* __restrict__ Wa,
+                                  const __nv_bfloat16* __restrict__ Wb,
+                                  OutT* __restrict__ ya, OutT* __restrict__ yb,
+                                  int V, int K) {
+    constexpr int S = 8;                      // matches GEMV_WPB (8) -> one output row per block
+    const bool is_b = blockIdx.x >= V;
+    const int row = is_b ? blockIdx.x - V : blockIdx.x;
+    if (row >= V) return;
+    const __nv_bfloat16* __restrict__ W = is_b ? Wb : Wa;
+    OutT* __restrict__ y = is_b ? yb : ya;
+
+    const int split = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    __shared__ float s_part[S];
+
+    const uint4* row4 = reinterpret_cast<const uint4*>(W + (size_t)row * K);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x);
+    const int n4 = K / 8;
+    float acc = 0.f;
+    for (int i = split * 32 + lane; i < n4; i += S * 32) {
+        uint4 wv = row4[i], xv = x4[i];
+        const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wv);
+        const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 wf = __bfloat1622float2(wh[j]), xf = __bfloat1622float2(xh[j]);
+            acc += wf.x * xf.x + wf.y * xf.y;
+        }
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+    if (lane == 0) s_part[split] = acc;
+    __syncthreads();
+    if (split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[s];
+        gemv_write(y + row, o);
+    }
+}
+#ifndef _MSC_VER
+template __global__ void gdn_ab_sk8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int, int);
+#endif
 // ---- quantized on-read GEMV (W = GGUF-native Q4_K/Q6_K [N,K]) -----------------
 // Dequantizes each 256-block in registers and dots with a full-precision (fp32)
 // activation — reads the quantized weight bytes (~4x less than bf16) with NO int8
@@ -1135,6 +1188,14 @@ void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K, cudaS
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_kernel<float><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);
+}
+
+void launch_gdn_alpha_beta(const void* x, const void* Wa, const void* Wb, void* ya, void* yb,
+                           int V, int K, cudaStream_t stream) {
+    gdn_ab_sk8_kernel<__nv_bfloat16><<<2 * V, GEMV_WPB * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<const __nv_bfloat16*>(Wa), reinterpret_cast<const __nv_bfloat16*>(Wb),
+        reinterpret_cast<__nv_bfloat16*>(ya), reinterpret_cast<__nv_bfloat16*>(yb), V, K);
 }
 
 void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int K, cudaStream_t stream) {

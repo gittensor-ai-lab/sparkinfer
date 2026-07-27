@@ -549,9 +549,42 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             float* layer_state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
             kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
                 layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim, st);
-            kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
-            attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
-            if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+            // Fuse the gated-norm epilogue with whichever per-row quantize the o_proj GEMM would
+            // otherwise run as a second pass over lnrm: write straight into A_i8/sx and skip
+            // materializing lnrm at all (see prefill_gdn_norm_quant.cu). Two variants, matching
+            // proj()'s own int8-then-fp8 precedence: the residual-fused int8 GEMM (dense/Qwythos
+            // GDN with resid_fuse on) and the fp8 GEMM (MoE/Qwen3.6, which always runs GDN o_proj
+            // on fp8 -- moe_fp8 defaults on since use_i8 defaults off for MoE). fp8 has no
+            // residual-fused GEMM yet, so that branch still falls through to the plain add below.
+            bool gdn_fused_norm_quant = false;
+            if (resid_fuse && use_i8) {
+                gdn_fused_norm_quant = kernels::launch_prefill_gated_norm_quant_i8(
+                    att, lz, w.ssm_norm, A_i8, sx, N, vh, c.linear_head_dim, eps, st);
+                if (gdn_fused_norm_quant) {
+                    a_q = nullptr; a_qR = 0; a_qK = 0;   // A_i8 now holds fresh data outside quant_a_i8's memo
+                    if (!kernels::launch_gguf_dequant_rows_i8(w.ssm_out_type, w.ssm_out, W_i8, sw, H, lvdim, st)) {
+                        const void* wb = dq(w.ssm_out, w.ssm_out_type, H, lvdim);
+                        kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, H, lvdim, st);
+                    }
+                    kernels::launch_prefill_gemm_i8_resid(A_i8, W_i8, sx, sw, x, N, H, lvdim, st);
+                    attn_fused = true;
+                }
+            } else if (!use_i8 && (use_fp8_gdn || moe_fp8)) {
+                gdn_fused_norm_quant = kernels::launch_prefill_gated_norm_quant_fp8(
+                    att, lz, w.ssm_norm, A_i8, sx, N, vh, c.linear_head_dim, eps, st);
+                if (gdn_fused_norm_quant) {
+                    a_q = nullptr; a_qR = 0; a_qK = 0;
+                    const void* wb = dq(w.ssm_out, w.ssm_out_type, H, lvdim);
+                    kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, H, lvdim, st);
+                    kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, ao, N, H, lvdim, st);
+                    attn_fused = false;   // no fp8 residual-fused GEMM yet -- fall to the add below
+                }
+            }
+            if (!gdn_fused_norm_quant) {
+                kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
+                attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
+                if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+            }
             use_i8 = restore_i8_gdn;
         } else {
             // ---- full softmax-attention layer (q_has_gate, partial RoPE, int8 KV) ----

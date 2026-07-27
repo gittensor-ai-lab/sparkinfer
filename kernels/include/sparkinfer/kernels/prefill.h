@@ -70,6 +70,19 @@ void launch_prefill_gated_norm(const void* x, const void* z, const void* weight,
                                int n_tokens, int v_heads, int head_dim, float eps,
                                cudaStream_t stream = nullptr);
 
+// Fused gated RMSNorm + per-row int8 quantize, for GDN layers whose o_proj takes the residual-
+// fused int8 GEMM path: numerically identical to launch_prefill_gated_norm followed by the int8
+// row quantizer (both round the gated-norm result to bf16 first), but skips materializing the
+// bf16 intermediate in DRAM. q/scale are the same A_i8/sx buffers the int8 GEMM reads.
+//   x/z: [N, v_heads*hd]   weight: [hd]   q: [N, v_heads*hd] int8   scale: [N]
+// Returns false (nothing launched) when head_dim != 128 or v_heads is not a multiple of 8 -- the
+// caller should fall back to launch_prefill_gated_norm + the standalone row quantizer.
+// Env SPARKINFER_PREFILL_GDN_NORM_QUANT (default 1): 0 disables (A/B).
+bool launch_prefill_gated_norm_quant_i8(const void* x, const void* z, const void* weight,
+                                        signed char* q, float* scale,
+                                        int n_tokens, int v_heads, int head_dim, float eps,
+                                        cudaStream_t stream = nullptr);
+
 // Full-attention prefill: batched QK-norm + partial-RoPE (q,k in place, bf16) + int8 KV write
 // into the single-sequence paged pool at positions 0..N-1. Matches the decode int8 layout
 // (per-(token,kv_head) max-abs fp16 scale). block_table maps logical block -> physical block.
