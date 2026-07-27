@@ -54,10 +54,13 @@ def main():
         rms_eps=float(meta(A + "attention.layer_norm_rms_epsilon")),
         eos_id=int(meta("tokenizer.ggml.eos_token_id") or 151645),
     )
-    # vocab from token_embd if metadata missing
+    # Prefer vocab from token_embd (matches qwen3_config_from_gguf: emb->dims[1]).
     ten = {t.name: t for t in r.tensors}
-    if "token_embd.weight" in ten:
-        cfg["vocab"] = int(ten["token_embd.weight"].shape[-1]) if False else cfg["vocab"]
+    emb = ten.get("token_embd.weight")
+    if emb is not None and len(emb.shape) >= 2:
+        cfg["vocab"] = int(emb.shape[1])
+    elif emb is not None and len(emb.shape) == 1:
+        cfg["vocab"] = int(emb.shape[0])
 
     with open(os.path.join(out, "config.txt"), "w") as f:
         for k, v in cfg.items():

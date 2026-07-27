@@ -133,7 +133,8 @@ merge than a broad rewrite.
 
 ## Current Target
 
-The current frontier is Qwen3-MoE Q4_K_M decode on RTX 5090 / consumer Blackwell.
+The current primary frontier is **Qwen3.6-35B-A3B** Q4_K_M decode on RTX 5090 /
+consumer Blackwell (with Qwen3-MoE / Qwen3.5 as additional scored or guard targets).
 The project is especially interested in:
 
 - Long-context flash decode at 16k and beyond.

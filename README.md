@@ -191,8 +191,12 @@ aggregated across contexts.
 The label is a **deterministic function of the measurements**, so it's reproducible across
 validators. The bot also tags the PR's **subsystem** — `area:kernels` / `runtime` / `moe` /
 `bench` — from its changed paths (categorization only — scoring is speedup-only; deterministic, no AI).
-The bot **never merges** — merging is manual after review. Runs the same evaluator you can run
-yourself: [`eval/`](eval) (`vast_eval.py`, `pr_eval_bot.py`).
+The bot labels each round's biggest verified win [`merge-first`](https://github.com/gittensor-ai-lab/sparkinfer/labels/merge-first)
+and can **auto-merge** that winner once it clears the guards in [CONTRIBUTING.md](CONTRIBUTING.md)
+(verified speedup, clean CI, no conflicts, author in good standing, only `kernels`/`runtime`/`moe`);
+a maintainer can stop that with `hold`. Other scored PRs stay [`needs-rebase`](https://github.com/gittensor-ai-lab/sparkinfer/labels/needs-rebase)
+until they rebase onto the new `main`. Runs the same evaluator you can run yourself:
+[`eval/`](eval) (`vast_eval.py`, `pr_eval_bot.py`).
 
 ### Trust & verifiability
 
