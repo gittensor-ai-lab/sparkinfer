@@ -91,6 +91,16 @@ void launch_pfm_moe_gemm_i8_bm_base(const signed char* A_i8, const float* sx,
                                     int N_out, int K, int max_tiles, int bm, int e_base,
                                     bool a_indirect, bool c_scatter, cudaStream_t stream);
 
+// Native-int8 mma.sync (m16n8k32) variant of the long-N grouped expert GEMM. Same tiling and
+// bit-identical int32 accumulation as pfm_moe_gemm_i8_kernel; opt-in via SPARKINFER_PREFILL_MOE_MMA.
+void launch_pfm_moe_gemm_i8_mma(const signed char* A_i8, const float* sx,
+                                const signed char* W_i8, const float* sw,
+                                const int* pair_tok, const float* pair_w,
+                                const int* offsets, const int* tilemap, const int* d_ntiles,
+                                void* C_bf16, float* out_f32,
+                                int N_out, int K, int max_tiles, int e_base,
+                                bool a_indirect, bool c_scatter, cudaStream_t stream);
+
 // Single-expert GEMM: W_i8/sw already point at one expert's rows (no e-stride).
 // grid.y = n_tiles = ceil(counts[expert]/bm). Used by the expert-serial L2 path
 // (dequant one expert → GEMM while ~3 MB stays L2-hot).

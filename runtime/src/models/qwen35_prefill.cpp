@@ -37,18 +37,60 @@ inline void pf_cu(cudaError_t e, const char* what) {
     if (e != cudaSuccess) fprintf(stderr, "[prefill] %s: %s\n", what, cudaGetErrorString(e));
 }
 // Simple device-buffer arena: all-or-nothing allocation with one free() at the end.
+//
+// Every prefill call allocates ~20-45 named scratch buffers (4 Arena instances) and frees all of
+// them before returning (see the free_all() calls below) -- a synchronous cudaMalloc/cudaFree pair
+// per buffer, per call, unconditionally, regardless of context length. Route them through the CUDA
+// stream-ordered allocator instead: cudaMallocAsync/cudaFreeAsync queue onto the SAME stream the
+// prefill kernels already run on (no extra host-device sync) and are served from a per-device pool
+// that caches freed blocks for reuse, so a steady-state prefill loop (same shapes recurring call to
+// call, which is exactly the eval sweep's pattern) stops touching the driver's global allocator
+// after the first call at each distinct size. Bit-identical: same bytes, same pointers' contents,
+// only the allocation path changes. SPARKINFER_PREFILL_ARENA_ASYNC=0 restores plain cudaMalloc/Free.
 struct Arena {
     std::vector<void*> bufs;
+    cudaStream_t stream = nullptr;
     bool ok = true;
+    static bool async_enabled() {
+        static const bool v = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_ARENA_ASYNC");
+            return !(e && e[0] == '0');
+        }();
+        return v;
+    }
     template <class T> T* alloc(size_t n) {
         void* p = nullptr;
         if (n == 0) n = 1;
-        if (cudaMalloc(&p, n * sizeof(T)) != cudaSuccess) { ok = false; return nullptr; }
+        const size_t bytes = n * sizeof(T);
+        cudaError_t e = (stream && async_enabled()) ? cudaMallocAsync(&p, bytes, stream)
+                                                      : cudaMalloc(&p, bytes);
+        if (e != cudaSuccess) { ok = false; return nullptr; }
         bufs.push_back(p);
         return static_cast<T*>(p);
     }
-    void free_all() { for (void* b : bufs) cudaFree(b); bufs.clear(); }
+    void free_all() {
+        const bool use_async = stream && async_enabled();
+        for (void* b : bufs) { if (use_async) cudaFreeAsync(b, stream); else cudaFree(b); }
+        bufs.clear();
+    }
 };
+// Let the pool keep recently-freed blocks resident instead of returning them to the OS on every
+// free (the default release threshold is 0 = release immediately, which defeats the point). Capped
+// well under the ~10 GB of VRAM the batched scratch never approaches at once, so this can't starve
+// the resident model weights or the KV cache. One-time, thread-safe (C++11 static local init).
+void ensure_prefill_mempool_tuned(cudaStream_t stream) {
+    if (!stream || !Arena::async_enabled()) return;
+    static const bool tuned = [] {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        cudaMemPool_t pool;
+        if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess) return false;
+        uint64_t threshold = 3ull << 30;   // 3 GB cap on cached-but-unused pool memory
+        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+        return true;
+    }();
+    (void)tuned;
+}
 } // namespace
 
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n) {
@@ -107,7 +149,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     bf16* lin_conv_state = static_cast<bf16*>(s.lin_conv_state);
 
     // ---- scratch ----
-    Arena a;
+    ensure_prefill_mempool_tuned(st);
+    Arena a; a.stream = st;
     bf16* x    = a.alloc<bf16>((size_t)N * H);
     bf16* xn   = a.alloc<bf16>((size_t)N * H);
     bf16* hn   = a.alloc<bf16>((size_t)N * H);
@@ -198,7 +241,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // SPARKINFER_PREFILL_MOE_FP8=0 restores the bf16 projections (A/B).
     const char* _pmfp8 = getenv("SPARKINFER_PREFILL_MOE_FP8");
     bool moe_fp8 = moe && (!_pmfp8 || _pmfp8[0] != '0');
-    Arena a8;
+    Arena a8; a8.stream = st;
     // A_i8 holds the quantized activation. Dense full-i8: non-FFN projs quantize N rows x K(<=H);
     // chunked FFN quantizes at most FC rows x ffn. Long-ctx selective: N*H if attn-i8/fp8-gdn else FC*ffn.
     // MoE: no chunked FFN; projections quantize N rows x maxAK.
@@ -227,7 +270,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
-    Arena aw;
+    Arena aw; aw.stream = st;
     signed char *ffn_Wg_i8 = nullptr, *ffn_Wu_i8 = nullptr, *ffn_Wd_i8 = nullptr;
     float *ffn_swg = nullptr, *ffn_swu = nullptr, *ffn_swd = nullptr;
     if (use_i8_ffn) {
@@ -324,7 +367,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         const char* e = getenv("SPARKINFER_PREFILL_HIDE_SG");
         return e && e[0] == '1';
     }();
-    Arena am;
+    Arena am; am.stream = st;
     signed char *Wg_i8 = nullptr, *Wu_i8 = nullptr, *Wd_i8 = nullptr, *h_i8 = nullptr, *mA_i8 = nullptr;
     float *swg = nullptr, *swu = nullptr, *swd = nullptr, *sh = nullptr, *msx = nullptr;
     float *mlogits = nullptr, *mweights = nullptr, *pair_w = nullptr, *routed_f32 = nullptr, *dw = nullptr;
