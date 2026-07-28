@@ -270,21 +270,6 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         const char* e = getenv("SPARKINFER_PREFILL_MOE_FUSED");
         return e && e[0] == '1';
     }();
-    // Fused gate+up GEMM (BM=16): one A staging pass per K-tile. Default ON at short-N.
-    const bool moe_fuse_gu = [&]{
-        if (!moe || moe_bm != 16) return false;
-        const char* e = getenv("SPARKINFER_PREFILL_MOE_FUSE_GU");
-        return !e || e[0] != '0';
-    }();
-    // Expert-group L2 path: dequant G experts (~G*3 MB) then GEMM that group while hot in
-    // L2. Wins at short-N (N<=512, G=32 → +5% @512); bulk is faster once tiles fill. Default
-    // ON for N<=512. SPARKINFER_PREFILL_MOE_SERIAL=0/1 overrides; GROUP default 32.
-    const bool moe_serial = [&]{
-        if (!moe || moe_fused) return false;
-        const char* e = getenv("SPARKINFER_PREFILL_MOE_SERIAL");
-        if (e) return e[0] != '0';
-        return N <= 512;
-    }();
     // Fused quantized-B routed GEMM (prefill_moe_q.cu): read the experts in their native GGUF
     // quantization and decode to int8 inside the B stage, so the per-layer int8 materialize never
     // happens (~1.6 GB/layer of write + read back). The dequant is a FIXED per-pass cost — it
@@ -293,7 +278,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // It pays only while each expert slice is decoded ~once, i.e. while pairs/expert stays inside a
     // couple of BM tiles: at BM=128 that is 1 tile at 4k and 2 at 8k, but 8 at 32k, where
     // re-decoding costs more than materializing. Hence the context cap (default 8192, which is also
-    // the CB mixed-load TTFT prefill size). SPARKINFER_PREFILL_MOE_QB=0 disables.
+    // the CB mixed-load TTFT prefill size). SPARKINFER_PREFILL_MOE_QB=0 disables. Moved above
+    // moe_serial: a BM=16 tiled kernel now exists too (see below), so moe_serial's default needs
+    // to know whether the fused path can already cover this N before falling back to it.
     const int moe_qb_maxctx = [&]{
         const char* e = getenv("SPARKINFER_PREFILL_MOE_QB_MAXCTX");
         const int v = e ? atoi(e) : 8192;
@@ -307,8 +294,35 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         const char* e = getenv("SPARKINFER_PREFILL_MOE_QB");
         return e ? atoi(e) : 7;
     }();
-    const bool moe_qb = moe && !moe_serial && !moe_fused && N <= moe_qb_maxctx &&
-                        s.moe_rs_gate && s.moe_rs_up && s.moe_rs_down && moe_qb_mask != 0;
+    const bool moe_qb_avail = moe && !moe_fused && N <= moe_qb_maxctx &&
+                              s.moe_rs_gate && s.moe_rs_up && s.moe_rs_down && moe_qb_mask != 0;
+    // Expert-group L2 path: dequant G experts (~G*3 MB) then GEMM that group while hot in
+    // L2. Was the default at N<=512 because until now the fused quantized-B GEMM (above) only had
+    // a BM=128 tiling, which under-fills badly at N<=512 (avg pairs/expert = N*top_k/E, ~16 at
+    // N=512 vs a 128-row tile). A BM=16 tiling of the SAME fused-decode kernel now exists
+    // (prefill_moe_q.cu's pfm_moe_gemm_qi8_bm16_kernel, matching this file's own moe_bm=16
+    // choice), so prefer it over materializing — it removes the same fixed per-layer dequant this
+    // path could only shrink via L2-resident chunking. SPARKINFER_PREFILL_MOE_SERIAL=1 forces the
+    // old L2 path back on for A/B; GROUP default 32.
+    const bool moe_serial = [&]{
+        if (!moe || moe_fused) return false;
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_SERIAL");
+        if (e) return e[0] != '0';
+        if (moe_bm == 16 && moe_qb_avail) return false;
+        return N <= 512;
+    }();
+    const bool moe_qb = moe_qb_avail && !moe_serial;
+    // Fused gate+up GEMM (BM=16, materialized-int8 bulk path): one A staging pass per K-tile.
+    // Default ON at short-N UNLESS moe_qb is already going to run gate/up through the fused-decode
+    // kernel (see the bulk branch below) — that path stages A once per weight anyway and skips the
+    // materialize this fusion was built to amortize, so forcing materialize+gate_up_bm16 back on
+    // top of it would just re-introduce the dequant moe_qb exists to remove.
+    const bool moe_fuse_gu = [&]{
+        if (!moe || moe_bm != 16) return false;
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_FUSE_GU");
+        if (e) return e[0] != '0';
+        return !moe_qb;
+    }();
     // Device tilemap + mask dequant: skip per-layer D2H counts sync. Default OFF — opt-in via
     // SPARKINFER_PREFILL_MOE_GPU=1. The #583 default-ON path fails prefill_check (batched vs
     // token-loop TOP1 ~0.44–0.56 @512 vs ~0.88–0.94 with host tilemap; #586). Stale global

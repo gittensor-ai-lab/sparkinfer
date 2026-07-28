@@ -24,7 +24,7 @@ namespace kernels {
 //   W_q        native GGUF expert pool, [E][n_out][K] blocks of `ggml_type`
 //   row_scale  per (expert, n_out) int8 row scale, [E * n_out], as produced by
 //              launch_gguf_dequant_rows_i8 (scale[row] = amax/127)
-//   bm         16 or 128, must match the tilemap the caller built
+//   bm         16 or 128, must match the tilemap the caller built (both tiled shapes implemented)
 bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float* sx,
                              const void* W_q, const float* row_scale,
                              const int* pair_tok, const float* pair_w,
