@@ -2318,6 +2318,9 @@ def main():
     ap.add_argument("--ceiling", type=float, default=0)
     ap.add_argument("--repo", default="gittensor-ai-lab/sparkinfer")
     ap.add_argument("--dry-run", action="store_true", help="evaluate + print, but don't label/comment")
+    ap.add_argument("--labels-only", action="store_true",
+                    help="apply greenlight/needs-benchmark/merge labels only — no GPU eval "
+                         "(used by cron when the pinned box is down; never rents)")
     # Dual-model: score Qwen3.6-35B-A3B (primary) and guard Qwen3-30B against no-regression.
     # Each PR is scored directly against the SAME-BOX origin/main baseline (measured once per run),
     # not a passed-in frontier number — so the gain is hardware-independent and always current.
@@ -2622,6 +2625,15 @@ def main():
     if args.dry_run:
         print("--- dry-run: would evaluate (oldest-first): " +
               ", ".join(f"#{n}" for _, n, *_ in pending)); return
+
+    if args.labels_only:
+        # GPU unavailable / cron tick with box down: labels already applied above; still reconcile
+        # merge-first / needs-rebase / auto-merge. Never touch vast.ai rent/start from here.
+        print("--- labels-only: skipping GPU eval for " +
+              ", ".join(f"#{n}" for _, n, *_ in pending))
+        if not args.dry_run:
+            reconcile_merge_labels(args.repo)
+        print("done — labels only (no GPU)."); return
 
     # Reuse the pinned stable box first (cached model, good download speed). Skip when on bare metal.
     if PINNED_INSTANCE and not ssh_box_enabled():
