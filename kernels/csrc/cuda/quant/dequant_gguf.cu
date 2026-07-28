@@ -224,11 +224,20 @@ __global__ void deq_rows_i8_twopass_kernel(const unsigned char* __restrict__ src
     }
 }
 
+// One warp per 32-value quant block: lane l owns value l, so both the 32B int8 read and the 64B
+// bf16 write are fully coalesced across the warp. The prior version ran one THREAD per block
+// through a 32-iteration serial loop -- every store in that loop was 64B (one block's worth) away
+// from the next lane's, so the warp's stores never coalesced at all. Q4_K/Q5_K/Q6_K already got
+// this treatment (launch_gguf_dequant_fast); Q8_0 (attn/GDN projection weights, unconditionally
+// dequanted every batched-prefill call) never did. Bit-identical: same d*q[l] per element.
 __global__ void deq_q8_0_kernel(const unsigned char* __restrict__ src, __nv_bfloat16* __restrict__ y, long nblocks) {
-    long b = (long)blockIdx.x * blockDim.x + threadIdx.x; if (b >= nblocks) return;
-    const unsigned char* blk = src + b * 34; float d = gg_h2f(blk);
-    const signed char* q = (const signed char*)(blk + 2); __nv_bfloat16* yy = y + b * 32;
-    for (int l = 0; l < 32; l++) yy[l] = __float2bfloat16(d * q[l]);
+    const long warp_id = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (warp_id >= nblocks) return;
+    const int lane = threadIdx.x & 31;
+    const unsigned char* blk = src + warp_id * 34;
+    const float d = gg_h2f(blk);
+    const signed char q = ((const signed char*)(blk + 2))[lane];
+    y[warp_id * 32 + lane] = __float2bfloat16(d * (float)q);
 }
 
 __global__ void deq_f16_kernel(const unsigned char* __restrict__ src, __nv_bfloat16* __restrict__ y, long n) {
@@ -264,7 +273,8 @@ void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_
     if (ggml_type == GGML_Q4_K) { long nb = n_values/256; deq_q4k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_Q5_K) { long nb = n_values/256; deq_q5k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_Q6_K) { long nb = n_values/256; deq_q6k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
-    else if (ggml_type == GGML_Q8_0) { long nb = n_values/32;  deq_q8_0_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
+    else if (ggml_type == GGML_Q8_0) { long nb = n_values/32;  const long thr = nb*32;
+                                        deq_q8_0_kernel<<<(thr+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_F16)  { deq_f16_kernel<<<(n_values+T-1)/T,T,0,stream>>>(s,d,n_values); }
     else /* F32 */                   { deq_f32_kernel<<<(n_values+T-1)/T,T,0,stream>>>(reinterpret_cast<const float*>(src),d,n_values); }
 }

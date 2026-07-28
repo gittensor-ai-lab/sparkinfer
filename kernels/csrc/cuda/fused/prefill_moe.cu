@@ -893,6 +893,22 @@ void launch_pfm_moe_gemm_i8_bm_base(const signed char* A_i8, const float* sx,
                 A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
         return;
     }
+    // Default ON: drive the long-N tile with native int8 mma.sync (m16n8k32) instead of wmma k16.
+    // Bit-identical int32 accumulation; SPARKINFER_PREFILL_MOE_MMA=0 disables (A/B). Only the gate/up
+    // projections (K=hidden, MMA-issue-bound) win from the native k32 shape; the down projection
+    // (c_scatter, K=ffn=512) is scatter-bound and neutral-to-slower, so keep it on wmma.
+    // Unreachable for short-N (N<=512, the default moe_serial threshold): the bm==PM_BM_SHORT branch
+    // above already returned, so this dispatch never runs there regardless of moe_mma's value.
+    static const bool moe_mma = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_MMA");
+        return !(e && e[0] == '0');
+    }();
+    if (moe_mma && !c_scatter) {
+        launch_pfm_moe_gemm_i8_mma(A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles,
+                                   C_bf16, out_f32, N_out, K, max_tiles, e_base,
+                                   a_indirect, c_scatter, stream);
+        return;
+    }
     if (a_indirect && !c_scatter)
         pfm_moe_gemm_i8_kernel<true, false><<<grid, 256, 0, stream>>>(
             A_i8, sx, W_i8, sw, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, N_out, K, e_base);
