@@ -42,7 +42,7 @@ BOT_ARGS=(
   --repo     "${REPO:-gittensor-ai-lab/sparkinfer}"
 )
 if [ "${EVAL_TRANSPORT:-vast}" != "ssh" ]; then
-  BOT_ARGS+=(--instance "${VAST_INSTANCE:-42682383}")
+  BOT_ARGS+=(--instance "${VAST_INSTANCE:-${VAST_DEFAULT_INSTANCE:-0}}")
 fi
 if printf '%s\n' "$@" | grep -qx -- '--bidir' || \
    [ -n "${BIDIR:-${TRIPLE:-1}}" ] && [ "${BIDIR:-${TRIPLE:-1}}" != "0" ] || \

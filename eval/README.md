@@ -160,10 +160,12 @@ python eval/pr_eval_bot.py --instance 42134865 --dry-run                       #
 ```bash
 crontab -l 2>/dev/null; echo "0 */2 * * * $PWD/eval/run_bot_cron.sh >> /tmp/sparkinfer_bot.log 2>&1" | crontab -
 ```
-Each run: **never rents a GPU**. If the pinned instance is already running and SSH works → full
-eval of new PR commits. If the GPU is stopped/unreachable → `--labels-only` (greenlight /
-needs-benchmark / merge-first reconcile, no GPU). Disable with `crontab -e`. Needs `gh`
-authenticated and `VAST_INSTANCE` in `.env.eval` (`VAST_NO_AUTO_PROVISION=1`).
+Each run: **always uses the pinned GPU** (`VAST_DEFAULT_INSTANCE` /
+`~/.sparkinfer_pinned_instance`). **Never rents** a new one. If the pin is already running and
+SSH works → full eval of new PR commits. If the pin is stopped/unreachable → `--labels-only`
+(greenlight / needs-benchmark / merge-first reconcile, no GPU). Disable with `crontab -e`. Needs
+`gh` authenticated and `VAST_INSTANCE` / `VAST_DEFAULT_INSTANCE` in `.env.eval`
+(`VAST_NO_AUTO_PROVISION=1`).
 
 **Dashboard.** Eval verdicts and frontier updates are committed to
 [`gittensor-ai-lab/sparkinfer-web`](https://github.com/gittensor-ai-lab/sparkinfer-web)

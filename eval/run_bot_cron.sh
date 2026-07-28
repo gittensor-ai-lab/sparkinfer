@@ -4,10 +4,10 @@
 #   0 */2 * * * /home/autotiny/Desktop/sparkinfer/eval/run_bot_cron.sh >> /tmp/sparkinfer_bot.log 2>&1
 #
 # Policy:
-#   • Never rent a new vast.ai GPU (pinned instance only; VAST_NO_AUTO_PROVISION=1).
+#   • Always target the pinned vast.ai GPU (VAST_DEFAULT_INSTANCE / ~/.sparkinfer_pinned_instance).
+#   • Never rent a new GPU (VAST_NO_AUTO_PROVISION=1). Never destroy the pin.
 #   • If the pinned box is running AND SSH-reachable → full eval + auto-merge.
-#   • If the box is down/stopped/unreachable → labels only (greenlight / needs-benchmark /
-#     merge-first reconcile). No start_instance, no provision.
+#   • If the pin is stopped/unreachable → labels only (no start_instance, no provision).
 #
 # Transport (set in .env.eval or env):
 #   EVAL_TRANSPORT=vast  — reuse pinned vast.ai instance (default)
@@ -40,13 +40,35 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 
 git pull -q origin main 2>/dev/null || true
 
+# Resolve the pinned GPU id (file wins, then env). Sync pin + instance files so the bot
+# always --reuse's this box and never drifts to a self-healed rental id.
+PIN_FILE="${VAST_PIN_FILE:-$HOME/.sparkinfer_pinned_instance}"
+INSTANCE_FILE="${VAST_INSTANCE_FILE:-$HOME/.sparkinfer_vast_instance}"
+resolve_pin() {
+  local v=""
+  if [ -f "$PIN_FILE" ]; then
+    v="$(tr -d '[:space:]' <"$PIN_FILE" 2>/dev/null || true)"
+  fi
+  if [ -z "$v" ] || [ "$v" = "0" ]; then
+    v="${VAST_DEFAULT_INSTANCE:-${VAST_INSTANCE:-}}"
+  fi
+  printf '%s' "$v"
+}
+PINNED_ID="$(resolve_pin)"
+if [ "${EVAL_TRANSPORT:-vast}" != "ssh" ] && [ -n "$PINNED_ID" ] && [ "$PINNED_ID" != "0" ]; then
+  export VAST_INSTANCE="$PINNED_ID"
+  export VAST_DEFAULT_INSTANCE="$PINNED_ID"
+  printf '%s\n' "$PINNED_ID" >"$PIN_FILE"
+  printf '%s\n' "$PINNED_ID" >"$INSTANCE_FILE"
+fi
+
 BOT_ARGS=(
   --frontier "${FRONTIER:-285}"
   --ceiling  "${CEILING:-366}"
   --repo     "${REPO:-gittensor-ai-lab/sparkinfer}"
 )
 if [ "${EVAL_TRANSPORT:-vast}" != "ssh" ]; then
-  BOT_ARGS+=(--instance "${VAST_INSTANCE:-${VAST_DEFAULT_INSTANCE:-0}}")
+  BOT_ARGS+=(--instance "${VAST_INSTANCE:-0}")
 fi
 [ "${BIDIR:-${TRIPLE:-1}}" != "0" ] && BOT_ARGS+=(--bidir --primary-quant "${PRIMARY_QUANT:-Q4_K_M}")
 if [ "${POLARIS:-1}" = "0" ]; then
@@ -55,7 +77,7 @@ else
   BOT_ARGS+=(--polaris)
 fi
 
-# Returns 0 iff the eval GPU is usable right now (no rent, no start).
+# Returns 0 iff the pinned eval GPU is usable right now (no rent, no start).
 gpu_ready() {
   local key="${SSH_KEY:-$HOME/.ssh/speedy}"
   if [ "${EVAL_TRANSPORT:-vast}" = "ssh" ]; then
@@ -65,7 +87,7 @@ gpu_ready() {
         -o StrictHostKeyChecking=accept-new -p "$port" "root@$host" 'true' 2>/dev/null
     return $?
   fi
-  local iid="${VAST_INSTANCE:-${VAST_DEFAULT_INSTANCE:-}}"
+  local iid="${VAST_INSTANCE:-}"
   [ -n "$iid" ] && [ "$iid" != "0" ] || return 1
   command -v vastai >/dev/null 2>&1 || return 1
   local raw st ip port
@@ -86,9 +108,9 @@ print(st, ip, p)
 
 TS="$(date -u +%FT%TZ)"
 if gpu_ready; then
-  echo "[$TS] sparkinfer PR bot — GPU up — full eval (AUTOMERGE=${SPARKINFER_AUTOMERGE}, no-rent)"
+  echo "[$TS] sparkinfer PR bot — pinned GPU ${VAST_INSTANCE:-ssh} up — full eval (AUTOMERGE=${SPARKINFER_AUTOMERGE}, no-rent)"
   python3 eval/pr_eval_bot.py "${BOT_ARGS[@]}"
 else
-  echo "[$TS] sparkinfer PR bot — GPU down/unreachable — labels only (no rent, no start)"
+  echo "[$TS] sparkinfer PR bot — pinned GPU ${VAST_INSTANCE:-?} down/unreachable — labels only (no rent, no start)"
   python3 eval/pr_eval_bot.py "${BOT_ARGS[@]}" --labels-only
 fi
