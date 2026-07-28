@@ -33,6 +33,8 @@ fi
 export SSH_KEY="${SSH_KEY:-$HOME/.ssh/speedy}"
 export PATH="/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1
+# Auto-merge the round's merge-first winner (guarded). Override with SPARKINFER_AUTOMERGE=0.
+export SPARKINFER_AUTOMERGE="${SPARKINFER_AUTOMERGE:-1}"
 
 BOT_ARGS=(
   --frontier "${FRONTIER:-285}"
@@ -53,5 +55,5 @@ else
   BOT_ARGS+=(--polaris)
 fi
 
-echo "[$(date -u +%FT%TZ)] eval bot (EVAL_TRANSPORT=${EVAL_TRANSPORT:-vast}, POLARIS=${POLARIS:-1}, SSH_KEY=$SSH_KEY)"
+echo "[$(date -u +%FT%TZ)] eval bot (EVAL_TRANSPORT=${EVAL_TRANSPORT:-vast}, POLARIS=${POLARIS:-1}, AUTOMERGE=${SPARKINFER_AUTOMERGE:-0}, SSH_KEY=$SSH_KEY)"
 exec python3 eval/pr_eval_bot.py "${BOT_ARGS[@]}" "$@"
