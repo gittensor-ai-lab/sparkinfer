@@ -1715,44 +1715,30 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         }
         for (int i = 1; i < B; i++) block[i] = draft_ids[i];
 
-        save_spec_snapshot();
-        const int kv_blocks = s.kv->num_blocks(s.active_seq_id);
-        if (!verify_block(block.data(), B, start, posterior.data())) {
-            fprintf(stderr, "[dflash] verify failed at start=%d\n", start);
-            break;
+        // Incremental verify with early-exit: forward only the accepted prefix, stopping at the
+        // first rejected proposal. forward_token advances GDN state + KV per token, so after
+        // block[0..keep-1] the recurrent state and KV sit exactly at start+keep -- no snapshot /
+        // restore / KV-truncate / replay needed (greedy speculative decoding is exact). Rejected
+        // proposals (block[keep..B-1]) are never forwarded, saving ~B-keep target forwards/step.
+        int accept = 0, keep = 0;
+        bool vfail = false;
+        for (int i = 0; i < B; i++) {
+            set_dflash_capture_row(i);
+            const int p = forward_token(block[i], start + i, true);
+            if (p < 0) { vfail = true; break; }
+            posterior[i] = p;
+            accept = i;
+            keep = i + 1;
+            if (i + 1 < B && block[i + 1] != p) break;   // first mismatch -> reject the rest
         }
-        int accept = 0;
-        for (; accept < B - 1; accept++) {
-            if (block[accept + 1] != posterior[accept]) break;
-        }
-        const int keep = accept + 1;
+        if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
+        // Accepted hiddens are in dflash_hidden rows 0..keep-1 (captured above); hand them to the
+        // next draft block via th_scratch and stash into the context buffer by global position.
         cu(cudaMemcpyAsync(th_scratch, s.dflash_hidden,
                            (size_t)keep * row_stride * sizeof(bf16),
                            cudaMemcpyDeviceToDevice, s.stream), "th keep");
+        for (int i = 0; i < keep; i++) dflash_stash_capture(start + i);
         cu(cudaStreamSynchronize(s.stream), "th sync");
-
-        // Full-block accept: verify already left KV/GDN at start+B — skip rollback.
-        // Partial accept: restore snapshot and replay the kept prefix (Phase 0 correctness).
-        if (accept < B - 1) {
-            restore_spec_snapshot();
-            s.kv->truncate_blocks(s.active_seq_id, kv_blocks);
-            // truncate returns pages to the pool — grow the table back before replay.
-            if (!s.kv->allocate(s.active_seq_id, start + keep + B)) {
-                fprintf(stderr, "[dflash] KV re-allocate failed after truncate\n");
-                break;
-            }
-            for (int i = 0; i < keep; i++) {
-                set_dflash_capture_row(0);
-                (void)forward_token(block[i], start + i, true);
-                dflash_stash_capture(start + i);
-            }
-        } else {
-            // Verify rows already hold the accepted hiddens — stash into context by row index.
-            for (int i = 0; i < keep; i++) {
-                set_dflash_capture_row(i);
-                dflash_stash_capture(start + i);
-            }
-        }
 
         bool stop = false;
         for (int i = 0; i < keep && (int)out.size() < max_new; i++) {
