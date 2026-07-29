@@ -1064,9 +1064,38 @@ __global__ void gemv_q6k_dp4a_multirow_kernel(const si_block_q8_1* __restrict__ 
     for (int m = 0; m < MMAX; m++) acc[m] = 0.f;
     #pragma unroll
     for (int kbx = 0; kbx < NSUPER; kbx++) {
-        const unsigned char* wblk = x_row + (size_t)kbx * 210;   // read once, reused by all M
-        for (int m = 0; m < M; m++)
-            acc[m] += si_vec_dot_q6_K(wblk, vy + (size_t)m * QPR + (size_t)kbx * 8, lane);
+        const unsigned char* wblk = x_row + (size_t)kbx * 210;
+        // Hoist the weight-side work out of the M loop: the 6-bit unpack, the super-block scale
+        // and d depend only on the weight, so calling si_vec_dot_q6_K per activation row redid
+        // all of it M times. Unpack once here, then each row costs just two dp4a's.
+        const signed char* scales = reinterpret_cast<const signed char*>(wblk + 192);
+        const float wd = gq_h2f(wblk + 208);
+        const int bq8_offset   = 4 * (lane / 16) + (lane % 16) / 8;
+        const int scale_offset = 8 * (lane / 16) + (lane % 16) / 4;
+        const int vh_shift     = 2 * ((lane % 16) / 8);
+        const int vl = si_get_int_b2(wblk, lane);
+        const int vh = si_get_int_b2(wblk + 128, 8 * (lane / 16) + (lane % 8)) >> vh_shift;
+        const signed char* sc = scales + scale_offset;
+        int vi[2], scv[2];
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
+            const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+            vi[i]  = __vsubss4((vil | vih), 0x20202020);
+            scv[i] = (int)sc[4 * i];
+        }
+        const si_block_q8_1* a0 = vy + (size_t)kbx * 8;
+        for (int m = 0; m < M; m++) {
+            const si_block_q8_1* row = a0 + (size_t)m * QPR;
+            float sumf = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const si_block_q8_1* b8 = row + bq8_offset + 2 * i;
+                const int u = reinterpret_cast<const int*>(b8->qs)[lane % 8];
+                sumf += __low2float(b8->ds) * (__dp4a(vi[i], u, 0) * scv[i]);
+            }
+            acc[m] += wd * sumf;
+        }
     }
     for (int m = 0; m < M; m++) {
         float a = acc[m];
