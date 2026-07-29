@@ -3,6 +3,7 @@
 #include "sparkinfer/models/dflash_kernels.h"
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/fused.h"
+#include "sparkinfer/kernels/quant.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -247,6 +248,7 @@ struct DFlashDraftModel::Impl {
     int lm_head_type = 0;
     int vocab = 0;
     int hidden = 0;
+    bf16* lm_head_bf16 = nullptr;  // eager dequant+transpose cache for the batched LM-head GEMM
 
     // Scratch
     cudaStream_t stream{};
@@ -314,6 +316,21 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
     p_->lm_head_type = lm_head_type;
     p_->vocab = vocab;
     p_->hidden = hidden;
+    // Eagerly dequantize the (static, resident) lm_head weight to bf16 exactly once, in its
+    // native [vocab,hidden] ("out,in") layout -- dflash_kernels::launch_gemv_batched16_f32
+    // reads W the same way a single-row GEMV does, so no relayout is needed. Lets
+    // forward_block score a whole block with one batched GEMV instead of a per-token loop.
+    if (!p_->lm_head_bf16 && vocab > 0 && hidden > 0) {
+        p_->lm_head_bf16 = p_->alloc<bf16>((size_t)vocab * hidden);
+        if (lm_head_type != 0) {
+            kernels::launch_gguf_dequant(lm_head_type, lm_head, p_->lm_head_bf16,
+                                         (long)vocab * hidden, p_->stream);
+        } else {
+            cu(cudaMemcpyAsync(p_->lm_head_bf16, lm_head, (size_t)vocab * hidden * sizeof(bf16),
+                               cudaMemcpyDeviceToDevice, p_->stream), "lm_head copy");
+        }
+        cu(cudaStreamSynchronize(p_->stream), "lm_head dequant");
+    }
 }
 
 void DFlashDraftModel::reset() { p_->seq_len = 0; }
@@ -439,6 +456,11 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     const int d = c.head_dim;
     const float scale = 1.f / sqrtf((float)d);
     const int past = s.seq_len;
+    // The fixed-size (block_size) projections below can use a batched-GEMV kernel that reads
+    // each weight row from DRAM once instead of once per token (see dflash_kernels.cu). It's
+    // compiled for exactly 16 rows, so it's only used when the draft's block_size is 16 (true
+    // for the current checkpoint); any other block_size falls back to the per-token GEMV loop.
+    const bool fast16 = (B == 16);
 
     cu(cudaMemcpyAsync(s.d_ids, noise_ids, B * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
     kernels::launch_embedding(s.d_ids, s.embed, s.noise, B, H, st);
@@ -464,8 +486,11 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, B, H, c.rms_eps, st);
 
         // Q from noise, K/V from cat(target, noise)
-        for (int t = 0; t < B; t++) {
-            kernels::launch_gemv(s.xn + (size_t)t * H, w.wq, s.q + (size_t)t * qdim, qdim, H, st);
+        if (fast16) {
+            dflash_kernels::launch_gemv_batched16(s.xn, w.wq, s.q, qdim, H, st);
+        } else {
+            for (int t = 0; t < B; t++)
+                kernels::launch_gemv(s.xn + (size_t)t * H, w.wq, s.q + (size_t)t * qdim, qdim, H, st);
         }
         // Build k_new / v_new = cat(k_ctx, k_noise)
         for (int t = 0; t < ctx_len; t++) {
@@ -474,11 +499,18 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wv,
                                  s.v_new + (size_t)t * kvdim, kvdim, H, st);
         }
-        for (int t = 0; t < B; t++) {
-            kernels::launch_gemv(s.xn + (size_t)t * H, w.wk,
-                                 s.k_new + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
-            kernels::launch_gemv(s.xn + (size_t)t * H, w.wv,
-                                 s.v_new + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
+        if (fast16) {
+            dflash_kernels::launch_gemv_batched16(s.xn, w.wk, s.k_new + (size_t)ctx_len * kvdim,
+                                                  kvdim, H, st);
+            dflash_kernels::launch_gemv_batched16(s.xn, w.wv, s.v_new + (size_t)ctx_len * kvdim,
+                                                  kvdim, H, st);
+        } else {
+            for (int t = 0; t < B; t++) {
+                kernels::launch_gemv(s.xn + (size_t)t * H, w.wk,
+                                     s.k_new + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
+                kernels::launch_gemv(s.xn + (size_t)t * H, w.wv,
+                                     s.v_new + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
+            }
         }
 
         const int new_len = ctx_len + B;
@@ -515,32 +547,51 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                         B, kv_len, c.n_q_heads, c.n_kv_heads, d,
                                         q_pos0, /*k_pos0_cache=*/0, window, scale, st);
 
-        for (int t = 0; t < B; t++)
-            kernels::launch_gemv(s.attn + (size_t)t * qdim, w.wo, s.ao + (size_t)t * H, H, qdim, st);
+        if (fast16) {
+            dflash_kernels::launch_gemv_batched16(s.attn, w.wo, s.ao, H, qdim, st);
+        } else {
+            for (int t = 0; t < B; t++)
+                kernels::launch_gemv(s.attn + (size_t)t * qdim, w.wo, s.ao + (size_t)t * H, H, qdim, st);
+        }
         dflash_kernels::launch_add(s.x, s.ao, s.h, B * H, st);
 
         dflash_kernels::launch_rms(s.h, w.post_norm, s.hn, B, H, c.rms_eps, st);
-        for (int t = 0; t < B; t++) {
-            kernels::launch_gemv(s.hn + (size_t)t * H, w.gate, s.gate + (size_t)t * I, I, H, st);
-            kernels::launch_gemv(s.hn + (size_t)t * H, w.up,   s.up   + (size_t)t * I, I, H, st);
+        if (fast16) {
+            dflash_kernels::launch_gemv_batched16(s.hn, w.gate, s.gate, I, H, st);
+            dflash_kernels::launch_gemv_batched16(s.hn, w.up, s.up, I, H, st);
+        } else {
+            for (int t = 0; t < B; t++) {
+                kernels::launch_gemv(s.hn + (size_t)t * H, w.gate, s.gate + (size_t)t * I, I, H, st);
+                kernels::launch_gemv(s.hn + (size_t)t * H, w.up,   s.up   + (size_t)t * I, I, H, st);
+            }
         }
         dflash_kernels::launch_swiglu(s.gate, s.up, s.gate, B * I, st);
-        for (int t = 0; t < B; t++)
-            kernels::launch_gemv(s.gate + (size_t)t * I, w.down, s.down + (size_t)t * H, H, I, st);
+        if (fast16) {
+            dflash_kernels::launch_gemv_batched16(s.gate, w.down, s.down, H, I, st);
+        } else {
+            for (int t = 0; t < B; t++)
+                kernels::launch_gemv(s.gate + (size_t)t * I, w.down, s.down + (size_t)t * H, H, I, st);
+        }
         dflash_kernels::launch_add(s.h, s.down, s.x, B * H, st);
     }
 
     dflash_kernels::launch_rms(s.x, s.final_norm, s.xn, B, H, c.rms_eps, st);
 
-    // LM head (target weights) -> logits / argmax. Skip row 0 for proposals but still compute.
+    // LM head (target weights) -> logits / argmax. Batched over the whole block: one batched
+    // GEMV against the eagerly dequantized bf16 lm_head cache instead of a per-token
+    // quantized GEMV loop.
     const int V = s.vocab > 0 ? s.vocab : c.vocab;
-    for (int t = 0; t < B; t++) {
-        const bf16* row = s.xn + (size_t)t * H;
-        float* logit_row = s.logits + (size_t)t * V;
-        if (s.lm_head_type)
-            kernels::launch_gemv_q_f32(row, s.lm_head, s.lm_head_type, logit_row, V, H, st);
-        else
-            kernels::launch_gemv_f32(row, s.lm_head, logit_row, V, H, st);
+    if (fast16) {
+        dflash_kernels::launch_gemv_batched16_f32(s.xn, s.lm_head_bf16, s.logits, V, H, st);
+    } else {
+        for (int t = 0; t < B; t++) {
+            const bf16* row = s.xn + (size_t)t * H;
+            float* logit_row = s.logits + (size_t)t * V;
+            if (s.lm_head_type)
+                kernels::launch_gemv_q_f32(row, s.lm_head, s.lm_head_type, logit_row, V, H, st);
+            else
+                kernels::launch_gemv_f32(row, s.lm_head, logit_row, V, H, st);
+        }
     }
     kernels::launch_argmax(s.logits, s.d_out, B, V, st);
     cu(cudaMemcpyAsync(s.h_out, s.d_out, B * sizeof(int), cudaMemcpyDeviceToHost, st), "argmax");

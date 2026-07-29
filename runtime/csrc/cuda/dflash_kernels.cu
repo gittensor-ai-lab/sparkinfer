@@ -143,6 +143,87 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
         ov[i] = f2b(acc[i] * inv);
 }
 
+// One warp per output row `n`, computing y[b][n] = sum_k x[b][k] * W[n][k] for all b in
+// [0,BATCH) at once. W stays in its native [N,K] "out,in" row-major layout (the same layout
+// the single-row GEMV path reads) -- unlike a tiled A@B GEMM, this needs no relayout. Each
+// warp reads its weight row from DRAM once and reuses it across the whole BATCH instead of
+// once per row, so BATCH separate GEMV launches collapse into one launch with ~BATCH-times
+// less weight traffic. Register cost is O(BATCH), so this is only used for the draft's
+// fixed block_size batch (16), never for the variable, potentially-large context length.
+// K is always a multiple of 8 for every weight this is used on (H=2048, qdim=4096,
+// kvdim=1024, I=6144), and cudaMalloc'd row bases land on >=16-byte boundaries, so every
+// lane's 8-element (16-byte) chunk is safely loadable as one uint4 -- this is the kernel's
+// dominant cost (each lane otherwise issues K/32 separate 2-byte loads per weight row), same
+// lesson as the fused prefill dequant-GEMM kernels: load width, not FLOPs, is the limiter here.
+template <int BATCH>
+__global__ void k_gemv_batched(const bf16* __restrict__ x, const bf16* __restrict__ W,
+                               bf16* __restrict__ y, int N, int K) {
+    const int warps_per_block = blockDim.x / 32;
+    const int n = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    if (n >= N) return;
+    const int lane = threadIdx.x & 31;
+    float acc[BATCH];
+#pragma unroll
+    for (int b = 0; b < BATCH; b++) acc[b] = 0.f;
+    const uint4* wrow4 = (const uint4*)(W + (size_t)n * K);
+    const int K8 = K / 8;
+    for (int k8 = lane; k8 < K8; k8 += 32) {
+        const bf16* wv = (const bf16*)&wrow4[k8];
+#pragma unroll
+        for (int b = 0; b < BATCH; b++) {
+            const bf16* xv = (const bf16*)&(((const uint4*)(x + (size_t)b * K))[k8]);
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < BATCH; b++) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc[b] += __shfl_down_sync(0xffffffffu, acc[b], off);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int b = 0; b < BATCH; b++) y[(size_t)b * N + n] = f2b(acc[b]);
+    }
+}
+
+// Same batched-GEMV shape as k_gemv_batched, but for the LM head: fp32 accumulate/output
+// (matching the precision the original per-row launch_gemv_q_f32/launch_gemv_f32 path used
+// for logits) and no BATCH-sized register cap on N (vocab is large, only grid.x scales).
+template <int BATCH>
+__global__ void k_gemv_batched_f32(const bf16* __restrict__ x, const bf16* __restrict__ W,
+                                   float* __restrict__ y, int N, int K) {
+    const int warps_per_block = blockDim.x / 32;
+    const int n = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    if (n >= N) return;
+    const int lane = threadIdx.x & 31;
+    float acc[BATCH];
+#pragma unroll
+    for (int b = 0; b < BATCH; b++) acc[b] = 0.f;
+    const uint4* wrow4 = (const uint4*)(W + (size_t)n * K);
+    const int K8 = K / 8;
+    for (int k8 = lane; k8 < K8; k8 += 32) {
+        const bf16* wv = (const bf16*)&wrow4[k8];
+#pragma unroll
+        for (int b = 0; b < BATCH; b++) {
+            const bf16* xv = (const bf16*)&(((const uint4*)(x + (size_t)b * K))[k8]);
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < BATCH; b++) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc[b] += __shfl_down_sync(0xffffffffu, acc[b], off);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int b = 0; b < BATCH; b++) y[(size_t)b * N + n] = acc[b];
+    }
+}
+
 } // namespace
 
 void launch_add(const void* x, const void* y, void* out, int n, cudaStream_t stream) {
@@ -185,6 +266,24 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
     k_attn<<<grid, 128, smem, stream>>>((const bf16*)q, (const bf16*)k, (const bf16*)v,
                                         (bf16*)out, q_len, kv_len, n_q, n_kv, d,
                                         q_pos0, k_pos0, window, scale);
+}
+
+void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
+                           cudaStream_t stream) {
+    if (N <= 0) return;
+    constexpr int WARPS_PER_BLOCK = 4;
+    dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+    k_gemv_batched<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
+        (const bf16*)x, (const bf16*)W, (bf16*)y, N, K);
+}
+
+void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,
+                               cudaStream_t stream) {
+    if (N <= 0) return;
+    constexpr int WARPS_PER_BLOCK = 4;
+    dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+    k_gemv_batched_f32<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
+        (const bf16*)x, (const bf16*)W, y, N, K);
 }
 
 } // namespace dflash_kernels

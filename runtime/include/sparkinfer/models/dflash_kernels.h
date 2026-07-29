@@ -30,6 +30,15 @@ void launch_add(const void* x, const void* y, void* out, int n,
 void launch_rms(const void* x, const void* w, void* out, int rows, int cols,
                 float eps, cudaStream_t stream);
 
+// Batched GEMV: y[b,:] = x[b,:] @ W^T for a fixed batch of 16 rows in one launch.
+// x: [16,K] bf16, W: [N,K] bf16 (native "out,in" layout, same as a single-row GEMV), y: [16,N] bf16.
+void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
+                           cudaStream_t stream);
+
+// Same, with fp32 output/accumulate (for the LM head's logits).
+void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,
+                               cudaStream_t stream);
+
 // Per-head RMSNorm on [seq, n_heads, d] (in-place).
 void launch_rms_heads(void* x, const void* w, int seq, int n_heads, int d,
                       float eps, cudaStream_t stream);
