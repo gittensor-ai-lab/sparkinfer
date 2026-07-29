@@ -1,5 +1,6 @@
 // DFlash draft kernels: small-seq GQA attention, RoPE, SwiGLU, RMSNorm.
 #include "sparkinfer/models/dflash_kernels.h"
+#include "sparkinfer/kernels/gemm.h"
 #include <cuda_bf16.h>
 #include <cmath>
 #include <cstdio>
@@ -266,6 +267,60 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
     k_attn<<<grid, 128, smem, stream>>>((const bf16*)q, (const bf16*)k, (const bf16*)v,
                                         (bf16*)out, q_len, kv_len, n_q, n_kv, d,
                                         q_pos0, k_pos0, window, scale);
+}
+
+// Runtime batch (2..16): same weight-reuse win as k_gemv_batched<16> for ctx projections
+// where ctx_len is variable (prompt prefill, accepted-prefix handoff).
+__global__ void k_gemv_batched_dyn(const bf16* __restrict__ x, const bf16* __restrict__ W,
+                                   bf16* __restrict__ y, int batch, int N, int K) {
+    const int warps_per_block = blockDim.x / 32;
+    const int n = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    if (n >= N || batch <= 0) return;
+    const int lane = threadIdx.x & 31;
+    float acc[16];
+    for (int b = 0; b < batch; b++) acc[b] = 0.f;
+    const uint4* wrow4 = (const uint4*)(W + (size_t)n * K);
+    const int K8 = K / 8;
+    for (int k8 = lane; k8 < K8; k8 += 32) {
+        const bf16* wv = (const bf16*)&wrow4[k8];
+        for (int b = 0; b < batch; b++) {
+            const bf16* xv = (const bf16*)&(((const uint4*)(x + (size_t)b * K))[k8]);
+            for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
+        }
+    }
+    for (int b = 0; b < batch; b++) {
+        for (int off = 16; off > 0; off >>= 1)
+            acc[b] += __shfl_down_sync(0xffffffffu, acc[b], off);
+    }
+    if (lane == 0) {
+        for (int b = 0; b < batch; b++) y[(size_t)b * N + n] = f2b(acc[b]);
+    }
+}
+
+void launch_gemv_batched(const void* x, const void* W, void* y, int batch, int N, int K,
+                         cudaStream_t stream) {
+    if (batch <= 0 || N <= 0) return;
+    if (batch == 1) {
+        kernels::launch_gemv(x, W, y, N, K, stream);
+        return;
+    }
+    if (batch > 16) {
+        const bf16* xp = (const bf16*)x;
+        bf16* yp = (bf16*)y;
+        for (int t0 = 0; t0 < batch; t0 += 16) {
+            const int b = (batch - t0 < 16) ? (batch - t0) : 16;
+            launch_gemv_batched(xp + (size_t)t0 * K, W, yp + (size_t)t0 * N, b, N, K, stream);
+        }
+        return;
+    }
+    if (batch == 16) {
+        launch_gemv_batched16(x, W, y, N, K, stream);
+        return;
+    }
+    constexpr int WARPS_PER_BLOCK = 4;
+    dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+    k_gemv_batched_dyn<<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
+        (const bf16*)x, (const bf16*)W, (bf16*)y, batch, N, K);
 }
 
 void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,

@@ -468,12 +468,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     kernels::launch_embedding(s.d_ids, s.embed, s.noise, B, H, st);
 
     // target_hidden [ctx, n_cap*H] -> fc -> hidden_norm -> target_proj [ctx, H]
-    // fc.weight is [H, n_cap*H] (out, in). Loop gemv per row.
+    // fc.weight is [H, n_cap*H] (out, in). Batched GEMV when ctx_len > 1.
     if (ctx_len > 0) {
         const bf16* th = (const bf16*)target_hidden;
-        for (int t = 0; t < ctx_len; t++) {
-            kernels::launch_gemv(th + (size_t)t * n_cap * H, s.fc,
-                                 s.target_proj + (size_t)t * H, H, n_cap * H, st);
+        if (ctx_len > 1) {
+            dflash_kernels::launch_gemv_batched(th, s.fc, s.target_proj, ctx_len, H, n_cap * H, st);
+        } else {
+            kernels::launch_gemv(th, s.fc, s.target_proj, H, n_cap * H, st);
         }
         dflash_kernels::launch_rms(s.target_proj, s.hidden_norm, s.target_proj,
                                    ctx_len, H, c.rms_eps, st);
@@ -495,11 +496,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wq, s.q + (size_t)t * qdim, qdim, H, st);
         }
         // Build k_new / v_new = cat(k_ctx, k_noise)
-        for (int t = 0; t < ctx_len; t++) {
-            kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wk,
-                                 s.k_new + (size_t)t * kvdim, kvdim, H, st);
-            kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wv,
-                                 s.v_new + (size_t)t * kvdim, kvdim, H, st);
+        if (ctx_len > 1) {
+            dflash_kernels::launch_gemv_batched(s.target_proj, w.wk, s.k_new, ctx_len, kvdim, H, st);
+            dflash_kernels::launch_gemv_batched(s.target_proj, w.wv, s.v_new, ctx_len, kvdim, H, st);
+        } else if (ctx_len == 1) {
+            kernels::launch_gemv(s.target_proj, w.wk, s.k_new, kvdim, H, st);
+            kernels::launch_gemv(s.target_proj, w.wv, s.v_new, kvdim, H, st);
         }
         if (fast16) {
             dflash_kernels::launch_gemv_batched16(s.xn, w.wk, s.k_new + (size_t)ctx_len * kvdim,

@@ -30,6 +30,11 @@ void launch_add(const void* x, const void* y, void* out, int n,
 void launch_rms(const void* x, const void* w, void* out, int rows, int cols,
                 float eps, cudaStream_t stream);
 
+// Batched GEMV: y[b,:] = x[b,:] @ W^T for batch rows in one launch (1 < batch <= 16).
+// x: [batch,K] bf16, W: [N,K] bf16 (native "out,in" layout), y: [batch,N] bf16.
+void launch_gemv_batched(const void* x, const void* W, void* y, int batch, int N, int K,
+                         cudaStream_t stream);
+
 // Batched GEMV: y[b,:] = x[b,:] @ W^T for a fixed batch of 16 rows in one launch.
 // x: [16,K] bf16, W: [N,K] bf16 (native "out,in" layout, same as a single-row GEMV), y: [16,N] bf16.
 void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
