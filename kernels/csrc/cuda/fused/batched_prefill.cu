@@ -351,6 +351,10 @@ __global__ void pf_gdn_conv_kernel(const __nv_bfloat16* __restrict__ qkv,
             }
             __syncthreads();
             cval *= sw[0];
+            // WAR guard: the next token's `sw[t >> 5] = ss` store must not begin
+            // until every warp has read this token's sw[0] — without this barrier a
+            // lagging warp can pick up token tok+1's partial sums as its normalizer.
+            __syncthreads();
         }
         out[(size_t)tok * out_dim + hh * head_dim + t] = __float2bfloat16(cval);
     }
@@ -492,6 +496,11 @@ __global__ void pf_gdn_conv_tile_kernel(const __nv_bfloat16* __restrict__ qkv,
             }
             __syncthreads();
             cval *= sw[0];
+            // WAR guard (same as pf_gdn_conv_kernel): keep the next tt iteration's
+            // `sw[t >> 5] = ss` store from racing this iteration's sw[0] read in
+            // lagging warps — #pragma unroll makes the next store eligible to issue
+            // as soon as the barrier above releases.
+            __syncthreads();
         }
         out[(size_t)tok * out_dim + hh * head_dim + t] = __float2bfloat16(cval);
     }
