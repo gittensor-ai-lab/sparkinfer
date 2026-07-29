@@ -134,6 +134,18 @@ struct Qwen35Model::Impl {
     int graph_prefill_attn_mode = -1;
     bool bench_feedback_graph = false;
     int graph_attn_mode = -1;  // host-side flash-decode dispatch class captured in cu_graph
+    // Separate decode graph for DFlash verify (sample=true, dflash_capture=true). The normal
+    // cu_graph/cu_exec can't be reused here because dflash_maybe_capture_layer's destination
+    // (dflash_hidden + cap_row*row_elems) changes every call; this graph instead always
+    // captures into the row-independent dflash_cap_stage buffer, and the caller does one
+    // small follow-up memcpy into the real row after each replay -- same varying-scalar-input
+    // pattern the plain decode graph already relies on for token_id/position.
+    cudaGraph_t cu_dflash_graph{};
+    cudaGraphExec_t cu_dflash_exec{};
+    bool dflash_graph_ready = false;
+    int dflash_graph_attn_mode = -1;
+    bool dflash_graph_sparse = false;
+    bf16* dflash_cap_stage = nullptr;  // [n_cap, H], row-independent capture target for the graph
 
     // scratch (bf16)
     bf16 *x, *xn, *q, *k, *v, *attn, *ao, *h, *hn, *routed, *shared;
@@ -397,7 +409,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->sparse_sel);
     cudaFree(p_->sparse_vtbl); cudaFree(p_->sparse_vlen);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
-    cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
+    cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context); cudaFree(p_->dflash_cap_stage);
     // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
     for (auto& kv : p_->sessions) {
         if (kv.first == 0) continue;
@@ -406,6 +418,7 @@ Qwen35Model::~Qwen35Model() {
     }
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
     if (p_->graph_prefill_ready) { cudaGraphExecDestroy(p_->cu_prefill_exec); cudaGraphDestroy(p_->cu_prefill_graph); }
+    if (p_->dflash_graph_ready) { cudaGraphExecDestroy(p_->cu_dflash_exec); cudaGraphDestroy(p_->cu_dflash_graph); }
     cudaEventDestroy(p_->ev_qkv); cudaEventDestroy(p_->ev_k); cudaEventDestroy(p_->ev_v);
     cudaEventDestroy(p_->ev_pipe_fork); cudaEventDestroy(p_->ev_gdn_z); cudaEventDestroy(p_->ev_gdn_ab);
     cudaEventDestroy(p_->ev_sx_gate); cudaEventDestroy(p_->ev_sx_done);
@@ -425,16 +438,17 @@ void Qwen35Model::copy_logits(float* host_logits) const {
 
 void Qwen35Model::dflash_maybe_capture_layer(int layer) {
     Impl& s = *p_;
-    if (!s.dflash_capture || !s.dflash_hidden || s.dflash_n_cap <= 0) return;
+    if (!s.dflash_capture || !s.dflash_cap_stage || s.dflash_n_cap <= 0) return;
     int slot = -1;
     for (int i = 0; i < s.dflash_n_cap; i++) {
         if (s.dflash_layer_ids[i] == layer) { slot = i; break; }
     }
     if (slot < 0) return;
     const int H = s.cfg.hidden;
-    const int row = s.dflash_cap_row;
-    if (row < 0 || row >= s.dflash_max_rows) return;
-    bf16* dst = s.dflash_hidden + ((size_t)row * s.dflash_n_cap + slot) * H;
+    // Writes to the row-independent staging buffer (not dflash_hidden[cap_row] directly) so
+    // this sequence of memcpys has a FIXED destination and can be captured into the dflash
+    // decode graph below; the caller copies stage -> dflash_hidden[cap_row] once per call.
+    bf16* dst = s.dflash_cap_stage + (size_t)slot * H;
     cu(cudaMemcpyAsync(dst, s.x, (size_t)H * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
        "dflash capture");
 }
@@ -447,6 +461,19 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     int seqlen = position + 1;
     cudaStream_t st = s.stream;
     const bool dflash_cap = s.dflash_capture;
+    // dflash_maybe_capture_layer always writes into the row-independent dflash_cap_stage
+    // buffer (graph-capturable, unlike dflash_hidden[cap_row] which varies call to call).
+    // Every path that can run it -- eager prefill, dflash decode graph capture, dflash decode
+    // graph replay -- must call this exactly once afterward or dflash_hidden[cap_row] is left
+    // stale/uninitialized for that call.
+    auto dflash_flush_stage = [&s, H]() {
+        if (!s.dflash_hidden || !s.dflash_cap_stage || s.dflash_n_cap <= 0 ||
+            s.dflash_cap_row < 0 || s.dflash_cap_row >= s.dflash_max_rows) return;
+        const size_t row_elems = (size_t)s.dflash_n_cap * H;
+        cu(cudaMemcpyAsync(s.dflash_hidden + (size_t)s.dflash_cap_row * row_elems,
+                           s.dflash_cap_stage, row_elems * sizeof(bf16),
+                           cudaMemcpyDeviceToDevice, s.stream), "dflash stage->hidden");
+    };
 
     s.h_scalars[0] = token_id;
     s.h_scalars[1] = position;
@@ -497,6 +524,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                 s.cu_prefill_exec = nullptr; s.cu_prefill_graph = nullptr;
                 s.graph_prefill_ready = false; s.graph_prefill_attn_mode = -1;
             }
+            if (s.dflash_graph_ready) {
+                cudaGraphExecDestroy(s.cu_dflash_exec); cudaGraphDestroy(s.cu_dflash_graph);
+                s.cu_dflash_exec = nullptr; s.cu_dflash_graph = nullptr;
+                s.dflash_graph_ready = false; s.dflash_graph_attn_mode = -1;
+            }
         }
     }
     // launch_flash_decode_split chooses its scalar-vs-MMA implementation on the host
@@ -530,6 +562,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.cu_graph = nullptr;
         s.graph_ready = false;
     }
+    if (s.dflash_graph_ready && attn_graph_mode != s.dflash_graph_attn_mode) {
+        cu(cudaGraphExecDestroy(s.cu_dflash_exec), "dflash graph recapture destroy exec");
+        cu(cudaGraphDestroy(s.cu_dflash_graph), "dflash graph recapture destroy graph");
+        s.cu_dflash_exec = nullptr;
+        s.cu_dflash_graph = nullptr;
+        s.dflash_graph_ready = false;
+    }
     const bool sparse_avail = s.sparse_budget > 0 && s.kv->int8_kv() &&
                               c.head_dim == 256 && c.n_q_heads == c.n_kv_heads * 4;
     // GQA-8 compact-view sparse is decode-only (`sample`): prefill and teacher-forced
@@ -542,6 +581,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         cu(cudaGraphExecDestroy(s.cu_exec), "sparse recapture destroy exec");
         cu(cudaGraphDestroy(s.cu_graph), "sparse recapture destroy graph");
         s.cu_exec = nullptr; s.cu_graph = nullptr; s.graph_ready = false;
+    }
+    if (s.dflash_graph_ready && s.dflash_graph_sparse != sparse_on) {
+        cu(cudaGraphExecDestroy(s.cu_dflash_exec), "dflash sparse recapture destroy exec");
+        cu(cudaGraphDestroy(s.cu_dflash_graph), "dflash sparse recapture destroy graph");
+        s.cu_dflash_exec = nullptr; s.cu_dflash_graph = nullptr; s.dflash_graph_ready = false;
     }
     if (s.graph_prefill_ready && attn_graph_mode != s.graph_prefill_attn_mode) {
         cu(cudaGraphExecDestroy(s.cu_prefill_exec), "prefill graph recapture destroy exec");
@@ -561,7 +605,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     }
 
     // Prefill graph: embed→layers→final norm (no LM head). Decode graph: full path + argmax.
-    // DFlash layer-hidden capture requires the eager path (graphs bake fixed destinations).
+    // DFlash's per-layer hidden capture used to require the eager path entirely (a captured
+    // graph bakes fixed destinations, and dflash_hidden[cap_row] varies call to call) -- the
+    // dflash decode graph below instead captures into the row-independent dflash_cap_stage
+    // buffer and the caller does one small follow-up memcpy into the real row, so DFlash
+    // verify tokens (sample=true) get graph replay too. The prefill/prompt path (sample=false)
+    // still falls back to eager under capture; it is not on the scored decode-tps path.
     if (!sample && s.graph_prefill_ready && !dflash_cap) {
         cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch");
         cu(cudaStreamSynchronize(st), "prefill graph sync");
@@ -569,6 +618,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     }
     if (sample && s.graph_ready && !dflash_cap) {
         cu(cudaGraphLaunch(s.cu_exec, st), "graph launch");
+        cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
+        cu(cudaStreamSynchronize(st), "sync");
+        return *s.h_out_id;
+    }
+    if (sample && dflash_cap && s.dflash_graph_ready) {
+        cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch");
+        dflash_flush_stage();
         cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
         cu(cudaStreamSynchronize(st), "sync");
         return *s.h_out_id;
@@ -581,7 +637,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.graph_prefill_ready = false;
         s.graph_prefill_attn_mode = -1;
     }
-    const bool capturing_graph = !dflash_cap;
+    // Reaching here means: no ready graph could be replayed above. For sample=true this is
+    // always safe to (re)capture -- either the plain decode graph (dflash_cap false) or the
+    // dflash decode graph (dflash_cap true, via the row-independent stage buffer); only the
+    // prefill/prompt path (sample=false) still avoids capturing while dflash_cap is on.
+    const bool capturing_graph = sample || !dflash_cap;
     if (capturing_graph)
         cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
 
@@ -1165,6 +1225,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             s.graph_prefill_attn_mode = attn_graph_mode;
             cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch (first)");
         }
+        // The prefill/prompt path always runs dflash_maybe_capture_layer eagerly (never
+        // graph-captured, see capturing_graph above), which now writes into the row-independent
+        // dflash_cap_stage instead of dflash_hidden[cap_row] directly (so the SAME helper is
+        // safe to call from inside the dflash decode graph too). Needs the same follow-up copy
+        // the decode-graph branches do, or dflash_hidden[cap_row] is never actually updated here.
+        if (dflash_cap) dflash_flush_stage();
         cu(cudaStreamSynchronize(st), "prefill sync");
         return token_id;
     }
@@ -1182,7 +1248,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
-    if (capturing_graph) {
+    if (capturing_graph && dflash_cap) {
+        cu(cudaStreamEndCapture(st, &s.cu_dflash_graph), "end dflash capture");
+        cu(cudaGraphInstantiate(&s.cu_dflash_exec, s.cu_dflash_graph, 0), "dflash graph instantiate");
+        s.dflash_graph_ready = true;
+        s.dflash_graph_attn_mode = attn_graph_mode;
+        s.dflash_graph_sparse = sparse_on;
+        cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
+        dflash_flush_stage();
+    } else if (capturing_graph) {
         cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
         cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
         s.graph_ready = true;
@@ -1352,6 +1426,15 @@ void Qwen35Model::invalidate_decode_graph() {
         s.graph_ready = false;
         s.graph_attn_mode = -1;
         s.graph_sparse = false;
+    }
+    if (s.dflash_graph_ready) {
+        cudaGraphExecDestroy(s.cu_dflash_exec);
+        cudaGraphDestroy(s.cu_dflash_graph);
+        s.cu_dflash_exec = nullptr;
+        s.cu_dflash_graph = nullptr;
+        s.dflash_graph_ready = false;
+        s.dflash_graph_attn_mode = -1;
+        s.dflash_graph_sparse = false;
     }
 }
 
@@ -1628,9 +1711,11 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
     const size_t hidden_bytes = (size_t)s.dflash_max_rows * row_elems * sizeof(bf16);
     if (s.dflash_hidden) { cudaFree(s.dflash_hidden); s.dflash_hidden = nullptr; }
     if (s.dflash_context) { cudaFree(s.dflash_context); s.dflash_context = nullptr; }
+    if (s.dflash_cap_stage) { cudaFree(s.dflash_cap_stage); s.dflash_cap_stage = nullptr; }
     s.dflash_ctx_cap = s.cfg.max_seq;
     cu(cudaMalloc(&s.dflash_hidden, hidden_bytes), "dflash hidden");
     cu(cudaMalloc(&s.dflash_context, (size_t)s.dflash_ctx_cap * row_elems * sizeof(bf16)), "dflash ctx");
+    cu(cudaMalloc(&s.dflash_cap_stage, row_elems * sizeof(bf16)), "dflash cap stage");
     if (s.cfg.hybrid && !s.spec_lin_snap) {
         const size_t ls = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
                           s.cfg.linear_head_dim * s.cfg.linear_head_dim;
