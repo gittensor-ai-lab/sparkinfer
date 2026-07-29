@@ -23,6 +23,17 @@ def to_bf16(x):
     return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
 
 
+def vocab_from_embedding(shape, fallback):
+    """Vocab size from token_embd.weight, matching qwen3_gguf_config.h.
+
+    ReaderTensor.shape is the raw ggml dim order ([n_embd, n_vocab]) — not the
+    reversed numpy order that .data is reshaped into — so vocab is dims[1],
+    exactly what the C++ loader reads as emb->dims[1]. A tensor that isn't 2-D
+    keeps the metadata value.
+    """
+    return int(shape[1]) if len(shape) >= 2 else fallback
+
+
 def main():
     if len(sys.argv) != 3:
         print(__doc__); sys.exit(1)
@@ -54,10 +65,10 @@ def main():
         rms_eps=float(meta(A + "attention.layer_norm_rms_epsilon")),
         eos_id=int(meta("tokenizer.ggml.eos_token_id") or 151645),
     )
-    # vocab from token_embd if metadata missing
+    # vocab from token_embd, preferred over metadata (matches the C++ loader)
     ten = {t.name: t for t in r.tensors}
     if "token_embd.weight" in ten:
-        cfg["vocab"] = int(ten["token_embd.weight"].shape[-1]) if False else cfg["vocab"]
+        cfg["vocab"] = vocab_from_embedding(ten["token_embd.weight"].shape, cfg["vocab"])
 
     with open(os.path.join(out, "config.txt"), "w") as f:
         for k, v in cfg.items():
