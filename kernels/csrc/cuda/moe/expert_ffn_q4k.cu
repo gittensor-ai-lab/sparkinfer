@@ -658,13 +658,14 @@ __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     if (pdl) si_pdl_lc();
 }
 
+// Pack4: 4 FFN rows / CTA (16 warps). Same si_vec_dot_q4_K math as pack2; halves the
+// gate/up grid again on Qwen3.6 (H=2048,F=512,top_k=8). PDL matches pack2 (signal at end).
 template <int H, int F, int TOPK>
 __global__ void gate_up_mmvq2_pack4_qwen_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
-    float* __restrict__ h_scratch, int n_rows
+    float* __restrict__ h_scratch, int n_rows, int pdl
 ) {
-    si_pdl_lc();
     constexpr int NW = 4, WS = 32;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int group = warp >> 2, group_warp = warp & 3;
@@ -693,6 +694,7 @@ __global__ void gate_up_mmvq2_pack4_qwen_kernel(
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
 }
 
 // Dense hybrid gate/up (Qwythos): same pack2 math as gate_up_mmvq2_pack2_qwen_kernel but
@@ -1316,6 +1318,9 @@ void launch_moe_expert_ffn_q4k(
     if (gu_spec < 0) { const char* gs = getenv("SPARKINFER_GU_SPEC"); gu_spec = (gs && gs[0] == '0') ? 0 : 1; }
     static int gu_pack2 = -1;
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
+    // Pack4 default ON when pack2 is ON. SPARKINFER_GU_PACK4=0 keeps pack2.
+    static int gu_pack4 = -1;
+    if (gu_pack4 < 0) { const char* gp4 = getenv("SPARKINFER_GU_PACK4"); gu_pack4 = (gp4 && gp4[0] == '0') ? 0 : 1; }
     const int gu_pdl = gu_mmvq_pdl();
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
@@ -1329,41 +1334,60 @@ void launch_moe_expert_ffn_q4k(
                 reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
             q = qbuf;
         }
-        if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
-            launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 1) / 2), dim3(8 * 32), 0, stream,
+        const int n_rows = num_tokens * top_k * ffn;
+        if (gu_pack4 && gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+            launch_pdl_kernel(gu_pdl, dim3((n_rows + 3) / 4), dim3(16 * 32), 0, stream,
+                gate_up_mmvq2_pack4_qwen_kernel<2048, 512, 8>,
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
+                n_rows, gu_pdl);
+        else if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+            launch_pdl_kernel(gu_pdl, dim3((n_rows + 1) / 2), dim3(8 * 32), 0, stream,
                 gate_up_mmvq2_pack2_qwen_kernel<2048, 512, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
-                num_tokens * top_k * ffn, gu_pdl);
+                n_rows, gu_pdl);
         else if (gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
-            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+            launch_pdl_kernel(gu_pdl, dim3(n_rows), dim3(4 * 32), 0, stream,
                 gate_up_mmvq2_qwen_kernel<2048, 512, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+        else if (gu_pack4 && gu_pack2 && gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
+            launch_pdl_kernel(gu_pdl, dim3((n_rows + 3) / 4), dim3(16 * 32), 0, stream,
+                gate_up_mmvq2_pack4_qwen_kernel<2048, 768, 8>,
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
+                n_rows, gu_pdl);
         else if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
-            launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 1) / 2), dim3(8 * 32), 0, stream,
+            launch_pdl_kernel(gu_pdl, dim3((n_rows + 1) / 2), dim3(8 * 32), 0, stream,
                 gate_up_mmvq2_pack2_qwen_kernel<2048, 768, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
-                num_tokens * top_k * ffn, gu_pdl);
+                n_rows, gu_pdl);
         else if (gu_spec && hidden == 2048 && ffn == 768 && top_k == 8)
-            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+            launch_pdl_kernel(gu_pdl, dim3(n_rows), dim3(4 * 32), 0, stream,
                 gate_up_mmvq2_qwen_kernel<2048, 768, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+        else if (gu_pack4 && gu_pack2 && gu_spec && hidden == 4096 && ffn == 12288 && top_k == 1)
+            launch_pdl_kernel(gu_pdl, dim3((n_rows + 3) / 4), dim3(16 * 32), 0, stream,
+                gate_up_mmvq2_pack4_qwen_kernel<4096, 12288, 1>,
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
+                n_rows, gu_pdl);
         else if (gu_pack2 && gu_spec && hidden == 4096 && ffn == 12288 && top_k == 1)
-            launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 1) / 2), dim3(8 * 32), 0, stream,
+            launch_pdl_kernel(gu_pdl, dim3((n_rows + 1) / 2), dim3(8 * 32), 0, stream,
                 gate_up_mmvq2_pack2_qwen_kernel<4096, 12288, 1>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
-                num_tokens * top_k * ffn, gu_pdl);
+                n_rows, gu_pdl);
         else if (gu_spec && hidden == 4096 && ffn == 12288 && top_k == 1)
-            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+            launch_pdl_kernel(gu_pdl, dim3(n_rows), dim3(4 * 32), 0, stream,
                 gate_up_mmvq2_qwen_kernel<4096, 12288, 1>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
         else
-            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+            launch_pdl_kernel(gu_pdl, dim3(n_rows), dim3(4 * 32), 0, stream,
                 gate_up_mmvq2_kernel,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
