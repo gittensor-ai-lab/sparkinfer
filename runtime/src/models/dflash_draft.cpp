@@ -259,6 +259,7 @@ struct DFlashDraftModel::Impl {
     bf16 *gate = nullptr, *up = nullptr, *down = nullptr;
     bf16 *k_new = nullptr, *v_new = nullptr;  // [ctx+B, n_kv, d]
     float* logits = nullptr;        // [B, vocab]
+    void* head_q8 = nullptr;        // [B] Q8_1 rows of xn for the multi-row head MMVQ
     int *d_ids = nullptr, *d_out = nullptr;
     int *h_out = nullptr;
 
@@ -421,6 +422,7 @@ bool DFlashDraftModel::load(const std::string& dir) {
     s.k_new = s.alloc<bf16>((size_t)max_kv * kvdim);
     s.v_new = s.alloc<bf16>((size_t)max_kv * kvdim);
     s.logits = s.alloc<float>((size_t)B * std::max(s.cfg.vocab, 1));
+    s.head_q8 = s.alloc<char>((size_t)B * kernels::llama_q8_1_bytes(H));
     s.d_ids = s.alloc<int>(B);
     s.d_out = s.alloc<int>(B);
     cu(cudaHostAlloc(&s.h_out, B * sizeof(int), cudaHostAllocDefault), "h_out");
@@ -581,6 +583,24 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // GEMV against the eagerly dequantized bf16 lm_head cache instead of a per-token
     // quantized GEMV loop.
     const int V = s.vocab > 0 ? s.vocab : c.vocab;
+    // The batched bf16 head (#661) still streams the DEQUANTIZED head every step: at V=248k,
+    // K=2048 that is ~1.0 GB per pass versus ~416 MB for the native Q6_K bytes, and it pins ~1 GB
+    // of VRAM for the bf16 cache. Prefer a multi-row Q6_K MMVQ that keeps the head quantized: each
+    // warp owns one output row, walks its superblocks once and accumulates all B dot products, so
+    // the weight streams from HBM a single time in its compact form.
+    // SPARKINFER_DFLASH_HEAD_MULTIROW=0 falls back to the bf16 batched path.
+    static int head_mr = -1;
+    if (head_mr < 0) { const char* e = getenv("SPARKINFER_DFLASH_HEAD_MULTIROW"); head_mr = (e && e[0] == '0') ? 0 : 1; }
+    bool head_done = false;
+    if (head_mr && s.lm_head_type == 14 && s.head_q8) {          // native Q6_K shared head
+        const size_t qrow = kernels::llama_q8_1_bytes(H);
+        for (int t = 0; t < B; t++)
+            kernels::launch_quantize_q8_1_blocks(s.xn + (size_t)t * H,
+                                                 (char*)s.head_q8 + (size_t)t * qrow, H, st);
+        head_done = kernels::launch_gemv_q6k_dp4a_multirow_f32(s.head_q8, s.lm_head, s.logits,
+                                                               V, H, B, st);
+    }
+    if (!head_done) {
     if (fast16) {
         dflash_kernels::launch_gemv_batched16_f32(s.xn, s.lm_head_bf16, s.logits, V, H, st);
     } else {
@@ -592,6 +612,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             else
                 kernels::launch_gemv_f32(row, s.lm_head, logit_row, V, H, st);
         }
+    }
     }
     kernels::launch_argmax(s.logits, s.d_out, B, V, st);
     cu(cudaMemcpyAsync(s.h_out, s.d_out, B * sizeof(int), cudaMemcpyDeviceToHost, st), "argmax");

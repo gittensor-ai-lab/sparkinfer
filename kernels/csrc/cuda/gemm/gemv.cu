@@ -1044,6 +1044,37 @@ __global__ void gemv_q6k_dp4a_kfixed_kernel(const si_block_q8_1* __restrict__ vy
     for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
     if (lane == 0) gemv_write(y + row, acc);
 }
+
+// Multi-row (M activations, one shared weight) Q6_K MMVQ. The DFlash draft head projects B block
+// tokens against the SAME lm_head; issuing B separate GEMVs re-read the whole vocab weight B times
+// (~416 MB per read at V=248k,K=2048 — far past L2, so it is real HBM traffic). Here each warp owns
+// one output row and walks its weight superblocks ONCE, accumulating all M dot products, so the
+// weight streams from HBM a single time and the M reuses hit L1. y is [M, N] row-major.
+template <typename OutT, int WPB, int NSUPER, int MMAX>
+__global__ void gemv_q6k_dp4a_multirow_kernel(const si_block_q8_1* __restrict__ vy,
+                                              const unsigned char* __restrict__ W,
+                                              OutT* __restrict__ y, int N, int M) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WPB + warp;
+    if (row >= N) return;
+    const unsigned char* x_row = W + (size_t)row * NSUPER * 210;
+    constexpr int QPR = NSUPER * 8;            // si_block_q8_1 blocks per activation row
+    float acc[MMAX];
+    #pragma unroll
+    for (int m = 0; m < MMAX; m++) acc[m] = 0.f;
+    #pragma unroll
+    for (int kbx = 0; kbx < NSUPER; kbx++) {
+        const unsigned char* wblk = x_row + (size_t)kbx * 210;   // read once, reused by all M
+        for (int m = 0; m < M; m++)
+            acc[m] += si_vec_dot_q6_K(wblk, vy + (size_t)m * QPR + (size_t)kbx * 8, lane);
+    }
+    for (int m = 0; m < M; m++) {
+        float a = acc[m];
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffff, a, s);
+        if (lane == 0) gemv_write(y + (size_t)m * N + row, a);
+    }
+}
 #ifndef _MSC_VER
 template __global__ void gemv_q6k_dp4a_kfixed_kernel<float, 8, 8>(const si_block_q8_1*, const unsigned char*, float*, int);
 #endif
@@ -1336,6 +1367,17 @@ void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K,
     else if (K == 4096) si_mmvq_q6k_kfixed_kernel<float, 16><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
     else                si_mmvq_q6k_kernel<float><<<N, 4 * 32, 0, stream>>>(q, w, y, N, K);
 }
+// M activation rows against one shared Q6_K weight. q81 is M contiguous llama_q8_1_bytes(K)
+// activation rows; y is [M, N] fp32. Returns false when the shape is unsupported (caller loops).
+bool launch_gemv_q6k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
+                                       int N, int K, int M, cudaStream_t stream) {
+    if (K != 2048 || M < 1 || M > 16) return false;   // draft head shape (H=2048, B<=16)
+    dim3 grid((N + 15) / 16);
+    gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 16><<<grid, 16 * 32, 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, M);
+    return true;
+}
+
 void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
     static int wpb = -1;
     if (wpb < 0) {

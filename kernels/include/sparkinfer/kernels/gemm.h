@@ -100,5 +100,10 @@ void launch_attn_qkv_mmvq_q4k(const void* q81,
     int Nq, int Nk, int Nv, int K, cudaStream_t stream = nullptr);
 // 1-warp-per-row Q6_K dp4a GEMV (large-N, e.g. LM head): GEMV_WPB rows/block.
 void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
+// M activation rows vs one shared Q6_K weight (DFlash draft head: B block tokens, same lm_head).
+// The weight streams from HBM once instead of M times. q81 = M contiguous llama_q8_1_bytes(K) rows,
+// y = [M, N] fp32. Returns false if the shape is unsupported so the caller can fall back.
+bool launch_gemv_q6k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
+                                       int N, int K, int M, cudaStream_t stream = nullptr);
 
 }} // namespace sparkinfer::kernels
