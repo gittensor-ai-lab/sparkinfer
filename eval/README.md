@@ -167,6 +167,26 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 `gh` authenticated and `VAST_INSTANCE` / `VAST_DEFAULT_INSTANCE` in `.env.eval`
 (`VAST_NO_AUTO_PROVISION=1`).
 
+## DFlash PR auto-evaluation bot
+
+`pr_dflash_bot.py` evaluates PRs that touch DFlash paths (`dflash*`, `qwen3_gguf_dflash_*`,
+`dflash_accuracy.sh`). It scores **same-box PR DFlash tok/s vs `origin/main` DFlash tok/s**,
+applies `eval-dflash:{XL,L,M,S,XS,none,REJECT}`, picks `dflash-merge-first`, and can auto-merge
+(`SPARKINFER_AUTOMERGE=1`) when accuracy passes (SPEC_AGREE) and the tier is a verified speedup.
+AR `eval:*` labels are left alone.
+
+```bash
+eval/setup_labels.sh                                  # creates eval-dflash:* + dflash-merge-*
+./eval/run_dflash_bot.sh                               # one poll
+./eval/run_dflash_bot.sh --only-prs 636 --reeval       # force one PR
+```
+
+**Schedule every 2 hours, :30 past the hour** (shares `/tmp/sparkinfer_bot.lock` with the AR bot):
+```bash
+crontab -l 2>/dev/null; echo "30 */2 * * * $PWD/eval/run_dflash_cron.sh >> /tmp/sparkinfer_dflash_bot.log 2>&1" | crontab -
+```
+Pinned GPU only; never rents. If the pin is down → `--labels-only` reconcile.
+
 **Dashboard.** Eval verdicts and frontier updates are committed to
 [`gittensor-ai-lab/sparkinfer-web`](https://github.com/gittensor-ai-lab/sparkinfer-web)
 (`public/dashboard/data.json`), not to this repo's `dashboard/`. Override with

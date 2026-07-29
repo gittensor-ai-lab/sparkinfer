@@ -33,4 +33,15 @@ for k in "${!RC[@]}"; do
   gh label create "$k" -R "$REPO" --color "${RC[$k]}" \
      --description "sparkinfer eval regression marker for this context" --force >/dev/null
 done
-echo "eval:*, area:*, *-context, and regression-* labels ready on $REPO"
+
+# DFlash speculative-decode bot (eval/pr_dflash_bot.py) — separate from AR eval:*
+for k in "${!C[@]}"; do
+  gh label create "eval-dflash:$k" -R "$REPO" --color "${C[$k]}" \
+     --description "sparkinfer DFlash vs-main speed tier: $k" --force >/dev/null
+done
+gh label create "dflash-merge-first" -R "$REPO" --color "0E8A16" \
+   --description "round winner: biggest verified DFlash speedup — auto-merge candidate" --force >/dev/null
+gh label create "dflash-needs-rebase" -R "$REPO" --color "FBCA04" \
+   --description "verified DFlash speedup but not this round's dflash-merge-first" --force >/dev/null
+
+echo "eval:*, eval-dflash:*, area:*, *-context, regression-*, dflash-merge-* labels ready on $REPO"
