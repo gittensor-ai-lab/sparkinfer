@@ -27,6 +27,7 @@ optimization preserved capability, not just token agreement. Headline claim it u
 ```
 scorers.py             deterministic, stdlib-only scoring (one fn per benchmark) + self-test
 run_quality.py         driver: prompt-build -> backend generate -> score -> report (+ A/B)
+run_qwen36_benchmark.sh  orchestrator: sparkinfer then llama-server (exclusive GPU)
 fetch.py               pull real datasets from HuggingFace, ~10% stratified dev sample -> data/
 data/*.jsonl           real ~10% dev samples (784 items) - regenerate with fetch.py
 seed_hand_authored/    the original hand-written seed (offline fallback / reference)
@@ -39,6 +40,7 @@ seed_hand_authored/    the original hand-written seed (offline fallback / refere
 python3 scorers.py                     # 10/10 scorer self-tests
 python3 run_quality.py --backend oracle  # gold/scorer sanity for answer-derivable tasks
 python3 run_quality.py --backend mock    # ~0%  - floor
+python3 run_quality.py --self-test-llama-server  # mock HTTP /completion wiring
 
 # 2. score sparkinfer on a GPU box:
 python3 run_quality.py --backend sparkinfer \
