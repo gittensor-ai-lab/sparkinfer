@@ -478,6 +478,12 @@
   const CTX_COLOR = {128:"#D14D72",512:"#7B5DFF",4096:"#0E8A16",16384:"#B8860B",32768:"#6F42C1"};
   const CTX_LABEL = {128:"128",512:"512",4096:"4k",16384:"16k",32768:"32k"};
   const ctxColor = ctx => CTX_COLOR[ctx] || "#7B5DFF";
+  // Resolve the pp[] row that produced prefill_frontier_pp (do not hardcode 128/32k).
+  const ppFrontierRow = q => {
+    const f = q?.prefill_frontier_pp;
+    if (f == null) return null;
+    return (q.pp || []).find(x => x.pp != null && Math.abs(Number(x.pp) - Number(f)) < 0.05) || null;
+  };
   const LLAMA_FILL = "linear-gradient(90deg,#A9A9B4,#C8C8D4)";
 
   const fmtDl = n => {
@@ -552,6 +558,10 @@
     const pctLlama = q36Lead != null ? (q36Lead>=0?"+":"")+q36Lead.toFixed(0)+"%" : "—";
     const pctAll = q36.ref_tps ? ((q36.frontier_tps/q36.ref_tps)*100).toFixed(0)+"%" : "—";
     const q35PctLlama = q35Lead != null ? (q35Lead>=0?"+":"")+q35Lead.toFixed(0)+"%" : "—";
+    const q36Pp = ppFrontierRow(q36);
+    const q35Pp = ppFrontierRow(q35);
+    const q36PpLbl = q36Pp ? `${q36Pp.label} prefill` : "prefill frontier";
+    const q35PpLbl = q35Pp ? `${q35Pp.label} prefill` : "prefill frontier";
     sotaStack.innerHTML = `<div class="sota-spotlight"><div class="inner">
       <div>
         <div class="sota-eyebrow">Primary eval target</div>
@@ -565,7 +575,7 @@
       </div>
       <div class="sota-stats">
         <div class="sota-stat"><div class="n">${q36.frontier_tps} <span>tok/s</span></div><div class="l">128-tok decode</div></div>
-        <div class="sota-stat"><div class="n">${q36.prefill_frontier_pp ? Math.round(q36.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">128 prefill baseline</div></div>
+        <div class="sota-stat"><div class="n">${q36.prefill_frontier_pp ? Math.round(q36.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">${q36PpLbl}</div></div>
         <div class="sota-stat"><div class="n">${pctLlama}</div><div class="l">vs ${q36.ref_name||"llama.cpp"} decode</div></div>
       </div>
     </div></div>`+
@@ -582,7 +592,7 @@
       </div>
       <div class="sota-stats">
         <div class="sota-stat"><div class="n">${q35.frontier_tps} <span>tok/s</span></div><div class="l">128-tok decode</div></div>
-        <div class="sota-stat"><div class="n">${q35.prefill_frontier_pp ? Math.round(q35.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">32k prefill</div></div>
+        <div class="sota-stat"><div class="n">${q35.prefill_frontier_pp ? Math.round(q35.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">${q35PpLbl}</div></div>
         <div class="sota-stat"><div class="n">${q35PctLlama}</div><div class="l">vs ${q35.ref_name||"llama.cpp"} decode</div></div>
       </div>
     </div>` : "");
@@ -676,7 +686,9 @@
   (function(){
     const q = D.qwen35 || {};
     const L = [...(D.landed_qwen35_pp || [])].sort((a,b)=>(a.date||"").localeCompare(b.date||"")||(a.pr||0)-(b.pr||0));
-    const refPp = (q.pp||[]).find(x=>x.label==="32k")?.ref_pp || 0;
+    const frontierRow = ppFrontierRow(q);
+    const refPp = frontierRow?.ref_pp || 0;
+    const ctxLbl = frontierRow?.label || "prefill";
     const pts = [];
     const base = q.baseline_pp;
     if (base) pts.push({name:"origin/main", sub:"same-box baseline · scored prefill", tps:base, baseline:true});
@@ -690,11 +702,11 @@
       const f = q.prefill_frontier_pp || Math.max(0, ...L.map(l=>l.tps), base||0);
       const b = base || (pts.length ? pts[0].tps : f);
       if (b && f) {
-        h.textContent = `${b} → ${f} pp tok/s · 32k prefill · ${refPp?((f/refPp)*100).toFixed(0)+'% of '+q.ref_name+' '+refPp:'—'}`;
+        h.textContent = `${b} → ${f} pp tok/s · ${ctxLbl} prefill · ${refPp?((f/refPp)*100).toFixed(0)+'% of '+q.ref_name+' '+refPp:'—'}`;
       }
     }
     if (!pts.length && refPp) {
-      pts.push({name:"llama.cpp", sub:"reference · 32k prefill", tps:refPp, llama:true, fixed:true});
+      pts.push({name:"llama.cpp", sub:`reference · ${ctxLbl} prefill`, tps:refPp, llama:true, fixed:true});
     }
     drawJourney("passes35", pts,
       legWrap(legItem("#D14D72","origin/main baseline")+
