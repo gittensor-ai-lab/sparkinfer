@@ -588,8 +588,10 @@
     </div>` : "");
   }
 
-  const kpiTps = q36ctx512?.tps || q36.frontier_tps || s.frontier_tps;
-  const kpiRef = q36ctx512?.ref_tps || q36.ref_tps || s.ref_tps;
+  // Bind the KPI strip to the scored Qwen3.6 competition frontier (128-tok), not 512-ctx.
+  // Preferring 512 here made "Frontier decode" disagree with q36.frontier_tps / the SOTA card.
+  const kpiTps = q36.frontier_tps || q36ctx128?.tps || s.frontier_tps;
+  const kpiRef = q36.ref_tps || q36ctx128?.ref_tps || s.ref_tps;
   const kpiRefName = q36.ref_name || s.ref_name;
   const kpiTm = q36.token_match ?? s.token_match;
   const kpiKl = q36.kl ?? s.kl;
@@ -598,8 +600,8 @@
   const pct   = kpiRef > 0 ? 100*(kpiTps - kpiRef)/kpiRef : 0;
   const gapx  = kpiTps > 0 ? (kpiRef/kpiTps).toFixed(2) : "—";
   $("kpis").innerHTML = [
-    {lab:"Frontier decode", val:kpiTps, unit:"tok/s", note:"single-stream, bs=1 · 512-context · 128-tok · Qwen3.6-35B-A3B"},
-    {lab:(ahead?"vs ":"Gap to ")+kpiRefName, val:(ahead?"+"+pct.toFixed(1)+"%":gapx+"×"), unit:"", note:`${kpiRefName} ${kpiRef} tok/s · 512-context`},
+    {lab:"Frontier decode", val:kpiTps, unit:"tok/s", note:"single-stream, bs=1 · 128-tok decode · Qwen3.6-35B-A3B"},
+    {lab:(ahead?"vs ":"Gap to ")+kpiRefName, val:(ahead?"+"+pct.toFixed(1)+"%":gapx+"×"), unit:"", note:`${kpiRefName} ${kpiRef} tok/s · 128-tok decode`},
     {lab:"Accuracy", val:(kpiTm*100).toFixed(0)+"%", unit:"top-1", note:`KL ${kpiKl} vs ${kpiRefName}`},
     {lab:"VRAM resident", val:kpiVram, unit:"GB", note:"experts kept quantized"},
   ].map(k=>`<div class="kpi"><div class="lab">${k.lab}</div><div class="val">${k.val} <span>${k.unit}</span></div><div class="note">${k.note}</div></div>`).join("");
