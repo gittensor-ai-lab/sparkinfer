@@ -30,6 +30,8 @@ fi
 export SPARKINFER_AUTOMERGE="${SPARKINFER_AUTOMERGE:-1}"
 export SPARKINFER_AUTOMERGE_ADMIN="${SPARKINFER_AUTOMERGE_ADMIN:-1}"
 export VAST_NO_AUTO_PROVISION=1
+# 512 gen crosses the KV-split knee; 128-gen DFlash PRs scored eval-dflash:none.
+export DFLASH_BENCH_TOKENS="${DFLASH_BENCH_TOKENS:-512}"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 
 git pull -q origin main 2>/dev/null || true

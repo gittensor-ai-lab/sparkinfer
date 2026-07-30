@@ -308,6 +308,7 @@ def eval_dflash_on_box(host, port, pr_ref: str):
         "prompt_ids": ids,
         "speedup_vs_main": round(pr["dflash_tps"] / main["dflash_tps"], 3) if main["dflash_tps"] else 0,
         "speedup_vs_ar": round(pr["dflash_tps"] / pr["ar_tps"], 3) if pr.get("ar_tps") else 0,
+        "bench_tokens": BENCH_TOKENS,
     }
 
 
@@ -318,6 +319,7 @@ def format_comment(commit: str, res: dict) -> str:
         "pr_dflash_tps": res.get("pr_dflash_tps"),
         "main_dflash_tps": res.get("main_dflash_tps"),
         "pass": res.get("pass"),
+        "bench_tokens": res.get("bench_tokens", BENCH_TOKENS),
     }
     marker = f"<!-- sparkinfer-dflash-eval:{commit} {json.dumps(meta, separators=(',', ':'))} -->"
     if not res.get("ok"):
@@ -331,6 +333,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer dflash auto-eval — `eval-dflash:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-dflash:{lab}` |\n"
+        f"| bench gen tokens | {res.get('bench_tokens', BENCH_TOKENS)} |\n"
         f"| PR DFlash tok/s | {res['pr_dflash_tps']:.2f} |\n"
         f"| main DFlash tok/s | {res['main_dflash_tps']:.2f} |\n"
         f"| speedup vs main | **{res['speedup_vs_main']:.2f}×** ({res['delta_pct']:+.1f}%) |\n"
