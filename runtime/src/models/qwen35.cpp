@@ -225,6 +225,7 @@ struct Qwen35Model::Impl {
     int dflash_ctx_len = 0;
     int dflash_ctx_cap = 0;
     int dflash_session_nsplits = 0;   // terminal-seqlen KV-split tier for this session (0=off)
+    bool dflash_defer_graph = false;  // skip verify-graph capture until after prompt prefill
     bf16* dflash_hidden = nullptr;    // [max_rows, n_cap * H]
     bf16* dflash_context = nullptr;   // [ctx_cap, n_cap * H]
     float* spec_lin_snap = nullptr;
@@ -468,6 +469,7 @@ void Qwen35Model::dflash_flush_stage_row() {
 
 void Qwen35Model::dflash_promote_session_splits() {
     Impl& s = *p_;
+    s.dflash_defer_graph = false;
     if (!s.adaptive_splits || s.dflash_session_nsplits <= 0) return;
     if (s.n_splits == s.dflash_session_nsplits) return;
     s.n_splits = s.dflash_session_nsplits;
@@ -668,7 +670,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // always safe to (re)capture -- either the plain decode graph (dflash_cap false) or the
     // dflash decode graph (dflash_cap true, via the row-independent stage buffer); only the
     // prefill/prompt path (sample=false) still avoids capturing while dflash_cap is on.
-    const bool capturing_graph = sample || !dflash_cap;
+    const bool capture_dflash_graph = dflash_cap && sample && !s.dflash_defer_graph;
+    const bool capture_plain_graph = sample && !dflash_cap;
+    const bool capture_prefill_graph = !sample && !dflash_cap;
+    const bool capturing_graph = capture_dflash_graph || capture_plain_graph || capture_prefill_graph;
     if (capturing_graph)
         cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
 
@@ -1275,7 +1280,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
-    if (capturing_graph && dflash_cap) {
+    if (capture_dflash_graph) {
         cu(cudaStreamEndCapture(st, &s.cu_dflash_graph), "end dflash capture");
         cu(cudaGraphInstantiate(&s.cu_dflash_exec, s.cu_dflash_graph, 0), "dflash graph instantiate");
         s.dflash_graph_ready = true;
@@ -1733,6 +1738,7 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
     s.dflash_cap_row = 0;
     s.dflash_ctx_len = 0;
     s.dflash_session_nsplits = 0;
+    s.dflash_defer_graph = false;
     invalidate_decode_graph();
     if (!on) return;
     const int H = s.cfg.hidden;
@@ -1839,10 +1845,21 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // Lock KV-split tier to the session's terminal seqlen before any graph capture (math-
     // identical across split counts; avoids a mid-decode dflash graph recapture).
     if (s.adaptive_splits) {
+        const Qwen35Config& c = s.cfg;
         const int max_seqlen = std::min(s.cfg.max_seq, (int)prompt.size() + max_new + B);
-        s.dflash_session_nsplits = adaptive_want_nsplits(max_seqlen, s.cfg, s.split_chunk, Impl::MAX_NSPLITS);
+        int tier = adaptive_want_nsplits(max_seqlen, c, s.split_chunk, Impl::MAX_NSPLITS);
+        // GQA-8 DFlash verify: 160 splits is faster on Blackwell even below the 512-token
+        // adaptive knee (split count is occupancy-only — math is identical).
+        if (c.head_dim == 256 && c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 8 &&
+            max_new >= 64 && tier < 160)
+            tier = 160;
+        s.dflash_session_nsplits = tier;
+        const int prefill_tier = adaptive_want_nsplits((int)prompt.size(), c, s.split_chunk,
+                                                       Impl::MAX_NSPLITS);
+        s.dflash_defer_graph = (tier > prefill_tier);
     } else {
         s.dflash_session_nsplits = 0;
+        s.dflash_defer_graph = false;
     }
 
     const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
