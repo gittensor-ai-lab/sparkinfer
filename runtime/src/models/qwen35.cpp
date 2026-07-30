@@ -484,15 +484,6 @@ int Qwen35Model::adaptive_want_nsplits(int seqlen, const Qwen35Config& c, int sp
     return want;
 }
 
-void Qwen35Model::dflash_promote_decode_splits(int max_seqlen) {
-    Impl& s = *p_;
-    if (!s.adaptive_splits || max_seqlen <= 0) return;
-    const int want = adaptive_want_nsplits(max_seqlen, s.cfg, s.split_chunk, Impl::MAX_NSPLITS);
-    if (want == s.n_splits) return;
-    s.n_splits = want;
-    invalidate_decode_graph();
-}
-
 int Qwen35Model::dflash_verify_token(int token_id, int position, int cap_row) {
     Impl& s = *p_;
     cudaStream_t st = s.stream;
@@ -1829,6 +1820,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     draft.set_shared_weights(embed_weights(), lm_head_weights(), lm_head_quant_type(),
                              s.cfg.vocab, s.cfg.hidden);
     set_dflash_capture(true, dc.target_layer_ids, B);
+    // Lock KV-split tier to the session's terminal seqlen before any graph capture (math-
+    // identical across split counts; avoids a mid-decode dflash graph recapture).
+    if (s.adaptive_splits) {
+        const int max_seqlen = std::min(s.cfg.max_seq, (int)prompt.size() + max_new + B);
+        s.n_splits = adaptive_want_nsplits(max_seqlen, s.cfg, s.split_chunk, Impl::MAX_NSPLITS);
+    }
 
     const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
     clear_prefix_cache();
