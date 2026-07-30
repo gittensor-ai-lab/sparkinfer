@@ -173,6 +173,9 @@ def _bidir_baseline_sane(q36, q35):
     return q36.get("128", 0) >= 200 and q35.get("128", 0) >= 80
 
 BASELINE_CACHE_FILE = os.path.join(HERE, ".baseline_cache.json")
+# Same-box main baseline cache is OFF by default — each eval run remeasures origin/main.
+# Set SPARKINFER_BASELINE_CACHE=1 to reuse a ≤12h cache (faster cron ticks, less precise).
+USE_BASELINE_CACHE = os.environ.get("SPARKINFER_BASELINE_CACHE", "0") == "1"
 
 
 def _baseline_box_id(instance=0):
@@ -2344,9 +2347,13 @@ def main():
                     help="comma-separated PR numbers — one baseline, then eval each (e.g. 387,389)")
     ap.add_argument("--skip-baseline", action="store_true",
                     help="require cached same-box baseline (≤12h, same box, same origin/main); abort if missing")
+    ap.add_argument("--baseline-cache", action="store_true",
+                    help="reuse ≤12h same-box baseline cache (default: always remeasure; "
+                         "or set SPARKINFER_BASELINE_CACHE=1)")
     ap.add_argument("--reeval", action="store_true",
                     help="re-run eval even if this commit was already graded (use with --only-pr)")
     args = ap.parse_args()
+    use_baseline_cache = USE_BASELINE_CACHE or args.baseline_cache
     if args.triple or args.dual:
         args.bidir = True
     if os.environ.get("BIDIR", "1") != "0" and not any(
@@ -2645,8 +2652,8 @@ def main():
     box_id = _baseline_box_id(base_iid)
     main_commit = _origin_main_short()
     bres = {}
-    cache = _load_baseline_cache(box_id)
-    cache_ok = cache and _baseline_cache_valid(cache, args.bidir, QWEN36_BASE, QWYTHOS_BASE, main_commit)
+    cache = _load_baseline_cache(box_id) if use_baseline_cache else None
+    cache_ok = bool(cache and _baseline_cache_valid(cache, args.bidir, QWEN36_BASE, QWYTHOS_BASE, main_commit))
     if cache_ok:
         if args.bidir:
             QWEN36_BASE.update(cache["q36"])
@@ -2660,6 +2667,8 @@ def main():
         print(f">> --skip-baseline: no valid cache for {box_id} — aborting")
         return
     else:
+        if not use_baseline_cache:
+            print(">> baseline cache disabled — measuring fresh same-box origin/main")
         if cache and main_commit:
             cached_commit = (cache.get("bres") or {}).get("commit")
             if (cached_commit and cached_commit != main_commit
@@ -2703,7 +2712,8 @@ def main():
         if not args.bidir and (not bres.get("pass") or not bres.get("tps")):
             log = (br.stdout + br.stderr)[-1200:]
             print(f">> same-box baseline (origin/main) failed — aborting; no PRs graded.\n{log}"); return
-        _save_baseline_cache(box_id, dict(QWEN36_BASE), dict(QWYTHOS_BASE), bres)
+        if use_baseline_cache:
+            _save_baseline_cache(box_id, dict(QWEN36_BASE), dict(QWYTHOS_BASE), bres)
     if args.bidir:
         run_baseline = float(QWEN36_BASE["128"])
         run_guard_128 = float(QWEN36_BASE["128"])

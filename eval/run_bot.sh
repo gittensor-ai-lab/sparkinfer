@@ -35,6 +35,7 @@ export PATH="/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1
 # Auto-merge the round's merge-first winner (guarded). Override with SPARKINFER_AUTOMERGE=0.
 export SPARKINFER_AUTOMERGE="${SPARKINFER_AUTOMERGE:-1}"
+export SPARKINFER_BASELINE_CACHE="${SPARKINFER_BASELINE_CACHE:-0}"
 
 BOT_ARGS=(
   --frontier "${FRONTIER:-285}"

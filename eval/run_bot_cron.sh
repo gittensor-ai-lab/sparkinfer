@@ -18,6 +18,7 @@ export PYTHONUNBUFFERED=1
 export SPARKINFER_AUTOMERGE="${SPARKINFER_AUTOMERGE:-1}"
 export SPARKINFER_AUTOMERGE_ADMIN="${SPARKINFER_AUTOMERGE_ADMIN:-1}"
 export VAST_NO_AUTO_PROVISION=1
+export SPARKINFER_BASELINE_CACHE="${SPARKINFER_BASELINE_CACHE:-0}"
 
 exec 9>/tmp/sparkinfer_bot.lock
 flock -n 9 || { echo "[$(date -u +%FT%TZ)] previous bot run still active — skipping this tick"; exit 0; }
@@ -36,6 +37,7 @@ fi
 export SPARKINFER_AUTOMERGE="${SPARKINFER_AUTOMERGE:-1}"
 export SPARKINFER_AUTOMERGE_ADMIN="${SPARKINFER_AUTOMERGE_ADMIN:-1}"
 export VAST_NO_AUTO_PROVISION=1
+export SPARKINFER_BASELINE_CACHE="${SPARKINFER_BASELINE_CACHE:-0}"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 
 git pull -q origin main 2>/dev/null || true
