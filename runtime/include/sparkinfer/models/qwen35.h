@@ -199,6 +199,10 @@ private:
     // Returns argmax seed at end-1 for decode, or -1 on failure.
     int ingest_prompt_range(const int* ids, int start, int end);
     void dflash_maybe_capture_layer(int layer);
+    void dflash_flush_stage_row();
+    int dflash_verify_token(int token_id, int position, int cap_row);
+    void dflash_promote_decode_splits(int max_seqlen);
+    static int adaptive_want_nsplits(int seqlen, const Qwen35Config& c, int split_chunk, int max_nsplits);
 
     struct Impl;
     Impl* p_;

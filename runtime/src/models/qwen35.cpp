@@ -453,6 +453,65 @@ void Qwen35Model::dflash_maybe_capture_layer(int layer) {
        "dflash capture");
 }
 
+void Qwen35Model::dflash_flush_stage_row() {
+    Impl& s = *p_;
+    if (!s.dflash_hidden || !s.dflash_cap_stage || s.dflash_n_cap <= 0) return;
+    const int row = s.dflash_cap_row;
+    if (row < 0 || row >= s.dflash_max_rows) return;
+    const int H = s.cfg.hidden;
+    const size_t row_elems = (size_t)s.dflash_n_cap * H;
+    cu(cudaMemcpyAsync(s.dflash_hidden + (size_t)row * row_elems, s.dflash_cap_stage,
+                       row_elems * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
+       "dflash stage->hidden");
+}
+
+int Qwen35Model::adaptive_want_nsplits(int seqlen, const Qwen35Config& c, int split_chunk, int max_nsplits) {
+    int want = 32;
+    if ((long)seqlen > 2L * split_chunk) want = 128;
+    if ((long)seqlen > 28L * split_chunk && (long)seqlen <= 48L * split_chunk)
+        want = max_nsplits;
+    if ((long)seqlen > 64L * split_chunk) want = max_nsplits;
+    if (want > max_nsplits) want = max_nsplits;
+    if (c.head_dim == 256 && c.n_kv_heads > 0 && want >= 128) {
+        if (c.n_q_heads == c.n_kv_heads * 8)
+            want = 160;
+        else if (c.n_q_heads == c.n_kv_heads * 4) {
+            if ((long)seqlen > 98304L)           want = 128;
+            else if ((long)seqlen > 65536L)      want = 192;
+            else                                 want = 160;
+        }
+    }
+    return want;
+}
+
+void Qwen35Model::dflash_promote_decode_splits(int max_seqlen) {
+    Impl& s = *p_;
+    if (!s.adaptive_splits || max_seqlen <= 0) return;
+    const int want = adaptive_want_nsplits(max_seqlen, s.cfg, s.split_chunk, Impl::MAX_NSPLITS);
+    if (want == s.n_splits) return;
+    s.n_splits = want;
+    invalidate_decode_graph();
+}
+
+int Qwen35Model::dflash_verify_token(int token_id, int position, int cap_row) {
+    Impl& s = *p_;
+    cudaStream_t st = s.stream;
+    s.dflash_cap_row = cap_row;
+    const int seqlen = position + 1;
+    s.h_scalars[0] = token_id;
+    s.h_scalars[1] = position;
+    s.h_scalars[2] = position;
+    s.h_scalars[3] = seqlen;
+    cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 4 * sizeof(int), cudaMemcpyHostToDevice, st), "verify scalars");
+    if (!s.dflash_graph_ready)
+        return forward_token(token_id, position, true);
+    cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash verify graph");
+    dflash_flush_stage_row();
+    cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "verify out_id");
+    cu(cudaStreamSynchronize(st), "verify sync");
+    return *s.h_out_id;
+}
+
 int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
@@ -461,19 +520,6 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     int seqlen = position + 1;
     cudaStream_t st = s.stream;
     const bool dflash_cap = s.dflash_capture;
-    // dflash_maybe_capture_layer always writes into the row-independent dflash_cap_stage
-    // buffer (graph-capturable, unlike dflash_hidden[cap_row] which varies call to call).
-    // Every path that can run it -- eager prefill, dflash decode graph capture, dflash decode
-    // graph replay -- must call this exactly once afterward or dflash_hidden[cap_row] is left
-    // stale/uninitialized for that call.
-    auto dflash_flush_stage = [&s, H]() {
-        if (!s.dflash_hidden || !s.dflash_cap_stage || s.dflash_n_cap <= 0 ||
-            s.dflash_cap_row < 0 || s.dflash_cap_row >= s.dflash_max_rows) return;
-        const size_t row_elems = (size_t)s.dflash_n_cap * H;
-        cu(cudaMemcpyAsync(s.dflash_hidden + (size_t)s.dflash_cap_row * row_elems,
-                           s.dflash_cap_stage, row_elems * sizeof(bf16),
-                           cudaMemcpyDeviceToDevice, s.stream), "dflash stage->hidden");
-    };
 
     s.h_scalars[0] = token_id;
     s.h_scalars[1] = position;
@@ -485,36 +531,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // (28*split_chunk < seqlen <= 48*split_chunk) is roofline-bound on 128 splits; promote
     // to MAX_NSPLITS there only. Past 16k keep the original 64* knee. Math unchanged.
     if (s.adaptive_splits) {
-        int want = 32;
-        if ((long)seqlen > 2L * s.split_chunk) want = 128;
-        if ((long)seqlen > 28L * s.split_chunk && (long)seqlen <= 48L * s.split_chunk)
-            want = Impl::MAX_NSPLITS;
-        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
-        if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
-        // hd256/GQA-8 occupancy correction (Qwen3.6 full-attention shape specifically): the
-        // generic 128/256 thresholds above were tuned around the split kernel's assumed
-        // occupancy, but fa_split_gqa_mma_i8_kernel<HEAD_DIM,GQA> is a single template shared
-        // by hd128 and hd256 under the SAME __launch_bounds__(GQA*32, 5) hint — hd256's smem
-        // footprint is ~1.9x hd128's (i8_smem ~33KB vs ~17KB for GQA=8), so its REAL achieved
-        // occupancy is lower than the 5 blocks/SM the generic policy assumes, meaning the split
-        // grid is systematically over-subscribed at this shape. Empirically re-measured (RTX
-        // 5090, same-box A/B, 4k/8k/16k/32k): a flat 160 beats both the 128 and 256 tiers at
-        // every measured point (+2.8% @16k, +4.9% @32k, +3.2% @8k, tied @4k), confirmed
-        // byte-safe (online-softmax combine is exact for any split count; verified top-1=100%,
-        // KL~equal to baseline vs a real llama.cpp reference at 120 sampled 8k-32k positions).
-        // GQA-8 (Qwen3.6): flat 160 through 32k (4k–32k A/B on RTX 5090).
-        // GQA-4 (Qwythos): same through 32k; promote splits at 64k/128k so per-split MMA
-        // chunks do not outgrow occupancy (64k: 192, 128k: 128 — same-box sweeps).
-        if (c.head_dim == 256 && c.n_kv_heads > 0 && want >= 128) {
-            if (c.n_q_heads == c.n_kv_heads * 8)
-                want = 160;
-            else if (c.n_q_heads == c.n_kv_heads * 4) {
-                if ((long)seqlen > 98304L)           want = 128;  // 128k decode (seqlen ~131k)
-                else if ((long)seqlen > 65536L)      want = 192;  // 64k decode band
-                else                                 want = 160;
-            }
-        }
-        if (want != s.n_splits) {                       // changed -> invalidate the captured graph
+        int want = adaptive_want_nsplits(seqlen, c, s.split_chunk, Impl::MAX_NSPLITS);
+        // DFlash verify graph is captured once per session at steady-state splits (see
+        // dflash_promote_decode_splits); mid-decode retiering is occupancy-only — skip recapture.
+        if (dflash_cap && s.dflash_graph_ready) want = s.n_splits;
+        if (want != s.n_splits) {
             s.n_splits = want;
             if (s.graph_ready) {
                 cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false;
@@ -562,7 +583,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.cu_graph = nullptr;
         s.graph_ready = false;
     }
-    if (s.dflash_graph_ready && attn_graph_mode != s.dflash_graph_attn_mode) {
+    if (s.dflash_graph_ready && attn_graph_mode != s.dflash_graph_attn_mode && !dflash_cap) {
         cu(cudaGraphExecDestroy(s.cu_dflash_exec), "dflash graph recapture destroy exec");
         cu(cudaGraphDestroy(s.cu_dflash_graph), "dflash graph recapture destroy graph");
         s.cu_dflash_exec = nullptr;
@@ -582,7 +603,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         cu(cudaGraphDestroy(s.cu_graph), "sparse recapture destroy graph");
         s.cu_exec = nullptr; s.cu_graph = nullptr; s.graph_ready = false;
     }
-    if (s.dflash_graph_ready && s.dflash_graph_sparse != sparse_on) {
+    if (s.dflash_graph_ready && s.dflash_graph_sparse != sparse_on && !dflash_cap) {
         cu(cudaGraphExecDestroy(s.cu_dflash_exec), "dflash sparse recapture destroy exec");
         cu(cudaGraphDestroy(s.cu_dflash_graph), "dflash sparse recapture destroy graph");
         s.cu_dflash_exec = nullptr; s.cu_dflash_graph = nullptr; s.dflash_graph_ready = false;
@@ -624,7 +645,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     }
     if (sample && dflash_cap && s.dflash_graph_ready) {
         cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch");
-        dflash_flush_stage();
+        dflash_flush_stage_row();
         cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
         cu(cudaStreamSynchronize(st), "sync");
         return *s.h_out_id;
@@ -1230,7 +1251,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         // dflash_cap_stage instead of dflash_hidden[cap_row] directly (so the SAME helper is
         // safe to call from inside the dflash decode graph too). Needs the same follow-up copy
         // the decode-graph branches do, or dflash_hidden[cap_row] is never actually updated here.
-        if (dflash_cap) dflash_flush_stage();
+        if (dflash_cap) dflash_flush_stage_row();
         cu(cudaStreamSynchronize(st), "prefill sync");
         return token_id;
     }
@@ -1256,7 +1277,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.dflash_graph_sparse = sparse_on;
         cu(cudaGraphUpload(s.cu_dflash_exec, st), "dflash graph upload");
         cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
-        dflash_flush_stage();
+        dflash_flush_stage_row();
     } else if (capturing_graph) {
         cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
         cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
@@ -1867,8 +1888,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int accept = 0, keep = 0;
         bool vfail = false;
         for (int i = 0; i < B; i++) {
-            set_dflash_capture_row(i);
-            const int p = forward_token(block[i], start + i, true);
+            const int p = dflash_verify_token(block[i], start + i, i);
             if (p < 0) { vfail = true; break; }
             posterior[i] = p;
             accept = i;
