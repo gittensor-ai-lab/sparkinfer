@@ -27,7 +27,7 @@ Usage:
   python3 run_quality.py --backend sparkinfer --tier development ...  # ~10%, 78 items
   python3 run_quality.py --backend sparkinfer --tier benchmark ...    # ~25%, 196 items
 """
-import argparse, json, os, subprocess, sys, glob
+import argparse, json, os, subprocess, sys, glob, urllib.error, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scorers
 
@@ -112,6 +112,41 @@ class LlamaBackend:
         return r.stdout
 
 
+class LlamaServerBackend:
+    """llama.cpp `llama-server` over HTTP - keeps the model resident across items.
+
+    `--backend llama` reloads the GGUF per item via llama-cli, which is impractical
+    for the benchmark tier; this talks to an already-running server instead. Prefers
+    the native `/completion` route and falls back to the OpenAI-compatible
+    `/v1/completions` when a build doesn't expose it. Greedy (temperature 0) so the
+    reference matches the other backends.
+    """
+    def __init__(self, url, timeout=600):
+        self.base = url.rstrip("/")
+        self.timeout = timeout
+        self.openai_route = False   # latched after one fallback, so we don't re-probe per item
+
+    def _post(self, path, payload):
+        req = urllib.request.Request(self.base + path, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode())
+
+    def gen_for(self, item):
+        n = MAXNEW.get(item["benchmark"], 200)
+        prompt = CHAT.format(p=build_prompt(item))
+        if not self.openai_route:
+            try:
+                return self._post("/completion", {"prompt": prompt, "n_predict": n,
+                                                  "temperature": 0.0})["content"]
+            except urllib.error.HTTPError as e:
+                if e.code not in (404, 405, 501):
+                    raise
+                self.openai_route = True
+        d = self._post("/v1/completions", {"prompt": prompt, "max_tokens": n, "temperature": 0.0})
+        return d["choices"][0]["text"]
+
+
 def make_backend(args, items):
     if args.backend == "oracle": return OracleBackend(items)
     if args.backend == "mock":   return MockBackend()
@@ -119,6 +154,10 @@ def make_backend(args, items):
         return SparkinferBackend(args.model, args.bin, args.tokenizer)
     if args.backend == "llama":
         return LlamaBackend(args.model, args.llama_cli)
+    if args.backend == "llama-server":
+        if not args.llama_url:
+            raise SystemExit("--backend llama-server requires --llama-url")
+        return LlamaServerBackend(args.llama_url)
     raise SystemExit("unknown backend " + args.backend)
 
 
@@ -136,17 +175,91 @@ def load(benchmarks, limit, tier=""):
     return items
 
 
+def self_test_llama_server():
+    """Drive LlamaServerBackend against a stub server - no GPU, no model, no llama.cpp.
+
+    Checks the request shape both endpoints receive, that the native route is used when
+    present, that a 404 latches the OpenAI fallback, and that what comes back still
+    scores through scorers.SCORERS. Returns a process exit code.
+    """
+    import http.server, threading
+
+    seen = []
+
+    def make_server(native_ok):
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a): pass          # keep the harness output clean
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen.append((self.path, body))
+                if self.path == "/completion":
+                    if not native_ok:
+                        self.send_response(404); self.end_headers(); return
+                    payload = {"content": "... #### 42"}
+                elif self.path == "/v1/completions":
+                    payload = {"choices": [{"text": "... #### 42"}]}
+                else:
+                    self.send_response(404); self.end_headers(); return
+                raw = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    item = {"benchmark": "gsm8k", "id": "selftest", "prompt": "2+2?", "target": "42"}
+    failures = []
+
+    def check(label, cond):
+        print(f"  {'ok  ' if cond else 'FAIL'}  {label}")
+        if not cond: failures.append(label)
+
+    print("self-test: llama-server backend")
+    for native_ok, want_path, want_key in ((True, "/completion", "n_predict"),
+                                           (False, "/v1/completions", "max_tokens")):
+        seen.clear()
+        srv = make_server(native_ok)
+        try:
+            be = LlamaServerBackend(f"http://127.0.0.1:{srv.server_address[1]}")
+            out = be.gen_for(item)
+        finally:
+            srv.shutdown()
+        tag = "native" if native_ok else "fallback"
+        check(f"{tag}: request reached {want_path}", seen[-1][0] == want_path)
+        check(f"{tag}: sent {want_key}", want_key in seen[-1][1])
+        check(f"{tag}: greedy (temperature 0)", seen[-1][1].get("temperature") == 0.0)
+        check(f"{tag}: prompt uses the chat template", "<|im_start|>" in seen[-1][1]["prompt"])
+        check(f"{tag}: generation returned", out.strip().endswith("42"))
+        check(f"{tag}: scorer accepts the output", scorers.SCORERS["gsm8k"](item, out)["pass"])
+        if not native_ok:
+            check("fallback: probed /completion first", seen[0][0] == "/completion")
+
+    print("\nself-test: %s" % ("PASS" if not failures else "FAIL (%d)" % len(failures)))
+    return 1 if failures else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", required=True, choices=["oracle", "mock", "sparkinfer", "llama"])
+    ap.add_argument("--backend", choices=["oracle", "mock", "sparkinfer", "llama", "llama-server"])
     ap.add_argument("--model"); ap.add_argument("--bin"); ap.add_argument("--tokenizer")
     ap.add_argument("--llama-cli")
+    ap.add_argument("--llama-url", help="base URL of a running llama-server, e.g. http://localhost:8082")
+    ap.add_argument("--self-test-llama-server", action="store_true",
+                    help="verify the llama-server wiring against a stub (no GPU/model)")
     ap.add_argument("--benchmarks", default="", help="comma list; default all")
     ap.add_argument("--limit", type=int, default=0, help="items per benchmark (0=all)")
     ap.add_argument("--tier", choices=sorted(TIERS),
-                    help="named per-suite sample: development ~=10%, benchmark ~=25%")
+                    help="named per-suite sample: development ~=10%%, benchmark ~=25%%")
     ap.add_argument("--out", default="", help="write per-item JSONL results here")
     args = ap.parse_args()
+
+    if args.self_test_llama_server:
+        sys.exit(self_test_llama_server())
+    if not args.backend:
+        ap.error("--backend is required (or use --self-test-llama-server)")
 
     benchmarks = set(b for b in args.benchmarks.split(",") if b)
     items = load(benchmarks, args.limit, args.tier or "")
