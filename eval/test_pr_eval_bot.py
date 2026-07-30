@@ -896,6 +896,38 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertIn("eval-qwen35:REJECT", body)
         self.assertIn("eval-qwen36:XL", body)
 
+    def test_bidir_failing_side_without_label_does_not_headline_as_passing(self):
+        """A failed side with no label of its own must not fall through to the
+        top-level label — on a bidir run that is the passing side, which is the
+        papering-over #555 established this function must prevent.
+
+        Reward-visible: `eval:XL` is x4.0 in the registry, `eval:REJECT` is x0.0.
+        """
+        res = {
+            "mode": "bidir", "label": "XL", "pass": True,
+            "score_qwen35": {"label": None, "pass": False, "tps": 0},
+            "score_qwen36": {"label": "XL", "pass": True, "tps": 3388.88},
+        }
+        self.assertEqual(bot._public_eval_label(res), "REJECT")
+
+    def test_bidir_failing_side_with_label_still_headlines_that_label(self):
+        """The fail-closed fallback must not swallow a real non-REJECT verdict."""
+        res = {
+            "mode": "bidir", "label": "XL", "pass": True,
+            "score_qwen35": {"label": "none", "pass": False},
+            "score_qwen36": {"label": "XL", "pass": True},
+        }
+        self.assertEqual(bot._public_eval_label(res), "none")
+
+    def test_bidir_all_sides_passing_keeps_the_top_level_label(self):
+        """No side failed, so the headline is unchanged."""
+        res = {
+            "mode": "bidir", "label": "XL", "pass": True,
+            "score_qwen35": {"label": "S", "pass": True},
+            "score_qwen36": {"label": "XL", "pass": True},
+        }
+        self.assertEqual(bot._public_eval_label(res), "XL")
+
     def test_none_reject_eval_count_ignores_infra_error(self):
         infra_body = bot.render({
             "label": "REJECT", "pass": False, "infra_error": True, "mode": "bidir",

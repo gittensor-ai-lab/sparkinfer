@@ -638,6 +638,11 @@ def _public_eval_label(res):
             for s in sides:
                 if s.get("pass") is False and s.get("label"):
                     return s["label"]
+            # A side failed but carried no label of its own (partial record).
+            # Falling through here would headline the top-level label, which on
+            # a bidir run is the passing side — the exact papering-over this
+            # function exists to prevent. Fail closed instead.
+            return "REJECT"
     return res.get("label")
 
 
