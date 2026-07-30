@@ -1254,6 +1254,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.dflash_graph_ready = true;
         s.dflash_graph_attn_mode = attn_graph_mode;
         s.dflash_graph_sparse = sparse_on;
+        cu(cudaGraphUpload(s.cu_dflash_exec, st), "dflash graph upload");
         cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
         dflash_flush_stage();
     } else if (capturing_graph) {
@@ -1844,11 +1845,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int th_len = n;
 
     std::vector<int> block(B), posterior(B), draft_ids(B);
-    bf16* th_scratch = nullptr;
-    const int row_stride = dflash_hidden_row_stride();
-    cu(cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)), "th scratch");
 
     auto t_decode0 = std::chrono::steady_clock::now();
+    if (s.dflash_graph_ready)
+        cu(cudaGraphUpload(s.cu_dflash_exec, s.stream), "dflash decode graph upload");
     while ((int)out.size() < max_new) {
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
@@ -1876,13 +1876,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             if (i + 1 < B && block[i + 1] != p) break;   // first mismatch -> reject the rest
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
-        // Accepted hiddens are in dflash_hidden rows 0..keep-1 (captured above); hand them to the
-        // next draft block via th_scratch and stash into the context buffer by global position.
-        cu(cudaMemcpyAsync(th_scratch, s.dflash_hidden,
-                           (size_t)keep * row_stride * sizeof(bf16),
-                           cudaMemcpyDeviceToDevice, s.stream), "th keep");
-        for (int i = 0; i < keep; i++) dflash_stash_capture(start + i);
-        cu(cudaStreamSynchronize(s.stream), "th sync");
+        // Accepted hiddens sit in dflash_hidden rows 0..keep-1; feed them directly to the next
+        // draft block (no th_scratch D2D copy — draft only reads, verify overwrites next step).
 
         bool stop = false;
         for (int i = 0; i < keep && (int)out.size() < max_new; i++) {
@@ -1900,7 +1895,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         start += keep;
         accept_sum += (double)keep;
         steps++;
-        target_hidden = th_scratch;
+        target_hidden = s.dflash_hidden;
         th_len = keep;
         if (gov) gov->pace();
     }
@@ -1911,7 +1906,6 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         stats->ttft_s = std::chrono::duration<double>(t1 - t0).count();
         stats->decode_s = std::chrono::duration<double>(t_end - t_decode0).count();
     }
-    cudaFree(th_scratch);
     close_session(sid);
     set_dflash_capture(false, {}, 0);
     draft.reset();
