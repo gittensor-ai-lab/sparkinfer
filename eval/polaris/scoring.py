@@ -87,8 +87,15 @@ def score(result: dict) -> dict:
 
     # ---- No-regression guard ----
     # Every measured context must hold >= tolerance vs main branch baseline.
+    #
+    # `all([])` is vacuously true, so an empty measurement set must not read as
+    # a pass: a guard carrying accuracy fields but no per-context speed flags is
+    # a partial infra failure, and this script fails closed on those (see the
+    # empty-primary branch above and the `bool(guard)` term below). Requiring at
+    # least one measured context keeps "no regression" a claim about evidence
+    # rather than about its absence.
     present = [k for k in GUARD_CTX_KEYS if k in guard]
-    speed_ok = all(guard.get(k, True) for k in present)
+    speed_ok = bool(present) and all(guard[k] for k in present)
     g_top1 = float(guard.get("top1", 0))
     g_kl = float(guard.get("kl", 99))
     g_acc_ok = g_top1 >= TOP1_BAR and g_kl <= KL_BAR
@@ -125,6 +132,10 @@ def score(result: dict) -> dict:
             )
         if not bool(guard):
             reasons.append("Qwen3-30B guard produced no verdict (infra error)")
+        elif not present:
+            reasons.append(
+                "Qwen3-30B guard measured no decode context (infra error)"
+            )
         if not reasons:
             reasons.append("Qwen3-30B no-regression guard failed")
         final["label"] = "REJECT"
