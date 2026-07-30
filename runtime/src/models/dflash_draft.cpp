@@ -344,6 +344,8 @@ void DFlashDraftModel::crop(int keep) {
 
 int DFlashDraftModel::seq_len() const { return p_->seq_len; }
 
+const int* DFlashDraftModel::device_argmax_ids() const { return p_->d_out; }
+
 const float* DFlashDraftModel::last_logits() const { return p_->logits; }
 
 bool DFlashDraftModel::load(const std::string& dir) {
@@ -617,9 +619,11 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     }
     }
     kernels::launch_argmax(s.logits, s.d_out, B, V, st);
-    cu(cudaMemcpyAsync(s.h_out, s.d_out, B * sizeof(int), cudaMemcpyDeviceToHost, st), "argmax");
-    cu(cudaStreamSynchronize(st), "draft sync");
-    for (int t = 0; t < B; t++) out_argmax[t] = s.h_out[t];
+    if (out_argmax) {
+        cu(cudaMemcpyAsync(s.h_out, s.d_out, B * sizeof(int), cudaMemcpyDeviceToHost, st), "argmax");
+        cu(cudaStreamSynchronize(st), "draft sync");
+        for (int t = 0; t < B; t++) out_argmax[t] = s.h_out[t];
+    }
 
     // Advance past the just-appended ctx+noise, then crop to `pos0` (= block start).
     // Matches z-lab dflash: past_key_values_draft.update(...) then .crop(start).

@@ -1847,16 +1847,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     if (s.adaptive_splits) {
         const Qwen35Config& c = s.cfg;
         const int max_seqlen = std::min(s.cfg.max_seq, (int)prompt.size() + max_new + B);
-        int tier = adaptive_want_nsplits(max_seqlen, c, s.split_chunk, Impl::MAX_NSPLITS);
-        // GQA-8 DFlash verify: 160 splits is faster on Blackwell even below the 512-token
-        // adaptive knee (split count is occupancy-only — math is identical).
-        if (c.head_dim == 256 && c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 8 &&
-            max_new >= 64 && tier < 160)
-            tier = 160;
-        s.dflash_session_nsplits = tier;
+        s.dflash_session_nsplits = adaptive_want_nsplits(max_seqlen, c, s.split_chunk, Impl::MAX_NSPLITS);
         const int prefill_tier = adaptive_want_nsplits((int)prompt.size(), c, s.split_chunk,
                                                        Impl::MAX_NSPLITS);
-        s.dflash_defer_graph = (tier > prefill_tier);
+        s.dflash_defer_graph = (s.dflash_session_nsplits > prefill_tier);
     } else {
         s.dflash_session_nsplits = 0;
         s.dflash_defer_graph = false;
@@ -1898,20 +1892,20 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     const void* target_hidden = dflash_context_buffer();
     int th_len = n;
 
-    std::vector<int> block(B), posterior(B), draft_ids(B);
+    std::vector<int> block(B), posterior(B);
 
     auto t_decode0 = std::chrono::steady_clock::now();
-    if (s.dflash_graph_ready)
-        cu(cudaGraphUpload(s.cu_dflash_exec, s.stream), "dflash decode graph upload");
     while ((int)out.size() < max_new) {
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 
-        if (!draft.forward_block(target_hidden, th_len, block.data(), start, draft_ids.data(), s.stream)) {
+        if (!draft.forward_block(target_hidden, th_len, block.data(), start, nullptr, s.stream)) {
             fprintf(stderr, "[dflash] draft forward failed at start=%d\n", start);
             break;
         }
-        for (int i = 1; i < B; i++) block[i] = draft_ids[i];
+        cu(cudaMemcpyAsync(&block[1], draft.device_argmax_ids() + 1, (size_t)(B - 1) * sizeof(int),
+                           cudaMemcpyDeviceToHost, s.stream), "draft ids");
+        cu(cudaStreamSynchronize(s.stream), "draft ids sync");
 
         // Incremental verify with early-exit: forward only the accepted prefix, stopping at the
         // first rejected proposal. forward_token advances GDN state + KV per token, so after
