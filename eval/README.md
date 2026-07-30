@@ -173,7 +173,8 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 `dflash_accuracy.sh`). It scores **same-box PR DFlash tok/s vs `origin/main` DFlash tok/s**,
 applies `eval-dflash:{XL,L,M,S,XS,none,REJECT}`, picks `dflash-merge-first`, and can auto-merge
 (`SPARKINFER_AUTOMERGE=1`) when accuracy passes (SPEC_AGREE) and the tier is a verified speedup.
-AR `eval:*` labels are left alone.
+AR `eval:*` labels are left alone. Throughput is measured with **512 generated tokens** by default
+(`DFLASH_BENCH_TOKENS`) so sessions cross the adaptive KV-split tier that DFlash verify graphs bake in.
 
 ```bash
 eval/setup_labels.sh                                  # creates eval-dflash:* + dflash-merge-*

@@ -466,6 +466,22 @@ void Qwen35Model::dflash_flush_stage_row() {
        "dflash stage->hidden");
 }
 
+void Qwen35Model::dflash_promote_session_splits() {
+    Impl& s = *p_;
+    if (!s.adaptive_splits || s.dflash_session_nsplits <= 0) return;
+    if (s.n_splits == s.dflash_session_nsplits) return;
+    s.n_splits = s.dflash_session_nsplits;
+    if (s.dflash_graph_ready) {
+        cu(cudaGraphExecDestroy(s.cu_dflash_exec), "dflash split promote destroy exec");
+        cu(cudaGraphDestroy(s.cu_dflash_graph), "dflash split promote destroy graph");
+        s.cu_dflash_exec = nullptr;
+        s.cu_dflash_graph = nullptr;
+        s.dflash_graph_ready = false;
+        s.dflash_graph_attn_mode = -1;
+        s.dflash_graph_sparse = false;
+    }
+}
+
 int Qwen35Model::adaptive_want_nsplits(int seqlen, const Qwen35Config& c, int split_chunk, int max_nsplits) {
     int want = 32;
     if ((long)seqlen > 2L * split_chunk) want = 128;
@@ -524,7 +540,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // to MAX_NSPLITS there only. Past 16k keep the original 64* knee. Math unchanged.
     if (s.adaptive_splits) {
         int want = adaptive_want_nsplits(seqlen, c, s.split_chunk, Impl::MAX_NSPLITS);
-        if (dflash_cap && s.dflash_session_nsplits > 0) want = s.dflash_session_nsplits;
+        if (dflash_cap && s.dflash_graph_ready) want = s.n_splits;
         if (want != s.n_splits) {
             s.n_splits = want;
             if (s.graph_ready) {
@@ -1825,7 +1841,6 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     if (s.adaptive_splits) {
         const int max_seqlen = std::min(s.cfg.max_seq, (int)prompt.size() + max_new + B);
         s.dflash_session_nsplits = adaptive_want_nsplits(max_seqlen, s.cfg, s.split_chunk, Impl::MAX_NSPLITS);
-        s.n_splits = s.dflash_session_nsplits;
     } else {
         s.dflash_session_nsplits = 0;
     }
@@ -1857,6 +1872,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         set_dflash_capture(false, {}, 0);
         return out;
     }
+    dflash_promote_session_splits();
 
     draft.reset();
     int start = n;

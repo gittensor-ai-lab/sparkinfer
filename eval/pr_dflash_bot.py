@@ -55,7 +55,9 @@ DEFAULT_DRAFT = os.environ.get(
 )
 DEFAULT_MODELS_DIR = os.environ.get("DFLASH_MODELS_DIR", "/workspace/models36")
 REMOTE_REPO = os.environ.get("DFLASH_REMOTE_REPO", "/root/sparkinfer")
-BENCH_TOKENS = int(os.environ.get("DFLASH_BENCH_TOKENS", "128"))
+# 512 gen crosses the adaptive KV-split knee (prompt + ntok > 2*split_chunk) so DFlash
+# verify graphs are captured at the terminal n_splits tier, not stuck at 32.
+BENCH_TOKENS = int(os.environ.get("DFLASH_BENCH_TOKENS", "512"))
 
 AUTO_MERGE = os.environ.get("SPARKINFER_AUTOMERGE", "0") == "1"
 AUTOMERGE_BLOCK = {

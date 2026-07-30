@@ -200,6 +200,7 @@ private:
     int ingest_prompt_range(const int* ids, int start, int end);
     void dflash_maybe_capture_layer(int layer);
     void dflash_flush_stage_row();
+    void dflash_promote_session_splits();
     int dflash_verify_token(int token_id, int position, int cap_row);
     static int adaptive_want_nsplits(int seqlen, const Qwen35Config& c, int split_chunk, int max_nsplits);
 
