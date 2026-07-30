@@ -224,6 +224,7 @@ struct Qwen35Model::Impl {
     int dflash_cap_row = 0;
     int dflash_ctx_len = 0;
     int dflash_ctx_cap = 0;
+    int dflash_session_nsplits = 0;   // terminal-seqlen KV-split tier for this session (0=off)
     bf16* dflash_hidden = nullptr;    // [max_rows, n_cap * H]
     bf16* dflash_context = nullptr;   // [ctx_cap, n_cap * H]
     float* spec_lin_snap = nullptr;
@@ -523,10 +524,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // to MAX_NSPLITS there only. Past 16k keep the original 64* knee. Math unchanged.
     if (s.adaptive_splits) {
         int want = adaptive_want_nsplits(seqlen, c, s.split_chunk, Impl::MAX_NSPLITS);
-        // DFlash pins n_splits at session entry from terminal seqlen (dflash_generate).
-        // Keep that tier for the whole session — including prompt prefill before the verify
-        // graph exists — so capture doesn't bake 32 splits and leave decode under-occupied.
-        if (dflash_cap) want = s.n_splits;
+        if (dflash_cap && s.dflash_session_nsplits > 0) want = s.dflash_session_nsplits;
         if (want != s.n_splits) {
             s.n_splits = want;
             if (s.graph_ready) {
@@ -1718,6 +1716,7 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
     s.dflash_max_rows = std::max(1, max_rows);
     s.dflash_cap_row = 0;
     s.dflash_ctx_len = 0;
+    s.dflash_session_nsplits = 0;
     invalidate_decode_graph();
     if (!on) return;
     const int H = s.cfg.hidden;
@@ -1825,7 +1824,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // identical across split counts; avoids a mid-decode dflash graph recapture).
     if (s.adaptive_splits) {
         const int max_seqlen = std::min(s.cfg.max_seq, (int)prompt.size() + max_new + B);
-        s.n_splits = adaptive_want_nsplits(max_seqlen, s.cfg, s.split_chunk, Impl::MAX_NSPLITS);
+        s.dflash_session_nsplits = adaptive_want_nsplits(max_seqlen, s.cfg, s.split_chunk, Impl::MAX_NSPLITS);
+        s.n_splits = s.dflash_session_nsplits;
+    } else {
+        s.dflash_session_nsplits = 0;
     }
 
     const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
