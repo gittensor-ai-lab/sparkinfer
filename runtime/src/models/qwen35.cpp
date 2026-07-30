@@ -523,9 +523,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // to MAX_NSPLITS there only. Past 16k keep the original 64* knee. Math unchanged.
     if (s.adaptive_splits) {
         int want = adaptive_want_nsplits(seqlen, c, s.split_chunk, Impl::MAX_NSPLITS);
-        // DFlash verify graph is captured once per session at steady-state splits (see
-        // dflash_promote_decode_splits); mid-decode retiering is occupancy-only — skip recapture.
-        if (dflash_cap && s.dflash_graph_ready) want = s.n_splits;
+        // DFlash pins n_splits at session entry from terminal seqlen (dflash_generate).
+        // Keep that tier for the whole session — including prompt prefill before the verify
+        // graph exists — so capture doesn't bake 32 splits and leave decode under-occupied.
+        if (dflash_cap) want = s.n_splits;
         if (want != s.n_splits) {
             s.n_splits = want;
             if (s.graph_ready) {
