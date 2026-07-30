@@ -447,7 +447,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      const int* noise_ids, int pos0,
                                      int* out_argmax, cudaStream_t stream) {
     Impl& s = *p_;
-    if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
+    if (!s.fc || !s.embed || !s.lm_head || !noise_ids) return false;
     if (ctx_len < 0 || ctx_len + s.cfg.block_size > s.cfg.max_seq + s.cfg.block_size) return false;
     cudaStream_t st = stream ? stream : s.stream;
     const auto& c = s.cfg;
