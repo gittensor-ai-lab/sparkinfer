@@ -33,6 +33,17 @@ void launch_prefill_gemm_i8(const signed char* A, const signed char* W,
 // Residual-fused int8 GEMM: C[m,n] = bf16(C[m,n] + bf16(acc*sx*sw)) -- pass the residual tensor as
 // C to fold the post-projection "x += out" into the store (same two-step rounding as the separate
 // add kernel, so the result is bit-identical while skipping the ao scratch round-trip + add pass).
+// Two projections of the SAME activation A with matching N and K (shared-expert gate+up,
+// attention wk+wv) in ONE launch: the N-tile index picks the weight, so the grid doubles instead of
+// two 16-block launches serializing on the stream, and A is staged once. Each weight is still read
+// exactly once and every output element keeps the same K accumulation order, so the results are
+// bit-identical to two launch_prefill_gemm_i8 calls. Returns false if it launched nothing.
+//   SPARKINFER_PREFILL_GEMM_PAIR (default 1)  0 disables (A/B) -> caller runs two GEMMs.
+bool launch_prefill_gemm_i8_pair(const signed char* A, const signed char* W0, const signed char* W1,
+                                 const float* sx, const float* sw0, const float* sw1,
+                                 void* C0, void* C1, int M, int N, int K,
+                                 cudaStream_t stream = nullptr);
+
 void launch_prefill_gemm_i8_resid(const signed char* A, const signed char* W,
                                   const float* sx, const float* sw, void* C,
                                   int M, int N, int K, cudaStream_t stream = nullptr);

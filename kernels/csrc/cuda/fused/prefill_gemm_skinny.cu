@@ -34,6 +34,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
 #include <mma.h>
 
 #include <cstdlib>
@@ -109,7 +110,115 @@ __global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Paired variant: C0 = A W0^T and C1 = A W1^T in one pass (ssm_alpha + ssm_beta).
+//
+// At long prompt length the shape above is compute-bound and a full grid is the whole fix. At SHORT
+// prompt length it is neither: M=512 gives grid = M/BT = 16 blocks on 170 SMs, and inside a block
+// every K slice is a bare `stage -> __syncthreads -> 4 mma -> __syncthreads` chain with nothing to
+// hide the global latency behind (measured 44 us per call, ~93 GB/s effective, 88 us per GDN layer
+// across the alpha/beta pair). Two things fix that without touching a single arithmetic step:
+//   * the pair shares A, so stage it ONCE and walk the K chain once instead of twice;
+//   * stage with cp.async into a double buffer, so slice k+1 is in flight during slice k's mma.
+// Warp w owns one 16x16 tile of weight (w >= HALF) -- the same tile the single-weight kernel would
+// give it -- and accumulates over K in the same order, so every output element is bit-identical.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void sk_cp16(void* dst, const void* src, bool pred) {
+    if (pred) __pipeline_memcpy_async(dst, src, 16);
+    else      *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
+}
+
+template <int BT, int NMAX, int KT, int WARPS>
+__global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_pair_kernel(
+        const __nv_bfloat16* __restrict__ A,
+        const __nv_bfloat16* __restrict__ W0, const __nv_bfloat16* __restrict__ W1,
+        __nv_bfloat16* __restrict__ C0, __nv_bfloat16* __restrict__ C1,
+        int M, int n_out, int K) {
+    using namespace nvcuda;
+    constexpr int TILES = (BT / 16) * (NMAX / 16);   // output tiles per weight == warps per weight
+    __shared__ __nv_bfloat16 sA[2][BT][KT + SK_PAD];
+    __shared__ __nv_bfloat16 sW[2][2][NMAX][KT + SK_PAD];
+    __shared__ float sC[WARPS][16][16];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int m0   = blockIdx.x * BT;
+    const int sel  = warp / TILES;                // which weight this warp accumulates
+    const int t    = warp - sel * TILES;
+    const int wm   = t / (NMAX / 16);
+    const int wn   = t % (NMAX / 16);
+
+    // Issue one K slice's A + W0 + W1 loads into buffer `buf`.
+    auto stage = [&](int buf, int k0) {
+        #pragma unroll
+        for (int e = tid; e < (BT * KT) / 8; e += WARPS * 32) {
+            const int i = e / (KT / 8), kv = (e % (KT / 8)) * 8;
+            const int gm = m0 + i, gk = k0 + kv;
+            sk_cp16(&sA[buf][i][kv], &A[(size_t)gm * K + gk], gm < M && gk + 7 < K);
+        }
+        #pragma unroll
+        for (int e = tid; e < (2 * NMAX * KT) / 8; e += WARPS * 32) {
+            const int wsel = e / ((NMAX * KT) / 8), r = e - wsel * ((NMAX * KT) / 8);
+            const int j = r / (KT / 8), kv = (r % (KT / 8)) * 8;
+            const int gk = k0 + kv;
+            const __nv_bfloat16* Wp = wsel ? W1 : W0;
+            sk_cp16(&sW[buf][wsel][j][kv], &Wp[(size_t)j * K + gk], j < n_out && gk + 7 < K);
+        }
+        __pipeline_commit();
+    };
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
+    wmma::fill_fragment(cf, 0.f);
+
+    stage(0, 0);
+    for (int k0 = 0, buf = 0; k0 < K; k0 += KT, buf ^= 1) {
+        if (k0 + KT < K) stage(buf ^ 1, k0 + KT);
+        __pipeline_wait_prior(k0 + KT < K ? 1 : 0);
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < KT; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, &sA[buf][wm * 16][kk], KT + SK_PAD);
+            wmma::load_matrix_sync(bf, &sW[buf][sel][wn * 16][kk], KT + SK_PAD);  // col_major => W^T
+            wmma::mma_sync(cf, af, bf, cf);
+        }
+        __syncthreads();
+    }
+
+    // Per-warp landing zone, so the store needs no barrier round-robin.
+    wmma::store_matrix_sync(&sC[warp][0][0], cf, 16, wmma::mem_row_major);
+    __syncwarp();
+    __nv_bfloat16* Cp = sel ? C1 : C0;
+    for (int e = lane; e < 256; e += 32) {
+        const int r = e >> 4, c = e & 15;
+        const int gm = m0 + wm * 16 + r, gn = wn * 16 + c;
+        if (gm < M && gn < n_out) Cp[(size_t)gm * n_out + gn] = __float2bfloat16(sC[warp][r][c]);
+    }
+}
+
 }  // namespace
+
+bool launch_prefill_gemm_skinny_pair(const void* A, const void* W0, const void* W1,
+                                     void* C0, void* C1,
+                                     int M, int N, int K, cudaStream_t stream) {
+    constexpr int BT = 32, NMAX = 32, KT = 64, WARPS = (BT / 16) * (NMAX / 16) * 2;
+    static_assert(WARPS * 32 <= 1024 && (KT % 16) == 0, "one warp per 16x16 output tile per weight");
+
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GEMM_SKINNY2");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!enabled || !W0 || !W1 || N > NMAX || M <= 0 || K <= 0 || (K % KT) != 0) return false;
+
+    dim3 grid((M + BT - 1) / BT);
+    pf_gemm_skinny_pair_kernel<BT, NMAX, KT, WARPS><<<grid, WARPS * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(A), reinterpret_cast<const __nv_bfloat16*>(W0),
+        reinterpret_cast<const __nv_bfloat16*>(W1), reinterpret_cast<__nv_bfloat16*>(C0),
+        reinterpret_cast<__nv_bfloat16*>(C1), M, N, K);
+    return true;
+}
 
 bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
                                 int M, int N, int K, cudaStream_t stream) {

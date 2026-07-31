@@ -16,6 +16,7 @@
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/gemm.h"
+#include "sparkinfer/kernels/prefill_gemm_skinny.h"
 #include "sparkinfer/kernels/prefill_i8.h"
 #include "sparkinfer/kernels/prefill_fp8.h"
 #include "sparkinfer/kernels/prefill_moe.h"
@@ -28,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_map>
 #include <vector>
 
 namespace sparkinfer {
@@ -50,7 +52,176 @@ struct Arena {
     }
     void free_all() { for (void* b : bufs) cudaFree(b); bufs.clear(); }
 };
+
+// ---------------------------------------------------------------------------
+// Static-weight conversion cache.
+//
+// Every projection converts its weight into the GEMM's operand type on EVERY prefill call:
+// Q4_K/Q8_0 -> bf16 scratch (launch_gguf_dequant) -> per-row fp8/int8 rows + row scales
+// (launch_prefill_quantize_rows_*). Those weights are immutable after load, so the conversion is
+// pure repeat work whose cost is O(weight bytes) and independent of the prompt length -- it is
+// noise at 32k and 8% of the call at short context (measured 4.5 ms of a 58.0 ms 512-token prefill,
+// RTX 5090, Qwen3.6-35B-A3B UD-Q4_K_M).
+//
+// Convert once, keep the rows + scales, hand the SAME bytes back on every later call: the GEMMs
+// see operands identical to the ones the first conversion produced, so this is bit-exact -- only
+// the address the operand is read from changes. The routed-expert pool is deliberately NOT cached
+// (int8 for all 256 experts x 40 layers is ~32 GB); this covers the per-layer dense projections
+// only. Entries are dropped once the budget is hit, so a cache miss just runs the old path.
+struct PfWeightCache {
+    struct Entry {
+        void*  q = nullptr;
+        float* scale = nullptr;
+        int    n_out = 0, K = 0;
+    };
+    std::unordered_map<unsigned long long, Entry> map;
+    size_t bytes = 0;
+    size_t budget = 0;
+    bool off = false;                    // set after a scratch-alloc failure; never re-armed
+    ~PfWeightCache() { release(); }
+    void release() {
+        for (auto& kv : map) { cudaFree(kv.second.q); cudaFree(kv.second.scale); }
+        map.clear();
+        bytes = 0;
+    }
+    // fmt: 0 = fp8 e4m3 rows, 1 = int8 rows. A weight is only ever converted at one shape, so the
+    // shape is stored and revalidated rather than hashed (a mismatch simply bypasses the cache).
+    Entry* find(const void* W, int fmt, int n_out, int K) {
+        auto it = map.find(((unsigned long long)(uintptr_t)W << 1) | (unsigned)fmt);
+        if (it == map.end() || !it->second.q) return nullptr;
+        if (it->second.n_out != n_out || it->second.K != K) return nullptr;
+        return &it->second;
+    }
+    // Reserve device storage for a new entry; null when the budget is spent or cudaMalloc fails.
+    Entry* insert(const void* W, int fmt, int n_out, int K) {
+        const size_t need = (size_t)n_out * (size_t)K + (size_t)n_out * sizeof(float);
+        if (bytes + need > budget) return nullptr;
+        Entry e;
+        if (cudaMalloc(&e.q, (size_t)n_out * K) != cudaSuccess) return nullptr;
+        if (cudaMalloc(&e.scale, (size_t)n_out * sizeof(float)) != cudaSuccess) {
+            cudaFree(e.q);
+            return nullptr;
+        }
+        e.n_out = n_out; e.K = K;
+        bytes += need;
+        return &(map[((unsigned long long)(uintptr_t)W << 1) | (unsigned)fmt] = e);
+    }
+};
+// Fetch (creating on first use) the cache behind a Qwen35PrefillCtx::weight_cache slot.
+// Null when caching is off, there is no slot, or the allocation fails — callers then run the
+// original per-call conversion, so a null cache is a slow path, never a wrong one.
+PfWeightCache* pf_wcache_get(void** slot) {
+    static const int on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_WCACHE");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!on || !slot) return nullptr;
+    if (!*slot) {
+        auto* nc = new PfWeightCache();
+        const char* mb = getenv("SPARKINFER_PREFILL_WCACHE_MB");
+        const int lim = mb ? atoi(mb) : 3072;
+        nc->budget = (size_t)(lim > 0 ? lim : 3072) << 20;
+        *slot = nc;
+    }
+    auto* wc = static_cast<PfWeightCache*>(*slot);
+    return wc->off ? nullptr : wc;
+}
+
+// Give the cached bytes back and stay off for the rest of the process. Called only when the
+// per-call scratch arena could not be allocated: the cache is a pure optimization, so at the point
+// where it competes with the buffers the prefill cannot run without, it loses.
+void pf_wcache_yield(void** slot) {
+    if (!slot || !*slot) return;
+    auto* wc = static_cast<PfWeightCache*>(*slot);
+    if (wc->off) return;
+    fprintf(stderr, "[prefill] scratch alloc failed with a %.0f MB weight cache resident "
+                    "-> releasing it and disabling\n", wc->bytes / 1e6);
+    wc->release();
+    wc->off = true;
+}
 } // namespace
+
+void prefill_weight_cache_free(void* cache) { delete static_cast<PfWeightCache*>(cache); }
+
+// Convert the dense projection weights into their GEMM operand form at LOAD, so that no prefill
+// call pays for it. Eager on purpose: the scored bench sweep times each context exactly once, so a
+// lazily filled cache would put the whole conversion inside the very pass it is meant to speed up
+// (the same reason the routed-expert row scales are filled eagerly).
+//
+// Formats mirror prefill_batched_run's defaults for the Qwen3.6 MoE hybrid — GDN and attention
+// projections on fp8 e4m3 (moe_fp8), shared expert on int8 (moe_shared_i8). Anything that deviates
+// from those defaults (an env override, or the Qwythos dense hybrid, whose choice depends on the
+// prompt length) is left un-warmed and converts lazily on first use: a miss costs one conversion,
+// never correctness. The routed-expert pool is never cached — int8 for 256 experts x 40 layers is
+// ~32 GB — so this touches only the per-layer dense projections (~1.4 GB for Qwen3.6-35B-A3B).
+void prefill_weight_cache_warm(const Qwen35PrefillCtx& s) {
+    const Qwen35Config& c = s.cfg;
+    if (!s.gguf || !c.hybrid || !(!c.dense_ffn && c.n_experts > 0)) return;
+    if (const char* e = getenv("SPARKINFER_PREFILL_I8"))       if (e[0] != '0') return;
+    if (const char* e = getenv("SPARKINFER_PREFILL_MOE_FP8"))  if (e[0] == '0') return;
+    const bool shared_i8 = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_SHARED_I8");
+        return e ? e[0] == '1' : true;
+    }();
+    PfWeightCache* wc = pf_wcache_get(s.weight_cache);
+    if (!wc) return;
+
+    const int H = c.hidden, mffn = c.moe_ffn;
+    const int lqkv = s.linear_qkvdim, lvdim = s.linear_vdim;
+    const int qdim = s.qdim, kvdim = s.kvdim, wide = 2 * s.qdim;
+    size_t maxw = (size_t)wide * H;
+    if ((size_t)lqkv * H > maxw) maxw = (size_t)lqkv * H;
+    bf16* wbuf = nullptr;
+    if (cudaMalloc(&wbuf, maxw * sizeof(bf16)) != cudaSuccess) return;
+    cudaStream_t st = s.stream;
+
+    auto dqw = [&](const void* W, int wtype, int n_out, int K) -> const void* {
+        if (wtype == 0) return W;
+        kernels::launch_gguf_dequant(wtype, W, wbuf, (long)n_out * K, st);
+        return wbuf;
+    };
+    // fmt 0 = fp8 e4m3 rows, 1 = int8 rows. Same kernels, same order as the in-run conversion.
+    auto conv = [&](const void* W, int wtype, int n_out, int K, int fmt) {
+        if (!W || n_out < 128 || wc->find(W, fmt, n_out, K)) return;
+        PfWeightCache::Entry* e = wc->insert(W, fmt, n_out, K);
+        if (!e) return;
+        if (fmt == 0) {
+            kernels::launch_prefill_quantize_rows_fp8(dqw(W, wtype, n_out, K), e->q, e->scale,
+                                                      n_out, K, st);
+        } else {
+            auto* q = static_cast<signed char*>(e->q);
+            if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, q, e->scale, n_out, K, st))
+                kernels::launch_prefill_quantize_rows_i8(dqw(W, wtype, n_out, K), q, e->scale,
+                                                         n_out, K, st);
+        }
+    };
+
+    for (int L = 0; L < c.n_layers; L++) {
+        const Qwen35LayerWeights& w = s.w.layers[L];
+        if (w.linear_attn) {
+            conv(w.wqkv,      w.wqkv_type,      lqkv,  H,     0);
+            conv(w.wqkv_gate, w.wqkv_gate_type, lvdim, H,     0);
+            conv(w.ssm_out,   w.ssm_out_type,   H,     lvdim, 0);
+        } else {
+            conv(w.wq, w.wq_type, wide,  H,    0);
+            conv(w.wk, w.wk_type, kvdim, H,    0);
+            conv(w.wv, w.wv_type, kvdim, H,    0);
+            conv(w.wo, w.wo_type, H,     qdim, 0);
+        }
+        if (c.n_shared > 0 && shared_i8) {
+            const void* sg = w.shared_gate_q ? w.shared_gate_q : w.shared_gate;
+            const void* su = w.shared_up_q   ? w.shared_up_q   : w.shared_up;
+            const void* sd = w.shared_down_q ? w.shared_down_q : w.shared_down;
+            conv(sg, w.shared_gate_q ? w.shared_gate_qtype : 0, mffn, H,    1);
+            conv(su, w.shared_up_q   ? w.shared_up_qtype   : 0, mffn, H,    1);
+            conv(sd, w.shared_down_q ? w.shared_down_qtype : 0, H,    mffn, 1);
+        }
+    }
+    cudaStreamSynchronize(st);
+    cudaFree(wbuf);
+    fprintf(stderr, "[prefill] projection weight cache: %zu tensors, %.0f MB\n",
+            wc->map.size(), wc->bytes / 1e6);
+}
 
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n) {
     const Qwen35Config& c = s.cfg;
@@ -135,7 +306,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     bf16* ffh  = ffg;                                    // SwiGLU computed in-place into ffg (down reads it)
     bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
     int*  d_ids = a.alloc<int>((size_t)N);
-    if (!a.ok) { a.free_all(); fprintf(stderr, "[prefill] scratch alloc failed (ctx=%d) -> fallback\n", N); return -1; }
+    if (!a.ok) {
+        a.free_all();
+        pf_wcache_yield(s.weight_cache);   // hand the cached weights back and retry unaided
+        fprintf(stderr, "[prefill] scratch alloc failed (ctx=%d) -> fallback\n", N);
+        return -1;
+    }
     // int8 tensor-core projections (prefill_gemm_i8): ~2x the bf16 GEMM at int8==bf16 output fidelity
     // (GGUF weights are already Q4_K/Q6_K -> int8 weight-quant is lossless vs what's stored). Default
     // ON at every batched context; SPARKINFER_PREFILL_I8=0 disables (A/B). The int8 scratch lives in
@@ -407,6 +583,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         sfh = am.alloc<bf16>((size_t)N * mffn);
         if (!am.ok) {
             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
+            pf_wcache_yield(s.weight_cache);
             fprintf(stderr, "[prefill] MoE scratch alloc failed (ctx=%d) -> fallback\n", N);
             return -1;
         }
@@ -419,6 +596,53 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (wtype == 0) return W;   // already bf16 dense
         kernels::launch_gguf_dequant(wtype, W, wbuf, (long)n_out * K, st);
         return wbuf;
+    };
+    // Static-weight conversion cache (see PfWeightCache): convert each dense projection weight to
+    // its fp8/int8 GEMM operand ONCE per model instead of once per prefill call. Normally already
+    // filled by prefill_weight_cache_warm() at load; anything it did not cover lands here on first
+    // use. Default ON; SPARKINFER_PREFILL_WCACHE=0 restores the per-call conversion (A/B), and
+    // SPARKINFER_PREFILL_WCACHE_MB caps the device budget (entries past it use the old path).
+    // Scoped to the MoE hybrid: that is where it was measured, its projection formats do not depend
+    // on the prompt length, and the dense hybrid runs to 128k where ~1 GB of resident cache would
+    // compete with the prefill scratch it cannot run without.
+    PfWeightCache* wc = moe ? pf_wcache_get(s.weight_cache) : nullptr;
+    // Weight -> per-row fp8 e4m3 operand. Returns the rows + row scales to feed the GEMM: the
+    // cached buffer when it is warm, else the shared W_i8/sw scratch the old path used.
+    auto w_fp8 = [&](const void* W, int wtype, int n_out, int K,
+                     const void** wq, const float** ws) {
+        if (wc) {
+            if (PfWeightCache::Entry* e = wc->find(W, 0, n_out, K)) {
+                *wq = e->q; *ws = e->scale;
+                return;
+            }
+            if (PfWeightCache::Entry* e = wc->insert(W, 0, n_out, K)) {
+                kernels::launch_prefill_quantize_rows_fp8(dq(W, wtype, n_out, K), e->q, e->scale,
+                                                          n_out, K, st);
+                *wq = e->q; *ws = e->scale;
+                return;
+            }
+        }
+        kernels::launch_prefill_quantize_rows_fp8(dq(W, wtype, n_out, K), W_i8, sw, n_out, K, st);
+        *wq = W_i8; *ws = sw;
+    };
+    // Weight -> per-row int8 operand, via the fused GGUF->int8 path when the quant type has one.
+    auto w_int8 = [&](const void* W, int wtype, int n_out, int K,
+                      const signed char** wq, const float** ws) {
+        signed char* q = W_i8;
+        float* sc = sw;
+        if (wc) {
+            if (PfWeightCache::Entry* e = wc->find(W, 1, n_out, K)) {
+                *wq = static_cast<signed char*>(e->q); *ws = e->scale;
+                return;
+            }
+            if (PfWeightCache::Entry* e = wc->insert(W, 1, n_out, K)) {
+                q = static_cast<signed char*>(e->q);
+                sc = e->scale;
+            }
+        }
+        if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, q, sc, n_out, K, st))
+            kernels::launch_prefill_quantize_rows_i8(dq(W, wtype, n_out, K), q, sc, n_out, K, st);
+        *wq = q; *ws = sc;
     };
     // int8 activation memo: consecutive int8 projections of the SAME input (wq/wk/wv on xn,
     // wqkv/wqkv_gate on xn, FFN gate/up on the same chunk) re-quantize identical values into
@@ -441,19 +665,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (use_i8 && n_out >= 128) {
             quant_a_i8(A, R, K);
             // fused Q4_K/Q6_K -> int8 rows skips the dequant-to-bf16 scratch round trip
-            if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st)) {
-                const void* wb = dq(W, wtype, n_out, K);
-                kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
-            }
-            kernels::launch_prefill_gemm_i8(A_i8, W_i8, sx, sw, C, R, n_out, K, st);
+            const signed char* wq; const float* ws;
+            w_int8(W, wtype, n_out, K, &wq, &ws);
+            kernels::launch_prefill_gemm_i8(A_i8, wq, sx, ws, C, R, n_out, K, st);
         } else if ((use_fp8_gdn || moe_fp8) && n_out >= 128) {
             // fp8 (e4m3) tensor-core path for the long-ctx GDN projections. A_i8/W_i8 (1 byte) hold
             // the e4m3 operands; dequant the weight to bf16 scratch, then row/channel fp8-quantize.
             a_q = nullptr;                              // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, R, K, st);
-            const void* wb = dq(W, wtype, n_out, K);
-            kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, n_out, K, st);
-            kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, C, R, n_out, K, st);
+            const void* wq; const float* ws;
+            w_fp8(W, wtype, n_out, K, &wq, &ws);
+            kernels::launch_prefill_gemm_fp8(A_i8, wq, sx, ws, C, R, n_out, K, st);
         } else {
             // mma.sync bf16 GEMM only for dense-hybrid long prefill (the >96k int8→bf16 fallback).
             // MoE reaches here only for the tiny n_out<128 gate projections or with the fp8 path
@@ -477,11 +699,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (!resid_fuse || !use_i8 || n_out < 128) return false;
         const int R = rows > 0 ? rows : N;
         quant_a_i8(A, R, K);
-        if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st)) {
-            const void* wb = dq(W, wtype, n_out, K);
-            kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
-        }
-        kernels::launch_prefill_gemm_i8_resid(A_i8, W_i8, sx, sw, Cx, R, n_out, K, st);
+        const signed char* wq; const float* ws;
+        w_int8(W, wtype, n_out, K, &wq, &ws);
+        kernels::launch_prefill_gemm_i8_resid(A_i8, wq, sx, ws, Cx, R, n_out, K, st);
         return true;
     };
 
@@ -496,12 +716,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (fp8_shareq) {
             a_q = nullptr;                              // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);   // xn -> e4m3 once
-            const void* wb = dq(w.wqkv, w.wqkv_type, lqkv, H);
-            kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lqkv, H, st);
-            kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, b8, N, lqkv, H, st);
-            wb = dq(w.wqkv_gate, w.wqkv_gate_type, lvdim, H);
-            kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lvdim, H, st);
-            kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, lz, N, lvdim, H, st);
+            const void* wq; const float* ws;
+            w_fp8(w.wqkv, w.wqkv_type, lqkv, H, &wq, &ws);
+            kernels::launch_prefill_gemm_fp8(A_i8, wq, sx, ws, b8, N, lqkv, H, st);
+            w_fp8(w.wqkv_gate, w.wqkv_gate_type, lvdim, H, &wq, &ws);
+            kernels::launch_prefill_gemm_fp8(A_i8, wq, sx, ws, lz, N, lvdim, H, st);
         } else {
             proj(A, w.wqkv,      w.wqkv_type,      b8, lqkv,  H);   // qkv
             proj(A, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H);   // z gate
@@ -541,8 +760,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             const bool restore_i8_gdn = use_i8;
             if (use_i8 && !use_i8_gdn) use_i8 = false;
             gdn_qkv_z(xn, w);                                       // qkv + z gate (fp8: fused)
-            proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
-            proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
+            // ssm_alpha and ssm_beta are the same narrow (n_out == v_heads) bf16 projection of the
+            // same xn, and at short prompt length each one is a latency chain over K, not mma work.
+            // Run the pair in one pass when both are dense bf16 (bit-identical, see the launcher);
+            // otherwise fall back to the two independent projections.
+            if (!(w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
+                  kernels::launch_prefill_gemm_skinny_pair(xn, w.ssm_alpha, w.ssm_beta, la, lb,
+                                                           N, vh, H, st))) {
+                proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh, H);
+                proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh, H);
+            }
             bf16* conv_state = lin_conv_state + (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
             kernels::launch_prefill_gdn_conv(b8, w.ssm_conv, conv_state, gq, gk, gv,
                 N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st);
@@ -1125,8 +1352,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 }
                 const bool restore_i8_sh = use_i8;
                 if (moe_shared_i8) use_i8 = true;
-                proj(hn, sg, sgt, sfg, mffn, H);
-                proj(hn, su, sut, sfu, mffn, H);
+                // gate and up are the same [mffn, H] int8 projection of the same hn, and at short
+                // prompt length each is only a 4x4 block grid. Run the pair in one launch when both
+                // take the int8 path (bit-identical, see launch_prefill_gemm_i8_pair).
+                bool sh_paired = false;
+                if (use_i8 && mffn >= 128) {
+                    const signed char *wq0, *wq1; const float *ws0, *ws1;
+                    quant_a_i8(hn, N, H);
+                    w_int8(sg, sgt, mffn, H, &wq0, &ws0);
+                    w_int8(su, sut, mffn, H, &wq1, &ws1);
+                    sh_paired = kernels::launch_prefill_gemm_i8_pair(
+                        A_i8, wq0, wq1, sx, ws0, ws1, sfg, sfu, N, mffn, H, st);
+                }
+                if (!sh_paired) {
+                    proj(hn, sg, sgt, sfg, mffn, H);
+                    proj(hn, su, sut, sfu, mffn, H);
+                }
                 kernels::launch_pfm_shared_swiglu(sfg, sfu, has_gi ? dw : nullptr, sfh, N, mffn, st);
                 proj(sfh, sd, sdt, ao, H, mffn);
                 use_i8 = restore_i8_sh;

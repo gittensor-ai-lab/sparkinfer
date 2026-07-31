@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
+#include <cstdlib>
 #include "sparkinfer/kernels/prefill_i8.h"
 
 #include "sparkinfer/kernels/prefill_quant_rows.h"
@@ -67,11 +68,19 @@ __global__ void pf_quantize_rows_i8(const __nv_bfloat16* __restrict__ x, signed 
 // RESID folds the residual add into the store: C[m,n] = bf16(C[m,n] + bf16(acc*sx*sw)) -- the same
 // two-step rounding as the pf_add kernel it replaces, reading and writing through the ONE C
 // pointer (no second aliased argument), so the fused path stays bit-identical to GEMM-then-add.
-template <bool RESID>
+// PAIR runs two projections that share A (shared-expert gate+up, attention wk+wv: same N, same K,
+// same input) as ONE launch, with the N-tile index selecting the weight. Two 4x4-block launches at
+// M=N=512 put 16 blocks on a 170-SM part and then serialize on the stream; one 8x4 launch is 32
+// blocks and stages A once. Each weight is still read exactly once (unlike shrinking PF_BM, which
+// would re-stage it per M-tile), and every output element keeps the same K order, so it is
+// bit-identical to the two separate calls.
+template <bool RESID, bool PAIR>
 __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
         const signed char* __restrict__ A, const signed char* __restrict__ W,
         const float* __restrict__ sx, const float* __restrict__ sw,
-        __nv_bfloat16* C, int M, int N, int K) {
+        __nv_bfloat16* C, int M, int N, int K,
+        const signed char* __restrict__ W1, const float* __restrict__ sw1,
+        __nv_bfloat16* C1, int nx) {
     __shared__ signed char As[2][PF_BM][PF_BK];
     __shared__ signed char Bs[2][PF_BN][PF_BK];
 
@@ -85,7 +94,12 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
     const int wm   = warp & 3;                        // rows [wm*32, +32)
     const int wn   = warp >> 2;                       // cols [wn*64, +64)
     const int m0   = blockIdx.y * PF_BM;
-    const int n0   = blockIdx.x * PF_BN;
+    int bx = blockIdx.x;
+    const signed char* __restrict__ Wp = W;
+    const float* __restrict__ swp = sw;
+    __nv_bfloat16* Cp = C;
+    if (PAIR && bx >= nx) { bx -= nx; Wp = W1; swp = sw1; Cp = C1; }
+    const int n0   = bx * PF_BN;
     const int nk   = (K + PF_BK - 1) / PF_BK;
 
     int acc[PF_MFRAG][PF_NFRAG][4];
@@ -103,7 +117,7 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
             const int r = s >> 2, c = s & 3, k = c << 4;
             const int gm = m0 + r, gn = n0 + r, gk = k0 + k;
             pf_cp16(&As[buf][r][pf_swz(k, r)], &A[(size_t)gm * K + gk], gm < M && gk < K);
-            pf_cp16(&Bs[buf][r][pf_swz(k, r)], &W[(size_t)gn * K + gk], gn < N && gk < K);
+            pf_cp16(&Bs[buf][r][pf_swz(k, r)], &Wp[(size_t)gn * K + gk], gn < N && gk < K);
         }
         __pipeline_commit();
     };
@@ -160,16 +174,16 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
                     const int gm = m0 + wm * 32 + i * 16 + grp + (e >> 1) * 8;
                     const int cn = gn + (e & 1);
                     if (gm < M && cn < N) {
-                        __nv_bfloat16 v = __float2bfloat16((float)acc[i][j][e] * sx[gm] * sw[cn]);
+                        __nv_bfloat16 v = __float2bfloat16((float)acc[i][j][e] * sx[gm] * swp[cn]);
                         if (RESID)
-                            v = __float2bfloat16(__bfloat162float(C[(size_t)gm * N + cn]) +
+                            v = __float2bfloat16(__bfloat162float(Cp[(size_t)gm * N + cn]) +
                                                  __bfloat162float(v));
-                        C[(size_t)gm * N + cn] = v;
+                        Cp[(size_t)gm * N + cn] = v;
                     }
                 }
                 continue;
             }
-            const float w0 = sw[gn], w1 = sw[gn + 1];
+            const float w0 = swp[gn], w1 = swp[gn + 1];
             #pragma unroll
             for (int h = 0; h < 2; h++) {
                 const int gm = m0 + wm * 32 + i * 16 + grp + h * 8;
@@ -177,7 +191,7 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
                 const float s = sx[gm];
                 __nv_bfloat162 v = __floats2bfloat162_rn((float)acc[i][j][h * 2] * s * w0,
                                                          (float)acc[i][j][h * 2 + 1] * s * w1);
-                __nv_bfloat162* cp = reinterpret_cast<__nv_bfloat162*>(&C[(size_t)gm * N + gn]);
+                __nv_bfloat162* cp = reinterpret_cast<__nv_bfloat162*>(&Cp[(size_t)gm * N + gn]);
                 if (RESID) {
                     const __nv_bfloat162 r = *cp;
                     v = __floats2bfloat162_rn(__bfloat162float(r.x) + __bfloat162float(v.x),
@@ -203,8 +217,26 @@ void launch_prefill_gemm_i8(const signed char* A, const signed char* W,
                             const float* sx, const float* sw, void* C,
                             int M, int N, int K, cudaStream_t stream) {
     dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
-    pf_gemm_i8_kernel<false><<<grid, 256, 0, stream>>>(
-        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+    pf_gemm_i8_kernel<false, false><<<grid, 256, 0, stream>>>(
+        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K, nullptr, nullptr, nullptr, 0);
+}
+
+// Two projections of the SAME A, same N and K, in one launch (see the PAIR note on the kernel).
+// Returns false (having launched nothing) when disabled, so the caller runs two separate GEMMs.
+bool launch_prefill_gemm_i8_pair(const signed char* A, const signed char* W0, const signed char* W1,
+                                 const float* sx, const float* sw0, const float* sw1,
+                                 void* C0, void* C1, int M, int N, int K, cudaStream_t stream) {
+    static const int on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GEMM_PAIR");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!on || !W0 || !W1 || M <= 0 || N <= 0 || K <= 0) return false;
+    const int nx = (N + PF_BN - 1) / PF_BN;
+    dim3 grid(2 * nx, (M + PF_BM - 1) / PF_BM);
+    pf_gemm_i8_kernel<false, true><<<grid, 256, 0, stream>>>(
+        A, W0, sx, sw0, reinterpret_cast<__nv_bfloat16*>(C0), M, N, K,
+        W1, sw1, reinterpret_cast<__nv_bfloat16*>(C1), nx);
+    return true;
 }
 
 // Residual-fused variant: C[m,n] += bf16(acc*sx*sw) with pf_add's rounding. Passing the residual
@@ -213,8 +245,8 @@ void launch_prefill_gemm_i8_resid(const signed char* A, const signed char* W,
                                   const float* sx, const float* sw, void* C,
                                   int M, int N, int K, cudaStream_t stream) {
     dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
-    pf_gemm_i8_kernel<true><<<grid, 256, 0, stream>>>(
-        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+    pf_gemm_i8_kernel<true, false><<<grid, 256, 0, stream>>>(
+        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K, nullptr, nullptr, nullptr, 0);
 }
 
 }} // namespace sparkinfer::kernels

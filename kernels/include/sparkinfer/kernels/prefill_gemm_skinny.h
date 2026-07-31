@@ -30,5 +30,21 @@ namespace kernels {
 bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
                                 int M, int N, int K, cudaStream_t stream = nullptr);
 
+// Same GEMM for a PAIR of narrow weights over the same A (the GDN ssm_alpha / ssm_beta gates):
+// C0 = A @ W0^T, C1 = A @ W1^T. One pass stages A and both weights, so the K-slice chain -- which is
+// what the shape actually costs at short prompt length, not the mma work -- is walked once instead
+// of twice, and the slices are cp.async double-buffered so the next one lands under the current
+// one's math. Each output element still accumulates over K in the same 16-wide wmma steps in the
+// same order as the single-weight kernel, so the results are bit-identical to two skinny calls.
+//
+// Returns false (having launched nothing) when the shape does not fit; the caller then runs the two
+// projections separately.
+//
+// Env knobs:
+//   SPARKINFER_PREFILL_GEMM_SKINNY2 (default 1)  0 disables (A/B) -> two separate projections.
+bool launch_prefill_gemm_skinny_pair(const void* A, const void* W0, const void* W1,
+                                     void* C0, void* C1,
+                                     int M, int N, int K, cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace sparkinfer

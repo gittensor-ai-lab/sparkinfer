@@ -172,6 +172,10 @@ struct Qwen35Model::Impl {
     // EAGERLY here at load, never lazily -- the scored sweep times each context exactly once
     // (512 first), so a lazy fill would land inside the very pass it is meant to speed up.
     float *moe_rs_gate = nullptr, *moe_rs_up = nullptr, *moe_rs_down = nullptr;
+    // Batched-prefill cache of the fp8/int8 conversions of the dense projection weights, filled at
+    // load and reused by every prefill call. Opaque here; owned by this Impl so it dies with the
+    // weights it mirrors (see prefill_weight_cache_warm / _free).
+    void* pf_wcache = nullptr;
     // flash-decoding (KV-split) attention partials
     static constexpr int MAX_NSPLITS = 256;   // partials sized for this; adaptive n_splits <= this
     int n_splits = 32;
@@ -405,6 +409,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->sx_h); cudaFree(p_->sx_q8);
     cudaFree(p_->mf_ids); cudaFree(p_->mf_counts); cudaFree(p_->mf_rc);
     cudaFree(p_->moe_rs_gate); cudaFree(p_->moe_rs_up); cudaFree(p_->moe_rs_down);
+    prefill_weight_cache_free(p_->pf_wcache); p_->pf_wcache = nullptr;
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->sparse_sel);
     cudaFree(p_->sparse_vtbl); cudaFree(p_->sparse_vlen);
@@ -1562,7 +1567,7 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
                           lin_state, lin_conv,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
-                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down };
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, &s.pf_wcache };
     return prefill_batched_run(ctx, prompt_ids, n);
 }
 
@@ -2456,6 +2461,18 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                         (double)((2 * ng + nd) * sizeof(float)) / (1024.0 * 1024.0));
             }
         }
+    }
+    // Batched prefill converts every dense projection weight (Q4_K/Q8_0) to its fp8/int8 GEMM
+    // operand. Do it once here rather than once per prefill call — same reason as the row scales
+    // above: the scored sweep times each context exactly once, so a lazy first fill would land
+    // inside the pass it is meant to speed up. See prefill_weight_cache_warm.
+    if (batched_prefill_enabled(s.gguf, c, 1)) {
+        Qwen35PrefillCtx wctx{ c, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
+                               s.lin_state, s.lin_conv_state,
+                               s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                               s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                               s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, &s.pf_wcache };
+        prefill_weight_cache_warm(wctx);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;

@@ -33,7 +33,18 @@ struct Qwen35PrefillCtx {
     const float*         moe_rs_gate;
     const float*         moe_rs_up;
     const float*         moe_rs_down;
+    // Slot for the model-owned cache of the fp8/int8 conversions of the STATIC projection weights
+    // (see PfWeightCache in qwen35_prefill.cpp). Owned by the caller so it lives exactly as long as
+    // the weights do; null disables caching.
+    void**               weight_cache;
 };
+
+// Fill Qwen35PrefillCtx::weight_cache at load time so no prefill call converts a static weight.
+// Only the ctx fields describing the weights are read (cfg/w/stream/gguf/dims/weight_cache).
+void prefill_weight_cache_warm(const Qwen35PrefillCtx& s);
+
+// Release a cache created through Qwen35PrefillCtx::weight_cache. Safe on null.
+void prefill_weight_cache_free(void* cache);
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
 // Returns the argmax at the last prompt position (seed for the first decode step), or -1 if the
