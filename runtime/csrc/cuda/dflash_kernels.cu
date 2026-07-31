@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace sparkinfer {
 namespace dflash_kernels {
@@ -143,6 +144,99 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
         ov[i] = f2b(acc[i] * inv);
 }
 
+// Barrier-free variant of k_attn. Same block shape (one block per (q_token, q_head)) and the
+// same online softmax, but the per-key cost is restructured:
+//
+//   k_attn gives every key to the whole block, so each of the kv_len keys costs a 128-thread
+//   shared-memory tree reduction -- 7 __syncthreads() plus the two around the accumulator update.
+//   That is ~9 block-wide barriers per key, and the q/acc/red arrays live in shared memory, for
+//   one FMA of real work per thread per key.
+//
+//   Here each warp instead owns a strided slice of the keys (t = warp, warp+nwarps, ...) and runs
+//   its own independent online softmax, so the dot product reduces with __shfl_down_sync inside a
+//   warp and never needs a barrier. q and the running accumulator stay in registers (EPL elements
+//   per lane), and each lane loads its 4 contiguous bf16 of k/v as one 8-byte access. The warps'
+//   partial (max, sum, acc) triples are merged through shared memory once, at the end, with a
+//   single __syncthreads() for the whole kernel instead of ~9 per key.
+//
+// The merge is the standard flash-attention rescale, so the result is mathematically the same
+// softmax; the summation order over keys/elements differs, so this is not bit-identical to
+// k_attn. Nothing downstream requires that: the draft only proposes tokens and every emitted
+// token is still whatever the target model's greedy argmax verifies (SPEC_AGREE is structural).
+// EPL = d/32 elements per lane; d must be a multiple of 32 and <= 256, else k_attn is used.
+template <int EPL>
+__global__ void k_attn_warp(const bf16* q, const bf16* k, const bf16* v, bf16* out,
+                            int q_len, int kv_len, int n_q, int n_kv, int d,
+                            int q_pos0, int k_pos0, int window, float scale) {
+    const int qt = blockIdx.x;
+    const int qh = blockIdx.y;
+    if (qt >= q_len || qh >= n_q) return;
+    const int kv_h = qh / (n_q / n_kv);
+    const bf16* qv = q + ((size_t)qt * n_q + qh) * d;
+    bf16* ov = out + ((size_t)qt * n_q + qh) * d;
+    const int q_pos = q_pos0 + qt;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int base = lane * EPL;                 // this lane's contiguous slice of the head dim
+
+    float qr[EPL], ar[EPL];
+#pragma unroll
+    for (int e = 0; e < EPL; e++) { qr[e] = b2f(qv[base + e]); ar[e] = 0.f; }
+
+    float max_s = -1e30f;
+    float sum = 0.f;
+    for (int t = warp; t < kv_len; t += nwarps) {
+        const int k_pos = k_pos0 + t;
+        if (window > 0 && (q_pos - k_pos) >= window) continue;
+        const bf16* kv = k + ((size_t)t * n_kv + kv_h) * d + base;
+        float dot = 0.f;
+#pragma unroll
+        for (int e = 0; e < EPL; e++) dot += qr[e] * b2f(kv[e]);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+        float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
+        const float new_max = fmaxf(max_s, score);
+        const float e1 = expf(max_s - new_max);
+        const float e2 = expf(score - new_max);
+        sum = sum * e1 + e2;
+        const bf16* vv = v + ((size_t)t * n_kv + kv_h) * d + base;
+#pragma unroll
+        for (int e = 0; e < EPL; e++) ar[e] = ar[e] * e1 + e2 * b2f(vv[e]);
+        max_s = new_max;
+    }
+
+    // Merge the per-warp online-softmax states: one barrier for the whole kernel.
+    extern __shared__ float sm[];
+    float* s_max = sm;                    // [nwarps]
+    float* s_sum = sm + nwarps;           // [nwarps]
+    float* s_acc = sm + 2 * nwarps;       // [nwarps * d]
+    if (lane == 0) { s_max[warp] = max_s; s_sum[warp] = sum; }
+    float* my_acc = s_acc + (size_t)warp * d + base;
+#pragma unroll
+    for (int e = 0; e < EPL; e++) my_acc[e] = ar[e];
+    __syncthreads();
+
+    if (warp != 0) return;
+    float gmax = -1e30f;
+    for (int w = 0; w < nwarps; w++) gmax = fmaxf(gmax, s_max[w]);
+    float gsum = 0.f;
+    float o[EPL];
+#pragma unroll
+    for (int e = 0; e < EPL; e++) o[e] = 0.f;
+    for (int w = 0; w < nwarps; w++) {
+        const float sc = expf(s_max[w] - gmax);
+        gsum += s_sum[w] * sc;
+        const float* aw = s_acc + (size_t)w * d + base;
+#pragma unroll
+        for (int e = 0; e < EPL; e++) o[e] += aw[e] * sc;
+    }
+    const float inv = (gsum > 0.f) ? (1.f / gsum) : 0.f;
+#pragma unroll
+    for (int e = 0; e < EPL; e++) ov[base + e] = f2b(o[e] * inv);
+}
+
 // One warp per output row `n`, computing y[b][n] = sum_k x[b][k] * W[n][k] for all b in
 // [0,BATCH) at once. W stays in its native [N,K] "out,in" row-major layout (the same layout
 // the single-row GEMV path reads) -- unlike a tiled A@B GEMM, this needs no relayout. Each
@@ -172,6 +266,52 @@ __global__ void k_gemv_batched(const bf16* __restrict__ x, const bf16* __restric
 #pragma unroll
         for (int b = 0; b < BATCH; b++) {
             const bf16* xv = (const bf16*)&(((const uint4*)(x + (size_t)b * K))[k8]);
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < BATCH; b++) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc[b] += __shfl_down_sync(0xffffffffu, acc[b], off);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int b = 0; b < BATCH; b++) y[(size_t)b * N + n] = f2b(acc[b]);
+    }
+}
+
+// Same math as k_gemv_batched -- identical operands in an identical per-(row,batch) order, so it
+// is bit-exact -- but it actually performs the 16-byte load the comment above describes.
+//
+// In the version above `wv` / `xv` are pointers *into global memory*: taking &wrow4[k8] never
+// brings the chunk into a register, so `wv[j]` compiles to eight separate 2-byte LDG.E.U16 per
+// chunk, and `xv[j]` to another eight per batch row: 8 + 8*BATCH = 136 scalar loads per lane per
+// chunk, where 1 + BATCH = 17 wide loads carry the same bytes.
+// Loading each chunk into a local uint4 first keeps it in registers -- the address never escapes
+// and every index is a compile-time constant after unrolling -- so ptxas widens the accesses.
+// Measured on sm_120 (CUDA 12.8), per unrolled body: 136 LDG.E.U16 -> 34 LDG.E.64, a 4x cut in
+// load instructions for identical work and identical results.
+template <int BATCH>
+__global__ void k_gemv_batched_vec(const bf16* __restrict__ x, const bf16* __restrict__ W,
+                                   bf16* __restrict__ y, int N, int K) {
+    const int warps_per_block = blockDim.x / 32;
+    const int n = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    if (n >= N) return;
+    const int lane = threadIdx.x & 31;
+    float acc[BATCH];
+#pragma unroll
+    for (int b = 0; b < BATCH; b++) acc[b] = 0.f;
+    const uint4* wrow4 = (const uint4*)(W + (size_t)n * K);
+    const int K8 = K / 8;
+    for (int k8 = lane; k8 < K8; k8 += 32) {
+        const uint4 wpk = wrow4[k8];                       // one wide load, kept in regs
+        const bf16* wv = (const bf16*)&wpk;
+#pragma unroll
+        for (int b = 0; b < BATCH; b++) {
+            const uint4 xpk = ((const uint4*)(x + (size_t)b * K))[k8];  // ditto
+            const bf16* xv = (const bf16*)&xpk;
 #pragma unroll
             for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
         }
@@ -224,6 +364,61 @@ __global__ void k_gemv_batched_f32(const bf16* __restrict__ x, const bf16* __res
     }
 }
 
+// k_gemv_batched_f32 with the same 16-byte-load fix; bit-exact with it.
+template <int BATCH>
+__global__ void k_gemv_batched_vec_f32(const bf16* __restrict__ x, const bf16* __restrict__ W,
+                                       float* __restrict__ y, int N, int K) {
+    const int warps_per_block = blockDim.x / 32;
+    const int n = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    if (n >= N) return;
+    const int lane = threadIdx.x & 31;
+    float acc[BATCH];
+#pragma unroll
+    for (int b = 0; b < BATCH; b++) acc[b] = 0.f;
+    const uint4* wrow4 = (const uint4*)(W + (size_t)n * K);
+    const int K8 = K / 8;
+    for (int k8 = lane; k8 < K8; k8 += 32) {
+        const uint4 wpk = wrow4[k8];
+        const bf16* wv = (const bf16*)&wpk;
+#pragma unroll
+        for (int b = 0; b < BATCH; b++) {
+            const uint4 xpk = ((const uint4*)(x + (size_t)b * K))[k8];
+            const bf16* xv = (const bf16*)&xpk;
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < BATCH; b++) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc[b] += __shfl_down_sync(0xffffffffu, acc[b], off);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int b = 0; b < BATCH; b++) y[(size_t)b * N + n] = acc[b];
+    }
+}
+
+
+// SPARKINFER_DFLASH_GEMV_VEC=0 restores the scalar-load kernels (A/B in one binary).
+inline bool gemv_vec_on() {
+    static const int on = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_GEMV_VEC");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    return on != 0;
+}
+
+// SPARKINFER_DFLASH_ATTN_WARP=0 restores the block-reduction attention.
+inline bool attn_warp_on() {
+    static const int on = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_ATTN_WARP");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    return on != 0;
+}
+
 } // namespace
 
 void launch_add(const void* x, const void* y, void* out, int n, cudaStream_t stream) {
@@ -262,10 +457,30 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      cudaStream_t stream) {
     if (q_len <= 0 || kv_len <= 0) return;
     dim3 grid(q_len, n_q);
-    int smem = (2 * d + 128) * (int)sizeof(float);
-    k_attn<<<grid, 128, smem, stream>>>((const bf16*)q, (const bf16*)k, (const bf16*)v,
-                                        (bf16*)out, q_len, kv_len, n_q, n_kv, d,
-                                        q_pos0, k_pos0, window, scale);
+    // 16 warps/block measured best on RTX 5090 (2/4/8/16/24/32 swept): more warps split the key
+    // range finer, and with no per-key barrier the only cost of extra warps is the final merge.
+    constexpr int THREADS = 512;
+    // SPARKINFER_DFLASH_ATTN_WARP=0 restores the block-reduction kernel (A/B in one binary).
+    if (attn_warp_on() && d % 32 == 0 && d / 32 >= 1 && d / 32 <= 8) {
+        const int nwarps = THREADS / 32;
+        const int smem = (2 * nwarps + nwarps * d) * (int)sizeof(float);
+#define SI_DFLASH_ATTN(EPL)                                                          \
+        k_attn_warp<EPL><<<grid, THREADS, smem, stream>>>(                           \
+            (const bf16*)q, (const bf16*)k, (const bf16*)v, (bf16*)out,              \
+            q_len, kv_len, n_q, n_kv, d, q_pos0, k_pos0, window, scale)
+        switch (d / 32) {
+            case 1: SI_DFLASH_ATTN(1); return;
+            case 2: SI_DFLASH_ATTN(2); return;
+            case 4: SI_DFLASH_ATTN(4); return;
+            case 8: SI_DFLASH_ATTN(8); return;
+            default: break;                       // 3,5,6,7 -> block-reduction fallback
+        }
+#undef SI_DFLASH_ATTN
+    }
+    const int smem_blk = (2 * d + 128) * (int)sizeof(float);
+    k_attn<<<grid, 128, smem_blk, stream>>>((const bf16*)q, (const bf16*)k, (const bf16*)v,
+                                            (bf16*)out, q_len, kv_len, n_q, n_kv, d,
+                                            q_pos0, k_pos0, window, scale);
 }
 
 void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
@@ -273,8 +488,13 @@ void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
     if (N <= 0) return;
     constexpr int WARPS_PER_BLOCK = 4;
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-    k_gemv_batched<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
-        (const bf16*)x, (const bf16*)W, (bf16*)y, N, K);
+    if (gemv_vec_on()) {
+        k_gemv_batched_vec<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
+            (const bf16*)x, (const bf16*)W, (bf16*)y, N, K);
+    } else {
+        k_gemv_batched<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
+            (const bf16*)x, (const bf16*)W, (bf16*)y, N, K);
+    }
 }
 
 void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,
@@ -282,8 +502,13 @@ void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, in
     if (N <= 0) return;
     constexpr int WARPS_PER_BLOCK = 4;
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-    k_gemv_batched_f32<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
-        (const bf16*)x, (const bf16*)W, y, N, K);
+    if (gemv_vec_on()) {
+        k_gemv_batched_vec_f32<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
+            (const bf16*)x, (const bf16*)W, y, N, K);
+    } else {
+        k_gemv_batched_f32<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
+            (const bf16*)x, (const bf16*)W, y, N, K);
+    }
 }
 
 } // namespace dflash_kernels
