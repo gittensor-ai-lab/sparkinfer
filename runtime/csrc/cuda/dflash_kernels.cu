@@ -155,64 +155,85 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
         ov[i] = f2b(acc[i] * inv);
 }
 
-// DFlash's shipped Qwen3.6 draft shape is hd128 with a 16-token query block. Follow
-// the warp-per-query organization used by FlashAttention paths in llama.cpp/vLLM:
-// keep Q and the online-softmax output in registers and use shuffles for QK, avoiding
-// block-wide synchronization for every key. The four products are paired in the same
-// +64, +32 order as k_attn's 128-thread reduction before the +16..+1 shuffle tree.
-__global__ void k_attn_warp_hd128(
+// Split the key sequence across the warps of one CTA, then merge their online-
+// softmax states once. This keeps the hd128 Q/output state in registers and exposes
+// parallelism across KV tokens as the sequence grows.
+__global__ void k_attn_multiwarp_hd128(
     const bf16* __restrict__ q, const bf16* __restrict__ k,
     const bf16* __restrict__ v, bf16* __restrict__ out,
     int q_len, int kv_len, int n_q, int n_kv,
     int q_pos0, int k_pos0, int window, float scale) {
     const int qt = blockIdx.x;
     const int qh = blockIdx.y;
-    const int lane = threadIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
     if (qt >= q_len || qh >= n_q) return;
 
     constexpr int D = 128;
     constexpr int E = D / 32;
+    const int base = lane * E;
     const int kv_h = qh / (n_q / n_kv);
-    const bf16* qv = q + ((size_t)qt * n_q + qh) * D;
-    bf16* ov = out + ((size_t)qt * n_q + qh) * D;
+    const bf16* qv = q + ((size_t)qt * n_q + qh) * D + base;
+    bf16* ov = out + ((size_t)qt * n_q + qh) * D + base;
     float qr[E], acc[E];
 #pragma unroll
     for (int e = 0; e < E; e++) {
-        qr[e] = b2f(qv[lane + e * 32]);
+        qr[e] = b2f(qv[e]);
         acc[e] = 0.f;
     }
 
     float max_s = -1e30f;
     float sum = 0.f;
     const int q_pos = q_pos0 + qt;
-    for (int t = 0; t < kv_len; t++) {
+    for (int t = warp; t < kv_len; t += nwarps) {
         const int k_pos = k_pos0 + t;
         if (window > 0 && (q_pos - k_pos) >= window) continue;
-        const bf16* kv = k + ((size_t)t * n_kv + kv_h) * D;
-        const float p0 = qr[0] * b2f(kv[lane]);
-        const float p1 = qr[1] * b2f(kv[lane + 32]);
-        const float p2 = qr[2] * b2f(kv[lane + 64]);
-        const float p3 = qr[3] * b2f(kv[lane + 96]);
-        float dot = __fadd_rn(__fadd_rn(p0, p2), __fadd_rn(p1, p3));
+        const bf16* kv = k + ((size_t)t * n_kv + kv_h) * D + base;
+        float dot = 0.f;
+#pragma unroll
+        for (int e = 0; e < E; e++) dot += qr[e] * b2f(kv[e]);
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             dot += __shfl_down_sync(0xffffffffu, dot, off);
-        dot = __shfl_sync(0xffffffffu, dot, 0);
-
-        const float score = dot * scale;
+        const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
         const float new_max = fmaxf(max_s, score);
         const float e1 = expf(max_s - new_max);
         const float e2 = expf(score - new_max);
         sum = sum * e1 + e2;
-        const bf16* vv = v + ((size_t)t * n_kv + kv_h) * D;
+        const bf16* vv = v + ((size_t)t * n_kv + kv_h) * D + base;
 #pragma unroll
-        for (int e = 0; e < E; e++)
-            acc[e] = acc[e] * e1 + e2 * b2f(vv[lane + e * 32]);
+        for (int e = 0; e < E; e++) acc[e] = acc[e] * e1 + e2 * b2f(vv[e]);
         max_s = new_max;
     }
-    const float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
+
+    extern __shared__ float sm[];
+    float* s_max = sm;
+    float* s_sum = sm + nwarps;
+    float* s_acc = sm + 2 * nwarps;
+    if (lane == 0) {
+        s_max[warp] = max_s;
+        s_sum[warp] = sum;
+    }
 #pragma unroll
-    for (int e = 0; e < E; e++) ov[lane + e * 32] = f2b(acc[e] * inv);
+    for (int e = 0; e < E; e++) s_acc[(size_t)warp * D + base + e] = acc[e];
+    __syncthreads();
+    if (warp != 0) return;
+
+    float global_max = -1e30f;
+    for (int w = 0; w < nwarps; w++) global_max = fmaxf(global_max, s_max[w]);
+    float global_sum = 0.f;
+    float result[E] = {0.f, 0.f, 0.f, 0.f};
+    for (int w = 0; w < nwarps; w++) {
+        const float correction = expf(s_max[w] - global_max);
+        global_sum += s_sum[w] * correction;
+#pragma unroll
+        for (int e = 0; e < E; e++)
+            result[e] += s_acc[(size_t)w * D + base + e] * correction;
+    }
+    const float inv = global_sum > 0.f ? 1.f / global_sum : 0.f;
+#pragma unroll
+    for (int e = 0; e < E; e++) ov[e] = f2b(result[e] * inv);
 }
 
 // One warp per output row `n`, computing y[b][n] = sum_k x[b][k] * W[n][k] for all b in
@@ -302,6 +323,48 @@ __global__ void k_gemv_batched_f32(const bf16* __restrict__ x, const bf16* __res
     }
 }
 
+// Arithmetic-identical to kernels::gemv_f32_sk_kernel<bf16,8> for N<4096,
+// extended with grid.y for independent activation rows. Each CTA still maps to
+// one (batch, output) pair and uses the same per-lane K traversal, XOR warp
+// reduction, and ordered eight-way split sum as the individual launches.
+__global__ void k_gemv_rows_exact_s8(const bf16* __restrict__ x,
+                                     const bf16* __restrict__ W,
+                                     bf16* __restrict__ y, int rows, int N, int K) {
+    const int n = blockIdx.x;
+    const int batch = blockIdx.y;
+    const int split = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (n >= N || batch >= rows) return;
+    const uint4* w4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x + (size_t)batch * K);
+    const int K8 = K / 8;
+    float acc = 0.f;
+    for (int i = split * 32 + lane; i < K8; i += 8 * 32) {
+        const uint4 wp = w4[i];
+        const uint4 xp = x4[i];
+        const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wp);
+        const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xp);
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float2 wf = __bfloat1622float2(wh[j]);
+            const float2 xf = __bfloat1622float2(xh[j]);
+            acc += wf.x * xf.x + wf.y * xf.y;
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    __shared__ float partial[8];
+    if (lane == 0) partial[split] = acc;
+    __syncthreads();
+    if (split == 0 && lane == 0) {
+        float result = 0.f;
+#pragma unroll
+        for (int s = 0; s < 8; s++) result += partial[s];
+        y[(size_t)batch * N + n] = f2b(result);
+    }
+}
+
 } // namespace
 
 void launch_add(const void* x, const void* y, void* out, int n, cudaStream_t stream) {
@@ -341,7 +404,10 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
     if (q_len <= 0 || kv_len <= 0) return;
     dim3 grid(q_len, n_q);
     if (d == 128) {
-        k_attn_warp_hd128<<<grid, 32, 0, stream>>>(
+        constexpr int THREADS = 512;
+        constexpr int NWARPS = THREADS / 32;
+        constexpr int SMEM = (2 * NWARPS + NWARPS * 128) * sizeof(float);
+        k_attn_multiwarp_hd128<<<grid, THREADS, SMEM, stream>>>(
             (const bf16*)q, (const bf16*)k, (const bf16*)v, (bf16*)out,
             q_len, kv_len, n_q, n_kv, q_pos0, k_pos0, window, scale);
         return;
@@ -359,6 +425,14 @@ void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
     k_gemv_batched<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
         (const bf16*)x, (const bf16*)W, (bf16*)y, N, K);
+}
+
+void launch_gemv_rows_exact(const void* x, const void* W, void* y,
+                            int rows, int N, int K, cudaStream_t stream) {
+    if (rows <= 0 || N <= 0) return;
+    dim3 grid(N, rows);
+    k_gemv_rows_exact_s8<<<grid, 8 * 32, 0, stream>>>(
+        (const bf16*)x, (const bf16*)W, (bf16*)y, rows, N, K);
 }
 
 void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,

@@ -471,9 +471,11 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // fc.weight is [H, n_cap*H] (out, in). Loop gemv per row.
     if (ctx_len > 0) {
         const bf16* th = (const bf16*)target_hidden;
-        for (int t = 0; t < ctx_len; t++) {
-            kernels::launch_gemv(th + (size_t)t * n_cap * H, s.fc,
-                                 s.target_proj + (size_t)t * H, H, n_cap * H, st);
+        if (ctx_len > 1) {
+            dflash_kernels::launch_gemv_rows_exact(th, s.fc, s.target_proj,
+                                                   ctx_len, H, n_cap * H, st);
+        } else {
+            kernels::launch_gemv(th, s.fc, s.target_proj, H, n_cap * H, st);
         }
         dflash_kernels::launch_rms(s.target_proj, s.hidden_norm, s.target_proj,
                                    ctx_len, H, c.rms_eps, st);
@@ -495,7 +497,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wq, s.q + (size_t)t * qdim, qdim, H, st);
         }
         // Build k_new / v_new = cat(k_ctx, k_noise)
-        for (int t = 0; t < ctx_len; t++) {
+        if (ctx_len > 1) {
+            dflash_kernels::launch_gemv_rows_exact(s.target_proj, w.wk, s.k_new,
+                                                   ctx_len, kvdim, H, st);
+            dflash_kernels::launch_gemv_rows_exact(s.target_proj, w.wv, s.v_new,
+                                                   ctx_len, kvdim, H, st);
+        } else if (ctx_len == 1) {
+            const int t = 0;
             kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wk,
                                  s.k_new + (size_t)t * kvdim, kvdim, H, st);
             kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wv,
@@ -594,11 +602,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     bool head_done = false;
     if (head_mr && s.lm_head_type == 14 && s.head_q8) {          // native Q6_K shared head
         const size_t qrow = kernels::llama_q8_1_bytes(H);
-        for (int t = 0; t < B; t++)
+        // Row 0 is the already-known seed token; only rows 1..B-1 become draft
+        // proposals, so avoid quantizing and scoring the unused head row.
+        for (int t = 1; t < B; t++)
             kernels::launch_quantize_q8_1_blocks(s.xn + (size_t)t * H,
-                                                 (char*)s.head_q8 + (size_t)t * qrow, H, st);
-        head_done = kernels::launch_gemv_q6k_dp4a_multirow_f32(s.head_q8, s.lm_head, s.logits,
-                                                               V, H, B, st);
+                                                 (char*)s.head_q8 + (size_t)(t - 1) * qrow, H, st);
+        head_done = kernels::launch_gemv_q6k_dp4a_multirow_f32(
+            s.head_q8, s.lm_head, s.logits + V, V, H, B - 1, st);
     }
     if (!head_done) {
     if (fast16) {
@@ -614,7 +624,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         }
     }
     }
-    kernels::launch_argmax(s.logits, s.d_out, B, V, st);
+    kernels::launch_argmax(s.logits + (head_done ? V : 0),
+                           s.d_out + (head_done ? 1 : 0),
+                           head_done ? B - 1 : B, V, st);
     cu(cudaMemcpyAsync(s.h_out, s.d_out, B * sizeof(int), cudaMemcpyDeviceToHost, st), "argmax");
     cu(cudaStreamSynchronize(st), "draft sync");
     for (int t = 0; t < B; t++) out_argmax[t] = s.h_out[t];

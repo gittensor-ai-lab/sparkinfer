@@ -35,6 +35,11 @@ void launch_rms(const void* x, const void* w, void* out, int rows, int cols,
 void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
                            cudaStream_t stream);
 
+// Exact batched form of the small-N S=8 split-K BF16 GEMV used by launch_gemv.
+// Collapses multiple row launches into grid.y without changing arithmetic order.
+void launch_gemv_rows_exact(const void* x, const void* W, void* y,
+                            int rows, int N, int K, cudaStream_t stream);
+
 // Same, with fp32 output/accumulate (for the LM head's logits).
 void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,
                                cudaStream_t stream);
