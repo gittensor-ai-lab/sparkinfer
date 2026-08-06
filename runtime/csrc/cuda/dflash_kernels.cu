@@ -240,10 +240,14 @@ __global__ void k_gemv_batched(const bf16* __restrict__ x, const bf16* __restric
     const uint4* wrow4 = (const uint4*)(W + (size_t)n * K);
     const int K8 = K / 8;
     for (int k8 = lane; k8 < K8; k8 += 32) {
-        const bf16* wv = (const bf16*)&wrow4[k8];
+        // Materialize the wide packets in registers. Merely taking a bf16 pointer
+        // into wrow4 lets ptxas scalarize every unrolled element access.
+        const uint4 wp = wrow4[k8];
+        const bf16* wv = (const bf16*)&wp;
 #pragma unroll
         for (int b = 0; b < BATCH; b++) {
-            const bf16* xv = (const bf16*)&(((const uint4*)(x + (size_t)b * K))[k8]);
+            const uint4 xp = ((const uint4*)(x + (size_t)b * K))[k8];
+            const bf16* xv = (const bf16*)&xp;
 #pragma unroll
             for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
         }
@@ -276,10 +280,12 @@ __global__ void k_gemv_batched_f32(const bf16* __restrict__ x, const bf16* __res
     const uint4* wrow4 = (const uint4*)(W + (size_t)n * K);
     const int K8 = K / 8;
     for (int k8 = lane; k8 < K8; k8 += 32) {
-        const bf16* wv = (const bf16*)&wrow4[k8];
+        const uint4 wp = wrow4[k8];
+        const bf16* wv = (const bf16*)&wp;
 #pragma unroll
         for (int b = 0; b < BATCH; b++) {
-            const bf16* xv = (const bf16*)&(((const uint4*)(x + (size_t)b * K))[k8]);
+            const uint4 xp = ((const uint4*)(x + (size_t)b * K))[k8];
+            const bf16* xv = (const bf16*)&xp;
 #pragma unroll
             for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
         }
