@@ -6,12 +6,12 @@
 namespace sparkinfer {
 namespace dflash_kernels {
 
-// Non-causal GQA attention. q: [q_len, n_q, d], k/v: [kv_len, n_kv, d], out: [q_len, n_q, d] bf16.
+// GQA attention. q: [q_len, n_q, d], k/v: [kv_len, n_kv, d], out: [q_len, n_q, d] bf16.
 // q_pos0 / k_pos0 are absolute positions of index 0. If window > 0, mask keys with
 // (q_pos - k_pos) >= window (sliding window). scale = 1/sqrt(d).
 void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      int q_len, int kv_len, int n_q, int n_kv, int d,
-                     int q_pos0, int k_pos0, int window, float scale,
+                     int q_pos0, int k_pos0, int window, bool causal, float scale,
                      cudaStream_t stream);
 
 // In-place RoPE on [seq, n_heads, d] bf16. positions[i] = pos0 + i.

@@ -91,7 +91,7 @@ __global__ void k_rope(bf16* x, int seq, int n_heads, int d, int pos0, float the
 // One block per (q_token, q_head). Online softmax over kv_len.
 __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
                        int q_len, int kv_len, int n_q, int n_kv, int d,
-                       int q_pos0, int k_pos0, int window, float scale) {
+                       int q_pos0, int k_pos0, int window, bool causal, float scale) {
     int qt = blockIdx.x;
     int qh = blockIdx.y;
     if (qt >= q_len || qh >= n_q) return;
@@ -115,6 +115,7 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
 
     for (int t = 0; t < kv_len; t++) {
         const int k_pos = k_pos0 + t;
+        if (causal && k_pos > q_pos) continue;
         if (window > 0 && (q_pos - k_pos) >= window) continue;
         const bf16* kv = k + ((size_t)t * n_kv + kv_h) * d;
         float dot = 0.f;
@@ -162,7 +163,7 @@ __global__ void k_attn_multiwarp_hd128(
     const bf16* __restrict__ q, const bf16* __restrict__ k,
     const bf16* __restrict__ v, bf16* __restrict__ out,
     int q_len, int kv_len, int n_q, int n_kv,
-    int q_pos0, int k_pos0, int window, float scale) {
+    int q_pos0, int k_pos0, int window, bool causal, float scale) {
     const int qt = blockIdx.x;
     const int qh = blockIdx.y;
     const int lane = threadIdx.x & 31;
@@ -188,6 +189,7 @@ __global__ void k_attn_multiwarp_hd128(
     const int q_pos = q_pos0 + qt;
     for (int t = warp; t < kv_len; t += nwarps) {
         const int k_pos = k_pos0 + t;
+        if (causal && k_pos > q_pos) continue;
         if (window > 0 && (q_pos - k_pos) >= window) continue;
         const bf16* kv = k + ((size_t)t * n_kv + kv_h) * D + base;
         float dot = 0.f;
@@ -399,7 +401,7 @@ void launch_rope_seq(void* x, int seq, int n_heads, int d, int pos0, float theta
 
 void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      int q_len, int kv_len, int n_q, int n_kv, int d,
-                     int q_pos0, int k_pos0, int window, float scale,
+                     int q_pos0, int k_pos0, int window, bool causal, float scale,
                      cudaStream_t stream) {
     if (q_len <= 0 || kv_len <= 0) return;
     dim3 grid(q_len, n_q);
@@ -409,13 +411,13 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
         constexpr int SMEM = (2 * NWARPS + NWARPS * 128) * sizeof(float);
         k_attn_multiwarp_hd128<<<grid, THREADS, SMEM, stream>>>(
             (const bf16*)q, (const bf16*)k, (const bf16*)v, (bf16*)out,
-            q_len, kv_len, n_q, n_kv, q_pos0, k_pos0, window, scale);
+            q_len, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale);
         return;
     }
     int smem = (2 * d + 128) * (int)sizeof(float);
     k_attn<<<grid, 128, smem, stream>>>((const bf16*)q, (const bf16*)k, (const bf16*)v,
                                         (bf16*)out, q_len, kv_len, n_q, n_kv, d,
-                                        q_pos0, k_pos0, window, scale);
+                                        q_pos0, k_pos0, window, causal, scale);
 }
 
 void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,

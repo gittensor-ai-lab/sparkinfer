@@ -553,9 +553,15 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         const int kv_len = past + new_len;
         const int window = (L < (int)c.sliding_layers.size() && c.sliding_layers[L])
                                ? c.sliding_window : 0;
+        static int mixed_causal = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_MIXED_CAUSAL");
+            return (!e || e[0] != '0') ? 1 : 0;
+        }();
+        const bool causal = mixed_causal && L < (int)c.sliding_layers.size() &&
+                            c.sliding_layers[L];
         dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L], s.v_cache[L], s.attn,
                                         B, kv_len, c.n_q_heads, c.n_kv_heads, d,
-                                        q_pos0, /*k_pos0_cache=*/0, window, scale, st);
+                                        q_pos0, /*k_pos0_cache=*/0, window, causal, scale, st);
 
         if (fast16) {
             dflash_kernels::launch_gemv_batched16(s.attn, w.wo, s.ao, H, qdim, st);
