@@ -217,6 +217,10 @@ struct Qwen35Model::Impl {
 
     // DFlash speculative decoding (target-side primitives).
     DFlashDraftModel* dflash_draft = nullptr;
+    // Preserve the native Q6_K head for the draft's multi-row MMVQ while the
+    // target uses its faster, narrower Q4_K requantized copy.
+    const void* dflash_lm_head = nullptr;
+    int dflash_lm_head_type = 0;
     bool dflash_capture = false;
     std::vector<int> dflash_layer_ids;
     int dflash_n_cap = 0;
@@ -1804,7 +1808,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     const int B = dc.block_size;
     const int mask_id = dc.mask_token_id;
 
-    draft.set_shared_weights(embed_weights(), lm_head_weights(), lm_head_quant_type(),
+    draft.set_shared_weights(embed_weights(),
+                             s.dflash_lm_head ? s.dflash_lm_head : lm_head_weights(),
+                             s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type(),
                              s.cfg.vocab, s.cfg.hidden);
     set_dflash_capture(true, dc.target_layer_ids, B);
 
@@ -2244,7 +2250,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return layer_index(name) >= ssm_out_min_layer;
         return false;
     };
-    const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K", q35_dense9b_requant_default);
+    const bool dual_dflash_lm_head = env_enabled(
+        "SPARKINFER_DFLASH_DUAL_LMHEAD",
+        q36_ud_requant_default && !q35_dense9b_requant_default);
+    const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K",
+                                       q35_dense9b_requant_default || dual_dflash_lm_head);
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
@@ -2293,6 +2303,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
     s.w.final_norm   = dense("output_norm.weight", false);
     const char* lm = g.tensor("output.weight") ? "output.weight" : "token_embd.weight";  // tied fallback
+    const GGUFTensor* lm_tensor = g.tensor(lm);
+    if (dual_dflash_lm_head && req_lm_q4 && lm_tensor &&
+        (lm_tensor->ggml_type == 14 || lm_tensor->ggml_type == 8)) {
+        s.dflash_lm_head = dev_quant(lm, s.dflash_lm_head_type);
+    }
     s.w.lm_head = lm_w(lm, s.w.lm_head_type);                 // native [vocab,hidden] for GEMV
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
 
