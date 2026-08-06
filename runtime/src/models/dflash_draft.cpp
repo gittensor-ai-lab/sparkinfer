@@ -491,17 +491,20 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
 
         // Q from noise, K/V from cat(target, noise)
         if (fast16) {
-            dflash_kernels::launch_gemv_batched16(s.xn, w.wq, s.q, qdim, H, st);
+            dflash_kernels::launch_gemv_batched16_fused3(
+                s.xn, w.wq, w.wk, w.wv,
+                s.q, s.k_new + (size_t)ctx_len * kvdim,
+                s.v_new + (size_t)ctx_len * kvdim,
+                qdim, kvdim, kvdim, H, st);
         } else {
             for (int t = 0; t < B; t++)
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wq, s.q + (size_t)t * qdim, qdim, H, st);
         }
         // Build k_new / v_new = cat(k_ctx, k_noise)
         if (ctx_len > 1) {
-            dflash_kernels::launch_gemv_rows_exact(s.target_proj, w.wk, s.k_new,
-                                                   ctx_len, kvdim, H, st);
-            dflash_kernels::launch_gemv_rows_exact(s.target_proj, w.wv, s.v_new,
-                                                   ctx_len, kvdim, H, st);
+            dflash_kernels::launch_gemv_rows_exact_fused2(
+                s.target_proj, w.wk, w.wv, s.k_new, s.v_new,
+                ctx_len, kvdim, kvdim, H, st);
         } else if (ctx_len == 1) {
             const int t = 0;
             kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wk,
@@ -509,12 +512,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wv,
                                  s.v_new + (size_t)t * kvdim, kvdim, H, st);
         }
-        if (fast16) {
-            dflash_kernels::launch_gemv_batched16(s.xn, w.wk, s.k_new + (size_t)ctx_len * kvdim,
-                                                  kvdim, H, st);
-            dflash_kernels::launch_gemv_batched16(s.xn, w.wv, s.v_new + (size_t)ctx_len * kvdim,
-                                                  kvdim, H, st);
-        } else {
+        if (!fast16) {
             for (int t = 0; t < B; t++) {
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wk,
                                      s.k_new + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
@@ -573,8 +571,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
 
         dflash_kernels::launch_rms(s.h, w.post_norm, s.hn, B, H, c.rms_eps, st);
         if (fast16) {
-            dflash_kernels::launch_gemv_batched16(s.hn, w.gate, s.gate, I, H, st);
-            dflash_kernels::launch_gemv_batched16(s.hn, w.up, s.up, I, H, st);
+            dflash_kernels::launch_gemv_batched16_fused2(
+                s.hn, w.gate, w.up, s.gate, s.up, I, I, H, st);
         } else {
             for (int t = 0; t < B; t++) {
                 kernels::launch_gemv(s.hn + (size_t)t * H, w.gate, s.gate + (size_t)t * I, I, H, st);

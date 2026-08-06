@@ -1850,10 +1850,6 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int th_len = n;
 
     std::vector<int> block(B), posterior(B), draft_ids(B);
-    bf16* th_scratch = nullptr;
-    const int row_stride = dflash_hidden_row_stride();
-    cu(cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)), "th scratch");
-
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
         block[0] = next;
@@ -1882,13 +1878,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             if (i + 1 < B && block[i + 1] != p) break;   // first mismatch -> reject the rest
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
-        // Accepted hiddens are in dflash_hidden rows 0..keep-1 (captured above); hand them to the
-        // next draft block via th_scratch and stash into the context buffer by global position.
-        cu(cudaMemcpyAsync(th_scratch, s.dflash_hidden,
-                           (size_t)keep * row_stride * sizeof(bf16),
-                           cudaMemcpyDeviceToDevice, s.stream), "th keep");
-        for (int i = 0; i < keep; i++) dflash_stash_capture(start + i);
-        cu(cudaStreamSynchronize(s.stream), "th sync");
+        // forward_token() synchronizes after sampling, so the accepted capture rows are already
+        // stable. The draft consumes only this newly accepted suffix; its KV cache retains all
+        // earlier context. Hand the capture buffer over directly instead of copying it to a second
+        // scratch allocation, stashing another unused full-context copy, and synchronizing again.
 
         bool stop = false;
         for (int i = 0; i < keep && (int)out.size() < max_new; i++) {
@@ -1906,7 +1899,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         start += keep;
         accept_sum += (double)keep;
         steps++;
-        target_hidden = th_scratch;
+        target_hidden = s.dflash_hidden;
         th_len = keep;
         if (gov) gov->pace();
     }
@@ -1917,7 +1910,6 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         stats->ttft_s = std::chrono::duration<double>(t1 - t0).count();
         stats->decode_s = std::chrono::duration<double>(t_end - t_decode0).count();
     }
-    cudaFree(th_scratch);
     close_session(sid);
     set_dflash_capture(false, {}, 0);
     draft.reset();

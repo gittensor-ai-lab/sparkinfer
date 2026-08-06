@@ -34,11 +34,24 @@ void launch_rms(const void* x, const void* w, void* out, int rows, int cols,
 // x: [16,K] bf16, W: [N,K] bf16 (native "out,in" layout, same as a single-row GEMV), y: [16,N] bf16.
 void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
                            cudaStream_t stream);
+void launch_gemv_batched16_fused2(const void* x,
+                                  const void* W0, const void* W1,
+                                  void* y0, void* y1,
+                                  int N0, int N1, int K, cudaStream_t stream);
+void launch_gemv_batched16_fused3(const void* x,
+                                  const void* W0, const void* W1, const void* W2,
+                                  void* y0, void* y1, void* y2,
+                                  int N0, int N1, int N2, int K, cudaStream_t stream);
 
 // Exact batched form of the small-N S=8 split-K BF16 GEMV used by launch_gemv.
 // Collapses multiple row launches into grid.y without changing arithmetic order.
 void launch_gemv_rows_exact(const void* x, const void* W, void* y,
                             int rows, int N, int K, cudaStream_t stream);
+void launch_gemv_rows_exact_fused2(const void* x,
+                                   const void* W0, const void* W1,
+                                   void* y0, void* y1,
+                                   int rows, int N0, int N1, int K,
+                                   cudaStream_t stream);
 
 // Same, with fp32 output/accumulate (for the LM head's logits).
 void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,

@@ -1050,7 +1050,7 @@ __global__ void gemv_q6k_dp4a_kfixed_kernel(const si_block_q8_1* __restrict__ vy
 // (~416 MB per read at V=248k,K=2048 — far past L2, so it is real HBM traffic). Here each warp owns
 // one output row and walks its weight superblocks ONCE, accumulating all M dot products, so the
 // weight streams from HBM a single time and the M reuses hit L1. y is [M, N] row-major.
-template <typename OutT, int WPB, int NSUPER, int MMAX>
+template <typename OutT, int WPB, int NSUPER, int MMAX, int MFIXED = 0>
 __global__ void gemv_q6k_dp4a_multirow_kernel(const si_block_q8_1* __restrict__ vy,
                                               const unsigned char* __restrict__ W,
                                               OutT* __restrict__ y, int N, int M) {
@@ -1085,7 +1085,8 @@ __global__ void gemv_q6k_dp4a_multirow_kernel(const si_block_q8_1* __restrict__ 
             scv[i] = (int)sc[4 * i];
         }
         const si_block_q8_1* a0 = vy + (size_t)kbx * 8;
-        for (int m = 0; m < M; m++) {
+        #pragma unroll
+        for (int m = 0; m < (MFIXED ? MFIXED : M); m++) {
             const si_block_q8_1* row = a0 + (size_t)m * QPR;
             float sumf = 0.f;
             #pragma unroll
@@ -1097,13 +1098,15 @@ __global__ void gemv_q6k_dp4a_multirow_kernel(const si_block_q8_1* __restrict__ 
             acc[m] += wd * sumf;
         }
     }
-    for (int m = 0; m < M; m++) {
+    #pragma unroll
+    for (int m = 0; m < (MFIXED ? MFIXED : M); m++) {
         float a = acc[m];
         #pragma unroll
         for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffff, a, s);
         if (lane == 0) gemv_write(y + (size_t)m * N + row, a);
     }
 }
+
 #ifndef _MSC_VER
 template __global__ void gemv_q6k_dp4a_kfixed_kernel<float, 8, 8>(const si_block_q8_1*, const unsigned char*, float*, int);
 #endif
@@ -1402,8 +1405,13 @@ bool launch_gemv_q6k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
                                        int N, int K, int M, cudaStream_t stream) {
     if (K != 2048 || M < 1 || M > 16) return false;   // draft head shape (H=2048, B<=16)
     dim3 grid((N + 15) / 16);
-    gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 16><<<grid, 16 * 32, 0, stream>>>(
-        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, M);
+    if (M == 15) {
+        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 16, 15><<<grid, 16 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, M);
+    } else {
+        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 16><<<grid, 16 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, M);
+    }
     return true;
 }
 

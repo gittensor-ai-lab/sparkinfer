@@ -287,6 +287,59 @@ __global__ void k_gemv_batched(const bf16* __restrict__ x, const bf16* __restric
     }
 }
 
+// Route several projections that share x through one grid. Each warp still owns exactly one
+// output row and executes the same accumulation loop as k_gemv_batched; only launch boundaries
+// change, so Q/K/V and gate/up keep bit-identical arithmetic.
+template <int BATCH>
+__global__ void k_gemv_batched_fused3(
+        const bf16* __restrict__ x,
+        const bf16* __restrict__ W0, const bf16* __restrict__ W1,
+        const bf16* __restrict__ W2,
+        bf16* __restrict__ y0, bf16* __restrict__ y1, bf16* __restrict__ y2,
+        int N0, int N1, int N2, int K) {
+    const int warps_per_block = blockDim.x / 32;
+    const int global_n = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    const int total = N0 + N1 + N2;
+    if (global_n >= total) return;
+    const bf16* W;
+    bf16* y;
+    int N, n;
+    if (global_n < N0) {
+        W = W0; y = y0; N = N0; n = global_n;
+    } else if (global_n < N0 + N1) {
+        W = W1; y = y1; N = N1; n = global_n - N0;
+    } else {
+        W = W2; y = y2; N = N2; n = global_n - N0 - N1;
+    }
+    const int lane = threadIdx.x & 31;
+    float acc[BATCH];
+#pragma unroll
+    for (int b = 0; b < BATCH; b++) acc[b] = 0.f;
+    const uint4* wrow4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+    const int K8 = K / 8;
+    for (int k8 = lane; k8 < K8; k8 += 32) {
+        const uint4 wp = wrow4[k8];
+        const bf16* wv = reinterpret_cast<const bf16*>(&wp);
+#pragma unroll
+        for (int b = 0; b < BATCH; b++) {
+            const uint4 xp = reinterpret_cast<const uint4*>(x + (size_t)b * K)[k8];
+            const bf16* xv = reinterpret_cast<const bf16*>(&xp);
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < BATCH; b++) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc[b] += __shfl_down_sync(0xffffffffu, acc[b], off);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int b = 0; b < BATCH; b++) y[(size_t)b * N + n] = f2b(acc[b]);
+    }
+}
+
 // Same batched-GEMV shape as k_gemv_batched, but for the LM head: fp32 accumulate/output
 // (matching the precision the original per-row launch_gemv_q_f32/launch_gemv_f32 path used
 // for logits) and no BATCH-sized register cap on N (vocab is large, only grid.x scales).
@@ -337,6 +390,51 @@ __global__ void k_gemv_rows_exact_s8(const bf16* __restrict__ x,
     const int split = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     if (n >= N || batch >= rows) return;
+    const uint4* w4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x + (size_t)batch * K);
+    const int K8 = K / 8;
+    float acc = 0.f;
+    for (int i = split * 32 + lane; i < K8; i += 8 * 32) {
+        const uint4 wp = w4[i];
+        const uint4 xp = x4[i];
+        const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wp);
+        const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xp);
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float2 wf = __bfloat1622float2(wh[j]);
+            const float2 xf = __bfloat1622float2(xh[j]);
+            acc += wf.x * xf.x + wf.y * xf.y;
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    __shared__ float partial[8];
+    if (lane == 0) partial[split] = acc;
+    __syncthreads();
+    if (split == 0 && lane == 0) {
+        float result = 0.f;
+#pragma unroll
+        for (int s = 0; s < 8; s++) result += partial[s];
+        y[(size_t)batch * N + n] = f2b(result);
+    }
+}
+
+__global__ void k_gemv_rows_exact_s8_fused2(
+        const bf16* __restrict__ x,
+        const bf16* __restrict__ W0, const bf16* __restrict__ W1,
+        bf16* __restrict__ y0, bf16* __restrict__ y1,
+        int rows, int N0, int N1, int K) {
+    const int global_n = blockIdx.x;
+    const int batch = blockIdx.y;
+    if (global_n >= N0 + N1 || batch >= rows) return;
+    const bool second = global_n >= N0;
+    const int n = second ? global_n - N0 : global_n;
+    const int N = second ? N1 : N0;
+    const bf16* W = second ? W1 : W0;
+    bf16* y = second ? y1 : y0;
+    const int split = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
     const uint4* w4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
     const uint4* x4 = reinterpret_cast<const uint4*>(x + (size_t)batch * K);
     const int K8 = K / 8;
@@ -429,12 +527,45 @@ void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
         (const bf16*)x, (const bf16*)W, (bf16*)y, N, K);
 }
 
+void launch_gemv_batched16_fused3(const void* x,
+                                  const void* W0, const void* W1, const void* W2,
+                                  void* y0, void* y1, void* y2,
+                                  int N0, int N1, int N2, int K, cudaStream_t stream) {
+    const int total = N0 + N1 + N2;
+    if (total <= 0) return;
+    constexpr int WARPS_PER_BLOCK = 4;
+    dim3 grid((total + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+    k_gemv_batched_fused3<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
+        (const bf16*)x, (const bf16*)W0, (const bf16*)W1, (const bf16*)W2,
+        (bf16*)y0, (bf16*)y1, (bf16*)y2, N0, N1, N2, K);
+}
+
+void launch_gemv_batched16_fused2(const void* x,
+                                  const void* W0, const void* W1,
+                                  void* y0, void* y1,
+                                  int N0, int N1, int K, cudaStream_t stream) {
+    launch_gemv_batched16_fused3(x, W0, W1, nullptr, y0, y1, nullptr,
+                                 N0, N1, 0, K, stream);
+}
+
 void launch_gemv_rows_exact(const void* x, const void* W, void* y,
                             int rows, int N, int K, cudaStream_t stream) {
     if (rows <= 0 || N <= 0) return;
     dim3 grid(N, rows);
     k_gemv_rows_exact_s8<<<grid, 8 * 32, 0, stream>>>(
         (const bf16*)x, (const bf16*)W, (bf16*)y, rows, N, K);
+}
+
+void launch_gemv_rows_exact_fused2(const void* x,
+                                   const void* W0, const void* W1,
+                                   void* y0, void* y1,
+                                   int rows, int N0, int N1, int K,
+                                   cudaStream_t stream) {
+    if (rows <= 0 || N0 + N1 <= 0) return;
+    dim3 grid(N0 + N1, rows);
+    k_gemv_rows_exact_s8_fused2<<<grid, 8 * 32, 0, stream>>>(
+        (const bf16*)x, (const bf16*)W0, (const bf16*)W1,
+        (bf16*)y0, (bf16*)y1, rows, N0, N1, K);
 }
 
 void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,
