@@ -122,10 +122,22 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
             dot += q_s[i] * b2f(kv[i]);
         red[threadIdx.x] = dot;
         __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-            __syncthreads();
+        // Preserve the original 128-way reduction tree, but stop using block-wide
+        // barriers once only warp 0 remains. The +64 and +32 stages still go through
+        // shared memory; +16..+1 use the equivalent shuffle-down tree. This removes
+        // four barriers per KV token without perturbing draft logits / acceptance.
+        if (threadIdx.x < 64) red[threadIdx.x] += red[threadIdx.x + 64];
+        __syncthreads();
+        if (threadIdx.x < 32) red[threadIdx.x] += red[threadIdx.x + 32];
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float warp_sum = red[threadIdx.x];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                warp_sum += __shfl_down_sync(0xffffffffu, warp_sum, off);
+            if (threadIdx.x == 0) red[0] = warp_sum;
         }
+        __syncthreads();
         float score = red[0] * scale;
         float new_max = fmaxf(max_s, score);
         float e1 = expf(max_s - new_max);
@@ -141,6 +153,66 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
     float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
     for (int i = threadIdx.x; i < d; i += blockDim.x)
         ov[i] = f2b(acc[i] * inv);
+}
+
+// DFlash's shipped Qwen3.6 draft shape is hd128 with a 16-token query block. Follow
+// the warp-per-query organization used by FlashAttention paths in llama.cpp/vLLM:
+// keep Q and the online-softmax output in registers and use shuffles for QK, avoiding
+// block-wide synchronization for every key. The four products are paired in the same
+// +64, +32 order as k_attn's 128-thread reduction before the +16..+1 shuffle tree.
+__global__ void k_attn_warp_hd128(
+    const bf16* __restrict__ q, const bf16* __restrict__ k,
+    const bf16* __restrict__ v, bf16* __restrict__ out,
+    int q_len, int kv_len, int n_q, int n_kv,
+    int q_pos0, int k_pos0, int window, float scale) {
+    const int qt = blockIdx.x;
+    const int qh = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (qt >= q_len || qh >= n_q) return;
+
+    constexpr int D = 128;
+    constexpr int E = D / 32;
+    const int kv_h = qh / (n_q / n_kv);
+    const bf16* qv = q + ((size_t)qt * n_q + qh) * D;
+    bf16* ov = out + ((size_t)qt * n_q + qh) * D;
+    float qr[E], acc[E];
+#pragma unroll
+    for (int e = 0; e < E; e++) {
+        qr[e] = b2f(qv[lane + e * 32]);
+        acc[e] = 0.f;
+    }
+
+    float max_s = -1e30f;
+    float sum = 0.f;
+    const int q_pos = q_pos0 + qt;
+    for (int t = 0; t < kv_len; t++) {
+        const int k_pos = k_pos0 + t;
+        if (window > 0 && (q_pos - k_pos) >= window) continue;
+        const bf16* kv = k + ((size_t)t * n_kv + kv_h) * D;
+        const float p0 = qr[0] * b2f(kv[lane]);
+        const float p1 = qr[1] * b2f(kv[lane + 32]);
+        const float p2 = qr[2] * b2f(kv[lane + 64]);
+        const float p3 = qr[3] * b2f(kv[lane + 96]);
+        float dot = __fadd_rn(__fadd_rn(p0, p2), __fadd_rn(p1, p3));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_down_sync(0xffffffffu, dot, off);
+        dot = __shfl_sync(0xffffffffu, dot, 0);
+
+        const float score = dot * scale;
+        const float new_max = fmaxf(max_s, score);
+        const float e1 = expf(max_s - new_max);
+        const float e2 = expf(score - new_max);
+        sum = sum * e1 + e2;
+        const bf16* vv = v + ((size_t)t * n_kv + kv_h) * D;
+#pragma unroll
+        for (int e = 0; e < E; e++)
+            acc[e] = acc[e] * e1 + e2 * b2f(vv[lane + e * 32]);
+        max_s = new_max;
+    }
+    const float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
+#pragma unroll
+    for (int e = 0; e < E; e++) ov[lane + e * 32] = f2b(acc[e] * inv);
 }
 
 // One warp per output row `n`, computing y[b][n] = sum_k x[b][k] * W[n][k] for all b in
@@ -262,6 +334,12 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      cudaStream_t stream) {
     if (q_len <= 0 || kv_len <= 0) return;
     dim3 grid(q_len, n_q);
+    if (d == 128) {
+        k_attn_warp_hd128<<<grid, 32, 0, stream>>>(
+            (const bf16*)q, (const bf16*)k, (const bf16*)v, (bf16*)out,
+            q_len, kv_len, n_q, n_kv, q_pos0, k_pos0, window, scale);
+        return;
+    }
     int smem = (2 * d + 128) * (int)sizeof(float);
     k_attn<<<grid, 128, smem, stream>>>((const bf16*)q, (const bf16*)k, (const bf16*)v,
                                         (bf16*)out, q_len, kv_len, n_q, n_kv, d,
