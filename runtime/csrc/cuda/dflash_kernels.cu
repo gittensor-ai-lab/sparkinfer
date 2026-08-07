@@ -69,6 +69,38 @@ __global__ void k_rms(const bf16* x, const bf16* w, bf16* out, int rows, int col
         or_[i] = f2b(b2f(xr[i]) * inv * b2f(w[i]));
 }
 
+// Residual add fused with the RMSNorm that always follows it: sum = a + b (kept for the next
+// residual) and out = rms(sum) * w. Identical arithmetic to launch_add followed by launch_rms, but
+// one eager launch instead of two and `sum` stays in registers for the norm's first pass.
+__global__ void k_add_rms(const bf16* a, const bf16* b, bf16* sum, const bf16* w, bf16* out,
+                          int rows, int cols, float eps) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const bf16* ar = a + (size_t)r * cols;
+    const bf16* br = b + (size_t)r * cols;
+    bf16* sr = sum + (size_t)r * cols;
+    bf16* orow = out + (size_t)r * cols;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float v = b2f(ar[i]) + b2f(br[i]);
+        sr[i] = f2b(v);
+        const float vq = b2f(sr[i]);          // round-trip through bf16, as launch_add then rms does
+        ss += vq * vq;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, off);
+    __shared__ float ws[32];
+    if (lane == 0) ws[warp] = ss;
+    __syncthreads();
+    float tot = 0.f;
+    for (int i = 0; i < nwarps; i++) tot += ws[i];
+    const float inv = rsqrtf(tot / (float)cols + eps);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        orow[i] = f2b(b2f(sr[i]) * inv * b2f(w[i]));
+}
+
 __global__ void k_rms_heads(bf16* x, const bf16* w, int seq, int n_heads, int d, float eps) {
     // One warp per (token, head): d is 128 here, so a head fits a single shuffle reduction and
     // the per-head block barriers disappear entirely.
@@ -86,6 +118,39 @@ __global__ void k_rms_heads(bf16* x, const bf16* w, int seq, int n_heads, int d,
     const float inv = rsqrtf(ss / (float)d + eps);
     for (int i = lane; i < d; i += 32)
         h[i] = f2b(b2f(h[i]) * inv * b2f(w[i]));
+}
+
+// Per-head RMSNorm immediately followed by RoPE on the same buffer. Two launches per tensor and
+// two per layer for q and k is 24 launches a draft block spends on ~37 us of work; the draft is
+// launched eagerly (no graph), so each one also pays a full launch gap. One warp per (token, head)
+// as in k_rms_heads, then the same rotation k_rope applies, in the same order per element.
+__global__ void k_rms_heads_rope(bf16* x, const bf16* w, int seq, int n_heads, int d,
+                                 float eps, int pos0, float theta) {
+    const int idx = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (idx >= seq * n_heads) return;
+    bf16* h = x + (size_t)idx * d;
+    const int lane = threadIdx.x & 31;
+    float ss = 0.f;
+    for (int i = lane; i < d; i += 32) {
+        float v = b2f(h[i]);
+        ss += v * v;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+    const float inv = rsqrtf(ss / (float)d + eps);
+    for (int i = lane; i < d; i += 32)
+        h[i] = f2b(b2f(h[i]) * inv * b2f(w[i]));
+    __syncwarp();
+    const int pos = pos0 + (idx / n_heads);
+    const int half = d / 2;
+    for (int i = lane; i < half; i += 32) {
+        const float freq = 1.f / powf(theta, (float)(2 * i) / (float)d);
+        const float ang = (float)pos * freq;
+        const float c = cosf(ang), sn = sinf(ang);
+        const float x0 = b2f(h[i]), x1 = b2f(h[i + half]);
+        h[i] = f2b(x0 * c - x1 * sn);
+        h[i + half] = f2b(x0 * sn + x1 * c);
+    }
 }
 
 __global__ void k_rope(bf16* x, int seq, int n_heads, int d, int pos0, float theta) {
@@ -741,7 +806,12 @@ void launch_gemv_batched_q4_fused3(const void* x,
                                    int batch) {
     const int total = N0 + N1 + N2;
     if (total <= 0) return;
-    constexpr int WPB = 4, ROWS = 8;
+    // ROWS is the number of WEIGHT rows a warp owns, which amortizes the activation re-reads --- but
+    // acc[ROWS][BATCH] plus wf[ROWS][8] are both live across the K loop, so at ROWS=8, BATCH=8 the
+    // kernel compiled to 167 registers and only 3 CTAs fit an SM (~19% occupancy), leaving it ~3.7x
+    // off HBM roofline. 4 halves both arrays and roughly doubles resident CTAs; measured 861.9 tok/s
+    // vs 855.4 at 8, with 3 and 5 within noise of 4.
+    constexpr int WPB = 4, ROWS = 4;
     const int warps = (total + ROWS - 1) / ROWS;
     dim3 grid((warps + WPB - 1) / WPB);
     const dim3 blk(WPB * 32);
@@ -810,6 +880,22 @@ void launch_rms(const void* x, const void* w, void* out, int rows, int cols, flo
                 cudaStream_t stream) {
     if (rows <= 0) return;
     k_rms<<<rows, 256, 0, stream>>>((const bf16*)x, (const bf16*)w, (bf16*)out, rows, cols, eps);
+}
+
+void launch_add_rms(const void* a, const void* b, void* sum, const void* w, void* out,
+                    int rows, int cols, float eps, cudaStream_t stream) {
+    if (rows <= 0 || cols <= 0) return;
+    k_add_rms<<<rows, 256, 0, stream>>>((const bf16*)a, (const bf16*)b, (bf16*)sum,
+                                        (const bf16*)w, (bf16*)out, rows, cols, eps);
+}
+
+void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, float eps,
+                           int pos0, float theta, cudaStream_t stream) {
+    if (seq <= 0 || n_heads <= 0) return;
+    constexpr int WPB = 4;
+    const int total = seq * n_heads;
+    k_rms_heads_rope<<<(total + WPB - 1) / WPB, WPB * 32, 0, stream>>>(
+        (bf16*)x, (const bf16*)w, seq, n_heads, d, eps, pos0, theta);
 }
 
 void launch_rms_heads(void* x, const void* w, int seq, int n_heads, int d, float eps,
@@ -905,7 +991,10 @@ void launch_gemv_rows_exact_fused2(const void* x,
                                    int rows, int N0, int N1, int K,
                                    cudaStream_t stream) {
     if (rows <= 0 || N0 + N1 <= 0) return;
-    constexpr int RMAX = 8, WPB = 4;
+    // RMAX is the activation-row tile. The r loop runs the full RMAX and folds r >= nr back onto
+    // row 0, so any slack is redundant work: with kProposalDepth=5 the accepted prefix this
+    // projects is at most 6 rows, and 8 spent a quarter of the kernel recomputing row 0.
+    constexpr int RMAX = 6, WPB = 4;
     dim3 grid((N0 + N1 + WPB - 1) / WPB, (rows + RMAX - 1) / RMAX);
     k_gemv_rows_batched_fused2<RMAX><<<grid, WPB * 32, 0, stream>>>(
         (const bf16*)x, (const bf16*)W0, (const bf16*)W1,
@@ -919,6 +1008,127 @@ void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, in
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
     k_gemv_batched_f32<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
         (const bf16*)x, (const bf16*)W, y, N, K);
+}
+
+// ---- all-layer accepted-prefix GDN commit -------------------------------------------------
+// Same expressions, same reduction order and the same intrinsics as the single-layer commits in
+// fused/batched_prefill.cu, so each layer's result is bit-identical; only the layer loop moves
+// from the host stream to a grid dimension.
+namespace {
+
+__device__ __forceinline__ float gc_sigmoid(float x) { return 1.f / (1.f + __expf(-x)); }
+__device__ __forceinline__ float gc_softplus(float x) { return x > 20.f ? x : __logf(1.f + __expf(x)); }
+__device__ __forceinline__ float gc_wsum(float v) {
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+    return v;
+}
+
+__global__ void k_gdn_conv_commit_layers(const bf16* __restrict__ qkv_base, size_t qkv_stride,
+                                         bf16* __restrict__ live_base, size_t live_stride,
+                                         const int* __restrict__ layer_ids,
+                                         int n_tokens, int qkv_dim, int conv_kernel) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= qkv_dim) return;
+    const size_t L = (size_t)layer_ids[blockIdx.y];
+    const bf16* qkv = qkv_base + qkv_stride * L;
+    bf16* live_state = live_base + live_stride * L;
+    const int history = conv_kernel - 1;
+    for (int c = 0; c < history; c++) {
+        const int src_tok = n_tokens - history + c;
+        live_state[(size_t)c * qkv_dim + d] = src_tok >= 0
+            ? qkv[(size_t)src_tok * qkv_dim + d]
+            : live_state[(size_t)(c + n_tokens) * qkv_dim + d];
+    }
+}
+
+template <int COLS, int HEAD_DIM>
+__global__ void k_gdn_scan_commit_layers(
+    const bf16* __restrict__ k_base, size_t k_stride,
+    const bf16* __restrict__ v_base, size_t v_stride,
+    const bf16* __restrict__ alpha_base, size_t ab_stride,
+    const bf16* __restrict__ beta_base,
+    const GdnCommitLayer* __restrict__ layers,
+    float* __restrict__ live_base, size_t live_stride,
+    int n_tokens, int q_heads, int v_heads) {
+    constexpr int NROW = HEAD_DIM / 32;
+    const int li = blockIdx.z;
+    const int vh = blockIdx.x;
+    const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (vh >= v_heads || j >= HEAD_DIM) return;
+    const size_t L = (size_t)layers[li].layer;
+    const bf16* k = k_base + k_stride * L;
+    const bf16* v = v_base + v_stride * L;
+    const bf16* alpha = alpha_base + ab_stride * L;
+    const bf16* beta = beta_base + ab_stride * L;
+    const bf16* dt = reinterpret_cast<const bf16*>(layers[li].dt);
+    const bf16* a = reinterpret_cast<const bf16*>(layers[li].a);
+    float* live_state = live_base + live_stride * L;
+
+    const int qh = vh % q_heads;
+    const int q_dim = q_heads * HEAD_DIM;
+    const int v_dim = v_heads * HEAD_DIM;
+    const size_t col_off = ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+    const float a_h = b2f(a[vh]);
+    const float dt_h = b2f(dt[vh]);
+
+    float sloc[NROW];
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) sloc[r] = live_state[col_off + lane + r * 32];
+    for (int t = 0; t < n_tokens; t++) {
+        const float bb = gc_sigmoid(b2f(beta[(size_t)t * v_heads + vh]));
+        const float g = __expf(gc_softplus(b2f(alpha[(size_t)t * v_heads + vh]) + dt_h) * a_h);
+        const bf16* kp = k + (size_t)t * q_dim + qh * HEAD_DIM;
+        const bf16* vp = v + (size_t)t * v_dim + vh * HEAD_DIM;
+        float part_sk = 0.f;
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            part_sk += sloc[r] * b2f(kp[i]);
+        }
+        const float sk = g * gc_wsum(part_sk);
+        const float delta = (b2f(vp[j]) - sk) * bb;
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            sloc[r] = sloc[r] * g + b2f(kp[i]) * delta;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) live_state[col_off + lane + r * 32] = sloc[r];
+}
+
+} // namespace
+
+void launch_gdn_conv_commit_layers(const void* qkv_base, size_t qkv_layer_stride,
+                                   void* live_base, size_t live_layer_stride,
+                                   const int* layer_ids, int n_layers, int n_tokens,
+                                   int q_heads, int v_heads, int head_dim, int conv_kernel,
+                                   cudaStream_t stream) {
+    if (n_tokens <= 0 || head_dim <= 0 || conv_kernel < 2 || conv_kernel > 8 || n_layers <= 0) return;
+    const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
+    constexpr int BLOCK = 256;
+    dim3 grid((qkv_dim + BLOCK - 1) / BLOCK, n_layers);
+    k_gdn_conv_commit_layers<<<grid, BLOCK, 0, stream>>>(
+        (const bf16*)qkv_base, qkv_layer_stride, (bf16*)live_base, live_layer_stride,
+        layer_ids, n_tokens, qkv_dim, conv_kernel);
+}
+
+void launch_gdn_scan_commit_layers(const void* k_base, size_t k_layer_stride,
+                                   const void* v_base, size_t v_layer_stride,
+                                   const void* alpha_base, size_t ab_layer_stride,
+                                   const void* beta_base, const GdnCommitLayer* layers,
+                                   float* live_base, size_t live_layer_stride,
+                                   int n_layers, int n_tokens, int q_heads, int v_heads,
+                                   int head_dim, cudaStream_t stream) {
+    if (n_tokens <= 0 || head_dim != 128 || n_layers <= 0) return;
+    constexpr int COLS = 4;
+    dim3 grid(v_heads, (head_dim + COLS - 1) / COLS, n_layers);
+    k_gdn_scan_commit_layers<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
+        (const bf16*)k_base, k_layer_stride, (const bf16*)v_base, v_layer_stride,
+        (const bf16*)alpha_base, ab_layer_stride, (const bf16*)beta_base, layers,
+        live_base, live_layer_stride, n_tokens, q_heads, v_heads);
 }
 
 } // namespace dflash_kernels

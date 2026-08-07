@@ -608,12 +608,24 @@ __global__ void shared_down_q8_mmvq_kernel(
     }
 }
 
+// Warps per CTA sized to the work that exists: one row is H/32 Q8_0 blocks and the loop strides
+// by NW*WS, so with H=2048 (64 blocks) a 4-warp CTA leaves threads 64..127 with zero iterations.
+// Those dead warps still occupy the CTA and still push a 0.0f into the shared-memory reduction.
+// Dropping them is numerically inert (the reduction just stops adding those zeros) and doubles the
+// CTAs that fit per SM. This kernel is hidden behind the routed MoE on stream_k in the DECODE path,
+// but the DFlash verify issues it on the main stream, where it is squarely on the critical path.
+template <int H, int WS>
+__device__ __host__ constexpr int si_shexp_nw() {
+    return (H / 32) >= 4 * WS ? 4 : ((H / 32) + WS - 1) / WS;
+}
+
 template <int H, int F, int R>
 __global__ void shared_gate_up_q8_mmvq_rows_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
     float* __restrict__ h_scratch) {
-    constexpr int NW = 4, WS = 32;
+    constexpr int WS = 32;
+    constexpr int NW = si_shexp_nw<H, WS>();
     const int f = blockIdx.x, lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5, tid = threadIdx.x;
     const int nblk = H >> 5;
@@ -646,23 +658,37 @@ __global__ void shared_gate_up_q8_mmvq_rows_kernel(
     }
 }
 
+// F/32 Q8_0 blocks per output row (16 for the Qwen3.6 shared expert) against a 32-lane stride left
+// lanes 16..31 with nothing to do, and the 32-lane reduction then folded their zeros in. Give each
+// half-warp its own output row instead: the surviving reduction is the same 16-lane tree the low
+// half already ran, minus a `+ 0.0f`, so every output is unchanged while the CTA covers twice the
+// rows. Only worthwhile because the DFlash verify puts this on the critical path — in decode it
+// hides on stream_k behind the routed MoE.
 template <int H, int F, int R>
 __global__ void shared_down_q8_mmvq_rows_kernel(
     const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
     __nv_bfloat16* __restrict__ out) {
-    const int h = blockIdx.x * WPB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    constexpr int nblk = F >> 5;
+    constexpr int HALF = (nblk <= 16) ? 1 : 0;          // two rows per warp when 16 lanes suffice
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int sub = HALF ? (lane >> 4) : 0;             // which half-warp
+    const int llane = HALF ? (lane & 15) : lane;
+    const int rows_per_warp = HALF ? 2 : 1;
+    const int h = (blockIdx.x * WPB + warp) * rows_per_warp + sub;
     if (h >= H) return;
-    const int nblk = F >> 5;
     const unsigned char* dbase = down_q + (size_t)h * nblk * 34;
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
-    for (int b = lane; b < nblk; b += 32)
+    for (int b = llane; b < nblk; b += (HALF ? 16 : 32))
         si_vec_dot_q8_0_rows<R>(dbase + (size_t)b * 34, hq8 + b, nblk, acc);
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-        acc[r] = q4kf_wsum(acc[r]);
-        if (lane == 0) out[(size_t)r * H + h] = __float2bfloat16(acc[r]);
+#pragma unroll
+        for (int m = (HALF ? 8 : 16); m > 0; m >>= 1)
+            acc[r] += __shfl_xor_sync(0xffffffff, acc[r], m);
+        if (llane == 0) out[(size_t)r * H + h] = __float2bfloat16(acc[r]);
     }
 }
 
@@ -1629,12 +1655,12 @@ void launch_shared_expert_q8_mmvq_rows(
     auto* hq = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
     auto* out = reinterpret_cast<__nv_bfloat16*>(output);
 #define SI_SHARED_ROWS(R) do { \
-    shared_gate_up_q8_mmvq_rows_kernel<2048, 512, R><<<512, 4 * 32, 0, stream>>>( \
+    shared_gate_up_q8_mmvq_rows_kernel<2048, 512, R><<<512, si_shexp_nw<2048, 32>() * 32, 0, stream>>>( \
         q, reinterpret_cast<const unsigned char*>(gate_q), \
         reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch); \
     quant_h_q8_1_kernel<<<((R * (512 >> 5)) + 7) / 8, 8 * 32, 0, stream>>>( \
         h_scratch, hq, R * (512 >> 5), 0); \
-    shared_down_q8_mmvq_rows_kernel<2048, 512, R><<<(2048 + WPB - 1) / WPB, WPB * 32, 0, stream>>>( \
+    shared_down_q8_mmvq_rows_kernel<2048, 512, R><<<(2048 + WPB * 2 - 1) / (WPB * 2), WPB * 32, 0, stream>>>( \
         hq, reinterpret_cast<const unsigned char*>(down_q), out); \
 } while (0)
     switch (rows) {

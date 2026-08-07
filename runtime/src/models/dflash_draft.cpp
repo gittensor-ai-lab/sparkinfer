@@ -268,6 +268,8 @@ struct DFlashDraftModel::Impl {
     bf16* lm_head_bf16 = nullptr;  // eager dequant+transpose cache for the batched LM-head GEMM
     signed char* lm_head_i8 = nullptr;
     float* lm_head_i8_scale = nullptr;
+    unsigned char* lm_head_i4 = nullptr;
+    float* lm_head_i4_scale = nullptr;
 
     // Scratch
     cudaStream_t stream{};
@@ -366,6 +368,11 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
         }
         cu(cudaStreamSynchronize(p_->stream), "lm_head dequant");
     }
+    // The draft's head is the single largest read in the draft block, and the draft only has to
+    // NOMINATE tokens -- every emitted token is still a target argmax, so the head's precision can
+    // only move the accept length, never correctness. int4 halves those bytes again (~254 MB vs
+    // ~508 MB at V=248k), and the kernel is at HBM peak, so its runtime is its weight bytes.
+    // SPARKINFER_DFLASH_HEAD_I4=0 keeps the int8 head.
     if (!p_->lm_head_i8 && lm_head_type == 12 && vocab > 0 && hidden == 2048) {
         p_->lm_head_i8 = p_->alloc<signed char>((size_t)vocab * hidden);
         p_->lm_head_i8_scale = p_->alloc<float>(vocab);
@@ -374,6 +381,23 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
                 vocab, hidden, p_->stream)) {
             p_->lm_head_i8 = nullptr;
             p_->lm_head_i8_scale = nullptr;
+        }
+        static const bool want_i4 = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_HEAD_I4");
+            return !(e && e[0] == '0');
+        }();
+        if (want_i4 && p_->lm_head_i8) {
+            p_->lm_head_i4 = p_->alloc<unsigned char>((size_t)vocab * (hidden / 2));
+            p_->lm_head_i4_scale = p_->alloc<float>(vocab);
+            if (p_->lm_head_i4 && p_->lm_head_i4_scale) {
+                kernels::launch_pack_i8_rows_i4(p_->lm_head_i8, p_->lm_head_i8_scale,
+                                                p_->lm_head_i4, p_->lm_head_i4_scale,
+                                                vocab, hidden, p_->stream);
+                cudaStreamSynchronize(p_->stream);
+            } else {
+                p_->lm_head_i4 = nullptr;
+                p_->lm_head_i4_scale = nullptr;
+            }
         }
         cu(cudaStreamSynchronize(p_->stream), "lm_head int8 prepack");
     }
@@ -571,7 +595,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     const int run_layers = active_layers > 0 ? std::min(active_layers, c.n_layers) : c.n_layers;
     for (int L = 0; L < run_layers; L++) {
         const LayerWeights& w = s.layers[L];
-        dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
+        if (L == 0)
+            dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
 
         // Q from noise, K/V from cat(target, noise)
         if (fast16) {
@@ -618,8 +643,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
 
         const int new_len = ctx_len + BW;
         // Q / K RMSNorm per head
-        dflash_kernels::launch_rms_heads(s.q, w.q_norm, BW, c.n_q_heads, d, c.rms_eps, st);
-        dflash_kernels::launch_rms_heads(s.k_new, w.k_norm, new_len, c.n_kv_heads, d, c.rms_eps, st);
+
 
         // RoPE: Q at positions past..(past+B) if past≈pos0 for noise-only positions.
         // Match reference: position_ids cover past_len .. start+block_size for the cat length.
@@ -628,8 +652,10 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // q_pos0 = pos0.
         const int k_pos0 = pos0 - ctx_len;
         const int q_pos0 = pos0;
-        dflash_kernels::launch_rope_seq(s.q, BW, c.n_q_heads, d, q_pos0, c.rope_theta, st);
-        dflash_kernels::launch_rope_seq(s.k_new, new_len, c.n_kv_heads, d, k_pos0, c.rope_theta, st);
+        dflash_kernels::launch_rms_heads_rope(s.q, w.q_norm, BW, c.n_q_heads, d, c.rms_eps,
+                                             q_pos0, c.rope_theta, st);
+        dflash_kernels::launch_rms_heads_rope(s.k_new, w.k_norm, new_len, c.n_kv_heads, d,
+                                             c.rms_eps, k_pos0, c.rope_theta, st);
 
         // Append into cache then attend over full past+new
         // Cache currently has `past` tokens. New keys start at offset `past`.
@@ -671,9 +697,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             for (int t = 0; t < BW; t++)
                 kernels::launch_gemv(s.attn + (size_t)t * qdim, w.wo, s.ao + (size_t)t * H, H, qdim, st);
         }
-        dflash_kernels::launch_add(s.x, s.ao, s.h, BW * H, st);
-
-        dflash_kernels::launch_rms(s.h, w.post_norm, s.hn, BW, H, c.rms_eps, st);
+        dflash_kernels::launch_add_rms(s.x, s.ao, s.h, w.post_norm, s.hn, BW, H, c.rms_eps, st);
         if (fast16) {
             if (w.q8_gate.q4)
                 dflash_kernels::launch_gemv_batched_q4_fused3(
@@ -708,10 +732,14 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             for (int t = 0; t < BW; t++)
                 kernels::launch_gemv(s.gate + (size_t)t * I, w.down, s.down + (size_t)t * H, H, I, st);
         }
-        dflash_kernels::launch_add(s.h, s.down, s.x, BW * H, st);
+        // Fold the second residual into the norm that always consumes it: the next layer's input
+        // norm, or the final norm after the last layer. Same math, one launch instead of two, and
+        // the draft is eager-launched so each saved launch is also a saved gap.
+        const bf16* next_norm = (L + 1 < run_layers) ? s.layers[L + 1].input_norm : s.final_norm;
+        dflash_kernels::launch_add_rms(s.h, s.down, s.x, next_norm, s.xn, BW, H, c.rms_eps, st);
     }
-
-    dflash_kernels::launch_rms(s.x, s.final_norm, s.xn, BW, H, c.rms_eps, st);
+    if (run_layers <= 0)
+        dflash_kernels::launch_rms(s.x, s.final_norm, s.xn, BW, H, c.rms_eps, st);
 
     // LM head (target weights) -> logits / argmax. Batched over the whole block: one batched
     // GEMV against the eagerly dequantized bf16 lm_head cache instead of a per-token
@@ -736,7 +764,11 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             const char* e = getenv("SPARKINFER_DFLASH_HEAD_I8");
             return !(e && e[0] == '0');
         }();
-        if (s.lm_head_type == 12 && head_i8 && s.lm_head_i8)
+        if (s.lm_head_type == 12 && s.lm_head_i4)
+            head_done = kernels::launch_gemv_i4_q81_multirow_f32(
+                s.head_q8, s.lm_head_i4, s.lm_head_i4_scale,
+                s.logits + V, V, H, kProposalDepth, st);
+        else if (s.lm_head_type == 12 && head_i8 && s.lm_head_i8)
             head_done = kernels::launch_gemv_i8_q81_multirow_f32(
                 s.head_q8, s.lm_head_i8, s.lm_head_i8_scale,
                 s.logits + V, V, H, kProposalDepth, st);

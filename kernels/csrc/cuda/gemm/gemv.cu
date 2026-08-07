@@ -169,6 +169,74 @@ __global__ void gemv_bf16_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
 }
 
 #ifndef _MSC_VER
+
+// Two independent weight matrices sharing one activation block, in a single launch. The DFlash
+// verify issues a stack of tiny row-GEMVs per layer (ssm_alpha and ssm_beta produce v_heads
+// outputs each from the same xn); at ~2 us apiece across 30 GDN layers that is almost entirely
+// launch and graph-node dependency latency rather than work. Mapping the concatenated output rows
+// onto one grid leaves every row's split-K traversal, warp reduction and ordered split sum exactly
+// as gemv_bf16_rows_sk_kernel computes them, so each output is bit-identical.
+template <typename OutT, int S, int M>
+__global__ void gemv_bf16_rows_sk2_kernel(const __nv_bfloat16* __restrict__ x,
+                                         const __nv_bfloat16* __restrict__ W0,
+                                         const __nv_bfloat16* __restrict__ W1,
+                                         OutT* __restrict__ y0, OutT* __restrict__ y1,
+                                         int N0, int N1, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float part[M][RPB][S];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n_all = blockIdx.x * RPB + row_local;
+    const bool second = n_all >= N0;
+    const __nv_bfloat16* W = second ? W1 : W0;
+    OutT* y = second ? y1 : y0;
+    const int n = second ? n_all - N0 : n_all;
+    const int N = second ? N1 : N0;
+    const bool live = n_all < N0 + N1;
+    float acc[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) acc[r] = 0.f;
+    if (live) {
+        const uint4* w4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+        const int n4 = K / 8;
+        for (int i = split * 32 + lane; i < n4; i += S * 32) {
+            const uint4 wv = w4[i];
+            const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            float2 wf[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) wf[j] = __bfloat1622float2(wh[j]);
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const uint4 xv = reinterpret_cast<const uint4*>(x + (size_t)r * K)[i];
+                const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 xf = __bfloat1622float2(xh[j]);
+                    acc[r] += wf[j].x * xf.x + wf[j].y * xf.y;
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < M; ++r)
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1)
+                acc[r] += __shfl_xor_sync(0xffffffff, acc[r], d);
+        if (lane == 0)
+#pragma unroll
+            for (int r = 0; r < M; ++r) part[r][row_local][split] = acc[r];
+    }
+    __syncthreads();
+    if (live && split == 0 && lane == 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float out = 0.f;
+#pragma unroll
+            for (int s = 0; s < S; ++s) out += part[r][row_local][s];
+            gemv_write(y + (size_t)r * N + n, out);
+        }
+    }
+}
+
 #define SI_INST_GEMV_ROWS(T, S, M) template __global__ void gemv_bf16_rows_sk_kernel<T, S, M>(const __nv_bfloat16*, const __nv_bfloat16*, T*, int, int)
 SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 1); SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 2);
 SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 3); SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 4);
@@ -620,6 +688,94 @@ __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4,
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
 }
 
+// Row-batched twin of si_vec_dot_q4_K: decode the Q4_K weight packet once (4-bit nibble
+// split, 6-bit scale/min unpack, superblock d/dmin) and reuse it across up to R activation
+// rows. The single-row helper redoes all of that per row, which is what makes the compact
+// verifier's projections ALU-bound at block width rather than bandwidth-bound: the weight
+// bytes are read once for the whole block, but the decode cost was paid M times. Each row still
+// evaluates the same two dp4a pairs, in the same i order, and accumulates into its own
+// float — identical operation sequence, so results are bit-identical per row.
+// Decoded Q4_K weight packet: the nibble split, the 6-bit scale/min pair and the superblock
+// d/dmin, i.e. everything in si_vec_dot_q4_K that depends only on the WEIGHT.
+struct si_q4k_packet {
+    int v0i[2], v1i[2];
+    unsigned short aux[2];
+    float2 dm4f;
+};
+
+__device__ __forceinline__ si_q4k_packet si_q4k_decode(const si_block_q4_K* __restrict__ bq4,
+                                                      int bq8_offset, int qoff) {
+    si_q4k_packet p;
+    const int* q4 = (const int*)(bq4->qs + 16 * bq8_offset + 4 * qoff);
+    const int v0 = q4[0], v1 = q4[4];
+    const unsigned short* scales = (const unsigned short*)bq4->scales;
+    const int j = bq8_offset / 2;
+    if (j < 2) { p.aux[0] = scales[j] & 0x3f3f; p.aux[1] = scales[j + 2] & 0x3f3f; }
+    else { p.aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+           p.aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2); }
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        p.v0i[i] = (v0 >> (4 * i)) & 0x0F0F0F0F;
+        p.v1i[i] = (v1 >> (4 * i)) & 0x0F0F0F0F;
+    }
+    p.dm4f = __half22float2(bq4->dm);
+    return p;
+}
+
+// Row-batched twin of si_vec_dot_q4_K over OROWS weight rows x R activation rows.
+//
+// Two different redundancies are removed here, and neither changes any row's arithmetic:
+//   * the WEIGHT decode is hoisted out of the activation-row loop (si_vec_dot_q4_K redoes it per
+//     row, which is what made the compact verifier's projections ALU-bound at block width even
+//     though the weight bytes are read once for the whole block);
+//   * the ACTIVATION-only term dp4a(0x01010101, u, ...) — a plain sum of eight quantized bytes —
+//     is shared across the OROWS weight rows this CTA owns. Every output row otherwise recomputes
+//     it identically, so per (weight row, activation row) the dp4a count drops from 8 to 4 + 4/OROWS.
+// Each row still evaluates the same two dp4a pairs in the same i order and accumulates into its own
+// float, so results stay bit-identical per row.
+template <int OROWS, int R>
+__device__ __forceinline__ void si_vec_dot_q4_K_tiled(
+        const si_block_q4_K* __restrict__ bq4, size_t wstride, int orows,
+        const si_block_q8_1* __restrict__ bq8_1, int iqs, int astride, int rows,
+        float (&acc)[OROWS][R]) {
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    const int qoff = (iqs / 2) % 4;
+    si_q4k_packet pk[OROWS];
+    #pragma unroll
+    for (int o = 0; o < OROWS; o++)
+        if (o < orows) pk[o] = si_q4k_decode(bq4 + wstride * o, bq8_offset, qoff);
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        if (r < rows) {
+            const si_block_q8_1* base = bq8_1 + (size_t)r * astride + bq8_offset;
+            int u0[2], u1[2], dot2[2];
+            float d8[2];
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const si_block_q8_1* bq8i = base + i;
+                d8[i] = __low2float(bq8i->ds);
+                const int* q8 = (const int*)bq8i->qs + qoff;
+                u0[i] = q8[0]; u1[i] = q8[4];
+                dot2[i] = __dp4a(0x01010101, u1[i], __dp4a(0x01010101, u0[i], 0));
+            }
+            #pragma unroll
+            for (int o = 0; o < OROWS; o++) {
+                if (o >= orows) continue;
+                const unsigned char* sc = (const unsigned char*)pk[o].aux;
+                const unsigned char* mn = sc + 2;
+                float sumf_d = 0.0f, sumf_m = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const int dot1 = __dp4a(pk[o].v1i[i], u1[i], __dp4a(pk[o].v0i[i], u0[i], 0));
+                    sumf_d += d8[i] * (dot1 * sc[i]);
+                    sumf_m += d8[i] * (dot2[i] * mn[i]);
+                }
+                acc[o][r] += pk[o].dm4f.x * sumf_d - pk[o].dm4f.y * sumf_m;
+            }
+        }
+    }
+}
+
 template <typename OutT>
 __global__ void si_mmvq_q4k_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
                                    OutT* __restrict__ y, int N, int K) {
@@ -836,62 +992,76 @@ template __global__ void si_mmvq_q4k_kfixed_kernel<float, 16>(const si_block_q8_
 // two-stage four-warp reduction are identical to si_mmvq_q4k_kfixed_kernel. Each CTA owns one
 // weight row and evaluates up to four activation rows before eviction, turning repeated HBM
 // reads into intra-CTA cache hits without changing any per-row floating-point association.
-template <typename OutT, int NSUPER, int MMAX>
+// Weight rows per CTA for the row-batched Q4_K MMVQ.
+#define SI_Q4K_OROWS 2
+
+// OROWS weight rows per CTA. The thread -> (superblock, sub-block) mapping, the two-stage
+// four-warp reduction and each row's accumulation order are untouched; owning more than one
+// weight row only lets the CTA share the activation loads and the activation-only dp4a term.
+template <typename OutT, int NSUPER, int MMAX, int OROWS>
 __global__ void si_mmvq_q4k_rows_exact_kernel(const si_block_q8_1* __restrict__ q,
                                               const unsigned char* __restrict__ W,
                                               OutT* __restrict__ y, int M, int N) {
     constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
     constexpr int QPR = NSUPER * 8;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
-    const int row = blockIdx.x;
-    if (row >= N) return;
+    const int row0 = blockIdx.x * OROWS;
+    if (row0 >= N) return;
+    const int orows = (N - row0 < OROWS) ? (N - row0) : OROWS;
     const si_block_q4_K* x_row = reinterpret_cast<const si_block_q4_K*>(
-        W + (size_t)row * NSUPER * 144);
+        W + (size_t)row0 * NSUPER * 144);
     constexpr int blocks_per_iter = vdr * NW * WS / qi;
-    float tmp[MMAX];
+    float tmp[OROWS][MMAX];
     #pragma unroll
-    for (int m = 0; m < MMAX; m++) tmp[m] = 0.f;
+    for (int o = 0; o < OROWS; o++)
+        #pragma unroll
+        for (int m = 0; m < MMAX; m++) tmp[o][m] = 0.f;
     #pragma unroll
     for (int kbx = tid / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
         const int kqs = vdr * (tid % (qi / vdr));
-        #pragma unroll
-        for (int m = 0; m < MMAX; m++) {
-            if (m < M) tmp[m] += si_vec_dot_q4_K(x_row + kbx, q + (size_t)m * QPR + kbx * 8, kqs);
-        }
+        si_vec_dot_q4_K_tiled<OROWS, MMAX>(x_row + kbx, (size_t)NSUPER, orows,
+                                           q + kbx * 8, kqs, QPR, M, tmp);
     }
-    __shared__ float partial[MMAX][NW - 1][WS];
+    __shared__ float partial[OROWS][MMAX][NW - 1][WS];
     if (warp > 0) {
         #pragma unroll
-        for (int m = 0; m < MMAX; m++) if (m < M) partial[m][warp - 1][lane] = tmp[m];
+        for (int o = 0; o < OROWS; o++)
+            #pragma unroll
+            for (int m = 0; m < MMAX; m++)
+                if (o < orows && m < M) partial[o][m][warp - 1][lane] = tmp[o][m];
     }
     __syncthreads();
     if (warp > 0) return;
     #pragma unroll
-    for (int m = 0; m < MMAX; m++) {
-        if (m >= M) break;
+    for (int o = 0; o < OROWS; o++) {
+        if (o >= orows) break;
         #pragma unroll
-        for (int l = 0; l < NW - 1; l++) tmp[m] += partial[m][l][lane];
-        #pragma unroll
-        for (int s = 16; s > 0; s >>= 1) tmp[m] += __shfl_xor_sync(0xffffffff, tmp[m], s);
-        if (lane == 0) gemv_write(y + (size_t)m * N + row, tmp[m]);
+        for (int m = 0; m < MMAX; m++) {
+            if (m >= M) break;
+            #pragma unroll
+            for (int l = 0; l < NW - 1; l++) tmp[o][m] += partial[o][m][l][lane];
+            #pragma unroll
+            for (int s = 16; s > 0; s >>= 1) tmp[o][m] += __shfl_xor_sync(0xffffffff, tmp[o][m], s);
+            if (lane == 0) gemv_write(y + (size_t)m * N + row0 + o, tmp[o][m]);
+        }
     }
 }
 #ifndef _MSC_VER
-template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 8>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 8, SI_Q4K_OROWS>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 8>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 8, SI_Q4K_OROWS>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 8>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 8, SI_Q4K_OROWS>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 8>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 8, SI_Q4K_OROWS>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 6>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 6, SI_Q4K_OROWS>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 6>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 6, SI_Q4K_OROWS>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 6>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 6, SI_Q4K_OROWS>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 6>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 6, SI_Q4K_OROWS>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
 #endif
 // One block per row index: warps 0-3 -> qkv[row], warps 4-7 -> z[row], keeping vy hot
@@ -1669,6 +1839,27 @@ bool launch_gemv_rows(const void* x, const void* W, void* y,
     return launch_gemv_rows_t<__nv_bfloat16, 8>(x, W,
         reinterpret_cast<__nv_bfloat16*>(y), M, N, K, stream);
 }
+bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, void* y1,
+                       int M, int N0, int N1, int K, cudaStream_t stream) {
+    if (M < 1 || M > 8 || N0 < 1 || N1 < 1 || (K & 7)) return false;
+    constexpr int S = 8, RPB = GEMV_WPB / S;
+    dim3 grid((N0 + N1 + RPB - 1) / RPB);
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+    const auto* w0 = reinterpret_cast<const __nv_bfloat16*>(W0);
+    const auto* w1 = reinterpret_cast<const __nv_bfloat16*>(W1);
+    auto* o0 = reinterpret_cast<__nv_bfloat16*>(y0);
+    auto* o1 = reinterpret_cast<__nv_bfloat16*>(y1);
+#define SI_GEMV_ROWS2(MM) gemv_bf16_rows_sk2_kernel<__nv_bfloat16, S, MM>\
+    <<<grid, GEMV_WPB * 32, 0, stream>>>(xp, w0, w1, o0, o1, N0, N1, K)
+    switch (M) {
+        case 1: SI_GEMV_ROWS2(1); break;  case 2: SI_GEMV_ROWS2(2); break;
+        case 3: SI_GEMV_ROWS2(3); break;  case 4: SI_GEMV_ROWS2(4); break;
+        case 5: SI_GEMV_ROWS2(5); break;  case 6: SI_GEMV_ROWS2(6); break;
+        case 7: SI_GEMV_ROWS2(7); break;  default: SI_GEMV_ROWS2(8); break;
+    }
+#undef SI_GEMV_ROWS2
+    return true;
+}
 bool launch_gemv_rows_f32(const void* x, const void* W, float* y,
                           int M, int N, int K, cudaStream_t stream) {
     return launch_gemv_rows_t<float, 4>(x, W, y, M, N, K, stream);
@@ -1854,14 +2045,18 @@ void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K,
 bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
     if (M < 1 || M > 8 || N < 1 || (K != 2048 && K != 4096)) return false;
-    if (K == 2048)
-        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 8><<<N, 4 * 32, 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
-            reinterpret_cast<__nv_bfloat16*>(y), M, N);
-    else
-        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 8><<<N, 4 * 32, 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
-            reinterpret_cast<__nv_bfloat16*>(y), M, N);
+    // Dispatch the tightest instantiated row width: MMAX bounds tmp[]/partial[] and the
+    // number of predicated row bodies, so a 6-row block should not pay an 8-row footprint.
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const auto* w = reinterpret_cast<const unsigned char*>(W);
+    auto* out = reinterpret_cast<__nv_bfloat16*>(y);
+    if (K == 2048) {
+        if (M <= 6) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 6, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, out, M, N);
+        else        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 8, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, out, M, N);
+    } else {
+        if (M <= 6) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 6, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, out, M, N);
+        else        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 8, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, out, M, N);
+    }
     return true;
 }
 bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
@@ -1912,10 +2107,13 @@ bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const auto* w = reinterpret_cast<const unsigned char*>(W);
     if (qtype == 12 && (K == 2048 || K == 4096)) {
-        if (K == 2048)
-            si_mmvq_q4k_rows_exact_kernel<float, 8, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
-        else
-            si_mmvq_q4k_rows_exact_kernel<float, 16, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        if (K == 2048) {
+            if (M <= 6) si_mmvq_q4k_rows_exact_kernel<float, 8, 6, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            else        si_mmvq_q4k_rows_exact_kernel<float, 8, 8, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        } else {
+            if (M <= 6) si_mmvq_q4k_rows_exact_kernel<float, 16, 6, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            else        si_mmvq_q4k_rows_exact_kernel<float, 16, 8, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        }
         return true;
     }
     if (qtype == 14 && (K == 2048 || K == 4096)) {

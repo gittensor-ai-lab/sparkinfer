@@ -26,6 +26,10 @@ void launch_swiglu(const void* gate, const void* up, void* out, int n,
 void launch_add(const void* x, const void* y, void* out, int n,
                 cudaStream_t stream);
 
+// sum = a + b, then out = rms(sum) * w. One launch for the residual+norm pair.
+void launch_add_rms(const void* a, const void* b, void* sum, const void* w, void* out,
+                    int rows, int cols, float eps, cudaStream_t stream);
+
 // RMSNorm over last dim: x [rows, cols] -> out [rows, cols], weight [cols].
 void launch_rms(const void* x, const void* w, void* out, int rows, int cols,
                 float eps, cudaStream_t stream);
@@ -91,6 +95,40 @@ void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, in
 // Per-head RMSNorm on [seq, n_heads, d] (in-place).
 void launch_rms_heads(void* x, const void* w, int seq, int n_heads, int d,
                       float eps, cudaStream_t stream);
+
+// Per-head RMSNorm followed by RoPE, same buffer, one launch. Same math and order as calling
+// launch_rms_heads then launch_rope_seq.
+void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, float eps,
+                           int pos0, float theta, cudaStream_t stream);
+
+// Accepted-prefix GDN commit for EVERY linear-attention layer in one launch.
+//
+// The per-layer commits (kernels::launch_dflash_gdn_{conv,scan}_commit) are independent — each
+// touches only its own slice of the live recurrent state — but they run back-to-back on one stream
+// after the verify graph, and the next step's draft cannot start until they drain. That put 2 *
+// n_gdn_layers tiny serialized launches on the critical path for work that is n_layers-way
+// parallel. These forms take the base pointer plus the per-layer stride and use a grid dimension
+// as the layer index. Every buffer is regularly strided by the FULL layer index (linear-attention
+// layers are interleaved with full-attention ones), so the layer table carries the real index; the
+// two per-layer weight vectors are not strided and are passed as device pointers.
+//
+// The per-layer arithmetic and reduction order are unchanged, so each layer's committed state is
+// bit-identical to running the single-layer kernels one at a time.
+struct GdnCommitLayer { const void* dt; const void* a; int layer; };
+
+void launch_gdn_conv_commit_layers(const void* qkv_base, size_t qkv_layer_stride,
+                                   void* live_base, size_t live_layer_stride,
+                                   const int* layer_ids, int n_layers, int n_tokens,
+                                   int q_heads, int v_heads, int head_dim, int conv_kernel,
+                                   cudaStream_t stream);
+
+void launch_gdn_scan_commit_layers(const void* k_base, size_t k_layer_stride,
+                                   const void* v_base, size_t v_layer_stride,
+                                   const void* alpha_base, size_t ab_layer_stride,
+                                   const void* beta_base, const GdnCommitLayer* layers,
+                                   float* live_base, size_t live_layer_stride,
+                                   int n_layers, int n_tokens, int q_heads, int v_heads,
+                                   int head_dim, cudaStream_t stream);
 
 } // namespace dflash_kernels
 } // namespace sparkinfer

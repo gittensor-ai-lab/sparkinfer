@@ -1862,18 +1862,30 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int th_len = n;
 
     std::vector<int> block(B), posterior(B), draft_ids(B);
-    // Proposal depth (also sets the draft's active diffusion width, depth+1).
+    // Proposal depth (also sets the draft's active diffusion width, depth+1). 5 is the measured
+    // optimum: accept length rises only 5.33 -> 5.95 -> 6.43 going to depth 6 and 7, while each
+    // extra verify row costs a flat ~0.74 ms, so depth 6 already loses. Keep in sync with
+    // dflash_draft.cpp's copy of this default.
     static const int kProposalDepth = []{
         const char* e = getenv("SPARKINFER_DFLASH_PROPOSALS");
         int v = e ? atoi(e) : 5;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
     // 0=off, 1=force, 2=adaptive (default). Adaptive preserves early-exit verification on
-    // low-acceptance workloads and switches to the weight-reusing four-row graph only after two
-    // consecutive full-block accepts.
+    // low-acceptance workloads and switches to the weight-reusing row-batched graph on a run of
+    // full-block accepts.
     static const int compact_mode = []{
         const char* e = getenv("SPARKINFER_DFLASH_COMPACT_VERIFY");
         return e ? atoi(e) : 2;
+    }();
+    // Full-block accepts arrive in runs (the target and draft agree over a whole predictable
+    // region), so one is already evidence the next step will accept a full block. Requiring two
+    // spent the first step of every run on the token loop, which costs one full target forward
+    // per accepted token instead of one row-batched pass over the block.
+    static const int kBlockScore = []{
+        const char* e = getenv("SPARKINFER_DFLASH_BLOCK_SCORE");
+        int v = e ? atoi(e) : 1;
+        return v < 1 ? 1 : v;
     }();
     int compact_score = 0;
     bf16* th_scratch = nullptr;
@@ -1886,7 +1898,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     }
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
-        const bool compact_verify = compact_mode == 1 || (compact_mode != 0 && compact_score >= 2);
+        const bool compact_verify = compact_mode == 1 ||
+            (compact_mode != 0 && compact_score >= kBlockScore);
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 

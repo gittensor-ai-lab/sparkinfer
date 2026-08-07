@@ -23,6 +23,7 @@
 #include "sparkinfer/kernels/prefill_moe_q.h"
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/attention.h"
+#include "sparkinfer/models/dflash_kernels.h"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -1336,6 +1337,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const int bs = s.kv->block_size(), mbs = s.kv->max_blocks_per_seq();
     const bool kv8 = s.kv->int8_kv();
     const int kv_elem = kv8 ? 1 : 2;
+    // The flash-decode split/combine kernels are already batched over grid.y = num_seqs, and every
+    // buffer this function hands them is laid out with exactly the per-row stride they expect. The
+    // one thing that is not is the block table: they index block_table[seq * max_blocks + blk], and
+    // all N verify rows share a single sequence. Replicate the table N times (N * max_blocks ints,
+    // a few KB) so the 10 full-attention layers each run ONE split + ONE combine instead of one per
+    // row. That removes 2*(N-1) graph nodes per attention layer, and the graph is ~1000 nodes deep
+    // against only ~5.6 ms of kernel time, so node count is itself a real cost here.
+    int* btab_rows = (N > 1) ? a.alloc<int>((size_t)N * mbs) : nullptr;
+    if (!a.ok) { fprintf(stderr, "[dflash-verify] block-table scratch allocation failed\n"); return -1; }
     bool supported = true;
     bool recording = false;
     bool head_ok = false;
@@ -1364,6 +1374,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     pf_cu(cudaMemcpyAsync(ids, ph_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify ids");
     pf_cu(cudaMemcpyAsync(pos, ph_pos, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify pos");
     pf_cu(cudaMemcpyAsync(seq, ph_seq, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify lens");
+    // Device-to-device inside the capture, so each replay re-reads the sequence's live table as it
+    // grows instead of baking in the mapping from capture time.
+    for (int i = 0; btab_rows && i < N; ++i)
+        pf_cu(cudaMemcpyAsync(btab_rows + (size_t)i * mbs, btable, (size_t)mbs * sizeof(int),
+                              cudaMemcpyDeviceToDevice, st), "verify btable row");
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, c.rms_eps, st);
     for (int L = 0; L < c.n_layers && supported; ++L) {
@@ -1374,10 +1389,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             bf16* rv = rec_v + (size_t)L * N * lvdim;
             bf16* ra = rec_a + (size_t)L * N * vh;
             bf16* rb = rec_b + (size_t)L * N * vh;
+            // alpha and beta are v_heads-wide reads of the same xn — two launches whose cost is
+            // almost entirely launch/graph-node latency. One fused launch, same per-row math.
+            const bool ab_fused = w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
+                kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, st);
             supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H) &&
                         proj(xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H) &&
-                        proj(xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
-                        proj(xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H);
+                        (ab_fused || (proj(xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
+                                      proj(xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H)));
             if (!supported) break;
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) +
                 (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
@@ -1414,19 +1433,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
                     bs, mbs, st);
             }
-            for (int i = 0; i < N; ++i)
-                kernels::launch_flash_decode_split(
-                    qb + (size_t)i * qdim, kp, vp, btable, seq + i, att + (size_t)i * qdim,
-                    fa_m + (size_t)i * c.n_q_heads * ns,
-                    fa_l + (size_t)i * c.n_q_heads * ns,
-                    fa_acc + (size_t)i * c.n_q_heads * ns * c.head_dim,
-                    1, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns,
-                    1.f / sqrtf((float)c.head_dim), st, nullptr, -1,
-                    ks, vs, kv8 ? 1 : 0, kv8 ? qg + (size_t)i * qdim : nullptr);
+            kernels::launch_flash_decode_split(
+                qb, kp, vp, btab_rows ? btab_rows : btable, seq, att,
+                fa_m, fa_l, fa_acc,
+                N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns,
+                1.f / sqrtf((float)c.head_dim), st, nullptr, -1,
+                ks, vs, kv8 ? 1 : 0, kv8 ? qg : nullptr);
+            // att/qg rows are contiguous at stride qdim, and the gate is elementwise, so one
+            // launch covers the whole block. N separate nodes cost N times the graph-node
+            // dependency latency for the same work.
             if (!kv8)
-                for (int i = 0; i < N; ++i)
-                    kernels::launch_qwen36_mul_sigmoid(att + (size_t)i * qdim,
-                                                        qg + (size_t)i * qdim, qdim, st);
+                kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
             supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
         }
         if (!supported) break;
@@ -1496,19 +1513,63 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
 verify_forward_done:
     int keep = 1;
     while (keep < N && token_ids[keep] == out_argmax[keep - 1]) ++keep;
-    for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
-        bf16* rq = rec_qkv + (size_t)L * N * lqkv;
-        bf16* rk = rec_k + (size_t)L * N * s.linear_qdim;
-        bf16* rv = rec_v + (size_t)L * N * lvdim;
-        bf16* ra = rec_a + (size_t)L * N * vh;
-        bf16* rb = rec_b + (size_t)L * N * vh;
-        bf16* conv_live = static_cast<bf16*>(s.lin_conv_state) +
-            (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
-        float* state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
-        kernels::launch_dflash_gdn_conv_commit(rq, conv_live, keep, c.linear_q_heads, vh,
-            c.linear_head_dim, c.linear_conv_kernel, st);
-        kernels::launch_dflash_gdn_scan_commit(rk, rv, ra, rb, s.w.layers[L].ssm_dt,
-            s.w.layers[L].ssm_a, state, keep, c.linear_q_heads, vh, c.linear_head_dim, st);
+    // Commit the accepted prefix into the live GDN state. This runs OUTSIDE the verify graph, on
+    // the same stream, and the next step's draft does not start until it drains — so its launches
+    // are on the critical path. One launch per GDN layer per commit meant 60 tiny serialized
+    // kernels for work that is independent across layers; drive all of them from one grid instead.
+    static const bool commit_layers = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_COMMIT_LAYERS");
+        return !(e && e[0] == '0');
+    }();
+    static thread_local const void* gdn_tbl_key = nullptr;
+    static thread_local int* d_gdn_layers = nullptr;
+    static thread_local dflash_kernels::GdnCommitLayer* d_gdn_w = nullptr;
+    static thread_local int n_gdn = 0;
+    if (commit_layers && gdn_tbl_key != &s.w) {
+        std::vector<int> ids;
+        std::vector<dflash_kernels::GdnCommitLayer> wts;
+        for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
+            ids.push_back(L);
+            wts.push_back({s.w.layers[L].ssm_dt, s.w.layers[L].ssm_a, L});
+        }
+        if (d_gdn_layers) cudaFree(d_gdn_layers);
+        if (d_gdn_w) cudaFree(d_gdn_w);
+        d_gdn_layers = nullptr; d_gdn_w = nullptr; n_gdn = 0;
+        if (!ids.empty() &&
+            cudaMalloc(&d_gdn_layers, ids.size() * sizeof(int)) == cudaSuccess &&
+            cudaMalloc(&d_gdn_w, wts.size() * sizeof(dflash_kernels::GdnCommitLayer)) == cudaSuccess) {
+            cudaMemcpy(d_gdn_layers, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_gdn_w, wts.data(), wts.size() * sizeof(dflash_kernels::GdnCommitLayer),
+                       cudaMemcpyHostToDevice);
+            n_gdn = (int)ids.size();
+            gdn_tbl_key = &s.w;
+        }
+    }
+    if (commit_layers && n_gdn > 0) {
+        dflash_kernels::launch_gdn_conv_commit_layers(
+            rec_qkv, (size_t)N * lqkv, s.lin_conv_state,
+            (size_t)(c.linear_conv_kernel - 1) * lqkv, d_gdn_layers, n_gdn, keep,
+            c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, st);
+        dflash_kernels::launch_gdn_scan_commit_layers(
+            rec_k, (size_t)N * s.linear_qdim, rec_v, (size_t)N * lvdim,
+            rec_a, (size_t)N * vh, rec_b, d_gdn_w,
+            s.lin_state, (size_t)vh * c.linear_head_dim * c.linear_head_dim,
+            n_gdn, keep, c.linear_q_heads, vh, c.linear_head_dim, st);
+    } else {
+        for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
+            bf16* rq = rec_qkv + (size_t)L * N * lqkv;
+            bf16* rk = rec_k + (size_t)L * N * s.linear_qdim;
+            bf16* rv = rec_v + (size_t)L * N * lvdim;
+            bf16* ra = rec_a + (size_t)L * N * vh;
+            bf16* rb = rec_b + (size_t)L * N * vh;
+            bf16* conv_live = static_cast<bf16*>(s.lin_conv_state) +
+                (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+            float* state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
+            kernels::launch_dflash_gdn_conv_commit(rq, conv_live, keep, c.linear_q_heads, vh,
+                c.linear_head_dim, c.linear_conv_kernel, st);
+            kernels::launch_dflash_gdn_scan_commit(rk, rv, ra, rb, s.w.layers[L].ssm_dt,
+                s.w.layers[L].ssm_a, state, keep, c.linear_q_heads, vh, c.linear_head_dim, st);
+        }
     }
     pf_cu(cudaStreamSynchronize(st), "verify commit");
     return keep;

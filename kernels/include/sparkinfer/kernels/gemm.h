@@ -109,6 +109,11 @@ void launch_mmvq_q80_f32(const void* q81, const void* W, float* y, int N, int K,
 bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream = nullptr);
 // GGUF dispatch for exact short-row projections (Q8_0=8, Q4_K=12, Q6_K=14).
+// Two bf16 weight matrices against one activation block in a single launch. Per-row results are
+// bit-identical to two launch_gemv_rows calls.
+bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, void* y1,
+                       int M, int N0, int N1, int K, cudaStream_t stream = nullptr);
+
 bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
                       int M, int N, int K, cudaStream_t stream = nullptr);
 // FP32-output counterpart for verifier logits. It preserves the serial decode reduction order.
