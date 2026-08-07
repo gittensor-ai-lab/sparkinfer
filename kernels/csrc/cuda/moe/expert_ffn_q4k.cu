@@ -570,6 +570,73 @@ __global__ void shared_gate_up_q8_mmvq_kernel(
     }
 }
 
+// H=2048 has exactly 64 Q8 blocks per shared-expert gate/up row. Two warps cover a
+// row without the two idle warps in the generic kernel; four rows share one 8-warp CTA.
+template <int H, int F>
+__global__ void shared_gate_up_q8_pack4_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
+    float* __restrict__ h_scratch) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int group = warp >> 1, sub = warp & 1;
+    const int f = blockIdx.x * 4 + group;
+    if (f >= F) return;
+    constexpr int NBLK = H >> 5;
+    const int b = sub * 32 + lane;
+    const unsigned char* gbase = gate_q + (size_t)f * NBLK * 34;
+    const unsigned char* ubase = up_q   + (size_t)f * NBLK * 34;
+    float tg = 0.f, tu = 0.f;
+    if (b < NBLK) {
+        tg = si_vec_dot_q8_0(gbase + (size_t)b * 34, vy + b);
+        tu = si_vec_dot_q8_0(ubase + (size_t)b * 34, vy + b);
+    }
+    __shared__ float sg[4][32], su[4][32];
+    if (sub) { sg[group][lane] = tg; su[group][lane] = tu; }
+    __syncthreads();
+    if (sub) return;
+    tg += sg[group][lane]; tu += su[group][lane];
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        tg += __shfl_xor_sync(0xffffffffu, tg, m);
+        tu += __shfl_xor_sync(0xffffffffu, tu, m);
+    }
+    if (lane == 0) {
+        const float w = dw ? __ldg(dw) : 1.f;
+        h_scratch[f] = w * q4kf_silu(tg) * tu;
+    }
+}
+
+// One warp can cover all 64 Q8 blocks by processing two blocks per lane. Packing
+// independent rows per CTA removes the cross-warp exchange and its block-wide barrier.
+template <int H, int F, int ROWS>
+__global__ void shared_gate_up_q8_warp_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
+    float* __restrict__ h_scratch) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int f = blockIdx.x * ROWS + warp;
+    if (f >= F) return;
+    constexpr int NBLK = H >> 5;
+    const unsigned char* gbase = gate_q + (size_t)f * NBLK * 34;
+    const unsigned char* ubase = up_q   + (size_t)f * NBLK * 34;
+    float tg = si_vec_dot_q8_0(gbase + (size_t)lane * 34, vy + lane);
+    float tu = si_vec_dot_q8_0(ubase + (size_t)lane * 34, vy + lane);
+#pragma unroll
+    for (int b = 32 + lane; b < NBLK; b += 32) {
+        tg += si_vec_dot_q8_0(gbase + (size_t)b * 34, vy + b);
+        tu += si_vec_dot_q8_0(ubase + (size_t)b * 34, vy + b);
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        tg += __shfl_xor_sync(0xffffffffu, tg, m);
+        tu += __shfl_xor_sync(0xffffffffu, tu, m);
+    }
+    if (lane == 0) {
+        const float w = dw ? __ldg(dw) : 1.f;
+        h_scratch[f] = w * q4kf_silu(tg) * tu;
+    }
+}
+
 template <int H, int F, bool ACCUM>
 __global__ void shared_down_q8_mmvq_kernel(
     const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
@@ -583,6 +650,29 @@ __global__ void shared_down_q8_mmvq_kernel(
         acc += si_vec_dot_q8_0(dbase + (size_t)b * 34, hq8 + b);
     acc = q4kf_wsum(acc);
     if (lane == 0) {
+        if constexpr (ACCUM) acc += __bfloat162float(out[h]);
+        out[h] = __float2bfloat16(acc);
+    }
+}
+
+// F=512 has 16 Q8 blocks per down row. Each half warp owns one output row, so all
+// lanes issue useful loads and an 8-warp CTA produces 16 rows instead of eight.
+template <int H, int F, bool ACCUM>
+__global__ void shared_down_q8_halfwarp_kernel(
+    const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
+    __nv_bfloat16* __restrict__ out) {
+    const int warp = threadIdx.x >> 5, lane16 = threadIdx.x & 15;
+    const int half = (threadIdx.x >> 4) & 1;
+    const int h = blockIdx.x * 16 + warp * 2 + half;
+    if (h >= H) return;
+    constexpr int NBLK = F >> 5;
+    const unsigned char* dbase = down_q + (size_t)h * NBLK * 34;
+    float acc = lane16 < NBLK
+        ? si_vec_dot_q8_0(dbase + (size_t)lane16 * 34, hq8 + lane16) : 0.f;
+#pragma unroll
+    for (int m = 8; m > 0; m >>= 1)
+        acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    if (lane16 == 0) {
         if constexpr (ACCUM) acc += __bfloat162float(out[h]);
         out[h] = __float2bfloat16(acc);
     }
@@ -1316,6 +1406,8 @@ void launch_moe_expert_ffn_q4k(
     if (gu_spec < 0) { const char* gs = getenv("SPARKINFER_GU_SPEC"); gu_spec = (gs && gs[0] == '0') ? 0 : 1; }
     static int gu_pack2 = -1;
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
+    static int gu_pack4 = -1;
+    if (gu_pack4 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK4"); gu_pack4 = (gp && gp[0] == '1') ? 1 : 0; }
     const int gu_pdl = gu_mmvq_pdl();
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
@@ -1329,7 +1421,13 @@ void launch_moe_expert_ffn_q4k(
                 reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
             q = qbuf;
         }
-        if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+        if (gu_pack4 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+            launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 3) / 4), dim3(16 * 32), 0, stream,
+                gate_up_mmvq2_pack4_qwen_kernel<2048, 512, 8>,
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
+                num_tokens * top_k * ffn);
+        else if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
             launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 1) / 2), dim3(8 * 32), 0, stream,
                 gate_up_mmvq2_pack2_qwen_kernel<2048, 512, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
@@ -1523,21 +1621,53 @@ void launch_shared_expert_q8_mmvq(
             reinterpret_cast<const __nv_bfloat16*>(input), qbuf, hidden);
         vy = qbuf;
     }
-    shared_gate_up_q8_mmvq_kernel<2048, 512><<<ffn, 4 * 32, 0, stream>>>(
-        vy, reinterpret_cast<const unsigned char*>(gate_q),
-        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    static int packed = -1;
+    if (packed < 0) {
+        const char* e = getenv("SPARKINFER_SHEXP_PACKED");
+        // The four-row warp kernel gives enough CTAs to cover the 5090 while keeping
+        // every lane useful. Explicit 0 restores the original kernels for A/B.
+        packed = !e ? 3 : ((e[0] >= '0' && e[0] <= '3') ? e[0] - '0' : 3);
+    }
+    if (packed == 3) {
+        shared_gate_up_q8_warp_kernel<2048, 512, 4><<<(ffn + 3) / 4, 4 * 32, 0, stream>>>(
+            vy, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    } else if (packed == 2) {
+        shared_gate_up_q8_warp_kernel<2048, 512, 8><<<(ffn + 7) / 8, 8 * 32, 0, stream>>>(
+            vy, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    } else if (packed == 1) {
+        shared_gate_up_q8_pack4_kernel<2048, 512><<<(ffn + 3) / 4, 8 * 32, 0, stream>>>(
+            vy, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    } else {
+        shared_gate_up_q8_mmvq_kernel<2048, 512><<<ffn, 4 * 32, 0, stream>>>(
+            vy, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch);
+    }
     const int nqb = ffn >> 5;
     quant_h_q8_1_kernel<<<(nqb + 7) / 8, 8 * 32, 0, stream>>>(
         h_scratch, qbuf, nqb, 0);
-    dim3 dn((hidden + WPB - 1) / WPB);
-    if (accum) {
-        shared_down_q8_mmvq_kernel<2048, 512, true><<<dn, WPB * 32, 0, stream>>>(
-            qbuf, reinterpret_cast<const unsigned char*>(down_q),
-            reinterpret_cast<__nv_bfloat16*>(output));
+    if (packed) {
+        dim3 dn((hidden + 15) / 16);
+        if (accum)
+            shared_down_q8_halfwarp_kernel<2048, 512, true><<<dn, WPB * 32, 0, stream>>>(
+                qbuf, reinterpret_cast<const unsigned char*>(down_q),
+                reinterpret_cast<__nv_bfloat16*>(output));
+        else
+            shared_down_q8_halfwarp_kernel<2048, 512, false><<<dn, WPB * 32, 0, stream>>>(
+                qbuf, reinterpret_cast<const unsigned char*>(down_q),
+                reinterpret_cast<__nv_bfloat16*>(output));
     } else {
-        shared_down_q8_mmvq_kernel<2048, 512, false><<<dn, WPB * 32, 0, stream>>>(
-            qbuf, reinterpret_cast<const unsigned char*>(down_q),
-            reinterpret_cast<__nv_bfloat16*>(output));
+        dim3 dn((hidden + WPB - 1) / WPB);
+        if (accum)
+            shared_down_q8_mmvq_kernel<2048, 512, true><<<dn, WPB * 32, 0, stream>>>(
+                qbuf, reinterpret_cast<const unsigned char*>(down_q),
+                reinterpret_cast<__nv_bfloat16*>(output));
+        else
+            shared_down_q8_mmvq_kernel<2048, 512, false><<<dn, WPB * 32, 0, stream>>>(
+                qbuf, reinterpret_cast<const unsigned char*>(down_q),
+                reinterpret_cast<__nv_bfloat16*>(output));
     }
 }
 #endif

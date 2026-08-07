@@ -1043,12 +1043,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             cudaStreamWaitEvent(s.stream_k, s.ev_pipe_fork, 0);
             cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
             if (w.shared_gate_inp) {
+                bool gate_sigmoid_done = false;
                 if (s.use_pq && w.shared_gate_inp_type == 12) {
                     if (s.use_llama) {
                         if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, s.stream_k);
-                        if (H == 2048)
+                        if (H == 2048) {
                             kernels::launch_mmvq_q4k_sigmoid(s.aq81, w.shared_gate_inp, s.d_shared_w, H, s.stream_k);
-                        else
+                            gate_sigmoid_done = true;
+                        } else
                             kernels::launch_mmvq_q4k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
                     } else {
                         kernels::launch_quantize_q8_1(s.hn, s.aq8, s.aq8_d, s.aq8_s, H, s.stream_k);
@@ -1071,12 +1073,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                         gemv_sigmoid = (e && e[0] == '1') ? 1 : 0; }   // default off: fused dot != split-k GEMV
                     if (gemv_sigmoid) {
                         kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.shared_gate_tmp, s.d_shared_w, H, s.stream_k);
+                        gate_sigmoid_done = true;
                     } else {
                         kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
-                        kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
                     }
                 }
-                if (w.shared_gate_inp && !(s.use_pq && s.use_llama && w.shared_gate_inp_type == 12 && H == 2048))
+                // All non-Q4_K paths above leave the gate logit in shared_gate_tmp. Apply the
+                // sigmoid exactly once here; the BF16 path previously launched this twice.
+                if (!gate_sigmoid_done)
                     kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
             }
             if (qmoe) {
