@@ -1053,7 +1053,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                         kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
                     }
                 }
-                if (w.shared_gate_inp && !(s.use_pq && s.use_llama && w.shared_gate_inp_type == 12 && H == 2048))
+                // The dense gate branch above already applies sigmoid (either fused into
+                // launch_gemv_sigmoid or as its split follow-up). Only quantized projections
+                // that leave a raw scalar in shared_gate_tmp need this common epilogue.
+                if (w.shared_gate_inp && w.shared_gate_inp_type != 0 &&
+                    !(s.use_pq && s.use_llama && w.shared_gate_inp_type == 12 && H == 2048))
                     kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
             }
             if (qmoe) {
