@@ -33,11 +33,19 @@ struct Qwen35PrefillCtx {
     const float*         moe_rs_gate;
     const float*         moe_rs_up;
     const float*         moe_rs_down;
+    int                  n_splits;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
 // Returns the argmax at the last prompt position (seed for the first decode step), or -1 if the
 // batched path is unsupported for this model/config (caller falls back to the token loop).
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n);
+
+// Exact short-block DFlash verifier. It evaluates all candidate rows from the live hybrid state,
+// commits only the accepted prefix, and leaves rejected KV rows outside the logical sequence.
+// Returns the number of consumed rows, or -1 when the exact fast path is unsupported.
+int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
+                            const int* capture_layers, int n_capture, void* capture_dst,
+                            int* out_argmax);
 
 } // namespace sparkinfer

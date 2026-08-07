@@ -570,6 +570,184 @@ __global__ void pf_gdn_scan_kernel(const __nv_bfloat16* __restrict__ q,
     for (int r = 0; r < NROW; r++) col[lane + r * 32] = sloc[r];
 }
 
+// DFlash verification scan. Arithmetic and reduction order match pf_gdn_scan_kernel, but the
+// register state is seeded from decode and each candidate's post-token state is checkpointed.
+// The live state is read-only, so a rejected suffix never needs rollback or replay.
+template <int COLS, int HEAD_DIM, bool WRITE_CHECKPOINT>
+__global__ void df_gdn_scan_checkpoint_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ alpha,
+    const __nv_bfloat16* __restrict__ beta, const __nv_bfloat16* __restrict__ dt,
+    const __nv_bfloat16* __restrict__ a, const float* __restrict__ live_state,
+    __nv_bfloat16* __restrict__ out, float* __restrict__ checkpoints,
+    int n_tokens, int q_heads, int v_heads) {
+    constexpr int NROW = HEAD_DIM / 32;
+    const int vh = blockIdx.x;
+    const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (vh >= v_heads || j >= HEAD_DIM) return;
+    const int qh = vh % q_heads;
+    const int q_dim = q_heads * HEAD_DIM;
+    const int v_dim = v_heads * HEAD_DIM;
+    const size_t state_elems = (size_t)v_heads * HEAD_DIM * HEAD_DIM;
+    const size_t col_off = ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+    const float scale = rsqrtf((float)HEAD_DIM);
+    const float a_h = pf_to_f(a[vh]);
+    const float dt_h = pf_to_f(dt[vh]);
+
+    float sloc[NROW];
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) sloc[r] = live_state[col_off + lane + r * 32];
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float bb = pf_sigmoid(pf_to_f(beta[(size_t)t * v_heads + vh]));
+        const float g = __expf(pf_softplus(pf_to_f(alpha[(size_t)t * v_heads + vh]) + dt_h) * a_h);
+        const __nv_bfloat16* qp = q + (size_t)t * q_dim + qh * HEAD_DIM;
+        const __nv_bfloat16* kp = k + (size_t)t * q_dim + qh * HEAD_DIM;
+        const __nv_bfloat16* vp = v + (size_t)t * v_dim + vh * HEAD_DIM;
+        float part_sk = 0.f;
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            part_sk += sloc[r] * pf_to_f(kp[i]);
+        }
+        const float sk = g * pf_wsum(part_sk);
+        const float delta = (pf_to_f(vp[j]) - sk) * bb;
+        float part_y = 0.f;
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            const float s_new = sloc[r] * g + pf_to_f(kp[i]) * delta;
+            sloc[r] = s_new;
+            part_y += s_new * pf_to_f(qp[i]) * scale;
+            if constexpr (WRITE_CHECKPOINT)
+                checkpoints[(size_t)t * state_elems + col_off + i] = s_new;
+        }
+        const float y = pf_wsum(part_y);
+        if (lane == 0) out[(size_t)t * v_dim + vh * HEAD_DIM + j] = __float2bfloat16(y);
+    }
+}
+
+// Commit only the accepted compact recurrence inputs. Verification already retained k/v and the
+// scalar gates for each row, so materializing N full state checkpoints is unnecessary: replay the
+// accepted prefix once into the live state. The update expression and reduction order are the
+// same as df_gdn_scan_checkpoint_kernel; q/output work is intentionally omitted because commit
+// happens after posterior selection.
+template <int COLS, int HEAD_DIM>
+__global__ void df_gdn_scan_commit_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ alpha, const __nv_bfloat16* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ dt, const __nv_bfloat16* __restrict__ a,
+    float* __restrict__ live_state, int n_tokens, int q_heads, int v_heads) {
+    constexpr int NROW = HEAD_DIM / 32;
+    const int vh = blockIdx.x;
+    const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (vh >= v_heads || j >= HEAD_DIM) return;
+    const int qh = vh % q_heads;
+    const int q_dim = q_heads * HEAD_DIM;
+    const int v_dim = v_heads * HEAD_DIM;
+    const size_t col_off = ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+    const float a_h = pf_to_f(a[vh]);
+    const float dt_h = pf_to_f(dt[vh]);
+
+    float sloc[NROW];
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) sloc[r] = live_state[col_off + lane + r * 32];
+    for (int t = 0; t < n_tokens; t++) {
+        const float bb = pf_sigmoid(pf_to_f(beta[(size_t)t * v_heads + vh]));
+        const float g = __expf(pf_softplus(pf_to_f(alpha[(size_t)t * v_heads + vh]) + dt_h) * a_h);
+        const __nv_bfloat16* kp = k + (size_t)t * q_dim + qh * HEAD_DIM;
+        const __nv_bfloat16* vp = v + (size_t)t * v_dim + vh * HEAD_DIM;
+        float part_sk = 0.f;
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            part_sk += sloc[r] * pf_to_f(kp[i]);
+        }
+        const float sk = g * pf_wsum(part_sk);
+        const float delta = (pf_to_f(vp[j]) - sk) * bb;
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            sloc[r] = sloc[r] * g + pf_to_f(kp[i]) * delta;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) live_state[col_off + lane + r * 32] = sloc[r];
+}
+
+// The convolution state is only the last conv_kernel-1 raw qkv rows. Commit therefore reduces to
+// a window splice from the original live history and the accepted qkv prefix; no convolution or
+// normalization needs to be repeated.
+__global__ void df_gdn_conv_commit_kernel(const __nv_bfloat16* __restrict__ qkv,
+                                          __nv_bfloat16* __restrict__ live_state,
+                                          int n_tokens, int qkv_dim, int conv_kernel) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= qkv_dim) return;
+    const int history = conv_kernel - 1;
+    for (int c = 0; c < history; c++) {
+        const int src_tok = n_tokens - history + c;
+        live_state[(size_t)c * qkv_dim + d] = src_tok >= 0
+            ? qkv[(size_t)src_tok * qkv_dim + d]
+            : live_state[(size_t)(c + n_tokens) * qkv_dim + d];
+    }
+}
+
+// DFlash causal-convolution counterpart. A single block owns one output head, seeds its rolling
+// window from decode state, and records the post-token window in decode layout for every row.
+template <bool WRITE_CHECKPOINT>
+__global__ void df_gdn_conv_checkpoint_kernel(
+    const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
+    const __nv_bfloat16* __restrict__ live_state, __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ checkpoints, int n_tokens, int q_heads, int v_heads,
+    int head_dim, int qkv_dim, int conv_kernel, float eps) {
+    const int q_dim = q_heads * head_dim;
+    const int v_dim = v_heads * head_dim;
+    const int blk = blockIdx.x, t = threadIdx.x;
+    int d, out_dim, hh; __nv_bfloat16* out; bool do_norm;
+    if (blk < q_heads) { hh = blk; d = hh * head_dim + t; out = q; out_dim = q_dim; do_norm = true; }
+    else if (blk < 2 * q_heads) { hh = blk - q_heads; d = q_dim + hh * head_dim + t; out = k; out_dim = q_dim; do_norm = true; }
+    else { hh = blk - 2 * q_heads; d = 2 * q_dim + hh * head_dim + t; out = v; out_dim = v_dim; do_norm = false; }
+    float w[8], hist[7];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) w[c] = c < conv_kernel ? pf_to_f(conv_w[(size_t)d * conv_kernel + c]) : 0.f;
+    #pragma unroll
+    for (int c = 0; c < 7; c++) hist[c] = c < conv_kernel - 1 ? pf_to_f(live_state[(size_t)c * qkv_dim + d]) : 0.f;
+    __shared__ float sw[32];
+    const int nwarp = (blockDim.x + 31) / 32;
+    const size_t state_elems = (size_t)(conv_kernel - 1) * qkv_dim;
+    for (int tok = 0; tok < n_tokens; tok++) {
+        const float cur = pf_to_f(qkv[(size_t)tok * qkv_dim + d]);
+        float y = cur * w[conv_kernel - 1];
+        #pragma unroll
+        for (int c = 0; c < 7; c++) if (c < conv_kernel - 1) y += hist[c] * w[c];
+        #pragma unroll
+        for (int c = 0; c < 6; c++) if (c < conv_kernel - 2) hist[c] = hist[c + 1];
+        if (conv_kernel >= 2) hist[conv_kernel - 2] = cur;
+        float cval = pf_silu(y);
+        if (do_norm) {
+            float ss = pf_wsum(cval * cval);
+            if ((t & 31) == 0) sw[t >> 5] = ss;
+            __syncthreads();
+            if (t < 32) {
+                float vv = t < nwarp ? sw[t] : 0.f;
+                vv = pf_wsum(vv);
+                if (t == 0) sw[0] = rsqrtf(vv + eps);
+            }
+            __syncthreads();
+            cval *= sw[0];
+        }
+        out[(size_t)tok * out_dim + hh * head_dim + t] = __float2bfloat16(cval);
+        if constexpr (WRITE_CHECKPOINT) {
+            #pragma unroll
+            for (int c = 0; c < 7; c++) if (c < conv_kernel - 1)
+                checkpoints[(size_t)tok * state_elems + (size_t)c * qkv_dim + d] = __float2bfloat16(hist[c]);
+        }
+    }
+}
+
 // ============================================================================
 // Batched gated RMSNorm: out = (x/rms(x)) * weight * silu(z), per (token, v_head).
 // One warp per (token, v_head). Mirrors gated_norm_warp_kernel.
@@ -883,6 +1061,91 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
     if (head_dim == 128)
         pf_gdn_scan_kernel<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
             qb, kb, vb, ab, bb, db, aa, state, ob, n_tokens, q_heads, v_heads);
+}
+
+void launch_dflash_gdn_conv(const void* qkv, const void* conv_w, const void* live_state,
+                            void* q, void* k, void* v, void* checkpoints,
+                            int n_tokens, int q_heads, int v_heads, int head_dim,
+                            int conv_kernel, float eps, cudaStream_t stream) {
+    if (n_tokens <= 0 || head_dim <= 0 || conv_kernel < 2 || conv_kernel > 8) return;
+    const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
+    df_gdn_conv_checkpoint_kernel<true><<<2 * q_heads + v_heads, head_dim, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
+        reinterpret_cast<const __nv_bfloat16*>(live_state), reinterpret_cast<__nv_bfloat16*>(q),
+        reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),
+        reinterpret_cast<__nv_bfloat16*>(checkpoints), n_tokens, q_heads, v_heads,
+        head_dim, qkv_dim, conv_kernel, eps);
+}
+
+void launch_dflash_gdn_scan(const void* q, const void* k, const void* v,
+                            const void* alpha, const void* beta, const void* dt, const void* a,
+                            const float* live_state, void* out, float* checkpoints,
+                            int n_tokens, int q_heads, int v_heads, int head_dim,
+                            cudaStream_t stream) {
+    if (n_tokens <= 0 || head_dim != 128) return;
+    constexpr int COLS = 4;
+    dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
+    df_gdn_scan_checkpoint_kernel<COLS, 128, true><<<grid, COLS * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(alpha),
+        reinterpret_cast<const __nv_bfloat16*>(beta), reinterpret_cast<const __nv_bfloat16*>(dt),
+        reinterpret_cast<const __nv_bfloat16*>(a), live_state,
+        reinterpret_cast<__nv_bfloat16*>(out), checkpoints, n_tokens, q_heads, v_heads);
+}
+
+void launch_dflash_gdn_conv_compact(const void* qkv, const void* conv_w,
+                                    const void* live_state, void* q, void* k, void* v,
+                                    int n_tokens, int q_heads, int v_heads, int head_dim,
+                                    int conv_kernel, float eps, cudaStream_t stream) {
+    if (n_tokens <= 0 || head_dim <= 0 || conv_kernel < 2 || conv_kernel > 8) return;
+    const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
+    df_gdn_conv_checkpoint_kernel<false><<<2 * q_heads + v_heads, head_dim, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
+        reinterpret_cast<const __nv_bfloat16*>(live_state), reinterpret_cast<__nv_bfloat16*>(q),
+        reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v), nullptr,
+        n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps);
+}
+
+void launch_dflash_gdn_scan_compact(const void* q, const void* k, const void* v,
+                                    const void* alpha, const void* beta,
+                                    const void* dt, const void* a, const float* live_state,
+                                    void* out, int n_tokens, int q_heads, int v_heads,
+                                    int head_dim, cudaStream_t stream) {
+    if (n_tokens <= 0 || head_dim != 128) return;
+    constexpr int COLS = 4;
+    dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
+    df_gdn_scan_checkpoint_kernel<COLS, 128, false><<<grid, COLS * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(alpha),
+        reinterpret_cast<const __nv_bfloat16*>(beta), reinterpret_cast<const __nv_bfloat16*>(dt),
+        reinterpret_cast<const __nv_bfloat16*>(a), live_state,
+        reinterpret_cast<__nv_bfloat16*>(out), nullptr, n_tokens, q_heads, v_heads);
+}
+
+void launch_dflash_gdn_conv_commit(const void* qkv, void* live_state, int n_tokens,
+                                   int q_heads, int v_heads, int head_dim, int conv_kernel,
+                                   cudaStream_t stream) {
+    if (n_tokens <= 0 || head_dim <= 0 || conv_kernel < 2 || conv_kernel > 8) return;
+    const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
+    constexpr int BLOCK = 256;
+    df_gdn_conv_commit_kernel<<<(qkv_dim + BLOCK - 1) / BLOCK, BLOCK, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkv),
+        reinterpret_cast<__nv_bfloat16*>(live_state), n_tokens, qkv_dim, conv_kernel);
+}
+
+void launch_dflash_gdn_scan_commit(const void* k, const void* v,
+                                   const void* alpha, const void* beta,
+                                   const void* dt, const void* a, float* live_state,
+                                   int n_tokens, int q_heads, int v_heads, int head_dim,
+                                   cudaStream_t stream) {
+    if (n_tokens <= 0 || head_dim != 128) return;
+    constexpr int COLS = 4;
+    dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
+    df_gdn_scan_commit_kernel<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(k), reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<const __nv_bfloat16*>(alpha), reinterpret_cast<const __nv_bfloat16*>(beta),
+        reinterpret_cast<const __nv_bfloat16*>(dt), reinterpret_cast<const __nv_bfloat16*>(a),
+        live_state, n_tokens, q_heads, v_heads);
 }
 
 void launch_prefill_gated_norm(const void* x, const void* z, const void* weight, void* out,

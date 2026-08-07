@@ -80,6 +80,12 @@ void launch_quantize_q8_1_rows(const void* x, void* y, int K, int rows, int x_st
                                cudaStream_t stream = nullptr);
 void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
+
+// Exact short-row target verifier: M contiguous Q8_1 activations against one Q4_K matrix.
+// Preserves launch_mmvq_q4k's four-warp dot/reduction order independently for every row while
+// sharing the weight traffic within a CTA. y is row-major [M,N]. Returns false if unsupported.
+bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
+                          int M, int N, int K, cudaStream_t stream = nullptr);
 // Fused GDN qkv+z Q4_K MMVQ (shared Q8_1 activation). K is hidden (2048 -> NSUPER=8, 4096 -> 16).
 void launch_mmvq_gdn_qkv_z_pack2(const void* q81, const void* qkv_w, const void* z_w,
                                  void* qkv_out, void* z_out, int n_qkv, int n_z, int K,
@@ -89,9 +95,21 @@ void launch_mmvq_q4k_sigmoid(const void* q81, const void* W, float* out, int K, 
 // Same, for Q6_K weights (attn-V upgrades + LM head). q81 = block_q8_1(activation).
 void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
+// Exact short-row Q6_K target projection, matching the four-warp decode association per row.
+bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
+                          int M, int N, int K, cudaStream_t stream = nullptr);
 // Q8_0 x Q8_1 dp4a mmvq (Qwen3.6 UD attention/GDN projections kept int8 on device)
 void launch_mmvq_q80(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q80_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
+// Exact short-row Q8_0 target projection, matching the four-warp decode association per row.
+bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
+                          int M, int N, int K, cudaStream_t stream = nullptr);
+// GGUF dispatch for exact short-row projections (Q8_0=8, Q4_K=12, Q6_K=14).
+bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
+                      int M, int N, int K, cudaStream_t stream = nullptr);
+// FP32-output counterpart for verifier logits. It preserves the serial decode reduction order.
+bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
+                          int M, int N, int K, cudaStream_t stream = nullptr);
 // GDN: four Q4_K projections from one block_q8_1 activation in a single grid (K=2048).
 void launch_gdn_quad_mmvq_q4k(const void* q81,
     const void* W0, const void* W1, const void* W2, const void* W3,

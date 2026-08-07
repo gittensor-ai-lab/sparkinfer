@@ -53,6 +53,12 @@ __global__ void sigmoid_scalar_kernel(const __nv_bfloat16* __restrict__ x,
     out[0] = q36_sigmoid(q36_to_f(x[0]));
 }
 
+__global__ void sigmoid_rows_kernel(const __nv_bfloat16* __restrict__ x,
+                                    float* __restrict__ out, int rows) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < rows) out[r] = q36_sigmoid(q36_to_f(x[r]));
+}
+
 // Shared-expert SwiGLU: out[i] = dw * SiLU(gate[i]) * up[i]. The shared-expert
 // gate scalar dw folds in here (down is linear, so scaling the intermediate is
 // identical to scaling the output), letting the caller finish with a plain add.
@@ -63,6 +69,19 @@ __global__ void shared_swiglu_kernel(const __nv_bfloat16* __restrict__ gate,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = __float2bfloat16((*dw) * q36_silu(q36_to_f(gate[i])) * q36_to_f(up[i]));
+}
+
+
+__global__ void shared_swiglu_rows_kernel(const __nv_bfloat16* __restrict__ gate,
+                                          const __nv_bfloat16* __restrict__ up,
+                                          const float* __restrict__ dw,
+                                          __nv_bfloat16* __restrict__ out,
+                                          int rows, int ffn) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = rows * ffn;
+    if (i >= n) return;
+    const int row = i / ffn;
+    out[i] = __float2bfloat16(dw[row] * q36_silu(q36_to_f(gate[i])) * q36_to_f(up[i]));
 }
 
 __global__ void conv_split_kernel(const __nv_bfloat16* __restrict__ qkv,
@@ -458,6 +477,16 @@ void launch_qwen36_shared_swiglu(const void* gate_bf16, const void* up_bf16,
         dw_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16), n);
 }
 
+void launch_qwen36_shared_swiglu_rows(const void* gate_bf16, const void* up_bf16,
+                                      const float* dw_f32, void* out_bf16,
+                                      int rows, int ffn, cudaStream_t stream) {
+    const int n = rows * ffn;
+    shared_swiglu_rows_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(up_bf16), dw_f32,
+        reinterpret_cast<__nv_bfloat16*>(out_bf16), rows, ffn);
+}
+
 void launch_qwen36_split_q_gate(const void* qg_bf16, void* q_bf16, void* gate_bf16,
                                 int n_heads, int head_dim, cudaStream_t stream) {
     const int n = n_heads * head_dim;
@@ -478,6 +507,14 @@ void launch_qwen36_sigmoid_scalar(const void* x_bf16, float* out_f32,
                                   cudaStream_t stream) {
     sigmoid_scalar_kernel<<<1, 1, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_bf16), out_f32);
+}
+
+
+void launch_qwen36_sigmoid_rows(const void* x_bf16, float* out_f32, int rows,
+                                cudaStream_t stream) {
+    if (rows <= 0) return;
+    sigmoid_rows_kernel<<<(rows + 31) / 32, 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16), out_f32, rows);
 }
 
 void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,

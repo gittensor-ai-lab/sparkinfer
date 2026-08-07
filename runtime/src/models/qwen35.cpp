@@ -1562,7 +1562,7 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
                           lin_state, lin_conv,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
-                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down };
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits };
     return prefill_batched_run(ctx, prompt_ids, n);
 }
 
@@ -1785,11 +1785,19 @@ bool Qwen35Model::verify_block(const int* token_ids, int n, int start_pos, int* 
 }
 
 bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bool /*resume_gdn*/,
-                                  int* out_argmax, const void* /*dflash_capture_dst*/) {
-    // Phase 3 gate: true batched hybrid verify (multi-token GDN+MoE) lands only after
-    // SPEC_AGREE + single-stream speedup. Token-loop verify is correct for GDN advance.
-    // Full-block accept in dflash_generate already skips rollback when accept==B-1.
-    return verify_block(token_ids, n, start_pos, out_argmax);
+                                  int* out_argmax, const void* dflash_capture_dst) {
+    Impl& s = *p_;
+    auto it = s.sessions.find(s.active_seq_id);
+    float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;
+    bf16* lin_conv = (it != s.sessions.end()) ? it->second.lin_conv_state : s.lin_conv_state;
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
+                          lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits };
+    const int consumed = dflash_verify_short_run(ctx, token_ids, n, start_pos,
+                                                  s.dflash_layer_ids.data(), s.dflash_n_cap,
+                                                  const_cast<void*>(dflash_capture_dst), out_argmax);
+    return consumed > 0;
 }
 
 std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, int max_new,
@@ -1860,6 +1868,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 3;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
+    // 0=off, 1=force, 2=adaptive (default). Adaptive preserves early-exit verification on
+    // low-acceptance workloads and switches to the weight-reusing four-row graph only after two
+    // consecutive full-block accepts.
+    static const int compact_mode = []{
+        const char* e = getenv("SPARKINFER_DFLASH_COMPACT_VERIFY");
+        return e ? atoi(e) : 2;
+    }();
+    int compact_score = 0;
     bf16* th_scratch = nullptr;
     const int row_stride = dflash_hidden_row_stride();
     if (cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)) != cudaSuccess) {
@@ -1870,6 +1886,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     }
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
+        const bool compact_verify = compact_mode == 1 || (compact_mode != 0 && compact_score >= 2);
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 
@@ -1889,13 +1906,16 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // draft block on its own stream. Ordering matters: the target must be in flight before
         // the draft's launches start, or the draft queues ahead of it. A deferred collect also
         // avoids spawning and joining a std::thread on every decode step.
-        set_dflash_capture_row(0);
-        s.defer_decode_sync = true;
-        int p0 = forward_token(block[0], start, true);
-        s.defer_decode_sync = false;
+        int p0 = -1;
+        if (!compact_verify) {
+            set_dflash_capture_row(0);
+            s.defer_decode_sync = true;
+            p0 = forward_token(block[0], start, true);
+            s.defer_decode_sync = false;
+        }
         const bool draft_ok = draft.forward_block(
             draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr);
-        if (p0 == kDFlashDeferred) {
+        if (!compact_verify && p0 == kDFlashDeferred) {
             cu(cudaStreamSynchronize(s.stream), "verify0 sync");
             s.decode_pending = false;
             p0 = *s.h_out_id;
@@ -1912,9 +1932,19 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // restore / KV-truncate / replay needed (greedy speculative decoding is exact). Rejected
         // proposals (block[keep..B-1]) are never forwarded, saving ~B-keep target forwards/step.
         int accept = 0, keep = 1;
-        bool vfail = p0 < 0;
-        posterior[0] = p0;
-        if (!vfail && block[1] == p0) {
+        bool vfail = false;
+        if (compact_verify) {
+            const int vn = kProposalDepth + 1;
+            vfail = !batched_forward(block.data(), vn, start, false, posterior.data(), s.dflash_hidden);
+            if (!vfail) {
+                while (accept < kProposalDepth && block[accept + 1] == posterior[accept]) ++accept;
+                keep = accept + 1;
+            }
+        } else {
+            vfail = p0 < 0;
+            posterior[0] = p0;
+        }
+        if (!compact_verify && !vfail && block[1] == p0) {
             for (int i = 1; i <= kProposalDepth; i++) {
                 set_dflash_capture_row(i);
                 const int p = forward_token(block[i], start + i, true);
@@ -1926,6 +1956,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             }
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
+        compact_score = keep == kProposalDepth + 1 ? std::min(compact_score + 1, 3) : 0;
         // forward_token() synchronizes after sampling, so the accepted capture rows are already
         // stable. The draft consumes only this newly accepted suffix; its KV cache retains all
         // earlier context. Hand the capture buffer over directly instead of copying it to a second

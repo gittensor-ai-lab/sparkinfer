@@ -661,6 +661,58 @@ template __global__ void si_mmvq_q80_kfixed_kernel<float, 64>(const si_block_q8_
 #ifndef _MSC_VER
 template __global__ void si_mmvq_q80_kfixed_kernel<float, 128>(const si_block_q8_1*, const unsigned char*, float*, int);
 #endif
+template <typename OutT, int NBLOCKS, int MMAX>
+__global__ void si_mmvq_q80_rows_exact_kernel(const si_block_q8_1* __restrict__ q,
+                                              const unsigned char* __restrict__ W,
+                                              OutT* __restrict__ y, int M, int N) {
+    constexpr int NW = 4, WS = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const unsigned char* w_row = W + (size_t)row * NBLOCKS * 34;
+    float tmp[MMAX];
+    #pragma unroll
+    for (int m = 0; m < MMAX; m++) tmp[m] = 0.f;
+    #pragma unroll
+    for (int kb = tid; kb < NBLOCKS; kb += NW * WS) {
+        #pragma unroll
+        for (int m = 0; m < MMAX; m++) {
+            if (m < M)
+                tmp[m] += si_vec_dot_q8_0_mmvq(w_row + (size_t)kb * 34,
+                                               q + (size_t)m * NBLOCKS + kb);
+        }
+    }
+    __shared__ float partial[MMAX][NW - 1][WS];
+    if (warp > 0) {
+        #pragma unroll
+        for (int m = 0; m < MMAX; m++) if (m < M) partial[m][warp - 1][lane] = tmp[m];
+    }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int m = 0; m < MMAX; m++) {
+        if (m >= M) break;
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) tmp[m] += partial[m][l][lane];
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) tmp[m] += __shfl_xor_sync(0xffffffff, tmp[m], s);
+        if (lane == 0) gemv_write(y + (size_t)m * N + row, tmp[m]);
+    }
+}
+#ifndef _MSC_VER
+template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 64, 4>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 128, 4>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 16, 4>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<float, 16, 4>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<float, 64, 4>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<float, 128, 4>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+#endif
 template <typename OutT, int NSUPER>
 __global__ void si_mmvq_q4k_kfixed_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
                                           OutT* __restrict__ y, int N) {
@@ -698,6 +750,60 @@ template __global__ void si_mmvq_q4k_kfixed_kernel<float, 8>(const si_block_q8_1
 #endif
 #ifndef _MSC_VER
 template __global__ void si_mmvq_q4k_kfixed_kernel<float, 16>(const si_block_q8_1*, const unsigned char*, float*, int);
+#endif
+// Short-row Q4_K MMVQ for exact target verification. The thread-to-fragment mapping and the
+// two-stage four-warp reduction are identical to si_mmvq_q4k_kfixed_kernel. Each CTA owns one
+// weight row and evaluates up to four activation rows before eviction, turning repeated HBM
+// reads into intra-CTA cache hits without changing any per-row floating-point association.
+template <typename OutT, int NSUPER, int MMAX>
+__global__ void si_mmvq_q4k_rows_exact_kernel(const si_block_q8_1* __restrict__ q,
+                                              const unsigned char* __restrict__ W,
+                                              OutT* __restrict__ y, int M, int N) {
+    constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
+    constexpr int QPR = NSUPER * 8;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const si_block_q4_K* x_row = reinterpret_cast<const si_block_q4_K*>(
+        W + (size_t)row * NSUPER * 144);
+    constexpr int blocks_per_iter = vdr * NW * WS / qi;
+    float tmp[MMAX];
+    #pragma unroll
+    for (int m = 0; m < MMAX; m++) tmp[m] = 0.f;
+    #pragma unroll
+    for (int kbx = tid / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
+        const int kqs = vdr * (tid % (qi / vdr));
+        #pragma unroll
+        for (int m = 0; m < MMAX; m++) {
+            if (m < M) tmp[m] += si_vec_dot_q4_K(x_row + kbx, q + (size_t)m * QPR + kbx * 8, kqs);
+        }
+    }
+    __shared__ float partial[MMAX][NW - 1][WS];
+    if (warp > 0) {
+        #pragma unroll
+        for (int m = 0; m < MMAX; m++) if (m < M) partial[m][warp - 1][lane] = tmp[m];
+    }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int m = 0; m < MMAX; m++) {
+        if (m >= M) break;
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) tmp[m] += partial[m][l][lane];
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) tmp[m] += __shfl_xor_sync(0xffffffff, tmp[m], s);
+        if (lane == 0) gemv_write(y + (size_t)m * N + row, tmp[m]);
+    }
+}
+#ifndef _MSC_VER
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 4>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 4>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 4>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 4>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
 #endif
 // One block per row index: warps 0-3 -> qkv[row], warps 4-7 -> z[row], keeping vy hot
 // in L2 across both when row < min(n_qkv, n_z). Grid = max(n_qkv, n_z).
@@ -1023,6 +1129,61 @@ template __global__ void si_mmvq_q6k_kfixed_kernel<float, 8>(const si_block_q8_1
 #endif
 #ifndef _MSC_VER
 template __global__ void si_mmvq_q6k_kfixed_kernel<float, 16>(const si_block_q8_1*, const unsigned char*, float*, int);
+#endif
+
+// Exact short-row Q6_K counterpart to si_mmvq_q4k_rows_exact_kernel. Four warps retain the
+// decode kernel's fragment ownership and two-stage reduction for every activation row, while the
+// CTA keeps the shared weight row hot across up to four verifier candidates.
+template <typename OutT, int NSUPER, int MMAX>
+__global__ void si_mmvq_q6k_rows_exact_kernel(const si_block_q8_1* __restrict__ q,
+                                              const unsigned char* __restrict__ W,
+                                              OutT* __restrict__ y, int M, int N) {
+    constexpr int NW = 4, WS = 32, vdr = 1, qi = 32;
+    constexpr int QPR = NSUPER * 8;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const unsigned char* x_row = W + (size_t)row * NSUPER * 210;
+    constexpr int blocks_per_iter = vdr * NW * WS / qi;
+    float tmp[MMAX];
+    #pragma unroll
+    for (int m = 0; m < MMAX; m++) tmp[m] = 0.f;
+    #pragma unroll
+    for (int kbx = tid / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
+        const int kqs = vdr * (tid % (qi / vdr));
+        #pragma unroll
+        for (int m = 0; m < MMAX; m++) {
+            if (m < M)
+                tmp[m] += si_vec_dot_q6_K(x_row + (size_t)kbx * 210,
+                                           q + (size_t)m * QPR + kbx * 8, kqs);
+        }
+    }
+    __shared__ float partial[MMAX][NW - 1][WS];
+    if (warp > 0) {
+        #pragma unroll
+        for (int m = 0; m < MMAX; m++) if (m < M) partial[m][warp - 1][lane] = tmp[m];
+    }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int m = 0; m < MMAX; m++) {
+        if (m >= M) break;
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) tmp[m] += partial[m][l][lane];
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) tmp[m] += __shfl_xor_sync(0xffffffff, tmp[m], s);
+        if (lane == 0) gemv_write(y + (size_t)m * N + row, tmp[m]);
+    }
+}
+#ifndef _MSC_VER
+template __global__ void si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 4>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 4>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q6k_rows_exact_kernel<float, 8, 4>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q6k_rows_exact_kernel<float, 16, 4>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
 #endif
 // 1-warp-per-row Q6_K dp4a GEMV: keeps the fp32 gemv_q block structure (GEMV_WPB rows/block,
 // well-occupied for large N like the LM head's 151936 rows) but dp4a instead of fp32 dequant.
@@ -1467,6 +1628,91 @@ void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K,
     else if (K == 2048)      si_mmvq_q4k_kfixed_kernel<float, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
     else if (K == 4096) si_mmvq_q4k_kfixed_kernel<float, 16><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
     else                si_mmvq_q4k_kernel<float><<<N, 4 * 32, 0, stream>>>(q, w, y, N, K);
+}
+bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
+                          int M, int N, int K, cudaStream_t stream) {
+    if (M < 1 || M > 4 || N < 1 || (K != 2048 && K != 4096)) return false;
+    if (K == 2048)
+        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 4><<<N, 4 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
+            reinterpret_cast<__nv_bfloat16*>(y), M, N);
+    else
+        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 4><<<N, 4 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
+            reinterpret_cast<__nv_bfloat16*>(y), M, N);
+    return true;
+}
+bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
+                          int M, int N, int K, cudaStream_t stream) {
+    if (M < 1 || M > 4 || N < 1 || (K != 2048 && K != 4096)) return false;
+    if (K == 2048)
+        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 4><<<N, 4 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81),
+            reinterpret_cast<const unsigned char*>(W),
+            reinterpret_cast<__nv_bfloat16*>(y), M, N);
+    else
+        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 4><<<N, 4 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81),
+            reinterpret_cast<const unsigned char*>(W),
+            reinterpret_cast<__nv_bfloat16*>(y), M, N);
+    return true;
+}
+bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
+                          int M, int N, int K, cudaStream_t stream) {
+    if (M < 1 || M > 4 || N < 1 || (K != 512 && K != 2048 && K != 4096)) return false;
+    if (K == 512)
+        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 16, 4><<<N, 4 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81),
+            reinterpret_cast<const unsigned char*>(W),
+            reinterpret_cast<__nv_bfloat16*>(y), M, N);
+    else if (K == 2048)
+        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 64, 4><<<N, 4 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81),
+            reinterpret_cast<const unsigned char*>(W),
+            reinterpret_cast<__nv_bfloat16*>(y), M, N);
+    else
+        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 128, 4><<<N, 4 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81),
+            reinterpret_cast<const unsigned char*>(W),
+            reinterpret_cast<__nv_bfloat16*>(y), M, N);
+    return true;
+}
+bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
+                      int M, int N, int K, cudaStream_t stream) {
+    if (qtype == 12) return launch_mmvq_q4k_rows(q81, W, y, M, N, K, stream);
+    if (qtype == 14) return launch_mmvq_q6k_rows(q81, W, y, M, N, K, stream);
+    if (qtype == 8)  return launch_mmvq_q80_rows(q81, W, y, M, N, K, stream);
+    return false;
+}
+bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
+                          int M, int N, int K, cudaStream_t stream) {
+    if (M < 1 || M > 4 || N < 1) return false;
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const auto* w = reinterpret_cast<const unsigned char*>(W);
+    if (qtype == 12 && (K == 2048 || K == 4096)) {
+        if (K == 2048)
+            si_mmvq_q4k_rows_exact_kernel<float, 8, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else
+            si_mmvq_q4k_rows_exact_kernel<float, 16, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        return true;
+    }
+    if (qtype == 14 && (K == 2048 || K == 4096)) {
+        if (K == 2048)
+            si_mmvq_q6k_rows_exact_kernel<float, 8, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else
+            si_mmvq_q6k_rows_exact_kernel<float, 16, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        return true;
+    }
+    if (qtype == 8 && (K == 512 || K == 2048 || K == 4096)) {
+        if (K == 512)
+            si_mmvq_q80_rows_exact_kernel<float, 16, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else if (K == 2048)
+            si_mmvq_q80_rows_exact_kernel<float, 64, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else
+            si_mmvq_q80_rows_exact_kernel<float, 128, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        return true;
+    }
+    return false;
 }
 void launch_mmvq_q80(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream) {
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);

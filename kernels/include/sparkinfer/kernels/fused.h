@@ -24,6 +24,10 @@ void launch_add_rmsnorm2(const void* x_bf16, const void* residual_bf16, const vo
 void launch_add_rmsnorm2_q8(const void* x_bf16, const void* residual_bf16, const void* weight_bf16,
                             void* out_sum_bf16, void* out_norm_bf16, void* out_q8,
                             int cols, float eps, cudaStream_t stream = nullptr);
+void launch_add_rmsnorm2_q8_rows(const void* x_bf16, const void* residual_bf16,
+                                 const void* weight_bf16, void* out_sum_bf16,
+                                 void* out_norm_bf16, void* out_q8, int rows, int cols,
+                                 float eps, cudaStream_t stream = nullptr);
 
 // Fold residual_add(res1,res2) into add_rmsnorm2: out_sum = x + (res1 + res2).
 void launch_add_rmsnorm3(const void* x_bf16, const void* res1_bf16, const void* res2_bf16,
@@ -32,6 +36,10 @@ void launch_add_rmsnorm3(const void* x_bf16, const void* res1_bf16, const void* 
 void launch_add_rmsnorm3_q8(const void* x_bf16, const void* res1_bf16, const void* res2_bf16,
                             const void* weight_bf16, void* out_sum_bf16, void* out_norm_bf16,
                             void* out_q8, int cols, float eps, cudaStream_t stream = nullptr);
+void launch_add_rmsnorm3_q8_rows(const void* x_bf16, const void* res1_bf16,
+                                 const void* res2_bf16, const void* weight_bf16,
+                                 void* out_sum_bf16, void* out_norm_bf16, void* out_q8,
+                                 int rows, int cols, float eps, cudaStream_t stream = nullptr);
 
 // Fused per-head Q-norm + K-norm in one kernel (1 graph node vs 2). In-place on q/k.
 void launch_rmsnorm_qk(void* q, void* k, const void* q_w, const void* k_w,
@@ -59,11 +67,16 @@ void launch_qwen36_mul_sigmoid(void* x_bf16, const void* gate_bf16, int n,
 
 void launch_qwen36_sigmoid_scalar(const void* x_bf16, float* out_f32,
                                   cudaStream_t stream = nullptr);
+void launch_qwen36_sigmoid_rows(const void* x_bf16, float* out_f32, int rows,
+                                cudaStream_t stream = nullptr);
 
 // Shared-expert SwiGLU with folded gate scalar: out[i] = dw * SiLU(gate[i]) * up[i].
 void launch_qwen36_shared_swiglu(const void* gate_bf16, const void* up_bf16,
                                  const float* dw_f32, void* out_bf16, int n,
                                  cudaStream_t stream = nullptr);
+void launch_qwen36_shared_swiglu_rows(const void* gate_bf16, const void* up_bf16,
+                                      const float* dw_f32, void* out_bf16,
+                                      int rows, int ffn, cudaStream_t stream = nullptr);
 
 void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
                                  void* conv_state_bf16, void* q_bf16, void* k_bf16,

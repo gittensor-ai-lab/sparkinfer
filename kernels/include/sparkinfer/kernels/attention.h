@@ -52,6 +52,16 @@ void launch_qknorm_rope_kv_partial(
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
     float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
 
+// DFlash short-block continuation for one sequence. `positions` has n_tokens absolute positions,
+// while `block_table` is a single sequence row (not n_tokens repeated rows). Math and bf16 KV
+// layout are identical to launch_qknorm_rope_kv_partial.
+void launch_dflash_qknorm_rope_kv_partial(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int max_blocks_per_seq,
+    cudaStream_t stream = nullptr);
+
 // Fused QK-norm + partial-RoPE + int8 KV-append for Qwen3.6 hd256 full-attn layers.
 void launch_qknorm_rope_kv_partial_int8(
     void* q, void* k, const void* v, const void* q_w, const void* k_w,
@@ -67,6 +77,15 @@ void launch_qknorm_rope_kv_partial_int8_gated(
     const int* block_table, const int* positions,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
     float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
+
+// Exact DFlash continuation variant: all candidate positions share one sequence block-table row.
+void launch_dflash_qknorm_rope_kv_partial_int8_gated(
+    const void* qraw, void* q, void* qgate, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, void* k_scale, void* v_scale,
+    const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int max_blocks_per_seq,
+    cudaStream_t stream = nullptr);
 
 // Variant for models with partial rotary embeddings (e.g. Qwen3.6: 64 of 256
 // dimensions rotate, the remaining per-head dimensions are copied unchanged).

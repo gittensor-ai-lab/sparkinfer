@@ -249,6 +249,7 @@ template __global__ void qknorm_rope_kv_kernel<true>(
 #endif
 // Fused QK-norm + partial-RoPE + KV-append for Qwen3.6 (rope_dim < head_dim). One kernel per head
 // replaces launch_rmsnorm_qk + launch_rope_kv_append_partial on the 10 full-attn layers.
+template <bool SINGLE_SEQUENCE>
 __global__ void qknorm_rope_kv_partial_kernel(
     __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
@@ -263,7 +264,8 @@ __global__ void qknorm_rope_kv_partial_kernel(
     const int rhalf = rotary_dim >> 1;
     const int pos  = positions[tok];
     const int blk = pos / block_size, within = pos % block_size;
-    const size_t ctok = (size_t)((size_t)block_table[tok * max_blocks_per_seq + blk] * block_size + within);
+    const int table_row = SINGLE_SEQUENCE ? 0 : tok * max_blocks_per_seq;
+    const size_t ctok = (size_t)((size_t)block_table[table_row + blk] * block_size + within);
 
     const bool is_v = (b >= n_q_heads + n_kv_heads);
     if (is_v) {
@@ -570,6 +572,7 @@ __global__ void qknorm_rope_kv_partial_int8_kernel(
 
 // Gated Qwen3.6 full-attn: read Q from qraw (2*head_dim interleaved), extract gate,
 // RMSNorm + partial RoPE in-place to q, then K/V int8 KV-append (same as int8 variant).
+template <bool SINGLE_SEQUENCE>
 __global__ void qknorm_rope_kv_partial_int8_gated_kernel(
     const __nv_bfloat16* __restrict__ qraw, __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ qgate,
@@ -587,7 +590,7 @@ __global__ void qknorm_rope_kv_partial_int8_gated_kernel(
     const int rhalf = rotary_dim >> 1;
     const int pos    = positions[tok];
     const int blk    = pos / block_size, within = pos % block_size;
-    const int phys   = block_table[tok * max_blocks_per_seq + blk];
+    const int phys   = block_table[(SINGLE_SEQUENCE ? 0 : tok * max_blocks_per_seq) + blk];
     const size_t ctok = (size_t)(phys * block_size + within);
 
     extern __shared__ float s_h[];
@@ -731,7 +734,24 @@ void launch_qknorm_rope_kv_partial(
 ) {
     dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
     const int smem = head_dim * sizeof(float);
-    qknorm_rope_kv_partial_kernel<<<grid, head_dim, smem, stream>>>(
+    qknorm_rope_kv_partial_kernel<false><<<grid, head_dim, smem, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
+        block_size, max_blocks_per_seq, eps);
+}
+
+void launch_dflash_qknorm_rope_kv_partial(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream
+) {
+    dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
+    const int smem = head_dim * sizeof(float);
+    qknorm_rope_kv_partial_kernel<true><<<grid, head_dim, smem, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
         reinterpret_cast<const __nv_bfloat16*>(v),
         reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
@@ -821,7 +841,26 @@ void launch_qknorm_rope_kv_partial_int8_gated(
     float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream) {
     dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
     const int smem = head_dim * (int)sizeof(float);
-    qknorm_rope_kv_partial_int8_gated_kernel<<<grid, head_dim, smem, stream>>>(
+    qknorm_rope_kv_partial_int8_gated_kernel<false><<<grid, head_dim, smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qraw), reinterpret_cast<__nv_bfloat16*>(q),
+        reinterpret_cast<__nv_bfloat16*>(qgate),
+        reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool),
+        reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
+        block_size, max_blocks_per_seq, eps);
+}
+
+void launch_dflash_qknorm_rope_kv_partial_int8_gated(
+    const void* qraw, void* q, void* qgate, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, void* k_scale, void* v_scale,
+    const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+    dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
+    const int smem = head_dim * (int)sizeof(float);
+    qknorm_rope_kv_partial_int8_gated_kernel<true><<<grid, head_dim, smem, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(qraw), reinterpret_cast<__nv_bfloat16*>(q),
         reinterpret_cast<__nv_bfloat16*>(qgate),
         reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<const __nv_bfloat16*>(v),

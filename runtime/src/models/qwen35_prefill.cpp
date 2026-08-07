@@ -22,12 +22,14 @@
 #include "sparkinfer/kernels/prefill_router_mma.h"
 #include "sparkinfer/kernels/prefill_moe_q.h"
 #include "sparkinfer/kernels/moe.h"
+#include "sparkinfer/kernels/attention.h"
 
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace sparkinfer {
@@ -40,15 +42,30 @@ inline void pf_cu(cudaError_t e, const char* what) {
 // Simple device-buffer arena: all-or-nothing allocation with one free() at the end.
 struct Arena {
     std::vector<void*> bufs;
+    std::vector<size_t> sizes;
+    size_t cursor = 0;
     bool ok = true;
     template <class T> T* alloc(size_t n) {
-        void* p = nullptr;
         if (n == 0) n = 1;
-        if (cudaMalloc(&p, n * sizeof(T)) != cudaSuccess) { ok = false; return nullptr; }
-        bufs.push_back(p);
+        const size_t bytes = n * sizeof(T);
+        void* p = nullptr;
+        if (cursor < bufs.size() && sizes[cursor] >= bytes) {
+            p = bufs[cursor++];
+            return static_cast<T*>(p);
+        }
+        if (cursor < bufs.size()) {
+            cudaFree(bufs[cursor]);
+            bufs.erase(bufs.begin() + cursor);
+            sizes.erase(sizes.begin() + cursor);
+        }
+        if (cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
+        bufs.insert(bufs.begin() + cursor, p);
+        sizes.insert(sizes.begin() + cursor, bytes);
+        ++cursor;
         return static_cast<T*>(p);
     }
-    void free_all() { for (void* b : bufs) cudaFree(b); bufs.clear(); }
+    void rewind() { cursor = 0; ok = true; }
+    void free_all() { for (void* b : bufs) cudaFree(b); bufs.clear(); sizes.clear(); cursor = 0; }
 };
 } // namespace
 
@@ -1167,6 +1184,310 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     am.free_all();
     aw.free_all();
     return seed;
+}
+
+int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
+                            const int* capture_layers, int n_capture, void* capture_dst,
+                            int* out_argmax) {
+    const Qwen35Config& c = s.cfg;
+    if (!token_ids || !out_argmax || n < 1 || n > 4 || !s.gguf || !c.hybrid || c.dense_ffn) {
+        fprintf(stderr, "[dflash-verify] base unsupported n=%d gguf=%d hybrid=%d dense=%d\n",
+                n, (int)s.gguf, (int)c.hybrid, (int)c.dense_ffn);
+        return -1;
+    }
+    if (c.head_dim != 256 || c.linear_head_dim != 128 || c.n_experts != 256 || c.top_k <= 0) {
+        fprintf(stderr, "[dflash-verify] shape unsupported hd=%d lhd=%d experts=%d topk=%d\n",
+                c.head_dim, c.linear_head_dim, c.n_experts, c.top_k);
+        return -1;
+    }
+    const int H = c.hidden, N = n, qdim = s.qdim, kvdim = s.kvdim;
+    const int lqkv = s.linear_qkvdim, lvdim = s.linear_vdim, vh = c.linear_v_heads;
+    const int ffn = c.moe_ffn, E = c.n_experts, topk = c.top_k;
+    cudaStream_t st = s.stream;
+    static thread_local Arena verify_arena;
+    verify_arena.rewind();
+    Arena& a = verify_arena;
+    bf16* x = a.alloc<bf16>((size_t)N * H);
+    bf16* xn = a.alloc<bf16>((size_t)N * H);
+    bf16* h = a.alloc<bf16>((size_t)N * H);
+    bf16* hn = a.alloc<bf16>((size_t)N * H);
+    bf16* ao = a.alloc<bf16>((size_t)N * H);
+    bf16* routed = a.alloc<bf16>((size_t)N * H);
+    bf16* shared = a.alloc<bf16>((size_t)N * H);
+    bf16* b8 = a.alloc<bf16>((size_t)N * 2 * qdim);
+    bf16* lz = a.alloc<bf16>((size_t)N * lvdim);
+    bf16* gq = a.alloc<bf16>((size_t)N * s.linear_qdim);
+    bf16* gk = a.alloc<bf16>((size_t)N * s.linear_qdim);
+    bf16* gv = a.alloc<bf16>((size_t)N * lvdim);
+    bf16* att = a.alloc<bf16>((size_t)N * lvdim);
+    bf16* lnrm = a.alloc<bf16>((size_t)N * lvdim);
+    bf16* la = a.alloc<bf16>((size_t)N * vh);
+    bf16* lb = a.alloc<bf16>((size_t)N * vh);
+    bf16* qb = gv;
+    bf16* qg = lnrm;
+    bf16* kf = gq;
+    bf16* vf = gk;
+    bf16* sg = a.alloc<bf16>((size_t)N * ffn);
+    bf16* su = a.alloc<bf16>((size_t)N * ffn);
+    bf16* sh = a.alloc<bf16>((size_t)N * ffn);
+    bf16* gate_raw = a.alloc<bf16>(N);
+    float* gate_w = a.alloc<float>(N);
+    int* ids = a.alloc<int>(N);
+    int* pos = a.alloc<int>(N);
+    int* seq = a.alloc<int>(N);
+    int* expert_ids = a.alloc<int>((size_t)N * topk);
+    float* expert_w = a.alloc<float>((size_t)N * topk);
+    float* router_logits = a.alloc<float>((size_t)N * E);
+    float* moe_h = a.alloc<float>((size_t)N * topk * ffn);
+    float* moe_out = a.alloc<float>((size_t)N * H);
+    float* logits = a.alloc<float>((size_t)N * c.vocab);
+    int* out_ids = a.alloc<int>(N);
+    const size_t q81_stride_max = kernels::llama_q8_1_bytes(std::max(H, lvdim));
+    void* q81 = a.alloc<unsigned char>((size_t)N * q81_stride_max);
+    const int ns = std::max(1, s.n_splits);
+    float* fa_m = a.alloc<float>((size_t)N * c.n_q_heads * ns);
+    float* fa_l = a.alloc<float>((size_t)N * c.n_q_heads * ns);
+    float* fa_acc = a.alloc<float>((size_t)N * c.n_q_heads * ns * c.head_dim);
+    // Compact recurrence records retained until posterior selection.
+    bf16* rec_qkv = a.alloc<bf16>((size_t)c.n_layers * N * lqkv);
+    bf16* rec_k = a.alloc<bf16>((size_t)c.n_layers * N * s.linear_qdim);
+    bf16* rec_v = a.alloc<bf16>((size_t)c.n_layers * N * lvdim);
+    bf16* rec_a = a.alloc<bf16>((size_t)c.n_layers * N * vh);
+    bf16* rec_b = a.alloc<bf16>((size_t)c.n_layers * N * vh);
+    if (!a.ok) { fprintf(stderr, "[dflash-verify] scratch allocation failed\n"); return -1; }
+
+    static thread_local int* ph_ids = nullptr;
+    static thread_local int* ph_pos = nullptr;
+    static thread_local int* ph_seq = nullptr;
+    static thread_local int* ph_out = nullptr;
+    static thread_local cudaGraph_t verify_graph = nullptr;
+    static thread_local cudaGraphExec_t verify_exec = nullptr;
+    static thread_local bool graph_warm = false;
+    static thread_local bool graph_ready = false;
+    static thread_local const void* graph_model_key = nullptr;
+    static thread_local const void* graph_state_key = nullptr;
+    static thread_local const void* graph_conv_key = nullptr;
+    static thread_local const void* graph_capture_key = nullptr;
+    static thread_local const void* graph_btable_key = nullptr;
+    if (!ph_ids) {
+        pf_cu(cudaHostAlloc(&ph_ids, 4 * sizeof(int), cudaHostAllocDefault), "verify host ids");
+        pf_cu(cudaHostAlloc(&ph_pos, 4 * sizeof(int), cudaHostAllocDefault), "verify host pos");
+        pf_cu(cudaHostAlloc(&ph_seq, 4 * sizeof(int), cudaHostAllocDefault), "verify host lens");
+        pf_cu(cudaHostAlloc(&ph_out, 4 * sizeof(int), cudaHostAllocDefault), "verify host out");
+    }
+    for (int i = 0; i < N; ++i) {
+        ph_ids[i] = token_ids[i];
+        ph_pos[i] = start_pos + i;
+        ph_seq[i] = start_pos + i + 1;
+    }
+
+    const bf16* q81_src = nullptr;
+    int q81_k = 0;
+    auto quant_rows = [&](const bf16* in, int k) {
+        if (q81_src == in && q81_k == k) return;
+        kernels::launch_quantize_q8_1_rows(in, q81, k, N, k, st);
+        q81_src = in;
+        q81_k = k;
+    };
+    auto proj = [&](const bf16* in, const void* w, int type, bf16* out, int no, int k) -> bool {
+        if (type == 0) {
+            for (int i = 0; i < N; ++i)
+                kernels::launch_gemv(in + (size_t)i * k, w, out + (size_t)i * no, no, k, st);
+            return true;
+        }
+        if (type != 8 && type != 12 && type != 14) {
+            fprintf(stderr, "[dflash-verify] unsupported projection type=%d N=%d K=%d\n", type, no, k);
+            return false;
+        }
+        quant_rows(in, k);
+        return kernels::launch_mmvq_rows(type, q81, w, out, N, no, k, st);
+    };
+    auto capture = [&](int layer) {
+        if (!capture_dst || !capture_layers || n_capture <= 0) return;
+        for (int slot = 0; slot < n_capture; ++slot) if (capture_layers[slot] == layer) {
+            char* dst = static_cast<char*>(capture_dst) + (size_t)slot * H * sizeof(bf16);
+            pf_cu(cudaMemcpy2DAsync(dst, (size_t)n_capture * H * sizeof(bf16), x,
+                                    (size_t)H * sizeof(bf16), (size_t)H * sizeof(bf16), N,
+                                    cudaMemcpyDeviceToDevice, st), "verify capture");
+        }
+    };
+
+    const int* btable = s.kv->block_table(s.seq_id);
+    const int bs = s.kv->block_size(), mbs = s.kv->max_blocks_per_seq();
+    const bool kv8 = s.kv->int8_kv();
+    const int kv_elem = kv8 ? 1 : 2;
+    bool supported = true;
+    bool recording = false;
+    if (graph_model_key != s.w.lm_head || graph_state_key != s.lin_state ||
+        graph_conv_key != s.lin_conv_state || graph_capture_key != capture_dst ||
+        graph_btable_key != btable) {
+        if (verify_exec) cudaGraphExecDestroy(verify_exec);
+        if (verify_graph) cudaGraphDestroy(verify_graph);
+        verify_exec = nullptr; verify_graph = nullptr;
+        graph_ready = false; graph_warm = false;
+        graph_model_key = s.w.lm_head;
+        graph_state_key = s.lin_state;
+        graph_conv_key = s.lin_conv_state;
+        graph_capture_key = capture_dst;
+        graph_btable_key = btable;
+    }
+    if (graph_ready) {
+        pf_cu(cudaGraphLaunch(verify_exec, st), "verify graph launch");
+        pf_cu(cudaStreamSynchronize(st), "verify graph sync");
+        std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
+        goto verify_forward_done;
+    }
+    recording = graph_warm;
+    if (recording)
+        pf_cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "verify graph begin");
+    pf_cu(cudaMemcpyAsync(ids, ph_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify ids");
+    pf_cu(cudaMemcpyAsync(pos, ph_pos, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify pos");
+    pf_cu(cudaMemcpyAsync(seq, ph_seq, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify lens");
+    kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
+    kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, c.rms_eps, st);
+    for (int L = 0; L < c.n_layers && supported; ++L) {
+        const Qwen35LayerWeights& w = s.w.layers[L];
+        if (w.linear_attn) {
+            bf16* rq = rec_qkv + (size_t)L * N * lqkv;
+            bf16* rk = rec_k + (size_t)L * N * s.linear_qdim;
+            bf16* rv = rec_v + (size_t)L * N * lvdim;
+            bf16* ra = rec_a + (size_t)L * N * vh;
+            bf16* rb = rec_b + (size_t)L * N * vh;
+            supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H) &&
+                        proj(xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H) &&
+                        proj(xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
+                        proj(xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H);
+            if (!supported) break;
+            const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) +
+                (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+            kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
+                N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+            const float* state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
+            kernels::launch_dflash_gdn_scan_compact(gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
+                state, att, N, c.linear_q_heads, vh, c.linear_head_dim, st);
+            kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
+                                                c.linear_head_dim, c.rms_eps, st);
+            supported = proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+        } else {
+            supported = proj(xn, w.wq, w.wq_type, b8, 2 * qdim, H) &&
+                        proj(xn, w.wk, w.wk_type, kf, kvdim, H) &&
+                        proj(xn, w.wv, w.wv_type, vf, kvdim, H);
+            if (!supported || !w.q_has_gate) break;
+            char* kp = static_cast<char*>(s.kv->k_pool()) +
+                       (size_t)L * s.kv->layer_stride_elems() * kv_elem;
+            char* vp = static_cast<char*>(s.kv->v_pool()) +
+                       (size_t)L * s.kv->layer_stride_elems() * kv_elem;
+            char* ks = kv8 ? static_cast<char*>(s.kv->k_scale_pool()) +
+                             (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+            char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
+                             (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+            if (kv8) {
+                kernels::launch_dflash_qknorm_rope_kv_partial_int8_gated(
+                    b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btable, pos,
+                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
+                    bs, mbs, st);
+            } else {
+                kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
+                kernels::launch_dflash_qknorm_rope_kv_partial(
+                    qb, kf, vf, w.q_norm, w.k_norm, kp, vp, btable, pos,
+                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
+                    bs, mbs, st);
+            }
+            for (int i = 0; i < N; ++i)
+                kernels::launch_flash_decode_split(
+                    qb + (size_t)i * qdim, kp, vp, btable, seq + i, att + (size_t)i * qdim,
+                    fa_m + (size_t)i * c.n_q_heads * ns,
+                    fa_l + (size_t)i * c.n_q_heads * ns,
+                    fa_acc + (size_t)i * c.n_q_heads * ns * c.head_dim,
+                    1, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns,
+                    1.f / sqrtf((float)c.head_dim), st, nullptr, -1,
+                    ks, vs, kv8 ? 1 : 0, kv8 ? qg + (size_t)i * qdim : nullptr);
+            if (!kv8)
+                for (int i = 0; i < N; ++i)
+                    kernels::launch_qwen36_mul_sigmoid(att + (size_t)i * qdim,
+                                                        qg + (size_t)i * qdim, qdim, st);
+            supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
+        }
+        if (!supported) break;
+        kernels::launch_add_rmsnorm2_q8_rows(x, ao, w.post_attn_norm, h, hn, q81,
+                                             N, H, c.rms_eps, st);
+        q81_src = hn; q81_k = H;
+
+        if (!w.gate_q || !w.router_w ||
+            !w.shared_gate_q || !w.shared_up_q || !w.shared_down_q ||
+            w.shared_gate_qtype != 8 || w.shared_up_qtype != 8 || w.shared_down_qtype != 8) {
+            fprintf(stderr, "[dflash-verify] unsupported MoE layer=%d gate=%p router=%p shared=%p/%p/%p types=%d/%d/%d\n",
+                    L, w.gate_q, w.router_w, w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                    w.shared_gate_qtype, w.shared_up_qtype, w.shared_down_qtype);
+            supported = false; break;
+        }
+        for (int i = 0; i < N; ++i)
+            kernels::launch_gemv_f32(hn + (size_t)i * H, w.router_w,
+                                     router_logits + (size_t)i * E, E, H, st);
+        kernels::launch_moe_router(router_logits, expert_ids, expert_w, nullptr,
+                                   N, E, topk, 1, st);
+        kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
+            w.gate_qtype, w.up_qtype, w.down_qtype, expert_ids, expert_w, routed,
+            moe_h, moe_out, N, topk, H, ffn, q81, st);
+
+        if (w.shared_gate_inp) {
+            supported = proj(hn, w.shared_gate_inp, w.shared_gate_inp_type, gate_raw, 1, H);
+            kernels::launch_qwen36_sigmoid_rows(gate_raw, gate_w, N, st);
+        } else {
+            pf_cu(cudaMemsetAsync(gate_w, 0, (size_t)N * sizeof(float), st), "verify shared gate");
+        }
+        supported = supported && kernels::launch_mmvq_rows(8, q81, w.shared_gate_q, sg, N, ffn, H, st) &&
+                    kernels::launch_mmvq_rows(8, q81, w.shared_up_q, su, N, ffn, H, st);
+        kernels::launch_qwen36_shared_swiglu_rows(sg, su, w.shared_gate_inp ? gate_w : nullptr,
+                                                  sh, N, ffn, st);
+        quant_rows(sh, ffn);
+        supported = supported && kernels::launch_mmvq_rows(8, q81, w.shared_down_q,
+                                                           shared, N, H, ffn, st);
+        const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
+        kernels::launch_add_rmsnorm3_q8_rows(h, routed, shared, next_norm, x, xn, q81,
+                                             N, H, c.rms_eps, st);
+        q81_src = xn; q81_k = H;
+        capture(L);
+    }
+    if (!supported) return -1;
+
+    quant_rows(xn, H);
+    if (!kernels::launch_mmvq_rows_f32(s.w.lm_head_type, q81, s.w.lm_head, logits,
+                                       N, c.vocab, H, st)) {
+        fprintf(stderr, "[dflash-verify] unsupported LM head type=%d H=%d\n", s.w.lm_head_type, H);
+        return -1;
+    }
+    kernels::launch_argmax(logits, out_ids, N, c.vocab, st);
+    pf_cu(cudaMemcpyAsync(ph_out, out_ids, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost, st),
+          "verify argmax");
+    if (recording) {
+        pf_cu(cudaStreamEndCapture(st, &verify_graph), "verify graph end");
+        pf_cu(cudaGraphInstantiate(&verify_exec, verify_graph, 0), "verify graph instantiate");
+        graph_ready = true;
+        pf_cu(cudaGraphLaunch(verify_exec, st), "verify graph first launch");
+    }
+    pf_cu(cudaStreamSynchronize(st), "verify sync");
+    std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
+    graph_warm = true;
+verify_forward_done:
+    int keep = 1;
+    while (keep < N && token_ids[keep] == out_argmax[keep - 1]) ++keep;
+    for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
+        bf16* rq = rec_qkv + (size_t)L * N * lqkv;
+        bf16* rk = rec_k + (size_t)L * N * s.linear_qdim;
+        bf16* rv = rec_v + (size_t)L * N * lvdim;
+        bf16* ra = rec_a + (size_t)L * N * vh;
+        bf16* rb = rec_b + (size_t)L * N * vh;
+        bf16* conv_live = static_cast<bf16*>(s.lin_conv_state) +
+            (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+        float* state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
+        kernels::launch_dflash_gdn_conv_commit(rq, conv_live, keep, c.linear_q_heads, vh,
+            c.linear_head_dim, c.linear_conv_kernel, st);
+        kernels::launch_dflash_gdn_scan_commit(rk, rv, ra, rb, s.w.layers[L].ssm_dt,
+            s.w.layers[L].ssm_a, state, keep, c.linear_q_heads, vh, c.linear_head_dim, st);
+    }
+    pf_cu(cudaStreamSynchronize(st), "verify commit");
+    return keep;
 }
 
 } // namespace sparkinfer

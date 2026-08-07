@@ -184,12 +184,13 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
                                        __nv_bfloat16* __restrict__ out_norm,
                                        si_blk_q8_1* __restrict__ out_q8,
                                        int cols, float eps) {
-    const size_t base = 0;
+    const size_t base = (size_t)blockIdx.x * cols;
     __shared__ float s_warp[32];
     const int t = threadIdx.x;
-    const uint4* x4 = reinterpret_cast<const uint4*>(x);
-    const uint4* r4 = reinterpret_cast<const uint4*>(residual);
-    uint4* osum4 = reinterpret_cast<uint4*>(out_sum);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x + base);
+    const uint4* r4 = reinterpret_cast<const uint4*>(residual + base);
+    uint4* osum4 = reinterpret_cast<uint4*>(out_sum + base);
+    out_q8 += (size_t)blockIdx.x * (cols >> 5);
 
     float xv[8], rv[8]; rn_unpack8(__ldg(x4 + t), xv); rn_unpack8(__ldg(r4 + t), rv);
     float sv[8]; float ss = 0.f;
@@ -210,12 +211,12 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
     // Re-read the bf16-rounded residual sum (exactly as add_rmsnorm2_kernel does), so out_norm
     // is bit-identical to the unfused path; then derive Q8_1 from the bf16-rounded out_norm.
     const uint4* w4 = reinterpret_cast<const uint4*>(weight);
-    const uint4* osum4r = reinterpret_cast<const uint4*>(out_sum);
+    const uint4* osum4r = reinterpret_cast<const uint4*>(out_sum + base);
     float svb[8], wv[8]; rn_unpack8(__ldg(osum4r + t), svb); rn_unpack8(__ldg(w4 + t), wv);
     float ov[8], bv[8];
     #pragma unroll
     for (int j = 0; j < 8; j++) { ov[j] = svb[j] * inv_rms * wv[j]; bv[j] = __bfloat162float(__float2bfloat16(ov[j])); }
-    reinterpret_cast<uint4*>(out_norm)[t] = rn_pack8(ov);
+    reinterpret_cast<uint4*>(out_norm + base)[t] = rn_pack8(ov);
 
     // Q8_1 of the bf16-rounded out_norm. 32-block = 4 consecutive threads (t&~3 .. +3).
     float amax = 0.f;
@@ -246,10 +247,12 @@ __global__ void add_rmsnorm3_q8_kernel(const __nv_bfloat16* __restrict__ x,
                                        int cols, float eps) {
     __shared__ float s_warp[32];
     const int t = threadIdx.x;
-    const uint4* x4  = reinterpret_cast<const uint4*>(x);
-    const uint4* r14 = reinterpret_cast<const uint4*>(res1);
-    const uint4* r24 = reinterpret_cast<const uint4*>(res2);
-    uint4* osum4 = reinterpret_cast<uint4*>(out_sum);
+    const size_t base = (size_t)blockIdx.x * cols;
+    const uint4* x4  = reinterpret_cast<const uint4*>(x + base);
+    const uint4* r14 = reinterpret_cast<const uint4*>(res1 + base);
+    const uint4* r24 = reinterpret_cast<const uint4*>(res2 + base);
+    uint4* osum4 = reinterpret_cast<uint4*>(out_sum + base);
+    out_q8 += (size_t)blockIdx.x * (cols >> 5);
 
     float xv[8], r1v[8], r2v[8];
     rn_unpack8(__ldg(x4 + t), xv); rn_unpack8(__ldg(r14 + t), r1v); rn_unpack8(__ldg(r24 + t), r2v);
@@ -273,12 +276,12 @@ __global__ void add_rmsnorm3_q8_kernel(const __nv_bfloat16* __restrict__ x,
     const float inv_rms = s_warp[0];
 
     const uint4* w4 = reinterpret_cast<const uint4*>(weight);
-    const uint4* osum4r = reinterpret_cast<const uint4*>(out_sum);
+    const uint4* osum4r = reinterpret_cast<const uint4*>(out_sum + base);
     float svb[8], wv[8]; rn_unpack8(__ldg(osum4r + t), svb); rn_unpack8(__ldg(w4 + t), wv);
     float ov[8], bv[8];
     #pragma unroll
     for (int j = 0; j < 8; j++) { ov[j] = svb[j] * inv_rms * wv[j]; bv[j] = __bfloat162float(__float2bfloat16(ov[j])); }
-    reinterpret_cast<uint4*>(out_norm)[t] = rn_pack8(ov);
+    reinterpret_cast<uint4*>(out_norm + base)[t] = rn_pack8(ov);
 
     float amax = 0.f;
     #pragma unroll
@@ -450,6 +453,27 @@ void launch_add_rmsnorm3_q8(const void* x, const void* res1, const void* res2, c
         reinterpret_cast<const __nv_bfloat16*>(weight),
         reinterpret_cast<__nv_bfloat16*>(out_sum),
         reinterpret_cast<__nv_bfloat16*>(out_norm),
+        reinterpret_cast<si_blk_q8_1*>(out_q8), cols, eps);
+}
+
+void launch_add_rmsnorm2_q8_rows(const void* x, const void* residual, const void* weight,
+                                 void* out_sum, void* out_norm, void* out_q8,
+                                 int rows, int cols, float eps, cudaStream_t stream) {
+    assert(rows > 0 && cols % 256 == 0 && (cols >> 3) <= 1024);
+    add_rmsnorm2_q8_kernel<<<rows, cols >> 3, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(residual),
+        reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out_sum),
+        reinterpret_cast<__nv_bfloat16*>(out_norm), reinterpret_cast<si_blk_q8_1*>(out_q8), cols, eps);
+}
+
+void launch_add_rmsnorm3_q8_rows(const void* x, const void* res1, const void* res2,
+                                 const void* weight, void* out_sum, void* out_norm, void* out_q8,
+                                 int rows, int cols, float eps, cudaStream_t stream) {
+    assert(rows > 0 && cols % 256 == 0 && (cols >> 3) <= 1024);
+    add_rmsnorm3_q8_kernel<<<rows, cols >> 3, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(res1),
+        reinterpret_cast<const __nv_bfloat16*>(res2), reinterpret_cast<const __nv_bfloat16*>(weight),
+        reinterpret_cast<__nv_bfloat16*>(out_sum), reinterpret_cast<__nv_bfloat16*>(out_norm),
         reinterpret_cast<si_blk_q8_1*>(out_q8), cols, eps);
 }
 
