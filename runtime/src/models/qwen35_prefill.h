@@ -44,6 +44,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 // Exact short-block DFlash verifier. It evaluates all candidate rows from the live hybrid state,
 // commits only the accepted prefix, and leaves rejected KV rows outside the logical sequence.
 // Returns the number of consumed rows, or -1 when the exact fast path is unsupported.
+// Widest verify window the compact path accepts; wider blocks fall back to the caller's
+// row-batched window. Declared here so the caller can gate on it instead of rediscovering
+// the limit through a failed call.
+constexpr int kDFlashCompactMaxRows = 4;
+
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax);

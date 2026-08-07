@@ -500,10 +500,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     const int qdim = c.n_q_heads * c.head_dim;
     const int kvdim = c.n_kv_heads * c.head_dim;
     const int d = c.head_dim;
-    // Proposal depth (also sets the draft's active diffusion width, depth+1).
+    // Proposal depth (also sets the draft's active diffusion width, depth+1). Must match the
+    // verifier's default in qwen35.cpp: the verifier sizes its window from its own copy, so a
+    // disagreement makes it verify rows the draft never proposed.
     static const int kProposalDepth = []{
         const char* e = getenv("SPARKINFER_DFLASH_PROPOSALS");
-        int v = e ? atoi(e) : 3;
+        int v = e ? atoi(e) : 5;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
     // Active diffusion width. Only rows 0..kProposalDepth are ever consumed (row 0 is the seed,

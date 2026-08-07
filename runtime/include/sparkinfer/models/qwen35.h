@@ -193,12 +193,23 @@ public:
     bool batched_forward(const int* token_ids, int n, int start_pos, bool resume_gdn,
                          int* out_argmax, const void* dflash_capture_dst = nullptr);
 
+    // Row-batched teacher-forced verify: forwards `rows` consecutive tokens (positions
+    // start_pos..start_pos+rows-1) through the layer stack in ONE pass, so every weight
+    // matrix streams from HBM once per window instead of once per token. Produces exactly
+    // the argmaxes, KV cache, GDN recurrent/conv state and hidden captures of `rows`
+    // successive forward_token(ids[i], start_pos+i, true) calls; rejected-token rollback
+    // stays the caller's job. Returns false — before touching any device state — when the
+    // pinned fast-path preconditions do not hold or rows is out of [1, kDFlashMaxRows];
+    // callers then fall back to the verify_block token loop.
+    bool dflash_verify_rows(const int* token_ids, int rows, int start_pos, int* out_argmax);
+
 private:
     void invalidate_decode_graph();
     // Prefill prompt tokens [start, end) with batched path when start==0, else token loop.
     // Returns argmax seed at end-1 for decode, or -1 on failure.
     int ingest_prompt_range(const int* ids, int start, int end);
     void dflash_maybe_capture_layer(int layer);
+    void dflash_rows_capture_layer(int layer, int rows, int row_base);
 
     struct Impl;
     Impl* p_;

@@ -22,6 +22,7 @@
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/proj_requant.h"
+#include "sparkinfer/kernels/dflash_rows.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -241,6 +242,40 @@ struct Qwen35Model::Impl {
     float* spec_lin_snap = nullptr;
     bf16* spec_conv_snap = nullptr;
 
+    // DFlash row-batched verify scratch (dflash_verify_rows): kDFlashMaxRows-row twins of the
+    // single-row decode buffers above, allocated lazily on the first supported verify window
+    // (rb_cap guards it) and freed in the destructor. The single-row buffers are never resized
+    // or aliased by the rows path -- the autoregressive decode path and its captured CUDA
+    // graphs depend on them staying byte-identical.
+    int rb_cap = 0;                   // allocated row capacity (0 = not yet allocated)
+    bf16 *rb_x = nullptr, *rb_xn = nullptr, *rb_h = nullptr, *rb_hn = nullptr;
+    bf16 *rb_routed = nullptr, *rb_shared = nullptr, *rb_ao = nullptr;
+    bf16 *rb_q = nullptr, *rb_k = nullptr, *rb_v = nullptr, *rb_attn = nullptr;
+    bf16 *rb_qraw = nullptr, *rb_qgate = nullptr;
+    bf16 *rb_lin_qkv = nullptr, *rb_lin_q = nullptr, *rb_lin_k = nullptr, *rb_lin_v = nullptr;
+    bf16 *rb_lin_z = nullptr, *rb_lin_alpha = nullptr, *rb_lin_beta = nullptr, *rb_lin_gdn = nullptr;
+    bf16 *rb_shared_gate_tmp = nullptr;   // [rows] shared-expert gate dot (pre-sigmoid)
+    // Q8_1 activation rows. Sized for the LARGEST K quantized on this path (qdim /
+    // linear_vdim = 4096 > hidden = 2048); each op packs its rows contiguously at
+    // llama_q8_1_bytes(K) for ITS K, which is the layout the rows-MMVQ kernels expect.
+    void *rb_aq81 = nullptr;
+    float *rb_logits = nullptr;           // [rows, vocab]
+    float *rb_mf_logits = nullptr, *rb_mf_weights = nullptr, *rb_mf_h = nullptr, *rb_mf_out = nullptr;
+    int   *rb_mf_ids = nullptr;
+    unsigned int *rb_rc = nullptr;        // per-row fused-router grid-completion counters (zeroed once;
+                                          // atomicInc self-clears them across calls)
+    float *rb_sx_h = nullptr;             // [rows, moe_ffn] shared-expert h scratch
+    void  *rb_sx_q8 = nullptr;            // [rows, llama_q8_1_bytes(moe_ffn)] shared-expert Q8_1(h)
+    float *rb_shared_w = nullptr;         // [rows] shared-expert sigmoid(gate) scalars
+    float *rb_fa_m = nullptr, *rb_fa_l = nullptr, *rb_fa_acc = nullptr;   // per-row flash-decode partials
+    int *rb_scalars = nullptr;            // [rows][5] {token,pos,writepos,seqlen,cap_row} + [rows] token ids
+    int *rb_out_id = nullptr;             // [rows] greedy argmax per row
+    int *rb_h_scalars = nullptr;          // pinned staging for rb_scalars (+ token ids)
+    int *rb_h_out_id = nullptr;           // pinned rows argmax readback
+    bool rb_alloc();
+    void rb_release();
+    bool dflash_rows_supported() const;
+
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
 
@@ -423,6 +458,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->sparse_vtbl); cudaFree(p_->sparse_vlen);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
+    p_->rb_release();   // DFlash row-batched verify scratch (rb_*)
     // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
     for (auto& kv : p_->sessions) {
         if (kv.first == 0) continue;
@@ -1774,6 +1810,419 @@ void Qwen35Model::restore_spec_snapshot() {
     invalidate_decode_graph();
 }
 
+// ---- DFlash row-batched verify ----------------------------------------------------------
+// The verify window's `rows` proposals share ONE pass through the 40 layers: every weight
+// matrix streams from HBM once per window instead of once per proposal (only the routed
+// experts still scale with rows). Bit-exactness with `rows` successive forward_token()
+// calls rests on two invariants: (a) every rows kernel computes each row with the same
+// operand order and reduction tree as its single-row counterpart (the dflash_rows.h
+// contract), and (b) every op with sequential state -- the depthwise conv, the GDN delta
+// rule, the KV append and the attention read -- consumes the rows strictly in position
+// order, so row r sees rows 0..r-1 of the window and nothing later.
+
+// Pins the exact configuration the scored Qwen3.6-35B-A3B Q4_K_M decode runs, kernel for
+// kernel. Every check corresponds to a branch forward_token() takes on that model; if ANY
+// fails, dflash_verify_rows() bails before touching device state and the caller falls back
+// to the token-loop verify. Strictness is the safety net: an unfamiliar model, quant mix or
+// flag override must never reach the rows path.
+bool Qwen35Model::Impl::dflash_rows_supported() const {
+    const Qwen35Config& c = cfg;
+    if (!gguf || !c.hybrid || c.dense_ffn) return false;
+    // Flag defaults the live path relies on (each one selects a kernel the rows path mirrors).
+    if (!(use_pq && use_llama && use_q6mmvq && use_fnq)) return false;         // fnq Q8_1 chain
+    if (!(use_addnorm3 && use_router_fused && use_gdn_pipe && !use_gdn_quad &&
+          use_attn_qkv && use_qkfuse && use_shexp_pipe)) return false;
+    // Env-gated statics inside forward_token / the launchers that pick the live kernels:
+    // fused GDN qkv+z, fused conv+l2norm, gated-norm Q8 emit, gated Q8 attention combine,
+    // dual-row Q4_K MMVQ dispatch, no router counts, split gemv+sigmoid gate scalar.
+    static const bool env_defaults = [] {
+        auto on  = [](const char* n) { const char* e = getenv(n); return !(e && e[0] == '0'); };
+        auto off = [](const char* n) { const char* e = getenv(n); return !(e && e[0] == '1'); };
+        return on("SPARKINFER_GDN_QKVZ_FUSE") && on("SPARKINFER_GDN_FUSE") &&
+               on("SPARKINFER_GDN_GNORM_Q8") && on("SPARKINFER_ATTN_GQ8") &&
+               on("SPARKINFER_MMVQ2") &&
+               off("SPARKINFER_MOE_COUNTS") && off("SPARKINFER_GEMV_SIGMOID");
+    }();
+    if (!env_defaults) return false;
+    // bf16 KV: the rows path mirrors qknorm_rope_kv_partial + the bf16 fa_split_gqa tile,
+    // and with int8 KV off the sink+window sparse view can never engage either.
+    if (kv->int8_kv()) return false;
+    // Model shape (Qwen3.6-35B-A3B).
+    if (c.n_layers != 40 || c.full_attn_interval != 4) return false;
+    if (c.hidden != 2048 || c.moe_ffn != 512 || c.n_experts != 256 || c.top_k != 8) return false;
+    if (c.n_shared <= 0 || c.vocab != 248320) return false;
+    if (c.head_dim != 256 || c.n_q_heads != 16 || c.n_kv_heads != 2 || c.rope_dim != 64) return false;
+    if (c.linear_q_heads != 16 || c.linear_v_heads != 32 || c.linear_head_dim != 128 ||
+        c.linear_conv_kernel != 4) return false;
+    if (linear_qkvdim != 8192 || linear_vdim != 4096 || qdim != 4096 || kvdim != 512) return false;
+    if (!w.embed_tokens || !w.final_norm || !w.lm_head || w.lm_head_type != 12) return false;
+    if ((int)w.layers.size() != c.n_layers) return false;
+    for (int L = 0; L < c.n_layers; L++) {
+        const Qwen35LayerWeights& lw = w.layers[L];
+        if (lw.linear_attn != is_linear_layer(c, L)) return false;
+        if (!lw.input_norm || !lw.post_attn_norm) return false;
+        if (lw.linear_attn) {
+            if (!(lw.wqkv && lw.wqkv_gate && lw.ssm_conv && lw.ssm_dt && lw.ssm_a &&
+                  lw.ssm_alpha && lw.ssm_beta && lw.ssm_norm && lw.ssm_out)) return false;
+            // Q4_K everywhere: si_mmvq_gdn_qkv_z_pack2 + si_mmvq_q4k (alpha/beta/ssm_out).
+            if (lw.wqkv_type != 12 || lw.wqkv_gate_type != 12 || lw.ssm_out_type != 12)
+                return false;
+            // alpha/beta dense bf16 -> plain GEMV per row (see the projection above).
+            if (lw.ssm_alpha_type != 0 || lw.ssm_beta_type != 0) return false;
+        } else {
+            if (!lw.q_has_gate) return false;   // split_q_gate + gated attention combine
+            if (!(lw.wq && lw.wk && lw.wv && lw.wo && lw.q_norm && lw.k_norm)) return false;
+            // Q4_K query, Q8_0 key/value, Q4_K output -- the shapes the rows MMVQs cover.
+            if (lw.wq_type != 12 || lw.wk_type != 8 || lw.wv_type != 8 || lw.wo_type != 12)
+                return false;
+        }
+        // moe_router_fused reads the router as dense bf16; experts stay GGUF-quantized.
+        if (!lw.router_w || lw.router_w_type != 0) return false;
+        if (!(lw.gate_q && lw.up_q && lw.down_q)) return false;
+        // Q8_0 shared expert + dense gate-scalar projection (gemv + sigmoid_scalar).
+        if (!(lw.shared_gate_q && lw.shared_up_q && lw.shared_down_q &&
+              lw.shared_gate_qtype == 8)) return false;
+        if (!lw.shared_gate_inp || lw.shared_gate_inp_type != 0) return false;
+    }
+    return true;
+}
+
+bool Qwen35Model::Impl::rb_alloc() {
+    if (rb_cap > 0) return true;
+    const int R = kernels::kDFlashMaxRows;
+    const Qwen35Config& c = cfg;
+    const int H = c.hidden;
+    const int kmax = std::max(H, std::max(qdim, linear_vdim));
+    const size_t fa_n = (size_t)c.n_q_heads * MAX_NSPLITS;
+    rb_x = alloc<bf16>((size_t)R * H); rb_xn = alloc<bf16>((size_t)R * H);
+    rb_h = alloc<bf16>((size_t)R * H); rb_hn = alloc<bf16>((size_t)R * H);
+    rb_routed = alloc<bf16>((size_t)R * H); rb_shared = alloc<bf16>((size_t)R * H);
+    rb_ao = alloc<bf16>((size_t)R * H);
+    rb_q = alloc<bf16>((size_t)R * qdim); rb_k = alloc<bf16>((size_t)R * kvdim);
+    rb_v = alloc<bf16>((size_t)R * kvdim); rb_attn = alloc<bf16>((size_t)R * qdim);
+    rb_qraw = alloc<bf16>((size_t)R * qdim * 2); rb_qgate = alloc<bf16>((size_t)R * qdim);
+    rb_lin_qkv = alloc<bf16>((size_t)R * linear_qkvdim);
+    rb_lin_q = alloc<bf16>((size_t)R * linear_qdim);
+    rb_lin_k = alloc<bf16>((size_t)R * linear_qdim);
+    rb_lin_v = alloc<bf16>((size_t)R * linear_vdim);
+    rb_lin_z = alloc<bf16>((size_t)R * linear_vdim);
+    rb_lin_alpha = alloc<bf16>((size_t)R * c.linear_v_heads);
+    rb_lin_beta = alloc<bf16>((size_t)R * c.linear_v_heads);
+    rb_lin_gdn = alloc<bf16>((size_t)R * linear_vdim);
+    rb_shared_gate_tmp = alloc<bf16>((size_t)R);
+    rb_aq81 = alloc<char>((size_t)R * kernels::llama_q8_1_bytes(kmax));
+    rb_logits = alloc<float>((size_t)R * c.vocab);
+    rb_mf_logits = alloc<float>((size_t)R * c.n_experts);
+    rb_mf_ids = alloc<int>((size_t)R * c.top_k);
+    rb_mf_weights = alloc<float>((size_t)R * c.top_k);
+    rb_mf_h = alloc<float>((size_t)R * c.top_k * c.moe_ffn);
+    rb_mf_out = alloc<float>((size_t)R * H);
+    rb_rc = alloc<unsigned int>((size_t)R);
+    rb_sx_h = alloc<float>((size_t)R * c.moe_ffn);
+    rb_sx_q8 = alloc<char>((size_t)R * kernels::llama_q8_1_bytes(c.moe_ffn));
+    rb_shared_w = alloc<float>((size_t)R);
+    rb_fa_m = alloc<float>((size_t)R * fa_n);
+    rb_fa_l = alloc<float>((size_t)R * fa_n);
+    rb_fa_acc = alloc<float>((size_t)R * fa_n * c.head_dim);
+    rb_scalars = alloc<int>((size_t)R * 6);   // [R][5] scalars + [R] token ids for the embedding
+    rb_out_id = alloc<int>((size_t)R);
+    cu(cudaHostAlloc(&rb_h_scalars, (size_t)R * 6 * sizeof(int), cudaHostAllocDefault), "rb host scalars");
+    cu(cudaHostAlloc(&rb_h_out_id, (size_t)R * sizeof(int), cudaHostAllocDefault), "rb host out ids");
+    const bool ok = rb_x && rb_xn && rb_h && rb_hn && rb_routed && rb_shared && rb_ao &&
+                    rb_q && rb_k && rb_v && rb_attn && rb_qraw && rb_qgate &&
+                    rb_lin_qkv && rb_lin_q && rb_lin_k && rb_lin_v && rb_lin_z &&
+                    rb_lin_alpha && rb_lin_beta && rb_lin_gdn && rb_shared_gate_tmp &&
+                    rb_aq81 && rb_logits && rb_mf_logits && rb_mf_ids && rb_mf_weights &&
+                    rb_mf_h && rb_mf_out && rb_rc && rb_sx_h && rb_sx_q8 && rb_shared_w &&
+                    rb_fa_m && rb_fa_l && rb_fa_acc && rb_scalars && rb_out_id &&
+                    rb_h_scalars && rb_h_out_id;
+    if (!ok) { rb_release(); return false; }
+    cu(cudaMemset(rb_rc, 0, (size_t)R * sizeof(unsigned int)), "rb_rc zero");
+    rb_cap = R;
+    return true;
+}
+
+void Qwen35Model::Impl::rb_release() {
+    cudaFree(rb_x); cudaFree(rb_xn); cudaFree(rb_h); cudaFree(rb_hn);
+    cudaFree(rb_routed); cudaFree(rb_shared); cudaFree(rb_ao);
+    cudaFree(rb_q); cudaFree(rb_k); cudaFree(rb_v); cudaFree(rb_attn);
+    cudaFree(rb_qraw); cudaFree(rb_qgate);
+    cudaFree(rb_lin_qkv); cudaFree(rb_lin_q); cudaFree(rb_lin_k); cudaFree(rb_lin_v);
+    cudaFree(rb_lin_z); cudaFree(rb_lin_alpha); cudaFree(rb_lin_beta); cudaFree(rb_lin_gdn);
+    cudaFree(rb_shared_gate_tmp); cudaFree(rb_aq81); cudaFree(rb_logits);
+    cudaFree(rb_mf_logits); cudaFree(rb_mf_ids); cudaFree(rb_mf_weights);
+    cudaFree(rb_mf_h); cudaFree(rb_mf_out); cudaFree(rb_rc);
+    cudaFree(rb_sx_h); cudaFree(rb_sx_q8); cudaFree(rb_shared_w);
+    cudaFree(rb_fa_m); cudaFree(rb_fa_l); cudaFree(rb_fa_acc);
+    cudaFree(rb_scalars); cudaFree(rb_out_id);
+    if (rb_h_scalars) cudaFreeHost(rb_h_scalars);
+    if (rb_h_out_id) cudaFreeHost(rb_h_out_id);
+    rb_x = rb_xn = rb_h = rb_hn = rb_routed = rb_shared = rb_ao = nullptr;
+    rb_q = rb_k = rb_v = rb_attn = rb_qraw = rb_qgate = nullptr;
+    rb_lin_qkv = rb_lin_q = rb_lin_k = rb_lin_v = rb_lin_z = nullptr;
+    rb_lin_alpha = rb_lin_beta = rb_lin_gdn = rb_shared_gate_tmp = nullptr;
+    rb_aq81 = rb_sx_q8 = nullptr;
+    rb_logits = rb_mf_logits = rb_mf_weights = rb_mf_h = rb_mf_out = nullptr;
+    rb_sx_h = rb_shared_w = rb_fa_m = rb_fa_l = rb_fa_acc = nullptr;
+    rb_mf_ids = rb_scalars = rb_out_id = nullptr;
+    rb_rc = nullptr;
+    rb_h_scalars = rb_h_out_id = nullptr;
+    rb_cap = 0;
+}
+
+// Rows twin of dflash_maybe_capture_layer: after layer L's tail, rb_x row r is the same
+// post-layer residual sum forward_token leaves in s.x for window token r. One strided D2D
+// copy places all rows into dflash_hidden[(row_base + r)][slot].
+void Qwen35Model::dflash_rows_capture_layer(int layer, int rows, int row_base) {
+    Impl& s = *p_;
+    if (!s.dflash_capture || !s.dflash_hidden || s.dflash_n_cap <= 0) return;
+    int slot = -1;
+    for (int i = 0; i < s.dflash_n_cap; i++) {
+        if (s.dflash_layer_ids[i] == layer) { slot = i; break; }
+    }
+    if (slot < 0) return;
+    const int H = s.cfg.hidden;
+    const size_t row_elems = (size_t)s.dflash_n_cap * H;
+    cu(cudaMemcpy2DAsync(s.dflash_hidden + (size_t)row_base * row_elems + (size_t)slot * H,
+                         row_elems * sizeof(bf16),
+                         s.rb_x, (size_t)H * sizeof(bf16),
+                         (size_t)H * sizeof(bf16), (size_t)rows,
+                         cudaMemcpyDeviceToDevice, s.stream),
+       "dflash rows capture");
+}
+
+bool Qwen35Model::dflash_verify_rows(const int* token_ids, int rows, int start_pos,
+                                     int* out_argmax) {
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    if (!token_ids || !out_argmax || start_pos < 0) return false;
+    if (rows < 1 || rows > kernels::kDFlashMaxRows) return false;
+    if (!s.dflash_rows_supported()) return false;
+    // Capture rows land at dflash_hidden[row_base + r]; row_base is the verify row index of
+    // the window's first token (the caller sets it via set_dflash_capture_row).
+    const int row_base = s.dflash_cap_row;
+    if (s.dflash_capture && (row_base < 0 || row_base + rows > s.dflash_max_rows)) return false;
+    // All bail-outs above precede any device work, so a false return leaves KV / GDN state
+    // untouched and the caller can rerun the same window through the token loop.
+    if (!s.rb_alloc()) return false;
+
+    const int H = c.hidden;
+    cudaStream_t st = s.stream;
+    const int R5 = kernels::kDFlashMaxRows * 5;
+    int* rb_tok = s.rb_scalars + R5;
+    const size_t q8h = kernels::llama_q8_1_bytes(H);          // Q8_1 row stride, K = hidden
+    const size_t q8q = kernels::llama_q8_1_bytes(s.qdim);     // Q8_1 row stride, K = qdim
+    const size_t q8f = kernels::llama_q8_1_bytes(c.moe_ffn);  // Q8_1 row stride, K = moe_ffn
+    for (int r = 0; r < rows; r++) {
+        const int pos = start_pos + r;
+        s.rb_h_scalars[r * 5 + 0] = token_ids[r];
+        s.rb_h_scalars[r * 5 + 1] = pos;
+        s.rb_h_scalars[r * 5 + 2] = pos;
+        s.rb_h_scalars[r * 5 + 3] = pos + 1;
+        s.rb_h_scalars[r * 5 + 4] = row_base + r;
+        s.rb_h_scalars[R5 + r] = token_ids[r];
+    }
+    cu(cudaMemcpyAsync(s.rb_scalars, s.rb_h_scalars, (size_t)rows * 5 * sizeof(int),
+                       cudaMemcpyHostToDevice, st), "rows scalars");
+    cu(cudaMemcpyAsync(rb_tok, s.rb_h_scalars + R5, (size_t)rows * sizeof(int),
+                       cudaMemcpyHostToDevice, st), "rows tokens");
+    if (c.hybrid && start_pos == 0) {
+        cu(cudaMemsetAsync(s.lin_state, 0,
+                           (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim * sizeof(float), st),
+           "rows linear state reset");
+        cu(cudaMemsetAsync(s.lin_conv_state, 0,
+                           (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim * sizeof(bf16), st),
+           "rows linear conv reset");
+    }
+    // The KV-split count is a partial-sum boundary in the flash-decode combine, so each row
+    // must use exactly the split count forward_token's depth-adaptive policy picks at that
+    // row's seqlen (mirrors the adaptive block in forward_token; s.n_splits itself is left
+    // alone so the decode-graph bookkeeping never sees this path).
+    auto row_splits = [&](int seqlen) {
+        if (!s.adaptive_splits) return s.n_splits;
+        int want = 32;
+        if ((long)seqlen > 2L * s.split_chunk) want = 128;
+        if ((long)seqlen > 28L * s.split_chunk && (long)seqlen <= 48L * s.split_chunk)
+            want = Impl::MAX_NSPLITS;
+        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
+        if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
+        if (c.head_dim == 256 && c.n_kv_heads > 0 && want >= 128) {
+            if (c.n_q_heads == c.n_kv_heads * 8)
+                want = 160;
+            else if (c.n_q_heads == c.n_kv_heads * 4) {
+                if ((long)seqlen > 98304L)      want = 128;
+                else if ((long)seqlen > 65536L) want = 192;
+                else                            want = 160;
+            }
+        }
+        return want;
+    };
+
+    kernels::launch_embedding(rb_tok, s.w.embed_tokens, s.rb_x, rows, H, st);
+    int* btable = s.kv->block_table(s.active_seq_id);
+    // Prime: xn = RMSNorm(x, layer0.input_norm). Every later layer's Q8_1(xn) is emitted by
+    // the previous layer's fused tail (fnq), so only layer 0 needs the standalone quantize.
+    kernels::launch_dflash_rows_rmsnorm(s.rb_x, s.w.layers[0].input_norm, s.rb_xn, H,
+                                        c.rms_eps, rows, st);
+    kernels::launch_quantize_q8_1_rows(s.rb_xn, s.rb_aq81, H, rows, H, st);
+
+    for (int L = 0; L < c.n_layers; L++) {
+        const Qwen35LayerWeights& w = s.w.layers[L];
+        if (w.linear_attn) {
+            // Live path runs alpha/beta on stream_v behind fork/join events; the rows path
+            // keeps them on the main stream -- correctness-neutral, the kernels' arithmetic
+            // does not depend on which stream issues them.
+            kernels::launch_dflash_rows_mmvq_gdn_qkv_z(s.rb_aq81, w.wqkv, w.wqkv_gate,
+                                                       s.rb_lin_qkv, s.rb_lin_z,
+                                                       s.linear_qkvdim, s.linear_vdim, H, rows, st);
+            // alpha/beta stay dense bf16 in this GGUF, so they take proj_xn's t==0 branch:
+            // a plain bf16 GEMV per row. They project to linear_v_heads (32) values, far too
+            // little weight to be worth a rows kernel, and looping keeps the split-K reduction
+            // identical to the single-token path.
+            for (int r = 0; r < rows; r++) {
+                kernels::launch_gemv(s.rb_xn + (size_t)r * H, w.ssm_alpha,
+                                     s.rb_lin_alpha + (size_t)r * c.linear_v_heads,
+                                     c.linear_v_heads, H, st);
+                kernels::launch_gemv(s.rb_xn + (size_t)r * H, w.ssm_beta,
+                                     s.rb_lin_beta + (size_t)r * c.linear_v_heads,
+                                     c.linear_v_heads, H, st);
+            }
+            bf16* conv_state = s.lin_conv_state +
+                (size_t)L * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
+            // One call for the whole window: the depthwise conv is causal, so the kernel
+            // walks the rows in order internally and leaves conv_state exactly where `rows`
+            // single-token calls would.
+            kernels::launch_dflash_rows_conv_split_l2norm(s.rb_lin_qkv, w.ssm_conv, conv_state,
+                                                          s.rb_lin_q, s.rb_lin_k, s.rb_lin_v,
+                                                          c.linear_q_heads, c.linear_v_heads,
+                                                          c.linear_head_dim, c.linear_conv_kernel,
+                                                          c.rms_eps, rows, st);
+            float* layer_state = s.lin_state +
+                (size_t)L * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+            // The delta-rule recurrence is inherently sequential in the token dimension:
+            // one single-token launch per row, in position order, against the same slice of
+            // lin_state -- identical to the token loop by construction.
+            for (int r = 0; r < rows; r++) {
+                kernels::launch_qwen36_gdn_ar(s.rb_lin_q + (size_t)r * s.linear_qdim,
+                                              s.rb_lin_k + (size_t)r * s.linear_qdim,
+                                              s.rb_lin_v + (size_t)r * s.linear_vdim,
+                                              s.rb_lin_alpha + (size_t)r * c.linear_v_heads,
+                                              s.rb_lin_beta + (size_t)r * c.linear_v_heads,
+                                              w.ssm_dt, w.ssm_a,
+                                              layer_state,
+                                              s.rb_lin_gdn + (size_t)r * s.linear_vdim,
+                                              c.linear_q_heads, c.linear_v_heads,
+                                              c.linear_head_dim, st);
+            }
+            kernels::launch_dflash_rows_gated_norm_q8(s.rb_lin_gdn, s.rb_lin_z, w.ssm_norm,
+                                                      s.rb_aq81, c.linear_v_heads,
+                                                      c.linear_head_dim, c.rms_eps, rows, st);
+            kernels::launch_dflash_rows_mmvq_q4k(s.rb_aq81, w.ssm_out, s.rb_ao, H,
+                                                 s.linear_vdim, rows, st);
+        } else {
+            // Q is Q4_K and K/V are Q8_0 in this GGUF, so the single-token path takes the
+            // per-projection use_qkvstream branch (Q on the main stream, K and V on the side
+            // streams) rather than the fused single-grid QKV kernel. The rows path issues the
+            // same three projections on one stream; each row's dot order is unchanged.
+            kernels::launch_dflash_rows_mmvq_q4k(s.rb_aq81, w.wq, s.rb_qraw, s.qdim * 2, H, rows, st);
+            kernels::launch_dflash_rows_mmvq_q80(s.rb_aq81, w.wk, s.rb_k, s.kvdim, H, rows, st);
+            kernels::launch_dflash_rows_mmvq_q80(s.rb_aq81, w.wv, s.rb_v, s.kvdim, H, rows, st);
+            void* kpool = (char*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems() * 2;
+            void* vpool = (char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * 2;
+            for (int r = 0; r < rows; r++)
+                kernels::launch_qwen36_split_q_gate(s.rb_qraw + (size_t)r * s.qdim * 2,
+                                                    s.rb_q + (size_t)r * s.qdim,
+                                                    s.rb_qgate + (size_t)r * s.qdim,
+                                                    c.n_q_heads, c.head_dim, st);
+            // KV append + attention strictly in position order: row r's K/V land in the
+            // cache before row r+1 runs, and row r attends with seqlen = start_pos + r + 1,
+            // so it sees exactly rows 0..r-1 of the window and never r+1 -- the causal
+            // teacher-forced semantics of the token loop.
+            for (int r = 0; r < rows; r++) {
+                const int seqlen_r = start_pos + r + 1;
+                const int* d_pos_r = s.rb_scalars + r * 5 + 1;
+                const int* d_seqlen_r = s.rb_scalars + r * 5 + 3;
+                kernels::launch_qknorm_rope_kv_partial(s.rb_q + (size_t)r * s.qdim,
+                                                       s.rb_k + (size_t)r * s.kvdim,
+                                                       s.rb_v + (size_t)r * s.kvdim,
+                                                       w.q_norm, w.k_norm,
+                                                       (bf16*)kpool, (bf16*)vpool, btable, d_pos_r, 1,
+                                                       c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim,
+                                                       c.rope_theta, c.rms_eps, s.kv->block_size(),
+                                                       s.kv->max_blocks_per_seq(), st);
+                // Gated combine emits Q8_1(sigmoid(gate) * attn) straight into this row's
+                // aq81 slice, same as the single-token attn_gate_q8 path.
+                kernels::launch_flash_decode_split(s.rb_q + (size_t)r * s.qdim, kpool, vpool,
+                                                   btable, d_seqlen_r,
+                                                   s.rb_attn + (size_t)r * s.qdim,
+                                                   s.rb_fa_m + (size_t)r * c.n_q_heads * Impl::MAX_NSPLITS,
+                                                   s.rb_fa_l + (size_t)r * c.n_q_heads * Impl::MAX_NSPLITS,
+                                                   s.rb_fa_acc + (size_t)r * c.n_q_heads * Impl::MAX_NSPLITS * c.head_dim,
+                                                   1, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                                                   s.kv->block_size(), s.kv->max_blocks_per_seq(),
+                                                   row_splits(seqlen_r),
+                                                   1.f / sqrtf((float)c.head_dim), st,
+                                                   (char*)s.rb_aq81 + (size_t)r * q8q, seqlen_r,
+                                                   nullptr, nullptr, 0,
+                                                   s.rb_qgate + (size_t)r * s.qdim);
+            }
+            kernels::launch_dflash_rows_mmvq_q4k(s.rb_aq81, w.wo, s.rb_ao, H, s.qdim, rows, st);
+        }
+
+        // h = x + ao ; hn = RMSNorm(h, post_attn_norm), also emitting Q8_1(hn) for the
+        // shared-expert and routed gate/up MMVQs (fnq).
+        kernels::launch_dflash_rows_add_rmsnorm2_q8(s.rb_x, s.rb_ao, w.post_attn_norm,
+                                                    s.rb_h, s.rb_hn, s.rb_aq81, H, c.rms_eps, rows, st);
+
+        // Shared expert per row (no rows form; the live path overlaps it with the routed MoE
+        // on stream_k, which is correctness-neutral to drop). The gate-scalar gemv + sigmoid
+        // is the exact single-token pair; the live path launches sigmoid_scalar twice on this
+        // branch, but it is a pure function of the gemv output, so once is value-identical.
+        // Each row gets its own h/Q8 scratch so rb_aq81 (still feeding the routed gate/up
+        // below) is never overwritten.
+        for (int r = 0; r < rows; r++) {
+            kernels::launch_gemv(s.rb_hn + (size_t)r * H, w.shared_gate_inp,
+                                 s.rb_shared_gate_tmp + r, 1, H, st);
+            kernels::launch_qwen36_sigmoid_scalar(s.rb_shared_gate_tmp + r, s.rb_shared_w + r, st);
+            kernels::launch_shared_expert_q8_mmvq(
+                s.rb_hn + (size_t)r * H, (char*)s.rb_aq81 + (size_t)r * q8h,
+                w.shared_gate_q, w.shared_up_q, w.shared_down_q,
+                s.rb_shared_w + r,
+                s.rb_shared + (size_t)r * H,
+                s.rb_sx_h + (size_t)r * c.moe_ffn,
+                (char*)s.rb_sx_q8 + (size_t)r * q8f,
+                H, c.moe_ffn, st, false);
+        }
+
+        kernels::launch_dflash_rows_router_fused(s.rb_hn, w.router_w, s.rb_mf_logits, s.rb_rc,
+                                                 s.rb_mf_ids, s.rb_mf_weights,
+                                                 c.n_experts, H, c.top_k, 1, rows, st);
+        kernels::launch_moe_expert_ffn_q4k(s.rb_hn, w.gate_q, w.up_q, w.down_q,
+                                           w.gate_qtype, w.up_qtype, w.down_qtype,
+                                           s.rb_mf_ids, s.rb_mf_weights, s.rb_routed,
+                                           s.rb_mf_h, s.rb_mf_out,
+                                           rows, c.top_k, H, c.moe_ffn,
+                                           s.rb_aq81, st);
+        // x = h + routed + shared ; xn = RMSNorm(x, next input norm) -- final_norm on the
+        // last layer -- plus Q8_1(xn) for the next layer / the LM head (fnq).
+        const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
+        kernels::launch_dflash_rows_add_rmsnorm3_q8(s.rb_h, s.rb_routed, s.rb_shared, nextnorm,
+                                                    s.rb_x, s.rb_xn, s.rb_aq81, H, c.rms_eps, rows, st);
+        dflash_rows_capture_layer(L, rows, row_base);
+    }
+
+    // The last layer's tail already folded final_norm and emitted Q8_1(xn) (fnq), exactly as
+    // forward_token reaches its LM head -- no separate final rmsnorm / quantize.
+    kernels::launch_dflash_rows_mmvq_q4k_f32(s.rb_aq81, s.w.lm_head, s.rb_logits,
+                                             c.vocab, H, rows, st);
+    kernels::launch_argmax(s.rb_logits, s.rb_out_id, rows, c.vocab, st);
+    cu(cudaMemcpyAsync(s.rb_h_out_id, s.rb_out_id, (size_t)rows * sizeof(int),
+                       cudaMemcpyDeviceToHost, st), "rows out ids");
+    cu(cudaStreamSynchronize(st), "rows verify sync");
+    for (int r = 0; r < rows; r++) out_argmax[r] = s.rb_h_out_id[r];
+    return true;
+}
+
 bool Qwen35Model::verify_block(const int* token_ids, int n, int start_pos, int* out_argmax) {
     if (!token_ids || !out_argmax || n <= 0) return false;
     for (int i = 0; i < n; i++) {
@@ -1797,7 +2246,12 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
     const int consumed = dflash_verify_short_run(ctx, token_ids, n, start_pos,
                                                   s.dflash_layer_ids.data(), s.dflash_n_cap,
                                                   const_cast<void*>(dflash_capture_dst), out_argmax);
-    return consumed > 0;
+    if (consumed > 0) return true;
+    // The compact path declines windows it does not support (currently anything past four
+    // rows). Degrade to the token loop rather than reporting failure: the caller treats a
+    // false return as a verify failure and stops generating, which turns an unsupported
+    // window into silently truncated output.
+    return verify_block(token_ids, n, start_pos, out_argmax);
 }
 
 std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, int max_new,
@@ -1862,20 +2316,32 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int th_len = n;
 
     std::vector<int> block(B), posterior(B), draft_ids(B);
-    // Proposal depth (also sets the draft's active diffusion width, depth+1).
+    // Proposal depth (also sets the draft's active diffusion width, depth+1). The verify
+    // window amortizes the target's weight stream over the whole tail, so a deeper tail is
+    // nearly free on the target side and only pays the draft's extra diffusion width; 5 is
+    // the measured optimum on an RTX 5090 (4 and 6 both lose to it). With the window off the
+    // ordering inverts -- every proposal costs its own full forward again and 3 wins -- so
+    // this default and SPARKINFER_DFLASH_ROWS belong together.
     static const int kProposalDepth = []{
         const char* e = getenv("SPARKINFER_DFLASH_PROPOSALS");
-        int v = e ? atoi(e) : 3;
+        int v = e ? atoi(e) : 5;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
     // 0=off, 1=force, 2=adaptive (default). Adaptive preserves early-exit verification on
     // low-acceptance workloads and switches to the weight-reusing four-row graph only after two
-    // consecutive full-block accepts.
+    // consecutive full-block accepts. It only applies while the block still fits that graph.
     static const int compact_mode = []{
         const char* e = getenv("SPARKINFER_DFLASH_COMPACT_VERIFY");
         return e ? atoi(e) : 2;
     }();
     int compact_score = 0;
+    const bool compact_fits = kProposalDepth + 1 <= kDFlashCompactMaxRows;
+    // Wider blocks verify their proposal tail as one row-batched window instead, which is what
+    // makes a deeper block affordable. SPARKINFER_DFLASH_ROWS=0 restores the token loop.
+    static const int rows_verify = []{
+        const char* e = getenv("SPARKINFER_DFLASH_ROWS");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
     bf16* th_scratch = nullptr;
     const int row_stride = dflash_hidden_row_stride();
     if (cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)) != cudaSuccess) {
@@ -1886,7 +2352,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     }
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
-        const bool compact_verify = compact_mode == 1 || (compact_mode != 0 && compact_score >= 2);
+        const bool compact_verify = compact_fits &&
+            (compact_mode == 1 || (compact_mode != 0 && compact_score >= 2));
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 
@@ -1926,13 +2393,25 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         }
         for (int i = 1; i <= kProposalDepth; i++) block[i] = draft_ids[i];
 
-        // Incremental verify with early-exit: forward only the accepted prefix, stopping at the
-        // first rejected proposal. forward_token advances GDN state + KV per token, so after
-        // block[0..keep-1] the recurrent state and KV sit exactly at start+keep -- no snapshot /
-        // restore / KV-truncate / replay needed (greedy speculative decoding is exact). Rejected
-        // proposals (block[keep..B-1]) are never forwarded, saving ~B-keep target forwards/step.
+        // Verify the proposal tail. Both paths below are exact; they differ in how many times
+        // the target's weight stream is read.
+        //
+        // Token loop: forward one proposal per call with early exit, stopping at the first
+        // mismatch. forward_token advances GDN state + KV per token, so after block[0..keep-1]
+        // the recurrent state and KV sit exactly at start+keep and nothing has to be undone.
+        // It costs one full target forward -- one read of every weight -- per emitted token,
+        // which is why DFlash decode lands below plain autoregressive decode.
+        //
+        // Window: push the whole tail through one row-batched forward. Weights stream once for
+        // the window instead of once per proposal; only the routed experts still scale with the
+        // window, since each token routes to its own. The trade is that proposals a rejection
+        // will discard are forwarded anyway, so the GDN recurrent + conv state is snapshotted at
+        // the window head and, when the tail is not fully accepted, rolled back and re-advanced
+        // over the accepted prefix only. KV needs no truncation: later steps overwrite the stale
+        // rows and attention only ever reads seqlen entries.
         int accept = 0, keep = 1;
         bool vfail = false;
+        bool windowed = false;
         if (compact_verify) {
             const int vn = kProposalDepth + 1;
             vfail = !batched_forward(block.data(), vn, start, false, posterior.data(), s.dflash_hidden);
@@ -1945,14 +2424,55 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             posterior[0] = p0;
         }
         if (!compact_verify && !vfail && block[1] == p0) {
+            // Blocks too wide for the compact graph still get one weight stream for the whole
+            // proposal tail, just with the seed verified separately so it keeps overlapping the
+            // draft. The window forwards proposals a rejection will discard, so the recurrent
+            // and conv state is snapshotted here and rewound below when the tail is not fully
+            // accepted. KV needs no truncation: later steps overwrite the stale rows and
+            // attention only ever reads seqlen entries.
+            if (rows_verify && kProposalDepth >= 2) {
+                const size_t ls = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
+                                  s.cfg.linear_head_dim * s.cfg.linear_head_dim;
+                const size_t cs = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim;
+                cu(cudaMemcpyAsync(s.spec_lin_snap, s.lin_state, ls * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, s.stream), "rows snap lin");
+                cu(cudaMemcpyAsync(s.spec_conv_snap, s.lin_conv_state, cs * sizeof(bf16),
+                                   cudaMemcpyDeviceToDevice, s.stream), "rows snap conv");
+                set_dflash_capture_row(1);
+                windowed = dflash_verify_rows(block.data() + 1, kProposalDepth, start + 1,
+                                              posterior.data() + 1);
+            }
             for (int i = 1; i <= kProposalDepth; i++) {
-                set_dflash_capture_row(i);
-                const int p = forward_token(block[i], start + i, true);
-                if (p < 0) { vfail = true; break; }
-                posterior[i] = p;
+                if (!windowed) {
+                    set_dflash_capture_row(i);
+                    posterior[i] = forward_token(block[i], start + i, true);
+                }
+                if (posterior[i] < 0) { vfail = true; break; }
                 accept = i;
                 keep = i + 1;
-                if (i < kProposalDepth && block[i + 1] != p) break;
+                if (i < kProposalDepth && block[i + 1] != posterior[i]) break;
+            }
+            if (windowed && !vfail && accept < kProposalDepth) {
+                // Rewind the recurrent state to the window head and replay only the accepted
+                // proposals. Restoring in place keeps every captured decode graph valid -- the
+                // graphs bake buffer addresses, not their contents.
+                const size_t rls = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
+                                   s.cfg.linear_head_dim * s.cfg.linear_head_dim;
+                const size_t rcs = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim;
+                cu(cudaMemcpyAsync(s.lin_state, s.spec_lin_snap, rls * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, s.stream), "rows rewind lin");
+                cu(cudaMemcpyAsync(s.lin_conv_state, s.spec_conv_snap, rcs * sizeof(bf16),
+                                   cudaMemcpyDeviceToDevice, s.stream), "rows rewind conv");
+                // Re-advance through the window as well. The accepted prefix is the common case
+                // when anything was rejected at all, and replaying it a token at a time would
+                // hand back most of what the window just saved.
+                set_dflash_capture_row(1);
+                if (!dflash_verify_rows(block.data() + 1, accept, start + 1, posterior.data() + 1)) {
+                    for (int i = 1; i <= accept; i++) {
+                        set_dflash_capture_row(i);
+                        if (forward_token(block[i], start + i, true) < 0) { vfail = true; break; }
+                    }
+                }
             }
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
