@@ -1564,7 +1564,12 @@ void launch_moe_expert_ffn_q4k(
         const int q_pdl = gu_pdl && pdl;
         launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
             quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
-        const int S = dense_top1_down_splitk(down_splitk_s_q5(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q5");
+        // Row-count-aware split-K: S=8 (July-2026 sweep) is tuned for 1-row AR decode; the DFlash
+        // compact verify runs num_tokens=6 rows -> already high occupancy, so split-K reduction
+        // overhead dominates and S=1 wins (+2.7% DFlash decode @2550, bit-exact @128, SPEC 32/32).
+        const char* s5env = getenv("SPARKINFER_DOWN_SPLITK_S_Q5");
+        const int Sbase = (num_tokens > 1 && !s5env) ? 1 : down_splitk_s_q5();
+        const int S = dense_top1_down_splitk(Sbase, top_k, "SPARKINFER_DOWN_SPLITK_S_Q5");
         if (S > 1) {
             const int RPB = WPB / S;
             dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
