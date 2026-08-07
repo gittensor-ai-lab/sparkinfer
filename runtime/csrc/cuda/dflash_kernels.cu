@@ -788,6 +788,93 @@ __global__ void k_gemv_batched_fused3_q4(
     }
 }
 
+// Same math as k_gemv_batched_fused3_q4, but the KSPLIT warps of a CTA cooperate on ONE group of
+// ROWS weight rows, each sweeping a 1/KSPLIT stripe of K, instead of each owning a different group.
+// That multiplies the CTA count by KSPLIT without touching the activation traffic (a CTA still
+// reads BATCH*K activations exactly once, just spread over its warps). The draft's projections run
+// at 0.75-4.5 CTAs/SM on a 170-SM device -- far too few to cover DRAM latency -- so parallelism,
+// not bytes, is what they are short of. Cutting ROWS instead would also add CTAs, but it multiplies
+// the activation re-reads, which is why 4 -> 2 -> 1 measured progressively worse.
+template <int BATCH, int ROWS, int KSPLIT>
+__global__ void k_gemv_batched_fused3_q4_ks(
+        const bf16* __restrict__ x,
+        const unsigned char* __restrict__ Q0, const unsigned char* __restrict__ Q1,
+        const unsigned char* __restrict__ Q2,
+        const __half2* __restrict__ D0, const __half2* __restrict__ D1, const __half2* __restrict__ D2,
+        bf16* __restrict__ y0, bf16* __restrict__ y1, bf16* __restrict__ y2,
+        int N0, int N1, int N2, int K) {
+    __shared__ float red[KSPLIT][ROWS][BATCH];
+    const int total = N0 + N1 + N2;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    for (int global_n = blockIdx.x * ROWS; global_n < total; global_n += gridDim.x * ROWS) {
+        const unsigned char* Q; const __half2* D; bf16* y; int N, n0;
+        if (global_n < N0)           { Q = Q0; D = D0; y = y0; N = N0; n0 = global_n; }
+        else if (global_n < N0 + N1) { Q = Q1; D = D1; y = y1; N = N1; n0 = global_n - N0; }
+        else                         { Q = Q2; D = D2; y = y2; N = N2; n0 = global_n - N0 - N1; }
+        const int nr = (N - n0 < ROWS) ? (N - n0) : ROWS;
+        const int K8 = K / 8, KS = K / 32;
+        float acc[ROWS][BATCH];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+#pragma unroll
+            for (int b = 0; b < BATCH; b++) acc[r][b] = 0.f;
+        for (int k8 = warp * 32 + lane; k8 < K8; k8 += KSPLIT * 32) {
+            float wf[ROWS][8];
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const int rr = (r < nr) ? r : 0;
+                const unsigned int packed =
+                    reinterpret_cast<const unsigned int*>(Q + (size_t)(n0 + rr) * (K / 2))[k8];
+                const float2 dmf = __half22float2(D[(size_t)(n0 + rr) * KS + (k8 >> 2)]);
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const unsigned int byte = (packed >> (8 * j)) & 0xFFu;
+                    wf[r][2 * j]     = (float)(byte & 0xFu) * dmf.x + dmf.y;
+                    wf[r][2 * j + 1] = (float)(byte >> 4)   * dmf.x + dmf.y;
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < BATCH; b++) {
+                const uint4 xp = reinterpret_cast<const uint4*>(x + (size_t)b * K)[k8];
+                const bf16* xv = reinterpret_cast<const bf16*>(&xp);
+                float xf[8];
+#pragma unroll
+                for (int j = 0; j < 8; j++) xf[j] = b2f(xv[j]);
+#pragma unroll
+                for (int r = 0; r < ROWS; r++)
+#pragma unroll
+                    for (int j = 0; j < 8; j++) acc[r][b] += wf[r][j] * xf[j];
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+#pragma unroll
+            for (int b = 0; b < BATCH; b++) {
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    acc[r][b] += __shfl_down_sync(0xffffffffu, acc[r][b], off);
+            }
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < ROWS; r++)
+#pragma unroll
+                for (int b = 0; b < BATCH; b++) red[warp][r][b] = acc[r][b];
+        }
+        __syncthreads();
+        // Fold the KSPLIT partials, one thread per (row, batch) output.
+        for (int i = threadIdx.x; i < ROWS * BATCH; i += blockDim.x) {
+            const int r = i / BATCH, b = i - r * BATCH;
+            if (r >= nr) continue;
+            float sum = 0.f;
+#pragma unroll
+            for (int s = 0; s < KSPLIT; s++) sum += red[s][r][b];
+            y[(size_t)b * N + n0 + r] = f2b(sum);
+        }
+        __syncthreads();
+    }
+}
+
 } // namespace
 
 void launch_quantize_w_q4(const void* w, void* q, void* dm, int N, int K, cudaStream_t stream) {
@@ -812,7 +899,35 @@ void launch_gemv_batched_q4_fused3(const void* x,
     // off HBM roofline. 4 halves both arrays and roughly doubles resident CTAs; measured 861.9 tok/s
     // vs 855.4 at 8, with 3 and 5 within noise of 4.
     constexpr int WPB = 4, ROWS = 4;
-    const int warps = (total + ROWS - 1) / ROWS;
+    // K-split factor: how many warps of a CTA cooperate on one group of ROWS weight rows.
+    // 2 measured best (1008.5 -> 1072.6 tok/s against the legacy kernel on the eval prompt); 4 is
+    // within noise and 8 is worse, and selecting it per launch from the grid size was worse still
+    // -- these projections are not latency-starved, they just want a second warp on the same rows.
+    // 0 restores the legacy one-group-per-warp kernel.
+    static const int ksplit = []{
+        const char* e = getenv("SPARKINFER_DFLASH_KSPLIT");
+        int v = e ? atoi(e) : 2;
+        return (v == 2 || v == 4 || v == 8) ? v : 0;
+    }();
+    const int nblk = (total + ROWS - 1) / ROWS;
+    if (ksplit) {
+        dim3 grid(nblk);
+        const dim3 blk(ksplit * 32);
+#define SI_Q4KS(BW_, KS_) k_gemv_batched_fused3_q4_ks<BW_, ROWS, KS_><<<grid, blk, 0, stream>>>(  \
+        (const bf16*)x, (const unsigned char*)Q0, (const unsigned char*)Q1,                       \
+        (const unsigned char*)Q2, (const __half2*)D0, (const __half2*)D1, (const __half2*)D2,     \
+        (bf16*)y0, (bf16*)y1, (bf16*)y2, N0, N1, N2, K)
+#define SI_Q4KS_B(BW_) do { if (ksplit == 2) SI_Q4KS(BW_, 2);                                     \
+                            else if (ksplit == 4) SI_Q4KS(BW_, 4);                                \
+                            else SI_Q4KS(BW_, 8); } while (0)
+        if (batch == 4)      SI_Q4KS_B(4);
+        else if (batch == 8) SI_Q4KS_B(8);
+        else                 SI_Q4KS_B(16);
+#undef SI_Q4KS_B
+#undef SI_Q4KS
+        return;
+    }
+    const int warps = nblk;
     dim3 grid((warps + WPB - 1) / WPB);
     const dim3 blk(WPB * 32);
 #define SI_Q4F3(BW_) k_gemv_batched_fused3_q4<BW_, ROWS><<<grid, blk, 0, stream>>>(              \

@@ -189,6 +189,12 @@ public:
     // Writes argmax at each position into out_argmax[0..n). Returns false on failure.
     bool verify_block(const int* token_ids, int n, int start_pos, int* out_argmax);
 
+    // Build the DFlash verify replay graph without running it. Stream capture records kernels
+    // instead of executing them, so this leaves model state untouched -- it exists purely to keep
+    // ~4.9 ms of graph construction out of the decode loop, where it landed on decode step 2 and
+    // made that token take twice as long as every other one.
+    void dflash_warm_verify(int n, int start_pos);
+
     // Batched verify entry (may fall back to verify_block). Same contract as verify_block.
     bool batched_forward(const int* token_ids, int n, int start_pos, bool resume_gdn,
                          int* out_argmax, const void* dflash_capture_dst = nullptr);

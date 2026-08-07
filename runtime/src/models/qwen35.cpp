@@ -1784,6 +1784,23 @@ bool Qwen35Model::verify_block(const int* token_ids, int n, int start_pos, int* 
     return true;
 }
 
+void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
+    Impl& s = *p_;
+    auto it = s.sessions.find(s.active_seq_id);
+    float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;
+    bf16* lin_conv = (it != s.sessions.end()) ? it->second.lin_conv_state : s.lin_conv_state;
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
+                          lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits };
+    // The recorded token ids and positions are irrelevant: the graph copies them from pinned host
+    // buffers at replay, so only the shapes (n, and the pointer keys) have to match the real steps.
+    std::vector<int> ids(n, 0);
+    std::vector<int> argmax(n, 0);
+    dflash_verify_short_run(ctx, ids.data(), n, start_pos, s.dflash_layer_ids.data(), s.dflash_n_cap,
+                            s.dflash_hidden, argmax.data(), /*capture_only=*/true);
+}
+
 bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bool /*resume_gdn*/,
                                   int* out_argmax, const void* dflash_capture_dst) {
     Impl& s = *p_;
@@ -1896,6 +1913,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         draft.reset();
         return out;
     }
+    // Build the verify replay graph before the decode clock starts. Capture records kernels
+    // rather than running them, so this changes no state -- it just stops decode step 2 from
+    // paying for graph construction.
+    dflash_warm_verify(kProposalDepth + 1, start);
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
         const bool compact_verify = compact_mode == 1 ||
@@ -1973,7 +1994,21 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             }
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
-        compact_score = keep == kProposalDepth + 1 ? std::min(compact_score + 1, 3) : 0;
+        // Leave the block only when the step accepted a single token. Resetting on ANY partial
+        // accept is what cost: the next step then runs the token loop, and if that step goes on to
+        // accept a full block it pays a separate target forward per token (~1.93 ms each) instead
+        // of one row-batched pass (~0.50 ms per row). Measured on the eval prompt, sweeping this
+        // threshold: 1 -> 984.1, 2 -> 1015.0, 3 -> 991.6, 4 -> 989.7 tok/s. 2 is the optimum from
+        // both directions -- at keep 1 the token loop's early exit really is cheaper (its seed
+        // forward overlaps the draft), and above 1 the re-entry cost dominates the single step.
+        // SPARKINFER_DFLASH_BLOCK_KEEP overrides (A/B).
+        static const int kStayKeep = []{
+            const char* e = getenv("SPARKINFER_DFLASH_BLOCK_KEEP");
+            int v = e ? atoi(e) : 2;
+            return v < 1 ? 1 : v;
+        }();
+        compact_score = keep == kProposalDepth + 1 ? std::min(compact_score + 1, 3)
+                      : (keep >= kStayKeep ? std::max(compact_score, kBlockScore) : 0);
         // forward_token() synchronizes after sampling, so the accepted capture rows are already
         // stable. The draft consumes only this newly accepted suffix; its KV cache retains all
         // earlier context. Hand the capture buffer over directly instead of copying it to a second

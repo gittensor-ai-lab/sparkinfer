@@ -2215,13 +2215,19 @@ void launch_pack_i8_rows_i4(const signed char* W_i8, const float* scale_i8,
 bool launch_gemv_i4_q81_multirow_f32(const void* q81, const unsigned char* W,
                                      const float* sw, float* y,
                                      int N, int K, int M, cudaStream_t stream) {
-    if (!q81 || !W || !sw || !y || K != 2048 || M < 3 || M > 6) return false;
+    // M up to 8: the draft scores kProposalDepth rows, and depth 7 -- the widest window
+    // dflash_verify_short_run accepts -- needs 7. Without those instantiations this returned false
+    // and the caller fell back to a per-token full-vocab GEMV loop over the whole block_size=16,
+    // which measured 3.80 ms against this kernel's 0.20.
+    if (!q81 || !W || !sw || !y || K != 2048 || M < 3 || M > 8) return false;
     dim3 grid((N + 15) / 16);
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     if (M == 3) gemv_i4_q81_multirow_kernel<3><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
     else if (M == 4) gemv_i4_q81_multirow_kernel<4><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
     else if (M == 5) gemv_i4_q81_multirow_kernel<5><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
-    else gemv_i4_q81_multirow_kernel<6><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else if (M == 6) gemv_i4_q81_multirow_kernel<6><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else if (M == 7) gemv_i4_q81_multirow_kernel<7><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else gemv_i4_q81_multirow_kernel<8><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
     return true;
 }
 

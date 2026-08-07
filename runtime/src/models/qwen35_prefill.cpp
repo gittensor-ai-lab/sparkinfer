@@ -1189,7 +1189,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
-                            int* out_argmax) {
+                            int* out_argmax, bool capture_only) {
     const Qwen35Config& c = s.cfg;
     if (!token_ids || !out_argmax || n < 1 || n > 8 || !s.gguf || !c.hybrid || c.dense_ffn) {
         fprintf(stderr, "[dflash-verify] base unsupported n=%d gguf=%d hybrid=%d dense=%d\n",
@@ -1386,13 +1386,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_capture_key = capture_dst;
         graph_btable_key = btable;
     }
+    if (graph_ready && capture_only) return 0;   // already built
     if (graph_ready) {
         pf_cu(cudaGraphLaunch(verify_exec, st), "verify graph launch");
         pf_cu(cudaStreamSynchronize(st), "verify graph sync");
         std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
         goto verify_forward_done;
     }
-    recording = graph_warm;
+    recording = graph_warm || capture_only;
     if (recording)
         pf_cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "verify graph begin");
     pf_cu(cudaMemcpyAsync(ids, ph_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify ids");
@@ -1583,6 +1584,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         pf_cu(cudaStreamEndCapture(st, &verify_graph), "verify graph end");
         pf_cu(cudaGraphInstantiate(&verify_exec, verify_graph, 0), "verify graph instantiate");
         graph_ready = true;
+        graph_warm = true;
+        // Nothing ran: capture records the kernels rather than executing them, so the model state
+        // is exactly as it was and there is no work to launch or collect.
+        if (capture_only) return 0;
         pf_cu(cudaGraphLaunch(verify_exec, st), "verify graph first launch");
     }
     pf_cu(cudaStreamSynchronize(st), "verify sync");
