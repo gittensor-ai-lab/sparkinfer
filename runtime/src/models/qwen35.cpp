@@ -11,6 +11,7 @@
 
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/models/dflash_draft.h"
+#include "sparkinfer/models/dflash_kernels.h"
 #include "qwen35_prefill.h"
 #include "sparkinfer/thermal_governor.h"
 #include "sparkinfer/kv_ops.h"
@@ -32,9 +33,9 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <climits>
 #include <limits>
 #include <algorithm>
-#include <thread>
 
 namespace sparkinfer {
 
@@ -43,6 +44,10 @@ inline void cu(cudaError_t e, const char* what) {
     if (e != cudaSuccess) fprintf(stderr, "[qwen35] %s: %s\n", what, cudaGetErrorString(e));
 }
 using bf16 = unsigned short;
+
+// forward_token() sentinel: the decode graph was enqueued but not yet collected. Never a valid
+// token id, so it cannot be confused with a real argmax.
+constexpr int kDFlashDeferred = INT_MIN;
 
 // launch_gguf_dequant only implements F32/F16/Q8_0/Q4_K/Q6_K. Reject anything
 // else at load time so Q5_K (etc.) cannot silently fall through as F32.
@@ -136,17 +141,14 @@ struct Qwen35Model::Impl {
     bool bench_feedback_graph = false;
     int graph_attn_mode = -1;  // host-side flash-decode dispatch class captured in cu_graph
     // Separate decode graph for DFlash verify (sample=true, dflash_capture=true). The normal
-    // cu_graph/cu_exec can't be reused here because dflash_maybe_capture_layer's destination
-    // (dflash_hidden + cap_row*row_elems) changes every call; this graph instead always
-    // captures into the row-independent dflash_cap_stage buffer, and the caller does one
-    // small follow-up memcpy into the real row after each replay -- same varying-scalar-input
-    // pattern the plain decode graph already relies on for token_id/position.
+    // cu_graph/cu_exec can't be reused here because it carries the extra per-layer hidden
+    // captures. Their destination row varies per call, which is handled the same way the graph
+    // already handles token_id/position: cap_row is packed into d_scalars and read on device.
     cudaGraph_t cu_dflash_graph{};
     cudaGraphExec_t cu_dflash_exec{};
     bool dflash_graph_ready = false;
     int dflash_graph_attn_mode = -1;
     bool dflash_graph_sparse = false;
-    bf16* dflash_cap_stage = nullptr;  // [n_cap, H], row-independent capture target for the graph
 
     // scratch (bf16)
     bf16 *x, *xn, *q, *k, *v, *attn, *ao, *h, *hn, *routed, *shared;
@@ -159,6 +161,7 @@ struct Qwen35Model::Impl {
     float* lin_state = nullptr;
     float* logits;
     int *d_scalars, *d_tok, *d_out_id, *d_pos, *d_seqlen, *d_writepos, *d_shared_ids;
+    int *d_cap_row = nullptr;   // dflash capture row, packed into d_scalars[4]
     int *h_scalars = nullptr, *h_out_id = nullptr;
     float* d_shared_w;
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
@@ -223,6 +226,10 @@ struct Qwen35Model::Impl {
     const void* dflash_lm_head = nullptr;
     int dflash_lm_head_type = 0;
     bool dflash_capture = false;
+    // DFlash verify token 0: enqueue the captured decode graph and collect it later, so the
+    // draft block can be issued in between (see dflash_generate).
+    bool defer_decode_sync = false;
+    bool decode_pending = false;
     std::vector<int> dflash_layer_ids;
     int dflash_n_cap = 0;
     int dflash_max_rows = 16;
@@ -289,11 +296,12 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         p_->shared_gate_tmp=p_->alloc<bf16>(1);
     }
     p_->logits=p_->alloc<float>(cfg.vocab);
-    p_->d_scalars=p_->alloc<int>(4);
+    p_->d_scalars=p_->alloc<int>(5);
     p_->d_tok=p_->d_scalars + 0; p_->d_pos=p_->d_scalars + 1;
     p_->d_writepos=p_->d_scalars + 2; p_->d_seqlen=p_->d_scalars + 3;
+    p_->d_cap_row=p_->d_scalars + 4;
     p_->d_out_id=p_->alloc<int>(1);
-    cu(cudaHostAlloc(&p_->h_scalars, 4 * sizeof(int), cudaHostAllocDefault), "host scalars");
+    cu(cudaHostAlloc(&p_->h_scalars, 5 * sizeof(int), cudaHostAllocDefault), "host scalars");
     cu(cudaHostAlloc(&p_->h_out_id, sizeof(int), cudaHostAllocDefault), "host out id");
     p_->d_shared_ids=p_->alloc<int>(1); p_->d_shared_w=p_->alloc<float>(1);
     int zero=0; float one=1.f;
@@ -414,7 +422,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->sparse_sel);
     cudaFree(p_->sparse_vtbl); cudaFree(p_->sparse_vlen);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
-    cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context); cudaFree(p_->dflash_cap_stage);
+    cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
     // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
     for (auto& kv : p_->sessions) {
         if (kv.first == 0) continue;
@@ -443,19 +451,19 @@ void Qwen35Model::copy_logits(float* host_logits) const {
 
 void Qwen35Model::dflash_maybe_capture_layer(int layer) {
     Impl& s = *p_;
-    if (!s.dflash_capture || !s.dflash_cap_stage || s.dflash_n_cap <= 0) return;
+    if (!s.dflash_capture || !s.dflash_hidden || s.dflash_n_cap <= 0) return;
     int slot = -1;
     for (int i = 0; i < s.dflash_n_cap; i++) {
         if (s.dflash_layer_ids[i] == layer) { slot = i; break; }
     }
     if (slot < 0) return;
     const int H = s.cfg.hidden;
-    // Writes to the row-independent staging buffer (not dflash_hidden[cap_row] directly) so
-    // this sequence of memcpys has a FIXED destination and can be captured into the dflash
-    // decode graph below; the caller copies stage -> dflash_hidden[cap_row] once per call.
-    bf16* dst = s.dflash_cap_stage + (size_t)slot * H;
-    cu(cudaMemcpyAsync(dst, s.x, (size_t)H * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
-       "dflash capture");
+    // Writes dflash_hidden[cap_row][slot] directly. cap_row is read from d_scalars[4] on the
+    // device, so this node is graph-capturable even though the row changes every verify token --
+    // which retires the staging buffer and the extra out-of-graph flush memcpy that every DFlash
+    // verify token paid on top of a plain decode forward.
+    dflash_kernels::launch_capture_row(s.x, s.dflash_hidden, s.d_cap_row, slot, H,
+                                       s.dflash_n_cap * H, s.dflash_max_rows, s.stream);
 }
 
 int Qwen35Model::forward_token(int token_id, int position, bool sample) {
@@ -466,25 +474,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     int seqlen = position + 1;
     cudaStream_t st = s.stream;
     const bool dflash_cap = s.dflash_capture;
-    // dflash_maybe_capture_layer always writes into the row-independent dflash_cap_stage
-    // buffer (graph-capturable, unlike dflash_hidden[cap_row] which varies call to call).
-    // Every path that can run it -- eager prefill, dflash decode graph capture, dflash decode
-    // graph replay -- must call this exactly once afterward or dflash_hidden[cap_row] is left
-    // stale/uninitialized for that call.
-    auto dflash_flush_stage = [&s, H]() {
-        if (!s.dflash_hidden || !s.dflash_cap_stage || s.dflash_n_cap <= 0 ||
-            s.dflash_cap_row < 0 || s.dflash_cap_row >= s.dflash_max_rows) return;
-        const size_t row_elems = (size_t)s.dflash_n_cap * H;
-        cu(cudaMemcpyAsync(s.dflash_hidden + (size_t)s.dflash_cap_row * row_elems,
-                           s.dflash_cap_stage, row_elems * sizeof(bf16),
-                           cudaMemcpyDeviceToDevice, s.stream), "dflash stage->hidden");
-    };
-
     s.h_scalars[0] = token_id;
     s.h_scalars[1] = position;
     s.h_scalars[2] = position;
     s.h_scalars[3] = seqlen;
-    cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 4 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
+    s.h_scalars[4] = s.dflash_cap_row;
+    cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 5 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
     // Depth-adaptive KV-split: 32 (short) -> 128 (mid) -> 256 (long). The 8k-12k band
     // (28*split_chunk < seqlen <= 48*split_chunk) is roofline-bound on 128 splits; promote
@@ -612,10 +607,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // Prefill graph: embed→layers→final norm (no LM head). Decode graph: full path + argmax.
     // DFlash's per-layer hidden capture used to require the eager path entirely (a captured
     // graph bakes fixed destinations, and dflash_hidden[cap_row] varies call to call) -- the
-    // dflash decode graph below instead captures into the row-independent dflash_cap_stage
-    // buffer and the caller does one small follow-up memcpy into the real row, so DFlash
-    // verify tokens (sample=true) get graph replay too. The prefill/prompt path (sample=false)
-    // still falls back to eager under capture; it is not on the scored decode-tps path.
+    // capture kernel reads cap_row from device memory instead, so DFlash verify tokens
+    // (sample=true) get graph replay with no post-replay fixup. The prefill/prompt path
+    // (sample=false) still falls back to eager under capture; not on the scored decode path.
     if (!sample && s.graph_prefill_ready && !dflash_cap) {
         cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch");
         cu(cudaStreamSynchronize(st), "prefill graph sync");
@@ -629,8 +623,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     }
     if (sample && dflash_cap && s.dflash_graph_ready) {
         cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch");
-        dflash_flush_stage();
         cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
+        // Deferred collect (DFlash verify token 0 only): return without blocking so the caller
+        // can issue the draft block behind it. The target forward is then already running on the
+        // GPU while the host is still issuing the draft's ~100 launches -- and it costs no
+        // std::thread spawn/join per decode step.
+        if (s.defer_decode_sync) { s.decode_pending = true; return kDFlashDeferred; }
         cu(cudaStreamSynchronize(st), "sync");
         return *s.h_out_id;
     }
@@ -1230,12 +1228,6 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             s.graph_prefill_attn_mode = attn_graph_mode;
             cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch (first)");
         }
-        // The prefill/prompt path always runs dflash_maybe_capture_layer eagerly (never
-        // graph-captured, see capturing_graph above), which now writes into the row-independent
-        // dflash_cap_stage instead of dflash_hidden[cap_row] directly (so the SAME helper is
-        // safe to call from inside the dflash decode graph too). Needs the same follow-up copy
-        // the decode-graph branches do, or dflash_hidden[cap_row] is never actually updated here.
-        if (dflash_cap) dflash_flush_stage();
         cu(cudaStreamSynchronize(st), "prefill sync");
         return token_id;
     }
@@ -1260,7 +1252,6 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.dflash_graph_attn_mode = attn_graph_mode;
         s.dflash_graph_sparse = sparse_on;
         cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
-        dflash_flush_stage();
     } else if (capturing_graph) {
         cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
         cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
@@ -1716,11 +1707,9 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
     const size_t hidden_bytes = (size_t)s.dflash_max_rows * row_elems * sizeof(bf16);
     if (s.dflash_hidden) { cudaFree(s.dflash_hidden); s.dflash_hidden = nullptr; }
     if (s.dflash_context) { cudaFree(s.dflash_context); s.dflash_context = nullptr; }
-    if (s.dflash_cap_stage) { cudaFree(s.dflash_cap_stage); s.dflash_cap_stage = nullptr; }
     s.dflash_ctx_cap = s.cfg.max_seq;
     cu(cudaMalloc(&s.dflash_hidden, hidden_bytes), "dflash hidden");
     cu(cudaMalloc(&s.dflash_context, (size_t)s.dflash_ctx_cap * row_elems * sizeof(bf16)), "dflash ctx");
-    cu(cudaMalloc(&s.dflash_cap_stage, row_elems * sizeof(bf16)), "dflash cap stage");
     if (s.cfg.hybrid && !s.spec_lin_snap) {
         const size_t ls = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
                           s.cfg.linear_head_dim * s.cfg.linear_head_dim;
@@ -1809,9 +1798,19 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     const int B = dc.block_size;
     const int mask_id = dc.mask_token_id;
 
-    draft.set_shared_weights(embed_weights(),
-                             s.dflash_lm_head ? s.dflash_lm_head : lm_head_weights(),
-                             s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type(),
+    // Head for the draft. The dual-head path keeps a native Q6_K copy so the draft's multi-row
+    // MMVQ has something to chew on, but that kernel runs near HBM peak, so its runtime is just
+    // its weight bytes -- and the target's own Q4_K copy is ~280 MB against the Q6_K's ~417 MB.
+    // With a multi-row Q4_K MMVQ the draft prefers the smaller one. SPARKINFER_DFLASH_HEAD_Q4=0
+    // restores the Q6_K copy (A/B).
+    static const int head_q4 = []{ const char* e = getenv("SPARKINFER_DFLASH_HEAD_Q4");
+                                   return (e && e[0] == '0') ? 0 : 1; }();
+    const bool use_q4_head = head_q4 && lm_head_quant_type() == 12 && lm_head_weights();
+    const void* draft_head = use_q4_head ? lm_head_weights()
+                           : (s.dflash_lm_head ? s.dflash_lm_head : lm_head_weights());
+    const int draft_head_type = use_q4_head ? lm_head_quant_type()
+                              : (s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type());
+    draft.set_shared_weights(embed_weights(), draft_head, draft_head_type,
                              s.cfg.vocab, s.cfg.hidden);
     set_dflash_capture(true, dc.target_layer_ids, B);
 
@@ -1851,7 +1850,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int th_len = n;
 
     std::vector<int> block(B), posterior(B), draft_ids(B);
-    constexpr int kProposalDepth = 3;
+    // Proposal depth (also sets the draft's active diffusion width, depth+1).
+    static const int kProposalDepth = []{
+        const char* e = getenv("SPARKINFER_DFLASH_PROPOSALS");
+        int v = e ? atoi(e) : 3;
+        return v < 1 ? 1 : (v > 15 ? 15 : v);
+    }();
     bf16* th_scratch = nullptr;
     const int row_stride = dflash_hidden_row_stride();
     if (cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)) != cudaSuccess) {
@@ -1877,12 +1881,21 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             draft_hidden = th_scratch;
         }
 
-        int p0 = -1;
+        // Enqueue verify token 0 first (one graph launch, ~10 us of host time), then issue the
+        // draft block on its own stream. Ordering matters: the target must be in flight before
+        // the draft's launches start, or the draft queues ahead of it. A deferred collect also
+        // avoids spawning and joining a std::thread on every decode step.
         set_dflash_capture_row(0);
-        std::thread verify0([&] { p0 = forward_token(block[0], start, true); });
+        s.defer_decode_sync = true;
+        int p0 = forward_token(block[0], start, true);
+        s.defer_decode_sync = false;
         const bool draft_ok = draft.forward_block(
             draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr);
-        verify0.join();
+        if (p0 == kDFlashDeferred) {
+            cu(cudaStreamSynchronize(s.stream), "verify0 sync");
+            s.decode_pending = false;
+            p0 = *s.h_out_id;
+        }
         if (!draft_ok) {
             fprintf(stderr, "[dflash] draft forward failed at start=%d\n", start);
             break;

@@ -74,6 +74,10 @@ void launch_gemv_q_dp4a_pq_f32(const void* q8, const float* ad, const float* as,
 // nwarps=4 cooperate per row. A/B test vs our split-K dp4a (SPARKINFER_LLAMA=1).
 size_t llama_q8_1_bytes(int K);
 void launch_quantize_q8_1_blocks(const void* x, void* y, int K, cudaStream_t stream = nullptr);
+// Row-batched Q8_1 quantize: `rows` activation rows of K values, x row stride `x_stride` elements,
+// y rows contiguous (llama_q8_1_bytes(K) apart). Same per-row math as the single-row launcher.
+void launch_quantize_q8_1_rows(const void* x, void* y, int K, int rows, int x_stride,
+                               cudaStream_t stream = nullptr);
 void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
 // Fused GDN qkv+z Q4_K MMVQ (shared Q8_1 activation). K is hidden (2048 -> NSUPER=8, 4096 -> 16).
@@ -103,6 +107,9 @@ void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, i
 // M activation rows vs one shared Q6_K weight (DFlash draft head: B block tokens, same lm_head).
 // The weight streams from HBM once instead of M times. q81 = M contiguous llama_q8_1_bytes(K) rows,
 // y = [M, N] fp32. Returns false if the shape is unsupported so the caller can fall back.
+// Same, for a Q4_K weight (the LM-head copy the target keeps). ~280 MB vs ~417 MB at V=248k.
+bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
+                                       int N, int K, int M, cudaStream_t stream = nullptr);
 bool launch_gemv_q6k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
                                        int N, int K, int M, cudaStream_t stream = nullptr);
 

@@ -92,6 +92,51 @@ __global__ void argmax_p2_kernel(int* __restrict__ out_id) {
     if (t == 0) out_id[0] = s_idx[0];
 }
 
+// Row-parallel form of the two-pass scan. The n_rows>1 path is one block per row: with the DFlash
+// draft's handful of proposal rows that pins a 248k-entry scan to a few of the 5090's 170 SMs.
+// Same split as the single-row decode path, with the row on grid.y and per-row partials.
+// argmax_merge is associative and picks max-value/min-index, so the verdict is identical to
+// argmax_kernel's regardless of how the scan is partitioned.
+static constexpr int ARGMAX_ROWS_MAX = 16;
+__device__ float g_argmax_rpv[ARGMAX_ROWS_MAX * ARGMAX_BLOCKS];
+__device__ int   g_argmax_rpi[ARGMAX_ROWS_MAX * ARGMAX_BLOCKS];
+
+__global__ void argmax_rows_p1_kernel(const float* __restrict__ logits, int vocab) {
+    const int row = blockIdx.y;
+    const float* L = logits + (size_t)row * vocab;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    __shared__ float s_val[256];
+    __shared__ int   s_idx[256];
+    float best = -1e30f; int bi = 0;
+    for (int v = tid; v < vocab; v += stride) if (L[v] > best) { best = L[v]; bi = v; }
+    s_val[threadIdx.x] = best; s_idx[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            argmax_merge(s_val[threadIdx.x], s_idx[threadIdx.x], s_val[threadIdx.x + s], s_idx[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        g_argmax_rpv[row * ARGMAX_BLOCKS + blockIdx.x] = s_val[0];
+        g_argmax_rpi[row * ARGMAX_BLOCKS + blockIdx.x] = s_idx[0];
+    }
+}
+
+__global__ void argmax_rows_p2_kernel(int* __restrict__ out_id) {
+    __shared__ float s_val[ARGMAX_BLOCKS];
+    __shared__ int   s_idx[ARGMAX_BLOCKS];
+    const int row = blockIdx.x, t = threadIdx.x;
+    s_val[t] = g_argmax_rpv[row * ARGMAX_BLOCKS + t];
+    s_idx[t] = g_argmax_rpi[row * ARGMAX_BLOCKS + t];
+    __syncthreads();
+    for (int s = ARGMAX_BLOCKS / 2; s > 0; s >>= 1) {
+        if (t < s) argmax_merge(s_val[t], s_idx[t], s_val[t + s], s_idx[t + s]);
+        __syncthreads();
+    }
+    if (t == 0) out_id[row] = s_idx[0];
+}
+
 __global__ void decode_feedback_kernel(int* __restrict__ scalars,
                                        const int* __restrict__ out_id) {
     scalars[0] = out_id[0];
@@ -114,6 +159,9 @@ void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab, cuda
     if (n_rows == 1) {   // decode: parallelize the single-row scan across all SMs
         argmax_p1_kernel<<<ARGMAX_BLOCKS, 256, 0, stream>>>(logits, vocab);
         argmax_p2_kernel<<<1, ARGMAX_BLOCKS, 0, stream>>>(out_id);
+    } else if (n_rows > 1 && n_rows <= ARGMAX_ROWS_MAX) {
+        argmax_rows_p1_kernel<<<dim3(ARGMAX_BLOCKS, n_rows), 256, 0, stream>>>(logits, vocab);
+        argmax_rows_p2_kernel<<<n_rows, ARGMAX_BLOCKS, 0, stream>>>(out_id);
     } else {
         argmax_kernel<<<n_rows, 1024, 0, stream>>>(logits, out_id, vocab);
     }

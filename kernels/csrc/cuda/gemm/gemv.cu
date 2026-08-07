@@ -497,6 +497,28 @@ __global__ void si_quantize_q8_1_blocks(const __nv_bfloat16* __restrict__ x,
     if (lane == 0) y[ib].ds = __floats2half2_rn(d, d * (float)s);
 }
 
+// Row-batched form: grid.y selects the activation row. The DFlash draft head quantizes its
+// proposal rows before the multi-row MMVQ; as separate launches those are tiny kernels (8 CTAs
+// each) whose launch latency dominates their runtime. Per-row arithmetic is unchanged.
+__global__ void si_quantize_q8_1_rows(const __nv_bfloat16* __restrict__ x,
+                                      si_block_q8_1* __restrict__ y, int K, int x_stride) {
+    const int warpsPB = blockDim.x >> 5, ib = blockIdx.x * warpsPB + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (ib >= (K >> 5)) return;
+    const __nv_bfloat16* xr = x + (size_t)blockIdx.y * x_stride;
+    si_block_q8_1* yr = y + (size_t)blockIdx.y * (K >> 5);
+    float xv = __bfloat162float(xr[ib * 32 + lane]), a = fabsf(xv);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    float d = a / 127.0f;
+    int qi = (a == 0.0f) ? 0 : (int)roundf(xv / d);
+    yr[ib].qs[lane] = (signed char)qi;
+    int s = qi;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+    if (lane == 0) yr[ib].ds = __floats2half2_rn(d, d * (float)s);
+}
+
 __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4,
                                                  const si_block_q8_1* bq8_1, int iqs) {
     int v[2], u[4]; float d8[2];
@@ -1050,13 +1072,81 @@ __global__ void gemv_q6k_dp4a_kfixed_kernel(const si_block_q8_1* __restrict__ vy
 // (~416 MB per read at V=248k,K=2048 — far past L2, so it is real HBM traffic). Here each warp owns
 // one output row and walks its weight superblocks ONCE, accumulating all M dot products, so the
 // weight streams from HBM a single time and the M reuses hit L1. y is [M, N] row-major.
+// Multi-row Q4_K MMVQ for the DFlash draft head. Same idea as the Q6_K multi-row kernel below,
+// but against the Q4_K copy of the LM head the target already keeps: 248k x 2048 is ~280 MB in
+// Q4_K versus ~417 MB in Q6_K, and that kernel already runs near HBM peak, so the bytes ARE the
+// runtime. One warp owns an output row and walks its super-blocks once; the weight-side work
+// (nibble extraction, the 6-bit scale/min unpack, and the block dm) is hoisted out of the row
+// loop so each extra activation row costs only its two dp4a's. Draft-only, so the Q4_K rounding
+// can shift proposals but never the emitted tokens.
+template <typename OutT, int WPB, int NSUPER, int MMAX, int MFIXED = 0>
+__global__ void si_mmvq_q4k_multirow_kernel(const si_block_q8_1* __restrict__ vy,
+                                            const unsigned char* __restrict__ W,
+                                            OutT* __restrict__ y, int N, int M) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    constexpr int QPR = NSUPER * 8;               // si_block_q8_1 blocks per activation row
+    for (int row = blockIdx.x * WPB + warp; row < N; row += gridDim.x * WPB) {
+        const si_block_q4_K* x_row = (const si_block_q4_K*)(W + (size_t)row * NSUPER * 144);
+        float acc[MMAX];
+        #pragma unroll
+        for (int m = 0; m < MMAX; m++) acc[m] = 0.f;
+        // 32 lanes cover the NSUPER*16 (super-block, iqs) pairs.
+        for (int p = lane; p < NSUPER * 16; p += 32) {
+            const int kbx = p >> 4, half = p & 15;
+            const si_block_q4_K* bq4 = x_row + kbx;
+            const int bq8_offset = 2 * (half / 4);
+            const int* q4 = (const int*)(bq4->qs + 16 * bq8_offset + 4 * (half % 4));
+            const int v0 = q4[0], v1 = q4[4];
+            const unsigned short* scales = (const unsigned short*)bq4->scales;
+            unsigned short aux[2]; const int j = bq8_offset / 2;
+            if (j < 2) { aux[0] = scales[j] & 0x3f3f; aux[1] = scales[j + 2] & 0x3f3f; }
+            else { aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+                   aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2); }
+            const unsigned char* sc = (const unsigned char*)aux;
+            const unsigned char* mn = sc + 2;
+            const float2 dm4f = __half22float2(bq4->dm);
+            #pragma unroll
+            for (int m = 0; m < (MFIXED ? MFIXED : M); m++) {
+                const si_block_q8_1* b8 = vy + (size_t)m * QPR + kbx * 8 + bq8_offset;
+                float sumf_d = 0.0f, sumf_m = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const float d8 = __low2float(b8[i].ds);
+                    const int* q8 = (const int*)b8[i].qs + (half % 4);
+                    const int u0 = q8[0], u1 = q8[4];
+                    const int v0i = (v0 >> (4 * i)) & 0x0F0F0F0F;
+                    const int v1i = (v1 >> (4 * i)) & 0x0F0F0F0F;
+                    const int dot1 = __dp4a(v1i, u1, __dp4a(v0i, u0, 0));
+                    const int dot2 = __dp4a(0x01010101, u1, __dp4a(0x01010101, u0, 0));
+                    sumf_d += d8 * (dot1 * sc[i]);
+                    sumf_m += d8 * (dot2 * mn[i]);
+                }
+                acc[m] += dm4f.x * sumf_d - dm4f.y * sumf_m;
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < MMAX; m++) {
+            if (MFIXED == 0 && m >= M) break;
+            float a = acc[m];
+            #pragma unroll
+            for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffff, a, s);
+            if (lane == 0) gemv_write(y + (size_t)m * N + row, a);
+        }
+    }
+}
+
 template <typename OutT, int WPB, int NSUPER, int MMAX, int MFIXED = 0>
 __global__ void gemv_q6k_dp4a_multirow_kernel(const si_block_q8_1* __restrict__ vy,
                                               const unsigned char* __restrict__ W,
                                               OutT* __restrict__ y, int N, int M) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row = blockIdx.x * WPB + warp;
-    if (row >= N) return;
+    // Grid-stride over output rows so the launcher can CAP the grid. This is the DFlash draft's
+    // largest kernel by far (a 248k-row vocabulary is 15520 CTAs of 512 threads) and it runs
+    // concurrently with a target verify forward on another stream. At full width it occupies the
+    // whole GPU and stalls that forward's long chain of small dependent kernels; the draft has a
+    // ~1.9 ms window to fit ~0.9 ms of work into, so trading draft width for less interference is
+    // free until the draft stops fitting.
+    for (int row = blockIdx.x * WPB + warp; row < N; row += gridDim.x * WPB) {
     const unsigned char* x_row = W + (size_t)row * NSUPER * 210;
     constexpr int QPR = NSUPER * 8;            // si_block_q8_1 blocks per activation row
     float acc[MMAX];
@@ -1104,6 +1194,7 @@ __global__ void gemv_q6k_dp4a_multirow_kernel(const si_block_q8_1* __restrict__ 
         #pragma unroll
         for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffff, a, s);
         if (lane == 0) gemv_write(y + (size_t)m * N + row, a);
+    }
     }
 }
 
@@ -1313,6 +1404,14 @@ void launch_quantize_q8_1_blocks(const void* x, void* y, int K, cudaStream_t str
     si_quantize_q8_1_blocks<<<grid, warpsPB * 32, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<si_block_q8_1*>(y), K);
 }
+void launch_quantize_q8_1_rows(const void* x, void* y, int K, int rows, int x_stride,
+                               cudaStream_t stream) {
+    if (rows <= 0) return;
+    const int nb = K >> 5, warpsPB = 8;
+    dim3 grid((nb + warpsPB - 1) / warpsPB, rows);
+    si_quantize_q8_1_rows<<<grid, warpsPB * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<si_block_q8_1*>(y), K, x_stride);
+}
 static int mmvq_dualrow() {
     static int v = -1;
     if (v < 0) { const char* e = getenv("SPARKINFER_MMVQ2"); v = (e && e[0] == '0') ? 0 : 1; }
@@ -1401,10 +1500,47 @@ void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K,
 }
 // M activation rows against one shared Q6_K weight. q81 is M contiguous llama_q8_1_bytes(K)
 // activation rows; y is [M, N] fp32. Returns false when the shape is unsupported (caller loops).
+bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
+                                       int N, int K, int M, cudaStream_t stream) {
+    if (K != 2048 || M < 1 || M > 16) return false;   // draft head shape (H=2048, B<=16)
+    static const int cap = []{
+        if (const char* e = getenv("SPARKINFER_DFLASH_HEAD_CTAS")) return atoi(e);
+        int sm = 0, dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+            return 0;
+        return sm > 1 ? sm / 2 : 0;
+    }();
+    int nblk = (N + 15) / 16;
+    if (cap > 0 && nblk > cap) nblk = cap;
+    dim3 grid(nblk);
+    auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    auto* w = reinterpret_cast<const unsigned char*>(W);
+    if (M == 3) si_mmvq_q4k_multirow_kernel<float, 16, 8, 3, 3><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    else        si_mmvq_q4k_multirow_kernel<float, 16, 8, 16><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    return true;
+}
+
 bool launch_gemv_q6k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
                                        int N, int K, int M, cudaStream_t stream) {
     if (K != 2048 || M < 1 || M > 16) return false;   // draft head shape (H=2048, B<=16)
-    dim3 grid((N + 15) / 16);
+    // Cap the grid so the draft head leaves SM slots for the target verify forward it runs
+    // concurrently with (the kernel grid-strides, so a capped grid still covers every row).
+    // Default: half the SMs. The kernel grid-strides, so a capped grid still covers every row —
+    // it just stops the draft head from occupying the whole GPU while a target verify forward
+    // runs concurrently on another stream. Measured peak on an RTX 5090 (170 SMs) is exactly
+    // SM/2 = 85; both wider (170/340/full) and narrower (56/40/28) are worse.
+    static const int cap = []{
+        if (const char* e = getenv("SPARKINFER_DFLASH_HEAD_CTAS")) return atoi(e);
+        int sm = 0, dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+            return 0;
+        return sm > 1 ? sm / 2 : 0;
+    }();
+    int nblk = (N + 15) / 16;
+    if (cap > 0 && nblk > cap) nblk = cap;
+    dim3 grid(nblk);
     if (M == 3) {
         gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 3, 3><<<grid, 16 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, M);

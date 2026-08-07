@@ -225,12 +225,29 @@ bool parse_config_json(const std::string& path, DFlashDraftConfig& cfg) {
     return true;
 }
 
+struct Q8W { signed char* q = nullptr; float* s = nullptr;
+              unsigned char* q4 = nullptr; void* dm = nullptr; };
+
 struct LayerWeights {
     bf16 *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
+    // Q8_0 mirrors of the four batched projections (Q/K/V, O, gate/up, down).
+    Q8W q8_wq, q8_wk, q8_wv, q8_wo, q8_gate, q8_up, q8_down;
     bf16 *q_norm = nullptr, *k_norm = nullptr;
     bf16 *input_norm = nullptr, *post_norm = nullptr;
     bf16 *gate = nullptr, *up = nullptr, *down = nullptr;
 };
+
+// Draft projection weight format: 4 = asymmetric int4, 8 = Q8_0, 0 = bf16. Default 4.
+inline int draft_w_bits() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_DFLASH_WBITS");
+        v = e ? atoi(e) : 4;
+        if (v != 0 && v != 4 && v != 8) v = 4;
+    }
+    return v;
+}
+inline bool q8_on() { return draft_w_bits() != 0; }
 
 } // namespace
 
@@ -266,6 +283,21 @@ struct DFlashDraftModel::Impl {
     // Per-layer contiguous KV cache: [max_seq, n_kv, d]
     std::vector<bf16*> k_cache, v_cache;
     int seq_len = 0;
+
+    Q8W make_q8(bf16* w, int N, int K) {
+        Q8W o;
+        if (draft_w_bits() == 4) {
+            o.q4 = alloc<unsigned char>((size_t)N * (K / 2));
+            o.dm = alloc<short>((size_t)N * (K / 32) * 2);   // __half2 per 32-weight block
+            dflash_kernels::launch_quantize_w_q4(w, o.q4, o.dm, N, K, stream);
+        } else {
+            o.q = alloc<signed char>((size_t)N * K);
+            o.s = alloc<float>((size_t)N * (K / 32));
+            dflash_kernels::launch_quantize_w_q8(w, o.q, o.s, N, K, stream);
+        }
+        cudaStreamSynchronize(stream);
+        return o;
+    }
 
     template <class T> T* alloc(size_t n) {
         void* p = nullptr;
@@ -402,6 +434,18 @@ bool DFlashDraftModel::load(const std::string& dir) {
         lw.q_norm = s.upload(*qn); lw.k_norm = s.upload(*kn);
         lw.input_norm = s.upload(*in); lw.post_norm = s.upload(*pn);
         lw.gate = s.upload(*g); lw.up = s.upload(*u); lw.down = s.upload(*d);
+        // Q8_0 mirrors: the batched projections are DRAM-bound at the narrowed diffusion width,
+        // so halving their weight bytes is the dominant remaining win. Built once, on load.
+        if (q8_on()) {
+            const int qd = s.cfg.n_q_heads * s.cfg.head_dim, kvd = s.cfg.n_kv_heads * s.cfg.head_dim;
+            lw.q8_wq   = s.make_q8(lw.wq,   qd,  H);
+            lw.q8_wk   = s.make_q8(lw.wk,   kvd, H);
+            lw.q8_wv   = s.make_q8(lw.wv,   kvd, H);
+            lw.q8_wo   = s.make_q8(lw.wo,   H,   qd);
+            lw.q8_gate = s.make_q8(lw.gate, I,   H);
+            lw.q8_up   = s.make_q8(lw.up,   I,   H);
+            lw.q8_down = s.make_q8(lw.down, H,   I);
+        }
     }
 
     // Scratch
@@ -456,24 +500,45 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     const int qdim = c.n_q_heads * c.head_dim;
     const int kvdim = c.n_kv_heads * c.head_dim;
     const int d = c.head_dim;
-    constexpr int kProposalDepth = 3;
+    // Proposal depth (also sets the draft's active diffusion width, depth+1).
+    static const int kProposalDepth = []{
+        const char* e = getenv("SPARKINFER_DFLASH_PROPOSALS");
+        int v = e ? atoi(e) : 3;
+        return v < 1 ? 1 : (v > 15 ? 15 : v);
+    }();
+    // Active diffusion width. Only rows 0..kProposalDepth are ever consumed (row 0 is the seed,
+    // 1..kProposalDepth the scored proposals), yet the backbone was run at the checkpoint's full
+    // block_size=16 — 12 of every 16 rows computed and discarded. The block's attention is
+    // bidirectional, so narrowing it DOES change what the draft proposes; that is allowed here
+    // because every emitted token is still a target argmax, only the accept length can move.
+    // SPARKINFER_DFLASH_BLOCK_WIDTH overrides (0/unset = kProposalDepth+1).
+    static const int BW = [&]{
+        const char* e = getenv("SPARKINFER_DFLASH_BLOCK_WIDTH");
+        int v = e ? atoi(e) : 0;
+        if (v <= 0) v = kProposalDepth + 1;
+        if (v < kProposalDepth + 1) v = kProposalDepth + 1;
+        // Round up to a width the batched-GEMV path is instantiated for; anything else falls
+        // back to the per-token GEMV loop, which costs far more than the rows it saves.
+        const int w = v <= 4 ? 4 : (v <= 8 ? 8 : 16);
+        return w > c.block_size ? c.block_size : w;
+    }();
     const float scale = 1.f / sqrtf((float)d);
     const int past = s.seq_len;
     // The fixed-size (block_size) projections below can use a batched-GEMV kernel that reads
     // each weight row from DRAM once instead of once per token (see dflash_kernels.cu). It's
     // compiled for exactly 16 rows, so it's only used when the draft's block_size is 16 (true
     // for the current checkpoint); any other block_size falls back to the per-token GEMV loop.
-    const bool fast16 = (B == 16);
+    const bool fast16 = (BW == 16 || BW == 8 || BW == 4);
 
-    cu(cudaMemcpyAsync(s.d_ids, noise_ids, B * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
-    kernels::launch_embedding(s.d_ids, s.embed, s.noise, B, H, st);
+    cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
+    kernels::launch_embedding(s.d_ids, s.embed, s.noise, BW, H, st);
 
     // target_hidden [ctx, n_cap*H] -> fc -> hidden_norm -> target_proj [ctx, H]
     // fc.weight is [H, n_cap*H] (out, in). Loop gemv per row.
     if (ctx_len > 0) {
         const bf16* th = (const bf16*)target_hidden;
         if (ctx_len > 1) {
-            dflash_kernels::launch_gemv_rows_exact(th, s.fc, s.target_proj,
+            dflash_kernels::launch_gemv_rows_batched(th, s.fc, s.target_proj,
                                                    ctx_len, H, n_cap * H, st);
         } else {
             kernels::launch_gemv(th, s.fc, s.target_proj, H, n_cap * H, st);
@@ -483,22 +548,33 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     }
 
     // x = noise embedding
-    cu(cudaMemcpyAsync(s.x, s.noise, (size_t)B * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+    cu(cudaMemcpyAsync(s.x, s.noise, (size_t)BW * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
        "noise->x");
 
     for (int L = 0; L < c.n_layers; L++) {
         const LayerWeights& w = s.layers[L];
-        dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, B, H, c.rms_eps, st);
+        dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
 
         // Q from noise, K/V from cat(target, noise)
         if (fast16) {
-            dflash_kernels::launch_gemv_batched16_fused3(
-                s.xn, w.wq, w.wk, w.wv,
-                s.q, s.k_new + (size_t)ctx_len * kvdim,
-                s.v_new + (size_t)ctx_len * kvdim,
-                qdim, kvdim, kvdim, H, st);
+            if (w.q8_wq.q4)
+                dflash_kernels::launch_gemv_batched_q4_fused3(
+                    s.xn, w.q8_wq.q4, w.q8_wk.q4, w.q8_wv.q4, w.q8_wq.dm, w.q8_wk.dm, w.q8_wv.dm,
+                    s.q, s.k_new + (size_t)ctx_len * kvdim, s.v_new + (size_t)ctx_len * kvdim,
+                    qdim, kvdim, kvdim, H, st, BW);
+            else if (w.q8_wq.q)
+                dflash_kernels::launch_gemv_batched_q8_fused3(
+                    s.xn, w.q8_wq.q, w.q8_wk.q, w.q8_wv.q, w.q8_wq.s, w.q8_wk.s, w.q8_wv.s,
+                    s.q, s.k_new + (size_t)ctx_len * kvdim, s.v_new + (size_t)ctx_len * kvdim,
+                    qdim, kvdim, kvdim, H, st, BW);
+            else
+                dflash_kernels::launch_gemv_batched16_fused3(
+                    s.xn, w.wq, w.wk, w.wv,
+                    s.q, s.k_new + (size_t)ctx_len * kvdim,
+                    s.v_new + (size_t)ctx_len * kvdim,
+                    qdim, kvdim, kvdim, H, st, BW);
         } else {
-            for (int t = 0; t < B; t++)
+            for (int t = 0; t < BW; t++)
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wq, s.q + (size_t)t * qdim, qdim, H, st);
         }
         // Build k_new / v_new = cat(k_ctx, k_noise)
@@ -514,7 +590,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                  s.v_new + (size_t)t * kvdim, kvdim, H, st);
         }
         if (!fast16) {
-            for (int t = 0; t < B; t++) {
+            for (int t = 0; t < BW; t++) {
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wk,
                                      s.k_new + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wv,
@@ -522,9 +598,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             }
         }
 
-        const int new_len = ctx_len + B;
+        const int new_len = ctx_len + BW;
         // Q / K RMSNorm per head
-        dflash_kernels::launch_rms_heads(s.q, w.q_norm, B, c.n_q_heads, d, c.rms_eps, st);
+        dflash_kernels::launch_rms_heads(s.q, w.q_norm, BW, c.n_q_heads, d, c.rms_eps, st);
         dflash_kernels::launch_rms_heads(s.k_new, w.k_norm, new_len, c.n_kv_heads, d, c.rms_eps, st);
 
         // RoPE: Q at positions past..(past+B) if past≈pos0 for noise-only positions.
@@ -534,7 +610,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // q_pos0 = pos0.
         const int k_pos0 = pos0 - ctx_len;
         const int q_pos0 = pos0;
-        dflash_kernels::launch_rope_seq(s.q, B, c.n_q_heads, d, q_pos0, c.rope_theta, st);
+        dflash_kernels::launch_rope_seq(s.q, BW, c.n_q_heads, d, q_pos0, c.rope_theta, st);
         dflash_kernels::launch_rope_seq(s.k_new, new_len, c.n_kv_heads, d, k_pos0, c.rope_theta, st);
 
         // Append into cache then attend over full past+new
@@ -559,38 +635,65 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         const bool causal = mixed_causal && L < (int)c.sliding_layers.size() &&
                             c.sliding_layers[L];
         dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L], s.v_cache[L], s.attn,
-                                        B, kv_len, c.n_q_heads, c.n_kv_heads, d,
+                                        BW, kv_len, c.n_q_heads, c.n_kv_heads, d,
                                         q_pos0, /*k_pos0_cache=*/0, window, causal, scale, st);
 
         if (fast16) {
-            dflash_kernels::launch_gemv_batched16(s.attn, w.wo, s.ao, H, qdim, st);
+            if (w.q8_wo.q4)
+                dflash_kernels::launch_gemv_batched_q4_fused3(
+                    s.attn, w.q8_wo.q4, nullptr, nullptr, w.q8_wo.dm, nullptr, nullptr,
+                    s.ao, nullptr, nullptr, H, 0, 0, qdim, st, BW);
+            else if (w.q8_wo.q)
+                dflash_kernels::launch_gemv_batched_q8_fused3(
+                    s.attn, w.q8_wo.q, nullptr, nullptr, w.q8_wo.s, nullptr, nullptr,
+                    s.ao, nullptr, nullptr, H, 0, 0, qdim, st, BW);
+            else
+                dflash_kernels::launch_gemv_batched16(s.attn, w.wo, s.ao, H, qdim, st, BW);
         } else {
-            for (int t = 0; t < B; t++)
+            for (int t = 0; t < BW; t++)
                 kernels::launch_gemv(s.attn + (size_t)t * qdim, w.wo, s.ao + (size_t)t * H, H, qdim, st);
         }
-        dflash_kernels::launch_add(s.x, s.ao, s.h, B * H, st);
+        dflash_kernels::launch_add(s.x, s.ao, s.h, BW * H, st);
 
-        dflash_kernels::launch_rms(s.h, w.post_norm, s.hn, B, H, c.rms_eps, st);
+        dflash_kernels::launch_rms(s.h, w.post_norm, s.hn, BW, H, c.rms_eps, st);
         if (fast16) {
-            dflash_kernels::launch_gemv_batched16_fused2(
-                s.hn, w.gate, w.up, s.gate, s.up, I, I, H, st);
+            if (w.q8_gate.q4)
+                dflash_kernels::launch_gemv_batched_q4_fused3(
+                    s.hn, w.q8_gate.q4, w.q8_up.q4, nullptr, w.q8_gate.dm, w.q8_up.dm, nullptr,
+                    s.gate, s.up, nullptr, I, I, 0, H, st, BW);
+            else if (w.q8_gate.q)
+                dflash_kernels::launch_gemv_batched_q8_fused3(
+                    s.hn, w.q8_gate.q, w.q8_up.q, nullptr, w.q8_gate.s, w.q8_up.s, nullptr,
+                    s.gate, s.up, nullptr, I, I, 0, H, st, BW);
+            else
+                dflash_kernels::launch_gemv_batched16_fused2(
+                    s.hn, w.gate, w.up, s.gate, s.up, I, I, H, st, BW);
         } else {
-            for (int t = 0; t < B; t++) {
+            for (int t = 0; t < BW; t++) {
                 kernels::launch_gemv(s.hn + (size_t)t * H, w.gate, s.gate + (size_t)t * I, I, H, st);
                 kernels::launch_gemv(s.hn + (size_t)t * H, w.up,   s.up   + (size_t)t * I, I, H, st);
             }
         }
-        dflash_kernels::launch_swiglu(s.gate, s.up, s.gate, B * I, st);
+        dflash_kernels::launch_swiglu(s.gate, s.up, s.gate, BW * I, st);
         if (fast16) {
-            dflash_kernels::launch_gemv_batched16(s.gate, w.down, s.down, H, I, st);
+            if (w.q8_down.q4)
+                dflash_kernels::launch_gemv_batched_q4_fused3(
+                    s.gate, w.q8_down.q4, nullptr, nullptr, w.q8_down.dm, nullptr, nullptr,
+                    s.down, nullptr, nullptr, H, 0, 0, I, st, BW);
+            else if (w.q8_down.q)
+                dflash_kernels::launch_gemv_batched_q8_fused3(
+                    s.gate, w.q8_down.q, nullptr, nullptr, w.q8_down.s, nullptr, nullptr,
+                    s.down, nullptr, nullptr, H, 0, 0, I, st, BW);
+            else
+                dflash_kernels::launch_gemv_batched16(s.gate, w.down, s.down, H, I, st, BW);
         } else {
-            for (int t = 0; t < B; t++)
+            for (int t = 0; t < BW; t++)
                 kernels::launch_gemv(s.gate + (size_t)t * I, w.down, s.down + (size_t)t * H, H, I, st);
         }
-        dflash_kernels::launch_add(s.h, s.down, s.x, B * H, st);
+        dflash_kernels::launch_add(s.h, s.down, s.x, BW * H, st);
     }
 
-    dflash_kernels::launch_rms(s.x, s.final_norm, s.xn, B, H, c.rms_eps, st);
+    dflash_kernels::launch_rms(s.x, s.final_norm, s.xn, BW, H, c.rms_eps, st);
 
     // LM head (target weights) -> logits / argmax. Batched over the whole block: one batched
     // GEMV against the eagerly dequantized bf16 lm_head cache instead of a per-token
@@ -605,19 +708,21 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     static int head_mr = -1;
     if (head_mr < 0) { const char* e = getenv("SPARKINFER_DFLASH_HEAD_MULTIROW"); head_mr = (e && e[0] == '0') ? 0 : 1; }
     bool head_done = false;
-    if (head_mr && s.lm_head_type == 14 && s.head_q8) {          // native Q6_K shared head
-        const size_t qrow = kernels::llama_q8_1_bytes(H);
-        // Score only the proposal rows the verifier can consume. The remaining diffusion rows
-        // still participate in the backbone, but streaming the 248k-row Q6_K head for them is
-        // wasted once verification is capped below the full block.
-        for (int t = 1; t <= kProposalDepth; t++)
-            kernels::launch_quantize_q8_1_blocks(s.xn + (size_t)t * H,
-                                                 (char*)s.head_q8 + (size_t)(t - 1) * qrow, H, st);
-        head_done = kernels::launch_gemv_q6k_dp4a_multirow_f32(
-            s.head_q8, s.lm_head, s.logits + V, V, H, kProposalDepth, st);
+    if (head_mr && s.head_q8 && (s.lm_head_type == 14 || s.lm_head_type == 12)) {
+        // Score only the proposal rows the verifier can consume. One row-batched quantize launch
+        // instead of kProposalDepth tiny ones (8 CTAs each, so launch latency dominated them).
+        kernels::launch_quantize_q8_1_rows(s.xn + (size_t)H, s.head_q8, H, kProposalDepth, H, st);
+        // Prefer the Q4_K head when one is bound: this kernel already runs near HBM peak, so its
+        // runtime IS its weight bytes -- ~280 MB in Q4_K against ~417 MB in Q6_K at V=248k.
+        if (s.lm_head_type == 12)
+            head_done = kernels::launch_gemv_q4k_dp4a_multirow_f32(
+                s.head_q8, s.lm_head, s.logits + V, V, H, kProposalDepth, st);
+        else
+            head_done = kernels::launch_gemv_q6k_dp4a_multirow_f32(
+                s.head_q8, s.lm_head, s.logits + V, V, H, kProposalDepth, st);
     }
     if (!head_done) {
-    if (fast16) {
+    if (BW == 16) {
         dflash_kernels::launch_gemv_batched16_f32(s.xn, s.lm_head_bf16, s.logits, V, H, st);
     } else {
         for (int t = 0; t < B; t++) {
@@ -643,7 +748,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // Matches z-lab dflash: past_key_values_draft.update(...) then .crop(start).
     // Without this, seq_len stays 0, crop(pos0) clamps to 0, and every step rebuilds
     // from an empty cache — draft quality collapses (τ≈1.x) after the first block.
-    s.seq_len = past + ctx_len + B;
+    s.seq_len = past + ctx_len + BW;
     crop(pos0);
     return true;
 }

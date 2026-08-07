@@ -32,21 +32,52 @@ void launch_rms(const void* x, const void* w, void* out, int rows, int cols,
 
 // Batched GEMV: y[b,:] = x[b,:] @ W^T for a fixed batch of 16 rows in one launch.
 // x: [16,K] bf16, W: [N,K] bf16 (native "out,in" layout, same as a single-row GEMV), y: [16,N] bf16.
+// `batch` = active activation rows (the draft's diffusion width; 4, 8 or 16).
 void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
-                           cudaStream_t stream);
+                           cudaStream_t stream, int batch = 16);
 void launch_gemv_batched16_fused2(const void* x,
                                   const void* W0, const void* W1,
                                   void* y0, void* y1,
-                                  int N0, int N1, int K, cudaStream_t stream);
+                                  int N0, int N1, int K, cudaStream_t stream, int batch = 16);
 void launch_gemv_batched16_fused3(const void* x,
                                   const void* W0, const void* W1, const void* W2,
                                   void* y0, void* y1, void* y2,
-                                  int N0, int N1, int N2, int K, cudaStream_t stream);
+                                  int N0, int N1, int N2, int K, cudaStream_t stream, int batch = 16);
 
 // Exact batched form of the small-N S=8 split-K BF16 GEMV used by launch_gemv.
 // Collapses multiple row launches into grid.y without changing arithmetic order.
 void launch_gemv_rows_exact(const void* x, const void* W, void* y,
                             int rows, int N, int K, cudaStream_t stream);
+// Copy hidden row `x` [H] into hidden[(*cap_row) * row_elems + slot * H]. The row index lives in
+// device memory so the launch can be captured into the decode graph and still target the right row.
+void launch_capture_row(const void* x, void* hidden, const int* cap_row, int slot, int H,
+                        int row_elems, int max_rows, cudaStream_t stream);
+
+// bf16 -> asymmetric int4 (packed nibbles + fp16 scale/min per 32). Run once at load.
+void launch_quantize_w_q4(const void* w, void* q, void* dm, int N, int K, cudaStream_t stream);
+
+// int4-weight form of launch_gemv_batched16_fused3 (~5 bits/weight vs Q8_0's 9).
+void launch_gemv_batched_q4_fused3(const void* x,
+                                   const void* Q0, const void* Q1, const void* Q2,
+                                   const void* D0, const void* D1, const void* D2,
+                                   void* y0, void* y1, void* y2,
+                                   int N0, int N1, int N2, int K, cudaStream_t stream,
+                                   int batch = 16);
+
+// bf16 -> Q8_0 (int8 + one fp32 scale per 32 values along K). Run once at load.
+void launch_quantize_w_q8(const void* w, void* q, float* sc, int N, int K, cudaStream_t stream);
+
+// Q8_0-weight form of launch_gemv_batched16_fused3 (half the weight bytes).
+void launch_gemv_batched_q8_fused3(const void* x,
+                                   const void* Q0, const void* Q1, const void* Q2,
+                                   const float* S0, const float* S1, const float* S2,
+                                   void* y0, void* y1, void* y2,
+                                   int N0, int N1, int N2, int K, cudaStream_t stream,
+                                   int batch = 16);
+
+// Single-weight form of the row-batched context projection (weight streamed once per 8 rows).
+void launch_gemv_rows_batched(const void* x, const void* W, void* y,
+                              int rows, int N, int K, cudaStream_t stream);
 void launch_gemv_rows_exact_fused2(const void* x,
                                    const void* W0, const void* W1,
                                    void* y0, void* y1,
