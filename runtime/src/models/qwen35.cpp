@@ -2142,8 +2142,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     };
     auto dev_quant_requant_q4k = [&](const std::string& name, int& qtype, bool req) -> const void* {
         const void* q6 = dev_quant(name, qtype);
-        if (!req || (qtype != 14 && qtype != 8) || !q6) return q6;
-        const int src_type = qtype;            // 14 (Q6_K) or 8 (Q8_0) -> Q4_K
+        // 14=Q6_K, 13=Q5_K (UD MoE downs), 8=Q8_0 -> Q4_K
+        if (!req || (qtype != 14 && qtype != 13 && qtype != 8) || !q6) return q6;
+        const int src_type = qtype;
         const GGUFTensor* t = g.tensor(name);
         const long nv = t->n_values;
         if (nv % 256 != 0) return q6;
@@ -2175,6 +2176,18 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dev_quant_down = [&](const std::string& name, int& qtype) -> const void* {
         static int req = -1;
         if (req < 0) { const char* e = getenv("SPARKINFER_DOWN_REQUANT_Q4K"); req = (e && e[0] == '0') ? 0 : 1; }
+        return dev_quant_requant_q4k(name, qtype, req != 0);
+    };
+    // MoE expert downs (ffn_down_exps): Q6_K (Qwen3-MoE) / Q5_K (Qwen3.6 UD) -> Q4_K at load so
+    // decode reads fewer weight bytes on the largest per-token GEMV. Reuses the dense-FFN
+    // affine fitter + existing Q4_K MMVQ down path. Default ON;
+    // SPARKINFER_MOE_DOWN_REQUANT_Q4K=0 keeps native Q5_K/Q6_K.
+    auto dev_quant_moe_down = [&](const std::string& name, int& qtype) -> const void* {
+        static int req = -1;
+        if (req < 0) {
+            const char* e = getenv("SPARKINFER_MOE_DOWN_REQUANT_Q4K");
+            req = (e && e[0] == '0') ? 0 : 1;
+        }
         return dev_quant_requant_q4k(name, qtype, req != 0);
     };
     // dense weight -> bf16 (optionally transpose [out,in] -> [in,out])
@@ -2465,7 +2478,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             }
             w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized
             w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
-            w.down_q = dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
+            w.down_q = dev_quant_moe_down(b + "ffn_down_exps.weight", w.down_qtype);
             if (s.cfg.n_shared > 0) {
             if (!expect_dims(b + "ffn_gate_shexp.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_up_shexp.weight", {H, c.moe_ffn}) ||
