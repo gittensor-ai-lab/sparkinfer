@@ -1405,7 +1405,10 @@ bool launch_gemv_q6k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
                                        int N, int K, int M, cudaStream_t stream) {
     if (K != 2048 || M < 1 || M > 16) return false;   // draft head shape (H=2048, B<=16)
     dim3 grid((N + 15) / 16);
-    if (M == 15) {
+    if (M == 3) {
+        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 3, 3><<<grid, 16 * 32, 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, M);
+    } else if (M == 15) {
         gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 16, 15><<<grid, 16 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, M);
     } else {

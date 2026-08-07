@@ -34,6 +34,7 @@
 #include <fstream>
 #include <limits>
 #include <algorithm>
+#include <thread>
 
 namespace sparkinfer {
 
@@ -1850,32 +1851,62 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int th_len = n;
 
     std::vector<int> block(B), posterior(B), draft_ids(B);
+    constexpr int kProposalDepth = 3;
+    bf16* th_scratch = nullptr;
+    const int row_stride = dflash_hidden_row_stride();
+    if (cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)) != cudaSuccess) {
+        close_session(sid);
+        set_dflash_capture(false, {}, 0);
+        draft.reset();
+        return out;
+    }
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 
-        if (!draft.forward_block(target_hidden, th_len, block.data(), start, draft_ids.data(), s.stream)) {
+        // The target overwrites dflash_hidden while capturing verify row zero. Preserve the
+        // accepted suffix before running that target forward concurrently with the independent
+        // draft stream. The initial full-context buffer is separate and needs no copy.
+        const void* draft_hidden = target_hidden;
+        if (target_hidden == s.dflash_hidden) {
+            cu(cudaMemcpyAsync(th_scratch, target_hidden,
+                               (size_t)th_len * row_stride * sizeof(bf16),
+                               cudaMemcpyDeviceToDevice, s.stream), "dflash overlap stash");
+            cu(cudaStreamSynchronize(s.stream), "dflash overlap stash sync");
+            draft_hidden = th_scratch;
+        }
+
+        int p0 = -1;
+        set_dflash_capture_row(0);
+        std::thread verify0([&] { p0 = forward_token(block[0], start, true); });
+        const bool draft_ok = draft.forward_block(
+            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr);
+        verify0.join();
+        if (!draft_ok) {
             fprintf(stderr, "[dflash] draft forward failed at start=%d\n", start);
             break;
         }
-        for (int i = 1; i < B; i++) block[i] = draft_ids[i];
+        for (int i = 1; i <= kProposalDepth; i++) block[i] = draft_ids[i];
 
         // Incremental verify with early-exit: forward only the accepted prefix, stopping at the
         // first rejected proposal. forward_token advances GDN state + KV per token, so after
         // block[0..keep-1] the recurrent state and KV sit exactly at start+keep -- no snapshot /
         // restore / KV-truncate / replay needed (greedy speculative decoding is exact). Rejected
         // proposals (block[keep..B-1]) are never forwarded, saving ~B-keep target forwards/step.
-        int accept = 0, keep = 0;
-        bool vfail = false;
-        for (int i = 0; i < B; i++) {
-            set_dflash_capture_row(i);
-            const int p = forward_token(block[i], start + i, true);
-            if (p < 0) { vfail = true; break; }
-            posterior[i] = p;
-            accept = i;
-            keep = i + 1;
-            if (i + 1 < B && block[i + 1] != p) break;   // first mismatch -> reject the rest
+        int accept = 0, keep = 1;
+        bool vfail = p0 < 0;
+        posterior[0] = p0;
+        if (!vfail && block[1] == p0) {
+            for (int i = 1; i <= kProposalDepth; i++) {
+                set_dflash_capture_row(i);
+                const int p = forward_token(block[i], start + i, true);
+                if (p < 0) { vfail = true; break; }
+                posterior[i] = p;
+                accept = i;
+                keep = i + 1;
+                if (i < kProposalDepth && block[i + 1] != p) break;
+            }
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
         // forward_token() synchronizes after sampling, so the accepted capture rows are already
@@ -1911,6 +1942,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         stats->decode_s = std::chrono::duration<double>(t_end - t_decode0).count();
     }
     close_session(sid);
+    if (th_scratch) cudaFree(th_scratch);
     set_dflash_capture(false, {}, 0);
     draft.reset();
     return out;

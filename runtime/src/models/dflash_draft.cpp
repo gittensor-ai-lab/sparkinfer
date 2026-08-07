@@ -456,6 +456,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     const int qdim = c.n_q_heads * c.head_dim;
     const int kvdim = c.n_kv_heads * c.head_dim;
     const int d = c.head_dim;
+    constexpr int kProposalDepth = 3;
     const float scale = 1.f / sqrtf((float)d);
     const int past = s.seq_len;
     // The fixed-size (block_size) projections below can use a batched-GEMV kernel that reads
@@ -606,13 +607,14 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     bool head_done = false;
     if (head_mr && s.lm_head_type == 14 && s.head_q8) {          // native Q6_K shared head
         const size_t qrow = kernels::llama_q8_1_bytes(H);
-        // Row 0 is the already-known seed token; only rows 1..B-1 become draft
-        // proposals, so avoid quantizing and scoring the unused head row.
-        for (int t = 1; t < B; t++)
+        // Score only the proposal rows the verifier can consume. The remaining diffusion rows
+        // still participate in the backbone, but streaming the 248k-row Q6_K head for them is
+        // wasted once verification is capped below the full block.
+        for (int t = 1; t <= kProposalDepth; t++)
             kernels::launch_quantize_q8_1_blocks(s.xn + (size_t)t * H,
                                                  (char*)s.head_q8 + (size_t)(t - 1) * qrow, H, st);
         head_done = kernels::launch_gemv_q6k_dp4a_multirow_f32(
-            s.head_q8, s.lm_head, s.logits + V, V, H, B - 1, st);
+            s.head_q8, s.lm_head, s.logits + V, V, H, kProposalDepth, st);
     }
     if (!head_done) {
     if (fast16) {
@@ -630,10 +632,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     }
     kernels::launch_argmax(s.logits + (head_done ? V : 0),
                            s.d_out + (head_done ? 1 : 0),
-                           head_done ? B - 1 : B, V, st);
-    cu(cudaMemcpyAsync(s.h_out, s.d_out, B * sizeof(int), cudaMemcpyDeviceToHost, st), "argmax");
+                           head_done ? kProposalDepth : B, V, st);
+    cu(cudaMemcpyAsync(s.h_out, s.d_out,
+                       (head_done ? kProposalDepth + 1 : B) * sizeof(int),
+                       cudaMemcpyDeviceToHost, st), "argmax");
     cu(cudaStreamSynchronize(st), "draft sync");
-    for (int t = 0; t < B; t++) out_argmax[t] = s.h_out[t];
+    for (int t = 0; t <= kProposalDepth; t++) out_argmax[t] = s.h_out[t];
 
     // Advance past the just-appended ctx+noise, then crop to `pos0` (= block start).
     // Matches z-lab dflash: past_key_values_draft.update(...) then .crop(start).
