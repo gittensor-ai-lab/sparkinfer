@@ -723,6 +723,21 @@ __global__ void k_gemv_batched_fused3_q4(
     }
 }
 
+
+// Compare a linear speculative candidate chain entirely on device. predictions[i] is the
+// target argmax after candidates[i]; each match accepts candidates[i + 1].
+__global__ void k_accept_linear(const int* candidates, const int* predictions, int n,
+                                int* out_accept, int* out_bonus) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    int accept = 0;
+    for (int i = 0; i + 1 < n; ++i) {
+        if (predictions[i] != candidates[i + 1]) break;
+        ++accept;
+    }
+    *out_accept = accept;
+    *out_bonus = predictions[accept];
+}
+
 } // namespace
 
 void launch_quantize_w_q4(const void* w, void* q, void* dm, int N, int K, cudaStream_t stream) {
@@ -919,6 +934,12 @@ void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, in
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
     k_gemv_batched_f32<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
         (const bf16*)x, (const bf16*)W, y, N, K);
+}
+
+void launch_accept_linear(const int* candidates, const int* predictions, int n,
+                          int* out_accept, int* out_bonus, cudaStream_t stream) {
+    if (!candidates || !predictions || !out_accept || !out_bonus || n <= 0) return;
+    k_accept_linear<<<1, 1, 0, stream>>>(candidates, predictions, n, out_accept, out_bonus);
 }
 
 } // namespace dflash_kernels
