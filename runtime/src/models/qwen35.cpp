@@ -1865,7 +1865,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // Proposal depth (also sets the draft's active diffusion width, depth+1).
     static const int kProposalDepth = []{
         const char* e = getenv("SPARKINFER_DFLASH_PROPOSALS");
-        int v = e ? atoi(e) : 3;
+        int v = e ? atoi(e) : 5;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
     // 0=off, 1=force, 2=adaptive (default). Adaptive preserves early-exit verification on

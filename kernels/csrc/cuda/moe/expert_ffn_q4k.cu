@@ -432,6 +432,26 @@ __device__ __forceinline__ float si_vec_dot_q8_0(const unsigned char* __restrict
     return d_w * d_a * (float)sumi;
 }
 
+template <int R>
+__device__ __forceinline__ void si_vec_dot_q8_0_rows(
+        const unsigned char* __restrict__ wblk,
+        const si_block_q8_1* __restrict__ ablk, int astride, float (&out)[R]) {
+    const float d_w = q4kf_h2f(wblk);
+    int wv[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) wv[k] = si_ld4(wblk + 2 + k * 4);
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const si_block_q8_1* a = ablk + (size_t)r * astride;
+        const float d_a = __low2float(a->ds);
+        const unsigned char* qa = reinterpret_cast<const unsigned char*>(a->qs);
+        int sumi = 0;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) sumi = __dp4a(wv[k], si_ld4(qa + k * 4), sumi);
+        out[r] += d_w * d_a * (float)sumi;
+    }
+}
+
 __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4, const si_block_q8_1* bq8_1, int iqs) {
     int v[2], u[4]; float d8[2];
     const int bq8_offset = 2 * ((iqs / 2) / 4);
@@ -585,6 +605,64 @@ __global__ void shared_down_q8_mmvq_kernel(
     if (lane == 0) {
         if constexpr (ACCUM) acc += __bfloat162float(out[h]);
         out[h] = __float2bfloat16(acc);
+    }
+}
+
+template <int H, int F, int R>
+__global__ void shared_gate_up_q8_mmvq_rows_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const float* __restrict__ dw,
+    float* __restrict__ h_scratch) {
+    constexpr int NW = 4, WS = 32;
+    const int f = blockIdx.x, lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int nblk = H >> 5;
+    const unsigned char* gbase = gate_q + (size_t)f * nblk * 34;
+    const unsigned char* ubase = up_q + (size_t)f * nblk * 34;
+    float tg[R], tu[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) { tg[r] = 0.f; tu[r] = 0.f; }
+    for (int b = tid; b < nblk; b += NW * WS) {
+        si_vec_dot_q8_0_rows<R>(gbase + (size_t)b * 34, vy + b, nblk, tg);
+        si_vec_dot_q8_0_rows<R>(ubase + (size_t)b * 34, vy + b, nblk, tu);
+    }
+    __shared__ float sg[R][NW - 1][WS], su[R][NW - 1][WS];
+    if (warp > 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) { sg[r][warp - 1][lane] = tg[r]; su[r][warp - 1][lane] = tu[r]; }
+    }
+    __syncthreads();
+    if (warp > 0) return;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int l = 0; l < NW - 1; ++l) { tg[r] += sg[r][l][lane]; tu[r] += su[r][l][lane]; }
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            tg[r] += __shfl_xor_sync(0xffffffffu, tg[r], m);
+            tu[r] += __shfl_xor_sync(0xffffffffu, tu[r], m);
+        }
+        if (lane == 0) h_scratch[(size_t)r * F + f] = __ldg(dw + r) * q4kf_silu(tg[r]) * tu[r];
+    }
+}
+
+template <int H, int F, int R>
+__global__ void shared_down_q8_mmvq_rows_kernel(
+    const si_block_q8_1* __restrict__ hq8, const unsigned char* __restrict__ down_q,
+    __nv_bfloat16* __restrict__ out) {
+    const int h = blockIdx.x * WPB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (h >= H) return;
+    const int nblk = F >> 5;
+    const unsigned char* dbase = down_q + (size_t)h * nblk * 34;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.f;
+    for (int b = lane; b < nblk; b += 32)
+        si_vec_dot_q8_0_rows<R>(dbase + (size_t)b * 34, hq8 + b, nblk, acc);
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        acc[r] = q4kf_wsum(acc[r]);
+        if (lane == 0) out[(size_t)r * H + h] = __float2bfloat16(acc[r]);
     }
 }
 
@@ -1539,6 +1617,38 @@ void launch_shared_expert_q8_mmvq(
             qbuf, reinterpret_cast<const unsigned char*>(down_q),
             reinterpret_cast<__nv_bfloat16*>(output));
     }
+}
+
+void launch_shared_expert_q8_mmvq_rows(
+    const void* input_q8, const void* gate_q, const void* up_q, const void* down_q,
+    const float* dw, void* output, float* h_scratch, void* h_q8_buf,
+    int hidden, int ffn, int rows, cudaStream_t stream) {
+    if (!input_q8 || !gate_q || !up_q || !down_q || !dw || !output || !h_scratch ||
+        !h_q8_buf || hidden != 2048 || ffn != 512 || rows < 1 || rows > 8) return;
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(input_q8);
+    auto* hq = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
+    auto* out = reinterpret_cast<__nv_bfloat16*>(output);
+#define SI_SHARED_ROWS(R) do { \
+    shared_gate_up_q8_mmvq_rows_kernel<2048, 512, R><<<512, 4 * 32, 0, stream>>>( \
+        q, reinterpret_cast<const unsigned char*>(gate_q), \
+        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch); \
+    quant_h_q8_1_kernel<<<((R * (512 >> 5)) + 7) / 8, 8 * 32, 0, stream>>>( \
+        h_scratch, hq, R * (512 >> 5), 0); \
+    shared_down_q8_mmvq_rows_kernel<2048, 512, R><<<(2048 + WPB - 1) / WPB, WPB * 32, 0, stream>>>( \
+        hq, reinterpret_cast<const unsigned char*>(down_q), out); \
+} while (0)
+    switch (rows) {
+        case 1: SI_SHARED_ROWS(1); break;
+        case 2: SI_SHARED_ROWS(2); break;
+        case 3: SI_SHARED_ROWS(3); break;
+        case 4: SI_SHARED_ROWS(4); break;
+        case 5: SI_SHARED_ROWS(5); break;
+        case 6: SI_SHARED_ROWS(6); break;
+        case 7: SI_SHARED_ROWS(7); break;
+        case 8: SI_SHARED_ROWS(8); break;
+        default: break;
+    }
+#undef SI_SHARED_ROWS
 }
 #endif
 

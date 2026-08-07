@@ -86,4 +86,9 @@ void launch_shared_expert_q8_mmvq(
     int hidden, int ffn, cudaStream_t stream = nullptr,
     bool accum = false);
 
+void launch_shared_expert_q8_mmvq_rows(
+    const void* input_q8, const void* gate_q, const void* up_q, const void* down_q,
+    const float* dw, void* output, float* h_scratch, void* h_q8_buf,
+    int hidden, int ffn, int rows, cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

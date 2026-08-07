@@ -111,6 +111,75 @@ template __global__ void gemv_f32_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloat1
 #ifndef _MSC_VER
 template __global__ void gemv_f32_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int);
 #endif
+
+// Compact verification supplies up to four activation rows for the same matrix.
+// Preserve the split-K reduction independently for each row while sharing every
+// weight packet across those row accumulators.
+template <typename OutT, int S, int M>
+__global__ void gemv_bf16_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
+                                         const __nv_bfloat16* __restrict__ W,
+                                         OutT* __restrict__ y, int N, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float part[M][RPB][S];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n = blockIdx.x * RPB + row_local;
+    float acc[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) acc[r] = 0.f;
+    if (n < N) {
+        const uint4* w4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+        const int n4 = K / 8;
+        for (int i = split * 32 + lane; i < n4; i += S * 32) {
+            const uint4 wv = w4[i];
+            const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            float2 wf[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) wf[j] = __bfloat1622float2(wh[j]);
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const uint4 xv = reinterpret_cast<const uint4*>(x + (size_t)r * K)[i];
+                const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 xf = __bfloat1622float2(xh[j]);
+                    acc[r] += wf[j].x * xf.x + wf[j].y * xf.y;
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < M; ++r)
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1)
+                acc[r] += __shfl_xor_sync(0xffffffff, acc[r], d);
+        if (lane == 0)
+#pragma unroll
+            for (int r = 0; r < M; ++r) part[r][row_local][split] = acc[r];
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float out = 0.f;
+#pragma unroll
+            for (int s = 0; s < S; ++s) out += part[r][row_local][s];
+            gemv_write(y + (size_t)r * N + n, out);
+        }
+    }
+}
+
+#ifndef _MSC_VER
+#define SI_INST_GEMV_ROWS(T, S, M) template __global__ void gemv_bf16_rows_sk_kernel<T, S, M>(const __nv_bfloat16*, const __nv_bfloat16*, T*, int, int)
+SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 1); SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 2);
+SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 3); SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 4);
+SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 5); SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 6);
+SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 7); SI_INST_GEMV_ROWS(__nv_bfloat16, 8, 8);
+SI_INST_GEMV_ROWS(float, 4, 1); SI_INST_GEMV_ROWS(float, 4, 2);
+SI_INST_GEMV_ROWS(float, 4, 3); SI_INST_GEMV_ROWS(float, 4, 4);
+SI_INST_GEMV_ROWS(float, 4, 5); SI_INST_GEMV_ROWS(float, 4, 6);
+SI_INST_GEMV_ROWS(float, 4, 7); SI_INST_GEMV_ROWS(float, 4, 8);
+#undef SI_INST_GEMV_ROWS
+#endif
 // ---- quantized on-read GEMV (W = GGUF-native Q4_K/Q6_K [N,K]) -----------------
 // Dequantizes each 256-block in registers and dots with a full-precision (fp32)
 // activation — reads the quantized weight bytes (~4x less than bf16) with NO int8
@@ -700,17 +769,29 @@ __global__ void si_mmvq_q80_rows_exact_kernel(const si_block_q8_1* __restrict__ 
     }
 }
 #ifndef _MSC_VER
-template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 64, 4>(
+template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 64, 8>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 128, 4>(
+template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 128, 8>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 16, 4>(
+template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 16, 8>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q80_rows_exact_kernel<float, 16, 4>(
+template __global__ void si_mmvq_q80_rows_exact_kernel<float, 16, 8>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
-template __global__ void si_mmvq_q80_rows_exact_kernel<float, 64, 4>(
+template __global__ void si_mmvq_q80_rows_exact_kernel<float, 64, 8>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
-template __global__ void si_mmvq_q80_rows_exact_kernel<float, 128, 4>(
+template __global__ void si_mmvq_q80_rows_exact_kernel<float, 128, 8>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 64, 6>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 128, 6>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 16, 6>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<float, 16, 6>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<float, 64, 6>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q80_rows_exact_kernel<float, 128, 6>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
 #endif
 template <typename OutT, int NSUPER>
@@ -796,13 +877,21 @@ __global__ void si_mmvq_q4k_rows_exact_kernel(const si_block_q8_1* __restrict__ 
     }
 }
 #ifndef _MSC_VER
-template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 4>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 8>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 4>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 8>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 4>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 8>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 4>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 8>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 6>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 6>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 6>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 6>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
 #endif
 // One block per row index: warps 0-3 -> qkv[row], warps 4-7 -> z[row], keeping vy hot
@@ -1176,13 +1265,21 @@ __global__ void si_mmvq_q6k_rows_exact_kernel(const si_block_q8_1* __restrict__ 
     }
 }
 #ifndef _MSC_VER
-template __global__ void si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 4>(
+template __global__ void si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 8>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 4>(
+template __global__ void si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 8>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q6k_rows_exact_kernel<float, 8, 4>(
+template __global__ void si_mmvq_q6k_rows_exact_kernel<float, 8, 8>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
-template __global__ void si_mmvq_q6k_rows_exact_kernel<float, 16, 4>(
+template __global__ void si_mmvq_q6k_rows_exact_kernel<float, 16, 8>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 6>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 6>(
+    const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q6k_rows_exact_kernel<float, 8, 6>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q6k_rows_exact_kernel<float, 16, 6>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
 #endif
 // 1-warp-per-row Q6_K dp4a GEMV: keeps the fp32 gemv_q block structure (GEMV_WPB rows/block,
@@ -1293,6 +1390,102 @@ __global__ void si_mmvq_q4k_multirow_kernel(const si_block_q8_1* __restrict__ vy
             for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffff, a, s);
             if (lane == 0) gemv_write(y + (size_t)m * N + row, a);
         }
+    }
+}
+
+template <int M>
+__global__ void gemv_i8_q81_multirow_kernel(
+        const si_block_q8_1* __restrict__ x, const signed char* __restrict__ W,
+        const float* __restrict__ sw, float* __restrict__ y, int N, int K) {
+    constexpr int WPB = 16;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WPB + warp;
+    if (row >= N) return;
+    const int nb = K >> 5;
+    const int* wi = reinterpret_cast<const int*>(W + (size_t)row * K);
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+    for (int b = lane; b < nb; b += 32) {
+        const int* wb = wi + b * 8;
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            const si_block_q8_1* a = x + (size_t)m * nb + b;
+            const int* ai = reinterpret_cast<const int*>(a->qs);
+            int dot = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) dot = __dp4a(wb[j], ai[j], dot);
+            acc[m] += (float)dot * __low2float(a->ds);
+        }
+    }
+    const float ws = sw[row];
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+#pragma unroll
+        for (int d = 16; d > 0; d >>= 1) acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], d);
+        if (lane == 0) y[(size_t)m * N + row] = acc[m] * ws;
+    }
+}
+
+__global__ void pack_i8_rows_i4_kernel(const signed char* __restrict__ src,
+                                       const float* __restrict__ ss,
+                                       unsigned char* __restrict__ dst,
+                                       float* __restrict__ ds, int rows, int K) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    if (threadIdx.x == 0) ds[row] = ss[row] * (127.f / 7.f);
+    const signed char* s = src + (size_t)row * K;
+    unsigned char* d = dst + (size_t)row * (K >> 1);
+    const int nb = K >> 5;
+    for (int p = threadIdx.x; p < nb * 16; p += blockDim.x) {
+        const int b = p >> 4, i = p & 15;
+        int lo = __float2int_rn((float)s[b * 32 + i] * (7.f / 127.f));
+        int hi = __float2int_rn((float)s[b * 32 + i + 16] * (7.f / 127.f));
+        lo = max(-7, min(7, lo));
+        hi = max(-7, min(7, hi));
+        d[b * 16 + i] = (unsigned char)((lo & 15) | ((hi & 15) << 4));
+    }
+}
+
+template <int M>
+__global__ void gemv_i4_q81_multirow_kernel(
+        const si_block_q8_1* __restrict__ x, const unsigned char* __restrict__ W,
+        const float* __restrict__ sw, float* __restrict__ y, int N, int K) {
+    constexpr int WPB = 16;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WPB + warp;
+    if (row >= N) return;
+    const int nb = K >> 5;
+    const int* wi = reinterpret_cast<const int*>(W + (size_t)row * (K >> 1));
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+    for (int b = lane; b < nb; b += 32) {
+        const int* wb = wi + b * 4;
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            const si_block_q8_1* a = x + (size_t)m * nb + b;
+            const int* ai = reinterpret_cast<const int*>(a->qs);
+            int dot = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = wb[j];
+                int lo = p & 0x0f0f0f0f;
+                int hi = (p >> 4) & 0x0f0f0f0f;
+                lo = (lo ^ 0x08080808) - 0x08080808;
+                hi = (hi ^ 0x08080808) - 0x08080808;
+                dot = __dp4a(lo, ai[j], dot);
+                dot = __dp4a(hi, ai[j + 4], dot);
+            }
+            acc[m] += (float)dot * __low2float(a->ds);
+        }
+    }
+    const float ws = sw[row];
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+#pragma unroll
+        for (int d = 16; d > 0; d >>= 1) acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], d);
+        if (lane == 0) y[(size_t)m * N + row] = acc[m] * ws;
     }
 }
 
@@ -1450,6 +1643,35 @@ void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K, cudaS
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_kernel<float><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);
+}
+
+template <typename T, int S>
+static bool launch_gemv_rows_t(const void* x, const void* W, T* y,
+                               int M, int N, int K, cudaStream_t stream) {
+    if (M < 1 || M > 8 || N < 1 || (K & 7)) return false;
+    constexpr int RPB = GEMV_WPB / S;
+    dim3 grid((N + RPB - 1) / RPB);
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+    const auto* wp = reinterpret_cast<const __nv_bfloat16*>(W);
+    if (M == 1) gemv_bf16_rows_sk_kernel<T, S, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, wp, y, N, K);
+    else if (M == 2) gemv_bf16_rows_sk_kernel<T, S, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, wp, y, N, K);
+    else if (M == 3) gemv_bf16_rows_sk_kernel<T, S, 3><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, wp, y, N, K);
+    else if (M == 4) gemv_bf16_rows_sk_kernel<T, S, 4><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, wp, y, N, K);
+    else if (M == 5) gemv_bf16_rows_sk_kernel<T, S, 5><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, wp, y, N, K);
+    else if (M == 6) gemv_bf16_rows_sk_kernel<T, S, 6><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, wp, y, N, K);
+    else if (M == 7) gemv_bf16_rows_sk_kernel<T, S, 7><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, wp, y, N, K);
+    else gemv_bf16_rows_sk_kernel<T, S, 8><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, wp, y, N, K);
+    return true;
+}
+
+bool launch_gemv_rows(const void* x, const void* W, void* y,
+                      int M, int N, int K, cudaStream_t stream) {
+    return launch_gemv_rows_t<__nv_bfloat16, 8>(x, W,
+        reinterpret_cast<__nv_bfloat16*>(y), M, N, K, stream);
+}
+bool launch_gemv_rows_f32(const void* x, const void* W, float* y,
+                          int M, int N, int K, cudaStream_t stream) {
+    return launch_gemv_rows_t<float, 4>(x, W, y, M, N, K, stream);
 }
 
 void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int K, cudaStream_t stream) {
@@ -1631,27 +1853,27 @@ void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K,
 }
 bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
-    if (M < 1 || M > 4 || N < 1 || (K != 2048 && K != 4096)) return false;
+    if (M < 1 || M > 8 || N < 1 || (K != 2048 && K != 4096)) return false;
     if (K == 2048)
-        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 4><<<N, 4 * 32, 0, stream>>>(
+        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 8><<<N, 4 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
             reinterpret_cast<__nv_bfloat16*>(y), M, N);
     else
-        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 4><<<N, 4 * 32, 0, stream>>>(
+        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 8><<<N, 4 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
             reinterpret_cast<__nv_bfloat16*>(y), M, N);
     return true;
 }
 bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
-    if (M < 1 || M > 4 || N < 1 || (K != 2048 && K != 4096)) return false;
+    if (M < 1 || M > 8 || N < 1 || (K != 2048 && K != 4096)) return false;
     if (K == 2048)
-        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 4><<<N, 4 * 32, 0, stream>>>(
+        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 8><<<N, 4 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81),
             reinterpret_cast<const unsigned char*>(W),
             reinterpret_cast<__nv_bfloat16*>(y), M, N);
     else
-        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 4><<<N, 4 * 32, 0, stream>>>(
+        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 8><<<N, 4 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81),
             reinterpret_cast<const unsigned char*>(W),
             reinterpret_cast<__nv_bfloat16*>(y), M, N);
@@ -1659,19 +1881,19 @@ bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
 }
 bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
-    if (M < 1 || M > 4 || N < 1 || (K != 512 && K != 2048 && K != 4096)) return false;
+    if (M < 1 || M > 8 || N < 1 || (K != 512 && K != 2048 && K != 4096)) return false;
     if (K == 512)
-        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 16, 4><<<N, 4 * 32, 0, stream>>>(
+        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 16, 8><<<N, 4 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81),
             reinterpret_cast<const unsigned char*>(W),
             reinterpret_cast<__nv_bfloat16*>(y), M, N);
     else if (K == 2048)
-        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 64, 4><<<N, 4 * 32, 0, stream>>>(
+        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 64, 8><<<N, 4 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81),
             reinterpret_cast<const unsigned char*>(W),
             reinterpret_cast<__nv_bfloat16*>(y), M, N);
     else
-        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 128, 4><<<N, 4 * 32, 0, stream>>>(
+        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 128, 8><<<N, 4 * 32, 0, stream>>>(
             reinterpret_cast<const si_block_q8_1*>(q81),
             reinterpret_cast<const unsigned char*>(W),
             reinterpret_cast<__nv_bfloat16*>(y), M, N);
@@ -1686,30 +1908,30 @@ bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
 }
 bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
                           int M, int N, int K, cudaStream_t stream) {
-    if (M < 1 || M > 4 || N < 1) return false;
+    if (M < 1 || M > 8 || N < 1) return false;
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const auto* w = reinterpret_cast<const unsigned char*>(W);
     if (qtype == 12 && (K == 2048 || K == 4096)) {
         if (K == 2048)
-            si_mmvq_q4k_rows_exact_kernel<float, 8, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            si_mmvq_q4k_rows_exact_kernel<float, 8, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         else
-            si_mmvq_q4k_rows_exact_kernel<float, 16, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            si_mmvq_q4k_rows_exact_kernel<float, 16, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         return true;
     }
     if (qtype == 14 && (K == 2048 || K == 4096)) {
         if (K == 2048)
-            si_mmvq_q6k_rows_exact_kernel<float, 8, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            si_mmvq_q6k_rows_exact_kernel<float, 8, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         else
-            si_mmvq_q6k_rows_exact_kernel<float, 16, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            si_mmvq_q6k_rows_exact_kernel<float, 16, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         return true;
     }
     if (qtype == 8 && (K == 512 || K == 2048 || K == 4096)) {
         if (K == 512)
-            si_mmvq_q80_rows_exact_kernel<float, 16, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            si_mmvq_q80_rows_exact_kernel<float, 16, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         else if (K == 2048)
-            si_mmvq_q80_rows_exact_kernel<float, 64, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            si_mmvq_q80_rows_exact_kernel<float, 64, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         else
-            si_mmvq_q80_rows_exact_kernel<float, 128, 4><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            si_mmvq_q80_rows_exact_kernel<float, 128, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         return true;
     }
     return false;
@@ -1755,7 +1977,7 @@ bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
         if (cudaGetDevice(&dev) != cudaSuccess ||
             cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
             return 0;
-        return sm > 1 ? sm / 2 : 0;
+        return 0;
     }();
     int nblk = (N + 15) / 16;
     if (cap > 0 && nblk > cap) nblk = cap;
@@ -1763,7 +1985,44 @@ bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
     auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     auto* w = reinterpret_cast<const unsigned char*>(W);
     if (M == 3) si_mmvq_q4k_multirow_kernel<float, 16, 8, 3, 3><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
-    else        si_mmvq_q4k_multirow_kernel<float, 16, 8, 16><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    else if (M == 6) si_mmvq_q4k_multirow_kernel<float, 16, 8, 6, 6><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    else si_mmvq_q4k_multirow_kernel<float, 16, 8, 16><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    return true;
+}
+
+bool launch_gemv_i8_q81_multirow_f32(const void* q81, const signed char* W,
+                                     const float* sw, float* y,
+                                     int N, int K, int M, cudaStream_t stream) {
+    if (!q81 || !W || !sw || !y || K != 2048 || M < 1 || M > 8) return false;
+    dim3 grid((N + 15) / 16);
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    if (M == 3) gemv_i8_q81_multirow_kernel<3><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else if (M == 4) gemv_i8_q81_multirow_kernel<4><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else if (M == 5) gemv_i8_q81_multirow_kernel<5><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else if (M == 6) gemv_i8_q81_multirow_kernel<6><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else if (M == 7) gemv_i8_q81_multirow_kernel<7><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else if (M == 8) gemv_i8_q81_multirow_kernel<8><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else return false;
+    return true;
+}
+
+void launch_pack_i8_rows_i4(const signed char* W_i8, const float* scale_i8,
+                            unsigned char* W_i4, float* scale_i4,
+                            int rows, int K, cudaStream_t stream) {
+    pack_i8_rows_i4_kernel<<<rows, 256, 0, stream>>>(
+        W_i8, scale_i8, W_i4, scale_i4, rows, K);
+}
+
+bool launch_gemv_i4_q81_multirow_f32(const void* q81, const unsigned char* W,
+                                     const float* sw, float* y,
+                                     int N, int K, int M, cudaStream_t stream) {
+    if (!q81 || !W || !sw || !y || K != 2048 || M < 3 || M > 6) return false;
+    dim3 grid((N + 15) / 16);
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    if (M == 3) gemv_i4_q81_multirow_kernel<3><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else if (M == 4) gemv_i4_q81_multirow_kernel<4><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else if (M == 5) gemv_i4_q81_multirow_kernel<5><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
+    else gemv_i4_q81_multirow_kernel<6><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
     return true;
 }
 

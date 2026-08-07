@@ -45,6 +45,10 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K,
                  cudaStream_t stream = nullptr);
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K,
                      cudaStream_t stream = nullptr);
+bool launch_gemv_rows(const void* x, const void* W, void* y,
+                      int M, int N, int K, cudaStream_t stream = nullptr);
+bool launch_gemv_rows_f32(const void* x, const void* W, float* y,
+                          int M, int N, int K, cudaStream_t stream = nullptr);
 
 // Fused GEMV + sigmoid for the shared-expert gate scalar (N=1). Uses scratch_bf16
 // for the bf16 dot (same as launch_gemv) then sigmoid_scalar. SPARKINFER_GEMV_SIGMOID=1 enables.
@@ -128,6 +132,15 @@ void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, i
 // Same, for a Q4_K weight (the LM-head copy the target keeps). ~280 MB vs ~417 MB at V=248k.
 bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
                                        int N, int K, int M, cudaStream_t stream = nullptr);
+bool launch_gemv_i8_q81_multirow_f32(const void* q81, const signed char* W,
+                                     const float* sw, float* y,
+                                     int N, int K, int M, cudaStream_t stream = nullptr);
+void launch_pack_i8_rows_i4(const signed char* W_i8, const float* scale_i8,
+                            unsigned char* W_i4, float* scale_i4,
+                            int rows, int K, cudaStream_t stream = nullptr);
+bool launch_gemv_i4_q81_multirow_f32(const void* q81, const unsigned char* W,
+                                     const float* sw, float* y,
+                                     int N, int K, int M, cudaStream_t stream = nullptr);
 bool launch_gemv_q6k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
                                        int N, int K, int M, cudaStream_t stream = nullptr);
 

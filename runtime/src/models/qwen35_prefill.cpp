@@ -1190,7 +1190,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax) {
     const Qwen35Config& c = s.cfg;
-    if (!token_ids || !out_argmax || n < 1 || n > 4 || !s.gguf || !c.hybrid || c.dense_ffn) {
+    if (!token_ids || !out_argmax || n < 1 || n > 8 || !s.gguf || !c.hybrid || c.dense_ffn) {
         fprintf(stderr, "[dflash-verify] base unsupported n=%d gguf=%d hybrid=%d dense=%d\n",
                 n, (int)s.gguf, (int)c.hybrid, (int)c.dense_ffn);
         return -1;
@@ -1269,11 +1269,33 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local const void* graph_conv_key = nullptr;
     static thread_local const void* graph_capture_key = nullptr;
     static thread_local const void* graph_btable_key = nullptr;
+    static thread_local const void* verify_head_key = nullptr;
+    static thread_local signed char* verify_head_i8 = nullptr;
+    static thread_local float* verify_head_scale = nullptr;
     if (!ph_ids) {
-        pf_cu(cudaHostAlloc(&ph_ids, 4 * sizeof(int), cudaHostAllocDefault), "verify host ids");
-        pf_cu(cudaHostAlloc(&ph_pos, 4 * sizeof(int), cudaHostAllocDefault), "verify host pos");
-        pf_cu(cudaHostAlloc(&ph_seq, 4 * sizeof(int), cudaHostAllocDefault), "verify host lens");
-        pf_cu(cudaHostAlloc(&ph_out, 4 * sizeof(int), cudaHostAllocDefault), "verify host out");
+        pf_cu(cudaHostAlloc(&ph_ids, 16 * sizeof(int), cudaHostAllocDefault), "verify host ids");
+        pf_cu(cudaHostAlloc(&ph_pos, 16 * sizeof(int), cudaHostAllocDefault), "verify host pos");
+        pf_cu(cudaHostAlloc(&ph_seq, 16 * sizeof(int), cudaHostAllocDefault), "verify host lens");
+        pf_cu(cudaHostAlloc(&ph_out, 16 * sizeof(int), cudaHostAllocDefault), "verify host out");
+    }
+    if (verify_head_key != s.w.lm_head && s.w.lm_head_type == 12 && H == 2048) {
+        if (verify_head_i8) cudaFree(verify_head_i8);
+        if (verify_head_scale) cudaFree(verify_head_scale);
+        verify_head_i8 = nullptr;
+        verify_head_scale = nullptr;
+        if (cudaMalloc(&verify_head_i8, (size_t)c.vocab * H) == cudaSuccess &&
+            cudaMalloc(&verify_head_scale, (size_t)c.vocab * sizeof(float)) == cudaSuccess &&
+            kernels::launch_gguf_dequant_rows_i8(
+                s.w.lm_head_type, s.w.lm_head, verify_head_i8, verify_head_scale,
+                c.vocab, H, st)) {
+            pf_cu(cudaStreamSynchronize(st), "verify head int8 prepack");
+            verify_head_key = s.w.lm_head;
+        } else {
+            if (verify_head_i8) cudaFree(verify_head_i8);
+            if (verify_head_scale) cudaFree(verify_head_scale);
+            verify_head_i8 = nullptr;
+            verify_head_scale = nullptr;
+        }
     }
     for (int i = 0; i < N; ++i) {
         ph_ids[i] = token_ids[i];
@@ -1291,9 +1313,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     };
     auto proj = [&](const bf16* in, const void* w, int type, bf16* out, int no, int k) -> bool {
         if (type == 0) {
-            for (int i = 0; i < N; ++i)
-                kernels::launch_gemv(in + (size_t)i * k, w, out + (size_t)i * no, no, k, st);
-            return true;
+            return kernels::launch_gemv_rows(in, w, out, N, no, k, st);
         }
         if (type != 8 && type != 12 && type != 14) {
             fprintf(stderr, "[dflash-verify] unsupported projection type=%d N=%d K=%d\n", type, no, k);
@@ -1318,6 +1338,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const int kv_elem = kv8 ? 1 : 2;
     bool supported = true;
     bool recording = false;
+    bool head_ok = false;
     if (graph_model_key != s.w.lm_head || graph_state_key != s.lin_state ||
         graph_conv_key != s.lin_conv_state || graph_capture_key != capture_dst ||
         graph_btable_key != btable) {
@@ -1421,9 +1442,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     w.shared_gate_qtype, w.shared_up_qtype, w.shared_down_qtype);
             supported = false; break;
         }
-        for (int i = 0; i < N; ++i)
-            kernels::launch_gemv_f32(hn + (size_t)i * H, w.router_w,
-                                     router_logits + (size_t)i * E, E, H, st);
+        supported = kernels::launch_gemv_rows_f32(hn, w.router_w, router_logits,
+                                                  N, E, H, st);
         kernels::launch_moe_router(router_logits, expert_ids, expert_w, nullptr,
                                    N, E, topk, 1, st);
         kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
@@ -1436,13 +1456,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         } else {
             pf_cu(cudaMemsetAsync(gate_w, 0, (size_t)N * sizeof(float), st), "verify shared gate");
         }
-        supported = supported && kernels::launch_mmvq_rows(8, q81, w.shared_gate_q, sg, N, ffn, H, st) &&
-                    kernels::launch_mmvq_rows(8, q81, w.shared_up_q, su, N, ffn, H, st);
-        kernels::launch_qwen36_shared_swiglu_rows(sg, su, w.shared_gate_inp ? gate_w : nullptr,
-                                                  sh, N, ffn, st);
-        quant_rows(sh, ffn);
-        supported = supported && kernels::launch_mmvq_rows(8, q81, w.shared_down_q,
-                                                           shared, N, H, ffn, st);
+        kernels::launch_shared_expert_q8_mmvq_rows(
+            q81, w.shared_gate_q, w.shared_up_q, w.shared_down_q, gate_w,
+            shared, moe_h, sg, H, ffn, N, st);
         const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm3_q8_rows(h, routed, shared, next_norm, x, xn, q81,
                                              N, H, c.rms_eps, st);
@@ -1452,8 +1468,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (!supported) return -1;
 
     quant_rows(xn, H);
-    if (!kernels::launch_mmvq_rows_f32(s.w.lm_head_type, q81, s.w.lm_head, logits,
-                                       N, c.vocab, H, st)) {
+    static const bool verify_head_i8_on = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_VERIFY_HEAD_I8");
+        return !(e && e[0] == '0');
+    }();
+    head_ok = verify_head_i8_on && verify_head_i8
+        ? kernels::launch_gemv_i8_q81_multirow_f32(
+              q81, verify_head_i8, verify_head_scale, logits, c.vocab, H, N, st)
+        : kernels::launch_mmvq_rows_f32(
+              s.w.lm_head_type, q81, s.w.lm_head, logits, N, c.vocab, H, st);
+    if (!head_ok) {
         fprintf(stderr, "[dflash-verify] unsupported LM head type=%d H=%d\n", s.w.lm_head_type, H);
         return -1;
     }

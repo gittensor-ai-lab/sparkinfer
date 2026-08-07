@@ -266,6 +266,8 @@ struct DFlashDraftModel::Impl {
     int vocab = 0;
     int hidden = 0;
     bf16* lm_head_bf16 = nullptr;  // eager dequant+transpose cache for the batched LM-head GEMM
+    signed char* lm_head_i8 = nullptr;
+    float* lm_head_i8_scale = nullptr;
 
     // Scratch
     cudaStream_t stream{};
@@ -363,6 +365,17 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
                                cudaMemcpyDeviceToDevice, p_->stream), "lm_head copy");
         }
         cu(cudaStreamSynchronize(p_->stream), "lm_head dequant");
+    }
+    if (!p_->lm_head_i8 && lm_head_type == 12 && vocab > 0 && hidden == 2048) {
+        p_->lm_head_i8 = p_->alloc<signed char>((size_t)vocab * hidden);
+        p_->lm_head_i8_scale = p_->alloc<float>(vocab);
+        if (!kernels::launch_gguf_dequant_rows_i8(
+                lm_head_type, lm_head, p_->lm_head_i8, p_->lm_head_i8_scale,
+                vocab, hidden, p_->stream)) {
+            p_->lm_head_i8 = nullptr;
+            p_->lm_head_i8_scale = nullptr;
+        }
+        cu(cudaStreamSynchronize(p_->stream), "lm_head int8 prepack");
     }
 }
 
@@ -503,7 +516,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // Proposal depth (also sets the draft's active diffusion width, depth+1).
     static const int kProposalDepth = []{
         const char* e = getenv("SPARKINFER_DFLASH_PROPOSALS");
-        int v = e ? atoi(e) : 3;
+        int v = e ? atoi(e) : 5;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
     // Active diffusion width. Only rows 0..kProposalDepth are ever consumed (row 0 is the seed,
@@ -551,7 +564,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     cu(cudaMemcpyAsync(s.x, s.noise, (size_t)BW * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
        "noise->x");
 
-    for (int L = 0; L < c.n_layers; L++) {
+    static const int active_layers = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_LAYERS");
+        return e ? atoi(e) : 0;
+    }();
+    const int run_layers = active_layers > 0 ? std::min(active_layers, c.n_layers) : c.n_layers;
+    for (int L = 0; L < run_layers; L++) {
         const LayerWeights& w = s.layers[L];
         dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
 
@@ -714,7 +732,15 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         kernels::launch_quantize_q8_1_rows(s.xn + (size_t)H, s.head_q8, H, kProposalDepth, H, st);
         // Prefer the Q4_K head when one is bound: this kernel already runs near HBM peak, so its
         // runtime IS its weight bytes -- ~280 MB in Q4_K against ~417 MB in Q6_K at V=248k.
-        if (s.lm_head_type == 12)
+        static const bool head_i8 = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_HEAD_I8");
+            return !(e && e[0] == '0');
+        }();
+        if (s.lm_head_type == 12 && head_i8 && s.lm_head_i8)
+            head_done = kernels::launch_gemv_i8_q81_multirow_f32(
+                s.head_q8, s.lm_head_i8, s.lm_head_i8_scale,
+                s.logits + V, V, H, kProposalDepth, st);
+        else if (s.lm_head_type == 12)
             head_done = kernels::launch_gemv_q4k_dp4a_multirow_f32(
                 s.head_q8, s.lm_head, s.logits + V, V, H, kProposalDepth, st);
         else
