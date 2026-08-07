@@ -1241,6 +1241,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* router_logits = a.alloc<float>((size_t)N * E);
     float* moe_h = a.alloc<float>((size_t)N * topk * ffn);
     float* moe_out = a.alloc<float>((size_t)N * H);
+    // Dedicated hidden scratch for the shared expert. It used to borrow moe_h, which is the one
+    // thing that stopped the shared branch from running concurrently with the routed one.
+    float* shared_h = a.alloc<float>((size_t)N * ffn);
     float* logits = a.alloc<float>((size_t)N * c.vocab);
     int* out_ids = a.alloc<int>(N);
     const size_t q81_stride_max = kernels::llama_q8_1_bytes(std::max(H, lvdim));
@@ -1273,6 +1276,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local const void* verify_head_key = nullptr;
     static thread_local signed char* verify_head_i8 = nullptr;
     static thread_local float* verify_head_scale = nullptr;
+    static thread_local cudaEvent_t ev_fork = nullptr;
+    static thread_local cudaEvent_t ev_join = nullptr;
+    // Off-critical-path stream for the shared expert. Empty stream_k means no overlap is possible.
+    static const bool shared_stream_on = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_SHARED_STREAM");
+        return !(e && e[0] == '0');
+    }();
+    const bool fork_shared = shared_stream_on && s.stream_k && s.stream_k != s.stream;
+    if (fork_shared && !ev_fork) {
+        pf_cu(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming), "verify fork event");
+        pf_cu(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming), "verify join event");
+    }
     if (!ph_ids) {
         pf_cu(cudaHostAlloc(&ph_ids, 16 * sizeof(int), cudaHostAllocDefault), "verify host ids");
         pf_cu(cudaHostAlloc(&ph_pos, 16 * sizeof(int), cudaHostAllocDefault), "verify host pos");
@@ -1322,6 +1337,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         }
         quant_rows(in, k);
         return kernels::launch_mmvq_rows(type, q81, w, out, N, no, k, st);
+    };
+    // proj() on an arbitrary stream. Callers must have `in` already quantized into q81 (checked at
+    // each call site), because quantizing here would write shared scratch off the main stream.
+    auto proj_on = [&](cudaStream_t ps, const bf16* in, const void* w, int type, bf16* out,
+                       int no, int k) -> bool {
+        if (type == 0) return kernels::launch_gemv_rows(in, w, out, N, no, k, ps);
+        if (type != 8 && type != 12 && type != 14) return false;
+        if (q81_src != in || q81_k != k) { quant_rows(in, k); ps = st; }
+        return kernels::launch_mmvq_rows(type, q81, w, out, N, no, k, ps);
     };
     auto capture = [&](int layer) {
         if (!capture_dst || !capture_layers || n_capture <= 0) return;
@@ -1389,14 +1413,30 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             bf16* rv = rec_v + (size_t)L * N * lvdim;
             bf16* ra = rec_a + (size_t)L * N * vh;
             bf16* rb = rec_b + (size_t)L * N * vh;
+            // wqkv, wqkv_gate and alpha/beta are three independent reads of the same xn. wqkv is
+            // the only one big enough to fill the device; wqkv_gate and the fused alpha/beta run
+            // at ~3 and ~0.4 CTAs per SM, so serializing them behind wqkv just adds their latency
+            // to the chain. Push the two small ones onto stream_k. Safe only once q81 already
+            // holds xn -- otherwise proj() would have to quantize, which writes shared scratch.
+            const bool fork_gdn = fork_shared && q81_src == xn && q81_k == H;
+            cudaStream_t gst = fork_gdn ? s.stream_k : st;
+            if (fork_gdn) {
+                pf_cu(cudaEventRecord(ev_fork, st), "verify gdn fork");
+                pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify gdn fork wait");
+            }
+            supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H);
             // alpha and beta are v_heads-wide reads of the same xn — two launches whose cost is
             // almost entirely launch/graph-node latency. One fused launch, same per-row math.
             const bool ab_fused = w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
-                kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, st);
-            supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H) &&
-                        proj(xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H) &&
-                        (ab_fused || (proj(xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
-                                      proj(xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H)));
+                kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, gst);
+            supported = supported &&
+                        proj_on(gst, xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H) &&
+                        (ab_fused || (proj_on(gst, xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
+                                      proj_on(gst, xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H)));
+            if (fork_gdn) {
+                pf_cu(cudaEventRecord(ev_join, s.stream_k), "verify gdn join");
+                pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn join wait");
+            }
             if (!supported) break;
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) +
                 (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
@@ -1409,9 +1449,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                 c.linear_head_dim, c.rms_eps, st);
             supported = proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
         } else {
+            // Same shape of win as the GDN block: wq is 2*qdim rows and saturates, while wk and wv
+            // are kvdim rows apiece and run at well under one CTA per SM.
+            const bool fork_attn = fork_shared && q81_src == xn && q81_k == H;
+            cudaStream_t ast = fork_attn ? s.stream_k : st;
+            if (fork_attn) {
+                pf_cu(cudaEventRecord(ev_fork, st), "verify attn fork");
+                pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify attn fork wait");
+            }
             supported = proj(xn, w.wq, w.wq_type, b8, 2 * qdim, H) &&
-                        proj(xn, w.wk, w.wk_type, kf, kvdim, H) &&
-                        proj(xn, w.wv, w.wv_type, vf, kvdim, H);
+                        proj_on(ast, xn, w.wk, w.wk_type, kf, kvdim, H) &&
+                        proj_on(ast, xn, w.wv, w.wv_type, vf, kvdim, H);
+            if (fork_attn) {
+                pf_cu(cudaEventRecord(ev_join, s.stream_k), "verify attn join");
+                pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify attn join wait");
+            }
             if (!supported || !w.q_has_gate) break;
             char* kp = static_cast<char*>(s.kv->k_pool()) +
                        (size_t)L * s.kv->layer_stride_elems() * kv_elem;
@@ -1459,6 +1511,22 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     w.shared_gate_qtype, w.shared_up_qtype, w.shared_down_qtype);
             supported = false; break;
         }
+        // The routed and shared experts read the same hn/q81 and write disjoint outputs (routed vs
+        // shared), so they are independent right up to the add_rmsnorm3 that sums them. They were
+        // nonetheless serialized on one stream, which put the shared branch fully on the critical
+        // path: its five launches never exceed ~3 CTAs per SM and cost ~10 us a layer, while the
+        // routed branch it waits behind saturates the device (gate_up and down each launch 12288
+        // CTAs). Fork the shared branch onto stream_k -- the stream AR decode already hides this
+        // same kernel on -- so it fills the routed kernels' gaps instead of extending the chain.
+        // Identical kernels on identical inputs in the same per-branch order: bit-identical output.
+        const bool shared_on_k = fork_shared && w.shared_gate_inp &&
+                                 q81_src == hn && q81_k == H;
+        cudaStream_t sst = shared_on_k ? s.stream_k : st;
+        if (shared_on_k) {
+            pf_cu(cudaEventRecord(ev_fork, st), "verify moe fork");
+            pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify moe fork wait");
+        }
+        // Routed branch first so the saturating work is enqueued ahead of the filler.
         supported = kernels::launch_gemv_rows_f32(hn, w.router_w, router_logits,
                                                   N, E, H, st);
         kernels::launch_moe_router(router_logits, expert_ids, expert_w, nullptr,
@@ -1468,14 +1536,24 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             moe_h, moe_out, N, topk, H, ffn, q81, st);
 
         if (w.shared_gate_inp) {
-            supported = proj(hn, w.shared_gate_inp, w.shared_gate_inp_type, gate_raw, 1, H);
-            kernels::launch_qwen36_sigmoid_rows(gate_raw, gate_w, N, st);
+            // q81 already holds hn (the add_rmsnorm2 fusion above wrote it), so this never has to
+            // quantize -- which is what makes it safe to issue off the main stream.
+            supported = supported &&
+                (w.shared_gate_inp_type == 0
+                     ? kernels::launch_gemv_rows(hn, w.shared_gate_inp, gate_raw, N, 1, H, sst)
+                     : kernels::launch_mmvq_rows(w.shared_gate_inp_type, q81, w.shared_gate_inp,
+                                                 gate_raw, N, 1, H, sst));
+            kernels::launch_qwen36_sigmoid_rows(gate_raw, gate_w, N, sst);
         } else {
-            pf_cu(cudaMemsetAsync(gate_w, 0, (size_t)N * sizeof(float), st), "verify shared gate");
+            pf_cu(cudaMemsetAsync(gate_w, 0, (size_t)N * sizeof(float), sst), "verify shared gate");
         }
         kernels::launch_shared_expert_q8_mmvq_rows(
             q81, w.shared_gate_q, w.shared_up_q, w.shared_down_q, gate_w,
-            shared, moe_h, sg, H, ffn, N, st);
+            shared, shared_h, sg, H, ffn, N, sst);
+        if (shared_on_k) {
+            pf_cu(cudaEventRecord(ev_join, s.stream_k), "verify moe join");
+            pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify moe join wait");
+        }
         const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm3_q8_rows(h, routed, shared, next_norm, x, xn, q81,
                                              N, H, c.rms_eps, st);

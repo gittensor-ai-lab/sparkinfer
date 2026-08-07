@@ -2062,36 +2062,37 @@ bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
 bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
     if (M < 1 || M > 8 || N < 1 || (K != 2048 && K != 4096)) return false;
-    if (K == 2048)
-        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 8><<<N, 4 * 32, 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81),
-            reinterpret_cast<const unsigned char*>(W),
-            reinterpret_cast<__nv_bfloat16*>(y), M, N);
-    else
-        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 8><<<N, 4 * 32, 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81),
-            reinterpret_cast<const unsigned char*>(W),
-            reinterpret_cast<__nv_bfloat16*>(y), M, N);
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const auto* w = reinterpret_cast<const unsigned char*>(W);
+    auto* out = reinterpret_cast<__nv_bfloat16*>(y);
+    if (K == 2048) {
+        if (M <= 6) si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 6><<<N, 4 * 32, 0, stream>>>(q, w, out, M, N);
+        else        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 8><<<N, 4 * 32, 0, stream>>>(q, w, out, M, N);
+    } else {
+        if (M <= 6) si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 6><<<N, 4 * 32, 0, stream>>>(q, w, out, M, N);
+        else        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 8><<<N, 4 * 32, 0, stream>>>(q, w, out, M, N);
+    }
     return true;
 }
 bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
     if (M < 1 || M > 8 || N < 1 || (K != 512 && K != 2048 && K != 4096)) return false;
-    if (K == 512)
-        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 16, 8><<<N, 4 * 32, 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81),
-            reinterpret_cast<const unsigned char*>(W),
-            reinterpret_cast<__nv_bfloat16*>(y), M, N);
-    else if (K == 2048)
-        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 64, 8><<<N, 4 * 32, 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81),
-            reinterpret_cast<const unsigned char*>(W),
-            reinterpret_cast<__nv_bfloat16*>(y), M, N);
-    else
-        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 128, 8><<<N, 4 * 32, 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81),
-            reinterpret_cast<const unsigned char*>(W),
-            reinterpret_cast<__nv_bfloat16*>(y), M, N);
+    // The 6-row instantiations already exist (and the Q4_K launcher below picks them); this one
+    // always asked for the 8-row body, so a 6-row block ran two predicated rows of tmp[]/partial[]
+    // and the reduction over them for nothing.
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const auto* w = reinterpret_cast<const unsigned char*>(W);
+    auto* out = reinterpret_cast<__nv_bfloat16*>(y);
+#define SI_Q80_ROWS(NSUP) do {                                                      \
+        if (M <= 6) si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, NSUP, 6>           \
+                        <<<N, 4 * 32, 0, stream>>>(q, w, out, M, N);                \
+        else        si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, NSUP, 8>           \
+                        <<<N, 4 * 32, 0, stream>>>(q, w, out, M, N);                \
+    } while (0)
+    if (K == 512)       SI_Q80_ROWS(16);
+    else if (K == 2048) SI_Q80_ROWS(64);
+    else                SI_Q80_ROWS(128);
+#undef SI_Q80_ROWS
     return true;
 }
 bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,

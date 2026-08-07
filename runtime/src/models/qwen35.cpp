@@ -1906,8 +1906,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // The target overwrites dflash_hidden while capturing verify row zero. Preserve the
         // accepted suffix before running that target forward concurrently with the independent
         // draft stream. The initial full-context buffer is separate and needs no copy.
+        // Only the token-loop path runs verify row zero concurrently with the draft and so needs
+        // the accepted suffix preserved. The compact path runs the draft to completion first, so
+        // nothing can overwrite dflash_hidden underneath it and the copy plus its full-device
+        // synchronize are pure overhead.
         const void* draft_hidden = target_hidden;
-        if (target_hidden == s.dflash_hidden) {
+        if (!compact_verify && target_hidden == s.dflash_hidden) {
             cu(cudaMemcpyAsync(th_scratch, target_hidden,
                                (size_t)th_len * row_stride * sizeof(bf16),
                                cudaMemcpyDeviceToDevice, s.stream), "dflash overlap stash");

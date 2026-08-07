@@ -278,7 +278,6 @@ struct DFlashDraftModel::Impl {
     bf16 *x = nullptr, *xn = nullptr, *h = nullptr, *hn = nullptr;
     bf16 *q = nullptr, *k = nullptr, *v = nullptr, *attn = nullptr, *ao = nullptr;
     bf16 *gate = nullptr, *up = nullptr, *down = nullptr;
-    bf16 *k_new = nullptr, *v_new = nullptr;  // [ctx+B, n_kv, d]
     float* logits = nullptr;        // [B, vocab]
     void* head_q8 = nullptr;        // [B] Q8_1 rows of xn for the multi-row head MMVQ
     int *d_ids = nullptr, *d_out = nullptr;
@@ -487,7 +486,6 @@ bool DFlashDraftModel::load(const std::string& dir) {
 
     // Scratch
     const int max_ctx = max_seq;
-    const int max_kv = max_ctx + B;
     s.noise = s.alloc<bf16>((size_t)B * H);
     s.target_proj = s.alloc<bf16>((size_t)max_ctx * H);
     s.x = s.alloc<bf16>((size_t)B * H);
@@ -500,8 +498,6 @@ bool DFlashDraftModel::load(const std::string& dir) {
     s.gate = s.alloc<bf16>((size_t)B * I);
     s.up = s.alloc<bf16>((size_t)B * I);
     s.down = s.alloc<bf16>((size_t)B * H);
-    s.k_new = s.alloc<bf16>((size_t)max_kv * kvdim);
-    s.v_new = s.alloc<bf16>((size_t)max_kv * kvdim);
     s.logits = s.alloc<float>((size_t)B * std::max(s.cfg.vocab, 1));
     s.head_q8 = s.alloc<char>((size_t)B * kernels::llama_q8_1_bytes(H));
     s.d_ids = s.alloc<int>(B);
@@ -593,8 +589,20 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         return e ? atoi(e) : 0;
     }();
     const int run_layers = active_layers > 0 ? std::min(active_layers, c.n_layers) : c.n_layers;
+    // cat(k_ctx, k_noise) is built at exactly the layout and length the cache slice expects, so
+    // staging it in k_new/v_new and memcpy'ing it in cost two extra D2D launches per layer -- 12 a
+    // block, on a draft that is launch-bound (its kernels are 1-3 us and the gaps between them are
+    // the same size). Project straight into the cache slice instead; the RoPE then runs in place
+    // there. Same values written to the same addresses in the same order.
+    const int new_len_all = ctx_len + BW;
+    if (past + new_len_all > c.max_seq) {
+        fprintf(stderr, "[dflash] KV overflow past=%d new=%d max=%d\n", past, new_len_all, c.max_seq);
+        return false;
+    }
     for (int L = 0; L < run_layers; L++) {
         const LayerWeights& w = s.layers[L];
+        bf16* const kdst = s.k_cache[L] + (size_t)past * kvdim;
+        bf16* const vdst = s.v_cache[L] + (size_t)past * kvdim;
         if (L == 0)
             dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
 
@@ -603,41 +611,41 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             if (w.q8_wq.q4)
                 dflash_kernels::launch_gemv_batched_q4_fused3(
                     s.xn, w.q8_wq.q4, w.q8_wk.q4, w.q8_wv.q4, w.q8_wq.dm, w.q8_wk.dm, w.q8_wv.dm,
-                    s.q, s.k_new + (size_t)ctx_len * kvdim, s.v_new + (size_t)ctx_len * kvdim,
+                    s.q, kdst + (size_t)ctx_len * kvdim, vdst + (size_t)ctx_len * kvdim,
                     qdim, kvdim, kvdim, H, st, BW);
             else if (w.q8_wq.q)
                 dflash_kernels::launch_gemv_batched_q8_fused3(
                     s.xn, w.q8_wq.q, w.q8_wk.q, w.q8_wv.q, w.q8_wq.s, w.q8_wk.s, w.q8_wv.s,
-                    s.q, s.k_new + (size_t)ctx_len * kvdim, s.v_new + (size_t)ctx_len * kvdim,
+                    s.q, kdst + (size_t)ctx_len * kvdim, vdst + (size_t)ctx_len * kvdim,
                     qdim, kvdim, kvdim, H, st, BW);
             else
                 dflash_kernels::launch_gemv_batched16_fused3(
                     s.xn, w.wq, w.wk, w.wv,
-                    s.q, s.k_new + (size_t)ctx_len * kvdim,
-                    s.v_new + (size_t)ctx_len * kvdim,
+                    s.q, kdst + (size_t)ctx_len * kvdim,
+                    vdst + (size_t)ctx_len * kvdim,
                     qdim, kvdim, kvdim, H, st, BW);
         } else {
             for (int t = 0; t < BW; t++)
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wq, s.q + (size_t)t * qdim, qdim, H, st);
         }
-        // Build k_new / v_new = cat(k_ctx, k_noise)
+        // Context half of cat(k_ctx, k_noise), written ahead of the noise rows.
         if (ctx_len > 1) {
             dflash_kernels::launch_gemv_rows_exact_fused2(
-                s.target_proj, w.wk, w.wv, s.k_new, s.v_new,
+                s.target_proj, w.wk, w.wv, kdst, vdst,
                 ctx_len, kvdim, kvdim, H, st);
         } else if (ctx_len == 1) {
             const int t = 0;
             kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wk,
-                                 s.k_new + (size_t)t * kvdim, kvdim, H, st);
+                                 kdst + (size_t)t * kvdim, kvdim, H, st);
             kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wv,
-                                 s.v_new + (size_t)t * kvdim, kvdim, H, st);
+                                 vdst + (size_t)t * kvdim, kvdim, H, st);
         }
         if (!fast16) {
             for (int t = 0; t < BW; t++) {
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wk,
-                                     s.k_new + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
+                                     kdst + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wv,
-                                     s.v_new + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
+                                     vdst + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
             }
         }
 
@@ -654,21 +662,10 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         const int q_pos0 = pos0;
         dflash_kernels::launch_rms_heads_rope(s.q, w.q_norm, BW, c.n_q_heads, d, c.rms_eps,
                                              q_pos0, c.rope_theta, st);
-        dflash_kernels::launch_rms_heads_rope(s.k_new, w.k_norm, new_len, c.n_kv_heads, d,
+        dflash_kernels::launch_rms_heads_rope(kdst, w.k_norm, new_len, c.n_kv_heads, d,
                                              c.rms_eps, k_pos0, c.rope_theta, st);
 
-        // Append into cache then attend over full past+new
-        // Cache currently has `past` tokens. New keys start at offset `past`.
-        if (past + new_len > c.max_seq) {
-            fprintf(stderr, "[dflash] KV overflow past=%d new=%d max=%d\n", past, new_len, c.max_seq);
-            return false;
-        }
-        cu(cudaMemcpyAsync(s.k_cache[L] + (size_t)past * kvdim, s.k_new,
-                           (size_t)new_len * kvdim * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
-           "k append");
-        cu(cudaMemcpyAsync(s.v_cache[L] + (size_t)past * kvdim, s.v_new,
-                           (size_t)new_len * kvdim * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
-           "v append");
+        // K/V are already in the cache at offset `past` -- attend over the full past+new.
         const int kv_len = past + new_len;
         const int window = (L < (int)c.sliding_layers.size() && c.sliding_layers[L])
                                ? c.sliding_window : 0;
