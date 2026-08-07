@@ -312,12 +312,20 @@ if [ ! -f "$DRAFT/model.safetensors" ] && [ ! -f "$DRAFT/model.safetensors.index
 fi
 test -f "$GGUF" || {{ echo "FAIL missing GGUF $GGUF"; exit 1; }}
 
-# Build dflash tools + qwen3_gguf_bench (incremental) — the latter drives the Qwen3.5/3.6 guard below.
+# Build dflash tools + qwen3_gguf_bench (incremental build — the latter drives the Qwen3.5/3.6
+# guard below — but ALWAYS reconfigure). build/ is gitignored so it survives every checkout on
+# this box; skipping `cmake -S . -B build` whenever CMakeCache.txt already exists left stale
+# generated Makefiles pointing at source files from a *different* PR's branch that added them —
+# switching checkout to main (or another PR without those files) then failed with
+# "No such file or directory" for files main never even references (#693, #694). cmake's own
+# configure step is cheap and idempotent on an existing cache, so there's no reason to skip it.
 mkdir -p build
-if [ ! -f build/CMakeCache.txt ]; then
-  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/dflash_cmake.log 2>&1
-fi
-cmake --build build --target qwen3_gguf_dflash_check qwen3_gguf_dflash_bench qwen3_gguf_bench -j"$(nproc)" >/tmp/dflash_build.log 2>&1
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/dflash_cmake.log 2>&1
+cmake --build build --target qwen3_gguf_dflash_check qwen3_gguf_dflash_bench qwen3_gguf_bench -j"$(nproc)" >/tmp/dflash_build.log 2>&1 || {{
+  echo "BUILD_FAILED — tail of /tmp/dflash_build.log:" >&2
+  tail -80 /tmp/dflash_build.log >&2
+  exit 1
+}}
 test -x build/runtime/qwen3_gguf_dflash_bench
 test -x build/runtime/qwen3_gguf_bench
 
