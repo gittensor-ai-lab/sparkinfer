@@ -484,7 +484,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // Depth-adaptive KV-split: 32 (short) -> 128 (mid) -> 256 (long). The 8k-12k band
     // (28*split_chunk < seqlen <= 48*split_chunk) is roofline-bound on 128 splits; promote
     // to MAX_NSPLITS there only. Past 16k keep the original 64* knee. Math unchanged.
-    if (s.adaptive_splits) {
+    // DFlash decode: freeze n_splits while capturing. Adapting it mid-generation (e.g. the
+    // 32->160 jump at seqlen>2*split_chunk ~= 512) invalidates + re-captures the separate dflash
+    // verify graph mid-stream, which corrupts the compact-verify state and makes DFlash emit a
+    // spurious token 0 then repeat (SPEC fails at ctx crossing the boundary; 508-512 etc.). The
+    // eval prompt (~128 ctx) never crosses the threshold, so this is free there. Non-dflash decode
+    // keeps adapting.
+    if (s.adaptive_splits && !s.dflash_capture) {
         int want = 32;
         if ((long)seqlen > 2L * s.split_chunk) want = 128;
         if ((long)seqlen > 28L * s.split_chunk && (long)seqlen <= 48L * s.split_chunk)
