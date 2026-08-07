@@ -98,6 +98,46 @@ __global__ void gemv_f32_sk_kernel(const __nv_bfloat16* __restrict__ x,
         gemv_write(y + n, o);
     }
 }
+
+// N=1 shared-expert gate. This is the S=8 split-K GEMV above with the existing
+// bf16 rounding point and sigmoid folded into its single writer. Keeping the
+// rounding before expf makes it bit-equivalent to launch_gemv + sigmoid_scalar.
+__global__ void gemv_bf16_sigmoid_sk8_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ W,
+    __nv_bfloat16* __restrict__ scratch, float* __restrict__ y, int K) {
+    constexpr int S = 8;
+    __shared__ float s_part[S];
+    const int split = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    float acc = 0.f;
+    const uint4* row4 = reinterpret_cast<const uint4*>(W);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x);
+    const int n4 = K / 8;
+    for (int i = split * 32 + lane; i < n4; i += S * 32) {
+        uint4 wv = row4[i], xv = x4[i];
+        const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wv);
+        const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 wf = __bfloat1622float2(wh[j]);
+            const float2 xf = __bfloat1622float2(xh[j]);
+            acc += wf.x * xf.x + wf.y * xf.y;
+        }
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1)
+        acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    if (lane == 0) s_part[split] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float o = 0.f;
+#pragma unroll
+        for (int s = 0; s < S; ++s) o += s_part[s];
+        const __nv_bfloat16 rounded = __float2bfloat16(o);
+        if (scratch) scratch[0] = rounded;
+        const float z = __bfloat162float(rounded);
+        y[0] = 1.f / (1.f + __expf(-z));
+    }
+}
 #ifndef _MSC_VER
 template __global__ void gemv_f32_sk_kernel<float, 4>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int);
 #endif
@@ -1260,10 +1300,16 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K, cudaStream
         reinterpret_cast<__nv_bfloat16*>(y), N, K);
 }
 
-// Fused GEMV + sigmoid for N=1 (shared-expert gate scalar). Delegates to the
-// faithful split-k launch_gemv + bf16-rounded sigmoid_scalar path.
+// Fused GEMV + sigmoid for N=1 (shared-expert gate scalar).
 void launch_gemv_sigmoid(const void* x, const void* W, void* scratch_bf16, float* y, int K,
                          cudaStream_t stream) {
+    if ((K & 7) == 0) {
+        gemv_bf16_sigmoid_sk8_kernel<<<1, 8 * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x),
+            reinterpret_cast<const __nv_bfloat16*>(W),
+            reinterpret_cast<__nv_bfloat16*>(scratch_bf16), y, K);
+        return;
+    }
     launch_gemv(x, W, scratch_bf16, 1, K, stream);
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
     launch_qwen36_sigmoid_scalar(scratch_bf16, y, stream);

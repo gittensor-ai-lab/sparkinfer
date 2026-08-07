@@ -88,6 +88,11 @@ void launch_gemv_rows_exact_fused2(const void* x,
 void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,
                                cudaStream_t stream);
 
+// Device-side acceptance for a linear candidate chain. Writes accepted proposal count and
+// the target bonus token, requiring only one final host collection for the whole verify window.
+void launch_accept_linear(const int* candidates, const int* predictions, int n,
+                          int* out_accept, int* out_bonus, cudaStream_t stream);
+
 // Per-head RMSNorm on [seq, n_heads, d] (in-place).
 void launch_rms_heads(void* x, const void* w, int seq, int n_heads, int d,
                       float eps, cudaStream_t stream);

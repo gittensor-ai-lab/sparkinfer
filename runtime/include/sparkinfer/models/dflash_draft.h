@@ -61,7 +61,8 @@ public:
     // Returns false on failure.
     bool forward_block(const void* target_hidden, int ctx_len,
                        const int* noise_ids, int pos0,
-                       int* out_argmax, cudaStream_t stream = nullptr);
+                       int* out_argmax, cudaStream_t stream = nullptr,
+                       cudaEvent_t wait_event = nullptr);
 
     // Apply target lm_head to last forward's hidden states; writes device logits [block, vocab]
     // and host argmax. Called internally by forward_block; exposed for debugging.

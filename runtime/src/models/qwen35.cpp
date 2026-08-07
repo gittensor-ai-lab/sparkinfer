@@ -238,6 +238,16 @@ struct Qwen35Model::Impl {
     int dflash_ctx_cap = 0;
     bf16* dflash_hidden = nullptr;    // [max_rows, n_cap * H]
     bf16* dflash_context = nullptr;   // [ctx_cap, n_cap * H]
+    // Tail-window verification keeps row scalars, target argmaxes and acceptance metadata on
+    // device until one final collect. The target graph still replays sequentially because GDN
+    // state is recurrent; this removes only the intermediate host gates.
+    int* dflash_batch_ids = nullptr;
+    int* dflash_batch_candidates = nullptr;
+    int* dflash_batch_result = nullptr;
+    int* h_dflash_batch_result = nullptr;
+    int* h_dflash_batch_scalars = nullptr;  // pinned [max_rows, 5]
+    bool dflash_batch_async = false;
+    int dflash_batch_row = 0;
     float* spec_lin_snap = nullptr;
     bf16* spec_conv_snap = nullptr;
 
@@ -423,6 +433,9 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->sparse_vtbl); cudaFree(p_->sparse_vlen);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
+    cudaFree(p_->dflash_batch_ids); cudaFree(p_->dflash_batch_candidates);
+    cudaFree(p_->dflash_batch_result); cudaFreeHost(p_->h_dflash_batch_result);
+    cudaFreeHost(p_->h_dflash_batch_scalars);
     // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
     for (auto& kv : p_->sessions) {
         if (kv.first == 0) continue;
@@ -474,12 +487,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     int seqlen = position + 1;
     cudaStream_t st = s.stream;
     const bool dflash_cap = s.dflash_capture;
-    s.h_scalars[0] = token_id;
-    s.h_scalars[1] = position;
-    s.h_scalars[2] = position;
-    s.h_scalars[3] = seqlen;
-    s.h_scalars[4] = s.dflash_cap_row;
-    cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 5 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
+    int* host_scalars = s.h_scalars;
+    if (s.dflash_batch_async && s.h_dflash_batch_scalars &&
+        s.dflash_batch_row >= 0 && s.dflash_batch_row < s.dflash_max_rows)
+        host_scalars = s.h_dflash_batch_scalars + (size_t)s.dflash_batch_row * 5;
+    host_scalars[0] = token_id;
+    host_scalars[1] = position;
+    host_scalars[2] = position;
+    host_scalars[3] = seqlen;
+    host_scalars[4] = s.dflash_cap_row;
+    cu(cudaMemcpyAsync(s.d_scalars, host_scalars, 5 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
     // Depth-adaptive KV-split: 32 (short) -> 128 (mid) -> 256 (long). The 8k-12k band
     // (28*split_chunk < seqlen <= 48*split_chunk) is roofline-bound on 128 splits; promote
@@ -623,6 +640,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     }
     if (sample && dflash_cap && s.dflash_graph_ready) {
         cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch");
+        if (s.dflash_batch_async && s.dflash_batch_ids &&
+            s.dflash_batch_row >= 0 && s.dflash_batch_row < s.dflash_max_rows) {
+            cu(cudaMemcpyAsync(s.dflash_batch_ids + s.dflash_batch_row, s.d_out_id,
+                               sizeof(int), cudaMemcpyDeviceToDevice, st), "dflash tail argmax");
+            return token_id;
+        }
         cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
         // Deferred collect (DFlash verify token 0 only): return without blocking so the caller
         // can issue the draft block behind it. The target forward is then already running on the
@@ -1020,12 +1043,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             cudaStreamWaitEvent(s.stream_k, s.ev_pipe_fork, 0);
             cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
             if (w.shared_gate_inp) {
+                bool gate_sigmoid_done = false;
                 if (s.use_pq && w.shared_gate_inp_type == 12) {
                     if (s.use_llama) {
                         if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, s.stream_k);
-                        if (H == 2048)
+                        if (H == 2048) {
                             kernels::launch_mmvq_q4k_sigmoid(s.aq81, w.shared_gate_inp, s.d_shared_w, H, s.stream_k);
-                        else
+                            gate_sigmoid_done = true;
+                        } else
                             kernels::launch_mmvq_q4k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
                     } else {
                         kernels::launch_quantize_q8_1(s.hn, s.aq8, s.aq8_d, s.aq8_s, H, s.stream_k);
@@ -1048,12 +1073,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                         gemv_sigmoid = (e && e[0] == '1') ? 1 : 0; }   // default off: fused dot != split-k GEMV
                     if (gemv_sigmoid) {
                         kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.shared_gate_tmp, s.d_shared_w, H, s.stream_k);
+                        gate_sigmoid_done = true;
                     } else {
                         kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
-                        kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
                     }
                 }
-                if (w.shared_gate_inp && !(s.use_pq && s.use_llama && w.shared_gate_inp_type == 12 && H == 2048))
+                // All non-Q4_K paths above leave the gate logit in shared_gate_tmp. Apply the
+                // sigmoid exactly once here; the BF16 path previously launched this twice.
+                if (!gate_sigmoid_done)
                     kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
             }
             if (qmoe) {
@@ -1271,6 +1298,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
     }
 
+    if (s.dflash_batch_async && s.dflash_batch_ids &&
+        s.dflash_batch_row >= 0 && s.dflash_batch_row < s.dflash_max_rows) {
+        cu(cudaMemcpyAsync(s.dflash_batch_ids + s.dflash_batch_row, s.d_out_id,
+                           sizeof(int), cudaMemcpyDeviceToDevice, st), "dflash tail argmax");
+        return token_id;
+    }
     cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
     cu(cudaStreamSynchronize(st), "sync");
     return *s.h_out_id;
@@ -1707,9 +1740,22 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
     const size_t hidden_bytes = (size_t)s.dflash_max_rows * row_elems * sizeof(bf16);
     if (s.dflash_hidden) { cudaFree(s.dflash_hidden); s.dflash_hidden = nullptr; }
     if (s.dflash_context) { cudaFree(s.dflash_context); s.dflash_context = nullptr; }
+    if (s.dflash_batch_ids) { cudaFree(s.dflash_batch_ids); s.dflash_batch_ids = nullptr; }
+    if (s.dflash_batch_candidates) { cudaFree(s.dflash_batch_candidates); s.dflash_batch_candidates = nullptr; }
+    if (s.dflash_batch_result) { cudaFree(s.dflash_batch_result); s.dflash_batch_result = nullptr; }
+    if (s.h_dflash_batch_result) { cudaFreeHost(s.h_dflash_batch_result); s.h_dflash_batch_result = nullptr; }
+    if (s.h_dflash_batch_scalars) { cudaFreeHost(s.h_dflash_batch_scalars); s.h_dflash_batch_scalars = nullptr; }
+    s.dflash_batch_async = false;
+    s.dflash_batch_row = 0;
     s.dflash_ctx_cap = s.cfg.max_seq;
     cu(cudaMalloc(&s.dflash_hidden, hidden_bytes), "dflash hidden");
     cu(cudaMalloc(&s.dflash_context, (size_t)s.dflash_ctx_cap * row_elems * sizeof(bf16)), "dflash ctx");
+    cu(cudaMalloc(&s.dflash_batch_ids, (size_t)s.dflash_max_rows * sizeof(int)), "dflash tail ids");
+    cu(cudaMalloc(&s.dflash_batch_candidates, (size_t)s.dflash_max_rows * sizeof(int)), "dflash tail candidates");
+    cu(cudaMalloc(&s.dflash_batch_result, 2 * sizeof(int)), "dflash tail result");
+    cu(cudaMallocHost(&s.h_dflash_batch_result, 2 * sizeof(int)), "dflash tail host result");
+    cu(cudaMallocHost(&s.h_dflash_batch_scalars, (size_t)s.dflash_max_rows * 5 * sizeof(int)),
+       "dflash tail host scalars");
     if (s.cfg.hybrid && !s.spec_lin_snap) {
         const size_t ls = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
                           s.cfg.linear_head_dim * s.cfg.linear_head_dim;
@@ -1753,7 +1799,6 @@ void Qwen35Model::save_spec_snapshot() {
        "spec snap lin");
     cu(cudaMemcpyAsync(s.spec_conv_snap, s.lin_conv_state, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
        "spec snap conv");
-    cu(cudaStreamSynchronize(s.stream), "spec snap sync");
 }
 
 void Qwen35Model::restore_spec_snapshot() {
@@ -1766,8 +1811,6 @@ void Qwen35Model::restore_spec_snapshot() {
        "spec restore lin");
     cu(cudaMemcpyAsync(s.lin_conv_state, s.spec_conv_snap, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
        "spec restore conv");
-    cu(cudaStreamSynchronize(s.stream), "spec restore sync");
-    invalidate_decode_graph();
 }
 
 bool Qwen35Model::verify_block(const int* token_ids, int n, int start_pos, int* out_argmax) {
@@ -1864,6 +1907,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         draft.reset();
         return out;
     }
+    cudaEvent_t th_scratch_ready = nullptr;
+    cu(cudaEventCreateWithFlags(&th_scratch_ready, cudaEventDisableTiming),
+       "dflash overlap event");
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
         block[0] = next;
@@ -1873,11 +1919,17 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // accepted suffix before running that target forward concurrently with the independent
         // draft stream. The initial full-context buffer is separate and needs no copy.
         const void* draft_hidden = target_hidden;
+        cudaEvent_t draft_wait = nullptr;
         if (target_hidden == s.dflash_hidden) {
             cu(cudaMemcpyAsync(th_scratch, target_hidden,
                                (size_t)th_len * row_stride * sizeof(bf16),
                                cudaMemcpyDeviceToDevice, s.stream), "dflash overlap stash");
-            cu(cudaStreamSynchronize(s.stream), "dflash overlap stash sync");
+            if (th_scratch_ready) {
+                cu(cudaEventRecord(th_scratch_ready, s.stream), "dflash overlap event record");
+                draft_wait = th_scratch_ready;
+            } else {
+                cu(cudaStreamSynchronize(s.stream), "dflash overlap stash sync");
+            }
             draft_hidden = th_scratch;
         }
 
@@ -1890,7 +1942,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int p0 = forward_token(block[0], start, true);
         s.defer_decode_sync = false;
         const bool draft_ok = draft.forward_block(
-            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr);
+            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, draft_wait);
         if (p0 == kDFlashDeferred) {
             cu(cudaStreamSynchronize(s.stream), "verify0 sync");
             s.decode_pending = false;
@@ -1902,15 +1954,69 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         }
         for (int i = 1; i <= kProposalDepth; i++) block[i] = draft_ids[i];
 
+        static const int batch_verify = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_BATCH_VERIFY");
+            return (e && e[0] == '1') ? 1 : 0;
+        }();
+        const bool use_batch_verify = batch_verify && s.cfg.hybrid &&
+            kProposalDepth >= 1 && kProposalDepth < B &&
+            s.dflash_batch_ids && s.dflash_batch_candidates && s.dflash_batch_result &&
+            s.h_dflash_batch_result && s.h_dflash_batch_scalars &&
+            s.spec_lin_snap && s.spec_conv_snap;
+
         // Incremental verify with early-exit: forward only the accepted prefix, stopping at the
         // first rejected proposal. forward_token advances GDN state + KV per token, so after
         // block[0..keep-1] the recurrent state and KV sit exactly at start+keep -- no snapshot /
         // restore / KV-truncate / replay needed (greedy speculative decoding is exact). Rejected
         // proposals (block[keep..B-1]) are never forwarded, saving ~B-keep target forwards/step.
         int accept = 0, keep = 1;
+        int bonus = p0;
         bool vfail = p0 < 0;
         posterior[0] = p0;
-        if (!vfail && block[1] == p0) {
+        if (!vfail && block[1] == p0 && use_batch_verify) {
+            // SGLang-style hybrid verify/commit: retain the exact post-seed recurrent state,
+            // queue the tail graph replays without host gates, then commit the live full-tail
+            // state or restore and replay only the accepted prefix after a rejection.
+            save_spec_snapshot();
+            const int tail_n = kProposalDepth;
+            cu(cudaMemcpyAsync(s.dflash_batch_candidates, block.data() + 1,
+                               (size_t)tail_n * sizeof(int), cudaMemcpyHostToDevice, s.stream),
+               "dflash tail candidates");
+            s.dflash_batch_async = true;
+            for (int i = 1; i <= kProposalDepth; ++i) {
+                set_dflash_capture_row(i);
+                s.dflash_batch_row = i;
+                forward_token(block[i], start + i, true);
+            }
+            s.dflash_batch_async = false;
+            dflash_kernels::launch_accept_linear(s.dflash_batch_candidates,
+                                                 s.dflash_batch_ids + 1, tail_n,
+                                                 s.dflash_batch_result,
+                                                 s.dflash_batch_result + 1, s.stream);
+            cu(cudaMemcpyAsync(s.h_dflash_batch_result, s.dflash_batch_result,
+                               2 * sizeof(int), cudaMemcpyDeviceToHost, s.stream),
+               "dflash tail accept");
+            cu(cudaStreamSynchronize(s.stream), "dflash tail verify sync");
+            const int tail_accept = s.h_dflash_batch_result[0];
+            accept = 1 + tail_accept;
+            bonus = s.h_dflash_batch_result[1];
+            if (tail_accept < 0 || tail_accept >= tail_n ||
+                accept > kProposalDepth || bonus < 0 || bonus >= s.cfg.vocab) {
+                vfail = true;
+            } else {
+                keep = accept + 1;
+                if (accept < kProposalDepth) {
+                    restore_spec_snapshot();
+                    s.dflash_batch_async = true;
+                    for (int i = 1; i <= accept; ++i) {
+                        set_dflash_capture_row(i);
+                        s.dflash_batch_row = i;
+                        forward_token(block[i], start + i, true);
+                    }
+                    s.dflash_batch_async = false;
+                }
+            }
+        } else if (!vfail && block[1] == p0) {
             for (int i = 1; i <= kProposalDepth; i++) {
                 set_dflash_capture_row(i);
                 const int p = forward_token(block[i], start + i, true);
@@ -1920,6 +2026,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 keep = i + 1;
                 if (i < kProposalDepth && block[i + 1] != p) break;
             }
+            bonus = posterior[accept];
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
         // forward_token() synchronizes after sampling, so the accepted capture rows are already
@@ -1934,7 +2041,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         }
         if (stop) break;
         // Bonus token becomes the next block seed (emitted on the following iteration).
-        next = posterior[accept];
+        next = bonus;
         if (next == s.cfg.eos_id) {
             if ((int)out.size() < max_new) out.push_back(next);
             break;
@@ -1955,6 +2062,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         stats->decode_s = std::chrono::duration<double>(t_end - t_decode0).count();
     }
     close_session(sid);
+    if (th_scratch_ready) cudaEventDestroy(th_scratch_ready);
     if (th_scratch) cudaFree(th_scratch);
     set_dflash_capture(false, {}, 0);
     draft.reset();
