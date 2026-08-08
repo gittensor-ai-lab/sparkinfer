@@ -1642,8 +1642,17 @@ __global__ void gemv_i4_q81_multirow_kernel(
                 const int p = wb[j];
                 int lo = p & 0x0f0f0f0f;
                 int hi = (p >> 4) & 0x0f0f0f0f;
-                lo = (lo ^ 0x08080808) - 0x08080808;
-                hi = (hi ^ 0x08080808) - 0x08080808;
+                // Per-byte 4-bit sign extension: (n ^ 8) - 8 must be evaluated in each
+                // byte lane INDEPENDENTLY. A scalar 32-bit subtract is not that: every
+                // byte holding a negative weight has (n ^ 8) < 8, so the lane
+                // underflows and BORROWS from the next-higher byte, silently
+                // decrementing its neighbour's decoded weight (and chaining when the
+                // neighbour goes negative too). __vsubss4 subtracts per byte with
+                // saturation — which never engages here, since (n ^ 8) - 8 is always
+                // in [-8, 7] — the same idiom the Q6_K reconstructions in this file
+                // already use.
+                lo = __vsubss4(lo ^ 0x08080808, 0x08080808);
+                hi = __vsubss4(hi ^ 0x08080808, 0x08080808);
                 dot = __dp4a(lo, ai[j], dot);
                 dot = __dp4a(hi, ai[j + 4], dot);
             }
