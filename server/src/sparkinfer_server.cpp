@@ -90,11 +90,19 @@ std::string random_id() {
     return ss.str();
 }
 
-std::string usage_json(int prompt_tokens, int completion_tokens) {
+std::string usage_json(int prompt_tokens, int completion_tokens, double ttft_ms = -1.0,
+                       double generation_ms = -1.0, double decode_tps = -1.0) {
     std::ostringstream o;
     const int total = prompt_tokens + completion_tokens;
     o << "\"usage\":{\"prompt_tokens\":" << prompt_tokens << ",\"completion_tokens\":" << completion_tokens
-      << ",\"total_tokens\":" << total << "}";
+      << ",\"total_tokens\":" << total;
+    if (ttft_ms >= 0.0)
+        o << ",\"ttft_ms\":" << std::fixed << std::setprecision(3) << ttft_ms;
+    if (generation_ms >= 0.0)
+        o << ",\"generation_ms\":" << std::fixed << std::setprecision(3) << generation_ms;
+    if (decode_tps >= 0.0)
+        o << ",\"decode_tps\":" << std::fixed << std::setprecision(2) << decode_tps;
+    o << "}";
     return o.str();
 }
 
@@ -313,13 +321,21 @@ int main(int argc, char** argv) {
                              std::vector<int> stream_ids;
                              stream_ids.reserve((size_t)max_tokens);
                              sparkinfer_server::ThinkingStreamSplitter splitter(enable_thinking);
+                             const auto wall_start = std::chrono::steady_clock::now();
+                             std::chrono::steady_clock::time_point first_tok_time;
+                             bool saw_first_tok = false;
                              auto on_tok = [&](int tid) {
+                                 if (!saw_first_tok) {
+                                     first_tok_time = std::chrono::steady_clock::now();
+                                     saw_first_tok = true;
+                                 }
                                  std::string piece = g_tokenizer.decode_delta(stream_ids, tid);
                                  const auto delta = splitter.feed(piece);
                                  write_stream_delta(sink, cid, created, "reasoning_content", delta.reasoning_content);
                                  write_stream_delta(sink, cid, created, "content", delta.content);
                              };
                              engine.complete_streaming(prompt_ids, max_tokens, on_tok);
+                             const auto wall_end = std::chrono::steady_clock::now();
                              sparkinfer_server::ThinkingStreamSplitter::Delta flush;
                              splitter.finish(flush);
                              write_stream_delta(sink, cid, created, "reasoning_content", flush.reasoning_content);
@@ -332,11 +348,27 @@ int main(int argc, char** argv) {
                              }
                              const int prompt_tokens = (int)prompt_ids.size();
                              const int completion_tokens = (int)stream_ids.size();
+                             const auto& timing = engine.last_timing();
+                             double ttft_ms = timing.ttft_ms;
+                             double generation_ms = timing.generation_ms;
+                             double decode_tps = timing.decode_tps;
+                             if (generation_ms < 0.0) {
+                                 generation_ms = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
+                             }
+                             if (ttft_ms < 0.0 && saw_first_tok) {
+                                 ttft_ms = std::chrono::duration<double, std::milli>(first_tok_time - wall_start).count();
+                             }
+                             if (decode_tps < 0.0 && completion_tokens > 0 && generation_ms > 0.0) {
+                                 const double decode_ms =
+                                     (ttft_ms >= 0.0) ? std::max(generation_ms - ttft_ms, 1.0) : generation_ms;
+                                 decode_tps = (double)completion_tokens * 1000.0 / decode_ms;
+                             }
                              std::ostringstream usage_chunk;
                              usage_chunk << "data: {\"id\":\"" << cid << "\",\"object\":\"chat.completion.chunk\","
                                          << "\"created\":" << created << ",\"model\":\"" << g_model_name << "\","
                                          << "\"choices\":[],"
-                                         << usage_json(prompt_tokens, completion_tokens) << "}\n\n";
+                                         << usage_json(prompt_tokens, completion_tokens, ttft_ms, generation_ms, decode_tps)
+                                         << "}\n\n";
                              sink.write(usage_chunk.str().c_str(), (size_t)usage_chunk.str().size());
                              std::string tail =
                                  "data: {\"id\":\"" + cid +
