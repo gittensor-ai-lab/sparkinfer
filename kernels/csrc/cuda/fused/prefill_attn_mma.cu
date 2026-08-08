@@ -522,7 +522,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_m
 }
 
 template <int HD, int GROUP_BLKS, int RQH>
-static void launch_attn_gqa(const void* q, const signed char* k_pool, const signed char* v_pool,
+static bool launch_attn_gqa(const void* q, const signed char* k_pool, const signed char* v_pool,
                             const void* k_scale, const void* v_scale, const int* block_table,
                             void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
                             int block_size, int max_blocks_per_seq, float scale, int win_blocks,
@@ -533,11 +533,25 @@ static void launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                     + (size_t)(RQH * BM * GN) * sizeof(float)        // s_s
                     + (size_t)(BM * HD) * sizeof(float)              // s_o
                     + (size_t)(2 * GN + 5 * RQH * BM) * sizeof(float);
-    static int cfg = 0;
-    if (!cfg) {
-        cudaFuncSetAttribute(pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
-        cfg = 1;
+    // At RQH=4 this is 76,032 B — past the 48 KB default, so the opt-in below is
+    // REQUIRED for the launch to be valid, and both it and the launch itself have to
+    // be checked: a discarded failure here used to report success to the caller, which
+    // then skipped the scalar fallback and consumed whatever `attn` already held —
+    // silently wrong logits, no diagnostic. cudaFuncSetAttribute is also a PER-DEVICE
+    // setting, so the do-once latch is keyed on the device ordinal, not the process
+    // (the old process-wide latch left every device but the first unconfigured, and
+    // the launch then failed with cudaErrorInvalidValue on exactly the path that
+    // needs the raise).
+    constexpr int kMaxDevices = 16;
+    static int cfg[kMaxDevices] = {0};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDevices) return false;
+    if (!cfg[dev]) {
+        const cudaError_t ce = cudaFuncSetAttribute(
+            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+        if (ce != cudaSuccess && sm > 48u * 1024u) return false;  // opt-in refused where it is required
+        cfg[dev] = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
     pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH><<<grid, GROUP_BLKS * 32, sm, stream>>>(
@@ -545,6 +559,9 @@ static void launch_attn_gqa(const void* q, const signed char* k_pool, const sign
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
         block_size, max_blocks_per_seq, scale, win_blocks);
+    // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek —
+    // rather than get — so a pre-existing sticky error is not silently cleared here.
+    return cudaPeekAtLastError() == cudaSuccess;
 }
 
 bool launch_prefill_attn_mma(
@@ -578,16 +595,18 @@ bool launch_prefill_attn_mma(
     if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
 
     const int gqa = n_q_heads / n_kv_heads;
-    if (gqa_rqh == 4 && gqa % 4 == 0) {
+    // Each tier reports whether it actually launched; a refusal (opt-in rejected,
+    // launch invalid) cascades to the next tier — RQH=2 needs 46,720 B, under the
+    // 48 KB default — and finally to the per-q-head kernel below, instead of
+    // returning success over an output buffer nothing wrote.
+    if (gqa_rqh == 4 && gqa % 4 == 0 &&
         launch_attn_gqa<HD, GROUP_BLKS, 4>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
-            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream);
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream))
         return true;
-    }
-    if (gqa_rqh >= 2 && gqa % 2 == 0) {
+    if (gqa_rqh >= 2 && gqa % 2 == 0 &&
         launch_attn_gqa<HD, GROUP_BLKS, 2>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
-            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream);
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream))
         return true;
-    }
 
     // Fallback: original per-q-head kernel.
     constexpr int GN = GROUP_BLKS * 16;
