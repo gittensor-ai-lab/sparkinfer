@@ -6,13 +6,28 @@
 namespace sparkinfer {
 namespace dflash_kernels {
 
+// Upper bounds for the hd128 row-batched KV-split attention path, so the caller can size
+// its per-split partial-state scratch once at load instead of per call.
+constexpr int kDFlashAttnMaxSplits = 16;
+constexpr int kDFlashAttnMaxRows = 16;
+// Below this key count the split path is not worth taking: the unsplit kernel is already short
+// enough that the extra combine pass eats the gain, and re-associating the reduction perturbs the
+// draft's proposals -- at a 512-token context that cost more mean acceptance than the kernel saved
+// (2.0317 -> 2.0000, net -0.7%). Long contexts, where the unsplit kernel is ~25x off roofline, are
+// the case this exists for; everything shorter stays bit-for-bit on the original kernel.
+constexpr int kDFlashAttnMinKv = 1024;
+
 // GQA attention. q: [q_len, n_q, d], k/v: [kv_len, n_kv, d], out: [q_len, n_q, d] bf16.
 // q_pos0 / k_pos0 are absolute positions of index 0. If window > 0, mask keys with
 // (q_pos - k_pos) >= window (sliding window). scale = 1/sqrt(d).
+// fa_m / fa_l / fa_acc: optional partial-state scratch for the hd128 KV-split path, sized
+// [kDFlashAttnMaxRows * n_q * kDFlashAttnMaxSplits] (and * 128 for fa_acc). Pass nullptr to
+// force the single-CTA-per-row kernel.
 void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      int q_len, int kv_len, int n_q, int n_kv, int d,
                      int q_pos0, int k_pos0, int window, bool causal, float scale,
-                     cudaStream_t stream);
+                     cudaStream_t stream, float* fa_m = nullptr, float* fa_l = nullptr,
+                     float* fa_acc = nullptr);
 
 // In-place RoPE on [seq, n_heads, d] bf16. positions[i] = pos0 + i.
 void launch_rope_seq(void* x, int seq, int n_heads, int d, int pos0,

@@ -4,6 +4,7 @@
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
+#include "sparkinfer/kernels/prefill.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -278,6 +279,8 @@ struct DFlashDraftModel::Impl {
     bf16 *x = nullptr, *xn = nullptr, *h = nullptr, *hn = nullptr;
     bf16 *q = nullptr, *k = nullptr, *v = nullptr, *attn = nullptr, *ao = nullptr;
     bf16 *gate = nullptr, *up = nullptr, *down = nullptr;
+    // Per-split online-softmax partials for the row-batched KV-split draft attention.
+    float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
     float* logits = nullptr;        // [B, vocab]
     void* head_q8 = nullptr;        // [B] Q8_1 rows of xn for the multi-row head MMVQ
     int *d_ids = nullptr, *d_out = nullptr;
@@ -495,6 +498,13 @@ bool DFlashDraftModel::load(const std::string& dir) {
     s.q = s.alloc<bf16>((size_t)B * qdim);
     s.attn = s.alloc<bf16>((size_t)B * qdim);
     s.ao = s.alloc<bf16>((size_t)B * H);
+    {
+        const size_t parts = (size_t)dflash_kernels::kDFlashAttnMaxRows * s.cfg.n_q_heads *
+                             dflash_kernels::kDFlashAttnMaxSplits;
+        s.fa_m = s.alloc<float>(parts);
+        s.fa_l = s.alloc<float>(parts);
+        s.fa_acc = s.alloc<float>(parts * 128);
+    }
     s.gate = s.alloc<bf16>((size_t)B * I);
     s.up = s.alloc<bf16>((size_t)B * I);
     s.down = s.alloc<bf16>((size_t)B * H);
@@ -517,6 +527,22 @@ bool DFlashDraftModel::load(const std::string& dir) {
     (void)I; (void)n_cap;
     return true;
 }
+
+namespace {
+// Rows below this keep the bit-exact row-batched GEMV path. Two reasons for a high bar. The
+// prefill GEMM tiles its output 128x128, so a narrow block leaves most of the tile idle and the
+// GEMV shape still wins outright. And re-associating this projection perturbs the draft's
+// proposals, which at a short context costs more acceptance than the kernel saves (measured at
+// 512: mean accept 2.0317 -> 2.0000, a net -0.65% even though the kernel itself got faster).
+// Only a genuinely long context ingestion, where the GEMV shape is an order of magnitude off,
+// takes the GEMM -- every shorter block stays bit-for-bit what it was.
+constexpr int kCtxGemmMinRows = 1024;
+bool ctx_gemm_enabled() {
+    static const int on = []{ const char* e = getenv("SPARKINFER_DFLASH_CTX_GEMM");
+                              return (e && e[0] == '0') ? 0 : 1; }();
+    return on != 0;
+}
+}  // namespace
 
 bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      const int* noise_ids, int pos0,
@@ -568,9 +594,20 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
 
     // target_hidden [ctx, n_cap*H] -> fc -> hidden_norm -> target_proj [ctx, H]
     // fc.weight is [H, n_cap*H] (out, in). Loop gemv per row.
+    // Context ingestion (the first block of a generation) runs these projections over the whole
+    // prompt: at a 4k context that one step is [4096, n_cap*H] -> [4096, H] here plus [4096, H] ->
+    // K/V per layer below. The row-batched GEMV kernels these used give one CTA per (output, row)
+    // and reduce K per CTA, so at 4k they hit ~13 TFLOPS -- fine for the 1-6 row steady-state
+    // blocks they were written for, an order of magnitude off for a 4096-row one. Route just the
+    // wide case to the tensor-core bf16 prefill GEMM (same C[M,N] = A[M,K] @ W^T with the native
+    // [N,K] weight, fp32 accumulate); anything at or below kCtxGemmMinRows keeps the existing
+    // exact GEMV path bit-for-bit, so every steady-state block is untouched.
+    const bool ctx_gemm = ctx_len >= kCtxGemmMinRows && ctx_gemm_enabled();
     if (ctx_len > 0) {
         const bf16* th = (const bf16*)target_hidden;
-        if (ctx_len > 1) {
+        if (ctx_gemm) {
+            kernels::launch_prefill_gemm(th, s.fc, s.target_proj, ctx_len, H, n_cap * H, st);
+        } else if (ctx_len > 1) {
             dflash_kernels::launch_gemv_rows_batched(th, s.fc, s.target_proj,
                                                    ctx_len, H, n_cap * H, st);
         } else {
@@ -629,7 +666,10 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wq, s.q + (size_t)t * qdim, qdim, H, st);
         }
         // Context half of cat(k_ctx, k_noise), written ahead of the noise rows.
-        if (ctx_len > 1) {
+        if (ctx_gemm) {
+            kernels::launch_prefill_gemm(s.target_proj, w.wk, kdst, ctx_len, kvdim, H, st);
+            kernels::launch_prefill_gemm(s.target_proj, w.wv, vdst, ctx_len, kvdim, H, st);
+        } else if (ctx_len > 1) {
             dflash_kernels::launch_gemv_rows_exact_fused2(
                 s.target_proj, w.wk, w.wv, kdst, vdst,
                 ctx_len, kvdim, kvdim, H, st);
@@ -677,7 +717,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                             c.sliding_layers[L];
         dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L], s.v_cache[L], s.attn,
                                         BW, kv_len, c.n_q_heads, c.n_kv_heads, d,
-                                        q_pos0, /*k_pos0_cache=*/0, window, causal, scale, st);
+                                        q_pos0, /*k_pos0_cache=*/0, window, causal, scale, st,
+                                        s.fa_m, s.fa_l, s.fa_acc);
 
         if (fast16) {
             if (w.q8_wo.q4)

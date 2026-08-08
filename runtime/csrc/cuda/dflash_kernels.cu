@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace sparkinfer {
 namespace dflash_kernels {
@@ -236,6 +237,146 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
     float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
     for (int i = threadIdx.x; i < d; i += blockDim.x)
         ov[i] = f2b(acc[i] * inv);
+}
+
+// Row-batched, KV-split hd128 GQA attention for long draft contexts.
+//
+// k_attn_multiwarp_hd128 gives one CTA to each (query row, q head) and walks the whole
+// key sequence inside it. The per-warp online-softmax update is loop-carried, so the CTA's
+// runtime grows with kv_len while the CTA count stays fixed at q_len*n_q -- at a 4k draft
+// context that serial chain, not the KV bytes, is what the kernel is waiting on (measured:
+// 1 query row costs the same as 4, so the short-grid case is latency-bound, and the 16-row
+// case then re-reads the same K/V once per row).
+//
+// This kernel fixes both: ROWS query rows share a CTA (each K/V vector is fetched once per
+// ROWS rows instead of once per row) and the key range is cut into n_splits chunks so the
+// serial chain shortens and the grid grows with context. Per-split partial (m, l, acc)
+// states are merged by k_attn_split_combine, which is the same online-softmax merge the
+// in-CTA warp reduction already does -- exact for any split count.
+template <int ROWS, int NWARPS>
+__global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
+    const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
+    float* __restrict__ p_m, float* __restrict__ p_l, float* __restrict__ p_acc,
+    int q_len, int kv_len, int n_q, int n_kv,
+    int q_pos0, int k_pos0, int window, bool causal, float scale, int n_splits) {
+    constexpr int D = 128, E = D / 32;
+    const int rg = blockIdx.x, qh = blockIdx.y, sp = blockIdx.z;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int base = lane * E;
+    const int kv_h = qh / (n_q / n_kv);
+    const int qt0 = rg * ROWS;
+
+    float qr[ROWS][E], acc[ROWS][E], max_s[ROWS], sum[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const int qt = qt0 + r;
+        const bf16* qv = q + ((size_t)qt * n_q + qh) * D + base;
+#pragma unroll
+        for (int e = 0; e < E; e++) { qr[r][e] = (qt < q_len) ? b2f(qv[e]) : 0.f; acc[r][e] = 0.f; }
+        max_s[r] = -1e30f;
+        sum[r] = 0.f;
+    }
+
+    const int chunk = (kv_len + n_splits - 1) / n_splits;
+    const int t0 = sp * chunk;
+    const int t1 = min(kv_len, t0 + chunk);
+
+    for (int t = t0 + warp; t < t1; t += NWARPS) {
+        const int k_pos = k_pos0 + t;
+        const bf16* kp = k + ((size_t)t * n_kv + kv_h) * D + base;
+        float kreg[E];
+#pragma unroll
+        for (int e = 0; e < E; e++) kreg[e] = b2f(kp[e]);
+        float dots[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            float d = 0.f;
+#pragma unroll
+            for (int e = 0; e < E; e++) d += qr[r][e] * kreg[e];
+            dots[r] = d;
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) dots[r] += __shfl_down_sync(0xffffffffu, dots[r], off);
+        float vreg[E];
+        bool vloaded = false;
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int qt = qt0 + r;
+            if (qt >= q_len) continue;
+            const int q_pos = q_pos0 + qt;
+            if (causal && k_pos > q_pos) continue;
+            if (window > 0 && (q_pos - k_pos) >= window) continue;
+            if (!vloaded) {
+                const bf16* vp = v + ((size_t)t * n_kv + kv_h) * D + base;
+#pragma unroll
+                for (int e = 0; e < E; e++) vreg[e] = b2f(vp[e]);
+                vloaded = true;
+            }
+            const float score = __shfl_sync(0xffffffffu, dots[r], 0) * scale;
+            const float new_max = fmaxf(max_s[r], score);
+            const float e1 = __expf(max_s[r] - new_max);
+            const float e2 = __expf(score - new_max);
+            sum[r] = sum[r] * e1 + e2;
+#pragma unroll
+            for (int e = 0; e < E; e++) acc[r][e] = acc[r][e] * e1 + e2 * vreg[e];
+            max_s[r] = new_max;
+        }
+    }
+
+    extern __shared__ float sm[];
+    float* s_max = sm;                            // NWARPS * ROWS
+    float* s_sum = s_max + NWARPS * ROWS;         // NWARPS * ROWS
+    float* s_acc = s_sum + NWARPS * ROWS;         // NWARPS * ROWS * D
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        if (lane == 0) { s_max[warp * ROWS + r] = max_s[r]; s_sum[warp * ROWS + r] = sum[r]; }
+#pragma unroll
+        for (int e = 0; e < E; e++)
+            s_acc[((size_t)warp * ROWS + r) * D + base + e] = acc[r][e];
+    }
+    __syncthreads();
+    if (warp != 0) return;
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const int qt = qt0 + r;
+        if (qt >= q_len) continue;
+        float gmax = -1e30f;
+        for (int w = 0; w < NWARPS; w++) gmax = fmaxf(gmax, s_max[w * ROWS + r]);
+        float gsum = 0.f;
+        float result[E] = {0.f, 0.f, 0.f, 0.f};
+        for (int w = 0; w < NWARPS; w++) {
+            const float c = __expf(s_max[w * ROWS + r] - gmax);
+            gsum += s_sum[w * ROWS + r] * c;
+#pragma unroll
+            for (int e = 0; e < E; e++)
+                result[e] += s_acc[((size_t)w * ROWS + r) * D + base + e] * c;
+        }
+        const size_t o = ((size_t)qt * n_q + qh) * n_splits + sp;
+#pragma unroll
+        for (int e = 0; e < E; e++) p_acc[o * D + base + e] = result[e];
+        if (lane == 0) { p_m[o] = gmax; p_l[o] = gsum; }
+    }
+}
+
+// Merge the per-split online-softmax partials into the bf16 output.
+__global__ void k_attn_split_combine(const float* __restrict__ p_m, const float* __restrict__ p_l,
+                                     const float* __restrict__ p_acc, bf16* __restrict__ out,
+                                     int n_q, int n_splits) {
+    constexpr int D = 128;
+    const int qt = blockIdx.x, qh = blockIdx.y, d = threadIdx.x;
+    const size_t b = ((size_t)qt * n_q + qh) * n_splits;
+    float gmax = -1e30f;
+    for (int s = 0; s < n_splits; s++) gmax = fmaxf(gmax, p_m[b + s]);
+    float gsum = 0.f, acc = 0.f;
+    for (int s = 0; s < n_splits; s++) {
+        const float c = __expf(p_m[b + s] - gmax);
+        gsum += p_l[b + s] * c;
+        acc += p_acc[(b + s) * D + d] * c;
+    }
+    const float inv = gsum > 0.f ? 1.f / gsum : 0.f;
+    out[((size_t)qt * n_q + qh) * D + d] = f2b(acc * inv);
 }
 
 // Split the key sequence across the warps of one CTA, then merge their online-
@@ -1029,13 +1170,41 @@ void launch_rope_seq(void* x, int seq, int n_heads, int d, int pos0, float theta
     k_rope<<<grid, 64, 0, stream>>>((bf16*)x, seq, n_heads, d, pos0, theta);
 }
 
+int attn_gqa_splits(int kv_len) {
+    // Chosen from a same-box sweep of the draft shape (16 rows, 32 q / 8 kv heads, hd128):
+    // kv_len 128 -> 2, 512 -> 8, 4096 -> 16 splits were each at or within ~2% of the best
+    // (splits, rows) pair, and every point beat the unsplit kernel. Splitting past 16 starts
+    // losing to the per-split combine and the shrinking per-CTA key count.
+    int s = kv_len / 64;
+    if (s < 2) s = 2;
+    if (s > kDFlashAttnMaxSplits) s = kDFlashAttnMaxSplits;
+    return s;
+}
+
 void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      int q_len, int kv_len, int n_q, int n_kv, int d,
                      int q_pos0, int k_pos0, int window, bool causal, float scale,
-                     cudaStream_t stream) {
+                     cudaStream_t stream, float* fa_m, float* fa_l, float* fa_acc) {
     if (q_len <= 0 || kv_len <= 0) return;
     dim3 grid(q_len, n_q);
     if (d == 128) {
+        // Row-batched + KV-split path. Needs the caller's partial-state scratch; without it
+        // (or below the sweep's crossover) fall through to the single-CTA-per-row kernel.
+        static const int kSplitAttn = []{ const char* e = getenv("SPARKINFER_DFLASH_SPLIT_ATTN");
+                                          return (e && e[0] == '0') ? 0 : 1; }();
+        if (kSplitAttn && fa_m && fa_l && fa_acc && n_kv > 0 && (n_q % n_kv) == 0 &&
+            q_len <= kDFlashAttnMaxRows && kv_len >= kDFlashAttnMinKv) {
+            constexpr int ROWS = 2, NWARPS = 8;
+            const int n_splits = attn_gqa_splits(kv_len);
+            const size_t smem = (size_t)(2 * NWARPS * ROWS + NWARPS * ROWS * 128) * sizeof(float);
+            dim3 g((q_len + ROWS - 1) / ROWS, n_q, n_splits);
+            k_attn_rows_split_hd128<ROWS, NWARPS><<<g, NWARPS * 32, smem, stream>>>(
+                (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc,
+                q_len, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale, n_splits);
+            k_attn_split_combine<<<dim3(q_len, n_q), 128, 0, stream>>>(
+                fa_m, fa_l, fa_acc, (bf16*)out, n_q, n_splits);
+            return;
+        }
         constexpr int THREADS = 512;
         constexpr int NWARPS = THREADS / 32;
         constexpr int SMEM = (2 * NWARPS + NWARPS * 128) * sizeof(float);
