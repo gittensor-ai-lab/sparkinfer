@@ -1273,6 +1273,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local const void* graph_conv_key = nullptr;
     static thread_local const void* graph_capture_key = nullptr;
     static thread_local const void* graph_btable_key = nullptr;
+    static thread_local int graph_ns_key = -1;
     static thread_local const void* verify_head_key = nullptr;
     static thread_local signed char* verify_head_i8 = nullptr;
     static thread_local float* verify_head_scale = nullptr;
@@ -1375,7 +1376,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     bool head_ok = false;
     if (graph_model_key != s.w.lm_head || graph_state_key != s.lin_state ||
         graph_conv_key != s.lin_conv_state || graph_capture_key != capture_dst ||
-        graph_btable_key != btable) {
+        graph_btable_key != btable || graph_ns_key != ns) {
         if (verify_exec) cudaGraphExecDestroy(verify_exec);
         if (verify_graph) cudaGraphDestroy(verify_graph);
         verify_exec = nullptr; verify_graph = nullptr;
@@ -1385,6 +1386,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_conv_key = s.lin_conv_state;
         graph_capture_key = capture_dst;
         graph_btable_key = btable;
+        graph_ns_key = ns;
     }
     if (graph_ready && capture_only) return 0;   // already built
     if (graph_ready) {

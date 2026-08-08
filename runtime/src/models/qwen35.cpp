@@ -526,7 +526,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // dflash_graph_ready specifically lets prefill keep adapting exactly like the non-DFlash path,
     // and only starts freezing once there is a live graph that a change would actually corrupt.
     if (s.adaptive_splits && !(s.dflash_capture && s.dflash_graph_ready)) {
-        const int want = adaptive_nsplits_for(seqlen);
+        // DFlash's decode graph freezes n_splits the instant it is captured (below). If THIS call
+        // is the one about to freeze it (dflash_cap, not yet ready) and the tier is about to turn
+        // over on the very next position, bake in the post-transition value now instead of the
+        // current one -- otherwise the freeze locks in the stale pre-transition n_splits forever
+        // (AR keeps adapting unfrozen and ends up permanently mismatched, not just off by rounding).
+        // Elsewhere (AR calls, and DFlash prefill positions far from a boundary) seqlen+1 falls in
+        // the same tier as seqlen, so this is a no-op.
+        int want = adaptive_nsplits_for(seqlen);
+        if (s.dflash_capture && !s.dflash_graph_ready) {
+            const int want_next = adaptive_nsplits_for(seqlen + 1);
+            if (want_next > want) want = want_next;
+        }
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
             if (s.graph_ready) {
