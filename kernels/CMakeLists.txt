@@ -1,14 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
-project(sparkinfer_kernels LANGUAGES CXX CUDA)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_STANDARD 17)
 
 # Primary target: sm_120 = consumer Blackwell (RTX 5090).
 # Also: sm_100 = datacenter Blackwell (B200/GB200), sm_90 = Hopper, sm_89 = Ada.
 # NOTE: RTX 5090 is compute capability 12.0 (sm_120), NOT sm_100. sm_100 is
 # datacenter Blackwell (B200) and is binary-incompatible with the 5090.
-set(CMAKE_CUDA_ARCHITECTURES "89;90;100;120;121" CACHE STRING "CUDA architectures")
+# Must be set BEFORE project(... CUDA) — see root CMakeLists.txt for why.
+# sm_121 excluded — unsupported by the CUDA 12.8 toolkit currently in use.
+set(CMAKE_CUDA_ARCHITECTURES "89;90;100;120" CACHE STRING "CUDA architectures")
+project(sparkinfer_kernels LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
 
 option(BUILD_TESTS         "Build unit tests"            ON)
 option(BUILD_BENCHMARKS    "Build benchmarks"            OFF)

@@ -1,9 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Must be set BEFORE project(... CUDA) — see root CMakeLists.txt for why.
+# sm_121 excluded — unsupported by the CUDA 12.8 toolkit currently in use.
+set(CMAKE_CUDA_ARCHITECTURES "89;90;100;120" CACHE STRING "CUDA architectures")
 project(sparkinfer_moe LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES "89;90;100;120;121" CACHE STRING "CUDA architectures")
 
 option(BUILD_TESTS "Build unit tests" ON)
 
