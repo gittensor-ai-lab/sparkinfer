@@ -351,6 +351,11 @@ __global__ void pf_gdn_conv_kernel(const __nv_bfloat16* __restrict__ qkv,
             }
             __syncthreads();
             cval *= sw[0];
+            // sw[] is reused by the next token's reduction, so without a barrier here a warp
+            // that has already advanced can overwrite sw[t>>5] while a slower warp is still
+            // reading sw[0] for THIS token (#705). do_norm is block-uniform, so the barrier is
+            // reached by every thread in the block.
+            __syncthreads();
         }
         out[(size_t)tok * out_dim + hh * head_dim + t] = __float2bfloat16(cval);
     }
@@ -492,6 +497,11 @@ __global__ void pf_gdn_conv_tile_kernel(const __nv_bfloat16* __restrict__ qkv,
             }
             __syncthreads();
             cval *= sw[0];
+            // sw[] is reused by the next token's reduction, so without a barrier here a warp
+            // that has already advanced can overwrite sw[t>>5] while a slower warp is still
+            // reading sw[0] for THIS token (#705). do_norm is block-uniform, so the barrier is
+            // reached by every thread in the block.
+            __syncthreads();
         }
         out[(size_t)tok * out_dim + hh * head_dim + t] = __float2bfloat16(cval);
     }
@@ -720,9 +730,18 @@ __global__ void df_gdn_conv_checkpoint_kernel(
     const size_t state_elems = (size_t)(conv_kernel - 1) * qkv_dim;
     for (int tok = 0; tok < n_tokens; tok++) {
         const float cur = pf_to_f(qkv[(size_t)tok * qkv_dim + d]);
-        float y = cur * w[conv_kernel - 1];
+        // Accumulate in EXACTLY the order the single-token decode conv uses
+        // (conv_split_l2norm_fused_kernel in qwen36.cu): every history tap in ascending order
+        // first, then the current token's tap last. Float addition is not associative, so summing
+        // `cur` first -- as this kernel used to -- lands a different low bit in q/k/v than decode
+        // does for identical inputs. That difference is ~1 ulp, but k and v feed the GDN
+        // recurrence (S = S*g + k*delta), whose state persists across decode steps, so it
+        // compounds until it flips an argmax and DFlash stops reproducing AR (#712). Matching the
+        // order makes the batched and single-token paths bit-identical.
+        float y = 0.f;
         #pragma unroll
         for (int c = 0; c < 7; c++) if (c < conv_kernel - 1) y += hist[c] * w[c];
+        y += cur * w[conv_kernel - 1];
         #pragma unroll
         for (int c = 0; c < 6; c++) if (c < conv_kernel - 2) hist[c] = hist[c + 1];
         if (conv_kernel >= 2) hist[conv_kernel - 2] = cur;
@@ -738,6 +757,11 @@ __global__ void df_gdn_conv_checkpoint_kernel(
             }
             __syncthreads();
             cval *= sw[0];
+            // Same sw[] reuse hazard as the prefill convs above (#705). This kernel is the one
+            // the DFlash compact verify runs, and a non-deterministic q/k norm here feeds k and v
+            // straight into the GDN recurrence, whose state persists across decode steps -- so the
+            // race compounds until it flips an argmax and the batched path stops reproducing AR.
+            __syncthreads();
         }
         out[(size_t)tok * out_dim + hh * head_dim + t] = __float2bfloat16(cval);
         if constexpr (WRITE_CHECKPOINT) {
