@@ -466,6 +466,25 @@ bool launch_prefill_attn_windowed(
     const size_t sm_lp = ((size_t)TK * (HD + 4) + (size_t)TK * HD) * sizeof(float)
                        + (size_t)TQ_LP * HD * sizeof(__nv_bfloat16);
 
+    // The lane-parallel tiles need 98,816 B of dynamic shared memory — well past the
+    // 48 KB default — so the cudaFuncSetAttribute opt-in below is REQUIRED for those
+    // launches to be valid, and both it and the launch itself have to be checked: a
+    // discarded failure used to report success to the caller, which then skipped its
+    // full-attention fallback and consumed whatever `attn` already held — silently
+    // wrong logits, no diagnostic. The attribute is also a PER-DEVICE setting, so the
+    // do-once latches are keyed on the device ordinal, not the process (a process-wide
+    // latch leaves every device but the first unconfigured, and the launch then fails
+    // with cudaErrorInvalidValue on exactly the path that needs the raise). On a
+    // refusal the windowed branch degrades to the 32 KB scalar windowed kernel, and
+    // the full branch to `return false` — the contract the tail of this function
+    // already documents ("caller runs full attention"). The launch check peeks —
+    // rather than gets — the error, so a pre-existing sticky error is not silently
+    // cleared here.
+    constexpr size_t kSmDefault = 48u * 1024u;
+    constexpr int kMaxDevices = 16;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDevices) return false;
+
     static int lanepar = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_LANEPAR");
         return (e && e[0] == '0') ? 0 : 1;
@@ -475,44 +494,58 @@ bool launch_prefill_attn_windowed(
         return e ? atoi(e) : 256;
     }();
     if (win_blocks > 0) {
-        if (lanepar) {
-            static int cfglw = 0;
-            if (!cfglw) {
-                cudaFuncSetAttribute(win_prefill_lanepar_kernel<HD, QPW, TK, true>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_lp);
-                cfglw = 1;
+        bool lanepar_ok = lanepar != 0;
+        if (lanepar_ok) {
+            static int cfglw[kMaxDevices] = {0};
+            if (!cfglw[dev]) {
+                const cudaError_t ce =
+                    cudaFuncSetAttribute(win_prefill_lanepar_kernel<HD, QPW, TK, true>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_lp);
+                if (ce != cudaSuccess && sm_lp > kSmDefault) lanepar_ok = false;
+                else cfglw[dev] = 1;
             }
-            dim3 gridw((n_tokens + TQ_LP - 1) / TQ_LP, n_q_heads);
-            win_prefill_lanepar_kernel<HD, QPW, TK, true><<<gridw, 16 * 32, sm_lp, stream>>>(
-                qb, k_pool, v_pool, ks, vs, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
-                block_size, max_blocks_per_seq, scale, win_blocks);
-            return true;
+            if (lanepar_ok) {
+                dim3 gridw((n_tokens + TQ_LP - 1) / TQ_LP, n_q_heads);
+                win_prefill_lanepar_kernel<HD, QPW, TK, true><<<gridw, 16 * 32, sm_lp, stream>>>(
+                    qb, k_pool, v_pool, ks, vs, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
+                    block_size, max_blocks_per_seq, scale, win_blocks);
+                if (cudaPeekAtLastError() == cudaSuccess) return true;
+            }
+            // opt-in refused or launch invalid: degrade to the 32 KB scalar windowed
+            // kernel below rather than reporting success over an unwritten buffer.
         }
-        static int cfgw = 0;
-        if (!cfgw) {
+        static int cfgw[kMaxDevices] = {0};
+        if (!cfgw[dev]) {
             cudaFuncSetAttribute(win_prefill_windowed_kernel<HD, TQ, TK>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
-            cfgw = 1;
+            cfgw[dev] = 1;   // 32 KB fits the default; the attribute is advisory here
         }
         dim3 gridw((n_tokens + TQ - 1) / TQ, n_q_heads);
         win_prefill_windowed_kernel<HD, TQ, TK><<<gridw, TQ * 32, sm, stream>>>(
             qb, k_pool, v_pool, ks, vs, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
             block_size, max_blocks_per_seq, scale, win_blocks);
-        return true;
+        return cudaPeekAtLastError() == cudaSuccess;
     }
 
     if (lanepar) {
-        static int cfglf = 0;
-        if (!cfglf) {
-            cudaFuncSetAttribute(win_prefill_lanepar_kernel<HD, QPW, TK, false>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_lp);
-            cfglf = 1;
+        static int cfglf[kMaxDevices] = {0};
+        bool ok = true;
+        if (!cfglf[dev]) {
+            const cudaError_t ce =
+                cudaFuncSetAttribute(win_prefill_lanepar_kernel<HD, QPW, TK, false>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_lp);
+            if (ce != cudaSuccess && sm_lp > kSmDefault) ok = false;
+            else cfglf[dev] = 1;
         }
-        dim3 grid((n_tokens + TQ_LP - 1) / TQ_LP, n_q_heads);
-        win_prefill_lanepar_kernel<HD, QPW, TK, false><<<grid, 16 * 32, sm_lp, stream>>>(
-            qb, k_pool, v_pool, ks, vs, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
-            block_size, max_blocks_per_seq, scale, 0);
-        return true;
+        if (ok) {
+            dim3 grid((n_tokens + TQ_LP - 1) / TQ_LP, n_q_heads);
+            win_prefill_lanepar_kernel<HD, QPW, TK, false><<<grid, 16 * 32, sm_lp, stream>>>(
+                qb, k_pool, v_pool, ks, vs, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
+                block_size, max_blocks_per_seq, scale, 0);
+            if (cudaPeekAtLastError() == cudaSuccess) return true;
+        }
+        // fall through: the tiled opt-in (if enabled) or the caller's full attention
+        // computes the same unwindowed result this variant would have.
     }
 
     static int tiled = [] {
@@ -520,17 +553,17 @@ bool launch_prefill_attn_windowed(
         return (e && e[0] == '1') ? 1 : 0;
     }();
     if (tiled) {
-        static int cfg = 0;
-        if (!cfg) {
+        static int cfg[kMaxDevices] = {0};
+        if (!cfg[dev]) {
             cudaFuncSetAttribute(win_prefill_tiled_kernel<HD, TQ, TK>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
-            cfg = 1;
+            cfg[dev] = 1;   // 32 KB fits the default; the attribute is advisory here
         }
         dim3 grid((n_tokens + TQ - 1) / TQ, n_q_heads);
         win_prefill_tiled_kernel<HD, TQ, TK><<<grid, TQ * 32, sm, stream>>>(
             qb, k_pool, v_pool, ks, vs, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
             block_size, max_blocks_per_seq, scale);
-        return true;
+        return cudaPeekAtLastError() == cudaSuccess;
     }
 
     return false;   // window + tiling both off -> caller runs full attention
