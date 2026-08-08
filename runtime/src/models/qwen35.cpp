@@ -1986,6 +1986,29 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 3;
         return v < 1 ? 1 : v;
     }();
+    // Bound above which the row-batched verify is not used (see the engage comment in the loop).
+    // Hoisted out of the loop because the decision below has to be made before the first draft.
+    static const int kCompactMaxSeq = []{
+        const char* e = getenv("SPARKINFER_DFLASH_COMPACT_MAX_SEQ");
+        return e ? atoi(e) : 384;
+    }();
+    // Speculation only pays when the row-batched verify runs.
+    //
+    // On the token-loop path the target runs one forward for block[0] plus one per accepted
+    // proposal, and the step emits exactly that many tokens (keep = accept + 1). That is ONE
+    // target forward per emitted token -- precisely what plain AR decode does. The proposals
+    // never collapse a forward there; they only decide when the loop early-exits. So the draft
+    // block is pure additive cost and DFlash decodes strictly SLOWER than not speculating.
+    // Measured, RTX 5090, Qwen3.6-35B-A3B UD-Q4_K_M, 128 generated tokens, bf16 KV:
+    // AR decode 524.2 tok/s at 512-ctx and 499.0 at 4k, against DFlash 459.6 and 440.0 --
+    // a 12.3% and 11.8% loss for running the draft.
+    //
+    // Whether the batched verify can run is `start + B <= kCompactMaxSeq`, and `start` only
+    // grows, so that predicate is MONOTONE: once it is false it is false for the rest of the
+    // generation and no proposal can ever be cashed in again. Detect that and stop drafting --
+    // the tokens emitted afterwards are AR's, produced by the same forward_token() plain
+    // generate() calls, so this trades no accuracy for the speed.
+    bool spec_off = false;
     int compact_score = 0;
     bf16* th_scratch = nullptr;
     const int row_stride = dflash_hidden_row_stride();
@@ -1997,10 +2020,35 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     }
     // Build the verify replay graph before the decode clock starts. Capture records kernels
     // rather than running them, so this changes no state -- it just stops decode step 2 from
-    // paying for graph construction.
-    dflash_warm_verify(kProposalDepth + 1, start);
+    // paying for graph construction. Skip it when the batched verify is already out of range at
+    // the first step, since it can never come back into range and the graph would go unused.
+    if (compact_mode == 1 || (start + B) <= kCompactMaxSeq)
+        dflash_warm_verify(kProposalDepth + 1, start);
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
+        // The batched verify is permanently out of reach from here on, so a proposal can no
+        // longer save a target forward. Decode autoregressively: one forward per token, the
+        // same call plain generate() makes, with no draft block and no capture rows on the
+        // target graph.
+        if (!spec_off && compact_mode != 1 && (start + B) > kCompactMaxSeq) {
+            spec_off = true;
+            // Also drops the per-layer capture-row copies the target graph carries for the
+            // draft -- dead weight once nothing drafts -- and restores the adaptive n_splits
+            // that plain AR decode uses.
+            set_dflash_capture(false, {}, 0);
+        }
+        if (spec_off) {
+            out.push_back(next);
+            if (next == s.cfg.eos_id || (int)out.size() >= max_new) break;
+            const int p = forward_token(next, start, true);
+            if (p < 0) { fprintf(stderr, "[dflash] AR fallback failed at %d\n", start); break; }
+            start += 1;
+            next = p;
+            accept_sum += 1.0;
+            steps++;
+            if (gov) gov->pace();
+            continue;
+        }
         // Second condition: only run the batched path where it is VERIFIED bit-exact against AR.
         // The row-batched pass computes a position as one row of an N-row GEMM where AR computes
         // it as a single-row GEMV; the two reduction orders are not bit-identical, and once the
@@ -2017,10 +2065,6 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // bound every context runs the token loop, which is byte-exact at any length -- i.e.
         // main's code path, unchanged. Raise SPARKINFER_DFLASH_COMPACT_MAX_SEQ to re-test the
         // long-context path once that numerical gap is closed.
-        static const int kCompactMaxSeq = []{
-            const char* e = getenv("SPARKINFER_DFLASH_COMPACT_MAX_SEQ");
-            return e ? atoi(e) : 384;
-        }();
         const bool compact_ctx_ok = (start + B) <= kCompactMaxSeq;
         const bool compact_verify = compact_mode == 1 ||
             (compact_mode != 0 && compact_ctx_ok && compact_score >= kBlockScore);
