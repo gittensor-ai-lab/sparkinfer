@@ -1685,7 +1685,16 @@ verify_forward_done:
                 s.w.layers[L].ssm_a, state, keep, c.linear_q_heads, vh, c.linear_head_dim, st);
         }
     }
-    pf_cu(cudaStreamSynchronize(st), "verify commit");
+    // No barrier after the commit: the host reads nothing the commit kernels produce, and every
+    // consumer of the GDN state they update (the next verify/prefill pass) runs on this same
+    // stream, so stream order already protects it. Syncing here serialized the next step's draft
+    // launch ramp behind the commit for no correctness benefit; letting them overlap hides the
+    // commit entirely. SPARKINFER_DFLASH_COMMIT_SYNC=1 restores the old barrier (A/B).
+    static const bool commit_sync = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_COMMIT_SYNC");
+        return e && e[0] == '1';
+    }();
+    if (commit_sync) pf_cu(cudaStreamSynchronize(st), "verify commit");
     return keep;
 }
 

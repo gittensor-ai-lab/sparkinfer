@@ -285,6 +285,7 @@ struct DFlashDraftModel::Impl {
     void* head_q8 = nullptr;        // [B] Q8_1 rows of xn for the multi-row head MMVQ
     int *d_ids = nullptr, *d_out = nullptr;
     int *h_out = nullptr;
+    int *h_ids = nullptr;   // pinned staging for the block's noise ids
 
     // Per-layer contiguous KV cache: [max_seq, n_kv, d]
     std::vector<bf16*> k_cache, v_cache;
@@ -341,6 +342,7 @@ DFlashDraftModel::~DFlashDraftModel() {
     if (!p_) return;
     for (void* p : p_->owned) cudaFree(p);
     if (p_->h_out) cudaFreeHost(p_->h_out);
+    if (p_->h_ids) cudaFreeHost(p_->h_ids);
     if (p_->stream) cudaStreamDestroy(p_->stream);
     delete p_;
     p_ = nullptr;
@@ -513,6 +515,7 @@ bool DFlashDraftModel::load(const std::string& dir) {
     s.d_ids = s.alloc<int>(B);
     s.d_out = s.alloc<int>(B);
     cu(cudaHostAlloc(&s.h_out, B * sizeof(int), cudaHostAllocDefault), "h_out");
+    cu(cudaHostAlloc(&s.h_ids, B * sizeof(int), cudaHostAllocDefault), "h_ids");
 
     s.k_cache.resize(s.cfg.n_layers);
     s.v_cache.resize(s.cfg.n_layers);
@@ -589,7 +592,20 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // for the current checkpoint); any other block_size falls back to the per-token GEMV loop.
     const bool fast16 = (BW == 16 || BW == 8 || BW == 4);
 
-    cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
+    // Stage the ids through pinned memory: an async H2D from the caller's pageable buffer
+    // makes the driver bounce it through an internal staging area, stalling this thread while
+    // the stream still has the previous step's tail in flight. The memcpy into the pinned
+    // buffer is nanoseconds; the async copy out of it is a true fire-and-forget.
+    static const bool pinned_ids = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_PINNED_IDS");
+        return !(e && e[0] == '0');
+    }();
+    if (pinned_ids && s.h_ids) {
+        memcpy(s.h_ids, noise_ids, (size_t)BW * sizeof(int));
+        cu(cudaMemcpyAsync(s.d_ids, s.h_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
+    } else {
+        cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
+    }
     kernels::launch_embedding(s.d_ids, s.embed, s.noise, BW, H, st);
 
     // target_hidden [ctx, n_cap*H] -> fc -> hidden_norm -> target_proj [ctx, H]
