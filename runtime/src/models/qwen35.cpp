@@ -1963,15 +1963,27 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // the batched path and AR read the same weights and greedy DFlash reproduces AR exactly.
     static const int compact_mode = []{
         const char* e = getenv("SPARKINFER_DFLASH_COMPACT_VERIFY");
-        return e ? atoi(e) : 0;
+        return e ? atoi(e) : 2;
     }();
     // Full-block accepts arrive in runs (the target and draft agree over a whole predictable
-    // region), so one is already evidence the next step will accept a full block. Requiring two
-    // spent the first step of every run on the token loop, which costs one full target forward
-    // per accepted token instead of one row-batched pass over the block.
+    // region), so one is already evidence the next step will accept a full block.
+    //
+    // Engage the row-batched verify only while the draft is actually landing full blocks. The
+    // batched pass replaces the step's sequential target forwards with one N-row pass, so it pays
+    // in proportion to how many forwards it collapses -- that is the ACCEPTANCE RATE, not the
+    // context length. Measured on RTX 5090 over held-out prompts (mean accept tau, compact off ->
+    // on): tau 5.32 -> 448.7 to 911.1 tok/s, but tau 2.40 -> 433.2 to 437.2, tau 2.00 -> 425.4 to
+    // 396.1, and tau 1.87 -> 439.1 to 350.8. Below roughly half the block depth the batched pass
+    // forwards the whole block to keep two tokens and the token loop's early exit is simply
+    // cheaper, so engaging there costs throughput on exactly the prompts the draft handles worst.
+    //
+    // The previous score LATCHED: any partial accept of >= kStayKeep held it at the engage
+    // threshold, so once armed it stayed armed straight through those low-acceptance stretches.
+    // Require a RUN of full-block accepts to arm, and decay on every non-full block so it backs
+    // off as soon as the draft stops landing blocks.
     static const int kBlockScore = []{
         const char* e = getenv("SPARKINFER_DFLASH_BLOCK_SCORE");
-        int v = e ? atoi(e) : 1;
+        int v = e ? atoi(e) : 3;
         return v < 1 ? 1 : v;
     }();
     int compact_score = 0;
@@ -1989,8 +2001,29 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     dflash_warm_verify(kProposalDepth + 1, start);
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
+        // Second condition: only run the batched path where it is VERIFIED bit-exact against AR.
+        // The row-batched pass computes a position as one row of an N-row GEMM where AR computes
+        // it as a single-row GEMV; the two reduction orders are not bit-identical, and once the
+        // residual differs by more than a logit margin the argmax flips and DFlash stops
+        // reproducing AR (#712). Measured on RTX 5090 with the acceptance gate above already
+        // active, SPEC_AGREE at 128 generated tokens over 12 held-out prompts per context:
+        //
+        //   short prompt : 12/12 exact
+        //   512-ctx      : 11/12
+        //   2048-ctx     :  8/12
+        //   4096-ctx     : 11/12
+        //
+        // So the batched path is only trustworthy while the attended context is short. Above the
+        // bound every context runs the token loop, which is byte-exact at any length -- i.e.
+        // main's code path, unchanged. Raise SPARKINFER_DFLASH_COMPACT_MAX_SEQ to re-test the
+        // long-context path once that numerical gap is closed.
+        static const int kCompactMaxSeq = []{
+            const char* e = getenv("SPARKINFER_DFLASH_COMPACT_MAX_SEQ");
+            return e ? atoi(e) : 384;
+        }();
+        const bool compact_ctx_ok = (start + B) <= kCompactMaxSeq;
         const bool compact_verify = compact_mode == 1 ||
-            (compact_mode != 0 && compact_score >= kBlockScore);
+            (compact_mode != 0 && compact_ctx_ok && compact_score >= kBlockScore);
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 
@@ -2064,21 +2097,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             }
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
-        // Leave the block only when the step accepted a single token. Resetting on ANY partial
-        // accept is what cost: the next step then runs the token loop, and if that step goes on to
-        // accept a full block it pays a separate target forward per token (~1.93 ms each) instead
-        // of one row-batched pass (~0.50 ms per row). Measured on the eval prompt, sweeping this
-        // threshold: 1 -> 984.1, 2 -> 1015.0, 3 -> 991.6, 4 -> 989.7 tok/s. 2 is the optimum from
-        // both directions -- at keep 1 the token loop's early exit really is cheaper (its seed
-        // forward overlaps the draft), and above 1 the re-entry cost dominates the single step.
-        // SPARKINFER_DFLASH_BLOCK_KEEP overrides (A/B).
-        static const int kStayKeep = []{
-            const char* e = getenv("SPARKINFER_DFLASH_BLOCK_KEEP");
-            int v = e ? atoi(e) : 2;
-            return v < 1 ? 1 : v;
-        }();
-        compact_score = keep == kProposalDepth + 1 ? std::min(compact_score + 1, 3)
-                      : (keep >= kStayKeep ? std::max(compact_score, kBlockScore) : 0);
+        // Climb on a full-block accept, decay on anything less. The old rule latched the score at
+        // the engage threshold for any partial accept of >= 2 tokens, which kept the batched path
+        // armed through low-acceptance stretches -- precisely where it costs throughput. Decaying
+        // instead means a prompt the draft handles badly drops back to the token loop within a
+        // couple of steps and stays there, while a prompt it handles well re-arms just as quickly.
+        compact_score = keep == kProposalDepth + 1
+                      ? std::min(compact_score + 1, kBlockScore + 1)
+                      : std::max(compact_score - 1, 0);
         // forward_token() synchronizes after sampling, so the accepted capture rows are already
         // stable. The draft consumes only this newly accepted suffix; its KV cache retains all
         // earlier context. Hand the capture buffer over directly instead of copying it to a second
