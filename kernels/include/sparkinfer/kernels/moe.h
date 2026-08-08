@@ -40,6 +40,14 @@ void launch_router_fused(
     int num_experts, int K, int top_k, int normalize,
     cudaStream_t stream = nullptr);
 
+// DFlash compact verifier: row-batched split-K router GEMV + per-row bitonic top-k in one
+// graph-replay-safe launch. Supports the fixed Qwen3.6 E=256, rows<=8 shape.
+bool launch_router_fused_rows(
+    const void* x, const void* W, float* logits, unsigned int* gridctr,
+    int* expert_ids, float* expert_weights,
+    int rows, int num_experts, int K, int top_k, int normalize,
+    cudaStream_t stream = nullptr);
+
 // Fused MoE expert FFN with SwiGLU activation.
 // For each token i and each of its top_k experts e (weight w):
 //   h = SiLU(X[i] @ gate_w[e]) * (X[i] @ up_w[e])     // [ffn_dim]

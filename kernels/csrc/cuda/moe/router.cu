@@ -265,6 +265,80 @@ __global__ void moe_router_fused_kernel(
     if (threadIdx.x < 32)
         si_warp_bitonic_top8(s_lg, threadIdx.x & 31, top_k, normalize, expert_ids, expert_weights, nullptr);
 }
+
+// Row-batched counterpart used by DFlash compact verification.  Its dot/reduction order is the
+// same as gemv_bf16_rows_sk_kernel<float,4,M>: each weight packet is shared across M activation
+// rows, while every row keeps an independent SPL-way reduction.  The last block then assigns one
+// warp to each token's top-k, removing the dependent moe_router launch in every target MoE layer.
+template <int SPL, int M>
+__global__ void moe_router_fused_rows_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ W,
+    float* __restrict__ logits, unsigned int* __restrict__ gridctr,
+    int* __restrict__ expert_ids, float* __restrict__ expert_weights,
+    int N, int K, int top_k, int normalize)
+{
+    constexpr int RPB = 8 / SPL;
+    __shared__ float s_part[M][RPB][SPL];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / SPL, split = warp % SPL;
+    const int n = blockIdx.x * RPB + row_local;
+    float acc[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) acc[r] = 0.f;
+    if (n < N) {
+        const uint4* row4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+        const int n4 = K / 8;
+        for (int i = split * 32 + lane; i < n4; i += SPL * 32) {
+            const uint4 wv = row4[i];
+            const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            float2 wf[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) wf[j] = __bfloat1622float2(wh[j]);
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const uint4 xv = reinterpret_cast<const uint4*>(x + (size_t)r * K)[i];
+                const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 xf = __bfloat1622float2(xh[j]);
+                    acc[r] += wf[j].x * xf.x + wf[j].y * xf.y;
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < M; ++r)
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1)
+                acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], d);
+        if (lane == 0)
+#pragma unroll
+            for (int r = 0; r < M; ++r) s_part[r][row_local][split] = acc[r];
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float o = 0.f;
+#pragma unroll
+            for (int s = 0; s < SPL; ++s) o += s_part[r][row_local][s];
+            logits[(size_t)r * N + n] = o;
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    __shared__ unsigned int s_last;
+    if (threadIdx.x == 0) s_last = atomicInc(gridctr, gridDim.x - 1);
+    __syncthreads();
+    if (s_last != gridDim.x - 1) return;
+    __shared__ float s_lg[M][256];
+    if (warp < M) {
+        for (int e = lane; e < N; e += 32) s_lg[warp][e] = logits[(size_t)warp * N + e];
+        __syncwarp();
+        si_warp_bitonic_top8(s_lg[warp], lane, top_k, normalize,
+                             expert_ids + (size_t)warp * top_k,
+                             expert_weights + (size_t)warp * top_k, nullptr);
+    }
+}
 #undef SI_CEXG
 
 // Batched warp-per-token top-k for the prefill router. One warp per token, 8 tokens per
@@ -338,6 +412,28 @@ void launch_router_fused(const void* x, const void* W, float* logits, unsigned i
     moe_router_fused_kernel<SPL><<<grid, 8 * 32, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W),
         logits, gridctr, expert_ids, expert_weights, num_experts, K, top_k, normalize);
+}
+
+bool launch_router_fused_rows(const void* x, const void* W, float* logits,
+                              unsigned int* gridctr, int* expert_ids, float* expert_weights,
+                              int rows, int num_experts, int K, int top_k, int normalize,
+                              cudaStream_t stream) {
+    if (!x || !W || !logits || !gridctr || !expert_ids || !expert_weights ||
+        rows < 1 || rows > 8 || num_experts != 256 || (K & 7) || top_k < 1 || top_k > 8)
+        return false;
+    constexpr int SPL = 4, RPB = 8 / SPL;
+    dim3 grid((num_experts + RPB - 1) / RPB);
+#define SI_ROUTER_ROWS(MM) moe_router_fused_rows_kernel<SPL, MM><<<grid, 8 * 32, 0, stream>>>( \
+        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), \
+        logits, gridctr, expert_ids, expert_weights, num_experts, K, top_k, normalize)
+    switch (rows) {
+        case 1: SI_ROUTER_ROWS(1); break; case 2: SI_ROUTER_ROWS(2); break;
+        case 3: SI_ROUTER_ROWS(3); break; case 4: SI_ROUTER_ROWS(4); break;
+        case 5: SI_ROUTER_ROWS(5); break; case 6: SI_ROUTER_ROWS(6); break;
+        case 7: SI_ROUTER_ROWS(7); break; default: SI_ROUTER_ROWS(8); break;
+    }
+#undef SI_ROUTER_ROWS
+    return true;
 }
 #endif
 

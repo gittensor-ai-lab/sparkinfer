@@ -1277,11 +1277,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local const void* verify_head_key = nullptr;
     static thread_local signed char* verify_head_i8 = nullptr;
     static thread_local float* verify_head_scale = nullptr;
+    static thread_local unsigned int* verify_router_counter = nullptr;
     static thread_local cudaEvent_t ev_fork = nullptr;
     static thread_local cudaEvent_t ev_join = nullptr;
     // Off-critical-path stream for the shared expert. Empty stream_k means no overlap is possible.
     static const bool shared_stream_on = [] {
         const char* e = getenv("SPARKINFER_DFLASH_SHARED_STREAM");
+        return !(e && e[0] == '0');
+    }();
+    static const bool router_fused_on = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_ROUTER_FUSED");
         return !(e && e[0] == '0');
     }();
     const bool fork_shared = shared_stream_on && s.stream_k && s.stream_k != s.stream;
@@ -1294,6 +1299,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         pf_cu(cudaHostAlloc(&ph_pos, 16 * sizeof(int), cudaHostAllocDefault), "verify host pos");
         pf_cu(cudaHostAlloc(&ph_seq, 16 * sizeof(int), cudaHostAllocDefault), "verify host lens");
         pf_cu(cudaHostAlloc(&ph_out, 16 * sizeof(int), cudaHostAllocDefault), "verify host out");
+    }
+    if (!verify_router_counter) {
+        pf_cu(cudaMalloc(&verify_router_counter, sizeof(unsigned int)), "verify router counter");
+        if (verify_router_counter)
+            pf_cu(cudaMemset(verify_router_counter, 0, sizeof(unsigned int)), "verify router counter init");
     }
     if (verify_head_key != s.w.lm_head && s.w.lm_head_type == 12 && H == 2048) {
         if (verify_head_i8) cudaFree(verify_head_i8);
@@ -1530,10 +1540,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify moe fork wait");
         }
         // Routed branch first so the saturating work is enqueued ahead of the filler.
-        supported = kernels::launch_gemv_rows_f32(hn, w.router_w, router_logits,
-                                                  N, E, H, st);
-        kernels::launch_moe_router(router_logits, expert_ids, expert_w, nullptr,
-                                   N, E, topk, 1, st);
+        const bool router_fused = router_fused_on && verify_router_counter &&
+            kernels::launch_router_fused_rows(
+                hn, w.router_w, router_logits, verify_router_counter, expert_ids, expert_w,
+                N, E, H, topk, 1, st);
+        supported = router_fused || kernels::launch_gemv_rows_f32(
+            hn, w.router_w, router_logits, N, E, H, st);
+        if (!router_fused)
+            kernels::launch_moe_router(router_logits, expert_ids, expert_w, nullptr,
+                                       N, E, topk, 1, st);
         kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
             w.gate_qtype, w.up_qtype, w.down_qtype, expert_ids, expert_w, routed,
             moe_h, moe_out, N, topk, H, ffn, q81, st);
@@ -1541,12 +1556,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         if (w.shared_gate_inp) {
             // q81 already holds hn (the add_rmsnorm2 fusion above wrote it), so this never has to
             // quantize -- which is what makes it safe to issue off the main stream.
-            supported = supported &&
-                (w.shared_gate_inp_type == 0
-                     ? kernels::launch_gemv_rows(hn, w.shared_gate_inp, gate_raw, N, 1, H, sst)
-                     : kernels::launch_mmvq_rows(w.shared_gate_inp_type, q81, w.shared_gate_inp,
-                                                 gate_raw, N, 1, H, sst));
-            kernels::launch_qwen36_sigmoid_rows(gate_raw, gate_w, N, sst);
+            const bool gate_sigmoid_fused = w.shared_gate_inp_type == 0 &&
+                kernels::launch_gemv_rows_sigmoid(hn, w.shared_gate_inp, gate_w, N, H, sst);
+            supported = supported && (gate_sigmoid_fused ||
+                kernels::launch_mmvq_rows(w.shared_gate_inp_type, q81, w.shared_gate_inp,
+                                          gate_raw, N, 1, H, sst));
+            if (!gate_sigmoid_fused)
+                kernels::launch_qwen36_sigmoid_rows(gate_raw, gate_w, N, sst);
         } else {
             pf_cu(cudaMemsetAsync(gate_w, 0, (size_t)N * sizeof(float), sst), "verify shared gate");
         }

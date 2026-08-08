@@ -47,6 +47,10 @@ void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K,
                      cudaStream_t stream = nullptr);
 bool launch_gemv_rows(const void* x, const void* W, void* y,
                       int M, int N, int K, cudaStream_t stream = nullptr);
+// DFlash shared-gate projection: exact launch_gemv_rows bf16 rounding followed by sigmoid,
+// fused into one graph node. Restricted to the N=1 compact-verification shape.
+bool launch_gemv_rows_sigmoid(const void* x, const void* W, float* y,
+                              int M, int K, cudaStream_t stream = nullptr);
 bool launch_gemv_rows_f32(const void* x, const void* W, float* y,
                           int M, int N, int K, cudaStream_t stream = nullptr);
 

@@ -115,7 +115,7 @@ template __global__ void gemv_f32_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat1
 // Compact verification supplies up to four activation rows for the same matrix.
 // Preserve the split-K reduction independently for each row while sharing every
 // weight packet across those row accumulators.
-template <typename OutT, int S, int M>
+template <typename OutT, int S, int M, bool SIGMOID = false>
 __global__ void gemv_bf16_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                          const __nv_bfloat16* __restrict__ W,
                                          OutT* __restrict__ y, int N, int K) {
@@ -163,7 +163,15 @@ __global__ void gemv_bf16_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
             float out = 0.f;
 #pragma unroll
             for (int s = 0; s < S; ++s) out += part[r][row_local][s];
-            gemv_write(y + (size_t)r * N + n, out);
+            if constexpr (SIGMOID) {
+                // Match the former two-kernel path exactly: the projection first rounds to bf16,
+                // then sigmoid converts that rounded value back to float.
+                const __nv_bfloat16 rounded = __float2bfloat16(out);
+                const float z = __bfloat162float(rounded);
+                y[(size_t)r * N + n] = 1.f / (1.f + __expf(-z));
+            } else {
+                gemv_write(y + (size_t)r * N + n, out);
+            }
         }
     }
 }
@@ -1838,6 +1846,23 @@ bool launch_gemv_rows(const void* x, const void* W, void* y,
                       int M, int N, int K, cudaStream_t stream) {
     return launch_gemv_rows_t<__nv_bfloat16, 8>(x, W,
         reinterpret_cast<__nv_bfloat16*>(y), M, N, K, stream);
+}
+bool launch_gemv_rows_sigmoid(const void* x, const void* W, float* y,
+                              int M, int K, cudaStream_t stream) {
+    if (M < 1 || M > 8 || (K & 7)) return false;
+    constexpr int S = 8;
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+    const auto* wp = reinterpret_cast<const __nv_bfloat16*>(W);
+#define SI_GEMV_ROWS_SIGMOID(MM) \
+    gemv_bf16_rows_sk_kernel<float, S, MM, true><<<1, GEMV_WPB * 32, 0, stream>>>(xp, wp, y, 1, K)
+    switch (M) {
+        case 1: SI_GEMV_ROWS_SIGMOID(1); break; case 2: SI_GEMV_ROWS_SIGMOID(2); break;
+        case 3: SI_GEMV_ROWS_SIGMOID(3); break; case 4: SI_GEMV_ROWS_SIGMOID(4); break;
+        case 5: SI_GEMV_ROWS_SIGMOID(5); break; case 6: SI_GEMV_ROWS_SIGMOID(6); break;
+        case 7: SI_GEMV_ROWS_SIGMOID(7); break; default: SI_GEMV_ROWS_SIGMOID(8); break;
+    }
+#undef SI_GEMV_ROWS_SIGMOID
+    return true;
 }
 bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, void* y1,
                        int M, int N0, int N1, int K, cudaStream_t stream) {
