@@ -234,6 +234,7 @@ struct Qwen35Model::Impl {
     int dflash_n_cap = 0;
     int dflash_max_rows = 16;
     int dflash_cap_row = 0;
+    int final_seqlen_hint = -1;   // set by generate()/dflash_generate() before their prefill loop
     int dflash_ctx_len = 0;
     int dflash_ctx_cap = 0;
     bf16* dflash_hidden = nullptr;    // [max_rows, n_cap * H]
@@ -526,17 +527,36 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // dflash_graph_ready specifically lets prefill keep adapting exactly like the non-DFlash path,
     // and only starts freezing once there is a live graph that a change would actually corrupt.
     if (s.adaptive_splits && !(s.dflash_capture && s.dflash_graph_ready)) {
-        // DFlash's decode graph freezes n_splits the instant it is captured (below). If THIS call
-        // is the one about to freeze it (dflash_cap, not yet ready) and the tier is about to turn
-        // over on the very next position, bake in the post-transition value now instead of the
-        // current one -- otherwise the freeze locks in the stale pre-transition n_splits forever
-        // (AR keeps adapting unfrozen and ends up permanently mismatched, not just off by rounding).
-        // Elsewhere (AR calls, and DFlash prefill positions far from a boundary) seqlen+1 falls in
-        // the same tier as seqlen, so this is a no-op.
+        // DFlash's decode graph freezes n_splits the instant it is captured (below) and never
+        // revisits it again -- so if the freeze happens to land on a call where the CURRENT
+        // position is still in a lower tier than where the rest of the generation will run (e.g.
+        // a prompt just under 512 tokens, whose decode phase crosses seqlen>512 partway through),
+        // the frozen value is permanently wrong for the back half of the run. AR's own graph
+        // doesn't have this problem in isolation -- it re-adapts every step, safely recapturing
+        // as seqlen grows -- but that means AR and a frozen DFlash graph would legitimately use
+        // DIFFERENT split counts for the SAME position (AR=32, DFlash=160, both individually
+        // correct for their own path but mismatched against each other), which is its own
+        // source of divergence. So both sides peek ahead at the very moment their own first
+        // decode-graph capture happens (final_seqlen_hint, set by generate()/dflash_generate()
+        // before their prefill loop) and settle on the SAME tier for the whole decode phase,
+        // rather than one side transitioning mid-run and the other starting there already.
+        // Elsewhere (prefill positions, and any later step once a graph is already ready) this
+        // branch doesn't fire, so prefill keeps adapting exactly as before.
         int want = adaptive_nsplits_for(seqlen);
-        if (s.dflash_capture && !s.dflash_graph_ready) {
-            const int want_next = adaptive_nsplits_for(seqlen + 1);
-            if (want_next > want) want = want_next;
+        // DFlash only needs the hint applied once, right as its graph freezes (below) -- after
+        // that this whole outer branch stops running (dflash_graph_ready gates it off), so the
+        // frozen value simply stays. AR has no such freeze: it re-derives want from the CURRENT
+        // seqlen on every single decode step and recaptures whenever that differs from s.n_splits
+        // (by design, so it can safely track a long prefill's own adaptation). Applying the hint
+        // to AR only once would just get overwritten back down on the very next step once seqlen
+        // no longer matches the hinted tier -- it has to be applied on every decode step so AR
+        // settles on and stays at the same tier DFlash is frozen at, instead of legitimately
+        // transitioning mid-decode while DFlash cannot follow.
+        const bool about_to_freeze_dflash = s.dflash_capture && !s.dflash_graph_ready;
+        const bool ar_decode_step = sample && !s.dflash_capture;
+        if (((sample && about_to_freeze_dflash) || ar_decode_step) && s.final_seqlen_hint > seqlen) {
+            const int want_final = adaptive_nsplits_for(s.final_seqlen_hint);
+            if (want_final > want) want = want_final;
         }
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
@@ -1696,6 +1716,13 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     }
     const int start = reuse ? s.prefix_len : 0;
     const size_t n = prompt.size();
+    // AR's own decode graph gets captured on the LAST prefill call inside ingest_prompt_range
+    // (the first one with sample=true) -- set the hint before that runs. See the matching
+    // comment in forward_token's adaptive-split block for why AR needs this too, not just
+    // DFlash: without it, AR would naturally transition mid-decode while a DFlash run over the
+    // same prompt length freezes at the final tier from the start, so the two sides would use
+    // different split counts for the same position and diverge from each other.
+    s.final_seqlen_hint = (int)n + max_new;
     int next = (start >= (int)n && reuse) ? s.prefix_next
                                             : ingest_prompt_range(prompt.data(), start, (int)n);
     if (next < 0 || next >= s.cfg.vocab) {
@@ -1888,6 +1915,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     activate_session(sid);
 
     const int n = (int)prompt.size();
+    // The decode graph freezes n_splits on the LAST prefill call below (the first one with
+    // sample=true), not at the start of the decode loop further down -- set the hint before
+    // prefill runs so that freeze already bakes in the tier the whole generation will need.
+    s.final_seqlen_hint = n + max_new;
     auto t0 = std::chrono::steady_clock::now();
     int next = -1;
     for (int i = 0; i < n; i++) {
@@ -1921,12 +1952,19 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 5;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
-    // 0=off, 1=force, 2=adaptive (default). Adaptive preserves early-exit verification on
-    // low-acceptance workloads and switches to the weight-reusing row-batched graph on a run of
-    // full-block accepts.
+    // 0=off (default), 1=force, 2=adaptive. The row-batched compact-verify graph
+    // (dflash_verify_short_run) is NOT bit-exact with the token-loop path: direct hidden-state
+    // checksums show a real, measurable discrepancy between its batched kernels and AR's own
+    // single-token computation, present in every row (including ones that still happen to land
+    // on the correct argmax) -- and on some fraction of steps that discrepancy is large enough to
+    // flip the winning token, breaking the lossless guarantee DFlash depends on (see #712).
+    // Token-loop-only, by contrast, has been verified byte-exact against AR at every context
+    // length and generation count tested during that investigation. Off by default until the
+    // batched path's numerical gap is closed; opt in via the env var for throughput-over-
+    // correctness experiments only.
     static const int compact_mode = []{
         const char* e = getenv("SPARKINFER_DFLASH_COMPACT_VERIFY");
-        return e ? atoi(e) : 2;
+        return e ? atoi(e) : 0;
     }();
     // Full-block accepts arrive in runs (the target and draft agree over a whole predictable
     // region), so one is already evidence the next step will accept a full block. Requiring two
