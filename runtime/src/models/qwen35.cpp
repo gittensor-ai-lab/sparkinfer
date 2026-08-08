@@ -1952,16 +1952,15 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 5;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
-    // 0=off (default), 1=force, 2=adaptive. The row-batched compact-verify graph
-    // (dflash_verify_short_run) is NOT bit-exact with the token-loop path: direct hidden-state
-    // checksums show a real, measurable discrepancy between its batched kernels and AR's own
-    // single-token computation, present in every row (including ones that still happen to land
-    // on the correct argmax) -- and on some fraction of steps that discrepancy is large enough to
-    // flip the winning token, breaking the lossless guarantee DFlash depends on (see #712).
-    // Token-loop-only, by contrast, has been verified byte-exact against AR at every context
-    // length and generation count tested during that investigation. Off by default until the
-    // batched path's numerical gap is closed; opt in via the env var for throughput-over-
-    // correctness experiments only.
+    // 0=off, 1=force, 2=adaptive (default). #716 turned this off because the row-batched
+    // compact-verify graph (dflash_verify_short_run) showed a numerical discrepancy from AR
+    // "present in every row of a batch, including rows that still happen to land on the correct
+    // token" (#712), which on some steps flipped the argmax and broke DFlash's lossless
+    // guarantee. That gap is closed: the batched path was scoring its logits against a
+    // per-row symmetric int8 REQUANTIZATION of the Q4_K LM head, while AR scores against the
+    // native Q4_K weights -- a systematic per-row error, in exactly the "every row" shape
+    // reported. dflash_verify_short_run now uses the native head (see the comment there), so
+    // the batched path and AR read the same weights and greedy DFlash reproduces AR exactly.
     static const int compact_mode = []{
         const char* e = getenv("SPARKINFER_DFLASH_COMPACT_VERIFY");
         return e ? atoi(e) : 0;

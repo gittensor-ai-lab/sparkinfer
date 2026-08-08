@@ -1492,7 +1492,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 qb, kp, vp, btab_rows ? btab_rows : btable, seq, att,
                 fa_m, fa_l, fa_acc,
                 N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns,
-                1.f / sqrtf((float)c.head_dim), st, nullptr, -1,
+                // Pass the real sequence length, not -1. This argument is the HOST-side hint
+                // launch_flash_decode_split uses to pick its implementation:
+                //   mma_chunk = (seqlen + n_splits - 1) / n_splits
+                //   mma_ok    = famma && seqlen > 512 && block_size == 16 && mma_chunk >= 32
+                // With -1 the gate is always false, so compact verify silently ran the SCALAR
+                // GQA kernel at every context while AR (which passes its true seqlen) switched
+                // to the int8 tensor-core kernel past 512. Two different accumulation orders
+                // computing what has to be the same number is precisely how the batched path
+                // drifts from AR at long context (#712). start_pos + N is the largest row
+                // length in this batch, matching what AR would report at the last row.
+                1.f / sqrtf((float)c.head_dim), st, nullptr, start_pos + N,
                 ks, vs, kv8 ? 1 : 0, kv8 ? qg : nullptr);
             // att/qg rows are contiguous at stride qdim, and the gate is elementwise, so one
             // launch covers the whole block. N separate nodes cost N times the graph-node
@@ -1566,9 +1576,28 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (!supported) return -1;
 
     quant_rows(xn, H);
+    // Score logits from the SAME weight representation AR uses. AR decode runs the
+    // native Q4_K head (qwen35.cpp: launch_mmvq_q4k_f32 on s.w.lm_head), whose Q4_K
+    // block structure carries a scale per 32 weights plus 6-bit sub-scales. The
+    // verify_head_i8 fast path instead scores against a requantization built by
+    // launch_gguf_dequant_rows_i8, which is symmetric int8 with ONE scale for the
+    // whole row: `q[r,c] = round(v[r,c]/scale[r]), scale[r] = max_c|v[r,c]|/127`
+    // (kernels/include/sparkinfer/kernels/quant.h). Collapsing 2048 columns onto a
+    // single max-magnitude scale is far coarser than Q4_K's ~64 block scales, so
+    // every row's logits carry a systematic error AR never sees -- which is exactly
+    // the "discrepancy present in every row of a batch, including rows that still
+    // happen to land on the correct token" reported in #712/#716, and on some
+    // fraction of steps it is large enough to flip the argmax and break DFlash's
+    // lossless guarantee.
+    //
+    // The int8 path is not even a bandwidth win: at vocab=248320 x H=2048 the int8
+    // head is 508 MB against the Q4_K head's ~286 MB, so it reads ~78% MORE per
+    // verify call. Defaulting to the native head is both the correct-by-construction
+    // choice and the cheaper one. Opt back in with SPARKINFER_DFLASH_VERIFY_HEAD_I8=1
+    // for A/B only.
     static const bool verify_head_i8_on = [] {
         const char* e = getenv("SPARKINFER_DFLASH_VERIFY_HEAD_I8");
-        return !(e && e[0] == '0');
+        return e && e[0] != '0';
     }();
     head_ok = verify_head_i8_on && verify_head_i8
         ? kernels::launch_gemv_i8_q81_multirow_f32(
