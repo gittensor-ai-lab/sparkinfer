@@ -1188,6 +1188,24 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
+        # Auto-close on a genuine none/REJECT verdict (a real benchmark that ran to completion
+        # and just wasn't a win) -- but ONLY when res["ok"] and delta_pct actually exist, i.e. a
+        # real pair of numbers came back. An infra failure (crash, OOM, timeout) also gets
+        # labeled REJECT by the fallback above with delta_pct=None, and must NOT close the PR --
+        # #720 crashed on one eval (REJECT, PR=None main=None) then came back +65% (XL) on a
+        # clean re-run; closing on that first crash would have killed a real win.
+        if label in ("none", "REJECT"):
+            close_body = (
+                "<!-- sparkinfer-dflash-auto-close -->\n"
+                f"## Closed: sparkinfer dflash auto-eval — `eval-dflash:{label}`\n\n"
+                f"This PR's DFlash speed measured **{res.get('delta_pct')}%** vs main "
+                f"({'no verified improvement' if label == 'none' else 'regression'}) — "
+                "closing automatically. Reopen (or open a fresh PR) if you have a fix or a "
+                "different approach."
+            )
+            arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
+            arb.gh(["pr", "close", str(num), "-R", repo])
+            print(f">> auto-closed PR #{num} (eval-dflash:{label})")
 
 
 def main():
