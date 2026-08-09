@@ -475,9 +475,13 @@
   const D = window.SPARKINFER, $ = id => document.getElementById(id);
   const s = D.status, maxPass = Math.max(...D.passes.map(p=>p.tps));
   // Shared context colors — same ctx size → same hue on every chart.
-  const CTX_COLOR = {128:"#D14D72",512:"#7B5DFF",4096:"#0E8A16",16384:"#B8860B",32768:"#6F42C1"};
-  const CTX_LABEL = {128:"128",512:"512",4096:"4k",16384:"16k",32768:"32k"};
+  const CTX_COLOR = {128:"#D14D72",512:"#7B5DFF",4096:"#0E8A16",16384:"#B8860B",32768:"#6F42C1",65536:"#E67E22",131072:"#17A2B8"};
+  const CTX_LABEL = {128:"128",512:"512",4096:"4k",16384:"16k",32768:"32k",65536:"64k",131072:"128k"};
   const ctxColor = ctx => CTX_COLOR[ctx] || "#7B5DFF";
+  // Label → ctx for rows keyed by display label. parseInt alone breaks every "Nk"
+  // label (parseInt("32k") === 32, and "128k" collapses onto short-decode 128).
+  const CTX_OF_LABEL = {"128":128,"512":512,"4k":4096,"16k":16384,"32k":32768,"64k":65536,"128k":131072};
+  const ctxOfLabel = lbl => CTX_OF_LABEL[lbl] || parseInt(lbl, 10) || 128;
   const LLAMA_FILL = "linear-gradient(90deg,#A9A9B4,#C8C8D4)";
 
   const fmtDl = n => {
@@ -782,7 +786,7 @@
       ref: x => x.ref_tps,
       label: x => x.label,
       sub: x => x.label === "128" ? "no prefill" : "128 gen tok",
-      color: x => ctxColor(x.label === "4k" ? 4096 : parseInt(x.label, 10) || 128),
+      color: x => ctxColor(ctxOfLabel(x.label)),
     });
     $("detail-q35").innerHTML = detailRows + splitNote("sparkinfer vs llama.cpp", "same GPU · Qwythos-9B Q4_K_M GGUF · decode");
   })();
@@ -820,7 +824,7 @@
       ref: x => x.ref_tps,
       label: x => x.label,
       sub: x => x.label === "128" ? "no prefill" : "128 gen tok",
-      color: x => ctxColor(x.label === "4k" ? 4096 : x.label === "16k" ? 16384 : x.label === "32k" ? 32768 : parseInt(x.label, 10) || 128),
+      color: x => ctxColor(ctxOfLabel(x.label)),
     });
     $("detail-q36").innerHTML = detailRows + splitNote("sparkinfer vs llama.cpp", "same GPU · Qwen3.6-35B-A3B UD-Q4_K_M GGUF · decode");
   })();
