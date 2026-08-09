@@ -69,13 +69,18 @@ gpu_ready() {
   if [ "${EVAL_TRANSPORT:-vast}" = "ssh" ]; then
     local host="${EVAL_SSH_HOST:-}" port="${EVAL_SSH_PORT:-22}" user="${EVAL_SSH_USER:-root}"
     [ -n "$host" ] || return 1
-    # ConnectTimeout=20 (was 10): the hourly tick lands at :00 alongside three separate */15
-    # dashboard-sync crons that also fire then, all doing their own network I/O at the same
-    # instant — plausible enough contention to blow a tight 10s budget. Capture+print stderr on
-    # failure (was silently discarded) so a future flaky tick actually leaves a diagnosable
-    # trace in the log instead of just "down — labels only" with no reason.
+    # IdentitiesOnly=yes: without it ssh also offers every identity in a running ssh-agent
+    # before the explicit -i key -- fine interactively (an agent can paper over a box where the
+    # -i key was never actually added to authorized_keys) but cron has no agent, so that gap
+    # surfaces as a flat "Permission denied" with zero indication why. This is what actually
+    # caused six straight silent "down — labels only" ticks on 2026-08-09: the box's
+    # authorized_keys never had SSH_KEY's public half, only the interactive session's agent key
+    # -- fixed by adding SSH_KEY's public key to the box directly, and pinned here so it can't
+    # silently regress (an agent that happens to have a WORKING key can also eat into
+    # MaxAuthTries before the right key is tried, on top of the missing-key case).
+    # ConnectTimeout=20 (was 10): cheap extra headroom, kept even though it wasn't the root cause.
     local err rc
-    err="$(ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=20 \
+    err="$(ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
         -o StrictHostKeyChecking=accept-new -p "$port" "$user@$host" 'true' 2>&1)"
     rc=$?
     [ "$rc" -eq 0 ] || echo "gpu_ready: ssh to $user@$host:$port failed (exit=$rc): $err" >&2

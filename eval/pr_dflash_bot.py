@@ -252,6 +252,13 @@ def ssh_run(host, port, cmd, timeout=7200, stdin_data=None):
     return subprocess.run(
         [
             "ssh", "-i", key,
+            # Without this, ssh also offers every identity in a running ssh-agent before the
+            # explicit key above -- fine interactively (agent papers over a missing/wrong -i key)
+            # but under cron there's no agent, so a box that only has the -i key authorized (not
+            # some agent identity) fails outright with "Permission denied", and even when an
+            # agent IS present, extra agent identities can eat into the server's MaxAuthTries
+            # before the right key is ever tried. Pin to exactly the key we mean to use.
+            "-o", "IdentitiesOnly=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "BatchMode=yes",
             "-o", "ServerAliveInterval=30",
@@ -642,7 +649,8 @@ def push_eval_polaris(host, port):
             tmp.write(tar_data)
             tmp_path = tmp.name
         scp = subprocess.run(
-            ["scp", "-P", str(port), "-i", key, "-o", "StrictHostKeyChecking=accept-new",
+            ["scp", "-P", str(port), "-i", key, "-o", "IdentitiesOnly=yes",
+             "-o", "StrictHostKeyChecking=accept-new",
              "-o", "BatchMode=yes", tmp_path, f"{user}@{host}:/tmp/si_polaris.tgz"],
             capture_output=True, text=True, timeout=120,
         )
