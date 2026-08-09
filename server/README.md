@@ -49,8 +49,8 @@ export SPARKINFER_ROOT="$(pwd)"
 
 ### RTX PRO 6000 deploy (32k / 4k)
 
-See [`changelog-pro6000.md`](../changelog-pro6000.md) for the full 5090→PRO 6000 migration
-notes and benchmark table.
+See [`bench/results/qwen3-30b-a3b_q4km_pro6000.md`](../bench/results/qwen3-30b-a3b_q4km_pro6000.md) for the
+5090→PRO 6000 migration notes and benchmark table.
 
 ```bash
 export CTX=36864          # 32k prompt + 4k completion KV pool
