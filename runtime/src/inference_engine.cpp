@@ -79,9 +79,13 @@ ContinuousBatchEngine::~ContinuousBatchEngine() {
     if (worker_.joinable()) worker_.join();
     std::lock_guard<std::mutex> lock(mu_);
     for (auto& kv : jobs_) {
-        if (!kv.second->seq_id) continue;
+        if (!kv.second || kv.second->done) continue;
+        // seq_id 0 is a valid prefix session (cannot use truthiness).
         if (kv.second->seq_id != 0) model_->close_session(kv.second->seq_id);
-        else kv_->free(0);
+        else if (kv.second->req.use_prefix_session) {
+            kv_->free(0);
+            model_->release_prefix_session();
+        }
     }
     jobs_.clear();
 }
@@ -272,7 +276,12 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         job.error = "prefill produced invalid seed token";
         job.done = true;
         if (job.seq_id != 0) model_->close_session(job.seq_id);
-        else kv_->free(job.seq_id);
+        else {
+            kv_->free(job.seq_id);
+            // Match generate(): KV is gone — soft-invalidate so the server does not
+            // skip cache_prefix() on the next exclusive prefix hit.
+            if (job.req.use_prefix_session) model_->release_prefix_session();
+        }
         job.seq_id = 0;
         return true;
     }
@@ -284,7 +293,10 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     if (job.next_token == cfg.eos_id || job.decode_emitted >= job.req.max_new_tokens) {
         job.done = true;
         if (job.seq_id != 0) model_->close_session(job.seq_id);
-        else kv_->free(job.seq_id);
+        else {
+            kv_->free(job.seq_id);
+            if (job.req.use_prefix_session) model_->release_prefix_session();
+        }
         job.seq_id = 0;
         return true;
     }

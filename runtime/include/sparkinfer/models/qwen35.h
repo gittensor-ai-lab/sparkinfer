@@ -111,6 +111,11 @@ public:
     // Drop the installed prefix cache and free its KV blocks.
     void clear_prefix_cache();
 
+    // Soft-invalidate after session 0's KV was freed (generate / ContinuousBatchEngine).
+    // Keeps prefix_tokens/len so the next cache_prefix() can re-warm; clears prefix_active
+    // so callers do not skip re-warm while the KV is empty.
+    void release_prefix_session();
+
     // Length of the currently cached prefix (0 if none).
     int prefix_cached_len() const;
 

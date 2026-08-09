@@ -1554,6 +1554,16 @@ void Qwen35Model::clear_prefix_cache() {
     s.prefix_active = false;
 }
 
+void Qwen35Model::release_prefix_session() {
+    Impl& s = *p_;
+    // Caller already freed session-0 KV. Keep the token fingerprint for matching;
+    // mark inactive so the next request re-runs cache_prefix() instead of
+    // attending against an empty block table.
+    s.prefix_next = -1;
+    s.prefix_active = false;
+    invalidate_decode_graph();
+}
+
 int Qwen35Model::prefix_cached_len() const { return p_->prefix_active ? p_->prefix_len : 0; }
 
 int Qwen35Model::prefix_seed_token() const {
@@ -1727,7 +1737,10 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
                                             : ingest_prompt_range(prompt.data(), start, (int)n);
     if (next < 0 || next >= s.cfg.vocab) {
         if (sid != 0) close_session(sid);
-        else s.kv->free(sid);
+        else {
+            s.kv->free(sid);
+            if (reuse) release_prefix_session();
+        }
         fprintf(stderr, "[qwen35] prompt prefill failed (start=%d n=%zu)\n", start, n);
         return out;
     }
@@ -1739,13 +1752,9 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     }
 
     if (sid != 0) close_session(sid);
-    else s.kv->free(sid);
-    if (reuse) {
-        // KV is gone; keep prefix_tokens/len so the next cache_prefix()+generate() pair can
-        // re-warm the shared prefix and only prefill the suffix.
-        s.prefix_next = -1;
-        s.prefix_active = false;
-        invalidate_decode_graph();
+    else {
+        s.kv->free(sid);
+        if (reuse) release_prefix_session();
     }
     return out;
 }
