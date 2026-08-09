@@ -100,7 +100,7 @@ def main() -> int:
     api_only = "--api-only" in sys.argv
     root = Path(args[0]) if args else Path("/workspace/sparkinfer-server")
     api = args[1] if len(args) > 1 else "http://127.0.0.1:8080"
-    gguf = root / "models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    gguf = Path(args[2]) if len(args) > 2 else root / "models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
     bench = root / "build/runtime/qwen3_gguf_bench"
     tok = Tokenizer.from_file(str(root / "models/tokenizer.json"))
 

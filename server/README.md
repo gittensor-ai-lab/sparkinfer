@@ -2,7 +2,7 @@
 
 OpenAI-compatible HTTP API for local GGUF inference — backend for sparkinfer.com.
 
-Enable with `-DBUILD_SERVER=ON` when building this repo (`dev` branch).
+Enable with `-DBUILD_SERVER=ON` when building this repo (`main`).
 
 ## Build
 
@@ -49,7 +49,7 @@ export SPARKINFER_ROOT="$(pwd)"
 
 ### RTX PRO 6000 deploy (32k / 4k)
 
-See [`changelog-pro6000.md`](../changelog-pro6000.md) for the full 5090→PRO 6000 migration
+See [`bench/results/qwen3-30b-a3b_q4km_pro6000.md`](../bench/results/qwen3-30b-a3b_q4km_pro6000.md) for the full 5090→PRO 6000 migration
 notes and benchmark table.
 
 ```bash
@@ -113,7 +113,7 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_ROOT` | `.` | Repo root (tokenizer script path) |
 | `CTX` | `36864` (PRO 6000) / `0` (5090) | KV pool size passed as `--ctx` |
 | `SPARKINFER_KV_INT8` | model-dependent | Same as `qwen3_gguf_generate` |
-| `SPARKINFER_TOKENIZER_URL` | Qwen3-30B tokenizer | Override tokenizer download |
+| `SPARKINFER_TOKENIZER_URL` | Qwen3.6-35B-A3B tokenizer | Override tokenizer download |
 | `SPARKINFER_SERVER_PREFIX_TOKEN_FILE` | — | JSON `[id,...]` warmed via `cache_prefix` each request |
 | `SPARKINFER_SERVER_PREFIX_TOKEN_IDS` | — | Comma-separated token ids (same as above) |
 | `SPARKINFER_PREFILL_BATCHED` | `1` | Batched prefill in `cache_prefix` / cold prompts |
