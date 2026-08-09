@@ -1352,7 +1352,8 @@ void launch_moe_expert_ffn_q4k(
     int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
-    int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream
+    int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream,
+    bool ar_exact_splitk
 ) {
     // Qwythos dense hybrid fast path: pack2 gate/up without expert lookup + PDL-chained
     // quant/down. SPARKINFER_DENSE_FFN_FUSE=0 restores the generic MoE dispatch below.
@@ -1567,8 +1568,16 @@ void launch_moe_expert_ffn_q4k(
         // Row-count-aware split-K: S=8 (July-2026 sweep) is tuned for 1-row AR decode; the DFlash
         // compact verify runs num_tokens=6 rows -> already high occupancy, so split-K reduction
         // overhead dominates and S=1 wins (+2.7% DFlash decode @2550, bit-exact @128, SPEC 32/32).
+        //
+        // S also fixes the reduction order, so it is the one thing here that is not row-count
+        // invariant: at S=1 each output row is one warp's serial sum over ffn, at S=8 it is eight
+        // partial sums combined. Both are correct, but they round differently, which is why a
+        // batched call did not reproduce what AR computes one token at a time. A caller that needs
+        // that reproduction passes ar_exact_splitk and gets AR's split count for any num_tokens;
+        // with S pinned the kernel's grid is dim3(num_tokens, ...), one block column per token, so
+        // every row's arithmetic is identical to the num_tokens == 1 call.
         const char* s5env = getenv("SPARKINFER_DOWN_SPLITK_S_Q5");
-        const int Sbase = (num_tokens > 1 && !s5env) ? 1 : down_splitk_s_q5();
+        const int Sbase = (num_tokens > 1 && !s5env && !ar_exact_splitk) ? 1 : down_splitk_s_q5();
         const int S = dense_top1_down_splitk(Sbase, top_k, "SPARKINFER_DOWN_SPLITK_S_Q5");
         if (S > 1) {
             const int RPB = WPB / S;

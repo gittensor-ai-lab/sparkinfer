@@ -1981,9 +1981,17 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // threshold, so once armed it stayed armed straight through those low-acceptance stretches.
     // Require a RUN of full-block accepts to arm, and decay on every non-full block so it backs
     // off as soon as the draft stops landing blocks.
+    // How many full-block accepts in a row arm the batched path. A run is evidence that the draft
+    // is tracking the target, and the decay below still disarms on two non-full blocks, so the run
+    // length only sets how long that evidence takes to accumulate -- and the wait is paid on every
+    // prompt the draft handles well. On the held-out short prompt (tau 5.33, where batching is
+    // worth +11%) a run of 3 spends the first few steps of a ~24-step generation on the token loop:
+    // 806.1 tok/s at 3 against 878.7 at 1. A prompt the draft handles badly is unaffected either
+    // way, because it never lands the full block that arms it at all -- measured at tau 2.08,
+    // 437.2 -> 434.4, while blindly forcing the batched path there costs 15%.
     static const int kBlockScore = []{
         const char* e = getenv("SPARKINFER_DFLASH_BLOCK_SCORE");
-        int v = e ? atoi(e) : 3;
+        int v = e ? atoi(e) : 1;
         return v < 1 ? 1 : v;
     }();
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
@@ -2026,6 +2034,17 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 3;
         return v < 1 ? 1 : v;
     }();
+    // The acceptance that makes batching pay is not a constant -- it falls as context grows. One
+    // batched pass replaces `keep` sequential target forwards, and each of those forwards re-reads
+    // the whole KV cache, so the token loop gets steadily more expensive with sequence length while
+    // the N-row pass barely moves. A threshold calibrated where the token loop is cheap therefore
+    // sits too high once the KV is long, and the batched path idles on steps where it was already
+    // the better choice. Measured at 4k (tau 3.91): 3 -> 529.2 tok/s, 2 -> 542.1.
+    static const int kEngageKeepLong = []{
+        const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_KEEP_LONG");
+        int v = e ? atoi(e) : 2;
+        return v < 1 ? 1 : v;
+    }();
     int compact_score = 0;
     int keep_ema8 = 0;   // EMA of keep, alpha = 1/8, held x8 so the decode path needs no float
     int step_no = 0;
@@ -2055,10 +2074,22 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // Below kCompactMaxSeq this is byte-identical to main: same acceptance-run rule, same
         // batched MoE. The change is purely additive above that bound, which main never reached.
         const bool short_ctx = (start + B) <= kCompactMaxSeq;
+        // keep_ema8 ramps from zero at alpha = 1/8, so it needs 8-10 steps to reach the engage
+        // threshold even on a stream that clears it comfortably. Measured at 4k (tau 3.91, ema8
+        // settles at ~31 against a threshold of 24): the batched path ran on 20 of 33 steps, and
+        // the 13 it missed were the warmup, not a genuine low-acceptance stretch -- worth 6.3% of
+        // decode on a 128-token generation.
+        //
+        // The ramp exists so a transient run of full blocks cannot arm the batched path at 512-ctx
+        // (tau 2.19), where it is 31% slower. kEngageMinSeq already excludes that case outright, so
+        // seeding is scoped to sequences past the floor: start armed there, and let the existing
+        // decay hand the stream back to the token loop within a couple of steps if the draft turns
+        // out not to be landing blocks. Below the floor the ramp is untouched.
+        if (step_no == 0 && (start + B) >= kEngageMinSeq) keep_ema8 = kEngageKeepLong * 8;
         const bool compact_verify = compact_mode == 1 ||
             (compact_mode != 0 && (short_ctx ? compact_score >= kBlockScore
                                              : ((start + B) >= kEngageMinSeq &&
-                                                keep_ema8 >= kEngageKeep * 8)));
+                                                keep_ema8 >= kEngageKeepLong * 8)));
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 

@@ -1572,23 +1572,22 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                   N, E, H, st);
         kernels::launch_moe_router(router_logits, expert_ids, expert_w, nullptr,
                                    N, E, topk, 1, st);
-        // launch_moe_expert_ffn_q4k is not row-count invariant: called with num_tokens=N it returns
-        // different values for some rows than the num_tokens=1 call AR decode makes -- from
-        // identical input, identical Q8_1 activations, identical expert ids and identical expert
-        // weights (all verified bit-identical by byte hash). That is the batched-vs-AR numerical
-        // gap in #712. Driving it one row at a time reproduces AR's arithmetic exactly. This is an
-        // mmvq-style kernel that reads expert weights per (token, expert) pair either way, so the
-        // per-row loop costs launch overhead, not extra weight traffic.
-        // Default ON. Two kernels inside launch_moe_expert_ffn_q4k are tuned for the num_tokens=1
-        // decode call and are not row-count invariant (the MMVQ down projection and the 4-warp
-        // Q4_K mmvq gate/up), so a single batched call over N rows does not reproduce AR. Swapping
-        // in their row-invariant variants does not help either: those variants are not numerically
-        // equal to the defaults AR itself runs, so the verify would still disagree with AR. The
-        // only construction that is exact BY DEFINITION is to make the same call AR makes --
-        // num_tokens=1, default kernels -- once per row.
+        // What made launch_moe_expert_ffn_q4k disagree with the num_tokens=1 call AR decode makes
+        // was one row-count-dependent choice inside it: the Q5_K down projection picks its split
+        // count from num_tokens (S=8 at one row, S=1 above), and S sets the reduction order. Same
+        // input, same activations, same expert ids, same weights -- different rounding.
+        //
+        // Pinning S to AR's choice removes the dependence outright. With S fixed the down kernel
+        // grids as dim3(num_tokens, ...), one block column per token, and the gate/up and quantize
+        // kernels grid per (token, expert, column); every row then computes exactly what it would
+        // as a one-row call, for any N. So the batched call is exact by construction too, and it
+        // costs one launch instead of N.
+        //
+        // The per-row loop stays available as an escape hatch (SPARKINFER_DFLASH_MOE_ROWWISE=1),
+        // since it is exact for reasons that do not depend on this reasoning being right.
         static const bool moe_rowwise = []{
             const char* e = getenv("SPARKINFER_DFLASH_MOE_ROWWISE");
-            return !(e && e[0] == '0');
+            return e && e[0] == '1';
         }();
         // Scope: below kCompactMaxSeq this stays on the single batched call, which is what main
         // already ships and what #720 certified 48/48 exact there -- the per-row error is real but
@@ -1598,6 +1597,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const char* e = getenv("SPARKINFER_DFLASH_MOE_ROWWISE_MINSEQ");
             return e ? atoi(e) : 384;
         }();
+        // Same bound decides the pinned split count, so short context keeps main's row-count aware
+        // S=1 and stays byte-identical; only the long-context path, which needs to reproduce AR,
+        // pays the pinned-S choice.
+        const bool moe_exact_splitk = (start_pos + N) > kRowwiseMinSeq;
         if (moe_rowwise && (start_pos + N) > kRowwiseMinSeq) {
             // Give every row its own scratch slice. Sharing moe_h/moe_out across the loop makes the
             // calls false-dependent, so they serialize and the row loop costs ~28% at 4k; sliced,
@@ -1632,7 +1635,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         } else
         kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
             w.gate_qtype, w.up_qtype, w.down_qtype, expert_ids, expert_w, routed,
-            moe_h, moe_out, N, topk, H, ffn, q81, st);
+            moe_h, moe_out, N, topk, H, ffn, q81, st, moe_exact_splitk);
 
         if (w.shared_gate_inp) {
             // q81 already holds hn (the add_rmsnorm2 fusion above wrote it), so this never has to

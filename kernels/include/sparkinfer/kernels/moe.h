@@ -75,7 +75,12 @@ void launch_moe_expert_ffn_q4k(
     float* h_scratch, float* out_scratch,
     int num_tokens, int top_k, int hidden, int ffn,
     const void* input_q8 = nullptr,   // pre-quantized Q8_1(input) from the fused norm; nullptr = quantize internally
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr,
+    // Force the Q5_K down split count that num_tokens == 1 would pick, instead of the row-count
+    // aware choice. The split count sets the reduction order, so a caller that must reproduce
+    // single-token decode bit-for-bit at num_tokens > 1 has to pin it; everyone else wants the
+    // faster row-count aware default.
+    bool ar_exact_splitk = false);
 
 // Qwen3.6 UD shared expert: Q8_0 gate/up/down via int8 dp4a MMVQ. Reuses the FNQ
 // Q8_1(hn) buffer for gate/up; overwrites h_q8_buf with Q8_1(h) for down.
