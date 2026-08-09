@@ -8,6 +8,13 @@
 
 namespace sparkinfer_server {
 
+// Outcome of one complete()/complete_streaming() call. Returned by value so concurrent
+// HTTP worker threads cannot observe or clear each other's failure state.
+struct CompletionResult {
+    std::vector<int> tokens;
+    std::string error;  // empty on success
+};
+
 // Thread-safe wrapper around sparkinfer::Qwen35Model + GGUF load.
 class ModelEngine {
 public:
@@ -30,21 +37,17 @@ public:
     void set_prefix_tokens(const std::vector<int>& tokens);
     int prefix_token_len() const;
 
-    // Greedy decode. Returns generated token ids (not including prompt).
-    // Sets last_error() on failure (empty prompt, context overflow, KV alloc).
-    std::vector<int> complete(const std::vector<int>& prompt_ids, int max_new_tokens);
+    // Greedy decode. Tokens are in .tokens; on failure .tokens is empty and .error is set.
+    CompletionResult complete(const std::vector<int>& prompt_ids, int max_new_tokens);
 
     // Same, but invokes cb after each generated token (for SSE streaming).
-    std::vector<int> complete_streaming(const std::vector<int>& prompt_ids, int max_new_tokens,
+    CompletionResult complete_streaming(const std::vector<int>& prompt_ids, int max_new_tokens,
                                         const std::function<void(int)>& on_token);
-
-    const std::string& last_error() const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     mutable std::mutex mu_;
-    std::string last_error_;
 };
 
 }  // namespace sparkinfer_server

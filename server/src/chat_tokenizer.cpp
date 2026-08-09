@@ -226,18 +226,24 @@ bool parse_chat_messages(const std::string& request_json, std::vector<ChatMessag
                     size_t dummy = 0;
                     extract_json_string(obj, c, dummy, msg.content);
                 } else if (c < obj.size() && obj[c] == '[') {
-                    // Multimodal: concatenate text parts only (images skipped for now).
+                    // Multimodal content parts: only concatenate "text" KEY values.
+                    // A naive find("\"text\"") also matches the type VALUE {"type":"text"},
+                    // and when extract fails `j` never advances → infinite loop / OOM.
                     size_t j = c;
-                    while (j < obj.size()) {
-                        size_t text_key = obj.find("\"text\"", j);
-                        if (text_key == std::string::npos || text_key >= obj.size()) break;
-                        size_t dummy = 0;
+                    const size_t lim = obj.size();
+                    while (j < lim) {
+                        const size_t text_key = obj.find("\"text\"", j);
+                        if (text_key == std::string::npos) break;
+                        j = text_key + 6;  // always past this match — scan cannot rewind
+                        size_t v = j;
+                        while (v < lim && (obj[v] == ':' || obj[v] == ' ')) ++v;
+                        if (v == j || v >= lim || obj[v] != '"') continue;  // type value, not a key
+                        size_t part_end = 0;
                         std::string piece;
-                        if (extract_json_string(obj, text_key + 6, dummy, piece)) {
-                            if (!msg.content.empty()) msg.content.push_back(' ');
-                            msg.content += piece;
-                        }
-                        j = dummy;
+                        if (!extract_json_string(obj, v, part_end, piece)) break;
+                        if (!msg.content.empty()) msg.content.push_back(' ');
+                        msg.content += piece;
+                        j = part_end;
                     }
                 }
             }

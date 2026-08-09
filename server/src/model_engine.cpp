@@ -172,43 +172,38 @@ int ModelEngine::prefix_token_len() const {
     return (int)impl_->prefix_tokens.size();
 }
 
-const std::string& ModelEngine::last_error() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return last_error_;
-}
-
-std::vector<int> ModelEngine::complete(const std::vector<int>& prompt_ids, int max_new_tokens) {
+CompletionResult ModelEngine::complete(const std::vector<int>& prompt_ids, int max_new_tokens) {
     return complete_streaming(prompt_ids, max_new_tokens, nullptr);
 }
 
-std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_ids,
+CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_ids,
                                                  int max_new_tokens,
                                                  const std::function<void(int)>& on_token) {
+    CompletionResult out;
     sparkinfer::ContinuousBatchEngine::Request req;
     req.prompt = prompt_ids;
     req.max_new_tokens = max_new_tokens;
 
     {
         std::lock_guard<std::mutex> lock(mu_);
-        last_error_.clear();
         if (!impl_->ready || !impl_->model || !impl_->batch_engine) {
-            last_error_ = "model not loaded";
-            return {};
+            out.error = "model not loaded";
+            return out;
         }
         if (prompt_ids.empty()) {
-            last_error_ = "empty prompt";
-            return {};
+            out.error = "empty prompt";
+            return out;
         }
         if (max_new_tokens <= 0) {
-            last_error_ = "max_new_tokens must be positive";
-            return {};
+            out.error = "max_new_tokens must be positive";
+            return out;
         }
         if ((int)prompt_ids.size() + max_new_tokens > impl_->cfg.max_seq) {
-            last_error_ = "prompt + max_tokens exceeds context limit (" +
-                          std::to_string(impl_->cfg.max_seq) + ")";
+            out.error = "prompt + max_tokens exceeds context limit (" +
+                        std::to_string(impl_->cfg.max_seq) + ")";
             fprintf(stderr, "[sparkinfer-server] context overflow: prompt=%zu max_new=%d max_seq=%d\n",
                     prompt_ids.size(), max_new_tokens, impl_->cfg.max_seq);
-            return {};
+            return out;
         }
 
         // Shared prefix KV (session 0) is only safe when no other request is in-flight.
@@ -218,9 +213,9 @@ std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_
         if (prefix_match && prefix_exclusive) {
             if (impl_->model->prefix_cached_len() != (int)impl_->prefix_tokens.size()) {
                 if (!impl_->model->cache_prefix(impl_->prefix_tokens)) {
-                    last_error_ = "cache_prefix failed (KV alloc or batched prefill)";
-                    fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
-                    return {};
+                    out.error = "cache_prefix failed (KV alloc or batched prefill)";
+                    fprintf(stderr, "[sparkinfer-server] %s\n", out.error.c_str());
+                    return out;
                 }
             }
             req.prefill_start = (int)impl_->prefix_tokens.size();
@@ -232,24 +227,28 @@ std::vector<int> ModelEngine::complete_streaming(const std::vector<int>& prompt_
         }
     }
 
+    // complete_streaming releases the engine mutex above so other HTTP workers can enqueue.
+    // Errors must travel with this stack frame — a shared last_error_ slot would let one
+    // request clear or observe another request's failure under concurrency.
     auto result = impl_->batch_engine->complete_streaming(req, on_token);
 
     std::lock_guard<std::mutex> lock(mu_);
     if (!result.error.empty()) {
-        last_error_ = result.error;
-        fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
-        return {};
+        out.error = result.error;
+        fprintf(stderr, "[sparkinfer-server] %s\n", out.error.c_str());
+        return out;
     }
 
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        last_error_ = std::string("cuda error after decode: ") + cudaGetErrorString(e);
-        fprintf(stderr, "[sparkinfer-server] %s\n", last_error_.c_str());
-        return {};
+        out.error = std::string("cuda error after decode: ") + cudaGetErrorString(e);
+        fprintf(stderr, "[sparkinfer-server] %s\n", out.error.c_str());
+        return out;
     }
     if (result.tokens.empty() && max_new_tokens > 0)
-        last_error_ = "generate returned no tokens (KV alloc failure?)";
-    return result.tokens;
+        out.error = "generate returned no tokens (KV alloc failure?)";
+    out.tokens = std::move(result.tokens);
+    return out;
 }
 
 }  // namespace sparkinfer_server

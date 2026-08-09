@@ -319,14 +319,14 @@ int main(int argc, char** argv) {
                                  write_stream_delta(sink, cid, created, "reasoning_content", delta.reasoning_content);
                                  write_stream_delta(sink, cid, created, "content", delta.content);
                              };
-                             engine.complete_streaming(prompt_ids, max_tokens, on_tok);
+                             const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok);
                              sparkinfer_server::ThinkingStreamSplitter::Delta flush;
                              splitter.finish(flush);
                              write_stream_delta(sink, cid, created, "reasoning_content", flush.reasoning_content);
                              write_stream_delta(sink, cid, created, "content", flush.content);
-                             if (!engine.last_error().empty()) {
+                             if (!outcome.error.empty()) {
                                  std::ostringstream err_chunk;
-                                 err_chunk << "data: {\"error\":{\"message\":\"" << json_escape(engine.last_error())
+                                 err_chunk << "data: {\"error\":{\"message\":\"" << json_escape(outcome.error)
                                            << "\"}}\n\n";
                                  sink.write(err_chunk.str().c_str(), (size_t)err_chunk.str().size());
                              }
@@ -350,15 +350,15 @@ int main(int argc, char** argv) {
                      return;
                  }
 
-                 std::vector<int> gen = engine.complete(prompt_ids, max_tokens);
+                 const auto outcome = engine.complete(prompt_ids, max_tokens);
                  std::string text;
-                 if (!engine.last_error().empty()) {
+                 if (!outcome.error.empty()) {
                      res.status = 400;
-                     res.set_content("{\"error\":{\"message\":\"" + json_escape(engine.last_error()) + "\"}}",
+                     res.set_content("{\"error\":{\"message\":\"" + json_escape(outcome.error) + "\"}}",
                                      "application/json");
                      return;
                  }
-                 if (!decode_ids(gen, text, err)) {
+                 if (!decode_ids(outcome.tokens, text, err)) {
                      res.status = 500;
                      res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
                                      "application/json");
@@ -375,7 +375,7 @@ int main(int argc, char** argv) {
                      body << ",\"reasoning_content\":\"" << json_escape(parsed.reasoning_content) << "\"";
                  body << ",\"content\":\"" << json_escape(parsed.content) << "\""
                       << "},\"finish_reason\":\"stop\"}],"
-                      << usage_json((int)prompt_ids.size(), (int)gen.size()) << "}";
+                      << usage_json((int)prompt_ids.size(), (int)outcome.tokens.size()) << "}";
                  res.set_content(body.str(), "application/json");
              });
 
