@@ -1842,6 +1842,12 @@ bool launch_gemv_rows(const void* x, const void* W, void* y,
 bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, void* y1,
                        int M, int N0, int N1, int K, cudaStream_t stream) {
     if (M < 1 || M > 8 || N0 < 1 || N1 < 1 || (K & 7)) return false;
+#ifdef _MSC_VER
+    // gemv_bf16_rows_sk2_kernel is compiled out under MSVC (see #ifndef _MSC_VER above).
+    // Two single-matrix launches are bit-identical to the fused path — just two grids.
+    return launch_gemv_rows(x, W0, y0, M, N0, K, stream) &&
+           launch_gemv_rows(x, W1, y1, M, N1, K, stream);
+#else
     constexpr int S = 8, RPB = GEMV_WPB / S;
     dim3 grid((N0 + N1 + RPB - 1) / RPB);
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
@@ -1859,6 +1865,7 @@ bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, 
     }
 #undef SI_GEMV_ROWS2
     return true;
+#endif
 }
 bool launch_gemv_rows_f32(const void* x, const void* W, float* y,
                           int M, int N, int K, cudaStream_t stream) {
