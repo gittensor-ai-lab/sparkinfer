@@ -535,12 +535,19 @@
   wireHfModel("detail-q36-hf", "detail-q36-dl", D.qwen36, "unsloth/Qwen3.6-35B-A3B-GGUF");
   wireHfModel("detail-q36-pp-hf", "detail-q36-pp-dl", D.qwen36, "unsloth/Qwen3.6-35B-A3B-GGUF");
 
+  // The q.pp[] row that carries the scored prefill frontier. Labels and reference
+  // values must be read off this row — hardcoding a context name lets the card
+  // caption drift from whichever row actually produced prefill_frontier_pp.
+  const ppFrontierRow = q => (q?.pp || []).find(x => x.pp === q.prefill_frontier_pp);
+
   const q36 = D.qwen36 || {};
   const q36ctx128 = (q36.ctx||[]).find(x=>x.label==="128");
   const q36ctx512 = (q36.ctx||[]).find(x=>x.label==="512");
   const q36Lead = q36ctx128 && q36ctx128.ref_tps ? 100*(q36ctx128.tps - q36ctx128.ref_tps)/q36ctx128.ref_tps : null;
+  const q36pp = ppFrontierRow(q36);
 
   const q35 = D.qwen35 || {};
+  const q35pp = ppFrontierRow(q35);
   const q35ctx128 = (q35.ctx||[]).find(x=>x.label==="128");
   const q35Lead = q35ctx128 && q35ctx128.ref_tps ? 100*(q35ctx128.tps - q35ctx128.ref_tps)/q35ctx128.ref_tps : null;
 
@@ -565,7 +572,7 @@
       </div>
       <div class="sota-stats">
         <div class="sota-stat"><div class="n">${q36.frontier_tps} <span>tok/s</span></div><div class="l">128-tok decode</div></div>
-        <div class="sota-stat"><div class="n">${q36.prefill_frontier_pp ? Math.round(q36.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">128 prefill baseline</div></div>
+        <div class="sota-stat"><div class="n">${q36.prefill_frontier_pp ? Math.round(q36.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">${q36pp ? q36pp.label + " prefill baseline" : "prefill baseline"}</div></div>
         <div class="sota-stat"><div class="n">${pctLlama}</div><div class="l">vs ${q36.ref_name||"llama.cpp"} decode</div></div>
       </div>
     </div></div>`+
@@ -582,7 +589,7 @@
       </div>
       <div class="sota-stats">
         <div class="sota-stat"><div class="n">${q35.frontier_tps} <span>tok/s</span></div><div class="l">128-tok decode</div></div>
-        <div class="sota-stat"><div class="n">${q35.prefill_frontier_pp ? Math.round(q35.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">32k prefill</div></div>
+        <div class="sota-stat"><div class="n">${q35.prefill_frontier_pp ? Math.round(q35.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">${q35pp ? q35pp.label + " prefill" : "prefill"}</div></div>
         <div class="sota-stat"><div class="n">${q35PctLlama}</div><div class="l">vs ${q35.ref_name||"llama.cpp"} decode</div></div>
       </div>
     </div>` : "");
@@ -676,7 +683,12 @@
   (function(){
     const q = D.qwen35 || {};
     const L = [...(D.landed_qwen35_pp || [])].sort((a,b)=>(a.date||"").localeCompare(b.date||"")||(a.pr||0)-(b.pr||0));
-    const refPp = (q.pp||[]).find(x=>x.label==="32k")?.ref_pp || 0;
+    // Reference and caption must come from the row that produced the scored
+    // frontier — comparing against a different context's llama.cpp number makes
+    // the percentage a cross-context comparison.
+    const fRow = ppFrontierRow(q);
+    const refPp = fRow?.ref_pp || 0;
+    const refCtx = fRow?.label || "scored";
     const pts = [];
     const base = q.baseline_pp;
     if (base) pts.push({name:"origin/main", sub:"same-box baseline · scored prefill", tps:base, baseline:true});
@@ -690,11 +702,11 @@
       const f = q.prefill_frontier_pp || Math.max(0, ...L.map(l=>l.tps), base||0);
       const b = base || (pts.length ? pts[0].tps : f);
       if (b && f) {
-        h.textContent = `${b} → ${f} pp tok/s · 32k prefill · ${refPp?((f/refPp)*100).toFixed(0)+'% of '+q.ref_name+' '+refPp:'—'}`;
+        h.textContent = `${b} → ${f} pp tok/s · ${refCtx} prefill · ${refPp?((f/refPp)*100).toFixed(0)+'% of '+q.ref_name+' '+refPp:'—'}`;
       }
     }
     if (!pts.length && refPp) {
-      pts.push({name:"llama.cpp", sub:"reference · 32k prefill", tps:refPp, llama:true, fixed:true});
+      pts.push({name:"llama.cpp", sub:`reference · ${refCtx} prefill`, tps:refPp, llama:true, fixed:true});
     }
     drawJourney("passes35", pts,
       legWrap(legItem("#D14D72","origin/main baseline")+
