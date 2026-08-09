@@ -446,9 +446,17 @@ std::string ChatTokenizer::decode_delta(std::vector<int>& acc, int new_id) const
     const std::string full = decode(acc);
     if (acc.size() == 1) return full;
     const std::string prev = decode(std::vector<int>(acc.begin(), acc.end() - 1));
-    if (full.size() >= prev.size() && full.compare(0, prev.size(), prev) == 0)
-        return full.substr(prev.size());
-    return full;
+    // HF-style Decode is not always prefix-stable: incomplete UTF-8 / BPE merges can
+    // rewrite the tail (often via U+FFFD). Returning `full` on mismatch re-sends the
+    // entire so-far string into the SSE stream. Emit only the bytes after the longest
+    // common prefix so clients append a true delta.
+    size_t i = 0;
+    const size_t n = std::min(full.size(), prev.size());
+    while (i < n && full[i] == prev[i]) ++i;
+    while (i > 0 && i < full.size() &&
+           (static_cast<unsigned char>(full[i]) & 0xC0) == 0x80)
+        --i;
+    return full.substr(i);
 }
 
 }  // namespace sparkinfer_server
