@@ -475,9 +475,21 @@
   const D = window.SPARKINFER, $ = id => document.getElementById(id);
   const s = D.status, maxPass = Math.max(...D.passes.map(p=>p.tps));
   // Shared context colors — same ctx size → same hue on every chart.
-  const CTX_COLOR = {128:"#D14D72",512:"#7B5DFF",4096:"#0E8A16",16384:"#B8860B",32768:"#6F42C1"};
-  const CTX_LABEL = {128:"128",512:"512",4096:"4k",16384:"16k",32768:"32k"};
+  const CTX_COLOR = {128:"#D14D72",512:"#7B5DFF",4096:"#0E8A16",16384:"#B8860B",32768:"#6F42C1",65536:"#E67E22",131072:"#17A2B8"};
+  const CTX_LABEL = {128:"128",512:"512",4096:"4k",16384:"16k",32768:"32k",65536:"64k",131072:"128k"};
+  // String labels used by Qwen3.5/3.6 decode rows — parseInt("32k") === 32 is wrong.
+  const LABEL_CTX = {"128":128,"512":512,"4k":4096,"16k":16384,"32k":32768,"64k":65536,"128k":131072};
+  const labelCtx = lbl => LABEL_CTX[lbl] ?? (Number.parseInt(lbl, 10) || 128);
   const ctxColor = ctx => CTX_COLOR[ctx] || "#7B5DFF";
+  // Prefer the pp[] row whose throughput matches the recorded prefill frontier.
+  const ppRowForFrontier = q => {
+    const rows = q.pp || [];
+    const target = q.prefill_frontier_pp;
+    if (target == null || !rows.length) return null;
+    return rows.find(x => x.pp === target)
+        || rows.find(x => Math.abs((x.pp || 0) - target) < 1e-3)
+        || null;
+  };
   const LLAMA_FILL = "linear-gradient(90deg,#A9A9B4,#C8C8D4)";
 
   const fmtDl = n => {
@@ -537,12 +549,15 @@
 
   const q36 = D.qwen36 || {};
   const q36ctx128 = (q36.ctx||[]).find(x=>x.label==="128");
-  const q36ctx512 = (q36.ctx||[]).find(x=>x.label==="512");
   const q36Lead = q36ctx128 && q36ctx128.ref_tps ? 100*(q36ctx128.tps - q36ctx128.ref_tps)/q36ctx128.ref_tps : null;
 
   const q35 = D.qwen35 || {};
   const q35ctx128 = (q35.ctx||[]).find(x=>x.label==="128");
   const q35Lead = q35ctx128 && q35ctx128.ref_tps ? 100*(q35ctx128.tps - q35ctx128.ref_tps)/q35ctx128.ref_tps : null;
+  const q36PpFrontier = ppRowForFrontier(q36);
+  const q35PpFrontier = ppRowForFrontier(q35);
+  const q36PpLabel = q36PpFrontier ? `${q36PpFrontier.label} prefill` : "prefill frontier";
+  const q35PpLabel = q35PpFrontier ? `${q35PpFrontier.label} prefill` : "prefill frontier";
 
   $("hero-meta").innerHTML = `GPU <b>${s.gpu}</b> &nbsp;·&nbsp; SOTA target <b>Qwen3.6-35B-A3B</b> &nbsp;·&nbsp; guard <b>${s.model}</b>`;
   $("updated").textContent = "updated " + D.updated;
@@ -565,7 +580,7 @@
       </div>
       <div class="sota-stats">
         <div class="sota-stat"><div class="n">${q36.frontier_tps} <span>tok/s</span></div><div class="l">128-tok decode</div></div>
-        <div class="sota-stat"><div class="n">${q36.prefill_frontier_pp ? Math.round(q36.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">128 prefill baseline</div></div>
+        <div class="sota-stat"><div class="n">${q36.prefill_frontier_pp ? Math.round(q36.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">${q36PpLabel}</div></div>
         <div class="sota-stat"><div class="n">${pctLlama}</div><div class="l">vs ${q36.ref_name||"llama.cpp"} decode</div></div>
       </div>
     </div></div>`+
@@ -582,14 +597,14 @@
       </div>
       <div class="sota-stats">
         <div class="sota-stat"><div class="n">${q35.frontier_tps} <span>tok/s</span></div><div class="l">128-tok decode</div></div>
-        <div class="sota-stat"><div class="n">${q35.prefill_frontier_pp ? Math.round(q35.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">32k prefill</div></div>
+        <div class="sota-stat"><div class="n">${q35.prefill_frontier_pp ? Math.round(q35.prefill_frontier_pp).toLocaleString() : "—"} <span>pp/s</span></div><div class="l">${q35PpLabel}</div></div>
         <div class="sota-stat"><div class="n">${q35PctLlama}</div><div class="l">vs ${q35.ref_name||"llama.cpp"} decode</div></div>
       </div>
     </div>` : "");
   }
 
-  const kpiTps = q36ctx512?.tps || q36.frontier_tps || s.frontier_tps;
-  const kpiRef = q36ctx512?.ref_tps || q36.ref_tps || s.ref_tps;
+  const kpiTps = q36.frontier_tps || s.frontier_tps;
+  const kpiRef = q36.ref_tps || s.ref_tps;
   const kpiRefName = q36.ref_name || s.ref_name;
   const kpiTm = q36.token_match ?? s.token_match;
   const kpiKl = q36.kl ?? s.kl;
@@ -598,8 +613,8 @@
   const pct   = kpiRef > 0 ? 100*(kpiTps - kpiRef)/kpiRef : 0;
   const gapx  = kpiTps > 0 ? (kpiRef/kpiTps).toFixed(2) : "—";
   $("kpis").innerHTML = [
-    {lab:"Frontier decode", val:kpiTps, unit:"tok/s", note:"single-stream, bs=1 · 512-context · 128-tok · Qwen3.6-35B-A3B"},
-    {lab:(ahead?"vs ":"Gap to ")+kpiRefName, val:(ahead?"+"+pct.toFixed(1)+"%":gapx+"×"), unit:"", note:`${kpiRefName} ${kpiRef} tok/s · 512-context`},
+    {lab:"Frontier decode", val:kpiTps, unit:"tok/s", note:"single-stream, bs=1 · 128-tok competition frontier · Qwen3.6-35B-A3B"},
+    {lab:(ahead?"vs ":"Gap to ")+kpiRefName, val:(ahead?"+"+pct.toFixed(1)+"%":gapx+"×"), unit:"", note:`${kpiRefName} ${kpiRef} tok/s · 128-tok frontier`},
     {lab:"Accuracy", val:(kpiTm*100).toFixed(0)+"%", unit:"top-1", note:`KL ${kpiKl} vs ${kpiRefName}`},
     {lab:"VRAM resident", val:kpiVram, unit:"GB", note:"experts kept quantized"},
   ].map(k=>`<div class="kpi"><div class="lab">${k.lab}</div><div class="val">${k.val} <span>${k.unit}</span></div><div class="note">${k.note}</div></div>`).join("");
@@ -676,7 +691,9 @@
   (function(){
     const q = D.qwen35 || {};
     const L = [...(D.landed_qwen35_pp || [])].sort((a,b)=>(a.date||"").localeCompare(b.date||"")||(a.pr||0)-(b.pr||0));
-    const refPp = (q.pp||[]).find(x=>x.label==="32k")?.ref_pp || 0;
+    const frontierPp = ppRowForFrontier(q);
+    const refPp = frontierPp?.ref_pp || 0;
+    const ppLbl = frontierPp ? `${frontierPp.label} prefill` : "prefill frontier";
     const pts = [];
     const base = q.baseline_pp;
     if (base) pts.push({name:"origin/main", sub:"same-box baseline · scored prefill", tps:base, baseline:true});
@@ -690,11 +707,11 @@
       const f = q.prefill_frontier_pp || Math.max(0, ...L.map(l=>l.tps), base||0);
       const b = base || (pts.length ? pts[0].tps : f);
       if (b && f) {
-        h.textContent = `${b} → ${f} pp tok/s · 32k prefill · ${refPp?((f/refPp)*100).toFixed(0)+'% of '+q.ref_name+' '+refPp:'—'}`;
+        h.textContent = `${b} → ${f} pp tok/s · ${ppLbl} · ${refPp?((f/refPp)*100).toFixed(0)+'% of '+q.ref_name+' '+refPp:'—'}`;
       }
     }
     if (!pts.length && refPp) {
-      pts.push({name:"llama.cpp", sub:"reference · 32k prefill", tps:refPp, llama:true, fixed:true});
+      pts.push({name:"llama.cpp", sub:"reference · "+ppLbl, tps:refPp, llama:true, fixed:true});
     }
     drawJourney("passes35", pts,
       legWrap(legItem("#D14D72","origin/main baseline")+
@@ -782,7 +799,7 @@
       ref: x => x.ref_tps,
       label: x => x.label,
       sub: x => x.label === "128" ? "no prefill" : "128 gen tok",
-      color: x => ctxColor(x.label === "4k" ? 4096 : parseInt(x.label, 10) || 128),
+      color: x => ctxColor(labelCtx(x.label)),
     });
     $("detail-q35").innerHTML = detailRows + splitNote("sparkinfer vs llama.cpp", "same GPU · Qwythos-9B Q4_K_M GGUF · decode");
   })();
@@ -820,7 +837,7 @@
       ref: x => x.ref_tps,
       label: x => x.label,
       sub: x => x.label === "128" ? "no prefill" : "128 gen tok",
-      color: x => ctxColor(x.label === "4k" ? 4096 : x.label === "16k" ? 16384 : x.label === "32k" ? 32768 : parseInt(x.label, 10) || 128),
+      color: x => ctxColor(labelCtx(x.label)),
     });
     $("detail-q36").innerHTML = detailRows + splitNote("sparkinfer vs llama.cpp", "same GPU · Qwen3.6-35B-A3B UD-Q4_K_M GGUF · decode");
   })();
