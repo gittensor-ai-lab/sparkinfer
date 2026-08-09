@@ -27,8 +27,8 @@ source of the incentive loop is clear: SPARKINFER is built through **SN74 on Git
 ## Before you open a PR
 
 ```bash
-# 1. build + tests (must be 5/5)
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES=120 && cmake --build build -j && ctest --test-dir build
+# 1. build + tests (all ctest targets must pass)
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=120 && cmake --build build -j && ctest --test-dir build  # all tests must pass
 
 # 2. speed — does it actually go faster?
 bench/scripts/bench.sh --download            # and --compare for the llama.cpp gap
