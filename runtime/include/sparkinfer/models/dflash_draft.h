@@ -59,6 +59,10 @@ public:
     //   pos0:          absolute position of noise_ids[0]
     //   out_argmax:    [block_size] host argmax (only [1..] are draft proposals; [0] unused)
     // Returns false on failure.
+    // Build the quantized weight copies now rather than on the first forward_block, so a caller
+    // that primes the draft outside a timed region does not pay for it inside one. Idempotent.
+    void ensure_quant();
+
     bool forward_block(const void* target_hidden, int ctx_len,
                        const int* noise_ids, int pos0,
                        int* out_argmax, cudaStream_t stream = nullptr);

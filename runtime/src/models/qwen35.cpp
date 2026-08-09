@@ -1887,6 +1887,127 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     const int B = dc.block_size;
     const int mask_id = dc.mask_token_id;
 
+    // The sequence length below which this path is byte-identical to main: the boundary between
+    // main's behaviour and the exact long-context batched verify.
+    static const int kCompactMaxSeq = []{
+        const char* e = getenv("SPARKINFER_DFLASH_COMPACT_MAX_SEQ");
+        return e ? atoi(e) : 384;
+    }();
+    // Sequence-length floor for the batched path. The acceptance EMA alone is not enough: 512-ctx
+    // settles at tau 2.19, below the engage threshold, but a transient run of full blocks early in
+    // the stream pushes it over and alpha 1/8 then takes ~8 steps to decay. A floor cannot be
+    // spoofed by a transient, and it costs 4k nothing because 4k clears it from the first step.
+    static const int kEngageMinSeq = []{
+        const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_MINSEQ");
+        return e ? atoi(e) : 1024;
+    }();
+
+    // Speculating is a strict LOSS wherever the batched verify cannot engage.
+    //
+    // The token loop verifies with early exit, so a step that keeps `keep` tokens runs exactly
+    // `keep` target forwards -- one per emitted token, the same count autoregressive decode runs --
+    // and then pays a draft block on top. It never saves a target forward; only the batched verify
+    // does, by collapsing them into one N-row pass. So in the band where the batched path is off,
+    // DFlash is AR plus the draft, and the draft is pure overhead. Measured on RTX 5090 with the
+    // batched path forced off, against this binary's own AR: 128-ctx 434.7 vs 516, 4k 385.9 vs 488,
+    // 512-ctx 401 vs 511 -- slower at every one, by very close to draft_ms / tau per token.
+    //
+    // Whether the batched path can ever engage is decided by the prompt and max_new alone, before a
+    // single token is generated: `start + remaining` is invariant across the loop, so a generation
+    // that starts above kCompactMaxSeq (short-context compact path off) and ends below
+    // kEngageMinSeq (long-context path off) spends every step on the token loop. Take the AR path
+    // for that band outright -- decided here, before prefill, so nothing about the DFlash setup
+    // (hidden-state capture, the draft's KV, the verify graph) is ever paid for.
+
+    // 0=off, 1=force, 2=adaptive (default). #716 turned this off because the row-batched
+    // compact-verify graph (dflash_verify_short_run) showed a numerical discrepancy from AR
+    // "present in every row of a batch, including rows that still happen to land on the correct
+    // token" (#712), which on some steps flipped the argmax and broke DFlash's lossless
+    // guarantee. That gap is closed: the batched path was scoring its logits against a
+    // per-row symmetric int8 REQUANTIZATION of the Q4_K LM head, while AR scores against the
+    // native Q4_K weights -- a systematic per-row error, in exactly the "every row" shape
+    // reported. dflash_verify_short_run now uses the native head (see the comment there), so
+    // the batched path and AR read the same weights and greedy DFlash reproduces AR exactly.
+    static const int compact_mode = []{
+        const char* e = getenv("SPARKINFER_DFLASH_COMPACT_VERIFY");
+        return e ? atoi(e) : 2;
+    }();
+    // Full-block accepts arrive in runs (the target and draft agree over a whole predictable
+    // region), so one is already evidence the next step will accept a full block.
+    //
+    // Engage the row-batched verify only while the draft is actually landing full blocks. The
+    // batched pass replaces the step's sequential target forwards with one N-row pass, so it pays
+    // in proportion to how many forwards it collapses -- that is the ACCEPTANCE RATE, not the
+    // context length. Measured on RTX 5090 over held-out prompts (mean accept tau, compact off ->
+    // on): tau 5.32 -> 448.7 to 911.1 tok/s, but tau 2.40 -> 433.2 to 437.2, tau 2.00 -> 425.4 to
+    // 396.1, and tau 1.87 -> 439.1 to 350.8. Below roughly half the block depth the batched pass
+    // forwards the whole block to keep two tokens and the token loop's early exit is simply
+    // cheaper, so engaging there costs throughput on exactly the prompts the draft handles worst.
+    //
+    // The previous score LATCHED: any partial accept of >= kStayKeep held it at the engage
+    // threshold, so once armed it stayed armed straight through those low-acceptance stretches.
+    // Require a RUN of full-block accepts to arm, and decay on every non-full block so it backs
+    // off as soon as the draft stops landing blocks.
+    // How many full-block accepts in a row arm the batched path. A run is evidence that the draft
+    // is tracking the target, and the decay below still disarms on two non-full blocks, so the run
+    // length only sets how long that evidence takes to accumulate -- and the wait is paid on every
+    // prompt the draft handles well. On the held-out short prompt (tau 5.33, where batching is
+    // worth +11%) a run of 3 spends the first few steps of a ~24-step generation on the token loop:
+    // 806.1 tok/s at 3 against 878.7 at 1. A prompt the draft handles badly is unaffected either
+    // way, because it never lands the full block that arms it at all -- measured at tau 2.08,
+    // 437.2 -> 434.4, while blindly forcing the batched path there costs 15%.
+    static const int kBlockScore = []{
+        const char* e = getenv("SPARKINFER_DFLASH_BLOCK_SCORE");
+        int v = e ? atoi(e) : 1;
+        return v < 1 ? 1 : v;
+    }();
+
+    const int n_prompt = (int)prompt.size();
+    const bool spec_never_pays = (n_prompt + B) > kCompactMaxSeq &&
+                                 (n_prompt + max_new + B) < kEngageMinSeq &&
+                                 compact_mode != 1;
+    if (spec_never_pays) {
+        // Plain autoregressive decode, set up the way generate() sets it up: no hidden-state
+        // capture, no draft KV, no verify graph. Deciding before prefill rather than falling back
+        // mid-stream is what makes this reach AR's own throughput instead of approaching it -- a
+        // fallback still pays for the DFlash prefill it already ran.
+        set_dflash_capture(false, {}, 0);
+        const int ar_budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
+        clear_prefix_cache();
+        invalidate_decode_graph();
+        const uint64_t ar_sid = open_session(ar_budget);
+        if (!ar_sid) {
+            fprintf(stderr, "[dflash] KV allocate failed (need %d)\n", ar_budget);
+            return out;
+        }
+        activate_session(ar_sid);
+        s.final_seqlen_hint = n_prompt + max_new;
+        const auto ar_t0 = std::chrono::steady_clock::now();
+        int ar_next = ingest_prompt_range(prompt.data(), 0, n_prompt);
+        const auto ar_t1 = std::chrono::steady_clock::now();
+        if (ar_next < 0 || ar_next >= s.cfg.vocab) {
+            close_session(ar_sid);
+            fprintf(stderr, "[dflash] prompt prefill failed (n=%d)\n", n_prompt);
+            return out;
+        }
+        for (int i = 0; i < max_new; i++) {
+            out.push_back(ar_next);
+            if (ar_next == s.cfg.eos_id) break;
+            ar_next = forward_token(ar_next, n_prompt + i, true);
+            if (ar_next < 0) break;
+            if (gov) gov->pace();
+        }
+        const auto ar_t2 = std::chrono::steady_clock::now();
+        if (stats) {
+            stats->steps = (int)out.size();
+            stats->mean_accept = 1.0;   // one target forward per token, by definition
+            stats->ttft_s = std::chrono::duration<double>(ar_t1 - ar_t0).count();
+            stats->decode_s = std::chrono::duration<double>(ar_t2 - ar_t1).count();
+        }
+        close_session(ar_sid);
+        return out;
+    }
+
     // Head for the draft. The dual-head path keeps a native Q6_K copy so the draft's multi-row
     // MMVQ has something to chew on, but that kernel runs near HBM peak, so its runtime is just
     // its weight bytes -- and the target's own Q4_K copy is ~280 MB against the Q6_K's ~417 MB.
@@ -1901,6 +2022,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                               : (s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type());
     draft.set_shared_weights(embed_weights(), draft_head, draft_head_type,
                              s.cfg.vocab, s.cfg.hidden);
+    // Build the draft's quantized weights here, before prefill and well before the decode clock,
+    // so this generation pays exactly what it did when load() built them eagerly. The point of
+    // deferring them is the branch above: a generation that takes the autoregressive path returns
+    // before this line and never materialises them at all.
+    draft.ensure_quant();
     set_dflash_capture(true, dc.target_layer_ids, B);
 
     const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
@@ -1952,48 +2078,6 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 5;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
-    // 0=off, 1=force, 2=adaptive (default). #716 turned this off because the row-batched
-    // compact-verify graph (dflash_verify_short_run) showed a numerical discrepancy from AR
-    // "present in every row of a batch, including rows that still happen to land on the correct
-    // token" (#712), which on some steps flipped the argmax and broke DFlash's lossless
-    // guarantee. That gap is closed: the batched path was scoring its logits against a
-    // per-row symmetric int8 REQUANTIZATION of the Q4_K LM head, while AR scores against the
-    // native Q4_K weights -- a systematic per-row error, in exactly the "every row" shape
-    // reported. dflash_verify_short_run now uses the native head (see the comment there), so
-    // the batched path and AR read the same weights and greedy DFlash reproduces AR exactly.
-    static const int compact_mode = []{
-        const char* e = getenv("SPARKINFER_DFLASH_COMPACT_VERIFY");
-        return e ? atoi(e) : 2;
-    }();
-    // Full-block accepts arrive in runs (the target and draft agree over a whole predictable
-    // region), so one is already evidence the next step will accept a full block.
-    //
-    // Engage the row-batched verify only while the draft is actually landing full blocks. The
-    // batched pass replaces the step's sequential target forwards with one N-row pass, so it pays
-    // in proportion to how many forwards it collapses -- that is the ACCEPTANCE RATE, not the
-    // context length. Measured on RTX 5090 over held-out prompts (mean accept tau, compact off ->
-    // on): tau 5.32 -> 448.7 to 911.1 tok/s, but tau 2.40 -> 433.2 to 437.2, tau 2.00 -> 425.4 to
-    // 396.1, and tau 1.87 -> 439.1 to 350.8. Below roughly half the block depth the batched pass
-    // forwards the whole block to keep two tokens and the token loop's early exit is simply
-    // cheaper, so engaging there costs throughput on exactly the prompts the draft handles worst.
-    //
-    // The previous score LATCHED: any partial accept of >= kStayKeep held it at the engage
-    // threshold, so once armed it stayed armed straight through those low-acceptance stretches.
-    // Require a RUN of full-block accepts to arm, and decay on every non-full block so it backs
-    // off as soon as the draft stops landing blocks.
-    // How many full-block accepts in a row arm the batched path. A run is evidence that the draft
-    // is tracking the target, and the decay below still disarms on two non-full blocks, so the run
-    // length only sets how long that evidence takes to accumulate -- and the wait is paid on every
-    // prompt the draft handles well. On the held-out short prompt (tau 5.33, where batching is
-    // worth +11%) a run of 3 spends the first few steps of a ~24-step generation on the token loop:
-    // 806.1 tok/s at 3 against 878.7 at 1. A prompt the draft handles badly is unaffected either
-    // way, because it never lands the full block that arms it at all -- measured at tau 2.08,
-    // 437.2 -> 434.4, while blindly forcing the batched path there costs 15%.
-    static const int kBlockScore = []{
-        const char* e = getenv("SPARKINFER_DFLASH_BLOCK_SCORE");
-        int v = e ? atoi(e) : 1;
-        return v < 1 ? 1 : v;
-    }();
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
     // accepted length, and it has no reason to sit at exactly B. Measured on RTX 5090 at the three
@@ -2012,10 +2096,6 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // hard bound that kept the batched verify away from long context entirely (the #712 gap); it
     // is now the boundary between "main's behaviour, unchanged" and "the new exact long-context
     // path", so nothing already validated at short context moves.
-    static const int kCompactMaxSeq = []{
-        const char* e = getenv("SPARKINFER_DFLASH_COMPACT_MAX_SEQ");
-        return e ? atoi(e) : 384;
-    }();
     // Compared against keep_ema8 in the SCALED domain (kEngageKeep * 8), not by shifting the EMA
     // down first. Shifting floors it, which collapses the very gap the gate exists to resolve:
     // 512-ctx sits at tau 2.19 (ema8 ~17.5) and 4k at tau 3.91 (ema8 ~31.3), and both floor to the
@@ -2025,10 +2105,6 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // stream pushes it over, and alpha 1/8 then takes ~8 steps to decay -- measured at 2.8-4.3%
     // lost to running the batched path where it is 31% SLOWER. A floor cannot be spoofed by a
     // transient, and it costs 4k nothing because 4k clears it from the first step.
-    static const int kEngageMinSeq = []{
-        const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_MINSEQ");
-        return e ? atoi(e) : 1024;
-    }();
     static const int kEngageKeep = []{
         const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_KEEP");
         int v = e ? atoi(e) : 3;

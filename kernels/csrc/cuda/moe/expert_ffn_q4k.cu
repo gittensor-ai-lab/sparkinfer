@@ -762,6 +762,49 @@ __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     if (pdl) si_pdl_lc();
 }
 
+// Same output as gate_up_mmvq2_pack2_qwen_kernel, one warp per element instead of four.
+//
+// pack2 splits each output across 4 warps because AR decode calls this with num_tokens=1, where
+// top_k*ffn = 4096 elements is not enough to fill the GPU and the extra warps buy occupancy. The
+// DFlash compact verify calls it with num_tokens=B, so the grid is already B times larger and the
+// split stops buying anything -- every thread runs a single si_vec_dot_q4_K pair (NB = H>>8 = 8,
+// stride 8, so the loop body executes once) and then pays a shared-memory round trip and a
+// __syncthreads to reassemble it.
+//
+// This is bit-identical to pack2, not merely equivalent. There, lane l of warp 0 finishes with
+//   p(kbx0) + p(kbx0+2) + p(kbx0+4) + p(kbx0+6),   kbx0 = l>>4
+// accumulated in that order: warp w covers tid4 = w*32 + l, hence kbx = kbx0 + 2w and the same
+// kqs = 2*(l&15) (32 is a multiple of 16), and the shared reduce folds warps 1,2,3 in ascending
+// order. Walking that same kbx sequence inside one warp produces the same partials in the same
+// order, so the butterfly below sees identical inputs. Only the thread mapping changes.
+template <int H, int F, int TOPK, int WARPS>
+__global__ void gate_up_mmvq2_warp_qwen_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int n_rows, int pdl
+) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WARPS + (int)(threadIdx.x >> 5);
+    if (row >= n_rows) { if (pdl) si_pdl_lc(); return; }
+    const int ts = row / F, f = row - ts * F, tok = ts / TOPK;
+    const int e = expert_ids[ts];
+    const int kbx0 = lane >> 4;
+    const int kqs = 2 * (lane & 15);
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
+    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
+    constexpr int NB = H >> 8;
+    float tg = 0.f, tu = 0.f;
+    for (int kbx = kbx0; kbx < NB; kbx += 2) {
+        tg += si_vec_dot_q4_K(g_row + kbx, vrow + (size_t)kbx * 8, kqs);
+        tu += si_vec_dot_q4_K(u_row + kbx, vrow + (size_t)kbx * 8, kqs);
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+    if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
+}
+
 template <int H, int F, int TOPK>
 __global__ void gate_up_mmvq2_pack4_qwen_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
@@ -997,14 +1040,22 @@ __global__ void down_q5k_mmvq_kernel(
     if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
 }
 
-template <int S>
+template <int S, int WPBK = WPB>
 __global__ void down_q5k_mmvq_splitk_kernel(
     const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
     const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
     __nv_bfloat16* __restrict__ output, int H, int F, int top_k, int pdl
 ) {
     if (pdl) si_pdl_sync();
-    constexpr int RPB = WPB / S;
+    // RPB = rows (hidden columns) per block. At the shipped WPBK = WPB = 8 and the exact-split
+    // S = 8 this is 1, i.e. a 256-thread block per single bf16 output -- with total = top_k*work
+    // = 256 that is one si_vec_dot_q5_K per thread, then a 32-lane butterfly, a shared store and a
+    // __syncthreads. Correct for AR decode, where grid.x = 1 and the block count is the only thing
+    // filling the GPU; wasteful for the DFlash verify, where grid.x = B already does. Raising WPBK
+    // packs several hidden columns into one block, and since s_part is indexed per column and each
+    // column keeps its own splits, warps and reduction order, the result is bit-identical -- the
+    // adjacent hh also share the same expert rows, so the wider block reads them contiguously.
+    constexpr int RPB = WPBK / S;
     __shared__ float s_part[RPB][S];
     const int token = blockIdx.x, lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
     const int hh_local = warpId / S, split = warpId % S;
@@ -1212,6 +1263,49 @@ static inline int gu_mmvq_pdl() {
     return v;
 }
 
+// Warps per block for the multi-row gate/up tiling; 0 disables it and restores the pack2 path for
+// every caller. Only reached when num_tokens > 1. Swept on RTX 5090 at both scored contexts
+// (pack2 -> 4 -> 8 -> 16 warps): 128-ctx 832.7 -> 842.5 -> 841.2 -> 838.6, 4k 514.1 -> 520.5 ->
+// 519.3 -> 519.0. Four warps per block wins at both.
+static inline int gu_batch_warps() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_GU_BATCH_WARPS");
+        v = e ? atoi(e) : 4;
+        if (v < 0) v = 0;
+        if (v > 32) v = 32;
+    }
+    return v;
+}
+
+// Warps per block for the multi-row Q5_K down split-K. WPB is the shipped tiling and stays the
+// default: widening the block so one block covers several hidden columns is bit-identical but
+// measurably slower here (4k, 32 warps vs WPB: 496.5 vs 519.3), because a 1024-thread block costs
+// more occupancy than the block count it saves. Kept as a knob, not a default.
+static inline int down_batch_warps() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_DOWN_BATCH_WARPS");
+        v = e ? atoi(e) : WPB;
+        if (v != WPB && v != 2 * WPB && v != 4 * WPB) v = WPB;
+    }
+    return v;
+}
+
+template <int H, int F, int TOPK, typename... Args>
+static inline void launch_gate_up_warp_qwen(int warps, int pdl, int n_rows, cudaStream_t stream,
+                                            Args... args) {
+    const dim3 grid((n_rows + warps - 1) / warps);
+    switch (warps) {
+        case 4:  launch_pdl_kernel(pdl, grid, dim3(4 * 32), 0, stream,
+                     gate_up_mmvq2_warp_qwen_kernel<H, F, TOPK, 4>, args..., n_rows, pdl); return;
+        case 16: launch_pdl_kernel(pdl, grid, dim3(16 * 32), 0, stream,
+                     gate_up_mmvq2_warp_qwen_kernel<H, F, TOPK, 16>, args..., n_rows, pdl); return;
+        default: launch_pdl_kernel(pdl, dim3((n_rows + 7) / 8), dim3(8 * 32), 0, stream,
+                     gate_up_mmvq2_warp_qwen_kernel<H, F, TOPK, 8>, args..., n_rows, pdl); return;
+    }
+}
+
 static inline int dense_top1_down_splitk(int current, int top_k, const char* specific_env) {
     if (top_k == 1 && !getenv("SPARKINFER_DOWN_SPLITK_S") && !getenv(specific_env))
         return 8;
@@ -1333,12 +1427,29 @@ static inline bool launch_down_q4k_mmvq_splitk(
         default: return false;
     }
 }
+// wpbk = warps per block. WPB is the shipped value and the only one AR decode uses; the DFlash
+// verify passes a wider block so one block covers RPB = wpbk/S hidden columns instead of one.
+// Every column keeps its own splits and its own reduction, so widening is bit-identical.
 static inline bool launch_down_q5k_mmvq_splitk(
     int S, int pdl, dim3 grid, const unsigned char* down_q, const int* expert_ids,
     const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
-    int H, int F, int top_k, cudaStream_t stream
+    int H, int F, int top_k, cudaStream_t stream, int wpbk = WPB
 ) {
-    const dim3 block(WPB * 32);
+    const dim3 block(wpbk * 32);
+    if (wpbk == 2 * WPB) {
+        switch (S) {
+            case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<4, 2 * WPB>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
+            case 8: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<8, 2 * WPB>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
+            default: return false;
+        }
+    }
+    if (wpbk == 4 * WPB) {
+        switch (S) {
+            case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<4, 4 * WPB>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
+            case 8: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<8, 4 * WPB>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
+            default: return false;
+        }
+    }
     switch (S) {
         case 2: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
         case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q5k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
@@ -1434,7 +1545,21 @@ void launch_moe_expert_ffn_q4k(
                 reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
             q = qbuf;
         }
-        if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
+        // Multi-row callers (the DFlash compact verify) get the one-warp-per-element tiling: same
+        // arithmetic, same order, same result, but without the 4-warp shared-memory reduce that
+        // only earns its keep when num_tokens == 1 leaves the GPU short of warps.
+        const int gu_warps = gu_batch_warps();
+        if (num_tokens > 1 && gu_warps > 0 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8) {
+            const int n_rows = num_tokens * top_k * ffn;
+            launch_gate_up_warp_qwen<2048, 512, 8>(gu_warps, gu_pdl, n_rows, stream,
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch);
+        } else if (num_tokens > 1 && gu_warps > 0 && gu_spec && hidden == 2048 && ffn == 768 && top_k == 8) {
+            const int n_rows = num_tokens * top_k * ffn;
+            launch_gate_up_warp_qwen<2048, 768, 8>(gu_warps, gu_pdl, n_rows, stream,
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch);
+        } else if (gu_pack2 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8)
             launch_pdl_kernel(gu_pdl, dim3((num_tokens * top_k * ffn + 1) / 2), dim3(8 * 32), 0, stream,
                 gate_up_mmvq2_pack2_qwen_kernel<2048, 512, 8>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
@@ -1580,11 +1705,15 @@ void launch_moe_expert_ffn_q4k(
         const int Sbase = (num_tokens > 1 && !s5env && !ar_exact_splitk) ? 1 : down_splitk_s_q5();
         const int S = dense_top1_down_splitk(Sbase, top_k, "SPARKINFER_DOWN_SPLITK_S_Q5");
         if (S > 1) {
-            const int RPB = WPB / S;
+            // A caller that pinned S for exactness (ar_exact_splitk) is the compact verify, which
+            // runs many rows; give it a block wide enough that the pinned split count no longer
+            // means one block per output. AR decode keeps WPB.
+            const int wpbk = num_tokens > 1 ? down_batch_warps() : WPB;
+            const int RPB = wpbk / S;
             dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
             if (launch_down_q5k_mmvq_splitk(S, pdl, dns,
                     reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
-                    reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, stream))
+                    reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, stream, wpbk))
                 return;
         }
         dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);

@@ -1380,9 +1380,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         if (!capture_dst || !capture_layers || n_capture <= 0) return;
         for (int slot = 0; slot < n_capture; ++slot) if (capture_layers[slot] == layer) {
             char* dst = static_cast<char*>(capture_dst) + (size_t)slot * H * sizeof(bf16);
-            pf_cu(cudaMemcpy2DAsync(dst, (size_t)n_capture * H * sizeof(bf16), x,
-                                    (size_t)H * sizeof(bf16), (size_t)H * sizeof(bf16), N,
-                                    cudaMemcpyDeviceToDevice, st), "verify capture");
+            // Kernel node, not a 2-D memcpy node: same bytes to the same addresses, but it
+            // schedules against its neighbours instead of draining the graph (see the note on
+            // launch_capture_rows in dflash_kernels.h).
+            dflash_kernels::launch_capture_rows(x, dst, N, H, n_capture * H, st);
         }
     };
 
@@ -1430,10 +1431,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     pf_cu(cudaMemcpyAsync(pos, ph_pos, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify pos");
     pf_cu(cudaMemcpyAsync(seq, ph_seq, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify lens");
     // Device-to-device inside the capture, so each replay re-reads the sequence's live table as it
-    // grows instead of baking in the mapping from capture time.
-    for (int i = 0; btab_rows && i < N; ++i)
-        pf_cu(cudaMemcpyAsync(btab_rows + (size_t)i * mbs, btable, (size_t)mbs * sizeof(int),
-                              cudaMemcpyDeviceToDevice, st), "verify btable row");
+    // grows instead of baking in the mapping from capture time. One kernel node rather than N
+    // memcpy nodes -- same reason as the capture copies above.
+    if (btab_rows)
+        dflash_kernels::launch_broadcast_rows_i32(btable, btab_rows, mbs, N, st);
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, c.rms_eps, st);
     for (int L = 0; L < c.n_layers && supported; ++L) {

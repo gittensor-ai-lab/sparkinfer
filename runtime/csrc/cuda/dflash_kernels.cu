@@ -1415,5 +1415,40 @@ void launch_gdn_scan_commit_layers(const void* k_base, size_t k_layer_stride,
         live_base, live_layer_stride, n_tokens, q_heads, v_heads);
 }
 
+namespace {
+// dst[r * dst_row_stride + c] = src[r * hidden + c]  -- the 2-D capture copy as a kernel node.
+__global__ void k_capture_rows(const bf16* __restrict__ src, bf16* __restrict__ dst,
+                               int rows, int hidden, int dst_row_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * hidden) return;
+    const int r = i / hidden, c = i - r * hidden;
+    dst[(size_t)r * dst_row_stride + c] = src[(size_t)r * hidden + c];
+}
+
+// dst[r * n + j] = src[j] for every row -- the block-table replication as a kernel node.
+__global__ void k_broadcast_rows_i32(const int* __restrict__ src, int* __restrict__ dst,
+                                     int n, int rows) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * rows) return;
+    dst[i] = src[i % n];
+}
+} // namespace
+
+void launch_capture_rows(const void* src, void* dst, int rows, int hidden, int dst_row_stride,
+                         cudaStream_t stream) {
+    const int total = rows * hidden;
+    if (total <= 0) return;
+    const int threads = 256;
+    k_capture_rows<<<(total + threads - 1) / threads, threads, 0, stream>>>(
+        (const bf16*)src, (bf16*)dst, rows, hidden, dst_row_stride);
+}
+
+void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaStream_t stream) {
+    const int total = n * rows;
+    if (total <= 0) return;
+    const int threads = 256;
+    k_broadcast_rows_i32<<<(total + threads - 1) / threads, threads, 0, stream>>>(src, dst, n, rows);
+}
+
 } // namespace dflash_kernels
 } // namespace sparkinfer

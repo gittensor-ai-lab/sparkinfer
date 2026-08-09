@@ -290,6 +290,26 @@ struct DFlashDraftModel::Impl {
     std::vector<bf16*> k_cache, v_cache;
     int seq_len = 0;
 
+    // The draft's quantized weight copies are built on first use, not at load. Constructing them
+    // is what makes merely loading the draft tax the TARGET's decode: measured on RTX 5090 with
+    // the same bench_decode call either side of draft.load(), 501.9 -> 460.1 tok/s at 512-ctx, and
+    // skipping just this construction removes all of it (501.2). Freeing the draft afterwards
+    // restores it too (501.4), so the cost tracks these buffers being resident rather than the
+    // ~216 MB they occupy -- 2.5 GB of dummy allocations reproduce none of it.
+    //
+    // Deferring means a generation that never runs the draft never pays. dflash_generate primes
+    // this before its decode clock starts, so a generation that does run the draft is unchanged.
+    struct PendingQuant { bf16* w; int N, K; Q8W* dst; };
+    std::vector<PendingQuant> pending_quant;
+    bool quant_ready = false;
+
+    void ensure_quant() {
+        if (quant_ready) return;
+        for (auto& pq : pending_quant) *pq.dst = make_q8(pq.w, pq.N, pq.K);
+        pending_quant.clear();
+        quant_ready = true;
+    }
+
     Q8W make_q8(bf16* w, int N, int K) {
         Q8W o;
         if (draft_w_bits() == 4) {
@@ -477,13 +497,13 @@ bool DFlashDraftModel::load(const std::string& dir) {
         // so halving their weight bytes is the dominant remaining win. Built once, on load.
         if (q8_on()) {
             const int qd = s.cfg.n_q_heads * s.cfg.head_dim, kvd = s.cfg.n_kv_heads * s.cfg.head_dim;
-            lw.q8_wq   = s.make_q8(lw.wq,   qd,  H);
-            lw.q8_wk   = s.make_q8(lw.wk,   kvd, H);
-            lw.q8_wv   = s.make_q8(lw.wv,   kvd, H);
-            lw.q8_wo   = s.make_q8(lw.wo,   H,   qd);
-            lw.q8_gate = s.make_q8(lw.gate, I,   H);
-            lw.q8_up   = s.make_q8(lw.up,   I,   H);
-            lw.q8_down = s.make_q8(lw.down, H,   I);
+            s.pending_quant.push_back({lw.wq,   qd,  H,  &lw.q8_wq});
+            s.pending_quant.push_back({lw.wk,   kvd, H,  &lw.q8_wk});
+            s.pending_quant.push_back({lw.wv,   kvd, H,  &lw.q8_wv});
+            s.pending_quant.push_back({lw.wo,   H,   qd, &lw.q8_wo});
+            s.pending_quant.push_back({lw.gate, I,   H,  &lw.q8_gate});
+            s.pending_quant.push_back({lw.up,   I,   H,  &lw.q8_up});
+            s.pending_quant.push_back({lw.down, H,   I,  &lw.q8_down});
         }
     }
 
@@ -544,10 +564,13 @@ bool ctx_gemm_enabled() {
 }
 }  // namespace
 
+void DFlashDraftModel::ensure_quant() { if (p_) p_->ensure_quant(); }
+
 bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      const int* noise_ids, int pos0,
                                      int* out_argmax, cudaStream_t stream) {
     Impl& s = *p_;
+    s.ensure_quant();
     if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
     if (ctx_len < 0 || ctx_len + s.cfg.block_size > s.cfg.max_seq + s.cfg.block_size) return false;
     cudaStream_t st = stream ? stream : s.stream;

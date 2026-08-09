@@ -145,5 +145,19 @@ void launch_gdn_scan_commit_layers(const void* k_base, size_t k_layer_stride,
                                    int n_layers, int n_tokens, int q_heads, int v_heads,
                                    int head_dim, cudaStream_t stream);
 
+// Copy nodes are barriers inside the verify graph. The batched verify records two kinds of
+// device-to-device copy per replay -- one 2-D copy per captured layer to stage the draft's target
+// features, and one per row to replicate the KV block table -- and although they move only tens of
+// kilobytes, a memcpy node does not schedule against its neighbours the way a kernel node does, so
+// each one drains the graph. Measured on RTX 5090 at 4k with nsys: 14 copy nodes per verify, 40 us
+// of actual copying and 2.07 ms of GPU idle behind them, against a 5.6 ms verify whose every other
+// node runs back-to-back.
+//
+// These do the same byte-for-byte copies as kernel nodes, which schedule normally.
+void launch_capture_rows(const void* src, void* dst, int rows, int hidden, int dst_row_stride,
+                         cudaStream_t stream);
+
+void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaStream_t stream);
+
 } // namespace dflash_kernels
 } // namespace sparkinfer
