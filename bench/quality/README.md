@@ -43,7 +43,7 @@ python3 run_quality.py --backend mock    # ~0%  - floor
 # 2. score sparkinfer on a GPU box:
 python3 run_quality.py --backend sparkinfer \
     --model /workspace/models/Qwen3-30B-A3B-Q4_K_M.gguf \
-    --bin ./build/qwen3_gguf_generate \
+    --bin ./build/runtime/qwen3_gguf_generate \
     --tokenizer /workspace/models/tokenizer.json
 
 # 3. score the llama.cpp reference (start llama-server first, then):

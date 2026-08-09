@@ -14,7 +14,7 @@ Usage:
   # sparkinfer:
   python3 run_quality.py --backend sparkinfer \
       --model /workspace/models/Qwen3-30B-A3B-Q4_K_M.gguf \
-      --bin ./build/qwen3_gguf_generate --tokenizer /workspace/models/tokenizer.json
+      --bin ./build/runtime/qwen3_gguf_generate --tokenizer /workspace/models/tokenizer.json
 
   # llama.cpp reference:
   python3 run_quality.py --backend llama --llama-cli /workspace/.llamacpp/build/bin/llama-cli \
