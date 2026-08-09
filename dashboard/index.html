@@ -537,7 +537,6 @@
 
   const q36 = D.qwen36 || {};
   const q36ctx128 = (q36.ctx||[]).find(x=>x.label==="128");
-  const q36ctx512 = (q36.ctx||[]).find(x=>x.label==="512");
   const q36Lead = q36ctx128 && q36ctx128.ref_tps ? 100*(q36ctx128.tps - q36ctx128.ref_tps)/q36ctx128.ref_tps : null;
 
   const q35 = D.qwen35 || {};
@@ -588,8 +587,11 @@
     </div>` : "");
   }
 
-  const kpiTps = q36ctx512?.tps || q36.frontier_tps || s.frontier_tps;
-  const kpiRef = q36ctx512?.ref_tps || q36.ref_tps || s.ref_tps;
+  // KPI strip reports the scored 128-token frontier — the same number the SOTA card
+  // and SN74 scoring use — not the 512-context row, which published a second,
+  // disagreeing "frontier" and computed the vs-reference % on the wrong context.
+  const kpiTps = q36.frontier_tps || s.frontier_tps;
+  const kpiRef = q36.ref_tps || s.ref_tps;
   const kpiRefName = q36.ref_name || s.ref_name;
   const kpiTm = q36.token_match ?? s.token_match;
   const kpiKl = q36.kl ?? s.kl;
@@ -598,8 +600,8 @@
   const pct   = kpiRef > 0 ? 100*(kpiTps - kpiRef)/kpiRef : 0;
   const gapx  = kpiTps > 0 ? (kpiRef/kpiTps).toFixed(2) : "—";
   $("kpis").innerHTML = [
-    {lab:"Frontier decode", val:kpiTps, unit:"tok/s", note:"single-stream, bs=1 · 512-context · 128-tok · Qwen3.6-35B-A3B"},
-    {lab:(ahead?"vs ":"Gap to ")+kpiRefName, val:(ahead?"+"+pct.toFixed(1)+"%":gapx+"×"), unit:"", note:`${kpiRefName} ${kpiRef} tok/s · 512-context`},
+    {lab:"Frontier decode", val:kpiTps, unit:"tok/s", note:"single-stream, bs=1 · 128-tok frontier · Qwen3.6-35B-A3B"},
+    {lab:(ahead?"vs ":"Gap to ")+kpiRefName, val:(ahead?"+"+pct.toFixed(1)+"%":gapx+"×"), unit:"", note:`${kpiRefName} ${kpiRef} tok/s · 128-tok frontier`},
     {lab:"Accuracy", val:(kpiTm*100).toFixed(0)+"%", unit:"top-1", note:`KL ${kpiKl} vs ${kpiRefName}`},
     {lab:"VRAM resident", val:kpiVram, unit:"GB", note:"experts kept quantized"},
   ].map(k=>`<div class="kpi"><div class="lab">${k.lab}</div><div class="val">${k.val} <span>${k.unit}</span></div><div class="note">${k.note}</div></div>`).join("");
