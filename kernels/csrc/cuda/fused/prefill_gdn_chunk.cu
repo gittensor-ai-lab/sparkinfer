@@ -577,15 +577,29 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                          + (size_t)HD * (JC + PAD) * sizeof(__nv_bfloat16)      // s_Sb
                          + (size_t)C * (JC + PAD) * sizeof(__nv_bfloat16);      // s_Ub
 
-    static int cfg = 0;
-    if (!cfg) {
-        if (cudaFuncSetAttribute(pf_gdnc_prep_kernel<C, HD>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_prep) != cudaSuccess)
-            return false;
-        if (cudaFuncSetAttribute(pf_gdnc_scan_kernel<C, HD, JC>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_scan) != cudaSuccess)
-            return false;
-        cfg = 1;
+    // sm_scan is ~68 KB — past the 48 KB default — so the MaxDynamicSharedMemorySize
+    // opt-in is REQUIRED for the scan launch to be valid. A discarded failure here used
+    // to still return true; the caller (launch_prefill_gdn_scan) then skipped the
+    // sequential pf_gdn_scan_kernel fallback and left GDN state/out untouched — silently
+    // wrong recurrence into decode. cudaFuncSetAttribute is also PER-DEVICE, so the
+    // do-once latch is keyed on the device ordinal (a process-wide latch left every
+    // device but the first unconfigured).
+    constexpr int kMaxDevices = 16;
+    static int cfg[kMaxDevices] = {0};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDevices) return false;
+    if (!cfg[dev]) {
+        const cudaError_t ce_prep = cudaFuncSetAttribute(
+            pf_gdnc_prep_kernel<C, HD>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_prep);
+        if (ce_prep != cudaSuccess && sm_prep > 48u * 1024u) return false;
+        const cudaError_t ce_scan = cudaFuncSetAttribute(
+            pf_gdnc_scan_kernel<C, HD, JC>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_scan);
+        // Scan is the load-bearing raise (~68 KB); prep is under 48 KB on current shapes
+        // but check both when over the default so a refused opt-in falls through.
+        if (ce_scan != cudaSuccess && sm_scan > 48u * 1024u) return false;
+        cfg[dev] = 1;
     }
 
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
@@ -610,7 +624,10 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     dim3 gscan(v_heads, HD / JC);
     pf_gdnc_scan_kernel<C, HD, JC><<<gscan, SCAN_THREADS, sm_scan, stream>>>(
         qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob, n_tokens, q_heads, v_heads, n_chunks);
-    return true;
+    // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek —
+    // rather than get — so a pre-existing sticky error is not silently cleared here.
+    // Returning false lets the caller fall through to the sequential GDN scan.
+    return cudaPeekAtLastError() == cudaSuccess;
 }
 
 }  // namespace kernels
