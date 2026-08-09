@@ -1240,7 +1240,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* expert_w = a.alloc<float>((size_t)N * topk);
     float* router_logits = a.alloc<float>((size_t)N * E);
     float* moe_h = a.alloc<float>((size_t)N * topk * ffn);
-    float* moe_out = a.alloc<float>((size_t)N * H);
+    // out_scratch is not just the [N, H] fp32 output: launch_moe_expert_ffn_q4k also reuses it as
+    // the Q8_1 staging buffer for the SwiGLU hidden, which needs
+    // num_tokens * top_k * llama_q8_1_bytes(ffn) bytes. That kernel's "<= hidden floats; fits"
+    // reasoning holds only for num_tokens == 1; the batched verify calls it with N rows and
+    // overruns an [N, H] float buffer whenever 9*ffn > 4*H, silently corrupting the rows staged
+    // after the overflow point. Size for both uses.
+    const size_t moe_out_floats = std::max((size_t)N * H,
+        ((size_t)N * topk * kernels::llama_q8_1_bytes(ffn) + sizeof(float) - 1) / sizeof(float));
+    float* moe_out = a.alloc<float>(moe_out_floats);
     // Dedicated hidden scratch for the shared expert. It used to borrow moe_h, which is the one
     // thing that stopped the shared branch from running concurrently with the routed one.
     float* shared_h = a.alloc<float>((size_t)N * ffn);
@@ -1279,6 +1287,26 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local float* verify_head_scale = nullptr;
     static thread_local cudaEvent_t ev_fork = nullptr;
     static thread_local cudaEvent_t ev_join = nullptr;
+    // Width of the per-row MoE fan-out, counting the caller's stream. One row's MoE does not fill
+    // the GPU, so issuing the rows on their own streams runs several at once. The rows are
+    // independent (own input row, own expert slice, own scratch), so this changes only when the
+    // launches run, never what they compute. Dedicated streams -- stream_k carries the shared
+    // expert, which already overlaps the routed branch.
+    static const int kRowFanout = []{
+        const char* e = getenv("SPARKINFER_DFLASH_MOE_ROW_FANOUT");
+        int v = e ? atoi(e) : 3;
+        if (v < 1) v = 1;
+        if (v > 4) v = 4;
+        return v;
+    }();
+    static thread_local cudaStream_t row_stream[3] = {nullptr, nullptr, nullptr};
+    static thread_local cudaEvent_t row_fork_ev[3] = {nullptr, nullptr, nullptr};
+    static thread_local cudaEvent_t row_join_ev[3] = {nullptr, nullptr, nullptr};
+    for (int i = 0; i < kRowFanout - 1; ++i) if (!row_stream[i]) {
+        pf_cu(cudaStreamCreateWithFlags(&row_stream[i], cudaStreamNonBlocking), "verify row stream");
+        pf_cu(cudaEventCreateWithFlags(&row_fork_ev[i], cudaEventDisableTiming), "verify row fork ev");
+        pf_cu(cudaEventCreateWithFlags(&row_join_ev[i], cudaEventDisableTiming), "verify row join ev");
+    }
     // Off-critical-path stream for the shared expert. Empty stream_k means no overlap is possible.
     static const bool shared_stream_on = [] {
         const char* e = getenv("SPARKINFER_DFLASH_SHARED_STREAM");
@@ -1544,6 +1572,64 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                   N, E, H, st);
         kernels::launch_moe_router(router_logits, expert_ids, expert_w, nullptr,
                                    N, E, topk, 1, st);
+        // launch_moe_expert_ffn_q4k is not row-count invariant: called with num_tokens=N it returns
+        // different values for some rows than the num_tokens=1 call AR decode makes -- from
+        // identical input, identical Q8_1 activations, identical expert ids and identical expert
+        // weights (all verified bit-identical by byte hash). That is the batched-vs-AR numerical
+        // gap in #712. Driving it one row at a time reproduces AR's arithmetic exactly. This is an
+        // mmvq-style kernel that reads expert weights per (token, expert) pair either way, so the
+        // per-row loop costs launch overhead, not extra weight traffic.
+        // Default ON. Two kernels inside launch_moe_expert_ffn_q4k are tuned for the num_tokens=1
+        // decode call and are not row-count invariant (the MMVQ down projection and the 4-warp
+        // Q4_K mmvq gate/up), so a single batched call over N rows does not reproduce AR. Swapping
+        // in their row-invariant variants does not help either: those variants are not numerically
+        // equal to the defaults AR itself runs, so the verify would still disagree with AR. The
+        // only construction that is exact BY DEFINITION is to make the same call AR makes --
+        // num_tokens=1, default kernels -- once per row.
+        static const bool moe_rowwise = []{
+            const char* e = getenv("SPARKINFER_DFLASH_MOE_ROWWISE");
+            return !(e && e[0] == '0');
+        }();
+        // Scope: below kCompactMaxSeq this stays on the single batched call, which is what main
+        // already ships and what #720 certified 48/48 exact there -- the per-row error is real but
+        // never compounds far enough to flip an argmax over a short generation, and the row loop
+        // would cost ~5% for nothing. Above the bound it does compound, so exactness is required.
+        static const int kRowwiseMinSeq = []{
+            const char* e = getenv("SPARKINFER_DFLASH_MOE_ROWWISE_MINSEQ");
+            return e ? atoi(e) : 384;
+        }();
+        if (moe_rowwise && (start_pos + N) > kRowwiseMinSeq) {
+            // Give every row its own scratch slice. Sharing moe_h/moe_out across the loop makes the
+            // calls false-dependent, so they serialize and the row loop costs ~28% at 4k; sliced,
+            // they are genuinely independent and the captured graph can overlap them.
+            const size_t q81_row = kernels::llama_q8_1_bytes(H);
+            const size_t h_row   = (size_t)topk * ffn;
+            const size_t out_row = moe_out_floats / (size_t)N;
+            // The rows are independent (own input row, own expert slice, own scratch), but issued
+            // back to back on one stream they serialize, and one row's MoE does not fill the GPU.
+            // Fan them across a second stream so two rows are in flight at once. stream_v is idle
+            // here -- the shared expert has stream_k -- and this changes only when the launches
+            // run, never what they compute.
+            const int fan = std::min(kRowFanout, N);
+            for (int i = 0; i < fan - 1; ++i) {
+                pf_cu(cudaEventRecord(row_fork_ev[i], st), "verify moe row fork");
+                pf_cu(cudaStreamWaitEvent(row_stream[i], row_fork_ev[i], 0), "verify moe row fork wait");
+            }
+            for (int r = 0; r < N; ++r) {
+                const int slot = r % fan;
+                cudaStream_t rs = slot == 0 ? st : row_stream[slot - 1];
+                kernels::launch_moe_expert_ffn_q4k(hn + (size_t)r * H, w.gate_q, w.up_q, w.down_q,
+                    w.gate_qtype, w.up_qtype, w.down_qtype,
+                    expert_ids + (size_t)r * topk, expert_w + (size_t)r * topk,
+                    routed + (size_t)r * H, moe_h + (size_t)r * h_row,
+                    moe_out + (size_t)r * out_row, 1, topk, H, ffn,
+                    static_cast<const unsigned char*>(q81) + (size_t)r * q81_row, rs);
+            }
+            for (int i = 0; i < fan - 1; ++i) {
+                pf_cu(cudaEventRecord(row_join_ev[i], row_stream[i]), "verify moe row join");
+                pf_cu(cudaStreamWaitEvent(st, row_join_ev[i], 0), "verify moe row join wait");
+            }
+        } else
         kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
             w.gate_qtype, w.up_qtype, w.down_qtype, expert_ids, expert_w, routed,
             moe_h, moe_out, N, topk, H, ffn, q81, st);

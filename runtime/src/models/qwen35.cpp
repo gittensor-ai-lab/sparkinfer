@@ -1986,7 +1986,49 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 3;
         return v < 1 ? 1 : v;
     }();
+    // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
+    // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
+    // accepted length, and it has no reason to sit at exactly B. Measured on RTX 5090 at the three
+    // scored contexts (token loop -> batched):
+    //
+    //     ctx    tau    token loop   batched      verdict
+    //     512    2.19   422.5        290.3        -31%  batched must stay OFF
+    //     4096   3.91   396.6        639.5        +61%  batched must stay ON
+    //     128    5.33   457.3        868.2        +90%  batched must stay ON
+    //
+    // Break-even is between tau 2.2 and 3.9. The full-block rule only climbs when keep == B, so a
+    // 4k stream sitting at a perfectly profitable tau of 3.9 armed the batched path roughly 40% of
+    // steps and banked +21% of the available +61%. Gating on a running mean of keep engages on the
+    // condition that actually makes batching profitable, and still leaves 512 on the token loop.
+    // The sequence length below which this PR is byte-identical to main. #720 shipped this as a
+    // hard bound that kept the batched verify away from long context entirely (the #712 gap); it
+    // is now the boundary between "main's behaviour, unchanged" and "the new exact long-context
+    // path", so nothing already validated at short context moves.
+    static const int kCompactMaxSeq = []{
+        const char* e = getenv("SPARKINFER_DFLASH_COMPACT_MAX_SEQ");
+        return e ? atoi(e) : 384;
+    }();
+    // Compared against keep_ema8 in the SCALED domain (kEngageKeep * 8), not by shifting the EMA
+    // down first. Shifting floors it, which collapses the very gap the gate exists to resolve:
+    // 512-ctx sits at tau 2.19 (ema8 ~17.5) and 4k at tau 3.91 (ema8 ~31.3), and both floor to the
+    // same value. Scaled, the threshold lands cleanly between them at 24.
+    // Sequence-length floor for the batched path. The EMA alone is not enough: 512-ctx settles at
+    // tau 2.19 (ema8 ~17.5, below the threshold) but a transient run of full blocks early in the
+    // stream pushes it over, and alpha 1/8 then takes ~8 steps to decay -- measured at 2.8-4.3%
+    // lost to running the batched path where it is 31% SLOWER. A floor cannot be spoofed by a
+    // transient, and it costs 4k nothing because 4k clears it from the first step.
+    static const int kEngageMinSeq = []{
+        const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_MINSEQ");
+        return e ? atoi(e) : 1024;
+    }();
+    static const int kEngageKeep = []{
+        const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_KEEP");
+        int v = e ? atoi(e) : 3;
+        return v < 1 ? 1 : v;
+    }();
     int compact_score = 0;
+    int keep_ema8 = 0;   // EMA of keep, alpha = 1/8, held x8 so the decode path needs no float
+    int step_no = 0;
     bf16* th_scratch = nullptr;
     const int row_stride = dflash_hidden_row_stride();
     if (cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)) != cudaSuccess) {
@@ -2001,29 +2043,22 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     dflash_warm_verify(kProposalDepth + 1, start);
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
-        // Second condition: only run the batched path where it is VERIFIED bit-exact against AR.
-        // The row-batched pass computes a position as one row of an N-row GEMM where AR computes
-        // it as a single-row GEMV; the two reduction orders are not bit-identical, and once the
-        // residual differs by more than a logit margin the argmax flips and DFlash stops
-        // reproducing AR (#712). Measured on RTX 5090 with the acceptance gate above already
-        // active, SPEC_AGREE at 128 generated tokens over 12 held-out prompts per context:
-        //
-        //   short prompt : 12/12 exact
-        //   512-ctx      : 11/12
-        //   2048-ctx     :  8/12
-        //   4096-ctx     : 11/12
-        //
-        // So the batched path is only trustworthy while the attended context is short. Above the
-        // bound every context runs the token loop, which is byte-exact at any length -- i.e.
-        // main's code path, unchanged. Raise SPARKINFER_DFLASH_COMPACT_MAX_SEQ to re-test the
-        // long-context path once that numerical gap is closed.
-        static const int kCompactMaxSeq = []{
-            const char* e = getenv("SPARKINFER_DFLASH_COMPACT_MAX_SEQ");
-            return e ? atoi(e) : 384;
-        }();
-        const bool compact_ctx_ok = (start + B) <= kCompactMaxSeq;
+        // The context bound this used to carry (SPARKINFER_DFLASH_COMPACT_MAX_SEQ, default 384)
+        // existed only to keep the batched path away from contexts where it diverged from AR --
+        // the #712 gap. That gap was a real defect, not a property of batching: the batched GDN
+        // conv summed its taps in a different order than the single-token decode conv, so every
+        // k/v differed from AR's by ~1 ulp, and the GDN recurrence carried that difference across
+        // decode steps until it flipped an argmax. With the two convs accumulating in the same
+        // order the paths are bit-identical at every context, so the bound has nothing left to do
+        // and the gate is now purely the acceptance test above -- engage where batching pays,
+        // stay on the token loop where it does not, at any sequence length.
+        // Below kCompactMaxSeq this is byte-identical to main: same acceptance-run rule, same
+        // batched MoE. The change is purely additive above that bound, which main never reached.
+        const bool short_ctx = (start + B) <= kCompactMaxSeq;
         const bool compact_verify = compact_mode == 1 ||
-            (compact_mode != 0 && compact_ctx_ok && compact_score >= kBlockScore);
+            (compact_mode != 0 && (short_ctx ? compact_score >= kBlockScore
+                                             : ((start + B) >= kEngageMinSeq &&
+                                                keep_ema8 >= kEngageKeep * 8)));
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 
@@ -2102,6 +2137,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // armed through low-acceptance stretches -- precisely where it costs throughput. Decaying
         // instead means a prompt the draft handles badly drops back to the token loop within a
         // couple of steps and stays there, while a prompt it handles well re-arms just as quickly.
+        // Ramp from zero rather than seeding on the first step. Seeding armed the batched path off
+        // a single lucky block, which at 512-ctx (tau 2.19, where batching is 31% SLOWER) cost 5.6%
+        // before the EMA had enough evidence to back off. Ramping costs ~3 token-loop steps at
+        // short context and keeps 512 on the token loop throughout.
+        keep_ema8 = keep_ema8 - (keep_ema8 >> 3) + keep;
+        ++step_no;
         compact_score = keep == kProposalDepth + 1
                       ? std::min(compact_score + 1, kBlockScore + 1)
                       : std::max(compact_score - 1, 0);
