@@ -69,9 +69,17 @@ gpu_ready() {
   if [ "${EVAL_TRANSPORT:-vast}" = "ssh" ]; then
     local host="${EVAL_SSH_HOST:-}" port="${EVAL_SSH_PORT:-22}" user="${EVAL_SSH_USER:-root}"
     [ -n "$host" ] || return 1
-    ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=10 \
-        -o StrictHostKeyChecking=accept-new -p "$port" "$user@$host" 'true' 2>/dev/null
-    return $?
+    # ConnectTimeout=20 (was 10): the hourly tick lands at :00 alongside three separate */15
+    # dashboard-sync crons that also fire then, all doing their own network I/O at the same
+    # instant — plausible enough contention to blow a tight 10s budget. Capture+print stderr on
+    # failure (was silently discarded) so a future flaky tick actually leaves a diagnosable
+    # trace in the log instead of just "down — labels only" with no reason.
+    local err rc
+    err="$(ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=20 \
+        -o StrictHostKeyChecking=accept-new -p "$port" "$user@$host" 'true' 2>&1)"
+    rc=$?
+    [ "$rc" -eq 0 ] || echo "gpu_ready: ssh to $user@$host:$port failed (exit=$rc): $err" >&2
+    return "$rc"
   fi
   local iid="${VAST_INSTANCE:-}"
   [ -n "$iid" ] && [ "$iid" != "0" ] || return 1
@@ -92,11 +100,18 @@ print(st, ip, p)
       -o StrictHostKeyChecking=accept-new -p "$port" "root@$ip" 'true' 2>/dev/null
 }
 
+# Cosmetic-only: VAST_INSTANCE is unconditionally set from .env.eval's legacy vast.ai section
+# even in EVAL_TRANSPORT=ssh mode (never cleared), so it was showing "pinned GPU 46396637" in
+# every ssh-mode log line regardless of the real target — misleading when debugging. Report the
+# actual target being checked instead.
+GPU_LABEL="${EVAL_SSH_HOST:-ssh}"
+[ "${EVAL_TRANSPORT:-vast}" = "ssh" ] || GPU_LABEL="${VAST_INSTANCE:-?}"
+
 TS="$(date -u +%FT%TZ)"
 if gpu_ready; then
-  echo "[$TS] sparkinfer DFlash bot — pinned GPU ${VAST_INSTANCE:-ssh} up — full eval (AUTOMERGE=${SPARKINFER_AUTOMERGE})"
+  echo "[$TS] sparkinfer DFlash bot — pinned GPU $GPU_LABEL up — full eval (AUTOMERGE=${SPARKINFER_AUTOMERGE})"
   python3 eval/pr_dflash_bot.py "${BOT_ARGS[@]}"
 else
-  echo "[$TS] sparkinfer DFlash bot — pinned GPU ${VAST_INSTANCE:-?} down — labels only"
+  echo "[$TS] sparkinfer DFlash bot — pinned GPU $GPU_LABEL down — labels only"
   python3 eval/pr_dflash_bot.py "${BOT_ARGS[@]}" --labels-only
 fi
