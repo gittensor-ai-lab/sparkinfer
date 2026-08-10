@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
 
     auto rt = sparkinfer::Runtime::create({}); rt->initialize();
     sparkinfer::KVCacheConfig kvc;
-    kvc.num_layers = cfg.n_layers; kvc.num_kv_heads = cfg.n_kv_heads; kvc.head_dim = cfg.head_dim; kvc.block_size = 16;
+    kvc.num_layers = sparkinfer::qwen35_kv_layer_count(cfg); kvc.num_kv_heads = cfg.n_kv_heads; kvc.head_dim = cfg.head_dim; kvc.block_size = 16;
     // int8 KV default mirrors the SHIPPED config, so scoring reflects what actually runs:
     //   non-hybrid (Qwen3-MoE, hd128) always ships int8 KV -> default int8.
     //   hybrid (Qwen3.6/Qwythos, hd256) ships int8 KV at ctx >= 4096 (bench.cpp:130,
@@ -70,7 +70,7 @@ int main(int argc, char** argv) {
       kvc.int8_kv = e ? (e[0] != '0') : (cfg.hybrid ? ((argc - 3) >= 4096) : true); }
     const size_t epb = (size_t)16 * cfg.n_kv_heads * cfg.head_dim;
     const size_t blocks = (cfg.max_seq + 15) / 16 + 8;
-    sparkinfer::KVCacheManager kv(kvc, (size_t)cfg.n_layers * 2 * epb * 2 * blocks);
+    sparkinfer::KVCacheManager kv(kvc, (size_t)sparkinfer::qwen35_kv_layer_count(cfg) * 2 * epb * 2 * blocks);
     sparkinfer::moe::MoEConfig mc;
     mc.num_experts = cfg.n_experts; mc.top_k = cfg.top_k; mc.hidden_dim = cfg.hidden;
     mc.ffn_dim = cfg.moe_ffn; mc.num_layers = cfg.n_layers;

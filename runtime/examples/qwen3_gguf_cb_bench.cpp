@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
     rt->initialize();
 
     sparkinfer::KVCacheConfig kvc;
-    kvc.num_layers = cfg.n_layers;
+    kvc.num_layers = sparkinfer::qwen35_kv_layer_count(cfg);
     kvc.num_kv_heads = cfg.n_kv_heads;
     kvc.head_dim = cfg.head_dim;
     kvc.block_size = 16;
@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
     const size_t epb = (size_t)16 * cfg.n_kv_heads * cfg.head_dim;
     // Pool for concurrency streams + one long prefill.
     const size_t blocks = (size_t)(concurrency + 1) * ((cfg.max_seq + 15) / 16 + 4);
-    sparkinfer::KVCacheManager kv(kvc, (size_t)cfg.n_layers * 2 * epb * 2 * blocks);
+    sparkinfer::KVCacheManager kv(kvc, (size_t)sparkinfer::qwen35_kv_layer_count(cfg) * 2 * epb * 2 * blocks);
 
     sparkinfer::moe::MoEConfig mc;
     mc.num_experts = cfg.n_experts;

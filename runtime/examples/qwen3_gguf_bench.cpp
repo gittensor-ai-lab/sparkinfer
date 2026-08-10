@@ -122,7 +122,7 @@ static bool init_session(BenchSession& s, const std::string& path, int max_ctx, 
     s.rt = sparkinfer::Runtime::create({});
     s.rt->initialize();
     sparkinfer::KVCacheConfig kvc;
-    kvc.num_layers = s.cfg.n_layers;
+    kvc.num_layers = sparkinfer::qwen35_kv_layer_count(s.cfg);
     kvc.num_kv_heads = s.cfg.n_kv_heads;
     kvc.head_dim = s.cfg.head_dim;
     kvc.block_size = 16;
@@ -131,7 +131,7 @@ static bool init_session(BenchSession& s, const std::string& path, int max_ctx, 
     const size_t epb = (size_t)16 * s.cfg.n_kv_heads * s.cfg.head_dim;
     const size_t blocks = (s.cfg.max_seq + 15) / 16 + 8;
     s.kv = std::make_unique<sparkinfer::KVCacheManager>(
-        kvc, (size_t)s.cfg.n_layers * 2 * epb * 2 * blocks);
+        kvc, (size_t)sparkinfer::qwen35_kv_layer_count(s.cfg) * 2 * epb * 2 * blocks);
     sparkinfer::moe::MoEConfig mc;
     mc.num_experts = s.cfg.n_experts; mc.top_k = s.cfg.top_k;
     mc.hidden_dim = s.cfg.hidden; mc.ffn_dim = s.cfg.moe_ffn;

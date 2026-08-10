@@ -948,10 +948,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // ---- QK-norm + RoPE + KV-append ----
             const bool kv8 = s.kv->int8_kv();
             const int kv_elem = kv8 ? 1 : 2;
-            void* kpool = (char*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-            void* vpool = (char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-            void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
-            void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+            void* kpool = (char*)s.kv->k_pool() + (size_t)qwen35_kv_slot(c, L) * s.kv->layer_stride_elems() * kv_elem;
+            void* vpool = (char*)s.kv->v_pool() + (size_t)qwen35_kv_slot(c, L) * s.kv->layer_stride_elems() * kv_elem;
+            void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)qwen35_kv_slot(c, L) * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+            void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)qwen35_kv_slot(c, L) * s.kv->scale_layer_stride_elems() * 2 : nullptr;
             const bool partial_rope = (c.rope_dim > 0 && c.rope_dim < c.head_dim);
             const bool qkgate_fuse = w.q_has_gate && partial_rope && kv8 && s.use_qkfuse && H == 2048;
             if (w.q_has_gate && !qkgate_fuse)

@@ -580,10 +580,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             proj(xn, w.wk, w.wk_type, kf, kvdim, H);
             proj(xn, w.wv, w.wv_type, vf, kvdim, H);
             kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
-            signed char* kpool = (signed char*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-            signed char* vpool = (signed char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-            void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
-            void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+            signed char* kpool = (signed char*)s.kv->k_pool() + (size_t)qwen35_kv_slot(c, L) * s.kv->layer_stride_elems() * kv_elem;
+            signed char* vpool = (signed char*)s.kv->v_pool() + (size_t)qwen35_kv_slot(c, L) * s.kv->layer_stride_elems() * kv_elem;
+            void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)qwen35_kv_slot(c, L) * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+            void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)qwen35_kv_slot(c, L) * s.kv->scale_layer_stride_elems() * 2 : nullptr;
             if (!kv8) { a.free_all(); a8.free_all(); am.free_all(); aw.free_all(); fprintf(stderr, "[prefill] batched prefill requires int8 KV\n"); return -1; }
             kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
                 kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
@@ -1498,13 +1498,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }
             if (!supported || !w.q_has_gate) break;
             char* kp = static_cast<char*>(s.kv->k_pool()) +
-                       (size_t)L * s.kv->layer_stride_elems() * kv_elem;
+                       (size_t)qwen35_kv_slot(c, L) * s.kv->layer_stride_elems() * kv_elem;
             char* vp = static_cast<char*>(s.kv->v_pool()) +
-                       (size_t)L * s.kv->layer_stride_elems() * kv_elem;
+                       (size_t)qwen35_kv_slot(c, L) * s.kv->layer_stride_elems() * kv_elem;
             char* ks = kv8 ? static_cast<char*>(s.kv->k_scale_pool()) +
-                             (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+                             (size_t)qwen35_kv_slot(c, L) * s.kv->scale_layer_stride_elems() * 2 : nullptr;
             char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
-                             (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+                             (size_t)qwen35_kv_slot(c, L) * s.kv->scale_layer_stride_elems() * 2 : nullptr;
             if (kv8) {
                 kernels::launch_dflash_qknorm_rope_kv_partial_int8_gated(
                     b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btable, pos,

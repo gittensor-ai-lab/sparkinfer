@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
     cfg.max_seq = 2048;
 
     sparkinfer::KVCacheConfig kvc;
-    kvc.num_layers = cfg.n_layers; kvc.num_kv_heads = cfg.n_kv_heads;
+    kvc.num_layers = sparkinfer::qwen35_kv_layer_count(cfg); kvc.num_kv_heads = cfg.n_kv_heads;
     kvc.head_dim = cfg.head_dim; kvc.block_size = 16;
     sparkinfer::KVCacheManager kv(kvc, 512ull * 1024 * 1024);
 

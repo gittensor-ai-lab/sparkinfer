@@ -52,4 +52,34 @@ struct Qwen35Config {
     float logit_scale = 1.f;              // 1 = no-op
 };
 
+// ---- paged-KV layer mapping ----
+//
+// Only full-attention layers own paged-KV storage. The hybrid stack interleaves Gated-DeltaNet
+// layers, which carry their history in the recurrent state (lin_state / lin_conv_state) and never
+// read or write the KV pool -- every k_pool()/v_pool() dereference in the decode and prefill paths
+// sits inside the full-attention branch. Indexing the pool by the FULL layer index therefore
+// reserves a sub-pool for each GDN layer that nothing ever touches: at full_attn_interval = 4 that
+// is three quarters of the allocation. On a 40-layer Qwen3.6 at a 32k context it is 10.81 GB where
+// 2.70 GB is used, which together with the ~21 GB of weights overruns a 32 GB card and fails the
+// KV allocation outright.
+//
+// These map a model layer to a compact KV slot. For a non-hybrid stack every layer owns KV, so the
+// mapping is the identity and nothing changes.
+inline bool qwen35_layer_uses_kv(const Qwen35Config& c, int layer) {
+    return !(c.hybrid && c.full_attn_interval > 0 && ((layer + 1) % c.full_attn_interval) != 0);
+}
+
+// Compact pool index for a full-attention layer (undefined for GDN layers, which never index it).
+inline int qwen35_kv_slot(const Qwen35Config& c, int layer) {
+    if (!(c.hybrid && c.full_attn_interval > 0)) return layer;
+    return (layer + 1) / c.full_attn_interval - 1;
+}
+
+// Number of layers that need a KV sub-pool. Callers size KVCacheConfig::num_layers and the pool
+// budget with this rather than n_layers.
+inline int qwen35_kv_layer_count(const Qwen35Config& c) {
+    if (!(c.hybrid && c.full_attn_interval > 0)) return c.n_layers;
+    return c.n_layers / c.full_attn_interval;
+}
+
 } // namespace sparkinfer
