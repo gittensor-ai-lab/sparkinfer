@@ -68,6 +68,10 @@ int main(int argc, char** argv) {
     if (!model.load_gguf(gguf)) { printf("[FAIL] load_gguf\n"); return 1; }
 
     sparkinfer::DFlashDraftConfig dcfg;
+    // Size the draft KV cache to the requested context (see qwen3_gguf_dflash_bench.cpp): the
+    // default max_seq=8192 otherwise makes draft.forward_block() bail out past 8k, so the accuracy
+    // check at longer contexts (16k sweep) sees a lossy/zero-throughput result instead of a match.
+    dcfg.max_seq = cfg.max_seq;
     sparkinfer::DFlashDraftModel draft(dcfg);
     if (!draft.load(draft_dir)) { printf("[FAIL] load draft %s\n", draft_dir.c_str()); return 1; }
     model.set_dflash_draft(&draft);

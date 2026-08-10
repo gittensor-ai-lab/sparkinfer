@@ -73,6 +73,11 @@ int main(int argc, char** argv) {
     if (!model.load_gguf(gguf)) { printf("[FAIL] load_gguf\n"); return 1; }
 
     sparkinfer::DFlashDraftConfig dcfg;
+    // Size the draft KV cache to the requested context. Without this the draft keeps its default
+    // max_seq=8192, so draft.forward_block() bails out past 8k and DFlash silently degrades to a
+    // lossy/zero-throughput fallback at longer contexts (e.g. the 16k eval sweep). The draft model
+    // itself supports up to max_position_embeddings (262144); the target is sized the same way above.
+    dcfg.max_seq = cfg.max_seq;
     sparkinfer::DFlashDraftModel draft(dcfg);
     if (!draft.load(draft_dir)) { printf("[FAIL] draft load\n"); return 1; }
     model.set_dflash_draft(&draft);
