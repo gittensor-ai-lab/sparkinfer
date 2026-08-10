@@ -13,6 +13,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <climits>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
 #endif
@@ -92,7 +93,12 @@ __global__ void fa_split_kernel(
 // all GQA warps reuse it. For Qwen's 8:1 GQA this cuts long-context KV global
 // reads in the split pass by up to 8x while preserving the same per-q-head
 // partials consumed by the existing combine kernel.
-template <int HEAD_DIM, int GQA, int TILE, bool INT8>
+// SEQ is how many verify rows one CTA answers. The K/V tile is staged in shared memory once per
+// CTA, so at SEQ=1 (decode, and the shipped verify) every row re-streams the whole KV: measured at
+// 4k, one launch costs 6.3 + 7.83*rows us, i.e. 88% of it is per-row at 6 rows. Folding S rows into
+// a CTA divides the KV traffic by S; the cost is S extra accumulators per thread, which is why the
+// fold has to stay narrow.
+template <int HEAD_DIM, int GQA, int TILE, bool INT8, int SEQ = 1>
 __global__ void fa_split_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pool,
     const void* __restrict__ v_pool, const int* __restrict__ block_table,
@@ -102,26 +108,45 @@ __global__ void fa_split_gqa_kernel(
     const __half* __restrict__ k_scale, const __half* __restrict__ v_scale
 ) {
     constexpr int ELEMS = HEAD_DIM / 32;
-    const int seq   = blockIdx.y;
+    const int seq0  = blockIdx.y * SEQ;
     const int split = blockIdx.x % n_splits;
     const int kvh   = blockIdx.x / n_splits;
     const int warp  = threadIdx.x >> 5;
     const int lane  = threadIdx.x & 31;
     const int qh    = kvh * GQA + warp;
 
-    float qr[ELEMS];
-    const __nv_bfloat16* qp = q + (size_t)(seq * num_q_heads + qh) * HEAD_DIM;
+    float qr[SEQ][ELEMS];
     #pragma unroll
-    for (int e = 0; e < ELEMS; e++) qr[e] = fa_to_f(qp[lane + e * 32]);
+    for (int v = 0; v < SEQ; v++) {
+        const __nv_bfloat16* qp = q + (size_t)((seq0 + v) * num_q_heads + qh) * HEAD_DIM;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) qr[v][e] = fa_to_f(qp[lane + e * 32]);
+    }
 
-    const int sl    = seq_lens[seq];
-    const int chunk = (sl + n_splits - 1) / n_splits;
-    const int start = split * chunk;
-    const int end   = min(sl, start + chunk);
-
-    float m = -1e30f, l = 0.f, acc[ELEMS];
+    // The folded rows differ in length (a verify block's row i ends at start_pos+i+1), so each row
+    // keeps its OWN chunk/start/end -- exactly the range the SEQ=1 kernel would give it. The CTA
+    // stages the union of those ranges (they differ by at most a token or two) and each row masks
+    // itself back to its own bounds, so every row accumulates the same keys in the same order as
+    // before: the fold is bit-exact by construction, not by luck.
+    int row_start[SEQ], row_end[SEQ];
+    int start = INT_MAX, end = 0;
     #pragma unroll
-    for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
+    for (int v = 0; v < SEQ; v++) {
+        const int slv = seq_lens[seq0 + v];
+        const int ch  = (slv + n_splits - 1) / n_splits;
+        row_start[v] = split * ch;
+        row_end[v]   = min(slv, row_start[v] + ch);
+        if (row_end[v] > row_start[v]) { start = min(start, row_start[v]); end = max(end, row_end[v]); }
+    }
+    if (start == INT_MAX) start = end = 0;
+
+    float m[SEQ], l[SEQ], acc[SEQ][ELEMS];
+    #pragma unroll
+    for (int v = 0; v < SEQ; v++) {
+        m[v] = -1e30f; l[v] = 0.f;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) acc[v][e] = 0.f;
+    }
 
     extern __shared__ __nv_bfloat16 s_kv[];
     __nv_bfloat16* s_k = s_kv;
@@ -136,7 +161,10 @@ __global__ void fa_split_gqa_kernel(
         if ((int)threadIdx.x < valid) {
             const int t = t0 + threadIdx.x;
             const int blk = t / block_size, wb = t % block_size;
-            const int phys = block_table[seq * max_blocks + blk];
+            // One staged tile serves every folded row, so the fold requires the rows to share a
+            // block table. The verify replicates one table across its rows (launch_broadcast_rows_i32),
+            // which is the only caller that folds.
+            const int phys = block_table[seq0 * max_blocks + blk];
             const size_t tokrow = (size_t)(phys * block_size + wb) * num_kv_heads + kvh;
             s_rowbase[threadIdx.x] = tokrow * HEAD_DIM;
             if constexpr (INT8) { s_ksc[threadIdx.x] = __half2float(k_scale[tokrow]); s_vsc[threadIdx.x] = __half2float(v_scale[tokrow]); }
@@ -174,23 +202,38 @@ __global__ void fa_split_gqa_kernel(
         }
         __syncthreads();
         for (int tt = 0; tt < valid; tt++) {
-            float p = 0.f;
+            // One shared-memory K/V read serves every folded row.
+            float kv_k[ELEMS], kv_v[ELEMS];
             #pragma unroll
-            for (int e = 0; e < ELEMS; e++) p += qr[e] * fa_to_f(s_k[tt * HEAD_DIM + lane + e * 32]);
-            const float score = fa_wsum(p) * scale;
-            const float mn = fmaxf(m, score), corr = __expf(m - mn), pe = __expf(score - mn);
-            l = l * corr + pe;
+            for (int e = 0; e < ELEMS; e++) {
+                kv_k[e] = fa_to_f(s_k[tt * HEAD_DIM + lane + e * 32]);
+                kv_v[e] = fa_to_f(s_v[tt * HEAD_DIM + lane + e * 32]);
+            }
+            const int gtok = t0 + tt;
             #pragma unroll
-            for (int e = 0; e < ELEMS; e++) acc[e] = acc[e] * corr + pe * fa_to_f(s_v[tt * HEAD_DIM + lane + e * 32]);
-            m = mn;
+            for (int v = 0; v < SEQ; v++) {
+                if (gtok < row_start[v] || gtok >= row_end[v]) continue;   // this row's own range
+                float p = 0.f;
+                #pragma unroll
+                for (int e = 0; e < ELEMS; e++) p += qr[v][e] * kv_k[e];
+                const float score = fa_wsum(p) * scale;
+                const float mn = fmaxf(m[v], score), corr = __expf(m[v] - mn), pe = __expf(score - mn);
+                l[v] = l[v] * corr + pe;
+                #pragma unroll
+                for (int e = 0; e < ELEMS; e++) acc[v][e] = acc[v][e] * corr + pe * kv_v[e];
+                m[v] = mn;
+            }
         }
         __syncthreads();
     }
 
-    const int idx = (seq * num_q_heads + qh) * n_splits + split;
-    if (lane == 0) { part_m[idx] = m; part_l[idx] = l; }
     #pragma unroll
-    for (int e = 0; e < ELEMS; e++) part_acc[(size_t)idx * HEAD_DIM + lane + e * 32] = acc[e];
+    for (int v = 0; v < SEQ; v++) {
+        const int idx = ((seq0 + v) * num_q_heads + qh) * n_splits + split;
+        if (lane == 0) { part_m[idx] = m[v]; part_l[idx] = l[v]; }
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) part_acc[(size_t)idx * HEAD_DIM + lane + e * 32] = acc[v][e];
+    }
 }
 
 // llama Q8_1 activation block (matches si_block_q8_1 used by the int8 MMVQ O-projection).
@@ -789,6 +832,36 @@ void launch_flash_decode_split(
                     reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
                     part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
                     reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                combine_hd256(out_q8);
+                (void)seqlen;
+                return;
+            }
+            // Fold S verify rows into one CTA so the staged K/V tile is read once for all of them
+            // instead of once per row. Only when S divides num_seqs exactly, so no row is padded.
+            static int seqfold = -1;
+            // 3 measured best on RTX 5090 (32k: 459.1 -> 497.0 tok/s). The fold is limited by the
+            // extra per-row accumulators it keeps live: 2 and 3 are within noise of each other in
+            // isolation (951.6 vs 943.8 us at 32k) while 6 regresses to 1548.0 us, worse than not
+            // folding at all. SPARKINFER_FA_SEQFOLD=1 restores one row per CTA.
+            if (seqfold < 0) { const char* e = getenv("SPARKINFER_FA_SEQFOLD"); seqfold = e ? atoi(e) : 3; }
+            if (!int8_kv && seqfold > 1 && num_seqs > 1 && (num_seqs % seqfold) == 0) {
+                const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
+                dim3 gqf(num_kv_heads * n_splits, num_seqs / seqfold);
+                if (seqfold == 2)
+                    fa_split_gqa_kernel<256, GQA, TILE, false, 2><<<gqf, GQA * 32, smem, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,
+                        n_splits, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                else if (seqfold == 3)
+                    fa_split_gqa_kernel<256, GQA, TILE, false, 3><<<gqf, GQA * 32, smem, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,
+                        n_splits, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                else
+                    fa_split_gqa_kernel<256, GQA, TILE, false, 6><<<gqf, GQA * 32, smem, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,
+                        n_splits, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
                 combine_hd256(out_q8);
                 (void)seqlen;
                 return;
