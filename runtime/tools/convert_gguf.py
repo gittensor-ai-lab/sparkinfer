@@ -54,10 +54,12 @@ def main():
         rms_eps=float(meta(A + "attention.layer_norm_rms_epsilon")),
         eos_id=int(meta("tokenizer.ggml.eos_token_id") or 151645),
     )
-    # vocab from token_embd if metadata missing
+    # Prefer embedding-tensor vocab over metadata (matches C++ emb->dims[1]).
     ten = {t.name: t for t in r.tensors}
     if "token_embd.weight" in ten:
-        cfg["vocab"] = int(ten["token_embd.weight"].shape[-1]) if False else cfg["vocab"]
+        shape = ten["token_embd.weight"].shape
+        if len(shape) >= 2:
+            cfg["vocab"] = int(shape[1])
 
     with open(os.path.join(out, "config.txt"), "w") as f:
         for k, v in cfg.items():
