@@ -257,7 +257,7 @@ template <int ROWS, int NWARPS>
 __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
     float* __restrict__ p_m, float* __restrict__ p_l, float* __restrict__ p_acc,
-    int q_len, int kv_len, int n_q, int n_kv,
+    int q_len, int kv_lo, int kv_len, int n_q, int n_kv,
     int q_pos0, int k_pos0, int window, bool causal, float scale, int n_splits) {
     constexpr int D = 128, E = D / 32;
     const int rg = blockIdx.x, qh = blockIdx.y, sp = blockIdx.z;
@@ -277,8 +277,11 @@ __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
         sum[r] = 0.f;
     }
 
-    const int chunk = (kv_len + n_splits - 1) / n_splits;
-    const int t0 = sp * chunk;
+    // Partition [kv_lo, kv_len) rather than [0, kv_len): keys below kv_lo are masked out for every
+    // row of the block (the caller derives kv_lo from the same window predicate this loop applies),
+    // so covering them only buys a K load and a QK dot that are thrown away.
+    const int chunk = (kv_len - kv_lo + n_splits - 1) / n_splits;
+    const int t0 = kv_lo + sp * chunk;
     const int t1 = min(kv_len, t0 + chunk);
 
     for (int t = t0 + warp; t < t1; t += NWARPS) {
@@ -1195,12 +1198,32 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
         if (kSplitAttn && fa_m && fa_l && fa_acc && n_kv > 0 && (n_q % n_kv) == 0 &&
             q_len <= kDFlashAttnMaxRows && kv_len >= kDFlashAttnMinKv) {
             constexpr int ROWS = 2, NWARPS = 8;
-            const int n_splits = attn_gqa_splits(kv_len);
+            const int n_splits_full = attn_gqa_splits(kv_len);
+            // A sliding-window layer masks a key only after the kernel has loaded it and reduced
+            // its QK dot, so past the window length it streams the whole cache to discard most of
+            // it -- at a 16k context with a 4096 window that is 3/4 of the traffic on every
+            // windowed layer. The kernel's own predicate is (q_pos - k_pos) >= window, and the
+            // block's smallest query position is q_pos0, so every key at or below
+            // q_pos0 - k_pos0 - window is dead for the whole block: start the partition above it.
+            static const int kWinSpan = []{ const char* e = getenv("SPARKINFER_DFLASH_WINSPAN");
+                                            return (e && e[0] == '0') ? 0 : 1; }();
+            // Narrow only when at least one whole split's worth of keys goes away: while the window
+            // still covers the cache this would trim a handful of keys, and re-partitioning the key
+            // range changes the order the online-softmax partials merge in -- not worth spending
+            // the draft's acceptance on for no traffic saved. The kv_len bound is belt-and-braces;
+            // the newest key is always inside the window, so lo < kv_len holds for any window >= 1.
+            int kv_lo = 0;
+            if (kWinSpan && window > 0) {
+                const long lo = (long)q_pos0 - (long)k_pos0 - (long)window + 1;
+                if (lo >= (kv_len + n_splits_full - 1) / n_splits_full && lo < (long)kv_len)
+                    kv_lo = (int)lo;
+            }
+            const int n_splits = kv_lo > 0 ? attn_gqa_splits(kv_len - kv_lo) : n_splits_full;
             const size_t smem = (size_t)(2 * NWARPS * ROWS + NWARPS * ROWS * 128) * sizeof(float);
             dim3 g((q_len + ROWS - 1) / ROWS, n_q, n_splits);
             k_attn_rows_split_hd128<ROWS, NWARPS><<<g, NWARPS * 32, smem, stream>>>(
                 (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc,
-                q_len, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale, n_splits);
+                q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale, n_splits);
             k_attn_split_combine<<<dim3(q_len, n_q), 128, 0, stream>>>(
                 fa_m, fa_l, fa_acc, (bf16*)out, n_q, n_splits);
             return;
