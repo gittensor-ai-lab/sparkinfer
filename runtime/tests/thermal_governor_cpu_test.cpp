@@ -38,6 +38,34 @@ int main() {
     CHECK(std::string(G::mode_name(G::Mode::Turbo))     == "turbo");
     CHECK(std::string(G::mode_name(G::Mode::Emergency)) == "emergency");
 
+    // Downgrade hysteresis: default config has hysteresis_c=3 (balanced=65, safe=70, emergency=80).
+    {
+        // Heating up is always immediate, regardless of the previous mode or hysteresis.
+        CHECK(G::classify(c, 70, G::Mode::Turbo)    == G::Mode::Safe);
+        CHECK(G::classify(c, 80, G::Mode::Balanced) == G::Mode::Emergency);
+
+        // Cooling from Safe (entry 70): must drop below 70-3=67 to downgrade. A dip to 68 or 69
+        // (still >= 67) stays in Safe instead of flapping back to Balanced.
+        CHECK(G::classify(c, 69, G::Mode::Safe) == G::Mode::Safe);
+        CHECK(G::classify(c, 68, G::Mode::Safe) == G::Mode::Safe);
+        CHECK(G::classify(c, 67, G::Mode::Safe) == G::Mode::Safe);   // boundary: not yet below
+        CHECK(G::classify(c, 66, G::Mode::Safe) == G::Mode::Balanced);
+
+        // Cooling from Emergency (entry 80): stays Emergency until below 80-3=77, then jumps
+        // straight to whatever tier the temperature naturally lands in.
+        CHECK(G::classify(c, 78, G::Mode::Emergency) == G::Mode::Emergency);
+        CHECK(G::classify(c, 76, G::Mode::Emergency) == G::Mode::Safe);
+        CHECK(G::classify(c, 50, G::Mode::Emergency) == G::Mode::Turbo);
+
+        // Unchanged temperature (natural == prev) is a no-op, not treated as heating or cooling.
+        CHECK(G::classify(c, 72, G::Mode::Safe) == G::Mode::Safe);
+
+        // hysteresis_c = 0 restores the legacy, state-free, symmetric behavior.
+        G::Config c0 = c; c0.hysteresis_c = 0;
+        CHECK(G::classify(c0, 69, G::Mode::Safe) == G::Mode::Balanced);
+        CHECK(G::classify(c0, 66, G::Mode::Safe) == G::Mode::Balanced);
+    }
+
     printf("thermal_governor_cpu_test: OK\n");
     return 0;
 }

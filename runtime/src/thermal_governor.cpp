@@ -8,6 +8,7 @@
 #include <chrono>
 #include <thread>
 #include <cstdio>
+#include <climits>
 
 namespace sparkinfer {
 
@@ -27,11 +28,34 @@ const char* ThermalGovernor::mode_name(Mode m) {
     return "?";
 }
 
-ThermalGovernor::Mode ThermalGovernor::classify(const Config& c, int temp_c) {
-    if (temp_c >= c.emergency_c) return Mode::Emergency;
-    if (temp_c >= c.safe_c)      return Mode::Safe;
-    if (temp_c >= c.balanced_c)  return Mode::Balanced;
-    return Mode::Turbo;
+namespace {
+// Tier rank for ordering comparisons (Turbo < Balanced < Safe < Emergency); matches enum order.
+inline int mode_rank(ThermalGovernor::Mode m) { return static_cast<int>(m); }
+
+// The temperature a mode was entered at (its lower threshold); Turbo has none (bottom tier).
+int mode_entry_threshold(const ThermalGovernor::Config& c, ThermalGovernor::Mode m) {
+    switch (m) {
+        case ThermalGovernor::Mode::Balanced:  return c.balanced_c;
+        case ThermalGovernor::Mode::Safe:      return c.safe_c;
+        case ThermalGovernor::Mode::Emergency: return c.emergency_c;
+        default:                               return INT_MIN;
+    }
+}
+}  // namespace
+
+ThermalGovernor::Mode ThermalGovernor::classify(const Config& c, int temp_c, Mode prev_mode) {
+    Mode natural = Mode::Turbo;
+    if (temp_c >= c.emergency_c) natural = Mode::Emergency;
+    else if (temp_c >= c.safe_c) natural = Mode::Safe;
+    else if (temp_c >= c.balanced_c) natural = Mode::Balanced;
+
+    // Heating (or unchanged) always applies immediately — never delay a safety upgrade.
+    if (c.hysteresis_c <= 0 || mode_rank(natural) >= mode_rank(prev_mode)) return natural;
+
+    // Cooling: stay in the current (hotter) tier until temp drops hysteresis_c below the tier's
+    // own entry threshold, so a brief dip right at the boundary doesn't flap the pace back up.
+    if (temp_c < mode_entry_threshold(c, prev_mode) - c.hysteresis_c) return natural;
+    return prev_mode;
 }
 
 static double pace_ms_for(const ThermalGovernor::Config& c, ThermalGovernor::Mode m) {
@@ -73,7 +97,7 @@ double ThermalGovernor::pace() {
         // Predictive: tier on max(measured, projected) so a fast rise throttles before crossing.
         if (cfg_.predict_horizon_ms > 0 && slope_ > 0.0)
             eff = last_temp_ + (int)(slope_ * cfg_.predict_horizon_ms / 1000.0);
-        mode_ = classify(cfg_, eff);
+        mode_ = classify(cfg_, eff, mode_);
     }
     const double ms = pace_ms_for(cfg_, mode_);
 

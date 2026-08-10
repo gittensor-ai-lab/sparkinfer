@@ -40,6 +40,14 @@ public:
         // tier on the projection, so we throttle BEFORE crossing a threshold. 0 = pure reactive.
         int predict_horizon_ms = 1500;
 
+        // Downgrade hysteresis (°C): stepping UP a tier (getting hotter) is always immediate —
+        // safety-first. Stepping DOWN a tier (cooling off) requires the effective temperature to
+        // fall this many degrees below the CURRENT tier's entry threshold first. Without this, a
+        // temperature hovering right at a boundary (e.g. 69.6 <-> 70.1 °C around `safe_c=70`)
+        // flips the mode — and the inter-token pace — every sample, producing visibly jittery
+        // tok/s with no thermal benefit. 0 = legacy behavior (immediate, symmetric up/down).
+        int hysteresis_c = 3;
+
         bool log_transitions = false;   // print a line on each mode change (observability)
 
         // Testing/benchmark override: when `forced` is set, apply `forced_mode` every token and
@@ -56,7 +64,9 @@ public:
     double pace();
 
     // Pure temperature→mode mapping (no hardware, no sleep) — the tiering policy, unit-testable.
-    static Mode classify(const Config& cfg, int temp_c);
+    // `prev_mode` is the mode in effect before this reading; it only matters for downgrade
+    // hysteresis (see Config::hysteresis_c above). Omit it for the plain, state-free mapping.
+    static Mode classify(const Config& cfg, int temp_c, Mode prev_mode = Mode::Turbo);
     static const char* mode_name(Mode m);
 
     Mode   mode()          const { return mode_; }
