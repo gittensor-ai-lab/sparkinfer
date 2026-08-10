@@ -12,7 +12,7 @@ The MoE dispatch and routing layer that sits between sparkinfer-runtime and spar
 
 - **Expert routing** — top-k selection with softmax, per-expert sigmoid (DeepSeek-V2 style), or expert-choice
 - **Sync-free token dispatch** — token counts tracked in GPU memory only, no CPU readback, enabling end-to-end CUDA graph capture
-- **Expert cache management** — async prefetch of next-layer experts while current layer executes; eviction for models where experts exceed VRAM
+- **Expert residency** — YAML `expert_cache:` knobs document intended eviction/prefetch policy; the current engine keeps layered weights resident once `set_layer_weights` runs
 
 ---
 
@@ -52,12 +52,11 @@ include/sparkinfer/moe/
 └── router.h   # Router, RouterType, RouterConfig
 
 src/
-├── router/    # routing kernel dispatch
-├── expert/    # expert weight cache, prefetch logic
-└── dispatcher/# token-to-expert assignment, GroupGEMM dispatch
+├── engine.cpp # MoEEngine::create / forward
+└── router.cpp # routing kernel dispatch
 ```
 
-Kernel implementation lives in [sparkinfer-kernels](https://github.com/gittensor-ai-lab/sparkinfer-kernels) (`csrc/cute/moe_swiglu/`, `csrc/cute/moe_gemm/`).
+Kernel implementation lives in-tree under [`kernels/`](../kernels/) (`csrc/cute/moe_swiglu/`, `csrc/cute/moe_gemm/`).
 
 ---
 

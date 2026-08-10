@@ -1,5 +1,5 @@
 # MoE engine configuration for Qwen3.5-35B-A3B
-# Load with: MoEEngine::create(MoEConfig::from_yaml("configs/qwen35_35b_a3b.yaml"))
+# Reference shape for MoEConfig fields (no MoEConfig::from_yaml in-tree — fill MoEConfig in C++).
 
 num_experts: 256
 top_k: 8
