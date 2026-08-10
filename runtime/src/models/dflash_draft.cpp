@@ -626,18 +626,44 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // [N,K] weight, fp32 accumulate); anything at or below kCtxGemmMinRows keeps the existing
     // exact GEMV path bit-for-bit, so every steady-state block is untouched.
     const bool ctx_gemm = ctx_len >= kCtxGemmMinRows && ctx_gemm_enabled();
-    if (ctx_len > 0) {
-        const bf16* th = (const bf16*)target_hidden;
-        if (ctx_gemm) {
-            kernels::launch_prefill_gemm(th, s.fc, s.target_proj, ctx_len, H, n_cap * H, st);
-        } else if (ctx_len > 1) {
-            dflash_kernels::launch_gemv_rows_batched(th, s.fc, s.target_proj,
-                                                   ctx_len, H, n_cap * H, st);
-        } else {
-            kernels::launch_gemv(th, s.fc, s.target_proj, H, n_cap * H, st);
+    // Draft full-attention-layer window (default ON = 3x the draft's sliding_window). The draft is a
+    // heuristic proposer whose every token the target verifies, so bounding how far back its "full"
+    // attention layer looks can only affect ACCEPTANCE (tau), never correctness. Measured: its
+    // proposals are unchanged (accept length identical) with the full layer bounded to 3x the sliding
+    // window -- the smallest multiple that stays tau-neutral at both 16k and 32k -- while 2x already
+    // costs acceptance. Bounding it lets the split attention (#751) and the ingestion (#752) trim the
+    // full layer's read / K-V / fc exactly as they trim the windowed layers, removing the last draft
+    // cost that still grew with context. Env override: unset -> 3*sliding_window; 0 -> off (full); N.
+    static const int kFullWindowEnv = []{ const char* e = getenv("SPARKINFER_DFLASH_FULL_WINDOW");
+                                          return e ? atoi(e) : -1; }();
+    const int kFullWindow = kFullWindowEnv >= 0 ? kFullWindowEnv : 3 * c.sliding_window;
+    // fc trim: once the full-attn layer is windowed, NO layer reads target_proj older than the
+    // largest window across layers, so project only that tail. Uses the same attn_gqa_kv_lo bound
+    // the per-layer ingestion (#752) applies, at the LARGEST window -> surviving rows byte-identical,
+    // and every skipped row is one no layer reads. kFullWindow==0 -> fc_skip 0 (unchanged).
+    int fc_skip = 0;
+    {
+        static const int kCT = []{ const char* e = getenv("SPARKINFER_DFLASH_CTX_TRIM");
+                                   return (e && e[0] == '0') ? 0 : 1; }();
+        if (ctx_len > 0 && kCT && kFullWindow > 0) {
+            const int maxwin = c.sliding_window > kFullWindow ? c.sliding_window : kFullWindow;
+            const int lo = dflash_kernels::attn_gqa_kv_lo(BW, past + ctx_len + BW, c.n_q_heads,
+                                                          c.n_kv_heads, d, pos0, 0, maxwin);
+            fc_skip = lo > past ? (lo - past < ctx_len ? lo - past : ctx_len) : 0;
         }
-        dflash_kernels::launch_rms(s.target_proj, s.hidden_norm, s.target_proj,
-                                   ctx_len, H, c.rms_eps, st);
+    }
+    const int fc_rows = ctx_len - fc_skip;
+    if (fc_rows > 0) {
+        const bf16* th = (const bf16*)target_hidden + (size_t)fc_skip * n_cap * H;
+        bf16* tp = s.target_proj + (size_t)fc_skip * H;
+        if (ctx_gemm) {
+            kernels::launch_prefill_gemm(th, s.fc, tp, fc_rows, H, n_cap * H, st);
+        } else if (fc_rows > 1) {
+            dflash_kernels::launch_gemv_rows_batched(th, s.fc, tp, fc_rows, H, n_cap * H, st);
+        } else {
+            kernels::launch_gemv(th, s.fc, tp, H, n_cap * H, st);
+        }
+        dflash_kernels::launch_rms(tp, s.hidden_norm, tp, fc_rows, H, c.rms_eps, st);
     }
 
     // x = noise embedding
@@ -665,8 +691,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     const int q_pos0_for_block = pos0;
     for (int L = 0; L < run_layers; L++) {
         const LayerWeights& w = s.layers[L];
-        const int window_of_layer = (L < (int)c.sliding_layers.size() && c.sliding_layers[L])
+        int window_of_layer = (L < (int)c.sliding_layers.size() && c.sliding_layers[L])
                                         ? c.sliding_window : 0;
+        if (window_of_layer == 0 && kFullWindow > 0) window_of_layer = kFullWindow;
         bf16* const kdst = s.k_cache[L] + (size_t)past * kvdim;
         bf16* const vdst = s.v_cache[L] + (size_t)past * kvdim;
         if (L == 0)
