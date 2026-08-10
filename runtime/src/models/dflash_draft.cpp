@@ -659,8 +659,14 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         fprintf(stderr, "[dflash] KV overflow past=%d new=%d max=%d\n", past, new_len_all, c.max_seq);
         return false;
     }
+    // Attention geometry for this block, hoisted: the context ingestion below needs the layer's
+    // window and the block's key span to know which context rows the attention can still reach.
+    const int kv_len_for_block = past + new_len_all;
+    const int q_pos0_for_block = pos0;
     for (int L = 0; L < run_layers; L++) {
         const LayerWeights& w = s.layers[L];
+        const int window_of_layer = (L < (int)c.sliding_layers.size() && c.sliding_layers[L])
+                                        ? c.sliding_window : 0;
         bf16* const kdst = s.k_cache[L] + (size_t)past * kvdim;
         bf16* const vdst = s.v_cache[L] + (size_t)past * kvdim;
         if (L == 0)
@@ -689,19 +695,38 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wq, s.q + (size_t)t * qdim, qdim, H, st);
         }
         // Context half of cat(k_ctx, k_noise), written ahead of the noise rows.
-        if (ctx_gemm) {
-            kernels::launch_prefill_gemm(s.target_proj, w.wk, kdst, ctx_len, kvdim, H, st);
-            kernels::launch_prefill_gemm(s.target_proj, w.wv, vdst, ctx_len, kvdim, H, st);
-        } else if (ctx_len > 1) {
+        //
+        // A windowed layer never reads a key older than `window` before the query, and
+        // launch_attn_gqa now starts its partition above that bound rather than masking it inside
+        // the loop -- so on a long prompt the leading context rows are projected into the cache and
+        // then never touched. Skip producing them. The bound comes from attn_gqa_kv_lo, the same
+        // function the launcher uses, evaluated at THIS block: q_pos0 only grows as the generation
+        // proceeds, and the one-split-worth guard it applies gets easier to satisfy as it does
+        // (the bound climbs a key per token while a split's width climbs a fraction of one), so a
+        // row dead for this block is dead for every later block too. Full-attention layers and
+        // every steady-state block (where the window still covers the cache) get skip == 0 and are
+        // byte-for-byte unchanged.
+        static const int kCtxTrim = []{ const char* e = getenv("SPARKINFER_DFLASH_CTX_TRIM");
+                                        return (e && e[0] == '0') ? 0 : 1; }();
+        const int ctx_kv_lo = (ctx_len > 0 && kCtxTrim)
+            ? dflash_kernels::attn_gqa_kv_lo(BW, kv_len_for_block, c.n_q_heads, c.n_kv_heads, d,
+                                             q_pos0_for_block, /*k_pos0=*/0, window_of_layer)
+            : 0;
+        const int ctx_skip = ctx_kv_lo > past ? std::min(ctx_kv_lo - past, ctx_len) : 0;
+        const int ctx_rows = ctx_len - ctx_skip;
+        const bf16* const ctx_src = s.target_proj + (size_t)ctx_skip * H;
+        bf16* const kdst_ctx = kdst + (size_t)ctx_skip * kvdim;
+        bf16* const vdst_ctx = vdst + (size_t)ctx_skip * kvdim;
+        if (ctx_rows > 0 && ctx_gemm) {
+            kernels::launch_prefill_gemm(ctx_src, w.wk, kdst_ctx, ctx_rows, kvdim, H, st);
+            kernels::launch_prefill_gemm(ctx_src, w.wv, vdst_ctx, ctx_rows, kvdim, H, st);
+        } else if (ctx_rows > 1) {
             dflash_kernels::launch_gemv_rows_exact_fused2(
-                s.target_proj, w.wk, w.wv, kdst, vdst,
-                ctx_len, kvdim, kvdim, H, st);
-        } else if (ctx_len == 1) {
-            const int t = 0;
-            kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wk,
-                                 kdst + (size_t)t * kvdim, kvdim, H, st);
-            kernels::launch_gemv(s.target_proj + (size_t)t * H, w.wv,
-                                 vdst + (size_t)t * kvdim, kvdim, H, st);
+                ctx_src, w.wk, w.wv, kdst_ctx, vdst_ctx,
+                ctx_rows, kvdim, kvdim, H, st);
+        } else if (ctx_rows == 1) {
+            kernels::launch_gemv(ctx_src, w.wk, kdst_ctx, kvdim, H, st);
+            kernels::launch_gemv(ctx_src, w.wv, vdst_ctx, kvdim, H, st);
         }
         if (!fast16) {
             for (int t = 0; t < BW; t++) {
@@ -725,13 +750,16 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         const int q_pos0 = pos0;
         dflash_kernels::launch_rms_heads_rope(s.q, w.q_norm, BW, c.n_q_heads, d, c.rms_eps,
                                              q_pos0, c.rope_theta, st);
-        dflash_kernels::launch_rms_heads_rope(kdst, w.k_norm, new_len, c.n_kv_heads, d,
-                                             c.rms_eps, k_pos0, c.rope_theta, st);
+        // Norm+RoPE only the rows that were actually produced above; the skipped context prefix
+        // holds no K to normalise. Row i of this slice keeps its own absolute position, so the
+        // surviving rows get exactly the angles they got before.
+        dflash_kernels::launch_rms_heads_rope(kdst + (size_t)ctx_skip * kvdim, w.k_norm,
+                                             new_len - ctx_skip, c.n_kv_heads, d,
+                                             c.rms_eps, k_pos0 + ctx_skip, c.rope_theta, st);
 
         // K/V are already in the cache at offset `past` -- attend over the full past+new.
         const int kv_len = past + new_len;
-        const int window = (L < (int)c.sliding_layers.size() && c.sliding_layers[L])
-                               ? c.sliding_window : 0;
+        const int window = window_of_layer;
         static int mixed_causal = [] {
             const char* e = getenv("SPARKINFER_DFLASH_MIXED_CAUSAL");
             return (!e || e[0] != '0') ? 1 : 0;

@@ -29,6 +29,15 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      cudaStream_t stream, float* fa_m = nullptr, float* fa_l = nullptr,
                      float* fa_acc = nullptr);
 
+// First key index launch_attn_gqa will actually read for a windowed layer, given a block whose
+// smallest query position is q_pos0; 0 when it will read from the start. Everything below the
+// return value is masked for every row of the block AND excluded from the split partition, so a
+// caller that fills the KV cache may leave those rows unwritten. Exposed rather than left inline in
+// the launcher so producer and consumer derive the bound from one place and cannot disagree -- a
+// row the producer skipped but the kernel still read would be uninitialized memory.
+int attn_gqa_kv_lo(int q_len, int kv_len, int n_q, int n_kv, int d,
+                   int q_pos0, int k_pos0, int window);
+
 // In-place RoPE on [seq, n_heads, d] bf16. positions[i] = pos0 + i.
 void launch_rope_seq(void* x, int seq, int n_heads, int d, int pos0,
                      float theta, cudaStream_t stream);

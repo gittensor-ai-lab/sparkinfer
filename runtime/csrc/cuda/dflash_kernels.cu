@@ -1184,6 +1184,30 @@ int attn_gqa_splits(int kv_len) {
     return s;
 }
 
+static inline int attn_gqa_split_path_ok(int q_len, int kv_len, int n_q, int n_kv, int d) {
+    static const int kSplitAttn = []{ const char* e = getenv("SPARKINFER_DFLASH_SPLIT_ATTN");
+                                      return (e && e[0] == '0') ? 0 : 1; }();
+    return kSplitAttn && d == 128 && n_kv > 0 && (n_q % n_kv) == 0 &&
+           q_len <= kDFlashAttnMaxRows && kv_len >= kDFlashAttnMinKv;
+}
+
+int attn_gqa_kv_lo(int q_len, int kv_len, int n_q, int n_kv, int d,
+                   int q_pos0, int k_pos0, int window) {
+    if (window <= 0 || !attn_gqa_split_path_ok(q_len, kv_len, n_q, n_kv, d)) return 0;
+    static const int kWinSpan = []{ const char* e = getenv("SPARKINFER_DFLASH_WINSPAN");
+                                    return (e && e[0] == '0') ? 0 : 1; }();
+    if (!kWinSpan) return 0;
+    // Narrow only when at least one whole split's worth of keys goes away: while the window still
+    // covers the cache this would trim a handful of keys, and re-partitioning the key range changes
+    // the order the online-softmax partials merge in -- not worth spending the draft's acceptance
+    // on for no traffic saved. The kv_len bound is belt-and-braces; the newest key is always inside
+    // the window, so lo < kv_len holds for any window >= 1.
+    const int n_splits_full = attn_gqa_splits(kv_len);
+    const long lo = (long)q_pos0 - (long)k_pos0 - (long)window + 1;
+    if (lo >= (kv_len + n_splits_full - 1) / n_splits_full && lo < (long)kv_len) return (int)lo;
+    return 0;
+}
+
 void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      int q_len, int kv_len, int n_q, int n_kv, int d,
                      int q_pos0, int k_pos0, int window, bool causal, float scale,
@@ -1193,10 +1217,7 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
     if (d == 128) {
         // Row-batched + KV-split path. Needs the caller's partial-state scratch; without it
         // (or below the sweep's crossover) fall through to the single-CTA-per-row kernel.
-        static const int kSplitAttn = []{ const char* e = getenv("SPARKINFER_DFLASH_SPLIT_ATTN");
-                                          return (e && e[0] == '0') ? 0 : 1; }();
-        if (kSplitAttn && fa_m && fa_l && fa_acc && n_kv > 0 && (n_q % n_kv) == 0 &&
-            q_len <= kDFlashAttnMaxRows && kv_len >= kDFlashAttnMinKv) {
+        if (fa_m && fa_l && fa_acc && attn_gqa_split_path_ok(q_len, kv_len, n_q, n_kv, d)) {
             constexpr int ROWS = 2, NWARPS = 8;
             const int n_splits_full = attn_gqa_splits(kv_len);
             // A sliding-window layer masks a key only after the kernel has loaded it and reduced
@@ -1205,19 +1226,7 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
             // windowed layer. The kernel's own predicate is (q_pos - k_pos) >= window, and the
             // block's smallest query position is q_pos0, so every key at or below
             // q_pos0 - k_pos0 - window is dead for the whole block: start the partition above it.
-            static const int kWinSpan = []{ const char* e = getenv("SPARKINFER_DFLASH_WINSPAN");
-                                            return (e && e[0] == '0') ? 0 : 1; }();
-            // Narrow only when at least one whole split's worth of keys goes away: while the window
-            // still covers the cache this would trim a handful of keys, and re-partitioning the key
-            // range changes the order the online-softmax partials merge in -- not worth spending
-            // the draft's acceptance on for no traffic saved. The kv_len bound is belt-and-braces;
-            // the newest key is always inside the window, so lo < kv_len holds for any window >= 1.
-            int kv_lo = 0;
-            if (kWinSpan && window > 0) {
-                const long lo = (long)q_pos0 - (long)k_pos0 - (long)window + 1;
-                if (lo >= (kv_len + n_splits_full - 1) / n_splits_full && lo < (long)kv_len)
-                    kv_lo = (int)lo;
-            }
+            const int kv_lo = attn_gqa_kv_lo(q_len, kv_len, n_q, n_kv, d, q_pos0, k_pos0, window);
             const int n_splits = kv_lo > 0 ? attn_gqa_splits(kv_len - kv_lo) : n_splits_full;
             const size_t smem = (size_t)(2 * NWARPS * ROWS + NWARPS * ROWS * 128) * sizeof(float);
             dim3 g((q_len + ROWS - 1) / ROWS, n_q, n_splits);
