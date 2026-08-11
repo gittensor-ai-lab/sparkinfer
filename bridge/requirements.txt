@@ -1,0 +1,17 @@
+# Pinned exact -- lmcache's real store()/retrieve() API surface used here
+# (lmcache.v1.cache_engine.LMCacheEngineBuilder, lmcache.v1.gpu_connector.GPUConnectorInterface,
+# lmcache.v1.metadata.LMCacheMetadata) is not lmcache's actively-promoted integration path (that's
+# MP-mode's standalone server, see docs/lmcache_bridge_protocol.md), so its signatures are not
+# guaranteed stable release to release. Bump deliberately, re-run bridge/tests/ (especially
+# test_bridge_e2e.py's byte-identical round-trip check) before trusting a newer version, not as a
+# routine dependency bump.
+lmcache==0.5.3
+
+# Pulled in transitively by lmcache even for CPU-only KV offload (it represents KV cache data as
+# torch tensors regardless of backend) -- a real, sizeable dependency (~500MB wheel), not optional.
+# CPU-only build is sufficient; the sidecar never touches a GPU itself (see ShmConnector in
+# lmcache_bridge.py -- it stands in for what would otherwise be real device memory).
+torch==2.13.0
+
+# Python >= 3.10 required (lmcache's own floor as of 0.5.3; this bridge's code uses no
+# newer-than-3.10 syntax itself).
