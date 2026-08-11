@@ -2696,10 +2696,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                name.find(".attn_v.weight") != std::string::npos ||
                name.find(".attn_output.weight") != std::string::npos;
     };
-    auto dev_quant_requant_q4k = [&](const std::string& name, int& qtype, bool req) -> const void* {
+    // allow_q5k is opt-in per call site, NOT a widening of the default set: dev_quant_down() also
+    // routes through here with requant on by default, so accepting Q5_K unconditionally would
+    // silently requantize the dense-FFN down tensor of any model that ships one.
+    auto dev_quant_requant_q4k = [&](const std::string& name, int& qtype, bool req,
+                                     bool allow_q5k = false) -> const void* {
         const void* q6 = dev_quant(name, qtype);
-        if (!req || (qtype != 14 && qtype != 8) || !q6) return q6;
-        const int src_type = qtype;            // 14 (Q6_K) or 8 (Q8_0) -> Q4_K
+        const bool src_ok = (qtype == 14 || qtype == 8 || (allow_q5k && qtype == 13));
+        if (!req || !src_ok || !q6) return q6;
+        const int src_type = qtype;            // 14 (Q6_K), 8 (Q8_0) or 13 (Q5_K) -> Q4_K
         const GGUFTensor* t = g.tensor(name);
         const long nv = t->n_values;
         if (nv % 256 != 0) return q6;
@@ -2909,10 +2914,20 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
         type = 0; return dense(name, false);
     };
+    // Muse Glimmer ships output.weight as Q5_K -- the only Q5_K tensor in the file -- and Q5_K was
+    // not on this list, so the head fell through to `dense()` and was dequantized to bf16. The
+    // decode LM head then read 2.69 GB every token (gemv_f32_sk) instead of 0.76 GB through the
+    // Q4_K MMVQ path: 1.60 ms of a 12.4 ms step. Requanting it to Q4_K at load is the same
+    // mechanism this codebase already applies to other models' heads (SPARKINFER_LMHEAD_REQUANT_Q4K).
+    static const bool mg_lm_q5k = [] {
+        const char* e = getenv("SPARKINFER_MUSE_LMHEAD_Q5K");
+        return !(e && e[0] == '0');
+    }();
     auto lm_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
-            return dev_quant_requant_q4k(name, type, req_lm_q4);
+        const bool q5k_ok = mg_lm_q5k && s.cfg.muse_glimmer && t && t->ggml_type == 13;
+        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8 || q5k_ok))
+            return dev_quant_requant_q4k(name, type, req_lm_q4 || q5k_ok, q5k_ok);
         type = 0; return dense(name, false);
     };
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {

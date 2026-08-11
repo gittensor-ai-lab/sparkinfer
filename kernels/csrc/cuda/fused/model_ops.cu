@@ -148,11 +148,15 @@ __global__ void decode_feedback_kernel(int* __restrict__ scalars,
 
 // Gemma2-style final-logit softcap, in place: logits[v] = tanh(logits[v] * scale / cap) * cap.
 // One block per row, grid-stride over vocab.
+// One CTA per row left a 202k-element vocab to a single 256-thread block at decode (n_rows == 1),
+// i.e. one SM of the device: 283 us to touch 1.6 MB, about 5.7 GB/s. Spread the vocab across
+// blockIdx.x and keep the row on blockIdx.y. Every element is still computed by exactly the same
+// expression, so the result is bit-identical -- only which thread evaluates it changes.
 __global__ void logit_softcap_kernel(float* __restrict__ logits, int vocab,
                                      float scale, float cap) {
-    float* L = logits + (size_t)blockIdx.x * vocab;
+    float* L = logits + (size_t)blockIdx.y * vocab;
     const float inv_cap = 1.f / cap;
-    for (int v = threadIdx.x; v < vocab; v += blockDim.x)
+    for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < vocab; v += gridDim.x * blockDim.x)
         L[v] = tanhf(L[v] * scale * inv_cap) * cap;
 }
 
@@ -241,7 +245,10 @@ void launch_decode_feedback(int* scalars, const int* out_id, cudaStream_t stream
 
 void launch_logit_softcap(float* logits, int n_rows, int vocab, float scale, float cap,
                           cudaStream_t stream) {
-    logit_softcap_kernel<<<n_rows, 256, 0, stream>>>(logits, vocab, scale, cap);
+    // Cap the x-grid so a huge vocab does not spawn more blocks than the device can use; the
+    // kernel's grid-stride loop covers whatever is left over.
+    const int bx = (vocab + 255) / 256 > 1024 ? 1024 : (vocab + 255) / 256;
+    logit_softcap_kernel<<<dim3(bx < 1 ? 1 : bx, n_rows), 256, 0, stream>>>(logits, vocab, scale, cap);
 }
 #endif
 

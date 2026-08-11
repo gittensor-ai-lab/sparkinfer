@@ -981,6 +981,9 @@ template __global__ void si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 8>(const si_bl
 #endif
 #ifndef _MSC_VER
 template __global__ void si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 16>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
+// Muse Glimmer hidden = 6656 -> 26 superblocks. Same loop and same reduction as the generic
+// kernel, so the result is bit-identical; only the trip count becomes a compile-time constant.
+template __global__ void si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 26>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
 #endif
 #ifndef _MSC_VER
 template __global__ void si_mmvq_q4k_kfixed_kernel<float, 8>(const si_block_q8_1*, const unsigned char*, float*, int);
@@ -2017,6 +2020,10 @@ void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cuda
         si_mmvq_q4k_dualrow_kernel<__nv_bfloat16, 8><<<(N + 1) / 2, 8 * 32, 0, stream>>>(q, w, out, N);
     else if (K == 2048) si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 8><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
     else if (K == 4096) si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 16><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
+    // Muse Glimmer's hidden size. Its q/gate/k/v projections were the only hot GEMVs left on the
+    // runtime-K kernel, measured at 1042 GB/s against 1374 GB/s for the K=4096 kfixed o_proj
+    // sitting next to them in the same layer.
+    else if (K == 6656) si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 26><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
     else                si_mmvq_q4k_kernel<__nv_bfloat16><<<N, 4 * 32, 0, stream>>>(q, w, out, N, K);
 }
 void launch_mmvq_gdn_qkv_z_pack2(const void* q81, const void* qkv_w, const void* z_w,
