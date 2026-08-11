@@ -968,17 +968,26 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                 const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
                 const bool any_q80 = (w.wq_type == 8 || w.wk_type == 8 || w.wv_type == 8);
                 prepare_xn_quant(any_q4k, any_q6k, any_q80);
-                const int nq = w.q_has_gate ? s.qdim * 2 : s.qdim;
-                const bool attn_qkv = s.use_attn_qkv && s.use_pq && s.use_llama && (H == 2048 || H == 4096)
+                // Muse Glimmer keeps attn_gate as its own quantized tensor (w.wgate), so Q goes
+                // straight to s.q and the gate straight to s.qgate -- no [q|gate] interleave to
+                // build and no split to undo it. Every other model still fuses them into s.qraw.
+                const bool sep_gate = (w.wgate != nullptr);
+                void* q_dst = (w.q_has_gate && !sep_gate) ? s.qraw : s.q;
+                const int nq = (w.q_has_gate && !sep_gate) ? s.qdim * 2 : s.qdim;
+                // The fused QKV kernel writes one contiguous q of width nq and knows nothing about
+                // a separate gate tensor, so it cannot serve this path.
+                const bool attn_qkv = !sep_gate && s.use_attn_qkv && s.use_pq && s.use_llama
+                                   && (H == 2048 || H == 4096)
                                    && w.wq_type == 12 && w.wk_type == 12 && w.wv_type == 12;
                 if (attn_qkv) {
                     kernels::launch_attn_qkv_mmvq_q4k(s.aq81, w.wq, w.wk, w.wv,
-                        w.q_has_gate ? s.qraw : s.q, s.k, s.v, nq, s.kvdim, s.kvdim, H, st);
+                        q_dst, s.k, s.v, nq, s.kvdim, s.kvdim, H, st);
                 } else if (s.use_qkvstream) {
                     cudaEventRecord(s.ev_qkv, st);
                     cudaStreamWaitEvent(s.stream_k, s.ev_qkv, 0);
                     cudaStreamWaitEvent(s.stream_v, s.ev_qkv, 0);
-                    proj_xn(w.wq, w.wq_type, w.q_has_gate ? s.qraw : s.q, w.q_has_gate ? s.qdim * 2 : s.qdim, st);
+                    proj_xn(w.wq, w.wq_type, q_dst, nq, st);
+                    if (sep_gate) proj_xn(w.wgate, w.wgate_type, s.qgate, s.qdim, st);
                     proj_xn(w.wk, w.wk_type, s.k, s.kvdim, s.stream_k);
                     proj_xn(w.wv, w.wv_type, s.v, s.kvdim, s.stream_v);
                     cudaEventRecord(s.ev_k, s.stream_k);
@@ -986,7 +995,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                     cudaStreamWaitEvent(st, s.ev_k, 0);
                     cudaStreamWaitEvent(st, s.ev_v, 0);
                 } else {
-                    proj_xn(w.wq, w.wq_type, w.q_has_gate ? s.qraw : s.q, w.q_has_gate ? s.qdim * 2 : s.qdim, st);
+                    proj_xn(w.wq, w.wq_type, q_dst, nq, st);
+                    if (sep_gate) proj_xn(w.wgate, w.wgate_type, s.qgate, s.qdim, st);
                     proj_xn(w.wk, w.wk_type, s.k, s.kvdim, st);
                     proj_xn(w.wv, w.wv_type, s.v, s.kvdim, st);
                 }
@@ -1005,7 +1015,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
             const bool partial_rope = (c.rope_dim > 0 && c.rope_dim < c.head_dim);
             const bool qkgate_fuse = w.q_has_gate && partial_rope && kv8 && s.use_qkfuse && H == 2048;
-            if (w.q_has_gate && !qkgate_fuse)
+            // w.wgate != nullptr means Q and the gate were projected straight into s.q / s.qgate
+            // above, so there is no interleaved s.qraw to split.
+            if (w.q_has_gate && !qkgate_fuse && !w.wgate)
                 kernels::launch_qwen36_split_q_gate(s.qraw, s.q, s.qgate, c.n_q_heads, c.head_dim, st);
             dbg_bf16(s.q, s.qdim, 11, L);      // tag 11: Q, raw split, pre QK-norm
             dbg_bf16(s.qgate, s.qdim, 12, L);  // tag 12: attn gate proj, pre-sigmoid
@@ -2986,6 +2998,23 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                     !expect_dims(b + "attn_output.weight", {s.qdim, H}) ||
                     !expect_dims(b + "attn_q_norm.weight", {c.head_dim}) ||
                     !expect_dims(b + "attn_k_norm.weight", {c.head_dim})) return false;
+                // SPARKINFER_MUSE_QGATE_Q=0 restores the original load-time dequantize+interleave
+                // (kept for a same-binary A/B; see the projection site for the matching switch).
+                static const int kQGateQ = []{ const char* e = getenv("SPARKINFER_MUSE_QGATE_Q");
+                                               return (e && e[0] == '0') ? 0 : 1; }();
+                if (kQGateQ) {
+                    // attn_q and attn_gate both ship Q4_K. Dequantizing them to bf16 so they can be
+                    // interleaved into the [q|gate] layout split_q_gate_kernel wants costs 109 MB
+                    // per layer against 31 MB kept quantized -- 4.08 GB of extra reads on EVERY
+                    // decode token across 52 layers, which profiled as the single largest kernel in
+                    // the 128-decode run (gemv_f32_sk, 29.8% of GPU time). The interleave only
+                    // exists because Qwen3.6's GGUF pre-fuses q|gate into one tensor; Muse ships
+                    // them separately, so keep both quantized and project each straight into its
+                    // own destination, which also drops the split entirely.
+                    w.wq    = attn_w(b + "attn_q.weight", w.wq_type);
+                    w.wgate = attn_w(b + "attn_gate.weight", w.wgate_type);
+                    if (!w.wq || !w.wgate) return false;
+                } else {
                 const void* qd = dense(b + "attn_q.weight", false);
                 const void* gd = dense(b + "attn_gate.weight", false);
                 if (!qd || !gd) return false;
@@ -3003,6 +3032,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 s.owned.push_back(combined);
                 w.wq = combined;
                 w.wq_type = 0;
+                }
                 w.wk = attn_w(b + "attn_k.weight", w.wk_type);
                 w.wv = attn_w(b + "attn_v.weight", w.wv_type);
                 w.wo = attn_w(b + "attn_output.weight", w.wo_type);

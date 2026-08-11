@@ -20,6 +20,10 @@ struct Qwen35LayerWeights {
     bool swa = false;
     const void* input_norm   = nullptr;  // [hidden]
     const void* wq = nullptr;            // [hidden, n_q_heads*head_dim]
+    // Muse Glimmer only: attn_gate ships as its OWN [hidden, n_q_heads*head_dim] tensor rather
+    // than pre-fused into wq the way Qwen3.6's GGUF writes it, so it is kept quantized and
+    // projected separately instead of being dequantized and interleaved into wq at load.
+    const void* wgate = nullptr;         // [hidden, n_q_heads*head_dim]
     const void* wk = nullptr;            // [hidden, n_kv_heads*head_dim]
     const void* wv = nullptr;            // [hidden, n_kv_heads*head_dim]
     const void* wo = nullptr;            // [n_q_heads*head_dim, hidden]
@@ -73,7 +77,7 @@ struct Qwen35LayerWeights {
     int gate_qtype = 0, up_qtype = 0, down_qtype = 0;
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
     // 14=Q6_K) -> weights kept quantized in VRAM, decoded on-read by launch_gemv_q.
-    int wq_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;
+    int wq_type = 0, wgate_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;
     int wqkv_type = 0, wqkv_gate_type = 0, ssm_beta_type = 0, ssm_alpha_type = 0, ssm_out_type = 0;
     int shared_gate_inp_type = 0;
 };
