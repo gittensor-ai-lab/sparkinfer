@@ -849,10 +849,34 @@ void launch_flash_decode_split(
             if (seqfold < 0) { const char* e = getenv("SPARKINFER_FA_SEQFOLD"); seqfold = e ? atoi(e) : 0; }
             const int fold = seqfold > 0 ? seqfold
                            : (num_seqs % 4 == 0 ? 4 : (num_seqs % 3 == 0 ? 3 : (num_seqs % 2 == 0 ? 2 : 1)));
-            if (!int8_kv && fold > 1 && num_seqs > 1 && (num_seqs % fold) == 0) {
+            if (fold > 1 && num_seqs > 1 && (num_seqs % fold) == 0) {
                 const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
                 dim3 gqf(num_kv_heads * n_splits, num_seqs / fold);
-                if (fold == 2)
+                // Same fold for int8 KV: the kernel already templates INT8+SEQ; only the
+                // launcher gated it off. When MMA does not take the early return, int8 was
+                // stuck on one-row-per-CTA and re-streamed the cache once per verify row.
+                if (int8_kv) {
+                    if (fold == 2)
+                        fa_split_gqa_kernel<256, GQA, TILE, true, 2><<<gqf, GQA * 32, smem, stream>>>(
+                            reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,
+                            n_splits, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                    else if (fold == 3)
+                        fa_split_gqa_kernel<256, GQA, TILE, true, 3><<<gqf, GQA * 32, smem, stream>>>(
+                            reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,
+                            n_splits, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                    else if (fold == 4)
+                        fa_split_gqa_kernel<256, GQA, TILE, true, 4><<<gqf, GQA * 32, smem, stream>>>(
+                            reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,
+                            n_splits, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                    else
+                        fa_split_gqa_kernel<256, GQA, TILE, true, 6><<<gqf, GQA * 32, smem, stream>>>(
+                            reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,
+                            n_splits, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                } else if (fold == 2)
                     fa_split_gqa_kernel<256, GQA, TILE, false, 2><<<gqf, GQA * 32, smem, stream>>>(
                         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
                         part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,

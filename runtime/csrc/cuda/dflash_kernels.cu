@@ -1275,7 +1275,21 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
         // Row-batched + KV-split path. Needs the caller's partial-state scratch; without it
         // (or below the sweep's crossover) fall through to the single-CTA-per-row kernel.
         if (fa_m && fa_l && fa_acc && attn_gqa_split_path_ok(q_len, kv_len, n_q, n_kv, d)) {
-            constexpr int ROWS = 2, NWARPS = 8;
+            constexpr int NWARPS = 8;
+            // Fold query rows into one CTA so each K/V vector is fetched once for all of them
+            // instead of once per ROWS=2 pair. Mirror the verify's seqfold (#763/#764): only when
+            // the width divides q_len exactly, and pick the widest instantiation that does.
+            // After #764 the long-context block is 8-wide (depth 7), so a fixed ROWS=2 still
+            // re-streams the cache four times per (q head, split); ROWS=4 cuts that to two.
+            // Shorter blocks stay at depth 5 → BW=6 → ROWS=3. SPARKINFER_DFLASH_ATTN_ROWS pins
+            // a width; 1 restores one row per CTA.
+            static int attn_rows = -1;
+            if (attn_rows < 0) {
+                const char* e = getenv("SPARKINFER_DFLASH_ATTN_ROWS");
+                attn_rows = e ? atoi(e) : 0;
+            }
+            const int rows = attn_rows > 0 ? attn_rows
+                           : (q_len % 4 == 0 ? 4 : (q_len % 3 == 0 ? 3 : (q_len % 2 == 0 ? 2 : 1)));
             const int n_splits_full = attn_gqa_splits(kv_len);
             // A sliding-window layer masks a key only after the kernel has loaded it and reduced
             // its QK dot, so past the window length it streams the whole cache to discard most of
@@ -1285,11 +1299,17 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
             // q_pos0 - k_pos0 - window is dead for the whole block: start the partition above it.
             const int kv_lo = attn_gqa_kv_lo(q_len, kv_len, n_q, n_kv, d, q_pos0, k_pos0, window);
             const int n_splits = kv_lo > 0 ? attn_gqa_splits(kv_len - kv_lo) : n_splits_full;
-            const size_t smem = (size_t)(2 * NWARPS * ROWS + NWARPS * ROWS * 128) * sizeof(float);
-            dim3 g((q_len + ROWS - 1) / ROWS, n_q, n_splits);
-            k_attn_rows_split_hd128<ROWS, NWARPS><<<g, NWARPS * 32, smem, stream>>>(
-                (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc,
-                q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale, n_splits);
+            const size_t smem = (size_t)(2 * NWARPS * rows + NWARPS * rows * 128) * sizeof(float);
+            dim3 g((q_len + rows - 1) / rows, n_q, n_splits);
+#define SI_ATTN_ROWS(R_)                                                       \
+            k_attn_rows_split_hd128<R_, NWARPS><<<g, NWARPS * 32, smem, stream>>>( \
+                (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc, \
+                q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale, n_splits)
+            if (rows == 4)      SI_ATTN_ROWS(4);
+            else if (rows == 3) SI_ATTN_ROWS(3);
+            else if (rows == 2) SI_ATTN_ROWS(2);
+            else                SI_ATTN_ROWS(1);
+#undef SI_ATTN_ROWS
             k_attn_split_combine<<<dim3(q_len, n_q), 128, 0, stream>>>(
                 fa_m, fa_l, fa_acc, (bf16*)out, n_q, n_splits);
             return;
@@ -1365,13 +1385,27 @@ void launch_gemv_rows_exact_fused2(const void* x,
                                    cudaStream_t stream) {
     if (rows <= 0 || N0 + N1 <= 0) return;
     // RMAX is the activation-row tile. The r loop runs the full RMAX and folds r >= nr back onto
-    // row 0, so any slack is redundant work: with kProposalDepth=5 the accepted prefix this
-    // projects is at most 6 rows, and 8 spent a quarter of the kernel recomputing row 0.
-    constexpr int RMAX = 6, WPB = 4;
-    dim3 grid((N0 + N1 + WPB - 1) / WPB, (rows + RMAX - 1) / RMAX);
-    k_gemv_rows_batched_fused2<RMAX><<<grid, WPB * 32, 0, stream>>>(
-        (const bf16*)x, (const bf16*)W0, (const bf16*)W1,
-        (bf16*)y0, (bf16*)y1, rows, N0, N1, K);
+    // row 0, so any slack is redundant work. After #764 long-context keep reaches 7–8 and the
+    // mid-length ctx/fc path still uses this launcher for rows < 1024: RMAX=6 forces a second
+    // weight pass with a near-empty tile on rows=7/8, and ceil(rows/6) passes on larger tiles.
+    // Pick the tightest width that covers the live row count without a second pass when possible
+    // (≤6 → 6, else 8). SPARKINFER_DFLASH_CTX_RMAX pins a width.
+    static int env_rmax = -1;
+    if (env_rmax < 0) {
+        const char* e = getenv("SPARKINFER_DFLASH_CTX_RMAX");
+        env_rmax = e ? atoi(e) : 0;
+    }
+    constexpr int WPB = 4;
+    const int rmax = env_rmax > 0 ? env_rmax : (rows <= 6 ? 6 : 8);
+#define SI_CTX_RMAX(R_) do {                                                     \
+        dim3 grid((N0 + N1 + WPB - 1) / WPB, (rows + (R_) - 1) / (R_));          \
+        k_gemv_rows_batched_fused2<R_><<<grid, WPB * 32, 0, stream>>>(           \
+            (const bf16*)x, (const bf16*)W0, (const bf16*)W1,                    \
+            (bf16*)y0, (bf16*)y1, rows, N0, N1, K);                              \
+    } while (0)
+    if (rmax >= 8) SI_CTX_RMAX(8);
+    else           SI_CTX_RMAX(6);
+#undef SI_CTX_RMAX
 }
 
 void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,

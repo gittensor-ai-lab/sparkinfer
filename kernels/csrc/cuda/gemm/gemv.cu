@@ -1569,8 +1569,9 @@ __global__ void gemv_i8_q81_multirow_kernel(
         const float* __restrict__ sw, float* __restrict__ y, int N, int K) {
     constexpr int WPB = 16;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row = blockIdx.x * WPB + warp;
-    if (row >= N) return;
+    // Grid-stride so the launcher can CAP the CTA count (same contract as the Q6_K / Q4_K
+    // multirow heads). Without it a capped grid would silently drop vocab rows.
+    for (int row = blockIdx.x * WPB + warp; row < N; row += gridDim.x * WPB) {
     const int nb = K >> 5;
     const int* wi = reinterpret_cast<const int*>(W + (size_t)row * K);
     float acc[M];
@@ -1594,6 +1595,7 @@ __global__ void gemv_i8_q81_multirow_kernel(
 #pragma unroll
         for (int d = 16; d > 0; d >>= 1) acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], d);
         if (lane == 0) y[(size_t)m * N + row] = acc[m] * ws;
+    }
     }
 }
 
@@ -1623,8 +1625,10 @@ __global__ void gemv_i4_q81_multirow_kernel(
         const float* __restrict__ sw, float* __restrict__ y, int N, int K) {
     constexpr int WPB = 16;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row = blockIdx.x * WPB + warp;
-    if (row >= N) return;
+    // Grid-stride: the default DFlash draft head (i4) is the largest concurrent kernel on the
+    // scored path and must leave SM slots for the overlapping target verify0. Cap only works
+    // when every vocab row is still visited — same contract as Q6_K multirow.
+    for (int row = blockIdx.x * WPB + warp; row < N; row += gridDim.x * WPB) {
     const int nb = K >> 5;
     const int* wi = reinterpret_cast<const int*>(W + (size_t)row * (K >> 1));
     float acc[M];
@@ -1665,6 +1669,7 @@ __global__ void gemv_i4_q81_multirow_kernel(
 #pragma unroll
         for (int d = 16; d > 0; d >>= 1) acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], d);
         if (lane == 0) y[(size_t)m * N + row] = acc[m] * ws;
+    }
     }
 }
 
@@ -2181,26 +2186,39 @@ void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K,
     else if (K == 4096) si_mmvq_q6k_kfixed_kernel<float, 16><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
     else                si_mmvq_q6k_kernel<float><<<N, 4 * 32, 0, stream>>>(q, w, y, N, K);
 }
-// M activation rows against one shared Q6_K weight. q81 is M contiguous llama_q8_1_bytes(K)
-// activation rows; y is [M, N] fp32. Returns false when the shape is unsupported (caller loops).
-bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
-                                       int N, int K, int M, cudaStream_t stream) {
-    if (K != 2048 || M < 1 || M > 16) return false;   // draft head shape (H=2048, B<=16)
+// Cap the draft-head vocab grid so it leaves SM slots for the concurrent target verify0.
+// Kernels must grid-stride for a cap to cover every row. Measured peak on RTX 5090 (170 SMs)
+// is SM/2 = 85 for the Q6 path; both wider and narrower are worse. Shared by Q4/Q6/i8/i4.
+static int dflash_head_cta_cap() {
     static const int cap = []{
         if (const char* e = getenv("SPARKINFER_DFLASH_HEAD_CTAS")) return atoi(e);
         int sm = 0, dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess ||
             cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
             return 0;
-        return 0;
+        return sm > 1 ? sm / 2 : 0;
     }();
+    return cap;
+}
+
+// M activation rows against one shared Q6_K weight. q81 is M contiguous llama_q8_1_bytes(K)
+// activation rows; y is [M, N] fp32. Returns false when the shape is unsupported (caller loops).
+bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
+                                       int N, int K, int M, cudaStream_t stream) {
+    if (K != 2048 || M < 1 || M > 16) return false;   // draft head shape (H=2048, B<=16)
     int nblk = (N + 15) / 16;
+    const int cap = dflash_head_cta_cap();
     if (cap > 0 && nblk > cap) nblk = cap;
     dim3 grid(nblk);
     auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     auto* w = reinterpret_cast<const unsigned char*>(W);
+    // Tightest MMAX for the live row count — depth 5 scores M=5, depth 7 scores M=7 (#764).
+    // Without these arms M=5/7 paid the MMAX=16 footprint.
     if (M == 3) si_mmvq_q4k_multirow_kernel<float, 16, 8, 3, 3><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    else if (M == 5) si_mmvq_q4k_multirow_kernel<float, 16, 8, 5, 5><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
     else if (M == 6) si_mmvq_q4k_multirow_kernel<float, 16, 8, 6, 6><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    else if (M == 7) si_mmvq_q4k_multirow_kernel<float, 16, 8, 7, 7><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    else if (M == 8) si_mmvq_q4k_multirow_kernel<float, 16, 8, 8, 8><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
     else si_mmvq_q4k_multirow_kernel<float, 16, 8, 16><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
     return true;
 }
@@ -2209,7 +2227,10 @@ bool launch_gemv_i8_q81_multirow_f32(const void* q81, const signed char* W,
                                      const float* sw, float* y,
                                      int N, int K, int M, cudaStream_t stream) {
     if (!q81 || !W || !sw || !y || K != 2048 || M < 1 || M > 8) return false;
-    dim3 grid((N + 15) / 16);
+    int nblk = (N + 15) / 16;
+    const int cap = dflash_head_cta_cap();
+    if (cap > 0 && nblk > cap) nblk = cap;
+    dim3 grid(nblk);
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     if (M == 3) gemv_i8_q81_multirow_kernel<3><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
     else if (M == 4) gemv_i8_q81_multirow_kernel<4><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
@@ -2235,8 +2256,15 @@ bool launch_gemv_i4_q81_multirow_f32(const void* q81, const unsigned char* W,
     // dflash_verify_short_run accepts -- needs 7. Without those instantiations this returned false
     // and the caller fell back to a per-token full-vocab GEMV loop over the whole block_size=16,
     // which measured 3.80 ms against this kernel's 0.20.
+    //
+    // Grid is capped to SM/2 by default (SPARKINFER_DFLASH_HEAD_CTAS overrides). The kernel
+    // grid-strides, so every vocab row is still covered — the cap only stops this head from
+    // occupying the whole GPU while verify0 runs on another stream.
     if (!q81 || !W || !sw || !y || K != 2048 || M < 3 || M > 8) return false;
-    dim3 grid((N + 15) / 16);
+    int nblk = (N + 15) / 16;
+    const int cap = dflash_head_cta_cap();
+    if (cap > 0 && nblk > cap) nblk = cap;
+    dim3 grid(nblk);
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     if (M == 3) gemv_i4_q81_multirow_kernel<3><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
     else if (M == 4) gemv_i4_q81_multirow_kernel<4><<<grid, 16 * 32, 0, stream>>>(q, W, sw, y, N, K);
@@ -2252,30 +2280,28 @@ bool launch_gemv_q6k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
     if (K != 2048 || M < 1 || M > 16) return false;   // draft head shape (H=2048, B<=16)
     // Cap the grid so the draft head leaves SM slots for the target verify forward it runs
     // concurrently with (the kernel grid-strides, so a capped grid still covers every row).
-    // Default: half the SMs. The kernel grid-strides, so a capped grid still covers every row —
-    // it just stops the draft head from occupying the whole GPU while a target verify forward
-    // runs concurrently on another stream. Measured peak on an RTX 5090 (170 SMs) is exactly
-    // SM/2 = 85; both wider (170/340/full) and narrower (56/40/28) are worse.
-    static const int cap = []{
-        if (const char* e = getenv("SPARKINFER_DFLASH_HEAD_CTAS")) return atoi(e);
-        int sm = 0, dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
-            return 0;
-        return sm > 1 ? sm / 2 : 0;
-    }();
+    // Default: half the SMs. Measured peak on an RTX 5090 (170 SMs) is exactly SM/2 = 85;
+    // both wider (170/340/full) and narrower (56/40/28) are worse.
     int nblk = (N + 15) / 16;
+    const int cap = dflash_head_cta_cap();
     if (cap > 0 && nblk > cap) nblk = cap;
     dim3 grid(nblk);
+    auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    auto* w = reinterpret_cast<const unsigned char*>(W);
     if (M == 3) {
-        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 3, 3><<<grid, 16 * 32, 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, M);
+        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 3, 3><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    } else if (M == 5) {
+        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 5, 5><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    } else if (M == 6) {
+        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 6, 6><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    } else if (M == 7) {
+        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 7, 7><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    } else if (M == 8) {
+        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 8, 8><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
     } else if (M == 15) {
-        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 16, 15><<<grid, 16 * 32, 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, M);
+        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 16, 15><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
     } else {
-        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 16><<<grid, 16 * 32, 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, M);
+        gemv_q6k_dp4a_multirow_kernel<float, 16, 8, 16><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
     }
     return true;
 }

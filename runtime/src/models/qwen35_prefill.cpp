@@ -1282,6 +1282,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local const void* graph_capture_key = nullptr;
     static thread_local const void* graph_btable_key = nullptr;
     static thread_local int graph_ns_key = -1;
+    // #764 selects proposal depth 5 or 7 by context, so this path is warmed at N=6 or N=8.
+    // The recorded grids, Arena bump offsets, and host memcpy width all scale with N — replaying
+    // a depth-5 graph for a depth-7 verify (or the reverse) is silent wrong math. Key it.
+    static thread_local int graph_n_key = -1;
     static thread_local const void* verify_head_key = nullptr;
     static thread_local signed char* verify_head_i8 = nullptr;
     static thread_local float* verify_head_scale = nullptr;
@@ -1405,7 +1409,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     bool head_ok = false;
     if (graph_model_key != s.w.lm_head || graph_state_key != s.lin_state ||
         graph_conv_key != s.lin_conv_state || graph_capture_key != capture_dst ||
-        graph_btable_key != btable || graph_ns_key != ns) {
+        graph_btable_key != btable || graph_ns_key != ns || graph_n_key != N) {
         if (verify_exec) cudaGraphExecDestroy(verify_exec);
         if (verify_graph) cudaGraphDestroy(verify_graph);
         verify_exec = nullptr; verify_graph = nullptr;
@@ -1416,6 +1420,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_capture_key = capture_dst;
         graph_btable_key = btable;
         graph_ns_key = ns;
+        graph_n_key = N;
     }
     if (graph_ready && capture_only) return 0;   // already built
     if (graph_ready) {
