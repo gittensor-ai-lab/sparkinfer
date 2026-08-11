@@ -2084,14 +2084,44 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
 
     std::vector<int> block(B), posterior(B), draft_ids(B);
     // Proposal depth (also sets the draft's active diffusion width, depth+1). 5 is the measured
-    // optimum: accept length rises only 5.33 -> 5.95 -> 6.43 going to depth 6 and 7, while each
-    // extra verify row costs a flat ~0.74 ms, so depth 6 already loses. Keep in sync with
-    // dflash_draft.cpp's copy of this default.
-    static const int kProposalDepth = []{
-        const char* e = getenv("SPARKINFER_DFLASH_PROPOSALS");
-        int v = e ? atoi(e) : 5;
-        return v < 1 ? 1 : (v > 15 ? 15 : v);
+    // optimum at short context: accept length rises only 5.33 -> 5.95 -> 6.43 going to depth 6 and
+    // 7, while each extra verify row costs a flat ~0.74 ms, so depth 6 already loses there.
+    //
+    // That trade inverts once the KV is long. An extra verify row costs roughly one more set of
+    // routed experts (each row picks its own 8 of 256, and they barely overlap), which is a fixed
+    // price per row; what it buys is fewer decode steps, and every step re-reads the whole KV
+    // cache. Short context: the KV read is negligible, the expert reads dominate, depth 5 wins.
+    // Long context: the KV read dominates, and paying flat expert cost to remove whole steps wins.
+    //
+    // The draft is also running out of room to be asked: at 32k the accept length is 5.61 out of a
+    // maximum of 6, so ~93% of steps are truncated by the request size rather than rejected by the
+    // target. Depth 7 is the largest that keeps every batched path -- the compact verify itself
+    // (dflash_verify_short_run bails above 8 rows), the row-batched Q4_K/Q6_K/Q8_0 GEMVs (MMAX=8 is
+    // the widest instantiation) and the batched MoE all stop at 8 rows -- and it leaves the draft
+    // untouched, because a width of depth+1 rounds up to the same 8-wide block either way.
+    //
+    // Measured, tok/s at depth 5 -> 7 (2 reps each, RTX 5090 @2550):
+    //     128    800.2 -> 749.1  (-6.4%)      8192   432.5 -> 419.7  (-3.0%)
+    //     4096   490.0 -> 429.3  (-12.4%)    12288   630.2 -> 677.7  (+7.5%)
+    //     16384  559.8 -> 567.4  (+1.4%)     32768   497.7 -> 520.2  (+4.5%)
+    // The crossover sits between 8k and 12k, so the floor is 12288 and everything below it keeps
+    // the depth it has today. Acceptance is a property of the text as much as of the length (the
+    // 8k prompt accepts 3.66, less than the 4k one's 3.91), so the floor is deliberately past the
+    // last length measured to lose rather than at it.
+    static const int kDeepMinSeq = []{
+        const char* e = getenv("SPARKINFER_DFLASH_DEEP_MIN_SEQ");
+        int v = e ? atoi(e) : 12288;
+        return v < 1 ? 1 : v;
     }();
+    // Explicit override wins; 0/unset selects by length. Keep in sync with dflash_draft.cpp, which
+    // reads the same variable for its own default and is handed this value per block.
+    static const int kProposalDepthEnv = []{
+        const char* e = getenv("SPARKINFER_DFLASH_PROPOSALS");
+        int v = e ? atoi(e) : 0;
+        return v < 0 ? 0 : (v > 15 ? 15 : v);
+    }();
+    const int kProposalDepth = kProposalDepthEnv > 0 ? kProposalDepthEnv
+                             : ((n + max_new) >= kDeepMinSeq ? 7 : 5);
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
     // accepted length, and it has no reason to sit at exactly B. Measured on RTX 5090 at the three
@@ -2211,7 +2241,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             s.defer_decode_sync = false;
         }
         const bool draft_ok = draft.forward_block(
-            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr);
+            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth);
         if (!compact_verify && p0 == kDFlashDeferred) {
             cu(cudaStreamSynchronize(s.stream), "verify0 sync");
             s.decode_pending = false;

@@ -568,7 +568,7 @@ void DFlashDraftModel::ensure_quant() { if (p_) p_->ensure_quant(); }
 
 bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      const int* noise_ids, int pos0,
-                                     int* out_argmax, cudaStream_t stream) {
+                                     int* out_argmax, cudaStream_t stream, int proposals) {
     Impl& s = *p_;
     s.ensure_quant();
     if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
@@ -582,21 +582,28 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     const int qdim = c.n_q_heads * c.head_dim;
     const int kvdim = c.n_kv_heads * c.head_dim;
     const int d = c.head_dim;
-    // Proposal depth (also sets the draft's active diffusion width, depth+1).
-    static const int kProposalDepth = []{
+    // Proposal depth (also sets the draft's active diffusion width, depth+1). The caller selects
+    // it by context length and passes it in; the env default only applies when it does not.
+    static const int kProposalDepthDefault = []{
         const char* e = getenv("SPARKINFER_DFLASH_PROPOSALS");
         int v = e ? atoi(e) : 5;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
+    const int kProposalDepth = proposals > 0 ? (proposals > 15 ? 15 : proposals)
+                                             : kProposalDepthDefault;
     // Active diffusion width. Only rows 0..kProposalDepth are ever consumed (row 0 is the seed,
     // 1..kProposalDepth the scored proposals), yet the backbone was run at the checkpoint's full
     // block_size=16 — 12 of every 16 rows computed and discarded. The block's attention is
     // bidirectional, so narrowing it DOES change what the draft proposes; that is allowed here
     // because every emitted token is still a target argmax, only the accept length can move.
     // SPARKINFER_DFLASH_BLOCK_WIDTH overrides (0/unset = kProposalDepth+1).
-    static const int BW = [&]{
-        const char* e = getenv("SPARKINFER_DFLASH_BLOCK_WIDTH");
-        int v = e ? atoi(e) : 0;
+    // Not cached across calls: the proposal depth it derives from is now chosen per generation.
+    const int BW = [&]{
+        static const int env_w = []{
+            const char* e = getenv("SPARKINFER_DFLASH_BLOCK_WIDTH");
+            return e ? atoi(e) : 0;
+        }();
+        int v = env_w;
         if (v <= 0) v = kProposalDepth + 1;
         if (v < kProposalDepth + 1) v = kProposalDepth + 1;
         // Round up to a width the batched-GEMV path is instantiated for; anything else falls

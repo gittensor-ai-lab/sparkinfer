@@ -63,9 +63,13 @@ public:
     // that primes the draft outside a timed region does not pay for it inside one. Idempotent.
     void ensure_quant();
 
+    //   proposals:     how many rows after the seed to score (0 = the built-in default). The
+    //                  verifier picks this by context length, so the draft has to be told rather
+    //                  than deciding for itself, or the two disagree on how long a block is.
     bool forward_block(const void* target_hidden, int ctx_len,
                        const int* noise_ids, int pos0,
-                       int* out_argmax, cudaStream_t stream = nullptr);
+                       int* out_argmax, cudaStream_t stream = nullptr,
+                       int proposals = 0);
 
     // Apply target lm_head to last forward's hidden states; writes device logits [block, vocab]
     // and host argmax. Called internally by forward_block; exposed for debugging.

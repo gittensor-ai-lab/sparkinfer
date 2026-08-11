@@ -839,21 +839,31 @@ void launch_flash_decode_split(
             // Fold S verify rows into one CTA so the staged K/V tile is read once for all of them
             // instead of once per row. Only when S divides num_seqs exactly, so no row is padded.
             static int seqfold = -1;
-            // 3 measured best on RTX 5090 (32k: 459.1 -> 497.0 tok/s). The fold is limited by the
-            // extra per-row accumulators it keeps live: 2 and 3 are within noise of each other in
-            // isolation (951.6 vs 943.8 us at 32k) while 6 regresses to 1548.0 us, worse than not
-            // folding at all. SPARKINFER_FA_SEQFOLD=1 restores one row per CTA.
-            if (seqfold < 0) { const char* e = getenv("SPARKINFER_FA_SEQFOLD"); seqfold = e ? atoi(e) : 3; }
-            if (!int8_kv && seqfold > 1 && num_seqs > 1 && (num_seqs % seqfold) == 0) {
+            // The fold is limited by the extra per-row accumulators it keeps live: 2, 3 and 4 are
+            // close in isolation (951.6 / 943.8 us at 32k for 2 and 3) while 6 regresses to
+            // 1548.0 us, worse than not folding at all. Since a fold only runs when it divides the
+            // row count exactly, the default picks the widest instantiation that does: a 6-row
+            // verify folds by 3 and an 8-row verify by 4, each leaving 2 CTAs per (kv head, split).
+            // Measured at 32k on an 8-row verify: fold 4 = 518.6 tok/s against fold 2 = 512.4.
+            // SPARKINFER_FA_SEQFOLD pins a specific width; 1 restores one row per CTA.
+            if (seqfold < 0) { const char* e = getenv("SPARKINFER_FA_SEQFOLD"); seqfold = e ? atoi(e) : 0; }
+            const int fold = seqfold > 0 ? seqfold
+                           : (num_seqs % 4 == 0 ? 4 : (num_seqs % 3 == 0 ? 3 : (num_seqs % 2 == 0 ? 2 : 1)));
+            if (!int8_kv && fold > 1 && num_seqs > 1 && (num_seqs % fold) == 0) {
                 const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
-                dim3 gqf(num_kv_heads * n_splits, num_seqs / seqfold);
-                if (seqfold == 2)
+                dim3 gqf(num_kv_heads * n_splits, num_seqs / fold);
+                if (fold == 2)
                     fa_split_gqa_kernel<256, GQA, TILE, false, 2><<<gqf, GQA * 32, smem, stream>>>(
                         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
                         part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,
                         n_splits, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
-                else if (seqfold == 3)
+                else if (fold == 3)
                     fa_split_gqa_kernel<256, GQA, TILE, false, 3><<<gqf, GQA * 32, smem, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,
+                        n_splits, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                else if (fold == 4)
+                    fa_split_gqa_kernel<256, GQA, TILE, false, 4><<<gqf, GQA * 32, smem, stream>>>(
                         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
                         part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks,
                         n_splits, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
