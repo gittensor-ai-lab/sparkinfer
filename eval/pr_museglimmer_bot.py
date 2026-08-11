@@ -16,7 +16,7 @@ Scoring, same-box PR-vs-main on a single pinned GPU:
               SAME GGUF, exactly the methodology validated by hand this session (commit
               6d911d4's message): qwen3_gguf_score dumps sparkinfer's per-position distribution,
               llama-server answers /completion (n_probs + cache_prompt + temperature=0) for the
-              same positions, accuracy_compare.py reports top1/KL. Bar: top1 >= 0.90, KL <= 0.20
+              same positions, accuracy_compare.py reports top1/KL. Bar: top1 >= 0.90, KL <= 0.10
               (this session achieved 0.980 / 0.0029 on the exact eval_text.txt corpus reused
               here). A PR that fails this bar is REJECTed regardless of speed — speed is
               meaningless if a PR silently breaks a still-fragile architecture's correctness.
@@ -73,7 +73,7 @@ BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 # on the 99-token eval_text.txt corpus; bars themselves are the short-pass bars this codebase
 # already uses elsewhere, see accuracy_compare.py's own docstring bar for top-1).
 ACC_TOP1_BAR = float(os.environ.get("MUSEGLIMMER_ACC_TOP1_BAR", "0.90"))
-ACC_KL_BAR = float(os.environ.get("MUSEGLIMMER_ACC_KL_BAR", "0.20"))
+ACC_KL_BAR = float(os.environ.get("MUSEGLIMMER_ACC_KL_BAR", "0.10"))
 
 EVAL_PREFIX = "eval-museglimmer:"
 MUSEGLIMMER_MERGE_FIRST = "museglimmer-merge-first"
