@@ -22,6 +22,8 @@
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/proj_requant.h"
+#include "sparkinfer/lmcache_bridge_client.h"
+#include "sparkinfer/lmcache_staging.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -236,6 +238,12 @@ struct Qwen35Model::Impl {
     int prefix_len = 0;
     int prefix_next = -1;
     bool prefix_active = false;
+
+    // Optional external KV cache tier (docs/lmcache_bridge_protocol.md). Null = disabled (the
+    // default) -- every lookup/store call site below is a no-op when this is null, so nothing
+    // about existing behavior changes unless a caller explicitly opts in via
+    // set_lmcache_bridge().
+    BridgeClient* lmcache_bridge = nullptr;
 
     // DFlash speculative decoding (target-side primitives).
     DFlashDraftModel* dflash_draft = nullptr;
@@ -1607,6 +1615,59 @@ bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
     return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
            n_tokens <= batched_maxctx;
 }
+
+// LMCache chunk size, tokens. Doubles as both the LOOKUP eligibility threshold (below this many
+// tokens, always recompute locally rather than pay an IPC round trip) and the STORE alignment
+// unit (a store range is rounded down to the nearest multiple, matching what the sidecar's own
+// LMCache instance is configured with -- see bridge/lmcache_bridge.py's identically-named env
+// var). Not negotiated from the sidecar's HELLO_ACK at runtime (that field exists on the wire
+// but is currently informational-only on this side, see lmcache_bridge_client.cpp) -- both sides
+// must be configured to agree; a mismatch degrades safely (misaligned STOREs are rejected by the
+// sidecar, not corrupted) rather than crashing, so this is a real but non-catastrophic
+// simplification, not a hidden correctness trap.
+int lmcache_chunk_size_tokens() {
+    static int chunk = [] {
+        const char* e = getenv("SPARKINFER_LMCACHE_CHUNK_SIZE");
+        const int v = e ? atoi(e) : 256;
+        return v > 0 ? v : 256;
+    }();
+    return chunk;
+}
+
+BridgeKVLayout lmcache_layout_from_cfg(const Qwen35Config& cfg, const KVCacheManager& kv) {
+    BridgeKVLayout layout;
+    layout.num_layers = cfg.n_layers;
+    layout.num_kv_heads = cfg.n_kv_heads;
+    layout.head_dim = cfg.head_dim;
+    layout.block_size = kv.block_size();
+    layout.int8_kv = kv.int8_kv();
+    layout.elem_bytes = kv.int8_kv() ? 1 : 2;
+    // model_name is unused for the staging byte-math this layout feeds (stage_kv_to_shm /
+    // restore_kv_from_shm never read it) -- the BridgeClient's own layout, fixed at construction
+    // and used for HELLO, is what actually needs to match the sidecar's.
+    return layout;
+}
+
+// Stores tokens[start, end) (rounded down to the nearest lmcache_chunk_size_tokens() boundary --
+// a trailing partial chunk is silently dropped, not sent, since the sidecar would reject it as
+// misaligned anyway) for seq_id to the external cache tier. No-op if no bridge is attached, the
+// bridge is currently unreachable, or nothing chunk-aligned remains. Fire-and-forget: the actual
+// network round trip happens on BridgeClient's own background thread, this call only blocks for
+// the (synchronous, on-stream) cudaMemcpy staging into shm.
+void lmcache_maybe_store(Qwen35Model::Impl& s, uint64_t seq_id, const std::vector<int>& tokens,
+                         int start, int end) {
+    if (!s.lmcache_bridge || !s.lmcache_bridge->is_alive()) return;
+    const int chunk = lmcache_chunk_size_tokens();
+    const int aligned_end = (end / chunk) * chunk;
+    if (aligned_end <= start) return;
+
+    static std::atomic<uint64_t> counter{0};
+    const std::string shm_name = "/sparkinfer_kv_store_" + std::to_string(seq_id) + "_" +
+                                 std::to_string(counter.fetch_add(1));
+    const BridgeKVLayout layout = lmcache_layout_from_cfg(s.cfg, *s.kv);
+    if (!stage_kv_to_shm(*s.kv, layout, seq_id, start, aligned_end, shm_name, s.stream)) return;
+    s.lmcache_bridge->store_async(tokens, start, aligned_end, shm_name);
+}
 } // namespace
 
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
@@ -1761,11 +1822,42 @@ int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chu
             return seed;
         }
     }
-    int limit = n;
-    if (chunk_limit > 0 && n > chunk_limit) limit = chunk_limit;
-    const int stop = start + limit;
+
+    // External KV cache lookup (docs/lmcache_bridge_protocol.md). Deliberately gated on
+    // batched_prefill_enabled() having already been tried-and-failed (or never eligible) above:
+    // the batched path is ~100x faster than the token loop and only ever eligible from position
+    // 0, so restoring a prefix from the bridge only when we were headed for the token loop
+    // anyway means a partial hit can never downgrade what would otherwise be a fast batched pass
+    // into a slower one for the remainder -- it's a strict win, never a trade-off. Only on the
+    // very first call for this range (start==0); a chunked resumption call (start>0, continuing
+    // a previous partial token-loop advance) never re-queries -- one round trip per prefill.
+    int actual_start = start;
+    if (start == 0 && s.lmcache_bridge && s.lmcache_bridge->is_alive() &&
+        n >= lmcache_chunk_size_tokens()) {
+        LookupResult res = s.lmcache_bridge->lookup(std::vector<int>(ids, ids + end));
+        if (res.ok && res.matched_tokens > 0) {
+            const BridgeKVLayout layout = lmcache_layout_from_cfg(s.cfg, *s.kv);
+            bool restored = true;
+            for (const BridgeKVChunk& c : res.chunks) {
+                if (!restore_kv_from_shm(*s.kv, layout, s.active_seq_id, res.shm_name,
+                                         c.shm_offset_bytes, c.start_tok, c.len_tok, s.stream)) {
+                    restored = false;
+                    break;
+                }
+            }
+            // A partial restore failure means some positions in [0, matched_tokens) may hold
+            // garbage KV -- never resume the token loop past whatever was verified fully
+            // restored, and never resume past a failure point at all: fall back to recomputing
+            // the entire range from 0 rather than risk attending against corrupted KV.
+            if (restored) actual_start = res.matched_tokens;
+        }
+    }
+
+    int limit = end - actual_start;
+    if (chunk_limit > 0 && limit > chunk_limit) limit = chunk_limit;
+    const int stop = actual_start + limit;
     int next = -1;
-    for (int i = start; i < stop; i++) {
+    for (int i = actual_start; i < stop; i++) {
         // Only sample (compute logits/argmax) at the true end of the whole range, not at a
         // chunk boundary -- decode doesn't start until the full prompt is ingested, so
         // intermediate chunk-final tokens never need a logits pass (unless the legacy
@@ -1802,6 +1894,11 @@ bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
 void Qwen35Model::clear_prefix_cache() {
     Impl& s = *p_;
     if (s.prefix_active || s.kv->allocated_tokens(s.active_seq_id) > 0) {
+        // Store to the external cache tier before the blocks it reads are freed below -- this
+        // is the "prefix cache overwrite" eviction point (docs/lmcache_bridge_protocol.md's
+        // STORE trigger list): the active prefix is about to be dropped for a different one.
+        if (s.prefix_active)
+            lmcache_maybe_store(s, s.active_seq_id, s.prefix_tokens, 0, s.prefix_len);
         s.kv->free(s.active_seq_id);
         invalidate_decode_graph();
     }
@@ -1915,9 +2012,18 @@ uint64_t Qwen35Model::open_session(int num_tokens) {
     return seq_id;
 }
 
-void Qwen35Model::close_session(uint64_t seq_id) {
+void Qwen35Model::set_lmcache_bridge(BridgeClient* bridge) { p_->lmcache_bridge = bridge; }
+
+void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_tokens) {
     Impl& s = *p_;
     if (seq_id == 0) return;
+    // Store to the external cache tier before freeing the blocks it reads -- this is the
+    // "session close" eviction point (docs/lmcache_bridge_protocol.md's STORE trigger list).
+    // store_tokens is null for most callers (this model class doesn't itself track a session's
+    // original prompt; only ContinuousBatchEngine::finish_job has that context) -- a null
+    // pointer is a pure no-op here, not a degraded path.
+    if (store_tokens && !store_tokens->empty())
+        lmcache_maybe_store(s, seq_id, *store_tokens, 0, (int)store_tokens->size());
     s.kv->free(seq_id);
     auto it = s.sessions.find(seq_id);
     if (it != s.sessions.end()) {

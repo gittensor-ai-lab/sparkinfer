@@ -9,6 +9,7 @@
 namespace sparkinfer {
 
 class ThermalGovernor;   // optional decode-time thermal pacing (thermal_governor.h)
+class BridgeClient;      // optional external KV cache tier (lmcache_bridge_client.h)
 
 // Device (bf16) weight pointers for one layer.
 struct Qwen35LayerWeights {
@@ -193,16 +194,26 @@ public:
     // the argmax seed for decode once out_pos == end, or -1 while there is remaining work (or on
     // failure). The single funnel both cache_prefix()'s exclusive-session path and
     // ContinuousBatchEngine::step_job()'s continuous-batch path dispatch prefill through, so
-    // batched-vs-token-loop routing and (later) any external KV cache lookup/store only need to
-    // be implemented once.
+    // batched-vs-token-loop routing and external KV cache lookup/store (when a bridge is
+    // attached via set_lmcache_bridge()) only need to be implemented once.
     int ingest_prompt_range(const int* ids, int start, int end, int chunk_limit = 0,
                             int* out_pos = nullptr);
+
+    // Attaches an optional external KV cache tier (docs/lmcache_bridge_protocol.md). Null (the
+    // default) leaves every lookup/store call site a no-op -- existing behavior is unchanged
+    // unless a caller explicitly opts in. Does not take ownership; the caller (ModelEngine) is
+    // responsible for the BridgeClient's lifetime, which must outlive this model.
+    void set_lmcache_bridge(BridgeClient* bridge);
 
     // Per-request session lifecycle for continuous batching / serving.
     // open_session() allocates right-sized KV blocks (+ hybrid recurrent state when needed).
     // activate_session() binds forward_token / prefill to that seq_id. Returns 0 on OOM.
     uint64_t open_session(int num_tokens);
-    void close_session(uint64_t seq_id);
+    // store_tokens, when non-null and an LMCache bridge is attached, stores this session's KV
+    // for [0, store_tokens->size()) to the bridge (chunk-aligned, see lmcache_maybe_store in
+    // qwen35.cpp) before freeing it -- the "session close" eviction point. Most callers don't
+    // have the original prompt at this call site and pass nullptr, which is a pure no-op.
+    void close_session(uint64_t seq_id, const std::vector<int>* store_tokens = nullptr);
     void activate_session(uint64_t seq_id);
     uint64_t active_session() const;
 

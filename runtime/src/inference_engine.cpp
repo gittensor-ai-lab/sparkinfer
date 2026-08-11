@@ -276,8 +276,15 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     // name it.
     auto finish_job = [this](Job& j) {
         j.done = true;
-        if (j.seq_id != 0) model_->close_session(j.seq_id);
-        else {
+        if (j.seq_id != 0) {
+            // Offer this session's KV to the external cache tier (docs/lmcache_bridge_protocol.md)
+            // only once the full prompt has actually been ingested -- j.phase only advances past
+            // PREFILL once prefill_pos reaches the prompt's end (see step_job). A job
+            // cancelled/timed-out mid-prefill has KV for only part of its prompt range (possibly
+            // garbage past prefill_pos), so store_tokens must stay null in that case; passing the
+            // full prompt would tell close_session a longer range is valid than actually is.
+            model_->close_session(j.seq_id, j.phase != SeqPhase::PREFILL ? &j.req.prompt : nullptr);
+        } else {
             kv_->free(j.seq_id);
             if (j.req.use_prefix_session) model_->release_prefix_session();
         }
