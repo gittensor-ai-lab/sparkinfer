@@ -554,6 +554,7 @@ __global__ void rmsnorm_qk_kernel(__nv_bfloat16* __restrict__ q, __nv_bfloat16* 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
 #include <cassert>
+#include <cstdlib>
 
 void launch_rmsnorm_qk(void* q, void* k, const void* q_w, const void* k_w,
                        int n_q_heads, int n_kv_heads, int head_dim, float eps, cudaStream_t stream) {
@@ -647,7 +648,25 @@ void launch_add_rmsnorm3_q8_rows(const void* x, const void* res1, const void* re
 void launch_muse_sandwich_tail(const void* residual, const void* branch, const void* post_w,
                                const void* next_w, void* out_x, void* out_xn,
                                int rows, int cols, float post_eps, float eps, cudaStream_t stream) {
-    muse_sandwich_tail_kernel<<<rows, 256, 0, stream>>>(
+    // 256 threads for a 6656-wide row means npack = 832 packs walked 3-4 deep per thread, twice,
+    // on a chain of dependent loads -- and the whole thing is one CTA of a 170-SM device. One
+    // thread per pack collapses that chain; 1024 is the first width that covers all 832 in a
+    // single pass. Sweep at 128 decode: 256 -> 91.80 tok/s, 512 -> 92.87, 768 -> 92.69,
+    // 1024 -> 93.49.
+    //
+    // This is the one change here that is NOT bit-identical: the block width sets how the
+    // sum-of-squares partials are grouped, so fp32 reassociates. It is a reassociation and not a
+    // loss of quality -- teacher-forced over 191 in-distribution positions, perplexity moves
+    // 2.12623 -> 2.11524 and agreement with the true next token 176/191 -> 175/191, while
+    // agreement against the 256-wide arm is 189/191 with mean |dlogprob| 1.1e-2.
+    // SPARKINFER_MUSE_TAIL_W overrides the width (256/512/768/1024) for A/B.
+    static int tail_w = -1;
+    if (tail_w < 0) {
+        const char* e = getenv("SPARKINFER_MUSE_TAIL_W");
+        tail_w = e ? atoi(e) : 1024;
+        if (tail_w != 256 && tail_w != 512 && tail_w != 768 && tail_w != 1024) tail_w = 1024;
+    }
+    muse_sandwich_tail_kernel<<<rows, tail_w, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(residual),
         reinterpret_cast<const __nv_bfloat16*>(branch),
         reinterpret_cast<const __nv_bfloat16*>(post_w),
