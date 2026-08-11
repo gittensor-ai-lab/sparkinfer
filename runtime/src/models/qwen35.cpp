@@ -1743,25 +1743,39 @@ bool Qwen35Model::prompt_matches_prefix(const std::vector<int>& prompt) const {
     return true;
 }
 
-int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end) {
+int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chunk_limit,
+                                     int* out_pos) {
     Impl& s = *p_;
-    if (!ids || end <= start) return -1;
+    if (!ids || end <= start) {
+        if (out_pos) *out_pos = start;
+        return -1;
+    }
     const int n = end - start;
+    // Batched GEMM prefill never chunks (no start_pos support in prefill_batched_run yet) --
+    // only eligible on the very first call for this range (start==0) and always covers the
+    // whole [0,end) in one pass regardless of chunk_limit.
     if (start == 0 && batched_prefill_enabled(s.gguf, s.cfg, n)) {
         int seed = prefill_batched(ids, n);
-        if (seed >= 0 && seed < s.cfg.vocab) return seed;
+        if (seed >= 0 && seed < s.cfg.vocab) {
+            if (out_pos) *out_pos = end;
+            return seed;
+        }
     }
+    int limit = n;
+    if (chunk_limit > 0 && n > chunk_limit) limit = chunk_limit;
+    const int stop = start + limit;
     int next = -1;
-    if (prefill_samples_lmhead()) {
-        for (int i = start; i < end; i++)
-            next = forward_token(ids[i], i, true);
-    } else {
-        for (int i = start; i + 1 < end; i++)
-            forward_token(ids[i], i, false);
-        if (end > start)
-            next = forward_token(ids[end - 1], end - 1, true);
+    for (int i = start; i < stop; i++) {
+        // Only sample (compute logits/argmax) at the true end of the whole range, not at a
+        // chunk boundary -- decode doesn't start until the full prompt is ingested, so
+        // intermediate chunk-final tokens never need a logits pass (unless the legacy
+        // every-step flag is set).
+        const bool sample = prefill_samples_lmhead() || i + 1 == end;
+        int r = forward_token(ids[i], i, sample);
+        if (sample) next = r;
     }
-    return next;
+    if (out_pos) *out_pos = stop;
+    return (stop >= end) ? next : -1;
 }
 
 bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {

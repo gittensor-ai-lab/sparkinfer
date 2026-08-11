@@ -184,6 +184,20 @@ public:
     // unsupported for this model/config. Implemented in qwen35_prefill.cpp.
     int prefill_batched(const int* prompt_ids, int n);
 
+    // Prefill prompt tokens [start, end) with the batched path when start==0 and eligible, else
+    // the token loop. chunk_limit > 0 caps the token-loop path to at most chunk_limit tokens per
+    // call (the batched path never chunks — it always covers the full range in one pass, so a
+    // chunk_limit smaller than end-start forces the token-loop fallback); pass 0 for unlimited
+    // (single call covers the whole range). out_pos, if non-null, receives the position reached
+    // (== end once the whole range is consumed, < end if chunk_limit stopped it early). Returns
+    // the argmax seed for decode once out_pos == end, or -1 while there is remaining work (or on
+    // failure). The single funnel both cache_prefix()'s exclusive-session path and
+    // ContinuousBatchEngine::step_job()'s continuous-batch path dispatch prefill through, so
+    // batched-vs-token-loop routing and (later) any external KV cache lookup/store only need to
+    // be implemented once.
+    int ingest_prompt_range(const int* ids, int start, int end, int chunk_limit = 0,
+                            int* out_pos = nullptr);
+
     // Per-request session lifecycle for continuous batching / serving.
     // open_session() allocates right-sized KV blocks (+ hybrid recurrent state when needed).
     // activate_session() binds forward_token / prefill to that seq_id. Returns 0 on OOM.
@@ -234,9 +248,6 @@ public:
 
 private:
     void invalidate_decode_graph();
-    // Prefill prompt tokens [start, end) with batched path when start==0, else token loop.
-    // Returns argmax seed at end-1 for decode, or -1 on failure.
-    int ingest_prompt_range(const int* ids, int start, int end);
     void dflash_maybe_capture_layer(int layer);
     // Depth-adaptive KV-split count for a given seqlen (32/128/160/256 tiers, GQA-8/hd256
     // occupancy correction). Shared by forward_token()'s normal per-token adaptation and

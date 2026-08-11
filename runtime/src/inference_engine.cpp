@@ -9,36 +9,6 @@ namespace sparkinfer {
 
 namespace {
 
-bool prefill_samples_lmhead() {
-    static int legacy = -1;
-    if (legacy < 0) {
-        const char* e = getenv("SPARKINFER_PREFILL_LEGACY");
-        legacy = (e && e[0] == '1') ? 1 : 0;
-    }
-    return legacy != 0;
-}
-
-// Match Qwen35Model::batched_prefill_enabled: dense hybrid (Qwythos) OR MoE hybrid
-// (Qwen3.6). The old dense_ffn-only gate forced MoE CB onto the token loop (~300 pp),
-// which is why scored Qwen3.6 CB mixed TTFT sat at ~17s on main.
-bool batched_prefill_enabled(const Qwen35Config& cfg, bool gguf, int n_tokens) {
-    static int want_batched = -1, batched_maxctx = -1;
-    if (want_batched < 0) {
-        const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
-        want_batched = (e && e[0] == '0') ? 0 : 1;
-        const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
-        batched_maxctx = mc ? atoi(mc) : 131072;
-    }
-    const bool ffn_ok = cfg.dense_ffn || cfg.n_experts > 0;
-    // Muse Glimmer: the batched-prefill full-attention kernels have no per-layer sliding-
-    // window/NoPE hook yet (see the matching note in Qwen35Model::batched_prefill_enabled,
-    // qwen35.cpp) -- force the token-loop path, which reuses forward_token()'s correct
-    // per-layer dispatch, until a windowed batched-prefill kernel exists.
-    if (cfg.muse_glimmer) return false;
-    return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
-           n_tokens <= batched_maxctx;
-}
-
 // Chunked-prefill budget (vLLM-style): when decode requests are waiting, only
 // advance this many prefill tokens before yielding. 0 = unlimited (full prompt).
 int prefill_chunk_tokens() {
@@ -83,7 +53,6 @@ struct ContinuousBatchEngine::Job {
     int prefill_pos = 0;
     int decode_emitted = 0;
     int next_token = -1;
-    bool batched_prefill_done = false;
     std::vector<int> output;
     std::string error;
     std::function<bool(int)> on_token;  // false return = cancel
@@ -331,39 +300,20 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     if (job.phase == SeqPhase::PREFILL) {
         const int n = (int)job.req.prompt.size();
         const int chunk = prefill_chunk_tokens();
-        const int remain = n - job.prefill_pos;
-        // Batched GEMM prefill (Qwythos / Qwen3.6 hybrid) is ~100× faster than the
-        // token loop. Never demote it to token-loop "chunks" — that destroys ITPS under
-        // mixed load. True mid-prompt chunked batched prefill needs start_pos support
-        // in prefill_batched_run; until then, decode-first scheduling already advances
-        // waiting decodes once before this full batched pass runs.
-        if (job.prefill_pos == job.req.prefill_start && job.req.prefill_start == 0 &&
-            batched_prefill_enabled(cfg, true, remain)) {
-            const int seed = model_->prefill_batched(job.req.prompt.data() + job.prefill_pos, remain);
-            if (seed >= 0 && seed < cfg.vocab) {
-                job.next_token = seed;
-                job.prefill_pos = n;
-                job.batched_prefill_done = true;
-                job.phase = SeqPhase::DECODE;
-                return false;
-            }
-        }
-        // Token-loop (or chunked) prefill: used when batched is unavailable (non-hybrid /
-        // disabled). Advance up to `limit` tokens then yield so decode can run.
-        int limit = remain;
-        if (chunked && chunk > 0 && remain > chunk) limit = chunk;
-        int advanced = 0;
-        while (advanced < limit && job.prefill_pos < n) {
-            const bool sample = prefill_samples_lmhead() || job.prefill_pos + 1 == n;
-            if (sample)
-                job.next_token = model_->forward_token(job.req.prompt[(size_t)job.prefill_pos],
-                                                       job.prefill_pos, true);
-            else
-                model_->forward_token(job.req.prompt[(size_t)job.prefill_pos], job.prefill_pos, false);
-            job.prefill_pos++;
-            advanced++;
-        }
+        // Qwen35Model::ingest_prompt_range() is the single funnel both this continuous-batch
+        // path and cache_prefix()'s exclusive-session path dispatch prefill through: it picks
+        // batched GEMM prefill (Qwythos / Qwen3.6 hybrid, ~100x faster than the token loop, only
+        // eligible from position 0) vs. the token-loop fallback itself, and the batched path
+        // never chunks (no start_pos support in prefill_batched_run yet) regardless of the
+        // chunk_limit passed here -- decode-first scheduling already advances waiting decodes
+        // once before a full batched pass runs, so that never hurts ITPS under mixed load.
+        const int chunk_limit = chunked ? chunk : 0;
+        int out_pos = job.prefill_pos;
+        const int seed = model_->ingest_prompt_range(job.req.prompt.data(), job.prefill_pos, n,
+                                                      chunk_limit, &out_pos);
+        job.prefill_pos = out_pos;
         if (job.prefill_pos >= n) {
+            job.next_token = seed;
             if (job.next_token < 0 && job.req.use_prefix_session)
                 job.next_token = model_->prefix_seed_token();
             job.phase = SeqPhase::DECODE;
