@@ -420,6 +420,112 @@ __global__ void norm_then_add_kernel(const __nv_bfloat16* __restrict__ residual,
     }
 }
 
+// Muse Glimmer's sandwich-norm tail, fused. The architecture runs it twice per layer:
+//   out_x  = residual + RMSNorm(branch, post_w, post_eps)      (launch_norm_then_add)
+//   out_xn = RMSNorm(out_x, next_w, eps)                       (launch_rmsnorm)
+// Both are single-CTA kernels over 6656 elements -- ~3.2 us each for 13 KB, i.e. one SM of 170
+// and almost pure launch/reduction latency -- and there are 4 of them per layer, 208 per token.
+//
+// Bit-identical to the pair by construction: the block is the same 256 threads, each stage keeps
+// the other kernel's exact loop order and warp-reduction tree, and stage 2 re-reads the bf16-
+// rounded out_x back from global rather than reusing the float registers, which is precisely what
+// the separate launch_rmsnorm would have seen.
+__global__ void muse_sandwich_tail_kernel(const __nv_bfloat16* __restrict__ residual,
+                                          const __nv_bfloat16* __restrict__ branch,
+                                          const __nv_bfloat16* __restrict__ post_w,
+                                          const __nv_bfloat16* __restrict__ next_w,
+                                          __nv_bfloat16* __restrict__ out_x,
+                                          __nv_bfloat16* __restrict__ out_xn,
+                                          int cols, float post_eps, float eps) {
+    const size_t base = (size_t)blockIdx.x * cols;
+    __shared__ float s_warp[32];
+    const int npack = cols >> 3;
+    const int tail = npack << 3;
+
+    // ---- stage 1: norm_then_add over `branch` ----
+    const uint4* b4 = reinterpret_cast<const uint4*>(branch + base);
+    float ss = 0.f;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+        float bv[8]; rn_unpack8(__ldg(b4 + p), bv);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ss = __fmaf_rn(bv[j], bv[j], ss);
+    }
+    for (int c = tail + threadIdx.x; c < cols; c += blockDim.x) {
+        float v = __bfloat162float(branch[base + c]);
+        ss = __fmaf_rn(v, v, ss);
+    }
+    ss = rn_warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        v = rn_warp_sum(v);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + post_eps);
+    }
+    __syncthreads();
+    const float inv1 = s_warp[0];
+    {
+        const uint4* pw4 = reinterpret_cast<const uint4*>(post_w);
+        const uint4* r4 = reinterpret_cast<const uint4*>(residual + base);
+        uint4* ox4 = reinterpret_cast<uint4*>(out_x + base);
+        for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+            float bv[8]; rn_unpack8(__ldg(b4 + p), bv);
+            float rv[8]; rn_unpack8(__ldg(r4 + p), rv);
+            float wv[8]; rn_unpack8(__ldg(pw4 + p), wv);
+            float ov[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ov[j] = rv[j] + bv[j] * inv1 * wv[j];
+            ox4[p] = rn_pack8(ov);
+        }
+        for (int c = tail + threadIdx.x; c < cols; c += blockDim.x) {
+            float bv = __bfloat162float(branch[base + c]);
+            float rv = __bfloat162float(residual[base + c]);
+            float wv = __bfloat162float(post_w[c]);
+            out_x[base + c] = __float2bfloat16(rv + bv * inv1 * wv);
+        }
+    }
+    __syncthreads();   // out_x visible to the whole block, and s_warp free to reuse
+
+    // ---- stage 2: rmsnorm over the bf16-rounded out_x ----
+    const uint4* x4 = reinterpret_cast<const uint4*>(out_x + base);
+    float ss2 = 0.f;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+        float xv[8]; rn_unpack8(__ldg(x4 + p), xv);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ss2 = __fmaf_rn(xv[j], xv[j], ss2);
+    }
+    for (int c = tail + threadIdx.x; c < cols; c += blockDim.x) {
+        float v = __bfloat162float(out_x[base + c]);
+        ss2 = __fmaf_rn(v, v, ss2);
+    }
+    ss2 = rn_warp_sum(ss2);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss2;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        v = rn_warp_sum(v);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps);
+    }
+    __syncthreads();
+    const float inv2 = s_warp[0];
+    {
+        const uint4* nw4 = reinterpret_cast<const uint4*>(next_w);
+        uint4* on4 = reinterpret_cast<uint4*>(out_xn + base);
+        for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+            float xv[8]; rn_unpack8(__ldg(x4 + p), xv);
+            float wv[8]; rn_unpack8(__ldg(nw4 + p), wv);
+            float ov[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ov[j] = xv[j] * inv2 * wv[j];
+            on4[p] = rn_pack8(ov);
+        }
+        for (int c = tail + threadIdx.x; c < cols; c += blockDim.x) {
+            float v = __bfloat162float(out_x[base + c]);
+            out_xn[base + c] = __float2bfloat16(v * inv2 * __bfloat162float(next_w[c]));
+        }
+    }
+}
+
 // Fused per-head Q-norm + K-norm: ONE kernel over (n_q_heads + n_kv_heads) heads
 // (each block normalizes one head), vs two launch_rmsnorm calls. 1 graph node saved.
 __global__ void rmsnorm_qk_kernel(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k,
@@ -536,6 +642,18 @@ void launch_add_rmsnorm3_q8_rows(const void* x, const void* res1, const void* re
         reinterpret_cast<const __nv_bfloat16*>(res2), reinterpret_cast<const __nv_bfloat16*>(weight),
         reinterpret_cast<__nv_bfloat16*>(out_sum), reinterpret_cast<__nv_bfloat16*>(out_norm),
         reinterpret_cast<si_blk_q8_1*>(out_q8), cols, eps);
+}
+
+void launch_muse_sandwich_tail(const void* residual, const void* branch, const void* post_w,
+                               const void* next_w, void* out_x, void* out_xn,
+                               int rows, int cols, float post_eps, float eps, cudaStream_t stream) {
+    muse_sandwich_tail_kernel<<<rows, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(residual),
+        reinterpret_cast<const __nv_bfloat16*>(branch),
+        reinterpret_cast<const __nv_bfloat16*>(post_w),
+        reinterpret_cast<const __nv_bfloat16*>(next_w),
+        reinterpret_cast<__nv_bfloat16*>(out_x),
+        reinterpret_cast<__nv_bfloat16*>(out_xn), cols, post_eps, eps);
 }
 
 void launch_norm_then_add(const void* residual, const void* block_out, const void* weight,

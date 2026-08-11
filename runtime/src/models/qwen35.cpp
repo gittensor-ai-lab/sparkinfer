@@ -43,6 +43,15 @@ namespace {
 inline void cu(cudaError_t e, const char* what) {
     if (e != cudaSuccess) fprintf(stderr, "[qwen35] %s: %s\n", what, cudaGetErrorString(e));
 }
+// SPARKINFER_MUSE_FUSE_TAIL=0 splits Muse Glimmer's sandwich-norm tail back into the original
+// launch_norm_then_add + launch_rmsnorm pair (the two produce bit-identical output).
+inline bool muse_fuse_tail() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_FUSE_TAIL");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 using bf16 = unsigned short;
 
 // forward_token() sentinel: the decode graph was enqueued but not yet collected. Never a valid
@@ -1206,9 +1215,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // upstream's `post_norm_eps` in muse-glimmer.cpp), distinct from the model's
             // normal rms_eps (1e-5, used for attn_norm/ffn_norm/q_norm/k_norm) -- reusing
             // c.rms_eps here silently gives wrong post-attn/post-ffn norms.
+            // Both halves of the sandwich tail are single-CTA kernels over 6656 elements, so each
+            // costs ~3.2 us of launch/reduction latency for 13 KB of traffic. Fuse them.
+            if (muse_fuse_tail())
+                kernels::launch_muse_sandwich_tail(s.x, s.ao, w.post_attn_norm, w.ffn_norm,
+                                                   s.h, s.hn, 1, H, 1e-8f, c.rms_eps, st);
+            else {
             kernels::launch_norm_then_add(s.x, s.ao, w.post_attn_norm, s.h, 1, H, 1e-8f, st);
             dbg_bf16(s.h, H, 50, L);   // tag 50: h = x + sandwich_norm(ao)  (post-attn residual)
             kernels::launch_rmsnorm(s.h, w.ffn_norm, s.hn, 1, H, c.rms_eps, st);
+            }
             dbg_bf16(s.hn, H, 51, L);  // tag 51: hn = pre-FFN norm(h)
         } else if (fnq) {
             // fused: h = x + ao ; hn = RMSNorm(h, post_attn_norm). When fnq, also emit
@@ -1440,9 +1456,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // always null here. xn = RMSNorm(x, nextnorm) is the next layer's ordinary
             // pre-attn norm (or final_norm on the last layer), unaffected by the sandwich.
             // Same 1e-8 post_norm_eps as the post-attn sandwich norm above -- see that comment.
+            if (muse_fuse_tail())
+                kernels::launch_muse_sandwich_tail(s.h, s.routed, w.post_ffn_norm, nextnorm,
+                                                   s.x, s.xn, 1, H, 1e-8f, c.rms_eps, st);
+            else {
             kernels::launch_norm_then_add(s.h, s.routed, w.post_ffn_norm, s.x, 1, H, 1e-8f, st);
             dbg_bf16(s.x, H, 70, L);   // tag 70: x = h + sandwich_norm(routed)  (layer output)
             kernels::launch_rmsnorm(s.x, nextnorm, s.xn, 1, H, c.rms_eps, st);
+            }
         } else if (shared_to_fold) {
             if (fnq)
                 kernels::launch_add_rmsnorm3_q8(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);

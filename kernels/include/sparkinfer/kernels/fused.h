@@ -37,6 +37,17 @@ void launch_norm_then_add(const void* residual_bf16, const void* block_out_bf16,
                           const void* weight_bf16, void* out_bf16,
                           int rows, int cols, float eps, cudaStream_t stream = nullptr);
 
+// Muse Glimmer's sandwich-norm tail in one launch instead of two:
+//   out_x  = residual + RMSNorm(branch, post_w, post_eps)   (what launch_norm_then_add does)
+//   out_xn = RMSNorm(out_x, next_w, eps)                    (what the following launch_rmsnorm does)
+// Bit-identical to that pair: same 256-thread block, same per-stage loop order and reduction tree,
+// and stage 2 re-reads the bf16-rounded out_x from memory exactly as the separate kernel would.
+void launch_muse_sandwich_tail(const void* residual_bf16, const void* branch_bf16,
+                               const void* post_w_bf16, const void* next_w_bf16,
+                               void* out_x_bf16, void* out_xn_bf16,
+                               int rows, int cols, float post_eps, float eps,
+                               cudaStream_t stream = nullptr);
+
 // Fold residual_add(res1,res2) into add_rmsnorm2: out_sum = x + (res1 + res2).
 void launch_add_rmsnorm3(const void* x_bf16, const void* res1_bf16, const void* res2_bf16,
                          const void* weight_bf16, void* out_sum_bf16, void* out_norm_bf16,
