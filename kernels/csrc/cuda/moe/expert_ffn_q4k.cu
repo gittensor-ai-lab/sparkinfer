@@ -1479,6 +1479,74 @@ static inline bool launch_down_q5k_mmvq_splitk(
     }
 }
 
+// ---- Muse Glimmer contextual-sparsity FFN -------------------------------------------------
+// SwiGLU gates each FFN neuron by silu(gate.x); a neuron whose |silu(gate.x)| ~ 0 contributes
+// ~nothing to h = silu(gate.x)*up.x (and thus to the down projection). Muse Glimmer is strongly
+// contextually sparse per token, so this fused gate/up kernel computes the gate projection
+// first and, for a gated-off neuron, writes h = 0 and SKIPS that neuron's up-projection Q4_K
+// weight read -- reading fewer weight bytes per token, which is the decode bottleneck. The mask
+// |silu(gate.x)| < tau is uniform across the CTA (one CTA per neuron f), so there is no warp
+// divergence and the launch grid is unchanged -- the captured decode graph is unaffected. tau is
+// read once from the environment (default 0.08); SPARKINFER_MG_SPARSE_FFN=0 disables it (falls
+// back to the dense gate/up arm) and SPARKINFER_MG_SPARSE_TAU overrides tau, both for A/B.
+__managed__ float d_mg_sparse_tau = 0.f;
+
+static void mg_sparse_ffn_init() {
+    static int done = 0; if (done) return; done = 1;
+    const char* off = getenv("SPARKINFER_MG_SPARSE_FFN");
+    if (off && off[0] == '0') { d_mg_sparse_tau = 0.f; return; }
+    const char* t = getenv("SPARKINFER_MG_SPARSE_TAU");
+    d_mg_sparse_tau = t ? (float)atof(t) : 0.08f;
+}
+
+template <int H, int F, int TOPK>
+__global__ void gate_up_mmvq2_qwen_sparse_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, float tau, int pdl
+) {
+    constexpr int NW = 4;
+    const int row = blockIdx.x, ts = row / F, f = row - ts * F, tok = ts / TOPK;
+    const int e = expert_ids[ts];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4;
+    const int kqs = 2 * (tid & 15);
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
+    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
+    constexpr int NB = H >> 8;
+    __shared__ float sred[NW];
+    // Phase 1: gate projection -> reduce to ALL threads -> silu (uniform; decides the mask).
+    float tg = 0.f;
+    for (int kbx = kbx0; kbx < NB; kbx += 8)
+        tg += si_vec_dot_q4_K(g_row + kbx, vrow + (size_t)kbx * 8, kqs);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) tg += __shfl_xor_sync(0xffffffff, tg, m);
+    if (lane == 0) sred[warp] = tg;
+    __syncthreads();
+    float tgf = 0.f;
+    #pragma unroll
+    for (int w = 0; w < NW; w++) tgf += sred[w];
+    const float g = q4kf_silu(tgf);
+    float hval = 0.f;
+    if (fabsf(g) >= tau) {                 // active neuron -> read up (Phase 2)
+        float tu = 0.f;
+        for (int kbx = kbx0; kbx < NB; kbx += 8)
+            tu += si_vec_dot_q4_K(u_row + kbx, vrow + (size_t)kbx * 8, kqs);
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) tu += __shfl_xor_sync(0xffffffff, tu, m);
+        __syncthreads();
+        if (lane == 0) sred[warp] = tu;
+        __syncthreads();
+        float tuf = 0.f;
+        #pragma unroll
+        for (int w = 0; w < NW; w++) tuf += sred[w];
+        hval = g * tuf;
+    }
+    if (tid == 0) h_scratch[(size_t)ts * F + f] = hval;
+    if (pdl) si_pdl_lc();
+}
+
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
     int gate_type, int up_type, int down_type,
@@ -1487,6 +1555,7 @@ void launch_moe_expert_ffn_q4k(
     int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream,
     bool ar_exact_splitk
 ) {
+    mg_sparse_ffn_init();
     // Qwythos dense hybrid fast path: pack2 gate/up without expert lookup + PDL-chained
     // quant/down. SPARKINFER_DENSE_FFN_FUSE=0 restores the generic MoE dispatch below.
     static int dense_fuse = -1;
@@ -1625,11 +1694,18 @@ void launch_moe_expert_ffn_q4k(
         // five times that, so pairing rows into 8-warp CTAs only coarsens scheduling. Measured
         // on a 5090 at 128 decode, a pack2 arm for this shape gives back about four fifths of
         // what this arm wins, so it is deliberately absent rather than merely unwritten.
-        else if (gu_spec && hidden == 6656 && ffn == 19968 && top_k == 1)
-            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
-                gate_up_mmvq2_qwen_kernel<6656, 19968, 1>,
-                q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+        else if (gu_spec && hidden == 6656 && ffn == 19968 && top_k == 1) {
+            if (d_mg_sparse_tau > 0.f)   // Muse Glimmer contextual-sparsity FFN (skip gated-off up reads)
+                launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                    gate_up_mmvq2_qwen_sparse_kernel<6656, 19968, 1>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, d_mg_sparse_tau, gu_pdl);
+            else
+                launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                    gate_up_mmvq2_qwen_kernel<6656, 19968, 1>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+        }
         else
             launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
                 gate_up_mmvq2_kernel,
