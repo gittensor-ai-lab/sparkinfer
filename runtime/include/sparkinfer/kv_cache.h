@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 #include <cuda_runtime.h>
 
 namespace sparkinfer {
@@ -50,6 +51,14 @@ public:
     // Returns device pointer to the block table for seq_id
     // Shape: [num_layers, max_blocks_per_seq]
     int* block_table(uint64_t seq_id) const;
+
+    // Physical block ids owned by seq_id, in logical order (index 0 = the sequence's first
+    // block). Empty if seq_id is unknown. Physical blocks are free-list allocated and not
+    // guaranteed contiguous, so a caller walking (layer, physical_block) byte ranges for bulk
+    // copy-out/copy-in (e.g. an external KV cache tier) needs this rather than assuming a
+    // contiguous span. Returns a reference into internal state -- valid only until the next
+    // allocate()/free()/truncate_blocks() call for this seq_id.
+    const std::vector<int>& physical_block_ids(uint64_t seq_id) const;
 
     // Device pointers to K and V storage pools (base = layer 0).
     // Per-layer pointer = (bf16*)k_pool() + layer * layer_stride_elems().

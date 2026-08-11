@@ -28,6 +28,14 @@ per sparkinfer server instance, passed to the sidecar at spawn time (`--socket <
 module during implementation (not expected, but not load-bearing either way since the frame already carries
 its own length).
 
+**The C++ side opens two independent connections to the same socket path, each with its own HELLO
+handshake**: a "control" connection used for LOOKUP + PING (and the initial HELLO), and a separate
+connection used only by the dedicated STORE background thread. This is deliberate, not an accident of
+implementation: LOOKUP and STORE share nothing (not even a mutex) so a slow STORE_ACK can never delay a
+LOOKUP the worker thread is waiting on within its tight timeout budget. The sidecar must accept multiple
+concurrent client connections (each gets its own `LMCacheEngine` interaction through the one underlying
+engine instance -- the engine itself is process-wide, only the socket is per-connection).
+
 ## Frame format
 
 Fixed 16-byte header, little-endian, followed by `payload_len` bytes of payload:
@@ -58,6 +66,13 @@ struct FrameHeader {
 
 All multi-byte payload fields are little-endian. Strings are length-prefixed (`uint32` byte length,
 followed by raw UTF-8 bytes, no NUL terminator).
+
+**Framing note**: `SOCK_SEQPACKET` preserves message boundaries but only if each frame (header + payload)
+is written with a single `send()`/`sendmsg()` call and read with a single `recv()` into a buffer large
+enough for the whole message -- two separate `send()` calls for header then payload would arrive as two
+separate messages, not one. Size receive buffers for the worst case: `token_ids` bounded by sparkinfer's
+max context (~163840 tokens, `kMaxBlocksPerSeq * block_size` in `kv_cache.cpp`) means a LOOKUP/STORE
+payload can approach ~640KB; implementations should size around 1-2MiB to have headroom.
 
 ## Versioning
 
@@ -104,6 +119,12 @@ for the range about to be (re)computed.
 uint32    n_tokens
 int32[n]  token_ids
 ```
+
+`token_ids` is the full prompt prefix from position 0 up to (and including) the range about to be
+recomputed -- not just the new range -- matching what STORE sends and what LMCache's own chunk hashing
+needs (chunk hashes chain off preceding chunks, per `lmcache.v1.cache_engine.LMCacheEngine.store()`'s own
+`tokens`/`mask` contract found during the Stage 1 spike). The sidecar computes matched-length and chunk
+boundaries itself; sparkinfer never computes a hash.
 
 Gating rule (enforced on the C++ side, not the sidecar): only sent when the range about to be recomputed is
 `>= chunk_size_tokens` (one LMCache chunk, 256 by default) — below that, sparkinfer always recomputes
@@ -186,7 +207,13 @@ confirms liveness, giving a generous window; if this ordering proves fragile in 
 never unlinking proactively and instead sweeping `/dev/shm/sparkinfer_kv_*` for orphans older than a few
 seconds on sidecar startup).
 
-Layout within one region, contiguous, no padding beyond natural alignment:
+Layout is per-chunk: each `LOOKUP_RESP` chunk entry's `shm_offset_bytes` points to the start of
+that chunk's own self-contained block below (sized from that chunk's own `chunk_len_tok`), not a
+single layout shared across all `n_chunks`. A multi-chunk match is `n_chunks` independent blocks
+back-to-back in the same region, each addressed by its own offset -- a reader must not assume
+chunk N+1 immediately follows chunk N's computed size; always use the offset given.
+
+Contiguous, no padding beyond natural alignment, within one chunk's block:
 
 ```
 [K bytes: num_layers * chunk_blocks * block_bytes]

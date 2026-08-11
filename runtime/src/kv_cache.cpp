@@ -158,6 +158,12 @@ int* KVCacheManager::block_table(uint64_t seq_id) const {
     return impl_->d_block_tables + (size_t)it->second * kMaxBlocksPerSeq;
 }
 
+const std::vector<int>& KVCacheManager::physical_block_ids(uint64_t seq_id) const {
+    static const std::vector<int> kEmpty;
+    auto it = impl_->seq_blocks.find(seq_id);
+    return it == impl_->seq_blocks.end() ? kEmpty : it->second;
+}
+
 void*  KVCacheManager::k_pool() const { return impl_->k_pool; }
 void*  KVCacheManager::v_pool() const { return impl_->v_pool; }
 size_t KVCacheManager::layer_stride_elems() const { return impl_->layer_stride; }
