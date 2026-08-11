@@ -1,6 +1,8 @@
 #pragma once
 #include <cuda_runtime.h>
 
+#include "sparkinfer/kernels/qtype.h"   // SI_QTYPE_Q3A
+
 namespace sparkinfer { namespace kernels {
 
 // Router projection: logits = input @ router_w  (bf16 x bf16 -> fp32).

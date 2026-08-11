@@ -2759,6 +2759,31 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (req < 0) { const char* e = getenv("SPARKINFER_DOWN_REQUANT_Q4K"); req = (e && e[0] == '0') ? 0 : 1; }
         return dev_quant_requant_q4k(name, qtype, req != 0);
     };
+    // Requantize a weight matrix to Q3_A (3.5 bits/weight -- Q4_K's asymmetric per-32 scale and
+    // min, 3-bit quant plane, 112 B per 256 weights) at load, then decode it on-read through
+    // si_vec_dot_q3_A, so the matrix is read 22.2% smaller on every decode token. Sources
+    // Q4_K/Q5_K/Q6_K straight to Q3_A (one dequant, one fit). Falls back to the untouched source
+    // on any failure.
+    auto dev_quant_q3a = [&](const std::string& name, int& qtype) -> const void* {
+        const void* src = dev_quant(name, qtype);
+        if (!src) return src;
+        if (qtype != 12 && qtype != 13 && qtype != 14) return src;   // Q4_K / Q5_K / Q6_K
+        const GGUFTensor* t = g.tensor(name);
+        const long nv = t->n_values;
+        if (nv % 256 != 0) return src;
+        void* deq = nullptr;
+        if (cudaMalloc(&deq, (size_t)nv * 2) != cudaSuccess) return src;
+        kernels::launch_gguf_dequant(qtype, src, deq, nv, s.stream);
+        void* q3 = nullptr;
+        if (cudaMalloc(&q3, (size_t)(nv / 256) * 112) != cudaSuccess) { cudaFree(deq); return src; }
+        kernels::launch_ffn_requant_q3a(deq, q3, nv, s.stream);
+        cudaStreamSynchronize(s.stream);
+        cudaFree(deq);
+        if (!s.owned.empty() && s.owned.back() == src) { s.owned.pop_back(); cudaFree((void*)src); }
+        s.owned.push_back(q3);
+        qtype = kernels::SI_QTYPE_Q3A;
+        return q3;
+    };
     // dense weight -> bf16 (optionally transpose [out,in] -> [in,out])
     auto dense = [&](const std::string& name, bool transpose) -> const void* {
         const GGUFTensor* t = g.tensor(name);
@@ -2817,6 +2842,35 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                  : (q35_dense9b_requant_default ? std::string("qkv,v")
                     : (q36_ud_requant_default ? std::string("attn_q,attn_output,qkv,attn_gate,ssm_out")
                                               : std::string()));
+    // Muse Glimmer's dense FFN gate/up -> Q3_A. ON by default for this architecture only, and
+    // deliberately NOT for ffn_down: measured on the scored corpus, gate+up costs KL 0.179 for
+    // +11% decode, while adding ffn_down costs KL 0.369 -- a REJECT -- for another 3.5 points.
+    // Architecture-scoped because trading weight precision for bandwidth is only legal under a
+    // distribution-agreement gate (top1 >= 0.90, KL <= 0.20 against llama.cpp on the same GGUF),
+    // and no other model this shared engine serves is scored that way.
+    // SPARKINFER_MUSE_FFN_Q3A=0 restores the Q4_K load path exactly, so both arms of an A/B come
+    // out of one binary.
+    const char* ffn_q3a_env = getenv("SPARKINFER_MUSE_FFN_Q3A");
+    const std::string ffn_q3a_mode =
+        ffn_q3a_env ? std::string(ffn_q3a_env)
+                    : (c.muse_glimmer ? std::string("ffn_gate,ffn_up") : std::string());
+    auto list_token = [](const std::string& list, const char* want) {
+        const std::string w(want);
+        size_t p = 0;
+        while (p < list.size()) {
+            while (p < list.size() && (list[p] == ',' || list[p] == '+' || list[p] == ':' || list[p] == ' ')) ++p;
+            size_t e = p;
+            while (e < list.size() && list[e] != ',' && list[e] != '+' && list[e] != ':' && list[e] != ' ') ++e;
+            if (e > p && list.compare(p, e - p, w) == 0) return true;
+            p = e + 1;
+        }
+        return false;
+    };
+    auto ffn_q3a_on = [&](const char* which) {
+        if (mode_is_off(ffn_q3a_mode)) return false;
+        if (ffn_q3a_mode == "1" || list_token(ffn_q3a_mode, "all")) return true;
+        return list_token(ffn_q3a_mode, which);
+    };
     auto mode_token = [&](const char* want) {
         const std::string w(want);
         size_t p = 0;
@@ -3110,8 +3164,14 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             if (!expect_dims(b + "ffn_gate.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_up.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_down.weight", {c.moe_ffn, H})) return false;
-            w.gate_q = dev_quant(b + "ffn_gate.weight", w.gate_qtype);
-            w.up_q   = dev_quant(b + "ffn_up.weight", w.up_qtype);
+            // gate and up convert together or not at all: the gate/up MMVQ reads one row of each
+            // in the same kernel, and a mixed pair has no dispatch -- it would fall through to the
+            // bf16 dequant path and read a 112-byte block as if it were 144.
+            const bool gu3 = ffn_q3a_on("ffn_gate") && ffn_q3a_on("ffn_up");
+            w.gate_q = gu3 ? dev_quant_q3a(b + "ffn_gate.weight", w.gate_qtype)
+                           : dev_quant(b + "ffn_gate.weight", w.gate_qtype);
+            w.up_q   = gu3 ? dev_quant_q3a(b + "ffn_up.weight", w.up_qtype)
+                           : dev_quant(b + "ffn_up.weight", w.up_qtype);
             w.down_q = dev_quant_down(b + "ffn_down.weight", w.down_qtype);
         } else {
             if (!expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;

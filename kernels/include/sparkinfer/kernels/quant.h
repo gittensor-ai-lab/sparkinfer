@@ -86,4 +86,11 @@ void launch_interleave_qgate_rows(const void* q, const void* gate, void* out,
 void launch_ffn_down_requant_q4k(const void* src_bf16, void* dst_q4k, long n_values,
                                  cudaStream_t stream = nullptr);
 
+// Requantize a weight matrix bf16 -> Q3_A, sparkinfer's internal 3.5 bits/weight super-block
+// (Q4_K's asymmetric per-32 scale and min and its 6-bit scale packing, with a 3-bit quant plane;
+// 112 B per 256 weights against Q4_K's 144 B) consumed by si_vec_dot_q3_A. Load-time only; never
+// read from or written to a GGUF. n_values must be a multiple of 256.
+void launch_ffn_requant_q3a(const void* src_bf16, void* dst_q3a, long n_values,
+                            cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

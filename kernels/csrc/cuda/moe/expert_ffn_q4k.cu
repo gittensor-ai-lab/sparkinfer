@@ -19,6 +19,7 @@
 #include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
+#include "sparkinfer/kernels/qtype.h"   // SI_QTYPE_Q3A (moe.h below is included from *inside* the namespace)
 #endif
 
 namespace sparkinfer {
@@ -526,6 +527,86 @@ __device__ __forceinline__ float si_vec_dot_q5_K(const si_block_q5_K* bq5, const
     float2 dm5f = __half22float2(bq5->dm);
     return dm5f.x * sumf_d - dm5f.y * sumf_m;
 }
+// ---- Q3_A: sparkinfer's internal 3.5 bits/weight super-block ------------------------------
+// Q4_K with the 4-bit quant plane replaced by a 3-bit one, keeping Q4_K's asymmetric per-32 scale
+// AND min and Q4_K's exact 6-bit scale/min packing -- 112 B per 256 weights against Q4_K's 144 B,
+// so a converted matrix is read 22.2% smaller on every decode token. Produced only by
+// launch_ffn_requant_q3a at model load; never read from or written to a GGUF, so the layout is
+// picked to keep this vec-dot as cheap as si_vec_dot_q4_K rather than to match any ggml type.
+//
+// Same iqs = 2*L convention as si_vec_dot_q4_K (L = 0..15): j = L/4 selects the sub-block pair
+// {2j, 2j+1}, m = L%4 selects positions 8m..8m+7. qs holds the low 2 bits as one int per (j,m) at
+// byte 16*j + 4*m, whose byte lane b = p%4 packs four 2-bit fields f = (s%2) | ((p%8)/4 << 1);
+// qh[p] holds the high bit of every sub-block at position p in bit s, so one int load covers four
+// positions for all eight sub-blocks. Both planes extract with one shift + one mask per four
+// weights, exactly like Q4_K's nibble plane.
+struct si_block_q3_A { __half2 dm; unsigned char scales[12]; unsigned char qs[64]; unsigned char qh[32]; };  // 112 B
+__device__ __forceinline__ float si_vec_dot_q3_A(const si_block_q3_A* bq3, const si_block_q8_1* bq8_1, int iqs) {
+    const int L = iqs >> 1;
+    const int j = L >> 2, m = L & 3;
+    const int vl  = *(const int*)(bq3->qs + 16 * j + 4 * m);
+    const int hlo = *(const int*)(bq3->qh + 8 * m);
+    const int hhi = *(const int*)(bq3->qh + 8 * m + 4);
+    // 6-bit scales/mins: identical packing and identical unpack to si_vec_dot_q4_K, with
+    // bq8_offset == 2*j so the aux index j is the same one that function uses.
+    const unsigned short* scales = (const unsigned short*)bq3->scales;
+    unsigned short aux[2];
+    if (j < 2) { aux[0] = scales[j] & 0x3f3f; aux[1] = scales[j + 2] & 0x3f3f; }
+    else { aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+           aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2); }
+    const unsigned char* sc = (const unsigned char*)aux; const unsigned char* mn = sc + 2;
+    float sumf_d = 0.f, sumf_m = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int s = 2 * j + i;                             // sub-block == q8_1 block index
+        const si_block_q8_1* bq8i = bq8_1 + s;
+        const float d8 = __low2float(bq8i->ds);
+        const int* q8 = (const int*)bq8i->qs;
+        const int u0 = q8[2 * m], u1 = q8[2 * m + 1];
+        const int v0 = ((vl >> (2 * i))     & 0x03030303) | (((hlo >> s) & 0x01010101) << 2);
+        const int v1 = ((vl >> (2 * i + 4)) & 0x03030303) | (((hhi >> s) & 0x01010101) << 2);
+        const int dot1 = __dp4a(v0, u0, __dp4a(v1, u1, 0));
+        const int dot2 = __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0));
+        sumf_d += d8 * (dot1 * sc[i]);
+        sumf_m += d8 * (dot2 * mn[i]);
+    }
+    float2 dm3f = __half22float2(bq3->dm);
+    return dm3f.x * sumf_d - dm3f.y * sumf_m;
+}
+
+// One CTA per output row, weights read as Q3_A. Same tiling, same accumulation order and same
+// 4-warp reduction as gate_up_mmvq2_kernel below -- only the block format differs.
+__global__ void gate_up_q3a_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int H, int F, int top_k, int pdl
+) {
+    constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
+    const int row = blockIdx.x, ts = row / F, f = row % F, tok = ts / top_k;
+    const int e = expert_ids[ts];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    const si_block_q3_A* g_row = (const si_block_q3_A*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 112);
+    const si_block_q3_A* u_row = (const si_block_q3_A*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 112);
+    const int blocks_per_row = H >> 8, blocks_per_iter = vdr * NW * WS / qi;   // = 8
+    float tg = 0.f, tu = 0.f;
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const int kby = kbx * 8, kqs = vdr * (tid % (qi / vdr));
+        tg += si_vec_dot_q3_A(g_row + kbx, vrow + kby, kqs);
+        tu += si_vec_dot_q3_A(u_row + kbx, vrow + kby, kqs);
+    }
+    __shared__ float sg[NW - 1][WS], su[NW - 1][WS];
+    if (warp > 0) { sg[warp - 1][lane] = tg; su[warp - 1][lane] = tu; }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) { tg += sg[l][lane]; tu += su[l][lane]; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+    if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
+}
+
 __global__ void gate_up_mmvq2_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
@@ -1555,7 +1636,8 @@ void launch_moe_expert_ffn_q4k(
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
     const int gu_pdl = gu_mmvq_pdl();
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
-    if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
+    if (mmvq && gu2 && ((gate_type == 12 && up_type == 12) ||
+                       (gate_type == SI_QTYPE_Q3A && up_type == SI_QTYPE_Q3A))) {   // faithful 4-warp mmvq gate/up
         const si_block_q8_1* q;
         if (input_q8) {   // pre-quantized Q8_1(hn) from the fused norm: skip the quantize node
             q = reinterpret_cast<const si_block_q8_1*>(input_q8);
@@ -1570,7 +1652,15 @@ void launch_moe_expert_ffn_q4k(
         // arithmetic, same order, same result, but without the 4-warp shared-memory reduce that
         // only earns its keep when num_tokens == 1 leaves the GPU short of warps.
         const int gu_warps = gu_batch_warps();
-        if (num_tokens > 1 && gu_warps > 0 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8) {
+        // Q3_A gate/up first: every arm below hard-codes the 144-byte Q4_K super-block, so a
+        // converted tensor reaching one of them would read the wrong stride.
+        if (gate_type == SI_QTYPE_Q3A) {
+            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                gate_up_q3a_kernel,
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
+                hidden, ffn, top_k, gu_pdl);
+        } else if (num_tokens > 1 && gu_warps > 0 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8) {
             const int n_rows = num_tokens * top_k * ffn;
             launch_gate_up_warp_qwen<2048, 512, 8>(gu_warps, gu_pdl, n_rows, stream,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
