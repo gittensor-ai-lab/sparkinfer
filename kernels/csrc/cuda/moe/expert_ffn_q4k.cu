@@ -1420,6 +1420,27 @@ static inline bool launch_down_q4k_mmvq_splitk(
             return true;
         }
     }
+    // Muse Glimmer's dense FFN down (F = 19968 -> NBLK 78, single expert). The counterpart to the
+    // gate/up arm: this was the other decode GEMV still landing on the runtime-parameterised
+    // kernel, 2.49 ms of the step. NBLK constant makes WORK and the wi loop bound compile-time.
+    // Identical dot products in identical order, so the result is bit-identical.
+    if (spec && top_k == 1 && F == 19968) {
+        if (S == 8) {
+            launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<8, 78, 1>,
+                down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+            return true;
+        }
+        if (S == 4) {
+            launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<4, 78, 1>,
+                down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+            return true;
+        }
+        if (S == 2) {
+            launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<2, 78, 1>,
+                down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+            return true;
+        }
+    }
     switch (S) {
         case 2: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
         case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
@@ -1590,6 +1611,23 @@ void launch_moe_expert_ffn_q4k(
         else if (gu_spec && hidden == 4096 && ffn == 12288 && top_k == 1)
             launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
                 gate_up_mmvq2_qwen_kernel<4096, 12288, 1>,
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+        // Muse Glimmer's dense FFN (hidden 6656, ffn 19968, single expert). This was the last
+        // shape on the runtime-parameterised kernel, and it is the largest kernel on the decode
+        // step -- 5.07 ms of a 12.7 ms token, 7.77 GB at 1532 GB/s. With H and F constant the
+        // per-CTA row/expert decode stops issuing true integer divides and NB = H>>8 = 26 becomes
+        // a known trip count. Same dot products in the same order as the generic kernel, so the
+        // result is bit-identical.
+        //
+        // No pack2 arm here, unlike the three shapes above. pack2 exists because at top_k*ffn =
+        // 4096 a one-row 4-warp CTA leaves the GPU short of blocks; F = 19968 already launches
+        // five times that, so pairing rows into 8-warp CTAs only coarsens scheduling. Measured
+        // on a 5090 at 128 decode, a pack2 arm for this shape gives back about four fifths of
+        // what this arm wins, so it is deliberately absent rather than merely unwritten.
+        else if (gu_spec && hidden == 6656 && ffn == 19968 && top_k == 1)
+            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                gate_up_mmvq2_qwen_kernel<6656, 19968, 1>,
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
         else
