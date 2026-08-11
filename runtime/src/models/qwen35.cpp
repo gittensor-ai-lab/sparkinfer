@@ -1654,9 +1654,15 @@ BridgeKVLayout lmcache_layout_from_cfg(const Qwen35Config& cfg, const KVCacheMan
 // bridge is currently unreachable, or nothing chunk-aligned remains. Fire-and-forget: the actual
 // network round trip happens on BridgeClient's own background thread, this call only blocks for
 // the (synchronous, on-stream) cudaMemcpy staging into shm.
-void lmcache_maybe_store(Qwen35Model::Impl& s, uint64_t seq_id, const std::vector<int>& tokens,
+//
+// Takes individual fields rather than Impl& -- Impl is a private nested type, so a free function
+// outside the class can't name it in a signature even from within the same translation unit
+// (only member functions, which is why every call site below reads `s.<field>` from inside an
+// actual Qwen35Model member function's `Impl& s = *p_;`).
+void lmcache_maybe_store(BridgeClient* bridge, const Qwen35Config& cfg, KVCacheManager& kv,
+                         cudaStream_t stream, uint64_t seq_id, const std::vector<int>& tokens,
                          int start, int end) {
-    if (!s.lmcache_bridge || !s.lmcache_bridge->is_alive()) return;
+    if (!bridge || !bridge->is_alive()) return;
     const int chunk = lmcache_chunk_size_tokens();
     const int aligned_end = (end / chunk) * chunk;
     if (aligned_end <= start) return;
@@ -1664,9 +1670,9 @@ void lmcache_maybe_store(Qwen35Model::Impl& s, uint64_t seq_id, const std::vecto
     static std::atomic<uint64_t> counter{0};
     const std::string shm_name = "/sparkinfer_kv_store_" + std::to_string(seq_id) + "_" +
                                  std::to_string(counter.fetch_add(1));
-    const BridgeKVLayout layout = lmcache_layout_from_cfg(s.cfg, *s.kv);
-    if (!stage_kv_to_shm(*s.kv, layout, seq_id, start, aligned_end, shm_name, s.stream)) return;
-    s.lmcache_bridge->store_async(tokens, start, aligned_end, shm_name);
+    const BridgeKVLayout layout = lmcache_layout_from_cfg(cfg, kv);
+    if (!stage_kv_to_shm(kv, layout, seq_id, start, aligned_end, shm_name, stream)) return;
+    bridge->store_async(tokens, start, aligned_end, shm_name);
 }
 } // namespace
 
@@ -1898,7 +1904,8 @@ void Qwen35Model::clear_prefix_cache() {
         // is the "prefix cache overwrite" eviction point (docs/lmcache_bridge_protocol.md's
         // STORE trigger list): the active prefix is about to be dropped for a different one.
         if (s.prefix_active)
-            lmcache_maybe_store(s, s.active_seq_id, s.prefix_tokens, 0, s.prefix_len);
+            lmcache_maybe_store(s.lmcache_bridge, s.cfg, *s.kv, s.stream, s.active_seq_id,
+                               s.prefix_tokens, 0, s.prefix_len);
         s.kv->free(s.active_seq_id);
         invalidate_decode_graph();
     }
@@ -2023,7 +2030,8 @@ void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_t
     // original prompt; only ContinuousBatchEngine::finish_job has that context) -- a null
     // pointer is a pure no-op here, not a degraded path.
     if (store_tokens && !store_tokens->empty())
-        lmcache_maybe_store(s, seq_id, *store_tokens, 0, (int)store_tokens->size());
+        lmcache_maybe_store(s.lmcache_bridge, s.cfg, *s.kv, s.stream, seq_id, *store_tokens, 0,
+                           (int)store_tokens->size());
     s.kv->free(seq_id);
     auto it = s.sessions.find(seq_id);
     if (it != s.sessions.end()) {
