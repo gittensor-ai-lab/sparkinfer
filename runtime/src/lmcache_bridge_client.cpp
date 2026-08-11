@@ -156,6 +156,18 @@ struct BridgeClient::Impl {
     std::mutex store_mu;
     std::condition_variable store_cv;
     std::deque<StoreItem> store_queue;
+
+    // Dedicated to the ping thread's interruptible sleep -- deliberately NOT store_cv/store_mu.
+    // An earlier version shared them (as a ready-made shutdown signal, since both threads just
+    // needed "wake up when running goes false"), but std::condition_variable::notify_one() wakes
+    // an arbitrary one of ALL current waiters, not a specific one: store_async()'s notify_one()
+    // could wake the ping thread instead of the store thread, leaving a queued STORE stuck until
+    // something else happened to wake the right thread (found via this file's own unit test
+    // flaking -- a queued store sometimes never got sent within a many-second window, not just a
+    // slow one). Two independent condition variables makes that class of bug structurally
+    // impossible rather than relying on both predicates happening to be safe under notify_all.
+    std::mutex shutdown_mu;
+    std::condition_variable shutdown_cv;
 };
 
 namespace {
@@ -293,13 +305,14 @@ BridgeClient::BridgeClient(std::string socket_path, BridgeKVLayout layout) : imp
 
     impl_->ping_thread = std::thread([this] {
         while (impl_->running.load(std::memory_order_relaxed)) {
-            // Interruptible sleep (shares store_mu/store_cv with the STORE thread purely as a
-            // ready-made shutdown signal -- no queue semantics implied here) so ~BridgeClient()
-            // doesn't block for up to 2s waiting on a plain sleep_for() to notice running=false.
+            // Interruptible sleep on its own dedicated condition variable (not store_cv -- see
+            // Impl::shutdown_cv's comment for why sharing one with the STORE thread is a real
+            // bug, not just a style choice) so ~BridgeClient() doesn't block for up to 2s waiting
+            // on a plain sleep_for() to notice running=false.
             {
-                std::unique_lock<std::mutex> wait_lock(impl_->store_mu);
-                impl_->store_cv.wait_for(wait_lock, std::chrono::milliseconds(2000),
-                                         [this] { return !impl_->running.load(std::memory_order_relaxed); });
+                std::unique_lock<std::mutex> wait_lock(impl_->shutdown_mu);
+                impl_->shutdown_cv.wait_for(wait_lock, std::chrono::milliseconds(2000),
+                                            [this] { return !impl_->running.load(std::memory_order_relaxed); });
             }
             if (!impl_->running.load(std::memory_order_relaxed)) break;
             std::lock_guard<std::mutex> lock(impl_->ctrl.mu);
@@ -374,6 +387,7 @@ BridgeClient::BridgeClient(std::string socket_path, BridgeKVLayout layout) : imp
 BridgeClient::~BridgeClient() {
     impl_->running.store(false, std::memory_order_relaxed);
     impl_->store_cv.notify_all();
+    impl_->shutdown_cv.notify_all();
     if (impl_->ping_thread.joinable()) impl_->ping_thread.join();
     if (impl_->store_thread.joinable()) impl_->store_thread.join();
     {
