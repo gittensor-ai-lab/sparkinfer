@@ -113,13 +113,18 @@ __device__ __forceinline__ float dqr_val(const unsigned char* blk, int t) {
 
 constexpr int DQR_BLOCK = 256, DQR_VEC = 4;   // 4 consecutive values/thread => 4B store, 128B/warp
 
-// One block per row; NG groups of DQR_BLOCK*DQR_VEC values each.
-template <int QT, int NG>
-__global__ __launch_bounds__(DQR_BLOCK) void deq_rows_i8_vec_kernel(
+// One block per row; NG groups of BLK*DQR_VEC values each. BLK is a template parameter because
+// v[NG][DQR_VEC] lives in registers: a wide row at BLK=256 needs a large NG (Muse Glimmer's
+// ffn_down, cols=19968, needs NG=20 => 80 floats/thread) and the resulting register pressure
+// costs more occupancy than the extra threads cost. Widening the block instead keeps NG small
+// (BLK=1024 => NG=5 for the same row). Value->thread mapping is unchanged, so the decode, the
+// amax and the stores are all bit-identical whatever BLK is.
+template <int QT, int NG, int BLK = DQR_BLOCK>
+__global__ __launch_bounds__(BLK) void deq_rows_i8_vec_kernel(
         const unsigned char* __restrict__ src, signed char* __restrict__ q,
         float* __restrict__ scale, int cols) {
     constexpr int BS = dqr_bs<QT>();
-    constexpr int GSPAN = DQR_BLOCK * DQR_VEC;               // values per group
+    constexpr int GSPAN = BLK * DQR_VEC;                     // values per group
     const int row = blockIdx.x, t = threadIdx.x;
     const int nsb = cols >> 8;
     const unsigned char* rbase = src + (size_t)row * nsb * BS;
@@ -140,13 +145,13 @@ __global__ __launch_bounds__(DQR_BLOCK) void deq_rows_i8_vec_kernel(
         }
     }
 
-    __shared__ float swarp[DQR_BLOCK / 32];
+    __shared__ float swarp[BLK / 32];
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
     if ((t & 31) == 0) swarp[t >> 5] = amax;
     __syncthreads();
     if (t < 32) {
-        float w = (t < DQR_BLOCK / 32) ? swarp[t] : 0.f;
+        float w = (t < BLK / 32) ? swarp[t] : 0.f;
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) w = fmaxf(w, __shfl_xor_sync(0xffffffffu, w, o));
         if (t == 0) swarp[0] = w;
@@ -177,7 +182,16 @@ bool dispatch(const unsigned char* s, signed char* q, float* scale, int rows, in
     else if (ng <= 4)  deq_rows_i8_vec_kernel<QT, 4><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
     else if (ng <= 8)  deq_rows_i8_vec_kernel<QT, 8><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
     else if (ng <= 12) deq_rows_i8_vec_kernel<QT, 12><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
-    else return false;                                   // wider than the register budget
+    else {
+        // Beyond 12 groups the register array is the binding constraint, not the thread count:
+        // Muse Glimmer's ffn_down (cols=19968) would need NG=20 at 256 threads = 80 floats/thread.
+        // A 1024-wide block covers the same row in NG=5, so widen the block instead of growing NG.
+        constexpr int WBLK = 1024, WSPAN = WBLK * DQR_VEC;
+        const int ngw = (cols + WSPAN - 1) / WSPAN;
+        if (ngw <= 5)      deq_rows_i8_vec_kernel<QT, 5, WBLK><<<rows, WBLK, 0, stream>>>(s, q, scale, cols);
+        else if (ngw <= 8) deq_rows_i8_vec_kernel<QT, 8, WBLK><<<rows, WBLK, 0, stream>>>(s, q, scale, cols);
+        else return false;                               // wider than the register budget
+    }
     return true;
 }
 
@@ -628,9 +642,27 @@ bool launch_gguf_dequant_rows_i8_fast(int ggml_type, const void* src, signed cha
         const char* e = getenv("SPARKINFER_DEQUANT_ROWS_I8_FAST");
         return (e && e[0] == '0') ? 0 : 1;
     }();
-    // Full-row / bulk path: require a full 1024-wide group so no threads idle. Partial widths
-    // (MoE down cols=512) use the gather/mask launchers below.
-    if (!enabled || rows <= 0 || cols <= 0 || (cols % (DQR_BLOCK * DQR_VEC)) != 0) return false;
+    // The kernel only needs a thread's 4 values to sit inside one super-block, which 4-alignment
+    // already guarantees, and nsb = cols>>8 to be exact -- i.e. cols % 256 == 0. Every group is
+    // guarded by `base < cols`, so a trailing partial group is already handled. Requiring a full
+    // 1024-wide group on top of that was a throughput guard (no idle threads), but it excluded
+    // every width that is super-block- but not 1024-aligned: Muse Glimmer is 6656 (ng=7, last
+    // group half-used) and 19968 (ng=20), so all of its attention and FFN weights fell back to
+    // the two-pass kernel, which decodes the whole row TWICE (once for amax, once to quantize)
+    // and costs more than the i8 GEMM that consumes it. A half-idle final group is far cheaper
+    // than a second decode pass. Still bit-identical to the two-pass kernel -- same decode, same
+    // amax (max is associative and exact in fp), same d = amax/127.f, same roundf(v * inv).
+    // SPARKINFER_DEQUANT_ROWS_I8_ANYCOL=0 restores the 1024-aligned-only gate.
+    static const int anycol = [] {
+        const char* e = getenv("SPARKINFER_DEQUANT_ROWS_I8_ANYCOL");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    // Only widths with at least one full group are admitted, so a row is never dominated by its
+    // partial tail. That deliberately leaves every sub-1024 width (Qwen3.6's MoE down is cols=512,
+    // which the gather/mask launchers already serve) on exactly the path it takes today.
+    const bool wide_ok = anycol && (cols % 256) == 0 && cols >= (DQR_BLOCK * DQR_VEC);
+    if (!enabled || rows <= 0 || cols <= 0 ||
+        ((cols % (DQR_BLOCK * DQR_VEC)) != 0 && !wide_ok)) return false;
 
     auto s = reinterpret_cast<const unsigned char*>(src);
     if (ggml_type == DQR_Q4_K) return dispatch<DQR_Q4_K>(s, q, scale, rows, cols, stream);
