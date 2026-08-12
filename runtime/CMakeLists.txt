@@ -95,4 +95,8 @@ if(BUILD_EXAMPLES)
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
+    # MTP correctness gate: SPEC_AGREE + DRAFT_TOP1 for Qwythos-MTP GGUFs.
+    add_executable(qwen3_gguf_mtp_check examples/qwen3_gguf_mtp_check.cpp)
+    target_include_directories(qwen3_gguf_mtp_check PRIVATE include)
+    target_link_libraries(qwen3_gguf_mtp_check PRIVATE sparkinfer_runtime CUDA::cudart)
 endif()

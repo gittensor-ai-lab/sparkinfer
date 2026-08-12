@@ -50,6 +50,12 @@ struct Qwen35Config {
     int   sliding_window = 0;          // token window for swa_layers entries (0 = disabled)
     float final_logit_softcapping = 0.f;  // 0 = disabled
     float logit_scale = 1.f;              // 1 = no-op
+
+    // Multi-Token Prediction (MTP / NextN) speculative decode head count.
+    // 0 = no MTP head in the GGUF; 1 = one NextN block (Qwythos-MTP GGUFs).
+    // When > 0 and SPARKINFER_MTP=1, the decode loop runs the MTP head as a
+    // speculative draft and accepts greedily (AR-identical output when correct).
+    int   n_nextn_layers = 0;
 };
 
 } // namespace sparkinfer

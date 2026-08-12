@@ -220,6 +220,18 @@ public:
     // Token budget for KV allocation: prompt + decode headroom, capped at max_seq.
     static int session_token_budget(size_t prompt_len, int max_new, int max_seq);
 
+    // Test hook: force MTP speculative decode on/off (no-op if MTP weights not loaded).
+    void set_mtp_decode(bool enable);
+
+    struct MtpDraftMetrics {
+        int positions = 0;
+        int main_top1 = 0;   // main argmax == teacher next
+        int draft_top1 = 0;  // MTP draft == main verify argmax
+        double mean_kl = 0.0; // KL(main || mtp) over full vocab
+    };
+    // Teacher-forced: at each position compare main greedy vs MTP first draft + logits KL.
+    MtpDraftMetrics mtp_draft_check(const std::vector<int>& tokens, int warmup = 2);
+
     // Shared weights for DFlash draft (embed + lm_head come from target).
     const void* embed_weights() const;
     const void* lm_head_weights() const;
@@ -260,6 +272,13 @@ public:
 private:
     void invalidate_decode_graph();
     void dflash_maybe_capture_layer(int layer);
+    // MTP batched draft verify: one multi-token target pass over `nd` rows
+    // (tokens[r] processed at position pos0+r), bit-identical per row to the
+    // per-token decode. preds[r] = greedy argmax at pos0+r. Returns false if the
+    // batched path is unavailable (caller falls back to the sequential verify).
+    bool mtp_spec_batch(const int* tokens, int nd, int pos0, int* preds);
+    // Restore GDN recurrent/conv state to the checkpoint taken after batch row `row`.
+    void mtp_spec_rollback(int row);
     // Depth-adaptive KV-split count for a given seqlen (32/128/160/256 tiers, GQA-8/hd256
     // occupancy correction). Shared by forward_token()'s normal per-token adaptation and
     // dflash_generate()'s one-time pre-capture initialization (see qwen35.cpp).
