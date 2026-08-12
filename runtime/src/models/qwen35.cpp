@@ -1868,7 +1868,17 @@ int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chu
             // garbage KV -- never resume the token loop past whatever was verified fully
             // restored, and never resume past a failure point at all: fall back to recomputing
             // the entire range from 0 rather than risk attending against corrupted KV.
-            if (restored) actual_start = res.matched_tokens;
+            //
+            // Clamped to end-1, never end itself: a full hit (matched_tokens == end) would
+            // otherwise skip the token loop entirely, and the token loop is what produces the
+            // decode seed (the LM-head logits at the last prompt position) -- the KV cache lets
+            // attention skip recomputing *past* positions, it doesn't let this function skip
+            // computing the *current*/last position's own forward pass, which is what next's
+            // value actually comes from. Found via lmcache_bench.cpp's benchmark, whose prompt
+            // length happened to land on an exact chunk boundary (matched_tokens == end) --
+            // earlier tests never hit this because their prompts weren't exact chunk multiples,
+            // so the token loop always had at least one real remaining token regardless.
+            if (restored) actual_start = std::min(res.matched_tokens, end - 1);
         }
     }
 
