@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -57,6 +58,17 @@ public:
     int active_requests() const;
     int free_kv_blocks() const;
     int max_queue_depth() const;
+
+    // LMCache bridge counters (docs/lmcache_bridge_protocol.md), for GET /metrics'
+    // sparkinfer_lmcache_lookup_{hits,misses}_total. enabled=false (both counts 0) when
+    // SPARKINFER_LMCACHE_ENABLE wasn't set or the sidecar never came up -- distinct from
+    // "enabled but 0 lookups happened yet," which also reports zero counts but enabled=true.
+    struct LMCacheStats {
+        bool enabled = false;
+        uint64_t lookup_hits = 0;
+        uint64_t lookup_misses = 0;
+    };
+    LMCacheStats lmcache_stats() const;
 
 private:
     struct Impl;

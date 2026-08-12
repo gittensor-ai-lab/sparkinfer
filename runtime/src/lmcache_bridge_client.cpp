@@ -142,6 +142,8 @@ struct BridgeClient::Impl {
     Connection store_conn;
 
     std::atomic<uint32_t> next_request_id{1};
+    std::atomic<uint64_t> lookup_hits{0};
+    std::atomic<uint64_t> lookup_misses{0};
 
     std::atomic<bool> running{true};
     std::thread ping_thread;
@@ -406,6 +408,18 @@ bool BridgeClient::is_alive() const {
 
 LookupResult BridgeClient::lookup(const std::vector<int>& token_ids) {
     LookupResult out;
+    // Fires on every exit path (there are several early returns below) rather than requiring
+    // each one to remember to increment the right counter -- classifies purely on `out`'s final
+    // state, which every return path already sets correctly for its own outcome.
+    struct CounterGuard {
+        Impl* impl;
+        const LookupResult* out;
+        ~CounterGuard() {
+            auto& counter = (out->ok && out->matched_tokens > 0) ? impl->lookup_hits : impl->lookup_misses;
+            counter.fetch_add(1, std::memory_order_relaxed);
+        }
+    } counter_guard{impl_.get(), &out};
+
     const int timeout_ms = lookup_timeout_ms_config();
 
     std::lock_guard<std::mutex> lock(impl_->ctrl.mu);
@@ -463,6 +477,14 @@ void BridgeClient::store_async(const std::vector<int>& token_ids, int new_start_
     impl_->store_queue.push_back(
         Impl::StoreItem{token_ids, new_start_tok, new_end_tok, std::move(shm_name)});
     impl_->store_cv.notify_one();
+}
+
+uint64_t BridgeClient::lookup_hit_count() const {
+    return impl_->lookup_hits.load(std::memory_order_relaxed);
+}
+
+uint64_t BridgeClient::lookup_miss_count() const {
+    return impl_->lookup_misses.load(std::memory_order_relaxed);
 }
 
 } // namespace sparkinfer

@@ -323,6 +323,22 @@ int main(int argc, char** argv) {
                 "# HELP sparkinfer_free_kv_blocks Free KV cache blocks\n"
                 "# TYPE sparkinfer_free_kv_blocks gauge\n"
              << "sparkinfer_free_kv_blocks " << engine.free_kv_blocks() << "\n";
+        // Only emitted when the LMCache bridge is actually enabled (docs/lmcache_bridge_protocol.md)
+        // -- omitting the metric entirely when disabled, rather than always emitting zeros, makes
+        // "is this feature even on" visible from /metrics itself, not just server startup logs.
+        const auto lmc = engine.lmcache_stats();
+        if (lmc.enabled) {
+            body << "# HELP sparkinfer_lmcache_lookup_hits_total External KV cache tier lookups "
+                    "that restored a matched prefix\n"
+                    "# TYPE sparkinfer_lmcache_lookup_hits_total counter\n"
+                 << "sparkinfer_lmcache_lookup_hits_total " << lmc.lookup_hits << "\n"
+                    "# HELP sparkinfer_lmcache_lookup_misses_total External KV cache tier lookups "
+                    "that found nothing usable (includes a genuine miss, a timed-out sidecar, and "
+                    "the sidecar being unreachable -- see docs/lmcache_bridge_protocol.md's "
+                    "degradation invariant, all three fall back to the same recompute path)\n"
+                    "# TYPE sparkinfer_lmcache_lookup_misses_total counter\n"
+                 << "sparkinfer_lmcache_lookup_misses_total " << lmc.lookup_misses << "\n";
+        }
         res.set_content(body.str(), "text/plain; version=0.0.4");
     });
 

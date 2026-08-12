@@ -341,6 +341,16 @@ int ModelEngine::max_queue_depth() const {
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->max_queue_depth() : 0;
 }
 
+ModelEngine::LMCacheStats ModelEngine::lmcache_stats() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    LMCacheStats stats;
+    if (!impl_->lmcache_bridge) return stats;  // enabled=false, both counts 0
+    stats.enabled = true;
+    stats.lookup_hits = impl_->lmcache_bridge->lookup_hit_count();
+    stats.lookup_misses = impl_->lmcache_bridge->lookup_miss_count();
+    return stats;
+}
+
 CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_ids,
                                                  int max_new_tokens,
                                                  const std::function<bool(int)>& on_token) {

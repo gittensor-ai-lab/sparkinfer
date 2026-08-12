@@ -181,6 +181,8 @@ int main() {
         assert(res.chunks.size() == 1);
         assert(res.chunks[0].start_tok == 0 && res.chunks[0].len_tok == 256);
         assert(client.is_alive());
+        assert(client.lookup_hit_count() == 1);
+        assert(client.lookup_miss_count() == 0);
         printf("[ok] handshake + LOOKUP hit\n");
     }
 
@@ -205,6 +207,10 @@ int main() {
         LookupResult res = client.lookup(std::vector<int>(256, 1));
         assert(res.ok);
         assert(res.matched_tokens == 0);
+        // res.ok is true (a well-formed response was parsed) but matched_tokens==0 is still a
+        // miss for counting purposes -- "ok" only means "the round trip succeeded," not "found."
+        assert(client.lookup_hit_count() == 0);
+        assert(client.lookup_miss_count() == 1);
         printf("[ok] LOOKUP miss\n");
     }
 

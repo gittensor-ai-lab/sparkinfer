@@ -77,6 +77,14 @@ public:
     void store_async(const std::vector<int>& token_ids, int new_start_tok, int new_end_tok,
                      std::string shm_name);
 
+    // Cumulative counts across every lookup() call this instance has made, for the
+    // sparkinfer_lmcache_lookup_{hits,misses}_total /metrics counters. A "hit" is
+    // res.ok && res.matched_tokens > 0; everything else (genuine miss, timeout, bridge down,
+    // malformed response) counts as a miss -- these deliberately do not distinguish "why" any
+    // more than LookupResult itself does, matching its own doc comment.
+    uint64_t lookup_hit_count() const;
+    uint64_t lookup_miss_count() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
