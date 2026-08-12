@@ -1126,7 +1126,7 @@ __global__ void down_q6k_mmvq_splitk_qwen_kernel(
     }
 }
 
-template <int S, int NBLK, int TOPK>
+template <int S, int NBLK, int TOPK, bool SKIP_ZERO_HQ8 = false>
 __global__ void down_q4k_mmvq_splitk_qwen_kernel(
     const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
     const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
@@ -1146,11 +1146,20 @@ __global__ void down_q4k_mmvq_splitk_qwen_kernel(
         for (int wi = split * 32 + lane; wi < TOPK * WORK; wi += S * 32) {
             const int j = wi / WORK, r = wi - j * WORK;
             const int kbx = r >> 4, kqs = (r & 15) << 1;
-            const int ts = token * TOPK + j, e = expert_ids[ts];
+            const int ts = token * TOPK + j;
+            const si_block_q8_1* h8 = hq8 + (size_t)ts * Q8PB;
+            // After #774's sparse gate/up, gated-off neurons write h=0 → Q8_1.d==0.
+            // Skip the matching down Q4_K weight load (same byte-saving idea, second half).
+            if constexpr (SKIP_ZERO_HQ8) {
+                const int bq8_offset = 2 * ((kqs / 2) / 4);  // matches si_vec_dot_q4_K
+                const si_block_q8_1* hb = h8 + (size_t)kbx * 8 + bq8_offset;
+                if (__low2float(hb[0].ds) == 0.f && __low2float(hb[1].ds) == 0.f)
+                    continue;
+            }
+            const int e = expert_ids[ts];
             const float w = expert_weights[ts];
             const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
                 down_q + ((size_t)e * H + hh) * NBLK * 144);
-            const si_block_q8_1* h8 = hq8 + (size_t)ts * Q8PB;
             acc += w * si_vec_dot_q4_K(drow + kbx, h8 + (size_t)kbx * 8, kqs);
         }
         #pragma unroll
@@ -1385,11 +1394,16 @@ static inline bool launch_down_q6k_mmvq_splitk(
         default: return false;
     }
 }
+static float g_mg_sparse_tau = -1.f;   // <0 = uninit; defined with mg_sparse_ffn_init below
+static int g_mg_sparse_down = -1;     // -1 uninit; 0 off; 1 on (default follows sparse FFN)
+static void mg_sparse_ffn_init();
+
 static inline bool launch_down_q4k_mmvq_splitk(
     int S, int pdl, dim3 grid, const unsigned char* down_q, const int* expert_ids,
     const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
     int H, int F, int top_k, cudaStream_t stream
 ) {
+    mg_sparse_ffn_init();
     static int spec = -1;
     if (spec < 0) { const char* e = getenv("SPARKINFER_DOWN_SPEC"); spec = (e && e[0] == '0') ? 0 : 1; }
     const dim3 block(WPB * 32);
@@ -1424,7 +1438,27 @@ static inline bool launch_down_q4k_mmvq_splitk(
     // gate/up arm: this was the other decode GEMV still landing on the runtime-parameterised
     // kernel, 2.49 ms of the step. NBLK constant makes WORK and the wi loop bound compile-time.
     // Identical dot products in identical order, so the result is bit-identical.
+    //
+    // When #774 sparse FFN is on, also skip down weight blocks whose hq8 scales are 0
+    // (SKIP_ZERO_HQ8). Grid unchanged; zeroed neurons contribute nothing either way.
     if (spec && top_k == 1 && F == 19968) {
+        if (g_mg_sparse_down) {
+            if (S == 8) {
+                launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<8, 78, 1, true>,
+                    down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+                return true;
+            }
+            if (S == 4) {
+                launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<4, 78, 1, true>,
+                    down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+                return true;
+            }
+            if (S == 2) {
+                launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<2, 78, 1, true>,
+                    down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+                return true;
+            }
+        }
         if (S == 8) {
             launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_qwen_kernel<8, 78, 1>,
                 down_q, expert_ids, expert_weights, hq8, output, H, pdl);
@@ -1489,14 +1523,26 @@ static inline bool launch_down_q5k_mmvq_splitk(
 // divergence and the launch grid is unchanged -- the captured decode graph is unaffected. tau is
 // read once from the environment (default 0.06); SPARKINFER_MG_SPARSE_FFN=0 disables it (falls
 // back to the dense gate/up arm) and SPARKINFER_MG_SPARSE_TAU overrides tau, both for A/B.
-static float g_mg_sparse_tau = -1.f;   // <0 = uninit; env-set once (host), passed by value
-
+//
+// Sparse DOWN (this change): the same zeroed h quantizes to Q8_1 with d==0, so Muse's Q4_K down
+// can skip those weight-block reads too. SPARKINFER_MG_SPARSE_DOWN=0 keeps sparse gate/up but
+// restores the dense down arm for a clean A/B of this second half alone.
 static void mg_sparse_ffn_init() {
-    if (g_mg_sparse_tau >= 0.f) return;
-    const char* off = getenv("SPARKINFER_MG_SPARSE_FFN");
-    if (off && off[0] == '0') { g_mg_sparse_tau = 0.f; return; }
-    const char* t = getenv("SPARKINFER_MG_SPARSE_TAU");
-    g_mg_sparse_tau = t ? (float)atof(t) : 0.06f;
+    if (g_mg_sparse_tau < 0.f) {
+        const char* off = getenv("SPARKINFER_MG_SPARSE_FFN");
+        if (off && off[0] == '0') {
+            g_mg_sparse_tau = 0.f;
+        } else {
+            const char* t = getenv("SPARKINFER_MG_SPARSE_TAU");
+            g_mg_sparse_tau = t ? (float)atof(t) : 0.06f;
+        }
+    }
+    if (g_mg_sparse_down < 0) {
+        const char* sd = getenv("SPARKINFER_MG_SPARSE_DOWN");
+        if (sd && sd[0] == '0') g_mg_sparse_down = 0;
+        else if (sd && sd[0] == '1') g_mg_sparse_down = 1;
+        else g_mg_sparse_down = (g_mg_sparse_tau > 0.f) ? 1 : 0;
+    }
 }
 
 template <int H, int F, int TOPK>
