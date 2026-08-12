@@ -68,6 +68,7 @@ struct Arena {
     }
     void rewind() { cursor = 0; ok = true; }
     void free_all() { for (void* b : bufs) cudaFree(b); bufs.clear(); sizes.clear(); cursor = 0; }
+    size_t total() const { size_t t = 0; for (size_t b : sizes) t += b; return t; }
 };
 } // namespace
 
@@ -139,7 +140,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     bf16* lin_conv_state = static_cast<bf16*>(s.lin_conv_state);
 
     // ---- scratch ----
-    Arena a;
+    // The scratch set is rebuilt from scratch on every call, and it is not small: Muse Glimmer at
+    // ctx=128 asks for ~0.56 GB across ~20 buffers, and the cudaMalloc + cudaFree pair measures
+    // 2.2 + 2.4 ms against a 94.5 ms prefill -- 4.6% of the batched prefill spent in the allocator,
+    // on the path the harness times. Hold the arenas across calls and rewind() them instead, which
+    // is what dflash_verify_short_run already does with its verify arena; the reuse check in
+    // Arena::alloc keeps a buffer only while it is big enough, so a growing prefill still resizes.
+    // A prefill whose scratch exceeds kArenaKeepBytes releases at the end rather than pinning it
+    // (a one-off 128k prompt should not hold ~10 GB forever).
+    // SPARKINFER_PREFILL_ARENA_REUSE=0 restores the per-call malloc/free (A/B).
+    static const bool arena_reuse = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ARENA_REUSE");
+        return !(e && e[0] == '0');
+    }();
+    constexpr size_t kArenaKeepBytes = 1ull << 30;
+    static thread_local Arena keep_a, keep_a8, keep_am, keep_aw;   // held across calls
+    Arena once_a, once_a8, once_am, once_aw;                       // per-call otherwise
+    if (arena_reuse) { keep_a.rewind(); keep_a8.rewind(); keep_am.rewind(); keep_aw.rewind(); }
+    Arena& a = arena_reuse ? keep_a : once_a;
     bf16* x    = a.alloc<bf16>((size_t)N * H);
     bf16* xn   = a.alloc<bf16>((size_t)N * H);
     bf16* hn   = a.alloc<bf16>((size_t)N * H);
@@ -234,7 +252,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // SPARKINFER_PREFILL_MOE_FP8=0 restores the bf16 projections (A/B).
     const char* _pmfp8 = getenv("SPARKINFER_PREFILL_MOE_FP8");
     bool moe_fp8 = moe && (!_pmfp8 || _pmfp8[0] != '0');
-    Arena a8;
+    Arena& a8 = arena_reuse ? keep_a8 : once_a8;
     // A_i8 holds the quantized activation. Dense full-i8: non-FFN projs quantize N rows x K(<=H);
     // chunked FFN quantizes at most FC rows x ffn. Long-ctx selective: N*H if attn-i8/fp8-gdn else FC*ffn.
     // MoE: no chunked FFN; projections quantize N rows x maxAK.
@@ -249,6 +267,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     signed char* W_i8 = need_i8 ? a8.alloc<signed char>(maxw) : nullptr;
     float* sx = need_i8 ? a8.alloc<float>(sx_n) : nullptr;
     float* sw = need_i8 ? a8.alloc<float>((size_t)maxNO) : nullptr;
+    // Muse Glimmer split-K partials for the skinny projections. launch_prefill_gemm_i8 puts one
+    // 128x128 output tile in a block, so Muse's narrow n_out (attn k/v = 256 -> TWO blocks, q and
+    // the q-gate = 4096 -> 32) leaves the device almost empty: measured on an RTX 5090 the 2-block
+    // k/v launch costs the same 69 us as the 32-block one and half of the 156-block ffn one. The
+    // split-K launcher fans those over blockIdx.z and reduces int32 partials here; int32 adds are
+    // exact, so the output is bit-identical (see launch_prefill_gemm_i8_splitk). Capped at
+    // kSkMaxRows because the partial buffer is N*n_out int32 -- and a prefill longer than that
+    // already has grid.y tiles to fill the device with, so the launcher declines it anyway.
+    // SPARKINFER_PREFILL_GEMM_SPLITK=0 disables (A/B).
+    constexpr int kSkMaxRows = 512;
+    const bool want_sk = c.muse_glimmer && !moe && need_i8 && N <= kSkMaxRows && [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GEMM_SPLITK");
+        return !(e && e[0] == '0');
+    }();
+    int* sk_p = want_sk ? a8.alloc<int>((size_t)N * maxNO) : nullptr;
     if (need_i8 && !a8.ok) {
         a8.free_all();
         use_i8 = false;
@@ -259,11 +292,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         moe_fp8 = false;
         A_i8 = W_i8 = nullptr;
         sx = sw = nullptr;
+        sk_p = nullptr;
     }
+    // Every split-K use is gated on this, so a non-Muse model never reaches the new kernel.
+    const bool mg_sk = sk_p != nullptr;
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
-    Arena aw;
+    Arena& aw = arena_reuse ? keep_aw : once_aw;
     signed char *ffn_Wg_i8 = nullptr, *ffn_Wu_i8 = nullptr, *ffn_Wd_i8 = nullptr;
     float *ffn_swg = nullptr, *ffn_swu = nullptr, *ffn_swd = nullptr;
     if (use_i8_ffn) {
@@ -398,7 +434,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         const char* e = getenv("SPARKINFER_PREFILL_HIDE_SG");
         return e && e[0] == '1';
     }();
-    Arena am;
+    Arena& am = arena_reuse ? keep_am : once_am;
     signed char *Wg_i8 = nullptr, *Wu_i8 = nullptr, *Wd_i8 = nullptr, *h_i8 = nullptr, *mA_i8 = nullptr;
     float *swg = nullptr, *swu = nullptr, *swd = nullptr, *sh = nullptr, *msx = nullptr;
     float *mlogits = nullptr, *mweights = nullptr, *pair_w = nullptr, *routed_f32 = nullptr, *dw = nullptr;
@@ -466,6 +502,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, R, K, st);
         a_q = A; a_qR = R; a_qK = K;
     };
+    // int8 tensor-core GEMM with the Muse-only split-K fan-out tried first. Everything else keeps
+    // calling the single-block launcher, so non-Muse output is byte-for-byte what it was.
+    auto gemm_i8 = [&](const signed char* Aq, const signed char* Wq, const float* sxq,
+                       const float* swq, bf16* Cc, int R, int n_out, int K, bool resid) {
+        if (mg_sk && kernels::launch_prefill_gemm_i8_splitk(Aq, Wq, sxq, swq, Cc, R, n_out, K,
+                                                            sk_p, resid, st))
+            return;
+        if (resid) kernels::launch_prefill_gemm_i8_resid(Aq, Wq, sxq, swq, Cc, R, n_out, K, st);
+        else       kernels::launch_prefill_gemm_i8(Aq, Wq, sxq, swq, Cc, R, n_out, K, st);
+    };
     // C[N,n_out] = A[N,K] @ W^T  (W native quantized [n_out,K]).
     auto proj = [&](const bf16* A, const void* W, int wtype, bf16* C, int n_out, int K, int rows = 0) {
         const int R = rows > 0 ? rows : N;   // rows (M) to process; chunked FFN passes a sub-N count
@@ -480,7 +526,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 const void* wb = dq(W, wtype, n_out, K);
                 kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
             }
-            kernels::launch_prefill_gemm_i8(A_i8, W_i8, sx, sw, C, R, n_out, K, st);
+            gemm_i8(A_i8, W_i8, sx, sw, C, R, n_out, K, false);
         } else if ((use_fp8_gdn || moe_fp8) && n_out >= 128) {
             // fp8 (e4m3) tensor-core path for the long-ctx GDN projections. A_i8/W_i8 (1 byte) hold
             // the e4m3 operands; dequant the weight to bf16 scratch, then row/channel fp8-quantize.
@@ -516,7 +562,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             const void* wb = dq(W, wtype, n_out, K);
             kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
         }
-        kernels::launch_prefill_gemm_i8_resid(A_i8, W_i8, sx, sw, Cx, R, n_out, K, st);
+        gemm_i8(A_i8, W_i8, sx, sw, Cx, R, n_out, K, true);
         return true;
     };
 
@@ -721,11 +767,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                             kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, H, ffn, st);
                         }
                         if (ffn_fused)
-                            kernels::launch_prefill_gemm_i8_resid(A_i8, W_i8, sx, sw,
-                                                                  x + (size_t)fo * H, fn, H, ffn, st);
+                            gemm_i8(A_i8, W_i8, sx, sw, x + (size_t)fo * H, fn, H, ffn, true);
                         else
-                            kernels::launch_prefill_gemm_i8(A_i8, W_i8, sx, sw,
-                                                            ao + (size_t)fo * H, fn, H, ffn, st);
+                            gemm_i8(A_i8, W_i8, sx, sw, ao + (size_t)fo * H, fn, H, ffn, false);
                     } else {
                         kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
                         if (!ffn_fused || !proj_resid(ffg, w.down_q, w.down_qtype,
@@ -1259,10 +1303,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     pf_cu(cudaStreamSynchronize(st), "prefill sync");
     int seed = *s.h_out_id;
 
-    a.free_all();
-    a8.free_all();
-    am.free_all();
-    aw.free_all();
+    // Release rather than hold when this call's scratch is too big to keep resident.
+    if (!arena_reuse ||
+        a.total() + a8.total() + am.total() + aw.total() > kArenaKeepBytes) {
+        a.free_all();
+        a8.free_all();
+        am.free_all();
+        aw.free_all();
+    }
     return seed;
 }
 
