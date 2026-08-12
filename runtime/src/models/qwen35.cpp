@@ -2369,6 +2369,34 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 1;
         return v < 1 ? 1 : v;
     }();
+    // ...but below kCompactMaxSeq that evidence is never worth waiting for, and re-collecting it
+    // after every partial accept costs more than it saves.
+    //
+    // The score decays on any block that is not full, so a single partial accept disarms the NEXT
+    // step back onto the token loop. At short context a re-arming step is not free: the batched
+    // pass costs a flat 5.10 ms there while a token-loop step costs `keep` target forwards at
+    // 1.91 ms each, so the loop only wins when keep <= 2 -- and the step that follows a partial
+    // accept is not the step that has a small keep. On the scored 128-ctx prompt (tau 5.3333) the
+    // gate therefore spends ~3 of ~24 steps on the token loop and gives up throughput on every
+    // one of them.
+    //
+    // Measured on RTX 5090, 2 reps, identical binary, tau IDENTICAL at 5.3333 in every run, so
+    // this is pure step time: adaptive gate 1008.35 / 1007.23 tok/s against 1044.15 / 1045.69
+    // armed from the first step (+3.68%). An oracle that knew each step's keep in advance and
+    // picked the cheaper path scores ~1068, so most of the available gap is closed by simply not
+    // waiting. The full depth sweep at this context confirms nothing else is left there: depth
+    // 3/4/5/6/7 measure 859.7 / 927.2 / 1046.0 / 1036.7 / 994.8, i.e. the shipped depth 5 is the
+    // peak.
+    //
+    // This is scoped to short_ctx and changes nothing above kCompactMaxSeq: 512 keeps its
+    // autoregressive path (spec_never_pays), and 4k/16k/32k keep the acceptance-EMA gate, which
+    // already seeds itself armed past kEngageMinSeq. Forcing the batched pass on GLOBALLY instead
+    // would defeat spec_never_pays and drop 512 from 515.7 to 494.9 tok/s -- a regression the
+    // eval rejects outright.
+    static const bool kShortArm = []{
+        const char* e = getenv("SPARKINFER_DFLASH_SHORT_ARM");
+        return !(e && e[0] == '0');
+    }();
 
     const int n_prompt = (int)prompt.size();
     const bool spec_never_pays = (n_prompt + B) > kCompactMaxSeq &&
@@ -2601,7 +2629,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // out not to be landing blocks. Below the floor the ramp is untouched.
         if (step_no == 0 && (start + B) >= kEngageMinSeq) keep_ema8 = kEngageKeepLong * 8;
         const bool compact_verify = compact_mode == 1 ||
-            (compact_mode != 0 && (short_ctx ? compact_score >= kBlockScore
+            (compact_mode != 0 && (short_ctx ? (kShortArm || compact_score >= kBlockScore)
                                              : ((start + B) >= kEngageMinSeq &&
                                                 keep_ema8 >= kEngageKeepLong * 8)));
         block[0] = next;
