@@ -37,4 +37,21 @@ void launch_prefill_gemm_i8_resid(const signed char* A, const signed char* W,
                                   const float* sx, const float* sw, void* C,
                                   int M, int N, int K, cudaStream_t stream = nullptr);
 
+// Split-K variant for skinny GEMMs (one 128-row M tile, narrow n_out). The launch above puts one
+// 128x128 output tile in a block, so a projection whose n_out is small leaves most of the device
+// idle: on an RTX 5090 a 2-block launch (Muse Glimmer's attn k/v, n_out=256) takes the same ~69 us
+// as a 32-block one, because a block streams its weight slice at only ~12.3 GB/s and the device
+// does not saturate until ~80 blocks. This splits the K loop across blockIdx.z, accumulates the
+// int32 tiles into `partials` (M*N int32, caller-owned, zeroed here) with atomicAdd, and scales
+// them in a second pass. int32 accumulation is exact and associative, so the result is BIT-
+// IDENTICAL to the single-block launcher; only the block count changes.
+//
+// Returns false -- caller must run launch_prefill_gemm_i8[_resid] itself -- when the shape does not
+// want splitting (grid already fills the device, M > 128, K too short), when `partials` is null, or
+// when SPARKINFER_PREFILL_GEMM_SPLITK=0 disables it (A/B).
+bool launch_prefill_gemm_i8_splitk(const signed char* A, const signed char* W,
+                                   const float* sx, const float* sw, void* C,
+                                   int M, int N, int K, int* partials, bool resid,
+                                   cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

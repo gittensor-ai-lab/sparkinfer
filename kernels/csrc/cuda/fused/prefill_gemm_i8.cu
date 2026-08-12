@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
+#include <cstdlib>
 #include "sparkinfer/kernels/prefill_i8.h"
 
 #include "sparkinfer/kernels/prefill_quant_rows.h"
@@ -67,11 +68,16 @@ __global__ void pf_quantize_rows_i8(const __nv_bfloat16* __restrict__ x, signed 
 // RESID folds the residual add into the store: C[m,n] = bf16(C[m,n] + bf16(acc*sx*sw)) -- the same
 // two-step rounding as the pf_add kernel it replaces, reading and writing through the ONE C
 // pointer (no second aliased argument), so the fused path stays bit-identical to GEMM-then-add.
-template <bool RESID>
+//
+// SPLITK partitions the K loop across blockIdx.z (ktiles BK-tiles each) and accumulates the int32
+// tile into P[M,N] with atomicAdd instead of storing C; a separate epilogue applies sx/sw. The
+// output is bit-identical because the accumulator is int32: integer addition is exact and
+// associative, so the reordered partial sums land on the same value the single-block loop produces.
+template <bool RESID, bool SPLITK>
 __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
         const signed char* __restrict__ A, const signed char* __restrict__ W,
         const float* __restrict__ sx, const float* __restrict__ sw,
-        __nv_bfloat16* C, int M, int N, int K) {
+        __nv_bfloat16* C, int* __restrict__ P, int M, int N, int K, int ktiles) {
     __shared__ signed char As[2][PF_BM][PF_BK];
     __shared__ signed char Bs[2][PF_BN][PF_BK];
 
@@ -87,6 +93,14 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
     const int m0   = blockIdx.y * PF_BM;
     const int n0   = blockIdx.x * PF_BN;
     const int nk   = (K + PF_BK - 1) / PF_BK;
+    // K-tile range this block owns. Without SPLITK that is the whole K loop, exactly as before.
+    int t0 = 0, t1 = nk;
+    if (SPLITK) {
+        t0 = blockIdx.z * ktiles;
+        t1 = t0 + ktiles;
+        if (t1 > nk) t1 = nk;
+        if (t0 >= t1) return;
+    }
 
     int acc[PF_MFRAG][PF_NFRAG][4];
     #pragma unroll
@@ -108,11 +122,11 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
         __pipeline_commit();
     };
 
-    stage(0, 0);
+    stage(0, t0 * PF_BK);
     int buf = 0;
-    for (int t = 0; t < nk; t++) {
-        if (t + 1 < nk) stage(buf ^ 1, (t + 1) * PF_BK);
-        __pipeline_wait_prior(t + 1 < nk ? 1 : 0);
+    for (int t = t0; t < t1; t++) {
+        if (t + 1 < t1) stage(buf ^ 1, (t + 1) * PF_BK);
+        __pipeline_wait_prior(t + 1 < t1 ? 1 : 0);
         __syncthreads();
 
         #pragma unroll
@@ -145,6 +159,25 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
         }
         __syncthreads();
         buf ^= 1;
+    }
+
+    // Split-K: hand the int32 tile to the partial buffer and let the epilogue scale it. Same
+    // (row, col) map as the scalar tail below.
+    if (SPLITK) {
+        #pragma unroll
+        for (int i = 0; i < PF_MFRAG; i++) {
+            #pragma unroll
+            for (int j = 0; j < PF_NFRAG; j++) {
+                const int gn = n0 + wn * 64 + j * 8 + tig * 2;
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int gm = m0 + wm * 32 + i * 16 + grp + (e >> 1) * 8;
+                    const int cn = gn + (e & 1);
+                    if (gm < M && cn < N) atomicAdd(&P[(size_t)gm * N + cn], acc[i][j][e]);
+                }
+            }
+        }
+        return;
     }
 
     // Registers straight to global: c0/c1 (and c2/c3) are adjacent columns, so each pair packs into
@@ -188,7 +221,88 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
         }
     }
 }
+// Split-K epilogue: apply the per-token / per-channel scales to the int32 partial sum. The
+// arithmetic is copied from the in-GEMM epilogue above -- ((float)acc * sx[m]) * sw[n] rounded
+// round-to-nearest, and for RESID the same round-then-add-then-round the fused store does -- so
+// the split path and the single-block path emit the same bits.
+template <bool RESID>
+__global__ void pf_gemm_i8_sk_epi_kernel(const int* __restrict__ P, const float* __restrict__ sx,
+                                         const float* __restrict__ sw,
+                                         __nv_bfloat16* __restrict__ C, int M, int N) {
+    const int m = blockIdx.y;
+    if (m >= M) return;
+    const float s = sx[m];
+    const size_t row = (size_t)m * N;
+    int n = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (n + 1 < N) {                                     // pair: one int2 load, one bf16x2 store
+        const int2 p = *reinterpret_cast<const int2*>(&P[row + n]);
+        __nv_bfloat162 v = __floats2bfloat162_rn((float)p.x * s * sw[n], (float)p.y * s * sw[n + 1]);
+        __nv_bfloat162* cp = reinterpret_cast<__nv_bfloat162*>(&C[row + n]);
+        if (RESID) {
+            const __nv_bfloat162 r = *cp;
+            v = __floats2bfloat162_rn(__bfloat162float(r.x) + __bfloat162float(v.x),
+                                      __bfloat162float(r.y) + __bfloat162float(v.y));
+        }
+        *cp = v;
+    } else if (n < N) {                                  // odd tail
+        __nv_bfloat16 v = __float2bfloat16((float)P[row + n] * s * sw[n]);
+        if (RESID)
+            v = __float2bfloat16(__bfloat162float(C[row + n]) + __bfloat162float(v));
+        C[row + n] = v;
+    }
+}
+
+// How many ways to split K. The launch is one 128x128 output tile per block, so a projection with a
+// narrow n_out gets a grid far smaller than the device: Muse Glimmer's attn k/v (n_out=256) run TWO
+// blocks, and measured on an RTX 5090 that launch costs the same 69 us as the 32-block q/gate one --
+// per-block streaming rate is ~12.3 GB/s and the device only saturates (~1.0 TB/s of weight) past
+// ~80 blocks. Splitting K until the grid reaches that knee is what converts the idle SMs into
+// throughput. Above it, extra blocks buy nothing and the partial-buffer traffic is a pure cost, so
+// wide projections (Muse's ffn gate/up at 156 tiles) are deliberately left alone.
+constexpr int PF_SK_TILES_MAX = 96;    // tile counts at/above this already fill the device
+constexpr int PF_SK_TARGET    = 170;   // blocks to aim for (one per SM)
+constexpr int PF_SK_MIN_KT    = 2;     // never leave a block fewer than this many BK-tiles
+constexpr int PF_SK_MAX       = 32;    // cap: partial-buffer atomics scale with the split count
+
+static int pf_sk_splits(int M, int N, int K) {
+    const int tiles = ((N + PF_BN - 1) / PF_BN) * ((M + PF_BM - 1) / PF_BM);
+    if (tiles <= 0 || tiles >= PF_SK_TILES_MAX) return 1;
+    int s = (PF_SK_TARGET + tiles - 1) / tiles;
+    if (s > PF_SK_MAX) s = PF_SK_MAX;
+    const int smax = ((K + PF_BK - 1) / PF_BK) / PF_SK_MIN_KT;
+    if (s > smax) s = smax;
+    return s > 1 ? s : 1;
+}
 } // namespace
+
+bool launch_prefill_gemm_i8_splitk(const signed char* A, const signed char* W,
+                                   const float* sx, const float* sw, void* C,
+                                   int M, int N, int K, int* partials, bool resid,
+                                   cudaStream_t stream) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GEMM_SPLITK");
+        return !(e && e[0] == '0');
+    }();
+    // One M tile only: the partial buffer is M*N int32 and the caller sizes it for that.
+    if (!on || !partials || M <= 0 || M > PF_BM || N <= 0 || K <= 0) return false;
+    const int splits = pf_sk_splits(M, N, K);
+    if (splits <= 1) return false;
+    const int nk = (K + PF_BK - 1) / PF_BK;
+    const int ktiles = (nk + splits - 1) / splits;
+    const int nz = (nk + ktiles - 1) / ktiles;
+    if (cudaMemsetAsync(partials, 0, (size_t)M * N * sizeof(int), stream) != cudaSuccess) return false;
+    dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM, nz);
+    pf_gemm_i8_kernel<false, true><<<grid, 256, 0, stream>>>(
+        A, W, sx, sw, nullptr, partials, M, N, K, ktiles);
+    dim3 eg(((N + 1) / 2 + 255) / 256, M);
+    if (resid)
+        pf_gemm_i8_sk_epi_kernel<true><<<eg, 256, 0, stream>>>(
+            partials, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N);
+    else
+        pf_gemm_i8_sk_epi_kernel<false><<<eg, 256, 0, stream>>>(
+            partials, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N);
+    return true;
+}
 
 void launch_prefill_quantize_rows_i8(const void* x_bf16, signed char* q, float* scale,
                                      int rows, int cols, cudaStream_t stream) {
@@ -203,8 +317,8 @@ void launch_prefill_gemm_i8(const signed char* A, const signed char* W,
                             const float* sx, const float* sw, void* C,
                             int M, int N, int K, cudaStream_t stream) {
     dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
-    pf_gemm_i8_kernel<false><<<grid, 256, 0, stream>>>(
-        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+    pf_gemm_i8_kernel<false, false><<<grid, 256, 0, stream>>>(
+        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), nullptr, M, N, K, 0);
 }
 
 // Residual-fused variant: C[m,n] += bf16(acc*sx*sw) with pf_add's rounding. Passing the residual
@@ -213,8 +327,8 @@ void launch_prefill_gemm_i8_resid(const signed char* A, const signed char* W,
                                   const float* sx, const float* sw, void* C,
                                   int M, int N, int K, cudaStream_t stream) {
     dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
-    pf_gemm_i8_kernel<true><<<grid, 256, 0, stream>>>(
-        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+    pf_gemm_i8_kernel<true, false><<<grid, 256, 0, stream>>>(
+        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), nullptr, M, N, K, 0);
 }
 
 }} // namespace sparkinfer::kernels
