@@ -677,13 +677,8 @@ void launch_add_rmsnorm3_q8_rows(const void* x, const void* res1, const void* re
         reinterpret_cast<si_blk_q8_1*>(out_q8), cols, eps);
 }
 
-void launch_muse_sandwich_tail(const void* residual, const void* branch, const void* post_w,
-                               const void* next_w, void* out_x, void* out_xn,
-                               int rows, int cols, float post_eps, float eps, cudaStream_t stream) {
-    launch_muse_sandwich_tail_q8(residual, branch, post_w, next_w, out_x, out_xn, nullptr,
-                                 rows, cols, post_eps, eps, stream);
-}
-
+// Q8 launcher first: bf16 wrapper calls it, and this .cu does not include fused.h
+// (NVCC otherwise errors "identifier undefined" — Muse bot BUILD_FAILED on #777).
 void launch_muse_sandwich_tail_q8(const void* residual, const void* branch, const void* post_w,
                                   const void* next_w, void* out_x, void* out_xn, void* out_q8,
                                   int rows, int cols, float post_eps, float eps,
@@ -732,6 +727,13 @@ void launch_muse_sandwich_tail_q8(const void* residual, const void* branch, cons
         reinterpret_cast<__nv_bfloat16*>(out_x),
         reinterpret_cast<__nv_bfloat16*>(out_xn),
         q8, cols, post_eps, eps);
+}
+
+void launch_muse_sandwich_tail(const void* residual, const void* branch, const void* post_w,
+                               const void* next_w, void* out_x, void* out_xn,
+                               int rows, int cols, float post_eps, float eps, cudaStream_t stream) {
+    launch_muse_sandwich_tail_q8(residual, branch, post_w, next_w, out_x, out_xn, nullptr,
+                                 rows, cols, post_eps, eps, stream);
 }
 
 void launch_norm_then_add(const void* residual, const void* block_out, const void* weight,
