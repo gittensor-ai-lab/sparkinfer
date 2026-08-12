@@ -123,6 +123,17 @@ void launch_prefill_qknorm_rope_kv_int8(
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream = nullptr);
 
+// Muse Glimmer bf16-KV counterpart: QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM)
+// RoPE when rotary_dim>0 (SWA layers), or NoPE when rotary_dim==0 (global layers) + bf16 KV
+// write. Muse Glimmer runs a bf16 KV cache (its decode KV write is bf16), so no int8 scale.
+//   k_pool/v_pool: bf16 [phys_tok, n_kv_heads, hd]
+void launch_prefill_qknorm_ropenorm_kv_bf16(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool,
+    const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
+    cudaStream_t stream = nullptr);
+
 // Full-attention prefill: causal attention over the paged int8 KV pool just filled above.
 // One warp per (token, q-head); online softmax over keys 0..token (causal). q is the rope'd
 // bf16 query [N,n_q_heads*hd]; out attn[N,n_q_heads*hd].

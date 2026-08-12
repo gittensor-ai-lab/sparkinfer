@@ -923,6 +923,84 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
 }
 
 // ============================================================================
+// Muse Glimmer full-attention prefill: QK-norm + NORMAL RoPE (consecutive-pair,
+// LLAMA_ROPE_TYPE_NORM) + BF16 KV write into the single-sequence paged pool. The
+// bf16 counterpart of pf_qknorm_rope_kv_int8_kernel: same prefill block-table
+// layout (pos==tok, block_table[blk]), but writes bf16 K/V (no int8 quant/scale)
+// and rotates consecutive pairs (2i,2i+1) instead of NeoX (i,i+half) -- Muse
+// Glimmer is LLAMA_ROPE_TYPE_NORM in llama.cpp (see rope_kv_append_normal_kernel,
+// rope.cu). rotary_dim>0 => rope (SWA layers, rotary_dim=head_dim); rotary_dim==0
+// => NoPE (global layers, QK-norm then append as-is). Bit-for-bit the same KV a
+// forward_token decode step writes via launch_rmsnorm + launch_rope_kv_append_normal
+// / launch_kv_append, so a subsequent decode reads a consistent cache.
+// grid = (N, n_q_heads + 2*n_kv_heads); blockDim = head_dim.
+// ============================================================================
+__global__ void pf_qknorm_ropenorm_kv_bf16_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    const int* __restrict__ block_table,
+    int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
+    int block_size, int max_blocks_per_seq) {
+    const int tok  = blockIdx.x;
+    const int unit = blockIdx.y;
+    const int t    = threadIdx.x;
+    const int pos  = tok;                              // prefill: position == token index
+    const int blk  = pos / block_size, within = pos % block_size;
+    const int phys = block_table[blk];                // single sequence
+    const size_t ctok = (size_t)phys * block_size + within;
+
+    extern __shared__ float s_h[];
+    __shared__ float s_warp[32];
+
+    const bool is_q = unit < n_q_heads;
+    const bool is_k = !is_q && unit < n_q_heads + n_kv_heads;
+    if (unit >= n_q_heads + 2 * n_kv_heads) return;
+
+    if (is_q || is_k) {
+        const int hh = is_q ? unit : (unit - n_q_heads);
+        const size_t base = ((size_t)tok * (is_q ? n_q_heads : n_kv_heads) + hh) * head_dim;
+        const __nv_bfloat16* src = is_q ? q : k;
+        const __nv_bfloat16* nrm = is_q ? q_w : k_w;
+        const float xv = pf_to_f(src[base + t]);
+        float ss = xv * xv;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+        if ((t & 31) == 0) s_warp[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (head_dim + 31) / 32) ? s_warp[t] : 0.f;
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) vv += __shfl_xor_sync(0xffffffff, vv, m);
+            if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+        }
+        __syncthreads();
+        s_h[t] = pf_to_f(__float2bfloat16(xv * s_warp[0] * pf_to_f(nrm[t])));
+        __syncthreads();
+        // NORMAL (consecutive-pair) RoPE of the normed head vector: pair (2i, 2i+1).
+        float out = s_h[t];
+        if (rotary_dim > 0 && t < rotary_dim) {
+            const int i = t >> 1;
+            const float freq = __powf(theta, -2.f * (float)i / (float)rotary_dim);
+            const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+            const float x0 = s_h[2 * i], x1 = s_h[2 * i + 1];
+            out = ((t & 1) == 0) ? (x0 * c - x1 * s) : (x0 * s + x1 * c);
+        }
+        if (is_q) {
+            q[base + t] = __float2bfloat16(out);
+        } else {
+            const size_t dst = (ctok * n_kv_heads + hh) * head_dim;
+            k_pool[dst + t] = __float2bfloat16(out);
+        }
+    } else {                                          // V: append as-is (no norm, no rope)
+        const int hh = unit - n_q_heads - n_kv_heads;
+        const size_t base = ((size_t)tok * n_kv_heads + hh) * head_dim;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+        v_pool[dst + t] = v[base + t];
+    }
+}
+
+// ============================================================================
 // Causal attention over the paged int8 KV pool. One warp per (token, q-head);
 // online softmax over keys 0..token. head_dim <= 256 -> ELEMS <= 8 per lane.
 // ============================================================================
@@ -1196,6 +1274,25 @@ void launch_prefill_qknorm_rope_kv_int8(
         reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
         reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
         reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+        block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
+        block_size, max_blocks_per_seq);
+}
+
+// Muse Glimmer bf16-KV counterpart: QK-norm + NORMAL RoPE (rotary_dim>0) / NoPE
+// (rotary_dim==0) + bf16 KV write. k_pool/v_pool are bf16 (muse uses a bf16 KV cache).
+void launch_prefill_qknorm_ropenorm_kv_bf16(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool,
+    const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
+    cudaStream_t stream) {
+    dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
+    const size_t shmem = (size_t)head_dim * sizeof(float);
+    pf_qknorm_ropenorm_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+        reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
         block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
         block_size, max_blocks_per_seq);
 }
