@@ -70,6 +70,12 @@ if(BUILD_EXAMPLES)
     add_executable(qwen3_gguf_bench examples/qwen3_gguf_bench.cpp)
     target_include_directories(qwen3_gguf_bench PRIVATE include)
     target_link_libraries(qwen3_gguf_bench PRIVATE sparkinfer_runtime CUDA::cudart)
+    # TTFT benchmark: LMCache cache-hit vs. full-recompute baseline on a synthetic model (see
+    # lmcache_bench.cpp's header comment for why a real GGUF isn't needed). Requires a real
+    # sidecar venv at runtime (SPARKINFER_LMCACHE_PYTHON/_BRIDGE_SCRIPT), not build time.
+    add_executable(lmcache_bench examples/lmcache_bench.cpp)
+    target_include_directories(lmcache_bench PRIVATE include)
+    target_link_libraries(lmcache_bench PRIVATE sparkinfer_runtime CUDA::cudart)
     add_executable(qwen3_gguf_cb_bench examples/qwen3_gguf_cb_bench.cpp)
     target_include_directories(qwen3_gguf_cb_bench PRIVATE include)
     find_package(Threads REQUIRED)
