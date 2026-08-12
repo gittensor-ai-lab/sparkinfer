@@ -81,6 +81,15 @@ struct Qwen35LayerWeights {
     int wq_type = 0, wgate_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;
     int wqkv_type = 0, wqkv_gate_type = 0, ssm_beta_type = 0, ssm_alpha_type = 0, ssm_out_type = 0;
     int shared_gate_inp_type = 0;
+
+    // Muse Glimmer fused prefill: per-output-row int8 scales (amax/127) of the native Q4_K/Q5_K
+    // attn + FFN gate/up weights, precomputed once at load. Let the batched prefill GEMM decode the
+    // weight to int8 in-register (launch_prefill_gemm_qi8_dense) instead of materializing the whole
+    // int8 weight first. Null => that weight stays on the materialize path (e.g. Q6_K down, or when
+    // the precompute is disabled/unavailable). Owned by the model Impl, not freed per-layer.
+    const float* wq_rs = nullptr; const float* wgate_rs = nullptr;
+    const float* wk_rs = nullptr; const float* wv_rs = nullptr; const float* wo_rs = nullptr;
+    const float* gate_rs = nullptr; const float* up_rs = nullptr;
 };
 
 struct Qwen35Weights {

@@ -520,6 +520,30 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         return true;
     };
 
+    // Muse Glimmer fused quantized-B projection: decode the native Q4_K/Q5_K weight to int8 INSIDE
+    // the GEMM (launch_prefill_gemm_qi8_dense) using the per-row scale precomputed at load (w.*_rs),
+    // skipping the int8 materialize (dequant -> W_i8 -> reload) that proj()'s int8 path pays -- the
+    // dominant weight-bandwidth cost at prefill's M=128, where the GEMM tile is compute-bound and the
+    // materialize round-trip is pure overhead. Bit-identical to proj(): same activation int8 (shared
+    // quant_a_i8 memo), same weight decode + per-row scale + int8 bytes, same int8 tensor-core
+    // accumulation. Falls back to proj() when the scale is absent (Q6_K down, precompute off) or the
+    // weight type/shape is unsupported. Reaches ONLY Muse (c.muse_glimmer); every other model's proj()
+    // calls are untouched. SPARKINFER_MUSE_PREFILL_QB=0 forces the materialize path (A/B).
+    const bool muse_qb = c.muse_glimmer && [] {
+        const char* e = getenv("SPARKINFER_MUSE_PREFILL_QB");
+        return !(e && e[0] == '0');
+    }();
+    auto proj_fused = [&](const bf16* A, const void* W, int wtype, const float* rs,
+                          bf16* C, int n_out, int K, int rows = 0) {
+        const int R = rows > 0 ? rows : N;
+        if (muse_qb && use_i8 && rs && n_out >= 128 && kernels::pfm_moe_gemm_qi8_supported(wtype)) {
+            quant_a_i8(A, R, K);
+            if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st))
+                return;
+        }
+        proj(A, W, wtype, C, n_out, K, rows);
+    };
+
     // GDN wqkv + wqkv_gate both project the same input xn, so on the fp8 path quantize xn to e4m3
     // ONCE and share it across both GEMMs (proj() would otherwise re-quantize xn per projection --
     // a full redundant read of xn and rewrite of the e4m3 activation each layer). Bit-identical to
@@ -602,10 +626,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 // goes straight to qb and the gate straight to qg, with no [q|gate] interleave to build
                 // and no split to undo (matches decode's sep_gate path, qwen35.cpp:988-1007). Projecting
                 // w.wq as `wide` (2*qdim) would dequant-read qdim rows PAST the 4096-row wq tensor.
-                proj(xn, w.wq,    w.wq_type,    qb, qdim,  H);
-                proj(xn, w.wgate, w.wgate_type, qg, qdim,  H);
-                proj(xn, w.wk,    w.wk_type,    kf, kvdim, H);
-                proj(xn, w.wv,    w.wv_type,    vf, kvdim, H);
+                proj_fused(xn, w.wq,    w.wq_type,    w.wq_rs,    qb, qdim,  H);
+                proj_fused(xn, w.wgate, w.wgate_type, w.wgate_rs, qg, qdim,  H);
+                proj_fused(xn, w.wk,    w.wk_type,    w.wk_rs,    kf, kvdim, H);
+                proj_fused(xn, w.wv,    w.wv_type,    w.wv_rs,    vf, kvdim, H);
             } else {
                 proj(xn, w.wq, w.wq_type, b8, wide,  H);             // qraw = [q|gate] per head
                 proj(xn, w.wk, w.wk_type, kf, kvdim, H);
@@ -643,7 +667,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
                 // add happens in launch_norm_then_add below.
-                proj(att, w.wo, w.wo_type, ao, H, qdim);
+                proj_fused(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim);
                 attn_fused = false;
             } else {
                 attn_fused = proj_resid(att, w.wo, w.wo_type, x, H, qdim);
@@ -707,8 +731,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         kernels::launch_prefill_gemm_i8(A_i8, ffn_Wd_i8, sx, ffn_swd,
                                                         ao + (size_t)fo * H, fn, H, ffn, st);
                 } else {
-                    proj(hn_c, w.gate_q, w.gate_qtype, ffg, ffn, H, fn);
-                    proj(hn_c, w.up_q,   w.up_qtype,   ffu, ffn, H, fn);
+                    proj_fused(hn_c, w.gate_q, w.gate_qtype, w.gate_rs, ffg, ffn, H, fn);
+                    proj_fused(hn_c, w.up_q,   w.up_qtype,   w.up_rs,   ffu, ffn, H, fn);
                     if (use_i8) {
                         // Same fused SwiGLU + per-row int8 quantize the long-ctx ffn_i8 branch
                         // runs (bit-identical to swiglu-then-quantize; both bf16-round first) --

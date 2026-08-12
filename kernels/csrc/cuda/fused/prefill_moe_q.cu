@@ -458,6 +458,131 @@ void dispatch_qi8_bm16(const signed char* A_i8, const float* sx, const void* W_q
             A_i8, sx, W, row_scale, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, n_out, K);
 }
 
+// ---------------------------------------------------------------------------
+// Dense (non-routed) fused-decode int8 GEMM: C[M,N] = A_i8[M,K] @ dequant(W_q[N,K])^T.
+// The same qm_decode_j64 B-stage + int8 WMMA as pfm_moe_gemm_qi8_kernel, with the expert /
+// pair-routing indirection stripped away: one dense weight [N,K], M contiguous activation rows,
+// C written directly (no gather, no scatter). Muse Glimmer's dense prefill uses this to consume
+// its native Q4_K/Q5_K attn + FFN gate/up weights straight from VRAM, skipping the per-layer int8
+// materialize (dequant -> write W_i8 -> read W_i8 back in the GEMM) that launch_prefill_gemm_i8
+// pays. The per-output-row scale is the one launch_gguf_dequant_rows_i8 itself produced,
+// precomputed once at load (Qwen35LayerWeights::*_rs), so every int8 byte -- and thus the whole
+// accumulation -- matches the materialize path by construction. BM=128 so each weight row is
+// decoded once per M-tile: at prefill's M=128 that is exactly once (one M-tile).
+template <int QT>
+__global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel(
+        const signed char* __restrict__ A_i8, const float* __restrict__ sx,
+        const unsigned char* __restrict__ W_q, const float* __restrict__ row_scale,
+        __nv_bfloat16* __restrict__ C, int Mtot, int N, int K) {
+    using namespace nvcuda;
+    constexpr int BS = qm_bs<QT>();
+    const int p0 = blockIdx.y * QM_BM;
+    const int M  = min(QM_BM, Mtot - p0);
+    if (M <= 0) return;
+    const int n0  = blockIdx.x * QM_BN;
+    const int nsb = K >> 8;
+
+    __shared__ __align__(16) signed char Bs[QM_BN][QM_LD];
+    __shared__ __align__(16) signed char As[2][QM_BM][QM_BK];
+    __shared__ int s_tok[QM_BM];
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wm = warp & 3, wn = warp >> 2;
+
+    // Direct activation rows (no pair_tok gather): row r of this M-tile is global token p0 + r.
+    for (int r = tid; r < QM_BM; r += blockDim.x)
+        s_tok[r] = (r < M) ? (p0 + r) : -1;
+
+    // Decode assignment: 4 threads per weight row, one 64-value sub-block pair (j64) each.
+    const int dr = tid >> 2, dj = tid & 3;
+    const int dgn = n0 + dr;
+    const bool drow_ok = dgn < N;
+    const unsigned char* drow = W_q + (size_t)(drow_ok ? dgn : 0) * (size_t)nsb * BS;
+    const float dscale = drow_ok ? row_scale[dgn] : 0.f;
+    const float dinv = (dscale > 0.f) ? (1.f / dscale) : 0.f;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> cf[2][2];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 2; j++) wmma::fill_fragment(cf[i][j], 0);
+
+    auto stageA = [&](int buf, int k0) {
+        for (int idx = tid; idx < QM_BM * 2; idx += blockDim.x) {
+            const int r = idx >> 1, c16 = (idx & 1) * 16;
+            const int arow = s_tok[r];
+            qm_cp16(&As[buf][r][c16], &A_i8[(size_t)max(arow, 0) * K + k0 + c16],
+                    arow >= 0 && (k0 + c16) < K);
+        }
+        __pipeline_commit();
+    };
+
+    __syncthreads();          // s_tok published before stageA reads it
+    stageA(0, 0);
+    int abuf = 0;
+
+    for (int sb = 0; sb < nsb; sb++) {
+        __syncthreads();      // previous super-block's MMA finished reading Bs
+        if (drow_ok) {
+            const unsigned char* blk = drow + (size_t)sb * BS;
+            qm_decode_j64<QT>(blk, dj, dinv, &Bs[dr][0]);
+        } else if (dj == 0) {
+#pragma unroll
+            for (int i = 0; i < QM_SB / 16; i++)
+                *reinterpret_cast<uint4*>(&Bs[dr][i * 16]) = make_uint4(0u, 0u, 0u, 0u);
+        }
+        __syncthreads();      // Bs ready
+
+        for (int kk = 0; kk < QM_SB; kk += QM_BK) {
+            const int knext = sb * QM_SB + kk + QM_BK;
+            if (knext < K) stageA(abuf ^ 1, knext);
+            __pipeline_wait_prior(knext < K ? 1 : 0);
+            __syncthreads();
+#pragma unroll
+            for (int k16 = 0; k16 < QM_BK; k16 += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af[2];
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf[2];
+#pragma unroll
+                for (int i = 0; i < 2; i++)
+                    wmma::load_matrix_sync(af[i], &As[abuf][wm * 32 + i * 16][k16], QM_BK);
+#pragma unroll
+                for (int j = 0; j < 2; j++)
+                    wmma::load_matrix_sync(bf[j], &Bs[wn * 32 + j * 16][kk + k16], QM_LD);
+#pragma unroll
+                for (int i = 0; i < 2; i++)
+#pragma unroll
+                    for (int j = 0; j < 2; j++) wmma::mma_sync(cf[i][j], af[i], bf[j], cf[i][j]);
+            }
+            __syncthreads();
+            abuf ^= 1;
+        }
+    }
+
+    // Epilogue staging reuses Bs (the K loop is done with it).
+    __syncthreads();
+    int* Cs = reinterpret_cast<int*>(&Bs[0][0]);
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int rm0 = wm * 32 + i * 16, gn0 = n0 + wn * 32 + j * 16;
+            wmma::store_matrix_sync(&Cs[warp * 256], cf[i][j], 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int el = lane; el < 256; el += 32) {
+                const int r = el >> 4, cc = el & 15;
+                const int rm = rm0 + r, rn = gn0 + cc;
+                if (rm < M && rn < N) {
+                    const int p = p0 + rm;
+                    const float v = (float)Cs[warp * 256 + el] * sx[p] * row_scale[rn];
+                    C[(size_t)p * N + rn] = __float2bfloat16(v);
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
 } // namespace
 
 bool pfm_moe_gemm_qi8_supported(int ggml_type) {
@@ -493,6 +618,24 @@ bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float
     else
         dispatch_qi8<QMQ_Q5_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
                                d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+    return true;
+}
+
+// Dense fused-decode int8 GEMM (single weight, no routing). See pf_dense_gemm_qi8_kernel.
+bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const float* sx,
+                                   const void* W_q, const float* row_scale, void* C_bf16,
+                                   int M, int N, int K, cudaStream_t stream) {
+    if (!pfm_moe_gemm_qi8_supported(ggml_type)) return false;   // Q4_K / Q5_K only
+    if (!row_scale || M <= 0) return false;
+    if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;         // whole super-blocks only
+    if (N <= 0 || (N % QM_BN) != 0) return false;               // 64-aligned output width
+    auto* C = reinterpret_cast<__nv_bfloat16*>(C_bf16);
+    const auto* W = reinterpret_cast<const unsigned char*>(W_q);
+    dim3 grid((N + QM_BN - 1) / QM_BN, (M + QM_BM - 1) / QM_BM);
+    if (ggml_type == QMQ_Q4_K)
+        pf_dense_gemm_qi8_kernel<QMQ_Q4_K><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K);
+    else
+        pf_dense_gemm_qi8_kernel<QMQ_Q5_K><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K);
     return true;
 }
 

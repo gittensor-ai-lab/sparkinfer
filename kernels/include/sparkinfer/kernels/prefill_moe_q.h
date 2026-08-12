@@ -36,5 +36,15 @@ bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float
 // True when launch_pfm_moe_gemm_qi8 has a decode for this ggml_type.
 bool pfm_moe_gemm_qi8_supported(int ggml_type);
 
+// Dense (non-routed) fused-decode int8 GEMM: C[M,N] = A_i8[M,K] @ dequant(W_q[N,K])^T, reading the
+// weight in native Q4_K/Q5_K and decoding it to int8 inside the B-stage using a per-output-row
+// scale precomputed at load (row_scale[n] = amax/127, == launch_gguf_dequant_rows_i8's scale). Skips
+// the int8 materialize (dequant -> W_i8 -> reload) that launch_prefill_gemm_i8 pays. Returns false
+// (launching nothing) for an unsupported ggml_type, null row_scale, K not a super-block multiple, or
+// N not 64-aligned -- callers fall back to the materialize path. Used by Muse Glimmer dense prefill.
+bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const float* sx,
+                                   const void* W_q, const float* row_scale, void* C_bf16,
+                                   int M, int N, int K, cudaStream_t stream = nullptr);
+
 } // namespace kernels
 } // namespace sparkinfer

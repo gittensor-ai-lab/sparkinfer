@@ -190,6 +190,9 @@ struct Qwen35Model::Impl {
     // EAGERLY here at load, never lazily -- the scored sweep times each context exactly once
     // (512 first), so a lazy fill would land inside the very pass it is meant to speed up.
     float *moe_rs_gate = nullptr, *moe_rs_up = nullptr, *moe_rs_down = nullptr;
+    // Muse Glimmer dense prefill: one pool of per-output-row int8 scales for the native Q4_K/Q5_K
+    // attn + FFN gate/up weights (Qwen35LayerWeights::*_rs point into it). See load().
+    float *muse_rs = nullptr;
     // flash-decoding (KV-split) attention partials
     static constexpr int MAX_NSPLITS = 256;   // partials sized for this; adaptive n_splits <= this
     int n_splits = 32;
@@ -474,6 +477,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->sx_h); cudaFree(p_->sx_q8);
     cudaFree(p_->mf_ids); cudaFree(p_->mf_counts); cudaFree(p_->mf_rc);
     cudaFree(p_->moe_rs_gate); cudaFree(p_->moe_rs_up); cudaFree(p_->moe_rs_down);
+    cudaFree(p_->muse_rs);
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->sparse_sel);
     cudaFree(p_->sparse_vtbl); cudaFree(p_->sparse_vlen);
@@ -3507,6 +3511,74 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             } else {
                 fprintf(stderr, "[prefill-moe] expert int8 row scales ready (%.0f MB)\n",
                         (double)((2 * ng + nd) * sizeof(float)) / (1024.0 * 1024.0));
+            }
+        }
+    }
+    // ---- Muse Glimmer: eager per-row int8 scales for the fused quantized-B dense prefill GEMM ----
+    // Muse's dense attn (wq/wgate/wk/wv/wo) and FFN gate/up ship as Q4_K. The batched prefill can
+    // decode them to int8 inside the GEMM's B-stage (prefill_moe_q.cu's dense path) rather than
+    // materializing the whole int8 weight per layer (dequant -> write W_i8 -> read W_i8 back). That
+    // needs the per-output-row int8 scale -- amax over the FULL row -- which is computed here with
+    // the SAME kernel the materialize path uses (launch_gguf_dequant_rows_i8, keeping only its
+    // `scale`), so the fused GEMM's int8 bytes match the materialize path's by construction, not by
+    // re-deriving the scale. Q6_K down (and any non-Q4/Q5 attn weight) is left null -> stays on the
+    // materialize path. ~11 MB for Muse-30B. SPARKINFER_MUSE_PREFILL_QB=0 skips the precompute.
+    if (c.muse_glimmer) {
+        const char* qb_env = getenv("SPARKINFER_MUSE_PREFILL_QB");
+        if (!qb_env || qb_env[0] != '0') {
+            auto fusable = [](int t) { return t == 12 || t == 13; };   // Q4_K / Q5_K
+            const int qd = c.n_q_heads * c.head_dim;                   // qdim (4096)
+            const int kd = c.n_kv_heads * c.head_dim;                  // kvdim (256)
+            const int ff = c.moe_ffn;                                  // dense FFN width (19968)
+            const size_t per_layer = (size_t)(2 * qd + 2 * kd + H + 2 * ff);  // rows/layer, all fusable
+            const size_t total = per_layer * (size_t)c.n_layers;
+            const size_t tmp_bytes = 64u << 20;                        // int8 scratch, thrown away
+            signed char* tmp = nullptr;
+            bool ok = cudaMalloc(&s.muse_rs, total * sizeof(float)) == cudaSuccess;
+            ok = ok && cudaMalloc(&tmp, tmp_bytes) == cudaSuccess;
+            auto fill = [&](int qtype, const void* src, float* dst, size_t rows, int cols) -> bool {
+                const int blk = (qtype == 12) ? 144 : (qtype == 13) ? 176 : 210;
+                const size_t rb = (size_t)(cols >> 8) * (size_t)blk;   // bytes per quantized row
+                const size_t chunk = tmp_bytes / (size_t)cols;        // rows/chunk fitting tmp
+                for (size_t r0 = 0; r0 < rows; r0 += chunk) {
+                    const size_t nr = (rows - r0 < chunk) ? (rows - r0) : chunk;
+                    if (!kernels::launch_gguf_dequant_rows_i8(
+                            qtype, (const char*)src + r0 * rb, tmp, dst + r0, (int)nr, cols, s.stream))
+                        return false;
+                }
+                return true;
+            };
+            for (int i = 0; ok && i < c.n_layers; i++) {
+                Qwen35LayerWeights& lw = s.w.layers[i];
+                float* base = s.muse_rs + (size_t)i * per_layer;
+                size_t off = 0;
+                // Compute a weight's row scales into the pool and publish its *_rs pointer; the pool
+                // slot is reserved for every weight (fixed layout) but filled only when fusable.
+                auto place = [&](const void* W, int wt, const float** rs, int rows, int cols) {
+                    float* dst = base + off; off += (size_t)rows;
+                    if (ok && W && fusable(wt) && fill(wt, W, dst, (size_t)rows, cols)) *rs = dst;
+                };
+                place(lw.wq,     lw.wq_type,     &lw.wq_rs,    qd, H);
+                place(lw.wgate,  lw.wgate_type,  &lw.wgate_rs, qd, H);
+                place(lw.wk,     lw.wk_type,     &lw.wk_rs,    kd, H);
+                place(lw.wv,     lw.wv_type,     &lw.wv_rs,    kd, H);
+                place(lw.wo,     lw.wo_type,     &lw.wo_rs,    H,  qd);
+                place(lw.gate_q, lw.gate_qtype,  &lw.gate_rs,  ff, H);
+                place(lw.up_q,   lw.up_qtype,    &lw.up_rs,    ff, H);
+            }
+            if (ok) ok = cudaStreamSynchronize(s.stream) == cudaSuccess;
+            if (tmp) cudaFree(tmp);
+            if (!ok) {
+                cudaFree(s.muse_rs); s.muse_rs = nullptr;
+                for (int i = 0; i < c.n_layers; i++) {
+                    Qwen35LayerWeights& lw = s.w.layers[i];
+                    lw.wq_rs = lw.wgate_rs = lw.wk_rs = lw.wv_rs = lw.wo_rs = lw.gate_rs = lw.up_rs = nullptr;
+                }
+                fprintf(stderr, "[prefill-muse] dense row-scale precompute unavailable "
+                                "-> int8 materialize path\n");
+            } else {
+                fprintf(stderr, "[prefill-muse] dense int8 row scales ready (%.0f MB)\n",
+                        (double)(total * sizeof(float)) / (1024.0 * 1024.0));
             }
         }
     }
