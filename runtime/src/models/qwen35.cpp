@@ -54,6 +54,16 @@ inline bool muse_fuse_tail() {
     }();
     return on;
 }
+// Fused sandwich also emits Q8_1(out_xn) into aq81 (Muse's fnq side channel). Off when the
+// fuse itself is off, or when SPARKINFER_MUSE_TAIL_Q8=0 (A/B vs a fresh standalone quantize).
+inline bool muse_tail_q8() {
+    static const bool on = [] {
+        if (!muse_fuse_tail()) return false;
+        const char* e = getenv("SPARKINFER_MUSE_TAIL_Q8");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 using bf16 = unsigned short;
 
 // forward_token() sentinel: the decode graph was enqueued but not yet collected. Never a valid
@@ -809,15 +819,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         dbg_bf16(s.xn, H, 10, L);   // tag 10: pre-attn-norm output (this layer's normed input)
         dbg_xn_snapshot(s.xn, L);
         // xn_q8_ready assumes the PREVIOUS layer's tail already emitted Q8_1(this layer's xn)
-        // into s.aq81 as a side effect (true for architectures whose post-MoE tail runs
-        // launch_add_rmsnorm2_q8 / add_rmsnorm3_q8). Muse Glimmer's tail is the sandwich-norm
-        // pair launch_norm_then_add + a plain launch_rmsnorm (see the c.muse_glimmer branch
-        // below) -- neither emits a Q8 side channel. Trusting xn_q8_ready==true here for L>0
-        // left s.aq81 permanently stuck holding layer 0's Q8_1(xn): every K/V projection at
-        // L=1..n_layers-1 (both wk_type=12 Q4_K and wv_type=14 Q6_K route through proj_xn's
-        // mmvq_q4k/mmvq_q6k branches, which read s.aq81 unconditionally) ran against the wrong
-        // layer's quantized activation. Force a fresh quantize every layer for muse_glimmer.
-        bool xn_q8_ready = fnq && L > 0 && !c.muse_glimmer;
+        // into s.aq81 as a side effect. Muse Glimmer's sandwich tail does that via
+        // launch_muse_sandwich_tail_q8 when muse_tail_q8() is on; otherwise force a fresh
+        // quantize (the old muse_glimmer exclusion).
+        bool xn_q8_ready = fnq && L > 0 && (!c.muse_glimmer || muse_tail_q8());
         auto prepare_xn_quant = [&](bool any_q4k, bool any_q6k, bool any_q80) {
             if (!s.gguf || !s.use_pq) return;
             if (xn_q8_ready) return;
@@ -1225,10 +1230,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // c.rms_eps here silently gives wrong post-attn/post-ffn norms.
             // Both halves of the sandwich tail are single-CTA kernels over 6656 elements, so each
             // costs ~3.2 us of launch/reduction latency for 13 KB of traffic. Fuse them.
-            if (muse_fuse_tail())
-                kernels::launch_muse_sandwich_tail(s.x, s.ao, w.post_attn_norm, w.ffn_norm,
-                                                   s.h, s.hn, 1, H, 1e-8f, c.rms_eps, st);
-            else {
+            // When fnq, also emit Q8_1(hn) into aq81 so the dense FFN gate/up MMVQ skips its
+            // standalone quantize — the Muse equivalent of launch_add_rmsnorm2_q8.
+            if (muse_fuse_tail()) {
+                if (fnq)
+                    kernels::launch_muse_sandwich_tail_q8(s.x, s.ao, w.post_attn_norm, w.ffn_norm,
+                                                          s.h, s.hn, s.aq81, 1, H, 1e-8f, c.rms_eps, st);
+                else
+                    kernels::launch_muse_sandwich_tail(s.x, s.ao, w.post_attn_norm, w.ffn_norm,
+                                                      s.h, s.hn, 1, H, 1e-8f, c.rms_eps, st);
+            } else {
             kernels::launch_norm_then_add(s.x, s.ao, w.post_attn_norm, s.h, 1, H, 1e-8f, st);
             dbg_bf16(s.h, H, 50, L);   // tag 50: h = x + sandwich_norm(ao)  (post-attn residual)
             kernels::launch_rmsnorm(s.h, w.ffn_norm, s.hn, 1, H, c.rms_eps, st);
@@ -1318,22 +1329,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // expert-FFN path as MoE decode — bf16 dequant+GEMV diverged ~40pp vs llama.cpp.
             //
             // input_q8 must be a valid Q8_1 quantization of s.hn (the FFN's actual input) or
-            // null (letting the kernel quantize s.hn itself). `fnq` only guarantees that for
-            // architectures whose post-attention step runs launch_add_rmsnorm2_q8, which emits
-            // Q8_1(hn) as a side effect of computing hn. Muse Glimmer's sandwich norm does not:
-            // its post-attn step is launch_norm_then_add (writes s.h, no Q8 emission) followed
-            // by a plain launch_rmsnorm into s.hn (see the c.muse_glimmer branch above) -- s.aq81
-            // at this point still holds Q8_1(xn) from this same layer's QKV-input quantize
-            // (prepare_xn_quant, earlier in this iteration), not Q8_1(hn). Passing that stale
-            // buffer here fed the gate/up MMVQ kernel the wrong activation vector entirely:
-            // garbage FFN output that still looked like a confident (but wrong) distribution
-            // downstream, rather than crashing or NaN-ing. Force nullptr for muse_glimmer so
-            // launch_moe_expert_ffn_q4k quantizes s.hn fresh instead of trusting the stale cache.
+            // null (letting the kernel quantize s.hn itself). With muse_tail_q8(), the post-attn
+            // sandwich emits Q8_1(hn) into aq81 via launch_muse_sandwich_tail_q8.
             kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
                                                1, c.top_k, H, c.moe_ffn,
-                                               (fnq && !c.muse_glimmer) ? s.aq81 : nullptr, st);
+                                               (fnq && (!c.muse_glimmer || muse_tail_q8())) ? s.aq81 : nullptr, st);
         } else if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
             // The per-expert token counts only feed the batched-dispatch sort; the single-token
             // decode expert FFN reads ids/weights directly and never touches them. Zeroing that
@@ -1464,10 +1466,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // always null here. xn = RMSNorm(x, nextnorm) is the next layer's ordinary
             // pre-attn norm (or final_norm on the last layer), unaffected by the sandwich.
             // Same 1e-8 post_norm_eps as the post-attn sandwich norm above -- see that comment.
-            if (muse_fuse_tail())
-                kernels::launch_muse_sandwich_tail(s.h, s.routed, w.post_ffn_norm, nextnorm,
-                                                   s.x, s.xn, 1, H, 1e-8f, c.rms_eps, st);
-            else {
+            // When fnq, emit Q8_1(xn) into aq81 for the next layer's QKV / final LM head.
+            if (muse_fuse_tail()) {
+                if (fnq)
+                    kernels::launch_muse_sandwich_tail_q8(s.h, s.routed, w.post_ffn_norm, nextnorm,
+                                                          s.x, s.xn, s.aq81, 1, H, 1e-8f, c.rms_eps, st);
+                else
+                    kernels::launch_muse_sandwich_tail(s.h, s.routed, w.post_ffn_norm, nextnorm,
+                                                      s.x, s.xn, 1, H, 1e-8f, c.rms_eps, st);
+            } else {
             kernels::launch_norm_then_add(s.h, s.routed, w.post_ffn_norm, s.x, 1, H, 1e-8f, st);
             dbg_bf16(s.x, H, 70, L);   // tag 70: x = h + sandwich_norm(routed)  (layer output)
             kernels::launch_rmsnorm(s.x, nextnorm, s.xn, 1, H, c.rms_eps, st);
@@ -1497,22 +1504,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         cu(cudaStreamSynchronize(st), "prefill sync");
         return token_id;
     }
-    // Third instance of the same stale-Q8_1-cache pattern as prepare_xn_quant's xn_q8_ready
-    // (L>0) and the dense_ffn gate/up input above: `fnq` only promises aq81==Q8_1(xn) here
-    // because the fnq path's final-layer tail is launch_add_rmsnorm2_q8/add_rmsnorm3_q8,
-    // which writes xn AND emits Q8_1(xn) into aq81 as a side effect. Muse Glimmer's final-
-    // layer tail is the c.muse_glimmer sandwich-norm branch above (launch_norm_then_add then
-    // a plain launch_rmsnorm into s.xn) -- no Q8 side channel. `fnq` itself doesn't check
-    // c.muse_glimmer (it's just s.gguf/use_fnq/use_pq/use_llama), so with fnq true this
-    // silently fed the LM head a stale aq81 left over from the last layer's fresh
-    // prepare_xn_quant(xn) quantize (a *different*, pre-final-norm activation vector) --
-    // wrong logits on every single decode step. Force a fresh quantize for muse_glimmer.
+    // Final LM-head quantize: with muse_tail_q8() the last layer's post-ffn sandwich emits
+    // Q8_1(xn) into aq81 (launch_muse_sandwich_tail_q8), same as add_rmsnorm2_q8 on other models.
     if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
-        if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
+        if (!fnq || (c.muse_glimmer && !muse_tail_q8()))
+            kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
         kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
     }
     else if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
-        if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
+        if (!fnq || (c.muse_glimmer && !muse_tail_q8()))
+            kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
         kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
     }
     else if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);

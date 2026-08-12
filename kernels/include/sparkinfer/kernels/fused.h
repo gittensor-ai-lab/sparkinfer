@@ -47,6 +47,14 @@ void launch_muse_sandwich_tail(const void* residual_bf16, const void* branch_bf1
                                void* out_x_bf16, void* out_xn_bf16,
                                int rows, int cols, float post_eps, float eps,
                                cudaStream_t stream = nullptr);
+// Same sandwich tail, also emitting Q8_1(out_xn) into out_q8 (si_block_q8_1 layout) from the
+// bf16-rounded out_xn — the Muse equivalent of launch_add_rmsnorm2_q8. out_q8 may be null to
+// keep the bf16-only path. SPARKINFER_MUSE_TAIL_Q8=0 disables the emit even when out_q8 is set.
+void launch_muse_sandwich_tail_q8(const void* residual_bf16, const void* branch_bf16,
+                                  const void* post_w_bf16, const void* next_w_bf16,
+                                  void* out_x_bf16, void* out_xn_bf16, void* out_q8,
+                                  int rows, int cols, float post_eps, float eps,
+                                  cudaStream_t stream = nullptr);
 
 // Fold residual_add(res1,res2) into add_rmsnorm2: out_sum = x + (res1 + res2).
 void launch_add_rmsnorm3(const void* x_bf16, const void* res1_bf16, const void* res2_bf16,

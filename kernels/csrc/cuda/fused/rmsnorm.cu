@@ -430,12 +430,18 @@ __global__ void norm_then_add_kernel(const __nv_bfloat16* __restrict__ residual,
 // the other kernel's exact loop order and warp-reduction tree, and stage 2 re-reads the bf16-
 // rounded out_x back from global rather than reusing the float registers, which is precisely what
 // the separate launch_rmsnorm would have seen.
+//
+// Optional out_q8: also emit Q8_1(out_xn) from the bf16-rounded out_xn, same contract as
+// add_rmsnorm2_q8_kernel, so the next MMVQ (FFN gate/up, next-layer QKV, or LM head) skips its
+// standalone quantize. Requires one pack per thread (blockDim == cols/8); the launcher enforces
+// that when out_q8 is set.
 __global__ void muse_sandwich_tail_kernel(const __nv_bfloat16* __restrict__ residual,
                                           const __nv_bfloat16* __restrict__ branch,
                                           const __nv_bfloat16* __restrict__ post_w,
                                           const __nv_bfloat16* __restrict__ next_w,
                                           __nv_bfloat16* __restrict__ out_x,
                                           __nv_bfloat16* __restrict__ out_xn,
+                                          si_blk_q8_1* __restrict__ out_q8,
                                           int cols, float post_eps, float eps) {
     const size_t base = (size_t)blockIdx.x * cols;
     __shared__ float s_warp[32];
@@ -523,6 +529,32 @@ __global__ void muse_sandwich_tail_kernel(const __nv_bfloat16* __restrict__ resi
             float v = __bfloat162float(out_x[base + c]);
             out_xn[base + c] = __float2bfloat16(v * inv2 * __bfloat162float(next_w[c]));
         }
+    }
+
+    // ---- optional Q8_1(out_xn) from the bf16-rounded write above ----
+    // Same layout as add_rmsnorm2_q8_kernel: one pack per thread, 4 consecutive threads per
+    // 32-element Q8_1 block. out_xn bf16 values are re-read so the quant is bit-identical to a
+    // standalone launch_quantize_q8_1_blocks on out_xn.
+    if (out_q8 && threadIdx.x < npack) {
+        out_q8 += (size_t)blockIdx.x * (cols >> 5);
+        const int t = threadIdx.x;
+        const uint4* on4 = reinterpret_cast<const uint4*>(out_xn + base);
+        float bv[8]; rn_unpack8(__ldg(on4 + t), bv);
+        float amax = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(bv[j]));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        const float d = amax / 127.0f;
+        const int b = t >> 2, r = t & 3;
+        int s = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int qi = (amax == 0.0f) ? 0 : (int)roundf(bv[j] / d);
+            out_q8[b].qs[r * 8 + j] = (signed char)qi; s += qi;
+        }
+        s += __shfl_xor_sync(0xffffffffu, s, 1); s += __shfl_xor_sync(0xffffffffu, s, 2);
+        if (r == 0) out_q8[b].ds = __floats2half2_rn(d, d * (float)s);
     }
 }
 
@@ -648,6 +680,14 @@ void launch_add_rmsnorm3_q8_rows(const void* x, const void* res1, const void* re
 void launch_muse_sandwich_tail(const void* residual, const void* branch, const void* post_w,
                                const void* next_w, void* out_x, void* out_xn,
                                int rows, int cols, float post_eps, float eps, cudaStream_t stream) {
+    launch_muse_sandwich_tail_q8(residual, branch, post_w, next_w, out_x, out_xn, nullptr,
+                                 rows, cols, post_eps, eps, stream);
+}
+
+void launch_muse_sandwich_tail_q8(const void* residual, const void* branch, const void* post_w,
+                                  const void* next_w, void* out_x, void* out_xn, void* out_q8,
+                                  int rows, int cols, float post_eps, float eps,
+                                  cudaStream_t stream) {
     // 256 threads for a 6656-wide row means npack = 832 packs walked 3-4 deep per thread, twice,
     // on a chain of dependent loads -- and the whole thing is one CTA of a 170-SM device. One
     // thread per pack collapses that chain; 1024 is the first width that covers all 832 in a
@@ -660,19 +700,38 @@ void launch_muse_sandwich_tail(const void* residual, const void* branch, const v
     // 2.12623 -> 2.11524 and agreement with the true next token 176/191 -> 175/191, while
     // agreement against the 256-wide arm is 189/191 with mean |dlogprob| 1.1e-2.
     // SPARKINFER_MUSE_TAIL_W overrides the width (256/512/768/1024) for A/B.
+    //
+    // When emitting Q8_1(out_xn), force one pack per thread (cols/8): the Q8 layout mirrors
+    // add_rmsnorm2_q8 (4 consecutive threads per 32-element block). For Muse H=6656 that is
+    // 832 threads — still covers every pack in one pass. SPARKINFER_MUSE_TAIL_Q8=0 disables
+    // the emit even if out_q8 is passed (falls back to bf16-only and the caller's fresh quantize).
     static int tail_w = -1;
     if (tail_w < 0) {
         const char* e = getenv("SPARKINFER_MUSE_TAIL_W");
         tail_w = e ? atoi(e) : 1024;
         if (tail_w != 256 && tail_w != 512 && tail_w != 768 && tail_w != 1024) tail_w = 1024;
     }
-    muse_sandwich_tail_kernel<<<rows, tail_w, 0, stream>>>(
+    static int tail_q8 = -1;
+    if (tail_q8 < 0) {
+        const char* e = getenv("SPARKINFER_MUSE_TAIL_Q8");
+        tail_q8 = (e && e[0] == '0') ? 0 : 1;
+    }
+    si_blk_q8_1* q8 = (out_q8 && tail_q8) ? reinterpret_cast<si_blk_q8_1*>(out_q8) : nullptr;
+    int threads = tail_w;
+    if (q8) {
+        // One pack per thread for the Q8 epilogue; cols must be a multiple of 256 so each
+        // 32-element block sits inside one warp (same assert as launch_add_rmsnorm2_q8).
+        assert(cols % 256 == 0 && (cols >> 3) <= 1024);
+        threads = cols >> 3;
+    }
+    muse_sandwich_tail_kernel<<<rows, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(residual),
         reinterpret_cast<const __nv_bfloat16*>(branch),
         reinterpret_cast<const __nv_bfloat16*>(post_w),
         reinterpret_cast<const __nv_bfloat16*>(next_w),
         reinterpret_cast<__nv_bfloat16*>(out_x),
-        reinterpret_cast<__nv_bfloat16*>(out_xn), cols, post_eps, eps);
+        reinterpret_cast<__nv_bfloat16*>(out_xn),
+        q8, cols, post_eps, eps);
 }
 
 void launch_norm_then_add(const void* residual, const void* block_out, const void* weight,
