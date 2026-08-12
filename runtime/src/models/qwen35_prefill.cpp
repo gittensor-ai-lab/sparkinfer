@@ -13,6 +13,7 @@
 
 #include "qwen35_prefill.h"
 #include "sparkinfer/kernels/prefill.h"
+#include "sparkinfer/kernels/prefill_attn_window.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/gemm.h"
@@ -79,7 +80,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool moe = !c.dense_ffn && c.n_experts > 0;
     if (!s.gguf || !c.hybrid || n <= 0) return -1;
     if (!c.dense_ffn && !moe) return -1;
-    if (c.head_dim != 256 || c.linear_head_dim != 128) return -1;   // kernels specialize these
+    // Muse Glimmer: dense hd128 GQA-16, per-layer SWA(NORMAL-rope)/global(NoPE), sandwich norm.
+    // Its BF16 attention (windowed/full hd128) + bf16 KV write reuse the batched pipeline below
+    // with muse-specific kernels; the full-attn scratch aliases (qb/qg<-gv/lnrm, kf/vf<-gq/gk) must
+    // still fit, i.e. linear_vdim>=qdim and linear_qdim>=kvdim (4096>=4096, 2048>=256 for muse).
+    // Muse runs a BF16 KV cache (its decode KV write is unconditionally bf16); if the cache is
+    // int8 here the config is inconsistent -- fall back to the token loop rather than corrupt it.
+    if (c.muse_glimmer) {
+        if (c.head_dim != 128 || !c.dense_ffn) return -1;
+        if (s.linear_vdim < s.qdim || s.linear_qdim < s.kvdim) return -1;
+        if (s.kv->int8_kv()) return -1;
+    } else if (c.head_dim != 256 || c.linear_head_dim != 128) {
+        return -1;   // kernels specialize these
+    }
     if (moe && (c.n_experts != 256 || c.top_k <= 0)) return -1;     // grouped top-k path specialized for 256
     if (moe)
         for (int L = 0; L < c.n_layers; L++) {
@@ -131,6 +144,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     bf16* xn   = a.alloc<bf16>((size_t)N * H);
     bf16* hn   = a.alloc<bf16>((size_t)N * H);
     bf16* ao   = a.alloc<bf16>((size_t)N * H);
+    // Muse Glimmer sandwich norm keeps the post-attention residual stream (h = x + RMSNorm(ao)*
+    // post_attn_norm) live across the FFN so the post-FFN sandwich can add onto it; other models
+    // fold the residual in place and need no extra buffer.
+    bf16* h    = c.muse_glimmer ? a.alloc<bf16>((size_t)N * H) : nullptr;
     bf16* b8   = a.alloc<bf16>((size_t)N * wide);        // qraw / lin_qkv (8192)
     bf16* lz   = a.alloc<bf16>((size_t)N * lvdim);       // lin_z (4096)
     bf16* gq   = a.alloc<bf16>((size_t)N * s.linear_qdim);   // gdn q (2048)
@@ -537,6 +554,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
     // embed -> x, prime xn = RMSNorm(x, layer0.input_norm)
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
+    // Muse Glimmer: unweighted embedding RMSNorm on x before layer 0 (decode qwen35.cpp:724-725).
+    // emb_norm_ones is a constant-1.0 weight, so this is a pure normalization of the embedding.
+    if (c.muse_glimmer && s.emb_norm_ones)
+        kernels::launch_rmsnorm(x, (const bf16*)s.emb_norm_ones, x, N, H, eps, st);
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, eps, st);
 
     // MoE aux events: overlap path and/or tiny shared-gate hide on stream_k.
@@ -576,30 +597,76 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // Long-ctx: optionally keep Q/K/V/O on int8 (no GDN recurrence here).
             const bool restore_i8 = use_i8;
             if (use_i8_attn) use_i8 = true;
-            proj(xn, w.wq, w.wq_type, b8, wide,  H);                 // qraw = [q|gate] per head
-            proj(xn, w.wk, w.wk_type, kf, kvdim, H);
-            proj(xn, w.wv, w.wv_type, vf, kvdim, H);
-            kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
-            signed char* kpool = (signed char*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-            signed char* vpool = (signed char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-            void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
-            void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
-            if (!kv8) { a.free_all(); a8.free_all(); am.free_all(); aw.free_all(); fprintf(stderr, "[prefill] batched prefill requires int8 KV\n"); return -1; }
-            kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
-                kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                rope_dim, rope_theta, eps, bs, mbs, st);
-            kernels::launch_prefill_attn_int8_paged(qb, kpool, vpool, kscale, vscale, btable, att,
-                N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
+            if (c.muse_glimmer && w.wgate) {
+                // Muse Glimmer keeps attn_gate as its OWN quantized tensor (w.wgate, [qdim,H]) -- Q
+                // goes straight to qb and the gate straight to qg, with no [q|gate] interleave to build
+                // and no split to undo (matches decode's sep_gate path, qwen35.cpp:988-1007). Projecting
+                // w.wq as `wide` (2*qdim) would dequant-read qdim rows PAST the 4096-row wq tensor.
+                proj(xn, w.wq,    w.wq_type,    qb, qdim,  H);
+                proj(xn, w.wgate, w.wgate_type, qg, qdim,  H);
+                proj(xn, w.wk,    w.wk_type,    kf, kvdim, H);
+                proj(xn, w.wv,    w.wv_type,    vf, kvdim, H);
+            } else {
+                proj(xn, w.wq, w.wq_type, b8, wide,  H);             // qraw = [q|gate] per head
+                proj(xn, w.wk, w.wk_type, kf, kvdim, H);
+                proj(xn, w.wv, w.wv_type, vf, kvdim, H);
+                kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
+            }
+            if (c.muse_glimmer) {
+                // Muse Glimmer runs a BF16 KV cache (its decode KV-write is bf16, qwen35.cpp:1065/1087),
+                // not int8. QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM) RoPE on SWA layers
+                // / NoPE on global layers, bf16 append -- the same KV a forward_token decode writes via
+                // launch_rmsnorm + launch_rope_kv_append_normal / launch_kv_append. Then pure-window
+                // attention on SWA layers, full causal on global (win_blocks<=0), over the bf16 pool.
+                bf16* kpool_bf = (bf16*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems();
+                bf16* vpool_bf = (bf16*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems();
+                const int muse_rot = w.swa ? c.head_dim : 0;      // SWA = full NORMAL rope; global = NoPE
+                kernels::launch_prefill_qknorm_ropenorm_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
+                    kpool_bf, vpool_bf, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                    muse_rot, rope_theta, eps, bs, mbs, st);
+                const int win_blocks = w.swa ? (c.sliding_window + bs - 1) / bs : 0;  // 0 => global full causal
+                kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, btable, att,
+                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks, st);
+            } else {
+                signed char* kpool = (signed char*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
+                signed char* vpool = (signed char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
+                void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+                void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+                if (!kv8) { a.free_all(); a8.free_all(); am.free_all(); aw.free_all(); fprintf(stderr, "[prefill] batched prefill requires int8 KV\n"); return -1; }
+                kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
+                    kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                    rope_dim, rope_theta, eps, bs, mbs, st);
+                kernels::launch_prefill_attn_int8_paged(qb, kpool, vpool, kscale, vscale, btable, att,
+                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
+            }
             kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
-            attn_fused = proj_resid(att, w.wo, w.wo_type, x, H, qdim);
-            if (!attn_fused) proj(att, w.wo, w.wo_type, ao, H, qdim);
+            if (c.muse_glimmer) {
+                // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
+                // add happens in launch_norm_then_add below.
+                proj(att, w.wo, w.wo_type, ao, H, qdim);
+                attn_fused = false;
+            } else {
+                attn_fused = proj_resid(att, w.wo, w.wo_type, x, H, qdim);
+                if (!attn_fused) proj(att, w.wo, w.wo_type, ao, H, qdim);
+            }
             use_i8 = restore_i8;
         }
 
-        // x += ao (post-attn residual, in-place; skipped when folded into the output proj)
-        // hn = RMSNorm(x, post_attn_norm)
-        if (!attn_fused) kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
-        kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
+        if (c.muse_glimmer) {
+            // Sandwich norm (post-attn): h = x + RMSNorm(ao) * post_attn_norm -- norm the attention
+            // output ALONE, then add to the residual (decode qwen35.cpp:1112). ffn_norm is a genuine
+            // SEPARATE pre-FFN norm here, not post_attn_norm doing double duty like every other arch.
+            // Sandwich (post_attn_norm/post_ffn_norm) RMSNorm uses its OWN eps 1e-8
+            // (upstream post_norm_eps), NOT the model's rms_eps (1e-5) which drives
+            // attn_norm/ffn_norm/q_norm/k_norm -- mirrors the decode fix (qwen35.cpp:6d911d4).
+            kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
+            kernels::launch_rmsnorm(h, w.ffn_norm, hn, N, H, eps, st);
+        } else {
+            // x += ao (post-attn residual, in-place; skipped when folded into the output proj)
+            // hn = RMSNorm(x, post_attn_norm)
+            if (!attn_fused) kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
+            kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
+        }
 
         if (!moe) {
             // dense SwiGLU FFN, chunked over tokens (upstream #530): ffg/ffu/A_i8 stay O(FC*ffn).
@@ -620,7 +687,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             }
             // The down projection takes the int8 path on both branches whenever ffn_i8 or use_i8,
             // so the FFN residual can ride the residual-fused GEMM straight into x per chunk.
-            const bool ffn_fused = resid_fuse && (ffn_i8 || use_i8);
+            // Muse Glimmer must NOT residual-fuse: the post-FFN sandwich (norm_then_add below) needs
+            // the RAW FFN output in `ao`, and the residual it adds onto is `h` (not x).
+            const bool ffn_fused = !c.muse_glimmer && resid_fuse && (ffn_i8 || use_i8);
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
@@ -665,8 +734,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     }
                 }
             }
-            // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk)
-            if (!ffn_fused) kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
+            if (c.muse_glimmer) {
+                // Sandwich norm (post-FFN): x = h + RMSNorm(ao) * post_ffn_norm (decode
+                // qwen35.cpp:1329). h is the post-attn residual stream; ao holds the raw FFN output.
+                // Same 1e-8 post_norm_eps as the post-attn sandwich norm above.
+                kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
+            } else if (!ffn_fused) {
+                // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk)
+                kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
+            }
         } else {
             // ---- expert-grouped 256-expert int8 MoE FFN (this PR): route -> bucket routed
             // (token, expert) pairs by expert -> per-expert int8 tensor-core GEMMs, so each expert's
@@ -1175,6 +1251,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         kernels::launch_gemv_q_f32(xn_last, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
     else
         kernels::launch_gemv_f32(xn_last, s.w.lm_head, s.logits, c.vocab, H, st);
+    // Muse Glimmer tanh final-logit softcap before argmax (decode qwen35.cpp:1365).
+    if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
+        kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
     pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "prefill seed");
     pf_cu(cudaStreamSynchronize(st), "prefill sync");

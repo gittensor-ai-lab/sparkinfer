@@ -26,6 +26,8 @@ struct Qwen35PrefillCtx {
     int*                 d_out_id;         // device argmax slot
     int*                 h_out_id;         // pinned host argmax slot
     bool                 gguf;             // native GGUF load (quantized weights)
+    const void*          emb_norm_ones;    // Muse Glimmer: constant-1.0 bf16 weight for the
+                                           // unweighted embedding RMSNorm (nullptr for other models)
     int                  qdim, kvdim;                       // full-attn q / kv dims
     int                  linear_qdim, linear_vdim, linear_qkvdim;  // GDN dims
     // Per-row int8 scales of the routed expert weights, [layer][expert * rows], precomputed at

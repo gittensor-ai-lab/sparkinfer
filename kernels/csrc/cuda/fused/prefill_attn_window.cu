@@ -437,6 +437,96 @@ __global__ void win_prefill_lanepar_kernel(
     }
 }
 
+// ----------------------------------------------------------------------------
+// BF16-KV pure sliding-window prefill attention for Muse Glimmer: reads a BF16 K/V pool
+// directly (Muse Glimmer runs a bf16 KV cache, not int8) -- no per-token dequant scale. win_blocks>0 =>
+// last win_blocks blocks (SWA layers); win_blocks<=0 => full causal (global/NoPE
+// layers), so this ONE kernel serves both Muse Glimmer attention types. Per-query
+// window/causal predicate is warp-uniform, so the masked-key `continue` never
+// splits a warp before the 32-lane reduction.
+// ----------------------------------------------------------------------------
+template <int HEAD_DIM, int TQ, int TK>
+__global__ void win_prefill_pure_bf16_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
+    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks) {
+    constexpr int ELEMS = HEAD_DIM / 32;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int head = blockIdx.y;
+    const int qbase = blockIdx.x * TQ;
+    const int qtok = qbase + warp;
+    const int kv_head = head / (n_q_heads / n_kv_heads);
+    const bool active = (qtok < n_tokens) && (head < n_q_heads);
+
+    auto win_start = [&](int t) -> int {
+        if (win_blocks <= 0) return 0;
+        const int n_blk_q = (t + block_size) / block_size;
+        const int rsb = (win_blocks >= n_blk_q) ? 0 : (n_blk_q - win_blocks);
+        return rsb * block_size;
+    };
+    const int my_rs = active ? win_start(qtok) : 0;
+
+    extern __shared__ __nv_bfloat16 smem_bf[];
+    __nv_bfloat16* sK = smem_bf;
+    __nv_bfloat16* sV = smem_bf + TK * HEAD_DIM;
+
+    float q_reg[ELEMS];
+    if (active) {
+        const size_t q_off = ((size_t)qtok * n_q_heads + head) * HEAD_DIM;
+#pragma unroll
+        for (int e = 0; e < ELEMS; e++) q_reg[e] = win_to_f(q[q_off + lane + e * 32]);
+    }
+    float m = -1e30f, l = 0.f, acc[ELEMS];
+#pragma unroll
+    for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
+
+    const int last_q = min(qbase + TQ - 1, n_tokens - 1);
+    const int blk_rs = win_start(qbase);
+
+    for (int k0 = blk_rs; k0 <= last_q; k0 += TK) {
+        const int tk = min(TK, last_q + 1 - k0);
+        for (int idx = threadIdx.x; idx < tk * HEAD_DIM; idx += blockDim.x) {
+            const int kk = idx / HEAD_DIM, d = idx - kk * HEAD_DIM;
+            const int kpos = k0 + kk;
+            const int blk = kpos / block_size, within = kpos - blk * block_size;
+            const int phys = block_table[blk];
+            const size_t ckt = (size_t)phys * block_size + within;
+            const size_t off = (ckt * n_kv_heads + kv_head) * HEAD_DIM + d;
+            sK[idx] = k_pool[off];
+            sV[idx] = v_pool[off];
+        }
+        __syncthreads();
+        if (active) {
+            for (int kpos = k0; kpos < k0 + tk; kpos++) {
+                if (kpos < my_rs || kpos > qtok) continue;
+                const int kk = kpos - k0;
+                const __nv_bfloat16* krow = sK + (size_t)kk * HEAD_DIM;
+                float partial = 0.f;
+#pragma unroll
+                for (int e = 0; e < ELEMS; e++) partial += q_reg[e] * win_to_f(krow[lane + e * 32]);
+                const float score = win_warp_sum(partial) * scale;
+                const float m_new = fmaxf(m, score);
+                const float corr = __expf(m - m_new);
+                const float p = __expf(score - m_new);
+                l = l * corr + p;
+                const __nv_bfloat16* vrow = sV + (size_t)kk * HEAD_DIM;
+#pragma unroll
+                for (int e = 0; e < ELEMS; e++) acc[e] = acc[e] * corr + p * win_to_f(vrow[lane + e * 32]);
+                m = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        const size_t q_off = ((size_t)qtok * n_q_heads + head) * HEAD_DIM;
+        const float inv = (l > 0.f) ? (1.f / l) : 0.f;
+#pragma unroll
+        for (int e = 0; e < ELEMS; e++) attn[q_off + lane + e * 32] = __float2bfloat16(acc[e] * inv);
+    }
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------------------
@@ -567,6 +657,25 @@ bool launch_prefill_attn_windowed(
     }
 
     return false;   // window + tiling both off -> caller runs full attention
+}
+
+// BF16-KV pure-window prefill attention for Muse Glimmer (hd128). win_blocks>0 =>
+// SWA layers (last win_blocks blocks); win_blocks<=0 => global/NoPE full causal.
+void launch_prefill_attn_swa_pure_bf16(
+    const void* q, const void* k_pool, const void* v_pool,
+    const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks,
+    cudaStream_t stream) {
+    (void)head_dim;   // Muse Glimmer attention is hd128 only; templated below.
+    constexpr int TQ = 16, TK = 32, HD = 128;
+    const size_t sm = (size_t)2 * TK * HD * sizeof(__nv_bfloat16);   // 16 KB: K + V bf16 tiles
+    dim3 grid((n_tokens + TQ - 1) / TQ, n_q_heads);
+    win_prefill_pure_bf16_kernel<HD, TQ, TK><<<grid, TQ * 32, sm, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
+        reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
+        reinterpret_cast<__nv_bfloat16*>(attn),
+        n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks);
 }
 
 }  // namespace kernels

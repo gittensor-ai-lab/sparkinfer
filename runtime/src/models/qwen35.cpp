@@ -1603,15 +1603,17 @@ bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
     // MoE requirements (256 experts, quantized experts + router) itself and returns -1 to
     // fall back if unsupported.
     const bool ffn_ok = cfg.dense_ffn || cfg.n_experts > 0;
-    // Muse Glimmer: prefill_batched_run's full-attention branch (launch_prefill_qknorm_rope_
-    // kv_int8, launch_prefill_attn_int8_paged) always applies RoPE over the whole sequence
-    // with no windowing hook -- correct for Qwen3.6/Qwythos (every full-attn layer there is
-    // genuinely global), wrong for Muse Glimmer's per-layer sliding-window/NoPE pattern.
-    // Route through the token-loop prefill instead, which calls forward_token() per position
-    // and so reuses the same per-layer swa/NoPE dispatch already wired into decode. Slower
-    // (sequential, not batched GEMM) but correct; a windowed batched-prefill kernel is a
-    // valid follow-up once plain generation is validated, not a blocker for it.
-    if (cfg.muse_glimmer) return false;
+    // Muse Glimmer: windowed batched prefill IS implemented in prefill_batched_run -- per-layer
+    // NoPE (rotary_dim=0) on the global layers, pure rolling-window attention (launch_prefill_attn_
+    // swa_pure_bf16) on the SWA layers, bf16 KV write, and sandwich/embedding norm + logit softcap
+    // parity with the decode path. Gated OFF by default until GPU accuracy validation
+    // (top1>=0.90 & KL<=0.20 vs llama.cpp); SPARKINFER_MUSE_BATCHED=1 opts in. Until then muse
+    // routes through the token loop (correct, just sequential). Flip the default to on once the box
+    // validates the accuracy gate + pp win.
+    if (cfg.muse_glimmer) {
+        static const int muse_batched = []{ const char* e = getenv("SPARKINFER_MUSE_BATCHED"); return (e && e[0] == '1') ? 1 : 0; }();
+        if (!muse_batched) return false;
+    }
     return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
            n_tokens <= batched_maxctx;
 }
@@ -2008,6 +2010,7 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
                           lin_state, lin_conv,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits };
     return prefill_batched_run(ctx, prompt_ids, n);
@@ -2259,6 +2262,7 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
     bf16* lin_conv = (it != s.sessions.end()) ? it->second.lin_conv_state : s.lin_conv_state;
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
                           lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits };
     // The recorded token ids and positions are irrelevant: the graph copies them from pinned host
@@ -2277,6 +2281,7 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
     bf16* lin_conv = (it != s.sessions.end()) ? it->second.lin_conv_state : s.lin_conv_state;
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
                           lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits };
     const int consumed = dflash_verify_short_run(ctx, token_ids, n, start_pos,

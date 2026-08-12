@@ -30,5 +30,18 @@ bool launch_prefill_attn_windowed(
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr);
 
+// PURE rolling-window (NO attention sink) prefill attention for Muse Glimmer's bf16 KV cache.
+// Each query attends to the last `win_blocks` KV blocks only (block 0 dropped once out of window),
+// matching the decode-side fa_kv_compact_view_pure selection. head_dim is fixed at 128 (Muse
+// Glimmer's only attention width). Always launches (the SWA layers have no full-attention fallback).
+// win_blocks>0 => SWA (last win_blocks blocks); win_blocks<=0 => global/NoPE full causal.
+// Same online-softmax; reads a bf16 K/V pool directly (no int8 dequant/scale).
+void launch_prefill_attn_swa_pure_bf16(
+    const void* q, const void* k_pool, const void* v_pool,
+    const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks,
+    cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace sparkinfer
