@@ -396,14 +396,32 @@ class BridgeServer:
                     proto.encode_store_ack(False, "store range not chunk-aligned")))
                 return
 
-            mask = torch.zeros(len(req.token_ids), dtype=torch.bool)
-            mask[req.new_start_tok : req.new_end_tok] = True
-            tokens = torch.tensor(req.token_ids, dtype=torch.int64)
+            # LMCache's mask contract (confirmed against the real store() docstring during the
+            # Stage 1 spike) is "FFFF...TTTT": Falses are an already-cached PREFIX to skip, Trues
+            # a SUFFIX extending to the end of `tokens` to store -- and it requires the False
+            # count to be a chunk_size multiple. That shape doesn't fit what sparkinfer actually
+            # sends: new_end_tok is often less than len(token_ids) (a trailing partial chunk
+            # beyond the chunk-aligned range genuinely isn't being stored at all, not "already
+            # cached elsewhere"), which isn't a prefix-skip/suffix-store split LMCache's mask can
+            # express. Found via the live E2E test (runtime/tests/lmcache_e2e_gpu_test.cpp):
+            # engine.store() raised "number of Falses ... not a multiple of the chunk size."
+            #
+            # Every current caller (Qwen35Model::lmcache_maybe_store in qwen35.cpp) always stores
+            # from position 0, so the fix for now is simpler than a general mask: truncate to the
+            # aligned range and pass no mask at all (mask=None means "store all of `tokens`", per
+            # store()'s own docstring). This assumes new_start_tok == 0; a future caller wanting a
+            # nonzero start would need real mask support, not implemented here.
+            if req.new_start_tok != 0:
+                conn.send(proto.encode_frame(
+                    proto.STORE_ACK, frame.request_id,
+                    proto.encode_store_ack(False, "nonzero new_start_tok not yet supported")))
+                return
+            tokens = torch.tensor(req.token_ids[: req.new_end_tok], dtype=torch.int64)
 
             with handle.lock:
                 handle.connector.begin_request(mm, base_tok=req.new_start_tok)
                 try:
-                    handle.engine.store(tokens=tokens, mask=mask)
+                    handle.engine.store(tokens=tokens)
                 finally:
                     handle.connector.end_request()
 
