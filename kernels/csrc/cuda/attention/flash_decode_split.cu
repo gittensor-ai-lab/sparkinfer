@@ -452,6 +452,22 @@ template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, 16>(const float*,
 template __global__ void fa_combine_gated_q8_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW>(
     const float*, const float*, const float*, __nv_bfloat16*, const __nv_bfloat16*, int, int, fa_block_q8_1*);
 #endif
+// head_dim=128 gated combine. The kernel is HEAD_DIM-generic (ELEMS = HEAD_DIM/(32*DG) = 1 here);
+// only the hd256 architectures had ever been instantiated, which is what kept Muse Glimmer (128)
+// on the split path -- a separate sigmoid-gate kernel plus a separate output quantize, two extra
+// graph nodes per layer, 104 per step.
+#ifndef _MSC_VER
+template __global__ void fa_combine_gated_q8_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW>(
+    const float*, const float*, const float*, __nv_bfloat16*, const __nv_bfloat16*, int, int, fa_block_q8_1*);
+#endif
+#ifndef _MSC_VER
+template __global__ void fa_combine_gated_q8_kernel<128, FA_COMBINE_DG, 8>(
+    const float*, const float*, const float*, __nv_bfloat16*, const __nv_bfloat16*, int, int, fa_block_q8_1*);
+#endif
+#ifndef _MSC_VER
+template __global__ void fa_combine_gated_q8_kernel<128, FA_COMBINE_DG, 16>(
+    const float*, const float*, const float*, __nv_bfloat16*, const __nv_bfloat16*, int, int, fa_block_q8_1*);
+#endif
 #ifndef _MSC_VER
 template __global__ void fa_combine_gated_q8_kernel<256, FA_COMBINE_DG, 8>(
     const float*, const float*, const float*, __nv_bfloat16*, const __nv_bfloat16*, int, int, fa_block_q8_1*);
@@ -682,6 +698,27 @@ static inline void fa_launch_combine(
     dim3 g(num_q_heads * FA_COMBINE_DG, num_seqs);
     fa_combine_kernel<128, FA_COMBINE_DG, NW><<<g, NW * 32, 0, stream>>>(
         part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8);
+}
+
+template <int NW>
+static inline void fa_launch_combine_gated(
+    const float* part_m, const float* part_l, const float* part_acc,
+    __nv_bfloat16* out, const __nv_bfloat16* gate, int num_q_heads, int n_splits,
+    fa_block_q8_1* out_q8, int num_seqs, cudaStream_t stream
+) {
+    dim3 g(num_q_heads * FA_COMBINE_DG, num_seqs);
+    fa_combine_gated_q8_kernel<128, FA_COMBINE_DG, NW><<<g, NW * 32, 0, stream>>>(
+        part_m, part_l, part_acc, out, gate, num_q_heads, n_splits, out_q8);
+}
+
+static inline void fa_launch_combine_gated_dispatch(
+    const float* part_m, const float* part_l, const float* part_acc,
+    __nv_bfloat16* out, const __nv_bfloat16* gate, int num_q_heads, int n_splits,
+    fa_block_q8_1* out_q8, int num_seqs, cudaStream_t stream
+) {
+    if (n_splits >= 128)      fa_launch_combine_gated<16>(part_m, part_l, part_acc, out, gate, num_q_heads, n_splits, out_q8, num_seqs, stream);
+    else if (n_splits >= 64)  fa_launch_combine_gated<8>(part_m, part_l, part_acc, out, gate, num_q_heads, n_splits, out_q8, num_seqs, stream);
+    else                      fa_launch_combine_gated<FA_COMBINE_NW>(part_m, part_l, part_acc, out, gate, num_q_heads, n_splits, out_q8, num_seqs, stream);
 }
 
 static inline void fa_launch_combine_dispatch(
@@ -950,8 +987,13 @@ void launch_flash_decode_split(
                     part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
                     ksc, vsc);
         }
-        fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
-                                   num_q_heads, n_splits, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+        if (gate && out_q8)
+            fa_launch_combine_gated_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                             gate, num_q_heads, n_splits,
+                                             reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+        else
+            fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                       num_q_heads, n_splits, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
         (void)head_dim;
         return;
     }
@@ -960,8 +1002,13 @@ void launch_flash_decode_split(
         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
         part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
         ksc, vsc, int8_kv);
-    fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
-                               num_q_heads, n_splits, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+    if (gate && out_q8)
+        fa_launch_combine_gated_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                         gate, num_q_heads, n_splits,
+                                         reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+    else
+        fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                   num_q_heads, n_splits, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
     (void)head_dim;
 }
 #endif
