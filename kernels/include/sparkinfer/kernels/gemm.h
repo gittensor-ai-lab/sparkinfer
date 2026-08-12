@@ -78,11 +78,20 @@ void launch_gemv_q_dp4a_pq_f32(const void* q8, const float* ad, const float* as,
 // nwarps=4 cooperate per row. A/B test vs our split-K dp4a (SPARKINFER_LLAMA=1).
 size_t llama_q8_1_bytes(int K);
 void launch_quantize_q8_1_blocks(const void* x, void* y, int K, cudaStream_t stream = nullptr);
+
+// Pull `bytes` of `p` into L2 (prefetch.global.L2 only -- no loads, no stores, no side effects).
+// Intended to run on a side stream during a latency-bound kernel, so the next weight-streaming
+// GEMV finds its leading slice already resident. Never changes a computed value.
+void launch_l2_prefetch(const void* p, size_t bytes, cudaStream_t stream = nullptr);
 // Row-batched Q8_1 quantize: `rows` activation rows of K values, x row stride `x_stride` elements,
 // y rows contiguous (llama_q8_1_bytes(K) apart). Same per-row math as the single-row launcher.
 void launch_quantize_q8_1_rows(const void* x, void* y, int K, int rows, int x_stride,
                                cudaStream_t stream = nullptr);
 void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
+// Two Q4_K matrices, one shared Q8_1 activation, one launch. Per-row results are bit-identical to
+// two launch_mmvq_q4k calls. Returns false if the shape is unsupported.
+bool launch_mmvq_q4k_kfixed2(const void* q81, const void* W0, const void* W1, void* y0, void* y1,
+                             int N0, int N1, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
 
 // Exact short-row target verifier: M contiguous Q8_1 activations against one Q4_K matrix.

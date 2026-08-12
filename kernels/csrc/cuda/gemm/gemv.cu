@@ -976,6 +976,53 @@ __global__ void si_mmvq_q4k_kfixed_kernel(const si_block_q8_1* __restrict__ vy, 
     if (lane == 0) gemv_write(y + row, tmp);
 }
 
+// Two Q4_K matrices against ONE shared Q8_1 activation in a single launch. The body below is
+// character-for-character si_mmvq_q4k_kfixed_kernel's; only which (W, y) a block addresses changes,
+// so every output row is produced by the identical dot/reduction order and the result is
+// bit-identical to two separate launches.
+//
+// Muse Glimmer projects attn_q and attn_gate as two separate Q4_K tensors back-to-back on the SAME
+// stream (they are not interleaved at load, unlike every other arch here), so merging them removes
+// one graph node per layer AND doubles the launch from 9.2 MB to 18.4 MB, which sits meaningfully
+// higher on this card's bandwidth-vs-transfer-size curve. Note this deliberately does NOT touch K/V,
+// which QKVSTREAM runs concurrently on side streams -- folding those in removes real overlap and
+// measured -0.13% when tried.
+template <typename OutT, int NSUPER>
+__global__ void si_mmvq_q4k_kfixed2_kernel(const si_block_q8_1* __restrict__ vy,
+                                           const unsigned char* __restrict__ W0,
+                                           const unsigned char* __restrict__ W1,
+                                           OutT* __restrict__ y0, OutT* __restrict__ y1, int N0) {
+    constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const bool second = (blockIdx.x >= (unsigned)N0);
+    const int row = second ? (int)blockIdx.x - N0 : (int)blockIdx.x;
+    const unsigned char* W = second ? W1 : W0;
+    OutT* y = second ? y1 : y0;
+    const si_block_q4_K* x_row = (const si_block_q4_K*)(W + (size_t)row * NSUPER * 144);
+    constexpr int blocks_per_iter = vdr * NW * WS / qi;
+    float tmp = 0.0f;
+    #pragma unroll
+    for (int kbx = tid / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
+        const int kby = kbx * 8;
+        const int kqs = vdr * (tid % (qi / vdr));
+        tmp += si_vec_dot_q4_K(x_row + kbx, vy + kby, kqs);
+    }
+    __shared__ float tmp_shared[NW - 1][WS];
+    if (warp > 0) tmp_shared[warp - 1][lane] = tmp;
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) tmp += tmp_shared[l][lane];
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, m);
+    if (lane == 0) gemv_write(y + row, tmp);
+}
+
+#ifndef _MSC_VER
+template __global__ void si_mmvq_q4k_kfixed2_kernel<__nv_bfloat16, 26>(
+    const si_block_q8_1*, const unsigned char*, const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, int);
+#endif
+
 #ifndef _MSC_VER
 template __global__ void si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 8>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
 #endif
@@ -1989,6 +2036,59 @@ void launch_gemv_q_dp4a_pq_f32(const void* q8, const float* ad, const float* as,
         reinterpret_cast<const signed char*>(q8), ad, as, reinterpret_cast<const unsigned char*>(W), y, N, K);
 }
 
+// ---- L2 weight prefetch ----
+// Decode is DRAM-bound (~86% bus utilization measured on a 5090), and the missing ~14% is time
+// the bus sits idle while a latency-bound kernel runs. The worst offender is the Muse Glimmer
+// sandwich-norm tail: two single-CTA reductions per layer, ~3.4 us each, during which 169 of 170
+// SMs and the entire memory bus do nothing. This kernel fills that window by pulling the leading
+// slice of the weight matrix the NEXT big GEMV will stream into L2, so those bytes are already
+// resident when it starts. Pure `prefetch.global.L2` -- no data reaches registers, nothing is
+// written, so it cannot perturb any result. The arithmetic downstream is bit-identical; only
+// where a byte is served from changes.
+__global__ void si_l2_prefetch_kernel(const char* __restrict__ p, size_t bytes) {
+    size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) << 7;   // one 128 B line per thread
+    const size_t stride = (size_t)gridDim.x * blockDim.x << 7;
+    for (; i < bytes; i += stride)
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(p + i));
+}
+
+// `prefetch.global.L2` is only a hint and the hardware may drop it under memory pressure -- which
+// is exactly the regime this runs in. This variant issues real 16 B loads instead, so the fill is
+// guaranteed; the accumulator is sunk behind a condition that never holds, which keeps the loads
+// from being dead-code-eliminated without ever storing anything.
+__device__ unsigned si_l2_pf_sink;
+__global__ void si_l2_load_kernel(const uint4* __restrict__ p, size_t n16) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    unsigned acc = 0;
+    for (; i < n16; i += stride) {
+        const uint4 v = __ldg(p + i);
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0xFFFFFFFFu && n16 == 0) si_l2_pf_sink = acc;   // never taken
+}
+
+void launch_l2_prefetch(const void* p, size_t bytes, cudaStream_t stream) {
+    if (!p || !bytes) return;
+    static int mode = -1;
+    if (mode < 0) { const char* e = getenv("SPARKINFER_MG_L2PF_MODE"); mode = e ? atoi(e) : 0; }
+    if (mode == 1) {
+        const size_t n16 = bytes >> 4;
+        const int threads = 256;
+        const int blocks = (int)((n16 + threads - 1) / threads < 512 ? (n16 + threads - 1) / threads : 512);
+        si_l2_load_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const uint4*>(p), n16);
+        return;
+    }
+    const size_t lines = (bytes + 127) >> 7;
+    const int threads = 256;
+    // Cap the grid so the prefetch never crowds out the latency-bound kernel it overlaps: 512 CTAs
+    // is already ~3x what it takes to saturate the bus, and leaves the single-CTA tail its SM.
+    const int blocks = (int)((lines + threads - 1) / threads < 512 ? (lines + threads - 1) / threads : 512);
+    si_l2_prefetch_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(p), bytes);
+}
+
 // ---- faithful llama.cpp Q4_K mmvq launchers ----
 size_t llama_q8_1_bytes(int K) { return (size_t)(K >> 5) * sizeof(si_block_q8_1); }  // 36 B / 32 vals
 void launch_quantize_q8_1_blocks(const void* x, void* y, int K, cudaStream_t stream) {
@@ -2010,6 +2110,16 @@ static int mmvq_dualrow() {
     if (v < 0) { const char* e = getenv("SPARKINFER_MMVQ2"); v = (e && e[0] == '0') ? 0 : 1; }
     return v;
 }
+bool launch_mmvq_q4k_kfixed2(const void* q81, const void* W0, const void* W1,
+                             void* y0, void* y1, int N0, int N1, int K, cudaStream_t stream) {
+    if (K != 6656 || N0 <= 0 || N1 <= 0) return false;   // Muse Glimmer's hidden size only
+    si_mmvq_q4k_kfixed2_kernel<__nv_bfloat16, 26><<<N0 + N1, 4 * 32, 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81),
+        reinterpret_cast<const unsigned char*>(W0), reinterpret_cast<const unsigned char*>(W1),
+        reinterpret_cast<__nv_bfloat16*>(y0), reinterpret_cast<__nv_bfloat16*>(y1), N0);
+    return true;
+}
+
 void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream) {
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const unsigned char* w = reinterpret_cast<const unsigned char*>(W);

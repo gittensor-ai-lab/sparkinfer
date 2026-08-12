@@ -42,6 +42,14 @@ void launch_norm_then_add(const void* residual_bf16, const void* block_out_bf16,
 //   out_xn = RMSNorm(out_x, next_w, eps)                    (what the following launch_rmsnorm does)
 // Bit-identical to that pair: same 256-thread block, same per-stage loop order and reduction tree,
 // and stage 2 re-reads the bf16-rounded out_x from memory exactly as the separate kernel would.
+// Fused QK-norm + optional NORM-convention RoPE + K/V append (Muse Glimmer). One kernel in place
+// of launch_rmsnorm_qk + launch_rope_kv_append_normal / launch_kv_append. Bit-identical.
+void launch_muse_qknorm_rope_kv(void* q, void* k, const void* v, const void* q_w, const void* k_w,
+                                void* k_pool, void* v_pool, const int* block_table,
+                                const int* pos_angle, const int* pos_slot,
+                                int n_q_heads, int n_kv_heads, int head_dim, float theta,
+                                int block_size, float eps, bool do_rope, cudaStream_t stream = nullptr);
+
 void launch_muse_sandwich_tail(const void* residual_bf16, const void* branch_bf16,
                                const void* post_w_bf16, const void* next_w_bf16,
                                void* out_x_bf16, void* out_xn_bf16,

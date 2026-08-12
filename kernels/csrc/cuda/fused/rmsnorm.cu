@@ -551,10 +551,104 @@ __global__ void rmsnorm_qk_kernel(__nv_bfloat16* __restrict__ q, __nv_bfloat16* 
     if (t < head_dim) x[base + t] = __float2bfloat16(v * s_warp[0] * __bfloat162float(w[t]));
 }
 
+
+// Fused QK-norm + (optional NORM-convention RoPE) + K/V cache append, for Muse Glimmer.
+// Collapses launch_rmsnorm_qk followed by launch_rope_kv_append_normal (sliding-window layers) or
+// launch_kv_append (NoPE layers) into ONE kernel: 2 decode-graph nodes per layer become 1, 52 per
+// 128-token step.
+//
+// Bit-identical to the split pair, by construction:
+//   * the per-head RMS reduction keeps rmsnorm_qk_kernel's exact warp -> shared -> warp grouping
+//     and the same blockDim (head_dim), so the fp32 summation order is unchanged;
+//   * the normed value is rounded to bf16 BEFORE the rotation reads it, which is precisely what
+//     the split path does implicitly when rmsnorm_qk stores bf16 to global and the rope kernel
+//     loads it back;
+//   * q/k are still written back in their normed (unrotated) form, so anything reading s.q/s.k
+//     afterwards sees exactly what it saw before.
+// `pos_angle` supplies the RoPE position and `pos_slot` the cache slot; the split path used d_pos
+// for both on the rope layers and d_writepos for the slot on the NoPE layers, so they are passed
+// separately rather than assumed equal.
+__global__ void muse_qknorm_rope_kv_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    const int* __restrict__ block_table, const int* __restrict__ pos_angle,
+    const int* __restrict__ pos_slot, int n_q_heads, int n_kv_heads, int head_dim,
+    float theta, int block_size, float eps, int do_rope
+) {
+    const int hh = blockIdx.x, t = threadIdx.x;
+    const int slot = pos_slot[0];
+    const int blk = slot / block_size, within = slot - blk * block_size;
+    const size_t ctok = (size_t)((size_t)block_table[blk] * block_size + within);
+
+    if (hh >= n_q_heads + n_kv_heads) {          // V head: straight copy, no norm, no rope
+        const int h = hh - n_q_heads - n_kv_heads;
+        v_pool[(ctok * n_kv_heads + h) * head_dim + t] = v[(size_t)h * head_dim + t];
+        return;
+    }
+    const bool is_q         = (hh < n_q_heads);
+    __nv_bfloat16* x        = is_q ? q : k;
+    const __nv_bfloat16* w  = is_q ? q_w : k_w;
+    const int head          = is_q ? hh : hh - n_q_heads;
+    const size_t base       = (size_t)head * head_dim;
+
+    __shared__ float s_warp[32];
+    extern __shared__ float s_h[];
+    const float xv = __bfloat162float(x[base + t]);
+    float ss = rn_warp_sum(xv * xv);
+    if ((t & 31) == 0) s_warp[t >> 5] = ss;
+    __syncthreads();
+    if (t < 32) {
+        float vv = (t < (blockDim.x + 31) / 32) ? s_warp[t] : 0.f;
+        vv = rn_warp_sum(vv);
+        if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+    }
+    __syncthreads();
+    const __nv_bfloat16 nb = __float2bfloat16(xv * s_warp[0] * __bfloat162float(w[t]));
+    x[base + t] = nb;                 // keep s.q / s.k byte-identical to the split path
+    s_h[t] = __bfloat162float(nb);
+    __syncthreads();
+
+    if (!do_rope) {                   // NoPE layer: append the normed K as-is
+        if (!is_q) k_pool[(ctok * n_kv_heads + head) * head_dim + t] = nb;
+        return;
+    }
+    const int half = head_dim >> 1;
+    if (t < half) {                   // NORM convention: rotate the pair (2i, 2i+1)
+        const float freq = __powf(theta, -2.f * (float)t / (float)head_dim);
+        const float ang = (float)pos_angle[0] * freq, c = __cosf(ang), sn = __sinf(ang);
+        const float x0 = s_h[2 * t], x1 = s_h[2 * t + 1];
+        if (is_q) {
+            q[base + 2 * t]     = __float2bfloat16(x0 * c - x1 * sn);
+            q[base + 2 * t + 1] = __float2bfloat16(x0 * sn + x1 * c);
+        } else {
+            const size_t dst = (ctok * n_kv_heads + head) * head_dim + 2 * t;
+            k_pool[dst]     = __float2bfloat16(x0 * c - x1 * sn);
+            k_pool[dst + 1] = __float2bfloat16(x0 * sn + x1 * c);
+        }
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
 #include <cassert>
 #include <cstdlib>
+
+void launch_muse_qknorm_rope_kv(void* q, void* k, const void* v, const void* q_w, const void* k_w,
+                                void* k_pool, void* v_pool, const int* block_table,
+                                const int* pos_angle, const int* pos_slot,
+                                int n_q_heads, int n_kv_heads, int head_dim, float theta,
+                                int block_size, float eps, bool do_rope, cudaStream_t stream) {
+    const int blocks = n_q_heads + 2 * n_kv_heads;   // q heads, k heads, then the v-copy heads
+    muse_qknorm_rope_kv_kernel<<<blocks, head_dim, head_dim * sizeof(float), stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        block_table, pos_angle, pos_slot, n_q_heads, n_kv_heads, head_dim, theta,
+        block_size, eps, do_rope ? 1 : 0);
+}
 
 void launch_rmsnorm_qk(void* q, void* k, const void* q_w, const void* k_w,
                        int n_q_heads, int n_kv_heads, int head_dim, float eps, cudaStream_t stream) {
