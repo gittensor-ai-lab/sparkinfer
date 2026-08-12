@@ -166,9 +166,12 @@ std::string filter_answer_chunk(std::string& carry, const std::string& piece) {
 struct ChatTokenizer::Impl {
     std::unique_ptr<tokenizers::Tokenizer> tok;
     bool museglimmer = false;
-    // Muse Glimmer harmony-format marker token ids, resolved lazily on first decode() once
-    // `tok` is loaded and `museglimmer` is set -- see decode()'s comment for why these need
-    // special handling.
+    // Muse Glimmer harmony-format marker token ids, resolved once in set_museglimmer() (single
+    // -threaded server startup, after `tok` is loaded) -- see decode()'s comment for why these
+    // need special handling. Deliberately NOT lazily resolved on first decode(): decode() runs
+    // on the shared g_tokenizer from every /v1/chat/completions request, and cpp-httplib
+    // dispatches those across a real thread pool by default -- a lazy first-call init here
+    // would race across concurrently-arriving requests.
     int32_t mg_start_id = -1, mg_message_id = -1, mg_eom_id = -1, mg_eot_id = -1;
 };
 
@@ -196,7 +199,20 @@ bool ChatTokenizer::load(const std::string& tokenizer_json_path, std::string& er
     return true;
 }
 
-void ChatTokenizer::set_museglimmer(bool on) { impl_->museglimmer = on; }
+void ChatTokenizer::set_museglimmer(bool on) {
+    impl_->museglimmer = on;
+    // Resolve the harmony-format marker ids here (single-threaded startup, `tok` already
+    // loaded by this point) rather than lazily in decode() -- see the Impl::mg_start_id
+    // comment for why. TokenToId returns -1 for an unknown token, which decode()'s
+    // marker_str() already treats as "never matches", so a missing marker degrades
+    // gracefully instead of crashing.
+    if (on && impl_->tok) {
+        impl_->mg_start_id = impl_->tok->TokenToId(kMgStart);
+        impl_->mg_message_id = impl_->tok->TokenToId(kMgMessage);
+        impl_->mg_eom_id = impl_->tok->TokenToId(kMgEom);
+        impl_->mg_eot_id = impl_->tok->TokenToId(kMgEot);
+    }
+}
 
 bool parse_chat_messages(const std::string& request_json, std::vector<ChatMessage>& messages, std::string& err) {
     messages.clear();
@@ -629,13 +645,8 @@ std::string ChatTokenizer::decode(const std::vector<int>& ids) const {
         // kMgStart/kMgMessage/kMgEom/kMgEot constants the parser already searches for,
         // rather than relying on the library's special-token handling. Non-museglimmer
         // models (Qwen3.6 et al, whose <think> tags are ordinary text tokens, not special
-        // ones) are unaffected -- this whole branch is gated on impl_->museglimmer.
-        if (impl_->mg_start_id < 0) {
-            impl_->mg_start_id = impl_->tok->TokenToId(kMgStart);
-            impl_->mg_message_id = impl_->tok->TokenToId(kMgMessage);
-            impl_->mg_eom_id = impl_->tok->TokenToId(kMgEom);
-            impl_->mg_eot_id = impl_->tok->TokenToId(kMgEot);
-        }
+        // ones) are unaffected -- this whole branch is gated on impl_->museglimmer. Marker
+        // ids are resolved once in set_museglimmer(), not lazily here -- see Impl::mg_start_id.
         auto marker_str = [&](int32_t id) -> const char* {
             if (id == impl_->mg_start_id) return kMgStart;
             if (id == impl_->mg_message_id) return kMgMessage;
