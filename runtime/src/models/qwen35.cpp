@@ -1662,7 +1662,15 @@ BridgeKVLayout lmcache_layout_from_cfg(const Qwen35Config& cfg, const KVCacheMan
 void lmcache_maybe_store(BridgeClient* bridge, const Qwen35Config& cfg, KVCacheManager& kv,
                          cudaStream_t stream, uint64_t seq_id, const std::vector<int>& tokens,
                          int start, int end) {
-    if (!bridge || !bridge->is_alive()) return;
+    // Deliberately not gated on bridge->is_alive(): that only becomes true as a side effect of
+    // a prior successful handshake, so gating on it here would mean the very first store in a
+    // freshly started process never fires (nothing has ever connected yet to make it true) --
+    // found via the live E2E test (lmcache_e2e_gpu_test.cpp), which is exactly the class of bug
+    // that kind of test exists to catch. store_async() (and the LOOKUP call in
+    // ingest_prompt_range, same reasoning) already handle "is the bridge actually reachable"
+    // internally via their own lazy-connect + cooldown/backoff -- that's what their docstrings
+    // mean by "safe to call regardless."
+    if (!bridge) return;
     const int chunk = lmcache_chunk_size_tokens();
     const int aligned_end = (end / chunk) * chunk;
     if (aligned_end <= start) return;
@@ -1837,9 +1845,14 @@ int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chu
     // into a slower one for the remainder -- it's a strict win, never a trade-off. Only on the
     // very first call for this range (start==0); a chunked resumption call (start>0, continuing
     // a previous partial token-loop advance) never re-queries -- one round trip per prefill.
+    // Deliberately not gated on lmcache_bridge->is_alive(): that only becomes true as a side
+    // effect of a prior successful handshake, so gating on it here would mean the very first
+    // lookup in a freshly started process never fires (found via the live E2E test,
+    // lmcache_e2e_gpu_test.cpp -- exactly the class of bug that test exists to catch).
+    // lookup() already handles "is the bridge actually reachable" internally via its own
+    // lazy-connect + cooldown/backoff, bounded by the 5ms default timeout either way.
     int actual_start = start;
-    if (start == 0 && s.lmcache_bridge && s.lmcache_bridge->is_alive() &&
-        n >= lmcache_chunk_size_tokens()) {
+    if (start == 0 && s.lmcache_bridge && n >= lmcache_chunk_size_tokens()) {
         LookupResult res = s.lmcache_bridge->lookup(std::vector<int>(ids, ids + end));
         if (res.ok && res.matched_tokens > 0) {
             const BridgeKVLayout layout = lmcache_layout_from_cfg(s.cfg, *s.kv);
