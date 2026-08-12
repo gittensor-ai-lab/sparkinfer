@@ -976,6 +976,53 @@ __global__ void si_mmvq_q4k_kfixed_kernel(const si_block_q8_1* __restrict__ vy, 
     if (lane == 0) gemv_write(y + row, tmp);
 }
 
+// Two Q4_K matrices against ONE shared Q8_1 activation in a single launch. The body below is
+// character-for-character si_mmvq_q4k_kfixed_kernel's; only which (W, y) a block addresses changes,
+// so every output row is produced by the identical dot/reduction order and the result is
+// bit-identical to two separate launches.
+//
+// Muse Glimmer projects attn_q and attn_gate as two separate Q4_K tensors back-to-back on the SAME
+// stream (they are not interleaved at load, unlike every other arch here), so merging them removes
+// one graph node per layer AND doubles the launch from 9.2 MB to 18.4 MB, which sits meaningfully
+// higher on this card's bandwidth-vs-transfer-size curve. Note this deliberately does NOT touch K/V,
+// which QKVSTREAM runs concurrently on side streams -- folding those in removes real overlap and
+// measured -0.13% when tried.
+template <typename OutT, int NSUPER>
+__global__ void si_mmvq_q4k_kfixed2_kernel(const si_block_q8_1* __restrict__ vy,
+                                           const unsigned char* __restrict__ W0,
+                                           const unsigned char* __restrict__ W1,
+                                           OutT* __restrict__ y0, OutT* __restrict__ y1, int N0) {
+    constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const bool second = (blockIdx.x >= (unsigned)N0);
+    const int row = second ? (int)blockIdx.x - N0 : (int)blockIdx.x;
+    const unsigned char* W = second ? W1 : W0;
+    OutT* y = second ? y1 : y0;
+    const si_block_q4_K* x_row = (const si_block_q4_K*)(W + (size_t)row * NSUPER * 144);
+    constexpr int blocks_per_iter = vdr * NW * WS / qi;
+    float tmp = 0.0f;
+    #pragma unroll
+    for (int kbx = tid / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
+        const int kby = kbx * 8;
+        const int kqs = vdr * (tid % (qi / vdr));
+        tmp += si_vec_dot_q4_K(x_row + kbx, vy + kby, kqs);
+    }
+    __shared__ float tmp_shared[NW - 1][WS];
+    if (warp > 0) tmp_shared[warp - 1][lane] = tmp;
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) tmp += tmp_shared[l][lane];
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, m);
+    if (lane == 0) gemv_write(y + row, tmp);
+}
+
+#ifndef _MSC_VER
+template __global__ void si_mmvq_q4k_kfixed2_kernel<__nv_bfloat16, 26>(
+    const si_block_q8_1*, const unsigned char*, const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, int);
+#endif
+
 #ifndef _MSC_VER
 template __global__ void si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 8>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
 #endif
@@ -2010,6 +2057,16 @@ static int mmvq_dualrow() {
     if (v < 0) { const char* e = getenv("SPARKINFER_MMVQ2"); v = (e && e[0] == '0') ? 0 : 1; }
     return v;
 }
+bool launch_mmvq_q4k_kfixed2(const void* q81, const void* W0, const void* W1,
+                             void* y0, void* y1, int N0, int N1, int K, cudaStream_t stream) {
+    if (K != 6656 || N0 <= 0 || N1 <= 0) return false;   // Muse Glimmer's hidden size only
+    si_mmvq_q4k_kfixed2_kernel<__nv_bfloat16, 26><<<N0 + N1, 4 * 32, 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81),
+        reinterpret_cast<const unsigned char*>(W0), reinterpret_cast<const unsigned char*>(W1),
+        reinterpret_cast<__nv_bfloat16*>(y0), reinterpret_cast<__nv_bfloat16*>(y1), N0);
+    return true;
+}
+
 void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream) {
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const unsigned char* w = reinterpret_cast<const unsigned char*>(W);

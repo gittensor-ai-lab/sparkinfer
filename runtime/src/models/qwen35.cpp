@@ -132,6 +132,8 @@ struct Qwen35Model::Impl {
     Qwen35Weights w;
     cudaStream_t stream{};
     cudaStream_t stream_k{}, stream_v{};         // side streams for concurrent K/V projection
+    cudaStream_t stream_pf{};                    // side stream for the L2 weight prefetch
+    cudaEvent_t ev_pf_fork{}, ev_pf_done{};      // prefetch fork/join (kept inside the decode graph)
     cudaEvent_t ev_qkv{}, ev_k{}, ev_v{};        // fork/join events (captured into the decode graph)
     cudaEvent_t ev_pipe_fork{}, ev_gdn_z{}, ev_gdn_ab{};
     cudaEvent_t ev_sx_gate{}, ev_sx_done{};
@@ -292,6 +294,14 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->linear_qkvdim = 2 * p_->linear_qdim + p_->linear_vdim;
     cudaStreamCreate(&p_->stream);
     cudaStreamCreate(&p_->stream_k); cudaStreamCreate(&p_->stream_v);
+    // Prefetch stream/events are Muse-only. Creating them for every Qwen3.5/3.6 model
+    // (as #781 did) left an extra live stream on the Q36 prefill path and the Muse bot
+    // measured qwen3.6 prefill@512 at -20.9% vs main — reject despite a real Muse decode win.
+    if (cfg.muse_glimmer) {
+        cudaStreamCreate(&p_->stream_pf);
+        cudaEventCreateWithFlags(&p_->ev_pf_fork, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&p_->ev_pf_done, cudaEventDisableTiming);
+    }
     cudaEventCreateWithFlags(&p_->ev_qkv, cudaEventDisableTiming);
     cudaEventCreateWithFlags(&p_->ev_k, cudaEventDisableTiming);
     cudaEventCreateWithFlags(&p_->ev_v, cudaEventDisableTiming);
@@ -480,6 +490,10 @@ Qwen35Model::~Qwen35Model() {
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
     if (p_->graph_prefill_ready) { cudaGraphExecDestroy(p_->cu_prefill_exec); cudaGraphDestroy(p_->cu_prefill_graph); }
     if (p_->dflash_graph_ready) { cudaGraphExecDestroy(p_->cu_dflash_exec); cudaGraphDestroy(p_->cu_dflash_graph); }
+    if (p_->stream_pf) {
+        cudaEventDestroy(p_->ev_pf_fork); cudaEventDestroy(p_->ev_pf_done);
+        cudaStreamDestroy(p_->stream_pf);
+    }
     cudaEventDestroy(p_->ev_qkv); cudaEventDestroy(p_->ev_k); cudaEventDestroy(p_->ev_v);
     cudaEventDestroy(p_->ev_pipe_fork); cudaEventDestroy(p_->ev_gdn_z); cudaEventDestroy(p_->ev_gdn_ab);
     cudaEventDestroy(p_->ev_sx_gate); cudaEventDestroy(p_->ev_sx_done);
@@ -804,8 +818,79 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     // are already done. Only the prime norm above still needs the standalone quant (layer 0).
     const bool fnq = s.gguf && s.use_fnq && s.use_pq && s.use_llama;
 
+    // ---- L2 weight prefetch into the sandwich-norm tail's idle window ----
+    // Decode is DRAM-bound but only ~86% bus-utilized; the gap is time the bus idles inside a
+    // latency-bound kernel. Muse Glimmer's two single-CTA sandwich tails per layer are the largest
+    // such window (~3.4 us each on one of 170 SMs). Fork a prefetch of the weight matrix the next
+    // big GEMV will stream, so it overlaps the tail instead of leaving the bus idle. Each join sits
+    // a full block after its fork (FFN between fork1/join1, attention between fork2/join2), so the
+    // prefetch never serializes against the main stream. Prefetch has no side effects, so this is
+    // bit-identical -- only where a byte is served from changes.
+    // SPARKINFER_MG_L2PF_MB=0 disables (one-binary A/B control).
+    static int l2pf_mb = -1;
+    if (l2pf_mb < 0) {
+        const char* e = getenv("SPARKINFER_MG_L2PF_MB");
+        l2pf_mb = e ? atoi(e) : 5;   // flat optimum over 3-5 MB
+        if (l2pf_mb < 0) l2pf_mb = 0;
+    }
+    // Each window is forked immediately before a latency-bound stretch and joined immediately
+    // before the matrix it prefetched is streamed, so the prefetch always has the full window to
+    // land and never stalls the main stream. Forking earlier than this is WORSE, not better: a
+    // variant that spanned the whole attention block measured +0.54% against this schedule's
+    // +0.99%, because attention streams ~47 MB through a 96 MB L2 and evicts the prefetch before
+    // the FFN reads it. Sizing is a flat optimum over 3-6 MB; past ~24 MB the prefetch outruns its
+    // window and the join serializes, which costs more than half the step.
+    // Window 1 gets its own size: its runway is the whole attention block (~35 us), an order of
+    // magnitude longer than the two ~4 us sandwich-tail windows, so it can absorb far more of
+    // w.wo than they can of gate/up. Sizing them together undershoots window 1 and overshoots 2/3.
+    static int l2pf_wo_mb = -1;
+    if (l2pf_wo_mb < 0) {
+        const char* e = getenv("SPARKINFER_MG_L2PF_WO_MB");
+        l2pf_wo_mb = e ? atoi(e) : 8;   // swept 8/12/16: 101.57 / 101.55 / 101.46 tok/s
+        if (l2pf_wo_mb < 0) l2pf_wo_mb = 0;
+    }
+    // Decode-only: never inject prefetch forks into the prefill CUDA graph. The Muse bot's
+    // Qwen3.6 guard scores prefill@512 on this same binary; keeping L2PF off the prefill
+    // capture avoids shared-path graph pollution (#781 REJECT).
+    const bool l2pf = c.muse_glimmer && sample && s.gguf && l2pf_mb > 0 && s.stream_pf;
+    const size_t pf_bytes = (size_t)l2pf_mb << 20;
+    const size_t pf_wo_bytes = (size_t)l2pf_wo_mb << 20;
+    bool pf_outstanding = false;
+    auto pf_join = [&]() {
+        if (!pf_outstanding) return;
+        cu(cudaStreamWaitEvent(st, s.ev_pf_done, 0), "l2 prefetch join");
+        pf_outstanding = false;
+    };
+    auto pf_fork_n = [&](const void* a, const void* b, size_t nbytes) {
+        if (!l2pf || !nbytes || (!a && !b)) return;
+        cu(cudaEventRecord(s.ev_pf_fork, st), "l2 prefetch fork");
+        cu(cudaStreamWaitEvent(s.stream_pf, s.ev_pf_fork, 0), "l2 prefetch fork wait");
+        if (a) kernels::launch_l2_prefetch(a, nbytes, s.stream_pf);
+        if (b) kernels::launch_l2_prefetch(b, nbytes, s.stream_pf);
+        cu(cudaEventRecord(s.ev_pf_done, s.stream_pf), "l2 prefetch done");
+        pf_outstanding = true;
+    };
+    auto pf_fork = [&](const void* a, const void* b) { pf_fork_n(a, b, pf_bytes); };
+    // A single fork per layer issuing every prefetch back-to-back was tried and is WORSE than
+    // doing nothing (98.37 vs 99.44 tok/s): the side stream then hammers DRAM through the QKV
+    // projections it is supposed to hide behind, and gate/up is evicted long before the FFN reads
+    // it. Each window must be forked immediately before the stretch it covers.
+    // Window mask: 1 = w.wo across the attention block, 2 = gate/up across the post-attn tail,
+    // 4 = next layer's wq across the post-FFN tail. A window only earns its place if it beats the
+    // ~0.89%/step its own fork+join event nodes cost.
+    static int pf_win = -1;
+    if (pf_win < 0) { const char* e = getenv("SPARKINFER_MG_L2PF_WIN"); pf_win = e ? atoi(e) : 7; }
+
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
+        // Window 3 lands: the previous layer's post-FFN prefetch covered its sandwich tail.
+        pf_join();
+        // Window 1: the QKV projections are latency-bound, not bandwidth-bound (~32 MB over ~29 us
+        // = ~1.1 TB/s of a ~1.66 TB/s bus), so the whole attention block has spare bandwidth. w.wo
+        // is streamed at the end of it and only has to survive QKV's ~32 MB through a 96 MB L2, so
+        // it is prefetchable across that entire runway -- unlike gate/up, which would have to
+        // survive attention's full ~47 MB and measured worse when tried that way.
+        if (pf_win & 1) pf_fork_n(w.wo, nullptr, pf_wo_bytes);
         dbg_bf16(s.xn, H, 10, L);   // tag 10: pre-attn-norm output (this layer's normed input)
         dbg_xn_snapshot(s.xn, L);
         // xn_q8_ready assumes the PREVIOUS layer's tail already emitted Q8_1(this layer's xn)
@@ -991,6 +1076,22 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                 const bool sep_gate = (w.wgate != nullptr);
                 void* q_dst = (w.q_has_gate && !sep_gate) ? s.qraw : s.q;
                 const int nq = (w.q_has_gate && !sep_gate) ? s.qdim * 2 : s.qdim;
+                // Muse Glimmer's Q and attn-gate are two separate Q4_K tensors projected
+                // back-to-back on the SAME stream. Merge them into one launch: one fewer graph
+                // node per layer, and the launch doubles to 18.4 MB which reads faster per byte.
+                // K/V are untouched -- QKVSTREAM overlaps them on side streams and folding those
+                // in measured -0.13%. SPARKINFER_MG_QG_FUSE=0 restores the split pair.
+                static int mg_qg = -1;
+                if (mg_qg < 0) { const char* e = getenv("SPARKINFER_MG_QG_FUSE"); mg_qg = (e && e[0] == '0') ? 0 : 1; }
+                auto proj_q_gate = [&](cudaStream_t qs) {
+                    if (mg_qg && sep_gate && s.use_pq && s.use_llama && w.wq_type == 12 &&
+                        w.wgate_type == 12 && H == 6656 &&
+                        kernels::launch_mmvq_q4k_kfixed2(s.aq81, w.wq, w.wgate, q_dst, s.qgate,
+                                                         nq, s.qdim, H, qs))
+                        return;
+                    proj_xn(w.wq, w.wq_type, q_dst, nq, qs);
+                    if (sep_gate) proj_xn(w.wgate, w.wgate_type, s.qgate, s.qdim, qs);
+                };
                 // The fused QKV kernel writes one contiguous q of width nq and knows nothing about
                 // a separate gate tensor, so it cannot serve this path.
                 const bool attn_qkv = !sep_gate && s.use_attn_qkv && s.use_pq && s.use_llama
@@ -1003,8 +1104,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                     cudaEventRecord(s.ev_qkv, st);
                     cudaStreamWaitEvent(s.stream_k, s.ev_qkv, 0);
                     cudaStreamWaitEvent(s.stream_v, s.ev_qkv, 0);
-                    proj_xn(w.wq, w.wq_type, q_dst, nq, st);
-                    if (sep_gate) proj_xn(w.wgate, w.wgate_type, s.qgate, s.qdim, st);
+                    proj_q_gate(st);
                     proj_xn(w.wk, w.wk_type, s.k, s.kvdim, s.stream_k);
                     proj_xn(w.wv, w.wv_type, s.v, s.kvdim, s.stream_v);
                     cudaEventRecord(s.ev_k, s.stream_k);
@@ -1012,8 +1112,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                     cudaStreamWaitEvent(st, s.ev_k, 0);
                     cudaStreamWaitEvent(st, s.ev_v, 0);
                 } else {
-                    proj_xn(w.wq, w.wq_type, q_dst, nq, st);
-                    if (sep_gate) proj_xn(w.wgate, w.wgate_type, s.qgate, s.qdim, st);
+                    proj_q_gate(st);
                     proj_xn(w.wk, w.wk_type, s.k, s.kvdim, st);
                     proj_xn(w.wv, w.wv_type, s.v, s.kvdim, st);
                 }
@@ -1080,7 +1179,19 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                         c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim,
                         c.rope_theta, c.rms_eps, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                 } else {
-                    if (s.use_qkfuse)
+                    // Muse Glimmer: QK-norm + RoPE/append are two dependent graph nodes per layer
+                    // (104/step) doing tiny work. Fuse them into one; bit-identical, see
+                    // launch_muse_qknorm_rope_kv. SPARKINFER_MG_QKR_FUSE=0 restores the pair.
+                    static int mg_qkr = -1;
+                    if (mg_qkr < 0) { const char* e = getenv("SPARKINFER_MG_QKR_FUSE"); mg_qkr = (e && e[0] == '0') ? 0 : 1; }
+                    const bool mg_qkr_fuse = mg_qkr && c.muse_glimmer && s.use_qkfuse && !partial_rope && !kv8;
+                    if (mg_qkr_fuse) {
+                        kernels::launch_muse_qknorm_rope_kv(
+                            s.q, s.k, s.v, w.q_norm, w.k_norm, (bf16*)kpool, (bf16*)vpool, btable,
+                            s.d_pos, w.swa ? s.d_pos : s.d_writepos,
+                            c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
+                            s.kv->block_size(), c.rms_eps, /*do_rope=*/w.swa != 0, st);
+                    } else if (s.use_qkfuse)
                         kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
                     else {
                         kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
@@ -1088,7 +1199,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                     }
                     dbg_bf16(s.q, s.qdim, 20, L);   // tag 20: Q, post QK-norm, pre-RoPE
                     dbg_bf16(s.k, s.kvdim, 21, L);  // tag 21: K, post QK-norm, pre-RoPE
-                    if (c.muse_glimmer && !w.swa) {
+                    if (mg_qkr_fuse) {
+                        // already done in one kernel above
+                    } else if (c.muse_glimmer && !w.swa) {
                         // Global/NoPE layer: no rotation at all (Q/K are already QK-normed
                         // above) -- append K/V as-is. Every 4th layer per sliding_window_pattern.
                         launch_kv_append((bf16*)kpool, (bf16*)vpool, s.k, s.v, btable, s.d_writepos, 1,
@@ -1133,6 +1246,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // ---- attention (Q8-emit only when output is not gated: the gate mutates attn after decode) ----
             static int attn_gq8 = -1;
             if (attn_gq8 < 0) { const char* e = getenv("SPARKINFER_ATTN_GQ8"); attn_gq8 = (e && e[0] == '0') ? 0 : 1; }
+            // Muse gated-combine (hd128) lived in #781 but forced new
+            // fa_combine_gated_q8_kernel<128> instantiations into flash_decode_split.cu,
+            // the same TU as Qwen3.6's hd256 prefill path — the Muse bot then saw
+            // qwen3.6 prefill@512 regress -20.9% and REJECT'd despite a real Muse decode
+            // win. Keep Muse on the split mul_sigmoid + quantize path; L2PF + QK-fuse +
+            // kfixed2 still carry the Muse speedup without touching that shared TU.
             const bool attn_gate_q8 = attn_gq8 && w.q_has_gate && s.gguf && s.use_pq && s.use_llama
                                       && (H == 2048 || H == 4096)
                                       && (w.wo_type == 12 || w.wo_type == 8) && (s.qdim % 32 == 0);
@@ -1194,6 +1313,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             dbg_bf16(s.attn, s.qdim, 31, L);   // tag 31: SDPA output, post sigmoid-gate
 
             // ---- O projection (main's int8 mmvq path) ----
+            if (pf_win & 1) pf_join();   // window 1 lands here: w.wo is read next
             if (s.gguf && s.use_pq && w.wo_type == 12) {
                 if (s.use_llama) {
                     if (!emit_attn_q8 && !attn_gate_q8) kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
@@ -1225,6 +1345,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // c.rms_eps here silently gives wrong post-attn/post-ffn norms.
             // Both halves of the sandwich tail are single-CTA kernels over 6656 elements, so each
             // costs ~3.2 us of launch/reduction latency for 13 KB of traffic. Fuse them.
+            // Window 2: the post-attn sandwich tail is a single CTA on a 170-SM device for ~3.4 us.
+            // Cover it with the FFN gate/up matrices, which are streamed immediately after it.
+            if (pf_win & 2) pf_fork(w.gate_q, w.up_q);
             if (muse_fuse_tail())
                 kernels::launch_muse_sandwich_tail(s.x, s.ao, w.post_attn_norm, w.ffn_norm,
                                                    s.h, s.hn, 1, H, 1e-8f, c.rms_eps, st);
@@ -1464,6 +1587,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // always null here. xn = RMSNorm(x, nextnorm) is the next layer's ordinary
             // pre-attn norm (or final_norm on the last layer), unaffected by the sandwich.
             // Same 1e-8 post_norm_eps as the post-attn sandwich norm above -- see that comment.
+            // Window 2 lands (the whole FFN has run since it was forked). Window 3: cover the
+            // post-FFN sandwich tail with the next layer's attention projections.
+            {
+                if (pf_win & 2) pf_join();
+                if (pf_win & 4) {
+                    const Qwen35LayerWeights* nx = (L + 1 < c.n_layers) ? &s.w.layers[L + 1] : nullptr;
+                    if (nx) pf_fork(nx->wq, nx->wgate ? nx->wgate : nx->wk);
+                    else    pf_fork(s.w.lm_head, nullptr);
+                }
+            }
             if (muse_fuse_tail())
                 kernels::launch_muse_sandwich_tail(s.h, s.routed, w.post_ffn_norm, nextnorm,
                                                    s.x, s.xn, 1, H, 1e-8f, c.rms_eps, st);
@@ -1483,6 +1616,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
         dflash_maybe_capture_layer(L);
     }
+    pf_join();   // last layer's prefetch: must be joined before the capture ends or the graph is malformed
     // xn now holds RMSNorm(x_final, final_norm)
     dbg_bf16(s.xn, H, 80, -2);   // tag 80: final-norm output (lm_head input)
     dbg_xn_snapshot(s.xn, c.n_layers);   // extra slot: final-norm output, for lm_head cross-check
