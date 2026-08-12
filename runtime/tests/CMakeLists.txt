@@ -47,6 +47,15 @@ add_executable(batch_engine_gpu_test batch_engine_gpu_test.cpp)
 target_link_libraries(batch_engine_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME batch_engine_gpu_test COMMAND batch_engine_gpu_test)
 
+# Real sidecar subprocess + real KV cache + a small synthetic model on real hardware -- the one
+# place both halves of the LMCache bridge run together against the real model code path. Skips
+# (not fails) unless SPARKINFER_LMCACHE_PYTHON/_BRIDGE_SCRIPT point at a real lmcache+torch venv
+# (see bridge/README.md) -- most environments running the rest of this suite won't have that
+# ~1.5GB, CPU-only-torch-is-enough dependency installed.
+add_executable(lmcache_e2e_gpu_test lmcache_e2e_gpu_test.cpp)
+target_link_libraries(lmcache_e2e_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME lmcache_e2e_gpu_test COMMAND lmcache_e2e_gpu_test)
+
 # GPU integration tests — run the real device path; skip without a device.
 add_executable(decode_runner_gpu_test decode_runner_gpu_test.cpp)
 target_link_libraries(decode_runner_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
