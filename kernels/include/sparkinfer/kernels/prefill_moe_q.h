@@ -60,7 +60,9 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
 bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8, const float* sx,
                                          const void* const* W_q, const float* const* row_scale,
                                          void* const* C_bf16, const int* N, int ngroup,
-                                         int M, int K, cudaStream_t stream = nullptr);
+                                         int M, int K, cudaStream_t stream = nullptr,
+                                         int* partials = nullptr, int partials_splits = 0,
+                                         size_t partials_cap = 0);
 
 } // namespace kernels
 } // namespace sparkinfer

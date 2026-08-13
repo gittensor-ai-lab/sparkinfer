@@ -489,6 +489,7 @@ struct PfQGroup {
     __nv_bfloat16*       C[PF_QGROUP_MAX];
     int                  N[PF_QGROUP_MAX];
     int                  first[PF_QGROUP_MAX];   // prefix sum of each group's tile count
+    int                  poff[PF_QGROUP_MAX];    // split-K: base of each group in `partials`
     int                  ngroup;
 };
 
@@ -519,28 +520,30 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
     __nv_bfloat16* C = C_arg;
     int N = N_arg;
     int xtile = blockIdx.x;
+    int grp = 0;
     if (GROUPED) {
-        int g = 0;
         #pragma unroll
         for (int i = 1; i < PF_QGROUP_MAX; i++)
-            if (i < gd.ngroup && (int)blockIdx.x >= gd.first[i]) g = i;
-        W_q = gd.W[g]; row_scale = gd.rs[g]; C = gd.C[g]; N = gd.N[g];
-        xtile = (int)blockIdx.x - gd.first[g];
+            if (i < gd.ngroup && (int)blockIdx.x >= gd.first[i]) grp = i;
+        W_q = gd.W[grp]; row_scale = gd.rs[grp]; C = gd.C[grp]; N = gd.N[grp];
+        xtile = (int)blockIdx.x - gd.first[grp];
     }
+    // Every group owns a disjoint [split][m][n] region of `partials`, so a grouped split-K launch
+    // needs its base here -- the one thing that kept the grouped launch from splitting.
+    const size_t pbase = GROUPED ? (size_t)gd.poff[grp] : 0;
     const int n0  = xtile * QM_BN;
     const int nsb = K >> 8;
 
     __shared__ __align__(16) signed char Bs[QM_BN][QM_LD];
     __shared__ __align__(16) signed char As[2][QM_BM][QM_BK];
-    __shared__ int s_tok[QM_BM];
 
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
     const int wm = warp & 3, wn = warp >> 2;
 
-    // Direct activation rows (no pair_tok gather): row r of this M-tile is global token p0 + r.
-    for (int r = tid; r < QM_BM; r += blockDim.x)
-        s_tok[r] = (r < M) ? (p0 + r) : -1;
+    // Direct activation rows: row r of this M-tile IS global token p0 + r, so it is computed in
+    // stageA rather than staged through smem (the pair_tok gather this kernel was cloned from is
+    // what needed a table). Saves 512 B of smem and the barrier that published it.
 
     // Decode assignment: 4 threads per weight row, one 64-value sub-block pair (j64) each.
     const int dr = tid >> 2, dj = tid & 3;
@@ -559,14 +562,13 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
     auto stageA = [&](int buf, int k0) {
         for (int idx = tid; idx < QM_BM * 2; idx += blockDim.x) {
             const int r = idx >> 1, c16 = (idx & 1) * 16;
-            const int arow = s_tok[r];
+            const int arow = (r < M) ? (p0 + r) : -1;
             qm_cp16(&As[buf][r][c16], &A_i8[(size_t)max(arow, 0) * K + k0 + c16],
                     arow >= 0 && (k0 + c16) < K);
         }
         __pipeline_commit();
     };
 
-    __syncthreads();          // s_tok published before stageA reads it
     const int sb_lo = SPLIT ? (int)blockIdx.z * sb_per_split : 0;
     const int sb_hi = SPLIT ? min(nsb, sb_lo + sb_per_split) : nsb;
     if (sb_lo >= sb_hi) return;
@@ -627,7 +629,7 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
                 if (rm < M && rn < N) {
                     const int p = p0 + rm;
                     if (SPLIT) {
-                        partials[(((size_t)blockIdx.z * Mtot) + p) * N + rn] = Cs[warp * 256 + el];
+                        partials[pbase + (((size_t)blockIdx.z * Mtot) + p) * N + rn] = Cs[warp * 256 + el];
                     } else {
                         const float v = (float)Cs[warp * 256 + el] * sx[p] * row_scale[rn];
                         C[(size_t)p * N + rn] = __float2bfloat16(v);
@@ -693,6 +695,42 @@ __global__ void pf_dense_splitk_reduce_kernel(const int* __restrict__ partials,
     C[idx] = __float2bfloat16((float)acc * sx[m] * row_scale[n]);
 }
 
+// Grouped split-K reduce. One launch covers every group: the flattened column picks the group
+// from the same tile prefix sum the GEMM prologue uses, so no per-group reduce launches are needed.
+__global__ void pf_dense_splitk_reduce_group_kernel(const int* __restrict__ partials,
+                                                    const float* __restrict__ sx,
+                                                    PfQGroup gd, int Mtot, int ncol, int splits) {
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)Mtot * (size_t)ncol) return;
+    const int m    = (int)(idx / (size_t)ncol);
+    const int rest = (int)(idx - (size_t)m * (size_t)ncol);
+    int g = 0;
+#pragma unroll
+    for (int i = 1; i < PF_QGROUP_MAX; i++)
+        if (i < gd.ngroup && rest >= gd.first[i] * QM_BN) g = i;
+    const int n = rest - gd.first[g] * QM_BN;
+    const int N = gd.N[g];
+    const int* base = partials + (size_t)gd.poff[g];
+    int acc = 0;
+    for (int s = 0; s < splits; s++) acc += base[((size_t)s * Mtot + m) * N + n];
+    gd.C[g][(size_t)m * N + n] = __float2bfloat16((float)acc * sx[m] * gd.rs[g][n]);
+}
+
+// K slices per launch. Shared by the single and grouped launchers so both fan out the same way.
+static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int partials_splits) {
+    static int sk_env = -1;
+    if (sk_env < 0) { const char* e = getenv("SPARKINFER_MUSE_QB_SPLITK"); sk_env = e ? atoi(e) : -2; }
+    int splits = 1;
+    if (have_partials && partials_splits > 1 && mtiles == 1 && sk_env != 0) {
+        const int nsb = K >> 8;
+        splits = (sk_env > 0) ? sk_env : (QM_TARGET_BLOCKS + ntiles - 1) / ntiles;
+        if (splits > partials_splits) splits = partials_splits;
+        if (splits > nsb / 2) splits = nsb / 2;
+        if (splits < 1) splits = 1;
+    }
+    return splits;
+}
+
 // Dense fused-decode int8 GEMM (single weight, no routing). See pf_dense_gemm_qi8_kernel_g.
 bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const float* sx,
                                    const void* W_q, const float* row_scale, void* C_bf16,
@@ -710,16 +748,7 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
     // Split K only when the plain grid leaves the device idle. With more than one M-tile the grid
     // already fans out over M and a split would only add the reduce pass. Each slice must own whole
     // super-blocks, at least 2, or the per-block prologue dominates it.
-    static int sk_env = -1;
-    if (sk_env < 0) { const char* e = getenv("SPARKINFER_MUSE_QB_SPLITK"); sk_env = e ? atoi(e) : -2; }
-    int splits = 1;
-    if (partials && partials_splits > 1 && mtiles == 1 && sk_env != 0) {
-        const int nsb = K >> 8;
-        splits = (sk_env > 0) ? sk_env : (QM_TARGET_BLOCKS + ntiles - 1) / ntiles;
-        if (splits > partials_splits) splits = partials_splits;
-        if (splits > nsb / 2) splits = nsb / 2;
-        if (splits < 1) splits = 1;
-    }
+    int splits = qm_pick_splits(ntiles, K, mtiles, partials != nullptr, partials_splits);
     if (splits > 1) {
         const int nsb_all = K >> 8;
         const int sb_per_split = (nsb_all + splits - 1) / splits;
@@ -757,7 +786,8 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
 bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8, const float* sx,
                                          const void* const* W_q, const float* const* row_scale,
                                          void* const* C_bf16, const int* N, int ngroup,
-                                         int M, int K, cudaStream_t stream) {
+                                         int M, int K, cudaStream_t stream,
+                                         int* partials, int partials_splits, size_t partials_cap) {
     if (!pfm_moe_gemm_qi8_supported(ggml_type)) return false;
     if (ngroup <= 0 || ngroup > PF_QGROUP_MAX || M <= 0) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;
@@ -773,7 +803,45 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
         d.first[i] = tiles;
         tiles += N[i] / QM_BN;
     }
-    dim3 grid(tiles, (M + QM_BM - 1) / QM_BM);
+    const int mtiles = (M + QM_BM - 1) / QM_BM;
+
+    // The grouped launch is the one the K split never reached, and at M=128 it is also the emptiest:
+    // q+gate+k+v is 136 tiles of a 510-block device, a quarter of one wave for the full K. Splitting
+    // it needs only the per-group base above; the arithmetic is the same exact int32 sum, so the
+    // result stays bit-identical. SPARKINFER_MUSE_GROUP_SPLITK=0 restores the single-slice launch.
+    static int gsk_env = -1;
+    if (gsk_env < 0) { const char* e = getenv("SPARKINFER_MUSE_GROUP_SPLITK"); gsk_env = e ? atoi(e) : 1; }
+    int splits = gsk_env == 0 ? 1
+                              : qm_pick_splits(tiles, K, mtiles, partials != nullptr, partials_splits);
+    // The caller sizes `partials` for one projection at a time; a group needs the sum of its
+    // widths, so clamp the slice count to what actually fits rather than trusting it.
+    int ncol_all = 0;
+    for (int i = 0; i < ngroup; i++) ncol_all += N[i];
+    while (splits > 1 && (size_t)splits * (size_t)M * (size_t)ncol_all > partials_cap) splits--;
+    if (splits > 1) {
+        const int nsb_all = K >> 8;
+        const int sb_per_split = (nsb_all + splits - 1) / splits;
+        // Same guard the single launcher documents: derive the launch count back from the slice
+        // size so every launched slice owns at least one super-block, or the reduce sums memory
+        // that was never written.
+        splits = (nsb_all + sb_per_split - 1) / sb_per_split;
+        if (splits > 1) {
+            int off = 0;
+            for (int i = 0; i < ngroup; i++) { d.poff[i] = off; off += splits * M * N[i]; }
+            dim3 grid(tiles, mtiles, splits);
+            if (ggml_type == QMQ_Q4_K)
+                pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, true, true><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split);
+            else
+                pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, true, true><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split);
+            const size_t total = (size_t)M * (size_t)tiles * QM_BN;
+            pf_dense_splitk_reduce_group_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
+                partials, sx, d, M, tiles * QM_BN, splits);
+            return true;
+        }
+    }
+    dim3 grid(tiles, mtiles);
     if (ggml_type == QMQ_Q4_K)
         pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, true><<<grid, 256, 0, stream>>>(A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d);
     else

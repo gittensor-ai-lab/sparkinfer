@@ -271,8 +271,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // M-tile (N <= QM_BM = 128): beyond that the plain grid already fans out over M, and the buffer
     // would scale with N. 8 * 128 * 19968 * 4 B = 82 MB, and only for Muse.
     constexpr int QB_SPLITS = 8;
+    const size_t qb_partials_cap = (size_t)QB_SPLITS * (size_t)N * (size_t)maxNO;
     int* qb_partials = (c.muse_glimmer && use_i8 && N <= 128)
-        ? a8.alloc<int>((size_t)QB_SPLITS * (size_t)N * (size_t)maxNO) : nullptr;
+        ? a8.alloc<int>(qb_partials_cap) : nullptr;
     // Muse Glimmer split-K partials for the skinny projections. launch_prefill_gemm_i8 puts one
     // 128x128 output tile in a block, so Muse's narrow n_out (attn k/v = 256 -> TWO blocks, q and
     // the q-gate = 4096 -> 32) leaves the device almost empty: measured on an RTX 5090 the 2-block
@@ -587,6 +588,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     }();
     const bool muse_group = c.muse_glimmer &&
         [] { const char* e = getenv("SPARKINFER_MUSE_PREFILL_GROUP"); return !(e && e[0] == '0'); }();
+    // SPARKINFER_MUSE_FFN_GROUP=0 keeps ffn gate/up as two launches (A/B).
+    const bool muse_ffn_group = c.muse_glimmer &&
+        [] { const char* e = getenv("SPARKINFER_MUSE_FFN_GROUP"); return !(e && e[0] == '0'); }();
+    // SPARKINFER_MUSE_GROUP_SUBSET=0 goes back to grouping only when all four projections share a
+    // type, which is the all-or-nothing test this replaces (A/B).
+    const bool muse_gsubset =
+        [] { const char* e = getenv("SPARKINFER_MUSE_GROUP_SUBSET"); return !(e && e[0] == '0'); }();
     auto proj_fused = [&](const bf16* A, const void* W, int wtype, const float* rs,
                           bf16* C, int n_out, int K, int rows = 0) {
         const int R = rows > 0 ? rows : N;
@@ -686,25 +694,39 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 // they cost four full CTA-durations, two of which carry four CTAs of work. One
                 // grid for all four collapses that to one. Bit-identical per output tile.
                 // SPARKINFER_MUSE_PREFILL_GROUP=0 restores the four separate launches.
-                bool grouped = false;
+                // Group whichever of the four share the anchor type instead of demanding that all
+                // four match: this GGUF gives half its layers a Q6_K attn_v, and the all-or-nothing
+                // test dropped every one of those layers back to four separate launches -- q and
+                // gate at 64 tiles, k at 4. Anything left out (or unsupported) still goes through
+                // proj_fused, the same path it took before, so its result is unchanged.
+                const void* Wa[4]; const float* rsa[4]; void* Ca[4]; int na[4];
+                bool inq = false, ing = false, ink = false, inv = false;
+                int ng = 0;
                 if (muse_group && muse_qb && use_i8 &&
-                    w.wq_rs && w.wgate_rs && w.wk_rs && w.wv_rs &&
-                    w.wq_type == w.wgate_type && w.wq_type == w.wk_type && w.wq_type == w.wv_type &&
                     kernels::pfm_moe_gemm_qi8_supported(w.wq_type)) {
-                    const void* Wp[4]  = { w.wq, w.wgate, w.wk, w.wv };
-                    const float* rsp[4] = { w.wq_rs, w.wgate_rs, w.wk_rs, w.wv_rs };
-                    void* Cp[4]        = { qb, qg, kf, vf };
-                    const int nout[4]  = { qdim, qdim, kvdim, kvdim };
+                    const int at = w.wq_type;
+                    auto take = [&](const void* W, int t, const float* rs, void* C, int n, bool& in) {
+                        if (!W || !rs || t != at) return;
+                        Wa[ng] = W; rsa[ng] = rs; Ca[ng] = C; na[ng] = n; ng++; in = true;
+                    };
+                    take(w.wq,    w.wq_type,    w.wq_rs,    qb, qdim,  inq);
+                    take(w.wgate, w.wgate_type, w.wgate_rs, qg, qdim,  ing);
+                    take(w.wk,    w.wk_type,    w.wk_rs,    kf, kvdim, ink);
+                    take(w.wv,    w.wv_type,    w.wv_rs,    vf, kvdim, inv);
+                    if (!muse_gsubset && ng != 4) { ng = 0; inq = ing = ink = inv = false; }
+                }
+                bool grouped = false;
+                if (ng >= 2) {
                     quant_a_i8(xn, N, H);
                     grouped = kernels::launch_prefill_gemm_qi8_dense_group(
-                        w.wq_type, A_i8, sx, Wp, rsp, Cp, nout, 4, N, H, st);
+                        w.wq_type, A_i8, sx, Wa, rsa, Ca, na, ng, N, H, st,
+                        qb_partials, QB_SPLITS, qb_partials_cap);
                 }
-                if (!grouped) {
-                proj_fused(xn, w.wq,    w.wq_type,    w.wq_rs,    qb, qdim,  H);
-                proj_fused(xn, w.wgate, w.wgate_type, w.wgate_rs, qg, qdim,  H);
-                proj_fused(xn, w.wk,    w.wk_type,    w.wk_rs,    kf, kvdim, H);
-                proj_fused(xn, w.wv,    w.wv_type,    w.wv_rs,    vf, kvdim, H);
-                }
+                if (!grouped) { inq = ing = ink = inv = false; }
+                if (!inq) proj_fused(xn, w.wq,    w.wq_type,    w.wq_rs,    qb, qdim,  H);
+                if (!ing) proj_fused(xn, w.wgate, w.wgate_type, w.wgate_rs, qg, qdim,  H);
+                if (!ink) proj_fused(xn, w.wk,    w.wk_type,    w.wk_rs,    kf, kvdim, H);
+                if (!inv) proj_fused(xn, w.wv,    w.wv_type,    w.wv_rs,    vf, kvdim, H);
             } else {
                 proj(xn, w.wq, w.wq_type, b8, wide,  H);             // qraw = [q|gate] per head
                 proj(xn, w.wk, w.wk_type, kf, kvdim, H);
@@ -806,8 +828,27 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         kernels::launch_prefill_gemm_i8(A_i8, ffn_Wd_i8, sx, ffn_swd,
                                                         ao + (size_t)fo * H, fn, H, ffn, st);
                 } else {
-                    proj_fused(hn_c, w.gate_q, w.gate_qtype, w.gate_rs, ffg, ffn, H, fn);
-                    proj_fused(hn_c, w.up_q,   w.up_qtype,   w.up_rs,   ffu, ffn, H, fn);
+                    // gate and up read the same hn chunk over the same K, so they are one grid for
+                    // the same reason q/gate/k/v are: two 312-tile launches each leave a partial
+                    // wave on a 510-block device, and one 624-tile launch leaves only one.
+                    // SPARKINFER_MUSE_FFN_GROUP=0 restores the two launches (A/B).
+                    bool ffn_grouped = false;
+                    if (muse_ffn_group && muse_qb && use_i8 && w.gate_rs && w.up_rs &&
+                        w.gate_qtype == w.up_qtype &&
+                        kernels::pfm_moe_gemm_qi8_supported(w.gate_qtype)) {
+                        const void*  Wf[2]  = { w.gate_q, w.up_q };
+                        const float* rsf[2] = { w.gate_rs, w.up_rs };
+                        void*        Cf[2]  = { ffg, ffu };
+                        const int    nf[2]  = { ffn, ffn };
+                        quant_a_i8(hn_c, fn, H);
+                        ffn_grouped = kernels::launch_prefill_gemm_qi8_dense_group(
+                            w.gate_qtype, A_i8, sx, Wf, rsf, Cf, nf, 2, fn, H, st,
+                            qb_partials, QB_SPLITS, qb_partials_cap);
+                    }
+                    if (!ffn_grouped) {
+                        proj_fused(hn_c, w.gate_q, w.gate_qtype, w.gate_rs, ffg, ffn, H, fn);
+                        proj_fused(hn_c, w.up_q,   w.up_qtype,   w.up_rs,   ffu, ffn, H, fn);
+                    }
                     if (use_i8) {
                         // Same fused SwiGLU + per-row int8 quantize the long-ctx ffn_i8 branch
                         // runs (bit-identical to swiglu-then-quantize; both bf16-round first) --
