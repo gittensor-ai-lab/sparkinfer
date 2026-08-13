@@ -1274,12 +1274,15 @@ static int qm_uncap_splits() {
 
 // Minimum super-blocks a slice must own. Removing the plane cap alone is not the answer: it lets a
 // shallow-K launch be cut until each block holds almost no K, and then the per-block prologue and
-// the atomic epilogue cost more than the extra parallelism buys. Measured at M=128 -- ffn_down
-// (nsb=78) gains 5.3% going 8 -> 20 slices, while q/gate/k/v (nsb=26) LOSES 0.6% going 7 -> 13.
-// The floor is per-slice work, not a fraction of nsb.
+// the atomic epilogue cost more than the extra parallelism buys. Re-sweeping the complete
+// prefill@128 path after zero-on-read showed that a five-super-block floor is the stable balance:
+// alternating 9-repetition medians on an RTX 5090 were 3646.76/3655.41 pp at 5 versus
+// 3581.87/3592.25 pp at 4. The deeper FFN projections still receive extra slices; the shallow
+// q/gate/k/v projections avoid paying another CTA prologue for too little K. The floor is
+// per-slice work, not a fraction of nsb.
 static int qm_min_sb_per_split() {
     static int e = -1;
-    if (e < 0) { const char* v = getenv("SPARKINFER_MUSE_QB_MINSB"); e = v ? atoi(v) : 4; }
+    if (e < 0) { const char* v = getenv("SPARKINFER_MUSE_QB_MINSB"); e = v ? atoi(v) : 5; }
     return e < 1 ? 1 : e;
 }
 
@@ -1317,10 +1320,8 @@ static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int
         if (budget > partials_splits) budget = partials_splits;
         if (budget > nsb / 2) budget = nsb / 2;
         if (one_plane) {
-            // Extra slices are only worth taking while each still owns real K. Measured at M=128:
-            // ffn_down (nsb=78) goes 8 -> 16 slices, 4+ super-blocks each, and its launch drops
-            // 5.3%; q/gate/k/v (nsb=26) cut to 2 super-blocks a slice LOSES 0.6%. So bound the
-            // extra slices by the work floor and never go below what the budget already gave.
+            // Extra slices are only worth taking while each still owns real K. Bound them by the
+            // measured work floor and never go below what the caller's plane budget already gave.
             int deep = splits;
             const int mn = nsb / qm_min_sb_per_split();
             if (deep > mn) deep = mn;
