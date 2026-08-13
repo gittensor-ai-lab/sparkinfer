@@ -41,6 +41,7 @@
 //   * int32 WMMA accumulation is exact, and the epilogue applies sx * row_scale in the same order.
 // ============================================================================
 #include "sparkinfer/kernels/prefill_moe_q.h"
+#include "sparkinfer/kernels/prefill_fp8.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -66,6 +67,14 @@ constexpr int QM_BN = 64;     // weight rows (output channels) per block
 constexpr int QM_SB = 256;    // values per GGUF super-block == the B-stage K depth
 constexpr int QM_BK = 32;     // WMMA K step
 constexpr int QM_LD = QM_SB + 16;   // Bs row stride: 16B-aligned for WMMA, +16 breaks bank conflicts
+// Weight rows per block for the DENSE (non-routed) fused GEMM only -- the routed MoE kernels keep
+// QM_BN. MEASURED, do not "optimize" this to 128: every block re-stages the whole A tile for its
+// own N slice, so A traffic is (n_out / BND) * M * K and at muse's shapes that is 968 MB per layer
+// against 272 MB of actual Q4_K weight -- 78% of everything the GEMM reads. Doubling BND halves
+// that and still LOSES 3570 -> 3288 pp, because 43008 B of Bs only leaves two resident blocks.
+// This kernel alternates a decode phase with an MMA phase and lives entirely on having a third
+// block to run the other phase; bytes are not what it is short of.
+constexpr int QM_BND = 64;
 
 template <int QT>
 __device__ __forceinline__ constexpr int qm_bs() {
@@ -88,6 +97,49 @@ __device__ __forceinline__ void qm_scale_min(const unsigned char* sc, int j, int
 __device__ __forceinline__ void qm_cp16(void* dst, const void* src, bool pred) {
     if (pred) __pipeline_memcpy_async(dst, src, 16);
     else      *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
+}
+
+// A Q4_K value's int8 depends only on its 4-bit nibble and its 32-value sub-block's (ds, dm), so a
+// sub-block has just SIXTEEN distinct results -- and the per-value decode was computing 32 of them.
+// Tabulate the 16 once, packed one per byte across four registers.
+//
+// Why this is the lever: cuobjdump -sass on the per-value form counts 64 I2FP + 65 F2I per 64
+// values decoded, and format conversion is quarter-rate on this part, so those two instructions
+// alone cost more than every other instruction in the decode combined. Here `n` is a compile-time
+// constant of the unrolled loop, so (float)n folds away and the I2F disappears entirely; the F2I
+// survives but is paid 16 times per 32 values instead of 32.
+//
+// BIT-IDENTICAL by construction: entry n is the exact expression the per-value path evaluated for
+// nibble n -- same ds * (float)n - dm, same * inv, same roundf, same truncating cast to a byte.
+__device__ __forceinline__ void qm_lut16(float ds, float dm, float inv, unsigned* __restrict__ t) {
+#pragma unroll
+    for (int g = 0; g < 4; g++) {
+        unsigned wv = 0;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int q = (int)roundf((ds * (float)(g * 4 + j) - dm) * inv);
+            wv |= ((unsigned)q & 0xFFu) << (8 * j);
+        }
+        t[g] = wv;
+    }
+}
+
+// Look up FOUR table entries at once and return them already packed as four int8, which is the
+// layout the shared-memory store wants -- so this also absorbs the per-value shift-and-or the old
+// loop used to assemble its output word. `nib` carries the four 4-bit indices one per byte.
+//
+//   w    : | .. |n3| .. |n2| .. |n1| .. |n0|  ->  byte0 = n1:n0, byte2 = n3:n2
+//   s    : the four indices packed one per NIBBLE, which is what prmt's selector wants
+//   p01  : entries 0-7 gathered by (n & 7);  p23: the same selector against entries 8-15
+//   last : picks p01 or p23 per byte by adding 4 to the selector nibble wherever n >= 8
+// Ten integer instructions for four values, none of them float and none a conversion.
+__device__ __forceinline__ unsigned qm_gather4(const unsigned* __restrict__ t, unsigned nib) {
+    const unsigned w = nib | (nib >> 4);
+    const unsigned s = __byte_perm(w, 0u, 0x4420u);
+    const unsigned sl = s & 0x7777u;
+    const unsigned p01 = __byte_perm(t[0], t[1], sl);
+    const unsigned p23 = __byte_perm(t[2], t[3], sl);
+    return __byte_perm(p01, p23, 0x3210u | ((s >> 1) & 0x4444u));
 }
 
 // Decode the 64 values of sub-block pair `j64` of one super-block into int8.
@@ -115,6 +167,33 @@ __device__ __forceinline__ void qm_decode_j64(const unsigned char* __restrict__ 
     const unsigned char* qb = qs + j64 * 32;
     const unsigned char* qh = blk + 16;               // Q5_K high-bit plane (unused for Q4_K)
     const int shl = 2 * j64, shh = 2 * j64 + 1;
+
+    // Q4_K: 4 bits per value, so the whole sub-block collapses to a 16-entry table (see qm_lut16).
+    // Q5_K's 5 bits would need 32 entries for 32 values -- no amortization -- so it keeps the
+    // per-value decode below, unchanged.
+    if (QT == QMQ_Q4_K) {
+        unsigned ta[4], tb[4];
+        qm_lut16(ds0, dm0, inv, ta);
+        qm_lut16(ds1, dm1, inv, tb);
+#pragma unroll
+        for (int c = 0; c < 2; c++) {
+            const uint4 qv = *reinterpret_cast<const uint4*>(qb + c * 16);
+            uint4 vlo, vhi;
+#pragma unroll
+            for (int w = 0; w < 4; w++) {
+                const unsigned qwd = (w == 0) ? qv.x : (w == 1) ? qv.y : (w == 2) ? qv.z : qv.w;
+                const unsigned alo = qm_gather4(ta, qwd & 0x0F0F0F0Fu);
+                const unsigned ahi = qm_gather4(tb, (qwd >> 4) & 0x0F0F0F0Fu);
+                if (w == 0)      { vlo.x = alo; vhi.x = ahi; }
+                else if (w == 1) { vlo.y = alo; vhi.y = ahi; }
+                else if (w == 2) { vlo.z = alo; vhi.z = ahi; }
+                else             { vlo.w = alo; vhi.w = ahi; }
+            }
+            *reinterpret_cast<uint4*>(dst + j64 * 64 + c * 16) = vlo;
+            *reinterpret_cast<uint4*>(dst + j64 * 64 + 32 + c * 16) = vhi;
+        }
+        return;
+    }
     // One 16-byte load per 16 values and one 16-byte store, for both nibble halves. 16 B is the
     // widest load the block strides permit and they are all aligned: the Q4_K/Q5_K block sizes
     // (144/176) and the qs/qh offsets (16/48) and j64*32 are every one a multiple of 16, on a
@@ -493,48 +572,62 @@ struct PfQGroup {
     int                  ngroup;
 };
 
-// SPLIT=true: blockIdx.z owns a slice of the K super-blocks and writes its raw int32 tile to
-// `partials`; pf_dense_splitk_reduce_kernel sums the slices and applies sx*row_scale once. int32
-// accumulation is exact and associative, so the summed value is BIT-IDENTICAL to the unsplit
-// kernel -- only the block count changes.
+// SPLIT=true: one blockIdx dimension owns a slice of the K super-blocks and contributes its raw
+// int32 tile to `partials`; pf_dense_splitk_reduce_kernel applies sx*row_scale once. int32
+// accumulation is exact and associative, so the total is BIT-IDENTICAL to the unsplit kernel --
+// only the block count and the summation order change.
 //
 // At prefill's M=128 grid.y collapses to 1, leaving a grid of just N/QM_BN blocks: 104 for the
 // 6656-wide o/down, 312 for the 19968-wide FFN pair, against ~510 block slots on a 5090. ncu on
 // the unsplit kernel: 0.13 waves/SM, 16.7% achieved occupancy, DRAM 6.0%, SM throughput 13.1% --
 // the kernel is neither bandwidth- nor compute-bound, it simply is not on the machine.
-// Only the UNGROUPED form splits: a grouped launch resolves a different N/C per output tile, so
-// its partials would need a per-group offset table, and it is the smallest of the five launches.
+//
+// HOW THE SLICES COMBINE. `atomic_acc=0` is the original scheme: each slice STORES its own tile
+// into a private [split][m][n] plane and the reduce pass sums the planes. That plane array is
+// `splits` times the output, and at muse's shapes it is the single largest DRAM stream in the
+// whole prefill -- 294 MB per layer written and read back, against 272 MB of actual Q4_K weights.
+// `atomic_acc=1` (the default) instead red.global.add's into ONE [m][n] accumulator, so the
+// footprint drops by `splits` and the reduce degenerates to a scale-and-store. Combined with the
+// K slice living on blockIdx.x -- so all slices of a tile are dispatched back-to-back rather than
+// a whole grid apart -- a tile's 32 KB of accumulator is written, re-hit and consumed inside L2.
+// Integer adds are exact and order-independent, so the accumulated value is the same either way.
 template <int QT, bool GROUPED, bool SPLIT = false>
 __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
         const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
         __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd,
-        int* __restrict__ partials = nullptr, int sb_per_split = 0) {
+        int* __restrict__ partials = nullptr, int sb_per_split = 0, int atomic_acc = 0) {
     using namespace nvcuda;
     constexpr int BS = qm_bs<QT>();
-    const int p0 = blockIdx.y * QM_BM;
+    // Split-K takes blockIdx.x for the K slice and shifts the tile/M indices up one dimension.
+    // Blocks are dispatched x-fastest, so the slices that share an output tile now issue together
+    // and their accumulator lines stay resident between them.
+    const int zsl  = SPLIT ? (int)blockIdx.x : 0;
+    const int btil = SPLIT ? (int)blockIdx.y : (int)blockIdx.x;
+    const int bmt  = SPLIT ? (int)blockIdx.z : (int)blockIdx.y;
+    const int p0 = bmt * QM_BM;
     const int M  = min(QM_BM, Mtot - p0);
     if (M <= 0) return;
     const unsigned char* W_q = W_q_arg;
     const float* row_scale = row_scale_arg;
     __nv_bfloat16* C = C_arg;
     int N = N_arg;
-    int xtile = blockIdx.x;
+    int xtile = btil;
     int grp = 0;
     if (GROUPED) {
         #pragma unroll
         for (int i = 1; i < PF_QGROUP_MAX; i++)
-            if (i < gd.ngroup && (int)blockIdx.x >= gd.first[i]) grp = i;
+            if (i < gd.ngroup && btil >= gd.first[i]) grp = i;
         W_q = gd.W[grp]; row_scale = gd.rs[grp]; C = gd.C[grp]; N = gd.N[grp];
-        xtile = (int)blockIdx.x - gd.first[grp];
+        xtile = btil - gd.first[grp];
     }
     // Every group owns a disjoint [split][m][n] region of `partials`, so a grouped split-K launch
     // needs its base here -- the one thing that kept the grouped launch from splitting.
     const size_t pbase = GROUPED ? (size_t)gd.poff[grp] : 0;
-    const int n0  = xtile * QM_BN;
+    const int n0  = xtile * QM_BND;
     const int nsb = K >> 8;
 
-    __shared__ __align__(16) signed char Bs[QM_BN][QM_LD];
+    __shared__ __align__(16) signed char Bs[QM_BND][QM_LD];
     __shared__ __align__(16) signed char As[2][QM_BM][QM_BK];
 
     const int tid = threadIdx.x;
@@ -569,7 +662,7 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
         __pipeline_commit();
     };
 
-    const int sb_lo = SPLIT ? (int)blockIdx.z * sb_per_split : 0;
+    const int sb_lo = SPLIT ? zsl * sb_per_split : 0;
     const int sb_hi = SPLIT ? min(nsb, sb_lo + sb_per_split) : nsb;
     if (sb_lo >= sb_hi) return;
     const int kend = sb_hi << 8;          // first K past this block's slice
@@ -629,7 +722,10 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
                 if (rm < M && rn < N) {
                     const int p = p0 + rm;
                     if (SPLIT) {
-                        partials[pbase + (((size_t)blockIdx.z * Mtot) + p) * N + rn] = Cs[warp * 256 + el];
+                        if (atomic_acc)
+                            atomicAdd(&partials[pbase + (size_t)p * N + rn], Cs[warp * 256 + el]);
+                        else
+                            partials[pbase + (((size_t)zsl * Mtot) + p) * N + rn] = Cs[warp * 256 + el];
                     } else {
                         const float v = (float)Cs[warp * 256 + el] * sx[p] * row_scale[rn];
                         C[(size_t)p * N + rn] = __float2bfloat16(v);
@@ -707,13 +803,21 @@ __global__ void pf_dense_splitk_reduce_group_kernel(const int* __restrict__ part
     int g = 0;
 #pragma unroll
     for (int i = 1; i < PF_QGROUP_MAX; i++)
-        if (i < gd.ngroup && rest >= gd.first[i] * QM_BN) g = i;
-    const int n = rest - gd.first[g] * QM_BN;
+        if (i < gd.ngroup && rest >= gd.first[i] * QM_BND) g = i;
+    const int n = rest - gd.first[g] * QM_BND;
     const int N = gd.N[g];
     const int* base = partials + (size_t)gd.poff[g];
     int acc = 0;
     for (int s = 0; s < splits; s++) acc += base[((size_t)s * Mtot + m) * N + n];
     gd.C[g][(size_t)m * N + n] = __float2bfloat16((float)acc * sx[m] * gd.rs[g][n]);
+}
+
+// Accumulate the K slices with int32 atomics into ONE [m][n] plane instead of storing `splits`
+// private planes and summing them. SPARKINFER_MUSE_QB_ATOMIC=0 restores the plane array (A/B).
+static int qm_atomic_acc() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_MUSE_QB_ATOMIC"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e;
 }
 
 // K slices per launch. Shared by the single and grouped launchers so both fan out the same way.
@@ -739,10 +843,10 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
     if (!pfm_moe_gemm_qi8_supported(ggml_type)) return false;   // Q4_K / Q5_K only
     if (!row_scale || M <= 0) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;         // whole super-blocks only
-    if (N <= 0 || (N % QM_BN) != 0) return false;               // 64-aligned output width
+    if (N <= 0 || (N % QM_BND) != 0) return false;               // tile-aligned output width
     auto* C = reinterpret_cast<__nv_bfloat16*>(C_bf16);
     const auto* W = reinterpret_cast<const unsigned char*>(W_q);
-    const int ntiles = (N + QM_BN - 1) / QM_BN;
+    const int ntiles = (N + QM_BND - 1) / QM_BND;
     const int mtiles = (M + QM_BM - 1) / QM_BM;
 
     // Split K only when the plain grid leaves the device idle. With more than one M-tile the grid
@@ -759,16 +863,21 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
         // own at least one super-block.
         splits = (nsb_all + sb_per_split - 1) / sb_per_split;
         if (splits > 1) {
-            dim3 grid(ntiles, mtiles, splits);
+            const int atomic = qm_atomic_acc();
+            const size_t total = (size_t)M * (size_t)N;
+            // The atomic accumulator must start at zero; one [m][n] plane, not `splits` of them.
+            if (atomic) cudaMemsetAsync(partials, 0, total * sizeof(int), stream);
+            dim3 grid(splits, ntiles, mtiles);
             if (ggml_type == QMQ_Q4_K)
                 pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, false, true><<<grid, 256, 0, stream>>>(
-                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split);
+                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, atomic);
             else
                 pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, false, true><<<grid, 256, 0, stream>>>(
-                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split);
-            const size_t total = (size_t)M * (size_t)N;
+                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, atomic);
+            // With the atomic accumulator every slice has already been summed, so the reduce pass
+            // reads the single plane (splits=1 indexes exactly the [m][n] the atomics wrote).
             pf_dense_splitk_reduce_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
-                partials, sx, row_scale, C, M, N, splits);
+                partials, sx, row_scale, C, M, N, atomic ? 1 : splits);
             return true;
         }
     }
@@ -787,7 +896,8 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
                                          const void* const* W_q, const float* const* row_scale,
                                          void* const* C_bf16, const int* N, int ngroup,
                                          int M, int K, cudaStream_t stream,
-                                         int* partials, int partials_splits, size_t partials_cap) {
+                                         int* partials, int partials_splits, size_t partials_cap,
+                                         signed char* fuse_q, float* fuse_sx, int* out_fused) {
     if (!pfm_moe_gemm_qi8_supported(ggml_type)) return false;
     if (ngroup <= 0 || ngroup > PF_QGROUP_MAX || M <= 0) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;
@@ -795,13 +905,13 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
     d.ngroup = ngroup;
     int tiles = 0;
     for (int i = 0; i < ngroup; i++) {
-        if (!row_scale[i] || N[i] <= 0 || (N[i] % QM_BN) != 0) return false;
+        if (!row_scale[i] || N[i] <= 0 || (N[i] % QM_BND) != 0) return false;
         d.W[i]  = reinterpret_cast<const unsigned char*>(W_q[i]);
         d.rs[i] = row_scale[i];
         d.C[i]  = reinterpret_cast<__nv_bfloat16*>(C_bf16[i]);
         d.N[i]  = N[i];
         d.first[i] = tiles;
-        tiles += N[i] / QM_BN;
+        tiles += N[i] / QM_BND;
     }
     const int mtiles = (M + QM_BM - 1) / QM_BM;
 
@@ -814,10 +924,16 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
     int splits = gsk_env == 0 ? 1
                               : qm_pick_splits(tiles, K, mtiles, partials != nullptr, partials_splits);
     // The caller sizes `partials` for one projection at a time; a group needs the sum of its
-    // widths, so clamp the slice count to what actually fits rather than trusting it.
+    // widths, so clamp the slice count to what actually fits rather than trusting it. The atomic
+    // accumulator needs one plane whatever the slice count, so there it is a yes/no test.
+    const int atomic = qm_atomic_acc();
     int ncol_all = 0;
     for (int i = 0; i < ngroup; i++) ncol_all += N[i];
-    while (splits > 1 && (size_t)splits * (size_t)M * (size_t)ncol_all > partials_cap) splits--;
+    if (atomic) {
+        if ((size_t)M * (size_t)ncol_all > partials_cap) splits = 1;
+    } else {
+        while (splits > 1 && (size_t)splits * (size_t)M * (size_t)ncol_all > partials_cap) splits--;
+    }
     if (splits > 1) {
         const int nsb_all = K >> 8;
         const int sb_per_split = (nsb_all + splits - 1) / splits;
@@ -827,17 +943,30 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
         splits = (nsb_all + sb_per_split - 1) / sb_per_split;
         if (splits > 1) {
             int off = 0;
-            for (int i = 0; i < ngroup; i++) { d.poff[i] = off; off += splits * M * N[i]; }
-            dim3 grid(tiles, mtiles, splits);
+            const int planes = atomic ? 1 : splits;
+            for (int i = 0; i < ngroup; i++) { d.poff[i] = off; off += planes * M * N[i]; }
+            // Every group's plane is packed back to back from `partials`, so one memset covers them.
+            if (atomic) cudaMemsetAsync(partials, 0, (size_t)off * sizeof(int), stream);
+            dim3 grid(splits, tiles, mtiles);
             if (ggml_type == QMQ_Q4_K)
                 pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, true, true><<<grid, 256, 0, stream>>>(
-                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split);
+                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split, atomic);
             else
                 pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, true, true><<<grid, 256, 0, stream>>>(
-                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split);
-            const size_t total = (size_t)M * (size_t)tiles * QM_BN;
+                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split, atomic);
+            // The FFN's gate/up pair is consumed by nothing except the SwiGLU + int8 quantize that
+            // follows it, so when the caller asks for that, apply the scale inside it and never
+            // materialize gate/up as bf16 at all: 20.4 MB of DRAM and one launch per layer gone.
+            if (atomic && out_fused && fuse_q && ngroup == 2 && N[0] == N[1] &&
+                kernels::launch_prefill_swiglu_quant_i8_acc(
+                    partials + d.poff[0], partials + d.poff[1], sx, d.rs[0], d.rs[1],
+                    fuse_q, fuse_sx, M, N[0], stream)) {
+                *out_fused = 1;
+                return true;
+            }
+            const size_t total = (size_t)M * (size_t)tiles * QM_BND;
             pf_dense_splitk_reduce_group_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
-                partials, sx, d, M, tiles * QM_BN, splits);
+                partials, sx, d, M, tiles * QM_BND, atomic ? 1 : splits);
             return true;
         }
     }

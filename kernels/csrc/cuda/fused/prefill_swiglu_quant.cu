@@ -105,7 +105,79 @@ __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_reg_kernel(
             q[base + c] = (signed char)((s_warp[0] == 0.f) ? 0 : (int)roundf(hv[i] / d));
     }
 }
+
+// Same SwiGLU+quantize, fed straight from the split-K int32 accumulator instead of from a bf16
+// gate/up pair that a reduce pass had to materialize first. The grouped FFN GEMM leaves gate and up
+// as two int32 planes; the old sequence was reduce(scale->bf16, 10.2 MB written) then this kernel
+// (10.2 MB read back). Applying the scale here deletes that whole round trip -- per Muse Glimmer
+// layer, 20.4 MB of DRAM and one kernel launch.
+//
+// Bit-identical: `__float2bfloat16((float)acc * sxr[row] * rs[c])` is exactly what
+// pf_dense_splitk_reduce_group_kernel stored, so the SwiGLU sees the same bf16 values it saw
+// before, and everything downstream of that is the unchanged register-resident path.
+template <int MAXV>
+__global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_acc_kernel(
+        const int* __restrict__ acc_g, const int* __restrict__ acc_u,
+        const float* __restrict__ sxr, const float* __restrict__ rs_g,
+        const float* __restrict__ rs_u,
+        signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const size_t base = (size_t)row * cols;
+    const float sr = sxr[row];
+    __shared__ float s_warp[32];
+    float hv[MAXV];
+    float amax = 0.f;
+    #pragma unroll
+    for (int i = 0; i < MAXV; i++) {
+        const int c = threadIdx.x + i * 1024;
+        if (c < cols) {
+            const float g = __bfloat162float(__float2bfloat16((float)acc_g[base + c] * sr * rs_g[c]));
+            const float u = __bfloat162float(__float2bfloat16((float)acc_u[base + c] * sr * rs_u[c]));
+            hv[i] = __bfloat162float(__float2bfloat16(sq_silu(g) * u));
+            amax = fmaxf(amax, fabsf(hv[i]));
+        }
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, m));
+        if (threadIdx.x == 0) s_warp[0] = v;
+    }
+    __syncthreads();
+    const float d = (s_warp[0] == 0.f) ? 1.f : (s_warp[0] / 127.0f);
+    if (threadIdx.x == 0) scale[row] = d;
+    #pragma unroll
+    for (int i = 0; i < MAXV; i++) {
+        const int c = threadIdx.x + i * 1024;
+        if (c < cols)
+            q[base + c] = (signed char)((s_warp[0] == 0.f) ? 0 : (int)roundf(hv[i] / d));
+    }
+}
 } // namespace
+
+// Returns false when the row is too wide/narrow for the register-resident form, in which case the
+// caller must keep the reduce + separate SwiGLU.
+bool launch_prefill_swiglu_quant_i8_acc(const int* acc_g, const int* acc_u, const float* sxr,
+                                        const float* rs_g, const float* rs_u,
+                                        signed char* q, float* scale, int rows, int cols,
+                                        cudaStream_t stream) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_FFN_FUSE_ACC");
+        return !(e && e[0] == '0');
+    }();
+    const int nv = (cols + 1023) / 1024;
+    if (!on || cols < 2048 || nv > 20) return false;
+    if (nv <= 8)       pf_swiglu_quant_i8_acc_kernel<8><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols);
+    else if (nv <= 12) pf_swiglu_quant_i8_acc_kernel<12><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols);
+    else if (nv <= 16) pf_swiglu_quant_i8_acc_kernel<16><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols);
+    else               pf_swiglu_quant_i8_acc_kernel<20><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols);
+    return true;
+}
 
 void launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed char* q, float* scale,
                                     int rows, int cols, cudaStream_t stream) {

@@ -33,6 +33,14 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
 // Fused SwiGLU + per-row int8 quantize: q[r,:] = int8(silu(gate[r,:]) * up[r,:]) with
 // scale[r] = amax_c|.| / 127. Replaces launch_prefill_swiglu + launch_prefill_quantize_rows_i8 on
 // the ffn-wide intermediate (one block per row), removing its DRAM round-trip. Bit-identical.
+// SwiGLU + per-row int8 quantize fed directly from the grouped GEMM's split-K int32 accumulator,
+// skipping the reduce pass that would otherwise materialize gate/up as bf16 first. Returns false if
+// the shape is not eligible (caller keeps reduce + launch_prefill_swiglu_quant_i8).
+bool launch_prefill_swiglu_quant_i8_acc(const int* acc_g, const int* acc_u, const float* sxr,
+                                        const float* rs_g, const float* rs_u,
+                                        signed char* q, float* scale, int rows, int cols,
+                                        cudaStream_t stream);
+
 void launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed char* q, float* scale,
                                     int rows, int cols, cudaStream_t stream = nullptr);
 

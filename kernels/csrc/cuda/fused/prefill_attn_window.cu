@@ -486,15 +486,25 @@ __global__ void win_prefill_pure_bf16_kernel(
 
     for (int k0 = blk_rs; k0 <= last_q; k0 += TK) {
         const int tk = min(TK, last_q + 1 - k0);
-        for (int idx = threadIdx.x; idx < tk * HEAD_DIM; idx += blockDim.x) {
-            const int kk = idx / HEAD_DIM, d = idx - kk * HEAD_DIM;
+        // One 16-byte copy per thread instead of eight 2-byte ones -- and, more to the point, the
+        // paged-KV address math once per THREAD instead of once per element: `kpos / block_size` is
+        // a division by a runtime value (~20 instructions) and `block_table[blk]` is a dependent
+        // global load that has to land before the data load can even issue. The old loop paid both
+        // eight times per thread per tile. HEAD_DIM is a multiple of 8 and the pools are
+        // cudaMalloc'd, so every uint4 below is 16-byte aligned. Same bytes, same order.
+        constexpr int VPT = 8;                    // bf16 per uint4
+        constexpr int DCH = HEAD_DIM / VPT;       // uint4 chunks per key row
+        for (int idx = threadIdx.x; idx < tk * DCH; idx += blockDim.x) {
+            const int kk = idx / DCH, d = (idx - kk * DCH) * VPT;
             const int kpos = k0 + kk;
             const int blk = kpos / block_size, within = kpos - blk * block_size;
             const int phys = block_table[blk];
             const size_t ckt = (size_t)phys * block_size + within;
             const size_t off = (ckt * n_kv_heads + kv_head) * HEAD_DIM + d;
-            sK[idx] = k_pool[off];
-            sV[idx] = v_pool[off];
+            *reinterpret_cast<uint4*>(sK + (size_t)kk * HEAD_DIM + d) =
+                *reinterpret_cast<const uint4*>(k_pool + off);
+            *reinterpret_cast<uint4*>(sV + (size_t)kk * HEAD_DIM + d) =
+                *reinterpret_cast<const uint4*>(v_pool + off);
         }
         __syncthreads();
         if (active) {

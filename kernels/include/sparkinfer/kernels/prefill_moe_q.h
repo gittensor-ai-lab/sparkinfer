@@ -62,7 +62,11 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
                                          void* const* C_bf16, const int* N, int ngroup,
                                          int M, int K, cudaStream_t stream = nullptr,
                                          int* partials = nullptr, int partials_splits = 0,
-                                         size_t partials_cap = 0);
+                                         size_t partials_cap = 0,
+                                         // Fuse the FFN's SwiGLU + int8 quantize into the split-K
+                                         // epilogue: gate/up never become bf16. Sets *out_fused.
+                                         signed char* fuse_q = nullptr, float* fuse_sx = nullptr,
+                                         int* out_fused = nullptr);
 
 } // namespace kernels
 } // namespace sparkinfer
