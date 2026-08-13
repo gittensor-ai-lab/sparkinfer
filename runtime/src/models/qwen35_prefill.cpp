@@ -314,6 +314,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         return !(e && e[0] == '0');
     }();
     signed char* A_i8p = muse_apack ? a8.alloc<signed char>(a_i8_sz) : nullptr;
+    signed char* xn_i8 = (c.muse_glimmer && need_i8) ? a8.alloc<signed char>((size_t)N * H) : nullptr;
+    signed char* xn_i8p = (muse_apack && xn_i8) ? a8.alloc<signed char>((size_t)N * H) : nullptr;
+    float* xn_sx = xn_i8 ? a8.alloc<float>((size_t)N) : nullptr;
+    bool xn_quantized = false;
+    signed char* lm_q8 = a8.alloc<signed char>((size_t)H + 32);
+    float* lm_ad = a8.alloc<float>((size_t)(H >> 5) + 1);
+    float* lm_as = a8.alloc<float>((size_t)(H >> 5) + 1);
     signed char* W_i8 = need_i8 ? a8.alloc<signed char>(maxw) : nullptr;
     float* sx = need_i8 ? a8.alloc<float>(sx_n) : nullptr;
     float* sw = need_i8 ? a8.alloc<float>((size_t)maxNO) : nullptr;
@@ -357,6 +364,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     if (need_i8 && !a8.ok) {
         a8.free_all();
         A_i8p = nullptr;
+        xn_i8 = xn_i8p = nullptr;
+        xn_sx = nullptr;
         use_i8 = false;
         use_i8_ffn = false;
         use_i8_attn = false;
@@ -742,7 +751,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // emb_norm_ones is a constant-1.0 weight, so this is a pure normalization of the embedding.
     if (c.muse_glimmer && s.emb_norm_ones)
         kernels::launch_rmsnorm(x, (const bf16*)s.emb_norm_ones, x, N, H, eps, st);
-    kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, eps, st);
+    xn_quantized = c.muse_glimmer && xn_i8 && xn_sx &&
+        kernels::launch_rmsnorm_quant_i8(x, s.w.layers[0].input_norm, xn, xn_i8, xn_sx,
+                                         N, H, eps, st, xn_i8p);
+    if (!xn_quantized)
+        kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, eps, st);
 
     // MoE aux events: overlap path and/or tiny shared-gate hide on stream_k.
     cudaEvent_t moe_ev_up{}, moe_ev_down0{}, moe_ev_ready{}, moe_ev_sg{};
@@ -818,11 +831,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 }
                 bool grouped = false;
                 if (ng >= 2) {
-                    quant_a_i8(xn, N, H);
+                    const signed char* group_a = A_i8;
+                    const float* group_sx = sx;
+                    const signed char* group_pack = nullptr;
+                    if (xn_quantized) {
+                        group_a = xn_i8;
+                        group_sx = xn_sx;
+                        group_pack = xn_i8p;
+                    } else {
+                        quant_a_i8(xn, N, H);
+                        group_pack = apk();
+                    }
                     grouped = kernels::launch_prefill_gemm_qi8_dense_group(
-                        w.wq_type, A_i8, sx, Wa, rsa, Ca, na, ng, N, H, st,
+                        w.wq_type, group_a, group_sx, Wa, rsa, Ca, na, ng, N, H, st,
                         qb_partials, QB_SPLITS, qb_partials_cap,
-                        nullptr, nullptr, nullptr, apk());
+                        nullptr, nullptr, nullptr, group_pack);
                 }
                 if (!grouped) { inq = ing = ink = inv = false; }
                 if (!inq) proj_fused(xn, w.wq,    w.wq_type,    w.wq_rs,    qb, qdim,  H);
@@ -898,7 +921,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // attn_norm/ffn_norm/q_norm/k_norm -- mirrors the decode fix (qwen35.cpp:6d911d4).
             if (attn_acc)
                 kernels::launch_norm_then_add_acc(x, qb_partials, sx, w.wo_rs, w.post_attn_norm,
-                                                  h, N, H, 1e-8f, st);
+                                                  h, N, H, 1e-8f, st,
+                                                  kernels::pf_dense_zero_on_read());
             else
                 kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
             // hn's only consumer is the grouped FFN's row-quantize, so emit the int8 in the same
@@ -1049,7 +1073,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 // Same 1e-8 post_norm_eps as the post-attn sandwich norm above.
                 if (ffn_acc)
                     kernels::launch_norm_then_add_acc(h, qb_partials, sx, w.down_rs,
-                                                      w.post_ffn_norm, x, N, H, 1e-8f, st);
+                                                      w.post_ffn_norm, x, N, H, 1e-8f, st,
+                                                      kernels::pf_dense_zero_on_read());
                 else
                     kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
             } else if (!ffn_fused) {
@@ -1545,7 +1570,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         }
 
         const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
+        xn_quantized = c.muse_glimmer && xn_i8 && xn_sx &&
+            kernels::launch_rmsnorm_quant_i8(x, next_norm, xn, xn_i8, xn_sx,
+                                             N, H, eps, st, xn_i8p);
+        if (!xn_quantized)
+            kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
     }
 
     if (moe_overlap) {

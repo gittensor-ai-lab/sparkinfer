@@ -779,12 +779,12 @@ void launch_muse_sandwich_tail(const void* residual, const void* branch, const v
 // norm_then_add_kernel, so the fp32 reduction tree is unchanged. (Re-associating it is what sank
 // an earlier attempt at fusing these norms.)
 __global__ void norm_then_add_acc_kernel(const __nv_bfloat16* __restrict__ residual,
-                                         const int* __restrict__ acc,
+                                         int* __restrict__ acc,
                                          const float* __restrict__ sxr,
                                          const float* __restrict__ rs,
                                          const __nv_bfloat16* __restrict__ weight,
                                          __nv_bfloat16* __restrict__ out,
-                                         int rows, int cols, float eps) {
+                                         int rows, int cols, float eps, int zero_after) {
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * cols;
@@ -842,11 +842,16 @@ __global__ void norm_then_add_acc_kernel(const __nv_bfloat16* __restrict__ resid
         #pragma unroll
         for (int j = 0; j < 8; j++) ov[j] = rv[j] + bv[j] * inv_rms * wv[j];
         o4[p] = rn_pack8(ov);
+        if (zero_after) {
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc[base + p * 8 + j] = 0;
+        }
     }
     for (int c = tail + threadIdx.x; c < cols; c += blockDim.x) {
         const float bv = __bfloat162float(__float2bfloat16((float)acc[base + c] * sr * rs[c]));
         out[base + c] = __float2bfloat16(__bfloat162float(residual[base + c])
                                          + bv * inv_rms * __bfloat162float(weight[c]));
+        if (zero_after) acc[base + c] = 0;
     }
 }
 
@@ -963,13 +968,13 @@ bool launch_rmsnorm_quant_i8(const void* x, const void* weight, void* out,
     return true;
 }
 
-void launch_norm_then_add_acc(const void* residual, const int* acc, const float* sxr,
+void launch_norm_then_add_acc(const void* residual, int* acc, const float* sxr,
                               const float* rs, const void* weight, void* out,
-                              int rows, int cols, float eps, cudaStream_t stream) {
+                              int rows, int cols, float eps, cudaStream_t stream, int zero_after) {
     norm_then_add_acc_kernel<<<rows, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(residual), acc, sxr, rs,
         reinterpret_cast<const __nv_bfloat16*>(weight),
-        reinterpret_cast<__nv_bfloat16*>(out), rows, cols, eps);
+        reinterpret_cast<__nv_bfloat16*>(out), rows, cols, eps, zero_after);
 }
 
 void launch_norm_then_add(const void* residual, const void* block_out, const void* weight,
