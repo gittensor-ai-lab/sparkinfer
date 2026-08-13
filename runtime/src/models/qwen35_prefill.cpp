@@ -579,6 +579,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         const char* e = getenv("SPARKINFER_MUSE_PREFILL_QB");
         return !(e && e[0] == '0');
     }();
+    const bool muse_group = c.muse_glimmer &&
+        [] { const char* e = getenv("SPARKINFER_MUSE_PREFILL_GROUP"); return !(e && e[0] == '0'); }();
     auto proj_fused = [&](const bf16* A, const void* W, int wtype, const float* rs,
                           bf16* C, int n_out, int K, int rows = 0) {
         const int R = rows > 0 ? rows : N;
@@ -672,10 +674,30 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 // goes straight to qb and the gate straight to qg, with no [q|gate] interleave to build
                 // and no split to undo (matches decode's sep_gate path, qwen35.cpp:988-1007). Projecting
                 // w.wq as `wide` (2*qdim) would dequant-read qdim rows PAST the 4096-row wq tensor.
+                // q/gate/k/v all read xn and are mutually independent. At M=128 each of them is
+                // ceil(n_out/64) CTAs of a 170-SM machine -- 64, 64, 4, 4 -- so as four launches
+                // they cost four full CTA-durations, two of which carry four CTAs of work. One
+                // grid for all four collapses that to one. Bit-identical per output tile.
+                // SPARKINFER_MUSE_PREFILL_GROUP=0 restores the four separate launches.
+                bool grouped = false;
+                if (muse_group && muse_qb && use_i8 &&
+                    w.wq_rs && w.wgate_rs && w.wk_rs && w.wv_rs &&
+                    w.wq_type == w.wgate_type && w.wq_type == w.wk_type && w.wq_type == w.wv_type &&
+                    kernels::pfm_moe_gemm_qi8_supported(w.wq_type)) {
+                    const void* Wp[4]  = { w.wq, w.wgate, w.wk, w.wv };
+                    const float* rsp[4] = { w.wq_rs, w.wgate_rs, w.wk_rs, w.wv_rs };
+                    void* Cp[4]        = { qb, qg, kf, vf };
+                    const int nout[4]  = { qdim, qdim, kvdim, kvdim };
+                    quant_a_i8(xn, N, H);
+                    grouped = kernels::launch_prefill_gemm_qi8_dense_group(
+                        w.wq_type, A_i8, sx, Wp, rsp, Cp, nout, 4, N, H, st);
+                }
+                if (!grouped) {
                 proj_fused(xn, w.wq,    w.wq_type,    w.wq_rs,    qb, qdim,  H);
                 proj_fused(xn, w.wgate, w.wgate_type, w.wgate_rs, qg, qdim,  H);
                 proj_fused(xn, w.wk,    w.wk_type,    w.wk_rs,    kf, kvdim, H);
                 proj_fused(xn, w.wv,    w.wv_type,    w.wv_rs,    vf, kvdim, H);
+                }
             } else {
                 proj(xn, w.wq, w.wq_type, b8, wide,  H);             // qraw = [q|gate] per head
                 proj(xn, w.wk, w.wk_type, kf, kvdim, H);

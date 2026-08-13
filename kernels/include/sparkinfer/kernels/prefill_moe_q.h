@@ -46,5 +46,15 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
                                    const void* W_q, const float* row_scale, void* C_bf16,
                                    int M, int N, int K, cudaStream_t stream = nullptr);
 
+// Fuse up to 4 projections sharing A_i8/sx (same M, same K) into ONE grid. At prefill's M=128 a
+// projection's grid is ceil(N/64) CTAs -- 64 for a 4096-wide q/gate but only 4 for a 256-wide
+// k/v -- all far under a 5090's 170 SMs, so every launch costs a full CTA-duration regardless of
+// how little work it carries. Bit-identical per output tile to the separate calls.
+// W_q/row_scale/C_bf16/N are ngroup-long arrays; all groups must share ggml_type.
+bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8, const float* sx,
+                                         const void* const* W_q, const float* const* row_scale,
+                                         void* const* C_bf16, const int* N, int ngroup,
+                                         int M, int K, cudaStream_t stream = nullptr);
+
 } // namespace kernels
 } // namespace sparkinfer

@@ -55,6 +55,7 @@ namespace {
 
 enum { QMQ_Q4_K = 12, QMQ_Q5_K = 13 };
 
+constexpr int PF_QGROUP_MAX = 4;   // projections fusable into one grouped launch
 constexpr int QM_BM = 128;    // pair rows per tile (must match the caller's tilemap)
 constexpr int QM_BN = 64;     // weight rows (output channels) per block
 constexpr int QM_SB = 256;    // values per GGUF super-block == the B-stage K depth
@@ -469,17 +470,47 @@ void dispatch_qi8_bm16(const signed char* A_i8, const float* sx, const void* W_q
 // precomputed once at load (Qwen35LayerWeights::*_rs), so every int8 byte -- and thus the whole
 // accumulation -- matches the materialize path by construction. BM=128 so each weight row is
 // decoded once per M-tile: at prefill's M=128 that is exactly once (one M-tile).
-template <int QT>
-__global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel(
+// Grouped form: several projections sharing the activation (same Mtot, same K), fused into ONE
+// launch. At prefill's M=128 the grid is (ceil(N/QM_BN), 1), so a projection gets ceil(N/64) CTAs
+// -- 64 for a 4096-wide q or gate, but only 4 for a 256-wide k or v. All are far under a 5090's
+// 170 SMs, so each launch costs a full CTA-duration however little work it carries: k and v each
+// burn a whole wave for four CTAs. Muse Glimmer's q/gate/k/v all read the same xn and are
+// mutually independent, so co-scheduling their tiles in one grid turns four waves into one.
+// blockIdx.x becomes a global tile id resolved against the descriptor; every other line of the
+// kernel is untouched, so each output tile computes exactly what its own launch would have.
+struct PfQGroup {
+    const unsigned char* W[PF_QGROUP_MAX];
+    const float*         rs[PF_QGROUP_MAX];
+    __nv_bfloat16*       C[PF_QGROUP_MAX];
+    int                  N[PF_QGROUP_MAX];
+    int                  first[PF_QGROUP_MAX];   // prefix sum of each group's tile count
+    int                  ngroup;
+};
+
+template <int QT, bool GROUPED>
+__global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
-        const unsigned char* __restrict__ W_q, const float* __restrict__ row_scale,
-        __nv_bfloat16* __restrict__ C, int Mtot, int N, int K) {
+        const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
+        __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd) {
     using namespace nvcuda;
     constexpr int BS = qm_bs<QT>();
     const int p0 = blockIdx.y * QM_BM;
     const int M  = min(QM_BM, Mtot - p0);
     if (M <= 0) return;
-    const int n0  = blockIdx.x * QM_BN;
+    const unsigned char* W_q = W_q_arg;
+    const float* row_scale = row_scale_arg;
+    __nv_bfloat16* C = C_arg;
+    int N = N_arg;
+    int xtile = blockIdx.x;
+    if (GROUPED) {
+        int g = 0;
+        #pragma unroll
+        for (int i = 1; i < PF_QGROUP_MAX; i++)
+            if (i < gd.ngroup && (int)blockIdx.x >= gd.first[i]) g = i;
+        W_q = gd.W[g]; row_scale = gd.rs[g]; C = gd.C[g]; N = gd.N[g];
+        xtile = (int)blockIdx.x - gd.first[g];
+    }
+    const int n0  = xtile * QM_BN;
     const int nsb = K >> 8;
 
     __shared__ __align__(16) signed char Bs[QM_BN][QM_LD];
@@ -633,9 +664,39 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
     const auto* W = reinterpret_cast<const unsigned char*>(W_q);
     dim3 grid((N + QM_BN - 1) / QM_BN, (M + QM_BM - 1) / QM_BM);
     if (ggml_type == QMQ_Q4_K)
-        pf_dense_gemm_qi8_kernel<QMQ_Q4_K><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K);
+        pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, false><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{});
     else
-        pf_dense_gemm_qi8_kernel<QMQ_Q5_K><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K);
+        pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, false><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{});
+    return true;
+}
+
+// Same kernel, one launch for up to PF_QGROUP_MAX projections sharing A_i8/sx (same M, same K).
+// Each output tile runs the identical decode, accumulation order and scales its own launch would
+// have, so the result is bit-identical; only the scheduling changes.
+bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8, const float* sx,
+                                         const void* const* W_q, const float* const* row_scale,
+                                         void* const* C_bf16, const int* N, int ngroup,
+                                         int M, int K, cudaStream_t stream) {
+    if (!pfm_moe_gemm_qi8_supported(ggml_type)) return false;
+    if (ngroup <= 0 || ngroup > PF_QGROUP_MAX || M <= 0) return false;
+    if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;
+    PfQGroup d{};
+    d.ngroup = ngroup;
+    int tiles = 0;
+    for (int i = 0; i < ngroup; i++) {
+        if (!row_scale[i] || N[i] <= 0 || (N[i] % QM_BN) != 0) return false;
+        d.W[i]  = reinterpret_cast<const unsigned char*>(W_q[i]);
+        d.rs[i] = row_scale[i];
+        d.C[i]  = reinterpret_cast<__nv_bfloat16*>(C_bf16[i]);
+        d.N[i]  = N[i];
+        d.first[i] = tiles;
+        tiles += N[i] / QM_BN;
+    }
+    dim3 grid(tiles, (M + QM_BM - 1) / QM_BM);
+    if (ggml_type == QMQ_Q4_K)
+        pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, true><<<grid, 256, 0, stream>>>(A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d);
+    else
+        pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, true><<<grid, 256, 0, stream>>>(A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d);
     return true;
 }
 
