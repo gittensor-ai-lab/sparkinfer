@@ -97,7 +97,14 @@ __device__ __forceinline__ void qm_cp16(void* dst, const void* src, bool pred) {
 // Everything stays in registers: the 32 quant bytes come in as two 16-byte loads and the int8
 // results are packed into words before being stored, so no byte array is ever addressed
 // dynamically (a dynamically indexed local array would land in local memory).
-template <int QT>
+//
+// LUT=true (Q4_K only): a nibble has 16 possible values, so roundf((ds*n-dm)*inv) is
+// tabulated once with n a compile-time constant -- the I2F on (float)n folds away -- then
+// each group of four input nibbles is four table bytes via prmt (integer-only, no local
+// memory). The per-value path paid 64 I2F+F2I per j64; this pays 16. Bit-identical: entry n
+// is the exact expression the per-value path evaluated. Dense GEMM only;
+// SPARKINFER_MUSE_Q4K_LUT=0 restores the per-value decode.
+template <int QT, bool LUT = false>
 __device__ __forceinline__ void qm_decode_j64(const unsigned char* __restrict__ blk, int j64,
                                               float inv, signed char* __restrict__ dst) {
     const float bd = qm_h2f(blk), bdmin = qm_h2f(blk + 2);
@@ -115,6 +122,51 @@ __device__ __forceinline__ void qm_decode_j64(const unsigned char* __restrict__ 
     const unsigned char* qb = qs + j64 * 32;
     const unsigned char* qh = blk + 16;               // Q5_K high-bit plane (unused for Q4_K)
     const int shl = 2 * j64, shh = 2 * j64 + 1;
+
+    // Q4_K nibble table. n is compile-time in the fill so (float)n folds; the gather is
+    // four prmt on packed registers (an indexed array or a ternary mux of the same table
+    // both lost prefill -- local memory / extra ALU). Bit-identical to the per-value loop.
+    if constexpr (LUT && QT == QMQ_Q4_K) {
+        unsigned ta[4], tb[4];
+#pragma unroll
+        for (int g = 0; g < 4; g++) {
+            unsigned wa = 0, wb = 0;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const float nf = (float)(4 * g + j);
+                wa |= ((unsigned)((int)roundf((ds0 * nf - dm0) * inv) & 0xFF)) << (8 * j);
+                wb |= ((unsigned)((int)roundf((ds1 * nf - dm1) * inv) & 0xFF)) << (8 * j);
+            }
+            ta[g] = wa;
+            tb[g] = wb;
+        }
+        auto ix4 = [](const unsigned* t, unsigned nib) -> unsigned {
+            const unsigned mix = nib | (nib >> 4);
+            const unsigned sel = __byte_perm(mix, 0u, 0x4420u);
+            const unsigned idx = sel & 0x7777u;
+            const unsigned lo  = __byte_perm(t[0], t[1], idx);
+            const unsigned hi  = __byte_perm(t[2], t[3], idx);
+            return __byte_perm(lo, hi, 0x3210u | ((sel >> 1) & 0x4444u));
+        };
+#pragma unroll
+        for (int c = 0; c < 2; c++) {
+            const uint4 qv = *reinterpret_cast<const uint4*>(qb + c * 16);
+            uint4 vlo, vhi;
+#pragma unroll
+            for (int w = 0; w < 4; w++) {
+                const unsigned qwd = (w == 0) ? qv.x : (w == 1) ? qv.y : (w == 2) ? qv.z : qv.w;
+                const unsigned alo = ix4(ta, qwd & 0x0F0F0F0Fu);
+                const unsigned ahi = ix4(tb, (qwd >> 4) & 0x0F0F0F0Fu);
+                if (w == 0)      { vlo.x = alo; vhi.x = ahi; }
+                else if (w == 1) { vlo.y = alo; vhi.y = ahi; }
+                else if (w == 2) { vlo.z = alo; vhi.z = ahi; }
+                else             { vlo.w = alo; vhi.w = ahi; }
+            }
+            *reinterpret_cast<uint4*>(dst + j64 * 64 + c * 16) = vlo;
+            *reinterpret_cast<uint4*>(dst + j64 * 64 + 32 + c * 16) = vhi;
+        }
+        return;
+    }
     // One 16-byte load per 16 values and one 16-byte store, for both nibble halves. 16 B is the
     // widest load the block strides permit and they are all aligned: the Q4_K/Q5_K block sizes
     // (144/176) and the qs/qh offsets (16/48) and j64*32 are every one a multiple of 16, on a
@@ -504,7 +556,10 @@ struct PfQGroup {
 // the kernel is neither bandwidth- nor compute-bound, it simply is not on the machine.
 // Only the UNGROUPED form splits: a grouped launch resolves a different N/C per output tile, so
 // its partials would need a per-group offset table, and it is the smallest of the five launches.
-template <int QT, bool GROUPED, bool SPLIT = false>
+//
+// Q4LUT: nibble-table Q4_K decode in the B-stage. Default ON. See qm_decode_j64.
+// SPARKINFER_MUSE_Q4K_LUT=0 restores the per-value roundf loop (A/B).
+template <int QT, bool GROUPED, bool SPLIT = false, bool Q4LUT = false>
 __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
         const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
@@ -580,7 +635,7 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
         __syncthreads();      // previous super-block's MMA finished reading Bs
         if (drow_ok) {
             const unsigned char* blk = drow + (size_t)sb * BS;
-            qm_decode_j64<QT>(blk, dj, dinv, &Bs[dr][0]);
+            qm_decode_j64<QT, Q4LUT>(blk, dj, dinv, &Bs[dr][0]);
         } else if (dj == 0) {
 #pragma unroll
             for (int i = 0; i < QM_SB / 16; i++)
@@ -716,6 +771,27 @@ __global__ void pf_dense_splitk_reduce_group_kernel(const int* __restrict__ part
     gd.C[g][(size_t)m * N + n] = __float2bfloat16((float)acc * sx[m] * gd.rs[g][n]);
 }
 
+// Q4_K nibble-table decode on the dense GEMM. Default ON.
+// SPARKINFER_MUSE_Q4K_LUT=0 restores the per-value roundf loop.
+static bool qm_q4_lut() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_MUSE_Q4K_LUT"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e != 0;
+}
+
+template <int QT, bool GROUPED, bool SPLIT>
+void qm_launch_dense_g(dim3 grid, const signed char* A_i8, const float* sx,
+                       const unsigned char* W, const float* row_scale, __nv_bfloat16* C,
+                       int M, int N, int K, PfQGroup gd, int* partials, int sb_per_split,
+                       cudaStream_t stream, bool q4lut) {
+    if (q4lut)
+        pf_dense_gemm_qi8_kernel_g<QT, GROUPED, SPLIT, true><<<grid, 256, 0, stream>>>(
+            A_i8, sx, W, row_scale, C, M, N, K, gd, partials, sb_per_split);
+    else
+        pf_dense_gemm_qi8_kernel_g<QT, GROUPED, SPLIT, false><<<grid, 256, 0, stream>>>(
+            A_i8, sx, W, row_scale, C, M, N, K, gd, partials, sb_per_split);
+}
+
 // K slices per launch. Shared by the single and grouped launchers so both fan out the same way.
 static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int partials_splits) {
     static int sk_env = -1;
@@ -760,12 +836,13 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
         splits = (nsb_all + sb_per_split - 1) / sb_per_split;
         if (splits > 1) {
             dim3 grid(ntiles, mtiles, splits);
+            const bool lut = qm_q4_lut();
             if (ggml_type == QMQ_Q4_K)
-                pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, false, true><<<grid, 256, 0, stream>>>(
-                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split);
+                qm_launch_dense_g<QMQ_Q4_K, false, true>(
+                    grid, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, stream, lut);
             else
-                pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, false, true><<<grid, 256, 0, stream>>>(
-                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split);
+                qm_launch_dense_g<QMQ_Q5_K, false, true>(
+                    grid, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, stream, lut);
             const size_t total = (size_t)M * (size_t)N;
             pf_dense_splitk_reduce_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
                 partials, sx, row_scale, C, M, N, splits);
@@ -773,10 +850,13 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
         }
     }
     dim3 grid(ntiles, mtiles);
+    const bool lut = qm_q4_lut();
     if (ggml_type == QMQ_Q4_K)
-        pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, false><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{});
+        qm_launch_dense_g<QMQ_Q4_K, false, false>(
+            grid, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, nullptr, 0, stream, lut);
     else
-        pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, false><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{});
+        qm_launch_dense_g<QMQ_Q5_K, false, false>(
+            grid, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, nullptr, 0, stream, lut);
     return true;
 }
 
@@ -829,12 +909,13 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
             int off = 0;
             for (int i = 0; i < ngroup; i++) { d.poff[i] = off; off += splits * M * N[i]; }
             dim3 grid(tiles, mtiles, splits);
+            const bool lut = qm_q4_lut();
             if (ggml_type == QMQ_Q4_K)
-                pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, true, true><<<grid, 256, 0, stream>>>(
-                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split);
+                qm_launch_dense_g<QMQ_Q4_K, true, true>(
+                    grid, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split, stream, lut);
             else
-                pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, true, true><<<grid, 256, 0, stream>>>(
-                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split);
+                qm_launch_dense_g<QMQ_Q5_K, true, true>(
+                    grid, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split, stream, lut);
             const size_t total = (size_t)M * (size_t)tiles * QM_BN;
             pf_dense_splitk_reduce_group_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
                 partials, sx, d, M, tiles * QM_BN, splits);
@@ -842,10 +923,13 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
         }
     }
     dim3 grid(tiles, mtiles);
+    const bool lut = qm_q4_lut();
     if (ggml_type == QMQ_Q4_K)
-        pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, true><<<grid, 256, 0, stream>>>(A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d);
+        qm_launch_dense_g<QMQ_Q4_K, true, false>(
+            grid, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, nullptr, 0, stream, lut);
     else
-        pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, true><<<grid, 256, 0, stream>>>(A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d);
+        qm_launch_dense_g<QMQ_Q5_K, true, false>(
+            grid, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, nullptr, 0, stream, lut);
     return true;
 }
 
