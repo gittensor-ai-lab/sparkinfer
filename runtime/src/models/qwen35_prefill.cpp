@@ -267,6 +267,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     signed char* W_i8 = need_i8 ? a8.alloc<signed char>(maxw) : nullptr;
     float* sx = need_i8 ? a8.alloc<float>(sx_n) : nullptr;
     float* sw = need_i8 ? a8.alloc<float>((size_t)maxNO) : nullptr;
+    // int32 partials for the fused GEMM's split-K fan-out. Only while the whole prompt is one
+    // M-tile (N <= QM_BM = 128): beyond that the plain grid already fans out over M, and the buffer
+    // would scale with N. 8 * 128 * 19968 * 4 B = 82 MB, and only for Muse.
+    constexpr int QB_SPLITS = 8;
+    int* qb_partials = (c.muse_glimmer && use_i8 && N <= 128)
+        ? a8.alloc<int>((size_t)QB_SPLITS * (size_t)N * (size_t)maxNO) : nullptr;
     // Muse Glimmer split-K partials for the skinny projections. launch_prefill_gemm_i8 puts one
     // 128x128 output tile in a block, so Muse's narrow n_out (attn k/v = 256 -> TWO blocks, q and
     // the q-gate = 4096 -> 32) leaves the device almost empty: measured on an RTX 5090 the 2-block
@@ -586,7 +592,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         const int R = rows > 0 ? rows : N;
         if (muse_qb && use_i8 && rs && n_out >= 128 && kernels::pfm_moe_gemm_qi8_supported(wtype)) {
             quant_a_i8(A, R, K);
-            if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st))
+            if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st,
+                                                       qb_partials, QB_SPLITS))
                 return;
         }
         proj(A, W, wtype, C, n_out, K, rows);
@@ -807,15 +814,30 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         // skips the ffg store + reload that proj()'s internal quantize would pay.
                         a_q = nullptr;                 // swiglu_quant writes A_i8/sx directly
                         kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st);
-                        if (!kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q,
-                                                                  W_i8, sw, H, ffn, st)) {
-                            const void* wb = dq(w.down_q, w.down_qtype, H, ffn);
-                            kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, H, ffn, st);
+                        // Fused quantized-B down projection. The activation is ALREADY in A_i8/sx
+                        // (the fused SwiGLU wrote it), so this cannot go through proj_fused, which
+                        // would re-quantize -- call the dense fused GEMM directly. Only the
+                        // residual-unfused form is eligible; Muse never takes the fused-residual
+                        // branch anyway (its sandwich norm needs the raw FFN output in ao).
+                        bool down_fused = false;
+                        if (!ffn_fused && muse_qb && w.down_rs &&
+                            kernels::pfm_moe_gemm_qi8_supported(w.down_qtype)) {
+                            down_fused = kernels::launch_prefill_gemm_qi8_dense(
+                                w.down_qtype, A_i8, sx, w.down_q, w.down_rs,
+                                ao + (size_t)fo * H, fn, H, ffn, st, qb_partials, QB_SPLITS);
                         }
-                        if (ffn_fused)
-                            gemm_i8(A_i8, W_i8, sx, sw, x + (size_t)fo * H, fn, H, ffn, true);
-                        else
-                            gemm_i8(A_i8, W_i8, sx, sw, ao + (size_t)fo * H, fn, H, ffn, false);
+                        if (!down_fused) {
+                            if (!kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q,
+                                                                      W_i8, sw, H, ffn, st)) {
+                                const void* wb = dq(w.down_q, w.down_qtype, H, ffn);
+                                kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, H, ffn, st);
+                            }
+                            // keeps #795's split-K fan-out for whatever still materializes (Q6_K down)
+                            if (ffn_fused)
+                                gemm_i8(A_i8, W_i8, sx, sw, x + (size_t)fo * H, fn, H, ffn, true);
+                            else
+                                gemm_i8(A_i8, W_i8, sx, sw, ao + (size_t)fo * H, fn, H, ffn, false);
+                        }
                     } else {
                         kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
                         if (!ffn_fused || !proj_resid(ffg, w.down_q, w.down_qtype,

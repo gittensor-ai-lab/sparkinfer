@@ -42,9 +42,15 @@ bool pfm_moe_gemm_qi8_supported(int ggml_type);
 // the int8 materialize (dequant -> W_i8 -> reload) that launch_prefill_gemm_i8 pays. Returns false
 // (launching nothing) for an unsupported ggml_type, null row_scale, K not a super-block multiple, or
 // N not 64-aligned -- callers fall back to the materialize path. Used by Muse Glimmer dense prefill.
+// `partials` (int32, >= partials_splits * M * N) enables a split-K fan-out: at prefill's M=128 the
+// plain grid is only N/64 blocks, far under the device, so K is sliced across blockIdx.z and the
+// int32 tiles are summed in a second pass. int32 accumulation is exact and associative => the
+// result is BIT-IDENTICAL to the unsplit launch. partials=nullptr (or splits<=1) disables it;
+// SPARKINFER_MUSE_QB_SPLITK=0 disables, >0 pins the slice count.
 bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const float* sx,
                                    const void* W_q, const float* row_scale, void* C_bf16,
-                                   int M, int N, int K, cudaStream_t stream = nullptr);
+                                   int M, int N, int K, cudaStream_t stream = nullptr,
+                                   int* partials = nullptr, int partials_splits = 0);
 
 // Fuse up to 4 projections sharing A_i8/sx (same M, same K) into ONE grid. At prefill's M=128 a
 // projection's grid is ceil(N/64) CTAs -- 64 for a 4096-wide q/gate but only 4 for a 256-wide

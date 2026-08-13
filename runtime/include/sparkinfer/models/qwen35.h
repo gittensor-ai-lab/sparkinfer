@@ -90,6 +90,11 @@ struct Qwen35LayerWeights {
     const float* wq_rs = nullptr; const float* wgate_rs = nullptr;
     const float* wk_rs = nullptr; const float* wv_rs = nullptr; const float* wo_rs = nullptr;
     const float* gate_rs = nullptr; const float* up_rs = nullptr;
+    // ffn_down's per-row int8 scale. Left out of the original dense set on the assumption that
+    // down is always Q6_K; in the shipped Muse Q4_K_M GGUF a large share of the down tensors are
+    // Q4_K, i.e. fusable, and were falling back to the int8 materialize only because the scale
+    // pool had no slot for them. Null when this layer's down really is unfusable (Q6_K).
+    const float* down_rs = nullptr;
 };
 
 struct Qwen35Weights {

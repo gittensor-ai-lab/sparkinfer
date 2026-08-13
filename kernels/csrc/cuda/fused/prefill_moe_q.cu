@@ -45,6 +45,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cstdlib>
 #include <cuda_pipeline.h>
 #include <mma.h>
 
@@ -56,6 +57,10 @@ namespace {
 enum { QMQ_Q4_K = 12, QMQ_Q5_K = 13 };
 
 constexpr int PF_QGROUP_MAX = 4;   // projections fusable into one grouped launch
+// Block-slot budget the split-K fan-out aims at: ~3 passes over a 5090's 170 SMs x 3 blocks/SM.
+// Measured: aiming at ONE pass picks 2 splits for the 312-tile FFN and loses to 4 (2211 vs 2550
+// pp) -- oversubscribing hides latency and shortens the tail. A target, never a cap.
+constexpr int QM_TARGET_BLOCKS = 1536;
 constexpr int QM_BM = 128;    // pair rows per tile (must match the caller's tilemap)
 constexpr int QM_BN = 64;     // weight rows (output channels) per block
 constexpr int QM_SB = 256;    // values per GGUF super-block == the B-stage K depth
@@ -487,11 +492,23 @@ struct PfQGroup {
     int                  ngroup;
 };
 
-template <int QT, bool GROUPED>
+// SPLIT=true: blockIdx.z owns a slice of the K super-blocks and writes its raw int32 tile to
+// `partials`; pf_dense_splitk_reduce_kernel sums the slices and applies sx*row_scale once. int32
+// accumulation is exact and associative, so the summed value is BIT-IDENTICAL to the unsplit
+// kernel -- only the block count changes.
+//
+// At prefill's M=128 grid.y collapses to 1, leaving a grid of just N/QM_BN blocks: 104 for the
+// 6656-wide o/down, 312 for the 19968-wide FFN pair, against ~510 block slots on a 5090. ncu on
+// the unsplit kernel: 0.13 waves/SM, 16.7% achieved occupancy, DRAM 6.0%, SM throughput 13.1% --
+// the kernel is neither bandwidth- nor compute-bound, it simply is not on the machine.
+// Only the UNGROUPED form splits: a grouped launch resolves a different N/C per output tile, so
+// its partials would need a per-group offset table, and it is the smallest of the five launches.
+template <int QT, bool GROUPED, bool SPLIT = false>
 __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
         const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
-        __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd) {
+        __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd,
+        int* __restrict__ partials = nullptr, int sb_per_split = 0) {
     using namespace nvcuda;
     constexpr int BS = qm_bs<QT>();
     const int p0 = blockIdx.y * QM_BM;
@@ -550,10 +567,14 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
     };
 
     __syncthreads();          // s_tok published before stageA reads it
-    stageA(0, 0);
+    const int sb_lo = SPLIT ? (int)blockIdx.z * sb_per_split : 0;
+    const int sb_hi = SPLIT ? min(nsb, sb_lo + sb_per_split) : nsb;
+    if (sb_lo >= sb_hi) return;
+    const int kend = sb_hi << 8;          // first K past this block's slice
+    stageA(0, sb_lo << 8);
     int abuf = 0;
 
-    for (int sb = 0; sb < nsb; sb++) {
+    for (int sb = sb_lo; sb < sb_hi; sb++) {
         __syncthreads();      // previous super-block's MMA finished reading Bs
         if (drow_ok) {
             const unsigned char* blk = drow + (size_t)sb * BS;
@@ -567,8 +588,8 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
 
         for (int kk = 0; kk < QM_SB; kk += QM_BK) {
             const int knext = sb * QM_SB + kk + QM_BK;
-            if (knext < K) stageA(abuf ^ 1, knext);
-            __pipeline_wait_prior(knext < K ? 1 : 0);
+            if (knext < kend) stageA(abuf ^ 1, knext);
+            __pipeline_wait_prior(knext < kend ? 1 : 0);
             __syncthreads();
 #pragma unroll
             for (int k16 = 0; k16 < QM_BK; k16 += 16) {
@@ -605,8 +626,12 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
                 const int rm = rm0 + r, rn = gn0 + cc;
                 if (rm < M && rn < N) {
                     const int p = p0 + rm;
-                    const float v = (float)Cs[warp * 256 + el] * sx[p] * row_scale[rn];
-                    C[(size_t)p * N + rn] = __float2bfloat16(v);
+                    if (SPLIT) {
+                        partials[(((size_t)blockIdx.z * Mtot) + p) * N + rn] = Cs[warp * 256 + el];
+                    } else {
+                        const float v = (float)Cs[warp * 256 + el] * sx[p] * row_scale[rn];
+                        C[(size_t)p * N + rn] = __float2bfloat16(v);
+                    }
                 }
             }
             __syncwarp();
@@ -652,17 +677,73 @@ bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float
     return true;
 }
 
-// Dense fused-decode int8 GEMM (single weight, no routing). See pf_dense_gemm_qi8_kernel.
+// Sum the split-K int32 partials and apply sx*row_scale once. The sum is over int32, so the total
+// is exactly what the unsplit kernel accumulated and the bf16 store sees an identical value.
+__global__ void pf_dense_splitk_reduce_kernel(const int* __restrict__ partials,
+                                              const float* __restrict__ sx,
+                                              const float* __restrict__ row_scale,
+                                              __nv_bfloat16* __restrict__ C,
+                                              int Mtot, int N, int splits) {
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)Mtot * (size_t)N) return;
+    const int m = (int)(idx / (size_t)N);
+    const int n = (int)(idx - (size_t)m * (size_t)N);
+    int acc = 0;
+    for (int s = 0; s < splits; s++) acc += partials[((size_t)s * Mtot + m) * N + n];
+    C[idx] = __float2bfloat16((float)acc * sx[m] * row_scale[n]);
+}
+
+// Dense fused-decode int8 GEMM (single weight, no routing). See pf_dense_gemm_qi8_kernel_g.
 bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const float* sx,
                                    const void* W_q, const float* row_scale, void* C_bf16,
-                                   int M, int N, int K, cudaStream_t stream) {
+                                   int M, int N, int K, cudaStream_t stream,
+                                   int* partials, int partials_splits) {
     if (!pfm_moe_gemm_qi8_supported(ggml_type)) return false;   // Q4_K / Q5_K only
     if (!row_scale || M <= 0) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;         // whole super-blocks only
     if (N <= 0 || (N % QM_BN) != 0) return false;               // 64-aligned output width
     auto* C = reinterpret_cast<__nv_bfloat16*>(C_bf16);
     const auto* W = reinterpret_cast<const unsigned char*>(W_q);
-    dim3 grid((N + QM_BN - 1) / QM_BN, (M + QM_BM - 1) / QM_BM);
+    const int ntiles = (N + QM_BN - 1) / QM_BN;
+    const int mtiles = (M + QM_BM - 1) / QM_BM;
+
+    // Split K only when the plain grid leaves the device idle. With more than one M-tile the grid
+    // already fans out over M and a split would only add the reduce pass. Each slice must own whole
+    // super-blocks, at least 2, or the per-block prologue dominates it.
+    static int sk_env = -1;
+    if (sk_env < 0) { const char* e = getenv("SPARKINFER_MUSE_QB_SPLITK"); sk_env = e ? atoi(e) : -2; }
+    int splits = 1;
+    if (partials && partials_splits > 1 && mtiles == 1 && sk_env != 0) {
+        const int nsb = K >> 8;
+        splits = (sk_env > 0) ? sk_env : (QM_TARGET_BLOCKS + ntiles - 1) / ntiles;
+        if (splits > partials_splits) splits = partials_splits;
+        if (splits > nsb / 2) splits = nsb / 2;
+        if (splits < 1) splits = 1;
+    }
+    if (splits > 1) {
+        const int nsb_all = K >> 8;
+        const int sb_per_split = (nsb_all + splits - 1) / splits;
+        // Re-derive the launch count from the slice size. Going the other way leaves trailing z
+        // slices with sb_lo >= nsb: those blocks return before writing, the reduce then sums
+        // never-written partials and the output is garbage (measured: TOP1 0.92 -> 0.67,
+        // KL 0.036 -> 0.306, while the throughput still looked fine). Every launched slice must
+        // own at least one super-block.
+        splits = (nsb_all + sb_per_split - 1) / sb_per_split;
+        if (splits > 1) {
+            dim3 grid(ntiles, mtiles, splits);
+            if (ggml_type == QMQ_Q4_K)
+                pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, false, true><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split);
+            else
+                pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, false, true><<<grid, 256, 0, stream>>>(
+                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split);
+            const size_t total = (size_t)M * (size_t)N;
+            pf_dense_splitk_reduce_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
+                partials, sx, row_scale, C, M, N, splits);
+            return true;
+        }
+    }
+    dim3 grid(ntiles, mtiles);
     if (ggml_type == QMQ_Q4_K)
         pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, false><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{});
     else

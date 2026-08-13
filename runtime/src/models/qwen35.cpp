@@ -3530,7 +3530,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             const int qd = c.n_q_heads * c.head_dim;                   // qdim (4096)
             const int kd = c.n_kv_heads * c.head_dim;                  // kvdim (256)
             const int ff = c.moe_ffn;                                  // dense FFN width (19968)
-            const size_t per_layer = (size_t)(2 * qd + 2 * kd + H + 2 * ff);  // rows/layer, all fusable
+            // + H for ffn_down: the original layout reserved no slot for it, so every Q4_K down
+            // fell back to the materialize path regardless of being a fusable type. Slots are
+            // reserved for all eight; a slot stays unfilled (and its *_rs null) when that
+            // weight's type is not fusable, so a Q6_K down still takes the materialize path.
+            const size_t per_layer = (size_t)(2 * qd + 2 * kd + H + 2 * ff + H);  // rows/layer
             const size_t total = per_layer * (size_t)c.n_layers;
             const size_t tmp_bytes = 64u << 20;                        // int8 scratch, thrown away
             signed char* tmp = nullptr;
@@ -3565,6 +3569,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 place(lw.wo,     lw.wo_type,     &lw.wo_rs,    H,  qd);
                 place(lw.gate_q, lw.gate_qtype,  &lw.gate_rs,  ff, H);
                 place(lw.up_q,   lw.up_qtype,    &lw.up_rs,    ff, H);
+                place(lw.down_q, lw.down_qtype,  &lw.down_rs,  H,  ff);
             }
             if (ok) ok = cudaStreamSynchronize(s.stream) == cudaSuccess;
             if (tmp) cudaFree(tmp);
@@ -3573,6 +3578,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 for (int i = 0; i < c.n_layers; i++) {
                     Qwen35LayerWeights& lw = s.w.layers[i];
                     lw.wq_rs = lw.wgate_rs = lw.wk_rs = lw.wv_rs = lw.wo_rs = lw.gate_rs = lw.up_rs = nullptr;
+                    lw.down_rs = nullptr;
                 }
                 fprintf(stderr, "[prefill-muse] dense row-scale precompute unavailable "
                                 "-> int8 materialize path\n");
