@@ -36,6 +36,9 @@ bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float
 // True when launch_pfm_moe_gemm_qi8 has a decode for this ggml_type.
 bool pfm_moe_gemm_qi8_supported(int ggml_type);
 
+// Dense fused-decode GEMM only: Q4_K / Q5_K / Q6_K (the routed predicate above stays Q4_K/Q5_K).
+bool pf_dense_gemm_qi8_supported(int ggml_type);
+
 // Dense (non-routed) fused-decode int8 GEMM: C[M,N] = A_i8[M,K] @ dequant(W_q[N,K])^T, reading the
 // weight in native Q4_K/Q5_K and decoding it to int8 inside the B-stage using a per-output-row
 // scale precomputed at load (row_scale[n] = amax/127, == launch_gguf_dequant_rows_i8's scale). Skips

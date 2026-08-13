@@ -55,13 +55,20 @@ namespace kernels {
 
 namespace {
 
-enum { QMQ_Q4_K = 12, QMQ_Q5_K = 13 };
+enum { QMQ_Q4_K = 12, QMQ_Q5_K = 13, QMQ_Q6_K = 14 };
 
 constexpr int PF_QGROUP_MAX = 4;   // projections fusable into one grouped launch
 // Block-slot budget the split-K fan-out aims at: ~3 passes over a 5090's 170 SMs x 3 blocks/SM.
 // Measured: aiming at ONE pass picks 2 splits for the 312-tile FFN and loses to 4 (2211 vs 2550
 // pp) -- oversubscribing hides latency and shortens the tail. A target, never a cap.
-constexpr int QM_TARGET_BLOCKS = 1536;
+// Re-tuned with the m16n8k32 inner loop and the `red` epilogue below: each slice now retires
+// faster and each slice's epilogue is cheaper, so the fan-out that best hides the tail moved up.
+// Re-measured with Q6_K in the fused path (median of 5, prefill@128): 1536 -> 4182.6 pp, then a
+// flat plateau -- 2048 -> 4215.6, 2560 -> 4223.6, 3072 -> 4221.9, i.e. anything from 2048 up is
+// within run-to-run noise of anything else. 1536 is the only value that is clearly off it.
+// A target, never a cap -- the per-GEMM slice count is still clamped by the partials plane
+// budget and by K depth.
+constexpr int QM_TARGET_BLOCKS = 2560;
 constexpr int QM_BM = 128;    // pair rows per tile (must match the caller's tilemap)
 constexpr int QM_BN = 64;     // weight rows (output channels) per block
 constexpr int QM_SB = 256;    // values per GGUF super-block == the B-stage K depth
@@ -78,7 +85,7 @@ constexpr int QM_BND = 64;
 
 template <int QT>
 __device__ __forceinline__ constexpr int qm_bs() {
-    return (QT == QMQ_Q4_K) ? 144 : 176;
+    return (QT == QMQ_Q4_K) ? 144 : (QT == QMQ_Q5_K) ? 176 : 210;
 }
 
 __device__ __forceinline__ float qm_h2f(const unsigned char* p) {
@@ -168,6 +175,69 @@ __device__ __forceinline__ void qm_decode_j64(const unsigned char* __restrict__ 
     const unsigned char* qh = blk + 16;               // Q5_K high-bit plane (unused for Q4_K)
     const int shl = 2 * j64, shh = 2 * j64 + 1;
 
+    // Q6_K carries no per-sub-block min and packs its 6 bits as a nibble plane plus a 2-bit
+    // plane, so it shares nothing with the K-quant path above and gets its own decode.
+    //
+    // ALIGNMENT is what kept this type out of the fused GEMM: a Q6_K super-block is 210 B, which
+    // is even but is not a multiple of 4 or 16, so a block's base is only ever 2-byte aligned and
+    // the uint4 loads the other types use would fault on every odd super-block. Every load here is
+    // a ushort, which 210 always satisfies.
+    //
+    // Thread j64 owns half = j64>>1 and, within it, the sub = j64&1 half of ql. Those 32 ql bytes
+    // carry quads (sub) and (sub+2) -- their low and high nibbles -- so each ql byte is read
+    // exactly twice per super-block instead of the four times a naive split would cost, and each
+    // thread still writes two contiguous 16-byte runs.
+    //
+    // BIT-IDENTICAL to dqr_q6k_val + the deq_rows_i8 quantize that produced `row_scale`:
+    // the reference evaluates d * sc[is + 2*quad] * qv left to right, so hoisting ds = d * sc to
+    // the 16-value group multiplies the identical floats, and the same roundf and truncating cast
+    // follow.
+    if (QT == QMQ_Q6_K) {
+        const int hh = j64 >> 1, sub = j64 & 1;
+        const unsigned char* q6 = blk + hh * 64 + sub * 32;
+        const unsigned char* h6 = blk + 128 + hh * 32;
+        const signed char*   s6 = reinterpret_cast<const signed char*>(blk + 192) + hh * 8;
+        const float d6 = qm_h2f(blk + 208);
+        const int qa = sub, qb = sub + 2;                    // this thread's two quads
+        const float dsa[2] = { d6 * s6[0 + 2 * qa], d6 * s6[1 + 2 * qa] };
+        const float dsb[2] = { d6 * s6[0 + 2 * qb], d6 * s6[1 + 2 * qb] };
+        const int sha = 2 * qa, shb = 2 * qb;
+        signed char* dA = dst + hh * 128 + sub * 32;         // quad `qa` output run
+        signed char* dB = dst + hh * 128 + 64 + sub * 32;    // quad `qb` output run
+#pragma unroll
+        for (int c = 0; c < 2; c++) {                        // c IS the reference's `is` (l / 16)
+            uint4 va, vb;
+#pragma unroll
+            for (int w = 0; w < 4; w++) {
+                const unsigned char* qp = q6 + c * 16 + w * 4;
+                const unsigned char* hp = h6 + c * 16 + w * 4;
+                const unsigned qwd = (unsigned)(*(const unsigned short*)qp)
+                                   | ((unsigned)(*(const unsigned short*)(qp + 2)) << 16);
+                const unsigned hwd = (unsigned)(*(const unsigned short*)hp)
+                                   | ((unsigned)(*(const unsigned short*)(hp + 2)) << 16);
+                unsigned aw = 0, bw = 0;
+#pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    const int sb8 = 8 * b;
+                    const unsigned by = (qwd >> sb8) & 0xFFu;
+                    const unsigned hb = (hwd >> sb8) & 0xFFu;
+                    const int va_q = (int)((by & 0xFu) | (((hb >> sha) & 3u) << 4)) - 32;
+                    const int vb_q = (int)((by >> 4)   | (((hb >> shb) & 3u) << 4)) - 32;
+                    const int ia = (int)roundf((dsa[c] * (float)va_q) * inv);
+                    const int ib = (int)roundf((dsb[c] * (float)vb_q) * inv);
+                    aw |= ((unsigned)(ia & 0xFF)) << sb8;
+                    bw |= ((unsigned)(ib & 0xFF)) << sb8;
+                }
+                if (w == 0)      { va.x = aw; vb.x = bw; }
+                else if (w == 1) { va.y = aw; vb.y = bw; }
+                else if (w == 2) { va.z = aw; vb.z = bw; }
+                else             { va.w = aw; vb.w = bw; }
+            }
+            *reinterpret_cast<uint4*>(dA + c * 16) = va;
+            *reinterpret_cast<uint4*>(dB + c * 16) = vb;
+        }
+        return;
+    }
     // Q4_K: 4 bits per value, so the whole sub-block collapses to a 16-entry table (see qm_lut16).
     // Q5_K's 5 bits would need 32 entries for 32 values -- no amortization -- so it keeps the
     // per-value decode below, unchanged.
@@ -572,6 +642,60 @@ struct PfQGroup {
     int                  ngroup;
 };
 
+// ---------------------------------------------------------------------------
+// mma.m16n8k32.s8 path.
+//
+// wmma's 16x16x16 int8 fragment can only reach a K=16 hardware shape: cuobjdump on this kernel
+// shows every mma_sync lowering to IMMA.16816.S8.S8. sm_120 also has IMMA.16832 -- the same
+// tensor-core throughput per instruction-pair, but twice the K per instruction -- so issuing
+// mma.m16n8k32 directly halves the MMA instruction stream for identical arithmetic.
+//
+// Why that is the lever here: deleting the MMA phase outright saves 6.5 ms of a 33.8 ms prefill,
+// but DOUBLING the MMA instruction count costs 10.8 ms. The stream is issue-bound, not
+// throughput-bound, so instruction count is the thing that matters and halving it is worth far
+// more than the delete-probe alone suggests.
+//
+// BIT-IDENTICAL: int32 accumulation is exact and order-independent, and the int8 operands are the
+// same bytes out of the same As/Bs tiles, so only the grouping of the adds changes.
+//
+// Costs nothing that the occupancy law taxes: the accumulator is 8 m16n8 tiles x 4 s32 = 32
+// registers per lane, exactly what the four 16x16 wmma accumulators used, and B is loaded one
+// 8-column tile at a time so at most 4+2 operand registers are live. Shared memory is untouched.
+// The split-K epilogue never reads the accumulated value back, but atomicAdd() is an
+// exchange: cuobjdump shows it lowering to ATOMG.E.ADD.STRONG.GPU, which allocates a destination
+// register and carries strong-GPU ordering. `red` is the fire-and-forget form -- no return, and
+// relaxed ordering is all this needs, since the split-K reduce that consumes the plane is a
+// separate kernel launch on the same stream and the launch boundary already orders it.
+// Same int32 adds in the same (order-independent) sum, so the result is unchanged.
+__device__ __forceinline__ void qm_red_add(int* p, int v) {
+    asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+}
+
+__device__ __forceinline__ void qm_ldsm_x4(unsigned (&r)[4], const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void qm_ldsm_x2(unsigned (&r)[2], const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                 : "=r"(r[0]), "=r"(r[1]) : "r"(a));
+}
+__device__ __forceinline__ void qm_mma_16832(int (&d)[4], const unsigned (&a)[4],
+                                             unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// SPARKINFER_MUSE_MMA_K32=0 restores the wmma 16x16x16 inner loop (A/B; bit-identical either way).
+static int qm_mma_k32() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_MUSE_MMA_K32"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e;
+}
+
 // SPLIT=true: one blockIdx dimension owns a slice of the K super-blocks and contributes its raw
 // int32 tile to `partials`; pf_dense_splitk_reduce_kernel applies sx*row_scale once. int32
 // accumulation is exact and associative, so the total is BIT-IDENTICAL to the unsplit kernel --
@@ -591,7 +715,7 @@ struct PfQGroup {
 // K slice living on blockIdx.x -- so all slices of a tile are dispatched back-to-back rather than
 // a whole grid apart -- a tile's 32 KB of accumulator is written, re-hit and consumed inside L2.
 // Integer adds are exact and order-independent, so the accumulated value is the same either way.
-template <int QT, bool GROUPED, bool SPLIT = false>
+template <int QT, bool GROUPED, bool SPLIT = false, bool K32 = true>
 __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
         const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
@@ -646,11 +770,23 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
     const float dscale = drow_ok ? row_scale[dgn] : 0.f;
     const float dinv = (dscale > 0.f) ? (1.f / dscale) : 0.f;
 
+    // K32: eight m16n8 int32 tiles (2 M-subtiles x 4 N-subtiles), 4 regs each = the same 32
+    // accumulator registers per lane the four 16x16 wmma fragments occupied.
+    int acc[2][4][4];
     wmma::fragment<wmma::accumulator, 16, 16, 16, int> cf[2][2];
+    if constexpr (K32) {
 #pragma unroll
-    for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 2; i++)
 #pragma unroll
-        for (int j = 0; j < 2; j++) wmma::fill_fragment(cf[i][j], 0);
+            for (int j = 0; j < 4; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) acc[i][j][e] = 0;
+    } else {
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+            for (int j = 0; j < 2; j++) wmma::fill_fragment(cf[i][j], 0);
+    }
 
     auto stageA = [&](int buf, int k0) {
         for (int idx = tid; idx < QM_BM * 2; idx += blockDim.x) {
@@ -686,6 +822,32 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
             if (knext < kend) stageA(abuf ^ 1, knext);
             __pipeline_wait_prior(knext < kend ? 1 : 0);
             __syncthreads();
+            if constexpr (K32) {
+                // One K=32 step covers the whole QM_BK slice, so the k16 loop disappears.
+                // ldmatrix lane->address mapping for m16n8k32: .x4 wants matrices
+                // (rows 0-7 | rows 8-15) x (bytes 0-15 | bytes 16-31) of a 16x32 A tile, and .x2
+                // wants (bytes 0-15 | bytes 16-31) of an 8-row B tile -- B lives in Bs as
+                // [n][k], which is already the col-major operand the instruction expects.
+                unsigned af32[2][4];
+#pragma unroll
+                for (int i = 0; i < 2; i++)
+                    qm_ldsm_x4(af32[i], &As[abuf][wm * 32 + i * 16 + (lane & 7) + 8 * ((lane >> 3) & 1)]
+                                          [16 * ((lane >> 4) & 1)]);
+#pragma unroll
+                for (int j2 = 0; j2 < 2; j2++) {
+                    // One .x4 covers two 8-column B subtiles: its four matrices are
+                    // (subtile 0 | subtile 1) x (k 0-15 | k 16-31), which is exactly two
+                    // m16n8k32 B operands. Halves the B load instructions for the same bytes.
+                    unsigned bb[4];
+                    qm_ldsm_x4(bb, &Bs[wn * 32 + j2 * 16 + ((lane >> 4) & 1) * 8 + (lane & 7)]
+                                     [kk + 16 * ((lane >> 3) & 1)]);
+#pragma unroll
+                    for (int i = 0; i < 2; i++) {
+                        qm_mma_16832(acc[i][2 * j2],     af32[i], bb[0], bb[1]);
+                        qm_mma_16832(acc[i][2 * j2 + 1], af32[i], bb[2], bb[3]);
+                    }
+                }
+            } else {
 #pragma unroll
             for (int k16 = 0; k16 < QM_BK; k16 += 16) {
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af[2];
@@ -701,6 +863,7 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
 #pragma unroll
                     for (int j = 0; j < 2; j++) wmma::mma_sync(cf[i][j], af[i], bf[j], cf[i][j]);
             }
+            }
             __syncthreads();
             abuf ^= 1;
         }
@@ -714,7 +877,22 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
 #pragma unroll
         for (int j = 0; j < 2; j++) {
             const int rm0 = wm * 32 + i * 16, gn0 = n0 + wn * 32 + j * 16;
-            wmma::store_matrix_sync(&Cs[warp * 256], cf[i][j], 16, wmma::mem_row_major);
+            if constexpr (K32) {
+                // m16n8k32's D layout: lane holds rows (lane>>2) and (lane>>2)+8, columns
+                // 2*(lane&3) and +1, of each 16x8 tile. Two of those tiles side by side rebuild
+                // exactly the 16x16 row-major tile the shared staging below already expects.
+#pragma unroll
+                for (int hh = 0; hh < 2; hh++) {
+                    const int* d = acc[i][2 * j + hh];
+                    const int rb = lane >> 2, cb = hh * 8 + 2 * (lane & 3);
+                    Cs[warp * 256 + rb * 16 + cb]            = d[0];
+                    Cs[warp * 256 + rb * 16 + cb + 1]        = d[1];
+                    Cs[warp * 256 + (rb + 8) * 16 + cb]      = d[2];
+                    Cs[warp * 256 + (rb + 8) * 16 + cb + 1]  = d[3];
+                }
+            } else {
+                wmma::store_matrix_sync(&Cs[warp * 256], cf[i][j], 16, wmma::mem_row_major);
+            }
             __syncwarp();
             for (int el = lane; el < 256; el += 32) {
                 const int r = el >> 4, cc = el & 15;
@@ -723,7 +901,7 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
                     const int p = p0 + rm;
                     if (SPLIT) {
                         if (atomic_acc)
-                            atomicAdd(&partials[pbase + (size_t)p * N + rn], Cs[warp * 256 + el]);
+                            qm_red_add(&partials[pbase + (size_t)p * N + rn], Cs[warp * 256 + el]);
                         else
                             partials[pbase + (((size_t)zsl * Mtot) + p) * N + rn] = Cs[warp * 256 + el];
                     } else {
@@ -741,6 +919,15 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
 
 bool pfm_moe_gemm_qi8_supported(int ggml_type) {
     return ggml_type == QMQ_Q4_K || ggml_type == QMQ_Q5_K;
+}
+
+// The DENSE fused GEMM additionally decodes Q6_K (see qm_decode_j64). Kept separate from the
+// routed predicate above on purpose: the routed MoE launcher gates every other model's expert
+// GEMMs on that one, and this widening is only wanted for the dense Muse Glimmer projections.
+// This GGUF gives 26 of its 52 layers a Q6_K attn_v, and those were the layers whose v fell out
+// of the fused path into a full materialize round trip (measured: 0.47 ms of a 30.4 ms prefill).
+bool pf_dense_gemm_qi8_supported(int ggml_type) {
+    return ggml_type == QMQ_Q4_K || ggml_type == QMQ_Q5_K || ggml_type == QMQ_Q6_K;
 }
 
 bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float* sx,
@@ -835,12 +1022,28 @@ static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int
     return splits;
 }
 
+// Dispatch on weight type and on the mma shape (K32 -> mma.m16n8k32, else the wmma inner loop).
+#define QM_LAUNCH_ONE(TY, GRP, SPL, ...)                                                           \
+    do {                                                                                           \
+        if (qm_mma_k32()) pf_dense_gemm_qi8_kernel_g<TY, GRP, SPL, true>                           \
+                              <<<grid, 256, 0, stream>>>(__VA_ARGS__);                             \
+        else              pf_dense_gemm_qi8_kernel_g<TY, GRP, SPL, false>                          \
+                              <<<grid, 256, 0, stream>>>(__VA_ARGS__);                             \
+    } while (0)
+
+#define QM_LAUNCH_DENSE(GRP, SPL, ...)                                                             \
+    do {                                                                                           \
+        if (ggml_type == QMQ_Q4_K)      QM_LAUNCH_ONE(QMQ_Q4_K, GRP, SPL, __VA_ARGS__);            \
+        else if (ggml_type == QMQ_Q5_K) QM_LAUNCH_ONE(QMQ_Q5_K, GRP, SPL, __VA_ARGS__);            \
+        else                            QM_LAUNCH_ONE(QMQ_Q6_K, GRP, SPL, __VA_ARGS__);            \
+    } while (0)
+
 // Dense fused-decode int8 GEMM (single weight, no routing). See pf_dense_gemm_qi8_kernel_g.
 bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const float* sx,
                                    const void* W_q, const float* row_scale, void* C_bf16,
                                    int M, int N, int K, cudaStream_t stream,
                                    int* partials, int partials_splits) {
-    if (!pfm_moe_gemm_qi8_supported(ggml_type)) return false;   // Q4_K / Q5_K only
+    if (!pf_dense_gemm_qi8_supported(ggml_type)) return false;   // Q4_K / Q5_K / Q6_K
     if (!row_scale || M <= 0) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;         // whole super-blocks only
     if (N <= 0 || (N % QM_BND) != 0) return false;               // tile-aligned output width
@@ -868,11 +1071,7 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
             // The atomic accumulator must start at zero; one [m][n] plane, not `splits` of them.
             if (atomic) cudaMemsetAsync(partials, 0, total * sizeof(int), stream);
             dim3 grid(splits, ntiles, mtiles);
-            if (ggml_type == QMQ_Q4_K)
-                pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, false, true><<<grid, 256, 0, stream>>>(
-                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, atomic);
-            else
-                pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, false, true><<<grid, 256, 0, stream>>>(
+            QM_LAUNCH_DENSE(false, true,
                     A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, atomic);
             // With the atomic accumulator every slice has already been summed, so the reduce pass
             // reads the single plane (splits=1 indexes exactly the [m][n] the atomics wrote).
@@ -882,10 +1081,7 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
         }
     }
     dim3 grid(ntiles, mtiles);
-    if (ggml_type == QMQ_Q4_K)
-        pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, false><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{});
-    else
-        pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, false><<<grid, 256, 0, stream>>>(A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{});
+    QM_LAUNCH_DENSE(false, false, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{});
     return true;
 }
 
@@ -898,7 +1094,7 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
                                          int M, int K, cudaStream_t stream,
                                          int* partials, int partials_splits, size_t partials_cap,
                                          signed char* fuse_q, float* fuse_sx, int* out_fused) {
-    if (!pfm_moe_gemm_qi8_supported(ggml_type)) return false;
+    if (!pf_dense_gemm_qi8_supported(ggml_type)) return false;
     if (ngroup <= 0 || ngroup > PF_QGROUP_MAX || M <= 0) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;
     PfQGroup d{};
@@ -948,11 +1144,7 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
             // Every group's plane is packed back to back from `partials`, so one memset covers them.
             if (atomic) cudaMemsetAsync(partials, 0, (size_t)off * sizeof(int), stream);
             dim3 grid(splits, tiles, mtiles);
-            if (ggml_type == QMQ_Q4_K)
-                pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, true, true><<<grid, 256, 0, stream>>>(
-                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split, atomic);
-            else
-                pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, true, true><<<grid, 256, 0, stream>>>(
+            QM_LAUNCH_DENSE(true, true,
                     A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split, atomic);
             // The FFN's gate/up pair is consumed by nothing except the SwiGLU + int8 quantize that
             // follows it, so when the caller asks for that, apply the scale inside it and never
@@ -971,10 +1163,7 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
         }
     }
     dim3 grid(tiles, mtiles);
-    if (ggml_type == QMQ_Q4_K)
-        pf_dense_gemm_qi8_kernel_g<QMQ_Q4_K, true><<<grid, 256, 0, stream>>>(A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d);
-    else
-        pf_dense_gemm_qi8_kernel_g<QMQ_Q5_K, true><<<grid, 256, 0, stream>>>(A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d);
+    QM_LAUNCH_DENSE(true, false, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d);
     return true;
 }
 

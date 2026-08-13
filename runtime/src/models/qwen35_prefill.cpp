@@ -598,7 +598,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     auto proj_fused = [&](const bf16* A, const void* W, int wtype, const float* rs,
                           bf16* C, int n_out, int K, int rows = 0) {
         const int R = rows > 0 ? rows : N;
-        if (muse_qb && use_i8 && rs && n_out >= 128 && kernels::pfm_moe_gemm_qi8_supported(wtype)) {
+        if (muse_qb && use_i8 && rs && n_out >= 128 && kernels::pf_dense_gemm_qi8_supported(wtype)) {
             quant_a_i8(A, R, K);
             if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st,
                                                        qb_partials, QB_SPLITS))
@@ -840,7 +840,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     int ffn_fused_swiglu = 0;
                     if (muse_ffn_group && muse_qb && use_i8 && w.gate_rs && w.up_rs &&
                         gate_pf_type == up_pf_type &&
-                        kernels::pfm_moe_gemm_qi8_supported(gate_pf_type)) {
+                        kernels::pf_dense_gemm_qi8_supported(gate_pf_type)) {
                         const void*  Wf[2]  = { gate_pf, up_pf };
                         const float* rsf[2] = { w.gate_rs, w.up_rs };
                         void*        Cf[2]  = { ffg, ffu };
@@ -874,7 +874,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         // branch anyway (its sandwich norm needs the raw FFN output in ao).
                         bool down_fused = false;
                         if (!ffn_fused && muse_qb && w.down_rs &&
-                            kernels::pfm_moe_gemm_qi8_supported(w.down_qtype)) {
+                            kernels::pf_dense_gemm_qi8_supported(w.down_qtype)) {
                             down_fused = kernels::launch_prefill_gemm_qi8_dense(
                                 w.down_qtype, A_i8, sx, w.down_q, w.down_rs,
                                 ao + (size_t)fo * H, fn, H, ffn, st, qb_partials, QB_SPLITS);

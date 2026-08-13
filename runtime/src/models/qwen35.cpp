@@ -3605,7 +3605,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     if (c.muse_glimmer) {
         const char* qb_env = getenv("SPARKINFER_MUSE_PREFILL_QB");
         if (!qb_env || qb_env[0] != '0') {
-            auto fusable = [](int t) { return t == 12 || t == 13; };   // Q4_K / Q5_K
+            // Q6_K too: the dense fused GEMM decodes it now, so a Q6_K attn_v / ffn_down gets its
+            // row scales here instead of falling back to the per-layer materialize.
+            auto fusable = [](int t) { return t == 12 || t == 13 || t == 14; };  // Q4_K / Q5_K / Q6_K
             const int qd = c.n_q_heads * c.head_dim;                   // qdim (4096)
             const int kd = c.n_kv_heads * c.head_dim;                  // kvdim (256)
             const int ff = c.moe_ffn;                                  // dense FFN width (19968)
