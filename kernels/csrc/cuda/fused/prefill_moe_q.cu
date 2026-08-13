@@ -813,7 +813,8 @@ __global__ __launch_bounds__(256, 2) void pf_dense_gemm_qi8_kernel_g(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
         const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
         __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd,
-        int* __restrict__ partials = nullptr, int sb_per_split = 0, int atomic_acc = 0) {
+        int* __restrict__ partials = nullptr, int sb_per_split = 0, int atomic_acc = 0,
+        const signed char* __restrict__ A_pack = nullptr) {
     using namespace nvcuda;
     constexpr int BS = qm_bs<QT>();
     // Split-K takes blockIdx.x for the K slice and shifts the tile/M indices up one dimension.
@@ -891,7 +892,19 @@ __global__ __launch_bounds__(256, 2) void pf_dense_gemm_qi8_kernel_g(
     const int a_r   = tid >> 1;
     const int a_c16 = (tid & 1) * 16;
     const int a_row = (a_r < M) ? (p0 + a_r) : -1;
-    const signed char* const a_src0 = A_i8 + (size_t)max(a_row, 0) * K + a_c16;
+    // A tile source. In the row-major activation the 128 chunks one stage wants are K bytes apart,
+    // so a warp's 16 rows issue 16 sector requests for 512 B. `A_pack` is the same int8 bytes in
+    // the k-tiled [k/32][row][32] layout the quantizer also emits (qr_pack_off, prefill_quant_rows.cu):
+    // there a stage is one contiguous 4 KB block, i.e. 4 line requests for the same 512 B per warp.
+    // Nothing else changes -- same cp.async count, same bytes, same destination -- so the int8 the
+    // MMA consumes is bit-identical and A_pack == nullptr keeps the original addressing.
+    const bool apk = A_pack != nullptr;
+    const signed char* const a_src0 =
+        apk ? (A_pack + (size_t)p0 * 32 + (size_t)tid * 16)
+            : (A_i8 + (size_t)max(a_row, 0) * K + a_c16);
+    // Bytes between consecutive QM_BK-wide stages. Both layouts advance by a constant, so the K
+    // loop carries a running pointer and one add either way.
+    const size_t a_step = apk ? (size_t)Mtot * 32 : (size_t)QM_BK;
     // XOR swizzle on the 16 B chunk index. As rows are QM_BK = 32 B apart, so the eight rows one
     // ldmatrix phase gathers land on only 16 of the 32 banks and every A-side phase pays a 2-way
     // conflict. Flipping the chunk order on rows whose bit 2 is set spreads those eight rows over
@@ -944,7 +957,9 @@ __global__ __launch_bounds__(256, 2) void pf_dense_gemm_qi8_kernel_g(
     const int sb_hi = SPLIT ? min(nsb, sb_lo + sb_per_split) : nsb;
     if (sb_lo >= sb_hi) return;
     const int kend = sb_hi << 8;          // first K past this block's slice
-    stageA(0, a_src0 + (sb_lo << 8));
+    const signed char* a_ptr = a_src0 + (apk ? (size_t)(sb_lo << 3) * (size_t)Mtot * 32
+                                             : (size_t)(sb_lo << 8));
+    stageA(0, a_ptr);
     int abuf = 0, bbuf = 0;
 
     // Zero-fill only ever applies to a tile past N, and those rows never change, so both planes
@@ -978,7 +993,7 @@ __global__ __launch_bounds__(256, 2) void pf_dense_gemm_qi8_kernel_g(
 
         for (int kk = 0; kk < QM_SB; kk += QM_BK) {
             const int knext = sb * QM_SB + kk + QM_BK;
-            if (knext < kend) stageA(abuf ^ 1, a_src0 + knext);
+            if (knext < kend) { a_ptr += a_step; stageA(abuf ^ 1, a_ptr); }
             __pipeline_wait_prior(knext < kend ? 1 : 0);
             __syncthreads();
             if constexpr (K32) {
@@ -1227,7 +1242,8 @@ static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int
 bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const float* sx,
                                    const void* W_q, const float* row_scale, void* C_bf16,
                                    int M, int N, int K, cudaStream_t stream,
-                                   int* partials, int partials_splits, int* out_acc) {
+                                   int* partials, int partials_splits, int* out_acc,
+                                   const signed char* A_pack) {
     if (!pf_dense_gemm_qi8_supported(ggml_type)) return false;   // Q4_K / Q5_K / Q6_K
     if (!row_scale || M <= 0) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;         // whole super-blocks only
@@ -1257,7 +1273,8 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
             if (atomic) cudaMemsetAsync(partials, 0, total * sizeof(int), stream);
             dim3 grid(splits, ntiles, mtiles);
             QM_LAUNCH_DENSE(false, true,
-                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, atomic);
+                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, atomic,
+                    A_pack);
             // With the atomic accumulator every slice has already been summed, so the reduce pass
             // reads the single plane (splits=1 indexes exactly the [m][n] the atomics wrote).
             if (atomic && out_acc) { *out_acc = 1; return true; }   // consumer reads the int32
@@ -1267,7 +1284,8 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
         }
     }
     dim3 grid(ntiles, mtiles);
-    QM_LAUNCH_DENSE(false, false, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{});
+    QM_LAUNCH_DENSE(false, false, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, nullptr, 0, 0,
+                    A_pack);
     return true;
 }
 
@@ -1279,7 +1297,8 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
                                          void* const* C_bf16, const int* N, int ngroup,
                                          int M, int K, cudaStream_t stream,
                                          int* partials, int partials_splits, size_t partials_cap,
-                                         signed char* fuse_q, float* fuse_sx, int* out_fused) {
+                                         signed char* fuse_q, float* fuse_sx, int* out_fused,
+                                         const signed char* A_pack, signed char* fuse_qp) {
     if (!pf_dense_gemm_qi8_supported(ggml_type)) return false;
     if (ngroup <= 0 || ngroup > PF_QGROUP_MAX || M <= 0) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;
@@ -1331,14 +1350,15 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
             if (atomic) cudaMemsetAsync(partials, 0, (size_t)off * sizeof(int), stream);
             dim3 grid(splits, tiles, mtiles);
             QM_LAUNCH_DENSE(true, true,
-                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split, atomic);
+                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split, atomic,
+                    A_pack);
             // The FFN's gate/up pair is consumed by nothing except the SwiGLU + int8 quantize that
             // follows it, so when the caller asks for that, apply the scale inside it and never
             // materialize gate/up as bf16 at all: 20.4 MB of DRAM and one launch per layer gone.
             if (atomic && out_fused && fuse_q && ngroup == 2 && N[0] == N[1] &&
                 kernels::launch_prefill_swiglu_quant_i8_acc(
                     partials + d.poff[0], partials + d.poff[1], sx, d.rs[0], d.rs[1],
-                    fuse_q, fuse_sx, M, N[0], stream)) {
+                    fuse_q, fuse_sx, M, N[0], stream, fuse_qp)) {
                 *out_fused = 1;
                 return true;
             }
@@ -1349,7 +1369,8 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
         }
     }
     dim3 grid(tiles, mtiles);
-    QM_LAUNCH_DENSE(true, false, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d);
+    QM_LAUNCH_DENSE(true, false, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, nullptr, 0, 0,
+                    A_pack);
     return true;
 }
 

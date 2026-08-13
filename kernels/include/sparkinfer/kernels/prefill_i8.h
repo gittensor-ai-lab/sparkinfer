@@ -21,11 +21,16 @@ namespace sparkinfer { namespace kernels {
 // q[r,c] = round(x[r,c] / scale[r]).  x: [rows,cols] bf16 -> q: [rows,cols] int8, scale: [rows] fp32.
 // One warp per row. Used for both the per-token activation A and (once, resident) the weight W.
 // Muse: fold attn *= sigmoid(gate) into the row-quantize load phase (bit-identical).
+// `qp` (optional): also emit the k-tiled [k/32][row][32] copy for the dense prefill GEMM.
 bool launch_prefill_gate_quant_rows_i8(const void* x, const void* gate, signed char* q,
-                                      float* scale, int rows, int cols, cudaStream_t stream);
+                                      float* scale, int rows, int cols, cudaStream_t stream,
+                                      signed char* qp = nullptr);
 
-void launch_prefill_quantize_rows_i8(const void* x_bf16, signed char* q, float* scale,
-                                     int rows, int cols, cudaStream_t stream = nullptr);
+// Returns false only when `qp` was requested but the path that ran cannot write it (the
+// warp-per-row fallback), i.e. the caller's k-tiled copy is now stale and must not be used.
+bool launch_prefill_quantize_rows_i8(const void* x_bf16, signed char* q, float* scale,
+                                     int rows, int cols, cudaStream_t stream = nullptr,
+                                     signed char* qp = nullptr);
 
 // int8 GEMM:  C[M,N] = A[M,K] @ W^T,  W native GGUF [N,K] row-major (so C[m,n]=sum_k A[m,k]*W[n,k]).
 // A/W int8 with per-row scales sx[M] (per token) and sw[N] (per output channel). Output C is bf16

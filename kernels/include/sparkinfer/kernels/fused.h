@@ -36,7 +36,8 @@ void launch_add_rmsnorm2_q8_rows(const void* x_bf16, const void* residual_bf16,
 // RMSNorm + per-row int8 quantize in one pass (still writes the bf16). Bit-identical.
 bool launch_rmsnorm_quant_i8(const void* x, const void* weight, void* out,
                              signed char* q, float* scale, int rows, int cols,
-                             float eps, cudaStream_t stream);
+                             float eps, cudaStream_t stream,
+                             signed char* qp = nullptr);
 
 // Sandwich norm fed from the split-K int32 accumulator (skips the reduce + the bf16 round trip).
 void launch_norm_then_add_acc(const void* residual_bf16, const int* acc, const float* sxr,

@@ -39,9 +39,11 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
 bool launch_prefill_swiglu_quant_i8_acc(const int* acc_g, const int* acc_u, const float* sxr,
                                         const float* rs_g, const float* rs_u,
                                         signed char* q, float* scale, int rows, int cols,
-                                        cudaStream_t stream);
+                                        cudaStream_t stream, signed char* qp = nullptr);
 
-void launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed char* q, float* scale,
-                                    int rows, int cols, cudaStream_t stream = nullptr);
+// Returns false only when `qp` was requested but the path that ran cannot write it.
+bool launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed char* q, float* scale,
+                                    int rows, int cols, cudaStream_t stream = nullptr,
+                                    signed char* qp = nullptr);
 
 }} // namespace sparkinfer::kernels

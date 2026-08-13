@@ -301,6 +301,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                   : (size_t)FC * ffn);
     const size_t sx_n = (wide_a || moe_shared_i8) ? (size_t)N : (size_t)FC;
     signed char* A_i8 = need_i8 ? a8.alloc<signed char>(a_i8_sz) : nullptr;
+    // k-tiled [k/32][row][32] copy of the int8 activation for Muse's dense prefill GEMM. That
+    // kernel stages a 32-byte K slice of all 128 rows per pipeline step; out of the row-major A
+    // those chunks are K bytes apart, so a warp issues 16 sector requests for 512 B, while out of
+    // this layout the same stage is one contiguous 4 KB block -- 4 line requests. Measured on an
+    // RTX 5090 by feeding the GEMM a contiguous address for the same bytes: prefill@128 30.65 ms
+    // vs 32.21 ms, i.e. the scatter alone is 5% of the prefill. The quantizer writes it alongside
+    // the row-major output, so nothing else has to change and every other consumer is untouched.
+    // SPARKINFER_MUSE_QB_APACK=0 restores row-major staging (A/B in one binary).
+    const bool muse_apack = c.muse_glimmer && need_i8 && [] {
+        const char* e = getenv("SPARKINFER_MUSE_QB_APACK");
+        return !(e && e[0] == '0');
+    }();
+    signed char* A_i8p = muse_apack ? a8.alloc<signed char>(a_i8_sz) : nullptr;
     signed char* W_i8 = need_i8 ? a8.alloc<signed char>(maxw) : nullptr;
     float* sx = need_i8 ? a8.alloc<float>(sx_n) : nullptr;
     float* sw = need_i8 ? a8.alloc<float>((size_t)maxNO) : nullptr;
@@ -333,6 +346,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     int* sk_p = want_sk ? a8.alloc<int>((size_t)N * maxNO) : nullptr;
     if (need_i8 && !a8.ok) {
         a8.free_all();
+        A_i8p = nullptr;
         use_i8 = false;
         use_i8_ffn = false;
         use_i8_attn = false;
@@ -559,9 +573,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // bit-identical, it reuses the exact bytes the first call produced. The memo is reset at
     // every layer top (xn/hn refresh in place) and wherever A_i8 is written outside proj().
     const bf16* a_q = nullptr; int a_qR = 0, a_qK = 0;
+    // Whether A_i8p currently holds the k-tiled copy of what is in A_i8. Every writer of A_i8
+    // either refreshes it or clears this, so a stale copy can never reach the GEMM.
+    bool a_pk = false;
+    auto apk = [&]() -> const signed char* { return a_pk ? A_i8p : nullptr; };
     auto quant_a_i8 = [&](const bf16* A, int R, int K) {
         if (a_q == A && a_qR == R && a_qK == K) return;
-        kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, R, K, st);
+        a_pk = kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, R, K, st, A_i8p) && A_i8p;
         a_q = A; a_qR = R; a_qK = K;
     };
     // int8 tensor-core GEMM with the Muse-only split-K fan-out tried first. Everything else keeps
@@ -592,7 +610,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         } else if ((use_fp8_gdn || moe_fp8) && n_out >= 128) {
             // fp8 (e4m3) tensor-core path for the long-ctx GDN projections. A_i8/W_i8 (1 byte) hold
             // the e4m3 operands; dequant the weight to bf16 scratch, then row/channel fp8-quantize.
-            a_q = nullptr;                              // A_i8 becomes e4m3 -- invalidate the memo
+            a_q = nullptr; a_pk = false;                // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, R, K, st);
             const void* wb = dq(W, wtype, n_out, K);
             kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, n_out, K, st);
@@ -659,7 +677,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (muse_qb && use_i8 && rs && n_out >= 128 && kernels::pf_dense_gemm_qi8_supported(wtype)) {
             quant_a_i8(A, R, K);
             if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st,
-                                                       qb_partials, QB_SPLITS, acc))
+                                                       qb_partials, QB_SPLITS, acc, apk()))
                 return;
         }
         proj(A, W, wtype, C, n_out, K, rows);
@@ -670,7 +688,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (muse_qb && use_i8 && rs && n_out >= 128 && kernels::pf_dense_gemm_qi8_supported(wtype)) {
             quant_a_i8(A, R, K);
             if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st,
-                                                       qb_partials, QB_SPLITS))
+                                                       qb_partials, QB_SPLITS, nullptr, apk()))
                 return;
         }
         proj(A, W, wtype, C, n_out, K, rows);
@@ -685,7 +703,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool fp8_shareq = (use_fp8_gdn || moe_fp8) && (!_pshareq || _pshareq[0] != '0');
     auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w) {
         if (fp8_shareq) {
-            a_q = nullptr;                              // A_i8 becomes e4m3 -- invalidate the memo
+            a_q = nullptr; a_pk = false;                // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);   // xn -> e4m3 once
             const void* wb = dq(w.wqkv, w.wqkv_type, lqkv, H);
             kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lqkv, H, st);
@@ -728,7 +746,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
-        a_q = nullptr;                                 // xn/hn are refreshed in place each layer
+        a_q = nullptr; a_pk = false;                   // xn/hn are refreshed in place each layer
         bool attn_fused = false;                       // post-attn residual folded into the proj?
         // Set when the o / ffn_down split-K accumulator was left un-reduced for the sandwich
         // norm to consume directly. Per layer: qb_partials is reused by the next GEMM.
@@ -793,7 +811,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     quant_a_i8(xn, N, H);
                     grouped = kernels::launch_prefill_gemm_qi8_dense_group(
                         w.wq_type, A_i8, sx, Wa, rsa, Ca, na, ng, N, H, st,
-                        qb_partials, QB_SPLITS, qb_partials_cap);
+                        qb_partials, QB_SPLITS, qb_partials_cap,
+                        nullptr, nullptr, nullptr, apk());
                 }
                 if (!grouped) { inq = ing = ink = inv = false; }
                 if (!inq) proj_fused(xn, w.wq,    w.wq_type,    w.wq_rs,    qb, qdim,  H);
@@ -841,8 +860,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             bool gate_fused = false;
             if (c.muse_glimmer && muse_qb && use_i8 && w.wo_rs && H >= 128 &&
                 kernels::pf_dense_gemm_qi8_supported(w.wo_type) &&
-                kernels::launch_prefill_gate_quant_rows_i8(att, qg, A_i8, sx, N, qdim, st)) {
+                kernels::launch_prefill_gate_quant_rows_i8(att, qg, A_i8, sx, N, qdim, st,
+                                                           A_i8p)) {
                 a_q = att; a_qR = N; a_qK = qdim;      // quant_a_i8(att, N, qdim) is now a no-op
+                a_pk = A_i8p != nullptr;
                 gate_fused = true;
             }
             if (!gate_fused) kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
@@ -874,8 +895,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // pass. Only when one chunk covers the prompt: a second chunk would need A_i8/sx again
             // after the first has overwritten them. The bf16 hn is still written either way.
             if (muse_ffn_group && muse_qb && use_i8 && FC >= N &&
-                kernels::launch_rmsnorm_quant_i8(h, w.ffn_norm, hn, A_i8, sx, N, H, eps, st)) {
+                kernels::launch_rmsnorm_quant_i8(h, w.ffn_norm, hn, A_i8, sx, N, H, eps, st,
+                                                 A_i8p)) {
                 hn_quantized = true;
+                // This kernel writes A_i8 itself, so it owns the k-tiled copy's validity too --
+                // the memo below makes quant_a_i8 a no-op, which would otherwise leave a_pk
+                // asserting the ATTENTION activation still packed at cols=qdim.
+                a_pk = A_i8p != nullptr;
             } else {
                 kernels::launch_rmsnorm(h, w.ffn_norm, hn, N, H, eps, st);
             }
@@ -917,11 +943,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 const bf16* hn_c = hn + (size_t)fo * H;
                 if (ffn_i8) {
                     a_q = nullptr;                     // this branch writes A_i8/sx directly
-                    kernels::launch_prefill_quantize_rows_i8(hn_c, A_i8, sx, fn, H, st);
+                    a_pk = kernels::launch_prefill_quantize_rows_i8(hn_c, A_i8, sx, fn, H, st,
+                                                                    A_i8p) && A_i8p;
                     kernels::launch_prefill_gemm_i8(A_i8, ffn_Wg_i8, sx, ffn_swg, ffg, fn, ffn, H, st);
                     kernels::launch_prefill_gemm_i8(A_i8, ffn_Wu_i8, sx, ffn_swu, ffu, fn, ffn, H, st);
                     // fused SwiGLU + int8 quantize for the down input (skips the ffg DRAM round-trip)
-                    kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st);
+                    a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st,
+                                                                   A_i8p) && A_i8p;
                     if (ffn_fused)
                         kernels::launch_prefill_gemm_i8_resid(A_i8, ffn_Wd_i8, sx, ffn_swd,
                                                               x + (size_t)fo * H, fn, H, ffn, st);
@@ -952,7 +980,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         ffn_grouped = kernels::launch_prefill_gemm_qi8_dense_group(
                             gate_pf_type, A_i8, sx, Wf, rsf, Cf, nf, 2, fn, H, st,
                             qb_partials, QB_SPLITS, qb_partials_cap,
-                            A_i8, sx, &ffn_fused_swiglu);
+                            A_i8, sx, &ffn_fused_swiglu, apk(), A_i8p);
                     }
                     if (!ffn_grouped) {
                         proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
@@ -963,8 +991,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         // runs (bit-identical to swiglu-then-quantize; both bf16-round first) --
                         // skips the ffg store + reload that proj()'s internal quantize would pay.
                         a_q = nullptr;                 // swiglu_quant writes A_i8/sx directly
+                        // The fused epilogue already emitted the k-tiled copy (fuse_qp below).
                         if (!ffn_fused_swiglu)
-                            kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st);
+                            a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn,
+                                                                          ffn, st, A_i8p) && A_i8p;
+                        else
+                            a_pk = A_i8p != nullptr;
                         // Fused quantized-B down projection. The activation is ALREADY in A_i8/sx
                         // (the fused SwiGLU wrote it), so this cannot go through proj_fused, which
                         // would re-quantize -- call the dense fused GEMM directly. Only the
@@ -979,7 +1011,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                             down_fused = kernels::launch_prefill_gemm_qi8_dense(
                                 w.down_qtype, A_i8, sx, w.down_q, w.down_rs,
                                 ao + (size_t)fo * H, fn, H, ffn, st, qb_partials, QB_SPLITS,
-                                (fn == N) ? &ffn_acc : nullptr);
+                                (fn == N) ? &ffn_acc : nullptr, apk());
                         }
                         if (!down_fused) {
                             if (!kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q,

@@ -24,8 +24,14 @@ namespace kernels {
 //
 // Env knobs:
 //   SPARKINFER_PREFILL_QUANT_ROWS  (default 1)  0 disables (A/B) -> falls through to #422's kernel.
+//   qp (optional)  when non-null, ALSO write the k-tiled [k/32][row][32] copy of the same int8
+//                  bytes that the Muse dense prefill GEMM stages its A tile from (see
+//                  qr_pack_off in the .cu). The row-major output is unaffected, so every other
+//                  consumer is unchanged; qp must have room for rows*cols bytes. Ignored when
+//                  cols is not a whole number of 32-column groups.
 bool launch_prefill_quant_rows_fast(const void* x, signed char* q, float* scale,
-                                    int rows, int cols, cudaStream_t stream = nullptr);
+                                    int rows, int cols, cudaStream_t stream = nullptr,
+                                    signed char* qp = nullptr);
 
 }  // namespace kernels
 }  // namespace sparkinfer

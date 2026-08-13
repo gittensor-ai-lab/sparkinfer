@@ -66,10 +66,17 @@ __global__ void pf_swiglu_quant_i8_kernel(const __nv_bfloat16* __restrict__ gate
 // (exact and associative, so the changed thread->value map cannot move the max), same
 // `s_warp[0] == 0.f` guard and the same `h / d` -- NOT h * (1/d), which differs in the last ulp.
 // The static trip count is what keeps hv[] in registers; a `c += blockDim.x` loop would spill it.
+// See qr_pack_off in prefill_quant_rows.cu: the k-tiled [k/32][row][32] copy the Muse dense prefill
+// GEMM stages its A tile from. Written alongside the row-major output, never instead of it.
+__device__ __forceinline__ size_t sq_pack_off(int r, int c, int rows) {
+    return (size_t)(c >> 5) * (size_t)rows * 32 + (size_t)r * 32 + (size_t)(c & 31);
+}
+
 template <int MAXV>
 __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_reg_kernel(
         const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
-        signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols) {
+        signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols,
+        signed char* __restrict__ qp) {
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * cols;
@@ -101,8 +108,11 @@ __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_reg_kernel(
     #pragma unroll
     for (int i = 0; i < MAXV; i++) {
         const int c = threadIdx.x + i * 1024;
-        if (c < cols)
-            q[base + c] = (signed char)((s_warp[0] == 0.f) ? 0 : (int)roundf(hv[i] / d));
+        if (c < cols) {
+            const signed char v8 = (signed char)((s_warp[0] == 0.f) ? 0 : (int)roundf(hv[i] / d));
+            q[base + c] = v8;
+            if (qp) qp[sq_pack_off(row, c, rows)] = v8;
+        }
     }
 }
 
@@ -120,7 +130,8 @@ __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_acc_kernel(
         const int* __restrict__ acc_g, const int* __restrict__ acc_u,
         const float* __restrict__ sxr, const float* __restrict__ rs_g,
         const float* __restrict__ rs_u,
-        signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols) {
+        signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols,
+        signed char* __restrict__ qp) {
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * cols;
@@ -154,8 +165,11 @@ __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_acc_kernel(
     #pragma unroll
     for (int i = 0; i < MAXV; i++) {
         const int c = threadIdx.x + i * 1024;
-        if (c < cols)
-            q[base + c] = (signed char)((s_warp[0] == 0.f) ? 0 : (int)roundf(hv[i] / d));
+        if (c < cols) {
+            const signed char v8 = (signed char)((s_warp[0] == 0.f) ? 0 : (int)roundf(hv[i] / d));
+            q[base + c] = v8;
+            if (qp) qp[sq_pack_off(row, c, rows)] = v8;
+        }
     }
 }
 } // namespace
@@ -165,22 +179,24 @@ __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_acc_kernel(
 bool launch_prefill_swiglu_quant_i8_acc(const int* acc_g, const int* acc_u, const float* sxr,
                                         const float* rs_g, const float* rs_u,
                                         signed char* q, float* scale, int rows, int cols,
-                                        cudaStream_t stream) {
+                                        cudaStream_t stream, signed char* qp) {
+    if (qp && (cols % 32) != 0) qp = nullptr;
     static const bool on = [] {
         const char* e = getenv("SPARKINFER_MUSE_FFN_FUSE_ACC");
         return !(e && e[0] == '0');
     }();
     const int nv = (cols + 1023) / 1024;
     if (!on || cols < 2048 || nv > 20) return false;
-    if (nv <= 8)       pf_swiglu_quant_i8_acc_kernel<8><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols);
-    else if (nv <= 12) pf_swiglu_quant_i8_acc_kernel<12><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols);
-    else if (nv <= 16) pf_swiglu_quant_i8_acc_kernel<16><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols);
-    else               pf_swiglu_quant_i8_acc_kernel<20><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols);
+    if (nv <= 8)       pf_swiglu_quant_i8_acc_kernel<8><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp);
+    else if (nv <= 12) pf_swiglu_quant_i8_acc_kernel<12><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp);
+    else if (nv <= 16) pf_swiglu_quant_i8_acc_kernel<16><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp);
+    else               pf_swiglu_quant_i8_acc_kernel<20><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp);
     return true;
 }
 
-void launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed char* q, float* scale,
-                                    int rows, int cols, cudaStream_t stream) {
+bool launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed char* q, float* scale,
+                                    int rows, int cols, cudaStream_t stream, signed char* qp) {
+    if (qp && (cols % 32) != 0) qp = nullptr;
     // Narrow rows (the MoE per-expert ffn) do not fill a 1024-wide block, and rows wider than
     // 20*1024 exceed the register budget; both keep the strided kernel.
     // SPARKINFER_PREFILL_SWIGLU_REG=0 restores it everywhere (A/B).
@@ -192,15 +208,17 @@ void launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed cha
     if (reg_ok && cols >= 2048 && nv <= 20) {
         auto* g = reinterpret_cast<const __nv_bfloat16*>(gate);
         auto* u = reinterpret_cast<const __nv_bfloat16*>(up);
-        if (nv <= 8)       pf_swiglu_quant_i8_reg_kernel<8><<<rows, 1024, 0, stream>>>(g, u, q, scale, rows, cols);
-        else if (nv <= 12) pf_swiglu_quant_i8_reg_kernel<12><<<rows, 1024, 0, stream>>>(g, u, q, scale, rows, cols);
-        else if (nv <= 16) pf_swiglu_quant_i8_reg_kernel<16><<<rows, 1024, 0, stream>>>(g, u, q, scale, rows, cols);
-        else               pf_swiglu_quant_i8_reg_kernel<20><<<rows, 1024, 0, stream>>>(g, u, q, scale, rows, cols);
-        return;
+        if (nv <= 8)       pf_swiglu_quant_i8_reg_kernel<8><<<rows, 1024, 0, stream>>>(g, u, q, scale, rows, cols, qp);
+        else if (nv <= 12) pf_swiglu_quant_i8_reg_kernel<12><<<rows, 1024, 0, stream>>>(g, u, q, scale, rows, cols, qp);
+        else if (nv <= 16) pf_swiglu_quant_i8_reg_kernel<16><<<rows, 1024, 0, stream>>>(g, u, q, scale, rows, cols, qp);
+        else               pf_swiglu_quant_i8_reg_kernel<20><<<rows, 1024, 0, stream>>>(g, u, q, scale, rows, cols, qp);
+        return true;
     }
     pf_swiglu_quant_i8_kernel<<<rows, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(gate), reinterpret_cast<const __nv_bfloat16*>(up),
         q, scale, rows, cols);
+    // The strided fallback has no k-tiled output: report the caller's packed copy as stale.
+    return qp == nullptr;
 }
 
 }} // namespace sparkinfer::kernels

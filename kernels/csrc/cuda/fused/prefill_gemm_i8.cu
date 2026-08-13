@@ -304,13 +304,15 @@ bool launch_prefill_gemm_i8_splitk(const signed char* A, const signed char* W,
     return true;
 }
 
-void launch_prefill_quantize_rows_i8(const void* x_bf16, signed char* q, float* scale,
-                                     int rows, int cols, cudaStream_t stream) {
+bool launch_prefill_quantize_rows_i8(const void* x_bf16, signed char* q, float* scale,
+                                     int rows, int cols, cudaStream_t stream, signed char* qp) {
     // Block-parallel single-pass path (one block per row, row held in registers; bit-identical).
     // SPARKINFER_PREFILL_QUANT_ROWS=0 restores the warp-per-row kernel below.
-    if (launch_prefill_quant_rows_fast(x_bf16, q, scale, rows, cols, stream)) return;
+    if (launch_prefill_quant_rows_fast(x_bf16, q, scale, rows, cols, stream, qp)) return true;
     pf_quantize_rows_i8<<<rows, 32, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_bf16), q, scale, rows, cols);
+    // The warp-per-row fallback has no k-tiled output, so tell the caller its packed copy is stale.
+    return qp == nullptr;
 }
 
 void launch_prefill_gemm_i8(const signed char* A, const signed char* W,

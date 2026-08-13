@@ -853,7 +853,7 @@ template <int MAXP>
 __global__ __launch_bounds__(256) void rmsnorm_quant_i8_kernel(
         const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
         __nv_bfloat16* __restrict__ out, signed char* __restrict__ q, float* __restrict__ scale,
-        int rows, int cols, float eps) {
+        int rows, int cols, float eps, signed char* __restrict__ qp) {
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * cols;
@@ -920,12 +920,23 @@ __global__ __launch_bounds__(256) void rmsnorm_quant_i8_kernel(
             o8[j] = (signed char)((amax_row == 0.f) ? 0
                                  : (int)roundf(__bfloat162float(reg[held][j]) / d));
         *reinterpret_cast<uint2*>(&q[base + p * 8]) = *reinterpret_cast<const uint2*>(o8);
+        // Same bytes in the k-tiled [k/32][row][32] layout the dense prefill GEMM stages from
+        // (qr_pack_off, prefill_quant_rows.cu). This kernel is the pre-FFN norm's fused quantize,
+        // so it is one of the writers of that activation and has to emit both.
+        if (qp) {
+            const int c = p * 8;
+            *reinterpret_cast<uint2*>(
+                &qp[(size_t)(c >> 5) * (size_t)rows * 32 + (size_t)row * 32 + (size_t)(c & 31)]) =
+                *reinterpret_cast<const uint2*>(o8);
+        }
     }
 }
 
 bool launch_rmsnorm_quant_i8(const void* x, const void* weight, void* out,
                              signed char* q, float* scale,
-                             int rows, int cols, float eps, cudaStream_t stream) {
+                             int rows, int cols, float eps, cudaStream_t stream,
+                             signed char* qp) {
+    if (qp && (cols % 32) != 0) qp = nullptr;
     static const int enabled = [] {
         const char* e = getenv("SPARKINFER_PREFILL_NORM_QUANT");
         return (e && e[0] == '0') ? 0 : 1;
@@ -936,9 +947,9 @@ bool launch_rmsnorm_quant_i8(const void* x, const void* weight, void* out,
     auto xb = reinterpret_cast<const __nv_bfloat16*>(x);
     auto wb = reinterpret_cast<const __nv_bfloat16*>(weight);
     auto ob = reinterpret_cast<__nv_bfloat16*>(out);
-    if (per <= 1)      rmsnorm_quant_i8_kernel<1><<<rows, 256, 0, stream>>>(xb, wb, ob, q, scale, rows, cols, eps);
-    else if (per <= 2) rmsnorm_quant_i8_kernel<2><<<rows, 256, 0, stream>>>(xb, wb, ob, q, scale, rows, cols, eps);
-    else if (per <= 4) rmsnorm_quant_i8_kernel<4><<<rows, 256, 0, stream>>>(xb, wb, ob, q, scale, rows, cols, eps);
+    if (per <= 1)      rmsnorm_quant_i8_kernel<1><<<rows, 256, 0, stream>>>(xb, wb, ob, q, scale, rows, cols, eps, qp);
+    else if (per <= 2) rmsnorm_quant_i8_kernel<2><<<rows, 256, 0, stream>>>(xb, wb, ob, q, scale, rows, cols, eps, qp);
+    else if (per <= 4) rmsnorm_quant_i8_kernel<4><<<rows, 256, 0, stream>>>(xb, wb, ob, q, scale, rows, cols, eps, qp);
     else return false;
     return true;
 }

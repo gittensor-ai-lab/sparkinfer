@@ -54,7 +54,12 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
                                    const void* W_q, const float* row_scale, void* C_bf16,
                                    int M, int N, int K, cudaStream_t stream = nullptr,
                                    int* partials = nullptr, int partials_splits = 0,
-                                   int* out_acc = nullptr);
+                                   int* out_acc = nullptr,
+                                   // Optional k-tiled [k/32][row][32] copy of A_i8 (see
+                                   // qr_pack_off, prefill_quant_rows.cu). Same bytes, staged with
+                                   // a quarter of the memory transactions; nullptr keeps the
+                                   // row-major addressing. Output is bit-identical either way.
+                                   const signed char* A_pack = nullptr);
 
 // Fuse up to 4 projections sharing A_i8/sx (same M, same K) into ONE grid. At prefill's M=128 a
 // projection's grid is ceil(N/64) CTAs -- 64 for a 4096-wide q/gate but only 4 for a 256-wide
@@ -70,7 +75,11 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
                                          // Fuse the FFN's SwiGLU + int8 quantize into the split-K
                                          // epilogue: gate/up never become bf16. Sets *out_fused.
                                          signed char* fuse_q = nullptr, float* fuse_sx = nullptr,
-                                         int* out_fused = nullptr);
+                                         int* out_fused = nullptr,
+                                         const signed char* A_pack = nullptr,
+                                         // k-tiled copy of the fused SwiGLU's int8 output, for the
+                                         // down projection that consumes it next.
+                                         signed char* fuse_qp = nullptr);
 
 } // namespace kernels
 } // namespace sparkinfer
