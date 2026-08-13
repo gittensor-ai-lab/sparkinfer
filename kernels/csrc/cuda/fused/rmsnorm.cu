@@ -801,9 +801,15 @@ __global__ void norm_then_add_acc_kernel(const __nv_bfloat16* __restrict__ resid
         }
     };
 
+    // Hold the scaled values across the two passes: `acc` is int32, so a second read of it is 4 B
+    // per element on a kernel already at the DRAM roofline (10.2 MB moved per launch at H=6656).
+    __nv_bfloat16 keep[4][8];
+    int held = 0;
     float ss = 0.f;
-    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+    for (int p = threadIdx.x; p < npack; p += blockDim.x, held++) {
         float bv[8]; load8(p, bv);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) keep[held][j] = __float2bfloat16(bv[j]);
         #pragma unroll
         for (int j = 0; j < 8; j++) ss = __fmaf_rn(bv[j], bv[j], ss);
     }
@@ -825,8 +831,11 @@ __global__ void norm_then_add_acc_kernel(const __nv_bfloat16* __restrict__ resid
     const uint4* w4 = reinterpret_cast<const uint4*>(weight);
     const uint4* r4 = reinterpret_cast<const uint4*>(residual + base);
     uint4* o4 = reinterpret_cast<uint4*>(out + base);
-    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
-        float bv[8]; load8(p, bv);
+    held = 0;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x, held++) {
+        float bv[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) bv[j] = __bfloat162float(keep[held][j]);
         float rv[8]; rn_unpack8(__ldg(r4 + p), rv);
         float wv[8]; rn_unpack8(__ldg(w4 + p), wv);
         float ov[8];

@@ -327,6 +327,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // 13 is the peak, and raising QM_TARGET_BLOCKS with it only adds atomic traffic (swept too).
     constexpr int QB_SPLITS = 13;
     const size_t qb_partials_cap = (size_t)QB_SPLITS * (size_t)N * (size_t)maxNO;
+    // LM-head activation, quantized once (see the seed argmax at the end of this function).
+    signed char* lm_q8 = a8.alloc<signed char>((size_t)H + 32);
+    float* lm_ad = a8.alloc<float>((size_t)(H >> 5) + 1);
+    float* lm_as = a8.alloc<float>((size_t)(H >> 5) + 1);
+
     int* qb_partials = (c.muse_glimmer && use_i8 && N <= 128)
         ? a8.alloc<int>(qb_partials_cap) : nullptr;
     // Muse Glimmer split-K partials for the skinny projections. launch_prefill_gemm_i8 puts one
@@ -1550,7 +1555,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
     // Seed for the first decode step: argmax at the last prompt position (xn already = final norm).
     const bf16* xn_last = xn + (size_t)(N - 1) * H;
-    if (s.w.lm_head_type)
+    // Q4_K head: quantize the activation ONCE and run the pre-quantized dp4a GEMV. gemv.cu calls
+    // this BIT-EXACT vs the in-kernel path -- same Q8_1 values, same dp4a -- and it drops the
+    // per-block re-quantization of the same 6656-value activation, which at vocab-many rows is the
+    // larger half of what that one launch reads after the weights themselves.
+    if (s.w.lm_head_type == 12 && lm_q8 && lm_ad && lm_as) {
+        kernels::launch_quantize_q8_1(xn_last, lm_q8, lm_ad, lm_as, H, st);
+        kernels::launch_gemv_q_dp4a_pq_f32(lm_q8, lm_ad, lm_as, s.w.lm_head, s.logits, c.vocab, H, st);
+    } else if (s.w.lm_head_type)
         kernels::launch_gemv_q_f32(xn_last, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
     else
         kernels::launch_gemv_f32(xn_last, s.w.lm_head, s.logits, c.vocab, H, st);

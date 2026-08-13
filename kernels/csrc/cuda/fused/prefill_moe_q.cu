@@ -47,6 +47,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdlib>
+#include <cmath>
 #include <cuda_pipeline.h>
 #include <mma.h>
 
@@ -339,10 +340,16 @@ template <int QT>
 __device__ __forceinline__ void qm_stage_fetch(const unsigned char* __restrict__ blk, int j64,
                                                QmStage<QT>& s) {
     if constexpr (QT == QMQ_Q4_K) {
-        s.hdr = *reinterpret_cast<const uint4*>(blk);
+        // __ldcs = evict-first. The weight stream is read exactly once and never revisited, but it
+        // is 14.2 GB per prefill pushed through a 96 MB L2 that other things genuinely want: the
+        // k-tiled activation tile every N-tile re-reads, and the int32 split-K accumulator the
+        // fused SwiGLU reads microseconds after the GEMM's red.add wrote it. Marking the weights
+        // streaming stops them evicting either. Same bytes, same values -- only which cache line
+        // survives changes.
+        s.hdr = __ldcs(reinterpret_cast<const uint4*>(blk));
         const unsigned char* qb = blk + 16 + j64 * 32;
-        s.q0 = *reinterpret_cast<const uint4*>(qb);
-        s.q1 = *reinterpret_cast<const uint4*>(qb + 16);
+        s.q0 = __ldcs(reinterpret_cast<const uint4*>(qb));
+        s.q1 = __ldcs(reinterpret_cast<const uint4*>(qb + 16));
     } else {
         s.blk = blk;
     }
@@ -1203,6 +1210,45 @@ static int qm_atomic_acc() {
     return e;
 }
 
+// Resident block slots on this device for a __launch_bounds__(256, 2) kernel.
+static int qm_block_slots() {
+    static int slots = 0;
+    if (!slots) {
+        int dev = 0, sm = 170;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
+        slots = sm * 2;
+    }
+    return slots;
+}
+
+// Among the slice counts NOT LARGER than the one the block-target heuristic asked for, take the one
+// that leaves the fewest idle block slots in the final wave.
+//
+// Why this matters here: the grid is `splits * ntiles` blocks against `slots` of them, and at
+// Muse's prefill@128 those land badly. The q/gate/k/v group is 136 tiles, so 13 slices put 1768
+// blocks on 340 slots = 5.20 waves -- six waves of occupancy doing 5.20 waves of work -- while 5
+// slices give exactly 2.00. The o projection is 104 tiles: 8 slices = 2.45 waves, 6 slices = 1.84.
+// Only ever moving DOWN is deliberate: a larger slice count would also multiply the split-K atomic
+// traffic, and that is what made a plain "raise the block target" retune lose (swept 2560 -> 5600).
+// Ties break toward more slices, since shorter blocks balance the tail better.
+// SPARKINFER_MUSE_QB_WAVE=0 restores the plain heuristic (A/B; bit-identical either way).
+static int qm_wave_pick(int ntiles, int nsb, int want) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPARKINFER_MUSE_QB_WAVE"); on = (e && e[0] == '0') ? 0 : 1; }
+    if (!on || ntiles <= 0 || want <= 1) return want;
+    const double slots = (double)qm_block_slots();
+    int best = want; double best_eff = -1.0;
+    for (int sbp = 1; sbp <= nsb; sbp++) {
+        const int s = (nsb + sbp - 1) / sbp;
+        if (s > want) continue;
+        const double w = (double)s * (double)ntiles / slots;
+        const double eff = w / ceil(w);
+        if (eff > best_eff + 1e-9 || (eff > best_eff - 1e-9 && s > best)) { best_eff = eff; best = s; }
+    }
+    return best;
+}
+
 // K slices per launch. Shared by the single and grouped launchers so both fan out the same way.
 static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int partials_splits) {
     static int sk_env = -1;
@@ -1214,6 +1260,7 @@ static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int
         if (splits > partials_splits) splits = partials_splits;
         if (splits > nsb / 2) splits = nsb / 2;
         if (splits < 1) splits = 1;
+        splits = qm_wave_pick(ntiles, nsb, splits);
     }
     return splits;
 }
