@@ -127,11 +127,11 @@ __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_reg_kernel(
 // before, and everything downstream of that is the unchanged register-resident path.
 template <int MAXV>
 __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_acc_kernel(
-        const int* __restrict__ acc_g, const int* __restrict__ acc_u,
+        int* __restrict__ acc_g, int* __restrict__ acc_u,
         const float* __restrict__ sxr, const float* __restrict__ rs_g,
         const float* __restrict__ rs_u,
         signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols,
-        signed char* __restrict__ qp) {
+        signed char* __restrict__ qp, int zero_after) {
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * cols;
@@ -169,6 +169,11 @@ __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_acc_kernel(
             const signed char v8 = (signed char)((s_warp[0] == 0.f) ? 0 : (int)roundf(hv[i] / d));
             q[base + c] = v8;
             if (qp) qp[sq_pack_off(row, c, rows)] = v8;
+            // Hand both accumulator planes back zeroed. This MUST live in the store loop, not in
+            // the load loop above: this kernel runs 128 blocks of 1024 threads (under one block per
+            // SM), so it depends entirely on its MAXV unrolled loads being in flight together, and
+            // interleaving stores there serialised them -- 13.8 -> 153.7 us/call, an 11x blowup.
+            if (zero_after) { acc_g[base + c] = 0; acc_u[base + c] = 0; }
         }
     }
 }
@@ -176,10 +181,10 @@ __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_acc_kernel(
 
 // Returns false when the row is too wide/narrow for the register-resident form, in which case the
 // caller must keep the reduce + separate SwiGLU.
-bool launch_prefill_swiglu_quant_i8_acc(const int* acc_g, const int* acc_u, const float* sxr,
+bool launch_prefill_swiglu_quant_i8_acc(int* acc_g, int* acc_u, const float* sxr,
                                         const float* rs_g, const float* rs_u,
                                         signed char* q, float* scale, int rows, int cols,
-                                        cudaStream_t stream, signed char* qp) {
+                                        cudaStream_t stream, signed char* qp, int zero_after) {
     if (qp && (cols % 32) != 0) qp = nullptr;
     static const bool on = [] {
         const char* e = getenv("SPARKINFER_MUSE_FFN_FUSE_ACC");
@@ -187,10 +192,10 @@ bool launch_prefill_swiglu_quant_i8_acc(const int* acc_g, const int* acc_u, cons
     }();
     const int nv = (cols + 1023) / 1024;
     if (!on || cols < 2048 || nv > 20) return false;
-    if (nv <= 8)       pf_swiglu_quant_i8_acc_kernel<8><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp);
-    else if (nv <= 12) pf_swiglu_quant_i8_acc_kernel<12><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp);
-    else if (nv <= 16) pf_swiglu_quant_i8_acc_kernel<16><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp);
-    else               pf_swiglu_quant_i8_acc_kernel<20><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp);
+    if (nv <= 8)       pf_swiglu_quant_i8_acc_kernel<8><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp, zero_after);
+    else if (nv <= 12) pf_swiglu_quant_i8_acc_kernel<12><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp, zero_after);
+    else if (nv <= 16) pf_swiglu_quant_i8_acc_kernel<16><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp, zero_after);
+    else               pf_swiglu_quant_i8_acc_kernel<20><<<rows, 1024, 0, stream>>>(acc_g, acc_u, sxr, rs_g, rs_u, q, scale, rows, cols, qp, zero_after);
     return true;
 }
 

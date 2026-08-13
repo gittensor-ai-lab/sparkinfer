@@ -36,10 +36,11 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
 // SwiGLU + per-row int8 quantize fed directly from the grouped GEMM's split-K int32 accumulator,
 // skipping the reduce pass that would otherwise materialize gate/up as bf16 first. Returns false if
 // the shape is not eligible (caller keeps reduce + launch_prefill_swiglu_quant_i8).
-bool launch_prefill_swiglu_quant_i8_acc(const int* acc_g, const int* acc_u, const float* sxr,
+bool launch_prefill_swiglu_quant_i8_acc(int* acc_g, int* acc_u, const float* sxr,
                                         const float* rs_g, const float* rs_u,
                                         signed char* q, float* scale, int rows, int cols,
-                                        cudaStream_t stream, signed char* qp = nullptr);
+                                        cudaStream_t stream, signed char* qp = nullptr,
+                                        int zero_after = 0);
 
 // Returns false only when `qp` was requested but the path that ran cannot write it.
 bool launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed char* q, float* scale,

@@ -61,6 +61,10 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
                                    // row-major addressing. Output is bit-identical either way.
                                    const signed char* A_pack = nullptr);
 
+// True when the split-K consumers hand their accumulator plane back zeroed, so the caller must
+// zero the buffer once at allocation instead of the launcher zeroing it before every launch.
+bool pf_dense_zero_on_read();
+
 // Fuse up to 4 projections sharing A_i8/sx (same M, same K) into ONE grid. At prefill's M=128 a
 // projection's grid is ceil(N/64) CTAs -- 64 for a 4096-wide q/gate but only 4 for a 256-wide
 // k/v -- all far under a 5090's 170 SMs, so every launch costs a full CTA-duration regardless of

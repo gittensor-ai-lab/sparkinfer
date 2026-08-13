@@ -1167,25 +1167,32 @@ bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float
 
 // Sum the split-K int32 partials and apply sx*row_scale once. The sum is over int32, so the total
 // is exactly what the unsplit kernel accumulated and the bf16 store sees an identical value.
-__global__ void pf_dense_splitk_reduce_kernel(const int* __restrict__ partials,
+__global__ void pf_dense_splitk_reduce_kernel(int* __restrict__ partials,
                                               const float* __restrict__ sx,
                                               const float* __restrict__ row_scale,
                                               __nv_bfloat16* __restrict__ C,
-                                              int Mtot, int N, int splits) {
+                                              int Mtot, int N, int splits, int zero_after) {
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)Mtot * (size_t)N) return;
     const int m = (int)(idx / (size_t)N);
     const int n = (int)(idx - (size_t)m * (size_t)N);
     int acc = 0;
-    for (int s = 0; s < splits; s++) acc += partials[((size_t)s * Mtot + m) * N + n];
+    for (int s = 0; s < splits; s++) {
+        const size_t off = ((size_t)s * Mtot + m) * N + n;
+        acc += partials[off];
+        // Hand the plane back zeroed for the next layer. This kernel has the line in cache already
+        // (it just read it), so the store rides along instead of costing a separate memset pass.
+        if (zero_after) partials[off] = 0;
+    }
     C[idx] = __float2bfloat16((float)acc * sx[m] * row_scale[n]);
 }
 
 // Grouped split-K reduce. One launch covers every group: the flattened column picks the group
 // from the same tile prefix sum the GEMM prologue uses, so no per-group reduce launches are needed.
-__global__ void pf_dense_splitk_reduce_group_kernel(const int* __restrict__ partials,
+__global__ void pf_dense_splitk_reduce_group_kernel(int* __restrict__ partials,
                                                     const float* __restrict__ sx,
-                                                    PfQGroup gd, int Mtot, int ncol, int splits) {
+                                                    PfQGroup gd, int Mtot, int ncol, int splits,
+                                                    int zero_after) {
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)Mtot * (size_t)ncol) return;
     const int m    = (int)(idx / (size_t)ncol);
@@ -1196,9 +1203,13 @@ __global__ void pf_dense_splitk_reduce_group_kernel(const int* __restrict__ part
         if (i < gd.ngroup && rest >= gd.first[i] * QM_BND) g = i;
     const int n = rest - gd.first[g] * QM_BND;
     const int N = gd.N[g];
-    const int* base = partials + (size_t)gd.poff[g];
+    int* base = partials + (size_t)gd.poff[g];
     int acc = 0;
-    for (int s = 0; s < splits; s++) acc += base[((size_t)s * Mtot + m) * N + n];
+    for (int s = 0; s < splits; s++) {
+        const size_t off = ((size_t)s * Mtot + m) * N + n;
+        acc += base[off];
+        if (zero_after) base[off] = 0;
+    }
     gd.C[g][(size_t)m * N + n] = __float2bfloat16((float)acc * sx[m] * gd.rs[g][n]);
 }
 
@@ -1247,18 +1258,76 @@ static int qm_wave_pick(int ntiles, int nsb, int want) {
         if (eff > best_eff + 1e-9 || (eff > best_eff - 1e-9 && s > best)) { best_eff = eff; best = s; }
     }
     return best;
+
+// `partials_splits` is how many private [m][n] planes the caller budgeted, so it bounds the slice
+// count only while each slice stores its own plane. The atomic accumulator sums every slice into
+// ONE plane, so under it the buffer says nothing about how finely K may be cut -- the real limits
+// are the target block count and "at least one whole super-block per slice". Leaving the plane
+// budget in place capped the 104-tile o/down launches at 8 slices when the chooser asked for 25,
+// i.e. 832 blocks of a 510-block device: 1.6 waves, and the second one two-thirds empty.
+// SPARKINFER_MUSE_QB_UNCAP=0 restores the plane-budget cap (A/B in one binary).
+static int qm_uncap_splits() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_MUSE_QB_UNCAP"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e;
+}
+
+// Minimum super-blocks a slice must own. Removing the plane cap alone is not the answer: it lets a
+// shallow-K launch be cut until each block holds almost no K, and then the per-block prologue and
+// the atomic epilogue cost more than the extra parallelism buys. Measured at M=128 -- ffn_down
+// (nsb=78) gains 5.3% going 8 -> 20 slices, while q/gate/k/v (nsb=26) LOSES 0.6% going 7 -> 13.
+// The floor is per-slice work, not a fraction of nsb.
+static int qm_min_sb_per_split() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_MUSE_QB_MINSB"); e = v ? atoi(v) : 4; }
+    return e < 1 ? 1 : e;
+}
+
+// The atomic accumulator needs its plane to start at zero, which cost a cudaMemsetAsync before
+// EVERY split launch: 2.07 GB per prefill at M=128, and 234 extra kernels sitting on the stream
+// between each GEMM and the consumer that reads its result. Priced by skipping them outright
+// (wrong output, timing only): +5.37% -- well above the 0.72 ms of GPU-busy nsys attributes to
+// them, because the gaps they open in the pipeline cost more than their own runtime.
+//
+// Instead the consumer hands the plane back zeroed. Every element the GEMM wrote is read exactly
+// once -- by the reduce, or for the FFN pair by the fused SwiGLU -- so the zero store rides on a
+// line that is already in cache, and stream ordering does the rest: GEMM atomics -> consumer
+// reads-and-zeroes -> next layer's GEMM lands in an already-zero plane. One memset of the whole
+// buffer when it is allocated covers the first use of every region.
+// SPARKINFER_MUSE_QB_ZOR=0 restores the per-launch memset (A/B in one binary).
+bool pf_dense_zero_on_read() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_MUSE_QB_ZOR"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e != 0;
 }
 
 // K slices per launch. Shared by the single and grouped launchers so both fan out the same way.
-static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int partials_splits) {
+static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int partials_splits,
+                          bool atomic) {
     static int sk_env = -1;
     if (sk_env < 0) { const char* e = getenv("SPARKINFER_MUSE_QB_SPLITK"); sk_env = e ? atoi(e) : -2; }
+    const bool one_plane = atomic && qm_uncap_splits();
     int splits = 1;
-    if (have_partials && partials_splits > 1 && mtiles == 1 && sk_env != 0) {
+    if (have_partials && (partials_splits > 1 || one_plane) && mtiles == 1 && sk_env != 0) {
         const int nsb = K >> 8;
         splits = (sk_env > 0) ? sk_env : (QM_TARGET_BLOCKS + ntiles - 1) / ntiles;
-        if (splits > partials_splits) splits = partials_splits;
-        if (splits > nsb / 2) splits = nsb / 2;
+        // What the plane budget allows -- unchanged, and the floor for the one-plane case so a
+        // launch can only ever gain slices here, never lose them.
+        int budget = splits;
+        if (budget > partials_splits) budget = partials_splits;
+        if (budget > nsb / 2) budget = nsb / 2;
+        if (one_plane) {
+            // Extra slices are only worth taking while each still owns real K. Measured at M=128:
+            // ffn_down (nsb=78) goes 8 -> 16 slices, 4+ super-blocks each, and its launch drops
+            // 5.3%; q/gate/k/v (nsb=26) cut to 2 super-blocks a slice LOSES 0.6%. So bound the
+            // extra slices by the work floor and never go below what the budget already gave.
+            int deep = splits;
+            const int mn = nsb / qm_min_sb_per_split();
+            if (deep > mn) deep = mn;
+            splits = deep > budget ? deep : budget;
+        } else {
+            splits = budget;
+        }
         if (splits < 1) splits = 1;
         splits = qm_wave_pick(ntiles, nsb, splits);
     }
@@ -1303,7 +1372,10 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
     // Split K only when the plain grid leaves the device idle. With more than one M-tile the grid
     // already fans out over M and a split would only add the reduce pass. Each slice must own whole
     // super-blocks, at least 2, or the per-block prologue dominates it.
-    int splits = qm_pick_splits(ntiles, K, mtiles, partials != nullptr, partials_splits);
+    const int atomic = qm_atomic_acc();
+    // One plane is M*N ints; the caller budgets `partials_splits` planes of the widest projection,
+    // so the atomic plane always fits and the slice count needs no buffer clamp here.
+    int splits = qm_pick_splits(ntiles, K, mtiles, partials != nullptr, partials_splits, atomic != 0);
     if (splits > 1) {
         const int nsb_all = K >> 8;
         const int sb_per_split = (nsb_all + splits - 1) / splits;
@@ -1314,10 +1386,10 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
         // own at least one super-block.
         splits = (nsb_all + sb_per_split - 1) / sb_per_split;
         if (splits > 1) {
-            const int atomic = qm_atomic_acc();
             const size_t total = (size_t)M * (size_t)N;
             // The atomic accumulator must start at zero; one [m][n] plane, not `splits` of them.
-            if (atomic) cudaMemsetAsync(partials, 0, total * sizeof(int), stream);
+            const int zor = (atomic && pf_dense_zero_on_read()) ? 1 : 0;
+            if (atomic && !zor) cudaMemsetAsync(partials, 0, total * sizeof(int), stream);
             dim3 grid(splits, ntiles, mtiles);
             QM_LAUNCH_DENSE(false, true,
                     A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, atomic,
@@ -1326,7 +1398,7 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
             // reads the single plane (splits=1 indexes exactly the [m][n] the atomics wrote).
             if (atomic && out_acc) { *out_acc = 1; return true; }   // consumer reads the int32
             pf_dense_splitk_reduce_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
-                partials, sx, row_scale, C, M, N, atomic ? 1 : splits);
+                partials, sx, row_scale, C, M, N, atomic ? 1 : splits, zor);
             return true;
         }
     }
@@ -1369,12 +1441,14 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
     // result stays bit-identical. SPARKINFER_MUSE_GROUP_SPLITK=0 restores the single-slice launch.
     static int gsk_env = -1;
     if (gsk_env < 0) { const char* e = getenv("SPARKINFER_MUSE_GROUP_SPLITK"); gsk_env = e ? atoi(e) : 1; }
-    int splits = gsk_env == 0 ? 1
-                              : qm_pick_splits(tiles, K, mtiles, partials != nullptr, partials_splits);
+    const int atomic = qm_atomic_acc();
+    int splits = gsk_env == 0
+                     ? 1
+                     : qm_pick_splits(tiles, K, mtiles, partials != nullptr, partials_splits,
+                                      atomic != 0);
     // The caller sizes `partials` for one projection at a time; a group needs the sum of its
     // widths, so clamp the slice count to what actually fits rather than trusting it. The atomic
     // accumulator needs one plane whatever the slice count, so there it is a yes/no test.
-    const int atomic = qm_atomic_acc();
     int ncol_all = 0;
     for (int i = 0; i < ngroup; i++) ncol_all += N[i];
     if (atomic) {
@@ -1394,7 +1468,8 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
             const int planes = atomic ? 1 : splits;
             for (int i = 0; i < ngroup; i++) { d.poff[i] = off; off += planes * M * N[i]; }
             // Every group's plane is packed back to back from `partials`, so one memset covers them.
-            if (atomic) cudaMemsetAsync(partials, 0, (size_t)off * sizeof(int), stream);
+            const int zor = (atomic && pf_dense_zero_on_read()) ? 1 : 0;
+            if (atomic && !zor) cudaMemsetAsync(partials, 0, (size_t)off * sizeof(int), stream);
             dim3 grid(splits, tiles, mtiles);
             QM_LAUNCH_DENSE(true, true,
                     A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split, atomic,
@@ -1405,13 +1480,13 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
             if (atomic && out_fused && fuse_q && ngroup == 2 && N[0] == N[1] &&
                 kernels::launch_prefill_swiglu_quant_i8_acc(
                     partials + d.poff[0], partials + d.poff[1], sx, d.rs[0], d.rs[1],
-                    fuse_q, fuse_sx, M, N[0], stream, fuse_qp)) {
+                    fuse_q, fuse_sx, M, N[0], stream, fuse_qp, zor)) {
                 *out_fused = 1;
                 return true;
             }
             const size_t total = (size_t)M * (size_t)tiles * QM_BND;
             pf_dense_splitk_reduce_group_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
-                partials, sx, d, M, tiles * QM_BND, atomic ? 1 : splits);
+                partials, sx, d, M, tiles * QM_BND, atomic ? 1 : splits, zor);
             return true;
         }
     }

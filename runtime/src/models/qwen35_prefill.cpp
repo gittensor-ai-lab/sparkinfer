@@ -334,6 +334,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
     int* qb_partials = (c.muse_glimmer && use_i8 && N <= 128)
         ? a8.alloc<int>(qb_partials_cap) : nullptr;
+    // With zero-on-read the consumers return each plane zeroed, so the only fill needed is this one
+    // -- it covers the first use of every region; from then on the buffer is self-maintaining.
+    // 82 MB once per prefill instead of 2.07 GB spread over 234 pre-launch memsets.
+    if (qb_partials && kernels::pf_dense_zero_on_read())
+        cudaMemsetAsync(qb_partials, 0, qb_partials_cap * sizeof(int), st);
     // Muse Glimmer split-K partials for the skinny projections. launch_prefill_gemm_i8 puts one
     // 128x128 output tile in a block, so Muse's narrow n_out (attn k/v = 256 -> TWO blocks, q and
     // the q-gate = 4096 -> 32) leaves the device almost empty: measured on an RTX 5090 the 2-block
