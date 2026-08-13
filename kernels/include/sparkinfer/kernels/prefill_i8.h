@@ -20,6 +20,10 @@ namespace sparkinfer { namespace kernels {
 // Per-row symmetric int8 quantization: scale[r] = max_c|x[r,c]| / 127,
 // q[r,c] = round(x[r,c] / scale[r]).  x: [rows,cols] bf16 -> q: [rows,cols] int8, scale: [rows] fp32.
 // One warp per row. Used for both the per-token activation A and (once, resident) the weight W.
+// Muse: fold attn *= sigmoid(gate) into the row-quantize load phase (bit-identical).
+bool launch_prefill_gate_quant_rows_i8(const void* x, const void* gate, signed char* q,
+                                      float* scale, int rows, int cols, cudaStream_t stream);
+
 void launch_prefill_quantize_rows_i8(const void* x_bf16, signed char* q, float* scale,
                                      int rows, int cols, cudaStream_t stream = nullptr);
 

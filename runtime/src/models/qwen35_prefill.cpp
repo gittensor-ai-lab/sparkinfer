@@ -270,7 +270,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // int32 partials for the fused GEMM's split-K fan-out. Only while the whole prompt is one
     // M-tile (N <= QM_BM = 128): beyond that the plain grid already fans out over M, and the buffer
     // would scale with N. 8 * 128 * 19968 * 4 B = 82 MB, and only for Muse.
-    constexpr int QB_SPLITS = 8;
+    // 13, not 8. This caps the split-K slice count, and at Muse's prefill@128 it is what the
+    // ffn_down launch actually binds on: 8 slices put 8*104 = 832 blocks on a device holding 340
+    // (2 blocks/SM x 170), i.e. 2.45 waves -- three waves of occupancy doing 2.45 waves of work.
+    // 13 slices give 1352 blocks = 3.98 waves, so the tail wave is full. Swept 8/10/12/13/16/20;
+    // 13 is the peak, and raising QM_TARGET_BLOCKS with it only adds atomic traffic (swept too).
+    constexpr int QB_SPLITS = 13;
     const size_t qb_partials_cap = (size_t)QB_SPLITS * (size_t)N * (size_t)maxNO;
     int* qb_partials = (c.muse_glimmer && use_i8 && N <= 128)
         ? a8.alloc<int>(qb_partials_cap) : nullptr;
@@ -595,6 +600,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // type, which is the all-or-nothing test this replaces (A/B).
     const bool muse_gsubset =
         [] { const char* e = getenv("SPARKINFER_MUSE_GROUP_SUBSET"); return !(e && e[0] == '0'); }();
+    // Same as proj_fused, but lets the split-K accumulator stand instead of reducing it to bf16,
+    // for the two projections (o and ffn_down) whose only consumer is the sandwich norm. Sets
+    // *acc to 1 when it did; the caller then feeds qb_partials to launch_norm_then_add_acc.
+    auto proj_fused_acc = [&](const bf16* A, const void* W, int wtype, const float* rs,
+                              bf16* C, int n_out, int K, int* acc, int rows = 0) {
+        const int R = rows > 0 ? rows : N;
+        if (muse_qb && use_i8 && rs && n_out >= 128 && kernels::pf_dense_gemm_qi8_supported(wtype)) {
+            quant_a_i8(A, R, K);
+            if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st,
+                                                       qb_partials, QB_SPLITS, acc))
+                return;
+        }
+        proj(A, W, wtype, C, n_out, K, rows);
+    };
     auto proj_fused = [&](const bf16* A, const void* W, int wtype, const float* rs,
                           bf16* C, int n_out, int K, int rows = 0) {
         const int R = rows > 0 ? rows : N;
@@ -661,6 +680,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         const Qwen35LayerWeights& w = s.w.layers[L];
         a_q = nullptr;                                 // xn/hn are refreshed in place each layer
         bool attn_fused = false;                       // post-attn residual folded into the proj?
+        // Set when the o / ffn_down split-K accumulator was left un-reduced for the sandwich
+        // norm to consume directly. Per layer: qb_partials is reused by the next GEMM.
+        int attn_acc = 0, ffn_acc = 0;
+        bool hn_quantized = false;   // pre-FFN norm already emitted A_i8/sx for the grouped FFN
         if (w.linear_attn) {
             // ---- Gated DeltaNet linear-attention layer ----
             // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
@@ -760,11 +783,23 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 kernels::launch_prefill_attn_int8_paged(qb, kpool, vpool, kscale, vscale, btable, att,
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
             }
-            kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
+            // Muse: the gated attention output feeds exactly one consumer -- the o projection's
+            // row-quantize -- so fold the gate into that quantize's load phase. `att` is then never
+            // written back as bf16 and never re-read, and one launch per layer goes away.
+            // Bit-identical; only taken when the o projection is certain to use A_i8 (otherwise
+            // proj() would read the un-gated `att`).
+            bool gate_fused = false;
+            if (c.muse_glimmer && muse_qb && use_i8 && w.wo_rs && H >= 128 &&
+                kernels::pf_dense_gemm_qi8_supported(w.wo_type) &&
+                kernels::launch_prefill_gate_quant_rows_i8(att, qg, A_i8, sx, N, qdim, st)) {
+                a_q = att; a_qR = N; a_qK = qdim;      // quant_a_i8(att, N, qdim) is now a no-op
+                gate_fused = true;
+            }
+            if (!gate_fused) kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
             if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
                 // add happens in launch_norm_then_add below.
-                proj_fused(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim);
+                proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
             } else {
                 attn_fused = proj_resid(att, w.wo, w.wo_type, x, H, qdim);
@@ -780,8 +815,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // Sandwich (post_attn_norm/post_ffn_norm) RMSNorm uses its OWN eps 1e-8
             // (upstream post_norm_eps), NOT the model's rms_eps (1e-5) which drives
             // attn_norm/ffn_norm/q_norm/k_norm -- mirrors the decode fix (qwen35.cpp:6d911d4).
-            kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
-            kernels::launch_rmsnorm(h, w.ffn_norm, hn, N, H, eps, st);
+            if (attn_acc)
+                kernels::launch_norm_then_add_acc(x, qb_partials, sx, w.wo_rs, w.post_attn_norm,
+                                                  h, N, H, 1e-8f, st);
+            else
+                kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
+            // hn's only consumer is the grouped FFN's row-quantize, so emit the int8 in the same
+            // pass. Only when one chunk covers the prompt: a second chunk would need A_i8/sx again
+            // after the first has overwritten them. The bf16 hn is still written either way.
+            if (muse_ffn_group && muse_qb && use_i8 && FC >= N &&
+                kernels::launch_rmsnorm_quant_i8(h, w.ffn_norm, hn, A_i8, sx, N, H, eps, st)) {
+                hn_quantized = true;
+            } else {
+                kernels::launch_rmsnorm(h, w.ffn_norm, hn, N, H, eps, st);
+            }
         } else {
             // x += ao (post-attn residual, in-place; skipped when folded into the output proj)
             // hn = RMSNorm(x, post_attn_norm)
@@ -845,6 +892,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         const float* rsf[2] = { w.gate_rs, w.up_rs };
                         void*        Cf[2]  = { ffg, ffu };
                         const int    nf[2]  = { ffn, ffn };
+                        if (hn_quantized) { a_q = hn_c; a_qR = fn; a_qK = H; }   // already done
                         quant_a_i8(hn_c, fn, H);
                         // A_i8/sx are handed in as the fused SwiGLU's OUTPUT as well as the GEMM's
                         // input: the GEMM has completed in stream order before the epilogue runs, and
@@ -875,9 +923,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         bool down_fused = false;
                         if (!ffn_fused && muse_qb && w.down_rs &&
                             kernels::pf_dense_gemm_qi8_supported(w.down_qtype)) {
+                            // The accumulator can only stand when this chunk IS the whole prompt:
+                            // a second chunk would overwrite both qb_partials and sx before the
+                            // post-FFN norm below reads them.
                             down_fused = kernels::launch_prefill_gemm_qi8_dense(
                                 w.down_qtype, A_i8, sx, w.down_q, w.down_rs,
-                                ao + (size_t)fo * H, fn, H, ffn, st, qb_partials, QB_SPLITS);
+                                ao + (size_t)fo * H, fn, H, ffn, st, qb_partials, QB_SPLITS,
+                                (fn == N) ? &ffn_acc : nullptr);
                         }
                         if (!down_fused) {
                             if (!kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q,
@@ -903,7 +955,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 // Sandwich norm (post-FFN): x = h + RMSNorm(ao) * post_ffn_norm (decode
                 // qwen35.cpp:1329). h is the post-attn residual stream; ao holds the raw FFN output.
                 // Same 1e-8 post_norm_eps as the post-attn sandwich norm above.
-                kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
+                if (ffn_acc)
+                    kernels::launch_norm_then_add_acc(h, qb_partials, sx, w.down_rs,
+                                                      w.post_ffn_norm, x, N, H, 1e-8f, st);
+                else
+                    kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
             } else if (!ffn_fused) {
                 // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk)
                 kernels::launch_prefill_add(x, ao, x, (long)N * H, st);

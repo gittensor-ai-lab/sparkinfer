@@ -53,7 +53,8 @@ bool pf_dense_gemm_qi8_supported(int ggml_type);
 bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const float* sx,
                                    const void* W_q, const float* row_scale, void* C_bf16,
                                    int M, int N, int K, cudaStream_t stream = nullptr,
-                                   int* partials = nullptr, int partials_splits = 0);
+                                   int* partials = nullptr, int partials_splits = 0,
+                                   int* out_acc = nullptr);
 
 // Fuse up to 4 projections sharing A_i8/sx (same M, same K) into ONE grid. At prefill's M=128 a
 // projection's grid is ceil(N/64) CTAs -- 64 for a 4096-wide q/gate but only 4 for a 256-wide

@@ -769,6 +769,189 @@ void launch_muse_sandwich_tail(const void* residual, const void* branch, const v
         reinterpret_cast<__nv_bfloat16*>(out_xn), cols, post_eps, eps);
 }
 
+// Same sandwich norm, fed straight from the split-K int32 accumulator instead of from a bf16
+// tensor a reduce pass had to materialize first. The o and down projections each wrote H bf16 per
+// token that exactly ONE kernel then read; this deletes that round trip and the reduce launch.
+//
+// BIT-IDENTICAL, and the accumulation order is the whole reason it is: `__float2bfloat16((float)acc
+// * sxr[row] * rs[c])` is exactly the value pf_dense_splitk_reduce_kernel stored, and the
+// sum-of-squares below walks the SAME packs of 8 in the SAME order with the SAME stride as
+// norm_then_add_kernel, so the fp32 reduction tree is unchanged. (Re-associating it is what sank
+// an earlier attempt at fusing these norms.)
+__global__ void norm_then_add_acc_kernel(const __nv_bfloat16* __restrict__ residual,
+                                         const int* __restrict__ acc,
+                                         const float* __restrict__ sxr,
+                                         const float* __restrict__ rs,
+                                         const __nv_bfloat16* __restrict__ weight,
+                                         __nv_bfloat16* __restrict__ out,
+                                         int rows, int cols, float eps) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const size_t base = (size_t)row * cols;
+    const float sr = sxr[row];
+    __shared__ float s_warp[32];
+    const int npack = cols >> 3;
+    const int tail = npack << 3;
+
+    auto load8 = [&](int p, float (&bv)[8]) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int c = p * 8 + j;
+            bv[j] = __bfloat162float(__float2bfloat16((float)acc[base + c] * sr * rs[c]));
+        }
+    };
+
+    float ss = 0.f;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+        float bv[8]; load8(p, bv);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ss = __fmaf_rn(bv[j], bv[j], ss);
+    }
+    for (int c = tail + threadIdx.x; c < cols; c += blockDim.x) {
+        float v = __bfloat162float(__float2bfloat16((float)acc[base + c] * sr * rs[c]));
+        ss = __fmaf_rn(v, v, ss);
+    }
+    ss = rn_warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        v = rn_warp_sum(v);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps);
+    }
+    __syncthreads();
+    const float inv_rms = s_warp[0];
+
+    const uint4* w4 = reinterpret_cast<const uint4*>(weight);
+    const uint4* r4 = reinterpret_cast<const uint4*>(residual + base);
+    uint4* o4 = reinterpret_cast<uint4*>(out + base);
+    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+        float bv[8]; load8(p, bv);
+        float rv[8]; rn_unpack8(__ldg(r4 + p), rv);
+        float wv[8]; rn_unpack8(__ldg(w4 + p), wv);
+        float ov[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ov[j] = rv[j] + bv[j] * inv_rms * wv[j];
+        o4[p] = rn_pack8(ov);
+    }
+    for (int c = tail + threadIdx.x; c < cols; c += blockDim.x) {
+        const float bv = __bfloat162float(__float2bfloat16((float)acc[base + c] * sr * rs[c]));
+        out[base + c] = __float2bfloat16(__bfloat162float(residual[base + c])
+                                         + bv * inv_rms * __bfloat162float(weight[c]));
+    }
+}
+
+// RMSNorm whose output is consumed by exactly one row-quantize (Muse's pre-FFN norm feeding the
+// grouped gate/up GEMM). Emitting the int8 in the same pass removes a launch and a full re-read of
+// the bf16 the norm just wrote. The bf16 is still written, so every fallback consumer is unaffected.
+//
+// BIT-IDENTICAL: the sum-of-squares walks the same packs of 8 in the same order with the same
+// stride and the same fp32 tree as rmsnorm_kernel; the stored bf16 is the same rn_pack8 value; and
+// the quantize is the same amax (order-independent), the same d = amax/127.0f, the same roundf and
+// the same amax==0 -> 0 rule that pf_quant_rows_fast_kernel applies.
+template <int MAXP>
+__global__ __launch_bounds__(256) void rmsnorm_quant_i8_kernel(
+        const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+        __nv_bfloat16* __restrict__ out, signed char* __restrict__ q, float* __restrict__ scale,
+        int rows, int cols, float eps) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const size_t base = (size_t)row * cols;
+    __shared__ float s_warp[32];
+    const int npack = cols >> 3;
+    const uint4* x4 = reinterpret_cast<const uint4*>(x + base);
+
+    float ss = 0.f;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+        float xv[8]; rn_unpack8(__ldg(x4 + p), xv);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ss = __fmaf_rn(xv[j], xv[j], ss);
+    }
+    ss = rn_warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        v = rn_warp_sum(v);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps);
+    }
+    __syncthreads();
+    const float inv_rms = s_warp[0];
+
+    const uint4* w4 = reinterpret_cast<const uint4*>(weight);
+    uint4* o4 = reinterpret_cast<uint4*>(out + base);
+    __nv_bfloat16 reg[MAXP][8];
+    float amax = 0.f;
+    int held = 0;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x, held++) {
+        float xv[8]; rn_unpack8(__ldg(x4 + p), xv);
+        float wv[8]; rn_unpack8(__ldg(w4 + p), wv);
+        float ov[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ov[j] = xv[j] * inv_rms * wv[j];
+        const uint4 packed = rn_pack8(ov);
+        o4[p] = packed;                                  // the bf16 the norm always wrote
+        *reinterpret_cast<uint4*>(reg[held]) = packed;   // keep it for the quantize below
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            amax = fmaxf(amax, fabsf(__bfloat162float(reg[held][j])));
+    }
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (threadIdx.x == 0) s_warp[0] = v;
+    }
+    __syncthreads();
+    const float amax_row = s_warp[0];
+    const float d = amax_row / 127.0f;
+    if (threadIdx.x == 0) scale[row] = d;
+
+    held = 0;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x, held++) {
+        signed char o8[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            o8[j] = (signed char)((amax_row == 0.f) ? 0
+                                 : (int)roundf(__bfloat162float(reg[held][j]) / d));
+        *reinterpret_cast<uint2*>(&q[base + p * 8]) = *reinterpret_cast<const uint2*>(o8);
+    }
+}
+
+bool launch_rmsnorm_quant_i8(const void* x, const void* weight, void* out,
+                             signed char* q, float* scale,
+                             int rows, int cols, float eps, cudaStream_t stream) {
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_NORM_QUANT");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!enabled || rows <= 0 || cols <= 0 || (cols & 7) != 0) return false;
+    const int npack = cols >> 3;
+    const int per = (npack + 255) / 256;                 // packs held per thread
+    auto xb = reinterpret_cast<const __nv_bfloat16*>(x);
+    auto wb = reinterpret_cast<const __nv_bfloat16*>(weight);
+    auto ob = reinterpret_cast<__nv_bfloat16*>(out);
+    if (per <= 1)      rmsnorm_quant_i8_kernel<1><<<rows, 256, 0, stream>>>(xb, wb, ob, q, scale, rows, cols, eps);
+    else if (per <= 2) rmsnorm_quant_i8_kernel<2><<<rows, 256, 0, stream>>>(xb, wb, ob, q, scale, rows, cols, eps);
+    else if (per <= 4) rmsnorm_quant_i8_kernel<4><<<rows, 256, 0, stream>>>(xb, wb, ob, q, scale, rows, cols, eps);
+    else return false;
+    return true;
+}
+
+void launch_norm_then_add_acc(const void* residual, const int* acc, const float* sxr,
+                              const float* rs, const void* weight, void* out,
+                              int rows, int cols, float eps, cudaStream_t stream) {
+    norm_then_add_acc_kernel<<<rows, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(residual), acc, sxr, rs,
+        reinterpret_cast<const __nv_bfloat16*>(weight),
+        reinterpret_cast<__nv_bfloat16*>(out), rows, cols, eps);
+}
+
 void launch_norm_then_add(const void* residual, const void* block_out, const void* weight,
                           void* out, int rows, int cols, float eps, cudaStream_t stream) {
     norm_then_add_kernel<<<rows, 256, 0, stream>>>(

@@ -305,6 +305,86 @@ __device__ __forceinline__ void qm_decode_j64(const unsigned char* __restrict__ 
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Staged weight fetch. The dense kernel below runs the B decode one super-block AHEAD of the MMA
+// that consumes it, so the global read has a whole MMA phase to retire in. Splitting the decode
+// into a load half and an arithmetic half is what makes that possible: the load half is issued
+// before the K loop and only its 12 registers stay live across it, and the arithmetic half runs
+// after. Q4_K needs exactly three uint4 -- the 16 B header and the thread's 32 quant bytes --
+// and both are 16 B aligned because the super-block is 144 B. Q5_K/Q6_K keep the fused
+// load-and-decode below; they are a small minority of this GGUF's tensors.
+__device__ __forceinline__ float qm_h2f_u(unsigned u) {
+    __half h; *((unsigned short*)&h) = (unsigned short)u; return __half2float(h);
+}
+__device__ __forceinline__ int qm_b(unsigned w, int i) { return (int)((w >> (8 * i)) & 0xFFu); }
+
+// The same unpack as qm_scale_min, reading the 12 packed bytes out of the header registers.
+// sc[0..3] are hdr.y, sc[4..7] are hdr.z, sc[8..11] are hdr.w.
+__device__ __forceinline__ void qm_scale_min_r(uint4 hdr, int j, int* s, int* m) {
+    if (j < 4) { *s = qm_b(hdr.y, j) & 63; *m = qm_b(hdr.z, j) & 63; }
+    else {
+        const int k = j - 4;
+        *s = (qm_b(hdr.w, k) & 0xF) | ((qm_b(hdr.y, k) >> 6) << 4);
+        *m = (qm_b(hdr.w, k) >> 4)  | ((qm_b(hdr.z, k) >> 6) << 4);
+    }
+}
+
+template <int QT>
+struct QmStage {
+    const unsigned char* blk;      // Q5_K / Q6_K: decoded straight from global, as before
+    uint4 hdr, q0, q1;             // Q4_K: the header and this thread's 32 quant bytes
+};
+
+template <int QT>
+__device__ __forceinline__ void qm_stage_fetch(const unsigned char* __restrict__ blk, int j64,
+                                               QmStage<QT>& s) {
+    if constexpr (QT == QMQ_Q4_K) {
+        s.hdr = *reinterpret_cast<const uint4*>(blk);
+        const unsigned char* qb = blk + 16 + j64 * 32;
+        s.q0 = *reinterpret_cast<const uint4*>(qb);
+        s.q1 = *reinterpret_cast<const uint4*>(qb + 16);
+    } else {
+        s.blk = blk;
+    }
+}
+
+// Bit-identical to qm_decode_j64: the same ds/dm products, the same 16-entry table and the same
+// gather, only the bytes arrive in registers instead of being re-read here.
+template <int QT>
+__device__ __forceinline__ void qm_stage_decode(const QmStage<QT>& s, int j64, float inv,
+                                                signed char* __restrict__ dst) {
+    if constexpr (QT == QMQ_Q4_K) {
+        const float bd = qm_h2f_u(s.hdr.x), bdmin = qm_h2f_u(s.hdr.x >> 16);
+        int s0, m0, s1, m1;
+        qm_scale_min_r(s.hdr, 2 * j64,     &s0, &m0);
+        qm_scale_min_r(s.hdr, 2 * j64 + 1, &s1, &m1);
+        const float ds0 = bd * s0, dm0 = bdmin * m0;
+        const float ds1 = bd * s1, dm1 = bdmin * m1;
+        unsigned ta[4], tb[4];
+        qm_lut16(ds0, dm0, inv, ta);
+        qm_lut16(ds1, dm1, inv, tb);
+#pragma unroll
+        for (int c = 0; c < 2; c++) {
+            const uint4 qv = (c == 0) ? s.q0 : s.q1;
+            uint4 vlo, vhi;
+#pragma unroll
+            for (int w = 0; w < 4; w++) {
+                const unsigned qwd = (w == 0) ? qv.x : (w == 1) ? qv.y : (w == 2) ? qv.z : qv.w;
+                const unsigned alo = qm_gather4(ta, qwd & 0x0F0F0F0Fu);
+                const unsigned ahi = qm_gather4(tb, (qwd >> 4) & 0x0F0F0F0Fu);
+                if (w == 0)      { vlo.x = alo; vhi.x = ahi; }
+                else if (w == 1) { vlo.y = alo; vhi.y = ahi; }
+                else if (w == 2) { vlo.z = alo; vhi.z = ahi; }
+                else             { vlo.w = alo; vhi.w = ahi; }
+            }
+            *reinterpret_cast<uint4*>(dst + j64 * 64 + c * 16) = vlo;
+            *reinterpret_cast<uint4*>(dst + j64 * 64 + 32 + c * 16) = vhi;
+        }
+    } else {
+        qm_decode_j64<QT>(s.blk, j64, inv, dst);
+    }
+}
+
 // 3 resident blocks/SM. Occupancy is what this kernel lives on: it alternates a decode phase
 // (global reads + ALU) with an MMA phase, so the other resident blocks are what keep the tensor
 // cores fed while one block is decoding. BN=64 rather than 128 is chosen for exactly this -- it puts
@@ -671,8 +751,9 @@ __device__ __forceinline__ void qm_red_add(int* p, int v) {
     asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
 }
 
-__device__ __forceinline__ void qm_ldsm_x4(unsigned (&r)[4], const void* p) {
-    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+// Takes the shared-window address rather than a generic pointer: converting one per use is what
+// the K loop cannot afford -- see the a_sm/b_sm bases below.
+__device__ __forceinline__ void qm_ldsm_x4(unsigned (&r)[4], unsigned a) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
@@ -715,8 +796,20 @@ static int qm_mma_k32() {
 // K slice living on blockIdx.x -- so all slices of a tile are dispatched back-to-back rather than
 // a whole grid apart -- a tile's 32 KB of accumulator is written, re-hit and consumed inside L2.
 // Integer adds are exact and order-independent, so the accumulated value is the same either way.
+//
+// WHY TWO RESIDENT BLOCKS AND NOT THREE. The routed kernel above takes three, on the reasoning
+// that one block's MMA phase covers another block's decode phase. That reasoning does not survive
+// measurement here: all resident blocks march through the same barrier at the same rate, so they
+// tend to sit in the SAME phase, and the weight read that was supposed to be hidden is instead
+// serialised against every block's MMA at once. Giving the block a second Bs plane and letting it
+// hide its OWN weight fetch -- issue super-block sb+1's loads, run sb's eight MMA steps, then do
+// the decode arithmetic -- is worth more than the third block: 3 blocks 4373 pp vs 2 blocks
+// pipelined 4482 pp at prefill@128. The freed budget is what pays for it (43008 B of smem and 128
+// registers against 25600 B and 80), and the decode split that makes it possible is qm_stage_fetch
+// / qm_stage_decode above. Also measured, and NOT kept: a third As plane so the K loop carries one
+// barrier instead of two (4452 pp -- barriers are not the bottleneck).
 template <int QT, bool GROUPED, bool SPLIT = false, bool K32 = true>
-__global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
+__global__ __launch_bounds__(256, 2) void pf_dense_gemm_qi8_kernel_g(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
         const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
         __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd,
@@ -751,7 +844,7 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
     const int n0  = xtile * QM_BND;
     const int nsb = K >> 8;
 
-    __shared__ __align__(16) signed char Bs[QM_BND][QM_LD];
+    __shared__ __align__(16) signed char Bs[2][QM_BND][QM_LD];
     __shared__ __align__(16) signed char As[2][QM_BM][QM_BK];
 
     const int tid = threadIdx.x;
@@ -788,38 +881,104 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
             for (int j = 0; j < 2; j++) wmma::fill_fragment(cf[i][j], 0);
     }
 
-    auto stageA = [&](int buf, int k0) {
-        for (int idx = tid; idx < QM_BM * 2; idx += blockDim.x) {
-            const int r = idx >> 1, c16 = (idx & 1) * 16;
-            const int arow = (r < M) ? (p0 + r) : -1;
-            qm_cp16(&As[buf][r][c16], &A_i8[(size_t)max(arow, 0) * K + k0 + c16],
-                    arow >= 0 && (k0 + c16) < K);
-        }
+    // A staging, straight-line. QM_BM*2 == the 256 threads this kernel is always launched with, so
+    // every thread owns exactly one 16 B chunk and the strided loop has exactly one iteration --
+    // but blockDim.x is not a compile-time constant, so ptxas could not see that and kept a real
+    // loop, with its own BSSY/BSYNC pair, induction variable and bound test, wrapped around a
+    // single cp.async. That ran 8 times per super-block. The row, the column and the source row
+    // base are all loop-invariant too, so only `+ k0` and the buffer offset move.
+    static_assert(QM_BM * 2 == 256, "stageA assumes one 16 B chunk per thread at 256 threads");
+    const int a_r   = tid >> 1;
+    const int a_c16 = (tid & 1) * 16;
+    const int a_row = (a_r < M) ? (p0 + a_r) : -1;
+    const signed char* const a_src0 = A_i8 + (size_t)max(a_row, 0) * K + a_c16;
+    // XOR swizzle on the 16 B chunk index. As rows are QM_BK = 32 B apart, so the eight rows one
+    // ldmatrix phase gathers land on only 16 of the 32 banks and every A-side phase pays a 2-way
+    // conflict. Flipping the chunk order on rows whose bit 2 is set spreads those eight rows over
+    // all 32 banks. It costs nothing -- no padding, no extra smem -- and it is a pure permutation
+    // of where a byte lives, undone by reading with the same XOR (see a_sm below). Only the K32
+    // path reads As through ldmatrix; the wmma fallback walks the row linearly, so it keeps the
+    // natural layout.
+    const int a_swz = K32 ? (16 * ((a_r >> 2) & 1)) : 0;
+    signed char* const a_dst0 = &As[0][a_r][a_c16 ^ a_swz];
+
+    // The column bound test this predicate used to carry can never fail: the launcher rejects any
+    // K that is not a whole number of super-blocks, and every k0 staged here is a multiple of
+    // QM_BK that the caller has already checked against kend <= K, so k0 + a_c16 is at most
+    // K - QM_BK + 16 < K. What is left is `a_row >= 0`, which is loop-invariant -- so the
+    // predicated branch and its BSSY/BSYNC pair lift out of the unrolled K loop entirely.
+    static_assert(QM_BK > 16, "stageA drops the column bound test on QM_BK > a_c16");
+    const bool a_ok = a_row >= 0;
+    // Rows past M hold zero for the whole kernel, so clear both A buffers once here rather than
+    // re-storing zeros on every K step. That leaves the loop with a bare cp.async under a uniform
+    // `if`, dropping the else-arm ptxas was wrapping in a BSSY/BSYNC pair -- along with the three
+    // dead predicated-off LDS it pads each async copy with -- eight times per super-block.
+    if (!a_ok) {
+        *reinterpret_cast<uint4*>(a_dst0) = make_uint4(0u, 0u, 0u, 0u);
+        *reinterpret_cast<uint4*>(a_dst0 + QM_BM * QM_BK) = make_uint4(0u, 0u, 0u, 0u);
+    }
+
+    auto stageA = [&](int buf, const signed char* src) {
+        if (a_ok) __pipeline_memcpy_async(a_dst0 + buf * (QM_BM * QM_BK), src, 16);
         __pipeline_commit();
     };
+
+    // ldmatrix takes a shared-window address, and deriving one from a generic pointer inside the K
+    // loop is expensive on this part: ptxas rebuilt the whole conversion every step -- an
+    // S2UR SR_CgaCtaId, a UMOV/UIADD3/ULEA chain and the lane row math, ~26 instructions per
+    // iteration to feed 4 LDSM. The lane's row is fixed for the life of the block and everything
+    // that moves is a plain byte offset (A: the buffer parity; B: kk), so take the two bases once.
+    unsigned a_sm = 0, b_sm = 0;
+    if constexpr (K32) {
+        // Row within the 16-row subtile. wm*32 + i*16 is a multiple of 16, so the swizzle bit
+        // (row >> 2) & 1 depends only on the lane -- it is the same for both i, and the i and
+        // buffer offsets below stay plain byte adds.
+        const int arr = (lane & 7) + 8 * ((lane >> 3) & 1);
+        a_sm = (unsigned)__cvta_generic_to_shared(
+            &As[0][wm * 32 + arr][16 * (((lane >> 4) & 1) ^ ((arr >> 2) & 1))]);
+        b_sm = (unsigned)__cvta_generic_to_shared(
+            &Bs[0][wn * 32 + ((lane >> 4) & 1) * 8 + (lane & 7)][16 * ((lane >> 3) & 1)]);
+    }
 
     const int sb_lo = SPLIT ? zsl * sb_per_split : 0;
     const int sb_hi = SPLIT ? min(nsb, sb_lo + sb_per_split) : nsb;
     if (sb_lo >= sb_hi) return;
     const int kend = sb_hi << 8;          // first K past this block's slice
-    stageA(0, sb_lo << 8);
-    int abuf = 0;
+    stageA(0, a_src0 + (sb_lo << 8));
+    int abuf = 0, bbuf = 0;
+
+    // Zero-fill only ever applies to a tile past N, and those rows never change, so both planes
+    // can be cleared once instead of once per super-block.
+    auto zero_plane = [&](int buf) {
+#pragma unroll
+        for (int i = 0; i < QM_SB / 16; i++)
+            *reinterpret_cast<uint4*>(&Bs[buf][dr][i * 16]) = make_uint4(0u, 0u, 0u, 0u);
+    };
+
+    // Prologue: stage the first super-block into plane 0. From here on the loop body always holds
+    // a decoded plane for `sb` and fills the other one for `sb + 1`.
+    QmStage<QT> stg;
+    if (drow_ok) {
+        qm_stage_fetch<QT>(drow + (size_t)sb_lo * BS, dj, stg);
+        qm_stage_decode<QT>(stg, dj, dinv, &Bs[0][dr][0]);
+    } else if (dj == 0) {
+        zero_plane(0);
+        zero_plane(1);
+    }
 
     for (int sb = sb_lo; sb < sb_hi; sb++) {
-        __syncthreads();      // previous super-block's MMA finished reading Bs
-        if (drow_ok) {
-            const unsigned char* blk = drow + (size_t)sb * BS;
-            qm_decode_j64<QT>(blk, dj, dinv, &Bs[dr][0]);
-        } else if (dj == 0) {
-#pragma unroll
-            for (int i = 0; i < QM_SB / 16; i++)
-                *reinterpret_cast<uint4*>(&Bs[dr][i * 16]) = make_uint4(0u, 0u, 0u, 0u);
-        }
-        __syncthreads();      // Bs ready
+        __syncthreads();      // Bs[bbuf] is decoded, and the MMA that read Bs[bbuf^1] is done
+        const bool more = (sb + 1) < sb_hi;
+        // Issue the NEXT super-block's weight read here, ahead of the MMA that follows. This is
+        // the whole point of the second Bs plane: the decode used to sit between two barriers with
+        // the tensor cores idle behind it, so a DRAM read whose latency the 3-blocks/SM occupancy
+        // was supposed to hide was in fact serialised against the MMA phase of every block on the
+        // SM at once. Only the 12 registers of the fetched bytes stay live across the K loop.
+        if (more && drow_ok) qm_stage_fetch<QT>(drow + (size_t)(sb + 1) * BS, dj, stg);
 
         for (int kk = 0; kk < QM_SB; kk += QM_BK) {
             const int knext = sb * QM_SB + kk + QM_BK;
-            if (knext < kend) stageA(abuf ^ 1, knext);
+            if (knext < kend) stageA(abuf ^ 1, a_src0 + knext);
             __pipeline_wait_prior(knext < kend ? 1 : 0);
             __syncthreads();
             if constexpr (K32) {
@@ -828,19 +987,22 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
                 // (rows 0-7 | rows 8-15) x (bytes 0-15 | bytes 16-31) of a 16x32 A tile, and .x2
                 // wants (bytes 0-15 | bytes 16-31) of an 8-row B tile -- B lives in Bs as
                 // [n][k], which is already the col-major operand the instruction expects.
+                // Both operand rows sit at a fixed byte offset from the bases taken above:
+                // the A subtile is +16 rows (i * 16 * QM_BK) and the buffer is +QM_BM*QM_BK,
+                // the B subtile is +16 rows (j2 * 16 * QM_LD) and the K step is +kk bytes.
+                const unsigned ab = a_sm + (unsigned)abuf * (QM_BM * QM_BK);
                 unsigned af32[2][4];
 #pragma unroll
                 for (int i = 0; i < 2; i++)
-                    qm_ldsm_x4(af32[i], &As[abuf][wm * 32 + i * 16 + (lane & 7) + 8 * ((lane >> 3) & 1)]
-                                          [16 * ((lane >> 4) & 1)]);
+                    qm_ldsm_x4(af32[i], ab + (unsigned)(i * 16 * QM_BK));
 #pragma unroll
                 for (int j2 = 0; j2 < 2; j2++) {
                     // One .x4 covers two 8-column B subtiles: its four matrices are
                     // (subtile 0 | subtile 1) x (k 0-15 | k 16-31), which is exactly two
                     // m16n8k32 B operands. Halves the B load instructions for the same bytes.
                     unsigned bb[4];
-                    qm_ldsm_x4(bb, &Bs[wn * 32 + j2 * 16 + ((lane >> 4) & 1) * 8 + (lane & 7)]
-                                     [kk + 16 * ((lane >> 3) & 1)]);
+                    qm_ldsm_x4(bb, b_sm + (unsigned)bbuf * (QM_BND * QM_LD)
+                                        + (unsigned)(j2 * 16 * QM_LD) + (unsigned)kk);
 #pragma unroll
                     for (int i = 0; i < 2; i++) {
                         qm_mma_16832(acc[i][2 * j2],     af32[i], bb[0], bb[1]);
@@ -857,7 +1019,7 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
                     wmma::load_matrix_sync(af[i], &As[abuf][wm * 32 + i * 16][k16], QM_BK);
 #pragma unroll
                 for (int j = 0; j < 2; j++)
-                    wmma::load_matrix_sync(bf[j], &Bs[wn * 32 + j * 16][kk + k16], QM_LD);
+                    wmma::load_matrix_sync(bf[j], &Bs[bbuf][wn * 32 + j * 16][kk + k16], QM_LD);
 #pragma unroll
                 for (int i = 0; i < 2; i++)
 #pragma unroll
@@ -867,11 +1029,18 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
             __syncthreads();
             abuf ^= 1;
         }
+
+        // Now turn the bytes fetched before the K loop into the other plane. Its consumer is the
+        // MMA of the next iteration, which the barrier at the top of the loop separates from this
+        // store; the plane being written was last read by the MMA of iteration sb-1, which that
+        // same barrier has already retired.
+        if (more && drow_ok) qm_stage_decode<QT>(stg, dj, dinv, &Bs[bbuf ^ 1][dr][0]);
+        bbuf ^= 1;
     }
 
     // Epilogue staging reuses Bs (the K loop is done with it).
     __syncthreads();
-    int* Cs = reinterpret_cast<int*>(&Bs[0][0]);
+    int* Cs = reinterpret_cast<int*>(&Bs[0][0][0]);
 #pragma unroll
     for (int i = 0; i < 2; i++) {
 #pragma unroll
@@ -894,17 +1063,29 @@ __global__ __launch_bounds__(256, 3) void pf_dense_gemm_qi8_kernel_g(
                 wmma::store_matrix_sync(&Cs[warp * 256], cf[i][j], 16, wmma::mem_row_major);
             }
             __syncwarp();
-            for (int el = lane; el < 256; el += 32) {
-                const int r = el >> 4, cc = el & 15;
-                const int rm = rm0 + r, rn = gn0 + cc;
-                if (rm < M && rn < N) {
-                    const int p = p0 + rm;
-                    if (SPLIT) {
-                        if (atomic_acc)
-                            qm_red_add(&partials[pbase + (size_t)p * N + rn], Cs[warp * 256 + el]);
-                        else
-                            partials[pbase + (((size_t)zsl * Mtot) + p) * N + rn] = Cs[warp * 256 + el];
-                    } else {
+            // `atomic_acc` is a kernel argument, so this test was being re-evaluated for every one
+            // of the 32 elements a lane writes: a BSSY/BSYNC pair, an ISETP and two branches per
+            // element, around the three instructions that do the work. It is uniform over the whole
+            // grid, so lift it (and the SPLIT arm) out of the element loop. Each element is
+            // independent, so the values and their order are unchanged.
+            if (SPLIT && atomic_acc) {
+                for (int el = lane; el < 256; el += 32) {
+                    const int rm = rm0 + (el >> 4), rn = gn0 + (el & 15);
+                    if (rm < M && rn < N)
+                        qm_red_add(&partials[pbase + (size_t)(p0 + rm) * N + rn], Cs[warp * 256 + el]);
+                }
+            } else if (SPLIT) {
+                for (int el = lane; el < 256; el += 32) {
+                    const int rm = rm0 + (el >> 4), rn = gn0 + (el & 15);
+                    if (rm < M && rn < N)
+                        partials[pbase + (((size_t)zsl * Mtot) + (p0 + rm)) * N + rn] =
+                            Cs[warp * 256 + el];
+                }
+            } else {
+                for (int el = lane; el < 256; el += 32) {
+                    const int rm = rm0 + (el >> 4), rn = gn0 + (el & 15);
+                    if (rm < M && rn < N) {
+                        const int p = p0 + rm;
                         const float v = (float)Cs[warp * 256 + el] * sx[p] * row_scale[rn];
                         C[(size_t)p * N + rn] = __float2bfloat16(v);
                     }
@@ -1039,10 +1220,14 @@ static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int
     } while (0)
 
 // Dense fused-decode int8 GEMM (single weight, no routing). See pf_dense_gemm_qi8_kernel_g.
+// `out_acc` (optional): when the split-K atomic path is taken, skip the reduce pass and report
+// that `partials[0 .. M*N)` holds the raw int32 accumulator instead. The caller's next kernel then
+// applies sx*row_scale itself -- see launch_norm_then_add_acc -- which saves the reduce launch and
+// the bf16 tensor it would have materialized for a single consumer.
 bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const float* sx,
                                    const void* W_q, const float* row_scale, void* C_bf16,
                                    int M, int N, int K, cudaStream_t stream,
-                                   int* partials, int partials_splits) {
+                                   int* partials, int partials_splits, int* out_acc) {
     if (!pf_dense_gemm_qi8_supported(ggml_type)) return false;   // Q4_K / Q5_K / Q6_K
     if (!row_scale || M <= 0) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;         // whole super-blocks only
@@ -1075,6 +1260,7 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
                     A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, atomic);
             // With the atomic accumulator every slice has already been summed, so the reduce pass
             // reads the single plane (splits=1 indexes exactly the [m][n] the atomics wrote).
+            if (atomic && out_acc) { *out_acc = 1; return true; }   // consumer reads the int32
             pf_dense_splitk_reduce_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
                 partials, sx, row_scale, C, M, N, atomic ? 1 : splits);
             return true;

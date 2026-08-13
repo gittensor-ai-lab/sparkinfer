@@ -678,7 +678,14 @@ void launch_prefill_attn_swa_pure_bf16(
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
     cudaStream_t stream) {
     (void)head_dim;   // Muse Glimmer attention is hd128 only; templated below.
-    constexpr int TQ = 16, TK = 32, HD = 128;
+    // TQ=8, not 16. This kernel is one warp per query, so TQ only sets how many queries share a
+    // block's K/V tile -- each warp still walks its own keys in ascending kpos, so the fp32 dot and
+    // the online-softmax chain are untouched and the result is bit-identical. At Muse's prefill@128
+    // the old TQ=16 launched ceil(128/16) x 32 = 256 blocks of 512 threads against 170 SMs that
+    // hold 4 such blocks each: 37.6% of the block slots, with the tail of a 1.5-block-per-SM
+    // distribution setting the runtime. Halving TQ doubles the grid to 512 smaller blocks and
+    // spreads them evenly, for the same total warps and the same K/V tile bytes per block.
+    constexpr int TQ = 8, TK = 32, HD = 128;
     const size_t sm = (size_t)2 * TK * HD * sizeof(__nv_bfloat16);   // 16 KB: K + V bf16 tiles
     dim3 grid((n_tokens + TQ - 1) / TQ, n_q_heads);
     win_prefill_pure_bf16_kernel<HD, TQ, TK><<<grid, TQ * 32, sm, stream>>>(

@@ -33,6 +33,16 @@ void launch_add_rmsnorm2_q8_rows(const void* x_bf16, const void* residual_bf16,
 // * weight. Unlike add_rmsnorm2/3 above (which norm the SUM), this norms block_out ALONE --
 // the sub-block's raw output, before any residual add -- and only the normalized result joins
 // the residual stream. Used for both the post-attention and post-FFN sandwich-norm steps.
+// RMSNorm + per-row int8 quantize in one pass (still writes the bf16). Bit-identical.
+bool launch_rmsnorm_quant_i8(const void* x, const void* weight, void* out,
+                             signed char* q, float* scale, int rows, int cols,
+                             float eps, cudaStream_t stream);
+
+// Sandwich norm fed from the split-K int32 accumulator (skips the reduce + the bf16 round trip).
+void launch_norm_then_add_acc(const void* residual_bf16, const int* acc, const float* sxr,
+                              const float* row_scale, const void* weight_bf16, void* out_bf16,
+                              int rows, int cols, float eps, cudaStream_t stream);
+
 void launch_norm_then_add(const void* residual_bf16, const void* block_out_bf16,
                           const void* weight_bf16, void* out_bf16,
                           int rows, int cols, float eps, cudaStream_t stream = nullptr);

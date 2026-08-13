@@ -98,7 +98,88 @@ __global__ __launch_bounds__(BLOCK) void pf_quant_rows_fast_kernel(
     }
 }
 
+
+// Muse Glimmer's attention output is gated (attn *= sigmoid(gate)) and then immediately row-quantized
+// to int8 for the o projection -- two kernels over the same qdim-wide tensor, with a full bf16 write
+// and re-read of `attn` in between that nothing else ever looks at. Folding the gate into the load
+// phase of the quantizer removes that round trip and one launch per layer.
+//
+// BIT-IDENTICAL to pf_mul_sigmoid_kernel followed by pf_quant_rows_fast_kernel: the gated value is
+// rounded to bf16 exactly as the separate kernel stored it, the amax is over that same value set
+// (max is associative and exact in fp), and d = amax/127.0f with the same roundf and amax==0 rule.
+template <int BLOCK, int VEC, int SLOTS>
+__global__ __launch_bounds__(BLOCK) void pf_gate_quant_rows_kernel(
+        const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ gate,
+        signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols) {
+    const int r   = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (r >= rows) return;
+    const size_t base = (size_t)r * cols;
+
+    __nv_bfloat16 reg[SLOTS][VEC];
+    float amax = 0.f;
+    #pragma unroll
+    for (int s = 0; s < SLOTS; s++) {
+        const int c = (tid + s * BLOCK) * VEC;
+        if (c < cols) {
+            __nv_bfloat16 xv[VEC], gv[VEC];
+            *reinterpret_cast<uint4*>(xv) = *reinterpret_cast<const uint4*>(&x[base + c]);
+            *reinterpret_cast<uint4*>(gv) = *reinterpret_cast<const uint4*>(&gate[base + c]);
+            #pragma unroll
+            for (int v = 0; v < VEC; v++) {
+                const float g = qr_to_f(gv[v]);
+                reg[s][v] = __float2bfloat16(qr_to_f(xv[v]) * (1.f / (1.f + __expf(-g))));
+                amax = fmaxf(amax, fabsf(qr_to_f(reg[s][v])));
+            }
+        }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    __shared__ float sred[BLOCK / 32];
+    if ((tid & 31) == 0) sred[tid >> 5] = amax;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < BLOCK / 32) ? sred[tid] : 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (tid == 0) sred[0] = v;
+    }
+    __syncthreads();
+    const float d = sred[0] / 127.0f;
+    if (tid == 0) scale[r] = d;
+
+    #pragma unroll
+    for (int s = 0; s < SLOTS; s++) {
+        const int c = (tid + s * BLOCK) * VEC;
+        if (c < cols) {
+            signed char out[VEC];
+            #pragma unroll
+            for (int v = 0; v < VEC; v++)
+                out[v] = (signed char)((sred[0] == 0.f) ? 0 : (int)roundf(qr_to_f(reg[s][v]) / d));
+            *reinterpret_cast<uint2*>(&q[base + c]) = *reinterpret_cast<const uint2*>(out);
+        }
+    }
+}
+
 }  // namespace
+
+bool launch_prefill_gate_quant_rows_i8(const void* x, const void* gate, signed char* q, float* scale,
+                                       int rows, int cols, cudaStream_t stream) {
+    constexpr int BLOCK = 256, VEC = 8;
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GATE_QUANT");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!enabled || rows <= 0 || cols <= 0 || (cols % VEC) != 0) return false;
+    auto xb = reinterpret_cast<const __nv_bfloat16*>(x);
+    auto gb = reinterpret_cast<const __nv_bfloat16*>(gate);
+    const int vecs = cols / VEC;
+    if (vecs <= BLOCK * 1)      pf_gate_quant_rows_kernel<BLOCK, VEC, 1><<<rows, BLOCK, 0, stream>>>(xb, gb, q, scale, rows, cols);
+    else if (vecs <= BLOCK * 2) pf_gate_quant_rows_kernel<BLOCK, VEC, 2><<<rows, BLOCK, 0, stream>>>(xb, gb, q, scale, rows, cols);
+    else if (vecs <= BLOCK * 4) pf_gate_quant_rows_kernel<BLOCK, VEC, 4><<<rows, BLOCK, 0, stream>>>(xb, gb, q, scale, rows, cols);
+    else return false;
+    return true;
+}
 
 bool launch_prefill_quant_rows_fast(const void* x, signed char* q, float* scale,
                                     int rows, int cols, cudaStream_t stream) {
