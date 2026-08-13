@@ -158,6 +158,43 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     Arena once_a, once_a8, once_am, once_aw;                       // per-call otherwise
     if (arena_reuse) { keep_a.rewind(); keep_a8.rewind(); keep_am.rewind(); keep_aw.rewind(); }
     Arena& a = arena_reuse ? keep_a : once_a;
+
+    // ---- CUDA-graph replay of the whole batched prefill -------------------------------------
+    // Muse's batched prefill is the only hot path here that is NOT graph-captured: decode gets a
+    // graph, this issues ~1088 kernel launches per prefill@128 (20.9 per layer) with host dispatch
+    // between every one. nsys puts the resulting GPU idle at 2.01 ms of a 38.18 ms window, and
+    // 1076 of those 1087 gaps are under 5 us -- launch overhead, not dependency stalls.
+    //
+    // Capture is only legal once the arena is WARM: Arena::alloc reuses a buffer whenever it is
+    // already big enough, so the second call for a given N does no cudaMalloc and hands out the
+    // SAME pointers the capture recorded. Hence capture on the second sighting of an N, replay
+    // after that. The prompt ids are staged through a PINNED buffer so the captured H2D has a
+    // stable source address and replay picks up new ids.
+    static cudaGraph_t     g_pfb_graph = nullptr;
+    static cudaGraphExec_t g_pfb_exec  = nullptr;
+    static int  g_pfb_n = -1, g_pfb_warm_n = -1, g_pfb_pin_cap = 0;
+    static int* g_pfb_pin = nullptr;
+    // DEFAULT ON: measured +5.91% on prefill@128, byte-identical output (SCORE_EQ IDENTICAL,
+    // TOP1 16/16). SPARKINFER_MUSE_PREFILL_GRAPH=0 restores eager dispatch.
+    static const bool graph_env = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PREFILL_GRAPH");
+        return !(e && e[0] == '0');
+    }();
+    const bool graph_on = graph_env && arena_reuse && c.muse_glimmer;
+    if (graph_on && N > g_pfb_pin_cap) {
+        if (g_pfb_pin) cudaFreeHost(g_pfb_pin);
+        g_pfb_pin = nullptr; g_pfb_pin_cap = 0;
+        if (cudaMallocHost(&g_pfb_pin, (size_t)N * sizeof(int)) == cudaSuccess) g_pfb_pin_cap = N;
+    }
+    const bool graph_ok = graph_on && g_pfb_pin && g_pfb_pin_cap >= N;
+    if (graph_ok) memcpy(g_pfb_pin, prompt_ids, (size_t)N * sizeof(int));
+    if (graph_ok && g_pfb_exec && g_pfb_n == N) {
+        pf_cu(cudaGraphLaunch(g_pfb_exec, st), "pfb graph launch");
+        pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st),
+              "pfb graph seed");
+        pf_cu(cudaStreamSynchronize(st), "pfb graph sync");
+        return *s.h_out_id;
+    }
     bf16* x    = a.alloc<bf16>((size_t)N * H);
     bf16* xn   = a.alloc<bf16>((size_t)N * H);
     bf16* hn   = a.alloc<bf16>((size_t)N * H);
@@ -495,7 +532,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         }
     }
 
-    pf_cu(cudaMemcpyAsync(d_ids, prompt_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "prefill ids");
+    // Capture on the SECOND sighting of this N (arena warm => no cudaMalloc inside the capture).
+    bool pfb_capturing = false;
+    // Re-capture when N changes: a graph is only valid for the N it recorded.
+    if (graph_ok && g_pfb_exec && g_pfb_n != N) {
+        cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr;
+        if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
+        g_pfb_n = -1;
+    }
+    if (graph_ok && !g_pfb_exec && g_pfb_warm_n == N) {
+        if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess)
+            pfb_capturing = true;
+    }
+    pf_cu(cudaMemcpyAsync(d_ids, graph_ok ? g_pfb_pin : prompt_ids, (size_t)N * sizeof(int),
+                          cudaMemcpyHostToDevice, st), "prefill ids");
 
     // Dequantize a native GGUF weight [n_out,K] to bf16 scratch; return a bf16 [n_out,K] ptr.
     auto dq = [&](const void* W, int wtype, int n_out, int K) -> const void* {
@@ -1476,6 +1526,31 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
         kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
+    // Close the capture BEFORE the D2H + sync: a synchronize cannot be recorded, and the seed
+    // readback is per-call anyway. Capturing records without executing, so the graph is launched
+    // here to actually produce THIS call's result.
+    if (pfb_capturing) {
+        cudaGraph_t g = nullptr;
+        if (cudaStreamEndCapture(st, &g) == cudaSuccess && g) {
+            cudaGraphExec_t e = nullptr;
+            if (cudaGraphInstantiate(&e, g, nullptr, nullptr, 0) == cudaSuccess) {
+                if (g_pfb_graph) cudaGraphDestroy(g_pfb_graph);
+                g_pfb_graph = g; g_pfb_exec = e; g_pfb_n = N;
+                pf_cu(cudaGraphLaunch(e, st), "pfb first launch");
+            } else {
+                // Nothing ran (capture records, it does not execute) and there is no graph to run
+                // it with. Report failure so the caller falls back to the token loop rather than
+                // returning a seed from uninitialised memory.
+                cudaGraphDestroy(g);
+                fprintf(stderr, "[prefill] graph instantiate failed -> fallback\n");
+                return -1;
+            }
+        } else {
+            fprintf(stderr, "[prefill] graph capture failed -> fallback\n");
+            return -1;
+        }
+    }
+    g_pfb_warm_n = N;
     pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "prefill seed");
     pf_cu(cudaStreamSynchronize(st), "prefill sync");
     int seed = *s.h_out_id;
