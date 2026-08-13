@@ -527,6 +527,186 @@ __global__ void win_prefill_pure_bf16_kernel(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Lane-parallel schedule of the Muse Glimmer bf16 kernel above.
+//
+// win_prefill_pure_bf16_kernel walks keys one at a time per query-warp: every
+// key pays a 5-shuffle warp reduction plus two dependent expf's, so the warp is
+// latency-bound and the fp32 units sit idle. That is the same bottleneck the
+// int8-KV lane-parallel kernel (win_prefill_lanepar_kernel) already removed for
+// Qwythos; Muse Glimmer's hd128 bf16 path never got the rewrite.
+//
+// Each of the 32 lanes owns ONE key of the TK=32 tile:
+//   - scoring: lane j computes the full 128-dim dot q.K[j] from smem (K rows
+//     padded to 132 floats -> lane-strided reads hit 32 distinct banks);
+//   - softmax: ONE max-reduce + ONE sum-reduce per tile;
+//   - AV: each lane owns 4 output dims; p_j broadcast by __shfl_sync.
+//
+// Window/causal predicate is Muse's pure rolling window (NO attention sink) --
+// identical to win_prefill_pure_bf16_kernel -- so SWA vs global is unchanged.
+// Online-softmax association order differs (tile-wide vs per-key), so the
+// output is not bit-identical; the values stay in the same fp32 online-softmax
+// recurrence. SPARKINFER_MUSE_PREFILL_ATTN_LANEPAR=0 restores the old kernel.
+// ----------------------------------------------------------------------------
+template <int HEAD_DIM, int QPW, int TK>
+__global__ void win_prefill_pure_bf16_lanepar_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
+    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks) {
+    (void)max_blocks_per_seq;
+    constexpr int ELEMS = HEAD_DIM / 32;
+    constexpr int KSTRIDE = HEAD_DIM + 4;
+    constexpr int NWARP = 16;
+    constexpr int TQ = NWARP * QPW;
+    static_assert(TK == 32, "one key per lane");
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int head = blockIdx.y;
+    const int qbase = blockIdx.x * TQ;
+    const int q0 = qbase + warp * QPW;
+    const int kv_head = head / (n_q_heads / n_kv_heads);
+    const bool active = (q0 < n_tokens) && (head < n_q_heads);
+
+    // Same window as win_prefill_pure_bf16_kernel (pure SWA, no sink).
+    auto win_start = [&](int t) -> int {
+        if (win_blocks <= 0) return 0;
+        const int n_blk_q = (t + block_size) / block_size;
+        const int rsb = (win_blocks >= n_blk_q) ? 0 : (n_blk_q - win_blocks);
+        return rsb * block_size;
+    };
+
+    extern __shared__ float smem_bf_lp[];
+    float* sK = smem_bf_lp;
+    float* sV = sK + TK * KSTRIDE;
+    __nv_bfloat16* sQ = reinterpret_cast<__nv_bfloat16*>(sV + TK * HEAD_DIM);
+
+    for (int idx = threadIdx.x; idx < TQ * (HEAD_DIM / 2); idx += blockDim.x) {
+        const int qq = idx / (HEAD_DIM / 2), d2 = idx - qq * (HEAD_DIM / 2);
+        const int qt = qbase + qq;
+        __nv_bfloat162 v2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+        if (qt < n_tokens && head < n_q_heads) {
+            const size_t q_off = ((size_t)qt * n_q_heads + head) * HEAD_DIM;
+            v2 = *reinterpret_cast<const __nv_bfloat162*>(q + q_off + d2 * 2);
+        }
+        *reinterpret_cast<__nv_bfloat162*>(sQ + (size_t)qq * HEAD_DIM + d2 * 2) = v2;
+    }
+
+    int qtok[QPW], my_rs[QPW];
+    float m[QPW], l[QPW], acc[QPW][ELEMS];
+#pragma unroll
+    for (int i = 0; i < QPW; i++) {
+        qtok[i] = q0 + i;
+        my_rs[i] = active ? win_start(min(qtok[i], n_tokens - 1)) : 0;
+        m[i] = -1e30f; l[i] = 0.f;
+#pragma unroll
+        for (int e = 0; e < ELEMS; e++) acc[i][e] = 0.f;
+    }
+
+    const int last_q = min(qbase + TQ - 1, n_tokens - 1);
+    const int blk_rs = win_start(qbase);
+
+    for (int k0 = blk_rs; k0 <= last_q; k0 += TK) {
+        const int tk = min(TK, last_q + 1 - k0);
+        for (int idx = threadIdx.x; idx < tk * (HEAD_DIM / 2); idx += blockDim.x) {
+            const int kk = idx / (HEAD_DIM / 2), d2 = idx - kk * (HEAD_DIM / 2);
+            const int kpos = k0 + kk;
+            const int blk = kpos / block_size, within = kpos - blk * block_size;
+            const int phys = block_table[blk];
+            const size_t ckt = (size_t)phys * block_size + within;
+            const size_t off = (ckt * n_kv_heads + kv_head) * HEAD_DIM + (size_t)d2 * 2;
+            const __nv_bfloat162 k2 = *reinterpret_cast<const __nv_bfloat162*>(k_pool + off);
+            const __nv_bfloat162 v2 = *reinterpret_cast<const __nv_bfloat162*>(v_pool + off);
+            sK[kk * KSTRIDE + d2 * 2]     = win_to_f(k2.x);
+            sK[kk * KSTRIDE + d2 * 2 + 1] = win_to_f(k2.y);
+            sV[kk * HEAD_DIM + d2 * 2]     = win_to_f(v2.x);
+            sV[kk * HEAD_DIM + d2 * 2 + 1] = win_to_f(v2.y);
+        }
+        __syncthreads();
+        if (active && k0 <= qtok[QPW - 1]) {
+            const int kpos = k0 + lane;
+            const bool live = lane < tk;
+            bool in[QPW];
+#pragma unroll
+            for (int i = 0; i < QPW; i++) {
+                in[i] = live && (kpos >= my_rs[i]) && (kpos <= qtok[i]) && (qtok[i] < n_tokens);
+            }
+            float s[QPW];
+            {
+                const float* krow = sK + lane * KSTRIDE;
+                const __nv_bfloat16* qrow = sQ + (size_t)(warp * QPW) * HEAD_DIM;
+                float sa[QPW], sb[QPW];
+#pragma unroll
+                for (int i = 0; i < QPW; i++) { sa[i] = 0.f; sb[i] = 0.f; }
+#pragma unroll
+                for (int d = 0; d < HEAD_DIM; d += 4) {
+                    const float4 kv = *reinterpret_cast<const float4*>(krow + d);
+#pragma unroll
+                    for (int i = 0; i < QPW; i++) {
+                        const __nv_bfloat162 qa = *reinterpret_cast<const __nv_bfloat162*>(
+                            qrow + (size_t)i * HEAD_DIM + d);
+                        const __nv_bfloat162 qb = *reinterpret_cast<const __nv_bfloat162*>(
+                            qrow + (size_t)i * HEAD_DIM + d + 2);
+                        sa[i] += __bfloat162float(qa.x) * kv.x + __bfloat162float(qa.y) * kv.y;
+                        sb[i] += __bfloat162float(qb.x) * kv.z + __bfloat162float(qb.y) * kv.w;
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < QPW; i++) s[i] = in[i] ? (sa[i] + sb[i]) * scale : -1e30f;
+            }
+#pragma unroll
+            for (int i = 0; i < QPW; i++) {
+                float tmax = s[i];
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1)
+                    tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, o));
+                if (tmax <= -1e29f) { s[i] = 0.f; continue; }
+                const float m_new = fmaxf(m[i], tmax);
+                const float corr = __expf(m[i] - m_new);
+                const float p = in[i] ? __expf(s[i] - m_new) : 0.f;
+                float tl = p;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1)
+                    tl += __shfl_xor_sync(0xffffffffu, tl, o);
+                l[i] = l[i] * corr + tl;
+                m[i] = m_new;
+#pragma unroll
+                for (int e = 0; e < ELEMS; e++) acc[i][e] *= corr;
+                s[i] = p;
+            }
+            for (int j = 0; j < tk; j++) {
+                float pj[QPW]; float any = 0.f;
+#pragma unroll
+                for (int i = 0; i < QPW; i++) {
+                    pj[i] = __shfl_sync(0xffffffffu, s[i], j);
+                    any += pj[i];
+                }
+                if (any != 0.f) {
+                    const float* vrow = sV + j * HEAD_DIM + lane;
+#pragma unroll
+                    for (int e = 0; e < ELEMS; e++) {
+                        const float vv = vrow[e * 32];
+#pragma unroll
+                        for (int i = 0; i < QPW; i++) acc[i][e] += pj[i] * vv;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+#pragma unroll
+        for (int i = 0; i < QPW; i++) {
+            if (qtok[i] >= n_tokens) break;
+            const size_t q_off = ((size_t)qtok[i] * n_q_heads + head) * HEAD_DIM;
+            const float inv = (l[i] > 0.f) ? (1.f / l[i]) : 0.f;
+#pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                attn[q_off + lane + e * 32] = __float2bfloat16(acc[i][e] * inv);
+        }
+    }
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------------------
@@ -661,6 +841,8 @@ bool launch_prefill_attn_windowed(
 
 // BF16-KV pure-window prefill attention for Muse Glimmer (hd128). win_blocks>0 =>
 // SWA layers (last win_blocks blocks); win_blocks<=0 => global/NoPE full causal.
+// Default: lane-parallel schedule (see win_prefill_pure_bf16_lanepar_kernel).
+// SPARKINFER_MUSE_PREFILL_ATTN_LANEPAR=0 restores the one-key-at-a-time kernel.
 void launch_prefill_attn_swa_pure_bf16(
     const void* q, const void* k_pool, const void* v_pool,
     const int* block_table, void* attn,
@@ -668,13 +850,32 @@ void launch_prefill_attn_swa_pure_bf16(
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
     cudaStream_t stream) {
     (void)head_dim;   // Muse Glimmer attention is hd128 only; templated below.
-    constexpr int TQ = 16, TK = 32, HD = 128;
+    auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
+    auto kb = reinterpret_cast<const __nv_bfloat16*>(k_pool);
+    auto vb = reinterpret_cast<const __nv_bfloat16*>(v_pool);
+    auto ob = reinterpret_cast<__nv_bfloat16*>(attn);
+    constexpr int TK = 32, HD = 128;
+    static int lanepar = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PREFILL_ATTN_LANEPAR");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (lanepar) {
+        // QPW=1 keeps the same 16-query tile as the old kernel, so ctx=128 still
+        // launches 256 CTAs (8 x 32 heads) rather than collapsing occupancy.
+        constexpr int QPW = 1, TQ_LP = 16 * QPW;
+        const size_t sm_lp = ((size_t)TK * (HD + 4) + (size_t)TK * HD) * sizeof(float)
+                           + (size_t)TQ_LP * HD * sizeof(__nv_bfloat16);
+        dim3 grid((n_tokens + TQ_LP - 1) / TQ_LP, n_q_heads);
+        win_prefill_pure_bf16_lanepar_kernel<HD, QPW, TK><<<grid, 16 * 32, sm_lp, stream>>>(
+            qb, kb, vb, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
+            block_size, max_blocks_per_seq, scale, win_blocks);
+        if (cudaPeekAtLastError() == cudaSuccess) return;
+    }
+    constexpr int TQ = 16;
     const size_t sm = (size_t)2 * TK * HD * sizeof(__nv_bfloat16);   // 16 KB: K + V bf16 tiles
     dim3 grid((n_tokens + TQ - 1) / TQ, n_q_heads);
     win_prefill_pure_bf16_kernel<HD, TQ, TK><<<grid, TQ * 32, sm, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
-        reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
-        reinterpret_cast<__nv_bfloat16*>(attn),
+        qb, kb, vb, block_table, ob,
         n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks);
 }
 
