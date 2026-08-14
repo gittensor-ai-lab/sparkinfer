@@ -436,11 +436,113 @@ __global__ void muse_sandwich_tail_kernel(const __nv_bfloat16* __restrict__ resi
                                           const __nv_bfloat16* __restrict__ next_w,
                                           __nv_bfloat16* __restrict__ out_x,
                                           __nv_bfloat16* __restrict__ out_xn,
-                                          int cols, float post_eps, float eps) {
+                                          si_blk_q8_1* __restrict__ out_q8,
+                                          int cols, float post_eps, float eps, int reg_tail) {
     const size_t base = (size_t)blockIdx.x * cols;
     __shared__ float s_warp[32];
     const int npack = cols >> 3;
     const int tail = npack << 3;
+
+    // One pack per thread -- Muse's 6656 columns is 832 packs against a 1024-thread block, and the
+    // scalar tail is empty -- lets the whole tail live in registers. Two things follow, and both
+    // are latency, not bandwidth: the bf16 stage 2 re-reads from out_x is the bf16 this thread
+    // just rounded, so keeping it deletes a store -> __syncthreads -> load round trip off the
+    // critical path; and with nothing downstream of a load, all four operands issue together
+    // instead of in three dependent waves. Same values, same order, so it stays bit-identical --
+    // rn_unpack8(rn_pack8(v)) is __bfloat162float(__float2bfloat16(v)), exactly what the global
+    // round trip returned. Wider rows keep the original path below.
+    if (reg_tail && npack <= blockDim.x && tail == cols) {
+        const int p = threadIdx.x;
+        const bool live = p < npack;
+        float bv[8], rv[8], pv[8], nv[8];
+        if (live) {
+            rn_unpack8(__ldg(reinterpret_cast<const uint4*>(branch + base) + p), bv);
+            rn_unpack8(__ldg(reinterpret_cast<const uint4*>(residual + base) + p), rv);
+            rn_unpack8(__ldg(reinterpret_cast<const uint4*>(post_w) + p), pv);
+            rn_unpack8(__ldg(reinterpret_cast<const uint4*>(next_w) + p), nv);
+        }
+        float ss = 0.f;
+        if (live) {
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ss = __fmaf_rn(bv[j], bv[j], ss);
+        }
+        ss = rn_warp_sum(ss);
+        if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+            v = rn_warp_sum(v);
+            if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + post_eps);
+        }
+        __syncthreads();
+        const float inv1 = s_warp[0];
+
+        float xv[8];
+        float ss2 = 0.f;
+        if (live) {
+            float ov[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ov[j] = rv[j] + bv[j] * inv1 * pv[j];
+            const uint4 packed = rn_pack8(ov);
+            reinterpret_cast<uint4*>(out_x + base)[p] = packed;
+            rn_unpack8(packed, xv);          // the bf16 the separate rmsnorm would have re-read
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ss2 = __fmaf_rn(xv[j], xv[j], ss2);
+        }
+        ss2 = rn_warp_sum(ss2);
+        __syncthreads();                     // every thread has consumed inv1; s_warp is free
+        if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss2;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+            v = rn_warp_sum(v);
+            if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps);
+        }
+        __syncthreads();
+        const float inv2 = s_warp[0];
+        if (live) {
+            float ov[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ov[j] = xv[j] * inv2 * nv[j];
+            const uint4 packed = rn_pack8(ov);
+            reinterpret_cast<uint4*>(out_xn + base)[p] = packed;
+            // Q8_1(out_xn) for whichever MMVQ consumes this row next -- the FFN's gate/up after
+            // the post-attention tail, the next layer's Q/K/V after the post-FFN one. Both used
+            // to launch a standalone quantize over a row this kernel had just written. Quantizes
+            // the *stored* bf16, and amax and the integer sum are both order-independent, so the
+            // 4-lane form here and the 32-lane si_quant_bf16_q8_1 emit the same block. The
+            // launcher only passes out_q8 when every warp is fully live, so these butterflies
+            // cannot diverge.
+            if (out_q8) {
+                float q[8]; rn_unpack8(packed, q);
+                const int b = p >> 2, r = p & 3;
+                float amax = 0.f;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(q[j]));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+                const float d = amax / 127.0f;
+                si_blk_q8_1* ob = out_q8 + (size_t)blockIdx.x * (cols >> 5) + b;
+                int s = 0;
+                unsigned w[2] = {0u, 0u};
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const int qi = (amax == 0.0f) ? 0 : (int)roundf(q[j] / d);
+                    w[j >> 2] |= ((unsigned)qi & 255u) << ((j & 3) * 8);
+                    s += qi;
+                }
+                // qs[r*8] sits at 36*b + 4 + 8*r, so the eight bytes this lane owns are always
+                // 4-byte aligned: two STG.32 instead of eight STG.U8, same bytes.
+                unsigned* qw = reinterpret_cast<unsigned*>(ob->qs + r * 8);
+                qw[0] = w[0];
+                qw[1] = w[1];
+                s += __shfl_xor_sync(0xffffffffu, s, 1);
+                s += __shfl_xor_sync(0xffffffffu, s, 2);
+                if (r == 0) ob->ds = __floats2half2_rn(d, d * (float)s);
+            }
+        }
+        return;
+    }
 
     // ---- stage 1: norm_then_add over `branch` ----
     const uint4* b4 = reinterpret_cast<const uint4*>(branch + base);
@@ -739,8 +841,8 @@ void launch_add_rmsnorm3_q8_rows(const void* x, const void* res1, const void* re
         reinterpret_cast<si_blk_q8_1*>(out_q8), cols, eps);
 }
 
-void launch_muse_sandwich_tail(const void* residual, const void* branch, const void* post_w,
-                               const void* next_w, void* out_x, void* out_xn,
+bool launch_muse_sandwich_tail(const void* residual, const void* branch, const void* post_w,
+                               const void* next_w, void* out_x, void* out_xn, void* out_q8,
                                int rows, int cols, float post_eps, float eps, cudaStream_t stream) {
     // 256 threads for a 6656-wide row means npack = 832 packs walked 3-4 deep per thread, twice,
     // on a chain of dependent loads -- and the whole thing is one CTA of a 170-SM device. One
@@ -760,13 +862,30 @@ void launch_muse_sandwich_tail(const void* residual, const void* branch, const v
         tail_w = e ? atoi(e) : 1024;
         if (tail_w != 256 && tail_w != 512 && tail_w != 768 && tail_w != 1024) tail_w = 1024;
     }
+    // SPARKINFER_MUSE_TAIL_REG=0 forces the global-memory path, so both arms of an A/B come out
+    // of one binary.
+    static int reg_tail = -1;
+    if (reg_tail < 0) {
+        const char* e = getenv("SPARKINFER_MUSE_TAIL_REG");
+        reg_tail = (e && e[0] == '0') ? 0 : 1;
+    }
+    // The Q8_1 side channel rides the register path only, and only when npack is a whole number
+    // of warps so the 4-lane butterflies stay convergent. Report what actually happened rather
+    // than letting the caller assume: a caller that skips its own quantize on a false promise
+    // feeds the next MMVQ a stale activation, which reads as a confident wrong distribution
+    // rather than as a crash.
+    const int npack = cols >> 3;
+    const bool q8 = out_q8 && reg_tail && npack <= tail_w && (npack << 3) == cols &&
+                    (npack & 31) == 0 && (cols & 31) == 0;
     muse_sandwich_tail_kernel<<<rows, tail_w, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(residual),
         reinterpret_cast<const __nv_bfloat16*>(branch),
         reinterpret_cast<const __nv_bfloat16*>(post_w),
         reinterpret_cast<const __nv_bfloat16*>(next_w),
         reinterpret_cast<__nv_bfloat16*>(out_x),
-        reinterpret_cast<__nv_bfloat16*>(out_xn), cols, post_eps, eps);
+        reinterpret_cast<__nv_bfloat16*>(out_xn),
+        q8 ? reinterpret_cast<si_blk_q8_1*>(out_q8) : nullptr, cols, post_eps, eps, reg_tail);
+    return q8;
 }
 
 // Same sandwich norm, fed straight from the split-K int32 accumulator instead of from a bf16

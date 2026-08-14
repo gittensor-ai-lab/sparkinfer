@@ -61,9 +61,12 @@ void launch_muse_qknorm_rope_kv(void* q, void* k, const void* v, const void* q_w
                                 int n_q_heads, int n_kv_heads, int head_dim, float theta,
                                 int block_size, float eps, bool do_rope, cudaStream_t stream = nullptr);
 
-void launch_muse_sandwich_tail(const void* residual_bf16, const void* branch_bf16,
+// Returns true if it also wrote Q8_1(out_xn) into out_q8, letting the caller skip the standalone
+// quantize its next MMVQ would otherwise need. Pass out_q8 = nullptr to opt out. Never assume the
+// emission happened -- it is conditional on the row shape and on the register path being taken.
+bool launch_muse_sandwich_tail(const void* residual_bf16, const void* branch_bf16,
                                const void* post_w_bf16, const void* next_w_bf16,
-                               void* out_x_bf16, void* out_xn_bf16,
+                               void* out_x_bf16, void* out_xn_bf16, void* out_q8,
                                int rows, int cols, float post_eps, float eps,
                                cudaStream_t stream = nullptr);
 
