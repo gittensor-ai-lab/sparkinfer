@@ -46,12 +46,12 @@ struct FP4Stack {
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
     using ScaleConfig = typename Mainloop::Sm1xxBlkScaledConfig;
 };
-using Wide = FP4Stack<128>;
-using Skinny = FP4Stack<64>;
-// 256-deep K tile: fewer mainloop trips and longer contiguous weight reads per CTA;
-// measured additive on top of the 64-wide tile. Shipped default; K=128 stays for the env A/B.
-using SkinnyK256 = FP4Stack<64, 256>;
-using WideK256 = FP4Stack<128, 256>;
+// Exactly two instantiations: the shipped tile (main's 128x128x128) and this PR's
+// 128x64x256. Each is a full CUTLASS blockscaled GEMM, so extra variants cost real
+// compile time in this translation unit for no runtime benefit -- the intermediate
+// shapes were tuning arms and are gone.
+using Wide = FP4Stack<128, 128>;
+using Skinny = FP4Stack<64, 256>;
 using Kernel = Wide::Kernel;
 using Gemm = Wide::Gemm;
 using StrideA = typename Kernel::StrideA;
@@ -68,14 +68,6 @@ auto sfb_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SF
 static_assert(std::is_same_v<decltype(Wide::ScaleConfig::tile_atom_to_shape_SFA(
                                  cute::make_shape(1, 1, 1, 1))),
                              decltype(Skinny::ScaleConfig::tile_atom_to_shape_SFA(
-                                 cute::make_shape(1, 1, 1, 1)))> &&
-              std::is_same_v<decltype(Wide::ScaleConfig::tile_atom_to_shape_SFA(
-                                 cute::make_shape(1, 1, 1, 1))),
-                             decltype(SkinnyK256::ScaleConfig::tile_atom_to_shape_SFA(
-                                 cute::make_shape(1, 1, 1, 1)))> &&
-              std::is_same_v<decltype(Wide::ScaleConfig::tile_atom_to_shape_SFA(
-                                 cute::make_shape(1, 1, 1, 1))),
-                             decltype(WideK256::ScaleConfig::tile_atom_to_shape_SFA(
                                  cute::make_shape(1, 1, 1, 1)))>,
               "scale-factor layouts diverge across tile variants");
 
@@ -159,11 +151,9 @@ size_t prefill_nvfp4_scale_bytes_b(int n, int k) {
 }
 size_t prefill_nvfp4_workspace_bytes(int m, int n, int k) {
     size_t r = Gemm::get_workspace_size(args(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
-    const size_t cand[3] = {
-        Skinny::Gemm::get_workspace_size(args_t<Skinny>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k)),
-        SkinnyK256::Gemm::get_workspace_size(args_t<SkinnyK256>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k)),
-        WideK256::Gemm::get_workspace_size(args_t<WideK256>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k))};
-    for (size_t c : cand) if (c > r) r = c;
+    const size_t sk = Skinny::Gemm::get_workspace_size(
+        args_t<Skinny>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
+    if (sk > r) r = sk;
     return r;
 }
 bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k, cudaStream_t st) {
@@ -185,23 +175,17 @@ bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k
 bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const void* sb,
                                void* d,int m,int n,int k,void* ws,cudaStream_t st) {
     if (!a||!sa||!b||!sb||!d||!prefill_nvfp4_supported(m,n,k)) return false;
-    // At m = 128 rows one M-tile is all there is, so CTAs = n / TILE_N: the 128-wide tile
-    // put 52 CTAs on 170 SMs for the hidden-output GEMMs (ffn_down, wo) and one incomplete
-    // 156-CTA wave for gate/up. The 64-wide tile doubles both -- measured faster for every
-    // shape this path serves, so it is the default; SPARKINFER_MUSE_NVFP4_SKINNY sets an
-    // n threshold above which the 128-wide tile returns (0 restores it everywhere).
+    // At m = 128 rows one M-tile is all there is, so CTAs = n / TILE_N: the shipped 128-wide
+    // tile puts 52 CTAs on 170 SMs for the hidden-output GEMM and one incomplete 156-CTA wave
+    // for gate/up. 128x64x256 doubles the CTAs and halves the mainloop trips, and measured
+    // faster for every shape this path serves. SPARKINFER_MUSE_NVFP4_SKINNY=0 restores the
+    // shipped tile (n above the threshold also falls back to it).
     static int sk = -1;
     if (sk < 0) {
         const char* e = getenv("SPARKINFER_MUSE_NVFP4_SKINNY");
         sk = e ? atoi(e) : 1 << 30;
     }
-    // 256-deep K tile: fewer mainloop trips, longer contiguous weight reads per CTA --
-    // measured +0.8% on top of the 64-wide tile, output bit-identical. =0 restores K=128.
-    static int k256 = -1;
-    if (k256 < 0) { const char* e = getenv("SPARKINFER_MUSE_NVFP4_K256"); k256 = (e && e[0]=='0') ? 0 : 1; }
-    if (n <= sk) return k256 ? run_gemm<SkinnyK256>(a,sa,b,sb,d,m,n,k,ws,st)
-                             : run_gemm<Skinny>(a,sa,b,sb,d,m,n,k,ws,st);
-    return k256 ? run_gemm<WideK256>(a,sa,b,sb,d,m,n,k,ws,st)
-                : run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st);
+    if (n <= sk) return run_gemm<Skinny>(a,sa,b,sb,d,m,n,k,ws,st);
+    return run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st);
 }
 } // namespace sparkinfer::kernels
