@@ -20,7 +20,110 @@ using E4 = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
 using BF = cutlass::bfloat16_t;
 using Cluster = Shape<_1, _1, _1>;
 
-template <class TileShape>
+// ---------------------------------------------------------------------------------------------
+// L2 EVICTION POLICY FOR THE WEIGHT STREAM.
+//
+// At M=128 the grid is 1 x ceil(N/TileN), so every CTA re-reads the WHOLE A operand while the B
+// weight slice it owns is read exactly once and never revisited. The L2 traffic that creates is
+// larger than the DRAM traffic for three of the four shapes -- down: A is 1.44 MB re-read by 104
+// CTAs = 150 MB of L2 against 74.8 MB of B from DRAM; qkvg 65 vs 32.6; wo 30.7 vs 15.3 -- so the
+// read-once weight stream evicting the reused A tile is a real cost.
+//
+// `__ldcs` is the usual fix and was worth +1.4% on the older hand-written int8 GEMM, but CUTLASS
+// loads A, B, SFA and SFB entirely through TMA and TMA ignores both `__ldcs` and a
+// cudaAccessPolicyWindow (measured: the window moves this kernel ~0%). The mechanism that DOES
+// reach a TMA load is the per-instruction .L2::cache_hint operand, which CUTLASS already plumbs
+// through Copy_Traits::with(mbar, multicast_mask, cache_hint) as a DEFAULTED argument -- the
+// sm120 mainloop simply never passes it (sm120_blockscaled_mma_tma.hpp:677-681 use the 1-arg form).
+//
+// Rather than vendor or patch CUTLASS, derive from its collective and hide `load()`. GemmUniversal
+// is templated on the mainloop type and every nested type it needs (Params, SharedStorage,
+// DispatchPolicy, TiledMma) is inherited, so only this one method changes. The body below is
+// CUTLASS's verbatim apart from the two hints: B and SFB are marked EVICT_FIRST so the weight
+// stream surrenders its lines first, and A/SFA are left EVICT_NORMAL -- marking A EVICT_FIRST
+// instead measured 61% WORSE, which is the control that proves the hint is doing what it says.
+// A cache hint cannot change any value, so this is bit-identical by construction.
+// Marking the reused A tile EVICT_LAST ("keep me") on top of this measured a WASH (9048 vs 9041,
+// splitting the pairs), so only the one-sided policy ships.
+template <class Base>
+struct MmaEvictFirstB : Base {
+    using Base::Base;
+    using typename Base::Params;
+    using typename Base::MainloopPipeline;
+    using typename Base::PipelineState;
+    using typename Base::TensorStorage;
+
+    template <class TensorA, class TensorB, class TensorSFA, class TensorSFB,
+              class KTileIterator, class BlockCoord>
+    CUTLASS_DEVICE void
+    load(Params const& params, MainloopPipeline pipeline, PipelineState smem_pipe_write,
+         cute::tuple<TensorA, TensorB, TensorSFA, TensorSFB> const& load_inputs,
+         BlockCoord const& blk_coord, KTileIterator k_tile_iter, int k_tile_count,
+         int thread_idx, uint32_t block_rank_in_cluster, TensorStorage& shared_tensors) {
+        using cute::_0;
+        using cute::Int;
+        constexpr auto EF = cute::TMA::CacheHintSm90::EVICT_FIRST;
+        int lane_predicate = cute::elect_one_sync();
+        if (lane_predicate) {
+            Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()),
+                                    typename Base::SmemLayoutA{});
+            Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()),
+                                    typename Base::SmemLayoutB{});
+            Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()),
+                                      typename Base::SmemLayoutSFA{});
+            Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()),
+                                      typename Base::SmemLayoutSFB{});
+
+            auto [gA_mkl, gB_nkl, gSFA_mkl, gSFB_nkl] = load_inputs;
+            auto block_tma_a = params.tma_load_a.get_slice(0);
+            auto block_tma_b = params.tma_load_b.get_slice(0);
+            auto block_tma_sfa = params.tma_load_sfa.get_slice(0);
+            auto block_tma_sfb = params.tma_load_sfb.get_slice(0);
+            auto [m_coord, n_coord, k_coord, l_coord] = blk_coord;
+
+            using TS = typename Base::TileShape;
+            using TSFB = typename Base::TileShapeSFB;
+            auto broadcast_n = make_layout(
+                make_shape(Int<cute::size<1>(TSFB{}) / cute::size<1>(TS{})>{},
+                           Int<cute::numeric_limits<int>::max()>{}),
+                make_stride(_0{}, cute::size<1>(TSFB{}) / cute::size<1>(TS{})));
+            Tensor gA = gA_mkl(_,_,m_coord,_,l_coord);
+            Tensor gB = gB_nkl(_,_,n_coord,_,l_coord);
+            Tensor gSFA = gSFA_mkl(_,_,m_coord,_,l_coord);
+            Tensor gSFB = gSFB_nkl(_,_,broadcast_n(n_coord),_,l_coord);
+
+            Tensor tAgA = block_tma_a.partition_S(gA);
+            Tensor tAsA = block_tma_a.partition_D(sA);
+            Tensor tBgB = block_tma_b.partition_S(gB);
+            Tensor tBsB = block_tma_b.partition_D(sB);
+            Tensor tAgSFA = block_tma_sfa.partition_S(gSFA);
+            Tensor tAsSFA = block_tma_sfa.partition_D(sSFA);
+            Tensor tBgSFB = block_tma_sfb.partition_S(gSFB);
+            Tensor tBsSFB = block_tma_sfb.partition_D(sSFB);
+
+            CUTLASS_PRAGMA_NO_UNROLL
+            for ( ; k_tile_count > 0; --k_tile_count) {
+                pipeline.producer_acquire(smem_pipe_write);
+                using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+                BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+                int write_stage = smem_pipe_write.index();
+                    copy(params.tma_load_a.with(*tma_barrier),
+                         tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
+                    copy(params.tma_load_sfa.with(*tma_barrier),
+                         tAgSFA(_,_,_,*k_tile_iter), tAsSFA(_,_,_,write_stage));
+                copy(params.tma_load_b.with(*tma_barrier, 0, EF),
+                     tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
+                copy(params.tma_load_sfb.with(*tma_barrier, 0, EF),
+                     tBgSFB(_,_,_,*k_tile_iter), tBsSFB(_,_,_,write_stage));
+                ++k_tile_iter;
+                ++smem_pipe_write;
+            }
+        }
+        __syncwarp();
+    }
+};
+
+template <class TileShape, bool EvictFirstB = false>
 struct Cfg {
     using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, TileShape, Cluster,
@@ -34,8 +137,9 @@ struct Cfg {
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
         cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+    using MainloopSel = cute::conditional_t<EvictFirstB, MmaEvictFirstB<Mainloop>, Mainloop>;
     using Kernel = cutlass::gemm::kernel::GemmUniversal<
-        Shape<int, int, int, int>, Mainloop, Epilogue, void>;
+        Shape<int, int, int, int>, MainloopSel, Epilogue, void>;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
 
@@ -44,6 +148,11 @@ struct Cfg {
 // the wide grid cannot (see nvfp4_prefer_narrow).
 using Wide = Cfg<Shape<_128, _128, _256>>;
 using Narrow = Cfg<Shape<_128, _64, _256>>;
+// Same two tilings with the weight stream marked evict-first. Kept as separate instantiations so
+// the policy can be A/B'd in ONE binary (SPARKINFER_NVFP4_EVICT_FIRST), which is the only way to
+// measure it without a rebuild between arms.
+using WideEF = Cfg<Shape<_128, _128, _256>, true>;
+using NarrowEF = Cfg<Shape<_128, _64, _256>, true>;
 
 using Gemm = typename Wide::Gemm;
 using Kernel = typename Wide::Kernel;
@@ -304,6 +413,14 @@ bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k
 bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const void* sb,
                                void* d,int m,int n,int k,void* ws,cudaStream_t st) {
     if (!a||!sa||!b||!sb||!d||!prefill_nvfp4_supported(m,n,k)) return false;
+    // Default ON; SPARKINFER_NVFP4_EVICT_FIRST=0 restores CUTLASS's stock loads for A/B.
+    static const bool ef = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_EVICT_FIRST");
+        return !e || atoi(e) != 0;
+    }();
+    if (ef)
+        return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st)
+                                  : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st);
     return prefer_narrow(m,n) ? run_gemm<Narrow>(a,sa,b,sb,d,m,n,k,ws,st)
                               : run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st);
 }

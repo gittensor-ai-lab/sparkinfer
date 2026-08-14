@@ -29,6 +29,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdlib>
+#include <type_traits>
 
 namespace sparkinfer {
 namespace kernels {
@@ -537,6 +538,201 @@ __global__ void win_prefill_pure_bf16_kernel(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Lane-parallel BF16-KV pure-window prefill attention (Muse Glimmer, hd128).
+//
+// Same schedule `win_prefill_lanepar_kernel` runs for the int8 hd256 layers,
+// retargeted at the bf16 KV pool: ONE KEY PER LANE instead of one key at a time.
+// `win_prefill_pure_bf16_kernel` walks its 128 keys sequentially and pays a full
+// 32-lane butterfly plus two __expf inside the dependency chain of EVERY key --
+// 32 butterflies and 64 exps per 32-key tile. Spreading the tile's keys across
+// the lanes leaves the FMA count identical (each lane does the whole HEAD_DIM
+// dot for its own key instead of HEAD_DIM/32 dots for all 32 keys) but collapses
+// that to 2 butterflies and 2 exps per tile, which is what the kernel was
+// actually bound by: it moved 2.3 MB/layer in 29 us, ~5% of DRAM bandwidth and
+// ~1.5% of the SM's FMA throughput, so neither memory nor math was the limit.
+//
+// This is a rounding-order change, not a masking change -- the causal/window
+// predicate, the sink-free window start, and the scale are copied verbatim from
+// the kernel above. The online softmax becomes tile-wise (one max/sum over the
+// 32 keys in flight) instead of strictly key-sequential, exactly the way the
+// in-tree int8 lanepar kernel already differs from the int8 sequential ones.
+//
+// K/V stay bf16 in smem (the int8 kernel dequantizes to fp32 because it must):
+// 18.9 KB/block keeps the same ~5 blocks/SM the sequential kernel gets, where
+// fp32 tiles would cost 35 KB and halve occupancy. KSTRIDE pads the K row to
+// HEAD_DIM+8 bf16 = 68 words, and 68 % 32 == 4, so the eight lanes of a 16-byte
+// phase cover banks {0-3, 4-7, ... 28-31}: conflict-free.
+// ----------------------------------------------------------------------------
+template <int HEAD_DIM, int NWARP, int QPW, int TK>
+__global__ void win_prefill_lanepar_bf16_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
+    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks) {
+    constexpr int ELEMS = HEAD_DIM / 32;
+    constexpr int KSTRIDE = HEAD_DIM + 8;   // bf16 elems; see bank note above
+    constexpr int TQ = NWARP * QPW;         // queries per block
+    static_assert(TK == 32, "one key per lane");
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int head = blockIdx.y;
+    const int qbase = blockIdx.x * TQ;
+    const int q0 = qbase + warp * QPW;      // this warp's first query
+    const int kv_head = head / (n_q_heads / n_kv_heads);
+    const bool active = (q0 < n_tokens) && (head < n_q_heads);
+
+    // verbatim from win_prefill_pure_bf16_kernel: no sink block, win_blocks<=0 => full causal
+    auto win_start = [&](int t) -> int {
+        if (win_blocks <= 0) return 0;
+        const int n_blk_q = (t + block_size) / block_size;
+        const int rsb = (win_blocks >= n_blk_q) ? 0 : (n_blk_q - win_blocks);
+        return rsb * block_size;
+    };
+    int qtok[QPW], my_rs[QPW];
+#pragma unroll
+    for (int i = 0; i < QPW; i++) {
+        qtok[i] = q0 + i;
+        my_rs[i] = active ? win_start(min(qtok[i], n_tokens - 1)) : 0;
+    }
+
+    extern __shared__ __nv_bfloat16 smem_lpb[];
+    __nv_bfloat16* sK = smem_lpb;                          // [TK][KSTRIDE]
+    __nv_bfloat16* sV = sK + TK * KSTRIDE;                 // [TK][HEAD_DIM]
+    __nv_bfloat16* sQ = sV + TK * HEAD_DIM;                // [TQ][HEAD_DIM]
+
+    for (int idx = threadIdx.x; idx < TQ * (HEAD_DIM / 8); idx += blockDim.x) {
+        const int qq = idx / (HEAD_DIM / 8), d8 = idx - qq * (HEAD_DIM / 8);
+        const int qt = qbase + qq;
+        uint4 v4 = make_uint4(0, 0, 0, 0);
+        if (qt < n_tokens && head < n_q_heads) {
+            const size_t q_off = ((size_t)qt * n_q_heads + head) * HEAD_DIM;
+            v4 = *reinterpret_cast<const uint4*>(q + q_off + (size_t)d8 * 8);
+        }
+        *reinterpret_cast<uint4*>(sQ + (size_t)qq * HEAD_DIM + (size_t)d8 * 8) = v4;
+    }
+
+    float m[QPW], l[QPW], acc[QPW][ELEMS];
+#pragma unroll
+    for (int i = 0; i < QPW; i++) {
+        m[i] = -1e30f; l[i] = 0.f;
+#pragma unroll
+        for (int e = 0; e < ELEMS; e++) acc[i][e] = 0.f;
+    }
+
+    const int last_q = min(qbase + TQ - 1, n_tokens - 1);
+    const int blk_rs = win_start(qbase);
+
+    for (int k0 = blk_rs; k0 <= last_q; k0 += TK) {
+        const int tk = min(TK, last_q + 1 - k0);
+        // identical staging to the sequential kernel: one uint4 per thread, paged
+        // address math once per thread rather than once per element
+        constexpr int VPT = 8, DCH = HEAD_DIM / VPT;
+        for (int idx = threadIdx.x; idx < tk * DCH; idx += blockDim.x) {
+            const int kk = idx / DCH, d = (idx - kk * DCH) * VPT;
+            const int kpos = k0 + kk;
+            const int blk = kpos / block_size, within = kpos - blk * block_size;
+            const int phys = block_table[blk];
+            const size_t ckt = (size_t)phys * block_size + within;
+            const size_t off = (ckt * n_kv_heads + kv_head) * HEAD_DIM + d;
+            *reinterpret_cast<uint4*>(sK + (size_t)kk * KSTRIDE + d) =
+                *reinterpret_cast<const uint4*>(k_pool + off);
+            *reinterpret_cast<uint4*>(sV + (size_t)kk * HEAD_DIM + d) =
+                *reinterpret_cast<const uint4*>(v_pool + off);
+        }
+        __syncthreads();
+        if (active && k0 <= qtok[QPW - 1]) {
+            const int kpos = k0 + lane;
+            const bool live = lane < tk;
+            bool in[QPW];
+#pragma unroll
+            for (int i = 0; i < QPW; i++)
+                in[i] = live && (kpos >= my_rs[i]) && (kpos <= qtok[i]) && (qtok[i] < n_tokens);
+            // one key per lane: the whole HEAD_DIM dot lives in this lane, and the
+            // single K row read feeds all QPW query dots
+            float s[QPW];
+            {
+                const __nv_bfloat16* krow = sK + (size_t)lane * KSTRIDE;
+                const __nv_bfloat16* qrow = sQ + (size_t)(warp * QPW) * HEAD_DIM;
+                float sa[QPW], sb[QPW];
+#pragma unroll
+                for (int i = 0; i < QPW; i++) { sa[i] = 0.f; sb[i] = 0.f; }
+#pragma unroll
+                // Scalar __bfloat162float, deliberately: staging the K pair through
+                // __bfloat1622float2 into a float2[4] costs more in registers than it saves in
+                // conversions and measured ~0.5% SLOWER end to end. Do not "optimize" this.
+                for (int d = 0; d < HEAD_DIM; d += 8) {
+                    const uint4 kraw = *reinterpret_cast<const uint4*>(krow + d);
+                    const __nv_bfloat162* kp = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+#pragma unroll
+                    for (int i = 0; i < QPW; i++) {
+                        const uint4 qraw = *reinterpret_cast<const uint4*>(
+                            qrow + (size_t)i * HEAD_DIM + d);                  // broadcast read
+                        const __nv_bfloat162* qp = reinterpret_cast<const __nv_bfloat162*>(&qraw);
+#pragma unroll
+                        for (int t = 0; t < 4; t++) {
+                            sa[i] += __bfloat162float(qp[t].x) * __bfloat162float(kp[t].x);
+                            sb[i] += __bfloat162float(qp[t].y) * __bfloat162float(kp[t].y);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < QPW; i++) s[i] = in[i] ? (sa[i] + sb[i]) * scale : -1e30f;
+            }
+#pragma unroll
+            for (int i = 0; i < QPW; i++) {
+                float tmax = s[i];
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1)
+                    tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, o));
+                if (tmax <= -1e29f) { s[i] = 0.f; continue; }  // no live key for this query
+                const float m_new = fmaxf(m[i], tmax);
+                const float corr = __expf(m[i] - m_new);
+                const float p = in[i] ? __expf(s[i] - m_new) : 0.f;
+                float tl = p;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) tl += __shfl_xor_sync(0xffffffffu, tl, o);
+                l[i] = l[i] * corr + tl;
+                m[i] = m_new;
+#pragma unroll
+                for (int e = 0; e < ELEMS; e++) acc[i][e] *= corr;
+                s[i] = p;                                      // reuse s[] as this tile's p
+            }
+            // dim-parallel AV: lane owns dims {lane, lane+32, ...}; one sV read
+            // feeds all QPW queries
+            for (int j = 0; j < tk; j++) {
+                float pj[QPW]; float any = 0.f;
+#pragma unroll
+                for (int i = 0; i < QPW; i++) {
+                    pj[i] = __shfl_sync(0xffffffffu, s[i], j);
+                    any += pj[i];
+                }
+                if (any != 0.f) {          // warp-uniform: fully-masked keys skip the warp
+                    const __nv_bfloat16* vrow = sV + (size_t)j * HEAD_DIM + lane;
+#pragma unroll
+                    for (int e = 0; e < ELEMS; e++) {
+                        const float vv = win_to_f(vrow[e * 32]);
+#pragma unroll
+                        for (int i = 0; i < QPW; i++) acc[i][e] += pj[i] * vv;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+#pragma unroll
+        for (int i = 0; i < QPW; i++) {
+            if (qtok[i] >= n_tokens) break;
+            const size_t q_off = ((size_t)qtok[i] * n_q_heads + head) * HEAD_DIM;
+            const float inv = (l[i] > 0.f) ? (1.f / l[i]) : 0.f;
+#pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                attn[q_off + lane + e * 32] = __float2bfloat16(acc[i][e] * inv);
+        }
+    }
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------------------
@@ -686,8 +882,34 @@ void launch_prefill_attn_swa_pure_bf16(
     // distribution setting the runtime. Halving TQ doubles the grid to 512 smaller blocks and
     // spreads them evenly, for the same total warps and the same K/V tile bytes per block.
     constexpr int TQ = 8, TK = 32, HD = 128;
-    const size_t sm = (size_t)2 * TK * HD * sizeof(__nv_bfloat16);   // 16 KB: K + V bf16 tiles
+    // Lane-parallel schedule (one key per lane) by default; SPARKINFER_MUSE_ATTN_LANEPAR=0
+    // restores the sequential one-key-at-a-time kernel. Same grid either way, so the only
+    // difference is the schedule and the fp32 rounding order that comes with it.
+    static const bool lanepar = [] {
+        const char* e = getenv("SPARKINFER_MUSE_ATTN_LANEPAR");
+        return !e || atoi(e) != 0;
+    }();
+    if (lanepar) {
+        // NWARP=8 / QPW=1 keeps EXACTLY the grid the sequential kernel uses (512 blocks of 256
+        // threads at prefill@128), so this changes the schedule and nothing else. Widening the
+        // block to amortize the staged K/V tile over more queries looked attractive -- each tile
+        // is re-staged by grid.x blocks per head -- but it measured monotonically worse
+        // (prefill@128 medians: QPW=1 8709, QPW=2 8594, QPW=4 8536), the same way the sequential
+        // kernel preferred TQ=8 over TQ=16: block count and machine coverage dominate that L2
+        // traffic. Do not re-sweep QPW without a structural reason.
+        constexpr int NWARP = 8, QPW = 1, KSTRIDE = HD + 8, TQB = NWARP * QPW;
+        const size_t sm = (size_t)(TK * KSTRIDE + TK * HD + TQB * HD) * sizeof(__nv_bfloat16);
+        dim3 g((n_tokens + TQB - 1) / TQB, n_q_heads);
+        win_prefill_lanepar_bf16_kernel<HD, NWARP, QPW, TK><<<g, NWARP * 32, sm, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q),
+            reinterpret_cast<const __nv_bfloat16*>(k_pool),
+            reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
+            reinterpret_cast<__nv_bfloat16*>(attn),
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks);
+        return;
+    }
     dim3 grid((n_tokens + TQ - 1) / TQ, n_q_heads);
+    const size_t sm = (size_t)2 * TK * HD * sizeof(__nv_bfloat16);   // 16 KB: K + V bf16 tiles
     win_prefill_pure_bf16_kernel<HD, TQ, TK><<<grid, TQ * 32, sm, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
         reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
