@@ -381,6 +381,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     unsigned char* fp4_a = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
     unsigned char* fp4_as = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
     unsigned char* fp4_ws = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
+    // Down-projection FP4 leg: the A operand is the SwiGLU output (k = ffn, not H), so it needs
+    // its own quant buffers and workspace. Only allocated when the load-time conversion produced
+    // down_fp4 weights (SPARKINFER_MUSE_NVFP4_DOWN=0 keeps these null).
+    const bool muse_nvfp4_dn = muse_nvfp4 && s.w.layers[0].down_fp4 &&
+                               kernels::prefill_nvfp4_supported(N, H, ffn);
+    unsigned char* fp4_a2 = muse_nvfp4_dn
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, ffn)) : nullptr;
+    unsigned char* fp4_as2 = muse_nvfp4_dn
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N, ffn)) : nullptr;
+    unsigned char* fp4_ws2 = muse_nvfp4_dn
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_workspace_bytes(N, H, ffn)) : nullptr;
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
@@ -892,6 +903,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
                 // add happens in launch_norm_then_add below.
+                // FP4 o-projection: att is bf16 here; one quant (k = qdim) + one block-scaled
                 proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
             } else {
@@ -972,6 +984,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                                        ffu, fn, ffn, H, fp4_ws, st);
                 if (layer_fp4) {
                     kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
+                    // FP4 down leg: quantize the SwiGLU output once and hit the same block-scaled
+                    // GEMM. Writes ao directly (chunks are disjoint), leaving ffn_acc unset so the
+                    // plain norm_then_add tail consumes it. Falls back to the int8 down on any
+                    // launch failure, exactly like the gate/up legs above.
+                    if (muse_nvfp4_dn && w.down_fp4 && w.down_fp4_sf &&
+                        kernels::launch_prefill_nvfp4_quant_a(ffg, fp4_a2, fp4_as2, fn, ffn, st) &&
+                        kernels::launch_prefill_nvfp4_gemm(fp4_a2, fp4_as2, w.down_fp4,
+                                                           w.down_fp4_sf, ao + (size_t)fo * H,
+                                                           fn, H, ffn, fp4_ws2, st)) {
+                        continue;
+                    }
                     proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
                                    ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
                     continue;

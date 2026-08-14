@@ -83,6 +83,7 @@ struct Qwen35LayerWeights {
     // Optional SM120-native NVFP4 copies used only by Muse batched prefill. Decode and all
     // unsupported shapes continue to use the GGUF-native pointers above.
     const void* gate_fp4 = nullptr; const void* gate_fp4_sf = nullptr;
+    const void* down_fp4 = nullptr; const void* down_fp4_sf = nullptr;
     const void* up_fp4 = nullptr;   const void* up_fp4_sf = nullptr;
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
     // 14=Q6_K) -> weights kept quantized in VRAM, decoded on-read by launch_gemv_q.
