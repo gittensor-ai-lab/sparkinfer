@@ -1258,6 +1258,7 @@ static int qm_wave_pick(int ntiles, int nsb, int want) {
         if (eff > best_eff + 1e-9 || (eff > best_eff - 1e-9 && s > best)) { best_eff = eff; best = s; }
     }
     return best;
+}
 
 // `partials_splits` is how many private [m][n] planes the caller budgeted, so it bounds the slice
 // count only while each slice stores its own plane. The atomic accumulator sums every slice into
@@ -1265,10 +1266,11 @@ static int qm_wave_pick(int ntiles, int nsb, int want) {
 // are the target block count and "at least one whole super-block per slice". Leaving the plane
 // budget in place capped the 104-tile o/down launches at 8 slices when the chooser asked for 25,
 // i.e. 832 blocks of a 510-block device: 1.6 waves, and the second one two-thirds empty.
-// SPARKINFER_MUSE_QB_UNCAP=0 restores the plane-budget cap (A/B in one binary).
+// PR #808's wave-fit chooser makes the extra depth neutral-to-slightly-negative on the complete
+// path, so retain it as an experiment rather than the default. SPARKINFER_MUSE_QB_UNCAP=1 enables.
 static int qm_uncap_splits() {
     static int e = -1;
-    if (e < 0) { const char* v = getenv("SPARKINFER_MUSE_QB_UNCAP"); e = (v && v[0] == '0') ? 0 : 1; }
+    if (e < 0) { const char* v = getenv("SPARKINFER_MUSE_QB_UNCAP"); e = (v && v[0] == '1') ? 1 : 0; }
     return e;
 }
 

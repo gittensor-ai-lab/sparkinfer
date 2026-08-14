@@ -44,6 +44,12 @@ void launch_norm_then_add_acc(const void* residual_bf16, int* acc, const float* 
                               const float* row_scale, const void* weight_bf16, void* out_bf16,
                               int rows, int cols, float eps, cudaStream_t stream,
                               int zero_after = 0);
+bool launch_norm_then_add_acc_quant(const void* residual_bf16, int* acc, const float* sxr,
+                                    const float* row_scale, const void* weight_bf16, void* out_bf16,
+                                    const void* next_weight_bf16, void* out_norm_bf16,
+                                    signed char* q, float* qscale, signed char* qp,
+                                    int rows, int cols, float eps, float next_eps,
+                                    cudaStream_t stream, int zero_after = 0);
 
 void launch_norm_then_add(const void* residual_bf16, const void* block_out_bf16,
                           const void* weight_bf16, void* out_bf16,

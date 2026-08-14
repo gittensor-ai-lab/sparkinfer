@@ -334,11 +334,6 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // 13 is the peak, and raising QM_TARGET_BLOCKS with it only adds atomic traffic (swept too).
     constexpr int QB_SPLITS = 13;
     const size_t qb_partials_cap = (size_t)QB_SPLITS * (size_t)N * (size_t)maxNO;
-    // LM-head activation, quantized once (see the seed argmax at the end of this function).
-    signed char* lm_q8 = a8.alloc<signed char>((size_t)H + 32);
-    float* lm_ad = a8.alloc<float>((size_t)(H >> 5) + 1);
-    float* lm_as = a8.alloc<float>((size_t)(H >> 5) + 1);
-
     int* qb_partials = (c.muse_glimmer && use_i8 && N <= 128)
         ? a8.alloc<int>(qb_partials_cap) : nullptr;
     // With zero-on-read the consumers return each plane zeroed, so the only fill needed is this one
@@ -919,16 +914,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // Sandwich (post_attn_norm/post_ffn_norm) RMSNorm uses its OWN eps 1e-8
             // (upstream post_norm_eps), NOT the model's rms_eps (1e-5) which drives
             // attn_norm/ffn_norm/q_norm/k_norm -- mirrors the decode fix (qwen35.cpp:6d911d4).
-            if (attn_acc)
+            bool fused_pre_ffn = false;
+            if (attn_acc && muse_ffn_group && muse_qb && use_i8 && FC >= N) {
+                fused_pre_ffn = kernels::launch_norm_then_add_acc_quant(
+                    x, qb_partials, sx, w.wo_rs, w.post_attn_norm, h, w.ffn_norm, hn,
+                    A_i8, sx, A_i8p, N, H, 1e-8f, eps, st,
+                    kernels::pf_dense_zero_on_read());
+            } else if (attn_acc) {
                 kernels::launch_norm_then_add_acc(x, qb_partials, sx, w.wo_rs, w.post_attn_norm,
                                                   h, N, H, 1e-8f, st,
                                                   kernels::pf_dense_zero_on_read());
-            else
+            } else {
                 kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
+            }
             // hn's only consumer is the grouped FFN's row-quantize, so emit the int8 in the same
             // pass. Only when one chunk covers the prompt: a second chunk would need A_i8/sx again
             // after the first has overwritten them. The bf16 hn is still written either way.
-            if (muse_ffn_group && muse_qb && use_i8 && FC >= N &&
+            if (fused_pre_ffn) {
+                hn_quantized = true;
+                a_pk = A_i8p != nullptr;
+            } else if (muse_ffn_group && muse_qb && use_i8 && FC >= N &&
                 kernels::launch_rmsnorm_quant_i8(h, w.ffn_norm, hn, A_i8, sx, N, H, eps, st,
                                                  A_i8p)) {
                 hn_quantized = true;

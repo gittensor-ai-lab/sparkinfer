@@ -784,7 +784,11 @@ __global__ void norm_then_add_acc_kernel(const __nv_bfloat16* __restrict__ resid
                                          const float* __restrict__ rs,
                                          const __nv_bfloat16* __restrict__ weight,
                                          __nv_bfloat16* __restrict__ out,
-                                         int rows, int cols, float eps, int zero_after) {
+                                         int rows, int cols, float eps, int zero_after,
+                                         const __nv_bfloat16* __restrict__ next_weight,
+                                         __nv_bfloat16* __restrict__ out_norm,
+                                         signed char* __restrict__ q, float* __restrict__ qscale,
+                                         signed char* __restrict__ qp, float next_eps) {
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * cols;
@@ -852,6 +856,77 @@ __global__ void norm_then_add_acc_kernel(const __nv_bfloat16* __restrict__ resid
         out[base + c] = __float2bfloat16(__bfloat162float(residual[base + c])
                                          + bv * inv_rms * __bfloat162float(weight[c]));
         if (zero_after) acc[base + c] = 0;
+    }
+
+    if (!next_weight) return;
+    __syncthreads();
+
+    // The pre-FFN RMSNorm consumes exactly the bf16 values written above. Re-read them here to
+    // preserve that rounding boundary, then emit both its bf16 output and the row-major/k-tiled
+    // int8 forms used by the grouped gate/up GEMM.
+    const uint4* x4 = reinterpret_cast<const uint4*>(out + base);
+    float ss2 = 0.f;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+        float xv[8]; rn_unpack8(x4[p], xv);
+#pragma unroll
+        for (int j = 0; j < 8; j++) ss2 = __fmaf_rn(xv[j], xv[j], ss2);
+    }
+    ss2 = rn_warp_sum(ss2);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss2;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        v = rn_warp_sum(v);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + next_eps);
+    }
+    __syncthreads();
+    const float inv2 = s_warp[0];
+    const uint4* nw4 = reinterpret_cast<const uint4*>(next_weight);
+    uint4* on4 = reinterpret_cast<uint4*>(out_norm + base);
+    __nv_bfloat16 norm_keep[4][8];
+    float amax = 0.f;
+    held = 0;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x, held++) {
+        float xv[8]; rn_unpack8(x4[p], xv);
+        float wv[8]; rn_unpack8(nw4[p], wv);
+        float nv[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) nv[j] = xv[j] * inv2 * wv[j];
+        const uint4 packed = rn_pack8(nv);
+        on4[p] = packed;
+        *reinterpret_cast<uint4*>(norm_keep[held]) = packed;
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            amax = fmaxf(amax, fabsf(__bfloat162float(norm_keep[held][j])));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (threadIdx.x == 0) s_warp[0] = v;
+    }
+    __syncthreads();
+    const float amax_row = s_warp[0];
+    const float d = amax_row / 127.0f;
+    if (threadIdx.x == 0) qscale[row] = d;
+    held = 0;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x, held++) {
+        signed char o8[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            o8[j] = (signed char)((amax_row == 0.f) ? 0
+                                 : (int)roundf(__bfloat162float(norm_keep[held][j]) / d));
+        *reinterpret_cast<uint2*>(&q[base + p * 8]) = *reinterpret_cast<const uint2*>(o8);
+        if (qp) {
+            const int c = p * 8;
+            *reinterpret_cast<uint2*>(
+                &qp[(size_t)(c >> 5) * (size_t)rows * 32 + (size_t)row * 32 + (size_t)(c & 31)]) =
+                *reinterpret_cast<const uint2*>(o8);
+        }
     }
 }
 
@@ -974,7 +1049,25 @@ void launch_norm_then_add_acc(const void* residual, int* acc, const float* sxr,
     norm_then_add_acc_kernel<<<rows, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(residual), acc, sxr, rs,
         reinterpret_cast<const __nv_bfloat16*>(weight),
-        reinterpret_cast<__nv_bfloat16*>(out), rows, cols, eps, zero_after);
+        reinterpret_cast<__nv_bfloat16*>(out), rows, cols, eps, zero_after,
+        nullptr, nullptr, nullptr, nullptr, nullptr, 0.f);
+}
+
+bool launch_norm_then_add_acc_quant(const void* residual, int* acc, const float* sxr,
+                                    const float* rs, const void* weight, void* out,
+                                    const void* next_weight, void* out_norm, signed char* q,
+                                    float* qscale, signed char* qp, int rows, int cols,
+                                    float eps, float next_eps, cudaStream_t stream,
+                                    int zero_after) {
+    if (rows <= 0 || cols <= 0 || (cols & 7) != 0 || ((cols >> 3) + 255) / 256 > 4)
+        return false;
+    if (qp && (cols % 32) != 0) qp = nullptr;
+    norm_then_add_acc_kernel<<<rows, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(residual), acc, sxr, rs,
+        reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out),
+        rows, cols, eps, zero_after, reinterpret_cast<const __nv_bfloat16*>(next_weight),
+        reinterpret_cast<__nv_bfloat16*>(out_norm), q, qscale, qp, next_eps);
+    return true;
 }
 
 void launch_norm_then_add(const void* residual, const void* block_out, const void* weight,
