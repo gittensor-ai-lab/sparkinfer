@@ -6,7 +6,11 @@ cmake_minimum_required(VERSION 3.20)
 # datacenter Blackwell (B200) and is binary-incompatible with the 5090.
 # Must be set BEFORE project(... CUDA) — see root CMakeLists.txt for why.
 # sm_121 excluded — unsupported by the CUDA 12.8 toolkit currently in use.
-set(CMAKE_CUDA_ARCHITECTURES "89;90;100;120" CACHE STRING "CUDA architectures")
+# See cmake/Nvfp4Arch.cmake: the Blackwell entry is sm_120a when the FP4 prefill kernels are in,
+# and the choice must be made before project() and shared by every target.
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/Nvfp4Arch.cmake)
+set(CMAKE_CUDA_ARCHITECTURES "89;90;100;${SPARKINFER_BLACKWELL_ARCH}"
+    CACHE STRING "CUDA architectures")
 project(sparkinfer_kernels LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -18,7 +22,8 @@ option(BUILD_BENCHMARKS    "Build benchmarks"            OFF)
 # tensor-core paths. OFF by default; the portable CUDA path below is the
 # production build and is what runs on RTX 5090 (sm_120).
 option(BUILD_CUTE_KERNELS  "Experimental CuTe DSL kernels (needs CUTLASS)" OFF)
-option(BUILD_NVFP4_KERNELS "Experimental SM120 native NVFP4 dense kernels" OFF)
+# BUILD_NVFP4_KERNELS is declared in cmake/Nvfp4Arch.cmake, above, because the architecture list
+# depends on it and has to be fixed before project().
 
 include_directories(include)
 
@@ -62,7 +67,6 @@ if(BUILD_NVFP4_KERNELS)
     target_include_directories(si_fused PRIVATE ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
     target_compile_definitions(si_fused PRIVATE SPARKINFER_BUILD_NVFP4=1)
     target_compile_options(si_fused PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-    set_target_properties(si_fused PROPERTIES CUDA_ARCHITECTURES "120a")
 endif()
 
 # Unified interface library

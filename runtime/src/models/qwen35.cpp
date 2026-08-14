@@ -3985,8 +3985,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // because scored prefill times the first pass. Gate/up native prefill copies that are distinct
     // from their compact Q3_A decode weights are released after conversion, keeping peak resident
     // memory within a 32-GB card. The normal GGUF pointers remain the correctness fallback.
+    // On by default now that the kernels are in the default build: the conversion is gated on
+    // Muse plus a successful sm_120a FP4 build, and the GGUF pointers stay as the fallback, so a
+    // box that could not build the FP4 path simply never takes it. SPARKINFER_MUSE_PREFILL_NVFP4=0
+    // forces the portable quantized projections back.
     const char* fp4_env = getenv("SPARKINFER_MUSE_PREFILL_NVFP4");
-    if (c.muse_glimmer && fp4_env && fp4_env[0] == '1' &&
+    if (c.muse_glimmer && (!fp4_env || fp4_env[0] != '0') &&
         kernels::prefill_nvfp4_supported(128, c.moe_ffn, H) &&
         kernels::prefill_nvfp4_supported(128, H, c.moe_ffn)) {
         void* tmp = nullptr;

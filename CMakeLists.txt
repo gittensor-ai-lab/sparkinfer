@@ -9,7 +9,17 @@ cmake_minimum_required(VERSION 3.20)
 # sometimes ancient e.g. "52") default if it isn't already set. A set() after
 # project() is a CACHE no-op once that's happened, silently building tensor-core/wmma
 # kernels for a target that can't support them.
-set(CMAKE_CUDA_ARCHITECTURES "89;90;100;120" CACHE STRING "CUDA architectures")
+#
+# The Blackwell entry is sm_120a, not sm_120, when the native FP4 prefill path is built. FP4's
+# block-scaled MMA is an architecture-specific instruction: ptxas rejects
+# `mma.sync.aligned.m16n8k64.kind::mxf4` outright on `.target sm_120` and accepts it on sm_120a,
+# and sm_120a SASS runs on the same silicon. It has to be decided HERE, for the whole project, and
+# not per target: a single library built for 120a while its siblings are 120 does not device-link
+# at all ("nvlink fatal: elfLink fatbinary error"), which is why the FP4 kernels could not be
+# enabled as they stood. The other architectures are unaffected.
+include(cmake/Nvfp4Arch.cmake)
+set(CMAKE_CUDA_ARCHITECTURES "89;90;100;${SPARKINFER_BLACKWELL_ARCH}"
+    CACHE STRING "CUDA architectures")
 project(sparkinfer LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
