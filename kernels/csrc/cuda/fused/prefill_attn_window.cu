@@ -669,6 +669,165 @@ bool launch_prefill_attn_windowed(
     return false;   // window + tiling both off -> caller runs full attention
 }
 
+// ----------------------------------------------------------------------------
+// Faster and more accurate schedule for the kernel above. Same decomposition --
+// one warp per query, keys walked in ascending kpos, the same fp32 online
+// softmax, the same pure rolling-window predicate -- with three changes.
+//
+// 1. Lane owns 4 CONSECUTIVE head dims instead of `lane + e*32`. The strided
+//    form is a 2-byte-per-lane shared load, so a warp moves 64 B per
+//    instruction, and it pays that four times per key for K and four for V.
+//    Consecutive-four is one __nv_bfloat162 pair: 256 B per warp instruction
+//    and a quarter of the LDS. Q, the V accumulation and the store follow.
+//
+// 2. KG keys are scored before any of them is reduced. Per key the old loop is
+//    a single dependent chain -- 4 FMAs, a 5-step shuffle butterfly, two
+//    __expf, then the loop-carried m/l/acc update -- and only the FMAs are
+//    work. Scoring KG first makes the butterflies independent so their shuffle
+//    steps interleave. KG=4 measured best of {1,2,4,8} (+1.24 / +1.88 / +1.45%
+//    end to end at 1,4,8); past 4 the live scores cost more than they buy.
+//
+// 3. The cross-lane butterfly runs ASCENDING (1,2,4,8,16). win_warp_sum() goes
+//    16->1, which pairs each lane with the one holding dims 16 away before
+//    pairing neighbours; ascending sums adjacent dims first, which are far
+//    closer in magnitude, so the 32-term reduction is better conditioned. This
+//    is why the kernel is MORE accurate than the one above, not less.
+//
+// ncu at prefill@128 on the old kernel: L1/TEX throughput 67.95% with DRAM at
+// 1.61% and 39.7% of a 9.75-cycle issue gap in MIO short-scoreboard -- bound by
+// shared-memory issue, not bandwidth and not math. After: 60.68% and 8.03.
+//
+// Numerics move (the 32-term dot is re-associated) and they move the right way.
+// qwen3_gguf_prefill_check 128/512, SPARKINFER_KV_INT8=0, batched vs the token
+// reference:  main 469/512 = 0.9160, KL 0.01818  ->  this 480/512 = 0.9375,
+// KL 0.01427. The per-lane 4-term sum is exact in fp32 (a bf16*bf16 product
+// carries at most 16 mantissa bits), so only the cross-lane order matters --
+// reversing the per-lane order alone is bit-identical.
+// SPARKINFER_MUSE_PREFILL_ATTN_WIDE=0 restores the kernel above.
+// ----------------------------------------------------------------------------
+template <int HEAD_DIM, int TQ, int TK, int KG>
+__global__ void win_prefill_pure_bf16_wide_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
+    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks) {
+    (void)max_blocks_per_seq;
+    constexpr int ELEMS = HEAD_DIM / 32;
+    static_assert(ELEMS == 4, "four consecutive dims per lane");
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int head = blockIdx.y;
+    const int qbase = blockIdx.x * TQ;
+    const int qtok = qbase + warp;
+    const int kv_head = head / (n_q_heads / n_kv_heads);
+    const bool active = (qtok < n_tokens) && (head < n_q_heads);
+    const int d0 = lane * ELEMS;
+
+    auto win_start = [&](int t) -> int {
+        if (win_blocks <= 0) return 0;
+        const int n_blk_q = (t + block_size) / block_size;
+        const int rsb = (win_blocks >= n_blk_q) ? 0 : (n_blk_q - win_blocks);
+        return rsb * block_size;
+    };
+    const int my_rs = active ? win_start(qtok) : 0;
+
+    extern __shared__ __nv_bfloat16 smem_bfw[];
+    __nv_bfloat16* sK = smem_bfw;
+    __nv_bfloat16* sV = smem_bfw + TK * HEAD_DIM;
+
+    float q_reg[ELEMS];
+    if (active) {
+        const size_t q_off = ((size_t)qtok * n_q_heads + head) * HEAD_DIM;
+        const __nv_bfloat162* qp = reinterpret_cast<const __nv_bfloat162*>(q + q_off + d0);
+        const __nv_bfloat162 a = qp[0], b = qp[1];
+        q_reg[0] = __bfloat162float(a.x); q_reg[1] = __bfloat162float(a.y);
+        q_reg[2] = __bfloat162float(b.x); q_reg[3] = __bfloat162float(b.y);
+    }
+    float m = -1e30f, l = 0.f, acc[ELEMS];
+#pragma unroll
+    for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
+
+    const int last_q = min(qbase + TQ - 1, n_tokens - 1);
+    const int blk_rs = win_start(qbase);
+
+    for (int k0 = blk_rs; k0 <= last_q; k0 += TK) {
+        const int tk = min(TK, last_q + 1 - k0);
+        // One 16-byte copy per thread, and the paged-KV address math once per THREAD rather than
+        // once per element (see win_prefill_pure_bf16_kernel). Same bytes, same order.
+        constexpr int VPT = 8;
+        constexpr int DCH = HEAD_DIM / VPT;
+        for (int idx = threadIdx.x; idx < tk * DCH; idx += blockDim.x) {
+            const int kk = idx / DCH, d = (idx - kk * DCH) * VPT;
+            const int kpos = k0 + kk;
+            const int blk = kpos / block_size, within = kpos - blk * block_size;
+            const int phys = block_table[blk];
+            const size_t ckt = (size_t)phys * block_size + within;
+            const size_t off = (ckt * n_kv_heads + kv_head) * HEAD_DIM + d;
+            *reinterpret_cast<uint4*>(sK + (size_t)kk * HEAD_DIM + d) =
+                *reinterpret_cast<const uint4*>(k_pool + off);
+            *reinterpret_cast<uint4*>(sV + (size_t)kk * HEAD_DIM + d) =
+                *reinterpret_cast<const uint4*>(v_pool + off);
+        }
+        __syncthreads();
+        if (active) {
+            // Warp-uniform, so a key's validity is warp-uniform and the grouping below never
+            // splits a warp before its butterfly.
+            const int lo = max(k0, my_rs);
+            const int hi = min(k0 + tk - 1, qtok);
+            for (int base = lo; base <= hi; base += KG) {
+                const int n = min(KG, hi + 1 - base);
+                float part[KG];
+#pragma unroll
+                for (int g = 0; g < KG; g++) {
+                    part[g] = 0.f;
+                    if (g < n) {
+                        const __nv_bfloat162* kp = reinterpret_cast<const __nv_bfloat162*>(
+                            sK + (size_t)(base + g - k0) * HEAD_DIM + d0);
+                        const __nv_bfloat162 a = kp[0], b = kp[1];
+                        part[g] = q_reg[0] * __bfloat162float(a.x)
+                                + q_reg[1] * __bfloat162float(a.y)
+                                + q_reg[2] * __bfloat162float(b.x)
+                                + q_reg[3] * __bfloat162float(b.y);
+                    }
+                }
+#pragma unroll
+                for (int d2 = 1; d2 <= 16; d2 <<= 1) {
+#pragma unroll
+                    for (int g = 0; g < KG; g++)
+                        part[g] += __shfl_xor_sync(0xffffffffu, part[g], d2);
+                }
+#pragma unroll
+                for (int g = 0; g < KG; g++) {
+                    if (g >= n) break;
+                    const float score = part[g] * scale;
+                    const float m_new = fmaxf(m, score);
+                    const float corr = __expf(m - m_new);
+                    const float pr = __expf(score - m_new);
+                    l = l * corr + pr;
+                    const __nv_bfloat162* vp = reinterpret_cast<const __nv_bfloat162*>(
+                        sV + (size_t)(base + g - k0) * HEAD_DIM + d0);
+                    const __nv_bfloat162 a = vp[0], b = vp[1];
+                    acc[0] = acc[0] * corr + pr * __bfloat162float(a.x);
+                    acc[1] = acc[1] * corr + pr * __bfloat162float(a.y);
+                    acc[2] = acc[2] * corr + pr * __bfloat162float(b.x);
+                    acc[3] = acc[3] * corr + pr * __bfloat162float(b.y);
+                    m = m_new;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        const size_t q_off = ((size_t)qtok * n_q_heads + head) * HEAD_DIM;
+        const float inv = (l > 0.f) ? (1.f / l) : 0.f;
+        __nv_bfloat162 o0, o1;
+        o0.x = __float2bfloat16(acc[0] * inv); o0.y = __float2bfloat16(acc[1] * inv);
+        o1.x = __float2bfloat16(acc[2] * inv); o1.y = __float2bfloat16(acc[3] * inv);
+        __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(attn + q_off + d0);
+        op[0] = o0; op[1] = o1;
+    }
+}
+
 // BF16-KV pure-window prefill attention for Muse Glimmer (hd128). win_blocks>0 =>
 // SWA layers (last win_blocks blocks); win_blocks<=0 => global/NoPE full causal.
 void launch_prefill_attn_swa_pure_bf16(
@@ -688,6 +847,18 @@ void launch_prefill_attn_swa_pure_bf16(
     constexpr int TQ = 8, TK = 32, HD = 128;
     const size_t sm = (size_t)2 * TK * HD * sizeof(__nv_bfloat16);   // 16 KB: K + V bf16 tiles
     dim3 grid((n_tokens + TQ - 1) / TQ, n_q_heads);
+    static const bool wide = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PREFILL_ATTN_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    if (wide) {
+        win_prefill_pure_bf16_wide_kernel<HD, TQ, TK, 4><<<grid, TQ * 32, sm, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
+            reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
+            reinterpret_cast<__nv_bfloat16*>(attn),
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks);
+        return;
+    }
     win_prefill_pure_bf16_kernel<HD, TQ, TK><<<grid, TQ * 32, sm, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
         reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,

@@ -1090,6 +1090,52 @@ void launch_prefill_add(const void* a, const void* b, void* out, long n, cudaStr
         reinterpret_cast<__nv_bfloat16*>(out), n);
 }
 
+// Scatter one contiguous [N, src_cols] projection block into four tight destinations.
+//
+// Muse's q|gate|k|v prefill projection is a single grouped GEMM into a [N, qdim*2 + kvdim*2]
+// buffer, and the rest of the layer wants four arrays each with its own tight row stride. That
+// was four cudaMemcpy2DAsync calls -- four launches and four strided engine passes over the same
+// 2.2 MB, 1.39 us apiece measured at prefill@128. One pass with a uint4 body does the same bytes
+// in one launch: every thread moves 8 bf16, and each segment boundary (0, qdim, 2*qdim,
+// 2*qdim+kvdim, src_cols) is a multiple of 8 for every shape this runs on, so no thread ever
+// straddles two destinations. Same bytes, same order, bit-identical.
+__global__ void pf_split4_kernel(const __nv_bfloat16* __restrict__ src,
+                                 __nv_bfloat16* __restrict__ d0, __nv_bfloat16* __restrict__ d1,
+                                 __nv_bfloat16* __restrict__ d2, __nv_bfloat16* __restrict__ d3,
+                                 int rows, int src_cols, int n0, int n1, int n2, int n3) {
+    constexpr int V = 8;
+    const long vec_per_row = src_cols / V;
+    const long total = (long)rows * vec_per_row;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long)gridDim.x * blockDim.x) {
+        const int row = (int)(i / vec_per_row);
+        const int c = (int)(i - (long)row * vec_per_row) * V;
+        const uint4 v = *reinterpret_cast<const uint4*>(src + (long)row * src_cols + c);
+        __nv_bfloat16* dst;
+        int off;
+        if (c < n0)                     { dst = d0; off = c;                     }
+        else if (c < n0 + n1)           { dst = d1; off = c - n0;                }
+        else if (c < n0 + n1 + n2)      { dst = d2; off = c - n0 - n1;           }
+        else                            { dst = d3; off = c - n0 - n1 - n2;      }
+        const int w = (dst == d0) ? n0 : (dst == d1) ? n1 : (dst == d2) ? n2 : n3;
+        *reinterpret_cast<uint4*>(dst + (long)row * w + off) = v;
+    }
+}
+
+void launch_prefill_split4(const void* src, void* d0, void* d1, void* d2, void* d3,
+                           int rows, int n0, int n1, int n2, int n3, cudaStream_t stream) {
+    const int src_cols = n0 + n1 + n2 + n3;
+    if (rows <= 0 || (src_cols & 7) || (n0 & 7) || (n1 & 7) || (n2 & 7) || (n3 & 7)) return;
+    const long total = (long)rows * (src_cols / 8);
+    int blocks = (int)((total + 255) / 256);
+    if (blocks > 8192) blocks = 8192;
+    if (blocks < 1) blocks = 1;
+    pf_split4_kernel<<<blocks, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(src), reinterpret_cast<__nv_bfloat16*>(d0),
+        reinterpret_cast<__nv_bfloat16*>(d1), reinterpret_cast<__nv_bfloat16*>(d2),
+        reinterpret_cast<__nv_bfloat16*>(d3), rows, src_cols, n0, n1, n2, n3);
+}
+
 void launch_prefill_split_q_gate(const void* qraw, void* q, void* gate,
                                  int n_tokens, int n_heads, int head_dim, cudaStream_t stream) {
     const long n = (long)n_tokens * n_heads * head_dim;

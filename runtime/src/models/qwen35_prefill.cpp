@@ -850,17 +850,30 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_as, N, H, st) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.qkvg_fp4, w.qkvg_fp4_sf,
                                                        fp4_qkv, N, qkvg_n, H, fp4_ws, st)) {
-                    const size_t sp = (size_t)qkvg_n * sizeof(bf16);
-                    struct { void* dst; int off, n; } cut[4] = {
-                        { qb, 0,            qdim  }, { qg, qdim,          qdim  },
-                        { kf, 2 * qdim,     kvdim }, { vf, 2 * qdim + kvdim, kvdim },
-                    };
-                    qkvg_fp4 = true;
-                    for (auto& cu : cut)
-                        qkvg_fp4 &= cudaMemcpy2DAsync(cu.dst, (size_t)cu.n * sizeof(bf16),
-                                                      fp4_qkv + cu.off, sp,
-                                                      (size_t)cu.n * sizeof(bf16), N,
-                                                      cudaMemcpyDeviceToDevice, st) == cudaSuccess;
+                    // One scatter pass instead of four strided D2D copies (four launches over
+                    // the same 2.2 MB). Same bytes, same destinations, bit-identical.
+                    // SPARKINFER_MUSE_PREFILL_SPLIT4=0 restores the copies.
+                    static const bool split4 = [] {
+                        const char* e = getenv("SPARKINFER_MUSE_PREFILL_SPLIT4");
+                        return !(e && e[0] == '0');
+                    }();
+                    if (split4) {
+                        kernels::launch_prefill_split4(fp4_qkv, qb, qg, kf, vf, N,
+                                                       qdim, qdim, kvdim, kvdim, st);
+                        qkvg_fp4 = cudaPeekAtLastError() == cudaSuccess;
+                    } else {
+                        const size_t sp = (size_t)qkvg_n * sizeof(bf16);
+                        struct { void* dst; int off, n; } cut[4] = {
+                            { qb, 0,            qdim  }, { qg, qdim,          qdim  },
+                            { kf, 2 * qdim,     kvdim }, { vf, 2 * qdim + kvdim, kvdim },
+                        };
+                        qkvg_fp4 = true;
+                        for (auto& cu : cut)
+                            qkvg_fp4 &= cudaMemcpy2DAsync(cu.dst, (size_t)cu.n * sizeof(bf16),
+                                                          fp4_qkv + cu.off, sp,
+                                                          (size_t)cu.n * sizeof(bf16), N,
+                                                          cudaMemcpyDeviceToDevice, st) == cudaSuccess;
+                    }
                     if (qkvg_fp4) inq = ing = ink = inv = true;
                 }
                 if (!qkvg_fp4 && muse_group && muse_qb && use_i8 &&

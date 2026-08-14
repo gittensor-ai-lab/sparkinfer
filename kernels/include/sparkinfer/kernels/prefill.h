@@ -33,6 +33,12 @@ void launch_prefill_swiglu(const void* gate, const void* up, void* h, long n,
 void launch_prefill_add(const void* a, const void* b, void* out, long n,
                         cudaStream_t stream = nullptr);
 
+// Scatter a contiguous [rows, n0+n1+n2+n3] block into four tight [rows, ni] destinations in one
+// pass. Every ni and their sum must be a multiple of 8. Replaces a run of cudaMemcpy2DAsync.
+void launch_prefill_split4(const void* src, void* d0, void* d1, void* d2, void* d3,
+                           int rows, int n0, int n1, int n2, int n3,
+                           cudaStream_t stream = nullptr);
+
 // Split interleaved-per-head [q|gate]: qraw[N, 2*n_heads*hd] (each head is hd q then hd gate)
 // -> q[N, n_heads*hd], gate[N, n_heads*hd]. Matches split_q_gate_kernel, batched over tokens.
 void launch_prefill_split_q_gate(const void* qraw, void* q, void* gate,
