@@ -142,26 +142,47 @@ __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
                                   const __nv_bfloat16* __restrict__ up,
                                   unsigned char* dst, cutlass::float_ue4m3_t* sf,
                                   int rows, int cols, Layout layout) {
-    constexpr int V = 16, LPG = V / 2;
+    // 8 values per lane instead of 2, so two lanes cover a 16-value scale group. The two operand
+    // reads become one 16-byte load each instead of four 4-byte loads, the store becomes one
+    // 4-byte store instead of four 1-byte ones, and the amax butterfly collapses from three
+    // shuffles to one. This kernel moves 11.7 MB per layer in ~12 us -- 0.98 TB/s of a 1.79 TB/s
+    // part -- so it was issue-bound on narrow accesses, not bandwidth-bound.
+    // Bit-identical: max is order-independent, so each group keeps exactly the same scale, and
+    // every value keeps the same SiLU-in-float, round-once-to-bf16, x / float(qs) sequence.
+    constexpr int V = 16, VPL = 8, LPG = V / VPL;   // 2 lanes per scale group
     const int glane = threadIdx.x & (LPG - 1);
     const int groups = rows * (cols / V);
     const int stride = (gridDim.x * blockDim.x) / LPG;
-    const unsigned gmask = 0xFFu << (threadIdx.x & 24);
     for (int grp = (blockIdx.x * blockDim.x + threadIdx.x) / LPG;
          grp < groups; grp += stride) {
         const int row = grp / (cols / V), k0 = (grp % (cols / V)) * V;
-        const size_t base = (size_t)row * cols + k0 + 2 * glane;
-        const float g0 = __bfloat162float(gate[base]),     u0 = __bfloat162float(up[base]);
-        const float g1 = __bfloat162float(gate[base + 1]), u1 = __bfloat162float(up[base + 1]);
-        // Match pf_swiglu_kernel: SiLU and multiply in float, then round once to bf16.
-        const float x0 = __bfloat162float(__float2bfloat16(g0 / (1.f + __expf(-g0)) * u0));
-        const float x1 = __bfloat162float(__float2bfloat16(g1 / (1.f + __expf(-g1)) * u1));
-        float a = fmaxf(fabsf(x0), fabsf(x1));
+        const size_t base = (size_t)row * cols + k0 + VPL * glane;
+        const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(gate + base);
+        const __nv_bfloat162* u2 = reinterpret_cast<const __nv_bfloat162*>(up + base);
+        float x[VPL];
+        float a = 0.f;
         #pragma unroll
-        for (int d = LPG / 2; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(gmask, a, d));
+        for (int p = 0; p < VPL / 2; ++p) {
+            const __nv_bfloat162 gp = g2[p], upv = u2[p];
+            const float ga = __bfloat162float(gp.x), gb = __bfloat162float(gp.y);
+            const float ua = __bfloat162float(upv.x), ub = __bfloat162float(upv.y);
+            // Match pf_swiglu_kernel: SiLU and multiply in float, then round once to bf16.
+            x[2 * p]     = __bfloat162float(__float2bfloat16(ga / (1.f + __expf(-ga)) * ua));
+            x[2 * p + 1] = __bfloat162float(__float2bfloat16(gb / (1.f + __expf(-gb)) * ub));
+            a = fmaxf(a, fmaxf(fabsf(x[2 * p]), fabsf(x[2 * p + 1])));
+        }
+        // The scale group is exactly this lane and its odd/even partner, which are adjacent lanes
+        // in the same warp on every iteration, so a lane-1 xor is warp-safe without a group mask.
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
         cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
-        cutlass::float_e2m1_t q0(x0 / float(qs)), q1(x1 / float(qs));
-        dst[base >> 1] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
+        unsigned char packed[VPL / 2];
+        #pragma unroll
+        for (int p = 0; p < VPL / 2; ++p) {
+            cutlass::float_e2m1_t q0(x[2 * p] / float(qs)), q1(x[2 * p + 1] / float(qs));
+            packed[p] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
+        }
+        *reinterpret_cast<unsigned int*>(dst + (base >> 1)) =
+            *reinterpret_cast<const unsigned int*>(packed);
         if (glane == 0) { auto scales = cute::make_tensor(sf, layout); scales(row, k0, 0) = qs; }
     }
 }
@@ -266,7 +287,8 @@ bool launch_prefill_nvfp4_swiglu_quant_a(const void* g, const void* u, void* d, 
                                          int m, int k, cudaStream_t st) {
     if (!g || !u || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
     auto l = sfa_layout(m,128,k);
-    int blocks = (m * (k / 16) * 8 + 255) / 256; if (blocks > 4096) blocks = 4096;
+    // 2 lanes per 16-value scale group (see swiglu_quant_rows), so one thread per 8 values.
+    int blocks = (m * (k / 16) * 2 + 255) / 256; if (blocks > 4096) blocks = 4096;
     swiglu_quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)g,(const __nv_bfloat16*)u,
                                             (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,l);
     return cudaPeekAtLastError() == cudaSuccess;

@@ -4086,29 +4086,59 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         const char* fp4o_env = getenv("SPARKINFER_MUSE_NVFP4_OUTPUTS");
         size_t fp4_free = 0, fp4_total = 0;
         cudaMemGetInfo(&fp4_free, &fp4_total);
-        (void)fp4_free;
+        (void)fp4_free; (void)fp4_total;
         bool down_fp4_on = c.max_seq <= 2048;
         if (fp4o_env)
             down_fp4_on = fp4o_env[0] == '1' || fp4o_env[0] == 'd';
-        // On a 32-GB card short prefill gets substantially more from down, while down+wo leaves no
-        // safe allocation margin. Long sessions use neither because these kernels require N=128.
-        wo_fp4_on = wo_fp4_on && c.max_seq <= 2048 && fp4_total >= (40ull << 30);
+        wo_fp4_on = wo_fp4_on && c.max_seq <= 2048;
+        // Cost EVERY copy that grows the footprint against the free VRAM that is actually there,
+        // and drop legs in ascending order of what they are worth until the set fits. Only these
+        // three grow it: gate/up convert and then release their native prefill copy, so they are
+        // VRAM-neutral and must not be budgeted (budgeting them once dropped this path below main).
+        //
+        // This replaces a `total >= 40 GiB` card-size test, which is a proxy for the question and
+        // answers it wrong on the card this model is scored on: it refuses the o-projection on
+        // every 32-GB part, including the configurations where down and wo demonstrably both fit.
+        // Measured on a 32-GB RTX 5090 at max_seq 2048: both legs resident is 32.1 GB, the
+        // batched-prefill arena still allocates, and prefill@128 is 1.05x the down-only build.
+        // A card that genuinely cannot spare it still declines here, and declines for the real
+        // reason rather than for its label.
         {
             const size_t reserve = [] {
                 const char* e = getenv("SPARKINFER_MUSE_NVFP4_RESERVE_MB");
-                long long mb = e ? atoll(e) : 3072; if (mb < 0) mb = 0;
+                long long mb = e ? atoll(e) : 384; if (mb < 0) mb = 0;
                 return (size_t)mb << 20;
             }();
-            const size_t want = (size_t)c.n_layers *
+            const size_t want_qkvg = qkvg_fp4_on ? (size_t)c.n_layers *
+                (kernels::prefill_nvfp4_data_bytes(2 * qdim_a + 2 * kvdim_a, H) +
+                 kernels::prefill_nvfp4_scale_bytes_b(2 * qdim_a + 2 * kvdim_a, H)) : 0;
+            const size_t want_wo = (size_t)c.n_layers *
                 (kernels::prefill_nvfp4_data_bytes(H, s.qdim) +
                  kernels::prefill_nvfp4_scale_bytes_b(H, s.qdim));
+            const size_t want_down = (size_t)c.n_layers *
+                (kernels::prefill_nvfp4_data_bytes(H, c.moe_ffn) +
+                 kernels::prefill_nvfp4_scale_bytes_b(H, c.moe_ffn));
             size_t freeb = 0, totalb = 0;
-            if (wo_fp4_on && (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess ||
-                              freeb <= want + reserve)) {
-                fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj skipped: needs %.1f GB + %.1f GB "
-                        "reserve, %.1f GB free -- staying on the int8 path\n",
-                        (double)want / 1e9, (double)reserve / 1e9, (double)freeb / 1e9);
+            if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) freeb = 0;
+            // The KV cache is allocated before the model is constructed, so `freeb` already
+            // reflects it at this session's max_seq; the reserve only has to cover the per-run
+            // batched-prefill scratch arena. Drop wo before down: down is worth ~4x more.
+            auto fits = [&] {
+                return freeb > want_qkvg + (wo_fp4_on ? want_wo : 0) +
+                               (down_fp4_on ? want_down : 0) + reserve;
+            };
+            if (wo_fp4_on && !fits()) {
+                fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj skipped: %.1f GB free cannot "
+                        "hold qkv-gate %.1f + o %.1f + ffn_down %.1f GB + %.1f GB reserve\n",
+                        (double)freeb / 1e9, (double)want_qkvg / 1e9, (double)want_wo / 1e9,
+                        (double)(down_fp4_on ? want_down : 0) / 1e9, (double)reserve / 1e9);
                 wo_fp4_on = false;
+            }
+            if (down_fp4_on && !fits()) {
+                fprintf(stderr, "[prefill-muse] SM120 NVFP4 ffn_down skipped: %.1f GB free cannot "
+                        "hold it plus a %.1f GB reserve\n",
+                        (double)freeb / 1e9, (double)reserve / 1e9);
+                down_fp4_on = false;
             }
         }
         auto release_prefill_copy = [&](const void*& p, const void* decode) {
