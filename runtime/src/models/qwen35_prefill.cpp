@@ -1033,17 +1033,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.up_fp4, w.up_fp4_sf,
                                                        ffu, fn, ffn, H, fp4_ws, st);
                 if (layer_fp4) {
-                    kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
                     const bool down_fp4_done = muse_nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
                         fp4_down_a && fp4_down_as &&
-                        kernels::launch_prefill_nvfp4_quant_a(
-                            ffg, fp4_down_a, fp4_down_as, fn, ffn, st) &&
+                        kernels::launch_prefill_nvfp4_swiglu_quant_a(
+                            ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st) &&
                         kernels::launch_prefill_nvfp4_gemm(
                             fp4_down_a, fp4_down_as, w.down_fp4, w.down_fp4_sf,
                             ao + (size_t)fo * H, fn, H, ffn, fp4_ws, st);
-                    if (!down_fp4_done)
+                    if (!down_fp4_done) {
+                        kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
                         proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
                                        ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
+                    }
                     continue;
                 }
                 if (ffn_i8) {

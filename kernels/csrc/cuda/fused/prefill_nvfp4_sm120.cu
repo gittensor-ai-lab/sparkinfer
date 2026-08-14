@@ -135,6 +135,37 @@ __global__ void gate_quant_rows(const __nv_bfloat16* __restrict__ src,
     }
 }
 
+// The down projection is the only consumer of SwiGLU. Produce the exact bf16-rounded activation
+// directly into its FP4 A operand instead of writing and rereading the 128 x 19968 bf16 tensor.
+template <class Layout>
+__global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
+                                  const __nv_bfloat16* __restrict__ up,
+                                  unsigned char* dst, cutlass::float_ue4m3_t* sf,
+                                  int rows, int cols, Layout layout) {
+    constexpr int V = 16, LPG = V / 2;
+    const int glane = threadIdx.x & (LPG - 1);
+    const int groups = rows * (cols / V);
+    const int stride = (gridDim.x * blockDim.x) / LPG;
+    const unsigned gmask = 0xFFu << (threadIdx.x & 24);
+    for (int grp = (blockIdx.x * blockDim.x + threadIdx.x) / LPG;
+         grp < groups; grp += stride) {
+        const int row = grp / (cols / V), k0 = (grp % (cols / V)) * V;
+        const size_t base = (size_t)row * cols + k0 + 2 * glane;
+        const float g0 = __bfloat162float(gate[base]),     u0 = __bfloat162float(up[base]);
+        const float g1 = __bfloat162float(gate[base + 1]), u1 = __bfloat162float(up[base + 1]);
+        // Match pf_swiglu_kernel: SiLU and multiply in float, then round once to bf16.
+        const float x0 = __bfloat162float(__float2bfloat16(g0 / (1.f + __expf(-g0)) * u0));
+        const float x1 = __bfloat162float(__float2bfloat16(g1 / (1.f + __expf(-g1)) * u1));
+        float a = fmaxf(fabsf(x0), fabsf(x1));
+        #pragma unroll
+        for (int d = LPG / 2; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(gmask, a, d));
+        cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
+        cutlass::float_e2m1_t q0(x0 / float(qs)), q1(x1 / float(qs));
+        dst[base >> 1] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
+        if (glane == 0) { auto scales = cute::make_tensor(sf, layout); scales(row, k0, 0) = qs; }
+    }
+}
+
 template <class C = Wide>
 typename C::Gemm::Arguments args(const void* a, const void* sa, const void* b, const void* sb,
                                  void* d, int m, int n, int k) {
@@ -229,6 +260,15 @@ bool launch_prefill_nvfp4_gate_quant_a(const void* sr, const void* g, void* d, v
     int blocks = (m * (k / 16) * 8 + 255) / 256; if (blocks > 4096) blocks = 4096;
     gate_quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)sr,(const __nv_bfloat16*)g,
                                           (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,l);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+bool launch_prefill_nvfp4_swiglu_quant_a(const void* g, const void* u, void* d, void* sf,
+                                         int m, int k, cudaStream_t st) {
+    if (!g || !u || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
+    auto l = sfa_layout(m,128,k);
+    int blocks = (m * (k / 16) * 8 + 255) / 256; if (blocks > 4096) blocks = 4096;
+    swiglu_quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)g,(const __nv_bfloat16*)u,
+                                            (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,l);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k, cudaStream_t st) {
