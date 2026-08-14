@@ -3996,11 +3996,62 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         void* tmp = nullptr;
         const size_t tmp_elems = (size_t)c.moe_ffn * H;
         bool ok = cudaMalloc(&tmp, tmp_elems * sizeof(bf16)) == cudaSuccess;
-        int ready = 0;
+        int ready = 0, down_ready = 0, wo_ready = 0;
+        const char* fp4_down_env = getenv("SPARKINFER_MUSE_NVFP4_DOWN");
+        bool down_fp4_on = (!fp4_down_env || fp4_down_env[0] != '0');
+        const char* fp4_wo_env = getenv("SPARKINFER_MUSE_NVFP4_WO");
+        bool wo_fp4_on = (!fp4_wo_env || fp4_wo_env[0] != '0');
+        // Converting until cudaMalloc fails is NOT a safe stopping rule. The batched prefill
+        // allocates its scratch arena (a ~266 MB dequant buffer plus the per-chunk FFN planes)
+        // at run time, AFTER load; if the conversions have taken the last of VRAM, that arena
+        // fails and prefill_batched_run bails to the token-loop path -- measured 112 pp against
+        // 6000+, i.e. a 50x regression, far worse than simply leaving a tensor on int8.
+        // So stop converting while a reserve still stands. Layers already converted keep their
+        // FP4 weights; the rest stay on the int8 path, which is exactly main's behaviour.
+        // SPARKINFER_MUSE_NVFP4_RESERVE_MB tunes the reserve (default 2048).
+        const size_t fp4_reserve_bytes = [] {
+            const char* e = getenv("SPARKINFER_MUSE_NVFP4_RESERVE_MB");
+            long long mb = e ? atoll(e) : 1536;
+            if (mb < 0) mb = 0;
+            return (size_t)mb << 20;
+        }();
+        auto fp4_budget_ok = [&](size_t need) {
+            size_t freeb = 0, totalb = 0;
+            if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) return false;
+            return freeb > need + fp4_reserve_bytes;
+        };
+        // ...and the decision is all-or-nothing, taken up front for the WHOLE tensor set. A
+        // partial conversion is the worst outcome available: it spends the VRAM but leaves most
+        // layers on int8, and measured 5106 pp against main's 5896 under pressure -- a
+        // regression, where converting nothing at all is exactly main's behaviour and exactly
+        // main's speed. gate/up are excluded from the sum because their FP4 copy replaces a
+        // released Q4_K prefill copy of identical size (0.5625 B/value either way), so they are
+        // VRAM-neutral; down and wo are the ones that actually grow the footprint.
+        {
+            const size_t per_down = kernels::prefill_nvfp4_data_bytes(H, c.moe_ffn) +
+                                    kernels::prefill_nvfp4_scale_bytes_b(H, c.moe_ffn);
+            const size_t per_wo   = kernels::prefill_nvfp4_data_bytes(H, s.qdim) +
+                                    kernels::prefill_nvfp4_scale_bytes_b(H, s.qdim);
+            const size_t want = (size_t)c.n_layers *
+                                ((down_fp4_on ? per_down : 0) + (wo_fp4_on ? per_wo : 0));
+            if (want && !fp4_budget_ok(want)) {
+                size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb);
+                fprintf(stderr, "[prefill-muse] SM120 NVFP4 down/o-proj skipped: needs %.1f GB + "
+                                "%.1f GB reserve, %.1f GB free -- staying on the int8 path\n",
+                        (double)want / 1e9, (double)fp4_reserve_bytes / 1e9, (double)freeb / 1e9);
+                down_fp4_on = wo_fp4_on = false;
+            }
+        }
         auto convert = [&](const void* src, int qtype, int rows, int cols,
                            const void** data, const void** sf) -> bool {
+            // NOTE: deliberately NOT budget-checked. gate/up are VRAM-neutral -- their FP4 copy
+            // replaces a released Q4_K prefill copy of exactly the same 0.5625 B/value -- so
+            // refusing them buys nothing and costs the gate/up FP4 path outright (measured 4725 pp
+            // against main's 5896 when a budget check blocked them). Only down and wo grow the
+            // footprint, and those are gated all-or-nothing above, before any conversion runs.
             void *d = nullptr, *scale = nullptr;
-            if (!src || cudaMalloc(&d, kernels::prefill_nvfp4_data_bytes(rows, cols)) != cudaSuccess)
+            if (!src) return false;
+            if (cudaMalloc(&d, kernels::prefill_nvfp4_data_bytes(rows, cols)) != cudaSuccess)
                 return false;
             if (cudaMalloc(&scale, kernels::prefill_nvfp4_scale_bytes_b(rows, cols)) != cudaSuccess) {
                 cudaFree(d); return false;
@@ -4032,10 +4083,38 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 release_prefill_copy(lw.prefill_up_q, lw.up_q);
                 ++ready;
             }
+            // ffn_down [H, ffn] is the single largest prefill kernel (27.5% of the step): its
+            // int8 arm split-K's 13 ways over a 104-tile grid and still costs 119 us a layer
+            // against 74 us for the block-scaled FP4 GEMM on the narrow tile. Unlike gate/up
+            // there is no separate prefill copy to release -- decode reads this same Q4_K
+            // tensor -- so the FP4 copy is a genuine +0.5625 B/value. Converted last and
+            // independently: if it does not fit, gate/up keep theirs and prefill falls back to
+            // the int8 down. SPARKINFER_MUSE_NVFP4_DOWN=0 disables it.
+            if (ok && down_fp4_on) {
+                if (convert(lw.down_q, lw.down_qtype, H, c.moe_ffn, &lw.down_fp4, &lw.down_fp4_sf))
+                    ++down_ready;
+                else
+                    lw.down_fp4 = lw.down_fp4_sf = nullptr;
+            }
+            // The o projection [H, qdim] is the other shape the narrow tile serves well. Like
+            // down it has no separate prefill copy to release, so it is a real +0.5625 B/value,
+            // and like down it is converted independently: a failure here leaves the int8 o
+            // projection in place without disturbing gate/up or down.
+            // SPARKINFER_MUSE_NVFP4_WO=0 disables it.
+            if (ok && wo_fp4_on && lw.wo) {
+                if (convert(lw.wo, lw.wo_type, H, s.qdim, &lw.wo_fp4, &lw.wo_fp4_sf))
+                    ++wo_ready;
+                else
+                    lw.wo_fp4 = lw.wo_fp4_sf = nullptr;
+            }
         }
         if (tmp) cudaFree(tmp);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 FFN weights ready: %d/%d layers%s\n",
                 ready, c.n_layers, ok ? "" : " (remaining layers use GGUF fallback)");
+        fprintf(stderr, "[prefill-muse] SM120 NVFP4 ffn_down weights ready: %d/%d layers\n",
+                down_ready, c.n_layers);
+        fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj weights ready: %d/%d layers\n",
+                wo_ready, c.n_layers);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;

@@ -367,20 +367,38 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool mg_sk = sk_p != nullptr;
 
     // Native block-scaled FP4 is deliberately narrow: Muse, the scored M=128 shape, and layers
-    // whose eager conversion completed. One activation buffer is shared by gate/up. Down stays on
-    // the higher-fidelity #808 quantized path because its error enters the residual directly.
+    // whose eager conversion completed. One activation buffer is shared by gate/up; the down
+    // projection needs its own, ffn-wide one because its A operand is the SwiGLU output.
     const bool muse_nvfp4 = c.muse_glimmer && N == 128 && !s.w.layers.empty() &&
                             s.w.layers[0].gate_fp4 &&
                             kernels::prefill_nvfp4_supported(N, ffn, H);
+    const bool muse_nvfp4_down = muse_nvfp4 && s.w.layers[0].down_fp4 &&
+                                 kernels::prefill_nvfp4_supported(N, H, ffn);
     const size_t fp4_a_data_bytes = muse_nvfp4
         ? kernels::prefill_nvfp4_data_bytes(N, H) : 0;
     const size_t fp4_a_sf_bytes = muse_nvfp4
         ? kernels::prefill_nvfp4_scale_bytes_a(N, H) : 0;
+    // One arena serves both GEMM shapes; take the larger of the two workspaces.
     const size_t fp4_ws_bytes = muse_nvfp4
-        ? kernels::prefill_nvfp4_workspace_bytes(N, ffn, H) : 0;
+        ? std::max(std::max(kernels::prefill_nvfp4_workspace_bytes(N, ffn, H),
+                            muse_nvfp4_down ? kernels::prefill_nvfp4_workspace_bytes(N, H, ffn)
+                                            : (size_t)0),
+                   kernels::prefill_nvfp4_supported(N, H, qdim)
+                       ? kernels::prefill_nvfp4_workspace_bytes(N, H, qdim) : (size_t)0)
+        : 0;
+    const size_t fp4_da_data_bytes = muse_nvfp4_down
+        ? kernels::prefill_nvfp4_data_bytes(N, ffn) : 0;
+    const size_t fp4_da_sf_bytes = muse_nvfp4_down
+        ? kernels::prefill_nvfp4_scale_bytes_a(N, ffn) : 0;
     unsigned char* fp4_a = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
     unsigned char* fp4_as = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
     unsigned char* fp4_ws = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
+    unsigned char* fp4_da = muse_nvfp4_down ? a8.alloc<unsigned char>(fp4_da_data_bytes) : nullptr;
+    unsigned char* fp4_das = muse_nvfp4_down ? a8.alloc<unsigned char>(fp4_da_sf_bytes) : nullptr;
+    // The o projection reuses the down leg's A buffers: qdim < ffn, so [N, qdim] fits inside the
+    // [N, ffn] allocation, and the two never overlap in a layer (o proj runs before the FFN).
+    const bool muse_nvfp4_wo = muse_nvfp4_down && !s.w.layers.empty() && s.w.layers[0].wo_fp4 &&
+                               kernels::prefill_nvfp4_supported(N, H, qdim);
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
@@ -879,8 +897,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // written back as bf16 and never re-read, and one launch per layer goes away.
             // Bit-identical; only taken when the o projection is certain to use A_i8 (otherwise
             // proj() would read the un-gated `att`).
+            //
+            // The block-scaled o projection folds the gate into its OWN quantize, so it is tried
+            // first and the int8 fold is skipped when it succeeds. Every arm therefore consumes a
+            // gated activation and nothing reads the raw `att`. That invariant is exactly what the
+            // reverted #816 broke -- it quantized `att` for FP4 while the gate rode along inside
+            // the int8 quantize, dropping the gate on every layer (KL 0.489 against 0.0114).
+            const bool wo_fp4_gated = muse_nvfp4_wo && w.wo_fp4 && w.wo_fp4_sf &&
+                fp4_da && fp4_das &&
+                kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_da, fp4_das, N, qdim, st);
+            // ...and if the GEMM then declines, `att` is still raw, so gate it before the int8 arm.
+            const bool wo_fp4_done = wo_fp4_gated && c.muse_glimmer &&
+                kernels::launch_prefill_nvfp4_gemm(fp4_da, fp4_das, w.wo_fp4, w.wo_fp4_sf,
+                                                   ao, N, H, qdim, fp4_ws, st);
             bool gate_fused = false;
-            if (c.muse_glimmer && muse_qb && use_i8 && w.wo_rs && H >= 128 &&
+            if (!wo_fp4_gated &&
+                c.muse_glimmer && muse_qb && use_i8 && w.wo_rs && H >= 128 &&
                 kernels::pf_dense_gemm_qi8_supported(w.wo_type) &&
                 kernels::launch_prefill_gate_quant_rows_i8(att, qg, A_i8, sx, N, qdim, st,
                                                            A_i8p)) {
@@ -888,11 +920,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 a_pk = A_i8p != nullptr;
                 gate_fused = true;
             }
-            if (!gate_fused) kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
+            if (!gate_fused && !wo_fp4_done)
+                kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
             if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
-                // add happens in launch_norm_then_add below.
-                proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
+                // add happens in launch_norm_then_add below. The FP4 GEMM already wrote `ao` as
+                // bf16 and left attn_acc at 0, so the plain norm_then_add tail consumes it.
+                if (!wo_fp4_done)
+                    proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
             } else {
                 attn_fused = proj_resid(att, w.wo, w.wo_type, x, H, qdim);
@@ -971,9 +1006,23 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.up_fp4, w.up_fp4_sf,
                                                        ffu, fn, ffn, H, fp4_ws, st);
                 if (layer_fp4) {
-                    kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
-                    proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
-                                   ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
+                    // ffn_down on the same block-scaled path, with the SwiGLU folded into its
+                    // A-operand quantize so the [fn, ffn] product is never written back as bf16.
+                    // Leaves ffn_acc at 0: the FP4 GEMM writes bf16 straight into `ao`, so the
+                    // post-FFN sandwich norm takes its plain (non-accumulator) arm, exactly as
+                    // the bf16 fallback below does.
+                    const bool down_fp4 = muse_nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
+                        fp4_da && fp4_das &&
+                        kernels::launch_prefill_nvfp4_swiglu_quant_a(ffg, ffu, fp4_da, fp4_das,
+                                                                     fn, ffn, st) &&
+                        kernels::launch_prefill_nvfp4_gemm(fp4_da, fp4_das, w.down_fp4,
+                                                           w.down_fp4_sf, ao + (size_t)fo * H,
+                                                           fn, H, ffn, fp4_ws, st);
+                    if (!down_fp4) {
+                        kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
+                        proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
+                                       ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
+                    }
                     continue;
                 }
                 if (ffn_i8) {
