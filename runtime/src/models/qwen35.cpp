@@ -3996,7 +3996,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         void* tmp = nullptr;
         const size_t tmp_elems = (size_t)c.moe_ffn * H;
         bool ok = cudaMalloc(&tmp, tmp_elems * sizeof(bf16)) == cudaSuccess;
-        int ready = 0;
+        int ready = 0, down_ready = 0, wo_ready = 0;
+        const bool extra_fp4 = [] { const char* e=getenv("SPARKINFER_MUSE_NVFP4_OUTPUTS");
+            return !(e && e[0]=='0'); }();
         auto convert = [&](const void* src, int qtype, int rows, int cols,
                            const void** data, const void** sf) -> bool {
             void *d = nullptr, *scale = nullptr;
@@ -4032,10 +4034,19 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 release_prefill_copy(lw.prefill_up_q, lw.up_q);
                 ++ready;
             }
+            // Output projections retain their compact GGUF tensors for decode; these FP4 copies
+            // are optional and failure-isolated, so a tight-memory card can still use gate/up.
+            if (ok && extra_fp4 &&
+                convert(lw.down_q, lw.down_qtype, H, c.moe_ffn,
+                        &lw.down_fp4, &lw.down_fp4_sf)) ++down_ready;
+            if (ok && extra_fp4 && lw.wo &&
+                convert(lw.wo, lw.wo_type, H, s.qdim, &lw.wo_fp4, &lw.wo_fp4_sf)) ++wo_ready;
         }
         if (tmp) cudaFree(tmp);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 FFN weights ready: %d/%d layers%s\n",
                 ready, c.n_layers, ok ? "" : " (remaining layers use GGUF fallback)");
+        fprintf(stderr, "[prefill-muse] SM120 NVFP4 output weights: down=%d/%d o=%d/%d\n",
+                down_ready, c.n_layers, wo_ready, c.n_layers);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;

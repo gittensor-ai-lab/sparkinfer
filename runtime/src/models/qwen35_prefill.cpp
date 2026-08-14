@@ -367,8 +367,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool mg_sk = sk_p != nullptr;
 
     // Native block-scaled FP4 is deliberately narrow: Muse, the scored M=128 shape, and layers
-    // whose eager conversion completed. One activation buffer is shared by gate/up. Down stays on
-    // the higher-fidelity #808 quantized path because its error enters the residual directly.
+    // whose eager conversion completed. The hidden-width buffer feeds gate/up; a second buffer is
+    // sized for the FFN-wide SwiGLU result and is reused earlier in the layer by the o projection.
     const bool muse_nvfp4 = c.muse_glimmer && N == 128 && !s.w.layers.empty() &&
                             s.w.layers[0].gate_fp4 &&
                             kernels::prefill_nvfp4_supported(N, ffn, H);
@@ -376,11 +376,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         ? kernels::prefill_nvfp4_data_bytes(N, H) : 0;
     const size_t fp4_a_sf_bytes = muse_nvfp4
         ? kernels::prefill_nvfp4_scale_bytes_a(N, H) : 0;
-    const size_t fp4_ws_bytes = muse_nvfp4
-        ? kernels::prefill_nvfp4_workspace_bytes(N, ffn, H) : 0;
+    const bool muse_nvfp4_down = muse_nvfp4 && s.w.layers[0].down_fp4 &&
+                                 kernels::prefill_nvfp4_supported(N, H, ffn);
+    const bool muse_nvfp4_wo = muse_nvfp4_down && s.w.layers[0].wo_fp4 &&
+                               kernels::prefill_nvfp4_supported(N, H, qdim);
+    size_t fp4_ws_bytes = muse_nvfp4 ? kernels::prefill_nvfp4_workspace_bytes(N, ffn, H) : 0;
+    if (muse_nvfp4_down)
+        fp4_ws_bytes = std::max(fp4_ws_bytes, kernels::prefill_nvfp4_workspace_bytes(N,H,ffn));
+    if (muse_nvfp4_wo)
+        fp4_ws_bytes = std::max(fp4_ws_bytes, kernels::prefill_nvfp4_workspace_bytes(N,H,qdim));
     unsigned char* fp4_a = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
     unsigned char* fp4_as = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
     unsigned char* fp4_ws = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
+    unsigned char* fp4_out_a = muse_nvfp4_down
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N,ffn)) : nullptr;
+    unsigned char* fp4_out_as = muse_nvfp4_down
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N,ffn)) : nullptr;
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
@@ -879,8 +890,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // written back as bf16 and never re-read, and one launch per layer goes away.
             // Bit-identical; only taken when the o projection is certain to use A_i8 (otherwise
             // proj() would read the un-gated `att`).
+            const bool fp4_gate_ready = muse_nvfp4_wo && w.wo_fp4 && w.wo_fp4_sf &&
+                fp4_out_a && fp4_out_as && kernels::launch_prefill_nvfp4_gate_quant_a(
+                    att,qg,fp4_out_a,fp4_out_as,N,qdim,st);
+            const bool fp4_o_done = fp4_gate_ready && kernels::launch_prefill_nvfp4_gemm(
+                fp4_out_a,fp4_out_as,w.wo_fp4,w.wo_fp4_sf,ao,N,H,qdim,fp4_ws,st);
             bool gate_fused = false;
-            if (c.muse_glimmer && muse_qb && use_i8 && w.wo_rs && H >= 128 &&
+            if (!fp4_gate_ready && c.muse_glimmer && muse_qb && use_i8 && w.wo_rs && H >= 128 &&
                 kernels::pf_dense_gemm_qi8_supported(w.wo_type) &&
                 kernels::launch_prefill_gate_quant_rows_i8(att, qg, A_i8, sx, N, qdim, st,
                                                            A_i8p)) {
@@ -888,11 +904,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 a_pk = A_i8p != nullptr;
                 gate_fused = true;
             }
-            if (!gate_fused) kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
+            if (!gate_fused && !fp4_o_done)
+                kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
             if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
                 // add happens in launch_norm_then_add below.
-                proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
+                if (!fp4_o_done)
+                    proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
             } else {
                 attn_fused = proj_resid(att, w.wo, w.wo_type, x, H, qdim);
@@ -971,9 +989,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.up_fp4, w.up_fp4_sf,
                                                        ffu, fn, ffn, H, fp4_ws, st);
                 if (layer_fp4) {
-                    kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
-                    proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
-                                   ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
+                    const bool fp4_down_done = muse_nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
+                        fp4_out_a && fp4_out_as && kernels::launch_prefill_nvfp4_swiglu_quant_a(
+                            ffg,ffu,fp4_out_a,fp4_out_as,fn,ffn,st) &&
+                        kernels::launch_prefill_nvfp4_gemm(fp4_out_a,fp4_out_as,w.down_fp4,
+                            w.down_fp4_sf,ao+(size_t)fo*H,fn,H,ffn,fp4_ws,st);
+                    if (!fp4_down_done) {
+                        kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
+                        proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
+                                       ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
+                    }
                     continue;
                 }
                 if (ffn_i8) {
