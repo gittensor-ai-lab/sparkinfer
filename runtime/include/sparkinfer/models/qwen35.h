@@ -84,6 +84,11 @@ struct Qwen35LayerWeights {
     // unsupported shapes continue to use the GGUF-native pointers above.
     const void* gate_fp4 = nullptr; const void* gate_fp4_sf = nullptr;
     const void* up_fp4 = nullptr;   const void* up_fp4_sf = nullptr;
+    // q | attn_gate | k | v stacked into ONE [2*qdim + 2*kvdim, H] FP4 operand. They all project
+    // the same `xn` and the batched prefill already runs them as a single grouped GEMM to keep the
+    // grid full, so the FP4 form has to stay grouped too -- as four separate GEMMs at m=128 the
+    // biggest is 32 CTAs of a 170-SM part. Row order matches the split below: q, gate, k, v.
+    const void* qkvg_fp4 = nullptr; const void* qkvg_fp4_sf = nullptr;
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
     // 14=Q6_K) -> weights kept quantized in VRAM, decoded on-read by launch_gemv_q.
     int wq_type = 0, wgate_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;

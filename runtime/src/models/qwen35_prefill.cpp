@@ -376,11 +376,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         ? kernels::prefill_nvfp4_data_bytes(N, H) : 0;
     const size_t fp4_a_sf_bytes = muse_nvfp4
         ? kernels::prefill_nvfp4_scale_bytes_a(N, H) : 0;
-    const size_t fp4_ws_bytes = muse_nvfp4
+    // The attention projection group: q | gate | k | v stacked, so one GEMM covers all four. Its A
+    // operand is `xn` at k = H -- the same shape gate/up already quantize -- so fp4_a/fp4_as serve
+    // it unchanged; only the [N, qkvg_n] bf16 output and a possibly wider workspace are new.
+    const int qkvg_n = 2 * qdim + 2 * kvdim;
+    const bool muse_nvfp4_qkv = muse_nvfp4 && s.w.layers[0].qkvg_fp4 &&
+                                kernels::prefill_nvfp4_supported(N, qkvg_n, H);
+    const size_t fp4_ws_gu = muse_nvfp4
         ? kernels::prefill_nvfp4_workspace_bytes(N, ffn, H) : 0;
+    const size_t fp4_ws_qkv = muse_nvfp4_qkv
+        ? kernels::prefill_nvfp4_workspace_bytes(N, qkvg_n, H) : 0;
+    const size_t fp4_ws_bytes = (fp4_ws_qkv > fp4_ws_gu) ? fp4_ws_qkv : fp4_ws_gu;
     unsigned char* fp4_a = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
     unsigned char* fp4_as = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
     unsigned char* fp4_ws = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
+    bf16* fp4_qkv = muse_nvfp4_qkv ? a8.alloc<bf16>((size_t)N * qkvg_n) : nullptr;
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
@@ -815,7 +825,30 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 const void* Wa[4]; const float* rsa[4]; void* Ca[4]; int na[4];
                 bool inq = false, ing = false, ink = false, inv = false;
                 int ng = 0;
-                if (muse_group && muse_qb && use_i8 &&
+                // FP4 form of that same grouped GEMM: q|gate|k|v are one [qkvg_n, H] operand, so
+                // this is a single block-scaled GEMM into a contiguous [N, qkvg_n] buffer, then
+                // four strided copies out to the destinations the rest of the layer expects
+                // (they are aliases into the GDN scratch and each wants a tight row stride).
+                // 2.2 MB of copy per layer against ~25 MB less weight traffic.
+                bool qkvg_fp4 = false;
+                if (muse_nvfp4_qkv && w.qkvg_fp4 && w.qkvg_fp4_sf && fp4_a && fp4_as && fp4_qkv &&
+                    kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_as, N, H, st) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.qkvg_fp4, w.qkvg_fp4_sf,
+                                                       fp4_qkv, N, qkvg_n, H, fp4_ws, st)) {
+                    const size_t sp = (size_t)qkvg_n * sizeof(bf16);
+                    struct { void* dst; int off, n; } cut[4] = {
+                        { qb, 0,            qdim  }, { qg, qdim,          qdim  },
+                        { kf, 2 * qdim,     kvdim }, { vf, 2 * qdim + kvdim, kvdim },
+                    };
+                    qkvg_fp4 = true;
+                    for (auto& cu : cut)
+                        qkvg_fp4 &= cudaMemcpy2DAsync(cu.dst, (size_t)cu.n * sizeof(bf16),
+                                                      fp4_qkv + cu.off, sp,
+                                                      (size_t)cu.n * sizeof(bf16), N,
+                                                      cudaMemcpyDeviceToDevice, st) == cudaSuccess;
+                    if (qkvg_fp4) inq = ing = ink = inv = true;
+                }
+                if (!qkvg_fp4 && muse_group && muse_qb && use_i8 &&
                     kernels::pfm_moe_gemm_qi8_supported(w.wq_type)) {
                     const int at = w.wq_type;
                     auto take = [&](const void* W, int t, const float* rs, void* C, int n, bool& in) {
@@ -836,7 +869,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         qb_partials, QB_SPLITS, qb_partials_cap,
                         nullptr, nullptr, nullptr, apk());
                 }
-                if (!grouped) { inq = ing = ink = inv = false; }
+                if (!grouped && !qkvg_fp4) { inq = ing = ink = inv = false; }
                 if (!inq) proj_fused(xn, w.wq,    w.wq_type,    w.wq_rs,    qb, qdim,  H);
                 if (!ing) proj_fused(xn, w.wgate, w.wgate_type, w.wgate_rs, qg, qdim,  H);
                 if (!ink) proj_fused(xn, w.wk,    w.wk_type,    w.wk_rs,    kf, kvdim, H);

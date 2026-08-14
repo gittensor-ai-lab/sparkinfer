@@ -3996,7 +3996,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         void* tmp = nullptr;
         const size_t tmp_elems = (size_t)c.moe_ffn * H;
         bool ok = cudaMalloc(&tmp, tmp_elems * sizeof(bf16)) == cudaSuccess;
-        int ready = 0;
+        int ready = 0, qkvg_ready = 0;
+        const int qdim_a = c.n_q_heads * c.head_dim;
+        const int kvdim_a = c.n_kv_heads * c.head_dim;
+        const char* fp4q_env = getenv("SPARKINFER_MUSE_PREFILL_NVFP4_QKV");
+        const bool qkvg_fp4_on = (!fp4q_env || fp4q_env[0] != '0') &&
+                                 kernels::prefill_nvfp4_supported(128, 2 * qdim_a + 2 * kvdim_a, H);
         auto convert = [&](const void* src, int qtype, int rows, int cols,
                            const void** data, const void** sf) -> bool {
             void *d = nullptr, *scale = nullptr;
@@ -4007,6 +4012,37 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             }
             kernels::launch_gguf_dequant(qtype, src, tmp, (long)rows * cols, s.stream);
             if (!kernels::launch_prefill_nvfp4_quant_b(tmp, d, scale, rows, cols, s.stream) ||
+                cudaStreamSynchronize(s.stream) != cudaSuccess) {
+                cudaFree(d); cudaFree(scale); return false;
+            }
+            s.owned.push_back(d); s.owned.push_back(scale); *data = d; *sf = scale;
+            return true;
+        };
+        // Stack several row-blocks that share `cols` into one FP4 operand: dequantize each into its
+        // slice of `tmp`, then quantize the whole thing once so the scale factors come out in the
+        // single atom-tiled layout the GEMM expects for the combined row count.
+        auto convert_group = [&](const void* const* src, const int* qtype, const int* rows,
+                                 int nsrc, int cols, const void** data, const void** sf) -> bool {
+            int total = 0;
+            for (int i = 0; i < nsrc; ++i) {
+                if (!src[i]) return false;
+                total += rows[i];
+            }
+            if (!kernels::prefill_nvfp4_supported(128, total, cols) ||
+                (size_t)total * cols > tmp_elems) return false;
+            void *d = nullptr, *scale = nullptr;
+            if (cudaMalloc(&d, kernels::prefill_nvfp4_data_bytes(total, cols)) != cudaSuccess)
+                return false;
+            if (cudaMalloc(&scale, kernels::prefill_nvfp4_scale_bytes_b(total, cols)) != cudaSuccess) {
+                cudaFree(d); return false;
+            }
+            long off = 0;
+            for (int i = 0; i < nsrc; ++i) {
+                kernels::launch_gguf_dequant(qtype[i], src[i], (bf16*)tmp + off,
+                                             (long)rows[i] * cols, s.stream);
+                off += (long)rows[i] * cols;
+            }
+            if (!kernels::launch_prefill_nvfp4_quant_b(tmp, d, scale, total, cols, s.stream) ||
                 cudaStreamSynchronize(s.stream) != cudaSuccess) {
                 cudaFree(d); cudaFree(scale); return false;
             }
@@ -4027,15 +4063,29 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             const int ut = lw.prefill_up_q ? lw.prefill_up_qtype : lw.up_qtype;
             ok = convert(g, gt, c.moe_ffn, H, &lw.gate_fp4, &lw.gate_fp4_sf) &&
                  convert(u, ut, c.moe_ffn, H, &lw.up_fp4, &lw.up_fp4_sf);
+            // The attention projection group. ~1.7 GB across 52 layers, against 3.9 GB for an
+            // ffn_down copy of the same kind, and it is the last dense int8 GEMM in the layer.
+            // Best-effort: a layer whose four weights are not all present just keeps the int8
+            // grouped path, which is what every layer does today.
+            if (ok && qkvg_fp4_on) {
+                const void* src[4] = { lw.wq, lw.wgate, lw.wk, lw.wv };
+                const int qt[4] = { lw.wq_type, lw.wgate_type, lw.wk_type, lw.wv_type };
+                const int rows[4] = { qdim_a, qdim_a, kvdim_a, kvdim_a };
+                if (!convert_group(src, qt, rows, 4, H, &lw.qkvg_fp4, &lw.qkvg_fp4_sf))
+                    lw.qkvg_fp4 = lw.qkvg_fp4_sf = nullptr;
+            }
             if (ok) {
                 release_prefill_copy(lw.prefill_gate_q, lw.gate_q);
                 release_prefill_copy(lw.prefill_up_q, lw.up_q);
                 ++ready;
+                if (lw.qkvg_fp4) ++qkvg_ready;
             }
         }
         if (tmp) cudaFree(tmp);
-        fprintf(stderr, "[prefill-muse] SM120 NVFP4 FFN weights ready: %d/%d layers%s\n",
-                ready, c.n_layers, ok ? "" : " (remaining layers use GGUF fallback)");
+        fprintf(stderr, "[prefill-muse] SM120 NVFP4 FFN weights ready: %d/%d layers%s"
+                        " (qkv-gate %d/%d)\n",
+                ready, c.n_layers, ok ? "" : " (remaining layers use GGUF fallback)",
+                qkvg_ready, c.n_layers);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;
