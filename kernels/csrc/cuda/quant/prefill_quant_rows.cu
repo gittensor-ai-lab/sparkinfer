@@ -223,6 +223,11 @@ bool launch_prefill_quant_rows_fast(const void* x, signed char* q, float* scale,
     else if (vecs <= BLOCK * 2) pf_quant_rows_fast_kernel<BLOCK, VEC, 2><<<rows, BLOCK, 0, stream>>>(xb, q, scale, rows, cols, qp);
     else if (vecs <= BLOCK * 4) pf_quant_rows_fast_kernel<BLOCK, VEC, 4><<<rows, BLOCK, 0, stream>>>(xb, q, scale, rows, cols, qp);
     else if (vecs <= BLOCK * 6) pf_quant_rows_fast_kernel<BLOCK, VEC, 6><<<rows, BLOCK, 0, stream>>>(xb, q, scale, rows, cols, qp);
+    else if (vecs <= BLOCK * 8) pf_quant_rows_fast_kernel<BLOCK, VEC, 8><<<rows, BLOCK, 0, stream>>>(xb, q, scale, rows, cols, qp);
+    // Muse's ffn width (19968 -> 2496 vectors) sat just past SLOTS=6 and fell to the warp-per-row
+    // scalar kernel: 128 blocks of 32 threads, the row read twice, 18.9 us a call against 2.0 for
+    // this one. SLOTS=10 covers it in registers (10 * VEC bf16 = 40 registers of a 256-budget).
+    else if (vecs <= BLOCK * 10) pf_quant_rows_fast_kernel<BLOCK, VEC, 10><<<rows, BLOCK, 0, stream>>>(xb, q, scale, rows, cols, qp);
     else return false;                                    // very wide rows: keep the scalar path
     return true;
 }

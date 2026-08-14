@@ -46,23 +46,36 @@ auto sfb_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SF
 template <class Layout>
 __global__ void quant_rows(const __nv_bfloat16* src, unsigned char* dst,
                            cutlass::float_ue4m3_t* sf, int rows, int cols, Layout layout) {
+    // V is fixed by the format: one ue4m3 scale per 16 values. The mapping of lanes onto those 16
+    // is not. One lane per value left half of every warp idle (lane < V), reduced 16 real values
+    // across 32 lanes, and stored 8 bytes per warp per step -- 63 GB/s, 3.5% of peak. Two values
+    // per lane puts 8 lanes on a group and 4 groups on a warp: every lane live, the amax reduction
+    // is 3 steps inside its own 8-lane group, and the warp's 4 groups store 32 contiguous bytes.
+    // Bit-identical: max is order-independent, and each value keeps the same scale and the same
+    // x / float(qs) rounding it had before.
     constexpr int V = 16;
-    constexpr int WARPS = 8;
-    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int total = rows * (cols / V);
-    for (int vec = blockIdx.x * WARPS + warp; vec < total; vec += gridDim.x * WARPS) {
-        int row = vec / (cols / V), k0 = (vec % (cols / V)) * V;
-        float x = lane < V ? __bfloat162float(src[(size_t)row * cols + k0 + lane]) : 0.f;
-        float a = fabsf(x);
+    constexpr int LPV = 8;            // lanes per scale group (2 values each)
+    constexpr int GPW = 32 / LPV;     // scale groups per warp
+    const int vpr = cols / V;
+    const int gpb = (int)(blockDim.x >> 5) * GPW;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int sub = lane & (LPV - 1);
+    const int gin = lane >> 3;
+    const int total = rows * vpr;
+    for (int g = blockIdx.x * gpb + warp * GPW + gin; g < total; g += gridDim.x * gpb) {
+        const int row = g / vpr, k0 = (g - row * vpr) * V;
+        const size_t base = (size_t)row * cols + k0 + sub * 2;
+        const __nv_bfloat162 v2 = *reinterpret_cast<const __nv_bfloat162*>(src + base);
+        const float x0 = __bfloat162float(v2.x), x1 = __bfloat162float(v2.y);
+        float a = fmaxf(fabsf(x0), fabsf(x1));
         #pragma unroll
-        for (int d = 16; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
+        for (int d = LPV >> 1; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
         cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
-        cutlass::float_e2m1_t q(x / float(qs));
-        unsigned nibble = q.raw() & 15u;
-        unsigned hi = __shfl_down_sync(0xffffffffu, nibble, 1);
-        if (lane < V && !(lane & 1))
-            dst[((size_t)row * cols + k0 + lane) >> 1] = (unsigned char)(nibble | (hi << 4));
-        if (lane == 0) {
+        cutlass::float_e2m1_t q0(x0 / float(qs));
+        cutlass::float_e2m1_t q1(x1 / float(qs));
+        dst[base >> 1] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
+        if (sub == 0) {
             auto scales = cute::make_tensor(sf, layout);
             scales(row, k0, 0) = qs;
         }
@@ -101,7 +114,7 @@ size_t prefill_nvfp4_workspace_bytes(int m, int n, int k) {
 bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k, cudaStream_t st) {
     if (!s || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
     auto l = sfa_layout(m,128,k);
-    int blocks = (m * (k / 16) + 7) / 8; if (blocks > 4096) blocks = 4096;
+    int blocks = (m * (k / 16) + 31) / 32; if (blocks > 4096) blocks = 4096;
     quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)s,(unsigned char*)d,
                                      (cutlass::float_ue4m3_t*)sf,m,k,l);
     return cudaPeekAtLastError() == cudaSuccess;
@@ -109,7 +122,7 @@ bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k
 bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k, cudaStream_t st) {
     if (!s || !d || !sf || !prefill_nvfp4_supported(128,n,k)) return false;
     auto l = sfb_layout(128,n,k);
-    int blocks = (n * (k / 16) + 7) / 8; if (blocks > 4096) blocks = 4096;
+    int blocks = (n * (k / 16) + 31) / 32; if (blocks > 4096) blocks = 4096;
     quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)s,(unsigned char*)d,
                                      (cutlass::float_ue4m3_t*)sf,n,k,l);
     return cudaPeekAtLastError() == cudaSuccess;
