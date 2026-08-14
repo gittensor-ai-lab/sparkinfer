@@ -3996,7 +3996,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         void* tmp = nullptr;
         const size_t tmp_elems = (size_t)c.moe_ffn * H;
         bool ok = cudaMalloc(&tmp, tmp_elems * sizeof(bf16)) == cudaSuccess;
-        int ready = 0;
+        int ready = 0, down_ready = 0, wo_ready = 0;
+        const char* fp4_down_env = getenv("SPARKINFER_MUSE_NVFP4_DOWN");
+        const bool down_fp4_on = (!fp4_down_env || fp4_down_env[0] != '0');
+        const char* fp4_wo_env = getenv("SPARKINFER_MUSE_NVFP4_WO");
+        const bool wo_fp4_on = (!fp4_wo_env || fp4_wo_env[0] != '0');
         auto convert = [&](const void* src, int qtype, int rows, int cols,
                            const void** data, const void** sf) -> bool {
             void *d = nullptr, *scale = nullptr;
@@ -4032,10 +4036,38 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 release_prefill_copy(lw.prefill_up_q, lw.up_q);
                 ++ready;
             }
+            // ffn_down [H, ffn] is the single largest prefill kernel (27.5% of the step): its
+            // int8 arm split-K's 13 ways over a 104-tile grid and still costs 119 us a layer
+            // against 74 us for the block-scaled FP4 GEMM on the narrow tile. Unlike gate/up
+            // there is no separate prefill copy to release -- decode reads this same Q4_K
+            // tensor -- so the FP4 copy is a genuine +0.5625 B/value. Converted last and
+            // independently: if it does not fit, gate/up keep theirs and prefill falls back to
+            // the int8 down. SPARKINFER_MUSE_NVFP4_DOWN=0 disables it.
+            if (ok && down_fp4_on) {
+                if (convert(lw.down_q, lw.down_qtype, H, c.moe_ffn, &lw.down_fp4, &lw.down_fp4_sf))
+                    ++down_ready;
+                else
+                    lw.down_fp4 = lw.down_fp4_sf = nullptr;
+            }
+            // The o projection [H, qdim] is the other shape the narrow tile serves well. Like
+            // down it has no separate prefill copy to release, so it is a real +0.5625 B/value,
+            // and like down it is converted independently: a failure here leaves the int8 o
+            // projection in place without disturbing gate/up or down.
+            // SPARKINFER_MUSE_NVFP4_WO=0 disables it.
+            if (ok && wo_fp4_on && lw.wo) {
+                if (convert(lw.wo, lw.wo_type, H, s.qdim, &lw.wo_fp4, &lw.wo_fp4_sf))
+                    ++wo_ready;
+                else
+                    lw.wo_fp4 = lw.wo_fp4_sf = nullptr;
+            }
         }
         if (tmp) cudaFree(tmp);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 FFN weights ready: %d/%d layers%s\n",
                 ready, c.n_layers, ok ? "" : " (remaining layers use GGUF fallback)");
+        fprintf(stderr, "[prefill-muse] SM120 NVFP4 ffn_down weights ready: %d/%d layers\n",
+                down_ready, c.n_layers);
+        fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj weights ready: %d/%d layers\n",
+                wo_ready, c.n_layers);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;
