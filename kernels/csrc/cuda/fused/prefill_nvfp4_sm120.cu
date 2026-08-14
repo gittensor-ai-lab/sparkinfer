@@ -42,7 +42,7 @@ struct Cfg {
 // Two N-tilings of the same GEMM. The 128-wide tile reuses each A tile across twice as many
 // output columns and is the right default; the 64-wide one exists only to fill the machine when
 // the wide grid cannot (see nvfp4_prefer_narrow).
-using Wide = Cfg<Shape<_128, _128, _128>>;
+using Wide = Cfg<Shape<_128, _128, _256>>;
 using Narrow = Cfg<Shape<_128, _64, _256>>;
 
 using Gemm = typename Wide::Gemm;
@@ -100,6 +100,41 @@ __global__ void quant_rows(const __nv_bfloat16* src, unsigned char* dst,
     }
 }
 
+// Muse's attention gate folded into the o-projection's A-operand quantize: att * sigmoid(qg)
+// straight to FP4. The int8 leg already does this (launch_prefill_gate_quant_rows_i8) and
+// deliberately leaves `att` UN-GATED; #816 was reverted because its FP4 o-projection quantized that
+// raw `att` and dropped the gate on every layer (TOP1 235/512, KL 0.489). Doing the gate here means
+// no path ever reads an un-gated `att`, and no separate pass over [128, qdim] is needed.
+template <class Layout>
+__global__ void gate_quant_rows(const __nv_bfloat16* __restrict__ src,
+                                const __nv_bfloat16* __restrict__ gate,
+                                unsigned char* dst, cutlass::float_ue4m3_t* sf,
+                                int rows, int cols, Layout layout) {
+    constexpr int V = 16, LPG = V / 2;
+    const int glane = threadIdx.x & (LPG - 1);
+    const int groups = rows * (cols / V);
+    const int stride = (gridDim.x * blockDim.x) / LPG;
+    // The four 8-lane groups in a warp can retire on different grid-stride iterations, so the amax
+    // butterfly must name only its own group.
+    const unsigned gmask = 0xFFu << (threadIdx.x & 24);
+    for (int grp = (blockIdx.x * blockDim.x + threadIdx.x) / LPG; grp < groups; grp += stride) {
+        const int row = grp / (cols / V), k0 = (grp % (cols / V)) * V;
+        const size_t base = (size_t)row * cols + k0 + 2 * glane;
+        const float s0 = __bfloat162float(src[base]),     g0 = __bfloat162float(gate[base]);
+        const float s1 = __bfloat162float(src[base + 1]), g1 = __bfloat162float(gate[base + 1]);
+        // Same expression and same bf16 rounding as pf_mul_sigmoid_kernel.
+        const float x0 = __bfloat162float(__float2bfloat16(s0 / (1.f + __expf(-g0))));
+        const float x1 = __bfloat162float(__float2bfloat16(s1 / (1.f + __expf(-g1))));
+        float a = fmaxf(fabsf(x0), fabsf(x1));
+        #pragma unroll
+        for (int d = LPG / 2; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(gmask, a, d));
+        cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
+        cutlass::float_e2m1_t q0(x0 / float(qs)), q1(x1 / float(qs));
+        dst[base >> 1] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
+        if (glane == 0) { auto scales = cute::make_tensor(sf, layout); scales(row, k0, 0) = qs; }
+    }
+}
+
 template <class C = Wide>
 typename C::Gemm::Arguments args(const void* a, const void* sa, const void* b, const void* sb,
                                  void* d, int m, int n, int k) {
@@ -137,7 +172,13 @@ bool prefer_narrow(int m, int n) {
         return !e || atoi(e) != 0;
     }();
     const int sms = sm_count();
-    return on && m <= 128 && sms > 0 && (n + 127) / 128 < sms;
+    // Narrow only once the WIDE grid has stopped covering the machine. The old test (n/128 < sms)
+    // sent gate/up (n=19968 -> 156 CTAs of 170) to the narrow tile as well, but 156 CTAs is already
+    // ~92% of one wave, and halving N there just doubles the A-tile re-reads. Requiring the narrow
+    // grid to still fit ONE wave (2*ceil(n/128) <= sms) keeps gate/up wide and leaves wo (52 CTAs)
+    // and q|gate|k|v (68) narrow. Measured cold-L2 at m=128, us: gate/up narrow 60.51 -> wide 56.19;
+    // wo wide 25.02 -> narrow 21.63; qkvg wide 39.14 -> narrow 31.84.
+    return on && m <= 128 && sms > 0 && 2 * ((n + 127) / 128) <= sms;
 }
 
 template <class C>
@@ -179,6 +220,15 @@ bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k
     int blocks = (m * (k / 16) + 31) / 32; if (blocks > 4096) blocks = 4096;
     quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)s,(unsigned char*)d,
                                      (cutlass::float_ue4m3_t*)sf,m,k,l);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+bool launch_prefill_nvfp4_gate_quant_a(const void* sr, const void* g, void* d, void* sf,
+                                       int m, int k, cudaStream_t st) {
+    if (!sr || !g || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
+    auto l = sfa_layout(m,128,k);
+    int blocks = (m * (k / 16) * 8 + 255) / 256; if (blocks > 4096) blocks = 4096;
+    gate_quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)sr,(const __nv_bfloat16*)g,
+                                          (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,l);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k, cudaStream_t st) {

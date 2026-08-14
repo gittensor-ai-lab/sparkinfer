@@ -386,7 +386,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         ? kernels::prefill_nvfp4_workspace_bytes(N, ffn, H) : 0;
     const size_t fp4_ws_qkv = muse_nvfp4_qkv
         ? kernels::prefill_nvfp4_workspace_bytes(N, qkvg_n, H) : 0;
-    const size_t fp4_ws_bytes = (fp4_ws_qkv > fp4_ws_gu) ? fp4_ws_qkv : fp4_ws_gu;
+    // o projection: A is `att` at k = qdim <= H, so fp4_a/fp4_as (sized for k = H) already cover it.
+    const bool muse_nvfp4_wo = muse_nvfp4 && s.w.layers[0].wo_fp4 &&
+                               kernels::prefill_nvfp4_supported(N, H, qdim);
+    const size_t fp4_ws_wo = muse_nvfp4_wo
+        ? kernels::prefill_nvfp4_workspace_bytes(N, H, qdim) : 0;
+    size_t fp4_ws_bytes = (fp4_ws_qkv > fp4_ws_gu) ? fp4_ws_qkv : fp4_ws_gu;
+    if (fp4_ws_wo > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_wo;
     unsigned char* fp4_a = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
     unsigned char* fp4_as = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
     unsigned char* fp4_ws = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
@@ -912,8 +918,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // written back as bf16 and never re-read, and one launch per layer goes away.
             // Bit-identical; only taken when the o projection is certain to use A_i8 (otherwise
             // proj() would read the un-gated `att`).
+            //
+            // The block-scaled o projection folds the gate into its OWN quantize, so it is tried
+            // first and the int8 fold is skipped when it succeeds. Every arm therefore consumes a
+            // gated activation and nothing reads the raw `att` -- the invariant #816 broke.
+            const bool wo_fp4_gated = muse_nvfp4_wo && w.wo_fp4 && w.wo_fp4_sf && fp4_a && fp4_as &&
+                kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_as, N, qdim, st);
+            const bool wo_fp4_done = wo_fp4_gated && c.muse_glimmer &&
+                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.wo_fp4, w.wo_fp4_sf,
+                                                   ao, N, H, qdim, fp4_ws, st);
             bool gate_fused = false;
-            if (c.muse_glimmer && muse_qb && use_i8 && w.wo_rs && H >= 128 &&
+            if (!wo_fp4_gated &&
+                c.muse_glimmer && muse_qb && use_i8 && w.wo_rs && H >= 128 &&
                 kernels::pf_dense_gemm_qi8_supported(w.wo_type) &&
                 kernels::launch_prefill_gate_quant_rows_i8(att, qg, A_i8, sx, N, qdim, st,
                                                            A_i8p)) {
@@ -921,11 +937,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 a_pk = A_i8p != nullptr;
                 gate_fused = true;
             }
-            if (!gate_fused) kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
+            // If the fused quantize ran but the GEMM declined, `att` is still raw -- gate it here.
+            if (!gate_fused && !wo_fp4_done)
+                kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
             if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
-                // add happens in launch_norm_then_add below.
-                proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
+                // add happens in launch_norm_then_add below. The FP4 GEMM already wrote `ao` and
+                // left attn_acc at 0, so the plain norm_then_add tail consumes it.
+                if (!wo_fp4_done)
+                    proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
             } else {
                 attn_fused = proj_resid(att, w.wo, w.wo_type, x, H, qdim);

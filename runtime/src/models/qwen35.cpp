@@ -4049,6 +4049,34 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             s.owned.push_back(d); s.owned.push_back(scale); *data = d; *sf = scale;
             return true;
         };
+        // The o-projection FP4 copy is decided ALL-OR-NOTHING before any layer converts, against
+        // free VRAM plus a reserve. A partial conversion is the worst outcome available: it spends
+        // the memory and still leaves most layers on int8, and if it takes the last of VRAM the
+        // batched-prefill scratch arena (allocated later, per run, and growing with the KV cache)
+        // fails and prefill drops to the token-loop path -- ~21x slower, and invisible to a bench
+        // that only covers ctx 0/128. Reserve defaults to 3 GB so the ctx-32k KV cache still fits.
+        // SPARKINFER_MUSE_NVFP4_WO=0 disables the leg; _RESERVE_MB tunes the reserve.
+        int wo_ready = 0;
+        const char* fp4_wo_env = getenv("SPARKINFER_MUSE_NVFP4_WO");
+        bool wo_fp4_on = (!fp4_wo_env || fp4_wo_env[0] != '0');
+        {
+            const size_t reserve = [] {
+                const char* e = getenv("SPARKINFER_MUSE_NVFP4_RESERVE_MB");
+                long long mb = e ? atoll(e) : 3072; if (mb < 0) mb = 0;
+                return (size_t)mb << 20;
+            }();
+            const size_t want = (size_t)c.n_layers *
+                (kernels::prefill_nvfp4_data_bytes(H, s.qdim) +
+                 kernels::prefill_nvfp4_scale_bytes_b(H, s.qdim));
+            size_t freeb = 0, totalb = 0;
+            if (wo_fp4_on && (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess ||
+                              freeb <= want + reserve)) {
+                fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj skipped: needs %.1f GB + %.1f GB "
+                        "reserve, %.1f GB free -- staying on the int8 path\n",
+                        (double)want / 1e9, (double)reserve / 1e9, (double)freeb / 1e9);
+                wo_fp4_on = false;
+            }
+        }
         auto release_prefill_copy = [&](const void*& p, const void* decode) {
             if (!p || p == decode) return;
             auto it = std::find(s.owned.begin(), s.owned.end(), const_cast<void*>(p));
@@ -4074,6 +4102,18 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 if (!convert_group(src, qt, rows, 4, H, &lw.qkvg_fp4, &lw.qkvg_fp4_sf))
                     lw.qkvg_fp4 = lw.qkvg_fp4_sf = nullptr;
             }
+            // o projection [H, qdim]. Like ffn_down it has no prefill-only counterpart -- decode
+            // reads lw.wo directly -- so its FP4 copy is a REAL +0.5625 B/value that nothing can
+            // free. That is exactly why #820's ffn_down leg was reverted in #825: at 3.9 GB it left
+            // no room for the KV cache plus the batched-prefill scratch arena at long context, and
+            // prefill silently fell back to the token loop. wo is 4.8x smaller (~0.8 GB), and the
+            // preflight above refuses it outright rather than converting a partial set.
+            if (ok && wo_fp4_on && lw.wo) {
+                if (convert(lw.wo, lw.wo_type, H, s.qdim, &lw.wo_fp4, &lw.wo_fp4_sf))
+                    ++wo_ready;
+                else
+                    lw.wo_fp4 = lw.wo_fp4_sf = nullptr;
+            }
             if (ok) {
                 release_prefill_copy(lw.prefill_gate_q, lw.gate_q);
                 release_prefill_copy(lw.prefill_up_q, lw.up_q);
@@ -4082,6 +4122,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             }
         }
         if (tmp) cudaFree(tmp);
+        fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj weights ready: %d/%d layers\n", wo_ready, c.n_layers);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 FFN weights ready: %d/%d layers%s"
                         " (qkv-gate %d/%d)\n",
                 ready, c.n_layers, ok ? "" : " (remaining layers use GGUF fallback)",
