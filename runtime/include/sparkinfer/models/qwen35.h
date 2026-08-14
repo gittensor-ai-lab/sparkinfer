@@ -92,6 +92,9 @@ struct Qwen35LayerWeights {
     // o projection [H, qdim]. Unlike ffn_down (~3.9 GB, reverted in #825) this is ~0.8 GB, and it
     // is gated on a free-VRAM preflight so a card that cannot spare it keeps the int8 path.
     const void* wo_fp4 = nullptr;   const void* wo_fp4_sf = nullptr;
+    // Short-context-only copy; decode retains down_q, so long-context configurations leave this
+    // null to preserve KV and batched-prefill scratch headroom on 32-GB cards.
+    const void* down_fp4 = nullptr; const void* down_fp4_sf = nullptr;
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
     // 14=Q6_K) -> weights kept quantized in VRAM, decoded on-read by launch_gemv_q.
     int wq_type = 0, wgate_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;

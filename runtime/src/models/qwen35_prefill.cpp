@@ -391,12 +391,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                kernels::prefill_nvfp4_supported(N, H, qdim);
     const size_t fp4_ws_wo = muse_nvfp4_wo
         ? kernels::prefill_nvfp4_workspace_bytes(N, H, qdim) : 0;
+    const bool muse_nvfp4_down = muse_nvfp4 && s.w.layers[0].down_fp4 &&
+                                 kernels::prefill_nvfp4_supported(N, H, ffn);
+    const size_t fp4_ws_down = muse_nvfp4_down
+        ? kernels::prefill_nvfp4_workspace_bytes(N, H, ffn) : 0;
     size_t fp4_ws_bytes = (fp4_ws_qkv > fp4_ws_gu) ? fp4_ws_qkv : fp4_ws_gu;
     if (fp4_ws_wo > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_wo;
+    if (fp4_ws_down > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_down;
     unsigned char* fp4_a = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
     unsigned char* fp4_as = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
     unsigned char* fp4_ws = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
     bf16* fp4_qkv = muse_nvfp4_qkv ? a8.alloc<bf16>((size_t)N * qkvg_n) : nullptr;
+    unsigned char* fp4_down_a = muse_nvfp4_down
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, ffn)) : nullptr;
+    unsigned char* fp4_down_as = muse_nvfp4_down
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N, ffn)) : nullptr;
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
@@ -1025,8 +1034,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                                        ffu, fn, ffn, H, fp4_ws, st);
                 if (layer_fp4) {
                     kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
-                    proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
-                                   ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
+                    const bool down_fp4_done = muse_nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
+                        fp4_down_a && fp4_down_as &&
+                        kernels::launch_prefill_nvfp4_quant_a(
+                            ffg, fp4_down_a, fp4_down_as, fn, ffn, st) &&
+                        kernels::launch_prefill_nvfp4_gemm(
+                            fp4_down_a, fp4_down_as, w.down_fp4, w.down_fp4_sf,
+                            ao + (size_t)fo * H, fn, H, ffn, fp4_ws, st);
+                    if (!down_fp4_done)
+                        proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
+                                       ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
                     continue;
                 }
                 if (ffn_i8) {

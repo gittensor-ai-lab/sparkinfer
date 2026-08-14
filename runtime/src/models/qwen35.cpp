@@ -4002,6 +4002,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         const char* fp4q_env = getenv("SPARKINFER_MUSE_PREFILL_NVFP4_QKV");
         const bool qkvg_fp4_on = (!fp4q_env || fp4q_env[0] != '0') &&
                                  kernels::prefill_nvfp4_supported(128, 2 * qdim_a + 2 * kvdim_a, H);
+        int down_ready = 0;
         auto convert = [&](const void* src, int qtype, int rows, int cols,
                            const void** data, const void** sf) -> bool {
             void *d = nullptr, *scale = nullptr;
@@ -4059,6 +4060,16 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         int wo_ready = 0;
         const char* fp4_wo_env = getenv("SPARKINFER_MUSE_NVFP4_WO");
         bool wo_fp4_on = (!fp4_wo_env || fp4_wo_env[0] != '0');
+        const char* fp4o_env = getenv("SPARKINFER_MUSE_NVFP4_OUTPUTS");
+        size_t fp4_free = 0, fp4_total = 0;
+        cudaMemGetInfo(&fp4_free, &fp4_total);
+        (void)fp4_free;
+        bool down_fp4_on = c.max_seq <= 2048;
+        if (fp4o_env)
+            down_fp4_on = fp4o_env[0] == '1' || fp4o_env[0] == 'd';
+        // On a 32-GB card short prefill gets substantially more from down, while down+wo leaves no
+        // safe allocation margin. Long sessions use neither because these kernels require N=128.
+        wo_fp4_on = wo_fp4_on && c.max_seq <= 2048 && fp4_total >= (40ull << 30);
         {
             const size_t reserve = [] {
                 const char* e = getenv("SPARKINFER_MUSE_NVFP4_RESERVE_MB");
@@ -4120,6 +4131,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 ++ready;
                 if (lw.qkvg_fp4) ++qkvg_ready;
             }
+            // Output projections retain their compact GGUF tensors for decode; these FP4 copies
+            // are optional and failure-isolated, so a tight-memory card can still use gate/up.
+            if (ok && down_fp4_on &&
+                convert(lw.down_q, lw.down_qtype, H, c.moe_ffn,
+                        &lw.down_fp4, &lw.down_fp4_sf)) ++down_ready;
         }
         if (tmp) cudaFree(tmp);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj weights ready: %d/%d layers\n", wo_ready, c.n_layers);
@@ -4127,6 +4143,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                         " (qkv-gate %d/%d)\n",
                 ready, c.n_layers, ok ? "" : " (remaining layers use GGUF fallback)",
                 qkvg_ready, c.n_layers);
+        fprintf(stderr, "[prefill-muse] SM120 NVFP4 down weights ready: %d/%d layers\n",
+                down_ready, c.n_layers);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;
