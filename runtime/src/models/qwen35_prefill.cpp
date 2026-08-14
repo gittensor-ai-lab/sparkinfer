@@ -903,6 +903,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
                 // add happens in launch_norm_then_add below.
+                // FP4 o-projection: att is bf16 here; one quant (k = qdim) + one block-scaled
+                // GEMM into ao, leaving attn_acc unset so the plain norm_then_add tail runs.
+                // Reuses the FFN-leg A buffers: qdim < ffn so both fit fp4_a2/fp4_as2, and the
+                // workspace for (N,H,qdim) is bounded by the (N,H,ffn) one already sized.
+                if (muse_nvfp4_dn && w.wo_fp4 && w.wo_fp4_sf &&
+                    kernels::launch_prefill_nvfp4_quant_a(att, fp4_a2, fp4_as2, N, qdim, st) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_a2, fp4_as2, w.wo_fp4, w.wo_fp4_sf,
+                                                       ao, N, H, qdim, fp4_ws2, st)) {
+                    /* attn_acc stays 0 */
+                } else
                 proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
             } else {
