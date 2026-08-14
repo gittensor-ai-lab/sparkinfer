@@ -1,5 +1,6 @@
 #include "sparkinfer/kernels/prefill_nvfp4.h"
 
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/float_subbyte.h>
@@ -16,32 +17,55 @@ namespace {
 using namespace cute;
 using E4 = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
 using BF = cutlass::bfloat16_t;
-using Tile = Shape<_128, _128, _128>;
 using Cluster = Shape<_1, _1, _1>;
-using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, Tile, Cluster,
-    cutlass::epilogue::collective::EpilogueTileAuto, float, float,
-    BF, cutlass::layout::RowMajor, 8, BF, cutlass::layout::RowMajor, 8,
-    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
-using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
-    E4, cutlass::layout::RowMajor, 32, E4, cutlass::layout::ColumnMajor, 32, float,
-    Tile, Cluster,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
-using Kernel = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int, int, int, int>, Mainloop, Epilogue, void>;
-using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+
+// The GEMM stack, parameterized on the CTA tile. At m == 128 rows there is one M-tile, so
+// CTAs = n/TILE_N: with the 128-wide tile the two hidden-output GEMMs (ffn_down, wo; n=6656)
+// launch 52 CTAs on a 170-SM part and stream their weights at ~1.06 TB/s, and even gate/up's
+// 156 CTAs are one incomplete wave at 1.24. The 64-wide tile doubles the CTAs in flight and
+// measured faster for every shape this path serves. The scale-factor layout atoms come from
+// the UMMA blockscaled format (Sm1xxBlkScaledConfig), not the CTA tile, so both variants read
+// the same packed A/B scale buffers -- asserted below.
+template <int TILE_N>
+struct FP4Stack {
+    using Tile = Shape<_128, Int<TILE_N>, _128>;
+    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, Tile, Cluster,
+        cutlass::epilogue::collective::EpilogueTileAuto, float, float,
+        BF, cutlass::layout::RowMajor, 8, BF, cutlass::layout::RowMajor, 8,
+        cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+    using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+        E4, cutlass::layout::RowMajor, 32, E4, cutlass::layout::ColumnMajor, 32, float,
+        Tile, Cluster,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+    using Kernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>, Mainloop, Epilogue, void>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+    using ScaleConfig = typename Mainloop::Sm1xxBlkScaledConfig;
+};
+using Wide = FP4Stack<128>;
+using Skinny = FP4Stack<64>;
+using Kernel = Wide::Kernel;
+using Gemm = Wide::Gemm;
 using StrideA = typename Kernel::StrideA;
 using StrideB = typename Kernel::StrideB;
 using StrideC = typename Kernel::StrideC;
 using StrideD = typename Kernel::StrideD;
-using ScaleConfig = typename Mainloop::Sm1xxBlkScaledConfig;
+using ScaleConfig = typename Wide::Mainloop::Sm1xxBlkScaledConfig;
 
 auto shape(int m, int n, int k) { return cute::make_shape(m, n, k, 1); }
 auto sfa_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SFA(shape(m,n,k)); }
 auto sfb_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SFB(shape(m,n,k)); }
+// Both tile variants must agree on the packed scale buffer layouts, or the skinny variant
+// would read scales packed for the wide one.
+static_assert(std::is_same_v<decltype(Wide::ScaleConfig::tile_atom_to_shape_SFA(
+                                 cute::make_shape(1, 1, 1, 1))),
+                             decltype(Skinny::ScaleConfig::tile_atom_to_shape_SFA(
+                                 cute::make_shape(1, 1, 1, 1)))>,
+              "scale-factor layouts diverge across tile variants");
 
 template <class Layout>
 __global__ void quant_rows(const __nv_bfloat16* src, unsigned char* dst,
@@ -82,15 +106,28 @@ __global__ void quant_rows(const __nv_bfloat16* src, unsigned char* dst,
     }
 }
 
-Gemm::Arguments args(const void* a, const void* sa, const void* b, const void* sb,
-                     void* d, int m, int n, int k) {
-    auto as = cutlass::make_cute_packed_stride(StrideA{}, {m,k,1});
-    auto bs = cutlass::make_cute_packed_stride(StrideB{}, {n,k,1});
-    auto cs = cutlass::make_cute_packed_stride(StrideC{}, {m,n,1});
-    auto ds = cutlass::make_cute_packed_stride(StrideD{}, {m,n,1});
+template <class S>
+typename S::Gemm::Arguments args_t(const void* a, const void* sa, const void* b, const void* sb,
+                                   void* d, int m, int n, int k) {
+    auto as = cutlass::make_cute_packed_stride(typename S::Kernel::StrideA{}, {m,k,1});
+    auto bs = cutlass::make_cute_packed_stride(typename S::Kernel::StrideB{}, {n,k,1});
+    auto cs = cutlass::make_cute_packed_stride(typename S::Kernel::StrideC{}, {m,n,1});
+    auto ds = cutlass::make_cute_packed_stride(typename S::Kernel::StrideD{}, {m,n,1});
     return {cutlass::gemm::GemmUniversalMode::kGemm, shape(m,n,k),
             {static_cast<const cutlass::float_e2m1_t*>(a), as, static_cast<const cutlass::float_e2m1_t*>(b), bs, static_cast<const cutlass::float_ue4m3_t*>(sa), sfa_layout(m,n,k), static_cast<const cutlass::float_ue4m3_t*>(sb), sfb_layout(m,n,k)},
             {{1.f, 0.f}, static_cast<const BF*>(nullptr), cs, static_cast<BF*>(d), ds}};
+}
+Gemm::Arguments args(const void* a, const void* sa, const void* b, const void* sb,
+                     void* d, int m, int n, int k) {
+    return args_t<Wide>(a, sa, b, sb, d, m, n, k);
+}
+template <class S>
+bool run_gemm(const void* a, const void* sa, const void* b, const void* sb,
+              void* d, int m, int n, int k, void* ws, cudaStream_t st) {
+    typename S::Gemm gemm; auto ar = args_t<S>(a,sa,b,sb,d,m,n,k);
+    return gemm.can_implement(ar) == cutlass::Status::kSuccess &&
+           gemm.initialize(ar,ws,st) == cutlass::Status::kSuccess &&
+           gemm.run(st) == cutlass::Status::kSuccess;
 }
 } // namespace
 
@@ -109,7 +146,10 @@ size_t prefill_nvfp4_scale_bytes_b(int n, int k) {
     return (size_t)cute::size(cute::filter_zeros(sfb_layout(128,n,k)));
 }
 size_t prefill_nvfp4_workspace_bytes(int m, int n, int k) {
-    return Gemm::get_workspace_size(args(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
+    const size_t w = Gemm::get_workspace_size(args(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
+    const size_t s = Skinny::Gemm::get_workspace_size(
+        args_t<Skinny>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
+    return w > s ? w : s;
 }
 bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k, cudaStream_t st) {
     if (!s || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
@@ -130,9 +170,17 @@ bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k
 bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const void* sb,
                                void* d,int m,int n,int k,void* ws,cudaStream_t st) {
     if (!a||!sa||!b||!sb||!d||!prefill_nvfp4_supported(m,n,k)) return false;
-    Gemm gemm; auto ar = args(a,sa,b,sb,d,m,n,k);
-    return gemm.can_implement(ar) == cutlass::Status::kSuccess &&
-           gemm.initialize(ar,ws,st) == cutlass::Status::kSuccess &&
-           gemm.run(st) == cutlass::Status::kSuccess;
+    // At m = 128 rows one M-tile is all there is, so CTAs = n / TILE_N: the 128-wide tile
+    // put 52 CTAs on 170 SMs for the hidden-output GEMMs (ffn_down, wo) and one incomplete
+    // 156-CTA wave for gate/up. The 64-wide tile doubles both -- measured faster for every
+    // shape this path serves, so it is the default; SPARKINFER_MUSE_NVFP4_SKINNY sets an
+    // n threshold above which the 128-wide tile returns (0 restores it everywhere).
+    static int sk = -1;
+    if (sk < 0) {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_SKINNY");
+        sk = e ? atoi(e) : 1 << 30;
+    }
+    if (n <= sk) return run_gemm<Skinny>(a,sa,b,sb,d,m,n,k,ws,st);
+    return run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st);
 }
 } // namespace sparkinfer::kernels
