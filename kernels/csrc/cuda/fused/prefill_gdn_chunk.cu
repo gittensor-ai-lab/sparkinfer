@@ -284,7 +284,7 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                                     float* __restrict__ state,
                                     __nv_bfloat16* __restrict__ out,
                                     int n_tokens, int q_heads, int v_heads, int n_chunks,
-                                    bool qh_block) {
+                                    bool qh_block, int carry) {
     extern __shared__ char s_raw[];
     float* s_S = reinterpret_cast<float*>(s_raw);                              // [HD][JC]  fp32 carrier
     float* s_U = s_S + (size_t)HD * JC;                                        // [C][JC]
@@ -312,7 +312,17 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     const int v_dim = v_heads * HD;
     const float scale = rsqrtf((float)HD);
 
-    for (int e = tid; e < HD * JC; e += nthr) s_S[e] = 0.f;    // fresh prefill: state starts at zero
+    // Fresh prefill zeros S. A segment continuation reloads the transposed
+    // [v_head][col][row] state the previous segment wrote, so a workspace split
+    // is just another chunk boundary and decode still sees one recurrence.
+    if (carry) {
+        for (int e = tid; e < HD * JC; e += nthr) {
+            const int m = e / JC, jj = e - m * JC;
+            s_S[e] = state[((size_t)h * HD + (j0 + jj)) * HD + m];
+        }
+    } else {
+        for (int e = tid; e < HD * JC; e += nthr) s_S[e] = 0.f;
+    }
 
     // The chunk loop is the ONE serial stage left in this prefill, and every iteration used
     // to expose the full global latency of its 25 KB W/K/Q staging before any math could
@@ -511,12 +521,24 @@ size_t g_ws_bytes = 0;
 
 bool ws_reserve(size_t bytes) {
     if (bytes <= g_ws_bytes) return true;
+    // Allocate the new buffer first so a failed grow keeps the working one.
+    // The old free-then-malloc dropped a fitting segment workspace every
+    // layer at ctx=16384 while retrying an O(N) size that never fits.
+    void* p = nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) return false;
     if (g_ws) cudaFree(g_ws);
-    g_ws = nullptr;
-    g_ws_bytes = 0;
-    if (cudaMalloc(&g_ws, bytes) != cudaSuccess) { g_ws = nullptr; return false; }
+    g_ws = p;
     g_ws_bytes = bytes;
     return true;
+}
+
+size_t gdnc_workspace_bytes(int n_tokens, int v_heads, int C, int HD) {
+    const int n_chunks = (n_tokens + C - 1) / C;
+    const size_t n_g = (size_t)n_tokens * v_heads;
+    const size_t n_w = (size_t)n_tokens * v_heads * HD;
+    const size_t n_m = (size_t)n_chunks * v_heads * C * C;
+    return n_g * sizeof(float) + n_m * sizeof(float)
+         + n_w * sizeof(__nv_bfloat16) + n_w * sizeof(__nv_bfloat16);
 }
 
 }  // namespace
@@ -543,31 +565,6 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
 
     if (!enabled || head_dim != HD || n_tokens < minctx) return false;
     if (q_heads <= 0 || v_heads <= 0 || (HD % JC) != 0) return false;
-
-    const int n_chunks = (n_tokens + C - 1) / C;
-
-    // Workspace: G and M in fp32, W^ and U0 in bf16. W^ is the scan's largest read — every one of
-    // the HD/JC column groups re-reads all of it each chunk — so bf16 there is worth ~1 pp of
-    // end-to-end prefill. It does cost a little accuracy, because the scan forms U^ = U0 - W^ S and
-    // that subtraction cancels: measured at ctx=4096 over 512 positions, top-1 0.9336 (fp32) ->
-    // 0.9277 (bf16), KL 0.01069 -> 0.01096. Both stay well clear of the 0.90 / 0.20 gates and the
-    // KL is still below the sequential scan's own 0.01136, so the trade is taken. M stays fp32: it
-    // is only C*C per chunk, so shrinking it buys little.
-    const size_t n_g = (size_t)n_tokens * v_heads;
-    const size_t n_w = (size_t)n_tokens * v_heads * HD;
-    const size_t n_m = (size_t)n_chunks * v_heads * C * C;
-    const size_t off_g = 0;
-    const size_t off_m = off_g + n_g * sizeof(float);
-    const size_t off_w = off_m + n_m * sizeof(float);
-    const size_t off_u = off_w + n_w * sizeof(__nv_bfloat16);
-    const size_t total = off_u + n_w * sizeof(__nv_bfloat16);
-    if (!ws_reserve(total)) return false;
-
-    char* base  = reinterpret_cast<char*>(g_ws);
-    float* g_buf = reinterpret_cast<float*>(base + off_g);
-    float* m_buf = reinterpret_cast<float*>(base + off_m);
-    __nv_bfloat16* w_buf = reinterpret_cast<__nv_bfloat16*>(base + off_w);
-    __nv_bfloat16* u_buf = reinterpret_cast<__nv_bfloat16*>(base + off_u);
 
     const size_t sm_prep = (size_t)2 * C * (HD + PAD) * sizeof(__nv_bfloat16)
                          + (size_t)C * (C + PAD) * sizeof(float)
@@ -606,32 +603,91 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         cfg[dev] = 1;
     }
 
+    auto db = reinterpret_cast<const __nv_bfloat16*>(dt);
+    auto aa = reinterpret_cast<const __nv_bfloat16*>(a);
+
+    // PREP_THREADS is fixed by the 2x2 (i,j) tiling in the A/M pass: C*C == 4*PREP_THREADS.
+    static_assert(C * C == PREP_THREADS * 4, "2x2 A/M tiling requires C*C == 4*PREP_THREADS");
+    static_assert(C * JC == SCAN_THREADS * 4, "2x2 tiling requires C*JC == 4*SCAN_THREADS");
+    static_assert(HD * JC == SCAN_THREADS * 16, "4x4 tiling requires HD*JC == 16*SCAN_THREADS");
+
+    // One sequence-slice: workspace is O(len). carry=0 zeros S (fresh prefill);
+    // carry=1 reloads the state the previous slice wrote.
+    auto run_slice = [&](const __nv_bfloat16* qb, const __nv_bfloat16* kb,
+                         const __nv_bfloat16* vb, const __nv_bfloat16* ab,
+                         const __nv_bfloat16* bb, __nv_bfloat16* ob,
+                         int len, int carry) -> bool {
+        const int n_chunks = (len + C - 1) / C;
+        const size_t n_g = (size_t)len * v_heads;
+        const size_t n_w = (size_t)len * v_heads * HD;
+        const size_t n_m = (size_t)n_chunks * v_heads * C * C;
+        const size_t off_m = n_g * sizeof(float);
+        const size_t off_w = off_m + n_m * sizeof(float);
+        const size_t off_u = off_w + n_w * sizeof(__nv_bfloat16);
+        const size_t total = off_u + n_w * sizeof(__nv_bfloat16);
+        if (!ws_reserve(total)) return false;
+        char* base = reinterpret_cast<char*>(g_ws);
+        float* g_buf = reinterpret_cast<float*>(base);
+        float* m_buf = reinterpret_cast<float*>(base + off_m);
+        auto* w_buf = reinterpret_cast<__nv_bfloat16*>(base + off_w);
+        auto* u_buf = reinterpret_cast<__nv_bfloat16*>(base + off_u);
+        dim3 gprep(n_chunks, v_heads);
+        pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
+            qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
+            len, q_heads, v_heads, qh_block);
+        dim3 gscan(v_heads, HD / JC);
+        pf_gdnc_scan_kernel<C, HD, JC><<<gscan, SCAN_THREADS, sm_scan, stream>>>(
+            qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
+            len, q_heads, v_heads, n_chunks, qh_block, carry);
+        return cudaPeekAtLastError() == cudaSuccess;
+    };
+
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
     auto kb = reinterpret_cast<const __nv_bfloat16*>(k);
     auto vb = reinterpret_cast<const __nv_bfloat16*>(v);
     auto ab = reinterpret_cast<const __nv_bfloat16*>(alpha);
     auto bb = reinterpret_cast<const __nv_bfloat16*>(beta);
-    auto db = reinterpret_cast<const __nv_bfloat16*>(dt);
-    auto aa = reinterpret_cast<const __nv_bfloat16*>(a);
     auto ob = reinterpret_cast<__nv_bfloat16*>(out);
 
-    // PREP_THREADS is fixed by the 2x2 (i,j) tiling in the A/M pass: C*C == 4*PREP_THREADS.
-    static_assert(C * C == PREP_THREADS * 4, "2x2 A/M tiling requires C*C == 4*PREP_THREADS");
-    dim3 gprep(n_chunks, v_heads);
-    pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
-        qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf, n_tokens, q_heads, v_heads, qh_block);
+    // Workspace is O(N): W^ and U0 are n_tokens*v_heads*HD bf16 each (~400 MB at
+    // ctx=16384 x 48 v-heads). ws_reserve failing used to drop every linear layer
+    // onto the sequential scan. A segment boundary on a multiple of C is the same
+    // as a chunk boundary once the scan reloads S, so the sequence is processed
+    // in slices whose workspace fits. ctx=128 still takes the one-shot path.
+    const size_t total = gdnc_workspace_bytes(n_tokens, v_heads, C, HD);
+    if (ws_reserve(total))
+        return run_slice(qb, kb, vb, ab, bb, ob, n_tokens, 0);
+    cudaGetLastError();   // clear the failed grow so later peek/getinfo are clean
 
-    // SCAN_THREADS is not free tuning: the register tiling below partitions the [C,JC] and [HD,JC]
-    // outputs across exactly this many threads (2x2 and 4x4 tiles respectively).
-    static_assert(C * JC == SCAN_THREADS * 4, "2x2 tiling requires C*JC == 4*SCAN_THREADS");
-    static_assert(HD * JC == SCAN_THREADS * 16, "4x4 tiling requires HD*JC == 16*SCAN_THREADS");
-    dim3 gscan(v_heads, HD / JC);
-    pf_gdnc_scan_kernel<C, HD, JC><<<gscan, SCAN_THREADS, sm_scan, stream>>>(
-        qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob, n_tokens, q_heads, v_heads, n_chunks, qh_block);
-    // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek —
-    // rather than get — so a pre-existing sticky error is not silently cleared here.
-    // Returning false lets the caller fall through to the sequential GDN scan.
-    return cudaPeekAtLastError() == cudaSuccess;
+    const size_t per_tok = (size_t)v_heads *
+        (sizeof(float) + (size_t)C * sizeof(float) + (size_t)2 * HD * sizeof(__nv_bfloat16));
+    size_t free_b = 0, tot_b = 0;
+    if (cudaMemGetInfo(&free_b, &tot_b) != cudaSuccess) return false;
+    const size_t margin = (size_t)32 << 20;
+    const size_t avail = (free_b > margin) ? (free_b - margin) : 0;
+    size_t seg = per_tok ? (avail / per_tok) : 0;
+    seg -= seg % (size_t)C;
+    if (seg < (size_t)C) return false;
+    if (seg > (size_t)n_tokens) seg = (size_t)n_tokens;
+
+    static int once_seg = 0;
+    if (!once_seg) {
+        fprintf(stderr, "[gdn-chunk] workspace %zu MB does not fit; %d-token segments (ctx=%d, free=%zu MB)\n",
+                gdnc_workspace_bytes(n_tokens, v_heads, C, HD) >> 20,
+                (int)seg, n_tokens, free_b >> 20);
+        once_seg = 1;
+    }
+
+    const size_t q_dim = (size_t)q_heads * HD;
+    const size_t v_dim = (size_t)v_heads * HD;
+    for (size_t off = 0; off < (size_t)n_tokens; off += seg) {
+        const int len = (int)((off + seg < (size_t)n_tokens) ? seg : (size_t)n_tokens - off);
+        if (!run_slice(qb + off * q_dim, kb + off * q_dim, vb + off * v_dim,
+                       ab + off * v_heads, bb + off * v_heads, ob + off * v_dim,
+                       len, off ? 1 : 0))
+            return false;
+    }
+    return true;
 }
 
 }  // namespace kernels

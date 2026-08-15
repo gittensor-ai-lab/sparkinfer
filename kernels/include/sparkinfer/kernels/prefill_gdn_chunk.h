@@ -27,7 +27,9 @@ namespace kernels {
 //     if (launch_prefill_gdn_chunk(...)) return;   // else fall through to the sequential scan
 //
 // Returns true if the kernels were launched, false if the caller should run its own scan (shape
-// not specialized, disabled by env, or workspace allocation failed).
+// not specialized, disabled by env, or even one chunk of workspace cannot be allocated).
+// When the O(N) W^/U0 workspace does not fit, the sequence is scanned in chunk-aligned
+// segments and the recurrence is carried through `state` — same arithmetic, same order.
 //
 // Produces out[N, v_heads*head_dim] and leaves the recurrent state in the SAME transposed
 // [v_head][col][row] layout the decode gdn_ar_fast kernel expects, so this is a drop-in
