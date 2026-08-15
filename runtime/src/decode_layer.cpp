@@ -94,8 +94,8 @@ void DecodeRunner::decode_layer(int layer, void* x, int num_seqs,
     kernels::launch_gemm(s.xn, w.wv, s.v, num_seqs, KV, H, 1.f, 0.f, gc, stream);
 
     // 3. append new K/V into the paged cache for this layer
-    bf16* kpool = (bf16*)s.kv->k_pool() + (size_t)layer * s.kv->layer_stride_elems();
-    bf16* vpool = (bf16*)s.kv->v_pool() + (size_t)layer * s.kv->layer_stride_elems();
+    bf16* kpool = (bf16*)s.kv->k_pool() + s.kv->layer_base_elems(layer);
+    bf16* vpool = (bf16*)s.kv->v_pool() + s.kv->layer_base_elems(layer);
     int* btable = s.kv->block_table(0);   // batch occupies slots 0..num_seqs-1
     launch_kv_append(kpool, vpool, s.k, s.v, btable, s.d_write_pos,
                      num_seqs, s.attn.num_kv_heads, s.attn.head_dim,

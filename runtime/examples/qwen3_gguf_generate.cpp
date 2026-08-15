@@ -61,9 +61,13 @@ int main(int argc, char** argv) {
     // int8 KV is the Qwen3-MoE head_dim=128 tensor-core path; Qwen3.6 attention (gated, head_dim=256) writes bf16 KV.
     { const char* e = getenv("SPARKINFER_KV_INT8");   // hybrid: int8 KV when prompt length >= 4k
       kvc.int8_kv = e ? (e[0] != '0') : (cfg.hybrid ? ((argc - 3) >= 4096) : true); }
+    // Only the full-attention layers get a pool slot (hybrid_kv_layer_slots): the
+    // Gated-DeltaNet layers carry a recurrent state and never read paged KV.
+    kvc.layer_slot = sparkinfer::hybrid_kv_layer_slots(cfg.n_layers, cfg.hybrid, cfg.full_attn_interval);
+    const int kvL = sparkinfer::kv_slot_count(kvc.layer_slot, cfg.n_layers);
     const size_t epb = (size_t)16 * cfg.n_kv_heads * cfg.head_dim;
     const size_t blocks = (cfg.max_seq + 15) / 16 + 8;
-    sparkinfer::KVCacheManager kv(kvc, (size_t)cfg.n_layers * 2 * epb * 2 * blocks);
+    sparkinfer::KVCacheManager kv(kvc, (size_t)kvL * 2 * epb * 2 * blocks);
 
     sparkinfer::moe::MoEConfig mc;
     mc.num_experts = cfg.n_experts; mc.top_k = cfg.top_k; mc.hidden_dim = cfg.hidden;

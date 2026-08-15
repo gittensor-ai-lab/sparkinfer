@@ -57,9 +57,13 @@ int main(int argc, char** argv) {
     kvc.head_dim = cfg.head_dim;
     kvc.block_size = 16;
     kvc.int8_kv = false;
+    // Only the full-attention layers get a pool slot (hybrid_kv_layer_slots): the
+    // Gated-DeltaNet layers carry a recurrent state and never read paged KV.
+    kvc.layer_slot = sparkinfer::hybrid_kv_layer_slots(cfg.n_layers, cfg.hybrid, cfg.full_attn_interval);
+    const int kvL = sparkinfer::kv_slot_count(kvc.layer_slot, cfg.n_layers);
     const size_t epb = (size_t)16 * cfg.n_kv_heads * cfg.head_dim;
     const size_t blocks = (cfg.max_seq + 15) / 16 + 8;
-    sparkinfer::KVCacheManager kv(kvc, (size_t)cfg.n_layers * 2 * epb * 2 * blocks);
+    sparkinfer::KVCacheManager kv(kvc, (size_t)kvL * 2 * epb * 2 * blocks);
 
     sparkinfer::moe::MoEConfig mc;
     mc.num_experts = cfg.n_experts;

@@ -33,6 +33,7 @@ struct KVCacheManager::Impl {
     bool int8_kv = false;
     void* k_pool = nullptr;
     void* v_pool = nullptr;
+    int n_slots = 0;
     void* k_scale = nullptr;         // int8 path only: [num_layers, ..., 1] __half per (token, kv_head)
     void* v_scale = nullptr;
     int* d_block_tables = nullptr;   // [kMaxSeqs, kMaxBlocksPerSeq]
@@ -54,17 +55,27 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
     // total_blocks sized against the bf16 budget so callers/capacity are unchanged; int8 just mallocs
     // fewer bytes (+ the small scale pools).
     const size_t bytes_per_block = elems_per_block * sizeof(unsigned short); // bf16 budget
-    const size_t denom = (size_t)cfg.num_layers * 2 * bytes_per_block;
+    // Only layers that actually hold KV get a pool slot (see KVCacheConfig::layer_slot).
+    int n_slots = 0;
+    for (int v : cfg.layer_slot) n_slots = (v + 1 > n_slots) ? v + 1 : n_slots;
+    if (cfg.layer_slot.empty()) n_slots = cfg.num_layers;
+    impl_->n_slots = n_slots;
+    const size_t denom = (size_t)n_slots * 2 * bytes_per_block;
     impl_->total_blocks = denom ? (int)(pool_bytes / denom) : 0;
     impl_->layer_stride = (size_t)impl_->total_blocks * elems_per_block;
 
-    const size_t pool_elems = (size_t)cfg.num_layers * impl_->layer_stride;
+    // One extra TRAP slice when compacted. A layer with no slot has no KV by construction, so
+    // reaching it means a caller ignored the layer typing; the trap absorbs that write instead of
+    // letting it alias slot 0 (a real layer's KV) and corrupt attention silently. Costs one slice
+    // of the n_slots the pool already shrank to.
+    const int alloc_slices = n_slots + (cfg.layer_slot.empty() ? 0 : 1);
+    const size_t pool_elems = (size_t)alloc_slices * impl_->layer_stride;
     cu(cudaMalloc(&impl_->k_pool, pool_elems * elem_bytes), "malloc k_pool");
     cu(cudaMalloc(&impl_->v_pool, pool_elems * elem_bytes), "malloc v_pool");
     if (impl_->int8_kv) {
         // one fp16 scale per (token slot, kv_head): scale stride = layer_stride / head_dim.
         impl_->scale_layer_stride = impl_->layer_stride / cfg.head_dim;
-        const size_t scale_elems = (size_t)cfg.num_layers * impl_->scale_layer_stride;
+        const size_t scale_elems = (size_t)alloc_slices * impl_->scale_layer_stride;
         cu(cudaMalloc(&impl_->k_scale, scale_elems * sizeof(unsigned short)), "malloc k_scale");
         cu(cudaMalloc(&impl_->v_scale, scale_elems * sizeof(unsigned short)), "malloc v_scale");
     }
@@ -167,6 +178,36 @@ const std::vector<int>& KVCacheManager::physical_block_ids(uint64_t seq_id) cons
 void*  KVCacheManager::k_pool() const { return impl_->k_pool; }
 void*  KVCacheManager::v_pool() const { return impl_->v_pool; }
 size_t KVCacheManager::layer_stride_elems() const { return impl_->layer_stride; }
+int KVCacheManager::kv_slots() const { return impl_->n_slots; }
+namespace {
+// A slot-less layer means the caller ignored the layer typing the pool was built from. Say so once
+// -- the trap slice keeps it from corrupting a real layer, but it is still a bug worth seeing.
+int kv_trap_slot(const std::vector<int>& m, int layer) {
+    const int s = (layer >= 0 && layer < (int)m.size()) ? m[layer] : -1;
+    if (s < 0) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[kv] layer %d has no KV slot (linear/GDN layer) -- routed to the trap "
+                            "slice; this layer should not be touching the paged pool\n", layer);
+        }
+    }
+    return s;
+}
+}  // namespace
+
+size_t KVCacheManager::layer_base_elems(int layer) const {
+    const auto& m = impl_->cfg.layer_slot;
+    if (m.empty()) return (size_t)layer * impl_->layer_stride;
+    const int s = kv_trap_slot(m, layer);
+    return (size_t)(s < 0 ? impl_->n_slots : s) * impl_->layer_stride;
+}
+size_t KVCacheManager::scale_layer_base_elems(int layer) const {
+    const auto& m = impl_->cfg.layer_slot;
+    if (m.empty()) return (size_t)layer * impl_->scale_layer_stride;
+    const int s = kv_trap_slot(m, layer);
+    return (size_t)(s < 0 ? impl_->n_slots : s) * impl_->scale_layer_stride;
+}
 bool   KVCacheManager::int8_kv() const { return impl_->int8_kv; }
 void*  KVCacheManager::k_scale_pool() const { return impl_->k_scale; }
 void*  KVCacheManager::v_scale_pool() const { return impl_->v_scale; }

@@ -126,10 +126,16 @@ static bool init_session(BenchSession& s, const std::string& path, int max_ctx, 
     kvc.block_size = 16;
     const char* e8 = getenv("SPARKINFER_KV_INT8");
     kvc.int8_kv = e8 ? (e8[0] != '0') : (max_ctx >= 4096);
+    // Only the full-attention layers get a pool slot (hybrid_kv_layer_slots): the
+    // Gated-DeltaNet layers carry a recurrent state and never read paged KV. On
+    // Qwen3.8-27B that is 16 slots of 64, so a 16k context fits where it used to OOM.
+    kvc.layer_slot = sparkinfer::hybrid_kv_layer_slots(s.cfg.n_layers, s.cfg.hybrid,
+                                                      s.cfg.full_attn_interval);
+    const int kvL = sparkinfer::kv_slot_count(kvc.layer_slot, s.cfg.n_layers);
     const size_t epb = (size_t)16 * s.cfg.n_kv_heads * s.cfg.head_dim;
     const size_t blocks = (s.cfg.max_seq + 15) / 16 + 8;
     s.kv = std::make_unique<sparkinfer::KVCacheManager>(
-        kvc, (size_t)s.cfg.n_layers * 2 * epb * 2 * blocks);
+        kvc, (size_t)kvL * 2 * epb * 2 * blocks);
     sparkinfer::moe::MoEConfig mc;
     mc.num_experts = s.cfg.n_experts; mc.top_k = s.cfg.top_k;
     mc.hidden_dim = s.cfg.hidden; mc.ffn_dim = s.cfg.moe_ffn;

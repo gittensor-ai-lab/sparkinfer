@@ -85,6 +85,10 @@ bool stage_kv_to_shm(KVCacheManager& kv, const BridgeKVLayout& layout, uint64_t 
     const int first_block = start_tok / layout.block_size;
     const int n_blocks = n_tok / layout.block_size;
 
+    // A compacted (hybrid) pool holds one slice per FULL-ATTENTION layer, indexed by slot, so
+    // the per-layer offsets below would walk past its end. Refuse rather than mis-index; this
+    // path is not used by the hybrid models that compact.
+    if (kv.kv_slots() != layout.num_layers) return false;
     const std::vector<int>& phys = kv.physical_block_ids(seq_id);
     if ((int)phys.size() < first_block + n_blocks) return false;
 
@@ -161,6 +165,10 @@ bool restore_kv_from_shm(KVCacheManager& kv, const BridgeKVLayout& layout, uint6
     const int first_block = start_tok / layout.block_size;
     const int n_blocks = len_tok / layout.block_size;
 
+    // A compacted (hybrid) pool holds one slice per FULL-ATTENTION layer, indexed by slot, so
+    // the per-layer offsets below would walk past its end. Refuse rather than mis-index; this
+    // path is not used by the hybrid models that compact.
+    if (kv.kv_slots() != layout.num_layers) return false;
     const std::vector<int>& phys = kv.physical_block_ids(seq_id);
     if ((int)phys.size() < first_block + n_blocks) return false;
 

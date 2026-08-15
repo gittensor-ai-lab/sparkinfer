@@ -123,6 +123,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const int lvdim = s.linear_vdim;                     // 4096
     const int vh   = c.linear_v_heads;                   // 32
     const int ffn  = c.moe_ffn;                          // dense: 12288; MoE: per-expert 512
+    // Floor for the VRAM-adaptive FFN chunk below: past this the chunk loop costs more in
+    // weight re-reads than the batched pass saves over the token loop.
+    constexpr int kMinFfnChunk = 1024;
+    // SPARKINFER_PREFILL_VERBOSE=1 reports the VRAM map around the batched scratch. Off by default.
+    const bool pf_verbose = []{ const char* e = getenv("SPARKINFER_PREFILL_VERBOSE"); return e && e[0] == '1'; }();
+    auto pf_vram = [&](const char* where) {
+        if (!pf_verbose) return;
+        size_t f = 0, t = 0;
+        cudaMemGetInfo(&f, &t);
+        fprintf(stderr, "[prefill/vram] %-22s free=%zu MB used=%zu MB\n", where, f >> 20, (t - f) >> 20);
+    };
     const int wide = 2 * qdim;                           // 8192 (qraw); also >= lqkv
     // wbuf must hold the largest weight the `dq` lambda dequantizes: the dense FFN (ffn*H) OR, on the
     // MoE path (small ffn=512), the biggest projection (wide/lqkv * H). Cover all of them.
@@ -139,7 +150,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // FFN is per-token independent, so chunking is numerically identical. Env override; default 32768.
     // (MoE doesn't use ffg/ffu — its grouped FFN has its own O(N*top_k) scratch, so chunking is moot.)
     const int ffn_chunk = []{ const char* e = getenv("SPARKINFER_PREFILL_FFN_CHUNK"); int c = e ? atoi(e) : 32768; return c > 0 ? c : 32768; }();
-    const int FC = (N < ffn_chunk) ? N : ffn_chunk;
+    int FC = (N < ffn_chunk) ? N : ffn_chunk;
     bf16* lin_conv_state = static_cast<bf16*>(s.lin_conv_state);
 
     // ---- scratch ----
@@ -200,6 +211,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         pf_cu(cudaStreamSynchronize(st), "pfb graph sync");
         return *s.h_out_id;
     }
+    pf_vram("entry");
     bf16* x    = a.alloc<bf16>((size_t)N * H);
     bf16* xn   = a.alloc<bf16>((size_t)N * H);
     bf16* hn   = a.alloc<bf16>((size_t)N * H);
@@ -225,12 +237,55 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     bf16* qg   = lnrm;                                   // full q-gate (4096) <- lin_norm (4096)
     bf16* kf   = gq;                                     // full k      (1024) <- gdn q    (2048)
     bf16* vf   = gk;                                     // full v      (1024) <- gdn k    (2048)
+    // Everything above is FC-independent and already allocated, so cudaMemGetInfo here reports
+    // exactly what is left for the FC-scaled pair -- size the chunk to that instead of to a
+    // constant. When ffg+ffu do not fit, the WHOLE arena alloc fails and prefill_batched returns
+    // -1, so the caller silently drops to the sequential token loop: at ctx=16384 that is 79 pp
+    // against 2191 pp batched, ~28x. A 27B NVFP4 checkpoint holds BOTH the NVFP4 prefill and Q4_K
+    // decode weight copies, which leaves a 32 GB card short of the default chunk's 1.1 GB.
+    // This only ever SHRINKS the chunk; FC < N is the same path every context above 32k already
+    // takes, and the FFN is per-token independent, so it stays numerically identical.
+    pf_vram("before ffg/ffu");
+    // An explicit SPARKINFER_PREFILL_FFN_CHUNK is an operator decision -- honour it as given.
+    if (!moe && !getenv("SPARKINFER_PREFILL_FFN_CHUNK")) {
+        size_t fb = 0, tb = 0;
+        if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
+            // What still has to come out of `fb` after the FC-scaled pair, so the chunk is sized
+            // against the real remainder rather than all of free VRAM.
+            const size_t tail = (size_t)maxw * sizeof(bf16)                    // wbuf
+                              + (size_t)maxw                                  // W_i8
+                              + (size_t)N * H                                 // A_i8 (int8) floor
+                              + (size_t)N * (sizeof(float) + sizeof(int));    // sx + d_ids
+            const size_t margin = (size_t)64 << 20;    // split-K partials + allocator slack
+            const size_t avail = (fb > tail + margin) ? fb - tail - margin : 0;
+            const int fc_before = FC;
+            // Test the HALVED value, not the current one: `FC > floor` would step straight past it.
+            while ((FC >> 1) >= kMinFfnChunk &&
+                   (size_t)2 * (size_t)FC * (size_t)ffn * sizeof(bf16) > avail)
+                FC >>= 1;
+            if (FC != fc_before)
+                fprintf(stderr, "[prefill] ffn chunk %d -> %d (ctx=%d, free=%zu MB) to keep the "
+                                "batched pass\n", fc_before, FC, N, fb >> 20);
+        }
+    }
     bf16* ffg  = a.alloc<bf16>((size_t)FC * ffn);        // ffn gate (12288), bounded to FC tokens
     bf16* ffu  = a.alloc<bf16>((size_t)FC * ffn);        // ffn up,          bounded to FC tokens
     bf16* ffh  = ffg;                                    // SwiGLU computed in-place into ffg (down reads it)
     bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
     int*  d_ids = a.alloc<int>((size_t)N);
-    if (!a.ok) { a.free_all(); fprintf(stderr, "[prefill] scratch alloc failed (ctx=%d) -> fallback\n", N); return -1; }
+    pf_vram("after dense arena");
+    if (!a.ok) {
+        // Report the numbers, not just the fact: this fallback costs ~50x at long context and the
+        // old message gave no way to tell a genuinely-too-small card from a chunk set too large.
+        size_t fb = 0, tb = 0;
+        cudaMemGetInfo(&fb, &tb);
+        const size_t held = a.total();
+        a.free_all();
+        fprintf(stderr, "[prefill] scratch alloc failed (ctx=%d, chunk=%d, held=%zu MB, "
+                        "free=%zu/%zu MB) -> fallback\n",
+                N, FC, held >> 20, fb >> 20, tb >> 20);
+        return -1;
+    }
     // int8 tensor-core projections (prefill_gemm_i8): ~2x the bf16 GEMM at int8==bf16 output fidelity
     // (GGUF weights are already Q4_K/Q6_K -> int8 weight-quant is lossless vs what's stored). Default
     // ON at every batched context; SPARKINFER_PREFILL_I8=0 disables (A/B). The int8 scratch lives in
@@ -284,6 +339,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // SPARKINFER_PREFILL_FP8_GDN=0 restores the bf16 GDN projections (A/B).
     const char* _pfp8 = getenv("SPARKINFER_PREFILL_FP8_GDN");
     bool use_fp8_gdn = long_bf16 && (!_pfp8 || _pfp8[0] != '0');
+    // The int8 projection path has only ever run with FC == N (main chunks the FFN only above
+    // 32k, and at those contexts it fails the scratch alloc and falls back before reaching here).
+    // With FC < N it corrupts memory: at ctx=16384 the pass ends in an illegal memory access that
+    // kills the decode graph right after it, reproducible at chunk 4096/2048 and cleared by
+    // SPARKINFER_PREFILL_I8=0. Rather than enable a path that is not demonstrably correct, run the
+    // chunked pass on the NVFP4/bf16 projections -- measured 2233 pp at 16k against the 79 pp
+    // token-loop fallback. ctx=128 has FC == N, so the scored floor keeps int8 exactly as today.
+    if (!moe && FC < N) {
+        use_i8 = false;
+        use_i8_ffn = false;
+        use_i8_attn = false;
+        use_fp8_gdn = false;
+    }
     // MoE (Qwen3.6): run the attn/GDN projections on the fp8 (e4m3) tensor cores instead of
     // the bf16 wmma GEMM. Default ON again: the #586/#587 prefill_check failures traced to the
     // opt-in MOE_GPU tilemap path's mask dequant silently no-opping (down cols=mffn declines
@@ -298,13 +366,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // A_i8 holds the quantized activation. Dense full-i8: non-FFN projs quantize N rows x K(<=H);
     // chunked FFN quantizes at most FC rows x ffn. Long-ctx selective: N*H if attn-i8/fp8-gdn else FC*ffn.
     // MoE: no chunked FFN; projections quantize N rows x maxAK.
-    const bool wide_a = use_i8 || use_i8_attn || use_fp8_gdn || moe_fp8;
     const bool need_i8 = use_i8 || use_i8_ffn || use_i8_attn || use_fp8_gdn || moe_shared_i8 || moe_fp8;
-    const size_t a_i8_sz = moe ? (size_t)N * maxAK
-                               : (wide_a
-                                  ? (((size_t)N * H > (size_t)FC * ffn) ? (size_t)N * H : (size_t)FC * ffn)
-                                  : (size_t)FC * ffn);
-    const size_t sx_n = (wide_a || moe_shared_i8) ? (size_t)N : (size_t)FC;
+    // Take the max on BOTH dense paths. The int8-projections-off branch used to size against
+    // FC*ffn alone, below the N*H the non-FFN projections quantize once the FFN chunk drops
+    // below N*H/ffn -- a silent overrun rather than an alloc failure. FC is floored above so this
+    // is a no-op in practice; it keeps a hand-set SPARKINFER_PREFILL_FFN_CHUNK from overrunning.
+    const size_t a_i8_dense = ((size_t)N * H > (size_t)FC * ffn) ? (size_t)N * H : (size_t)FC * ffn;
+    const size_t a_i8_sz = moe ? (size_t)N * maxAK : a_i8_dense;
+    // N, not FC: sx is the per-row scale that pairs with A_i8 above, and the same non-FFN
+    // projections write N of them. FC >= the chunk floor makes this equal in practice (FC <= N
+    // always), and it costs N floats to be right when the chunk is small.
+    const size_t sx_n = (size_t)N;
     signed char* A_i8 = need_i8 ? a8.alloc<signed char>(a_i8_sz) : nullptr;
     // k-tiled [k/32][row][32] copy of the int8 activation for Muse's dense prefill GEMM. That
     // kernel stages a 32-byte K slice of all 128 rows per pipeline step; out of the row-major A
@@ -368,6 +440,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         A_i8 = W_i8 = nullptr;
         sx = sw = nullptr;
         sk_p = nullptr;
+        // free_all() above also released the LM-head seed buffers and the split-K partials, which
+        // were taken from THIS arena further up -- those pointers now dangle into freed VRAM, and
+        // the seed argmax at the end of this function writes through the LM-head trio
+        // unconditionally. Re-take them (they are a few KB); the partials are only read on the
+        // int8 path that just turned off, so drop them instead of re-allocating.
+        qb_partials = nullptr;
+        a8.rewind();                       // free_all() clears the buffers but leaves ok=false
+        lm_q8 = a8.alloc<signed char>((size_t)H + 32);
+        lm_ad = a8.alloc<float>((size_t)(H >> 5) + 1);
+        lm_as = a8.alloc<float>((size_t)(H >> 5) + 1);
+        if (!a8.ok) {
+            a.free_all(); a8.free_all();
+            fprintf(stderr, "[prefill] lm-head seed scratch alloc failed (ctx=%d) -> fallback\n", N);
+            return -1;
+        }
     }
     const bool mg_sk = sk_p != nullptr;
 
@@ -991,8 +1078,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 // / NoPE on global layers, bf16 append -- the same KV a forward_token decode writes via
                 // launch_rmsnorm + launch_rope_kv_append_normal / launch_kv_append. Then pure-window
                 // attention on SWA layers, full causal on global (win_blocks<=0), over the bf16 pool.
-                bf16* kpool_bf = (bf16*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems();
-                bf16* vpool_bf = (bf16*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems();
+                bf16* kpool_bf = (bf16*)s.kv->k_pool() + s.kv->layer_base_elems(L);
+                bf16* vpool_bf = (bf16*)s.kv->v_pool() + s.kv->layer_base_elems(L);
                 const int muse_rot = w.swa ? c.head_dim : 0;      // SWA = full NORMAL rope; global = NoPE
                 kernels::launch_prefill_qknorm_ropenorm_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
                     kpool_bf, vpool_bf, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
@@ -1001,10 +1088,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, btable, att,
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks, st);
             } else {
-                signed char* kpool = (signed char*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-                signed char* vpool = (signed char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-                void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
-                void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+                signed char* kpool = (signed char*)s.kv->k_pool() + s.kv->layer_base_elems(L) * kv_elem;
+                signed char* vpool = (signed char*)s.kv->v_pool() + s.kv->layer_base_elems(L) * kv_elem;
+                void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
+                void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
                 // bf16 KV: batched prefill used to decline here, which sent Qwen3.8's prefill@128
                 // down the sequential per-token path (88.0 tok/s, barely above its own 84.2 tok/s
                 // decode, because that path re-streams every weight once per position). The bf16
@@ -2199,13 +2286,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }
             if (!supported || !w.q_has_gate) break;
             char* kp = static_cast<char*>(s.kv->k_pool()) +
-                       (size_t)L * s.kv->layer_stride_elems() * kv_elem;
+                       s.kv->layer_base_elems(L) * kv_elem;
             char* vp = static_cast<char*>(s.kv->v_pool()) +
-                       (size_t)L * s.kv->layer_stride_elems() * kv_elem;
+                       s.kv->layer_base_elems(L) * kv_elem;
             char* ks = kv8 ? static_cast<char*>(s.kv->k_scale_pool()) +
-                             (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+                             s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
-                             (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+                             s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             if (kv8) {
                 kernels::launch_dflash_qknorm_rope_kv_partial_int8_gated(
                     b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btable, pos,
