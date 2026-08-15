@@ -922,6 +922,143 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
     }
 }
 
+// Same NeoX / partial-RoPE as pf_qknorm_rope_kv_int8_kernel, writing bf16 K/V.
+// Qwen3.8-27B's scored ctx=128 bench keeps a bf16 cache (int8 KV only at
+// ctx>=4096); without this path batched prefill bails and the NVFP4 FFN never
+// runs on the metric the eval bot actually times.
+__global__ void pf_qknorm_rope_kv_bf16_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    const int* __restrict__ block_table,
+    int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
+    int block_size, int max_blocks_per_seq) {
+    const int tok  = blockIdx.x;
+    const int unit = blockIdx.y;
+    const int t    = threadIdx.x;
+    const int rhalf = rotary_dim >> 1;
+    const int pos   = tok;
+    const int blk   = pos / block_size, within = pos % block_size;
+    const int phys  = block_table[blk];
+    const size_t ctok = (size_t)phys * block_size + within;
+
+    extern __shared__ float s_h[];
+    __shared__ float s_warp[32];
+
+    if (unit < n_q_heads) {
+        const size_t base = ((size_t)tok * n_q_heads + unit) * head_dim;
+        const float xv = pf_to_f(q[base + t]);
+        float ss = xv * xv;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+        if ((t & 31) == 0) s_warp[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (head_dim + 31) / 32) ? s_warp[t] : 0.f;
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) vv += __shfl_xor_sync(0xffffffff, vv, m);
+            if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+        }
+        __syncthreads();
+        s_h[t] = pf_to_f(__float2bfloat16(xv * s_warp[0] * pf_to_f(q_w[t])));
+        __syncthreads();
+        if (t < rhalf) {
+            const float freq = __powf(theta, -2.f * (float)t / (float)rotary_dim);
+            const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+            const float x0 = s_h[t], x1 = s_h[t + rhalf];
+            s_h[t]         = pf_to_f(__float2bfloat16(x0 * c - x1 * s));
+            s_h[t + rhalf] = pf_to_f(__float2bfloat16(x1 * c + x0 * s));
+        }
+        __syncthreads();
+        if (t < head_dim) q[base + t] = __float2bfloat16(s_h[t]);
+        return;
+    }
+
+    const bool is_k = unit < n_q_heads + n_kv_heads;
+    const int  hh   = is_k ? (unit - n_q_heads) : (unit - n_q_heads - n_kv_heads);
+    const size_t base = ((size_t)tok * n_kv_heads + hh) * head_dim;
+    const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+
+    float val;
+    if (is_k) {
+        const float xv = pf_to_f(k[base + t]);
+        float ss = xv * xv;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+        if ((t & 31) == 0) s_warp[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (head_dim + 31) / 32) ? s_warp[t] : 0.f;
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) vv += __shfl_xor_sync(0xffffffff, vv, m);
+            if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+        }
+        __syncthreads();
+        s_h[t] = pf_to_f(__float2bfloat16(xv * s_warp[0] * pf_to_f(k_w[t])));
+        __syncthreads();
+        if (t < rotary_dim) {
+            const int i = (t < rhalf) ? t : (t - rhalf);
+            const float freq = __powf(theta, -2.f * (float)i / (float)rotary_dim);
+            const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+            const float x0 = s_h[i], x1 = s_h[i + rhalf];
+            val = (t < rhalf) ? (x0 * c - x1 * s) : (x1 * c + x0 * s);
+        } else {
+            val = s_h[t];
+        }
+    } else {
+        val = pf_to_f(v[base + t]);
+    }
+    if (is_k) k_pool[dst + t] = __float2bfloat16(val);
+    else      v_pool[dst + t] = __float2bfloat16(val);
+}
+
+template <int HEAD_DIM>
+__global__ void pf_attn_bf16_paged_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
+    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int block_size, int max_blocks_per_seq, float scale) {
+    constexpr int ELEMS = HEAD_DIM / 32;
+    const int head = blockIdx.y;
+    const int qtok = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (head >= n_q_heads || qtok >= n_tokens) return;
+    const int kv_head = head / (n_q_heads / n_kv_heads);
+
+    const size_t q_off = ((size_t)qtok * n_q_heads + head) * HEAD_DIM;
+    float q_reg[ELEMS];
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) q_reg[e] = pf_to_f(q[q_off + lane + e * 32]);
+
+    float m = -1e30f, l = 0.f, acc[ELEMS];
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
+
+    for (int kpos = 0; kpos <= qtok; kpos++) {
+        const int blk = kpos / block_size, within = kpos % block_size;
+        const int phys = block_table[blk];
+        const size_t ckt = ((size_t)phys * block_size + within);
+        const size_t kv_off = (ckt * n_kv_heads + kv_head) * HEAD_DIM;
+        float partial = 0.f;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++)
+            partial += q_reg[e] * pf_to_f(k_pool[kv_off + lane + e * 32]);
+        const float score = pf_wsum(partial) * scale;
+
+        const float m_new = fmaxf(m, score);
+        const float corr  = __expf(m - m_new);
+        const float p     = __expf(score - m_new);
+        l = l * corr + p;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++)
+            acc[e] = acc[e] * corr + p * pf_to_f(v_pool[kv_off + lane + e * 32]);
+        m = m_new;
+    }
+    const float inv = (l > 0.f) ? (1.f / l) : 0.f;
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) attn[q_off + lane + e * 32] = __float2bfloat16(acc[e] * inv);
+}
+
 // ============================================================================
 // Muse Glimmer full-attention prefill: QK-norm + NORMAL RoPE (consecutive-pair,
 // LLAMA_ROPE_TYPE_NORM) + BF16 KV write into the single-sequence paged pool. The
@@ -1323,6 +1460,37 @@ void launch_prefill_attn_int8_paged(
         pf_attn_int8_paged_kernel<256><<<grid, 32, 0, stream>>>(
             qb, k_pool, v_pool, ks, vs, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
             block_size, max_blocks_per_seq, scale);
+}
+
+void launch_prefill_qknorm_rope_kv_bf16(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool,
+    const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
+    cudaStream_t stream) {
+    dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);
+    const size_t shmem = (size_t)head_dim * sizeof(float);
+    pf_qknorm_rope_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+        reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
+        block_size, max_blocks_per_seq);
+}
+
+void launch_prefill_attn_bf16_paged(
+    const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    dim3 grid(n_tokens, n_q_heads);
+    if (head_dim == 256)
+        pf_attn_bf16_paged_kernel<256><<<grid, 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q),
+            reinterpret_cast<const __nv_bfloat16*>(k_pool),
+            reinterpret_cast<const __nv_bfloat16*>(v_pool),
+            block_table, reinterpret_cast<__nv_bfloat16*>(attn),
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale);
 }
 
 } // namespace kernels
