@@ -509,6 +509,105 @@ __global__ void gemv_fp8_kernel(const __nv_bfloat16* __restrict__ x,
 #ifndef _MSC_VER
 template __global__ void gemv_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 #endif
+
+// ---- compressed-tensors NVFP4 (E2M1 + UE4M3 block-16 + F32 global) on-read GEMV --
+// Payload: [256 B header | ue4m3 scale[N*(K/16)] | packed u8[N*(K/2)]].
+// One scale group = 16 weights = 8 packed bytes. LUTs stay in registers --
+// __constant__ + cudaMemcpyToSymbol is unsafe from this static lib's .so link.
+__device__ __forceinline__ float si_e2m1(unsigned nibble) {
+    const float t[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+                         -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+    return t[nibble & 15u];
+}
+__device__ __forceinline__ float si_ue4m3(unsigned b) {
+    const int e = (int)((b >> 3) & 15u);
+    const int m = (int)(b & 7u);
+    if (e == 0) return ldexpf((float)m, -9);
+    return ldexpf(8.f + (float)m, e - 10);
+}
+__device__ __forceinline__ float si_nvfp4_group_dot(const unsigned char* packed8,
+                                                    unsigned char scale, float inv_g,
+                                                    const __nv_bfloat16* x16) {
+    const float s = si_ue4m3(scale) * inv_g;
+    const unsigned int p0 = __ldg(reinterpret_cast<const unsigned int*>(packed8));
+    const unsigned int p1 = __ldg(reinterpret_cast<const unsigned int*>(packed8 + 4));
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x16);
+    float acc = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p0 >> (8 * i)) & 255u;
+        const float2 xf = __bfloat1622float2(x2[i]);
+        acc += (si_e2m1(b & 15u) * s) * xf.x + (si_e2m1(b >> 4) * s) * xf.y;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p1 >> (8 * i)) & 255u;
+        const float2 xf = __bfloat1622float2(x2[i + 4]);
+        acc += (si_e2m1(b & 15u) * s) * xf.x + (si_e2m1(b >> 4) * s) * xf.y;
+    }
+    return acc;
+}
+
+template <typename OutT, int S>
+__global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
+                                     const void* __restrict__ packed,
+                                     OutT* __restrict__ y, int N, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float s_part[RPB][S];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n = blockIdx.x * RPB + row_local;
+    float acc = 0.f;
+    if (n < N) {
+        const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
+        const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
+        const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
+        const unsigned char* srow = sf + (size_t)n * (size_t)(K >> 4);
+        const unsigned char* prow = w + (size_t)n * (size_t)(K >> 1);
+        const int ng = K >> 4;
+        for (int g = split * 32 + lane; g < ng; g += S * 32)
+            acc += si_nvfp4_group_dot(prow + (size_t)g * 8, srow[g], inv_g, x + g * 16);
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+        if (lane == 0) s_part[row_local][split] = acc;
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+        float o = s_part[row_local][0];
+        #pragma unroll
+        for (int t = 1; t < S; t++) o += s_part[row_local][t];
+        gemv_write(y + n, o);
+    }
+}
+#ifndef _MSC_VER
+template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 2>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+#endif
+
+template <typename OutT>
+__global__ void gemv_nvfp4_kernel(const __nv_bfloat16* __restrict__ x,
+                                  const void* __restrict__ packed,
+                                  OutT* __restrict__ y, int N, int K) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int n = blockIdx.x * GEMV_WPB + warp;
+    if (n >= N) return;
+    const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
+    const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
+    const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
+    const unsigned char* srow = sf + (size_t)n * (size_t)(K >> 4);
+    const unsigned char* prow = w + (size_t)n * (size_t)(K >> 1);
+    float acc = 0.f;
+    const int ng = K >> 4;
+    for (int g = lane; g < ng; g += 32)
+        acc += si_nvfp4_group_dot(prow + (size_t)g * 8, srow[g], inv_g, x + g * 16);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+    if (lane == 0) gemv_write(y + n, acc);
+}
+#ifndef _MSC_VER
+template __global__ void gemv_nvfp4_kernel<__nv_bfloat16>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+#endif
 // ---- faithful llama.cpp int8 MMVQ for a dense Q4_K [N,K] GEMV --------------------
 // Quantizes the activation to Q8_1 (int8 + per-32 scale + sum) once per token, then
 // dp4a's the Q4_K weight nibbles against it — the same vec_dot_q4_K_q8_1 math llama.cpp
@@ -2049,8 +2148,30 @@ void launch_gemv_fp8(const void* x, const void* W, void* y, int N, int K, cudaSt
     gemv_fp8_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
 }
 
+void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K, cudaStream_t stream) {
+    if (!x || !W || !y || N < 1 || K < 1 || (K & 15)) return;
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+    auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
+    if (gemv_bf16_splitk()) {
+        if (N >= 8192) {
+            constexpr int S = 2, RPB = GEMV_WPB / S;
+            gemv_nvfp4_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+        } else if (N >= 4096) {
+            constexpr int S = 4, RPB = GEMV_WPB / S;
+            gemv_nvfp4_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+        } else {
+            constexpr int S = 8, RPB = GEMV_WPB / S;
+            gemv_nvfp4_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+        }
+        return;
+    }
+    dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
+    gemv_nvfp4_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+}
+
 void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int K, cudaStream_t stream) {
     if (wtype == SI_QTYPE_FP8) { launch_gemv_fp8(x, W, y, N, K, stream); return; }
+    if (wtype == SI_QTYPE_NVFP4) { launch_gemv_nvfp4(x, W, y, N, K, stream); return; }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     if (gemv_mmvq() && wtype == 12) {   // faithful int8 dp4a (Q4_K)
         size_t sm = 2 * (size_t)(K >> 5) * sizeof(float) + (size_t)K;

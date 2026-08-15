@@ -28,6 +28,15 @@ bool launch_prefill_nvfp4_quant_b(const void* src_bf16, void* dst_fp4, void* dst
 bool launch_prefill_nvfp4_gemm(const void* a_fp4, const void* sfa,
                                const void* b_fp4, const void* sfb,
                                void* d_bf16, int m, int n, int k,
-                               void* workspace, cudaStream_t stream = nullptr);
+                               void* workspace, cudaStream_t stream = nullptr,
+                               float alpha = 1.f);
+
+// Scatter a compressed-tensors row-major UE4M3 scale [n, k/16] into the CUTLASS
+// SFB layout launch_prefill_nvfp4_gemm expects for B. Packed E2M1 bytes are
+// already the same nibble order as launch_prefill_nvfp4_quant_b, so they are
+// used as-is. The checkpoint's tensor-wide global_scale is applied as GEMM
+// alpha (1/global_scale), not folded into these UE4M3 bytes.
+bool launch_ct_nvfp4_pack_sfb(const void* scale_rowmajor, void* sfb,
+                              int n, int k, cudaStream_t stream = nullptr);
 
 } // namespace sparkinfer::kernels

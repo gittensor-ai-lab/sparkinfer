@@ -25,4 +25,15 @@ static constexpr int SI_QTYPE_Q3A = 112;   // == the block size in bytes, per 25
 // 108 is unused as a ggml type id (ggml's 108 is not a weight format we ship).
 static constexpr int SI_QTYPE_FP8 = 108;
 
+// Compressed-tensors NVFP4 (E2M1, block 16) kept native. Payload is
+//   [256 B header: f32 global_scale at byte 0 |
+//    ue4m3 scale[N*(K/16)] |
+//    packed u8[N*(K/2)]]
+// The 256-byte header keeps the packed region 256-aligned for CUTLASS TMA.
+// Dequant matches launch_ct_dequant_nvfp4:
+//   W[r,c] = e2m1(nibble) * ue4m3(scale[r,c/16]) / global_scale.
+// 109 is unused as a ggml type id.
+static constexpr int SI_QTYPE_NVFP4 = 109;
+static constexpr int SI_NVFP4_HDR = 256;
+
 }} // namespace sparkinfer::kernels

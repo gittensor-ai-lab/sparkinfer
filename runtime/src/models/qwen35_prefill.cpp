@@ -383,9 +383,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // function (qkv-fusion, wo-fusion, sandwich norm) -- those are structurally specific to
     // Muse's own tensor layout (a separate wgate tensor; Qwen3.8-27B fuses its gate into Q's
     // projection width instead) and don't apply here.
-    const bool q38_nvfp4 = c.dense_ffn && !c.muse_glimmer && N == 128 && !s.w.layers.empty() &&
-                           s.w.layers[0].gate_fp4 &&
-                           kernels::prefill_nvfp4_supported(N, ffn, H);
+    // Muse keeps N==128 (its scored shape). Qwen3.8 batched prefill only runs at ctx>=4096
+    // (int8 KV), so pinning this to N==128 meant the native gate/up NVFP4 GEMM never fired
+    // on the path the bench actually times. CUTLASS accepts any m%8==0, n/k%128==0 — 4k x
+    // 17408 x 5120 qualifies. SPARKINFER_Q38_NVFP4=0 restores the int8/bf16 FFN.
+    const bool q38_nvfp4 = [&] {
+        if (!c.dense_ffn || c.muse_glimmer || s.w.layers.empty() || !s.w.layers[0].gate_fp4)
+            return false;
+        if (!kernels::prefill_nvfp4_supported(N, ffn, H)) return false;
+        const char* e = getenv("SPARKINFER_Q38_NVFP4");
+        return !(e && e[0] == '0');
+    }();
     const bool gu_nvfp4 = muse_nvfp4 || q38_nvfp4;
     const size_t fp4_a_data_bytes = gu_nvfp4
         ? kernels::prefill_nvfp4_data_bytes(N, H) : 0;
@@ -408,7 +416,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         ? kernels::prefill_nvfp4_workspace_bytes(N, H, qdim) : 0;
     const bool muse_nvfp4_down = muse_nvfp4 && s.w.layers[0].down_fp4 &&
                                  kernels::prefill_nvfp4_supported(N, H, ffn);
-    const size_t fp4_ws_down = muse_nvfp4_down
+    const bool q38_nvfp4_down = q38_nvfp4 && s.w.layers[0].down_fp4 &&
+                                kernels::prefill_nvfp4_supported(N, H, ffn);
+    const bool nvfp4_down = muse_nvfp4_down || q38_nvfp4_down;
+    const size_t fp4_ws_down = nvfp4_down
         ? kernels::prefill_nvfp4_workspace_bytes(N, H, ffn) : 0;
     size_t fp4_ws_bytes = (fp4_ws_qkv > fp4_ws_gu) ? fp4_ws_qkv : fp4_ws_gu;
     if (fp4_ws_wo > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_wo;
@@ -417,9 +428,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     unsigned char* fp4_as = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
     unsigned char* fp4_ws = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
     bf16* fp4_qkv = muse_nvfp4_qkv ? a8.alloc<bf16>((size_t)N * qkvg_n) : nullptr;
-    unsigned char* fp4_down_a = muse_nvfp4_down
+    unsigned char* fp4_down_a = nvfp4_down
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, ffn)) : nullptr;
-    unsigned char* fp4_down_as = muse_nvfp4_down
+    unsigned char* fp4_down_as = nvfp4_down
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N, ffn)) : nullptr;
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
@@ -1046,21 +1057,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
-                const bool layer_fp4 = gu_nvfp4 && fn == 128 && w.gate_fp4 && w.gate_fp4_sf &&
+                const bool layer_fp4 = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
                     w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
+                    kernels::prefill_nvfp4_supported(fn, ffn, H) &&
                     kernels::launch_prefill_nvfp4_quant_a(hn_c, fp4_a, fp4_as, fn, H, st) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.gate_fp4, w.gate_fp4_sf,
-                                                       ffg, fn, ffn, H, fp4_ws, st) &&
+                                                       ffg, fn, ffn, H, fp4_ws, st,
+                                                       w.gate_fp4_alpha) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.up_fp4, w.up_fp4_sf,
-                                                       ffu, fn, ffn, H, fp4_ws, st);
+                                                       ffu, fn, ffn, H, fp4_ws, st,
+                                                       w.up_fp4_alpha);
                 if (layer_fp4) {
-                    const bool down_fp4_done = muse_nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
+                    const bool down_fp4_done = nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
                         fp4_down_a && fp4_down_as &&
                         kernels::launch_prefill_nvfp4_swiglu_quant_a(
                             ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st) &&
                         kernels::launch_prefill_nvfp4_gemm(
                             fp4_down_a, fp4_down_as, w.down_fp4, w.down_fp4_sf,
-                            ao + (size_t)fo * H, fn, H, ffn, fp4_ws, st);
+                            ao + (size_t)fo * H, fn, H, ffn, fp4_ws, st,
+                            w.down_fp4_alpha);
                     if (!down_fp4_done) {
                         kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
                         proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,

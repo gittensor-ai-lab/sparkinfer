@@ -299,14 +299,14 @@ __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
 
 template <class C = Wide>
 typename C::Gemm::Arguments args(const void* a, const void* sa, const void* b, const void* sb,
-                                 void* d, int m, int n, int k) {
+                                 void* d, int m, int n, int k, float alpha = 1.f) {
     auto as = cutlass::make_cute_packed_stride(StrideA{}, {m,k,1});
     auto bs = cutlass::make_cute_packed_stride(StrideB{}, {n,k,1});
     auto cs = cutlass::make_cute_packed_stride(StrideC{}, {m,n,1});
     auto ds = cutlass::make_cute_packed_stride(StrideD{}, {m,n,1});
     return {cutlass::gemm::GemmUniversalMode::kGemm, shape(m,n,k),
             {static_cast<const cutlass::float_e2m1_t*>(a), as, static_cast<const cutlass::float_e2m1_t*>(b), bs, static_cast<const cutlass::float_ue4m3_t*>(sa), sfa_layout(m,n,k), static_cast<const cutlass::float_ue4m3_t*>(sb), sfb_layout(m,n,k)},
-            {{1.f, 0.f}, static_cast<const BF*>(nullptr), cs, static_cast<BF*>(d), ds}};
+            {{alpha, 0.f}, static_cast<const BF*>(nullptr), cs, static_cast<BF*>(d), ds}};
 }
 
 int sm_count() {
@@ -345,9 +345,9 @@ bool prefer_narrow(int m, int n) {
 
 template <class C>
 bool run_gemm(const void* a, const void* sa, const void* b, const void* sb,
-              void* d, int m, int n, int k, void* ws, cudaStream_t st) {
+              void* d, int m, int n, int k, void* ws, cudaStream_t st, float alpha) {
     typename C::Gemm gemm;
-    auto ar = args<C>(a, sa, b, sb, d, m, n, k);
+    auto ar = args<C>(a, sa, b, sb, d, m, n, k, alpha);
     return gemm.can_implement(ar) == cutlass::Status::kSuccess &&
            gemm.initialize(ar, ws, st) == cutlass::Status::kSuccess &&
            gemm.run(st) == cutlass::Status::kSuccess;
@@ -412,7 +412,7 @@ bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const void* sb,
-                               void* d,int m,int n,int k,void* ws,cudaStream_t st) {
+                               void* d,int m,int n,int k,void* ws,cudaStream_t st, float alpha) {
     if (!a||!sa||!b||!sb||!d||!prefill_nvfp4_supported(m,n,k)) return false;
     // Default ON; SPARKINFER_NVFP4_EVICT_FIRST=0 restores CUTLASS's stock loads for A/B.
     static const bool ef = [] {
@@ -420,10 +420,10 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
         return !e || atoi(e) != 0;
     }();
     if (ef)
-        return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st)
-                                  : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st);
-    return prefer_narrow(m,n) ? run_gemm<Narrow>(a,sa,b,sb,d,m,n,k,ws,st)
-                              : run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st);
+        return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha)
+                                  : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha);
+    return prefer_narrow(m,n) ? run_gemm<Narrow>(a,sa,b,sb,d,m,n,k,ws,st,alpha)
+                              : run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st,alpha);
 }
 
 // ---- HuggingFace "compressed-tensors" NVFP4 checkpoint dequant (load-time, one-shot) ----
@@ -466,6 +466,34 @@ void launch_ct_dequant_nvfp4(const void* packed_u8, const void* group_scale_ue4m
         reinterpret_cast<const unsigned char*>(packed_u8),
         reinterpret_cast<const unsigned char*>(group_scale_ue4m3), global_scale,
         reinterpret_cast<__nv_bfloat16*>(out_bf16), rows, cols);
+}
+
+template <class Layout>
+__global__ void pack_sfb_rows(const unsigned char* __restrict__ src,
+                              cutlass::float_ue4m3_t* sf, int rows, int cols,
+                              Layout layout) {
+    const int vpr = cols / 16;
+    const int total = rows * vpr;
+    for (int g = (int)(blockIdx.x * blockDim.x + threadIdx.x); g < total;
+         g += (int)(gridDim.x * blockDim.x)) {
+        const int row = g / vpr, k0 = (g - row * vpr) * 16;
+        auto scales = cute::make_tensor(sf, layout);
+        scales(row, k0, 0) = cutlass::float_ue4m3_t::bitcast(src[g]);
+    }
+}
+
+bool launch_ct_nvfp4_pack_sfb(const void* scale_rowmajor, void* sfb,
+                              int n, int k, cudaStream_t st) {
+    if (!scale_rowmajor || !sfb || !prefill_nvfp4_supported(128, n, k)) return false;
+    const size_t bytes = prefill_nvfp4_scale_bytes_b(n, k);
+    if (bytes && cudaMemsetAsync(sfb, 0, bytes, st) != cudaSuccess) return false;
+    auto l = sfb_layout(128, n, k);
+    int blocks = (n * (k / 16) + 255) / 256;
+    if (blocks > 4096) blocks = 4096;
+    pack_sfb_rows<<<blocks, 256, 0, st>>>(
+        reinterpret_cast<const unsigned char*>(scale_rowmajor),
+        reinterpret_cast<cutlass::float_ue4m3_t*>(sfb), n, k, l);
+    return cudaPeekAtLastError() == cudaSuccess;
 }
 
 } // namespace sparkinfer::kernels

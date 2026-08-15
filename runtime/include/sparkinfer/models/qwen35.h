@@ -84,6 +84,9 @@ struct Qwen35LayerWeights {
     // unsupported shapes continue to use the GGUF-native pointers above.
     const void* gate_fp4 = nullptr; const void* gate_fp4_sf = nullptr;
     const void* up_fp4 = nullptr;   const void* up_fp4_sf = nullptr;
+    // 1/weight_global_scale for checkpoint-native NVFP4 B operands. Muse's
+    // from-bf16 quant_b copies leave this at 1 (global already folded into UE4M3).
+    float gate_fp4_alpha = 1.f, up_fp4_alpha = 1.f, down_fp4_alpha = 1.f;
     // q | attn_gate | k | v stacked into ONE [2*qdim + 2*kvdim, H] FP4 operand. They all project
     // the same `xn` and the batched prefill already runs them as a single grouped GEMM to keep the
     // grid full, so the FP4 form has to stay grouped too -- as four separate GEMMs at m=128 the
@@ -96,8 +99,9 @@ struct Qwen35LayerWeights {
     // null to preserve KV and batched-prefill scratch headroom on 32-GB cards.
     const void* down_fp4 = nullptr; const void* down_fp4_sf = nullptr;
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
-    // 14=Q6_K, 8=Q8_0) or SI_QTYPE_FP8 (108) -> weights kept quantized in VRAM,
-    // decoded on-read by launch_gemv_q / launch_gemv_fp8.
+    // 14=Q6_K, 8=Q8_0) or SI_QTYPE_FP8 (108) / SI_QTYPE_NVFP4 (109) -> weights kept
+    // quantized in VRAM, decoded on-read by launch_gemv_q / launch_gemv_fp8 /
+    // launch_gemv_nvfp4.
     int wq_type = 0, wgate_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;
     int wqkv_type = 0, wqkv_gate_type = 0, ssm_beta_type = 0, ssm_alpha_type = 0, ssm_out_type = 0;
     int shared_gate_inp_type = 0;

@@ -70,6 +70,13 @@ void launch_gemv_q_f32(const void* x, const void* W, int wtype, float* y, int N,
 void launch_gemv_fp8(const void* x, const void* W, void* y, int N, int K,
                      cudaStream_t stream = nullptr);
 
+// Compressed-tensors NVFP4 on-read GEMV. W is the SI_QTYPE_NVFP4 payload
+// [256 B header with f32 global_scale | ue4m3 scale[N*(K/16)] | packed u8[N*(K/2)]].
+// Dequant matches launch_ct_dequant_nvfp4 then a bf16 GEMV: each weight is rounded
+// to bf16(e2m1 * ue4m3 / global_scale) before the dot. K must be a multiple of 16.
+void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K,
+                       cudaStream_t stream = nullptr);
+
 // Pre-quantized Q8_1 activation path: quantize x[K] ONCE (q8 int8 [K], ad/as [K/32]),
 // then run Q4_K dp4a GEMVs that read it — kills the per-block re-quantization that the
 // in-kernel dp4a path repeats N/8 times (and per GEMV). Output is bit-exact vs that path.

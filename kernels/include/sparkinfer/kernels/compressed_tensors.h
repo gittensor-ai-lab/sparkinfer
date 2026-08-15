@@ -3,8 +3,9 @@
 
 // HuggingFace "compressed-tensors" checkpoints (NVIDIA ModelOpt / llm-compressor --
 // e.g. unsloth/Qwen3.8-27B-NVFP4). Two consumers:
-//   - load-time dequant to bf16, then the same Q4_K / NVFP4 requant pipeline load_gguf() uses
+//   - load-time dequant to bf16, then the same Q4_K requant pipeline load_gguf() uses (FP8 FFN)
 //   - decode GEMV that keeps checkpoint FP8 native (SI_QTYPE_FP8 packed payload; launch_gemv_fp8)
+//   - decode GEMV / prefill GEMM that keep checkpoint NVFP4 native (SI_QTYPE_NVFP4; launch_gemv_nvfp4)
 
 namespace sparkinfer { namespace kernels {
 
