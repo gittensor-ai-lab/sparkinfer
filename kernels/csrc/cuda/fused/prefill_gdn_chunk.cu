@@ -654,27 +654,32 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     // onto the sequential scan. A segment boundary on a multiple of C is the same
     // as a chunk boundary once the scan reloads S, so the sequence is processed
     // in slices whose workspace fits. ctx=128 still takes the one-shot path.
+    //
+    // Size the slice by probing cudaMalloc, not cudaMemGetInfo. After a failed
+    // 483 MB grow the allocator reported 37 MB free and a 32 MB margin left
+    // 192-token slices (85 launches/layer). A 1024-token workspace is ~30 MB
+    // and allocates; each doubling cuts the launch count in half.
     const size_t total = gdnc_workspace_bytes(n_tokens, v_heads, C, HD);
     if (ws_reserve(total))
         return run_slice(qb, kb, vb, ab, bb, ob, n_tokens, 0);
     cudaGetLastError();   // clear the failed grow so later peek/getinfo are clean
 
-    const size_t per_tok = (size_t)v_heads *
-        (sizeof(float) + (size_t)C * sizeof(float) + (size_t)2 * HD * sizeof(__nv_bfloat16));
-    size_t free_b = 0, tot_b = 0;
-    if (cudaMemGetInfo(&free_b, &tot_b) != cudaSuccess) return false;
-    const size_t margin = (size_t)32 << 20;
-    const size_t avail = (free_b > margin) ? (free_b - margin) : 0;
-    size_t seg = per_tok ? (avail / per_tok) : 0;
-    seg -= seg % (size_t)C;
-    if (seg < (size_t)C) return false;
-    if (seg > (size_t)n_tokens) seg = (size_t)n_tokens;
+    int seg = 0;
+    for (int cand = n_tokens >> 1; cand >= C; cand >>= 1) {
+        cand -= cand % C;
+        if (cand < C) break;
+        if (ws_reserve(gdnc_workspace_bytes(cand, v_heads, C, HD))) {
+            seg = cand;
+            break;
+        }
+        cudaGetLastError();
+    }
+    if (seg < C) return false;
 
     static int once_seg = 0;
     if (!once_seg) {
-        fprintf(stderr, "[gdn-chunk] workspace %zu MB does not fit; %d-token segments (ctx=%d, free=%zu MB)\n",
-                gdnc_workspace_bytes(n_tokens, v_heads, C, HD) >> 20,
-                (int)seg, n_tokens, free_b >> 20);
+        fprintf(stderr, "[gdn-chunk] workspace %zu MB does not fit; %d-token segments (ctx=%d)\n",
+                total >> 20, seg, n_tokens);
         once_seg = 1;
     }
 
