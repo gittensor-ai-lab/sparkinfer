@@ -4537,26 +4537,6 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     // batched prefill otherwise dequantizes the FP8 originals to bf16 EVERY PASS and runs the
     // naive bf16 GEMM. VRAM-preflighted; SPARKINFER_Q38_NVFP4_GDN=0 disables the FP4 copies
     // (the FP8-direct mode below needs no copies at all).
-    bool gdn_fp4_on = [&] {
-        const char* e = getenv("SPARKINFER_Q38_NVFP4_GDN");
-        if (e && e[0] == '0') return false;
-        const size_t per =
-            kernels::prefill_nvfp4_data_bytes(s.linear_qkvdim, H) +
-            kernels::prefill_nvfp4_scale_bytes_b(s.linear_qkvdim, H) +
-            kernels::prefill_nvfp4_data_bytes((long)c.linear_v_heads * c.linear_head_dim, H) +
-            kernels::prefill_nvfp4_scale_bytes_b((long)c.linear_v_heads * c.linear_head_dim, H);
-        const size_t need = per * (size_t)(c.n_layers * 3 / 4 + 1);   // ~48 of 64 are linear
-        size_t freeb = 0, totb = 0;
-        if (cudaMemGetInfo(&freeb, &totb) != cudaSuccess) return false;
-        const char* r = getenv("SPARKINFER_Q38_NVFP4_GDN_RESERVE_MB");
-        const size_t reserve = ((size_t)(r ? atol(r) : 3072)) << 20;
-        if (freeb < need + reserve) {
-            fprintf(stderr, "[compressed-tensors] GDN NVFP4 declined: need %.2f GB\n",
-                    (double)need / 1e9);
-            return false;
-        }
-        return true;
-    }();
     int gdnq_ready = 0, gdnz_ready = 0;
 
     // embed_tokens: HF embedding tables are already [vocab,hidden] (not a Linear layer), no
@@ -4627,21 +4607,9 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
                     ? static_cast<const char*>(w.wqkv_gate) + rz * 2 : nullptr;
                 if (w.wqkv_fp8_w && w.z_fp8_w) ++gdnq_ready, ++gdnz_ready;
             }
-            if (gdn_mode == "fp4" && gdn_fp4_on) {
-                void* qb16 = dequant_fp8(lb + "in_proj_qkv", s.linear_qkvdim, H);
-                if (qb16) {
-                    if (quantize_nvfp4_prefill(qb16, s.linear_qkvdim, H,
-                                               &w.wqkv_fp4, &w.wqkv_fp4_sf)) ++gdnq_ready;
-                    cudaFree(qb16);
-                }
-                void* zb16 = dequant_fp8(lb + "in_proj_z",
-                                         c.linear_v_heads * c.linear_head_dim, H);
-                if (zb16) {
-                    if (quantize_nvfp4_prefill(zb16, c.linear_v_heads * c.linear_head_dim, H,
-                                               &w.z_fp4, &w.z_fp4_sf)) ++gdnz_ready;
-                    cudaFree(zb16);
-                }
-            }
+            // (An earlier FP4-copy mode for these projections was dropped: #837 removed the
+            // from-bf16 NVFP4 quantize helper it depended on, and the FP8-direct form above is
+            // both cheaper -- no copies at all -- and numerically exact on the weight side.)
             w.ssm_out = keep_fp8(lb + "out_proj", H, s.linear_vdim, w.ssm_out_type);
             // Small, checkpoint-unquantized tensors -- plain bf16, NO transpose. conv1d's raw HF
             // layout [qkvdim,1,conv_kernel] (=[qkvdim,conv_kernel] squeezed) already matches
