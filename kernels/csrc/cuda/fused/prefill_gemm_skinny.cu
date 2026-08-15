@@ -34,6 +34,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
 #include <mma.h>
 
 #include <cstdlib>
@@ -45,6 +46,12 @@ namespace {
 
 constexpr int SK_PAD = 8;    // break the power-of-two smem row stride
 
+// 16-byte cp.async when in-bounds, zero-fill otherwise. Same helper pf_gemm_kernel uses.
+__device__ __forceinline__ void sk_cp16(void* dst, const void* src, bool pred) {
+    if (pred) __pipeline_memcpy_async(dst, src, 16);
+    else      *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
+}
+
 // One block per BT-row strip; NMAX output columns held at once; K streamed KT at a time.
 // WARPS warps, each owning one 16x16 wmma accumulator tile of the [BT, NMAX] output.
 template <int BT, int NMAX, int KT, int WARPS>
@@ -52,8 +59,10 @@ __global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_kernel(
         const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ W,
         __nv_bfloat16* __restrict__ C, int M, int n_out, int K) {
     using namespace nvcuda;
-    __shared__ __nv_bfloat16 sA[BT][KT + SK_PAD];
-    __shared__ __nv_bfloat16 sW[NMAX][KT + SK_PAD];
+    // __align__(16): cp.async and the uint4 zero-fill both need 16B-aligned destinations, and the
+    // padded row stride (KT+SK_PAD elements = 144B) only keeps that if the base is aligned too.
+    __shared__ __align__(16) __nv_bfloat16 sA[2][BT][KT + SK_PAD];
+    __shared__ __align__(16) __nv_bfloat16 sW[2][NMAX][KT + SK_PAD];
     __shared__ float sC[16][16];
 
     const int tid  = threadIdx.x;
@@ -66,33 +75,43 @@ __global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_kernel(
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
     wmma::fill_fragment(cf, 0.f);
 
-    for (int k0 = 0; k0 < K; k0 += KT) {
-        // 16-byte vector staging: 8 bf16 per thread per slot, so a warp moves 512 contiguous bytes.
+    // 16-byte cp.async staging: 8 bf16 per thread per slot, so a warp moves 512 contiguous bytes.
+    // Double-buffered exactly like pf_gemm_kernel -- with only WARPS*32 threads issuing plain
+    // loads, the K loop otherwise pays full global latency on every one of its K/KT trips with no
+    // other warp resident to cover it, which is what left this kernel at 118 us for a 128x48x5120
+    // GEMM whose tensor-core work is a few microseconds.
+    auto stage = [&](int buf, int k0) {
         for (int e = tid; e < (BT * KT) / 8; e += WARPS * 32) {
             const int i = e / (KT / 8), kv = (e % (KT / 8)) * 8;
             const int gm = m0 + i, gk = k0 + kv;
-            const bool ok = gm < M && gk + 7 < K;
-            *reinterpret_cast<uint4*>(&sA[i][kv]) =
-                ok ? *reinterpret_cast<const uint4*>(&A[(size_t)gm * K + gk]) : make_uint4(0, 0, 0, 0);
+            sk_cp16(&sA[buf][i][kv], &A[(size_t)gm * K + gk], gm < M && gk + 7 < K);
         }
         for (int e = tid; e < (NMAX * KT) / 8; e += WARPS * 32) {
             const int j = e / (KT / 8), kv = (e % (KT / 8)) * 8;
             const int gk = k0 + kv;
-            const bool ok = j < n_out && gk + 7 < K;
-            *reinterpret_cast<uint4*>(&sW[j][kv]) =
-                ok ? *reinterpret_cast<const uint4*>(&W[(size_t)j * K + gk]) : make_uint4(0, 0, 0, 0);
+            sk_cp16(&sW[buf][j][kv], &W[(size_t)j * K + gk], j < n_out && gk + 7 < K);
         }
+        __pipeline_commit();
+    };
+
+    const int nk = K / KT;              // launcher guarantees K % KT == 0
+    stage(0, 0);
+    int buf = 0;
+    for (int t = 0; t < nk; t++) {
+        if (t + 1 < nk) stage(buf ^ 1, (t + 1) * KT);
+        __pipeline_wait_prior(t + 1 < nk ? 1 : 0);
         __syncthreads();
 
         #pragma unroll
         for (int kk = 0; kk < KT; kk += 16) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
-            wmma::load_matrix_sync(af, &sA[wm * 16][kk], KT + SK_PAD);
-            wmma::load_matrix_sync(bf, &sW[wn * 16][kk], KT + SK_PAD);   // col_major => W^T
+            wmma::load_matrix_sync(af, &sA[buf][wm * 16][kk], KT + SK_PAD);
+            wmma::load_matrix_sync(bf, &sW[buf][wn * 16][kk], KT + SK_PAD);   // col_major => W^T
             wmma::mma_sync(cf, af, bf, cf);
         }
         __syncthreads();
+        buf ^= 1;
     }
 
     // staged store: one warp at a time reuses sC, then writes bf16 with bounds+n_out masking
@@ -111,10 +130,23 @@ __global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_kernel(
 
 }  // namespace
 
+// One instantiation of the kernel above. n_out is masked inside, so NMAX only has to be the
+// smallest multiple of 16 that covers it -- the padding columns cost tensor-core slots.
+#define SI_SKINNY_LAUNCH(BTV, NMAXV)                                                        \
+    do {                                                                                    \
+        constexpr int BT_ = (BTV), NMAX_ = (NMAXV), W_ = (BT_ / 16) * (NMAX_ / 16);         \
+        static_assert(W_ * 32 <= 1024 && (KT % 16) == 0, "one warp per 16x16 output tile"); \
+        pf_gemm_skinny_kernel<BT_, NMAX_, KT, W_><<<dim3((M + BT_ - 1) / BT_),              \
+                                                    W_ * 32, 0, stream>>>(                  \
+            reinterpret_cast<const __nv_bfloat16*>(A),                                      \
+            reinterpret_cast<const __nv_bfloat16*>(W),                                      \
+            reinterpret_cast<__nv_bfloat16*>(C), M, N, K);                                  \
+        return true;                                                                        \
+    } while (0)
+
 bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
                                 int M, int N, int K, cudaStream_t stream) {
-    constexpr int BT = 32, NMAX = 32, KT = 64, WARPS = (BT / 16) * (NMAX / 16);
-    static_assert(WARPS * 32 <= 1024 && (KT % 16) == 0, "one warp per 16x16 output tile");
+    constexpr int KT = 64, NWIDE = 64;
 
     static const int enabled = [] {
         const char* e = getenv("SPARKINFER_PREFILL_GEMM_SKINNY");
@@ -122,14 +154,38 @@ bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
     }();
     // Only worth it while the 128-wide tile is mostly padding; wider outputs keep the tiled GEMM,
     // which is tensor-core bound and already the right shape for them.
-    if (!enabled || N > NMAX || M <= 0 || K <= 0 || (K % KT) != 0) return false;
+    if (!enabled || N > NWIDE || M <= 0 || K <= 0 || (K % KT) != 0) return false;
 
-    dim3 grid((M + BT - 1) / BT);
-    pf_gemm_skinny_kernel<BT, NMAX, KT, WARPS><<<grid, WARPS * 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A), reinterpret_cast<const __nv_bfloat16*>(W),
-        reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
-    return true;
+    // Qwen3.5 / Muse Glimmer: 32 v-heads, long prompts. Unchanged shape, so unchanged bytes.
+    if (N <= 32) SI_SKINNY_LAUNCH(32, 32);
+
+    // Qwen3.8-27B has 48 v-heads, so its ssm_alpha/ssm_beta are [48,K] -- one column tile too wide
+    // for the NMAX=32 instantiation above, which is why they were still falling through to
+    // pf_gemm_kernel. At the scored ctx=128 that grids to ((48+127)/128, (128+127)/128) = ONE
+    // block: a single SM runs the whole 128x48x5120 GEMM, 96 times per prefill.
+    //
+    // BT stays 32. At M=128 that is only 4 blocks, so widening the grid by halving the row strip
+    // looks like the obvious next move -- it measures WORSE (+5.6% vs +15.0% over the pf_gemm
+    // fallback). Total work is fixed at (M/16)*(NMAX/16) warp tiles of K/16 mma steps whatever the
+    // blocking, and what actually costs time here is the staging: fewer threads per block means
+    // more sequential 16B load rounds per K tile, and the block cannot spare warps to cover them.
+    // SPARKINFER_PREFILL_SKINNY_BT re-runs that A/B.
+    static const int bt_env = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_SKINNY_BT");
+        return e ? atoi(e) : 32;
+    }();
+
+    if (N <= 48) {
+        if (bt_env <= 16) SI_SKINNY_LAUNCH(16, 48);
+        if (bt_env >= 64) SI_SKINNY_LAUNCH(64, 48);
+        SI_SKINNY_LAUNCH(32, 48);
+    }
+    if (bt_env <= 16) SI_SKINNY_LAUNCH(16, 64);
+    if (bt_env >= 64) SI_SKINNY_LAUNCH(64, 64);
+    SI_SKINNY_LAUNCH(32, 64);
 }
+
+#undef SI_SKINNY_LAUNCH
 
 }  // namespace kernels
 }  // namespace sparkinfer

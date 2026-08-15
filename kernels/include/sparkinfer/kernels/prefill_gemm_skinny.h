@@ -25,8 +25,14 @@ namespace kernels {
 // Accumulates in fp32 and emits bf16, exactly like pf_gemm_kernel; only the blocking changes, so
 // the result matches to fp32 reassociation.
 //
+// n_out is masked inside the kernel, so the column tile is only rounded up to a multiple of 16:
+// 32 v-heads (Qwen3.5 / Muse Glimmer) and 48 (Qwen3.8-27B) each get an exact instantiation. 48 sat
+// one tile above the original NMAX=32 cap and so kept falling through to pf_gemm_kernel, which at
+// the scored ctx=128 grids to a single block for the whole 128x48xK GEMM.
+//
 // Env knobs:
 //   SPARKINFER_PREFILL_GEMM_SKINNY  (default 1)  0 disables (A/B) -> falls through to pf_gemm.
+//   SPARKINFER_PREFILL_SKINNY_BT    (16|32|64)   row strip per block, default 32 (A/B knob).
 bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
                                 int M, int N, int K, cudaStream_t stream = nullptr);
 
