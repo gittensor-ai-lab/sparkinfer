@@ -177,13 +177,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     static cudaGraphExec_t g_pfb_exec  = nullptr;
     static int  g_pfb_n = -1, g_pfb_warm_n = -1, g_pfb_pin_cap = 0;
     static int* g_pfb_pin = nullptr;
-    // DEFAULT ON: measured +5.91% on prefill@128, byte-identical output (SCORE_EQ IDENTICAL,
-    // TOP1 16/16). SPARKINFER_MUSE_PREFILL_GRAPH=0 restores eager dispatch.
+    // DEFAULT ON: measured +5.91% on Muse prefill@128, byte-identical output (SCORE_EQ IDENTICAL,
+    // TOP1 16/16). Qwen3.8-27B is the same dense-hybrid launch storm (~20 kernels/layer × 64)
+    // and the same warm-arena capture is legal there — MoE stays off (host tilemaps / events).
+    // SPARKINFER_MUSE_PREFILL_GRAPH=0 restores eager dispatch.
     static const bool graph_env = [] {
         const char* e = getenv("SPARKINFER_MUSE_PREFILL_GRAPH");
         return !(e && e[0] == '0');
     }();
-    const bool graph_on = graph_env && arena_reuse && c.muse_glimmer;
+    const bool graph_on = graph_env && arena_reuse && c.dense_ffn;
     if (graph_on && N > g_pfb_pin_cap) {
         if (g_pfb_pin) cudaFreeHost(g_pfb_pin);
         g_pfb_pin = nullptr; g_pfb_pin_cap = 0;
@@ -959,9 +961,28 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 if (!ink) proj_fused(xn, w.wk,    w.wk_type,    w.wk_rs,    kf, kvdim, H);
                 if (!inv) proj_fused(xn, w.wv,    w.wv_type,    w.wv_rs,    vf, kvdim, H);
             } else {
-                proj_fused(xn, w.wq, w.wq_type, w.wq_rs, b8, wide,  H);  // qraw = [q|gate]
-                proj_fused(xn, w.wk, w.wk_type, w.wk_rs, kf, kvdim, H);
-                proj_fused(xn, w.wv, w.wv_type, w.wv_rs, vf, kvdim, H);
+                // Qwen3.8: [q|gate] is one wide wq, then skinny k/v (8 tiles each). One grouped
+                // launch fills the 5090; four separate ones leave k/v paying a full CTA duration
+                // for 8 blocks. Same kernel as Muse, bit-identical per tile.
+                bool grouped = false;
+                if (use_i8 && w.wq_rs && w.wk_rs && w.wv_rs &&
+                    w.wk_type == w.wq_type && w.wv_type == w.wq_type &&
+                    kernels::pf_dense_gemm_qi8_supported(w.wq_type)) {
+                    const void*  Wa[3]  = { w.wq, w.wk, w.wv };
+                    const float* rsa[3] = { w.wq_rs, w.wk_rs, w.wv_rs };
+                    void*        Ca[3]  = { b8, kf, vf };
+                    const int    na[3]  = { wide, kvdim, kvdim };
+                    quant_a_i8(xn, N, H);
+                    grouped = kernels::launch_prefill_gemm_qi8_dense_group(
+                        w.wq_type, A_i8, sx, Wa, rsa, Ca, na, 3, N, H, st,
+                        qb_partials, QB_SPLITS, qb_partials_cap,
+                        nullptr, nullptr, nullptr, apk());
+                }
+                if (!grouped) {
+                    proj_fused(xn, w.wq, w.wq_type, w.wq_rs, b8, wide,  H);  // qraw = [q|gate]
+                    proj_fused(xn, w.wk, w.wk_type, w.wk_rs, kf, kvdim, H);
+                    proj_fused(xn, w.wv, w.wv_type, w.wv_rs, vf, kvdim, H);
+                }
                 kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
             }
             if (c.muse_glimmer) {
@@ -1152,8 +1173,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     continue;
                 }
                 if (ffn_qi8) {
-                    proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
-                    proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   ffu, ffn, H, fn);
+                    bool gu_grouped = false;
+                    if (gate_pf_type == up_pf_type && w.gate_rs && w.up_rs) {
+                        const void*  Wf[2]  = { gate_pf, up_pf };
+                        const float* rsf[2] = { w.gate_rs, w.up_rs };
+                        void*        Cf[2]  = { ffg, ffu };
+                        const int    nf[2]  = { ffn, ffn };
+                        quant_a_i8(hn_c, fn, H);
+                        gu_grouped = kernels::launch_prefill_gemm_qi8_dense_group(
+                            gate_pf_type, A_i8, sx, Wf, rsf, Cf, nf, 2, fn, H, st,
+                            qb_partials, QB_SPLITS, qb_partials_cap,
+                            nullptr, nullptr, nullptr, apk());
+                    }
+                    if (!gu_grouped) {
+                        proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
+                        proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   ffu, ffn, H, fn);
+                    }
                     a_q = nullptr;
                     a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st,
                                                                    A_i8p) && A_i8p;
