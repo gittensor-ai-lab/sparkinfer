@@ -211,16 +211,31 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         pf_cu(cudaStreamSynchronize(st), "pfb graph sync");
         return *s.h_out_id;
     }
+    // Drop a graph recorded for a different N before the scratch allocs. At ctx=16384 the
+    // ctx=128 graph is ~300 MB and was still resident while the FFN chunk was sized, which
+    // left the first 16k pass ~350 MB tighter than the later ones.
+    if (graph_ok && g_pfb_exec && g_pfb_n != N) {
+        cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr;
+        if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
+        g_pfb_n = -1;
+    }
     pf_vram("entry");
     bf16* x    = a.alloc<bf16>((size_t)N * H);
     bf16* xn   = a.alloc<bf16>((size_t)N * H);
-    bf16* hn   = a.alloc<bf16>((size_t)N * H);
-    bf16* ao   = a.alloc<bf16>((size_t)N * H);
+    // xn (pre-attn RMSNorm) dies at the post-attn residual; hn (pre-FFN RMSNorm) is born
+    // there. They never overlap on the non-sandwich path, so one N*H buffer is enough.
+    // Saves 160 MB at ctx=16384 (H=5120). Muse sandwich keeps both:
+    // its post-attn residual lives in `h`, but decode-faithful sandwich still writes hn
+    // from h while xn is the next layer's input-norm (same buffer would race).
+    bf16* hn   = c.muse_glimmer ? a.alloc<bf16>((size_t)N * H) : xn;
     // Muse Glimmer sandwich norm keeps the post-attention residual stream (h = x + RMSNorm(ao)*
     // post_attn_norm) live across the FFN so the post-FFN sandwich can add onto it; other models
     // fold the residual in place and need no extra buffer.
     bf16* h    = c.muse_glimmer ? a.alloc<bf16>((size_t)N * H) : nullptr;
     bf16* b8   = a.alloc<bf16>((size_t)N * wide);        // qraw / lin_qkv (8192)
+    // ao (attn / FFN down dest) is born after qraw is split or GDN conv consumes b8.
+    // wide >= H on every hybrid this pass accepts, so ao rides in the same allocation.
+    bf16* ao   = (wide >= H) ? b8 : a.alloc<bf16>((size_t)N * H);
     bf16* lz   = a.alloc<bf16>((size_t)N * lvdim);       // lin_z (4096)
     bf16* gq   = a.alloc<bf16>((size_t)N * s.linear_qdim);   // gdn q (2048)
     bf16* gk   = a.alloc<bf16>((size_t)N * s.linear_qdim);   // gdn k (2048)
@@ -266,7 +281,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             //
             // This can only make the chunk SMALLER, which is the safe direction: an oversized
             // chunk is what fails the arena alloc and drops the whole pass to the token loop.
-            const size_t gdn_reserve = c.hybrid ? ((size_t)256 << 20) : 0;
+            //
+            // When the 16k arena has settled there is enough free for a 2048-token FFN pair
+            // plus an 8192-token GDN slice (~241 MB, two launches). That beats #852's
+            // 1024-token FFN + one-shot 483 MB scan: the FFN re-reads its NVFP4 weights
+            // once per chunk. Fall back to the 256 MB paper reserve when the pair does
+            // not fit, so a tight first pass still keeps the batched path.
+            const size_t gdn_full = (size_t)256 << 20;
+            const size_t gdn_half = (size_t)200 << 20;   // 8192-token slice + slack
+            const size_t ffn_2048 = (size_t)2 * 2048 * (size_t)ffn * sizeof(bf16);
+            const size_t gdn_reserve = !c.hybrid ? 0
+                : (fb > tail + margin + ffn_2048 + gdn_half ? gdn_half : gdn_full);
             const size_t claimed = tail + margin + gdn_reserve;
             const size_t avail = (fb > claimed) ? fb - claimed : 0;
             const int fc_before = FC;
@@ -718,13 +743,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     }
 
     // Capture on the SECOND sighting of this N (arena warm => no cudaMalloc inside the capture).
+    // A graph for a different N was already destroyed above, before the scratch allocs.
     bool pfb_capturing = false;
-    // Re-capture when N changes: a graph is only valid for the N it recorded.
-    if (graph_ok && g_pfb_exec && g_pfb_n != N) {
-        cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr;
-        if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
-        g_pfb_n = -1;
-    }
     if (graph_ok && !g_pfb_exec && g_pfb_warm_n == N) {
         if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess)
             pfb_capturing = true;

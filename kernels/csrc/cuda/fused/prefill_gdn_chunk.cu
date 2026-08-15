@@ -324,14 +324,13 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         for (int e = tid; e < HD * JC; e += nthr) s_S[e] = 0.f;
     }
 
-    // The chunk loop is the ONE serial stage left in this prefill, and every iteration used
-    // to expose the full global latency of its 25 KB W/K/Q staging before any math could
-    // start. Issue those loads with cp.async at the END of the previous iteration (the
-    // S-update sync is the last read of the old tiles), so they overlap the g/U/M stages
-    // and the loop-carried sync. Same buffers, same staged values, same math -- only WHEN
-    // the loads are issued changes. Tail rows of a short final chunk are zeroed after the
-    // wait (cp.async cannot predicate, and reading past n_tokens would fault).
-    auto stage_wkq = [&](int c2) {
+    // The chunk loop is the ONE serial stage left in this prefill. Issue W/K/Q and the
+    // small g/U/M tiles with cp.async at the END of the previous iteration (the S-update
+    // sync is the last read of the old tiles) so they overlap the loop-carried math.
+    // Same buffers, same staged values, same math -- only WHEN the loads are issued
+    // changes. Tail rows of a short final chunk are zeroed after the wait (cp.async
+    // cannot predicate, and reading past n_tokens would fault).
+    auto stage_chunk = [&](int c2) {
         const int t0s = c2 * C;
         const int lens = min(C, n_tokens - t0s);
         for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
@@ -345,25 +344,29 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                                         q + (size_t)(t0s + i) * q_dim + qh * HD + d, 16);
             }
         }
+        // g: C floats. U: JC bf16 per row into s_Ub (converted after the wait).
+        // M: C packed floats per row; s_M is padded so each row is its own copy.
+        if (tid < C && tid < lens)
+            __pipeline_memcpy_async(s_g + tid, g_buf + (size_t)(t0s + tid) * v_heads + h, 4);
+        for (int e8 = tid; e8 < (C * JC) / 8; e8 += nthr) {
+            const int i = e8 / (JC / 8), jj = (e8 % (JC / 8)) * 8;
+            if (i < lens)
+                __pipeline_memcpy_async(s_Ub + i * (JC + PAD) + jj,
+                                        u_buf + ((size_t)(t0s + i) * v_heads + h) * HD + j0 + jj, 16);
+        }
+        const float* msrc = m_buf + ((size_t)c2 * v_heads + h) * C * C;
+        for (int e4 = tid; e4 < (C * C) / 4; e4 += nthr) {
+            const int i = e4 / (C / 4), j = (e4 % (C / 4)) * 4;
+            __pipeline_memcpy_async(s_M + i * (C + PAD) + j, msrc + i * C + j, 16);
+        }
         __pipeline_commit();
     };
-    if (n_chunks > 0) stage_wkq(0);
+    if (n_chunks > 0) stage_chunk(0);
 
     for (int c = 0; c < n_chunks; c++) {
         const int t0  = c * C;
         const int len = min(C, n_tokens - t0);
 
-        // ---- stage the small linear tiles; W/K/Q arrive via the early-issued cp.async ----
-        for (int i = tid; i < C; i += nthr)
-            s_g[i] = (i < len) ? g_buf[(size_t)(t0 + i) * v_heads + h] : 0.f;
-        for (int e = tid; e < C * JC; e += nthr) {
-            const int i = e / JC, jj = e - i * JC;
-            s_U[e] = (i < len) ? gc_to_f(u_buf[((size_t)(t0 + i) * v_heads + h) * HD + j0 + jj]) : 0.f;
-        }
-        for (int e = tid; e < C * C; e += nthr) {
-            const int i = e / C, j = e - i * C;
-            s_M[i * (C + PAD) + j] = m_buf[(size_t)e + ((size_t)c * v_heads + h) * C * C];
-        }
         __pipeline_wait_prior(0);
         if (len < C) {
             for (int e = tid; e < C * HD; e += nthr) {
@@ -374,6 +377,12 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                     s_Q[i * (HD + PAD) + d] = __float2bfloat16(0.f);
                 }
             }
+            for (int i = tid; i < C; i += nthr)
+                if (i >= len) s_g[i] = 0.f;
+        }
+        for (int e = tid; e < C * JC; e += nthr) {
+            const int i = e / JC, jj = e - i * JC;
+            s_U[e] = (i < len) ? gc_to_f(s_Ub[i * (JC + PAD) + jj]) : 0.f;
         }
         __syncthreads();
 
@@ -504,7 +513,7 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
             }
         }
         __syncthreads();
-        if (c + 1 < n_chunks) stage_wkq(c + 1);   // last read of W/K/Q was above this sync
+        if (c + 1 < n_chunks) stage_chunk(c + 1);   // last read of W/K/Q/U/M/g was above this sync
     }
 
     // ---- final state, in the transposed [v_head][col][row] layout decode expects ----
