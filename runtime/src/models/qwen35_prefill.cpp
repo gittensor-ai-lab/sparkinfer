@@ -935,12 +935,37 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 signed char* vpool = (signed char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
                 void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
                 void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
-                if (!kv8) { a.free_all(); a8.free_all(); am.free_all(); aw.free_all(); fprintf(stderr, "[prefill] batched prefill requires int8 KV\n"); return -1; }
+                // bf16 KV: batched prefill used to decline here, which sent Qwen3.8's prefill@128
+                // down the sequential per-token path (88.0 tok/s, barely above its own 84.2 tok/s
+                // decode, because that path re-streams every weight once per position). The bf16
+                // twins below take the same schedule as the int8 pair with the quantize removed,
+                // and write exactly the bf16 KV a forward_token decode writes when kv8 is off, so
+                // a decode continuing from this cache reads a consistent one.
+                // SPARKINFER_PREFILL_BF16_KV=0 restores the decline.
+                static int pf_bf16kv = -1;
+                if (pf_bf16kv < 0) { const char* e = getenv("SPARKINFER_PREFILL_BF16_KV"); pf_bf16kv = (e && e[0] == '0') ? 0 : 1; }
+                if (!kv8) {
+                    // Capability check by shape, NOT by calling the launcher -- invoking it as a
+                    // probe would really launch the kernel, on the wrong stream and over a KV pool
+                    // this pass has not written yet.
+                    const bool bf16_attn_ok = pf_bf16kv && (c.head_dim == 128 || c.head_dim == 256);
+                    if (!bf16_attn_ok) {
+                        a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
+                        fprintf(stderr, "[prefill] batched prefill requires int8 KV\n");
+                        return -1;
+                    }
+                    kernels::launch_prefill_qknorm_rope_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
+                        kpool, vpool, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                        rope_dim, rope_theta, eps, bs, mbs, st);
+                    kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, btable, att,
+                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
+                } else {
                 kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
                     kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
                     rope_dim, rope_theta, eps, bs, mbs, st);
                 kernels::launch_prefill_attn_int8_paged(qb, kpool, vpool, kscale, vscale, btable, att,
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
+                }
             }
             // Muse: the gated attention output feeds exactly one consumer -- the o projection's
             // row-quantize -- so fold the gate into that quantize's load phase. `att` is then never
