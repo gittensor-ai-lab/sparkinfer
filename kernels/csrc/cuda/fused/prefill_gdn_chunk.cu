@@ -55,6 +55,7 @@
 // The state stays fp32 and is written back in the SAME transposed [v_head][col][row] layout the
 // decode gdn_ar_fast kernel expects, so this is a drop-in replacement and decode is untouched.
 // ============================================================================
+#include <algorithm>
 #include "sparkinfer/kernels/prefill_gdn_chunk.h"
 
 #include <cuda_runtime.h>
@@ -561,7 +562,52 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     const size_t off_w = off_m + n_m * sizeof(float);
     const size_t off_u = off_w + n_w * sizeof(__nv_bfloat16);
     const size_t total = off_u + n_w * sizeof(__nv_bfloat16);
-    if (!ws_reserve(total)) return false;
+    if (!ws_reserve(total)) {
+        // The workspace is O(N): W^ and U0 alone are n_tokens*v_heads*HD bf16 each, so it reaches
+        // ~322 MB at ctx=16384 and stops fitting long before the sequence itself does. Falling
+        // through here drops the whole layer onto the SEQUENTIAL scan -- which is what ctx=16384
+        // has been getting, at ~2x the cost of this path (measured at ctx=4096, where the
+        // workspace still fits: 8275.82 pp with this path vs 7059.03 pp forced sequential).
+        //
+        // The scan is already sequential ACROSS chunks and carries `state` in and out, so a
+        // segment boundary on a multiple of C is just another chunk boundary: process the sequence
+        // in segments whose workspace does fit and let the recurrence carry, instead of giving the
+        // path up. Same chunk boundaries, same arithmetic, same order.
+        // ws_reserve's cudaMalloc just failed and we are handling that here, so clear the sticky
+        // error: several launchers report success as `cudaPeekAtLastError() == cudaSuccess`, which
+        // does not clear and cannot tell whose error it is.
+        cudaGetLastError();
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+        const size_t margin = (size_t)32 << 20;
+        const size_t avail = (free_b > margin) ? (free_b - margin) : 0;
+        // ws(S) = S*v_heads*(sizeof(float) + C*sizeof(float) + 2*HD*sizeof(bf16))
+        const size_t per_tok = (size_t)v_heads *
+            (sizeof(float) + (size_t)C * sizeof(float) + (size_t)2 * HD * sizeof(__nv_bfloat16));
+        size_t seg = per_tok ? (avail / per_tok) : 0;
+        seg -= seg % (size_t)C;                       // land segments on chunk boundaries
+        if (seg < (size_t)C) return false;            // cannot even hold one chunk -> sequential
+        if (seg > (size_t)n_tokens) seg = (size_t)n_tokens;
+
+        const size_t q_dim = (size_t)q_heads * HD;
+        const size_t v_dim = (size_t)v_heads * HD;
+        auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
+        auto kb = reinterpret_cast<const __nv_bfloat16*>(k);
+        auto vb = reinterpret_cast<const __nv_bfloat16*>(v);
+        auto ab = reinterpret_cast<const __nv_bfloat16*>(alpha);
+        auto bb = reinterpret_cast<const __nv_bfloat16*>(beta);
+        auto ob = reinterpret_cast<__nv_bfloat16*>(out);
+        for (size_t off = 0; off < (size_t)n_tokens; off += seg) {
+            const int len = (int)std::min(seg, (size_t)n_tokens - off);
+            // dt and a are per-HEAD, not per-token, so they are passed through unshifted.
+            if (!launch_prefill_gdn_chunk(qb + off * q_dim, kb + off * q_dim, vb + off * v_dim,
+                                          ab + off * v_heads, bb + off * v_heads, dt, a,
+                                          state, ob + off * v_dim,
+                                          len, q_heads, v_heads, head_dim, qh_block, stream))
+                return false;   // a segment that cannot run leaves the caller its sequential path
+        }
+        return true;
+    }
 
     char* base  = reinterpret_cast<char*>(g_ws);
     float* g_buf = reinterpret_cast<float*>(base + off_g);

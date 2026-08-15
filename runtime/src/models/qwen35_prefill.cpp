@@ -252,17 +252,27 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
             // What still has to come out of `fb` after the FC-scaled pair, so the chunk is sized
             // against the real remainder rather than all of free VRAM.
-            const size_t tail = (size_t)maxw * sizeof(bf16)                    // wbuf
-                              + (size_t)maxw                                  // W_i8
-                              + (size_t)N * H                                 // A_i8 (int8) floor
-                              + (size_t)N * (sizeof(float) + sizeof(int));    // sx + d_ids
-            const size_t margin = (size_t)64 << 20;    // split-K partials + allocator slack
+            // Reserve for A_i8 and nothing else. wbuf/W_i8 are sized by maxw (N-independent) and
+            // are already resident from an earlier call, so they cost nothing here; the FP4
+            // activation buffers are allocated after the int8 arena's own ok-check, so if they
+            // miss, only the FP4 path declines. A_i8 is the one that must fit: it is allocated
+            // before that check, so losing it turns the int8 projections off for the whole pass
+            // (measured at ctx=16384: chunk 4096 leaves 48 MB, A_i8 misses, and prefill drops from
+            // ~4970 to ~2200 pp). Reserving the full tail instead costs a chunk step, which is
+            // worth more than the slack it buys -- chunk 2048 measures ~5.9% over 1024.
+            const size_t tail = (size_t)N * (size_t)imax(H, imax(qdim, lvdim));   // A_i8
+            const size_t margin = (size_t)32 << 20;    // allocator slack
             const size_t avail = (fb > tail + margin) ? fb - tail - margin : 0;
             const int fc_before = FC;
-            // Test the HALVED value, not the current one: `FC > floor` would step straight past it.
-            while ((FC >> 1) >= kMinFfnChunk &&
-                   (size_t)2 * (size_t)FC * (size_t)ffn * sizeof(bf16) > avail)
-                FC >>= 1;
+            // Take the LARGEST chunk that fits, not the largest power-of-two step: halving jumps
+            // 4096 -> 2048 and leaves most of the budget unused, and every extra token per chunk is
+            // one fewer pass over the FFN weights. Rounded down to 256 (the FFN chunk loop takes any
+            // fn, and 256 keeps m%8 for the block-scaled kernels) and floored at kMinFfnChunk.
+            const size_t per_tok = (size_t)2 * (size_t)ffn * sizeof(bf16);   // ffg + ffu, per token
+            size_t fc_fit = per_tok ? (avail / per_tok) : 0;
+            fc_fit &= ~(size_t)255;
+            if (fc_fit < (size_t)kMinFfnChunk) fc_fit = (size_t)kMinFfnChunk;
+            if ((size_t)FC > fc_fit) FC = (int)fc_fit;
             if (FC != fc_before)
                 fprintf(stderr, "[prefill] ffn chunk %d -> %d (ctx=%d, free=%zu MB) to keep the "
                                 "batched pass\n", fc_before, FC, N, fb >> 20);
