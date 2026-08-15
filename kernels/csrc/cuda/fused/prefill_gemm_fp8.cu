@@ -212,6 +212,19 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
 }
 } // namespace
 
+__global__ void pf_fp8_wscales_bf16_kernel(const __nv_bfloat16* __restrict__ s,
+                                           float* __restrict__ sw, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) sw[i] = __bfloat162float(s[i]);
+}
+
+void launch_prefill_fp8_wscales_bf16(const void* scale_bf16, float* sw, int n,
+                                     cudaStream_t stream) {
+    if (n <= 0) return;
+    pf_fp8_wscales_bf16_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(scale_bf16), sw, n);
+}
+
 void launch_prefill_quantize_rows_fp8(const void* x_bf16, void* q, float* scale,
                                       int rows, int cols, cudaStream_t stream) {
     pf_quantize_rows_fp8_kernel<<<rows, 32, 0, stream>>>(

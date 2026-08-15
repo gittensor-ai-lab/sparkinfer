@@ -23,6 +23,11 @@ namespace sparkinfer { namespace kernels {
 void launch_prefill_quantize_rows_fp8(const void* x_bf16, void* q, float* scale,
                                       int rows, int cols, cudaStream_t stream = nullptr);
 
+// Checkpoint SI_QTYPE_FP8 stores per-row scales as bf16. The GEMM epilogue wants fp32 sw[N]
+// with the same multiply convention (W_bf16 = e4m3 * scale).
+void launch_prefill_fp8_wscales_bf16(const void* scale_bf16, float* sw, int n,
+                                     cudaStream_t stream = nullptr);
+
 // fp8 GEMM: C[M,N] = A[M,K] @ W^T, W dequantized bf16 [N,K] row-major (C[m,n]=sum_k A[m,k]*W[n,k]).
 // A/W e4m3 with per-row scales sx[M] (per token) and sw[N] (per output channel). Output C is bf16
 // with the dequant sx[m]*sw[n] fused into the store. fp16 accumulate with a per-BK-tile fp32 flush.
