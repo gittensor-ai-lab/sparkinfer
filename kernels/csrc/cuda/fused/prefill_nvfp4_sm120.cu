@@ -219,7 +219,7 @@ template <class Layout>
 __global__ void gate_quant_rows(const __nv_bfloat16* __restrict__ src,
                                 const __nv_bfloat16* __restrict__ gate,
                                 unsigned char* dst, cutlass::float_ue4m3_t* sf,
-                                int rows, int cols, Layout layout) {
+                                int rows, int cols, int gld, Layout layout) {
     constexpr int V = 16, LPG = V / 2;
     const int glane = threadIdx.x & (LPG - 1);
     const int groups = rows * (cols / V);
@@ -230,8 +230,11 @@ __global__ void gate_quant_rows(const __nv_bfloat16* __restrict__ src,
     for (int grp = (blockIdx.x * blockDim.x + threadIdx.x) / LPG; grp < groups; grp += stride) {
         const int row = grp / (cols / V), k0 = (grp % (cols / V)) * V;
         const size_t base = (size_t)row * cols + k0 + 2 * glane;
-        const float s0 = __bfloat162float(src[base]),     g0 = __bfloat162float(gate[base]);
-        const float s1 = __bfloat162float(src[base + 1]), g1 = __bfloat162float(gate[base + 1]);
+        // The gate may be a column slice of the stacked q|gate|k|v GEMM output (gld = its full
+        // row width) instead of a tight copy; the values are identical either way.
+        const size_t gbase = (size_t)row * gld + k0 + 2 * glane;
+        const float s0 = __bfloat162float(src[base]),     g0 = __bfloat162float(gate[gbase]);
+        const float s1 = __bfloat162float(src[base + 1]), g1 = __bfloat162float(gate[gbase + 1]);
         // Same expression and same bf16 rounding as pf_mul_sigmoid_kernel.
         const float x0 = __bfloat162float(__float2bfloat16(s0 / (1.f + __expf(-g0))));
         const float x1 = __bfloat162float(__float2bfloat16(s1 / (1.f + __expf(-g1))));
@@ -386,12 +389,14 @@ bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_gate_quant_a(const void* sr, const void* g, void* d, void* sf,
-                                       int m, int k, cudaStream_t st) {
+                                       int m, int k, cudaStream_t st, int g_ld) {
     if (!sr || !g || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
+    const int gld = g_ld > 0 ? g_ld : k;
+    if (gld < k) return false;
     auto l = sfa_layout(m,128,k);
     int blocks = (m * (k / 16) * 8 + 255) / 256; if (blocks > 4096) blocks = 4096;
     gate_quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)sr,(const __nv_bfloat16*)g,
-                                          (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,l);
+                                          (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,gld,l);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_swiglu_quant_a(const void* g, const void* u, void* d, void* sf,

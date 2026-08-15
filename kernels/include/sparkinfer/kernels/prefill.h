@@ -153,12 +153,16 @@ bool launch_prefill_attn_bf16_paged(
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr);
 
+// q/k/v may be tight per-tensor inputs (q_ld/kv_ld <= 0) or column slices of the stacked
+// q|gate|k|v GEMM output read in place (q_ld = kv_ld = that row's full width). The normed/roped
+// q always lands tight in q_out (q_out == q is fine for the tight in-place case).
 void launch_prefill_qknorm_ropenorm_kv_bf16(
-    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    const void* q, void* q_out, const void* k, const void* v,
+    const void* q_w, const void* k_w,
     void* k_pool, void* v_pool,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr, int q_ld = 0, int kv_ld = 0);
 
 // Full-attention prefill: causal attention over the paged int8 KV pool just filled above.
 // One warp per (token, q-head); online softmax over keys 0..token (causal). q is the rope'd

@@ -862,6 +862,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // Long-ctx: optionally keep Q/K/V/O on int8 (no GDN recurrence here).
             const bool restore_i8 = use_i8;
             if (use_i8_attn) use_i8 = true;
+            // q/gate/k/v left IN the stacked GEMM output and read strided by their consumers --
+            // no split copy at all (the QK-norm/RoPE pass re-lands the roped q tight in qb, and
+            // the FP4 o-projection's gate quantize takes the gate slice with a row stride).
+            bool qkv_inplace = false;
             if (c.muse_glimmer && w.wgate) {
                 // Muse Glimmer keeps attn_gate as its OWN quantized tensor (w.wgate, [qdim,H]) -- Q
                 // goes straight to qb and the gate straight to qg, with no [q|gate] interleave to build
@@ -890,15 +894,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_as, N, H, st) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.qkvg_fp4, w.qkvg_fp4_sf,
                                                        fp4_qkv, N, qkvg_n, H, fp4_ws, st)) {
-                    // One split kernel instead of four 2D-copy nodes (byte-identical; see
-                    // pf_qkvg_split_kernel). SPARKINFER_MUSE_QKV_SPLIT_FUSE=0 restores the copies.
-                    static const bool split_fuse = [] {
+                    // SPARKINFER_MUSE_QKV_SPLIT_FUSE: 2 (default) = no split at all, consumers
+                    // read the stacked output in place; 1 = one split kernel; 0 = the four
+                    // 2D-copy nodes. All three move/read identical bytes.
+                    static const int split_mode = [] {
                         const char* e = getenv("SPARKINFER_MUSE_QKV_SPLIT_FUSE");
-                        return !e || atoi(e) != 0;
+                        return e ? atoi(e) : 2;
                     }();
-                    qkvg_fp4 = split_fuse &&
-                        kernels::launch_prefill_qkvg_split(fp4_qkv, qb, qg, kf, vf,
-                                                           N, qdim, kvdim, st);
+                    if (split_mode >= 2) {
+                        qkv_inplace = true;
+                        qkvg_fp4 = true;
+                    } else if (split_mode == 1) {
+                        qkvg_fp4 = kernels::launch_prefill_qkvg_split(fp4_qkv, qb, qg, kf, vf,
+                                                                      N, qdim, kvdim, st);
+                    }
                     if (!qkvg_fp4) {
                         const size_t sp = (size_t)qkvg_n * sizeof(bf16);
                         struct { void* dst; int off, n; } cut[4] = {
@@ -955,9 +964,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 bf16* kpool_bf = (bf16*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems();
                 bf16* vpool_bf = (bf16*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems();
                 const int muse_rot = w.swa ? c.head_dim : 0;      // SWA = full NORMAL rope; global = NoPE
-                kernels::launch_prefill_qknorm_ropenorm_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
+                // In-place mode reads q/k/v straight out of the stacked GEMM output (row stride
+                // qkvg_n); the roped q lands tight in qb either way, which is what attention reads.
+                kernels::launch_prefill_qknorm_ropenorm_kv_bf16(
+                    qkv_inplace ? fp4_qkv : qb, qb,
+                    qkv_inplace ? fp4_qkv + 2 * qdim : kf,
+                    qkv_inplace ? fp4_qkv + 2 * qdim + kvdim : vf,
+                    w.q_norm, w.k_norm,
                     kpool_bf, vpool_bf, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                    muse_rot, rope_theta, eps, bs, mbs, st);
+                    muse_rot, rope_theta, eps, bs, mbs, st,
+                    qkv_inplace ? qkvg_n : 0, qkv_inplace ? qkvg_n : 0);
                 const int win_blocks = w.swa ? (c.sliding_window + bs - 1) / bs : 0;  // 0 => global full causal
                 kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, btable, att,
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks, st);
@@ -1008,7 +1024,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // first and the int8 fold is skipped when it succeeds. Every arm therefore consumes a
             // gated activation and nothing reads the raw `att` -- the invariant #816 broke.
             const bool wo_fp4_gated = muse_nvfp4_wo && w.wo_fp4 && w.wo_fp4_sf && fp4_a && fp4_as &&
-                kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_as, N, qdim, st);
+                kernels::launch_prefill_nvfp4_gate_quant_a(
+                    att, qkv_inplace ? fp4_qkv + qdim : qg, fp4_a, fp4_as, N, qdim, st,
+                    qkv_inplace ? qkvg_n : 0);
+            // In-place mode never wrote the tight qg; if the FP4 leg declined, materialize it
+            // for the fallback gate consumers below (a path the 128-token bench never takes).
+            if (!wo_fp4_gated && qkv_inplace)
+                pf_cu(cudaMemcpy2DAsync(qg, (size_t)qdim * sizeof(bf16),
+                                        fp4_qkv + qdim, (size_t)qkvg_n * sizeof(bf16),
+                                        (size_t)qdim * sizeof(bf16), N,
+                                        cudaMemcpyDeviceToDevice, st), "qg late split");
             const bool wo_fp4_done = wo_fp4_gated && c.muse_glimmer &&
                 kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.wo_fp4, w.wo_fp4_sf,
                                                    ao, N, H, qdim, fp4_ws, st);

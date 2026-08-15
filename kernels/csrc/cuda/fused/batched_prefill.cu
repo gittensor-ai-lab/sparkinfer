@@ -937,12 +937,13 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
 // grid = (N, n_q_heads + 2*n_kv_heads); blockDim = head_dim.
 // ============================================================================
 __global__ void pf_qknorm_ropenorm_kv_bf16_kernel(
-    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ q_out,
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
     __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
-    int block_size, int max_blocks_per_seq) {
+    int block_size, int max_blocks_per_seq, int q_ld, int kv_ld) {
     const int tok  = blockIdx.x;
     const int unit = blockIdx.y;
     const int t    = threadIdx.x;
@@ -960,7 +961,9 @@ __global__ void pf_qknorm_ropenorm_kv_bf16_kernel(
 
     if (is_q || is_k) {
         const int hh = is_q ? unit : (unit - n_q_heads);
-        const size_t base = ((size_t)tok * (is_q ? n_q_heads : n_kv_heads) + hh) * head_dim;
+        // Row stride of the SOURCE: tight (heads*head_dim) for split inputs, or the stacked
+        // q|gate|k|v GEMM output's full row width when reading it in place (no split copy).
+        const size_t base = (size_t)tok * (is_q ? q_ld : kv_ld) + (size_t)hh * head_dim;
         const __nv_bfloat16* src = is_q ? q : k;
         const __nv_bfloat16* nrm = is_q ? q_w : k_w;
         const float xv = pf_to_f(src[base + t]);
@@ -988,14 +991,16 @@ __global__ void pf_qknorm_ropenorm_kv_bf16_kernel(
             out = ((t & 1) == 0) ? (x0 * c - x1 * s) : (x0 * s + x1 * c);
         }
         if (is_q) {
-            q[base + t] = __float2bfloat16(out);
+            // The normed/roped q always lands TIGHT ([tok, n_q_heads*head_dim]) -- the
+            // attention kernels read that layout regardless of where the raw q came from.
+            q_out[((size_t)tok * n_q_heads + hh) * head_dim + t] = __float2bfloat16(out);
         } else {
             const size_t dst = (ctok * n_kv_heads + hh) * head_dim;
             k_pool[dst + t] = __float2bfloat16(out);
         }
     } else {                                          // V: append as-is (no norm, no rope)
         const int hh = unit - n_q_heads - n_kv_heads;
-        const size_t base = ((size_t)tok * n_kv_heads + hh) * head_dim;
+        const size_t base = (size_t)tok * kv_ld + (size_t)hh * head_dim;
         const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
         v_pool[dst + t] = v[base + t];
     }
@@ -1468,20 +1473,24 @@ void launch_prefill_qknorm_rope_kv_int8(
 // Muse Glimmer bf16-KV counterpart: QK-norm + NORMAL RoPE (rotary_dim>0) / NoPE
 // (rotary_dim==0) + bf16 KV write. k_pool/v_pool are bf16 (muse uses a bf16 KV cache).
 void launch_prefill_qknorm_ropenorm_kv_bf16(
-    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    const void* q, void* q_out, const void* k, const void* v,
+    const void* q_w, const void* k_w,
     void* k_pool, void* v_pool,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream) {
+    cudaStream_t stream, int q_ld, int kv_ld) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
+    if (q_ld <= 0) q_ld = n_q_heads * head_dim;        // tight (split) inputs
+    if (kv_ld <= 0) kv_ld = n_kv_heads * head_dim;
     pf_qknorm_ropenorm_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(q_out),
+        reinterpret_cast<const __nv_bfloat16*>(k),
         reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
         reinterpret_cast<const __nv_bfloat16*>(k_w),
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
         block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-        block_size, max_blocks_per_seq);
+        block_size, max_blocks_per_seq, q_ld, kv_ld);
 }
 
 void launch_prefill_attn_int8_paged(
