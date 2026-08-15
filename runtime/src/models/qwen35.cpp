@@ -4607,7 +4607,9 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
                         != cudaSuccess) return nullptr;
                     std::vector<float> hf(rows);
                     for (long i = 0; i < rows; ++i) {
-                        __nv_bfloat16 b; memcpy(&b, &hb[i], 2); hf[i] = __bfloat162float(b);
+                        // bf16 -> f32 is the identity on the top 16 bits.
+                        const uint32_t u = ((uint32_t)hb[i]) << 16;
+                        float f; memcpy(&f, &u, 4); hf[i] = f;
                     }
                     void* d = nullptr;
                     if (cudaMalloc(&d, rows * 4) != cudaSuccess) return nullptr;
