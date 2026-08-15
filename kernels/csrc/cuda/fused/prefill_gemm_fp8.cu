@@ -83,14 +83,27 @@ __global__ void pf_quantize_rows_fp8_kernel(const __nv_bfloat16* __restrict__ x,
 // keeps only one block per SM resident.
 // SPLITK partitions the K loop across blockIdx.z (same occupancy fix as launch_prefill_gemm_i8_splitk)
 // and atomicAdds the unscaled fp32 tile into P[M,N]; a separate epilogue applies sx*sw.
-template <bool SPLITK>
+// STAGES is the cp.async pipeline depth. At 2 (one prefetch in flight) the K loop pays a full
+// global-memory latency on nearly every trip: the accumulators alone are acc[2][8][4] + h[2][8][2],
+// so __launch_bounds__(256,2) caps this at 8 warps x 2 blocks and there is no other warp resident
+// to cover the miss. Depth costs only shared memory, not registers -- measured on an RTX 5090 at
+// M=128, non-split-K, against the shipped depth: qkv 74.19 -> 62.49 us (+15.8%), z 73.81 -> 61.92
+// (+16.1%), out 86.48 -> 72.72 (+15.9%). It flattens at 3 (4/6 measure the same within noise), so
+// 3 it is: 48 KB, still two blocks per SM.
+//
+// Only the ISSUE point of the staging moves; the mma order and the FP8_FLUSH cadence are untouched,
+// so the result is bit-identical to the 2-stage path.
+template <bool SPLITK, int STAGES>
 __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
         const __nv_fp8_e4m3* __restrict__ A, const __nv_fp8_e4m3* __restrict__ W,
         const float* __restrict__ sx, const float* __restrict__ sw,
         __nv_bfloat16* __restrict__ C, float* __restrict__ P,
         int M, int N, int K, int ktiles) {
-    __shared__ __nv_fp8_e4m3 As[2][FP8_BM][FP8_BK];
-    __shared__ __nv_fp8_e4m3 Bs[2][FP8_BN][FP8_BK];
+    // Dynamic so depth > 2 can exceed the 48 KB static cap without a second kernel.
+    extern __shared__ __align__(16) char fp8_smem[];
+    auto As = reinterpret_cast<__nv_fp8_e4m3 (*)[FP8_BM][FP8_BK]>(fp8_smem);
+    auto Bs = reinterpret_cast<__nv_fp8_e4m3 (*)[FP8_BN][FP8_BK]>(
+        fp8_smem + (size_t)STAGES * FP8_BM * FP8_BK);
 
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;
@@ -139,11 +152,16 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
         #pragma unroll
         for (int j = 0; j < FP8_NFRAG; j++) { h[i][j][0] = 0u; h[i][j][1] = 0u; }
 
-    stage(0, t0 * FP8_BK);
+    // Fill STAGES-1 buffers before the first mma; empty commits keep the outstanding count (and so
+    // the __pipeline_wait_prior depth below) uniform when the K range is shorter than the pipeline.
+    #pragma unroll
+    for (int i = 0; i < STAGES - 1; i++) {
+        if (t0 + i < t1) stage(i, (t0 + i) * FP8_BK);
+        else             __pipeline_commit();
+    }
     int buf = 0;
     for (int t = t0; t < t1; t++) {
-        if (t + 1 < t1) stage(buf ^ 1, (t + 1) * FP8_BK);
-        __pipeline_wait_prior(t + 1 < t1 ? 1 : 0);
+        __pipeline_wait_prior(STAGES - 2);
         __syncthreads();
 
         #pragma unroll
@@ -190,7 +208,11 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
                 }
         }
         __syncthreads();
-        buf ^= 1;
+        // Refill the buffer just consumed, STAGES-1 tiles ahead.
+        const int nxt = t + STAGES - 1;
+        if (nxt < t1) stage(buf, nxt * FP8_BK);
+        else          __pipeline_commit();
+        buf = (buf + 1 == STAGES) ? 0 : buf + 1;
     }
 
     if (SPLITK) {
@@ -261,13 +283,54 @@ void launch_prefill_quantize_rows_fp8(const void* x_bf16, void* q, float* scale,
         reinterpret_cast<__nv_fp8_e4m3*>(q), scale, rows, cols);
 }
 
+namespace {
+constexpr int FP8_STAGES = 3;
+constexpr size_t FP8_SMEM(int stages) {
+    return (size_t)stages * (FP8_BM * FP8_BK + FP8_BN * FP8_BK);
+}
+
+// SPARKINFER_PREFILL_FP8_STAGES=2 restores the shipped single-prefetch pipeline (A/B from one
+// binary); 4 is kept instantiated so the depth sweep can be re-run on other parts.
+static int fp8_stages_env() {
+    static const int s = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_FP8_STAGES");
+        const int v = e ? atoi(e) : FP8_STAGES;
+        return (v == 2 || v == 3 || v == 4) ? v : FP8_STAGES;
+    }();
+    return s;
+}
+
+// >48 KB of shared memory per block is opt-in, once per kernel.
+template <bool SPLITK, int STAGES>
+static bool fp8_opt_in_smem() {
+    static const bool ok = [] {
+        if (FP8_SMEM(STAGES) <= 48 * 1024) return true;
+        return cudaFuncSetAttribute(pf_gemm_fp8_kernel<SPLITK, STAGES>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    (int)FP8_SMEM(STAGES)) == cudaSuccess;
+    }();
+    return ok;
+}
+} // namespace
+
 void launch_prefill_gemm_fp8(const void* A, const void* W,
                              const float* sx, const float* sw, void* C,
                              int M, int N, int K, cudaStream_t stream) {
     dim3 grid((N + FP8_BN - 1) / FP8_BN, (M + FP8_BM - 1) / FP8_BM);
-    pf_gemm_fp8_kernel<false><<<grid, 256, 0, stream>>>(
-        reinterpret_cast<const __nv_fp8_e4m3*>(A), reinterpret_cast<const __nv_fp8_e4m3*>(W),
-        sx, sw, reinterpret_cast<__nv_bfloat16*>(C), nullptr, M, N, K, 0);
+    const auto a = reinterpret_cast<const __nv_fp8_e4m3*>(A);
+    const auto w = reinterpret_cast<const __nv_fp8_e4m3*>(W);
+    const auto c = reinterpret_cast<__nv_bfloat16*>(C);
+    const int st_ = fp8_stages_env();
+    if (st_ == 4 && fp8_opt_in_smem<false, 4>()) {
+        pf_gemm_fp8_kernel<false, 4><<<grid, 256, FP8_SMEM(4), stream>>>(
+            a, w, sx, sw, c, nullptr, M, N, K, 0);
+    } else if (st_ != 2 && fp8_opt_in_smem<false, 3>()) {
+        pf_gemm_fp8_kernel<false, 3><<<grid, 256, FP8_SMEM(3), stream>>>(
+            a, w, sx, sw, c, nullptr, M, N, K, 0);
+    } else {
+        pf_gemm_fp8_kernel<false, 2><<<grid, 256, FP8_SMEM(2), stream>>>(
+            a, w, sx, sw, c, nullptr, M, N, K, 0);
+    }
 }
 
 // Same occupancy knee as the int8 split-K launcher: one 128x128 tile per block, so GDN
@@ -321,9 +384,19 @@ bool launch_prefill_gemm_fp8_splitk(const void* A, const void* W,
     if (cudaMemsetAsync(partials, 0, (size_t)M * N * sizeof(float), stream) != cudaSuccess)
         return false;
     dim3 grid((N + FP8_BN - 1) / FP8_BN, (M + FP8_BM - 1) / FP8_BM, nz);
-    pf_gemm_fp8_kernel<true><<<grid, 256, 0, stream>>>(
-        reinterpret_cast<const __nv_fp8_e4m3*>(A), reinterpret_cast<const __nv_fp8_e4m3*>(W),
-        sx, sw, nullptr, partials, M, N, K, ktiles);
+    const auto a = reinterpret_cast<const __nv_fp8_e4m3*>(A);
+    const auto w = reinterpret_cast<const __nv_fp8_e4m3*>(W);
+    const int st_ = fp8_stages_env();
+    if (st_ == 4 && fp8_opt_in_smem<true, 4>()) {
+        pf_gemm_fp8_kernel<true, 4><<<grid, 256, FP8_SMEM(4), stream>>>(
+            a, w, sx, sw, nullptr, partials, M, N, K, ktiles);
+    } else if (st_ != 2 && fp8_opt_in_smem<true, 3>()) {
+        pf_gemm_fp8_kernel<true, 3><<<grid, 256, FP8_SMEM(3), stream>>>(
+            a, w, sx, sw, nullptr, partials, M, N, K, ktiles);
+    } else {
+        pf_gemm_fp8_kernel<true, 2><<<grid, 256, FP8_SMEM(2), stream>>>(
+            a, w, sx, sw, nullptr, partials, M, N, K, ktiles);
+    }
     dim3 eg(((N + 1) / 2 + 255) / 256, M);
     pf_gemm_fp8_sk_epi_kernel<<<eg, 256, 0, stream>>>(
         partials, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N);
