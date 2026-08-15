@@ -128,6 +128,84 @@ __global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_kernel(
     }
 }
 
+// Same cp.async staging, K partitioned across blockIdx.y so M=128 (4 row-tiles)
+// fills the 170-SM 5090. Partials atomicAdd into fp32 P[M,N].
+template <int BT, int NMAX, int KT, int WARPS>
+__global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_sk_kernel(
+        const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ W,
+        float* __restrict__ P, int M, int n_out, int K, int ktiles) {
+    using namespace nvcuda;
+    __shared__ __align__(16) __nv_bfloat16 sA[2][BT][KT + SK_PAD];
+    __shared__ __align__(16) __nv_bfloat16 sW[2][NMAX][KT + SK_PAD];
+    __shared__ float sC[16][16];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int m0   = blockIdx.x * BT;
+    const int wm   = warp / (NMAX / 16);
+    const int wn   = warp % (NMAX / 16);
+    const int nk   = K / KT;
+    const int t0   = blockIdx.y * ktiles;
+    int t1         = t0 + ktiles;
+    if (t1 > nk) t1 = nk;
+    if (t0 >= t1) return;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
+    wmma::fill_fragment(cf, 0.f);
+
+    auto stage = [&](int buf, int k0) {
+        for (int e = tid; e < (BT * KT) / 8; e += WARPS * 32) {
+            const int i = e / (KT / 8), kv = (e % (KT / 8)) * 8;
+            const int gm = m0 + i, gk = k0 + kv;
+            sk_cp16(&sA[buf][i][kv], &A[(size_t)gm * K + gk], gm < M && gk + 7 < K);
+        }
+        for (int e = tid; e < (NMAX * KT) / 8; e += WARPS * 32) {
+            const int j = e / (KT / 8), kv = (e % (KT / 8)) * 8;
+            const int gk = k0 + kv;
+            sk_cp16(&sW[buf][j][kv], &W[(size_t)j * K + gk], j < n_out && gk + 7 < K);
+        }
+        __pipeline_commit();
+    };
+
+    stage(0, t0 * KT);
+    int buf = 0;
+    for (int t = t0; t < t1; t++) {
+        if (t + 1 < t1) stage(buf ^ 1, (t + 1) * KT);
+        __pipeline_wait_prior(t + 1 < t1 ? 1 : 0);
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < KT; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, &sA[buf][wm * 16][kk], KT + SK_PAD);
+            wmma::load_matrix_sync(bf, &sW[buf][wn * 16][kk], KT + SK_PAD);
+            wmma::mma_sync(cf, af, bf, cf);
+        }
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    for (int w = 0; w < WARPS; w++) {
+        __syncthreads();
+        if (warp != w) continue;
+        wmma::store_matrix_sync(&sC[0][0], cf, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32) {
+            const int r = e >> 4, c = e & 15;
+            const int gm = m0 + wm * 16 + r, gn = wn * 16 + c;
+            if (gm < M && gn < n_out) atomicAdd(&P[(size_t)gm * n_out + gn], sC[r][c]);
+        }
+    }
+}
+
+__global__ void pf_gemm_skinny_reduce(const float* __restrict__ P,
+                                      __nv_bfloat16* __restrict__ C, int M, int N) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < M * N) C[i] = __float2bfloat16(P[i]);
+}
+
 }  // namespace
 
 // One instantiation of the kernel above. n_out is masked inside, so NMAX only has to be the
@@ -136,11 +214,40 @@ __global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_kernel(
     do {                                                                                    \
         constexpr int BT_ = (BTV), NMAX_ = (NMAXV), W_ = (BT_ / 16) * (NMAX_ / 16);         \
         static_assert(W_ * 32 <= 1024 && (KT % 16) == 0, "one warp per 16x16 output tile"); \
-        pf_gemm_skinny_kernel<BT_, NMAX_, KT, W_><<<dim3((M + BT_ - 1) / BT_),              \
-                                                    W_ * 32, 0, stream>>>(                  \
+        const int mtiles = (M + BT_ - 1) / BT_;                                             \
+        const int nk = K / KT;                                                              \
+        int splits = 1;                                                                     \
+        if (sk_on && mtiles > 0 && mtiles < 170 && nk >= 4) {                               \
+            splits = (170 + mtiles - 1) / mtiles;                                           \
+            if (splits > nk / 2) splits = nk / 2;                                           \
+            if (splits < 1) splits = 1;                                                     \
+        }                                                                                   \
+        if (splits <= 1) {                                                                  \
+            pf_gemm_skinny_kernel<BT_, NMAX_, KT, W_><<<mtiles, W_ * 32, 0, stream>>>(      \
+                reinterpret_cast<const __nv_bfloat16*>(A),                                  \
+                reinterpret_cast<const __nv_bfloat16*>(W),                                  \
+                reinterpret_cast<__nv_bfloat16*>(C), M, N, K);                              \
+            return true;                                                                    \
+        }                                                                                   \
+        static float* parts = nullptr;                                                      \
+        static size_t parts_n = 0;                                                          \
+        const size_t need = (size_t)M * (size_t)N;                                          \
+        if (parts_n < need) {                                                               \
+            if (parts) cudaFree(parts);                                                     \
+            parts = nullptr; parts_n = 0;                                                   \
+            if (cudaMalloc(&parts, need * sizeof(float)) != cudaSuccess) return false;      \
+            parts_n = need;                                                                 \
+        }                                                                                   \
+        if (cudaMemsetAsync(parts, 0, need * sizeof(float), stream) != cudaSuccess)         \
+            return false;                                                                   \
+        const int ktiles = (nk + splits - 1) / splits;                                      \
+        const int nz = (nk + ktiles - 1) / ktiles;                                          \
+        pf_gemm_skinny_sk_kernel<BT_, NMAX_, KT, W_><<<dim3(mtiles, nz), W_ * 32, 0, stream>>>( \
             reinterpret_cast<const __nv_bfloat16*>(A),                                      \
             reinterpret_cast<const __nv_bfloat16*>(W),                                      \
-            reinterpret_cast<__nv_bfloat16*>(C), M, N, K);                                  \
+            parts, M, N, K, ktiles);                                                        \
+        pf_gemm_skinny_reduce<<<(int)((need + 255) / 256), 256, 0, stream>>>(               \
+            parts, reinterpret_cast<__nv_bfloat16*>(C), M, N);                              \
         return true;                                                                        \
     } while (0)
 
@@ -151,6 +258,13 @@ bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
     static const int enabled = [] {
         const char* e = getenv("SPARKINFER_PREFILL_GEMM_SKINNY");
         return (e && e[0] == '0') ? 0 : 1;
+    }();
+    // Split-K fills the 5090 at M=128 (4 row-tiles). #842 kept one wave of 4 CTAs
+    // because shrinking BT made staging worse; splitting K keeps BT=32. Default ON.
+    // SPARKINFER_PREFILL_SKINNY_SPLITK=0 restores #842's single-wave grid.
+    static const bool sk_on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_SKINNY_SPLITK");
+        return !(e && e[0] == '0');
     }();
     // Only worth it while the 128-wide tile is mostly padding; wider outputs keep the tiled GEMM,
     // which is tensor-core bound and already the right shape for them.
