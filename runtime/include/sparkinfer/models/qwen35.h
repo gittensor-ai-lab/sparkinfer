@@ -80,6 +80,7 @@ struct Qwen35LayerWeights {
     // present; see gdn_qkv_z.
     const void* wqkv_fp8_w = nullptr; const float* wqkv_fp8_sw = nullptr;
     const void* z_fp8_w = nullptr;    const float* z_fp8_sw = nullptr;
+    const void* out_fp8_w = nullptr;  const float* out_fp8_sw = nullptr;
 
     // GGUF path: experts kept quantized in VRAM (gguf-native [E,out,in] layout).
     // When gate_q != nullptr the model dequantizes these per-layer into scratch

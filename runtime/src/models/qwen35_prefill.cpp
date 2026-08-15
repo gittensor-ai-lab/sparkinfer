@@ -893,8 +893,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
                 c.gdn_qh_block, st);
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
-            attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
-            if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+            // FP8-direct out projection (same treatment as the in-projections above): the
+            // resident checkpoint payload with staged f32 scales, one e4m3 A-quantize of the
+            // gated-norm output. Falls through to the existing paths when unavailable.
+            bool out_fp8_done = false;
+            if (w.out_fp8_w && w.out_fp8_sw) {
+                a_q = nullptr; a_pk = false;            // A_i8 becomes e4m3 -- invalidate the memo
+                kernels::launch_prefill_quantize_rows_fp8(lnrm, A_i8, sx, N, lvdim, st);
+                kernels::launch_prefill_gemm_fp8(A_i8, w.out_fp8_w, sx, w.out_fp8_sw,
+                                                 ao, N, H, lvdim, st);
+                out_fp8_done = true;
+                attn_fused = false;
+            }
+            if (!out_fp8_done) {
+                attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
+                if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+            }
             use_i8 = restore_i8_gdn;
         } else {
             // ---- full softmax-attention layer (q_has_gate, partial RoPE, int8 KV) ----

@@ -4605,6 +4605,12 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
                 w.z_fp8_sw = stage_f32_scales(w.wqkv_gate, rz);
                 w.z_fp8_w = w.z_fp8_sw
                     ? static_cast<const char*>(w.wqkv_gate) + rz * 2 : nullptr;
+                if (w.ssm_out && w.ssm_out_type == kernels::SI_QTYPE_FP8) {
+                    const long ro = H;   // out_proj is [H, linear_vdim]
+                    w.out_fp8_sw = stage_f32_scales(w.ssm_out, ro);
+                    w.out_fp8_w = w.out_fp8_sw
+                        ? static_cast<const char*>(w.ssm_out) + ro * 2 : nullptr;
+                }
                 if (w.wqkv_fp8_w && w.z_fp8_w) ++gdnq_ready, ++gdnz_ready;
             }
             // (An earlier FP4-copy mode for these projections was dropped: #837 removed the
