@@ -80,7 +80,8 @@ pid_t spawn_lmcache_sidecar(const std::string& socket_path, const sparkinfer::Qw
         script,
         "--socket", socket_path,
         "--instance-id", "sparkinfer",
-        "--num-layers", std::to_string(cfg.n_layers),
+        // Sub-pools actually allocated (compacted for hybrids), matching BridgeKVLayout below.
+        "--num-layers", std::to_string(kv.kv_layer_count()),
         "--num-kv-heads", std::to_string(cfg.n_kv_heads),
         "--head-dim", std::to_string(cfg.head_dim),
         "--block-size", std::to_string(kv.block_size()),
@@ -260,6 +261,15 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
       kvc.int8_kv = e ? (e[0] != '0')
                       : (impl_->cfg.muse_glimmer ? false
                          : impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
+    // Hybrid: only every full_attn_interval-th layer owns KV (the rest are Gated-DeltaNet and keep
+    // their state in the recurrent/conv buffers), so the pool only needs that many sub-pools.
+    // SPARKINFER_KV_COMPACT=0 restores the full-width pool.
+    {
+        const char* kc = getenv("SPARKINFER_KV_COMPACT");
+        if (!(kc && kc[0] == '0') && impl_->cfg.hybrid && impl_->cfg.full_attn_interval > 1 &&
+            impl_->cfg.n_layers % impl_->cfg.full_attn_interval == 0)
+            kvc.attn_every = impl_->cfg.full_attn_interval;
+    }
     const size_t epb = (size_t)16 * impl_->cfg.n_kv_heads * impl_->cfg.head_dim;
     const size_t blocks = (size_t)impl_->cfg.max_seq / 16 + 8;
     impl_->kv = std::make_unique<sparkinfer::KVCacheManager>(
@@ -309,7 +319,8 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             spawn_lmcache_sidecar(socket_path, impl_->cfg, *impl_->kv, gguf_path);
         if (impl_->lmcache_sidecar_pid > 0) {
             sparkinfer::BridgeKVLayout layout;
-            layout.num_layers = impl_->cfg.n_layers;
+            // Sub-pools actually allocated (compacted for hybrids), not model layers.
+            layout.num_layers = impl_->kv->kv_layer_count();
             layout.num_kv_heads = impl_->cfg.n_kv_heads;
             layout.head_dim = impl_->cfg.head_dim;
             layout.block_size = impl_->kv->block_size();

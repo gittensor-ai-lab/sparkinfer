@@ -991,8 +991,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 // / NoPE on global layers, bf16 append -- the same KV a forward_token decode writes via
                 // launch_rmsnorm + launch_rope_kv_append_normal / launch_kv_append. Then pure-window
                 // attention on SWA layers, full causal on global (win_blocks<=0), over the bf16 pool.
-                bf16* kpool_bf = (bf16*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems();
-                bf16* vpool_bf = (bf16*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems();
+                bf16* kpool_bf = (bf16*)s.kv->k_pool() + s.kv->layer_offset_elems(L);
+                bf16* vpool_bf = (bf16*)s.kv->v_pool() + s.kv->layer_offset_elems(L);
                 const int muse_rot = w.swa ? c.head_dim : 0;      // SWA = full NORMAL rope; global = NoPE
                 kernels::launch_prefill_qknorm_ropenorm_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
                     kpool_bf, vpool_bf, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
@@ -1001,10 +1001,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, btable, att,
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks, st);
             } else {
-                signed char* kpool = (signed char*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-                signed char* vpool = (signed char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-                void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
-                void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+                signed char* kpool = (signed char*)s.kv->k_pool() + s.kv->layer_offset_elems(L) * kv_elem;
+                signed char* vpool = (signed char*)s.kv->v_pool() + s.kv->layer_offset_elems(L) * kv_elem;
+                void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_offset_elems(L) * 2 : nullptr;
+                void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_offset_elems(L) * 2 : nullptr;
                 // bf16 KV: batched prefill used to decline here, which sent Qwen3.8's prefill@128
                 // down the sequential per-token path (88.0 tok/s, barely above its own 84.2 tok/s
                 // decode, because that path re-streams every weight once per position). The bf16
@@ -2199,13 +2199,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }
             if (!supported || !w.q_has_gate) break;
             char* kp = static_cast<char*>(s.kv->k_pool()) +
-                       (size_t)L * s.kv->layer_stride_elems() * kv_elem;
+                       s.kv->layer_offset_elems(L) * kv_elem;
             char* vp = static_cast<char*>(s.kv->v_pool()) +
-                       (size_t)L * s.kv->layer_stride_elems() * kv_elem;
+                       s.kv->layer_offset_elems(L) * kv_elem;
             char* ks = kv8 ? static_cast<char*>(s.kv->k_scale_pool()) +
-                             (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+                             s.kv->scale_layer_offset_elems(L) * 2 : nullptr;
             char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
-                             (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+                             s.kv->scale_layer_offset_elems(L) * 2 : nullptr;
             if (kv8) {
                 kernels::launch_dflash_qknorm_rope_kv_partial_int8_gated(
                     b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btable, pos,

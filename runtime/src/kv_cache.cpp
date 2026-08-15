@@ -30,6 +30,7 @@ struct KVCacheManager::Impl {
     int total_blocks = 0;
     size_t layer_stride = 0;         // elements per layer in each pool
     size_t scale_layer_stride = 0;   // int8 path: fp16 scales per layer (= layer_stride / head_dim)
+    int kv_layers = 0;               // sub-pools actually allocated (see KVCacheConfig::attn_every)
     bool int8_kv = false;
     void* k_pool = nullptr;
     void* v_pool = nullptr;
@@ -58,13 +59,19 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
     impl_->total_blocks = denom ? (int)(pool_bytes / denom) : 0;
     impl_->layer_stride = (size_t)impl_->total_blocks * elems_per_block;
 
-    const size_t pool_elems = (size_t)cfg.num_layers * impl_->layer_stride;
+    // Hybrid models own KV on only every attn_every-th layer (see KVCacheConfig::attn_every).
+    // total_blocks/denom deliberately still divide by num_layers, so block capacity and
+    // max_blocks_per_seq are IDENTICAL to before -- only the number of sub-pools allocated drops.
+    impl_->kv_layers = (cfg.attn_every > 0) ? (cfg.num_layers / cfg.attn_every) : cfg.num_layers;
+    if (impl_->kv_layers < 1) impl_->kv_layers = cfg.num_layers;
+
+    const size_t pool_elems = (size_t)impl_->kv_layers * impl_->layer_stride;
     cu(cudaMalloc(&impl_->k_pool, pool_elems * elem_bytes), "malloc k_pool");
     cu(cudaMalloc(&impl_->v_pool, pool_elems * elem_bytes), "malloc v_pool");
     if (impl_->int8_kv) {
         // one fp16 scale per (token slot, kv_head): scale stride = layer_stride / head_dim.
         impl_->scale_layer_stride = impl_->layer_stride / cfg.head_dim;
-        const size_t scale_elems = (size_t)cfg.num_layers * impl_->scale_layer_stride;
+        const size_t scale_elems = (size_t)impl_->kv_layers * impl_->scale_layer_stride;
         cu(cudaMalloc(&impl_->k_scale, scale_elems * sizeof(unsigned short)), "malloc k_scale");
         cu(cudaMalloc(&impl_->v_scale, scale_elems * sizeof(unsigned short)), "malloc v_scale");
     }
@@ -167,6 +174,15 @@ const std::vector<int>& KVCacheManager::physical_block_ids(uint64_t seq_id) cons
 void*  KVCacheManager::k_pool() const { return impl_->k_pool; }
 void*  KVCacheManager::v_pool() const { return impl_->v_pool; }
 size_t KVCacheManager::layer_stride_elems() const { return impl_->layer_stride; }
+int KVCacheManager::kv_layer_count() const { return impl_->kv_layers; }
+size_t KVCacheManager::layer_offset_elems(int layer) const {
+    const int slot = (impl_->cfg.attn_every > 0) ? (layer / impl_->cfg.attn_every) : layer;
+    return (size_t)slot * impl_->layer_stride;
+}
+size_t KVCacheManager::scale_layer_offset_elems(int layer) const {
+    const int slot = (impl_->cfg.attn_every > 0) ? (layer / impl_->cfg.attn_every) : layer;
+    return (size_t)slot * impl_->scale_layer_stride;
+}
 bool   KVCacheManager::int8_kv() const { return impl_->int8_kv; }
 void*  KVCacheManager::k_scale_pool() const { return impl_->k_scale; }
 void*  KVCacheManager::v_scale_pool() const { return impl_->v_scale; }

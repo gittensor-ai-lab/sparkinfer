@@ -126,6 +126,15 @@ static bool init_session(BenchSession& s, const std::string& path, int max_ctx, 
     kvc.block_size = 16;
     const char* e8 = getenv("SPARKINFER_KV_INT8");
     kvc.int8_kv = e8 ? (e8[0] != '0') : (max_ctx >= 4096);
+    // Hybrid: only every full_attn_interval-th layer owns KV; the rest are Gated-DeltaNet and keep
+    // their state in the recurrent/conv buffers. Without this the pool reserves sub-pools for all
+    // 64 of Qwen3.8's layers when 16 are used. SPARKINFER_KV_COMPACT=0 restores the full pool.
+    {
+        const char* kc = getenv("SPARKINFER_KV_COMPACT");
+        if (!(kc && kc[0] == '0') && s.cfg.hybrid && s.cfg.full_attn_interval > 1 &&
+            s.cfg.n_layers % s.cfg.full_attn_interval == 0)
+            kvc.attn_every = s.cfg.full_attn_interval;
+    }
     const size_t epb = (size_t)16 * s.cfg.n_kv_heads * s.cfg.head_dim;
     const size_t blocks = (s.cfg.max_seq + 15) / 16 + 8;
     s.kv = std::make_unique<sparkinfer::KVCacheManager>(

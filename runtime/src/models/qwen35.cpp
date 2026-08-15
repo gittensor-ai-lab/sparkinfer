@@ -1342,10 +1342,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // ---- QK-norm + RoPE + KV-append ----
             const bool kv8 = s.kv->int8_kv();
             const int kv_elem = kv8 ? 1 : 2;
-            void* kpool = (char*)s.kv->k_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-            void* vpool = (char*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems() * kv_elem;
-            void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
-            void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + (size_t)L * s.kv->scale_layer_stride_elems() * 2 : nullptr;
+            void* kpool = (char*)s.kv->k_pool() + s.kv->layer_offset_elems(L) * kv_elem;
+            void* vpool = (char*)s.kv->v_pool() + s.kv->layer_offset_elems(L) * kv_elem;
+            void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_offset_elems(L) * 2 : nullptr;
+            void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_offset_elems(L) * 2 : nullptr;
             const bool partial_rope = (c.rope_dim > 0 && c.rope_dim < c.head_dim);
             const bool qkgate_fuse = w.q_has_gate && partial_rope && kv8 && s.use_qkfuse && H == 2048;
             // w.wgate != nullptr means Q and the gate were projected straight into s.q / s.qgate
@@ -2044,7 +2044,9 @@ int lmcache_chunk_size_tokens() {
 
 BridgeKVLayout lmcache_layout_from_cfg(const Qwen35Config& cfg, const KVCacheManager& kv) {
     BridgeKVLayout layout;
-    layout.num_layers = cfg.n_layers;
+    // Sub-pools actually allocated, not model layers: the hybrid pool is compacted to the
+    // full-attention layers, and lmcache_staging walks [0, num_layers) x layer_stride.
+    layout.num_layers = kv.kv_layer_count();
     layout.num_kv_heads = cfg.n_kv_heads;
     layout.head_dim = cfg.head_dim;
     layout.block_size = kv.block_size();

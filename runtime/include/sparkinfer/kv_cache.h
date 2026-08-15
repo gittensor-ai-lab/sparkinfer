@@ -21,6 +21,17 @@ struct KVCacheConfig {
     KVLayout layout = KVLayout::PAGED;
     bool fp8_kv = false;        // FP8 KV cache compression
     bool int8_kv = false;       // int8 (Q8-style) KV cache; halves the long-context KV read
+    // Hybrid (Gated-DeltaNet) models: only every Nth layer is a full-attention layer that owns any
+    // KV; the linear-attention layers keep their state in the recurrent/conv buffers instead. When
+    // >0, the pool is sized for num_layers/attn_every sub-pools and layer_offset_elems() maps an
+    // absolute layer index onto its compact slot. 0 = every layer owns KV (the default, and what
+    // every non-hybrid model wants).
+    //
+    // Qwen3.8-27B is 64 layers with full_attn_interval=4, so 48 of its 64 sub-pools were allocated
+    // and never written: 4.34 GB of the pool at ctx=16k, on a part with ~2.9 GB free after weights.
+    // That is what pushed the batched prefill's scratch arena over the edge -- it declined and fell
+    // back to the per-token loop (79 pp).
+    int attn_every = 0;
 };
 
 // GPU-side KV block pool.
@@ -65,6 +76,14 @@ public:
     void* k_pool() const;
     void* v_pool() const;
     size_t layer_stride_elems() const;   // elements between consecutive layers' sub-pools
+
+    // Element offset of `layer`'s sub-pool. Use this instead of layer * layer_stride_elems():
+    // with attn_every > 0 the sub-pools are compacted and the absolute layer index is not the
+    // slot index. Identity when attn_every == 0.
+    size_t layer_offset_elems(int layer) const;
+    size_t scale_layer_offset_elems(int layer) const;
+    // Number of sub-pools actually allocated (num_layers when attn_every == 0).
+    int kv_layer_count() const;
 
     // int8 KV (Q8-style int8 + per-(token,kv_head) fp16 scale). When int8_kv(), k_pool/v_pool hold
     // int8 and k_scale_pool/v_scale_pool hold one __half scale per head vector.
