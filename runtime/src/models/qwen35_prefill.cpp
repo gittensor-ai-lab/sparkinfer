@@ -427,7 +427,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool nvfp4_down = muse_nvfp4_down || q38_nvfp4_down;
     const size_t fp4_ws_down = nvfp4_down
         ? kernels::prefill_nvfp4_workspace_bytes(N, H, ffn) : 0;
+    // Qwen3.8 GDN in-projections on the FP4 path (loader-built copies; see gdn_qkv_z).
+    const bool q38_gdn_fp4 = q38_nvfp4 && !s.w.layers.empty() &&
+        [&]{ for (const auto& L : s.w.layers) if (L.linear_attn) return L.wqkv_fp4 != nullptr;
+             return false; }() &&
+        kernels::prefill_nvfp4_supported(N, lqkv, H);
+    const size_t fp4_ws_gdnq = q38_gdn_fp4
+        ? kernels::prefill_nvfp4_workspace_bytes(N, lqkv, H) : 0;
+    const size_t fp4_ws_gdnz = q38_gdn_fp4
+        ? kernels::prefill_nvfp4_workspace_bytes(N, lvdim, H) : 0;
     size_t fp4_ws_bytes = (fp4_ws_qkv > fp4_ws_gu) ? fp4_ws_qkv : fp4_ws_gu;
+    if (fp4_ws_gdnq > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_gdnq;
+    if (fp4_ws_gdnz > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_gdnz;
     if (fp4_ws_wo > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_wo;
     if (fp4_ws_down > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_down;
     unsigned char* fp4_a = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
@@ -797,8 +808,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lvdim, H, st);
             kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, lz, N, lvdim, H, st);
         } else {
-            proj(A, w.wqkv,      w.wqkv_type,      b8, lqkv,  H);   // qkv
-            proj(A, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H);   // z gate
+            // Block-scaled FP4 first (Qwen3.8: the loader built these from the FP8 originals) --
+            // one A-quantize of xn feeds both GEMMs, replacing the per-pass FP8->bf16 weight
+            // materialize + naive bf16 GEMM pair (96 x ~197 us per pass on this model).
+            bool fp4_done = false;
+            if (w.wqkv_fp4 && w.wqkv_fp4_sf && fp4_a && fp4_as &&
+                kernels::launch_prefill_nvfp4_quant_a(A, fp4_a, fp4_as, N, H, st) &&
+                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.wqkv_fp4, w.wqkv_fp4_sf,
+                                                   b8, N, lqkv, H, fp4_ws, st)) {
+                fp4_done = true;
+                if (!(w.z_fp4 && w.z_fp4_sf &&
+                      kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.z_fp4, w.z_fp4_sf,
+                                                         lz, N, lvdim, H, fp4_ws, st)))
+                    proj(A, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H);
+            }
+            if (!fp4_done) {
+                proj(A, w.wqkv,      w.wqkv_type,      b8, lqkv,  H);   // qkv
+                proj(A, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H);   // z gate
+            }
         }
     };
 

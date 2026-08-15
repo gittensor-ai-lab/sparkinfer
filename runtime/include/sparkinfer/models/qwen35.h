@@ -70,6 +70,10 @@ struct Qwen35LayerWeights {
     const void* ssm_alpha = nullptr;      // [hidden, value_heads]
     const void* ssm_norm = nullptr;       // [linear_head_dim]
     const void* ssm_out = nullptr;        // [value_dim, hidden]
+    // Qwen3.8 batched prefill: NVFP4 copies of the GDN in-projections (decode keeps the FP8
+    // originals above). Null => prefill uses the dequant-materialize path as before.
+    const void* wqkv_fp4 = nullptr; const void* wqkv_fp4_sf = nullptr;
+    const void* z_fp4 = nullptr;    const void* z_fp4_sf = nullptr;
 
     // GGUF path: experts kept quantized in VRAM (gguf-native [E,out,in] layout).
     // When gate_q != nullptr the model dequantizes these per-layer into scratch
