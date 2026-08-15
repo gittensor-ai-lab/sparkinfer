@@ -13,6 +13,7 @@
 #include <cute/tensor.hpp>
 
 #include <cstdlib>
+#include <cmath>
 
 namespace sparkinfer::kernels {
 namespace {
@@ -309,6 +310,134 @@ typename C::Gemm::Arguments args(const void* a, const void* sa, const void* b, c
             {{alpha, 0.f}, static_cast<const BF*>(nullptr), cs, static_cast<BF*>(d), ds}};
 }
 
+// ---------------------------------------------------------------------------------------------
+// PLAIN e4m3 GEMM ON THE SAME TENSOR CORES.
+//
+// The GDN projections (in_proj_qkv / in_proj_z / out_proj, 48 layers) are the one big weight
+// stream this checkpoint keeps as native FP8, and they run on a hand-written cp.async + ldmatrix
+// kernel (prefill_gemm_fp8.cu). At prefill@128 that kernel reaches 900 GB/s while the CUTLASS
+// block-scaled FFN GEMM in this same file reaches 1391 GB/s on the same box and the same M=128 --
+// the difference is warp specialization and TMA pipeline depth, not the shapes. Measured control:
+// handing the hand-written kernel 33% more CTAs moves it +0.3%, so it is not CTA-starved; it is
+// limited inside the CTA. So run these three shapes through CUTLASS instead.
+//
+// Structured deliberately so the two kernels share an epilogue: this entry point writes UNSCALED
+// FP32 into the caller's existing split-K partials buffer, and the caller then runs the SAME
+// pf_gemm_fp8_sk_epi_kernel it already ran to apply sx/sw and round to bf16. Nothing about how the
+// scales are applied changes, so the only numeric difference is the accumulator -- CUTLASS keeps
+// fp32 the whole way where the hand kernel accumulates in fp16 and flushes every FP8_FLUSH tiles.
+// It also needs no zeroing pass, which removes the per-call cudaMemsetAsync of M*N floats.
+using F8 = cutlass::float_e4m3_t;
+
+// The two dequant scales are applied INSIDE the epilogue, so the GEMM emits finished bf16 and no
+// fp32 tile is ever written to memory. Handing the result out as fp32 for a separate scale pass
+// costs a 4-byte store plus a 4-byte load plus the 2-byte store on every output element -- 10 bytes
+// where 2 will do. Across the 48 GDN layers' three projections that is ~1.06 GB of round-trip per
+// prefill@128, on kernels whose entire weight stream is 5.5 GB.
+//
+// Order is chosen to match pf_gemm_fp8_sk_epi_kernel exactly: it computes `p * s * sw[n]` in float,
+// i.e. (acc * sx) * sw, and rounds to bf16 once at the end. The tree below is the same association
+// with the same single rounding, so switching a projection between the two paths is bit-identical.
+constexpr auto kRN = cutlass::FloatRoundStyle::round_to_nearest;
+
+template <class TileShape>
+struct CfgF8 {
+    // sx is a per-row (per-token) scale -> column vector, stride <_1,_0,_0>.
+    // sw is a per-column (per-output-channel) scale -> row vector, stride <_0,_1,_0>.
+    using Sx = cutlass::epilogue::fusion::Sm90ColBroadcast<0, TileShape, float>;
+    using Sw = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, float>;
+    using MulF32 = cutlass::epilogue::fusion::Sm90Compute<cutlass::multiplies, float, float, kRN>;
+    using MulOut = cutlass::epilogue::fusion::Sm90Compute<cutlass::multiplies, BF, float, kRN>;
+    using Inner = cutlass::epilogue::fusion::Sm90EVT<MulF32, Sx,
+                      cutlass::epilogue::fusion::Sm90AccFetch>;
+    using Fusion = cutlass::epilogue::fusion::Sm90EVT<MulOut, Sw, Inner>;
+
+    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, TileShape, Cluster,
+        cutlass::epilogue::collective::EpilogueTileAuto, float, float,
+        void, cutlass::layout::RowMajor, 1, BF, cutlass::layout::RowMajor, 8,
+        cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>::CollectiveOp;
+    using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+        F8, cutlass::layout::RowMajor, 16, F8, cutlass::layout::ColumnMajor, 16, float,
+        TileShape, Cluster,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+    using Kernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>, Mainloop, Epilogue, void>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+};
+
+// Same two N-tilings, and the same reason as the block-scaled pair above: at m<=128 the grid is one
+// CTA tall, so the wide tile alone cannot cover the machine for the narrower GDN shapes.
+using F8Wide = CfgF8<Shape<_128, _128, _128>>;
+using F8Narrow = CfgF8<Shape<_128, _64, _128>>;
+using F8XNarrow = CfgF8<Shape<_128, _32, _128>>;
+
+// At m<=128 the grid is exactly ceil(n/TileN) CTAs -- one tile row, no second wave to hide a short
+// first one -- and this collective is one CTA per SM (384 threads, TMA-pipelined smem). So the tile
+// choice IS the occupancy choice, and the GDN shapes land badly on a fixed 64-wide tile. Measured
+// per-projection on an RTX 5090 (170 SMs) at prefill@128, after the switch to CUTLASS:
+//   gate/up  n=17408 -> 136 CTAs (0.80 wave)  1414 GB/s
+//   qkv      n=10240 -> 160 CTAs (0.94 wave)  1272 GB/s
+//   ffn_down n= 5120 ->  80 CTAs (0.47 wave)  1268 GB/s
+//   in_proj_z n=6144 ->  96 CTAs (0.56 wave)   885 GB/s
+//   out_proj n= 5120 ->  80 CTAs (0.47 wave)   797 GB/s
+// The two worst are exactly the two that leave half the machine idle. Note ffn_down is also 80 CTAs
+// yet reaches 1268: its K is 17408 against out_proj's 6144, so its K loop amortizes the prologue
+// over ~3x as many tiles. Occupancy hurts most where K is short.
+//
+// So pick TileN by how much of a WAVE the resulting grid fills, not by a fixed threshold. A grid of
+// 1.13 waves is 0.57 effective, worse than one of 0.94 -- the score below is `waves` when it fits
+// in one wave and `waves/ceil(waves)` when it spills, which is just "fraction of the launched slots
+// that do work". Larger tiles win ties because they re-read the shared A tile fewer times.
+// BIT-IDENTICAL: every output element still accumulates the whole K range in the same order; only
+// which CTA owns which output column changes.
+// SPARKINFER_PREFILL_FP8_TILEN=64 (or 128/32) pins one tile; =0 restores the old prefer_narrow.
+int sm_count();   // defined below, next to the block-scaled tile heuristic
+
+inline int f8_pick_tile_n(int m, int n) {
+    const int sms = sm_count();
+    if (m > 128 || sms <= 0) return 128;
+    int best = 128;
+    double best_fill = -1.0;
+    for (int t : {128, 64, 32}) {
+        const double waves = (double)((n + t - 1) / t) / (double)sms;
+        const double fill = waves <= 1.0 ? waves : waves / std::ceil(waves);
+        if (fill > best_fill + 1e-9) { best_fill = fill; best = t; }
+    }
+    return best;
+}
+
+template <class C>
+typename C::Gemm::Arguments f8_args(const void* a, const void* b, void* d,
+                                    const float* sx, const float* sw, int m, int n, int k) {
+    using SA = typename C::Kernel::StrideA;
+    using SB = typename C::Kernel::StrideB;
+    using SC = typename C::Kernel::StrideC;
+    using SD = typename C::Kernel::StrideD;
+    // Sm90EVT<Node, Child0, Child1>::Arguments is {child0, child1, node}, so the tree
+    // MulOut(Sw, MulF32(Sx, Acc)) nests as { {sw...}, { {sx...}, {}, {} }, {} }.
+    typename C::Fusion::Arguments fus = { {sw, 0.f, {}}, { {sx, 0.f, {}}, {}, {} }, {} };
+    return {cutlass::gemm::GemmUniversalMode::kGemm, shape(m, n, k),
+            {static_cast<const F8*>(a), cutlass::make_cute_packed_stride(SA{}, {m, k, 1}),
+             static_cast<const F8*>(b), cutlass::make_cute_packed_stride(SB{}, {n, k, 1})},
+            {fus, static_cast<const BF*>(nullptr),
+             cutlass::make_cute_packed_stride(SC{}, {m, n, 1}),
+             static_cast<BF*>(d), cutlass::make_cute_packed_stride(SD{}, {m, n, 1})}};
+}
+
+template <class C>
+bool run_f8(const void* a, const void* b, void* d, const float* sx, const float* sw,
+            int m, int n, int k, void* ws, cudaStream_t st) {
+    typename C::Gemm gemm;
+    auto ar = f8_args<C>(a, b, d, sx, sw, m, n, k);
+    return gemm.can_implement(ar) == cutlass::Status::kSuccess &&
+           gemm.initialize(ar, ws, st) == cutlass::Status::kSuccess &&
+           gemm.run(st) == cutlass::Status::kSuccess;
+}
+
 int sm_count() {
     static const int sms = [] {
         int dev = 0, c = 0;
@@ -419,11 +548,53 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
         const char* e = getenv("SPARKINFER_NVFP4_EVICT_FIRST");
         return !e || atoi(e) != 0;
     }();
+    // NOTE: the wave-fill tile picker the FP8 path uses (f8_pick_tile_n) was tried here too and
+    // measured WORSE -- 1.0782x -> 1.0434x prefill@128. ffn_down at n=5120 does move from 80 to 160
+    // CTAs, but a 32-wide tile halves the columns each A tile is amortized over while the
+    // block-scale operand's own N granularity stops paying for itself. The block-scaled path keeps
+    // two rungs; only the plain-FP8 one gets three.
     if (ef)
         return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha)
                                   : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha);
     return prefer_narrow(m,n) ? run_gemm<Narrow>(a,sa,b,sb,d,m,n,k,ws,st,alpha)
                               : run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st,alpha);
+}
+
+bool prefill_ct_fp8_gemm_supported(int m, int n, int k) {
+    int dev = 0, major = 0, minor = 0;
+    // 16-element alignment on both operands is the F8F6F4 collective's requirement; the FP32 D
+    // operand needs 4. The GDN shapes (k=5120/6144, n=10240/6144/5120) clear all of them.
+    return cudaGetDevice(&dev) == cudaSuccess &&
+           cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+           cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+           major == 12 && minor == 0 && m > 0 && n > 0 && k > 0 &&
+           !(k & 15) && !(n & 15) && !(n & 3);
+}
+
+size_t prefill_ct_fp8_gemm_workspace_bytes(int m, int n, int k) {
+    const size_t w = F8Wide::Gemm::get_workspace_size(
+        f8_args<F8Wide>(nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k));
+    const size_t nw = F8Narrow::Gemm::get_workspace_size(
+        f8_args<F8Narrow>(nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k));
+    const size_t xw = F8XNarrow::Gemm::get_workspace_size(
+        f8_args<F8XNarrow>(nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k));
+    return w > nw ? (w > xw ? w : xw) : (nw > xw ? nw : xw);
+}
+
+bool launch_prefill_ct_fp8_gemm(const void* a, const void* b, void* d,
+                                const float* sx, const float* sw,
+                                int m, int n, int k, void* ws, cudaStream_t st) {
+    if (!a || !b || !d || !sx || !sw || !prefill_ct_fp8_gemm_supported(m, n, k)) return false;
+    static const int pin = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_FP8_TILEN");
+        return e ? atoi(e) : -1;
+    }();
+    const int t = (pin == 128 || pin == 64 || pin == 32) ? pin
+                : (pin == 0 ? (prefer_narrow(m, n) ? 64 : 128)   // legacy sizing
+                            : f8_pick_tile_n(m, n));
+    if (t == 32) return run_f8<F8XNarrow>(a, b, d, sx, sw, m, n, k, ws, st);
+    if (t == 64) return run_f8<F8Narrow>(a, b, d, sx, sw, m, n, k, ws, st);
+    return run_f8<F8Wide>(a, b, d, sx, sw, m, n, k, ws, st);
 }
 
 // ---- HuggingFace "compressed-tensors" NVFP4 checkpoint dequant (load-time, one-shot) ----

@@ -21,6 +21,7 @@
 #include <cuda_pipeline.h>
 #include <cstdlib>
 #include "sparkinfer/kernels/prefill_fp8.h"
+#include "sparkinfer/kernels/prefill_nvfp4.h"   // launch_prefill_ct_fp8_gemm (stubbed when NVFP4 is off)
 
 namespace sparkinfer { namespace kernels {
 
@@ -77,6 +78,42 @@ __global__ void pf_quantize_rows_fp8_kernel(const __nv_bfloat16* __restrict__ x,
     if (lane == 0) scale[r] = d;
     for (int c = lane; c < cols; c += 32)
         q[(size_t)r * cols + c] = __nv_fp8_e4m3(__bfloat162float(x[(size_t)r * cols + c]) / d);
+}
+
+// Same quantize, one BLOCK per row instead of one warp. At the GDN widths (cols = 5120/6144) the
+// one-warp form gives each lane 160-192 strided 2-byte loads and reads the row twice, which is why
+// 96 launches of it cost 0.42 ms of a 26.9 ms prefill@128 at ~4.4 us each. 256 threads and
+// bf16x2 loads cut both the per-lane trip count and the request count 16x.
+// BIT-IDENTICAL: amax is a max-reduction, so widening it cannot change the value it produces, and
+// every element keeps the same x / d division and the same e4m3 rounding.
+__global__ __launch_bounds__(256) void pf_quantize_rows_fp8_wide_kernel(
+        const __nv_bfloat16* __restrict__ x, __nv_fp8_e4m3* __restrict__ q,
+        float* __restrict__ scale, int rows, int cols) {
+    __shared__ float s_part[8];
+    const int r = blockIdx.x, tid = threadIdx.x;
+    if (r >= rows) return;
+    const size_t base = (size_t)r * cols;
+    const int half = cols >> 1;                       // cols is even at every shape this serves
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x + base);
+    float amax = 0.f;
+    for (int c = tid; c < half; c += 256) {
+        const __nv_bfloat162 v = x2[c];
+        amax = fmaxf(amax, fmaxf(fabsf(__bfloat162float(v.x)), fabsf(__bfloat162float(v.y))));
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    if ((tid & 31) == 0) s_part[tid >> 5] = amax;
+    __syncthreads();
+    amax = s_part[0];
+    #pragma unroll
+    for (int w = 1; w < 8; w++) amax = fmaxf(amax, s_part[w]);
+    const float d = (amax == 0.f) ? 1.f : (amax / FP8_TGT);
+    if (tid == 0) scale[r] = d;
+    for (int c = tid; c < half; c += 256) {
+        const __nv_bfloat162 v = x2[c];
+        q[base + 2 * c]     = __nv_fp8_e4m3(__bfloat162float(v.x) / d);
+        q[base + 2 * c + 1] = __nv_fp8_e4m3(__bfloat162float(v.y) / d);
+    }
 }
 
 // The 2 in __launch_bounds__ mirrors the int8 kernel: unbounded, nvcc picks a register count that
@@ -256,6 +293,17 @@ void launch_prefill_fp8_wscales_bf16(const void* scale_bf16, float* sw, int n,
 
 void launch_prefill_quantize_rows_fp8(const void* x_bf16, void* q, float* scale,
                                       int rows, int cols, cudaStream_t stream) {
+    // SPARKINFER_PREFILL_FP8_QUANT_WIDE=0 restores the one-warp-per-row kernel (A/B in ONE binary).
+    static const bool wide = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_FP8_QUANT_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    if (wide && rows > 0 && cols > 0 && !(cols & 1)) {
+        pf_quantize_rows_fp8_wide_kernel<<<rows, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+            reinterpret_cast<__nv_fp8_e4m3*>(q), scale, rows, cols);
+        return;
+    }
     pf_quantize_rows_fp8_kernel<<<rows, 32, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_bf16),
         reinterpret_cast<__nv_fp8_e4m3*>(q), scale, rows, cols);
@@ -313,6 +361,23 @@ bool launch_prefill_gemm_fp8_splitk(const void* A, const void* W,
         return !(e && e[0] == '0');
     }();
     if (!on || !partials || M <= 0 || M > FP8_BM || N <= 0 || K <= 0) return false;
+
+    // Prefer the CUTLASS F8F6F4 collective for the same problem. It applies sx/sw in its own
+    // epilogue with the same (acc*sx)*sw association and the same single bf16 rounding this file's
+    // pf_gemm_fp8_sk_epi_kernel uses, and writes bf16 straight to C -- so there is no fp32 tile, no
+    // second pass over M*N, and no zeroing pass (the split-K memset goes away with it).
+    // Only taken when CUTLASS wants no workspace: this runs inside the captured prefill graph,
+    // where there is nowhere to allocate one. SPARKINFER_PREFILL_FP8_CUTLASS=0 restores the
+    // hand-written split-K kernel (A/B in ONE binary).
+    static const bool ct_on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_FP8_CUTLASS");
+        return !(e && e[0] == '0');
+    }();
+    if (ct_on && prefill_ct_fp8_gemm_supported(M, N, K) &&
+        prefill_ct_fp8_gemm_workspace_bytes(M, N, K) == 0 &&
+        launch_prefill_ct_fp8_gemm(A, W, C, sx, sw, M, N, K, nullptr, stream))
+        return true;
+
     const int splits = fp8_sk_splits(M, N, K);
     if (splits <= 1) return false;
     const int nk = (K + FP8_BK - 1) / FP8_BK;

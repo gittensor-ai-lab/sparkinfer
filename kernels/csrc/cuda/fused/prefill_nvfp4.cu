@@ -17,6 +17,10 @@ bool launch_prefill_nvfp4_swiglu_quant_a(const void*, const void*, void*, void*,
 bool launch_prefill_nvfp4_quant_b(const void*, void*, void*, int, int, cudaStream_t) { return false; }
 bool launch_prefill_nvfp4_gemm(const void*, const void*, const void*, const void*, void*, int, int,
                                int, void*, cudaStream_t, float) { return false; }
+bool prefill_ct_fp8_gemm_supported(int, int, int) { return false; }
+size_t prefill_ct_fp8_gemm_workspace_bytes(int, int, int) { return 0; }
+bool launch_prefill_ct_fp8_gemm(const void*, const void*, void*, const float*, const float*,
+                                int, int, int, void*, cudaStream_t) { return false; }
 bool launch_ct_nvfp4_pack_sfb(const void*, void*, int, int, cudaStream_t) { return false; }
 } // namespace sparkinfer::kernels
 #endif

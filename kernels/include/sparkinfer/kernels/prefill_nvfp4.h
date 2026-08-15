@@ -31,6 +31,23 @@ bool launch_prefill_nvfp4_gemm(const void* a_fp4, const void* sfa,
                                void* workspace, cudaStream_t stream = nullptr,
                                float alpha = 1.f);
 
+// ---- plain (non block-scaled) e4m3 GEMM on the same SM120 tensor cores --------------------------
+// A [m,k] row-major e4m3, B [n,k] row-major e4m3 (i.e. TN, K-major on both, which is the only
+// layout the SM120 F8F6F4 collective accepts), D [m,n] row-major bf16.
+// The per-row activation scale sx[m] and per-column weight scale sw[n] are applied INSIDE the
+// epilogue as (acc * sx) * sw with a single round to bf16 -- the same association and the same
+// single rounding pf_gemm_fp8_sk_epi_kernel performs, so a projection can move between this path
+// and the hand-written split-K one bit-identically. Emitting bf16 here means no fp32 tile is ever
+// written to memory.
+// Returns false when NVFP4 support is compiled out, the device is not sm_120, the shape is not
+// 16-element aligned, or CUTLASS declines the problem -- caller falls back to its own kernel.
+bool prefill_ct_fp8_gemm_supported(int m, int n, int k);
+size_t prefill_ct_fp8_gemm_workspace_bytes(int m, int n, int k);
+bool launch_prefill_ct_fp8_gemm(const void* a_e4m3, const void* b_e4m3, void* d_bf16,
+                                const float* sx, const float* sw,
+                                int m, int n, int k, void* workspace,
+                                cudaStream_t stream = nullptr);
+
 // Scatter a compressed-tensors row-major UE4M3 scale [n, k/16] into the CUTLASS
 // SFB layout launch_prefill_nvfp4_gemm expects for B. Packed E2M1 bytes are
 // already the same nibble order as launch_prefill_nvfp4_quant_b, so they are
