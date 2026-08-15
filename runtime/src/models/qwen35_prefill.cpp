@@ -1144,6 +1144,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
                                        ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
                     }
+                    // Both arms above land the FFN output in `ao`, and the epilogue only folds `ao`
+                    // into the residual when !ffn_fused. That held while Muse Glimmer was the only
+                    // model reaching here (ffn_fused is `!c.muse_glimmer && ...`, so always false
+                    // for it). Qwen3.8-27B is the first non-Muse model in this branch and it DOES
+                    // fuse the residual, so the epilogue skipped the add and every FP4 layer's FFN
+                    // output was computed and then dropped -- batched-vs-token-loop top1 4/16,
+                    // KL 3.13. Add it here for the chunk rather than declining the FP4 arms, which
+                    // would give the residual back at the cost of the block-scaled down GEMM.
+                    if (ffn_fused)
+                        kernels::launch_prefill_add(x + (size_t)fo * H, ao + (size_t)fo * H,
+                                                    x + (size_t)fo * H, (long)fn * H, st);
                     continue;
                 }
                 if (ffn_i8) {

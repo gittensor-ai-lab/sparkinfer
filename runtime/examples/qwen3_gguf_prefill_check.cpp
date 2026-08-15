@@ -15,6 +15,7 @@
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
 #include "qwen3_gguf_config.h"
+#include "qwen_checkpoint.h"   // after models/qwen35.h: it references sparkinfer::Qwen35Model
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -53,10 +54,17 @@ int main(int argc, char** argv) {
     const int P = argc > 2 ? atoi(argv[2]) : 4096;
     const int C = argc > 3 ? atoi(argv[3]) : 16;
 
+    // Same three-way detection the bench/score tools use, so this checker can verify a
+    // compressed-tensors (NVFP4/FP8) directory too -- previously it only opened a .gguf, which
+    // left the one model whose prefill@128 is scored with no batched-prefill correctness gate.
     sparkinfer::GGUF g;
-    if (!g.open(path)) { printf("[FAIL] open %s\n", path.c_str()); return 1; }
     sparkinfer::Qwen35Config cfg;
-    qwen3_config_from_gguf(g, cfg);
+    QwenCheckpointKind kind = QwenCheckpointKind::Gguf;
+    std::string cperr;
+    if (!qwen_checkpoint_open(path, cfg, g, kind, cperr)) {
+        printf("[FAIL] open %s: %s\n", path.c_str(), cperr.c_str());
+        return 1;
+    }
     cfg.max_seq = P + C + 16;
 
     auto rt = sparkinfer::Runtime::create({}); rt->initialize();
@@ -71,7 +79,7 @@ int main(int argc, char** argv) {
     mc.ffn_dim = cfg.moe_ffn; mc.num_layers = cfg.n_layers;
     auto engine = sparkinfer::moe::MoEEngine::create(mc);
     sparkinfer::Qwen35Model model(cfg, &kv, engine.get());
-    if (!model.load_gguf(path)) { printf("[FAIL] load_gguf\n"); return 1; }
+    if (!qwen_checkpoint_load(model, path, kind)) { printf("[FAIL] load (%s)\n", qwen_checkpoint_kind_label(kind)); return 1; }
 
     std::vector<int> prompt(P), cont(C);
     for (int i = 0; i < P; i++) prompt[i] = 100 + (i % 20000);
