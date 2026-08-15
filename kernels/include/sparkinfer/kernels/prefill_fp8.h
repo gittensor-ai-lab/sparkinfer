@@ -35,6 +35,14 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
                              const float* sx, const float* sw, void* C,
                              int M, int N, int K, cudaStream_t stream = nullptr);
 
+// Split-K variant for the scored M=128 GDN projections (40-64 tiles on a 170-SM 5090).
+// `partials` is M*N fp32. Returns false when the shape already fills the device (caller
+// keeps launch_prefill_gemm_fp8). SPARKINFER_PREFILL_GEMM_SPLITK=0 disables.
+bool launch_prefill_gemm_fp8_splitk(const void* A, const void* W,
+                                    const float* sx, const float* sw, void* C,
+                                    int M, int N, int K, float* partials,
+                                    cudaStream_t stream = nullptr);
+
 // Fused SwiGLU + per-row int8 quantize: q[r,:] = int8(silu(gate[r,:]) * up[r,:]) with
 // scale[r] = amax_c|.| / 127. Replaces launch_prefill_swiglu + launch_prefill_quantize_rows_i8 on
 // the ffn-wide intermediate (one block per row), removing its DRAM round-trip. Bit-identical.
