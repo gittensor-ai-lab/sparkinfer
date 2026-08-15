@@ -27,6 +27,10 @@
 #include "qwen38_hf_config.h"
 
 #include <sys/stat.h>
+// MSVC's <sys/stat.h> defines _S_IFDIR but not the POSIX S_ISDIR macro family.
+#if defined(_MSC_VER) && !defined(S_ISDIR)
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
 
 #include <fstream>
 #include <string>
