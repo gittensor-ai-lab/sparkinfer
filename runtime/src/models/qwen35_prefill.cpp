@@ -811,7 +811,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // FP8-direct first (Qwen3.8): the resident checkpoint FP8 payloads with staged f32
             // scales -- zero weight-side quantization error (decode's exact bytes), only the
             // e4m3 A-quantize differs from the bf16 materialize path this replaces.
-            if (w.wqkv_fp8_w && w.wqkv_fp8_sw && w.z_fp8_w && w.z_fp8_sw) {
+            if (w.wqkv_fp8_w && w.wqkv_fp8_sw && w.z_fp8_w && w.z_fp8_sw && A_i8 && sx) {
                 a_q = nullptr; a_pk = false;            // A_i8 becomes e4m3 -- invalidate the memo
                 kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);
                 kernels::launch_prefill_gemm_fp8(A_i8, w.wqkv_fp8_w, sx, w.wqkv_fp8_sw,
@@ -897,7 +897,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // resident checkpoint payload with staged f32 scales, one e4m3 A-quantize of the
             // gated-norm output. Falls through to the existing paths when unavailable.
             bool out_fp8_done = false;
-            if (w.out_fp8_w && w.out_fp8_sw) {
+            if (w.out_fp8_w && w.out_fp8_sw && A_i8 && sx) {
                 a_q = nullptr; a_pk = false;            // A_i8 becomes e4m3 -- invalidate the memo
                 kernels::launch_prefill_quantize_rows_fp8(lnrm, A_i8, sx, N, lvdim, st);
                 kernels::launch_prefill_gemm_fp8(A_i8, w.out_fp8_w, sx, w.out_fp8_sw,
