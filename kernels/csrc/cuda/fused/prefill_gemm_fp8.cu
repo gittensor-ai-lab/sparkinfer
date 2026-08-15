@@ -19,6 +19,7 @@
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cuda_pipeline.h>
+#include <cstdlib>
 #include "sparkinfer/kernels/prefill_fp8.h"
 
 namespace sparkinfer { namespace kernels {
@@ -80,10 +81,14 @@ __global__ void pf_quantize_rows_fp8_kernel(const __nv_bfloat16* __restrict__ x,
 
 // The 2 in __launch_bounds__ mirrors the int8 kernel: unbounded, nvcc picks a register count that
 // keeps only one block per SM resident.
+// SPLITK partitions the K loop across blockIdx.z (same occupancy fix as launch_prefill_gemm_i8_splitk)
+// and atomicAdds the unscaled fp32 tile into P[M,N]; a separate epilogue applies sx*sw.
+template <bool SPLITK>
 __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
         const __nv_fp8_e4m3* __restrict__ A, const __nv_fp8_e4m3* __restrict__ W,
         const float* __restrict__ sx, const float* __restrict__ sw,
-        __nv_bfloat16* __restrict__ C, int M, int N, int K) {
+        __nv_bfloat16* __restrict__ C, float* __restrict__ P,
+        int M, int N, int K, int ktiles) {
     __shared__ __nv_fp8_e4m3 As[2][FP8_BM][FP8_BK];
     __shared__ __nv_fp8_e4m3 Bs[2][FP8_BN][FP8_BK];
 
@@ -99,6 +104,13 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
     const int m0   = blockIdx.y * FP8_BM;
     const int n0   = blockIdx.x * FP8_BN;
     const int nk   = (K + FP8_BK - 1) / FP8_BK;
+    int t0 = 0, t1 = nk;
+    if (SPLITK) {
+        t0 = blockIdx.z * ktiles;
+        t1 = t0 + ktiles;
+        if (t1 > nk) t1 = nk;
+        if (t0 >= t1) return;
+    }
 
     float acc[FP8_MFRAG][FP8_NFRAG][4];
     #pragma unroll
@@ -127,11 +139,11 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
         #pragma unroll
         for (int j = 0; j < FP8_NFRAG; j++) { h[i][j][0] = 0u; h[i][j][1] = 0u; }
 
-    stage(0, 0);
+    stage(0, t0 * FP8_BK);
     int buf = 0;
-    for (int t = 0; t < nk; t++) {
-        if (t + 1 < nk) stage(buf ^ 1, (t + 1) * FP8_BK);
-        __pipeline_wait_prior(t + 1 < nk ? 1 : 0);
+    for (int t = t0; t < t1; t++) {
+        if (t + 1 < t1) stage(buf ^ 1, (t + 1) * FP8_BK);
+        __pipeline_wait_prior(t + 1 < t1 ? 1 : 0);
         __syncthreads();
 
         #pragma unroll
@@ -163,7 +175,7 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
                           "r"(bf[j][0]), "r"(bf[j][1]));
         }
         // flush fp16 partials into the fp32 accumulator every FP8_FLUSH tiles (and on the last one)
-        if ((t % FP8_FLUSH) == FP8_FLUSH - 1 || t == nk - 1) {
+        if ((t % FP8_FLUSH) == FP8_FLUSH - 1 || t == t1 - 1) {
             #pragma unroll
             for (int i = 0; i < FP8_MFRAG; i++)
                 #pragma unroll
@@ -179,6 +191,23 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
         }
         __syncthreads();
         buf ^= 1;
+    }
+
+    if (SPLITK) {
+        #pragma unroll
+        for (int i = 0; i < FP8_MFRAG; i++) {
+            #pragma unroll
+            for (int j = 0; j < FP8_NFRAG; j++) {
+                const int gn = n0 + wn * 64 + j * 8 + tig * 2;
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int gm = m0 + wm * 32 + i * 16 + grp + (e >> 1) * 8;
+                    const int cn = gn + (e & 1);
+                    if (gm < M && cn < N) atomicAdd(&P[(size_t)gm * N + cn], acc[i][j][e]);
+                }
+            }
+        }
+        return;
     }
 
     // Registers straight to global: c0/c1 (and c2/c3) are adjacent columns -> one bf16x2 store each.
@@ -236,9 +265,69 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
                              const float* sx, const float* sw, void* C,
                              int M, int N, int K, cudaStream_t stream) {
     dim3 grid((N + FP8_BN - 1) / FP8_BN, (M + FP8_BM - 1) / FP8_BM);
-    pf_gemm_fp8_kernel<<<grid, 256, 0, stream>>>(
+    pf_gemm_fp8_kernel<false><<<grid, 256, 0, stream>>>(
         reinterpret_cast<const __nv_fp8_e4m3*>(A), reinterpret_cast<const __nv_fp8_e4m3*>(W),
-        sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+        sx, sw, reinterpret_cast<__nv_bfloat16*>(C), nullptr, M, N, K, 0);
+}
+
+// Same occupancy knee as the int8 split-K launcher: one 128x128 tile per block, so GDN
+// qkv/z/out at M=128 are 64/48/40 blocks on a 170-SM 5090.
+constexpr int FP8_SK_TILES_MAX = 96;
+constexpr int FP8_SK_TARGET    = 170;
+constexpr int FP8_SK_MIN_KT    = 2;
+constexpr int FP8_SK_MAX       = 32;
+
+static int fp8_sk_splits(int M, int N, int K) {
+    const int tiles = ((N + FP8_BN - 1) / FP8_BN) * ((M + FP8_BM - 1) / FP8_BM);
+    if (tiles <= 0 || tiles >= FP8_SK_TILES_MAX) return 1;
+    int s = (FP8_SK_TARGET + tiles - 1) / tiles;
+    if (s > FP8_SK_MAX) s = FP8_SK_MAX;
+    const int smax = ((K + FP8_BK - 1) / FP8_BK) / FP8_SK_MIN_KT;
+    if (s > smax) s = smax;
+    return s > 1 ? s : 1;
+}
+
+__global__ void pf_gemm_fp8_sk_epi_kernel(const float* __restrict__ P, const float* __restrict__ sx,
+                                          const float* __restrict__ sw, __nv_bfloat16* __restrict__ C,
+                                          int M, int N) {
+    const int m = blockIdx.y;
+    if (m >= M) return;
+    const float s = sx[m];
+    const size_t row = (size_t)m * N;
+    int n = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (n + 1 < N) {
+        const float2 p = *reinterpret_cast<const float2*>(&P[row + n]);
+        *reinterpret_cast<__nv_bfloat162*>(&C[row + n]) =
+            __floats2bfloat162_rn(p.x * s * sw[n], p.y * s * sw[n + 1]);
+    } else if (n < N) {
+        C[row + n] = __float2bfloat16(P[row + n] * s * sw[n]);
+    }
+}
+
+bool launch_prefill_gemm_fp8_splitk(const void* A, const void* W,
+                                    const float* sx, const float* sw, void* C,
+                                    int M, int N, int K, float* partials,
+                                    cudaStream_t stream) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GEMM_SPLITK");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || !partials || M <= 0 || M > FP8_BM || N <= 0 || K <= 0) return false;
+    const int splits = fp8_sk_splits(M, N, K);
+    if (splits <= 1) return false;
+    const int nk = (K + FP8_BK - 1) / FP8_BK;
+    const int ktiles = (nk + splits - 1) / splits;
+    const int nz = (nk + ktiles - 1) / ktiles;
+    if (cudaMemsetAsync(partials, 0, (size_t)M * N * sizeof(float), stream) != cudaSuccess)
+        return false;
+    dim3 grid((N + FP8_BN - 1) / FP8_BN, (M + FP8_BM - 1) / FP8_BM, nz);
+    pf_gemm_fp8_kernel<true><<<grid, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(A), reinterpret_cast<const __nv_fp8_e4m3*>(W),
+        sx, sw, nullptr, partials, M, N, K, ktiles);
+    dim3 eg(((N + 1) / 2 + 255) / 256, M);
+    pf_gemm_fp8_sk_epi_kernel<<<eg, 256, 0, stream>>>(
+        partials, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N);
+    return true;
 }
 
 }} // namespace sparkinfer::kernels
