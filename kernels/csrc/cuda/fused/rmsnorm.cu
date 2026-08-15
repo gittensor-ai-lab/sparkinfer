@@ -1100,6 +1100,115 @@ void launch_norm_then_add(const void* residual, const void* block_out, const voi
         reinterpret_cast<__nv_bfloat16*>(out), rows, cols, eps);
 }
 
+// The Muse sandwich pair as ONE node: out = residual + RMSNorm(block_out)*w1 (eps1, the 1e-8
+// sandwich eps) immediately followed by out2 = RMSNorm(out)*w2 (eps2, the model rms_eps -- the
+// pre-FFN norm after the attention sandwich, or the next layer's input norm after the FFN one).
+// Both halves are 1-CTA-per-row kernels on the same grid already, so this halves the node count
+// without touching occupancy -- the trap that killed the norm->quant fusion. Bit-identical: `out`
+// is rounded to bf16 BEFORE the second sum-of-squares (held in registers as the packed bf16), so
+// the second norm consumes exactly the tensor the separate rmsnorm re-read from memory, and every
+// reduction keeps the originals' per-thread order and rn_warp_sum tree.
+template <int PER>
+__global__ void norm_then_add_rmsnorm_kernel(const __nv_bfloat16* __restrict__ residual,
+                                             const __nv_bfloat16* __restrict__ block_out,
+                                             const __nv_bfloat16* __restrict__ w1,
+                                             __nv_bfloat16* __restrict__ out,
+                                             const __nv_bfloat16* __restrict__ w2,
+                                             __nv_bfloat16* __restrict__ out2,
+                                             int rows, int cols, float eps1, float eps2) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const size_t base = (size_t)row * cols;
+    __shared__ float s_warp[32];
+    const int npack = cols >> 3;                     // cols % 8 == 0, launcher-enforced
+    const uint4* b4  = reinterpret_cast<const uint4*>(block_out + base);
+    const uint4* r4  = reinterpret_cast<const uint4*>(residual + base);
+    const uint4* w14 = reinterpret_cast<const uint4*>(w1);
+    const uint4* w24 = reinterpret_cast<const uint4*>(w2);
+    uint4* o4  = reinterpret_cast<uint4*>(out + base);
+    uint4* o24 = reinterpret_cast<uint4*>(out2 + base);
+
+    float ss = 0.f;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+        float bv[8]; rn_unpack8(__ldg(b4 + p), bv);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ss = __fmaf_rn(bv[j], bv[j], ss);
+    }
+    ss = rn_warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        v = rn_warp_sum(v);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps1);
+    }
+    __syncthreads();
+    const float inv1 = s_warp[0];
+
+    uint4 hreg[PER];
+    float ss2 = 0.f;
+    int held = 0;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x, held++) {
+        float bv[8]; rn_unpack8(__ldg(b4 + p), bv);
+        float rv[8]; rn_unpack8(__ldg(r4 + p), rv);
+        float wv[8]; rn_unpack8(__ldg(w14 + p), wv);
+        float ov[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ov[j] = rv[j] + bv[j] * inv1 * wv[j];
+        const uint4 packed = rn_pack8(ov);           // the bf16 the first norm always wrote
+        o4[p] = packed;
+        hreg[held] = packed;
+        float hv[8]; rn_unpack8(packed, hv);         // second sumsq over the ROUNDED values
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ss2 = __fmaf_rn(hv[j], hv[j], ss2);
+    }
+    __syncthreads();                                 // everyone is past reading inv1
+    ss2 = rn_warp_sum(ss2);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss2;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        v = rn_warp_sum(v);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps2);
+    }
+    __syncthreads();
+    const float inv2 = s_warp[0];
+
+    held = 0;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x, held++) {
+        float hv[8]; rn_unpack8(hreg[held], hv);
+        float wv[8]; rn_unpack8(__ldg(w24 + p), wv);
+        float ov[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ov[j] = hv[j] * inv2 * wv[j];
+        o24[p] = rn_pack8(ov);
+    }
+}
+
+bool launch_norm_then_add_rmsnorm(const void* residual, const void* block_out, const void* w1,
+                                  void* out, const void* w2, void* out2,
+                                  int rows, int cols, float eps1, float eps2,
+                                  cudaStream_t stream) {
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_MUSE_SANDWICH_FUSE");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!enabled || rows <= 0 || cols <= 0 || (cols & 7) != 0) return false;
+    const int npack = cols >> 3;
+    const int per = (npack + 255) / 256;
+    auto rb = reinterpret_cast<const __nv_bfloat16*>(residual);
+    auto bb = reinterpret_cast<const __nv_bfloat16*>(block_out);
+    auto w1b = reinterpret_cast<const __nv_bfloat16*>(w1);
+    auto w2b = reinterpret_cast<const __nv_bfloat16*>(w2);
+    auto ob = reinterpret_cast<__nv_bfloat16*>(out);
+    auto o2b = reinterpret_cast<__nv_bfloat16*>(out2);
+    if (per <= 1)      norm_then_add_rmsnorm_kernel<1><<<rows, 256, 0, stream>>>(rb, bb, w1b, ob, w2b, o2b, rows, cols, eps1, eps2);
+    else if (per <= 2) norm_then_add_rmsnorm_kernel<2><<<rows, 256, 0, stream>>>(rb, bb, w1b, ob, w2b, o2b, rows, cols, eps1, eps2);
+    else if (per <= 4) norm_then_add_rmsnorm_kernel<4><<<rows, 256, 0, stream>>>(rb, bb, w1b, ob, w2b, o2b, rows, cols, eps1, eps2);
+    else return false;
+    return true;
+}
+
 void launch_add_rmsnorm3(const void* x, const void* res1, const void* res2, const void* weight,
                          void* out_sum, void* out_norm, int rows, int cols, float eps,
                          cudaStream_t stream) {

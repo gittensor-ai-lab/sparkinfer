@@ -837,6 +837,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         // norm to consume directly. Per layer: qb_partials is reused by the next GEMM.
         int attn_acc = 0, ffn_acc = 0;
         bool hn_quantized = false;   // pre-FFN norm already emitted A_i8/sx for the grouped FFN
+        bool sandwich2_fused = false; // post-FFN sandwich already emitted next layer's xn
         if (w.linear_attn) {
             // ---- Gated DeltaNet linear-attention layer ----
             // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
@@ -1046,6 +1047,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // Sandwich (post_attn_norm/post_ffn_norm) RMSNorm uses its OWN eps 1e-8
             // (upstream post_norm_eps), NOT the model's rms_eps (1e-5) which drives
             // attn_norm/ffn_norm/q_norm/k_norm -- mirrors the decode fix (qwen35.cpp:6d911d4).
+            // Both sandwich halves are 1-CTA-per-row kernels on the same grid, so the pair runs
+            // as ONE node when neither the split-K accumulator nor the fused int8 quantize wants
+            // the separate forms (bit-identical either way; see norm_then_add_rmsnorm_kernel).
+            bool sandwich1_fused = false;
+            if (!attn_acc && !(muse_ffn_group && muse_qb && use_i8 && FC >= N))
+                sandwich1_fused = kernels::launch_norm_then_add_rmsnorm(
+                    x, ao, w.post_attn_norm, h, w.ffn_norm, hn, N, H, 1e-8f, eps, st);
+            if (!sandwich1_fused) {
             if (attn_acc)
                 kernels::launch_norm_then_add_acc(x, qb_partials, sx, w.wo_rs, w.post_attn_norm,
                                                   h, N, H, 1e-8f, st);
@@ -1064,6 +1073,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 a_pk = A_i8p != nullptr;
             } else {
                 kernels::launch_rmsnorm(h, w.ffn_norm, hn, N, H, eps, st);
+            }
             }
         } else {
             // x += ao (post-attn residual, in-place; skipped when folded into the output proj)
@@ -1241,11 +1251,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 // Sandwich norm (post-FFN): x = h + RMSNorm(ao) * post_ffn_norm (decode
                 // qwen35.cpp:1329). h is the post-attn residual stream; ao holds the raw FFN output.
                 // Same 1e-8 post_norm_eps as the post-attn sandwich norm above.
-                if (ffn_acc)
+                if (ffn_acc) {
                     kernels::launch_norm_then_add_acc(h, qb_partials, sx, w.down_rs,
                                                       w.post_ffn_norm, x, N, H, 1e-8f, st);
-                else
-                    kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
+                } else {
+                    // Pair the post-FFN sandwich with the next layer's input norm (or the final
+                    // norm) the same way -- one node instead of two, bit-identical.
+                    const void* nn2 = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm
+                                                           : s.w.final_norm;
+                    sandwich2_fused = kernels::launch_norm_then_add_rmsnorm(
+                        h, ao, w.post_ffn_norm, x, nn2, xn, N, H, 1e-8f, eps, st);
+                    if (!sandwich2_fused)
+                        kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
+                }
             } else if (!ffn_fused) {
                 // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk)
                 kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
@@ -1738,8 +1756,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_pfm_resid3(x, routed_f32, shared_out, x, (long)N * H, st);
         }
 
-        const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
+        if (!sandwich2_fused) {
+            const void* next_norm =
+                (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
+            kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
+        }
     }
 
     if (moe_overlap) {

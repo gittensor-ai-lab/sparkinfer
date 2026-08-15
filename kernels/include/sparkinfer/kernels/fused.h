@@ -44,6 +44,13 @@ void launch_norm_then_add_acc(const void* residual_bf16, const int* acc, const f
                               const float* row_scale, const void* weight_bf16, void* out_bf16,
                               int rows, int cols, float eps, cudaStream_t stream);
 
+// The Muse sandwich pair as one node: out = residual + RMSNorm(block_out, w1, eps1), then
+// out2 = RMSNorm(out, w2, eps2). Bit-identical to the two separate launches; false = caller
+// runs them separately (odd cols, or SPARKINFER_MUSE_SANDWICH_FUSE=0).
+bool launch_norm_then_add_rmsnorm(const void* residual, const void* block_out, const void* w1,
+                                  void* out, const void* w2, void* out2,
+                                  int rows, int cols, float eps1, float eps2,
+                                  cudaStream_t stream = nullptr);
 void launch_norm_then_add(const void* residual_bf16, const void* block_out_bf16,
                           const void* weight_bf16, void* out_bf16,
                           int rows, int cols, float eps, cudaStream_t stream = nullptr);
