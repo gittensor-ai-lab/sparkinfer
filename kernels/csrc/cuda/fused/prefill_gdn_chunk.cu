@@ -535,7 +535,10 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     }();
     static const int minctx = [] {
         const char* e = getenv("SPARKINFER_PREFILL_GDN_CHUNK_MINCTX");
-        return e ? atoi(e) : 256;
+        // 128: Qwen3.8-27B scored prefill (48 v-heads, hd=128) amortizes the prep
+        // pass — sequential scan is the leftover serial chain at ctx=128.
+        // 256 was the Qwythos-era default; SPARKINFER_PREFILL_GDN_CHUNK_MINCTX=256 restores it.
+        return e ? atoi(e) : 128;
     }();
 
     if (!enabled || head_dim != HD || n_tokens < minctx) return false;

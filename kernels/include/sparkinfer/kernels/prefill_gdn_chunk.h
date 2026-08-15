@@ -35,8 +35,7 @@ namespace kernels {
 //
 // Env knobs:
 //   SPARKINFER_PREFILL_GDN_CHUNK         (default 1)   0 disables (A/B) -> sequential scan (#398).
-//   SPARKINFER_PREFILL_GDN_CHUNK_MINCTX  (default 256) only chunk at n_tokens >= this; short
-//                                                      prompts do not amortize the prep pass.
+//   SPARKINFER_PREFILL_GDN_CHUNK_MINCTX  (default 128) only chunk at n_tokens >= this.
 // qh_block: v-head -> q/k-head broadcast convention; see launch_qwen36_gdn_ar's own comment
 // (fused.h). Must match whatever the decode-path GDN kernel uses for the same checkpoint.
 bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
