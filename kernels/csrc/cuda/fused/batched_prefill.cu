@@ -1211,6 +1211,27 @@ void launch_prefill_swiglu(const void* gate, const void* up, void* h, long n, cu
         reinterpret_cast<__nv_bfloat16*>(h), n);
 }
 
+// Strided-source SwiGLU: gate/up are column slices of one [rows, ld] tensor (the stacked gate|up
+// GEMM output), the result is written contiguous [rows, cols]. Per element this is exactly
+// pf_swiglu_kernel's value chain, so it is bit-identical to the unstrided form.
+__global__ void pf_swiglu_ld_kernel(const __nv_bfloat16* __restrict__ gate,
+                                    const __nv_bfloat16* __restrict__ up,
+                                    __nv_bfloat16* __restrict__ h, int rows, int cols, int ld) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * cols) return;
+    const int r = (int)(i / cols);
+    const long s = (long)r * ld + (int)(i - (long)r * cols);
+    h[i] = __float2bfloat16(pf_silu(pf_to_f(gate[s])) * pf_to_f(up[s]));
+}
+
+void launch_prefill_swiglu_ld(const void* gate, const void* up, void* h,
+                              int rows, int cols, int ld, cudaStream_t stream) {
+    const long n = (long)rows * cols;
+    pf_swiglu_ld_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(gate), reinterpret_cast<const __nv_bfloat16*>(up),
+        reinterpret_cast<__nv_bfloat16*>(h), rows, cols, ld);
+}
+
 void launch_prefill_add(const void* a, const void* b, void* out, long n, cudaStream_t stream) {
     pf_add_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(a), reinterpret_cast<const __nv_bfloat16*>(b),

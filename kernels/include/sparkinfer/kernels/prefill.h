@@ -26,6 +26,9 @@ void launch_prefill_gemm(const void* A, const void* W, void* C,
                          bool prefer_mma = false);
 
 // SwiGLU elementwise for the dense FFN: h[i] = silu(gate[i]) * up[i] over n elements.
+// gate/up as column slices of one [rows, ld] tensor; output contiguous [rows, cols].
+void launch_prefill_swiglu_ld(const void* gate, const void* up, void* h,
+                              int rows, int cols, int ld, cudaStream_t stream = nullptr);
 void launch_prefill_swiglu(const void* gate, const void* up, void* h, long n,
                            cudaStream_t stream = nullptr);
 

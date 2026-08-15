@@ -251,7 +251,7 @@ template <class Layout>
 __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
                                   const __nv_bfloat16* __restrict__ up,
                                   unsigned char* dst, cutlass::float_ue4m3_t* sf,
-                                  int rows, int cols, Layout layout) {
+                                  int rows, int cols, int ld, Layout layout) {
     // 8 values per lane instead of 2, so two lanes cover a 16-value scale group. The two operand
     // reads become one 16-byte load each instead of four 4-byte loads, the store becomes one
     // 4-byte store instead of four 1-byte ones, and the amax butterfly collapses from three
@@ -266,9 +266,10 @@ __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
     for (int grp = (blockIdx.x * blockDim.x + threadIdx.x) / LPG;
          grp < groups; grp += stride) {
         const int row = grp / (cols / V), k0 = (grp % (cols / V)) * V;
-        const size_t base = (size_t)row * cols + k0 + VPL * glane;
-        const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(gate + base);
-        const __nv_bfloat162* u2 = reinterpret_cast<const __nv_bfloat162*>(up + base);
+        const size_t base = (size_t)row * cols + k0 + VPL * glane;       // FP4 dst (contiguous)
+        const size_t lbase = (size_t)row * ld + k0 + VPL * glane;        // gate/up src (strided)
+        const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(gate + lbase);
+        const __nv_bfloat162* u2 = reinterpret_cast<const __nv_bfloat162*>(up + lbase);
         float x[VPL];
         float a = 0.f;
         #pragma unroll
@@ -394,13 +395,15 @@ bool launch_prefill_nvfp4_gate_quant_a(const void* sr, const void* g, void* d, v
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_swiglu_quant_a(const void* g, const void* u, void* d, void* sf,
-                                         int m, int k, cudaStream_t st) {
+                                         int m, int k, cudaStream_t st, int ld_src) {
     if (!g || !u || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
+    const int ld = ld_src > 0 ? ld_src : k;
+    if (ld < k || (ld & 7)) return false;   // 16 B loads assume 8-value alignment per row
     auto l = sfa_layout(m,128,k);
     // 2 lanes per 16-value scale group (see swiglu_quant_rows), so one thread per 8 values.
     int blocks = (m * (k / 16) * 2 + 255) / 256; if (blocks > 4096) blocks = 4096;
     swiglu_quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)g,(const __nv_bfloat16*)u,
-                                            (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,l);
+                                            (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,ld,l);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k, cudaStream_t st) {

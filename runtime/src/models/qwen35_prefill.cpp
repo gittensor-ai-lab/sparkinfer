@@ -372,7 +372,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // whose eager conversion completed. One activation buffer is shared by gate/up. Down stays on
     // the higher-fidelity #808 quantized path because its error enters the residual directly.
     const bool muse_nvfp4 = c.muse_glimmer && N == 128 && !s.w.layers.empty() &&
-                            s.w.layers[0].gate_fp4 &&
+                            (s.w.layers[0].gate_fp4 || s.w.layers[0].gu_fp4) &&
                             kernels::prefill_nvfp4_supported(N, ffn, H);
     // Qwen3.8-27B's own gate/up NVFP4 (compressed-tensors checkpoint, see
     // Qwen35Model::load_compressed_tensors): same dense_ffn shape and the exact same gate_fp4/
@@ -395,6 +395,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         return !(e && e[0] == '0');
     }();
     const bool gu_nvfp4 = muse_nvfp4 || q38_nvfp4;
+    // gate|up stacked into one [2*ffn, H] operand at load: one GEMM instead of two per layer
+    // (same grouping the attention projections already use), into one [N, 2*ffn] output whose
+    // column halves the SwiGLU consumers read with row stride 2*ffn. Muse-only: Qwen3.8's loader
+    // never sets gu_fp4, so q38 keeps the separate pair below.
+    const bool muse_nvfp4_gu = muse_nvfp4 && s.w.layers[0].gu_fp4 &&
+                               kernels::prefill_nvfp4_supported(N, 2 * ffn, H);
     const size_t fp4_a_data_bytes = gu_nvfp4
         ? kernels::prefill_nvfp4_data_bytes(N, H) : 0;
     const size_t fp4_a_sf_bytes = gu_nvfp4
@@ -406,7 +412,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool muse_nvfp4_qkv = muse_nvfp4 && s.w.layers[0].qkvg_fp4 &&
                                 kernels::prefill_nvfp4_supported(N, qkvg_n, H);
     const size_t fp4_ws_gu = gu_nvfp4
-        ? kernels::prefill_nvfp4_workspace_bytes(N, ffn, H) : 0;
+        ? kernels::prefill_nvfp4_workspace_bytes(N, muse_nvfp4_gu ? 2 * ffn : ffn, H) : 0;
     const size_t fp4_ws_qkv = muse_nvfp4_qkv
         ? kernels::prefill_nvfp4_workspace_bytes(N, qkvg_n, H) : 0;
     // o projection: A is `att` at k = qdim <= H, so fp4_a/fp4_as (sized for k = H) already cover it.
@@ -432,6 +438,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, ffn)) : nullptr;
     unsigned char* fp4_down_as = nvfp4_down
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N, ffn)) : nullptr;
+    // The stacked gate|up GEMM's [FC, 2*ffn] output; its halves alias ffg/ffu duty via strides.
+    bf16* ffgu = muse_nvfp4_gu ? a8.alloc<bf16>((size_t)FC * 2 * ffn) : nullptr;
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
@@ -1082,27 +1090,45 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
-                const bool layer_fp4 = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
-                    w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
+                // Stacked gate|up (Muse): one [fn, 2*ffn] GEMM whose column halves play ffg/ffu
+                // with row stride 2*ffn; everything else (including Qwen3.8's checkpoint-native
+                // pair with its global-scale alphas) takes the separate two-GEMM form below.
+                const bool use_gu = muse_nvfp4_gu && w.gu_fp4 && w.gu_fp4_sf && ffgu != nullptr;
+                const bf16* fgate = use_gu ? ffgu : ffg;
+                const bf16* fup   = use_gu ? ffgu + ffn : ffu;
+                const int   fld   = use_gu ? 2 * ffn : ffn;
+                bool layer_fp4 = gu_nvfp4 && fp4_a && fp4_as &&
+                    (use_gu || (w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf)) &&
                     kernels::prefill_nvfp4_supported(fn, ffn, H) &&
-                    kernels::launch_prefill_nvfp4_quant_a(hn_c, fp4_a, fp4_as, fn, H, st) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.gate_fp4, w.gate_fp4_sf,
-                                                       ffg, fn, ffn, H, fp4_ws, st,
-                                                       w.gate_fp4_alpha) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.up_fp4, w.up_fp4_sf,
-                                                       ffu, fn, ffn, H, fp4_ws, st,
-                                                       w.up_fp4_alpha);
+                    kernels::launch_prefill_nvfp4_quant_a(hn_c, fp4_a, fp4_as, fn, H, st);
+                if (layer_fp4) {
+                    layer_fp4 = use_gu
+                        ? kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.gu_fp4, w.gu_fp4_sf,
+                                                             ffgu, fn, 2 * ffn, H, fp4_ws, st)
+                        : (kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.gate_fp4,
+                                                              w.gate_fp4_sf,
+                                                              ffg, fn, ffn, H, fp4_ws, st,
+                                                              w.gate_fp4_alpha) &&
+                           kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.up_fp4, w.up_fp4_sf,
+                                                              ffu, fn, ffn, H, fp4_ws, st,
+                                                              w.up_fp4_alpha));
+                }
                 if (layer_fp4) {
                     const bool down_fp4_done = nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
                         fp4_down_a && fp4_down_as &&
                         kernels::launch_prefill_nvfp4_swiglu_quant_a(
-                            ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st) &&
+                            fgate, fup, fp4_down_a, fp4_down_as, fn, ffn, st, fld) &&
                         kernels::launch_prefill_nvfp4_gemm(
                             fp4_down_a, fp4_down_as, w.down_fp4, w.down_fp4_sf,
                             ao + (size_t)fo * H, fn, H, ffn, fp4_ws, st,
                             w.down_fp4_alpha);
                     if (!down_fp4_done) {
-                        kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
+                        // The SwiGLU output lands contiguous in ffg either way, so the quantized
+                        // down projection below reads exactly what it always read.
+                        if (use_gu)
+                            kernels::launch_prefill_swiglu_ld(fgate, fup, ffg, fn, ffn, fld, st);
+                        else
+                            kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
                         proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
                                        ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
                     }

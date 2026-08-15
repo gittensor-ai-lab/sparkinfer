@@ -4068,7 +4068,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         kernels::prefill_nvfp4_supported(128, c.moe_ffn, H) &&
         kernels::prefill_nvfp4_supported(128, H, c.moe_ffn)) {
         void* tmp = nullptr;
-        const size_t tmp_elems = (size_t)c.moe_ffn * H;
+        // gate|up stacked into one [2*ffn, H] operand (same grouping argument as qkvg below:
+        // both project the same activation, so one GEMM instead of two removes the second
+        // launch's fixed cost every layer). The staging buffer must then hold both halves at
+        // once so the block scales come out in the single atom-tiled layout of the combined
+        // row count. SPARKINFER_MUSE_NVFP4_GU=0 restores the two separate operands.
+        const char* fp4gu_env = getenv("SPARKINFER_MUSE_NVFP4_GU");
+        const bool gu_fp4_on = (!fp4gu_env || fp4gu_env[0] != '0') &&
+                               kernels::prefill_nvfp4_supported(128, 2 * c.moe_ffn, H);
+        const size_t tmp_elems = (size_t)(gu_fp4_on ? 2 : 1) * c.moe_ffn * H;
         bool ok = cudaMalloc(&tmp, tmp_elems * sizeof(bf16)) == cudaSuccess;
         int ready = 0, qkvg_ready = 0;
         const int qdim_a = c.n_q_heads * c.head_dim;
@@ -4204,8 +4212,16 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             const void* u = lw.prefill_up_q ? lw.prefill_up_q : lw.up_q;
             const int gt = lw.prefill_gate_q ? lw.prefill_gate_qtype : lw.gate_qtype;
             const int ut = lw.prefill_up_q ? lw.prefill_up_qtype : lw.up_qtype;
-            ok = convert(g, gt, c.moe_ffn, H, &lw.gate_fp4, &lw.gate_fp4_sf) &&
-                 convert(u, ut, c.moe_ffn, H, &lw.up_fp4, &lw.up_fp4_sf);
+            bool gu_done = false;
+            if (gu_fp4_on) {
+                const void* src2[2] = { g, u };
+                const int qt2[2] = { gt, ut };
+                const int rows2[2] = { c.moe_ffn, c.moe_ffn };
+                gu_done = convert_group(src2, qt2, rows2, 2, H, &lw.gu_fp4, &lw.gu_fp4_sf);
+            }
+            ok = gu_done ||
+                 (convert(g, gt, c.moe_ffn, H, &lw.gate_fp4, &lw.gate_fp4_sf) &&
+                  convert(u, ut, c.moe_ffn, H, &lw.up_fp4, &lw.up_fp4_sf));
             // The attention projection group. ~1.7 GB across 52 layers, against 3.9 GB for an
             // ffn_down copy of the same kind, and it is the last dense int8 GEMM in the layer.
             // Best-effort: a layer whose four weights are not all present just keeps the int8

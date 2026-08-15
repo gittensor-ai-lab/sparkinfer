@@ -87,6 +87,10 @@ struct Qwen35LayerWeights {
     // 1/weight_global_scale for checkpoint-native NVFP4 B operands. Muse's
     // from-bf16 quant_b copies leave this at 1 (global already folded into UE4M3).
     float gate_fp4_alpha = 1.f, up_fp4_alpha = 1.f, down_fp4_alpha = 1.f;
+    // gate|up stacked into ONE [2*ffn, H] FP4 operand (same reasoning as qkvg_fp4 below: both
+    // project the same `hn`, so stacking halves the GEMM launches and their fixed cost). When this
+    // is set, gate_fp4/up_fp4 stay null -- the bytes are identical, only the grouping differs.
+    const void* gu_fp4 = nullptr;   const void* gu_fp4_sf = nullptr;
     // q | attn_gate | k | v stacked into ONE [2*qdim + 2*kvdim, H] FP4 operand. They all project
     // the same `xn` and the batched prefill already runs them as a single grouped GEMM to keep the
     // grid full, so the FP4 form has to stay grouped too -- as four separate GEMMs at m=128 the
