@@ -339,19 +339,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // SPARKINFER_PREFILL_FP8_GDN=0 restores the bf16 GDN projections (A/B).
     const char* _pfp8 = getenv("SPARKINFER_PREFILL_FP8_GDN");
     bool use_fp8_gdn = long_bf16 && (!_pfp8 || _pfp8[0] != '0');
-    // The int8 projection path has only ever run with FC == N (main chunks the FFN only above
-    // 32k, and at those contexts it fails the scratch alloc and falls back before reaching here).
-    // With FC < N it corrupts memory: at ctx=16384 the pass ends in an illegal memory access that
-    // kills the decode graph right after it, reproducible at chunk 4096/2048 and cleared by
-    // SPARKINFER_PREFILL_I8=0. Rather than enable a path that is not demonstrably correct, run the
-    // chunked pass on the NVFP4/bf16 projections -- measured 2233 pp at 16k against the 79 pp
-    // token-loop fallback. ctx=128 has FC == N, so the scored floor keeps int8 exactly as today.
-    if (!moe && FC < N) {
-        use_i8 = false;
-        use_i8_ffn = false;
-        use_i8_attn = false;
-        use_fp8_gdn = false;
-    }
+    // #845 disabled the int8 projections whenever FC < N: that combination ended the pass in an
+    // illegal memory access which took the decode graph with it. The cause was the A_i8 sizing
+    // below (N*H, while the o projection quantizes N*qdim), not the int8 path itself, so with the
+    // sizing corrected the workaround is gone and the chunked pass keeps its tensor-core
+    // projections -- worth 66.6% of the 16k pass, which was falling back to bf16 pf_gemm_kernel.
     // MoE (Qwen3.6): run the attn/GDN projections on the fp8 (e4m3) tensor cores instead of
     // the bf16 wmma GEMM. Default ON again: the #586/#587 prefill_check failures traced to the
     // opt-in MOE_GPU tilemap path's mask dequant silently no-opping (down cols=mffn declines
@@ -363,19 +355,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const char* _pmfp8 = getenv("SPARKINFER_PREFILL_MOE_FP8");
     bool moe_fp8 = moe && (!_pmfp8 || _pmfp8[0] != '0');
     Arena& a8 = arena_reuse ? keep_a8 : once_a8;
-    // A_i8 holds the quantized activation. Dense full-i8: non-FFN projs quantize N rows x K(<=H);
-    // chunked FFN quantizes at most FC rows x ffn. Long-ctx selective: N*H if attn-i8/fp8-gdn else FC*ffn.
+    // A_i8 holds the quantized activation. The comment below used to say the non-FFN projections
+    // quantize "N rows x K(<=H)" -- they do not: the o projection's A is `att` at k = qdim, and on
+    // Qwen3.8-27B qdim (24*256 = 6144) is WIDER than H (5120). N*H under-sizes it by N*(qdim-H).
+    // That was invisible while FC == N, because the FC*ffn term (ffn = 17408) covered everything;
+    // chunk the FFN and the cover disappears, and pf_quantize_rows_fp8_kernel writes past the end
+    // (compute-sanitizer: "Invalid __global__ write ... 962561 bytes after the nearest allocation
+    // of size 20971520", i.e. N*H, from the o-projection quantize at N x 6144).
+    // So: N rows x the widest K any N-row projection uses, OR FC rows x ffn for the chunked FFN.
     // MoE: no chunked FFN; projections quantize N rows x maxAK.
     const bool need_i8 = use_i8 || use_i8_ffn || use_i8_attn || use_fp8_gdn || moe_shared_i8 || moe_fp8;
-    // Take the max on BOTH dense paths. The int8-projections-off branch used to size against
-    // FC*ffn alone, below the N*H the non-FFN projections quantize once the FFN chunk drops
-    // below N*H/ffn -- a silent overrun rather than an alloc failure. FC is floored above so this
-    // is a no-op in practice; it keeps a hand-set SPARKINFER_PREFILL_FFN_CHUNK from overrunning.
-    const size_t a_i8_dense = ((size_t)N * H > (size_t)FC * ffn) ? (size_t)N * H : (size_t)FC * ffn;
+    // Both terms, on both dense paths: the N-row projections and the FC-row FFN chunk each have to
+    // fit, and neither one bounds the other once FC and N can differ.
+    const int a_wide_k = imax(H, imax(qdim, lvdim));   // widest K quantized with N rows
+    const size_t a_i8_rows_n = (size_t)N * (size_t)a_wide_k;
+    const size_t a_i8_dense = (a_i8_rows_n > (size_t)FC * ffn) ? a_i8_rows_n : (size_t)FC * ffn;
     const size_t a_i8_sz = moe ? (size_t)N * maxAK : a_i8_dense;
-    // N, not FC: sx is the per-row scale that pairs with A_i8 above, and the same non-FFN
-    // projections write N of them. FC >= the chunk floor makes this equal in practice (FC <= N
-    // always), and it costs N floats to be right when the chunk is small.
+    // N, not FC: sx is the per-row scale that pairs with A_i8 above, and the non-FFN projections
+    // write N of them regardless of how small the FFN chunk gets. Costs N floats.
     const size_t sx_n = (size_t)N;
     signed char* A_i8 = need_i8 ? a8.alloc<signed char>(a_i8_sz) : nullptr;
     // k-tiled [k/32][row][32] copy of the int8 activation for Muse's dense prefill GEMM. That
