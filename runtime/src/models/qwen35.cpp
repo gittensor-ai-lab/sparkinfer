@@ -4606,6 +4606,74 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     fprintf(stderr, "[compressed-tensors] loaded %d layers, native NVFP4 prefill FFN %d/%d "
             "(decode stays Q4_K)\n",
             c.n_layers, gu_ready, c.n_layers);
+
+    // Same fused Q4_K-in-GEMM row scales Muse uses, for the tensors this checkpoint still
+    // stores as Q4_K: full-attn q/k/v/o (16 layers) and FFN 56-63 (the 8 FP8 MLP layers
+    // requanted to Q4_K). Lets prefill decode Q4_K inside the GEMM instead of materializing
+    // int8 weights every layer. SPARKINFER_Q38_PREFILL_QB=0 skips (A/B).
+    {
+        const char* e = getenv("SPARKINFER_Q38_PREFILL_QB");
+        if (e && e[0] == '0') return true;
+        auto fusable = [](int t) { return t == 12 || t == 13 || t == 14; };
+        const int qd = c.n_q_heads * c.head_dim;
+        const int q_out = c.hybrid ? qd * 2 : qd;
+        const int kd = c.n_kv_heads * c.head_dim;
+        const int ff = c.moe_ffn;
+        const size_t per_layer = (size_t)q_out + (size_t)kd * 2 + (size_t)H + (size_t)ff * 2 + (size_t)H;
+        const size_t total = per_layer * (size_t)c.n_layers;
+        const size_t tmp_bytes = 64u << 20;
+        signed char* tmp = nullptr;
+        bool ok = cudaMalloc(&s.muse_rs, total * sizeof(float)) == cudaSuccess;
+        ok = ok && cudaMalloc(&tmp, tmp_bytes) == cudaSuccess;
+        auto fill = [&](int qtype, const void* src, float* dst, size_t rows, int cols) -> bool {
+            const int blk = (qtype == 12) ? 144 : (qtype == 13) ? 176 : 210;
+            const size_t rb = (size_t)(cols >> 8) * (size_t)blk;
+            const size_t chunk = tmp_bytes / (size_t)cols;
+            for (size_t r0 = 0; r0 < rows; r0 += chunk) {
+                const size_t nr = (rows - r0 < chunk) ? (rows - r0) : chunk;
+                if (!kernels::launch_gguf_dequant_rows_i8(
+                        qtype, (const char*)src + r0 * rb, tmp, dst + r0, (int)nr, cols, s.stream))
+                    return false;
+            }
+            return true;
+        };
+        for (int i = 0; ok && i < c.n_layers; i++) {
+            Qwen35LayerWeights& lw = s.w.layers[i];
+            float* base = s.muse_rs + (size_t)i * per_layer;
+            size_t off = 0;
+            auto place = [&](const void* W, int wt, const float** rs, int rows, int cols) {
+                float* dst = base + off; off += (size_t)rows;
+                if (ok && W && fusable(wt) && fill(wt, W, dst, (size_t)rows, cols)) *rs = dst;
+            };
+            place(lw.wq,     lw.wq_type,     &lw.wq_rs,    q_out, H);
+            place(lw.wk,     lw.wk_type,     &lw.wk_rs,    kd,    H);
+            place(lw.wv,     lw.wv_type,     &lw.wv_rs,    kd,    H);
+            place(lw.wo,     lw.wo_type,     &lw.wo_rs,    H,     qd);
+            // Layers 0-55 FFN stay on checkpoint NVFP4; only 56-63 are Q4_K in prefill.
+            if (ffn_is_fp8_layer(i)) {
+                place(lw.gate_q, lw.gate_qtype,  &lw.gate_rs,  ff, H);
+                place(lw.up_q,   lw.up_qtype,    &lw.up_rs,    ff, H);
+                place(lw.down_q, lw.down_qtype,  &lw.down_rs,  H,  ff);
+            } else {
+                off += (size_t)ff * 2 + (size_t)H;
+            }
+        }
+        if (ok) ok = cudaStreamSynchronize(s.stream) == cudaSuccess;
+        if (tmp) cudaFree(tmp);
+        if (!ok) {
+            cudaFree(s.muse_rs); s.muse_rs = nullptr;
+            for (int i = 0; i < c.n_layers; i++) {
+                Qwen35LayerWeights& lw = s.w.layers[i];
+                lw.wq_rs = lw.wk_rs = lw.wv_rs = lw.wo_rs = nullptr;
+                lw.gate_rs = lw.up_rs = lw.down_rs = nullptr;
+            }
+            fprintf(stderr, "[compressed-tensors] Q4_K row-scale precompute unavailable "
+                            "-> int8 materialize path\n");
+        } else {
+            fprintf(stderr, "[compressed-tensors] Q4_K prefill row scales ready (%.0f MB)\n",
+                    (double)(total * sizeof(float)) / (1024.0 * 1024.0));
+        }
+    }
     return true;
 }
 

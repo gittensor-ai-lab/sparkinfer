@@ -335,7 +335,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     float* lm_ad = a8.alloc<float>((size_t)(H >> 5) + 1);
     float* lm_as = a8.alloc<float>((size_t)(H >> 5) + 1);
 
-    int* qb_partials = (c.muse_glimmer && use_i8 && N <= 128)
+    int* qb_partials = (use_i8 && N <= 128 && !moe)
         ? a8.alloc<int>(qb_partials_cap) : nullptr;
     // Muse Glimmer split-K partials for the skinny projections. launch_prefill_gemm_i8 puts one
     // 128x128 output tile in a block, so Muse's narrow n_out (attn k/v = 256 -> TWO blocks, q and
@@ -773,7 +773,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     auto proj_fused_acc = [&](const bf16* A, const void* W, int wtype, const float* rs,
                               bf16* C, int n_out, int K, int* acc, int rows = 0) {
         const int R = rows > 0 ? rows : N;
-        if (muse_qb && use_i8 && rs && n_out >= 128 && kernels::pf_dense_gemm_qi8_supported(wtype)) {
+        if (use_i8 && rs && n_out >= 128 && kernels::pf_dense_gemm_qi8_supported(wtype)) {
             quant_a_i8(A, R, K);
             if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st,
                                                        qb_partials, QB_SPLITS, acc, apk()))
@@ -784,7 +784,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     auto proj_fused = [&](const bf16* A, const void* W, int wtype, const float* rs,
                           bf16* C, int n_out, int K, int rows = 0) {
         const int R = rows > 0 ? rows : N;
-        if (muse_qb && use_i8 && rs && n_out >= 128 && kernels::pf_dense_gemm_qi8_supported(wtype)) {
+        if (use_i8 && rs && n_out >= 128 && kernels::pf_dense_gemm_qi8_supported(wtype)) {
             quant_a_i8(A, R, K);
             if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st,
                                                        qb_partials, QB_SPLITS, nullptr, apk()))
@@ -959,9 +959,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 if (!ink) proj_fused(xn, w.wk,    w.wk_type,    w.wk_rs,    kf, kvdim, H);
                 if (!inv) proj_fused(xn, w.wv,    w.wv_type,    w.wv_rs,    vf, kvdim, H);
             } else {
-                proj(xn, w.wq, w.wq_type, b8, wide,  H);             // qraw = [q|gate] per head
-                proj(xn, w.wk, w.wk_type, kf, kvdim, H);
-                proj(xn, w.wv, w.wv_type, vf, kvdim, H);
+                proj_fused(xn, w.wq, w.wq_type, w.wq_rs, b8, wide,  H);  // qraw = [q|gate]
+                proj_fused(xn, w.wk, w.wk_type, w.wk_rs, kf, kvdim, H);
+                proj_fused(xn, w.wv, w.wv_type, w.wv_rs, vf, kvdim, H);
                 kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
             }
             if (c.muse_glimmer) {
@@ -1051,6 +1051,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 if (!wo_fp4_done)
                     proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
+            } else if (w.wo_rs) {
+                proj_fused(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim);
+                attn_fused = false;
             } else {
                 attn_fused = proj_resid(att, w.wo, w.wo_type, x, H, qdim);
                 if (!attn_fused) proj(att, w.wo, w.wo_type, ao, H, qdim);
@@ -1107,7 +1110,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     kernels::launch_prefill_quantize_rows_i8(wb, dst, scale, n_out, K, st);
                 }
             };
-            if (ffn_i8) {
+            const bool ffn_qi8 = use_i8 && w.gate_rs && w.up_rs &&
+                kernels::pf_dense_gemm_qi8_supported(gate_pf_type);
+            if (ffn_i8 && !ffn_qi8) {
                 dequant_w_i8(gate_pf_type, gate_pf, ffn_Wg_i8, ffn_swg, ffn, H);
                 dequant_w_i8(up_pf_type,   up_pf,   ffn_Wu_i8, ffn_swu, ffn, H);
                 dequant_w_i8(w.down_qtype, w.down_q, ffn_Wd_i8, ffn_swd, H, ffn);
@@ -1116,7 +1121,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // so the FFN residual can ride the residual-fused GEMM straight into x per chunk.
             // Muse Glimmer must NOT residual-fuse: the post-FFN sandwich (norm_then_add below) needs
             // the RAW FFN output in `ao`, and the residual it adds onto is `h` (not x).
-            const bool ffn_fused = !c.muse_glimmer && resid_fuse && (ffn_i8 || use_i8);
+            const bool ffn_fused = !c.muse_glimmer && resid_fuse && (ffn_i8 || use_i8) && !ffn_qi8;
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
@@ -1143,6 +1148,32 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
                         proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
                                        ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
+                    }
+                    continue;
+                }
+                if (ffn_qi8) {
+                    proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
+                    proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   ffu, ffn, H, fn);
+                    a_q = nullptr;
+                    a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st,
+                                                                   A_i8p) && A_i8p;
+                    bool down_fused = false;
+                    if (w.down_rs && kernels::pf_dense_gemm_qi8_supported(w.down_qtype)) {
+                        down_fused = kernels::launch_prefill_gemm_qi8_dense(
+                            w.down_qtype, A_i8, sx, w.down_q, w.down_rs,
+                            ao + (size_t)fo * H, fn, H, ffn, st,
+                            qb_partials, QB_SPLITS, nullptr, apk());
+                    }
+                    if (!down_fused) {
+                        if (!kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q,
+                                                                  W_i8, sw, H, ffn, st)) {
+                            const void* wb = dq(w.down_q, w.down_qtype, H, ffn);
+                            kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, H, ffn, st);
+                        }
+                        if (ffn_fused)
+                            gemm_i8(A_i8, W_i8, sx, sw, x + (size_t)fo * H, fn, H, ffn, true);
+                        else
+                            gemm_i8(A_i8, W_i8, sx, sw, ao + (size_t)fo * H, fn, H, ffn, false);
                     }
                     continue;
                 }
