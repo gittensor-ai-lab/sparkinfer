@@ -74,6 +74,12 @@ struct Qwen35LayerWeights {
     // originals above). Null => prefill uses the dequant-materialize path as before.
     const void* wqkv_fp4 = nullptr; const void* wqkv_fp4_sf = nullptr;
     const void* z_fp4 = nullptr;    const void* z_fp4_sf = nullptr;
+    // FP8 alternative for the same two projections: payload pointers into the resident keep_fp8
+    // blobs (the checkpoint's own bytes -- zero weight-side error) + f32 copies of their per-row
+    // scales in the layout launch_prefill_gemm_fp8 wants. Preferred over the FP4 copies when
+    // present; see gdn_qkv_z.
+    const void* wqkv_fp8_w = nullptr; const float* wqkv_fp8_sw = nullptr;
+    const void* z_fp8_w = nullptr;    const float* z_fp8_sw = nullptr;
 
     // GGUF path: experts kept quantized in VRAM (gguf-native [E,out,in] layout).
     // When gate_q != nullptr the model dequantizes these per-layer into scratch

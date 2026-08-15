@@ -4589,7 +4589,43 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             // dequantizes these FP8 weights to bf16 EVERY PASS and runs the naive bf16 GEMM
             // (96 x ~197 us per pass). Decode keeps reading the FP8 originals above. Same
             // preflighted budget/env as ffn_down; a decline just keeps the materialize path.
-            if (gdn_fp4_on) {
+            // FP8-direct prefill wiring: point at the resident keep_fp8 payloads (the
+            // checkpoint's own bytes, zero weight-side error) and stage f32 copies of their
+            // per-row bf16 scales in launch_prefill_gemm_fp8's layout. Preferred over the FP4
+            // copies (the GDN recurrence amplifies A/B quantization error across the prompt;
+            // FP4-B measured continuation flips, FP8-B keeps decode's exact weight numerics).
+            // SPARKINFER_Q38_GDN_PREFILL: fp8 (default) | fp4 | off.
+            static const std::string gdn_mode = [] {
+                const char* e = getenv("SPARKINFER_Q38_GDN_PREFILL");
+                return std::string(e ? e : "fp8");
+            }();
+            if (gdn_mode == "fp8" && w.wqkv && w.wqkv_type == kernels::SI_QTYPE_FP8 &&
+                w.wqkv_gate && w.wqkv_gate_type == kernels::SI_QTYPE_FP8) {
+                auto stage_f32_scales = [&](const void* packed, long rows) -> const float* {
+                    std::vector<uint16_t> hb(rows);
+                    if (cudaMemcpy(hb.data(), packed, rows * 2, cudaMemcpyDeviceToHost)
+                        != cudaSuccess) return nullptr;
+                    std::vector<float> hf(rows);
+                    for (long i = 0; i < rows; ++i) {
+                        __nv_bfloat16 b; memcpy(&b, &hb[i], 2); hf[i] = __bfloat162float(b);
+                    }
+                    void* d = nullptr;
+                    if (cudaMalloc(&d, rows * 4) != cudaSuccess) return nullptr;
+                    if (cudaMemcpy(d, hf.data(), rows * 4, cudaMemcpyHostToDevice)
+                        != cudaSuccess) { cudaFree(d); return nullptr; }
+                    s.owned.push_back(d);
+                    return static_cast<const float*>(d);
+                };
+                const long rq = s.linear_qkvdim, rz = (long)c.linear_v_heads * c.linear_head_dim;
+                w.wqkv_fp8_sw = stage_f32_scales(w.wqkv, rq);
+                w.wqkv_fp8_w = w.wqkv_fp8_sw
+                    ? static_cast<const char*>(w.wqkv) + rq * 2 : nullptr;
+                w.z_fp8_sw = stage_f32_scales(w.wqkv_gate, rz);
+                w.z_fp8_w = w.z_fp8_sw
+                    ? static_cast<const char*>(w.wqkv_gate) + rz * 2 : nullptr;
+                if (w.wqkv_fp8_w && w.z_fp8_w) ++gdnq_ready, ++gdnz_ready;
+            }
+            if (gdn_mode == "fp4" && gdn_fp4_on) {
                 void* qb16 = dequant_fp8(lb + "in_proj_qkv", s.linear_qkvdim, H);
                 if (qb16) {
                     if (quantize_nvfp4_prefill(qb16, s.linear_qkvdim, H,

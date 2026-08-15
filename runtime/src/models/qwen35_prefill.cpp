@@ -808,6 +808,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lvdim, H, st);
             kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, lz, N, lvdim, H, st);
         } else {
+            // FP8-direct first (Qwen3.8): the resident checkpoint FP8 payloads with staged f32
+            // scales -- zero weight-side quantization error (decode's exact bytes), only the
+            // e4m3 A-quantize differs from the bf16 materialize path this replaces.
+            if (w.wqkv_fp8_w && w.wqkv_fp8_sw && w.z_fp8_w && w.z_fp8_sw) {
+                a_q = nullptr; a_pk = false;            // A_i8 becomes e4m3 -- invalidate the memo
+                kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);
+                kernels::launch_prefill_gemm_fp8(A_i8, w.wqkv_fp8_w, sx, w.wqkv_fp8_sw,
+                                                 b8, N, lqkv, H, st);
+                kernels::launch_prefill_gemm_fp8(A_i8, w.z_fp8_w, sx, w.z_fp8_sw,
+                                                 lz, N, lvdim, H, st);
+                return;
+            }
             // Block-scaled FP4 first (Qwen3.8: the loader built these from the FP8 originals) --
             // one A-quantize of xn feeds both GEMMs, replacing the per-pass FP8->bf16 weight
             // materialize + naive bf16 GEMM pair (96 x ~197 us per pass on this model).
