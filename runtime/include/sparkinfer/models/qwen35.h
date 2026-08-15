@@ -96,7 +96,8 @@ struct Qwen35LayerWeights {
     // null to preserve KV and batched-prefill scratch headroom on 32-GB cards.
     const void* down_fp4 = nullptr; const void* down_fp4_sf = nullptr;
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
-    // 14=Q6_K) -> weights kept quantized in VRAM, decoded on-read by launch_gemv_q.
+    // 14=Q6_K, 8=Q8_0) or SI_QTYPE_FP8 (108) -> weights kept quantized in VRAM,
+    // decoded on-read by launch_gemv_q / launch_gemv_fp8.
     int wq_type = 0, wgate_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;
     int wqkv_type = 0, wqkv_gate_type = 0, ssm_beta_type = 0, ssm_alpha_type = 0, ssm_out_type = 0;
     int shared_gate_inp_type = 0;

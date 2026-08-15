@@ -1831,6 +1831,15 @@ void launch_moe_expert_ffn_q4k(
                     q, reinterpret_cast<const unsigned char*>(gate_q),
                     reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
         }
+        // Qwen3.8-27B dense hybrid (hidden 5120, ffn 17408). Same recipe as Muse's 6656x19968
+        // arm: F is already large enough that pack2 coarsens scheduling. Compile-time H/F
+        // makes NB = H>>8 = 20 a known trip count; same dots in the same order as the
+        // generic kernel, so the result is bit-identical.
+        else if (gu_spec && hidden == 5120 && ffn == 17408 && top_k == 1)
+            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                gate_up_mmvq2_qwen_kernel<5120, 17408, 1>,
+                q, reinterpret_cast<const unsigned char*>(gate_q),
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
         else
             launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
                 gate_up_mmvq2_kernel,

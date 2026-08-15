@@ -23,6 +23,7 @@
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/quant.h"
+#include "sparkinfer/kernels/qtype.h"
 #include "sparkinfer/kernels/proj_requant.h"
 #include "sparkinfer/kernels/prefill_nvfp4.h"
 #include "sparkinfer/lmcache_bridge_client.h"
@@ -1133,6 +1134,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_mmvq_q6k(s.aq81, W, y, N, H, pst);
                 else if (s.use_pq && s.use_llama && t == 8)
                     kernels::launch_mmvq_q80(s.aq81, W, y, N, H, pst);
+                else if (t == kernels::SI_QTYPE_FP8)
+                    kernels::launch_gemv_fp8(s.xn, W, y, N, H, pst);
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -1155,6 +1158,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 } else if (s.use_pq && s.use_llama && t == 8) {
                     kernels::launch_quantize_q8_1_blocks(x, s.aq81, K, st);
                     kernels::launch_mmvq_q80(s.aq81, W, y, N, K, st);
+                } else if (t == kernels::SI_QTYPE_FP8) {
+                    kernels::launch_gemv_fp8(x, W, y, N, K, st);
                 } else if (t) kernels::launch_gemv_q(x, W, t, y, N, K, st);
                 else          kernels::launch_gemv(x, W, y, N, K, st);
             } else {
@@ -1180,7 +1185,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     fuse = (e && e[0] == '0') ? 0 : 1; }
                 return fuse && s.gguf && s.use_pq && s.use_llama &&
                        w.wqkv_type == 12 && w.wqkv_gate_type == 12 &&
-                       (H == 2048 || H == 4096) && s.linear_qkvdim > 0 && s.linear_vdim > 0;
+                       (H == 2048 || H == 4096 || H == 5120) && s.linear_qkvdim > 0 && s.linear_vdim > 0;
             }();
             if (gdn_quad) {
                 kernels::launch_gdn_quad_mmvq_q4k(s.aq81, w.wqkv, w.wqkv_gate, w.ssm_alpha, w.ssm_beta,
@@ -1224,7 +1229,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             static int gdn_fuse = -1;
             if (gdn_fuse < 0) { const char* e = getenv("SPARKINFER_GDN_FUSE"); gdn_fuse = (e && e[0] == '0') ? 0 : 1; }
             if (gdn_fuse && c.linear_head_dim == 128 && c.linear_q_heads == 16 &&
-                c.linear_v_heads == 32) {
+                (c.linear_v_heads == 32 || c.linear_v_heads == 48)) {
                 kernels::launch_qwen36_conv_split_l2norm_fused(s.lin_qkv, w.ssm_conv, conv_state,
                                                  s.lin_q, s.lin_k, s.lin_v,
                                                  c.linear_q_heads, c.linear_v_heads,
@@ -1305,7 +1310,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 // The fused QKV kernel writes one contiguous q of width nq and knows nothing about
                 // a separate gate tensor, so it cannot serve this path.
                 const bool attn_qkv = !sep_gate && s.use_attn_qkv && s.use_pq && s.use_llama
-                                   && (H == 2048 || H == 4096)
+                                   && (H == 2048 || H == 4096 || H == 5120)
                                    && w.wq_type == 12 && w.wk_type == 12 && w.wv_type == 12;
                 if (attn_qkv) {
                     kernels::launch_attn_qkv_mmvq_q4k(s.aq81, w.wq, w.wk, w.wv,
@@ -4399,17 +4404,29 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         return out;
     };
 
-    // bf16 [out,in] source -> kept resident as-is (qtype=0), decode reads it via the existing
-    // plain-bf16 launch_gemv fallback in proj_xn/proj_from (the t==0 branch of the same dispatch
-    // Q4_K/Q6_K/Q8_0 share). Used for GDN's projections instead of requant_q4k: these weights are
-    // themselves dequantized from FP8 at load time, and re-quantizing an already-quantized source
-    // to 4 bits a second time compounds error more than a single quantization step from a native
-    // bf16/fp32 checkpoint would.
-    auto keep_bf16 = [&](void* bf16_src, int& qtype) -> const void* {
-        if (!bf16_src) return nullptr;
-        s.owned.push_back(bf16_src);
-        qtype = 0;
-        return bf16_src;
+    // Checkpoint FP8 kept native: [bf16 scale[rows] | e4m3 W[rows*cols]]. Decode reads it via
+    // launch_gemv_fp8, which applies the same bf16(float(e4m3)*scale) rounding as dequant_fp8
+    // so the GEMV matches keep_bf16 at half the GDN traffic. A second quant (Q4_K / Q8_0) on
+    // these already-FP8 weights fails the PR-vs-main gate (Q4_K: top1 0.96 / KL 0.035;
+    // Q8_0: top1 1.00 / KL 0.015, bar is 0.01).
+    auto keep_fp8 = [&](const std::string& prefix, int rows, int cols, int& qtype) -> const void* {
+        const STTensor* w = st.tensor(prefix + ".weight");
+        const STTensor* sc = st.tensor(prefix + ".weight_scale");
+        if (!w || !sc || w->dtype != STDType::F8_E4M3 || w->n_values != (long)rows * cols ||
+            sc->n_values != rows) {
+            fprintf(stderr, "[compressed-tensors] %s: missing/malformed FP8 weight or scale\n",
+                    prefix.c_str());
+            return nullptr;
+        }
+        const size_t scale_bytes = (size_t)rows * 2;
+        const size_t w_bytes = (size_t)rows * (size_t)cols;
+        void* packed = nullptr;
+        if (cudaMalloc(&packed, scale_bytes + w_bytes) != cudaSuccess) return nullptr;
+        cudaMemcpy(packed, sc->data, scale_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<char*>(packed) + scale_bytes, w->data, w_bytes, cudaMemcpyHostToDevice);
+        s.owned.push_back(packed);
+        qtype = kernels::SI_QTYPE_FP8;
+        return packed;
     };
 
     // bf16 [out,in] source -> resident Q4_K (decode path). Frees the source.
@@ -4465,12 +4482,12 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
 
         if (w.linear_attn) {
             const std::string lb = b + "linear_attn.";
-            void* qkv = dequant_fp8(lb + "in_proj_qkv", s.linear_qkvdim, H);
-            w.wqkv = keep_bf16(qkv, w.wqkv_type);
-            void* z = dequant_fp8(lb + "in_proj_z", c.linear_v_heads * c.linear_head_dim, H);
-            w.wqkv_gate = keep_bf16(z, w.wqkv_gate_type);
-            void* op = dequant_fp8(lb + "out_proj", H, s.linear_vdim);
-            w.ssm_out = keep_bf16(op, w.ssm_out_type);
+            // Native checkpoint FP8 (not a second Q4_K/Q8_0 fit): same bf16 rounding as
+            // keep_bf16, half the GDN traffic. See keep_fp8 above.
+            w.wqkv = keep_fp8(lb + "in_proj_qkv", s.linear_qkvdim, H, w.wqkv_type);
+            w.wqkv_gate = keep_fp8(lb + "in_proj_z", c.linear_v_heads * c.linear_head_dim, H,
+                                   w.wqkv_gate_type);
+            w.ssm_out = keep_fp8(lb + "out_proj", H, s.linear_vdim, w.ssm_out_type);
             // Small, checkpoint-unquantized tensors -- plain bf16, NO transpose. conv1d's raw HF
             // layout [qkvdim,1,conv_kernel] (=[qkvdim,conv_kernel] squeezed) already matches
             // conv_split_kernel's own indexing (conv_w[d*conv_kernel+t], d=channel, t=tap) --

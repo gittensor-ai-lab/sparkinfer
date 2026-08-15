@@ -19,4 +19,10 @@ namespace sparkinfer { namespace kernels {
 // unqualified name from that file's kernels.
 static constexpr int SI_QTYPE_Q3A = 112;   // == the block size in bytes, per 256 weights
 
+// Compressed-tensors FP8 (E4M3) kept native for decode GEMV. Payload is
+//   [bf16 scale[N] | e4m3 W[N*K]]
+// matching launch_ct_dequant_fp8's per-row scale: W_bf16[r,c] = bf16(float(e4m3)*float(scale[r])).
+// 108 is unused as a ggml type id (ggml's 108 is not a weight format we ship).
+static constexpr int SI_QTYPE_FP8 = 108;
+
 }} // namespace sparkinfer::kernels

@@ -16,6 +16,8 @@
 #include "sparkinfer/kernels/prefill_attn_window.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
+#include "sparkinfer/kernels/qtype.h"
+#include "sparkinfer/kernels/compressed_tensors.h"
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/prefill_i8.h"
 #include "sparkinfer/kernels/prefill_fp8.h"
@@ -624,6 +626,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // Dequantize a native GGUF weight [n_out,K] to bf16 scratch; return a bf16 [n_out,K] ptr.
     auto dq = [&](const void* W, int wtype, int n_out, int K) -> const void* {
         if (wtype == 0) return W;   // already bf16 dense
+        if (wtype == kernels::SI_QTYPE_FP8) {
+            kernels::launch_ct_dequant_fp8_packed(W, wbuf, n_out, K, st);
+            return wbuf;
+        }
         kernels::launch_gguf_dequant(wtype, W, wbuf, (long)n_out * K, st);
         return wbuf;
     };

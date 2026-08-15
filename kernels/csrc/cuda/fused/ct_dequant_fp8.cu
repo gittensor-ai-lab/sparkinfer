@@ -35,4 +35,11 @@ void launch_ct_dequant_fp8(const void* w_e4m3, const void* scale_bf16, void* out
         reinterpret_cast<__nv_bfloat16*>(out_bf16), rows, cols);
 }
 
+void launch_ct_dequant_fp8_packed(const void* packed, void* out_bf16,
+                                  int rows, int cols, cudaStream_t stream) {
+    if (!packed || !out_bf16 || rows <= 0 || cols <= 0) return;
+    const char* p = reinterpret_cast<const char*>(packed);
+    launch_ct_dequant_fp8(p + (size_t)rows * 2, packed, out_bf16, rows, cols, stream);
+}
+
 }} // namespace sparkinfer::kernels

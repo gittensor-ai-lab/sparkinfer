@@ -1,14 +1,10 @@
 #pragma once
 #include <cuda_runtime.h>
 
-// Dequantizes tensors from HuggingFace "compressed-tensors" format checkpoints (NVIDIA ModelOpt /
-// llm-compressor convention -- the exact format used by e.g. unsloth/Qwen3.8-27B-NVFP4) straight
-// to bf16, so the result can feed the SAME requantize-to-internal-format pipeline load_gguf()
-// already uses (bf16 -> Q4_K for decode via launch_proj_requant_q4k_lloyd, bf16 -> this runtime's
-// own fresh NVFP4 for prefill via the existing Muse Glimmer conversion path). One-directional,
-// one-time, load-only conversion -- no new GEMM/GEMV kernels, no global-scale bookkeeping needed
-// downstream, since the re-quantize step produces its own fresh scales the same way it already
-// does for every other model.
+// HuggingFace "compressed-tensors" checkpoints (NVIDIA ModelOpt / llm-compressor --
+// e.g. unsloth/Qwen3.8-27B-NVFP4). Two consumers:
+//   - load-time dequant to bf16, then the same Q4_K / NVFP4 requant pipeline load_gguf() uses
+//   - decode GEMV that keeps checkpoint FP8 native (SI_QTYPE_FP8 packed payload; launch_gemv_fp8)
 
 namespace sparkinfer { namespace kernels {
 
@@ -16,6 +12,10 @@ namespace sparkinfer { namespace kernels {
 // w: [rows,cols] raw e4m3 bytes, scale: [rows] bf16, out: [rows,cols] bf16.
 void launch_ct_dequant_fp8(const void* w_e4m3, const void* scale_bf16, void* out_bf16,
                            int rows, int cols, cudaStream_t stream = nullptr);
+
+// Same dequant, packed as [bf16 scale[rows] | e4m3 w[rows*cols]] (SI_QTYPE_FP8 decode payload).
+void launch_ct_dequant_fp8_packed(const void* packed, void* out_bf16,
+                                  int rows, int cols, cudaStream_t stream = nullptr);
 
 // NVFP4 (E2M1), block_size=16 group scale (UE4M3) + a single tensor-wide F32 global scale:
 //   out[r,c] = float(e2m1(packed nibble)) * float(ue4m3(group_scale[r, c/16])) * global_scale
