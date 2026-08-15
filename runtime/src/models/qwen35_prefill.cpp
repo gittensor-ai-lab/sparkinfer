@@ -257,7 +257,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                               + (size_t)N * H                                 // A_i8 (int8) floor
                               + (size_t)N * (sizeof(float) + sizeof(int));    // sx + d_ids
             const size_t margin = (size_t)64 << 20;    // split-K partials + allocator slack
-            const size_t avail = (fb > tail + margin) ? fb - tail - margin : 0;
+            // The chunk-parallel GDN scan draws on this same budget, AFTER this point, and it is
+            // the larger consumer: its workspace is O(N) (~483 MB at ctx=16384). Sizing the FFN
+            // chunk against everything that is free leaves the scan ~25 MB, which forces it into
+            // ~199-token slices -- 83 per layer -- and most of the win from running it at all is
+            // lost. Reserve a working segment for it here so the two are balanced rather than
+            // first-come-first-served. Hybrid stacks only; nothing else runs that scan.
+            //
+            // This can only make the chunk SMALLER, which is the safe direction: an oversized
+            // chunk is what fails the arena alloc and drops the whole pass to the token loop.
+            const size_t gdn_reserve = c.hybrid ? ((size_t)256 << 20) : 0;
+            const size_t claimed = tail + margin + gdn_reserve;
+            const size_t avail = (fb > claimed) ? fb - claimed : 0;
             const int fc_before = FC;
             // Test the HALVED value, not the current one: `FC > floor` would step straight past it.
             while ((FC >> 1) >= kMinFfnChunk &&
