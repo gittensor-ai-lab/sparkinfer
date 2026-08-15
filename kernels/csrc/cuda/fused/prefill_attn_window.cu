@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <mma.h>            // bf16 tensor-core path for Muse Glimmer's hd128 windowed attention
 
 #include <cstdlib>
 #include <type_traits>
@@ -867,6 +868,194 @@ bool launch_prefill_attn_windowed(
 
 // BF16-KV pure-window prefill attention for Muse Glimmer (hd128). win_blocks>0 =>
 // SWA layers (last win_blocks blocks); win_blocks<=0 => global/NoPE full causal.
+namespace {
+
+// ---------------------------------------------------------------------------------------------
+// bf16 TENSOR-CORE windowed prefill attention (Muse Glimmer: hd128, bf16 paged KV).
+//
+// prefill_attn_mma.h already states the problem: the scalar path "evaluates QK^T and PV with scalar
+// FMA plus a 5-shuffle warp reduction per key, which measures ~8 TFLOP/s on sm_120", and the repo
+// already fixed it on the tensor cores -- for Qwythos hd256 + INT8 paged KV
+// (pf_attn_mma_i8_kernel). Muse's windowed layers are hd128 + bf16 and never reach that path, so
+// they still pay one warp reduction per key. Measured standalone at Muse's exact shape
+// (n=128, 32 q heads, 2 kv heads, hd128, causal): scalar 28.67 us vs bf16 wmma 10.25 us = 2.80x,
+// and 5.02x at n=512.
+//
+// This is the int8 kernel's schedule with the int8 machinery REMOVED, not a new design:
+//   * QK and PV accumulate in fp32 directly, so the per-tile Q amax/round and the per-row P
+//     amax/round (plus its extra warp reduction) that existed only to feed int8 tensor cores are
+//     gone. P stays bf16.
+//   * K and V fragments are loaded STRAIGHT FROM THE PAGED POOL, no smem staging: block_size is 16
+//     and wmma's tile is 16x16, so a KV page IS a fragment with ldm = n_kv_heads*HEAD_DIM.
+//   * The per-row `corr` rescale of the O accumulator makes NO assumption about the fp32
+//     accumulator's element order -- an index fragment carrying (row<<8)|col is loaded once and
+//     `idxf.x[e] >> 8` names the row, exactly as pf_attn_mma_i8_kernel does.
+//
+// Mask is the scalar kernel's, term for term: per-query window start (NOT the block-level start)
+// and causal `gtok <= qtok`. NOT bit-identical to the scalar path -- fp32 tensor-core accumulation
+// reassociates the sum -- so the batched-prefill accuracy gate is mandatory before this ships.
+//
+// WARPS must divide HEAD_DIM/16 (each warp owns HEAD_DIM/16/WARPS output d-tiles in the PV mma)
+// and equals the number of KV pages consumed per group iteration.
+template <int HEAD_DIM, int WARPS>
+__global__ __launch_bounds__(WARPS * 32, 2) void win_prefill_mma_bf16_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
+    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks) {
+    using namespace nvcuda::wmma;
+    constexpr int BM = 16;                 // query rows per block == wmma M == KV page size
+    constexpr int GN = 16 * WARPS;         // keys consumed per group iteration
+    constexpr int DT = HEAD_DIM / 16;      // d-tiles
+    constexpr int DPW = DT / WARPS;        // d-tiles per warp in the PV mma
+    constexpr int RPW = BM / WARPS;        // query rows per warp in the softmax
+    static_assert(DT % WARPS == 0, "HEAD_DIM/16 must be divisible by WARPS");
+    static_assert(BM % WARPS == 0, "BM must be divisible by WARPS");
+    static_assert(GN % 32 == 0, "GN must be a multiple of the warp width");
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int head = blockIdx.y, qbase = blockIdx.x * BM;
+    const int kvh = head / (n_q_heads / n_kv_heads);
+    const int KVLD = n_kv_heads * HEAD_DIM;          // ldm of a KV page in the pool
+    (void)max_blocks_per_seq;
+
+    extern __shared__ char mma_smem_bf[];
+    __nv_bfloat16* s_q = reinterpret_cast<__nv_bfloat16*>(mma_smem_bf);   // [BM][HEAD_DIM]
+    __nv_bfloat16* s_p = s_q + BM * HEAD_DIM;                             // [BM][GN]
+    float* s_s    = reinterpret_cast<float*>(s_p + BM * GN);              // [BM][GN]
+    float* s_o    = s_s + BM * GN;                                        // [BM][HEAD_DIM]
+    float* s_m    = s_o + BM * HEAD_DIM;                                  // [BM]
+    float* s_l    = s_m + BM;                                             // [BM]
+    float* s_corr = s_l + BM;                                             // [BM]
+
+    // Per-query window start, identical to the scalar kernel's win_start().
+    auto win_start = [&](int t) -> int {
+        if (win_blocks <= 0) return 0;
+        const int n_blk_q = (t + block_size) / block_size;
+        const int rsb = (win_blocks >= n_blk_q) ? 0 : (n_blk_q - win_blocks);
+        return rsb * block_size;
+    };
+
+    // Accumulator row map: no assumption about the fp32 fragment's element order.
+    fragment<accumulator, 16, 16, 16, float> ofr[DPW];
+    fragment<accumulator, 16, 16, 16, int> idxf;
+    {
+        int* tile = reinterpret_cast<int*>(s_s) + warp * 256;   // disjoint per warp, reused below
+        for (int i = lane; i < 256; i += 32) tile[i] = ((i >> 4) << 8) | (i & 15);
+        __syncwarp();
+        load_matrix_sync(idxf, tile, 16, mem_row_major);
+    }
+    #pragma unroll
+    for (int dd = 0; dd < DPW; dd++) fill_fragment(ofr[dd], 0.f);
+
+    for (int i = tid; i < BM * HEAD_DIM; i += blockDim.x) {
+        const int r = i / HEAD_DIM, c = i - r * HEAD_DIM, t = qbase + r;
+        s_q[i] = (t < n_tokens)
+               ? q[((size_t)t * n_q_heads + head) * HEAD_DIM + c] : __float2bfloat16(0.f);
+    }
+    for (int r = tid; r < BM; r += blockDim.x) { s_m[r] = -1e30f; s_l[r] = 0.f; }
+    __syncthreads();
+
+    const int last_q = min(qbase + BM - 1, n_tokens - 1);
+    const int blk_rs = win_start(qbase);   // monotonic in t, so this bounds every row in the tile
+
+    for (int k0 = blk_rs; k0 <= last_q; k0 += GN) {
+        const int gblk = min(WARPS, (last_q + 1 - k0 + 15) >> 4);   // live 16-key pages this group
+
+        // ---- QK: one page per warp, fp32 accumulate, land the tile in s_s ----
+        if (warp < gblk) {
+            const int pb = block_table[(k0 / block_size) + warp];
+            const __nv_bfloat16* kb =
+                k_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM;
+            fragment<accumulator, 16, 16, 16, float> cf;
+            fill_fragment(cf, 0.f);
+            #pragma unroll
+            for (int d = 0; d < DT; d++) {
+                fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> af;
+                fragment<matrix_b, 16, 16, 16, __nv_bfloat16, col_major> bf;
+                load_matrix_sync(af, s_q + d * 16, HEAD_DIM);
+                load_matrix_sync(bf, kb + d * 16, KVLD);
+                mma_sync(cf, af, bf, cf);
+            }
+            store_matrix_sync(s_s + warp * 16, cf, GN, mem_row_major);
+        }
+        __syncthreads();
+
+        // ---- online softmax over the whole GN-wide row, one warp per RPW rows ----
+        #pragma unroll
+        for (int rr = 0; rr < RPW; rr++) {
+            const int r = warp * RPW + rr, qtok = qbase + r;
+            const int my_rs = (qtok < n_tokens) ? win_start(qtok) : 0;
+            float sc[GN / 32], mx = -1e30f;
+            #pragma unroll
+            for (int u = 0; u < GN / 32; u++) {
+                const int t = lane + u * 32, gtok = k0 + t;
+                const bool live = (t < gblk * 16) && (qtok < n_tokens) &&
+                                  (gtok <= qtok) && (gtok >= my_rs);
+                sc[u] = live ? s_s[r * GN + t] * scale : -1e30f;
+                mx = fmaxf(mx, sc[u]);
+            }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = s_m[r], m_new = fmaxf(m_old, mx), corr = __expf(m_old - m_new);
+            float sum = 0.f;
+            #pragma unroll
+            for (int u = 0; u < GN / 32; u++) {
+                const int t = lane + u * 32;
+                const float p = (sc[u] > -1e29f) ? __expf(sc[u] - m_new) : 0.f;
+                sum += p;
+                s_p[r * GN + t] = __float2bfloat16(p);
+            }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            if (lane == 0) {
+                s_m[r] = m_new; s_l[r] = s_l[r] * corr + sum; s_corr[r] = corr;
+            }
+        }
+        __syncthreads();
+
+        // ---- PV: each warp owns DPW output d-tiles; V comes straight from the pool ----
+        #pragma unroll
+        for (int dd = 0; dd < DPW; dd++) {
+            const int dt = warp * DPW + dd;
+            fragment<accumulator, 16, 16, 16, float> cf;
+            fill_fragment(cf, 0.f);
+            for (int ks = 0; ks < gblk; ks++) {
+                const int pb = block_table[(k0 / block_size) + ks];
+                const __nv_bfloat16* vb =
+                    v_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
+                fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> af;
+                fragment<matrix_b, 16, 16, 16, __nv_bfloat16, row_major> bf;
+                load_matrix_sync(af, s_p + ks * 16, GN);
+                load_matrix_sync(bf, vb, KVLD);
+                mma_sync(cf, af, bf, cf);
+            }
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const int r = idxf.x[e] >> 8;
+                ofr[dd].x[e] = __fmaf_rn(ofr[dd].x[e], s_corr[r], cf.x[e]);
+            }
+        }
+        __syncthreads();   // s_s / s_p are rewritten by the next group
+    }
+
+    #pragma unroll
+    for (int dd = 0; dd < DPW; dd++)
+        store_matrix_sync(s_o + (warp * DPW + dd) * 16, ofr[dd], HEAD_DIM, mem_row_major);
+    __syncthreads();
+
+    for (int r = 0; r < BM; r++) {
+        const int qtok = qbase + r;
+        if (qtok >= n_tokens) break;
+        const float l = s_l[r], inv = (l > 0.f) ? (1.f / l) : 0.f;
+        for (int c = tid; c < HEAD_DIM; c += blockDim.x)
+            attn[((size_t)qtok * n_q_heads + head) * HEAD_DIM + c] =
+                __float2bfloat16(s_o[r * HEAD_DIM + c] * inv);
+    }
+}
+
+}  // namespace
+
 void launch_prefill_attn_swa_pure_bf16(
     const void* q, const void* k_pool, const void* v_pool,
     const int* block_table, void* attn,
@@ -882,6 +1071,54 @@ void launch_prefill_attn_swa_pure_bf16(
     // distribution setting the runtime. Halving TQ doubles the grid to 512 smaller blocks and
     // spreads them evenly, for the same total warps and the same K/V tile bytes per block.
     constexpr int TQ = 8, TK = 32, HD = 128;
+
+    // bf16 tensor-core path, ahead of the scalar schedules. Requires a 16-token KV page (a page is
+    // then exactly one wmma tile) and a GQA ratio, which Muse Glimmer satisfies (block_size 16,
+    // 32 q heads over 2 kv heads). Anything else falls through to the scalar kernels below,
+    // unchanged. SPARKINFER_MUSE_ATTN_MMA=0 disables (one-binary A/B control).
+    static const bool attn_mma = [] {
+        const char* e = getenv("SPARKINFER_MUSE_ATTN_MMA");
+        return !e || atoi(e) != 0;
+    }();
+    if (attn_mma && block_size == 16 && n_kv_heads > 0 && (n_q_heads % n_kv_heads) == 0) {
+        // WARPS is both the KV pages consumed per group iteration and the divisor of HD/16 output
+        // d-tiles. At prefill@128 with WARPS=8 the group is 128 keys wide, so the whole causal
+        // range for a 16-query tile is ONE iteration -- no group loop, no repeated barriers.
+        // SPARKINFER_MUSE_ATTN_MMA_WARPS selects (4 or 8) for a one-binary A/B.
+        static const int mw = [] {
+            const char* e = getenv("SPARKINFER_MUSE_ATTN_MMA_WARPS");
+            const int v = e ? atoi(e) : 8;
+            return (v == 4 || v == 8) ? v : 8;
+        }();
+        constexpr int MBM = 16;
+        auto sm_for = [&](int W) {
+            const int GNw = 16 * W;
+            return (size_t)MBM * HD * sizeof(__nv_bfloat16)          // s_q
+                 + (size_t)MBM * GNw * sizeof(__nv_bfloat16)         // s_p
+                 + (size_t)MBM * GNw * sizeof(float)                 // s_s (also the idx tile)
+                 + (size_t)MBM * HD * sizeof(float)                  // s_o
+                 + (size_t)3 * MBM * sizeof(float);                  // s_m / s_l / s_corr
+        };
+        dim3 gm((n_tokens + MBM - 1) / MBM, n_q_heads);
+        if (mw == 8) {
+            win_prefill_mma_bf16_kernel<HD, 8><<<gm, 8 * 32, sm_for(8), stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q),
+                reinterpret_cast<const __nv_bfloat16*>(k_pool),
+                reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
+                reinterpret_cast<__nv_bfloat16*>(attn),
+                n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks);
+        } else {
+            win_prefill_mma_bf16_kernel<HD, 4><<<gm, 4 * 32, sm_for(4), stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q),
+                reinterpret_cast<const __nv_bfloat16*>(k_pool),
+                reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
+                reinterpret_cast<__nv_bfloat16*>(attn),
+                n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks);
+        }
+        if (cudaPeekAtLastError() == cudaSuccess) return;
+        // else fall through: the scalar kernels below compute the same attention.
+    }
+
     // Lane-parallel schedule (one key per lane) by default; SPARKINFER_MUSE_ATTN_LANEPAR=0
     // restores the sequential one-key-at-a-time kernel. Same grid either way, so the only
     // difference is the schedule and the fp32 rounding order that comes with it.
