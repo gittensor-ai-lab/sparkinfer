@@ -29,6 +29,9 @@ void launch_prefill_gemm(const void* A, const void* W, void* C,
 // gate/up as column slices of one [rows, ld] tensor; output contiguous [rows, cols].
 void launch_prefill_swiglu_ld(const void* gate, const void* up, void* h,
                               int rows, int cols, int ld, cudaStream_t stream = nullptr);
+// One-launch split of the stacked q|gate|k|v GEMM output (byte-identical to the four 2D copies).
+bool launch_prefill_qkvg_split(const void* src, void* qb, void* qg, void* kf, void* vf,
+                               int rows, int qdim, int kvdim, cudaStream_t stream = nullptr);
 void launch_prefill_swiglu(const void* gate, const void* up, void* h, long n,
                            cudaStream_t stream = nullptr);
 

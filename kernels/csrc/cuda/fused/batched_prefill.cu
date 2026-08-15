@@ -10,6 +10,7 @@
 // Numerics mirror the decode kernels (qwen36.cu / rope.cu) so the KV cache and recurrent
 // state left behind are faithful to the token-by-token path.
 
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1230,6 +1231,44 @@ void launch_prefill_swiglu_ld(const void* gate, const void* up, void* h,
     pf_swiglu_ld_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(gate), reinterpret_cast<const __nv_bfloat16*>(up),
         reinterpret_cast<__nv_bfloat16*>(h), rows, cols, ld);
+}
+
+// One-launch split of the stacked [rows, 2*qdim + 2*kvdim] q|gate|k|v GEMM output into the four
+// tight-stride destinations the rest of the layer expects -- replaces four cudaMemcpy2DAsync
+// nodes per layer with a single kernel moving the same bytes. 16 B vectors: every column
+// boundary (qdim, 2*qdim, 2*qdim + kvdim) is a multiple of 8 bf16, so a vector never straddles
+// two destinations. Byte-identical to the copies by construction.
+__global__ void pf_qkvg_split_kernel(const uint4* __restrict__ src, uint4* __restrict__ qb,
+                                     uint4* __restrict__ qg, uint4* __restrict__ kf,
+                                     uint4* __restrict__ vf, int rows, int qd8, int kd8) {
+    const int rw = 2 * qd8 + 2 * kd8;                 // row width in 8-bf16 vectors
+    const long total = (long)rows * rw;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long)gridDim.x * blockDim.x) {
+        const int r = (int)(i / rw), c = (int)(i - (long)r * rw);
+        const uint4 v = src[i];
+        if (c < qd8)                 qb[(long)r * qd8 + c] = v;
+        else if (c < 2 * qd8)        qg[(long)r * qd8 + (c - qd8)] = v;
+        else if (c < 2 * qd8 + kd8)  kf[(long)r * kd8 + (c - 2 * qd8)] = v;
+        else                         vf[(long)r * kd8 + (c - 2 * qd8 - kd8)] = v;
+    }
+}
+
+bool launch_prefill_qkvg_split(const void* src, void* qb, void* qg, void* kf, void* vf,
+                               int rows, int qdim, int kvdim, cudaStream_t stream) {
+    if ((qdim & 7) || (kvdim & 7) || rows <= 0) return false;
+    // The destinations are aliases into scratch; 16 B vectors need 16 B bases.
+    if ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(qb) |
+         reinterpret_cast<uintptr_t>(qg) | reinterpret_cast<uintptr_t>(kf) |
+         reinterpret_cast<uintptr_t>(vf)) & 15) return false;
+    const int qd8 = qdim >> 3, kd8 = kvdim >> 3;
+    const long total = (long)rows * (2 * qd8 + 2 * kd8);
+    int blocks = (int)((total + 255) / 256); if (blocks > 4096) blocks = 4096;
+    pf_qkvg_split_kernel<<<blocks, 256, 0, stream>>>(
+        reinterpret_cast<const uint4*>(src), reinterpret_cast<uint4*>(qb),
+        reinterpret_cast<uint4*>(qg), reinterpret_cast<uint4*>(kf),
+        reinterpret_cast<uint4*>(vf), rows, qd8, kd8);
+    return cudaPeekAtLastError() == cudaSuccess;
 }
 
 void launch_prefill_add(const void* a, const void* b, void* out, long n, cudaStream_t stream) {
