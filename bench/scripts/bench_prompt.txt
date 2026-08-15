@@ -1,0 +1,12 @@
+Modern inference servers spend most of their time moving weights rather than doing arithmetic. A
+single decode step reads every resident parameter once and performs only a handful of operations
+per byte, so throughput tracks memory bandwidth far more closely than it tracks peak floating point
+capability. This is why quantization pays off: halving the bytes per parameter very nearly halves
+the time per token, while the extra unpacking work hides in the shadow of the load. Prefill behaves
+differently. Because it processes many positions at once, it can reuse each weight across the whole
+batch, which turns the problem back into a compute bound one and makes tensor core utilisation the
+thing that matters. A benchmark that measures only one of these regimes will therefore mislead
+anyone who reads it as a general statement about speed. The safest habit is to report both numbers,
+state the context length they were taken at, and keep the prompt representative of real traffic
+rather than a synthetic pattern chosen for convenience, since caches and routing decisions can
+behave very differently on text that a user would actually send to the model.

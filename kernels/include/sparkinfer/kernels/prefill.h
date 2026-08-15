@@ -132,17 +132,8 @@ void launch_prefill_qknorm_rope_kv_int8(
 // RoPE when rotary_dim>0 (SWA layers), or NoPE when rotary_dim==0 (global layers) + bf16 KV
 // write. Muse Glimmer runs a bf16 KV cache (its decode KV write is bf16), so no int8 scale.
 //   k_pool/v_pool: bf16 [phys_tok, n_kv_heads, hd]
-void launch_prefill_qknorm_ropenorm_kv_bf16(
-    void* q, void* k, const void* v, const void* q_w, const void* k_w,
-    void* k_pool, void* v_pool,
-    const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream = nullptr);
-
-// Qwen3.5/3.8 hybrid bf16-KV counterpart of launch_prefill_qknorm_rope_kv_int8:
-// same NeoX / partial-RoPE math, but writes bf16 K/V (no int8 scale). Used when
-// the cache is bf16 — the scored Qwen3.8 ctx=128 bench — so batched prefill
-// (and its NVFP4 FFN) can run without flipping decode onto int8 KV.
+// bf16-KV twin of launch_prefill_qknorm_rope_kv_int8: NeoX (i, i+half) partial RoPE and a bf16
+// KV write, for hybrid dense models whose bench runs a bf16 cache at short context (Qwen3.8).
 void launch_prefill_qknorm_rope_kv_bf16(
     void* q, void* k, const void* v, const void* q_w, const void* k_w,
     void* k_pool, void* v_pool,
@@ -150,11 +141,18 @@ void launch_prefill_qknorm_rope_kv_bf16(
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream = nullptr);
 
-// Causal attention over a paged bf16 KV pool. hd=256 (Qwen3.5/3.8 hybrid).
-void launch_prefill_attn_bf16_paged(
+// Full-causal attention over a bf16 paged KV pool. false = no instantiation for head_dim.
+bool launch_prefill_attn_bf16_paged(
     const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr);
+
+void launch_prefill_qknorm_ropenorm_kv_bf16(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool,
+    const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
+    cudaStream_t stream = nullptr);
 
 // Full-attention prefill: causal attention over the paged int8 KV pool just filled above.
 // One warp per (token, q-head); online softmax over keys 0..token (causal). q is the rope'd

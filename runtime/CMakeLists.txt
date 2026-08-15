@@ -66,7 +66,10 @@ if(BUILD_EXAMPLES)
     add_executable(qwen3_gguf_generate examples/qwen3_gguf_generate.cpp)
     target_include_directories(qwen3_gguf_generate PRIVATE include)
     find_package(Threads REQUIRED)   # background GPU-observability sampler uses std::thread
-    target_link_libraries(qwen3_gguf_generate PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
+    # nlohmann_json: same reason as qwen3_gguf_bench below -- this tool also routes through
+    # qwen_checkpoint.h so a compressed-tensors directory can be generated from directly.
+    target_link_libraries(qwen3_gguf_generate PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads
+                          nlohmann_json::nlohmann_json)
     add_executable(qwen3_gguf_bench examples/qwen3_gguf_bench.cpp)
     target_include_directories(qwen3_gguf_bench PRIVATE include)
     # nlohmann_json: qwen_checkpoint.h reads an HF compressed-tensors (NVFP4) config.json via

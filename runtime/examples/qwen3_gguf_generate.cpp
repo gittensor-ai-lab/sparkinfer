@@ -3,8 +3,14 @@
 // in VRAM (Q4_K/Q6_K) and are dequantized per-layer at decode time — so the
 // resident footprint is the Q4_K_M size, not the bf16 expansion.
 //
-// Usage: qwen3_gguf_generate <model.gguf> <max_new> <id0> <id1> ...
+// Usage: qwen3_gguf_generate <model.gguf|checkpoint_dir> <max_new> <id0> <id1> ...
 // (tokenize/detokenize with tools/run_qwen3.py)
+//
+// Accepts the same three checkpoint shapes as qwen3_gguf_bench/qwen3_gguf_score, via the shared
+// qwen_checkpoint.h dispatch. This one was missed when the other two grew directory support, which
+// left NO way to run a real prompt against a compressed-tensors checkpoint outside the server --
+// so free-running generation on the NVFP4 path went unexercised while teacher-forced scoring
+// (which only drives decode) looked perfectly healthy.
 
 #include "sparkinfer/runtime.h"
 #include "sparkinfer/kv_cache.h"
@@ -13,6 +19,7 @@
 #include "sparkinfer/moe/engine.h"
 #include "sparkinfer/thermal_governor.h"
 #include "qwen3_gguf_config.h"
+#include "qwen_checkpoint.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -24,7 +31,7 @@
 #include <thread>
 
 int main(int argc, char** argv) {
-    if (argc < 4) { printf("usage: %s <model.gguf> <max_new> <id0> [id1 ...]\n", argv[0]); return 2; }
+    if (argc < 4) { printf("usage: %s <model.gguf|checkpoint_dir> <max_new> <id0> [id1 ...]\n", argv[0]); return 2; }
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
 
@@ -33,11 +40,15 @@ int main(int argc, char** argv) {
     std::vector<int> prompt;
     for (int i = 3; i < argc; i++) prompt.push_back(atoi(argv[i]));
 
-    // read architecture from GGUF metadata
+    // read architecture from GGUF metadata / HF config.json, depending on the checkpoint shape
     sparkinfer::GGUF g;
-    if (!g.open(path)) { printf("[FAIL] cannot open %s\n", path.c_str()); return 1; }
     sparkinfer::Qwen35Config cfg;
-    qwen3_config_from_gguf(g, cfg);
+    QwenCheckpointKind kind{};
+    std::string cerr_msg;
+    if (!qwen_checkpoint_open(path, cfg, g, kind, cerr_msg)) {
+        printf("[FAIL] %s\n", cerr_msg.c_str());
+        return 1;
+    }
     cfg.max_seq    = std::max(2048, (int)prompt.size() + max_new + 16);
     printf("arch: %s, %d layers, hidden %d, %dQ/%dKV hd%d, %d experts top-%d, ffn %d, vocab %d\n",
            qwen3_model_label(cfg), cfg.n_layers, cfg.hidden, cfg.n_q_heads,
@@ -60,8 +71,8 @@ int main(int argc, char** argv) {
     auto engine = sparkinfer::moe::MoEEngine::create(mc);
 
     sparkinfer::Qwen35Model model(cfg, &kv, engine.get());
-    printf("loading GGUF (dense->bf16, experts kept quantized) ...\n");
-    if (!model.load_gguf(path)) { printf("[FAIL] load_gguf\n"); return 1; }
+    printf("loading checkpoint (%s) ...\n", qwen_checkpoint_kind_label(kind));
+    if (!qwen_checkpoint_load(model, path, kind)) { printf("[FAIL] load\n"); return 1; }
     {
         auto g = sparkinfer::query_gpu_stats();
         printf("loaded. GPU: %s. generating %d tokens from %zu prompt tokens\n",

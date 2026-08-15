@@ -2092,6 +2092,32 @@ void lmcache_maybe_store(BridgeClient* bridge, const Qwen35Config& cfg, KVCacheM
 }
 } // namespace
 
+// Fills `ids` with the first `n` token ids from SPARKINFER_BENCH_PROMPT_FILE (whitespace-separated
+// decimal ids). Returns false -- leaving `ids` untouched for the caller's synthetic fallback -- if
+// the var is unset, the file is unreadable, or it holds fewer than `n` ids. Deliberately strict
+// about the short-file case: silently padding a real prompt with synthetic filler would produce a
+// number that is neither one thing nor the other, and would do it invisibly.
+static bool bench_prompt_ids_from_env(std::vector<int>& ids, int n) {
+    const char* path = getenv("SPARKINFER_BENCH_PROMPT_FILE");
+    if (!path || !*path) return false;
+    std::ifstream f(path);
+    if (!f) { fprintf(stderr, "[bench] prompt file %s unreadable — using synthetic prompt\n", path); return false; }
+    std::vector<int> got;
+    got.reserve(n);
+    for (long v; f >> v; ) {
+        got.push_back((int)v);
+        if ((int)got.size() >= n) break;
+    }
+    if ((int)got.size() < n) {
+        fprintf(stderr, "[bench] prompt file %s has %zu ids, need %d — using synthetic prompt\n",
+                path, got.size(), n);
+        return false;
+    }
+    ids.assign(got.begin(), got.begin() + n);
+    fprintf(stderr, "[bench] prompt: %d real tokens from %s\n", n, path);
+    return true;
+}
+
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
     BenchDecodeResult out{};
     Impl& s = *p_;
@@ -2131,7 +2157,15 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     if (start_pos > 0) {
         if (batched_prefill_enabled(s.gguf, s.cfg, start_pos)) {
             std::vector<int> ids(start_pos);
-            for (int i = 0; i < start_pos; i++) ids[i] = 100 + (i % 20000);   // deterministic pseudo-prompt
+            // Default is a synthetic ramp, NOT text. That is fine for a weight-bandwidth-bound
+            // dense decode, but it is out-of-distribution for anything whose cost depends on token
+            // CONTENT -- MoE expert routing, GDN state, any cache keyed on repeats -- so an
+            // optimization that only pays off on this ramp would still score as a real speedup.
+            // SPARKINFER_BENCH_PROMPT_FILE (space-separated ids, e.g. produced by the eval bot's
+            // own tokenizer) substitutes a real prompt. Left OPT-IN so existing baselines across
+            // every model stay comparable; see bench_prompt_ids() for the parsing.
+            if (!bench_prompt_ids_from_env(ids, start_pos))
+                for (int i = 0; i < start_pos; i++) ids[i] = 100 + (i % 20000);   // deterministic pseudo-prompt
             auto pb0 = std::chrono::high_resolution_clock::now();
             int seed = prefill_batched(ids.data(), start_pos);
             cudaDeviceSynchronize();
