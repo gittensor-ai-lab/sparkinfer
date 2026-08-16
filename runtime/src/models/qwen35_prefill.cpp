@@ -855,7 +855,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (use_i8 && n_out >= 128) {
             quant_a_i8(A, R, K);
             // fused Q4_K/Q6_K -> int8 rows skips the dequant-to-bf16 scratch round trip
-            if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st)) {
+            bool w_i8_ready = kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st);
+            // Same for a checkpoint NVFP4 weight, which otherwise has no fused arm at all: dq()
+            // writes the whole [n_out,K] as bf16 and the row-quantizer reads it straight back.
+            // Bit-identical to that pair -- see launch_ct_dequant_nvfp4_rows_i8.
+            if (!w_i8_ready && wtype == kernels::SI_QTYPE_NVFP4) {
+                const size_t hdr = (size_t)kernels::SI_NVFP4_HDR;
+                const size_t scale_bytes = (size_t)n_out * K / 16;
+                w_i8_ready = kernels::launch_ct_dequant_nvfp4_rows_i8(
+                    static_cast<const char*>(W) + hdr + scale_bytes,
+                    static_cast<const char*>(W) + hdr,
+                    static_cast<const float*>(W), W_i8, sw, n_out, K, st);
+            }
+            if (!w_i8_ready) {
                 const void* wb = dq(W, wtype, n_out, K);
                 kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
             }
