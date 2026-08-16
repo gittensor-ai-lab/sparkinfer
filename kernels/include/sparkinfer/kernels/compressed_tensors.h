@@ -50,4 +50,16 @@ bool launch_ct_dequant_nvfp4_rows_i8(const void* packed_u8, const void* group_sc
                                      const float* global_scale_dev, signed char* q, float* scale,
                                      int rows, int cols, cudaStream_t stream = nullptr);
 
+// Exhaustive equivalence check for the per-group basis the NVFP4 checkpoint decode uses: every
+// E2M1 nibble (16) against every group-scale byte (256), over a sweep of global scales, compared
+// against the per-value `v * s / global_scale` it replaces. The encoding space is small enough to
+// cover completely, so this proves the identity rather than sampling it.
+//
+// *bf16_mismatch is the one that must be zero: bf16 is what the decode stores. *fp32_finite_
+// mismatch must also be zero; it excludes the two NaN scale encodings (0x7F/0xFF), where both
+// results are NaN and differ only in the NaN's sign bit and which no real checkpoint contains.
+// Returns false if the check could not run.
+bool ct_nvfp4_basis_selftest(unsigned long long* fp32_finite_mismatch,
+                             unsigned long long* bf16_mismatch, int* combinations = nullptr);
+
 }} // namespace sparkinfer::kernels

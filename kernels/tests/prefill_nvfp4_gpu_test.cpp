@@ -1,4 +1,5 @@
 #include "sparkinfer/kernels/prefill_nvfp4.h"
+#include "sparkinfer/kernels/compressed_tensors.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cmath>
@@ -26,6 +27,15 @@ int main() {
     float lo=1e9f,hi=-1e9f;
     for(auto v:hD){ float x=__bfloat162float(v); lo=fminf(lo,x); hi=fmaxf(hi,x); ok &= std::isfinite(x) && x>115.f && x<141.f; }
     std::printf("prefill_nvfp4_gpu_test: %s range=[%.3f,%.3f]\n",ok?"OK":"FAIL",lo,hi);
+
+    // The checkpoint decode's per-group basis must agree with the per-value divide it replaces,
+    // bit for bit, over the whole encoding space.
+    unsigned long long bad_f32=0, bad_bf16=0; int combos=0;
+    const bool ran = ct_nvfp4_basis_selftest(&bad_f32,&bad_bf16,&combos);
+    const bool basis_ok = ran && bad_f32==0 && bad_bf16==0;
+    std::printf("ct_nvfp4_basis_selftest: %s combinations=%d fp32_finite_mismatch=%llu bf16_mismatch=%llu\n",
+                basis_ok?"OK":"FAIL",combos,bad_f32,bad_bf16);
+    ok &= basis_ok;
     cudaFree(A0);cudaFree(B0);cudaFree(A);cudaFree(B);cudaFree(SA);cudaFree(SB);cudaFree(D);if(W)cudaFree(W);
     return ok?0:1;
 }

@@ -486,7 +486,8 @@ __global__ void ct_dequant_nvfp4_kernel(const unsigned char* __restrict__ packed
 //   0  as merged: cutlass conversions, (v * s) / global_scale
 //   1  the integer decodes, same divide -- bit-identical
 //   2  mode 1 plus a hoisted reciprocal, which is NOT bit-identical (measured, see below)
-enum : int { CT_ALU_BASE = 0, CT_ALU_INT = 1, CT_ALU_RCP = 2 };
+//   3  the per-group basis below: no divide and no per-value conversion at all, bit-identical
+enum : int { CT_ALU_BASE = 0, CT_ALU_INT = 1, CT_ALU_RCP = 2, CT_ALU_BASIS = 3 };
 
 // e2m1 magnitudes doubled are {0,1,2,3,4,6,8,12} -- all < 16, so the table is the nibbles of one
 // 32-bit literal and the decode is a shift, a mask and an int->float, with no memory touched.
@@ -504,6 +505,78 @@ __device__ __forceinline__ float ct_ue4m3(unsigned b) {
     return __int_as_float((int)(((e + 120u) << 23) | (m << 20)));
 }
 
+// PER-GROUP BASIS (mode 3). The divide is per VALUE, and modes 1 and 2 are the two ends of one
+// trade: keep it and pay for it, or hoist a reciprocal and stop being bit-identical. There is a
+// third option that is both, because within a group the divide has only sixteen numerators.
+//
+// The eight E2M1 magnitudes are {0, .5, 1, 1.5, 2, 3, 4, 6}, which is {1, 1.5} times exact powers
+// of two. So two divides PER GROUP
+//     b1 = s / gs   (v = 1)            b15 = 1.5f * s / gs   (v = 1.5)
+// span all sixteen values: each is b1 or b15 scaled by a power of two. That scaling is exact and
+// rounding commutes with it, so b1 * 2^k IS the correctly-rounded (2^k * s) / gs rather than an
+// approximation of it -- where mode 2 rounds twice. `1.5f * s` is exact as well: s carries 4
+// significant bits and 1.5 carries 2, against fp32's 24.
+//
+// Per value this leaves a select, a multiply by a power of two, and a sign XOR: no divide, and no
+// E2M1 conversion at all, since the magnitude is folded into which basis got selected. `s` keeps
+// the CUTLASS conversion -- once per sixteen values its cost is negligible, and it stays exact for
+// every byte, including those above 0x7F where ct_ue4m3 drops the sign bit that
+// cutlass::float_ue4m3_t::bitcast honours.
+//
+// XOR rather than OR for the sign: by that same signed reading the basis can be negative, so the
+// nibble's sign must flip it, not merely set it. E2M1's -0 (nibble 0x8) still yields -0.0, exactly
+// as `v * s / gs` does.
+struct nvfp4_basis { float b1, b15; };
+__device__ __forceinline__ nvfp4_basis nvfp4_group_basis(unsigned char sbyte, float gs) {
+    const float s = float(cutlass::float_ue4m3_t::bitcast(sbyte));
+    nvfp4_basis b;
+    b.b1  = s / gs;
+    b.b15 = (1.5f * s) / gs;
+    return b;
+}
+// E2M1 nibble: bit3 sign, bits2-1 exponent, bit0 mantissa.
+//   e == 0 -> subnormal, magnitude m * 0.5   (0 or 0.5, both off b1)
+//   e >= 1 -> magnitude (1 + 0.5*m) * 2^(e-1)
+__device__ __forceinline__ float nvfp4_dequant_val(unsigned nib, const nvfp4_basis& b) {
+    const unsigned e = (nib >> 1) & 3u, m = nib & 1u;
+    const bool sub = (e == 0u);
+    const float base = (m && !sub) ? b.b15 : b.b1;
+    const float pw   = sub ? (m ? 0.5f : 0.0f) : (float)(1u << (e - 1u));
+    const float mag  = base * pw;
+    return __int_as_float(__float_as_int(mag) ^ (int)((nib & 8u) << 28));
+}
+
+// Exhaustive equivalence check for the basis: every nibble against every group-scale byte, over a
+// sweep of global scales. The encoding space is small enough to cover completely.
+__global__ void ct_nvfp4_basis_selftest_kernel(const float* __restrict__ gsv, int ngs,
+                                               unsigned long long* __restrict__ counts) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 256 * ngs) return;
+    const unsigned char sb = (unsigned char)(i & 255);
+    const float gs = gsv[i >> 8];
+    const nvfp4_basis b = nvfp4_group_basis(sb, gs);
+    const float s = float(cutlass::float_ue4m3_t::bitcast(sb));
+    for (unsigned nib = 0; nib < 16; nib++) {
+        const float ref = float(cutlass::float_e2m1_t::bitcast((unsigned char)nib)) * s / gs;
+        const float got = nvfp4_dequant_val(nib, b);
+        if (__float_as_int(ref) != __float_as_int(got) && !(isnan(s) || isnan(ref)))
+            atomicAdd(counts, 1ull);
+        const __nv_bfloat16 rb = __float2bfloat16(ref), gb = __float2bfloat16(got);
+        if (*(const unsigned short*)&rb != *(const unsigned short*)&gb) atomicAdd(counts + 1, 1ull);
+    }
+}
+
+// Which ALU form both checkpoint-decode kernels use. Default is the basis; SPARKINFER_CT_NVFP4_ALU
+// picks 0/1/2/3 so every arm comes out of one binary.
+inline int ct_nvfp4_alu_mode() {
+    static const int alu = [] {
+        const char* e = getenv("SPARKINFER_CT_NVFP4_ALU");
+        const int v = e ? atoi(e) : CT_ALU_BASIS;
+        return (v >= CT_ALU_BASE && v <= CT_ALU_BASIS) ? v : CT_ALU_BASIS;
+    }();
+    return alu;
+}
+
 template <int ALU>
 __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ packed,
                                             const unsigned char* __restrict__ group_scale,
@@ -512,7 +585,7 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
                                             __nv_bfloat16* __restrict__ out,
                                             int rows, int cols) {
     if (global_scale_dev) global_scale = *global_scale_dev;
-    const float inv_gs = (ALU >= CT_ALU_RCP) ? (1.f / global_scale) : 0.f;
+    const float inv_gs = (ALU == CT_ALU_RCP) ? (1.f / global_scale) : 0.f;
     const int ngroups = cols >> 4;
     const int r = blockIdx.y;
     if (r >= rows) return;
@@ -522,8 +595,11 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
     for (int g = blockIdx.x * blockDim.x + threadIdx.x; g < ngroups;
          g += gridDim.x * blockDim.x) {
         const uint2 pk = *reinterpret_cast<const uint2*>(prow + (size_t)g * 8);
-        const float s = (ALU >= CT_ALU_INT) ? ct_ue4m3(srow[g])
-                                            : float(cutlass::float_ue4m3_t::bitcast(srow[g]));
+        const float s = (ALU == CT_ALU_INT || ALU == CT_ALU_RCP)
+                            ? ct_ue4m3(srow[g])
+                            : float(cutlass::float_ue4m3_t::bitcast(srow[g]));
+        const nvfp4_basis nb = (ALU == CT_ALU_BASIS) ? nvfp4_group_basis(srow[g], global_scale)
+                                                     : nvfp4_basis{0.f, 0.f};
         // __align__(16) so the two uint4 stores below are legal; indices are compile-time constant
         // under the unroll, so this stays in registers (verified: ncu local ld/st = 0).
         __align__(16) __nv_bfloat16 o[16];
@@ -532,9 +608,10 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
             const unsigned word = (j < 8) ? pk.x : pk.y;
             const unsigned byte = (word >> (8 * ((j & 7) >> 1))) & 255u;
             const unsigned char nib = (unsigned char)((j & 1) ? (byte >> 4) : (byte & 0xF));
+            if (ALU == CT_ALU_BASIS) { o[j] = __float2bfloat16(nvfp4_dequant_val(nib, nb)); continue; }
             const float v = (ALU >= CT_ALU_INT) ? (0.5f * ct_e2m1_x2(nib))
                                                 : float(cutlass::float_e2m1_t::bitcast(nib));
-            o[j] = __float2bfloat16((ALU >= CT_ALU_RCP) ? (v * s * inv_gs) : (v * s / global_scale));
+            o[j] = __float2bfloat16((ALU == CT_ALU_RCP) ? (v * s * inv_gs) : (v * s / global_scale));
         }
         *reinterpret_cast<uint4*>(orow + (size_t)g * 16)     = *reinterpret_cast<const uint4*>(o);
         *reinterpret_cast<uint4*>(orow + (size_t)g * 16 + 8) = *reinterpret_cast<const uint4*>(o + 8);
@@ -557,7 +634,7 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
 //
 // Eight consecutive columns from a multiple of 8 lie inside one 16-element group, so a slot is one
 // 4-byte packed load plus one scale byte.
-template <int BLOCK, int VEC, int SLOTS>
+template <int BLOCK, int VEC, int SLOTS, int ALU>
 __global__ __launch_bounds__(BLOCK) void ct_nvfp4_rows_i8_kernel(
         const unsigned char* __restrict__ packed, const unsigned char* __restrict__ group_scale,
         const float* __restrict__ global_scale_dev, signed char* __restrict__ q,
@@ -577,12 +654,16 @@ __global__ __launch_bounds__(BLOCK) void ct_nvfp4_rows_i8_kernel(
         const int c = (tid + s * BLOCK) * VEC;
         if (c < cols) {
             const unsigned pk = *reinterpret_cast<const unsigned*>(prow + (c >> 1));
-            const float gsc = ct_ue4m3(srow[c >> 4]);
+            const float gsc = (ALU == CT_ALU_BASIS) ? 0.f : ct_ue4m3(srow[c >> 4]);
+            const nvfp4_basis nb = (ALU == CT_ALU_BASIS) ? nvfp4_group_basis(srow[c >> 4], gs)
+                                                         : nvfp4_basis{0.f, 0.f};
             #pragma unroll
             for (int v = 0; v < VEC; v++) {
                 const unsigned byte = (pk >> (8 * (v >> 1))) & 255u;
                 const unsigned char nib = (unsigned char)((v & 1) ? (byte >> 4) : (byte & 0xF));
-                reg[s][v] = __float2bfloat16((0.5f * ct_e2m1_x2(nib)) * gsc / gs);
+                reg[s][v] = (ALU == CT_ALU_BASIS)
+                    ? __float2bfloat16(nvfp4_dequant_val(nib, nb))
+                    : __float2bfloat16((0.5f * ct_e2m1_x2(nib)) * gsc / gs);
                 amax = fmaxf(amax, fabsf(__bfloat162float(reg[s][v])));
             }
         }
@@ -627,20 +708,56 @@ bool launch_ct_dequant_nvfp4_rows_i8(const void* packed_u8, const void* group_sc
     if (!on || !packed_u8 || !group_scale_ue4m3 || !global_scale_dev || !q || !scale) return false;
     if (rows <= 0 || cols <= 0 || (cols & 15) != 0) return false;
     const int slots = (cols + BLOCK * VEC - 1) / (BLOCK * VEC);
-    #define SI_NVFP4_ROWS_I8(S) \
-        ct_nvfp4_rows_i8_kernel<BLOCK, VEC, S><<<rows, BLOCK, 0, stream>>>( \
+    const bool basis = ct_nvfp4_alu_mode() == CT_ALU_BASIS;
+    #define SI_NVFP4_ROWS_I8(S, A) \
+        ct_nvfp4_rows_i8_kernel<BLOCK, VEC, S, A><<<rows, BLOCK, 0, stream>>>( \
             reinterpret_cast<const unsigned char*>(packed_u8), \
             reinterpret_cast<const unsigned char*>(group_scale_ue4m3), \
             global_scale_dev, q, scale, rows, cols)
+    #define SI_NVFP4_ROWS_I8_S(S) \
+        do { if (basis) SI_NVFP4_ROWS_I8(S, CT_ALU_BASIS); \
+             else       SI_NVFP4_ROWS_I8(S, CT_ALU_INT); } while (0)
     switch (slots) {
-        case 1: SI_NVFP4_ROWS_I8(1); break;
-        case 2: SI_NVFP4_ROWS_I8(2); break;
-        case 3: SI_NVFP4_ROWS_I8(3); break;
-        case 4: SI_NVFP4_ROWS_I8(4); break;
+        case 1: SI_NVFP4_ROWS_I8_S(1); break;
+        case 2: SI_NVFP4_ROWS_I8_S(2); break;
+        case 3: SI_NVFP4_ROWS_I8_S(3); break;
+        case 4: SI_NVFP4_ROWS_I8_S(4); break;
         default: return false;
     }
+    #undef SI_NVFP4_ROWS_I8_S
     #undef SI_NVFP4_ROWS_I8
     return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool ct_nvfp4_basis_selftest(unsigned long long* fp32_finite_mismatch,
+                             unsigned long long* bf16_mismatch, int* combinations) {
+    // Global scales: what a ModelOpt export actually produces (amax-derived, 448*6 and friends),
+    // plus adversarial ones -- denormal-adjacent, huge, and non-representable thirds.
+    float h[64];
+    int n = 0;
+    const float fixed[] = {1.f, 0.5f, 2.f, 3.f, 7.f, 0.1f, 1234.5f, 1e-6f, 1e6f, 0.000123f,
+                           448.f * 6.f, 1.f / 3.f, 65504.f, 1e-30f, 1e30f, 6.1035156e-05f};
+    for (float v : fixed) h[n++] = v;
+    for (int k = 0; k < 16; k++) h[n++] = 0.37f * (float)(k + 1) * (float)(k + 1);
+
+    float* d = nullptr;
+    unsigned long long* c = nullptr;
+    if (cudaMalloc(&d, (size_t)n * sizeof(float)) != cudaSuccess) return false;
+    if (cudaMallocManaged(&c, 2 * sizeof(unsigned long long)) != cudaSuccess) {
+        cudaFree(d);
+        return false;
+    }
+    c[0] = 0; c[1] = 0;
+    cudaMemcpy(d, h, (size_t)n * sizeof(float), cudaMemcpyHostToDevice);
+    const int total = 256 * n;
+    ct_nvfp4_basis_selftest_kernel<<<(total + 255) / 256, 256>>>(d, n, c);
+    const bool ok = cudaDeviceSynchronize() == cudaSuccess;
+    if (fp32_finite_mismatch) *fp32_finite_mismatch = c[0];
+    if (bf16_mismatch) *bf16_mismatch = c[1];
+    if (combinations) *combinations = total * 16;
+    cudaFree(d);
+    cudaFree(c);
+    return ok;
 }
 
 static void ct_dequant_nvfp4_launch(const void* packed_u8, const void* group_scale_ue4m3,
@@ -654,13 +771,7 @@ static void ct_dequant_nvfp4_launch(const void* packed_u8, const void* group_sca
         const char* e = getenv("SPARKINFER_CT_NVFP4_G16");
         return (e && e[0] == '0') ? 0 : 1;
     }();
-    // Which ALU form the group-wise kernel uses; see the enum above. Default is the bit-identical
-    // integer decode. SPARKINFER_CT_NVFP4_ALU picks 0/1/2 for A/B.
-    static const int alu = [] {
-        const char* e = getenv("SPARKINFER_CT_NVFP4_ALU");
-        const int v = e ? atoi(e) : CT_ALU_INT;
-        return (v >= CT_ALU_BASE && v <= CT_ALU_RCP) ? v : CT_ALU_INT;
-    }();
+    const int alu = ct_nvfp4_alu_mode();
     if (g16 && rows > 0 && cols > 0 && (cols & 15) == 0 &&
         ((reinterpret_cast<size_t>(packed_u8) | reinterpret_cast<size_t>(out_bf16)) & 15u) == 0) {
         const int ngroups = cols >> 4;
@@ -670,7 +781,10 @@ static void ct_dequant_nvfp4_launch(const void* packed_u8, const void* group_sca
         auto* pk = reinterpret_cast<const unsigned char*>(packed_u8);
         auto* gsc = reinterpret_cast<const unsigned char*>(group_scale_ue4m3);
         auto* ob = reinterpret_cast<__nv_bfloat16*>(out_bf16);
-        if (alu == CT_ALU_RCP)
+        if (alu == CT_ALU_BASIS)
+            ct_dequant_nvfp4_g16_kernel<CT_ALU_BASIS><<<grid, threads, 0, stream>>>(
+                pk, gsc, global_scale, global_scale_dev, ob, rows, cols);
+        else if (alu == CT_ALU_RCP)
             ct_dequant_nvfp4_g16_kernel<CT_ALU_RCP><<<grid, threads, 0, stream>>>(
                 pk, gsc, global_scale, global_scale_dev, ob, rows, cols);
         else if (alu == CT_ALU_INT)
