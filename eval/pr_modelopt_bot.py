@@ -98,10 +98,17 @@ SIG = 0.02
 REGRESS_TOL = 0.98
 BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 
-# The ONE dimension that can earn a tier. prefill@128 and prefill@16k are still measured and still
-# act as no-regression floors (see evaluate_pr), but a PR that only improves them scores "none":
-# 128-context decode is the sole optimisation target for the ModelOpt checkpoint.
-SCORING_DIM = "decode@128"
+# The dimensions that can earn a tier. Both 128-context optimisations count for the ModelOpt
+# checkpoint (decision 2026-08-16, prefill@128 added alongside decode@128); prefill@16k is still
+# measured and still acts as a no-regression floor, but a PR that only improves it scores "none".
+#
+# A PR is tiered on its BEST scoring dimension, not on a sum or an average: the two are largely
+# independent optimisations (decode is weight-bandwidth bound at m=1, prefill@128 is a
+# tensor-core GEMM at m=128), so a real win in one is a real win, and averaging would let a
+# strong result be diluted by an untouched dimension. SCORING_DIM stays defined as the primary
+# for the places that report a single name.
+SCORING_DIMS = ["decode@128", "prefill@128"]
+SCORING_DIM = SCORING_DIMS[0]
 
 # Accuracy gate bars. This gate is DIFFERENTIAL (PR vs origin/main on the same token stream, see
 # the module docstring pt. 2), not absolute-vs-llama.cpp, so the bars are much tighter than the
@@ -1088,10 +1095,10 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         scored.append({"dim": name, "label": lab, "delta": dlt, "passed": ok, "reason": why})
     by_dim = {s["dim"]: s for s in scored}
 
-    # ANY dimension regressing is still a hard REJECT. decode@128 and prefill@128 are NOT scoring
-    # dimensions any more -- they cannot earn a tier -- but they remain no-regression FLOORS,
-    # because without them a PR could trade decode throughput away to buy long-context prefill and
-    # still auto-merge at XL. They cost nothing to keep: all three come from the one sweep.
+    # ANY dimension regressing is still a hard REJECT. prefill@16k is NOT a scoring dimension --
+    # it cannot earn a tier -- but it remains a no-regression FLOOR, because without it a PR could
+    # trade long-context prefill away to buy 128-context throughput and still auto-merge at XL.
+    # It costs nothing to keep: all three come from the one sweep.
     regressed = [s for s in scored if s["label"] == "REJECT"]
     if regressed:
         worst = min(regressed, key=lambda s: s["delta"])
@@ -1101,7 +1108,11 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     else:
         # The tier comes from prefill@16k ALONE. A decode-only or prefill@128-only improvement now
         # scores "none" by design -- long-context prefill is the only optimisation target.
-        best = by_dim[SCORING_DIM]
+        # Best of the scoring dimensions, by measured delta. max() over deltas rather than over
+        # tier letters: two dimensions can share a bucket while one is clearly the larger win, and
+        # the delta is what the tier was derived from anyway.
+        best = max((by_dim[d] for d in SCORING_DIMS if d in by_dim),
+                   key=lambda s: s["delta"], default=by_dim[SCORING_DIM])
         label, delta_pct, passed, speed_reason = best["label"], best["delta"], best["passed"], best["reason"]
     decode_label,  decode_delta_pct  = by_dim["decode@128"]["label"],  by_dim["decode@128"]["delta"]
     prefill_label, prefill_delta_pct = by_dim["prefill@128"]["label"], by_dim["prefill@128"]["delta"]
@@ -1276,7 +1287,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer modelopt auto-eval — `eval-modelopt:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-modelopt:{lab}` |\n"
-        f"| scored at | decode@128 (the only scoring dimension); prefill@128 + prefill@16k are no-regression floors |\n"
+        f"| scored at | decode@128 + prefill@128 (best of the two earns the tier); prefill@16k is a no-regression floor |\n"
         f"| tier came from | `{res.get('scored_dimension', '?')}` |\n"
         f"| PR decode tok/s | {res['pr_decode_tps']:.2f} |\n"
         f"| main decode tok/s | {res['main_decode_tps']:.2f} |\n"
