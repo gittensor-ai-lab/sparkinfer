@@ -98,6 +98,14 @@ struct Qwen35LayerWeights {
     // Short-context-only copy; decode retains down_q, so long-context configurations leave this
     // null to preserve KV and batched-prefill scratch headroom on 32-GB cards.
     const void* down_fp4 = nullptr; const void* down_fp4_sf = nullptr;
+    // GDN in/out projections, for checkpoints that ship them as NVFP4 (ModelOpt). These point INTO
+    // the payload keep_nvfp4_native already keeps resident for decode's launch_gemv_nvfp4, so only
+    // the CUTLASS SFB scale copy (1 byte per 16 weights) is new VRAM -- the packed nibbles are
+    // shared, not duplicated. Null on any checkpoint that stores the GDN projections in FP8.
+    const void* gdn_qkv_fp4 = nullptr; const void* gdn_qkv_fp4_sf = nullptr;
+    const void* gdn_z_fp4 = nullptr;   const void* gdn_z_fp4_sf = nullptr;
+    const void* gdn_out_fp4 = nullptr; const void* gdn_out_fp4_sf = nullptr;
+    float gdn_qkv_fp4_alpha = 1.f, gdn_z_fp4_alpha = 1.f, gdn_out_fp4_alpha = 1.f;
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
     // 14=Q6_K, 8=Q8_0) or SI_QTYPE_FP8 (108) / SI_QTYPE_NVFP4 (109) -> weights kept
     // quantized in VRAM, decoded on-read by launch_gemv_q / launch_gemv_fp8 /

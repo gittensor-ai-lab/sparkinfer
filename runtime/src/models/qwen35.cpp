@@ -4683,8 +4683,19 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         const char* e = getenv("SPARKINFER_Q38_GDN_NVFP4");
         return !(e && e[0] == '0');
     }();
-    auto keep_nvfp4_native = [&](const std::string& prefix, int rows, int cols,
-                                 int& qtype) -> const void* {
+    // Batched prefill's native-NVFP4 arm for the GDN projections. The packed nibbles are already
+    // resident for decode, so the only new bytes are the CUTLASS SFB scale copy -- 1 byte per 16
+    // weights, i.e. 1/9th of what the payload it describes already costs. Without it batched
+    // prefill has no NVFP4 B operand and proj() expands every GDN weight NVFP4 -> bf16 -> int8 on
+    // every pass. SPARKINFER_Q38_GDN_PREFILL_NVFP4=0 skips the SFB entirely (A/B, and the VRAM
+    // escape hatch for a card that would rather spend those bytes on KV).
+    static const bool gdn_prefill_fp4 = [] {
+        const char* e = getenv("SPARKINFER_Q38_GDN_PREFILL_NVFP4");
+        return !(e && e[0] == '0');
+    }();
+    auto keep_nvfp4_native = [&](const std::string& prefix, int rows, int cols, int& qtype,
+                                 const void** fp4 = nullptr, const void** fp4_sf = nullptr,
+                                 float* fp4_alpha = nullptr) -> const void* {
         NvFp4Src src{};
         if (!nvfp4_src(prefix, rows, cols, src)) return nullptr;
         if (!gdn_keep_nvfp4) return requant_q4k(dequant_nvfp4(prefix, rows, cols),
@@ -4702,16 +4713,35 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
                    cudaMemcpyHostToDevice);
         s.owned.push_back(payload);
         qtype = kernels::SI_QTYPE_NVFP4;
+        if (fp4 && gdn_prefill_fp4 && kernels::prefill_nvfp4_supported(128, rows, cols)) {
+            void* sf = nullptr;
+            const size_t sf_bytes = kernels::prefill_nvfp4_scale_bytes_b(rows, cols);
+            if (sf_bytes && cudaMalloc(&sf, sf_bytes) == cudaSuccess &&
+                kernels::launch_ct_nvfp4_pack_sfb(static_cast<char*>(payload) + hdr, sf,
+                                                  rows, cols, s.stream) &&
+                cudaStreamSynchronize(s.stream) == cudaSuccess) {
+                s.owned.push_back(sf);
+                *fp4 = static_cast<char*>(payload) + hdr + scale_bytes;
+                *fp4_sf = sf;
+                // src.global is already the divisor launch_ct_dequant_nvfp4 divides by, so the
+                // GEMM's alpha is its reciprocal -- keep_nvfp4's convention for the FFN, verbatim.
+                *fp4_alpha = (src.global != 0.f) ? (1.f / src.global) : 1.f;
+            } else if (sf) {
+                cudaFree(sf);
+            }
+        }
         return payload;
     };
 
     // One Linear kept in whatever native form this checkpoint ships it in: FP8 stays FP8, NVFP4
     // stays NVFP4, and anything else falls back to a Q4_K fit from bf16. Used for the GDN
     // projections, where both shipped checkpoints deliberately avoid a second quantization.
-    auto keep_native = [&](const std::string& prefix, int rows, int cols,
-                           int& qtype) -> const void* {
+    auto keep_native = [&](const std::string& prefix, int rows, int cols, int& qtype,
+                           const void** fp4 = nullptr, const void** fp4_sf = nullptr,
+                           float* fp4_alpha = nullptr) -> const void* {
         NvFp4Src probe{};
-        if (nvfp4_src(prefix, rows, cols, probe)) return keep_nvfp4_native(prefix, rows, cols, qtype);
+        if (nvfp4_src(prefix, rows, cols, probe))
+            return keep_nvfp4_native(prefix, rows, cols, qtype, fp4, fp4_sf, fp4_alpha);
         const STTensor* w = st.tensor(prefix + ".weight");
         if (w && w->dtype == STDType::F8_E4M3) return keep_fp8(prefix, rows, cols, qtype);
         return requant_q4k(dequant_any(prefix, rows, cols), (long)rows * cols, qtype);
@@ -4740,10 +4770,13 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             const std::string lb = b + "linear_attn.";
             // Native checkpoint format, whichever it is (FP8 or NVFP4) -- not a second Q4_K/Q8_0
             // fit: same bf16 rounding as keep_bf16, half the GDN traffic. See keep_native above.
-            w.wqkv = keep_native(lb + "in_proj_qkv", s.linear_qkvdim, H, w.wqkv_type);
+            w.wqkv = keep_native(lb + "in_proj_qkv", s.linear_qkvdim, H, w.wqkv_type,
+                                 &w.gdn_qkv_fp4, &w.gdn_qkv_fp4_sf, &w.gdn_qkv_fp4_alpha);
             w.wqkv_gate = keep_native(lb + "in_proj_z", c.linear_v_heads * c.linear_head_dim, H,
-                                      w.wqkv_gate_type);
-            w.ssm_out = keep_native(lb + "out_proj", H, s.linear_vdim, w.ssm_out_type);
+                                      w.wqkv_gate_type,
+                                      &w.gdn_z_fp4, &w.gdn_z_fp4_sf, &w.gdn_z_fp4_alpha);
+            w.ssm_out = keep_native(lb + "out_proj", H, s.linear_vdim, w.ssm_out_type,
+                                    &w.gdn_out_fp4, &w.gdn_out_fp4_sf, &w.gdn_out_fp4_alpha);
             // Small, checkpoint-unquantized tensors -- plain bf16, NO transpose. conv1d's raw HF
             // layout [qkvdim,1,conv_kernel] (=[qkvdim,conv_kernel] squeezed) already matches
             // conv_split_kernel's own indexing (conv_w[d*conv_kernel+t], d=channel, t=tap) --
