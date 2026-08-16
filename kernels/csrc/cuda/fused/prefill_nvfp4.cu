@@ -13,10 +13,17 @@ bool launch_prefill_nvfp4_quant_a(const void*, void*, void*, int, int, cudaStrea
 bool launch_prefill_nvfp4_gate_quant_a(const void*, const void*, void*, void*, int, int,
                                        cudaStream_t) { return false; }
 bool launch_prefill_nvfp4_swiglu_quant_a(const void*, const void*, void*, void*, int, int,
-                                         cudaStream_t) { return false; }
+                                         cudaStream_t, int) { return false; }
 bool launch_prefill_nvfp4_quant_b(const void*, void*, void*, int, int, cudaStream_t) { return false; }
 bool launch_prefill_nvfp4_gemm(const void*, const void*, const void*, const void*, void*, int, int,
                                int, void*, cudaStream_t, float) { return false; }
 bool launch_ct_nvfp4_pack_sfb(const void*, void*, int, int, cudaStream_t) { return false; }
+// Returning false here is not merely a link fix: the caller treats false as "shape unsupported"
+// and falls back to launch_add_rmsnorm2 + a separate quantize, which is the pre-fusion path.
+bool launch_prefill_gated_norm_nvfp4_a(const void*, const void*, const void*, void*, void*, void*,
+                                       int, int, int, float, cudaStream_t) { return false; }
+bool launch_prefill_add_rmsnorm2_nvfp4_a(const void*, const void*, const void*, void*, void*,
+                                         void*, void*, int, int, float,
+                                         cudaStream_t) { return false; }
 } // namespace sparkinfer::kernels
 #endif

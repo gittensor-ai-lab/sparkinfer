@@ -253,7 +253,11 @@ __global__ void pf_gemm_skinny_reduce(const float* __restrict__ P,
 
 bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
                                 int M, int N, int K, cudaStream_t stream) {
-    constexpr int KT = 64, NWIDE = 64;
+    // NWIDE 64 -> 96 so a FUSED in_proj_a|in_proj_b (2 x 48 v-heads) still lands here. At N=96
+    // the tiled fallback grids to ceil(96/128) x ceil(128/128) = ONE block -- a single SM running
+    // the whole GEMM -- which is why routing a fused n=96 operand through it measured -34.5%.
+    // BT=32, NMAX=96 is 12 warps (384 threads), well inside the 1024 the macro asserts.
+    constexpr int KT = 64, NWIDE = 96;
 
     static const int enabled = [] {
         const char* e = getenv("SPARKINFER_PREFILL_GEMM_SKINNY");
@@ -294,9 +298,14 @@ bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
         if (bt_env >= 64) SI_SKINNY_LAUNCH(64, 48);
         SI_SKINNY_LAUNCH(32, 48);
     }
-    if (bt_env <= 16) SI_SKINNY_LAUNCH(16, 64);
-    if (bt_env >= 64) SI_SKINNY_LAUNCH(64, 64);
-    SI_SKINNY_LAUNCH(32, 64);
+    if (N <= 64) {
+        if (bt_env <= 16) SI_SKINNY_LAUNCH(16, 64);
+        if (bt_env >= 64) SI_SKINNY_LAUNCH(64, 64);
+        SI_SKINNY_LAUNCH(32, 64);
+    }
+    if (bt_env <= 16) SI_SKINNY_LAUNCH(16, 96);
+    if (bt_env >= 64) SI_SKINNY_LAUNCH(64, 96);
+    SI_SKINNY_LAUNCH(32, 96);
 }
 
 #undef SI_SKINNY_LAUNCH

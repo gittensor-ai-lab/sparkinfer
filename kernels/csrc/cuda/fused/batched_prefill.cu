@@ -277,14 +277,16 @@ __global__ void pf_add_kernel(const __nv_bfloat16* __restrict__ a,
 __global__ void pf_split_q_gate_kernel(const __nv_bfloat16* __restrict__ qraw,
                                        __nv_bfloat16* __restrict__ q,
                                        __nv_bfloat16* __restrict__ gate,
-                                       int n_tokens, int n_heads, int head_dim) {
+                                       int n_tokens, int n_heads, int head_dim, int row_stride) {
     const long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
     const long per = (long)n_heads * head_dim;
     if (gid >= (long)n_tokens * per) return;
     const int t = gid / per;
     const int r = gid % per;                       // within-token index
     const int h = r / head_dim, d = r % head_dim;
-    const size_t src = (size_t)t * 2 * per + (size_t)h * 2 * head_dim + d;
+    // row_stride is 2*per for a tight [q|gate] buffer, and wider when [q|gate] is the leading
+    // slice of a fused q|k|v GEMM output that this reads in place instead of copying out.
+    const size_t src = (size_t)t * row_stride + (size_t)h * 2 * head_dim + d;
     q[gid]    = qraw[src];
     gate[gid] = qraw[src + head_dim];
 }
@@ -533,7 +535,7 @@ __global__ void pf_gdn_scan_kernel(const __nv_bfloat16* __restrict__ q,
                                    const __nv_bfloat16* __restrict__ a,
                                    float* __restrict__ state,
                                    __nv_bfloat16* __restrict__ out,
-                                   int n_tokens, int q_heads, int v_heads, bool qh_block) {
+                                   int n_tokens, int q_heads, int v_heads, int ab_stride, bool qh_block) {
     constexpr int NROW = HEAD_DIM / 32;
     const int vh   = blockIdx.x;
     const int j    = blockIdx.y * COLS + (threadIdx.x >> 5);
@@ -551,8 +553,8 @@ __global__ void pf_gdn_scan_kernel(const __nv_bfloat16* __restrict__ q,
     for (int r = 0; r < NROW; r++) sloc[r] = 0.f;   // fresh prefill: state starts at zero
 
     for (int t = 0; t < n_tokens; t++) {
-        const float bb = pf_sigmoid(pf_to_f(beta[(size_t)t * v_heads + vh]));
-        const float g  = __expf(pf_softplus(pf_to_f(alpha[(size_t)t * v_heads + vh]) + dt_h) * a_h);
+        const float bb = pf_sigmoid(pf_to_f(beta[(size_t)t * ab_stride + vh]));
+        const float g  = __expf(pf_softplus(pf_to_f(alpha[(size_t)t * ab_stride + vh]) + dt_h) * a_h);
         const __nv_bfloat16* qp = q + ((size_t)t * q_dim + qh * HEAD_DIM);
         const __nv_bfloat16* kp = k + ((size_t)t * q_dim + qh * HEAD_DIM);
         const __nv_bfloat16* vp = v + ((size_t)t * v_dim + vh * HEAD_DIM);
@@ -1156,24 +1158,57 @@ __global__ void pf_attn_bf16_paged_kernel(
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
 
-    for (int kpos = 0; kpos <= qtok; kpos++) {
-        const int blk = kpos / block_size, within = kpos % block_size;
-        const int phys = block_table[blk];
-        const size_t ckt = ((size_t)phys * block_size + within);
-        const size_t kv_off = (ckt * n_kv_heads + kv_head) * HEAD_DIM;
-        float partial = 0.f;
+    // KEY TILE. One key per iteration made every key a serial dependency chain: an ELEMS-long
+    // dot, then a 5-step warp-shuffle reduction, then an online-softmax update that consumes the
+    // reduction -- ~40-50 cycles of latency to do 16 FMAs. Measured 7.7 TFLOPS = 3.9% of bf16 peak.
+    // Processing KT keys per iteration lets the KT reductions interleave (independent shuffle
+    // chains, so their latency overlaps instead of serialising) and pays the sequential softmax
+    // rescale once per tile instead of once per key. Mathematically the same online softmax;
+    // not bit-identical, because the running max now advances a tile at a time.
+    constexpr int KT = 8;
+    for (int kbase = 0; kbase <= qtok; kbase += KT) {
+        const int nk = min(KT, qtok - kbase + 1);
+        float score[KT];
+        size_t kv_offs[KT];
         #pragma unroll
-        for (int e = 0; e < ELEMS; e++)
-            partial += q_reg[e] * pf_to_f(k_pool[kv_off + lane + e * 32]);
-        const float score = pf_wsum(partial) * scale;
+        for (int t = 0; t < KT; t++) {
+            const int kpos = kbase + t;
+            const int kp = (t < nk) ? kpos : kbase;          // clamp: result discarded below
+            const int blk = kp / block_size, within = kp % block_size;
+            const size_t ckt = ((size_t)block_table[blk] * block_size + within);
+            kv_offs[t] = (ckt * n_kv_heads + kv_head) * HEAD_DIM;
+        }
+        #pragma unroll
+        for (int t = 0; t < KT; t++) {
+            float partial = 0.f;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                partial += q_reg[e] * pf_to_f(k_pool[kv_offs[t] + lane + e * 32]);
+            score[t] = partial;                              // reduced below, interleaved
+        }
+        #pragma unroll
+        for (int t = 0; t < KT; t++) score[t] = pf_wsum(score[t]) * scale;
 
-        const float m_new = fmaxf(m, score);
-        const float corr  = __expf(m - m_new);
-        const float p     = __expf(score - m_new);
-        l = l * corr + p;
+        float m_new = m;
         #pragma unroll
-        for (int e = 0; e < ELEMS; e++)
-            acc[e] = acc[e] * corr + p * pf_to_f(v_pool[kv_off + lane + e * 32]);
+        for (int t = 0; t < KT; t++) if (t < nk) m_new = fmaxf(m_new, score[t]);
+        const float corr = __expf(m - m_new);
+        float psum = 0.f;
+        float pv[KT];
+        #pragma unroll
+        for (int t = 0; t < KT; t++) {
+            pv[t] = (t < nk) ? __expf(score[t] - m_new) : 0.f;
+            psum += pv[t];
+        }
+        l = l * corr + psum;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) {
+            float a = acc[e] * corr;
+            #pragma unroll
+            for (int t = 0; t < KT; t++)
+                if (t < nk) a += pv[t] * pf_to_f(v_pool[kv_offs[t] + lane + e * 32]);
+            acc[e] = a;
+        }
         m = m_new;
     }
     const float inv = (l > 0.f) ? (1.f / l) : 0.f;
@@ -1218,11 +1253,13 @@ void launch_prefill_add(const void* a, const void* b, void* out, long n, cudaStr
 }
 
 void launch_prefill_split_q_gate(const void* qraw, void* q, void* gate,
-                                 int n_tokens, int n_heads, int head_dim, cudaStream_t stream) {
+                                 int n_tokens, int n_heads, int head_dim, cudaStream_t stream,
+                                 int row_stride) {
     const long n = (long)n_tokens * n_heads * head_dim;
+    const int rs = row_stride > 0 ? row_stride : 2 * n_heads * head_dim;
     pf_split_q_gate_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(qraw), reinterpret_cast<__nv_bfloat16*>(q),
-        reinterpret_cast<__nv_bfloat16*>(gate), n_tokens, n_heads, head_dim);
+        reinterpret_cast<__nv_bfloat16*>(gate), n_tokens, n_heads, head_dim, rs);
 }
 
 void launch_prefill_mul_sigmoid(void* attn, const void* gate, int n_tokens, int dim, cudaStream_t stream) {
@@ -1272,11 +1309,12 @@ void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_sta
 void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              const void* alpha, const void* beta, const void* dt, const void* a,
                              float* state, void* out, int n_tokens, int q_heads, int v_heads,
-                             int head_dim, bool qh_block, cudaStream_t stream) {
+                             int head_dim, bool qh_block, cudaStream_t stream, int ab_stride) {
+    const int abs_ = ab_stride > 0 ? ab_stride : v_heads;
     // Chunk-parallel (WY/UT transform) scan: shortens the serial chain N -> N/C. Falls through to
     // the sequential scan below when disabled (SPARKINFER_PREFILL_GDN_CHUNK=0) or shape-unsupported.
     if (launch_prefill_gdn_chunk(q, k, v, alpha, beta, dt, a, state, out,
-                                 n_tokens, q_heads, v_heads, head_dim, qh_block, stream)) return;
+                                 n_tokens, q_heads, v_heads, head_dim, qh_block, stream, abs_)) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
@@ -1289,7 +1327,7 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
     auto ob = reinterpret_cast<__nv_bfloat16*>(out);
     if (head_dim == 128)
         pf_gdn_scan_kernel<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
-            qb, kb, vb, ab, bb, db, aa, state, ob, n_tokens, q_heads, v_heads, qh_block);
+            qb, kb, vb, ab, bb, db, aa, state, ob, n_tokens, q_heads, v_heads, abs_, qh_block);
 }
 
 void launch_dflash_gdn_conv(const void* qkv, const void* conv_w, const void* live_state,

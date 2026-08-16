@@ -394,7 +394,11 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->h=p_->alloc<bf16>(H); p_->hn=p_->alloc<bf16>(H);
     p_->routed=p_->alloc<bf16>(H); p_->shared=p_->alloc<bf16>(H);
     if (cfg.hybrid) {
-        p_->qraw=p_->alloc<bf16>(p_->qdim * 2);
+        // Sized for the fused q|k|v GEMV (see qkv_cat): [q|gate] then k then v in one buffer, so
+        // the single GEMV writes in place and split_q_gate still reads the leading 2*qdim. Widening
+        // one allocation avoids aliasing s.k/s.v into it, which the per-pointer cudaFree at
+        // teardown would turn into a double free.
+        p_->qraw=p_->alloc<bf16>(p_->qdim * 2 + p_->kvdim * 2);
         p_->qgate=p_->alloc<bf16>(p_->qdim);
         p_->lin_qkv=p_->alloc<bf16>(p_->linear_qkvdim);
         p_->lin_q=p_->alloc<bf16>(p_->linear_qdim);
@@ -1318,7 +1322,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 const bool attn_qkv = !sep_gate && s.use_attn_qkv && s.use_pq && s.use_llama
                                    && (H == 2048 || H == 4096 || H == 5120)
                                    && w.wq_type == 12 && w.wk_type == 12 && w.wv_type == 12;
-                if (attn_qkv) {
+                if (w.qkv_cat && q_dst == s.qraw) {
+                    // One GEMV over the fused operand instead of three. k and v are n=1024 on
+                    // their own -- at m=1 that is three launches for one weight stream, and the
+                    // fused payload is exactly q_out+2*kvdim rows so the GEMV's own offsets line
+                    // up. Copy the two tails out (2 KB each) rather than aliasing s.k/s.v.
+                    kernels::launch_gemv_nvfp4(s.xn, w.qkv_cat, s.qraw, w.qkv_cat_rows, H, st);
+                    bf16* kv = static_cast<bf16*>(s.qraw) + nq;
+                    cudaMemcpyAsync(s.k, kv, (size_t)s.kvdim * sizeof(bf16),
+                                    cudaMemcpyDeviceToDevice, st);
+                    cudaMemcpyAsync(s.v, kv + s.kvdim, (size_t)s.kvdim * sizeof(bf16),
+                                    cudaMemcpyDeviceToDevice, st);
+                } else if (attn_qkv) {
                     kernels::launch_attn_qkv_mmvq_q4k(s.aq81, w.wq, w.wk, w.wv,
                         q_dst, s.k, s.v, nq, s.kvdim, s.kvdim, H, st);
                 } else if (s.use_qkvstream) {
@@ -4527,7 +4542,8 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     };
 
     auto keep_nvfp4 = [&](const std::string& prefix, int rows, int cols,
-                          const void** fp4, const void** fp4_sf, float& fp4_alpha) -> const void* {
+                          const void** fp4, const void** fp4_sf, float& fp4_alpha,
+                          bool want_fp4 = true) -> const void* {
         NvFp4Src src{};
         if (!nvfp4_src(prefix, rows, cols, src)) {
             fprintf(stderr, "[compressed-tensors] %s: missing/malformed NVFP4 tensors\n",
@@ -4563,10 +4579,14 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             const char* e = getenv("SPARKINFER_QWEN38_PREFILL_NVFP4");
             return !(e && e[0] == '0');
         }();
-        if (keep_prefill_fp4) s.owned.push_back(payload);
+        // want_fp4=false: the caller is building a fused operand instead, so this payload is
+        // transient -- still the SOURCE for q4k_from_nvfp4 below, then freed by the caller. Keeping
+        // it out of s.owned is what makes that early free safe.
+        const bool keep_this = keep_prefill_fp4 && want_fp4;
+        if (keep_this) s.owned.push_back(payload);
         fp4_alpha = (global_scale != 0.f) ? (1.f / global_scale) : 1.f;
         const void* packed = static_cast<char*>(payload) + hdr + scale_bytes;
-        if (keep_prefill_fp4 && kernels::prefill_nvfp4_supported(128, rows, cols)) {
+        if (keep_this && kernels::prefill_nvfp4_supported(128, rows, cols)) {
             void* sf = nullptr;
             const size_t sf_bytes = kernels::prefill_nvfp4_scale_bytes_b(rows, cols);
             if (sf_bytes && cudaMalloc(&sf, sf_bytes) == cudaSuccess &&
@@ -4733,6 +4753,179 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         return payload;
     };
 
+    // The 16 full-attention layers ship q/k/v/o as NVFP4 too (same weight/weight_scale/
+    // weight_scale_2 trio the MLP uses), but they were being refit to Q4_K at load, so batched
+    // prefill then re-expanded every one of them Q4_K -> int8 on EVERY pass -- 2.5625 bytes of
+    // traffic per stored weight against the 0.625 the native form needs. Over 16 layers x
+    // (12288 + 1024 + 1024 + 5120... ) = 1.68 G weights that is ~4.3 GB moved per pass to read a
+    // 0.94 GB operand, and it is the same expand-then-renarrow the GDN projections had.
+    //
+    // This REPLACES the Q4_K copy instead of sitting beside it, and that is deliberate: at
+    // ctx=16384 this model runs with under 1 GB free, and a second copy (~0.9 GB) would starve the
+    // FFN chunk and cost more at 16k than it wins at 128. Decode reads the same payload through
+    // launch_gemv_nvfp4 (proj_xn already dispatches SI_QTYPE_NVFP4), so the switch is
+    // all-or-nothing per tensor: either the native payload is built and both paths use it, or the
+    // Q4_K refit stands and both paths use that. SPARKINFER_Q38_ATTN_NVFP4=0 forces the latter.
+    static const bool attn_keep_nvfp4 = [] {
+        const char* e = getenv("SPARKINFER_Q38_ATTN_NVFP4");
+        return !(e && e[0] == '0');
+    }();
+    auto keep_attn = [&](const std::string& prefix, int rows, int cols, int& qtype,
+                         const void** fp4, const void** fp4_sf, float* fp4_alpha) -> const void* {
+        NvFp4Src probe{};
+        if (attn_keep_nvfp4 && gdn_keep_nvfp4 && nvfp4_src(prefix, rows, cols, probe)) {
+            // Roll back cleanly if the SFB does not get built: keep_nvfp4_native has already
+            // registered the payload in s.owned and stamped qtype NVFP4 by then, and a payload
+            // without an SFB is the worst of both -- prefill would have an NVFP4 type and no B
+            // operand to go with it. Half a conversion is not a usable state, so undo it.
+            const size_t owned0 = s.owned.size();
+            const int qtype0 = qtype;
+            if (const void* p = keep_nvfp4_native(prefix, rows, cols, qtype, fp4, fp4_sf, fp4_alpha)) {
+                if (*fp4 && *fp4_sf) return p;
+                for (size_t i = owned0; i < s.owned.size(); i++) cudaFree(s.owned[i]);
+                s.owned.resize(owned0);
+                *fp4 = nullptr; *fp4_sf = nullptr; qtype = qtype0;
+            }
+        }
+        return requant_q4k(dequant_any(prefix, rows, cols), (long)rows * cols, qtype);
+    };
+
+    // Build q|k|v as a single NVFP4 payload. Requires all three to be NVFP4 with the SAME
+    // weight_scale_2 -- ModelOpt guarantees it (they are quantized as one group) but it is checked
+    // rather than assumed, because a mismatch would silently rescale two thirds of attention.
+    // Returns false having touched nothing if any precondition fails.
+    static const bool attn_cat_on = [] {
+        const char* e = getenv("SPARKINFER_Q38_ATTN_QKV_CAT");
+        return !(e && e[0] == '0');
+    }();
+    auto keep_attn_cat = [&](const std::string& ab, int q_out, int kvd, int cols,
+                             Qwen35LayerWeights& w) -> bool {
+        if (!attn_cat_on || !attn_keep_nvfp4 || !gdn_keep_nvfp4) return false;
+        NvFp4Src sq{}, sk{}, sv{};
+        if (!nvfp4_src(ab + "q_proj", q_out, cols, sq) ||
+            !nvfp4_src(ab + "k_proj", kvd, cols, sk) ||
+            !nvfp4_src(ab + "v_proj", kvd, cols, sv)) return false;
+        if (!(sq.global == sk.global && sq.global == sv.global)) return false;
+        const int rows = q_out + 2 * kvd;
+        if (!kernels::prefill_nvfp4_supported(128, rows, cols)) return false;
+        const size_t hdr = (size_t)kernels::SI_NVFP4_HDR;
+        const size_t sc_all = (size_t)rows * cols / 16, pk_all = (size_t)rows * cols / 2;
+        void* pay = nullptr;
+        if (cudaMalloc(&pay, hdr + sc_all + pk_all) != cudaSuccess) return false;
+        cudaMemset(pay, 0, hdr);
+        cudaMemcpy(pay, &sq.global, 4, cudaMemcpyHostToDevice);
+        char* sc = static_cast<char*>(pay) + hdr;
+        char* pk = sc + sc_all;
+        const NvFp4Src* src[3] = { &sq, &sk, &sv };
+        const int rw[3] = { q_out, kvd, kvd };
+        for (int i = 0; i < 3; i++) {
+            const size_t sb = (size_t)rw[i] * cols / 16, pb = (size_t)rw[i] * cols / 2;
+            cudaMemcpy(sc, src[i]->group, sb, cudaMemcpyHostToDevice);  sc += sb;
+            cudaMemcpy(pk, src[i]->packed, pb, cudaMemcpyHostToDevice); pk += pb;
+        }
+        void* sf = nullptr;
+        const size_t sf_bytes = kernels::prefill_nvfp4_scale_bytes_b(rows, cols);
+        if (!sf_bytes || cudaMalloc(&sf, sf_bytes) != cudaSuccess ||
+            !kernels::launch_ct_nvfp4_pack_sfb(static_cast<char*>(pay) + hdr, sf, rows, cols,
+                                               s.stream) ||
+            cudaStreamSynchronize(s.stream) != cudaSuccess) {
+            if (sf) cudaFree(sf);
+            cudaFree(pay);
+            return false;
+        }
+        s.owned.push_back(pay);
+        s.owned.push_back(sf);
+        w.qkv_cat = pay;
+        w.qkv_cat_fp4 = static_cast<char*>(pay) + hdr + sc_all;
+        w.qkv_cat_fp4_sf = sf;
+        w.qkv_cat_alpha = (sq.global != 0.f) ? (1.f / sq.global) : 1.f;
+        w.qkv_cat_rows = rows;
+        // Keep the three pointers valid (the load-time null check reads them); nothing consumes
+        // them individually once qkv_cat is set.
+        w.wq = w.wk = w.wv = pay;
+        w.wq_type = w.wk_type = w.wv_type = kernels::SI_QTYPE_NVFP4;
+        return true;
+    };
+
+    // gate|up as a single NVFP4 operand -- same exactness argument as keep_attn_cat (ModelOpt gives
+    // the pair one shared weight_scale_2, checked not assumed). Built from the HOST checkpoint
+    // arrays, so the two per-tensor device payloads stay transient and are freed by the caller
+    // after they have served as the source for the Q4_K decode copies. VRAM is therefore a wash.
+    static const bool gu_cat_on = [] {
+        const char* e = getenv("SPARKINFER_Q38_FFN_GU_CAT");
+        return !(e && e[0] == '0');
+    }();
+    // ALL layers or none. Prefill makes ffg/ffu strided views of ONE buffer, so the fused layout
+    // is a property of the whole pass, and keep_nvfp4 below drops the per-tensor FP4 payload for
+    // exactly the layers that fused -- so a partially-fusable checkpoint has no correct layout at
+    // all. Measured on unsloth/Qwen3.8-27B-NVFP4, where gate_proj and up_proj share a
+    // weight_scale_2 on 56 of 64 layers: committing to the fused layout dropped prefill@16k to the
+    // token loop (8687 -> 80 pp), and merely refusing it at prefill time still cost -30%, because
+    // those 56 layers had already lost their per-tensor FP4 at load. Decide before anything loads,
+    // from host-side metadata only (nvfp4_src is st.tensor() lookups plus a 4-byte memcpy, no
+    // device work). The ModelOpt checkpoint qualifies on all 64 layers and is unaffected.
+    bool gu_cat_uniform = c.dense_ffn || c.n_experts <= 0;
+    if (gu_cat_uniform && gu_cat_on) {
+        int eligible = 0;
+        for (int i = 0; i < c.n_layers; i++) {
+            const std::string mb =
+                "model.language_model.layers." + std::to_string(i) + ".mlp.";
+            NvFp4Src sg{}, su{};
+            if (nvfp4_src(mb + "gate_proj", c.moe_ffn, H, sg) &&
+                nvfp4_src(mb + "up_proj", c.moe_ffn, H, su) && sg.global == su.global) eligible++;
+        }
+        if (eligible != c.n_layers) {
+            gu_cat_uniform = false;
+            if (eligible)
+                fprintf(stderr, "[compressed-tensors] gate|up fusable on %d/%d layers -- not "
+                                "uniform, keeping the per-tensor NVFP4 layout\n",
+                        eligible, c.n_layers);
+        }
+    }
+    auto keep_gu_cat = [&](const std::string& mb, int ff, int cols,
+                           Qwen35LayerWeights& w) -> bool {
+        // gu_cat_uniform is the all-or-nothing decision taken before any layer loaded; without it
+        // a partially-fusable checkpoint ends up with no correct ffg/ffu layout at all.
+        if (!gu_cat_on || !gu_cat_uniform) return false;
+        NvFp4Src sg{}, su{};
+        if (!nvfp4_src(mb + "gate_proj", ff, cols, sg) ||
+            !nvfp4_src(mb + "up_proj", ff, cols, su)) return false;
+        if (!(sg.global == su.global)) return false;
+        const int rows = 2 * ff;
+        if (!kernels::prefill_nvfp4_supported(128, rows, cols)) return false;
+        const size_t hdr = (size_t)kernels::SI_NVFP4_HDR;
+        const size_t sc_all = (size_t)rows * cols / 16, pk_all = (size_t)rows * cols / 2;
+        void* pay = nullptr;
+        if (cudaMalloc(&pay, hdr + sc_all + pk_all) != cudaSuccess) return false;
+        cudaMemset(pay, 0, hdr);
+        cudaMemcpy(pay, &sg.global, 4, cudaMemcpyHostToDevice);
+        char* sc = static_cast<char*>(pay) + hdr;
+        char* pk = sc + sc_all;
+        const NvFp4Src* src[2] = { &sg, &su };
+        for (int i = 0; i < 2; i++) {
+            const size_t sb = (size_t)ff * cols / 16, pb = (size_t)ff * cols / 2;
+            cudaMemcpy(sc, src[i]->group, sb, cudaMemcpyHostToDevice);  sc += sb;
+            cudaMemcpy(pk, src[i]->packed, pb, cudaMemcpyHostToDevice); pk += pb;
+        }
+        void* sf = nullptr;
+        const size_t sf_bytes = kernels::prefill_nvfp4_scale_bytes_b(rows, cols);
+        if (!sf_bytes || cudaMalloc(&sf, sf_bytes) != cudaSuccess ||
+            !kernels::launch_ct_nvfp4_pack_sfb(static_cast<char*>(pay) + hdr, sf, rows, cols,
+                                               s.stream) ||
+            cudaStreamSynchronize(s.stream) != cudaSuccess) {
+            if (sf) cudaFree(sf);
+            cudaFree(pay);
+            return false;
+        }
+        s.owned.push_back(pay);
+        s.owned.push_back(sf);
+        w.gate_up_cat_fp4 = static_cast<char*>(pay) + hdr + sc_all;
+        w.gate_up_cat_fp4_sf = sf;
+        w.gate_up_cat_alpha = (sg.global != 0.f) ? (1.f / sg.global) : 1.f;
+        w.gate_up_cat_rows = rows;
+        return true;
+    };
+
     // One Linear kept in whatever native form this checkpoint ships it in: FP8 stays FP8, NVFP4
     // stays NVFP4, and anything else falls back to a Q4_K fit from bf16. Used for the GDN
     // projections, where both shipped checkpoints deliberately avoid a second quantization.
@@ -4758,7 +4951,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
 
     s.w.layers.resize(c.n_layers);
-    int gu_ready = 0;
+    int gu_ready = 0, attn_ready = 0, attn_cat_ready = 0;
     for (int i = 0; i < c.n_layers; i++) {
         const std::string b = "model.language_model.layers." + std::to_string(i) + ".";
         Qwen35LayerWeights& w = s.w.layers[i];
@@ -4793,21 +4986,53 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.ssm_a = load_a_log_transformed(lb + "A_log", c.linear_v_heads);
             w.ssm_norm = plain_bf16(lb + "norm.weight", c.linear_head_dim);
             w.ssm_conv = plain_bf16(lb + "conv1d.weight", (long)s.linear_qkvdim * c.linear_conv_kernel);
-            w.ssm_alpha = plain_bf16(lb + "in_proj_a.weight", (long)c.linear_v_heads * H);
-            w.ssm_beta = plain_bf16(lb + "in_proj_b.weight", (long)c.linear_v_heads * H);
+            // Adjacent so prefill can run them as ONE n=2*v_heads GEMM: n=48 is the model's
+            // smallest output width and those 96 launches profile 4.2x off roofline. Loaded
+            // straight into the single allocation (not copied from two) so only it is owned.
+            {
+                const size_t half = (size_t)c.linear_v_heads * H * sizeof(uint16_t);
+                const STTensor* ta = st.tensor(lb + "in_proj_a.weight");
+                const STTensor* tb = st.tensor(lb + "in_proj_b.weight");
+                void* ab = nullptr;
+                if (ta && tb && ta->dtype == STDType::BF16 && tb->dtype == STDType::BF16 &&
+                    ta->n_values == (long)c.linear_v_heads * H &&
+                    tb->n_values == (long)c.linear_v_heads * H &&
+                    cudaMalloc(&ab, 2 * half) == cudaSuccess) {
+                    cudaMemcpy(ab, ta->data, half, cudaMemcpyHostToDevice);
+                    cudaMemcpy(static_cast<char*>(ab) + half, tb->data, half, cudaMemcpyHostToDevice);
+                    s.owned.push_back(ab);
+                    w.ssm_ab = ab;
+                    w.ssm_alpha = ab;
+                    w.ssm_beta = static_cast<char*>(ab) + half;
+                } else {
+                    if (ab) cudaFree(ab);
+                    w.ssm_alpha = plain_bf16(lb + "in_proj_a.weight", (long)c.linear_v_heads * H);
+                    w.ssm_beta = plain_bf16(lb + "in_proj_b.weight", (long)c.linear_v_heads * H);
+                }
+            }
             if (!w.wqkv || !w.wqkv_gate || !w.ssm_out || !w.ssm_dt || !w.ssm_a || !w.ssm_norm ||
                 !w.ssm_conv || !w.ssm_alpha || !w.ssm_beta) return false;
         } else {
             w.q_has_gate = c.hybrid;
             const std::string ab = b + "self_attn.";
             const int q_out = w.q_has_gate ? s.qdim * 2 : s.qdim;
-            w.wq = requant_q4k(dequant_any(ab + "q_proj", q_out, H), (long)q_out * H, w.wq_type);
-            w.wk = requant_q4k(dequant_any(ab + "k_proj", s.kvdim, H), (long)s.kvdim * H, w.wk_type);
-            w.wv = requant_q4k(dequant_any(ab + "v_proj", s.kvdim, H), (long)s.kvdim * H, w.wv_type);
-            w.wo = requant_q4k(dequant_any(ab + "o_proj", H, s.qdim), (long)H * s.qdim, w.wo_type);
+            // q|k|v as ONE operand when the checkpoint lets it be exact -- see qkv_cat in
+            // qwen35.h. keep_attn's per-tensor path is the fallback for everything else.
+            if (!keep_attn_cat(ab, q_out, s.kvdim, H, w)) {
+                w.wq = keep_attn(ab + "q_proj", q_out, H, w.wq_type,
+                                 &w.wq_fp4, &w.wq_fp4_sf, &w.wq_fp4_alpha);
+                w.wk = keep_attn(ab + "k_proj", s.kvdim, H, w.wk_type,
+                                 &w.wk_fp4, &w.wk_fp4_sf, &w.wk_fp4_alpha);
+                w.wv = keep_attn(ab + "v_proj", s.kvdim, H, w.wv_type,
+                                 &w.wv_fp4, &w.wv_fp4_sf, &w.wv_fp4_alpha);
+            }
+            w.wo = keep_attn(ab + "o_proj", H, s.qdim, w.wo_type,
+                             &w.wo_fp4, &w.wo_fp4_sf, &w.wo_fp4_alpha);
             w.q_norm = load_norm_plus1(ab + "q_norm.weight", c.head_dim);
             w.k_norm = load_norm_plus1(ab + "k_norm.weight", c.head_dim);
             if (!w.wq || !w.wk || !w.wv || !w.wo || !w.q_norm || !w.k_norm) return false;
+            if ((w.qkv_cat || (w.wq_fp4 && w.wk_fp4 && w.wv_fp4)) && w.wo_fp4) ++attn_ready;
+            if (w.qkv_cat) ++attn_cat_ready;
         }
 
         const std::string mb = b + "mlp.";
@@ -4819,16 +5044,22 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.down_q = requant_q4k(dequant_any(mb + "down_proj", H, c.moe_ffn),
                                    (long)H * c.moe_ffn, w.down_qtype);
         } else {
+            const bool gu_cat = keep_gu_cat(mb, c.moe_ffn, H, w);
             const void* g_pay = keep_nvfp4(mb + "gate_proj", c.moe_ffn, H,
-                                           &w.gate_fp4, &w.gate_fp4_sf, w.gate_fp4_alpha);
+                                           &w.gate_fp4, &w.gate_fp4_sf, w.gate_fp4_alpha, !gu_cat);
             const void* u_pay = keep_nvfp4(mb + "up_proj", c.moe_ffn, H,
-                                           &w.up_fp4, &w.up_fp4_sf, w.up_fp4_alpha);
+                                           &w.up_fp4, &w.up_fp4_sf, w.up_fp4_alpha, !gu_cat);
             const void* d_pay = keep_nvfp4(mb + "down_proj", H, c.moe_ffn,
                                            &w.down_fp4, &w.down_fp4_sf, w.down_fp4_alpha);
             w.gate_q = q4k_from_nvfp4(g_pay, c.moe_ffn, H, w.gate_qtype);
             w.up_q = q4k_from_nvfp4(u_pay, c.moe_ffn, H, w.up_qtype);
             w.down_q = q4k_from_nvfp4(d_pay, H, c.moe_ffn, w.down_qtype);
-            if (!w.gate_fp4) {
+            if (gu_cat) {
+                // The fused operand replaced them; these two only fed q4k_from_nvfp4 above.
+                cudaFree(const_cast<void*>(g_pay));
+                cudaFree(const_cast<void*>(u_pay));
+            }
+            if (!w.gate_fp4 && !gu_cat) {
                 // Prefill copies disabled: the payloads were deliberately not registered in
                 // s.owned (see keep_nvfp4), the Q4_K decode copies above are built, so release the
                 // NVFP4 source now rather than at teardown. Keyed on gate_fp4 being unset, which
@@ -4837,13 +5068,13 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
                 cudaFree(const_cast<void*>(u_pay));
                 cudaFree(const_cast<void*>(d_pay));
             }
-            if (w.gate_fp4 && w.up_fp4) ++gu_ready;
+            if ((w.gate_fp4 && w.up_fp4) || w.gate_up_cat_fp4) ++gu_ready;
         }
         if (!w.gate_q || !w.up_q || !w.down_q) return false;
     }
     fprintf(stderr, "[compressed-tensors] loaded %d layers, native NVFP4 prefill FFN %d/%d "
-            "(decode stays Q4_K)\n",
-            c.n_layers, gu_ready, c.n_layers);
+            "(decode stays Q4_K), full-attn q/k/v/o %d layers (qkv fused %d)\n",
+            c.n_layers, gu_ready, c.n_layers, attn_ready, attn_cat_ready);
 
     // Same fused Q4_K-in-GEMM row scales Muse uses, for whichever tensors ended up Q4_K after the
     // per-tensor routing above -- full-attn q/k/v/o always, plus any FFN layer with no native
