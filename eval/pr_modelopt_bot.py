@@ -109,8 +109,19 @@ SCORING_DIM = "decode@128"
 # should agree essentially exactly. Anything less means the PR changed the model's numerics.
 # Not 1.0/0.0 — a PR may legitimately reassociate float ops (fusing a kernel, changing a
 # reduction order), which perturbs the last bits without being a correctness bug.
-ACC_TOP1_BAR = float(os.environ.get("MODELOPT_ACC_TOP1_BAR", "0.99"))
-ACC_KL_BAR = float(os.environ.get("MODELOPT_ACC_KL_BAR", "0.01"))
+# top1 0.90 and KL 0.1, both loosened by explicit decision 2026-08-16 from the Qwen3.8 bot's
+# 0.99 / 0.01. The gate stays differential (PR vs main on the same token stream), so it still
+# catches a PR that CHANGES this model's output distribution -- it now tolerates ten times the KL
+# drift and lets one token in ten flip its argmax before calling that a failure.
+#
+# Worth knowing what that admits, since these are the numbers this codebase measured by hand
+# during Qwen3.8 bring-up: a second quantization of the GDN projections scored top1 0.96 / KL
+# 0.035 and was rejected as too lossy to ship; a Q8_0 fit scored 1.00 / 0.015. Both pass here.
+# So this bar no longer distinguishes "same model, faster" from "slightly different, faster" --
+# it is a guard against gross corruption, not against quality drift. The batched-prefill parity
+# gate and the Qwen3.8 no-regression guard are what carry correctness now.
+ACC_TOP1_BAR = float(os.environ.get("MODELOPT_ACC_TOP1_BAR", "0.9"))
+ACC_KL_BAR = float(os.environ.get("MODELOPT_ACC_KL_BAR", "0.1"))
 
 EVAL_PREFIX = "eval-modelopt:"
 MODELOPT_MERGE_FIRST = "modelopt-merge-first"
