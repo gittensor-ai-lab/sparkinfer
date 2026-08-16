@@ -462,11 +462,77 @@ __global__ void ct_dequant_nvfp4_kernel(const unsigned char* __restrict__ packed
     // the expected ~0.01-0.05 std typical of a trained projection matrix.
     out[i] = __float2bfloat16(v * s / global_scale);
 }
+
+// Group-wise twin of the kernel above. Same arithmetic, same operand order, same
+// __float2bfloat16 -- only the work decomposition changes, so the output is bit-identical.
+//
+// The per-element kernel is the dominant cost of a ModelOpt prefill: nsys puts it at 33.2 ms of a
+// 52.9 ms prefill@128 (63%), moving 138 MB per GDN qkv call at ~730 GB/s while the GEMVs beside it
+// run at ~1500. Per thread it paid a 64-bit `i / cols` division, re-read each packed byte from two
+// threads and each scale byte from sixteen, and issued a 2-byte store.
+//
+// One thread owns one 16-element group instead -- exactly the granularity the scale is stored at:
+//   * the row index comes from blockIdx.y, so the division disappears;
+//   * the group's 8 packed bytes are one 8-byte load (the row pitch is cols/2 and cols%16==0, so
+//     every group is 8-byte aligned), and its scale is one byte read once, not sixteen times;
+//   * the 16 results leave as two 16-byte stores.
+// A warp then reads 256 contiguous packed bytes and writes 1 KB, all coalesced.
+__global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ packed,
+                                            const unsigned char* __restrict__ group_scale,
+                                            float global_scale,
+                                            const float* __restrict__ global_scale_dev,
+                                            __nv_bfloat16* __restrict__ out,
+                                            int rows, int cols) {
+    if (global_scale_dev) global_scale = *global_scale_dev;
+    const int ngroups = cols >> 4;
+    const int r = blockIdx.y;
+    if (r >= rows) return;
+    const unsigned char* prow = packed + (size_t)r * (size_t)(cols >> 1);
+    const unsigned char* srow = group_scale + (size_t)r * (size_t)ngroups;
+    __nv_bfloat16* orow = out + (size_t)r * (size_t)cols;
+    for (int g = blockIdx.x * blockDim.x + threadIdx.x; g < ngroups;
+         g += gridDim.x * blockDim.x) {
+        const uint2 pk = *reinterpret_cast<const uint2*>(prow + (size_t)g * 8);
+        const float s = float(cutlass::float_ue4m3_t::bitcast(srow[g]));
+        // __align__(16) so the two uint4 stores below are legal; indices are compile-time constant
+        // under the unroll, so this stays in registers (verified: ncu local ld/st = 0).
+        __align__(16) __nv_bfloat16 o[16];
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const unsigned word = (j < 8) ? pk.x : pk.y;
+            const unsigned byte = (word >> (8 * ((j & 7) >> 1))) & 255u;
+            const unsigned char nib = (unsigned char)((j & 1) ? (byte >> 4) : (byte & 0xF));
+            const float v = float(cutlass::float_e2m1_t::bitcast(nib));
+            o[j] = __float2bfloat16(v * s / global_scale);
+        }
+        *reinterpret_cast<uint4*>(orow + (size_t)g * 16)     = *reinterpret_cast<const uint4*>(o);
+        *reinterpret_cast<uint4*>(orow + (size_t)g * 16 + 8) = *reinterpret_cast<const uint4*>(o + 8);
+    }
+}
 } // namespace
 
 static void ct_dequant_nvfp4_launch(const void* packed_u8, const void* group_scale_ue4m3,
                                     float global_scale, const float* global_scale_dev,
                                     void* out_bf16, int rows, int cols, cudaStream_t stream) {
+    // Group-wise path when the shape allows it (SPARKINFER_CT_NVFP4_G16=0 restores the
+    // per-element kernel for A/B). cols%16==0 makes every group's 8 packed bytes 8-byte aligned
+    // and every 16-value output run 32-byte aligned; the payload pointers themselves come from
+    // cudaMalloc plus a 256-byte header, so both bases are aligned too.
+    static const int g16 = [] {
+        const char* e = getenv("SPARKINFER_CT_NVFP4_G16");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (g16 && rows > 0 && cols > 0 && (cols & 15) == 0 &&
+        ((reinterpret_cast<size_t>(packed_u8) | reinterpret_cast<size_t>(out_bf16)) & 15u) == 0) {
+        const int ngroups = cols >> 4;
+        const int threads = 256;
+        const int bx = (ngroups + threads - 1) / threads;
+        ct_dequant_nvfp4_g16_kernel<<<dim3(bx > 0 ? bx : 1, rows), threads, 0, stream>>>(
+            reinterpret_cast<const unsigned char*>(packed_u8),
+            reinterpret_cast<const unsigned char*>(group_scale_ue4m3), global_scale,
+            global_scale_dev, reinterpret_cast<__nv_bfloat16*>(out_bf16), rows, cols);
+        return;
+    }
     const long n = (long)rows * cols;
     const int threads = 256;
     const long blocks = (n + threads - 1) / threads;
