@@ -98,9 +98,9 @@ SIG = 0.02
 REGRESS_TOL = 0.98
 BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 
-# The ONE dimension that can earn a tier. decode@128 and prefill@128 are still measured and still
-# act as no-regression floors (see evaluate_pr), but a PR that only improves them now scores
-# "none": long-context prefill is the sole optimisation target for this model.
+# The ONE dimension that can earn a tier. prefill@128 and prefill@16k are still measured and still
+# act as no-regression floors (see evaluate_pr), but a PR that only improves them scores "none":
+# 128-context decode is the sole optimisation target for the ModelOpt checkpoint.
 SCORING_DIM = "decode@128"
 
 # Accuracy gate bars. This gate is DIFFERENTIAL (PR vs origin/main on the same token stream, see
@@ -1265,7 +1265,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer modelopt auto-eval — `eval-modelopt:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-modelopt:{lab}` |\n"
-        f"| scored at | prefill@16k (the only scoring dimension); decode@128 + prefill@128 are no-regression floors |\n"
+        f"| scored at | decode@128 (the only scoring dimension); prefill@128 + prefill@16k are no-regression floors |\n"
         f"| tier came from | `{res.get('scored_dimension', '?')}` |\n"
         f"| PR decode tok/s | {res['pr_decode_tps']:.2f} |\n"
         f"| main decode tok/s | {res['main_decode_tps']:.2f} |\n"
