@@ -287,8 +287,33 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
 // RQH=1 is bit-identical to the per-head kernel. Math (mask, online softmax, int8
 // round) is unchanged -- only the load ordering differs.
 // ============================================================================
+// Shared smem layout for the GQA kernel, so the kernel and its launcher cannot drift apart.
+//
+// s_o (the [BM][HEAD_DIM] float epilogue landing zone) is only ever touched AFTER the last key
+// group has been consumed, and s_qi/s_pi/s_s are all dead by that point -- only s_l survives into
+// the epilogue. So s_o does not need its own 16 KB: it can overlay the front of the block. That
+// is what puts RQH=6 -- Qwen3.8's whole GQA group, so each K page and V tile is read exactly once
+// instead of twice at RQH=3 -- under the 100 KB sm_120 cap at all: 105,344 B without this,
+// 88,960 B with it. It also takes RQH=3 from 61,376 B to 44,992 B, back to 2 blocks/SM.
+//
+// The overlay costs one extra __syncthreads() before the epilogue: the PV loop deliberately runs
+// without a trailing barrier (it leans on the next group's after-QK barrier), so without one a
+// fast warp's first s_o store would land on s_pi while a slow warp was still reading it.
 template <int HEAD_DIM, int GROUP_BLKS, int RQH>
-__global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_mma_gqa_kernel(
+struct attn_gqa_smem {
+    static constexpr int    BM    = 16;
+    static constexpr int    GN    = GROUP_BLKS * 16;
+    static constexpr size_t front = (size_t)RQH * BM * HEAD_DIM                    // s_qi (int8)
+                                  + (size_t)RQH * BM * GN                          // s_pi (int8)
+                                  + (size_t)(RQH * BM * GN) * sizeof(float);       // s_s
+    static constexpr size_t olen  = (size_t)(BM * HEAD_DIM) * sizeof(float);       // s_o
+    static constexpr bool   alias = front >= olen;                                 // holds for RQH>=2
+    static constexpr size_t bytes = front + (alias ? 0 : olen)
+                                  + (size_t)(2 * GN + 5 * RQH * BM) * sizeof(float);
+};
+
+template <int HEAD_DIM, int GROUP_BLKS, int RQH>
+__global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 3 ? 2 : 1)) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
     const __half* __restrict__ v_scale, const int* __restrict__ block_table,
@@ -316,8 +341,11 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_m
     signed char* s_qi = reinterpret_cast<signed char*>(mma_smem);   // [RQH][BM][HEAD_DIM]
     signed char* s_pi = s_qi + (size_t)RQH * BM * HEAD_DIM;          // [RQH][BM][GN]
     float* s_s  = reinterpret_cast<float*>(s_pi + (size_t)RQH * BM * GN); // [RQH][BM][GN]
-    float* s_o  = s_s + (size_t)RQH * BM * GN;                       // [BM][HEAD_DIM] epilogue landing
-    float* s_ks = s_o + BM * HEAD_DIM;                               // [GN] shared
+    using SM = attn_gqa_smem<HEAD_DIM, GROUP_BLKS, RQH>;
+    // [BM][HEAD_DIM] epilogue landing -- overlays s_qi/s_pi/s_s, which are dead by the epilogue.
+    float* s_o  = SM::alias ? reinterpret_cast<float*>(mma_smem)
+                            : reinterpret_cast<float*>(mma_smem + SM::front);
+    float* s_ks = reinterpret_cast<float*>(mma_smem + SM::front + (SM::alias ? 0 : SM::olen));
     float* s_vs = s_ks + GN;                                         // [GN] shared
     float* s_qs = s_vs + GN;                                         // [RQH][BM]
     float* s_ps = s_qs + RQH * BM;                                   // [RQH][BM]
@@ -501,6 +529,10 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_m
     run_range(split_sink ? blk_rs : 0, last_q + 1);
 
     // ---- epilogue: one head at a time through the shared s_o landing zone ----
+    // s_o overlays s_qi/s_pi/s_s (see attn_gqa_smem), and the PV loop above exits without a
+    // trailing barrier, so fence here before the first store lands on a buffer another warp
+    // may still be reading.
+    __syncthreads();
     #pragma unroll
     for (int h = 0; h < RQH; h++) {
         const int head = head0 + h;
@@ -527,13 +559,10 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                             void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
                             int block_size, int max_blocks_per_seq, float scale, int win_blocks,
                             cudaStream_t stream) {
-    constexpr int BM = 16, GN = GROUP_BLKS * 16;
-    const size_t sm = (size_t)RQH * BM * HD                          // s_qi (int8)
-                    + (size_t)RQH * BM * GN                          // s_pi (int8)
-                    + (size_t)(RQH * BM * GN) * sizeof(float)        // s_s
-                    + (size_t)(BM * HD) * sizeof(float)              // s_o
-                    + (size_t)(2 * GN + 5 * RQH * BM) * sizeof(float);
-    // At RQH=4 this is 76,032 B — past the 48 KB default, so the opt-in below is
+    constexpr int BM = 16;
+    const size_t sm = attn_gqa_smem<HD, GROUP_BLKS, RQH>::bytes;
+    // With the s_o overlay this is 30,336 / 44,992 / 59,648 / 88,960 B at RQH=2/3/4/6 — every
+    // tier above RQH=2 is past the 48 KB default, so the opt-in below is
     // REQUIRED for the launch to be valid, and both it and the launch itself have to
     // be checked: a discarded failure here used to report success to the caller, which
     // then skipped the scalar fallback and consumed whatever `attn` already held —
@@ -587,8 +616,13 @@ bool launch_prefill_attn_mma(
     // is loaded once and fed RQH mma's instead of being re-read per q-head. RQH=1 disables.
     static const int gqa_rqh = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_GQA_RQH");
-        const int v = e ? atoi(e) : 4;
-        return (v == 1 || v == 2 || v == 4) ? v : 4;
+        const int v = e ? atoi(e) : 6;
+        return (v == 1 || v == 2 || v == 3 || v == 4 || v == 6) ? v : 6;
+    }();
+    // Token floor for the widest (grid-narrowing) tier -- see the RQH=6 dispatch below.
+    static const int minctx6 = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_GQA_MINCTX6");
+        return e ? atoi(e) : 2048;
     }();
 
     if (!enabled || head_dim != HD || block_size != 16 || n_tokens < minctx) return false;
@@ -599,8 +633,33 @@ bool launch_prefill_attn_mma(
     // launch invalid) cascades to the next tier — RQH=2 needs 46,720 B, under the
     // 48 KB default — and finally to the per-q-head kernel below, instead of
     // returning success over an output buffer nothing wrote.
-    if (gqa_rqh == 4 && gqa % 4 == 0 &&
+    // RQH=6 tier: the entire GQA group in one block, so each K page and V tile is read exactly
+    // once per kv-head instead of twice at RQH=3. Only fits because s_o overlays the front of the
+    // block (see attn_gqa_smem) -- 88,960 B against the 100 KB sm_120 cap, where the un-overlaid
+    // layout wanted 105,344 B and could not launch at all. 1 block/SM either way, so unlike the
+    // RQH=3 tier this is pure traffic reduction with no occupancy given up.
+    //
+    // Fusing RQH heads divides the grid's head dimension by RQH, so it only pays once the grid is
+    // wide enough to fill the device without it: at ctx=128 the grid is 8 x (24/6) = 32 blocks and
+    // RQH=6 measured -0.9% against RQH=3's 64, while at ctx=16384 it is 1024 x 4 and measured
+    // +1.0%. Gate on token count -- a shape property, so the tier choice is identical on every box.
+    if (gqa_rqh >= 6 && gqa % 6 == 0 && n_tokens >= minctx6 &&
+        launch_attn_gqa<HD, GROUP_BLKS, 6>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream))
+        return true;
+    // >= 4, not == 4: the default is now 6 (for GQA-6 checkpoints), and a gqa=4 model such as
+    // Qwen3.6 must still take this tier rather than falling past it to RQH=2.
+    if (gqa_rqh >= 4 && gqa % 4 == 0 &&
         launch_attn_gqa<HD, GROUP_BLKS, 4>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream))
+        return true;
+    // RQH=3 tier: Qwen3.8 is GQA-6, which 4 cannot divide, so it used to fall straight to 2 and
+    // re-read each K page / V tile 3x per kv-head instead of 2x. Measured +1.4% at prefill@16k.
+    // With the s_o overlay it needs 44,992 B, so it keeps 2 blocks/SM (it cost 61,376 B and one
+    // block/SM before) -- which is why the launch bound above is 2 for RQH<=3. Also the tier
+    // RQH=6 falls back to below ctx=2048.
+    if (gqa_rqh >= 3 && gqa % 3 == 0 &&
+        launch_attn_gqa<HD, GROUP_BLKS, 3>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
             n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream))
         return true;
     if (gqa_rqh >= 2 && gqa % 2 == 0 &&
