@@ -477,6 +477,34 @@ __global__ void ct_dequant_nvfp4_kernel(const unsigned char* __restrict__ packed
 //     every group is 8-byte aligned), and its scale is one byte read once, not sixteen times;
 //   * the 16 results leave as two 16-byte stores.
 // A warp then reads 256 contiguous packed bytes and writes 1 KB, all coalesced.
+// ALU MODES. ncu says this kernel is NOT bandwidth bound -- DRAM 43.7% against SM 80.9% at 78%
+// warps active, with zero local memory. It is the per-element decode that costs, so the levers are
+// the two CUTLASS conversions and the fp32 divide, not the byte count. (Fusing this kernel into the
+// row-quantize that follows it cuts DRAM traffic 4.4x and measures 1.2% SLOWER, which is the
+// control that proves the point -- do not re-try it.)
+//
+//   0  as merged: cutlass conversions, (v * s) / global_scale
+//   1  the integer decodes, same divide -- bit-identical
+//   2  mode 1 plus a hoisted reciprocal, which is NOT bit-identical (measured, see below)
+enum : int { CT_ALU_BASE = 0, CT_ALU_INT = 1, CT_ALU_RCP = 2 };
+
+// e2m1 magnitudes doubled are {0,1,2,3,4,6,8,12} -- all < 16, so the table is the nibbles of one
+// 32-bit literal and the decode is a shift, a mask and an int->float, with no memory touched.
+// Halving the result is exact in binary floating point, so 0.5f * this is exactly the value
+// cutlass::float_e2m1_t::bitcast produces, sign and -0.0 included.
+__device__ __forceinline__ float ct_e2m1_x2(unsigned n) {
+    const unsigned mag = (0xC8643210u >> ((n & 7u) << 2)) & 15u;
+    return __int_as_float(__float_as_int(__uint2float_rn(mag)) | ((n & 8u) << 28));
+}
+// Unsigned E4M3 -> float by assembling the bits. For e>0, (8+m) * 2^(e-10) is exactly the fp32
+// with exponent field e+120 and mantissa m<<20; e==0 is the subnormal leg, an exact multiply.
+__device__ __forceinline__ float ct_ue4m3(unsigned b) {
+    const unsigned e = (b >> 3) & 15u, m = b & 7u;
+    if (e == 0) return (float)m * (1.f / 512.f);
+    return __int_as_float((int)(((e + 120u) << 23) | (m << 20)));
+}
+
+template <int ALU>
 __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ packed,
                                             const unsigned char* __restrict__ group_scale,
                                             float global_scale,
@@ -484,6 +512,7 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
                                             __nv_bfloat16* __restrict__ out,
                                             int rows, int cols) {
     if (global_scale_dev) global_scale = *global_scale_dev;
+    const float inv_gs = (ALU >= CT_ALU_RCP) ? (1.f / global_scale) : 0.f;
     const int ngroups = cols >> 4;
     const int r = blockIdx.y;
     if (r >= rows) return;
@@ -493,7 +522,8 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
     for (int g = blockIdx.x * blockDim.x + threadIdx.x; g < ngroups;
          g += gridDim.x * blockDim.x) {
         const uint2 pk = *reinterpret_cast<const uint2*>(prow + (size_t)g * 8);
-        const float s = float(cutlass::float_ue4m3_t::bitcast(srow[g]));
+        const float s = (ALU >= CT_ALU_INT) ? ct_ue4m3(srow[g])
+                                            : float(cutlass::float_ue4m3_t::bitcast(srow[g]));
         // __align__(16) so the two uint4 stores below are legal; indices are compile-time constant
         // under the unroll, so this stays in registers (verified: ncu local ld/st = 0).
         __align__(16) __nv_bfloat16 o[16];
@@ -502,8 +532,9 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
             const unsigned word = (j < 8) ? pk.x : pk.y;
             const unsigned byte = (word >> (8 * ((j & 7) >> 1))) & 255u;
             const unsigned char nib = (unsigned char)((j & 1) ? (byte >> 4) : (byte & 0xF));
-            const float v = float(cutlass::float_e2m1_t::bitcast(nib));
-            o[j] = __float2bfloat16(v * s / global_scale);
+            const float v = (ALU >= CT_ALU_INT) ? (0.5f * ct_e2m1_x2(nib))
+                                                : float(cutlass::float_e2m1_t::bitcast(nib));
+            o[j] = __float2bfloat16((ALU >= CT_ALU_RCP) ? (v * s * inv_gs) : (v * s / global_scale));
         }
         *reinterpret_cast<uint4*>(orow + (size_t)g * 16)     = *reinterpret_cast<const uint4*>(o);
         *reinterpret_cast<uint4*>(orow + (size_t)g * 16 + 8) = *reinterpret_cast<const uint4*>(o + 8);
@@ -522,15 +553,31 @@ static void ct_dequant_nvfp4_launch(const void* packed_u8, const void* group_sca
         const char* e = getenv("SPARKINFER_CT_NVFP4_G16");
         return (e && e[0] == '0') ? 0 : 1;
     }();
+    // Which ALU form the group-wise kernel uses; see the enum above. Default is the bit-identical
+    // integer decode. SPARKINFER_CT_NVFP4_ALU picks 0/1/2 for A/B.
+    static const int alu = [] {
+        const char* e = getenv("SPARKINFER_CT_NVFP4_ALU");
+        const int v = e ? atoi(e) : CT_ALU_INT;
+        return (v >= CT_ALU_BASE && v <= CT_ALU_RCP) ? v : CT_ALU_INT;
+    }();
     if (g16 && rows > 0 && cols > 0 && (cols & 15) == 0 &&
         ((reinterpret_cast<size_t>(packed_u8) | reinterpret_cast<size_t>(out_bf16)) & 15u) == 0) {
         const int ngroups = cols >> 4;
         const int threads = 256;
         const int bx = (ngroups + threads - 1) / threads;
-        ct_dequant_nvfp4_g16_kernel<<<dim3(bx > 0 ? bx : 1, rows), threads, 0, stream>>>(
-            reinterpret_cast<const unsigned char*>(packed_u8),
-            reinterpret_cast<const unsigned char*>(group_scale_ue4m3), global_scale,
-            global_scale_dev, reinterpret_cast<__nv_bfloat16*>(out_bf16), rows, cols);
+        const dim3 grid(bx > 0 ? bx : 1, rows);
+        auto* pk = reinterpret_cast<const unsigned char*>(packed_u8);
+        auto* gsc = reinterpret_cast<const unsigned char*>(group_scale_ue4m3);
+        auto* ob = reinterpret_cast<__nv_bfloat16*>(out_bf16);
+        if (alu == CT_ALU_RCP)
+            ct_dequant_nvfp4_g16_kernel<CT_ALU_RCP><<<grid, threads, 0, stream>>>(
+                pk, gsc, global_scale, global_scale_dev, ob, rows, cols);
+        else if (alu == CT_ALU_INT)
+            ct_dequant_nvfp4_g16_kernel<CT_ALU_INT><<<grid, threads, 0, stream>>>(
+                pk, gsc, global_scale, global_scale_dev, ob, rows, cols);
+        else
+            ct_dequant_nvfp4_g16_kernel<CT_ALU_BASE><<<grid, threads, 0, stream>>>(
+                pk, gsc, global_scale, global_scale_dev, ob, rows, cols);
         return;
     }
     const long n = (long)rows * cols;
