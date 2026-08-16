@@ -514,21 +514,58 @@ template __global__ void gemv_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, co
 // Payload: [256 B header | ue4m3 scale[N*(K/16)] | packed u8[N*(K/2)]].
 // One scale group = 16 weights = 8 packed bytes. LUTs stay in registers --
 // __constant__ + cudaMemcpyToSymbol is unsafe from this static lib's .so link.
-__device__ __forceinline__ float si_e2m1(unsigned nibble) {
-    const float t[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
-                         -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
-    return t[nibble & 15u];
+// E2M1 nibble -> float, by arithmetic rather than table lookup.
+//
+// The table form (`const float t[16]` indexed by the nibble) does NOT stay in registers: the index
+// is a runtime value, so nvcc must place the array in LOCAL memory and every decode becomes a
+// local-memory load -- 16 of them per 16-weight group, per lane, on top of the 8 bytes of weight
+// the group actually reads. That is what held gemv_nvfp4_sk_kernel to 21-46% of this part's
+// bandwidth while the Q4_K dp4a GEMVs beside it run at 86-89%.
+//
+// e2m1 is s|ee|m with magnitude (e ? 2^(e-1) * (1 + m/2) : m/2). Doubling it makes every value an
+// integer -- {0,1,2,3,4,6,8,12} -- reachable as `e ? ((2+m) << (e-1)) : m`, so the decode is a
+// handful of integer ops and one int->float convert, with no memory touched at all.
+//
+// Bit-identical to the table: the doubled magnitude and the compensating 0.5 are both exact in
+// binary floating point, so (2*mag) * (0.5*s) rounds to exactly what mag * s did. Nibble 8 still
+// yields -0.0f.
+__device__ __forceinline__ float si_e2m1_x2(unsigned nibble) {
+    const unsigned n = nibble & 15u;
+    // The eight doubled magnitudes {0,1,2,3,4,6,8,12} are all < 16, so the whole table fits in the
+    // nibbles of one 32-bit literal and the lookup is a shift and a mask -- an immediate operand,
+    // not memory. (0xC8643210: nibble i, counting from the LSB, is magnitude i.) This replaces the
+    // exponent reconstruction, which needed a select and cost roughly half again as many ops.
+    const unsigned mag = (0xC8643210u >> ((n & 7u) << 2)) & 15u;
+    // graft the sign bit on rather than branching, so nibble 8 keeps its -0.0f
+    return __int_as_float(__float_as_int(__uint2float_rn(mag)) | ((n & 8u) << 28));
 }
+// Unsigned E4M3 group scale -> float, by assembling the fp32 bits.
+//
+// The ldexpf form costs a branch plus two library calls per 16-weight group. For e>0,
+// (8+m) * 2^(e-10) == (1 + m/8) * 2^(e-7), which is exactly an fp32 with exponent field e+120 and
+// mantissa m<<20 -- pure integer work. e==0 stays on the multiply (m * 2^-9); it is the rare
+// subnormal leg and keeping it explicit avoids special-casing the bit pattern.
 __device__ __forceinline__ float si_ue4m3(unsigned b) {
-    const int e = (int)((b >> 3) & 15u);
-    const int m = (int)(b & 7u);
-    if (e == 0) return ldexpf((float)m, -9);
-    return ldexpf(8.f + (float)m, e - 10);
+    const unsigned e = (b >> 3) & 15u, m = b & 7u;
+    if (e == 0) return (float)m * (1.f / 512.f);          // 2^-9, exact
+    return __int_as_float((int)(((e + 120u) << 23) | (m << 20)));
 }
 __device__ __forceinline__ float si_nvfp4_group_dot(const unsigned char* packed8,
                                                     unsigned char scale, float inv_g,
                                                     const __nv_bfloat16* x16) {
-    const float s = si_ue4m3(scale) * inv_g;
+    // si_e2m1_x2 returns twice the weight, so halve the scale here -- both are exact in binary
+    // floating point, and the product rounds to what (weight * s) did.
+    //
+    // The scale stays folded into every term rather than being applied once to the group's dot
+    // product. Hoisting it saves 16 fp32 multiplies per group and is 22% faster, but it is NOT
+    // equivalent here: measured against this same build with only that change, top1 fell to 0.9849
+    // and KL(main||pr) rose to 0.162 nats over 199 positions -- past the 0.99/0.01 gate. These are
+    // the Gated-DeltaNet in-projections, and its near-1 decay amplifies a last-ulp difference along
+    // the sequence (the same sensitivity prefill_gemm_fp8.cu's header documents). Do not re-try it.
+    const float s = si_ue4m3(scale) * inv_g * 0.5f;
+    // Left as two 4-byte loads: a uint2 would halve the load count but needs 8-byte alignment,
+    // which the row base only happens to have for these shapes (K/16 a multiple of 8), not in
+    // general. The warp reads the same 256 contiguous bytes either way.
     const unsigned int p0 = __ldg(reinterpret_cast<const unsigned int*>(packed8));
     const unsigned int p1 = __ldg(reinterpret_cast<const unsigned int*>(packed8 + 4));
     const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x16);
@@ -537,13 +574,13 @@ __device__ __forceinline__ float si_nvfp4_group_dot(const unsigned char* packed8
     for (int i = 0; i < 4; i++) {
         const unsigned b = (p0 >> (8 * i)) & 255u;
         const float2 xf = __bfloat1622float2(x2[i]);
-        acc += (si_e2m1(b & 15u) * s) * xf.x + (si_e2m1(b >> 4) * s) * xf.y;
+        acc += (si_e2m1_x2(b & 15u) * s) * xf.x + (si_e2m1_x2(b >> 4) * s) * xf.y;
     }
     #pragma unroll
     for (int i = 0; i < 4; i++) {
         const unsigned b = (p1 >> (8 * i)) & 255u;
         const float2 xf = __bfloat1622float2(x2[i + 4]);
-        acc += (si_e2m1(b & 15u) * s) * xf.x + (si_e2m1(b >> 4) * s) * xf.y;
+        acc += (si_e2m1_x2(b & 15u) * s) * xf.x + (si_e2m1_x2(b >> 4) * s) * xf.y;
     }
     return acc;
 }
