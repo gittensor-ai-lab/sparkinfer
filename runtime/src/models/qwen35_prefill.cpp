@@ -493,10 +493,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         return !(e && e[0] == '0');
     }();
     const bool gu_nvfp4 = muse_nvfp4 || q38_nvfp4;
+    // FP4 activation staging is sized by the FFN CHUNK, not the prompt: every consumer of these
+    // buffers runs inside the token-chunked FFN loop and passes fn <= FC rows. Sizing by N asked
+    // for 16x what is used at ctx=16384. Muse still gets N rows because it only reaches the FP4
+    // path at N == 128, where FC == N by construction (FC = min(N, ffn_chunk)).
+    // SPARKINFER_PREFILL_FP4_CHUNK_A=0 restores the N-sized buffers (A/B in ONE binary).
+    static const bool fp4_chunk_a = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_FP4_CHUNK_A");
+        return !(e && e[0] == '0');
+    }();
+    const int fp4_rows = fp4_chunk_a ? FC : N;
     const size_t fp4_a_data_bytes = gu_nvfp4
-        ? kernels::prefill_nvfp4_data_bytes(N, H) : 0;
+        ? kernels::prefill_nvfp4_data_bytes(fp4_rows, H) : 0;
     const size_t fp4_a_sf_bytes = gu_nvfp4
-        ? kernels::prefill_nvfp4_scale_bytes_a(N, H) : 0;
+        ? kernels::prefill_nvfp4_scale_bytes_a(fp4_rows, H) : 0;
     // The attention projection group: q | gate | k | v stacked, so one GEMM covers all four. Its A
     // operand is `xn` at k = H -- the same shape gate/up already quantize -- so fp4_a/fp4_as serve
     // it unchanged; only the [N, qkvg_n] bf16 output and a possibly wider workspace are new.
@@ -504,7 +514,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool muse_nvfp4_qkv = muse_nvfp4 && s.w.layers[0].qkvg_fp4 &&
                                 kernels::prefill_nvfp4_supported(N, qkvg_n, H);
     const size_t fp4_ws_gu = gu_nvfp4
-        ? kernels::prefill_nvfp4_workspace_bytes(N, ffn, H) : 0;
+        ? kernels::prefill_nvfp4_workspace_bytes(fp4_rows, ffn, H) : 0;
     const size_t fp4_ws_qkv = muse_nvfp4_qkv
         ? kernels::prefill_nvfp4_workspace_bytes(N, qkvg_n, H) : 0;
     // o projection: A is `att` at k = qdim <= H, so fp4_a/fp4_as (sized for k = H) already cover it.
@@ -517,8 +527,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool q38_nvfp4_down = q38_nvfp4 && s.w.layers[0].down_fp4 &&
                                 kernels::prefill_nvfp4_supported(N, H, ffn);
     const bool nvfp4_down = muse_nvfp4_down || q38_nvfp4_down;
+    // Same correction as fp4_down_a below: the down GEMM runs at m = fn <= FC, never at m = N.
     const size_t fp4_ws_down = nvfp4_down
-        ? kernels::prefill_nvfp4_workspace_bytes(N, H, ffn) : 0;
+        ? kernels::prefill_nvfp4_workspace_bytes(fp4_rows, H, ffn) : 0;
     size_t fp4_ws_bytes = (fp4_ws_qkv > fp4_ws_gu) ? fp4_ws_qkv : fp4_ws_gu;
     if (fp4_ws_wo > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_wo;
     if (fp4_ws_down > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_down;
@@ -526,10 +537,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     unsigned char* fp4_as = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
     unsigned char* fp4_ws = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
     bf16* fp4_qkv = muse_nvfp4_qkv ? a8.alloc<bf16>((size_t)N * qkvg_n) : nullptr;
+    // Sized by the FFN CHUNK, not the prompt. These two feed exactly one call --
+    // launch_prefill_nvfp4_swiglu_quant_a(ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn) inside the
+    // token-chunked FFN loop -- so they never hold more than FC rows. Sizing them by N asked for
+    // 16x what is used at ctx=16384 (142.6 MB against 8.9 MB, FC=1024 after #852's VRAM sizing),
+    // the arena had nothing like that left, and a8.alloc handed back nullptr. That nullptr is not
+    // an error anywhere: `down_fp4_done` just tests fp4_down_a and quietly falls through, so the
+    // whole native-FP4 ffn_down leg was silently off at exactly the context it is worth the most,
+    // leaving `down` on dequant-to-int8 + int8 GEMM (nsys: 6.0% + 12.9% of the prefill).
+    // Muse is unaffected: it only reaches here at N == 128, where FC == N.
     unsigned char* fp4_down_a = nvfp4_down
-        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, ffn)) : nullptr;
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(fp4_rows, ffn)) : nullptr;
     unsigned char* fp4_down_as = nvfp4_down
-        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N, ffn)) : nullptr;
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(fp4_rows, ffn)) : nullptr;
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.

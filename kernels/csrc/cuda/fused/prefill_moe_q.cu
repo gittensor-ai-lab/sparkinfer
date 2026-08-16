@@ -1133,6 +1133,30 @@ bool pf_dense_gemm_qi8_supported(int ggml_type) {
     return ggml_type == QMQ_Q4_K || ggml_type == QMQ_Q5_K || ggml_type == QMQ_Q6_K;
 }
 
+// Decoding Q4_K inside the GEMM skips the int8 materialize (dequant -> W_i8 -> reload), which is
+// the right trade only while that round trip is the dominant cost -- i.e. at the short-prompt M
+// this path was built for. It is not free: the decode sits on the MMA issue path, and measured on
+// an RTX 5090 at ctx=16384 this kernel sustains ~254 TOPS against the plain int8 GEMM's ~549 on
+// the same operands, so past a few hundred rows the materialize (a fixed ~154 us for a
+// 17408x5120 tensor) is repaid many times over by the faster GEMM.
+// Crossover from those two rates: the per-row saving of the faster GEMM equals the materialize at
+// M ~ 400, so decline past QB_MAX_M and let the caller take its own materialize path -- every
+// caller already treats `false` as "run your own GEMM". The two paths are bit-identical (same
+// activation int8 via the shared quant_a_i8 memo, same weight decode + per-row scale + int8 bytes,
+// same int8 tensor-core accumulation), so this is a pure scheduling choice, not a numeric one.
+// Measured end to end on Qwen3.8-27B: forcing this path off at EVERY M (the pre-existing
+// SPARKINFER_Q38_PREFILL_QB=0) is +21.8% at prefill@16k but -16.1% at prefill@128 -- the threshold
+// is what keeps both.
+// SPARKINFER_PREFILL_QB_MAX_M=0 disables the cap (restores the old always-fused behaviour).
+static int qb_max_m() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_QB_MAX_M");
+        const int x = e ? atoi(e) : 512;
+        return x > 0 ? x : (1 << 30);
+    }();
+    return v;
+}
+
 bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float* sx,
                              const void* W_q, const float* row_scale,
                              const int* pair_tok, const float* pair_w,
@@ -1292,7 +1316,7 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
                                    int* partials, int partials_splits, int* out_acc,
                                    const signed char* A_pack) {
     if (!pf_dense_gemm_qi8_supported(ggml_type)) return false;   // Q4_K / Q5_K / Q6_K
-    if (!row_scale || M <= 0) return false;
+    if (!row_scale || M <= 0 || M > qb_max_m()) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;         // whole super-blocks only
     if (N <= 0 || (N % QM_BND) != 0) return false;               // tile-aligned output width
     auto* C = reinterpret_cast<__nv_bfloat16*>(C_bf16);
@@ -1347,7 +1371,7 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
                                          signed char* fuse_q, float* fuse_sx, int* out_fused,
                                          const signed char* A_pack, signed char* fuse_qp) {
     if (!pf_dense_gemm_qi8_supported(ggml_type)) return false;
-    if (ngroup <= 0 || ngroup > PF_QGROUP_MAX || M <= 0) return false;
+    if (ngroup <= 0 || ngroup > PF_QGROUP_MAX || M <= 0 || M > qb_max_m()) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;
     PfQGroup d{};
     d.ngroup = ngroup;
