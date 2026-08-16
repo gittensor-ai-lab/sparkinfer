@@ -119,7 +119,7 @@ MODELOPT_NEEDS_REBASE = "modelopt-needs-rebase"
 # a scoring change existed must not keep a stale-scored label/score forever.
 EVAL_SCHEMA_VERSION = "v1-modelopt-decode128"
 MARKER_RE = re.compile(
-    r"<!-- sparkinfer-qwen38-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
+    r"<!-- sparkinfer-modelopt-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
 )
 
@@ -183,7 +183,7 @@ AUTOMERGE_BLOCK = {
 }
 
 SCORES_FILE = os.path.expanduser(
-    os.environ.get("MODELOPT_SCORES_FILE", "~/.sparkinfer_qwen38_scores.json")
+    os.environ.get("MODELOPT_SCORES_FILE", "~/.sparkinfer_modelopt_scores.json")
 )
 
 # Polaris verifiable-compute receipts — same policy/keys as the AR and DFlash bots (on by
@@ -221,7 +221,7 @@ def _save_scores(data):
         with open(SCORES_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        print(f">> qwen38 scores save skipped: {e}")
+        print(f">> modelopt scores save skipped: {e}")
 
 
 def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
@@ -336,7 +336,7 @@ def qwen38_evaluated_commits(repo, num):
     for c in json.loads(r.stdout or "{}").get("comments", []):
         body = c.get("body") or ""
         m = MARKER_RE.search(body)
-        if not m or "sparkinfer qwen38 auto-eval" not in body:
+        if not m or "sparkinfer modelopt auto-eval" not in body:
             continue
         meta_raw = m.group(2)
         try:
@@ -1225,12 +1225,12 @@ def format_comment(commit: str, res: dict) -> str:
         "q36_guard_ok": res.get("q36_guard_ok"),
     }
     marker = (
-        f"<!-- sparkinfer-qwen38-eval:{EVAL_SCHEMA_VERSION}:{commit} "
+        f"<!-- sparkinfer-modelopt-eval:{EVAL_SCHEMA_VERSION}:{commit} "
         f"{json.dumps(meta, separators=(',', ':'))} -->"
     )
     if not res.get("ok"):
         return (
-            f"{marker}\n## sparkinfer qwen38 auto-eval — error\n\n"
+            f"{marker}\n## sparkinfer modelopt auto-eval — error\n\n"
             f"**reason:** `{res.get('reason')}`\n\n"
             f"<details><summary>log tail</summary>\n\n```\n{(res.get('log') or '')[:1800]}\n```\n</details>\n"
         )
@@ -1262,9 +1262,9 @@ def format_comment(commit: str, res: dict) -> str:
     else:
         polaris_row = ""
     return (
-        f"{marker}\n## sparkinfer qwen38 auto-eval — `eval-qwen38:{lab}`\n\n"
+        f"{marker}\n## sparkinfer modelopt auto-eval — `eval-modelopt:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
-        f"| **label** | `eval-qwen38:{lab}` |\n"
+        f"| **label** | `eval-modelopt:{lab}` |\n"
         f"| scored at | prefill@16k (the only scoring dimension); decode@128 + prefill@128 are no-regression floors |\n"
         f"| tier came from | `{res.get('scored_dimension', '?')}` |\n"
         f"| PR decode tok/s | {res['pr_decode_tps']:.2f} |\n"
@@ -1475,7 +1475,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
     label = res.get("label") if res.get("ok") else "REJECT"
     if not res.get("ok"):
         label = "REJECT"
-    print(f"PR #{num}: eval-qwen38:{label}  "
+    print(f"PR #{num}: eval-modelopt:{label}  "
           f"decode PR={res.get('pr_decode_tps')} main={res.get('main_decode_tps')}  "
           f"prefill PR={res.get('pr_prefill_pp')} main={res.get('main_prefill_pp')}  "
           f"from={res.get('scored_dimension')}  "
@@ -1553,7 +1553,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "(regression)"
             close_body = (
                 "<!-- sparkinfer-qwen38-auto-close -->\n"
-                f"## Closed: sparkinfer qwen38 auto-eval — `eval-qwen38:{label}`\n\n"
+                f"## Closed: sparkinfer modelopt auto-eval — `eval-modelopt:{label}`\n\n"
                 f"This PR's Qwen3.8-27B prefill@16k speed measured **{res.get('delta_pct')}%** "
                 f"vs main, {fail_clause} "
                 "— closing automatically. This bot evaluates every eligible PR in the repo "
@@ -1564,7 +1564,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             )
             arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
             arb.gh(["pr", "close", str(num), "-R", repo])
-            print(f">> auto-closed PR #{num} (eval-qwen38:{label})")
+            print(f">> auto-closed PR #{num} (eval-modelopt:{label})")
 
 
 def main():
