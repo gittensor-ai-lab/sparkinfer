@@ -644,6 +644,58 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         fp4_gdn_ws = (wb <= fp4_ws_bytes && fp4_ws) ? fp4_ws : a8.alloc<unsigned char>(wb);
     }
 
+    // ---- full-attention q|gate / k / v / o straight off the checkpoint's NVFP4 bytes ----
+    // The 16 softmax-attention layers were the last projections still leaving the block-scaled
+    // GEMM: proj() ran them as a dp4a int8 GEMM over the Q4_K copy, measured at ~30% of peak
+    // against the FP4 GEMM's 76% beside it (nsys, ctx=128: 1.076 ms for q|gate,k,v + 0.589 ms for
+    // o, per pass, moving 0.94 GB). Loading them with keep_native (qwen35.cpp) makes the packed
+    // nibbles the resident form, so this is the same GEMM the FFN and GDN already use.
+    //
+    // Bounded by N like the GDN arm and for the same reason -- the saving is per-layer fixed cost,
+    // so it is worth the most where N is small -- and so the scored ctx=128 shape cannot depend on
+    // the cudaMemGetInfo-derived FC. Bit 0 is q|gate/k/v (which share one A quantize), bit 1 is o.
+    static const int attn_fp4_mask = [] {
+        const char* e = getenv("SPARKINFER_Q38_ATTN_NVFP4_PREFILL");
+        return e ? atoi(e) : 3;
+    }();
+    // Unlike the GDN arm this is NOT bounded to short prompts. #860 bounds GDN at 2048 because
+    // the delta-rule recurrence compounds activation-quant error along the sequence; softmax
+    // attention has no such carry -- each q/k/v row is projected independently -- so the FP4
+    // activation error does not accumulate with N. It also MUST cover every length here: the Q4_K
+    // copy no longer exists, so any N that misses this arm falls back to expanding the NVFP4
+    // weight to bf16 and then to int8 on every pass, which is far worse than the arm is good
+    // (measured: -3.7% at ctx=16384 when the bound was left at 2048).
+    static const int attn_fp4_maxn = [] {
+        const char* e = getenv("SPARKINFER_Q38_ATTN_NVFP4_MAXN");
+        return e ? atoi(e) : (1 << 30);
+    }();
+    // Layer 0 is a GDN layer under full_attention_interval, so probe for the first full-attn one.
+    const Qwen35LayerWeights* attn_probe = nullptr;
+    for (const auto& lw : s.w.layers)
+        if (!lw.linear_attn) { attn_probe = &lw; break; }
+    const int wide_n = 2 * qdim;                     // wq holds [q|gate] as one operand
+    const bool attn_nvfp4 = attn_fp4_mask != 0 && !moe && !c.muse_glimmer &&
+        attn_probe && attn_probe->wq_fp4 && N <= attn_fp4_maxn &&
+        kernels::prefill_nvfp4_supported(N, wide_n, H) &&
+        kernels::prefill_nvfp4_supported(N, kvdim, H) &&
+        kernels::prefill_nvfp4_supported(N, H, qdim);
+    // o's A operand is `att` at k = qdim (6144 here), wider than the q/k/v k = H, so one staging
+    // pair sized for the widest of the two covers all four projections.
+    const int attn_k = (qdim > H) ? qdim : H;
+    unsigned char* fp4_attn_a = attn_nvfp4
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, attn_k)) : nullptr;
+    unsigned char* fp4_attn_as = attn_nvfp4
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N, attn_k)) : nullptr;
+    unsigned char* fp4_attn_ws = nullptr;
+    if (attn_nvfp4) {
+        size_t wb = kernels::prefill_nvfp4_workspace_bytes(N, wide_n, H);
+        const size_t wk = kernels::prefill_nvfp4_workspace_bytes(N, kvdim, H);
+        const size_t wo2 = kernels::prefill_nvfp4_workspace_bytes(N, H, qdim);
+        if (wk > wb) wb = wk;
+        if (wo2 > wb) wb = wo2;
+        fp4_attn_ws = (wb <= fp4_ws_bytes && fp4_ws) ? fp4_ws : a8.alloc<unsigned char>(wb);
+    }
+
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
     Arena& aw = arena_reuse ? keep_aw : once_aw;
@@ -966,6 +1018,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // Bit-identical to the two-step path. SPARKINFER_PREFILL_RESID_FUSE=0 disables (A/B).
     const char* _prfuse = getenv("SPARKINFER_PREFILL_RESID_FUSE");
     const bool resid_fuse = !_prfuse || _prfuse[0] != '0';
+    // Same idea for the block-scaled NVFP4 projections, which used to be excluded from it because
+    // the launcher had no source operand: CUTLASS's LinearCombination epilogue is already
+    // D = alpha*Acc + beta*C, so passing the residual as C and beta=1 folds the add in.
+    // SPARKINFER_PREFILL_NVFP4_RESID_FUSE=0 restores the raw-projection + separate-add form (A/B).
+    const bool nvfp4_resid_fuse = resid_fuse && [] {
+        const char* e = getenv("SPARKINFER_PREFILL_NVFP4_RESID_FUSE");
+        return !(e && e[0] == '0');
+    }();
     auto proj_resid = [&](const bf16* A, const void* W, int wtype, bf16* Cx, int n_out, int K,
                           int rows = 0) -> bool {
         if (!resid_fuse || !use_i8 || n_out < 128 || wtype == kernels::SI_QTYPE_FP8) return false;
@@ -1133,18 +1193,30 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
                 c.gdn_qh_block, st);
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
-            // out_proj off the same NVFP4 bytes. The block-scaled GEMM cannot accumulate the
-            // residual, so this writes the RAW projection to `ao` and leaves attn_fused false --
-            // the `if (!attn_fused) launch_prefill_add(x, ao, x, ...)` below is what applies it,
-            // exactly as the Muse wo_fp4 arm does for the o projection.
-            const bool out_fp4 = gdn_nvfp4 && (gdn_fp4_mask & 2) &&
-                w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
+            // out_proj off the same NVFP4 bytes, with the residual folded into the block-scaled
+            // GEMM's own epilogue (D = A*B + C, C aliasing D aliasing x) instead of written raw
+            // to `ao` for a separate full-tensor add. That add is three N*H bf16 streams (read x,
+            // read ao, write x) for one flop per element; the epilogue already holds the
+            // accumulator in registers, so folding it in costs one read and removes the pass.
+            // The fused form claims the residual itself -- attn_fused suppresses the add below.
+            bool out_fp4 = false;
+            if (gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
                 fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
-                kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_gdn_a, fp4_gdn_as, N, lvdim, st) &&
-                kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
-                                                   w.gdn_out_fp4, w.gdn_out_fp4_sf,
-                                                   ao, N, H, lvdim, fp4_gdn_ws, st,
-                                                   w.gdn_out_fp4_alpha);
+                kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_gdn_a, fp4_gdn_as, N, lvdim, st)) {
+                if (nvfp4_resid_fuse &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                       w.gdn_out_fp4, w.gdn_out_fp4_sf,
+                                                       x, N, H, lvdim, fp4_gdn_ws, st,
+                                                       w.gdn_out_fp4_alpha, x)) {
+                    out_fp4 = true;
+                    attn_fused = true;
+                } else if (kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                              w.gdn_out_fp4, w.gdn_out_fp4_sf,
+                                                              ao, N, H, lvdim, fp4_gdn_ws, st,
+                                                              w.gdn_out_fp4_alpha)) {
+                    out_fp4 = true;
+                }
+            }
             if (!out_fp4) {
                 attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
                 if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
@@ -1226,8 +1298,30 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 // Qwen3.8: [q|gate] is one wide wq, then skinny k/v (8 tiles each). One grouped
                 // launch fills the 5090; four separate ones leave k/v paying a full CTA duration
                 // for 8 blocks. Same kernel as Muse, bit-identical per tile.
-                bool grouped = false;
-                if (use_i8 && w.wq_rs && w.wk_rs && w.wv_rs &&
+                // Checkpoint-native NVFP4: quantize xn to FP4 ONCE (all three projections read it)
+                // and run three block-scaled GEMMs off the packed nibbles. [q|gate] stays the one
+                // wide operand it already is, so the split below is untouched. A_i8/sx are not
+                // written, so the int8 activation memo stays valid for whatever runs next.
+                bool qkv_fp4 = false;
+                if (attn_nvfp4 && (attn_fp4_mask & 1) &&
+                    w.wq_fp4 && w.wq_fp4_sf && w.wk_fp4 && w.wk_fp4_sf &&
+                    w.wv_fp4 && w.wv_fp4_sf && fp4_attn_a && fp4_attn_as && fp4_attn_ws &&
+                    kernels::launch_prefill_nvfp4_quant_a(xn, fp4_attn_a, fp4_attn_as, N, H, st) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                       w.wq_fp4, w.wq_fp4_sf,
+                                                       b8, N, wide, H, fp4_attn_ws, st,
+                                                       w.wq_fp4_alpha) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                       w.wk_fp4, w.wk_fp4_sf,
+                                                       kf, N, kvdim, H, fp4_attn_ws, st,
+                                                       w.wk_fp4_alpha) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                       w.wv_fp4, w.wv_fp4_sf,
+                                                       vf, N, kvdim, H, fp4_attn_ws, st,
+                                                       w.wv_fp4_alpha))
+                    qkv_fp4 = true;
+                bool grouped = qkv_fp4;
+                if (!qkv_fp4 && use_i8 && w.wq_rs && w.wk_rs && w.wv_rs &&
                     w.wk_type == w.wq_type && w.wv_type == w.wq_type &&
                     kernels::pf_dense_gemm_qi8_supported(w.wq_type)) {
                     const void*  Wa[3]  = { w.wq, w.wk, w.wv };
@@ -1327,7 +1421,32 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             if (!gate_fused && !wo_fp4_done) {
                 kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
             }
-            if (c.muse_glimmer) {
+            // o off the same NVFP4 bytes, reading the already-gated `att`, with the residual taken
+            // by the epilogue's C operand (same fold as the GDN out_proj above) so no separate
+            // full-tensor add pass is needed. If the fused form declines, fall back to writing the
+            // raw projection to `ao` and let the `if (!attn_fused) launch_prefill_add(...)` tail
+            // apply it, exactly as the Muse wo_fp4 arm does.
+            bool wo_fp4_q38 = false, wo_fp4_resid = false;
+            if (attn_nvfp4 && (attn_fp4_mask & 2) &&
+                w.wo_fp4 && w.wo_fp4_sf && fp4_attn_a && fp4_attn_as && fp4_attn_ws &&
+                kernels::launch_prefill_nvfp4_quant_a(att, fp4_attn_a, fp4_attn_as, N, qdim, st)) {
+                if (nvfp4_resid_fuse && !c.muse_glimmer &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                       w.wo_fp4, w.wo_fp4_sf,
+                                                       x, N, H, qdim, fp4_attn_ws, st,
+                                                       w.wo_fp4_alpha, x)) {
+                    wo_fp4_q38 = true;
+                    wo_fp4_resid = true;
+                } else if (kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                              w.wo_fp4, w.wo_fp4_sf,
+                                                              ao, N, H, qdim, fp4_attn_ws, st,
+                                                              w.wo_fp4_alpha)) {
+                    wo_fp4_q38 = true;
+                }
+            }
+            if (wo_fp4_q38) {
+                attn_fused = wo_fp4_resid;
+            } else if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
                 // add happens in launch_norm_then_add below. The FP4 GEMM already wrote `ao` and
                 // left attn_acc at 0, so the plain norm_then_add tail consumes it.
@@ -1426,6 +1545,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                           w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as;
             const bool ffn_fused = !c.muse_glimmer && !ffn_fp4_possible &&
                                    resid_fuse && (ffn_i8 || use_i8) && !ffn_qi8;
+            // The FP4 down projection accumulates the residual in its own epilogue (see the GDN
+            // out_proj above). Decided per LAYER, not per chunk, so the whole layer takes one
+            // route: a chunk that fuses has already applied its residual to x, so a mix would
+            // need the trailing add to skip exactly those rows. When it is on, any chunk whose
+            // fused GEMM declines applies its own residual immediately instead.
+            const bool ffn_fp4_resid = nvfp4_resid_fuse && ffn_fp4_possible && !c.muse_glimmer &&
+                                       nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
+                                       fp4_down_a && fp4_down_as;
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
@@ -1440,19 +1567,31 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                                        ffu, fn, ffn, H, fp4_ws, st,
                                                        w.up_fp4_alpha);
                 if (layer_fp4) {
-                    const bool down_fp4_done = nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
+                    bf16* xc = x + (size_t)fo * H;
+                    const bool down_swiglu_q = nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
                         fp4_down_a && fp4_down_as &&
                         kernels::launch_prefill_nvfp4_swiglu_quant_a(
-                            ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st) &&
+                            ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st);
+                    const bool down_fp4_resid = down_swiglu_q && ffn_fp4_resid &&
                         kernels::launch_prefill_nvfp4_gemm(
                             fp4_down_a, fp4_down_as, w.down_fp4, w.down_fp4_sf,
+                            xc, fn, H, ffn, fp4_ws, st, w.down_fp4_alpha, xc);
+                    const bool down_fp4_done = down_fp4_resid ||
+                        (down_swiglu_q &&
+                         kernels::launch_prefill_nvfp4_gemm(
+                            fp4_down_a, fp4_down_as, w.down_fp4, w.down_fp4_sf,
                             ao + (size_t)fo * H, fn, H, ffn, fp4_ws, st,
-                            w.down_fp4_alpha);
+                            w.down_fp4_alpha));
                     if (!down_fp4_done) {
                         kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
                         proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
                                        ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
                     }
+                    // Keep the layer on one route: if the residual-fused arm is active but this
+                    // chunk fell through it, that chunk's rows are still raw in `ao` and the
+                    // trailing whole-tensor add is going to be skipped, so apply them here.
+                    if (ffn_fp4_resid && !down_fp4_resid)
+                        kernels::launch_prefill_add(xc, ao + (size_t)fo * H, xc, (long)fn * H, st);
                     continue;
                 }
                 if (ffn_qi8) {
@@ -1596,8 +1735,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                                       w.post_ffn_norm, x, N, H, 1e-8f, st);
                 else
                     kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
-            } else if (!ffn_fused) {
-                // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk)
+            } else if (!ffn_fused && !ffn_fp4_resid) {
+                // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk,
+                // whether through the int8 fused-residual GEMM or the FP4 epilogue's C operand)
                 kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
             }
         } else {

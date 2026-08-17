@@ -318,14 +318,19 @@ __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
 
 template <class C = Wide>
 typename C::Gemm::Arguments args(const void* a, const void* sa, const void* b, const void* sb,
-                                 void* d, int m, int n, int k, float alpha = 1.f) {
+                                 void* d, int m, int n, int k, float alpha = 1.f,
+                                 const void* c = nullptr) {
     auto as = cutlass::make_cute_packed_stride(StrideA{}, {m,k,1});
     auto bs = cutlass::make_cute_packed_stride(StrideB{}, {n,k,1});
     auto cs = cutlass::make_cute_packed_stride(StrideC{}, {m,n,1});
     auto ds = cutlass::make_cute_packed_stride(StrideD{}, {m,n,1});
+    // beta is 1 exactly when a source is supplied — the residual accumulate. With c == nullptr
+    // beta MUST stay 0: the epilogue skips the C load entirely on beta == 0, and a non-zero beta
+    // over a null pointer faults.
+    const float beta = c ? 1.f : 0.f;
     return {cutlass::gemm::GemmUniversalMode::kGemm, shape(m,n,k),
             {static_cast<const cutlass::float_e2m1_t*>(a), as, static_cast<const cutlass::float_e2m1_t*>(b), bs, static_cast<const cutlass::float_ue4m3_t*>(sa), sfa_layout(m,n,k), static_cast<const cutlass::float_ue4m3_t*>(sb), sfb_layout(m,n,k)},
-            {{alpha, 0.f}, static_cast<const BF*>(nullptr), cs, static_cast<BF*>(d), ds}};
+            {{alpha, beta}, static_cast<const BF*>(c), cs, static_cast<BF*>(d), ds}};
 }
 
 int sm_count() {
@@ -364,9 +369,10 @@ bool prefer_narrow(int m, int n) {
 
 template <class C>
 bool run_gemm(const void* a, const void* sa, const void* b, const void* sb,
-              void* d, int m, int n, int k, void* ws, cudaStream_t st, float alpha) {
+              void* d, int m, int n, int k, void* ws, cudaStream_t st, float alpha,
+              const void* c) {
     typename C::Gemm gemm;
-    auto ar = args<C>(a, sa, b, sb, d, m, n, k, alpha);
+    auto ar = args<C>(a, sa, b, sb, d, m, n, k, alpha, c);
     return gemm.can_implement(ar) == cutlass::Status::kSuccess &&
            gemm.initialize(ar, ws, st) == cutlass::Status::kSuccess &&
            gemm.run(st) == cutlass::Status::kSuccess;
@@ -439,7 +445,8 @@ bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const void* sb,
-                               void* d,int m,int n,int k,void* ws,cudaStream_t st, float alpha) {
+                               void* d,int m,int n,int k,void* ws,cudaStream_t st, float alpha,
+                               const void* c) {
     if (!a||!sa||!b||!sb||!d||!prefill_nvfp4_supported(m,n,k)) return false;
     // Default ON; SPARKINFER_NVFP4_EVICT_FIRST=0 restores CUTLASS's stock loads for A/B.
     static const bool ef = [] {
@@ -451,14 +458,14 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
     // implement the shape.
     const int big = nvfp4_big_tile();
     if (big && m >= 512) {
-        if (run_gemm<BigM>(a,sa,b,sb,d,m,n,k,ws,st,alpha)) return true;
+        if (run_gemm<BigM>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)) return true;
 
     }
     if (ef)
-        return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha)
-                                  : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha);
-    return prefer_narrow(m,n) ? run_gemm<Narrow>(a,sa,b,sb,d,m,n,k,ws,st,alpha)
-                              : run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st,alpha);
+        return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)
+                                  : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c);
+    return prefer_narrow(m,n) ? run_gemm<Narrow>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)
+                              : run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c);
 }
 
 // ---- HuggingFace "compressed-tensors" NVFP4 checkpoint dequant (load-time, one-shot) ----

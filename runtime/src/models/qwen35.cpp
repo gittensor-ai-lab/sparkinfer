@@ -4801,10 +4801,38 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.q_has_gate = c.hybrid;
             const std::string ab = b + "self_attn.";
             const int q_out = w.q_has_gate ? s.qdim * 2 : s.qdim;
-            w.wq = requant_q4k(dequant_any(ab + "q_proj", q_out, H), (long)q_out * H, w.wq_type);
-            w.wk = requant_q4k(dequant_any(ab + "k_proj", s.kvdim, H), (long)s.kvdim * H, w.wk_type);
-            w.wv = requant_q4k(dequant_any(ab + "v_proj", s.kvdim, H), (long)s.kvdim * H, w.wv_type);
-            w.wo = requant_q4k(dequant_any(ab + "o_proj", H, s.qdim), (long)H * s.qdim, w.wo_type);
+            // Same treatment the GDN projections get: keep the checkpoint's own NVFP4 bytes rather
+            // than fitting a second quantization to them. Batched prefill then feeds the packed
+            // nibbles to the SM120 block-scaled GEMM instead of streaming a Q4_K copy through a
+            // dp4a GEMM at ~30% of peak, and decode reads them through launch_gemv_nvfp4.
+            //
+            // This REPLACES the Q4_K copy rather than sitting beside it, which is what makes it
+            // affordable: the payload is 0.5625 B/weight against Q4_K's 0.5625, so only the
+            // CUTLASS SFB scale copy (0.0625 B/weight, ~105 MB over 16 layers) is new residency.
+            // Holding both would have cost ~1.05 GB, and this model already peaks at 31.9 GB of a
+            // 32.6 GB card at max_ctx=16384 -- there is 676 MB of headroom, so the both-copies
+            // form would have shrunk the 16k prefill arena, which is a no-regression floor.
+            // SPARKINFER_Q38_ATTN_NVFP4=0 restores the Q4_K requant (A/B in ONE binary).
+            static const bool attn_native_fp4 = [] {
+                const char* e = getenv("SPARKINFER_Q38_ATTN_NVFP4");
+                return !(e && e[0] == '0');
+            }();
+            // Per TENSOR, and only when it is genuinely NVFP4. keep_native would otherwise route
+            // an FP8 attention tensor to keep_fp8, which is exactly what the OTHER shipped
+            // Qwen3.8 checkpoint (unsloth: NVFP4 FFN + FP8 attention/GDN) stores -- that moved its
+            // decode off Q4_K MMVQ and cost it 3.4%, a model this change has no business touching.
+            // Probing per tensor keeps every non-NVFP4 attention weight on the exact path it had.
+            auto attn_w = [&](const std::string& nm, int rows, int cols, int& qt,
+                              const void** fp4, const void** fp4_sf, float* alpha) -> const void* {
+                NvFp4Src probe{};
+                if (attn_native_fp4 && nvfp4_src(ab + nm, rows, cols, probe))
+                    return keep_native(ab + nm, rows, cols, qt, fp4, fp4_sf, alpha);
+                return requant_q4k(dequant_any(ab + nm, rows, cols), (long)rows * cols, qt);
+            };
+            w.wq = attn_w("q_proj", q_out,   H,       w.wq_type, &w.wq_fp4, &w.wq_fp4_sf, &w.wq_fp4_alpha);
+            w.wk = attn_w("k_proj", s.kvdim, H,       w.wk_type, &w.wk_fp4, &w.wk_fp4_sf, &w.wk_fp4_alpha);
+            w.wv = attn_w("v_proj", s.kvdim, H,       w.wv_type, &w.wv_fp4, &w.wv_fp4_sf, &w.wv_fp4_alpha);
+            w.wo = attn_w("o_proj", H,       s.qdim,  w.wo_type, &w.wo_fp4, &w.wo_fp4_sf, &w.wo_fp4_alpha);
             w.q_norm = load_norm_plus1(ab + "q_norm.weight", c.head_dim);
             w.k_norm = load_norm_plus1(ab + "k_norm.weight", c.head_dim);
             if (!w.wq || !w.wk || !w.wv || !w.wo || !w.q_norm || !w.k_norm) return false;

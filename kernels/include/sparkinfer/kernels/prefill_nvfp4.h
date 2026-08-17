@@ -25,11 +25,16 @@ bool launch_prefill_nvfp4_swiglu_quant_a(const void* gate_bf16, const void* up_b
                                          int m, int k, cudaStream_t stream = nullptr);
 bool launch_prefill_nvfp4_quant_b(const void* src_bf16, void* dst_fp4, void* dst_sf,
                                   int n, int k, cudaStream_t stream = nullptr);
+// c_bf16 is the epilogue's source operand: non-null makes this compute
+// D = alpha*(A*B) + C instead of D = alpha*(A*B), which is how a residual add is
+// folded into the block-scaled GEMM rather than run as a separate full-tensor pass.
+// c_bf16 may alias d_bf16 (the in-place x += proj form); the epilogue reads each
+// output tile before it stores it.
 bool launch_prefill_nvfp4_gemm(const void* a_fp4, const void* sfa,
                                const void* b_fp4, const void* sfb,
                                void* d_bf16, int m, int n, int k,
                                void* workspace, cudaStream_t stream = nullptr,
-                               float alpha = 1.f);
+                               float alpha = 1.f, const void* c_bf16 = nullptr);
 
 // Scatter a compressed-tensors row-major UE4M3 scale [n, k/16] into the CUTLASS
 // SFB layout launch_prefill_nvfp4_gemm expects for B. Packed E2M1 bytes are

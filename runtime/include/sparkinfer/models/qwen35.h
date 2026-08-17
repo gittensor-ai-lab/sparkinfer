@@ -98,6 +98,18 @@ struct Qwen35LayerWeights {
     // Short-context-only copy; decode retains down_q, so long-context configurations leave this
     // null to preserve KV and batched-prefill scratch headroom on 32-GB cards.
     const void* down_fp4 = nullptr; const void* down_fp4_sf = nullptr;
+    // Full-attention q/k/v projections as the checkpoint ships them (ModelOpt NVFP4). Unlike the
+    // GDN pointers below these do NOT alias a payload decode already holds: decode reads the Q4_K
+    // wq/wk/wv/wo built from the same bytes, because native NVFP4 GEMV is ~0.65x at m=1. So the
+    // packed nibbles are genuinely extra residency and are gated on a free-VRAM preflight.
+    // q and attn_gate stay ONE wide [2*qdim, H] operand, exactly as wq already is, so the
+    // split_q_gate that follows the projection is unchanged.
+    const void* wq_fp4 = nullptr; const void* wq_fp4_sf = nullptr;
+    const void* wk_fp4 = nullptr; const void* wk_fp4_sf = nullptr;
+    const void* wv_fp4 = nullptr; const void* wv_fp4_sf = nullptr;
+    // Muse builds wo_fp4 from bf16 and folds the global scale into UE4M3, leaving alpha 1; the
+    // checkpoint-native path carries 1/weight_global_scale here instead (pack_sfb omits it).
+    float wq_fp4_alpha = 1.f, wk_fp4_alpha = 1.f, wv_fp4_alpha = 1.f, wo_fp4_alpha = 1.f;
     // GDN in/out projections, for checkpoints that ship them as NVFP4 (ModelOpt). These point INTO
     // the payload keep_nvfp4_native already keeps resident for decode's launch_gemv_nvfp4, so only
     // the CUTLASS SFB scale copy (1 byte per 16 weights) is new VRAM -- the packed nibbles are

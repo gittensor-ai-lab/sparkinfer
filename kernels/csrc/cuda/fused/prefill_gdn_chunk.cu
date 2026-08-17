@@ -285,22 +285,37 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                                     __nv_bfloat16* __restrict__ out,
                                     int n_tokens, int q_heads, int v_heads, int n_chunks,
                                     bool qh_block, int carry) {
+    // ONE arena, with three regions reused at disjoint points of the chunk body. That reuse is
+    // what keeps JC=64 -- the one-wave launch shape, see launch_prefill_gdn_chunk -- inside the
+    // 100 KB an SM has; laid out naively it needs 133 KB and cannot be launched at all.
+    //   s_W|s_Q -> s_C  : the wmma accumulator staging for BOTH matmuls. W^ and Q are read only
+    //                     by the U^/Y0 k-loop, and are dead from there until the cp.async
+    //                     restage at the bottom of the iteration.
+    //   s_Sb    -> s_Y, then s_Ub : S's bf16 mirror is dead once that same k-loop has read it.
+    // s_K is NOT reused: the S update at the end of the chunk still needs it.
     extern __shared__ char s_raw[];
+    constexpr int NW = (C * JC) / 128;          // warps; == 2 x (C/16)x(JC/16) accumulator tiles
     float* s_S = reinterpret_cast<float*>(s_raw);                              // [HD][JC]  fp32 carrier
     float* s_U = s_S + (size_t)HD * JC;                                        // [C][JC]
     float* s_M = s_U + (size_t)C * JC;                                         // [C][C+PAD]
     float* s_g = s_M + (size_t)C * (C + PAD);                                  // [C]
     float* s_eg = s_g + C;                                                     // [C] hoisted per-row expf
-    float* s_Y = s_eg + C;                                                     // [C][JC]  Q S staging
     __nv_bfloat16* s_W =
-        reinterpret_cast<__nv_bfloat16*>(s_Y + (size_t)C * JC);                // [C][HD+PAD]
-    __nv_bfloat16* s_K = s_W + (size_t)C * (HD + PAD);                         // [C][HD+PAD]
-    __nv_bfloat16* s_Q = s_K + (size_t)C * (HD + PAD);                         // [C][HD+PAD]
+        reinterpret_cast<__nv_bfloat16*>(s_eg + C);                            // [C][HD+PAD]
+    __nv_bfloat16* s_Q = s_W + (size_t)C * (HD + PAD);                         // [C][HD+PAD]
+    __nv_bfloat16* s_K = s_Q + (size_t)C * (HD + PAD);                         // [C][HD+PAD]
     // bf16 operand mirrors. S stays fp32 across chunks (it is the recurrent carrier); it is
     // narrowed to bf16 ONCE per chunk to feed the tensor cores, which is the only precision the
     // wmma path costs over the fp32 register-tiled one — W^, K and Q are already bf16.
-    __nv_bfloat16* s_Sb = s_Q + (size_t)C * (HD + PAD);                        // [HD][JC+PAD]
-    __nv_bfloat16* s_Ub = s_Sb + (size_t)HD * (JC + PAD);                      // [C][JC+PAD]
+    __nv_bfloat16* s_Sb = s_K + (size_t)C * (HD + PAD);                        // [HD][JC+PAD]
+    float* s_C = reinterpret_cast<float*>(s_W);                                // [NW][16][16]
+    float* s_Y = reinterpret_cast<float*>(s_Sb);                               // [C][JC]  Q S staging
+    __nv_bfloat16* s_Ub = s_Sb;                                                // [C][JC+PAD]
+    static_assert(2 * C * (HD + PAD) * sizeof(__nv_bfloat16) >= (size_t)NW * 256 * sizeof(float),
+                  "s_C must fit in the s_W|s_Q pair");
+    static_assert(HD * (JC + PAD) * sizeof(__nv_bfloat16) >= (size_t)C * JC * sizeof(float),
+                  "s_Y must fit in s_Sb");
+    static_assert(HD * (JC + PAD) >= C * (JC + PAD), "s_Ub must fit in s_Sb");
 
     const int h    = blockIdx.x;
     const int j0   = blockIdx.y * JC;
@@ -391,12 +406,15 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         __syncthreads();
         {
             using namespace nvcuda;
-            // 8 warps, 8 output tiles of 16x16: warps 0-3 own U^ = W^ S, warps 4-7 own Y0 = Q S.
+            // NW warps, NW output tiles of 16x16: the first TU own U^ = W^ S, the rest Y0 = Q S.
             // Both contract over HD against the same s_Sb, so the two matmuls share its fragments.
+            constexpr int TJ = JC / 16;                      // tile columns
+            constexpr int TU = (C / 16) * TJ;                // tiles per matmul; NW == 2*TU
+            static_assert(NW == 2 * TU, "one accumulator tile per warp");
             const int warp = tid >> 5;
-            const bool isU = warp < 4;
-            const int t    = warp & 3;                       // 2x2 tile grid over [C=32, JC=32]
-            const int ti = (t >> 1) * 16, tj = (t & 1) * 16;
+            const bool isU = warp < TU;
+            const int t    = isU ? warp : warp - TU;         // (C/16) x TJ tile grid over [C, JC]
+            const int ti = (t / TJ) * 16, tj = (t % TJ) * 16;
             const __nv_bfloat16* Aop = isU ? s_W : s_Q;
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
             wmma::fill_fragment(cf, 0.f);
@@ -408,14 +426,17 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                 wmma::load_matrix_sync(bf, s_Sb + (size_t)kk * (JC + PAD) + tj, JC + PAD);
                 wmma::mma_sync(cf, af, bf, cf);
             }
-            __shared__ float sC[8][16][16];
-            wmma::store_matrix_sync(&sC[warp][0][0], cf, 16, wmma::mem_row_major);
+            // s_C overlays s_W|s_Q and s_Y overlays s_Sb — all three of which the loop above is
+            // still reading in the other warps, so nothing may land until every warp is out of it.
+            __syncthreads();
+            wmma::store_matrix_sync(s_C + (size_t)warp * 256, cf, 16, wmma::mem_row_major);
             __syncthreads();
             for (int e = tid; e < C * JC; e += nthr) {
                 const int i = e / JC, jj = e - i * JC;
-                const int w = ((i >> 4) << 1) | (jj >> 4);
-                s_U[e] -= sC[w][i & 15][jj & 15];             // U^ = U0 - W^ S
-                s_Y[e]  = sC[4 + w][i & 15][jj & 15];         // Y0 = Q S
+                const int w = (i >> 4) * TJ + (jj >> 4);
+                const int o = (i & 15) * 16 + (jj & 15);
+                s_U[e] -= s_C[(size_t)w * 256 + o];           // U^ = U0 - W^ S
+                s_Y[e]  = s_C[(size_t)(TU + w) * 256 + o];    // Y0 = Q S
             }
         }
         __syncthreads();
@@ -428,7 +449,7 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         for (int i = tid; i < C; i += nthr) s_eg[i] = __expf(s_g[i]);
         __syncthreads();
         {
-            constexpr int NTHR2 = 256;
+            constexpr int NTHR2 = NW * 32;
             constexpr int OPT = (C * JC) / NTHR2;
             constexpr int ISTR2 = NTHR2 / JC;
             const int jj = tid % JC, i0 = tid / JC;
@@ -476,12 +497,14 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         {
             using namespace nvcuda;
             const float gl = __expf(g_last);
-            const int warp = tid >> 5;                       // 8 warps x 2 tiles = 16 tiles [128,32]
-            __shared__ float sC2[8][16][16];
+            constexpr int TJ = JC / 16;
+            constexpr int REPS = ((HD / 16) * TJ) / NW;      // NW warps x REPS tiles = [HD,JC]
+            static_assert(REPS * NW == (HD / 16) * TJ, "S-update tiles must divide over the warps");
+            const int warp = tid >> 5;
             #pragma unroll
-            for (int rep = 0; rep < 2; rep++) {
-                const int tile = warp * 2 + rep;             // 0..15
-                const int ti = (tile >> 1) * 16, tj = (tile & 1) * 16;
+            for (int rep = 0; rep < REPS; rep++) {
+                const int tile = warp * REPS + rep;
+                const int ti = (tile / TJ) * 16, tj = (tile % TJ) * 16;
                 wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
                 wmma::fill_fragment(cf, 0.f);
                 #pragma unroll
@@ -493,12 +516,12 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                     wmma::load_matrix_sync(bf, s_Ub + (size_t)kk * (JC + PAD) + tj, JC + PAD);
                     wmma::mma_sync(cf, af, bf, cf);
                 }
-                wmma::store_matrix_sync(&sC2[warp][0][0], cf, 16, wmma::mem_row_major);
+                wmma::store_matrix_sync(s_C + (size_t)warp * 256, cf, 16, wmma::mem_row_major);
                 __syncwarp();
                 for (int e = (tid & 31); e < 256; e += 32) {
                     const int r = e >> 4, cc = e & 15;
                     const int m = ti + r, jj = tj + cc;
-                    s_S[m * JC + jj] = gl * s_S[m * JC + jj] + sC2[warp][r][cc];
+                    s_S[m * JC + jj] = gl * s_S[m * JC + jj] + s_C[(size_t)warp * 256 + r * 16 + cc];
                 }
                 __syncwarp();
             }
@@ -541,6 +564,49 @@ size_t gdnc_workspace_bytes(int n_tokens, int v_heads, int C, int HD) {
          + n_w * sizeof(__nv_bfloat16) + n_w * sizeof(__nv_bfloat16);
 }
 
+// Shared memory for one scan block, matching the arena the kernel carves up (s_C, s_Y and s_Ub
+// are overlays and cost nothing here).
+template <int C, int HD, int JC>
+constexpr size_t gdnc_scan_smem() {
+    return (size_t)HD * JC * sizeof(float)                                  // s_S (fp32 carrier)
+         + (size_t)C * JC * sizeof(float)                                   // s_U
+         + (size_t)C * (C + PAD) * sizeof(float)                            // s_M
+         + (size_t)2 * C * sizeof(float)                                    // s_g, s_eg
+         + (size_t)3 * C * (HD + PAD) * sizeof(__nv_bfloat16)               // s_W, s_Q, s_K
+         + (size_t)HD * (JC + PAD) * sizeof(__nv_bfloat16);                 // s_Sb
+}
+
+int gdnc_sm_count() {
+    static const int sms = [] {
+        int dev = 0, c = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&c, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+            return 0;
+        return c;
+    }();
+    return sms;
+}
+
+// The MaxDynamicSharedMemorySize opt-in, latched once per (device, JC). Both instantiations are
+// separate functions and the attribute is per-function AND per-device, so they need separate
+// latches — a shared one would leave whichever kernel ran second unconfigured, and its launches
+// would then fail silently and fall through to the sequential scan.
+template <int C, int HD, int JC>
+bool gdnc_scan_smem_ok(int dev) {
+    constexpr int kMaxDevices = 16;
+    static int cfg[kMaxDevices] = {0};                 // 0 unknown, 1 usable, 2 refused
+    if (dev < 0 || dev >= kMaxDevices) return false;
+    if (!cfg[dev]) {
+        constexpr size_t sm = gdnc_scan_smem<C, HD, JC>();
+        const cudaError_t ce = cudaFuncSetAttribute(
+            pf_gdnc_scan_kernel<C, HD, JC>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+        if (ce != cudaSuccess) cudaGetLastError();
+        cfg[dev] = (ce == cudaSuccess || sm <= 48u * 1024u) ? 1 : 2;
+    }
+    return cfg[dev] == 1;
+}
+
 }  // namespace
 
 bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
@@ -549,7 +615,10 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               float* state, void* out,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
                               bool qh_block, cudaStream_t stream) {
-    constexpr int C = 32, HD = 128, JC = 32, SCAN_THREADS = 256, PREP_THREADS = 256;
+    constexpr int C = 32, HD = 128, PREP_THREADS = 256;
+    // State columns per scan block. JC_S is the shape every context used before; JC_B halves the
+    // grid — see use_big below for why that is the whole point at long context.
+    constexpr int JC_S = 32, JC_B = 64;
 
     static const int enabled = [] {
         const char* e = getenv("SPARKINFER_PREFILL_GDN_CHUNK");
@@ -562,29 +631,46 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         // 256 was the Qwythos-era default; SPARKINFER_PREFILL_GDN_CHUNK_MINCTX=256 restores it.
         return e ? atoi(e) : 128;
     }();
+    // The scan block is far too big to double up on an SM (85 KB of the 100 KB an SM has, ncu:
+    // launch__occupancy_limit_shared_mem = 1), so the grid is the launch: v_heads x HD/JC blocks,
+    // one per SM, and any remainder past the SM count is a SECOND WAVE that costs a full serial
+    // chain to carry it. On this checkpoint (48 v-heads) JC=32 is 192 blocks on 170 SMs — 170 then
+    // 22 — so the launch is 56% efficient however fast the block itself is.
+    //
+    // JC=64 is 96 blocks: one wave, the same 1536 warps in flight (16 per block instead of 8), and
+    // half the W/K/Q staging per state column because one staged tile now serves 64 columns.
+    // Confirmed by the reverse experiment before building it: JC=16 is 384 blocks = three waves,
+    // and it measures ~21% slower on this kernel, which is what the wave count alone predicts.
+    //
+    // Gated on the NARROW GRID ACTUALLY SPILLING PAST ONE WAVE, not on the model or the context,
+    // because that spill IS the win — there is nothing else here to gain. A wider block is
+    // otherwise a straight loss: it costs ~1.65x the per-block time (16 warps queueing on the same
+    // __syncthreads) and leaves more SMs idle. Qwen3.5/3.6 carry 32 v-heads, so their narrow grid
+    // is 32*4 = 128 blocks and ALREADY fits one wave on 170 SMs; taking the wide block there halves
+    // the grid to 64 and cost the Qwen3.6 guard 6.1% at ctx=4096 (25487 -> 23924 pp, reproduced
+    // twice) while ctx=512 and every decode point stayed flat. Qwen3.8-27B carries 48, so 48*4 =
+    // 192 > 170, which is the case this exists for.
+    //
+    // Also gated on context: at ctx=128 the chain is 4 chunks long, too short for the second wave
+    // to pay for the wider block, and prefill@128 is a no-regression floor.
+    static const int bigjc_minctx = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_SCAN_BIGJC_MINCTX");
+        return e ? atoi(e) : 2048;
+    }();
 
     if (!enabled || head_dim != HD || n_tokens < minctx) return false;
-    if (q_heads <= 0 || v_heads <= 0 || (HD % JC) != 0) return false;
+    if (q_heads <= 0 || v_heads <= 0) return false;
 
     const size_t sm_prep = (size_t)2 * C * (HD + PAD) * sizeof(__nv_bfloat16)
                          + (size_t)C * (C + PAD) * sizeof(float)
                          + (size_t)3 * C * sizeof(float);
-    const size_t sm_scan = (size_t)HD * JC * sizeof(float)          // s_S (fp32 carrier)
-                         + (size_t)C * JC * sizeof(float)            // s_U
-                         + (size_t)C * (C + PAD) * sizeof(float)     // s_M
-                         + (size_t)2 * C * sizeof(float)             // s_g, s_eg
-                         + (size_t)C * JC * sizeof(float)            // s_Y
-                         + (size_t)3 * C * (HD + PAD) * sizeof(__nv_bfloat16)   // s_W, s_K, s_Q
-                         + (size_t)HD * (JC + PAD) * sizeof(__nv_bfloat16)      // s_Sb
-                         + (size_t)C * (JC + PAD) * sizeof(__nv_bfloat16);      // s_Ub
 
-    // sm_scan is ~68 KB — past the 48 KB default — so the MaxDynamicSharedMemorySize
-    // opt-in is REQUIRED for the scan launch to be valid. A discarded failure here used
-    // to still return true; the caller (launch_prefill_gdn_scan) then skipped the
-    // sequential pf_gdn_scan_kernel fallback and left GDN state/out untouched — silently
-    // wrong recurrence into decode. cudaFuncSetAttribute is also PER-DEVICE, so the
-    // do-once latch is keyed on the device ordinal (a process-wide latch left every
-    // device but the first unconfigured).
+    // The MaxDynamicSharedMemorySize opt-in is REQUIRED for either scan launch to be valid (both
+    // are past the 48 KB default). A discarded failure here used to still return true; the caller
+    // (launch_prefill_gdn_scan) then skipped the sequential pf_gdn_scan_kernel fallback and left
+    // GDN state/out untouched — silently wrong recurrence into decode. cudaFuncSetAttribute is
+    // also PER-DEVICE, so the do-once latch is keyed on the device ordinal (a process-wide latch
+    // left every device but the first unconfigured).
     constexpr int kMaxDevices = 16;
     static int cfg[kMaxDevices] = {0};
     int dev = 0;
@@ -594,22 +680,25 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
             pf_gdnc_prep_kernel<C, HD>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_prep);
         if (ce_prep != cudaSuccess && sm_prep > 48u * 1024u) return false;
-        const cudaError_t ce_scan = cudaFuncSetAttribute(
-            pf_gdnc_scan_kernel<C, HD, JC>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_scan);
-        // Scan is the load-bearing raise (~68 KB); prep is under 48 KB on current shapes
-        // but check both when over the default so a refused opt-in falls through.
-        if (ce_scan != cudaSuccess && sm_scan > 48u * 1024u) return false;
         cfg[dev] = 1;
     }
+    if (!gdnc_scan_smem_ok<C, HD, JC_S>(dev)) return false;
+    // JC_B is ~89 KB and only the wide shape; a device that refuses it just keeps JC_S.
+    const int sms = gdnc_sm_count();
+    const bool spills = sms > 0 && v_heads * (HD / JC_S) > sms;
+    const bool use_big = spills && n_tokens >= bigjc_minctx &&
+                         gdnc_scan_smem_ok<C, HD, JC_B>(dev);
 
     auto db = reinterpret_cast<const __nv_bfloat16*>(dt);
     auto aa = reinterpret_cast<const __nv_bfloat16*>(a);
 
     // PREP_THREADS is fixed by the 2x2 (i,j) tiling in the A/M pass: C*C == 4*PREP_THREADS.
     static_assert(C * C == PREP_THREADS * 4, "2x2 A/M tiling requires C*C == 4*PREP_THREADS");
-    static_assert(C * JC == SCAN_THREADS * 4, "2x2 tiling requires C*JC == 4*SCAN_THREADS");
-    static_assert(HD * JC == SCAN_THREADS * 16, "4x4 tiling requires HD*JC == 16*SCAN_THREADS");
+    // One thread per 4 [C,JC] outputs and per 16 [HD,JC] outputs; both fix the same block size,
+    // which is why the warp count is derivable from JC alone (NW = C*JC/128 in the kernel).
+    static_assert(C * JC_S == (C * JC_S / 4) * 4 && HD * JC_S == (C * JC_S / 4) * 16, "JC_S tiling");
+    static_assert(C * JC_B == (C * JC_B / 4) * 4 && HD * JC_B == (C * JC_B / 4) * 16, "JC_B tiling");
+    static_assert(HD % JC_S == 0 && HD % JC_B == 0, "JC must divide the state rows");
 
     // One sequence-slice: workspace is O(len). carry=0 zeros S (fresh prefill);
     // carry=1 reloads the state the previous slice wrote.
@@ -635,10 +724,19 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
             qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
             len, q_heads, v_heads, qh_block);
-        dim3 gscan(v_heads, HD / JC);
-        pf_gdnc_scan_kernel<C, HD, JC><<<gscan, SCAN_THREADS, sm_scan, stream>>>(
-            qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
-            len, q_heads, v_heads, n_chunks, qh_block, carry);
+        if (use_big) {
+            pf_gdnc_scan_kernel<C, HD, JC_B>
+                <<<dim3(v_heads, HD / JC_B), (C * JC_B) / 4,
+                   gdnc_scan_smem<C, HD, JC_B>(), stream>>>(
+                    qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
+                    len, q_heads, v_heads, n_chunks, qh_block, carry);
+        } else {
+            pf_gdnc_scan_kernel<C, HD, JC_S>
+                <<<dim3(v_heads, HD / JC_S), (C * JC_S) / 4,
+                   gdnc_scan_smem<C, HD, JC_S>(), stream>>>(
+                    qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
+                    len, q_heads, v_heads, n_chunks, qh_block, carry);
+        }
         return cudaPeekAtLastError() == cudaSuccess;
     };
 

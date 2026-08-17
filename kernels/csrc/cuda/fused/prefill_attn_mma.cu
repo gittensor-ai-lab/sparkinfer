@@ -306,7 +306,7 @@ inline int attn_smem_pad() {
 }
 
 template <int HEAD_DIM, int GROUP_BLKS, int RQH>
-__global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_mma_gqa_kernel(
+__global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 3 ? 2 : 1)) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
     const __half* __restrict__ v_scale, const int* __restrict__ block_table,
@@ -333,9 +333,15 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_m
     // Per-q-head Q(int8), P(int8), scores(float); shared K/V scales; per-(qh,row) softmax state.
     signed char* s_qi = reinterpret_cast<signed char*>(mma_smem);   // [RQH][BM][qld]
     signed char* s_pi = s_qi + (size_t)RQH * BM * qld;               // [RQH][BM][pld]
+    // s_o OVERLAYS s_s. The scores are dead by the epilogue -- the last read of s_s is the P
+    // quantization inside the softmax section, and the PV mma after it touches only s_pi/s_ps/
+    // s_corr -- so the landing zone costs nothing on top of the score buffer it lands in. That
+    // is what makes RQH=3 fit: 46,528 B against the 51,200 a second resident block needs, where
+    // holding both buffers is 62,912 and caps this kernel at one block per SM.
+    constexpr int SBLK = (RQH * BM * GN > BM * HEAD_DIM) ? RQH * BM * GN : BM * HEAD_DIM;
     float* s_s  = reinterpret_cast<float*>(s_pi + (size_t)RQH * BM * pld); // [RQH][BM][GN]
-    float* s_o  = s_s + (size_t)RQH * BM * GN;                       // [BM][HEAD_DIM] epilogue landing
-    float* s_ks = s_o + BM * HEAD_DIM;                               // [GN] shared
+    float* s_o  = s_s;                                               // [BM][HEAD_DIM] epilogue landing
+    float* s_ks = s_s + SBLK;                                        // [GN] shared
     float* s_vs = s_ks + GN;                                         // [GN] shared
     float* s_qs = s_vs + GN;                                         // [RQH][BM]
     float* s_ps = s_qs + RQH * BM;                                   // [RQH][BM]
@@ -559,10 +565,11 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
     // small-context first call, after which every padded launch failed and silently fell back --
     // measured as -45% at ctx=16384 and -34% on the Qwen3.6 guard at ctx=4096, with no diagnostic.
     const int qld_max = HD + attn_smem_pad(), pld_max = GN + attn_smem_pad();
+    // s_o lands in s_s (dead by the epilogue), so the pair costs the larger of the two.
+    constexpr int SBLK = (RQH * BM * GN > BM * HD) ? RQH * BM * GN : BM * HD;
     const size_t sm = (size_t)RQH * BM * qld                         // s_qi (int8, padded)
                     + (size_t)RQH * BM * pld                         // s_pi (int8, padded)
-                    + (size_t)(RQH * BM * GN) * sizeof(float)        // s_s
-                    + (size_t)(BM * HD) * sizeof(float)              // s_o
+                    + (size_t)SBLK * sizeof(float)                   // s_s, with s_o overlaid
                     + (size_t)(2 * GN + 5 * RQH * BM) * sizeof(float);
     // At RQH=4 this is 76,032 B — past the 48 KB default, so the opt-in below is
     // REQUIRED for the launch to be valid, and both it and the launch itself have to
@@ -580,8 +587,7 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
     if (!cfg[dev]) {
         const size_t sm_max = (size_t)RQH * BM * qld_max
                             + (size_t)RQH * BM * pld_max
-                            + (size_t)(RQH * BM * GN) * sizeof(float)
-                            + (size_t)(BM * HD) * sizeof(float)
+                            + (size_t)SBLK * sizeof(float)
                             + (size_t)(2 * GN + 5 * RQH * BM) * sizeof(float);
         const cudaError_t ce = cudaFuncSetAttribute(
             pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH>,
@@ -624,7 +630,7 @@ bool launch_prefill_attn_mma(
     static const int gqa_rqh = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_GQA_RQH");
         const int v = e ? atoi(e) : 4;
-        return (v == 1 || v == 2 || v == 4) ? v : 4;
+        return (v == 1 || v == 2 || v == 3 || v == 4) ? v : 4;
     }();
 
     if (!enabled || head_dim != HD || block_size != 16 || n_tokens < minctx) return false;
@@ -637,6 +643,22 @@ bool launch_prefill_attn_mma(
     // returning success over an output buffer nothing wrote.
     if (gqa_rqh == 4 && gqa % 4 == 0 &&
         launch_attn_gqa<HD, GROUP_BLKS, 4>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream))
+        return true;
+    // RQH=3 exists for GQA-6 (this checkpoint: 24 q-heads over 4 kv-heads), where 4 does not
+    // divide the group and the tier above always falls through to 2. ncu at ctx=16384 puts this
+    // kernel at 80.3% of peak L2 throughput with DRAM at 1.7% -- it is bound by re-reading the
+    // same K/V pages out of L2, not by the tensor cores (SM 62.7%). RQH=3 loads each K page and V
+    // tile once for THREE q-heads instead of two, which is 1/3 off the dominant traffic term, and
+    // with s_o overlaid on s_s it still fits the two resident blocks its __launch_bounds__ asks
+    // for. Ordered after 4 and before 2 so a group that divides by 4 keeps the wider tier.
+    //
+    // Long context only, for the same reason the shared-memory padding is: the win is the L2
+    // re-read, which only dominates once the window is long. At ctx=128 there is no re-read to
+    // save and the wider block costs registers -- measured +1.9% at ctx=16384 against -0.45% on
+    // prefill@128, which is a no-regression floor.
+    if (gqa_rqh >= 3 && gqa % 3 == 0 && n_tokens >= 2048 &&
+        launch_attn_gqa<HD, GROUP_BLKS, 3>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
             n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream))
         return true;
     if (gqa_rqh >= 2 && gqa % 2 == 0 &&
