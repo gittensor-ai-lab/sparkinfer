@@ -287,13 +287,31 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
 // RQH=1 is bit-identical to the per-head kernel. Math (mask, online softmax, int8
 // round) is unchanged -- only the load ordering differs.
 // ============================================================================
+// Shared-memory row padding for the int8 wmma operands. Without it s_qi's row stride is HEAD_DIM
+// (256 B = 64 banks) and s_pi's is GN (128 B = 32 banks), both exact multiples of the 128-byte bank
+// row, so all 16 rows of a tile start on bank 0 and every ldmatrix replays 16-way. Measured on the
+// unpadded kernel at ctx=16384: 2.48e9 shared-load bank conflicts over 3.27e9 wavefronts for
+// 4.37e8 instructions -- 7.5 wavefronts per instruction against an ideal of 1, which is why the
+// tensor pipe sits at 20.5% while the stalls are mio_throttle and short_scoreboard.
+// +16 B keeps the 16-byte alignment int8 ldmatrix requires and takes gcd(stride/4, 32) from 32 to
+// 4, i.e. 8 distinct starting banks instead of 1 (16-way -> 2-way).
+// SPARKINFER_PREFILL_ATTN_SMEM_PAD=0 restores the packed layout (A/B in ONE binary).
+inline int attn_smem_pad() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_SMEM_PAD");
+        const int x = e ? atoi(e) : 16;
+        return (x == 0 || x == 16 || x == 32) ? x : 16;
+    }();
+    return v;
+}
+
 template <int HEAD_DIM, int GROUP_BLKS, int RQH>
 __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
     const __half* __restrict__ v_scale, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale, int win_blocks) {
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, int qld, int pld) {
     using namespace nvcuda::wmma;
     constexpr int BM    = 16;
     constexpr int GN    = GROUP_BLKS * 16;
@@ -313,9 +331,9 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_m
 
     extern __shared__ char mma_smem[];
     // Per-q-head Q(int8), P(int8), scores(float); shared K/V scales; per-(qh,row) softmax state.
-    signed char* s_qi = reinterpret_cast<signed char*>(mma_smem);   // [RQH][BM][HEAD_DIM]
-    signed char* s_pi = s_qi + (size_t)RQH * BM * HEAD_DIM;          // [RQH][BM][GN]
-    float* s_s  = reinterpret_cast<float*>(s_pi + (size_t)RQH * BM * GN); // [RQH][BM][GN]
+    signed char* s_qi = reinterpret_cast<signed char*>(mma_smem);   // [RQH][BM][qld]
+    signed char* s_pi = s_qi + (size_t)RQH * BM * qld;               // [RQH][BM][pld]
+    float* s_s  = reinterpret_cast<float*>(s_pi + (size_t)RQH * BM * pld); // [RQH][BM][GN]
     float* s_o  = s_s + (size_t)RQH * BM * GN;                       // [BM][HEAD_DIM] epilogue landing
     float* s_ks = s_o + BM * HEAD_DIM;                               // [GN] shared
     float* s_vs = s_ks + GN;                                         // [GN] shared
@@ -360,7 +378,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_m
             if (lane == 0) s_qs[h * BM + r] = d;
             #pragma unroll
             for (int e = 0; e < QE; e++)
-                s_qi[((size_t)h * BM + r) * HEAD_DIM + lane + e * 32] =
+                s_qi[((size_t)h * BM + r) * qld + lane + e * 32] =
                     (signed char)((amax == 0.f) ? 0 : (int)roundf(qv[e] / d));
         }
     }
@@ -404,7 +422,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_m
                     load_matrix_sync(bf, kb + ks * 16, KVLD);        // K fragment: loaded once
                     #pragma unroll
                     for (int h = 0; h < RQH; h++) {
-                        load_matrix_sync(af, s_qi + ((size_t)h * BM) * HEAD_DIM + ks * 16, HEAD_DIM);
+                        load_matrix_sync(af, s_qi + ((size_t)h * BM) * qld + ks * 16, qld);
                         mma_sync(cf[h], af, bf, cf[h]);
                     }
                 }
@@ -421,7 +439,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_m
                 const int qh_head = head0 + h;
                 const int* s_si = reinterpret_cast<const int*>(s_s) + (size_t)h * BM * GN;
                 float* s_sh = s_s + (size_t)h * BM * GN;
-                signed char* s_pih = s_pi + (size_t)h * BM * GN;
+                signed char* s_pih = s_pi + (size_t)h * BM * pld;
                 #pragma unroll
                 for (int rr = 0; rr < BM / WARPS; rr++) {
                     const int r = warp * (BM / WARPS) + rr;
@@ -481,7 +499,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 2 ? 2 : 1)) void pf_attn_m
                     load_matrix_sync(bf, vb, KVLD);                  // V fragment: loaded once
                     #pragma unroll
                     for (int h = 0; h < RQH; h++) {
-                        load_matrix_sync(af, s_pi + (size_t)h * BM * GN + ks * 16, GN);
+                        load_matrix_sync(af, s_pi + (size_t)h * BM * pld + ks * 16, pld);
                         mma_sync(cf[h], af, bf, cf[h]);
                     }
                 }
@@ -528,8 +546,21 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                             int block_size, int max_blocks_per_seq, float scale, int win_blocks,
                             cudaStream_t stream) {
     constexpr int BM = 16, GN = GROUP_BLKS * 16;
-    const size_t sm = (size_t)RQH * BM * HD                          // s_qi (int8)
-                    + (size_t)RQH * BM * GN                          // s_pi (int8)
+    // Only at long context. The padding costs ~1 KB of shared memory per block, which is enough to
+    // push this kernel past the 2-blocks-per-SM occupancy its __launch_bounds__ asks for at RQH<=2.
+    // Where attention dominates (ctx>=2048) trading that occupancy for 8x fewer ldmatrix replays is
+    // strongly positive; where it does not, the occupancy is worth more than the conflicts --
+    // measured on the Qwen3.6 guard at ctx=512, padding unconditionally cost 5.8% (9993 -> 9410 pp)
+    // while the same build at ctx=4096 was +0.3% and Qwen3.8 at ctx=16384 was +5.1%.
+    const int pad = (n_tokens >= 2048) ? attn_smem_pad() : 0;
+    const int qld = HD + pad, pld = GN + pad;
+    // The opt-in below is latched once per device, so it MUST be raised to the largest size any
+    // later launch can ask for. Sizing it from THIS call's pad locked in the unpadded size on a
+    // small-context first call, after which every padded launch failed and silently fell back --
+    // measured as -45% at ctx=16384 and -34% on the Qwen3.6 guard at ctx=4096, with no diagnostic.
+    const int qld_max = HD + attn_smem_pad(), pld_max = GN + attn_smem_pad();
+    const size_t sm = (size_t)RQH * BM * qld                         // s_qi (int8, padded)
+                    + (size_t)RQH * BM * pld                         // s_pi (int8, padded)
                     + (size_t)(RQH * BM * GN) * sizeof(float)        // s_s
                     + (size_t)(BM * HD) * sizeof(float)              // s_o
                     + (size_t)(2 * GN + 5 * RQH * BM) * sizeof(float);
@@ -547,10 +578,15 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDevices) return false;
     if (!cfg[dev]) {
+        const size_t sm_max = (size_t)RQH * BM * qld_max
+                            + (size_t)RQH * BM * pld_max
+                            + (size_t)(RQH * BM * GN) * sizeof(float)
+                            + (size_t)(BM * HD) * sizeof(float)
+                            + (size_t)(2 * GN + 5 * RQH * BM) * sizeof(float);
         const cudaError_t ce = cudaFuncSetAttribute(
             pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
-        if (ce != cudaSuccess && sm > 48u * 1024u) return false;  // opt-in refused where it is required
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_max);
+        if (ce != cudaSuccess && sm_max > 48u * 1024u) return false;  // opt-in refused where required
         cfg[dev] = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
@@ -558,7 +594,7 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
-        block_size, max_blocks_per_seq, scale, win_blocks);
+        block_size, max_blocks_per_seq, scale, win_blocks, qld, pld);
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek —
     // rather than get — so a pre-existing sticky error is not silently cleared here.
     return cudaPeekAtLastError() == cudaSuccess;

@@ -604,9 +604,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const Qwen35LayerWeights* gdn_probe = nullptr;
     for (const auto& lw : s.w.layers)
         if (lw.linear_attn) { gdn_probe = &lw; break; }
+    // Long context takes this arm too. The 2048 bound rested on two claims, and measurement on an
+    // RTX 5090 contradicts both. (a) "the saving is a per-layer FIXED cost, worth the most where N
+    // is small": it is not only the avoided NVFP4->bf16->int8 expansion -- the block-scaled GEMM
+    // itself replaces the int8 GEMM, and at ctx=16384 those 48x3 projections are 144 of the 208
+    // pf_gemm_i8 launches that make up 22.9% of the pass (nsys), so extending the arm is worth
+    // +7.7% prefill@16k (9660 -> 10404 pp, medians of 3 alternated rounds, reps=5).
+    // (b) "the GDN recurrence amplifies activation-quant error with sequence length": batched
+    // prefill against the token-loop reference in the same build agrees 24/24 = 1.000 at N =
+    // 512 / 2048 / 8192 / 16384 with this arm on -- identical to the int8 arm at every one of
+    // those lengths, so the FP4 activations do not drift as the recurrence lengthens.
+    // The third claim ("a fixed bound keeps the scored ctx=128 shape off the VRAM-derived FC") is
+    // untouched: 128 was already inside the bound, and prefill@128 and decode@128 both measure flat.
     static const int gdn_fp4_maxn = [] {
         const char* e = getenv("SPARKINFER_Q38_GDN_NVFP4_MAXN");
-        return e ? atoi(e) : 2048;
+        return e ? atoi(e) : (1 << 30);
     }();
     const bool gdn_nvfp4 = gdn_fp4_env && !moe && gdn_probe && gdn_probe->gdn_qkv_fp4 &&
         N <= gdn_fp4_maxn &&

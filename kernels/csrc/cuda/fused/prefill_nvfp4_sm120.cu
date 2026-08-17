@@ -154,6 +154,25 @@ using Narrow = Cfg<Shape<_128, _64, _256>>;
 // measure it without a rebuild between arms.
 using WideEF = Cfg<Shape<_128, _128, _256>, true>;
 using NarrowEF = Cfg<Shape<_128, _64, _256>, true>;
+// Both tiles above are M=128 because they were chosen for the scored ctx=128, where the grid is
+// exactly one CTA tall and only N matters. Long-context prefill runs the SAME GEMMs at m=16384
+// (FFN chunks and the GDN projections), where an M=128 tile reloads each B tile once per 128 rows
+// -- 128 times over the operand. A taller tile amortises that. SPARKINFER_NVFP4_BIG_TILE picks:
+//   1 = 256x128, 2 = 128x256, 3 = 256x256   (0 = off, keep the M=128 tiles)
+// K tile halved to 128: at 256 the MN-larger tiles need more smem per stage than
+// StageCountAutoCarveout can carve two stages out of, which CUTLASS rejects outright.
+// Measured at ctx=16384 against 128x128x256: 256x128x128 +6.7%, 128x256x128 -14%, 256x256x64 -76%
+// (K=64 leaves the mainloop too little per stage). M is the axis that pays. 384x128 / 512x128 /
+// 256x64x256 do not compile -- CUTLASS cannot carve two mainloop stages out of their shared memory
+// -- and non-power-of-two tiles fail cute's stride-divisibility and the epilogue's
+// MMA_TILE_M | EPI_TILE_M check, so 256x128x128 is the reachable optimum.
+using BigM = Cfg<Shape<_256, _128, _128>, true>;
+// M is the axis that pays (256x128 beat 128x128 by 6.7% at m=16384 while 128x256 lost 14%), so
+// probe further up it. K stays >=128: at 64 the mainloop has too few elements per stage to cover
+// its own latency and the GEMM collapses (measured 2494 pp, a 4x loss).
+// EVICT_FIRST on B stays correct at this tile too: dropping it measured 11310 vs 11409 pp.
+// Non-power-of-two tiles are not reachable: K=192 fails cute's stride-divisibility check and
+// M=192 fails the epilogue's "MMA_TILE_M must divide EPI_TILE_M", so 256x128x128 stands.
 
 using Gemm = typename Wide::Gemm;
 using Kernel = typename Wide::Kernel;
@@ -368,6 +387,14 @@ size_t prefill_nvfp4_scale_bytes_a(int m, int k) {
 size_t prefill_nvfp4_scale_bytes_b(int n, int k) {
     return (size_t)cute::size(cute::filter_zeros(sfb_layout(128,n,k)));
 }
+int nvfp4_big_tile() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_BIG_TILE");
+        const int x = e ? atoi(e) : 1;
+        return (x == 0 || x == 1) ? x : 1;
+    }();
+    return v;
+}
 size_t prefill_nvfp4_workspace_bytes(int m, int n, int k) {
     // Either tiling may run for a given shape, so the caller's buffer has to cover both.
     const size_t w = Wide::Gemm::get_workspace_size(
@@ -419,6 +446,14 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
         const char* e = getenv("SPARKINFER_NVFP4_EVICT_FIRST");
         return !e || atoi(e) != 0;
     }();
+    // Long-context: a taller/wider tile than the m=128-tuned pair above. Gated on a many-CTA-tall
+    // grid so the scored ctx=128 shape is untouched, and it falls through if CUTLASS cannot
+    // implement the shape.
+    const int big = nvfp4_big_tile();
+    if (big && m >= 512) {
+        if (run_gemm<BigM>(a,sa,b,sb,d,m,n,k,ws,st,alpha)) return true;
+
+    }
     if (ef)
         return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha)
                                   : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha);
