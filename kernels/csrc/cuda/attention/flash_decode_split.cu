@@ -394,6 +394,9 @@ __global__ void fa_combine_gated_q8_kernel(
 #ifndef FA_GQA_TILE
 #define FA_GQA_TILE 14      // bf16 smem + uint4 ldg sweet spot at n_splits=128
 #endif
+#ifndef FA_GQA6_TILE
+#define FA_GQA6_TILE 8     // Qwen3.8-27B hd256 GQA-6 (24Q/4KV); independently sweepable
+#endif
 #ifndef FA_GQA4_TILE
 #define FA_GQA4_TILE 8     // Qwythos hd256 GQA-4 (16Q/4KV); independently sweepable
 #endif
@@ -483,6 +486,7 @@ template __global__ void fa_combine_gated_q8_kernel<256, FA_COMBINE_DG, 16>(
 // hd256 GQA-4 MMA needs 8 warps (128-token KV groups) even though only 4 q-rows are live.
 template <int HEAD_DIM, int GQA> struct fa_mma_block_threads { static constexpr int v = GQA * 32; };
 template <> struct fa_mma_block_threads<256, 4> { static constexpr int v = 256; };
+template <> struct fa_mma_block_threads<256, 6> { static constexpr int v = 256; };
 
 // Tensor-core (wmma int8) GQA flash-decode split for long context. The 8 GQA q-heads of a kv-head are
 // the batch (M) dim, so S = Q·Kᵀ and O = P·V become small matmuls on the tensor cores, replacing the
@@ -689,6 +693,12 @@ template __global__ void fa_split_gqa_mma_i8_kernel<256, 4>(const __nv_bfloat16*
     const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
     const __half*, const __half*);
 #endif
+// Qwen3.8-27B full-attn: 24Q/4KV hd256 — same kernel again, M = 6 rows padded to the 16-row mma.
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_mma_i8_kernel<256, 6>(const __nv_bfloat16*, const signed char*,
+    const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
+    const __half*, const __half*);
+#endif
 template <int NW>
 static inline void fa_launch_combine(
     const float* part_m, const float* part_l, const float* part_acc,
@@ -856,6 +866,57 @@ void launch_flash_decode_split(
                         part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
                         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
             }
+            combine_hd256(out_q8);
+            (void)seqlen;
+            return;
+        }
+        // Qwen3.8-27B: 24Q/4KV full-attn. The shared-KV tile above is instantiated for GQA 4 and
+        // 8 only, so a 6:1 group fell through to the scalar one-warp-per-block kernel, where every
+        // q-head re-reads its group's K and V from global. At ctx=16384 that is the whole
+        // long-context cost of decode: the split pass moves 67.1 MB per layer per token at
+        // 635 GB/s, 35% of this part's bandwidth, and 13.8% of the decode step. Staging the tile
+        // once per (kv head, split) reads each K/V byte once for all six q-heads instead of six
+        // times. Same partials, same layout, same combine pass -- only who reads the KV changes.
+        // SPARKINFER_FAGQA6=0 restores the scalar kernel (A/B in ONE binary).
+        static int fagqa6 = -1;
+        if (fagqa6 < 0) { const char* e = getenv("SPARKINFER_FAGQA6"); fagqa6 = (e && e[0] == '0') ? 0 : 1; }
+        if (fagqa6 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 6) {
+            constexpr int GQA = 6, TILE = FA_GQA6_TILE;
+            dim3 gq(num_kv_heads * n_splits, num_seqs);
+            // int8 tensor-core arm, same as the 4:1 and 8:1 groups already take: Q and P go to
+            // int8 so QK and PV run on the int8 tensor cores, and the KV global read halves
+            // again. M is the group's 6 q-heads padded to the 16-row mma; blockDim stays 256
+            // because the mainloop gives one of its 8 warps to each of 8 KV blocks per iteration,
+            // which is independent of GQA. SPARKINFER_FAMMA6=0 keeps the bf16 tile kernel.
+            static int famma6 = -1;
+            if (famma6 < 0) { const char* e = getenv("SPARKINFER_FAMMA6"); famma6 = (e && e[0] == '0') ? 0 : 1; }
+            if (mma_ok256 && int8_kv && famma6) {
+                constexpr int MMA_THREADS = fa_mma_block_threads<256, GQA>::v;
+                const size_t i8_smem = (size_t)2 * 16 * 256 * sizeof(signed char)
+                                     + (size_t)(16 + GQA) * 256 * sizeof(float)
+                                     + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
+                fa_split_gqa_mma_i8_kernel<256, GQA><<<gq, MMA_THREADS, i8_smem, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+                    reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                combine_hd256(out_q8);
+                (void)seqlen;
+                return;
+            }
+            const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
+            // int8_kv must use the <...,true> instantiation: it dequants int8 -> bf16 into the
+            // staged tile, and reading the int8 pool as bf16 would be garbage.
+            if (int8_kv)
+                fa_split_gqa_kernel<256, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+            else
+                fa_split_gqa_kernel<256, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
             combine_hd256(out_q8);
             (void)seqlen;
             return;
