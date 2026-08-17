@@ -171,6 +171,173 @@ auto shape(int m, int n, int k) { return cute::make_shape(m, n, k, 1); }
 auto sfa_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SFA(shape(m,n,k)); }
 auto sfb_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SFB(shape(m,n,k)); }
 
+// The GDN gated norm with the FP4 A-operand quantize folded in -- the third site where a norm's
+// output is immediately re-read and quantized (here `lnrm`, by the out projection).
+//
+// The existing pf_gated_norm_kernel puts ONE WARP on a (token, head) pair with lane-strided
+// elements (d = lane + r*32), which scatters a 16-value NVFP4 group across 16 lanes and makes the
+// packed store a cross-lane gather. This re-tiles instead: one block per TOKEN, 8 CONSECUTIVE
+// elements per thread. A head is then head_dim/8 consecutive lanes (16 at head_dim=128, so its
+// RMS reduction is a 4-step shuffle inside half a warp) and a scale group is exactly TWO lanes.
+//
+// Same arithmetic as pf_gated_norm_kernel: ss over the fp32 x, rsqrt(ss/head_dim + eps), and
+// x*inv*w*silu(z) rounded to bf16 -- and the quantize then reads that bf16-rounded value, so it
+// matches running the standalone quantizer on `lnrm` afterwards.
+template <class Layout>
+__global__ void gated_norm_nvfp4a_kernel(const __nv_bfloat16* __restrict__ x,
+                                         const __nv_bfloat16* __restrict__ z,
+                                         const __nv_bfloat16* __restrict__ wgt,
+                                         __nv_bfloat16* __restrict__ out,
+                                         unsigned char* __restrict__ dst,
+                                         cutlass::float_ue4m3_t* __restrict__ sf,
+                                         int cols, int head_dim, float eps, Layout layout) {
+    const int t = blockIdx.x, p = threadIdx.x;
+    const int tph = head_dim >> 3;            // threads per head (power of two, <= 32)
+    const int din = (p & (tph - 1)) << 3;     // element offset inside this head
+    const size_t base = (size_t)t * cols + (size_t)p * 8;
+
+    const uint4 xr = __ldg(reinterpret_cast<const uint4*>(x) + (base >> 3));
+    const uint4 zr = __ldg(reinterpret_cast<const uint4*>(z) + (base >> 3));
+    const uint4 wr = __ldg(reinterpret_cast<const uint4*>(wgt) + (din >> 3));
+    const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xr);
+    const __nv_bfloat162* zp = reinterpret_cast<const __nv_bfloat162*>(&zr);
+    const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&wr);
+    float xv[8], zv[8], wv[8], ss = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float2 a = __bfloat1622float2(xp[i]), b = __bfloat1622float2(zp[i]),
+                     c = __bfloat1622float2(wp[i]);
+        xv[2*i] = a.x; xv[2*i+1] = a.y;
+        zv[2*i] = b.x; zv[2*i+1] = b.y;
+        wv[2*i] = c.x; wv[2*i+1] = c.y;
+    }
+    #pragma unroll
+    for (int j = 0; j < 8; j++) ss += xv[j] * xv[j];
+    for (int d = 1; d < tph; d <<= 1) ss += __shfl_xor_sync(0xffffffffu, ss, d);
+    const float inv = rsqrtf(ss / (float)head_dim + eps);
+
+    float on[8]; __nv_bfloat162 no[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float s0 = 1.f / (1.f + __expf(-zv[2*i])), s1 = 1.f / (1.f + __expf(-zv[2*i+1]));
+        no[i] = __floats2bfloat162_rn(xv[2*i]   * inv * wv[2*i]   * (zv[2*i]   * s0),
+                                      xv[2*i+1] * inv * wv[2*i+1] * (zv[2*i+1] * s1));
+        const float2 rb = __bfloat1622float2(no[i]);   // quantize the BF16-ROUNDED output
+        on[2*i] = rb.x; on[2*i+1] = rb.y;
+    }
+    *(reinterpret_cast<uint4*>(out) + (base >> 3)) = *reinterpret_cast<const uint4*>(no);
+
+    float a = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) a = fmaxf(a, fabsf(on[j]));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
+    cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
+    unsigned int packed = 0;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        cutlass::float_e2m1_t q(on[j] / float(qs));
+        packed |= (unsigned int)(q.raw() & 15u) << (4 * j);
+    }
+    *reinterpret_cast<unsigned int*>(dst + (base >> 1)) = packed;
+    if ((p & 1) == 0) {
+        auto scales = cute::make_tensor(sf, layout);
+        scales(t, (p >> 1) * 16, 0) = qs;
+    }
+}
+
+// add_rmsnorm2 with the FP4 A-operand quantize folded in.
+//
+// Every batched-prefill GEMM group is preceded by a norm whose output it immediately quantizes:
+// the FFN reads `hn` straight out of the post-attention add+norm, and the GDN/attention groups read
+// `xn` out of the end-of-layer one. That is a whole kernel and a whole re-read of an N x H tensor
+// per site per layer for work the norm already had in registers.
+//
+// Specialised the same way add_rmsnorm2_q8_kernel is: exactly one 8-wide pack per thread
+// (blockDim*8 == cols), which makes a 16-value NVFP4 scale group exactly TWO adjacent lanes, so the
+// group amax is a single shuffle. Requires cols % 128 == 0 (the layout already demands it) and
+// cols <= 8192 so cols/8 fits a block.
+//
+// Numerically identical to running the two kernels back to back: `ss` accumulates on the fp32 sum
+// exactly as add_rmsnorm2_kernel does, out_norm is formed from the BF16-ROUNDED sum exactly as it
+// does, and the quantize then reads that same bf16-rounded out_norm -- the invariant
+// add_rmsnorm2_q8_kernel already relies on for its Q8_1 side output.
+template <class Layout>
+__global__ void add_rmsnorm2_nvfp4a_kernel(const __nv_bfloat16* __restrict__ x,
+                                           const __nv_bfloat16* __restrict__ res,
+                                           const __nv_bfloat16* __restrict__ wgt,
+                                           __nv_bfloat16* __restrict__ out_sum,
+                                           __nv_bfloat16* __restrict__ out_norm,
+                                           unsigned char* __restrict__ dst,
+                                           cutlass::float_ue4m3_t* __restrict__ sf,
+                                           int cols, float eps, Layout layout) {
+    const int row = blockIdx.x, p = threadIdx.x;
+    const size_t base = (size_t)row * cols;
+    __shared__ float s_warp[32];
+
+    const uint4 xr = __ldg(reinterpret_cast<const uint4*>(x + base) + p);
+    const uint4 rr = __ldg(reinterpret_cast<const uint4*>(res + base) + p);
+    const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xr);
+    const __nv_bfloat162* rp = reinterpret_cast<const __nv_bfloat162*>(&rr);
+    float sv[8]; float ss = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float2 a = __bfloat1622float2(xp[i]), b = __bfloat1622float2(rp[i]);
+        sv[2 * i] = a.x + b.x; sv[2 * i + 1] = a.y + b.y;
+    }
+    #pragma unroll
+    for (int j = 0; j < 8; j++) ss = __fmaf_rn(sv[j], sv[j], ss);
+    // out_sum is the bf16 rounding of the fp32 sum; keep the rounded copy for the norm below so
+    // this matches add_rmsnorm2_kernel, which RE-READS out_sum rather than reusing sv.
+    __nv_bfloat162 so[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) so[i] = __floats2bfloat162_rn(sv[2 * i], sv[2 * i + 1]);
+    *(reinterpret_cast<uint4*>(out_sum + base) + p) = *reinterpret_cast<const uint4*>(so);
+
+    #pragma unroll
+    for (int d = 16; d; d >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, d);
+    if ((p & 31) == 0) s_warp[p >> 5] = ss;
+    __syncthreads();
+    if (p < 32) {
+        float v = (p < (int)((blockDim.x + 31) / 32)) ? s_warp[p] : 0.f;
+        #pragma unroll
+        for (int d = 16; d; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
+        if (p == 0) s_warp[0] = rsqrtf(v / cols + eps);
+    }
+    __syncthreads();
+    const float inv_rms = s_warp[0];
+
+    const uint4 wr = __ldg(reinterpret_cast<const uint4*>(wgt) + p);
+    const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&wr);
+    const __nv_bfloat162* sp = reinterpret_cast<const __nv_bfloat162*>(so);
+    float on[8]; __nv_bfloat162 no[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float2 srf = __bfloat1622float2(sp[i]), wf = __bfloat1622float2(wp[i]);
+        const float o0 = srf.x * inv_rms * wf.x, o1 = srf.y * inv_rms * wf.y;
+        no[i] = __floats2bfloat162_rn(o0, o1);
+        const float2 rb = __bfloat1622float2(no[i]);   // quantize the BF16-ROUNDED out_norm
+        on[2 * i] = rb.x; on[2 * i + 1] = rb.y;
+    }
+    *(reinterpret_cast<uint4*>(out_norm + base) + p) = *reinterpret_cast<const uint4*>(no);
+
+    float a = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) a = fmaxf(a, fabsf(on[j]));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));      // group = two adjacent lanes
+    cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
+    unsigned int packed = 0;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        cutlass::float_e2m1_t q(on[j] / float(qs));
+        packed |= (unsigned int)(q.raw() & 15u) << (4 * j);
+    }
+    *reinterpret_cast<unsigned int*>(dst + ((base + (size_t)p * 8) >> 1)) = packed;
+    if ((p & 1) == 0) {
+        auto scales = cute::make_tensor(sf, layout);
+        scales(row, (p >> 1) * 16, 0) = qs;
+    }
+}
+
 template <class Layout>
 __global__ void quant_rows(const __nv_bfloat16* src, unsigned char* dst,
                            cutlass::float_ue4m3_t* sf, int rows, int cols, Layout layout) {
@@ -251,7 +418,7 @@ template <class Layout>
 __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
                                   const __nv_bfloat16* __restrict__ up,
                                   unsigned char* dst, cutlass::float_ue4m3_t* sf,
-                                  int rows, int cols, Layout layout) {
+                                  int rows, int cols, int src_stride, Layout layout) {
     // 8 values per lane instead of 2, so two lanes cover a 16-value scale group. The two operand
     // reads become one 16-byte load each instead of four 4-byte loads, the store becomes one
     // 4-byte store instead of four 1-byte ones, and the amax butterfly collapses from three
@@ -266,9 +433,12 @@ __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
     for (int grp = (blockIdx.x * blockDim.x + threadIdx.x) / LPG;
          grp < groups; grp += stride) {
         const int row = grp / (cols / V), k0 = (grp % (cols / V)) * V;
+        // src_stride is elements per row in `gate`/`up`; wider than cols when they are the two
+        // halves of one fused gate|up GEMM output read in place. dst keeps the tight `cols` stride.
         const size_t base = (size_t)row * cols + k0 + VPL * glane;
-        const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(gate + base);
-        const __nv_bfloat162* u2 = reinterpret_cast<const __nv_bfloat162*>(up + base);
+        const size_t sbase = (size_t)row * src_stride + k0 + VPL * glane;
+        const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(gate + sbase);
+        const __nv_bfloat162* u2 = reinterpret_cast<const __nv_bfloat162*>(up + sbase);
         float x[VPL];
         float a = 0.f;
         #pragma unroll
@@ -384,6 +554,38 @@ bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k
                                      (cutlass::float_ue4m3_t*)sf,m,k,l);
     return cudaPeekAtLastError() == cudaSuccess;
 }
+// Fused GDN gated-norm + FP4-quantize. False = shape unsupported, nothing written.
+bool launch_prefill_gated_norm_nvfp4_a(const void* x, const void* z, const void* w, void* out,
+                                       void* d, void* sf, int rows, int cols, int head_dim,
+                                       float eps, cudaStream_t st) {
+    if (!x || !z || !w || !out || !d || !sf) return false;
+    if (head_dim <= 0 || (head_dim & 7) || cols <= 0 || (cols % head_dim)) return false;
+    const int tph = head_dim >> 3;
+    if (tph < 1 || tph > 32 || (tph & (tph - 1))) return false;   // power of two, within a warp
+    if ((cols & 127) || (cols >> 3) > 1024) return false;
+    if (!prefill_nvfp4_supported(rows, 128, cols)) return false;
+    auto l = sfa_layout(rows, 128, cols);
+    gated_norm_nvfp4a_kernel<<<rows, cols >> 3, 0, st>>>(
+        (const __nv_bfloat16*)x, (const __nv_bfloat16*)z, (const __nv_bfloat16*)w,
+        (__nv_bfloat16*)out, (unsigned char*)d, (cutlass::float_ue4m3_t*)sf,
+        cols, head_dim, eps, l);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+// Fused add+RMSNorm+FP4-quantize. Returns false (having done nothing) unless the shape is one the
+// specialisation covers, so every caller keeps its existing two-kernel path as the fallback.
+bool launch_prefill_add_rmsnorm2_nvfp4_a(const void* x, const void* res, const void* w,
+                                         void* out_sum, void* out_norm, void* d, void* sf,
+                                         int rows, int cols, float eps, cudaStream_t st) {
+    if (!x || !res || !w || !out_sum || !out_norm || !d || !sf) return false;
+    if (cols <= 0 || (cols & 127) || (cols >> 3) > 1024) return false;
+    if (!prefill_nvfp4_supported(rows, 128, cols)) return false;
+    auto l = sfa_layout(rows, 128, cols);
+    add_rmsnorm2_nvfp4a_kernel<<<rows, cols >> 3, 0, st>>>(
+        (const __nv_bfloat16*)x, (const __nv_bfloat16*)res, (const __nv_bfloat16*)w,
+        (__nv_bfloat16*)out_sum, (__nv_bfloat16*)out_norm,
+        (unsigned char*)d, (cutlass::float_ue4m3_t*)sf, cols, eps, l);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
 bool launch_prefill_nvfp4_gate_quant_a(const void* sr, const void* g, void* d, void* sf,
                                        int m, int k, cudaStream_t st) {
     if (!sr || !g || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
@@ -394,13 +596,14 @@ bool launch_prefill_nvfp4_gate_quant_a(const void* sr, const void* g, void* d, v
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_swiglu_quant_a(const void* g, const void* u, void* d, void* sf,
-                                         int m, int k, cudaStream_t st) {
+                                         int m, int k, cudaStream_t st, int src_stride) {
     if (!g || !u || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
     auto l = sfa_layout(m,128,k);
+    const int ss = src_stride > 0 ? src_stride : k;
     // 2 lanes per 16-value scale group (see swiglu_quant_rows), so one thread per 8 values.
     int blocks = (m * (k / 16) * 2 + 255) / 256; if (blocks > 4096) blocks = 4096;
     swiglu_quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)g,(const __nv_bfloat16*)u,
-                                            (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,l);
+                                            (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,ss,l);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k, cudaStream_t st) {

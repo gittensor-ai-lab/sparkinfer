@@ -279,8 +279,32 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                 "batched pass\n", fc_before, FC, N, fb >> 20);
         }
     }
-    bf16* ffg  = a.alloc<bf16>((size_t)FC * ffn);        // ffn gate (12288), bounded to FC tokens
-    bf16* ffu  = a.alloc<bf16>((size_t)FC * ffn);        // ffn up,          bounded to FC tokens
+    // With a fused gate|up operand the GEMM emits [FC, 2*ffn] (gate then up PER ROW), so ffg/ffu
+    // become strided views of one buffer rather than two tight ones. Same total bytes either way,
+    // which is what keeps this VRAM-neutral at ctx=16384 where the FFN chunk is already competing
+    // for the last ~900 MB.
+    // ALL-OR-NOTHING, and it must be: ffg/ffu below become strided views of ONE buffer, so the
+    // layout is a property of the whole pass, not of a layer. keep_gu_cat is per-layer and can
+    // legitimately decline for some layers (it requires gate_proj and up_proj to share one
+    // weight_scale_2, which only holds when the checkpoint quantized them as one group), and
+    // keep_nvfp4 then frees the per-tensor FP4 payload for exactly the layers that DID fuse. So a
+    // mixed checkpoint has no single correct layout, and probing for the FIRST layer that fused
+    // committed the pass to a stride the other layers cannot satisfy -- measured on
+    // unsloth/Qwen3.8-27B-NVFP4 at ctx=16384, where one non-fused layer dropped the entire
+    // prefill to the token loop (8687 -> 80 pp). Require every layer, so the fallback is the
+    // ordinary tight-buffer path rather than a bail.
+    int gu_cat_layers = 0;
+    for (const auto& lw : s.w.layers)
+        if (lw.gate_up_cat_fp4 && lw.gate_up_cat_fp4_sf) gu_cat_layers++;
+    const bool gu_cat_live = !moe && !s.w.layers.empty() &&
+                             gu_cat_layers == (int)s.w.layers.size();
+    if (!s.w.layers.empty() && gu_cat_layers && !gu_cat_live)
+        fprintf(stderr, "[prefill] gate|up fused on %d/%zu layers -- not uniform, using the "
+                        "per-tensor layout\n", gu_cat_layers, s.w.layers.size());
+    bf16* ffgu = gu_cat_live ? a.alloc<bf16>((size_t)FC * ffn * 2) : nullptr;
+    bf16* ffg  = gu_cat_live ? ffgu       : a.alloc<bf16>((size_t)FC * ffn);
+    bf16* ffu  = gu_cat_live ? ffgu + ffn : a.alloc<bf16>((size_t)FC * ffn);
+    const int gu_src_stride = gu_cat_live ? 2 * ffn : ffn;
     bf16* ffh  = ffg;                                    // SwiGLU computed in-place into ffg (down reads it)
     bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
     int*  d_ids = a.alloc<int>((size_t)N);
@@ -511,7 +535,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // back on a throughput result alone, because throughput is what selected for the bug.
     // SPARKINFER_Q38_NVFP4=1 re-enables it for that debugging.
     const bool q38_nvfp4 = [&] {
-        if (!c.dense_ffn || c.muse_glimmer || s.w.layers.empty() || !s.w.layers[0].gate_fp4)
+        // gate_fp4 is null when the fused gate|up operand replaced the per-tensor pair, so probe
+        // for either form -- this predicate is what turns the whole FP4 FFN arm on.
+        if (!c.dense_ffn || c.muse_glimmer || s.w.layers.empty() ||
+            (!s.w.layers[0].gate_fp4 && !s.w.layers[0].gate_up_cat_fp4))
             return false;
         if (!kernels::prefill_nvfp4_supported(N, ffn, H)) return false;
         const char* e = getenv("SPARKINFER_Q38_NVFP4");
@@ -558,6 +585,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     size_t fp4_ws_bytes = (fp4_ws_qkv > fp4_ws_gu) ? fp4_ws_qkv : fp4_ws_gu;
     if (fp4_ws_wo > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_wo;
     if (fp4_ws_down > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_down;
+    // The fused gate|up GEMM is twice as wide as either half, so it wants a bigger CUTLASS
+    // workspace than any shape above. Sizing this here is what the arm's success depends on --
+    // an undersized ws is exactly how run_gemm declines and the pass falls to the token loop.
+    for (const auto& lw : s.w.layers) {
+        if (!lw.gate_up_cat_fp4) continue;
+        const size_t w2 = kernels::prefill_nvfp4_workspace_bytes(fp4_rows, lw.gate_up_cat_rows, H);
+        if (w2 > fp4_ws_bytes) fp4_ws_bytes = w2;
+        break;
+    }
     unsigned char* fp4_a = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
     unsigned char* fp4_as = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
     unsigned char* fp4_ws = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
@@ -613,24 +649,82 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         kernels::prefill_nvfp4_supported(N, lqkv, H) &&
         kernels::prefill_nvfp4_supported(N, lvdim, H) &&
         kernels::prefill_nvfp4_supported(N, H, lvdim);
+    // ---- full-attention q/k/v/o straight off the checkpoint's NVFP4 bytes ----
+    // The other half of the same expand-then-renarrow the GDN arm above deletes. On this
+    // checkpoint q/k/v/o are NVFP4, but the loader used to refit them to Q4_K, so every pass ran
+    // Q4_K -> int8 (deq_rows_i8_vec, measured 2.34 ms of a 21.4 ms pass) -> int8 GEMM. With the
+    // native payload kept instead (see keep_attn in qwen35.cpp) the same SM120 block-scaled GEMM
+    // the FFN and GDN already use reads the packed nibbles directly.
+    //
+    // Bounded by the same N as the GDN arm and for the same two reasons: the saving is a per-layer
+    // FIXED cost so it is worth most where N is small, and a fixed bound keeps the scored shape off
+    // the cudaMemGetInfo-derived FC.
+    //
+    // The A/B switch is SPARKINFER_Q38_ATTN_NVFP4=0 (qwen35.cpp), NOT this mask: the conversion is
+    // all-or-nothing, so once the payload is NVFP4 there are no Q4_K row scales left for the int8
+    // group to use and clearing a bit here drops that projection to the generic proj() path rather
+    // than to the path this replaced. The mask is for pricing q/k/v (bit 0) against o_proj (bit 1)
+    // while both operands exist -- it is a probe, not an escape hatch.
+    static const int attn_fp4_mask = [] {
+        const char* e = getenv("SPARKINFER_Q38_ATTN_NVFP4_PREFILL");
+        return e ? atoi(e) : 3;
+    }();
+    const Qwen35LayerWeights* attn_probe = nullptr;
+    for (const auto& lw : s.w.layers)
+        if (!lw.linear_attn) { attn_probe = &lw; break; }
+    const bool attn_nvfp4 = attn_fp4_mask != 0 && !moe && attn_probe &&
+        (attn_probe->wq_fp4 || attn_probe->qkv_cat) &&
+        N <= gdn_fp4_maxn &&
+        kernels::prefill_nvfp4_supported(N, wide, H) &&
+        kernels::prefill_nvfp4_supported(N, kvdim, H) &&
+        kernels::prefill_nvfp4_supported(N, H, qdim);
     // out_proj's A operand is `lnrm` at k = lvdim, which is WIDER than the FFN's k = H on this
     // model (6144 vs 5120), so fp4_a/fp4_as cannot be reused -- they would be overrun by a quarter
-    // of a row. One staging pair sized for the widest GDN k covers all three projections.
-    const int gdn_k = (lvdim > H) ? lvdim : H;
-    unsigned char* fp4_gdn_a = gdn_nvfp4
+    // of a row. One staging pair sized for the widest GDN k covers all three projections; the
+    // attention arm shares it, so size it for the widest k of EITHER (o_proj reads att at k=qdim).
+    int gdn_k = (lvdim > H) ? lvdim : H;
+    if (attn_nvfp4 && qdim > gdn_k) gdn_k = qdim;
+    // Fused q|k|v GEMM output: [N, q_out + 2*kvdim]. split_q_gate reads the leading [q|gate] in
+    // place with this row stride; k and v are copied out (256 KB each) rather than teaching
+    // qknorm_rope a stride.
+    const Qwen35LayerWeights* attn_cat_probe = nullptr;
+    for (const auto& lw : s.w.layers)
+        if (!lw.linear_attn) { attn_cat_probe = &lw; break; }
+    const int qkvc_n = (attn_cat_probe && attn_cat_probe->qkv_cat) ? attn_cat_probe->qkv_cat_rows : 0;
+    bf16* qkvc = nullptr;
+    // With the fused operand there is no per-tensor q/k/v left to fall back to -- wq/wk/wv all
+    // point at the concatenated payload, which any per-tensor reader would mis-offset. If this N
+    // cannot run the fused GEMM, hand the whole pass to the token loop instead of reading garbage.
+    if (qkvc_n && !kernels::prefill_nvfp4_supported(N, qkvc_n, H)) {
+        a.free_all(); a8.free_all();
+        fprintf(stderr, "[prefill] fused q|k|v operand unsupported at N=%d -> token loop\n", N);
+        return -1;
+    }
+    const bool fp4_stage = gdn_nvfp4 || attn_nvfp4;
+    if (qkvc_n && attn_nvfp4) qkvc = a.alloc<bf16>((size_t)N * qkvc_n);
+    unsigned char* fp4_gdn_a = fp4_stage
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, gdn_k)) : nullptr;
-    unsigned char* fp4_gdn_as = gdn_nvfp4
+    unsigned char* fp4_gdn_as = fp4_stage
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N, gdn_k)) : nullptr;
     // The three GDN shapes can each want more workspace than the FFN's, and fp4_ws is shared.
     unsigned char* fp4_gdn_ws = nullptr;
-    if (gdn_nvfp4) {
-        size_t wb = kernels::prefill_nvfp4_workspace_bytes(N, lqkv, H);
-        const size_t wz = kernels::prefill_nvfp4_workspace_bytes(N, lvdim, H);
-        const size_t wo = kernels::prefill_nvfp4_workspace_bytes(N, H, lvdim);
-        if (wz > wb) wb = wz;
-        if (wo > wb) wb = wo;
+    if (fp4_stage) {
+        size_t wb = 0;
+        auto need = [&](int n, int k) {
+            const size_t w = kernels::prefill_nvfp4_workspace_bytes(N, n, k);
+            if (w > wb) wb = w;
+        };
+        if (gdn_nvfp4) { need(lqkv, H); need(lvdim, H); need(H, lvdim); }
+        if (attn_nvfp4) { need(wide, H); need(kvdim, H); need(H, qdim); }
         fp4_gdn_ws = (wb <= fp4_ws_bytes && fp4_ws) ? fp4_ws : a8.alloc<unsigned char>(wb);
     }
+
+    // Set by the end-of-layer add+norm when it also wrote the FP4 A operand for the NEXT layer's
+    // qkv group, so that group can skip its own quantize. The memo crosses the loop boundary, so
+    // it is copied into `xn_fp4` and cleared at the top of every iteration -- a layer can only ever
+    // consume what its immediate predecessor left. Declared here rather than in the loop because
+    // gdn_qkv_z (defined below, before the loop) reads it.
+    bool xn_fp4_ready = false, xn_fp4 = false;
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
@@ -1029,7 +1123,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (gdn_nvfp4 && (gdn_fp4_mask & 1) &&
             w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf && w.gdn_z_fp4 && w.gdn_z_fp4_sf &&
             fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
-            kernels::launch_prefill_nvfp4_quant_a(A, fp4_gdn_a, fp4_gdn_as, N, H, st) &&
+            ((xn_fp4 && A == xn) ||
+             kernels::launch_prefill_nvfp4_quant_a(A, fp4_gdn_a, fp4_gdn_as, N, H, st)) &&
             kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
                                                w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf,
                                                b8, N, lqkv, H, fp4_gdn_ws, st,
@@ -1097,10 +1192,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     if (moe_hide_sg)
         pf_cu(cudaEventCreateWithFlags(&moe_ev_sg, cudaEventDisableTiming), "moe ev_sg");
 
+    // Both residual adds in a dense layer land immediately before a norm with nothing in between,
+    // so launch_add_rmsnorm2 can do each pair in one pass instead of two -- one fewer launch per
+    // site per layer, and `x` is not re-read from L2 between them.
+    static const bool addnorm_fuse = [] {
+        const char* e = getenv("SPARKINFER_Q38_PREFILL_ADDNORM");
+        return !(e && e[0] == '0');
+    }();
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         a_q = nullptr; a_pk = false;                   // xn/hn are refreshed in place each layer
         bool attn_fused = false;                       // post-attn residual folded into the proj?
+        // The dense FFN's residual add sits immediately before the end-of-layer norm with nothing
+        // between them, so defer it and let launch_add_rmsnorm2 do both -- the same pairing already
+        // taken after attention above. `ao` still holds the FFN output at the norm site.
+        bool ffn_add_pending = false;
+        bool hn_fp4_ready = false;     // post-attn norm already wrote fp4_a/fp4_as from `hn`
+        xn_fp4 = xn_fp4_ready;   // consume the predecessor's memo, then drop it
+        xn_fp4_ready = false;
         // Set when the o / ffn_down split-K accumulator was left un-reduced for the sandwich
         // norm to consume directly. Per layer: qb_partials is reused by the next GEMM.
         int attn_acc = 0, ffn_acc = 0;
@@ -1120,7 +1229,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
                 layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
                 c.gdn_qh_block, st);
-            kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
+            // The out projection below quantizes `lnrm` to FP4 immediately and nothing touches
+            // fp4_gdn_a in between, so fold that quantize into the gated norm. Consumed only under
+            // the same operand it was produced from; a false here just means the out projection
+            // quantizes for itself, as before.
+            bool lnrm_fp4_ready = false;
+            if (gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
+                fp4_gdn_a && fp4_gdn_as &&
+                kernels::launch_prefill_gated_norm_nvfp4_a(att, lz, w.ssm_norm, lnrm,
+                                                           fp4_gdn_a, fp4_gdn_as,
+                                                           N, lvdim, c.linear_head_dim, eps, st))
+                lnrm_fp4_ready = true;
+            else
+                kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
             // out_proj off the same NVFP4 bytes. The block-scaled GEMM cannot accumulate the
             // residual, so this writes the RAW projection to `ao` and leaves attn_fused false --
             // the `if (!attn_fused) launch_prefill_add(x, ao, x, ...)` below is what applies it,
@@ -1128,7 +1249,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             const bool out_fp4 = gdn_nvfp4 && (gdn_fp4_mask & 2) &&
                 w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
                 fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
-                kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_gdn_a, fp4_gdn_as, N, lvdim, st) &&
+                (lnrm_fp4_ready ||
+                 kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_gdn_a, fp4_gdn_as, N, lvdim, st)) &&
                 kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
                                                    w.gdn_out_fp4, w.gdn_out_fp4_sf,
                                                    ao, N, H, lvdim, fp4_gdn_ws, st,
@@ -1214,8 +1336,53 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 // Qwen3.8: [q|gate] is one wide wq, then skinny k/v (8 tiles each). One grouped
                 // launch fills the 5090; four separate ones leave k/v paying a full CTA duration
                 // for 8 blocks. Same kernel as Muse, bit-identical per tile.
-                bool grouped = false;
-                if (use_i8 && w.wq_rs && w.wk_rs && w.wv_rs &&
+                //
+                // Checkpoint-native NVFP4 first: quantize xn to FP4 ONCE (all three read it) and
+                // run three block-scaled GEMMs straight off the packed nibbles. Unlike the int8
+                // group this cannot batch the three into one launch, but it does not need to --
+                // the point here is the weight traffic, not the tile count, and k/v are 1/12th of
+                // wq. A_i8/sx are untouched, so the int8 activation memo stays valid downstream.
+                bool qkv_fp4 = false;
+                bool qkv_cat_done = false;
+                if (attn_nvfp4 && (attn_fp4_mask & 1) && qkvc && w.qkv_cat_fp4 && w.qkv_cat_fp4_sf &&
+                    fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
+                    kernels::prefill_nvfp4_supported(N, w.qkv_cat_rows, H) &&
+                    (xn_fp4 ||
+                     kernels::launch_prefill_nvfp4_quant_a(xn, fp4_gdn_a, fp4_gdn_as, N, H, st)) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                       w.qkv_cat_fp4, w.qkv_cat_fp4_sf,
+                                                       qkvc, N, w.qkv_cat_rows, H, fp4_gdn_ws, st,
+                                                       w.qkv_cat_alpha)) {
+                    // k and v are the two tails of the fused output.
+                    const size_t rs = (size_t)w.qkv_cat_rows * sizeof(bf16);
+                    const size_t kb = (size_t)kvdim * sizeof(bf16);
+                    qkv_cat_done =
+                        cudaMemcpy2DAsync(kf, kb, qkvc + wide, rs, kb, N,
+                                          cudaMemcpyDeviceToDevice, st) == cudaSuccess &&
+                        cudaMemcpy2DAsync(vf, kb, qkvc + wide + kvdim, rs, kb, N,
+                                          cudaMemcpyDeviceToDevice, st) == cudaSuccess;
+                }
+                if (qkv_cat_done) qkv_fp4 = true;
+                else if (attn_nvfp4 && (attn_fp4_mask & 1) &&
+                    w.wq_fp4 && w.wq_fp4_sf && w.wk_fp4 && w.wk_fp4_sf &&
+                    w.wv_fp4 && w.wv_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
+                    (xn_fp4 ||
+                     kernels::launch_prefill_nvfp4_quant_a(xn, fp4_gdn_a, fp4_gdn_as, N, H, st)) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                       w.wq_fp4, w.wq_fp4_sf,
+                                                       b8, N, wide, H, fp4_gdn_ws, st,
+                                                       w.wq_fp4_alpha) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                       w.wk_fp4, w.wk_fp4_sf,
+                                                       kf, N, kvdim, H, fp4_gdn_ws, st,
+                                                       w.wk_fp4_alpha) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                       w.wv_fp4, w.wv_fp4_sf,
+                                                       vf, N, kvdim, H, fp4_gdn_ws, st,
+                                                       w.wv_fp4_alpha))
+                    qkv_fp4 = true;
+                bool grouped = qkv_fp4;
+                if (!qkv_fp4 && use_i8 && w.wq_rs && w.wk_rs && w.wv_rs &&
                     w.wk_type == w.wq_type && w.wv_type == w.wq_type &&
                     kernels::pf_dense_gemm_qi8_supported(w.wq_type)) {
                     const void*  Wa[3]  = { w.wq, w.wk, w.wv };
@@ -1233,7 +1400,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     proj_fused(xn, w.wk, w.wk_type, w.wk_rs, kf, kvdim, H);
                     proj_fused(xn, w.wv, w.wv_type, w.wv_rs, vf, kvdim, H);
                 }
-                kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
+                if (qkv_cat_done)
+                    kernels::launch_prefill_split_q_gate(qkvc, qb, qg, N, c.n_q_heads, c.head_dim,
+                                                         st, w.qkv_cat_rows);
+                else
+                    kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
             }
             if (c.muse_glimmer) {
                 // Muse Glimmer runs a BF16 KV cache (its decode KV-write is bf16, qwen35.cpp:1065/1087),
@@ -1322,6 +1493,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 if (!wo_fp4_done)
                     proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
+            } else if (attn_nvfp4 && (attn_fp4_mask & 2) &&
+                       w.wo_fp4 && w.wo_fp4_sf &&
+                       fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
+                       kernels::launch_prefill_nvfp4_quant_a(att, fp4_gdn_a, fp4_gdn_as,
+                                                             N, qdim, st) &&
+                       kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                          w.wo_fp4, w.wo_fp4_sf,
+                                                          ao, N, H, qdim, fp4_gdn_ws, st,
+                                                          w.wo_fp4_alpha)) {
+                // `att` is already gated by the mul_sigmoid above, so this quantizes the same
+                // activation the int8 arms would have. The block-scaled GEMM cannot accumulate the
+                // residual, so leave attn_fused false and let the launch_prefill_add below apply
+                // it -- the same bookkeeping the GDN out_proj arm uses.
+                attn_fused = false;
             } else if (w.wo_rs) {
                 proj_fused(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim);
                 attn_fused = false;
@@ -1361,8 +1546,41 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         } else {
             // x += ao (post-attn residual, in-place; skipped when folded into the output proj)
             // hn = RMSNorm(x, post_attn_norm)
-            if (!attn_fused) kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
-            kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
+            //
+            // One kernel instead of two when the add is actually taken: launch_add_rmsnorm2 emits
+            // BOTH the residual sum and its norm, which is exactly this pair, and it saves the
+            // round trip that re-reads `x` from L2 between them plus one launch per layer. At
+            // N=128 these tensors are L2-resident so the win is the launch and the re-read, not
+            // DRAM. Same arithmetic -- same add, same rms over the same sum, same weight -- but
+            // the fused kernel owns its reduction order, so this is numerically equivalent rather
+            // than provably bit-identical; the batched-prefill parity gate is what checks it.
+            // SPARKINFER_Q38_PREFILL_ADDNORM=0 restores the split pairs (A/B in ONE binary).
+            // The FFN quantizes `hn` to FP4 immediately below and nothing touches fp4_a in
+            // between, so fold that quantize in here too when the FFN will read the whole tensor
+            // as ONE chunk. The flag is consumed only under `fo == 0 && fn == N` at the actual use
+            // site, so if the chunk loop disagrees with this prediction the FFN simply quantizes
+            // for itself -- a redundant kernel, never stale data. That asymmetry is deliberate:
+            // a residual-stream flag decided here and trusted there is exactly what silently
+            // dropped the FFN for twelve PRs (#837..#ccd7818).
+            hn_fp4_ready = false;
+            if (!attn_fused && addnorm_fuse) {
+                // The FFN's FP4 arm is live under EITHER operand form. Testing only the per-tensor
+                // w.gate_fp4 silently disabled this fold on every layer of a checkpoint whose
+                // gate|up fused, because keep_nvfp4(..., want_fp4 = !gu_cat) leaves that pointer
+                // null exactly when the concat took it -- the same "predicate reads a pointer the
+                // concat nulls" shape as the q38_nvfp4 bug.
+                const bool ffn_fp4_live = (w.gate_up_cat_fp4 && w.gate_up_cat_fp4_sf) ||
+                                          (w.gate_fp4 && w.gate_fp4_sf);
+                if (N <= FC && ffn_fp4_live && fp4_a && fp4_as &&
+                    kernels::launch_prefill_add_rmsnorm2_nvfp4_a(
+                        x, ao, w.post_attn_norm, x, hn, fp4_a, fp4_as, N, H, eps, st))
+                    hn_fp4_ready = true;
+                else
+                    kernels::launch_add_rmsnorm2(x, ao, w.post_attn_norm, x, hn, N, H, eps, st);
+            } else {
+                if (!attn_fused) kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
+                kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
+            }
         }
 
         if (!moe) {
@@ -1417,25 +1635,44 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
-                const bool layer_fp4 = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
-                    w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
+                const bool layer_fp4 = gu_nvfp4 && (gu_cat_live || (w.gate_fp4 && w.gate_fp4_sf)) &&
+                    (gu_cat_live || (w.up_fp4 && w.up_fp4_sf)) && fp4_a && fp4_as &&
                     kernels::prefill_nvfp4_supported(fn, ffn, H) &&
-                    kernels::launch_prefill_nvfp4_quant_a(hn_c, fp4_a, fp4_as, fn, H, st) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.gate_fp4, w.gate_fp4_sf,
-                                                       ffg, fn, ffn, H, fp4_ws, st,
-                                                       w.gate_fp4_alpha) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.up_fp4, w.up_fp4_sf,
-                                                       ffu, fn, ffn, H, fp4_ws, st,
-                                                       w.up_fp4_alpha);
+                    (!gu_cat_live ||
+                     kernels::prefill_nvfp4_supported(fn, w.gate_up_cat_rows, H)) &&
+                    ((hn_fp4_ready && fo == 0 && fn == N) ||
+                     kernels::launch_prefill_nvfp4_quant_a(hn_c, fp4_a, fp4_as, fn, H, st)) &&
+                    (gu_cat_live
+                        ? kernels::launch_prefill_nvfp4_gemm(
+                              fp4_a, fp4_as, w.gate_up_cat_fp4, w.gate_up_cat_fp4_sf,
+                              ffgu, fn, w.gate_up_cat_rows, H, fp4_ws, st, w.gate_up_cat_alpha)
+                        : (kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.gate_fp4,
+                                                              w.gate_fp4_sf, ffg, fn, ffn, H,
+                                                              fp4_ws, st, w.gate_fp4_alpha) &&
+                           kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.up_fp4,
+                                                              w.up_fp4_sf, ffu, fn, ffn, H,
+                                                              fp4_ws, st, w.up_fp4_alpha)));
+                if (!layer_fp4 && gu_cat_live) {
+                    a.free_all(); a8.free_all();
+                    fprintf(stderr, "[prefill] fused gate|up GEMM declined at fn=%d -> token loop\n", fn);
+                    return -1;
+                }
                 if (layer_fp4) {
                     const bool down_fp4_done = nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
                         fp4_down_a && fp4_down_as &&
                         kernels::launch_prefill_nvfp4_swiglu_quant_a(
-                            ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st) &&
+                            ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st, gu_src_stride) &&
                         kernels::launch_prefill_nvfp4_gemm(
                             fp4_down_a, fp4_down_as, w.down_fp4, w.down_fp4_sf,
                             ao + (size_t)fo * H, fn, H, ffn, fp4_ws, st,
                             w.down_fp4_alpha);
+                    if (!down_fp4_done && gu_cat_live) {
+                        // ffg/ffu are strided views of the fused output; every non-FP4 consumer
+                        // below assumes tight [fn, ffn]. Refuse rather than read them wrong.
+                        a.free_all(); a8.free_all();
+                        fprintf(stderr, "[prefill] fused gate|up: down FP4 arm declined -> token loop\n");
+                        return -1;
+                    }
                     if (!down_fp4_done) {
                         kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
                         proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
@@ -1585,8 +1822,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 else
                     kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
             } else if (!ffn_fused) {
-                // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk)
-                kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
+                // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk).
+                // Deferred into the end-of-layer norm below when the fusion is on.
+                if (addnorm_fuse) ffn_add_pending = true;
+                else kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
             }
         } else {
             // ---- expert-grouped 256-expert int8 MoE FFN (this PR): route -> bucket routed
@@ -2077,7 +2316,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         }
 
         const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
+        // Same fold as the post-attention norm above: the next layer's qkv group quantizes this
+        // `xn` to FP4 and nothing touches fp4_gdn_a in between (the GDN out / o projections
+        // overwrite it only AFTER their qkv group has run). Worth doing on the last layer too --
+        // the memo is simply never consumed there.
+        if (ffn_add_pending) {
+            if (fp4_gdn_a && fp4_gdn_as && (gdn_nvfp4 || attn_nvfp4) &&
+                kernels::launch_prefill_add_rmsnorm2_nvfp4_a(
+                    x, ao, next_norm, x, xn, fp4_gdn_a, fp4_gdn_as, N, H, eps, st))
+                xn_fp4_ready = true;
+            else
+                kernels::launch_add_rmsnorm2(x, ao, next_norm, x, xn, N, H, eps, st);
+        } else {
+            kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
+        }
     }
 
     if (moe_overlap) {

@@ -35,9 +35,11 @@ void launch_prefill_add(const void* a, const void* b, void* out, long n,
 
 // Split interleaved-per-head [q|gate]: qraw[N, 2*n_heads*hd] (each head is hd q then hd gate)
 // -> q[N, n_heads*hd], gate[N, n_heads*hd]. Matches split_q_gate_kernel, batched over tokens.
+// row_stride = elements per token in `qraw` (0 = tight 2*n_heads*head_dim). A wider stride lets
+// this read [q|gate] in place as the leading slice of a fused q|k|v GEMM output.
 void launch_prefill_split_q_gate(const void* qraw, void* q, void* gate,
                                  int n_tokens, int n_heads, int head_dim,
-                                 cudaStream_t stream = nullptr);
+                                 cudaStream_t stream = nullptr, int row_stride = 0);
 
 // Batched attn *= sigmoid(gate), elementwise over n_tokens*dim (Qwen3.6 q-gate).
 void launch_prefill_mul_sigmoid(void* attn, const void* gate, int n_tokens, int dim,

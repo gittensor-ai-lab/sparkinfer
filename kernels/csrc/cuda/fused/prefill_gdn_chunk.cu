@@ -35,8 +35,10 @@
 //     (I + A) U^ = B (V - diag(exp G) K S_in),   A[i][j] = b_i (k_i.k_j) exp(G_i - G_j), j < i
 //     Y         = [ diag(exp G) (Q S_in) + M U^ ] * scale,  M[i][j] = (q_i.k_j) exp(G_i-G_j), j<=i
 //     S_out     = exp(G_last) S_in + K^T U~,     U~[j] = exp(G_last - G_j) U^[j]
-// (I + A) is unit lower triangular, so T = (I+A)^-1 is too and costs C^3/6 MACs by forward
-// substitution. The serial chain shortens from N to N/C and the inner work becomes dense matmuls
+// (I + A) is unit lower triangular, so T = (I+A)^-1 is too; it is built by BLOCKED inversion
+// (log2(C) levels of [[L11,0],[L21,L22]]^-1 = [[T11,0],[-T22 L21 T11, T22]]) rather than the
+// C^3/6-MAC forward substitution, which cost 62 block barriers and left 225 of 256 threads idle.
+// The serial chain shortens from N to N/C and the inner work becomes dense matmuls
 // over shared-memory tiles that every state column reuses.
 //
 // NUMERICS. ssm_a is negative for all 24 linear layers x 32 v-heads of this checkpoint (read from
@@ -191,18 +193,50 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     }
     __syncthreads();
 
-    // ---- T = (I + A)^-1 in place, by forward substitution over rows ----
-    //   T[i][j] = -A[i][j] - sum_{m=j+1}^{i-1} A[i][m] T[m][j]      (T[j][j] = 1)
-    // Row i still holds A while it is being read; rows m < i already hold T.
-    for (int i = 1; i < C; i++) {
-        for (int j = tid; j < i; j += nthr) {
-            float acc = s_A[i * (C + PAD) + j];
-            for (int m = j + 1; m < i; m++) acc += s_A[i * (C + PAD) + m] * s_A[m * (C + PAD) + j];
-            s_t[j] = -acc;
+    // ---- T = (I + A)^-1 in place, by BLOCKED (divide-and-conquer) inversion ----
+    // For a diagonal block of size bw = 2*hb at offset o,
+    //     [[L11, 0], [L21, L22]]^-1 = [[T11, 0], [-T22 L21 T11, T22]]
+    // so each level only has to fill the (2,1) sub-block of every size-bw diagonal block: the two
+    // diagonal halves were inverted by level bw/2, and L21 is still raw A because no earlier level
+    // touches that region. T11 and T22 are themselves unit lower triangular, which is what lets the
+    // m-loops start at j+1 and stop at i (the implicit 1s are the initial `acc`).
+    //
+    // This replaces a row-at-a-time forward substitution, which was this kernel's serial
+    // bottleneck: C-1 = 31 rows x 2 block barriers = 62 barriers, a dependent FMA chain of
+    // sum(i-1) = 465, and never more than 31 of the 256 threads busy (row i has only i entries).
+    // The blocked form is log2(C) = 5 levels: 10 barriers, a chain of 2+4+8+16+32 = 62, and the
+    // last two levels carry 94% of the MACs at 128 and 256 threads. It issues ~2x the MACs
+    // (C^3/3 vs C^3/6) and still wins, because the grid is 192 blocks on 170 SMs -- barely one
+    // block per SM, so there is nothing to hide a barrier behind and arithmetic is nearly free.
+    //
+    // s_P aliases s_x: Q was consumed by the wmma pass above and V is not staged until after W^,
+    // so the scratch costs no extra shared memory (it must not overlap s_A, which sits above s_x).
+    {
+        float* s_P = reinterpret_cast<float*>(s_x);                          // [C][C+PAD]
+        for (int bw = 2; bw <= C; bw <<= 1) {
+            const int hb = bw >> 1;
+            const int nout = (C / bw) * hb * hb;
+            for (int e = tid; e < nout; e += nthr) {                         // P = L21 . T11
+                const int b = e / (hb * hb), r = e - b * hb * hb;
+                const int i = r / hb, j = r - i * hb, o = b * bw;
+                float acc = s_A[(o + hb + i) * (C + PAD) + o + j];           // m == j: T11[j][j] = 1
+                for (int m = j + 1; m < hb; m++)
+                    acc += s_A[(o + hb + i) * (C + PAD) + o + m]
+                         * s_A[(o + m) * (C + PAD) + o + j];
+                s_P[(o + hb + i) * (C + PAD) + o + j] = acc;
+            }
+            __syncthreads();
+            for (int e = tid; e < nout; e += nthr) {                         // T21 = -T22 . P
+                const int b = e / (hb * hb), r = e - b * hb * hb;
+                const int i = r / hb, j = r - i * hb, o = b * bw;
+                float acc = s_P[(o + hb + i) * (C + PAD) + o + j];           // m == i: T22[i][i] = 1
+                for (int m = 0; m < i; m++)
+                    acc += s_A[(o + hb + i) * (C + PAD) + o + hb + m]
+                         * s_P[(o + hb + m) * (C + PAD) + o + j];
+                s_A[(o + hb + i) * (C + PAD) + o + j] = -acc;
+            }
+            __syncthreads();
         }
-        __syncthreads();
-        for (int j = tid; j < i; j += nthr) s_A[i * (C + PAD) + j] = s_t[j];
-        __syncthreads();
     }
 
     // ---- W^ = T . (b_m exp(G_m) k_m) ----
@@ -284,7 +318,7 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                                     float* __restrict__ state,
                                     __nv_bfloat16* __restrict__ out,
                                     int n_tokens, int q_heads, int v_heads, int n_chunks,
-                                    bool qh_block, int carry) {
+                                    bool qh_block, int carry, int mwmma) {
     extern __shared__ char s_raw[];
     float* s_S = reinterpret_cast<float*>(s_raw);                              // [HD][JC]  fp32 carrier
     float* s_U = s_S + (size_t)HD * JC;                                        // [C][JC]
@@ -427,7 +461,54 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         // bit-identical to the reference element loop.
         for (int i = tid; i < C; i += nthr) s_eg[i] = __expf(s_g[i]);
         __syncthreads();
-        {
+        if (mwmma) {
+            // M . U^ on tensor cores. The scalar form below issues, per pp, one s_U load and FOUR
+            // broadcast s_M loads for only four FMAs -- ~1280 shared transactions per block-chunk
+            // against ~256 cycles of real FMA work. It is shared-INSTRUCTION bound, not FLOP
+            // bound, and wmma is what removes those instructions (16x16x16 per mma).
+            // m_buf already stores hard 0 for j>i (prep writes them), so a dense product is
+            // mathematically the masked one. Narrowing M/U^ to bf16 matches what this kernel
+            // already does for S and U~ on its other two matmuls.
+            // s_Mb aliases s_Sb (dead once the U^/Y0 pass above is done) and s_Ub is not written
+            // until the S update below -- so this costs no extra shared memory.
+            __nv_bfloat16* s_Mb = s_Sb;
+            for (int e = tid; e < C * C; e += nthr) {
+                const int i = e / C, pp = e - i * C;
+                s_Mb[i * (C + PAD) + pp] = __float2bfloat16(s_M[i * (C + PAD) + pp]);
+            }
+            for (int e = tid; e < C * JC; e += nthr) {
+                const int i = e / JC, jj = e - i * JC;
+                s_Ub[i * (JC + PAD) + jj] = __float2bfloat16(s_U[e]);
+            }
+            __syncthreads();
+            {
+                using namespace nvcuda;
+                const int warp = tid >> 5;
+                __shared__ float sMU[4][16][16];
+                if (warp < 4) {                       // [32,32]x[32,32] = 4 tiles, k-depth 2 steps
+                    const int ti = (warp >> 1) * 16, tj = (warp & 1) * 16;
+                    wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
+                    wmma::fill_fragment(cf, 0.f);
+                    #pragma unroll
+                    for (int kk = 0; kk < C; kk += 16) {
+                        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+                        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bf;
+                        wmma::load_matrix_sync(af, s_Mb + (size_t)ti * (C + PAD) + kk, C + PAD);
+                        wmma::load_matrix_sync(bf, s_Ub + (size_t)kk * (JC + PAD) + tj, JC + PAD);
+                        wmma::mma_sync(cf, af, bf, cf);
+                    }
+                    wmma::store_matrix_sync(&sMU[warp][0][0], cf, 16, wmma::mem_row_major);
+                }
+                __syncthreads();
+                for (int e = tid; e < C * JC; e += nthr) {
+                    const int i = e / JC, jj = e - i * JC;
+                    if (t0 + i >= n_tokens) continue;
+                    const int w = ((i >> 4) << 1) | (jj >> 4);
+                    const float y = (s_eg[i] * s_Y[i * JC + jj] + sMU[w][i & 15][jj & 15]) * scale;
+                    out[(size_t)(t0 + i) * v_dim + h * HD + j0 + jj] = __float2bfloat16(y);
+                }
+            }
+        } else {
             constexpr int NTHR2 = 256;
             constexpr int OPT = (C * JC) / NTHR2;
             constexpr int ISTR2 = NTHR2 / JC;
@@ -477,13 +558,21 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
             using namespace nvcuda;
             const float gl = __expf(g_last);
             const int warp = tid >> 5;                       // 8 warps x 2 tiles = 16 tiles [128,32]
-            __shared__ float sC2[8][16][16];
+            // The accumulator IS the destination: seed cf with the decayed old state and let the
+            // mma add K^T U~ straight onto it, then store back to s_S. That removes the 8 KB sC2
+            // staging array, both __syncwarp, and a dependent shared round-trip per tile -- none of
+            // which has anything to hide behind at ~1.13 blocks/SM. Safe because tile = 2*warp+rep
+            // gives ti = 16*warp for BOTH reps, so warp w owns s_S rows [16w, 16w+16) exclusively
+            // and the two reps only differ in column half. Not bit-identical: the old form summed
+            // the products from zero and added gl*S afterwards, this one starts from gl*S.
             #pragma unroll
             for (int rep = 0; rep < 2; rep++) {
                 const int tile = warp * 2 + rep;             // 0..15
                 const int ti = (tile >> 1) * 16, tj = (tile & 1) * 16;
                 wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
-                wmma::fill_fragment(cf, 0.f);
+                wmma::load_matrix_sync(cf, s_S + (size_t)ti * JC + tj, JC, wmma::mem_row_major);
+                #pragma unroll
+                for (int e = 0; e < cf.num_elements; e++) cf.x[e] *= gl;
                 #pragma unroll
                 for (int kk = 0; kk < C; kk += 16) {
                     // K^T: A[m][p] = s_K[p][m] -> col_major over s_K gives the transpose for free
@@ -493,14 +582,7 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                     wmma::load_matrix_sync(bf, s_Ub + (size_t)kk * (JC + PAD) + tj, JC + PAD);
                     wmma::mma_sync(cf, af, bf, cf);
                 }
-                wmma::store_matrix_sync(&sC2[warp][0][0], cf, 16, wmma::mem_row_major);
-                __syncwarp();
-                for (int e = (tid & 31); e < 256; e += 32) {
-                    const int r = e >> 4, cc = e & 15;
-                    const int m = ti + r, jj = tj + cc;
-                    s_S[m * JC + jj] = gl * s_S[m * JC + jj] + sC2[warp][r][cc];
-                }
-                __syncwarp();
+                wmma::store_matrix_sync(s_S + (size_t)ti * JC + tj, cf, JC, wmma::mem_row_major);
             }
         }
         __syncthreads();
@@ -603,6 +685,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         cfg[dev] = 1;
     }
 
+    static const int mwmma = [] { const char* e = getenv("SPARKINFER_SCAN_MWMMA"); return (e && e[0] == '0') ? 0 : 1; }();
     auto db = reinterpret_cast<const __nv_bfloat16*>(dt);
     auto aa = reinterpret_cast<const __nv_bfloat16*>(a);
 
@@ -638,7 +721,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         dim3 gscan(v_heads, HD / JC);
         pf_gdnc_scan_kernel<C, HD, JC><<<gscan, SCAN_THREADS, sm_scan, stream>>>(
             qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
-            len, q_heads, v_heads, n_chunks, qh_block, carry);
+            len, q_heads, v_heads, n_chunks, qh_block, carry, mwmma);
         return cudaPeekAtLastError() == cudaSuccess;
     };
 

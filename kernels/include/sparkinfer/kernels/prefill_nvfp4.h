@@ -12,6 +12,19 @@ size_t prefill_nvfp4_scale_bytes_a(int m, int k);
 size_t prefill_nvfp4_scale_bytes_b(int n, int k);
 size_t prefill_nvfp4_workspace_bytes(int m, int n, int k);
 
+// GDN gated norm (out = x*rsqrt(mean(x^2)+eps)*w*silu(z)) with the FP4 A-operand quantize of the
+// result folded in. Numerically identical to launch_prefill_gated_norm + the standalone quantizer.
+bool launch_prefill_gated_norm_nvfp4_a(const void* x, const void* z, const void* w, void* out,
+                                       void* dst_fp4, void* dst_sf, int rows, int cols,
+                                       int head_dim, float eps, cudaStream_t stream = nullptr);
+// add_rmsnorm2 (out_sum = x + res; out_norm = rmsnorm(out_sum)*w) with the FP4 A-operand
+// quantize of out_norm folded in, so a GEMM group that follows a norm does not re-read it.
+// Numerically identical to the two kernels run back to back. False = shape unsupported, nothing
+// written, caller keeps its two-kernel path.
+bool launch_prefill_add_rmsnorm2_nvfp4_a(const void* x, const void* res, const void* w,
+                                         void* out_sum, void* out_norm, void* dst_fp4, void* dst_sf,
+                                         int rows, int cols, float eps,
+                                         cudaStream_t stream = nullptr);
 bool launch_prefill_nvfp4_quant_a(const void* src_bf16, void* dst_fp4, void* dst_sf,
                                   int m, int k, cudaStream_t stream = nullptr);
 // Muse's attention gate fused into the A-operand quantize: x * sigmoid(g) straight to FP4, the
@@ -20,9 +33,12 @@ bool launch_prefill_nvfp4_gate_quant_a(const void* src_bf16, const void* gate_bf
                                        void* dst_fp4, void* dst_sf,
                                        int m, int k, cudaStream_t stream = nullptr);
 // Fuse the dense FFN's bf16-rounded SwiGLU producer into the down projection's FP4 A quantize.
+// src_stride = elements per row in gate/up (0 = tight k); wider when they are the two halves of
+// one fused gate|up GEMM output being read in place.
 bool launch_prefill_nvfp4_swiglu_quant_a(const void* gate_bf16, const void* up_bf16,
                                          void* dst_fp4, void* dst_sf,
-                                         int m, int k, cudaStream_t stream = nullptr);
+                                         int m, int k, cudaStream_t stream = nullptr,
+                                         int src_stride = 0);
 bool launch_prefill_nvfp4_quant_b(const void* src_bf16, void* dst_fp4, void* dst_sf,
                                   int n, int k, cudaStream_t stream = nullptr);
 bool launch_prefill_nvfp4_gemm(const void* a_fp4, const void* sfa,

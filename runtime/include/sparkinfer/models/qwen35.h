@@ -82,6 +82,14 @@ struct Qwen35LayerWeights {
     int prefill_gate_qtype = 0, prefill_up_qtype = 0;
     // Optional SM120-native NVFP4 copies used only by Muse batched prefill. Decode and all
     // unsupported shapes continue to use the GGUF-native pointers above.
+    // gate|up as ONE [2*ffn, H] NVFP4 operand, REPLACING the two separate FP4 copies. Same
+    // exactness proof as qkv_cat: ModelOpt quantizes the pair together so weight_scale_2 is
+    // bit-identical, and both arrays are row-major, so the concat is a byte copy with one alpha.
+    // Halves the FFN's GEMM launches (128 -> 64 per pass); decode is untouched because it reads
+    // the Q4_K copies (gate_q/up_q), so this is prefill-only.
+    const void* gate_up_cat_fp4 = nullptr; const void* gate_up_cat_fp4_sf = nullptr;
+    float gate_up_cat_alpha = 1.f;
+    int gate_up_cat_rows = 0;
     const void* gate_fp4 = nullptr; const void* gate_fp4_sf = nullptr;
     const void* up_fp4 = nullptr;   const void* up_fp4_sf = nullptr;
     // 1/weight_global_scale for checkpoint-native NVFP4 B operands. Muse's
@@ -106,6 +114,27 @@ struct Qwen35LayerWeights {
     const void* gdn_z_fp4 = nullptr;   const void* gdn_z_fp4_sf = nullptr;
     const void* gdn_out_fp4 = nullptr; const void* gdn_out_fp4_sf = nullptr;
     float gdn_qkv_fp4_alpha = 1.f, gdn_z_fp4_alpha = 1.f, gdn_out_fp4_alpha = 1.f;
+    // Full-attention q/k/v/o for the same NVFP4 checkpoints. These REPLACE the Q4_K refit rather
+    // than sitting beside it: the payload below is what decode's launch_gemv_nvfp4 reads too, so
+    // the only new bytes on the card are the CUTLASS SFB (1 per 16 weights). Keeping a Q4_K copy
+    // as well would cost ~0.9 GB, and at ctx=16384 this model already runs with under 1 GB free.
+    // q|k|v stacked into ONE [q_out + 2*kvdim, H] NVFP4 operand, REPLACING the three separate
+    // payloads (same bytes, one allocation -- VRAM neutral). ModelOpt quantizes the three together
+    // so their weight_scale_2 is bit-identical per layer, which is what makes a row-wise concat
+    // EXACT: packed nibbles and group scales are both row-major and one shared global means one
+    // GEMM alpha. Worth doing because at m=128 the grid IS the N-tile count -- k and v (n=1024)
+    // cover 16 of 170 SMs and cost as much wall time as the 12288-row q for a sixth of the bytes.
+    // Fused, n=14336 takes the wide tile at 112 CTAs. wq/wk/wv all point at this payload so the
+    // load-time null checks still hold; nothing reads them individually once qkv_cat is set.
+    const void* qkv_cat = nullptr;          // whole payload (hdr|group scales|packed), decode GEMV
+    const void* qkv_cat_fp4 = nullptr;      // packed nibbles = CUTLASS B
+    const void* qkv_cat_fp4_sf = nullptr;   // CUTLASS SFB over all q_out+2*kvdim rows
+    float qkv_cat_alpha = 1.f;
+    int qkv_cat_rows = 0;
+    const void* wq_fp4 = nullptr; const void* wq_fp4_sf = nullptr;
+    const void* wk_fp4 = nullptr; const void* wk_fp4_sf = nullptr;
+    const void* wv_fp4 = nullptr; const void* wv_fp4_sf = nullptr;
+    float wq_fp4_alpha = 1.f, wk_fp4_alpha = 1.f, wv_fp4_alpha = 1.f, wo_fp4_alpha = 1.f;
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
     // 14=Q6_K, 8=Q8_0) or SI_QTYPE_FP8 (108) / SI_QTYPE_NVFP4 (109) -> weights kept
     // quantized in VRAM, decoded on-read by launch_gemv_q / launch_gemv_fp8 /
