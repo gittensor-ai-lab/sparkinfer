@@ -397,6 +397,18 @@ __global__ void fa_combine_gated_q8_kernel(
 #ifndef FA_GQA6_TILE
 #define FA_GQA6_TILE 8     // Qwen3.8-27B hd256 GQA-6 (24Q/4KV); independently sweepable
 #endif
+// Deep tile for the SMALL-split regime. FA_GQA6_TILE above is a sweet spot at n_splits=128, where a
+// block walks seqlen/n_splits ~= 32 keys and the staging loop runs two or three times. When the
+// split count is small the same block walks the WHOLE range instead: at 4k with n_splits=1 that is
+// 512 stage/sync/compute/sync cycles, each issuing only blockDim*16 B of loads before its barrier,
+// so DRAM latency is exposed every iteration -- measured 1.11 ms/call, ~30 GB/s across 4 CTAs
+// (~7.5 GB/s each) against a 18.7 us roofline for the bytes it reads. Staging a deeper tile puts
+// proportionally more independent loads in flight per barrier and cuts the barrier count by the
+// same factor. Capped by dynamic smem: 2 * TILE * 256 * 2 B = 1024*TILE, and this launcher never
+// opts in past the 48 KB default, so 32 -> 32 KB is safe and 48 would not be.
+#ifndef FA_GQA6_TILE_DEEP
+#define FA_GQA6_TILE_DEEP 32
+#endif
 #ifndef FA_GQA4_TILE
 #define FA_GQA4_TILE 8     // Qwythos hd256 GQA-4 (16Q/4KV); independently sweepable
 #endif
@@ -904,19 +916,40 @@ void launch_flash_decode_split(
                 (void)seqlen;
                 return;
             }
-            const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
+            // How many keys ONE block walks -- not the sequence length. This, not seqlen, is what
+            // sets the staging-loop iteration count, so it is what picks the tile depth.
+            const long fa6_chunk = (long)(seqlen > 0 ? seqlen : 0) /
+                                   (long)(n_splits > 0 ? n_splits : 1);
+            // SPARKINFER_FA_TILE_DEEP: unset/2 = auto by chunk, 0 = always the shallow tile,
+            // 1 = always deep. A/B in ONE binary, which is the only honest way to compare when the
+            // kernels live in a shared library.
+            static int fa6_deep_env = -1;
+            if (fa6_deep_env < 0) {
+                const char* e = getenv("SPARKINFER_FA_TILE_DEEP");
+                fa6_deep_env = e ? atoi(e) : 2;
+            }
+            const bool fa6_deep = (fa6_deep_env == 2) ? (fa6_chunk >= 256) : (fa6_deep_env != 0);
             // int8_kv must use the <...,true> instantiation: it dequants int8 -> bf16 into the
             // staged tile, and reading the int8 pool as bf16 would be garbage.
-            if (int8_kv)
-                fa_split_gqa_kernel<256, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
-                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
-            else
-                fa_split_gqa_kernel<256, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
-                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+#define SI_FA6_LAUNCH(TL, I8)                                                                     \
+            do {                                                                                  \
+                const size_t sm6 = (size_t)2 * (TL) * 256 * sizeof(__nv_bfloat16);                \
+                fa_split_gqa_kernel<256, GQA, (TL), I8><<<gq, GQA * 32, sm6, stream>>>(           \
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table,       \
+                    seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads,         \
+                    block_size, max_blocks, n_splits,                                             \
+                    reinterpret_cast<const __half*>(k_scale),                                     \
+                    reinterpret_cast<const __half*>(v_scale));                                     \
+            } while (0)
+            constexpr int TILE_DEEP = FA_GQA6_TILE_DEEP;
+            if (int8_kv) {
+                if (fa6_deep) SI_FA6_LAUNCH(TILE_DEEP, true);
+                else          SI_FA6_LAUNCH(TILE, true);
+            } else {
+                if (fa6_deep) SI_FA6_LAUNCH(TILE_DEEP, false);
+                else          SI_FA6_LAUNCH(TILE, false);
+            }
+#undef SI_FA6_LAUNCH
             combine_hd256(out_q8);
             (void)seqlen;
             return;
