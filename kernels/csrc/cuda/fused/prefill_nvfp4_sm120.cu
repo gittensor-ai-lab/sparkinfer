@@ -190,42 +190,86 @@ auto shape(int m, int n, int k) { return cute::make_shape(m, n, k, 1); }
 auto sfa_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SFA(shape(m,n,k)); }
 auto sfb_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SFB(shape(m,n,k)); }
 
-template <class Layout>
-__global__ void quant_rows(const __nv_bfloat16* src, unsigned char* dst,
-                           cutlass::float_ue4m3_t* sf, int rows, int cols, Layout layout) {
-    // V is fixed by the format: one ue4m3 scale per 16 values. The mapping of lanes onto those 16
-    // is not. One lane per value left half of every warp idle (lane < V), reduced 16 real values
-    // across 32 lanes, and stored 8 bytes per warp per step -- 63 GB/s, 3.5% of peak. Two values
-    // per lane puts 8 lanes on a group and 4 groups on a warp: every lane live, the amax reduction
-    // is 3 steps inside its own 8-lane group, and the warp's 4 groups store 32 contiguous bytes.
-    // Bit-identical: max is order-independent, and each value keeps the same scale and the same
-    // x / float(qs) rounding it had before.
+// V is fixed by the format: one ue4m3 scale per 16 values. The mapping of lanes onto those 16 is
+// not, and it is worth a lot. One lane per value left half of every warp idle (lane < V) and stored
+// 8 bytes per warp -- 63 GB/s, 3.5% of peak. Two values per lane (LPV=8) put every lane live and
+// took the warp's store to 32 contiguous bytes.
+//
+// EIGHT values per lane (LPV=2) is the shape below. Per lane that is one 16-byte load and one
+// 4-byte store, so a warp moves 512 B in and 128 B out in single transactions, against 128 B in /
+// 32 B out before -- and the amax reduction collapses from 3 shuffles to 1. The kernel is pure
+// bandwidth (2 B read and 0.5625 B written per element) and was measured at ~30% of peak, which is
+// what a 1-byte-per-lane store costs.
+//
+// Bit-identical at any LPV: max is order-independent, so the group's amax is the same however the
+// 16 values are split across lanes, and each value then keeps the same qs and the same
+// x / float(qs) rounding. LPV is a template parameter only so the two can be A/B'd in one binary.
+template <int LPV, class Layout>
+__global__ void quant_rows_t(const __nv_bfloat16* src, unsigned char* dst,
+                             cutlass::float_ue4m3_t* sf, int rows, int cols, Layout layout) {
     constexpr int V = 16;
-    constexpr int LPV = 8;            // lanes per scale group (2 values each)
+    constexpr int VPL = V / LPV;      // values per lane
     constexpr int GPW = 32 / LPV;     // scale groups per warp
     const int vpr = cols / V;
     const int gpb = (int)(blockDim.x >> 5) * GPW;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int sub = lane & (LPV - 1);
-    const int gin = lane >> 3;
+    const int gin = lane / LPV;
     const int total = rows * vpr;
     for (int g = blockIdx.x * gpb + warp * GPW + gin; g < total; g += gridDim.x * gpb) {
         const int row = g / vpr, k0 = (g - row * vpr) * V;
-        const size_t base = (size_t)row * cols + k0 + sub * 2;
-        const __nv_bfloat162 v2 = *reinterpret_cast<const __nv_bfloat162*>(src + base);
-        const float x0 = __bfloat162float(v2.x), x1 = __bfloat162float(v2.y);
-        float a = fmaxf(fabsf(x0), fabsf(x1));
+        const size_t base = (size_t)row * cols + k0 + sub * VPL;
+        // VPL is 2, 4 or 8 values = 4, 8 or 16 B, and base is a multiple of VPL, so this is a
+        // single naturally-aligned vector load whenever cols is (5120 / 6144 / 17408 all are).
+        __nv_bfloat162 v2[VPL / 2];
+        #pragma unroll
+        for (int i = 0; i < VPL / 2; i++)
+            v2[i] = reinterpret_cast<const __nv_bfloat162*>(src + base)[i];
+        float x[VPL];
+        float a = 0.f;
+        #pragma unroll
+        for (int i = 0; i < VPL / 2; i++) {
+            x[2 * i]     = __bfloat162float(v2[i].x);
+            x[2 * i + 1] = __bfloat162float(v2[i].y);
+            a = fmaxf(a, fmaxf(fabsf(x[2 * i]), fabsf(x[2 * i + 1])));
+        }
         #pragma unroll
         for (int d = LPV >> 1; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
         cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
-        cutlass::float_e2m1_t q0(x0 / float(qs));
-        cutlass::float_e2m1_t q1(x1 / float(qs));
-        dst[base >> 1] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
+        const float qsf = float(qs);
+        // One packed store per lane: VPL nibbles = VPL/2 bytes, and base is a multiple of VPL so
+        // base>>1 is a multiple of VPL/2 -- naturally aligned for the 2- or 4-byte case.
+        unsigned char packed[VPL / 2];
+        #pragma unroll
+        for (int i = 0; i < VPL / 2; i++) {
+            cutlass::float_e2m1_t q0(x[2 * i] / qsf), q1(x[2 * i + 1] / qsf);
+            packed[i] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
+        }
+        #pragma unroll
+        for (int i = 0; i < VPL / 2; i++) dst[(base >> 1) + i] = packed[i];
         if (sub == 0) {
             auto scales = cute::make_tensor(sf, layout);
             scales(row, k0, 0) = qs;
         }
+    }
+}
+// SPARKINFER_NVFP4_QUANT_LPV=8 restores the two-values-per-lane shape (A/B in ONE binary).
+inline int nvfp4_quant_lpv() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_QUANT_LPV");
+        const int x = e ? atoi(e) : 2;
+        return (x == 2 || x == 4 || x == 8) ? x : 2;
+    }();
+    return v;
+}
+template <class Layout>
+void quant_rows_dispatch(int blocks, cudaStream_t st, const __nv_bfloat16* src, unsigned char* dst,
+                         cutlass::float_ue4m3_t* sf, int rows, int cols, Layout layout) {
+    switch (nvfp4_quant_lpv()) {
+        case 8:  quant_rows_t<8><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout); break;
+        case 4:  quant_rows_t<4><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout); break;
+        default: quant_rows_t<2><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout); break;
     }
 }
 
@@ -413,8 +457,8 @@ bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k
     if (!s || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
     auto l = sfa_layout(m,128,k);
     int blocks = (m * (k / 16) + 31) / 32; if (blocks > 4096) blocks = 4096;
-    quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)s,(unsigned char*)d,
-                                     (cutlass::float_ue4m3_t*)sf,m,k,l);
+    quant_rows_dispatch(blocks,st,(const __nv_bfloat16*)s,(unsigned char*)d,
+                        (cutlass::float_ue4m3_t*)sf,m,k,l);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_gate_quant_a(const void* sr, const void* g, void* d, void* sf,
@@ -440,8 +484,8 @@ bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k
     if (!s || !d || !sf || !prefill_nvfp4_supported(128,n,k)) return false;
     auto l = sfb_layout(128,n,k);
     int blocks = (n * (k / 16) + 31) / 32; if (blocks > 4096) blocks = 4096;
-    quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)s,(unsigned char*)d,
-                                     (cutlass::float_ue4m3_t*)sf,n,k,l);
+    quant_rows_dispatch(blocks,st,(const __nv_bfloat16*)s,(unsigned char*)d,
+                        (cutlass::float_ue4m3_t*)sf,n,k,l);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const void* sb,
