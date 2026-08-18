@@ -3080,6 +3080,42 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 12288;
         return v < 1 ? 1 : v;
     }();
+    // ...and then stop proposing deeper than the DRAFT's own context cost can pay for.
+    //
+    // Each extra proposal is another row in the draft block: another 248320-wide LM-head row and
+    // argmax, and another row of the draft's own attention over the same KV. The first two are
+    // fixed, but the third grows with context, so the depth that pays is not a property of the
+    // model, it is a property of how long the sequence already is. In the token loop the extra
+    // proposals buy nothing unless they are actually accepted, and at this model's acceptance
+    // they are not: mean accepted length is identical at depth 1, 2 and 3 at 4k.
+    //
+    // Measured on RTX 5090 at the split counts the server runs (not the harness pin), one binary,
+    // DSPARK_TPS with lossless=1 everywhere:
+    //
+    //     ctx    depth 1    depth 3     mean accept (d1 / d3)
+    //     128     81.94      91.69      1.1034 / 1.0159      <- depth 3 wins
+    //     512     92.32      91.95      1.0000 / 1.0000      <- tie, draft inert
+    //     1024    78.72      68.30      1.1429 / 1.1566      <- depth 1 by 15.3%
+    //     2048    83.04      78.35      1.0435 / 1.0435      <- depth 1 by 6.0%
+    //     4096    81.23      74.82      1.0756 / 1.0756      <- depth 1 by 8.6%
+    //
+    // 128 is the one context that prefers the wide block, and for a reason that is visible in its
+    // acceptance column rather than its throughput: at depth 3 the draft accepts essentially
+    // nothing (1.0159), the idle-draft rule stops drafting altogether, and the stream runs at AR
+    // speed. Narrowing raises acceptance just enough (1.1034) to keep the draft alive without
+    // being worth its cost. So the rule is not "narrow always" -- it is "narrow once the draft is
+    // carrying a context whose per-row cost the deeper proposals cannot repay", which is what the
+    // 512 tie and everything above it show.
+    //
+    // Scope: only the band this measures. Below kNarrowMinSeq nothing changes, and the
+    // >= kDeepMinSeq branch keeps its own depth of 7 -- long context is where acceptance actually
+    // climbs and it is measured separately. The batched verify also keeps the static depth: its
+    // row count has to match the graph dflash_warm_verify captured for kProposalDepth+1 rows.
+    static const int kNarrowMinSeq = []{
+        const char* e = getenv("SPARKINFER_DFLASH_NARROW_MINSEQ");
+        int v = e ? atoi(e) : 512;
+        return v < 1 ? 1 : v;
+    }();
     // Explicit override wins; 0/unset selects by length. Keep in sync with dflash_draft.cpp, which
     // reads the same variable for its own default and is handed this value per block.
     static const int kProposalDepthEnv = []{
@@ -3108,8 +3144,15 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // deep threshold accepts deeply enough to pay for leaving it. The >= kDeepMinSeq branch keeps
     // its 7: long context is where acceptance actually climbs (the ladder above this comment), and
     // it is measured separately.
+    // Narrow band (see the table below): a generation that STARTS above kNarrowMinSeq and stays
+    // below the deep threshold proposes one token, not three. Decided once per generation rather
+    // than per step, because the verify graph dflash_warm_verify captures is sized from this and
+    // a graph built for a row count the stream never uses costs more than the rows it saves --
+    // measured, per-step narrowing under a 4-row warm graph recovers only 0.7% of the 9.4%.
     const int kProposalDepth = kProposalDepthEnv > 0 ? kProposalDepthEnv
-                             : ((n + max_new) >= kDeepMinSeq ? 7 : 3);
+                             : ((n + max_new) >= kDeepMinSeq ? 7
+                                : (n >= kNarrowMinSeq ? 1 : 3));
+
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
     // accepted length, and it has no reason to sit at exactly B. Measured on RTX 5090 at the three
