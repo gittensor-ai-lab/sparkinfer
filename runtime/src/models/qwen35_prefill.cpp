@@ -2578,6 +2578,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // N one-row calls are bit-identical to N AR steps, which is what keeps the speculative
         // path lossless by construction rather than by measurement.
         if (type == kernels::SI_QTYPE_NVFP4) {
+            // One weight stream for all N rows when a rows kernel covers this width. It reproduces
+            // the one-row kernel's dot and split-fold order per row, so the results are the same
+            // bits the loop below produces -- the loop stays as the fallback for widths it does
+            // not cover, and is what every other N still runs.
+            if (kernels::launch_gemv_nvfp4_rows(in, w, out, N, no, k, st)) return true;
             for (int r = 0; r < N; ++r)
                 kernels::launch_gemv_nvfp4(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
             return true;
@@ -2605,6 +2610,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // Native FP8/NVFP4 touch no shared q81 scratch, so unlike the mmvq path below they are
         // safe on ANY stream and never need the fall-back to `st`.
         if (type == kernels::SI_QTYPE_FP8 || type == kernels::SI_QTYPE_NVFP4) {
+            if (type == kernels::SI_QTYPE_NVFP4 &&
+                kernels::launch_gemv_nvfp4_rows(in, w, out, N, no, k, ps)) return true;
             for (int r = 0; r < N; ++r) {
                 const bf16* xr = in + (size_t)r * k;
                 bf16* yr = out + (size_t)r * no;

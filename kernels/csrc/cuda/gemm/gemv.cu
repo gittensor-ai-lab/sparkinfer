@@ -622,6 +622,76 @@ template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloa
 template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 #endif
 
+// Row-batched form of gemv_nvfp4_sk_kernel: R activation rows against ONE weight stream.
+//
+// The speculative verify projects R rows through the same weight matrix. For every quantized type
+// that has a rows kernel (launch_mmvq_rows) it streams the weights once for all R; NVFP4 had no
+// such kernel, so the verify fell back to R separate one-row launches and re-read the whole
+// matrix R times. On the ModelOpt checkpoint every GDN and attention projection is NVFP4, so that
+// is the batched verify's dominant cost and a reason it stays more expensive per emitted token
+// than the token loop it is meant to replace.
+//
+// Bit-identical per row, by construction and for the same reason launch_mmvq_q4k_rows is: row r
+// walks exactly the group sequence the one-row kernel walks for it (same split, same lane, same
+// stride), accumulates into its own float, and folds its splits in the same ascending order. Only
+// the weight and scale loads are shared between rows -- the arithmetic per row is untouched, which
+// is what keeps the speculative path lossless by construction rather than by measurement.
+template <typename OutT, int S, int R>
+__global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
+                                          const void* __restrict__ packed,
+                                          OutT* __restrict__ y, int N, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float s_part[RPB][S][R];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n = blockIdx.x * RPB + row_local;
+    float acc[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.f;
+    if (n < N) {
+        const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
+        const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
+        const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
+        const unsigned char* srow = sf + (size_t)n * (size_t)(K >> 4);
+        const unsigned char* prow = w + (size_t)n * (size_t)(K >> 1);
+        const int ng = K >> 4;
+        for (int g = split * 32 + lane; g < ng; g += S * 32) {
+            const unsigned char sc = srow[g];
+            #pragma unroll
+            for (int r = 0; r < R; r++)
+                acc[r] += si_nvfp4_group_dot(prow + (size_t)g * 8, sc, inv_g,
+                                             x + (size_t)r * K + (size_t)g * 16);
+        }
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) acc[r] += __shfl_xor_sync(0xffffffff, acc[r], m);
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < R; r++) s_part[row_local][split][r] = acc[r];
+        }
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            float o = s_part[row_local][0][r];
+            #pragma unroll
+            for (int t = 1; t < S; t++) o += s_part[row_local][t][r];
+            gemv_write(y + (size_t)r * N + n, o);
+        }
+    }
+}
+#ifndef _MSC_VER
+#define SI_NVFP4_ROWS_INST(S_, R_) \
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+SI_NVFP4_ROWS_INST(2, 2) SI_NVFP4_ROWS_INST(4, 2) SI_NVFP4_ROWS_INST(8, 2)
+SI_NVFP4_ROWS_INST(2, 4) SI_NVFP4_ROWS_INST(4, 4) SI_NVFP4_ROWS_INST(8, 4)
+SI_NVFP4_ROWS_INST(2, 6) SI_NVFP4_ROWS_INST(4, 6) SI_NVFP4_ROWS_INST(8, 6)
+#undef SI_NVFP4_ROWS_INST
+#endif
+
 template <typename OutT>
 __global__ void gemv_nvfp4_kernel(const __nv_bfloat16* __restrict__ x,
                                   const void* __restrict__ packed,
@@ -2204,6 +2274,31 @@ void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K, cuda
     }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_nvfp4_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+}
+
+bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N, int K,
+                            cudaStream_t stream) {
+    if (!x || !W || !y || N < 1 || K < 1 || (K & 15)) return false;
+    if (!gemv_bf16_splitk()) return false;          // the rows kernel exists in split-K form only
+    if (M != 2 && M != 4 && M != 6) return false;   // instantiated widths; caller loops otherwise
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+    auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
+#define SI_NVFP4_ROWS(S_, R_) do { \
+        constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
+        const dim3 grid((N + RPB - 1) / RPB); \
+        gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+    } while (0)
+#define SI_NVFP4_ROWS_S(R_) do { \
+        if (N >= 8192)      SI_NVFP4_ROWS(2, R_); \
+        else if (N >= 4096) SI_NVFP4_ROWS(4, R_); \
+        else                SI_NVFP4_ROWS(8, R_); \
+    } while (0)
+    if (M == 2)      SI_NVFP4_ROWS_S(2);
+    else if (M == 4) SI_NVFP4_ROWS_S(4);
+    else             SI_NVFP4_ROWS_S(6);
+#undef SI_NVFP4_ROWS_S
+#undef SI_NVFP4_ROWS
+    return true;
 }
 
 void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int K, cudaStream_t stream) {
