@@ -2609,7 +2609,14 @@ void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K,
 // activation rows; y is [M, N] fp32. Returns false when the shape is unsupported (caller loops).
 bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
                                        int N, int K, int M, cudaStream_t stream) {
-    if (K != 2048 || M < 1 || M > 16) return false;   // draft head shape (H=2048, B<=16)
+    // NSUPER is K/256, the super-block count the kernel strides the weight by. It was
+    // instantiated for K=2048 alone, so every draft whose hidden size is not 2048 -- Qwen3.8-27B's
+    // DSpark draft is H=5120 -- silently declined here and fell back to the per-row LM-head loop
+    // in dflash_draft.cpp, which walks the whole 248k-row head once PER ROW. Same omission, and
+    // the same fix, as the K=5120/6144 instantiations launch_mmvq_q4k_rows already carries.
+    if (M < 1 || M > 16) return false;
+    const int nsuper = (K == 2048) ? 8 : (K == 5120) ? 20 : (K == 6144) ? 24 : 0;
+    if (!nsuper) return false;
     static const int cap = []{
         if (const char* e = getenv("SPARKINFER_DFLASH_HEAD_CTAS")) return atoi(e);
         int sm = 0, dev = 0;
@@ -2623,9 +2630,18 @@ bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
     dim3 grid(nblk);
     auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     auto* w = reinterpret_cast<const unsigned char*>(W);
-    if (M == 3) si_mmvq_q4k_multirow_kernel<float, 16, 8, 3, 3><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
-    else if (M == 6) si_mmvq_q4k_multirow_kernel<float, 16, 8, 6, 6><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
-    else si_mmvq_q4k_multirow_kernel<float, 16, 8, 16><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M);
+    // MFIXED 3 and 6 keep the row loop fully unrolled at the two depths the draft actually uses;
+    // anything else runs the MMAX=16 form with a runtime bound.
+    #define SI_MR_BY_M(NS) \
+        do { \
+            if (M == 3)      si_mmvq_q4k_multirow_kernel<float, 16, NS, 3, 3><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); \
+            else if (M == 6) si_mmvq_q4k_multirow_kernel<float, 16, NS, 6, 6><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); \
+            else             si_mmvq_q4k_multirow_kernel<float, 16, NS, 16><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); \
+        } while (0)
+    if (nsuper == 8)       SI_MR_BY_M(8);
+    else if (nsuper == 20) SI_MR_BY_M(20);
+    else                   SI_MR_BY_M(24);
+    #undef SI_MR_BY_M
     return true;
 }
 
