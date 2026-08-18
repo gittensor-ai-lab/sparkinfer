@@ -3154,6 +3154,29 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         return v < 1 ? 1 : v;
     }();
     int compact_score = 0;
+    // Consecutive steps on which the batched verify stayed disarmed. In the token loop a draft
+    // block can NEVER save a target forward (see the strict-LOSS note above: a step that keeps
+    // `keep` tokens runs exactly `keep` target forwards, the same count AR runs) -- its only
+    // payoff is arming the batched verify. So once the draft has demonstrably stopped landing full
+    // blocks, the block is pure overhead and is skipped, which degenerates the step to AR.
+    // Probes keep it self-correcting: every kDraftProbePeriod steps one block is drafted anyway,
+    // so a stream whose draft starts tracking re-arms exactly as it would have.
+    // SPARKINFER_DFLASH_IDLE_DRAFT=0 restores main's unconditional draft.
+    int disarmed_run = 0;
+    static const int kIdleDraftOn = []{
+        const char* e = getenv("SPARKINFER_DFLASH_IDLE_DRAFT");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    static const int kDraftProbeAfter = []{
+        const char* e = getenv("SPARKINFER_DFLASH_IDLE_AFTER");
+        int v = e ? atoi(e) : 8;
+        return v < 1 ? 1 : v;
+    }();
+    static const int kDraftProbePeriod = []{
+        const char* e = getenv("SPARKINFER_DFLASH_IDLE_PROBE");
+        int v = e ? atoi(e) : 32;
+        return v < 2 ? 2 : v;
+    }();
     int keep_ema8 = 0;   // EMA of keep, alpha = 1/8, held x8 so the decode path needs no float
     int step_no = 0;
     bf16* th_scratch = nullptr;
@@ -3198,6 +3221,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             (compact_mode != 0 && (short_ctx ? compact_score >= kBlockScore
                                              : ((start + B) >= kEngageMinSeq &&
                                                 keep_ema8 >= kEngageKeepLong * 8)));
+        if (compact_verify) disarmed_run = 0; else ++disarmed_run;
+        // Skip the draft only after kDraftProbeAfter consecutive disarmed steps, and let every
+        // kDraftProbePeriod-th step through as a probe.
+        const bool draft_idle = kIdleDraftOn && !compact_verify &&
+                                disarmed_run > kDraftProbeAfter &&
+                                ((disarmed_run - kDraftProbeAfter) % kDraftProbePeriod) != 0;
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 
@@ -3261,7 +3290,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             p0 = forward_token(block[0], start, true);
             s.defer_decode_sync = false;
         }
-        const bool draft_ok = draft.forward_block(
+        const bool draft_ok = draft_idle ? true : draft.forward_block(
             draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth,
             draft_confidence.data());
         if (getenv("SPARKINFER_DFLASH_CONFIDENCE_DEBUG")) {
@@ -3278,7 +3307,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             fprintf(stderr, "[dflash] draft forward failed at start=%d\n", start);
             break;
         }
-        for (int i = 1; i <= kProposalDepth; i++) block[i] = draft_ids[i];
+        if (!draft_idle) for (int i = 1; i <= kProposalDepth; i++) block[i] = draft_ids[i];
 
         // Incremental verify with early-exit: forward only the accepted prefix, stopping at the
         // first rejected proposal. forward_token advances GDN state + KV per token, so after
@@ -3312,7 +3341,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             return e ? (float)atof(e) : 0.f;
         }();
         static const bool confidence_gate_on = getenv("SPARKINFER_DFLASH_CONFIDENCE_GATE") != nullptr;
-        if (!compact_verify && !vfail && block[1] == p0) {
+        if (!compact_verify && !draft_idle && !vfail && block[1] == p0) {
             for (int i = 1; i <= kProposalDepth; i++) {
                 if (i > 1 && confidence_gate_on && draft_confidence[i] < kConfidenceGate) break;
                 set_dflash_capture_row(i);
