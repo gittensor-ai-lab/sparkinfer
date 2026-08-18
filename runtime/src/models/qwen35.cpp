@@ -3087,8 +3087,29 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 0;
         return v < 0 ? 0 : (v > 15 ? 15 : v);
     }();
+    // Below the deep threshold the depth is 3, not 5. Two measurements decide it, both on the
+    // RTX 5090 against the released DSpark draft (block_size 7):
+    //
+    //   1. ACCEPTANCE SATURATES BELOW 4. At ctx=128 the mean accepted length is 1.2549 at depth 3
+    //      and *exactly* 1.2549 at 4, 5 and 6 -- proposals past the third are never accepted, so
+    //      every target row spent verifying them is spent for nothing. At ctx=4096 it is 1.113 at
+    //      depth 3 against 1.123 at depth 5, i.e. a hundredth of a token for two extra rows.
+    //
+    //   2. DEPTH 4 IS A CLIFF, NOT A SLOPE. The draft's active block width is
+    //      round_up(depth+1) over {4, 8, 16} capped at block_size, so depth 3 runs a 4-wide draft
+    //      block and depth 4 runs a 7-wide one. Crossing it costs a quarter of the throughput for
+    //      the zero extra accepts above:
+    //
+    //        ctx=128   depth 1/2/3 -> 64.89 / 65.00 / 66.13 tok/s   depth 4/5/6 -> 48.74 / 48.45 / 48.12
+    //        ctx=4096  depth 3 -> 29.88                             depth 5/7   -> 24.28 / 20.46
+    //        ctx=512   depth 3/5/7 -> 77.65 / 77.62 / 77.56         (accept 1.0: DSpark is inert here)
+    //
+    // So 3 is the largest depth that still fits the cheap block-width tier, and nothing below the
+    // deep threshold accepts deeply enough to pay for leaving it. The >= kDeepMinSeq branch keeps
+    // its 7: long context is where acceptance actually climbs (the ladder above this comment), and
+    // it is measured separately.
     const int kProposalDepth = kProposalDepthEnv > 0 ? kProposalDepthEnv
-                             : ((n + max_new) >= kDeepMinSeq ? 7 : 5);
+                             : ((n + max_new) >= kDeepMinSeq ? 7 : 3);
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
     // accepted length, and it has no reason to sit at exactly B. Measured on RTX 5090 at the three
