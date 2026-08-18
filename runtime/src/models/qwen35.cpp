@@ -3172,9 +3172,48 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 8;
         return v < 1 ? 1 : v;
     }();
+    // ...but 8 was measured at ctx=128, and past kEngageMinSeq the arithmetic that makes a warmup
+    // worth paying for no longer holds.
+    //
+    // Arming the batched verify requires keep_ema8 >= kEngageKeepLong * 8. keep_ema8 is an
+    // alpha-1/8 EMA of keep held x8, so its fixed point is 8 * mean(keep): the gate is exactly
+    // "mean accepted length >= kEngageKeepLong", i.e. >= 2 tokens. The released DSpark draft
+    // against this target measures tau 1.0847 at ctx=4096 -- so the EMA settles near 8.7 against a
+    // threshold of 16 and CANNOT reach it. The eight disarmed steps are spent gathering evidence
+    // for a threshold that is arithmetically out of reach.
+    //
+    // Two more reasons the wait is worse here than at 128. The stream past the floor STARTS armed
+    // (the step-0 seed below), so it has already been given its chance before the counter begins.
+    // And a decode step at 4k costs ~3x one at 128 -- the same eight blocks are ~3x more expensive
+    // in absolute terms, against a 128-token generation, which is why this is worth 9-10% rather
+    // than a rounding error.
+    //
+    // Only the WARMUP shortens. kDraftProbePeriod is untouched, so a stream whose draft does start
+    // tracking re-arms on exactly the same schedule it does today, and the adaptivity #869 built is
+    // preserved -- this changes how long the path waits before believing what it has measured, not
+    // whether it can change its mind.
+    static const int kDraftProbeAfterLong = []{
+        const char* e = getenv("SPARKINFER_DFLASH_IDLE_AFTER_LONG");
+        int v = e ? atoi(e) : 1;
+        return v < 1 ? 1 : v;
+    }();
     static const int kDraftProbePeriod = []{
         const char* e = getenv("SPARKINFER_DFLASH_IDLE_PROBE");
         int v = e ? atoi(e) : 32;
+        return v < 2 ? 2 : v;
+    }();
+    // The re-arming probe is also priced for ctx=128. Past kEngageMinSeq it guards against a
+    // transition that CANNOT happen on one lucky block: re-arming needs keep_ema8 to climb from
+    // ~8.7 (tau 1.0847) to 16, i.e. the mean accepted length has to roughly double and STAY there
+    // for several steps, because alpha is 1/8. A single probe block can never supply that evidence
+    // -- only a sustained run can, and a sustained run is exactly what a longer period still
+    // catches. Meanwhile at 32 a 128-token generation pays ~3 probe blocks, each costing about a
+    // full target forward, which is the remaining gap to the AR leg this path degenerates to.
+    // 256 still probes: any generation long enough for the draft's behaviour to genuinely change
+    // is long enough to be re-tested. Below the floor the period is untouched.
+    static const int kDraftProbePeriodLong = []{
+        const char* e = getenv("SPARKINFER_DFLASH_IDLE_PROBE_LONG");
+        int v = e ? atoi(e) : 256;
         return v < 2 ? 2 : v;
     }();
     int keep_ema8 = 0;   // EMA of keep, alpha = 1/8, held x8 so the decode path needs no float
@@ -3224,9 +3263,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         if (compact_verify) disarmed_run = 0; else ++disarmed_run;
         // Skip the draft only after kDraftProbeAfter consecutive disarmed steps, and let every
         // kDraftProbePeriod-th step through as a probe.
+        // Past the batched-verify floor the draft has to EARN its block against a gate it can only
+        // clear at tau >= kEngageKeepLong; below the floor nothing changes.
+        const bool long_ctx = (start + B) >= kEngageMinSeq;
+        const int probe_after  = long_ctx ? kDraftProbeAfterLong  : kDraftProbeAfter;
+        const int probe_period = long_ctx ? kDraftProbePeriodLong : kDraftProbePeriod;
         const bool draft_idle = kIdleDraftOn && !compact_verify &&
-                                disarmed_run > kDraftProbeAfter &&
-                                ((disarmed_run - kDraftProbeAfter) % kDraftProbePeriod) != 0;
+                                disarmed_run > probe_after &&
+                                ((disarmed_run - probe_after) % probe_period) != 0;
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 
@@ -3237,8 +3281,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // the accepted suffix preserved. The compact path runs the draft to completion first, so
         // nothing can overwrite dflash_hidden underneath it and the copy plus its full-device
         // synchronize are pure overhead.
+        // ...and an idle step needs it even less than the compact path does: draft_idle skips
+        // forward_block() entirely, so NOTHING reads draft_hidden and nothing can overwrite
+        // dflash_hidden underneath it. The copy is dead and the full stream synchronize with it --
+        // and that sync is the expensive half, because it drains the decode stream to the host once
+        // per step on a path that is otherwise pure AR. This is what keeps a fully idled stream
+        // short of the AR leg it degenerates to.
         const void* draft_hidden = target_hidden;
-        if (!compact_verify && target_hidden == s.dflash_hidden) {
+        if (!compact_verify && !draft_idle && target_hidden == s.dflash_hidden) {
             cu(cudaMemcpyAsync(th_scratch, target_hidden,
                                (size_t)th_len * row_stride * sizeof(bf16),
                                cudaMemcpyDeviceToDevice, s.stream), "dflash overlap stash");

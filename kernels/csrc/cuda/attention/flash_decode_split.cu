@@ -1110,27 +1110,46 @@ void launch_flash_decode_split(
             // 48 KB default, so the kernel opts in once. SPARKINFER_FA_PIPE=0 disables.
             static int fa6_pipe = -1;
             if (fa6_pipe < 0) { const char* e = getenv("SPARKINFER_FA_PIPE"); fa6_pipe = (e && e[0] == '0') ? 0 : 1; }
+            // Deepen the PIPELINED tile from 32 to 48. 32 is what the synchronous launcher could
+            // afford under the 48 KB default; the pipelined kernel already opts in, and at a small
+            // split count this launcher runs ~4 CTAs, so blocks/SM is not what bounds it. 48 needs
+            // 4 * 48 * 256 * 2 = 96 KB, which fits sm_120's ~100 KB dynamic cap; 64 would need
+            // 128 KB and does NOT fit (measured: the opt-in fails and the whole pipeline is lost).
+            //
+            // CASCADING fallback, deliberately: try 48, then 32, and only then the synchronous
+            // tile. All-or-nothing on 48 would mean a device where 64 KB fits but 96 KB does not
+            // silently loses the cp.async pipeline entirely -- strictly worse than main. This way
+            // every device keeps at least the depth it has today.
+            // SPARKINFER_FA_PIPE_TILE pins a depth for A/B in one binary.
+            static int fa6_pt = -1;
+            if (fa6_pt < 0) { const char* e = getenv("SPARKINFER_FA_PIPE_TILE"); fa6_pt = e ? atoi(e) : 48; }
+#define SI_PIPE_TRY(PTV)                                                                          \
+            do {                                                                                  \
+                constexpr int PT = (PTV);                                                         \
+                const size_t psm = (size_t)4 * PT * 256 * sizeof(__nv_bfloat16);                  \
+                static int ok_##PTV = -1;                                                         \
+                if (ok_##PTV < 0) {                                                               \
+                    ok_##PTV = (cudaFuncSetAttribute(                                             \
+                                   (const void*)fa_split_gqa_pipe_kernel<256, GQA, PT>,           \
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,                   \
+                                   (int)psm) == cudaSuccess) ? 1 : 0;                             \
+                    if (!ok_##PTV) cudaGetLastError();                                            \
+                }                                                                                 \
+                if (ok_##PTV) {                                                                   \
+                    fa_split_gqa_pipe_kernel<256, GQA, PT><<<gq, GQA * 32, psm, stream>>>(        \
+                        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table,   \
+                        seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads,     \
+                        block_size, max_blocks, n_splits);                                        \
+                    combine_hd256(out_q8);                                                        \
+                    (void)seqlen;                                                                 \
+                    return;                                                                       \
+                }                                                                                 \
+            } while (0)
             if (fa6_pipe && !int8_kv && fa6_deep) {
-                constexpr int PT = FA_GQA6_TILE_DEEP;
-                const size_t psm = (size_t)4 * PT * 256 * sizeof(__nv_bfloat16);
-                static int pipe_ok = -1;
-                if (pipe_ok < 0) {
-                    pipe_ok = (cudaFuncSetAttribute(
-                                   (const void*)fa_split_gqa_pipe_kernel<256, GQA, PT>,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   (int)psm) == cudaSuccess) ? 1 : 0;
-                    if (!pipe_ok) cudaGetLastError();   // clear, fall through to the synchronous tile
-                }
-                if (pipe_ok) {
-                    fa_split_gqa_pipe_kernel<256, GQA, PT><<<gq, GQA * 32, psm, stream>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table,
-                        seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads,
-                        block_size, max_blocks, n_splits);
-                    combine_hd256(out_q8);
-                    (void)seqlen;
-                    return;
-                }
+                if (fa6_pt >= 48) SI_PIPE_TRY(48);
+                SI_PIPE_TRY(32);
             }
+#undef SI_PIPE_TRY
             if (int8_kv) {
                 if (fa6_deep) SI_FA6_LAUNCH(TILE_DEEP, true);
                 else          SI_FA6_LAUNCH(TILE, true);
