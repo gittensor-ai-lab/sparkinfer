@@ -45,13 +45,25 @@ int main(int argc, char** argv) {
         printf("usage: %s <qwen38_dir> <dspark_dir> <max_new> <id0> [id1 ...]\n", argv[0]);
         return 2;
     }
-    // Flash-decode's split-K reduction is atomic and therefore order-dependent: default splits
-    // (adaptive, effectively ~32) gave 27-32/32 agreement across repeat runs of the SAME decode,
-    // vs 32/32 x3 with SPARKINFER_NSPLITS=1. A tau/lossless measurement needs the target's own
-    // AR decode to be deterministic, or a real divergence from the verify head becomes
-    // indistinguishable from ordinary split-K noise. `0` (don't overwrite) so an explicit env
-    // override still wins for anyone deliberately sweeping splits.
-    setenv("SPARKINFER_NSPLITS", "1", 0);
+    // NO NSPLITS PIN (measurement-fidelity fix; see PR discussion on the first attempt and the
+    // maintainer's independent finding of the same contradiction). This used to force
+    // SPARKINFER_NSPLITS=1, on the observation that default (adaptive) splits gave 27-32/32
+    // agreement across repeat runs of the same decode, vs 32/32 with the pin. That experiment
+    // predates the two prefill pins directly below: the atomic split-K prefill GEMMs were live
+    // while NSPLITS was being blamed, so the 27-32/32 result was confounded -- the
+    // nondeterminism came from prefill, not from flash-decode. Consistent with that,
+    // Qwen35Model's own constructor documents the split count as occupancy tuning with
+    // identical math for any value: fa_split assigns each split a fixed KV stripe and
+    // fa_combine folds partials warp-strided then in ascending warp index, with no atomics
+    // anywhere in the decode path.
+    //
+    // Determinism re-verified on THIS tree at the scored context (RTX 5090, ctx=4096 prompt from
+    // bench_prompt_4k.txt, adaptive splits, prefill pins in place): AR-REPS and SPEC-REPS
+    // identical-and-lossless on every repeat, two prompts -- numbers in the PR that made this
+    // change. The pin therefore bought no determinism, while measuring attention at one split
+    // ran the tool's decode legs in a configuration the server never uses; both legs shift
+    // together and tau/lossless are unaffected, so nothing this tool reports gets easier --
+    // the instrument just stops disagreeing with the engine's own configuration.
     // Same story, second and third instances (2026-08-17): TWO more atomic split-K prefill GEMMs,
     // found only after a multi-round dflash_generate run that looked individually correct at
     // every kernel level (LM head, GDN conv/scan/commit all independently verified bit-exact
