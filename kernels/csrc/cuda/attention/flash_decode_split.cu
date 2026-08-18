@@ -258,6 +258,172 @@ __global__ void fa_split_gqa_pipe_kernel(
     }
 }
 
+
+// KV-GROUP SPLIT of the cp.async pipeline kernel.
+//
+// #874 hid the staging latency but left the shape of the grid alone: at a small split count this
+// launcher runs dim3(num_kv_heads * n_splits, num_seqs) = ~4 CTAs of GQA*32 = 192 threads, i.e.
+// six warps on four SMs of 170. Measured with a skip-probe (mainloop removed) the walk is still
+// ~47% of the decode step, so the work is there -- there are simply almost no warps doing it.
+//
+// Split the block's KV range across KVG warp-groups instead. Each group walks its own contiguous
+// stripe with its own double-buffered tile and its own (m, l, acc), and the groups are merged once
+// at the end with the standard log-sum-exp rescale. This multiplies warps per SM by KVG WITHOUT
+// touching n_splits, the part_m/part_l/part_acc layout, or the combine kernel -- the block still
+// emits exactly one split's partials per q-head.
+//
+// EXACTNESS. Within a stripe the token order is unchanged, and the cross-group merge folds groups
+// in ascending index with a fixed formula, so the result is deterministic run to run. It is a
+// different summation ORDER than the single-group walk (a partition of the same keys), so it is
+// not bit-identical -- it is the same reassociation the existing n_splits>1 combine already
+// performs, and acceptance is unaffected because the draft is untouched.
+//
+// SHARED MEMORY. sm_120 has 128 KB of L1/shared per SM, ~100 KB addressable as dynamic smem --
+// NOT the 228 KB of datacenter Blackwell. KVG=2 at TILE=16 needs 4 * 16 * 256 * 2 B * 2 = 64 KB
+// of tiles plus KVG*GQA*HEAD_DIM floats of merge scratch (12 KB), which fits; KVG=4 or TILE>=24
+// does not. That cap is why this is a 2-group split and not a 4-group one.
+template <int HEAD_DIM, int GQA, int TILE, int KVG>
+__global__ void fa_split_gqa_pipeg_kernel(
+    const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pool,
+    const void* __restrict__ v_pool, const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens,
+    float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+    float scale, int num_q_heads, int num_kv_heads, int block_size, int max_blocks, int n_splits
+) {
+    constexpr int ELEMS  = HEAD_DIM / 32;
+    constexpr int TELEMS = TILE * HEAD_DIM;
+    constexpr int GTHR   = GQA * 32;              // threads per KV group
+    const int seq0  = blockIdx.y;
+    const int split = blockIdx.x % n_splits;
+    const int kvh   = blockIdx.x / n_splits;
+    const int grp   = threadIdx.x / GTHR;
+    const int gtid  = threadIdx.x - grp * GTHR;
+    const int warp  = gtid >> 5;
+    const int lane  = gtid & 31;
+    const int qh    = kvh * GQA + warp;
+
+    float qr[ELEMS];
+    {
+        const __nv_bfloat16* qp = q + (size_t)(seq0 * num_q_heads + qh) * HEAD_DIM;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) qr[e] = fa_to_f(qp[lane + e * 32]);
+    }
+
+    const int sl    = seq_lens[seq0];
+    const int chunk = (sl + n_splits - 1) / n_splits;
+    const int start = split * chunk;
+    const int end   = min(sl, start + chunk);
+    // Every group runs the SAME iteration count so the block-wide barriers stay uniform; a group
+    // whose stripe is short simply contributes valid==0 tiles.
+    const int span  = end > start ? end - start : 0;
+    const int gch   = (span + KVG - 1) / KVG;
+    const int gs    = start + grp * gch;
+    const int ge    = min(end, gs + gch);
+    const int niter = (gch + TILE - 1) / TILE;
+
+    float m = -1e30f, l = 0.f, acc[ELEMS];
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
+
+    extern __shared__ __nv_bfloat16 s_kv[];
+    __nv_bfloat16* s_k = s_kv + (size_t)grp * 4 * TELEMS;
+    __nv_bfloat16* s_v = s_k  + (size_t)2 * TELEMS;
+    __shared__ size_t s_rowbase[KVG][2][TILE];
+    __shared__ float  s_mm[KVG][GQA], s_ll[KVG][GQA];
+    __shared__ float  s_ac[KVG][GQA][HEAD_DIM];
+    const __nv_bfloat16* __restrict__ kb = reinterpret_cast<const __nv_bfloat16*>(k_pool);
+    const __nv_bfloat16* __restrict__ vb = reinterpret_cast<const __nv_bfloat16*>(v_pool);
+
+    auto resolve = [&](int buf, int t0v, int validv) {
+        if (gtid < validv) {
+            const int t = t0v + gtid;
+            const int blk = t / block_size, wb = t % block_size;
+            const int phys = block_table[seq0 * max_blocks + blk];
+            const size_t tokrow = (size_t)(phys * block_size + wb) * num_kv_heads + kvh;
+            s_rowbase[grp][buf][gtid] = tokrow * HEAD_DIM;
+        }
+    };
+    auto issue = [&](int buf, int validv) {
+        __nv_bfloat16* dk = s_k + (size_t)buf * TELEMS;
+        __nv_bfloat16* dv = s_v + (size_t)buf * TELEMS;
+        for (int i = gtid * 8; i < validv * HEAD_DIM; i += GTHR * 8) {
+            const int within = i / HEAD_DIM, d = i % HEAD_DIM;
+            const size_t base = s_rowbase[grp][buf][within] + d;
+            __pipeline_memcpy_async(dk + i, kb + base, 16);
+            __pipeline_memcpy_async(dv + i, vb + base, 16);
+        }
+        __pipeline_commit();
+    };
+
+    int buf = 0;
+    {
+        const int v0 = ge > gs ? min(TILE, ge - gs) : 0;
+        resolve(0, gs, v0);
+        __syncthreads();
+        issue(0, v0);            // committed even when v0==0, so the group count stays uniform
+    }
+    for (int it = 0; it < niter; it++) {
+        const int t0 = gs + it * TILE;
+        const int valid  = (t0 < ge) ? min(TILE, ge - t0) : 0;
+        const int nt0    = t0 + TILE;
+        const int nvalid = (nt0 < ge) ? min(TILE, ge - nt0) : 0;
+        const bool more  = (it + 1 < niter);
+        if (more) {
+            resolve(buf ^ 1, nt0, nvalid);
+            __syncthreads();
+            issue(buf ^ 1, nvalid);
+        }
+        __pipeline_wait_prior(more ? 1 : 0);
+        __syncthreads();
+        const __nv_bfloat16* ck = s_k + (size_t)buf * TELEMS;
+        const __nv_bfloat16* cv = s_v + (size_t)buf * TELEMS;
+        for (int tt = 0; tt < valid; tt++) {
+            float kv_k[ELEMS], kv_v[ELEMS];
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++) {
+                kv_k[e] = fa_to_f(ck[tt * HEAD_DIM + lane + e * 32]);
+                kv_v[e] = fa_to_f(cv[tt * HEAD_DIM + lane + e * 32]);
+            }
+            float p = 0.f;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++) p += qr[e] * kv_k[e];
+            const float score = fa_wsum(p) * scale;
+            const float mn = fmaxf(m, score), corr = __expf(m - mn), pe = __expf(score - mn);
+            l = l * corr + pe;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++) acc[e] = acc[e] * corr + pe * kv_v[e];
+            m = mn;
+        }
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    // Cross-group merge: ascending group index, fixed formula -> deterministic.
+    if (lane == 0) { s_mm[grp][warp] = m; s_ll[grp][warp] = l; }
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) s_ac[grp][warp][lane + e * 32] = acc[e];
+    __syncthreads();
+    if (grp == 0) {
+        float mm = -1e30f;
+        #pragma unroll
+        for (int g = 0; g < KVG; g++) mm = fmaxf(mm, s_mm[g][warp]);
+        float ll = 0.f, aa[ELEMS];
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) aa[e] = 0.f;
+        #pragma unroll
+        for (int g = 0; g < KVG; g++) {
+            const float c = __expf(s_mm[g][warp] - mm);
+            ll += s_ll[g][warp] * c;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++) aa[e] += s_ac[g][warp][lane + e * 32] * c;
+        }
+        const int idx = (seq0 * num_q_heads + qh) * n_splits + split;
+        if (lane == 0) { part_m[idx] = mm; part_l[idx] = ll; }
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) part_acc[(size_t)idx * HEAD_DIM + lane + e * 32] = aa[e];
+    }
+}
+
 template <int HEAD_DIM, int GQA, int TILE, bool INT8, int SEQ = 1>
 __global__ void fa_split_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pool,
@@ -1110,6 +1276,47 @@ void launch_flash_decode_split(
             // 48 KB default, so the kernel opts in once. SPARKINFER_FA_PIPE=0 disables.
             static int fa6_pipe = -1;
             if (fa6_pipe < 0) { const char* e = getenv("SPARKINFER_FA_PIPE"); fa6_pipe = (e && e[0] == '0') ? 0 : 1; }
+            // KV-GROUP split: KVG warp-groups per block, each walking its own stripe. Raises
+            // warps/SM by KVG without changing n_splits or the combine. Off by default until
+            // measured; SPARKINFER_FA_KVG=2 selects it. Tau-neutral -- the draft is untouched.
+            static int fa6_kvg = -1;
+            if (fa6_kvg < 0) { const char* e = getenv("SPARKINFER_FA_KVG"); fa6_kvg = e ? atoi(e) : 3; }
+            // KT (tile per group) is swept independently of KVG: both trade against the same
+            // ~100 KB dynamic-smem cap, so the best point is not obvious a priori.
+            //   KVG=2 KT=16 -> 64 KB tiles + 13 KB merge = 77 KB
+            //   KVG=2 KT=20 -> 80 KB          + 13 KB    = 93 KB
+            //   KVG=3 KT=12 -> 72 KB          + 19 KB    = 91 KB
+            static int fa6_kt = -1;
+            if (fa6_kt < 0) { const char* e = getenv("SPARKINFER_FA_KVG_TILE"); fa6_kt = e ? atoi(e) : 16; }
+#define SI_KVG_TRY(KVGV, KTV)                                                                     \
+            do {                                                                                  \
+                constexpr int KVG = (KVGV), KT = (KTV);                                           \
+                const size_t gsm = (size_t)4 * KT * 256 * sizeof(__nv_bfloat16) * KVG;            \
+                static int ok_##KVGV##_##KTV = -1;                                                \
+                if (ok_##KVGV##_##KTV < 0) {                                                      \
+                    ok_##KVGV##_##KTV = (cudaFuncSetAttribute(                                    \
+                                  (const void*)fa_split_gqa_pipeg_kernel<256, GQA, KT, KVG>,      \
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,                    \
+                                  (int)gsm) == cudaSuccess) ? 1 : 0;                              \
+                    if (!ok_##KVGV##_##KTV) cudaGetLastError();                                   \
+                }                                                                                 \
+                if (ok_##KVGV##_##KTV) {                                                          \
+                    fa_split_gqa_pipeg_kernel<256, GQA, KT, KVG>                                  \
+                        <<<gq, GQA * 32 * KVG, gsm, stream>>>(                                    \
+                        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table,   \
+                        seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads,     \
+                        block_size, max_blocks, n_splits);                                        \
+                    combine_hd256(out_q8);                                                        \
+                    (void)seqlen;                                                                 \
+                    return;                                                                       \
+                }                                                                                 \
+            } while (0)
+            if (fa6_kvg >= 2 && fa6_pipe && !int8_kv && fa6_deep && num_seqs == 1) {
+                if (fa6_kvg >= 3)      { SI_KVG_TRY(3, 12); }
+                else if (fa6_kt >= 20) { SI_KVG_TRY(2, 20); }
+                SI_KVG_TRY(2, 16);
+            }
+#undef SI_KVG_TRY
             if (fa6_pipe && !int8_kv && fa6_deep) {
                 constexpr int PT = FA_GQA6_TILE_DEEP;
                 const size_t psm = (size_t)4 * PT * 256 * sizeof(__nv_bfloat16);
