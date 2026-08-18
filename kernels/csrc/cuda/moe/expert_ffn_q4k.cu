@@ -821,10 +821,15 @@ __global__ void gate_up_mmvq2_qwen_kernel(
     const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
     constexpr int NB = H >> 8;
     float tg = 0.f, tu = 0.f;
-    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+    // Two sequential passes, not one interleaved loop. tg and tu are independent accumulators
+    // and each still folds its dots in the same kbx order, so both results are bit-identical to
+    // the interleaved form -- but the warp now streams one contiguous Q4_K row to completion
+    // before touching the other matrix, instead of alternating between two DRAM streams tens of
+    // MB apart every superblock. The activation blocks are re-read by the second pass from L1.
+    for (int kbx = kbx0; kbx < NB; kbx += 8)
         tg += si_vec_dot_q4_K(g_row + kbx, vrow + (size_t)kbx * 8, kqs);
+    for (int kbx = kbx0; kbx < NB; kbx += 8)
         tu += si_vec_dot_q4_K(u_row + kbx, vrow + (size_t)kbx * 8, kqs);
-    }
     __shared__ float sg[NW - 1][WS], su[NW - 1][WS];
     if (warp > 0) { sg[warp - 1][lane] = tg; su[warp - 1][lane] = tu; }
     __syncthreads();

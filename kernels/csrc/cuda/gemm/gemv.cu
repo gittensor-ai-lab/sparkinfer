@@ -539,6 +539,15 @@ __device__ __forceinline__ float si_e2m1_x2(unsigned nibble) {
     // graft the sign bit on rather than branching, so nibble 8 keeps its -0.0f
     return __int_as_float(__float_as_int(__uint2float_rn(mag)) | ((n & 8u) << 28));
 }
+// Same value, one lookup instruction: PRMT selects magnitude byte i of the 8-entry table held in
+// two register-immediate words (bytes {0,1,2,3} / {4,6,8,12}). Selector nibbles above the lowest
+// are zero, so result bytes 1-3 all select table byte 0 (= 0), leaving exactly `mag` -- the same
+// integer si_e2m1_x2's shift-and-mask produces, fed through the identical cvt and sign graft.
+__device__ __forceinline__ float si_e2m1_x2_prmt(unsigned nibble) {
+    const unsigned n = nibble & 15u;
+    const unsigned mag = __byte_perm(0x03020100u, 0x0C080604u, n & 7u);
+    return __int_as_float(__float_as_int(__uint2float_rn(mag)) | ((n & 8u) << 28));
+}
 // Unsigned E4M3 group scale -> float, by assembling the fp32 bits.
 //
 // The ldexpf form costs a branch plus two library calls per 16-weight group. For e>0,
@@ -574,22 +583,51 @@ __device__ __forceinline__ float si_nvfp4_group_dot(const unsigned char* packed8
     for (int i = 0; i < 4; i++) {
         const unsigned b = (p0 >> (8 * i)) & 255u;
         const float2 xf = __bfloat1622float2(x2[i]);
-        acc += (si_e2m1_x2(b & 15u) * s) * xf.x + (si_e2m1_x2(b >> 4) * s) * xf.y;
+        acc += (si_e2m1_x2_prmt(b & 15u) * s) * xf.x + (si_e2m1_x2_prmt(b >> 4) * s) * xf.y;
     }
     #pragma unroll
     for (int i = 0; i < 4; i++) {
         const unsigned b = (p1 >> (8 * i)) & 255u;
         const float2 xf = __bfloat1622float2(x2[i + 4]);
-        acc += (si_e2m1_x2(b & 15u) * s) * xf.x + (si_e2m1_x2(b >> 4) * s) * xf.y;
+        acc += (si_e2m1_x2_prmt(b & 15u) * s) * xf.x + (si_e2m1_x2_prmt(b >> 4) * s) * xf.y;
     }
     return acc;
 }
 
-template <typename OutT, int S>
+// The same 16-weight dot with the weight bytes pre-loaded as one uint2. The FMA sequence is
+// copied from si_nvfp4_group_dot term for term -- p0's four bytes low-nibble-then-high against
+// x2[0..3], then p1's against x2[4..7], accumulated in that order into one running float -- so the
+// result is bit-identical; only how the weight bytes arrived changes (one 8-byte load the caller
+// issues instead of two 4-byte ones here). The activations stay on the narrow bf16x2 loads: they
+// are L2-resident and re-read by every row, so widening them only raises register pressure -- it
+// is the cold weight stream that needs its loads consolidated. The magnitude lookup goes through
+// si_e2m1_x2_prmt, which produces the identical integer by a single PRMT.
+__device__ __forceinline__ float si_nvfp4_group_dot_w(const uint2 w8, unsigned char scale,
+                                                      float inv_g, const __nv_bfloat16* x16) {
+    const float s = si_ue4m3(scale) * inv_g * 0.5f;
+    const unsigned int p0 = w8.x, p1 = w8.y;
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x16);
+    float acc = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p0 >> (8 * i)) & 255u;
+        const float2 xf = __bfloat1622float2(x2[i]);
+        acc += (si_e2m1_x2_prmt(b & 15u) * s) * xf.x + (si_e2m1_x2_prmt(b >> 4) * s) * xf.y;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p1 >> (8 * i)) & 255u;
+        const float2 xf = __bfloat1622float2(x2[i + 4]);
+        acc += (si_e2m1_x2_prmt(b & 15u) * s) * xf.x + (si_e2m1_x2_prmt(b >> 4) * s) * xf.y;
+    }
+    return acc;
+}
+
+template <typename OutT, int S, bool WIDE, int WPB = GEMV_WPB>
 __global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                      const void* __restrict__ packed,
                                      OutT* __restrict__ y, int N, int K) {
-    constexpr int RPB = GEMV_WPB / S;
+    constexpr int RPB = WPB / S;
     __shared__ float s_part[RPB][S];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row_local = warp / S, split = warp % S;
@@ -602,8 +640,21 @@ __global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
         const unsigned char* srow = sf + (size_t)n * (size_t)(K >> 4);
         const unsigned char* prow = w + (size_t)n * (size_t)(K >> 1);
         const int ng = K >> 4;
-        for (int g = split * 32 + lane; g < ng; g += S * 32)
-            acc += si_nvfp4_group_dot(prow + (size_t)g * 8, srow[g], inv_g, x + g * 16);
+        if (WIDE) {
+            // Same groups in the same order; the operands just arrive as one 8-byte and two
+            // 16-byte loads per group instead of ten narrow ones, so each lane has far fewer
+            // load instructions in flight-limiting position while the weights stream cold from
+            // DRAM. The launcher guarantees 8B/16B alignment before selecting this path
+            // (K % 128 == 0 makes every row base 8B-aligned behind the 256 B header, and x is
+            // checked directly).
+            for (int g = split * 32 + lane; g < ng; g += S * 32) {
+                const uint2 w8 = __ldg(reinterpret_cast<const uint2*>(prow + (size_t)g * 8));
+                acc += si_nvfp4_group_dot_w(w8, srow[g], inv_g, x + (size_t)g * 16);
+            }
+        } else {
+            for (int g = split * 32 + lane; g < ng; g += S * 32)
+                acc += si_nvfp4_group_dot(prow + (size_t)g * 8, srow[g], inv_g, x + g * 16);
+        }
         #pragma unroll
         for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
         if (lane == 0) s_part[row_local][split] = acc;
@@ -617,9 +668,13 @@ __global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 #ifndef _MSC_VER
-template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 2>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
-template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
-template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 2, false>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 4, false>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 8, false>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 2, true>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 2, true, 4>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 4, true>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 8, true>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 #endif
 
 template <typename OutT>
@@ -2190,16 +2245,35 @@ void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K, cuda
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
     if (gemv_bf16_splitk()) {
+        // Wide-load path: legal only when every pointer the kernel derives is aligned for the
+        // vector loads it issues. K % 128 == 0 puts the packed region (header 256 B + N*K/16
+        // scale bytes, K/16 then a multiple of 8) and every row stride K/2 on 8-byte boundaries
+        // for any N; x carries 32 B per group, checked directly. Every decode projection of the
+        // Qwen3.8 checkpoints satisfies this; anything else keeps the byte-wise path, same math.
+        const bool wide = ((K & 127) == 0) &&
+                          ((reinterpret_cast<size_t>(x) & 3u) == 0) &&
+                          ((reinterpret_cast<size_t>(W) & 7u) == 0);
+#define SI_GEMV_NVFP4_SK(S_) do { \
+        constexpr int S = (S_), RPB = GEMV_WPB / S; \
+        if (wide) gemv_nvfp4_sk_kernel<__nv_bfloat16, S, true><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+        else      gemv_nvfp4_sk_kernel<__nv_bfloat16, S, false><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+    } while (0)
         if (N >= 8192) {
-            constexpr int S = 2, RPB = GEMV_WPB / S;
-            gemv_nvfp4_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
-        } else if (N >= 4096) {
-            constexpr int S = 4, RPB = GEMV_WPB / S;
-            gemv_nvfp4_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
-        } else {
-            constexpr int S = 8, RPB = GEMV_WPB / S;
-            gemv_nvfp4_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+            // S=2 at the stock 8-warp block measured SLOWER wide (22.2us vs 18.7us on the
+            // N=12288 in-projection): four resident rows' live state fights the consolidated
+            // loads for registers. Halving the block to 4 warps (2 rows) keeps the same per-row
+            // split-2 reduction order -- block shape packs rows, it does not touch the math --
+            // and lets the wide path win here too.
+            constexpr int S = 2, WPB = 4, RPB = WPB / S;
+            if (wide) gemv_nvfp4_sk_kernel<__nv_bfloat16, S, true, WPB><<<dim3((N + RPB - 1) / RPB), WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+            else {
+                constexpr int RPB8 = GEMV_WPB / S;
+                gemv_nvfp4_sk_kernel<__nv_bfloat16, S, false><<<dim3((N + RPB8 - 1) / RPB8), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+            }
         }
+        else if (N >= 4096) SI_GEMV_NVFP4_SK(4);
+        else                SI_GEMV_NVFP4_SK(8);
+#undef SI_GEMV_NVFP4_SK
         return;
     }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
