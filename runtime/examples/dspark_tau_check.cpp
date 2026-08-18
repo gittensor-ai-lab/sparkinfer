@@ -45,13 +45,21 @@ int main(int argc, char** argv) {
         printf("usage: %s <qwen38_dir> <dspark_dir> <max_new> <id0> [id1 ...]\n", argv[0]);
         return 2;
     }
-    // Flash-decode's split-K reduction is atomic and therefore order-dependent: default splits
-    // (adaptive, effectively ~32) gave 27-32/32 agreement across repeat runs of the SAME decode,
-    // vs 32/32 x3 with SPARKINFER_NSPLITS=1. A tau/lossless measurement needs the target's own
-    // AR decode to be deterministic, or a real divergence from the verify head becomes
-    // indistinguishable from ordinary split-K noise. `0` (don't overwrite) so an explicit env
-    // override still wins for anyone deliberately sweeping splits.
-    setenv("SPARKINFER_NSPLITS", "1", 0);
+    // NO NSPLITS PIN. This used to force SPARKINFER_NSPLITS=1, on the observation that default
+    // (adaptive, effectively ~32) splits gave 27-32/32 agreement across repeat runs of the same
+    // decode, vs 32/32 with the pin. But that experiment predates the two prefill pins directly
+    // below: the atomic split-K prefill GEMMs were live while NSPLITS was being blamed, so the
+    // 27-32/32 result was confounded -- the nondeterminism it saw came from prefill, not from
+    // flash-decode. The decode split path itself has a fixed reduction order end to end:
+    // fa_split assigns each split a fixed KV stripe, and fa_combine folds partials warp-strided
+    // then in ascending warp index, with no atomics anywhere in the decode path.
+    //
+    // Re-measured with the prefill pins in place (RTX 5090, this harness, adaptive splits):
+    // AR-REPS 40/40 identical and SPEC-REPS 120/120 identical-and-lossless on both a prose and
+    // a numeric 128-token prompt. Meanwhile the pin itself was costing the measurement ~7%:
+    // decode@128 runs attention at seqlen 128-256, where one split leaves the flash-decode
+    // grid a fraction of the machine wide. The server never runs pinned splits, so measuring
+    // with them understates the engine on exactly the dimension this tool exists to score.
     // Same story, second and third instances (2026-08-17): TWO more atomic split-K prefill GEMMs,
     // found only after a multi-round dflash_generate run that looked individually correct at
     // every kernel level (LM head, GDN conv/scan/commit all independently verified bit-exact
