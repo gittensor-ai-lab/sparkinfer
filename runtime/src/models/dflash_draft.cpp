@@ -1302,7 +1302,39 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // prediction for position start+1 is redundant with the target's own verify-row-0 call, which
     // is strictly more reliable than any draft guess), so it only needs a plain argmax in the
     // !head_done path, where the batched LM-head GEMV computed it too and left it unscored.
-    if (s.markov_w1 && s.markov_w2) {
+    // MARKOV HEAD, PRICED. It raises acceptance and costs more than the acceptance is worth
+    // below long context, so it is gated on the same sequence-length threshold the proposal-depth
+    // ladder uses rather than run unconditionally.
+    //
+    // What it costs: w2 is [vocab, rank] = 248320 x 256 bf16 = 127 MB, re-read once per proposal
+    // row -- 381 MB a step at depth 3 -- because row r's latent conditions on row r-1's own
+    // corrected argmax. That chain also replaces ONE batched argmax over the whole block with a
+    // sequential bias -> confidence -> argmax triple per row. Measured, the pair is 1.41 ms of a
+    // 16.3 ms step, well past the ~419 us the bias GEMVs alone account for.
+    //
+    // What it buys, measured on RTX 5090 against the released draft (accept -> tok/s):
+    //     ctx=128    1.2549 -> 76.93     off: 1.1852 -> 79.53   (+3.4% without it)
+    //     ctx=4096   1.1130 -> 32.16     off: 1.0579 -> 33.04   (+2.7% without it)
+    //     ctx=512    1.0000 -> 77.61     off: 1.0000 -> 77.63   (accept 1.0: DSpark inert here)
+    // Acceptance does fall, and it still loses: the extra 0.07 tokens a step do not pay for the
+    // step getting 1.41 ms longer.
+    //
+    // Deep context keeps it: that is where acceptance actually climbs and where the ladder above
+    // already switches strategy, and it is not measured here. Draft-only either way -- this shifts
+    // what is proposed, never what is emitted, which is why LOSSLESS is unaffected.
+    // SPARKINFER_DFLASH_MARKOV=1/0 pins it explicitly.
+    static const int kMarkovDeepMinSeq = []{
+        const char* e = getenv("SPARKINFER_DFLASH_DEEP_MIN_SEQ");
+        int v = e ? atoi(e) : 12288;
+        return v < 1 ? 1 : v;
+    }();
+    static const int markov_env = []{
+        const char* e = getenv("SPARKINFER_DFLASH_MARKOV");
+        return e ? (e[0] == '0' ? 0 : 1) : -1;
+    }();
+    const bool markov_on = markov_env >= 0 ? (markov_env != 0)
+                                           : (past + BW >= kMarkovDeepMinSeq);
+    if (markov_on && s.markov_w1 && s.markov_w2) {
         if (!head_done) kernels::launch_argmax(s.logits, s.d_out, 1, V, st);
         for (int r = 1; r <= kProposalDepth; r++) {
             const int* prev = (r == 1) ? s.d_ids : (s.d_out + (r - 1));
