@@ -16,6 +16,7 @@
 #include <climits>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
+#include <cuda_pipeline.h>
 #endif
 
 namespace sparkinfer {
@@ -98,6 +99,165 @@ __global__ void fa_split_kernel(
 // 4k, one launch costs 6.3 + 7.83*rows us, i.e. 88% of it is per-row at 6 rows. Folding S rows into
 // a CTA divides the KV traffic by S; the cost is S extra accumulators per thread, which is why the
 // fold has to stay narrow.
+
+// Double-buffered KV staging with cp.async. Identical mathematics to fa_split_gqa_kernel below --
+// same q registers, same per-token online-softmax update, same partials layout -- but the next
+// tile's global->shared copy is issued BEFORE the current tile is consumed, so the load overlaps
+// the compute instead of the block stalling on it at every barrier.
+//
+// Why: the synchronous kernel runs stage -> __syncthreads -> compute -> __syncthreads, so DRAM
+// latency is exposed once per tile. At n_splits=1 and 4k that is hundreds of tiles per block, and
+// the block sustains only ~7.5 GB/s. Deepening the tile put more loads in flight per barrier
+// (+14%) but never overlapped the two phases; this does.
+//
+// bf16 KV only: cp.async copies bytes verbatim and cannot dequantize, so an int8 pool still needs
+// the dequant-into-smem path of the kernel below.
+//
+// Bit-identical to that kernel: cp.async changes WHEN bytes land in shared memory, not their
+// values, and the token walk (start..end, consecutive tiles, per-token update) is unchanged, so
+// every row accumulates the same keys in the same order.
+template <int HEAD_DIM, int GQA, int TILE, int SEQ = 1>
+__global__ void fa_split_gqa_pipe_kernel(
+    const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pool,
+    const void* __restrict__ v_pool, const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens,
+    float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+    float scale, int num_q_heads, int num_kv_heads, int block_size, int max_blocks, int n_splits
+) {
+    constexpr int ELEMS = HEAD_DIM / 32;
+    constexpr int TELEMS = TILE * HEAD_DIM;
+    const int seq0  = blockIdx.y * SEQ;
+    const int split = blockIdx.x % n_splits;
+    const int kvh   = blockIdx.x / n_splits;
+    const int warp  = threadIdx.x >> 5;
+    const int lane  = threadIdx.x & 31;
+    const int qh    = kvh * GQA + warp;
+
+    float qr[SEQ][ELEMS];
+    #pragma unroll
+    for (int v = 0; v < SEQ; v++) {
+        const __nv_bfloat16* qp = q + (size_t)((seq0 + v) * num_q_heads + qh) * HEAD_DIM;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) qr[v][e] = fa_to_f(qp[lane + e * 32]);
+    }
+
+    int row_start[SEQ], row_end[SEQ];
+    int start = INT_MAX, end = 0;
+    #pragma unroll
+    for (int v = 0; v < SEQ; v++) {
+        const int slv = seq_lens[seq0 + v];
+        const int ch  = (slv + n_splits - 1) / n_splits;
+        row_start[v] = split * ch;
+        row_end[v]   = min(slv, row_start[v] + ch);
+        if (row_end[v] > row_start[v]) { start = min(start, row_start[v]); end = max(end, row_end[v]); }
+    }
+    if (start == INT_MAX) start = end = 0;
+
+    float m[SEQ], l[SEQ], acc[SEQ][ELEMS];
+    #pragma unroll
+    for (int v = 0; v < SEQ; v++) {
+        m[v] = -1e30f; l[v] = 0.f;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) acc[v][e] = 0.f;
+    }
+
+    extern __shared__ __nv_bfloat16 s_kv[];
+    __nv_bfloat16* s_k = s_kv;                       // [2][TILE*HEAD_DIM]
+    __nv_bfloat16* s_v = s_kv + (size_t)2 * TELEMS;  // [2][TILE*HEAD_DIM]
+    __shared__ size_t s_rowbase[2][TILE];
+    const __nv_bfloat16* __restrict__ kb = reinterpret_cast<const __nv_bfloat16*>(k_pool);
+    const __nv_bfloat16* __restrict__ vb = reinterpret_cast<const __nv_bfloat16*>(v_pool);
+
+    // Resolve one tile's per-token global row bases into s_rowbase[buf]. Same address math as the
+    // synchronous kernel, hoisted to one thread per token.
+    auto resolve = [&](int buf, int t0v, int validv) {
+        if ((int)threadIdx.x < validv) {
+            const int t = t0v + threadIdx.x;
+            const int blk = t / block_size, wb = t % block_size;
+            const int phys = block_table[seq0 * max_blocks + blk];
+            const size_t tokrow = (size_t)(phys * block_size + wb) * num_kv_heads + kvh;
+            s_rowbase[buf][threadIdx.x] = tokrow * HEAD_DIM;
+        }
+    };
+    // Issue the async copies for one tile. 16 B per thread-item, matching the uint4 load it replaces.
+    auto issue = [&](int buf, int validv) {
+        __nv_bfloat16* dk = s_k + (size_t)buf * TELEMS;
+        __nv_bfloat16* dv = s_v + (size_t)buf * TELEMS;
+        for (int i = threadIdx.x * 8; i < validv * HEAD_DIM; i += blockDim.x * 8) {
+            const int within = i / HEAD_DIM, d = i % HEAD_DIM;
+            const size_t base = s_rowbase[buf][within] + d;
+            __pipeline_memcpy_async(dk + i, kb + base, 16);
+            __pipeline_memcpy_async(dv + i, vb + base, 16);
+        }
+        __pipeline_commit();
+    };
+
+    if (start >= end) {
+        #pragma unroll
+        for (int v = 0; v < SEQ; v++) {
+            const int idx = ((seq0 + v) * num_q_heads + qh) * n_splits + split;
+            if (lane == 0) { part_m[idx] = m[v]; part_l[idx] = l[v]; }
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++) part_acc[(size_t)idx * HEAD_DIM + lane + e * 32] = acc[v][e];
+        }
+        return;
+    }
+
+    int buf = 0;
+    resolve(0, start, min(TILE, end - start));
+    __syncthreads();
+    issue(0, min(TILE, end - start));
+
+    for (int t0 = start; t0 < end; t0 += TILE) {
+        const int valid = min(TILE, end - t0);
+        const int nt0 = t0 + TILE;
+        // Uniform across the block (depends only on t0/end), so the guarded barrier below is not
+        // divergent.
+        const int nvalid = nt0 < end ? min(TILE, end - nt0) : 0;
+        if (nvalid > 0) {
+            resolve(buf ^ 1, nt0, nvalid);
+            __syncthreads();          // s_rowbase[buf^1] visible before its copies read it
+            issue(buf ^ 1, nvalid);
+        }
+        __pipeline_wait_prior(nvalid > 0 ? 1 : 0);
+        __syncthreads();
+        const __nv_bfloat16* ck = s_k + (size_t)buf * TELEMS;
+        const __nv_bfloat16* cv = s_v + (size_t)buf * TELEMS;
+        for (int tt = 0; tt < valid; tt++) {
+            float kv_k[ELEMS], kv_v[ELEMS];
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++) {
+                kv_k[e] = fa_to_f(ck[tt * HEAD_DIM + lane + e * 32]);
+                kv_v[e] = fa_to_f(cv[tt * HEAD_DIM + lane + e * 32]);
+            }
+            const int gtok = t0 + tt;
+            #pragma unroll
+            for (int v = 0; v < SEQ; v++) {
+                if (gtok < row_start[v] || gtok >= row_end[v]) continue;
+                float p = 0.f;
+                #pragma unroll
+                for (int e = 0; e < ELEMS; e++) p += qr[v][e] * kv_k[e];
+                const float score = fa_wsum(p) * scale;
+                const float mn = fmaxf(m[v], score), corr = __expf(m[v] - mn), pe = __expf(score - mn);
+                l[v] = l[v] * corr + pe;
+                #pragma unroll
+                for (int e = 0; e < ELEMS; e++) acc[v][e] = acc[v][e] * corr + pe * kv_v[e];
+                m[v] = mn;
+            }
+        }
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    #pragma unroll
+    for (int v = 0; v < SEQ; v++) {
+        const int idx = ((seq0 + v) * num_q_heads + qh) * n_splits + split;
+        if (lane == 0) { part_m[idx] = m[v]; part_l[idx] = l[v]; }
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) part_acc[(size_t)idx * HEAD_DIM + lane + e * 32] = acc[v][e];
+    }
+}
+
 template <int HEAD_DIM, int GQA, int TILE, bool INT8, int SEQ = 1>
 __global__ void fa_split_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pool,
@@ -942,6 +1102,35 @@ void launch_flash_decode_split(
                     reinterpret_cast<const __half*>(v_scale));                                     \
             } while (0)
             constexpr int TILE_DEEP = FA_GQA6_TILE_DEEP;
+            // cp.async pipeline: issue the NEXT tile's global->shared copy before consuming this
+            // one, so the load overlaps the compute instead of the block stalling at every barrier.
+            // Deepening the tile alone raised loads-in-flight but kept the two phases strictly
+            // serial. bf16 KV only -- cp.async copies bytes verbatim and cannot dequantize.
+            // Double buffering needs 2x the staging smem (4 * TILE * 256 * 2 B), which is past the
+            // 48 KB default, so the kernel opts in once. SPARKINFER_FA_PIPE=0 disables.
+            static int fa6_pipe = -1;
+            if (fa6_pipe < 0) { const char* e = getenv("SPARKINFER_FA_PIPE"); fa6_pipe = (e && e[0] == '0') ? 0 : 1; }
+            if (fa6_pipe && !int8_kv && fa6_deep) {
+                constexpr int PT = FA_GQA6_TILE_DEEP;
+                const size_t psm = (size_t)4 * PT * 256 * sizeof(__nv_bfloat16);
+                static int pipe_ok = -1;
+                if (pipe_ok < 0) {
+                    pipe_ok = (cudaFuncSetAttribute(
+                                   (const void*)fa_split_gqa_pipe_kernel<256, GQA, PT>,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   (int)psm) == cudaSuccess) ? 1 : 0;
+                    if (!pipe_ok) cudaGetLastError();   // clear, fall through to the synchronous tile
+                }
+                if (pipe_ok) {
+                    fa_split_gqa_pipe_kernel<256, GQA, PT><<<gq, GQA * 32, psm, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table,
+                        seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads,
+                        block_size, max_blocks, n_splits);
+                    combine_hd256(out_q8);
+                    (void)seqlen;
+                    return;
+                }
+            }
             if (int8_kv) {
                 if (fa6_deep) SI_FA6_LAUNCH(TILE_DEEP, true);
                 else          SI_FA6_LAUNCH(TILE, true);
