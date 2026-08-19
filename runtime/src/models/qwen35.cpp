@@ -1959,6 +1959,20 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 fprintf(stderr, "[dflash-graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
                         position, seqlen, s.n_splits, attn_graph_mode, mma_chunk, sparse_on ? 1 : 0);
             }
+            // SPARKINFER_DFLASH_GRAPH_DOT=<path> writes the captured DFlash decode graph out in
+            // DOT form, with kernel names and node parameters. What that buys is a question the
+            // timeline cannot answer: whether two nodes are ORDERED. Reachability over the dumped
+            // DAG decides it exactly -- for the verify-overlap investigation in #870 it showed
+            // 879 nodes / 1132 edges whose only unordered pairs were the five intended GDN-pipe
+            // overlaps, and the capture_row nodes with none at all, which ruled out a missing
+            // intra-graph dependency without another day of bisection. Env-gated, so it costs a
+            // getenv on the capture path and nothing anywhere else.
+            if (const char* dot = getenv("SPARKINFER_DFLASH_GRAPH_DOT")) {
+                cudaGraphDebugDotPrint(s.cu_dflash_graph, dot,
+                                       cudaGraphDebugDotFlagsVerbose |
+                                       cudaGraphDebugDotFlagsKernelNodeParams);
+                fprintf(stderr, "[dflash-graph] dot written to %s\n", dot);
+            }
         }
         cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
     } else if (capturing_graph) {
