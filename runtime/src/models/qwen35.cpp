@@ -3187,6 +3187,105 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         draft.reset();
         return out;
     }
+    // ---- price the batched verify, then believe the price --------------------------------
+    //
+    // The batched verify is the only path that can make speculation pay here. The token loop runs
+    // one target forward per KEPT token -- exactly the count AR runs -- so acceptance buys it
+    // nothing there, and the draft block on top is pure overhead; only the N-row pass can collapse
+    // `keep` forwards into one. Whether that is a win is arithmetic: the pass has to cost less
+    // than the `keep` forwards it replaces.
+    //
+    // On this checkpoint it does not, by a wide margin. Measured at ctx=4096 with CUDA events
+    // around each phase of this loop (128 new tokens, 119 steps, adaptive splits):
+    //
+    //     batched verify, 4 rows    37.7 ms/step   = 3.2 single-token target forwards
+    //     single target forward     11.7 ms
+    //     mean keep on armed steps   1.1 tokens
+    //
+    // It is not row-batched, and deliberately so: the ModelOpt checkpoint keeps every GDN and
+    // attention projection native NVFP4, and dflash_verify_short_run drives those -- and the Q4_K
+    // LM head -- as a loop of ONE-ROW launches, because a one-row call reproduces AR's own kernel
+    // bit for bit and that is what keeps the speculative path lossless by construction. The
+    // consequence is that N rows re-stream the whole weight set N times, so break-even sits near
+    // the ROW COUNT, not near kEngageKeepLong (2). The gate armed 10 of 119 steps and those 10
+    // steps were 20.6% of the entire decode, for 11 of the 128 emitted tokens.
+    //
+    // Two deterministic triggers latch the batched path off for the rest of the generation:
+    //
+    //   (a) it has been ARMED, and the keeps it bought are not close to the rows it paid for --
+    //       mean keep over armed steps below kLatchKeepNum/kLatchKeepDen of kProposalDepth+1; or
+    //   (b) the gate itself has kept it DISARMED for kLatchAfter consecutive steps.
+    //
+    // Both read only quantities produced by steps that ran unoverlapped, so the step the latch
+    // fires on is reproducible run to run -- which matters, because latching is what makes the
+    // overlap below safe.
+    //
+    // Neither trigger fires on a stream where the batched pass works: it arms within ~6 steps of
+    // the EMA ramp (well inside kLatchAfter) and then keeps near-full blocks. That is the Qwen3.6
+    // case these thresholds were tuned on -- tau 3.9 at ctx=4096 against a 4-row pass, +61% for
+    // batching. SPARKINFER_DFLASH_LATCH_AFTER=0 restores main's behaviour in full.
+    static const int kLatchAfter = []{
+        const char* e = getenv("SPARKINFER_DFLASH_LATCH_AFTER");
+        int v = e ? atoi(e) : 12;
+        return v < 0 ? 0 : v;
+    }();
+    // Mean keep, as a fraction of the row count, below which an armed pass is judged not to have
+    // paid for itself. 3/4 rather than 1: the pass costs ~0.8 of a forward per row here, so it
+    // needs nearly every row accepted, and demanding exactly `rows` would never latch on a stream
+    // that lands one short.
+    static const int kLatchKeepNum = []{ const char* e = getenv("SPARKINFER_DFLASH_LATCH_KEEP_NUM");
+                                         int v = e ? atoi(e) : 3; return v < 0 ? 0 : v; }();
+    static const int kLatchKeepDen = []{ const char* e = getenv("SPARKINFER_DFLASH_LATCH_KEEP_DEN");
+                                         int v = e ? atoi(e) : 4; return v < 1 ? 1 : v; }();
+    bool spec_latched = false;
+    int armed_steps = 0;
+    long armed_keep_sum = 0;
+    // Once latched, the draft's remaining product is ACCEPTANCE -- in the token loop the step runs
+    // one target forward per kept token either way, so a block that lands saves no work and a
+    // block that misses costs its own runtime. #869's idle rule spends blocks on a signal that no
+    // longer exists here: it counts steps since the BATCHED verify was armed, and after the latch
+    // that never happens again, so it decays to one probe every kDraftProbePeriod (32) and
+    // acceptance falls to ~1.0 -- a real regression against main, not a saving.
+    //
+    // Count what actually predicts the next block instead: whether the last one landed. Draft
+    // while the draft is landing; once it has missed, fall back to one block in kAccIdleProbe.
+    // Measured at ctx=4096, extra accepted tokens per drafted block:
+    //
+    //     a block every step          0.231 / block   (104 blocks, tau 1.2308)
+    //     acceptance-keyed, probe 4   0.179 / block   ( 39 blocks, tau 1.0579)
+    //     fixed 8-on / 16-off         0.143 / block   ( 42 blocks, tau 1.0492)
+    //     acceptance-keyed, probe 8   0.072 / block   ( 28 blocks, tau 1.0159)
+    //
+    // The acceptance key beats a fixed duty cycle at the same block count, which is the evidence
+    // for keying on it rather than on position.
+    //
+    // kAccIdleAfter is 2 -- two steps of grace after a landing, because acceptance arrives in
+    // runs, the same observation kBlockScore is built on. kAccIdleProbe is half #869's
+    // kDraftProbePeriod (32): a probe there existed to re-arm the batched verify, a rarer and more
+    // valuable event than the acceptance a probe buys here. Swept in one binary at ctx=4096
+    // (DSPARK_TPS / tau; main is 70.12 / 1.0756 on this box):
+    //
+    //     after 1, probe 4    81.4 / 1.0847        after 2, probe  8   82.2 / 1.0756
+    //     after 1, probe 8    82.4 / 1.0579        after 2, probe 12   83.2 / 1.0407
+    //     after 1, probe 12   83.1 / 1.0579        after 2, probe 16   83.1 / 1.0579
+    //     after 3, probe 8    82.8 / 1.0240  <- faster, and NOT shippable: tau under the floor
+    //
+    // The frontier is narrow, because past the latch the only cost above AR is the draft itself --
+    // at zero draft blocks the run lands at ~83.7 against an AR of 87.3. So this pair is the
+    // fastest point that still holds MEAN_ACCEPT comfortably inside the no-regression floor, not
+    // the fastest point.
+    static const int kAccIdleAfter = []{
+        const char* e = getenv("SPARKINFER_DFLASH_ACC_AFTER");
+        int v = e ? atoi(e) : 2;
+        return v < 0 ? 0 : v;
+    }();
+    static const int kAccIdleProbe = []{
+        const char* e = getenv("SPARKINFER_DFLASH_ACC_PROBE");
+        int v = e ? atoi(e) : 16;
+        return v < 2 ? 2 : v;
+    }();
+    int miss_run = 0;   // steps since the draft last landed anything
+
     // Build the verify replay graph before the decode clock starts. Capture records kernels
     // rather than running them, so this changes no state -- it just stops decode step 2 from
     // paying for graph construction.
@@ -3216,17 +3315,33 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // seeding is scoped to sequences past the floor: start armed there, and let the existing
         // decay hand the stream back to the token loop within a couple of steps if the draft turns
         // out not to be landing blocks. Below the floor the ramp is untouched.
-        if (step_no == 0 && (start + B) >= kEngageMinSeq) keep_ema8 = kEngageKeepLong * 8;
-        const bool compact_verify = compact_mode == 1 ||
-            (compact_mode != 0 && (short_ctx ? compact_score >= kBlockScore
-                                             : ((start + B) >= kEngageMinSeq &&
-                                                keep_ema8 >= kEngageKeepLong * 8)));
+        // Seeding the EMA arms the batched verify on step 0 with no evidence at all, which on this
+        // checkpoint means paying one 37.7 ms pass (3.2 target forwards) to learn what the gate's
+        // own acceptance test establishes for free a few steps later. With the latch enabled, let
+        // the ramp decide: a stream where the pass pays clears the threshold in ~6 steps (alpha
+        // 1/8 from zero, 8 * keep well above 16) and never latches, while this one converges to
+        // 8 * 1.08, never arms, and trigger (b) latches it off having spent nothing.
+        if (step_no == 0 && kLatchAfter == 0 && (start + B) >= kEngageMinSeq)
+            keep_ema8 = kEngageKeepLong * 8;
+        const bool compact_verify = !spec_latched &&
+            (compact_mode == 1 ||
+             (compact_mode != 0 && (short_ctx ? compact_score >= kBlockScore
+                                              : ((start + B) >= kEngageMinSeq &&
+                                                 keep_ema8 >= kEngageKeepLong * 8))));
         if (compact_verify) disarmed_run = 0; else ++disarmed_run;
+        // Trigger (b). Trigger (a) needs this step's `keep` and fires further down.
+        // compact_mode == 1 is an explicit "always batched" override and is never latched away.
+        const bool latch_allowed = kLatchAfter > 0 && compact_mode != 1;
+        if (!spec_latched && latch_allowed && armed_steps == 0 && disarmed_run >= kLatchAfter)
+            spec_latched = true;
         // Skip the draft only after kDraftProbeAfter consecutive disarmed steps, and let every
         // kDraftProbePeriod-th step through as a probe.
         const bool draft_idle = kIdleDraftOn && !compact_verify &&
-                                disarmed_run > kDraftProbeAfter &&
-                                ((disarmed_run - kDraftProbeAfter) % kDraftProbePeriod) != 0;
+            (spec_latched
+                 ? (kAccIdleAfter > 0 && miss_run > kAccIdleAfter &&
+                    ((miss_run - kAccIdleAfter) % kAccIdleProbe) != 0)
+                 : (disarmed_run > kDraftProbeAfter &&
+                    ((disarmed_run - kDraftProbeAfter) % kDraftProbePeriod) != 0));
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 
@@ -3286,7 +3401,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int p0 = -1;
         if (!compact_verify) {
             set_dflash_capture_row(0);
-            s.defer_decode_sync = overlap_on;
+            // Overlap verify row zero with the draft block once the batched path is latched off.
+            // The note below disabled this because the overlap perturbs the accept GROUPING, and
+            // grouping feeds keep_ema8 -> compact_verify -> which verify path a later step takes.
+            // Latched, nothing downstream reads the grouping: keep_ema8 and compact_score are
+            // dead, the draft cadence is positional, and every emitted token is a target argmax at
+            // its own position whatever the grouping -- so the token stream is AR's by
+            // construction. That is the property the old unconditional overlap lacked.
+            s.defer_decode_sync = overlap_on || spec_latched;
             p0 = forward_token(block[0], start, true);
             s.defer_decode_sync = false;
         }
@@ -3365,6 +3487,17 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // short context and keeps 512 on the token loop throughout.
         keep_ema8 = keep_ema8 - (keep_ema8 >> 3) + keep;
         ++step_no;
+        // Counted on every step, idle ones included: gating the increment on a drafted step
+        // freezes the counter the moment it crosses the threshold, and the probe never comes
+        // round again.
+        if (!draft_idle && keep > 1) miss_run = 0; else ++miss_run;
+        // Trigger (a): score the batched pass on what it actually bought. Fed only by steps that
+        // ran it, and only while unlatched -- so it never reads anything an overlapped step made.
+        if (compact_verify) { ++armed_steps; armed_keep_sum += keep; }
+        if (!spec_latched && latch_allowed && armed_steps > 0 &&
+            armed_keep_sum * kLatchKeepDen <
+                (long)armed_steps * (kProposalDepth + 1) * kLatchKeepNum)
+            spec_latched = true;
         compact_score = keep == kProposalDepth + 1
                       ? std::min(compact_score + 1, kBlockScore + 1)
                       : std::max(compact_score - 1, 0);
