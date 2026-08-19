@@ -3363,7 +3363,25 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // a single lucky block, which at 512-ctx (tau 2.19, where batching is 31% SLOWER) cost 5.6%
         // before the EMA had enough evidence to back off. Ramping costs ~3 token-loop steps at
         // short context and keeps 512 on the token loop throughout.
-        keep_ema8 = keep_ema8 - (keep_ema8 >> 3) + keep;
+        // Decay rounded UP. With the truncating shift this alpha=1/8 EMA has a fixed point
+        // anywhere in [8, 15]: at keep_ema8 = 15 the shift yields 1, which a keep of 1 exactly
+        // cancels, so the average parks at 15 and never reaches its true equilibrium of 8 * keep.
+        // The arming threshold is kEngageKeepLong * 8 = 16, i.e. ONE above that stuck value, so a
+        // single lucky two-token step trips the batched verify on, and the step after drops it
+        // back to 15 -- primed to trip again. Measured at ctx=4096 on the released draft: armed on
+        // 18 of 480 steps while mean accept was 1.0235, i.e. armed by noise, not by acceptance.
+        //
+        // Rounding the decay up restores the intended behaviour: 15 -> 14 -> ... -> 8, and 8 * keep
+        // is a true fixed point (keep=2 settles at exactly 16, which is what "engage at mean keep
+        // >= kEngageKeepLong" is supposed to mean). Short context is unaffected -- it gates on
+        // compact_score, not on this average.
+        // SPARKINFER_DFLASH_EMA_TRUNC=1 restores the truncating decay for A/B in one binary.
+        static const bool ema_trunc = []{
+            const char* e = getenv("SPARKINFER_DFLASH_EMA_TRUNC");
+            return e && e[0] == '1';
+        }();
+        keep_ema8 = ema_trunc ? (keep_ema8 - (keep_ema8 >> 3) + keep)
+                              : (keep_ema8 - ((keep_ema8 + 7) >> 3) + keep);
         ++step_no;
         compact_score = keep == kProposalDepth + 1
                       ? std::min(compact_score + 1, kBlockScore + 1)
