@@ -837,6 +837,75 @@ __global__ void gate_up_mmvq2_qwen_kernel(
     if (pdl) si_pdl_lc();
 }
 
+// Row-batched dense gate/up: T token rows against ONE weight stream.
+//
+// gate_up_mmvq2_qwen_kernel is launched with grid = num_tokens * F, i.e. one CTA per (token,
+// ffn row), and every CTA loads the gate and up rows it needs itself. At num_tokens == 1 that is
+// exactly right. At the speculative verify's num_tokens == N it reads the whole FFN N times, and
+// the FFN is the largest weight in the model -- so the verify pays N x the DRAM traffic for a
+// pass whose weights do not depend on the token at all. Decode here runs at ~85% of this card's
+// bandwidth, so that traffic is the cost.
+//
+// One CTA per ffn row, T tokens folded inside: the weight super-blocks are read once and each
+// token's activation blocks are dotted against them in the SAME order the one-token kernel uses
+// (same lane -> kbx/kqs mapping, same four-warp shared reduce, same silu(tg)*tu tail). Every row
+// therefore produces the bits the per-token kernel produced for it -- the verify's losslessness
+// argument (N one-row calls are bit-identical to N AR steps) survives unchanged.
+template <int H, int F, int TOPK, int T>
+__global__ void gate_up_mmvq2_qwen_rows_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int pdl
+) {
+    constexpr int NW = 4, WS = 32;
+    const int f = blockIdx.x;                    // ffn row, shared by every token
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4;
+    const int kqs = 2 * (tid & 15);
+    constexpr int NB = H >> 8;
+    // TOPK == 1 on every shape this arm serves, so token t's slot is t and its expert is
+    // expert_ids[t]; the weight rows below are the same for all of them when the expert matches,
+    // which is the case this kernel exists for (dense FFN, one expert).
+    const int e0 = expert_ids[0];
+    const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e0 * F + f) * (H >> 8) * 144);
+    const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e0 * F + f) * (H >> 8) * 144);
+    float tg[T], tu[T];
+#pragma unroll
+    for (int t = 0; t < T; t++) { tg[t] = 0.f; tu[t] = 0.f; }
+    // The weight block stays in global and is read through the same __ldg path the one-token
+    // kernel uses; what makes it cheap for token t>0 is that the CTA touched those exact bytes
+    // microseconds earlier, so they are in L1/L2 rather than DRAM. Copying the 144-byte
+    // super-block into registers instead looks like reuse and is not: it spills to local memory
+    // and measured 3.2x SLOWER than the per-token kernel it replaces.
+    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+#pragma unroll
+        for (int t = 0; t < T; t++) {
+            const si_block_q8_1* vrow = vy + (size_t)t * (H >> 5);
+            tg[t] += si_vec_dot_q4_K(g_row + kbx, vrow + (size_t)kbx * 8, kqs);
+            tu[t] += si_vec_dot_q4_K(u_row + kbx, vrow + (size_t)kbx * 8, kqs);
+        }
+    }
+    __shared__ float sg[T][NW - 1][WS], su[T][NW - 1][WS];
+    if (warp > 0) {
+#pragma unroll
+        for (int t = 0; t < T; t++) { sg[t][warp - 1][lane] = tg[t]; su[t][warp - 1][lane] = tu[t]; }
+    }
+    __syncthreads();
+    if (warp > 0) return;
+#pragma unroll
+    for (int t = 0; t < T; t++) {
+        #pragma unroll
+        for (int l = 0; l < NW - 1; l++) { tg[t] += sg[t][l][lane]; tu[t] += su[t][l][lane]; }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            tg[t] += __shfl_xor_sync(0xffffffff, tg[t], m);
+            tu[t] += __shfl_xor_sync(0xffffffff, tu[t], m);
+        }
+        if (lane == 0) h_scratch[(size_t)t * F + f] = q4kf_silu(tg[t]) * tu[t];
+    }
+    if (pdl) si_pdl_lc();
+}
+
 template <int H, int F, int TOPK>
 __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
@@ -1835,6 +1904,33 @@ void launch_moe_expert_ffn_q4k(
         // arm: F is already large enough that pack2 coarsens scheduling. Compile-time H/F
         // makes NB = H>>8 = 20 a known trip count; same dots in the same order as the
         // generic kernel, so the result is bit-identical.
+        else if (gu_spec && hidden == 5120 && ffn == 17408 && top_k == 1 &&
+                 num_tokens >= 2 && num_tokens <= 4) {
+            // Verify rows share the FFN weights; read them once. See
+            // gate_up_mmvq2_qwen_rows_kernel -- bit-identical per row, one CTA per ffn row.
+            static const int rows_on = []{ const char* e = getenv("SPARKINFER_GU_ROWS");
+                                           return (e && e[0] == '0') ? 0 : 1; }();
+            if (rows_on) {
+                const dim3 gr(ffn), gb(4 * 32);
+                if (num_tokens == 2)
+                    launch_pdl_kernel(gu_pdl, gr, gb, 0, stream, gate_up_mmvq2_qwen_rows_kernel<5120, 17408, 1, 2>,
+                        q, reinterpret_cast<const unsigned char*>(gate_q),
+                        reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+                else if (num_tokens == 3)
+                    launch_pdl_kernel(gu_pdl, gr, gb, 0, stream, gate_up_mmvq2_qwen_rows_kernel<5120, 17408, 1, 3>,
+                        q, reinterpret_cast<const unsigned char*>(gate_q),
+                        reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+                else
+                    launch_pdl_kernel(gu_pdl, gr, gb, 0, stream, gate_up_mmvq2_qwen_rows_kernel<5120, 17408, 1, 4>,
+                        q, reinterpret_cast<const unsigned char*>(gate_q),
+                        reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+            } else {
+                launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                    gate_up_mmvq2_qwen_kernel<5120, 17408, 1>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+            }
+        }
         else if (gu_spec && hidden == 5120 && ffn == 17408 && top_k == 1)
             launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
                 gate_up_mmvq2_qwen_kernel<5120, 17408, 1>,
