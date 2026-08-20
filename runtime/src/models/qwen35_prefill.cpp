@@ -2885,6 +2885,27 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 fprintf(stderr, "[dflash-verify] dense layer=%d missing gate/up/down\n", L);
                 supported = false; break;
             }
+            // Checkpoint-native NVFP4 FFN, matching the decode path's own branch
+            // (SPARKINFER_QWEN38_DECODE_NVFP4=1, see qwen35.cpp). BOTH sides have to switch
+            // together: losslessness is defined as the speculative output matching the AR output
+            // of the SAME build, so running NVFP4 in decode while the verify stays on Q4_K makes
+            // the two disagree on weights that differ by ~8% and reports LOSSLESS=0 -- a path
+            // inconsistency, not an accuracy finding. Measured exactly that way before this
+            // branch existed.
+            static const bool kDecodeNvfp4 = [] {
+                const char* e = getenv("SPARKINFER_QWEN38_DECODE_NVFP4");
+                return e && e[0] == '1';
+            }();
+            if (kDecodeNvfp4 && w.gate_nv && w.up_nv && w.down_nv && topk == 1 &&
+                kernels::launch_gemv_nvfp4_rows(hn, w.gate_nv, sg, N, ffn, H, st) &&
+                kernels::launch_gemv_nvfp4_rows(hn, w.up_nv, su, N, ffn, H, st)) {
+                kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
+                if (!kernels::launch_gemv_nvfp4_rows(sh, w.down_nv, routed, N, H, ffn, st)) {
+                    fprintf(stderr, "[dflash-verify] NVFP4 down declined N=%d H=%d ffn=%d\n",
+                            N, H, ffn);
+                    supported = false; break;
+                }
+            } else
             kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                expert_ids, expert_w, routed, moe_h, moe_out,
