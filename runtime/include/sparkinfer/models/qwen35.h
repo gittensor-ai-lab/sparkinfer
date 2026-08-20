@@ -107,6 +107,14 @@ struct Qwen35LayerWeights {
     // 8.25% mean relative weight error against the NVFP4 source (corr 0.9968) -- NVFP4's 8
     // magnitudes per 16-element group with an e4m3 scale and Q4_K's 16 levels per 32 with a 6-bit
     // scale/min do not nest, so the conversion is pure loss on top of an already-lossy format.
+    // Measured cost of that conversion, same corpus, same build, only this flag changed:
+    //
+    //     Q4_K decode (default)   PPL 3.204
+    //     NVFP4 decode            PPL 3.010     6.1% better
+    //
+    // So it is a real quality regression, not a theoretical one. What it is NOT is the cause of
+    // the DSpark acceptance gap: tau measured 1.6552 on Q4_K against 1.6333 on NVFP4, i.e.
+    // unchanged, so the draft is not being held back by the target's requantized weights.
     // Set by SPARKINFER_QWEN38_DECODE_NVFP4=1 so the decode FFN can read the checkpoint directly.
     const void* gate_nv = nullptr; const void* up_nv = nullptr; const void* down_nv = nullptr;
     // Full-attention q/k/v projections as the checkpoint ships them (ModelOpt NVFP4). Unlike the
