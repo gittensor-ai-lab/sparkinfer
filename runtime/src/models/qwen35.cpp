@@ -3197,6 +3197,27 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 2;
         return v < 1 ? 1 : v;
     }();
+    // The engage threshold in EIGHTHS, which is the domain keep_ema8 already lives in, so it can
+    // express the number the trade actually turns on instead of rounding it to a whole token.
+    //
+    // One batched pass replaces `keep` sequential target forwards, so it pays exactly when
+    // keep > (batched cost / one forward). Measured on this target at ctx=4k, the two-row batched
+    // verify costs 13.71 ms against an 11.15 ms single-token forward -- 1.23 forwards. The gate
+    // asked for keep >= 2. Everything between 1.23 and 2 is a step where batching was already the
+    // cheaper option and the token loop ran anyway, and at the acceptance this model reaches
+    // (mean keep 1.33) that band is where the stream actually sits.
+    //
+    // 10/8 = 1.25, just above the measured 1.23, so the gate keeps a margin against the ratio
+    // rather than sitting on it. It is self-limiting at short context, which is why this is not
+    // simply "always batch": at ctx=512 acceptance is 1.0, keep_ema8 settles at 8, and 8 < 10
+    // leaves the stream on the token loop exactly as today -- which matters, because the batched
+    // pass is measured 31% SLOWER there. SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS=16 restores main's
+    // whole-token threshold, so both arms of an A/B come out of one binary.
+    static const int kEngageKeepEighths = []{
+        const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS");
+        int v = e ? atoi(e) : 10;
+        return v < 1 ? 1 : v;
+    }();
     int compact_score = 0;
     // Consecutive steps on which the batched verify stayed disarmed. In the token loop a draft
     // block can NEVER save a target forward (see the strict-LOSS note above: a step that keeps
@@ -3289,11 +3310,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // seeding is scoped to sequences past the floor: start armed there, and let the existing
         // decay hand the stream back to the token loop within a couple of steps if the draft turns
         // out not to be landing blocks. Below the floor the ramp is untouched.
-        if (step_no == 0 && (start + B) >= kEngageMinSeq) keep_ema8 = kEngageKeepLong * 8;
+        if (step_no == 0 && (start + B) >= kEngageMinSeq) keep_ema8 = kEngageKeepEighths;
         const bool compact_verify = compact_mode == 1 ||
             (compact_mode != 0 && (short_ctx ? compact_score >= kBlockScore
                                              : ((start + B) >= kEngageMinSeq &&
-                                                keep_ema8 >= kEngageKeepLong * 8)));
+                                                keep_ema8 >= kEngageKeepEighths)));
         if (compact_verify) disarmed_run = 0; else ++disarmed_run;
         // Skip the draft only after kDraftProbeAfter consecutive disarmed steps, and let every
         // kDraftProbePeriod-th step through as a probe.

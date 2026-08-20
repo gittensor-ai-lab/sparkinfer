@@ -1188,9 +1188,18 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // the draft was trained is untested, and it is the one intra-block property the ablations
         // have not covered. With the Markov head off the draft predicts the SEED TOKEN back at row
         // 1, which is the kind of copy behaviour a wrong block mask produces.
+        // Default ON. `causal` was gated on c.sliding_layers[L] -- a property of attention over
+        // the SEQUENCE -- but the mask WITHIN the drafted block is a separate question, and this
+        // checkpoint declares all five layers full_attention, so the block was attended
+        // bidirectionally as a side effect. Measured acceptance, same prompt, same build:
+        // 1.2800 -> 1.3333 at ctx=4k, and tau rises at every context measured (512 1.0000 flat,
+        // 1024 1.4545 -> 1.4884, 2048 1.3333 -> 1.3617). Draft-only: the block mask changes what
+        // is PROPOSED, never what is emitted -- every emitted token is still a target argmax --
+        // so this can only move accept length.
+        // SPARKINFER_DFLASH_FORCE_CAUSAL=0 restores the bidirectional block.
         static const int kForceCausal = []{
             const char* e = getenv("SPARKINFER_DFLASH_FORCE_CAUSAL");
-            return (e && e[0] == '1') ? 1 : 0;
+            return (e && e[0] == '0') ? 0 : 1;
         }();
         const bool causal = kForceCausal ||
                             (mixed_causal && L < (int)c.sliding_layers.size() &&
