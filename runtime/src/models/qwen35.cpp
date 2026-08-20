@@ -20,6 +20,7 @@
 #include "sparkinfer/kernels/compressed_tensors.h"
 #include "sparkinfer/kernels/attention.h"
 #include "sparkinfer/kernels/gemm.h"
+#include "sparkinfer/kernels/prefill.h"   // launch_prefill_swiglu, for the NVFP4 decode FFN
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/quant.h"
@@ -257,6 +258,10 @@ struct Qwen35Model::Impl {
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
     // GGUF fused-expert decode scratch (allocated by load_gguf)
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
+    // Decode-side NVFP4 FFN scratch (SPARKINFER_QWEN38_DECODE_NVFP4=1): gate and up outputs, and
+    // the SwiGLU result that feeds down. bf16 [moe_ffn] each -- ~104 KB total at ffn=17408, so it
+    // is allocated unconditionally rather than gated, keeping the decode path branch-free.
+    bf16 *nv_gate = nullptr, *nv_up = nullptr, *nv_h = nullptr;
     float *sx_h = nullptr;   // pipelined shared-expert h_scratch (avoids racing routed mf_h)
     void  *sx_q8 = nullptr;  // pipelined shared-expert Q8_1(h) for down (avoids racing aq81)
     int   *mf_ids = nullptr, *mf_counts = nullptr;
@@ -488,6 +493,9 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     cu(cudaMemset(p_->mf_rc, 0, sizeof(unsigned int)), "mf_rc zero");   // grid-completion counter starts at 0
     p_->mf_h       = p_->alloc<float>((size_t)std::max(1, cfg.top_k) * cfg.moe_ffn);
     p_->mf_out     = p_->alloc<float>(cfg.hidden);
+    p_->nv_gate    = p_->alloc<bf16>(cfg.moe_ffn);
+    p_->nv_up      = p_->alloc<bf16>(cfg.moe_ffn);
+    p_->nv_h       = p_->alloc<bf16>(cfg.moe_ffn);
     if (cfg.dense_ffn && cfg.top_k > 0) {
         cu(cudaMemcpy(p_->mf_ids, &zero, sizeof(int), cudaMemcpyHostToDevice), "dense expert id");
         cu(cudaMemcpy(p_->mf_weights, &one, sizeof(float), cudaMemcpyHostToDevice), "dense expert w");
@@ -1699,6 +1707,22 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // garbage FFN output that still looked like a confident (but wrong) distribution
             // downstream, rather than crashing or NaN-ing. Force nullptr for muse_glimmer so
             // launch_moe_expert_ffn_q4k quantizes s.hn fresh instead of trusting the stale cache.
+            // Checkpoint-native decode FFN (SPARKINFER_QWEN38_DECODE_NVFP4=1). gate_q/up_q/down_q
+            // are a Q4_K REQUANTIZATION of the NVFP4 the checkpoint ships -- 8.25% mean relative
+            // weight error, corr 0.9968 -- so this path exists to answer whether decoding the
+            // actual checkpoint numerics changes anything measurable. It is dense-only (top_k==1,
+            // one expert): the 256-expert MoE routes per token and has no single payload to read.
+            //
+            // Deliberately unfused: three GEMVs and an elementwise SwiGLU, against the Q4_K path's
+            // single fused kernel. That is the slow-but-obviously-correct shape for an accuracy
+            // experiment; if the accuracy win is real, the fusion work follows, and NVFP4's
+            // decoded magnitudes are exact int8 so a dp4a path is reachable.
+            if (w.gate_nv && w.up_nv && w.down_nv && c.top_k == 1) {
+                kernels::launch_gemv_nvfp4(s.hn, w.gate_nv, s.nv_gate, c.moe_ffn, H, st);
+                kernels::launch_gemv_nvfp4(s.hn, w.up_nv, s.nv_up, c.moe_ffn, H, st);
+                kernels::launch_prefill_swiglu(s.nv_gate, s.nv_up, s.nv_h, c.moe_ffn, st);
+                kernels::launch_gemv_nvfp4(s.nv_h, w.down_nv, s.routed, H, c.moe_ffn, st);
+            } else
             kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
@@ -4787,6 +4811,14 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         return true;
     };
 
+    // Run the DECODE FFN on the checkpoint's own NVFP4 weights instead of a Q4_K requantization
+    // of them. Off by default: it is an accuracy experiment with a real throughput risk, since
+    // the Q4_K path is dp4a int8 MMVQ and heavily tuned while launch_gemv_nvfp4 dequantizes to
+    // float. See the gate_nv/up_nv/down_nv comment in qwen35.h for what the conversion costs.
+    static const bool kDecodeNvfp4 = [] {
+        const char* e = getenv("SPARKINFER_QWEN38_DECODE_NVFP4");
+        return e && e[0] == '1';
+    }();
     auto keep_nvfp4 = [&](const std::string& prefix, int rows, int cols,
                           const void** fp4, const void** fp4_sf, float& fp4_alpha) -> const void* {
         NvFp4Src src{};
@@ -5117,7 +5149,21 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.gate_q = q4k_from_nvfp4(g_pay, c.moe_ffn, H, w.gate_qtype);
             w.up_q = q4k_from_nvfp4(u_pay, c.moe_ffn, H, w.up_qtype);
             w.down_q = q4k_from_nvfp4(d_pay, H, c.moe_ffn, w.down_qtype);
-            if (!w.gate_fp4) {
+            // SPARKINFER_QWEN38_DECODE_NVFP4=1 keeps the checkpoint's own payloads for DECODE, so
+            // the FFN runs the numerics the checkpoint actually ships instead of a Q4_K
+            // requantization of them (8.25% mean relative weight error -- see qwen35.h).
+            //
+            // The Q4_K copies are still built, deliberately: this is an A/B, and holding both lets
+            // the path be toggled per run without a reload. That costs the second residency the
+            // comment in keep_nvfp4 describes (~9.6 GB), so it fits at 4k and will NOT fit
+            // alongside a long-context KV. Once the accuracy question is settled one of the two
+            // copies should go, not both stay.
+            if (kDecodeNvfp4) {
+                w.gate_nv = g_pay; w.up_nv = u_pay; w.down_nv = d_pay;
+                s.owned.push_back(const_cast<void*>(g_pay));
+                s.owned.push_back(const_cast<void*>(u_pay));
+                s.owned.push_back(const_cast<void*>(d_pay));
+            } else if (!w.gate_fp4) {
                 // Prefill copies disabled: the payloads were deliberately not registered in
                 // s.owned (see keep_nvfp4), the Q4_K decode copies above are built, so release the
                 // NVFP4 source now rather than at teardown. Keyed on gate_fp4 being unset, which
