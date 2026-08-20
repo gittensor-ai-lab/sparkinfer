@@ -735,6 +735,31 @@ __device__ __forceinline__ float si_nvfp4_group_dot_decoded(const float* __restr
     return acc;
 }
 
+// x-side split of si_nvfp4_group_dot_decoded, for callers that reuse one group of activations
+// across several output rows. si_nvfp4_load_x16 converts the 16 bf16 once; si_nvfp4_dot16 folds
+// them in EXACTLY the order si_nvfp4_group_dot_decoded does -- same pairing, same term order, same
+// running sum -- so a caller that loads then dots produces the identical bits.
+__device__ __forceinline__ void si_nvfp4_load_x16(const __nv_bfloat16* x16, float* __restrict__ xv) {
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x16);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const float2 xf = __bfloat1622float2(x2[i]);
+        xv[2 * i] = xf.x;
+        xv[2 * i + 1] = xf.y;
+    }
+}
+
+__device__ __forceinline__ float si_nvfp4_dot16(const float* __restrict__ ws,
+                                                const float* __restrict__ xv) {
+    float acc = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) acc += ws[2 * i] * xv[2 * i] + ws[2 * i + 1] * xv[2 * i + 1];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        acc += ws[8 + 2 * i] * xv[8 + 2 * i] + ws[8 + 2 * i + 1] * xv[8 + 2 * i + 1];
+    return acc;
+}
+
 template <typename OutT, int S>
 __global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                      const void* __restrict__ packed,
@@ -786,57 +811,89 @@ template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloa
 // stride), accumulates into its own float, and folds its splits in the same ascending order. Only
 // the weight and scale loads are shared between rows -- the arithmetic per row is untouched, which
 // is what keeps the speculative path lossless by construction rather than by measurement.
-template <typename OutT, int S, int R>
+template <typename OutT, int S, int R, int NR>
 __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                           const void* __restrict__ packed,
                                           OutT* __restrict__ y, int N, int K) {
     constexpr int RPB = GEMV_WPB / S;
-    __shared__ float s_part[RPB][S][R];
+    __shared__ float s_part[RPB][S][NR][R];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row_local = warp / S, split = warp % S;
-    const int n = blockIdx.x * RPB + row_local;
-    float acc[R];
+    // NR OUTPUT ROWS PER WARP. The dominant traffic here is not the weights, it is the
+    // ACTIVATIONS: this kernel computes y[r][n] = dot(x[r], W[n]), so x is re-read once for every
+    // output row n. At N=K=5120, R=2 that is 105 MB of x against 14.7 MB of weights -- 7x -- and it
+    // is exactly the 3.41 GB L1 / 29.5 MB DRAM ratio the note above records. Staging x in SHARED
+    // memory to fix it cost 30%, because sharing across warps needs two __syncthreads per tile and
+    // those serialise the split-K warps. Reusing x across NR output rows inside ONE warp needs no
+    // barrier at all: the rows are private to the warp, x is loaded once into registers and dotted
+    // against NR decoded weight groups, and x traffic falls by NR.
+    //
+    // Bit-identical: each (n, r) dot still walks the same groups in the same order and folds the
+    // same S partials. Only which warp owns which output row changes. NR=1 is the original.
+    const int n0 = blockIdx.x * (RPB * NR) + row_local * NR;
+    float acc[NR][R];
     #pragma unroll
-    for (int r = 0; r < R; r++) acc[r] = 0.f;
-    if (n < N) {
+    for (int j = 0; j < NR; j++)
+        #pragma unroll
+        for (int r = 0; r < R; r++) acc[j][r] = 0.f;
+    if (n0 < N) {
         const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
         const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
         const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
-        const unsigned char* srow = sf + (size_t)n * (size_t)(K >> 4);
-        const unsigned char* prow = w + (size_t)n * (size_t)(K >> 1);
         const int ng = K >> 4;
         for (int g = split * 32 + lane; g < ng; g += S * 32) {
-            // Decode the group once, then dot it against every row. See si_nvfp4_group_decode.
-            float ws[16];
-            si_nvfp4_group_decode(prow + (size_t)g * 8, srow[g], inv_g, ws);
+            // x for this group, once, shared by every output row this warp owns.
+            float xv[R][16];
             #pragma unroll
             for (int r = 0; r < R; r++)
-                acc[r] += si_nvfp4_group_dot_decoded(ws, x + (size_t)r * K + (size_t)g * 16);
+                si_nvfp4_load_x16(x + (size_t)r * K + (size_t)g * 16, xv[r]);
+            #pragma unroll
+            for (int j = 0; j < NR; j++) {
+                const int nj = n0 + j;
+                if (NR > 1 && nj >= N) break;
+                const unsigned char* srow = sf + (size_t)nj * (size_t)(K >> 4);
+                const unsigned char* prow = w + (size_t)nj * (size_t)(K >> 1);
+                float ws[16];
+                si_nvfp4_group_decode(prow + (size_t)g * 8, srow[g], inv_g, ws);
+                #pragma unroll
+                for (int r = 0; r < R; r++) acc[j][r] += si_nvfp4_dot16(ws, xv[r]);
+            }
         }
         #pragma unroll
-        for (int r = 0; r < R; r++) {
+        for (int j = 0; j < NR; j++)
             #pragma unroll
-            for (int m = 16; m > 0; m >>= 1) acc[r] += __shfl_xor_sync(0xffffffff, acc[r], m);
-        }
+            for (int r = 0; r < R; r++) {
+                #pragma unroll
+                for (int m = 16; m > 0; m >>= 1)
+                    acc[j][r] += __shfl_xor_sync(0xffffffff, acc[j][r], m);
+            }
         if (lane == 0) {
             #pragma unroll
-            for (int r = 0; r < R; r++) s_part[row_local][split][r] = acc[r];
+            for (int j = 0; j < NR; j++)
+                #pragma unroll
+                for (int r = 0; r < R; r++) s_part[row_local][split][j][r] = acc[j][r];
         }
     }
     __syncthreads();
-    if (n < N && split == 0 && lane == 0) {
+    if (n0 < N && split == 0 && lane == 0) {
         #pragma unroll
-        for (int r = 0; r < R; r++) {
-            float o = s_part[row_local][0][r];
+        for (int j = 0; j < NR; j++) {
+            const int nj = n0 + j;
+            if (NR > 1 && nj >= N) break;
             #pragma unroll
-            for (int t = 1; t < S; t++) o += s_part[row_local][t][r];
-            gemv_write(y + (size_t)r * N + n, o);
+            for (int r = 0; r < R; r++) {
+                float o = s_part[row_local][0][j][r];
+                #pragma unroll
+                for (int t = 1; t < S; t++) o += s_part[row_local][t][j][r];
+                gemv_write(y + (size_t)r * N + nj, o);
+            }
         }
     }
 }
 #ifndef _MSC_VER
 #define SI_NVFP4_ROWS_INST(S_, R_) \
-template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 1>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 2>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 SI_NVFP4_ROWS_INST(2, 2) SI_NVFP4_ROWS_INST(4, 2) SI_NVFP4_ROWS_INST(8, 2)
 SI_NVFP4_ROWS_INST(2, 4) SI_NVFP4_ROWS_INST(4, 4) SI_NVFP4_ROWS_INST(8, 4)
 SI_NVFP4_ROWS_INST(2, 6) SI_NVFP4_ROWS_INST(4, 6) SI_NVFP4_ROWS_INST(8, 6)
@@ -2475,10 +2532,16 @@ bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N,
     if (M < 2 || M > 8) return false;
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
+    // SPARKINFER_NVFP4_ROWS_NR=1 gives one output row per warp, i.e. main's kernel exactly, so both
+    // arms of an A/B come out of one binary.
+    static const int nr = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
+                              return (e && e[0] == '1') ? 1 : 2; }();
 #define SI_NVFP4_ROWS(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
-        const dim3 grid((N + RPB - 1) / RPB); \
-        gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+        if (nr == 2) { const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
+            gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
+        else { const dim3 grid((N + RPB - 1) / RPB); \
+            gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
     } while (0)
 #define SI_NVFP4_ROWS_S(R_) do { \
         if (N >= 8192)      SI_NVFP4_ROWS(2, R_); \
