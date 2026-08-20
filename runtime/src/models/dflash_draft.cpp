@@ -1298,11 +1298,25 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // SPARKINFER_DFLASH_HEAD_MULTIROW=0 falls back to the bf16 batched path.
     static int head_mr = -1;
     if (head_mr < 0) { const char* e = getenv("SPARKINFER_DFLASH_HEAD_MULTIROW"); head_mr = (e && e[0] == '0') ? 0 : 1; }
+    // SGLang consumes base-logit rows [0, depth). Keep the legacy [1, depth+1) producer and
+    // consumer together behind one A/B switch; changing only one side reads the wrong (or, on the
+    // multi-row fast path, uninitialised) logits and is not a meaningful comparison.
+    static const int kRowShift = []{
+        const char* e = getenv("SPARKINFER_DFLASH_ROW_SHIFT");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    const int head_row0 = kRowShift ? 0 : 1;
     bool head_done = false;
     if (head_mr && s.head_q8 && (s.lm_head_type == 14 || s.lm_head_type == 12)) {
         // Score only the proposal rows the verifier can consume. One row-batched quantize launch
         // instead of kProposalDepth tiny ones (8 CTAs each, so launch latency dominated them).
-        kernels::launch_quantize_q8_1_rows(s.xn + (size_t)H, s.head_q8, H, kProposalDepth, H, st);
+        // DSpark's Markov chain consumes base-logit rows [0, depth): row 0 plus the anchor token
+        // produces proposal 1, row 1 plus proposal 1 produces proposal 2, and so on. Quantizing
+        // rows [1, depth+1) here was the other half of the legacy row displacement below: merely
+        // fixing the consumer would otherwise make row 0 read uninitialised logits on this fast
+        // multi-row head path.
+        kernels::launch_quantize_q8_1_rows(s.xn + (size_t)head_row0 * H,
+                                           s.head_q8, H, kProposalDepth, H, st);
         // Prefer the Q4_K head when one is bound: this kernel already runs near HBM peak, so its
         // runtime IS its weight bytes -- ~280 MB in Q4_K against ~417 MB in Q6_K at V=248k.
         static const bool head_i8 = [] {
@@ -1312,17 +1326,19 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         if (s.lm_head_type == 12 && s.lm_head_i4)
             head_done = kernels::launch_gemv_i4_q81_multirow_f32(
                 s.head_q8, s.lm_head_i4, s.lm_head_i4_scale,
-                s.logits + V, V, H, kProposalDepth, st);
+                s.logits + (size_t)head_row0 * V, V, H, kProposalDepth, st);
         else if (s.lm_head_type == 12 && head_i8 && s.lm_head_i8)
             head_done = kernels::launch_gemv_i8_q81_multirow_f32(
                 s.head_q8, s.lm_head_i8, s.lm_head_i8_scale,
-                s.logits + V, V, H, kProposalDepth, st);
+                s.logits + (size_t)head_row0 * V, V, H, kProposalDepth, st);
         else if (s.lm_head_type == 12)
             head_done = kernels::launch_gemv_q4k_dp4a_multirow_f32(
-                s.head_q8, s.lm_head, s.logits + V, V, H, kProposalDepth, st);
+                s.head_q8, s.lm_head, s.logits + (size_t)head_row0 * V,
+                V, H, kProposalDepth, st);
         else
             head_done = kernels::launch_gemv_q6k_dp4a_multirow_f32(
-                s.head_q8, s.lm_head, s.logits + V, V, H, kProposalDepth, st);
+                s.head_q8, s.lm_head, s.logits + (size_t)head_row0 * V,
+                V, H, kProposalDepth, st);
     }
     if (!head_done) {
     if (BW == 16) {
@@ -1341,13 +1357,11 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // DSpark's Markov head: position r's logit bias conditions on the token AT position r itself
     // (the anchor for r==0, its own -- just-chosen -- prediction for r>0), predicting position
     // r+1. That token is only known once position r-1's own Markov-corrected argmax has run, so
-    // rows 1..kProposalDepth chain sequentially instead of the single batched argmax below --
+    // proposals 1..kProposalDepth chain sequentially instead of the single batched argmax below --
     // each launch reads its "previous token" from device memory (s.d_ids[0], the real anchor, for
     // r==1; this same loop's own s.d_out[r-1] for r>1), so the chain needs no host round-trip
-    // until the final readback already below. Row 0 itself is never consumed by the caller (its
-    // prediction for position start+1 is redundant with the target's own verify-row-0 call, which
-    // is strictly more reliable than any draft guess), so it only needs a plain argmax in the
-    // !head_done path, where the batched LM-head GEMV computed it too and left it unscored.
+    // until the final readback already below. Base row 0 is consumed to form proposal 1; d_out[0]
+    // itself is not a proposal because the caller already owns the target-produced anchor token.
     // MARKOV HEAD: ALWAYS ON. It was gated on sequence length (#868, threshold 12288) because it
     // "raises acceptance and costs more than the acceptance is worth below long context". That was
     // measured inside the regime the gate itself creates, and the conclusion was wrong.
@@ -1384,9 +1398,10 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // selects the proposal-depth ladder in qwen35.cpp, which is a separate decision.
     const bool markov_on = markov_env >= 0 ? (markov_env != 0) : true;
     if (markov_on && s.markov_w1 && s.markov_w2) {
-        // ROW SHIFT (SPARKINFER_DFLASH_ROW_SHIFT=1). Which block row backs proposal r?
+        // ROW SHIFT (SPARKINFER_DFLASH_ROW_SHIFT=0 restores the legacy mapping). Which block row
+        // backs proposal r?
         //
-        // We read row r. SGLang reads row r-1: its run_markov_block iterates step_idx over ALL
+        // The legacy path reads row r. SGLang reads row r-1: its Markov sampler iterates over ALL
         // gamma rows of base_logits starting at row 0, with first_prev_tokens = the anchor
         // (draft_block_ids[:,0], the bonus token) -- so its FIRST proposal comes from row 0, the
         // row holding the real seed token, and its gamma-th from row gamma-1. Ours discards row 0
@@ -1397,10 +1412,6 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // That is consistent with the symptom: tau lands well above 1.0 because the Markov bias,
         // conditioned correctly, partially compensates for the wrong base row -- but it is capped,
         // and deeper drafting buys nothing because every position is displaced.
-        static const int kRowShift = []{
-            const char* e = getenv("SPARKINFER_DFLASH_ROW_SHIFT");
-            return (e && e[0] == '1') ? 1 : 0;
-        }();
         if (!head_done) kernels::launch_argmax(s.logits, s.d_out, 1, V, st);
         for (int r = 1; r <= kProposalDepth; r++) {
             const int* prev = (r == 1) ? s.d_ids : (s.d_out + (r - 1));
@@ -1413,19 +1424,22 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             // argmax is to be accepted. Order doesn't matter relative to the argmax call below --
             // it depends on s.xn and s.markov_latent, neither of which the argmax touches.
             if (s.confidence_w)
-                dflash_kernels::launch_confidence_head(s.xn + (size_t)r * H, s.markov_latent,
+                dflash_kernels::launch_confidence_head(s.xn + row * H, s.markov_latent,
                                                        s.confidence_w, s.confidence_bias, H,
                                                        s.markov_rank, s.d_confidence + r, st);
             kernels::launch_argmax(s.logits + row * V, s.d_out + r, 1, V, st);
         }
     } else {
-        kernels::launch_argmax(s.logits + (head_done ? V : 0),
+        kernels::launch_argmax(s.logits + (size_t)(head_done ? head_row0 : 0) * V,
                                s.d_out + (head_done ? 1 : 0),
                                head_done ? kProposalDepth : B, V, st);
     }
-    cu(cudaMemcpyAsync(s.h_out, s.d_out,
-                       (head_done ? kProposalDepth + 1 : B) * sizeof(int),
-                       cudaMemcpyDeviceToHost, st), "argmax");
+    if (head_done)
+        cu(cudaMemcpyAsync(s.h_out + 1, s.d_out + 1, kProposalDepth * sizeof(int),
+                           cudaMemcpyDeviceToHost, st), "argmax");
+    else
+        cu(cudaMemcpyAsync(s.h_out, s.d_out, B * sizeof(int),
+                           cudaMemcpyDeviceToHost, st), "argmax");
 
     // NUMERICAL DIFFERENTIAL DUMP (SPARKINFER_DSPARK_DUMP=<dir>). Writes ONE block's worth of
     // inputs and intermediates so a Python reference can recompute the same step from the same
@@ -1479,7 +1493,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                            kProposalDepth * sizeof(float), cudaMemcpyDeviceToHost, st),
            "confidence readback");
     cu(cudaStreamSynchronize(st), "draft sync");
-    for (int t = 0; t <= kProposalDepth; t++) out_argmax[t] = s.h_out[t];
+    for (int t = head_done ? 1 : 0; t <= kProposalDepth; t++) out_argmax[t] = s.h_out[t];
     if (out_confidence && s.confidence_w)
         for (int t = 1; t <= kProposalDepth; t++) out_confidence[t] = s.h_confidence[t];
 
