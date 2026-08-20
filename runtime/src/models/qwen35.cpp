@@ -3133,7 +3133,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     //      depth 3 against 1.123 at depth 5, i.e. a hundredth of a token for two extra rows.
     //
     //   2. DEPTH 4 IS A CLIFF, NOT A SLOPE. The draft's active block width is
-    //      round_up(depth+1) over {4, 8, 16} capped at block_size, so depth 3 runs a 4-wide draft
+    //      round_up(depth+1) over {2, 4, 8, 16} capped at block_size, so depth 3 runs a 4-wide draft
     //      block and depth 4 runs a 7-wide one. Crossing it costs a quarter of the throughput for
     //      the zero extra accepts above:
     //
