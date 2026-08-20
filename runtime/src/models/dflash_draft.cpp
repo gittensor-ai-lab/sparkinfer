@@ -962,7 +962,16 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             return e ? atoi(e) : 0;
         }();
         int v = env_w;
-        if (v <= 0) v = kProposalDepth + 1;
+        if (v <= 0) {
+            v = kProposalDepth + 1;
+            // DSpark's full-attention block is bidirectional: even when the verifier only asks
+            // for proposal 1, later mask rows are trained context for the base-logit row that
+            // produces it. The two-row tier removed too much of that context. Four rows stay on
+            // the same fast batched-GEMV tier and measured 106.70 -> 111.57 tok/s (tau 1.561 ->
+            // 1.662) on Qwen3.8-27B, while the full seven-row fallback costs 9.27 ms. Plain
+            // DFlash checkpoints have no Markov head and retain the old depth+1 choice.
+            if (s.markov_w1 && c.block_size == 7 && v < 4) v = 4;
+        }
         if (v < kProposalDepth + 1) v = kProposalDepth + 1;
         // Round up to a width the batched-GEMV path is instantiated for; anything else falls
         // back to the per-token GEMV loop, which costs far more than the rows it saves.
@@ -1181,25 +1190,18 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             const char* e = getenv("SPARKINFER_DFLASH_MIXED_CAUSAL");
             return (!e || e[0] != '0') ? 1 : 0;
         }();
-        // FORCE_CAUSAL (SPARKINFER_DFLASH_FORCE_CAUSAL=1) makes every layer causal within the
-        // block. Default behaviour is unchanged: causal is normally on only for sliding layers,
-        // and this checkpoint declares all five as full_attention, so the block is attended
-        // BIDIRECTIONALLY -- row i sees rows j>i, which are mask tokens. Whether that matches how
-        // the draft was trained is untested, and it is the one intra-block property the ablations
-        // have not covered. With the Markov head off the draft predicts the SEED TOKEN back at row
-        // 1, which is the kind of copy behaviour a wrong block mask produces.
-        // Default ON. `causal` was gated on c.sliding_layers[L] -- a property of attention over
-        // the SEQUENCE -- but the mask WITHIN the drafted block is a separate question, and this
-        // checkpoint declares all five layers full_attention, so the block was attended
-        // bidirectionally as a side effect. Measured acceptance, same prompt, same build:
-        // 1.2800 -> 1.3333 at ctx=4k, and tau rises at every context measured (512 1.0000 flat,
-        // 1024 1.4545 -> 1.4884, 2048 1.3333 -> 1.3617). Draft-only: the block mask changes what
-        // is PROPOSED, never what is emitted -- every emitted token is still a target argmax --
-        // so this can only move accept length.
-        // SPARKINFER_DFLASH_FORCE_CAUSAL=0 restores the bidirectional block.
+        // Full-attention DFlash layers are ENCODER_ONLY in the reference/SGLang implementation
+        // unless the checkpoint explicitly declares is_causal. This checkpoint does not, so its
+        // draft block is bidirectional: row i sees the later mask-token rows it was trained with.
+        // SparkInfer used to force every layer causal by default after an ablation made against
+        // the old, displaced Markov-logit rows. Repeating the comparison after fixing that row
+        // mapping reverses the decision: reference semantics raise tau 1.561 -> 1.600 and decode
+        // 106.70 -> 109.36 tok/s at depth 1, with identical 1.999 ms draft cost and lossless output.
+        // Sliding layers remain causal through mixed_causal below. The override is retained for
+        // checkpoints that need it: SPARKINFER_DFLASH_FORCE_CAUSAL=1 forces every layer causal.
         static const int kForceCausal = []{
             const char* e = getenv("SPARKINFER_DFLASH_FORCE_CAUSAL");
-            return (e && e[0] == '0') ? 0 : 1;
+            return (e && e[0] == '1') ? 1 : 0;
         }();
         const bool causal = kForceCausal ||
                             (mixed_causal && L < (int)c.sliding_layers.size() &&
