@@ -1718,8 +1718,6 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // experiment; if the accuracy win is real, the fusion work follows, and NVFP4's
             // decoded magnitudes are exact int8 so a dp4a path is reachable.
             if (w.gate_nv && w.up_nv && w.down_nv && c.top_k == 1) {
-                { static bool once = false;
-                  if (!once) { once = true; fprintf(stderr, "[nvfp4-decode] FFN on checkpoint NVFP4\n"); } }
                 kernels::launch_gemv_nvfp4(s.hn, w.gate_nv, s.nv_gate, c.moe_ffn, H, st);
                 kernels::launch_gemv_nvfp4(s.hn, w.up_nv, s.nv_up, c.moe_ffn, H, st);
                 kernels::launch_prefill_swiglu(s.nv_gate, s.nv_up, s.nv_h, c.moe_ffn, st);
