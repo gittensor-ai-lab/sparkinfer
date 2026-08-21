@@ -2881,7 +2881,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // constants AR uses (expert 0, weight 1.0) and run the identical expert kernel at N rows,
         // then skip straight past the MoE routing/shared machinery below.
         if (dense) {
-            if (!w.gate_q || !w.up_q || !w.down_q) {
+            static const bool kDecodeNvfp4 = [] {
+                const char* e = getenv("SPARKINFER_QWEN38_DECODE_NVFP4");
+                return e && e[0] == '1';
+            }();
+            const bool native_ffn = kDecodeNvfp4 && w.gate_nv && w.up_nv && w.down_nv;
+            const bool q4_ffn = w.gate_q && w.up_q && w.down_q;
+            if (!native_ffn && !q4_ffn) {
                 fprintf(stderr, "[dflash-verify] dense layer=%d missing gate/up/down\n", L);
                 supported = false; break;
             }
@@ -2892,24 +2898,26 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // the two disagree on weights that differ by ~8% and reports LOSSLESS=0 -- a path
             // inconsistency, not an accuracy finding. Measured exactly that way before this
             // branch existed.
-            static const bool kDecodeNvfp4 = [] {
-                const char* e = getenv("SPARKINFER_QWEN38_DECODE_NVFP4");
-                return e && e[0] == '1';
-            }();
-            if (kDecodeNvfp4 && w.gate_nv && w.up_nv && w.down_nv && topk == 1 &&
-                kernels::launch_gemv_nvfp4_rows(hn, w.gate_nv, sg, N, ffn, H, st) &&
-                kernels::launch_gemv_nvfp4_rows(hn, w.up_nv, su, N, ffn, H, st)) {
+            if (native_ffn) {
+                if (topk != 1 ||
+                    !kernels::launch_gemv_nvfp4_rows(hn, w.gate_nv, sg, N, ffn, H, st) ||
+                    !kernels::launch_gemv_nvfp4_rows(hn, w.up_nv, su, N, ffn, H, st)) {
+                    fprintf(stderr, "[dflash-verify] NVFP4 gate/up declined N=%d ffn=%d H=%d\n",
+                            N, ffn, H);
+                    supported = false; break;
+                }
                 kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
                 if (!kernels::launch_gemv_nvfp4_rows(sh, w.down_nv, routed, N, H, ffn, st)) {
                     fprintf(stderr, "[dflash-verify] NVFP4 down declined N=%d H=%d ffn=%d\n",
                             N, H, ffn);
                     supported = false; break;
                 }
-            } else
-            kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
-                                               w.gate_qtype, w.up_qtype, w.down_qtype,
-                                               expert_ids, expert_w, routed, moe_h, moe_out,
-                                               N, topk, H, ffn, q81, st);
+            } else {
+                kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
+                                                   w.gate_qtype, w.up_qtype, w.down_qtype,
+                                                   expert_ids, expert_w, routed, moe_h, moe_out,
+                                                   N, topk, H, ffn, q81, st);
+            }
             if (L == 0) vdbg_snapshot2(routed, 3);
             // Residual + next-layer norm, matching the MoE branch's tail.
             const void* nn = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;

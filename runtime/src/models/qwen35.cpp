@@ -4856,7 +4856,8 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             const char* e = getenv("SPARKINFER_QWEN38_PREFILL_NVFP4");
             return !(e && e[0] == '0');
         }();
-        if (keep_prefill_fp4) s.owned.push_back(payload);
+        // Exactly one owner even when the same payload serves both prefill and native decode.
+        if (keep_prefill_fp4 || kDecodeNvfp4) s.owned.push_back(payload);
         fp4_alpha = (global_scale != 0.f) ? (1.f / global_scale) : 1.f;
         const void* packed = static_cast<char*>(payload) + hdr + scale_bytes;
         if (keep_prefill_fp4 && kernels::prefill_nvfp4_supported(128, rows, cols)) {
@@ -5146,24 +5147,22 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
                                            &w.up_fp4, &w.up_fp4_sf, w.up_fp4_alpha);
             const void* d_pay = keep_nvfp4(mb + "down_proj", H, c.moe_ffn,
                                            &w.down_fp4, &w.down_fp4_sf, w.down_fp4_alpha);
-            w.gate_q = q4k_from_nvfp4(g_pay, c.moe_ffn, H, w.gate_qtype);
-            w.up_q = q4k_from_nvfp4(u_pay, c.moe_ffn, H, w.up_qtype);
-            w.down_q = q4k_from_nvfp4(d_pay, H, c.moe_ffn, w.down_qtype);
             // SPARKINFER_QWEN38_DECODE_NVFP4=1 keeps the checkpoint's own payloads for DECODE, so
             // the FFN runs the numerics the checkpoint actually ships instead of a Q4_K
             // requantization of them (8.25% mean relative weight error -- see qwen35.h).
             //
-            // The Q4_K copies are still built, deliberately: this is an A/B, and holding both lets
-            // the path be toggled per run without a reload. That costs the second residency the
-            // comment in keep_nvfp4 describes (~9.6 GB), so it fits at 4k and will NOT fit
-            // alongside a long-context KV. Once the accuracy question is settled one of the two
-            // copies should go, not both stay.
+            // This is selected before loading and cannot change without reloading the model, so
+            // building Q4_K copies as well buys no usable runtime A/B: the dispatch flag is a
+            // process-static value too. It only requantizes every FFN at startup and holds another
+            // ~9.6 GB for weights no kernel can reach. Keep exactly one decode representation.
             if (kDecodeNvfp4) {
                 w.gate_nv = g_pay; w.up_nv = u_pay; w.down_nv = d_pay;
-                s.owned.push_back(const_cast<void*>(g_pay));
-                s.owned.push_back(const_cast<void*>(u_pay));
-                s.owned.push_back(const_cast<void*>(d_pay));
-            } else if (!w.gate_fp4) {
+            } else {
+                w.gate_q = q4k_from_nvfp4(g_pay, c.moe_ffn, H, w.gate_qtype);
+                w.up_q = q4k_from_nvfp4(u_pay, c.moe_ffn, H, w.up_qtype);
+                w.down_q = q4k_from_nvfp4(d_pay, H, c.moe_ffn, w.down_qtype);
+            }
+            if (!kDecodeNvfp4 && !w.gate_fp4) {
                 // Prefill copies disabled: the payloads were deliberately not registered in
                 // s.owned (see keep_nvfp4), the Q4_K decode copies above are built, so release the
                 // NVFP4 source now rather than at teardown. Keyed on gate_fp4 being unset, which
@@ -5174,11 +5173,13 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             }
             if (w.gate_fp4 && w.up_fp4) ++gu_ready;
         }
-        if (!w.gate_q || !w.up_q || !w.down_q) return false;
+        const bool native_ffn = w.gate_nv && w.up_nv && w.down_nv;
+        const bool q4_ffn = w.gate_q && w.up_q && w.down_q;
+        if (!native_ffn && !q4_ffn) return false;
     }
-    fprintf(stderr, "[compressed-tensors] loaded %d layers, native NVFP4 prefill FFN %d/%d "
-            "(decode stays Q4_K)\n",
-            c.n_layers, gu_ready, c.n_layers);
+    fprintf(stderr, "[compressed-tensors] loaded %d layers, native NVFP4 prefill FFN %d/%d, "
+            "decode FFN %s\n", c.n_layers, gu_ready, c.n_layers,
+            kDecodeNvfp4 ? "NVFP4" : "Q4_K");
 
     // Same fused Q4_K-in-GEMM row scales Muse uses, for whichever tensors ended up Q4_K after the
     // per-tensor routing above -- full-attn q/k/v/o always, plus any FFN layer with no native
