@@ -2874,7 +2874,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // kernel args (a printf's tag/step) do not, which is why this uses vdbg_snapshot's
         // approach and not a live stat-printer call here.
         if (L == 0) vdbg_snapshot2(ao, 0);
-        kernels::launch_add_rmsnorm2_q8_rows(x, ao, w.post_attn_norm, h, hn, q81,
+        static const bool kDecodeNvfp4 = [] {
+            const char* e = getenv("SPARKINFER_QWEN38_DECODE_NVFP4");
+            return !(e && e[0] == '0');
+        }();
+        const bool native_ffn_here = dense && kDecodeNvfp4 &&
+                                     w.gate_nv && w.up_nv && w.down_nv;
+        kernels::launch_add_rmsnorm2_q8_rows(x, ao, w.post_attn_norm, h, hn,
+                                             native_ffn_here ? nullptr : q81,
                                              N, H, c.rms_eps, st);
         // FIXED (2026-08-17): this used to snapshot h BEFORE this kernel wrote it -- h is an
         // arena buffer reused every layer, so the earlier capture was reading whatever the
@@ -2889,12 +2896,6 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // constants AR uses (expert 0, weight 1.0) and run the identical expert kernel at N rows,
         // then skip straight past the MoE routing/shared machinery below.
         if (dense) {
-            // Same default and same env as the decode dispatch in qwen35.cpp -- ON unless
-            // SPARKINFER_QWEN38_DECODE_NVFP4=0. These two MUST stay in lockstep; see below.
-            static const bool kDecodeNvfp4 = [] {
-                const char* e = getenv("SPARKINFER_QWEN38_DECODE_NVFP4");
-                return !(e && e[0] == '0');
-            }();
             const bool native_ffn = kDecodeNvfp4 && w.gate_nv && w.up_nv && w.down_nv;
             const bool q4_ffn = w.gate_q && w.up_q && w.down_q;
             if (!native_ffn && !q4_ffn) {

@@ -190,7 +190,7 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
     const uint4* x4 = reinterpret_cast<const uint4*>(x + base);
     const uint4* r4 = reinterpret_cast<const uint4*>(residual + base);
     uint4* osum4 = reinterpret_cast<uint4*>(out_sum + base);
-    out_q8 += (size_t)blockIdx.x * (cols >> 5);
+    if (out_q8) out_q8 += (size_t)blockIdx.x * (cols >> 5);
 
     float xv[8], rv[8]; rn_unpack8(__ldg(x4 + t), xv); rn_unpack8(__ldg(r4 + t), rv);
     float sv[8]; float ss = 0.f;
@@ -213,27 +213,32 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
     const uint4* w4 = reinterpret_cast<const uint4*>(weight);
     const uint4* osum4r = reinterpret_cast<const uint4*>(out_sum + base);
     float svb[8], wv[8]; rn_unpack8(__ldg(osum4r + t), svb); rn_unpack8(__ldg(w4 + t), wv);
-    float ov[8], bv[8];
+    float ov[8];
     #pragma unroll
-    for (int j = 0; j < 8; j++) { ov[j] = svb[j] * inv_rms * wv[j]; bv[j] = __bfloat162float(__float2bfloat16(ov[j])); }
+    for (int j = 0; j < 8; j++) ov[j] = svb[j] * inv_rms * wv[j];
     reinterpret_cast<uint4*>(out_norm + base)[t] = rn_pack8(ov);
 
-    // Q8_1 of the bf16-rounded out_norm. 32-block = 4 consecutive threads (t&~3 .. +3).
-    float amax = 0.f;
-    #pragma unroll
-    for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(bv[j]));
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
-    const float d = amax / 127.0f;
-    const int b = t >> 2, r = t & 3;
-    int s = 0;
-    #pragma unroll
-    for (int j = 0; j < 8; j++) {
-        int qi = (amax == 0.0f) ? 0 : (int)roundf(bv[j] / d);
-        out_q8[b].qs[r * 8 + j] = (signed char)qi; s += qi;
+    if (out_q8) {
+        float bv[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) bv[j] = __bfloat162float(__float2bfloat16(ov[j]));
+        // Q8_1 of the bf16-rounded out_norm. 32-block = 4 consecutive threads (t&~3 .. +3).
+        float amax = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(bv[j]));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        const float d = amax / 127.0f;
+        const int b = t >> 2, r = t & 3;
+        int s = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int qi = (amax == 0.0f) ? 0 : (int)roundf(bv[j] / d);
+            out_q8[b].qs[r * 8 + j] = (signed char)qi; s += qi;
+        }
+        s += __shfl_xor_sync(0xffffffffu, s, 1); s += __shfl_xor_sync(0xffffffffu, s, 2);
+        if (r == 0) out_q8[b].ds = __floats2half2_rn(d, d * (float)s);
     }
-    s += __shfl_xor_sync(0xffffffffu, s, 1); s += __shfl_xor_sync(0xffffffffu, s, 2);
-    if (r == 0) out_q8[b].ds = __floats2half2_rn(d, d * (float)s);
 }
 
 // 3-input add_rmsnorm2_q8: out_sum = x + (res1 + res2), folding a residual_add node.
