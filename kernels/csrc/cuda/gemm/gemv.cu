@@ -951,6 +951,80 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
         }
     }
 }
+
+// Two independent projections of the same activation rows. This preserves the exact arithmetic
+// of gemv_nvfp4_rows_sk_kernel for each output, but loads each x group only once for gate+up.
+template <int S>
+__global__ void gemv_nvfp4_rows_dual_sk_kernel(const __nv_bfloat16* __restrict__ x,
+        const void* __restrict__ packed0, const void* __restrict__ packed1,
+        __nv_bfloat16* __restrict__ h, int N, int K) {
+    constexpr int R = 2, NR = 2, RPB = GEMV_WPB / S;
+    __shared__ float part[2][RPB][S][NR][R];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int rl = warp / S, split = warp % S;
+    const int n0 = blockIdx.x * (RPB * NR) + rl * NR;
+    float acc[2][NR][R] = {};
+    if (n0 < N) {
+        const void* pp[2] = {packed0, packed1};
+        const float inv[2] = {1.f / *reinterpret_cast<const float*>(packed0),
+                              1.f / *reinterpret_cast<const float*>(packed1)};
+        const int ng = K >> 4;
+        for (int g = split * 32 + lane; g < ng; g += S * 32) {
+            float xv[R][16];
+            #pragma unroll
+            for (int r = 0; r < R; ++r)
+                si_nvfp4_load_x16_v4(x + (size_t)r * K + (size_t)g * 16, xv[r]);
+            #pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                const unsigned char* sf = reinterpret_cast<const unsigned char*>(pp[p]) + SI_NVFP4_HDR;
+                const unsigned char* wb = sf + (size_t)N * (size_t)(K >> 4);
+                #pragma unroll
+                for (int j = 0; j < NR; ++j) {
+                    const int n = n0 + j;
+                    if (n >= N) break;
+                    float ws[16];
+                    si_nvfp4_group_decode_w8(wb + (size_t)n * (size_t)(K >> 1) + (size_t)g * 8,
+                                             sf[(size_t)n * (size_t)(K >> 4) + g], inv[p], ws);
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r) acc[p][j][r] += si_nvfp4_dot16(ws, xv[r]);
+                }
+            }
+        }
+        #pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            #pragma unroll
+            for (int j = 0; j < NR; ++j) {
+                #pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    #pragma unroll
+                    for (int m = 16; m > 0; m >>= 1)
+                        acc[p][j][r] += __shfl_xor_sync(0xffffffff, acc[p][j][r], m);
+                    if (lane == 0) part[p][rl][split][j][r] = acc[p][j][r];
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (n0 < N && split == 0 && lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < NR; ++j) {
+            const int n = n0 + j; if (n >= N) break;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) {
+                float g = part[0][rl][0][j][r], u = part[1][rl][0][j][r];
+                #pragma unroll
+                for (int t = 1; t < S; ++t) {
+                    g += part[0][rl][t][j][r];
+                    u += part[1][rl][t][j][r];
+                }
+                // Match the separate GEMVs' bf16 stores and pf_swiglu_kernel exactly.
+                g = __bfloat162float(__float2bfloat16(g));
+                u = __bfloat162float(__float2bfloat16(u));
+                h[(size_t)r * N + n] = __float2bfloat16((g / (1.f + __expf(-g))) * u);
+            }
+        }
+    }
+}
 #ifndef _MSC_VER
 #define SI_NVFP4_ROWS_INST(S_, R_) \
 template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 1, 0>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \
@@ -2627,6 +2701,26 @@ bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N,
     }
 #undef SI_NVFP4_ROWS_S
 #undef SI_NVFP4_ROWS
+    return true;
+}
+
+bool launch_gemv_nvfp4_rows_dual_swiglu(const void* x, const void* W0, const void* W1,
+                                        void* h, int M, int N, int K, cudaStream_t stream) {
+    if (!x || !W0 || !W1 || !h || M != 2 || N < 1 || K < 1 || (K & 15) ||
+        !gemv_bf16_splitk()) return false;
+    constexpr int NR = 2;
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+    auto* hp = reinterpret_cast<__nv_bfloat16*>(h);
+    if (N >= 8192) {
+        constexpr int S=2, RPB=GEMV_WPB/S;
+        gemv_nvfp4_rows_dual_sk_kernel<S><<<dim3((N+RPB*NR-1)/(RPB*NR)),GEMV_WPB*32,0,stream>>>(xp,W0,W1,hp,N,K);
+    } else if (N >= 4096) {
+        constexpr int S=4, RPB=GEMV_WPB/S;
+        gemv_nvfp4_rows_dual_sk_kernel<S><<<dim3((N+RPB*NR-1)/(RPB*NR)),GEMV_WPB*32,0,stream>>>(xp,W0,W1,hp,N,K);
+    } else {
+        constexpr int S=8, RPB=GEMV_WPB/S;
+        gemv_nvfp4_rows_dual_sk_kernel<S><<<dim3((N+RPB*NR-1)/(RPB*NR)),GEMV_WPB*32,0,stream>>>(xp,W0,W1,hp,N,K);
+    }
     return true;
 }
 

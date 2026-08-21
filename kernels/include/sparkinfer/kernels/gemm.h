@@ -88,6 +88,9 @@ bool launch_gemv_fp8_rows(const void* x, const void* W, void* y, int M, int N, i
 // Returns false for widths/shapes it does not cover, so callers keep their row loop as fallback.
 bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N, int K,
                             cudaStream_t stream = nullptr);
+bool launch_gemv_nvfp4_rows_dual_swiglu(const void* x, const void* W0, const void* W1,
+                                        void* h, int M, int N, int K,
+                                        cudaStream_t stream = nullptr);
 
 void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K,
                        cudaStream_t stream = nullptr);

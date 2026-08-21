@@ -2909,14 +2909,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // inconsistency, not an accuracy finding. Measured exactly that way before this
             // branch existed.
             if (native_ffn) {
-                if (topk != 1 ||
+                const bool dual = topk == 1 && kernels::launch_gemv_nvfp4_rows_dual_swiglu(
+                    hn, w.gate_nv, w.up_nv, sh, N, ffn, H, st);
+                if (!dual && (topk != 1 ||
                     !kernels::launch_gemv_nvfp4_rows(hn, w.gate_nv, sg, N, ffn, H, st) ||
-                    !kernels::launch_gemv_nvfp4_rows(hn, w.up_nv, su, N, ffn, H, st)) {
+                    !kernels::launch_gemv_nvfp4_rows(hn, w.up_nv, su, N, ffn, H, st))) {
                     fprintf(stderr, "[dflash-verify] NVFP4 gate/up declined N=%d ffn=%d H=%d\n",
                             N, ffn, H);
                     supported = false; break;
                 }
-                kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
+                if (!dual) kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
                 if (!kernels::launch_gemv_nvfp4_rows(sh, w.down_nv, routed, N, H, ffn, st)) {
                     fprintf(stderr, "[dflash-verify] NVFP4 down declined N=%d H=%d ffn=%d\n",
                             N, H, ffn);
