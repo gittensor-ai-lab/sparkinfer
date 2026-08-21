@@ -717,6 +717,33 @@ __device__ __forceinline__ void si_nvfp4_group_decode(const unsigned char* packe
     }
 }
 
+// 8-BYTE form of the decode above. si_nvfp4_group_dot's header explains why the ONE-ROW kernel
+// leaves these as two 4-byte loads: a uint2 needs 8-byte alignment, which "the row base only
+// happens to have for these shapes, not in general". The ROWS kernel is not the general case --
+// launch_gemv_nvfp4_rows rejects any K with (K & 15), so a weight row base nj*(K>>1) is a multiple
+// of 8 bytes and the group offset g*8 always is, for every shape that can reach here. Same two
+// 32-bit words, same order (little-endian: .x is the low four bytes), so p0 and p1 hold exactly
+// the bits the two separate loads produced.
+__device__ __forceinline__ void si_nvfp4_group_decode_w8(const unsigned char* packed8,
+                                                         unsigned char scale, float inv_g,
+                                                         float* __restrict__ ws) {
+    const float s = si_ue4m3(scale) * inv_g * 0.5f;
+    const uint2 pw = __ldg(reinterpret_cast<const uint2*>(packed8));
+    const unsigned int p0 = pw.x, p1 = pw.y;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p0 >> (8 * i)) & 255u;
+        ws[2 * i]     = si_e2m1_x2(b & 15u) * s;
+        ws[2 * i + 1] = si_e2m1_x2(b >> 4) * s;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p1 >> (8 * i)) & 255u;
+        ws[8 + 2 * i]     = si_e2m1_x2(b & 15u) * s;
+        ws[8 + 2 * i + 1] = si_e2m1_x2(b >> 4) * s;
+    }
+}
+
 // Same term order and same accumulation order as si_nvfp4_group_dot, reading pre-scaled weights.
 __device__ __forceinline__ float si_nvfp4_group_dot_decoded(const float* __restrict__ ws,
                                                             const __nv_bfloat16* x16) {
@@ -747,6 +774,34 @@ __device__ __forceinline__ void si_nvfp4_load_x16(const __nv_bfloat16* x16, floa
         xv[2 * i] = xf.x;
         xv[2 * i + 1] = xf.y;
     }
+}
+// 128-BIT form of the load above. The eight __nv_bfloat162 reads are eight separate LDG.E in SASS
+// -- nvcc cannot prove the 16-byte alignment because K is a runtime value, so it never widens
+// them. The group's 32 bytes ARE contiguous and aligned: launch_gemv_nvfp4_rows rejects any K
+// with (K & 15), so a row base r*K and a group base g*16 are both multiples of 16 elements = 32
+// bytes, and the x allocation itself is device-allocated (256-byte aligned).
+//
+// That matters because this kernel is load-ISSUE bound, not bandwidth bound. The header records
+// the ncu verdict -- memory pipe 88% of peak against SM 33%, "latency-bound on a dependent chain"
+// -- and at R=2, NR=2 the inner loop issues 20 LDG.E.CONSTANT per group, 16 of which are these
+// activation reads. Two uint4 loads per row replace eight, taking the group from 20 issued loads
+// to 8. No byte moves that did not move before.
+//
+// Bit-identical: the same 32 bytes are reinterpreted as the same eight __nv_bfloat162 in the same
+// order and converted by the same __bfloat1622float2, so every xv[] entry has the same bits.
+__device__ __forceinline__ void si_bf162_pair_to_f2(unsigned u, float* __restrict__ xv) {
+    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u));
+    xv[0] = f.x;
+    xv[1] = f.y;
+}
+__device__ __forceinline__ void si_nvfp4_load_x16_v4(const __nv_bfloat16* x16,
+                                                     float* __restrict__ xv) {
+    const uint4 a = *reinterpret_cast<const uint4*>(x16);
+    const uint4 b = *reinterpret_cast<const uint4*>(x16 + 8);
+    si_bf162_pair_to_f2(a.x, xv +  0); si_bf162_pair_to_f2(a.y, xv +  2);
+    si_bf162_pair_to_f2(a.z, xv +  4); si_bf162_pair_to_f2(a.w, xv +  6);
+    si_bf162_pair_to_f2(b.x, xv +  8); si_bf162_pair_to_f2(b.y, xv + 10);
+    si_bf162_pair_to_f2(b.z, xv + 12); si_bf162_pair_to_f2(b.w, xv + 14);
 }
 
 __device__ __forceinline__ float si_nvfp4_dot16(const float* __restrict__ ws,
@@ -811,7 +866,7 @@ template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloa
 // stride), accumulates into its own float, and folds its splits in the same ascending order. Only
 // the weight and scale loads are shared between rows -- the arithmetic per row is untouched, which
 // is what keeps the speculative path lossless by construction rather than by measurement.
-template <typename OutT, int S, int R, int NR>
+template <typename OutT, int S, int R, int NR, int WIDE>
 __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                           const void* __restrict__ packed,
                                           OutT* __restrict__ y, int N, int K) {
@@ -845,8 +900,10 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
             // x for this group, once, shared by every output row this warp owns.
             float xv[R][16];
             #pragma unroll
-            for (int r = 0; r < R; r++)
-                si_nvfp4_load_x16(x + (size_t)r * K + (size_t)g * 16, xv[r]);
+            for (int r = 0; r < R; r++) {
+                if (WIDE) si_nvfp4_load_x16_v4(x + (size_t)r * K + (size_t)g * 16, xv[r]);
+                else      si_nvfp4_load_x16   (x + (size_t)r * K + (size_t)g * 16, xv[r]);
+            }
             #pragma unroll
             for (int j = 0; j < NR; j++) {
                 const int nj = n0 + j;
@@ -854,7 +911,8 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
                 const unsigned char* srow = sf + (size_t)nj * (size_t)(K >> 4);
                 const unsigned char* prow = w + (size_t)nj * (size_t)(K >> 1);
                 float ws[16];
-                si_nvfp4_group_decode(prow + (size_t)g * 8, srow[g], inv_g, ws);
+                if (WIDE >= 2) si_nvfp4_group_decode_w8(prow + (size_t)g * 8, srow[g], inv_g, ws);
+                else           si_nvfp4_group_decode   (prow + (size_t)g * 8, srow[g], inv_g, ws);
                 #pragma unroll
                 for (int r = 0; r < R; r++) acc[j][r] += si_nvfp4_dot16(ws, xv[r]);
             }
@@ -892,8 +950,10 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
 }
 #ifndef _MSC_VER
 #define SI_NVFP4_ROWS_INST(S_, R_) \
-template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 1>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \
-template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 2>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 1, 0>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 2, 0>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 2, 1>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 2, 2>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 SI_NVFP4_ROWS_INST(2, 2) SI_NVFP4_ROWS_INST(4, 2) SI_NVFP4_ROWS_INST(8, 2)
 SI_NVFP4_ROWS_INST(2, 4) SI_NVFP4_ROWS_INST(4, 4) SI_NVFP4_ROWS_INST(8, 4)
 SI_NVFP4_ROWS_INST(2, 6) SI_NVFP4_ROWS_INST(4, 6) SI_NVFP4_ROWS_INST(8, 6)
@@ -2536,12 +2596,20 @@ bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N,
     // arms of an A/B come out of one binary.
     static const int nr = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
                               return (e && e[0] == '1') ? 1 : 2; }();
+    // SPARKINFER_NVFP4_ROWS_V4 selects the load width: 0 restores main's scalar loads, 1 widens
+    // only the activations, 2 (default) widens the weight pair as well. All three arms come out of
+    // one binary the way the NR toggle beside it does.
+    static const int xv4 = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_V4");
+                               const int v = e ? atoi(e) : 2;
+                               return (v < 0 || v > 2) ? 2 : v; }();
 #define SI_NVFP4_ROWS(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
         if (nr == 2) { const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
-            gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
+            if (xv4 == 2)      gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 2, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+            else if (xv4 == 1) gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 2, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+            else               gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 2, 0><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
         else { const dim3 grid((N + RPB - 1) / RPB); \
-            gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
+            gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 1, 0><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
     } while (0)
 #define SI_NVFP4_ROWS_S(R_) do { \
         if (N >= 8192)      SI_NVFP4_ROWS(2, R_); \
