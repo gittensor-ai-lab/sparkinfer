@@ -276,6 +276,17 @@ struct Qwen35Model::Impl {
     // a second feeds down. Sized for the widest K the FFN reads (moe_ffn for down).
     signed char *nv_xq = nullptr;
     float *nv_xs = nullptr;
+    // Separate int8 staging for the PROJECTIONS. The FFN pair above is re-quantized twice inside
+    // one layer (layer input, then the SwiGLU hidden), so the projections cannot share it: they
+    // are issued before the FFN and must survive until the last projection of the layer reads it.
+    signed char *nv_pxq = nullptr;
+    float *nv_pxs = nullptr;
+    // A SECOND pair for projections whose input is not xn (attention output, GDN gate input).
+    // Those are issued on the main stream only, while the xn pair above is read by projections
+    // the GDN branch forks onto stream_k -- one buffer for both would let the main stream
+    // overwrite the quantized xn while the forked stream is still reading it.
+    signed char *nv_fxq = nullptr;
+    float *nv_fxs = nullptr;
     float *sx_h = nullptr;   // pipelined shared-expert h_scratch (avoids racing routed mf_h)
     void  *sx_q8 = nullptr;  // pipelined shared-expert Q8_1(h) for down (avoids racing aq81)
     int   *mf_ids = nullptr, *mf_counts = nullptr;
@@ -512,6 +523,10 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->nv_h       = p_->alloc<bf16>(cfg.moe_ffn);
     p_->nv_xq      = p_->alloc<signed char>(cfg.moe_ffn);
     p_->nv_xs      = p_->alloc<float>(cfg.moe_ffn / 16 + 1);
+    p_->nv_pxq     = p_->alloc<signed char>(cfg.moe_ffn);
+    p_->nv_pxs     = p_->alloc<float>(cfg.moe_ffn / 16 + 1);
+    p_->nv_fxq     = p_->alloc<signed char>(cfg.moe_ffn);
+    p_->nv_fxs     = p_->alloc<float>(cfg.moe_ffn / 16 + 1);
     if (cfg.dense_ffn && cfg.top_k > 0) {
         cu(cudaMemcpy(p_->mf_ids, &zero, sizeof(int), cudaMemcpyHostToDevice), "dense expert id");
         cu(cudaMemcpy(p_->mf_weights, &one, sizeof(float), cudaMemcpyHostToDevice), "dense expert w");
@@ -761,6 +776,16 @@ int Qwen35Model::adaptive_nsplits_for(int seqlen) const {
         }
     }
     return want;
+}
+
+// Separate switch from the FFN's, so the two halves of the NVFP4 dp4a conversion can be A/B'd
+// independently in one binary. Both must be on for the projections to take the dp4a path.
+static inline bool nvfp4_dp4a_proj() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_QWEN38_NVFP4_DP4A_PROJ");
+        return !e || e[0] != '0';
+    }();
+    return v;
 }
 
 int Qwen35Model::forward_token(int token_id, int position, bool sample, float temperature,
@@ -1147,6 +1172,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         // mmvq_q4k/mmvq_q6k branches, which read s.aq81 unconditionally) ran against the wrong
         // layer's quantized activation. Force a fresh quantize every layer for muse_glimmer.
         bool xn_q8_ready = (fnq && L > 0 && !c.muse_glimmer) || muse_xn_q8;
+        // Same idea as xn_q8_ready, for the NVFP4 dp4a projections: q, k, v, the qkv gate and
+        // alpha/beta all read THIS layer's xn, so it is quantized once and reused. Reset per layer
+        // because s.xn is rewritten by the previous layer's tail.
+        bool nv_xn_ready = false;
         // Both flags are re-earned every layer by the tail that actually ran; consumed here, so
         // a layer whose tail declines falls back to its own quantize instead of inheriting.
         muse_hn_q8 = false;
@@ -1161,6 +1190,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 kernels::launch_quantize_q8_1(s.xn, s.aq8, s.aq8_d, s.aq8_s, H, st);
             }
         };
+        // Quantize xn ONCE per layer, on the main stream, before anything forks. Every NVFP4
+        // projection of this layer reads the same xn, so one quantize serves q/k/v, the qkv gate
+        // and alpha/beta -- and doing it here rather than inside proj_xn is what keeps the forked
+        // stream_k projections reading a buffer nobody is still writing.
+        auto prepare_xn_nvfp4 = [&](bool any_nv) {
+            if (!any_nv || nv_xn_ready) return;
+            if (!kernels::qwen38_nvfp4_dp4a() || !nvfp4_dp4a_proj()) return;
+            kernels::launch_gemv_nvfp4_quant_x(s.xn, s.nv_pxq, s.nv_pxs, 1, H, st);
+            nv_xn_ready = true;
+        };
         auto proj_xn = [&](const void* W, int t, void* y, int N, cudaStream_t pst) {
             if (s.gguf) {
                 if (s.use_pq && t == 12) {
@@ -1173,8 +1212,33 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_mmvq_q80(s.aq81, W, y, N, H, pst);
                 else if (t == kernels::SI_QTYPE_FP8)
                     kernels::launch_gemv_fp8(s.xn, W, y, N, H, pst);
-                else if (t == kernels::SI_QTYPE_NVFP4)
+                else if (t == kernels::SI_QTYPE_NVFP4) {
+                    // dp4a for the checkpoint's native NVFP4 GDN/attention projections, by the
+                    // same argument #904 used for the dense FFN: the decoded magnitudes are exact
+                    // integers, so the group dot is group_scale * sum(mag * xq) -- an exact
+                    // integer reduction. The weights stay bit-exact and only the activation is
+                    // quantized, at one scale per 16 values, matching the weight group size.
+                    //
+                    // #904 converted the FFN and left these on the float GEMV. They are the
+                    // remainder of the checkpoint's NVFP4 -- every GDN in-projection and output,
+                    // plus the full-attention q/k/v/o -- and on a decode step that is weight-bound
+                    // they are read in full for every token.
+                    //
+                    // Gated on the SAME switch as the FFN so decode and the speculative verify
+                    // never disagree: losslessness here means the speculative stream matches THIS
+                    // build's AR stream, so one side on dp4a and the other on the float path would
+                    // fail the gate on path inconsistency rather than on accuracy.
+                    // Consumes the quantize prepare_xn_nvfp4() already issued on the MAIN
+                    // stream. It must not quantize here: the GDN branch forks the qkv gate and
+                    // alpha/beta onto stream_k, so an inline quantize would have two streams
+                    // writing one staging buffer. (That is exactly what a first cut did, and it
+                    // showed up as LOSSLESS=0 with tau collapsed to 1.0 -- the verify and decode
+                    // disagreeing because decode's own projections were racing.)
+                    if (nv_xn_ready &&
+                        kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pxq, s.nv_pxs, W, y, 1, N, H, pst))
+                        return;
                     kernels::launch_gemv_nvfp4(s.xn, W, y, N, H, pst);
+                }
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -1200,6 +1264,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 } else if (t == kernels::SI_QTYPE_FP8) {
                     kernels::launch_gemv_fp8(x, W, y, N, K, st);
                 } else if (t == kernels::SI_QTYPE_NVFP4) {
+                    // Own quantize: unlike proj_xn the source differs per call (attention output,
+                    // GDN gated norm). Measured net positive even so -- the verify amortizes it
+                    // over N rows and decode's extra launch is smaller than the dp4a saving.
+                    if (kernels::qwen38_nvfp4_dp4a() && nvfp4_dp4a_proj()) {
+                        kernels::launch_gemv_nvfp4_quant_x(x, s.nv_fxq, s.nv_fxs, 1, K, st);
+                        if (kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_fxq, s.nv_fxs, W, y, 1, N, K, st))
+                            return;
+                    }
                     kernels::launch_gemv_nvfp4(x, W, y, N, K, st);
                 } else if (t) kernels::launch_gemv_q(x, W, t, y, N, K, st);
                 else          kernels::launch_gemv(x, W, y, N, K, st);
@@ -1216,6 +1288,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             const bool any_q80 = (w.wqkv_type == 8 || w.wqkv_gate_type == 8 ||
                                   w.ssm_alpha_type == 8 || w.ssm_beta_type == 8);
             prepare_xn_quant(any_q4k, any_q6k, any_q80);
+            prepare_xn_nvfp4(w.wqkv_type == kernels::SI_QTYPE_NVFP4 ||
+                             w.wqkv_gate_type == kernels::SI_QTYPE_NVFP4 ||
+                             w.ssm_alpha_type == kernels::SI_QTYPE_NVFP4 ||
+                             w.ssm_beta_type == kernels::SI_QTYPE_NVFP4);
             const bool gdn_quad = s.use_gdn_quad && s.gguf && s.use_pq && s.use_llama && H == 2048
                                && w.wqkv_type == 12 && w.wqkv_gate_type == 12
                                && w.ssm_alpha_type == 12 && w.ssm_beta_type == 12;
@@ -1326,6 +1402,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
                 const bool any_q80 = (w.wq_type == 8 || w.wk_type == 8 || w.wv_type == 8);
                 prepare_xn_quant(any_q4k, any_q6k, any_q80);
+                prepare_xn_nvfp4(w.wq_type == kernels::SI_QTYPE_NVFP4 ||
+                                 w.wk_type == kernels::SI_QTYPE_NVFP4 ||
+                                 w.wv_type == kernels::SI_QTYPE_NVFP4);
                 // Muse Glimmer keeps attn_gate as its own quantized tensor (w.wgate), so Q goes
                 // straight to s.q and the gate straight to s.qgate -- no [q|gate] interleave to
                 // build and no split to undo it. Every other model still fuses them into s.qraw.

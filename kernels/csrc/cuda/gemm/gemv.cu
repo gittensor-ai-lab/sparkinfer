@@ -2757,10 +2757,21 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
     // Split-K chosen by N exactly as the float rows kernel does, so the two paths fan out over the
     // GPU identically and a comparison between them is a comparison of the arithmetic alone.
+    // NR (output rows per warp-group) was fixed at 2, which is right for the dense FFN this path
+    // was written for: at N = 17408 the grid is still ~4x the SM count, and folding two output
+    // rows into a warp-group halves the activation traffic. The GDN and attention projections are
+    // 2048 to 12288 rows wide, where halving the grid costs more occupancy than the sharing buys.
+    // Pick NR by N. SPARKINFER_NVFP4_DP4A_NR pins it for A/B.
+    static const int nr_pin = []{ const char* e = getenv("SPARKINFER_NVFP4_DP4A_NR");
+                                  int v = e ? atoi(e) : 0; return (v == 1 || v == 2) ? v : 0; }();
+    const int nr = nr_pin ? nr_pin : (N >= 16384 ? 2 : 1);
+#define SI_NVFP4_DP4A_NR(S_, R_, NR_) do { \
+        constexpr int S = (S_), R = (R_), NR = (NR_), RPB = GEMV_WPB / S; \
+        const dim3 grid((N + RPB * NR - 1) / (RPB * NR)); \
+        gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, NR><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
+    } while (0)
 #define SI_NVFP4_DP4A(S_, R_) do { \
-        constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
-        const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
-        gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
+        if (nr == 2) SI_NVFP4_DP4A_NR(S_, R_, 2); else SI_NVFP4_DP4A_NR(S_, R_, 1); \
     } while (0)
 #define SI_NVFP4_DP4A_S(R_) do { \
         if (N >= 8192)      SI_NVFP4_DP4A(2, R_); \
@@ -2775,6 +2786,7 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
     }
 #undef SI_NVFP4_DP4A_S
 #undef SI_NVFP4_DP4A
+#undef SI_NVFP4_DP4A_NR
     return true;
 }
 

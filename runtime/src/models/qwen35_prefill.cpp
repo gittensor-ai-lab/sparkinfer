@@ -2319,6 +2319,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     return seed;
 }
 
+// Mirrors qwen35.cpp's switch of the same name: both sides must select the same projection
+// arithmetic or DSpark stops reproducing AR and the losslessness gate fails on path inconsistency.
+static inline bool verify_nvfp4_dp4a_proj() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_QWEN38_NVFP4_DP4A_PROJ");
+        return !e || e[0] != '0';
+    }();
+    return v;
+}
+
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax, bool capture_only) {
@@ -2464,6 +2474,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* shared_h = a.alloc<float>((size_t)N * ffn);
     float* logits = a.alloc<float>((size_t)N * c.vocab);
     int* out_ids = a.alloc<int>(N);
+    // int8 staging for the dp4a NVFP4 projections (see proj() below), one scale per 16 values.
+    const int nv_kmax = std::max(std::max(H, lvdim), std::max(s.linear_qdim, qdim));
+    signed char* nvp_xq = a.alloc<signed char>((size_t)N * nv_kmax);
+    float* nvp_xs = a.alloc<float>((size_t)N * (nv_kmax / 16 + 1));
+    // Second pair for projections whose input is NOT xn. The xn pair is filled once per layer on
+    // the main stream and then read by projections this function forks onto stream_k, so a single
+    // shared buffer would let a later main-stream quantize overwrite it mid-flight.
+    signed char* nvf_xq = a.alloc<signed char>((size_t)N * nv_kmax);
+    float* nvf_xs = a.alloc<float>((size_t)N * (nv_kmax / 16 + 1));
+    bool nv_xn_ready = false;
     const size_t q81_stride_max = kernels::llama_q8_1_bytes(std::max(H, lvdim));
     void* q81 = a.alloc<unsigned char>((size_t)N * q81_stride_max);
     const int ns = std::max(1, s.n_splits);
@@ -2604,6 +2624,23 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // N one-row calls are bit-identical to N AR steps, which is what keeps the speculative
         // path lossless by construction rather than by measurement.
         if (type == kernels::SI_QTYPE_NVFP4) {
+            // dp4a first, on the same switch decode uses. #904 established that NVFP4's decoded
+            // magnitudes are exact integers, so a group's dot is group_scale * sum(mag * xq) -- an
+            // exact integer reduction -- and applied it to the dense FFN. These projections are
+            // the rest of the checkpoint's NVFP4 and were left on the float rows kernel below.
+            // The dp4a rows kernel is instantiated from M = 1, so the N rows here run the same
+            // kernel AR decode runs at one row, which is what keeps this path lossless.
+            if (kernels::qwen38_nvfp4_dp4a() && verify_nvfp4_dp4a_proj()) {
+                const bool is_xn = (in == xn);
+                signed char* xq = is_xn ? nvp_xq : nvf_xq;
+                float* xs = is_xn ? nvp_xs : nvf_xs;
+                if (!is_xn || !nv_xn_ready) {
+                    kernels::launch_gemv_nvfp4_quant_x(in, xq, xs, N, k, st);
+                    if (is_xn) nv_xn_ready = true;
+                }
+                if (kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w, out, N, no, k, st))
+                    return true;
+            }
             // One weight stream for all N rows when a rows kernel covers this width. It reproduces
             // the one-row kernel's dot and split-fold order per row, so the results are the same
             // bits the loop below produces -- the loop stays as the fallback for widths it does
@@ -2636,6 +2673,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // Native FP8/NVFP4 touch no shared q81 scratch, so unlike the mmvq path below they are
         // safe on ANY stream and never need the fall-back to `st`.
         if (type == kernels::SI_QTYPE_FP8 || type == kernels::SI_QTYPE_NVFP4) {
+            // Same contract as the q81 path above: the caller has already quantized `in` on the
+            // main stream, so this never writes shared scratch off-stream.
+            if (type == kernels::SI_QTYPE_NVFP4 && kernels::qwen38_nvfp4_dp4a() &&
+                verify_nvfp4_dp4a_proj() && in == xn && nv_xn_ready) {
+                if (kernels::launch_gemv_nvfp4_rows_dp4a(nvp_xq, nvp_xs, w, out, N, no, k, ps))
+                    return true;
+            }
             if (type == kernels::SI_QTYPE_NVFP4 &&
                 kernels::launch_gemv_nvfp4_rows(in, w, out, N, no, k, ps)) return true;
             if (type == kernels::SI_QTYPE_FP8 &&
@@ -2772,6 +2816,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         vdbg_snapshot(xn, L);
         if (L == 0) vdbg_snapshot2(x, 4);   // raw pre-norm residual stream (h = x + ao)
         const Qwen35LayerWeights& w = s.w.layers[L];
+        nv_xn_ready = false;   // xn was rewritten by the previous layer's tail
         if (w.linear_attn) {
             bf16* rq = rec_qkv + (size_t)L * N * lqkv;
             bf16* rk = rec_k + (size_t)L * N * s.linear_qdim;
@@ -2785,6 +2830,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // holds xn -- otherwise proj() would have to quantize, which writes shared scratch.
             const bool fork_gdn = fork_shared && q81_src == xn && q81_k == H;
             cudaStream_t gst = fork_gdn ? s.stream_k : st;
+            // Same precondition the q81 comment above states, for the dp4a NVFP4 staging: quantize
+            // xn on the MAIN stream BEFORE the fork event is recorded, so stream_k's wait covers
+            // it. Issued here rather than lazily inside proj() because proj_on() runs on stream_k
+            // and the fork event is recorded before proj() would have had a chance to fill it.
+            if (kernels::qwen38_nvfp4_dp4a() && verify_nvfp4_dp4a_proj() && !nv_xn_ready &&
+                (w.wqkv_type == kernels::SI_QTYPE_NVFP4 ||
+                 w.wqkv_gate_type == kernels::SI_QTYPE_NVFP4 ||
+                 w.ssm_alpha_type == kernels::SI_QTYPE_NVFP4 ||
+                 w.ssm_beta_type == kernels::SI_QTYPE_NVFP4)) {
+                kernels::launch_gemv_nvfp4_quant_x(xn, nvp_xq, nvp_xs, N, H, st);
+                nv_xn_ready = true;
+            }
             if (fork_gdn) {
                 pf_cu(cudaEventRecord(ev_fork, st), "verify gdn fork");
                 pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify gdn fork wait");
@@ -2818,6 +2875,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // are kvdim rows apiece and run at well under one CTA per SM.
             const bool fork_attn = fork_shared && q81_src == xn && q81_k == H;
             cudaStream_t ast = fork_attn ? s.stream_k : st;
+            // Same pre-fork quantize as the GDN branch above: wk and wv are issued on stream_k,
+            // so xn's int8 staging has to be filled on the main stream before the fork event is
+            // recorded, or stream_k's wait does not cover it.
+            if (kernels::qwen38_nvfp4_dp4a() && verify_nvfp4_dp4a_proj() && !nv_xn_ready &&
+                (w.wq_type == kernels::SI_QTYPE_NVFP4 ||
+                 w.wk_type == kernels::SI_QTYPE_NVFP4 ||
+                 w.wv_type == kernels::SI_QTYPE_NVFP4)) {
+                kernels::launch_gemv_nvfp4_quant_x(xn, nvp_xq, nvp_xs, N, H, st);
+                nv_xn_ready = true;
+            }
             if (fork_attn) {
                 pf_cu(cudaEventRecord(ev_fork, st), "verify attn fork");
                 pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify attn fork wait");
