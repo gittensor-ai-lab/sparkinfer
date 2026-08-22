@@ -1103,6 +1103,22 @@ SI_NVFP4_DP4A_INST(2, 6) SI_NVFP4_DP4A_INST(4, 6) SI_NVFP4_DP4A_INST(8, 6)
 SI_NVFP4_DP4A_INST(2, 7) SI_NVFP4_DP4A_INST(4, 7) SI_NVFP4_DP4A_INST(8, 7)
 SI_NVFP4_DP4A_INST(2, 8) SI_NVFP4_DP4A_INST(4, 8) SI_NVFP4_DP4A_INST(8, 8)
 #undef SI_NVFP4_DP4A_INST
+// NR = 1 as well. NR is how many OUTPUT rows a warp-group owns, and at NR = 2 the compiler keeps
+// two sets of weight temporaries (pw, the four decoded quads, the group scale) live across the
+// unrolled j loop on top of the second acc column. That costs far more than the acc array alone:
+// registers run 47/48/56/64/70/78/80/93 across R = 1..8 at NR = 2 against 38/39/39/40/42/40/44/42
+// at NR = 1, i.e. NR = 1 is nearly FLAT in the row count where NR = 2 is not.
+#define SI_NVFP4_DP4A_INST1(S_, R_) \
+template __global__ void gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S_, R_, 1>(const signed char*, const float*, const void*, __nv_bfloat16*, int, int);
+SI_NVFP4_DP4A_INST1(2, 1) SI_NVFP4_DP4A_INST1(4, 1) SI_NVFP4_DP4A_INST1(8, 1)
+SI_NVFP4_DP4A_INST1(2, 2) SI_NVFP4_DP4A_INST1(4, 2) SI_NVFP4_DP4A_INST1(8, 2)
+SI_NVFP4_DP4A_INST1(2, 3) SI_NVFP4_DP4A_INST1(4, 3) SI_NVFP4_DP4A_INST1(8, 3)
+SI_NVFP4_DP4A_INST1(2, 4) SI_NVFP4_DP4A_INST1(4, 4) SI_NVFP4_DP4A_INST1(8, 4)
+SI_NVFP4_DP4A_INST1(2, 5) SI_NVFP4_DP4A_INST1(4, 5) SI_NVFP4_DP4A_INST1(8, 5)
+SI_NVFP4_DP4A_INST1(2, 6) SI_NVFP4_DP4A_INST1(4, 6) SI_NVFP4_DP4A_INST1(8, 6)
+SI_NVFP4_DP4A_INST1(2, 7) SI_NVFP4_DP4A_INST1(4, 7) SI_NVFP4_DP4A_INST1(8, 7)
+SI_NVFP4_DP4A_INST1(2, 8) SI_NVFP4_DP4A_INST1(4, 8) SI_NVFP4_DP4A_INST1(8, 8)
+#undef SI_NVFP4_DP4A_INST1
 #endif
 
 #ifndef _MSC_VER
@@ -2757,10 +2773,31 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
     // Split-K chosen by N exactly as the float rows kernel does, so the two paths fan out over the
     // GPU identically and a comparison between them is a comparison of the arithmetic alone.
+    // Output rows per warp-group. ncu on this kernel says it is LATENCY bound, not compute bound
+    // -- across R = 1/2/4/8 the SM pipes sit at 28/32/31/20% of peak while warp occupancy falls
+    // 93/77/62/32% and DRAM follows it down 68/74/58/27% -- so what it wants is resident warps,
+    // and NR is what buys them: two output rows per warp-group keeps two sets of weight
+    // temporaries live across the unrolled j loop, which costs 24 registers at R=4 and 51 at R=8.
+    //
+    // Measured on the isolated kernel with a DRAM-resident working set, microseconds at R=4:
+    //   ffn gate/up N=17408  40.8 -> 34.8      gdn wide N=12288  30.7 -> 26.6
+    //   attn q      N=6144   15.5 -> 13.8      ffn down N=5120   36.8 -> 36.8
+    // Neutral-or-better at every shape for R in [3, 7]; at R = 8 it inverts on the narrow shapes
+    // (ffn down 49.2 -> 59.4), and at R <= 2 there are already enough warps for the load, so the
+    // extra grid is not repaid. Hence the band rather than a blanket switch.
+    // 0 = pick by row count, 1 or 2 force.
+    static const int nr_mode = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
+                                   int v = e ? atoi(e) : 0; return (v == 1 || v == 2) ? v : 0; }();
 #define SI_NVFP4_DP4A(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
-        const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
-        gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
+        const int nr = nr_mode ? nr_mode : ((R >= 3 && R <= 7) ? 1 : 2); \
+        if (nr == 1) { \
+            const dim3 grid((N + RPB - 1) / RPB); \
+            gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
+        } else { \
+            const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
+            gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
+        } \
     } while (0)
 #define SI_NVFP4_DP4A_S(R_) do { \
         if (N >= 8192)      SI_NVFP4_DP4A(2, R_); \
