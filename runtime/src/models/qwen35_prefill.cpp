@@ -73,6 +73,11 @@ struct Arena {
     void free_all() { for (void* b : bufs) cudaFree(b); bufs.clear(); sizes.clear(); cursor = 0; }
     size_t total() const { size_t t = 0; for (size_t b : sizes) t += b; return t; }
 };
+
+// Widest verify block dflash_verify_short_run accepts. Also the number of GRAPH TIERS it keeps:
+// one instantiated graph per row count, so the caller can pick the block width per step instead
+// of being locked to whatever width the single warm graph happened to be captured at.
+constexpr int kVerifyMaxRows = 8;
 } // namespace
 
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n) {
@@ -2335,7 +2340,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // unverified draft tokens -- observed echoing the prompt back), so DSpark cannot work at all
     // until this branch exists.
     const bool dense = c.dense_ffn;
-    if (!token_ids || !out_argmax || n < 1 || n > 8 || !s.gguf || !c.hybrid) {
+    if (!token_ids || !out_argmax || n < 1 || n > kVerifyMaxRows || !s.gguf || !c.hybrid) {
         fprintf(stderr, "[dflash-verify] base unsupported n=%d gguf=%d hybrid=%d\n",
                 n, (int)s.gguf, (int)c.hybrid);
         return -1;
@@ -2347,6 +2352,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         return -1;
     }
     const int H = c.hidden, N = n, qdim = s.qdim, kvdim = s.kvdim;
+    // Every arena buffer below is sized for the WIDEST verify tier, not for this call's N.
+    // The per-tier graphs each bake their own device pointers, and Arena::alloc frees and
+    // reallocates a slot the moment a later call asks it for more bytes -- which would leave an
+    // already-instantiated narrower graph pointing at freed memory. Sizing at the maximum makes
+    // the arena layout identical for every tier, so the tiers can coexist.
+    const int NA = kVerifyMaxRows;
     const int lqkv = s.linear_qkvdim, lvdim = s.linear_vdim, vh = c.linear_v_heads;
     const int ffn = c.moe_ffn, E = c.n_experts, topk = c.top_k;
     // DEBUG ONLY (dspark_tau_check bisection, 2026-08-17): confirm the row<->position mapping
@@ -2361,24 +2372,24 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local Arena verify_arena;
     verify_arena.rewind();
     Arena& a = verify_arena;
-    bf16* x = a.alloc<bf16>((size_t)N * H);
-    bf16* xn = a.alloc<bf16>((size_t)N * H);
-    bf16* h = a.alloc<bf16>((size_t)N * H);
+    bf16* x = a.alloc<bf16>((size_t)NA * H);
+    bf16* xn = a.alloc<bf16>((size_t)NA * H);
+    bf16* h = a.alloc<bf16>((size_t)NA * H);
     // dp4a NVFP4 FFN staging, hoisted OUT of the layer loop on purpose. Arena::alloc falls back to
     // cudaMalloc on a miss, and this function runs inside the verify's CUDA graph capture, where
     // cudaMalloc is illegal -- allocating per layer returned null on the first captured pass and
     // the FFN silently declined. Everything else here is allocated up front for the same reason.
     const int nv_kwide = (c.moe_ffn > H ? c.moe_ffn : H);
-    signed char* nv_xq = a.alloc<signed char>((size_t)N * nv_kwide);
-    float* nv_xs = a.alloc<float>((size_t)N * (nv_kwide / 16) + 1);
+    signed char* nv_xq = a.alloc<signed char>((size_t)NA * nv_kwide);
+    float* nv_xs = a.alloc<float>((size_t)NA * (nv_kwide / 16) + 1);
     // Projection-side int8 staging, separate from the FFN's. Two buffers, not one: the q/k/v and
     // GDN in-projections run on parallel streams reading the SAME quantized xn, and the o_proj /
     // ssm_out quantize that follows must not overwrite it while those are still in flight.
     const int nv_pwide = [&]{ int m = H; if (s.qdim > m) m = s.qdim; if (s.linear_vdim > m) m = s.linear_vdim; return m; }();
-    signed char* nv_pq_a = a.alloc<signed char>((size_t)N * nv_pwide);
-    float* nv_ps_a = a.alloc<float>((size_t)N * (nv_pwide / 16) + 1);
-    signed char* nv_pq_b = a.alloc<signed char>((size_t)N * nv_pwide);
-    float* nv_ps_b = a.alloc<float>((size_t)N * (nv_pwide / 16) + 1);
+    signed char* nv_pq_a = a.alloc<signed char>((size_t)NA * nv_pwide);
+    float* nv_ps_a = a.alloc<float>((size_t)NA * (nv_pwide / 16) + 1);
+    signed char* nv_pq_b = a.alloc<signed char>((size_t)NA * nv_pwide);
+    float* nv_ps_b = a.alloc<float>((size_t)NA * (nv_pwide / 16) + 1);
     // DEBUG ONLY (dspark_tau_check bisection, 2026-08-17): SPARKINFER_DFLASH_VERIFY_DUMP_ROW=<row>
     // dumps that row's pre-attn-norm xn after EVERY layer, plus the post-final-norm xn, into
     // [n_layers+1, H] bf16 written to SPARKINFER_DFLASH_VERIFY_DUMP_FILE (default
@@ -2429,35 +2440,35 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                         (size_t)H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
                         "verify_dbg2 snapshot");
     };
-    bf16* hn = a.alloc<bf16>((size_t)N * H);
-    bf16* ao = a.alloc<bf16>((size_t)N * H);
-    bf16* routed = a.alloc<bf16>((size_t)N * H);
-    bf16* shared = a.alloc<bf16>((size_t)N * H);
-    bf16* b8 = a.alloc<bf16>((size_t)N * 2 * qdim);
-    bf16* lz = a.alloc<bf16>((size_t)N * lvdim);
-    bf16* gq = a.alloc<bf16>((size_t)N * s.linear_qdim);
-    bf16* gk = a.alloc<bf16>((size_t)N * s.linear_qdim);
-    bf16* gv = a.alloc<bf16>((size_t)N * lvdim);
-    bf16* att = a.alloc<bf16>((size_t)N * lvdim);
-    bf16* lnrm = a.alloc<bf16>((size_t)N * lvdim);
-    bf16* la = a.alloc<bf16>((size_t)N * vh);
-    bf16* lb = a.alloc<bf16>((size_t)N * vh);
+    bf16* hn = a.alloc<bf16>((size_t)NA * H);
+    bf16* ao = a.alloc<bf16>((size_t)NA * H);
+    bf16* routed = a.alloc<bf16>((size_t)NA * H);
+    bf16* shared = a.alloc<bf16>((size_t)NA * H);
+    bf16* b8 = a.alloc<bf16>((size_t)NA * 2 * qdim);
+    bf16* lz = a.alloc<bf16>((size_t)NA * lvdim);
+    bf16* gq = a.alloc<bf16>((size_t)NA * s.linear_qdim);
+    bf16* gk = a.alloc<bf16>((size_t)NA * s.linear_qdim);
+    bf16* gv = a.alloc<bf16>((size_t)NA * lvdim);
+    bf16* att = a.alloc<bf16>((size_t)NA * lvdim);
+    bf16* lnrm = a.alloc<bf16>((size_t)NA * lvdim);
+    bf16* la = a.alloc<bf16>((size_t)NA * vh);
+    bf16* lb = a.alloc<bf16>((size_t)NA * vh);
     bf16* qb = gv;
     bf16* qg = lnrm;
     bf16* kf = gq;
     bf16* vf = gk;
-    bf16* sg = a.alloc<bf16>((size_t)N * ffn);
-    bf16* su = a.alloc<bf16>((size_t)N * ffn);
-    bf16* sh = a.alloc<bf16>((size_t)N * ffn);
-    bf16* gate_raw = a.alloc<bf16>(N);
-    float* gate_w = a.alloc<float>(N);
-    int* ids = a.alloc<int>(N);
-    int* pos = a.alloc<int>(N);
-    int* seq = a.alloc<int>(N);
-    int* expert_ids = a.alloc<int>((size_t)N * topk);
-    float* expert_w = a.alloc<float>((size_t)N * topk);
-    float* router_logits = a.alloc<float>((size_t)N * E);
-    float* moe_h = a.alloc<float>((size_t)N * topk * ffn);
+    bf16* sg = a.alloc<bf16>((size_t)NA * ffn);
+    bf16* su = a.alloc<bf16>((size_t)NA * ffn);
+    bf16* sh = a.alloc<bf16>((size_t)NA * ffn);
+    bf16* gate_raw = a.alloc<bf16>(NA);
+    float* gate_w = a.alloc<float>(NA);
+    int* ids = a.alloc<int>(NA);
+    int* pos = a.alloc<int>(NA);
+    int* seq = a.alloc<int>(NA);
+    int* expert_ids = a.alloc<int>((size_t)NA * topk);
+    float* expert_w = a.alloc<float>((size_t)NA * topk);
+    float* router_logits = a.alloc<float>((size_t)NA * E);
+    float* moe_h = a.alloc<float>((size_t)NA * topk * ffn);
     // out_scratch is not just the [N, H] fp32 output: launch_moe_expert_ffn_q4k also reuses it as
     // the Q8_1 staging buffer for the SwiGLU hidden, which needs
     // num_tokens * top_k * llama_q8_1_bytes(ffn) bytes. That kernel's "<= hidden floats; fits"
@@ -2466,34 +2477,39 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // after the overflow point. Size for both uses.
     const size_t moe_out_floats = std::max((size_t)N * H,
         ((size_t)N * topk * kernels::llama_q8_1_bytes(ffn) + sizeof(float) - 1) / sizeof(float));
-    float* moe_out = a.alloc<float>(moe_out_floats);
+    // Both terms of moe_out_floats scale linearly in the row count, so widening to NA is a
+    // ceil-divide away; rounding UP keeps the widest tier's requirement covered exactly.
+    float* moe_out = a.alloc<float>(((moe_out_floats + (size_t)N - 1) / (size_t)N) * (size_t)NA);
     // Dedicated hidden scratch for the shared expert. It used to borrow moe_h, which is the one
     // thing that stopped the shared branch from running concurrently with the routed one.
-    float* shared_h = a.alloc<float>((size_t)N * ffn);
-    float* logits = a.alloc<float>((size_t)N * c.vocab);
-    int* out_ids = a.alloc<int>(N);
+    float* shared_h = a.alloc<float>((size_t)NA * ffn);
+    float* logits = a.alloc<float>((size_t)NA * c.vocab);
+    int* out_ids = a.alloc<int>(NA);
     const size_t q81_stride_max = kernels::llama_q8_1_bytes(std::max(H, lvdim));
-    void* q81 = a.alloc<unsigned char>((size_t)N * q81_stride_max);
+    void* q81 = a.alloc<unsigned char>((size_t)NA * q81_stride_max);
     const int ns = std::max(1, s.n_splits);
-    float* fa_m = a.alloc<float>((size_t)N * c.n_q_heads * ns);
-    float* fa_l = a.alloc<float>((size_t)N * c.n_q_heads * ns);
-    float* fa_acc = a.alloc<float>((size_t)N * c.n_q_heads * ns * c.head_dim);
+    float* fa_m = a.alloc<float>((size_t)NA * c.n_q_heads * ns);
+    float* fa_l = a.alloc<float>((size_t)NA * c.n_q_heads * ns);
+    float* fa_acc = a.alloc<float>((size_t)NA * c.n_q_heads * ns * c.head_dim);
     // Compact recurrence records retained until posterior selection.
-    bf16* rec_qkv = a.alloc<bf16>((size_t)c.n_layers * N * lqkv);
-    bf16* rec_k = a.alloc<bf16>((size_t)c.n_layers * N * s.linear_qdim);
-    bf16* rec_v = a.alloc<bf16>((size_t)c.n_layers * N * lvdim);
-    bf16* rec_a = a.alloc<bf16>((size_t)c.n_layers * N * vh);
-    bf16* rec_b = a.alloc<bf16>((size_t)c.n_layers * N * vh);
+    bf16* rec_qkv = a.alloc<bf16>((size_t)c.n_layers * NA * lqkv);
+    bf16* rec_k = a.alloc<bf16>((size_t)c.n_layers * NA * s.linear_qdim);
+    bf16* rec_v = a.alloc<bf16>((size_t)c.n_layers * NA * lvdim);
+    bf16* rec_a = a.alloc<bf16>((size_t)c.n_layers * NA * vh);
+    bf16* rec_b = a.alloc<bf16>((size_t)c.n_layers * NA * vh);
     if (!a.ok) { fprintf(stderr, "[dflash-verify] scratch allocation failed\n"); return -1; }
 
     static thread_local int* ph_ids = nullptr;
     static thread_local int* ph_pos = nullptr;
     static thread_local int* ph_seq = nullptr;
     static thread_local int* ph_out = nullptr;
-    static thread_local cudaGraph_t verify_graph = nullptr;
-    static thread_local cudaGraphExec_t verify_exec = nullptr;
+    // One graph per row count (index 1..kVerifyMaxRows). A single slot meant the verify could
+    // only ever replay the width dflash_warm_verify captured, which is why the block width had to
+    // be a per-GENERATION constant; with a tier per width the caller can choose it per step.
+    static thread_local cudaGraph_t verify_graph[kVerifyMaxRows + 1] = {};
+    static thread_local cudaGraphExec_t verify_exec[kVerifyMaxRows + 1] = {};
     static thread_local bool graph_warm = false;
-    static thread_local bool graph_ready = false;
+    static thread_local bool graph_ready_t[kVerifyMaxRows + 1] = {};
     static thread_local const void* graph_model_key = nullptr;
     static thread_local const void* graph_state_key = nullptr;
     static thread_local const void* graph_conv_key = nullptr;
@@ -2718,7 +2734,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // a few KB) so the 10 full-attention layers each run ONE split + ONE combine instead of one per
     // row. That removes 2*(N-1) graph nodes per attention layer, and the graph is ~1000 nodes deep
     // against only ~5.6 ms of kernel time, so node count is itself a real cost here.
-    int* btab_rows = (N > 1) ? a.alloc<int>((size_t)N * mbs) : nullptr;
+    int* btab_rows = (N > 1) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
     if (!a.ok) { fprintf(stderr, "[dflash-verify] block-table scratch allocation failed\n"); return -1; }
     bool supported = true;
     int  vfail_L = -1;   // layer whose stage declined, for the bailout diagnostic below
@@ -2742,10 +2758,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (graph_model_key != s.w.lm_head || graph_state_key != s.lin_state ||
         graph_conv_key != s.lin_conv_state || graph_capture_key != capture_dst ||
         graph_btable_key != btable || graph_ns_key != ns) {
-        if (verify_exec) cudaGraphExecDestroy(verify_exec);
-        if (verify_graph) cudaGraphDestroy(verify_graph);
-        verify_exec = nullptr; verify_graph = nullptr;
-        graph_ready = false; graph_warm = false;
+        for (int t = 1; t <= kVerifyMaxRows; t++) {
+            if (verify_exec[t]) cudaGraphExecDestroy(verify_exec[t]);
+            if (verify_graph[t]) cudaGraphDestroy(verify_graph[t]);
+            verify_exec[t] = nullptr; verify_graph[t] = nullptr;
+            graph_ready_t[t] = false;
+        }
+        graph_warm = false;
         graph_model_key = s.w.lm_head;
         graph_state_key = s.lin_state;
         graph_conv_key = s.lin_conv_state;
@@ -2753,9 +2772,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_btable_key = btable;
         graph_ns_key = ns;
     }
-    if (graph_ready && capture_only) return 0;   // already built
-    if (graph_ready) {
-        pf_cu(cudaGraphLaunch(verify_exec, st), "verify graph launch");
+    if (graph_ready_t[N] && capture_only) return 0;   // this tier is already built
+    if (graph_ready_t[N]) {
+        pf_cu(cudaGraphLaunch(verify_exec[N], st), "verify graph launch");
         pf_cu(cudaStreamSynchronize(st), "verify graph sync");
         std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
         if (vdbg_dump_now) {
@@ -3259,14 +3278,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     pf_cu(cudaMemcpyAsync(ph_out, out_ids, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost, st),
           "verify argmax");
     if (recording) {
-        pf_cu(cudaStreamEndCapture(st, &verify_graph), "verify graph end");
-        pf_cu(cudaGraphInstantiate(&verify_exec, verify_graph, 0), "verify graph instantiate");
-        graph_ready = true;
+        pf_cu(cudaStreamEndCapture(st, &verify_graph[N]), "verify graph end");
+        pf_cu(cudaGraphInstantiate(&verify_exec[N], verify_graph[N], 0), "verify graph instantiate");
+        graph_ready_t[N] = true;
         graph_warm = true;
         // Nothing ran: capture records the kernels rather than executing them, so the model state
         // is exactly as it was and there is no work to launch or collect.
         if (capture_only) return 0;
-        pf_cu(cudaGraphLaunch(verify_exec, st), "verify graph first launch");
+        pf_cu(cudaGraphLaunch(verify_exec[N], st), "verify graph first launch");
     }
     pf_cu(cudaStreamSynchronize(st), "verify sync");
     std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));

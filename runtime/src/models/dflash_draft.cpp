@@ -981,6 +981,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         if (v < kProposalDepth + 1) v = kProposalDepth + 1;
         // Round up to a width the batched-GEMV path is instantiated for; anything else falls
         // back to the per-token GEMV loop, which costs far more than the rows it saves.
+        //
+        // The rounding targets {2,4,8,16} and is then CLAMPED to block_size, which is 7 on the
+        // released DSpark checkpoints -- not a power of two. So every depth from 4 up asked for a
+        // width of 7, nothing was instantiated for 7, and the draft fell to the per-token loop:
+        // 2.5 ms -> 9.9 ms. Widths 5/6/7 are instantiated now (see dflash_kernels.cu), so the
+        // clamp lands on a batched width. This matters most at ctx >= SPARKINFER_DFLASH_DEEP_MIN_SEQ,
+        // where the ladder in qwen35.cpp selects depth 7 and therefore width 7 on every block.
         const int w = v <= 2 ? 2 : (v <= 4 ? 4 : (v <= 8 ? 8 : 16));
         return w > c.block_size ? c.block_size : w;
     }();
@@ -990,7 +997,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // each weight row from DRAM once instead of once per token (see dflash_kernels.cu). It's
     // instantiated for the active width tiers below; an unsupported width falls back to the
     // per-token GEMV loop.
-    const bool fast16 = (BW == 16 || BW == 8 || BW == 4 || BW == 2);
+    const bool fast16 = (BW == 16 || BW == 8 || BW == 7 || BW == 6 || BW == 5 ||
+                         BW == 4 || BW == 2);
 
     cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
     kernels::launch_embedding(s.d_ids, s.embed, s.noise, BW, H, st);

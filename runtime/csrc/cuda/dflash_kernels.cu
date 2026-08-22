@@ -1121,8 +1121,15 @@ void launch_gemv_batched_q4_fused3(const void* x,
 #define SI_Q4KS_B(BW_) do { if (ksplit == 2) SI_Q4KS(BW_, 2);                                     \
                             else if (ksplit == 4) SI_Q4KS(BW_, 4);                                \
                             else SI_Q4KS(BW_, 8); } while (0)
+        // Widths 5/6/7 are instantiated because the released DSpark draft's block_size is 7,
+        // which is not a power of two: rounding depth+1 up over {2,4,8,16} and clamping to 7
+        // produced a width nothing was compiled for, and the caller fell back to a per-token
+        // GEMV loop that re-reads every weight row once per row.
         if (batch == 2)      SI_Q4KS_B(2);
         else if (batch == 4) SI_Q4KS_B(4);
+        else if (batch == 5) SI_Q4KS_B(5);
+        else if (batch == 6) SI_Q4KS_B(6);
+        else if (batch == 7) SI_Q4KS_B(7);
         else if (batch == 8) SI_Q4KS_B(8);
         else                 SI_Q4KS_B(16);
 #undef SI_Q4KS_B
@@ -1138,6 +1145,9 @@ void launch_gemv_batched_q4_fused3(const void* x,
         (bf16*)y0, (bf16*)y1, (bf16*)y2, N0, N1, N2, K)
     if (batch == 2)      SI_Q4F3(2);
     else if (batch == 4) SI_Q4F3(4);
+    else if (batch == 5) SI_Q4F3(5);
+    else if (batch == 6) SI_Q4F3(6);
+    else if (batch == 7) SI_Q4F3(7);
     else if (batch == 8) SI_Q4F3(8);
     else                 SI_Q4F3(16);
 #undef SI_Q4F3
@@ -1180,6 +1190,9 @@ void launch_gemv_batched_q8_fused3(const void* x,
         S0, S1, S2, (bf16*)y0, (bf16*)y1, (bf16*)y2, N0, N1, N2, K)
     if (batch == 2)      SI_Q8F3(2);
     else if (batch == 4) SI_Q8F3(4);
+    else if (batch == 5) SI_Q8F3(5);
+    else if (batch == 6) SI_Q8F3(6);
+    else if (batch == 7) SI_Q8F3(7);
     else if (batch == 8) SI_Q8F3(8);
     else                 SI_Q8F3(16);
 #undef SI_Q8F3
@@ -1347,6 +1360,9 @@ void launch_gemv_batched16_fused3(const void* x,
         (bf16*)y0, (bf16*)y1, (bf16*)y2, N0, N1, N2, K)
     if (batch == 2)       SI_FUSED3(2);
     else if (batch == 4)  SI_FUSED3(4);
+    else if (batch == 5)  SI_FUSED3(5);
+    else if (batch == 6)  SI_FUSED3(6);
+    else if (batch == 7)  SI_FUSED3(7);
     else if (batch == 8)  SI_FUSED3(8);
     else                  SI_FUSED3(16);
 #undef SI_FUSED3
@@ -1565,6 +1581,50 @@ __global__ void k_markov_bias_add(const bf16* __restrict__ w1, const bf16* __res
     logits[v] += acc;
 }
 
+// Same bias, one WARP per vocabulary row instead of one thread.
+//
+// w2 is [vocab, rank] row major, so a thread per row puts consecutive lanes `rank * 2` bytes
+// apart -- 512 B at rank 256 -- and each 2-byte load pulls a whole sector. The kernel is nothing
+// but a stream over w2 (127 MB at V=248320, rank 256) and it was reaching 870 GB/s of a 1.79 TB/s
+// part, alone among the draft's kernels in not being at roofline. A warp per row reads that row
+// as 32 lanes x uint4 = one contiguous 512 B burst.
+//
+// The warp reduction sums in a different order than the sequential loop, so the bias differs in
+// the last bits. That is DRAFT-ONLY: it can shift which token the draft proposes, never which
+// token is emitted, because every emitted token is still a target argmax. Losslessness is
+// untouched; only acceptance can move.
+template <int RANK>
+__global__ void k_markov_bias_add_warp(const bf16* __restrict__ w1, const bf16* __restrict__ w2,
+                                       const int* __restrict__ prev_token,
+                                       float* __restrict__ logits, int vocab,
+                                       float* __restrict__ out_latent) {
+    constexpr int VEC = 8;                          // bf16 per uint4
+    constexpr int PER_LANE = RANK / (32 * VEC);
+    __shared__ float latent[RANK];
+    const int tok = *prev_token;
+    const bf16* w1_row = w1 + (size_t)tok * RANK;
+    for (int r = threadIdx.x; r < RANK; r += blockDim.x) latent[r] = b2f(w1_row[r]);
+    __syncthreads();
+    if (out_latent && blockIdx.x == 0)
+        for (int r = threadIdx.x; r < RANK; r += blockDim.x) out_latent[r] = latent[r];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int v = blockIdx.x * (int)(blockDim.x >> 5) + warp;
+    if (v >= vocab) return;
+    const bf16* w2_row = w2 + (size_t)v * RANK;
+    float acc = 0.f;
+    #pragma unroll
+    for (int p = 0; p < PER_LANE; p++) {
+        const int base = (p * 32 + lane) * VEC;
+        const uint4 raw = *reinterpret_cast<const uint4*>(w2_row + base);
+        const bf16* wv = reinterpret_cast<const bf16*>(&raw);
+        #pragma unroll
+        for (int i = 0; i < VEC; i++) acc += latent[base + i] * b2f(wv[i]);
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    if (lane == 0) logits[v] += acc;
+}
+
 // confidence_logit = dot(hidden[H], w[0:H]) + dot(latent[rank], w[H:H+rank]) + bias -- a single
 // linear layer over the concatenation of this row's hidden state and its Markov latent, matching
 // DSpark's AcceptRatePredictor(confidence_head_with_markov=True). One block, block-wide reduction
@@ -1607,6 +1667,19 @@ void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_toke
                             float* out_latent) {
     if (vocab <= 0 || rank <= 0) return;
     const int threads = 256;
+    // Warp-per-row form for the rank the released DSpark checkpoints actually carry. It needs the
+    // row length to be a compile-time multiple of 32 lanes x 8 bf16 so the uint4 loads land, and
+    // 16-byte-aligned rows, which rank 256 (512 B per row) gives. Any other rank keeps the
+    // original thread-per-row kernel.
+    static const bool warp_rows = []{ const char* e = getenv("SPARKINFER_DFLASH_MARKOV_WARP");
+                                      return !(e && e[0] == '0'); }();
+    if (warp_rows && rank == 256) {
+        const int warps_per_block = threads / 32;
+        const int blocks_w = (vocab + warps_per_block - 1) / warps_per_block;
+        k_markov_bias_add_warp<256><<<blocks_w, threads, 0, stream>>>(
+            (const bf16*)w1, (const bf16*)w2, prev_token, logits, vocab, out_latent);
+        return;
+    }
     const int blocks = (vocab + threads - 1) / threads;
     k_markov_bias_add<<<blocks, threads, rank * sizeof(float), stream>>>(
         (const bf16*)w1, (const bf16*)w2, prev_token, logits, vocab, rank, out_latent);

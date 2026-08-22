@@ -3329,7 +3329,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // Build the verify replay graph before the decode clock starts. Capture records kernels
     // rather than running them, so this changes no state -- it just stops decode step 2 from
     // paying for graph construction.
-    dflash_warm_verify(kProposalDepth + 1, start);
+    // Warm EVERY row count the planner below can select, not just the deepest. Each width is a
+    // separate graph tier (see dflash_verify_short_run); building them here keeps graph capture
+    // off the decode clock, and capture records kernels rather than running them, so warming a
+    // tier the stream never uses costs nothing but the capture itself.
+    for (int t = 1; t <= kProposalDepth + 1; t++) dflash_warm_verify(t, start);
     // Verify-path cost breakdown (SPARKINFER_DSPARK_TIMING=1). The two verify implementations are
     // timed per call so their cost can be compared directly rather than inferred from end-to-end
     // throughput. Synchronises around each call -- a measurement mode, not a benchmark -- but both
@@ -3348,6 +3352,26 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         cudaStreamSynchronize(s.stream);
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     };
+    // ---- Confidence-planned verify length -------------------------------------------------
+    // The draft proposes kProposalDepth tokens every step; how many of them are worth VERIFYING
+    // is a per-step question, not a per-generation constant. DSpark's confidence head already
+    // scores each proposal's own accept probability, and this loop already reads it back -- on
+    // the batched path it was then thrown away. Survival S_i = prod_{j<=i} sigmoid(conf_j) is the
+    // probability that row i is both reached and accepted, so verifying d+1 rows is worth
+    // 1 + sum_{i<=d} S_i tokens and costs C0 + c1*(d+1) ms. Take the d that maximises the ratio.
+    //
+    // There is no tuned constant anywhere in this. The probabilities are the head's own sigmoid
+    // (it is trained as an accept-rate predictor, so sigmoid(logit) IS its calibrated output --
+    // fitting a per-position logistic on top measured no better). C0 and c1 are least-squares
+    // fitted ONLINE from this run's own (rows, ms) verify samples, so the model is measured on
+    // whatever GPU is running rather than baked in. batched_forward already synchronises before
+    // it returns, so the sample costs no extra sync.
+    static const bool kPlanOn = []{ const char* e = getenv("SPARKINFER_DSPARK_PLAN");
+                                    return !(e && e[0] == '0'); }();
+    double ls_n = 0, ls_r = 0, ls_rr = 0, ls_y = 0, ls_ry = 0;   // least-squares accumulators
+    double fit_c0 = 0, fit_c1 = 0;
+    bool fit_ok = false;
+    long plan_rows_sum = 0, plan_steps = 0;
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
         // The context bound this used to carry (SPARKINFER_DFLASH_COMPACT_MAX_SEQ, default 384)
@@ -3452,6 +3476,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             s.defer_decode_sync = false;
         }
         auto _td = std::chrono::steady_clock::now();
+        // Sentinel: forward_block fills these only when the checkpoint HAS a confidence head.
+        // A NaN survivor means no head, and the planner falls back to the fixed depth.
+        for (int i = 0; i <= kProposalDepth; i++)
+            draft_confidence[i] = std::numeric_limits<float>::quiet_NaN();
         const bool draft_ok = draft_idle ? true : draft.forward_block(
             draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth,
             draft_confidence.data());
@@ -3478,16 +3506,53 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // restore / KV-truncate / replay needed (greedy speculative decoding is exact). Rejected
         // proposals (block[keep..B-1]) are never forwarded, saving ~B-keep target forwards/step.
         int accept = 0, keep = 1;
+        int plan_vn = kProposalDepth + 1;
         bool vfail = false;
         if (compact_verify) {
-            const int vn = kProposalDepth + 1;
+            int vn = kProposalDepth + 1;
+            const bool have_conf = kPlanOn && !draft_idle &&
+                                   !std::isnan(draft_confidence[kProposalDepth > 0 ? 1 : 0]);
+            if (have_conf && fit_ok) {
+                double surv = 1.0, worth = 1.0, best = -1.0;
+                int best_d = kProposalDepth;
+                for (int d = 0; d <= kProposalDepth; d++) {
+                    if (d > 0) {
+                        surv *= 1.0 / (1.0 + std::exp(-(double)draft_confidence[d]));
+                        worth += surv;
+                    }
+                    const double v = worth / (fit_c0 + fit_c1 * (d + 1));
+                    if (v > best) { best = v; best_d = d; }
+                }
+                vn = best_d + 1;
+            } else if (have_conf) {
+                // Two-point bootstrap: the cost model needs two distinct row counts before it can
+                // be fitted, and one full-depth step plus one minimal step gives them. Two steps
+                // of a 70-step generation, and the minimal one still emits a verified token.
+                vn = (ls_n < 1) ? kProposalDepth + 1 : 2;
+            }
             auto _tb = std::chrono::steady_clock::now();
             vfail = !batched_forward(block.data(), vn, start, false, posterior.data(), s.dflash_hidden);
-            if (kTiming) { t_batched_ms += ms_since(_tb); n_batched++; }
+            const double vms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - _tb).count();
+            if (kTiming) { t_batched_ms += vms; n_batched++; }
             if (!vfail) {
-                while (accept < kProposalDepth && block[accept + 1] == posterior[accept]) ++accept;
+                // Feed the sample back into the cost model. Only clean samples: a failed verify
+                // has no meaningful duration.
+                ls_n += 1; ls_r += vn; ls_rr += (double)vn * vn;
+                ls_y += vms; ls_ry += vn * vms;
+                const double det = ls_n * ls_rr - ls_r * ls_r;
+                if (det > 1e-9) {
+                    const double c1 = (ls_n * ls_ry - ls_r * ls_y) / det;
+                    const double c0 = (ls_y - c1 * ls_r) / ls_n;
+                    // A negative marginal row cost is noise, not a measurement; keep the previous
+                    // fit (or stay unfitted) rather than planning off it.
+                    if (c1 > 0 && c0 > 0) { fit_c1 = c1; fit_c0 = c0; fit_ok = true; }
+                }
+                plan_rows_sum += vn; plan_steps++;
+                while (accept < vn - 1 && block[accept + 1] == posterior[accept]) ++accept;
                 keep = accept + 1;
             }
+            plan_vn = vn;
         } else {
             vfail = p0 < 0;
             posterior[0] = p0;
@@ -3547,7 +3612,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         }
         keep_ema8 = keep_ema8 - (keep_ema8 >> 3) + keep;
         ++step_no;
-        compact_score = keep == kProposalDepth + 1
+        // "Full block" now means "everything we asked to be verified was accepted", which is
+        // the planned width, not the static depth -- otherwise a step the planner deliberately
+        // narrowed would read as a partial accept and decay the engage score.
+        compact_score = keep == plan_vn
                       ? std::min(compact_score + 1, kBlockScore + 1)
                       : std::max(compact_score - 1, 0);
         // forward_token() synchronizes after sampling, so the accepted capture rows are already
@@ -3585,6 +3653,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             const double fpc = n_fwd ? t_fwd_ms / n_fwd : 0.0;
             fprintf(stderr, "[timing] draft   %8.3f ms/call  n=%ld\n", n_draft ? t_draft_ms / n_draft : 0.0, n_draft);
             fprintf(stderr, "[timing] fwd_tok %8.3f ms/call  n=%ld  (token-loop verify)\n", fpc, n_fwd);
+            if (plan_steps)
+                fprintf(stderr, "[timing] plan    %8.3f rows/step (of %d)  fit C0=%.3f c1=%.3f ms\n",
+                        (double)plan_rows_sum / plan_steps, kProposalDepth + 1, fit_c0, fit_c1);
             fprintf(stderr, "[timing] batched %8.3f ms/call  n=%ld  = %.2f forwards\n",
                     n_batched ? t_batched_ms / n_batched : 0.0, n_batched,
                     (n_batched && fpc > 0) ? (t_batched_ms / n_batched) / fpc : 0.0);
