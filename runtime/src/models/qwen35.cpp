@@ -272,6 +272,10 @@ struct Qwen35Model::Impl {
     // the SwiGLU result that feeds down. bf16 [moe_ffn] each -- ~104 KB total at ffn=17408, so it
     // is allocated unconditionally rather than gated, keeping the decode path branch-free.
     bf16 *nv_gate = nullptr, *nv_up = nullptr, *nv_h = nullptr;
+    // int8 staging for the dp4a NVFP4 FFN: one quantize of the layer input feeds gate AND up,
+    // a second feeds down. Sized for the widest K the FFN reads (moe_ffn for down).
+    signed char *nv_xq = nullptr;
+    float *nv_xs = nullptr;
     float *sx_h = nullptr;   // pipelined shared-expert h_scratch (avoids racing routed mf_h)
     void  *sx_q8 = nullptr;  // pipelined shared-expert Q8_1(h) for down (avoids racing aq81)
     int   *mf_ids = nullptr, *mf_counts = nullptr;
@@ -506,6 +510,8 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->nv_gate    = p_->alloc<bf16>(cfg.moe_ffn);
     p_->nv_up      = p_->alloc<bf16>(cfg.moe_ffn);
     p_->nv_h       = p_->alloc<bf16>(cfg.moe_ffn);
+    p_->nv_xq      = p_->alloc<signed char>(cfg.moe_ffn);
+    p_->nv_xs      = p_->alloc<float>(cfg.moe_ffn / 16 + 1);
     if (cfg.dense_ffn && cfg.top_k > 0) {
         cu(cudaMemcpy(p_->mf_ids, &zero, sizeof(int), cudaMemcpyHostToDevice), "dense expert id");
         cu(cudaMemcpy(p_->mf_weights, &one, sizeof(float), cudaMemcpyHostToDevice), "dense expert w");
@@ -1729,10 +1735,31 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // experiment; if the accuracy win is real, the fusion work follows, and NVFP4's
             // decoded magnitudes are exact int8 so a dp4a path is reachable.
             if (w.gate_nv && w.up_nv && w.down_nv && c.top_k == 1) {
+                // dp4a NVFP4 (SPARKINFER_QWEN38_NVFP4_DP4A=0 restores the float GEMVs). The
+                // weights stay exactly what the checkpoint ships -- NVFP4 magnitudes are integers,
+                // so the group dot is an exact integer reduction -- and only the activation is
+                // quantized, at one scale per 16 values.
+                //
+                // The verify in qwen35_prefill.cpp switches on the SAME flag and calls the SAME
+                // kernel at N rows. Both sides must move together: losslessness here is defined as
+                // the speculative output matching the AR output of this build, so a decode on
+                // dp4a against a verify on the float path would disagree and report LOSSLESS=0.
+                if (kernels::qwen38_nvfp4_dp4a()) {
+                    kernels::launch_gemv_nvfp4_quant_x(s.hn, s.nv_xq, s.nv_xs, 1, H, st);
+                    kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.gate_nv, s.nv_gate,
+                                                         1, c.moe_ffn, H, st);
+                    kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.up_nv, s.nv_up,
+                                                         1, c.moe_ffn, H, st);
+                    kernels::launch_prefill_swiglu(s.nv_gate, s.nv_up, s.nv_h, c.moe_ffn, st);
+                    kernels::launch_gemv_nvfp4_quant_x(s.nv_h, s.nv_xq, s.nv_xs, 1, c.moe_ffn, st);
+                    kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.down_nv, s.routed,
+                                                         1, H, c.moe_ffn, st);
+                } else {
                 kernels::launch_gemv_nvfp4(s.hn, w.gate_nv, s.nv_gate, c.moe_ffn, H, st);
                 kernels::launch_gemv_nvfp4(s.hn, w.up_nv, s.nv_up, c.moe_ffn, H, st);
                 kernels::launch_prefill_swiglu(s.nv_gate, s.nv_up, s.nv_h, c.moe_ffn, st);
                 kernels::launch_gemv_nvfp4(s.nv_h, w.down_nv, s.routed, H, c.moe_ffn, st);
+                }
             } else
             kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,

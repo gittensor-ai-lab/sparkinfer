@@ -951,6 +951,160 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
         }
     }
 }
+
+// ================= dp4a NVFP4 =================================================================
+//
+// The float path above decodes every nibble to a float and does 16 fp32 FMAs per group PER ROW.
+// ncu on the current default says that is what limits it: no pipe is saturated (DRAM 58.4%,
+// SM 55.3%, Mem Pipes 14.2%), ALU Heavy is 47-62% of executed instructions, and 40-48% of the ~11
+// cycles between issues is a Long Scoreboard stall on L1TEX that occupancy cannot hide because 64
+// registers/thread caps the kernel at 4 blocks/SM.
+//
+// NVFP4's decoded magnitudes are EXACT integers -- {0,+-1,+-2,+-3,+-4,+-6,+-8,+-12}, the doubled
+// e2m1 magnitudes -- so sum(w_k * x_k) over a group is exactly group_scale * sum(mag_k * xq_k)
+// once the activation is int8. That turns 16 FMAs into 4 dp4a per row, and lets the nibble decode
+// run as byte-parallel table lookups instead of per-nibble arithmetic.
+//
+// PRMT AS A BYTE LUT. __byte_perm(a, b, sel) uses four nibbles of `sel` to pick four bytes out of
+// {a, b} -- and the NVFP4 codes ARE nibbles already, so one instruction looks up four magnitudes.
+// A second lookup builds the sign mask (selector nibble 0/1 picks 0x00/0xFF), and __vsub4 applies
+// it byte-wise without borrowing across lanes. That is ~1.75 ALU ops per weight against ~10.5 for
+// the float decode, and the int8 staging is a quarter the registers of the float staging.
+//
+// -0 is handled: code 8 gives mag 0 and mask 0xFF, and (0 ^ 0xFF) - 0xFF is 0 in byte arithmetic,
+// which is the correct int8 for -0.
+__device__ __forceinline__ void si_nvfp4_i8x8(unsigned p, unsigned& q0, unsigned& q1) {
+    // Magnitudes for codes 0..3 and 4..7, one byte each, in the two PRMT source registers.
+    const unsigned MAG_LO = 0x03020100u;   // {0, 1, 2, 3}
+    const unsigned MAG_HI = 0x0C080604u;   // {4, 6, 8, 12}
+    const unsigned SGN    = 0x0000FF00u;   // byte 0 = 0x00 (positive), byte 1 = 0xFF (negative)
+    const unsigned msel = p & 0x77777777u;          // code & 7  -> magnitude index
+    const unsigned ssel = (p >> 3) & 0x11111111u;   // code >> 3 -> 0 or 1
+    const unsigned m0 = __byte_perm(MAG_LO, MAG_HI, msel);
+    const unsigned s0 = __byte_perm(SGN, 0u, ssel);
+    const unsigned m1 = __byte_perm(MAG_LO, MAG_HI, msel >> 16);
+    const unsigned s1 = __byte_perm(SGN, 0u, ssel >> 16);
+    q0 = __vsub4(m0 ^ s0, s0);
+    q1 = __vsub4(m1 ^ s1, s1);
+}
+
+// One thread per 16-element activation group: symmetric int8 with a per-group scale. Matching the
+// NVFP4 group width keeps the quantization as local as the weights it multiplies.
+__global__ void si_nvfp4_quant_x_kernel(const __nv_bfloat16* __restrict__ x,
+                                        signed char* __restrict__ xq,
+                                        float* __restrict__ xs, int ngroups) {
+    const int gi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gi >= ngroups) return;
+    const __nv_bfloat16* src = x + (size_t)gi * 16;
+    float v[16];
+    si_nvfp4_load_x16_v4(src, v);
+    float amax = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) { const float a = fabsf(v[i]); amax = a > amax ? a : amax; }
+    const float s   = amax * (1.f / 127.f);
+    const float inv = amax > 0.f ? 127.f / amax : 0.f;
+    signed char o[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) o[i] = (signed char)__float2int_rn(v[i] * inv);
+    *reinterpret_cast<uint4*>(xq + (size_t)gi * 16) = *reinterpret_cast<const uint4*>(o);
+    xs[gi] = s;
+}
+
+template <typename OutT, int S, int R, int NR>
+__global__ void gemv_nvfp4_rows_dp4a_kernel(const signed char* __restrict__ xq,
+                                            const float* __restrict__ xs,
+                                            const void* __restrict__ packed,
+                                            OutT* __restrict__ y, int N, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float s_part[RPB][S][NR][R];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n0 = blockIdx.x * (RPB * NR) + row_local * NR;
+    float acc[NR][R];
+    #pragma unroll
+    for (int j = 0; j < NR; j++)
+        #pragma unroll
+        for (int r = 0; r < R; r++) acc[j][r] = 0.f;
+    if (n0 < N) {
+        const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
+        const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
+        const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
+        const int ng = K >> 4;
+        for (int g = split * 32 + lane; g < ng; g += S * 32) {
+            uint4 xv[R];
+            float sx[R];
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                xv[r] = *reinterpret_cast<const uint4*>(xq + (size_t)r * K + (size_t)g * 16);
+                sx[r] = xs[(size_t)r * ng + g];
+            }
+            #pragma unroll
+            for (int j = 0; j < NR; j++) {
+                const int nj = n0 + j;
+                if (NR > 1 && nj >= N) break;
+                const unsigned char* srow = sf + (size_t)nj * (size_t)(K >> 4);
+                const unsigned char* prow = w + (size_t)nj * (size_t)(K >> 1);
+                const uint2 pw = __ldg(reinterpret_cast<const uint2*>(prow + (size_t)g * 8));
+                unsigned q0, q1, q2, q3;
+                si_nvfp4_i8x8(pw.x, q0, q1);
+                si_nvfp4_i8x8(pw.y, q2, q3);
+                const float sw = si_ue4m3(srow[g]) * inv_g * 0.5f;
+                #pragma unroll
+                for (int r = 0; r < R; r++) {
+                    int iacc = 0;
+                    iacc = __dp4a((int)q0, (int)xv[r].x, iacc);
+                    iacc = __dp4a((int)q1, (int)xv[r].y, iacc);
+                    iacc = __dp4a((int)q2, (int)xv[r].z, iacc);
+                    iacc = __dp4a((int)q3, (int)xv[r].w, iacc);
+                    acc[j][r] += (sw * sx[r]) * (float)iacc;
+                }
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < NR; j++)
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                #pragma unroll
+                for (int m = 16; m > 0; m >>= 1)
+                    acc[j][r] += __shfl_xor_sync(0xffffffff, acc[j][r], m);
+            }
+        if (lane == 0) {
+            #pragma unroll
+            for (int j = 0; j < NR; j++)
+                #pragma unroll
+                for (int r = 0; r < R; r++) s_part[row_local][split][j][r] = acc[j][r];
+        }
+    }
+    __syncthreads();
+    if (n0 < N && split == 0 && lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < NR; j++) {
+            const int nj = n0 + j;
+            if (NR > 1 && nj >= N) break;
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                float o = s_part[row_local][0][j][r];
+                #pragma unroll
+                for (int t = 1; t < S; t++) o += s_part[row_local][t][j][r];
+                gemv_write(y + (size_t)r * N + nj, o);
+            }
+        }
+    }
+}
+#ifndef _MSC_VER
+#define SI_NVFP4_DP4A_INST(S_, R_) \
+template __global__ void gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S_, R_, 2>(const signed char*, const float*, const void*, __nv_bfloat16*, int, int);
+SI_NVFP4_DP4A_INST(2, 1) SI_NVFP4_DP4A_INST(4, 1) SI_NVFP4_DP4A_INST(8, 1)
+SI_NVFP4_DP4A_INST(2, 2) SI_NVFP4_DP4A_INST(4, 2) SI_NVFP4_DP4A_INST(8, 2)
+SI_NVFP4_DP4A_INST(2, 3) SI_NVFP4_DP4A_INST(4, 3) SI_NVFP4_DP4A_INST(8, 3)
+SI_NVFP4_DP4A_INST(2, 4) SI_NVFP4_DP4A_INST(4, 4) SI_NVFP4_DP4A_INST(8, 4)
+SI_NVFP4_DP4A_INST(2, 5) SI_NVFP4_DP4A_INST(4, 5) SI_NVFP4_DP4A_INST(8, 5)
+SI_NVFP4_DP4A_INST(2, 6) SI_NVFP4_DP4A_INST(4, 6) SI_NVFP4_DP4A_INST(8, 6)
+SI_NVFP4_DP4A_INST(2, 7) SI_NVFP4_DP4A_INST(4, 7) SI_NVFP4_DP4A_INST(8, 7)
+SI_NVFP4_DP4A_INST(2, 8) SI_NVFP4_DP4A_INST(4, 8) SI_NVFP4_DP4A_INST(8, 8)
+#undef SI_NVFP4_DP4A_INST
+#endif
+
 #ifndef _MSC_VER
 #define SI_NVFP4_ROWS_INST(S_, R_) \
 template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 1, 0>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \
@@ -2581,6 +2735,47 @@ void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K, cuda
     }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_nvfp4_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+}
+
+void launch_gemv_nvfp4_quant_x(const void* x, void* xq, void* xs, int M, int K,
+                               cudaStream_t stream) {
+    if (!x || !xq || !xs || M < 1 || K < 1 || (K & 15)) return;
+    const int ngroups = M * (K >> 4);
+    const int blk = 256;
+    si_nvfp4_quant_x_kernel<<<(ngroups + blk - 1) / blk, blk, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<signed char*>(xq),
+        reinterpret_cast<float*>(xs), ngroups);
+}
+
+bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, void* y,
+                                 int M, int N, int K, cudaStream_t stream) {
+    if (!xq || !xs || !W || !y || N < 1 || K < 1 || (K & 15)) return false;
+    if (!gemv_bf16_splitk()) return false;
+    if (M < 1 || M > 8) return false;
+    const auto* xp = reinterpret_cast<const signed char*>(xq);
+    const auto* sp = reinterpret_cast<const float*>(xs);
+    auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
+    // Split-K chosen by N exactly as the float rows kernel does, so the two paths fan out over the
+    // GPU identically and a comparison between them is a comparison of the arithmetic alone.
+#define SI_NVFP4_DP4A(S_, R_) do { \
+        constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
+        const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
+        gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
+    } while (0)
+#define SI_NVFP4_DP4A_S(R_) do { \
+        if (N >= 8192)      SI_NVFP4_DP4A(2, R_); \
+        else if (N >= 4096) SI_NVFP4_DP4A(4, R_); \
+        else                SI_NVFP4_DP4A(8, R_); \
+    } while (0)
+    switch (M) {
+        case 1: SI_NVFP4_DP4A_S(1); break;  case 2: SI_NVFP4_DP4A_S(2); break;
+        case 3: SI_NVFP4_DP4A_S(3); break;  case 4: SI_NVFP4_DP4A_S(4); break;
+        case 5: SI_NVFP4_DP4A_S(5); break;  case 6: SI_NVFP4_DP4A_S(6); break;
+        case 7: SI_NVFP4_DP4A_S(7); break;  default: SI_NVFP4_DP4A_S(8); break;
+    }
+#undef SI_NVFP4_DP4A_S
+#undef SI_NVFP4_DP4A
+    return true;
 }
 
 bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N, int K,

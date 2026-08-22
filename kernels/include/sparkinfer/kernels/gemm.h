@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 namespace sparkinfer { namespace kernels {
@@ -91,6 +92,36 @@ bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N,
 
 void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K,
                        cudaStream_t stream = nullptr);
+
+// ---- dp4a NVFP4: exact-integer weight magnitudes against int8 activations ----
+//
+// NVFP4 decodes to w = mag * (group_scale/2) where mag is one of {0,+-1,+-2,+-3,+-4,+-6,+-8,+-12}
+// -- EXACT small integers. So a group's dot is group_scale * sum(mag_k * xq_k), an exact integer
+// reduction, which is what makes dp4a legal here rather than an approximation of the float path.
+// Weights stay exact; only the activation is quantized.
+//
+// launch_gemv_nvfp4_quant_x quantizes M rows of bf16 activations to int8 with ONE scale per
+// 16-element group -- the same granularity as the NVFP4 weight groups, and finer than the Q8_1
+// per-32 blocks the Q4_K path used. Call it once per activation buffer and reuse the result across
+// every projection that reads that buffer.
+//
+// The rows kernel is instantiated from M = 1, so AR decode (one row) and the speculative verify
+// (M rows) run the SAME kernel and agree by construction, which is what DSpark's losslessness
+// gate requires of any path that replaces launch_gemv_nvfp4.
+// ONE switch for both sides. Decode and the speculative verify must select the same FFN
+// arithmetic or DSpark stops reproducing AR and the losslessness gate fails on a path
+// inconsistency rather than on anything about accuracy.
+inline bool qwen38_nvfp4_dp4a() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_QWEN38_NVFP4_DP4A");
+        return !e || e[0] != '0';
+    }();
+    return v;
+}
+void launch_gemv_nvfp4_quant_x(const void* x, void* xq, void* xs, int M, int K,
+                               cudaStream_t stream);
+bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, void* y,
+                                 int M, int N, int K, cudaStream_t stream);
 
 // Pre-quantized Q8_1 activation path: quantize x[K] ONCE (q8 int8 [K], ad/as [K/32]),
 // then run Q4_K dp4a GEMVs that read it — kills the per-block re-quantization that the

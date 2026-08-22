@@ -2364,6 +2364,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     bf16* x = a.alloc<bf16>((size_t)N * H);
     bf16* xn = a.alloc<bf16>((size_t)N * H);
     bf16* h = a.alloc<bf16>((size_t)N * H);
+    // dp4a NVFP4 FFN staging, hoisted OUT of the layer loop on purpose. Arena::alloc falls back to
+    // cudaMalloc on a miss, and this function runs inside the verify's CUDA graph capture, where
+    // cudaMalloc is illegal -- allocating per layer returned null on the first captured pass and
+    // the FFN silently declined. Everything else here is allocated up front for the same reason.
+    const int nv_kwide = (c.moe_ffn > H ? c.moe_ffn : H);
+    signed char* nv_xq = a.alloc<signed char>((size_t)N * nv_kwide);
+    float* nv_xs = a.alloc<float>((size_t)N * (nv_kwide / 16) + 1);
     // DEBUG ONLY (dspark_tau_check bisection, 2026-08-17): SPARKINFER_DFLASH_VERIFY_DUMP_ROW=<row>
     // dumps that row's pre-attn-norm xn after EVERY layer, plus the post-final-norm xn, into
     // [n_layers+1, H] bf16 written to SPARKINFER_DFLASH_VERIFY_DUMP_FILE (default
@@ -2908,7 +2915,27 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // the two disagree on weights that differ by ~8% and reports LOSSLESS=0 -- a path
             // inconsistency, not an accuracy finding. Measured exactly that way before this
             // branch existed.
-            if (native_ffn) {
+            // dp4a arm, selected by the SAME switch the decode branch reads (qwen35.cpp). One
+            // quantize of hn feeds both gate and up; a second feeds down. Scratch comes from the
+            // verify arena, so it is sized for N rows and released with the rest of the pass.
+            if (native_ffn && topk == 1 && kernels::qwen38_nvfp4_dp4a()) {
+                signed char* xq = nv_xq;
+                float* xs = nv_xs;
+                kernels::launch_gemv_nvfp4_quant_x(hn, xq, xs, N, H, st);
+                if (!kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.gate_nv, sg, N, ffn, H, st) ||
+                    !kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.up_nv, su, N, ffn, H, st)) {
+                    fprintf(stderr, "[dflash-verify] NVFP4 dp4a gate/up declined N=%d ffn=%d H=%d\n",
+                            N, ffn, H);
+                    supported = false; break;
+                }
+                kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
+                kernels::launch_gemv_nvfp4_quant_x(sh, xq, xs, N, ffn, st);
+                if (!kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.down_nv, routed, N, H, ffn, st)) {
+                    fprintf(stderr, "[dflash-verify] NVFP4 dp4a down declined N=%d H=%d ffn=%d\n",
+                            N, H, ffn);
+                    supported = false; break;
+                }
+            } else if (native_ffn) {
                 if (topk != 1 ||
                     !kernels::launch_gemv_nvfp4_rows(hn, w.gate_nv, sg, N, ffn, H, st) ||
                     !kernels::launch_gemv_nvfp4_rows(hn, w.up_nv, su, N, ffn, H, st)) {
