@@ -329,6 +329,10 @@ struct DFlashDraftModel::Impl {
     // verifier/draft vocab remapping is needed.
     bf16* markov_w1 = nullptr;
     bf16* markov_w2 = nullptr;
+    // int8 copy of markov_w2 with per-32 scales, built once at load; the bf16 original is released
+    // as soon as it exists. See launch_markov_bias_add_q8 for why this is about L2, not DRAM.
+    signed char* markov_w2_q = nullptr;
+    float* markov_w2_s = nullptr;
     int markov_rank = 0;
 
     // DSpark's confidence head (AcceptRatePredictor): predicts a per-position accept
@@ -390,6 +394,15 @@ struct DFlashDraftModel::Impl {
         }
         cudaStreamSynchronize(stream);
         return o;
+    }
+
+    // Give a buffer back and drop it from `owned`, so the destructor does not double-free it.
+    void release(void* p) {
+        if (!p) return;
+        for (size_t i = 0; i < owned.size(); i++) {
+            if (owned[i] == p) { owned.erase(owned.begin() + i); break; }
+        }
+        cudaFree(p);
     }
 
     template <class T> T* alloc(size_t n) {
@@ -767,6 +780,24 @@ bool DFlashDraftModel::load(const std::string& dir) {
         mw1->shape[1] == mw2->shape[1] && mw1->shape[1] > 0) {
         s.markov_w1 = s.upload(*mw1);
         s.markov_w2 = s.upload(*mw2);
+        // SPARKINFER_DFLASH_MARKOV_Q8=0 keeps the bf16 table (A/B).
+        {
+            static const bool q8_on = []{ const char* e = getenv("SPARKINFER_DFLASH_MARKOV_Q8");
+                                          return !(e && e[0] == '0'); }();
+            const int rk = (int)mw1->shape[1], nv = (int)mw2->shape[0];
+            if (q8_on && rk == 256 && nv > 0) {
+                s.markov_w2_q = s.alloc<signed char>((size_t)nv * rk);
+                s.markov_w2_s = s.alloc<float>((size_t)nv * (rk / 32));
+                dflash_kernels::launch_quantize_w_q8(s.markov_w2, s.markov_w2_q, s.markov_w2_s,
+                                                     nv, rk, s.stream);
+                cu(cudaStreamSynchronize(s.stream), "markov w2 q8");
+                // Release the bf16 table: nothing reads it once the int8 one exists, and holding
+                // both would ADD ~72 MB on a card already carrying two full weight copies.
+                // Freeing it makes this net -56 MB.
+                s.release(s.markov_w2);
+                s.markov_w2 = nullptr;
+            }
+        }
         s.markov_rank = (int)mw1->shape[1];
     } else if (mw1 || mw2) {
         fprintf(stderr, "[dflash] markov_head tensors present but malformed "
@@ -1413,7 +1444,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // Default ON at every context. SPARKINFER_DFLASH_DEEP_MIN_SEQ no longer gates this; it still
     // selects the proposal-depth ladder in qwen35.cpp, which is a separate decision.
     const bool markov_on = markov_env >= 0 ? (markov_env != 0) : true;
-    if (markov_on && s.markov_w1 && s.markov_w2) {
+    if (markov_on && s.markov_w1 && (s.markov_w2 || s.markov_w2_q)) {
         // ROW SHIFT (SPARKINFER_DFLASH_ROW_SHIFT=0 restores the legacy mapping). Which block row
         // backs proposal r?
         //
@@ -1432,9 +1463,16 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         for (int r = 1; r <= kProposalDepth; r++) {
             const int* prev = (r == 1) ? s.d_ids : (s.d_out + (r - 1));
             const size_t row = (size_t)(kRowShift ? r - 1 : r);
-            dflash_kernels::launch_markov_bias_add(s.markov_w1, s.markov_w2, prev,
-                                                   s.logits + row * V, V, s.markov_rank, st,
-                                                   s.confidence_w ? s.markov_latent : nullptr);
+            if (s.markov_w2_q)
+                dflash_kernels::launch_markov_bias_add_q8(
+                    s.markov_w1, s.markov_w2_q, s.markov_w2_s, prev,
+                    s.logits + row * V, V, s.markov_rank, st,
+                    s.confidence_w ? s.markov_latent : nullptr);
+            else
+                dflash_kernels::launch_markov_bias_add(
+                    s.markov_w1, s.markov_w2, prev,
+                    s.logits + row * V, V, s.markov_rank, st,
+                    s.confidence_w ? s.markov_latent : nullptr);
             // Confidence head (optional): reads THIS row's hidden state + the Markov latent the
             // bias call above just wrote, predicting how likely this row's (about to be computed)
             // argmax is to be accepted. Order doesn't matter relative to the argmax call below --

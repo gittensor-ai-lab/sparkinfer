@@ -2521,6 +2521,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local float* verify_head_scale = nullptr;
     static thread_local cudaEvent_t ev_fork = nullptr;
     static thread_local cudaEvent_t ev_join = nullptr;
+    // Second join point for the GDN side branch: alpha/beta and wqkv_gate are consumed by two
+    // different kernels, several launches apart.
+    static thread_local cudaEvent_t ev_join_ab = nullptr;
     // Width of the per-row MoE fan-out, counting the caller's stream. One row's MoE does not fill
     // the GPU, so issuing the rows on their own streams runs several at once. The rows are
     // independent (own input row, own expert slice, own scratch), so this changes only when the
@@ -2550,6 +2553,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (fork_shared && !ev_fork) {
         pf_cu(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming), "verify fork event");
         pf_cu(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming), "verify join event");
+        pf_cu(cudaEventCreateWithFlags(&ev_join_ab, cudaEventDisableTiming), "verify ab join event");
     }
     if (!ph_ids) {
         pf_cu(cudaHostAlloc(&ph_ids, 16 * sizeof(int), cudaHostAllocDefault), "verify host ids");
@@ -2873,13 +2877,26 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // almost entirely launch/graph-node latency. One fused launch, same per-row math.
             const bool ab_fused = w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
                 kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, gst);
+            // Split join. One join here made the side branch's 11.8 MB wqkv_gate GEMV complete
+            // before conv_compact -- which reads only rq, off the MAIN stream -- and before the
+            // scan, which reads only alpha/beta. Nothing needs lz until gated_norm, three launches
+            // later. Record one event after alpha/beta and one after wqkv_gate, and wait for each
+            // where its consumer actually is, so the wide gate GEMV overlaps the conv and the scan
+            // instead of blocking them.
+            //
+            // stream_k is in-order, so ev_join_ab necessarily retires before ev_join; no kernel is
+            // reordered or dropped, so the arithmetic is untouched. Only valid when ab_fused put
+            // alpha/beta FIRST on that stream -- otherwise they are issued after wqkv_gate inside
+            // the && chain below and one join is the correct structure.
+            const bool split_ok = fork_gdn && ab_fused;
+            if (split_ok) pf_cu(cudaEventRecord(ev_join_ab, s.stream_k), "verify gdn ab join");
             supported = supported &&
                         proj_on(gst, xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H) &&
                         (ab_fused || (proj_on(gst, xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
                                       proj_on(gst, xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H)));
             if (fork_gdn) {
                 pf_cu(cudaEventRecord(ev_join, s.stream_k), "verify gdn join");
-                pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn join wait");
+                if (!split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn join wait");
             }
             if (!supported) break;
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) +
@@ -2887,8 +2904,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
                 N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
             const float* state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
+            // ra/rb are the scan's only side-branch inputs.
+            if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "verify gdn ab wait");
             kernels::launch_dflash_gdn_scan_compact(gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
                 state, att, N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
+            // ...and lz is gated_norm's.
+            if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn z wait");
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
                                                 c.linear_head_dim, c.rms_eps, st);
             supported = proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);

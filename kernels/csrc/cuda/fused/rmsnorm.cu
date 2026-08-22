@@ -227,11 +227,19 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
     const float d = amax / 127.0f;
     const int b = t >> 2, r = t & 3;
     int s = 0;
+    // The eight bytes this thread owns are contiguous (qs[r*8 .. r*8+7]), so stage them in
+    // registers and store two 32-bit words instead of eight STG.U8. Two words, not one 64-bit
+    // store: qs sits at offset 4 in si_blk_q8_1 (after the half2 scale), so qs + r*8 is 4-byte
+    // aligned and never 8-byte aligned. Same bytes, same values.
+    signed char qb[8];
     #pragma unroll
     for (int j = 0; j < 8; j++) {
         int qi = (amax == 0.0f) ? 0 : (int)roundf(bv[j] / d);
-        out_q8[b].qs[r * 8 + j] = (signed char)qi; s += qi;
+        qb[j] = (signed char)qi; s += qi;
     }
+    unsigned int* qw = reinterpret_cast<unsigned int*>(out_q8[b].qs + r * 8);
+    qw[0] = reinterpret_cast<const unsigned int*>(qb)[0];
+    qw[1] = reinterpret_cast<const unsigned int*>(qb)[1];
     s += __shfl_xor_sync(0xffffffffu, s, 1); s += __shfl_xor_sync(0xffffffffu, s, 2);
     if (r == 0) out_q8[b].ds = __floats2half2_rn(d, d * (float)s);
 }
@@ -291,11 +299,19 @@ __global__ void add_rmsnorm3_q8_kernel(const __nv_bfloat16* __restrict__ x,
     const float d = amax / 127.0f;
     const int b = t >> 2, r = t & 3;
     int s = 0;
+    // The eight bytes this thread owns are contiguous (qs[r*8 .. r*8+7]), so stage them in
+    // registers and store two 32-bit words instead of eight STG.U8. Two words, not one 64-bit
+    // store: qs sits at offset 4 in si_blk_q8_1 (after the half2 scale), so qs + r*8 is 4-byte
+    // aligned and never 8-byte aligned. Same bytes, same values.
+    signed char qb[8];
     #pragma unroll
     for (int j = 0; j < 8; j++) {
         int qi = (amax == 0.0f) ? 0 : (int)roundf(bv[j] / d);
-        out_q8[b].qs[r * 8 + j] = (signed char)qi; s += qi;
+        qb[j] = (signed char)qi; s += qi;
     }
+    unsigned int* qw = reinterpret_cast<unsigned int*>(out_q8[b].qs + r * 8);
+    qw[0] = reinterpret_cast<const unsigned int*>(qb)[0];
+    qw[1] = reinterpret_cast<const unsigned int*>(qb)[1];
     s += __shfl_xor_sync(0xffffffffu, s, 1); s += __shfl_xor_sync(0xffffffffu, s, 2);
     if (r == 0) out_q8[b].ds = __floats2half2_rn(d, d * (float)s);
 }

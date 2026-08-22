@@ -1625,6 +1625,56 @@ __global__ void k_markov_bias_add_warp(const bf16* __restrict__ w1, const bf16* 
     if (lane == 0) logits[v] += acc;
 }
 
+// int8 w2 with per-32 scales -- the same warp-per-row map over half the bytes.
+//
+// Two effects, and the second is the one that pays. The obvious one is 127 MB -> 71 MB of DRAM per
+// call. The one that matters is that the table then FITS IN L2: this head runs once per proposal
+// row and every row re-reads the whole of w2, so at bf16 each call is a cold 127 MB stream while at
+// int8 the second and third calls hit cache.
+//
+// Quantizing a bias table is safe here for the same reason the warp reduction's reordered sum is:
+// the draft only NOMINATES, and every emitted token is still a target argmax. It can move tau and
+// nothing else.
+template <int RANK>
+__global__ void k_markov_bias_add_warp_q8(const bf16* __restrict__ w1,
+                                          const signed char* __restrict__ w2q,
+                                          const float* __restrict__ w2s,
+                                          const int* __restrict__ prev_token,
+                                          float* __restrict__ logits, int vocab,
+                                          float* __restrict__ out_latent) {
+    constexpr int VEC = 8;                          // int8 per int2
+    constexpr int PER_LANE = RANK / (32 * VEC);
+    constexpr int NSC = RANK / 32;
+    __shared__ float latent[RANK];
+    const int tok = *prev_token;
+    const bf16* w1_row = w1 + (size_t)tok * RANK;
+    for (int r = threadIdx.x; r < RANK; r += blockDim.x) latent[r] = b2f(w1_row[r]);
+    __syncthreads();
+    if (out_latent && blockIdx.x == 0)
+        for (int r = threadIdx.x; r < RANK; r += blockDim.x) out_latent[r] = latent[r];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int v = blockIdx.x * (int)(blockDim.x >> 5) + warp;
+    if (v >= vocab) return;
+    const signed char* row = w2q + (size_t)v * RANK;
+    const float* rsc = w2s + (size_t)v * NSC;
+    float acc = 0.f;
+    #pragma unroll
+    for (int p = 0; p < PER_LANE; p++) {
+        const int base = (p * 32 + lane) * VEC;
+        const int2 raw = *reinterpret_cast<const int2*>(row + base);
+        const signed char* wv = reinterpret_cast<const signed char*>(&raw);
+        // VEC == 8 keeps every lane's slice inside one 32-wide scale block.
+        const float sc = rsc[base >> 5];
+        float part = 0.f;
+        #pragma unroll
+        for (int i = 0; i < VEC; i++) part += latent[base + i] * (float)wv[i];
+        acc += part * sc;
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    if (lane == 0) logits[v] += acc;
+}
+
 // confidence_logit = dot(hidden[H], w[0:H]) + dot(latent[rank], w[H:H+rank]) + bias -- a single
 // linear layer over the concatenation of this row's hidden state and its Markov latent, matching
 // DSpark's AcceptRatePredictor(confidence_head_with_markov=True). One block, block-wide reduction
@@ -1660,6 +1710,16 @@ void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaSt
     if (total <= 0) return;
     const int threads = 256;
     k_broadcast_rows_i32<<<(total + threads - 1) / threads, threads, 0, stream>>>(src, dst, n, rows);
+}
+
+void launch_markov_bias_add_q8(const void* w1, const void* w2q, const float* w2s,
+                               const int* prev_token, float* logits, int vocab, int rank,
+                               cudaStream_t stream, float* out_latent) {
+    if (vocab <= 0 || rank != 256 || !w2q || !w2s) return;
+    const int threads = 256, warps_per_block = threads / 32;
+    const int blocks_w = (vocab + warps_per_block - 1) / warps_per_block;
+    k_markov_bias_add_warp_q8<256><<<blocks_w, threads, 0, stream>>>(
+        (const bf16*)w1, (const signed char*)w2q, w2s, prev_token, logits, vocab, out_latent);
 }
 
 void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_token,

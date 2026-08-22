@@ -731,7 +731,9 @@ __device__ __forceinline__ void si_nvfp4_group_decode_w8(const unsigned char* pa
                                                          unsigned char scale, float inv_g,
                                                          float* __restrict__ ws) {
     const float s = si_ue4m3(scale) * inv_g * 0.5f;
-    const uint2 pw = __ldg(reinterpret_cast<const uint2*>(packed8));
+    // Evict-first: this weight stream is read once per call and would otherwise flush the
+    // activation rows that every CTA re-reads. Same bytes, same order: bit-identical.
+    const uint2 pw = __ldcs(reinterpret_cast<const uint2*>(packed8));
     const unsigned int p0 = pw.x, p1 = pw.y;
     #pragma unroll
     for (int i = 0; i < 4; i++) {
@@ -1044,11 +1046,14 @@ __global__ void gemv_nvfp4_rows_dp4a_kernel(const signed char* __restrict__ xq,
                 if (NR > 1 && nj >= N) break;
                 const unsigned char* srow = sf + (size_t)nj * (size_t)(K >> 4);
                 const unsigned char* prow = w + (size_t)nj * (size_t)(K >> 1);
-                const uint2 pw = __ldg(reinterpret_cast<const uint2*>(prow + (size_t)g * 8));
+                // Evict-first, same reason: each CTA owns disjoint output rows and touches
+                // every weight byte once, while the R x K activation block is re-read by EVERY
+                // CTA (2176 of them for a 17408-wide FFN matrix). Bit-identical.
+                const uint2 pw = __ldcs(reinterpret_cast<const uint2*>(prow + (size_t)g * 8));
                 unsigned q0, q1, q2, q3;
                 si_nvfp4_i8x8(pw.x, q0, q1);
                 si_nvfp4_i8x8(pw.y, q2, q3);
-                const float sw = si_ue4m3(srow[g]) * inv_g * 0.5f;
+                const float sw = si_ue4m3(__ldcs(srow + g)) * inv_g * 0.5f;
                 #pragma unroll
                 for (int r = 0; r < R; r++) {
                     int iacc = 0;

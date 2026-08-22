@@ -193,6 +193,12 @@ void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaSt
 // once position k-1's (already Markov-corrected) argmax has been computed. out_latent (optional,
 // nullptr to skip) receives the same [rank] latent vector this call already computed, for the
 // confidence head below to reuse instead of re-doing the embedding lookup.
+// int8 w2 twin of launch_markov_bias_add. w2q is [vocab, rank] int8 with per-32 scales in w2s;
+// halves the stream and drops the table under L2, which is what the repeated per-row reads want.
+// Requires rank == 256 (the released DSpark checkpoints); declines otherwise.
+void launch_markov_bias_add_q8(const void* w1, const void* w2q, const float* w2s,
+                               const int* prev_token, float* logits, int vocab, int rank,
+                               cudaStream_t stream, float* out_latent);
 void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_token,
                             float* logits, int vocab, int rank, cudaStream_t stream,
                             float* out_latent = nullptr);
