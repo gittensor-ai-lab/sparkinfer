@@ -2757,15 +2757,39 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
     // Split-K chosen by N exactly as the float rows kernel does, so the two paths fan out over the
     // GPU identically and a comparison between them is a comparison of the arithmetic alone.
-#define SI_NVFP4_DP4A(S_, R_) do { \
-        constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
-        const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
-        gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
+    // NR (output rows per warp-group) was fixed at 2, which is right for the dense FFN this path
+    // was written for: at N = 17408 the grid is still ~4x the SM count, and folding two output
+    // rows into a warp-group halves the activation traffic. The GDN and attention projections are
+    // 2048 to 12288 rows wide, where halving the grid costs more occupancy than the sharing buys.
+    // Pick NR by N. SPARKINFER_NVFP4_DP4A_NR pins it for A/B.
+    static const int nr_pin = []{ const char* e = getenv("SPARKINFER_NVFP4_DP4A_NR");
+                                  int v = e ? atoi(e) : 0; return (v == 1 || v == 2) ? v : 0; }();
+    // Width above which two output rows per warp-group pays. Swept: see the PR notes.
+    // Measured, same binary, DSPARK_TPS / AR: NR=2 everywhere 108.52 / 87.32, NR=1 everywhere
+    // 109.17 / 90.02, NR=2 only at the FFN's width 109.29 / 89.10. Keying it on the ROW COUNT
+    // instead (NR=1 at M==1, NR=2 above) is worse -- 108.52 / 90.01 -- so width is the right
+    // discriminator, not batch.
+    static const int nr_wide = []{ const char* e = getenv("SPARKINFER_NVFP4_DP4A_NRW");
+                                   int v = e ? atoi(e) : 16384; return v > 0 ? v : 16384; }();
+    const int nr = nr_pin ? nr_pin : (N >= nr_wide ? 2 : 1);
+#define SI_NVFP4_DP4A_NR(S_, R_, NR_) do { \
+        constexpr int S = (S_), R = (R_), NR = (NR_), RPB = GEMV_WPB / S; \
+        const dim3 grid((N + RPB * NR - 1) / (RPB * NR)); \
+        gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, NR><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
     } while (0)
+#define SI_NVFP4_DP4A(S_, R_) do { \
+        if (nr == 2) SI_NVFP4_DP4A_NR(S_, R_, 2); else SI_NVFP4_DP4A_NR(S_, R_, 1); \
+    } while (0)
+    // Split count. Inherited from the float rows kernel's N thresholds; dp4a has a different
+    // instruction mix per byte, so the crossovers are not obviously the same. SPARKINFER_NVFP4_DP4A_S
+    // pins it for a sweep.
+    static const int s_pin = []{ const char* e = getenv("SPARKINFER_NVFP4_DP4A_S");
+                                 int v = e ? atoi(e) : 0; return (v==2||v==4||v==8) ? v : 0; }();
+    const int s_sel = s_pin ? s_pin : (N >= 8192 ? 2 : (N >= 4096 ? 4 : 8));
 #define SI_NVFP4_DP4A_S(R_) do { \
-        if (N >= 8192)      SI_NVFP4_DP4A(2, R_); \
-        else if (N >= 4096) SI_NVFP4_DP4A(4, R_); \
-        else                SI_NVFP4_DP4A(8, R_); \
+        if (s_sel == 2)      SI_NVFP4_DP4A(2, R_); \
+        else if (s_sel == 4) SI_NVFP4_DP4A(4, R_); \
+        else                 SI_NVFP4_DP4A(8, R_); \
     } while (0)
     switch (M) {
         case 1: SI_NVFP4_DP4A_S(1); break;  case 2: SI_NVFP4_DP4A_S(2); break;
@@ -2775,6 +2799,7 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
     }
 #undef SI_NVFP4_DP4A_S
 #undef SI_NVFP4_DP4A
+#undef SI_NVFP4_DP4A_NR
     return true;
 }
 
