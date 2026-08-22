@@ -276,6 +276,12 @@ struct Qwen35Model::Impl {
     // a second feeds down. Sized for the widest K the FFN reads (moe_ffn for down).
     signed char *nv_xq = nullptr;
     float *nv_xs = nullptr;
+    // Projection-side int8 staging (attention + GDN), separate from the FFN's. `a` holds the
+    // layer input xn, shared by every projection that reads it; `b` holds one-off inputs
+    // (o_proj's att, ssm_out's lnrm) so quantizing those cannot clobber xn while the parallel
+    // K/V and GDN streams are still reading it.
+    signed char *nv_pq_a = nullptr, *nv_pq_b = nullptr;
+    float *nv_ps_a = nullptr, *nv_ps_b = nullptr;
     float *sx_h = nullptr;   // pipelined shared-expert h_scratch (avoids racing routed mf_h)
     void  *sx_q8 = nullptr;  // pipelined shared-expert Q8_1(h) for down (avoids racing aq81)
     int   *mf_ids = nullptr, *mf_counts = nullptr;
@@ -512,6 +518,15 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->nv_h       = p_->alloc<bf16>(cfg.moe_ffn);
     p_->nv_xq      = p_->alloc<signed char>(cfg.moe_ffn);
     p_->nv_xs      = p_->alloc<float>(cfg.moe_ffn / 16 + 1);
+    {
+        int pw = cfg.hidden;
+        if (p_->qdim > pw) pw = p_->qdim;
+        if (p_->linear_vdim > pw) pw = p_->linear_vdim;
+        p_->nv_pq_a = p_->alloc<signed char>(pw);
+        p_->nv_ps_a = p_->alloc<float>(pw / 16 + 1);
+        p_->nv_pq_b = p_->alloc<signed char>(pw);
+        p_->nv_ps_b = p_->alloc<float>(pw / 16 + 1);
+    }
     if (cfg.dense_ffn && cfg.top_k > 0) {
         cu(cudaMemcpy(p_->mf_ids, &zero, sizeof(int), cudaMemcpyHostToDevice), "dense expert id");
         cu(cudaMemcpy(p_->mf_weights, &one, sizeof(float), cudaMemcpyHostToDevice), "dense expert w");
@@ -1161,6 +1176,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 kernels::launch_quantize_q8_1(s.xn, s.aq8, s.aq8_d, s.aq8_s, H, st);
             }
         };
+        // NVFP4 dp4a staging for xn. Issued on `st` before any stream fork, exactly like the
+        // Q8_1 quantize above, so the parallel K/V and GDN streams that read it inherit the same
+        // dependency they already have on xn itself. Not gated on use_pq: that flag selects the
+        // mmvq activation format, which this path does not use.
+        bool xn_nv_ready = false;
+        auto prepare_xn_nvfp4 = [&](bool any_nv) {
+            if (!any_nv || xn_nv_ready || !kernels::qwen38_nvfp4_dp4a_proj()) return;
+            kernels::launch_gemv_nvfp4_quant_x(s.xn, s.nv_pq_a, s.nv_ps_a, 1, H, st);
+            xn_nv_ready = true;
+        };
         auto proj_xn = [&](const void* W, int t, void* y, int N, cudaStream_t pst) {
             if (s.gguf) {
                 if (s.use_pq && t == 12) {
@@ -1173,8 +1198,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_mmvq_q80(s.aq81, W, y, N, H, pst);
                 else if (t == kernels::SI_QTYPE_FP8)
                     kernels::launch_gemv_fp8(s.xn, W, y, N, H, pst);
-                else if (t == kernels::SI_QTYPE_NVFP4)
-                    kernels::launch_gemv_nvfp4(s.xn, W, y, N, H, pst);
+                else if (t == kernels::SI_QTYPE_NVFP4) {
+                    if (!(xn_nv_ready &&
+                          kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pq_a, s.nv_ps_a, W, y,
+                                                               1, N, H, pst)))
+                        kernels::launch_gemv_nvfp4(s.xn, W, y, N, H, pst);
+                }
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -1200,6 +1229,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 } else if (t == kernels::SI_QTYPE_FP8) {
                     kernels::launch_gemv_fp8(x, W, y, N, K, st);
                 } else if (t == kernels::SI_QTYPE_NVFP4) {
+                    if (kernels::qwen38_nvfp4_dp4a_proj()) {
+                        kernels::launch_gemv_nvfp4_quant_x(x, s.nv_pq_b, s.nv_ps_b, 1, K, st);
+                        if (kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pq_b, s.nv_ps_b, W, y,
+                                                                 1, N, K, st)) return;
+                    }
                     kernels::launch_gemv_nvfp4(x, W, y, N, K, st);
                 } else if (t) kernels::launch_gemv_q(x, W, t, y, N, K, st);
                 else          kernels::launch_gemv(x, W, y, N, K, st);
@@ -1216,6 +1250,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             const bool any_q80 = (w.wqkv_type == 8 || w.wqkv_gate_type == 8 ||
                                   w.ssm_alpha_type == 8 || w.ssm_beta_type == 8);
             prepare_xn_quant(any_q4k, any_q6k, any_q80);
+            prepare_xn_nvfp4(w.wqkv_type == kernels::SI_QTYPE_NVFP4 ||
+                             w.wqkv_gate_type == kernels::SI_QTYPE_NVFP4 ||
+                             w.ssm_alpha_type == kernels::SI_QTYPE_NVFP4 ||
+                             w.ssm_beta_type == kernels::SI_QTYPE_NVFP4);
             const bool gdn_quad = s.use_gdn_quad && s.gguf && s.use_pq && s.use_llama && H == 2048
                                && w.wqkv_type == 12 && w.wqkv_gate_type == 12
                                && w.ssm_alpha_type == 12 && w.ssm_beta_type == 12;
@@ -1326,6 +1364,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
                 const bool any_q80 = (w.wq_type == 8 || w.wk_type == 8 || w.wv_type == 8);
                 prepare_xn_quant(any_q4k, any_q6k, any_q80);
+                prepare_xn_nvfp4(w.wq_type == kernels::SI_QTYPE_NVFP4 ||
+                                 w.wk_type == kernels::SI_QTYPE_NVFP4 ||
+                                 w.wv_type == kernels::SI_QTYPE_NVFP4);
                 // Muse Glimmer keeps attn_gate as its own quantized tensor (w.wgate), so Q goes
                 // straight to s.q and the gate straight to s.qgate -- no [q|gate] interleave to
                 // build and no split to undo it. Every other model still fuses them into s.qraw.
@@ -1589,6 +1630,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
                 kernels::launch_mmvq_q80(s.aq81, w.wo, s.ao, H, s.qdim, st);
             }
+            // o_proj does not go through proj_from, so it needs the dp4a arm spelled out here.
+            // The verify drives w.wo through its own proj(), which does take that arm -- leaving
+            // this one on the float GEMV made decode and verify disagree on 16 layers' worth of
+            // attention output, which showed up as LOSSLESS=0 rather than as a wrong number.
+            else if (s.gguf && w.wo_type == kernels::SI_QTYPE_NVFP4 &&
+                     kernels::qwen38_nvfp4_dp4a_proj() &&
+                     (kernels::launch_gemv_nvfp4_quant_x(s.attn, s.nv_pq_b, s.nv_ps_b, 1, s.qdim, st),
+                      kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pq_b, s.nv_ps_b, w.wo, s.ao,
+                                                           1, H, s.qdim, st))) {}
             else if (s.gguf && w.wo_type) kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, s.qdim, st);
             else if (s.gguf)         kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
             else                     kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
@@ -3144,42 +3194,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 12288;
         return v < 1 ? 1 : v;
     }();
-    // ...and then stop proposing deeper than the DRAFT's own context cost can pay for.
+    // ...and then propose as deep as the draft's own block already reaches.
     //
-    // Each extra proposal is another row in the draft block: another 248320-wide LM-head row and
-    // argmax, and another row of the draft's own attention over the same KV. The first two are
-    // fixed, but the third grows with context, so the depth that pays is not a property of the
-    // model, it is a property of how long the sequence already is. In the token loop the extra
-    // proposals buy nothing unless they are actually accepted, and at this model's acceptance
-    // they are not: mean accepted length is identical at depth 1, 2 and 3 at 4k.
+    // Each extra proposal is another row in the draft block -- another 248320-wide LM-head row and
+    // argmax, and another row of the draft's own attention over the same KV -- and another row in
+    // the target's batched verify. Whether that pays is decided by what a verify row costs, and
+    // that number moved: with every NVFP4 projection on dp4a the marginal row is 0.963 ms against
+    // the ~3.6 ms it cost when this ladder last chose one proposal.
     //
-    // Measured on RTX 5090 at the split counts the server runs (not the harness pin), one binary,
-    // DSPARK_TPS with lossless=1 everywhere:
-    //
-    //     ctx    depth 1    depth 3     mean accept (d1 / d3)
-    //     128     81.94      91.69      1.1034 / 1.0159      <- depth 3 wins
-    //     512     92.32      91.95      1.0000 / 1.0000      <- tie, draft inert
-    //     1024    78.72      68.30      1.1429 / 1.1566      <- depth 1 by 15.3%
-    //     2048    83.04      78.35      1.0435 / 1.0435      <- depth 1 by 6.0%
-    //     4096    81.23      74.82      1.0756 / 1.0756      <- depth 1 by 8.6%
-    //
-    // 128 is the one context that prefers the wide block, and for a reason that is visible in its
-    // acceptance column rather than its throughput: at depth 3 the draft accepts essentially
-    // nothing (1.0159), the idle-draft rule stops drafting altogether, and the stream runs at AR
-    // speed. Narrowing raises acceptance just enough (1.1034) to keep the draft alive without
-    // being worth its cost. So the rule is not "narrow always" -- it is "narrow once the draft is
-    // carrying a context whose per-row cost the deeper proposals cannot repay", which is what the
-    // 512 tie and everything above it show.
-    //
-    // Scope: only the band this measures. Below kNarrowMinSeq nothing changes, and the
-    // >= kDeepMinSeq branch keeps its own depth of 7 -- long context is where acceptance actually
-    // climbs and it is measured separately. The batched verify also keeps the static depth: its
-    // row count has to match the graph dflash_warm_verify captured for kProposalDepth+1 rows.
-    static const int kNarrowMinSeq = []{
-        const char* e = getenv("SPARKINFER_DFLASH_NARROW_MINSEQ");
-        int v = e ? atoi(e) : 512;
-        return v < 1 ? 1 : v;
-    }();
     // Explicit override wins; 0/unset selects by length. Keep in sync with dflash_draft.cpp, which
     // reads the same variable for its own default and is handed this value per block.
     static const int kProposalDepthEnv = []{
@@ -3187,35 +3209,18 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 0;
         return v < 0 ? 0 : (v > 15 ? 15 : v);
     }();
-    // Below the deep threshold the depth is 3, not 5. Two measurements decide it, both on the
-    // RTX 5090 against the released DSpark draft (block_size 7):
+    // Measured on RTX 5090 at ctx=4096, reps=3, one binary, all lossless:
     //
-    //   1. ACCEPTANCE SATURATES BELOW 4. At ctx=128 the mean accepted length is 1.2549 at depth 3
-    //      and *exactly* 1.2549 at 4, 5 and 6 -- proposals past the third are never accepted, so
-    //      every target row spent verifying them is spent for nothing. At ctx=4096 it is 1.113 at
-    //      depth 3 against 1.123 at depth 5, i.e. a hundredth of a token for two extra rows.
+    //     depth 1  104.28 tok/s  tau 1.5059   depth 3  109.48 tok/s  tau 1.8056
+    //     depth 2  109.30 tok/s  tau 1.7200   depth 4   76.24 tok/s  tau 1.9403
     //
-    //   2. DEPTH 4 IS A CLIFF, NOT A SLOPE. The draft's active block width is
-    //      round_up(depth+1) over {2, 4, 8, 16} capped at block_size, so depth 3 runs a 4-wide draft
-    //      block and depth 4 runs a 7-wide one. Crossing it costs a quarter of the throughput for
-    //      the zero extra accepts above:
-    //
-    //        ctx=128   depth 1/2/3 -> 64.89 / 65.00 / 66.13 tok/s   depth 4/5/6 -> 48.74 / 48.45 / 48.12
-    //        ctx=4096  depth 3 -> 29.88                             depth 5/7   -> 24.28 / 20.46
-    //        ctx=512   depth 3/5/7 -> 77.65 / 77.62 / 77.56         (accept 1.0: DSpark is inert here)
-    //
-    // So 3 is the largest depth that still fits the cheap block-width tier, and nothing below the
-    // deep threshold accepts deeply enough to pay for leaving it. The >= kDeepMinSeq branch keeps
-    // its 7: long context is where acceptance actually climbs (the ladder above this comment), and
-    // it is measured separately.
-    // Narrow band (see the table below): a generation that STARTS above kNarrowMinSeq and stays
-    // below the deep threshold proposes one token, not three. Decided once per generation rather
-    // than per step, because the verify graph dflash_warm_verify captures is sized from this and
-    // a graph built for a row count the stream never uses costs more than the rows it saves --
-    // measured, per-step narrowing under a 4-row warm graph recovers only 0.7% of the 9.4%.
+    // Three is the natural stop, and not by tuning: the draft's block is already FOUR rows wide
+    // (dflash_draft.cpp widens it to 4 whenever a Markov head is present), so depth 3 consumes
+    // every proposal that block already computes. Depth 4 needs a 5-wide block, which rounds to
+    // the checkpoint's block_size of 7 -- a width the draft's batched GEMV is not instantiated
+    // for -- so the draft falls onto its per-token loop and costs 9.92 ms instead of 2.52.
     const int kProposalDepth = kProposalDepthEnv > 0 ? kProposalDepthEnv
-                             : ((n + max_new) >= kDeepMinSeq ? 7
-                                : (n >= kNarrowMinSeq ? 1 : 3));
+                             : ((n + max_new) >= kDeepMinSeq ? 7 : 3);
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN

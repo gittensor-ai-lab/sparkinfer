@@ -111,6 +111,15 @@ void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K,
 // ONE switch for both sides. Decode and the speculative verify must select the same FFN
 // arithmetic or DSpark stops reproducing AR and the losslessness gate fails on a path
 // inconsistency rather than on anything about accuracy.
+// Attention and GDN projections, switched separately from the FFN so each arm can be A/B'd on
+// its own. Decode and verify both read this, so they cannot disagree.
+inline bool qwen38_nvfp4_dp4a_proj() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_QWEN38_NVFP4_DP4A_PROJ");
+        return !e || e[0] != '0';
+    }();
+    return v;
+}
 inline bool qwen38_nvfp4_dp4a() {
     static const bool v = [] {
         const char* e = getenv("SPARKINFER_QWEN38_NVFP4_DP4A");

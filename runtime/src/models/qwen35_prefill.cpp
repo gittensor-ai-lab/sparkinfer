@@ -2371,6 +2371,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const int nv_kwide = (c.moe_ffn > H ? c.moe_ffn : H);
     signed char* nv_xq = a.alloc<signed char>((size_t)N * nv_kwide);
     float* nv_xs = a.alloc<float>((size_t)N * (nv_kwide / 16) + 1);
+    // Projection-side int8 staging, separate from the FFN's. Two buffers, not one: the q/k/v and
+    // GDN in-projections run on parallel streams reading the SAME quantized xn, and the o_proj /
+    // ssm_out quantize that follows must not overwrite it while those are still in flight.
+    const int nv_pwide = [&]{ int m = H; if (s.qdim > m) m = s.qdim; if (s.linear_vdim > m) m = s.linear_vdim; return m; }();
+    signed char* nv_pq_a = a.alloc<signed char>((size_t)N * nv_pwide);
+    float* nv_ps_a = a.alloc<float>((size_t)N * (nv_pwide / 16) + 1);
+    signed char* nv_pq_b = a.alloc<signed char>((size_t)N * nv_pwide);
+    float* nv_ps_b = a.alloc<float>((size_t)N * (nv_pwide / 16) + 1);
     // DEBUG ONLY (dspark_tau_check bisection, 2026-08-17): SPARKINFER_DFLASH_VERIFY_DUMP_ROW=<row>
     // dumps that row's pre-attn-norm xn after EVERY layer, plus the post-final-norm xn, into
     // [n_layers+1, H] bf16 written to SPARKINFER_DFLASH_VERIFY_DUMP_FILE (default
@@ -2566,6 +2574,24 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         q81_src = in;
         q81_k = k;
     };
+    // Same caching discipline as quant_rows above, for the NVFP4 dp4a path: q/k/v (and the four
+    // GDN in-projections) all read one `xn`, so it is quantized once per layer and reused. The A/B
+    // buffers alternate by source so a later quantize cannot clobber one a parallel stream is
+    // still reading.
+    const bf16* nvq_src_a = nullptr; int nvq_k_a = 0;
+    const bf16* nvq_src_b = nullptr; int nvq_k_b = 0;
+    bool nvq_use_b = false;
+    auto quant_nv_rows = [&](const bf16* in, int k) {
+        if (nvq_src_a == in && nvq_k_a == k) { nvq_use_b = false; return; }
+        if (nvq_src_b == in && nvq_k_b == k) { nvq_use_b = true;  return; }
+        if (!nvq_use_b) {
+            kernels::launch_gemv_nvfp4_quant_x(in, nv_pq_b, nv_ps_b, N, k, st);
+            nvq_src_b = in; nvq_k_b = k; nvq_use_b = true;
+        } else {
+            kernels::launch_gemv_nvfp4_quant_x(in, nv_pq_a, nv_ps_a, N, k, st);
+            nvq_src_a = in; nvq_k_a = k; nvq_use_b = false;
+        }
+    };
     auto proj = [&](const bf16* in, const void* w, int type, bf16* out, int no, int k) -> bool {
         if (type == 0) {
             return kernels::launch_gemv_rows(in, w, out, N, no, k, st);
@@ -2608,6 +2634,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // the one-row kernel's dot and split-fold order per row, so the results are the same
             // bits the loop below produces -- the loop stays as the fallback for widths it does
             // not cover, and is what every other N still runs.
+            if (kernels::qwen38_nvfp4_dp4a_proj()) {
+                quant_nv_rows(in, k);
+                if (kernels::launch_gemv_nvfp4_rows_dp4a(nvq_use_b ? nv_pq_b : nv_pq_a,
+                                                         nvq_use_b ? nv_ps_b : nv_ps_a,
+                                                         w, out, N, no, k, st)) return true;
+            }
             if (kernels::launch_gemv_nvfp4_rows(in, w, out, N, no, k, st)) return true;
             for (int r = 0; r < N; ++r)
                 kernels::launch_gemv_nvfp4(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
@@ -2636,6 +2668,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // Native FP8/NVFP4 touch no shared q81 scratch, so unlike the mmvq path below they are
         // safe on ANY stream and never need the fall-back to `st`.
         if (type == kernels::SI_QTYPE_FP8 || type == kernels::SI_QTYPE_NVFP4) {
+            // Reads the quantized `in` proj() already produced on `st` for this same buffer --
+            // never quantizes here, for the reason the header note gives: writing shared scratch
+            // off the main stream races. Falls through to the float path if it was not staged,
+            // which keeps this correct if a caller ever reorders.
+            if (type == kernels::SI_QTYPE_NVFP4 && kernels::qwen38_nvfp4_dp4a_proj()) {
+                const bool ha = (nvq_src_a == in && nvq_k_a == k);
+                const bool hb = (nvq_src_b == in && nvq_k_b == k);
+                if ((ha || hb) &&
+                    kernels::launch_gemv_nvfp4_rows_dp4a(hb ? nv_pq_b : nv_pq_a,
+                                                         hb ? nv_ps_b : nv_ps_a,
+                                                         w, out, N, no, k, ps)) return true;
+            }
             if (type == kernels::SI_QTYPE_NVFP4 &&
                 kernels::launch_gemv_nvfp4_rows(in, w, out, N, no, k, ps)) return true;
             if (type == kernels::SI_QTYPE_FP8 &&
@@ -2768,6 +2812,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, c.rms_eps, st);
     for (int L = 0; L < c.n_layers && supported; ++L) {
+        // Reset the dp4a activation cache every layer. `xn` is the SAME buffer at every layer, so
+        // a pointer-keyed cache that is never invalidated silently reuses layer 0's quantization
+        // for all 64 -- which is the stale-activation failure this file documents for s.aq81. The
+        // Q8_1 cache beside it stays valid only because the layer tail re-stamps q81_src when it
+        // emits a fresh Q8_1(xn); nothing re-stamps this one, so clear it here.
+        nvq_src_a = nullptr; nvq_k_a = 0;
+        nvq_src_b = nullptr; nvq_k_b = 0;
         vfail_L = L;
         vdbg_snapshot(xn, L);
         if (L == 0) vdbg_snapshot2(x, 4);   // raw pre-norm residual stream (h = x + ao)
@@ -2783,6 +2834,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // at ~3 and ~0.4 CTAs per SM, so serializing them behind wqkv just adds their latency
             // to the chain. Push the two small ones onto stream_k. Safe only once q81 already
             // holds xn -- otherwise proj() would have to quantize, which writes shared scratch.
+            // Stage xn for dp4a BEFORE the fork, for the same reason the fork below is gated on
+            // q81 already holding xn: anything proj() issues lands AFTER the fork event, so a
+            // parallel stream reading it would race. With xn staged here, proj() hits the cache
+            // and issues nothing, and proj_on() finds it already there.
+            if (kernels::qwen38_nvfp4_dp4a_proj() &&
+                (w.wqkv_type == kernels::SI_QTYPE_NVFP4 ||
+                 w.wqkv_gate_type == kernels::SI_QTYPE_NVFP4 ||
+                 w.ssm_alpha_type == kernels::SI_QTYPE_NVFP4 ||
+                 w.ssm_beta_type == kernels::SI_QTYPE_NVFP4)) quant_nv_rows(xn, H);
             const bool fork_gdn = fork_shared && q81_src == xn && q81_k == H;
             cudaStream_t gst = fork_gdn ? s.stream_k : st;
             if (fork_gdn) {
@@ -2816,6 +2876,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         } else {
             // Same shape of win as the GDN block: wq is 2*qdim rows and saturates, while wk and wv
             // are kvdim rows apiece and run at well under one CTA per SM.
+            // Stage xn for dp4a BEFORE the fork, for the same reason the fork below is gated on
+            // q81 already holding xn: anything proj() issues lands AFTER the fork event, so a
+            // parallel stream reading it would race. With xn staged here, proj() hits the cache
+            // and issues nothing, and proj_on() finds it already there.
+            if (kernels::qwen38_nvfp4_dp4a_proj() &&
+                (w.wq_type == kernels::SI_QTYPE_NVFP4 ||
+                 w.wk_type == kernels::SI_QTYPE_NVFP4 ||
+                 w.wv_type == kernels::SI_QTYPE_NVFP4)) quant_nv_rows(xn, H);
             const bool fork_attn = fork_shared && q81_src == xn && q81_k == H;
             cudaStream_t ast = fork_attn ? s.stream_k : st;
             if (fork_attn) {
