@@ -208,11 +208,16 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
     __syncthreads();
     const float inv_rms = s_warp[0];
 
-    // Re-read the bf16-rounded residual sum (exactly as add_rmsnorm2_kernel does), so out_norm
-    // is bit-identical to the unfused path; then derive Q8_1 from the bf16-rounded out_norm.
+    // The bf16-rounded residual sum, exactly as add_rmsnorm2_kernel does -- but rounded in
+    // REGISTERS rather than read back out of out_sum. Every thread's store to out_sum[t] is its
+    // own, so the round trip only made each thread wait for its own store to become visible, and
+    // at grid = rows (three or four CTAs for a verify block) there is nothing else resident to
+    // hide that. Same values, so out_norm and the Q8_1 below are bit-identical either way.
     const uint4* w4 = reinterpret_cast<const uint4*>(weight);
-    const uint4* osum4r = reinterpret_cast<const uint4*>(out_sum + base);
-    float svb[8], wv[8]; rn_unpack8(__ldg(osum4r + t), svb); rn_unpack8(__ldg(w4 + t), wv);
+    float svb[8], wv[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) svb[j] = __bfloat162float(__float2bfloat16(sv[j]));
+    rn_unpack8(__ldg(w4 + t), wv);
     float ov[8], bv[8];
     #pragma unroll
     for (int j = 0; j < 8; j++) { ov[j] = svb[j] * inv_rms * wv[j]; bv[j] = __bfloat162float(__float2bfloat16(ov[j])); }

@@ -266,6 +266,40 @@ __global__ void pf_swiglu_kernel(const __nv_bfloat16* __restrict__ gate,
     h[i] = __float2bfloat16(pf_silu(pf_to_f(gate[i])) * pf_to_f(up[i]));
 }
 
+// SwiGLU that also emits the NVFP4 activation quantization the `down` projection is about to
+// want. The standalone quantizer is a 5-block kernel that does ~40 KB of work and still costs
+// ~1.5 us as its own graph node -- the verify issues 256 of them per step, 0.39 ms, and at that
+// size the node is nearly all ramp. Folding it into the producer costs one 16-lane shuffle.
+//
+// Bit-identical to running si_nvfp4_quant_x_kernel on `h` afterwards: it quantizes the SAME
+// bf16-rounded values, takes the max over the same 16, and uses the same scale expression. The
+// 16-element group is 16 consecutive threads and blockDim is a multiple of 16, so a group never
+// straddles a warp and the whole group is live or dead together.
+__global__ void pf_swiglu_nvfp4_kernel(const __nv_bfloat16* __restrict__ gate,
+                                       const __nv_bfloat16* __restrict__ up,
+                                       __nv_bfloat16* __restrict__ h,
+                                       signed char* __restrict__ xq, float* __restrict__ xs,
+                                       long n) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const bool live = i < n;
+    float f = 0.f;
+    if (live) {
+        const __nv_bfloat16 vb =
+            __float2bfloat16(pf_silu(pf_to_f(gate[i])) * pf_to_f(up[i]));
+        h[i] = vb;
+        f = __bfloat162float(vb);
+    }
+    float amax = fabsf(f);
+    #pragma unroll
+    for (int m = 1; m < 16; m <<= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+    if (live) {
+        const float inv = amax > 0.f ? 127.f / amax : 0.f;
+        xq[i] = (signed char)__float2int_rn(f * inv);
+        if ((threadIdx.x & 15) == 0) xs[i >> 4] = amax * (1.f / 127.f);
+    }
+}
+
 __global__ void pf_add_kernel(const __nv_bfloat16* __restrict__ a,
                               const __nv_bfloat16* __restrict__ b,
                               __nv_bfloat16* __restrict__ out, long n) {
@@ -1209,6 +1243,18 @@ void launch_prefill_swiglu(const void* gate, const void* up, void* h, long n, cu
     pf_swiglu_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(gate), reinterpret_cast<const __nv_bfloat16*>(up),
         reinterpret_cast<__nv_bfloat16*>(h), n);
+}
+
+// n must be a multiple of 16 (it is N * ffn, and ffn is a multiple of 16 on every checkpoint that
+// reaches the NVFP4 arm); anything else falls back to the caller's separate quantize.
+bool launch_prefill_swiglu_nvfp4(const void* gate, const void* up, void* h,
+                                 void* xq, void* xs, long n, cudaStream_t stream) {
+    if (!xq || !xs || (n & 15)) return false;
+    pf_swiglu_nvfp4_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(gate), reinterpret_cast<const __nv_bfloat16*>(up),
+        reinterpret_cast<__nv_bfloat16*>(h), reinterpret_cast<signed char*>(xq),
+        reinterpret_cast<float*>(xs), n);
+    return true;
 }
 
 void launch_prefill_add(const void* a, const void* b, void* out, long n, cudaStream_t stream) {

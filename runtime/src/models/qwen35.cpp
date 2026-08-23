@@ -1840,12 +1840,21 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 // dp4a against a verify on the float path would disagree and report LOSSLESS=0.
                 if (kernels::qwen38_nvfp4_dp4a()) {
                     kernels::launch_gemv_nvfp4_quant_x(s.hn, s.nv_xq, s.nv_xs, 1, H, st);
+                    // One grid for gate and up (see launch_gemv_nvfp4_rows_dp4a2): same shape,
+                    // same activation, and per-row bit-identical to the two singles below.
+                    if (!kernels::launch_gemv_nvfp4_rows_dp4a2(s.nv_xq, s.nv_xs, w.gate_nv,
+                                                               w.up_nv, s.nv_gate, s.nv_up,
+                                                               1, c.moe_ffn, H, st)) {
                     kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.gate_nv, s.nv_gate,
                                                          1, c.moe_ffn, H, st);
                     kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.up_nv, s.nv_up,
                                                          1, c.moe_ffn, H, st);
+                    }
+                    if (!kernels::launch_prefill_swiglu_nvfp4(s.nv_gate, s.nv_up, s.nv_h,
+                                                             s.nv_xq, s.nv_xs, c.moe_ffn, st)) {
                     kernels::launch_prefill_swiglu(s.nv_gate, s.nv_up, s.nv_h, c.moe_ffn, st);
                     kernels::launch_gemv_nvfp4_quant_x(s.nv_h, s.nv_xq, s.nv_xs, 1, c.moe_ffn, st);
+                    }
                     kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.down_nv, s.routed,
                                                          1, H, c.moe_ffn, st);
                 } else {
@@ -3446,6 +3455,76 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     double ls_n = 0, ls_r = 0, ls_rr = 0, ls_y = 0, ls_ry = 0;   // least-squares accumulators
     double fit_c0 = 0, fit_c1 = 0;
     bool fit_ok = false;
+    // Running mean of the DRAFT block's wall cost, for the rate above. forward_block ends with a
+    // device-to-host read of its proposals, so it is already synchronous and steady_clock brackets
+    // it exactly; no extra synchronize is added for this.
+    double ls_d_sum = 0, fit_d = 0;
+    long ls_d_n = 0;
+    // Per-WIDTH measured cost, which the affine fit above cannot express. The verify's cost is not
+    // affine in the row count: the row-batched NVFP4 GEMV picks its output-rows-per-warp from the
+    // row count, so widths that share a kernel configuration share a slope and the curve has a
+    // knee. A least-squares line through such a curve mis-prices BOTH ends -- it reads a higher
+    // intercept and a shallower slope than either segment has -- and the plan drifts toward the
+    // wide end on cost it is not actually paying. Measured at ctx=4k: the fit reported
+    // C0=10.31 c1=1.02 where the true costs are 12.34 ms at 2 rows and 14.39 at 4, i.e. the line
+    // over-prices 2 rows by 0.3 ms and under-prices 4 by 0.5.
+    //
+    // Every width the planner can select already has its own warmed graph tier
+    // (dflash_warm_verify above), so a width costs exactly one number and that number can simply
+    // be measured. Walk the widths once at the start of decode, then keep a running mean of each.
+    // The affine fit stays as the estimate for any width that has not been sampled yet.
+    static const int kPlanMaxW = 17;                      // kProposalDepth <= 15, so width <= 16
+    double w_sum[kPlanMaxW] = {0};
+    long   w_n[kPlanMaxW] = {0};
+    // Bootstrap cursor: the first sample of the run is discarded (it carries whatever warm-up the
+    // first batched call still has), then widths are walked from the widest down to 1.
+    int boot_w = kProposalDepth + 1;
+    bool boot_first = true;
+    // The run's own achieved rate, tokens per millisecond of WHOLE step (draft included). The plan
+    // maximises worth(d) - rate * cost(d+1) rather than the ratio worth(d)/cost(d+1): the ratio
+    // rule maximises tokens per VERIFY millisecond, and the step also pays a draft whose size does
+    // not depend on d, so the ratio rule is optimising the wrong denominator. The exchange rate
+    // between a token and a millisecond is exactly the throughput the run is already achieving,
+    // and that is a number this loop can measure instead of assume.
+    double plan_tok = 0, plan_ms = 0;
+    // Online calibration of the confidence head, per proposal position.
+    //
+    // The head is an accept-rate predictor, so sigmoid(logit) is read as P(this position is
+    // accepted) and the survival of a d-row plan as the product over positions. Both halves of
+    // that are wrong in the same direction, and measurably so. Instrumented at ctx=4k with the
+    // plan pinned to full depth (so `accept` is uncensored), 71 steps:
+    //
+    //   position   P(accept | prefix accepted)   mean sigmoid(logit)   ratio
+    //     1              0.4789                       0.4211           1.14
+    //     2              0.4706                       0.3496           1.35
+    //     3              0.5625                       0.3282           1.71
+    //
+    // The head is under-confident everywhere, and it gets worse with depth because conditioning on
+    // "the prefix was accepted" selects the steps the draft is tracking well -- a correlation the
+    // per-position logits cannot express. Multiplying raw sigmoids therefore under-states the
+    // survival of the DEEP rows most: predicted mean S_3 is 0.044 against an observed 0.127, a
+    // factor of 2.9. The plan reads that as "row 3 will almost never land" and stops short.
+    //
+    // So each position carries a scale fitted from the run's own accepts: the ratio of how often
+    // that position actually landed to what the head said, over the steps where the prefix landed
+    // AND the verify was wide enough to check it (otherwise `accept` is censored and the sample is
+    // not a miss, it is a non-observation). kPlanCalPrior shrinks it toward 1 while the counts are
+    // small, and it is clamped so a short unlucky run cannot invert the signal.
+    //
+    // This can only ever make the plan WIDER: every measured ratio is above 1, and the clamp's
+    // floor is 1. It is the same correction the tau-floor gate exists to protect -- more rows
+    // verified at the same draft, not fewer.
+    static const bool kPlanCal = []{ const char* e = getenv("SPARKINFER_DSPARK_PLAN_CAL");
+                                     return !(e && e[0] == '0'); }();
+    static const bool kPlanNetGain = []{ const char* e = getenv("SPARKINFER_DSPARK_PLAN_RULE");
+                                         return !(e && e[0] == '0'); }();
+    static const double kPlanCalPrior = []{ const char* e = getenv("SPARKINFER_DSPARK_CAL_PRIOR");
+                                            double v = e ? atof(e) : 3.0;
+                                            return v > 0 ? v : 3.0; }();
+    static const double kPlanCalMax = []{ const char* e = getenv("SPARKINFER_DSPARK_CAL_MAX");
+                                          double v = e ? atof(e) : 3.0;
+                                          return v >= 1.0 ? v : 3.0; }();
+    double cal_hit[kPlanMaxW] = {0}, cal_pred[kPlanMaxW] = {0};
     long plan_rows_sum = 0, plan_steps = 0;
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
@@ -3558,6 +3637,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         const bool draft_ok = draft_idle ? true : draft.forward_block(
             draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth,
             draft_confidence.data());
+        if (!draft_idle) {
+            ls_d_sum += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - _td).count();
+            ls_d_n++;
+            fit_d = ls_d_sum / (double)ls_d_n;
+        }
         if (kTiming && !draft_idle) { t_draft_ms += ms_since(_td); n_draft++; }
         if (getenv("SPARKINFER_DFLASH_CONFIDENCE_DEBUG")) {
             fprintf(stderr, "[confidence-debug] start=%d confidence=[", start);
@@ -3587,23 +3672,44 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             int vn = kProposalDepth + 1;
             const bool have_conf = kPlanOn && !draft_idle &&
                                    !std::isnan(draft_confidence[kProposalDepth > 0 ? 1 : 0]);
-            if (have_conf && fit_ok) {
-                double surv = 1.0, worth = 1.0, best = -1.0;
+            // Cost of verifying w rows: the width's own measured mean once it has one, else the
+            // affine fit, which is all a not-yet-sampled width has to go on.
+            auto plan_cost = [&](int w) -> double {
+                if (w >= 1 && w < kPlanMaxW && w_n[w] > 0) return w_sum[w] / (double)w_n[w];
+                return fit_c0 + fit_c1 * (double)w;
+            };
+            if (have_conf && boot_w >= 1) {
+                // Walk every width once so the table starts complete. Each of these steps still
+                // verifies and still emits, so the only cost is planning off the head rather than
+                // off measurement for kProposalDepth+1 steps of a ~78-step generation.
+                vn = boot_w;
+            } else if (have_conf) {
+                const double rate = (plan_ms > 0) ? plan_tok / plan_ms : 0.0;
+                double surv = 1.0, worth = 1.0, best = -1e30;
                 int best_d = kProposalDepth;
                 for (int d = 0; d <= kProposalDepth; d++) {
                     if (d > 0) {
-                        surv *= 1.0 / (1.0 + std::exp(-(double)draft_confidence[d]));
+                        double p = 1.0 / (1.0 + std::exp(-(double)draft_confidence[d]));
+                        if (kPlanCal && d < kPlanMaxW) {
+                            double k = (cal_hit[d] + kPlanCalPrior) /
+                                       (cal_pred[d] + kPlanCalPrior);
+                            if (k < 1.0) k = 1.0;
+                            if (k > kPlanCalMax) k = kPlanCalMax;
+                            p *= k;
+                            if (p > 1.0) p = 1.0;
+                        }
+                        surv *= p;
                         worth += surv;
                     }
-                    const double v = worth / (fit_c0 + fit_c1 * (d + 1));
+                    // Net gain in tokens after paying for the rows at the run's own exchange rate.
+                    // Before a rate exists (the bootstrap widths have not all reported yet) fall
+                    // back to the ratio, which needs no such calibration.
+                    const double v = (rate > 0 && kPlanNetGain)
+                                         ? worth - rate * plan_cost(d + 1)
+                                         : worth / plan_cost(d + 1);
                     if (v > best) { best = v; best_d = d; }
                 }
                 vn = best_d + 1;
-            } else if (have_conf) {
-                // Two-point bootstrap: the cost model needs two distinct row counts before it can
-                // be fitted, and one full-depth step plus one minimal step gives them. Two steps
-                // of a 70-step generation, and the minimal one still emits a verified token.
-                vn = (ls_n < 1) ? kProposalDepth + 1 : 2;
             }
             auto _tb = std::chrono::steady_clock::now();
             vfail = !batched_forward(block.data(), vn, start, false, posterior.data(), s.dflash_hidden);
@@ -3613,6 +3719,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             if (!vfail) {
                 // Feed the sample back into the cost model. Only clean samples: a failed verify
                 // has no meaningful duration.
+                if (boot_first) {
+                    boot_first = false;          // discard: first call of the run
+                } else {
+                    if (vn >= 1 && vn < kPlanMaxW) { w_sum[vn] += vms; w_n[vn] += 1; }
+                    if (boot_w >= 1) --boot_w;   // next width, then leave bootstrap at 0
+                }
                 ls_n += 1; ls_r += vn; ls_rr += (double)vn * vn;
                 ls_y += vms; ls_ry += vn * vms;
                 const double det = ls_n * ls_rr - ls_r * ls_r;
@@ -3626,6 +3738,21 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 plan_rows_sum += vn; plan_steps++;
                 while (accept < vn - 1 && block[accept + 1] == posterior[accept]) ++accept;
                 keep = accept + 1;
+                // Feed the achieved rate. The draft is part of the step it paid for, so it is in
+                // the denominator here even though it is not in plan_cost().
+                plan_tok += (double)keep;
+                plan_ms  += vms + fit_d;
+                // Calibration counters. Position i is only OBSERVED when the prefix accepted and
+                // the plan was wide enough to check it; beyond that `accept` is censored by the
+                // plan, not by the draft, and counting it as a miss would teach the plan to keep
+                // narrowing itself.
+                if (kPlanCal && have_conf) {
+                    for (int i = 1; i <= kProposalDepth && i <= vn - 1 && i < kPlanMaxW; i++) {
+                        if (accept < i - 1) break;
+                        cal_pred[i] += 1.0 / (1.0 + std::exp(-(double)draft_confidence[i]));
+                        if (accept >= i) cal_hit[i] += 1.0;
+                    }
+                }
             }
             plan_vn = vn;
         } else {

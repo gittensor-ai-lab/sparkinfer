@@ -86,8 +86,13 @@ __global__ void k_add_rms(const bf16* a, const bf16* b, bf16* sum, const bf16* w
     float ss = 0.f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         const float v = b2f(ar[i]) + b2f(br[i]);
-        sr[i] = f2b(v);
-        const float vq = b2f(sr[i]);          // round-trip through bf16, as launch_add then rms does
+        const bf16 vb = f2b(v);
+        sr[i] = vb;
+        // Same bf16 round-trip the unfused launch_add-then-rms does -- but taken from the value
+        // just computed instead of read back out of global. Reading sr[i] here made every thread
+        // wait on its own store to land, which at grid = rows (four CTAs for a four-row block) is
+        // the whole kernel: it measured 12.3 us for 40 KB of work.
+        const float vq = b2f(vb);
         ss += vq * vq;
     }
 #pragma unroll
@@ -1217,7 +1222,10 @@ void launch_rms(const void* x, const void* w, void* out, int rows, int cols, flo
 void launch_add_rms(const void* a, const void* b, void* sum, const void* w, void* out,
                     int rows, int cols, float eps, cudaStream_t stream) {
     if (rows <= 0 || cols <= 0) return;
-    k_add_rms<<<rows, 256, 0, stream>>>((const bf16*)a, (const bf16*)b, (bf16*)sum,
+    // One CTA per row and only 256 threads left a 5120-wide row at 20 elements per thread with
+    // four CTAs resident on a 170-SM device. Widen the CTA instead: same reduction (warp sums
+    // folded in ascending warp order through ws[]), four times the memory-level parallelism.
+    k_add_rms<<<rows, 1024, 0, stream>>>((const bf16*)a, (const bf16*)b, (bf16*)sum,
                                         (const bf16*)w, (bf16*)out, rows, cols, eps);
 }
 

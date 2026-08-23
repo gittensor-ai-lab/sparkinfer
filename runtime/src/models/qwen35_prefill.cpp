@@ -3059,14 +3059,22 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 signed char* xq = nv_xq;
                 float* xs = nv_xs;
                 kernels::launch_gemv_nvfp4_quant_x(hn, xq, xs, N, H, st);
-                if (!kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.gate_nv, sg, N, ffn, H, st) ||
-                    !kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.up_nv, su, N, ffn, H, st)) {
+                // gate and up are the same shape over the same activation, so one grid can carry
+                // both: half the launches, and one partial last wave instead of two. Falls back to
+                // the pair of singles for any shape the paired launcher declines.
+                if (!kernels::launch_gemv_nvfp4_rows_dp4a2(xq, xs, w.gate_nv, w.up_nv, sg, su,
+                                                           N, ffn, H, st) &&
+                    (!kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.gate_nv, sg, N, ffn, H, st) ||
+                     !kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.up_nv, su, N, ffn, H, st))) {
                     fprintf(stderr, "[dflash-verify] NVFP4 dp4a gate/up declined N=%d ffn=%d H=%d\n",
                             N, ffn, H);
                     supported = false; break;
                 }
-                kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
-                kernels::launch_gemv_nvfp4_quant_x(sh, xq, xs, N, ffn, st);
+                if (!kernels::launch_prefill_swiglu_nvfp4(sg, su, sh, xq, xs,
+                                                         (long)N * ffn, st)) {
+                    kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
+                    kernels::launch_gemv_nvfp4_quant_x(sh, xq, xs, N, ffn, st);
+                }
                 if (!kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.down_nv, routed, N, H, ffn, st)) {
                     fprintf(stderr, "[dflash-verify] NVFP4 dp4a down declined N=%d H=%d ffn=%d\n",
                             N, H, ffn);

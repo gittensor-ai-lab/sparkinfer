@@ -1032,7 +1032,75 @@ __global__ void gemv_nvfp4_rows_dp4a_kernel(const signed char* __restrict__ xq,
         const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
         const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
         const int ng = K >> 4;
-        for (int g = split * 32 + lane; g < ng; g += S * 32) {
+        const int gstride = S * 32;
+        int g = split * 32 + lane;
+        // GPT of this lane's OWN groups per trip. The lane keeps exactly the group sequence it had
+        // -- g, g+stride, g+2*stride, ... -- and accumulates them in that order, so every
+        // (output row, activation row) dot is the same sum of the same terms in the same order.
+        // What changes is how many of those groups' loads are in flight together, which is what
+        // the kernel is short of: at one group per trip a lane issues 2R+2 loads and then waits on
+        // all of them before the next trip can start.
+        //
+        // Measured on the isolated kernel with a DRAM-RESIDENT weight (24 rotating copies, so the
+        // 50 MB matrix cannot sit in L2 and the number is HBM, not cache), microseconds at NR=2,
+        // 1 group -> 2 -> 4 per trip:
+        //   ffn gate/up N=17408 K=5120  S=2  38.13 -> 36.69 -> 34.76
+        //   ffn down    N=5120  K=17408 S=4  38.77 -> 37.67 -> 34.33
+        //   gdn qkv     N=10240 K=5120  S=2  22.98 -> 21.88 -> 20.80
+        // FOUR DOES NOT TRANSFER, and that is worth recording: in the isolated kernel the
+        // activation block is the same array on every launch and stays in L1, while in the verify
+        // each projection's activation was written by the kernel before it and is cold. End to end
+        // the 4-wide trip measured 14.317 ms per 4-row verify against 14.045 for the 2-wide, so
+        // two is what ships. R=1 also stays on the plain single-group loop -- a trip there is
+        // already small enough that a second group only costs occupancy (32.58 -> 34.44), and it
+        // leaves AR decode byte-for-byte unchanged.
+        constexpr int GPT = (R >= 2) ? 2 : 1;
+        if (GPT > 1) {
+            for (; g + (GPT - 1) * gstride < ng; g += GPT * gstride) {
+                uint4 xg[GPT][R];
+                float sg[GPT][R];
+                #pragma unroll
+                for (int u = 0; u < GPT; u++) {
+                    const int gu = g + u * gstride;
+                    #pragma unroll
+                    for (int r = 0; r < R; r++) {
+                        xg[u][r] = *reinterpret_cast<const uint4*>(xq + (size_t)r * K + (size_t)gu * 16);
+                        sg[u][r] = xs[(size_t)r * ng + gu];
+                    }
+                }
+                #pragma unroll
+                for (int j = 0; j < NR; j++) {
+                    const int nj = n0 + j;
+                    if (NR > 1 && nj >= N) break;
+                    const unsigned char* srow = sf + (size_t)nj * (size_t)(K >> 4);
+                    const unsigned char* prow = w + (size_t)nj * (size_t)(K >> 1);
+                    uint2 pw[GPT];
+                    float sw[GPT];
+                    #pragma unroll
+                    for (int u = 0; u < GPT; u++) {
+                        const int gu = g + u * gstride;
+                        pw[u] = __ldcs(reinterpret_cast<const uint2*>(prow + (size_t)gu * 8));
+                        sw[u] = si_ue4m3(__ldcs(srow + gu)) * inv_g * 0.5f;
+                    }
+                    #pragma unroll
+                    for (int u = 0; u < GPT; u++) {
+                        unsigned q0, q1, q2, q3;
+                        si_nvfp4_i8x8(pw[u].x, q0, q1);
+                        si_nvfp4_i8x8(pw[u].y, q2, q3);
+                        #pragma unroll
+                        for (int r = 0; r < R; r++) {
+                            int iacc = 0;
+                            iacc = __dp4a((int)q0, (int)xg[u][r].x, iacc);
+                            iacc = __dp4a((int)q1, (int)xg[u][r].y, iacc);
+                            iacc = __dp4a((int)q2, (int)xg[u][r].z, iacc);
+                            iacc = __dp4a((int)q3, (int)xg[u][r].w, iacc);
+                            acc[j][r] += (sw[u] * sg[u][r]) * (float)iacc;
+                        }
+                    }
+                }
+            }
+        }
+        for (; g < ng; g += gstride) {
             uint4 xv[R];
             float sx[R];
             #pragma unroll
@@ -1788,70 +1856,98 @@ template __global__ void si_mmvq_q4k_kfixed_kernel<float, 20>(const si_block_q8_
 // OROWS weight rows per CTA. The thread -> (superblock, sub-block) mapping, the two-stage
 // four-warp reduction and each row's accumulation order are untouched; owning more than one
 // weight row only lets the CTA share the activation loads and the activation-only dp4a term.
-template <typename OutT, int NSUPER, int MMAX, int OROWS>
+// GRP independent NW=4 groups per CTA. Each group keeps EXACTLY the mapping and the two-stage
+// four-warp reduction the one-group kernel has -- same thread -> (super-block, sub-block) map,
+// same smem fold, same shuffle order -- so every output row is bit-identical to what AR's
+// si_mmvq_q4k_kfixed_kernel produces for it. Only how many groups share a CTA changes.
+//
+// Why it matters: this kernel's runtime is not its 715 MB of weights, it is the ACTIVATION. Each
+// CTA reads M x NSUPER x 8 q8_1 blocks -- 23 KB at four verify rows -- and at one group per CTA
+// there are 124160 CTAs for a 248320-row head, so the same 23 KB is pulled 124160 times: 2.9 GB
+// against 0.7 GB of weights. Groups inside a CTA read the same activation, so GRP of them share
+// one pull. Measured end to end at ctx=4k: the head is 0.771 ms/step at GRP=1 against a draft-side
+// multi-row head that moves the same bytes in 0.578, and that gap is what this closes.
+template <typename OutT, int NSUPER, int MMAX, int OROWS, int GRP>
 __global__ void si_mmvq_q4k_rows_exact_kernel(const si_block_q8_1* __restrict__ q,
                                               const unsigned char* __restrict__ W,
                                               OutT* __restrict__ y, int M, int N) {
     constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
     constexpr int QPR = NSUPER * 8;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
-    const int row0 = blockIdx.x * OROWS;
-    if (row0 >= N) return;
-    const int orows = (N - row0 < OROWS) ? (N - row0) : OROWS;
-    const si_block_q4_K* x_row = reinterpret_cast<const si_block_q4_K*>(
-        W + (size_t)row0 * NSUPER * 144);
-    constexpr int blocks_per_iter = vdr * NW * WS / qi;
-    float tmp[OROWS][MMAX];
-    #pragma unroll
-    for (int o = 0; o < OROWS; o++)
-        #pragma unroll
-        for (int m = 0; m < MMAX; m++) tmp[o][m] = 0.f;
-    #pragma unroll
-    for (int kbx = tid / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
-        const int kqs = vdr * (tid % (qi / vdr));
-        si_vec_dot_q4_K_tiled<OROWS, MMAX>(x_row + kbx, (size_t)NSUPER, orows,
-                                           q + kbx * 8, kqs, QPR, M, tmp);
-    }
-    __shared__ float partial[OROWS][MMAX][NW - 1][WS];
-    if (warp > 0) {
+    const int grp = threadIdx.x / (NW * WS);
+    const int tid = threadIdx.x - grp * (NW * WS);      // thread id WITHIN the group
+    const int lane = tid & 31, warp = tid >> 5;
+    const int row0 = (blockIdx.x * GRP + grp) * OROWS;
+    __shared__ float partial[GRP][OROWS][MMAX][NW - 1][WS];
+    if (row0 < N) {
+        const int orows = (N - row0 < OROWS) ? (N - row0) : OROWS;
+        const si_block_q4_K* x_row = reinterpret_cast<const si_block_q4_K*>(
+            W + (size_t)row0 * NSUPER * 144);
+        constexpr int blocks_per_iter = vdr * NW * WS / qi;
+        float tmp[OROWS][MMAX];
         #pragma unroll
         for (int o = 0; o < OROWS; o++)
             #pragma unroll
-            for (int m = 0; m < MMAX; m++)
-                if (o < orows && m < M) partial[o][m][warp - 1][lane] = tmp[o][m];
-    }
-    __syncthreads();
-    if (warp > 0) return;
-    #pragma unroll
-    for (int o = 0; o < OROWS; o++) {
-        if (o >= orows) break;
+            for (int m = 0; m < MMAX; m++) tmp[o][m] = 0.f;
         #pragma unroll
-        for (int m = 0; m < MMAX; m++) {
-            if (m >= M) break;
-            #pragma unroll
-            for (int l = 0; l < NW - 1; l++) tmp[o][m] += partial[o][m][l][lane];
-            #pragma unroll
-            for (int s = 16; s > 0; s >>= 1) tmp[o][m] += __shfl_xor_sync(0xffffffff, tmp[o][m], s);
-            if (lane == 0) gemv_write(y + (size_t)m * N + row0 + o, tmp[o][m]);
+        for (int kbx = tid / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
+            const int kqs = vdr * (tid % (qi / vdr));
+            si_vec_dot_q4_K_tiled<OROWS, MMAX>(x_row + kbx, (size_t)NSUPER, orows,
+                                               q + kbx * 8, kqs, QPR, M, tmp);
         }
+        if (warp > 0) {
+            #pragma unroll
+            for (int o = 0; o < OROWS; o++)
+                #pragma unroll
+                for (int m = 0; m < MMAX; m++)
+                    if (o < orows && m < M) partial[grp][o][m][warp - 1][lane] = tmp[o][m];
+        }
+        __syncthreads();
+        if (warp == 0) {
+            #pragma unroll
+            for (int o = 0; o < OROWS; o++) {
+                if (o >= orows) break;
+                #pragma unroll
+                for (int m = 0; m < MMAX; m++) {
+                    if (m >= M) break;
+                    #pragma unroll
+                    for (int l = 0; l < NW - 1; l++) tmp[o][m] += partial[grp][o][m][l][lane];
+                    #pragma unroll
+                    for (int s = 16; s > 0; s >>= 1)
+                        tmp[o][m] += __shfl_xor_sync(0xffffffff, tmp[o][m], s);
+                    if (lane == 0) gemv_write(y + (size_t)m * N + row0 + o, tmp[o][m]);
+                }
+            }
+        }
+    } else {
+        __syncthreads();   // every thread of the CTA must reach the same barrier
     }
 }
 #ifndef _MSC_VER
-template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 8, SI_Q4K_OROWS>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 8, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 8, SI_Q4K_OROWS>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 8, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 8, SI_Q4K_OROWS>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 8, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 8, SI_Q4K_OROWS>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 8, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 6, SI_Q4K_OROWS>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 6, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 6, SI_Q4K_OROWS>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 6, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 6, SI_Q4K_OROWS>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 6, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
-template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 6, SI_Q4K_OROWS>(
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 6, SI_Q4K_OROWS, 1>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+// Qwen3.8's LM head: K=5120 -> 20 super-blocks. MMAX is the compile-time bound on the activation
+// rows, and it sizes BOTH the per-thread accumulator array and the smem reduction buffer, so
+// rounding a 4-row verify up to the 6-wide instantiation carries 33% more of each for nothing.
+// OROWS is the weight rows a CTA owns, which is what amortises the activation re-read.
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 20, 4, 2, 1>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 20, 4, 4, 1>(
+    const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 20, 6, 4, 1>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
 #endif
 // One block per row index: warps 0-3 -> qkv[row], warps 4-7 -> z[row], keeping vy hot
@@ -2768,6 +2864,218 @@ void launch_gemv_nvfp4_quant_x(const void* x, void* xq, void* xs, int M, int K,
         reinterpret_cast<float*>(xs), ngroups);
 }
 
+// Two independent NVFP4 matrices of the SAME width and K, driven from one grid. The FFN's gate
+// and up projections are exactly that pair: same activation, same [17408, 5120] shape, issued back
+// to back. As two launches each grid is 2176 CTAs against a machine that holds ~680 resident, so
+// each pays its own partial last wave and its own ramp; one launch of 4352 amortises both over
+// twice the work. It also removes one graph node per layer, and the verify graph is ~1100 nodes
+// deep against 15 ms of kernel time.
+//
+// Bit-identical: a CTA still owns RPB*NR consecutive output rows of ONE matrix (N0 is a multiple
+// of RPB*NR for every shape this is used on, so no CTA straddles the boundary), walks the same
+// groups in the same order, and folds the same S partials. Only which launch carries it changes.
+template <typename OutT, int S, int R, int NR>
+__global__ void gemv_nvfp4_rows_dp4a2_kernel(const signed char* __restrict__ xq,
+                                             const float* __restrict__ xs,
+                                             const void* __restrict__ packed0,
+                                             const void* __restrict__ packed1,
+                                             OutT* __restrict__ y0, OutT* __restrict__ y1,
+                                             int N, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float s_part[RPB][S][NR][R];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int blk_rows = RPB * NR;
+    const int nblk = (N + blk_rows - 1) / blk_rows;
+    const bool second = blockIdx.x >= nblk;
+    const void* __restrict__ packed = second ? packed1 : packed0;
+    OutT* __restrict__ y = second ? y1 : y0;
+    const int n0 = (blockIdx.x - (second ? nblk : 0)) * blk_rows + row_local * NR;
+    float acc[NR][R];
+    #pragma unroll
+    for (int j = 0; j < NR; j++)
+        #pragma unroll
+        for (int r = 0; r < R; r++) acc[j][r] = 0.f;
+    if (n0 < N) {
+        const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
+        const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
+        const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
+        const int ng = K >> 4;
+        const int gstride = S * 32;
+        int g = split * 32 + lane;
+        // GPT of this lane's OWN groups per trip. The lane keeps exactly the group sequence it had
+        // -- g, g+stride, g+2*stride, ... -- and accumulates them in that order, so every
+        // (output row, activation row) dot is the same sum of the same terms in the same order.
+        // What changes is how many of those groups' loads are in flight together, which is what
+        // the kernel is short of: at one group per trip a lane issues 2R+2 loads and then waits on
+        // all of them before the next trip can start.
+        //
+        // Measured on the isolated kernel with a DRAM-RESIDENT weight (24 rotating copies, so the
+        // 50 MB matrix cannot sit in L2 and the number is HBM, not cache), microseconds at NR=2,
+        // 1 group -> 2 -> 4 per trip:
+        //   ffn gate/up N=17408 K=5120  S=2  38.13 -> 36.69 -> 34.76
+        //   ffn down    N=5120  K=17408 S=4  38.77 -> 37.67 -> 34.33
+        //   gdn qkv     N=10240 K=5120  S=2  22.98 -> 21.88 -> 20.80
+        // FOUR DOES NOT TRANSFER, and that is worth recording: in the isolated kernel the
+        // activation block is the same array on every launch and stays in L1, while in the verify
+        // each projection's activation was written by the kernel before it and is cold. End to end
+        // the 4-wide trip measured 14.317 ms per 4-row verify against 14.045 for the 2-wide, so
+        // two is what ships. R=1 also stays on the plain single-group loop -- a trip there is
+        // already small enough that a second group only costs occupancy (32.58 -> 34.44), and it
+        // leaves AR decode byte-for-byte unchanged.
+        constexpr int GPT = (R >= 2) ? 2 : 1;
+        if (GPT > 1) {
+            for (; g + (GPT - 1) * gstride < ng; g += GPT * gstride) {
+                uint4 xg[GPT][R];
+                float sg[GPT][R];
+                #pragma unroll
+                for (int u = 0; u < GPT; u++) {
+                    const int gu = g + u * gstride;
+                    #pragma unroll
+                    for (int r = 0; r < R; r++) {
+                        xg[u][r] = *reinterpret_cast<const uint4*>(xq + (size_t)r * K + (size_t)gu * 16);
+                        sg[u][r] = xs[(size_t)r * ng + gu];
+                    }
+                }
+                #pragma unroll
+                for (int j = 0; j < NR; j++) {
+                    const int nj = n0 + j;
+                    if (NR > 1 && nj >= N) break;
+                    const unsigned char* srow = sf + (size_t)nj * (size_t)(K >> 4);
+                    const unsigned char* prow = w + (size_t)nj * (size_t)(K >> 1);
+                    uint2 pw[GPT];
+                    float sw[GPT];
+                    #pragma unroll
+                    for (int u = 0; u < GPT; u++) {
+                        const int gu = g + u * gstride;
+                        pw[u] = __ldcs(reinterpret_cast<const uint2*>(prow + (size_t)gu * 8));
+                        sw[u] = si_ue4m3(__ldcs(srow + gu)) * inv_g * 0.5f;
+                    }
+                    #pragma unroll
+                    for (int u = 0; u < GPT; u++) {
+                        unsigned q0, q1, q2, q3;
+                        si_nvfp4_i8x8(pw[u].x, q0, q1);
+                        si_nvfp4_i8x8(pw[u].y, q2, q3);
+                        #pragma unroll
+                        for (int r = 0; r < R; r++) {
+                            int iacc = 0;
+                            iacc = __dp4a((int)q0, (int)xg[u][r].x, iacc);
+                            iacc = __dp4a((int)q1, (int)xg[u][r].y, iacc);
+                            iacc = __dp4a((int)q2, (int)xg[u][r].z, iacc);
+                            iacc = __dp4a((int)q3, (int)xg[u][r].w, iacc);
+                            acc[j][r] += (sw[u] * sg[u][r]) * (float)iacc;
+                        }
+                    }
+                }
+            }
+        }
+        for (; g < ng; g += gstride) {
+            uint4 xv[R];
+            float sx[R];
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                xv[r] = *reinterpret_cast<const uint4*>(xq + (size_t)r * K + (size_t)g * 16);
+                sx[r] = xs[(size_t)r * ng + g];
+            }
+            #pragma unroll
+            for (int j = 0; j < NR; j++) {
+                const int nj = n0 + j;
+                if (NR > 1 && nj >= N) break;
+                const unsigned char* srow = sf + (size_t)nj * (size_t)(K >> 4);
+                const unsigned char* prow = w + (size_t)nj * (size_t)(K >> 1);
+                const uint2 pw = __ldcs(reinterpret_cast<const uint2*>(prow + (size_t)g * 8));
+                unsigned q0, q1, q2, q3;
+                si_nvfp4_i8x8(pw.x, q0, q1);
+                si_nvfp4_i8x8(pw.y, q2, q3);
+                const float sw = si_ue4m3(__ldcs(srow + g)) * inv_g * 0.5f;
+                #pragma unroll
+                for (int r = 0; r < R; r++) {
+                    int iacc = 0;
+                    iacc = __dp4a((int)q0, (int)xv[r].x, iacc);
+                    iacc = __dp4a((int)q1, (int)xv[r].y, iacc);
+                    iacc = __dp4a((int)q2, (int)xv[r].z, iacc);
+                    iacc = __dp4a((int)q3, (int)xv[r].w, iacc);
+                    acc[j][r] += (sw * sx[r]) * (float)iacc;
+                }
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < NR; j++)
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                #pragma unroll
+                for (int m = 16; m > 0; m >>= 1)
+                    acc[j][r] += __shfl_xor_sync(0xffffffff, acc[j][r], m);
+            }
+        if (lane == 0) {
+            #pragma unroll
+            for (int j = 0; j < NR; j++)
+                #pragma unroll
+                for (int r = 0; r < R; r++) s_part[row_local][split][j][r] = acc[j][r];
+        }
+    }
+    __syncthreads();
+    if (n0 < N && split == 0 && lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < NR; j++) {
+            const int nj = n0 + j;
+            if (NR > 1 && nj >= N) break;
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                float o = s_part[row_local][0][j][r];
+                #pragma unroll
+                for (int t = 1; t < S; t++) o += s_part[row_local][t][j][r];
+                gemv_write(y + (size_t)r * N + nj, o);
+            }
+        }
+    }
+}
+
+// Paired form of launch_gemv_nvfp4_rows_dp4a: same activation, two same-shaped weight matrices.
+// Declines (returning false, so the caller issues the two singles) whenever a CTA could straddle
+// the matrix boundary, which is the only thing that would change a row's arithmetic.
+bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
+                                  const void* W0, const void* W1, void* y0, void* y1,
+                                  int M, int N, int K, cudaStream_t stream) {
+    if (!xq || !xs || !W0 || !W1 || !y0 || !y1 || N < 1 || K < 1 || (K & 15)) return false;
+    if (!gemv_bf16_splitk()) return false;
+    if (M < 1 || M > 8) return false;
+    static const int nr_mode = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
+                                   int v = e ? atoi(e) : 0; return (v == 1 || v == 2) ? v : 0; }();
+    static const bool pair_on = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_PAIR");
+                                    return !(e && e[0] == '0'); }();
+    if (!pair_on) return false;
+    const auto* xp = reinterpret_cast<const signed char*>(xq);
+    const auto* sp = reinterpret_cast<const float*>(xs);
+    auto* yp0 = reinterpret_cast<__nv_bfloat16*>(y0);
+    auto* yp1 = reinterpret_cast<__nv_bfloat16*>(y1);
+#define SI_NVFP4_DP4A2(S_, R_) do { \
+        constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
+        const int nr = nr_mode ? nr_mode : (R == 1 ? 1 : 2); \
+        const int blk = RPB * nr; \
+        if (N % blk) return false; \
+        const dim3 grid(2 * (N / blk)); \
+        if (nr == 1) \
+            gemv_nvfp4_rows_dp4a2_kernel<__nv_bfloat16, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W0, W1, yp0, yp1, N, K); \
+        else \
+            gemv_nvfp4_rows_dp4a2_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W0, W1, yp0, yp1, N, K); \
+    } while (0)
+#define SI_NVFP4_DP4A2_S(R_) do { \
+        if (N >= 8192)      SI_NVFP4_DP4A2(2, R_); \
+        else if (N >= 4096) SI_NVFP4_DP4A2(4, R_); \
+        else                SI_NVFP4_DP4A2(8, R_); \
+    } while (0)
+    switch (M) {
+        case 1: SI_NVFP4_DP4A2_S(1); break;  case 2: SI_NVFP4_DP4A2_S(2); break;
+        case 3: SI_NVFP4_DP4A2_S(3); break;  case 4: SI_NVFP4_DP4A2_S(4); break;
+        case 5: SI_NVFP4_DP4A2_S(5); break;  case 6: SI_NVFP4_DP4A2_S(6); break;
+        case 7: SI_NVFP4_DP4A2_S(7); break;  default: SI_NVFP4_DP4A2_S(8); break;
+    }
+#undef SI_NVFP4_DP4A2_S
+#undef SI_NVFP4_DP4A2
+    return true;
+}
+
 bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, void* y,
                                  int M, int N, int K, cudaStream_t stream) {
     if (!xq || !xs || !W || !y || N < 1 || K < 1 || (K & 15)) return false;
@@ -2778,24 +3086,26 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
     // Split-K chosen by N exactly as the float rows kernel does, so the two paths fan out over the
     // GPU identically and a comparison between them is a comparison of the arithmetic alone.
-    // Output rows per warp-group. ncu on this kernel says it is LATENCY bound, not compute bound
-    // -- across R = 1/2/4/8 the SM pipes sit at 28/32/31/20% of peak while warp occupancy falls
-    // 93/77/62/32% and DRAM follows it down 68/74/58/27% -- so what it wants is resident warps,
-    // and NR is what buys them: two output rows per warp-group keeps two sets of weight
-    // temporaries live across the unrolled j loop, which costs 24 registers at R=4 and 51 at R=8.
     //
-    // Measured on the isolated kernel with a DRAM-resident working set, microseconds at R=4:
-    //   ffn gate/up N=17408  40.8 -> 34.8      gdn wide N=12288  30.7 -> 26.6
-    //   attn q      N=6144   15.5 -> 13.8      ffn down N=5120   36.8 -> 36.8
-    // Neutral-or-better at every shape for R in [3, 7]; at R = 8 it inverts on the narrow shapes
-    // (ffn down 49.2 -> 59.4), and at R <= 2 there are already enough warps for the load, so the
-    // extra grid is not repaid. Hence the band rather than a blanket switch.
+    // NR is the output rows one warp-group owns. It is what decides how often the R x K activation
+    // block is re-read: this kernel computes y[r][n] = dot(x[r], W[n]), so x is re-read once per
+    // output row, and NR output rows per warp share one read. NR=1 doubles the grid instead.
+    //
+    // The split is by ROW COUNT and the two ends want opposite things, measured end to end at
+    // ctx=4k on the ModelOpt checkpoint (dspark_tau_check, one binary, SPARKINFER_NVFP4_ROWS_NR):
+    //   R = 1 (AR decode, one activation row): NR=1 -> AR 91.22 tok/s, NR=2 -> 86.73.
+    //     One activation row is 5 KB; it stays in L1 whatever NR does, so the re-read costs
+    //     nothing and only the extra grid is left, which is worth 5%.
+    //   R >= 2 (the batched verify): NR=2 -> 14.116 ms per 4-row verify, NR=1 -> 14.725.
+    //     Four rows plus their scales is 25 KB re-read by 4352 CTAs, and halving that is worth
+    //     4.1% even though it halves the grid.
     // 0 = pick by row count, 1 or 2 force.
     static const int nr_mode = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
-                                   int v = e ? atoi(e) : 0; return (v == 1 || v == 2) ? v : 0; }();
+                                   int v = e ? atoi(e) : 0;
+                                   return (v == 1 || v == 2) ? v : 0; }();
 #define SI_NVFP4_DP4A(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
-        const int nr = nr_mode ? nr_mode : ((R >= 3 && R <= 7) ? 1 : 2); \
+        const int nr = nr_mode ? nr_mode : (R == 1 ? 1 : 2); \
         if (nr == 1) { \
             const dim3 grid((N + RPB - 1) / RPB); \
             gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
@@ -3141,8 +3451,8 @@ bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
     const int grid = (N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS;
     #define SI_Q4K_ROWS_DISPATCH(KB) \
         do { \
-            if (M <= 6) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 6, SI_Q4K_OROWS><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
-            else        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 8, SI_Q4K_OROWS><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            if (M <= 6) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 6, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            else        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 8, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
         } while (0)
     if      (K == 2048) SI_Q4K_ROWS_DISPATCH(8);
     else if (K == 4096) SI_Q4K_ROWS_DISPATCH(16);
@@ -3204,10 +3514,26 @@ bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
     // AFTER every layer had already succeeded -- "unsupported LM head type=12 H=5120".
     if (qtype == 12 && (K == 2048 || K == 4096 || K == 5120 || K == 6144)) {
         const int grid = (N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS;
+        // The verify's LM head is the one call here that runs at a width the planner chooses, so it
+        // is the one that pays for a loose MMAX. SPARKINFER_Q4K_OROWS pins the weight-rows-per-CTA
+        // for an A/B out of one binary; 0 keeps the compiled default.
+        static const int orows_env = []{ const char* e = getenv("SPARKINFER_Q4K_OROWS");
+                                         int v = e ? atoi(e) : 0; return (v == 2 || v == 4) ? v : 0; }();
+        if (K == 5120 && M <= 4) {
+            const int orows = orows_env ? orows_env : 2;
+            const int g = (N + orows - 1) / orows;
+            if (orows == 4) si_mmvq_q4k_rows_exact_kernel<float, 20, 4, 4, 1><<<g, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            else            si_mmvq_q4k_rows_exact_kernel<float, 20, 4, 2, 1><<<g, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            return true;
+        }
+        if (K == 5120 && M <= 6 && orows_env == 4) {
+            si_mmvq_q4k_rows_exact_kernel<float, 20, 6, 4, 1><<<(N + 3) / 4, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            return true;
+        }
         #define SI_Q4K_ROWS_F32_DISPATCH(KB) \
             do { \
-                if (M <= 6) si_mmvq_q4k_rows_exact_kernel<float, KB, 6, SI_Q4K_OROWS><<<grid, 4 * 32, 0, stream>>>(q, w, y, M, N); \
-                else        si_mmvq_q4k_rows_exact_kernel<float, KB, 8, SI_Q4K_OROWS><<<grid, 4 * 32, 0, stream>>>(q, w, y, M, N); \
+                if (M <= 6) si_mmvq_q4k_rows_exact_kernel<float, KB, 6, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, y, M, N); \
+                else        si_mmvq_q4k_rows_exact_kernel<float, KB, 8, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, y, M, N); \
             } while (0)
         if      (K == 2048) SI_Q4K_ROWS_F32_DISPATCH(8);
         else if (K == 4096) SI_Q4K_ROWS_F32_DISPATCH(16);

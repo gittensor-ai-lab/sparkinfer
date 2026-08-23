@@ -29,6 +29,13 @@ void launch_prefill_gemm(const void* A, const void* W, void* C,
 void launch_prefill_swiglu(const void* gate, const void* up, void* h, long n,
                            cudaStream_t stream = nullptr);
 
+// SwiGLU that also writes the NVFP4 activation quantization of its own output (int8 quants plus
+// one fp32 scale per 16 values), so the down projection does not need a separate quantize node.
+// Bit-identical to launch_gemv_nvfp4_quant_x on the same output. False (and nothing written) for
+// a length that is not a multiple of 16.
+bool launch_prefill_swiglu_nvfp4(const void* gate, const void* up, void* h,
+                                 void* xq, void* xs, long n, cudaStream_t stream = nullptr);
+
 // Batched residual add: out[i] = a[i] + b[i] (out may alias a). bf16.
 void launch_prefill_add(const void* a, const void* b, void* out, long n,
                         cudaStream_t stream = nullptr);

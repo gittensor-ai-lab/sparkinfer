@@ -131,6 +131,12 @@ void launch_gemv_nvfp4_quant_x(const void* x, void* xq, void* xs, int M, int K,
                                cudaStream_t stream);
 bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, void* y,
                                  int M, int N, int K, cudaStream_t stream);
+// Paired form: one grid over two same-shaped NVFP4 matrices sharing one activation (the FFN's
+// gate/up pair). Returns false when the shape would let a CTA straddle the boundary; the caller
+// then issues the two single launches.
+bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
+                                  const void* W0, const void* W1, void* y0, void* y1,
+                                  int M, int N, int K, cudaStream_t stream);
 
 // Pre-quantized Q8_1 activation path: quantize x[K] ONCE (q8 int8 [K], ad/as [K/32]),
 // then run Q4_K dp4a GEMVs that read it — kills the per-block re-quantization that the

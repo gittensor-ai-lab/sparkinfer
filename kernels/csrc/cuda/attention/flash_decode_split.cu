@@ -1247,6 +1247,54 @@ void launch_flash_decode_split(
                 (void)seqlen;
                 return;
             }
+            // Fold S verify rows into one CTA so the staged K/V tile is read ONCE for all of
+            // them instead of once per row. The 8:1 group has had this since the fold kernel was
+            // written; the 6:1 group (Qwen3.8-27B's 24Q/4KV full-attention layers) never got the
+            // dispatch, so every batched verify re-streamed the whole KV per row. Measured at
+            // ctx=4096, N=4: 57.4 us per layer against 29.2 at N=2 -- exactly linear in rows,
+            // i.e. the KV read was being paid four times.
+            //
+            // Bit-exact for the same reason the 8:1 fold is: each folded row keeps its OWN
+            // chunk/start/end (a verify block's row i ends at start_pos+i+1) and masks itself back
+            // to that range, so it accumulates the same keys in the same order the SEQ=1 kernel
+            // gives it. Only which CTA stages the tile changes.
+            //
+            // Requires the rows to share one block table, which the verify already guarantees:
+            // dflash_verify_short_run replicates its table N times (launch_broadcast_rows_i32)
+            // before this call, and is the only caller that passes num_seqs > 1 here.
+            static int fa6_fold_env = -1;
+            if (fa6_fold_env < 0) {
+                const char* e = getenv("SPARKINFER_FA_SEQFOLD");
+                fa6_fold_env = e ? atoi(e) : 0;
+            }
+            // Prefer the NARROWEST fold that divides the row count. Folding trades KV-staging
+            // traffic for CTAs -- at 4 kv heads x n_splits the grid is already only a few CTAs
+            // per SM -- and this kernel is issue-bound on the per-row softmax, not on the staged
+            // read, so the wide fold gives back more parallelism than it saves. Measured at
+            // ctx=4k, 4 rows: fold 2 = 14.389 ms per verify against fold 4 = 14.438 and no fold
+            // at 14.6, i.e. two rows per CTA takes the whole win.
+            const int fa6_fold = fa6_fold_env > 0
+                               ? fa6_fold_env
+                               : (num_seqs % 2 == 0 ? 2 : (num_seqs % 3 == 0 ? 3 : 1));
+            if (!int8_kv && num_seqs > 1 && fa6_fold > 1 && (num_seqs % fa6_fold) == 0) {
+                const size_t smf = (size_t)2 * FA_GQA6_TILE * 256 * sizeof(__nv_bfloat16);
+                dim3 gqf(num_kv_heads * n_splits, num_seqs / fa6_fold);
+#define SI_FA6_FOLD(SQ)                                                                           \
+                fa_split_gqa_kernel<256, GQA, FA_GQA6_TILE, false, (SQ)>                          \
+                    <<<gqf, GQA * 32, smf, stream>>>(                                             \
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table,       \
+                    seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads,         \
+                    block_size, max_blocks, n_splits,                                             \
+                    reinterpret_cast<const __half*>(k_scale),                                     \
+                    reinterpret_cast<const __half*>(v_scale))
+                if (fa6_fold == 3)      SI_FA6_FOLD(3);
+                else if (fa6_fold == 4) SI_FA6_FOLD(4);
+                else                    SI_FA6_FOLD(2);
+#undef SI_FA6_FOLD
+                combine_hd256(out_q8);
+                (void)seqlen;
+                return;
+            }
             // How many keys ONE block walks -- not the sequence length. This, not seqlen, is what
             // sets the staging-loop iteration count, so it is what picks the tile depth.
             const long fa6_chunk = (long)(seqlen > 0 ? seqlen : 0) /
