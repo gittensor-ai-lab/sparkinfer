@@ -3205,7 +3205,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // deferring them is the branch above: a generation that takes the autoregressive path returns
     // before this line and never materialises them at all.
     draft.ensure_quant();
-    set_dflash_capture(true, dc.target_layer_ids, B);
+    // B + 1 rows, not B: the verify submits vn = kProposalDepth + 1 rows and captures a target
+    // hidden state for each, so a full-block plan captures row B. k_capture_row guards on
+    // max_rows, so sizing this at B did not corrupt memory -- it silently DROPPED the last
+    // row, handing the next draft block a stale hidden state precisely when everything was
+    // accepted, which is the case a full-depth plan is trying to produce.
+    set_dflash_capture(true, dc.target_layer_ids, B + 1);
 
     const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
     clear_prefix_cache();
@@ -3246,7 +3251,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     const void* target_hidden = dflash_context_buffer();
     int th_len = n;
 
-    std::vector<int> block(B), posterior(B), draft_ids(B);
+    // Depth-indexed buffers. With the SGLang row-shift mapping (dflash_draft.cpp), block row
+    // r-1 backs proposal r, so a block_size-wide block backs proposals 1..B -- and block[],
+    // posterior[] and draft_ids[] are every one of them indexed at B. Sized B alone, drafting
+    // the full block wrote one past the end of all three; draft_confidence already had the
+    // extra slot, which is why the overflow never showed up as a confidence bug.
+    std::vector<int> block(B + 1), posterior(B + 1), draft_ids(B + 1);
     std::vector<float> draft_confidence(B + 1, 0.f);
     // Proposal depth (also sets the draft's active diffusion width, depth+1). 5 is the measured
     // optimum at short context: accept length rises only 5.33 -> 5.95 -> 6.43 going to depth 6 and
@@ -3303,8 +3313,22 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // every proposal that block already computes. Depth 4 needs a 5-wide block, which rounds to
     // the checkpoint's block_size of 7 -- a width the draft's batched GEMV is not instantiated
     // for -- so the draft falls onto its per-token loop and costs 9.92 ms instead of 2.52.
-    const int kProposalDepth = kProposalDepthEnv > 0 ? kProposalDepthEnv
-                             : ((n + max_new) >= kDeepMinSeq ? 7 : 3);
+    // Clamp to block_size: the draft can only back as many proposals as its block has rows
+    // (row r-1 -> proposal r), so asking for more than B silently indexes past every
+    // depth-sized buffer above and reads stale argmax rows.
+    // Short-context depth is 4, not 3. The draft proposes a token per block row and the verify
+    // planner then prices each row against its own measured width cost, so the depth only has to
+    // be deep enough that the planner has a row left to buy when the draft is confident. Measured
+    // at ctx 4096, same binary, arms alternated and repeated (tok/s):
+    //     depth 3 (main)  119.8543 / 119.8760      depth 4  124.7007 / 124.4120
+    //     depth 5         123.2482 / 123.4245      depth 6  121.6701 / 121.6861
+    //     depth 7         117.0281
+    // Past 4 the extra proposal costs a block row of draft (~0.14 ms through 5 layers) plus a
+    // wider bootstrap walk, and buys nothing: uncensored acceptance -- planner disabled so every
+    // proposal reaches the target -- saturates at depth 6, where depth 6 and depth 7 return an
+    // IDENTICAL tau of 1.9692 over 65 steps.
+    const int kProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
+                             : ((n + max_new) >= kDeepMinSeq ? 7 : 4));
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN

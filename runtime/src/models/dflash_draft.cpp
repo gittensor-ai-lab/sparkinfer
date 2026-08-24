@@ -444,11 +444,16 @@ struct DFlashDraftModel::Impl {
         logits = alloc<float>((size_t)B * std::max(cfg.vocab, 1));
         head_q8 = alloc<char>((size_t)B * kernels::llama_q8_1_bytes(H));
         d_ids = alloc<int>(B);
-        d_out = alloc<int>(B);
-        cu(cudaHostAlloc(&h_out, B * sizeof(int), cudaHostAllocDefault), "h_out");
+        // Proposal-indexed, not row-indexed. Under the row-shift mapping the chain writes
+        // d_out[r] / d_confidence[r] for r = 1..kProposalDepth, and a block_size-wide block
+        // backs kProposalDepth == B -- so index B is live and these need B+1 slots. d_ids stays
+        // at B: it holds the block's input ids, one per row.
+        d_out = alloc<int>(B + 1);
+        cu(cudaHostAlloc(&h_out, (B + 1) * sizeof(int), cudaHostAllocDefault), "h_out");
         if (confidence_w) {
-            d_confidence = alloc<float>(B);
-            cu(cudaHostAlloc(&h_confidence, B * sizeof(float), cudaHostAllocDefault), "h_confidence");
+            d_confidence = alloc<float>(B + 1);
+            cu(cudaHostAlloc(&h_confidence, (B + 1) * sizeof(float), cudaHostAllocDefault),
+               "h_confidence");
         }
 
         k_cache.resize(cfg.n_layers);
@@ -609,6 +614,7 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
 }
 
 void DFlashDraftModel::reset() { p_->seq_len = 0; }
+
 
 void DFlashDraftModel::crop(int keep) {
     if (keep < 0) keep = 0;
@@ -984,8 +990,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         int v = e ? atoi(e) : 5;
         return v < 1 ? 1 : (v > 15 ? 15 : v);
     }();
-    const int kProposalDepth = proposals > 0 ? (proposals > 15 ? 15 : proposals)
-                                             : kProposalDepthDefault;
+    // Also clamped to block_size: proposal r reads block row r-1 (or r without the row shift),
+    // so a block can never back more proposals than it has rows. Without this a checkpoint whose
+    // block_size is below the requested depth reads uninitialised argmax rows as proposals.
+    const int kProposalDepth = std::min(c.block_size,
+                                        proposals > 0 ? (proposals > 15 ? 15 : proposals)
+                                                      : kProposalDepthDefault);
     // Active diffusion width. Only rows 0..kProposalDepth are ever consumed (row 0 is the seed,
     // 1..kProposalDepth the scored proposals), yet the backbone was run at the checkpoint's full
     // block_size=16 — 12 of every 16 rows computed and discarded. The block's attention is
@@ -1019,6 +1029,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // 2.5 ms -> 9.9 ms. Widths 5/6/7 are instantiated now (see dflash_kernels.cu), so the
         // clamp lands on a batched width. This matters most at ctx >= SPARKINFER_DFLASH_DEEP_MIN_SEQ,
         // where the ladder in qwen35.cpp selects depth 7 and therefore width 7 on every block.
+        // DO NOT narrow this to depth+1. Tried it: at proposal depth 4 it takes the block from
+        // 7 rows to 5 and saves ~0.13 ms of draft, and it LOSES more than that in acceptance --
+        // 125.0920 tok/s at tau 1.8824 with the rounding below, against 124.2785 / 1.8551 with an
+        // exact width, measured on one binary with the arms alternated. The block's attention is
+        // bidirectional, so mask rows the verifier never reads are still trained CONTEXT for the
+        // rows it does read; the comment above about the two-row tier is the same effect at the
+        // other end, and the ceiling is not free either.
         const int w = v <= 2 ? 2 : (v <= 4 ? 4 : (v <= 8 ? 8 : 16));
         return w > c.block_size ? c.block_size : w;
     }();

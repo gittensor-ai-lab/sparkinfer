@@ -3617,13 +3617,33 @@ bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
     dim3 grid(nblk);
     auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     auto* w = reinterpret_cast<const unsigned char*>(W);
-    // MFIXED 3 and 6 keep the row loop fully unrolled at the two depths the draft actually uses;
-    // anything else runs the MMAX=16 form with a runtime bound.
+    // One exact MFIXED per row count the proposal ladder can actually ask for, not just the two
+    // it used to ask for. MMAX sizes acc[MMAX] and bounds the row loop, so the fallback form runs
+    // SIXTEEN predicated rows to do five and carries 56 registers against 39-40 for the exact
+    // ones -- 2 CTAs of 16 warps against 3, i.e. 66% occupancy against 100%. Measured on the
+    // draft head (V=248320, K=5120): 838.6 us at M=5 on the fallback against 457.1 us at M=3 on
+    // the exact form. That gap was the largest single term in the cost of drafting a wider block,
+    // and it is why depth 6 (exact) was cheaper than depth 5 (fallback) despite proposing more.
+    // A/B switch: 0 restores the previous dispatch (exact only at M = 3 and 6).
+    static const bool mfixed_all = []{ const char* e = getenv("SPARKINFER_DFLASH_HEAD_MFIXED");
+                                       return !(e && e[0] == '0'); }();
     #define SI_MR_BY_M(NS) \
         do { \
-            if (M == 3)      si_mmvq_q4k_multirow_kernel<float, 16, NS, 3, 3><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); \
-            else if (M == 6) si_mmvq_q4k_multirow_kernel<float, 16, NS, 6, 6><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); \
-            else             si_mmvq_q4k_multirow_kernel<float, 16, NS, 16><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); \
+            if (!mfixed_all) { \
+                if (M == 3)      si_mmvq_q4k_multirow_kernel<float, 16, NS, 3, 3><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); \
+                else if (M == 6) si_mmvq_q4k_multirow_kernel<float, 16, NS, 6, 6><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); \
+                else             si_mmvq_q4k_multirow_kernel<float, 16, NS, 16><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); \
+            } else switch (M) { \
+                case 1: si_mmvq_q4k_multirow_kernel<float, 16, NS, 1, 1><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); break; \
+                case 2: si_mmvq_q4k_multirow_kernel<float, 16, NS, 2, 2><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); break; \
+                case 3: si_mmvq_q4k_multirow_kernel<float, 16, NS, 3, 3><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); break; \
+                case 4: si_mmvq_q4k_multirow_kernel<float, 16, NS, 4, 4><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); break; \
+                case 5: si_mmvq_q4k_multirow_kernel<float, 16, NS, 5, 5><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); break; \
+                case 6: si_mmvq_q4k_multirow_kernel<float, 16, NS, 6, 6><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); break; \
+                case 7: si_mmvq_q4k_multirow_kernel<float, 16, NS, 7, 7><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); break; \
+                case 8: si_mmvq_q4k_multirow_kernel<float, 16, NS, 8, 8><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); break; \
+                default: si_mmvq_q4k_multirow_kernel<float, 16, NS, 16><<<grid, 16 * 32, 0, stream>>>(q, w, y, N, M); break; \
+            } \
         } while (0)
     if (nsuper == 8)       SI_MR_BY_M(8);
     else if (nsuper == 20) SI_MR_BY_M(20);

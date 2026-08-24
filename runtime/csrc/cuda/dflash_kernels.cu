@@ -1643,7 +1643,14 @@ __global__ void k_markov_bias_add_warp(const bf16* __restrict__ w1, const bf16* 
 // Quantizing a bias table is safe here for the same reason the warp reduction's reordered sum is:
 // the draft only NOMINATES, and every emitted token is still a target argmax. It can move tau and
 // nothing else.
-template <int RANK>
+// ROWS = vocabulary rows per warp. At RANK=256 and VEC=8 a warp's 32 lanes cover exactly one row
+// in a single int2 load each, so ROWS=1 leaves the warp with ONE load in flight and then five
+// shuffle steps in which 31 of 32 lanes discard their result. The table is already L2-resident
+// (71 MB in 96 MB), so 71 MB at L2 rate is a ~20 us floor against ~145 us measured -- this kernel
+// is latency-bound, not bandwidth-bound, and the fix is memory-level parallelism rather than fewer
+// bytes. ROWS consecutive rows are ROWS*256 CONTIGUOUS bytes, so the wider load stays perfectly
+// coalesced. Same knob as the NR/ROWS/MFIXED family elsewhere in this tree.
+template <int RANK, int ROWS>
 __global__ void k_markov_bias_add_warp_q8(const bf16* __restrict__ w1,
                                           const signed char* __restrict__ w2q,
                                           const float* __restrict__ w2s,
@@ -1661,26 +1668,44 @@ __global__ void k_markov_bias_add_warp_q8(const bf16* __restrict__ w1,
     if (out_latent && blockIdx.x == 0)
         for (int r = threadIdx.x; r < RANK; r += blockDim.x) out_latent[r] = latent[r];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int v = blockIdx.x * (int)(blockDim.x >> 5) + warp;
-    if (v >= vocab) return;
-    const signed char* row = w2q + (size_t)v * RANK;
-    const float* rsc = w2s + (size_t)v * NSC;
-    float acc = 0.f;
+    const int v0 = (blockIdx.x * (int)(blockDim.x >> 5) + warp) * ROWS;
+    if (v0 >= vocab) return;
+    // Issue every row's load before reducing any of them: the reductions are what serialise, so
+    // the loads have to be in flight across all ROWS first for this to buy anything.
+    int2 raw[ROWS][PER_LANE];
+    float sc[ROWS][PER_LANE];
     #pragma unroll
-    for (int p = 0; p < PER_LANE; p++) {
-        const int base = (p * 32 + lane) * VEC;
-        const int2 raw = *reinterpret_cast<const int2*>(row + base);
-        const signed char* wv = reinterpret_cast<const signed char*>(&raw);
-        // VEC == 8 keeps every lane's slice inside one 32-wide scale block.
-        const float sc = rsc[base >> 5];
-        float part = 0.f;
+    for (int r = 0; r < ROWS; r++) {
+        const int v = v0 + r;
+        if (ROWS > 1 && v >= vocab) break;
+        const signed char* row = w2q + (size_t)v * RANK;
+        const float* rsc = w2s + (size_t)v * NSC;
         #pragma unroll
-        for (int i = 0; i < VEC; i++) part += latent[base + i] * (float)wv[i];
-        acc += part * sc;
+        for (int p = 0; p < PER_LANE; p++) {
+            const int base = (p * 32 + lane) * VEC;
+            raw[r][p] = *reinterpret_cast<const int2*>(row + base);
+            // VEC == 8 keeps every lane's slice inside one 32-wide scale block.
+            sc[r][p] = rsc[base >> 5];
+        }
     }
     #pragma unroll
-    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
-    if (lane == 0) logits[v] += acc;
+    for (int r = 0; r < ROWS; r++) {
+        const int v = v0 + r;
+        if (ROWS > 1 && v >= vocab) break;
+        float acc = 0.f;
+        #pragma unroll
+        for (int p = 0; p < PER_LANE; p++) {
+            const int base = (p * 32 + lane) * VEC;
+            const signed char* wv = reinterpret_cast<const signed char*>(&raw[r][p]);
+            float part = 0.f;
+            #pragma unroll
+            for (int i = 0; i < VEC; i++) part += latent[base + i] * (float)wv[i];
+            acc += part * sc[r][p];
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (lane == 0) logits[v] += acc;
+    }
 }
 
 // confidence_logit = dot(hidden[H], w[0:H]) + dot(latent[rank], w[H:H+rank]) + bias -- a single
@@ -1725,9 +1750,26 @@ void launch_markov_bias_add_q8(const void* w1, const void* w2q, const float* w2s
                                cudaStream_t stream, float* out_latent) {
     if (vocab <= 0 || rank != 256 || !w2q || !w2s) return;
     const int threads = 256, warps_per_block = threads / 32;
-    const int blocks_w = (vocab + warps_per_block - 1) / warps_per_block;
-    k_markov_bias_add_warp_q8<256><<<blocks_w, threads, 0, stream>>>(
-        (const bf16*)w1, (const signed char*)w2q, w2s, prev_token, logits, vocab, out_latent);
+    // Rows per warp. 1 is the pre-existing kernel exactly, so both arms of the A/B come out of one
+    // binary the way the NR and MFIXED toggles beside them do.
+    // Measured at proposal depth 7 (PLAN=0, so draft ms is the only thing moving), draft ms:
+    //     ROWS=1  3.199 / 3.200      ROWS=2  3.106 / 3.107      ROWS=4  3.139 / 3.139
+    // 2 wins; the curve turns back up by 4, so this is not "more is better". ROWS=8 is deliberately
+    // NOT offered: its arm produced no output at all in the sweep and the cause was never found, so
+    // it is unmeasured, and an unmeasured path should not be selectable.
+    static const int mrows = []{ const char* e = getenv("SPARKINFER_DFLASH_MARKOV_ROWS");
+                                 const int v = e ? atoi(e) : 2;
+                                 return (v == 1 || v == 2 || v == 4) ? v : 2; }();
+#define SI_MARKOV_Q8(R_) do { \
+        constexpr int R = (R_); \
+        const int blocks_w = (vocab + warps_per_block * R - 1) / (warps_per_block * R); \
+        k_markov_bias_add_warp_q8<256, R><<<blocks_w, threads, 0, stream>>>( \
+            (const bf16*)w1, (const signed char*)w2q, w2s, prev_token, logits, vocab, out_latent); \
+    } while (0)
+    if (mrows == 1)      SI_MARKOV_Q8(1);
+    else if (mrows == 4) SI_MARKOV_Q8(4);
+    else                 SI_MARKOV_Q8(2);
+#undef SI_MARKOV_Q8
 }
 
 void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_token,
