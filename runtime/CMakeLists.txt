@@ -121,6 +121,11 @@ if(BUILD_EXAMPLES)
     target_include_directories(dspark_tau_check PRIVATE include)
     target_link_libraries(dspark_tau_check PRIVATE sparkinfer_runtime CUDA::cudart
                           nlohmann_json::nlohmann_json)
+    # Acceptance rate of the checkpoint's own MTP head, teacher-forced against the target.
+    add_executable(mtp_probe examples/mtp_probe.cpp)
+    target_include_directories(mtp_probe PRIVATE include)
+    target_link_libraries(mtp_probe PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)

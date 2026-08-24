@@ -121,7 +121,14 @@ void launch_dflash_gdn_scan_commit(const void* k, const void* v,
 //   x/z: [N, v_heads*hd]   weight: [hd]   out: [N, v_heads*hd]
 void launch_prefill_gated_norm(const void* x, const void* z, const void* weight, void* out,
                                int n_tokens, int v_heads, int head_dim, float eps,
-                               cudaStream_t stream = nullptr);
+                               cudaStream_t stream = nullptr,
+                               void* out_nvq = nullptr, void* out_nvs = nullptr);
+
+// mul_sigmoid that also writes the NVFP4 activation quantization of its own output, so the O
+// projection does not need a separate quantize node. False for a length that is not a multiple
+// of 16; nothing is written in that case.
+bool launch_qwen36_mul_sigmoid_nvfp4(void* attn, const void* gate, void* xq, void* xs,
+                                     long n, cudaStream_t stream = nullptr);
 
 // Full-attention prefill: batched QK-norm + partial-RoPE (q,k in place, bf16) + int8 KV write
 // into the single-sequence paged pool at positions 0..N-1. Matches the decode int8 layout

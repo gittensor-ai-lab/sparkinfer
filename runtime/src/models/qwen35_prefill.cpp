@@ -1222,7 +1222,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
                 layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
                 c.gdn_qh_block, st);
-            kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
+            kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
+                                               c.linear_head_dim, eps, st);
             // out_proj off the same NVFP4 bytes, with the residual folded into the block-scaled
             // GEMM's own epilogue (D = A*B + C, C aliasing D aliasing x) instead of written raw
             // to `ao` for a separate full-tensor add. That add is three N*H bf16 streams (read x,
@@ -2627,9 +2628,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // GDN in-projections) all read one `xn`, so it is quantized once per layer and reused. The A/B
     // buffers alternate by source so a later quantize cannot clobber one a parallel stream is
     // still reading.
+    bool xn_nv_staged = false;     // the layer tail already wrote NVFP4(xn) into slot A
     const bf16* nvq_src_a = nullptr; int nvq_k_a = 0;
     const bf16* nvq_src_b = nullptr; int nvq_k_b = 0;
     bool nvq_use_b = false;
+    // Pick the slot quant_nv_rows WOULD have used and claim it, WITHOUT launching: for the two
+    // activations whose producer can emit the NVFP4 form itself (the GDN gated norm and the
+    // attention gate-multiply), the quantize node disappears entirely. The slot choice mirrors
+    // quant_nv_rows exactly so the two cannot drift.
+    auto stage_nv_slot = [&](const bf16* in, int k, signed char** q, float** sc) {
+        if (!nvq_use_b) { *q = nv_pq_b; *sc = nv_ps_b; nvq_src_b = in; nvq_k_b = k; nvq_use_b = true; }
+        else            { *q = nv_pq_a; *sc = nv_ps_a; nvq_src_a = in; nvq_k_a = k; nvq_use_b = false; }
+    };
     auto quant_nv_rows = [&](const bf16* in, int k) {
         if (nvq_src_a == in && nvq_k_a == k) { nvq_use_b = false; return; }
         if (nvq_src_b == in && nvq_k_b == k) { nvq_use_b = true;  return; }
@@ -2871,6 +2881,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // emits a fresh Q8_1(xn); nothing re-stamps this one, so clear it here.
         nvq_src_a = nullptr; nvq_k_a = 0;
         nvq_src_b = nullptr; nvq_k_b = 0;
+        // ...then re-stamp the one entry the PREVIOUS layer's tail norm already produced. Slot A
+        // holds NVFP4(xn) for this layer; nvq_use_b = false keeps the next distinct source going
+        // to B rather than clobbering it.
+        if (xn_nv_staged) {
+            nvq_src_a = xn; nvq_k_a = H; nvq_use_b = false;
+            xn_nv_staged = false;
+        }
         vfail_L = L;
         vdbg_snapshot(xn, L);
         if (L == 0) vdbg_snapshot2(x, 4);   // raw pre-norm residual stream (h = x + ao)
@@ -2939,8 +2956,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 state, att, N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
             // ...and lz is gated_norm's.
             if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn z wait");
-            kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
-                                                c.linear_head_dim, c.rms_eps, st);
+            {
+                // The gated norm can emit the NVFP4 form of its own output, so the out projection
+                // that consumes it needs no separate quantize node.
+                signed char* gq = nullptr; float* gs = nullptr;
+                const bool gnv = kernels::qwen38_nvfp4_dp4a() &&
+                                 w.ssm_out_type == kernels::SI_QTYPE_NVFP4 && nv_pq_a && nv_pq_b;
+                if (gnv) stage_nv_slot(lnrm, lvdim, &gq, &gs);
+                kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
+                                                   c.linear_head_dim, c.rms_eps, st, gq, gs);
+            }
             supported = proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
         } else {
             // Same shape of win as the GDN block: wq is 2*qdim rows and saturates, while wk and wv
@@ -3007,7 +3032,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // launch covers the whole block. N separate nodes cost N times the graph-node
             // dependency latency for the same work.
             if (!kv8) {
-                kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
+                signed char* aq = nullptr; float* as_ = nullptr;
+                const bool anv = kernels::qwen38_nvfp4_dp4a() &&
+                                 w.wo_type == kernels::SI_QTYPE_NVFP4 && nv_pq_a && nv_pq_b;
+                if (anv) stage_nv_slot(att, qdim, &aq, &as_);
+                if (!anv || !kernels::launch_qwen36_mul_sigmoid_nvfp4(att, qg, aq, as_,
+                                                                     (long)N * qdim, st))
+                    kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
             }
             supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
         }
@@ -3018,8 +3049,22 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // kernel args (a printf's tag/step) do not, which is why this uses vdbg_snapshot's
         // approach and not a live stat-printer call here.
         if (L == 0) vdbg_snapshot2(ao, 0);
-        kernels::launch_add_rmsnorm2_q8_rows(x, ao, w.post_attn_norm, h, hn, q81,
-                                             N, H, c.rms_eps, st);
+        // Emit the NVFP4 quantization of hn straight out of the norm when the FFN is going to
+        // ask for exactly that. Saves one graph node per layer; bit-identical either way.
+        static const bool kDecNvfp4Hn = [] {
+            const char* e = getenv("SPARKINFER_QWEN38_DECODE_NVFP4");
+            return !(e && e[0] == '0');
+        }();
+        const bool nv_hn = dense && kDecNvfp4Hn && w.gate_nv && w.up_nv && w.down_nv &&
+                           c.top_k == 1 && kernels::qwen38_nvfp4_dp4a() && nv_xq && nv_xs;
+        // When the FFN takes the NVFP4 arm, hn's Q8_1 has no consumer at all -- proj() only reads
+        // q81 for Q4_K/Q6_K/Q8_0 weights, and every Linear on this checkpoint is NVFP4. Skip it,
+        // and leave q81_src pointing at whatever it did so nothing reads a buffer this call did
+        // not write.
+        kernels::launch_add_rmsnorm2_q8_rows(x, ao, w.post_attn_norm, h, hn,
+                                             nv_hn ? nullptr : q81,
+                                             N, H, c.rms_eps, st,
+                                             nv_hn ? nv_xq : nullptr, nv_hn ? nv_xs : nullptr);
         // FIXED (2026-08-17): this used to snapshot h BEFORE this kernel wrote it -- h is an
         // arena buffer reused every layer, so the earlier capture was reading whatever the
         // PREVIOUS layer's residual left there, not this layer's real value. That stale read is
@@ -3027,7 +3072,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // isolated repro of this exact kernel under compute-sanitizer (memcheck + racecheck, 0
         // errors both) proved the kernel itself was never the problem.
         if (L == 0) { vdbg_snapshot2(h, 1); vdbg_snapshot2(hn, 2); }
-        q81_src = hn; q81_k = H;
+        if (!nv_hn) { q81_src = hn; q81_k = H; }
 
         // Dense FFN: one expert, no router, no shared expert. Seed ids/weights with the same
         // constants AR uses (expert 0, weight 1.0) and run the identical expert kernel at N rows,
@@ -3058,7 +3103,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (native_ffn && topk == 1 && kernels::qwen38_nvfp4_dp4a()) {
                 signed char* xq = nv_xq;
                 float* xs = nv_xs;
-                kernels::launch_gemv_nvfp4_quant_x(hn, xq, xs, N, H, st);
+                if (!nv_hn) kernels::launch_gemv_nvfp4_quant_x(hn, xq, xs, N, H, st);
                 // gate and up are the same shape over the same activation, so one grid can carry
                 // both: half the launches, and one partial last wave instead of two. Falls back to
                 // the pair of singles for any shape the paired launcher declines.
@@ -3103,8 +3148,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (L == 0) vdbg_snapshot2(routed, 3);
             // Residual + next-layer norm, matching the MoE branch's tail.
             const void* nn = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
+            // Same for xn, whose consumer is the NEXT layer's projections via quant_nv_rows().
+            // Staged into the A slot; the loop head hands it to the memo after the per-layer
+            // reset (the reset has to come first -- xn is the same buffer at every layer, which is
+            // exactly the stale-activation hazard that reset exists for).
+            const bool nv_xn = kernels::qwen38_nvfp4_dp4a() && nv_pq_a && nv_ps_a;
             kernels::launch_add_rmsnorm2_q8_rows(h, routed, nn, x, xn, q81,
-                                                 N, H, c.rms_eps, st);
+                                                 N, H, c.rms_eps, st,
+                                                 nv_xn ? nv_pq_a : nullptr,
+                                                 nv_xn ? nv_ps_a : nullptr);
+            xn_nv_staged = nv_xn;
             q81_src = xn; q81_k = H;
             // capture(L) MUST still run: it is the last statement of the layer loop and it is what
             // hands this layer's hidden state to the draft. An earlier revision of this branch used

@@ -27,7 +27,8 @@ void launch_add_rmsnorm2_q8(const void* x_bf16, const void* residual_bf16, const
 void launch_add_rmsnorm2_q8_rows(const void* x_bf16, const void* residual_bf16,
                                  const void* weight_bf16, void* out_sum_bf16,
                                  void* out_norm_bf16, void* out_q8, int rows, int cols,
-                                 float eps, cudaStream_t stream = nullptr);
+                                 float eps, cudaStream_t stream = nullptr,
+                                 void* out_nvq = nullptr, void* out_nvs = nullptr);
 
 // Sandwich-norm residual add (Gemma2/Muse-Glimmer style): out = residual + RMSNorm(block_out)
 // * weight. Unlike add_rmsnorm2/3 above (which norm the SUM), this norms block_out ALONE --

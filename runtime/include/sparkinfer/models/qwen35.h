@@ -169,12 +169,40 @@ struct Qwen35LayerWeights {
     const float* down_rs = nullptr;
 };
 
+// The checkpoint's own multi-token-prediction head: one full transformer layer plus the two
+// norms and the projection that fuse (last hidden state, next token embedding) into its input.
+// It ships in the scored Qwen3.8-27B NVFP4 export (15 tensors, 849 MB, left in BF16 while the
+// 400 model Linears were quantized) and has never been loaded here: a single MTP pass proposes
+// one token, so it was read as capping tau at 2.0 against a draft expected to reach 4-5. The
+// DSpark draft measures tau 1.985, and running the head on its own output lifts the cap -- at
+// depth 2 it reaches 2.189.
+struct Qwen35MtpWeights {
+    const void* fc = nullptr;                 // [hidden, 2*hidden]  concat(norm(emb), norm(h))
+    const void* pre_fc_norm_embedding = nullptr;
+    const void* pre_fc_norm_hidden = nullptr;
+    const void* input_layernorm = nullptr;
+    const void* post_attention_layernorm = nullptr;
+    const void* norm = nullptr;               // final norm before the shared lm_head
+    const void* q_proj = nullptr;             // [2*n_q*head_dim, hidden]  (q and its output gate)
+    const void* k_proj = nullptr;             // [n_kv*head_dim, hidden]
+    const void* v_proj = nullptr;
+    const void* o_proj = nullptr;             // [hidden, n_q*head_dim]
+    const void* q_norm = nullptr;             // [head_dim]
+    const void* k_norm = nullptr;
+    const void* gate_proj = nullptr;          // [ffn, hidden]
+    const void* up_proj = nullptr;
+    const void* down_proj = nullptr;          // [hidden, ffn]
+    int proj_type = 0;                        // 0 = bf16, else ggml qtype for the on-read GEMV
+    bool ok = false;
+};
+
 struct Qwen35Weights {
     const void* embed_tokens = nullptr;  // [vocab, hidden]
     const void* final_norm   = nullptr;  // [hidden]
     const void* lm_head      = nullptr;  // [hidden, vocab]  (pre-transposed)
     int lm_head_type = 0;                 // 0 = bf16; else ggml type -> on-read quantized GEMV
     std::vector<Qwen35LayerWeights> layers;
+    Qwen35MtpWeights mtp;
 };
 
 // Single-sequence (batch=1) greedy decoder for the Qwen family -- routed-MoE (Qwen3.6) and
@@ -439,6 +467,16 @@ public:
 
     // Shared weights for DFlash draft (embed + lm_head come from target).
     const void* embed_weights() const;
+    // Runs the checkpoint's MTP head `depth` times, each step conditioned on what the previous
+    // one produced, and writes the proposed token ids to `out`. `h_prenorm` is the target's
+    // PRE-final-norm hidden state at the position that produced `tok`. Proposals only -- nothing
+    // here is ever emitted without a target argmax confirming it. Returns how many ids were
+    // written (< depth on any failure, -1 if the head is unavailable).
+    int mtp_propose(const void* h_prenorm, int tok, int pos, int depth, int* out);
+    bool mtp_available() const;
+    // Device pointer to the per-layer hidden-state capture buffer (see set_dflash_capture).
+    // Slot i holds the residual stream after target_layer_ids[i], row-major over rows.
+    const void* dflash_hidden_ptr() const;
     const void* lm_head_weights() const;
     int lm_head_quant_type() const;
 

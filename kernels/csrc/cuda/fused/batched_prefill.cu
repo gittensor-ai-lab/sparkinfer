@@ -330,6 +330,31 @@ __global__ void pf_mul_sigmoid_kernel(__nv_bfloat16* __restrict__ attn,
     attn[i] = __float2bfloat16(pf_to_f(attn[i]) * pf_sigmoid(pf_to_f(gate[i])));
 }
 
+// Same, plus the NVFP4 activation quantization the O projection is about to want. blockDim is a
+// multiple of 16 and n is N*qdim, so a 16-element group is 16 consecutive live threads.
+__global__ void pf_mul_sigmoid_nvfp4_kernel(__nv_bfloat16* __restrict__ attn,
+                                            const __nv_bfloat16* __restrict__ gate,
+                                            signed char* __restrict__ xq,
+                                            float* __restrict__ xs, long n) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const bool live = i < n;
+    float f = 0.f;
+    if (live) {
+        const __nv_bfloat16 b =
+            __float2bfloat16(pf_to_f(attn[i]) * pf_sigmoid(pf_to_f(gate[i])));
+        attn[i] = b;
+        f = __bfloat162float(b);
+    }
+    float a = fabsf(f);
+    #pragma unroll
+    for (int m = 1; m < 16; m <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    if (live) {
+        const float ivq = a > 0.f ? 127.f / a : 0.f;
+        xq[i] = (signed char)__float2int_rn(f * ivq);
+        if ((threadIdx.x & 15) == 0) xs[i >> 4] = a * (1.f / 127.f);
+    }
+}
+
 // ============================================================================
 // Gated-DeltaNet causal conv + split + SiLU + L2-norm(q,k), scanned over N tokens.
 // One block per output head (blockDim = head_dim); each thread owns one channel and
@@ -815,6 +840,8 @@ __global__ void pf_gated_norm_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ z,
                                      const __nv_bfloat16* __restrict__ weight,
                                      __nv_bfloat16* __restrict__ out,
+                                     signed char* __restrict__ out_nvq,
+                                     float* __restrict__ out_nvs,
                                      int n_tokens, int v_heads, float eps) {
     constexpr int NROW = HEAD_DIM / 32;
     const int h    = blockIdx.y;                    // v_head
@@ -832,10 +859,29 @@ __global__ void pf_gated_norm_kernel(const __nv_bfloat16* __restrict__ x,
         ss += xv[r] * xv[r];
     }
     const float inv = rsqrtf(pf_wsum(ss) / HEAD_DIM + eps);
+    float ov[NROW];
     #pragma unroll
     for (int r = 0; r < NROW; r++) {
         const int d = lane + r * 32;
-        out[base + d] = __float2bfloat16(xv[r] * inv * wv[r] * pf_silu(zv[r]));
+        const __nv_bfloat16 b = __float2bfloat16(xv[r] * inv * wv[r] * pf_silu(zv[r]));
+        out[base + d] = b;
+        ov[r] = __bfloat162float(b);
+    }
+    // Optional NVFP4 activation quantization of the value just written, for the out projection
+    // that consumes it. A 16-element group is 16 consecutive lanes at a fixed r (d = lane + 32r),
+    // so the group max is a four-step shuffle inside a half-warp and no group straddles anything.
+    // Bit-identical to launch_gemv_nvfp4_quant_x on `out`.
+    if (out_nvq) {
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            float a = fabsf(ov[r]);
+            #pragma unroll
+            for (int m = 1; m < 16; m <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+            const float ivq = a > 0.f ? 127.f / a : 0.f;
+            const size_t d = base + lane + (size_t)r * 32;
+            out_nvq[d] = (signed char)__float2int_rn(ov[r] * ivq);
+            if ((lane & 15) == 0) out_nvs[d >> 4] = a * (1.f / 127.f);
+        }
     }
 }
 
@@ -1387,14 +1433,35 @@ void launch_dflash_gdn_scan_compact(const void* q, const void* k, const void* v,
                                     void* out, int n_tokens, int q_heads, int v_heads,
                                     int head_dim, bool qh_block, cudaStream_t stream) {
     if (n_tokens <= 0 || head_dim != 128) return;
-    constexpr int COLS = 4;
-    dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
-    df_gdn_scan_checkpoint_kernel<COLS, 128, false><<<grid, COLS * 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
-        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(alpha),
-        reinterpret_cast<const __nv_bfloat16*>(beta), reinterpret_cast<const __nv_bfloat16*>(dt),
-        reinterpret_cast<const __nv_bfloat16*>(a), live_state,
-        reinterpret_cast<__nv_bfloat16*>(out), nullptr, n_tokens, q_heads, v_heads, qh_block);
+    // COLS is warps per CTA, i.e. how many v-columns share a block. The columns are INDEPENDENT
+    // here -- one warp owns column j and reduces only across its own 32 k-elements -- so this is a
+    // pure parallelism knob and every value produces bit-identical output. It matters because the
+    // verify runs this at three or four tokens, where the kernel is latency-bound rather than
+    // bandwidth-bound: at COLS=4 the grid is v_heads x 32 = 1536 CTAs, ~9 per SM, each reading
+    // 2 KB of live state and then walking a short serial recurrence.
+    // SPARKINFER_DFLASH_SCAN_COLS sweeps it.
+    static const int cols_env = []{ const char* e = getenv("SPARKINFER_DFLASH_SCAN_COLS");
+                                    int v = e ? atoi(e) : 0;
+                                    return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 0; }();
+    const int cols = cols_env ? cols_env : 4;
+#define SI_GDN_SCAN(CL) do {                                                                      \
+        constexpr int COLS = (CL);                                                                \
+        dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);                                         \
+        df_gdn_scan_checkpoint_kernel<COLS, 128, false><<<grid, COLS * 32, 0, stream>>>(          \
+            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k), \
+            reinterpret_cast<const __nv_bfloat16*>(v),                                            \
+            reinterpret_cast<const __nv_bfloat16*>(alpha),                                        \
+            reinterpret_cast<const __nv_bfloat16*>(beta),                                         \
+            reinterpret_cast<const __nv_bfloat16*>(dt),                                           \
+            reinterpret_cast<const __nv_bfloat16*>(a), live_state,                                \
+            reinterpret_cast<__nv_bfloat16*>(out), nullptr,                                       \
+            n_tokens, q_heads, v_heads, qh_block);                                                \
+    } while (0)
+    if (cols == 1)      SI_GDN_SCAN(1);
+    else if (cols == 2) SI_GDN_SCAN(2);
+    else if (cols == 8) SI_GDN_SCAN(8);
+    else                SI_GDN_SCAN(4);
+#undef SI_GDN_SCAN
 }
 
 void launch_dflash_gdn_conv_commit(const void* qkv, void* live_state, int n_tokens,
@@ -1424,14 +1491,26 @@ void launch_dflash_gdn_scan_commit(const void* k, const void* v,
 }
 
 void launch_prefill_gated_norm(const void* x, const void* z, const void* weight, void* out,
-                               int n_tokens, int v_heads, int head_dim, float eps, cudaStream_t stream) {
+                               int n_tokens, int v_heads, int head_dim, float eps,
+                               cudaStream_t stream, void* out_nvq, void* out_nvs) {
     dim3 grid(n_tokens, v_heads);   // token on grid.x (grid.y capped at 65535)
     auto xb = reinterpret_cast<const __nv_bfloat16*>(x);
     auto zb = reinterpret_cast<const __nv_bfloat16*>(z);
     auto wb = reinterpret_cast<const __nv_bfloat16*>(weight);
     auto ob = reinterpret_cast<__nv_bfloat16*>(out);
     if (head_dim == 128)
-        pf_gated_norm_kernel<128><<<grid, 32, 0, stream>>>(xb, zb, wb, ob, n_tokens, v_heads, eps);
+        pf_gated_norm_kernel<128><<<grid, 32, 0, stream>>>(
+            xb, zb, wb, ob, reinterpret_cast<signed char*>(out_nvq),
+            reinterpret_cast<float*>(out_nvs), n_tokens, v_heads, eps);
+}
+
+bool launch_qwen36_mul_sigmoid_nvfp4(void* attn, const void* gate, void* xq, void* xs,
+                                     long n, cudaStream_t stream) {
+    if (!xq || !xs || (n & 15)) return false;
+    pf_mul_sigmoid_nvfp4_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(attn), reinterpret_cast<const __nv_bfloat16*>(gate),
+        reinterpret_cast<signed char*>(xq), reinterpret_cast<float*>(xs), n);
+    return true;
 }
 
 void launch_prefill_qknorm_rope_kv_int8(

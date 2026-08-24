@@ -308,6 +308,22 @@ struct Qwen35Model::Impl {
     bool adaptive_splits = true;              // scale n_splits with seq_len (decode graph re-captured on change)
     int split_chunk = 256;                    // target serial KV per split (SPARKINFER_SPLIT_CHUNK)
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
+    // MTP head scratch + its own KV. The pool is the paged layout every attention kernel here
+    // already speaks, driven by an IDENTITY block table -- block i maps to slot i -- which makes
+    // it exactly a dense [seq, n_kv, head_dim] cache while letting the head reuse
+    // launch_qknorm_rope_kv_partial and launch_flash_decode_split unchanged. One layer, so it is
+    // small: 4 kv heads x 256 dims x 2 (k,v) x 2 B x max_seq.
+    void  *mtp_kpool = nullptr, *mtp_vpool = nullptr;
+    int   *mtp_btable = nullptr, *mtp_seq = nullptr;
+    void  *mtp_cat = nullptr, *mtp_x = nullptr, *mtp_xn = nullptr, *mtp_hn = nullptr;
+    void  *mtp_qg = nullptr, *mtp_q = nullptr, *mtp_gate = nullptr;
+    void  *mtp_k = nullptr, *mtp_v = nullptr, *mtp_att = nullptr, *mtp_ao = nullptr;
+    void  *mtp_g = nullptr, *mtp_u = nullptr, *mtp_sh = nullptr, *mtp_q81 = nullptr;
+    int   *mtp_ids = nullptr;    // device-side proposals, so the recursion never syncs
+    int   *mtp_hpin = nullptr;   // PINNED staging for the head's three per-step scalars
+    int    mtp_cap = 0;          // positions the pool can hold
+    int    mtp_base = -1;        // absolute position that maps to MTP KV slot 0
+    bool   mtp_ready = false;
     // Sink + sliding-window sparse-KV. Default on; SPARKINFER_SPARSE_KV=0 disables. Per-kv_head block list.
     int*   sparse_sel = nullptr;
     int    sparse_budget = 0;      // max sel slots = 1 + window
@@ -2927,6 +2943,181 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
 }
 
 const void* Qwen35Model::embed_weights() const { return p_->w.embed_tokens; }
+// Recursion depth the MTP scratch is sized for. Each extra step is one more transformer layer of
+// weight reads (~0.59 ms) and buys at most one more accepted token, so the useful range is small.
+static const int kMtpMaxDepth = 4;
+
+// One step of the checkpoint's own MTP head: given the target's last PRE-final-norm hidden state
+// and the token it produced, predict the token after that.
+//
+// This is the whole point of the head -- it is a drafter the model's own authors trained against
+// this exact target, where DSpark is a separate checkpoint trained against a different one. It is
+// also one layer instead of five: 849 MB in BF16, ~239 MB requantised to Q4_K, against DSpark's
+// ~1.74 GB of reads per block.
+//
+// Loss-free by construction, exactly like the DSpark draft: whatever this returns is only ever a
+// PROPOSAL, and every token the engine emits is still a target argmax. Only acceptance is at risk.
+//
+// Returns the proposed token id, or -1 if the head is unavailable / the position is out of range.
+int Qwen35Model::mtp_propose(const void* h_prenorm, int tok, int pos, int depth, int* out) {
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    const Qwen35MtpWeights& m = s.w.mtp;
+    if (!m.ok || !h_prenorm || pos < 0) return -1;
+    const int depth_req = depth < 1 ? 1 : (depth > kMtpMaxDepth ? kMtpMaxDepth : depth);
+    depth = depth_req;
+    const int H = c.hidden, qdim = c.n_q_heads * c.head_dim, kvdim = c.n_kv_heads * c.head_dim;
+    const int ffn = c.moe_ffn;
+    const int bs = s.kv->block_size();
+    if (!s.mtp_ready) {
+        // Sized for the longest sequence a decode can reach here; one layer keeps it cheap.
+        s.mtp_cap = c.max_seq > 0 ? c.max_seq : 8192;
+        const int nblk = (s.mtp_cap + bs - 1) / bs;
+        auto A = [&](void** dst, size_t bytes) { return cudaMalloc(dst, bytes) == cudaSuccess; };
+        bool ok = A(&s.mtp_kpool, (size_t)nblk * bs * kvdim * 2) &&
+                  A(&s.mtp_vpool, (size_t)nblk * bs * kvdim * 2) &&
+                  A((void**)&s.mtp_btable, (size_t)nblk * sizeof(int)) &&
+                  A((void**)&s.mtp_seq, sizeof(int)) &&
+                  A(&s.mtp_cat, (size_t)2 * H * 2) && A(&s.mtp_x, (size_t)H * 2) &&
+                  A(&s.mtp_xn, (size_t)H * 2) && A(&s.mtp_hn, (size_t)H * 2) &&
+                  A(&s.mtp_qg, (size_t)2 * qdim * 2) && A(&s.mtp_q, (size_t)qdim * 2) &&
+                  A(&s.mtp_gate, (size_t)qdim * 2) && A(&s.mtp_k, (size_t)kvdim * 2) &&
+                  A(&s.mtp_v, (size_t)kvdim * 2) && A(&s.mtp_att, (size_t)qdim * 2) &&
+                  A(&s.mtp_ao, (size_t)H * 2) && A(&s.mtp_g, (size_t)ffn * 2) &&
+                  A(&s.mtp_u, (size_t)ffn * 2) && A(&s.mtp_sh, (size_t)ffn * 2) &&
+                  A(&s.mtp_q81, kernels::llama_q8_1_bytes(std::max(2 * H, ffn))) &&
+                  A((void**)&s.mtp_ids, (size_t)kMtpMaxDepth * sizeof(int));
+        // The head's per-step scalars (token, position, kv length) stage through PINNED host
+        // memory, and each recursion step owns its own three slots. From pageable memory the
+        // driver has to stage the bytes itself before cudaMemcpyAsync can return, which serialises
+        // the host against a queue that is otherwise entirely async -- and this head issues ~22
+        // kernels per step, so that stall was most of its cost: 1.25 ms measured against 0.48 ms
+        // of actual weight traffic.
+        ok = ok && cudaHostAlloc((void**)&s.mtp_hpin, (size_t)kMtpMaxDepth * 3 * sizeof(int),
+                                 cudaHostAllocDefault) == cudaSuccess;
+        if (!ok) { fprintf(stderr, "[mtp] scratch allocation failed\n"); return -1; }
+        // Identity block table: block i -> slot i, so position p lands at p * kvdim.
+        std::vector<int> ident((size_t)nblk);
+        for (int i = 0; i < nblk; i++) ident[(size_t)i] = i;
+        cudaMemcpy(s.mtp_btable, ident.data(), ident.size() * sizeof(int), cudaMemcpyHostToDevice);
+        s.mtp_ready = true;
+    }
+    // The MTP layer's KV is indexed by SLOT, not by absolute position: slot 0 is the first
+    // position this head ever saw. That matters because the prompt is never run through this
+    // layer -- only the 64 target layers are -- so an absolute index would make the head attend
+    // over thousands of slots of memory it never wrote. RoPE is a relative encoding: the q.k
+    // product depends only on the difference of the two positions, so numbering both the query
+    // and every key by slot preserves the geometry exactly while confining attention to history
+    // that is real.
+    // Restart the numbering on the first call, on any backward jump, and whenever the pool would
+    // overflow -- a restart costs only the history this head had accumulated, never correctness.
+    if (s.mtp_base < 0 || pos < s.mtp_base || pos - s.mtp_base + depth > s.mtp_cap)
+        s.mtp_base = pos;
+    const int slot0 = pos - s.mtp_base;
+    if (slot0 + depth > s.mtp_cap) return 0;
+    cudaStream_t st = s.stream;
+    const float eps = c.rms_eps;
+    const int qt = m.proj_type;
+    auto gemv = [&](const void* src, int K, const void* W, void* dst, int N) {
+        bool ok;
+        if (qt == 0) {
+            ok = kernels::launch_gemv_rows(src, W, dst, 1, N, K, st);
+        } else {
+            kernels::launch_quantize_q8_1_rows(src, s.mtp_q81, K, 1, K, st);
+            ok = kernels::launch_mmvq_rows(qt, s.mtp_q81, W, dst, 1, N, K, st);
+        }
+        if (!ok) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "[mtp] no GEMV for qtype=%d N=%d K=%d -- head disabled\n", qt, N, K);
+            }
+        }
+        return ok;
+    };
+
+    // Depth > 1 runs the head on ITS OWN output: step d is conditioned on (the layer residual the
+    // head just produced, the token it just proposed). This is the standard MTP recursion, and it
+    // is the only way this drafter can reach the acceptance length a 3-deep DSpark block does --
+    // one MTP pass can propose at most one token, so depth 1 caps tau at 2.0.
+    //
+    // Nothing crosses to the host between steps: each argmax lands in mtp_ids[d] on the device and
+    // step d+1 embeds straight from mtp_ids[d-1], so the whole block costs ONE sync at the end.
+    if (depth < 1) return 0;
+
+    for (int d = 0; d < depth; d++) {
+    // fc( concat( norm(emb(tok)), norm(h) ) ) -- the head's two inputs, each normed by its own
+    // weight, concatenated into one 2H row.
+    const int* tok_dev;
+    int* pin = s.mtp_hpin + d * 3;
+    if (d == 0) {
+        pin[0] = tok;
+        cudaMemcpyAsync(s.d_tok, pin, sizeof(int), cudaMemcpyHostToDevice, st);
+        tok_dev = s.d_tok;
+    } else {
+        tok_dev = s.mtp_ids + (d - 1);
+    }
+    // mtp_x is the previous step's residual, and it is READ into mtp_cat here before the fc below
+    // overwrites it -- so the recursion needs no extra buffer.
+    const void* h_in = (d == 0) ? h_prenorm : s.mtp_x;
+    kernels::launch_embedding(tok_dev, s.w.embed_tokens, s.mtp_cat, 1, H, st);
+    kernels::launch_rmsnorm(s.mtp_cat, m.pre_fc_norm_embedding, s.mtp_cat, 1, H, eps, st);
+    kernels::launch_rmsnorm(h_in, m.pre_fc_norm_hidden,
+                            static_cast<char*>(s.mtp_cat) + (size_t)H * 2, 1, H, eps, st);
+    if (!gemv(s.mtp_cat, 2 * H, m.fc, s.mtp_x, H)) return d;
+
+    // ---- the single transformer layer ----
+    kernels::launch_rmsnorm(s.mtp_x, m.input_layernorm, s.mtp_xn, 1, H, eps, st);
+    if (!gemv(s.mtp_xn, H, m.q_proj, s.mtp_qg, 2 * qdim)) return d;
+    if (!gemv(s.mtp_xn, H, m.k_proj, s.mtp_k, kvdim)) return d;
+    if (!gemv(s.mtp_xn, H, m.v_proj, s.mtp_v, kvdim)) return d;
+    // q_proj carries q and its output gate interleaved per head (attn_output_gate).
+    kernels::launch_prefill_split_q_gate(s.mtp_qg, s.mtp_q, s.mtp_gate, 1,
+                                         c.n_q_heads, c.head_dim, st);
+    // qk-norm + partial RoPE + append k/v at `pos`. The identity block table makes the paged pool
+    // a dense cache, so this is the same kernel AR decode uses, unchanged.
+    pin[1] = slot0 + d;
+    cudaMemcpyAsync(s.d_pos, pin + 1, sizeof(int), cudaMemcpyHostToDevice, st);
+    kernels::launch_qknorm_rope_kv_partial(s.mtp_q, s.mtp_k, s.mtp_v, m.q_norm, m.k_norm,
+                                           (bf16*)s.mtp_kpool, (bf16*)s.mtp_vpool, s.mtp_btable,
+                                           s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                                           c.rope_dim, c.rope_theta, eps, bs,
+                                           (s.mtp_cap + bs - 1) / bs, st);
+    const int hlen = slot0 + d + 1;
+    pin[2] = hlen;
+    cudaMemcpyAsync(s.mtp_seq, pin + 2, sizeof(int), cudaMemcpyHostToDevice, st);
+    kernels::launch_flash_decode_split(s.mtp_q, s.mtp_kpool, s.mtp_vpool, s.mtp_btable, s.mtp_seq,
+                                       s.mtp_att, s.fa_m, s.fa_l, s.fa_acc, 1, c.n_q_heads,
+                                       c.n_kv_heads, c.head_dim, bs, (s.mtp_cap + bs - 1) / bs,
+                                       1, 1.f / sqrtf((float)c.head_dim), st, nullptr, hlen);
+    kernels::launch_qwen36_mul_sigmoid(s.mtp_att, s.mtp_gate, qdim, st);
+    if (!gemv(s.mtp_att, qdim, m.o_proj, s.mtp_ao, H)) return d;
+    dflash_kernels::launch_add(s.mtp_x, s.mtp_ao, s.mtp_x, H, st);
+
+    kernels::launch_rmsnorm(s.mtp_x, m.post_attention_layernorm, s.mtp_hn, 1, H, eps, st);
+    if (!gemv(s.mtp_hn, H, m.gate_proj, s.mtp_g, ffn)) return d;
+    if (!gemv(s.mtp_hn, H, m.up_proj, s.mtp_u, ffn)) return d;
+    kernels::launch_prefill_swiglu(s.mtp_g, s.mtp_u, s.mtp_sh, ffn, st);
+    if (!gemv(s.mtp_sh, ffn, m.down_proj, s.mtp_ao, H)) return d;
+    dflash_kernels::launch_add(s.mtp_x, s.mtp_ao, s.mtp_x, H, st);
+
+    // final norm -> the TARGET's own lm_head -> argmax
+    kernels::launch_rmsnorm(s.mtp_x, m.norm, s.mtp_xn, 1, H, eps, st);
+    kernels::launch_quantize_q8_1_rows(s.mtp_xn, s.mtp_q81, H, 1, H, st);
+    if (!kernels::launch_mmvq_rows_f32(s.w.lm_head_type, s.mtp_q81, s.w.lm_head, s.logits,
+                                       1, c.vocab, H, st)) return d;
+    kernels::launch_argmax(s.logits, s.mtp_ids + d, 1, c.vocab, st);
+    }
+    cudaMemcpyAsync(out, s.mtp_ids, (size_t)depth * sizeof(int), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    for (int d = 0; d < depth; d++)
+        if (out[d] < 0 || out[d] >= c.vocab) return d;
+    return depth;
+}
+
+bool Qwen35Model::mtp_available() const { return p_ && p_->w.mtp.ok; }
+const void* Qwen35Model::dflash_hidden_ptr() const { return p_ ? p_->dflash_hidden : nullptr; }
+
 const void* Qwen35Model::lm_head_weights() const { return p_->w.lm_head; }
 int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
 
@@ -3205,7 +3396,24 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // deferring them is the branch above: a generation that takes the autoregressive path returns
     // before this line and never materialises them at all.
     draft.ensure_quant();
-    set_dflash_capture(true, dc.target_layer_ids, B);
+    // Draft with the checkpoint's OWN multi-token-prediction head instead of the DSpark draft.
+    //
+    // Measured on this target, free-running on the argmax chain (runtime/examples/mtp_probe.cpp):
+    // MTP proposes the target's next argmax 68.3% of the time against DSpark's 48.6%, and it is
+    // one transformer layer -- 0.59 ms of weight read per step against DSpark's 2.12 ms block.
+    // Both drafters are loss-free by construction: they only NOMINATE, every emitted token is
+    // still a target argmax, so this trades one proposer for another and nothing else.
+    //
+    // The head consumes the PRE-final-norm residual, so the capture list becomes the last layer
+    // alone -- one slot instead of DSpark's five, which also shrinks the capture buffer.
+    // On whenever the checkpoint actually ships the head. A GGUF target, or a checkpoint whose
+    // mtp.* tensors are absent, leaves mtp_available() false and the DSpark draft runs exactly as
+    // before -- so this costs nothing where the head does not exist. SPARKINFER_DSPARK_MTP=0
+    // forces the DSpark draft back, which is how both arms come out of one binary.
+    const bool kMtpDraft = []{ const char* e = getenv("SPARKINFER_DSPARK_MTP");
+                               return !(e && e[0] == '0'); }() && mtp_available();
+    if (kMtpDraft) set_dflash_capture(true, {s.cfg.n_layers - 1}, B);
+    else           set_dflash_capture(true, dc.target_layer_ids, B);
 
     const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
     clear_prefix_cache();
@@ -3303,8 +3511,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // every proposal that block already computes. Depth 4 needs a 5-wide block, which rounds to
     // the checkpoint's block_size of 7 -- a width the draft's batched GEMV is not instantiated
     // for -- so the draft falls onto its per-token loop and costs 9.92 ms instead of 2.52.
-    const int kProposalDepth = kProposalDepthEnv > 0 ? kProposalDepthEnv
-                             : ((n + max_new) >= kDeepMinSeq ? 7 : 3);
+    // The MTP head predicts one token per pass, so its depth is a RECURSION count (see
+    // mtp_propose). Two is the default: it is what lifts acceptance past the 3-deep DSpark block
+    // this replaces, at two thirds of that block's weight traffic.
+    static const int kMtpDepth = []{ const char* e = getenv("SPARKINFER_DSPARK_MTP_DEPTH");
+                                     int v = e ? atoi(e) : 2; return v < 1 ? 1 : v; }();
+    const int kProposalDepth = kMtpDraft ? kMtpDepth
+                             : (kProposalDepthEnv > 0 ? kProposalDepthEnv
+                                : ((n + max_new) >= kDeepMinSeq ? 7 : 3));
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
@@ -3634,9 +3848,24 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // A NaN survivor means no head, and the planner falls back to the fixed depth.
         for (int i = 0; i <= kProposalDepth; i++)
             draft_confidence[i] = std::numeric_limits<float>::quiet_NaN();
-        const bool draft_ok = draft_idle ? true : draft.forward_block(
+        bool draft_ok = true;
+        if (kMtpDraft) {
+            // MTP(h, emb(block[0])) -> the token after block[0]. `h` is the pre-final-norm hidden
+            // of the row that produced block[0], which is the last accepted row of the previous
+            // verify -- capture slot row th_len-1, and the capture list is one layer wide here so
+            // the row stride is exactly hidden.
+            if (!draft_idle) {
+                const char* hp = static_cast<const char*>(target_hidden) +
+                                 (size_t)(th_len > 0 ? th_len - 1 : 0) * s.cfg.hidden * 2;
+                const int got = mtp_propose(hp, block[0], start, kProposalDepth,
+                                            draft_ids.data() + 1);
+                draft_ok = got == kProposalDepth;
+            }
+        } else {
+            draft_ok = draft_idle ? true : draft.forward_block(
             draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth,
             draft_confidence.data());
+        }
         if (!draft_idle) {
             ls_d_sum += std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - _td).count();
@@ -5381,6 +5610,69 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     s.w.lm_head = requant_q4k(dequant_any("lm_head", c.vocab, H), (long)c.vocab * H,
                               s.w.lm_head_type);
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
+
+    // ---- the checkpoint's own MTP head ------------------------------------------------------
+    // 15 tensors under "mtp.": one complete transformer layer, the two norms that condition it,
+    // and the fc that fuses (normed next-token embedding, normed last hidden state) into its
+    // input. ModelOpt left every one of them BF16 -- they are not among the 400 Linears it
+    // quantized -- so they load through the same dequant_any/requant_q4k pair the lm_head takes,
+    // which is also what keeps the head's resident cost to ~239 MB instead of 849.
+    //
+    // Optional by construction: a checkpoint without an MTP head (or one whose shard was never
+    // downloaded) simply leaves mtp.ok false and every caller falls back to the DSpark draft.
+    // SPARKINFER_QWEN38_MTP=0 skips the load entirely.
+    {
+        static const bool want_mtp = []{ const char* e = getenv("SPARKINFER_QWEN38_MTP");
+                                         return !(e && e[0] == '0'); }();
+        Qwen35MtpWeights& m = s.w.mtp;
+        const int qdim  = c.n_q_heads * c.head_dim;          // 6144
+        const int kvdim = c.n_kv_heads * c.head_dim;         // 1024
+        const int ffn   = c.moe_ffn;                         // 17408
+        if (want_mtp && st.tensor("mtp.fc.weight")) {
+            // BF16 by default. Q4_K would cost 239 MB instead of 849, but the on-read Q4_K GEMV
+            // is only instantiated for a few K, and the head needs K=10240 (fc) and K=17408
+            // (down_proj) -- neither is among them. Correctness first; SPARKINFER_QWEN38_MTP_Q4K=1
+            // takes the smaller form for the shapes that do have a kernel.
+            // Requantised by default. The head is a DRAFTER -- what it returns is only ever a
+            // proposal, and every emitted token is still a target argmax -- so its numerics can
+            // only move acceptance, never correctness. 849 MB of BF16 is 0.85 ms of weight read
+            // per recursion step against Q4_K's ~0.25, and at depth 2 that is the difference
+            // between the head paying for itself and not.
+            static const bool mtp_q4k = []{ const char* e = getenv("SPARKINFER_QWEN38_MTP_Q4K");
+                                            return !(e && e[0] == '0'); }();
+            auto q4 = [&](const char* prefix, int rows, int cols) -> const void* {
+                void* d = dequant_any(prefix, rows, cols);
+                if (!d) return nullptr;
+                if (!mtp_q4k) { s.owned.push_back(d); return d; }
+                int t = 0;
+                const void* r = requant_q4k(d, (long)rows * cols, t);
+                if (m.proj_type == 0) m.proj_type = t;
+                return r;
+            };
+            m.fc        = q4("mtp.fc", H, 2 * H);
+            m.q_proj    = q4("mtp.layers.0.self_attn.q_proj", 2 * qdim, H);
+            m.k_proj    = q4("mtp.layers.0.self_attn.k_proj", kvdim, H);
+            m.v_proj    = q4("mtp.layers.0.self_attn.v_proj", kvdim, H);
+            m.o_proj    = q4("mtp.layers.0.self_attn.o_proj", H, qdim);
+            m.gate_proj = q4("mtp.layers.0.mlp.gate_proj", ffn, H);
+            m.up_proj   = q4("mtp.layers.0.mlp.up_proj", ffn, H);
+            m.down_proj = q4("mtp.layers.0.mlp.down_proj", H, ffn);
+            // Norms take the same +1 this checkpoint needs everywhere else.
+            m.pre_fc_norm_embedding      = load_norm_plus1("mtp.pre_fc_norm_embedding.weight", H);
+            m.pre_fc_norm_hidden         = load_norm_plus1("mtp.pre_fc_norm_hidden.weight", H);
+            m.input_layernorm            = load_norm_plus1("mtp.layers.0.input_layernorm.weight", H);
+            m.post_attention_layernorm   = load_norm_plus1("mtp.layers.0.post_attention_layernorm.weight", H);
+            m.norm                       = load_norm_plus1("mtp.norm.weight", H);
+            m.q_norm = load_norm_plus1("mtp.layers.0.self_attn.q_norm.weight", c.head_dim);
+            m.k_norm = load_norm_plus1("mtp.layers.0.self_attn.k_norm.weight", c.head_dim);
+            m.ok = m.fc && m.q_proj && m.k_proj && m.v_proj && m.o_proj &&
+                   m.gate_proj && m.up_proj && m.down_proj &&
+                   m.pre_fc_norm_embedding && m.pre_fc_norm_hidden && m.input_layernorm &&
+                   m.post_attention_layernorm && m.norm && m.q_norm && m.k_norm;
+            fprintf(stderr, "[compressed-tensors] MTP head %s (qtype=%d)\n",
+                    m.ok ? "loaded" : "INCOMPLETE -> DSpark draft only", m.proj_type);
+        }
+    }
 
     s.w.layers.resize(c.n_layers);
     int gu_ready = 0;

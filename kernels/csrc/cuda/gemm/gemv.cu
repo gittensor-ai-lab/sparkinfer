@@ -3442,7 +3442,7 @@ bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
     // the token loop, and DFlash speculation could never engage on Qwen3.8 at all. 20 (5120) and
     // 24 (6144) are added for exactly that.
     if (M < 1 || M > 8 || N < 1) return false;
-    if (K != 2048 && K != 4096 && K != 5120 && K != 6144) return false;
+    if (K != 2048 && K != 4096 && K != 5120 && K != 6144 && K != 10240 && K != 17408) return false;
     // Dispatch the tightest instantiated row width: MMAX bounds tmp[]/partial[] and the
     // number of predicated row bodies, so a 6-row block should not pay an 8-row footprint.
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
@@ -3454,6 +3454,15 @@ bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
             if (M <= 6) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 6, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
             else        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 8, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
         } while (0)
+    // 10240 (the MTP head's fc, which takes a 2H concat) and 17408 (its ffn_down) are single-row
+    // by construction -- the head drafts one token at a time -- so they instantiate at MMAX=1 and
+    // cost nothing to add: NSUPER only bounds a loop trip count here, not an array.
+    if (K == 10240 || K == 17408) {
+        if (M != 1) return false;
+        if (K == 10240) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 40, 1, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N);
+        else            si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 68, 1, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N);
+        return true;
+    }
     if      (K == 2048) SI_Q4K_ROWS_DISPATCH(8);
     else if (K == 4096) SI_Q4K_ROWS_DISPATCH(16);
     else if (K == 5120) SI_Q4K_ROWS_DISPATCH(20);
