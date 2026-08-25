@@ -1311,7 +1311,28 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
         // Row-batched + KV-split path. Needs the caller's partial-state scratch; without it
         // (or below the sweep's crossover) fall through to the single-CTA-per-row kernel.
         if (fa_m && fa_l && fa_acc && attn_gqa_split_path_ok(q_len, kv_len, n_q, n_kv, d)) {
-            constexpr int ROWS = 2, NWARPS = 8;
+            constexpr int NWARPS = 8;
+            // QUERY ROWS PER CTA. The grid is (ceil(q_len/ROWS), n_q, n_splits) and the kv head is
+            // derived per q head, so each K/V byte is re-read (n_q/n_kv) x ceil(q_len/ROWS) times.
+            // On Qwen3.8's DSpark draft that is 5 x ceil(q_len/ROWS): at #913's block width of 7
+            // and ROWS=2 it is FOUR row groups, so 20 reads of every key. The draft's per-layer KV
+            // is ~17 MB at ctx 4k, small enough to sit in L2, which is why this shows up as
+            // ~139 GB/s of "DRAM" and 0.60 ms a block -- 29% of the whole draft -- rather than as
+            // a bandwidth wall. Widening the row tile is the only knob here that removes reads
+            // rather than moving them: ROWS >= q_len collapses the row groups to one.
+            // ROWS 2 -> 4 is on record as a REGRESSION, but that was measured when the block was
+            // 4 wide, where it was 2 row groups -> 1 and halved the grid. At #913's width of 7 it
+            // is 4 groups -> 1 and the trade is different, so it was re-derived rather than
+            // inherited. Measured at ctx 4096, K=65536, one binary, draft ms/block:
+            //     ROWS 2 -> 2.070    ROWS 4 -> 2.001    ROWS 8 -> 1.955
+            // Monotone, so the old note does not hold at this width. 8 covers the whole block in
+            // one group; the epilogue already drops rows past q_len, so the overhang is free.
+            // SPARKINFER_DFLASH_ATTN_ROWS pins it for an A/B out of one binary.
+            static const int rows_env = []{
+                const char* e = getenv("SPARKINFER_DFLASH_ATTN_ROWS");
+                int v = e ? atoi(e) : 8;
+                return (v == 2 || v == 4 || v == 8) ? v : 8;
+            }();
             const int n_splits_full = attn_gqa_splits(kv_len);
             // A sliding-window layer masks a key only after the kernel has loaded it and reduced
             // its QK dot, so past the window length it streams the whole cache to discard most of
@@ -1321,11 +1342,19 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
             // q_pos0 - k_pos0 - window is dead for the whole block: start the partition above it.
             const int kv_lo = attn_gqa_kv_lo(q_len, kv_len, n_q, n_kv, d, q_pos0, k_pos0, window);
             const int n_splits = kv_lo > 0 ? attn_gqa_splits(kv_len - kv_lo) : n_splits_full;
-            const size_t smem = (size_t)(2 * NWARPS * ROWS + NWARPS * ROWS * 128) * sizeof(float);
-            dim3 g((q_len + ROWS - 1) / ROWS, n_q, n_splits);
-            k_attn_rows_split_hd128<ROWS, NWARPS><<<g, NWARPS * 32, smem, stream>>>(
-                (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc,
-                q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale, n_splits);
+#define SI_DF_ATTN_ROWS(R)                                                                    \
+            do {                                                                                  \
+                const size_t smem = (size_t)(2 * NWARPS * (R) + NWARPS * (R) * 128) * sizeof(float); \
+                dim3 g((q_len + (R) - 1) / (R), n_q, n_splits);                                   \
+                k_attn_rows_split_hd128<(R), NWARPS><<<g, NWARPS * 32, smem, stream>>>(           \
+                    (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc,           \
+                    q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale,       \
+                    n_splits);                                                                    \
+            } while (0)
+            if (rows_env == 8)      SI_DF_ATTN_ROWS(8);
+            else if (rows_env == 4) SI_DF_ATTN_ROWS(4);
+            else                    SI_DF_ATTN_ROWS(2);
+#undef SI_DF_ATTN_ROWS
             k_attn_split_combine<<<dim3(q_len, n_q), 128, 0, stream>>>(
                 fa_m, fa_l, fa_acc, (bf16*)out, n_q, n_splits);
             return;

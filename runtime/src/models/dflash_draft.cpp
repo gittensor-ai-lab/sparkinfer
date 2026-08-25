@@ -1354,6 +1354,62 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // GEMV against the eagerly dequantized bf16 lm_head cache instead of a per-token
     // quantized GEMV loop.
     const int V = s.vocab > 0 ? s.vocab : c.vocab;
+    // DRAFT OUTPUT VOCABULARY (SPARKINFER_DFLASH_DRAFT_VOCAB, 0 = full).
+    //
+    // Everything downstream of the backbone is proportional to the vocabulary, and on Qwen3.8 that
+    // vocabulary is 248320. Per block the head streams the target's Q4_K LM head once (715 MB) and
+    // then the Markov chain re-reads w2 -- [248320, 256] int8 plus its per-32 scales, ~71 MB --
+    // ONCE PER PROPOSAL ROW, serially. Between them they are the two largest items in the draft,
+    // and #913 made that worse in the direction that matters here: at depth 4 the chain runs four
+    // rows, so the head moves 715 + 4 x 71 = ~1001 MB a block.
+    //
+    // Both are NOMINATION-only: a token this head cannot score is simply never proposed, which
+    // costs at most one acceptance and can never change what is emitted, because every emitted
+    // token is still a target argmax over the FULL vocabulary. So the head may score a prefix.
+    //
+    // The rows are contiguous in both tables ([vocab, ...], row-major), so a prefix is just a
+    // smaller length -- no repack, no second copy, no extra VRAM. Qwen3.8's vocabulary has no
+    // reserved tail to reclaim (only 243 of the 248320 ids are undefined), but it IS
+    // frequency-ordered, and coverage plateaus hard. Fraction of tokens with id < K:
+    //
+    //     K        bench_prompt_4k   repo prose   repo C++     LM head   w2+scales
+    //     32768        92.61%          90.86%      93.77%        94 MB      9.4 MB
+    //     65536        97.53%          96.64%      97.92%       189 MB     18.7 MB
+    //     98304        99.95%          99.23%     100.00%       283 MB     28.1 MB
+    //    163840        99.95%          99.38%     100.00%       472 MB     46.8 MB
+    //
+    // Three unrelated corpora agree on the shape: the ids above ~100k are rare scripts and exotic
+    // unicode, not this text, and by 65536 the curve has already flattened to within 2.5% of it.
+    //
+    // 65536 is NOT the throughput peak. Swept end to end at ctx 4096, one binary, tok/s and mean
+    // accept, with the draft's own per-block cost:
+    //
+    //     K         DSPARK tok/s   draft ms/block   mean accept
+    //     248320      122.87           2.575          1.8286
+    //     131072      125.90           2.250          1.8286
+    //      98304      125.98           2.159          1.8286
+    //      65536      127.08           2.075          1.8286
+    //      49152      127.84           2.03           1.8286   <- peak
+    //      32768      125.90           1.99           1.8028
+    //      24576      126.42           1.96           1.8028
+    //      16384      125.00           1.94           1.7778
+    //
+    // Acceptance is flat down to 49152 and turns over below it: at 32768 the generation needs an
+    // extra step (128 tokens in 71 instead of 70), which is what mean accept 1.8286 -> 1.8028 is.
+    // So 49152 sits ONE step from that edge, and its 0.6% advantage over 65536 was found by
+    // walking the prompt this benchmark scores. 65536 is taken off the coverage curve instead --
+    // the one three unrelated corpora agree on -- and keeps a full step of margin. Giving up 0.6%
+    // is the right side to err on for a change whose entire safety argument is coverage.
+    //
+    // The Markov head's OTHER table, w1, is indexed by the PREVIOUS token and is not pruned: the
+    // conditioning still accepts any target token, only the output side is narrowed.
+    static const int kDraftVocab = []{
+        const char* e = getenv("SPARKINFER_DFLASH_DRAFT_VOCAB");
+        return e ? atoi(e) : 65536;
+    }();
+    // Vd is the logits ROW STRIDE as well as the length: the multi-row head writes y[m*N + n], so
+    // the stride has to travel with it or the Markov chain reads the wrong row.
+    const int Vd = (kDraftVocab > 0 && kDraftVocab < V) ? kDraftVocab : V;
     // The batched bf16 head (#661) still streams the DEQUANTIZED head every step: at V=248k,
     // K=2048 that is ~1.0 GB per pass versus ~416 MB for the native Q6_K bytes, and it pins ~1 GB
     // of VRAM for the bf16 cache. Prefer a multi-row Q6_K MMVQ that keeps the head quantized: each
@@ -1390,31 +1446,31 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         if (s.lm_head_type == 12 && s.lm_head_i4)
             head_done = kernels::launch_gemv_i4_q81_multirow_f32(
                 s.head_q8, s.lm_head_i4, s.lm_head_i4_scale,
-                s.logits + (size_t)head_row0 * V, V, H, kProposalDepth, st);
+                s.logits + (size_t)head_row0 * Vd, Vd, H, kProposalDepth, st);
         else if (s.lm_head_type == 12 && head_i8 && s.lm_head_i8)
             head_done = kernels::launch_gemv_i8_q81_multirow_f32(
                 s.head_q8, s.lm_head_i8, s.lm_head_i8_scale,
-                s.logits + (size_t)head_row0 * V, V, H, kProposalDepth, st);
+                s.logits + (size_t)head_row0 * Vd, Vd, H, kProposalDepth, st);
         else if (s.lm_head_type == 12)
             head_done = kernels::launch_gemv_q4k_dp4a_multirow_f32(
-                s.head_q8, s.lm_head, s.logits + (size_t)head_row0 * V,
-                V, H, kProposalDepth, st);
+                s.head_q8, s.lm_head, s.logits + (size_t)head_row0 * Vd,
+                Vd, H, kProposalDepth, st);
         else
             head_done = kernels::launch_gemv_q6k_dp4a_multirow_f32(
-                s.head_q8, s.lm_head, s.logits + (size_t)head_row0 * V,
-                V, H, kProposalDepth, st);
+                s.head_q8, s.lm_head, s.logits + (size_t)head_row0 * Vd,
+                Vd, H, kProposalDepth, st);
     }
     if (!head_done) {
     if (BW == 16) {
-        dflash_kernels::launch_gemv_batched16_f32(s.xn, s.lm_head_bf16, s.logits, V, H, st);
+        dflash_kernels::launch_gemv_batched16_f32(s.xn, s.lm_head_bf16, s.logits, Vd, H, st);
     } else {
         for (int t = 0; t < B; t++) {
             const bf16* row = s.xn + (size_t)t * H;
-            float* logit_row = s.logits + (size_t)t * V;
+            float* logit_row = s.logits + (size_t)t * Vd;
             if (s.lm_head_type)
-                kernels::launch_gemv_q_f32(row, s.lm_head, s.lm_head_type, logit_row, V, H, st);
+                kernels::launch_gemv_q_f32(row, s.lm_head, s.lm_head_type, logit_row, Vd, H, st);
             else
-                kernels::launch_gemv_f32(row, s.lm_head, logit_row, V, H, st);
+                kernels::launch_gemv_f32(row, s.lm_head, logit_row, Vd, H, st);
         }
     }
     }
@@ -1476,19 +1532,19 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // That is consistent with the symptom: tau lands well above 1.0 because the Markov bias,
         // conditioned correctly, partially compensates for the wrong base row -- but it is capped,
         // and deeper drafting buys nothing because every position is displaced.
-        if (!head_done) kernels::launch_argmax(s.logits, s.d_out, 1, V, st);
+        if (!head_done) kernels::launch_argmax(s.logits, s.d_out, 1, Vd, st);
         for (int r = 1; r <= kProposalDepth; r++) {
             const int* prev = (r == 1) ? s.d_ids : (s.d_out + (r - 1));
             const size_t row = (size_t)(kRowShift ? r - 1 : r);
             if (s.markov_w2_q)
                 dflash_kernels::launch_markov_bias_add_q8(
                     s.markov_w1, s.markov_w2_q, s.markov_w2_s, prev,
-                    s.logits + row * V, V, s.markov_rank, st,
+                    s.logits + row * Vd, Vd, s.markov_rank, st,
                     s.confidence_w ? s.markov_latent : nullptr);
             else
                 dflash_kernels::launch_markov_bias_add(
                     s.markov_w1, s.markov_w2, prev,
-                    s.logits + row * V, V, s.markov_rank, st,
+                    s.logits + row * Vd, Vd, s.markov_rank, st,
                     s.confidence_w ? s.markov_latent : nullptr);
             // Confidence head (optional): reads THIS row's hidden state + the Markov latent the
             // bias call above just wrote, predicting how likely this row's (about to be computed)
@@ -1498,12 +1554,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                 dflash_kernels::launch_confidence_head(s.xn + row * H, s.markov_latent,
                                                        s.confidence_w, s.confidence_bias, H,
                                                        s.markov_rank, s.d_confidence + r, st);
-            kernels::launch_argmax(s.logits + row * V, s.d_out + r, 1, V, st);
+            kernels::launch_argmax(s.logits + row * Vd, s.d_out + r, 1, Vd, st);
         }
     } else {
-        kernels::launch_argmax(s.logits + (size_t)(head_done ? head_row0 : 0) * V,
+        kernels::launch_argmax(s.logits + (size_t)(head_done ? head_row0 : 0) * Vd,
                                s.d_out + (head_done ? 1 : 0),
-                               head_done ? kProposalDepth : B, V, st);
+                               head_done ? kProposalDepth : B, Vd, st);
     }
     if (head_done)
         cu(cudaMemcpyAsync(s.h_out + 1, s.d_out + 1, kProposalDepth * sizeof(int),
