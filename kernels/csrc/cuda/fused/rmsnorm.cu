@@ -177,12 +177,24 @@ __global__ void add_rmsnorm2_kernel(const __nv_bfloat16* __restrict__ x,
 // (blockDim*8 == cols), so each 32-element Q8_1 block maps to 4 consecutive threads. The Q8_1
 // is computed from the bf16-rounded out_norm, so it is bit-identical to running the standalone
 // quantizer on out_norm afterwards.
+//
+// NV: also emit the NVFP4 activation form (symmetric int8 with one fp32 scale per 16) that the
+// checkpoint-native FFN/projection GEMVs want. The verify issues one standalone
+// si_nvfp4_quant_x_kernel per norm output -- 128 of them a step at ~1.26 us, nearly all node ramp
+// for ~40 KB of work -- and every input it reads is a value this kernel already has in registers.
+// Bit-identical to that kernel on out_norm: same bf16-rounded values, max over the same 16, and
+// the same `amax * (1/127)` scale and `127/amax` inverse, in the same order. The 16-element group
+// is two ADJACENT threads (each owns 8 consecutive elements of the row) and blockDim is a multiple
+// of 16, so a group never straddles a warp -- one shuffle completes it.
+template <bool NV>
 __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
                                        const __nv_bfloat16* __restrict__ residual,
                                        const __nv_bfloat16* __restrict__ weight,
                                        __nv_bfloat16* __restrict__ out_sum,
                                        __nv_bfloat16* __restrict__ out_norm,
                                        si_blk_q8_1* __restrict__ out_q8,
+                                       signed char* __restrict__ nv_q,
+                                       float* __restrict__ nv_s,
                                        int cols, float eps) {
     const size_t base = (size_t)blockIdx.x * cols;
     __shared__ float s_warp[32];
@@ -192,7 +204,14 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
     uint4* osum4 = reinterpret_cast<uint4*>(out_sum + base);
     out_q8 += (size_t)blockIdx.x * (cols >> 5);
 
-    float xv[8], rv[8]; rn_unpack8(__ldg(x4 + t), xv); rn_unpack8(__ldg(r4 + t), rv);
+    // The norm weight is issued WITH x and residual rather than after the block reduction. It
+    // never depended on the reduction, and at grid = rows (three or four CTAs for a verify block)
+    // there is no other work resident to hide a load started that late. Same values. On its own
+    // this was inside the run-to-run spread; it is here because it costs nothing and it is the
+    // same shape of fix as the register round-trip the comment below describes.
+    const uint4* w4 = reinterpret_cast<const uint4*>(weight);
+    float xv[8], rv[8], wv[8];
+    rn_unpack8(__ldg(x4 + t), xv); rn_unpack8(__ldg(r4 + t), rv); rn_unpack8(__ldg(w4 + t), wv);
     float sv[8]; float ss = 0.f;
     #pragma unroll
     for (int j = 0; j < 8; j++) { sv[j] = xv[j] + rv[j]; ss = __fmaf_rn(sv[j], sv[j], ss); }
@@ -213,15 +232,26 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
     // own, so the round trip only made each thread wait for its own store to become visible, and
     // at grid = rows (three or four CTAs for a verify block) there is nothing else resident to
     // hide that. Same values, so out_norm and the Q8_1 below are bit-identical either way.
-    const uint4* w4 = reinterpret_cast<const uint4*>(weight);
-    float svb[8], wv[8];
+    float svb[8];
     #pragma unroll
     for (int j = 0; j < 8; j++) svb[j] = __bfloat162float(__float2bfloat16(sv[j]));
-    rn_unpack8(__ldg(w4 + t), wv);
     float ov[8], bv[8];
     #pragma unroll
     for (int j = 0; j < 8; j++) { ov[j] = svb[j] * inv_rms * wv[j]; bv[j] = __bfloat162float(__float2bfloat16(ov[j])); }
     reinterpret_cast<uint4*>(out_norm + base)[t] = rn_pack8(ov);
+
+    if (NV) {
+        float a16 = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) a16 = fmaxf(a16, fabsf(bv[j]));
+        a16 = fmaxf(a16, __shfl_xor_sync(0xffffffffu, a16, 1));
+        const float inv = a16 > 0.f ? 127.f / a16 : 0.f;
+        signed char nb[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) nb[j] = (signed char)__float2int_rn(bv[j] * inv);
+        reinterpret_cast<uint2*>(nv_q + base)[t] = *reinterpret_cast<const uint2*>(nb);
+        if ((t & 1) == 0) nv_s[(base >> 4) + (t >> 1)] = a16 * (1.f / 127.f);
+    }
 
     // Q8_1 of the bf16-rounded out_norm. 32-block = 4 consecutive threads (t&~3 .. +3).
     float amax = 0.f;
@@ -818,13 +848,13 @@ void launch_add_rmsnorm2_q8(const void* x, const void* residual, const void* wei
     // cols % 256 == 0 (every warp full, each 32-block within one warp) and cols/8 <= 1024
     // (max block dim). The decode residual width (hidden = 2048) satisfies both.
     assert(cols % 256 == 0 && (cols >> 3) <= 1024);
-    add_rmsnorm2_q8_kernel<<<1, cols >> 3, 0, stream>>>(
+    add_rmsnorm2_q8_kernel<false><<<1, cols >> 3, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x),
         reinterpret_cast<const __nv_bfloat16*>(residual),
         reinterpret_cast<const __nv_bfloat16*>(weight),
         reinterpret_cast<__nv_bfloat16*>(out_sum),
         reinterpret_cast<__nv_bfloat16*>(out_norm),
-        reinterpret_cast<si_blk_q8_1*>(out_q8), cols, eps);
+        reinterpret_cast<si_blk_q8_1*>(out_q8), nullptr, nullptr, cols, eps);
 }
 
 void launch_add_rmsnorm3_q8(const void* x, const void* res1, const void* res2, const void* weight,
@@ -845,10 +875,27 @@ void launch_add_rmsnorm2_q8_rows(const void* x, const void* residual, const void
                                  void* out_sum, void* out_norm, void* out_q8,
                                  int rows, int cols, float eps, cudaStream_t stream) {
     assert(rows > 0 && cols % 256 == 0 && (cols >> 3) <= 1024);
-    add_rmsnorm2_q8_kernel<<<rows, cols >> 3, 0, stream>>>(
+    add_rmsnorm2_q8_kernel<false><<<rows, cols >> 3, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(residual),
         reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out_sum),
-        reinterpret_cast<__nv_bfloat16*>(out_norm), reinterpret_cast<si_blk_q8_1*>(out_q8), cols, eps);
+        reinterpret_cast<__nv_bfloat16*>(out_norm), reinterpret_cast<si_blk_q8_1*>(out_q8),
+        nullptr, nullptr, cols, eps);
+}
+
+// Same, plus the NVFP4 activation form of out_norm. cols must be a multiple of 256 (which already
+// makes it a multiple of 16, so the per-16 groups tile the row exactly). Declines -- writing
+// nothing and returning false -- for anything else, so the caller keeps its standalone quantize.
+bool launch_add_rmsnorm2_q8_nvfp4_rows(const void* x, const void* residual, const void* weight,
+                                       void* out_sum, void* out_norm, void* out_q8,
+                                       void* nv_q, void* nv_s,
+                                       int rows, int cols, float eps, cudaStream_t stream) {
+    if (!nv_q || !nv_s || rows <= 0 || (cols % 256) != 0 || (cols >> 3) > 1024) return false;
+    add_rmsnorm2_q8_kernel<true><<<rows, cols >> 3, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(residual),
+        reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out_sum),
+        reinterpret_cast<__nv_bfloat16*>(out_norm), reinterpret_cast<si_blk_q8_1*>(out_q8),
+        reinterpret_cast<signed char*>(nv_q), reinterpret_cast<float*>(nv_s), cols, eps);
+    return true;
 }
 
 void launch_add_rmsnorm3_q8_rows(const void* x, const void* res1, const void* res2,

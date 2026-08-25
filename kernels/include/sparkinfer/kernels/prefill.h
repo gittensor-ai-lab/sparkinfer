@@ -119,6 +119,13 @@ void launch_dflash_gdn_scan_commit(const void* k, const void* v,
 
 // Batched gated RMSNorm: out[t,h,:] = (x/rms(x)) * weight * silu(z), per (token, v_head).
 //   x/z: [N, v_heads*hd]   weight: [hd]   out: [N, v_heads*hd]
+// Gated RMSNorm that ALSO writes the NVFP4 activation form of `out` (int8 quants + one fp32
+// scale per 16), bit-identical to launch_gemv_nvfp4_quant_x run on `out` afterwards. False (and
+// nothing written) for a shape it cannot cover.
+bool launch_prefill_gated_norm_nvfp4(const void* x, const void* z, const void* weight, void* out,
+                                     void* nv_q, void* nv_s,
+                                     int n_tokens, int v_heads, int head_dim, float eps,
+                                     cudaStream_t stream = nullptr);
 void launch_prefill_gated_norm(const void* x, const void* z, const void* weight, void* out,
                                int n_tokens, int v_heads, int head_dim, float eps,
                                cudaStream_t stream = nullptr);
