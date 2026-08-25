@@ -28,6 +28,14 @@ void launch_add_rmsnorm2_q8_rows(const void* x_bf16, const void* residual_bf16,
                                  const void* weight_bf16, void* out_sum_bf16,
                                  void* out_norm_bf16, void* out_q8, int rows, int cols,
                                  float eps, cudaStream_t stream = nullptr);
+// Same, and ALSO writes the NVFP4 activation form of out_norm (int8 quants + one fp32 scale per
+// 16), bit-identical to launch_gemv_nvfp4_quant_x run on out_norm afterwards. False (and nothing
+// written) when the shape does not fit, so the caller keeps its standalone quantize.
+bool launch_add_rmsnorm2_q8_nvfp4_rows(const void* x_bf16, const void* residual_bf16,
+                                       const void* weight_bf16, void* out_sum_bf16,
+                                       void* out_norm_bf16, void* out_q8,
+                                       void* nv_q, void* nv_s, int rows, int cols,
+                                       float eps, cudaStream_t stream = nullptr);
 
 // Sandwich-norm residual add (Gemma2/Muse-Glimmer style): out = residual + RMSNorm(block_out)
 // * weight. Unlike add_rmsnorm2/3 above (which norm the SUM), this norms block_out ALONE --

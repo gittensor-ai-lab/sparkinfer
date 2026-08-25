@@ -425,6 +425,149 @@ __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
     }
 }
 
+// KEY-TILED form of k_attn_rows_split_hd128. BIT-IDENTICAL to it -- same value, same last bit.
+//
+// What is wrong with the one-key-at-a-time loop: it does a FIVE-STEP warp reduction per key and
+// then folds that key into the online-softmax state, so every iteration is
+//   reduce -> broadcast -> exp -> rescale acc
+// with the reduction INSIDE the loop-carried chain. The kernel is not DRAM-bound (135 GB/s
+// unique), not L2-bound (677) and not compute-bound (2.4 TFLOP/s) at this shape; it is waiting on
+// that chain. The ROWS sweep is the proof: ROWS 2 -> 8 cuts the K/V traffic FOURFOLD and buys only
+// 5%, because the traffic was never the cost and the per-warp key count -- and so the chain length
+// -- is the same either way.
+//
+// This form gives each warp KT of its OWN keys per trip and splits the iteration in two:
+//   1. the KT x ROWS QK dots are computed first, so their reductions are mutually INDEPENDENT and
+//      pipeline instead of each one serialising behind the previous key's softmax update;
+//   2. the reduction is a shfl_xor BUTTERFLY, which pairs lanes in exactly the tree shfl_down
+//      builds at lane 0 -- so it is the same float -- and leaves it in EVERY lane, retiring the
+//      separate broadcast shuffle each row needed;
+//   3. only then are the KT keys folded into the state, one at a time, in the original order.
+//
+// Step 3 is deliberately NOT tiled. Taking a max over KT keys at once would shorten the carried
+// chain further, but it changes the rescale factors in the last bits -- and while that is legal
+// here (the draft only nominates; the target verifies every proposal, so losslessness cannot
+// move), it perturbs which tokens get proposed and measured as a whole generation step of tau. The
+// win is the reduction leaving the chain, not the softmax fold, so this keeps the free half.
+//
+// The warp's key SEQUENCE is also preserved: warp w still walks t0+w, t0+w+NWARPS, ... in that
+// order, so its partial (m, l, acc) -- and the cross-warp merge in the epilogue -- are unchanged.
+template <int ROWS, int NWARPS, int KT>
+__global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_tile_hd128(
+    const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
+    float* __restrict__ p_m, float* __restrict__ p_l, float* __restrict__ p_acc,
+    int q_len, int kv_lo, int kv_len, int n_q, int n_kv,
+    int q_pos0, int k_pos0, int window, bool causal, float scale, int n_splits) {
+    constexpr int D = 128, E = D / 32;
+    const int rg = blockIdx.x, qh = blockIdx.y, sp = blockIdx.z;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int base = lane * E;
+    const int kv_h = qh / (n_q / n_kv);
+    const int qt0 = rg * ROWS;
+
+    float qr[ROWS][E], acc[ROWS][E], max_s[ROWS], sum[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const int qt = qt0 + r;
+        const bf16* qv = q + ((size_t)qt * n_q + qh) * D + base;
+#pragma unroll
+        for (int e = 0; e < E; e++) { qr[r][e] = (qt < q_len) ? b2f(qv[e]) : 0.f; acc[r][e] = 0.f; }
+        max_s[r] = -1e30f;
+        sum[r] = 0.f;
+    }
+
+    const int chunk = (kv_len - kv_lo + n_splits - 1) / n_splits;
+    const int t0 = kv_lo + sp * chunk;
+    const int t1 = min(kv_len, t0 + chunk);
+
+    for (int tb = t0 + warp; tb < t1; tb += NWARPS * KT) {
+        float sc[ROWS][KT], vr[KT][E];
+        // 1. KT independent key loads and KT x ROWS independent dots.
+#pragma unroll
+        for (int u = 0; u < KT; u++) {
+            const int t = tb + u * NWARPS;
+            const int ts = (t < t1) ? t : tb;              // in-range address for the dead lane-set
+            const bf16* kp = k + ((size_t)ts * n_kv + kv_h) * D + base;
+            const bf16* vp = v + ((size_t)ts * n_kv + kv_h) * D + base;
+            float kreg[E];
+#pragma unroll
+            for (int e = 0; e < E; e++) { kreg[e] = b2f(kp[e]); vr[u][e] = b2f(vp[e]); }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                float d = 0.f;
+#pragma unroll
+                for (int e = 0; e < E; e++) d += qr[r][e] * kreg[e];
+                sc[r][u] = d;
+            }
+        }
+        // 2. One butterfly pass over all ROWS*KT partial dots.
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+#pragma unroll
+            for (int r = 0; r < ROWS; r++)
+#pragma unroll
+                for (int u = 0; u < KT; u++)
+                    sc[r][u] += __shfl_xor_sync(0xffffffffu, sc[r][u], off);
+        // 3. Fold the tile into the state, key by key, in the original order.
+#pragma unroll
+        for (int u = 0; u < KT; u++) {
+            const int t = tb + u * NWARPS;
+            if (t >= t1) break;
+            const int k_pos = k_pos0 + t;
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const int qt = qt0 + r;
+                if (qt >= q_len) continue;
+                const int q_pos = q_pos0 + qt;
+                if (causal && k_pos > q_pos) continue;
+                if (window > 0 && (q_pos - k_pos) >= window) continue;
+                const float score = sc[r][u] * scale;
+                const float new_max = fmaxf(max_s[r], score);
+                const float e1 = __expf(max_s[r] - new_max);
+                const float e2 = __expf(score - new_max);
+                sum[r] = sum[r] * e1 + e2;
+#pragma unroll
+                for (int e = 0; e < E; e++) acc[r][e] = acc[r][e] * e1 + e2 * vr[u][e];
+                max_s[r] = new_max;
+            }
+        }
+    }
+
+    extern __shared__ float sm[];
+    float* s_max = sm;
+    float* s_sum = s_max + NWARPS * ROWS;
+    float* s_acc = s_sum + NWARPS * ROWS;
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        if (lane == 0) { s_max[warp * ROWS + r] = max_s[r]; s_sum[warp * ROWS + r] = sum[r]; }
+#pragma unroll
+        for (int e = 0; e < E; e++)
+            s_acc[((size_t)warp * ROWS + r) * D + base + e] = acc[r][e];
+    }
+    __syncthreads();
+    if (warp != 0) return;
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const int qt = qt0 + r;
+        if (qt >= q_len) continue;
+        float gmax = -1e30f;
+        for (int w = 0; w < NWARPS; w++) gmax = fmaxf(gmax, s_max[w * ROWS + r]);
+        float gsum = 0.f;
+        float result[E] = {0.f, 0.f, 0.f, 0.f};
+        for (int w = 0; w < NWARPS; w++) {
+            const float c = __expf(s_max[w * ROWS + r] - gmax);
+            gsum += s_sum[w * ROWS + r] * c;
+#pragma unroll
+            for (int e = 0; e < E; e++)
+                result[e] += s_acc[((size_t)w * ROWS + r) * D + base + e] * c;
+        }
+        const size_t o = ((size_t)qt * n_q + qh) * n_splits + sp;
+#pragma unroll
+        for (int e = 0; e < E; e++) p_acc[o * D + base + e] = result[e];
+        if (lane == 0) { p_m[o] = gmax; p_l[o] = gsum; }
+    }
+}
+
 // Merge the per-split online-softmax partials into the bf16 output.
 __global__ void k_attn_split_combine(const float* __restrict__ p_m, const float* __restrict__ p_l,
                                      const float* __restrict__ p_acc, bf16* __restrict__ out,
@@ -1342,14 +1485,36 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
             // q_pos0 - k_pos0 - window is dead for the whole block: start the partition above it.
             const int kv_lo = attn_gqa_kv_lo(q_len, kv_len, n_q, n_kv, d, q_pos0, k_pos0, window);
             const int n_splits = kv_lo > 0 ? attn_gqa_splits(kv_len - kv_lo) : n_splits_full;
+            // KEYS PER TRIP for the tiled kernel above. 0 keeps the one-key-at-a-time kernel,
+            // which is what every earlier measurement on this shape was taken against.
+            // KEYS PER TRIP for the tiled kernel above. Swept end to end at ctx 4k, one binary,
+            // draft ms/block (the low-noise signal -- tok/s is quantised by a whole generation
+            // step here):  KT 0 (untiled) 1.951, KT 2 -> 1.798, KT 4 -> 1.952.
+            // Unimodal at 2, and only 2 is instantiated: a wider tile holds KT keys' worth of V
+            // and KT*ROWS partial dots live, which at ROWS=8 costs more occupancy than the shorter
+            // chain buys back (ptxas: 128 registers at KT=2 against 205 at KT=4 and 254 at KT=8,
+            // the last one block per SM). Instantiating the losing widths anyway cost 8.6 MB of
+            // device code across the four architectures this builds for, for kernels that only an
+            // A/B would ever launch. 0 keeps the one-key-at-a-time kernel for that A/B.
+            static const int kt_env = []{
+                const char* e = getenv("SPARKINFER_DFLASH_ATTN_KT");
+                int v = e ? atoi(e) : 2;
+                return (v == 0 || v == 2) ? v : 2;
+            }();
 #define SI_DF_ATTN_ROWS(R)                                                                    \
             do {                                                                                  \
                 const size_t smem = (size_t)(2 * NWARPS * (R) + NWARPS * (R) * 128) * sizeof(float); \
                 dim3 g((q_len + (R) - 1) / (R), n_q, n_splits);                                   \
-                k_attn_rows_split_hd128<(R), NWARPS><<<g, NWARPS * 32, smem, stream>>>(           \
-                    (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc,           \
-                    q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale,       \
-                    n_splits);                                                                    \
+                if (kt_env == 2)                                                                  \
+                    k_attn_rows_tile_hd128<(R), NWARPS, 2><<<g, NWARPS * 32, smem, stream>>>(     \
+                        (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc,       \
+                        q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale,   \
+                        n_splits);                                                                \
+                else                                                                              \
+                    k_attn_rows_split_hd128<(R), NWARPS><<<g, NWARPS * 32, smem, stream>>>(       \
+                        (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc,       \
+                        q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale,   \
+                        n_splits);                                                                \
             } while (0)
             if (rows_env == 8)      SI_DF_ATTN_ROWS(8);
             else if (rows_env == 4) SI_DF_ATTN_ROWS(4);

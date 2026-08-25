@@ -806,15 +806,94 @@ __global__ void df_gdn_conv_checkpoint_kernel(
     }
 }
 
+// TOKEN-PARALLEL form of df_gdn_conv_checkpoint_kernel.
+//
+// The causal conv is an FIR filter, not a recurrence: y[tok] depends only on the conv_kernel
+// inputs at positions tok-conv_kernel+1..tok, all of which are already in `qkv` (or, for negative
+// positions, in the seeded decode state). The kernel above nevertheless walks the tokens SERIALLY
+// so it can carry `hist` in registers, and pays for it twice -- the whole per-token chain
+// (including two or three block barriers for the q/k norm) is serialised, and the grid is only
+// 2*q_heads + v_heads = 80 CTAs, so 90 of this box's 170 SMs sit idle for the 4.3 us it takes.
+//
+// Reconstructing the window per token from memory costs conv_kernel-1 extra loads (they are the
+// same cache lines the neighbouring CTAs read) and gives grid.y = n_tokens.
+//
+// BIT-IDENTICAL to the serial kernel: the same taps in the same ascending order, the current
+// token's tap last -- the order the single-token decode conv uses, which is what keeps the batched
+// verify reproducing AR (see the serial kernel's own comment on #712) -- and the same block
+// reduction for the q/k norm.
+template <bool WRITE_CHECKPOINT>
+__global__ void df_gdn_conv_par_kernel(
+    const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
+    const __nv_bfloat16* __restrict__ live_state, __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ checkpoints, int n_tokens, int q_heads, int v_heads,
+    int head_dim, int qkv_dim, int conv_kernel, float eps) {
+    const int q_dim = q_heads * head_dim;
+    const int v_dim = v_heads * head_dim;
+    const int blk = blockIdx.x, tok = blockIdx.y, t = threadIdx.x;
+    int d, out_dim, hh; __nv_bfloat16* out; bool do_norm;
+    if (blk < q_heads) { hh = blk; d = hh * head_dim + t; out = q; out_dim = q_dim; do_norm = true; }
+    else if (blk < 2 * q_heads) { hh = blk - q_heads; d = q_dim + hh * head_dim + t; out = k; out_dim = q_dim; do_norm = true; }
+    else { hh = blk - 2 * q_heads; d = 2 * q_dim + hh * head_dim + t; out = v; out_dim = v_dim; do_norm = false; }
+    float w[8], hist[7];
+#pragma unroll
+    for (int c = 0; c < 8; c++) w[c] = c < conv_kernel ? pf_to_f(conv_w[(size_t)d * conv_kernel + c]) : 0.f;
+    // Window entering token `tok`: tap c is input position tok - (conv_kernel-1) + c. A negative
+    // position is decode state, and its live_state row is that position + (conv_kernel-1) = tok+c.
+#pragma unroll
+    for (int c = 0; c < 7; c++) {
+        if (c >= conv_kernel - 1) { hist[c] = 0.f; continue; }
+        const int p = tok - (conv_kernel - 1) + c;
+        hist[c] = p >= 0 ? pf_to_f(qkv[(size_t)p * qkv_dim + d])
+                         : pf_to_f(live_state[(size_t)(tok + c) * qkv_dim + d]);
+    }
+    const float cur = pf_to_f(qkv[(size_t)tok * qkv_dim + d]);
+    float y = 0.f;
+#pragma unroll
+    for (int c = 0; c < 7; c++) if (c < conv_kernel - 1) y += hist[c] * w[c];
+    y += cur * w[conv_kernel - 1];
+    float cval = pf_silu(y);
+    __shared__ float sw[32];
+    const int nwarp = (blockDim.x + 31) / 32;
+    if (do_norm) {
+        float ss = pf_wsum(cval * cval);
+        if ((t & 31) == 0) sw[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = t < nwarp ? sw[t] : 0.f;
+            vv = pf_wsum(vv);
+            if (t == 0) sw[0] = rsqrtf(vv + eps);
+        }
+        __syncthreads();
+        cval *= sw[0];
+    }
+    out[(size_t)tok * out_dim + hh * head_dim + t] = __float2bfloat16(cval);
+    if constexpr (WRITE_CHECKPOINT) {
+        const size_t state_elems = (size_t)(conv_kernel - 1) * qkv_dim;
+        // Window LEAVING token `tok`: shifted one, with `cur` in the last slot.
+#pragma unroll
+        for (int c = 0; c < 7; c++) if (c < conv_kernel - 1)
+            checkpoints[(size_t)tok * state_elems + (size_t)c * qkv_dim + d] =
+                __float2bfloat16(c < conv_kernel - 2 ? hist[c + 1] : cur);
+    }
+}
+
 // ============================================================================
 // Batched gated RMSNorm: out = (x/rms(x)) * weight * silu(z), per (token, v_head).
 // One warp per (token, v_head). Mirrors gated_norm_warp_kernel.
 // ============================================================================
-template <int HEAD_DIM>
+// NV: also emit the NVFP4 activation form of `out`, which is exactly what the GDN out-projection
+// quantizes next -- one si_nvfp4_quant_x node per linear-attention layer, 48 a step at ~1.26 us
+// for ~40 KB of work. Bit-identical to that kernel run on `out`: the same bf16-rounded values, the
+// max over the same 16, and the same `amax * (1/127)` scale and `127/amax` inverse. A 16-group is
+// SIXTEEN LANES of one warp at a fixed r (lane l owns dim l + 32r), so one shuffle completes it.
+template <int HEAD_DIM, bool NV>
 __global__ void pf_gated_norm_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ z,
                                      const __nv_bfloat16* __restrict__ weight,
                                      __nv_bfloat16* __restrict__ out,
+                                     signed char* __restrict__ nv_q, float* __restrict__ nv_s,
                                      int n_tokens, int v_heads, float eps) {
     constexpr int NROW = HEAD_DIM / 32;
     const int h    = blockIdx.y;                    // v_head
@@ -835,7 +914,19 @@ __global__ void pf_gated_norm_kernel(const __nv_bfloat16* __restrict__ x,
     #pragma unroll
     for (int r = 0; r < NROW; r++) {
         const int d = lane + r * 32;
-        out[base + d] = __float2bfloat16(xv[r] * inv * wv[r] * pf_silu(zv[r]));
+        const __nv_bfloat16 ob = __float2bfloat16(xv[r] * inv * wv[r] * pf_silu(zv[r]));
+        out[base + d] = ob;
+        if (NV) {
+            const float f = __bfloat162float(ob);
+            float a16 = fabsf(f);
+            a16 = fmaxf(a16, __shfl_xor_sync(0xffffffffu, a16, 1));
+            a16 = fmaxf(a16, __shfl_xor_sync(0xffffffffu, a16, 2));
+            a16 = fmaxf(a16, __shfl_xor_sync(0xffffffffu, a16, 4));
+            a16 = fmaxf(a16, __shfl_xor_sync(0xffffffffu, a16, 8));
+            const float iq = a16 > 0.f ? 127.f / a16 : 0.f;
+            nv_q[base + d] = (signed char)__float2int_rn(f * iq);
+            if ((lane & 15) == 0) nv_s[(base >> 4) + (d >> 4)] = a16 * (1.f / 127.f);
+        }
     }
 }
 
@@ -1338,12 +1429,28 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
             qb, kb, vb, ab, bb, db, aa, state, ob, n_tokens, q_heads, v_heads, qh_block);
 }
 
+// SPARKINFER_GDN_CONV_PAR=0 keeps the serial-over-tokens kernel, for an A/B out of one binary.
+static inline bool df_gdn_conv_par() {
+    static const bool on = []{ const char* e = getenv("SPARKINFER_GDN_CONV_PAR");
+                               return !(e && e[0] == '0'); }();
+    return on;
+}
+
 void launch_dflash_gdn_conv(const void* qkv, const void* conv_w, const void* live_state,
                             void* q, void* k, void* v, void* checkpoints,
                             int n_tokens, int q_heads, int v_heads, int head_dim,
                             int conv_kernel, float eps, cudaStream_t stream) {
     if (n_tokens <= 0 || head_dim <= 0 || conv_kernel < 2 || conv_kernel > 8) return;
     const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
+    if (df_gdn_conv_par()) {
+        df_gdn_conv_par_kernel<true><<<dim3(2 * q_heads + v_heads, n_tokens), head_dim, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
+            reinterpret_cast<const __nv_bfloat16*>(live_state), reinterpret_cast<__nv_bfloat16*>(q),
+            reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),
+            reinterpret_cast<__nv_bfloat16*>(checkpoints), n_tokens, q_heads, v_heads,
+            head_dim, qkv_dim, conv_kernel, eps);
+        return;
+    }
     df_gdn_conv_checkpoint_kernel<true><<<2 * q_heads + v_heads, head_dim, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
         reinterpret_cast<const __nv_bfloat16*>(live_state), reinterpret_cast<__nv_bfloat16*>(q),
@@ -1374,6 +1481,14 @@ void launch_dflash_gdn_conv_compact(const void* qkv, const void* conv_w,
                                     int conv_kernel, float eps, cudaStream_t stream) {
     if (n_tokens <= 0 || head_dim <= 0 || conv_kernel < 2 || conv_kernel > 8) return;
     const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
+    if (df_gdn_conv_par()) {
+        df_gdn_conv_par_kernel<false><<<dim3(2 * q_heads + v_heads, n_tokens), head_dim, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
+            reinterpret_cast<const __nv_bfloat16*>(live_state), reinterpret_cast<__nv_bfloat16*>(q),
+            reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v), nullptr,
+            n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps);
+        return;
+    }
     df_gdn_conv_checkpoint_kernel<false><<<2 * q_heads + v_heads, head_dim, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
         reinterpret_cast<const __nv_bfloat16*>(live_state), reinterpret_cast<__nv_bfloat16*>(q),
@@ -1431,7 +1546,25 @@ void launch_prefill_gated_norm(const void* x, const void* z, const void* weight,
     auto wb = reinterpret_cast<const __nv_bfloat16*>(weight);
     auto ob = reinterpret_cast<__nv_bfloat16*>(out);
     if (head_dim == 128)
-        pf_gated_norm_kernel<128><<<grid, 32, 0, stream>>>(xb, zb, wb, ob, n_tokens, v_heads, eps);
+        pf_gated_norm_kernel<128, false><<<grid, 32, 0, stream>>>(
+            xb, zb, wb, ob, nullptr, nullptr, n_tokens, v_heads, eps);
+}
+
+// Same, plus the NVFP4 activation form of `out` (int8 quants + one fp32 scale per 16), which is
+// what the GDN out-projection wants next. Bit-identical to launch_gemv_nvfp4_quant_x on `out`.
+// False (and nothing written) for a shape it cannot cover, so the caller keeps its own quantize.
+bool launch_prefill_gated_norm_nvfp4(const void* x, const void* z, const void* weight, void* out,
+                                     void* nv_q, void* nv_s,
+                                     int n_tokens, int v_heads, int head_dim, float eps,
+                                     cudaStream_t stream) {
+    if (!nv_q || !nv_s || head_dim != 128 || n_tokens <= 0 || v_heads <= 0) return false;
+    dim3 grid(n_tokens, v_heads);
+    pf_gated_norm_kernel<128, true><<<grid, 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(z),
+        reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out),
+        reinterpret_cast<signed char*>(nv_q), reinterpret_cast<float*>(nv_s),
+        n_tokens, v_heads, eps);
+    return true;
 }
 
 void launch_prefill_qknorm_rope_kv_int8(
