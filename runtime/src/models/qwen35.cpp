@@ -3565,7 +3565,19 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     long   w_n[kPlanMaxW] = {0};
     // Bootstrap cursor: the first sample of the run is discarded (it carries whatever warm-up the
     // first batched call still has), then widths are walked from the widest down to 1.
-    int boot_w = kProposalDepth + 1;
+    // Bootstrap is exploration, not useful work: forcing every available width is especially
+    // expensive for short generations, where it can consume most of the decode steps before the
+    // planner starts using the confidence head. Four rows are enough to fit the affine cost and
+    // populate the non-linear knee used by the narrow planner. Wider choices remain available
+    // through that fit and get their own running mean as soon as the planner selects them.
+    // Set 0 to restore the exhaustive walk, or a positive value to cap it explicitly.
+    static const int kPlanBootMax = []{
+        const char* e = getenv("SPARKINFER_DSPARK_PLAN_BOOT_MAX");
+        int v = e ? atoi(e) : 4;
+        return v >= 0 ? v : 4;
+    }();
+    int boot_w = kPlanBootMax > 0 ? std::min(kProposalDepth + 1, kPlanBootMax)
+                                  : kProposalDepth + 1;
     bool boot_first = true;
     // The run's own achieved rate, tokens per millisecond of WHOLE step (draft included). The plan
     // maximises worth(d) - rate * cost(d+1) rather than the ratio worth(d)/cost(d+1): the ratio
