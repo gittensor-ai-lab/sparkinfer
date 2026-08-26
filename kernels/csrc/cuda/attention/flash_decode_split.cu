@@ -1267,6 +1267,11 @@ void launch_flash_decode_split(
                 const char* e = getenv("SPARKINFER_FA_SEQFOLD");
                 fa6_fold_env = e ? atoi(e) : 0;
             }
+            // SPARKINFER_FA_PIPE is read again further down for the num_seqs == 1 path; same knob,
+            // hoisted so the fold above can honour it too.
+            static int fa6_pipe_ok = -1;
+            if (fa6_pipe_ok < 0) { const char* e = getenv("SPARKINFER_FA_PIPE");
+                                   fa6_pipe_ok = (e && e[0] == '0') ? 0 : 1; }
             // Prefer the NARROWEST fold that divides the row count. Folding trades KV-staging
             // traffic for CTAs -- at 4 kv heads x n_splits the grid is already only a few CTAs
             // per SM -- and this kernel is issue-bound on the per-row softmax, not on the staged
@@ -1276,6 +1281,45 @@ void launch_flash_decode_split(
             const int fa6_fold = fa6_fold_env > 0
                                ? fa6_fold_env
                                : (num_seqs % 2 == 0 ? 2 : (num_seqs % 3 == 0 ? 3 : 1));
+            // cp.async DOUBLE BUFFERING FOR THE FOLD. fa_split_gqa_pipe_kernel has carried a SEQ
+            // template parameter since it was written and has never been instantiated above 1: the
+            // fold below returns before the pipelined/KV-group dispatch further down, and that
+            // dispatch is gated on num_seqs == 1 anyway. So the batched verify -- which is where
+            // nearly all of this kernel's time is -- has only ever run the SYNCHRONOUS tile, which
+            // does stage -> __syncthreads -> compute -> __syncthreads and exposes the global read
+            // latency once per tile. At ctx 4k each CTA walks ~32 keys in 4 tiles of 8, so there
+            // are four exposed round trips to overlap.
+            //
+            // Shallow tile deliberately: the pipelined path further down pairs cp.async with a
+            // DEEP tile because it runs at long context, where a CTA has hundreds of tiles. Here
+            // the chunk is 32 keys, so a deep tile would be one tile and there would be nothing to
+            // overlap -- the win is the pipeline, not the tile depth. 4*8*256*2 = 16 KB, under the
+            // 48 KB default, so no cudaFuncSetAttribute is needed.
+            //
+            // Bit-identical to the synchronous fold: cp.async changes WHEN bytes land in shared
+            // memory, not their values, and the token walk (start..end, consecutive tiles, the
+            // per-token online-softmax update) is unchanged. SPARKINFER_FA_FOLD_PIPE=0 reverts.
+            static int fa6_fold_pipe = -1;
+            if (fa6_fold_pipe < 0) { const char* e = getenv("SPARKINFER_FA_FOLD_PIPE");
+                                     fa6_fold_pipe = (e && e[0] == '0') ? 0 : 1; }
+            if (!int8_kv && num_seqs > 1 && fa6_fold > 1 && (num_seqs % fa6_fold) == 0 &&
+                fa6_pipe_ok && fa6_fold_pipe) {
+                const size_t smp = (size_t)4 * FA_GQA6_TILE * 256 * sizeof(__nv_bfloat16);
+                dim3 gqp(num_kv_heads * n_splits, num_seqs / fa6_fold);
+#define SI_FA6_FOLD_PIPE(SQ)                                                                      \
+                fa_split_gqa_pipe_kernel<256, GQA, FA_GQA6_TILE, (SQ)>                            \
+                    <<<gqp, GQA * 32, smp, stream>>>(                                             \
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table,       \
+                    seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads,         \
+                    block_size, max_blocks, n_splits)
+                if (fa6_fold == 3)      SI_FA6_FOLD_PIPE(3);
+                else if (fa6_fold == 4) SI_FA6_FOLD_PIPE(4);
+                else                    SI_FA6_FOLD_PIPE(2);
+#undef SI_FA6_FOLD_PIPE
+                combine_hd256(out_q8);
+                (void)seqlen;
+                return;
+            }
             if (!int8_kv && num_seqs > 1 && fa6_fold > 1 && (num_seqs % fa6_fold) == 0) {
                 const size_t smf = (size_t)2 * FA_GQA6_TILE * 256 * sizeof(__nv_bfloat16);
                 dim3 gqf(num_kv_heads * n_splits, num_seqs / fa6_fold);

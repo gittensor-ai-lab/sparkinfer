@@ -2730,6 +2730,30 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         }
         return true;
     };
+    // Two SAME-SHAPED NVFP4 projections over one activation, on one grid -- the pattern
+    // launch_gemv_nvfp4_rows_dp4a2 exists for, and which the FFN's gate/up already uses. `wk` and
+    // `wv` are exactly that: both [kvdim, H], both reading the staged `xn`, issued back to back.
+    // At Qwen3.8's 4 kv heads x 256 head_dim that is a 1024-row matrix whose own launch is ~5.2 us
+    // for 2.95 MB -- a third of the streaming ceiling, because a grid that small is nearly all
+    // per-launch cost. One grid for the pair halves the launches and doubles the work each one
+    // amortises over.
+    //
+    // Bit-identical to the two singles by the paired kernel's own construction: a CTA still owns
+    // RPB*NR consecutive output rows of ONE of the two matrices, walks the same groups in the same
+    // order and folds the same S partials -- only which launch carries it changes. It declines
+    // (and the caller issues the singles) for any shape where a CTA could straddle the boundary.
+    // Returns false when it did NOT fuse, so the caller falls back rather than skipping work.
+    auto proj_pair_nv_on = [&](cudaStream_t ps, const bf16* in, const void* w0, int t0,
+                               const void* w1, int t1, bf16* o0, bf16* o1, int no, int k) -> bool {
+        if (t0 != kernels::SI_QTYPE_NVFP4 || t1 != kernels::SI_QTYPE_NVFP4) return false;
+        if (!kernels::qwen38_nvfp4_dp4a_proj()) return false;
+        const bool ha = (nvq_src_a == in && nvq_k_a == k);
+        const bool hb = (nvq_src_b == in && nvq_k_b == k);
+        if (!ha && !hb) return false;             // `in` was never staged -- do not quantize here
+        return kernels::launch_gemv_nvfp4_rows_dp4a2(hb ? nv_pq_b : nv_pq_a,
+                                                     hb ? nv_ps_b : nv_ps_a,
+                                                     w0, w1, o0, o1, N, no, k, ps);
+    };
     // proj() on an arbitrary stream. Callers must have `in` already quantized into q81 (checked at
     // each call site), because quantizing here would write shared scratch off the main stream.
     auto proj_on = [&](cudaStream_t ps, const bf16* in, const void* w, int type, bf16* out,
@@ -3004,8 +3028,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify attn fork wait");
             }
             supported = proj(xn, w.wq, w.wq_type, b8, 2 * qdim, H) &&
-                        proj_on(ast, xn, w.wk, w.wk_type, kf, kvdim, H) &&
-                        proj_on(ast, xn, w.wv, w.wv_type, vf, kvdim, H);
+                        (proj_pair_nv_on(ast, xn, w.wk, w.wk_type, w.wv, w.wv_type,
+                                         kf, vf, kvdim, H) ||
+                         (proj_on(ast, xn, w.wk, w.wk_type, kf, kvdim, H) &&
+                          proj_on(ast, xn, w.wv, w.wv_type, vf, kvdim, H)));
             if (fork_attn) {
                 pf_cu(cudaEventRecord(ev_join, s.stream_k), "verify attn join");
                 pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify attn join wait");

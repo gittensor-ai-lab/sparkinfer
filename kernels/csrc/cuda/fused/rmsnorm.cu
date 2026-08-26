@@ -219,13 +219,15 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
     ss = rn_warp_sum(ss);
     if ((t & 31) == 0) s_warp[t >> 5] = ss;
     __syncthreads();
-    if (t < 32) {
-        float v = (t < (blockDim.x + 31) / 32) ? s_warp[t] : 0.f;
-        v = rn_warp_sum(v);
-        if (t == 0) s_warp[0] = rsqrtf(v / cols + eps);
-    }
-    __syncthreads();
-    const float inv_rms = s_warp[0];
+    // EVERY warp folds the per-warp partials itself, over the same 32 lanes and the same tree the
+    // one reducing warp used, so the result is the same float -- but the second __syncthreads and
+    // the dependent read of s_warp[0] that followed it both leave the critical chain. At grid =
+    // rows (three or four CTAs for a verify block) there is nothing else resident to hide either,
+    // and this kernel is 128 launches a step of ~2.3 us each, almost all of it chain.
+    const int nw = (int)((blockDim.x + 31) / 32);
+    float red = ((t & 31) < nw) ? s_warp[t & 31] : 0.f;
+    red = rn_warp_sum(red);
+    const float inv_rms = rsqrtf(red / cols + eps);
 
     // The bf16-rounded residual sum, exactly as add_rmsnorm2_kernel does -- but rounded in
     // REGISTERS rather than read back out of out_sum. Every thread's store to out_sum[t] is its

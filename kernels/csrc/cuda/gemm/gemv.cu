@@ -1507,6 +1507,11 @@ struct si_q4k_packet {
 __device__ __forceinline__ si_q4k_packet si_q4k_decode(const si_block_q4_K* __restrict__ bq4,
                                                       int bq8_offset, int qoff) {
     si_q4k_packet p;
+    // NOT __ldcs. Q4_K keeps a superblock's scales and quants in ONE 144-byte struct that several
+    // threads of a CTA read, so an evict-first hint here destroys intra-block reuse rather than
+    // protecting anything: measured +0.012 ms on the verify's batched call. The draft's Q4 backbone
+    // is the opposite shape -- a flat [N][K/2] array where each thread owns its own word -- and
+    // does want the hint.
     const int* q4 = (const int*)(bq4->qs + 16 * bq8_offset + 4 * qoff);
     const int v0 = q4[0], v1 = q4[4];
     const unsigned short* scales = (const unsigned short*)bq4->scales;

@@ -73,8 +73,30 @@ __global__ void k_rms(const bf16* x, const bf16* w, bf16* out, int rows, int col
 // Residual add fused with the RMSNorm that always follows it: sum = a + b (kept for the next
 // residual) and out = rms(sum) * w. Identical arithmetic to launch_add followed by launch_rms, but
 // one eager launch instead of two and `sum` stays in registers for the norm's first pass.
+// llama q8_1 layout, same struct the target's MMVQ kernels use: 36 B per 32 values, with
+// ds = (d, d*sum(q)) so the affine dequant's second term needs no extra reduction.
+struct si_q81_blk { __half2 ds; signed char qs[32]; };
+
+// Emit ONE q8_1 block from a warp that already holds its 32 values, one per lane. Character for
+// character the arithmetic of si_quantize_q8_1_rows -- same amax butterfly, same d = amax/127,
+// same roundf, same d*sum(q) in ds.y -- so folding it into a producer is bit-identical to running
+// that kernel afterwards, and just deletes the launch. The draft issues 27 of those a step at ~1 us
+// each purely because the dp4a backbone needs its activation quantized.
+__device__ __forceinline__ void si_q81_emit(si_q81_blk* dst, int lane, float xv) {
+    float a = fabsf(xv);
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    const float d = a / 127.0f;
+    const int qi = (a == 0.0f) ? 0 : (int)roundf(xv / d);
+    dst->qs[lane] = (signed char)qi;
+    int sm = qi;
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, m);
+    if (lane == 0) dst->ds = __floats2half2_rn(d, d * (float)sm);
+}
+
 __global__ void k_add_rms(const bf16* a, const bf16* b, bf16* sum, const bf16* w, bf16* out,
-                          int rows, int cols, float eps) {
+                          int rows, int cols, float eps, si_q81_blk* q81) {
     const int r = blockIdx.x;
     if (r >= rows) return;
     const bf16* ar = a + (size_t)r * cols;
@@ -103,8 +125,14 @@ __global__ void k_add_rms(const bf16* a, const bf16* b, bf16* sum, const bf16* w
     float tot = 0.f;
     for (int i = 0; i < nwarps; i++) tot += ws[i];
     const float inv = rsqrtf(tot / (float)cols + eps);
-    for (int i = threadIdx.x; i < cols; i += blockDim.x)
-        orow[i] = f2b(b2f(sr[i]) * inv * b2f(w[i]));
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const bf16 ob = f2b(b2f(sr[i]) * inv * b2f(w[i]));
+        orow[i] = ob;
+        // The dp4a backbone wants Q8_1 of exactly this row. blockDim is a multiple of 32, so on
+        // every pass element i sits on lane i%32 of one warp and the 32 lanes of that warp hold
+        // the whole 32-group -- which is precisely what the standalone quantizer assumes.
+        if (q81) si_q81_emit(q81 + (size_t)r * (cols >> 5) + (i >> 5), threadIdx.x & 31, b2f(ob));
+    }
 }
 
 __global__ void k_rms_heads(bf16* x, const bf16* w, int seq, int n_heads, int d, float eps) {
@@ -1144,6 +1172,126 @@ __global__ void k_gemv_batched_fused3_q4(
 // at 0.75-4.5 CTAs/SM on a 170-SM device -- far too few to cover DRAM latency -- so parallelism,
 // not bytes, is what they are short of. Cutting ROWS instead would also add CTAs, but it multiplies
 // the activation re-reads, which is why 4 -> 2 -> 1 measured progressively worse.
+// The Q4 weight and scale reads are __ldcs (evict-first). This kernel streams 620 MB of draft
+// weights per block and every byte is read exactly once, so caching them is pure harm: it evicts
+// the small, genuinely hot data the rest of the step re-reads -- the verify's staged activations,
+// which every CTA of every NVFP4 GEMV pulls from L2, and the KV caches. #909 put the same hint on
+// the target's NVFP4 weight stream for +3.50%; this kernel and the two LM heads were the streams
+// it did not cover, and between them they were pushing 1.8 GB/step through L2 with default policy.
+// DP4A form of k_gemv_batched_fused3_q4_ks.
+//
+// The draft was the one part of this engine that never got the treatment the verify has. Its
+// backbone multiplied BF16 activations by dequantized-to-float Q4 weights, which costs on three
+// axes at once, and the axes are not independent:
+//   * TRAFFIC. Activation reads are grid x BATCH x K x 2 B, and grid is total/ROWS. At the draft's
+//     shapes that is 3.86 GB of activation per block against 620 MB of weights -- 6:1. Cutting it
+//     by raising ROWS was measured (1.484 -> 1.546 ms): it halves the traffic and doubles the
+//     registers, and the registers win. The only escape is fewer BYTES per element.
+//   * INSTRUCTIONS. `wf[r][j] = q*d + m` then a float FMA per (r, b, j) is ONE MAC per
+//     instruction. Measured 0.69 MACs/instruction against the verify's dp4a path at 2.3.
+//   * REGISTERS. `float wf[ROWS][8]` is 32 registers of dequantized weight held live across the
+//     activation loop.
+// A q8_1 activation fixes all three in the same direction: 1.125 B/element instead of 2, eight
+// dp4a instead of 32 float FMAs per (r, b) per 32-block, and the weights stay packed as int8 (8
+// registers, not 32). sum(w.x) = d_w*d_x*dp4a(q, xq) + m_w*(d_x*sum(xq)), and q8_1 already carries
+// d_x*sum(xq) in ds.y, so the affine term is free.
+//
+// Draft-only, so this is NOMINATION-only: it can move which tokens are proposed, never which are
+// emitted. LOSSLESS is unaffected.
+template <int BATCH, int ROWS, int KSPLIT>
+__global__ void k_gemv_batched_fused3_q4_dp4a(
+        const si_q81_blk* __restrict__ xq,
+        const unsigned char* __restrict__ Q0, const unsigned char* __restrict__ Q1,
+        const unsigned char* __restrict__ Q2,
+        const __half2* __restrict__ D0, const __half2* __restrict__ D1, const __half2* __restrict__ D2,
+        bf16* __restrict__ y0, bf16* __restrict__ y1, bf16* __restrict__ y2,
+        int N0, int N1, int N2, int K) {
+    __shared__ float red[KSPLIT][ROWS][BATCH];
+    const int total = N0 + N1 + N2;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int KB = K / 32;                       // 32-value blocks: one weight (d, m) pair each
+    for (int global_n = blockIdx.x * ROWS; global_n < total; global_n += gridDim.x * ROWS) {
+        const unsigned char* Q; const __half2* D; bf16* y; int N, n0;
+        if (global_n < N0)           { Q = Q0; D = D0; y = y0; N = N0; n0 = global_n; }
+        else if (global_n < N0 + N1) { Q = Q1; D = D1; y = y1; N = N1; n0 = global_n - N0; }
+        else                         { Q = Q2; D = D2; y = y2; N = N2; n0 = global_n - N0 - N1; }
+        const int nr = (N - n0 < ROWS) ? (N - n0) : ROWS;
+        float acc[ROWS][BATCH];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+#pragma unroll
+            for (int b = 0; b < BATCH; b++) acc[r][b] = 0.f;
+        for (int kb = warp * 32 + lane; kb < KB; kb += KSPLIT * 32) {
+            unsigned wq[ROWS][8];
+            float dw[ROWS], mw[ROWS];
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const int rr = (r < nr) ? r : 0;
+                const uint4 pk = __ldcs(reinterpret_cast<const uint4*>(
+                    Q + (size_t)(rr + n0) * (K / 2) + (size_t)kb * 16));
+                const float2 dmf = __half22float2(__ldcs(&D[(size_t)(rr + n0) * KB + kb]));
+                dw[r] = dmf.x; mw[r] = dmf.y;
+                const unsigned pv[4] = { pk.x, pk.y, pk.z, pk.w };
+#pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    // Element e of a word: nibble e, little-endian -- so even elements are the low
+                    // nibbles and odd the high, and the two interleave back with one byte_perm.
+                    const unsigned lo = pv[u] & 0x0F0F0F0Fu;
+                    const unsigned hi = (pv[u] >> 4) & 0x0F0F0F0Fu;
+                    wq[r][2 * u]     = __byte_perm(lo, hi, 0x5140);
+                    wq[r][2 * u + 1] = __byte_perm(lo, hi, 0x7362);
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < BATCH; b++) {
+                const si_q81_blk* xb = xq + (size_t)b * KB + kb;
+                const float2 dsf = __half22float2(xb->ds);
+                // FOUR-byte loads, not uint4: a q8_1 block is 36 bytes with ds first, so qs sits at
+                // byte 36*b + 4 and is never 16-byte aligned. A uint4 load there is misaligned and
+                // silently returns garbage -- it took the whole verify down (batched 0.095 ms,
+                // tau 4.64, LOSSLESS 0) because the draft then fed out-of-range ids into it.
+                const unsigned* ap = reinterpret_cast<const unsigned*>(xb->qs);
+                unsigned av[8];
+#pragma unroll
+                for (int u = 0; u < 8; u++) av[u] = ap[u];
+#pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    int d1 = 0;
+#pragma unroll
+                    for (int u = 0; u < 8; u++) d1 = __dp4a((int)wq[r][u], (int)av[u], d1);
+                    acc[r][b] += dw[r] * (dsf.x * (float)d1) + mw[r] * dsf.y;
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+#pragma unroll
+            for (int b = 0; b < BATCH; b++) {
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    acc[r][b] += __shfl_down_sync(0xffffffffu, acc[r][b], off);
+            }
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < ROWS; r++)
+#pragma unroll
+                for (int b = 0; b < BATCH; b++) red[warp][r][b] = acc[r][b];
+        }
+        __syncthreads();
+        if (warp == 0 && lane < ROWS * BATCH) {
+            const int r = lane / BATCH, b = lane % BATCH;
+            if (r < nr) {
+                float o = 0.f;
+#pragma unroll
+                for (int w = 0; w < KSPLIT; w++) o += red[w][r][b];
+                y[(size_t)b * N + n0 + r] = f2b(o);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 template <int BATCH, int ROWS, int KSPLIT>
 __global__ void k_gemv_batched_fused3_q4_ks(
         const bf16* __restrict__ x,
@@ -1174,8 +1322,8 @@ __global__ void k_gemv_batched_fused3_q4_ks(
             for (int r = 0; r < ROWS; r++) {
                 const int rr = (r < nr) ? r : 0;
                 const unsigned int packed =
-                    reinterpret_cast<const unsigned int*>(Q + (size_t)(n0 + rr) * (K / 2))[k8];
-                const float2 dmf = __half22float2(D[(size_t)(n0 + rr) * KS + (k8 >> 2)]);
+                    __ldcs(&reinterpret_cast<const unsigned int*>(Q + (size_t)(n0 + rr) * (K / 2))[k8]);
+                const float2 dmf = __half22float2(__ldcs(&D[(size_t)(n0 + rr) * KS + (k8 >> 2)]));
 #pragma unroll
                 for (int j = 0; j < 4; j++) {
                     const unsigned int byte = (packed >> (8 * j)) & 0xFFu;
@@ -1234,6 +1382,36 @@ void launch_quantize_w_q4(const void* w, void* q, void* dm, int N, int K, cudaSt
         (const bf16*)w, (unsigned char*)q, (__half2*)dm, nblocks);
 }
 
+// dp4a twin of launch_gemv_batched_q4_fused3. `xq81` is Q8_1(x) -- one si_q81_blk per 32 values
+// per batch row -- which the caller produces once and reuses for every projection sharing that
+// activation. Declines when the shapes do not line up so the caller keeps the float path.
+void launch_gemv_batched_q4_dp4a_fused3(const void* xq81,
+                                        const void* Q0, const void* Q1, const void* Q2,
+                                        const void* D0, const void* D1, const void* D2,
+                                        void* y0, void* y1, void* y2,
+                                        int N0, int N1, int N2, int K, cudaStream_t stream,
+                                        int batch) {
+    const int total = N0 + N1 + N2;
+    if (total <= 0 || (K & 31)) return;
+    constexpr int ROWS = 4, KS = 2;
+    const int nblk = (total + ROWS - 1) / ROWS;
+    const dim3 grid(nblk), blk(KS * 32);
+    const auto* xp = reinterpret_cast<const si_q81_blk*>(xq81);
+#define SI_DP4A_F3(BW_) k_gemv_batched_fused3_q4_dp4a<BW_, ROWS, KS><<<grid, blk, 0, stream>>>( \
+        xp, (const unsigned char*)Q0, (const unsigned char*)Q1, (const unsigned char*)Q2,       \
+        (const __half2*)D0, (const __half2*)D1, (const __half2*)D2,                            \
+        (bf16*)y0, (bf16*)y1, (bf16*)y2, N0, N1, N2, K)
+    if (batch == 1)      SI_DP4A_F3(1);
+    else if (batch == 2) SI_DP4A_F3(2);
+    else if (batch == 3) SI_DP4A_F3(3);
+    else if (batch == 4) SI_DP4A_F3(4);
+    else if (batch == 5) SI_DP4A_F3(5);
+    else if (batch == 6) SI_DP4A_F3(6);
+    else if (batch == 7) SI_DP4A_F3(7);
+    else                 SI_DP4A_F3(8);
+#undef SI_DP4A_F3
+}
+
 void launch_gemv_batched_q4_fused3(const void* x,
                                    const void* Q0, const void* Q1, const void* Q2,
                                    const void* D0, const void* D1, const void* D2,
@@ -1273,7 +1451,13 @@ void launch_gemv_batched_q4_fused3(const void* x,
         // which is not a power of two: rounding depth+1 up over {2,4,8,16} and clamping to 7
         // produced a width nothing was compiled for, and the caller fell back to a per-token
         // GEMV loop that re-reads every weight row once per row.
-        if (batch == 2)      SI_Q4KS_B(2);
+        // Widths 1 and 3 exist for the draft's CONTEXT rows and its fc projection, whose row
+        // count is the ACCEPTED length: 1 is its mode and 3 its next most common value. Without
+        // them a 1- or 3-row call fell through to the 16-wide branch and would read up to 15 rows
+        // of activation past the end of the caller's buffer.
+        if (batch == 1)      SI_Q4KS_B(1);
+        else if (batch == 2) SI_Q4KS_B(2);
+        else if (batch == 3) SI_Q4KS_B(3);
         else if (batch == 4) SI_Q4KS_B(4);
         else if (batch == 5) SI_Q4KS_B(5);
         else if (batch == 6) SI_Q4KS_B(6);
@@ -1363,13 +1547,14 @@ void launch_rms(const void* x, const void* w, void* out, int rows, int cols, flo
 }
 
 void launch_add_rms(const void* a, const void* b, void* sum, const void* w, void* out,
-                    int rows, int cols, float eps, cudaStream_t stream) {
+                    int rows, int cols, float eps, cudaStream_t stream, void* q81) {
     if (rows <= 0 || cols <= 0) return;
     // One CTA per row and only 256 threads left a 5120-wide row at 20 elements per thread with
     // four CTAs resident on a 170-SM device. Widen the CTA instead: same reduction (warp sums
     // folded in ascending warp order through ws[]), four times the memory-level parallelism.
     k_add_rms<<<rows, 1024, 0, stream>>>((const bf16*)a, (const bf16*)b, (bf16*)sum,
-                                        (const bf16*)w, (bf16*)out, rows, cols, eps);
+                                        (const bf16*)w, (bf16*)out, rows, cols, eps,
+                                        reinterpret_cast<si_q81_blk*>(q81));
 }
 
 void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, float eps,
@@ -1414,9 +1599,19 @@ int attn_gqa_splits(int kv_len) {
     // kv_len 128 -> 2, 512 -> 8, 4096 -> 16 splits were each at or within ~2% of the best
     // (splits, rows) pair, and every point beat the unsplit kernel. Splitting past 16 starts
     // losing to the per-split combine and the shrinking per-CTA key count.
+    // Probe knob. The sweep behind the constant above was taken against the ONE-KEY-AT-A-TIME
+    // kernel; the key tile shortened the per-warp chain, which is exactly the quantity the split
+    // count trades against the per-split partial writes and the combine, so the optimum is worth
+    // re-deriving rather than inherited. Clamped to the compiled cap -- fa_m/fa_l/fa_acc are sized
+    // for it.
+    static const int cap = []{
+        const char* e = getenv("SPARKINFER_DFLASH_ATTN_SPLITS");
+        const int v = e ? atoi(e) : kDFlashAttnMaxSplits;
+        return (v >= 1 && v <= kDFlashAttnMaxSplits) ? v : kDFlashAttnMaxSplits;
+    }();
     int s = kv_len / 64;
     if (s < 2) s = 2;
-    if (s > kDFlashAttnMaxSplits) s = kDFlashAttnMaxSplits;
+    if (s > cap) s = cap;
     return s;
 }
 
@@ -1921,6 +2116,36 @@ __global__ void k_confidence_head(const bf16* __restrict__ hidden, const float* 
     }
     if (threadIdx.x == 0) *out_confidence = sred[0] + bias_val;
 }
+
+// ROW-BATCHED confidence head. Identical arithmetic to k_confidence_head -- same dot, same block
+// size, same shared-memory tree -- with blockIdx.x selecting the row.
+//
+// The single-row form runs on a grid of ONE, so its 8.5 us is almost entirely launch and reduction
+// latency, and DSpark's Markov chain calls it once per proposal: four grid-1 launches, 34 us of a
+// 1.5 ms draft. They were serialised only because `markov_latent` was one buffer that each chain
+// step overwrote; giving the latent a per-row stride lets all four run as one grid-4 launch after
+// the chain, which is what this kernel is for. Nothing about the chain's own ordering changes --
+// the confidence head never fed back into it.
+__global__ void k_confidence_head_rows(const bf16* __restrict__ hidden, int hidden_stride,
+                                       const float* __restrict__ latent, int latent_stride,
+                                       const bf16* __restrict__ w, float bias_val,
+                                       int H, int rank, int row0,
+                                       float* __restrict__ out_confidence) {
+    extern __shared__ float sred[];
+    const int b = blockIdx.x;
+    const bf16* hp = hidden + (size_t)(row0 + b) * hidden_stride;
+    const float* lp = latent + (size_t)(b + 1) * latent_stride;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) acc += b2f(hp[i]) * b2f(w[i]);
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) acc += lp[i] * b2f(w[H + i]);
+    sred[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sred[threadIdx.x] += sred[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out_confidence[b + 1] = sred[0] + bias_val;
+}
 } // namespace
 
 void launch_capture_rows(const void* src, void* dst, int rows, int hidden, int dst_row_stride,
@@ -1995,6 +2220,17 @@ void launch_confidence_head(const void* hidden, const float* latent, const void*
     const int threads = 256;
     k_confidence_head<<<1, threads, threads * sizeof(float), stream>>>(
         (const bf16*)hidden, latent, (const bf16*)w, bias, H, rank, out_confidence);
+}
+
+void launch_confidence_head_rows(const void* hidden, int hidden_stride,
+                                 const float* latent, int latent_stride,
+                                 const void* w, float bias, int H, int rank,
+                                 int row0, int rows, float* out_confidence, cudaStream_t stream) {
+    if (H <= 0 || rank < 0 || rows <= 0) return;
+    const int threads = 256;
+    k_confidence_head_rows<<<rows, threads, threads * sizeof(float), stream>>>(
+        (const bf16*)hidden, hidden_stride, latent, latent_stride,
+        (const bf16*)w, bias, H, rank, row0, out_confidence);
 }
 
 } // namespace dflash_kernels

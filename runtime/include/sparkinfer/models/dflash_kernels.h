@@ -51,8 +51,11 @@ void launch_add(const void* x, const void* y, void* out, int n,
                 cudaStream_t stream);
 
 // sum = a + b, then out = rms(sum) * w. One launch for the residual+norm pair.
+// `q81`, when non-null, additionally emits Q8_1(out) -- 36 B per 32 values per row -- so the dp4a
+// backbone's activation needs no separate quantize launch. Bit-identical to running
+// launch_quantize_q8_1_rows on `out` afterwards.
 void launch_add_rms(const void* a, const void* b, void* sum, const void* w, void* out,
-                    int rows, int cols, float eps, cudaStream_t stream);
+                    int rows, int cols, float eps, cudaStream_t stream, void* q81 = nullptr);
 
 // RMSNorm over last dim: x [rows, cols] -> out [rows, cols], weight [cols].
 void launch_rms(const void* x, const void* w, void* out, int rows, int cols,
@@ -85,6 +88,13 @@ void launch_capture_row(const void* x, void* hidden, const int* cap_row, int slo
 void launch_quantize_w_q4(const void* w, void* q, void* dm, int N, int K, cudaStream_t stream);
 
 // int4-weight form of launch_gemv_batched16_fused3 (~5 bits/weight vs Q8_0's 9).
+// dp4a twin of the Q4 fused3 below; `xq81` is Q8_1(x), 36 B per 32 values per batch row.
+void launch_gemv_batched_q4_dp4a_fused3(const void* xq81,
+                                        const void* Q0, const void* Q1, const void* Q2,
+                                        const void* D0, const void* D1, const void* D2,
+                                        void* y0, void* y1, void* y2,
+                                        int N0, int N1, int N2, int K, cudaStream_t stream,
+                                        int batch);
 void launch_gemv_batched_q4_fused3(const void* x,
                                    const void* Q0, const void* Q1, const void* Q2,
                                    const void* D0, const void* D1, const void* D2,
@@ -209,6 +219,12 @@ void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_toke
 // comparisons). `latent` must already hold the SAME row's Markov latent (see out_latent above).
 void launch_confidence_head(const void* hidden, const float* latent, const void* w, float bias,
                             int H, int rank, float* out_confidence, cudaStream_t stream);
+// Row-batched form of the above: one launch for every proposal row instead of one per row inside
+// the Markov chain. `latent` must have a per-row stride (see Impl::markov_latent).
+void launch_confidence_head_rows(const void* hidden, int hidden_stride,
+                                 const float* latent, int latent_stride,
+                                 const void* w, float bias, int H, int rank,
+                                 int row0, int rows, float* out_confidence, cudaStream_t stream);
 
 } // namespace dflash_kernels
 } // namespace sparkinfer

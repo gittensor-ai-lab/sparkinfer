@@ -319,6 +319,10 @@ struct DFlashDraftModel::Impl {
     float  yarn_att_scale = 1.0f;
     bf16* hidden_norm = nullptr;
     bf16* final_norm = nullptr;
+    // Quantized copy of `fc`. The projector is [hidden, n_cap*hidden] = [5120, 25600] on DSpark,
+    // 262 MB of bf16 -- and it was the ONE draft matrix still read at full precision, once per
+    // block, to project 1-5 context rows. Every other projection has had a Q4 copy since #661.
+    Q8W q8_fc;
     std::vector<void*> owned;
 
     // Shared target pointers
@@ -351,7 +355,12 @@ struct DFlashDraftModel::Impl {
     // (confidence_head_with_markov=True for every DSpark checkpoint released so far).
     bf16* confidence_w = nullptr;   // [hidden + markov_rank]
     float confidence_bias = 0.f;    // scalar, read back to host once at load (cheap, load-time only)
-    float* markov_latent = nullptr; // [markov_rank] scratch, reused per row of the sequential loop
+    // [block_size+1][markov_rank]. It USED to be a single [markov_rank] scratch overwritten by
+    // every step of the sequential Markov loop, which forced the confidence head to run inside
+    // that loop -- four separate grid-of-ONE launches, 8.5 us each, for a dot product. With a
+    // per-row stride the four become one grid-4 launch after the chain. The chain itself is
+    // unaffected: nothing in it ever read the latent back.
+    float* markov_latent = nullptr;
 
     // Scratch
     cudaStream_t stream{};
@@ -365,6 +374,11 @@ struct DFlashDraftModel::Impl {
     float* logits = nullptr;        // [B, vocab]
     void* head_q8 = nullptr;        // [B] Q8_1 rows of xn for the multi-row head MMVQ
     int *d_ids = nullptr, *d_out = nullptr;
+    int *h_ids = nullptr;                        // PINNED staging for the block ids
+    // Q8_1 staging for the dp4a backbone: one 36-byte block per 32 values per block row, sized for
+    // the widest K any projection uses (the FFN's intermediate).
+    void* xq81 = nullptr;
+
     int *h_out = nullptr;
     float *d_confidence = nullptr, *h_confidence = nullptr;   // [B], confidence head output
 
@@ -461,6 +475,20 @@ struct DFlashDraftModel::Impl {
         // at B: it holds the block's input ids, one per row.
         d_out = alloc<int>(B + 1);
         cu(cudaHostAlloc(&h_out, (B + 1) * sizeof(int), cudaHostAllocDefault), "h_out");
+        // The block ids arrive in a caller-owned std::vector, i.e. PAGEABLE memory, and CUDA
+        // performs a stream synchronize before a pageable H2D copy is initiated. Every other host
+        // buffer on this path (h_out, h_confidence, and the verify's ph_ids/ph_pos/ph_seq) is
+        // already pinned; this one was the exception, and it sits at the very first instruction of
+        // the draft block -- immediately after the verify has left a 158 us GDN state commit in
+        // flight on the target's stream, which shares no data with the draft and should overlap it.
+        cu(cudaHostAlloc(&h_ids, (B + 1) * sizeof(int), cudaHostAllocDefault), "h_ids");
+        {
+            int kmax = (cfg.intermediate > cfg.hidden ? cfg.intermediate : cfg.hidden);
+            const int kfc = (int)cfg.target_layer_ids.size() * cfg.hidden;   // the fc projector
+            if (kfc > kmax) kmax = kfc;
+            const size_t blocks = (size_t)(B + 1) * ((kmax + 31) / 32);
+            xq81 = alloc<char>(blocks * 36);
+        }
         if (confidence_w) {
             d_confidence = alloc<float>(B + 1);
             cu(cudaHostAlloc(&h_confidence, (B + 1) * sizeof(float), cudaHostAllocDefault),
@@ -553,6 +581,7 @@ DFlashDraftModel::~DFlashDraftModel() {
     if (!p_) return;
     for (void* p : p_->owned) cudaFree(p);
     if (p_->h_out) cudaFreeHost(p_->h_out);
+    if (p_->h_ids) cudaFreeHost(p_->h_ids);
     if (p_->h_confidence) cudaFreeHost(p_->h_confidence);
     if (p_->stream) cudaStreamDestroy(p_->stream);
     delete p_;
@@ -744,6 +773,12 @@ bool DFlashDraftModel::load(const std::string& dir) {
     s.fc = s.upload(*fc);
     s.hidden_norm = s.upload(*hn);
     s.final_norm = s.upload(*nn);
+    // Quantize the projector alongside the layer weights (see Impl::q8_fc). The bf16 copy stays:
+    // the FIRST block projects the whole prompt and routes to the tensor-core GEMM, which is
+    // compute-bound and wants bf16.
+    if (q8_on())
+        s.pending_quant.push_back({s.fc, s.cfg.hidden,
+                                   (int)s.cfg.target_layer_ids.size() * s.cfg.hidden, &s.q8_fc});
 
     s.layers.resize(s.cfg.n_layers);
     for (int L = 0; L < s.cfg.n_layers; L++) {
@@ -838,7 +873,7 @@ bool DFlashDraftModel::load(const std::string& dir) {
             const unsigned short raw = *reinterpret_cast<const unsigned short*>(cb->data);
             unsigned int bits = (unsigned int)raw << 16;
             std::memcpy(&s.confidence_bias, &bits, sizeof(float));
-            if (cudaMalloc(&s.markov_latent, (size_t)s.markov_rank * sizeof(float)) != cudaSuccess)
+            if (cudaMalloc(&s.markov_latent, (size_t)(s.cfg.block_size + 1) * s.markov_rank * sizeof(float)) != cudaSuccess)
                 s.confidence_w = nullptr;  // can't run the head without scratch -- disable cleanly
             else
                 s.owned.push_back(s.markov_latent);
@@ -915,6 +950,9 @@ bool DFlashDraftModel::load_gguf(const std::string& path) {
     s.hidden_norm = dense("enc.output_norm.weight");
     s.final_norm = dense("output_norm.weight");
     if (!s.fc || !s.hidden_norm || !s.final_norm) return false;
+    if (q8_on())
+        s.pending_quant.push_back({s.fc, s.cfg.hidden,
+                                   (int)s.cfg.target_layer_ids.size() * s.cfg.hidden, &s.q8_fc});
 
     const int H = s.cfg.hidden;
     const int I = s.cfg.intermediate;
@@ -1050,6 +1088,41 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         const int w = v <= 2 ? 2 : (v <= 4 ? 4 : (v <= 8 ? 8 : 16));
         return w > c.block_size ? c.block_size : w;
     }();
+    // DP4A BACKBONE (SPARKINFER_DFLASH_DP4A=0 restores the float path). Quantizes each activation
+    // to Q8_1 once and drives every projection that shares it through the dp4a kernel: 1.125 B per
+    // element instead of 2, eight dp4a instead of 32 float FMAs per (weight row, block row) per
+    // 32-block, and the weights stay packed. Draft-only, so it moves what is PROPOSED, never what
+    // is emitted.
+    // BITMASK: 1 = Q/K/V, 2 = o-proj, 4 = gate/up, 8 = down. Swept at 512 generated tokens, where
+    // tau resolves to 512/222 rather than 128/71 -- at 128 the step-count lottery is 1.4% and
+    // swamps the effect, and reading it there produced a confident but WRONG conclusion that the
+    // o-projection could not take a quantized activation:
+    //
+    //     mask           draft ms   step ms   tau      DSPARK
+    //     0  (none)       1.475     13.374    2.3198   172.44
+    //     12 (FFN)        1.382     13.278    2.3198   173.68
+    //     14 (+o_proj)    1.369     13.246    2.3094   173.33
+    //     15 (all four)   1.336     13.215    2.3198   174.51   <- default
+    //
+    // All four take Q8_1 for free. Draft-only either way: this moves what is PROPOSED, never what
+    // is emitted, and LOSSLESS stays 1.
+    static const int kDp4a = []{ const char* e = getenv("SPARKINFER_DFLASH_DP4A");
+                                 return e ? atoi(e) : 15; }();
+    const bool dp4a_ok = s.xq81 != nullptr;
+    const bool dp4a_qkv  = dp4a_ok && (kDp4a & 1);
+    const bool dp4a_o    = dp4a_ok && (kDp4a & 2);
+    const bool dp4a_gu   = dp4a_ok && (kDp4a & 4);
+    const bool dp4a_down = dp4a_ok && (kDp4a & 8);
+    // Set when the producing norm has already emitted Q8_1 of the activation, so the projection
+    // that consumes it can skip the standalone quantize launch. The single staging buffer is safe
+    // because each fold is immediately followed by its one consumer -- nothing else touches xq81
+    // in between.
+    bool xn_ready = false, hn_ready = false;
+    auto q81n = [&](const bf16* src, int kk, int rows) {
+        kernels::launch_quantize_q8_1_rows(src, s.xq81, kk, rows, kk, st);
+        return s.xq81;
+    };
+    auto q81 = [&](const bf16* src, int kk) { return q81n(src, kk, BW); };
     const float scale = 1.f / sqrtf((float)d);
     const int past = s.seq_len;
     // The fixed-size (block_size) projections below can use a batched-GEMV kernel that reads
@@ -1059,7 +1132,15 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     const bool fast16 = (BW == 16 || BW == 8 || BW == 7 || BW == 6 || BW == 5 ||
                          BW == 4 || BW == 2);
 
-    cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
+    // Stage through pinned memory (see h_ids): a pageable H2D would sync the stream here.
+    static const bool kPinIds = []{ const char* e = getenv("SPARKINFER_DFLASH_PIN_IDS");
+                                    return !(e && e[0] == '0'); }();
+    if (kPinIds && s.h_ids) {
+        for (int i = 0; i < BW; i++) s.h_ids[i] = noise_ids[i];
+        cu(cudaMemcpyAsync(s.d_ids, s.h_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
+    } else {
+        cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
+    }
     kernels::launch_embedding(s.d_ids, s.embed, s.noise, BW, H, st);
 
     // target_hidden [ctx, n_cap*H] -> fc -> hidden_norm -> target_proj [ctx, H]
@@ -1100,11 +1181,25 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         }
     }
     const int fc_rows = ctx_len - fc_skip;
+    // Route the two remaining BF16 weight reads in this block -- the projector above and the
+    // per-layer context K/V below -- through the Q4 copies. 0 restores bf16 for both.
+    static const bool kCtxQ4 = []{ const char* e = getenv("SPARKINFER_DFLASH_CTX_Q4");
+                                   return !(e && e[0] == '0'); }();
     if (fc_rows > 0) {
         const bf16* th = (const bf16*)target_hidden + (size_t)fc_skip * n_cap * H;
         bf16* tp = s.target_proj + (size_t)fc_skip * H;
+        const bool fc_q4 = kCtxQ4 && s.q8_fc.q4 && fc_rows >= 1 && fc_rows <= 8;
         if (ctx_gemm) {
             kernels::launch_prefill_gemm(th, s.fc, tp, fc_rows, H, n_cap * H, st);
+        } else if (fc_q4 && dp4a_ok) {
+            dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
+                q81n(th, n_cap * H, fc_rows), s.q8_fc.q4, nullptr, nullptr,
+                s.q8_fc.dm, nullptr, nullptr,
+                tp, nullptr, nullptr, H, 0, 0, n_cap * H, st, fc_rows);
+        } else if (fc_q4) {
+            dflash_kernels::launch_gemv_batched_q4_fused3(
+                th, s.q8_fc.q4, nullptr, nullptr, s.q8_fc.dm, nullptr, nullptr,
+                tp, nullptr, nullptr, H, 0, 0, n_cap * H, st, fc_rows);
         } else if (fc_rows > 1) {
             dflash_kernels::launch_gemv_rows_batched(th, s.fc, tp, fc_rows, H, n_cap * H, st);
         } else {
@@ -1155,7 +1250,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
 
         // Q from noise, K/V from cat(target, noise)
         if (fast16) {
-            if (w.q8_wq.q4)
+            if (w.q8_wq.q4 && dp4a_qkv)
+                dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
+                    xn_ready ? s.xq81 : q81(s.xn, H), w.q8_wq.q4, w.q8_wk.q4, w.q8_wv.q4,
+                    w.q8_wq.dm, w.q8_wk.dm, w.q8_wv.dm,
+                    s.q, kdst + (size_t)ctx_len * kvdim, vdst + (size_t)ctx_len * kvdim,
+                    qdim, kvdim, kvdim, H, st, BW);
+            else if (w.q8_wq.q4)
                 dflash_kernels::launch_gemv_batched_q4_fused3(
                     s.xn, w.q8_wq.q4, w.q8_wk.q4, w.q8_wv.q4, w.q8_wq.dm, w.q8_wk.dm, w.q8_wv.dm,
                     s.q, kdst + (size_t)ctx_len * kvdim, vdst + (size_t)ctx_len * kvdim,
@@ -1175,6 +1276,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             for (int t = 0; t < BW; t++)
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wq, s.q + (size_t)t * qdim, qdim, H, st);
         }
+        xn_ready = false;   // consumed above; xq81 is reused by the projections that follow
         // Context half of cat(k_ctx, k_noise), written ahead of the noise rows.
         //
         // A windowed layer never reads a key older than `window` before the query, and
@@ -1198,9 +1300,42 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         const bf16* const ctx_src = s.target_proj + (size_t)ctx_skip * H;
         bf16* const kdst_ctx = kdst + (size_t)ctx_skip * kvdim;
         bf16* const vdst_ctx = vdst + (size_t)ctx_skip * kvdim;
+        // The steady-state context rows went through the BF16 wk/wv while every other projection
+        // in this block -- including the noise rows' own K/V, from the same two matrices -- goes
+        // through the Q4 copies. That is 21 MB of weights per layer against 2.6 MB, on a path that
+        // runs 1-5 rows and is therefore purely weight-bound.
+        //
+        // It was left bf16 out of caution about the context being the one place the TARGET's
+        // information enters the draft. Measured, that caution is unfounded: sweeping the draft's
+        // whole backbone precision (SPARKINFER_DFLASH_WBITS) does not move acceptance in the
+        // direction precision would predict. At 512 generated tokens, MORE precision gives LOWER
+        // acceptance -- Q4 tau 2.3733, Q8 tau 2.3624 for +0.47 ms of draft -- so what is being
+        // read is numeric luck, not draft quality. Judge changes on this path by `draft ms/call`
+        // and `batched ms/call`, which are deterministic to ~0.005 ms; a tau delta under ~2% on a
+        // single prompt says nothing. The draft is insensitive to weight precision, so the context
+        // rows may use the same Q4 copies the block rows do.
+        //
+        // The wide first-block case (ctx_gemm) stays on the bf16 tensor-core GEMM: at 4096 rows it
+        // is COMPUTE bound and already runs at ~169 TFLOPS, ~80% of this card's bf16 peak, where a
+        // dequantising path would only add work. SPARKINFER_DFLASH_CTX_Q4=0 restores bf16.
+        // ctx_rows is the ACCEPTED length, so 1 is its modal value -- and the single-row case was
+        // the most expensive of all, two separate bf16 GEMVs each streaming the whole 10.5 MB
+        // matrix to produce one row. Cover 1..8, not just the multi-row tiers.
+        const bool ctx_q4 = kCtxQ4 && w.q8_wk.q4 && w.q8_wv.q4 && ctx_rows >= 1 && ctx_rows <= 8;
         if (ctx_rows > 0 && ctx_gemm) {
             kernels::launch_prefill_gemm(ctx_src, w.wk, kdst_ctx, ctx_rows, kvdim, H, st);
             kernels::launch_prefill_gemm(ctx_src, w.wv, vdst_ctx, ctx_rows, kvdim, H, st);
+        } else if (ctx_q4 && dp4a_ok) {
+            dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
+                q81n(ctx_src, H, ctx_rows), w.q8_wk.q4, w.q8_wv.q4, nullptr,
+                w.q8_wk.dm, w.q8_wv.dm, nullptr,
+                kdst_ctx, vdst_ctx, nullptr, kvdim, kvdim, 0, H, st, ctx_rows);
+        } else if (ctx_q4) {
+            // Same fused pair the noise rows use; y0/y1 are written as [row][kvdim], which is
+            // exactly the cache slice's layout.
+            dflash_kernels::launch_gemv_batched_q4_fused3(
+                ctx_src, w.q8_wk.q4, w.q8_wv.q4, nullptr, w.q8_wk.dm, w.q8_wv.dm, nullptr,
+                kdst_ctx, vdst_ctx, nullptr, kvdim, kvdim, 0, H, st, ctx_rows);
         } else if (ctx_rows > 1) {
             dflash_kernels::launch_gemv_rows_exact_fused2(
                 ctx_src, w.wk, w.wv, kdst_ctx, vdst_ctx,
@@ -1285,7 +1420,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                         s.fa_m, s.fa_l, s.fa_acc);
 
         if (fast16) {
-            if (w.q8_wo.q4)
+            if (w.q8_wo.q4 && dp4a_o)
+                dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
+                    q81(s.attn, qdim), w.q8_wo.q4, nullptr, nullptr,
+                    w.q8_wo.dm, nullptr, nullptr,
+                    s.ao, nullptr, nullptr, H, 0, 0, qdim, st, BW);
+            else if (w.q8_wo.q4)
                 dflash_kernels::launch_gemv_batched_q4_fused3(
                     s.attn, w.q8_wo.q4, nullptr, nullptr, w.q8_wo.dm, nullptr, nullptr,
                     s.ao, nullptr, nullptr, H, 0, 0, qdim, st, BW);
@@ -1299,9 +1439,16 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             for (int t = 0; t < BW; t++)
                 kernels::launch_gemv(s.attn + (size_t)t * qdim, w.wo, s.ao + (size_t)t * H, H, qdim, st);
         }
-        dflash_kernels::launch_add_rms(s.x, s.ao, s.h, w.post_norm, s.hn, BW, H, c.rms_eps, st);
+        dflash_kernels::launch_add_rms(s.x, s.ao, s.h, w.post_norm, s.hn, BW, H, c.rms_eps, st,
+                                       dp4a_gu ? s.xq81 : nullptr);
+        hn_ready = dp4a_gu;
         if (fast16) {
-            if (w.q8_gate.q4)
+            if (w.q8_gate.q4 && dp4a_gu)
+                dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
+                    hn_ready ? s.xq81 : q81(s.hn, H), w.q8_gate.q4, w.q8_up.q4, nullptr,
+                    w.q8_gate.dm, w.q8_up.dm, nullptr,
+                    s.gate, s.up, nullptr, I, I, 0, H, st, BW);
+            else if (w.q8_gate.q4)
                 dflash_kernels::launch_gemv_batched_q4_fused3(
                     s.hn, w.q8_gate.q4, w.q8_up.q4, nullptr, w.q8_gate.dm, w.q8_up.dm, nullptr,
                     s.gate, s.up, nullptr, I, I, 0, H, st, BW);
@@ -1320,7 +1467,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         }
         dflash_kernels::launch_swiglu(s.gate, s.up, s.gate, BW * I, st);
         if (fast16) {
-            if (w.q8_down.q4)
+            if (w.q8_down.q4 && dp4a_down)
+                dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
+                    q81(s.gate, I), w.q8_down.q4, nullptr, nullptr,
+                    w.q8_down.dm, nullptr, nullptr,
+                    s.down, nullptr, nullptr, H, 0, 0, I, st, BW);
+            else if (w.q8_down.q4)
                 dflash_kernels::launch_gemv_batched_q4_fused3(
                     s.gate, w.q8_down.q4, nullptr, nullptr, w.q8_down.dm, nullptr, nullptr,
                     s.down, nullptr, nullptr, H, 0, 0, I, st, BW);
@@ -1338,7 +1490,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // norm, or the final norm after the last layer. Same math, one launch instead of two, and
         // the draft is eager-launched so each saved launch is also a saved gap.
         const bf16* next_norm = (L + 1 < run_layers) ? s.layers[L + 1].input_norm : s.final_norm;
-        dflash_kernels::launch_add_rms(s.h, s.down, s.x, next_norm, s.xn, BW, H, c.rms_eps, st);
+        dflash_kernels::launch_add_rms(s.h, s.down, s.x, next_norm, s.xn, BW, H, c.rms_eps, st,
+                                       dp4a_qkv ? s.xq81 : nullptr);
+        xn_ready = dp4a_qkv;
         // Per-layer residual stream, for the differential (see the dump block below). s.x is the
         // layer's output residual; comparing it layer by layer turns "the backbone diverges"
         // into "layer N diverges", which is the difference between a search and a fix.
@@ -1551,22 +1705,23 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                 dflash_kernels::launch_markov_bias_add_q8(
                     s.markov_w1, s.markov_w2_q, s.markov_w2_s, prev,
                     s.logits + row * Vd, Vd, s.markov_rank, st,
-                    s.confidence_w ? s.markov_latent : nullptr);
+                    s.confidence_w ? s.markov_latent + (size_t)r * s.markov_rank : nullptr);
             else
                 dflash_kernels::launch_markov_bias_add(
                     s.markov_w1, s.markov_w2, prev,
                     s.logits + row * Vd, Vd, s.markov_rank, st,
-                    s.confidence_w ? s.markov_latent : nullptr);
-            // Confidence head (optional): reads THIS row's hidden state + the Markov latent the
-            // bias call above just wrote, predicting how likely this row's (about to be computed)
-            // argmax is to be accepted. Order doesn't matter relative to the argmax call below --
-            // it depends on s.xn and s.markov_latent, neither of which the argmax touches.
-            if (s.confidence_w)
-                dflash_kernels::launch_confidence_head(s.xn + row * H, s.markov_latent,
-                                                       s.confidence_w, s.confidence_bias, H,
-                                                       s.markov_rank, s.d_confidence + r, st);
+                    s.confidence_w ? s.markov_latent + (size_t)r * s.markov_rank : nullptr);
             kernels::launch_argmax(s.logits + row * Vd, s.d_out + r, 1, Vd, st);
         }
+        // Confidence head (optional), for every proposal row at once. It reads row r's hidden
+        // state and the Markov latent that row's bias call wrote, and nothing in the chain ever
+        // consumed it, so hoisting it out of the loop changes no value -- only the launch count,
+        // from kProposalDepth grid-of-one kernels to one.
+        if (s.confidence_w)
+            dflash_kernels::launch_confidence_head_rows(
+                s.xn, H, s.markov_latent, s.markov_rank,
+                s.confidence_w, s.confidence_bias, H, s.markov_rank,
+                kRowShift ? 0 : 1, kProposalDepth, s.d_confidence, st);
     } else {
         kernels::launch_argmax(s.logits + (size_t)(head_done ? head_row0 : 0) * Vd,
                                s.d_out + (head_done ? 1 : 0),
