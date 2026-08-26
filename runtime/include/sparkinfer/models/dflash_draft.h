@@ -46,6 +46,11 @@ struct DFlashDraftConfig {
     float yarn_beta_slow = 1.f;
 };
 
+// DEBUG (SPARKINFER_DSPARK_TOPK=<K>): the top-K candidates of the row that backs each proposal,
+// captured inside forward_block. [r*K + j] is proposal r's j-th best; [r*K+0] == out_argmax[r].
+int dflash_debug_topk_k();
+const int* dflash_debug_topk();
+
 class DFlashDraftModel {
 public:
     explicit DFlashDraftModel(const DFlashDraftConfig& cfg);

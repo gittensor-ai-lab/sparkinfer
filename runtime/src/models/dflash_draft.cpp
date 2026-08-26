@@ -635,6 +635,15 @@ void DFlashDraftModel::crop(int keep) {
 
 int DFlashDraftModel::seq_len() const { return p_->seq_len; }
 
+// ---- DEBUG: per-proposal top-K of the row that actually backs it -------------------------
+// SPARKINFER_DSPARK_TOPK=<K>. Filled inside forward_block at the exact point the argmax is taken,
+// from the exact pointer the argmax reads -- AFTER the Markov bias has been added in place -- so
+// the row mapping cannot be misattributed the way an after-the-fact read of last_logits() can.
+// g_dbg_topk[r*K + j] is the j-th best candidate for proposal r; [r*K+0] is out_argmax[r] by
+// construction, which is the built-in self-check.
+namespace { std::vector<int> g_dbg_topk; std::vector<float> g_dbg_row; int g_dbg_K = 0; }
+int dflash_debug_topk_k() { return g_dbg_K; }
+const int* dflash_debug_topk() { return g_dbg_topk.empty() ? nullptr : g_dbg_topk.data(); }
 const float* DFlashDraftModel::last_logits() const { return p_->logits; }
 
 // YaRN inverse-frequency table, computed exactly as HuggingFace's _compute_yarn_parameters does
@@ -1437,6 +1446,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         return (e && e[0] == '0') ? 0 : 1;
     }();
     const int head_row0 = kRowShift ? 0 : 1;
+    { static const int k = []{ const char* e = getenv("SPARKINFER_DSPARK_TOPK");
+                               int v = e ? atoi(e) : 0; return v < 0 ? 0 : (v > 32 ? 32 : v); }();
+      g_dbg_K = k; }
     bool head_done = false;
     if (head_mr && s.head_q8 && (s.lm_head_type == 14 || s.lm_head_type == 12)) {
         // Score only the proposal rows the verifier can consume. One row-batched quantize launch
@@ -1566,6 +1578,23 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                                        s.confidence_w, s.confidence_bias, H,
                                                        s.markov_rank, s.d_confidence + r, st);
             kernels::launch_argmax(s.logits + row * Vd, s.d_out + r, 1, Vd, st);
+            if (g_dbg_K > 0) {
+                // Debug path: synchronous, and deliberately so -- it reads the same row the
+                // argmax above just consumed, before the next iteration can touch it.
+                if (g_dbg_row.size() < (size_t)Vd) g_dbg_row.resize(Vd);
+                if (g_dbg_topk.size() < (size_t)(kProposalDepth + 1) * g_dbg_K)
+                    g_dbg_topk.assign((size_t)(kProposalDepth + 1) * g_dbg_K, -1);
+                if (cudaStreamSynchronize(st) == cudaSuccess &&
+                    cudaMemcpy(g_dbg_row.data(), s.logits + row * Vd,
+                               (size_t)Vd * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                    std::vector<int> idx(Vd);
+                    for (int j = 0; j < Vd; j++) idx[j] = j;
+                    const int K = g_dbg_K < Vd ? g_dbg_K : Vd;
+                    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
+                        [&](int a, int b){ return g_dbg_row[a] > g_dbg_row[b]; });
+                    for (int j = 0; j < K; j++) g_dbg_topk[(size_t)r * g_dbg_K + j] = idx[j];
+                }
+            }
         }
     } else {
         kernels::launch_argmax(s.logits + (size_t)(head_done ? head_row0 : 0) * Vd,

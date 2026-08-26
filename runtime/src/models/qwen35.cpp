@@ -3574,6 +3574,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // between a token and a millisecond is exactly the throughput the run is already achieving,
     // and that is a number this loop can measure instead of assume.
     double plan_tok = 0, plan_ms = 0;
+    // Rank-probe accumulators (debug; see the probe below).
+    static const bool kRankProbe = []{ const char* e = getenv("SPARKINFER_DSPARK_TOPK");
+                                       return e && atoi(e) > 0; }();
+    long rp_seen[kPlanMaxW] = {0}, rp_out[kPlanMaxW] = {0};
+    long rp_nomap[kPlanMaxW] = {0};
+    long rp_rank[kPlanMaxW][32] = {{0}};
     // Online calibration of the confidence head, per proposal position.
     //
     // The head is an accept-rate predictor, so sigmoid(logit) is read as P(this position is
@@ -3746,7 +3752,6 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             break;
         }
         if (!draft_idle) for (int i = 1; i <= kProposalDepth; i++) block[i] = draft_ids[i];
-
         // Incremental verify with early-exit: forward only the accepted prefix, stopping at the
         // first rejected proposal. forward_token advances GDN state + KV per token, so after
         // block[0..keep-1] the recurrent state and KV sit exactly at start+keep -- no snapshot /
@@ -3825,6 +3830,27 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 plan_rows_sum += vn; plan_steps++;
                 while (accept < vn - 1 && block[accept + 1] == posterior[accept]) ++accept;
                 keep = accept + 1;
+                // ---- RANK PROBE (SPARKINFER_DSPARK_TOPK=<K>, debug only) -------------------
+                // The chain accepts position i only when the draft's ARGMAX equals the target's.
+                // A width-k tree accepts whenever the target's token is anywhere in the draft's
+                // top k there. dflash_debug_topk() is captured INSIDE forward_block from the exact
+                // row the argmax reads, so [i*K+0] == block[i] by construction -- checked, and a
+                // mismatch drops the sample instead of counting it.
+                if (kRankProbe) {
+                    const int K = dflash_debug_topk_k();
+                    const int* tk = dflash_debug_topk();
+                    if (K > 0 && tk) {
+                        for (int i = 1; i <= kProposalDepth && i <= vn - 1 && i < kPlanMaxW; i++) {
+                            if (accept < i - 1) break;
+                            const int tgt = posterior[i - 1];
+                            if (tk[(size_t)i * K] != block[i]) { rp_nomap[i]++; continue; }
+                            int rank = -1;
+                            for (int j = 0; j < K; j++) if (tk[(size_t)i * K + j] == tgt) { rank = j; break; }
+                            rp_seen[i]++;
+                            if (rank < 0) rp_out[i]++; else rp_rank[i][rank]++;
+                        }
+                    }
+                }
                 // Feed the achieved rate. The draft is part of the step it paid for, so it is in
                 // the denominator here even though it is not in plan_cost().
                 plan_tok += (double)keep;
@@ -3935,6 +3961,32 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     auto t_end = std::chrono::steady_clock::now();
     if (stats) {
         stats->steps = steps;
+        if (kRankProbe) {
+            const int K = dflash_debug_topk_k();
+            fprintf(stderr, "\n[rankprobe] rank of the TARGET's token inside the DRAFT's top-%d\n", K);
+            fprintf(stderr, "[rankprobe] pos  seen");
+            for (int j = 0; j < K; j++) fprintf(stderr, "  r%-2d", j + 1);
+            fprintf(stderr, "   out  nomap\n");
+            for (int i = 1; i < kPlanMaxW; i++) {
+                if (!rp_seen[i]) continue;
+                fprintf(stderr, "[rankprobe] %3d %5ld", i, rp_seen[i]);
+                for (int j = 0; j < K; j++) fprintf(stderr, " %4ld", rp_rank[i][j]);
+                fprintf(stderr, " %5ld %6ld\n", rp_out[i], rp_nomap[i]);
+            }
+            // tau(width w) = 1 + sum_i prod_{j<=i} P(target in draft top-w at j)
+            fprintf(stderr, "[rankprobe] tau ceiling by tree width:\n");
+            for (int w = 1; w <= K; w++) {
+                double surv = 1.0, tau = 1.0;
+                for (int i = 1; i < kPlanMaxW; i++) {
+                    if (!rp_seen[i]) break;
+                    long hit = 0;
+                    for (int j = 0; j < w; j++) hit += rp_rank[i][j];
+                    surv *= (double)hit / (double)rp_seen[i];
+                    tau += surv;
+                }
+                fprintf(stderr, "[rankprobe]   width %2d  tau %.3f\n", w, tau);
+            }
+        }
         stats->mean_accept = steps > 0 ? accept_sum / steps : 0;
         stats->ttft_s = std::chrono::duration<double>(t1 - t0).count();
         if (kProfile) cudaProfilerStop();
