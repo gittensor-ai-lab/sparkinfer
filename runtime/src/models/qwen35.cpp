@@ -5555,8 +5555,20 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         cudaMemcpy(pd, src.packed, packed_bytes, cudaMemcpyHostToDevice);
         cudaMemcpy(gd, src.group, scale_bytes, cudaMemcpyHostToDevice);
         kernels::launch_ct_dequant_nvfp4(pd, gd, src.global, out, rows, cols, s.stream);
-        cudaStreamSynchronize(s.stream);
+        // CHECKED, because an unchecked failure here is invisible in the worst possible way: the
+        // output buffer is left as cudaMalloc returned it and the caller requantizes that into a
+        // perfectly well-formed weight of zeros. A zero lm_head yields a uniform distribution over
+        // the vocabulary, so the model emits token 0 forever while every layer's activations look
+        // healthy -- which is exactly how the gridDim.y overflow fixed above stayed hidden.
+        cudaError_t de = cudaGetLastError();
+        if (de == cudaSuccess) de = cudaStreamSynchronize(s.stream);
         cudaFree(pd); cudaFree(gd);
+        if (de != cudaSuccess) {
+            fprintf(stderr, "[compressed-tensors] %s: NVFP4 dequant failed (%s) for [%d,%d]\n",
+                    prefix.c_str(), cudaGetErrorString(de), rows, cols);
+            cudaFree(out);
+            return nullptr;
+        }
         return out;
     };
 

@@ -1603,10 +1603,29 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
         if (!moe) {
             // dense SwiGLU FFN, chunked over tokens (upstream #530): ffg/ffu/A_i8 stay O(FC*ffn).
-            const void* gate_pf = w.prefill_gate_q ? w.prefill_gate_q : w.gate_q;
-            const void* up_pf = w.prefill_up_q ? w.prefill_up_q : w.up_q;
-            const int gate_pf_type = w.prefill_gate_q ? w.prefill_gate_qtype : w.gate_qtype;
-            const int up_pf_type = w.prefill_up_q ? w.prefill_up_qtype : w.up_qtype;
+            // Third fallback, to the checkpoint's own NVFP4 payload. Under
+            // SPARKINFER_QWEN38_DECODE_NVFP4 (ON by default) the loader makes those payloads the
+            // DECODE weights and deliberately builds no Q4_K copy at all, so gate_q/up_q/down_q
+            // are null -- and every consumer below reached them without a null check, handing a
+            // null source straight to launch_prefill_quantize_rows_i8 (illegal read at ~NULL, CUDA
+            // context lost on the first batched prefill). Only the fp4 fast arms were reachable,
+            // and the down projection has no fp4 arm on this shape, so the crash was unconditional.
+            // dq() already dequantizes SI_QTYPE_NVFP4, so resolving the type here is all the rest
+            // of this function needs.
+            auto ffn_pf = [](const void* pref, int pref_t, const void* q4, int q4_t,
+                             const void* nv, const void** out_w, int* out_t) {
+                if (pref)     { *out_w = pref; *out_t = pref_t; return; }
+                if (q4)       { *out_w = q4;   *out_t = q4_t;   return; }
+                *out_w = nv; *out_t = kernels::SI_QTYPE_NVFP4;
+            };
+            const void* gate_pf; int gate_pf_type;
+            const void* up_pf;   int up_pf_type;
+            const void* down_pf; int down_pf_type;
+            ffn_pf(w.prefill_gate_q, w.prefill_gate_qtype, w.gate_q, w.gate_qtype, w.gate_nv,
+                   &gate_pf, &gate_pf_type);
+            ffn_pf(w.prefill_up_q, w.prefill_up_qtype, w.up_q, w.up_qtype, w.up_nv,
+                   &up_pf, &up_pf_type);
+            ffn_pf(nullptr, 0, w.down_q, w.down_qtype, w.down_nv, &down_pf, &down_pf_type);
             // Per-token independent, so this is numerically identical to the full-width pass.
             // Long-ctx: selective int8 FFN (GDN/attn stay bf16) + int8 weight cache across chunks.
             const bool ffn_i8 = use_i8_ffn && ffn_Wg_i8 != nullptr;
@@ -1622,7 +1641,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             if (ffn_i8 && !ffn_qi8) {
                 dequant_w_i8(gate_pf_type, gate_pf, ffn_Wg_i8, ffn_swg, ffn, H);
                 dequant_w_i8(up_pf_type,   up_pf,   ffn_Wu_i8, ffn_swu, ffn, H);
-                dequant_w_i8(w.down_qtype, w.down_q, ffn_Wd_i8, ffn_swd, H, ffn);
+                dequant_w_i8(down_pf_type, down_pf, ffn_Wd_i8, ffn_swd, H, ffn);
             }
             // The down projection takes the int8 path on both branches whenever ffn_i8 or use_i8,
             // so the FFN residual can ride the residual-fused GEMM straight into x per chunk.
@@ -1689,7 +1708,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                             w.down_fp4_alpha));
                     if (!down_fp4_done) {
                         kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
-                        proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
+                        proj_fused_acc(ffg, down_pf, down_pf_type, w.down_rs,
                                        ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
                     }
                     // Keep the layer on one route: if the residual-fused arm is active but this
@@ -1720,16 +1739,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st,
                                                                    A_i8p) && A_i8p;
                     bool down_fused = false;
-                    if (w.down_rs && kernels::pf_dense_gemm_qi8_supported(w.down_qtype)) {
+                    if (w.down_rs && kernels::pf_dense_gemm_qi8_supported(down_pf_type)) {
                         down_fused = kernels::launch_prefill_gemm_qi8_dense(
-                            w.down_qtype, A_i8, sx, w.down_q, w.down_rs,
+                            down_pf_type, A_i8, sx, down_pf, w.down_rs,
                             ao + (size_t)fo * H, fn, H, ffn, st,
                             qb_partials, QB_SPLITS, nullptr, apk());
                     }
                     if (!down_fused) {
-                        if (!kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q,
+                        if (!kernels::launch_gguf_dequant_rows_i8(down_pf_type, down_pf,
                                                                   W_i8, sw, H, ffn, st)) {
-                            const void* wb = dq(w.down_q, w.down_qtype, H, ffn);
+                            const void* wb = dq(down_pf, down_pf_type, H, ffn);
                             kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, H, ffn, st);
                         }
                         if (ffn_fused)
@@ -1802,19 +1821,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         // branch anyway (its sandwich norm needs the raw FFN output in ao).
                         bool down_fused = false;
                         if (!ffn_fused && muse_qb && w.down_rs &&
-                            kernels::pf_dense_gemm_qi8_supported(w.down_qtype)) {
+                            kernels::pf_dense_gemm_qi8_supported(down_pf_type)) {
                             // The accumulator can only stand when this chunk IS the whole prompt:
                             // a second chunk would overwrite both qb_partials and sx before the
                             // post-FFN norm below reads them.
                             down_fused = kernels::launch_prefill_gemm_qi8_dense(
-                                w.down_qtype, A_i8, sx, w.down_q, w.down_rs,
+                                down_pf_type, A_i8, sx, down_pf, w.down_rs,
                                 ao + (size_t)fo * H, fn, H, ffn, st, qb_partials, QB_SPLITS,
                                 (fn == N) ? &ffn_acc : nullptr, apk());
                         }
                         if (!down_fused) {
-                            if (!kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q,
+                            if (!kernels::launch_gguf_dequant_rows_i8(down_pf_type, down_pf,
                                                                       W_i8, sw, H, ffn, st)) {
-                                const void* wb = dq(w.down_q, w.down_qtype, H, ffn);
+                                const void* wb = dq(down_pf, down_pf_type, H, ffn);
                                 kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, H, ffn, st);
                             }
                             // keeps #795's split-K fan-out for whatever still materializes (Q6_K down)
@@ -1825,9 +1844,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         }
                     } else {
                         kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
-                        if (!ffn_fused || !proj_resid(ffg, w.down_q, w.down_qtype,
+                        if (!ffn_fused || !proj_resid(ffg, down_pf, down_pf_type,
                                                       x + (size_t)fo * H, H, ffn, fn))
-                            proj(ffg, w.down_q, w.down_qtype, ao + (size_t)fo * H, H, ffn, fn);
+                            proj(ffg, down_pf, down_pf_type, ao + (size_t)fo * H, H, ffn, fn);
                     }
                 }
             }
