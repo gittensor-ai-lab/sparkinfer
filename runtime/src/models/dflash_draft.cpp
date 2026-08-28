@@ -1164,7 +1164,46 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // cost that still grew with context. Env override: unset -> 3*sliding_window; 0 -> off (full); N.
     static const int kFullWindowEnv = []{ const char* e = getenv("SPARKINFER_DFLASH_FULL_WINDOW");
                                           return e ? atoi(e) : -1; }();
-    const int kFullWindow = kFullWindowEnv >= 0 ? kFullWindowEnv : 3 * c.sliding_window;
+    // The DSpark checkpoint ships "sliding_window": null. find_int runs strtol over " null" and
+    // gets 0, so 3 * c.sliding_window is 0, and BOTH trim paths below are gated behind
+    // `kFullWindow > 0` -- the draft has never windowed anything, at any context. Nothing warns:
+    // the run succeeds and the draft simply attends every token it has.
+    //
+    // That is free while the context is short and expensive once it is not. nsys on the decode
+    // range, per step: the draft's attention (k_attn_rows_tile_hd128) is 0.32 ms of a 13.6 ms step
+    // at ctx=4096 and 2.44 ms of a 20.9 ms step at ctx=32768 -- it grew 7.5x for an 8x context,
+    // because it is attending all of it, and the draft goes from 12% of the step to 24%.
+    //
+    // Windowing is NOT a win everywhere, so it is gated rather than simply switched on. Default vs
+    // an 8192 window, one binary, arms alternated, every arm lossless with AR flat:
+    //     ctx    default    window 8192
+    //     4k     143.03  ->  142.90    0%      inert by construction, tau BIT-IDENTICAL at 1.9394:
+    //                                          a window wider than the context trims nothing
+    //     16k    231.46  ->  214.05   -7.5%    (second prompt: 161.45 -> 152.17, -5.7%)
+    //     24k    174.55  ->  176.82   +1.3%
+    //     32k    109.13  ->  122.63  +12.4%    (second prompt: 102.08 -> 116.05, +13.7%)
+    // Both ends reproduce on an independent prompt, so neither the win nor the loss is noise. So it
+    // engages only once the context is at least 3x the window -- once the draft would be keeping at
+    // most a third of what it is paying to attend to.
+    //
+    // PROVENANCE, because it bounds what these numbers mean: the long prompts above come from
+    // bench/scripts/gen_eval_prompt.py --len, which builds a long stream by tiling seed-shuffled
+    // paragraph orders of a short corpus. Such a stream is self-similar, and how much exploitable
+    // structure sits beyond the window depends on where the truncation lands -- which is why the
+    // measured tau is non-monotonic in the context (5.20 at 16k, 3.69 at 24k, 2.30 at 32k). The
+    // RELATIVE comparisons are still sound (the target verifies every token, so both arms of a pair
+    // emit identical text and a tau difference is a real acceptance difference), but the absolute
+    // tok/s are not representative of non-repeating prose, and the sign of this trade is known to
+    // move with acceptance: it LOSES in the high-tau regime above.
+    //
+    // The gate is on `past + ctx_len`, NOT ctx_len. ctx_len is how many NEW target rows this block
+    // ingests -- the whole prompt on the first block and then just `keep` (1..8) on every one
+    // after -- so gating on it alone engages the window for one block and switches it off for the
+    // rest of the run.
+    static const int kDefaultWindow = 8192;
+    int kFullWindow = kFullWindowEnv >= 0 ? kFullWindowEnv : 3 * c.sliding_window;
+    if (kFullWindowEnv < 0 && kFullWindow <= 0 && past + ctx_len >= 3 * kDefaultWindow)
+        kFullWindow = kDefaultWindow;
     // fc trim: once the full-attn layer is windowed, NO layer reads target_proj older than the
     // largest window across layers, so project only that tail. Uses the same attn_gqa_kv_lo bound
     // the per-layer ingestion (#752) applies, at the LARGEST window -> surviving rows byte-identical,
