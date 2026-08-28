@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """TPE auto-tuner for DSpark speculative decode.
 
-Defaults to ctx=128 (DSPARK_CTX), which is NOT what the eval bot scores -- pr_dspark_bot.py scores
-dspark-decode@4k. A ctx=128 sweep was run to exhaustion and returned +0.7%, so a fresh run should
-almost certainly set DSPARK_CTX=4096 to search the dimension that actually earns a tier.
+Defaults to ctx=128 (DSPARK_CTX). This tuner uses short independent train/holdout prompts and does
+not reproduce the evaluator's fixed 32k corpus; set DSPARK_CTX only for exploratory sweeps where
+the supplied prompt actually contains that many tokens.
 
 Searches the DFlash/DSpark runtime knobs for the configuration that maximises DSpark decode
 throughput, subject to a hard losslessness constraint. Modelled on p-e-w/heretic, which co-optimises
