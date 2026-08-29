@@ -1200,9 +1200,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // ingests -- the whole prompt on the first block and then just `keep` (1..8) on every one
     // after -- so gating on it alone engages the window for one block and switches it off for the
     // rest of the run.
-    static const int kDefaultWindow = 8192;
-    static const int kScored32kWindow = 4096;
-    static const int kScored32kMinSeq = 32768;
+    // One window, one threshold. This used to be a two-tier rule (8192 above 24576, 4096 above
+    // 32768) with nothing at all below 24576; the 16k measurement below collapses it, because 4096
+    // beats 8192 everywhere it was checked and the band under 24576 was simply unserved.
+    // kMidCtxMinSeq is deliberately the same 12288 boundary the proposal-depth ladder in
+    // qwen35.cpp uses -- the two policies describe the same regime and should not drift apart.
+    static const int kMidCtxWindow = 4096;
+    static const int kMidCtxMinSeq = 12288;
     int kFullWindow = kFullWindowEnv >= 0 ? kFullWindowEnv : 3 * c.sliding_window;
     if (kFullWindowEnv < 0 && kFullWindow <= 0) {
         const int total_ctx = past + ctx_len;
@@ -1211,8 +1215,18 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // 4096 cuts draft time 1.920 -> 1.525 ms while remaining lossless and moving end-to-end
         // throughput 89.85 -> 91.80 tok/s. Preserve the independently measured 8k policy below
         // the scored regime, where the 4k-window trade has not been established.
-        if (total_ctx >= kScored32kMinSeq) kFullWindow = kScored32kWindow;
-        else if (total_ctx >= 3 * kDefaultWindow) kFullWindow = kDefaultWindow;
+        // ...and the same is true from 12k up, which is where the draft's attention first becomes
+        // a large share of the step. Below 24576 the rule above never fired at all -- kFullWindow
+        // is 3 * c.sliding_window and the checkpoint's sliding_window parses to 0 -- so at 16k the
+        // draft was still attending all 16384 tokens and costing 2.886 ms of a 15.7 ms step.
+        // Measured at ctx=16384 on the first 16384 tokens of bench_prompt_32k.txt (real prose, not
+        // a tiling), three fresh processes per arm, every arm lossless and AR flat at 85.39-85.50:
+        //     window   none     8192     4096     3072     2048      (at proposal depth 2)
+        //     tok/s   82.478   86.093   92.031   92.749   91.594
+        // 4096 rather than the marginally better 3072: the peak is broad, 3072 is worth 0.8% on
+        // ONE prompt, and reusing the constant the scored regime already uses is worth more than
+        // that. So a single threshold now covers everything from 12288 up.
+        if (total_ctx >= kMidCtxMinSeq) kFullWindow = kMidCtxWindow;
     }
     // fc trim: once the full-attn layer is windowed, NO layer reads target_proj older than the
     // largest window across layers, so project only that tail. Uses the same attn_gqa_kv_lo bound
