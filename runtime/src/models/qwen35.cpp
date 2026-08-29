@@ -3397,12 +3397,25 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // seven checkpoint proposals available lets structured output collapse far more decode steps.
     // On the six matched 19-41 prompt-token / 200-256 output-token workloads this moved throughput
     // from 92-318 to 151-432 tok/s, while the 4k regime above keeps its measured depth-4 optimum.
+    // And the 12288..32768 band takes depth 2. That band kept the deep tier's 7 long after the
+    // acceptance that justified it was gone: the note above records 32k accepting 5.61 of a
+    // maximum 6, whereas ctx=16384 on real prose accepts 1.29. Seven proposals there are not
+    // merely unused -- they LOWER tau, because the planner spends verify rows on deep proposals
+    // that are wrong (1.2929 at depth 7 against 1.3061 at depth 3-4). Measured at ctx=16384 on the
+    // first 16384 tokens of bench_prompt_32k.txt, three fresh processes per arm, all lossless,
+    // AR flat at 85.39-85.50 (tok/s, at the 4096 window this band now also gets):
+    //     depth   7(was)      4        3        2        1
+    //             82.478    90.926   91.517   92.031   91.897
+    // Depth 2 with the window is +11.58% end to end and takes DSpark from 0.966x AR -- an outright
+    // net loss against not speculating at all -- to 1.078x. The two changes stack because they cut
+    // different costs: depth removes the planner's bootstrap walk and a 248320-wide head row per
+    // proposal, the window removes draft attention.
     const bool kShortGeneration = (n + max_new + B) <= kCompactMaxSeq;
     constexpr int kScored32kMinSeq = 32768;
     const int kProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
                              : (kShortGeneration ? 7
                                 : ((n + max_new) >= kScored32kMinSeq ? 3
-                                   : ((n + max_new) >= kDeepMinSeq ? 7 : 4))));
+                                   : ((n + max_new) >= kDeepMinSeq ? 2 : 4))));
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
