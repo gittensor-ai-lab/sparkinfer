@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""sparkinfer DSpark speculative-decode PR auto-evaluator (Qwen3.8-27B, ctx=32k).
+"""sparkinfer DSpark speculative-decode PR auto-evaluator (Qwen3.8-27B, ctx=16k).
 
 Adapted from pr_modelopt_bot.py — same transport, same tier buckets, same GitHub plumbing — and
-narrowed to one question: how fast is DSpark speculative decode at ctx=32k, and is it still exact?
+narrowed to one question: how fast is DSpark speculative decode at ctx=16k, and is it still exact?
 
-  0. SCOPE (2026-08-28) — DSpark decode @ ctx=32k is the ONLY scored dimension.
+  0. SCOPE (2026-08-28) — DSpark decode @ ctx=16k is the ONLY scored dimension.
               The target is the ModelOpt NVFP4 checkpoint (MODEL_DIR); the draft is the released
               DSpark checkpoint (DRAFT_DIR). Both legs — the AR reference and the speculative run —
               are measured in ONE process by runtime/examples/dspark_tau_check.cpp, so they share a
               model load, a GPU state and an env, and the PR-vs-main delta is apples-to-apples.
 
-              WHY 4k AND NOT 128, which this bot scored for its first day. At ctx=128 speculation
+              WHY 16k AND NOT 128, which this bot scored for its first day. At ctx=128 speculation
               cannot pay, structurally. The token-loop verify runs one target forward per KEPT
               token — exactly the count AR runs — so accepting more tokens saves nothing there; the
               draft's only payoff is arming the BATCHED verify, and the batched path is slower than
@@ -25,13 +25,13 @@ narrowed to one question: how fast is DSpark speculative decode at ctx=32k, and 
               was the only direction the metric left open. A metric whose optimum is "turn the
               feature off" is measuring the wrong thing.
 
-              32768 is well past kEngageMinSeq (1024), so the adaptive gate CAN arm the batched verify —
+              16384 is well past kEngageMinSeq (1024), so the adaptive gate CAN arm the batched verify —
               the one path where accepting k tokens costs ONE target forward instead of k. That
               makes tau a real lever again and "DSpark beats AR" reachable rather than impossible.
               Known starting point from #867's own grid: tau ~1.113 and 29.88 tok/s at ctx=4096,
               depth 3.
 
-              Nothing is measured at ctx=128 any more (explicit decision: score 32k only). Short
+              Nothing is measured at ctx=128 any more (explicit decision: score 16k only). Short
               context therefore has NO coverage in this bot — if that matters, add it back as a
               floor, which costs one more harness run per ref.
 
@@ -138,21 +138,21 @@ BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 # over the whole prompt), so a real win in one is a real win, and averaging would let an untouched
 # dimension dilute it.
 #
-# The one scored dimension: DSpark speculative decode throughput at ctx=32768, as measured by
+# The one scored dimension: DSpark speculative decode throughput at ctx=16384, as measured by
 # runtime/examples/dspark_tau_check.cpp's METRIC DSPARK_TPS.
 #
 # This said ctx=128 until 2026-08-21, and the paragraph above it described decode@128 and
 # prefill@128 as no-regression floors. Both were inherited verbatim from pr_modelopt_bot.py and
 # neither survived the move to long context: the module docstring's SCOPE section is explicit that
 # "nothing is measured at ctx=128 any more". The scored dimension moved from 4k to 32k on
-# 2026-08-28. The floors this bot actually runs are the AR floor, the tau floor, and the two 16k
-# long-context guards -- all documented in the docstring, none of them at 128.
+# 2026-08-28, then to 16k. The floors this bot actually runs are the AR floor, the tau floor, and
+# the two 16k long-context guards -- all documented in the docstring, none of them at 128.
 #
 # Single-dimension on purpose. The multi-dimension machinery below (best-tier-wins across a list,
-# every dimension also a floor) is kept intact so adding e.g. "dspark-decode@32k" later is a
+# every dimension also a floor) is kept intact so adding e.g. "dspark-decode@16k" later is a
 # one-line change, but with one entry the combination rule degenerates to "score it, and reject if
 # it regresses" -- which is what a focused optimisation target wants.
-SCORING_DIMS = ["dspark-decode@32k"]
+SCORING_DIMS = ["dspark-decode@16k"]
 SCORING_DIM = SCORING_DIMS[0]
 
 # Accuracy gate bars. This gate is DIFFERENTIAL (PR vs origin/main on the same token stream, see
@@ -185,7 +185,7 @@ MODELOPT_NEEDS_REBASE = "dspark-needs-rebase"
 # baseline moves by ~72% (dspark@4k 43.06 -> 74.05, ar@4k 47.39 -> 90.19) and every score taken
 # under v1 is incomparable -- bumping the schema forces re-evaluation instead of letting a stale
 # label sit next to a number that no longer means the same thing.
-EVAL_SCHEMA_VERSION = "v3-dspark-decode32k"
+EVAL_SCHEMA_VERSION = "v4-dspark-decode16k"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-dspark-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -217,7 +217,7 @@ MODEL_WEIGHT_FILE = os.environ.get("MODELOPT_MODEL_WEIGHT_FILE",
 DRAFT_DIR = os.environ.get("DSPARK_DRAFT_DIR", "/root/workspace/dspark")
 # Prompt length for the scored context. dspark_tau_check takes explicit token ids, so this is the
 # real ctx: the bot tokenizes bench/scripts/bench_prompt_32k.txt and truncates to this many ids.
-# ctx=32768, not 4096 (explicit decision 2026-08-28): the serving target is now long-context
+# ctx=16384, not 4096 (explicit decision 2026-08-28): the serving target is now long-context
 # traffic, so contributors must optimise the KV-read and verification regime that production uses.
 # At ctx=128 speculation CANNOT pay: the token
 # loop runs one target forward per kept token, exactly as AR does, so the draft's only payoff is
@@ -226,15 +226,15 @@ DRAFT_DIR = os.environ.get("DSPARK_DRAFT_DIR", "/root/workspace/dspark")
 # at a ceiling of "stop speculating", with tau collapsing 1.255 -> 1.000 on the way. The metric was
 # rewarding the removal of speculation because that was the only direction available.
 #
-# 32768 is past kEngageMinSeq (1024), so the adaptive gate CAN arm the batched verify, which is the
+# 16384 is past kEngageMinSeq (1024), so the adaptive gate CAN arm the batched verify, which is the
 # only path on which accepting k tokens costs one target forward instead of k. That makes tau a
 # real lever again and makes "DSpark beats AR" reachable rather than structurally impossible.
-DSPARK_CTX = int(os.environ.get("DSPARK_CTX", "32768"))
+DSPARK_CTX = int(os.environ.get("DSPARK_CTX", "16384"))
 # Repeats of the speculative generation per round. Every one must match AR for LOSSLESS to be 1.
 #
 # Three independent processes, not three generations in one loaded runtime. Process isolation makes
 # each repetition start from the same allocator/graph/model state and still catches nondeterministic
-# losslessness defects. Batched 32k prefill keeps the extra model loads cheaper than the old
+# losslessness defects. Batched 16k prefill keeps the extra model loads cheaper than the old
 # in-process token-loop repeats.
 #
 # Detection honesty: the defect class this targets (the draft/verify overlap race) needs FULL-BLOCK
@@ -331,7 +331,7 @@ GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
 # Same shape as the inherited Qwen3.6 guard below, except the subject is a compressed-tensors
 # DIRECTORY rather than a GGUF, so there is no ensure_model/ensure_tokenizer download step.
 Q38_GUARD_MODEL_DIR = os.environ.get("Q38_GUARD_MODEL_DIR", "/root/workspace/models_qwen38")
-# decode@32k is this bot's scoring dimension; the guard contexts below are separate from it
+# decode@16k is this bot's scoring dimension; the guard contexts below are separate from it
 # because that is where the shared prefill and KV paths cost the most.
 Q38_GUARD_CTXS = [0, 4096, 16384]
 
@@ -357,7 +357,7 @@ SCORES_FILE = os.path.expanduser(
 # judge.py's --from-stdin generic RESULT_JSON path (NOT --dflash, which hardcodes a
 # DFlash-shaped measurement block and eval_mode="dflash" — reusing it here would produce a
 # mislabeled, semantically wrong attestation). SPARKINFER_EVAL_MODE is set explicitly below so
-# the attestation correctly records "qwen38-32k", not the AR bot's "longctx" default.
+# the attestation correctly records "qwen38-16k", not the AR bot's "longctx" default.
 POLARIS_ENABLED = os.environ.get("POLARIS", "1") != "0"
 POLARIS_API_KEY = os.environ.get("POLARIS_API_KEY", "")
 _POLARIS_PUBKEY_FILE = os.path.join(HERE, "polaris", "sparkinfer_eval.pub")
@@ -721,7 +721,7 @@ def _ssh_run_resilient(host, port, script: str, label: str):
 
 
 def _remote_script(ref: str, role: str = "pr", main: dict | None = None) -> str:
-    """Bash run on the eval box: checkout ref, build, DSpark speculative decode @ctx=32k against
+    """Bash run on the eval box: checkout ref, build, DSpark speculative decode @ctx=16k against
     the NVFP4 target, and the teacher-forced score dump.
 
     Run once per ref -- identical script both times so the two measurements are directly
@@ -897,15 +897,15 @@ test -f "$DRAFT_DIR/config.json" || {{ echo "FAIL $DRAFT_DIR has no config.json"
 
 # Real prompt, not a synthetic ramp -- same reasoning as the sibling bots: a synthetic token stream
 # is a gaming surface, and that matters when the bot can auto-merge without a human reading the
-# diff. Truncated to CTX ids so "ctx=32k" means 32768 real tokens of ordinary prose.
+# diff. Truncated to CTX ids so "ctx=16k" means 16384 real tokens of ordinary prose.
 # bench_prompt_32k.txt, NOT bench_prompt.txt: the latter is ~245 tokens, so truncating it to CTX
-# would have produced a 245-token context while every label said 32k. Nothing would have warned --
+# would have produced a 245-token context while every label said 16k. Nothing would have warned --
 # the run succeeds, the metric parses, and the number is simply of something else. That is the same
 # failure the prefill parity gate had when its corpus was too short for n=128 to run, except that
 # one at least printed "skipped".
 #
 # So the length is CHECKED, not assumed: short corpus is a hard failure of the round. And the text
-# is deliberately non-repeating natural prose. Tiling a short prompt to reach 32768 would have
+# is deliberately non-repeating natural prose. Tiling a short prompt to reach 16384 would have
 # been easy and would have wrecked the measurement -- repeated text is far more
 # predictable, which inflates acceptance, and tau is the exact quantity this bot reports.
 DSPARK_IDS=/tmp/dspark_prompt_ids.txt
@@ -984,11 +984,11 @@ if [ "$IS_PR" = "1" ]; then
   fi
   if _lt "0" "$REF_DSPARK"; then
     _lt "$DS" "$(python3 -c "print($REF_DSPARK * $REGRESS_TOL)")" \
-      && _fail_fast "dspark-decode@32k regression: $DS < $(python3 -c "print(round($REGRESS_TOL*100))")% of main $REF_DSPARK"
+      && _fail_fast "dspark-decode@16k regression: $DS < $(python3 -c "print(round($REGRESS_TOL*100))")% of main $REF_DSPARK"
   fi
   if _lt "0" "$REF_AR"; then
     _lt "$AR" "$(python3 -c "print($REF_AR * $REGRESS_TOL)")" \
-      && _fail_fast "ar-decode@32k regression: $AR < $(python3 -c "print(round($REGRESS_TOL*100))")% of main $REF_AR"
+      && _fail_fast "ar-decode@16k regression: $AR < $(python3 -c "print(round($REGRESS_TOL*100))")% of main $REF_AR"
   fi
 fi
 # ---------------------------------------------------------------------------------------------
@@ -1045,11 +1045,11 @@ if [ "$IS_PR" = "1" ]; then
 fi
 
 # --- no-regression guards @ ctx=16k (added 2026-08-18 by explicit request) ---
-# The scored dimension is speculative decode at ctx=32k. Nothing in it looks at 16k or at
-# batched prefill, so without these two guards a DSpark PR could speed up its own path while
-# silently regressing what actually ships -- the AR serving numbers the README publishes. Both are
-# differential (PR vs freshly-measured main, same box, same round, REGRESS_TOL) and both are hard
-# REJECTs, exactly like the sibling bots' guards.
+# The scored dimension covers speculative decode at ctx=16k, but not standalone long-context
+# prefill or the sibling Qwen3.6 model. Without these two guards a DSpark PR could speed up its own
+# path while silently regressing what actually ships -- the AR serving numbers the README
+# publishes. Both are differential (PR vs freshly-measured main, same box, same round,
+# REGRESS_TOL) and both are hard REJECTs, exactly like the sibling bots' guards.
 #
 # 16k ONLY, not the sibling bots' full 0/512/4k/16k/32k sweep: one context per model keeps a round
 # to two extra model loads, and 16k is where long-context prefill and a large KV read both
@@ -1301,15 +1301,15 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
     if not push_eval_polaris(host, port):
         return None
     result_json = {
-        "model": "qwen38-32k",
+        "model": "qwen38-16k",
         "label": res.get("label"),
         "pass": res.get("pass"),
         "tps": res.get("pr_decode_tps"),
         "delta_tps": (res.get("pr_decode_tps") or 0) - (res.get("main_decode_tps") or 0),
         "pct_over_frontier": res.get("delta_pct"),
         "score_context": DSPARK_CTX,
-        "best_context_label": "32k",
-        "ctx_32768_tps": res.get("pr_decode_tps"),
+        "best_context_label": "16k",
+        "ctx_16384_tps": res.get("pr_decode_tps"),
         "top1": res.get("pr_top1"),
         "kl": res.get("pr_kl"),
     }
@@ -1317,7 +1317,7 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
     stdin_payload = "RESULT_JSON " + json.dumps(result_json)
     cmd = (
         f"cd {shlex.quote(REMOTE_REPO)} && "
-        f"SPARKINFER_EVAL_MODE=qwen38-32k SPARKINFER_DECODE_TOKENS={BENCH_TOKENS} "
+        f"SPARKINFER_EVAL_MODE=qwen38-16k SPARKINFER_DECODE_TOKENS={BENCH_TOKENS} "
         f"SPARKINFER_EVAL_SEED={shlex.quote(eval_seed)} python3 eval/polaris/judge.py --from-stdin "
         f"--model-file {shlex.quote(MODEL_WEIGHT_FILE)} "
         f"--build-dir {shlex.quote(REMOTE_REPO)}/build/runtime "
@@ -1376,10 +1376,10 @@ def measure_main_baseline(host, port):
     # default, and a zero baseline would make tier_from_gain treat every PR as an infinite speedup
     # on the dimension that earns a tier -- i.e. auto-merge on a broken measurement.
     if not main.get("dspark_tps"):
-        return {"ok": False, "reason": "main run missing/zero DSpark decode@32k tok/s",
+        return {"ok": False, "reason": "main run missing/zero DSpark decode@16k tok/s",
                 "log": (r.stdout or "")[-1500:]}
     if not main.get("ar_tps"):
-        return {"ok": False, "reason": "main run missing/zero AR decode@32k tok/s",
+        return {"ok": False, "reason": "main run missing/zero AR decode@16k tok/s",
                 "log": (r.stdout or "")[-1500:]}
     # If MAIN is not lossless the whole round is meaningless: every PR would be compared against a
     # baseline that is already emitting unverified tokens, and "faster than a broken reference" is
@@ -1446,10 +1446,10 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         }
         return res
     if not pr.get("dspark_tps"):
-        return {"ok": False, "reason": "PR run missing/zero DSpark decode@32k tok/s",
+        return {"ok": False, "reason": "PR run missing/zero DSpark decode@16k tok/s",
                 "log": (r.stdout or "")[-1500:]}
     if not pr.get("ar_tps"):
-        return {"ok": False, "reason": "PR run missing/zero AR decode@32k tok/s",
+        return {"ok": False, "reason": "PR run missing/zero AR decode@16k tok/s",
                 "log": (r.stdout or "")[-1500:]}
     if not pr.get("mean_accept"):
         return {"ok": False, "reason": "PR run missing/zero mean accept (tau)",
@@ -1461,21 +1461,21 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         return {"ok": False, "reason": "PR run missing accuracy METRIC line (score dump failed, "
                                        "or no main baseline dump to diff against)",
                 "log": (r.stdout or "")[-1500:]}
-    print(f">> PR dspark@32k={pr['dspark_tps']:.2f} (scored) "
-          f"ar@32k={pr['ar_tps']:.2f} "
+    print(f">> PR dspark@16k={pr['dspark_tps']:.2f} (scored) "
+          f"ar@16k={pr['ar_tps']:.2f} "
           f"ratio={pr['dspark_tps'] / pr['ar_tps']:.3f}x "
           f"tau={pr.get('mean_accept', 0):.3f} lossless={pr.get('lossless')} "
           f"top1={pr.get('top1', 0):.4f} kl={pr.get('kl', 99):.5f}")
 
     # One scored dimension, one floor.
-    #   * dspark-decode@32k is what earns a tier -- the ONLY scored dimension.
-    #   * ar-decode@32k is a FLOOR only (it is not in SCORING_DIMS, so it can never earn a tier).
+    #   * dspark-decode@16k is what earns a tier -- the ONLY scored dimension.
+    #   * ar-decode@16k is a FLOOR only (it is not in SCORING_DIMS, so it can never earn a tier).
     #     Without it a PR could post a DSpark "speedup" by making the AR baseline slower -- they
     #     share every target forward, so that is a one-line change away -- or could buy speculative
     #     throughput by pessimising the ordinary serving path. Either regressing is a hard REJECT.
     dims = [
-        ("dspark-decode@32k", pr["dspark_tps"], main["dspark_tps"]),
-        ("ar-decode@32k",     pr["ar_tps"],     main["ar_tps"]),
+        ("dspark-decode@16k", pr["dspark_tps"], main["dspark_tps"]),
+        ("ar-decode@16k",     pr["ar_tps"],     main["ar_tps"]),
     ]
     scored = []
     for name, pr_v, main_v in dims:
@@ -1505,8 +1505,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         best = max((by_dim[d] for d in SCORING_DIMS if d in by_dim),
                    key=lambda s: s["delta"], default=by_dim[SCORING_DIM])
         label, delta_pct, passed, speed_reason = best["label"], best["delta"], best["passed"], best["reason"]
-    dspark_label, dspark_delta_pct = by_dim["dspark-decode@32k"]["label"], by_dim["dspark-decode@32k"]["delta"]
-    ar_label,     ar_delta_pct     = by_dim["ar-decode@32k"]["label"],     by_dim["ar-decode@32k"]["delta"]
+    dspark_label, dspark_delta_pct = by_dim["dspark-decode@16k"]["label"], by_dim["dspark-decode@16k"]["delta"]
+    ar_label,     ar_delta_pct     = by_dim["ar-decode@16k"]["label"],     by_dim["ar-decode@16k"]["delta"]
     # Keep the speed-only verdict: `label` below can be forced to REJECT by the accuracy gate or
     # the Qwen3.6 guard, and the comment/dashboard still need to say whether speed itself moved.
     speed_label = label
@@ -1598,7 +1598,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "reason": reason,
         "delta_pct": delta_pct,
         # Generic names kept so the dashboard/scores plumbing below reads unchanged; here they mean
-        # the SCORED dimension, DSpark speculative decode at ctx=32k.
+        # the SCORED dimension, DSpark speculative decode at ctx=16k.
         "pr_decode_tps": pr["dspark_tps"],
         "main_decode_tps": main["dspark_tps"],
         "decode_delta_pct": dspark_delta_pct,
@@ -1750,7 +1750,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer DSpark auto-eval — `eval-dspark:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-dspark:{lab}` |\n"
-        f"| scored at | **DSpark speculative decode @ ctx=32k** on the ModelOpt NVFP4 checkpoint |\n"
+        f"| scored at | **DSpark speculative decode @ ctx=16k** on the ModelOpt NVFP4 checkpoint |\n"
         f"| **PR DSpark tok/s** | **{_num('pr_dspark_tps'):.2f}** |\n"
         f"| **main DSpark tok/s** | **{_num('main_dspark_tps'):.2f}** |\n"
         f"| **speedup vs main** | **{res.get('speedup_vs_main', 0):.3f}×** ({res.get('decode_delta_pct', 0):+.1f}%) |\n"
@@ -1770,13 +1770,13 @@ def format_comment(commit: str, res: dict) -> str:
         f"| commit | `{commit[:9]}` |\n\n"
         f"{res.get('reason') or ''}\n\n"
         "<sub>Scored on the pinned eval box vs same-box `origin/main`: DSpark speculative decode "
-        "throughput at ctx=32k on the ModelOpt NVFP4 checkpoint, with the AR reference measured in "
+        "throughput at ctx=16k on the ModelOpt NVFP4 checkpoint, with the AR reference measured in "
         "the same process and the same model load. Both a regression in AR decode and any "
         "divergence from the AR token sequence are hard REJECTs — a speculative decoder that is "
         "fast because it skips verification is not faster, it is wrong. τ is the lever, and the "
         "row above reports it against a block_size of 7. This is informational, not a judgment on "
         "your PR: a `none` label just "
-        "means no measurable DSpark decode@32k speedup was verified, which is expected and fine if "
+        "means no measurable DSpark decode@16k speedup was verified, which is expected and fine if "
         "that isn't what your change is about. "
         "Automated — merge behaviour depends on SPARKINFER_DSPARK_AUTOMERGE.</sub>\n"
     )
@@ -2052,7 +2052,7 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
         result = {
             "id": rid, "pr": int(num), "title": title,
             "url": f"https://github.com/{repo}/pull/{num}", "commit": oid[:7],
-            "eval_mode": "qwen38-32k",
+            "eval_mode": "qwen38-16k",
             "label": res.get("label"), "pass": res.get("pass"), "reason": res.get("reason"),
             "delta_pct": res.get("delta_pct"),
             "pr_decode_tps": res.get("pr_decode_tps"), "main_decode_tps": res.get("main_decode_tps"),
@@ -2084,7 +2084,7 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
         idx = json.load(open(ipath)) if os.path.exists(ipath) else []
         idx = [e for e in idx if e.get("id") != rid]
         idx_entry = {"id": rid, "pr": int(num), "title": title, "label": res.get("label"),
-                     "delta_pct": res.get("delta_pct"), "eval_mode": "qwen38-32k", "date": result["date"]}
+                     "delta_pct": res.get("delta_pct"), "eval_mode": "qwen38-16k", "date": result["date"]}
         if receipt:
             idx_entry["polaris"] = True
             idx_entry["polaris_receipt_id"] = receipt.get("receipt_id", "")[:16]
@@ -2206,9 +2206,9 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             elif not res.get("accuracy_ok"):
                 fail_clause = "and failed the accuracy gate"
             elif res.get("decode_regressed") and res.get("prefill_regressed"):
-                fail_clause = "(dspark decode@32k and AR decode@32k regression)"
+                fail_clause = "(dspark decode@16k and AR decode@16k regression)"
             elif res.get("decode_regressed"):
-                fail_clause = "(dspark decode@32k regression)"
+                fail_clause = "(dspark decode@16k regression)"
             elif res.get("prefill_regressed"):
                 fail_clause = "(prefill@128 regression)"
             elif label == "none":
@@ -2372,8 +2372,8 @@ def main():
         return
     # main has no top1/kl of its own: it IS the accuracy reference, and its score dump was just
     # written to SCORE_DUMP_MAIN for each PR in this round to diff against.
-    print(f">> main baseline: dspark@32k={main_result['dspark_tps']:.2f} tok/s (scored) "
-          f"ar@32k={main_result['ar_tps']:.2f} tok/s "
+    print(f">> main baseline: dspark@16k={main_result['dspark_tps']:.2f} tok/s (scored) "
+          f"ar@16k={main_result['ar_tps']:.2f} tok/s "
           f"ratio={main_result['dspark_tps'] / main_result['ar_tps']:.3f}x "
           f"tau={main_result.get('mean_accept', 0):.3f} lossless={main_result.get('lossless')}")
 

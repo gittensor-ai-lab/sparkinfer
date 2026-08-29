@@ -96,10 +96,9 @@ int main(int argc, char** argv) {
     //     atomic accumulation. 5/5 lossless=YES on both the 32- and 40-token repros after both
     //     pins landed (was still nondeterministic with only the first).
     setenv("SPARKINFER_PREFILL_SKINNY_SPLITK", "0", 0);
-    // Batched 32k prefill needs the checkpoint-native NVFP4 FFN operands. The adaptive FFN/GDN
-    // chunking leaves roughly 400-500 MB free on a 5090 at the tightest point, while reducing TTFT
-    // from many minutes to about 40 seconds. Pin it for this evaluator so a caller's low-memory
-    // serving environment cannot select the unsupported Q4_K batched-FFN fallback.
+    // Batched long-context prefill needs the checkpoint-native NVFP4 FFN operands. At the scored
+    // 16k context this fits comfortably on a 5090. Pin it for this evaluator so a caller's
+    // low-memory serving environment cannot select the unsupported Q4_K batched-FFN fallback.
     setenv("SPARKINFER_QWEN38_PREFILL_NVFP4", "1", 1);
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
