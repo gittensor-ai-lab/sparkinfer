@@ -36,6 +36,11 @@ struct Qwen35PrefillCtx {
     const float*         moe_rs_up;
     const float*         moe_rs_down;
     int                  n_splits;
+    // Optional DSpark prompt capture. When present, each selected layer copies all prompt rows
+    // into capture_dst laid out as [token, capture_slot, hidden], matching dflash_context.
+    const int*           capture_layers;
+    int                  n_capture;
+    void*                capture_dst;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.

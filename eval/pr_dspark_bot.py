@@ -232,11 +232,10 @@ DRAFT_DIR = os.environ.get("DSPARK_DRAFT_DIR", "/root/workspace/dspark")
 DSPARK_CTX = int(os.environ.get("DSPARK_CTX", "32768"))
 # Repeats of the speculative generation per round. Every one must match AR for LOSSLESS to be 1.
 #
-# 3, not 5, and the reason is cost at this context. Each repeat re-runs the WHOLE speculative
-# generation including its own prompt prefill, and dspark_tau_check pins the token-loop prefill for
-# AR/spec comparability -- so a 4096-token prefill costs ~78s of the ~261s single run (measured
-# 2026-08-18). Reps are ~82s each: 3 reps is 431s per ref and a ~20 min round; 5 would be ~590s per
-# ref and push a round toward 30 min against an hourly tick.
+# Three independent processes, not three generations in one loaded runtime. Process isolation makes
+# each repetition start from the same allocator/graph/model state and still catches nondeterministic
+# losslessness defects. Batched 32k prefill keeps the extra model loads cheaper than the old
+# in-process token-loop repeats.
 #
 # Detection honesty: the defect class this targets (the draft/verify overlap race) needs FULL-BLOCK
 # accepts to fire, because it corrupts accept GROUPING and only the adaptive gate turns that into a
@@ -890,10 +889,9 @@ test -x build/runtime/qwen3_gguf_bench
 # whole point: AR_TPS and DSPARK_TPS come off the same weights, the same GPU state and the same
 # env, so their ratio means something and the PR-vs-main delta is not measuring load variance.
 #
-# The env pins inside dspark_tau_check.cpp are deliberately NOT production defaults (they force
-# AR's prefill onto the token loop so both legs start from the same state, and pin split-K
-# determinism). Both refs in a round run the identical binary under identical pins and the scored
-# metric is relative, so the offset cancels. Do not read AR_TPS here as the serving decode rate.
+# The determinism pins inside dspark_tau_check.cpp apply identically to both legs. Both refs in a
+# round run the identical binary under identical pins and the scored metric is relative, so the
+# offset cancels. AR and DSpark share the same batched prompt-prefill implementation.
 test -d "$DRAFT_DIR" || {{ echo "FAIL missing DSpark draft dir $DRAFT_DIR"; exit 1; }}
 test -f "$DRAFT_DIR/config.json" || {{ echo "FAIL $DRAFT_DIR has no config.json"; exit 1; }}
 
@@ -932,16 +930,23 @@ echo "DSPARK_PROMPT_IDS $DS_NIDS"
 
 wait_gpu_clear
 DS_OUT=/tmp/dspark_run.txt
-# SPEC_REPS: repeat the whole speculative generation and require EVERY repeat to match AR, not just
-# the first. Losslessness is a property of the path, not of one lucky run, and the defects that
-# matter here are probabilistic: the target/draft overlap race diverged on 5-7 of 40 repeats, so a
-# single-shot gate scores it a pass whenever the run happens to come out clean.
-#
-# The verdict now requires every repeat to match AR, not just the first. See DSPARK_SPEC_REPS for
-# why the count is 3 and for the honest limitation: at the current tau this particular hazard
-# cannot be provoked, so the gate is a strict improvement that has not yet caught a live defect.
-SPARKINFER_DSPARK_SPEC_REPS={spec_reps} timeout 2400 build/runtime/dspark_tau_check "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" $(cat "$DSPARK_IDS") \
-  > "$DS_OUT" 2>&1 || {{ echo "DSPARK_RUN_FAILED -- tail of $DS_OUT:" >&2; tail -40 "$DS_OUT" >&2; }}
+# Run every losslessness repetition in a fresh process. Reusing one loaded runtime couples the
+# repetitions through allocator and CUDA-graph state; the gate is supposed to ask whether this
+# build is lossless from a clean serving start, not whether an earlier synthetic audit poisoned a
+# later one. Each child still performs its own AR-vs-DSpark exact-token comparison. Keep run 1 as
+# the scored throughput sample and aggregate only the absolute correctness verdict across runs.
+DS_ALL_OK=1
+for rep in $(seq 1 {spec_reps}); do
+  REP_OUT="/tmp/dspark_run_${{rep}}.txt"
+  SPARKINFER_DSPARK_SPEC_REPS=1 timeout 900 build/runtime/dspark_tau_check \
+    "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" $(cat "$DSPARK_IDS") > "$REP_OUT" 2>&1 || DS_ALL_OK=0
+  if [ "$rep" -eq 1 ]; then cp "$REP_OUT" "$DS_OUT"; fi
+  REP_LL=$(sed -n 's/^METRIC LOSSLESS //p' "$REP_OUT" | tail -1)
+  [ "${{REP_LL:-0}}" = "1" ] || DS_ALL_OK=0
+  echo "DSPARK_FRESH_REP $rep lossless=${{REP_LL:-0}}"
+done
+echo "METRIC LOSSLESS $DS_ALL_OK" >> "$DS_OUT"
+echo "METRIC LOSSLESS_RUNS {spec_reps}" >> "$DS_OUT"
 grep -E '^(DSPARK|AR|draft:) ' "$DS_OUT" || true
 
 # Default 0 on a missing metric, so a crashed or truncated run reads as "no speedup, not lossless"

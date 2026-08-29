@@ -96,35 +96,11 @@ int main(int argc, char** argv) {
     //     atomic accumulation. 5/5 lossless=YES on both the 32- and 40-token repros after both
     //     pins landed (was still nondeterministic with only the first).
     setenv("SPARKINFER_PREFILL_SKINNY_SPLITK", "0", 0);
-    // Fourth pin, same family, but for VRAM rather than determinism (2026-08-17): the checkpoint's
-    // native NVFP4 FFN tensors are kept resident ON TOP OF the Q4_K copies decode always uses,
-    // purely to speed up batched prefill (qwen35.cpp's own load-time comment: ~9.6 GB extra,
-    // pushing this model to ~29.7 GB on a 32.6 GB card). This tool never measures prefill
-    // throughput -- it measures tau/lossless -- so that second residency buys nothing here and
-    // was what left too little headroom for the draft + dflash workspace to fit, producing an
-    // unchecked-cudaMalloc-driven illegal-memory-access cascade instead of a clean OOM message.
-    setenv("SPARKINFER_QWEN38_PREFILL_NVFP4", "0", 0);
-    // Fifth pin (2026-08-17): dflash_generate() prompt-prefills through its OWN token-by-token
-    // loop (qwen35.cpp's dflash_generate, the `for (int i = 0; i < n; i++) forward_token(...)`
-    // block), never through ingest_prompt_range's batched path -- while this file's AR reference
-    // used generate(), whose prefill defaults to batched. Those two prefill implementations are
-    // NOT guaranteed bit-identical (see bench/scripts/prefill_parity_check.py's own tolerant 0.75
-    // bar, which exists because they aren't); the gap is normally a few ULPs, invisible at the
-    // prefill boundary, but with the target's own decode carrying GDN recurrent state forward, a
-    // few-ULP difference at position 0 compounds every subsequent step until it flips an argmax.
-    // Traced via a fresh per-layer xn diff (AR vs DFlash, both dumped with SPARKINFER_MG_DUMP_STEP)
-    // at the exact round where a 64-token generation on a 12-token prompt first diverges: L0 exact
-    // (embedding correct), L1 already off by up to 0.0078 in ~22% of elements -- a real but tiny
-    // divergence growing round over round until argmax finally flips around step 31. Confirmed as
-    // the sole cause: forcing AR's own prefill to token-loop too (this pin) reproduces
-    // lossless=YES 64/64 across repeats; every other candidate (deferred target/draft overlap,
-    // the draft's own forward pass, the compact-verify warm-up graph capture, the +block_size KV
-    // budget padding) was independently ruled out first and left the divergence unchanged. This is
-    // a test-harness fairness fix, not a claim that batched prefill is wrong -- dflash_generate's
-    // own prefill was simply never upgraded to the batched path, so comparing against a
-    // batched-prefilled AR reference was comparing two different starting states, not verifying
-    // DFlash's speculative logic.
-    setenv("SPARKINFER_PREFILL_BATCHED", "0", 0);
+    // Batched 32k prefill needs the checkpoint-native NVFP4 FFN operands. The adaptive FFN/GDN
+    // chunking leaves roughly 400-500 MB free on a 5090 at the tightest point, while reducing TTFT
+    // from many minutes to about 40 seconds. Pin it for this evaluator so a caller's low-memory
+    // serving environment cannot select the unsupported Q4_K batched-FFN fallback.
+    setenv("SPARKINFER_QWEN38_PREFILL_NVFP4", "1", 1);
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
 

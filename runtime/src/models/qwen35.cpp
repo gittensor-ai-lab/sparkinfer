@@ -2707,8 +2707,13 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
-                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits };
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          s.dflash_capture ? s.dflash_layer_ids.data() : nullptr,
+                          s.dflash_capture ? s.dflash_n_cap : 0,
+                          s.dflash_capture ? s.dflash_context : nullptr };
     const int seed = prefill_batched_run(ctx, prompt_ids, n);
+    if (seed >= 0 && s.dflash_capture && s.dflash_context && s.dflash_n_cap > 0)
+        s.dflash_ctx_len = n;
     // Seed-token logprob (see ingest_prompt_range's want_seed_logprob). prefill_batched_run's
     // LM-head tail stops at argmax -- it never runs the sort/scan that last_token_logprobs()
     // reads -- so without this the FIRST token of every response has no logprob entry and
@@ -3092,7 +3097,8 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
                           lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
-                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits };
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr };
     // The recorded token ids and positions are irrelevant: the graph copies them from pinned host
     // buffers at replay, so only the shapes (n, and the pointer keys) have to match the real steps.
     std::vector<int> ids(n, 0);
@@ -3111,7 +3117,8 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
                           lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
-                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits };
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr };
     const int consumed = dflash_verify_short_run(ctx, token_ids, n, start_pos,
                                                   s.dflash_layer_ids.data(), s.dflash_n_cap,
                                                   const_cast<void*>(dflash_capture_dst), out_argmax);
@@ -3293,12 +3300,16 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     s.final_seqlen_hint = n + max_new;
     auto t0 = std::chrono::steady_clock::now();
     int next = -1;
-    for (int i = 0; i < n; i++) {
-        set_dflash_capture_row(0);
-        const bool sample = (i + 1 == n);
-        int r = forward_token(prompt[i], i, sample);
-        dflash_stash_capture(i);
-        if (sample) next = r;
+    if (batched_prefill_enabled(s.gguf, s.cfg, n))
+        next = prefill_batched(prompt.data(), n);
+    if (next < 0) {
+        for (int i = 0; i < n; i++) {
+            set_dflash_capture_row(0);
+            const bool sample = (i + 1 == n);
+            int r = forward_token(prompt[i], i, sample);
+            dflash_stash_capture(i);
+            if (sample) next = r;
+        }
     }
     auto t1 = std::chrono::steady_clock::now();
     if (next < 0 || next >= s.cfg.vocab) {

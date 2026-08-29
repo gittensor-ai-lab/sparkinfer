@@ -124,6 +124,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const int N = n;
     cudaStream_t st = s.stream;
 
+    // This path always starts at position zero, so its recurrent GDN state must start from zero
+    // just like forward_token(position=0). Session buffers come from cudaMalloc and may reuse pages
+    // from a previous request; the scan consumes their initial value before writing the final one.
+    // Without this reset the first request after process start is correct, while later batched
+    // prefills can inherit the preceding request's state and diverge despite identical tokens.
+    if (s.lin_state && s.lin_conv_state) {
+        pf_cu(cudaMemsetAsync(
+                  s.lin_state, 0,
+                  (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim *
+                      c.linear_head_dim * sizeof(float),
+                  st),
+              "linear state reset");
+        pf_cu(cudaMemsetAsync(
+                  s.lin_conv_state, 0,
+                  (size_t)c.n_layers * (c.linear_conv_kernel - 1) *
+                      s.linear_qkvdim * sizeof(bf16),
+                  st),
+              "linear conv reset");
+    }
+
     const int qdim = s.qdim, kvdim = s.kvdim;            // full-attn: 4096 / 1024
     const int lqkv = s.linear_qkvdim;                    // 8192
     const int lvdim = s.linear_vdim;                     // 4096
@@ -209,7 +229,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         const char* e = getenv("SPARKINFER_MUSE_PREFILL_GRAPH");
         return !(e && e[0] == '0');
     }();
-    const bool graph_on = graph_env && arena_reuse && c.dense_ffn;
+    // DSpark capture destinations are session-owned and change between generations. Do not replay
+    // a whole-prefill graph whose memcpy nodes captured a previous session's destination.
+    const bool capture_dflash = s.capture_dst && s.capture_layers && s.n_capture > 0;
+    const bool graph_on = graph_env && arena_reuse && c.dense_ffn && !capture_dflash;
     if (graph_on && N > g_pfb_pin_cap) {
         if (g_pfb_pin) cudaFreeHost(g_pfb_pin);
         g_pfb_pin = nullptr; g_pfb_pin_cap = 0;
@@ -2268,6 +2291,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // x = x + routed + shared (fp32 math); x already holds the post-attn residual, so this
             // fused add writes the final layer output directly (no separate ffn-out residual add).
             kernels::launch_pfm_resid3(x, routed_f32, shared_out, x, (long)N * H, st);
+        }
+
+        if (capture_dflash) {
+            for (int slot = 0; slot < s.n_capture; ++slot) {
+                if (s.capture_layers[slot] != L) continue;
+                char* dst = static_cast<char*>(s.capture_dst) +
+                            (size_t)slot * H * sizeof(bf16);
+                dflash_kernels::launch_capture_rows(
+                    x, dst, N, H, s.n_capture * H, st);
+            }
         }
 
         const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
