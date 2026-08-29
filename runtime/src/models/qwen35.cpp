@@ -3412,10 +3412,26 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // proposal, the window removes draft attention.
     const bool kShortGeneration = (n + max_new + B) <= kCompactMaxSeq;
     constexpr int kScored32kMinSeq = 32768;
-    const int kProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
-                             : (kShortGeneration ? 7
-                                : ((n + max_new) >= kScored32kMinSeq ? 3
-                                   : ((n + max_new) >= kDeepMinSeq ? 2 : 4))));
+    const int kInitialProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
+                                    : (kShortGeneration ? 7
+                                       : ((n + max_new) >= kScored32kMinSeq ? 3
+                                          : ((n + max_new) >= kDeepMinSeq ? 2 : 4))));
+    // A length-only depth is a safe starting point, not a workload policy. At the same 16k
+    // context real chat accepts ~1.36 tokens while code/JSON/repetition accept 5.35/6.62/6.92 at
+    // depth 7. Keeping the prose-tuned depth-2 ceiling makes those predictable streams pay 27-39%
+    // needless decode time. Leave an explicit SPARKINFER_DFLASH_PROPOSALS override fixed for
+    // reproducible A/B runs; otherwise make the whole checkpoint depth available and let observed
+    // accepts promote the active depth below.
+    static const bool kAdaptiveDepthOn = [] {
+        const char* e = getenv("SPARKINFER_DSPARK_ADAPTIVE_DEPTH");
+        return !(e && e[0] == '0');
+    }();
+    const bool kAdaptiveProposalDepth = kAdaptiveDepthOn && kProposalDepthEnv == 0 &&
+                                        !kShortGeneration;
+    const int kProposalDepth = kAdaptiveProposalDepth ? B : kInitialProposalDepth;
+    int active_proposal_depth = kInitialProposalDepth;
+    int depth_promote_run = 0;
+    int depth_demote_run = 0;
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
@@ -3589,7 +3605,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     long   w_n[kPlanMaxW] = {0};
     // Bootstrap cursor: the first sample of the run is discarded (it carries whatever warm-up the
     // first batched call still has), then widths are walked from the widest down to 1.
-    int boot_w = kProposalDepth + 1;
+    int boot_w = active_proposal_depth + 1;
     bool boot_first = true;
     // The run's own achieved rate, tokens per millisecond of WHOLE step (draft included). The plan
     // maximises worth(d) - rate * cost(d+1) rather than the ratio worth(d)/cost(d+1): the ratio
@@ -3670,7 +3686,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // especially costly here: it serializes up to seven ~10.7 ms target forwards. Keep the
         // explicit COMPACT_VERIFY=0 override, but make planned batching the adaptive default for
         // short full-depth generations.
-        const bool short_planned_verify = short_ctx && kProposalDepth == B;
+        const bool short_planned_verify = short_ctx && active_proposal_depth == B;
         const bool compact_verify = compact_mode == 1 ||
             (compact_mode != 0 && (short_ctx ? (short_planned_verify || compact_score >= kBlockScore)
                                              : ((start + B) >= kEngageMinSeq &&
@@ -3749,10 +3765,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         auto _td = std::chrono::steady_clock::now();
         // Sentinel: forward_block fills these only when the checkpoint HAS a confidence head.
         // A NaN survivor means no head, and the planner falls back to the fixed depth.
-        for (int i = 0; i <= kProposalDepth; i++)
+        for (int i = 0; i <= active_proposal_depth; i++)
             draft_confidence[i] = std::numeric_limits<float>::quiet_NaN();
         const bool draft_ok = draft_idle ? true : draft.forward_block(
-            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth,
+            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, active_proposal_depth,
             draft_confidence.data());
         if (!draft_idle) {
             ls_d_sum += std::chrono::duration<double, std::milli>(
@@ -3763,7 +3779,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         if (kTiming && !draft_idle) { t_draft_ms += ms_since(_td); n_draft++; }
         if (getenv("SPARKINFER_DFLASH_CONFIDENCE_DEBUG")) {
             fprintf(stderr, "[confidence-debug] start=%d confidence=[", start);
-            for (int i = 1; i <= kProposalDepth; i++) fprintf(stderr, "%.3f ", draft_confidence[i]);
+            for (int i = 1; i <= active_proposal_depth; i++) fprintf(stderr, "%.3f ", draft_confidence[i]);
             fprintf(stderr, "]\n");
         }
         if (!compact_verify && p0 == kDFlashDeferred) {
@@ -3775,7 +3791,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             fprintf(stderr, "[dflash] draft forward failed at start=%d\n", start);
             break;
         }
-        if (!draft_idle) for (int i = 1; i <= kProposalDepth; i++) block[i] = draft_ids[i];
+        if (!draft_idle) for (int i = 1; i <= active_proposal_depth; i++) block[i] = draft_ids[i];
 
         // Incremental verify with early-exit: forward only the accepted prefix, stopping at the
         // first rejected proposal. forward_token advances GDN state + KV per token, so after
@@ -3783,12 +3799,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // restore / KV-truncate / replay needed (greedy speculative decoding is exact). Rejected
         // proposals (block[keep..B-1]) are never forwarded, saving ~B-keep target forwards/step.
         int accept = 0, keep = 1;
-        int plan_vn = kProposalDepth + 1;
+        int plan_vn = active_proposal_depth + 1;
         bool vfail = false;
         if (compact_verify) {
-            int vn = kProposalDepth + 1;
+            int vn = active_proposal_depth + 1;
             const bool have_conf = kPlanOn && !draft_idle &&
-                                   !std::isnan(draft_confidence[kProposalDepth > 0 ? 1 : 0]);
+                                   !std::isnan(draft_confidence[active_proposal_depth > 0 ? 1 : 0]);
             // Cost of verifying w rows: the width's own measured mean once it has one, else the
             // affine fit, which is all a not-yet-sampled width has to go on.
             auto plan_cost = [&](int w) -> double {
@@ -3803,8 +3819,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             } else if (have_conf) {
                 const double rate = (plan_ms > 0) ? plan_tok / plan_ms : 0.0;
                 double surv = 1.0, worth = 1.0, best = -1e30;
-                int best_d = kProposalDepth;
-                for (int d = 0; d <= kProposalDepth; d++) {
+                int best_d = active_proposal_depth;
+                for (int d = 0; d <= active_proposal_depth; d++) {
                     if (d > 0) {
                         double p = 1.0 / (1.0 + std::exp(-(double)draft_confidence[d]));
                         if (kPlanCal && d < kPlanMaxW) {
@@ -3864,7 +3880,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 // plan, not by the draft, and counting it as a miss would teach the plan to keep
                 // narrowing itself.
                 if (kPlanCal && have_conf) {
-                    for (int i = 1; i <= kProposalDepth && i <= vn - 1 && i < kPlanMaxW; i++) {
+                    for (int i = 1; i <= active_proposal_depth && i <= vn - 1 && i < kPlanMaxW; i++) {
                         if (accept < i - 1) break;
                         cal_pred[i] += 1.0 / (1.0 + std::exp(-(double)draft_confidence[i]));
                         if (accept >= i) cal_hit[i] += 1.0;
@@ -3891,7 +3907,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         }();
         static const bool confidence_gate_on = getenv("SPARKINFER_DFLASH_CONFIDENCE_GATE") != nullptr;
         if (!compact_verify && !draft_idle && !vfail && block[1] == p0) {
-            for (int i = 1; i <= kProposalDepth; i++) {
+            for (int i = 1; i <= active_proposal_depth; i++) {
                 if (i > 1 && confidence_gate_on && draft_confidence[i] < kConfidenceGate) break;
                 set_dflash_capture_row(i);
                 auto _tfi = std::chrono::steady_clock::now();
@@ -3901,7 +3917,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 posterior[i] = p;
                 accept = i;
                 keep = i + 1;
-                if (i < kProposalDepth && block[i + 1] != p) break;
+                if (i < active_proposal_depth && block[i + 1] != p) break;
             }
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
@@ -3923,9 +3939,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         if (getenv("SPARKINFER_DSPARK_PROBE")) {
             fprintf(stderr, "[probe] step=%d start=%d seed=%d accept=%d draft=[", step_no, start,
                     block[0], accept);
-            for (int i = 1; i <= kProposalDepth; i++) fprintf(stderr, "%d ", block[i]);
+            for (int i = 1; i <= active_proposal_depth; i++) fprintf(stderr, "%d ", block[i]);
             fprintf(stderr, "] target=[");
-            for (int i = 0; i <= kProposalDepth; i++)
+            for (int i = 0; i <= active_proposal_depth; i++)
                 fprintf(stderr, "%d ", (compact_verify || i <= accept) ? posterior[i] : -1);
             fprintf(stderr, "]\n");
         }
@@ -3937,6 +3953,36 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         compact_score = keep == plan_vn
                       ? std::min(compact_score + 1, kBlockScore + 1)
                       : std::max(compact_score - 1, 0);
+        // Discover predictable workloads instead of permanently classifying them by context
+        // length. Promotion requires the verifier to reach the deepest available proposal twice;
+        // a lucky first block therefore cannot send ordinary chat straight to depth 7. Once wide,
+        // three consecutive plans of at most two rows are evidence that the confidence/cost model
+        // sees no value in the extra draft rows, so step back toward the length-tuned starting
+        // depth. Changing depth never changes correctness: every accepted row remains verified by
+        // the target, and declining a proposal merely emits it through a later target step.
+        if (kAdaptiveProposalDepth) {
+            const bool deepest_landed = plan_vn == active_proposal_depth + 1 &&
+                                        accept == active_proposal_depth;
+            depth_promote_run = deepest_landed ? depth_promote_run + 1
+                                               : std::max(depth_promote_run - 1, 0);
+            depth_demote_run = (active_proposal_depth > kInitialProposalDepth && plan_vn <= 2)
+                                   ? depth_demote_run + 1 : 0;
+            if (depth_promote_run >= 2 && active_proposal_depth < B) {
+                active_proposal_depth = active_proposal_depth < 4
+                                            ? std::min(4, B) : B;
+                // Force the planner to measure the newly exposed widths before pricing them.
+                boot_w = active_proposal_depth + 1;
+                depth_promote_run = 0;
+                depth_demote_run = 0;
+            } else if (depth_demote_run >= 3) {
+                active_proposal_depth = active_proposal_depth > 4
+                                            ? std::max(4, kInitialProposalDepth)
+                                            : kInitialProposalDepth;
+                if (boot_w > active_proposal_depth + 1) boot_w = active_proposal_depth + 1;
+                depth_promote_run = 0;
+                depth_demote_run = 0;
+            }
+        }
         // forward_token() synchronizes after sampling, so the accepted capture rows are already
         // stable. The draft consumes only this newly accepted suffix; its KV cache retains all
         // earlier context. Hand the capture buffer over directly instead of copying it to a second
