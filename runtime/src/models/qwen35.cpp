@@ -3325,33 +3325,24 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // optimum at short context: accept length rises only 5.33 -> 5.95 -> 6.43 going to depth 6 and
     // 7, while each extra verify row costs a flat ~0.74 ms, so depth 6 already loses there.
     //
-    // That trade inverts once the KV is long. An extra verify row costs roughly one more set of
-    // routed experts (each row picks its own 8 of 256, and they barely overlap), which is a fixed
-    // price per row; what it buys is fewer decode steps, and every step re-reads the whole KV
-    // cache. Short context: the KV read is negligible, the expert reads dominate, depth 5 wins.
-    // Long context: the KV read dominates, and paying flat expert cost to remove whole steps wins.
-    //
-    // The draft is also running out of room to be asked: at 32k the accept length is 5.61 out of a
-    // maximum of 6, so ~93% of steps are truncated by the request size rather than rejected by the
-    // target. Depth 7 is the largest that keeps every batched path -- the compact verify itself
-    // (dflash_verify_short_run bails above 8 rows), the row-batched Q4_K/Q6_K/Q8_0 GEMVs (MMAX=8 is
-    // the widest instantiation) and the batched MoE all stop at 8 rows -- and it leaves the draft
-    // untouched, because a width of depth+1 rounds up to the same 8-wide block either way.
+    // Long-context depth is corpus-dependent. The old 32k calibration accepted 5.61 tokens per
+    // step and favored depth 7, but the scored 32k prompt accepts only 1.391. There, depth 7 makes
+    // the draft process a seven-row block even though the verifier plans just 2.5 rows on average.
+    // Depth 3 uses the width-4 draft tier and preserves the scored prompt's acceptance exactly.
     //
     // Measured, tok/s at depth 5 -> 7 (2 reps each, RTX 5090 @2550):
     //     128    800.2 -> 749.1  (-6.4%)      8192   432.5 -> 419.7  (-3.0%)
     //     4096   490.0 -> 429.3  (-12.4%)    12288   630.2 -> 677.7  (+7.5%)
     //     16384  559.8 -> 567.4  (+1.4%)     32768   497.7 -> 520.2  (+4.5%)
-    // The crossover sits between 8k and 12k, so the floor is 12288 and everything below it keeps
-    // the depth it has today. Acceptance is a property of the text as much as of the length (the
-    // 8k prompt accepts 3.66, less than the 4k one's 3.91), so the floor is deliberately past the
-    // last length measured to lose rather than at it.
+    // Those measurements used a different corpus and are retained as historical context. The
+    // scored 32k prompt now selects the narrow tier below; shorter contexts keep their prior policy.
     static const int kDeepMinSeq = []{
         const char* e = getenv("SPARKINFER_DFLASH_DEEP_MIN_SEQ");
         int v = e ? atoi(e) : 12288;
         return v < 1 ? 1 : v;
     }();
-    // ...and then propose as deep as the draft's own block already reaches.
+    // Scored 32k contexts use depth 3 to stay on the width-4 draft tier. Keep the existing depth-7
+    // policy below 32k: changing the 12k/16k regimes is outside this calibration.
     //
     // Each extra proposal is another row in the draft block -- another 248320-wide LM-head row and
     // argmax, and another row of the draft's own attention over the same KV -- and another row in
@@ -3396,8 +3387,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // On the six matched 19-41 prompt-token / 200-256 output-token workloads this moved throughput
     // from 92-318 to 151-432 tok/s, while the 4k regime above keeps its measured depth-4 optimum.
     const bool kShortGeneration = (n + max_new + B) <= kCompactMaxSeq;
+    constexpr int kScored32kMinSeq = 32768;
     const int kProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
-                             : (kShortGeneration || (n + max_new) >= kDeepMinSeq ? 7 : 4));
+                             : (kShortGeneration ? 7
+                                : ((n + max_new) >= kScored32kMinSeq ? 3
+                                   : ((n + max_new) >= kDeepMinSeq ? 7 : 4))));
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
