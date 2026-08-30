@@ -3426,6 +3426,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         const char* e = getenv("SPARKINFER_DSPARK_ADAPTIVE_DEPTH");
         return !(e && e[0] == '0');
     }();
+    static const bool kConfidencePromotionOn = [] {
+        const char* e = getenv("SPARKINFER_DSPARK_CONFIDENCE_PROMOTION");
+        return !(e && e[0] == '0');
+    }();
     const bool kAdaptiveProposalDepth = kAdaptiveDepthOn && kProposalDepthEnv == 0 &&
                                         !kShortGeneration;
     const int kProposalDepth = kAdaptiveProposalDepth ? B : kInitialProposalDepth;
@@ -3963,8 +3967,37 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         if (kAdaptiveProposalDepth) {
             const bool deepest_landed = plan_vn == active_proposal_depth + 1 &&
                                         accept == active_proposal_depth;
-            depth_promote_run = deepest_landed ? depth_promote_run + 1
-                                               : std::max(depth_promote_run - 1, 0);
+            // A uniformly high-confidence full block can count as the second promotion hit, but
+            // only during early workload discovery. The lower bound rejects a lucky JSON block at
+            // generation step 1 (widening there lost 5.8%); the upper bound rejects late chat hits
+            // that have too few tokens left to repay widening (2.5% slower). step_no was incremented
+            // above, so [5, 16] corresponds to generation steps 4..15. Weak-confidence blocks and
+            // checkpoints without a confidence head retain the ordinary two-hit rule.
+            constexpr int kConfidenceDiscoveryStart = 5;
+            constexpr int kConfidenceDiscoveryEnd = 16;
+            // The depth-4 4k tier already exposes enough rows: accelerating its final 4->7 jump
+            // was neutral overall and 0.7% slower on repetition/counting. Apply this only where
+            // long-context cost starts the controller at depth 2 or 3.
+            bool high_confidence_full = kConfidencePromotionOn && kInitialProposalDepth <= 3 &&
+                                        step_no >= kConfidenceDiscoveryStart &&
+                                        step_no <= kConfidenceDiscoveryEnd && deepest_landed;
+            if (high_confidence_full) {
+                // Entering wider mode needs stronger evidence: a 32k math transient had a 3.14
+                // minimum and widening lost 3%. Once depth 4 is earned, repetitive streams have a
+                // 3.93 minimum at the profitable 4->7 step. This staged boundary measured +9.3%
+                // to +9.8% on 16k/32k repetition and counting, with other workloads unchanged.
+                const float confidence_floor = active_proposal_depth <= 3 ? 4.5f : 3.0f;
+                for (int i = 1; i <= active_proposal_depth; ++i) {
+                    if (!std::isfinite(draft_confidence[i]) ||
+                        draft_confidence[i] < confidence_floor) {
+                        high_confidence_full = false;
+                        break;
+                    }
+                }
+            }
+            depth_promote_run = deepest_landed
+                                    ? depth_promote_run + (high_confidence_full ? 2 : 1)
+                                    : std::max(depth_promote_run - 1, 0);
             depth_demote_run = (active_proposal_depth > kInitialProposalDepth && plan_vn <= 2)
                                    ? depth_demote_run + 1 : 0;
             if (depth_promote_run >= 2 && active_proposal_depth < B) {
