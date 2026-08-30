@@ -2577,6 +2577,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local const void* graph_conv_key = nullptr;
     static thread_local const void* graph_capture_key = nullptr;
     static thread_local const void* graph_btable_key = nullptr;
+    // Allocators can reuse every pointer above for the next request. The captured KV kernels
+    // still belong to the session whose block-table contents they recorded, so session identity
+    // must participate in graph reuse even when the table address itself is unchanged.
+    static thread_local uint64_t graph_seq_key = UINT64_MAX;
     static thread_local int graph_ns_key = -1;
     static thread_local const void* verify_head_key = nullptr;
     static thread_local signed char* verify_head_i8 = nullptr;
@@ -2868,7 +2872,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     bool head_ok = false;
     if (graph_model_key != s.w.lm_head || graph_state_key != s.lin_state ||
         graph_conv_key != s.lin_conv_state || graph_capture_key != capture_dst ||
-        graph_btable_key != btable || graph_ns_key != ns) {
+        graph_btable_key != btable || graph_seq_key != s.seq_id || graph_ns_key != ns) {
         for (int t = 1; t <= kVerifyMaxRows; t++) {
             if (verify_exec[t]) cudaGraphExecDestroy(verify_exec[t]);
             if (verify_graph[t]) cudaGraphDestroy(verify_graph[t]);
@@ -2881,6 +2885,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_conv_key = s.lin_conv_state;
         graph_capture_key = capture_dst;
         graph_btable_key = btable;
+        graph_seq_key = s.seq_id;
         graph_ns_key = ns;
     }
     if (graph_ready_t[N] && capture_only) return 0;   // this tier is already built
