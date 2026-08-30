@@ -28,7 +28,9 @@
 // (PR vs main on the same box, same pins), so the offset cancels -- but do not read AR_TPS here as
 // the serving decode rate, which qwen3_gguf_bench measures without them.
 //
-// Usage: dspark_tau_check <qwen38_checkpoint_dir> <dspark_draft_dir> <max_new> <id0> [id1 ...]
+// Usage: dspark_tau_check <qwen38_checkpoint_dir> <dspark_draft_dir> <max_new>
+//                         <id0> [id1 ...]
+//    or: dspark_tau_check <qwen38_checkpoint_dir> <dspark_draft_dir> <max_new> @<ids_file>
 
 #include "sparkinfer/runtime.h"
 #include "sparkinfer/kv_cache.h"
@@ -42,13 +44,16 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <algorithm>
 
 int main(int argc, char** argv) {
     if (argc < 5) {
-        printf("usage: %s <qwen38_dir> <dspark_dir> <max_new> <id0> [id1 ...]\n", argv[0]);
+        printf("usage: %s <qwen38_dir> <dspark_dir> <max_new> <id0> [id1 ...]\n"
+               "   or: %s <qwen38_dir> <dspark_dir> <max_new> @<ids_file>\n",
+               argv[0], argv[0]);
         return 2;
     }
     // NO SPARKINFER_NSPLITS PIN. There used to be one (=1), and removing it on 2026-08-19 is the
@@ -106,7 +111,17 @@ int main(int argc, char** argv) {
     const std::string tpath = argv[1], dpath = argv[2];
     const int max_new = atoi(argv[3]);
     std::vector<int> prompt;
-    for (int i = 4; i < argc; i++) prompt.push_back(atoi(argv[i]));
+    if (argc == 5 && argv[4][0] == '@') {
+        std::ifstream ids(argv[4] + 1);
+        int id = 0;
+        while (ids >> id) prompt.push_back(id);
+        if (!ids.eof() || prompt.empty()) {
+            fprintf(stderr, "[FAIL] cannot read token ids from %s\n", argv[4] + 1);
+            return 2;
+        }
+    } else {
+        for (int i = 4; i < argc; i++) prompt.push_back(atoi(argv[i]));
+    }
 
     sparkinfer::GGUF g;
     sparkinfer::Qwen35Config cfg;
