@@ -3381,10 +3381,13 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // Clamp to block_size: the draft can only back as many proposals as its block has rows
     // (row r-1 -> proposal r), so asking for more than B silently indexes past every
     // depth-sized buffer above and reads stale argmax rows.
-    // Mid-context depth is 4. The draft proposes a token per block row and the verify planner then
-    // prices each row against its own measured width cost, so the depth only has to be deep enough
-    // that the planner has a row left to buy when the draft is confident. Measured at ctx 4096,
-    // same binary, arms alternated and repeated (tok/s):
+    // Mid-context now starts at depth 3. The earlier single-prompt calibration below selected 4,
+    // but the matched workload matrix exposed why a fixed fourth row is the wrong default: 4K
+    // code peaks at depth 3 (177.4 tok/s versus 169.0 at 4), while math and structured streams
+    // have enough full-prefix/confidence evidence for the adaptive controller to promote. Starting
+    // at 3 activates that workload discovery path (its confidence shortcut is deliberately scoped
+    // to initial depths <=3) instead of forcing every stream to pay row 4 from step zero.
+    // Historical single-prompt measurement at ctx 4096, same binary, arms alternated (tok/s):
     //     depth 3 (main)  119.8543 / 119.8760      depth 4  124.7007 / 124.4120
     //     depth 5         123.2482 / 123.4245      depth 6  121.6701 / 121.6861
     //     depth 7         117.0281
@@ -3415,7 +3418,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     const int kInitialProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
                                     : (kShortGeneration ? 7
                                        : ((n + max_new) >= kScored32kMinSeq ? 3
-                                          : ((n + max_new) >= kDeepMinSeq ? 2 : 4))));
+                                          : ((n + max_new) >= kDeepMinSeq ? 2 : 3))));
     // A length-only depth is a safe starting point, not a workload policy. At the same 16k
     // context real chat accepts ~1.36 tokens while code/JSON/repetition accept 5.35/6.62/6.92 at
     // depth 7. Keeping the prose-tuned depth-2 ceiling makes those predictable streams pay 27-39%
@@ -3811,7 +3814,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         bool vfail = false;
         if (compact_verify) {
             int vn = active_proposal_depth + 1;
-            const bool have_conf = kPlanOn && !draft_idle &&
+            // At depths <=3 the whole verify is only 2-4 rows and is the measured optimum for
+            // ordinary code/chat. Letting the cost planner narrow this already-cheap bootstrap
+            // tier discarded useful accepts (4K code: 167 vs 177 tok/s at fixed full depth 3).
+            // Use confidence to decide whether to PROMOTE; price individual rows only once a
+            // promoted depth exposes genuinely optional width.
+            const bool have_conf = kPlanOn && active_proposal_depth > 3 && !draft_idle &&
                                    !std::isnan(draft_confidence[active_proposal_depth > 0 ? 1 : 0]);
             // Cost of verifying w rows: the width's own measured mean once it has one, else the
             // affine fit, which is all a not-yet-sampled width has to go on.
@@ -3819,7 +3827,21 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 if (w >= 1 && w < kPlanMaxW && w_n[w] > 0) return w_sum[w] / (double)w_n[w];
                 return fit_c0 + fit_c1 * (double)w;
             };
-            if (have_conf && boot_w >= 1) {
+            bool uniformly_high_confidence = have_conf;
+            if (uniformly_high_confidence) {
+                for (int i = 1; i <= active_proposal_depth; ++i) {
+                    if (!std::isfinite(draft_confidence[i]) || draft_confidence[i] < 3.0f) {
+                        uniformly_high_confidence = false;
+                        break;
+                    }
+                }
+            }
+            if (uniformly_high_confidence) {
+                // The cost fit used to narrow even counting/repetition rows whose every proposal
+                // carried overwhelming confidence (typically logits 6..11). That censored the
+                // observed tau to ~5.6 although a full depth-7 verify reaches 7.33 and 382 tok/s.
+                vn = active_proposal_depth + 1;
+            } else if (have_conf && boot_w >= 1) {
                 // Walk every width once so the table starts complete. Each of these steps still
                 // verifies and still emits, so the only cost is planning off the head rather than
                 // off measurement for kProposalDepth+1 steps of a ~78-step generation.
@@ -3984,7 +4006,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             // long-context cost starts the controller at depth 2 or 3.
             bool high_confidence_full = kConfidencePromotionOn && kInitialProposalDepth <= 3 &&
                                         step_no >= kConfidenceDiscoveryStart &&
-                                        step_no <= kConfidenceDiscoveryEnd && deepest_landed;
+                                        step_no <= kConfidenceDiscoveryEnd;
             if (high_confidence_full) {
                 // Entering wider mode needs stronger evidence: a 32k math transient had a 3.14
                 // minimum and widening lost 3%. Once depth 4 is earned, repetitive streams have a
@@ -3999,7 +4021,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                     }
                 }
             }
-            depth_promote_run = deepest_landed
+            // A shallow full accept by itself is common in ordinary code/chat and was promoting
+            // those streams away from their measured depth-3 optimum. Require the confidence
+            // head to corroborate the initial workload classification; once depth 4 has been
+            // earned, the ordinary landed-prefix evidence remains sufficient for 4 -> 7.
+            const bool initial_promotion_evidence = active_proposal_depth > 3 ||
+                                                    high_confidence_full;
+            const bool promotion_evidence = deepest_landed || high_confidence_full;
+            depth_promote_run = promotion_evidence && initial_promotion_evidence
                                     ? depth_promote_run + (high_confidence_full ? 2 : 1)
                                     : std::max(depth_promote_run - 1, 0);
             depth_demote_run = (active_proposal_depth > kInitialProposalDepth && plan_vn <= 2)
