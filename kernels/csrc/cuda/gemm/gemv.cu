@@ -3066,8 +3066,9 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
             gemv_nvfp4_rows_dp4a2_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W0, W1, yp0, yp1, N, K); \
     } while (0)
 #define SI_NVFP4_DP4A2_S(R_) do { \
-        if (N >= 8192)      SI_NVFP4_DP4A2(2, R_); \
-        else if (N >= 4096) SI_NVFP4_DP4A2(4, R_); \
+        /* At verifier widths, 5120-wide projections are faster with S=2: the extra */ \
+        /* split reduction costs more than the shorter per-warp K walk saves. */ \
+        if (N >= 4096)      SI_NVFP4_DP4A2(2, R_); \
         else                SI_NVFP4_DP4A2(8, R_); \
     } while (0)
     switch (M) {
@@ -3120,8 +3121,8 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
         } \
     } while (0)
 #define SI_NVFP4_DP4A_S(R_) do { \
-        if (N >= 8192)      SI_NVFP4_DP4A(2, R_); \
-        else if (N >= 4096) SI_NVFP4_DP4A(4, R_); \
+        /* Keep 5120-wide target projections on the verifier-calibrated two-way split. */ \
+        if (N >= 4096)      SI_NVFP4_DP4A(2, R_); \
         else                SI_NVFP4_DP4A(8, R_); \
     } while (0)
     switch (M) {

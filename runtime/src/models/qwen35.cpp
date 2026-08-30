@@ -3414,9 +3414,18 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // different costs: depth removes the planner's bootstrap walk and a 248320-wide head row per
     // proposal, the window removes draft attention.
     const bool kShortGeneration = (n + max_new + B) <= kCompactMaxSeq;
+    // Long outputs amortise the wider draft/verify startup even when the prompt itself is 4K.
+    // On the matched 4K/256 matrix depth 7 is lossless and clears the SGLang baseline; the old
+    // depth-3 start leaves math at 211 tok/s although
+    // the same runtime reaches 245 at depth 7.  Keep this below the long-context tier: 12K+
+    // retains its independently calibrated shallow policy, and short 4K outputs retain the
+    // adaptive depth-3 start that wins when there are too few tokens to repay widening.
+    constexpr int kWideOutputMinTokens = 200;
+    const bool kAmortizedMidContext = max_new >= kWideOutputMinTokens &&
+                                      (n + max_new) < kDeepMinSeq;
     constexpr int kScored32kMinSeq = 32768;
     const int kInitialProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
-                                    : (kShortGeneration ? 7
+                                    : ((kShortGeneration || kAmortizedMidContext) ? 7
                                        : ((n + max_new) >= kScored32kMinSeq ? 3
                                           : ((n + max_new) >= kDeepMinSeq ? 2 : 3))));
     // A length-only depth is a safe starting point, not a workload policy. At the same 16k
