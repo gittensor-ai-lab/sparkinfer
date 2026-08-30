@@ -58,4 +58,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax, bool capture_only = false);
 
+// Release request-scoped verify graphs and their device arena. Call after a speculative
+// generation so the next long prefill sees the same free-VRAM budget as the first one.
+void dflash_release_verify_cache();
+
 } // namespace sparkinfer

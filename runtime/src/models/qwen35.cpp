@@ -3548,7 +3548,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // separate graph tier (see dflash_verify_short_run); building them here keeps graph capture
     // off the decode clock, and capture records kernels rather than running them, so warming a
     // tier the stream never uses costs nothing but the capture itself.
-    for (int t = 1; t <= kProposalDepth + 1; t++) dflash_warm_verify(t, start);
+    // A forced token-loop run never launches the compact verifier. Besides wasting a sizeable
+    // graph-capture warmup, building those unused tiers makes the isolation mode exercise state
+    // that it explicitly asked to bypass. Keep COMPACT_VERIFY=0 a true token-loop control.
+    if (compact_mode != 0)
+        for (int t = 1; t <= kProposalDepth + 1; t++) dflash_warm_verify(t, start);
     // Verify-path cost breakdown (SPARKINFER_DSPARK_TIMING=1). The two verify implementations are
     // timed per call so their cost can be compared directly rather than inferred from end-to-end
     // throughput. Synchronises around each call -- a measurement mode, not a benchmark -- but both
@@ -4062,6 +4066,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     }
     close_session(sid);
     if (th_scratch) cudaFree(th_scratch);
+    // Verify graphs bake pointers into their request-sized arena. They are useful only for this
+    // generation; retaining them steals enough VRAM from a following 32K prefill to change its
+    // scratch path and, for the recurrent GDN stack, its result.
+    dflash_release_verify_cache();
     set_dflash_capture(false, {}, 0);
     draft.reset();
     return out;

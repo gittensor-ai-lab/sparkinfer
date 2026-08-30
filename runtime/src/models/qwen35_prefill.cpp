@@ -79,7 +79,33 @@ struct Arena {
 // one instantiated graph per row count, so the caller can pick the block width per step instead
 // of being locked to whatever width the single warm graph happened to be captured at.
 constexpr int kVerifyMaxRows = 8;
+
+struct VerifyGraphCache {
+    Arena arena;
+    cudaGraph_t graph[kVerifyMaxRows + 1] = {};
+    cudaGraphExec_t exec[kVerifyMaxRows + 1] = {};
+    bool ready[kVerifyMaxRows + 1] = {};
+    bool warm = false;
+};
+
+VerifyGraphCache& verify_graph_cache() {
+    static thread_local VerifyGraphCache cache;
+    return cache;
+}
 } // namespace
+
+void dflash_release_verify_cache() {
+    VerifyGraphCache& cache = verify_graph_cache();
+    for (int t = 1; t <= kVerifyMaxRows; ++t) {
+        if (cache.exec[t]) cudaGraphExecDestroy(cache.exec[t]);
+        if (cache.graph[t]) cudaGraphDestroy(cache.graph[t]);
+        cache.exec[t] = nullptr;
+        cache.graph[t] = nullptr;
+        cache.ready[t] = false;
+    }
+    cache.warm = false;
+    cache.arena.free_all();
+}
 
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n) {
     const Qwen35Config& c = s.cfg;
@@ -2431,9 +2457,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         fprintf(stderr, "]\n");
     }
     cudaStream_t st = s.stream;
-    static thread_local Arena verify_arena;
-    verify_arena.rewind();
-    Arena& a = verify_arena;
+    VerifyGraphCache& graph_cache = verify_graph_cache();
+    graph_cache.arena.rewind();
+    Arena& a = graph_cache.arena;
     bf16* x = a.alloc<bf16>((size_t)NA * H);
     bf16* xn = a.alloc<bf16>((size_t)NA * H);
     bf16* h = a.alloc<bf16>((size_t)NA * H);
@@ -2568,10 +2594,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // One graph per row count (index 1..kVerifyMaxRows). A single slot meant the verify could
     // only ever replay the width dflash_warm_verify captured, which is why the block width had to
     // be a per-GENERATION constant; with a tier per width the caller can choose it per step.
-    static thread_local cudaGraph_t verify_graph[kVerifyMaxRows + 1] = {};
-    static thread_local cudaGraphExec_t verify_exec[kVerifyMaxRows + 1] = {};
-    static thread_local bool graph_warm = false;
-    static thread_local bool graph_ready_t[kVerifyMaxRows + 1] = {};
+    cudaGraph_t (&verify_graph)[kVerifyMaxRows + 1] = graph_cache.graph;
+    cudaGraphExec_t (&verify_exec)[kVerifyMaxRows + 1] = graph_cache.exec;
+    bool& graph_warm = graph_cache.warm;
+    bool (&graph_ready_t)[kVerifyMaxRows + 1] = graph_cache.ready;
     static thread_local const void* graph_model_key = nullptr;
     static thread_local const void* graph_state_key = nullptr;
     static thread_local const void* graph_conv_key = nullptr;
