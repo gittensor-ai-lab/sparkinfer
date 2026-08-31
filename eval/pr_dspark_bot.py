@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sparkinfer DSpark speculative-decode PR auto-evaluator (Qwen3.8-27B, ctx=16k).
+"""sparkinfer DSpark PR auto-evaluator (Qwen3.8-27B, decode@16k + prefill@32k).
 
 Adapted from pr_modelopt_bot.py — same transport, same tier buckets, same GitHub plumbing — and
 narrowed to one question: how fast is DSpark speculative decode at ctx=16k, and is it still exact?
@@ -152,7 +152,7 @@ BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 # every dimension also a floor) is kept intact so adding e.g. "dspark-decode@16k" later is a
 # one-line change, but with one entry the combination rule degenerates to "score it, and reject if
 # it regresses" -- which is what a focused optimisation target wants.
-SCORING_DIMS = ["dspark-decode@16k"]
+SCORING_DIMS = ["dspark-decode@16k", "dspark-prefill@32k"]
 SCORING_DIM = SCORING_DIMS[0]
 
 # Accuracy gate bars. This gate is DIFFERENTIAL (PR vs origin/main on the same token stream, see
@@ -185,7 +185,7 @@ MODELOPT_NEEDS_REBASE = "dspark-needs-rebase"
 # baseline moves by ~72% (dspark@4k 43.06 -> 74.05, ar@4k 47.39 -> 90.19) and every score taken
 # under v1 is incomparable -- bumping the schema forces re-evaluation instead of letting a stale
 # label sit next to a number that no longer means the same thing.
-EVAL_SCHEMA_VERSION = "v4-dspark-decode16k"
+EVAL_SCHEMA_VERSION = "v5-dspark-decode16k-prefill32k"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-dspark-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -230,6 +230,7 @@ DRAFT_DIR = os.environ.get("DSPARK_DRAFT_DIR", "/root/workspace/dspark")
 # only path on which accepting k tokens costs one target forward instead of k. That makes tau a
 # real lever again and makes "DSpark beats AR" reachable rather than structurally impossible.
 DSPARK_CTX = int(os.environ.get("DSPARK_CTX", "16384"))
+DSPARK_PREFILL_CTX = int(os.environ.get("DSPARK_PREFILL_CTX", "32768"))
 # Repeats of the speculative generation per round. Every one must match AR for LOSSLESS to be 1.
 #
 # Three independent processes, not three generations in one loaded runtime. Process isolation makes
@@ -736,6 +737,7 @@ def _remote_script(ref: str, role: str = "pr", main: dict | None = None) -> str:
     parity_bar = PARITY_BAR
     draft_dir = shlex.quote(DRAFT_DIR)
     ctx = DSPARK_CTX
+    prefill_ctx = DSPARK_PREFILL_CTX
     spec_reps = DSPARK_SPEC_REPS
     eval_text = shlex.quote(EVAL_TEXT)
     dump_self = shlex.quote(SCORE_DUMP_MAIN if role == "main" else SCORE_DUMP_PR)
@@ -748,6 +750,7 @@ def _remote_script(ref: str, role: str = "pr", main: dict | None = None) -> str:
     # ever compares, the policy stays in Python.
     m = main or {}
     ref_dspark = float(m.get("dspark_tps") or 0)
+    ref_prefill = float(m.get("prefill_pp") or 0)
     ref_ar = float(m.get("ar_tps") or 0)
     ref_tau = float(m.get("mean_accept") or 0)
     tau_tol = DSPARK_TAU_TOL
@@ -795,6 +798,7 @@ REPO={repo}
 MODEL_DIR={model_dir}
 DRAFT_DIR={draft_dir}
 CTX={ctx}
+PREFILL_CTX={prefill_ctx}
 NTOK={ntok}
 TOPK={topk}
 PARITY_BAR={parity_bar}
@@ -803,6 +807,7 @@ DUMP_SELF={dump_self}
 DUMP_MAIN={dump_main}
 IS_PR={is_pr}
 REF_DSPARK={ref_dspark}
+REF_PREFILL={ref_prefill}
 REF_AR={ref_ar}
 REF_TAU={ref_tau}
 TAU_TOL={tau_tol}
@@ -963,6 +968,27 @@ echo "RESULT_MEAN_ACCEPT $(_ds_metric MEAN_ACCEPT)"
 echo "RESULT_LOSSLESS $(_ds_metric LOSSLESS)"
 echo "RESULT_LOSSLESS_RUNS $(_ds_metric LOSSLESS_RUNS)"
 
+# The second scored dimension is production batched prefill at 32k. Measure it separately from
+# dspark_tau_check: that correctness harness pins deterministic prefill kernels, so its TTFT is
+# intentionally not representative of the serving path. qwen3_gguf_bench uses the production
+# defaults and reports the median of five repetitions from one model load.
+wait_gpu_clear
+PREFILL_OUT=/tmp/dspark_prefill32k.txt
+SPARKINFER_BENCH_SWEEP_CTXS="$PREFILL_CTX" SPARKINFER_BENCH_REPS=5 \
+  timeout 900 build/runtime/qwen3_gguf_bench "$MODEL_DIR" 1 sweep > "$PREFILL_OUT" 2>&1
+PREFILL_PP=$(python3 - "$PREFILL_OUT" "$PREFILL_CTX" <<'PYPF'
+import json, sys
+prefix = "SWEEP_JSON "
+for line in open(sys.argv[1]):
+    if line.startswith(prefix):
+        print(json.loads(line[len(prefix):])[sys.argv[2]]["prefill_pp"])
+        break
+else:
+    print(0)
+PYPF
+)
+echo "RESULT_PREFILL_PP ${{PREFILL_PP:-0}}"
+
 # --- FAIL FAST -------------------------------------------------------------------------------
 # Every gate below is decidable from the stage that just ran, so a PR that fails one is already
 # REJECTed no matter what the remaining stages say. Running them anyway costs the accuracy dump
@@ -974,7 +1000,7 @@ echo "RESULT_LOSSLESS_RUNS $(_ds_metric LOSSLESS_RUNS)"
 if [ "$IS_PR" = "1" ]; then
   _fail_fast() {{ echo "EARLY_REJECT $1"; echo "EARLY_REJECT_STAGE dspark"; exit 0; }}
   _lt() {{ python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)" "$1" "$2"; }}
-  DS=$(_ds_metric DSPARK_TPS); AR=$(_ds_metric AR_TPS)
+  DS=$(_ds_metric DSPARK_TPS); AR=$(_ds_metric AR_TPS); PF=${{PREFILL_PP:-0}}
   TAU=$(_ds_metric MEAN_ACCEPT); LL=$(_ds_metric LOSSLESS); LLR=$(_ds_metric LOSSLESS_RUNS)
   [ "${{LL%%.*}}" = "1" ] || _fail_fast "losslessness gate failed: DSpark output does not match the AR reference token-for-token"
   _lt "$LLR" "{spec_reps}" && _fail_fast "losslessness verified over only ${{LLR%%.*}} run(s), need {spec_reps}"
@@ -989,6 +1015,10 @@ if [ "$IS_PR" = "1" ]; then
   if _lt "0" "$REF_AR"; then
     _lt "$AR" "$(python3 -c "print($REF_AR * $REGRESS_TOL)")" \
       && _fail_fast "ar-decode@16k regression: $AR < $(python3 -c "print(round($REGRESS_TOL*100))")% of main $REF_AR"
+  fi
+  if _lt "0" "$REF_PREFILL"; then
+    _lt "$PF" "$(python3 -c "print($REF_PREFILL * $REGRESS_TOL)")" \
+      && _fail_fast "dspark-prefill@32k regression: $PF < $(python3 -c "print(round($REGRESS_TOL*100))")% of main $REF_PREFILL"
   fi
 fi
 # ---------------------------------------------------------------------------------------------
@@ -1141,6 +1171,11 @@ def _parse_remote(stdout: str) -> dict:
         elif line.startswith("RESULT_AR_TPS "):
             try:
                 out["ar_tps"] = float(line.split()[1])
+            except ValueError:
+                pass
+        elif line.startswith("RESULT_PREFILL_PP "):
+            try:
+                out["prefill_pp"] = float(line.split()[1])
             except ValueError:
                 pass
         elif line.startswith("RESULT_MEAN_ACCEPT "):
@@ -1301,14 +1336,14 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
     if not push_eval_polaris(host, port):
         return None
     result_json = {
-        "model": "qwen38-16k",
+        "model": "qwen38-dspark-16k-prefill-32k",
         "label": res.get("label"),
         "pass": res.get("pass"),
         "tps": res.get("pr_decode_tps"),
         "delta_tps": (res.get("pr_decode_tps") or 0) - (res.get("main_decode_tps") or 0),
         "pct_over_frontier": res.get("delta_pct"),
         "score_context": DSPARK_CTX,
-        "best_context_label": "16k",
+        "best_context_label": "16k-decode+32k-prefill",
         "ctx_16384_tps": res.get("pr_decode_tps"),
         "top1": res.get("pr_top1"),
         "kl": res.get("pr_kl"),
@@ -1317,7 +1352,7 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
     stdin_payload = "RESULT_JSON " + json.dumps(result_json)
     cmd = (
         f"cd {shlex.quote(REMOTE_REPO)} && "
-        f"SPARKINFER_EVAL_MODE=qwen38-16k SPARKINFER_DECODE_TOKENS={BENCH_TOKENS} "
+        f"SPARKINFER_EVAL_MODE=qwen38-dspark-16k-prefill-32k SPARKINFER_DECODE_TOKENS={BENCH_TOKENS} "
         f"SPARKINFER_EVAL_SEED={shlex.quote(eval_seed)} python3 eval/polaris/judge.py --from-stdin "
         f"--model-file {shlex.quote(MODEL_WEIGHT_FILE)} "
         f"--build-dir {shlex.quote(REMOTE_REPO)}/build/runtime "
@@ -1381,6 +1416,9 @@ def measure_main_baseline(host, port):
     if not main.get("ar_tps"):
         return {"ok": False, "reason": "main run missing/zero AR decode@16k tok/s",
                 "log": (r.stdout or "")[-1500:]}
+    if not main.get("prefill_pp"):
+        return {"ok": False, "reason": "main run missing/zero prefill@32k prompt tok/s",
+                "log": (r.stdout or "")[-1500:]}
     # If MAIN is not lossless the whole round is meaningless: every PR would be compared against a
     # baseline that is already emitting unverified tokens, and "faster than a broken reference" is
     # not a result. Stop the round rather than scoring against it.
@@ -1434,6 +1472,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
             "delta_pct": 0.0, "early_reject": True, "early_reject_stage": stage,
             "pr_dspark_tps": pr.get("dspark_tps", 0.0), "main_dspark_tps": main.get("dspark_tps", 0.0),
             "pr_ar_tps": pr.get("ar_tps", 0.0), "main_ar_tps": main.get("ar_tps", 0.0),
+            "pr_prefill_pp": pr.get("prefill_pp", 0.0), "main_prefill_pp": main.get("prefill_pp", 0.0),
             "pr_decode_tps": pr.get("dspark_tps", 0.0), "main_decode_tps": main.get("dspark_tps", 0.0),
             "pr_mean_accept": pr.get("mean_accept", 0.0), "main_mean_accept": main.get("mean_accept", 0.0),
             "lossless": pr.get("lossless") is True, "lossless_runs": pr.get("lossless_runs", 0),
@@ -1451,6 +1490,9 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     if not pr.get("ar_tps"):
         return {"ok": False, "reason": "PR run missing/zero AR decode@16k tok/s",
                 "log": (r.stdout or "")[-1500:]}
+    if not pr.get("prefill_pp"):
+        return {"ok": False, "reason": "PR run missing/zero prefill@32k prompt tok/s",
+                "log": (r.stdout or "")[-1500:]}
     if not pr.get("mean_accept"):
         return {"ok": False, "reason": "PR run missing/zero mean accept (tau)",
                 "log": (r.stdout or "")[-1500:]}
@@ -1462,6 +1504,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
                                        "or no main baseline dump to diff against)",
                 "log": (r.stdout or "")[-1500:]}
     print(f">> PR dspark@16k={pr['dspark_tps']:.2f} (scored) "
+          f"prefill@32k={pr['prefill_pp']:.2f} pp/s (scored) "
           f"ar@16k={pr['ar_tps']:.2f} "
           f"ratio={pr['dspark_tps'] / pr['ar_tps']:.3f}x "
           f"tau={pr.get('mean_accept', 0):.3f} lossless={pr.get('lossless')} "
@@ -1475,6 +1518,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     #     throughput by pessimising the ordinary serving path. Either regressing is a hard REJECT.
     dims = [
         ("dspark-decode@16k", pr["dspark_tps"], main["dspark_tps"]),
+        ("dspark-prefill@32k", pr["prefill_pp"], main["prefill_pp"]),
         ("ar-decode@16k",     pr["ar_tps"],     main["ar_tps"]),
     ]
     scored = []
@@ -1506,6 +1550,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
                    key=lambda s: s["delta"], default=by_dim[SCORING_DIM])
         label, delta_pct, passed, speed_reason = best["label"], best["delta"], best["passed"], best["reason"]
     dspark_label, dspark_delta_pct = by_dim["dspark-decode@16k"]["label"], by_dim["dspark-decode@16k"]["delta"]
+    prefill_label, prefill_delta_pct = by_dim["dspark-prefill@32k"]["label"], by_dim["dspark-prefill@32k"]["delta"]
     ar_label,     ar_delta_pct     = by_dim["ar-decode@16k"]["label"],     by_dim["ar-decode@16k"]["delta"]
     # Keep the speed-only verdict: `label` below can be forced to REJECT by the accuracy gate or
     # the Qwen3.6 guard, and the comment/dashboard still need to say whether speed itself moved.
@@ -1605,6 +1650,10 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "decode_regressed": dspark_label == "REJECT",
         "pr_dspark_tps": pr["dspark_tps"],
         "main_dspark_tps": main["dspark_tps"],
+        "pr_prefill_pp": pr["prefill_pp"],
+        "main_prefill_pp": main["prefill_pp"],
+        "prefill_delta_pct": prefill_delta_pct,
+        "prefill_regressed": prefill_label == "REJECT",
         "pr_ar_tps": pr["ar_tps"],
         "main_ar_tps": main["ar_tps"],
         "ar_delta_pct": ar_delta_pct,
@@ -1626,7 +1675,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "q36_guard": pr.get("guard36"),
         "q36_guard_main": main.get("guard36"),
         "scored_dimension": best["dim"],
-        "speedup_vs_main": round(pr["dspark_tps"] / main["dspark_tps"], 3) if main.get("dspark_tps") else 0,
+        "speedup_vs_main": round(best["delta"] / 100 + 1, 3),
         "pr_top1": pr_top1,
         "pr_kl": pr_kl,
         "pr_ppl": pr.get("ppl_pr"),
@@ -1665,6 +1714,9 @@ def format_comment(commit: str, res: dict) -> str:
         "main_ar_tps": res.get("main_ar_tps"),
         "pr_dspark_tps": res.get("pr_dspark_tps"),
         "main_dspark_tps": res.get("main_dspark_tps"),
+        "pr_prefill_pp": res.get("pr_prefill_pp"),
+        "main_prefill_pp": res.get("main_prefill_pp"),
+        "prefill_delta_pct": res.get("prefill_delta_pct"),
         "scored_dimension": res.get("scored_dimension"),
         "pr_top1": res.get("pr_top1"),
         "pr_kl": res.get("pr_kl"),
@@ -1750,10 +1802,13 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer DSpark auto-eval — `eval-dspark:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-dspark:{lab}` |\n"
-        f"| scored at | **DSpark speculative decode @ ctx=16k** on the ModelOpt NVFP4 checkpoint |\n"
+        f"| scored at | **DSpark decode @16k + batched prefill @32k** on the ModelOpt NVFP4 checkpoint |\n"
         f"| **PR DSpark tok/s** | **{_num('pr_dspark_tps'):.2f}** |\n"
         f"| **main DSpark tok/s** | **{_num('main_dspark_tps'):.2f}** |\n"
-        f"| **speedup vs main** | **{res.get('speedup_vs_main', 0):.3f}×** ({res.get('decode_delta_pct', 0):+.1f}%) |\n"
+        f"| DSpark decode vs main | {res.get('decode_delta_pct', 0):+.1f}% |\n"
+        f"| **PR prefill @32k** | **{_num('pr_prefill_pp'):.1f} pp/s** |\n"
+        f"| **main prefill @32k** | **{_num('main_prefill_pp'):.1f} pp/s** |\n"
+        f"| prefill vs main | {res.get('prefill_delta_pct', 0):+.1f}% |\n"
         f"| PR AR tok/s (floor) | {_num('pr_ar_tps'):.2f} |\n"
         f"| main AR tok/s (floor) | {_num('main_ar_tps'):.2f} |\n"
         f"| AR vs main (floor) | {res.get('ar_delta_pct', 0):+.1f}% |\n"
@@ -1770,7 +1825,8 @@ def format_comment(commit: str, res: dict) -> str:
         f"| commit | `{commit[:9]}` |\n\n"
         f"{res.get('reason') or ''}\n\n"
         "<sub>Scored on the pinned eval box vs same-box `origin/main`: DSpark speculative decode "
-        "throughput at ctx=16k on the ModelOpt NVFP4 checkpoint, with the AR reference measured in "
+        "at ctx=16k and production batched prefill at ctx=32k on the ModelOpt NVFP4 checkpoint. "
+        "The AR reference is measured in "
         "the same process and the same model load. Both a regression in AR decode and any "
         "divergence from the AR token sequence are hard REJECTs — a speculative decoder that is "
         "fast because it skips verification is not faster, it is wrong. τ is the lever, and the "
@@ -2052,10 +2108,11 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
         result = {
             "id": rid, "pr": int(num), "title": title,
             "url": f"https://github.com/{repo}/pull/{num}", "commit": oid[:7],
-            "eval_mode": "qwen38-16k",
+            "eval_mode": "qwen38-dspark-16k-prefill-32k",
             "label": res.get("label"), "pass": res.get("pass"), "reason": res.get("reason"),
             "delta_pct": res.get("delta_pct"),
             "pr_decode_tps": res.get("pr_decode_tps"), "main_decode_tps": res.get("main_decode_tps"),
+            "pr_prefill_pp": res.get("pr_prefill_pp"), "main_prefill_pp": res.get("main_prefill_pp"),
             "pr_ar_tps": res.get("pr_ar_tps"), "main_ar_tps": res.get("main_ar_tps"),
             "prefill_delta_pct": res.get("prefill_delta_pct"),
             "pr_ar_tps": res.get("pr_ar_tps"),
@@ -2373,6 +2430,7 @@ def main():
     # main has no top1/kl of its own: it IS the accuracy reference, and its score dump was just
     # written to SCORE_DUMP_MAIN for each PR in this round to diff against.
     print(f">> main baseline: dspark@16k={main_result['dspark_tps']:.2f} tok/s (scored) "
+          f"prefill@32k={main_result['prefill_pp']:.2f} pp/s (scored) "
           f"ar@16k={main_result['ar_tps']:.2f} tok/s "
           f"ratio={main_result['dspark_tps'] / main_result['ar_tps']:.3f}x "
           f"tau={main_result.get('mean_accept', 0):.3f} lossless={main_result.get('lossless')}")
