@@ -1311,6 +1311,102 @@ __global__ void pf_attn_bf16_paged_kernel(
     for (int e = 0; e < ELEMS; e++) attn[q_off + lane + e * 32] = __float2bfloat16(acc[e] * inv);
 }
 
+// BIT-IDENTICAL shared-memory-tiled BF16 paged prefill attention.
+//
+// Same per-key arithmetic in the same ascending-kpos order as the scalar kernel above -- same dot,
+// same online-softmax update, same rounding -- so the output is byte-for-byte what main produces.
+// Only the SOURCE of K/V changes: one block of NWARP warps stages a TK-key tile in shared memory
+// and the warps in that block (one query each) all read it.
+//
+// TK and NWARP are ONE decision, not two. The scalar kernel launches 32-thread blocks and hits the
+// blocks/SM limit at 32 warps, so a tile only pays if it clears that. A 32-key tile is 32 KB of
+// smem: at NWARP=8 (256 threads) the SM holds 3 blocks = 24 warps -- FEWER than the kernel it
+// replaces -- and measures +0.6%; at NWARP=32 (1024 threads) it holds 2 blocks = 64 warps, the
+// ceiling, with 32 queries sharing each staged tile, and measures +21.5%. Swept at ctx=32768
+// (DSPARK_PREFILL_PP, stock ~1181): 16k/4w 840, 16k/8w 1248, 8k/16w 1338, 16k/16w 1367,
+// 32k/8w 1193, 32k/16w 1389, 48k/16w 1399, 32k/32w 1435.
+//
+// A 64-key tile needs 64 KB, past the 48 KB dynamic-smem default. The launch is refused, the
+// cudaGetLastError() check below catches it, and the call falls through to the scalar kernel
+// rather than reporting success over an output buffer nothing wrote (measured: stock).
+template <int HEAD_DIM, int TK, int NWARP>
+__global__ __launch_bounds__(NWARP * 32) void pf_attn_bf16_paged_tiled_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
+    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int block_size, int max_blocks_per_seq, float scale) {
+    constexpr int ELEMS = HEAD_DIM / 32;
+    extern __shared__ __nv_bfloat16 pf_tile_smem[];
+    __nv_bfloat16* sK = pf_tile_smem;
+    __nv_bfloat16* sV = pf_tile_smem + (size_t)TK * HEAD_DIM;
+
+    const int head = blockIdx.y;
+    if (head >= n_q_heads) return;
+    const int kv_head = head / (n_q_heads / n_kv_heads);
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int q0 = blockIdx.x * NWARP;
+    const int qtok = q0 + warp;
+    const int nthreads = NWARP * 32;
+
+    float q_reg[ELEMS];
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) q_reg[e] = 0.f;
+    if (qtok < n_tokens) {
+        const size_t q_off = ((size_t)qtok * n_q_heads + head) * HEAD_DIM;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) q_reg[e] = pf_to_f(q[q_off + lane + e * 32]);
+    }
+
+    float m = -1e30f, l = 0.f, acc[ELEMS];
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
+
+    const int qmax = min(q0 + NWARP - 1, n_tokens - 1);
+
+    for (int t0 = 0; t0 <= qmax; t0 += TK) {
+        const int tk = min(TK, qmax - t0 + 1);
+        for (int idx = threadIdx.x; idx < tk * HEAD_DIM; idx += nthreads) {
+            const int kk = idx / HEAD_DIM;
+            const int d = idx - kk * HEAD_DIM;
+            const int kpos = t0 + kk;
+            const int blk = kpos / block_size, within = kpos % block_size;
+            const size_t kv_off =
+                (((size_t)block_table[blk] * block_size + within) * n_kv_heads + kv_head) * HEAD_DIM;
+            sK[(size_t)kk * HEAD_DIM + d] = k_pool[kv_off + d];
+            sV[(size_t)kk * HEAD_DIM + d] = v_pool[kv_off + d];
+        }
+        __syncthreads();
+        if (qtok < n_tokens) {
+            const int kend = min(tk, qtok - t0 + 1);
+            for (int kk = 0; kk < kend; kk++) {
+                float partial = 0.f;
+                #pragma unroll
+                for (int e = 0; e < ELEMS; e++)
+                    partial += q_reg[e] * pf_to_f(sK[(size_t)kk * HEAD_DIM + lane + e * 32]);
+                const float score = pf_wsum(partial) * scale;
+                const float m_new = fmaxf(m, score);
+                const float corr = __expf(m - m_new);
+                const float p = __expf(score - m_new);
+                l = l * corr + p;
+                #pragma unroll
+                for (int e = 0; e < ELEMS; e++)
+                    acc[e] = acc[e] * corr + p * pf_to_f(sV[(size_t)kk * HEAD_DIM + lane + e * 32]);
+                m = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (qtok < n_tokens) {
+        const float inv = (l > 0.f) ? (1.f / l) : 0.f;
+        const size_t q_off = ((size_t)qtok * n_q_heads + head) * HEAD_DIM;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++)
+            attn[q_off + lane + e * 32] = __float2bfloat16(acc[e] * inv);
+    }
+}
+
 // ============================================================================
 // Host launchers
 // ============================================================================
@@ -1677,6 +1773,46 @@ bool launch_prefill_attn_bf16_paged(
     auto kb = reinterpret_cast<const __nv_bfloat16*>(k_pool);
     auto vb = reinterpret_cast<const __nv_bfloat16*>(v_pool);
     auto ob = reinterpret_cast<__nv_bfloat16*>(attn);
+    // Tile width in keys. SPARKINFER_PREFILL_ATTN_BF16_TILE=0 restores the per-warp scalar
+    // kernel for A/B; 8/16/32/48 select a width. 32 with 32 warps measured best at ctx=32k.
+    static const int tile = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_TILE");
+        return e ? atoi(e) : 32;
+    }();
+    // Queries per block. Each warp still owns one query, so this changes only how many queries
+    // share a staged tile -- and how many warps the SM can hold. It is NOT separable from the tile
+    // width: a 32-key tile is the worst choice at 8 warps and the best at 32.
+    static const int tw = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_WARPS");
+        const int v = e ? atoi(e) : 32;
+        return (v == 4 || v == 8 || v == 16 || v == 32) ? v : 8;
+    }();
+    if (tile && head_dim == 256 && n_kv_heads > 0 && n_q_heads % n_kv_heads == 0) {
+        const size_t sm = (size_t)2 * tile * 256 * sizeof(__nv_bfloat16);
+        bool ok = true;
+#define SI_PF_TILE(TK, NW)                                                                     \
+        do {                                                                                       \
+            dim3 gt((n_tokens + (NW) - 1) / (NW), n_q_heads);                                      \
+            pf_attn_bf16_paged_tiled_kernel<256, (TK), (NW)><<<gt, (NW) * 32, sm, stream>>>(       \
+                qb, kb, vb, block_table, ob, n_tokens, n_q_heads, n_kv_heads,                      \
+                block_size, max_blocks_per_seq, scale);                                            \
+        } while (0)
+        if      (tile ==  8 && tw ==  4) SI_PF_TILE(8, 4);
+        else if (tile ==  8 && tw ==  8) SI_PF_TILE(8, 8);
+        else if (tile ==  8 && tw == 16) SI_PF_TILE(8, 16);
+        else if (tile == 16 && tw ==  4) SI_PF_TILE(16, 4);
+        else if (tile == 16 && tw ==  8) SI_PF_TILE(16, 8);
+        else if (tile == 16 && tw == 16) SI_PF_TILE(16, 16);
+        else if (tile == 32 && tw ==  8) SI_PF_TILE(32, 8);
+        else if (tile == 32 && tw == 16) SI_PF_TILE(32, 16);
+        else if (tile == 32 && tw == 32) SI_PF_TILE(32, 32);
+        else if (tile == 48 && tw == 16) SI_PF_TILE(48, 16);
+        else if (tile == 64 && tw == 16) SI_PF_TILE(64, 16);
+        else if (tile == 64 && tw == 32) SI_PF_TILE(64, 32);
+        else ok = false;
+#undef SI_PF_TILE
+        if (ok && cudaGetLastError() == cudaSuccess) return true;
+    }
     if (head_dim == 256) {
         pf_attn_bf16_paged_kernel<256><<<grid, 32, 0, stream>>>(
             qb, kb, vb, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
