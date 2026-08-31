@@ -236,13 +236,33 @@ __global__ void fa_split_gqa_pipe_kernel(
                 kv_v[e] = fa_to_f(cv[tt * HEAD_DIM + lane + e * 32]);
             }
             const int gtok = t0 + tt;
+            // SEQ independent QK dots FIRST, then one butterfly pass over all of them, and only
+            // then the folds. The shipped shape was dot -> fa_wsum -> softmax -> acc, per row: a
+            // 5-deep shfl chain and two MUFU with nothing in flight to cover them, repeated SEQ
+            // times. Hoisting the dots exposes SEQ independent reductions to interleave.
+            //
+            // BIT-IDENTICAL: each row's dot accumulates over e in the same order, each row's
+            // butterfly walks the same mask sequence fa_wsum walks (so it is the same tree of the
+            // same partials), and the online-softmax fold still runs row by row on the same
+            // score. Only the instruction SCHEDULE changes. Measured at ctx 16384, pinned verify
+            // width 3, one binary per arm: batched 12.243 -> 12.022 ms/call, tau bit-identical.
+            float sc[SEQ];
             #pragma unroll
             for (int v = 0; v < SEQ; v++) {
-                if (gtok < row_start[v] || gtok >= row_end[v]) continue;
                 float p = 0.f;
                 #pragma unroll
                 for (int e = 0; e < ELEMS; e++) p += qr[v][e] * kv_k[e];
-                const float score = fa_wsum(p) * scale;
+                sc[v] = p;
+            }
+            #pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1)
+                #pragma unroll
+                for (int v = 0; v < SEQ; v++)
+                    sc[v] += __shfl_xor_sync(0xffffffff, sc[v], mask);
+            #pragma unroll
+            for (int v = 0; v < SEQ; v++) {
+                if (gtok < row_start[v] || gtok >= row_end[v]) continue;
+                const float score = sc[v] * scale;
                 const float mn = fmaxf(m[v], score), corr = __expf(m[v] - mn), pe = __expf(score - mn);
                 l[v] = l[v] * corr + pe;
                 #pragma unroll
