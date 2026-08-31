@@ -28,7 +28,8 @@ bool launch_prefill_attn_windowed(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr);
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks,
+    cudaStream_t stream = nullptr);
 
 // PURE rolling-window (NO attention sink) prefill attention for Muse Glimmer's bf16 KV cache.
 // Each query attends to the last `win_blocks` KV blocks only (block 0 dropped once out of window),

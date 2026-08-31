@@ -748,7 +748,7 @@ bool launch_prefill_attn_windowed(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream) {
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
     auto ks = reinterpret_cast<const __half*>(k_scale);
     auto vs = reinterpret_cast<const __half*>(v_scale);
@@ -784,10 +784,6 @@ bool launch_prefill_attn_windowed(
     static int lanepar = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_LANEPAR");
         return (e && e[0] == '0') ? 0 : 1;
-    }();
-    static int win_blocks = [] {
-        const char* e = getenv("SPARKINFER_PREFILL_ATTN_WINDOW");
-        return e ? atoi(e) : 256;
     }();
     if (win_blocks > 0) {
         bool lanepar_ok = lanepar != 0;

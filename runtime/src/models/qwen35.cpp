@@ -2928,6 +2928,14 @@ void Qwen35Model::set_logit_bias(uint64_t seq_id, const std::vector<std::pair<in
 std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov,
                                        double* out_ttft_s, double* out_decode_s) {
     Impl& s = *p_;
+    // Fixed-output benchmark mode, matching common serving-runtime benchmark tools' ignore_eos
+    // option. This helper is not used by the HTTP continuous-batch engine, and the default remains
+    // normal EOS termination. Keeping the override explicit prevents quantization-dependent EOS
+    // choices from turning a requested fixed-token throughput measurement into a two-token sample.
+    const bool ignore_eos = [] {
+        const char* e = getenv("SPARKINFER_BENCH_IGNORE_EOS");
+        return e && e[0] == '1';
+    }();
     if (s.dflash_draft) {
         const char* e = getenv("SPARKINFER_DFLASH");
         if (e && e[0] == '1') return dflash_generate(prompt, max_new, nullptr, gov);
@@ -2980,7 +2988,8 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     }
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);
-        if (next == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && next == s.cfg.eos_id2)) break;
+        if (!ignore_eos &&
+            (next == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && next == s.cfg.eos_id2))) break;
         next = forward_token(next, (int)prompt.size() + i, true);
         if (gov) gov->pace();
     }
@@ -3128,6 +3137,10 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
 std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, int max_new,
                                               DFlashStats* stats, ThermalGovernor* gov) {
     Impl& s = *p_;
+    const bool ignore_eos = [] {
+        const char* e = getenv("SPARKINFER_BENCH_IGNORE_EOS");
+        return e && e[0] == '1';
+    }();
     std::vector<int> out;
     if (!s.dflash_draft || prompt.empty() || max_new <= 0) return out;
     DFlashDraftModel& draft = *s.dflash_draft;
@@ -3240,7 +3253,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         }
         for (int i = 0; i < max_new; i++) {
             out.push_back(ar_next);
-            if (ar_next == s.cfg.eos_id) break;
+            if (!ignore_eos &&
+                (ar_next == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && ar_next == s.cfg.eos_id2))) break;
             ar_next = forward_token(ar_next, n_prompt + i, true);
             if (ar_next < 0) break;
             if (gov) gov->pace();
@@ -3448,6 +3462,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int active_proposal_depth = kInitialProposalDepth;
     int depth_promote_run = 0;
     int depth_demote_run = 0;
+    int full_width_credit = 0;
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
@@ -3665,6 +3680,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                                      return !(e && e[0] == '0'); }();
     static const bool kPlanNetGain = []{ const char* e = getenv("SPARKINFER_DSPARK_PLAN_RULE");
                                          return !(e && e[0] == '0'); }();
+    static const double kPlanRateScale = [] {
+        const char* e = getenv("SPARKINFER_DSPARK_PLAN_RATE_SCALE");
+        const double v = e ? atof(e) : 1.0;
+        return v > 0.0 ? v : 1.0;
+    }();
     static const double kPlanCalPrior = []{ const char* e = getenv("SPARKINFER_DSPARK_CAL_PRIOR");
                                             double v = e ? atof(e) : 3.0;
                                             return v > 0 ? v : 3.0; }();
@@ -3673,6 +3693,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                                           return v >= 1.0 ? v : 3.0; }();
     double cal_hit[kPlanMaxW] = {0}, cal_pred[kPlanMaxW] = {0};
     long plan_rows_sum = 0, plan_steps = 0;
+    bool predictable_stream = false;
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
         // The context bound this used to carry (SPARKINFER_DFLASH_COMPACT_MAX_SEQ, default 384)
@@ -3837,7 +3858,22 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 return fit_c0 + fit_c1 * (double)w;
             };
             bool uniformly_high_confidence = have_conf;
-            if (uniformly_high_confidence) {
+            // A high-confidence prefix alone is common in JSON and must not force a wide verify.
+            // Sustained confidence through proposal position six is different: on repetition and
+            // counting it appears within the first few steps and predicts that full-width blocks
+            // will keep landing. Latch that workload classification for this generation so later
+            // confidence decay does not make the planner repeatedly rediscover it. This affects
+            // cost only; every row is still checked by the target before it can be emitted.
+            if (have_conf && active_proposal_depth >= 6) {
+                bool deep_confidence = true;
+                for (int i = 1; i <= 6; ++i)
+                    deep_confidence = deep_confidence && std::isfinite(draft_confidence[i]) &&
+                                      draft_confidence[i] >= 2.0f;
+                predictable_stream = predictable_stream || deep_confidence;
+            }
+            if (predictable_stream || full_width_credit > 0) {
+                vn = active_proposal_depth + 1;
+            } else if (uniformly_high_confidence) {
                 for (int i = 1; i <= active_proposal_depth; ++i) {
                     if (!std::isfinite(draft_confidence[i]) || draft_confidence[i] < 3.0f) {
                         uniformly_high_confidence = false;
@@ -3856,8 +3892,13 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 // off measurement for kProposalDepth+1 steps of a ~78-step generation.
                 vn = boot_w;
             } else if (have_conf) {
-                const double rate = (plan_ms > 0) ? plan_tok / plan_ms : 0.0;
+                const double rate = (plan_ms > 0) ? kPlanRateScale * plan_tok / plan_ms : 0.0;
                 double surv = 1.0, worth = 1.0, best = -1e30;
+                // Once a stream has earned a promoted draft depth, widths 1 and 2 save almost no
+                // verifier time versus width 3 (4K JSON: 11.18/11.38/11.44 ms) but censor useful
+                // accepts. Keep three rows as the minimum promoted plan; shallow depth-3 streams
+                // already bypass this planner and retain their fixed full-width verify.
+                const int min_d = active_proposal_depth > 3 ? 2 : 0;
                 int best_d = active_proposal_depth;
                 for (int d = 0; d <= active_proposal_depth; d++) {
                     if (d > 0) {
@@ -3876,6 +3917,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                     // Net gain in tokens after paying for the rows at the run's own exchange rate.
                     // Before a rate exists (the bootstrap widths have not all reported yet) fall
                     // back to the ratio, which needs no such calibration.
+                    if (d < min_d) continue;
                     const double v = (rate > 0 && kPlanNetGain)
                                          ? worth - rate * plan_cost(d + 1)
                                          : worth / plan_cost(d + 1);
@@ -3895,7 +3937,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                     boot_first = false;          // discard: first call of the run
                 } else {
                     if (vn >= 1 && vn < kPlanMaxW) { w_sum[vn] += vms; w_n[vn] += 1; }
-                    if (boot_w >= 1) --boot_w;   // next width, then leave bootstrap at 0
+                    if (boot_w > 3) --boot_w;    // promoted plans never benefit from widths < 3
+                    else boot_w = 0;
                 }
                 ls_n += 1; ls_r += vn; ls_rr += (double)vn * vn;
                 ls_y += vms; ls_ry += vn * vms;
@@ -4002,13 +4045,21 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         if (kAdaptiveProposalDepth) {
             const bool deepest_landed = plan_vn == active_proposal_depth + 1 &&
                                         accept == active_proposal_depth;
+            if (active_proposal_depth == B && deepest_landed)
+                // A deepest-row hit is strong evidence that truncating the next verify would
+                // throw away useful work. Eight steps lets highly predictable streams remain at
+                // their measured full-width optimum; any miss still starts decaying the credit,
+                // and low-confidence streams never earn it in the first place.
+                full_width_credit = 8;
+            else if (full_width_credit > 0)
+                --full_width_credit;
             // A uniformly high-confidence full block can count as the second promotion hit, but
             // only during early workload discovery. The lower bound rejects a lucky JSON block at
             // generation step 1 (widening there lost 5.8%); the upper bound rejects late chat hits
             // that have too few tokens left to repay widening (2.5% slower). step_no was incremented
             // above, so [5, 16] corresponds to generation steps 4..15. Weak-confidence blocks and
             // checkpoints without a confidence head retain the ordinary two-hit rule.
-            constexpr int kConfidenceDiscoveryStart = 5;
+            constexpr int kConfidenceDiscoveryStart = 1;
             constexpr int kConfidenceDiscoveryEnd = 16;
             // The depth-4 4k tier already exposes enough rows: accelerating its final 4->7 jump
             // was neutral overall and 0.7% slower on repetition/counting. Apply this only where
@@ -4043,8 +4094,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             depth_demote_run = (active_proposal_depth > kInitialProposalDepth && plan_vn <= 2)
                                    ? depth_demote_run + 1 : 0;
             if (depth_promote_run >= 2 && active_proposal_depth < B) {
-                active_proposal_depth = active_proposal_depth < 4
-                                            ? std::min(4, B) : B;
+                const bool early_direct_wide = high_confidence_full &&
+                                               active_proposal_depth <= 3 && step_no <= 5;
+                active_proposal_depth = early_direct_wide ? B
+                                        : (active_proposal_depth < 4 ? std::min(4, B) : B);
                 // Force the planner to measure the newly exposed widths before pricing them.
                 boot_w = active_proposal_depth + 1;
                 depth_promote_run = 0;
@@ -4066,12 +4119,17 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         bool stop = false;
         for (int i = 0; i < keep && (int)out.size() < max_new; i++) {
             out.push_back(block[i]);
-            if (block[i] == s.cfg.eos_id) { stop = true; break; }
+            if (!ignore_eos &&
+                (block[i] == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && block[i] == s.cfg.eos_id2))) {
+                stop = true;
+                break;
+            }
         }
         if (stop) break;
         // Bonus token becomes the next block seed (emitted on the following iteration).
         next = posterior[accept];
-        if (next == s.cfg.eos_id) {
+        if (!ignore_eos &&
+            (next == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && next == s.cfg.eos_id2))) {
             if ((int)out.size() < max_new) out.push_back(next);
             break;
         }
@@ -4096,6 +4154,13 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             if (plan_steps)
                 fprintf(stderr, "[timing] plan    %8.3f rows/step (of %d)  fit C0=%.3f c1=%.3f ms\n",
                         (double)plan_rows_sum / plan_steps, kProposalDepth + 1, fit_c0, fit_c1);
+            if (plan_steps) {
+                fprintf(stderr, "[timing] widths ");
+                for (int w = 1; w < kPlanMaxW; ++w)
+                    if (w_n[w] > 0)
+                        fprintf(stderr, " w%d=%ld@%.3fms", w, w_n[w], w_sum[w] / w_n[w]);
+                fprintf(stderr, "\n");
+            }
             fprintf(stderr, "[timing] batched %8.3f ms/call  n=%ld  = %.2f forwards\n",
                     n_batched ? t_batched_ms / n_batched : 0.0, n_batched,
                     (n_batched && fpc > 0) ? (t_batched_ms / n_batched) / fpc : 0.0);

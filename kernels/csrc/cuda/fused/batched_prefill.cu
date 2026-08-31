@@ -567,7 +567,8 @@ __global__ void pf_gdn_scan_kernel(const __nv_bfloat16* __restrict__ q,
                                    const __nv_bfloat16* __restrict__ a,
                                    float* __restrict__ state,
                                    __nv_bfloat16* __restrict__ out,
-                                   int n_tokens, int q_heads, int v_heads, bool qh_block) {
+                                   int n_tokens, int q_heads, int v_heads, bool qh_block,
+                                   bool state_bf16) {
     constexpr int NROW = HEAD_DIM / 32;
     const int vh   = blockIdx.x;
     const int j    = blockIdx.y * COLS + (threadIdx.x >> 5);
@@ -602,7 +603,8 @@ __global__ void pf_gdn_scan_kernel(const __nv_bfloat16* __restrict__ q,
         #pragma unroll
         for (int r = 0; r < NROW; r++) {
             const int i = lane + r * 32;
-            const float s_new = sloc[r] * g + pf_to_f(kp[i]) * delta;
+            float s_new = sloc[r] * g + pf_to_f(kp[i]) * delta;
+            if (state_bf16) s_new = pf_to_f(__float2bfloat16(s_new));
             sloc[r] = s_new;
             part_y += s_new * pf_to_f(qp[i]) * scale;
         }
@@ -624,7 +626,7 @@ __global__ void df_gdn_scan_checkpoint_kernel(
     const __nv_bfloat16* __restrict__ beta, const __nv_bfloat16* __restrict__ dt,
     const __nv_bfloat16* __restrict__ a, const float* __restrict__ live_state,
     __nv_bfloat16* __restrict__ out, float* __restrict__ checkpoints,
-    int n_tokens, int q_heads, int v_heads, bool qh_block) {
+    int n_tokens, int q_heads, int v_heads, bool qh_block, bool state_bf16) {
     constexpr int NROW = HEAD_DIM / 32;
     const int vh = blockIdx.x;
     const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
@@ -661,7 +663,8 @@ __global__ void df_gdn_scan_checkpoint_kernel(
         #pragma unroll
         for (int r = 0; r < NROW; r++) {
             const int i = lane + r * 32;
-            const float s_new = sloc[r] * g + pf_to_f(kp[i]) * delta;
+            float s_new = sloc[r] * g + pf_to_f(kp[i]) * delta;
+            if (state_bf16) s_new = pf_to_f(__float2bfloat16(s_new));
             sloc[r] = s_new;
             part_y += s_new * pf_to_f(qp[i]) * scale;
             if constexpr (WRITE_CHECKPOINT)
@@ -682,7 +685,8 @@ __global__ void df_gdn_scan_commit_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const __nv_bfloat16* __restrict__ alpha, const __nv_bfloat16* __restrict__ beta,
     const __nv_bfloat16* __restrict__ dt, const __nv_bfloat16* __restrict__ a,
-    float* __restrict__ live_state, int n_tokens, int q_heads, int v_heads, bool qh_block) {
+    float* __restrict__ live_state, int n_tokens, int q_heads, int v_heads, bool qh_block,
+    bool state_bf16) {
     constexpr int NROW = HEAD_DIM / 32;
     const int vh = blockIdx.x;
     const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
@@ -714,7 +718,8 @@ __global__ void df_gdn_scan_commit_kernel(
         #pragma unroll
         for (int r = 0; r < NROW; r++) {
             const int i = lane + r * 32;
-            sloc[r] = sloc[r] * g + pf_to_f(kp[i]) * delta;
+            float s_new = sloc[r] * g + pf_to_f(kp[i]) * delta;
+            sloc[r] = state_bf16 ? pf_to_f(__float2bfloat16(s_new)) : s_new;
         }
     }
     #pragma unroll
@@ -1410,6 +1415,10 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              const void* alpha, const void* beta, const void* dt, const void* a,
                              float* state, void* out, int n_tokens, int q_heads, int v_heads,
                              int head_dim, bool qh_block, cudaStream_t stream) {
+    static const bool state_bf16 = [] {
+        const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
+        return e && e[0] == '1';
+    }();
     // Chunk-parallel (WY/UT transform) scan: shortens the serial chain N -> N/C. Falls through to
     // the sequential scan below when disabled (SPARKINFER_PREFILL_GDN_CHUNK=0) or shape-unsupported.
     if (launch_prefill_gdn_chunk(q, k, v, alpha, beta, dt, a, state, out,
@@ -1426,7 +1435,8 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
     auto ob = reinterpret_cast<__nv_bfloat16*>(out);
     if (head_dim == 128)
         pf_gdn_scan_kernel<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
-            qb, kb, vb, ab, bb, db, aa, state, ob, n_tokens, q_heads, v_heads, qh_block);
+            qb, kb, vb, ab, bb, db, aa, state, ob, n_tokens, q_heads, v_heads, qh_block,
+            state_bf16);
 }
 
 // SPARKINFER_GDN_CONV_PAR=0 keeps the serial-over-tokens kernel, for an A/B out of one binary.
@@ -1467,12 +1477,15 @@ void launch_dflash_gdn_scan(const void* q, const void* k, const void* v,
     if (n_tokens <= 0 || head_dim != 128) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
+    static const bool state_bf16 = [] { const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
+                                        return e && e[0] == '1'; }();
     df_gdn_scan_checkpoint_kernel<COLS, 128, true><<<grid, COLS * 32, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
         reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(alpha),
         reinterpret_cast<const __nv_bfloat16*>(beta), reinterpret_cast<const __nv_bfloat16*>(dt),
         reinterpret_cast<const __nv_bfloat16*>(a), live_state,
-        reinterpret_cast<__nv_bfloat16*>(out), checkpoints, n_tokens, q_heads, v_heads, qh_block);
+        reinterpret_cast<__nv_bfloat16*>(out), checkpoints, n_tokens, q_heads, v_heads, qh_block,
+        state_bf16);
 }
 
 void launch_dflash_gdn_conv_compact(const void* qkv, const void* conv_w,
@@ -1504,12 +1517,15 @@ void launch_dflash_gdn_scan_compact(const void* q, const void* k, const void* v,
     if (n_tokens <= 0 || head_dim != 128) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
+    static const bool state_bf16 = [] { const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
+                                        return e && e[0] == '1'; }();
     df_gdn_scan_checkpoint_kernel<COLS, 128, false><<<grid, COLS * 32, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
         reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(alpha),
         reinterpret_cast<const __nv_bfloat16*>(beta), reinterpret_cast<const __nv_bfloat16*>(dt),
         reinterpret_cast<const __nv_bfloat16*>(a), live_state,
-        reinterpret_cast<__nv_bfloat16*>(out), nullptr, n_tokens, q_heads, v_heads, qh_block);
+        reinterpret_cast<__nv_bfloat16*>(out), nullptr, n_tokens, q_heads, v_heads, qh_block,
+        state_bf16);
 }
 
 void launch_dflash_gdn_conv_commit(const void* qkv, void* live_state, int n_tokens,
@@ -1531,11 +1547,13 @@ void launch_dflash_gdn_scan_commit(const void* k, const void* v,
     if (n_tokens <= 0 || head_dim != 128) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
+    static const bool state_bf16 = [] { const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
+                                        return e && e[0] == '1'; }();
     df_gdn_scan_commit_kernel<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(k), reinterpret_cast<const __nv_bfloat16*>(v),
         reinterpret_cast<const __nv_bfloat16*>(alpha), reinterpret_cast<const __nv_bfloat16*>(beta),
         reinterpret_cast<const __nv_bfloat16*>(dt), reinterpret_cast<const __nv_bfloat16*>(a),
-        live_state, n_tokens, q_heads, v_heads, qh_block);
+        live_state, n_tokens, q_heads, v_heads, qh_block, state_bf16);
 }
 
 void launch_prefill_gated_norm(const void* x, const void* z, const void* weight, void* out,
@@ -1607,18 +1625,20 @@ void launch_prefill_attn_int8_paged(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream) {
     // int8 tensor-core prefill attention: same mask + online softmax as the scalar path below,
     // run on the wmma int8 cores (the scalar kernels are compute-bound at ~8 TFLOP/s). Honours the
-    // same SPARKINFER_PREFILL_ATTN_WINDOW selection. SPARKINFER_PREFILL_ATTN_MMA=0 falls through.
+    // caller's per-layer window (zero means global/full). SPARKINFER_PREFILL_ATTN_MMA=0 falls through.
     if (launch_prefill_attn_mma(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
-            n_tokens, n_q_heads, n_kv_heads, head_dim, block_size, max_blocks_per_seq, scale, stream))
+            n_tokens, n_q_heads, n_kv_heads, head_dim, block_size, max_blocks_per_seq, scale,
+            win_blocks, stream))
         return;
     // Sink + sliding-window sparse prefill attention (StreamingLLM, matches the merged decode
-    // sparse-KV #379): O(N*window) instead of O(N^2) at long context. Default on; returns false
-    // (SPARKINFER_PREFILL_ATTN_WINDOW=0, or head_dim != 256) to fall through to full attention.
+    // sparse-KV #379): O(N*window) instead of O(N^2) at long context. Returns false when the
+    // caller requests full attention and the tiled full kernel is disabled, or for unsupported HD.
     if (launch_prefill_attn_windowed(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
-            n_tokens, n_q_heads, n_kv_heads, head_dim, block_size, max_blocks_per_seq, scale, stream))
+            n_tokens, n_q_heads, n_kv_heads, head_dim, block_size, max_blocks_per_seq, scale,
+            win_blocks, stream))
         return;
     dim3 grid(n_tokens, n_q_heads);   // token on grid.x
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);

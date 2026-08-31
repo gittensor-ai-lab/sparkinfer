@@ -1852,7 +1852,7 @@ __global__ void k_gdn_scan_commit_layers(
     const bf16* __restrict__ beta_base,
     const GdnCommitLayer* __restrict__ layers,
     float* __restrict__ live_base, size_t live_stride,
-    int n_tokens, int q_heads, int v_heads, bool qh_block) {
+    int n_tokens, int q_heads, int v_heads, bool qh_block, bool state_bf16) {
     constexpr int NROW = HEAD_DIM / 32;
     const int li = blockIdx.z;
     const int vh = blockIdx.x;
@@ -1898,7 +1898,8 @@ __global__ void k_gdn_scan_commit_layers(
         #pragma unroll
         for (int r = 0; r < NROW; r++) {
             const int i = lane + r * 32;
-            sloc[r] = sloc[r] * g + b2f(kp[i]) * delta;
+            float s_new = sloc[r] * g + b2f(kp[i]) * delta;
+            sloc[r] = state_bf16 ? b2f(__float2bfloat16(s_new)) : s_new;
         }
     }
     #pragma unroll
@@ -1930,11 +1931,13 @@ void launch_gdn_scan_commit_layers(const void* k_base, size_t k_layer_stride,
                                    int head_dim, bool qh_block, cudaStream_t stream) {
     if (n_tokens <= 0 || head_dim != 128 || n_layers <= 0) return;
     constexpr int COLS = 4;
+    static const bool state_bf16 = [] { const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
+                                        return e && e[0] == '1'; }();
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS, n_layers);
     k_gdn_scan_commit_layers<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
         (const bf16*)k_base, k_layer_stride, (const bf16*)v_base, v_layer_stride,
         (const bf16*)alpha_base, ab_layer_stride, (const bf16*)beta_base, layers,
-        live_base, live_layer_stride, n_tokens, q_heads, v_heads, qh_block);
+        live_base, live_layer_stride, n_tokens, q_heads, v_heads, qh_block, state_bf16);
 }
 
 namespace {

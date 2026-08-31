@@ -247,6 +247,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     static cudaGraphExec_t g_pfb_exec  = nullptr;
     static int  g_pfb_n = -1, g_pfb_warm_n = -1, g_pfb_pin_cap = 0;
     static int* g_pfb_pin = nullptr;
+    static const void* g_pfb_model_key = nullptr;
+    static const void* g_pfb_lin_key = nullptr;
+    static const void* g_pfb_conv_key = nullptr;
+    static const void* g_pfb_btable_key = nullptr;
     // DEFAULT ON: measured +5.91% on Muse prefill@128, byte-identical output (SCORE_EQ IDENTICAL,
     // TOP1 16/16). Qwen3.8-27B is the same dense-hybrid launch storm (~20 kernels/layer × 64)
     // and the same warm-arena capture is legal there — MoE stays off (host tilemaps / events).
@@ -259,6 +263,23 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // a whole-prefill graph whose memcpy nodes captured a previous session's destination.
     const bool capture_dflash = s.capture_dst && s.capture_layers && s.n_capture > 0;
     const bool graph_on = graph_env && arena_reuse && c.dense_ffn && !capture_dflash;
+    const void* const pfb_btable = s.kv->block_table(s.seq_id);
+    // A whole-prefill graph embeds every pointer passed to its kernel nodes. The arena addresses
+    // are deliberately stable, but recurrent state and the paged-KV block table are session-owned:
+    // close_session() frees the former and a later same-length request may occupy another table
+    // slot. Keying replay on N alone therefore wrote GDN conv state through a dangling pointer
+    // (compute-sanitizer: 2176 invalid writes at ctx=512) and silently corrupted longer runs.
+    // Model identity matters too because these statics are thread-local to this translation unit,
+    // not to one Qwen35Model instance.
+    const bool graph_keys_match = g_pfb_model_key == s.w.lm_head &&
+                                  g_pfb_lin_key == s.lin_state &&
+                                  g_pfb_conv_key == s.lin_conv_state &&
+                                  g_pfb_btable_key == pfb_btable;
+    if (g_pfb_exec && !graph_keys_match) {
+        cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr;
+        if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
+        g_pfb_n = -1;
+    }
     if (graph_on && N > g_pfb_pin_cap) {
         if (g_pfb_pin) cudaFreeHost(g_pfb_pin);
         g_pfb_pin = nullptr; g_pfb_pin_cap = 0;
@@ -1468,8 +1489,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
                         kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
                         rope_dim, rope_theta, eps, bs, mbs, st);
+                    // Qwen3.8 interleaves SWA and global-attention layers. The old int8 launcher
+                    // read one process-wide 4096-token window for every layer, silently truncating
+                    // the global layers at long context. Pass the layer contract explicitly, as
+                    // the BF16/Muse path above already does: zero means full causal attention.
+                    const int win_blocks = w.swa ? (c.sliding_window + bs - 1) / bs : 0;
                     kernels::launch_prefill_attn_int8_paged(qb, kpool, vpool, kscale, vscale, btable, att,
-                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
+                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks, st);
                 }
             }
             // Muse: the gated attention output feeds exactly one consumer -- the o projection's
@@ -2370,6 +2396,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             if (cudaGraphInstantiate(&e, g, nullptr, nullptr, 0) == cudaSuccess) {
                 if (g_pfb_graph) cudaGraphDestroy(g_pfb_graph);
                 g_pfb_graph = g; g_pfb_exec = e; g_pfb_n = N;
+                g_pfb_model_key = s.w.lm_head;
+                g_pfb_lin_key = s.lin_state;
+                g_pfb_conv_key = s.lin_conv_state;
+                g_pfb_btable_key = pfb_btable;
                 pf_cu(cudaGraphLaunch(e, st), "pfb first launch");
             } else {
                 // Nothing ran (capture records, it does not execute) and there is no graph to run
@@ -3121,6 +3151,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
                     bs, mbs, st);
             }
+            // Match the autoregressive decode path exactly. Its fused int8 attention gate is
+            // enabled only for the 2048/4096-wide layouts; Qwen3.8 (H=5120) applies sigmoid(g)
+            // in a separate kernel. Using the fused accumulation here changed verifier logits
+            // after the first speculative token even though both paths consumed the same KV.
+            const bool int8_gate_fused = kv8 && (H == 2048 || H == 4096);
             kernels::launch_flash_decode_split(
                 qb, kp, vp, btab_rows ? btab_rows : btable, seq, att,
                 fa_m, fa_l, fa_acc,
@@ -3136,11 +3171,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // drifts from AR at long context (#712). start_pos + N is the largest row
                 // length in this batch, matching what AR would report at the last row.
                 1.f / sqrtf((float)c.head_dim), st, nullptr, start_pos + N,
-                ks, vs, kv8 ? 1 : 0, kv8 ? qg : nullptr);
+                ks, vs, kv8 ? 1 : 0, int8_gate_fused ? qg : nullptr);
             // att/qg rows are contiguous at stride qdim, and the gate is elementwise, so one
             // launch covers the whole block. N separate nodes cost N times the graph-node
             // dependency latency for the same work.
-            if (!kv8) {
+            if (!int8_gate_fused) {
                 kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
             }
             supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
@@ -3596,7 +3631,17 @@ verify_forward_done:
                 c.gdn_qh_block, st);
         }
     }
-    pf_cu(cudaStreamSynchronize(st), "verify commit");
+    // The next draft block consumes only the captured target hidden rows and the draft model's
+    // own state. It does not read the target GDN state updated above. Leaving the commit queued on
+    // the target stream lets it overlap that draft work; the next compact verify is submitted to
+    // this same stream, so CUDA stream ordering still guarantees the commit has completed before
+    // target state is read again. Keep the synchronous path as the default until the overlap has
+    // passed the long-context reproducibility matrix.
+    static const bool async_commit = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_ASYNC_COMMIT");
+        return e && e[0] == '1';
+    }();
+    if (!async_commit) pf_cu(cudaStreamSynchronize(st), "verify commit");
     return keep;
 }
 

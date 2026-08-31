@@ -611,7 +611,7 @@ bool launch_prefill_attn_mma(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream) {
     constexpr int HD = 256, GROUP_BLKS = 8, BM = 16;
 
     static const int enabled = [] {
@@ -621,10 +621,6 @@ bool launch_prefill_attn_mma(
     static const int minctx = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_MMA_MINCTX");
         return e ? atoi(e) : 0;
-    }();
-    static const int win_blocks = [] {
-        const char* e = getenv("SPARKINFER_PREFILL_ATTN_WINDOW");
-        return e ? atoi(e) : 256;
     }();
     // GQA fusion: one block owns RQH q-heads sharing a kv-head, so each K page / V tile
     // is loaded once and fed RQH mma's instead of being re-read per q-head. RQH=1 disables.

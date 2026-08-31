@@ -13,6 +13,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#ifdef SPARKINFER_DIRECT_NVFP4_IMPL
+#include <cutlass/float_subbyte.h>
+#include <cute/arch/mma_sm120.hpp>
+#endif
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/qtype.h"
 #endif
@@ -24,6 +28,133 @@ namespace sparkinfer {
 namespace kernels {
 
 static constexpr int GEMV_WPB = 8;   // warps (output rows) per block
+
+#ifdef SPARKINFER_DIRECT_NVFP4_IMPL
+namespace {
+using NvE2M1 = cutlass::float_e2m1_t;
+using NvUE4M3 = cutlass::float_ue4m3_t;
+
+__global__ void nvfp4_mma_quant_x_kernel(const __nv_bfloat16* __restrict__ x,
+                                         unsigned char* __restrict__ q,
+                                         unsigned char* __restrict__ sf,
+                                         int M, int K) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    const int groups = M * (K >> 4);
+    if (g >= groups) return;
+    const int row = g / (K >> 4), k0 = (g - row * (K >> 4)) * 16;
+    float v[16], a = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        v[i] = __bfloat162float(x[(size_t)row * K + k0 + i]);
+        a = fmaxf(a, fabsf(v[i]));
+    }
+    NvUE4M3 s(fmaxf(a * (1.f / 6.f), 0x1p-9f));
+    unsigned char packed[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        NvE2M1 q0(v[2 * i] / float(s)), q1(v[2 * i + 1] / float(s));
+        packed[i] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
+    }
+    *reinterpret_cast<ulonglong1*>(q + ((size_t)row * K + k0) / 2) =
+        *reinterpret_cast<const ulonglong1*>(packed);
+    sf[(size_t)row * (K >> 4) + (k0 >> 4)] = s.raw();
+}
+
+__device__ __forceinline__ unsigned nvfp4_nibble(const unsigned char* p, size_t i) {
+    const unsigned char b = p[i >> 1];
+    return (i & 1) ? (unsigned)(b >> 4) : (unsigned)(b & 15u);
+}
+
+__global__ void nvfp4_mma_rows_kernel(const unsigned char* __restrict__ aq,
+                                      const unsigned char* __restrict__ as,
+                                      const void* __restrict__ payload,
+                                      __nv_bfloat16* __restrict__ y,
+                                      int M, int N, int K) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    using Atom = cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<
+        NvE2M1, NvE2M1, float, NvUE4M3, 16>;
+    const int lane = threadIdx.x & 31;
+    const int nbase = blockIdx.x * 8;
+    const int lt0 = lane & 3, lt1 = lane >> 2;
+    const unsigned char* hdr = reinterpret_cast<const unsigned char*>(payload);
+    const float alpha = 1.f / *reinterpret_cast<const float*>(hdr);
+    const unsigned char* bs = hdr + 256;
+    const unsigned char* bq = bs + (size_t)N * (K >> 4);
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        unsigned ar[4] = {0,0,0,0}, br[2] = {0,0};
+#pragma unroll
+        for (int vi = 0; vi < 32; ++vi) {
+            const int v0 = vi & 7, v1 = (vi >> 3) & 1, v2 = vi >> 4;
+            const int m = lt1 + v1 * 8;
+            const int k = k0 + lt0 * 8 + v0 + v2 * 32;
+            const unsigned nib = m < M ? nvfp4_nibble(aq, (size_t)m * K + k) : 0u;
+            ar[vi >> 3] |= nib << (4 * (vi & 7));
+        }
+#pragma unroll
+        for (int vi = 0; vi < 16; ++vi) {
+            const int v0 = vi & 7, v1 = vi >> 3;
+            const int n = nbase + lt1;
+            const int k = k0 + lt0 * 8 + v0 + v1 * 32;
+            const unsigned nib = n < N ? nvfp4_nibble(bq, (size_t)n * K + k) : 0u;
+            br[vi >> 3] |= nib << (4 * (vi & 7));
+        }
+        const int sm = (lane & 1) * 8 + (lane >> 2);
+        const int sn = nbase + (lane >> 2);
+        unsigned sfa = 0, sfb = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned av = sm < M ? as[(size_t)sm * (K >> 4) + (k0 >> 4) + j] : 0u;
+            const unsigned bv = sn < N ? bs[(size_t)sn * (K >> 4) + (k0 >> 4) + j] : 0u;
+            sfa |= av << (8 * j); sfb |= bv << (8 * j);
+        }
+        float o0, o1, o2, o3;
+        Atom::fma(o0,o1,o2,o3, ar[0],ar[1],ar[2],ar[3], br[0],br[1],
+                  d0,d1,d2,d3, sfa,sfb);
+        d0=o0; d1=o1; d2=o2; d3=o3;
+    }
+    const int n = nbase + lt1;
+    const int m0 = lt0 * 4;
+    if (n < N) {
+        if (m0 + 0 < M) y[(size_t)(m0 + 0) * N + n] = __float2bfloat16(d0 * alpha);
+        if (m0 + 2 < M) y[(size_t)(m0 + 2) * N + n] = __float2bfloat16(d1 * alpha);
+        if (m0 + 1 < M) y[(size_t)(m0 + 1) * N + n] = __float2bfloat16(d2 * alpha);
+        if (m0 + 3 < M) y[(size_t)(m0 + 3) * N + n] = __float2bfloat16(d3 * alpha);
+    }
+#endif
+}
+} // namespace
+
+size_t nvfp4_mma_data_bytes(int M, int K) { return ((size_t)M * K + 1) / 2; }
+size_t nvfp4_mma_scale_bytes(int M, int K) { return (size_t)M * (K >> 4); }
+bool launch_nvfp4_mma_quant_x(const void* x, void* q, void* sf, int M, int K,
+                              cudaStream_t stream) {
+    if (!x || !q || !sf || M < 1 || M > 8 || (K & 63)) return false;
+    int dev=0, major=0, minor=0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
+        major != 12 || minor != 0) return false;
+    const int groups = M * (K >> 4), threads = 256;
+    nvfp4_mma_quant_x_kernel<<<(groups + threads - 1) / threads, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<unsigned char*>(q),
+        reinterpret_cast<unsigned char*>(sf), M, K);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+bool launch_nvfp4_mma_rows(const void* q, const void* sf, const void* W, void* y,
+                           int M, int N, int K, cudaStream_t stream) {
+    if (!q || !sf || !W || !y || M < 1 || M > 8 || (N & 7) || (K & 63)) return false;
+    int dev=0, major=0, minor=0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
+        major != 12 || minor != 0) return false;
+    nvfp4_mma_rows_kernel<<<N / 8, 32, 0, stream>>>(
+        reinterpret_cast<const unsigned char*>(q), reinterpret_cast<const unsigned char*>(sf), W,
+        reinterpret_cast<__nv_bfloat16*>(y), M, N, K);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+#endif
 
 __device__ __forceinline__ void gemv_write(float* p, float v) { *p = v; }
 __device__ __forceinline__ void gemv_write(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
@@ -1054,7 +1185,7 @@ __global__ void gemv_nvfp4_rows_dp4a_kernel(const signed char* __restrict__ xq,
         // two is what ships. R=1 also stays on the plain single-group loop -- a trip there is
         // already small enough that a second group only costs occupancy (32.58 -> 34.44), and it
         // leaves AR decode byte-for-byte unchanged.
-        constexpr int GPT = (R >= 2) ? 2 : 1;
+        constexpr int GPT = (R >= 4 && R <= 6) ? 1 : ((R >= 2) ? 2 : 1);
         if (GPT > 1) {
             for (; g + (GPT - 1) * gstride < ng; g += GPT * gstride) {
                 uint4 xg[GPT][R];
@@ -3036,6 +3167,145 @@ __global__ void gemv_nvfp4_rows_dp4a2_kernel(const signed char* __restrict__ xq,
     }
 }
 
+// Pairwise gate/up ownership: one warp-group computes the SAME output row from both matrices.
+// The existing paired launcher only concatenates two grids, so each matrix reloads the R x K
+// activation block independently. Here both weight streams consume one activation load. NR=1 per
+// matrix keeps the accumulator/register footprint comparable to the old NR=2 single-matrix CTA,
+// and the block count is identical: N/RPB versus 2*N/(RPB*2).
+template <typename OutT, int S, int R, int NR>
+__global__ void gemv_nvfp4_rows_dp4a_pairwise_kernel(
+    const signed char* __restrict__ xq, const float* __restrict__ xs,
+    const void* __restrict__ packed0, const void* __restrict__ packed1,
+    OutT* __restrict__ y0, OutT* __restrict__ y1, int N, int K) {
+    constexpr int PAIR_WPB = (S == 8) ? 8 : 4;
+    constexpr int RPB = PAIR_WPB / S;
+    __shared__ float s_part[RPB][S][2][NR][R];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n0 = blockIdx.x * (RPB * NR) + row_local * NR;
+    float acc[2][NR][R];
+#pragma unroll
+    for (int b = 0; b < 2; ++b)
+#pragma unroll
+        for (int j = 0; j < NR; ++j)
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[b][j][r] = 0.f;
+    if (n0 < N) {
+        const unsigned char* p[2] = {
+            reinterpret_cast<const unsigned char*>(packed0),
+            reinterpret_cast<const unsigned char*>(packed1)};
+        const float inv_g[2] = {
+            1.f / *reinterpret_cast<const float*>(p[0]),
+            1.f / *reinterpret_cast<const float*>(p[1])};
+        const unsigned char* sf[2] = {p[0] + SI_NVFP4_HDR, p[1] + SI_NVFP4_HDR};
+        const unsigned char* w[2] = {
+            sf[0] + (size_t)N * (K >> 4), sf[1] + (size_t)N * (K >> 4)};
+        const int ng = K >> 4, gstride = S * 32;
+        int g = split * 32 + lane;
+        constexpr int GPT = (R >= 2) ? 2 : 1;
+        for (; g + (GPT - 1) * gstride < ng; g += GPT * gstride) {
+            uint4 xg[GPT][R];
+            float sx[GPT][R];
+#pragma unroll
+            for (int u = 0; u < GPT; ++u) {
+                const int gu = g + u * gstride;
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    xg[u][r] = *reinterpret_cast<const uint4*>(
+                        xq + (size_t)r * K + (size_t)gu * 16);
+                    sx[u][r] = xs[(size_t)r * ng + gu];
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                for (int j = 0; j < NR; ++j) {
+                    const int n = n0 + j;
+                    if (n >= N) break;
+                    const unsigned char* srow = sf[b] + (size_t)n * ng;
+                    const unsigned char* prow = w[b] + (size_t)n * (K >> 1);
+#pragma unroll
+                    for (int u = 0; u < GPT; ++u) {
+                        const int gu = g + u * gstride;
+                        const uint2 pw = __ldcs(reinterpret_cast<const uint2*>(prow + (size_t)gu * 8));
+                        unsigned q0, q1, q2, q3;
+                        si_nvfp4_i8x8(pw.x, q0, q1); si_nvfp4_i8x8(pw.y, q2, q3);
+                        const float sw = si_ue4m3(__ldcs(srow + gu)) * inv_g[b] * 0.5f;
+#pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            int ia = 0;
+                            ia = __dp4a((int)q0, (int)xg[u][r].x, ia);
+                            ia = __dp4a((int)q1, (int)xg[u][r].y, ia);
+                            ia = __dp4a((int)q2, (int)xg[u][r].z, ia);
+                            ia = __dp4a((int)q3, (int)xg[u][r].w, ia);
+                            acc[b][j][r] += (sw * sx[u][r]) * (float)ia;
+                        }
+                    }
+                }
+            }
+        }
+        for (; g < ng; g += gstride) {
+            uint4 xv[R]; float sx[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                xv[r] = *reinterpret_cast<const uint4*>(xq + (size_t)r*K + (size_t)g*16);
+                sx[r] = xs[(size_t)r*ng + g];
+            }
+#pragma unroll
+            for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                for (int j=0;j<NR;++j) {
+                    const int n=n0+j; if (n>=N) break;
+                    const unsigned char* srow=sf[b]+(size_t)n*ng;
+                    const unsigned char* prow=w[b]+(size_t)n*(K>>1);
+                    const uint2 pw=__ldcs(reinterpret_cast<const uint2*>(prow+(size_t)g*8));
+                    unsigned q0,q1,q2,q3; si_nvfp4_i8x8(pw.x,q0,q1); si_nvfp4_i8x8(pw.y,q2,q3);
+                    const float sw=si_ue4m3(__ldcs(srow+g))*inv_g[b]*0.5f;
+#pragma unroll
+                    for (int r=0;r<R;++r) {
+                        int ia=0;
+                        ia=__dp4a((int)q0,(int)xv[r].x,ia); ia=__dp4a((int)q1,(int)xv[r].y,ia);
+                        ia=__dp4a((int)q2,(int)xv[r].z,ia); ia=__dp4a((int)q3,(int)xv[r].w,ia);
+                        acc[b][j][r]+=(sw*sx[r])*(float)ia;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int b=0;b<2;++b)
+#pragma unroll
+            for (int j=0;j<NR;++j)
+#pragma unroll
+                for (int r=0;r<R;++r)
+#pragma unroll
+                    for (int m=16;m>0;m>>=1) acc[b][j][r]+=__shfl_xor_sync(0xffffffff,acc[b][j][r],m);
+        if (lane == 0)
+#pragma unroll
+            for (int b=0;b<2;++b)
+#pragma unroll
+                for (int j=0;j<NR;++j)
+#pragma unroll
+                    for (int r=0;r<R;++r) s_part[row_local][split][b][j][r]=acc[b][j][r];
+    }
+    __syncthreads();
+    if (n0 < N && split == 0 && lane == 0) {
+        OutT* yy[2] = {y0,y1};
+#pragma unroll
+        for (int b=0;b<2;++b)
+#pragma unroll
+            for (int j=0;j<NR;++j) {
+                const int n=n0+j; if (n>=N) break;
+#pragma unroll
+                for (int r=0;r<R;++r) {
+                    float o=s_part[row_local][0][b][j][r];
+#pragma unroll
+                    for (int t=1;t<S;++t) o+=s_part[row_local][t][b][j][r];
+                    gemv_write(yy[b]+(size_t)r*N+n,o);
+                }
+            }
+    }
+}
+
 // Paired form of launch_gemv_nvfp4_rows_dp4a: same activation, two same-shaped weight matrices.
 // Declines (returning false, so the caller issues the two singles) whenever a CTA could straddle
 // the matrix boundary, which is the only thing that would change a row's arithmetic.
@@ -3054,6 +3324,33 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
     const auto* sp = reinterpret_cast<const float*>(xs);
     auto* yp0 = reinterpret_cast<__nv_bfloat16*>(y0);
     auto* yp1 = reinterpret_cast<__nv_bfloat16*>(y1);
+    static const bool pairwise = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_PAIRWISE");
+                                     return e && e[0] == '1'; }();
+#define SI_NVFP4_PAIRWISE(S_, R_) do {                                                        \
+        constexpr int S=(S_), R=(R_), NR=1, PAIR_WPB=(S==8)?8:4, RPB=PAIR_WPB/S;              \
+        gemv_nvfp4_rows_dp4a_pairwise_kernel<__nv_bfloat16,S,R,NR>                             \
+            <<<(N+RPB*NR-1)/(RPB*NR),PAIR_WPB*32,0,stream>>>(xp,sp,W0,W1,yp0,yp1,N,K);         \
+    } while (0)
+    if (pairwise && M >= 2) {
+        if (N >= 4096) {
+            switch (M) {
+                case 2: SI_NVFP4_PAIRWISE(2,2); break; case 3: SI_NVFP4_PAIRWISE(2,3); break;
+                case 4: SI_NVFP4_PAIRWISE(2,4); break; case 5: SI_NVFP4_PAIRWISE(2,5); break;
+                case 6: SI_NVFP4_PAIRWISE(2,6); break; case 7: SI_NVFP4_PAIRWISE(2,7); break;
+                default: SI_NVFP4_PAIRWISE(2,8); break;
+            }
+        } else {
+            switch (M) {
+                case 2: SI_NVFP4_PAIRWISE(8,2); break; case 3: SI_NVFP4_PAIRWISE(8,3); break;
+                case 4: SI_NVFP4_PAIRWISE(8,4); break; case 5: SI_NVFP4_PAIRWISE(8,5); break;
+                case 6: SI_NVFP4_PAIRWISE(8,6); break; case 7: SI_NVFP4_PAIRWISE(8,7); break;
+                default: SI_NVFP4_PAIRWISE(8,8); break;
+            }
+        }
+#undef SI_NVFP4_PAIRWISE
+        return cudaPeekAtLastError() == cudaSuccess;
+    }
+#undef SI_NVFP4_PAIRWISE
 #define SI_NVFP4_DP4A2(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
         const int nr = nr_mode ? nr_mode : (R == 1 ? 1 : 2); \
@@ -3109,20 +3406,29 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
     static const int nr_mode = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
                                    int v = e ? atoi(e) : 0;
                                    return (v == 1 || v == 2) ? v : 0; }();
+    static const bool down_nr4 = []{ const char* e = getenv("SPARKINFER_NVFP4_DOWN_NR4");
+                                     return e && e[0] == '1'; }();
 #define SI_NVFP4_DP4A(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
-        const int nr = nr_mode ? nr_mode : (R == 1 ? 1 : 2); \
+        const int nr = (down_nr4 && K > N && R >= 2 && R <= 6) ? 4 \
+                     : (nr_mode ? nr_mode : (R == 1 ? 1 : 2)); \
         if (nr == 1) { \
             const dim3 grid((N + RPB - 1) / RPB); \
             gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
-        } else { \
+        } else if (nr == 2) { \
             const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
             gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
+        } else { \
+            const dim3 grid((N + RPB * 4 - 1) / (RPB * 4)); \
+            gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 4><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp,W, yp, N, K); \
         } \
     } while (0)
 #define SI_NVFP4_DP4A_S(R_) do { \
-        /* Keep 5120-wide target projections on the verifier-calibrated two-way split. */ \
-        if (N >= 4096)      SI_NVFP4_DP4A(2, R_); \
+        /* Keep one reduction association across every verifier width. Width-dependent S=1 at */ \
+        /* R=8 was faster, but diverged from the S=2 AR reference on 4K math at token 82. */ \
+        if (N >= 4096) { \
+            SI_NVFP4_DP4A(2, R_); \
+        } \
         else                SI_NVFP4_DP4A(8, R_); \
     } while (0)
     switch (M) {

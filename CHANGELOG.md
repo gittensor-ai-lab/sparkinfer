@@ -16,6 +16,30 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 - Clarified that `SPARKINFER_MAX_QUEUE_DEPTH=0` is unlimited admission and that deployments which
   require immediate overload rejection must configure a finite cap.
 
+## [0.5.3] — 2026-08-31
+
+SparkInfer's Qwen3.8-27B + DSpark path is faster than the pinned SGLang comparison in every
+workload of the matched **4K-context, 128-generated-token** matrix on one RTX 5090. This is a
+4K result; it does not claim the same ordering at 16K or 32K.
+
+RTX 5090 · target `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` · draft
+`RadixArk/Qwen3.8-27B-DSpark` · greedy batch size 1 · fixed 128-token output · exact output match
+against SparkInfer AR.
+
+| workload | SparkInfer | pinned SGLang | SparkInfer delta |
+|---|---:|---:|---:|
+| chat | **167.92 tok/s** | 114.56 tok/s | **+46.6%** |
+| code | **171.89 tok/s** | 170.32 tok/s | **+0.9%** |
+| math | **249.08 tok/s** | 225.09 tok/s | **+10.7%** |
+| JSON | **202.88 tok/s** | 202.33 tok/s | **+0.3%** |
+| repetition | **406.85 tok/s** | 398.61 tok/s | **+2.1%** |
+| counting | **406.00 tok/s** | 376.90 tok/s | **+7.7%** |
+
+The release improves row-batched NVFP4 projection kernels, prefill dispatch and DSpark verifier
+planning. Deep-confidence streams retain full-width verification, while less predictable streams
+avoid verifier rows whose cost would exceed their expected accepted-token value. Speculation
+remains lossless: draft tokens are emitted only after exact target verification.
+
 ## [0.4.5] — 2026-08-10
 
 sparkinfer's **plain autoregressive decode is ~2× llama.cpp** on Qwen3.6-35B-A3B — flat across
