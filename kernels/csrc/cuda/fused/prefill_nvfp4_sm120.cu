@@ -747,7 +747,12 @@ static void ct_dequant_nvfp4_launch(const void* packed_u8, const void* group_sca
         const int v = e ? atoi(e) : CT_ALU_INT;
         return (v >= CT_ALU_BASE && v <= CT_ALU_RCP) ? v : CT_ALU_INT;
     }();
-    if (g16 && rows > 0 && cols > 0 && (cols & 15) == 0 &&
+    // The group-wise kernel maps one output row to grid.y. CUDA caps grid.y at 65535 even on
+    // Blackwell; Qwen3.8's ModelOpt lm_head has 248320 rows, so attempting this layout there
+    // fails the launch with cudaErrorInvalidValue and leaves the entire head uninitialized.
+    // The flattened kernel below has the same numerics and uses only grid.x, whose limit easily
+    // covers the head, so route oversized row counts through it.
+    if (g16 && rows > 0 && rows <= 65535 && cols > 0 && (cols & 15) == 0 &&
         ((reinterpret_cast<size_t>(packed_u8) | reinterpret_cast<size_t>(out_bf16)) & 15u) == 0) {
         const int ngroups = cols >> 4;
         const int threads = 256;
