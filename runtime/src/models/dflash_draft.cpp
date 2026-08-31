@@ -679,11 +679,12 @@ const float* DFlashDraftModel::last_logits() const { return p_->logits; }
 // this reason.
 static void compute_yarn_inv_freq(const DFlashDraftConfig& cfg, std::vector<float>& inv_freq,
                                   float& att_scale) {
+    constexpr double kPi = 3.14159265358979323846;
     const int d = cfg.head_dim, half = d / 2;
     const double base = cfg.rope_theta, factor = cfg.yarn_factor;
     const double orig = cfg.yarn_orig_max_pos > 0 ? cfg.yarn_orig_max_pos : 8192.0;
     auto find_dim = [&](double nrot) {
-        return (d * std::log(orig / (nrot * 2.0 * M_PI))) / (2.0 * std::log(base));
+        return (d * std::log(orig / (nrot * 2.0 * kPi))) / (2.0 * std::log(base));
     };
     double low  = std::floor(find_dim(cfg.yarn_beta_fast));
     double high = std::ceil (find_dim(cfg.yarn_beta_slow));
