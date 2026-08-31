@@ -185,7 +185,7 @@ MODELOPT_NEEDS_REBASE = "dspark-needs-rebase"
 # baseline moves by ~72% (dspark@4k 43.06 -> 74.05, ar@4k 47.39 -> 90.19) and every score taken
 # under v1 is incomparable -- bumping the schema forces re-evaluation instead of letting a stale
 # label sit next to a number that no longer means the same thing.
-EVAL_SCHEMA_VERSION = "v5-dspark-decode16k-prefill32k"
+EVAL_SCHEMA_VERSION = "v6-dspark-decode16k-dspark-prefill32k"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-dspark-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -968,25 +968,26 @@ echo "RESULT_MEAN_ACCEPT $(_ds_metric MEAN_ACCEPT)"
 echo "RESULT_LOSSLESS $(_ds_metric LOSSLESS)"
 echo "RESULT_LOSSLESS_RUNS $(_ds_metric LOSSLESS_RUNS)"
 
-# The second scored dimension is production batched prefill at 32k. Measure it separately from
-# dspark_tau_check: that correctness harness pins deterministic prefill kernels, so its TTFT is
-# intentionally not representative of the serving path. qwen3_gguf_bench uses the production
-# defaults and reports the median of five repetitions from one model load.
+# The second scored dimension is DSpark-enabled prefill at 32k: the target prompt pass while
+# hidden-state capture for the draft is active. This is intentionally measured by
+# dspark_tau_check, not qwen3_gguf_bench (which measures ordinary target-only prefill and is about
+# an order of magnitude faster). One generated token is enough to make dflash_generate report its
+# prompt TTFT; prompt_tokens / ttft_s is emitted as METRIC DSPARK_PREFILL_PP by the pinned harness.
 wait_gpu_clear
 PREFILL_OUT=/tmp/dspark_prefill32k.txt
-SPARKINFER_BENCH_SWEEP_CTXS="$PREFILL_CTX" SPARKINFER_BENCH_REPS=5 \
-  timeout 900 build/runtime/qwen3_gguf_bench "$MODEL_DIR" 1 sweep > "$PREFILL_OUT" 2>&1
-PREFILL_PP=$(python3 - "$PREFILL_OUT" "$PREFILL_CTX" <<'PYPF'
-import json, sys
-prefix = "SWEEP_JSON "
-for line in open(sys.argv[1]):
-    if line.startswith(prefix):
-        print(json.loads(line[len(prefix):])[sys.argv[2]]["prefill_pp"])
-        break
-else:
-    print(0)
+PREFILL_IDS=/tmp/dspark_prefill32k_ids.txt
+python3 - "$MODEL_DIR/tokenizer.json" bench/scripts/bench_prompt_32k.txt "$PREFILL_CTX" > "$PREFILL_IDS" <<'PYPF'
+import sys
+from tokenizers import Tokenizer
+want = int(sys.argv[3])
+ids = Tokenizer.from_file(sys.argv[1]).encode(open(sys.argv[2]).read()).ids
+if len(ids) < want:
+    raise SystemExit("PREFILL_PROMPT_TOO_SHORT have=%d want=%d" % (len(ids), want))
+print(" ".join(str(i) for i in ids[:want]))
 PYPF
-)
+timeout 900 build/runtime/dspark_tau_check \
+  "$MODEL_DIR" "$DRAFT_DIR" 1 "@$PREFILL_IDS" > "$PREFILL_OUT" 2>&1
+PREFILL_PP=$(sed -n 's/^METRIC DSPARK_PREFILL_PP //p' "$PREFILL_OUT" | tail -1)
 echo "RESULT_PREFILL_PP ${{PREFILL_PP:-0}}"
 
 # --- FAIL FAST -------------------------------------------------------------------------------

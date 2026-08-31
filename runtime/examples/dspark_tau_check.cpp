@@ -450,9 +450,12 @@ int main(int argc, char** argv) {
     printf("DSPARK ceiling: block_size=%d (MTP's ceiling is 2)\n", dc.block_size);
 
     const double spec_tps = stats.decode_s > 0 ? (double)spec.size() / stats.decode_s : 0.0;
+    const double spec_prefill_pp = stats.ttft_s > 0 ? (double)prompt.size() / stats.ttft_s : 0.0;
     printf("AR     %.2f tok/s  (decode %.3fs, ttft %.3fs)\n", ar_tps, ar_decode_s, ar_ttft_s);
     printf("DSPARK %.2f tok/s  (decode %.3fs)  = %.3fx AR\n",
            spec_tps, stats.decode_s, ar_tps > 0 ? spec_tps / ar_tps : 0.0);
+    printf("DSPARK prefill %.2f prompt tok/s  (ttft %.3fs, n=%zu)\n",
+           spec_prefill_pp, stats.ttft_s, prompt.size());
 
     // Machine-readable tail for the eval bot. LOSSLESS is emitted as 1/0 rather than YES/NO so a
     // parser that silently fails to find it reads as 0 (reject) and not as a pass -- the same
@@ -461,6 +464,7 @@ int main(int argc, char** argv) {
     // it is wrong, so throughput here is only meaningful conditional on this being 1.
     printf("METRIC AR_TPS %.4f\n", ar_tps);
     printf("METRIC DSPARK_TPS %.4f\n", spec_tps);
+    printf("METRIC DSPARK_PREFILL_PP %.4f\n", spec_prefill_pp);
     printf("METRIC MEAN_ACCEPT %.4f\n", stats.mean_accept);
     printf("METRIC LOSSLESS %d\n", lossless ? 1 : 0);
     // How much evidence is behind that 1, so a consumer can tell "verified across N runs" from
