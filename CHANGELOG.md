@@ -23,8 +23,12 @@ workload of the matched **4K-context, 128-generated-token** matrix on one RTX 50
 4K result; it does not claim the same ordering at 16K or 32K.
 
 RTX 5090 · target `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` · draft
-`RadixArk/Qwen3.8-27B-DSpark` · greedy batch size 1 · fixed 128-token output · exact output match
+`gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4` · greedy batch size 1 · fixed 128-token output · exact output match
 against SparkInfer AR.
+
+> **Metadata correction (2026-08-31):** the original release text incorrectly named the
+> upstream RadixArk BF16 draft. The measurements used Gittensor's matching 1.4 GB NVFP4 draft;
+> benchmark numbers and generated outputs are unchanged.
 
 | workload | SparkInfer | pinned SGLang | SparkInfer delta |
 |---|---:|---:|---:|
