@@ -1133,7 +1133,13 @@ bool launch_prefill_attn_mma_bf16_vi8(
     const void* q, const void* k_pool, const signed char* v_i8, const void* v_scale,
     const int* block_table, void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
     int head_dim, int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
-    if (head_dim != 256 || block_size != 16 || n_tokens < 32768 ||
+    // Same threshold, same env var, as the attn_vi8 gate in qwen35_prefill.cpp -- see the comment
+    // there. The two are one decision split across a host allocation and a device launch.
+    static const int vi8_minctx = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_VI8_MINCTX");
+        return e ? atoi(e) : 16384;
+    }();
+    if (head_dim != 256 || block_size != 16 || n_tokens < vi8_minctx ||
         n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 ||
         (n_q_heads / n_kv_heads) % 3 != 0)
         return false;

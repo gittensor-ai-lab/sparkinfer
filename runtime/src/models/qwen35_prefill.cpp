@@ -367,7 +367,34 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     bf16* qg   = lnrm;                                   // full q-gate (4096) <- lin_norm (4096)
     bf16* kf   = gq;                                     // full k      (1024) <- gdn q    (2048)
     bf16* vf   = gk;                                     // full v      (1024) <- gdn k    (2048)
-    const bool attn_vi8 = !c.muse_glimmer && c.hybrid && N >= 32768 &&
+    // MIN CONTEXT, not a 32k-only switch. The int8 V shadow was introduced against the 32k
+    // prefill and gated at exactly that length, so ctx=16384 -- a scored context -- ran the bf16
+    // P x V tier instead. The shadow's cost is per-token (one int8 write folded into the KV
+    // write) while its saving is per-key, so it pays well before 32k. Measured on an RTX 5090
+    // against the scored prompt, batched prefill pp/s: 9927.4 -> 11893.6 (+19.81%) at ctx=16384.
+    //
+    // 16384 AND NOT 4096, THOUGH 4k IS ALSO FASTER TO PREFILL. The shadow perturbs the prefill's
+    // numerics, which reaches decode only through the draft's acceptance, and the direction of
+    // that is not a property of the change -- it is a property of the prompt. Same binary, same
+    // prompt, two repeats per arm, all lossless:
+    //
+    //     ctx     prefill pp/s        decode tok/s       mean accept
+    //     4096    14019.0 -> 14982.8  191.14 -> 150.84   2.4615 -> 1.9545   (x0.794)
+    //     16384    9927.4 -> 11893.6  115.92 -> 142.95   1.5238 -> 1.8824   (x1.235)
+    //
+    // At 4k that is a 21% decode regression and an acceptance ratio through the 0.95 tau floor,
+    // so a 6.9% prefill gain there is not available at any price. The gate is therefore set at
+    // the shortest context where the shadow is measured safe on EVERY scored axis, and 4096 and
+    // 32768 both keep the behaviour they already had -- byte-for-byte.
+    //
+    // MUST stay in step with the same threshold in launch_prefill_attn_mma_bf16_vi8(): the host
+    // allocates and fills the shadow, the launcher consumes it, and moving only one of them
+    // silently pays for a buffer the kernel then declines.
+    static const int vi8_minctx = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_VI8_MINCTX");
+        return e ? atoi(e) : 16384;
+    }();
+    const bool attn_vi8 = !c.muse_glimmer && c.hybrid && N >= vi8_minctx &&
         [] { const char* e = getenv("SPARKINFER_PREFILL_ATTN_VI8"); return !e || e[0] != '0'; }();
     signed char* vi8 = nullptr;
     void* vi8_scale = nullptr;
