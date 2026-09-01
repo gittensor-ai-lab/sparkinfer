@@ -1255,7 +1255,11 @@ __global__ void pf_qknorm_rope_kv_bf16_kernel(
             q[base + t] = __float2bfloat16(out);
         } else {
             const size_t dst = (ctok * n_kv_heads + hh) * head_dim;
-            k_pool[dst + t] = __float2bfloat16(out);
+            const __nv_bfloat16 ko = __float2bfloat16(out);
+            k_pool[dst + t] = ko;
+            // The V-int8 attention path consumes a contiguous shadow. Keep rotated K in its
+            // existing projection buffer too; decode still receives the identical paged write.
+            if (v_i8) k[base + t] = ko;
         }
     } else {
         const int hh = unit - n_q_heads - n_kv_heads;

@@ -273,6 +273,65 @@ void quant_rows_dispatch(int blocks, cudaStream_t st, const __nv_bfloat16* src, 
     }
 }
 
+template <class Layout>
+__global__ void rmsnorm_quant_rows(const __nv_bfloat16* __restrict__ src,
+                                   const __nv_bfloat16* __restrict__ weight,
+                                   unsigned char* dst, cutlass::float_ue4m3_t* sf,
+                                   int rows, int cols, float eps, Layout layout) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const size_t base = (size_t)row * cols;
+    __shared__ float s_warp[32];
+    const int npack = cols >> 3;
+    float ss = 0.f;
+    const uint4* x4 = reinterpret_cast<const uint4*>(src + base);
+    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+        const uint4 q = __ldg(x4 + p);
+        const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&q);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float v = __bfloat162float(h[j]);
+            ss = __fmaf_rn(v, v, ss);
+        }
+    }
+    #pragma unroll
+    for (int d = 16; d; d >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, d);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x + 31) / 32 ? s_warp[threadIdx.x] : 0.f;
+        #pragma unroll
+        for (int d = 16; d; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps);
+    }
+    __syncthreads();
+    const float inv = s_warp[0];
+    const int groups = cols >> 4;
+    for (int g = threadIdx.x; g < groups; g += blockDim.x) {
+        const int k0 = g << 4;
+        float x[16], a = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const __nv_bfloat16 nv = __float2bfloat16(
+                __bfloat162float(src[base + k0 + j]) * inv *
+                __bfloat162float(weight[k0 + j]));
+            x[j] = __bfloat162float(nv);
+            a = fmaxf(a, fabsf(x[j]));
+        }
+        cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
+        unsigned char packed[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            cutlass::float_e2m1_t q0(x[2*j] / float(qs)), q1(x[2*j+1] / float(qs));
+            packed[j] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
+        }
+        *reinterpret_cast<unsigned long long*>(dst + (base >> 1) + (k0 >> 1)) =
+            *reinterpret_cast<const unsigned long long*>(packed);
+        auto scales = cute::make_tensor(sf, layout);
+        scales(row, k0, 0) = qs;
+    }
+}
+
 // Muse's attention gate folded into the o-projection's A-operand quantize: att * sigmoid(qg)
 // straight to FP4. The int8 leg already does this (launch_prefill_gate_quant_rows_i8) and
 // deliberately leaves `att` UN-GATED; #816 was reverted because its FP4 o-projection quantized that
@@ -459,6 +518,16 @@ bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k
     int blocks = (m * (k / 16) + 31) / 32; if (blocks > 4096) blocks = 4096;
     quant_rows_dispatch(blocks,st,(const __nv_bfloat16*)s,(unsigned char*)d,
                         (cutlass::float_ue4m3_t*)sf,m,k,l);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+bool launch_prefill_nvfp4_rmsnorm_quant_a(const void* s, const void* w, void* d, void* sf,
+                                          int m, int k, float eps, cudaStream_t st) {
+    if (!s || !w || !d || !sf || !prefill_nvfp4_supported(m,128,k) || (k & 15)) return false;
+    auto l = sfa_layout(m,128,k);
+    rmsnorm_quant_rows<<<m,256,0,st>>>((const __nv_bfloat16*)s,
+                                      (const __nv_bfloat16*)w,
+                                      (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,
+                                      m,k,eps,l);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_gate_quant_a(const void* sr, const void* g, void* d, void* sf,

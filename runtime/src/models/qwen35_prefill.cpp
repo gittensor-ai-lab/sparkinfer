@@ -1296,14 +1296,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // or MoE); SPARKINFER_PREFILL_FP8_GDN_SHAREQ=0 restores the per-projection quantize (A/B).
     const char* _pshareq = getenv("SPARKINFER_PREFILL_FP8_GDN_SHAREQ");
     const bool fp8_shareq = (use_fp8_gdn || moe_fp8) && (!_pshareq || _pshareq[0] != '0');
-    auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w) {
+    auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w, bool norm_deferred) {
         // Checkpoint-native NVFP4: quantize xn to FP4 ONCE (both projections read it) and run two
         // block-scaled GEMMs straight off the packed nibbles. A_i8/sx are not touched, so the int8
         // activation memo stays valid for whatever runs next in the layer.
         if (gdn_nvfp4 && (gdn_fp4_mask & 1) &&
             w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf && w.gdn_z_fp4 && w.gdn_z_fp4_sf &&
             fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
-            kernels::launch_prefill_nvfp4_quant_a(A, fp4_gdn_a, fp4_gdn_as, N, H, st) &&
+            (norm_deferred
+             ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
+                   x, w.input_norm, fp4_gdn_a, fp4_gdn_as, N, H, c.rms_eps, st)
+             : kernels::launch_prefill_nvfp4_quant_a(
+                   A, fp4_gdn_a, fp4_gdn_as, N, H, st)) &&
             kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
                                                w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf,
                                                b8, N, lqkv, H, fp4_gdn_ws, st,
@@ -1371,6 +1375,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     if (moe_hide_sg)
         pf_cu(cudaEventCreateWithFlags(&moe_ev_sg, cudaEventDisableTiming), "moe ev_sg");
 
+    bool attn_norm_deferred = false;
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         a_q = nullptr; a_pk = false;                   // xn/hn are refreshed in place each layer
@@ -1384,7 +1389,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
             const bool restore_i8_gdn = use_i8;
             if (use_i8 && !use_i8_gdn) use_i8 = false;
-            gdn_qkv_z(xn, w);                                       // qkv + z gate (fp8: fused)
+            gdn_qkv_z(xn, w, attn_norm_deferred);                    // qkv + z gate (fp8: fused)
             proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
             proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
             bf16* conv_state = lin_conv_state + (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
@@ -1508,7 +1513,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 if (attn_nvfp4 && (attn_fp4_mask & 1) &&
                     w.wq_fp4 && w.wq_fp4_sf && w.wk_fp4 && w.wk_fp4_sf &&
                     w.wv_fp4 && w.wv_fp4_sf && fp4_attn_a && fp4_attn_as && fp4_attn_ws &&
-                    kernels::launch_prefill_nvfp4_quant_a(xn, fp4_attn_a, fp4_attn_as, N, H, st) &&
+                    (attn_norm_deferred
+                     ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
+                           x, w.input_norm, fp4_attn_a, fp4_attn_as, N, H, eps, st)
+                     : kernels::launch_prefill_nvfp4_quant_a(
+                           xn, fp4_attn_a, fp4_attn_as, N, H, st)) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
                                                        w.wq_fp4, w.wq_fp4_sf,
                                                        b8, N, wide, H, fp4_attn_ws, st,
@@ -1593,7 +1602,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                             c.n_q_heads, c.n_kv_heads, c.head_dim,
                             rope_dim, rope_theta, eps, bs, mbs, st);
                     const bool vi8_done = vi8 && kernels::launch_prefill_attn_mma_bf16_vi8(
-                        qb, kpool, vi8, vi8_scale, btable, att, N, c.n_q_heads, c.n_kv_heads,
+                        qb, kf, vi8, vi8_scale, btable, att, N, c.n_q_heads, c.n_kv_heads,
                         c.head_dim, bs, mbs, attn_scale, st);
                     if (!vi8_done)
                         kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, btable, att,
@@ -1681,6 +1690,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             use_i8 = restore_i8;
         }
 
+        const bool ffn_norm_fp4 = !c.muse_glimmer && !moe && N >= 32768 && gu_nvfp4 &&
+            w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
+            [] { const char* e = getenv("SPARKINFER_Q38_FFN_NORM_FP4");
+                 return !e || e[0] != '0'; }();
         if (c.muse_glimmer) {
             // Sandwich norm (post-attn): h = x + RMSNorm(ao) * post_attn_norm -- norm the attention
             // output ALONE, then add to the residual (decode qwen35.cpp:1112). ffn_norm is a genuine
@@ -1711,7 +1724,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // x += ao (post-attn residual, in-place; skipped when folded into the output proj)
             // hn = RMSNorm(x, post_attn_norm)
             if (!attn_fused) kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
-            kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
+            if (!ffn_norm_fp4)
+                kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
         }
 
         if (!moe) {
@@ -1796,7 +1810,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 const bool layer_fp4 = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
                     w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
                     kernels::prefill_nvfp4_supported(fn, ffn, H) &&
-                    kernels::launch_prefill_nvfp4_quant_a(hn_c, fp4_a, fp4_as, fn, H, st) &&
+                    (ffn_norm_fp4
+                     ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
+                           x + (size_t)fo * H, w.post_attn_norm,
+                           fp4_a, fp4_as, fn, H, eps, st)
+                     : kernels::launch_prefill_nvfp4_quant_a(
+                           hn_c, fp4_a, fp4_as, fn, H, st)) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.gate_fp4, w.gate_fp4_sf,
                                                        ffg, fn, ffn, H, fp4_ws, st,
                                                        w.gate_fp4_alpha) &&
@@ -2489,8 +2508,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             }
         }
 
+        const Qwen35LayerWeights* nw = L + 1 < c.n_layers ? &s.w.layers[L + 1] : nullptr;
+        const bool next_attn_fp4 = nw &&
+            (nw->linear_attn
+             ? (gdn_nvfp4 && (gdn_fp4_mask & 1) && nw->gdn_qkv_fp4 && nw->gdn_qkv_fp4_sf &&
+                nw->gdn_z_fp4 && nw->gdn_z_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws)
+             : attn_nvfp4);
+        const bool defer_next_attn_norm = L + 1 < c.n_layers && N >= 32768 &&
+            !c.muse_glimmer && next_attn_fp4 &&
+            [] { const char* e = getenv("SPARKINFER_Q38_ATTN_NORM_FP4");
+                 return !e || e[0] != '0'; }();
         const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
+        if (!defer_next_attn_norm) kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
+        attn_norm_deferred = defer_next_attn_norm;
     }
 
     if (moe_overlap) {
