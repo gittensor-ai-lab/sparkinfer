@@ -367,6 +367,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     bf16* qg   = lnrm;                                   // full q-gate (4096) <- lin_norm (4096)
     bf16* kf   = gq;                                     // full k      (1024) <- gdn q    (2048)
     bf16* vf   = gk;                                     // full v      (1024) <- gdn k    (2048)
+    const bool attn_vi8 = !c.muse_glimmer && c.hybrid && N >= 32768 &&
+        [] { const char* e = getenv("SPARKINFER_PREFILL_ATTN_VI8"); return !e || e[0] != '0'; }();
+    signed char* vi8 = nullptr;
+    void* vi8_scale = nullptr;
+    if (attn_vi8) {
+        // Full-attention K occupies only the first kvdim columns of gq, whose GDN allocation is
+        // linear_qdim columns wide.  GDN and full-attention layers are mutually exclusive, so the
+        // unused tail can hold the int8 V shadow and its per-row/head fp16 scales.  Keeping these
+        // ~33 MB out of a8 matters at 32k: it leaves enough free VRAM for 4096-token GDN segments
+        // instead of 2048, while the alias is dead again before the next GDN layer writes gq.
+        const size_t spare = (size_t)N * (s.linear_qdim - kvdim) * sizeof(bf16);
+        const size_t vi8_bytes = (size_t)N * kvdim;
+        const size_t scale_bytes = (size_t)N * c.n_kv_heads * sizeof(unsigned short);
+        if (spare >= vi8_bytes + scale_bytes) {
+            unsigned char* tail = reinterpret_cast<unsigned char*>(gq + (size_t)N * kvdim);
+            vi8 = reinterpret_cast<signed char*>(tail);
+            vi8_scale = tail + vi8_bytes;
+        }
+    }
     // Everything above is FC-independent and already allocated, so cudaMemGetInfo here reports
     // exactly what is left for the FC-scaled pair -- size the chunk to that instead of to a
     // constant. When ffg+ffu do not fit, the WHOLE arena alloc fails and prefill_batched returns
@@ -448,6 +467,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const char* _pmfp8 = getenv("SPARKINFER_PREFILL_MOE_FP8");
     bool moe_fp8 = moe && (!_pmfp8 || _pmfp8[0] != '0');
     Arena& a8 = arena_reuse ? keep_a8 : once_a8;
+    if (attn_vi8 && !vi8) {
+        vi8 = a8.alloc<signed char>((size_t)N * kvdim);
+        vi8_scale = a8.alloc<unsigned short>((size_t)N * c.n_kv_heads);
+    }
     // A_i8 holds the quantized activation. The comment below used to say the non-FFN projections
     // quantize "N rows x K(<=H)" -- they do not: the o projection's A is `att` at k = qdim, and on
     // Qwen3.8-27B qdim (24*256 = 6144) is WIDER than H (5120). N*H under-sizes it by N*(qdim-H).
@@ -1559,11 +1582,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         fprintf(stderr, "[prefill] batched prefill requires int8 KV\n");
                         return -1;
                     }
-                    kernels::launch_prefill_qknorm_rope_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
-                        kpool, vpool, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                        rope_dim, rope_theta, eps, bs, mbs, st);
-                    kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, btable, att,
-                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
+                    if (vi8)
+                        kernels::launch_prefill_qknorm_rope_kv_bf16_vi8(
+                            qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, vi8, vi8_scale,
+                            btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                            rope_dim, rope_theta, eps, bs, mbs, st);
+                    else
+                        kernels::launch_prefill_qknorm_rope_kv_bf16(
+                            qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, btable, N,
+                            c.n_q_heads, c.n_kv_heads, c.head_dim,
+                            rope_dim, rope_theta, eps, bs, mbs, st);
+                    const bool vi8_done = vi8 && kernels::launch_prefill_attn_mma_bf16_vi8(
+                        qb, kpool, vi8, vi8_scale, btable, att, N, c.n_q_heads, c.n_kv_heads,
+                        c.head_dim, bs, mbs, attn_scale, st);
+                    if (!vi8_done)
+                        kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, btable, att,
+                            N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
                 } else {
                     kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
                         kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
@@ -2446,10 +2480,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (capture_dflash) {
             for (int slot = 0; slot < s.n_capture; ++slot) {
                 if (s.capture_layers[slot] != L) continue;
+                const int first = std::max(0, s.capture_start);
+                if (first >= N) continue;
                 char* dst = static_cast<char*>(s.capture_dst) +
                             (size_t)slot * H * sizeof(bf16);
                 dflash_kernels::launch_capture_rows(
-                    x, dst, N, H, s.n_capture * H, st);
+                    x + (size_t)first * H, dst, N - first, H, s.n_capture * H, st);
             }
         }
 

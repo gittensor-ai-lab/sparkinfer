@@ -738,10 +738,11 @@ bool launch_prefill_attn_mma(
 // mantissa, so P*V is evaluated as p_hi*V + p_lo*V: two mma's over the SAME V fragment, ~fp32
 // accuracy in P for 1.5x the PV work. `l` is then summed from float(p_hi)+float(p_lo) so the
 // denominator matches the numerator exactly rather than being the unrounded fp32 sum.
-template <int HEAD_DIM, int GROUP_BLKS, int RQH, bool PSPLIT>
+template <int HEAD_DIM, int GROUP_BLKS, int RQH, bool PSPLIT, bool VINT8 = false>
 __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
-    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    const void* __restrict__ v_pool_raw, const __half* __restrict__ v_scale,
+    const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
     int block_size, int max_blocks_per_seq, float scale, int qld, int pld) {
     using namespace nvcuda::wmma;
@@ -760,6 +761,8 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     const int gqa   = n_q_heads / n_kv_heads;
     const int kvh   = head0 / gqa;                            // all RQH heads share this kv-head
     const size_t KVLD = (size_t)n_kv_heads * HEAD_DIM;
+    const auto* v_pool_bf = reinterpret_cast<const __nv_bfloat16*>(v_pool_raw);
+    const auto* v_pool_i8 = reinterpret_cast<const signed char*>(v_pool_raw);
 
     extern __shared__ char mma_smem_bf[];
     // Only Q and P are staged. s_o overlays s_s for exactly the reason it does in the int8 twin:
@@ -775,6 +778,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     float* s_m    = s_s + SBLK;                                              // [RQH][BM]
     float* s_l    = s_m + RQH * BM;                                          // [RQH][BM]
     float* s_corr = s_l + RQH * BM;                                          // [RQH][BM]
+    float* s_ps   = s_corr + RQH * BM;                                        // [RQH][BM], VINT8
 
     fragment<accumulator, 16, 16, 16, float> ofr[RQH][DPW];
     // Row index of each accumulator lane element. Built with a FLOAT accumulator so the fragment
@@ -849,6 +853,8 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
             const float* s_sh = s_s + (size_t)h * BM * GN;
             __nv_bfloat16* s_ph = s_p + (size_t)h * BM * pld;
             __nv_bfloat16* s_ph2 = s_p2 + (size_t)h * BM * pld;
+            signed char* s_pih = reinterpret_cast<signed char*>(s_p) +
+                                 (size_t)h * BM * (2 * pld);
             #pragma unroll
             for (int rr = 0; rr < RPW; rr++) {
                 const int r = warp * RPW + rr;
@@ -865,26 +871,43 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                 for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
                 const float m_old = s_m[h * BM + r], m_new = fmaxf(m_old, mx);
                 const float corr = __expf(m_old - m_new);
-                float sum = 0.f;
+                float sum = 0.f, pamax = 0.f;
                 #pragma unroll
                 for (int u = 0; u < GN / 32; u++) {
                     const int t = lane + u * 32;
                     float p = 0.f;
                     if (sc[u] > -1e29f) p = __expf(sc[u] - m_new);
-                    const __nv_bfloat16 hi = __float2bfloat16(p);
-                    s_ph[r * pld + t] = hi;
-                    if (PSPLIT) {
-                        const float ph = __bfloat162float(hi);
-                        const __nv_bfloat16 lo = __float2bfloat16(p - ph);
-                        s_ph2[r * pld + t] = lo;
-                        // Sum exactly what PV will consume, so l matches the numerator.
-                        sum += ph + __bfloat162float(lo);
+                    if constexpr (VINT8) {
+                        const int gtok = k0 + t;
+                        const float pv = p * __half2float(v_scale[(size_t)gtok * n_kv_heads + kvh]);
+                        sc[u] = pv; pamax = fmaxf(pamax, fabsf(pv)); sum += p;
                     } else {
-                        sum += __bfloat162float(hi);
+                        const __nv_bfloat16 hi = __float2bfloat16(p);
+                        s_ph[r * pld + t] = hi;
+                        if (PSPLIT) {
+                            const float ph = __bfloat162float(hi);
+                            const __nv_bfloat16 lo = __float2bfloat16(p - ph);
+                            s_ph2[r * pld + t] = lo;
+                            sum += ph + __bfloat162float(lo);
+                        } else sum += __bfloat162float(hi);
                     }
                 }
                 #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                for (int o = 16; o > 0; o >>= 1) {
+                    sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                    if constexpr (VINT8)
+                        pamax = fmaxf(pamax, __shfl_xor_sync(0xffffffffu, pamax, o));
+                }
+                if constexpr (VINT8) {
+                    const float pd = pamax * (1.f / 127.f);
+                    if (lane == 0) s_ps[h * BM + r] = pd;
+                    #pragma unroll
+                    for (int u = 0; u < GN / 32; ++u) {
+                        const int t = lane + u * 32;
+                        s_pih[r * (2 * pld) + t] =
+                            (signed char)(pd == 0.f ? 0 : __float2int_rn(sc[u] / pd));
+                    }
+                }
                 if (lane == 0) {
                     s_m[h * BM + r] = m_new;
                     s_l[h * BM + r] = s_l[h * BM + r] * corr + sum;
@@ -895,6 +918,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
         __syncthreads();
 
         // ---- PV: load each V tile fragment ONCE, feed RQH q-heads ----
+        if constexpr (!VINT8) {
         #pragma unroll
         for (int dd = 0; dd < DPW; dd++) {
             const int dt = warp * DPW + dd;
@@ -904,7 +928,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
             for (int ks = 0; ks < gblk; ks++) {
                 const int pb = block_table[(k0 / block_size) + ks];
                 const __nv_bfloat16* vb =
-                    v_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
+                    v_pool_bf + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
                 fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> af;
                 fragment<matrix_b, 16, 16, 16, __nv_bfloat16, row_major> bf;
                 load_matrix_sync(bf, vb, KVLD);                  // V fragment: loaded once
@@ -925,6 +949,38 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                     const int r = (int)idxf.x[e];
                     ofr[h][dd].x[e] = __fmaf_rn(ofr[h][dd].x[e], s_corr[h * BM + r], cf[h].x[e]);
                 }
+        }
+        } else {
+        #pragma unroll
+        for (int dd = 0; dd < DPW; dd++) {
+            const int dt = warp * DPW + dd;
+            fragment<accumulator, 16, 16, 16, int> cf[RQH];
+            #pragma unroll
+            for (int h = 0; h < RQH; h++) fill_fragment(cf[h], 0);
+            for (int ks = 0; ks < gblk; ks++) {
+                const signed char* vb = v_pool_i8 +
+                    ((size_t)(k0 + ks * 16) * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
+                fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
+                fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
+                load_matrix_sync(bf, vb, KVLD);
+                #pragma unroll
+                for (int h = 0; h < RQH; h++) {
+                    load_matrix_sync(af, reinterpret_cast<signed char*>(s_p) +
+                                         (size_t)h * BM * (2 * pld) + ks * 16,
+                                     2 * pld);
+                    mma_sync(cf[h], af, bf, cf[h]);
+                }
+            }
+            #pragma unroll
+            for (int h = 0; h < RQH; h++)
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int r = (int)idxf.x[e];
+                    ofr[h][dd].x[e] = __fmaf_rn(
+                        ofr[h][dd].x[e], s_corr[h * BM + r],
+                        (float)cf[h].x[e] * s_ps[h * BM + r]);
+                }
+        }
         }
         __syncthreads();   // s_p is rewritten by the next iteration's softmax
     }
@@ -950,9 +1006,9 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     }
 }
 
-template <int HD, int GROUP_BLKS, int RQH, bool PSPLIT>
+template <int HD, int GROUP_BLKS, int RQH, bool PSPLIT, bool VINT8 = false>
 static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* v_pool,
-                                 const int* block_table, void* attn, int n_tokens,
+                                 const void* v_scale, const int* block_table, void* attn, int n_tokens,
                                  int n_q_heads, int n_kv_heads, int block_size,
                                  int max_blocks_per_seq, float scale, cudaStream_t stream) {
     constexpr int BM = 16, GN = GROUP_BLKS * 16;
@@ -965,18 +1021,18 @@ static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* 
     constexpr int SBLK = (RQH * BM * GN > BM * HD) ? RQH * BM * GN : BM * HD;
     const size_t sm = (size_t)RQH * BM * qld * sizeof(__nv_bfloat16)
                     + (size_t)(PSPLIT ? 2 : 1) * RQH * BM * pld * sizeof(__nv_bfloat16)
-                    + (size_t)(SBLK + 3 * RQH * BM) * sizeof(float);
+                    + (size_t)(SBLK + (VINT8 ? 4 : 3) * RQH * BM) * sizeof(float);
     static int cfg = 0;
     if (!cfg) {
-        if (cudaFuncSetAttribute(pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT>,
+        if (cudaFuncSetAttribute(pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT, VINT8>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) != cudaSuccess)
             return false;
         cfg = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
-    pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT><<<grid, GROUP_BLKS * 32, sm, stream>>>(
+    pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT, VINT8><<<grid, GROUP_BLKS * 32, sm, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
-        reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
+        v_pool, reinterpret_cast<const __half*>(v_scale), block_table,
         reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
         block_size, max_blocks_per_seq, scale, qld, pld);
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek --
@@ -1024,34 +1080,47 @@ bool launch_prefill_attn_mma_bf16(
     if (group_blks == 16) {
         if (!psplit && rqh_env >= 3 && gqa % 3 == 0 &&
             launch_attn_bf16_gqa<HD, 16, 3, false>(
-                q, k_pool, v_pool, block_table, attn, n_tokens, n_q_heads, n_kv_heads,
+                q, k_pool, v_pool, nullptr, block_table, attn, n_tokens, n_q_heads, n_kv_heads,
                 block_size, max_blocks_per_seq, scale, stream))
             return true;
         if (rqh_env >= 2 && gqa % 2 == 0) {
             if (psplit ? launch_attn_bf16_gqa<HD, 16, 2, true>(
-                             q, k_pool, v_pool, block_table, attn, n_tokens, n_q_heads,
+                             q, k_pool, v_pool, nullptr, block_table, attn, n_tokens, n_q_heads,
                              n_kv_heads, block_size, max_blocks_per_seq, scale, stream)
                        : launch_attn_bf16_gqa<HD, 16, 2, false>(
-                             q, k_pool, v_pool, block_table, attn, n_tokens, n_q_heads,
+                             q, k_pool, v_pool, nullptr, block_table, attn, n_tokens, n_q_heads,
                              n_kv_heads, block_size, max_blocks_per_seq, scale, stream))
                 return true;
         }
         return psplit ? launch_attn_bf16_gqa<HD, 16, 1, true>(
-                            q, k_pool, v_pool, block_table, attn, n_tokens, n_q_heads,
+                            q, k_pool, v_pool, nullptr, block_table, attn, n_tokens, n_q_heads,
                             n_kv_heads, block_size, max_blocks_per_seq, scale, stream)
                       : launch_attn_bf16_gqa<HD, 16, 1, false>(
-                            q, k_pool, v_pool, block_table, attn, n_tokens, n_q_heads,
+                            q, k_pool, v_pool, nullptr, block_table, attn, n_tokens, n_q_heads,
                             n_kv_heads, block_size, max_blocks_per_seq, scale, stream);
     }
 #define SI_MMA_BF16_TRY(RQH_)                                                                     \
-    (psplit ? launch_attn_bf16_gqa<HD, 8, RQH_, true>(q, k_pool, v_pool, block_table, attn,       \
+    (psplit ? launch_attn_bf16_gqa<HD, 8, RQH_, true>(q, k_pool, v_pool, nullptr, block_table, attn,       \
                   n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream) \
-            : launch_attn_bf16_gqa<HD, 8, RQH_, false>(q, k_pool, v_pool, block_table, attn,      \
+            : launch_attn_bf16_gqa<HD, 8, RQH_, false>(q, k_pool, v_pool, nullptr, block_table, attn,      \
                   n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream))
     if (rqh_env >= 3 && gqa % 3 == 0 && SI_MMA_BF16_TRY(3)) return true;
     if (rqh_env >= 2 && gqa % 2 == 0 && SI_MMA_BF16_TRY(2)) return true;
     return SI_MMA_BF16_TRY(1);
 #undef SI_MMA_BF16_TRY
+}
+
+bool launch_prefill_attn_mma_bf16_vi8(
+    const void* q, const void* k_pool, const signed char* v_i8, const void* v_scale,
+    const int* block_table, void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int head_dim, int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    if (head_dim != 256 || block_size != 16 || n_tokens < 32768 ||
+        n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 ||
+        (n_q_heads / n_kv_heads) % 3 != 0)
+        return false;
+    return launch_attn_bf16_gqa<256, 16, 3, false, true>(
+        q, k_pool, v_i8, v_scale, block_table, attn, n_tokens, n_q_heads, n_kv_heads,
+        block_size, max_blocks_per_seq, scale, stream);
 }
 
 }  // namespace kernels

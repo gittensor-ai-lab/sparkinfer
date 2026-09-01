@@ -474,7 +474,8 @@ public:
 
     // DFlash: capture concat hidden states at target_layer_ids per forward step.
     // Disables CUDA-graph replay while enabled (capture needs eager layer outputs).
-    void set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows = 16);
+    void set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows = 16,
+                            int context_start = 0);
     void set_dflash_capture_row(int row);
     // Append the current capture-row into the growing context buffer at global_pos.
     void dflash_stash_capture(int global_pos);

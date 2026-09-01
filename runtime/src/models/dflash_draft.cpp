@@ -1019,7 +1019,7 @@ void DFlashDraftModel::ensure_quant() { if (p_) p_->ensure_quant(); }
 bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      const int* noise_ids, int pos0,
                                      int* out_argmax, cudaStream_t stream, int proposals,
-                                     float* out_confidence) {
+                                     float* out_confidence, int target_hidden_start) {
     Impl& s = *p_;
     s.ensure_quant();
     if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
@@ -1250,7 +1250,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     static const bool kCtxQ4 = []{ const char* e = getenv("SPARKINFER_DFLASH_CTX_Q4");
                                    return !(e && e[0] == '0'); }();
     if (fc_rows > 0) {
-        const bf16* th = (const bf16*)target_hidden + (size_t)fc_skip * n_cap * H;
+        if (fc_skip < target_hidden_start) return false;
+        const bf16* th = (const bf16*)target_hidden +
+                         (size_t)(fc_skip - target_hidden_start) * n_cap * H;
         bf16* tp = s.target_proj + (size_t)fc_skip * H;
         const bool fc_q4 = kCtxQ4 && s.q8_fc.q4 && fc_rows >= 1 && fc_rows <= 8;
         if (ctx_gemm) {

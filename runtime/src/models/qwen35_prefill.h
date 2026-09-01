@@ -41,6 +41,7 @@ struct Qwen35PrefillCtx {
     const int*           capture_layers;
     int                  n_capture;
     void*                capture_dst;
+    int                  capture_start;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
