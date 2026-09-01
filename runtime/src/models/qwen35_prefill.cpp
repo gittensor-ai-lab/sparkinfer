@@ -371,6 +371,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         [] { const char* e = getenv("SPARKINFER_PREFILL_ATTN_VI8"); return !e || e[0] != '0'; }();
     signed char* vi8 = nullptr;
     void* vi8_scale = nullptr;
+    if (attn_vi8) {
+        // Full-attention K occupies only the first kvdim columns of gq, whose GDN allocation is
+        // linear_qdim columns wide.  GDN and full-attention layers are mutually exclusive, so the
+        // unused tail can hold the int8 V shadow and its per-row/head fp16 scales.  Keeping these
+        // ~33 MB out of a8 matters at 32k: it leaves enough free VRAM for 4096-token GDN segments
+        // instead of 2048, while the alias is dead again before the next GDN layer writes gq.
+        const size_t spare = (size_t)N * (s.linear_qdim - kvdim) * sizeof(bf16);
+        const size_t vi8_bytes = (size_t)N * kvdim;
+        const size_t scale_bytes = (size_t)N * c.n_kv_heads * sizeof(unsigned short);
+        if (spare >= vi8_bytes + scale_bytes) {
+            unsigned char* tail = reinterpret_cast<unsigned char*>(gq + (size_t)N * kvdim);
+            vi8 = reinterpret_cast<signed char*>(tail);
+            vi8_scale = tail + vi8_bytes;
+        }
+    }
     // Everything above is FC-independent and already allocated, so cudaMemGetInfo here reports
     // exactly what is left for the FC-scaled pair -- size the chunk to that instead of to a
     // constant. When ffg+ffu do not fit, the WHOLE arena alloc fails and prefill_batched returns
@@ -452,7 +467,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const char* _pmfp8 = getenv("SPARKINFER_PREFILL_MOE_FP8");
     bool moe_fp8 = moe && (!_pmfp8 || _pmfp8[0] != '0');
     Arena& a8 = arena_reuse ? keep_a8 : once_a8;
-    if (attn_vi8) {
+    if (attn_vi8 && !vi8) {
         vi8 = a8.alloc<signed char>((size_t)N * kvdim);
         vi8_scale = a8.alloc<unsigned short>((size_t)N * c.n_kv_heads);
     }
