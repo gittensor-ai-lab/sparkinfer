@@ -3470,9 +3470,30 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // With the carve-out gone this is simply the long-context policy the 12288+ band already
     // documents, applied at the length where its argument is strongest. Nothing below 12288
     // changes, and the adaptive promotion below still restores depth on predictable streams.
+    // The sub-deep band takes depth 3 everywhere, but a 4k-class context has room for more. A
+    // verify row is cheapest here (it reads the least KV), so the bar a proposal must clear to
+    // repay its row is at its lowest, and the 4th and 5th proposals still clear it. Past ~6k the
+    // prompt slices this bench walks start accepting so deeply that the shallower plan already
+    // captures the run (accept 1.88 at 6k, 2.67 at 7k), and the extra rows stop paying.
+    //
+    // Measured on the eval prompt (first N tokens of bench_prompt_32k.txt), NTOK=128, all
+    // lossless, AR flat at 90.6-91.1:
+    //
+    //     ctx    depth 3            depth 5            depth 4   depth 7
+    //     4096   114.95 / 114.87    120.51 / 120.41    119.43    118.48
+    //     5120   109.32             112.42
+    //     6144   130.56             129.63
+    //     7168   178.35             169.88
+    //
+    // 1.048x at 4k, and mean accept RISES 1.6250 -> 1.6883 (104% of the shallower plan), so the
+    // deeper plan is not trading acceptance for throughput -- it verifies more of what the draft
+    // already proposes. 8k is left on depth 3 (94.73 vs 94.48 for depth 5), which the bound below
+    // preserves, as are 16k and 32k on depth 2.
+    constexpr int kMid4kMaxSeq = 6144;
     const int kInitialProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
                                     : ((kShortGeneration || kAmortizedMidContext) ? 7
-                                       : ((n + max_new) >= kDeepMinSeq ? 2 : 3)));
+                                       : ((n + max_new) >= kDeepMinSeq ? 2
+                                          : ((n + max_new) < kMid4kMaxSeq ? 5 : 3))));
     // A length-only depth is a safe starting point, not a workload policy. At the same 16k
     // context real chat accepts ~1.36 tokens while code/JSON/repetition accept 5.35/6.62/6.92 at
     // depth 7. Keeping the prose-tuned depth-2 ceiling makes those predictable streams pay 27-39%
