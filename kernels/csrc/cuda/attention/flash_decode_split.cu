@@ -449,7 +449,9 @@ __global__ void fa_split_gqa_pipeg_kernel(
     }
 }
 
-template <int HEAD_DIM, int GQA, int TILE, bool INT8, int SEQ = 1>
+// QKH hoists the SEQ per-row QK dots ahead of their warp reductions -- see the compute loop
+// below. Only meaningful for SEQ > 1, and bit-identical to the shipped order.
+template <int HEAD_DIM, int GQA, int TILE, bool INT8, int SEQ = 1, bool QKH = false>
 __global__ void fa_split_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pool,
     const void* __restrict__ v_pool, const int* __restrict__ block_table,
@@ -561,18 +563,60 @@ __global__ void fa_split_gqa_kernel(
                 kv_v[e] = fa_to_f(s_v[tt * HEAD_DIM + lane + e * 32]);
             }
             const int gtok = t0 + tt;
-            #pragma unroll
-            for (int v = 0; v < SEQ; v++) {
-                if (gtok < row_start[v] || gtok >= row_end[v]) continue;   // this row's own range
-                float p = 0.f;
+            if constexpr (QKH && SEQ > 1) {
+                // SEQ independent QK dots FIRST, then one butterfly pass over all of them, and
+                // only then the folds. The shipped shape is dot -> fa_wsum -> softmax, per row: a
+                // 5-deep shfl chain and two MUFU with nothing in flight to cover them, repeated
+                // SEQ times. Hoisting the dots exposes SEQ independent reductions to interleave.
+                //
+                // This is the same transform #931 applied to fa_split_gqa_pipe_kernel, where it
+                // measured batched 12.243 -> 12.022 ms/call at ctx 16384 with tau bit-identical.
+                // It was only ever applied to the cp.async kernel; 8557dcd made that path opt-in,
+                // so the batched verify now runs THIS kernel and lost the transform with it.
+                //
+                // BIT-IDENTICAL: each row's dot accumulates over e in the same order, and the
+                // butterfly below walks exactly the mask sequence fa_wsum walks (m = 16..1,
+                // __shfl_xor_sync over the full mask), so it is the same tree of the same
+                // partials. The range test is warp-uniform (gtok and row_start/row_end do not
+                // depend on lane), so hoisting the dots above it cannot change which lanes
+                // participate in a shuffle. Only the instruction SCHEDULE changes.
+                float sc[SEQ];
                 #pragma unroll
-                for (int e = 0; e < ELEMS; e++) p += qr[v][e] * kv_k[e];
-                const float score = fa_wsum(p) * scale;
-                const float mn = fmaxf(m[v], score), corr = __expf(m[v] - mn), pe = __expf(score - mn);
-                l[v] = l[v] * corr + pe;
+                for (int v = 0; v < SEQ; v++) {
+                    float p = 0.f;
+                    #pragma unroll
+                    for (int e = 0; e < ELEMS; e++) p += qr[v][e] * kv_k[e];
+                    sc[v] = p;
+                }
                 #pragma unroll
-                for (int e = 0; e < ELEMS; e++) acc[v][e] = acc[v][e] * corr + pe * kv_v[e];
-                m[v] = mn;
+                for (int mask = 16; mask > 0; mask >>= 1)
+                    #pragma unroll
+                    for (int v = 0; v < SEQ; v++)
+                        sc[v] += __shfl_xor_sync(0xffffffff, sc[v], mask);
+                #pragma unroll
+                for (int v = 0; v < SEQ; v++) {
+                    if (gtok < row_start[v] || gtok >= row_end[v]) continue;   // this row's own range
+                    const float score = sc[v] * scale;
+                    const float mn = fmaxf(m[v], score), corr = __expf(m[v] - mn), pe = __expf(score - mn);
+                    l[v] = l[v] * corr + pe;
+                    #pragma unroll
+                    for (int e = 0; e < ELEMS; e++) acc[v][e] = acc[v][e] * corr + pe * kv_v[e];
+                    m[v] = mn;
+                }
+            } else {
+                #pragma unroll
+                for (int v = 0; v < SEQ; v++) {
+                    if (gtok < row_start[v] || gtok >= row_end[v]) continue;   // this row's own range
+                    float p = 0.f;
+                    #pragma unroll
+                    for (int e = 0; e < ELEMS; e++) p += qr[v][e] * kv_k[e];
+                    const float score = fa_wsum(p) * scale;
+                    const float mn = fmaxf(m[v], score), corr = __expf(m[v] - mn), pe = __expf(score - mn);
+                    l[v] = l[v] * corr + pe;
+                    #pragma unroll
+                    for (int e = 0; e < ELEMS; e++) acc[v][e] = acc[v][e] * corr + pe * kv_v[e];
+                    m[v] = mn;
+                }
             }
         }
         __syncthreads();
@@ -1346,20 +1390,44 @@ void launch_flash_decode_split(
                 return;
             }
             if (!int8_kv && num_seqs > 1 && fa6_fold > 1 && (num_seqs % fa6_fold) == 0) {
+                // Hoist the folded rows' QK dots ahead of their warp reductions -- see this
+                // kernel's compute loop. #931 measured the transform on the cp.async twin
+                // (fa_split_gqa_pipe_kernel): batched 12.243 -> 12.022 ms/call at ctx=16384, tau
+                // bit-identical. It was only ever applied there, and 8557dcd made that twin
+                // opt-in, so the batched verify -- which at long context is EVERY step, not a
+                // fraction of them -- lost the transform along with cp.async. This restores it on
+                // the kernel that now actually runs, with no asynchronous copy and so no
+                // shared-memory lifetime for 8557dcd's concern to apply to.
+                //
+                // Measured on the synchronous kernel, RTX 5090, ctx=16384, ONE binary with the
+                // arms alternated, 2 reps each, every arm lossless:
+                //     batched  12.1085 -> 11.7975 ms/call  (-2.57%)
+                //     decode    113.09 ->  115.77 tok/s    (+2.37%)
+                //     tau       1.5238 in every arm, unchanged -- same accepts, same steps
+                // SPARKINFER_FA_QKHOIST=0 restores the shipped instruction order.
+                static int fa6_qkh = -1;
+                if (fa6_qkh < 0) { const char* e = getenv("SPARKINFER_FA_QKHOIST");
+                                   fa6_qkh = (e && e[0] == '0') ? 0 : 1; }
                 const size_t smf = (size_t)2 * FA_GQA6_TILE * 256 * sizeof(__nv_bfloat16);
                 dim3 gqf(num_kv_heads * n_splits, num_seqs / fa6_fold);
-#define SI_FA6_FOLD(SQ)                                                                           \
-                fa_split_gqa_kernel<256, GQA, FA_GQA6_TILE, false, (SQ)>                          \
+#define SI_FA6_FOLD_T(SQ, QK)                                                                     \
+                fa_split_gqa_kernel<256, GQA, FA_GQA6_TILE, false, (SQ), (QK)>                    \
                     <<<gqf, GQA * 32, smf, stream>>>(                                             \
                     reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table,       \
                     seq_lens, part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads,         \
                     block_size, max_blocks, n_splits,                                             \
                     reinterpret_cast<const __half*>(k_scale),                                     \
                     reinterpret_cast<const __half*>(v_scale))
+#define SI_FA6_FOLD(SQ)                                                                           \
+                do {                                                                              \
+                    if (fa6_qkh) SI_FA6_FOLD_T((SQ), true);                                       \
+                    else         SI_FA6_FOLD_T((SQ), false);                                      \
+                } while (0)
                 if (fa6_fold == 3)      SI_FA6_FOLD(3);
                 else if (fa6_fold == 4) SI_FA6_FOLD(4);
                 else                    SI_FA6_FOLD(2);
 #undef SI_FA6_FOLD
+#undef SI_FA6_FOLD_T
                 combine_hd256(out_q8);
                 (void)seqlen;
                 return;
