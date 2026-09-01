@@ -179,10 +179,12 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 ## Qwen3.8-27B PR auto-evaluation bots
 
 > **The scored path is `pr_dspark_bot.py`** (`eval/run_dspark_cron.sh`, hourly at `:00`), and as
-> of 2026-08-21 it is the ONLY bot on cron. It scores one dimension, `dspark-decode@32k`, on the
-> ModelOpt checkpoint (`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`), behind lossless + AR
-> floors and the Qwen3.6 / Qwen3.8 no-regression guards. See that file's module docstring — it is
-> the authority, not this README.
+> of 2026-08-21 it is the ONLY bot on cron. It scores DSpark decode and DSpark-enabled batched
+> prefill at **4k, 16k, and 32k** on the ModelOpt checkpoint
+> (`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`). Every measured axis is also a no-regression
+> floor; decode is lossless against same-process AR and acceptance cannot regress materially.
+> The Qwen3.6 / Qwen3.8 shared-path guards remain mandatory. See that file's module docstring —
+> it is the authority, not this README.
 >
 > Every other bot here — `pr_qwen38_bot.py`, `pr_modelopt_bot.py`, `pr_museglimmer_bot.py`,
 > `pr_dflash_bot.py` — is kept for reference and run by hand only. The sections below describe
