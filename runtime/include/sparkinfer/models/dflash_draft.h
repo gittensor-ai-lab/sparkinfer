@@ -97,7 +97,8 @@ public:
     bool forward_block(const void* target_hidden, int ctx_len,
                        const int* noise_ids, int pos0,
                        int* out_argmax, cudaStream_t stream = nullptr,
-                       int proposals = 0, float* out_confidence = nullptr);
+                       int proposals = 0, float* out_confidence = nullptr,
+                       int target_hidden_start = 0);
 
     // Apply target lm_head to last forward's hidden states; writes device logits [block, vocab]
     // and host argmax. Called internally by forward_block; exposed for debugging.

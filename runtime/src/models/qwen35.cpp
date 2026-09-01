@@ -396,6 +396,7 @@ struct Qwen35Model::Impl {
     int final_seqlen_hint = -1;   // set by generate()/dflash_generate() before their prefill loop
     int dflash_ctx_len = 0;
     int dflash_ctx_cap = 0;
+    int dflash_ctx_start = 0;
     bf16* dflash_hidden = nullptr;    // [max_rows, n_cap * H]
     bf16* dflash_context = nullptr;   // [ctx_cap, n_cap * H]
     float* spec_lin_snap = nullptr;
@@ -2710,7 +2711,8 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           s.dflash_capture ? s.dflash_layer_ids.data() : nullptr,
                           s.dflash_capture ? s.dflash_n_cap : 0,
-                          s.dflash_capture ? s.dflash_context : nullptr };
+                          s.dflash_capture ? s.dflash_context : nullptr,
+                          s.dflash_capture ? s.dflash_ctx_start : 0 };
     const int seed = prefill_batched_run(ctx, prompt_ids, n);
     if (seed >= 0 && s.dflash_capture && s.dflash_context && s.dflash_n_cap > 0)
         s.dflash_ctx_len = n;
@@ -3009,7 +3011,8 @@ int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
 
 void Qwen35Model::set_dflash_draft(DFlashDraftModel* draft) { p_->dflash_draft = draft; }
 
-void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows) {
+void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows,
+                                    int context_start) {
     Impl& s = *p_;
     s.dflash_capture = on;
     s.dflash_layer_ids = target_layer_ids;
@@ -3017,6 +3020,7 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
     s.dflash_max_rows = std::max(1, max_rows);
     s.dflash_cap_row = 0;
     s.dflash_ctx_len = 0;
+    s.dflash_ctx_start = std::max(0, std::min(context_start, s.cfg.max_seq));
     invalidate_decode_graph();
     if (!on) return;
     const int H = s.cfg.hidden;
@@ -3024,7 +3028,7 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
     const size_t hidden_bytes = (size_t)s.dflash_max_rows * row_elems * sizeof(bf16);
     if (s.dflash_hidden) { cudaFree(s.dflash_hidden); s.dflash_hidden = nullptr; }
     if (s.dflash_context) { cudaFree(s.dflash_context); s.dflash_context = nullptr; }
-    s.dflash_ctx_cap = s.cfg.max_seq;
+    s.dflash_ctx_cap = s.cfg.max_seq - s.dflash_ctx_start;
     cu(cudaMalloc(&s.dflash_hidden, hidden_bytes), "dflash hidden");
     cu(cudaMalloc(&s.dflash_context, (size_t)s.dflash_ctx_cap * row_elems * sizeof(bf16)), "dflash ctx");
     if (s.cfg.hybrid && !s.spec_lin_snap) {
@@ -3043,11 +3047,12 @@ void Qwen35Model::set_dflash_capture_row(int row) { p_->dflash_cap_row = row; }
 void Qwen35Model::dflash_stash_capture(int global_pos) {
     Impl& s = *p_;
     if (!s.dflash_hidden || !s.dflash_context || s.dflash_n_cap <= 0) return;
-    if (global_pos < 0 || global_pos >= s.dflash_ctx_cap) return;
+    const int stored_pos = global_pos - s.dflash_ctx_start;
+    if (stored_pos < 0 || stored_pos >= s.dflash_ctx_cap) return;
     const int H = s.cfg.hidden;
     const size_t row_elems = (size_t)s.dflash_n_cap * H;
     const bf16* src = s.dflash_hidden + (size_t)s.dflash_cap_row * row_elems;
-    bf16* dst = s.dflash_context + (size_t)global_pos * row_elems;
+    bf16* dst = s.dflash_context + (size_t)stored_pos * row_elems;
     cu(cudaMemcpyAsync(dst, src, row_elems * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
        "dflash stash");
     if (global_pos + 1 > s.dflash_ctx_len) s.dflash_ctx_len = global_pos + 1;
@@ -3107,7 +3112,7 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
                           s.emb_norm_ones,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
-                          nullptr, 0, nullptr };
+                          nullptr, 0, nullptr, 0 };
     // The recorded token ids and positions are irrelevant: the graph copies them from pinned host
     // buffers at replay, so only the shapes (n, and the pointer keys) have to match the real steps.
     std::vector<int> ids(n, 0);
@@ -3127,7 +3132,7 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
                           s.emb_norm_ones,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
-                          nullptr, 0, nullptr };
+                          nullptr, 0, nullptr, 0 };
     const int consumed = dflash_verify_short_run(ctx, token_ids, n, start_pos,
                                                   s.dflash_layer_ids.data(), s.dflash_n_cap,
                                                   const_cast<void*>(dflash_capture_dst), out_argmax);
@@ -3294,7 +3299,16 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // max_rows, so sizing this at B did not corrupt memory -- it silently DROPPED the last
     // row, handing the next draft block a stale hidden state precisely when everything was
     // accepted, which is the case a full-depth plan is trying to produce.
-    set_dflash_capture(true, dc.target_layer_ids, B + 1);
+    int capture_start = 0;
+    const char* draft_window_env = getenv("SPARKINFER_DFLASH_FULL_WINDOW");
+    if (draft_window_env) {
+        const int window = atoi(draft_window_env);
+        if (window > 0 && (int)prompt.size() > window)
+            capture_start = (int)prompt.size() - window;
+    } else if ((int)prompt.size() >= 12288) {
+        capture_start = (int)prompt.size() - 4096;
+    }
+    set_dflash_capture(true, dc.target_layer_ids, B + 1, capture_start);
 
     const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
     clear_prefix_cache();
@@ -3338,6 +3352,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int steps = 0;
     const void* target_hidden = dflash_context_buffer();
     int th_len = n;
+    int th_start = s.dflash_ctx_start;
 
     // Depth-indexed buffers. With the SGLang row-shift mapping (dflash_draft.cpp), block row
     // r-1 backs proposal r, so a block_size-wide block backs proposals 1..B -- and block[],
@@ -3810,7 +3825,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             draft_confidence[i] = std::numeric_limits<float>::quiet_NaN();
         const bool draft_ok = draft_idle ? true : draft.forward_block(
             draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, active_proposal_depth,
-            draft_confidence.data());
+            draft_confidence.data(), th_start);
         if (!draft_idle) {
             ls_d_sum += std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - _td).count();
@@ -4139,6 +4154,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         steps++;
         target_hidden = s.dflash_hidden;
         th_len = keep;
+        th_start = 0;
         if (gov) gov->pace();
     }
     auto t_end = std::chrono::steady_clock::now();

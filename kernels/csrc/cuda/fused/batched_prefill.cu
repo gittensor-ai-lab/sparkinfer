@@ -1201,6 +1201,7 @@ __global__ void pf_qknorm_rope_kv_bf16_kernel(
     __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
     __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    signed char* __restrict__ v_i8, __half* __restrict__ v_i8_scale,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
     int block_size, int max_blocks_per_seq) {
@@ -1261,6 +1262,24 @@ __global__ void pf_qknorm_rope_kv_bf16_kernel(
         const size_t base = ((size_t)tok * n_kv_heads + hh) * head_dim;
         const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
         v_pool[dst + t] = v[base + t];
+        if (v_i8) {
+            const float x = pf_to_f(v[base + t]);
+            float a = fabsf(x);
+            #pragma unroll
+            for (int d = 16; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
+            if ((t & 31) == 0) s_warp[t >> 5] = a;
+            __syncthreads();
+            if (t < 32) {
+                a = t < (head_dim + 31) / 32 ? s_warp[t] : 0.f;
+                #pragma unroll
+                for (int d = 16; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
+                if (t == 0) s_warp[0] = a;
+            }
+            __syncthreads();
+            const float s = s_warp[0] * (1.f / 127.f);
+            v_i8[base + t] = (signed char)(s == 0.f ? 0 : (int)roundf(x / s));
+            if (t == 0) v_i8_scale[(size_t)tok * n_kv_heads + hh] = __float2half(s);
+        }
     }
 }
 
@@ -1717,6 +1736,23 @@ void launch_prefill_qknorm_ropenorm_kv_bf16(
         block_size, max_blocks_per_seq);
 }
 
+void launch_prefill_qknorm_rope_kv_bf16_vi8(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, signed char* v_i8, void* v_i8_scale,
+    const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
+    cudaStream_t stream) {
+    dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);
+    const size_t shmem = (size_t)head_dim * sizeof(float);
+    pf_qknorm_rope_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+        reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        v_i8, reinterpret_cast<__half*>(v_i8_scale), block_table,
+        n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps, block_size, max_blocks_per_seq);
+}
+
 void launch_prefill_attn_int8_paged(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
@@ -1760,7 +1796,7 @@ void launch_prefill_qknorm_rope_kv_bf16(
         reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
         reinterpret_cast<const __nv_bfloat16*>(k_w),
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
-        block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
+        nullptr, nullptr, block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
         block_size, max_blocks_per_seq);
 }
 

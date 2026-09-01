@@ -46,5 +46,11 @@ bool launch_prefill_attn_mma_bf16(
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr);
 
+bool launch_prefill_attn_mma_bf16_vi8(
+    const void* q, const void* k_pool, const signed char* v_i8, const void* v_scale,
+    const int* block_table, void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int head_dim, int block_size, int max_blocks_per_seq, float scale,
+    cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace sparkinfer

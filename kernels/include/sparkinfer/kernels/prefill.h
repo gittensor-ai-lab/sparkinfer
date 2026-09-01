@@ -155,11 +155,24 @@ void launch_prefill_qknorm_rope_kv_bf16(
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream = nullptr);
 
+void launch_prefill_qknorm_rope_kv_bf16_vi8(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, signed char* v_i8, void* v_i8_scale,
+    const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
+    cudaStream_t stream = nullptr);
+
 // Full-causal attention over a bf16 paged KV pool. false = no instantiation for head_dim.
 bool launch_prefill_attn_bf16_paged(
     const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr);
+
+bool launch_prefill_attn_mma_bf16_vi8(
+    const void* q, const void* k_pool, const signed char* v_i8, const void* v_scale,
+    const int* block_table, void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int head_dim, int block_size, int max_blocks_per_seq, float scale,
+    cudaStream_t stream);
 
 void launch_prefill_qknorm_ropenorm_kv_bf16(
     void* q, void* k, const void* v, const void* q_w, const void* k_w,
