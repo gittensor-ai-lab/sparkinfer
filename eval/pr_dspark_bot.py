@@ -688,13 +688,18 @@ def _looks_like_hard_kill(stdout: str, stderr: str) -> bool:
 
 
 def _ssh_run_resilient(host, port, script: str, label: str):
-    """One automatic retry on an apparent hard kill — same insurance pr_dflash_bot.py added
-    after #684/#690 (heavy model-reload boundaries silently killing the whole remote shell)."""
+    """Retry once on a hard kill or an explicitly classified child-process infrastructure fault."""
     r = ssh_run(host, port, script, via_stdin=True)
-    if r.returncode != 0 and _looks_like_hard_kill(r.stdout, r.stderr):
-        print(f">> {label}: looks like a hard kill (no ERR-trap diagnostic, no accuracy-stage "
-              f"checkpoint reached) — retrying once")
-        r = ssh_run(host, port, script, via_stdin=True)
+    if r.returncode != 0:
+        combined = (r.stdout or "") + "\n" + (r.stderr or "")
+        if "RETRYABLE_INFRA_FAILURE" in combined:
+            print(f">> {label}: transient DSpark child-process failure — retrying the entire "
+                  "measurement once")
+            r = ssh_run(host, port, script, via_stdin=True)
+        elif _looks_like_hard_kill(r.stdout, r.stderr):
+            print(f">> {label}: looks like a hard kill (no ERR-trap diagnostic, no final "
+                  f"checkpoint reached) — retrying once")
+            r = ssh_run(host, port, script, via_stdin=True)
     return r
 
 
@@ -937,11 +942,16 @@ DS_OUT=/tmp/dspark_run.txt
 # build is lossless from a clean serving start, not whether an earlier synthetic audit poisoned a
 # later one. Each child still performs its own AR-vs-DSpark exact-token comparison. Keep run 1 as
 # the scored throughput sample and aggregate only the absolute correctness verdict across runs.
+DSPARK_INFRA_FAILED=0
 DS_ALL_OK=1
 for rep in $(seq 1 {spec_reps}); do
   REP_OUT="/tmp/dspark_run_${{rep}}.txt"
-  SPARKINFER_DSPARK_SPEC_REPS=1 timeout 900 build/runtime/dspark_tau_check \
-    "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" $(cat "$DSPARK_IDS") > "$REP_OUT" 2>&1 || DS_ALL_OK=0
+  if ! SPARKINFER_DSPARK_SPEC_REPS=1 timeout 900 build/runtime/dspark_tau_check \
+    "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" $(cat "$DSPARK_IDS") > "$REP_OUT" 2>&1; then
+    DSPARK_INFRA_FAILED=1
+    DS_ALL_OK=0
+    echo "DSPARK_CHILD_FAILED context=16k rep=$rep" >&2
+  fi
   if [ "$rep" -eq 1 ]; then cp "$REP_OUT" "$DS_OUT"; fi
   REP_LL=$(sed -n 's/^METRIC LOSSLESS //p' "$REP_OUT" | tail -1)
   [ "${{REP_LL:-0}}" = "1" ] || DS_ALL_OK=0
@@ -985,8 +995,12 @@ PY4K
 DS4_ALL_OK=1
 for rep in $(seq 1 {spec_reps}); do
   REP_OUT="/tmp/dspark4_run_${{rep}}.txt"
-  SPARKINFER_DSPARK_SPEC_REPS=1 timeout 900 build/runtime/dspark_tau_check \
-    "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" "@$DS4_IDS" > "$REP_OUT" 2>&1 || DS4_ALL_OK=0
+  if ! SPARKINFER_DSPARK_SPEC_REPS=1 timeout 900 build/runtime/dspark_tau_check \
+    "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" "@$DS4_IDS" > "$REP_OUT" 2>&1; then
+    DSPARK_INFRA_FAILED=1
+    DS4_ALL_OK=0
+    echo "DSPARK_CHILD_FAILED context=4k rep=$rep" >&2
+  fi
   if [ "$rep" -eq 1 ]; then cp "$REP_OUT" "$DS4_OUT"; fi
   REP_LL=$(sed -n 's/^METRIC LOSSLESS //p' "$REP_OUT" | tail -1)
   [ "${{REP_LL:-0}}" = "1" ] || DS4_ALL_OK=0
@@ -1025,8 +1039,12 @@ PYPF
 DS32_ALL_OK=1
 for rep in $(seq 1 {spec_reps}); do
   REP_OUT="/tmp/dspark32_run_${{rep}}.txt"
-  SPARKINFER_DSPARK_SPEC_REPS=1 timeout 1200 build/runtime/dspark_tau_check \
-    "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" "@$PREFILL_IDS" > "$REP_OUT" 2>&1 || DS32_ALL_OK=0
+  if ! SPARKINFER_DSPARK_SPEC_REPS=1 timeout 1200 build/runtime/dspark_tau_check \
+    "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" "@$PREFILL_IDS" > "$REP_OUT" 2>&1; then
+    DSPARK_INFRA_FAILED=1
+    DS32_ALL_OK=0
+    echo "DSPARK_CHILD_FAILED context=32k rep=$rep" >&2
+  fi
   if [ "$rep" -eq 1 ]; then cp "$REP_OUT" "$DS32_OUT"; fi
   REP_LL=$(sed -n 's/^METRIC LOSSLESS //p' "$REP_OUT" | tail -1)
   [ "${{REP_LL:-0}}" = "1" ] || DS32_ALL_OK=0
@@ -1046,6 +1064,15 @@ echo "RESULT_LOSSLESS32 $(_ds32_metric LOSSLESS)"
 echo "RESULT_LOSSLESS32_RUNS $(_ds32_metric LOSSLESS_RUNS)"
 PREFILL_PP=$(_ds32_metric DSPARK_PREFILL_PP)
 echo "RESULT_PREFILL_PP ${{PREFILL_PP:-0}}"
+
+# A child that could not load the model, timed out, crashed or was OOM-killed is an evaluator
+# infrastructure failure, not evidence of a slow or incorrect PR. Exit nonzero before fail-fast
+# correctness gates; _ssh_run_resilient retries this whole ref once with clean processes. Exact
+# token mismatch still returns zero from the harness with LOSSLESS=0 and remains non-retryable.
+if [ "$DSPARK_INFRA_FAILED" = "1" ]; then
+  echo "RETRYABLE_INFRA_FAILURE one or more DSpark harness processes exited nonzero" >&2
+  exit 75
+fi
 
 # --- FAIL FAST -------------------------------------------------------------------------------
 # Every gate below is decidable from the stage that just ran, so a PR that fails one is already
