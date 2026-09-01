@@ -208,7 +208,54 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // ctx=16384. Anything sized off FC must therefore be allocated AFTER that loop and must not
     // assume FC == N; getting this wrong is how the native-FP4 ffn_down leg silently disabled
     // itself, see the fp4_down_a comment further down.
-    const int ffn_chunk = []{ const char* e = getenv("SPARKINFER_PREFILL_FFN_CHUNK"); int c = e ? atoi(e) : 32768; return c > 0 ? c : 32768; }();
+    //
+    // The DEFAULT is a cache-derived size, not "as many tokens as will fit". Chunking was treated
+    // as a pure cost -- every extra chunk re-reads the layer's gate|up|down weights -- so the
+    // sizing loop below only ever shrank FC and the starting value was as large as possible.
+    // Measured on RTX 5090 at ctx=16384 (Qwen3.8-27B, ffn=17408), one prefill pass, pp/s:
+    //
+    //     chunks   1 (FC=N)   2 (8192)   4 (4096)   8 (2048)   16 (1024)
+    //     pp        9151.72    9226.99    9230.46    9156.11     9007.34
+    //
+    // so FC=N is 0.86% SLOWER than a 4-chunk pass, and the optimum is a broad plateau at 4096-8192.
+    // The ffg/ffu pair is 2 * FC * ffn * 2 B and the down projection reads it straight back, so a
+    // chunk that fits the L2 working set turns that round trip into hits; past ~2x L2 the extra
+    // weight re-reads take over, which is the 1024 column and why the VRAM floor below is the
+    // WORST point on this curve, not a safe one.
+    //
+    // Expressed in BYTES per buffer rather than tokens so it tracks ffn across checkpoints
+    // (17408 here, 512 per-expert on the MoE path, 12288 on Muse Glimmer) instead of encoding one
+    // model's token count. SPARKINFER_PREFILL_FFN_CHUNK still overrides, and still skips the
+    // VRAM loop entirely -- an operator decision is honoured as given.
+    constexpr size_t kFfnChunkBytes = (size_t)143 << 20;   // ~= 1.5x the 96 MB L2 on GB202
+    const int ffn_chunk = [&]{
+        const char* e = getenv("SPARKINFER_PREFILL_FFN_CHUNK");
+        if (e) { const int c = atoi(e); if (c > 0) return c; }
+        const size_t per_row = (size_t)ffn * sizeof(bf16);
+        const size_t want = per_row ? kFfnChunkBytes / per_row : (size_t)32768;
+        // ROUND DOWN TO A POWER OF TWO. Not cosmetic: prefill_nvfp4_supported() requires
+        // !(m & 7), so a chunk size that is not a multiple of 8 makes `layer_fp4` false for
+        // EVERY chunk and silently drops the whole FFN onto the bf16 dequant GEMM. The raw
+        // byte-derived value here is 4307 on this checkpoint, and shipping it measured
+        // 9155 -> 3325 pp at ctx=16384 -- a 2.75x regression with no error and no fallback
+        // message, exactly the failure mode the fp4_down_a comment below warns about.
+        // A power of two also matches the halving loop, so every value FC can take is aligned.
+        int c = 1;
+        while ((size_t)(c << 1) <= want && (c << 1) <= 32768) c <<= 1;
+        // ...but never more than FOUR chunks. The cache-derived size above is a per-BUFFER
+        // quantity and so is independent of N, while the cost it trades against -- re-reading the
+        // layer's gate|up|down (134 MB of fp4 on this checkpoint) once per chunk -- scales with the
+        // chunk COUNT. At ctx=16384 the two settings are tied (4096: 9230.46 pp, 8192: 9226.99),
+        // but at 32768 the same 4096 would be 8 chunks against 8192's 4, which is 34 GB of extra
+        // weight traffic for an L2 advantage worth 0.04%. Four chunks is where the measured
+        // plateau starts and it keeps the count fixed as context grows.
+        int by_count = 1;
+        while ((by_count << 1) <= 32768 && (size_t)(by_count << 1) * 4 <= (size_t)N) by_count <<= 1;
+        if (by_count > c) c = by_count;
+        if (c < kMinFfnChunk) c = kMinFfnChunk;
+        if (c > 32768) c = 32768;
+        return c;
+    }();
     int FC = (N < ffn_chunk) ? N : ffn_chunk;
     bf16* lin_conv_state = static_cast<bf16*>(s.lin_conv_state);
 
@@ -328,58 +375,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // decode weight copies, which leaves a 32 GB card short of the default chunk's 1.1 GB.
     // This only ever SHRINKS the chunk; FC < N is the same path every context above 32k already
     // takes, and the FFN is per-token independent, so it stays numerically identical.
-    pf_vram("before ffg/ffu");
-    // An explicit SPARKINFER_PREFILL_FFN_CHUNK is an operator decision -- honour it as given.
-    if (!moe && !getenv("SPARKINFER_PREFILL_FFN_CHUNK")) {
-        size_t fb = 0, tb = 0;
-        if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
-            // What still has to come out of `fb` after the FC-scaled pair, so the chunk is sized
-            // against the real remainder rather than all of free VRAM.
-            const size_t tail = (size_t)maxw * sizeof(bf16)                    // wbuf
-                              + (size_t)maxw                                  // W_i8
-                              + (size_t)N * H                                 // A_i8 (int8) floor
-                              + (size_t)N * (sizeof(float) + sizeof(int));    // sx + d_ids
-            const size_t margin = (size_t)64 << 20;    // split-K partials + allocator slack
-            // The chunk-parallel GDN scan draws on this same budget, AFTER this point, and it is
-            // the larger consumer: its workspace is O(N) (~483 MB at ctx=16384). Sizing the FFN
-            // chunk against everything that is free leaves the scan ~25 MB, which forces it into
-            // ~199-token slices -- 83 per layer -- and most of the win from running it at all is
-            // lost. Reserve a working segment for it here so the two are balanced rather than
-            // first-come-first-served. Hybrid stacks only; nothing else runs that scan.
-            //
-            // This can only make the chunk SMALLER, which is the safe direction: an oversized
-            // chunk is what fails the arena alloc and drops the whole pass to the token loop.
-            const size_t gdn_reserve = c.hybrid ? ((size_t)256 << 20) : 0;
-            const size_t claimed = tail + margin + gdn_reserve;
-            const size_t avail = (fb > claimed) ? fb - claimed : 0;
-            const int fc_before = FC;
-            // Test the HALVED value, not the current one: `FC > floor` would step straight past it.
-            while ((FC >> 1) >= kMinFfnChunk &&
-                   (size_t)2 * (size_t)FC * (size_t)ffn * sizeof(bf16) > avail)
-                FC >>= 1;
-            if (FC != fc_before)
-                fprintf(stderr, "[prefill] ffn chunk %d -> %d (ctx=%d, free=%zu MB) to keep the "
-                                "batched pass\n", fc_before, FC, N, fb >> 20);
-        }
-    }
-    bf16* ffg  = a.alloc<bf16>((size_t)FC * ffn);        // ffn gate (12288), bounded to FC tokens
-    bf16* ffu  = a.alloc<bf16>((size_t)FC * ffn);        // ffn up,          bounded to FC tokens
-    bf16* ffh  = ffg;                                    // SwiGLU computed in-place into ffg (down reads it)
-    bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
-    int*  d_ids = a.alloc<int>((size_t)N);
-    pf_vram("after dense arena");
-    if (!a.ok) {
-        // Report the numbers, not just the fact: this fallback costs ~50x at long context and the
-        // old message gave no way to tell a genuinely-too-small card from a chunk set too large.
-        size_t fb = 0, tb = 0;
-        cudaMemGetInfo(&fb, &tb);
-        const size_t held = a.total();
-        a.free_all();
-        fprintf(stderr, "[prefill] scratch alloc failed (ctx=%d, chunk=%d, held=%zu MB, "
-                        "free=%zu/%zu MB) -> fallback\n",
-                N, FC, held >> 20, fb >> 20, tb >> 20);
-        return -1;
-    }
+    // HOISTED above the FFN-chunk sizing loop below (it was immediately after the arena bail).
+    // That loop has to know whether the int8 arena is allocated AT ALL before it can price
+    // what still has to come out of free VRAM. Nothing in this block reads FC or any arena
+    // pointer, so the move is mechanical; the FC-dependent A_i8/W_i8/sx sizing stays below.
     // int8 tensor-core projections (prefill_gemm_i8): ~2x the bf16 GEMM at int8==bf16 output fidelity
     // (GGUF weights are already Q4_K/Q6_K -> int8 weight-quant is lossless vs what's stored). Default
     // ON at every batched context; SPARKINFER_PREFILL_I8=0 disables (A/B). The int8 scratch lives in
@@ -459,6 +458,86 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // So: N rows x the widest K any N-row projection uses, OR FC rows x ffn for the chunked FFN.
     // MoE: no chunked FFN; projections quantize N rows x maxAK.
     const bool need_i8 = use_i8 || use_i8_ffn || use_i8_attn || use_fp8_gdn || moe_shared_i8 || moe_fp8;
+
+    pf_vram("before ffg/ffu");
+    // ffg/ffu ALIAS buffers that are provably dead across the FFN, so on the dense path the
+    // FC-scaled pair usually costs NO new VRAM at all -- which is the whole reason the sizing loop
+    // below exists. Liveness, per layer: b8 carries the raw projection output (lin_qkv, or [q|gate])
+    // and its LAST read is the GDN conv or split_q_gate; lz carries the GDN z gate and its last
+    // read is the gated norm. Both are consumed by the o / ssm_out projection, which is upstream of
+    // the pre-FFN norm, and neither is written again until the NEXT layer's projections. The FFN
+    // itself touches only hn / ffg / ffu / the fp4 operands / x. Every stream fork in this function
+    // is MoE-only (moe_overlap / moe_hide_sg), so on the dense path nothing runs concurrently that
+    // could still be reading them.
+    //
+    // This matters because the sizing loop below could only ever SHRINK FC, and at ctx=32768 it
+    // shrinks it all the way to the kMinFfnChunk floor of 1024 -- which the chunk curve above
+    // measures as the WORST point available, 1.58% behind a single-chunk pass and 2.47% behind the
+    // 4-chunk optimum. With the pair aliased there is nothing to shrink for, so FC simply stays at
+    // the cache-derived optimum on every box, instead of being decided by how much VRAM happened
+    // to be free. It also hands back 285 MB at ctx=16384 (1.1 GB against the old FC=N default).
+    // MoE keeps real buffers: its grouped FFN has its own scratch and its shared-expert leg runs on
+    // forked streams, a liveness argument this has not been checked against.
+    const bool ffn_alias = !moe && (size_t)FC * (size_t)ffn <= (size_t)N * (size_t)wide
+                                && (size_t)FC * (size_t)ffn <= (size_t)N * (size_t)lvdim;
+    // An explicit SPARKINFER_PREFILL_FFN_CHUNK is an operator decision -- honour it as given.
+    if (!ffn_alias && !moe && !getenv("SPARKINFER_PREFILL_FFN_CHUNK")) {
+        size_t fb = 0, tb = 0;
+        if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
+            // What still has to come out of `fb` after the FC-scaled pair, so the chunk is sized
+            // against the real remainder rather than all of free VRAM.
+            // W_i8, A_i8 and sx are allocated ONLY when need_i8. Charging for them unconditionally
+            // over-reserved 257 MB at ctx=32768 on this checkpoint (maxw = 89.1M and N*H = 167.8M),
+            // which is enough on its own to drive `avail` to zero and slam FC onto the kMinFfnChunk
+            // floor -- the measured WORST point of the chunk curve above, 1.58% behind a 4-chunk
+            // pass. dspark_tau_check pins SPARKINFER_PREFILL_I8=0 and 32768 is below bf16_minctx,
+            // so need_i8 is false on exactly the path the scored prefill takes.
+            const size_t tail = (size_t)maxw * sizeof(bf16)                    // wbuf
+                              + (need_i8 ? (size_t)maxw : 0)                   // W_i8
+                              + (need_i8 ? (size_t)N * H : 0)                  // A_i8 (int8) floor
+                              + (need_i8 ? (size_t)N * sizeof(float) : 0)      // sx
+                              + (size_t)N * sizeof(int);                       // d_ids
+            const size_t margin = (size_t)64 << 20;    // split-K partials + allocator slack
+            // The chunk-parallel GDN scan draws on this same budget, AFTER this point, and it is
+            // the larger consumer: its workspace is O(N) (~483 MB at ctx=16384). Sizing the FFN
+            // chunk against everything that is free leaves the scan ~25 MB, which forces it into
+            // ~199-token slices -- 83 per layer -- and most of the win from running it at all is
+            // lost. Reserve a working segment for it here so the two are balanced rather than
+            // first-come-first-served. Hybrid stacks only; nothing else runs that scan.
+            //
+            // This can only make the chunk SMALLER, which is the safe direction: an oversized
+            // chunk is what fails the arena alloc and drops the whole pass to the token loop.
+            const size_t gdn_reserve = c.hybrid ? ((size_t)256 << 20) : 0;
+            const size_t claimed = tail + margin + gdn_reserve;
+            const size_t avail = (fb > claimed) ? fb - claimed : 0;
+            const int fc_before = FC;
+            // Test the HALVED value, not the current one: `FC > floor` would step straight past it.
+            while ((FC >> 1) >= kMinFfnChunk &&
+                   (size_t)2 * (size_t)FC * (size_t)ffn * sizeof(bf16) > avail)
+                FC >>= 1;
+            if (FC != fc_before)
+                fprintf(stderr, "[prefill] ffn chunk %d -> %d (ctx=%d, free=%zu MB) to keep the "
+                                "batched pass\n", fc_before, FC, N, fb >> 20);
+        }
+    }
+    bf16* ffg  = ffn_alias ? b8 : a.alloc<bf16>((size_t)FC * ffn);   // ffn gate, bounded to FC tokens
+    bf16* ffu  = ffn_alias ? lz : a.alloc<bf16>((size_t)FC * ffn);   // ffn up,   bounded to FC tokens
+    bf16* ffh  = ffg;                                    // SwiGLU computed in-place into ffg (down reads it)
+    bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
+    int*  d_ids = a.alloc<int>((size_t)N);
+    pf_vram("after dense arena");
+    if (!a.ok) {
+        // Report the numbers, not just the fact: this fallback costs ~50x at long context and the
+        // old message gave no way to tell a genuinely-too-small card from a chunk set too large.
+        size_t fb = 0, tb = 0;
+        cudaMemGetInfo(&fb, &tb);
+        const size_t held = a.total();
+        a.free_all();
+        fprintf(stderr, "[prefill] scratch alloc failed (ctx=%d, chunk=%d, held=%zu MB, "
+                        "free=%zu/%zu MB) -> fallback\n",
+                N, FC, held >> 20, fb >> 20, tb >> 20);
+        return -1;
+    }
     // Both terms, on both dense paths: the N-row projections and the FC-row FFN chunk each have to
     // fit, and neither one bounds the other once FC and N can differ.
     const int a_wide_k = imax(H, imax(qdim, lvdim));   // widest K quantized with N rows

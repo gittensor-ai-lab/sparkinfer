@@ -100,7 +100,8 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
                                     __nv_bfloat16* __restrict__ w_buf,
                                     __nv_bfloat16* __restrict__ u_buf,
                                     float* __restrict__ m_buf,
-                                    int n_tokens, int q_heads, int v_heads, bool qh_block) {
+                                    int n_tokens, int q_heads, int v_heads, bool qh_block,
+                                    bool warp_inv) {
     extern __shared__ char s_raw[];
     __nv_bfloat16* s_k = reinterpret_cast<__nv_bfloat16*>(s_raw);              // [C][HD+PAD]
     __nv_bfloat16* s_x = s_k + (size_t)C * (HD + PAD);                         // [C][HD+PAD] q then v
@@ -193,16 +194,59 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
 
     // ---- T = (I + A)^-1 in place, by forward substitution over rows ----
     //   T[i][j] = -A[i][j] - sum_{m=j+1}^{i-1} A[i][m] T[m][j]      (T[j][j] = 1)
-    // Row i still holds A while it is being read; rows m < i already hold T.
-    for (int i = 1; i < C; i++) {
-        for (int j = tid; j < i; j += nthr) {
-            float acc = s_A[i * (C + PAD) + j];
-            for (int m = j + 1; m < i; m++) acc += s_A[i * (C + PAD) + m] * s_A[m * (C + PAD) + j];
-            s_t[j] = -acc;
+    //
+    // WHY THIS IS WARP-PRIVATE. The recurrence is serial in i and each column j carries its own
+    // dependent chain, so the block form below (kept as the fallback) costs C-1 rounds of
+    //     compute -> __syncthreads -> write back -> __syncthreads
+    // = 62 block barriers at C=32, and in every one of those rounds only threads j < i are live.
+    // At C=32 that is ONE warp of the block's eight, and its chain runs through SHARED MEMORY:
+    // T[m][j] is read back from s_A the round after it was written, so each FMA pays a smem
+    // round trip (~30 cycles) instead of a register dependency (~4).
+    //
+    // Column j is only ever read by lane j, so give lane j the whole column in REGISTERS. C is
+    // the warp size here, so one warp owns the entire triangle, both loops unroll (making every
+    // tcol[] index a compile-time constant, which is what keeps it in registers rather than
+    // spilling to local memory), and the barriers disappear entirely -- the warp is implicitly
+    // synchronized. Row i of s_A is never overwritten while the substitution runs, so the
+    // "row i still holds A" hazard the block form had to fence against cannot arise.
+    //
+    // BIT-IDENTICAL: `acc` still starts at A[i][j] and still accumulates m in ASCENDING order
+    // over exactly the same index set (m > j && m < i), so every output is the same float. The
+    // predicate replaces the loop bounds; it does not reassociate the sum.
+    if constexpr (C == 32) if (warp_inv) {
+        if (tid < C) {
+            const int j = tid;
+            float tcol[C];                       // tcol[m] == T[m][j]
+            #pragma unroll
+            for (int m = 0; m < C; m++) tcol[m] = 0.f;
+            tcol[j] = 1.f;                       // unit diagonal
+            #pragma unroll
+            for (int i = 1; i < C; i++) {
+                // Warp-uniform address: all C lanes read the same s_A element, which the shared
+                // memory unit serves as a broadcast, not a C-way conflict.
+                float acc = s_A[i * (C + PAD) + j];
+                #pragma unroll
+                for (int m = 0; m < C; m++)
+                    if (m > j && m < i) acc += s_A[i * (C + PAD) + m] * tcol[m];
+                tcol[i] = -acc;                  // only lanes j < i publish below
+            }
+            #pragma unroll
+            for (int i = 1; i < C; i++)
+                if (j < i) s_A[i * (C + PAD) + j] = tcol[i];
         }
         __syncthreads();
-        for (int j = tid; j < i; j += nthr) s_A[i * (C + PAD) + j] = s_t[j];
-        __syncthreads();
+    }
+    if (!(C == 32 && warp_inv)) {
+        for (int i = 1; i < C; i++) {
+            for (int j = tid; j < i; j += nthr) {
+                float acc = s_A[i * (C + PAD) + j];
+                for (int m = j + 1; m < i; m++) acc += s_A[i * (C + PAD) + m] * s_A[m * (C + PAD) + j];
+                s_t[j] = -acc;
+            }
+            __syncthreads();
+            for (int j = tid; j < i; j += nthr) s_A[i * (C + PAD) + j] = s_t[j];
+            __syncthreads();
+        }
     }
 
     // ---- W^ = T . (b_m exp(G_m) k_m) ----
@@ -721,6 +765,14 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         return e ? atoi(e) : 2048;
     }();
 
+    // Warp-private register forward substitution in the prep kernel (see the kernel body).
+    // Bit-identical to the block form; SPARKINFER_PREFILL_GDN_PREP_WARPINV=0 restores it so the
+    // two can be A/B'd in ONE binary.
+    static const bool prep_warp_inv = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_PREP_WARPINV");
+        return !(e && e[0] == '0');
+    }();
+
     if (!enabled || head_dim != HD || n_tokens < minctx) return false;
     if (q_heads <= 0 || v_heads <= 0) return false;
 
@@ -799,7 +851,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         dim3 gprep(n_chunks, v_heads);
         pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
             qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
-            len, q_heads, v_heads, qh_block);
+            len, q_heads, v_heads, qh_block, prep_warp_inv);
         if (use_regs) {
             pf_gdnc_scan_kernel<C, HD, JC_S, true>
                 <<<dim3(v_heads, HD / JC_S), (C * JC_S) / 4,
