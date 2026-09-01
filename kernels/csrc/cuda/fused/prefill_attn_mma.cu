@@ -905,7 +905,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                     for (int u = 0; u < GN / 32; ++u) {
                         const int t = lane + u * 32;
                         s_pih[r * (2 * pld) + t] =
-                            (signed char)(pd == 0.f ? 0 : (int)roundf(sc[u] / pd));
+                            (signed char)(pd == 0.f ? 0 : __float2int_rn(sc[u] / pd));
                     }
                 }
                 if (lane == 0) {

@@ -1277,7 +1277,7 @@ __global__ void pf_qknorm_rope_kv_bf16_kernel(
             }
             __syncthreads();
             const float s = s_warp[0] * (1.f / 127.f);
-            v_i8[base + t] = (signed char)(s == 0.f ? 0 : (int)roundf(x / s));
+            v_i8[base + t] = (signed char)(s == 0.f ? 0 : __float2int_rn(x / s));
             if (t == 0) v_i8_scale[(size_t)tok * n_kv_heads + hh] = __float2half(s);
         }
     }
