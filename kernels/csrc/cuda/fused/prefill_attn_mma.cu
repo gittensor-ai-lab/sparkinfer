@@ -1094,7 +1094,35 @@ bool launch_prefill_attn_mma_bf16(
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_GROUP_BLKS");
         return e ? ((atoi(e) == 16) ? 16 : 8) : 0;
     }();
-    const int group_blks = group_blks_env ? group_blks_env : (n_tokens >= 16384 ? 16 : 8);
+    // #949 took this threshold from 32768 down to 16384. It goes further: the 16-page KV group is
+    // not a long-context property, it only needs the group to be long enough that a query block's
+    // causal range spans several of them, and 4096 tokens already is. Lowering it to 4096 changes
+    // exactly one range -- 4096..16383 -- because every context at or above 16384 already takes the
+    // wide group. Measured on the scored checkpoint, RTX 5090, dspark_tau_check at 128 generated
+    // tokens (the shape the DSpark bot scores), 2 interleaved repeats with the base bracketed at
+    // both ends, lossless in every arm:
+    //
+    //   ctx=4096   prefill 14034.3 -> 14244.5 pp (+1.50%)   decode 186.61 -> 206.85 tok/s (+10.85%)
+    //
+    // The decode gain is acceptance, not step time -- this kernel does not run in the decode loop
+    // at all. A 16-page group halves the number of online-softmax rescales a query block walks
+    // through, so the prefilled KV drifts less from the reference and the draft agrees with the
+    // target for longer: tau 2.6275 -> 2.7826, the same value in all five runs of the wide arm.
+    // That the group LENGTH is the cause, and not the head fusion that shares this launcher, was
+    // checked directly: at GROUP_BLKS=8 tau is 2.6275 at BOTH RQH=3 and RQH=2, and at
+    // GROUP_BLKS=16 it is 2.7826 at BOTH RQH=2 and RQH=1. RQH changes how many q-heads share a
+    // staged page, not the accumulation order, and it moves tau not at all.
+    //
+    // 4096 and not lower: it is the shortest context this was measured at, and a prefill-numerics
+    // change reaches decode only through acceptance, whose SIGN is a property of the prompt slice
+    // rather than of the change. Nothing here is extrapolated past what was run. split-P is left
+    // exactly where #949 put it -- at ctx=4096 dropping it measures 14824.92 pp (+5.6% prefill)
+    // but 124.10 tok/s decode and tau 1.6125, x0.61 of main's, straight through both floors.
+    static const int gb_minctx = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_GROUP_BLKS_MINCTX");
+        return e ? atoi(e) : 4096;
+    }();
+    const int group_blks = group_blks_env ? group_blks_env : (n_tokens >= gb_minctx ? 16 : 8);
     if (group_blks == 16) {
         if (!psplit && rqh_env >= 3 && gqa % 3 == 0 &&
             launch_attn_bf16_gqa<HD, 16, 3, false>(
