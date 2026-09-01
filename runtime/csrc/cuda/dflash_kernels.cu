@@ -1663,14 +1663,30 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
             // is 4 groups -> 1 and the trade is different, so it was re-derived rather than
             // inherited. Measured at ctx 4096, K=65536, one binary, draft ms/block:
             //     ROWS 2 -> 2.070    ROWS 4 -> 2.001    ROWS 8 -> 1.955
-            // Monotone, so the old note does not hold at this width. 8 covers the whole block in
-            // one group; the epilogue already drops rows past q_len, so the overhang is free.
-            // SPARKINFER_DFLASH_ATTN_ROWS pins it for an A/B out of one binary.
+            // Monotone, so the old note does not hold at this width: 8 covers the whole block in
+            // one group. SPARKINFER_DFLASH_ATTN_ROWS pins it for an A/B out of one binary.
+            //
+            // But 8 is only right when the block IS 8 (or 7) wide, and the overhang is NOT
+            // free. The tile is a fixed-size register array: rows past q_len carry qr[]=0 and
+            // are still loaded, still dotted
+            // against every key, and still folded through the butterfly -- only the
+            // online-softmax update (step 3) skips them. So a tile wider than the block pays for
+            // the overhang in both work and REGISTERS, and buys nothing: what a wide tile is FOR
+            // is collapsing the ROW GROUPS that each re-read the KV, and one group is one group
+            // at either width.
+            // The 12288+ band takes proposal depth 2 (qwen35.cpp), which makes the draft's block 4
+            // rows wide, so the shipped 8 was covering a 4-row block with an 8-row tile on every
+            // layer of every step there. Pick the SMALLEST instantiated tier that still covers the
+            // block in one group; at width 7-8 that is the same 8 the sweep above measured.
+            // Bit-identical either way: each row's dots, its butterfly and its fold are
+            // independent of ROWS, so rows 0..q_len-1 see the same values in the same order.
             static const int rows_env = []{
                 const char* e = getenv("SPARKINFER_DFLASH_ATTN_ROWS");
-                int v = e ? atoi(e) : 8;
-                return (v == 2 || v == 4 || v == 8) ? v : 8;
+                int v = e ? atoi(e) : 0;
+                return (v == 2 || v == 4 || v == 8) ? v : 0;
             }();
+            const int rows_tile = rows_env ? rows_env
+                                : (q_len <= 2 ? 2 : (q_len <= 4 ? 4 : 8));
             const int n_splits_full = attn_gqa_splits(kv_len);
             // A sliding-window layer masks a key only after the kernel has loaded it and reduced
             // its QK dot, so past the window length it streams the whole cache to discard most of
@@ -1711,9 +1727,9 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                         q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale,   \
                         n_splits);                                                                \
             } while (0)
-            if (rows_env == 8)      SI_DF_ATTN_ROWS(8);
-            else if (rows_env == 4) SI_DF_ATTN_ROWS(4);
-            else                    SI_DF_ATTN_ROWS(2);
+            if (rows_tile == 8)      SI_DF_ATTN_ROWS(8);
+            else if (rows_tile == 4) SI_DF_ATTN_ROWS(4);
+            else                     SI_DF_ATTN_ROWS(2);
 #undef SI_DF_ATTN_ROWS
             k_attn_split_combine<<<dim3(q_len, n_q), 128, 0, stream>>>(
                 fa_m, fa_l, fa_acc, (bf16*)out, n_q, n_splits);
