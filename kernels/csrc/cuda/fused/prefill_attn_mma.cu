@@ -738,12 +738,13 @@ bool launch_prefill_attn_mma(
 // mantissa, so P*V is evaluated as p_hi*V + p_lo*V: two mma's over the SAME V fragment, ~fp32
 // accuracy in P for 1.5x the PV work. `l` is then summed from float(p_hi)+float(p_lo) so the
 // denominator matches the numerator exactly rather than being the unrounded fp32 sum.
-template <int HEAD_DIM, int GROUP_BLKS, int RQH, bool PSPLIT>
+template <int HEAD_DIM, int GROUP_BLKS, int RQH, bool PSPLIT, bool VI8 = false>
 __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
     const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale, int qld, int pld) {
+    int block_size, int max_blocks_per_seq, float scale, int qld, int pld,
+    const signed char* __restrict__ v8, const __half* __restrict__ v8_scale) {
     using namespace nvcuda::wmma;
     constexpr int BM    = 16;                    // query rows per block == wmma M == KV page size
     constexpr int GN    = GROUP_BLKS * 16;       // keys per iteration
@@ -769,10 +770,25 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     // Low half of the split P, immediately after the high half; zero-sized when PSPLIT is off.
     __nv_bfloat16* s_p2 = s_p + (size_t)RQH * BM * pld;                   // [RQH][BM][pld]
     constexpr int PPLANES = PSPLIT ? 2 : 1;
+    // INT8 P plane. It REPLACES the bf16 one (PV reads only this when VI8), so the block gets
+    // SMALLER: 12,672 B of int8 against 25,344 B of bf16 at RQH=3/GROUP_BLKS=16.
+    // INT8 leading dimension must be a multiple of 16 -- wmma's int8 fragment loads want a
+    // 16-BYTE aligned row start, and pld = GN + 8 = 264 is only a multiple of 8. Legal for bf16
+    // (8 elements = 16 B), a misaligned-address fault for int8. Give the int8 plane its own pitch.
+    const int pld8 = (GN + 16);
+    signed char* s_pi = reinterpret_cast<signed char*>(s_p);              // [RQH][BM][pld8]
     constexpr int SBLK = (RQH * BM * GN > BM * HEAD_DIM) ? RQH * BM * GN : BM * HEAD_DIM;
-    float* s_s    = reinterpret_cast<float*>(s_p + (size_t)PPLANES * RQH * BM * pld);  // [RQH][BM][GN]
+    // The P plane is int8 under VI8 and bf16 otherwise, so s_s has to step over the ACTUAL byte
+    // count -- stepping over PPLANES*RQH*BM*pld bf16 ELEMENTS in the int8 case overruns the
+    // launcher's allocation by RQH*BM*pld bytes and corrupts everything past s_s.
+    float* s_s    = reinterpret_cast<float*>(
+        VI8 ? reinterpret_cast<char*>(s_p) + (size_t)RQH * BM * pld8
+            : reinterpret_cast<char*>(s_p)
+                  + (size_t)PPLANES * RQH * BM * pld * sizeof(__nv_bfloat16));  // [BM][GN]
     float* s_o    = s_s;                                                     // [BM][HEAD_DIM]
-    float* s_m    = s_s + SBLK;                                              // [RQH][BM]
+    float* s_vs   = s_s + SBLK;                                              // [GN]  per-key V scale
+    float* s_ps   = s_vs + (VI8 ? GN : 0);                                   // [RQH][BM] P scale
+    float* s_m    = s_ps + (VI8 ? RQH * BM : 0);                             // [RQH][BM]
     float* s_l    = s_m + RQH * BM;                                          // [RQH][BM]
     float* s_corr = s_l + RQH * BM;                                          // [RQH][BM]
 
@@ -816,6 +832,20 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     for (int k0 = 0; k0 < last_q + 1; k0 += GN) {
         const int nk   = min(GN, last_q + 1 - k0);
         const int gblk = (nk + 15) / 16;
+
+        // Per-KEY V scale for this group. It cannot be applied after the int8 P x V mma -- the
+        // mma sums over keys, so a per-key factor does not come out of the int32 accumulator.
+        // Fold it into P instead (see below): sum_k P[r,k]*sv[k]*V8[k,d] means quantizing
+        // P'[r,k] = P[r,k]*sv[k], after which the epilogue needs only the per-ROW P scale. This is
+        // exactly why the int8 twin above carries s_ps[] and no V scale.
+        if (VI8) {
+            for (int j = tid; j < GN; j += blockDim.x) {
+                const int gt = k0 + j;
+                s_vs[j] = (gt < n_tokens) ? __half2float(v8_scale[(size_t)gt * n_kv_heads + kvh])
+                                          : 0.f;
+            }
+            __syncthreads();
+        }
 
         // ---- QK: load each K page fragment ONCE, feed RQH q-heads ----
         if (warp < gblk) {
@@ -866,11 +896,13 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                 const float m_old = s_m[h * BM + r], m_new = fmaxf(m_old, mx);
                 const float corr = __expf(m_old - m_new);
                 float sum = 0.f;
+                float pvv[GN / 32], pam = 0.f;
                 #pragma unroll
                 for (int u = 0; u < GN / 32; u++) {
                     const int t = lane + u * 32;
                     float p = 0.f;
                     if (sc[u] > -1e29f) p = __expf(sc[u] - m_new);
+                    if (VI8) { pvv[u] = p * s_vs[t]; pam = fmaxf(pam, pvv[u]); continue; }
                     const __nv_bfloat16 hi = __float2bfloat16(p);
                     s_ph[r * pld + t] = hi;
                     if (PSPLIT) {
@@ -882,6 +914,25 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                     } else {
                         sum += __bfloat162float(hi);
                     }
+                }
+                if (VI8) {
+                    // Row max of P' -> the one scale the epilogue needs.
+                    #pragma unroll
+                    for (int o = 16; o > 0; o >>= 1)
+                        pam = fmaxf(pam, __shfl_xor_sync(0xffffffffu, pam, o));
+                    const float sp  = pam > 0.f ? pam * (1.f / 127.f) : 1.f;
+                    const float isp = 1.f / sp;
+                    #pragma unroll
+                    for (int u = 0; u < GN / 32; u++) {
+                        const int t = lane + u * 32;
+                        const int q = __float2int_rn(pvv[u] * isp);
+                        s_pi[((size_t)h * BM + r) * pld8 + t] =
+                            (signed char)(q < -127 ? -127 : (q > 127 ? 127 : q));
+                        // l must count exactly what PV will consume, so re-dequantize.
+                        const float sv = s_vs[t];
+                        sum += (sv > 0.f) ? ((float)q * sp / sv) : 0.f;
+                    }
+                    if (lane == 0) s_ps[h * BM + r] = sp;
                 }
                 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
@@ -898,6 +949,34 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
         #pragma unroll
         for (int dd = 0; dd < DPW; dd++) {
             const int dt = warp * DPW + dd;
+            if (VI8) {
+                fragment<accumulator, 16, 16, 16, int> ci[RQH];
+                #pragma unroll
+                for (int h = 0; h < RQH; h++) fill_fragment(ci[h], 0);
+                for (int ks = 0; ks < gblk; ks++) {
+                    // Token-indexed shadow: batched prefill always starts at position 0, so key
+                    // token == key index and no block_table hop is needed.
+                    const signed char* v8b =
+                        v8 + ((size_t)(k0 + ks * 16) * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
+                    fragment<matrix_a, 16, 16, 16, signed char, row_major> ai;
+                    fragment<matrix_b, 16, 16, 16, signed char, row_major> bi;
+                    load_matrix_sync(bi, v8b, KVLD);
+                    #pragma unroll
+                    for (int h = 0; h < RQH; h++) {
+                        load_matrix_sync(ai, s_pi + ((size_t)h * BM) * pld8 + ks * 16, pld8);
+                        mma_sync(ci[h], ai, bi, ci[h]);
+                    }
+                }
+                #pragma unroll
+                for (int h = 0; h < RQH; h++)
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        const int r = (int)idxf.x[e];
+                        ofr[h][dd].x[e] = __fmaf_rn((float)ci[h].x[e], s_ps[h * BM + r],
+                                                    ofr[h][dd].x[e] * s_corr[h * BM + r]);
+                    }
+                continue;
+            }
             fragment<accumulator, 16, 16, 16, float> cf[RQH];
             #pragma unroll
             for (int h = 0; h < RQH; h++) fill_fragment(cf[h], 0.f);
@@ -950,11 +1029,12 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     }
 }
 
-template <int HD, int GROUP_BLKS, int RQH, bool PSPLIT>
+template <int HD, int GROUP_BLKS, int RQH, bool PSPLIT, bool VI8 = false>
 static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* v_pool,
                                  const int* block_table, void* attn, int n_tokens,
                                  int n_q_heads, int n_kv_heads, int block_size,
-                                 int max_blocks_per_seq, float scale, cudaStream_t stream) {
+                                 int max_blocks_per_seq, float scale, cudaStream_t stream,
+                                 const void* v8 = nullptr, const void* v8_scale = nullptr) {
     constexpr int BM = 16, GN = GROUP_BLKS * 16;
     // Same bank-conflict argument as attn_smem_pad() above, in bf16 elements: an unpadded row
     // stride of HD (512 B) or GN (256 B) is a whole multiple of the 128-byte bank row, so all 16
@@ -963,22 +1043,28 @@ static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* 
     const int pad = attn_smem_pad() ? 8 : 0;
     const int qld = HD + pad, pld = GN + pad;
     constexpr int SBLK = (RQH * BM * GN > BM * HD) ? RQH * BM * GN : BM * HD;
+    // VI8 stores P as int8 INSTEAD of bf16, so the plane halves; the two extra float arrays
+    // (per-key V scale, per-row P scale) cost GN + RQH*BM. Net at RQH=3/GROUP_BLKS=16:
+    // 100,416 B -> 87,744 B, i.e. this path needs LESS shared memory than the bf16 one.
     const size_t sm = (size_t)RQH * BM * qld * sizeof(__nv_bfloat16)
-                    + (size_t)(PSPLIT ? 2 : 1) * RQH * BM * pld * sizeof(__nv_bfloat16)
-                    + (size_t)(SBLK + 3 * RQH * BM) * sizeof(float);
+                    + (VI8 ? (size_t)RQH * BM * (GN + 16)
+                           : (size_t)(PSPLIT ? 2 : 1) * RQH * BM * pld * sizeof(__nv_bfloat16))
+                    + (size_t)(SBLK + 3 * RQH * BM) * sizeof(float)
+                    + (VI8 ? (size_t)(GN + RQH * BM) * sizeof(float) : 0);
     static int cfg = 0;
     if (!cfg) {
-        if (cudaFuncSetAttribute(pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT>,
+        if (cudaFuncSetAttribute(pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT, VI8>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) != cudaSuccess)
             return false;
         cfg = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
-    pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT><<<grid, GROUP_BLKS * 32, sm, stream>>>(
+    pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT, VI8><<<grid, GROUP_BLKS * 32, sm, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
         reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
         reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
-        block_size, max_blocks_per_seq, scale, qld, pld);
+        block_size, max_blocks_per_seq, scale, qld, pld,
+        reinterpret_cast<const signed char*>(v8), reinterpret_cast<const __half*>(v8_scale));
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek --
     // rather than get -- so a pre-existing sticky error is not silently cleared here.
     return cudaPeekAtLastError() == cudaSuccess;
@@ -987,7 +1073,8 @@ static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* 
 bool launch_prefill_attn_mma_bf16(
     const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream,
+    const void* v8, const void* v8_scale) {
     constexpr int HD = 256;
     static const int enabled = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_MMA");
@@ -1022,6 +1109,16 @@ bool launch_prefill_attn_mma_bf16(
     }();
     const int group_blks = group_blks_env ? group_blks_env : (n_tokens >= 32768 ? 16 : 8);
     if (group_blks == 16) {
+        // INT8 P x V tier. Q, K and the online softmax stay BF16; only the P x V contraction moves
+        // to the int8 tensor cores, which run at 2x the bf16 rate on sm_120. The per-key V scale is
+        // folded into P before quantizing (see the kernel), so the int32 accumulator stays exact
+        // and the epilogue needs one per-row scale. Needs LESS shared memory than the bf16 path
+        // (int8 P plane replaces the bf16 one), and falls through when no shadow was built.
+        if (!psplit && v8 && v8_scale && rqh_env >= 3 && gqa % 3 == 0 &&
+            launch_attn_bf16_gqa<HD, 16, 3, false, true>(
+                q, k_pool, v_pool, block_table, attn, n_tokens, n_q_heads, n_kv_heads,
+                block_size, max_blocks_per_seq, scale, stream, v8, v8_scale))
+            return true;
         if (!psplit && rqh_env >= 3 && gqa % 3 == 0 &&
             launch_attn_bf16_gqa<HD, 16, 3, false>(
                 q, k_pool, v_pool, block_table, attn, n_tokens, n_q_heads, n_kv_heads,

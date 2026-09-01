@@ -520,6 +520,45 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                 "batched pass\n", fc_before, FC, N, fb >> 20);
         }
     }
+    // INT8 V SHADOW for the >=32k prefill P x V stage (see launch_prefill_attn_mma_bf16). The bf16
+    // KV pool stays authoritative -- decode and every shorter context read only that -- so this is
+    // an extra copy, not a degraded cache. N * n_kv_heads * head_dim bytes = 33.5 MB at ctx=32768
+    // on this checkpoint, plus one half per (token, kv-head) for the scale.
+    static const bool vi8_on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_VI8");
+        return !(e && e[0] == '0');
+    }();
+    static const int vi8_minctx = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_VI8_MINCTX");
+        return e ? atoi(e) : 32768;
+    }();
+    const bool want_vi8 = vi8_on && !moe && N >= vi8_minctx && c.head_dim == 256;
+    // PAD to a whole 16-key page. The attention reads V a 16-token page at a time and the final
+    // page of the causal range can extend up to 15 tokens past n_tokens -- the paged bf16 pool
+    // absorbs that because its blocks are fully allocated, a token-indexed shadow sized exactly N
+    // does not, and it faults. Those tail keys are masked (P8 = 0 there), so their content is
+    // irrelevant; only the ADDRESS has to be legal.
+    const size_t v8_toks = want_vi8 ? (((size_t)N + 63) & ~(size_t)63) : 0;
+    const size_t v8_bytes = v8_toks * ((size_t)c.n_kv_heads * c.head_dim + (size_t)c.n_kv_heads * 2);
+    // ALIAS `lz`, do not allocate. lz is the GDN z gate: it is written by gdn_qkv_z and last read
+    // by pf_gated_norm, so it is only ever live on a LINEAR-ATTENTION layer -- and the V shadow is
+    // only ever live on a FULL-ATTENTION one, between the KV write and the attention kernel. The
+    // two live ranges are disjoint by layer type. Within an attention layer the shadow is dead
+    // after the attention, and lz's other consumer (ffu, aliased in #937) is not written until the
+    // FFN, which is downstream of the o projection.
+    //
+    // This matters on a starved box: at ctx=32768 the batched arena has ~100 MB of headroom, the
+    // chunk-parallel GDN scan takes whatever is left, and a 33.5 MB allocation here would come
+    // straight out of one of them. lz is N*lvdim*2 = 402 MB at 32k against the 34 MB needed.
+    const bool v8_alias = want_vi8 && v8_bytes <= (size_t)N * (size_t)lvdim * sizeof(bf16);
+    signed char* v8   = !want_vi8 ? nullptr
+                        : (v8_alias ? reinterpret_cast<signed char*>(lz)
+                                    : a.alloc<signed char>(v8_toks * c.n_kv_heads * c.head_dim));
+    void*        v8s  = !want_vi8 ? nullptr
+                        : (v8_alias ? (void*)(reinterpret_cast<signed char*>(lz)
+                                              + v8_toks * (size_t)c.n_kv_heads * c.head_dim)
+                                    : (void*)a.alloc<unsigned short>(v8_toks * c.n_kv_heads));
+    if (want_vi8 && (!v8 || !v8s)) { v8 = nullptr; v8s = nullptr; }   // degrade to the bf16 path
     bf16* ffg  = ffn_alias ? b8 : a.alloc<bf16>((size_t)FC * ffn);   // ffn gate, bounded to FC tokens
     bf16* ffu  = ffn_alias ? lz : a.alloc<bf16>((size_t)FC * ffn);   // ffn up,   bounded to FC tokens
     bf16* ffh  = ffg;                                    // SwiGLU computed in-place into ffg (down reads it)
@@ -1561,9 +1600,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     }
                     kernels::launch_prefill_qknorm_rope_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
                         kpool, vpool, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                        rope_dim, rope_theta, eps, bs, mbs, st);
+                        rope_dim, rope_theta, eps, bs, mbs, st, v8, v8s);
                     kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, btable, att,
-                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
+                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st,
+                        v8, v8s);
                 } else {
                     kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
                         kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,

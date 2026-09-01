@@ -1203,7 +1203,8 @@ __global__ void pf_qknorm_rope_kv_bf16_kernel(
     __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
-    int block_size, int max_blocks_per_seq) {
+    int block_size, int max_blocks_per_seq,
+    signed char* __restrict__ v8, __half* __restrict__ v8_scale) {
     const int tok  = blockIdx.x;
     const int unit = blockIdx.y;
     const int t    = threadIdx.x;
@@ -1261,6 +1262,30 @@ __global__ void pf_qknorm_rope_kv_bf16_kernel(
         const size_t base = ((size_t)tok * n_kv_heads + hh) * head_dim;
         const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
         v_pool[dst + t] = v[base + t];
+        // INT8 V SHADOW for the >=32k prefill P x V stage. The bf16 pool above stays authoritative
+        // -- decode and every shorter context read only that -- so this adds a second copy rather
+        // than degrading the cache. One scale per (token, kv-head): the attention folds it into P
+        // before quantizing, which is what keeps the int32 accumulation exact.
+        // Token-indexed, not paged: batched prefill always starts at position 0.
+        if (v8) {
+            __shared__ float s_va[32];
+            const float vf = pf_to_f(v[base + t]);
+            float a = fabsf(vf);
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+            const int w = t >> 5, ln = t & 31;
+            if (ln == 0) s_va[w] = a;
+            __syncthreads();
+            float m2 = 0.f;
+            const int nw = (int)((blockDim.x + 31) >> 5);
+            for (int i2 = 0; i2 < nw; i2++) m2 = fmaxf(m2, s_va[i2]);
+            const float sv = (m2 > 0.f) ? m2 * (1.f / 127.f) : 1.f;
+            const int q8 = __float2int_rn(vf / sv);
+            const size_t vd = ((size_t)tok * n_kv_heads + hh) * head_dim + t;
+            v8[vd] = (signed char)(q8 < -127 ? -127 : (q8 > 127 ? 127 : q8));
+            if (t == 0) v8_scale[(size_t)tok * n_kv_heads + hh] = __float2half(sv);
+            __syncthreads();
+        }
     }
 }
 
@@ -1752,7 +1777,7 @@ void launch_prefill_qknorm_rope_kv_bf16(
     void* k_pool, void* v_pool,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream) {
+    cudaStream_t stream, void* v8, void* v8_scale) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);
     const size_t shmem = (size_t)head_dim * sizeof(float);
     pf_qknorm_rope_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
@@ -1761,19 +1786,21 @@ void launch_prefill_qknorm_rope_kv_bf16(
         reinterpret_cast<const __nv_bfloat16*>(k_w),
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
         block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-        block_size, max_blocks_per_seq);
+        block_size, max_blocks_per_seq,
+        reinterpret_cast<signed char*>(v8), reinterpret_cast<__half*>(v8_scale));
 }
 
 bool launch_prefill_attn_bf16_paged(
     const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream,
+    const void* v8, const void* v8_scale) {
     // Tensor cores first. pf_attn_bf16_paged_kernel below is one warp per (query, q-head) walking
     // the causal history a key at a time; at long context that is the prompt pass's largest single
     // cost. The mma kernel declines any shape it does not cover, so this stays a strict addition.
     if (launch_prefill_attn_mma_bf16(q, k_pool, v_pool, block_table, attn, n_tokens, n_q_heads,
                                      n_kv_heads, head_dim, block_size, max_blocks_per_seq,
-                                     scale, stream))
+                                     scale, stream, v8, v8_scale))
         return true;
     dim3 grid(n_tokens, n_q_heads);
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
