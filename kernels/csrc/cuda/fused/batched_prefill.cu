@@ -1329,7 +1329,7 @@ __global__ void pf_attn_bf16_paged_kernel(
 // A 64-key tile needs 64 KB, past the 48 KB dynamic-smem default. The launch is refused, the
 // cudaGetLastError() check below catches it, and the call falls through to the scalar kernel
 // rather than reporting success over an output buffer nothing wrote (measured: stock).
-template <int HEAD_DIM, int TK, int NWARP>
+template <int HEAD_DIM, int TK, int NWARP, int QPW = 1>
 __global__ __launch_bounds__(NWARP * 32) void pf_attn_bf16_paged_tiled_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
     const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
@@ -1345,24 +1345,36 @@ __global__ __launch_bounds__(NWARP * 32) void pf_attn_bf16_paged_tiled_kernel(
     const int kv_head = head / (n_q_heads / n_kv_heads);
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int q0 = blockIdx.x * NWARP;
-    const int qtok = q0 + warp;
+    // QPW queries per warp. A block covers NWARP*QPW queries and walks the key history ONCE for
+    // all of them, so raising QPW cuts the block count -- and with it the total tile-load and
+    // __syncthreads work -- without changing what any single query computes.
+    const int q0 = blockIdx.x * (NWARP * QPW);
     const int nthreads = NWARP * 32;
-
-    float q_reg[ELEMS];
+    int qt[QPW];
     #pragma unroll
-    for (int e = 0; e < ELEMS; e++) q_reg[e] = 0.f;
-    if (qtok < n_tokens) {
-        const size_t q_off = ((size_t)qtok * n_q_heads + head) * HEAD_DIM;
+    for (int j = 0; j < QPW; j++) qt[j] = q0 + warp * QPW + j;
+
+    float q_reg[QPW][ELEMS];
+    #pragma unroll
+    for (int j = 0; j < QPW; j++) {
         #pragma unroll
-        for (int e = 0; e < ELEMS; e++) q_reg[e] = pf_to_f(q[q_off + lane + e * 32]);
+        for (int e = 0; e < ELEMS; e++) q_reg[j][e] = 0.f;
+        if (qt[j] < n_tokens) {
+            const size_t q_off = ((size_t)qt[j] * n_q_heads + head) * HEAD_DIM;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++) q_reg[j][e] = pf_to_f(q[q_off + lane + e * 32]);
+        }
     }
 
-    float m = -1e30f, l = 0.f, acc[ELEMS];
+    float m[QPW], l[QPW], acc[QPW][ELEMS];
     #pragma unroll
-    for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
+    for (int j = 0; j < QPW; j++) {
+        m[j] = -1e30f; l[j] = 0.f;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) acc[j][e] = 0.f;
+    }
 
-    const int qmax = min(q0 + NWARP - 1, n_tokens - 1);
+    const int qmax = min(q0 + NWARP * QPW - 1, n_tokens - 1);
 
     for (int t0 = 0; t0 <= qmax; t0 += TK) {
         const int tk = min(TK, qmax - t0 + 1);
@@ -1377,33 +1389,38 @@ __global__ __launch_bounds__(NWARP * 32) void pf_attn_bf16_paged_tiled_kernel(
             sV[(size_t)kk * HEAD_DIM + d] = v_pool[kv_off + d];
         }
         __syncthreads();
-        if (qtok < n_tokens) {
-            const int kend = min(tk, qtok - t0 + 1);
+        #pragma unroll
+        for (int j = 0; j < QPW; j++) {
+            if (qt[j] >= n_tokens) continue;
+            const int kend = min(tk, qt[j] - t0 + 1);
             for (int kk = 0; kk < kend; kk++) {
                 float partial = 0.f;
                 #pragma unroll
                 for (int e = 0; e < ELEMS; e++)
-                    partial += q_reg[e] * pf_to_f(sK[(size_t)kk * HEAD_DIM + lane + e * 32]);
+                    partial += q_reg[j][e] * pf_to_f(sK[(size_t)kk * HEAD_DIM + lane + e * 32]);
                 const float score = pf_wsum(partial) * scale;
-                const float m_new = fmaxf(m, score);
-                const float corr = __expf(m - m_new);
+                const float m_new = fmaxf(m[j], score);
+                const float corr = __expf(m[j] - m_new);
                 const float p = __expf(score - m_new);
-                l = l * corr + p;
+                l[j] = l[j] * corr + p;
                 #pragma unroll
                 for (int e = 0; e < ELEMS; e++)
-                    acc[e] = acc[e] * corr + p * pf_to_f(sV[(size_t)kk * HEAD_DIM + lane + e * 32]);
-                m = m_new;
+                    acc[j][e] = acc[j][e] * corr
+                              + p * pf_to_f(sV[(size_t)kk * HEAD_DIM + lane + e * 32]);
+                m[j] = m_new;
             }
         }
         __syncthreads();
     }
 
-    if (qtok < n_tokens) {
-        const float inv = (l > 0.f) ? (1.f / l) : 0.f;
-        const size_t q_off = ((size_t)qtok * n_q_heads + head) * HEAD_DIM;
+    #pragma unroll
+    for (int j = 0; j < QPW; j++) {
+        if (qt[j] >= n_tokens) continue;
+        const float inv = (l[j] > 0.f) ? (1.f / l[j]) : 0.f;
+        const size_t q_off = ((size_t)qt[j] * n_q_heads + head) * HEAD_DIM;
         #pragma unroll
         for (int e = 0; e < ELEMS; e++)
-            attn[q_off + lane + e * 32] = __float2bfloat16(acc[e] * inv);
+            attn[q_off + lane + e * 32] = __float2bfloat16(acc[j][e] * inv);
     }
 }
 
@@ -1794,6 +1811,40 @@ bool launch_prefill_attn_bf16_paged(
         const int v = e ? atoi(e) : 32;
         return (v == 4 || v == 8 || v == 16 || v == 32) ? v : 8;
     }();
+    // Queries handled per warp. =1 restores the one-query-per-warp geometry for A/B. 2 measured
+    // best at ctx=32k: 1447 -> 1522 pp. 3 and 4 regress (1408 / 1153) -- each warp holds QPW copies
+    // of q_reg[8] and acc[8], and past 2 the register pressure costs more than the halved block
+    // count buys. Tile width is insensitive at QPW=2 (24k 1517, 32k 1522, 40k 1522, 48k 1523).
+    static const int qpw = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_QPW");
+        const int v = e ? atoi(e) : 2;
+        return (v == 1 || v == 2 || v == 3 || v == 4) ? v : 1;
+    }();
+    if (tile && qpw > 1 && head_dim == 256 && n_kv_heads > 0 && n_q_heads % n_kv_heads == 0) {
+        const size_t sm = (size_t)2 * tile * 256 * sizeof(__nv_bfloat16);
+        bool ok = true;
+#define SI_PF_QPW(TK, NW, QP)                                                                  \
+        do {                                                                                       \
+            dim3 gq((n_tokens + (NW) * (QP) - 1) / ((NW) * (QP)), n_q_heads);                      \
+            pf_attn_bf16_paged_tiled_kernel<256, (TK), (NW), (QP)><<<gq, (NW) * 32, sm, stream>>>( \
+                qb, kb, vb, block_table, ob, n_tokens, n_q_heads, n_kv_heads,                      \
+                block_size, max_blocks_per_seq, scale);                                            \
+        } while (0)
+        if      (tile == 32 && tw == 32 && qpw == 2) SI_PF_QPW(32, 32, 2);
+        else if (tile == 32 && tw == 32 && qpw == 4) SI_PF_QPW(32, 32, 4);
+        else if (tile == 32 && tw == 16 && qpw == 2) SI_PF_QPW(32, 16, 2);
+        else if (tile == 32 && tw == 16 && qpw == 4) SI_PF_QPW(32, 16, 4);
+        else if (tile == 16 && tw == 32 && qpw == 2) SI_PF_QPW(16, 32, 2);
+        else if (tile == 64 && tw == 32 && qpw == 2) SI_PF_QPW(64, 32, 2);
+        else if (tile == 24 && tw == 32 && qpw == 2) SI_PF_QPW(24, 32, 2);
+        else if (tile == 40 && tw == 32 && qpw == 2) SI_PF_QPW(40, 32, 2);
+        else if (tile == 48 && tw == 32 && qpw == 2) SI_PF_QPW(48, 32, 2);
+        else if (tile == 32 && tw == 32 && qpw == 3) SI_PF_QPW(32, 32, 3);
+        else if (tile == 48 && tw == 32 && qpw == 3) SI_PF_QPW(48, 32, 3);
+        else ok = false;
+#undef SI_PF_QPW
+        if (ok && cudaGetLastError() == cudaSuccess) return true;
+    }
     if (tile && head_dim == 256 && n_kv_heads > 0 && n_q_heads % n_kv_heads == 0) {
         const size_t sm = (size_t)2 * tile * 256 * sizeof(__nv_bfloat16);
         bool ok = true;
