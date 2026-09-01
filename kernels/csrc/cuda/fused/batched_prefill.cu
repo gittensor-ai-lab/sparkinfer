@@ -1768,6 +1768,13 @@ bool launch_prefill_attn_bf16_paged(
     const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    // Tensor cores first. pf_attn_bf16_paged_kernel below is one warp per (query, q-head) walking
+    // the causal history a key at a time; at long context that is the prompt pass's largest single
+    // cost. The mma kernel declines any shape it does not cover, so this stays a strict addition.
+    if (launch_prefill_attn_mma_bf16(q, k_pool, v_pool, block_table, attn, n_tokens, n_q_heads,
+                                     n_kv_heads, head_dim, block_size, max_blocks_per_seq,
+                                     scale, stream))
+        return true;
     dim3 grid(n_tokens, n_q_heads);
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
     auto kb = reinterpret_cast<const __nv_bfloat16*>(k_pool);

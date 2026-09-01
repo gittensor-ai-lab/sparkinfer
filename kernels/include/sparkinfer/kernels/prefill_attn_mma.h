@@ -34,5 +34,17 @@ bool launch_prefill_attn_mma(
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
     cudaStream_t stream = nullptr);
 
+// BF16-KV twin, full causal, hd256 GQA. The int8 entry above cannot serve a bf16 KV pool, and the
+// bf16 pool is what the DSpark harness runs (dspark_tau_check pins int8_kv=false), so without this
+// the bf16 branch falls to a scalar warp-per-query kernel. Returns false when the shape is not
+// covered (hd != 256, block_size != 16, GQA not divisible), so the caller keeps its fallback.
+//   SPARKINFER_PREFILL_ATTN_BF16_MMA  (default 1)  0 disables (A/B in one binary).
+//   SPARKINFER_PREFILL_ATTN_BF16_RQH  (default 3)  q-heads fused per block; 1 turns fusion off.
+//   SPARKINFER_PREFILL_ATTN_BF16_PSPLIT (default 1) 0 = single-bf16 P (faster, moves the output).
+bool launch_prefill_attn_mma_bf16(
+    const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace sparkinfer

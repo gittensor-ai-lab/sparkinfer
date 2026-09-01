@@ -705,5 +705,321 @@ bool launch_prefill_attn_mma(
 }
 
 
+// ============================================================================
+// BF16-KV tensor-core prefill attention, hd256 GQA.
+//
+// The int8 kernels above are unreachable when the KV pool is bf16, and the bf16 pool is exactly
+// what the DSpark harness runs (dspark_tau_check pins int8_kv=false) -- so the bf16 branch of
+// launch_prefill_attn_bf16_paged fell to pf_attn_bf16_paged_kernel: one 32-thread block per
+// (query, q-head) walking the causal history one key at a time out of global memory, with a
+// 32-lane shuffle reduction per key. At ctx=32768 over 16 full-attention layers that is 2.1e14
+// FLOP issued as scalar FFMA, and it dominates the prompt pass.
+//
+// This is the same schedule as pf_attn_mma_gqa_kernel with every quantization step deleted:
+//   * Q is ALREADY bf16, so there is no per-row quantize and no s_qs.
+//   * K/V are ALREADY bf16 in the pool, so there are no dequant scales (s_ks/s_vs) to stage.
+//   * P is stored bf16 rather than int8, so there is no per-row P scale (s_ps) and no roundf.
+// A KV page is 16 tokens and wmma's tile is 16x16, so a page IS a fragment read straight out of
+// the pool with ldm = n_kv_heads*HEAD_DIM -- for QK as a col_major B (which is K^T) and for PV as
+// a row_major B. Nothing but Q and P is staged in shared memory.
+//
+// Accuracy moves the RIGHT way relative to the int8 twin: bf16 P carries 8 mantissa bits against
+// int8's 7, and the QK product is exact bf16xbf16->fp32 rather than a symmetric-quantized
+// approximation, so the fused-GQA KL cliff documented on launch_prefill_attn_mma has no analogue
+// here -- there is no quantization to lose the tail to.
+// ============================================================================
+// PSPLIT: carry P as a hi+lo bf16 PAIR instead of a single bf16.
+// A single bf16 P has ~2^-9 relative error, and because attention is peaked the effective
+// number of contributing keys is small, so that error does NOT average away -- it lands at
+// ~1e-3 on the output, which is exactly the scale that flips a near-tied argmax. Measured:
+// with single-bf16 P the 16k prompt's continuation diverges from main at the FIRST token and
+// tau falls 1.6410 -> 1.5059 (ratio 0.918, under the 0.95 floor), even though the kernel is
+// self-consistent (RQH=1/2/3 byte-identical). p_lo = p - float(bf16(p)) recovers the dropped
+// mantissa, so P*V is evaluated as p_hi*V + p_lo*V: two mma's over the SAME V fragment, ~fp32
+// accuracy in P for 1.5x the PV work. `l` is then summed from float(p_hi)+float(p_lo) so the
+// denominator matches the numerator exactly rather than being the unrounded fp32 sum.
+template <int HEAD_DIM, int GROUP_BLKS, int RQH, bool PSPLIT>
+__global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
+    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
+    int block_size, int max_blocks_per_seq, float scale, int qld, int pld) {
+    using namespace nvcuda::wmma;
+    constexpr int BM    = 16;                    // query rows per block == wmma M == KV page size
+    constexpr int GN    = GROUP_BLKS * 16;       // keys per iteration
+    constexpr int KH    = HEAD_DIM / 16;         // k-tiles of the QK contraction
+    constexpr int DTILE = HEAD_DIM / 16;         // output d-tiles
+    constexpr int WARPS = GROUP_BLKS;
+    constexpr int DPW   = DTILE / WARPS;         // output d-tiles per warp
+    constexpr int QE    = HEAD_DIM / 32;         // Q elements per lane when staging
+    constexpr int RPW   = BM / WARPS;            // softmax rows per warp
+
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
+    const int qbase = blockIdx.x * BM;
+    const int head0 = blockIdx.y * RQH;                       // first q-head this block owns
+    const int gqa   = n_q_heads / n_kv_heads;
+    const int kvh   = head0 / gqa;                            // all RQH heads share this kv-head
+    const size_t KVLD = (size_t)n_kv_heads * HEAD_DIM;
+
+    extern __shared__ char mma_smem_bf[];
+    // Only Q and P are staged. s_o overlays s_s for exactly the reason it does in the int8 twin:
+    // the scores are dead by the epilogue, so the landing zone is free.
+    __nv_bfloat16* s_q = reinterpret_cast<__nv_bfloat16*>(mma_smem_bf);   // [RQH][BM][qld]
+    __nv_bfloat16* s_p = s_q + (size_t)RQH * BM * qld;                    // [RQH][BM][pld]
+    // Low half of the split P, immediately after the high half; zero-sized when PSPLIT is off.
+    __nv_bfloat16* s_p2 = s_p + (size_t)RQH * BM * pld;                   // [RQH][BM][pld]
+    constexpr int PPLANES = PSPLIT ? 2 : 1;
+    constexpr int SBLK = (RQH * BM * GN > BM * HEAD_DIM) ? RQH * BM * GN : BM * HEAD_DIM;
+    float* s_s    = reinterpret_cast<float*>(s_p + (size_t)PPLANES * RQH * BM * pld);  // [RQH][BM][GN]
+    float* s_o    = s_s;                                                     // [BM][HEAD_DIM]
+    float* s_m    = s_s + SBLK;                                              // [RQH][BM]
+    float* s_l    = s_m + RQH * BM;                                          // [RQH][BM]
+    float* s_corr = s_l + RQH * BM;                                          // [RQH][BM]
+
+    fragment<accumulator, 16, 16, 16, float> ofr[RQH][DPW];
+    // Row index of each accumulator lane element. Built with a FLOAT accumulator so the fragment
+    // layout is the one the float accumulators below actually use, rather than assuming the int
+    // accumulator maps identically. Rows 0..15 are exact in float.
+    fragment<accumulator, 16, 16, 16, float> idxf;
+    {
+        float* tile = s_s + warp * 256;
+        for (int i = lane; i < 256; i += 32) tile[i] = (float)(i >> 4);
+        __syncwarp();
+        load_matrix_sync(idxf, tile, 16, mem_row_major);
+    }
+    #pragma unroll
+    for (int h = 0; h < RQH; h++)
+        #pragma unroll
+        for (int dd = 0; dd < DPW; dd++) fill_fragment(ofr[h][dd], 0.f);
+
+    // ---- stage Q rows for each of the RQH heads (no quantize: Q is already bf16) ----
+    #pragma unroll
+    for (int h = 0; h < RQH; h++) {
+        const int head = head0 + h;
+        #pragma unroll
+        for (int rr = 0; rr < RPW; rr++) {
+            const int r = warp * RPW + rr;
+            const int qtok = qbase + r;
+            #pragma unroll
+            for (int e = 0; e < QE; e++)
+                s_q[((size_t)h * BM + r) * qld + lane + e * 32] =
+                    (qtok < n_tokens)
+                        ? q[((size_t)qtok * n_q_heads + head) * HEAD_DIM + lane + e * 32]
+                        : __float2bfloat16(0.f);
+        }
+    }
+    if (tid < RQH * BM) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
+    __syncthreads();
+
+    const int last_q = min(qbase + BM - 1, n_tokens - 1);
+
+    for (int k0 = 0; k0 < last_q + 1; k0 += GN) {
+        const int nk   = min(GN, last_q + 1 - k0);
+        const int gblk = (nk + 15) / 16;
+
+        // ---- QK: load each K page fragment ONCE, feed RQH q-heads ----
+        if (warp < gblk) {
+            const int pb = block_table[(k0 / block_size) + warp];
+            const __nv_bfloat16* kb =
+                k_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM;
+            fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> af;
+            fragment<matrix_b, 16, 16, 16, __nv_bfloat16, col_major> bf;
+            fragment<accumulator, 16, 16, 16, float> cf[RQH];
+            #pragma unroll
+            for (int h = 0; h < RQH; h++) fill_fragment(cf[h], 0.f);
+            #pragma unroll
+            for (int ks = 0; ks < KH; ks++) {
+                // col_major with ldm=KVLD reads element (d, ktok) from kb[ktok*KVLD + d]: K^T.
+                load_matrix_sync(bf, kb + ks * 16, KVLD);        // K fragment: loaded once
+                #pragma unroll
+                for (int h = 0; h < RQH; h++) {
+                    load_matrix_sync(af, s_q + ((size_t)h * BM) * qld + ks * 16, qld);
+                    mma_sync(cf[h], af, bf, cf[h]);
+                }
+            }
+            #pragma unroll
+            for (int h = 0; h < RQH; h++)
+                store_matrix_sync(s_s + (size_t)h * BM * GN + warp * 16, cf[h], GN, mem_row_major);
+        }
+        __syncthreads();
+
+        // ---- online softmax per head; write P as bf16 (no quantize) ----
+        #pragma unroll
+        for (int h = 0; h < RQH; h++) {
+            const float* s_sh = s_s + (size_t)h * BM * GN;
+            __nv_bfloat16* s_ph = s_p + (size_t)h * BM * pld;
+            __nv_bfloat16* s_ph2 = s_p2 + (size_t)h * BM * pld;
+            #pragma unroll
+            for (int rr = 0; rr < RPW; rr++) {
+                const int r = warp * RPW + rr;
+                const int qtok = qbase + r;
+                float sc[GN / 32], mx = -1e30f;
+                #pragma unroll
+                for (int u = 0; u < GN / 32; u++) {
+                    const int t = lane + u * 32, gtok = k0 + t;
+                    const bool live = (t < gblk * 16) && (qtok < n_tokens) && (gtok <= qtok);
+                    sc[u] = live ? s_sh[r * GN + t] * scale : -1e30f;
+                    mx = fmaxf(mx, sc[u]);
+                }
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                const float m_old = s_m[h * BM + r], m_new = fmaxf(m_old, mx);
+                const float corr = __expf(m_old - m_new);
+                float sum = 0.f;
+                #pragma unroll
+                for (int u = 0; u < GN / 32; u++) {
+                    const int t = lane + u * 32;
+                    float p = 0.f;
+                    if (sc[u] > -1e29f) p = __expf(sc[u] - m_new);
+                    const __nv_bfloat16 hi = __float2bfloat16(p);
+                    s_ph[r * pld + t] = hi;
+                    if (PSPLIT) {
+                        const float ph = __bfloat162float(hi);
+                        const __nv_bfloat16 lo = __float2bfloat16(p - ph);
+                        s_ph2[r * pld + t] = lo;
+                        // Sum exactly what PV will consume, so l matches the numerator.
+                        sum += ph + __bfloat162float(lo);
+                    } else {
+                        sum += __bfloat162float(hi);
+                    }
+                }
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                if (lane == 0) {
+                    s_m[h * BM + r] = m_new;
+                    s_l[h * BM + r] = s_l[h * BM + r] * corr + sum;
+                    s_corr[h * BM + r] = corr;
+                }
+            }
+        }
+        __syncthreads();
+
+        // ---- PV: load each V tile fragment ONCE, feed RQH q-heads ----
+        #pragma unroll
+        for (int dd = 0; dd < DPW; dd++) {
+            const int dt = warp * DPW + dd;
+            fragment<accumulator, 16, 16, 16, float> cf[RQH];
+            #pragma unroll
+            for (int h = 0; h < RQH; h++) fill_fragment(cf[h], 0.f);
+            for (int ks = 0; ks < gblk; ks++) {
+                const int pb = block_table[(k0 / block_size) + ks];
+                const __nv_bfloat16* vb =
+                    v_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
+                fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> af;
+                fragment<matrix_b, 16, 16, 16, __nv_bfloat16, row_major> bf;
+                load_matrix_sync(bf, vb, KVLD);                  // V fragment: loaded once
+                #pragma unroll
+                for (int h = 0; h < RQH; h++) {
+                    load_matrix_sync(af, s_p + (size_t)h * BM * pld + ks * 16, pld);
+                    mma_sync(cf[h], af, bf, cf[h]);
+                    if (PSPLIT) {   // same V fragment, second pass for the recovered mantissa
+                        load_matrix_sync(af, s_p2 + (size_t)h * BM * pld + ks * 16, pld);
+                        mma_sync(cf[h], af, bf, cf[h]);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int h = 0; h < RQH; h++)
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int r = (int)idxf.x[e];
+                    ofr[h][dd].x[e] = __fmaf_rn(ofr[h][dd].x[e], s_corr[h * BM + r], cf[h].x[e]);
+                }
+        }
+        __syncthreads();   // s_p is rewritten by the next iteration's softmax
+    }
+
+    // ---- epilogue: one head at a time through the shared s_o landing zone ----
+    #pragma unroll
+    for (int h = 0; h < RQH; h++) {
+        #pragma unroll
+        for (int dd = 0; dd < DPW; dd++)
+            store_matrix_sync(s_o + (warp * DPW + dd) * 16, ofr[h][dd], HEAD_DIM, mem_row_major);
+        __syncthreads();
+        const int head = head0 + h;
+        for (int r = 0; r < BM; r++) {
+            const int qtok = qbase + r;
+            if (qtok >= n_tokens) break;
+            const float l = s_l[h * BM + r];
+            const float inv = (l > 0.f) ? (1.f / l) : 0.f;
+            for (int c = tid; c < HEAD_DIM; c += blockDim.x)
+                attn[((size_t)qtok * n_q_heads + head) * HEAD_DIM + c] =
+                    __float2bfloat16(s_o[r * HEAD_DIM + c] * inv);
+        }
+        __syncthreads();
+    }
+}
+
+template <int HD, int GROUP_BLKS, int RQH, bool PSPLIT>
+static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* v_pool,
+                                 const int* block_table, void* attn, int n_tokens,
+                                 int n_q_heads, int n_kv_heads, int block_size,
+                                 int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    constexpr int BM = 16, GN = GROUP_BLKS * 16;
+    // Same bank-conflict argument as attn_smem_pad() above, in bf16 elements: an unpadded row
+    // stride of HD (512 B) or GN (256 B) is a whole multiple of the 128-byte bank row, so all 16
+    // rows of a tile start on bank 0 and every ldmatrix replays 16-way. +8 bf16 elements is 16 B,
+    // which keeps the alignment ldmatrix requires.
+    const int pad = attn_smem_pad() ? 8 : 0;
+    const int qld = HD + pad, pld = GN + pad;
+    constexpr int SBLK = (RQH * BM * GN > BM * HD) ? RQH * BM * GN : BM * HD;
+    const size_t sm = (size_t)RQH * BM * qld * sizeof(__nv_bfloat16)
+                    + (size_t)(PSPLIT ? 2 : 1) * RQH * BM * pld * sizeof(__nv_bfloat16)
+                    + (size_t)(SBLK + 3 * RQH * BM) * sizeof(float);
+    static int cfg = 0;
+    if (!cfg) {
+        if (cudaFuncSetAttribute(pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) != cudaSuccess)
+            return false;
+        cfg = 1;
+    }
+    dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
+    pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT><<<grid, GROUP_BLKS * 32, sm, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
+        reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
+        reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
+        block_size, max_blocks_per_seq, scale, qld, pld);
+    // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek --
+    // rather than get -- so a pre-existing sticky error is not silently cleared here.
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool launch_prefill_attn_mma_bf16(
+    const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    constexpr int HD = 256;
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_MMA");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    // One block owns RQH q-heads sharing a kv-head, so each K page / V tile is read once and fed
+    // RQH mma's instead of being re-read per q-head. This checkpoint is GQA-6, so 3 divides the
+    // group and 2 is the fallback; RQH=1 turns the fusion off.
+    static const int rqh_env = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_RQH");
+        const int v = e ? atoi(e) : 3;
+        return (v == 1 || v == 2 || v == 3) ? v : 3;
+    }();
+    if (!enabled || head_dim != HD || block_size != 16) return false;
+    if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
+    const int gqa = n_q_heads / n_kv_heads;
+
+    // Split-P is ON by default: a single bf16 P moves the model's output (see the kernel comment).
+    static const int psplit = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_PSPLIT");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+#define SI_MMA_BF16_TRY(RQH_)                                                                     \
+    (psplit ? launch_attn_bf16_gqa<HD, 8, RQH_, true>(q, k_pool, v_pool, block_table, attn,       \
+                  n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream) \
+            : launch_attn_bf16_gqa<HD, 8, RQH_, false>(q, k_pool, v_pool, block_table, attn,      \
+                  n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream))
+    if (rqh_env >= 3 && gqa % 3 == 0 && SI_MMA_BF16_TRY(3)) return true;
+    if (rqh_env >= 2 && gqa % 2 == 0 && SI_MMA_BF16_TRY(2)) return true;
+    return SI_MMA_BF16_TRY(1);
+#undef SI_MMA_BF16_TRY
+}
+
 }  // namespace kernels
 }  // namespace sparkinfer
