@@ -19,7 +19,6 @@ SparkInfer focuses on the models driving the future of AI — not thousands of l
 | [**Qwen3.6-35B-A3B**](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | Primary SOTA — hybrid Gated-DeltaNet + full-attention MoE |
 | [**Qwen3.8-27B**](https://huggingface.co/Qwen/Qwen3.8-27B) | Dense hybrid Gated-DeltaNet · current eval scope — native NVFP4 from **[our RTX 5090 build](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090)** or [unsloth](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4), both supported |
 | [**SparkDistill**](https://github.com/gittensor-model-hub/SparkDistill/) | Fable 5 / OpenAI 5.6-level CoT *(coming soon)* |
-| [**MiniMax M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) | Open MoE frontier *(next)* |
 
 ## Blackwell native
 
