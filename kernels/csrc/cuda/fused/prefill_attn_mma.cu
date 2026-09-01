@@ -1080,22 +1080,21 @@ bool launch_prefill_attn_mma_bf16(
     if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
     const int gqa = n_q_heads / n_kv_heads;
 
-    // Keep split-P for every short/medium context, including the 16k decode/acceptance regime:
-    // a single bf16 P moves its first continuation token and lowers tau (see the kernel comment).
-    // At 32k the wider 16-page group is the throughput shape, but its RQH=3 split-P footprint is
-    // larger than the device's dynamic-smem ceiling. The single-P tier fits and remains lossless;
-    // shorter accuracy/decode paths stay byte-for-byte on the upstream 8-page split-P tier.
-    // RTX 5090, exact scored prompt: 7102.82 -> 8674.64 pp/s (+22.13%, mean of two final runs).
+    // At 16k and above the wider 16-page group is the throughput shape, but its RQH=3 split-P
+    // footprint is larger than the device's dynamic-smem ceiling. The single-P tier fits and is
+    // lossless; shorter accuracy/decode paths stay byte-for-byte on the 8-page split-P tier.
+    // RTX 5090, scored 16k prompt with 128 generated tokens: 9875.40 -> 11309.30 pp/s (+14.52%),
+    // 128/128 lossless in three repeats and mean acceptance 1.4066 -> 1.4222.
     static const int psplit_env = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_PSPLIT");
         return e ? ((e[0] == '0') ? 0 : 1) : -1;
     }();
-    const int psplit = psplit_env >= 0 ? psplit_env : (n_tokens < 32768 ? 1 : 0);
+    const int psplit = psplit_env >= 0 ? psplit_env : (n_tokens < 16384 ? 1 : 0);
     static const int group_blks_env = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_GROUP_BLKS");
         return e ? ((atoi(e) == 16) ? 16 : 8) : 0;
     }();
-    const int group_blks = group_blks_env ? group_blks_env : (n_tokens >= 32768 ? 16 : 8);
+    const int group_blks = group_blks_env ? group_blks_env : (n_tokens >= 16384 ? 16 : 8);
     if (group_blks == 16) {
         if (!psplit && rqh_env >= 3 && gqa % 3 == 0 &&
             launch_attn_bf16_gqa<HD, 16, 3, false>(

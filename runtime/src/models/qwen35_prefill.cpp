@@ -1690,7 +1690,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             use_i8 = restore_i8;
         }
 
-        const bool ffn_norm_fp4 = !c.muse_glimmer && !moe && N >= 32768 && gu_nvfp4 &&
+        const bool ffn_norm_fp4 = !c.muse_glimmer && !moe && N >= 16384 && gu_nvfp4 &&
             w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
             [] { const char* e = getenv("SPARKINFER_Q38_FFN_NORM_FP4");
                  return !e || e[0] != '0'; }();
@@ -2514,7 +2514,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
              ? (gdn_nvfp4 && (gdn_fp4_mask & 1) && nw->gdn_qkv_fp4 && nw->gdn_qkv_fp4_sf &&
                 nw->gdn_z_fp4 && nw->gdn_z_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws)
              : attn_nvfp4);
-        const bool defer_next_attn_norm = L + 1 < c.n_layers && N >= 32768 &&
+        const bool defer_next_attn_norm = L + 1 < c.n_layers && N >= 16384 &&
             !c.muse_glimmer && next_attn_fp4 &&
             [] { const char* e = getenv("SPARKINFER_Q38_ATTN_NORM_FP4");
                  return !e || e[0] != '0'; }();
