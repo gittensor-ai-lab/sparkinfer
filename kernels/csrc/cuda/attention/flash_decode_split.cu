@@ -1289,9 +1289,13 @@ void launch_flash_decode_split(
             }
             // SPARKINFER_FA_PIPE is read again further down for the num_seqs == 1 path; same knob,
             // hoisted so the fold above can honour it too.
+            // #874's cp.async path is experimental until its asynchronous shared-memory lifetime
+            // is proven under repeated/concurrent launches.  A short losslessness run is not a
+            // sufficient race detector: an unset variable must select the synchronous kernel.
+            // Keep an explicit opt-in for reproducing and validating the pipeline fix.
             static int fa6_pipe_ok = -1;
             if (fa6_pipe_ok < 0) { const char* e = getenv("SPARKINFER_FA_PIPE");
-                                   fa6_pipe_ok = (e && e[0] == '0') ? 0 : 1; }
+                                   fa6_pipe_ok = (e && e[0] == '1') ? 1 : 0; }
             // Prefer the NARROWEST fold that divides the row count. Folding trades KV-staging
             // traffic for CTAs -- at 4 kv heads x n_splits the grid is already only a few CTAs
             // per SM -- and this kernel is issue-bound on the per-row softmax, not on the staged
@@ -1318,10 +1322,11 @@ void launch_flash_decode_split(
             //
             // Bit-identical to the synchronous fold: cp.async changes WHEN bytes land in shared
             // memory, not their values, and the token walk (start..end, consecutive tiles, the
-            // per-token online-softmax update) is unchanged. SPARKINFER_FA_FOLD_PIPE=0 reverts.
+            // per-token online-softmax update) is unchanged. The experimental arm requires both
+            // SPARKINFER_FA_PIPE=1 and SPARKINFER_FA_FOLD_PIPE=1.
             static int fa6_fold_pipe = -1;
             if (fa6_fold_pipe < 0) { const char* e = getenv("SPARKINFER_FA_FOLD_PIPE");
-                                     fa6_fold_pipe = (e && e[0] == '0') ? 0 : 1; }
+                                     fa6_fold_pipe = (e && e[0] == '1') ? 1 : 0; }
             if (!int8_kv && num_seqs > 1 && fa6_fold > 1 && (num_seqs % fa6_fold) == 0 &&
                 fa6_pipe_ok && fa6_fold_pipe) {
                 const size_t smp = (size_t)4 * FA_GQA6_TILE * 256 * sizeof(__nv_bfloat16);
@@ -1390,9 +1395,11 @@ void launch_flash_decode_split(
             // Deepening the tile alone raised loads-in-flight but kept the two phases strictly
             // serial. bf16 KV only -- cp.async copies bytes verbatim and cannot dequantize.
             // Double buffering needs 2x the staging smem (4 * TILE * 256 * 2 B), which is past the
-            // 48 KB default, so the kernel opts in once. SPARKINFER_FA_PIPE=0 disables.
+            // 48 KB default, so the kernel opts in once. SPARKINFER_FA_PIPE=1 explicitly enables
+            // this experimental path; unset/default uses the synchronous correctness path.
             static int fa6_pipe = -1;
-            if (fa6_pipe < 0) { const char* e = getenv("SPARKINFER_FA_PIPE"); fa6_pipe = (e && e[0] == '0') ? 0 : 1; }
+            if (fa6_pipe < 0) { const char* e = getenv("SPARKINFER_FA_PIPE");
+                                fa6_pipe = (e && e[0] == '1') ? 1 : 0; }
             // KV-GROUP split: KVG warp-groups per block, each walking its own stripe. Raises
             // warps/SM by KVG without changing n_splits or the combine. Off by default until
             // measured; SPARKINFER_FA_KVG=2 selects it. Tau-neutral -- the draft is untouched.
