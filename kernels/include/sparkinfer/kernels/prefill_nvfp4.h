@@ -14,6 +14,10 @@ size_t prefill_nvfp4_workspace_bytes(int m, int n, int k);
 
 bool launch_prefill_nvfp4_quant_a(const void* src_bf16, void* dst_fp4, void* dst_sf,
                                   int m, int k, cudaStream_t stream = nullptr);
+bool launch_prefill_nvfp4_rmsnorm_quant_a(const void* src_bf16, const void* weight_bf16,
+                                          void* dst_fp4, void* dst_sf,
+                                          int m, int k, float eps,
+                                          cudaStream_t stream = nullptr);
 // Muse's attention gate fused into the A-operand quantize: x * sigmoid(g) straight to FP4, the
 // same fold launch_prefill_gate_quant_rows_i8 does for the int8 o-projection.
 bool launch_prefill_nvfp4_gate_quant_a(const void* src_bf16, const void* gate_bf16,

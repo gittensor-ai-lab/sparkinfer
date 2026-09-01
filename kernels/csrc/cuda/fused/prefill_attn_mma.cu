@@ -821,11 +821,29 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
         const int nk   = min(GN, last_q + 1 - k0);
         const int gblk = (nk + 15) / 16;
 
+        // VINT8 scales are shared by all BM rows and all RQH query heads, but loading them in the
+        // softmax loop repeats the same half load BM*RQH times. Stage one copy per key into the
+        // otherwise-unused 8-column padding of the first 2*BM Q rows. This consumes no additional
+        // shared memory and preserves the exact __half2float conversion at the consumer.
+        if constexpr (VINT8) {
+            __half* s_vs_pad = reinterpret_cast<__half*>(s_q);
+            for (int t = tid; t < GN; t += blockDim.x) {
+                const int pr = t >> 3, pc = HEAD_DIM + (t & 7);
+                s_vs_pad[pr * qld + pc] = (t < nk)
+                    ? v_scale[(size_t)(k0 + t) * n_kv_heads + kvh]
+                    : __float2half(0.f);
+            }
+        }
+
         // ---- QK: load each K page fragment ONCE, feed RQH q-heads ----
         if (warp < gblk) {
-            const int pb = block_table[(k0 / block_size) + warp];
-            const __nv_bfloat16* kb =
-                k_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM;
+            const __nv_bfloat16* kb;
+            if constexpr (VINT8) {
+                kb = k_pool + ((size_t)(k0 + warp * 16) * n_kv_heads + kvh) * HEAD_DIM;
+            } else {
+                const int pb = block_table[(k0 / block_size) + warp];
+                kb = k_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM;
+            }
             fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> af;
             fragment<matrix_b, 16, 16, 16, __nv_bfloat16, col_major> bf;
             fragment<accumulator, 16, 16, 16, float> cf[RQH];
@@ -878,8 +896,9 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                     float p = 0.f;
                     if (sc[u] > -1e29f) p = __expf(sc[u] - m_new);
                     if constexpr (VINT8) {
-                        const int gtok = k0 + t;
-                        const float pv = p * __half2float(v_scale[(size_t)gtok * n_kv_heads + kvh]);
+                        const __half* s_vs_pad = reinterpret_cast<const __half*>(s_q);
+                        const int pr = t >> 3, pc = HEAD_DIM + (t & 7);
+                        const float pv = p * __half2float(s_vs_pad[pr * qld + pc]);
                         sc[u] = pv; pamax = fmaxf(pamax, fabsf(pv)); sum += p;
                     } else {
                         const __nv_bfloat16 hi = __float2bfloat16(p);
