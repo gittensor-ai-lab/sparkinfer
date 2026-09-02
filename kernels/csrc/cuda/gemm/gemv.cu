@@ -3353,7 +3353,10 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
 #undef SI_NVFP4_PAIRWISE
 #define SI_NVFP4_DP4A2(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
-        const int nr = nr_mode ? nr_mode : (R == 1 ? 1 : 2); \
+        /* Width three is the long-context verifier's steady shape. NR=1 keeps enough CTAs */ \
+        /* resident to hide the larger per-row register footprint; wider verifies still win */ \
+        /* from sharing each activation read across two output rows. */ \
+        const int nr = nr_mode ? nr_mode : ((R == 1 || R == 3) ? 1 : 2); \
         const int blk = RPB * nr; \
         if (N % blk) return false; \
         const dim3 grid(2 * (N / blk)); \
@@ -3406,12 +3409,19 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
     static const int nr_mode = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
                                    int v = e ? atoi(e) : 0;
                                    return (v == 1 || v == 2) ? v : 0; }();
-    static const bool down_nr4 = []{ const char* e = getenv("SPARKINFER_NVFP4_DOWN_NR4");
-                                     return e && e[0] == '1'; }();
+    // RTX 5090, Qwen3.8 DSpark @16k, three fresh lossless runs: the width-3 defaults below cut
+    // verify 12.74 -> 12.20 ms and move decode 120.91 -> 125.65-125.74 tok/s. The env overrides
+    // remain available for paired A/Bs and for checkpoints whose width distribution differs.
+    static const int down_nr4_mode = []{ const char* e = getenv("SPARKINFER_NVFP4_DOWN_NR4");
+        return e ? ((e[0] == '1') ? 1 : 0) : -1; }();
 #define SI_NVFP4_DP4A(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
+        const bool down_nr4 = down_nr4_mode >= 0 ? down_nr4_mode != 0 : R == 3; \
+        /* The width-3 FFN down projection is the exception: its long K walk supplies enough */ \
+        /* parallel work that four output rows can share an activation read without starving */ \
+        /* the GPU. Keep NR=4 scoped to K>N; extending it to all width-3 singles was slower. */ \
         const int nr = (down_nr4 && K > N && R >= 2 && R <= 6) ? 4 \
-                     : (nr_mode ? nr_mode : (R == 1 ? 1 : 2)); \
+                     : (nr_mode ? nr_mode : ((R == 1 || R == 3) ? 1 : 2)); \
         if (nr == 1) { \
             const dim3 grid((N + RPB - 1) / RPB); \
             gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
