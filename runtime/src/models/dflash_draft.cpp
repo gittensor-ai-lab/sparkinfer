@@ -1206,8 +1206,32 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // beats 8192 everywhere it was checked and the band under 24576 was simply unserved.
     // kMidCtxMinSeq is deliberately the same 12288 boundary the proposal-depth ladder in
     // qwen35.cpp uses -- the two policies describe the same regime and should not drift apart.
-    static const int kMidCtxWindow = 4096;
+    //
+    // 2048 rather than 4096 in the band this can be measured in. Re-swept on the SCORED prompt
+    // (first 16384 tokens of bench_prompt_32k.txt) at the shipped proposal depth, not the depth-2
+    // ladder the 4096 column above was taken at. Both terms move the right way -- old context is
+    // not buying acceptance here, it is only costing draft time:
+    //
+    //   window    8192     4096     3072     2560     2048     1536     1024
+    //   tok/s    117.72   118.94   122.42   122.69   126.11   123.20   123.77   (128 gen tokens)
+    //   tau      1.6203   1.6000   1.6410   1.6410   1.6842   1.6410   1.6410
+    //   draft ms  1.691    1.370    1.310    1.263    1.235    1.203    1.168
+    //
+    // tau at 128 generated tokens is quantised (128/80, /78, /76), so the peak was re-measured at
+    // 512 to confirm it is a mechanism and not a step boundary: 4096 -> 150.85 tok/s at tau 2.0397
+    // and draft 1.287 ms, 2048 -> 155.23 at tau 2.0894 and draft 1.183, with 1536 (154.02) and
+    // 3072 (151.87) on either side. Acceptance +2.4% and draft cost -8% at the same time.
+    // 2048 reproduces exactly across fresh processes (126.095 / 126.125, tau 1.6842 in both).
+    //
+    // The band is CLOSED at the top rather than extended: 24576 and above keeps the 4096 that was
+    // independently measured there. Narrowing further at 32k is plausible from the trend, but a
+    // 32 GB card cannot run ctx=32768 through the batched prefill at all (the scratch arena is
+    // ~13 MB short and the run falls back), so it cannot be measured here -- and dspark-decode@32k
+    // is both a scored dimension and a no-regression floor. Ship what is measured.
+    static const int kMidCtxWindow = 2048;
     static const int kMidCtxMinSeq = 12288;
+    static const int kMidCtxMaxSeq = 24576;
+    static const int kLongCtxWindow = 4096;
     int kFullWindow = kFullWindowEnv >= 0 ? kFullWindowEnv : 3 * c.sliding_window;
     if (kFullWindowEnv < 0 && kFullWindow <= 0) {
         const int total_ctx = past + ctx_len;
@@ -1227,7 +1251,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // 4096 rather than the marginally better 3072: the peak is broad, 3072 is worth 0.8% on
         // ONE prompt, and reusing the constant the scored regime already uses is worth more than
         // that. So a single threshold now covers everything from 12288 up.
-        if (total_ctx >= kMidCtxMinSeq) kFullWindow = kMidCtxWindow;
+        if (total_ctx >= kMidCtxMinSeq)
+            kFullWindow = total_ctx < kMidCtxMaxSeq ? kMidCtxWindow : kLongCtxWindow;
     }
     // fc trim: once the full-attn layer is windowed, NO layer reads target_proj older than the
     // largest window across layers, so project only that tail. Uses the same attn_gqa_kv_lo bound
