@@ -47,7 +47,8 @@ struct Qwen35PrefillCtx {
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
 // Returns the argmax at the last prompt position (seed for the first decode step), or -1 if the
 // batched path is unsupported for this model/config (caller falls back to the token loop).
-int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n);
+// pos0: where this pass's tokens start in the sequence (0 = whole prompt in one pass).
+int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n, int pos0 = 0);
 
 // Exact short-block DFlash verifier. It evaluates all candidate rows from the live hybrid state,
 // commits only the accepted prefix, and leaves rejected KV rows outside the logical sequence.

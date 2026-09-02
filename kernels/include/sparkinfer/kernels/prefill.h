@@ -54,10 +54,16 @@ void launch_prefill_mul_sigmoid(void* attn, const void* gate, int n_tokens, int 
 // over all N tokens. Leaves the last conv_kernel-1 raw qkv rows in conv_state (decode layout).
 //   qkv:        [N, 2*q_heads*hd + v_heads*hd]      conv_w: [qkv_dim, conv_kernel]
 //   conv_state: [conv_kernel-1, qkv_dim] (bf16)     q/k: [N, q_heads*hd]   v: [N, v_heads*hd]
+//   conv_prev:  [conv_kernel-1, qkv_dim] (bf16), same layout as conv_state -- the previous
+//               window's trailing raw qkv rows, for a pass that does not start at position 0.
+//               nullptr (the default) pads with zeros, which is correct only at position 0.
+//               MUST NOT alias conv_state: the kernel writes conv_state from the block holding
+//               the pass's last token while other blocks may still be reading conv_prev.
 void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_state,
                              void* q, void* k, void* v,
                              int n_tokens, int q_heads, int v_heads, int head_dim,
-                             int conv_kernel, float eps, cudaStream_t stream = nullptr);
+                             int conv_kernel, float eps, cudaStream_t stream = nullptr,
+                             const void* conv_prev = nullptr);
 
 // Gated-DeltaNet sequential recurrence scan over all N tokens (one launch). Produces
 // out[N, v_heads*hd] and leaves the recurrent state in the SPARKINFER_GDN_FAST transposed
@@ -140,7 +146,8 @@ void launch_prefill_qknorm_rope_kv_int8(
     signed char* k_pool, signed char* v_pool, void* k_scale, void* v_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr,
+    int pos0 = 0);
 
 // Muse Glimmer bf16-KV counterpart: QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM)
 // RoPE when rotary_dim>0 (SWA layers), or NoPE when rotary_dim==0 (global layers) + bf16 KV
@@ -153,42 +160,48 @@ void launch_prefill_qknorm_rope_kv_bf16(
     void* k_pool, void* v_pool,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr,
+    int pos0 = 0);
 
 void launch_prefill_qknorm_rope_kv_bf16_vi8(
     void* q, void* k, const void* v, const void* q_w, const void* k_w,
     void* k_pool, void* v_pool, signed char* v_i8, void* v_i8_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr,
+    int pos0 = 0);
 
 // Full-causal attention over a bf16 paged KV pool. false = no instantiation for head_dim.
 bool launch_prefill_attn_bf16_paged(
     const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr);
+    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr,
+    int q_pos0 = 0);
 
 bool launch_prefill_attn_mma_bf16_vi8(
     const void* q, const void* k_pool, const signed char* v_i8, const void* v_scale,
     const int* block_table, void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
     int head_dim, int block_size, int max_blocks_per_seq, float scale,
-    cudaStream_t stream);
+    cudaStream_t stream, int q_pos0 = 0);
 
 void launch_prefill_qknorm_ropenorm_kv_bf16(
     void* q, void* k, const void* v, const void* q_w, const void* k_w,
     void* k_pool, void* v_pool,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr,
+    int pos0 = 0);
 
 // Full-attention prefill: causal attention over the paged int8 KV pool just filled above.
-// One warp per (token, q-head); online softmax over keys 0..token (causal). q is the rope'd
+// One warp per (token, q-head); online softmax over keys 0..q_pos0+token (causal). q is the rope'd
 // bf16 query [N,n_q_heads*hd]; out attn[N,n_q_heads*hd].
-void launch_prefill_attn_int8_paged(
+// q_pos0: sequence position of this pass's first query (0 for a whole-prompt pass). Returns
+// false when no kernel here covers the shape, leaving `attn` unwritten -- callers must check.
+bool launch_prefill_attn_int8_paged(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr, int q_pos0 = 0);
 
 }} // namespace sparkinfer::kernels

@@ -62,7 +62,12 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
     const __half* __restrict__ v_scale, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale, int win_blocks) {
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, int q_pos0) {
+    // q_pos0 is where this pass's queries START in the sequence. It was implicitly 0 while
+    // prefill always ingested [0, N) in a single pass; carrying it lets a long prompt be
+    // ingested in windows. Queries and outputs stay addressed by the LOCAL row, while the
+    // causal bound and key range below run in sequence coordinates, so a window attends
+    // over the whole prefix that precedes it.
     using namespace nvcuda::wmma;
     constexpr int BM    = 16;                    // query rows per block == wmma M == KV page size
     constexpr int GN    = GROUP_BLKS * 16;       // keys per group
@@ -135,10 +140,10 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
     __syncthreads();
 
     // ---- sink/window range for this (16-aligned) query tile ----
-    const int last_q = min(qbase + BM - 1, n_tokens - 1);
+    const int last_q = q_pos0 + min(qbase + BM - 1, n_tokens - 1);
     int blk_rs = 0;                                   // first token of the recent window
     if (win_blocks > 0) {
-        const int n_blk_q = (qbase + block_size) / block_size;   // constant across the tile
+        const int n_blk_q = (q_pos0 + qbase + block_size) / block_size;   // constant across the tile
         const int rsb = (win_blocks >= n_blk_q - 1) ? 1 : (n_blk_q - win_blocks);
         blk_rs = rsb * block_size;
     }
@@ -189,7 +194,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, 3) void pf_attn_mma_i8_kernel(
                     const int t = lane + u * 32, gtok = k0 + t;
                     // causal + (sink OR recent window); the window start is uniform across the tile
                     const bool live = (t < gblk * 16) && (gtok < hi) && (qtok < n_tokens) &&
-                                      (gtok <= qtok) &&
+                                      (gtok <= q_pos0 + qtok) &&
                                       (win_blocks <= 0 || gtok < block_size || gtok >= blk_rs);
                     sc[u] = live ? (float)s_si[r * GN + t] * s_qs[r] * s_ks[t] * scale : -1e30f;
                     mx = fmaxf(mx, sc[u]);
@@ -312,7 +317,12 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 3 ? 2 : 1)) void pf_attn_m
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
     const __half* __restrict__ v_scale, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale, int win_blocks, int qld, int pld) {
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, int qld, int pld, int q_pos0) {
+    // q_pos0 is where this pass's queries START in the sequence. It was implicitly 0 while
+    // prefill always ingested [0, N) in a single pass; carrying it lets a long prompt be
+    // ingested in windows. Queries and outputs stay addressed by the LOCAL row, while the
+    // causal bound and key range below run in sequence coordinates, so a window attends
+    // over the whole prefix that precedes it.
     using namespace nvcuda::wmma;
     constexpr int BM    = 16;
     constexpr int GN    = GROUP_BLKS * 16;
@@ -392,10 +402,10 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 3 ? 2 : 1)) void pf_attn_m
     if (tid < RQH * BM) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
     __syncthreads();
 
-    const int last_q = min(qbase + BM - 1, n_tokens - 1);
+    const int last_q = q_pos0 + min(qbase + BM - 1, n_tokens - 1);
     int blk_rs = 0;
     if (win_blocks > 0) {
-        const int n_blk_q = (qbase + block_size) / block_size;
+        const int n_blk_q = (q_pos0 + qbase + block_size) / block_size;
         const int rsb = (win_blocks >= n_blk_q - 1) ? 1 : (n_blk_q - win_blocks);
         blk_rs = rsb * block_size;
     }
@@ -456,7 +466,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 3 ? 2 : 1)) void pf_attn_m
                     for (int u = 0; u < GN / 32; u++) {
                         const int t = lane + u * 32, gtok = k0 + t;
                         const bool live = (t < gblk * 16) && (gtok < hi) && (qtok < n_tokens) &&
-                                          (gtok <= qtok) &&
+                                          (gtok <= q_pos0 + qtok) &&
                                           (win_blocks <= 0 || gtok < block_size || gtok >= blk_rs);
                         sc[u] = live ? (float)s_si[r * GN + t] * s_qs[h * BM + r] * s_ks[t] * scale : -1e30f;
                         mx = fmaxf(mx, sc[u]);
@@ -551,7 +561,7 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                             const void* k_scale, const void* v_scale, const int* block_table,
                             void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
                             int block_size, int max_blocks_per_seq, float scale, int win_blocks,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, int q_pos0) {
     constexpr int BM = 16, GN = GROUP_BLKS * 16;
     // Only at long context. The padding costs ~1 KB of shared memory per block, which is enough to
     // push this kernel past the 2-blocks-per-SM occupancy its __launch_bounds__ asks for at RQH<=2.
@@ -601,7 +611,7 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
-        block_size, max_blocks_per_seq, scale, win_blocks, qld, pld);
+        block_size, max_blocks_per_seq, scale, win_blocks, qld, pld, q_pos0);
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek —
     // rather than get — so a pre-existing sticky error is not silently cleared here.
     return cudaPeekAtLastError() == cudaSuccess;
@@ -611,7 +621,8 @@ bool launch_prefill_attn_mma(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream) {
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream,
+    int q_pos0) {
     constexpr int HD = 256, GROUP_BLKS = 8, BM = 16;
 
     static const int enabled = [] {
@@ -659,7 +670,7 @@ bool launch_prefill_attn_mma(
     // returning success over an output buffer nothing wrote.
     if (gqa_rqh == 4 && gqa % 4 == 0 &&
         launch_attn_gqa<HD, GROUP_BLKS, 4>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
-            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream))
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
         return true;
     // RQH=3 exists for GQA-6 (this checkpoint: 24 q-heads over 4 kv-heads), where 4 does not
     // divide the group and the tier above always falls through to 2. ncu at ctx=16384 puts this
@@ -675,11 +686,11 @@ bool launch_prefill_attn_mma(
     // prefill@128, which is a no-regression floor.
     if (gqa_rqh >= 3 && gqa % 3 == 0 && n_tokens >= 2048 &&
         launch_attn_gqa<HD, GROUP_BLKS, 3>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
-            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream))
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
         return true;
     if (gqa_rqh >= 2 && gqa % 2 == 0 &&
         launch_attn_gqa<HD, GROUP_BLKS, 2>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
-            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream))
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
         return true;
 
     // Fallback: original per-q-head kernel.
@@ -700,7 +711,7 @@ bool launch_prefill_attn_mma(
         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
-        block_size, max_blocks_per_seq, scale, win_blocks);
+        block_size, max_blocks_per_seq, scale, win_blocks, q_pos0);
     return true;
 }
 
@@ -744,7 +755,12 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     const void* __restrict__ v_pool_raw, const __half* __restrict__ v_scale,
     const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale, int qld, int pld) {
+    int block_size, int max_blocks_per_seq, float scale, int qld, int pld, int q_pos0) {
+    // q_pos0 is where this pass's queries START in the sequence. It was implicitly 0 while
+    // prefill always ingested [0, N) in a single pass; carrying it lets a long prompt be
+    // ingested in windows. Queries and outputs stay addressed by the LOCAL row, while the
+    // causal bound and key range below run in sequence coordinates, so a window attends
+    // over the whole prefix that precedes it.
     using namespace nvcuda::wmma;
     constexpr int BM    = 16;                    // query rows per block == wmma M == KV page size
     constexpr int GN    = GROUP_BLKS * 16;       // keys per iteration
@@ -815,7 +831,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     if (tid < RQH * BM) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
     __syncthreads();
 
-    const int last_q = min(qbase + BM - 1, n_tokens - 1);
+    const int last_q = q_pos0 + min(qbase + BM - 1, n_tokens - 1);
 
     for (int k0 = 0; k0 < last_q + 1; k0 += GN) {
         const int nk   = min(GN, last_q + 1 - k0);
@@ -881,7 +897,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                 #pragma unroll
                 for (int u = 0; u < GN / 32; u++) {
                     const int t = lane + u * 32, gtok = k0 + t;
-                    const bool live = (t < gblk * 16) && (qtok < n_tokens) && (gtok <= qtok);
+                    const bool live = (t < gblk * 16) && (qtok < n_tokens) && (gtok <= q_pos0 + qtok);
                     sc[u] = live ? s_sh[r * GN + t] * scale : -1e30f;
                     mx = fmaxf(mx, sc[u]);
                 }
@@ -1029,7 +1045,8 @@ template <int HD, int GROUP_BLKS, int RQH, bool PSPLIT, bool VINT8 = false>
 static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* v_pool,
                                  const void* v_scale, const int* block_table, void* attn, int n_tokens,
                                  int n_q_heads, int n_kv_heads, int block_size,
-                                 int max_blocks_per_seq, float scale, cudaStream_t stream) {
+                                 int max_blocks_per_seq, float scale, cudaStream_t stream,
+                                 int q_pos0) {
     constexpr int BM = 16, GN = GROUP_BLKS * 16;
     // Same bank-conflict argument as attn_smem_pad() above, in bf16 elements: an unpadded row
     // stride of HD (512 B) or GN (256 B) is a whole multiple of the 128-byte bank row, so all 16
@@ -1053,7 +1070,7 @@ static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* 
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
         v_pool, reinterpret_cast<const __half*>(v_scale), block_table,
         reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
-        block_size, max_blocks_per_seq, scale, qld, pld);
+        block_size, max_blocks_per_seq, scale, qld, pld, q_pos0);
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek --
     // rather than get -- so a pre-existing sticky error is not silently cleared here.
     return cudaPeekAtLastError() == cudaSuccess;
@@ -1062,7 +1079,7 @@ static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* 
 bool launch_prefill_attn_mma_bf16(
     const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream, int q_pos0) {
     constexpr int HD = 256;
     static const int enabled = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_MMA");
@@ -1099,29 +1116,29 @@ bool launch_prefill_attn_mma_bf16(
         if (!psplit && rqh_env >= 3 && gqa % 3 == 0 &&
             launch_attn_bf16_gqa<HD, 16, 3, false>(
                 q, k_pool, v_pool, nullptr, block_table, attn, n_tokens, n_q_heads, n_kv_heads,
-                block_size, max_blocks_per_seq, scale, stream))
+                block_size, max_blocks_per_seq, scale, stream, q_pos0))
             return true;
         if (rqh_env >= 2 && gqa % 2 == 0) {
             if (psplit ? launch_attn_bf16_gqa<HD, 16, 2, true>(
                              q, k_pool, v_pool, nullptr, block_table, attn, n_tokens, n_q_heads,
-                             n_kv_heads, block_size, max_blocks_per_seq, scale, stream)
+                             n_kv_heads, block_size, max_blocks_per_seq, scale, stream, q_pos0)
                        : launch_attn_bf16_gqa<HD, 16, 2, false>(
                              q, k_pool, v_pool, nullptr, block_table, attn, n_tokens, n_q_heads,
-                             n_kv_heads, block_size, max_blocks_per_seq, scale, stream))
+                             n_kv_heads, block_size, max_blocks_per_seq, scale, stream, q_pos0))
                 return true;
         }
         return psplit ? launch_attn_bf16_gqa<HD, 16, 1, true>(
                             q, k_pool, v_pool, nullptr, block_table, attn, n_tokens, n_q_heads,
-                            n_kv_heads, block_size, max_blocks_per_seq, scale, stream)
+                            n_kv_heads, block_size, max_blocks_per_seq, scale, stream, q_pos0)
                       : launch_attn_bf16_gqa<HD, 16, 1, false>(
                             q, k_pool, v_pool, nullptr, block_table, attn, n_tokens, n_q_heads,
-                            n_kv_heads, block_size, max_blocks_per_seq, scale, stream);
+                            n_kv_heads, block_size, max_blocks_per_seq, scale, stream, q_pos0);
     }
 #define SI_MMA_BF16_TRY(RQH_)                                                                     \
     (psplit ? launch_attn_bf16_gqa<HD, 8, RQH_, true>(q, k_pool, v_pool, nullptr, block_table, attn,       \
-                  n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream) \
+                  n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream, q_pos0) \
             : launch_attn_bf16_gqa<HD, 8, RQH_, false>(q, k_pool, v_pool, nullptr, block_table, attn,      \
-                  n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream))
+                  n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream, q_pos0))
     if (rqh_env >= 3 && gqa % 3 == 0 && SI_MMA_BF16_TRY(3)) return true;
     if (rqh_env >= 2 && gqa % 2 == 0 && SI_MMA_BF16_TRY(2)) return true;
     return SI_MMA_BF16_TRY(1);
@@ -1131,14 +1148,15 @@ bool launch_prefill_attn_mma_bf16(
 bool launch_prefill_attn_mma_bf16_vi8(
     const void* q, const void* k_pool, const signed char* v_i8, const void* v_scale,
     const int* block_table, void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int head_dim, int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    int head_dim, int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream,
+    int q_pos0) {
     if (head_dim != 256 || block_size != 16 || n_tokens < 32768 ||
         n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 ||
         (n_q_heads / n_kv_heads) % 3 != 0)
         return false;
     return launch_attn_bf16_gqa<256, 16, 3, false, true>(
         q, k_pool, v_i8, v_scale, block_table, attn, n_tokens, n_q_heads, n_kv_heads,
-        block_size, max_blocks_per_seq, scale, stream);
+        block_size, max_blocks_per_seq, scale, stream, q_pos0);
 }
 
 }  // namespace kernels

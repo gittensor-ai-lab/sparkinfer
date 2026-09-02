@@ -32,7 +32,8 @@ bool launch_prefill_attn_mma(
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr,
+    int q_pos0 = 0);
 
 // BF16-KV twin, full causal, hd256 GQA. The int8 entry above cannot serve a bf16 KV pool, and the
 // bf16 pool is what the DSpark harness runs (dspark_tau_check pins int8_kv=false), so without this
@@ -44,13 +45,15 @@ bool launch_prefill_attn_mma(
 bool launch_prefill_attn_mma_bf16(
     const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr);
+    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr,
+    int q_pos0 = 0);
 
 bool launch_prefill_attn_mma_bf16_vi8(
     const void* q, const void* k_pool, const signed char* v_i8, const void* v_scale,
     const int* block_table, void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
     int head_dim, int block_size, int max_blocks_per_seq, float scale,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream,
+    int q_pos0);   // default declared in prefill.h
 
 }  // namespace kernels
 }  // namespace sparkinfer

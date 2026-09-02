@@ -2245,6 +2245,32 @@ bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
            n_tokens <= batched_maxctx;
 }
 
+// Tokens per batched-prefill window. The single-pass arena scales with the token count (mostly
+// the N*H activations and the attention scratch): it measured ~8.4 GB at 128k, which no longer
+// fits beside an NVFP4 27B and its 128k+ KV cache -- the allocation fails and the WHOLE prompt
+// drops onto the token loop, ~50x slower. Windowing bounds the arena by this constant instead,
+// so a 256k prompt costs the same arena as a 32k one. Only prompts LONGER than a window are
+// split, so every context that already fit in one pass is left on exactly the path it had.
+// SPARKINFER_PREFILL_WINDOW overrides; 0 restores the single unwindowed pass.
+int prefill_window_tokens() {
+    static const int w = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_WINDOW");
+        const int v = e ? atoi(e) : 32768;
+        return v < 0 ? 0 : v;
+    }();
+    return w;
+}
+
+// Batched-prefill eligibility for a prompt that may be windowed: every condition of
+// batched_prefill_enabled() except the context cap, which a window makes irrelevant -- what has
+// to fit is one window, not the prompt.
+bool batched_prefill_windowed_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
+    const int w = prefill_window_tokens();
+    if (n_tokens <= 0) return false;
+    if (w <= 0 || n_tokens <= w) return batched_prefill_enabled(gguf, cfg, n_tokens);
+    return batched_prefill_enabled(gguf, cfg, w);
+}
+
 // LMCache chunk size, tokens. Doubles as both the LOOKUP eligibility threshold (below this many
 // tokens, always recompute locally rather than pay an IPC round trip) and the STORE alignment
 // unit (a store range is rounded down to the nearest multiple, matching what the sidecar's own
@@ -2376,7 +2402,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     // naive) falls back to the token loop below, which is left byte-identical to main on purpose.
     bool batched_done = false;
     if (start_pos > 0) {
-        if (batched_prefill_enabled(s.gguf, s.cfg, start_pos)) {
+        if (batched_prefill_windowed_enabled(s.gguf, s.cfg, start_pos)) {
             std::vector<int> ids(start_pos);
             // Default is a synthetic ramp, NOT text. That is fine for a weight-bandwidth-bound
             // dense decode, but it is out-of-distribution for anything whose cost depends on token
@@ -2388,7 +2414,10 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
             if (!bench_prompt_ids_from_env(ids, start_pos))
                 for (int i = 0; i < start_pos; i++) ids[i] = 100 + (i % 20000);   // deterministic pseudo-prompt
             auto pb0 = std::chrono::high_resolution_clock::now();
-            int seed = prefill_batched(ids.data(), start_pos);
+            // No out_done: on a refusal the loop below re-ingests from position 0, and since it
+            // feeds its own output back as the next input (this is a synthetic bench prompt, not
+            // ids[]) resuming mid-way would not reproduce the same sequence anyway.
+            int seed = prefill_batched_chunked(ids.data(), start_pos);
             cudaDeviceSynchronize();
             auto pb1 = std::chrono::high_resolution_clock::now();
             if (seed >= 0) {
@@ -2503,12 +2532,14 @@ int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chu
         return -1;
     }
     const int n = end - start;
-    // Batched GEMM prefill never chunks (no start_pos support in prefill_batched_run yet) --
-    // only eligible on the very first call for this range (start==0) and always covers the
-    // whole [0,end) in one pass regardless of chunk_limit.
-    if (start == 0 && batched_prefill_enabled(s.gguf, s.cfg, n)) {
-        int seed = prefill_batched(ids, n, want_seed_logprob);
-        if (seed >= 0 && seed < s.cfg.vocab) {
+    // Batched GEMM prefill. Only eligible on the very first call for this range (start==0) --
+    // a windowed pass carries the Gated-DeltaNet recurrence forward from wherever the state
+    // already is, so it has to begin where the state does -- and it always covers the whole
+    // [0,end), in prefill_window_tokens()-sized windows, regardless of chunk_limit.
+    int batched_done = 0;
+    if (start == 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, n)) {
+        int seed = prefill_batched_chunked(ids, n, want_seed_logprob, &batched_done);
+        if (seed >= 0) {
             if (out_pos) *out_pos = end;
             return seed;
         }
@@ -2528,8 +2559,10 @@ int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chu
     // lmcache_e2e_gpu_test.cpp -- exactly the class of bug that test exists to catch).
     // lookup() already handles "is the bridge actually reachable" internally via its own
     // lazy-connect + cooldown/backoff, bounded by the 5ms default timeout either way.
-    int actual_start = start;
-    if (start == 0 && s.lmcache_bridge && n >= lmcache_chunk_size_tokens()) {
+    // Whatever the batched windows did land is already correct in the KV cache and in the GDN
+    // state, so the token loop resumes from there instead of recomputing it.
+    int actual_start = start + batched_done;
+    if (actual_start == 0 && s.lmcache_bridge && n >= lmcache_chunk_size_tokens()) {
         LookupResult res = s.lmcache_bridge->lookup(std::vector<int>(ids, ids + end));
         if (res.ok && res.matched_tokens > 0) {
             const BridgeKVLayout layout = lmcache_layout_from_cfg(s.cfg, *s.kv);
@@ -2698,7 +2731,8 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 
 // Thin adapter: hand the batched-prefill orchestration (qwen35_prefill.cpp) exactly the scratch
 // buffers, streams and config it needs, so Impl stays private to this file.
-int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob) {
+int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob,
+                                 int pos0) {
     Impl& s = *p_;
     auto it = s.sessions.find(s.active_seq_id);
     float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;
@@ -2713,9 +2747,9 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.dflash_capture ? s.dflash_n_cap : 0,
                           s.dflash_capture ? s.dflash_context : nullptr,
                           s.dflash_capture ? s.dflash_ctx_start : 0 };
-    const int seed = prefill_batched_run(ctx, prompt_ids, n);
+    const int seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
     if (seed >= 0 && s.dflash_capture && s.dflash_context && s.dflash_n_cap > 0)
-        s.dflash_ctx_len = n;
+        s.dflash_ctx_len = pos0 + n;
     // Seed-token logprob (see ingest_prompt_range's want_seed_logprob). prefill_batched_run's
     // LM-head tail stops at argmax -- it never runs the sort/scan that last_token_logprobs()
     // reads -- so without this the FIRST token of every response has no logprob entry and
@@ -2747,6 +2781,44 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
         cu(cudaStreamSynchronize(s.stream), "prefill seed logprob sync");
     }
     return seed;
+}
+
+int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want_seed_logprob,
+                                         int* out_done) {
+    if (out_done) *out_done = 0;
+    if (!prompt_ids || n <= 0) return -1;
+    const int window = prefill_window_tokens();
+    Impl& s = *p_;
+    // Short enough for one pass: run exactly the call this function replaced, so no context that
+    // already worked changes kernel path, tile shape or arithmetic.
+    if (window <= 0 || n <= window) {
+        const int seed = prefill_batched(prompt_ids, n, want_seed_logprob);
+        if (seed < 0 || seed >= s.cfg.vocab) return -1;
+        if (out_done) *out_done = n;
+        return seed;
+    }
+    for (int pos = 0; pos < n; pos += window) {
+        const int len = std::min(window, n - pos);
+        const bool last = (pos + len >= n);
+        // Only the final window needs the seed logprob -- the earlier ones exist to fill KV and
+        // carry the Gated-DeltaNet recurrence, and nothing ever reads their argmax.
+        const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
+        // A window that declines -- a path with no start position (Muse's rolling-window
+        // attention, a DSpark capture), or a scratch allocation that failed even at window size
+        // -- leaves [0, pos) correct in the cache and stops there: the caller finishes the rest
+        // token by token rather than recomputing what already landed.
+        if (seed < 0) return -1;
+        // *out_done advances only over windows whose result is trustworthy: a final window that
+        // produced a nonsense seed is not counted, so the caller redoes it rather than trusting
+        // a KV range whose own LM head disagreed with itself.
+        if (last) {
+            if (seed >= s.cfg.vocab) return -1;
+            if (out_done) *out_done = n;
+            return seed;
+        }
+        if (out_done) *out_done = pos + len;
+    }
+    return -1;
 }
 
 int Qwen35Model::session_token_budget(size_t prompt_len, int max_new, int max_seq) {
@@ -3328,10 +3400,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     s.final_seqlen_hint = n + max_new;
     auto t0 = std::chrono::steady_clock::now();
     int next = -1;
-    if (batched_prefill_enabled(s.gguf, s.cfg, n))
-        next = prefill_batched(prompt.data(), n);
+    int batched_done = 0;
+    if (batched_prefill_windowed_enabled(s.gguf, s.cfg, n))
+        next = prefill_batched_chunked(prompt.data(), n, false, &batched_done);
     if (next < 0) {
-        for (int i = 0; i < n; i++) {
+        for (int i = batched_done; i < n; i++) {
             set_dflash_capture_row(0);
             const bool sample = (i + 1 == n);
             int r = forward_token(prompt[i], i, sample);
