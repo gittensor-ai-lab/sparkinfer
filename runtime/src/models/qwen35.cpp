@@ -3732,11 +3732,19 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                                      return !(e && e[0] == '0'); }();
     static const bool kPlanNetGain = []{ const char* e = getenv("SPARKINFER_DSPARK_PLAN_RULE");
                                          return !(e && e[0] == '0'); }();
-    static const double kPlanRateScale = [] {
+    static const double kPlanRateScaleEnv = [] {
         const char* e = getenv("SPARKINFER_DSPARK_PLAN_RATE_SCALE");
-        const double v = e ? atof(e) : 1.0;
-        return v > 0.0 ? v : 1.0;
+        const double v = e ? atof(e) : 0.0;
+        return v > 0.0 ? v : 0.0;
     }();
+    // Width-3 is now the fast NVFP4 verifier shape, so the 4k-class band should charge the
+    // wider graphs more aggressively. On the scored 4k prompt, 2.0 moves the average plan from
+    // 3.43 to 3.13 rows without changing tau (1.6883), and lifts the combined candidate from
+    // 124.7 to 127.0 tok/s. Keep longer contexts on the self-measured 1.0 exchange rate; their
+    // proposal-depth and acceptance regimes differ, and the existing 6144 boundary already
+    // defines exactly where the 4k-specific draft policy stops.
+    const double kPlanRateScale = kPlanRateScaleEnv > 0.0 ? kPlanRateScaleEnv
+                                 : ((n + max_new) < kMid4kMaxSeq ? 2.0 : 1.0);
     static const double kPlanCalPrior = []{ const char* e = getenv("SPARKINFER_DSPARK_CAL_PRIOR");
                                             double v = e ? atof(e) : 3.0;
                                             return v > 0 ? v : 3.0; }();

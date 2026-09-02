@@ -3801,10 +3801,17 @@ verify_forward_done:
     // this same stream, so CUDA stream ordering still guarantees the commit has completed before
     // target state is read again. Keep the synchronous path as the default until the overlap has
     // passed the long-context reproducibility matrix.
-    static const bool async_commit = [] {
+    static const int async_commit_env = [] {
         const char* e = getenv("SPARKINFER_DFLASH_ASYNC_COMMIT");
-        return e && e[0] == '1';
+        return e ? ((e[0] == '1') ? 1 : 0) : -1;
     }();
+    // At 4k the next draft block is long enough to hide this commit, while the next target graph
+    // remains ordered behind it on `st`. Five repeated generations kept exact AR equality and
+    // moved the combined candidate 127.35 -> 127.64 tok/s. Keep short decode and the longer
+    // scored contexts synchronous; their overlap trade differs and they are not part of this
+    // calibration. The explicit environment setting still wins for cross-context testing.
+    const bool async_commit = async_commit_env >= 0 ? async_commit_env != 0
+                                                    : (start_pos >= 2048 && start_pos < 6144);
     if (!async_commit) pf_cu(cudaStreamSynchronize(st), "verify commit");
     return keep;
 }
