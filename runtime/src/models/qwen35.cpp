@@ -2245,20 +2245,43 @@ bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
            n_tokens <= batched_maxctx;
 }
 
-// Tokens per batched-prefill window. The single-pass arena scales with the token count (mostly
-// the N*H activations and the attention scratch): it measured ~8.4 GB at 128k, which no longer
-// fits beside an NVFP4 27B and its 128k+ KV cache -- the allocation fails and the WHOLE prompt
-// drops onto the token loop, ~50x slower. Windowing bounds the arena by this constant instead,
-// so a 256k prompt costs the same arena as a 32k one. Only prompts LONGER than a window are
-// split, so every context that already fit in one pass is left on exactly the path it had.
-// SPARKINFER_PREFILL_WINDOW overrides; 0 restores the single unwindowed pass.
+// Tokens per batched-prefill window, for a prompt long enough to need windowing at all (see
+// prefill_single_pass_max_tokens). The single-pass arena scales with the token count (mostly the
+// N*H activations and the attention scratch): it measured ~8.4 GB at 128k, which no longer fits
+// beside an NVFP4 27B and its 128k+ KV cache -- the allocation fails and the WHOLE prompt drops
+// onto the token loop, ~30x slower. Windowing bounds the arena by this constant instead, so a
+// 256k prompt costs the same arena as a 32k one.
+//
+// 16384 rather than a window as large as will fit: measured at ctx=262144 on an RTX 5090, 16384
+// ingests at 2642 pp against 2135 for 32768, i.e. the SMALLER window is 24% faster. The arena a
+// window holds is released and reallocated per window once it exceeds the keep-resident budget,
+// and a smaller one both costs less to cycle and leaves more of L2 to the attention scan against
+// a quarter-million-token KV cache -- which is what a long prefill is actually spending its time
+// on. SPARKINFER_PREFILL_WINDOW overrides; 0 restores the single unwindowed pass.
 int prefill_window_tokens() {
     static const int w = [] {
         const char* e = getenv("SPARKINFER_PREFILL_WINDOW");
-        const int v = e ? atoi(e) : 32768;
+        const int v = e ? atoi(e) : 16384;
         return v < 0 ? 0 : v;
     }();
     return w;
+}
+
+// Largest prompt still ingested in ONE pass. Separate from the window size on purpose: windowing
+// exists to bound the arena, so below the size where a single pass demonstrably fits there is no
+// reason to pay for it (a second LM-head tail, an arena release-and-reallocate per window, and no
+// whole-prefill CUDA graph after the first window). 32768 is where the single pass is measured
+// working and fast, and holding the threshold there is what keeps every context at or below it on
+// exactly the path it had -- including the 4k/16k/32k prefill dimensions, which are no-regression
+// floors. The window size below it is then free to be whatever ingests a LONG prompt fastest,
+// which is not the same number. SPARKINFER_PREFILL_SINGLE_MAX overrides.
+int prefill_single_pass_max_tokens() {
+    static const int m = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_SINGLE_MAX");
+        const int v = e ? atoi(e) : 32768;
+        return v < 0 ? 0 : v;
+    }();
+    return m;
 }
 
 // Batched-prefill eligibility for a prompt that may be windowed: every condition of
@@ -2267,7 +2290,8 @@ int prefill_window_tokens() {
 bool batched_prefill_windowed_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
     const int w = prefill_window_tokens();
     if (n_tokens <= 0) return false;
-    if (w <= 0 || n_tokens <= w) return batched_prefill_enabled(gguf, cfg, n_tokens);
+    if (w <= 0 || n_tokens <= prefill_single_pass_max_tokens())
+        return batched_prefill_enabled(gguf, cfg, n_tokens);
     return batched_prefill_enabled(gguf, cfg, w);
 }
 
@@ -2790,8 +2814,9 @@ int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want
     const int window = prefill_window_tokens();
     Impl& s = *p_;
     // Short enough for one pass: run exactly the call this function replaced, so no context that
-    // already worked changes kernel path, tile shape or arithmetic.
-    if (window <= 0 || n <= window) {
+    // already worked changes kernel path, tile shape or arithmetic. The bound is the single-pass
+    // threshold, NOT the window size -- a prompt between the two is still one pass.
+    if (window <= 0 || n <= prefill_single_pass_max_tokens()) {
         const int seed = prefill_batched(prompt_ids, n, want_seed_logprob);
         if (seed < 0 || seed >= s.cfg.vocab) return -1;
         if (out_done) *out_done = n;
