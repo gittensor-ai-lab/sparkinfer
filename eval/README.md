@@ -186,8 +186,8 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 > The Qwen3.6 / Qwen3.8 shared-path guards remain mandatory. See that file's module docstring —
 > it is the authority, not this README.
 >
-> The 256k row uses `qwen3_gguf_bench` sweep mode with one exact 262,144-token context, INT8 KV,
-> and the memory-safe Q4_K decode representation. Main currently uses the sequential prefill
+> The 256k row uses `qwen3_gguf_bench` sweep mode with one exact 262,144-token context,
+> checkpoint-native NVFP4 prefill/decode representations, and INT8 KV. Main currently uses the sequential prefill
 > fallback there, so one main or PR measurement takes roughly 65 minutes on the pinned RTX 5090.
 > The hourly lock therefore skips overlapping ticks; it never starts concurrent GPU evaluations.
 >

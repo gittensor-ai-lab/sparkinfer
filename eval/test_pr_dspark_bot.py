@@ -8,15 +8,15 @@ class Prefill256KEvalTests(unittest.TestCase):
     def test_256k_is_exact_scored_dimension(self):
         self.assertEqual(bot.DSPARK_PREFILL_CTX_256K, 262144)
         self.assertIn("target-prefill@256k", bot.SCORING_DIMS)
-        self.assertIn("256k-prefill", bot.EVAL_SCHEMA_VERSION)
+        self.assertIn("native-nvfp4-256k-prefill", bot.EVAL_SCHEMA_VERSION)
 
     def test_remote_script_uses_one_pass_memory_safe_sweep(self):
         script = bot._remote_script("main", role="main")
         self.assertIn('PREFILL_CTX256=262144', script)
         self.assertIn('SPARKINFER_BENCH_SWEEP_CTXS="$PREFILL_CTX256"', script)
         self.assertIn('qwen3_gguf_bench "$MODEL_DIR" 128 sweep', script)
-        self.assertIn('SPARKINFER_QWEN38_PREFILL_NVFP4=0', script)
-        self.assertIn('SPARKINFER_QWEN38_DECODE_NVFP4=0', script)
+        self.assertIn('SPARKINFER_QWEN38_PREFILL_NVFP4=1', script)
+        self.assertIn('SPARKINFER_QWEN38_DECODE_NVFP4=1', script)
         self.assertIn('SPARKINFER_KV_INT8=1', script)
         self.assertIn('RESULT_PREFILL256_PP', script)
         self.assertIn('runtime/examples/qwen3_gguf_bench.cpp', script)

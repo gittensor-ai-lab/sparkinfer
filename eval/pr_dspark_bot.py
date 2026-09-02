@@ -165,7 +165,7 @@ MODELOPT_NEEDS_REBASE = "dspark-needs-rebase"
 # baseline moves by ~72% (dspark@4k 43.06 -> 74.05, ar@4k 47.39 -> 90.19) and every score taken
 # under v1 is incomparable -- bumping the schema forces re-evaluation instead of letting a stale
 # label sit next to a number that no longer means the same thing.
-EVAL_SCHEMA_VERSION = "v9-dspark-4k-16k-32k-decode-prefill-256k-prefill"
+EVAL_SCHEMA_VERSION = "v10-dspark-native-nvfp4-256k-prefill"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-dspark-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -1175,13 +1175,14 @@ fi
 # Main currently exceeds the batched-prefill scratch ceiling at 256k and therefore uses the
 # sequential fallback (~67 pp/s on the pinned 5090). That is an honest baseline, not a reason to
 # hide the dimension: a memory-safe chunked batched-prefill implementation should replace it and
-# earn the corresponding speedup. The fixed Q4_K decode representation and INT8 KV settings are
-# the configuration that fits this exact context on a 32 GB RTX 5090.
+# earn the corresponding speedup. The checkpoint-native NVFP4 prefill and decode representations
+# are pinned explicitly so this row exercises the format served by the release rather than silently
+# changing its numerical/performance contract. INT8 KV keeps the exact context within 32 GB.
 wait_gpu_clear
 PF256_OUT=/tmp/dspark_prefill256k.txt
 if ! timeout 7200 env \
-  SPARKINFER_QWEN38_PREFILL_NVFP4=0 \
-  SPARKINFER_QWEN38_DECODE_NVFP4=0 \
+  SPARKINFER_QWEN38_PREFILL_NVFP4=1 \
+  SPARKINFER_QWEN38_DECODE_NVFP4=1 \
   SPARKINFER_KV_INT8=1 \
   SPARKINFER_PREFILL_BATCHED=1 \
   SPARKINFER_BENCH_SWEEP_CTXS="$PREFILL_CTX256" \
