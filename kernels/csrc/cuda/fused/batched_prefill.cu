@@ -330,6 +330,20 @@ __global__ void pf_mul_sigmoid_kernel(__nv_bfloat16* __restrict__ attn,
     attn[i] = __float2bfloat16(pf_to_f(attn[i]) * pf_sigmoid(pf_to_f(gate[i])));
 }
 
+// One tap of the Gated-DeltaNet causal conv, by token index relative to THIS pass. A windowed
+// pass starts mid-sequence, so the taps that reach back past its own token 0 are not zero: they
+// are the last conv_kernel-1 raw qkv rows of the previous window, handed in through conv_prev in
+// exactly the layout conv_state is written in (index 0 = oldest). conv_prev == nullptr -- the
+// whole-prompt pass, which really does begin at position 0 -- restores the zero pad, so every
+// unwindowed call keeps the arithmetic it had.
+__device__ __forceinline__ float pf_conv_tap(const __nv_bfloat16* __restrict__ qkv,
+                                             const __nv_bfloat16* __restrict__ conv_prev,
+                                             int src, int d, int qkv_dim, int conv_kernel) {
+    if (src >= 0)   return pf_to_f(qkv[(size_t)src * qkv_dim + d]);
+    if (!conv_prev) return 0.f;
+    return pf_to_f(conv_prev[(size_t)(src + conv_kernel - 1) * qkv_dim + d]);
+}
+
 // ============================================================================
 // Gated-DeltaNet causal conv + split + SiLU + L2-norm(q,k), scanned over N tokens.
 // One block per output head (blockDim = head_dim); each thread owns one channel and
@@ -342,7 +356,8 @@ __global__ void pf_gdn_conv_kernel(const __nv_bfloat16* __restrict__ qkv,
                                    __nv_bfloat16* __restrict__ k,
                                    __nv_bfloat16* __restrict__ v,
                                    int n_tokens, int q_heads, int v_heads,
-                                   int head_dim, int qkv_dim, int conv_kernel, float eps) {
+                                   int head_dim, int qkv_dim, int conv_kernel, float eps,
+                                   const __nv_bfloat16* __restrict__ conv_prev) {
     const int q_dim = q_heads * head_dim;
     const int v_dim = v_heads * head_dim;
     const int blk = blockIdx.x;                    // output head
@@ -357,7 +372,10 @@ __global__ void pf_gdn_conv_kernel(const __nv_bfloat16* __restrict__ qkv,
     for (int c = 0; c < 8; c++) w[c] = (c < conv_kernel) ? pf_to_f(conv_w[(size_t)d * conv_kernel + c]) : 0.f;
     float hist[7];                                 // last conv_kernel-1 raw qkv (<=7)
     #pragma unroll
-    for (int c = 0; c < 7; c++) hist[c] = 0.f;
+    for (int c = 0; c < 7; c++)
+        hist[c] = (c < conv_kernel - 1) ? pf_conv_tap(qkv, conv_prev, c - (conv_kernel - 1), d,
+                                                      qkv_dim, conv_kernel)
+                                        : 0.f;
 
     __shared__ float sw[32];
     const int nwarp = (blockDim.x + 31) / 32;
@@ -414,7 +432,8 @@ __global__ void pf_gdn_conv_par_kernel(const __nv_bfloat16* __restrict__ qkv,
                                        __nv_bfloat16* __restrict__ k,
                                        __nv_bfloat16* __restrict__ v,
                                        int n_tokens, int q_heads, int v_heads,
-                                       int head_dim, int qkv_dim, int conv_kernel, float eps) {
+                                       int head_dim, int qkv_dim, int conv_kernel, float eps,
+                                       const __nv_bfloat16* __restrict__ conv_prev) {
     const int q_dim = q_heads * head_dim;
     const int v_dim = v_heads * head_dim;
     const int tok = blockIdx.x;
@@ -430,8 +449,9 @@ __global__ void pf_gdn_conv_par_kernel(const __nv_bfloat16* __restrict__ qkv,
     for (int c = 0; c < 8; c++) {
         if (c >= conv_kernel) break;
         const int src = tok - (conv_kernel - 1) + c;
-        if (src >= 0)
-            y += pf_to_f(conv_w[(size_t)d * conv_kernel + c]) * pf_to_f(qkv[(size_t)src * qkv_dim + d]);
+        if (src >= 0 || conv_prev)
+            y += pf_to_f(conv_w[(size_t)d * conv_kernel + c]) *
+                 pf_conv_tap(qkv, conv_prev, src, d, qkv_dim, conv_kernel);
     }
 
     float cval = pf_silu(y);
@@ -456,9 +476,11 @@ __global__ void pf_gdn_conv_par_kernel(const __nv_bfloat16* __restrict__ qkv,
         #pragma unroll
         for (int c = 0; c < 7; c++) {
             if (c >= conv_kernel - 1) break;
+            // src < 0 means this pass was shorter than the conv window: the rows it did not
+            // supply come from the window before it, not from zero.
             const int src = n_tokens - 1 - (conv_kernel - 2 - c);
             conv_state[(size_t)c * qkv_dim + d] =
-                (src >= 0) ? qkv[(size_t)src * qkv_dim + d] : __float2bfloat16(0.f);
+                __float2bfloat16(pf_conv_tap(qkv, conv_prev, src, d, qkv_dim, conv_kernel));
         }
     }
 }
@@ -481,7 +503,8 @@ __global__ void pf_gdn_conv_tile_kernel(const __nv_bfloat16* __restrict__ qkv,
                                         __nv_bfloat16* __restrict__ k,
                                         __nv_bfloat16* __restrict__ v,
                                         int n_tokens, int q_heads, int v_heads,
-                                        int head_dim, int qkv_dim, int conv_kernel, float eps) {
+                                        int head_dim, int qkv_dim, int conv_kernel, float eps,
+                                        const __nv_bfloat16* __restrict__ conv_prev) {
     const int q_dim = q_heads * head_dim;
     const int v_dim = v_heads * head_dim;
     const int tok0 = blockIdx.x * PF_CONV_TT;
@@ -499,7 +522,8 @@ __global__ void pf_gdn_conv_tile_kernel(const __nv_bfloat16* __restrict__ qkv,
     #pragma unroll
     for (int c = 0; c < 7; c++) {
         const int src = tok0 - (conv_kernel - 1) + c;
-        hist[c] = (c < conv_kernel - 1 && src >= 0) ? pf_to_f(qkv[(size_t)src * qkv_dim + d]) : 0.f;
+        hist[c] = (c < conv_kernel - 1) ? pf_conv_tap(qkv, conv_prev, src, d, qkv_dim, conv_kernel)
+                                        : 0.f;
     }
 
     __shared__ float sw[32];
@@ -545,9 +569,11 @@ __global__ void pf_gdn_conv_tile_kernel(const __nv_bfloat16* __restrict__ qkv,
         #pragma unroll
         for (int c = 0; c < 7; c++) {
             if (c >= conv_kernel - 1) break;
+            // src < 0 means this pass was shorter than the conv window: the rows it did not
+            // supply come from the window before it, not from zero.
             const int src = n_tokens - 1 - (conv_kernel - 2 - c);
             conv_state[(size_t)c * qkv_dim + d] =
-                (src >= 0) ? qkv[(size_t)src * qkv_dim + d] : __float2bfloat16(0.f);
+                __float2bfloat16(pf_conv_tap(qkv, conv_prev, src, d, qkv_dim, conv_kernel));
         }
     }
 }
@@ -948,12 +974,16 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
     __half* __restrict__ k_scale, __half* __restrict__ v_scale,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
-    int block_size, int max_blocks_per_seq) {
+    int block_size, int max_blocks_per_seq, int pos0) {
     const int tok  = blockIdx.x;                    // token (grid.x avoids 65535 grid.y cap)
     const int unit = blockIdx.y;
     const int t    = threadIdx.x;
     const int rhalf = rotary_dim >> 1;
-    const int pos   = tok;                              // prefill: position == token index
+    // `tok` indexes THIS PASS's activation buffers; `pos` indexes the sequence. The two were
+    // equal while prefill always ingested [0, N) in a single pass. pos0 separates them so a long
+    // prompt can be ingested in windows: the RoPE angle and the block-table slot below both follow
+    // the sequence position, while q/k/v stay addressed by the local row.
+    const int pos = pos0 + tok;
     const int blk   = pos / block_size, within = pos % block_size;
     const int phys  = block_table[blk];                // single sequence
     const size_t ctok = (size_t)phys * block_size + within;
@@ -1071,11 +1101,15 @@ __global__ void pf_qknorm_ropenorm_kv_bf16_kernel(
     __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
-    int block_size, int max_blocks_per_seq) {
+    int block_size, int max_blocks_per_seq, int pos0) {
     const int tok  = blockIdx.x;
     const int unit = blockIdx.y;
     const int t    = threadIdx.x;
-    const int pos  = tok;                              // prefill: position == token index
+    // `tok` indexes THIS PASS's activation buffers; `pos` indexes the sequence. The two were
+    // equal while prefill always ingested [0, N) in a single pass. pos0 separates them so a long
+    // prompt can be ingested in windows: the RoPE angle and the block-table slot below both follow
+    // the sequence position, while q/k/v stay addressed by the local row.
+    const int pos = pos0 + tok;
     const int blk  = pos / block_size, within = pos % block_size;
     const int phys = block_table[blk];                // single sequence
     const size_t ctok = (size_t)phys * block_size + within;
@@ -1140,7 +1174,7 @@ __global__ void pf_attn_int8_paged_kernel(
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
     const __half* __restrict__ v_scale, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale) {
+    int block_size, int max_blocks_per_seq, float scale, int q_pos0) {
     constexpr int ELEMS = HEAD_DIM / 32;
     const int head = blockIdx.y;                    // q-head
     const int qtok = blockIdx.x;                    // query token (grid.x avoids 65535 grid.y cap)
@@ -1157,7 +1191,10 @@ __global__ void pf_attn_int8_paged_kernel(
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
 
-    for (int kpos = 0; kpos <= qtok; kpos++) {
+    // qtok is the query's row in THIS pass; q_pos0 + qtok is its position in the sequence, and
+    // both the causal bound and the KV scan follow the latter -- a windowed pass attends over
+    // everything already in the paged cache, not only over its own window.
+    for (int kpos = 0; kpos <= q_pos0 + qtok; kpos++) {
         const int blk = kpos / block_size, within = kpos % block_size;
         const int phys = block_table[blk];
         const size_t ckt = ((size_t)phys * block_size + within);
@@ -1204,11 +1241,15 @@ __global__ void pf_qknorm_rope_kv_bf16_kernel(
     signed char* __restrict__ v_i8, __half* __restrict__ v_i8_scale,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
-    int block_size, int max_blocks_per_seq) {
+    int block_size, int max_blocks_per_seq, int pos0) {
     const int tok  = blockIdx.x;
     const int unit = blockIdx.y;
     const int t    = threadIdx.x;
-    const int pos  = tok;                              // prefill: position == token index
+    // `tok` indexes THIS PASS's activation buffers; `pos` indexes the sequence. The two were
+    // equal while prefill always ingested [0, N) in a single pass. pos0 separates them so a long
+    // prompt can be ingested in windows: the RoPE angle and the block-table slot below both follow
+    // the sequence position, while q/k/v stay addressed by the local row.
+    const int pos = pos0 + tok;
     const int blk  = pos / block_size, within = pos % block_size;
     const int phys = block_table[blk];
     const size_t ctok = (size_t)phys * block_size + within;
@@ -1292,7 +1333,7 @@ __global__ void pf_attn_bf16_paged_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
     const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale) {
+    int block_size, int max_blocks_per_seq, float scale, int q_pos0) {
     constexpr int ELEMS = HEAD_DIM / 32;
     const int head = blockIdx.y;
     const int qtok = blockIdx.x;
@@ -1309,7 +1350,8 @@ __global__ void pf_attn_bf16_paged_kernel(
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
 
-    for (int kpos = 0; kpos <= qtok; kpos++) {
+    // Sequence position, not row-in-this-pass: see pf_attn_int8_paged_kernel.
+    for (int kpos = 0; kpos <= q_pos0 + qtok; kpos++) {
         const int blk = kpos / block_size, within = kpos % block_size;
         const int phys = block_table[blk];
         const size_t ckt = ((size_t)phys * block_size + within);
@@ -1357,7 +1399,7 @@ __global__ __launch_bounds__(NWARP * 32) void pf_attn_bf16_paged_tiled_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
     const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale) {
+    int block_size, int max_blocks_per_seq, float scale, int q_pos0) {
     constexpr int ELEMS = HEAD_DIM / 32;
     extern __shared__ __nv_bfloat16 pf_tile_smem[];
     __nv_bfloat16* sK = pf_tile_smem;
@@ -1385,7 +1427,10 @@ __global__ __launch_bounds__(NWARP * 32) void pf_attn_bf16_paged_tiled_kernel(
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
 
-    const int qmax = min(q0 + NWARP - 1, n_tokens - 1);
+    // Sequence position of the last query this block owns: the KV tile loop below walks absolute
+    // positions (kpos indexes the paged cache directly), so it has to stop where the sequence
+    // says, not where this pass's row numbering does.
+    const int qmax = q_pos0 + min(q0 + NWARP - 1, n_tokens - 1);
 
     for (int t0 = 0; t0 <= qmax; t0 += TK) {
         const int tk = min(TK, qmax - t0 + 1);
@@ -1401,7 +1446,7 @@ __global__ __launch_bounds__(NWARP * 32) void pf_attn_bf16_paged_tiled_kernel(
         }
         __syncthreads();
         if (qtok < n_tokens) {
-            const int kend = min(tk, qtok - t0 + 1);
+            const int kend = min(tk, q_pos0 + qtok - t0 + 1);   // causal, in sequence positions
             for (int kk = 0; kk < kend; kk++) {
                 float partial = 0.f;
                 #pragma unroll
@@ -1494,7 +1539,8 @@ void launch_prefill_mul_sigmoid(void* attn, const void* gate, int n_tokens, int 
 
 void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_state,
                              void* q, void* k, void* v, int n_tokens, int q_heads, int v_heads,
-                             int head_dim, int conv_kernel, float eps, cudaStream_t stream) {
+                             int head_dim, int conv_kernel, float eps, cudaStream_t stream,
+                             const void* conv_prev) {
     const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
     const int blocks = 2 * q_heads + v_heads;
     static int seq = [] {   // SPARKINFER_PREFILL_GDN_CONV_SEQ=1 restores the token-loop kernel
@@ -1511,7 +1557,8 @@ void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_sta
             reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
             reinterpret_cast<__nv_bfloat16*>(conv_state), reinterpret_cast<__nv_bfloat16*>(q),
             reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),
-            n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps);
+            n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps,
+            reinterpret_cast<const __nv_bfloat16*>(conv_prev));
         return;
     }
     if (!seq) {
@@ -1520,14 +1567,16 @@ void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_sta
             reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
             reinterpret_cast<__nv_bfloat16*>(conv_state), reinterpret_cast<__nv_bfloat16*>(q),
             reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),
-            n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps);
+            n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps,
+            reinterpret_cast<const __nv_bfloat16*>(conv_prev));
         return;
     }
     pf_gdn_conv_kernel<<<blocks, head_dim, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
         reinterpret_cast<__nv_bfloat16*>(conv_state), reinterpret_cast<__nv_bfloat16*>(q),
         reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),
-        n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps);
+        n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps,
+        reinterpret_cast<const __nv_bfloat16*>(conv_prev));
 }
 
 void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
@@ -1709,7 +1758,7 @@ void launch_prefill_qknorm_rope_kv_int8(
     signed char* k_pool, signed char* v_pool, void* k_scale, void* v_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream) {
+    cudaStream_t stream, int pos0) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
     pf_qknorm_rope_kv_int8_kernel<<<grid, head_dim, shmem, stream>>>(
@@ -1718,7 +1767,7 @@ void launch_prefill_qknorm_rope_kv_int8(
         reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
         reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-        block_size, max_blocks_per_seq);
+        block_size, max_blocks_per_seq, pos0);
 }
 
 // Muse Glimmer bf16-KV counterpart: QK-norm + NORMAL RoPE (rotary_dim>0) / NoPE
@@ -1728,7 +1777,7 @@ void launch_prefill_qknorm_ropenorm_kv_bf16(
     void* k_pool, void* v_pool,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream) {
+    cudaStream_t stream, int pos0) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
     pf_qknorm_ropenorm_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
@@ -1737,7 +1786,7 @@ void launch_prefill_qknorm_ropenorm_kv_bf16(
         reinterpret_cast<const __nv_bfloat16*>(k_w),
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
         block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-        block_size, max_blocks_per_seq);
+        block_size, max_blocks_per_seq, pos0);
 }
 
 void launch_prefill_qknorm_rope_kv_bf16_vi8(
@@ -1745,7 +1794,7 @@ void launch_prefill_qknorm_rope_kv_bf16_vi8(
     void* k_pool, void* v_pool, signed char* v_i8, void* v_i8_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream) {
+    cudaStream_t stream, int pos0) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);
     const size_t shmem = (size_t)head_dim * sizeof(float);
     pf_qknorm_rope_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
@@ -1754,37 +1803,50 @@ void launch_prefill_qknorm_rope_kv_bf16_vi8(
         reinterpret_cast<const __nv_bfloat16*>(k_w),
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
         v_i8, reinterpret_cast<__half*>(v_i8_scale), block_table,
-        n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps, block_size, max_blocks_per_seq);
+        n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps, block_size, max_blocks_per_seq, pos0);
 }
 
-void launch_prefill_attn_int8_paged(
+bool launch_prefill_attn_int8_paged(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream) {
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream,
+    int q_pos0) {
     // int8 tensor-core prefill attention: same mask + online softmax as the scalar path below,
     // run on the wmma int8 cores (the scalar kernels are compute-bound at ~8 TFLOP/s). Honours the
     // caller's per-layer window (zero means global/full). SPARKINFER_PREFILL_ATTN_MMA=0 falls through.
     if (launch_prefill_attn_mma(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
             n_tokens, n_q_heads, n_kv_heads, head_dim, block_size, max_blocks_per_seq, scale,
-            win_blocks, stream))
-        return;
+            win_blocks, stream, q_pos0))
+        return true;
     // Sink + sliding-window sparse prefill attention (StreamingLLM, matches the merged decode
     // sparse-KV #379): O(N*window) instead of O(N^2) at long context. Returns false when the
     // caller requests full attention and the tiled full kernel is disabled, or for unsupported HD.
-    if (launch_prefill_attn_windowed(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+    // Skipped for a windowed pass: this one takes its sink and window bounds from the local row
+    // index, so it would attend over the wrong span. The scalar kernel below is exact at any
+    // q_pos0 and takes over.
+    if (q_pos0 == 0 &&
+        launch_prefill_attn_windowed(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
             n_tokens, n_q_heads, n_kv_heads, head_dim, block_size, max_blocks_per_seq, scale,
             win_blocks, stream))
-        return;
+        return true;
     dim3 grid(n_tokens, n_q_heads);   // token on grid.x
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
     auto ks = reinterpret_cast<const __half*>(k_scale);
     auto vs = reinterpret_cast<const __half*>(v_scale);
     auto ob = reinterpret_cast<__nv_bfloat16*>(attn);
-    if (head_dim == 256)
-        pf_attn_int8_paged_kernel<256><<<grid, 32, 0, stream>>>(
-            qb, k_pool, v_pool, ks, vs, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
-            block_size, max_blocks_per_seq, scale);
+    // The scalar kernel is full-causal only -- it has no notion of a sink or a sliding window.
+    // At q_pos0 == 0 that is how it has always been reached (the windowed kernel above handles
+    // win_blocks and returns true), but on a windowed pass that kernel is skipped, so a layer
+    // with a real window would silently get full attention over the whole prefix. Refuse.
+    if (q_pos0 != 0 && win_blocks > 0) return false;
+    // The scalar fallback exists only for head_dim 256; for anything else there is no correct
+    // path left, and saying so beats leaving `attn` holding whatever the scratch held before.
+    if (head_dim != 256) return false;
+    pf_attn_int8_paged_kernel<256><<<grid, 32, 0, stream>>>(
+        qb, k_pool, v_pool, ks, vs, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
+        block_size, max_blocks_per_seq, scale, q_pos0);
+    return true;
 }
 
 void launch_prefill_qknorm_rope_kv_bf16(
@@ -1792,7 +1854,7 @@ void launch_prefill_qknorm_rope_kv_bf16(
     void* k_pool, void* v_pool,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream) {
+    cudaStream_t stream, int pos0) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);
     const size_t shmem = (size_t)head_dim * sizeof(float);
     pf_qknorm_rope_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
@@ -1801,19 +1863,19 @@ void launch_prefill_qknorm_rope_kv_bf16(
         reinterpret_cast<const __nv_bfloat16*>(k_w),
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
         nullptr, nullptr, block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-        block_size, max_blocks_per_seq);
+        block_size, max_blocks_per_seq, pos0);
 }
 
 bool launch_prefill_attn_bf16_paged(
     const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream, int q_pos0) {
     // Tensor cores first. pf_attn_bf16_paged_kernel below is one warp per (query, q-head) walking
     // the causal history a key at a time; at long context that is the prompt pass's largest single
     // cost. The mma kernel declines any shape it does not cover, so this stays a strict addition.
     if (launch_prefill_attn_mma_bf16(q, k_pool, v_pool, block_table, attn, n_tokens, n_q_heads,
                                      n_kv_heads, head_dim, block_size, max_blocks_per_seq,
-                                     scale, stream))
+                                     scale, stream, q_pos0))
         return true;
     dim3 grid(n_tokens, n_q_heads);
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
@@ -1842,7 +1904,7 @@ bool launch_prefill_attn_bf16_paged(
             dim3 gt((n_tokens + (NW) - 1) / (NW), n_q_heads);                                      \
             pf_attn_bf16_paged_tiled_kernel<256, (TK), (NW)><<<gt, (NW) * 32, sm, stream>>>(       \
                 qb, kb, vb, block_table, ob, n_tokens, n_q_heads, n_kv_heads,                      \
-                block_size, max_blocks_per_seq, scale);                                            \
+                block_size, max_blocks_per_seq, scale, q_pos0);                                    \
         } while (0)
         if      (tile ==  8 && tw ==  4) SI_PF_TILE(8, 4);
         else if (tile ==  8 && tw ==  8) SI_PF_TILE(8, 8);
@@ -1863,13 +1925,13 @@ bool launch_prefill_attn_bf16_paged(
     if (head_dim == 256) {
         pf_attn_bf16_paged_kernel<256><<<grid, 32, 0, stream>>>(
             qb, kb, vb, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
-            block_size, max_blocks_per_seq, scale);
+            block_size, max_blocks_per_seq, scale, q_pos0);
         return true;
     }
     if (head_dim == 128) {
         pf_attn_bf16_paged_kernel<128><<<grid, 32, 0, stream>>>(
             qb, kb, vb, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
-            block_size, max_blocks_per_seq, scale);
+            block_size, max_blocks_per_seq, scale, q_pos0);
         return true;
     }
     return false;

@@ -4,7 +4,13 @@
 // Fills the cache two ways over the SAME prompt, then teacher-forces the SAME continuation
 // tokens and compares the per-position next-token logits:
 //   TOKEN   : forward_token() over the whole prompt (the reference path)
-//   BATCHED : prefill_batched() over the prompt
+//   BATCHED : prefill_batched_chunked() over the prompt
+//
+// SPARKINFER_PREFILL_WINDOW sets the batched pass's window size, so this same A/B is also the
+// test for WINDOWED prefill: set it well below the prefix length (e.g. 512 against a 4096-token
+// prefix) and the batched side runs as eight chained passes whose positions, causal masks and
+// Gated-DeltaNet carry-over all have to line up with the token loop's, or the logits diverge.
+// SPARKINFER_PREFILL_WINDOW=0 forces the single unwindowed pass.
 // Reports top-1 agreement and mean KL(token || batched) over the continuation positions.
 //
 // Usage: qwen3_gguf_prefill_check <model.gguf|checkpoint_dir> [prefix_len=4096] [cont_len=16]
@@ -119,7 +125,7 @@ int main(int argc, char** argv) {
 
     // ---- BATCHED path ----
     if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv allocate\n"); return 1; }
-    int seed = model.prefill_batched(prompt.data(), P);
+    int seed = model.prefill_batched_chunked(prompt.data(), P);
     if (seed < 0) { printf("[FAIL] prefill_batched unsupported (seed=%d)\n", seed); return 1; }
     for (int j = 0; j < C; j++) { amB[j] = model.forward_token(cont[j], P + j); model.copy_logits(LB[j].data()); }
     kv.free(0);

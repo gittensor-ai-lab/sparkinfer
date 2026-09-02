@@ -107,7 +107,8 @@ void dflash_release_verify_cache() {
     cache.arena.free_all();
 }
 
-int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n) {
+int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
+                        int pos0) {
     const Qwen35Config& c = s.cfg;
     // Batched prefill supports the Qwen3.5 dense-hybrid (Qwythos) AND the Qwen3.6-35B-A3B MoE hybrid.
     // Both share the GDN + full-attention batched kernels (identical math at 128/16/32 GDN dims and
@@ -150,12 +151,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const int N = n;
     cudaStream_t st = s.stream;
 
-    // This path always starts at position zero, so its recurrent GDN state must start from zero
+    // A windowed ingest (pos0 > 0) resumes mid-sequence. Every path below that has no notion of a
+    // start position has to refuse HERE, before the first kernel runs: bailing out from inside the
+    // layer loop would leave the Gated-DeltaNet state advanced for the layers already done and not
+    // for the rest, and nothing downstream can tell that apart from a clean state or undo it.
+    if (pos0 < 0) return -1;
+    if (pos0 != 0) {
+        if (c.muse_glimmer) return -1;   // rolling-window SWA attention indexes from token 0
+        if (s.capture_dst && s.capture_layers && s.n_capture > 0) return -1;  // DSpark capture rows
+    }
+
+    // A pass that starts at position zero must start its recurrent GDN state from zero,
     // just like forward_token(position=0). Session buffers come from cudaMalloc and may reuse pages
     // from a previous request; the scan consumes their initial value before writing the final one.
     // Without this reset the first request after process start is correct, while later batched
     // prefills can inherit the preceding request's state and diverge despite identical tokens.
-    if (s.lin_state && s.lin_conv_state) {
+    // ...but only for the window that actually starts at position zero. A windowed ingest carries
+    // the recurrence forward: zeroing here on a later window would discard everything the previous
+    // ones accumulated and produce a confidently wrong continuation.
+    if (pos0 == 0 && s.lin_state && s.lin_conv_state) {
         pf_cu(cudaMemsetAsync(
                   s.lin_state, 0,
                   (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim *
@@ -309,7 +323,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // DSpark capture destinations are session-owned and change between generations. Do not replay
     // a whole-prefill graph whose memcpy nodes captured a previous session's destination.
     const bool capture_dflash = s.capture_dst && s.capture_layers && s.n_capture > 0;
-    const bool graph_on = graph_env && arena_reuse && c.dense_ffn && !capture_dflash;
+    // A captured graph bakes in every kernel PARAMETER, pos0 among them, and replay is keyed on
+    // the token count -- so a windowed prefill, whose windows all share one N and differ only in
+    // pos0, would replay the first window's positions for every window after it: right length,
+    // wrong place in the sequence, no error anywhere. Windows are unique in pos0 and could never
+    // reuse each other's graph anyway, so they run eager. pos0 == 0 (the whole-prompt pass, and
+    // the first window) still captures and still replays a graph an earlier pass left behind.
+    const bool graph_on = graph_env && arena_reuse && c.dense_ffn && !capture_dflash && pos0 == 0;
     const void* const pfb_btable = s.kv->block_table(s.seq_id);
     // A whole-prefill graph embeds every pointer passed to its kernel nodes. The arena addresses
     // are deliberately stable, but recurrent state and the paged-KV block table are session-owned:
@@ -359,6 +379,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     bf16* lnrm = a.alloc<bf16>((size_t)N * lvdim);       // lin_norm (4096)
     bf16* la   = a.alloc<bf16>((size_t)N * vh);          // lin_alpha (32)
     bf16* lb   = a.alloc<bf16>((size_t)N * vh);          // lin_beta (32)
+    // The previous window's trailing raw-qkv rows, staged out of the live conv state so the conv
+    // kernel can read them while it overwrites conv_state with this window's own. One layer's
+    // worth is enough -- the layer loop copies into it immediately before each conv. Allocated
+    // unconditionally (it is ~48 KB) even though only a windowed pass has a predecessor: the
+    // arena hands out buffers by CURSOR POSITION and reuses them across calls, so a slot that
+    // appears only on some calls would shift every later allocation's index and make each pass
+    // free and re-cudaMalloc the whole chain. `cconv` below is what decides zeros vs carry-in.
+    bf16* cprev = a.alloc<bf16>((size_t)(c.linear_conv_kernel - 1) * lqkv);
+    // At pos0 == 0 the conv genuinely starts from zeros -- pass nullptr and the kernels take
+    // exactly the arithmetic path they had before windowing existed.
+    bf16* cconv = (pos0 != 0) ? cprev : nullptr;
     // Full-attention scratch ALIASES the GDN scratch: a layer is either linear-attn (GDN) or full
     // softmax-attn, never both, and qb/qg/kf/vf are pairwise-distinct within a full-attn layer while
     // the GDN buffers they map onto are unused there (and vice-versa). Saves ~10K bf16/token of peak
@@ -1393,8 +1424,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
             proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
             bf16* conv_state = lin_conv_state + (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+            if (cconv)
+                pf_cu(cudaMemcpyAsync(cprev, conv_state,
+                                      (size_t)(c.linear_conv_kernel - 1) * lqkv * sizeof(bf16),
+                                      cudaMemcpyDeviceToDevice, st), "gdn conv carry-in");
             kernels::launch_prefill_gdn_conv(b8, w.ssm_conv, conv_state, gq, gk, gv,
-                N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st);
+                N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st, cconv);
             float* layer_state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
             kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
                 layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
@@ -1595,29 +1630,41 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         kernels::launch_prefill_qknorm_rope_kv_bf16_vi8(
                             qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, vi8, vi8_scale,
                             btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                            rope_dim, rope_theta, eps, bs, mbs, st);
+                            rope_dim, rope_theta, eps, bs, mbs, st, pos0);
                     else
                         kernels::launch_prefill_qknorm_rope_kv_bf16(
                             qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, btable, N,
                             c.n_q_heads, c.n_kv_heads, c.head_dim,
-                            rope_dim, rope_theta, eps, bs, mbs, st);
+                            rope_dim, rope_theta, eps, bs, mbs, st, pos0);
                     const bool vi8_done = vi8 && kernels::launch_prefill_attn_mma_bf16_vi8(
                         qb, kf, vi8, vi8_scale, btable, att, N, c.n_q_heads, c.n_kv_heads,
-                        c.head_dim, bs, mbs, attn_scale, st);
+                        c.head_dim, bs, mbs, attn_scale, st, pos0);
                     if (!vi8_done)
-                        kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, btable, att,
-                            N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
+                        if (!kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, btable, att,
+                                N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
+                                st, pos0)) {
+                            a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
+                            fprintf(stderr, "[prefill] windowed pass declined by attention "
+                                            "(pos0=%d)\n", pos0);
+                            return -1;
+                        }
                 } else {
                     kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
                         kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                        rope_dim, rope_theta, eps, bs, mbs, st);
+                        rope_dim, rope_theta, eps, bs, mbs, st, pos0);
                     // Qwen3.8 interleaves SWA and global-attention layers. The old int8 launcher
                     // read one process-wide 4096-token window for every layer, silently truncating
                     // the global layers at long context. Pass the layer contract explicitly, as
                     // the BF16/Muse path above already does: zero means full causal attention.
                     const int win_blocks = w.swa ? (c.sliding_window + bs - 1) / bs : 0;
-                    kernels::launch_prefill_attn_int8_paged(qb, kpool, vpool, kscale, vscale, btable, att,
-                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks, st);
+                    if (!kernels::launch_prefill_attn_int8_paged(qb, kpool, vpool, kscale, vscale,
+                            btable, att, N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs,
+                            attn_scale, win_blocks, st, pos0)) {
+                        a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
+                        fprintf(stderr, "[prefill] no int8 attention kernel for hd=%d win=%d "
+                                        "pos0=%d\n", c.head_dim, win_blocks, pos0);
+                        return -1;
+                    }
                 }
             }
             // Muse: the gated attention output feeds exactly one consumer -- the o projection's

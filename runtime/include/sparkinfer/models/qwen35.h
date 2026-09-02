@@ -390,7 +390,14 @@ public:
     // seed token, so last_token_logprobs() is valid immediately after this returns -- see
     // ingest_prompt_range's identical parameter. Off by default: it costs a full-vocab sort, and
     // the seed's logprob is only wanted when the request asked for logprobs.
-    int prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob = false);
+    int prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob = false,
+                        int pos0 = 0);
+    // Same pass, ingested as position-windows so the scratch arena is bounded by the window
+    // rather than by n. Returns the seed for the last token, or -1 if a window was refused --
+    // in which case *out_done (when given) reports how many leading tokens ARE in the cache,
+    // so the caller can finish from there instead of recomputing from zero.
+    int prefill_batched_chunked(const int* prompt_ids, int n, bool want_seed_logprob = false,
+                                int* out_done = nullptr);
 
     // Prefill prompt tokens [start, end) with the batched path when start==0 and eligible, else
     // the token loop. chunk_limit > 0 caps the token-loop path to at most chunk_limit tokens per
