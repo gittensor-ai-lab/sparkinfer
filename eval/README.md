@@ -180,11 +180,16 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 
 > **The scored path is `pr_dspark_bot.py`** (`eval/run_dspark_cron.sh`, hourly at `:00`), and as
 > of 2026-08-21 it is the ONLY bot on cron. It scores DSpark decode and DSpark-enabled batched
-> prefill at **4k, 16k, and 32k** on the ModelOpt checkpoint
+> prefill at **4k, 16k, and 32k**, plus target-model prefill at **256k**, on the ModelOpt checkpoint
 > (`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`). Every measured axis is also a no-regression
 > floor; decode is lossless against same-process AR and acceptance cannot regress materially.
 > The Qwen3.6 / Qwen3.8 shared-path guards remain mandatory. See that file's module docstring —
 > it is the authority, not this README.
+>
+> The 256k row uses `qwen3_gguf_bench` sweep mode with one exact 262,144-token context, INT8 KV,
+> and the memory-safe Q4_K decode representation. Main currently uses the sequential prefill
+> fallback there, so one main or PR measurement takes roughly 65 minutes on the pinned RTX 5090.
+> The hourly lock therefore skips overlapping ticks; it never starts concurrent GPU evaluations.
 >
 > Every other bot here — `pr_qwen38_bot.py`, `pr_modelopt_bot.py`, `pr_museglimmer_bot.py`,
 > `pr_dflash_bot.py` — is kept for reference and run by hand only. The sections below describe
