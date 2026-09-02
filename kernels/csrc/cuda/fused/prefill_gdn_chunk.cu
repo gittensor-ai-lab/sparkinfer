@@ -264,12 +264,27 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
         float acc[IPT];
         #pragma unroll
         for (int si = 0; si < IPT; si++) acc[si] = 0.f;
-        for (int m = 0; m < C; m++) {
-            const float bk = s_t[m] * gc_to_f(s_k[m * (HD + PAD) + d]);
+        // THE TRIANGLE IS WALKED, NOT MASKED. `if (m <= i)` leaves the m > i half of every
+        // (i, m) pair as a predicated-off FFMA that still burns an issue slot -- half of the
+        // C*IPT = 512 per thread at C=32/HD=128. i = i0 + si*ISTR covers exactly [0, C), so
+        // grouping m by ISTR makes the live set a COMPILE-TIME range: for m in [g*ISTR,
+        // (g+1)*ISTR), every si < g is structurally dead and every si > g is structurally live,
+        // leaving one real predicate on the diagonal group si == g. 512 issued multiply-adds
+        // become 272, and the same count of shared loads goes with them.
+        // BIT-IDENTICAL: identical operand set per output, still accumulated in ascending m --
+        // the loop bounds encode the mask instead of a predicate evaluating it.
+        static_assert(IPT * ISTR == C, "the triangle walk needs i = i0 + si*ISTR to cover [0,C)");
+        #pragma unroll
+        for (int g = 0; g < IPT; g++) {
             #pragma unroll
-            for (int si = 0; si < IPT; si++) {
-                const int i = i0 + si * ISTR;
-                if (m <= i) acc[si] += s_A[i * (C + PAD) + m] * bk;
+            for (int u = 0; u < ISTR; u++) {
+                const int m = g * ISTR + u;
+                const float bk = s_t[m] * gc_to_f(s_k[m * (HD + PAD) + d]);
+                #pragma unroll
+                for (int si = g; si < IPT; si++) {
+                    const int i = i0 + si * ISTR;
+                    if (si > g || u <= i0) acc[si] += s_A[i * (C + PAD) + m] * bk;
+                }
             }
         }
         #pragma unroll
@@ -296,12 +311,17 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
         float acc[IPT];
         #pragma unroll
         for (int si = 0; si < IPT; si++) acc[si] = 0.f;
-        for (int m = 0; m < C; m++) {
-            const float bv = s_b[m] * gc_to_f(s_x[m * (HD + PAD) + d]);
+        #pragma unroll
+        for (int g = 0; g < IPT; g++) {          // same triangle walk as W^ above
             #pragma unroll
-            for (int si = 0; si < IPT; si++) {
-                const int i = i0 + si * ISTR;
-                if (m <= i) acc[si] += s_A[i * (C + PAD) + m] * bv;
+            for (int u = 0; u < ISTR; u++) {
+                const int m = g * ISTR + u;
+                const float bv = s_b[m] * gc_to_f(s_x[m * (HD + PAD) + d]);
+                #pragma unroll
+                for (int si = g; si < IPT; si++) {
+                    const int i = i0 + si * ISTR;
+                    if (si > g || u <= i0) acc[si] += s_A[i * (C + PAD) + m] * bv;
+                }
             }
         }
         #pragma unroll
@@ -319,9 +339,12 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
 // Per chunk: U^ = U0 - W^ S ; Y = [diag(exp G)(Q S) + M U^] * scale ; S = exp(G_last) S + K^T U~.
 // ---------------------------------------------------------------------------
 // REGS keeps the recurrent state S in REGISTERS instead of shared memory. S is [HD][JC] fp32 and
-// every loop that touches it already walks `for (e = tid; e < HD*JC; e += nthr)`, so thread tid
-// owns exactly the elements e = tid + t*NTHR -- a fixed (m, jj) = (warp + t*NW, lane) mapping, no
-// communication. That frees HD*JC*4 B of shared memory, which is what buys a SECOND resident block
+// thread tid owns the SPT elements e = tid*SPT + t -- a fixed, communication-free mapping.
+// CONTIGUOUS, not strided by NTHR: the two loops that run every chunk (narrowing S to its bf16
+// mirror, and folding the S-update tiles back in) then touch four adjacent columns at a time and
+// can move them 8 or 16 bytes at a time instead of 2 or 4. The strided form owned SPT elements
+// one column apart in different rows and forced SPT scalar accesses in each.
+// Keeping S in registers frees HD*JC*4 B of shared memory, which is what buys a SECOND resident block
 // per SM: 45,824 B against the 51,200 two blocks need, where the smem-S form is 62,208 and caps
 // the kernel at one. The whole grid is then resident in one wave using every SM, instead of the
 // 96-block/96-SM shape JC=64 had to use to avoid a second wave.
@@ -333,8 +356,16 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
 //
 // Bit-identical: same values, same per-element order, same `gl * S + K^T U~` arithmetic -- only
 // where S lives changes.
+//
+// The __launch_bounds__ states that 2-blocks-per-SM target rather than leaving it to be inferred.
+// Without it the compiler sizes the register budget for one block and the wider accesses below
+// push this shape to 168 registers per thread -- 256 x 168 is past the 65536-register file, so it
+// silently drops to ONE resident block and gives back everything they win. At (256, 2) it fits in
+// 128 with no spill (STACK:0). The non-REGS shapes ask for 1 because shared memory already caps
+// them there (62,208 B of a ~100 KB SM).
 template <int C, int HD, int JC, bool REGS = false>
-__global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
+__global__ __launch_bounds__((C * JC) / 4, REGS ? 2 : 1)
+void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                                     const __nv_bfloat16* __restrict__ k,
                                     const float* __restrict__ g_buf,
                                     const __nv_bfloat16* __restrict__ w_buf,
@@ -396,7 +427,7 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     if constexpr (REGS) {
         #pragma unroll
         for (int t = 0; t < SPT; t++) {
-            const int e = tid + t * NTHR;
+            const int e = tid * SPT + t;
             const int m = e / JC, jj = e - m * JC;
             sreg[t] = carry ? state[((size_t)h * HD + (j0 + jj)) * HD + m] : 0.f;
         }
@@ -441,13 +472,33 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         // ---- stage the small linear tiles; W/K/Q arrive via the early-issued cp.async ----
         for (int i = tid; i < C; i += nthr)
             s_g[i] = (i < len) ? g_buf[(size_t)(t0 + i) * v_heads + h] : 0.f;
-        for (int e = tid; e < C * JC; e += nthr) {
-            const int i = e / JC, jj = e - i * JC;
-            s_U[e] = (i < len) ? gc_to_f(u_buf[((size_t)(t0 + i) * v_heads + h) * HD + j0 + jj]) : 0.f;
+        // Every per-element loop in this chunk body moves FOUR values at a time. At C=JC=32 each
+        // of them is exactly C*JC == 1024 elements over 256 threads, so scalar they are 4 trips of
+        // 2-3 memory instructions each; the body is bound by how many load/store instructions it
+        // issues, not by the bytes they move (30 KB per chunk against a 6.8 us iteration is under
+        // a tenth of this SM's share of DRAM). Quadding them cuts the instruction count ~4x for
+        // the same traffic. Bit-identical throughout: same values, same addresses, same order --
+        // only the width of each access changes. J4 is the group count; every base is naturally
+        // aligned because JC, HD, C and C+PAD are all multiples of 4.
+        constexpr int J4 = (C * JC) / 4;
+        static_assert(C % 4 == 0 && JC % 4 == 0 && (C + PAD) % 4 == 0 && (JC + PAD) % 4 == 0,
+                      "vector-of-4 staging needs every row stride 4-aligned");
+        for (int q4 = tid; q4 < J4; q4 += nthr) {
+            const int e = q4 * 4, i = e / JC, jj = e - i * JC;
+            if (i < len) {
+                const __nv_bfloat16* up = u_buf + ((size_t)(t0 + i) * v_heads + h) * HD + j0 + jj;
+                const ushort4 u4 = *reinterpret_cast<const ushort4*>(up);
+                const __nv_bfloat16* ub = reinterpret_cast<const __nv_bfloat16*>(&u4);
+                *reinterpret_cast<float4*>(&s_U[e]) =
+                    make_float4(gc_to_f(ub[0]), gc_to_f(ub[1]), gc_to_f(ub[2]), gc_to_f(ub[3]));
+            } else {
+                *reinterpret_cast<float4*>(&s_U[e]) = make_float4(0.f, 0.f, 0.f, 0.f);
+            }
         }
-        for (int e = tid; e < C * C; e += nthr) {
-            const int i = e / C, j = e - i * C;
-            s_M[i * (C + PAD) + j] = m_buf[(size_t)e + ((size_t)c * v_heads + h) * C * C];
+        for (int q4 = tid; q4 < (C * C) / 4; q4 += nthr) {
+            const int e = q4 * 4, i = e / C, j = e - i * C;
+            *reinterpret_cast<float4*>(&s_M[i * (C + PAD) + j]) =
+                *reinterpret_cast<const float4*>(m_buf + (size_t)e + ((size_t)c * v_heads + h) * C * C);
         }
         __pipeline_wait_prior(0);
         if (len < C) {
@@ -470,11 +521,15 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         // [C=32,JC=32] outputs / 256 threads = exactly 4 each, so the tiling divides evenly.
         // ---- narrow S to bf16 once, then run U^ = U0 - W^ S and Y0 = Q S on tensor cores ----
         if constexpr (REGS) {
+            static_assert(SPT % 4 == 0 && JC % 4 == 0, "contiguous S mapping needs SPT and JC 4-aligned");
             #pragma unroll
-            for (int t = 0; t < SPT; t++) {
-                const int e = tid + t * NTHR;
-                const int m = e / JC, jj = e - m * JC;
-                s_Sb[m * (JC + PAD) + jj] = __float2bfloat16(sreg[t]);
+            for (int t = 0; t < SPT; t += 4) {
+                const int e = tid * SPT + t;
+                const int m = e / JC, jj = e - m * JC;   // 4 adjacent columns of one row
+                const __nv_bfloat16 b4[4] = {__float2bfloat16(sreg[t]), __float2bfloat16(sreg[t + 1]),
+                                             __float2bfloat16(sreg[t + 2]), __float2bfloat16(sreg[t + 3])};
+                *reinterpret_cast<ushort4*>(&s_Sb[m * (JC + PAD) + jj]) =
+                    *reinterpret_cast<const ushort4*>(b4);
             }
         } else {
             for (int e = tid; e < HD * JC; e += nthr) {
@@ -510,12 +565,16 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
             __syncthreads();
             wmma::store_matrix_sync(s_C + (size_t)warp * 256, cf, 16, wmma::mem_row_major);
             __syncthreads();
-            for (int e = tid; e < C * JC; e += nthr) {
-                const int i = e / JC, jj = e - i * JC;
+            for (int q4 = tid; q4 < J4; q4 += nthr) {      // a group of 4 never crosses a tile
+                const int e = q4 * 4, i = e / JC, jj = e - i * JC;
                 const int w = (i >> 4) * TJ + (jj >> 4);
                 const int o = (i & 15) * 16 + (jj & 15);
-                s_U[e] -= s_C[(size_t)w * 256 + o];           // U^ = U0 - W^ S
-                s_Y[e]  = s_C[(size_t)(TU + w) * 256 + o];    // Y0 = Q S
+                const float4 cu = *reinterpret_cast<const float4*>(&s_C[(size_t)w * 256 + o]);
+                float4 u = *reinterpret_cast<const float4*>(&s_U[e]);
+                u.x -= cu.x; u.y -= cu.y; u.z -= cu.z; u.w -= cu.w;   // U^ = U0 - W^ S
+                *reinterpret_cast<float4*>(&s_U[e]) = u;
+                *reinterpret_cast<float4*>(&s_Y[e]) =
+                    *reinterpret_cast<const float4*>(&s_C[(size_t)(TU + w) * 256 + o]);  // Y0 = Q S
             }
         }
         __syncthreads();
@@ -535,12 +594,33 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
             float mu[OPT];
             #pragma unroll
             for (int si = 0; si < OPT; si++) mu[si] = 0.f;
-            for (int pp = 0; pp < C; pp++) {
-                const float u = s_U[pp * JC + jj];
+            // M is read WIDE, exactly as T is in the prep kernel: M[i][pp..pp+3] are contiguous,
+            // so one float4 replaces four scalar loads. This loop is the largest single phase of
+            // the chunk body despite having EIGHT TIMES FEWER multiply-adds than the U^/Y0 pair
+            // above it, because at C=JC=32 it issues C*(1 + OPT) = 160 shared loads per thread for
+            // OPT*C = 128 FFMAs. Widening the M side and walking the triangle rather than masking
+            // it (same transform as the prep kernel) takes that to 40 loads for 80 FFMAs.
+            // BIT-IDENTICAL: same operands, same ascending-p accumulation per output.
+            static_assert(C % 4 == 0 && (C + PAD) % 4 == 0, "float4 M reads need both dims 4-aligned");
+            static_assert(OPT * ISTR2 == C && ISTR2 % 4 == 0, "triangle walk / wide M read");
+            #pragma unroll
+            for (int g = 0; g < OPT; g++) {          // same triangle walk as the prep kernel
                 #pragma unroll
-                for (int si = 0; si < OPT; si++) {
-                    const int i = i0 + si * ISTR2;
-                    if (pp <= i) mu[si] += s_M[i * (C + PAD) + pp] * u;
+                for (int q = 0; q < ISTR2 / 4; q++) {
+                    const int p0 = g * ISTR2 + q * 4;
+                    float uu[4];
+                    #pragma unroll
+                    for (int v = 0; v < 4; v++) uu[v] = s_U[(p0 + v) * JC + jj];
+                    #pragma unroll
+                    for (int si = g; si < OPT; si++) {
+                        const int i = i0 + si * ISTR2;
+                        const float4 m4 = *reinterpret_cast<const float4*>(&s_M[i * (C + PAD) + p0]);
+                        const bool live = (si > g);
+                        if (live || p0 + 0 <= i) mu[si] += m4.x * uu[0];
+                        if (live || p0 + 1 <= i) mu[si] += m4.y * uu[1];
+                        if (live || p0 + 2 <= i) mu[si] += m4.z * uu[2];
+                        if (live || p0 + 3 <= i) mu[si] += m4.w * uu[3];
+                    }
                 }
             }
             #pragma unroll
@@ -550,6 +630,8 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                 const float y = (s_eg[i] * s_Y[i * JC + jj] + mu[si]) * scale;
                 out[(size_t)(t0 + i) * v_dim + h * HD + j0 + jj] = __float2bfloat16(y);
             }
+            // The epilogue stays scalar on purpose: jj is the thread's own column, so its OPT
+            // outputs are ISTR2 rows apart rather than adjacent and there is nothing to widen.
         }
         __syncthreads();
 
@@ -561,16 +643,23 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         const float g_last = s_g[len - 1];
         for (int i = tid; i < C; i += nthr) s_eg[i] = __expf(g_last - s_g[i]);
         __syncthreads();
-        for (int e = tid; e < C * JC; e += nthr) {
-            const int i = e / JC;
-            s_U[e] *= s_eg[i];
+        for (int q4 = tid; q4 < J4; q4 += nthr) {
+            const int e = q4 * 4, i = e / JC;
+            const float g = s_eg[i];                  // one row per group of 4: i is constant
+            float4 u = *reinterpret_cast<const float4*>(&s_U[e]);
+            u.x *= g; u.y *= g; u.z *= g; u.w *= g;
+            *reinterpret_cast<float4*>(&s_U[e]) = u;
         }
         __syncthreads();
 
         // ---- S = exp(G_last) S + K^T U~   [HD,C] x [C,JC], on tensor cores ----
-        for (int e = tid; e < C * JC; e += nthr) {
-            const int i = e / JC, jj = e - i * JC;
-            s_Ub[i * (JC + PAD) + jj] = __float2bfloat16(s_U[e]);
+        for (int q4 = tid; q4 < J4; q4 += nthr) {
+            const int e = q4 * 4, i = e / JC, jj = e - i * JC;
+            const float4 u = *reinterpret_cast<const float4*>(&s_U[e]);
+            const __nv_bfloat16 b4[4] = {__float2bfloat16(u.x), __float2bfloat16(u.y),
+                                         __float2bfloat16(u.z), __float2bfloat16(u.w)};
+            *reinterpret_cast<ushort4*>(&s_Ub[i * (JC + PAD) + jj]) =
+                *reinterpret_cast<const ushort4*>(b4);
         }
         __syncthreads();
         {
@@ -616,11 +705,16 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
             if constexpr (REGS) {
                 __syncthreads();                 // every tile written before any thread reads back
                 #pragma unroll
-                for (int t = 0; t < SPT; t++) {
-                    const int e = tid + t * NTHR;
+                for (int t = 0; t < SPT; t += 4) {
+                    const int e = tid * SPT + t;
                     const int m = e / JC, jj = e - m * JC;
-                    const int tile = (m >> 4) * TJ + (jj >> 4);
-                    sreg[t] = gl * sreg[t] + s_C[(size_t)tile * 256 + (m & 15) * 16 + (jj & 15)];
+                    const int tile = (m >> 4) * TJ + (jj >> 4);   // 4 adjacent columns, one tile
+                    const float4 c4 = *reinterpret_cast<const float4*>(
+                        &s_C[(size_t)tile * 256 + (m & 15) * 16 + (jj & 15)]);
+                    sreg[t]     = gl * sreg[t]     + c4.x;
+                    sreg[t + 1] = gl * sreg[t + 1] + c4.y;
+                    sreg[t + 2] = gl * sreg[t + 2] + c4.z;
+                    sreg[t + 3] = gl * sreg[t + 3] + c4.w;
                 }
             }
         }
@@ -632,7 +726,7 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     if constexpr (REGS) {
         #pragma unroll
         for (int t = 0; t < SPT; t++) {
-            const int e = tid + t * NTHR;
+            const int e = tid * SPT + t;
             const int m = e / JC, jj = e - m * JC;
             state[((size_t)h * HD + (j0 + jj)) * HD + m] = sreg[t];
         }
@@ -662,12 +756,18 @@ bool ws_reserve(size_t bytes) {
     return true;
 }
 
+// m_buf is read as float4 by the scan, so its base must be 16-byte aligned: round the g_buf
+// region that precedes it up. n_g is n_tokens*v_heads, which is NOT a multiple of 4 for every
+// (context, head count) pair, so this cannot be left to luck.
+constexpr size_t GDNC_ALIGN = 16;
+inline size_t gdnc_align_up(size_t x) { return (x + (GDNC_ALIGN - 1)) & ~(GDNC_ALIGN - 1); }
+
 size_t gdnc_workspace_bytes(int n_tokens, int v_heads, int C, int HD) {
     const int n_chunks = (n_tokens + C - 1) / C;
     const size_t n_g = (size_t)n_tokens * v_heads;
     const size_t n_w = (size_t)n_tokens * v_heads * HD;
     const size_t n_m = (size_t)n_chunks * v_heads * C * C;
-    return n_g * sizeof(float) + n_m * sizeof(float)
+    return gdnc_align_up(n_g * sizeof(float)) + n_m * sizeof(float)
          + n_w * sizeof(__nv_bfloat16) + n_w * sizeof(__nv_bfloat16);
 }
 
@@ -838,7 +938,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         const size_t n_g = (size_t)len * v_heads;
         const size_t n_w = (size_t)len * v_heads * HD;
         const size_t n_m = (size_t)n_chunks * v_heads * C * C;
-        const size_t off_m = n_g * sizeof(float);
+        const size_t off_m = gdnc_align_up(n_g * sizeof(float));
         const size_t off_w = off_m + n_m * sizeof(float);
         const size_t off_u = off_w + n_w * sizeof(__nv_bfloat16);
         const size_t total = off_u + n_w * sizeof(__nv_bfloat16);
