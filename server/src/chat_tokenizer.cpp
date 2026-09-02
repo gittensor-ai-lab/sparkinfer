@@ -291,6 +291,18 @@ bool parse_enable_thinking(const std::string& request_json, bool default_value) 
     if (root.is_discarded() || !root.is_object()) return default_value;
     const auto top = root.find("enable_thinking");
     if (top != root.end() && top->is_boolean()) return top->get<bool>();
+    const auto reasoning = root.find("reasoning");
+    if (reasoning != root.end() && reasoning->is_object()) {
+        const auto enabled = reasoning->find("enabled");
+        if (enabled != reasoning->end() && enabled->is_boolean()) return enabled->get<bool>();
+        // OpenRouter's effort form requests reasoning even when it omits an explicit enabled flag.
+        const auto effort = reasoning->find("effort");
+        if (effort != reasoning->end() && effort->is_string()) return effort->get<std::string>() != "none";
+        const auto budget = reasoning->find("max_tokens");
+        if (budget != reasoning->end() && budget->is_number_integer()) return budget->get<long long>() > 0;
+    }
+    if (root.contains("reasoning_effort") && root["reasoning_effort"].is_string())
+        return root["reasoning_effort"].get<std::string>() != "none";
     const auto kwargs = root.find("chat_template_kwargs");
     if (kwargs != root.end() && kwargs->is_object()) {
         const auto nested = kwargs->find("enable_thinking");

@@ -133,7 +133,7 @@ void launch_temperature_sample(float* logits, int n_rows, int vocab,
 // winner) is unconditionally kept by both checks, so at least one surviving entry always exists
 // and launch_argmax can never see an all -inf row.
 //
-// *top_k_i32 <= 0 or >= vocab disables top_k (no truncation). *top_p_f32 <= 0 or >= 1.0 disables
+// *top_k_i32 <= 0 or >= vocab disables top_k (no truncation). *top_p_f32 >= 1.0 disables
 // top_p. Both are read from device memory on EVERY launch, same graph-replay-across-requests
 // rationale as launch_temperature_sample's temp/seed/step -- ALWAYS launch this unconditionally
 // on a CUDA-graph-captured decode path, never host-gate on top_k/top_p being set.

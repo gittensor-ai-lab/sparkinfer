@@ -230,6 +230,22 @@ bool test_tool_choice_none_still_uses_strict_output_parser() {
     return true;
 }
 
+bool test_openrouter_reasoning_enablement() {
+    CHECK(sparkinfer_server::parse_enable_thinking(
+        R"({"reasoning":{"enabled":true}})", false));
+    CHECK(!sparkinfer_server::parse_enable_thinking(
+        R"({"reasoning":{"enabled":false,"effort":"high"}})", true));
+    CHECK(sparkinfer_server::parse_enable_thinking(
+        R"({"reasoning":{"effort":"low"}})", false));
+    CHECK(sparkinfer_server::parse_enable_thinking(
+        R"({"reasoning_effort":"medium"})", false));
+    CHECK(!sparkinfer_server::parse_enable_thinking(
+        R"({"reasoning":{"effort":"none"}})", true));
+    CHECK(sparkinfer_server::parse_enable_thinking(
+        R"({"reasoning":{"max_tokens":512}})", false));
+    return true;
+}
+
 }  // namespace
 
 // GPT-2/ByteLevel-BPE byte-table round-trip -- pure function, no loaded tokenizer needed. "Ġ" is
@@ -281,6 +297,7 @@ int main() {
     if (!test_stop_filter_marker_with_embedded_nul()) return 1;
     if (!test_muse_rejects_all_tool_protocol_history()) return 1;
     if (!test_tool_choice_none_still_uses_strict_output_parser()) return 1;
+    if (!test_openrouter_reasoning_enablement()) return 1;
     if (!test_gpt2_bytelevel_decode_space_marker()) return 1;
     if (!test_gpt2_bytelevel_decode_invalid_utf8_shows_replacement()) return 1;
     if (!test_gpt2_bytelevel_decode_empty_piece()) return 1;

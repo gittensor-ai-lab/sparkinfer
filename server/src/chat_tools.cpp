@@ -963,20 +963,30 @@ bool parse_chat_request_json(const std::string& body, ChatRequest& request, std:
     }
     if (root.contains("tool_choice")) {
         const json& choice = root["tool_choice"];
-        if (!choice.is_string())
-            return set_error(err, "named/object tool_choice is not supported; use auto or none");
-        const std::string value = choice.get<std::string>();
-        if (value == "auto") parsed.tool_choice = ToolChoiceMode::kAuto;
-        else if (value == "none") parsed.tool_choice = ToolChoiceMode::kNone;
-        else if (value == "required") return set_error(err, "tool_choice=required is not supported");
-        else return set_error(err, "unsupported tool_choice " + value + "; use auto or none");
+        if (choice.is_string()) {
+            const std::string value = choice.get<std::string>();
+            if (value == "auto") parsed.tool_choice = ToolChoiceMode::kAuto;
+            else if (value == "none") parsed.tool_choice = ToolChoiceMode::kNone;
+            else if (value == "required") parsed.tool_choice = ToolChoiceMode::kRequired;
+            else return set_error(err, "unsupported tool_choice " + value);
+        } else if (choice.is_object()) {
+            if (!is_allowed_key(choice, {"type", "function"}, "tool_choice", err)) return false;
+            if (choice.value("type", "") != "function" || !choice.contains("function") ||
+                !choice["function"].is_object() ||
+                !is_allowed_key(choice["function"], {"name"}, "tool_choice.function", err) ||
+                !choice["function"].contains("name") || !choice["function"]["name"].is_string() ||
+                choice["function"]["name"].get_ref<const std::string&>().empty())
+                return set_error(err, "tool_choice must name a function");
+            parsed.tool_choice = ToolChoiceMode::kNamed;
+            parsed.required_tool_name = choice["function"]["name"].get<std::string>();
+        } else {
+            return set_error(err, "tool_choice must be auto, none, required, or a named function");
+        }
     }
     if (root.contains("parallel_tool_calls")) {
         if (!root["parallel_tool_calls"].is_boolean())
             return set_error(err, "parallel_tool_calls must be a boolean");
         parsed.parallel_tool_calls = root["parallel_tool_calls"].get<bool>();
-        if (!parsed.parallel_tool_calls)
-            return set_error(err, "parallel_tool_calls=false is not supported");
     }
     if (root.contains("response_format")) {
         const json& rf = root["response_format"];
@@ -1013,13 +1023,56 @@ bool parse_chat_request_json(const std::string& body, ChatRequest& request, std:
             return set_error(err, "unsupported response_format.type " + type);
         }
     }
-    if (!parsed.tools.empty() &&
-        parsed.response_format.type != ResponseFormatType::kText)
+    // Both features are supported independently. Combining them needs a separate output grammar
+    // (a tool call is not itself the requested JSON response), so reject it instead of silently
+    // bypassing response_format validation.
+    if (!parsed.tools.empty() && parsed.response_format.type != ResponseFormatType::kText)
         return set_error(err, "response_format is not supported together with tools");
     if (parsed.tools.empty() && parsed.tool_choice != ToolChoiceMode::kNone)
         parsed.tool_choice = ToolChoiceMode::kNone;
     std::set<std::string> offered;
     for (const ToolDefinition& tool : parsed.tools) offered.insert(tool.name);
+    if (parsed.tool_choice == ToolChoiceMode::kNamed &&
+        !offered.count(parsed.required_tool_name))
+        return set_error(err, "tool_choice names an unoffered function " + parsed.required_tool_name);
+
+    auto set_effort = [&](const json& value, const char* where) -> bool {
+        if (!value.is_string()) return set_error(err, std::string(where) + " must be a string");
+        const std::string effort = value.get<std::string>();
+        if (effort != "none" && effort != "minimal" && effort != "low" &&
+            effort != "medium" && effort != "high" && effort != "xhigh" && effort != "max")
+            return set_error(err, std::string(where) +
+                " must be none, minimal, low, medium, high, xhigh, or max");
+        parsed.reasoning_effort = effort == "max" ? "xhigh" : effort;
+        return true;
+    };
+    if (root.contains("reasoning_effort") && !root["reasoning_effort"].is_null() &&
+        !set_effort(root["reasoning_effort"], "reasoning_effort")) return false;
+    if (root.contains("reasoning") && !root["reasoning"].is_null()) {
+        const json& reasoning = root["reasoning"];
+        if (!reasoning.is_object()) return set_error(err, "reasoning must be an object");
+        if (reasoning.contains("enabled")) {
+            if (!reasoning["enabled"].is_boolean())
+                return set_error(err, "reasoning.enabled must be a boolean");
+            if (!reasoning["enabled"].get<bool>()) parsed.reasoning_effort = "none";
+            else if (parsed.reasoning_effort.empty()) parsed.reasoning_effort = "medium";
+        }
+        if (reasoning.contains("effort") && !reasoning["effort"].is_null() &&
+            !set_effort(reasoning["effort"], "reasoning.effort")) return false;
+        if (reasoning.contains("max_tokens") && !reasoning["max_tokens"].is_null()) {
+            if (!reasoning["max_tokens"].is_number_integer() ||
+                reasoning["max_tokens"].get<long long>() <= 0)
+                return set_error(err, "reasoning.max_tokens must be a positive integer");
+            // OpenRouter normally converts budgets to effort for effort-only providers. Accept a
+            // direct budget as medium rather than rejecting an otherwise portable request.
+            if (parsed.reasoning_effort.empty()) parsed.reasoning_effort = "medium";
+        }
+        if (reasoning.contains("exclude")) {
+            if (!reasoning["exclude"].is_boolean())
+                return set_error(err, "reasoning.exclude must be a boolean");
+            parsed.reasoning_exclude = reasoning["exclude"].get<bool>();
+        }
+    }
     for (size_t i = 0; i < parsed.messages.size(); ++i) {
         for (const ToolCall& call : parsed.messages[i].tool_calls) {
             if (!offered.count(call.name))
@@ -1167,8 +1220,8 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
             return false;
         }
         const double p = value.get<double>();
-        if (!(p > 0.0) || !(p <= 1.0)) {  // NaN-safe: comparisons against NaN are false either way
-            err = "top_p must be between 0.0 (exclusive) and 1.0 (inclusive)";
+        if (!(p >= 0.0) || !(p <= 1.0)) {  // NaN-safe: comparisons against NaN are false either way
+            err = "top_p must be between 0.0 and 1.0";
             return false;
         }
         out.top_p = static_cast<float>(p);
@@ -1472,13 +1525,11 @@ std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_
                                         bool inject_reasoning_effort) {
     std::ostringstream out;
     size_t first_message = 0;
-    const bool tools_active = !request.tools.empty() && request.tool_choice == ToolChoiceMode::kAuto;
+    const bool tools_active = !request.tools.empty() && request.tool_choice != ToolChoiceMode::kNone;
     const bool json_mode = request.response_format.type != ResponseFormatType::kText;
-    // Qwen3.8-27B's chat_template.jinja always resolves reasoning_effort to its default (xhigh)
-    // -- this server never wires reasoning_effort as a request param -- and prepends this exact
-    // wording whenever thinking is enabled, independent of tools/response_format.
+    const std::string effort = request.reasoning_effort.empty() ? "xhigh" : request.reasoning_effort;
     const std::string reasoning_instructions = (inject_reasoning_effort && enable_thinking)
-        ? "Reasoning effort is set to xhigh. Please think carefully through the task, validate "
+        ? "Reasoning effort is set to " + effort + ". Please think carefully through the task, validate "
           "key assumptions, consider plausible alternatives, and prioritize correctness, "
           "consistency, and clarity in the final answer."
         : std::string();
@@ -1494,6 +1545,12 @@ std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_
             for (const ToolDefinition& tool : request.tools)
                 out << '\n' << qwen_template_json(tool.spec);
             out << kToolInstructionsTail;
+            if (request.tool_choice == ToolChoiceMode::kRequired)
+                out << "\n\nYou MUST call at least one of the offered functions.";
+            else if (request.tool_choice == ToolChoiceMode::kNamed)
+                out << "\n\nYou MUST call the function named " << request.required_tool_name << ".";
+            if (!request.parallel_tool_calls)
+                out << "\nCall at most one function.";
         }
         if (json_mode) {
             if (tools_active) out << "\n\n";
@@ -1694,6 +1751,15 @@ ParsedToolOutput parse_qwen36_tool_output(const std::string& raw, bool enable_th
     if (!request.parallel_tool_calls && out.tool_calls.size() > 1) {
         return fail_tool_output(std::move(out),
                                 "model emitted parallel tool calls when they were disabled");
+    }
+    if (request.tool_choice == ToolChoiceMode::kRequired && out.tool_calls.empty())
+        return fail_tool_output(std::move(out), "model did not call a required tool");
+    if (request.tool_choice == ToolChoiceMode::kNamed) {
+        if (out.tool_calls.empty())
+            return fail_tool_output(std::move(out), "model did not call the required function");
+        for (const ToolCall& call : out.tool_calls)
+            if (call.name != request.required_tool_name)
+                return fail_tool_output(std::move(out), "model called a function other than the required function");
     }
     return out;
 }

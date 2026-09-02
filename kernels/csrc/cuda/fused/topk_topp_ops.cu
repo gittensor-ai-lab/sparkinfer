@@ -58,7 +58,9 @@ __global__ void topk_topp_mask_kernel(float* __restrict__ logits,
     if (effective_k < 1) effective_k = 1;  // defensive floor -- never trust the input blindly
 
     const float top_p = *top_p_f32;
-    const bool top_p_active = top_p > 0.f && top_p < 1.f;
+    // OpenAI accepts top_p=0. Keep rank 0 unconditionally and mask every lower rank in that
+    // case, rather than treating zero as the old internal "disabled" sentinel.
+    const bool top_p_active = top_p >= 0.f && top_p < 1.f;
     const float total_topk = topk_cumsum[effective_k - 1];
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vocab; i += gridDim.x * blockDim.x) {

@@ -49,14 +49,36 @@ export SPARKINFER_ROOT="$(pwd)"
 | Endpoint | Description |
 |----------|-------------|
 | `GET /health` | `{"status":"ok"}` |
-| `GET /v1/models` | OpenAI model list (includes live `context_length`) |
+| `GET /v1/models` | OpenAI model list plus OpenRouter provider schema v2.4 capabilities (includes live `context_length`) |
 | `GET /v1/info` | Model limits (`max_context`, `max_output_tokens`) — live values, not build-time constants |
 | `GET /v1/capacity` | This worker's live occupancy: `active_requests`, `free_kv_blocks`, `max_queue_depth`, `accepting_requests`. Single-process only — not fleet-wide. |
 | `GET /metrics` | Prometheus text-exposition counters/gauges: request totals by outcome (`ok`/`client_error`/`overloaded`/`timeout`/`cancelled`/`server_error`), prompt/completion token totals, active requests, free KV blocks, uptime. |
 | `POST /v1/tokenize` | Token count for a chat request body |
 | `POST /v1/completions` | Legacy OpenAI text completion (`prompt` string, `echo`, integer `logprobs`). `echo` prepends the prompt TEXT; it does not report per-prompt-token logprobs — use `/v1/score` for that. |
 | `POST /v1/score` | **Teacher-forced scoring.** Per-token logprobs of a *supplied* continuation, no generation. See below. |
-| `POST /v1/chat/completions` | Chat (JSON `messages`, optional `tools`, `tool_choice`, `stream`, `enable_thinking`). Responses include OpenAI `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`) plus additive GPU timing fields (`ttft_ms`, `generation_ms`, `decode_tps`) that standard OpenAI SDKs ignore. With `stream_options.include_usage=true`, streaming sends a final chunk with `choices:[]` + `usage` before `[DONE]`. A streaming client that disconnects mid-response cancels generation (checked via `DataSink::is_writable()`) instead of running to completion for nobody. Overload (no queue capacity) returns `429`; a request that exceeds `SPARKINFER_REQUEST_TIMEOUT_S` returns `504`. |
+| `POST /v1/chat/completions` | Chat (JSON `messages`, optional `tools`, `tool_choice`, `stream`, `enable_thinking`, `reasoning`, or `reasoning_effort`). Responses include OpenAI `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`) plus additive GPU timing fields (`ttft_ms`, `generation_ms`, `decode_tps`) that standard OpenAI SDKs ignore. Streaming sends a final chunk with `choices:[]` + `usage` before `[DONE]` by default. A streaming client that disconnects mid-response cancels generation (checked via `DataSink::is_writable()`) instead of running to completion for nobody. Overload (no queue capacity) returns `429`; a request that exceeds `SPARKINFER_REQUEST_TIMEOUT_S` returns `504`. |
+
+### OpenRouter provider configuration
+
+`/v1/models` exposes the typed v2.4 text capabilities OpenRouter consumes. Set the deployment
+identity and per-token USD prices explicitly; unconfigured prices are omitted rather than reported
+as zero:
+
+```bash
+export SPARKINFER_HF_MODEL_ID=gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090
+export SPARKINFER_QUANTIZATION=nvfp4
+export SPARKINFER_PROMPT_PRICE_USD=0.0000001
+export SPARKINFER_COMPLETION_PRICE_USD=0.0000003
+```
+
+SSE comment heartbeats are emitted every 15 seconds during queueing and long prefill. Configure
+that with `SPARKINFER_SSE_KEEPALIVE_SECONDS` (`0` disables it). Streaming usage is always emitted
+by default, even when the caller omits `stream_options.include_usage`; set
+`SPARKINFER_ALWAYS_STREAM_USAGE=0` only for legacy deployments that require opt-in usage chunks.
+`tool_choice` accepts `auto`, `none`, `required`, and OpenAI's named-function object form;
+`parallel_tool_calls=false` enforces at most one returned call. Tools and structured output are
+supported independently, but their combination is rejected because it has no unambiguous output
+grammar in this server.
 
 ### Timing fields
 

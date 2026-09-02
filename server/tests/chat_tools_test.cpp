@@ -222,11 +222,20 @@ bool test_tool_choice_modes() {
     CHECK(!contains(no_tools_prompt, "<function=lookup>"));
     CHECK(contains(no_tools_prompt, "<|im_start|>user\nUse lookup if allowed."));
 
+    CHECK(parse_request(prefix + "\"required\"}", request));
+    CHECK(request.tool_choice == ToolChoiceMode::kRequired);
+    CHECK(contains(apply_qwen36_tools_template(request, false), "MUST call at least one"));
+    CHECK(!parse_qwen36_tool_output("No call", false, request).error.empty());
+
+    CHECK(parse_request(prefix + R"JSON({"type":"function","function":{"name":"lookup"}})JSON" + "}", request));
+    CHECK(request.tool_choice == ToolChoiceMode::kNamed);
+    CHECK(request.required_tool_name == "lookup");
+    CHECK(contains(apply_qwen36_tools_template(request, false), "MUST call the function named lookup"));
+
     for (const std::string& bad_choice : {
-             std::string("\"required\""),
              std::string("\"sometimes\""),
              std::string("7"),
-             std::string(R"JSON({"type":"function","function":{"name":"lookup"}})JSON"),
+             std::string(R"JSON({"type":"function","function":{"name":"missing"}})JSON"),
              std::string(R"JSON({"type":"function","function":{}})JSON"),
              std::string(R"JSON({"type":"other","function":{"name":"lookup"}})JSON")}) {
         std::string error;
@@ -714,6 +723,39 @@ bool test_parallel_tool_calls() {
     const ParsedToolOutput disallowed = parse_qwen36_tool_output(raw, false, request);
     CHECK(!disallowed.error.empty());
     CHECK(disallowed.tool_calls.empty());
+
+    json single_request = json::parse(hermes_request());
+    single_request["parallel_tool_calls"] = false;
+    CHECK(parse_request(single_request.dump(), request));
+    CHECK(!request.parallel_tool_calls);
+    return true;
+}
+
+bool test_reasoning_effort_controls() {
+    ChatRequest request;
+    CHECK(parse_request(
+        R"({"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"medium"}})",
+        request));
+    CHECK(request.reasoning_effort == "medium");
+    CHECK(contains(apply_qwen36_tools_template(request, true), "Reasoning effort is set to medium"));
+
+    CHECK(parse_request(
+        R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"})",
+        request));
+    CHECK(request.reasoning_effort == "low");
+    CHECK(parse_request(
+        R"({"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"max","exclude":true}})",
+        request));
+    CHECK(request.reasoning_effort == "xhigh");
+    CHECK(request.reasoning_exclude);
+    CHECK(parse_request(
+        R"({"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"none"}})",
+        request));
+    CHECK(request.reasoning_effort == "none");
+    std::string error;
+    CHECK(!parse_chat_request_json(
+        R"({"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"turbo"}})",
+        request, error));
     return true;
 }
 
@@ -978,7 +1020,8 @@ bool test_request_controls_top_p_validation() {
     CHECK(controls.top_p > 0.89f && controls.top_p < 0.91f);
     CHECK(parse_request_controls(R"({"top_p":0.0001})", controls, err));
     CHECK(controls.top_p > 0.f && controls.top_p < 0.001f);
-    CHECK(!parse_request_controls(R"({"top_p":0})", controls, err));
+    CHECK(parse_request_controls(R"({"top_p":0})", controls, err));
+    CHECK(controls.top_p == 0.f);
     CHECK(!parse_request_controls(R"({"top_p":-0.1})", controls, err));
     CHECK(!parse_request_controls(R"({"top_p":1.1})", controls, err));
     CHECK(!parse_request_controls(R"({"top_p":"high"})", controls, err));
@@ -1525,6 +1568,7 @@ int main() {
     if (!test_schema_keyword_type_applicability()) return 1;
     if (!test_unsupported_schema_keywords_are_rejected()) return 1;
     if (!test_parallel_tool_calls()) return 1;
+    if (!test_reasoning_effort_controls()) return 1;
     if (!test_plain_answer()) return 1;
     if (!test_control_markup_never_leaks_as_content()) return 1;
     if (!test_trailing_whitespace_after_tool_call_is_not_malformed()) return 1;

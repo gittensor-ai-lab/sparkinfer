@@ -11,6 +11,7 @@
 #include <atomic>
 #include <csignal>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,28 @@ int max_output_tokens() {
         return n > 0 ? n : 4096;
     }();
     return v;
+}
+
+int sse_keepalive_seconds() {
+    static int v = [] {
+        const char* e = getenv("SPARKINFER_SSE_KEEPALIVE_SECONDS");
+        if (!e || !*e) return 15;
+        return std::max(0, std::min(atoi(e), 300));
+    }();
+    return v;
+}
+
+bool always_stream_usage() {
+    static bool v = [] {
+        const char* e = getenv("SPARKINFER_ALWAYS_STREAM_USAGE");
+        return !e || e[0] != '0';
+    }();
+    return v;
+}
+
+std::string env_string(const char* name, const std::string& fallback = {}) {
+    const char* value = getenv(name);
+    return value && *value ? value : fallback;
 }
 
 std::string g_api_key;
@@ -151,6 +174,51 @@ struct GuardedSink {
     std::mutex& mu;
 };
 
+// SSE comments are ignored by OpenAI clients and prevent proxy idle timeouts during long prefill.
+class SseHeartbeat {
+public:
+    explicit SseHeartbeat(GuardedSink& sink) : sink_(sink), interval_(sse_keepalive_seconds()) {
+        if (interval_ > 0) worker_ = std::thread([this] { run(); });
+    }
+    ~SseHeartbeat() { stop(); }
+    SseHeartbeat(const SseHeartbeat&) = delete;
+    SseHeartbeat& operator=(const SseHeartbeat&) = delete;
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(state_mu_);
+            stopped_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) worker_.join();
+    }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> state_lock(state_mu_);
+        while (!cv_.wait_for(state_lock, std::chrono::seconds(interval_), [this] { return stopped_; })) {
+            state_lock.unlock();
+            static constexpr char event[] = ": keep-alive\n\n";
+            {
+                std::lock_guard<std::mutex> write_lock(sink_.mu);
+                if (!sink_.sink.is_writable() || !sink_.sink.write(event, sizeof(event) - 1)) {
+                    state_lock.lock();
+                    stopped_ = true;
+                    return;
+                }
+            }
+            state_lock.lock();
+        }
+    }
+
+    GuardedSink& sink_;
+    int interval_;
+    std::mutex state_mu_;
+    std::condition_variable cv_;
+    bool stopped_ = false;
+    std::thread worker_;
+};
+
 bool write_sse_json(GuardedSink& gs, const nlohmann::json& value) {
     const std::string event = "data: " + value.dump() + "\n\n";
     std::lock_guard<std::mutex> lock(gs.mu);
@@ -196,6 +264,19 @@ bool write_stream_delta(GuardedSink& gs, const std::string& cid, long long creat
                                                 {"delta", {{field, piece}}},
                                                 {"finish_reason", nullptr},
                                                 {"logprobs", logprobs}}});
+    return write_sse_json(gs, chunk);
+}
+
+bool write_stream_reasoning_delta(GuardedSink& gs, const std::string& cid, long long created,
+                                  const std::string& piece, int choice_index,
+                                  const nlohmann::json& logprobs = nullptr) {
+    if (piece.empty()) return true;
+    auto chunk = stream_chunk_base(cid, created);
+    // OpenRouter standardizes on `reasoning`; `reasoning_content` remains as the widely-used
+    // OpenAI-compatible alias and preserves SparkInfer's existing wire contract.
+    chunk["choices"] = nlohmann::json::array({{{"index", choice_index},
+        {"delta", {{"reasoning", piece}, {"reasoning_content", piece}}},
+        {"finish_reason", nullptr}, {"logprobs", logprobs}}});
     return write_sse_json(gs, chunk);
 }
 
@@ -445,11 +526,53 @@ int main(int argc, char** argv) {
     });
 
     svr.Get("/v1/models", [&engine](const httplib::Request&, httplib::Response& res) {
-        std::ostringstream body;
-        body << "{\"object\":\"list\",\"data\":[{\"id\":\"" << g_model_name
-             << "\",\"object\":\"model\",\"owned_by\":\"sparkinfer\",\"context_length\":"
-             << engine.max_seq() << "}]}";
-        res.set_content(body.str(), "application/json");
+        using json = nlohmann::json;
+        const int context = engine.max_seq();
+        json supported = {
+            {"temperature", {{"type", "range"}, {"min", 0}, {"max", 2}}},
+            {"top_p", {{"type", "range"}, {"min", 0}, {"max", 1}}},
+            {"max_tokens", {{"type", "integer"}, {"min", 1}, {"max", max_output_tokens()}, {"unit", "token"}}},
+            {"stop", {{"type", "array"}, {"max_items", 4}}},
+            {"seed", {{"type", "unknown"}}},
+            {"presence_penalty", {{"type", "range"}, {"min", -2}, {"max", 2}}},
+            {"frequency_penalty", {{"type", "range"}, {"min", -2}, {"max", 2}}},
+            {"logprobs", {{"type", "boolean"}}},
+            {"top_logprobs", {{"type", "integer"}, {"min", 0}, {"max", 20}}},
+            {"logit_bias", {{"type", "unknown"}}},
+            {"n", {{"type", "integer"}, {"min", 1}, {"max", 8}}}
+        };
+        if (!engine.is_museglimmer()) {
+            supported["tools"] = {{"type", "boolean"}};
+            supported["structured_outputs"] = {{"type", "boolean"}};
+        }
+        if (engine.is_qwen38()) supported["reasoning"] = {{"type", "boolean"}};
+        json input = {{"type", "text"},
+            {"supported_inputs", {{"max_context_length", {{"value", context}, {"unit", "token"}}}}}};
+        json output = {{"type", "text"}, {"streaming", true},
+            {"max_length", {{"value", max_output_tokens()}, {"unit", "token"}}},
+            {"supported_parameters", std::move(supported)}};
+        const std::string prompt_price = env_string("SPARKINFER_PROMPT_PRICE_USD");
+        const std::string completion_price = env_string("SPARKINFER_COMPLETION_PRICE_USD");
+        if (!prompt_price.empty())
+            input["pricing"] = json::array({{{"type", "prompt"}, {"unit", "token"},
+                                               {"cost_usd", prompt_price}}});
+        if (!completion_price.empty())
+            output["pricing"] = json::array({{{"type", "completion"}, {"unit", "token"},
+                                                {"cost_usd", completion_price}}});
+        json model = {
+            {"schema_version", "2.4"}, {"id", g_model_name}, {"name", g_model_name},
+            {"object", "model"}, {"owned_by", "sparkinfer"},
+            {"hugging_face_id", env_string("SPARKINFER_HF_MODEL_ID")},
+            {"quantization", nullptr},
+            {"context_length", context},
+            {"input_modalities", json::array({std::move(input)})},
+            {"output_modalities", json::array({std::move(output)})},
+            {"is_ready", engine.loaded() && engine.device_healthy()}
+        };
+        const std::string quantization = env_string("SPARKINFER_QUANTIZATION");
+        if (!quantization.empty()) model["quantization"] = quantization;
+        res.set_content(json({{"object", "list"}, {"data", json::array({std::move(model)})}}).dump(),
+                        "application/json");
     });
 
     svr.Get("/v1/info", [&engine](const httplib::Request& req, httplib::Response& res) {
@@ -756,55 +879,9 @@ int main(int argc, char** argv) {
                                      "application/json");
                      return;
                  }
-                 // DFlash's verify step requires exact greedy-argmax determinism against the
-                 // draft model's own proposal -- real sampling can't coexist with it. DFlash is
-                 // a process-wide, env-var-gated toggle (not per-request), so this is checked
-                 // once per request against the process env, at validation time, before any
-                 // generation is attempted.
-                 //
-                 // top_k/top_p deliberately have no analogous check here: they can only ever
-                 // change output in combination with an actual Gumbel draw, which only happens
-                 // at temperature > 0 -- already rejected below regardless of top_k/top_p. A
-                 // top_k=5, temperature=0 request under DFlash is safe (masking is provably
-                 // inert at temperature<=0 -- see ContinuousBatchEngine::Request's doc comment).
-                 // logprobs needs no check either -- it's pure output reporting, never touches
-                 // the sampling path at all.
-                 const bool dflash_env_on =
-                     [] { const char* e = getenv("SPARKINFER_DFLASH"); return e && e[0] == '1'; }();
-                 if (sparkinfer_server::should_reject_dflash_temperature(dflash_env_on, controls.temperature)) {
-                     g_requests_client_error++;
-                     res.status = 400;
-                     res.set_content("{\"error\":{\"message\":\"temperature sampling is not supported "
-                                     "while SPARKINFER_DFLASH=1 is active on this server instance\"}}",
-                                     "application/json");
-                     return;
-                 }
-                 // Unlike top_k/top_p (provably inert at temperature<=0, see above), presence/
-                 // frequency penalty can change the greedy-argmax winner even at temperature==0 --
-                 // no inertness proof exists, so this needs its own DFlash check, independent of
-                 // the temperature check above.
-                 if (sparkinfer_server::should_reject_dflash_penalty(
-                         dflash_env_on, controls.presence_penalty, controls.frequency_penalty)) {
-                     g_requests_client_error++;
-                     res.status = 400;
-                     res.set_content("{\"error\":{\"message\":\"presence_penalty/frequency_penalty are not "
-                                     "supported while SPARKINFER_DFLASH=1 is active on this server instance\"}}",
-                                     "application/json");
-                     return;
-                 }
-                 // Same "no inertness proof at temperature<=0" gap as presence/frequency penalty
-                 // above -- an arbitrary per-vocab additive bias can change the greedy-argmax
-                 // winner on its own, so this needs its own DFlash check too, independent of both
-                 // checks above.
-                 if (sparkinfer_server::should_reject_dflash_logit_bias(
-                         dflash_env_on, !controls.logit_bias.empty())) {
-                     g_requests_client_error++;
-                     res.status = 400;
-                     res.set_content("{\"error\":{\"message\":\"logit_bias is not supported while "
-                                     "SPARKINFER_DFLASH=1 is active on this server instance\"}}",
-                                     "application/json");
-                     return;
-                 }
+                 // The HTTP server runs ContinuousBatchEngine, whose request path is currently
+                 // autoregressive even when the standalone DFlash benchmark env var is present.
+                 // Do not reject valid OpenAI sampling controls based on an unrelated process env.
                  if (!controls.seed_set) {
                      static thread_local std::random_device rd;
                      controls.seed = ((uint64_t)rd() << 32) | rd();
@@ -865,11 +942,13 @@ int main(int argc, char** argv) {
                  };
 
                  if (stream) {
+                     res.set_header("Cache-Control", "no-cache");
+                     res.set_header("X-Accel-Buffering", "no");
                      res.set_chunked_content_provider(
                          "text/event-stream",
                          [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
                           chat_request, tool_protocol, json_mode_active,
-                          include_usage = controls.include_usage, stop = controls.stop,
+                          include_usage = controls.include_usage || always_stream_usage(), stop = controls.stop,
                           temperature = controls.temperature, seed = controls.seed,
                           top_k = controls.top_k, top_p = controls.top_p,
                           presence_penalty = controls.presence_penalty,
@@ -885,10 +964,12 @@ int main(int argc, char** argv) {
 
                              std::mutex sink_mu;
                              GuardedSink gs{sink, sink_mu};
+                             SseHeartbeat heartbeat(gs);
 
                              for (int ci = 0; ci < n; ci++) {
                                  if (!write_stream_role(gs, cid, created, ci)) {
                                      g_requests_cancelled++;
+                                     heartbeat.stop();
                                      sink.done();
                                      return true;
                                  }
@@ -922,8 +1003,9 @@ int main(int argc, char** argv) {
                              auto emit_buffered_output = [&](int ci,
                                                              sparkinfer_server::ParsedAssistantOutput parsed,
                                                              const std::string& finish_reason) {
-                                 write_stream_delta(gs, cid, created, "reasoning_content",
-                                                    parsed.reasoning_content, ci);
+                                 if (!chat_request.reasoning_exclude)
+                                     write_stream_reasoning_delta(gs, cid, created,
+                                                                  parsed.reasoning_content, ci);
                                  write_stream_delta(gs, cid, created, "content", parsed.content, ci);
                                  for (size_t i = 0; i < parsed.tool_calls.size(); ++i) {
                                      parsed.tool_calls[i].id = random_id("call_");
@@ -1073,9 +1155,10 @@ int main(int argc, char** argv) {
                                      if (stop_filter.matched()) {
                                          if (!safe.empty()) {
                                              const auto delta = splitter.feed(safe);
-                                             if (!delta.reasoning_content.empty())
-                                                 write_stream_delta(gs, cid, created, "reasoning_content",
-                                                                    delta.reasoning_content, ci, take_pending());
+                                             if (!chat_request.reasoning_exclude && !delta.reasoning_content.empty())
+                                                 write_stream_reasoning_delta(gs, cid, created,
+                                                                              delta.reasoning_content, ci,
+                                                                              take_pending());
                                              if (!delta.content.empty())
                                                  write_stream_delta(gs, cid, created, "content", delta.content,
                                                                     ci, take_pending());
@@ -1093,10 +1176,10 @@ int main(int argc, char** argv) {
                                      // logprobs for tokens whose text it does not contain.
                                      // Concatenating every chunk's entries now yields exactly one
                                      // per generated token, matching the non-streaming response.
-                                     if (!delta.reasoning_content.empty())
-                                         ok = write_stream_delta(gs, cid, created, "reasoning_content",
-                                                                  delta.reasoning_content, ci,
-                                                                  take_pending()) && ok;
+                                     if (!chat_request.reasoning_exclude && !delta.reasoning_content.empty())
+                                         ok = write_stream_reasoning_delta(gs, cid, created,
+                                                                            delta.reasoning_content, ci,
+                                                                            take_pending()) && ok;
                                      if (!delta.content.empty())
                                          ok = write_stream_delta(gs, cid, created, "content", delta.content,
                                                                  ci, take_pending()) && ok;
@@ -1172,9 +1255,10 @@ int main(int argc, char** argv) {
                                      // consume the entries and then throw them away with the
                                      // delta -- and the safety net below could not see them,
                                      // because the buffer would already be clear.
-                                     if (!flush.reasoning_content.empty())
-                                         write_stream_delta(gs, cid, created, "reasoning_content",
-                                                            flush.reasoning_content, ci, take_pending());
+                                     if (!chat_request.reasoning_exclude && !flush.reasoning_content.empty())
+                                         write_stream_reasoning_delta(gs, cid, created,
+                                                                      flush.reasoning_content, ci,
+                                                                      take_pending());
                                      if (!flush.content.empty())
                                          write_stream_delta(gs, cid, created, "content", flush.content,
                                                             ci, take_pending());
@@ -1285,6 +1369,7 @@ int main(int argc, char** argv) {
                                  }
                                  if (f.fail == BranchOutcome::Fail::cancelled) {
                                      // Client is already gone -- nothing left to write to.
+                                     heartbeat.stop();
                                      sink.done();
                                      return true;
                                  }
@@ -1295,6 +1380,7 @@ int main(int argc, char** argv) {
                                  if (include_usage)
                                      write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
                                                         (int)agg_completion, -1.0, -1.0, -1.0);
+                                 heartbeat.stop();
                                  write_stream_done(gs);
                                  sink.done();
                                  return true;
@@ -1314,6 +1400,7 @@ int main(int argc, char** argv) {
                                  // sums real per-branch prefill cost; see plan for why.
                                  write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
                                                     (int)agg_completion, ttft_min, gen_max, decode_tps_agg);
+                             heartbeat.stop();
                              write_stream_done(gs);
                              sink.done();
                              return true;
@@ -1533,8 +1620,10 @@ int main(int argc, char** argv) {
                      }
 
                      nlohmann::json message = {{"role", "assistant"}};
-                     if (!parsed.reasoning_content.empty())
+                     if (!chat_request.reasoning_exclude && !parsed.reasoning_content.empty()) {
+                         message["reasoning"] = parsed.reasoning_content;
                          message["reasoning_content"] = parsed.reasoning_content;
+                     }
                      // parsed.tool_calls is only non-empty here for a complete, successfully-
                      // parsed call.
                      if (!parsed.tool_calls.empty()) {
@@ -1721,34 +1810,6 @@ int main(int argc, char** argv) {
                                      "application/json");
                      return;
                  }
-                 const bool dflash_env_on =
-                     [] { const char* e = getenv("SPARKINFER_DFLASH"); return e && e[0] == '1'; }();
-                 if (sparkinfer_server::should_reject_dflash_temperature(dflash_env_on, controls.temperature)) {
-                     g_requests_client_error++;
-                     res.status = 400;
-                     res.set_content("{\"error\":{\"message\":\"temperature sampling is not supported "
-                                     "while SPARKINFER_DFLASH=1 is active on this server instance\"}}",
-                                     "application/json");
-                     return;
-                 }
-                 if (sparkinfer_server::should_reject_dflash_penalty(
-                         dflash_env_on, controls.presence_penalty, controls.frequency_penalty)) {
-                     g_requests_client_error++;
-                     res.status = 400;
-                     res.set_content("{\"error\":{\"message\":\"presence_penalty/frequency_penalty are not "
-                                     "supported while SPARKINFER_DFLASH=1 is active on this server instance\"}}",
-                                     "application/json");
-                     return;
-                 }
-                 if (sparkinfer_server::should_reject_dflash_logit_bias(
-                         dflash_env_on, !controls.logit_bias.empty())) {
-                     g_requests_client_error++;
-                     res.status = 400;
-                     res.set_content("{\"error\":{\"message\":\"logit_bias is not supported while "
-                                     "SPARKINFER_DFLASH=1 is active on this server instance\"}}",
-                                     "application/json");
-                     return;
-                 }
                  if (!controls.seed_set) {
                      static thread_local std::random_device rd;
                      controls.seed = ((uint64_t)rd() << 32) | rd();
@@ -1790,10 +1851,12 @@ int main(int argc, char** argv) {
                  };
 
                  if (stream) {
+                     res.set_header("Cache-Control", "no-cache");
+                     res.set_header("X-Accel-Buffering", "no");
                      res.set_chunked_content_provider(
                          "text/event-stream",
                          [&engine, prompt_ids, prompt, echo, max_tokens, cid, created,
-                          include_usage = controls.include_usage, stop = controls.stop,
+                          include_usage = controls.include_usage || always_stream_usage(), stop = controls.stop,
                           temperature = controls.temperature, seed = controls.seed,
                           top_k = controls.top_k, top_p = controls.top_p,
                           presence_penalty = controls.presence_penalty,
@@ -1809,6 +1872,7 @@ int main(int argc, char** argv) {
 
                              std::mutex sink_mu;
                              GuardedSink gs{sink, sink_mu};
+                             SseHeartbeat heartbeat(gs);
 
                              struct BranchOutcome {
                                  bool ok = false;
@@ -1962,6 +2026,7 @@ int main(int argc, char** argv) {
                                      default:                                g_requests_server_error++; break;
                                  }
                                  if (f.fail == BranchOutcome::Fail::cancelled) {
+                                     heartbeat.stop();
                                      sink.done();
                                      return true;
                                  }
@@ -1970,6 +2035,7 @@ int main(int argc, char** argv) {
                                      write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
                                                         (int)agg_completion, -1.0, -1.0, -1.0,
                                                         "text_completion");
+                                 heartbeat.stop();
                                  write_stream_done(gs);
                                  sink.done();
                                  return true;
@@ -1987,6 +2053,7 @@ int main(int argc, char** argv) {
                                  write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
                                                     (int)agg_completion, ttft_min, gen_max, decode_tps_agg,
                                                     "text_completion");
+                             heartbeat.stop();
                              write_stream_done(gs);
                              sink.done();
                              return true;

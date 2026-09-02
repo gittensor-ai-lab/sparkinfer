@@ -180,6 +180,12 @@ bool test_top_p_hand_computed_cutoff() {
         bool ok = !is_neg_inf(out[0]) && is_neg_inf(out[1]) && is_neg_inf(out[2]) && is_neg_inf(out[3]);
         if (!ok) { printf("FAIL: top_p=0.35 surviving set mismatch (rank-0 invariant)\n"); return false; }
     }
+    // OpenAI permits top_p=0: it means the rank-0 token is the only survivor.
+    {
+        const auto out = masked_logits(s, logits, /*top_k=*/0, /*top_p=*/0.0f);
+        const bool ok = finite_indices(out) == std::vector<int>({0});
+        if (!ok) { printf("FAIL: top_p=0 must keep only rank 0\n"); return false; }
+    }
     printf("[OK] top_p hand-computed cutoffs match exactly\n");
     return true;
 }

@@ -25,6 +25,8 @@ struct ToolDefinition {
 enum class ToolChoiceMode {
     kAuto,
     kNone,
+    kRequired,
+    kNamed,
 };
 
 struct ChatMessage {
@@ -56,7 +58,12 @@ struct ChatRequest {
     std::vector<ChatMessage> messages;
     std::vector<ToolDefinition> tools;
     ToolChoiceMode tool_choice = ToolChoiceMode::kAuto;
+    std::string required_tool_name;  // populated for OpenAI's named/object tool_choice
     bool parallel_tool_calls = true;
+    // OpenRouter/OpenAI reasoning controls. The tokenizer uses this when it constructs the
+    // Qwen3.8 system instruction; empty means the model's default (xhigh).
+    std::string reasoning_effort;
+    bool reasoning_exclude = false;
     ResponseFormat response_format;
 };
 

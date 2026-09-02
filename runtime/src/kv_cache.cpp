@@ -9,6 +9,7 @@
 
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/device_health.h"
+#include <algorithm>
 #include <atomic>
 
 #include <cuda_runtime.h>
@@ -36,12 +37,12 @@ inline void cu(cudaError_t e, const char* what) {
         fprintf(stderr, "[kv] (further CUDA errors suppressed)\n");
 }
 constexpr int kMaxSeqs = 256;
-constexpr int kMaxBlocksPerSeq = 10240;  // 10240 * 16 = 163840 tokens (128k ctx + decode headroom)
 }
 
 struct KVCacheManager::Impl {
     KVCacheConfig cfg;
     int total_blocks = 0;
+    int max_blocks_per_seq = 0;
     size_t layer_stride = 0;         // elements per layer in each pool
     size_t scale_layer_stride = 0;   // int8 path: fp16 scales per layer (= layer_stride / head_dim)
     bool int8_kv = false;
@@ -50,7 +51,7 @@ struct KVCacheManager::Impl {
     int n_slots = 0;
     void* k_scale = nullptr;         // int8 path only: [num_layers, ..., 1] __half per (token, kv_head)
     void* v_scale = nullptr;
-    int* d_block_tables = nullptr;   // [kMaxSeqs, kMaxBlocksPerSeq]
+    int* d_block_tables = nullptr;   // [kMaxSeqs, max_blocks_per_seq]
     std::vector<int> free_list;
     std::unordered_map<uint64_t, std::vector<int>> seq_blocks;
     std::unordered_map<uint64_t, int> seq_slot;   // seq_id -> row in d_block_tables
@@ -76,6 +77,10 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
     impl_->n_slots = n_slots;
     const size_t denom = (size_t)n_slots * 2 * bytes_per_block;
     impl_->total_blocks = denom ? (int)(pool_bytes / denom) : 0;
+    // A sequence can never own more blocks than exist in the pool. Deriving the table stride
+    // from that real limit avoids a separate 163,840-token ceiling that used to contradict the
+    // server's advertised model context on large-context NVFP4 deployments.
+    impl_->max_blocks_per_seq = std::max(1, impl_->total_blocks);
     impl_->layer_stride = (size_t)impl_->total_blocks * elems_per_block;
 
     // One extra TRAP slice when compacted. A layer with no slot has no KV by construction, so
@@ -93,7 +98,8 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
         cu(cudaMalloc(&impl_->k_scale, scale_elems * sizeof(unsigned short)), "malloc k_scale");
         cu(cudaMalloc(&impl_->v_scale, scale_elems * sizeof(unsigned short)), "malloc v_scale");
     }
-    cu(cudaMalloc(&impl_->d_block_tables, (size_t)kMaxSeqs * kMaxBlocksPerSeq * sizeof(int)), "malloc tables");
+    cu(cudaMalloc(&impl_->d_block_tables,
+                  (size_t)kMaxSeqs * impl_->max_blocks_per_seq * sizeof(int)), "malloc tables");
 
     impl_->free_list.reserve(impl_->total_blocks);
     for (int i = impl_->total_blocks - 1; i >= 0; --i) impl_->free_list.push_back(i);
@@ -108,7 +114,7 @@ KVCacheManager::~KVCacheManager() {
 
 bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
     const int need = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
-    if (need > kMaxBlocksPerSeq) return false;
+    if (need > impl_->max_blocks_per_seq) return false;
 
     auto& blocks = impl_->seq_blocks[seq_id];
     const int have = (int)blocks.size();
@@ -134,7 +140,7 @@ bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
         impl_->free_list.pop_back();
     }
 
-    cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * kMaxBlocksPerSeq, blocks.data(),
+    cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * impl_->max_blocks_per_seq, blocks.data(),
                   blocks.size() * sizeof(int), cudaMemcpyHostToDevice), "copy block table");
     return true;
 }
@@ -162,7 +168,7 @@ bool KVCacheManager::truncate_blocks(uint64_t seq_id, int keep_blocks) {
     }
     auto sit = impl_->seq_slot.find(seq_id);
     if (sit == impl_->seq_slot.end()) return false;
-    cu(cudaMemcpy(impl_->d_block_tables + (size_t)sit->second * kMaxBlocksPerSeq, blocks.data(),
+    cu(cudaMemcpy(impl_->d_block_tables + (size_t)sit->second * impl_->max_blocks_per_seq, blocks.data(),
                   blocks.size() * sizeof(int), cudaMemcpyHostToDevice), "truncate block table");
     return true;
 }
@@ -180,7 +186,7 @@ void KVCacheManager::free(uint64_t seq_id) {
 int* KVCacheManager::block_table(uint64_t seq_id) const {
     auto it = impl_->seq_slot.find(seq_id);
     if (it == impl_->seq_slot.end()) return nullptr;
-    return impl_->d_block_tables + (size_t)it->second * kMaxBlocksPerSeq;
+    return impl_->d_block_tables + (size_t)it->second * impl_->max_blocks_per_seq;
 }
 
 const std::vector<int>& KVCacheManager::physical_block_ids(uint64_t seq_id) const {
@@ -227,7 +233,7 @@ void*  KVCacheManager::k_scale_pool() const { return impl_->k_scale; }
 void*  KVCacheManager::v_scale_pool() const { return impl_->v_scale; }
 size_t KVCacheManager::scale_layer_stride_elems() const { return impl_->scale_layer_stride; }
 int    KVCacheManager::block_size() const { return impl_->cfg.block_size; }
-int    KVCacheManager::max_blocks_per_seq() const { return kMaxBlocksPerSeq; }
+int    KVCacheManager::max_blocks_per_seq() const { return impl_->max_blocks_per_seq; }
 int    KVCacheManager::num_free_blocks() const { return (int)impl_->free_list.size(); }
 int    KVCacheManager::num_total_blocks() const { return impl_->total_blocks; }
 
