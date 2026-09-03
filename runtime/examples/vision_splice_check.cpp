@@ -11,6 +11,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include "sparkinfer/models/qwen_vision.h"
+#include "sparkinfer/models/qwen_vision_preprocess.h"
 
 using namespace sparkinfer;
 static int g_fail = 0;
@@ -74,6 +75,35 @@ int main() {
           "a text-only prompt (0 images, 0 placeholders) is a no-op success");
 
     cudaFree(d_x);
-    printf(g_fail ? "[FAIL] %d check(s) failed\n" : "[OK] splice behaves correctly\n", g_fail);
+
+    // ---- placeholder expansion, MULTIPLE images ----
+    // Every test so far has used exactly one image, so the per-image counts vector -- the whole
+    // reason expand takes a vector rather than an int -- has never actually been exercised. Two
+    // images of DIFFERENT sizes is the case that catches an expansion that reuses one count, or
+    // that expands in the wrong order: with equal counts both bugs are invisible.
+    {
+        const std::vector<int> in = {1, IMG, 2, IMG, 3};
+        std::vector<int> out;
+        check(qwen_vision_expand_placeholders(in, IMG, {2, 3}, out, err),
+              "expand accepts two images with different token counts");
+        const std::vector<int> want = {1, IMG, IMG, 2, IMG, IMG, IMG, 3};
+        check(out == want, "each placeholder expands to ITS OWN count, in order");
+
+        check(!qwen_vision_expand_placeholders(in, IMG, {2}, out, err),
+              "refuses 2 placeholders but 1 image");
+        check(!qwen_vision_expand_placeholders(in, IMG, {2, 3, 4}, out, err),
+              "refuses 2 placeholders but 3 images");
+        check(!qwen_vision_expand_placeholders(in, IMG, {2, 0}, out, err),
+              "refuses a zero token count");
+        check(!qwen_vision_expand_placeholders(in, IMG, {2, -1}, out, err),
+              "refuses a negative token count");
+
+        std::vector<int> out2;
+        check(qwen_vision_expand_placeholders({1, 2, 3}, IMG, {}, out2, err) &&
+              out2 == std::vector<int>({1, 2, 3}),
+              "a text-only prompt with no images passes through unchanged");
+    }
+
+    printf(g_fail ? "[FAIL] %d check(s) failed\n" : "[OK] splice and expansion behave correctly\n", g_fail);
     return g_fail ? 1 : 0;
 }
