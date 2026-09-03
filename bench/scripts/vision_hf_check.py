@@ -22,14 +22,35 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir"); ap.add_argument("--pixels", required=True)
-    ap.add_argument("--gh", type=int, required=True); ap.add_argument("--gw", type=int, required=True)
+    ap.add_argument("--gh", type=int, default=0); ap.add_argument("--gw", type=int, default=0)
+    ap.add_argument("--image", default="", help="also diff OUR preprocessing against the real "
+                    "AutoImageProcessor for this image, and take the grid from it")
     ap.add_argument("--compare", default=""); ap.add_argument("--dump", default="")
     a = ap.parse_args()
 
     cfg = AutoConfig.from_pretrained(a.model_dir).vision_config
     m = cfg.spatial_merge_size
-    gh, gw = a.gh, a.gw
     patch_in = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size ** 2
+
+    hf_pix = None
+    if a.image:
+        # The REAL processor. The tower diff below feeds both sides identical pixels, so it can
+        # say nothing about preprocessing conventions -- resize, normalisation, patch order, and
+        # the still-image repeat across the temporal axis were all still resting on a reference
+        # written by the same hand as the code. This is the only check that settles them.
+        from PIL import Image
+        from transformers import AutoImageProcessor
+        ip = AutoImageProcessor.from_pretrained(a.model_dir)
+        enc = ip(images=Image.open(a.image).convert("RGB"), return_tensors="np")
+        hf_pix = np.asarray(enc["pixel_values"], dtype=np.float32)
+        t_, gh, gw = (int(v) for v in np.asarray(enc["image_grid_thw"])[0])
+        print(f"real processor: {a.image} -> grid t={t_} {gh}x{gw}, pixel_values {hf_pix.shape}")
+        if a.gh and (a.gh, a.gw) != (gh, gw):
+            print(f"[FAIL] our grid {a.gh}x{a.gw} != processor grid {gh}x{gw}"); sys.exit(1)
+    else:
+        gh, gw = a.gh, a.gw
+    if gh <= 0 or gw <= 0:
+        print("[FAIL] need --gh/--gw or --image"); sys.exit(1)
 
     pix = np.fromfile(a.pixels, dtype=np.float32).reshape(gh * gw, patch_in)
 
@@ -37,6 +58,19 @@ def main():
     # order transformers expects: blocks in raster order, and within a block its m*m patches.
     perm = np.arange(gh * gw).reshape(gh // m, m, gw // m, m).transpose(0, 2, 1, 3).reshape(-1)
     pix_mbm = pix[perm]
+
+    if hf_pix is not None:
+        if hf_pix.shape != pix_mbm.shape:
+            print(f"[FAIL] processor produced {hf_pix.shape}, we produced {pix_mbm.shape}")
+            sys.exit(1)
+        dp = np.abs(pix_mbm - hf_pix)
+        lsb = (1.0 / 255.0) / 0.5
+        print(f"  preprocessing vs real processor: max|diff|={dp.max():.6f} "
+              f"mean|diff|={dp.mean():.6f}  (one uint8 LSB = {lsb:.6f})")
+        if dp.max() > 1.01 * lsb:
+            print("[FAIL] preprocessing disagrees with the real processor by more than one LSB")
+            sys.exit(1)
+        print("  preprocessing: MATCH")
 
     # float32 throughout: the point is to isolate an ALGORITHMIC difference, and bf16 noise on a
     # 27-block tower is large enough (cosine ~0.9993 at 2304 patches) to hide or mimic one.
