@@ -131,6 +131,11 @@ if(BUILD_EXAMPLES)
                           nlohmann_json::nlohmann_json)
     # Runs the CUDA tower on vision_ref.py's exact synthetic input and dumps the embeddings for
     # that script to judge. The reference owns the tolerance, not this binary.
+    # Cross-checks the smart_resize port against the Python original over a grid of shapes.
+    # Exact integer logic, so bench/scripts/vision_resize_check.py demands strict equality.
+    add_executable(vision_resize_check examples/vision_resize_check.cpp)
+    target_include_directories(vision_resize_check PRIVATE include)
+    target_link_libraries(vision_resize_check PRIVATE sparkinfer_runtime CUDA::cudart)
     add_executable(vision_forward_check examples/vision_forward_check.cpp)
     target_include_directories(vision_forward_check PRIVATE include)
     target_link_libraries(vision_forward_check PRIVATE sparkinfer_runtime CUDA::cudart
