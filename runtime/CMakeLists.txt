@@ -121,6 +121,43 @@ if(BUILD_EXAMPLES)
     target_include_directories(dspark_tau_check PRIVATE include)
     target_link_libraries(dspark_tau_check PRIVATE sparkinfer_runtime CUDA::cudart
                           nlohmann_json::nlohmann_json)
+    # Vision-tower probe: does this checkpoint carry a complete vision encoder, and does every
+    # tensor match the shape its own vision_config implies? Stage 1 of image support -- no
+    # inference, just a structural check, because a silently missing or mis-shaped vision weight
+    # produces plausible garbage rather than an error.
+    add_executable(vision_probe examples/vision_probe.cpp)
+    target_include_directories(vision_probe PRIVATE include)
+    target_link_libraries(vision_probe PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
+    # Runs the CUDA tower on vision_ref.py's exact synthetic input and dumps the embeddings for
+    # that script to judge. The reference owns the tolerance, not this binary.
+    # Cross-checks the smart_resize port against the Python original over a grid of shapes.
+    # Exact integer logic, so bench/scripts/vision_resize_check.py demands strict equality.
+    add_executable(vision_resize_check examples/vision_resize_check.cpp)
+    target_include_directories(vision_resize_check PRIVATE include)
+    target_link_libraries(vision_resize_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    # Splice behaviour, especially the REFUSALS -- a count mismatch must be a hard error, never
+    # a partial write, or the model silently reads a truncated image region.
+    add_executable(vision_splice_check examples/vision_splice_check.cpp)
+    target_include_directories(vision_splice_check PRIVATE include)
+    target_link_libraries(vision_splice_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    # End-to-end: a real image file through decode -> preprocess -> tower -> splice -> generate.
+    # Needs server/third_party for the vendored stb_image.h.
+    add_executable(vision_e2e examples/vision_e2e.cpp)
+    target_include_directories(vision_e2e PRIVATE include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/../server/third_party)
+    target_link_libraries(vision_e2e PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
+    # Preprocessing differential (CPU only, no GPU) -- also needs the vendored stb_image.h.
+    add_executable(vision_preprocess_check examples/vision_preprocess_check.cpp)
+    target_include_directories(vision_preprocess_check PRIVATE include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/../server/third_party)
+    target_link_libraries(vision_preprocess_check PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
+    add_executable(vision_forward_check examples/vision_forward_check.cpp)
+    target_include_directories(vision_forward_check PRIVATE include)
+    target_link_libraries(vision_forward_check PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)

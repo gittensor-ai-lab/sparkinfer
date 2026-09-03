@@ -6,6 +6,11 @@
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/lmcache_bridge_client.h"
 #include "sparkinfer/models/qwen35.h"
+#include "sparkinfer/models/qwen_vision.h"
+#include "sparkinfer/models/qwen_vision_hf_config.h"
+#include "sparkinfer/models/qwen_vision_preprocess.h"
+#include "sparkinfer/safetensors.h"
+#include "image_input.hpp"
 #include "sparkinfer/moe/engine.h"
 #include "sparkinfer/runtime.h"
 
@@ -154,11 +159,26 @@ struct ModelEngine::Impl {
     std::unique_ptr<sparkinfer::BridgeClient> lmcache_bridge;
     pid_t lmcache_sidecar_pid = -1;
 
+    // Vision tower, when the checkpoint ships one. Owned here and handed to the batch engine by
+    // pointer, so it must outlive it -- and must be freed while the CUDA context is still alive,
+    // which is why reset_vision() is called from ~Impl's BODY rather than left to member order.
+    sparkinfer::QwenVisionConfig vcfg{};
+    sparkinfer::QwenVisionWeights vweights{};
+    bool vision_ready = false;
+
+    void reset_vision() {
+        if (!vision_ready) return;
+        free_qwen_vision_weights(vweights);
+        vweights = sparkinfer::QwenVisionWeights{};
+        vision_ready = false;
+    }
+
     // Explicit teardown order: destroy the BridgeClient first (joins its ping/store threads,
     // which may otherwise be mid-handshake against the sidecar) before killing the sidecar out
     // from under it -- tearing them down in the other order risks those threads observing a
     // closed socket mid-operation instead of a clean, already-stopped state.
     ~Impl() {
+        reset_vision();
         lmcache_bridge.reset();
         terminate_lmcache_sidecar(lmcache_sidecar_pid);
     }
@@ -170,6 +190,7 @@ ModelEngine::~ModelEngine() = default;
 bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     std::lock_guard<std::mutex> lock(mu_);
     impl_->ready = false;
+    impl_->reset_vision();
     impl_->batch_engine.reset();
     impl_->model.reset();
     impl_->engine.reset();
@@ -363,6 +384,28 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     impl_->batch_engine = std::make_unique<sparkinfer::ContinuousBatchEngine>(
         impl_->model.get(), impl_->kv.get(), batch_tokens_per_step(), policy);
 
+    // Vision tower. Absence is NOT an error -- a text-only checkpoint has no vision_config and
+    // has_vision() stays false -- but a tower that is present and fails to load is reported here
+    // rather than left to surface as a confusing per-request failure much later.
+    if (is_dir) {
+        std::string verr;
+        if (!qwen_vision_config_from_hf_json(gguf_path, impl_->vcfg, verr)) {
+            fprintf(stderr, "[sparkinfer-server] vision config malformed: %s\n", verr.c_str());
+        } else if (impl_->vcfg.present) {
+            sparkinfer::SafeTensorsModel vst;
+            if (!vst.open(gguf_path)) {
+                fprintf(stderr, "[sparkinfer-server] vision: cannot open safetensors\n");
+            } else if (!load_qwen_vision_weights(vst, impl_->vcfg, impl_->vweights, verr)) {
+                fprintf(stderr, "[sparkinfer-server] vision tower load failed: %s\n", verr.c_str());
+            } else {
+                impl_->vision_ready = true;
+                impl_->batch_engine->set_vision(&impl_->vweights, &impl_->vcfg);
+                fprintf(stderr, "[sparkinfer-server] vision tower ready: %d blocks, out_hidden=%d\n",
+                        impl_->vcfg.depth, impl_->vcfg.out_hidden);
+            }
+        }
+    }
+
     impl_->path = gguf_path;
     impl_->ready = true;
     fprintf(stderr, "[sparkinfer-server] continuous batching enabled (policy=%d, batch=%d)\n",
@@ -407,6 +450,71 @@ int ModelEngine::max_seq() const {
 bool ModelEngine::is_museglimmer() const {
     std::lock_guard<std::mutex> lock(mu_);
     return impl_->ready && impl_->cfg.muse_glimmer;
+}
+
+bool ModelEngine::has_vision() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return impl_->vision_ready;
+}
+
+bool ModelEngine::prepare_images(const std::vector<std::string>& urls, int image_token_id,
+                                 std::vector<int>& prompt_ids, PreparedImages& out,
+                                 std::string& err) const {
+    out.images.clear();
+    out.positions.clear();
+    if (urls.empty()) return true;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!impl_->vision_ready) {
+            err = "this model has no vision tower; image input is not supported";
+            return false;
+        }
+    }
+    // vcfg is written only by load() and read-only afterwards, and the tower weights are not
+    // touched here at all -- this does CPU preprocessing only, so it runs without the engine
+    // mutex and without contending for the GPU.
+    for (size_t i = 0; i < urls.size(); i++) {
+        const std::string where = "image " + std::to_string(i);
+        std::vector<unsigned char> bytes;
+        if (!parse_image_url(urls[i], bytes, err)) { err = where + ": " + err; return false; }
+        DecodedImage img;
+        if (!decode_image(bytes.data(), bytes.size(), img, err)) { err = where + ": " + err; return false; }
+        PreparedImages::Image pi;
+        int gh = 0, gw = 0;
+        auto pixels = std::make_shared<std::vector<float>>();
+        if (!sparkinfer::qwen_vision_preprocess(img.rgb.data(), img.height, img.width, impl_->vcfg,
+                                                *pixels, &gh, &gw, err)) {
+            err = where + ": " + err;
+            return false;
+        }
+        pi.pixels = std::move(pixels);
+        pi.grid_h = gh;
+        pi.grid_w = gw;
+        out.images.push_back(std::move(pi));
+    }
+    // One placeholder per image goes in, the count each grid needs comes out. A mismatch here is
+    // an error, never a best-effort expansion: guessing would hand the model a prompt whose image
+    // span is quietly truncated or padded, which it will describe fluently either way.
+    return reexpand_images(image_token_id, prompt_ids, out, err);
+}
+
+bool ModelEngine::reexpand_images(int image_token_id, std::vector<int>& prompt_ids,
+                                  PreparedImages& io, std::string& err) const {
+    io.positions.clear();
+    if (io.images.empty()) return true;
+    // Counts come from the grids, not from a remembered list, so this is correct whether it runs
+    // on the first prompt or on one rebuilt from scratch afterwards.
+    std::vector<int> counts;
+    counts.reserve(io.images.size());
+    for (const auto& im : io.images)
+        counts.push_back(sparkinfer::qwen_vision_num_tokens(im.grid_h, im.grid_w, impl_->vcfg));
+    std::vector<int> expanded;
+    if (!sparkinfer::qwen_vision_expand_placeholders(prompt_ids, image_token_id, counts, expanded, err))
+        return false;
+    prompt_ids.swap(expanded);
+    for (size_t i = 0; i < prompt_ids.size(); i++)
+        if (prompt_ids[i] == image_token_id) io.positions.push_back((int)i);
+    return true;
 }
 
 bool ModelEngine::is_qwen38() const {
@@ -463,12 +571,19 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
                                                  bool logprobs, int top_logprobs,
                                                  const std::function<void(const TokenLogprob&)>&
                                                      on_token_logprob,
-                                                 const std::vector<int>& forced_tokens) {
+                                                 const std::vector<int>& forced_tokens,
+                                                 const PreparedImages* images) {
     CompletionResult out;
     sparkinfer::ContinuousBatchEngine::Request req;
     req.prompt = prompt_ids;
     req.max_new_tokens = max_new_tokens;
     req.forced_tokens = forced_tokens;
+    if (images && !images->positions.empty()) {
+        req.vision_pos = images->positions;
+        req.vision_images.reserve(images->images.size());
+        for (const auto& im : images->images)
+            req.vision_images.push_back({im.pixels, im.grid_h, im.grid_w});   // shares the buffer
+    }
     req.temperature = temperature;
     req.seed = seed;
     req.top_k = top_k;

@@ -42,6 +42,21 @@ struct Qwen35PrefillCtx {
     int                  n_capture;
     void*                capture_dst;
     int                  capture_start;
+    // Optional image input. MUST STAY LAST: every Qwen35PrefillCtx is built with positional
+    // aggregate initialization, so a field inserted mid-struct silently shifts every later value
+    // -- putting these after n_splits made capture_layers land in vision_emb. At the end, the
+    // existing initializers simply omit them and they value-initialize to null/0, which is
+    // exactly the text-only default.
+    //
+    // Null (always so for a text-only request) means the vision path is not merely skipped but
+    // never referenced -- the splice site in prefill_batched_run is guarded on this pointer.
+    //   vision_emb: [vision_n, hidden] bf16 on device, the tower's merged embeddings
+    //   vision_pos: [vision_n] int32 on device, prompt positions carrying image_token_id
+    // The caller validates vision_n against the placeholder count BEFORE building this, so by the
+    // time prefill sees it the two are known to agree.
+    const void*          vision_emb = nullptr;
+    const int*           vision_pos = nullptr;
+    int                  vision_n   = 0;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.

@@ -13,6 +13,7 @@
 
 #include "qwen35_prefill.h"
 #include "sparkinfer/kernels/prefill.h"
+#include "sparkinfer/kernels/vision.h"
 #include "sparkinfer/kernels/prefill_attn_window.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
@@ -1390,6 +1391,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
 
     // embed -> x, prime xn = RMSNorm(x, layer0.input_norm)
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
+    // Image input, if any: overwrite the rows whose token is image_token_id with the vision
+    // tower's merged embeddings. Strictly additive -- s.vision_emb is null for every text-only
+    // request, so this branch is not taken and no vision code is referenced at all. The caller
+    // has already checked that vision_n equals the placeholder count; by here they agree.
+    //
+    // Placed immediately after the gather and before ANY layer runs, because from the model's
+    // point of view an image embedding is just a token embedding that came from somewhere else.
+    // Everything downstream -- RoPE, attention, the KV write -- treats those rows identically,
+    // which is what makes plain 1-D RoPE sufficient (this checkpoint has no M-RoPE).
+    if (s.vision_emb && s.vision_pos && s.vision_n > 0)
+        kernels::launch_vision_splice(x, s.vision_pos, s.vision_emb, s.vision_n, H, st);
     // Muse Glimmer: unweighted embedding RMSNorm on x before layer 0 (decode qwen35.cpp:724-725).
     // emb_norm_ones is a constant-1.0 weight, so this is a pure normalization of the embedding.
     if (c.muse_glimmer && s.emb_norm_ones)

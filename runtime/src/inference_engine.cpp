@@ -1,4 +1,5 @@
 #include "sparkinfer/inference_engine.h"
+#include "sparkinfer/models/qwen_vision.h"
 
 #include "sparkinfer/device_health.h"
 
@@ -136,6 +137,13 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
         return out;
     }
     return wait_locked(rid);
+}
+
+void ContinuousBatchEngine::set_vision(const QwenVisionWeights* weights,
+                                      const QwenVisionConfig* cfg) {
+    std::lock_guard<std::mutex> lock(mu_);
+    vision_weights_ = weights;
+    vision_cfg_ = cfg;
 }
 
 int ContinuousBatchEngine::num_active() const {
@@ -386,8 +394,46 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         // logprobs -- it costs a full-vocab sort, and unlike the decode path (frozen graph
         // topology) this one is free to branch on the host.
         const bool want_seed_logprob = job.req.logprobs && job.on_token_logprob;
+        // Run the vision tower for this job HERE, on the worker thread, and stage the result
+        // only for the prefill immediately below. Both halves of that are required: the tower
+        // issues work on the legacy default stream, which cannot overlap another job's CUDA
+        // graph capture, and set_pending_vision is a single slot on the shared model, so leaving
+        // it set would splice this request's image into whatever job prefills next. One worker
+        // thread runs step_job, so nothing can prefill between the set and the clear.
+        const bool has_vision = !job.req.vision_pos.empty();
+        if (has_vision && (!vision_weights_ || !vision_cfg_)) {
+            job.error = "this model has no vision tower; image input is not supported";
+            finish_job(job);
+            return true;
+        }
+        if (has_vision) {
+            std::vector<float> emb;
+            std::string verr;
+            for (const auto& img : job.req.vision_images) {
+                const int nblk = (img.grid_h / vision_cfg_->spatial_merge) *
+                                 (img.grid_w / vision_cfg_->spatial_merge);
+                const size_t off = emb.size();
+                emb.resize(off + (size_t)nblk * vision_cfg_->out_hidden);
+                if (!img.pixels ||
+                    !qwen_vision_forward(*vision_weights_, *vision_cfg_, img.pixels->data(),
+                                         img.grid_h, img.grid_w, emb.data() + off, verr)) {
+                    job.error = "vision tower failed: " + verr;
+                    finish_job(job);
+                    return true;
+                }
+            }
+            if (emb.size() != job.req.vision_pos.size() * (size_t)vision_cfg_->out_hidden ||
+                !model_->set_pending_vision(emb.data(), job.req.vision_pos.data(),
+                                            (int)job.req.vision_pos.size(),
+                                            vision_cfg_->out_hidden)) {
+                job.error = "failed to stage image embeddings for prefill";
+                finish_job(job);
+                return true;
+            }
+        }
         const int seed = model_->ingest_prompt_range(job.req.prompt.data(), job.prefill_pos, n,
                                                       chunk_limit, &out_pos, want_seed_logprob);
+        if (has_vision) model_->clear_pending_vision();
         job.prefill_pos = out_pos;
         if (job.prefill_pos >= n) {
             // Known v1 scope limitation for temperature sampling (runtime/src/models/qwen35.cpp's

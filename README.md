@@ -238,7 +238,7 @@ Your own model: `bench/scripts/bench.sh /path/to/model.gguf --tokens 256`. Optio
 | [`moe/`](moe) | sync-free MoE router + expert dispatch |
 | [`bench/`](bench) | reproducible benchmarks + eval harness |
 | [`dashboard/`](dashboard) | static frontier dashboard (GitHub Pages) |
-| [`server/`](server) | OpenAI-compatible HTTP API (`BUILD_SERVER=ON`) |
+| [`server/`](server) | OpenAI-compatible HTTP API (`BUILD_SERVER=ON`), incl. [image input](docs/image_input.md) |
 
 **Scoring is speedup-only.** SN74 pays verified marginal speedups labeled **XL / L / M / S / XS**. Sub-2% gains are never aggregated across contexts. See [`.gittensor/weights.json`](.gittensor/weights.json).
 

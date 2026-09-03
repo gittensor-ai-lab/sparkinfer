@@ -26,6 +26,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(re2)
 
 add_executable(sparkinfer_server
+    src/image_input.cpp
     src/sparkinfer_server.cpp
     src/model_engine.cpp
     src/chat_tokenizer.cpp
@@ -68,6 +69,19 @@ if(BUILD_TESTS)
     )
     target_compile_features(chat_tools_test PRIVATE cxx_std_17)
     add_test(NAME chat_tools_test COMMAND chat_tools_test)
+
+    # Image input: base64, data: URL parsing, decode -- and the refusals, which are the
+    # security-relevant half (no remote fetch, bounded payloads, no silent truncation).
+    add_executable(image_input_test
+        tests/image_input_test.cpp
+        src/image_input.cpp
+    )
+    target_include_directories(image_input_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+    )
+    target_compile_features(image_input_test PRIVATE cxx_std_17)
+    add_test(NAME image_input_test COMMAND image_input_test)
 
     add_executable(chat_tokenizer_test
         tests/chat_tokenizer_test.cpp

@@ -35,6 +35,25 @@ struct CompletionResult {
     double decode_tps = -1.0;
 };
 
+// Images already decoded and preprocessed, ready for the vision tower. Mirrored field-by-field
+// into ContinuousBatchEngine::Request, keeping this header's "never re-expose runtime types"
+// convention -- same reason TokenLogprob above is a hand-copied struct.
+//
+// Pixels, not embeddings: the tower has to run on the batch engine's worker thread (CUDA graph
+// capture), so all this carries is the CPU-side preprocessing result.
+struct PreparedImages {
+    struct Image {
+        // Shared so a copy of PreparedImages is cheap. Branch and retry paths each need their
+        // OWN positions (see reexpand_images) while sharing one preprocessing result, and they
+        // run concurrently, so mutating a single shared copy is not an option.
+        std::shared_ptr<const std::vector<float>> pixels;
+        int grid_h = 0;
+        int grid_w = 0;
+    };
+    std::vector<Image> images;
+    std::vector<int> positions;      // absolute prompt indices of the expanded placeholder run
+};
+
 // Thread-safe wrapper around sparkinfer::Qwen35Model + GGUF load.
 class ModelEngine {
 public:
@@ -61,6 +80,32 @@ public:
     int max_seq() const;
     bool is_museglimmer() const;
     bool is_qwen38() const;
+    // True when the loaded checkpoint shipped a vision tower and it loaded successfully. False
+    // for every text-only model, and for a vision checkpoint whose tower failed to load -- in
+    // both cases a request carrying images is refused rather than answered from its text.
+    bool has_vision() const;
+
+    // Decodes image_url values, preprocesses each to the tower's patch tensor, expands the
+    // prompt's single <|image_pad|> per image to the token count that image's grid needs, and
+    // reports where those tokens landed. prompt_ids is rewritten in place.
+    //
+    // The expansion belongs here rather than in the chat template because only the processor
+    // knows the resized grid -- the template emits exactly one placeholder per image and the
+    // reference processor expands it the same way.
+    bool prepare_images(const std::vector<std::string>& urls, int image_token_id,
+                        std::vector<int>& prompt_ids, PreparedImages& out,
+                        std::string& err) const;
+
+    // Re-expands placeholders and recomputes positions against a prompt that was rebuilt after
+    // prepare_images already ran. The tool-call continuation path re-renders the entire prompt
+    // from the message list, so both the earlier expansion and the offsets it recorded are stale
+    // -- it comes back with one bare <|image_pad|> per image again. Reuses the preprocessing;
+    // only the token bookkeeping is redone.
+    //
+    // Takes its own PreparedImages copy per branch by design: concurrent branches must not share
+    // one positions vector.
+    bool reexpand_images(int image_token_id, std::vector<int>& prompt_ids, PreparedImages& io,
+                         std::string& err) const;
 
     // Optional shared prompt prefix (e.g. system message tokens). When set, each request whose
     // prompt starts with these ids calls cache_prefix() (batched prefill) before generate().
@@ -104,7 +149,8 @@ public:
                                         bool logprobs = false, int top_logprobs = 0,
                                         const std::function<void(const TokenLogprob&)>&
                                             on_token_logprob = nullptr,
-                                        const std::vector<int>& forced_tokens = {});
+                                        const std::vector<int>& forced_tokens = {},
+                                        const PreparedImages* images = nullptr);
 
     // TEACHER-FORCED SCORING (POST /v1/score): non-empty `forced_tokens` turns the call into a
     // scoring pass instead of a generation. max_new_tokens must equal forced_tokens.size(); the

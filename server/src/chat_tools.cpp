@@ -32,6 +32,9 @@ constexpr int kMaxN = 8;
 constexpr int kMaxTopLogprobs = 20;
 
 constexpr const char* kImStart = "<|im_start|>";
+constexpr const char* kVisionStart = "<|vision_start|>";
+constexpr const char* kImagePad    = "<|image_pad|>";
+constexpr const char* kVisionEnd   = "<|vision_end|>";
 constexpr const char* kImEnd = "<|im_end|>";
 constexpr const char* kThinkOpen = "<think>";
 constexpr const char* kThinkClose = "</think>";
@@ -204,7 +207,8 @@ bool is_allowed_key(const json& object, const std::set<std::string>& allowed,
 }
 
 bool parse_content(const json& value, std::string& content, bool& is_null,
-                   const std::string& where, std::string& err) {
+                   const std::string& where, std::string& err,
+                   std::vector<std::string>* images, const std::string& role) {
     content.clear();
     is_null = value.is_null();
     if (is_null) return true;
@@ -218,10 +222,27 @@ bool parse_content(const json& value, std::string& content, bool& is_null,
         const json& part = value[i];
         if (!part.is_object() || !part.contains("type") || !part["type"].is_string())
             return set_error(err, where + ".content[" + std::to_string(i) + "] must have a string type");
-        // Non-text parts (image_url, audio, ...) are ignored, not rejected -- this backend has
-        // no vision/audio input path, but a client sending a mixed multimodal payload (common
-        // even against text-only backends, since agent frameworks often build one payload
-        // shape for every provider) should still get an answer from the text that IS present.
+        if (part["type"] == "image_url" && images) {
+            // Mirrors the template: an image part renders as this marker, and a system/developer
+            // message containing one is refused outright rather than producing a prompt shape the
+            // model was never trained to read.
+            if (role == "system")
+                return set_error(err, where + ".content[" + std::to_string(i) +
+                                      "]: system/developer messages cannot contain images");
+            const json& iu = part.contains("image_url") ? part["image_url"] : json();
+            if (!iu.is_object() || !iu.contains("url") || !iu["url"].is_string())
+                return set_error(err, where + ".content[" + std::to_string(i) +
+                                      "].image_url.url must be a string");
+            images->push_back(iu["url"].get<std::string>());
+            content += kVisionStart;
+            content += kImagePad;
+            content += kVisionEnd;
+            continue;
+        }
+        // Remaining non-text parts (audio, and image_url when the caller passes no image sink)
+        // are ignored rather than rejected: a client sending a mixed multimodal payload -- common
+        // even against text-only backends, since agent frameworks build one payload shape for
+        // every provider -- should still get an answer from the text that IS present.
         if (part["type"] != "text") continue;
         if (!part.contains("text") || !part["text"].is_string())
             return set_error(err, where + ".content[" + std::to_string(i) + "].text must be a string");
@@ -555,7 +576,8 @@ bool parse_message(const json& value, ChatMessage& message, size_t index, std::s
         message.role != "tool")
         return set_error(err, where + ".role is unsupported");
     if (value.contains("content")) {
-        if (!parse_content(value["content"], message.content, message.content_is_null, where, err)) return false;
+        if (!parse_content(value["content"], message.content, message.content_is_null, where, err,
+                           &message.images, message.role)) return false;
     } else {
         message.content_is_null = true;
     }

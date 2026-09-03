@@ -763,13 +763,17 @@ bool test_nontext_content_parts_are_ignored_not_rejected() {
     // A mixed multimodal payload (common even against text-only backends -- agent frameworks
     // often build one request shape for every provider) must still succeed using whatever text
     // parts are present, not hard-reject the whole request.
+    //
+    // This used to cover image_url too. It no longer can: images are honored now, so they get
+    // their own tests below. Anything still genuinely unsupported -- audio here -- must keep
+    // being skipped rather than rejected.
     json body = {
         {"model", "spark"},
         {"messages", json::array({json::object({
              {"role", "user"},
              {"content", json::array({
                   json::object({{"type", "text"}, {"text", "describe this: "}}),
-                  json::object({{"type", "image_url"}, {"image_url", json::object({{"url", "http://x/y.png"}})}}),
+                  json::object({{"type", "input_audio"}, {"input_audio", json::object({{"data", "AAA"}})}}),
                   json::object({{"type", "text"}, {"text", "please"}}),
               })},
          })})},
@@ -778,6 +782,79 @@ bool test_nontext_content_parts_are_ignored_not_rejected() {
     CHECK(parse_request(body.dump(), request));
     CHECK(request.messages.size() == 1);
     CHECK(request.messages[0].content == "describe this: please");
+    CHECK(request.messages[0].images.empty());
+    return true;
+}
+
+bool test_image_parts_render_a_marker_and_collect_urls() {
+    // Each image_url renders the marker the template emits, AT the position the part occupied,
+    // and its URL is collected in the same order. The two must stay in lockstep: the processor
+    // pairs the Nth placeholder with the Nth image to expand it to that image's token count, so
+    // an ordering or count skew here silently splices one image's embeddings over another's span.
+    json body = {
+        {"model", "spark"},
+        {"messages", json::array({json::object({
+             {"role", "user"},
+             {"content", json::array({
+                  json::object({{"type", "text"}, {"text", "A:"}}),
+                  json::object({{"type", "image_url"},
+                                {"image_url", json::object({{"url", "data:image/png;base64,AAA"}})}}),
+                  json::object({{"type", "text"}, {"text", " B:"}}),
+                  json::object({{"type", "image_url"},
+                                {"image_url", json::object({{"url", "data:image/png;base64,BBB"}})}}),
+              })},
+         })})},
+    };
+    ChatRequest request;
+    CHECK(parse_request(body.dump(), request));
+    CHECK(request.messages[0].images.size() == 2);
+    CHECK(request.messages[0].images[0] == "data:image/png;base64,AAA");
+    CHECK(request.messages[0].images[1] == "data:image/png;base64,BBB");
+    CHECK(request.messages[0].content ==
+          "A:<|vision_start|><|image_pad|><|vision_end|>"
+          " B:<|vision_start|><|image_pad|><|vision_end|>");
+    return true;
+}
+
+bool test_image_in_system_message_is_rejected() {
+    // The chat template raises on this outright; parsing mirrors it rather than building a
+    // prompt shape the model was never trained to read. "developer" is aliased to system, so it
+    // has to be refused by the SAME rule and not slip past on the role name.
+    for (const char* role : {"system", "developer"}) {
+        json body = {
+            {"model", "spark"},
+            {"messages", json::array({json::object({
+                 {"role", role},
+                 {"content", json::array({json::object({
+                      {"type", "image_url"},
+                      {"image_url", json::object({{"url", "data:image/png;base64,AAA"}})}})})},
+             })})},
+        };
+        ChatRequest request;
+        CHECK(!parse_request(body.dump(), request));
+    }
+    return true;
+}
+
+bool test_malformed_image_url_is_rejected() {
+    // A part that says it is an image but carries no usable url is a broken request, not
+    // something to skip: skipping it would drop an image the caller believes was sent and answer
+    // confidently about what is left.
+    const char* bad[] = {
+        R"([{"type":"image_url"}])",
+        R"([{"type":"image_url","image_url":{}}])",
+        R"([{"type":"image_url","image_url":{"url":123}}])",
+        R"([{"type":"image_url","image_url":"data:image/png;base64,AAA"}])",
+    };
+    for (const char* parts : bad) {
+        json body = {
+            {"model", "spark"},
+            {"messages", json::array({json::object({
+                 {"role", "user"}, {"content", json::parse(parts)}})})},
+        };
+        ChatRequest request;
+        CHECK(!parse_request(body.dump(), request));
+    }
     return true;
 }
 
@@ -1573,6 +1650,9 @@ int main() {
     if (!test_control_markup_never_leaks_as_content()) return 1;
     if (!test_trailing_whitespace_after_tool_call_is_not_malformed()) return 1;
     if (!test_nontext_content_parts_are_ignored_not_rejected()) return 1;
+    if (!test_image_parts_render_a_marker_and_collect_urls()) return 1;
+    if (!test_image_in_system_message_is_rejected()) return 1;
+    if (!test_malformed_image_url_is_rejected()) return 1;
     if (!test_developer_role_is_accepted_as_system_alias()) return 1;
     if (!test_response_format_type_validation()) return 1;
     if (!test_response_format_json_object_parses()) return 1;

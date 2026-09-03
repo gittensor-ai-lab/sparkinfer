@@ -29,6 +29,11 @@ namespace sparkinfer {
 // speculation. Anyone picking this up owns the sampling guard: Qwen35Model::generate has no
 // check against a temperature-sampling caller (see its comment), and step_job serves arbitrary
 // per-request sampling params, so multi-accept here needs one.
+// Held by pointer only, so a forward declaration keeps the vision tower out of every
+// translation unit that merely wants to submit a request.
+struct QwenVisionWeights;
+struct QwenVisionConfig;
+
 class ContinuousBatchEngine {
 public:
     struct Request {
@@ -108,6 +113,36 @@ public:
         //   * the LAST forced token costs no forward pass: its logprob comes from the position
         //     before it, and nothing is predicted after it.
         std::vector<int> forced_tokens;
+        // MULTIMODAL. One entry per image, in prompt order; vision_pos holds the absolute
+        // prompt indices the resulting embedding rows overwrite (the expanded <|image_pad|> run),
+        // concatenated across images. Empty for a text request, which is the no-op path.
+        //
+        // PIXELS, not embeddings, and deliberately so. Two reasons, and both are load-bearing:
+        //
+        // 1. The tower must run on the WORKER thread. qwen_vision_forward issues its work on the
+        //    legacy default stream, and the decode path captures CUDA graphs; the legacy stream
+        //    implicitly synchronises with capturing blocking streams, so running the tower from a
+        //    submitting HTTP thread would break capture out from under an unrelated decoding job.
+        //    Preprocessing (decode, resize, normalise) is pure CPU and stays with the caller.
+        //
+        // 2. The embeddings are staged on the SHARED model via set_pending_vision, a single slot
+        //    consumed by the next prefill. Only the worker knows which job that is. Staging from
+        //    the submitting thread would splice one request's image into another's prefill --
+        //    the same shape as the clear_prefix_cache race in ModelEngine::complete_streaming,
+        //    which corrupted the KV cache under concurrent load.
+        //
+        // Deep-copied into Job by submit_locked's `job.req = req;`, like prompt and logit_bias.
+        struct VisionImage {
+            // Shared, not owned: Request is deep-copied into Job, and a request that retries or
+            // fans out into branches copies it again. A 1536-token image is ~9 MB of patch
+            // tensor, so copying it per hop is worth avoiding; nothing mutates it after
+            // preprocessing.
+            std::shared_ptr<const std::vector<float>> pixels;
+            int grid_h = 0;
+            int grid_w = 0;
+        };
+        std::vector<VisionImage> vision_images;
+        std::vector<int> vision_pos;
     };
 
     struct Result {
@@ -161,6 +196,12 @@ public:
                                   on_token_logprob = nullptr);
 
     int num_active() const;
+
+    // Vision tower used by step_job when a request carries images. Both non-owning and expected
+    // to outlive the engine (ModelEngine owns them). Never set => a request with images is
+    // rejected rather than silently answered from its text alone, which would produce a fluent
+    // description of an image the model never saw.
+    void set_vision(const QwenVisionWeights* weights, const QwenVisionConfig* cfg);
     int num_free_kv_blocks() const;
     // Admission-time queue depth cap (SPARKINFER_MAX_QUEUE_DEPTH, 0 = unlimited). Requests
     // beyond this are rejected as overloaded before any KV allocation is attempted.
@@ -180,6 +221,8 @@ private:
     KVCacheManager* kv_;
     Scheduler scheduler_;
     SchedulePolicy policy_ = SchedulePolicy::CONTINUOUS_BATCHING;
+    const QwenVisionWeights* vision_weights_ = nullptr;
+    const QwenVisionConfig* vision_cfg_ = nullptr;
     std::thread worker_;
     std::atomic<bool> running_{false};
     mutable std::mutex mu_;
