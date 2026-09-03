@@ -26,7 +26,9 @@ def smart_resize(height, width, factor, min_pixels, max_pixels):
     return h_bar, w_bar
 
 lines = open(sys.argv[1]).read().splitlines()
-hdr = next(l for l in lines if l.startswith("#"))
+# Match the PARAMETER header specifically: the candidate also prints "# <check> ok" lines
+# for the placeholder-expansion checks, and taking the first "#" line grabbed one of those.
+hdr = next(l for l in lines if l.startswith("#") and "factor=" in l)
 factor = int(re.search(r"factor=(\d+)", hdr).group(1))
 minp = int(re.search(r"min_pixels=(\d+)", hdr).group(1))
 maxp = int(re.search(r"max_pixels=(\d+)", hdr).group(1))

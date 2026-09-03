@@ -135,4 +135,32 @@ bool qwen_vision_preprocess(const unsigned char* rgb, int height, int width,
     return true;
 }
 
+bool qwen_vision_expand_placeholders(const std::vector<int>& in, int image_token_id,
+                                     const std::vector<int>& counts,
+                                     std::vector<int>& out, std::string& err) {
+    size_t found = 0;
+    for (int t : in) if (t == image_token_id) found++;
+    if (found != counts.size()) {
+        err = "expand: prompt has " + std::to_string(found) + " image placeholder(s) but "
+            + std::to_string(counts.size()) + " image(s) were supplied";
+        return false;
+    }
+    for (size_t i = 0; i < counts.size(); i++) {
+        if (counts[i] <= 0) {
+            err = "expand: image " + std::to_string(i) + " needs a positive token count";
+            return false;
+        }
+    }
+    size_t total = in.size();
+    for (int c : counts) total += (size_t)c - 1;   // each placeholder becomes c tokens
+    out.clear();
+    out.reserve(total);
+    size_t idx = 0;
+    for (int t : in) {
+        if (t == image_token_id) out.insert(out.end(), (size_t)counts[idx++], image_token_id);
+        else out.push_back(t);
+    }
+    return true;
+}
+
 }  // namespace sparkinfer

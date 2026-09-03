@@ -37,4 +37,24 @@ bool qwen_vision_preprocess(const unsigned char* rgb, int height, int width,
 // silently misaligns the whole sequence.
 int qwen_vision_num_tokens(int grid_h, int grid_w, const QwenVisionConfig& cfg);
 
+// Expands each single image placeholder into the number of tokens its image actually needs.
+//
+// The chat template emits exactly ONE <|image_pad|> per image:
+//     "<|vision_start|><|image_pad|><|vision_end|>"
+// and the reference PROCESSOR (not the template) expands it, because only the processor knows the
+// resized grid:
+//     num_image_tokens = image_grid_thw.prod() // merge_size**2
+// which for a still image is (grid_h/merge)*(grid_w/merge) -- qwen_vision_num_tokens.
+//
+// Done in token space rather than by editing the rendered string: the template's output has
+// already been tokenized, expanding text would force a re-tokenize, and a re-tokenize can shift
+// unrelated tokens through merge effects at the seams.
+//
+// counts must have one entry per placeholder found, in order. A mismatch is an error rather than
+// a best-effort expansion: it means the caller preprocessed a different number of images than the
+// prompt refers to, and guessing which is right would produce a silently misaligned prompt.
+bool qwen_vision_expand_placeholders(const std::vector<int>& in, int image_token_id,
+                                     const std::vector<int>& counts,
+                                     std::vector<int>& out, std::string& err);
+
 }  // namespace sparkinfer
