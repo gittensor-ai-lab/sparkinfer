@@ -141,6 +141,13 @@ if(BUILD_EXAMPLES)
     add_executable(vision_splice_check examples/vision_splice_check.cpp)
     target_include_directories(vision_splice_check PRIVATE include)
     target_link_libraries(vision_splice_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    # End-to-end: a real image file through decode -> preprocess -> tower -> splice -> generate.
+    # Needs server/third_party for the vendored stb_image.h.
+    add_executable(vision_e2e examples/vision_e2e.cpp)
+    target_include_directories(vision_e2e PRIVATE include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/../server/third_party)
+    target_link_libraries(vision_e2e PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
     add_executable(vision_forward_check examples/vision_forward_check.cpp)
     target_include_directories(vision_forward_check PRIVATE include)
     target_link_libraries(vision_forward_check PRIVATE sparkinfer_runtime CUDA::cudart
