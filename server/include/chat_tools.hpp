@@ -37,6 +37,11 @@ struct ChatMessage {
     std::string name;
     std::string tool_call_id;
     std::vector<ToolCall> tool_calls;
+    // image_url values from multimodal content parts, in the order they appeared. The rendered
+    // content carries one <|vision_start|><|image_pad|><|vision_end|> per entry at the position
+    // that part occupied, so this vector and those markers stay in lockstep -- the processor, not
+    // the template, later expands each placeholder to the token count its grid needs.
+    std::vector<std::string> images;
 };
 
 enum class ResponseFormatType {

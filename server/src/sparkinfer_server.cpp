@@ -160,6 +160,26 @@ bool encode_messages(const std::string& body, std::vector<int>& ids, bool enable
     return g_tokenizer.encode_chat_request(body, ids, enable_thinking, err, request);
 }
 
+// The image placeholder's token id, resolved from the loaded tokenizer rather than hardcoded --
+// it differs between checkpoints and a wrong constant would splice embeddings over ordinary text.
+// Negative when this tokenizer has no such token, which is how a text-only model reports that it
+// cannot take images. Resolved once: it cannot change while a model is loaded.
+int image_pad_token_id() {
+    static const int id = [] {
+        const std::vector<int> ids = g_tokenizer.encode_raw("<|image_pad|>");
+        return ids.size() == 1 ? ids[0] : -1;
+    }();
+    return id;
+}
+
+// Collects every image_url in the request, in message order, matching the order the rendered
+// prompt's placeholders appear in.
+std::vector<std::string> collect_image_urls(const sparkinfer_server::ChatRequest& r) {
+    std::vector<std::string> urls;
+    for (const auto& m : r.messages) urls.insert(urls.end(), m.images.begin(), m.images.end());
+    return urls;
+}
+
 // RequestControls / parse_request_controls / should_reject_dflash_temperature now live in
 // chat_tools.hpp/.cpp (moved so `stop`/`temperature`/`seed` validation has a unit-test seam via
 // chat_tools_test, same as ChatRequest/parse_chat_request_json already had).
@@ -718,6 +738,24 @@ int main(int argc, char** argv) {
         const bool enable_thinking = sparkinfer_server::parse_enable_thinking(req.body, engine.is_qwen38());
         std::vector<int> ids;
         std::string err;
+        // Images would render a bare <|image_pad|> into these ids: the count each image really
+        // needs depends on its resized grid, which only the preprocessor knows. Reporting the
+        // unexpanded number would understate the prompt by hundreds or thousands of tokens, so
+        // this says so rather than returning a wrong count.
+        {
+            sparkinfer_server::ChatRequest probe;
+            std::string perr;
+            if (encode_messages(req.body, ids, enable_thinking, perr, &probe) &&
+                !collect_image_urls(probe).empty()) {
+                g_requests_client_error++;
+                res.status = 400;
+                res.set_content("{\"error\":{\"message\":\"/v1/tokenize does not support image "
+                                "content parts; token counts for images depend on the resized "
+                                "grid\"}}", "application/json");
+                return;
+            }
+            ids.clear();
+        }
         if (!encode_messages(req.body, ids, enable_thinking, err)) {
             res.status = 400;
             res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}", "application/json");
@@ -783,6 +821,19 @@ int main(int argc, char** argv) {
             const bool enable_thinking =
                 sparkinfer_server::parse_enable_thinking(req.body, engine.is_qwen38());
             std::string err;
+            // Scoring an image prompt would need the tower run and the placeholders expanded.
+            // Silently dropping the image and returning logprobs for the text alone is the worst
+            // option for an endpoint that exists to be compared against another copy of itself.
+            {
+                sparkinfer_server::ChatRequest probe;
+                std::string perr;
+                if (encode_messages(req.body, prompt_ids, enable_thinking, perr, &probe) &&
+                    !collect_image_urls(probe).empty()) {
+                    fail(400, "/v1/score does not support image content parts");
+                    return;
+                }
+                prompt_ids.clear();
+            }
             if (!encode_messages(req.body, prompt_ids, enable_thinking, err)) {
                 fail(400, err);
                 return;
@@ -944,12 +995,38 @@ int main(int argc, char** argv) {
 
                  std::vector<int> prompt_ids;
                  sparkinfer_server::ChatRequest chat_request;
+                 sparkinfer_server::PreparedImages prepared;
                  if (!encode_messages(req.body, prompt_ids, enable_thinking, err, &chat_request)) {
                      g_requests_client_error++;
                      res.status = 400;
                      res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
                                      "application/json");
                      return;
+                 }
+                 // Images: decode, preprocess, and expand each placeholder to the token count
+                 // its grid needs. Deliberately BEFORE the max_seq check below -- a 1024x1536
+                 // image expands one placeholder into 1536 tokens, so checking the unexpanded
+                 // prompt would admit a request that cannot fit and fail it deep in prefill.
+                 {
+                     const std::vector<std::string> urls =
+                         collect_image_urls(chat_request);
+                     if (!urls.empty()) {
+                         const int pad_id = image_pad_token_id();
+                         std::string ierr;
+                         if (pad_id < 0) {
+                             ierr = "this model's tokenizer has no image placeholder token; "
+                                    "image input is not supported";
+                         } else if (!engine.prepare_images(urls, pad_id, prompt_ids, prepared, ierr)) {
+                             // ierr already names which image and why.
+                         }
+                         if (!ierr.empty()) {
+                             g_requests_client_error++;
+                             res.status = 400;
+                             res.set_content("{\"error\":{\"message\":\"" + json_escape(ierr) + "\"}}",
+                                             "application/json");
+                             return;
+                         }
+                     }
                  }
                  // Presence of a tool protocol requires strict, buffered parsing even when
                  // tool_choice=none. The latter disables execution, not output validation:
@@ -996,6 +1073,10 @@ int main(int argc, char** argv) {
                      res.set_chunked_content_provider(
                          "text/event-stream",
                          [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
+                          // BY VALUE, like prompt_ids beside it: this provider runs after the
+                          // handler returns, so a reference would dangle. Cheap -- PreparedImages
+                          // shares its pixel buffers rather than owning them.
+                          prepared,
                           chat_request, tool_protocol, json_mode_active,
                           include_usage = controls.include_usage || always_stream_usage(), stop = controls.stop,
                           temperature = controls.temperature, seed = controls.seed,
@@ -1070,6 +1151,10 @@ int main(int argc, char** argv) {
                              // valid attempt is confirmed.
                              auto run_json_mode_branch = [&](int ci, uint64_t branch_seed, BranchOutcome* out) {
                                  std::vector<int> cur_prompt_ids = prompt_ids;
+                                 // Per-branch copy: the continuation below re-renders the prompt,
+                                 // which moves every placeholder, and branches run concurrently.
+                                 // The copy is cheap -- the pixel buffers are shared, not cloned.
+                                 sparkinfer_server::PreparedImages cur_images = prepared;
                                  sparkinfer_server::ChatRequest cur_request = chat_request;
                                  sparkinfer_server::CompletionResult outcome;
                                  bool ok = false;
@@ -1097,7 +1182,8 @@ int main(int argc, char** argv) {
                                      };
                                      outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok,
                                          temperature, branch_seed, top_k, top_p, presence_penalty,
-                                         frequency_penalty, logit_bias);
+                                         frequency_penalty, logit_bias, false, 0, nullptr, {},
+                                         &cur_images);
                                      out->prompt_tokens += (long long)cur_prompt_ids.size();
                                      out->completion_tokens += (long long)ids.size();
                                      if (outcome.cancelled && !stopped_by_sequence) {
@@ -1140,6 +1226,17 @@ int main(int argc, char** argv) {
                                      if (attempt == 1) {
                                          cur_request = build_retry_request(chat_request, out->parsed.content, validation_err);
                                          cur_prompt_ids = g_tokenizer.encode_augmented(cur_request, enable_thinking);
+                                         // Same re-expansion as the non-streaming branch: the
+                                         // rebuilt prompt's placeholders moved.
+                                         if (!cur_images.images.empty()) {
+                                             std::string rerr;
+                                             if (!engine.reexpand_images(image_pad_token_id(),
+                                                                         cur_prompt_ids, cur_images, rerr)) {
+                                                 out->fail = BranchOutcome::Fail::server_error;
+                                                 out->fail_message = "image re-expansion failed: " + rerr;
+                                                 return;
+                                             }
+                                         }
                                      }
                                  }
                                  if (!ok) {
@@ -1239,7 +1336,8 @@ int main(int argc, char** argv) {
                                                   : nullptr;
                                  const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
-                                     logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob);
+                                     logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob,
+                                     {}, &prepared);
                                  out->prompt_tokens = (long long)prompt_ids.size();
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
@@ -1505,6 +1603,7 @@ int main(int argc, char** argv) {
                          // anywhere -- resubmitting the identical prompt would just reproduce the
                          // same invalid output) before giving up.
                          std::vector<int> cur_prompt_ids = prompt_ids;
+                         sparkinfer_server::PreparedImages cur_images = prepared;
                          sparkinfer_server::ChatRequest cur_request = chat_request;
                          bool ok = false;
                          std::string validation_err;
@@ -1531,7 +1630,8 @@ int main(int argc, char** argv) {
                              };
                              outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok,
                                  controls.temperature, branch_seed, controls.top_k, controls.top_p,
-                                 controls.presence_penalty, controls.frequency_penalty, controls.logit_bias);
+                                 controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
+                                 false, 0, nullptr, {}, &cur_images);
                              out.prompt_tokens += (long long)cur_prompt_ids.size();
                              out.completion_tokens += (long long)ids.size();
                              if (!outcome.error.empty()) {
@@ -1577,6 +1677,19 @@ int main(int argc, char** argv) {
                              if (attempt == 1) {
                                  cur_request = build_retry_request(chat_request, parsed.content, validation_err);
                                  cur_prompt_ids = g_tokenizer.encode_augmented(cur_request, enable_thinking);
+                                 // The rebuilt prompt carries one bare placeholder per image
+                                 // again, at new offsets -- re-expand, or the splice lands on the
+                                 // wrong tokens.
+                                 if (!cur_images.images.empty()) {
+                                     std::string rerr;
+                                     if (!engine.reexpand_images(image_pad_token_id(), cur_prompt_ids,
+                                                                 cur_images, rerr)) {
+                                         out.http_status = 500;
+                                         out.fail = NonStreamBranchOutcome::Fail::server_error;
+                                         out.http_error = "image re-expansion failed: " + rerr;
+                                         return out;
+                                     }
+                                 }
                              }
                          }
                          if (!ok) {
@@ -1620,7 +1733,8 @@ int main(int argc, char** argv) {
                          outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok,
                              controls.temperature, branch_seed, controls.top_k, controls.top_p,
                              controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
-                             controls.logprobs, controls.top_logprobs, maybe_nonstream_on_tok_logprob);
+                             controls.logprobs, controls.top_logprobs, maybe_nonstream_on_tok_logprob,
+                             {}, &prepared);
                          // Defensive clamp -- should already hold, cheap insurance against any
                          // subtle off-by-one between the two accumulation paths above.
                          if (logprob_entries.size() > outcome.tokens.size())
