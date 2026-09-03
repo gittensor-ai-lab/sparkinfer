@@ -85,6 +85,8 @@ def run_tower(st, cfg, pixels, grid_h, grid_w, trace=None):
 
     # learned position embedding, bilinearly resampled from the 48x48 table to this grid --
     # Qwen3-VL interpolates rather than truncating, so a non-48 grid is not a slice.
+    # The table is 48x48. At a 48x48 patch grid (a 768x768 image) the resample below is the
+    # identity, which is the shape to validate at first -- it removes interpolation as a variable.
     pos = st.get("model.visual.pos_embed.weight")                # [2304, H]
     side = int(round(pos.shape[0] ** 0.5))
     pg = pos.reshape(side, side, H)
@@ -148,6 +150,12 @@ def main():
                     ((yy + xx) / max(a.h + a.w - 2, 1)) * 2 - 1]).astype(np.float32)  # [C,H,W]
     # patchify: [C,H,W] -> [gh*gw, C*T*P*P]; a still image repeats across the temporal axis.
     pt = img.reshape(C, gh, P, gw, P).transpose(1, 3, 0, 2, 4)           # [gh,gw,C,P,P]
+    # A still image is REPEATED across the temporal axis, not zero-padded. Verified against the
+    # released weights rather than assumed: the Conv3d's two temporal slices are cosine 0.997
+    # similar (max|t0-t1| 0.005 against absmax 0.075). Filters that similar can only arise if both
+    # slices always saw the same input in training. Zero-padding slice 1 would have left it
+    # without image gradient -- it would look random or near-zero, not 99.7% correlated with
+    # slice 0. Getting this backwards halves or doubles the patch-embed signal.
     pt = np.repeat(pt[:, :, :, None], T, axis=3)                         # [gh,gw,C,T,P,P]
     pixels = pt.reshape(gh * gw, C * T * P * P).astype(np.float32)
 
