@@ -46,6 +46,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 
+#include <cstdio>
 #include <cstdlib>
 
 namespace sparkinfer {
@@ -311,6 +312,35 @@ inline int attn_smem_pad() {
     return v;
 }
 
+// wmma's 16x16x16 int8 fragment can only reach the K=16 hardware shape: every mma_sync lowers to
+// IMMA.16816. sm_120 also has IMMA.16832 -- the same tensor throughput per instruction-pair but
+// twice the K per instruction -- so issuing mma.m16n8k32 directly halves the QK MMA instruction
+// stream, and its 16x32 A operand halves the Q ldmatrix count with it (one 16-byte-per-lane
+// ldmatrix.x4 where wmma needed two 8-byte fragment loads). Same lever, and the same reasoning,
+// as the m16n8k32 path in prefill_moe_q.cu: this kernel is issue- and MIO-bound, not
+// throughput-bound, so instruction count is what it pays in.
+//
+// BIT-IDENTICAL: int32 accumulation is exact and order-independent, and the operands are the same
+// bytes out of the same s_qi rows and the same K pages -- only the grouping of the adds changes.
+//
+// Only the QK product converts. PV cannot: mma.m16n8k32 is .row.col, so BOTH operands need the
+// reduction axis contiguous, and PV reduces over keys while the V pool is [key][dim] -- V's key
+// axis is strided by n_kv_heads*HEAD_DIM. wmma's row_major B, which does not require that, is
+// what lets V be fed to the tensor cores straight out of the paged pool.
+template <bool B> struct pf_bool { static constexpr bool value = B; };
+
+__device__ __forceinline__ void pf_ldsm_x4(unsigned (&r)[4], unsigned a) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void pf_mma_16832(int (&d)[4], const unsigned (&a)[4],
+                                             unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
 template <int HEAD_DIM, int GROUP_BLKS, int RQH>
 __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 ? 2 : 1))) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
@@ -349,12 +379,25 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     // s_corr -- so the landing zone costs nothing on top of the score buffer it lands in. That
     // is what makes RQH=3 fit: 46,528 B against the 51,200 a second resident block needs, where
     // holding both buffers is 62,912 and caps this kernel at one block per SM.
-    constexpr int SBLK = (RQH * BM * GN > BM * HEAD_DIM) ? RQH * BM * GN : BM * HEAD_DIM;
-    float* s_s  = reinterpret_cast<float*>(s_pi + (size_t)RQH * BM * pld); // [RQH][BM][GN]
+    // Score-plane row stride. GN alone is a whole multiple of the 128-byte bank row, so all 16
+    // rows of a QK output tile start on bank 0 and store_matrix_sync replays 8-way -- the defect
+    // attn_smem_pad() fixes for the two ldmatrix operands, on the one buffer it was never applied
+    // to. +4 floats puts the 8 rows a single store phase touches on 8 different starting banks
+    // (2-way; 1-way is unreachable, 8 row-starts x 4 column-pairs cannot tile 32 banks), and
+    // keeps the 16-byte alignment the vectorized softmax load needs, for 768 B.
+    // It MUST be a compile-time constant: passing the stride as a kernel argument costs
+    // store_matrix_sync its immediate offsets and measured -4.7% on its own, swamping the
+    // conflict it removes.
+    constexpr int SPLD = GN + 4;
+    constexpr int SBLK = (RQH * BM * SPLD > BM * HEAD_DIM) ? RQH * BM * SPLD : BM * HEAD_DIM;
+    float* s_s  = reinterpret_cast<float*>(s_pi + (size_t)RQH * BM * pld); // [RQH][BM][SPLD]
     float* s_o  = s_s;                                               // [BM][HEAD_DIM] epilogue landing
-    float* s_ks = s_s + SBLK;                                        // [GN] shared
-    float* s_vs = s_ks + GN;                                         // [GN] shared
-    float* s_qs = s_vs + GN;                                         // [RQH][BM]
+    // The K and V dequant scales arrive as __half and are only ever multiplied into a float, so
+    // they stay __half in shared: half the bytes, and -- because the softmax hoists a lane's whole
+    // column set into registers -- half the registers that hoist costs.
+    __half* s_ks = reinterpret_cast<__half*>(s_s + SBLK);            // [GN] shared
+    __half* s_vs = s_ks + GN;                                        // [GN] shared
+    float* s_qs = reinterpret_cast<float*>(s_vs + GN);               // [RQH][BM]
     float* s_ps = s_qs + RQH * BM;                                   // [RQH][BM]
     float* s_m  = s_ps + RQH * BM;                                   // [RQH][BM]
     float* s_l  = s_m + RQH * BM;                                    // [RQH][BM]
@@ -367,6 +410,20 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
         for (int i = lane; i < 256; i += 32) tile[i] = ((i >> 4) << 8) | (i & 15);
         __syncwarp();
         load_matrix_sync(idxf, tile, 16, mem_row_major);
+    }
+    // A 16x16 accumulator gives every lane 8 elements spread over exactly TWO query rows (a row's
+    // 16 elements sit in 4 lanes, 4 each), so the per-row P quantum and the online-softmax
+    // correction the PV epilogue applies are two values per head, not eight. Resolve which of the
+    // two each element belongs to once, from idxf, and the epilogue's 2*8*RQH shared loads per
+    // group iteration become 2*2*RQH register reads. Nothing here assumes a layout: the rows and
+    // the mask are read out of the index fragment itself.
+    const int rlo = idxf.x[0] >> 8;
+    int rhi = rlo;
+    unsigned hi_mask = 0u;
+    #pragma unroll
+    for (int e = 1; e < 8; e++) {
+        const int re = idxf.x[e] >> 8;
+        if (re != rlo) { rhi = re; hi_mask |= 1u << e; }
     }
     #pragma unroll
     for (int h = 0; h < RQH; h++)
@@ -392,7 +449,12 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
             const float d = amax / 127.0f;
-            if (lane == 0) s_qs[h * BM + r] = d;
+            // The softmax scale and log2(e) are per-kernel constants and the Q scale is per row,
+            // so all three fold into one number here -- once per row per block instead of once
+            // per score. Folding log2(e) in is what lets the online softmax use a bare ex2:
+            // __expf(x) is `ex2.approx(x * log2e)`, and every x it is given has already been
+            // multiplied by this row scale.
+            if (lane == 0) s_qs[h * BM + r] = d * scale * 1.4426950408889634f;
             #pragma unroll
             for (int e = 0; e < QE; e++)
                 s_qi[((size_t)h * BM + r) * qld + lane + e * 32] =
@@ -401,6 +463,18 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     }
     if (tid < RQH * BM) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
     __syncthreads();
+
+    // ldmatrix.x4 lane->address mapping for the m16n8k32 A operand: the four 8x8 b16 matrices are
+    // (rows 0-7 | rows 8-15) x (bytes 0-15 | bytes 16-31) of a 16x32 tile, so lane l supplies the
+    // start of row (l & 15) at byte column (l >> 4) * 16. Only the k-step offset changes inside
+    // the loop, so the whole per-head base is hoisted out of it.
+    static_assert(HEAD_DIM % 32 == 0, "m16n8k32 needs whole 32-byte k steps");
+    constexpr int KSTEPS = HEAD_DIM / 32;
+    unsigned qa_base[RQH];
+    #pragma unroll
+    for (int h = 0; h < RQH; h++)
+        qa_base[h] = (unsigned)__cvta_generic_to_shared(
+            s_qi + ((size_t)h * BM + (lane & 15)) * qld + (lane >> 4) * 16);
 
     const int last_q = q_pos0 + min(qbase + BM - 1, n_tokens - 1);
     int blk_rs = 0;
@@ -420,98 +494,205 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                 const int lb = (k0 / block_size) + j / 16, within = j & 15;
                 const int pb = block_table[lb];
                 const size_t si = (size_t)(pb * block_size + within) * SLD + kvh;
-                s_ks[j] = __half2float(k_scale[si]);
-                s_vs[j] = __half2float(v_scale[si]);
+                s_ks[j] = k_scale[si];
+                s_vs[j] = v_scale[si];
             }
 
             // ---- QK: load each K page fragment ONCE, feed RQH q-heads ----
+            // One 16x32 K slice covers two m16n8k32 B operands (keys 0-7 and 8-15). The B operand
+            // is n x k col-major, which for K[key][dim] means lane l holds key (l>>2), dims
+            // (l&3)*4 .. +3 and the same four 16 bytes later -- two 4-byte loads straight out of
+            // the paged pool, exactly as before with no staging.
             if (warp < gblk) {
                 const int pb = block_table[(k0 / block_size) + warp];
                 const signed char* kb =
                     k_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM;
-                fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
-                fragment<matrix_b, 16, 16, 16, signed char, col_major> bf;
-                fragment<accumulator, 16, 16, 16, int> cf[RQH];
-                #pragma unroll
-                for (int h = 0; h < RQH; h++) fill_fragment(cf[h], 0);
-                #pragma unroll
-                for (int ks = 0; ks < KH; ks++) {
-                    load_matrix_sync(bf, kb + ks * 16, KVLD);        // K fragment: loaded once
-                    #pragma unroll
-                    for (int h = 0; h < RQH; h++) {
-                        load_matrix_sync(af, s_qi + ((size_t)h * BM) * qld + ks * 16, qld);
-                        mma_sync(cf[h], af, bf, cf[h]);
-                    }
-                }
+                const signed char* kl = kb + (size_t)(lane >> 2) * KVLD + (lane & 3) * 4;
+                int acc[RQH][2][4];
                 #pragma unroll
                 for (int h = 0; h < RQH; h++)
-                    store_matrix_sync(reinterpret_cast<int*>(s_s) + (size_t)h * BM * GN + warp * 16,
-                                      cf[h], GN, mem_row_major);
+                    #pragma unroll
+                    for (int t = 0; t < 2; t++)
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++) acc[h][t][e] = 0;
+                #pragma unroll
+                for (int kk = 0; kk < KSTEPS; kk++) {
+                    unsigned bfr[2][2];
+                    #pragma unroll
+                    for (int t = 0; t < 2; t++) {
+                        const signed char* p = kl + (size_t)t * 8 * KVLD + kk * 32;
+                        bfr[t][0] = *reinterpret_cast<const unsigned*>(p);
+                        bfr[t][1] = *reinterpret_cast<const unsigned*>(p + 16);
+                    }
+                    #pragma unroll
+                    for (int h = 0; h < RQH; h++) {
+                        unsigned a[4];
+                        pf_ldsm_x4(a, qa_base[h] + (unsigned)(kk * 32));
+                        #pragma unroll
+                        for (int t = 0; t < 2; t++)
+                            pf_mma_16832(acc[h][t], a, bfr[t][0], bfr[t][1]);
+                    }
+                }
+                // m16n8k32's D layout: lane holds rows (l>>2) and (l>>2)+8, columns 2*(l&3) and
+                // +1 of each 16x8 tile. The two adjacent columns make each half of it one 8-byte
+                // store, so the plane is written in 4 stores per head instead of 8.
+                const int dr = lane >> 2, dc = 2 * (lane & 3);
+                #pragma unroll
+                for (int h = 0; h < RQH; h++) {
+                    int* sp = reinterpret_cast<int*>(s_s) + (size_t)h * BM * SPLD + warp * 16;
+                    #pragma unroll
+                    for (int t = 0; t < 2; t++) {
+                        *reinterpret_cast<int2*>(sp + dr * SPLD + t * 8 + dc) =
+                            make_int2(acc[h][t][0], acc[h][t][1]);
+                        *reinterpret_cast<int2*>(sp + (dr + 8) * SPLD + t * 8 + dc) =
+                            make_int2(acc[h][t][2], acc[h][t][3]);
+                    }
+                }
             }
             __syncthreads();
 
+            // Every mask term is monotone in the key index, so a group that is FULL and whose
+            // last key precedes the first query row's causal bound needs no mask at all: the
+            // per-column window/causal/bounds test, six integer ops on every one of the
+            // BM*RQH*GN scores, disappears. At 256k almost every group is interior -- a query
+            // tile at position p has p/GN interior groups and at most one masked one -- so this
+            // is the common path, not the rare one.
+            const bool grp_full =
+                (nk == GN) && (qbase + BM <= n_tokens) && (k0 + GN <= q_pos0 + qbase + 1) &&
+                (win_blocks <= 0 || k0 >= blk_rs || k0 + GN <= block_size);
+
             // ---- online softmax per head; quantize P' ----
+            // Column ownership inside the warp is VECTOR, not strided. Lane `lane` used to own
+            // the set {lane + 32u}, one column per 32, so every one of this section's shared
+            // accesses was a separate 4-byte instruction: GN/32 score loads, GN/32 K-scale
+            // loads, GN/32 V-scale loads and GN/32 single-byte P' stores, per query row and per
+            // q-head. Giving the lane VW CONSECUTIVE columns instead makes each of those a
+            // single 16-byte load or a single packed 4-byte store, so the whole section issues
+            // 4x fewer shared instructions for exactly the same bytes. The access stays
+            // conflict-free: 32 lanes x 16 B is four 128-byte bank rows, which the hardware
+            // already splits into four phases, and the packed byte store lands in one row.
+            // The padding note above measures the tensor pipe at 20.5% with the stalls on
+            // mio_throttle and short_scoreboard, i.e. this kernel is bound by shared-memory
+            // INSTRUCTIONS and their latency, not by bytes or by math -- so removing three of
+            // every four is the axis.
+            //
+            // Only the softmax's `sum` is affected numerically: max and |P'|max are exact under
+            // regrouping, the per-row P' quantum pd = pamax/127 is therefore identical, and so
+            // are the int8 P' values and the whole PV accumulation. The one changed quantity is
+            // the last-bit rounding of the softmax denominator s_l, which each lane now
+            // accumulates over a different column subset before the same butterfly.
+            constexpr int VW = 4;                       // consecutive columns per lane per step
+            constexpr int VU = GN / (32 * VW);          // vector steps per (row, q-head)
+            static_assert(GN % (32 * VW) == 0, "GN must cover whole vector steps");
+            // The K and V dequant scales for a lane's columns depend only on (lane, step), so
+            // all RQH heads -- and every row this warp owns -- read the same values. Hoisting
+            // them out of the head loop turns 2*RQH*(BM/WARPS) vector loads per group into 2.
+            __half2 ksr[GN / 64], vsr[GN / 64];
             #pragma unroll
-            for (int h = 0; h < RQH; h++) {
-                const int qh_head = head0 + h;
-                const int* s_si = reinterpret_cast<const int*>(s_s) + (size_t)h * BM * GN;
-                signed char* s_pih = s_pi + (size_t)h * BM * pld;
+            for (int v = 0; v < VU; v++) {
+                const int t0 = (v * 32 + lane) * VW;
+                const uint2 kw = *reinterpret_cast<const uint2*>(s_ks + t0);
+                const uint2 vw = *reinterpret_cast<const uint2*>(s_vs + t0);
+                ksr[v * 2 + 0] = *reinterpret_cast<const __half2*>(&kw.x);
+                ksr[v * 2 + 1] = *reinterpret_cast<const __half2*>(&kw.y);
+                vsr[v * 2 + 0] = *reinterpret_cast<const __half2*>(&vw.x);
+                vsr[v * 2 + 1] = *reinterpret_cast<const __half2*>(&vw.y);
+            }
+            // u is a compile-time constant in every unrolled use below, so the half picked out of
+            // the pair resolves statically and the pairs stay in registers.
+            #define PF_KS(u) (((u) & 1) ? __high2float(ksr[(u) >> 1]) : __low2float(ksr[(u) >> 1]))
+            #define PF_VS(u) (((u) & 1) ? __high2float(vsr[(u) >> 1]) : __low2float(vsr[(u) >> 1]))
+            auto softmax_group = [&](auto FULLT) {
+                constexpr bool FULL = decltype(FULLT)::value;
                 #pragma unroll
-                for (int rr = 0; rr < BM / WARPS; rr++) {
-                    const int r = warp * (BM / WARPS) + rr;
-                    const int qtok = qbase + r;
-                    float sc[GN / 32], mx = -1e30f;
+                for (int h = 0; h < RQH; h++) {
+                    const int* s_si = reinterpret_cast<const int*>(s_s) + (size_t)h * BM * SPLD;
+                    signed char* s_pih = s_pi + (size_t)h * BM * pld;
                     #pragma unroll
-                    for (int u = 0; u < GN / 32; u++) {
-                        const int t = lane + u * 32, gtok = k0 + t;
-                        const bool live = (t < gblk * 16) && (gtok < hi) && (qtok < n_tokens) &&
-                                          (gtok <= q_pos0 + qtok) &&
-                                          (win_blocks <= 0 || gtok < block_size || gtok >= blk_rs);
-                        sc[u] = live ? (float)s_si[r * GN + t] * s_qs[h * BM + r] * s_ks[t] * scale : -1e30f;
-                        mx = fmaxf(mx, sc[u]);
-                    }
-                    #pragma unroll
-                    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-                    const float m_old = s_m[h * BM + r], m_new = fmaxf(m_old, mx), corr = __expf(m_old - m_new);
-                    float sum = 0.f, pamax = 0.f;
-                    // P' stays in registers between the exp and the quantize. Lane `lane` owns
-                    // exactly columns {lane + 32u}, and the quantize below re-reads exactly those
-                    // columns, so the round trip through s_sh that the two loops used to share was
-                    // a store and a reload of a value the thread already held. Dropping it removes
-                    // two of the three 4-byte shared accesses this section makes per score. The
-                    // padding note above measures the tensor pipe at 20.5% with the stalls on
-                    // mio_throttle, so shared-memory instructions are the currency here, not math
-                    // and not K/V bytes -- worth +2.7% at ctx=262144 on its own.
-                    // Arithmetic is untouched (a float survives shared memory exactly), so every
-                    // tier of this kernel stays bit-identical to what it produced before.
-                    float pvr[GN / 32];
-                    #pragma unroll
-                    for (int u = 0; u < GN / 32; u++) {
-                        const int t = lane + u * 32;
-                        float pv = 0.f;
-                        if (sc[u] > -1e29f) {
-                            const float p = __expf(sc[u] - m_new);
-                            sum += p; pv = p * s_vs[t]; pamax = fmaxf(pamax, fabsf(pv));
+                    for (int rr = 0; rr < BM / WARPS; rr++) {
+                        const int r = warp * (BM / WARPS) + rr;
+                        const int qtok = qbase + r;
+                        const float qs = s_qs[h * BM + r];
+                        float sc[GN / 32], mx = -1e30f;
+                        #pragma unroll
+                        for (int v = 0; v < VU; v++) {
+                            const int t0 = (v * 32 + lane) * VW;
+                            const int4 raw = *reinterpret_cast<const int4*>(s_si + r * SPLD + t0);
+                            const int rw[VW] = {raw.x, raw.y, raw.z, raw.w};
+                            #pragma unroll
+                            for (int j = 0; j < VW; j++) {
+                                const int u = v * VW + j;
+                                if constexpr (FULL) {
+                                    sc[u] = (float)rw[j] * qs * PF_KS(u);
+                                } else {
+                                    const int t = t0 + j, gtok = k0 + t;
+                                    const bool live =
+                                        (t < gblk * 16) && (gtok < hi) && (qtok < n_tokens) &&
+                                        (gtok <= q_pos0 + qtok) &&
+                                        (win_blocks <= 0 || gtok < block_size || gtok >= blk_rs);
+                                    sc[u] = live ? (float)rw[j] * qs * PF_KS(u) : -1e30f;
+                                }
+                                mx = fmaxf(mx, sc[u]);
+                            }
                         }
-                        pvr[u] = pv;
-                    }
-                    #pragma unroll
-                    for (int o = 16; o > 0; o >>= 1) {
-                        sum   += __shfl_xor_sync(0xffffffffu, sum, o);
-                        pamax  = fmaxf(pamax, __shfl_xor_sync(0xffffffffu, pamax, o));
-                    }
-                    const float pd = pamax / 127.0f;
-                    if (lane == 0) { s_m[h * BM + r] = m_new; s_l[h * BM + r] = s_l[h * BM + r] * corr + sum;
-                                     s_ps[h * BM + r] = pd; s_corr[h * BM + r] = corr; }
-                    #pragma unroll
-                    for (int u = 0; u < GN / 32; u++) {
-                        const int t = lane + u * 32;
-                        if (t < gblk * 16)
-                            s_pih[r * GN + t] =
-                                (signed char)((pamax == 0.f) ? 0 : (int)roundf(pvr[u] / pd));
+                        #pragma unroll
+                        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                        const float m_old = s_m[h * BM + r], m_new = fmaxf(m_old, mx),
+                                    corr = exp2f(m_old - m_new);
+                        float sum = 0.f, pamax = 0.f;
+                        // P' overwrites the score register it was computed from: sc[u] is read at
+                        // the top of the iteration and dead by the bottom, so the separate P'
+                        // array the register staging used to need is free.
+                        #pragma unroll
+                        for (int u = 0; u < GN / 32; u++) {
+                            float pv = 0.f;
+                            if (FULL || sc[u] > -1e29f) {
+                                const float p = exp2f(sc[u] - m_new);
+                                // p is an exponential and the V dequant scale is an absmax/127,
+                                // so pv is non-negative by construction and |pv| is pv.
+                                sum += p; pv = p * PF_VS(u); pamax = fmaxf(pamax, pv);
+                            }
+                            sc[u] = pv;
+                        }
+                        #pragma unroll
+                        for (int o = 16; o > 0; o >>= 1) {
+                            sum   += __shfl_xor_sync(0xffffffffu, sum, o);
+                            pamax  = fmaxf(pamax, __shfl_xor_sync(0xffffffffu, pamax, o));
+                        }
+                        const float pd = pamax / 127.0f;
+                        // The quantum is per row, so its reciprocal and its zero test are per row
+                        // too: an all-zero row makes ipd zero and every P' falls out as zero,
+                        // which is what the per-column ternary used to spell out GN/32 times.
+                        const float ipd = (pamax == 0.f) ? 0.f : 127.0f / pamax;
+                        if (lane == 0) { s_m[h * BM + r] = m_new; s_l[h * BM + r] = s_l[h * BM + r] * corr + sum;
+                                         s_ps[h * BM + r] = pd; s_corr[h * BM + r] = corr; }
+                        // gblk*16 is a multiple of 16 and t0 of VW, so a lane's VW columns are
+                        // either all live or all past the group -- the per-column bound becomes
+                        // one test. __float2int_rn is the single cvt.rni the PV operand wants;
+                        // roundf is ties-away-from-zero and lowers to a five-instruction sequence
+                        // for a quantum that is already a per-row estimate. The bf16 sibling
+                        // kernel has always quantized P' this way.
+                        #pragma unroll
+                        for (int v = 0; v < VU; v++) {
+                            const int t0 = (v * 32 + lane) * VW;
+                            if (FULL || t0 < gblk * 16) {
+                                unsigned packed = 0u;
+                                #pragma unroll
+                                for (int j = 0; j < VW; j++) {
+                                    const signed char q8 =
+                                        (signed char)__float2int_rn(sc[v * VW + j] * ipd);
+                                    packed |= ((unsigned)(unsigned char)q8) << (8 * j);
+                                }
+                                *reinterpret_cast<unsigned*>(s_pih + r * GN + t0) = packed;
+                            }
+                        }
                     }
                 }
-            }
+            };
+            if (grp_full) softmax_group(pf_bool<true>{});
+            else          softmax_group(pf_bool<false>{});
+            #undef PF_KS
+            #undef PF_VS
             __syncthreads();
 
             // ---- PV: load each V tile fragment ONCE, feed RQH q-heads ----
@@ -535,13 +716,16 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                     }
                 }
                 #pragma unroll
-                for (int h = 0; h < RQH; h++)
+                for (int h = 0; h < RQH; h++) {
+                    const float ps_lo = s_ps[h * BM + rlo],   ps_hi = s_ps[h * BM + rhi];
+                    const float cr_lo = s_corr[h * BM + rlo], cr_hi = s_corr[h * BM + rhi];
                     #pragma unroll
                     for (int e = 0; e < 8; e++) {
-                        const int r = idxf.x[e] >> 8;
-                        ofr[h][dd].x[e] = __fmaf_rn((float)cf[h].x[e], s_ps[h * BM + r],
-                                                    __fmul_rn(ofr[h][dd].x[e], s_corr[h * BM + r]));
+                        const bool up = (hi_mask >> e) & 1u;
+                        ofr[h][dd].x[e] = __fmaf_rn((float)cf[h].x[e], up ? ps_hi : ps_lo,
+                                                    __fmul_rn(ofr[h][dd].x[e], up ? cr_hi : cr_lo));
                     }
+                }
             }
         }
     };
@@ -591,11 +775,13 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
     // measured as -45% at ctx=16384 and -34% on the Qwen3.6 guard at ctx=4096, with no diagnostic.
     const int qld_max = HD + attn_smem_pad(), pld_max = GN + attn_smem_pad();
     // s_o lands in s_s (dead by the epilogue), so the pair costs the larger of the two.
-    constexpr int SBLK = (RQH * BM * GN > BM * HD) ? RQH * BM * GN : BM * HD;
+    constexpr int SPLD = GN + 4;
+    constexpr int SBLK = (RQH * BM * SPLD > BM * HD) ? RQH * BM * SPLD : BM * HD;
     const size_t sm = (size_t)RQH * BM * qld                         // s_qi (int8, padded)
                     + (size_t)RQH * BM * pld                         // s_pi (int8, padded)
                     + (size_t)SBLK * sizeof(float)                   // s_s, with s_o overlaid
-                    + (size_t)(2 * GN + 5 * RQH * BM) * sizeof(float);
+                    + (size_t)2 * GN * sizeof(__half)                // s_ks, s_vs
+                    + (size_t)5 * RQH * BM * sizeof(float);
     // At RQH=4 this is 76,032 B — past the 48 KB default, so the opt-in below is
     // REQUIRED for the launch to be valid, and both it and the launch itself have to
     // be checked: a discarded failure here used to report success to the caller, which
@@ -613,7 +799,8 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
         const size_t sm_max = (size_t)RQH * BM * qld_max
                             + (size_t)RQH * BM * pld_max
                             + (size_t)SBLK * sizeof(float)
-                            + (size_t)(2 * GN + 5 * RQH * BM) * sizeof(float);
+                            + (size_t)2 * GN * sizeof(__half)
+                            + (size_t)5 * RQH * BM * sizeof(float);
         const cudaError_t ce = cudaFuncSetAttribute(
             pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_max);
@@ -628,7 +815,21 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
         block_size, max_blocks_per_seq, scale, win_blocks, qld, pld, q_pos0);
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek —
     // rather than get — so a pre-existing sticky error is not silently cleared here.
-    return cudaPeekAtLastError() == cudaSuccess;
+    const bool ok = cudaPeekAtLastError() == cudaSuccess;
+    // SPARKINFER_PREFILL_ATTN_TIER=1 prints the tier that ACTUALLY launched, once per
+    // instantiation. A refused wide launch falls through to the next tier silently, which reads
+    // exactly like "the change did nothing" -- host-side and once, so it costs nothing.
+    static const bool tier_dbg = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_TIER");
+        return e && e[0] != '0';
+    }();
+    static bool announced[kMaxDevices] = {false};
+    if (tier_dbg && !announced[dev]) {
+        announced[dev] = true;
+        fprintf(stderr, "[pf-attn-tier] RQH=%d GB=%d GN=%d smem=%zu qld=%d pld=%d n=%d ok=%d\n",
+                RQH, GROUP_BLKS, GN, sm, qld, pld, n_tokens, (int)ok);
+    }
+    return ok;
 }
 
 bool launch_prefill_attn_mma(
