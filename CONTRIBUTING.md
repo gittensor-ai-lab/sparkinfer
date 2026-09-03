@@ -120,11 +120,12 @@ The authoritative statement is the `SCOPE` block at the top of the bot itself
 ([`eval/pr_dspark_bot.py`](eval/pr_dspark_bot.py)) — that file is the source of truth, this
 table is a summary and can lag it.
 
-| | Current (since 2026-08-18) |
+| | Current (since 2026-09-03) |
 |---|---|
-| **Scored dimension** | DSpark speculative decode throughput @ **ctx=4096** (`dspark-decode@4k`) |
+| **Scored dimensions** | DSpark decode **and** DSpark-enabled batched prefill at **ctx=4k / 16k / 32k**, plus target-model prefill **and** decode at **ctx=256k** — eight dimensions, any one of which can earn the tier |
 | **Model pair** | target = Qwen3.8-27B ModelOpt NVFP4; draft = released DSpark checkpoint |
-| **Harness** | `runtime/examples/dspark_tau_check.cpp` — both legs in one process, one model load |
+| **Harness** | `runtime/examples/dspark_tau_check.cpp` for 4k/16k/32k — both legs in one process, one model load. The 256k rows come from a one-row `qwen3_gguf_bench` sweep. |
+| **256k is target-only** | No draft at that context: a 262,144-token KV cache needs the VRAM the draft would occupy, so `dspark-decode@256k` does not exist. Both 256k rows measure the served target model. |
 | **Not measured at all** | ctx=128 (any length below `kEngageMinSeq`=1024), batched-prefill parity |
 | **Explicitly out of scope** | replacing the DSpark drafter — including the checkpoint's MTP head. See below. |
 

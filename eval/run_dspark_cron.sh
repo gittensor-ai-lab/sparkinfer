@@ -7,9 +7,14 @@
 #   long-context as the scored dimension (2026-08-18, explicit user decision), so the two are NOT
 #   meant to run together — both drive the one pinned GPU, and both want the same lock.
 #
-#   The scored dimensions are DSpark decode + prefill at 4k/16k/32k and target prefill at 256k
-#   (SCORING_DIMS in the bot). The 256k baseline currently uses sequential prefill and takes about
-#   65 minutes per ref, so a main+PR round intentionally spans multiple hourly ticks.
+#   The scored dimensions are DSpark decode + prefill at 4k/16k/32k and target prefill AND decode
+#   at 256k (SCORING_DIMS in the bot). The 256k baseline currently uses sequential prefill and takes
+#   about 65 minutes per ref, so a main+PR round intentionally spans multiple hourly ticks.
+#
+#   decode@256k adds NO time to that: the one-row sweep already fills the 262,144-token context
+#   once and reports prefill and decode together, and the decode half was simply discarded before
+#   2026-09-03. Both 256k rows are target-only -- the draft is not loaded at that context because
+#   the KV cache needs its VRAM.
 #
 #   The Qwen3.6 and Qwen3.8 no-regression guards ARE run — check_q36_guard / check_q38_guard — and
 #   a round bails if either produces no MAIN baseline. The 256k row dominates wall time until a
