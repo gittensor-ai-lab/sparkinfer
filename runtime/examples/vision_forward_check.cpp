@@ -21,7 +21,7 @@
 
 #include "sparkinfer/safetensors.h"
 #include "sparkinfer/models/qwen_vision.h"
-#include "qwen_vision_hf_config.h"
+#include "sparkinfer/models/qwen_vision_hf_config.h"
 
 using namespace sparkinfer;
 

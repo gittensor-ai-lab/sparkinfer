@@ -14,7 +14,7 @@
 
 #include "sparkinfer/safetensors.h"
 #include "sparkinfer/models/qwen_vision_config.h"
-#include "qwen_vision_hf_config.h"
+#include "sparkinfer/models/qwen_vision_hf_config.h"
 
 using sparkinfer::QwenVisionConfig;
 using sparkinfer::SafeTensorsModel;

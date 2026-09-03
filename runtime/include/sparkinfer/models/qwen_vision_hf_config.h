@@ -10,7 +10,7 @@
 #include <nlohmann/json.hpp>
 #include "sparkinfer/models/qwen_vision_config.h"
 
-static bool qwen_vision_config_from_hf_json(const std::string& model_dir,
+inline bool qwen_vision_config_from_hf_json(const std::string& model_dir,
                                             sparkinfer::QwenVisionConfig& vc, std::string& err) {
     std::ifstream cf(model_dir + "/config.json");
     if (!cf) { err = "config.json not found in " + model_dir; return false; }

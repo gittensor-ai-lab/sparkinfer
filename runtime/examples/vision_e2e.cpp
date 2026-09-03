@@ -23,7 +23,7 @@
 #include "sparkinfer/models/qwen_vision.h"
 #include "sparkinfer/models/qwen_vision_preprocess.h"
 #include "qwen_checkpoint.h"
-#include "qwen_vision_hf_config.h"
+#include "sparkinfer/models/qwen_vision_hf_config.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
