@@ -578,9 +578,24 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
                              cfg.n_q_heads == cfg.n_kv_heads * 4;
     // GQA-8 hd256 (Qwen3.6 full-attn layers), issue #559: same sink+window policy, but
     // realized as a compacted paged-KV view fed to the unmodified dense int8-MMA kernel.
+    // The compact view is ratio-AGNOSTIC: launch_fa_kv_compact_view builds a sink+window block
+    // table, and launch_flash_decode_split is the same dense entry point that already serves this
+    // shape, with the head counts passed as runtime arguments. GQA-8 was simply the ratio it was
+    // first wired for. Qwen3.8 is GQA-6 (24 q over 4 kv), matched neither predicate, and has
+    // therefore been reading the WHOLE KV cache on every decode step -- 8.59 GB at ctx=262144,
+    // which nsys puts at 9.56 ms of a 19.87 ms step (48%) and only 50% of DRAM peak.
+    // SPARKINFER_SPARSE_GQA6=0 restores the dense path for A/B in one binary.
+    const int gqa_ratio = cfg.n_kv_heads > 0 ? cfg.n_q_heads / cfg.n_kv_heads : 0;
+    static const bool sparse_gqa6_on = [] {
+        const char* e = getenv("SPARKINFER_SPARSE_GQA6");
+        return !(e && e[0] == '0');
+    }();
+    const bool sparse_gqa6 = sparse_gqa6_on && cfg.head_dim == 256 && cfg.n_kv_heads > 0 &&
+                             cfg.n_q_heads == cfg.n_kv_heads * 6;
     const bool sparse_gqa8 = cfg.head_dim == 256 && cfg.n_kv_heads > 0 &&
                              cfg.n_q_heads == cfg.n_kv_heads * 8;
-    if (sparse_enable && (sparse_gqa4 || sparse_gqa8)) {
+    const bool sparse_view = sparse_gqa6 || sparse_gqa8;   // compact-view tiers
+    if (sparse_enable && (sparse_gqa4 || sparse_view)) {
         p_->sparse_window = 256;
         if (const char* w = getenv("SPARKINFER_SPARSE_WINDOW")) { int v = atoi(w); if (v > 0) p_->sparse_window = v; }
         // Legacy aliases from the Quest prototype (blocks, not tokens).
@@ -592,10 +607,10 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         // only clears the dense cost decisively from ~16k context up (bot-measured on this
         // shape: sparse under 16k is a wash-to-regression, 16k/32k are wins). Engaging at
         // 16384 also keeps every mid-length scoring probe on the exact dense path.
-        if (sparse_gqa8) p_->sparse_min_ctx = 16384;
+        if (sparse_view) p_->sparse_min_ctx = 16384;
         if (const char* mc = getenv("SPARKINFER_SPARSE_MIN_CTX")) { int v = atoi(mc); if (v > 0) p_->sparse_min_ctx = v; }
         p_->sparse_budget = 1 + p_->sparse_window;
-        if (sparse_gqa8) {
+        if (sparse_view) {
             p_->sparse_vtbl = p_->alloc<int>(p_->sparse_budget);
             p_->sparse_vlen = p_->alloc<int>(1);
             // Split the compact view so each MMA split still covers >= 2 KV blocks (the
@@ -609,8 +624,8 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
             p_->sparse_sel = p_->alloc<int>((size_t)cfg.n_kv_heads * p_->sparse_budget);
         }
         fprintf(stderr, "[sparse-kv] sliding-window (default on): gqa=%d window=%d blocks (%d tokens) min_ctx=%d%s\n",
-                sparse_gqa8 ? 8 : 4, p_->sparse_window, p_->sparse_window * kv->block_size(),
-                p_->sparse_min_ctx, sparse_gqa8 ? " (compact-view, decode-only)" : "");
+                sparse_view ? gqa_ratio : 4, p_->sparse_window, p_->sparse_window * kv->block_size(),
+                p_->sparse_min_ctx, sparse_view ? " (compact-view, decode-only)" : "");
     }
     // Muse Glimmer: mandatory pure sliding-window view for swa-flagged layers, every step,
     // regardless of context length (architectural, not a long-context approximation).
@@ -1048,8 +1063,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // GQA-8 compact-view sparse is decode-only (`sample`): prefill and teacher-forced
     // scoring always run the exact dense path, and the windowed view is never baked into
     // the prefill graph.
+    // Stays gated on int8 KV. Lifting it does speed the AR leg (+11.2% at ctx=32768), but the
+    // DSpark verify path does not consult the view, so the two legs stop agreeing and
+    // dspark_tau_check reports LOSSLESS=0 -- a hard gate. Both legs would have to become sparse
+    // together before this could be relaxed.
     const bool sparse_view_avail = s.sparse_vtbl != nullptr && sample && s.kv->int8_kv() &&
-                                   c.head_dim == 256 && c.n_q_heads == c.n_kv_heads * 8;
+                                   c.head_dim == 256 && c.n_kv_heads > 0 &&
+                                   (c.n_q_heads == c.n_kv_heads * 6 ||
+                                    c.n_q_heads == c.n_kv_heads * 8);
     const bool sparse_on = (sparse_avail || sparse_view_avail) && seqlen >= s.sparse_min_ctx;
     if (s.graph_ready && s.graph_sparse != sparse_on) {
         cu(cudaGraphExecDestroy(s.cu_exec), "sparse recapture destroy exec");
