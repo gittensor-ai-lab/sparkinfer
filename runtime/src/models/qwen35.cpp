@@ -89,6 +89,14 @@ inline bool muse_fuse_tail() {
 }
 using bf16 = unsigned short;
 
+// float -> bf16 on the host. Truncating (not round-to-nearest-even), matching what the rest of
+// this file's host-side conversions do; the vision embeddings it converts are already the output
+// of a bf16 tower, so the low bits being dropped here carry no information.
+inline bf16 f32_to_bf16_host(float f) {
+    unsigned u; std::memcpy(&u, &f, sizeof(u));
+    return (bf16)(u >> 16);
+}
+
 // forward_token() sentinel: the decode graph was enqueued but not yet collected. Never a valid
 // token id, so it cannot be confused with a real argmax.
 constexpr int kDFlashDeferred = INT_MIN;
@@ -193,6 +201,12 @@ struct Qwen35Model::Impl {
     int qdim, kvdim;
     int linear_qdim = 0, linear_vdim = 0, linear_qkvdim = 0;
     bool gguf = false;   // true after load_gguf: dense weights are native [out,in], use GEMV
+    // Pending image input for the NEXT prefill_batched call, set by set_pending_vision and
+    // cleared once consumed. Device-resident so prefill can splice without a host round trip.
+    // Null on every text-only request, which is what keeps the vision path off the measured path.
+    void* d_vision_emb = nullptr;
+    int*  d_vision_pos = nullptr;
+    int   vision_n = 0;
     // Guards the capture window against legacy-default-stream work issued by other threads.
     // See Qwen35Model::device_mutex() in the header for why this is required.
     std::recursive_mutex device_mu;
@@ -865,6 +879,33 @@ int Qwen35Model::adaptive_nsplits_for(int seqlen) const {
 }
 
 std::recursive_mutex& Qwen35Model::device_mutex() { return p_->device_mu; }
+
+bool Qwen35Model::set_pending_vision(const float* emb, const int* positions, int n_img, int hidden) {
+    Impl& s = *p_;
+    clear_pending_vision();
+    if (!emb || !positions || n_img <= 0) return false;
+    if (hidden != s.cfg.hidden) return false;   // merger output must match the LM embedding width
+    const size_t n = (size_t)n_img * hidden;
+    std::vector<bf16> h(n);
+    for (size_t i = 0; i < n; i++) h[i] = f32_to_bf16_host(emb[i]);
+    if (cudaMalloc(&s.d_vision_emb, n * sizeof(bf16)) != cudaSuccess) return false;
+    if (cudaMalloc((void**)&s.d_vision_pos, (size_t)n_img * sizeof(int)) != cudaSuccess) {
+        cudaFree(s.d_vision_emb); s.d_vision_emb = nullptr; return false;
+    }
+    if (cudaMemcpy(s.d_vision_emb, h.data(), n * sizeof(bf16), cudaMemcpyHostToDevice) != cudaSuccess
+     || cudaMemcpy(s.d_vision_pos, positions, (size_t)n_img * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+        clear_pending_vision(); return false;
+    }
+    s.vision_n = n_img;
+    return true;
+}
+
+void Qwen35Model::clear_pending_vision() {
+    Impl& s = *p_;
+    if (s.d_vision_emb) cudaFree(s.d_vision_emb);
+    if (s.d_vision_pos) cudaFree(s.d_vision_pos);
+    s.d_vision_emb = nullptr; s.d_vision_pos = nullptr; s.vision_n = 0;
+}
 
 int Qwen35Model::forward_token(int token_id, int position, bool sample, float temperature,
                                unsigned long long seed, unsigned long long sample_step,
@@ -2791,8 +2832,18 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.dflash_capture ? s.dflash_layer_ids.data() : nullptr,
                           s.dflash_capture ? s.dflash_n_cap : 0,
                           s.dflash_capture ? s.dflash_context : nullptr,
-                          s.dflash_capture ? s.dflash_ctx_start : 0 };
+                          s.dflash_capture ? s.dflash_ctx_start : 0,
+                          // Image input, if set_pending_vision was called for this prompt.
+                          // Only prefill_batched gets these: the other two Qwen35PrefillCtx
+                          // sites are DSpark verify paths, which replay already-generated
+                          // tokens and can never contain an image placeholder.
+                          s.d_vision_emb, s.d_vision_pos, s.vision_n };
     const int seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    // Consume it. This is PER-REQUEST state, not model state: leaving it set would splice the
+    // previous request's image into the next prompt, which would produce fluent, confident text
+    // about an image the caller never sent. Cleared on every path out, including the failure
+    // path below, because a prefill that returned -1 has still consumed the staging.
+    clear_pending_vision();
     if (seed >= 0 && s.dflash_capture && s.dflash_context && s.dflash_n_cap > 0)
         s.dflash_ctx_len = pos0 + n;
     // Seed-token logprob (see ingest_prompt_range's want_seed_logprob). prefill_batched_run's

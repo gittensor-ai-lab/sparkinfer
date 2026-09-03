@@ -214,6 +214,14 @@ public:
     // thread still blocks normally.
     std::recursive_mutex& device_mutex();
 
+    // Stage an image for the NEXT prefill_batched call. emb is [n_img, hidden] float32 from
+    // qwen_vision_forward; positions are the prompt indices carrying image_token_id, which the
+    // caller has already checked number exactly n_img. Consumed by that one prefill and then
+    // cleared -- it is per-request state, not model state, and leaving it set would splice a
+    // stale image into the next prompt.
+    bool set_pending_vision(const float* emb, const int* positions, int n_img, int hidden);
+    void clear_pending_vision();
+
     // Load weights from a sparkinfer weight directory (see runtime/tools/convert_qwen35.py).
     // Returns false on failure. Allocates device buffers it owns.
     bool load_weights(const std::string& dir);
