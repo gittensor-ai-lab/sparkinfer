@@ -1231,7 +1231,22 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     static const int kMidCtxWindow = 2048;
     static const int kMidCtxMinSeq = 12288;
     static const int kMidCtxMaxSeq = 24576;
-    static const int kLongCtxWindow = 4096;
+    // The long band keeps 4096 while the mid band was narrowed to 2048, but the reason the mid
+    // band moved applies harder here, not less: acceptance falls with context while the draft's
+    // attention cost rises with it, so at 32k old context buys even less than it does at 16k.
+    // Measured at ctx=32768 on bench_prompt_32k.txt, lossless at every point, MEAN_ACCEPT
+    // identical (1.2800) across the whole range -- this is draft time removed, not acceptance
+    // traded away:
+    //
+    //     window   4096     3072     2048     1024      256
+    //     tok/s   89.28    89.88    90.44    90.79    91.33
+    //
+    // 2048 rather than the faster 256, for the reason the mid band chose 4096 over 3072: 512 and
+    // 768 sit in a reproducible acceptance dip (tau 1.2673 and 1.2549), so the narrow end is not a
+    // broad peak on this prompt and picking its best point is fitting one corpus. 2048 is the
+    // constant the band below already uses, which collapses the window ladder to one value above
+    // 12288.
+    static const int kLongCtxWindow = 2048;
     int kFullWindow = kFullWindowEnv >= 0 ? kFullWindowEnv : 3 * c.sliding_window;
     if (kFullWindowEnv < 0 && kFullWindow <= 0) {
         const int total_ctx = past + ctx_len;
