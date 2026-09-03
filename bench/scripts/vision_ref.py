@@ -100,6 +100,25 @@ def run_tower(st, cfg, pixels, grid_h, grid_w, trace=None):
     if trace is not None: trace["after_pos_embed"] = x.copy()
 
     N = x.shape[0]
+
+    # 2D rotary, applied to q and k in every block. A head_dim/2-wide frequency vector -- first
+    # half driven by the patch's ROW, second by its COLUMN -- concatenated with itself to head_dim
+    # before cos/sin, then q <- q*cos + rotate_half(q)*sin.
+    #
+    # This file originally omitted it, and so did the CUDA it exists to check, so the two agreed
+    # at cosine 0.999 while BOTH disagreed with transformers at 0.77. That is the precise failure
+    # mode a hand-written reference has: it can only catch errors its author did not also make.
+    # bench/scripts/vision_hf_check.py diffs against transformers itself and is the real gate.
+    half, per_axis = hd // 2, hd // 4
+    inv = 10000.0 ** (-np.arange(per_axis, dtype=np.float64) / per_axis)
+    rr, cc = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing="ij")
+    freqs = np.concatenate([rr.reshape(-1, 1) * inv, cc.reshape(-1, 1) * inv], axis=1)   # [N, half]
+    emb = np.concatenate([freqs, freqs], axis=1)                                         # [N, hd]
+    rcos, rsin = np.cos(emb), np.sin(emb)
+
+    def rotate_half(t):                       # t: [heads, N, hd]
+        return np.concatenate([-t[..., half:], t[..., :half]], axis=-1)
+
     for b in range(depth):
         pfx = f"model.visual.blocks.{b}."
         h = layernorm(x, st.get(pfx + "norm1.weight"), st.get(pfx + "norm1.bias"))
@@ -108,6 +127,8 @@ def run_tower(st, cfg, pixels, grid_h, grid_w, trace=None):
         q = q.reshape(N, heads, hd).transpose(1, 0, 2)
         k = k.reshape(N, heads, hd).transpose(1, 0, 2)
         v = v.reshape(N, heads, hd).transpose(1, 0, 2)
+        q = q * rcos + rotate_half(q) * rsin
+        k = k * rcos + rotate_half(k) * rsin
         # FULL bidirectional attention over all patches -- no causal mask. A causal mask here is
         # the classic silent bug: it still produces embeddings, just wrong ones.
         att = softmax((q @ k.transpose(0, 2, 1)) / np.sqrt(hd), axis=-1)

@@ -144,7 +144,10 @@ bool qwen_vision_forward(const QwenVisionWeights& w, const QwenVisionConfig& cfg
     void* d_mlp  = alloc((size_t)N * I * sizeof(bf16));
     void* d_mrg  = alloc((size_t)nblk * M * sizeof(bf16));
     void* d_out  = alloc((size_t)nblk * (size_t)cfg.out_hidden * sizeof(bf16));
-    if (!d_pix || !d_x || !d_h || !d_qkv || !d_q || !d_k || !d_v || !d_att || !d_mlp || !d_mrg || !d_out) {
+    void* d_cos  = alloc((size_t)N * (hd / 2) * sizeof(float));
+    void* d_sin  = alloc((size_t)N * (hd / 2) * sizeof(float));
+    if (!d_pix || !d_x || !d_h || !d_qkv || !d_q || !d_k || !d_v || !d_att || !d_mlp || !d_mrg ||
+        !d_out || !d_cos || !d_sin) {
         cleanup(); err = "vision forward: device allocation failed"; return false;
     }
 
@@ -187,6 +190,34 @@ bool qwen_vision_forward(const QwenVisionWeights& w, const QwenVisionConfig& cfg
     }
     kernels::launch_vision_residual_add(d_x, d_h, (long)N * H, s);
 
+    // --- 2D rotary tables ---
+    // Built here rather than per block: q/k are re-projected every block, but the rotation each
+    // patch receives depends only on where it sits in the grid, so the tables are computed once.
+    //
+    // The frequency vector is head_dim/2 wide: its first half rotates by the patch's ROW, its
+    // second by its COLUMN, giving attention a way to resolve relative position that the learned
+    // pos_embed -- added once, before the first block -- cannot. inv_freq matches the reference's
+    // 1 / theta^(2i/rope_dim) with rope_dim = head_dim/2, so exponents run i/(head_dim/4).
+    {
+        const int half = hd / 2, per_axis = half / 2;
+        std::vector<float> hc((size_t)N * half), hs((size_t)N * half);
+        for (int y = 0; y < grid_h; y++)
+            for (int x = 0; x < grid_w; x++) {
+                const size_t t = (size_t)y * grid_w + x;
+                for (int j = 0; j < half; j++) {
+                    const int i2 = (j < per_axis) ? j : j - per_axis;
+                    const double pos = (j < per_axis) ? (double)y : (double)x;
+                    const double f = pos * std::pow(10000.0, -(double)i2 / (double)per_axis);
+                    hc[t * half + j] = (float)std::cos(f);
+                    hs[t * half + j] = (float)std::sin(f);
+                }
+            }
+        if (!cu_ok(cudaMemcpy(d_cos, hc.data(), hc.size() * sizeof(float), cudaMemcpyHostToDevice),
+                   "upload rope cos", err) ||
+            !cu_ok(cudaMemcpy(d_sin, hs.data(), hs.size() * sizeof(float), cudaMemcpyHostToDevice),
+                   "upload rope sin", err)) { cleanup(); return false; }
+    }
+
     const float scale = 1.0f / std::sqrt((float)hd);
     for (int b = 0; b < cfg.depth; b++) {
         const auto& B = w.blocks[b];
@@ -199,6 +230,7 @@ bool qwen_vision_forward(const QwenVisionWeights& w, const QwenVisionConfig& cfg
         cudaMemcpy2DAsync(d_q, col, (const char*)d_qkv,             row, col, N, cudaMemcpyDeviceToDevice, s);
         cudaMemcpy2DAsync(d_k, col, (const char*)d_qkv + col,       row, col, N, cudaMemcpyDeviceToDevice, s);
         cudaMemcpy2DAsync(d_v, col, (const char*)d_qkv + 2 * col,   row, col, N, cudaMemcpyDeviceToDevice, s);
+        kernels::launch_vision_rope(d_q, d_k, d_cos, d_sin, N, heads, hd, s);
         kernels::launch_vision_attention(d_q, d_k, d_v, d_att, N, heads, hd, scale, s);
         kernels::launch_prefill_gemm(d_att, B.proj_w, d_h, N, H, H, s);
         kernels::launch_vision_add_bias(d_h, B.proj_b, N, H, s);

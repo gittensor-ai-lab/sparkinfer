@@ -87,6 +87,35 @@ __global__ void vis_residual_add_kernel(bf16* __restrict__ acc, const bf16* __re
     acc[i] = f2b(b2f(acc[i]) + b2f(add[i]));
 }
 
+// 2D rotary position embedding, applied to q and k before attention.
+//
+// The reference builds a frequency vector of width head_dim/2 -- its first half driven by a
+// patch's ROW index and its second by its COLUMN -- then concatenates it with ITSELF to head_dim
+// before taking cos/sin. So only head_dim/2 distinct table entries exist per token, and the
+// upper half of the rotation reuses them; that is why cos_t/sin_t are [n_tokens, head_dim/2].
+//
+// One thread per (token, head, d) with d < head_dim/2, rotating the PAIR (d, d + head_dim/2)
+// together. A thread per element would race: the rotation mixes the two halves, so a thread
+// would read a partner another thread had already overwritten.
+__global__ void vis_rope_kernel(bf16* __restrict__ q, bf16* __restrict__ k,
+                                const float* __restrict__ cos_t, const float* __restrict__ sin_t,
+                                long n_tokens, int n_heads, int head_dim) {
+    const int half = head_dim >> 1;
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tokens * (long)n_heads * half) return;
+    const int d = (int)(i % half);
+    const long hidx = i / half;                  // token * n_heads + head
+    const long tok = hidx / n_heads;
+    const long base = hidx * (long)head_dim + d;
+    const float c = cos_t[tok * half + d], sn = sin_t[tok * half + d];
+    const float q0 = b2f(q[base]), q1 = b2f(q[base + half]);
+    q[base]        = f2b(q0 * c - q1 * sn);
+    q[base + half] = f2b(q1 * c + q0 * sn);
+    const float k0 = b2f(k[base]), k1 = b2f(k[base + half]);
+    k[base]        = f2b(k0 * c - k1 * sn);
+    k[base + half] = f2b(k1 * c + k0 * sn);
+}
+
 // One warp per (head, query). Online softmax over all keys -- no mask, every query sees every
 // patch. head_dim is 72 here, so each lane holds ceil(72/32)=3 accumulators.
 __global__ void vis_attention_kernel(const bf16* __restrict__ q, const bf16* __restrict__ k,
@@ -202,6 +231,15 @@ void launch_vision_residual_add(void* acc, const void* add, long n, cudaStream_t
     if (n <= 0) return;
     vis_residual_add_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(
         (bf16*)acc, (const bf16*)add, n);
+}
+
+void launch_vision_rope(void* q, void* k, const void* cos_table, const void* sin_table,
+                        int n_tokens, int n_heads, int head_dim, cudaStream_t stream) {
+    if (n_tokens <= 0 || n_heads <= 0 || head_dim <= 1 || (head_dim & 1)) return;
+    const long n = (long)n_tokens * n_heads * (head_dim >> 1);
+    vis_rope_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(
+        (bf16*)q, (bf16*)k, (const float*)cos_table, (const float*)sin_table,
+        n_tokens, n_heads, head_dim);
 }
 
 void launch_vision_attention(const void* q, const void* k, const void* v, void* out,

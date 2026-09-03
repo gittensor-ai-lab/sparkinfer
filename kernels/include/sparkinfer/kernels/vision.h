@@ -38,6 +38,18 @@ void launch_vision_residual_add(void* acc, const void* add, long n, cudaStream_t
 // q/k/v are [n_tokens, n_heads*head_dim] as the QKV projection leaves them; out matches.
 // No mask: a causal mask here is the classic silent bug -- it still produces embeddings, just
 // wrong ones, and nothing downstream can tell.
+// 2D rotary position embedding for the vision tower, applied IN PLACE to q and k before
+// attention. Every block re-projects qkv, so this runs once per block, not once per image.
+//
+// cos_table/sin_table are float [n_tokens, head_dim/2], row-major over the patch grid, and hold
+// only the DISTINCT half of the frequencies: the reference concatenates its width-head_dim/2
+// frequency vector with itself before taking cos/sin, so the upper half repeats the lower.
+//
+// Omitting this entirely is what made the tower agree with a hand-written reference while both
+// disagreed with transformers at cosine 0.77 -- see bench/scripts/vision_hf_check.py.
+void launch_vision_rope(void* q, void* k, const void* cos_table, const void* sin_table,
+                        int n_tokens, int n_heads, int head_dim, cudaStream_t stream = nullptr);
+
 void launch_vision_attention(const void* q, const void* k, const void* v, void* out,
                              int n_tokens, int n_heads, int head_dim, float scale,
                              cudaStream_t stream = nullptr);
