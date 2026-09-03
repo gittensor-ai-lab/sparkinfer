@@ -11,7 +11,9 @@ struct DecodedImage {
     std::vector<unsigned char> rgb;   // [height * width * 3]
 };
 
-// Decodes PNG / JPEG / BMP / GIF / TGA bytes (whatever stb_image supports) to RGB8.
+// Decodes PNG / JPEG / BMP bytes to RGB8. Those three and no others: image_input.cpp sets
+// STBI_ONLY_PNG/JPEG/BMP, so stb's GIF, TGA, PSD, HDR, PIC and PNM decoders are not compiled in
+// -- fewer parsers reachable from untrusted request bytes.
 //
 // Alpha is DROPPED, not composited: stb is asked for 3 channels, so an RGBA source loses its
 // alpha rather than being flattened onto a background. The vision tower has no alpha channel and
