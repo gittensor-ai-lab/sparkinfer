@@ -157,7 +157,28 @@ __global__ void vis_patch_merge_kernel(const bf16* __restrict__ x, bf16* __restr
     }
 }
 
+__global__ void vis_splice_kernel(bf16* __restrict__ x, const int* __restrict__ pos,
+                                  const bf16* __restrict__ emb, int n_img, int hidden) {
+    const long total = (long)n_img * hidden;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long)gridDim.x * blockDim.x) {
+        const int d = (int)(i % hidden);
+        const int r = (int)(i / hidden);
+        x[(size_t)pos[r] * hidden + d] = emb[i];
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
+void launch_vision_splice(void* x, const int* positions, const void* emb,
+                          int n_img, int hidden, cudaStream_t stream) {
+    if (n_img <= 0 || hidden <= 0) return;
+    const long total = (long)n_img * hidden;
+    unsigned blocks = (unsigned)((total + 255) / 256);
+    if (blocks > 65535) blocks = 65535;
+    vis_splice_kernel<<<blocks, 256, 0, stream>>>(
+        (bf16*)x, positions, (const bf16*)emb, n_img, hidden);
+}
+
 void launch_vision_layernorm(const void* x, const void* weight, const void* bias, void* out,
                              int n_rows, int dim, float eps, cudaStream_t stream) {
     if (n_rows <= 0 || dim <= 0) return;

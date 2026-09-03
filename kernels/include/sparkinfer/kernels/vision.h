@@ -50,5 +50,15 @@ void launch_vision_attention(const void* q, const void* k, const void* v, void* 
 void launch_vision_patch_merge(const void* x, void* out, int grid_h, int grid_w, int merge,
                                int dim, cudaStream_t stream = nullptr);
 
+// Overwrite selected rows of the embedded prompt with vision embeddings:
+//   x[positions[i], :] = emb[i, :]   for i in [0, n_img)
+// x is the [n_tokens, hidden] bf16 output of launch_embedding; emb is [n_img, hidden] bf16.
+// positions is device-side and must be strictly increasing (the caller derives it from the token
+// stream). Nothing here validates the COUNT -- qwen_vision_splice_embeddings does that on the
+// host, before any device work, because a count mismatch shifts every later token and must be an
+// error rather than a partial write.
+void launch_vision_splice(void* x, const int* positions, const void* emb,
+                          int n_img, int hidden, cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace sparkinfer

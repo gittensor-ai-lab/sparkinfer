@@ -136,6 +136,11 @@ if(BUILD_EXAMPLES)
     add_executable(vision_resize_check examples/vision_resize_check.cpp)
     target_include_directories(vision_resize_check PRIVATE include)
     target_link_libraries(vision_resize_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    # Splice behaviour, especially the REFUSALS -- a count mismatch must be a hard error, never
+    # a partial write, or the model silently reads a truncated image region.
+    add_executable(vision_splice_check examples/vision_splice_check.cpp)
+    target_include_directories(vision_splice_check PRIVATE include)
+    target_link_libraries(vision_splice_check PRIVATE sparkinfer_runtime CUDA::cudart)
     add_executable(vision_forward_check examples/vision_forward_check.cpp)
     target_include_directories(vision_forward_check PRIVATE include)
     target_link_libraries(vision_forward_check PRIVATE sparkinfer_runtime CUDA::cudart

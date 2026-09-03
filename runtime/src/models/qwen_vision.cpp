@@ -237,4 +237,41 @@ bool qwen_vision_forward(const QwenVisionWeights& w, const QwenVisionConfig& cfg
     return true;
 }
 
+bool qwen_vision_splice_embeddings(void* d_x, const int* token_ids, int n_tokens,
+                                   const float* vision_emb, int n_img, int hidden,
+                                   int image_token_id, std::string& err) {
+    if (!d_x || !token_ids || !vision_emb || hidden <= 0) { err = "splice: null argument"; return false; }
+
+    std::vector<int> pos;
+    pos.reserve(n_img > 0 ? n_img : 0);
+    for (int t = 0; t < n_tokens; t++) if (token_ids[t] == image_token_id) pos.push_back(t);
+
+    if ((int)pos.size() != n_img) {
+        err = "splice: prompt carries " + std::to_string(pos.size()) + " image placeholder(s) but "
+            + std::to_string(n_img) + " vision embedding(s) were produced -- the prompt's image "
+              "token count must equal (grid_h/merge)*(grid_w/merge)";
+        return false;
+    }
+    if (n_img == 0) return true;   // no image in this prompt; nothing to do
+
+    void* d_pos = nullptr; void* d_emb = nullptr;
+    if (!cu_ok(cudaMalloc(&d_pos, pos.size() * sizeof(int)), "splice positions alloc", err)) return false;
+    if (!cu_ok(cudaMalloc(&d_emb, (size_t)n_img * hidden * sizeof(bf16)), "splice emb alloc", err)) {
+        cudaFree(d_pos); return false;
+    }
+    std::vector<bf16> hemb((size_t)n_img * hidden);
+    for (size_t i = 0; i < hemb.size(); i++) hemb[i] = f32_to_bf16(vision_emb[i]);
+
+    bool ok = cu_ok(cudaMemcpy(d_pos, pos.data(), pos.size() * sizeof(int), cudaMemcpyHostToDevice),
+                    "upload splice positions", err)
+           && cu_ok(cudaMemcpy(d_emb, hemb.data(), hemb.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+                    "upload vision embeddings", err);
+    if (ok) {
+        kernels::launch_vision_splice(d_x, (const int*)d_pos, d_emb, n_img, hidden, nullptr);
+        ok = cu_ok(cudaDeviceSynchronize(), "splice sync", err);
+    }
+    cudaFree(d_pos); cudaFree(d_emb);
+    return ok;
+}
+
 }  // namespace sparkinfer

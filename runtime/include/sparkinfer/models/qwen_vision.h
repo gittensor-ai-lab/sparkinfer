@@ -50,4 +50,20 @@ bool qwen_vision_forward(const QwenVisionWeights& w, const QwenVisionConfig& cfg
                          const float* pixels_host, int grid_h, int grid_w,
                          float* out_host, std::string& err);
 
+// Splices vision embeddings into an already-embedded prompt, in place.
+//
+//   d_x:        [n_tokens, hidden] bf16 on device -- the output of launch_embedding
+//   token_ids:  [n_tokens] host, the prompt as tokenized
+//   vision_emb: [n_img, hidden] host float32 -- qwen_vision_forward's output
+//
+// Fails (writing nothing) unless the number of image_token_id placeholders in token_ids is
+// EXACTLY n_img. That check is the whole point of this function existing rather than callers
+// scattering rows themselves: too few placeholders and later image embeddings are dropped, too
+// many and stale token embeddings survive inside the image span. Either way the model reads a
+// prompt whose image region is silently truncated or padded, produces fluent text about it, and
+// nothing downstream can tell. A hard error is the only safe behaviour.
+bool qwen_vision_splice_embeddings(void* d_x, const int* token_ids, int n_tokens,
+                                   const float* vision_emb, int n_img, int hidden,
+                                   int image_token_id, std::string& err);
+
 }  // namespace sparkinfer
