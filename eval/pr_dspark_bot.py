@@ -1859,7 +1859,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
           f"tau={pr.get('mean_accept', 0):.3f} lossless={pr.get('lossless')} "
           f"top1={pr.get('top1', 0):.4f} kl={pr.get('kl', 99):.5f}")
 
-    # Seven scored axes plus three AR-only floors. Without the AR floors a PR could post a
+    # Eight scored axes plus three AR-only floors. Without the AR floors a PR could post a
     # DSpark "speedup" by slowing ordinary serving; every regression remains a hard REJECT.
     dims = [
         ("dspark-decode@4k",  pr["dspark4_tps"], main["dspark4_tps"]),
@@ -2945,6 +2945,7 @@ def main():
           f"dspark@32k={main_result['dspark32_tps']:.2f} tok/s (scored) "
           f"prefill@32k={main_result['prefill_pp']:.2f} pp/s (scored) "
           f"prefill@256k={main_result['prefill256_pp']:.2f} pp/s (scored) "
+          f"decode@256k={main_result['decode256_tps']:.2f} tok/s (scored) "
           f"ar@16k={main_result['ar_tps']:.2f} tok/s "
           f"ratio={main_result['dspark_tps'] / main_result['ar_tps']:.3f}x "
           f"tau={main_result.get('mean_accept', 0):.3f} lossless={main_result.get('lossless')}")
