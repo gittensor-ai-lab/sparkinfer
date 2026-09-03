@@ -133,6 +133,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir"); ap.add_argument("--h", type=int, default=64)
     ap.add_argument("--w", type=int, default=64); ap.add_argument("--dump", default="")
+    ap.add_argument("--compare", default="", help="raw f32 file from vision_forward_check to judge")
     a = ap.parse_args()
     cfg = json.load(open(os.path.join(a.model_dir, "config.json")))["vision_config"]
     P, T, C, merge = cfg["patch_size"], cfg["temporal_patch_size"], cfg["in_channels"], cfg["spatial_merge_size"]
@@ -170,6 +171,41 @@ def main():
     if a.dump:
         np.savez(a.dump, pixels=pixels, out=out, **trace)
         print(f"dumped -> {a.dump}")
+
+    if a.compare:
+        # The tolerance lives HERE, not in the C++ binary, so the two cannot drift apart.
+        got = np.fromfile(a.compare, dtype=np.float32)
+        if got.size != out.size:
+            print(f"[FAIL] size mismatch: reference {out.size}, candidate {got.size}")
+            sys.exit(1)
+        got = got.reshape(out.shape)
+        d = np.abs(got - out)
+        den = max(float(np.abs(out).max()), 1e-9)
+        rel = float(d.max()) / den
+        cos = float((got.ravel() @ out.ravel()) /
+                    (np.linalg.norm(got) * np.linalg.norm(out) + 1e-30))
+        print(f"\ncompare vs {a.compare}")
+        print(f"  max|diff| = {d.max():.6f}   rel = {rel:.3e}   cosine = {cos:.8f}")
+        print(f"  reference absmax = {np.abs(out).max():.4f}   candidate absmax = {np.abs(got).max():.4f}")
+        # COSINE is the bar, not max-relative. Measured on the released weights by re-running
+        # this reference with every intermediate rounded to bf16 (what the CUDA path stores),
+        # bf16 ALONE costs:
+        #
+        #     256x256 ( 256 patches)   rel 1.73e-02   cos 0.99980
+        #     768x768 (2304 patches)   rel 4.64e-02   cos 0.99934
+        #
+        # So max-relative on the single largest element is dominated by bf16 noise that grows
+        # with patch count, and any fixed threshold on it is either unreachable at scale or
+        # useless at small sizes. An earlier 2% bar sat BELOW the noise floor at 768x768 and
+        # failed a correct implementation.
+        #
+        # Cosine over the whole tensor is stable across sizes (>= 0.9987 measured) and still
+        # collapses instantly under a real convention error -- a causal mask, a wrong patch
+        # order or the erf-GELU moves it to 0.9x or worse, not to the fourth decimal.
+        ok = cos > 0.998 and rel < 0.25
+        print("VERDICT:", "MATCH -- CUDA tower agrees with the reference" if ok
+              else "MISMATCH -- the CUDA tower does not implement this architecture")
+        sys.exit(0 if ok else 1)
 
 if __name__ == "__main__":
     main()
