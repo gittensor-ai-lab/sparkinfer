@@ -133,7 +133,11 @@ public:
         //
         // Deep-copied into Job by submit_locked's `job.req = req;`, like prompt and logit_bias.
         struct VisionImage {
-            std::vector<float> pixels;   // [grid_h*grid_w, in_ch*temporal*patch*patch], row-major
+            // Shared, not owned: Request is deep-copied into Job, and a request that retries or
+            // fans out into branches copies it again. A 1536-token image is ~9 MB of patch
+            // tensor, so copying it per hop is worth avoiding; nothing mutates it after
+            // preprocessing.
+            std::shared_ptr<const std::vector<float>> pixels;
             int grid_h = 0;
             int grid_w = 0;
         };

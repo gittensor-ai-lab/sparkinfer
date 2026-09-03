@@ -414,7 +414,8 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
                                  (img.grid_w / vision_cfg_->spatial_merge);
                 const size_t off = emb.size();
                 emb.resize(off + (size_t)nblk * vision_cfg_->out_hidden);
-                if (!qwen_vision_forward(*vision_weights_, *vision_cfg_, img.pixels.data(),
+                if (!img.pixels ||
+                    !qwen_vision_forward(*vision_weights_, *vision_cfg_, img.pixels->data(),
                                          img.grid_h, img.grid_w, emb.data() + off, verr)) {
                     job.error = "vision tower failed: " + verr;
                     finish_job(job);
