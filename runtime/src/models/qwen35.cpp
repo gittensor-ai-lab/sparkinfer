@@ -3609,10 +3609,32 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // already proposes. 8k is left on depth 3 (94.73 vs 94.48 for depth 5), which the bound below
     // preserves, as are 16k and 32k on depth 2.
     constexpr int kMid4kMaxSeq = 6144;
+    // The deep band's depth of 2 was measured at 16k and carried to every length above it, but the
+    // band spans a factor of two in verify cost and the two ends do not want the same plan. A
+    // verify row at 32k reads twice the KV a 16k row does, while acceptance FALLS with length, so
+    // the second proposal is charged more and lands less often. Measured on RTX 5090, reps=1,
+    // lossless everywhere, `bench_prompt_32k.txt` truncated to each context:
+    //
+    //     ctx    depth 1              depth 2              main (adaptive)
+    //     16384  115.38 / 115.17      125.58 / 125.50      126.11 / 125.20     <- 2 is right
+    //     32768   89.34 /  89.39       87.00               87.19 /  87.20      <- 1 is right
+    //
+    // At 16k the second proposal is worth 8.9% and at 32k it costs 2.5%. Split the band rather
+    // than move it: 16k keeps exactly the plan it has.
+    //
+    // This is the INITIAL depth, and the adaptive controller below can only promote from it and
+    // demote back TO it -- `depth_demote_run` is gated on `active_proposal_depth >
+    // kInitialProposalDepth`, so the initial value is a floor. That is why 32k could not reach
+    // depth 1 on its own: the floor was 2. Lowering the floor keeps the whole promotion path
+    // intact, so a predictable stream at 32k still climbs to 4 or B exactly as before.
+    // 24576 is not a new boundary: it is the one dflash_draft.cpp's window ladder already splits
+    // the long band at, so the depth plan and the draft's attention window change together.
+    constexpr int kVeryDeepMinSeq = 24576;
     const int kInitialProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
                                     : ((kShortGeneration || kAmortizedMidContext) ? 7
-                                       : ((n + max_new) >= kDeepMinSeq ? 2
-                                          : ((n + max_new) < kMid4kMaxSeq ? 5 : 3))));
+                                       : ((n + max_new) >= kVeryDeepMinSeq ? 1
+                                          : ((n + max_new) >= kDeepMinSeq ? 2
+                                             : ((n + max_new) < kMid4kMaxSeq ? 5 : 3)))));
     // A length-only depth is a safe starting point, not a workload policy. At the same 16k
     // context real chat accepts ~1.36 tokens while code/JSON/repetition accept 5.35/6.62/6.92 at
     // depth 7. Keeping the prose-tuned depth-2 ceiling makes those predictable streams pay 27-39%
