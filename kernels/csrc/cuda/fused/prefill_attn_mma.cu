@@ -312,7 +312,7 @@ inline int attn_smem_pad() {
 }
 
 template <int HEAD_DIM, int GROUP_BLKS, int RQH>
-__global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 3 ? 2 : 1)) void pf_attn_mma_gqa_kernel(
+__global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 ? 2 : 1))) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
     const __half* __restrict__ v_scale, const int* __restrict__ block_table,
@@ -455,7 +455,6 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 3 ? 2 : 1)) void pf_attn_m
             for (int h = 0; h < RQH; h++) {
                 const int qh_head = head0 + h;
                 const int* s_si = reinterpret_cast<const int*>(s_s) + (size_t)h * BM * GN;
-                float* s_sh = s_s + (size_t)h * BM * GN;
                 signed char* s_pih = s_pi + (size_t)h * BM * pld;
                 #pragma unroll
                 for (int rr = 0; rr < BM / WARPS; rr++) {
@@ -475,6 +474,17 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 3 ? 2 : 1)) void pf_attn_m
                     for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
                     const float m_old = s_m[h * BM + r], m_new = fmaxf(m_old, mx), corr = __expf(m_old - m_new);
                     float sum = 0.f, pamax = 0.f;
+                    // P' stays in registers between the exp and the quantize. Lane `lane` owns
+                    // exactly columns {lane + 32u}, and the quantize below re-reads exactly those
+                    // columns, so the round trip through s_sh that the two loops used to share was
+                    // a store and a reload of a value the thread already held. Dropping it removes
+                    // two of the three 4-byte shared accesses this section makes per score. The
+                    // padding note above measures the tensor pipe at 20.5% with the stalls on
+                    // mio_throttle, so shared-memory instructions are the currency here, not math
+                    // and not K/V bytes -- worth +2.7% at ctx=262144 on its own.
+                    // Arithmetic is untouched (a float survives shared memory exactly), so every
+                    // tier of this kernel stays bit-identical to what it produced before.
+                    float pvr[GN / 32];
                     #pragma unroll
                     for (int u = 0; u < GN / 32; u++) {
                         const int t = lane + u * 32;
@@ -483,7 +493,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 3 ? 2 : 1)) void pf_attn_m
                             const float p = __expf(sc[u] - m_new);
                             sum += p; pv = p * s_vs[t]; pamax = fmaxf(pamax, fabsf(pv));
                         }
-                        s_sh[r * GN + t] = pv;
+                        pvr[u] = pv;
                     }
                     #pragma unroll
                     for (int o = 16; o > 0; o >>= 1) {
@@ -493,9 +503,13 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (RQH <= 3 ? 2 : 1)) void pf_attn_m
                     const float pd = pamax / 127.0f;
                     if (lane == 0) { s_m[h * BM + r] = m_new; s_l[h * BM + r] = s_l[h * BM + r] * corr + sum;
                                      s_ps[h * BM + r] = pd; s_corr[h * BM + r] = corr; }
-                    for (int t = lane; t < gblk * 16; t += 32)
-                        s_pih[r * GN + t] =
-                            (signed char)((pamax == 0.f) ? 0 : (int)roundf(s_sh[r * GN + t] / pd));
+                    #pragma unroll
+                    for (int u = 0; u < GN / 32; u++) {
+                        const int t = lane + u * 32;
+                        if (t < gblk * 16)
+                            s_pih[r * GN + t] =
+                                (signed char)((pamax == 0.f) ? 0 : (int)roundf(pvr[u] / pd));
+                    }
                 }
             }
             __syncthreads();
@@ -659,6 +673,14 @@ bool launch_prefill_attn_mma(
         const int v = e ? atoi(e) : dflt;
         return (v == 1 || v == 2 || v == 3 || v == 4) ? v : dflt;
     }();
+    // KV pages per group iteration for the RQH=3 tier; 8 restores the previous width (A/B in ONE
+    // binary). Only 8 and 16 are structurally valid -- GROUP_BLKS is also the warp count, and the
+    // kernel needs both BM and HEAD_DIM/16 to divide by it.
+    static const int gqa_gb = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_GQA_GB");
+        const int v = e ? atoi(e) : 16;
+        return (v == 8 || v == 16) ? v : 16;
+    }();
 
     if (!enabled || head_dim != HD || block_size != 16 || n_tokens < minctx) return false;
     if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
@@ -684,10 +706,34 @@ bool launch_prefill_attn_mma(
     // re-read, which only dominates once the window is long. At ctx=128 there is no re-read to
     // save and the wider block costs registers -- measured +1.9% at ctx=16384 against -0.45% on
     // prefill@128, which is a no-regression floor.
-    if (gqa_rqh >= 3 && gqa % 3 == 0 && n_tokens >= 2048 &&
-        launch_attn_gqa<HD, GROUP_BLKS, 3>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
-            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
-        return true;
+    // GROUP_BLKS fixes BOTH the keys retired per group iteration (GN) and the warp count, so
+    // doubling it to 16 halves the number of group iterations a block runs -- and with it every
+    // per-iteration fixed cost. The one that matters is the online softmax's reductions: each
+    // (query row, q-head) pass ends in two warp butterflies (max, then sum+|P'|max) worth ~30
+    // instructions regardless of how many keys the group holds, and a block runs BM*RQH of them
+    // per iteration. At GN=128 that is 48 passes per 128 keys; at GN=256 it is 48 per 256. The
+    // two __syncthreads() per iteration halve per key with it. DPW also drops from 2 to 1, which
+    // frees the second set of RQH float accumulators -- enough to retire the 160 bytes of stack
+    // the RQH=3 tier was spilling.
+    //
+    // The cost is shared memory: 78,272 B against 46,528, so one block per SM instead of two. It
+    // is a wash on occupancy (16 warps either way, since the block itself doubles to 16 warps)
+    // and strongly positive on work per barrier. Measured on an RTX 5090 at the scored
+    // target-prefill@256k point, interleaved x2: 2872.08 vs 2609.18 pp/s, +10.08%.
+    //
+    // Only this tier. RQH=4 at GN=256 needs 103,680 B, past the device's 101,376 B ceiling, and
+    // RQH=2 would re-read each K page more often for a wider group -- so GQA-8 checkpoints
+    // (Qwen3.6) keep exactly the tier and the numerics they had. Falls through to the GN=128 tier
+    // if the wide launch is refused, so a device with a smaller ceiling still gets the old path.
+    if (gqa_rqh >= 3 && gqa % 3 == 0 && n_tokens >= 2048) {
+        if (gqa_gb >= 16 &&
+            launch_attn_gqa<HD, 16, 3>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+                n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
+            return true;
+        if (launch_attn_gqa<HD, GROUP_BLKS, 3>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+                n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
+            return true;
+    }
     if (gqa_rqh >= 2 && gqa % 2 == 0 &&
         launch_attn_gqa<HD, GROUP_BLKS, 2>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
             n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
