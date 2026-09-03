@@ -12,7 +12,11 @@ enum class STDType { F32, F16, BF16, I64, I32, I8, U8, F8_E4M3, Unknown };
 struct STTensor {
     STDType dtype = STDType::Unknown;
     int     n_dims = 0;
-    long    dims[4] = {1, 1, 1, 1};   // row-major, dims[0] slowest (matches safetensors' own order)
+    // 5 slots, not 4: Qwen3.8's vision tower carries a 5-D Conv3d patch-embed weight
+    // (model.visual.patch_embed.proj.weight, [out, in_ch, t_patch, ph, pw]). A 4-wide array made
+    // that tensor uncatalogable, so the reader skipped it and image input was structurally
+    // impossible regardless of what else was implemented.
+    long    dims[5] = {1, 1, 1, 1, 1};   // row-major, dims[0] slowest (matches safetensors' own order)
     long    n_values = 0;
     long    n_bytes = 0;
     const void* data = nullptr;       // pointer into the owning shard's mmap

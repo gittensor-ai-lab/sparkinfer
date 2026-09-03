@@ -121,6 +121,14 @@ if(BUILD_EXAMPLES)
     target_include_directories(dspark_tau_check PRIVATE include)
     target_link_libraries(dspark_tau_check PRIVATE sparkinfer_runtime CUDA::cudart
                           nlohmann_json::nlohmann_json)
+    # Vision-tower probe: does this checkpoint carry a complete vision encoder, and does every
+    # tensor match the shape its own vision_config implies? Stage 1 of image support -- no
+    # inference, just a structural check, because a silently missing or mis-shaped vision weight
+    # produces plausible garbage rather than an error.
+    add_executable(vision_probe examples/vision_probe.cpp)
+    target_include_directories(vision_probe PRIVATE include)
+    target_link_libraries(vision_probe PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)

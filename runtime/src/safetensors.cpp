@@ -317,11 +317,12 @@ bool SafeTensorsShard::open(const std::string& path) {
         STTensor t;
         t.dtype = dtype_from_str(dt_it->second.str());
         const auto& shape = sh_it->second.arr();
-        if (shape.size() > 4) {
-            // Vision-tower tensors (e.g. a 5-D patch_embed conv weight) exceed STTensor::dims'
-            // fixed width. Out of scope for this reader (text-only), so skip cataloging this one
-            // tensor rather than failing the whole checkpoint -- nothing looks it up by name.
-            fprintf(stderr, "[safetensors] %s: skipping tensor %s with %zu dims (max 4)\n",
+        if (shape.size() > 5) {
+            // 5 dims covers everything these checkpoints ship -- the widest is the vision tower's
+            // Conv3d patch embed at [out, in_ch, t_patch, ph, pw]. Anything wider is unexpected;
+            // skip cataloging it rather than failing the whole checkpoint, and say so loudly
+            // (this used to fire on the 5-D patch embed, silently making image input impossible).
+            fprintf(stderr, "[safetensors] %s: skipping tensor %s with %zu dims (max 5)\n",
                     path.c_str(), name.c_str(), shape.size());
             continue;
         }
