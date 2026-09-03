@@ -9,9 +9,14 @@ namespace sparkinfer {
 
 namespace {
 
-// PIL/torchvision BICUBIC kernel, a = -0.5. When DOWNscaling, the filter support is widened by
-// the scale factor (antialiasing) -- without that, downsampling aliases badly and the resized
-// image differs visibly from the reference, not just numerically.
+// PIL's BICUBIC kernel, a = -0.5. NOT torchvision's, which uses a = -0.75 -- the two libraries
+// genuinely disagree on this constant, so "bicubic" alone does not pin the filter down. We match
+// PIL, i.e. the slow Qwen2VLImageProcessor; see bench/scripts/vision_preprocess_ref.py for the
+// measured cost of that choice against the fast (torchvision) processor the checkpoint declares.
+//
+// When DOWNscaling, the filter support is widened by the scale factor (antialiasing) -- without
+// that, downsampling aliases badly and the resized image differs visibly from the reference, not
+// just numerically. Verified against PIL to max|diff| 1e-4 by vision_preprocess_ref.py.
 inline float cubic(float x, float a = -0.5f) {
     x = std::fabs(x);
     if (x < 1.0f) return ((a + 2.0f) * x - (a + 3.0f)) * x * x + 1.0f;
@@ -97,26 +102,47 @@ bool qwen_vision_preprocess(const unsigned char* rgb, int height, int width,
     const int C = cfg.in_channels, P = cfg.patch_size, T = cfg.temporal_patch;
     const int gh = rh / P, gw = rw / P;
 
-    // uint8 -> float in [0,1], planar, then resize each plane, then normalize with mean/std.
-    // Order matters: the reference rescales BEFORE normalizing, and normalizes AFTER resizing.
+    // Planar uint8 VALUES (0..255, not yet rescaled), then resize, then rescale, then normalize.
+    //
+    // This order is the reference's, and it is not interchangeable with rescaling first even
+    // though resampling is linear: transformers resizes the uint8 image and casts the result back
+    // to uint8 -- PIL in the slow processor, torchvision in the fast one -- which ROUNDS to
+    // nearest and CLAMPS bicubic's overshoot into [0,255]. Neither of those commutes with
+    // scaling. Rescaling first (which this did until measured) leaves the overshoot in place and
+    // drifts from the reference by up to 0.127 in normalized units at high-contrast edges, where
+    // rounding alone would account for only ~0.004.
     std::vector<float> plane((size_t)C * height * width);
     for (int c = 0; c < C; c++)
         for (int y = 0; y < height; y++)
             for (int x = 0; x < width; x++)
                 plane[((size_t)c * height + y) * width + x] =
-                    rgb[((size_t)y * width + x) * C + c] * (1.0f / 255.0f);
+                    (float)rgb[((size_t)y * width + x) * C + c];
 
     std::vector<float> tmp((size_t)C * height * rw), out((size_t)C * rh * rw);
     for (int c = 0; c < C; c++) {   // horizontal then vertical
         resample_axis(&plane[(size_t)c * height * width], width, rw, 1, 1,
                       height, width, rw, &tmp[(size_t)c * height * rw]);
-        resample_axis(&tmp[(size_t)c * height * rw], height, rh, rw, rw,
-                      rw, 1, 1, &out[(size_t)c * rh * rw]);
+        // The reference's INTERMEDIATE image is uint8 too: PIL resamples horizontally into an
+        // 8-bit temp, then vertically out of it, so the round-and-clamp happens TWICE. Carrying
+        // float through both passes and rounding once at the end is more accurate but drifts
+        // from the reference by several LSB at edges, which is not ours to decide.
+        float* t = &tmp[(size_t)c * height * rw];
+        for (long i = 0; i < (long)height * rw; i++)
+            t[i] = std::min(255.0f, std::max(0.0f, std::floor(t[i] + 0.5f)));
+        resample_axis(t, height, rh, rw, rw, rw, 1, 1, &out[(size_t)c * rh * rw]);
     }
     for (int c = 0; c < C; c++) {
         const float mu = cfg.mean[c], sd = cfg.std_[c] != 0.f ? cfg.std_[c] : 1.f;
         float* p = &out[(size_t)c * rh * rw];
-        for (long i = 0; i < (long)rh * rw; i++) p[i] = (p[i] - mu) / sd;
+        for (long i = 0; i < (long)rh * rw; i++) {
+            // The uint8 round-trip the reference performs, then rescale, then normalize.
+            // floor(x+0.5), i.e. round-half-UP, because PIL's 8-bit resample accumulates in
+            // fixed point and rounds with a half-LSB add -- not nearbyint's round-half-to-EVEN,
+            // which disagrees on exact .5 ties. (smart_resize above genuinely does want
+            // banker's rounding; that is Python's round(), a different reference entirely.)
+            const float q = std::min(255.0f, std::max(0.0f, std::floor(p[i] + 0.5f)));
+            p[i] = (q * (1.0f / 255.0f) - mu) / sd;
+        }
     }
 
     // Patchify: row-major over the grid, each patch (C, T, P, P), still image repeated across T.

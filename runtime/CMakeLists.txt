@@ -148,6 +148,12 @@ if(BUILD_EXAMPLES)
                                ${CMAKE_CURRENT_SOURCE_DIR}/../server/third_party)
     target_link_libraries(vision_e2e PRIVATE sparkinfer_runtime CUDA::cudart
                           nlohmann_json::nlohmann_json)
+    # Preprocessing differential (CPU only, no GPU) -- also needs the vendored stb_image.h.
+    add_executable(vision_preprocess_check examples/vision_preprocess_check.cpp)
+    target_include_directories(vision_preprocess_check PRIVATE include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/../server/third_party)
+    target_link_libraries(vision_preprocess_check PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
     add_executable(vision_forward_check examples/vision_forward_check.cpp)
     target_include_directories(vision_forward_check PRIVATE include)
     target_link_libraries(vision_forward_check PRIVATE sparkinfer_runtime CUDA::cudart
