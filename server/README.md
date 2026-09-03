@@ -71,6 +71,13 @@ export SPARKINFER_PROMPT_PRICE_USD=0.0000001
 export SPARKINFER_COMPLETION_PRICE_USD=0.0000003
 ```
 
+For a production provider endpoint, use `server/run_openrouter.sh` and follow the
+[OpenRouter operational SLO](../docs/openrouter_slo.md). The profile requires stable model
+metadata, bounds admission at six concurrent requests by default, enables a request deadline and
+keeps streaming heartbeats/usage enabled. It also enables strict provider-schema mode, omitting
+OpenAI's legacy `object`, `owned_by`, and root `context_length` fields because OpenRouter v2.4
+rejects unknown properties. These are deployment defaults, not a contractual uptime guarantee.
+
 SSE comment heartbeats are emitted every 15 seconds during queueing and long prefill. Configure
 that with `SPARKINFER_SSE_KEEPALIVE_SECONDS` (`0` disables it). Streaming usage is always emitted
 by default, even when the caller omits `stream_options.include_usage`; set
@@ -312,6 +319,11 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_MAX_QUEUE_DEPTH` | `0` (unlimited) | Admission-time cap on the total active continuous-batch set (running and waiting between scheduler steps). Beyond it, new requests are rejected as `429` before KV allocation. Production services that promise bounded admission should set this explicitly; `0` does not satisfy such a promise. |
 | `SPARKINFER_REQUEST_TIMEOUT_S` | `0` (disabled) | Per-request wall-clock deadline from submission to finish; exceeding it returns `504`. Left disabled by default — a cold 32k-context prefill alone has been measured taking ~90s of TTFT, so an aggressive default would misfire on legitimate long-context requests. |
 | `SPARKINFER_READ_TIMEOUT_S` / `SPARKINFER_WRITE_TIMEOUT_S` | `300` | Transport-level socket timeouts (httplib). Reset on each byte transferred, so a slow-but-progressing stream doesn't trip them. |
+| `SPARKINFER_MODEL_CREATED` | `0` | Model creation time as a Unix timestamp for OpenRouter schema v2.4. `run_openrouter.sh` requires a real value. |
+| `SPARKINFER_REQUESTS_PER_MINUTE` | — | Optional request/minute capacity published by `/v1/models`. Enforcement belongs at the gateway; this declaration must match it. |
+| `SPARKINFER_PROMPT_TOKENS_PER_MINUTE` | — | Optional prompt-token/minute capacity published by `/v1/models`. |
+| `SPARKINFER_COMPLETION_TOKENS_PER_MINUTE` | — | Optional completion-token/minute capacity published by `/v1/models`. |
+| `SPARKINFER_OPENROUTER_PROVIDER` | `0` | `1` emits the strict, closed OpenRouter v2.4 model document. The OpenRouter launcher sets this automatically. |
 
 ### Concurrency diagnostic
 

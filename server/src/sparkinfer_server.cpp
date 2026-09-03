@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <csignal>
 #include <chrono>
 #include <condition_variable>
@@ -57,9 +58,30 @@ bool always_stream_usage() {
     return v;
 }
 
+bool openrouter_provider_mode() {
+    static bool v = [] {
+        const char* e = getenv("SPARKINFER_OPENROUTER_PROVIDER");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
 std::string env_string(const char* name, const std::string& fallback = {}) {
     const char* value = getenv(name);
     return value && *value ? value : fallback;
+}
+
+// Positive integer deployment metadata used by OpenRouter's provider schema. Invalid or absent
+// values are omitted rather than publishing a made-up limit. `created` is the one exception: the
+// schema requires it, so an unconfigured deployment reports the Unix epoch and the OpenRouter
+// launcher below requires operators to provide the real model timestamp.
+long long env_positive_integer(const char* name, long long fallback = 0) {
+    const char* value = getenv(name);
+    if (!value || !*value) return fallback;
+    char* end = nullptr;
+    errno = 0;
+    const long long parsed = strtoll(value, &end, 10);
+    return errno == 0 && end && *end == '\0' && parsed > 0 ? parsed : fallback;
 }
 
 std::string g_api_key;
@@ -559,16 +581,43 @@ int main(int argc, char** argv) {
         if (!completion_price.empty())
             output["pricing"] = json::array({{{"type", "completion"}, {"unit", "token"},
                                                 {"cost_usd", completion_price}}});
+
+        const long long prompt_tpm = env_positive_integer("SPARKINFER_PROMPT_TOKENS_PER_MINUTE");
+        if (prompt_tpm > 0)
+            input["capacity"] = json::array({{{"type", "prompt"}, {"unit", "token"},
+                                                {"per", "minute"}, {"value", prompt_tpm}}});
+        const long long completion_tpm =
+            env_positive_integer("SPARKINFER_COMPLETION_TOKENS_PER_MINUTE");
+        if (completion_tpm > 0)
+            output["capacity"] = json::array({{{"type", "completion"}, {"unit", "token"},
+                                                 {"per", "minute"}, {"value", completion_tpm}}});
         json model = {
             {"schema_version", "2.4"}, {"id", g_model_name}, {"name", g_model_name},
-            {"object", "model"}, {"owned_by", "sparkinfer"},
+            {"created", env_positive_integer("SPARKINFER_MODEL_CREATED")},
             {"hugging_face_id", env_string("SPARKINFER_HF_MODEL_ID")},
             {"quantization", nullptr},
-            {"context_length", context},
             {"input_modalities", json::array({std::move(input)})},
             {"output_modalities", json::array({std::move(output)})},
-            {"is_ready", engine.loaded() && engine.device_healthy()}
+            {"is_ready", engine.loaded() && engine.device_healthy() && !g_shutdown_requested.load()}
         };
+        // OpenRouter's v2.4 schema is closed (`additionalProperties: false`), while OpenAI clients
+        // conventionally expect these legacy list-model fields. Provider mode must omit them;
+        // ordinary deployments retain the old response shape for compatibility.
+        if (!openrouter_provider_mode()) {
+            model["object"] = "model";
+            model["owned_by"] = "sparkinfer";
+            model["context_length"] = context;
+        }
+        const long long rpm = env_positive_integer("SPARKINFER_REQUESTS_PER_MINUTE");
+        if (rpm > 0)
+            model["capacity"] = json::array({{{"type", "request"}, {"unit", "request"},
+                                                {"per", "minute"}, {"value", rpm}}});
+        const int concurrency = engine.max_queue_depth();
+        if (concurrency > 0) {
+            if (!model.contains("capacity")) model["capacity"] = json::array();
+            model["capacity"].push_back({{"type", "concurrency"}, {"unit", "request"},
+                                           {"value", concurrency}});
+        }
         const std::string quantization = env_string("SPARKINFER_QUANTIZATION");
         if (!quantization.empty()) model["quantization"] = quantization;
         res.set_content(json({{"object", "list"}, {"data", json::array({std::move(model)})}}).dump(),
