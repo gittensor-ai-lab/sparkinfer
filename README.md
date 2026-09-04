@@ -156,13 +156,13 @@ target verify them in one batched pass, so accepting *k* tokens costs one target
 
 | context | DSpark decode | AR decode | speedup | mean accepted (τ) |
 |---:|---:|---:|---:|---:|
-| 16k | **128.6** tok/s | 86.8 tok/s | **1.482×** | 1.730 |
+| 16k | **130.1** tok/s | 86.7 tok/s | **1.499×** | 1.730 |
 
 <sub>**Lossless**: the eval regenerates the same prompt with the draft disabled and requires the two token sequences to be byte-identical, so this is exact-token equality with autoregressive decode, not distributional agreement. A run that is not lossless is rejected regardless of speed.</sub>
 
 <sub>Measured at ctx=16384 on `bench/scripts/bench_prompt_32k.txt`. Speculative throughput depends on how predictable the generated text is — the same build measures a materially different τ on prose, code and repetitive text — so treat this as that workload at that context, not a general serving figure. The AR column is the autoregressive decode measured in the same process, same model load, same GPU state.</sub>
 
-<sub>Auto-refreshed by the DSpark eval bot at `b97f6ce67` — these are the numbers that PR measured on the pinned RTX 5090, which after squash-merge are main's. Regenerated on every auto-merge, so the table cannot drift behind the code.</sub>
+<sub>Auto-refreshed by the DSpark eval bot at `e281c615f` — these are the numbers that PR measured on the pinned RTX 5090, which after squash-merge are main's. Regenerated on every auto-merge, so the table cannot drift behind the code.</sub>
 <!-- BENCH:qwen38-dspark:end -->
 
 Speculation only pays when the verify costs less than what it replaces: `speedup ≈ τ / (verify cost
