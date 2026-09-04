@@ -122,6 +122,15 @@ jobs:
           if-no-files-found: error
 
   build-windows:
+    # Not on pull requests. The Windows bundle only ships from `push` to main and from version
+    # tags -- the `release` job below is gated on refs/tags/v* -- so building it per PR gated
+    # nothing and produced nothing that ships. It just spent ~13 minutes of Windows runner time
+    # on every PR and left a red X reviewers had to learn to ignore.
+    #
+    # Safe to skip: branch protection's only required status check is "guard", so this cannot
+    # block a merge. Linux still builds, packages and smoke-tests on every PR, and Windows is
+    # still built (and attested) on push to main and on release tags, where it actually ships.
+    if: github.event_name != 'pull_request'
     runs-on: windows-2022
     permissions:
       contents: read
