@@ -85,6 +85,10 @@ long long env_positive_integer(const char* name, long long fallback = 0) {
 }
 
 std::string g_api_key;
+// Advertised model id: every completion response, /v1/models, /v1/info and /metrics carry it,
+// and clients route, log and bill on it. This default is a Qwen3.6 id for historical reasons, so
+// it is only correct when a Qwen3.6 checkpoint is what actually got loaded -- main() corrects it
+// after load() for the architectures the engine can identify, unless --model-name was given.
 std::string g_model_name = "qwen3.6-35b-a3b";
 sparkinfer_server::ChatTokenizer g_tokenizer;
 const auto g_start_time = std::chrono::steady_clock::now();
@@ -504,6 +508,7 @@ int main(int argc, char** argv) {
     int port = 8080;
     std::string model_path;
     std::string tokenizer_json;
+    bool model_name_explicit = false;   // --model-name given: never second-guess the operator
     int ctx = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -515,7 +520,7 @@ int main(int argc, char** argv) {
         else if (need("--ctx")) ctx = atoi(argv[++i]);
         else if (need("--api-key")) g_api_key = argv[++i];
         else if (need("--tokenizer")) tokenizer_json = argv[++i];
-        else if (need("--model-name")) g_model_name = argv[++i];
+        else if (need("--model-name")) { g_model_name = argv[++i]; model_name_explicit = true; }
         else if (a == "-h" || a == "--help") {
             fprintf(stderr,
                     "usage: %s -m model.gguf [--host 127.0.0.1] [--port 8080] [--ctx N] "
@@ -540,6 +545,22 @@ int main(int argc, char** argv) {
 
     sparkinfer_server::ModelEngine engine;
     if (!engine.load(model_path, ctx > 0 ? ctx : 0)) return 1;
+
+    // Name what was actually loaded. Without this the server reports "qwen3.6-35b-a3b" whatever
+    // it is serving -- a client asking Qwen3.8 a question is told it spoke to Qwen3.6, and every
+    // log line and usage record inherits that.
+    //
+    // Deliberately narrow: only architectures the engine can positively identify are renamed, and
+    // Qwen3.6 keeps the historical id byte-for-byte. Deriving the name from the checkpoint path
+    // instead would be more general and would also change what existing Qwen3.6 deployments
+    // advertise, which is what OpenRouter routes on.
+    if (!model_name_explicit) {
+        if (engine.is_qwen38()) g_model_name = "qwen3.8-27b";
+        else if (engine.is_museglimmer()) g_model_name = "muse-glimmer-30b";
+        if (g_model_name != "qwen3.6-35b-a3b")
+            fprintf(stderr, "[sparkinfer-server] advertising model id: %s "
+                            "(override with --model-name)\n", g_model_name.c_str());
+    }
     g_tokenizer.set_museglimmer(engine.is_museglimmer());
     g_tokenizer.set_qwen38(engine.is_qwen38());
 
@@ -611,12 +632,25 @@ int main(int argc, char** argv) {
         if (completion_tpm > 0)
             output["capacity"] = json::array({{{"type", "completion"}, {"unit", "token"},
                                                  {"per", "minute"}, {"value", completion_tpm}}});
+        // Advertise image input when a vision tower actually loaded. Claiming text-only while
+        // accepting images makes a router refuse to send work this server can do; claiming images
+        // on a text-only checkpoint is worse, so it keys off has_vision() rather than a build flag.
+        //
+        // CAVEAT: OpenRouter's v2.4 schema is closed (additionalProperties: false) and is not
+        // vendored here, so this entry's exact shape is unverified against it. It only appears for
+        // a vision-capable checkpoint, and the registered provider deployment is Qwen3.6 (GGUF, no
+        // tower), so a listing in use today cannot be affected -- but verify against the model
+        // monitor before registering a vision model.
+        json input_modalities = json::array({std::move(input)});
+        if (engine.has_vision())
+            input_modalities.push_back({{"type", "image"}});
+
         json model = {
             {"schema_version", "2.4"}, {"id", g_model_name}, {"name", g_model_name},
             {"created", env_positive_integer("SPARKINFER_MODEL_CREATED")},
             {"hugging_face_id", env_string("SPARKINFER_HF_MODEL_ID")},
             {"quantization", nullptr},
-            {"input_modalities", json::array({std::move(input)})},
+            {"input_modalities", std::move(input_modalities)},
             {"output_modalities", json::array({std::move(output)})},
             {"is_ready", engine.loaded() && engine.device_healthy() && !g_shutdown_requested.load()}
         };
