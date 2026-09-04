@@ -3,14 +3,82 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
-## Unreleased
+## [0.5.4] — 2026-09-04
 
+**SparkInfer is faster than SGLang across the matched workload matrix**, and Qwen3.8-27B now
+accepts image input. DSpark speculative decode is additionally measured at 16K and 32K, which
+0.5.3 declined to claim.
+
+### Versus SGLang
+
+The engine-versus-engine result stands as measured in 0.5.3: both engines on the same prompts,
+same box, same 4K / 128-token shape. SparkInfer was faster in every workload of that matrix.
+
+| workload | SparkInfer | SGLang | delta |
+|---|---:|---:|---:|
+| chat | **167.92 tok/s** | 114.56 tok/s | **+46.6%** |
+| code | **171.89 tok/s** | 170.32 tok/s | **+0.9%** |
+| math | **249.08 tok/s** | 225.09 tok/s | **+10.7%** |
+| JSON | **202.88 tok/s** | 202.33 tok/s | **+0.3%** |
+| repetition | **406.85 tok/s** | 398.61 tok/s | **+2.1%** |
+
+This release does not re-measure SGLang, and makes no SGLang claim at 16K or 32K.
+
+### DSpark decode across context
+
+RTX 5090 · target `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` · draft
+`gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4` · greedy batch size 1 · 128-token output ·
+thinking disabled · best of 3 · every row byte-identical to SparkInfer's own AR output.
+
+| workload | 4K | 16K | 32K |
+|---|---:|---:|---:|
+| chat | **306.0** | 133.7 | 131.3 |
+| code | **379.6** | 242.2 | 163.4 |
+| math | **355.6** | 260.0 | 233.0 |
+| JSON | **348.6** | 298.4 | 243.1 |
+| repetition | **436.8** | 349.4 | 297.1 |
+| **mean speedup over AR** | **4.01x** | **2.97x** | **2.63x** |
+
+The AR reference is measured in the same process and model load: 91.0 tok/s at 4K, 86.4 at 16K,
+81.3 at 32K. Speculation stays lossless — a draft token is emitted only after the target verifies
+it exactly.
+
+Two caveats worth stating plainly. **This table is not comparable to the SGLang table above**: the
+prompt corpus differs, 0.5.3's was never committed, and the same engine measures 167.9 on that
+corpus and 306.0 on this one — most of that gap is prompts, not code. And the `counting` workload
+is omitted here; it sits nearest the block-size ceiling, where tau swings between 3.3 and 7.5 on
+prompt details alone, so its per-context figures are not stable enough to publish.
+
+This release therefore ships the corpus (`bench/scripts/workloads.py`) with the three methodology
+choices that dominate any result: 128 generated tokens, thinking disabled, and prompts capped at
+`max_seq`. Reproducing 0.5.3 required rediscovering all three.
+
+### Image input
+
+`/v1/chat/completions` accepts OpenAI `image_url` content parts on checkpoints that ship a vision
+tower. Several images per request, interleaved with text, each expanded to the token count its own
+resized grid needs. `data:` URLs only — remote fetching is refused as an SSRF primitive.
+See [`docs/image_input.md`](docs/image_input.md).
+
+The tower is verified against `transformers`' own `Qwen3_5VisionModel` rather than a
+re-implementation. That mattered: a hand-written reference and the CUDA both omitted the tower's
+2D rotary position embeddings and agreed with each other at cosine 0.999 while both disagreed with
+the real implementation at 0.77. Preprocessing is checked against the real `Qwen2VLImageProcessor`
+to within one uint8 LSB.
+
+### Also
+
+- Target decode at 256K is now a scored dimension, taken from the sweep that already runs.
+- The DSpark eval no longer reports stages that never ran as failures; a fail-fast round shows the
+  one reason it stopped instead of nine.
+- The server reports the model it actually loaded, and advertises image input when a vision tower
+  is present.
 - Added `server/scripts/diagnose_concurrency.py`, a reproducible 6/8/10/12-stream diagnostic that
   captures external token throughput, request accounting, capacity, container configuration, GPU
   telemetry and PCIe state in one JSON report.
 - Documented the exact trust boundary and compatibility semantics of the server's `ttft_ms`,
-  `generation_ms` and `decode_tps` fields. They are engine telemetry, not trusted billing or reward
-  measurements.
+  `generation_ms` and `decode_tps` fields. They are engine telemetry, not trusted billing or
+  reward measurements.
 - Clarified that deterministic concurrent batching is promised only for a qualified runtime,
   artifact, configuration and GPU-model tuple.
 - Clarified that `SPARKINFER_MAX_QUEUE_DEPTH=0` is unlimited admission and that deployments which
