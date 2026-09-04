@@ -2209,7 +2209,13 @@ def format_comment(commit: str, res: dict) -> str:
 
     def _v(key, fmt, unit=""):
         v = res.get(key)
-        return "—" if v is None else f"{format(v, fmt)}{unit}"
+        # A skipped stage reports 0 rather than nothing (the shell emits 0 for an unrun step), and
+        # a throughput of exactly 0 is never a real measurement -- #961 printed "PR prefill @256k
+        # 0.0 pp/s" against main's 3495, which reads as a total collapse rather than a stage that
+        # never started. Only when the round fail-fasted: outside that, a real zero is a finding.
+        if v is None or (early and v == 0 and unit):
+            return "—"
+        return f"{format(v, fmt)}{unit}"
 
     def _pct(key, pr_key=None, main_key=None):
         v = res.get(key)
