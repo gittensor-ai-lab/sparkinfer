@@ -2197,10 +2197,50 @@ def format_comment(commit: str, res: dict) -> str:
     def _num(key, default=0.0):
         v = res.get(key)
         return default if v is None else v
-    if res.get("accuracy_ok"):
+
+    # A round that fail-fasts leaves every later measurement absent. Rendering absent as a NUMBER
+    # is what made this report unreadable: a skipped 256k stage printed "0.0 pp/s" (reads as
+    # catastrophic), a missing delta printed "+0.0%" (reads as measured-and-neutral, even when the
+    # two columns beside it plainly differ), and a missing pass-flag printed "FAILED" (reads as a
+    # second, unrelated defect). A contributor then sees eight failures instead of the one real
+    # cause. Absent must look absent.
+    early = res.get("early_reject")
+    early_stage = res.get("early_reject_stage") or "dspark"
+
+    def _v(key, fmt, unit=""):
+        v = res.get(key)
+        return "—" if v is None else f"{format(v, fmt)}{unit}"
+
+    def _pct(key, pr_key=None, main_key=None):
+        v = res.get(key)
+        if v is not None:
+            return f"{v:+.1f}%"
+        # The bot only stores a delta for the SCORED dimension, so every other row used to print
+        # "+0.0%" from a dict default -- next to two columns that visibly differed. Compute it
+        # when both sides were actually measured: showing a contributor -3.6% at 4k AND 16k is
+        # the difference between "something failed" and "here is where you regressed".
+        pr, mn = res.get(pr_key), res.get(main_key)
+        if pr is None or mn is None or not mn:
+            return "—"
+        return f"{100.0 * (pr - mn) / mn:+.1f}%"
+
+    def _gate(name, ok_key, ok_text, fail_text):
+        if res.get(ok_key):
+            return f"| {name} | ✅ {ok_text} |\n"
+        if early:
+            return (f"| {name} | ⏭️ not reached — the round stopped at the "
+                    f"`{early_stage}` stage |\n")
+        return f"| {name} | ❌ **FAILED** — {fail_text} — **verdict forced to REJECT** |\n"
+    # early_reject FIRST: the ok-flag is absent or stale after a fail-fast, and testing it first
+    # is how this row came to read "✅ top1=0.000" against a bar of >=0.9 -- a tick and a failing
+    # number in the same cell.
+    if early:
+        acc_row = ("| accuracy gate | ⏭️ not reached — the round stopped at the "
+                   f"`{early_stage}` stage |\n")
+    elif res.get("accuracy_ok"):
         acc_row = (f"| accuracy gate | ✅ top1={_num('pr_top1'):.3f} "
                     f"(bar >={ACC_TOP1_BAR}) · KL={_num('pr_kl'):.4f} (bar <={ACC_KL_BAR}) |\n")
-    elif res.get("early_reject"):
+    elif False:
         # Not a failure of this gate -- it never ran. Saying "FAILED top1=0.000" here would be a
         # false statement about a PR that was stopped earlier, for a different reason.
         acc_row = ("| accuracy gate | ⏭️ not reached — rejected earlier at the "
@@ -2212,44 +2252,44 @@ def format_comment(commit: str, res: dict) -> str:
     # No "main accuracy" row: this gate is differential, so main IS the reference -- there is no
     # separate absolute bar for it to miss.
     main_acc_note = ""
-    if res.get("lossless"):
-        ls_row = ("| losslessness gate | ✅ DSpark matches the AR reference token-for-token, "
-                  f"verified across **{res.get('lossless_runs', 1)}** independent runs |\n")
-    else:
-        ls_row = ("| losslessness gate | ❌ **FAILED** — DSpark diverged from the AR reference — "
-                  "**verdict forced to REJECT regardless of speed** |\n")
-    if res.get("lossless32"):
-        ls32_row = ("| losslessness @32k | ✅ DSpark matches AR token-for-token, "
-                    f"verified across **{res.get('lossless32_runs', 1)}** independent runs |\n")
-    else:
-        ls32_row = ("| losslessness @32k | ❌ **FAILED or not measured** — "
-                    "**verdict forced to REJECT** |\n")
-    if res.get("lossless4"):
-        ls4_row = ("| losslessness @4k | ✅ DSpark matches AR token-for-token, "
-                   f"verified across **{res.get('lossless4_runs', 1)}** independent runs |\n")
-    else:
-        ls4_row = ("| losslessness @4k | ❌ **FAILED or not measured** — "
-                   "**verdict forced to REJECT** |\n")
-    if res.get("tau_ok"):
-        tau_row = (f"| mean accept τ floor | ✅ {_num('pr_mean_accept'):.4f} vs main "
-                   f"{_num('main_mean_accept'):.4f} (bar ≥{100 * DSPARK_TAU_TOL:.0f}%) |\n")
-    else:
-        tau_row = (f"| mean accept τ floor | ❌ **FAILED** — {_num('pr_mean_accept'):.4f} vs main "
-                   f"{_num('main_mean_accept'):.4f} — throughput gained by speculating less is "
-                   "the feature being removed, not a speedup — **verdict forced to REJECT** |\n")
-    tau4_row = (f"| mean accept τ @4k | {_num('pr_mean_accept4'):.4f} "
-                f"(main {_num('main_mean_accept4'):.4f}) — "
-                f"{'✅' if res.get('tau4_ok') else '❌'} |\n")
-    tau32_row = (f"| mean accept τ @32k | {_num('pr_mean_accept32'):.4f} "
-                 f"(main {_num('main_mean_accept32'):.4f}) — "
-                 f"{'✅' if res.get('tau32_ok') else '❌'} |\n")
+    ls_row = _gate("losslessness gate", "lossless",
+                   "DSpark matches the AR reference token-for-token, verified across "
+                   f"**{res.get('lossless_runs', 1)}** independent runs",
+                   "DSpark diverged from the AR reference")
+    ls32_row = _gate("losslessness @32k", "lossless32",
+                     "DSpark matches AR token-for-token, verified across "
+                     f"**{res.get('lossless32_runs', 1)}** independent runs",
+                     "DSpark diverged from the AR reference at 32k")
+    ls4_row = _gate("losslessness @4k", "lossless4",
+                    "DSpark matches AR token-for-token, verified across "
+                    f"**{res.get('lossless4_runs', 1)}** independent runs",
+                    "DSpark diverged from the AR reference at 4k")
+    tau_row = _gate("mean accept τ floor", "tau_ok",
+                    f"{_v('pr_mean_accept', '.4f')} vs main {_v('main_mean_accept', '.4f')} "
+                    f"(bar ≥{100 * DSPARK_TAU_TOL:.0f}%)",
+                    f"{_v('pr_mean_accept', '.4f')} vs main {_v('main_mean_accept', '.4f')} — "
+                    "throughput gained by speculating less is the feature being removed, "
+                    "not a speedup")
+    def _tau_ctx_row(name, pr_key, main_key, ok_key):
+        if res.get(ok_key):
+            return (f"| {name} | ✅ {_v(pr_key, '.4f')} (main {_v(main_key, '.4f')}) |\n")
+        if early:
+            return (f"| {name} | ⏭️ not reached — the round stopped at the "
+                    f"`{early_stage}` stage |\n")
+        return f"| {name} | ❌ {_v(pr_key, '.4f')} (main {_v(main_key, '.4f')}) |\n"
+    tau4_row = _tau_ctx_row("mean accept τ @4k", "pr_mean_accept4", "main_mean_accept4", "tau4_ok")
+    tau32_row = _tau_ctx_row("mean accept τ @32k", "pr_mean_accept32", "main_mean_accept32", "tau32_ok")
+
     def _guard_row(name, ok_key, prob_key, ctxs_key):
         if res.get(ok_key):
             vals = (res.get(ctxs_key) or {}).get(16384) or {}
             detail = (f" — decode {vals['decode']:.1f} tok/s · prefill {vals['prefill']:.0f} pp"
                       if vals.get("decode") and vals.get("prefill") else "")
             return f"| {name} guard @16k | ✅ no regression (decode+prefill){detail} |\n"
-        problems = "; ".join((res.get(prob_key) or [])[:4])
+        if early:
+            return (f"| {name} guard @16k | ⏭️ not reached — the round stopped at the "
+                    f"`{early_stage}` stage |\n")
+        problems = "; ".join((res.get(prob_key) or [])[:4]) or "regression detected"
         return (f"| {name} guard @16k | ❌ **FAILED** — {problems} — "
                 "**verdict forced to REJECT regardless of speed** |\n")
     # "(upstream unsloth)", not "(ModelOpt)": ModelOpt is the SCORED checkpoint, and labelling the
@@ -2268,39 +2308,54 @@ def format_comment(commit: str, res: dict) -> str:
         polaris_row = "| Polaris receipt | collected, not signed (no key configured) |\n"
     else:
         polaris_row = ""
+    # The decisive line, at the TOP. It was previously the last line of the comment, under ~30
+    # rows of metrics -- several of which the same fail-fast had left unmeasured and which the
+    # table then rendered as failures. The one sentence that explains the verdict should not be
+    # the one a contributor has to scroll for.
+    if early:
+        banner = (f"> ### ❌ Rejected at the `{early_stage}` stage\n>\n"
+                  f"> **{early}**\n>\n"
+                  "> The round stops at the first regression, so every later stage was **not run**. "
+                  "Rows marked ⏭️ below were not measured — they are not additional failures, and "
+                  "fixing this one may be all that is needed.\n\n")
+    elif res.get("reason") and lab == "REJECT":
+        banner = f"> ### ❌ Rejected\n>\n> **{res.get('reason')}**\n\n"
+    else:
+        banner = ""
     return (
         f"{marker}\n## sparkinfer DSpark auto-eval — `eval-dspark:{lab}`\n\n"
+        f"{banner}"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-dspark:{lab}` |\n"
         f"| scored at | **DSpark decode + batched prefill @4k/@16k/@32k; target prefill @256k** on the ModelOpt NVFP4 checkpoint |\n"
-        f"| **PR DSpark @4k** | **{_num('pr_dspark4_tps'):.2f} tok/s** |\n"
-        f"| **main DSpark @4k** | **{_num('main_dspark4_tps'):.2f} tok/s** |\n"
-        f"| DSpark decode @4k vs main | {res.get('decode4_delta_pct', 0):+.1f}% |\n"
-        f"| **PR prefill @4k** | **{_num('pr_prefill4_pp'):.1f} pp/s** |\n"
-        f"| **main prefill @4k** | **{_num('main_prefill4_pp'):.1f} pp/s** |\n"
-        f"| prefill @4k vs main | {res.get('prefill4_delta_pct', 0):+.1f}% |\n"
-        f"| **PR DSpark @16k** | **{_num('pr_dspark_tps'):.2f} tok/s** |\n"
-        f"| **main DSpark @16k** | **{_num('main_dspark_tps'):.2f} tok/s** |\n"
-        f"| DSpark decode @16k vs main | {res.get('decode_delta_pct', 0):+.1f}% |\n"
-        f"| **PR prefill @16k** | **{_num('pr_prefill16_pp'):.1f} pp/s** |\n"
-        f"| **main prefill @16k** | **{_num('main_prefill16_pp'):.1f} pp/s** |\n"
-        f"| prefill @16k vs main | {res.get('prefill16_delta_pct', 0):+.1f}% |\n"
-        f"| **PR DSpark @32k** | **{_num('pr_dspark32_tps'):.2f} tok/s** |\n"
-        f"| **main DSpark @32k** | **{_num('main_dspark32_tps'):.2f} tok/s** |\n"
-        f"| DSpark decode @32k vs main | {res.get('decode32_delta_pct', 0):+.1f}% |\n"
-        f"| **PR prefill @32k** | **{_num('pr_prefill_pp'):.1f} pp/s** |\n"
-        f"| **main prefill @32k** | **{_num('main_prefill_pp'):.1f} pp/s** |\n"
-        f"| prefill vs main | {res.get('prefill_delta_pct', 0):+.1f}% |\n"
-        f"| **PR prefill @256k** | **{_num('pr_prefill256_pp'):.1f} pp/s** |\n"
-        f"| **main prefill @256k** | **{_num('main_prefill256_pp'):.1f} pp/s** |\n"
-        f"| **PR decode @256k** | **{_num('pr_decode256_tps'):.2f} tok/s** |\n"
-        f"| **main decode @256k** | **{_num('main_decode256_tps'):.2f} tok/s** |\n"
-        f"| prefill @256k vs main | {res.get('prefill256_delta_pct', 0):+.1f}% |\n"
-        f"| PR AR tok/s (floor) | {_num('pr_ar_tps'):.2f} |\n"
-        f"| main AR tok/s (floor) | {_num('main_ar_tps'):.2f} |\n"
-        f"| AR vs main (floor) | {res.get('ar_delta_pct', 0):+.1f}% |\n"
-        f"| **DSpark vs AR** | **{res.get('dspark_vs_ar', 0):.3f}×** — above 1.0 means speculation finally pays |\n"
-        f"| mean accept τ | {_num('pr_mean_accept'):.3f} (main {_num('main_mean_accept'):.3f}, ceiling 7) |\n"
+        f"| **PR DSpark @4k** | **{_v('pr_dspark4_tps', '.2f', ' tok/s')}** |\n"
+        f"| **main DSpark @4k** | **{_v('main_dspark4_tps', '.2f', ' tok/s')}** |\n"
+        f"| DSpark decode @4k vs main | {_pct('decode4_delta_pct', 'pr_dspark4_tps', 'main_dspark4_tps')} |\n"
+        f"| **PR prefill @4k** | **{_v('pr_prefill4_pp', '.1f', ' pp/s')}** |\n"
+        f"| **main prefill @4k** | **{_v('main_prefill4_pp', '.1f', ' pp/s')}** |\n"
+        f"| prefill @4k vs main | {_pct('prefill4_delta_pct', 'pr_prefill4_pp', 'main_prefill4_pp')} |\n"
+        f"| **PR DSpark @16k** | **{_v('pr_dspark_tps', '.2f', ' tok/s')}** |\n"
+        f"| **main DSpark @16k** | **{_v('main_dspark_tps', '.2f', ' tok/s')}** |\n"
+        f"| DSpark decode @16k vs main | {_pct('decode_delta_pct', 'pr_dspark_tps', 'main_dspark_tps')} |\n"
+        f"| **PR prefill @16k** | **{_v('pr_prefill16_pp', '.1f', ' pp/s')}** |\n"
+        f"| **main prefill @16k** | **{_v('main_prefill16_pp', '.1f', ' pp/s')}** |\n"
+        f"| prefill @16k vs main | {_pct('prefill16_delta_pct', 'pr_prefill16_pp', 'main_prefill16_pp')} |\n"
+        f"| **PR DSpark @32k** | **{_v('pr_dspark32_tps', '.2f', ' tok/s')}** |\n"
+        f"| **main DSpark @32k** | **{_v('main_dspark32_tps', '.2f', ' tok/s')}** |\n"
+        f"| DSpark decode @32k vs main | {_pct('decode32_delta_pct', 'pr_dspark32_tps', 'main_dspark32_tps')} |\n"
+        f"| **PR prefill @32k** | **{_v('pr_prefill_pp', '.1f', ' pp/s')}** |\n"
+        f"| **main prefill @32k** | **{_v('main_prefill_pp', '.1f', ' pp/s')}** |\n"
+        f"| prefill vs main | {_pct('prefill_delta_pct', 'pr_prefill_pp', 'main_prefill_pp')} |\n"
+        f"| **PR prefill @256k** | **{_v('pr_prefill256_pp', '.1f', ' pp/s')}** |\n"
+        f"| **main prefill @256k** | **{_v('main_prefill256_pp', '.1f', ' pp/s')}** |\n"
+        f"| **PR decode @256k** | **{_v('pr_decode256_tps', '.2f', ' tok/s')}** |\n"
+        f"| **main decode @256k** | **{_v('main_decode256_tps', '.2f', ' tok/s')}** |\n"
+        f"| prefill @256k vs main | {_pct('prefill256_delta_pct', 'pr_prefill256_pp', 'main_prefill256_pp')} |\n"
+        f"| PR AR tok/s (floor) | {_v('pr_ar_tps', '.2f')} |\n"
+        f"| main AR tok/s (floor) | {_v('main_ar_tps', '.2f')} |\n"
+        f"| AR vs main (floor) | {_pct('ar_delta_pct', 'pr_ar_tps', 'main_ar_tps')} |\n"
+        f"| **DSpark vs AR** | **{_v('dspark_vs_ar', '.3f', '×')}** — above 1.0 means speculation finally pays |\n"
+        f"| mean accept τ | {_v('pr_mean_accept', '.3f')} (main {_v('main_mean_accept', '.3f')}, ceiling 7) |\n"
         f"{acc_row}"
         f"{main_acc_note}"
         f"{ls_row}"
