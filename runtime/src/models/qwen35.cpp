@@ -3681,10 +3681,27 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // 24576 is not a new boundary: it is the one dflash_draft.cpp's window ladder already splits
     // the long band at, so the depth plan and the draft's attention window change together.
     constexpr int kVeryDeepMinSeq = 24576;
+    // The 12288..24576 band's depth of 2 is STALE. Its note above is anchored on a run where the
+    // arm spread was 82-92 tok/s; the same sweep today, on the released NVFP4 draft, runs at
+    // 121-134 and reverses the ordering. Three interleaved rounds at ctx=16384, every arm
+    // lossless, AR flat at 88.3-89.0:
+    //
+    //     depth   1        2 (was)   3          4
+    //     tok/s   121.48   131.25    134.03     129.76
+    //     tau     1.5176   1.7297    1.8971     1.8194
+    //
+    // Depth 3 is +2.12% end to end, and it gets there by ACCEPTING MORE (tau +9.7%), not by
+    // spending fewer verify rows -- the verify grows 12.091 -> 12.935 ms and the extra proposal
+    // still pays for itself. That is the direction this bot rewards; a throughput win bought by
+    // speculating less would not be one.
+    //
+    // Depth 4 turns back over (tau falls to 1.8194), so 3 is a peak and not the edge of a ramp.
+    // The band is bounded at both ends, so nothing else moves: 4k takes the kShortGeneration
+    // branch and 32k the >= kVeryDeepMinSeq one, both untouched.
     const int kInitialProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
                                     : ((kShortGeneration || kAmortizedMidContext) ? 7
                                        : ((n + max_new) >= kVeryDeepMinSeq ? 1
-                                          : ((n + max_new) >= kDeepMinSeq ? 2
+                                          : ((n + max_new) >= kDeepMinSeq ? 3
                                              : ((n + max_new) < kMid4kMaxSeq ? 5 : 3)))));
     // A length-only depth is a safe starting point, not a workload policy. At the same 16k
     // context real chat accepts ~1.36 tokens while code/JSON/repetition accept 5.35/6.62/6.92 at
