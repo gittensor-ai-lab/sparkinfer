@@ -3324,8 +3324,18 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
     const auto* sp = reinterpret_cast<const float*>(xs);
     auto* yp0 = reinterpret_cast<__nv_bfloat16*>(y0);
     auto* yp1 = reinterpret_cast<__nv_bfloat16*>(y1);
+    // Default ON for batched widths; SPARKINFER_NVFP4_ROWS_PAIRWISE=0 restores the concatenated
+    // grid. This kernel sizes itself, by its own note above, to match "the old NR=2 single-matrix
+    // CTA" -- and at width 3 the single-matrix dispatch was NOT NR=2, it was carved out to NR=1.
+    // The two were mismatched at exactly the width the scored verifier runs, which is why turning
+    // this on used to LOSE (-0.53% at ctx=16384 on the old dispatch) and now wins. Measured on
+    // RTX 5090 with the width-3 carve-out removed, arms interleaved, tau identical and lossless:
+    //     ctx=16384   148.63 -> 149.81 tok/s   (verify 11.800 -> 11.700 ms)
+    //     ctx=4096    135.08 -> 136.28 tok/s
+    // It engages only at M >= 2, so AR decode and both long-context guard models -- which drive
+    // this path one activation row at a time -- keep byte-for-byte the launch they had.
     static const bool pairwise = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_PAIRWISE");
-                                     return e && e[0] == '1'; }();
+                                     return !(e && e[0] == '0'); }();
 #define SI_NVFP4_PAIRWISE(S_, R_) do {                                                        \
         constexpr int S=(S_), R=(R_), NR=1, PAIR_WPB=(S==8)?8:4, RPB=PAIR_WPB/S;              \
         gemv_nvfp4_rows_dp4a_pairwise_kernel<__nv_bfloat16,S,R,NR>                             \
@@ -3353,10 +3363,10 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
 #undef SI_NVFP4_PAIRWISE
 #define SI_NVFP4_DP4A2(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
-        /* Width three is the long-context verifier's steady shape. NR=1 keeps enough CTAs */ \
-        /* resident to hide the larger per-row register footprint; wider verifies still win */ \
-        /* from sharing each activation read across two output rows. */ \
-        const int nr = nr_mode ? nr_mode : ((R == 1 || R == 3) ? 1 : 2); \
+        /* Width three takes NR=2 like every other batched width -- one activation read shared */ \
+        /* across two output rows. It used to be carved out to NR=1 here and in the single- */ \
+        /* matrix dispatch below; see the measurement on that one, which retired both. */ \
+        const int nr = nr_mode ? nr_mode : ((R == 1) ? 1 : 2); \
         const int blk = RPB * nr; \
         if (N % blk) return false; \
         const dim3 grid(2 * (N / blk)); \
@@ -3405,23 +3415,37 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
     //   R >= 2 (the batched verify): NR=2 -> 14.116 ms per 4-row verify, NR=1 -> 14.725.
     //     Four rows plus their scales is 25 KB re-read by 4352 CTAs, and halving that is worth
     //     4.1% even though it halves the grid.
-    // 0 = pick by row count, 1 or 2 force.
+    // 0 = pick by row count; 1, 2 or 4 force.
     static const int nr_mode = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
                                    int v = e ? atoi(e) : 0;
-                                   return (v == 1 || v == 2) ? v : 0; }();
-    // RTX 5090, Qwen3.8 DSpark @16k, three fresh lossless runs: the width-3 defaults below cut
-    // verify 12.74 -> 12.20 ms and move decode 120.91 -> 125.65-125.74 tok/s. The env overrides
-    // remain available for paired A/Bs and for checkpoints whose width distribution differs.
+                                   return (v == 1 || v == 2 || v == 4) ? v : 0; }();
+    // The width-3 carve-out that used to live below -- NR=1 at R==3, and down_nr4 defaulting on
+    // there -- was calibrated against a 120.91 -> 125.65 tok/s baseline, i.e. before the dispatch
+    // around it was retuned. Re-measured on current main it is a REGRESSION: width 3 wants the
+    // NR=2 that every other batched width already takes. Width 3 is not an incidental case, it is
+    // the steady shape of the scored long-context verifier (proposal depth 2 plus the bonus row).
+    //
+    // RTX 5090, ctx=16384, arms interleaved, tau IDENTICAL at 1.9545 and lossless in every run,
+    // so this is step time and nothing else:
+    //     R==3 -> NR=1, down_nr4 on (was)   145.87 tok/s, verify 12.051 ms
+    //     R==3 -> NR=2, down_nr4 off        148.63 tok/s, verify 11.805 ms   (+1.89%)
+    //     R==3 -> NR=4                      147.52 tok/s, and AR -3.5%
+    // ctx=4096 moves as well (132.83 -> 134.94, +1.59%, tau 1.7568 in both): the width planner
+    // lands on three rows there too. ctx=32768 runs width 2 and is untouched by construction.
+    //
+    // R==1 keeps NR=1: one activation row is 5 KB and stays in L1, so sharing it buys nothing and
+    // only the halved grid is left -- the 5% the note above records. The env overrides remain for
+    // paired A/Bs and for checkpoints whose width distribution differs.
     static const int down_nr4_mode = []{ const char* e = getenv("SPARKINFER_NVFP4_DOWN_NR4");
         return e ? ((e[0] == '1') ? 1 : 0) : -1; }();
 #define SI_NVFP4_DP4A(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
-        const bool down_nr4 = down_nr4_mode >= 0 ? down_nr4_mode != 0 : R == 3; \
-        /* The width-3 FFN down projection is the exception: its long K walk supplies enough */ \
-        /* parallel work that four output rows can share an activation read without starving */ \
-        /* the GPU. Keep NR=4 scoped to K>N; extending it to all width-3 singles was slower. */ \
+        const bool down_nr4 = down_nr4_mode >= 0 ? down_nr4_mode != 0 : false; \
+        /* down_nr4 used to default ON at width 3, the other half of the same stale carve-out. */ \
+        /* With NR=2 restored, forcing four output rows onto the K>N projections costs 0.67% */ \
+        /* (148.96 -> 147.97 with both arms env-pinned), so it is opt-in only now. */ \
         const int nr = (down_nr4 && K > N && R >= 2 && R <= 6) ? 4 \
-                     : (nr_mode ? nr_mode : ((R == 1 || R == 3) ? 1 : 2)); \
+                     : (nr_mode ? nr_mode : ((R == 1) ? 1 : 2)); \
         if (nr == 1) { \
             const dim3 grid((N + RPB - 1) / RPB); \
             gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
