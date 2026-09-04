@@ -333,6 +333,8 @@ __device__ __forceinline__ void pf_ldsm_x4(unsigned (&r)[4], unsigned a) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
+template <int V> struct pf_int { static constexpr int value = V; };
+
 __device__ __forceinline__ void pf_mma_16832(int (&d)[4], const unsigned (&a)[4],
                                              unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -341,7 +343,7 @@ __device__ __forceinline__ void pf_mma_16832(int (&d)[4], const unsigned (&a)[4]
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-template <int HEAD_DIM, int GROUP_BLKS, int RQH>
+template <int HEAD_DIM, int GROUP_BLKS, int RQH, int PLANES = 0>
 __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 ? 2 : 1))) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
@@ -389,8 +391,16 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     // store_matrix_sync its immediate offsets and measured -4.7% on its own, swamping the
     // conflict it removes.
     constexpr int SPLD = GN + 4;
-    constexpr int SBLK = (RQH * BM * SPLD > BM * HEAD_DIM) ? RQH * BM * SPLD : BM * HEAD_DIM;
-    float* s_s  = reinterpret_cast<float*>(s_pi + (size_t)RQH * BM * pld); // [RQH][BM][SPLD]
+    // How many q-heads the score plane holds AT ONCE. It was always RQH -- QK wrote every head's
+    // scores, then one softmax pass drained them all -- and at RQH*BM*GN floats that plane is what
+    // caps RQH. Holding fewer heads at a time makes the plane a rolling buffer: QK fills PLANES
+    // heads, the softmax drains them into s_pi, and the next group of heads reuses the same
+    // floats. That is what lets a block own all six q-heads of a kv-head instead of three, which
+    // is the whole point -- see the dispatch note on the RQH=6 tier.
+    constexpr int SPL  = (PLANES > 0 && PLANES < RQH) ? PLANES : RQH;
+    static_assert(RQH % SPL == 0, "the head loop must tile the score plane exactly");
+    constexpr int SBLK = (SPL * BM * SPLD > BM * HEAD_DIM) ? SPL * BM * SPLD : BM * HEAD_DIM;
+    float* s_s  = reinterpret_cast<float*>(s_pi + (size_t)RQH * BM * pld); // [SPL][BM][SPLD]
     float* s_o  = s_s;                                               // [BM][HEAD_DIM] epilogue landing
     // The K and V dequant scales arrive as __half and are only ever multiplied into a float, so
     // they stay __half in shared: half the bytes, and -- because the softmax hoists a lane's whole
@@ -498,39 +508,71 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                 s_vs[j] = v_scale[si];
             }
 
-            // ---- QK: load each K page fragment ONCE, feed RQH q-heads ----
+            // ---- QK: load each K page fragment ONCE, feed the block's q-heads ----
             // One 16x32 K slice covers two m16n8k32 B operands (keys 0-7 and 8-15). The B operand
             // is n x k col-major, which for K[key][dim] means lane l holds key (l>>2), dims
             // (l&3)*4 .. +3 and the same four 16 bytes later -- two 4-byte loads straight out of
             // the paged pool, exactly as before with no staging.
+            //
+            // With a rolling score plane the head loop runs SEVERAL times over the same keys, so
+            // the K fragments are hoisted into registers first and the pool is read exactly once
+            // per block per group however many q-heads the block owns. That is the whole traffic
+            // argument -- see the RQH=6 dispatch note. At SPL == RQH there is only one pass and
+            // the loads stay inside the k-step loop exactly as they were.
+            constexpr int KREG = (SPL == RQH) ? 1 : KSTEPS;
+            unsigned kfr[KREG][2][2];
+            const signed char* kl = nullptr;
             if (warp < gblk) {
                 const int pb = block_table[(k0 / block_size) + warp];
-                const signed char* kb =
-                    k_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM;
-                const signed char* kl = kb + (size_t)(lane >> 2) * KVLD + (lane & 3) * 4;
-                int acc[RQH][2][4];
+                kl = k_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM
+                   + (size_t)(lane >> 2) * KVLD + (lane & 3) * 4;
+                if constexpr (SPL != RQH) {
+                    #pragma unroll
+                    for (int kk = 0; kk < KSTEPS; kk++)
+                        #pragma unroll
+                        for (int t = 0; t < 2; t++) {
+                            const signed char* p = kl + (size_t)t * 8 * KVLD + kk * 32;
+                            kfr[kk][t][0] = *reinterpret_cast<const unsigned*>(p);
+                            kfr[kk][t][1] = *reinterpret_cast<const unsigned*>(p + 16);
+                        }
+                }
+            }
+            // H0T is a compile-time head base: qa_base lives in registers, so a runtime index
+            // into it would push the whole array to local memory.
+            auto qk_group = [&](auto H0T) {
+                constexpr int h0 = decltype(H0T)::value;
+                if (warp >= gblk) return;
+                int acc[SPL][2][4];
                 #pragma unroll
-                for (int h = 0; h < RQH; h++)
+                for (int hp = 0; hp < SPL; hp++)
                     #pragma unroll
                     for (int t = 0; t < 2; t++)
                         #pragma unroll
-                        for (int e = 0; e < 4; e++) acc[h][t][e] = 0;
+                        for (int e = 0; e < 4; e++) acc[hp][t][e] = 0;
                 #pragma unroll
                 for (int kk = 0; kk < KSTEPS; kk++) {
                     unsigned bfr[2][2];
-                    #pragma unroll
-                    for (int t = 0; t < 2; t++) {
-                        const signed char* p = kl + (size_t)t * 8 * KVLD + kk * 32;
-                        bfr[t][0] = *reinterpret_cast<const unsigned*>(p);
-                        bfr[t][1] = *reinterpret_cast<const unsigned*>(p + 16);
+                    if constexpr (SPL == RQH) {
+                        #pragma unroll
+                        for (int t = 0; t < 2; t++) {
+                            const signed char* p = kl + (size_t)t * 8 * KVLD + kk * 32;
+                            bfr[t][0] = *reinterpret_cast<const unsigned*>(p);
+                            bfr[t][1] = *reinterpret_cast<const unsigned*>(p + 16);
+                        }
+                    } else {
+                        #pragma unroll
+                        for (int t = 0; t < 2; t++) {
+                            bfr[t][0] = kfr[kk][t][0];
+                            bfr[t][1] = kfr[kk][t][1];
+                        }
                     }
                     #pragma unroll
-                    for (int h = 0; h < RQH; h++) {
+                    for (int hp = 0; hp < SPL; hp++) {
                         unsigned a[4];
-                        pf_ldsm_x4(a, qa_base[h] + (unsigned)(kk * 32));
+                        pf_ldsm_x4(a, qa_base[h0 + hp] + (unsigned)(kk * 32));
                         #pragma unroll
                         for (int t = 0; t < 2; t++)
-                            pf_mma_16832(acc[h][t], a, bfr[t][0], bfr[t][1]);
+                            pf_mma_16832(acc[hp][t], a, bfr[t][0], bfr[t][1]);
                     }
                 }
                 // m16n8k32's D layout: lane holds rows (l>>2) and (l>>2)+8, columns 2*(l&3) and
@@ -538,17 +580,18 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                 // store, so the plane is written in 4 stores per head instead of 8.
                 const int dr = lane >> 2, dc = 2 * (lane & 3);
                 #pragma unroll
-                for (int h = 0; h < RQH; h++) {
-                    int* sp = reinterpret_cast<int*>(s_s) + (size_t)h * BM * SPLD + warp * 16;
+                for (int hp = 0; hp < SPL; hp++) {
+                    int* sp = reinterpret_cast<int*>(s_s) + (size_t)hp * BM * SPLD + warp * 16;
                     #pragma unroll
                     for (int t = 0; t < 2; t++) {
                         *reinterpret_cast<int2*>(sp + dr * SPLD + t * 8 + dc) =
-                            make_int2(acc[h][t][0], acc[h][t][1]);
+                            make_int2(acc[hp][t][0], acc[hp][t][1]);
                         *reinterpret_cast<int2*>(sp + (dr + 8) * SPLD + t * 8 + dc) =
-                            make_int2(acc[h][t][2], acc[h][t][3]);
+                            make_int2(acc[hp][t][2], acc[hp][t][3]);
                     }
                 }
-            }
+            };
+            qk_group(pf_int<0>{});
             __syncthreads();
 
             // Every mask term is monotone in the key index, so a group that is FULL and whose
@@ -602,11 +645,21 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             // the pair resolves statically and the pairs stay in registers.
             #define PF_KS(u) (((u) & 1) ? __high2float(ksr[(u) >> 1]) : __low2float(ksr[(u) >> 1]))
             #define PF_VS(u) (((u) & 1) ? __high2float(vsr[(u) >> 1]) : __low2float(vsr[(u) >> 1]))
-            auto softmax_group = [&](auto FULLT) {
+            // One q-head, from the plane index it was written to. Splitting the head loop out of
+            // the lambda is what lets the caller drain a plane that holds fewer heads than RQH;
+            // at SPL == RQH the wrapper below reproduces the loop this used to be.
+            // Row stride of the P' plane. The PV mma reads it with leading dimension `pld`, and
+            // the bf16 sibling kernel writes `r * pld + t` to match; this one has always written
+            // `r * GN + t`, so wherever the two differ (pld = GN + 16 at n_tokens >= 2048) row r
+            // is read shifted by 16r columns, and the last row reads past everything any row
+            // wrote. The shipped tiers keep that byte for byte -- it is their numerics and there
+            // is nothing to gain by moving them -- but the new tier is new code and is written
+            // the way the sibling already does it.
+            const int pstr = (SPL == RQH) ? GN : pld;
+            auto softmax_head = [&](auto FULLT, int h, int hp) {
                 constexpr bool FULL = decltype(FULLT)::value;
-                #pragma unroll
-                for (int h = 0; h < RQH; h++) {
-                    const int* s_si = reinterpret_cast<const int*>(s_s) + (size_t)h * BM * SPLD;
+                {
+                    const int* s_si = reinterpret_cast<const int*>(s_s) + (size_t)hp * BM * SPLD;
                     signed char* s_pih = s_pi + (size_t)h * BM * pld;
                     #pragma unroll
                     for (int rr = 0; rr < BM / WARPS; rr++) {
@@ -683,14 +736,35 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                                         (signed char)__float2int_rn(sc[v * VW + j] * ipd);
                                     packed |= ((unsigned)(unsigned char)q8) << (8 * j);
                                 }
-                                *reinterpret_cast<unsigned*>(s_pih + r * GN + t0) = packed;
+                                *reinterpret_cast<unsigned*>(s_pih + r * pstr + t0) = packed;
                             }
                         }
                     }
                 }
             };
-            if (grp_full) softmax_group(pf_bool<true>{});
-            else          softmax_group(pf_bool<false>{});
+            auto softmax_planes = [&](int h0) {
+                #pragma unroll
+                for (int hp = 0; hp < SPL; hp++) {
+                    if (grp_full) softmax_head(pf_bool<true>{},  h0 + hp, hp);
+                    else          softmax_head(pf_bool<false>{}, h0 + hp, hp);
+                }
+            };
+            // QK for head group 0 already ran above; drain it, then -- when the plane holds
+            // fewer heads than the block owns -- run the remaining groups QK-then-drain against
+            // the same floats. The head base has to be a compile-time constant (qa_base is a
+            // register array), so the tail is spelled out rather than looped; RQH is at most 6.
+            softmax_planes(0);
+            auto roll = [&](auto H0T) {
+                __syncthreads();                           // the plane is free again
+                qk_group(H0T);
+                __syncthreads();
+                softmax_planes(decltype(H0T)::value);
+            };
+            if constexpr (1 * SPL < RQH) roll(pf_int<1 * SPL>{});
+            if constexpr (2 * SPL < RQH) roll(pf_int<2 * SPL>{});
+            if constexpr (3 * SPL < RQH) roll(pf_int<3 * SPL>{});
+            if constexpr (4 * SPL < RQH) roll(pf_int<4 * SPL>{});
+            if constexpr (5 * SPL < RQH) roll(pf_int<5 * SPL>{});
             #undef PF_KS
             #undef PF_VS
             __syncthreads();
@@ -754,7 +828,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     }
 }
 
-template <int HD, int GROUP_BLKS, int RQH>
+template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0>
 static bool launch_attn_gqa(const void* q, const signed char* k_pool, const signed char* v_pool,
                             const void* k_scale, const void* v_scale, const int* block_table,
                             void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
@@ -776,7 +850,8 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
     const int qld_max = HD + attn_smem_pad(), pld_max = GN + attn_smem_pad();
     // s_o lands in s_s (dead by the epilogue), so the pair costs the larger of the two.
     constexpr int SPLD = GN + 4;
-    constexpr int SBLK = (RQH * BM * SPLD > BM * HD) ? RQH * BM * SPLD : BM * HD;
+    constexpr int SPL  = (PLANES > 0 && PLANES < RQH) ? PLANES : RQH;
+    constexpr int SBLK = (SPL * BM * SPLD > BM * HD) ? SPL * BM * SPLD : BM * HD;
     const size_t sm = (size_t)RQH * BM * qld                         // s_qi (int8, padded)
                     + (size_t)RQH * BM * pld                         // s_pi (int8, padded)
                     + (size_t)SBLK * sizeof(float)                   // s_s, with s_o overlaid
@@ -802,13 +877,13 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                             + (size_t)2 * GN * sizeof(__half)
                             + (size_t)5 * RQH * BM * sizeof(float);
         const cudaError_t ce = cudaFuncSetAttribute(
-            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH>,
+            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_max);
         if (ce != cudaSuccess && sm_max > 48u * 1024u) return false;  // opt-in refused where required
         cfg[dev] = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
-    pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH><<<grid, GROUP_BLKS * 32, sm, stream>>>(
+    pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES><<<grid, GROUP_BLKS * 32, sm, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
@@ -826,8 +901,9 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
     static bool announced[kMaxDevices] = {false};
     if (tier_dbg && !announced[dev]) {
         announced[dev] = true;
-        fprintf(stderr, "[pf-attn-tier] RQH=%d GB=%d GN=%d smem=%zu qld=%d pld=%d n=%d ok=%d\n",
-                RQH, GROUP_BLKS, GN, sm, qld, pld, n_tokens, (int)ok);
+        fprintf(stderr,
+                "[pf-attn-tier] RQH=%d SPL=%d GB=%d GN=%d smem=%zu qld=%d pld=%d n=%d ok=%d\n",
+                RQH, SPL, GROUP_BLKS, GN, sm, qld, pld, n_tokens, (int)ok);
     }
     return ok;
 }
@@ -882,6 +958,13 @@ bool launch_prefill_attn_mma(
         const int v = e ? atoi(e) : 16;
         return (v == 8 || v == 16) ? v : 16;
     }();
+    // Smallest KV span (prefix + this pass's queries) that takes the six-head tier below.
+    // 0 disables it and restores the RQH=3 tier everywhere.
+    static const long wide_minkeys = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_GQA6_MINKEYS");
+        const long v = e ? atol(e) : 65536;
+        return v < 0 ? 0 : v;
+    }();
 
     if (!enabled || head_dim != HD || block_size != 16 || n_tokens < minctx) return false;
     if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
@@ -926,6 +1009,37 @@ bool launch_prefill_attn_mma(
     // RQH=2 would re-read each K page more often for a wider group -- so GQA-8 checkpoints
     // (Qwen3.6) keep exactly the tier and the numerics they had. Falls through to the GN=128 tier
     // if the wide launch is refused, so a device with a smaller ceiling still gets the old path.
+    // Six heads per block, above the context where the KV stream stops fitting in L2.
+    //
+    // The comment above says this kernel is bound by re-reading the same K/V pages out of L2, and
+    // that is why RQH went 2 -> 3. It stopped there because the score plane is RQH*BM*GN floats
+    // and a fourth head does not fit beside the GN=256 group. But a block's K/V traffic is
+    // (keys) x (blocks that share the kv-head), and that second factor is n_tokens/BM x gqa/RQH --
+    // at GQA-6 and RQH=3 every kv-head's stream is pulled twice. Six heads pulls it once.
+    //
+    // At ctx=32768 six heads is worth almost nothing and costs the GN=256 group: a kv-head's
+    // whole K+V there is 16 MB, L2 holds it, and the second read is very nearly free. At 262144
+    // that stream is 134 MB against a 96 MB L2 and it is not free at all. Skip-probed on this
+    // checkpoint at ctx=262144: stubbing the V pool read is +30.6% on the dimension and stubbing
+    // the K pool read is +23.3%, so the two streams are over half of it -- which is what makes
+    // halving them worth a tier, and why the tier is gated on length.
+    //
+    // What made six heads fit is the rolling score plane: SPL=2 keeps only two heads of scores
+    // live, so the plane costs 2*BM*GN floats instead of 6 and the whole block is 88,448 B rather
+    // than 155,008. The K fragments move into registers across the three head passes so the pool
+    // is still read exactly once per block per group -- without that the head loop would re-read
+    // K three times and give the traffic straight back.
+    //
+    // Gated on the KV SPAN, not on n_tokens: a windowed long-prompt pass ingests 16,384 tokens at
+    // a time, so n_tokens alone cannot tell a 16k prompt from the tenth window of a 256k one. That
+    // keeps every short-context caller -- the 4k/16k prefill dimensions and both cross-model
+    // guards -- on exactly the tier, tile shape and arithmetic they have today.
+    if (gqa_rqh >= 3 && gqa % 6 == 0 && wide_minkeys > 0 &&
+        (long)q_pos0 + n_tokens >= wide_minkeys && n_tokens >= 2048 && gqa_gb >= 16 &&
+        launch_attn_gqa<HD, 16, 6, 2>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks,
+            stream, q_pos0))
+        return true;
     if (gqa_rqh >= 3 && gqa % 3 == 0 && n_tokens >= 2048) {
         if (gqa_gb >= 16 &&
             launch_attn_gqa<HD, 16, 3>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
