@@ -2228,6 +2228,11 @@ def format_comment(commit: str, res: dict) -> str:
         pr, mn = res.get(pr_key), res.get(main_key)
         if pr is None or mn is None or not mn:
             return "—"
+        # Same skipped-stage zero as _v: computing a delta against it yields a confident
+        # "-100.0%", which is worse than saying nothing -- it invents a total collapse out of a
+        # stage that never ran.
+        if early and pr == 0:
+            return "—"
         return f"{100.0 * (pr - mn) / mn:+.1f}%"
 
     def _gate(name, ok_key, ok_text, fail_text):
