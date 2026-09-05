@@ -707,7 +707,15 @@ bool ModelEngine::reexpand_vision(int image_token_id, int video_token_id,
     // out of step with the placeholder runs they describe.
     io.mrope_pos.clear();
     io.mrope_decode_offset = 0;
-    if (impl_->cfg.mrope()) {
+    // SPARKINFER_MROPE=0 falls back to the 1D positions used before MRoPE existed. Kept because
+    // MRoPE is a BEHAVIOURAL change to already-shipped image handling, not a pure addition: an
+    // operator who sees image answers move after an upgrade needs a way to attribute it, and an
+    // A/B on one build is the only way to measure the effect on output at all.
+    static const bool mrope_enabled = [] {
+        const char* e = getenv("SPARKINFER_MROPE");
+        return !(e && e[0] == '0');
+    }();
+    if (impl_->cfg.mrope() && mrope_enabled) {
         std::vector<sparkinfer::QwenVisionSpanGrid> grids;
         grids.reserve(io.images.size());
         // grid_t is 1 per unit: an image is one temporal group, and the reference splits a video's
