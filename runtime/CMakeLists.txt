@@ -138,6 +138,15 @@ if(BUILD_EXAMPLES)
     # integer equality -- "close" would be meaningless. A hand-written Python reference was
     # deliberately avoided: in the vision-tower work the local NumPy reference reproduced the very
     # omission it existed to catch.
+    # Runs the REAL prefill RoPE kernel with MRoPE positions and dumps its rotated Q for
+    # bench/scripts/mrope_kernel_check.py. mrope_positions_dump proves we COMPUTE the reference's
+    # position ids; this proves the KERNEL APPLIES them the same way, which is where the
+    # from-scratch interleaved axis selection lives. Correct positions fed to the wrong frequency
+    # bands would pass the first check and fail this one.
+    add_executable(mrope_kernel_dump examples/mrope_kernel_dump.cpp)
+    target_include_directories(mrope_kernel_dump PRIVATE include ../kernels/include)
+    target_link_libraries(mrope_kernel_dump PRIVATE sparkinfer_runtime CUDA::cudart)
+
     add_executable(mrope_positions_dump examples/mrope_positions_dump.cpp)
     target_include_directories(mrope_positions_dump PRIVATE include)
     target_link_libraries(mrope_positions_dump PRIVATE sparkinfer_runtime)
