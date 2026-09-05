@@ -364,6 +364,11 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     constexpr int DPW   = DTILE / WARPS;
     constexpr int QE    = HEAD_DIM / 32;
 
+    // launch_prefill_attn_mma refuses anything but block_size == 16, so every use of it below is
+    // a constant -- and `k0 / block_size` on the runtime argument is a full integer division,
+    // which the GPU lowers to a float-reciprocal sequence, once per key group. Naming the
+    // constant turns that into a shift and every page-stride multiply into an immediate.
+    constexpr int BLKSZ = 16;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
     const int qbase = blockIdx.x * BM;
     const int head0 = blockIdx.y * RQH;                       // first q-head this block owns
@@ -414,27 +419,21 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     float* s_corr = s_l + RQH * BM;                                  // [RQH][BM]
 
     fragment<accumulator, 16, 16, 16, float> ofr[RQH][DPW];
-    fragment<accumulator, 16, 16, 16, int> idxf;
-    {
-        int* tile = reinterpret_cast<int*>(s_s) + warp * 256;
-        for (int i = lane; i < 256; i += 32) tile[i] = ((i >> 4) << 8) | (i & 15);
-        __syncwarp();
-        load_matrix_sync(idxf, tile, 16, mem_row_major);
-    }
-    // A 16x16 accumulator gives every lane 8 elements spread over exactly TWO query rows (a row's
-    // 16 elements sit in 4 lanes, 4 each), so the per-row P quantum and the online-softmax
-    // correction the PV epilogue applies are two values per head, not eight. Resolve which of the
-    // two each element belongs to once, from idxf, and the epilogue's 2*8*RQH shared loads per
-    // group iteration become 2*2*RQH register reads. Nothing here assumes a layout: the rows and
-    // the mask are read out of the index fragment itself.
-    const int rlo = idxf.x[0] >> 8;
-    int rhi = rlo;
-    unsigned hi_mask = 0u;
-    #pragma unroll
-    for (int e = 1; e < 8; e++) {
-        const int re = idxf.x[e] >> 8;
-        if (re != rlo) { rhi = re; hi_mask |= 1u << e; }
-    }
+    // A 16x16 accumulator gives every lane 8 elements spread over exactly TWO query rows, so the
+    // per-row P quantum and the online-softmax correction the PV epilogue applies are two values
+    // per head, not eight. The map: the fragment is two m16n8 halves and in each half a lane holds
+    // rows (lane>>2) and (lane>>2)+8, two columns each -- so elements 0,1,4,5 are the low row and
+    // 2,3,6,7 the high one, for every lane.
+    //
+    // It used to be READ OUT of an index fragment staged through shared memory to avoid naming the
+    // layout, and that cost a 256-int store, a __syncwarp, a load_matrix_sync and an 8-element scan
+    // on every block -- plus a live accumulator fragment across the prologue, and a RUNTIME mask,
+    // which made `up` below a per-element select instead of a constant: 2*8*RQH of them per key
+    // group. The layout is not a new assumption -- the whole int8 PV epilogue already depends on
+    // it -- and qwen3_gguf_prefill_check verifies it end to end.
+    const int rlo = lane >> 2;
+    const int rhi = rlo + 8;
+    constexpr unsigned hi_mask = 0xCCu;
     #pragma unroll
     for (int h = 0; h < RQH; h++)
         #pragma unroll
@@ -489,21 +488,30 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     const int last_q = q_pos0 + min(qbase + BM - 1, n_tokens - 1);
     int blk_rs = 0;
     if (win_blocks > 0) {
-        const int n_blk_q = (q_pos0 + qbase + block_size) / block_size;
+        const int n_blk_q = (q_pos0 + qbase + BLKSZ) / BLKSZ;
         const int rsb = (win_blocks >= n_blk_q - 1) ? 1 : (n_blk_q - win_blocks);
-        blk_rs = rsb * block_size;
+        blk_rs = rsb * BLKSZ;
     }
-    const bool split_sink = (win_blocks > 0) && (blk_rs > block_size);
+    const bool split_sink = (win_blocks > 0) && (blk_rs > BLKSZ);
 
-    auto run_range = [&](int lo, int hi) {
+    // The sink range and the main range are the same loop over different bounds, and calling a
+    // [&] lambda twice inlines its whole body twice: ~9.7k SASS instructions for this kernel,
+    // about 64 KB of straight-line code per copy against a 32 KB L1 instruction cache. Only one
+    // of the two ever runs on any given call -- the sink range is empty unless a sliding window
+    // splits it -- so the second copy buys nothing and evicts the first. `unroll 1` is load
+    // bearing: without it ptxas peels the two-iteration loop straight back into two bodies.
+    #pragma unroll 1
+    for (int rr_ = (split_sink ? 0 : 1); rr_ < 2; rr_++) {
+        const int lo = (rr_ == 0) ? 0 : (split_sink ? blk_rs : 0);
+        const int hi = (rr_ == 0) ? BLKSZ : (last_q + 1);
         for (int k0 = lo; k0 < hi; k0 += GN) {
             const int nk   = min(GN, hi - k0);
             const int gblk = (nk + 15) / 16;
             // K/V dequant scales for the group -- shared across all RQH heads (one kv-head).
             for (int j = tid; j < gblk * 16; j += blockDim.x) {
-                const int lb = (k0 / block_size) + j / 16, within = j & 15;
+                const int lb = (k0 / BLKSZ) + j / 16, within = j & 15;
                 const int pb = block_table[lb];
-                const size_t si = (size_t)(pb * block_size + within) * SLD + kvh;
+                const size_t si = (size_t)(pb * BLKSZ + within) * SLD + kvh;
                 s_ks[j] = k_scale[si];
                 s_vs[j] = v_scale[si];
             }
@@ -523,8 +531,8 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             unsigned kfr[KREG][2][2];
             const signed char* kl = nullptr;
             if (warp < gblk) {
-                const int pb = block_table[(k0 / block_size) + warp];
-                kl = k_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM
+                const int pb = block_table[(k0 / BLKSZ) + warp];
+                kl = k_pool + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * HEAD_DIM
                    + (size_t)(lane >> 2) * KVLD + (lane & 3) * 4;
                 if constexpr (SPL != RQH) {
                     #pragma unroll
@@ -602,7 +610,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             // is the common path, not the rare one.
             const bool grp_full =
                 (nk == GN) && (qbase + BM <= n_tokens) && (k0 + GN <= q_pos0 + qbase + 1) &&
-                (win_blocks <= 0 || k0 >= blk_rs || k0 + GN <= block_size);
+                (win_blocks <= 0 || k0 >= blk_rs || k0 + GN <= BLKSZ);
 
             // ---- online softmax per head; quantize P' ----
             // Column ownership inside the warp is VECTOR, not strided. Lane `lane` used to own
@@ -682,7 +690,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                                     const bool live =
                                         (t < gblk * 16) && (gtok < hi) && (qtok < n_tokens) &&
                                         (gtok <= q_pos0 + qtok) &&
-                                        (win_blocks <= 0 || gtok < block_size || gtok >= blk_rs);
+                                        (win_blocks <= 0 || gtok < BLKSZ || gtok >= blk_rs);
                                     sc[u] = live ? (float)rw[j] * qs * PF_KS(u) : -1e30f;
                                 }
                                 mx = fmaxf(mx, sc[u]);
@@ -742,11 +750,16 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                     }
                 }
             };
+            // The masked and unmasked softmax bodies are large and the choice is the same for
+            // every head in the group, so decide once and run the heads back to back. Deciding
+            // per head interleaves SPL copies of each body in the instruction stream.
             auto softmax_planes = [&](int h0) {
-                #pragma unroll
-                for (int hp = 0; hp < SPL; hp++) {
-                    if (grp_full) softmax_head(pf_bool<true>{},  h0 + hp, hp);
-                    else          softmax_head(pf_bool<false>{}, h0 + hp, hp);
+                if (grp_full) {
+                    #pragma unroll
+                    for (int hp = 0; hp < SPL; hp++) softmax_head(pf_bool<true>{}, h0 + hp, hp);
+                } else {
+                    #pragma unroll
+                    for (int hp = 0; hp < SPL; hp++) softmax_head(pf_bool<false>{}, h0 + hp, hp);
                 }
             };
             // QK for head group 0 already ran above; drain it, then -- when the plane holds
@@ -777,9 +790,9 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                 #pragma unroll
                 for (int h = 0; h < RQH; h++) fill_fragment(cf[h], 0);
                 for (int ks = 0; ks < gblk; ks++) {
-                    const int pb = block_table[(k0 / block_size) + ks];
+                    const int pb = block_table[(k0 / BLKSZ) + ks];
                     const signed char* vb =
-                        v_pool + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
+                        v_pool + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
                     fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
                     fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
                     load_matrix_sync(bf, vb, KVLD);                  // V fragment: loaded once
@@ -802,10 +815,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                 }
             }
         }
-    };
-
-    if (split_sink) run_range(0, block_size);
-    run_range(split_sink ? blk_rs : 0, last_q + 1);
+    }
 
     // ---- epilogue: one head at a time through the shared s_o landing zone ----
     #pragma unroll
@@ -834,6 +844,9 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                             void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
                             int block_size, int max_blocks_per_seq, float scale, int win_blocks,
                             cudaStream_t stream, int q_pos0) {
+    // The kernel below takes the paged block size as a compile-time constant, so refuse anything
+    // else here rather than leaning on the one caller's own guard.
+    if (block_size != 16) return false;
     constexpr int BM = 16, GN = GROUP_BLKS * 16;
     // Only at long context. The padding costs ~1 KB of shared memory per block, which is enough to
     // push this kernel past the 2-blocks-per-SM occupancy its __launch_bounds__ asks for at RQH<=2.
