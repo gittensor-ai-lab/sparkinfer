@@ -97,6 +97,38 @@ bool qwen_vision_expand_video_placeholders(const std::vector<int>& in, int video
                                            const std::vector<QwenVideoSpan>& videos,
                                            std::vector<int>& out, std::string& err);
 
+// One vision span's grid, for qwen_vision_mrope_positions below.
+struct QwenVisionSpanGrid {
+    int grid_t = 1;      // temporal groups; 1 for an image, and 1 PER GROUP for video
+    int grid_h = 0;      // pre-merge patch grid
+    int grid_w = 0;
+};
+
+// Builds the LM's 3D (t, h, w) position ids for a prompt containing vision spans.
+//
+// Qwen3.5's text model uses INTERLEAVED MRoPE (rope_parameters.mrope_section = [11,11,10],
+// mrope_interleaved = true), so a token's rotary position is not one number but three, and the
+// frequency index selects which axis it reads. Two consequences the 1D path gets wrong:
+//
+//   1. Vision tokens get (t, row, col) rather than a running counter, so the tower's spatial
+//      layout reaches attention instead of being flattened into sequence order.
+//   2. Text AFTER a vision span resumes at start + max(grid_h, grid_w)/merge, NOT at
+//      start + <number of vision tokens>. A 32x32 image contributes 256 tokens but advances the
+//      position counter by only 16.
+//
+// For TEXT tokens all three axes are equal, which is exactly plain 1D RoPE -- that degeneracy is
+// why a text-only prompt is unaffected by any of this, and why enabling MRoPE cannot move
+// text-only numbers.
+//
+// out is filled with 3*n_tokens ints laid out [t0,h0,w0, t1,h1,w1, ...]. spans must list every
+// vision span in prompt order, one entry per MAXIMAL placeholder run (so one per image, and one
+// per temporal group for video, matching how the prompt is expanded).
+bool qwen_vision_mrope_positions(const std::vector<int>& token_ids,
+                                 int image_token_id, int video_token_id,
+                                 const std::vector<QwenVisionSpanGrid>& spans,
+                                 int spatial_merge, int start_pos,
+                                 std::vector<int>& out, std::string& err);
+
 // Expands each single image placeholder into the number of tokens its image actually needs.
 //
 // The chat template emits exactly ONE <|image_pad|> per image:

@@ -244,6 +244,75 @@ std::vector<float> qwen_vision_video_timestamps(const std::vector<int>& frame_in
     return out;
 }
 
+bool qwen_vision_mrope_positions(const std::vector<int>& token_ids,
+                                 int image_token_id, int video_token_id,
+                                 const std::vector<QwenVisionSpanGrid>& spans,
+                                 int spatial_merge, int start_pos,
+                                 std::vector<int>& out, std::string& err) {
+    if (spatial_merge <= 0) { err = "mrope: spatial_merge must be positive"; return false; }
+    out.assign(token_ids.size() * 3, 0);
+
+    long pos = start_pos;
+    size_t next_span = 0;
+    size_t i = 0;
+    while (i < token_ids.size()) {
+        const int id = token_ids[i];
+        if (id != image_token_id && id != video_token_id) {
+            // Text: all three axes share one counter, which is plain 1D RoPE.
+            out[i * 3 + 0] = (int)pos;
+            out[i * 3 + 1] = (int)pos;
+            out[i * 3 + 2] = (int)pos;
+            pos++;
+            i++;
+            continue;
+        }
+        size_t j = i;
+        while (j < token_ids.size() && token_ids[j] == id) j++;
+        const size_t run = j - i;
+
+        if (next_span >= spans.size()) {
+            err = "mrope: prompt has more vision spans than grids were supplied";
+            return false;
+        }
+        const QwenVisionSpanGrid& g = spans[next_span++];
+        const int lt = g.grid_t;
+        const int lh = g.grid_h / spatial_merge;
+        const int lw = g.grid_w / spatial_merge;
+        if (lt <= 0 || lh <= 0 || lw <= 0) {
+            err = "mrope: vision span has a degenerate merged grid";
+            return false;
+        }
+        if ((size_t)lt * lh * lw != run) {
+            err = "mrope: vision span covers " + std::to_string(run) +
+                  " tokens but its grid implies " + std::to_string((size_t)lt * lh * lw);
+            return false;
+        }
+
+        // meshgrid(t, h, w) in ij order, flattened -- the reference's get_vision_position_ids.
+        // The temporal index is NOT offset by start_pos twice: the reference adds start_position
+        // to h and w up front and to t only after the time_interval multiply, which for
+        // time_interval = 1 lands all three on the same base.
+        size_t k = i;
+        for (int t = 0; t < lt; t++)
+            for (int h = 0; h < lh; h++)
+                for (int w = 0; w < lw; w++, k++) {
+                    out[k * 3 + 0] = (int)(pos + t);
+                    out[k * 3 + 1] = (int)(pos + h);
+                    out[k * 3 + 2] = (int)(pos + w);
+                }
+
+        // The advance that the 1D path gets wrong: max(h, w), not the token count.
+        pos += (lh > lw ? lh : lw);
+        i = j;
+    }
+    if (next_span != spans.size()) {
+        err = "mrope: " + std::to_string(spans.size() - next_span) +
+              " supplied grid(s) had no matching vision span in the prompt";
+        return false;
+    }
+    return true;
+}
+
 bool qwen_vision_expand_video_placeholders(const std::vector<int>& in, int video_token_id,
                                            int vision_start_token_id, int vision_end_token_id,
                                            const std::vector<QwenVideoSpan>& videos,

@@ -133,6 +133,15 @@ if(BUILD_EXAMPLES)
     # that script to judge. The reference owns the tolerance, not this binary.
     # Cross-checks the smart_resize port against the Python original over a grid of shapes.
     # Exact integer logic, so bench/scripts/vision_resize_check.py demands strict equality.
+    # Dumps MRoPE position ids as JSON for bench/scripts/mrope_ref_check.py, which diffs them
+    # against transformers' OWN get_rope_index. Position INDICES, so the comparison is exact
+    # integer equality -- "close" would be meaningless. A hand-written Python reference was
+    # deliberately avoided: in the vision-tower work the local NumPy reference reproduced the very
+    # omission it existed to catch.
+    add_executable(mrope_positions_dump examples/mrope_positions_dump.cpp)
+    target_include_directories(mrope_positions_dump PRIVATE include)
+    target_link_libraries(mrope_positions_dump PRIVATE sparkinfer_runtime)
+
     add_executable(vision_resize_check examples/vision_resize_check.cpp)
     target_include_directories(vision_resize_check PRIVATE include)
     target_link_libraries(vision_resize_check PRIVATE sparkinfer_runtime CUDA::cudart)
