@@ -207,6 +207,15 @@ struct Qwen35Model::Impl {
     void* d_vision_emb = nullptr;
     int*  d_vision_pos = nullptr;
     int   vision_n = 0;
+    // Interleaved-MRoPE rotary positions for the pending prompt: [n_tokens*3] int32 on device.
+    // Null on every text-only request, which is what keeps the MRoPE kernel instantiation off the
+    // measured path entirely.
+    int*  d_mrope_pos = nullptr;
+    int   mrope_n = 0;
+    // Added to the DECODE rotary position, never to the cache slot. Vision spans advance the
+    // rotary counter by less than their token count, so generated tokens sit at a lower rotary
+    // position than their slot index; this is that difference, and it is 0 without vision.
+    int   mrope_pos_offset = 0;
     // Guards the capture window against legacy-default-stream work issued by other threads.
     // See Qwen35Model::device_mutex() in the header for why this is required.
     std::recursive_mutex device_mu;
@@ -907,6 +916,32 @@ void Qwen35Model::clear_pending_vision() {
     s.d_vision_emb = nullptr; s.d_vision_pos = nullptr; s.vision_n = 0;
 }
 
+bool Qwen35Model::set_pending_mrope(const int* positions, int n_tokens, int decode_offset) {
+    Impl& s = *p_;
+    clear_pending_mrope();
+    if (!positions || n_tokens <= 0) return false;
+    const size_t n = (size_t)n_tokens * 3;
+    if (cudaMalloc((void**)&s.d_mrope_pos, n * sizeof(int)) != cudaSuccess) return false;
+    if (cudaMemcpy(s.d_mrope_pos, positions, n * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+        clear_pending_mrope();
+        return false;
+    }
+    s.mrope_n = n_tokens;
+    // Survives clear_pending_mrope deliberately: the positions are consumed by ONE prefill, but
+    // the offset has to keep applying to every decode step of the same session afterwards.
+    s.mrope_pos_offset = decode_offset;
+    return true;
+}
+
+void Qwen35Model::clear_pending_mrope() {
+    Impl& s = *p_;
+    if (s.d_mrope_pos) cudaFree(s.d_mrope_pos);
+    s.d_mrope_pos = nullptr;
+    s.mrope_n = 0;
+}
+
+void Qwen35Model::reset_mrope_offset() { p_->mrope_pos_offset = 0; }
+
 int Qwen35Model::forward_token(int token_id, int position, bool sample, float temperature,
                                unsigned long long seed, unsigned long long sample_step,
                                int top_k, float top_p,
@@ -973,7 +1008,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     };
 
     s.h_scalars[0] = token_id;
-    s.h_scalars[1] = position;
+    // [1] is the ROTARY position, [2] the KV cache slot. They are the same number for every
+    // text-only request and diverge under MRoPE: a vision span occupies one cache slot per token
+    // but advances the rotary counter by only max(grid_h, grid_w)/merge, so everything generated
+    // after an image sits at a LOWER rotary position than its slot index.
+    //
+    // One scalar is enough for the whole decode-side correction because a generated token is text,
+    // and text has all three MRoPE axes equal -- so the three-number position collapses back to
+    // one, just shifted. mrope_pos_offset is 0 whenever no vision span was ingested, which makes
+    // this line identical to what it was.
+    s.h_scalars[1] = position + s.mrope_pos_offset;
     s.h_scalars[2] = position;
     s.h_scalars[3] = seqlen;
     s.h_scalars[4] = s.dflash_cap_row;
@@ -2837,7 +2881,9 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           // Only prefill_batched gets these: the other two Qwen35PrefillCtx
                           // sites are DSpark verify paths, which replay already-generated
                           // tokens and can never contain an image placeholder.
-                          s.d_vision_emb, s.d_vision_pos, s.vision_n };
+                          s.d_vision_emb, s.d_vision_pos, s.vision_n,
+                          // MRoPE rotary positions, null unless set_pending_mrope ran for this prompt.
+                          s.d_mrope_pos };
     const int seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
     // Consume it. This is PER-REQUEST state, not model state: leaving it set would splice the
     // previous request's image into the next prompt, which would produce fluent, confident text

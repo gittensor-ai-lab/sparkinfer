@@ -1387,6 +1387,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const int  kv_elem = kv8 ? 1 : 2;
     const float rope_theta = c.rope_theta, eps = c.rms_eps;
     const int rope_dim = (c.rope_dim > 0) ? c.rope_dim : c.head_dim;
+    // MRoPE positions for THIS window. s.mrope_pos is indexed by absolute prompt position, while
+    // the kernels index by the row within this pass -- the same split pos0 already draws between
+    // `pos` and `tok` -- so the pointer is advanced past the rows earlier windows consumed.
+    // Null (every text-only request) makes the launchers pick their non-MRoPE instantiation.
+    const int* const mrope_win =
+        (s.mrope_pos && c.mrope()) ? s.mrope_pos + (size_t)3 * pos0 : nullptr;
     const float attn_scale = 1.f / sqrtf((float)c.head_dim);
 
     // embed -> x, prime xn = RMSNorm(x, layer0.input_norm)
@@ -1642,12 +1648,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         kernels::launch_prefill_qknorm_rope_kv_bf16_vi8(
                             qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, vi8, vi8_scale,
                             btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                            rope_dim, rope_theta, eps, bs, mbs, st, pos0);
+                            rope_dim, rope_theta, eps, bs, mbs, st, pos0,
+                            mrope_win, c.mrope_sec_h, c.mrope_sec_w);
                     else
                         kernels::launch_prefill_qknorm_rope_kv_bf16(
                             qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, btable, N,
                             c.n_q_heads, c.n_kv_heads, c.head_dim,
-                            rope_dim, rope_theta, eps, bs, mbs, st, pos0);
+                            rope_dim, rope_theta, eps, bs, mbs, st, pos0,
+                            mrope_win, c.mrope_sec_h, c.mrope_sec_w);
                     const bool vi8_done = vi8 && kernels::launch_prefill_attn_mma_bf16_vi8(
                         qb, kf, vi8, vi8_scale, btable, att, N, c.n_q_heads, c.n_kv_heads,
                         c.head_dim, bs, mbs, attn_scale, st, pos0);
@@ -1663,7 +1671,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 } else {
                     kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
                         kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                        rope_dim, rope_theta, eps, bs, mbs, st, pos0);
+                        rope_dim, rope_theta, eps, bs, mbs, st, pos0,
+                        mrope_win, c.mrope_sec_h, c.mrope_sec_w);
                     // Qwen3.8 interleaves SWA and global-attention layers. The old int8 launcher
                     // read one process-wide 4096-token window for every layer, silently truncating
                     // the global layers at long context. Pass the layer contract explicitly, as

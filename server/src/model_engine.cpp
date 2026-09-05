@@ -702,6 +702,28 @@ bool ModelEngine::reexpand_vision(int image_token_id, int video_token_id,
         err = "prompt carries fewer vision spans than were preprocessed";
         return false;
     }
+
+    // MRoPE positions, computed from the SAME walk-ordered unit list so the spans cannot drift
+    // out of step with the placeholder runs they describe.
+    io.mrope_pos.clear();
+    io.mrope_decode_offset = 0;
+    if (impl_->cfg.mrope()) {
+        std::vector<sparkinfer::QwenVisionSpanGrid> grids;
+        grids.reserve(io.images.size());
+        // grid_t is 1 per unit: an image is one temporal group, and the reference splits a video's
+        // grid into one t=1 row PER GROUP, which is exactly how the prompt spans them too.
+        for (const auto& im : io.images) grids.push_back({1, im.grid_h, im.grid_w});
+        if (!sparkinfer::qwen_vision_mrope_positions(prompt_ids, image_token_id, video_token_id,
+                                                     grids, impl_->vcfg.spatial_merge, 0,
+                                                     io.mrope_pos, err))
+            return false;
+        // The last token's rotary position + 1 is where decode resumes; the difference from the
+        // prompt length is the constant every later decode step applies.
+        if (!prompt_ids.empty()) {
+            const int last_t = io.mrope_pos[(prompt_ids.size() - 1) * 3];
+            io.mrope_decode_offset = (last_t + 1) - (int)prompt_ids.size();
+        }
+    }
     return true;
 }
 
@@ -766,6 +788,14 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     req.prompt = prompt_ids;
     req.max_new_tokens = max_new_tokens;
     req.forced_tokens = forced_tokens;
+    if (images && !images->mrope_pos.empty()) {
+        // Carried whenever the checkpoint declares an mrope_section, independently of whether this
+        // particular request has images: the positions describe every token, and a prompt with no
+        // vision span still gets the (degenerate, all-axes-equal) values, which cost nothing and
+        // keep one code path instead of two.
+        req.mrope_pos = images->mrope_pos;
+        req.mrope_decode_offset = images->mrope_decode_offset;
+    }
     if (images && !images->positions.empty()) {
         req.vision_pos = images->positions;
         req.vision_images.reserve(images->images.size());

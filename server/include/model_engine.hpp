@@ -71,6 +71,14 @@ struct PreparedImages {
     // embedding at another image's location.
     std::vector<Image> images;
     std::vector<int> positions;      // absolute prompt indices of the expanded placeholder run
+
+    // Interleaved-MRoPE rotary positions for the whole prompt: [n_tokens*3], [t,h,w] per token.
+    // Empty when the loaded checkpoint declares no mrope_section.
+    std::vector<int> mrope_pos;
+    // (rotary position after the prompt) - prompt length. Zero or negative, because a vision span
+    // advances the rotary counter by max(h,w)/merge rather than by its token count. Every decode
+    // step of the request adds this to its rotary position while its cache slot stays sequential.
+    int mrope_decode_offset = 0;
 };
 
 // Thread-safe wrapper around sparkinfer::Qwen35Model + GGUF load.

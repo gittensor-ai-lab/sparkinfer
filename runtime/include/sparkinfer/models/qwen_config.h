@@ -31,6 +31,19 @@ struct Qwen35Config {
     bool  hybrid      = false;
     int   full_attn_interval = 4;
     int   rope_dim    = 0;      // 0 = rotate the full attention head
+    // Interleaved MRoPE (rope_parameters.mrope_section). Qwen3.5 gives a token THREE rotary
+    // positions -- temporal, height, width -- and the frequency index selects which one it reads,
+    // laid out [T H W T H W ...] rather than in contiguous chunks.
+    //
+    // Only the H and W section lengths are stored: the T section is whatever is left over, and
+    // the axis rule (i%3, bounded by 3*sec_h / 3*sec_w) needs exactly these two bounds.
+    // Zero means the checkpoint declares no mrope_section, i.e. ordinary 1D RoPE.
+    //
+    // For a TEXT token all three positions are equal, so MRoPE degenerates to 1D RoPE bit for
+    // bit. That is why a text-only prompt is unaffected whether or not this is set.
+    int   mrope_sec_h = 0;
+    int   mrope_sec_w = 0;
+    bool  mrope() const { return mrope_sec_h > 0 || mrope_sec_w > 0; }
     int   linear_q_heads = 16;
     int   linear_v_heads = 32;
     int   linear_head_dim = 128;

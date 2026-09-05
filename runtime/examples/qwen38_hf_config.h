@@ -65,6 +65,17 @@ static bool qwen38_config_from_hf_json(const std::string& model_dir,
             cfg.rope_theta = rp["rope_theta"].get<float>();
         if (rp.contains("partial_rotary_factor") && rp["partial_rotary_factor"].is_number())
             partial_rotary = rp["partial_rotary_factor"].get<float>();
+        // mrope_section is [T, H, W] frequency-band lengths summing to rope_dim/2. Only read when
+        // the checkpoint declares it; absent means ordinary 1D RoPE, which is the correct reading
+        // for every non-multimodal Qwen in this codebase.
+        if (rp.contains("mrope_section") && rp["mrope_section"].is_array() &&
+            rp["mrope_section"].size() >= 3) {
+            const auto& ms = rp["mrope_section"];
+            if (ms[1].is_number_integer() && ms[2].is_number_integer()) {
+                cfg.mrope_sec_h = ms[1].get<int>();
+                cfg.mrope_sec_w = ms[2].get<int>();
+            }
+        }
     }
     partial_rotary = getf("partial_rotary_factor", partial_rotary);   // top-level override/fallback
 

@@ -220,6 +220,21 @@ public:
     // cleared -- it is per-request state, not model state, and leaving it set would splice a
     // stale image into the next prompt.
     bool set_pending_vision(const float* emb, const int* positions, int n_img, int hidden);
+
+    // Supplies interleaved-MRoPE rotary positions for the NEXT prefill, plus the offset that every
+    // subsequent decode step of this session must add to its rotary position.
+    //
+    //   positions:     [n_tokens * 3] host int32, laid out [t0,h0,w0, t1,h1,w1, ...]
+    //   decode_offset: (rotary position after the prompt) - n_tokens. Zero or negative: a vision
+    //                  span advances the rotary counter by max(h,w)/merge, not by its token count.
+    //
+    // Text-only callers never call this, and the prefill and decode paths then run exactly the
+    // code they ran before MRoPE existed.
+    bool set_pending_mrope(const int* positions, int n_tokens, int decode_offset);
+    void clear_pending_mrope();
+    // Clears the decode offset. Needed when a session is reused for a new, image-free prompt --
+    // the offset outlives the positions by design, so it must be cleared explicitly.
+    void reset_mrope_offset();
     void clear_pending_vision();
 
     // Load weights from a sparkinfer weight directory (see runtime/tools/convert_qwen35.py).

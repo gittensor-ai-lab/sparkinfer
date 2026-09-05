@@ -143,6 +143,13 @@ public:
         };
         std::vector<VisionImage> vision_images;
         std::vector<int> vision_pos;
+        // Interleaved-MRoPE rotary positions for this prompt, [n_tokens*3] as [t,h,w] per token.
+        // Empty for text-only requests and for checkpoints without an mrope_section, in which case
+        // the prefill and decode paths run exactly as they did before MRoPE existed.
+        std::vector<int> mrope_pos;
+        // Added to every DECODE step's rotary position (never to its cache slot). See
+        // Qwen35Model::set_pending_mrope.
+        int mrope_decode_offset = 0;
     };
 
     struct Result {

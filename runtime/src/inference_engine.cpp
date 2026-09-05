@@ -430,10 +430,29 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
                 finish_job(job);
                 return true;
             }
+            // Rotary positions for the same prompt. Staged separately from the embeddings because
+            // they describe every token, not just the spliced ones -- and because a checkpoint
+            // without an mrope_section supplies none while still having images.
+            if (!job.req.mrope_pos.empty() &&
+                !model_->set_pending_mrope(job.req.mrope_pos.data(),
+                                           (int)(job.req.mrope_pos.size() / 3),
+                                           job.req.mrope_decode_offset)) {
+                job.error = "failed to stage MRoPE positions for prefill";
+                finish_job(job);
+                return true;
+            }
         }
+        // The decode offset deliberately OUTLIVES the positions -- decode needs it for every token
+        // after the prompt -- so a request that supplies none must clear it explicitly. Without
+        // this, a text-only request arriving after an image request on the same model would
+        // inherit the image's rotary shift and silently decode at the wrong positions.
+        if (job.req.mrope_pos.empty()) model_->reset_mrope_offset();
         const int seed = model_->ingest_prompt_range(job.req.prompt.data(), job.prefill_pos, n,
                                                       chunk_limit, &out_pos, want_seed_logprob);
         if (has_vision) model_->clear_pending_vision();
+        // Positions are consumed by the prefill they were staged for; the offset is not cleared
+        // here, by design.
+        if (!job.req.mrope_pos.empty()) model_->clear_pending_mrope();
         job.prefill_pos = out_pos;
         if (job.prefill_pos >= n) {
             // Known v1 scope limitation for temperature sampling (runtime/src/models/qwen35.cpp's
