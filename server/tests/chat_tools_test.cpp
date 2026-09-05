@@ -737,7 +737,15 @@ bool test_reasoning_effort_controls() {
         R"({"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"medium"}})",
         request));
     CHECK(request.reasoning_effort == "medium");
-    CHECK(contains(apply_qwen36_tools_template(request, true), "Reasoning effort is set to medium"));
+    // Third argument is inject_reasoning_effort, which DEFAULTS TO FALSE -- only Qwen3.8's
+    // template prepends the reasoning-effort system message; Qwen3.6 and Muse Glimmer never do.
+    // Calling with two arguments enables thinking but not injection, so this asserted a string the
+    // call could not produce. Broken since the assertion was written (3881e0c), which added it
+    // against the three-parameter signature 8dbfcdb had already introduced.
+    CHECK(contains(apply_qwen36_tools_template(request, true, true),
+                   "Reasoning effort is set to medium"));
+    // And the default really is off, or the assertion above would pass for the wrong reason.
+    CHECK(!contains(apply_qwen36_tools_template(request, true), "Reasoning effort is set to"));
 
     CHECK(parse_request(
         R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"})",

@@ -88,3 +88,15 @@ add_test(NAME qwen35_gpu_test COMMAND qwen35_gpu_test)
 add_executable(dflash_gdn_checkpoint_gpu_test dflash_gdn_checkpoint_gpu_test.cpp)
 target_link_libraries(dflash_gdn_checkpoint_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME dflash_gdn_checkpoint_gpu_test COMMAND dflash_gdn_checkpoint_gpu_test)
+
+# Video preprocessing — pure C++, no GPU, no checkpoint. Anchors the video path to the image
+# path by EQUIVALENCE: a 2-frame video of one still must be byte-identical to that still as an
+# image, because the tower's Conv3d time extent is filled by repetition for images and by real
+# frames for video. That single assertion transfers the image path's measured reference-exactness
+# (PIL bicubic constant, the twice-rounded uint8 intermediate, the (C,T,P,P) layout) onto video
+# without re-verifying any of it against transformers.
+add_executable(qwen_vision_video_cpu_test qwen_vision_video_cpu_test.cpp
+               ../src/models/qwen_vision_preprocess.cpp)
+target_include_directories(qwen_vision_video_cpu_test PRIVATE ../include)
+set_target_properties(qwen_vision_video_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME qwen_vision_video_cpu_test COMMAND qwen_vision_video_cpu_test)

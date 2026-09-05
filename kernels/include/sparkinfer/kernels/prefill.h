@@ -147,7 +147,8 @@ void launch_prefill_qknorm_rope_kv_int8(
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream = nullptr,
-    int pos0 = 0);
+    int pos0 = 0,
+    const int* mrope_pos = nullptr, int mrope_sec_h = 0, int mrope_sec_w = 0);
 
 // Muse Glimmer bf16-KV counterpart: QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM)
 // RoPE when rotary_dim>0 (SWA layers), or NoPE when rotary_dim==0 (global layers) + bf16 KV
@@ -161,7 +162,8 @@ void launch_prefill_qknorm_rope_kv_bf16(
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream = nullptr,
-    int pos0 = 0);
+    int pos0 = 0,
+    const int* mrope_pos = nullptr, int mrope_sec_h = 0, int mrope_sec_w = 0);
 
 void launch_prefill_qknorm_rope_kv_bf16_vi8(
     void* q, void* k, const void* v, const void* q_w, const void* k_w,
@@ -169,7 +171,8 @@ void launch_prefill_qknorm_rope_kv_bf16_vi8(
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream = nullptr,
-    int pos0 = 0);
+    int pos0 = 0,
+    const int* mrope_pos = nullptr, int mrope_sec_h = 0, int mrope_sec_w = 0);
 
 // Full-causal attention over a bf16 paged KV pool. false = no instantiation for head_dim.
 bool launch_prefill_attn_bf16_paged(

@@ -176,6 +176,38 @@ int image_pad_token_id() {
     return id;
 }
 
+// The video placeholder's token id, same contract as image_pad_token_id above.
+int video_pad_token_id() {
+    static const int id = [] {
+        const std::vector<int> ids = g_tokenizer.encode_raw("<|video_pad|>");
+        return ids.size() == 1 ? ids[0] : -1;
+    }();
+    return id;
+}
+
+int vision_start_token_id() {
+    static const int id = [] {
+        const std::vector<int> ids = g_tokenizer.encode_raw("<|vision_start|>");
+        return ids.size() == 1 ? ids[0] : -1;
+    }();
+    return id;
+}
+
+int vision_end_token_id() {
+    static const int id = [] {
+        const std::vector<int> ids = g_tokenizer.encode_raw("<|vision_end|>");
+        return ids.size() == 1 ? ids[0] : -1;
+    }();
+    return id;
+}
+
+// Collects every video_url in the request, in message order, alongside collect_image_urls.
+std::vector<std::string> collect_video_urls(const sparkinfer_server::ChatRequest& r) {
+    std::vector<std::string> urls;
+    for (const auto& m : r.messages) urls.insert(urls.end(), m.videos.begin(), m.videos.end());
+    return urls;
+}
+
 // Collects every image_url in the request, in message order, matching the order the rendered
 // prompt's placeholders appear in.
 std::vector<std::string> collect_image_urls(const sparkinfer_server::ChatRequest& r) {
@@ -780,12 +812,13 @@ int main(int argc, char** argv) {
             sparkinfer_server::ChatRequest probe;
             std::string perr;
             if (encode_messages(req.body, ids, enable_thinking, perr, &probe) &&
-                !collect_image_urls(probe).empty()) {
+                (!collect_image_urls(probe).empty() || !collect_video_urls(probe).empty())) {
                 g_requests_client_error++;
                 res.status = 400;
-                res.set_content("{\"error\":{\"message\":\"/v1/tokenize does not support image "
-                                "content parts; token counts for images depend on the resized "
-                                "grid\"}}", "application/json");
+                res.set_content("{\"error\":{\"message\":\"/v1/tokenize does not support image or "
+                                "video content parts; token counts for them depend on the resized "
+                                "grid, and for video on how many frames were sampled\"}}",
+                                "application/json");
                 return;
             }
             ids.clear();
@@ -862,8 +895,8 @@ int main(int argc, char** argv) {
                 sparkinfer_server::ChatRequest probe;
                 std::string perr;
                 if (encode_messages(req.body, prompt_ids, enable_thinking, perr, &probe) &&
-                    !collect_image_urls(probe).empty()) {
-                    fail(400, "/v1/score does not support image content parts");
+                    (!collect_image_urls(probe).empty() || !collect_video_urls(probe).empty())) {
+                    fail(400, "/v1/score does not support image or video content parts");
                     return;
                 }
                 prompt_ids.clear();
@@ -1044,12 +1077,31 @@ int main(int argc, char** argv) {
                  {
                      const std::vector<std::string> urls =
                          collect_image_urls(chat_request);
-                     if (!urls.empty()) {
+                     const std::vector<std::string> video_urls =
+                         collect_video_urls(chat_request);
+                     if (!urls.empty() || !video_urls.empty()) {
                          const int pad_id = image_pad_token_id();
+                         const int vpad_id = video_pad_token_id();
+                         const int vstart = vision_start_token_id();
+                         const int vend = vision_end_token_id();
                          std::string ierr;
-                         if (pad_id < 0) {
+                         if (!urls.empty() && pad_id < 0) {
                              ierr = "this model's tokenizer has no image placeholder token; "
                                     "image input is not supported";
+                         } else if (!video_urls.empty() && (vpad_id < 0 || vstart < 0 || vend < 0)) {
+                             ierr = "this model's tokenizer has no video placeholder tokens; "
+                                    "video input is not supported";
+                         } else if (!video_urls.empty()) {
+                             // Timestamp markers are tokenized here because the engine has no
+                             // tokenizer; encode_raw so "<1.5 seconds>" is not treated as a
+                             // special token lookup.
+                             sparkinfer_server::ModelEngine::VideoSampling sampling;
+                             if (!engine.prepare_vision(
+                                     urls, video_urls, pad_id, vpad_id, vstart, vend, sampling,
+                                     [](const std::string& t) { return g_tokenizer.encode_raw(t); },
+                                     prompt_ids, prepared, ierr)) {
+                                 // ierr already names which clip and why.
+                             }
                          } else if (!engine.prepare_images(urls, pad_id, prompt_ids, prepared, ierr)) {
                              // ierr already names which image and why.
                          }

@@ -111,6 +111,19 @@ int sample_one(Scratch& s, const std::vector<float>& logits, int top_k, float to
 
 bool is_neg_inf(float v) { return v == -std::numeric_limits<float>::infinity(); }
 
+// The indices that SURVIVED masking, in order.
+//
+// Stronger than spelling the survivors out elementwise (!is_neg_inf(out[0]) && is_neg_inf(out[1])
+// && ...): that form asserts what the listed entries are, but not that nothing ELSE survived, so a
+// mask that kept an extra token beyond the ones written down would still pass. Comparing the whole
+// surviving SET catches that.
+std::vector<int> finite_indices(const std::vector<float>& v) {
+    std::vector<int> idx;
+    for (size_t i = 0; i < v.size(); i++)
+        if (!is_neg_inf(v[i])) idx.push_back((int)i);
+    return idx;
+}
+
 bool test_top_k_1_always_greedy() {
     const std::vector<float> logits = {1.0f, 5.0f, 3.0f, 2.0f, -1.0f, 4.0f};
     Scratch s((int)logits.size());

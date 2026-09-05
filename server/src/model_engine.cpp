@@ -11,6 +11,7 @@
 #include "sparkinfer/models/qwen_vision_preprocess.h"
 #include "sparkinfer/safetensors.h"
 #include "image_input.hpp"
+#include "video_input.hpp"
 #include "sparkinfer/moe/engine.h"
 #include "sparkinfer/runtime.h"
 
@@ -460,6 +461,8 @@ bool ModelEngine::has_vision() const {
 bool ModelEngine::prepare_images(const std::vector<std::string>& urls, int image_token_id,
                                  std::vector<int>& prompt_ids, PreparedImages& out,
                                  std::string& err) const {
+    out.src_images.clear();
+    out.src_videos.clear();
     out.images.clear();
     out.positions.clear();
     if (urls.empty()) return true;
@@ -490,7 +493,7 @@ bool ModelEngine::prepare_images(const std::vector<std::string>& urls, int image
         pi.pixels = std::move(pixels);
         pi.grid_h = gh;
         pi.grid_w = gw;
-        out.images.push_back(std::move(pi));
+        out.src_images.push_back(std::move(pi));
     }
     // One placeholder per image goes in, the count each grid needs comes out. A mismatch here is
     // an error, never a best-effort expansion: guessing would hand the model a prompt whose image
@@ -498,22 +501,237 @@ bool ModelEngine::prepare_images(const std::vector<std::string>& urls, int image
     return reexpand_images(image_token_id, prompt_ids, out, err);
 }
 
+bool ModelEngine::prepare_vision(const std::vector<std::string>& image_urls,
+                                 const std::vector<std::string>& video_urls,
+                                 int image_token_id, int video_token_id,
+                                 int vision_start_token_id, int vision_end_token_id,
+                                 const VideoSampling& sampling,
+                                 const std::function<std::vector<int>(const std::string&)>& tokenize,
+                                 std::vector<int>& prompt_ids, PreparedImages& out,
+                                 std::string& err) const {
+    out.src_images.clear();
+    out.src_videos.clear();
+    out.images.clear();
+    out.positions.clear();
+    if (image_urls.empty() && video_urls.empty()) return true;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!impl_->vision_ready) {
+            err = "this model has no vision tower; image and video input are not supported";
+            return false;
+        }
+    }
+    if (!video_urls.empty() && !tokenize) {
+        err = "video input requires a tokenizer for its timestamp markers";
+        return false;
+    }
+
+    // Everything below is CPU-only preprocessing -- no tower weights are touched -- so it runs
+    // without the engine mutex and without contending for the GPU.
+    for (size_t i = 0; i < image_urls.size(); i++) {
+        const std::string where = "image " + std::to_string(i);
+        std::vector<unsigned char> bytes;
+        if (!parse_image_url(image_urls[i], bytes, err)) { err = where + ": " + err; return false; }
+        DecodedImage img;
+        if (!decode_image(bytes.data(), bytes.size(), img, err)) { err = where + ": " + err; return false; }
+        PreparedImages::Image pi;
+        int gh = 0, gw = 0;
+        auto pixels = std::make_shared<std::vector<float>>();
+        if (!sparkinfer::qwen_vision_preprocess(img.rgb.data(), img.height, img.width, impl_->vcfg,
+                                                *pixels, &gh, &gw, err)) {
+            err = where + ": " + err;
+            return false;
+        }
+        pi.pixels = std::move(pixels);
+        pi.grid_h = gh;
+        pi.grid_w = gw;
+        out.src_images.push_back(std::move(pi));
+    }
+
+    for (size_t i = 0; i < video_urls.size(); i++) {
+        const std::string where = "video " + std::to_string(i);
+        if (!video_decoder_available(nullptr)) {
+            err = where + ": video input needs ffmpeg and ffprobe on PATH";
+            return false;
+        }
+        std::vector<unsigned char> bytes;
+        if (!parse_video_url(video_urls[i], bytes, err)) { err = where + ": " + err; return false; }
+        DecodedVideo clip;
+        const int max_frames = sampling.max_frames > 0 ? sampling.max_frames : kDefaultMaxVideoFrames;
+        if (!decode_video(bytes.data(), bytes.size(), max_frames, sampling.fps, clip, err)) {
+            err = where + ": " + err;
+            return false;
+        }
+
+        std::vector<const unsigned char*> frame_ptrs;
+        frame_ptrs.reserve(clip.frames.size());
+        for (const auto& f : clip.frames) frame_ptrs.push_back(f.data());
+
+        std::vector<float> pixels;
+        int gt = 0, gh = 0, gw = 0;
+        if (!sparkinfer::qwen_vision_preprocess_video(frame_ptrs.data(), (int)frame_ptrs.size(),
+                                                      clip.height, clip.width, impl_->vcfg,
+                                                      pixels, &gt, &gh, &gw, err)) {
+            err = where + ": " + err;
+            return false;
+        }
+
+        PreparedImages::Video pv;
+        pv.tokens_per_frame = sparkinfer::qwen_vision_num_tokens(gh, gw, impl_->vcfg);
+        if (pv.tokens_per_frame <= 0) {
+            err = where + ": video grid does not divide into the spatial merge block";
+            return false;
+        }
+
+        // Slice the clip's one contiguous buffer into per-group buffers. Each group is an
+        // ordinary tower call, and Image owns its pixels, so the copy buys a uniform contract
+        // with the image path rather than a second offset-aware code path in the tower.
+        const size_t per_group = pixels.size() / (size_t)(gt > 0 ? gt : 1);
+        pv.groups.reserve((size_t)gt);
+        for (int g = 0; g < gt; g++) {
+            PreparedImages::Image gi;
+            auto buf = std::make_shared<std::vector<float>>(
+                pixels.begin() + (size_t)g * per_group,
+                pixels.begin() + (size_t)(g + 1) * per_group);
+            gi.pixels = std::move(buf);
+            gi.grid_h = gh;
+            gi.grid_w = gw;
+            pv.groups.push_back(std::move(gi));
+        }
+
+        const std::vector<float> ts = sparkinfer::qwen_vision_video_timestamps(
+            clip.frame_indices, clip.fps, impl_->vcfg.temporal_patch);
+        pv.timestamp_tokens.reserve(pv.groups.size());
+        for (size_t g = 0; g < pv.groups.size(); g++) {
+            // Reference format: one decimal, e.g. "<1.5 seconds>". snprintf rather than
+            // std::to_string, which is locale-independent here but fixed at six decimals.
+            char buf[64];
+            const float t = g < ts.size() ? ts[g] : 0.0f;
+            std::snprintf(buf, sizeof(buf), "<%.1f seconds>", (double)t);
+            pv.timestamp_tokens.push_back(tokenize(buf));
+        }
+        out.src_videos.push_back(std::move(pv));
+    }
+
+    return reexpand_vision(image_token_id, video_token_id,
+                           vision_start_token_id, vision_end_token_id, prompt_ids, out, err);
+}
+
 bool ModelEngine::reexpand_images(int image_token_id, std::vector<int>& prompt_ids,
                                   PreparedImages& io, std::string& err) const {
+    return reexpand_vision(image_token_id, impl_->vcfg.video_token_id,
+                           impl_->vcfg.vision_start_token_id, impl_->vcfg.vision_end_token_id,
+                           prompt_ids, io, err);
+}
+
+bool ModelEngine::reexpand_vision(int image_token_id, int video_token_id,
+                                  int vision_start_token_id, int vision_end_token_id,
+                                  std::vector<int>& prompt_ids, PreparedImages& io,
+                                  std::string& err) const {
     io.positions.clear();
-    if (io.images.empty()) return true;
-    // Counts come from the grids, not from a remembered list, so this is correct whether it runs
-    // on the first prompt or on one rebuilt from scratch afterwards.
-    std::vector<int> counts;
-    counts.reserve(io.images.size());
-    for (const auto& im : io.images)
-        counts.push_back(sparkinfer::qwen_vision_num_tokens(im.grid_h, im.grid_w, impl_->vcfg));
-    std::vector<int> expanded;
-    if (!sparkinfer::qwen_vision_expand_placeholders(prompt_ids, image_token_id, counts, expanded, err))
+    io.images.clear();
+    if (io.src_images.empty() && io.src_videos.empty()) return true;
+
+    // VIDEOS FIRST, then images. Each expansion scans for its own placeholder id and preserves
+    // every other token, so the two are independent -- but doing videos first keeps the image
+    // expansion working on a prompt whose video spans are already their final length, which is
+    // what makes the single ordering walk below correct.
+    if (!io.src_videos.empty()) {
+        std::vector<sparkinfer::QwenVideoSpan> spans;
+        spans.reserve(io.src_videos.size());
+        for (const auto& v : io.src_videos) {
+            sparkinfer::QwenVideoSpan sp;
+            sp.tokens_per_frame = v.tokens_per_frame;
+            sp.timestamp_tokens = v.timestamp_tokens;
+            spans.push_back(std::move(sp));
+        }
+        std::vector<int> expanded;
+        if (!sparkinfer::qwen_vision_expand_video_placeholders(
+                prompt_ids, video_token_id, vision_start_token_id, vision_end_token_id,
+                spans, expanded, err))
+            return false;
+        prompt_ids.swap(expanded);
+    }
+    if (!io.src_images.empty()) {
+        std::vector<int> counts;
+        counts.reserve(io.src_images.size());
+        for (const auto& im : io.src_images)
+            counts.push_back(sparkinfer::qwen_vision_num_tokens(im.grid_h, im.grid_w, impl_->vcfg));
+        std::vector<int> expanded;
+        if (!sparkinfer::qwen_vision_expand_placeholders(prompt_ids, image_token_id, counts,
+                                                         expanded, err))
+            return false;
+        prompt_ids.swap(expanded);
+    }
+
+    // Walk the finished prompt once and emit tower units in the order their placeholders appear.
+    // Each MAXIMAL run of one placeholder id is one unit: an image's run is its whole grid, and a
+    // video group's run is bounded by the vision_end/timestamp tokens between groups. Ordering by
+    // the walk -- rather than concatenating images-then-videos -- is what makes an interleaved
+    // request correct, because the engine pairs images[i] with positions[i] by index alone.
+    size_t next_image = 0, next_video = 0, next_group = 0;
+    for (size_t i = 0; i < prompt_ids.size(); ) {
+        const int id = prompt_ids[i];
+        if (id != image_token_id && id != video_token_id) { i++; continue; }
+        size_t j = i;
+        while (j < prompt_ids.size() && prompt_ids[j] == id) {
+            io.positions.push_back((int)j);
+            j++;
+        }
+        if (id == image_token_id) {
+            if (next_image >= io.src_images.size()) {
+                err = "prompt carries more image spans than images were preprocessed";
+                return false;
+            }
+            io.images.push_back(io.src_images[next_image++]);
+        } else {
+            if (next_video >= io.src_videos.size() ||
+                next_group >= io.src_videos[next_video].groups.size()) {
+                err = "prompt carries more video frame spans than frames were preprocessed";
+                return false;
+            }
+            io.images.push_back(io.src_videos[next_video].groups[next_group++]);
+            if (next_group == io.src_videos[next_video].groups.size()) {
+                next_video++;
+                next_group = 0;
+            }
+        }
+        i = j;
+    }
+    if (next_image != io.src_images.size() || next_video != io.src_videos.size()) {
+        err = "prompt carries fewer vision spans than were preprocessed";
         return false;
-    prompt_ids.swap(expanded);
-    for (size_t i = 0; i < prompt_ids.size(); i++)
-        if (prompt_ids[i] == image_token_id) io.positions.push_back((int)i);
+    }
+
+    // MRoPE positions, computed from the SAME walk-ordered unit list so the spans cannot drift
+    // out of step with the placeholder runs they describe.
+    io.mrope_pos.clear();
+    io.mrope_decode_offset = 0;
+    // SPARKINFER_MROPE=0 falls back to the 1D positions used before MRoPE existed. Kept because
+    // MRoPE is a BEHAVIOURAL change to already-shipped image handling, not a pure addition: an
+    // operator who sees image answers move after an upgrade needs a way to attribute it, and an
+    // A/B on one build is the only way to measure the effect on output at all.
+    static const bool mrope_enabled = [] {
+        const char* e = getenv("SPARKINFER_MROPE");
+        return !(e && e[0] == '0');
+    }();
+    if (impl_->cfg.mrope() && mrope_enabled) {
+        std::vector<sparkinfer::QwenVisionSpanGrid> grids;
+        grids.reserve(io.images.size());
+        // grid_t is 1 per unit: an image is one temporal group, and the reference splits a video's
+        // grid into one t=1 row PER GROUP, which is exactly how the prompt spans them too.
+        for (const auto& im : io.images) grids.push_back({1, im.grid_h, im.grid_w});
+        if (!sparkinfer::qwen_vision_mrope_positions(prompt_ids, image_token_id, video_token_id,
+                                                     grids, impl_->vcfg.spatial_merge, 0,
+                                                     io.mrope_pos, err))
+            return false;
+        // The last token's rotary position + 1 is where decode resumes; the difference from the
+        // prompt length is the constant every later decode step applies.
+        if (!prompt_ids.empty()) {
+            const int last_t = io.mrope_pos[(prompt_ids.size() - 1) * 3];
+            io.mrope_decode_offset = (last_t + 1) - (int)prompt_ids.size();
+        }
+    }
     return true;
 }
 
@@ -578,6 +796,14 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     req.prompt = prompt_ids;
     req.max_new_tokens = max_new_tokens;
     req.forced_tokens = forced_tokens;
+    if (images && !images->mrope_pos.empty()) {
+        // Carried whenever the checkpoint declares an mrope_section, independently of whether this
+        // particular request has images: the positions describe every token, and a prompt with no
+        // vision span still gets the (degenerate, all-axes-equal) values, which cost nothing and
+        // keep one code path instead of two.
+        req.mrope_pos = images->mrope_pos;
+        req.mrope_decode_offset = images->mrope_decode_offset;
+    }
     if (images && !images->positions.empty()) {
         req.vision_pos = images->positions;
         req.vision_images.reserve(images->images.size());

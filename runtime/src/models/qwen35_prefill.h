@@ -57,6 +57,14 @@ struct Qwen35PrefillCtx {
     const void*          vision_emb = nullptr;
     const int*           vision_pos = nullptr;
     int                  vision_n   = 0;
+
+    // Interleaved-MRoPE rotary positions: [n_tokens * 3] int32 on device, laid out
+    // [t0,h0,w0, t1,h1,w1, ...]. Null means the ordinary 1D ramp (pos0 + row), which is what every
+    // text-only request uses and what the kernels compile to when this is absent.
+    //
+    // Indexed by the row within THIS PASS, so a windowed prefill must hand over the slice for its
+    // own window rather than the whole prompt -- the same relationship `tok` already has to pos0.
+    const int*           mrope_pos  = nullptr;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
