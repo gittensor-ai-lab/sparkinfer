@@ -50,6 +50,25 @@ struct PreparedImages {
         int grid_h = 0;
         int grid_w = 0;
     };
+    // One decoded clip. Each temporal group is an ordinary Image -- the tower call for a video
+    // frame-pair is byte-for-byte the call for a still, which is why video needed no tower work.
+    struct Video {
+        std::vector<Image> groups;
+        // Tokenized "<N.N seconds>" marker per group, tokenized by the server (the runtime has no
+        // tokenizer). Kept here so a re-render can redo the expansion without re-decoding.
+        std::vector<std::vector<int>> timestamp_tokens;
+        int tokens_per_frame = 0;
+    };
+
+    // Inputs, in message order, kept so reexpand() can rebuild a prompt from scratch after a
+    // tool-call retry re-renders it.
+    std::vector<Image> src_images;
+    std::vector<Video> src_videos;
+
+    // FLATTENED tower units in PROMPT order, one per entry in `positions`. Images and video
+    // groups interleave here exactly as their placeholders do in the prompt -- the engine pairs
+    // images[i] with positions[i] positionally, so any other order silently splices each image's
+    // embedding at another image's location.
     std::vector<Image> images;
     std::vector<int> positions;      // absolute prompt indices of the expanded placeholder run
 };
@@ -96,6 +115,29 @@ public:
                         std::vector<int>& prompt_ids, PreparedImages& out,
                         std::string& err) const;
 
+    // Sampling parameters for video decode. Frames become prompt tokens, so these are a context
+    // budget as much as a memory one; 0 means "use the built-in default".
+    struct VideoSampling { int max_frames = 0; double fps = 0.0; };
+
+    // Same, for images and videos together. Videos decode through ffmpeg, sample to frames, and
+    // preprocess into temporal groups; each group becomes an ordinary tower unit.
+    //
+    // tokenize renders the "<N.N seconds>" marker that precedes each temporal group's span. It is
+    // a callback rather than a return-and-call-again because the timestamps depend on the sampled
+    // frame indices, which only exist after decoding -- and decoding twice would mean two ffmpeg
+    // subprocesses per request. The engine has no tokenizer of its own, hence the injection.
+    //
+    // Handles the interleaved case: a message carrying an image and a video in either order comes
+    // back with images[] in PROMPT order, not images-then-videos, because the engine pairs
+    // images[i] with positions[i] positionally.
+    bool prepare_vision(const std::vector<std::string>& image_urls,
+                        const std::vector<std::string>& video_urls,
+                        int image_token_id, int video_token_id,
+                        int vision_start_token_id, int vision_end_token_id,
+                        const VideoSampling& sampling,
+                        const std::function<std::vector<int>(const std::string&)>& tokenize,
+                        std::vector<int>& prompt_ids, PreparedImages& out, std::string& err) const;
+
     // Re-expands placeholders and recomputes positions against a prompt that was rebuilt after
     // prepare_images already ran. The tool-call continuation path re-renders the entire prompt
     // from the message list, so both the earlier expansion and the offsets it recorded are stale
@@ -106,6 +148,13 @@ public:
     // one positions vector.
     bool reexpand_images(int image_token_id, std::vector<int>& prompt_ids, PreparedImages& io,
                          std::string& err) const;
+
+    // The general form: re-expands image AND video placeholders and rebuilds images[]/positions[]
+    // in prompt order. reexpand_images() is this with the vision token ids taken from the loaded
+    // checkpoint's vision_config.
+    bool reexpand_vision(int image_token_id, int video_token_id,
+                         int vision_start_token_id, int vision_end_token_id,
+                         std::vector<int>& prompt_ids, PreparedImages& io, std::string& err) const;
 
     // Optional shared prompt prefix (e.g. system message tokens). When set, each request whose
     // prompt starts with these ids calls cache_prefix() (batched prefill) before generate().
