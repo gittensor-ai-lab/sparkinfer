@@ -244,6 +244,44 @@ std::vector<float> qwen_vision_video_timestamps(const std::vector<int>& frame_in
     return out;
 }
 
+bool qwen_vision_expand_video_placeholders(const std::vector<int>& in, int video_token_id,
+                                           int vision_start_token_id, int vision_end_token_id,
+                                           const std::vector<QwenVideoSpan>& videos,
+                                           std::vector<int>& out, std::string& err) {
+    size_t found = 0;
+    for (int t : in) if (t == video_token_id) found++;
+    if (found != videos.size()) {
+        err = "video placeholder count mismatch: prompt has " + std::to_string(found) +
+              " <|video_pad|>, caller preprocessed " + std::to_string(videos.size()) + " video(s)";
+        return false;
+    }
+    for (size_t i = 0; i < videos.size(); i++) {
+        if (videos[i].tokens_per_frame <= 0) {
+            err = "video " + std::to_string(i) + ": tokens_per_frame must be positive";
+            return false;
+        }
+        if (videos[i].timestamp_tokens.empty()) {
+            err = "video " + std::to_string(i) + ": no temporal groups";
+            return false;
+        }
+    }
+
+    out.clear();
+    out.reserve(in.size());
+    size_t vi = 0;
+    for (int t : in) {
+        if (t != video_token_id) { out.push_back(t); continue; }
+        const QwenVideoSpan& v = videos[vi++];
+        for (const std::vector<int>& ts : v.timestamp_tokens) {
+            out.insert(out.end(), ts.begin(), ts.end());
+            out.push_back(vision_start_token_id);
+            out.insert(out.end(), (size_t)v.tokens_per_frame, video_token_id);
+            out.push_back(vision_end_token_id);
+        }
+    }
+    return true;
+}
+
 bool qwen_vision_expand_placeholders(const std::vector<int>& in, int image_token_id,
                                      const std::vector<int>& counts,
                                      std::vector<int>& out, std::string& err) {

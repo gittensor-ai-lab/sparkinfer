@@ -68,6 +68,35 @@ std::vector<float> qwen_vision_video_timestamps(const std::vector<int>& frame_in
 // silently misaligns the whole sequence.
 int qwen_vision_num_tokens(int grid_h, int grid_w, const QwenVisionConfig& cfg);
 
+// One video's expansion parameters, for qwen_vision_expand_video_placeholders below.
+struct QwenVideoSpan {
+    // Placeholder tokens ONE temporal group needs: (grid_h/merge) * (grid_w/merge). Every group
+    // of a clip has the same count -- the whole clip shares one smart_resize.
+    int tokens_per_frame = 0;
+    // Tokenized "<N.N seconds>" marker, one entry per temporal group. Tokenized by the CALLER:
+    // the runtime has no tokenizer, and re-tokenizing the rendered prompt to insert these would
+    // risk shifting unrelated tokens through merge effects at the seams -- the same reason the
+    // image expansion works in token space.
+    std::vector<std::vector<int>> timestamp_tokens;
+};
+
+// Expands each single video placeholder into per-frame spans carrying timestamp markers.
+//
+// The chat template emits ONE <|video_pad|> per video, wrapped once:
+//     "<|vision_start|><|video_pad|><|vision_end|>"
+// and the reference PROCESSOR replaces ONLY the <|video_pad|> token -- not the wrapper -- with
+//     for each temporal group g:  "<t_g seconds>" <|vision_start|> <|video_pad|>*n <|vision_end|>
+// so the result is deliberately NESTED: the template's pair wraps the whole clip and every frame
+// carries its own inner pair. That looks like a bug and is not; Qwen3.5 separates video frames
+// with timestamps, and get_rope_index relies on each frame being its own vision span.
+//
+// The timestamps are not decoration. Without MRoPE's temporal axis they are the only signal that
+// orders the frames, and even with it they carry real elapsed time across subsampled frames.
+bool qwen_vision_expand_video_placeholders(const std::vector<int>& in, int video_token_id,
+                                           int vision_start_token_id, int vision_end_token_id,
+                                           const std::vector<QwenVideoSpan>& videos,
+                                           std::vector<int>& out, std::string& err);
+
 // Expands each single image placeholder into the number of tokens its image actually needs.
 //
 // The chat template emits exactly ONE <|image_pad|> per image:

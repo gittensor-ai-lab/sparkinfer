@@ -154,6 +154,59 @@ int main() {
               "null frame pointer rejected");
     }
 
+    // --- 6. placeholder expansion: nested spans, timestamps, exact token budget --------------
+    {
+        const int VS = cfg.vision_start_token_id, VE = cfg.vision_end_token_id;
+        const int VP = cfg.video_token_id;
+        // What the chat template produces: "Video 1: <|vision_start|><|video_pad|><|vision_end|>"
+        const std::vector<int> in = { 700, 701, VS, VP, VE, 702 };
+
+        QwenVideoSpan v;
+        v.tokens_per_frame = 4;                       // a 4x4 patch grid merged 2x2
+        v.timestamp_tokens = { {900, 901}, {902, 903} };   // two temporal groups
+        std::vector<int> out;
+        err.clear();   // else a previous section's message trails into this one's label
+        check(qwen_vision_expand_video_placeholders(in, VP, VS, VE, {v}, out, err),
+              "video expansion succeeds" + (err.empty() ? "" : " -- " + err));
+
+        // Per group: 2 timestamp tokens + vision_start + 4 pads + vision_end = 8. Two groups = 16.
+        // Plus the 5 non-placeholder tokens the template contributed.
+        check(out.size() == 5 + 16, "expanded length is template tokens + per-group spans");
+
+        int pads = 0, starts = 0, ends = 0;
+        for (int t : out) { if (t == VP) pads++; if (t == VS) starts++; if (t == VE) ends++; }
+        check(pads == 8, "one pad per merged patch per group (2 groups x 4)");
+        // The template's outer pair PLUS one inner pair per group -- the nesting is intentional.
+        check(starts == 3 && ends == 3, "outer template pair plus one inner pair per frame");
+
+        const std::vector<int> want = {
+            700, 701, VS,
+            900, 901, VS, VP, VP, VP, VP, VE,
+            902, 903, VS, VP, VP, VP, VP, VE,
+            VE, 702 };
+        check(out == want, "expansion matches the reference layout exactly");
+    }
+
+    // --- 7. expansion refuses the mismatches that would misalign a prompt ----------------------
+    {
+        const int VS = cfg.vision_start_token_id, VE = cfg.vision_end_token_id, VP = cfg.video_token_id;
+        std::vector<int> out;
+        QwenVideoSpan v; v.tokens_per_frame = 4; v.timestamp_tokens = { {900} };
+
+        // Two placeholders, one video preprocessed: silently expanding one would leave a bare
+        // <|video_pad|> the splice then has no embedding for.
+        check(!qwen_vision_expand_video_placeholders({VS, VP, VE, VS, VP, VE}, VP, VS, VE, {v}, out, err),
+              "placeholder/video count mismatch rejected");
+
+        QwenVideoSpan bad; bad.tokens_per_frame = 0; bad.timestamp_tokens = { {900} };
+        check(!qwen_vision_expand_video_placeholders({VS, VP, VE}, VP, VS, VE, {bad}, out, err),
+              "zero tokens_per_frame rejected");
+
+        QwenVideoSpan empty; empty.tokens_per_frame = 4;
+        check(!qwen_vision_expand_video_placeholders({VS, VP, VE}, VP, VS, VE, {empty}, out, err),
+              "video with no temporal groups rejected");
+    }
+
     std::printf(failures ? "\nFAILED (%d)\n" : "\nPASSED\n", failures);
     return failures ? 1 : 0;
 }
