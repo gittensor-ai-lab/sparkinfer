@@ -27,6 +27,7 @@ FetchContent_MakeAvailable(re2)
 
 add_executable(sparkinfer_server
     src/image_input.cpp
+    src/video_input.cpp
     src/sparkinfer_server.cpp
     src/model_engine.cpp
     src/chat_tokenizer.cpp
