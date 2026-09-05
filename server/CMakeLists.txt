@@ -83,6 +83,22 @@ if(BUILD_TESTS)
     target_compile_features(image_input_test PRIVATE cxx_std_17)
     add_test(NAME image_input_test COMMAND image_input_test)
 
+    # Video input: the ffmpeg subprocess path against real containers ffmpeg synthesizes itself,
+    # plus the same refusals image_input_test covers. SKIPS (passes) when ffmpeg is absent --
+    # video decoding is an optional runtime dependency and must not turn a box's suite red for
+    # not having it.
+    add_executable(video_input_test
+        tests/video_input_test.cpp
+        src/video_input.cpp
+        src/image_input.cpp
+    )
+    target_include_directories(video_input_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+    )
+    target_compile_features(video_input_test PRIVATE cxx_std_17)
+    add_test(NAME video_input_test COMMAND video_input_test)
+
     add_executable(chat_tokenizer_test
         tests/chat_tokenizer_test.cpp
         src/chat_tokenizer.cpp

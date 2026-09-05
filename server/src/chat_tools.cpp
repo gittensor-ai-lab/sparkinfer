@@ -35,6 +35,7 @@ constexpr const char* kImStart = "<|im_start|>";
 constexpr const char* kVisionStart = "<|vision_start|>";
 constexpr const char* kImagePad    = "<|image_pad|>";
 constexpr const char* kVisionEnd   = "<|vision_end|>";
+constexpr const char* kVideoPad    = "<|video_pad|>";
 constexpr const char* kImEnd = "<|im_end|>";
 constexpr const char* kThinkOpen = "<think>";
 constexpr const char* kThinkClose = "</think>";
@@ -208,7 +209,8 @@ bool is_allowed_key(const json& object, const std::set<std::string>& allowed,
 
 bool parse_content(const json& value, std::string& content, bool& is_null,
                    const std::string& where, std::string& err,
-                   std::vector<std::string>* images, const std::string& role) {
+                   std::vector<std::string>* images, const std::string& role,
+                   std::vector<std::string>* videos) {
     content.clear();
     is_null = value.is_null();
     if (is_null) return true;
@@ -236,6 +238,25 @@ bool parse_content(const json& value, std::string& content, bool& is_null,
             images->push_back(iu["url"].get<std::string>());
             content += kVisionStart;
             content += kImagePad;
+            content += kVisionEnd;
+            continue;
+        }
+        if (part["type"] == "video_url" && videos) {
+            // Same shape as image_url above, and refused in system/developer messages for the
+            // same reason -- the template raises on it outright.
+            if (role == "system")
+                return set_error(err, where + ".content[" + std::to_string(i) +
+                                      "]: system/developer messages cannot contain videos");
+            const json& vu = part.contains("video_url") ? part["video_url"] : json();
+            if (!vu.is_object() || !vu.contains("url") || !vu["url"].is_string())
+                return set_error(err, where + ".content[" + std::to_string(i) +
+                                      "].video_url.url must be a string");
+            videos->push_back(vu["url"].get<std::string>());
+            // ONE <|video_pad|> here, exactly as the template emits. The per-frame timestamped
+            // spans are expanded later, in token space, once the clip's grid is known -- the
+            // template cannot do it because it does not know how many frames were sampled.
+            content += kVisionStart;
+            content += kVideoPad;
             content += kVisionEnd;
             continue;
         }
@@ -577,7 +598,7 @@ bool parse_message(const json& value, ChatMessage& message, size_t index, std::s
         return set_error(err, where + ".role is unsupported");
     if (value.contains("content")) {
         if (!parse_content(value["content"], message.content, message.content_is_null, where, err,
-                           &message.images, message.role)) return false;
+                           &message.images, message.role, &message.videos)) return false;
     } else {
         message.content_is_null = true;
     }

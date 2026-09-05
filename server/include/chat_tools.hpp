@@ -42,6 +42,12 @@ struct ChatMessage {
     // that part occupied, so this vector and those markers stay in lockstep -- the processor, not
     // the template, later expands each placeholder to the token count its grid needs.
     std::vector<std::string> images;
+    // video_url values, same contract as images above: one
+    // <|vision_start|><|video_pad|><|vision_end|> renders per entry, in order. Kept in its OWN
+    // vector rather than folded into images because the two expand differently -- an image
+    // becomes one span of merged-patch placeholders, a video becomes one timestamped span PER
+    // temporal group -- and because the splice keys on a different token id.
+    std::vector<std::string> videos;
 };
 
 enum class ResponseFormatType {
