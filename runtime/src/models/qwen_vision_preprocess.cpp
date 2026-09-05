@@ -50,6 +50,53 @@ void resample_axis(const float* src, int src_len, int dst_len, int stride_src, i
     }
 }
 
+// Resize + rescale + normalize ONE frame into planar [C, rh, rw] float32.
+//
+// Split out of qwen_vision_preprocess so the video path reuses this byte-for-byte rather than
+// growing a second copy of the reference-exact ordering below. That ordering is load-bearing and
+// was measured, not guessed (see the comments inside): resize the uint8 VALUES, round-and-clamp
+// the intermediate back to uint8 the way PIL does, and only then rescale and normalize. A video
+// is just N frames through this same funnel, so any drift here would apply identically to images
+// and video -- which is exactly the property that makes the image reference check cover both.
+void normalize_frame(const unsigned char* rgb, int height, int width, int rh, int rw,
+                     const QwenVisionConfig& cfg, std::vector<float>& out) {
+    const int C = cfg.in_channels;
+    std::vector<float> plane((size_t)C * height * width);
+    for (int c = 0; c < C; c++)
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+                plane[((size_t)c * height + y) * width + x] =
+                    (float)rgb[((size_t)y * width + x) * C + c];
+
+    std::vector<float> tmp((size_t)C * height * rw);
+    out.assign((size_t)C * rh * rw, 0.0f);
+    for (int c = 0; c < C; c++) {   // horizontal then vertical
+        resample_axis(&plane[(size_t)c * height * width], width, rw, 1, 1,
+                      height, width, rw, &tmp[(size_t)c * height * rw]);
+        // The reference's INTERMEDIATE image is uint8 too: PIL resamples horizontally into an
+        // 8-bit temp, then vertically out of it, so the round-and-clamp happens TWICE. Carrying
+        // float through both passes and rounding once at the end is more accurate but drifts
+        // from the reference by several LSB at edges, which is not ours to decide.
+        float* t = &tmp[(size_t)c * height * rw];
+        for (long i = 0; i < (long)height * rw; i++)
+            t[i] = std::min(255.0f, std::max(0.0f, std::floor(t[i] + 0.5f)));
+        resample_axis(t, height, rh, rw, rw, rw, 1, 1, &out[(size_t)c * rh * rw]);
+    }
+    for (int c = 0; c < C; c++) {
+        const float mu = cfg.mean[c], sd = cfg.std_[c] != 0.f ? cfg.std_[c] : 1.f;
+        float* p = &out[(size_t)c * rh * rw];
+        for (long i = 0; i < (long)rh * rw; i++) {
+            // The uint8 round-trip the reference performs, then rescale, then normalize.
+            // floor(x+0.5), i.e. round-half-UP, because PIL's 8-bit resample accumulates in
+            // fixed point and rounds with a half-LSB add -- not nearbyint's round-half-to-EVEN,
+            // which disagrees on exact .5 ties. (smart_resize genuinely does want banker's
+            // rounding; that is Python's round(), a different reference entirely.)
+            const float q = std::min(255.0f, std::max(0.0f, std::floor(p[i] + 0.5f)));
+            p[i] = (q * (1.0f / 255.0f) - mu) / sd;
+        }
+    }
+}
+
 }  // namespace
 
 bool qwen_vision_smart_resize(int height, int width, int factor, long min_pixels, long max_pixels,
@@ -102,48 +149,8 @@ bool qwen_vision_preprocess(const unsigned char* rgb, int height, int width,
     const int C = cfg.in_channels, P = cfg.patch_size, T = cfg.temporal_patch;
     const int gh = rh / P, gw = rw / P;
 
-    // Planar uint8 VALUES (0..255, not yet rescaled), then resize, then rescale, then normalize.
-    //
-    // This order is the reference's, and it is not interchangeable with rescaling first even
-    // though resampling is linear: transformers resizes the uint8 image and casts the result back
-    // to uint8 -- PIL in the slow processor, torchvision in the fast one -- which ROUNDS to
-    // nearest and CLAMPS bicubic's overshoot into [0,255]. Neither of those commutes with
-    // scaling. Rescaling first (which this did until measured) leaves the overshoot in place and
-    // drifts from the reference by up to 0.127 in normalized units at high-contrast edges, where
-    // rounding alone would account for only ~0.004.
-    std::vector<float> plane((size_t)C * height * width);
-    for (int c = 0; c < C; c++)
-        for (int y = 0; y < height; y++)
-            for (int x = 0; x < width; x++)
-                plane[((size_t)c * height + y) * width + x] =
-                    (float)rgb[((size_t)y * width + x) * C + c];
-
-    std::vector<float> tmp((size_t)C * height * rw), out((size_t)C * rh * rw);
-    for (int c = 0; c < C; c++) {   // horizontal then vertical
-        resample_axis(&plane[(size_t)c * height * width], width, rw, 1, 1,
-                      height, width, rw, &tmp[(size_t)c * height * rw]);
-        // The reference's INTERMEDIATE image is uint8 too: PIL resamples horizontally into an
-        // 8-bit temp, then vertically out of it, so the round-and-clamp happens TWICE. Carrying
-        // float through both passes and rounding once at the end is more accurate but drifts
-        // from the reference by several LSB at edges, which is not ours to decide.
-        float* t = &tmp[(size_t)c * height * rw];
-        for (long i = 0; i < (long)height * rw; i++)
-            t[i] = std::min(255.0f, std::max(0.0f, std::floor(t[i] + 0.5f)));
-        resample_axis(t, height, rh, rw, rw, rw, 1, 1, &out[(size_t)c * rh * rw]);
-    }
-    for (int c = 0; c < C; c++) {
-        const float mu = cfg.mean[c], sd = cfg.std_[c] != 0.f ? cfg.std_[c] : 1.f;
-        float* p = &out[(size_t)c * rh * rw];
-        for (long i = 0; i < (long)rh * rw; i++) {
-            // The uint8 round-trip the reference performs, then rescale, then normalize.
-            // floor(x+0.5), i.e. round-half-UP, because PIL's 8-bit resample accumulates in
-            // fixed point and rounds with a half-LSB add -- not nearbyint's round-half-to-EVEN,
-            // which disagrees on exact .5 ties. (smart_resize above genuinely does want
-            // banker's rounding; that is Python's round(), a different reference entirely.)
-            const float q = std::min(255.0f, std::max(0.0f, std::floor(p[i] + 0.5f)));
-            p[i] = (q * (1.0f / 255.0f) - mu) / sd;
-        }
-    }
+    std::vector<float> out;
+    normalize_frame(rgb, height, width, rh, rw, cfg, out);
 
     // Patchify: row-major over the grid, each patch (C, T, P, P), still image repeated across T.
     pixels.assign((size_t)gh * gw * C * T * P * P, 0.0f);
@@ -159,6 +166,82 @@ bool qwen_vision_preprocess(const unsigned char* rgb, int height, int width,
       }
     *grid_h = gh; *grid_w = gw;
     return true;
+}
+
+bool qwen_vision_preprocess_video(const unsigned char* const* frames, int n_frames,
+                                  int height, int width, const QwenVisionConfig& cfg,
+                                  std::vector<float>& pixels,
+                                  int* grid_t, int* grid_h, int* grid_w, std::string& err) {
+    if (!frames || n_frames <= 0) { err = "preprocess video: no frames"; return false; }
+    for (int i = 0; i < n_frames; i++)
+        if (!frames[i]) { err = "preprocess video: null frame " + std::to_string(i); return false; }
+    if (height <= 0 || width <= 0) { err = "preprocess video: empty frame"; return false; }
+
+    const int C = cfg.in_channels, P = cfg.patch_size, T = cfg.temporal_patch;
+    if (T <= 0) { err = "preprocess video: temporal_patch must be positive"; return false; }
+
+    // ONE smart_resize for the whole clip, not per frame. The reference sizes a video from a
+    // single (height, width) because every frame shares a grid -- a per-frame resize would let
+    // two frames disagree on grid_h/grid_w, and the tower packs T frames into ONE patch, so a
+    // mismatch there is not a quality question, it is a shape error at the Conv3d.
+    int rh = 0, rw = 0;
+    if (!qwen_vision_smart_resize(height, width, cfg.size_granularity(),
+                                  cfg.min_pixels, cfg.max_pixels, &rh, &rw, err)) return false;
+    const int gh = rh / P, gw = rw / P;
+
+    // Pad the frame count up to a multiple of the temporal patch by REPEATING THE LAST FRAME.
+    // This is the reference's own padding (Qwen3VLProcessor._calculate_timestamps does
+    // `indices.extend(indices[-1] ...)`), not a convenience: a trailing partial group would
+    // otherwise be dropped or zero-filled, and zero-fill is a black frame the model will happily
+    // describe. Repeating the last frame is temporally meaningless but visually truthful.
+    const int n_pad = (n_frames % T == 0) ? n_frames : n_frames + (T - n_frames % T);
+    const int gt = n_pad / T;
+
+    // Normalize each DISTINCT frame once. The padding repeats an already-normalized frame rather
+    // than re-running the resize on it.
+    std::vector<std::vector<float>> norm((size_t)n_frames);
+    for (int i = 0; i < n_frames; i++)
+        normalize_frame(frames[i], height, width, rh, rw, cfg, norm[(size_t)i]);
+
+    // Patchify, group-major: [gt * gh * gw, C*T*P*P]. Within a group the layout is identical to
+    // the image path's (C, T, P, P) -- the only difference is that T now carries REAL consecutive
+    // frames instead of the same still repeated. That is the whole of "video" at this layer.
+    pixels.assign((size_t)gt * gh * gw * C * T * P * P, 0.0f);
+    for (int g = 0; g < gt; g++)
+      for (int gy = 0; gy < gh; gy++)
+        for (int gx = 0; gx < gw; gx++) {
+          float* dst = &pixels[(((size_t)g * gh + gy) * gw + gx) * C * T * P * P];
+          for (int c = 0; c < C; c++)
+            for (int t = 0; t < T; t++) {
+              const int fi = std::min(g * T + t, n_frames - 1);   // last-frame padding
+              const float* src = norm[(size_t)fi].data();
+              for (int py = 0; py < P; py++)
+                for (int px = 0; px < P; px++)
+                  dst[((c * T + t) * P + py) * P + px] =
+                      src[((size_t)c * rh + (gy * P + py)) * rw + (gx * P + px)];
+            }
+        }
+    *grid_t = gt; *grid_h = gh; *grid_w = gw;
+    return true;
+}
+
+std::vector<float> qwen_vision_video_timestamps(const std::vector<int>& frame_indices,
+                                                double fps, int temporal_patch) {
+    std::vector<float> out;
+    if (frame_indices.empty() || temporal_patch <= 0) return out;
+    if (fps <= 0.0) fps = 24.0;   // the reference's own fallback when fps cannot be inferred
+
+    // Pad indices to a whole number of temporal patches by repeating the last, then average
+    // each patch's first and last frame time. Both steps are the reference's
+    // (Qwen3VLProcessor._calculate_timestamps); the average is what makes a 2-frame patch report
+    // the midpoint of the interval it actually covers rather than its leading edge.
+    std::vector<int> idx = frame_indices;
+    while (idx.size() % (size_t)temporal_patch) idx.push_back(idx.back());
+    for (size_t i = 0; i < idx.size(); i += (size_t)temporal_patch) {
+        const double a = idx[i] / fps, b = idx[i + (size_t)temporal_patch - 1] / fps;
+        out.push_back((float)((a + b) / 2.0));
+    }
+    return out;
 }
 
 bool qwen_vision_expand_placeholders(const std::vector<int>& in, int image_token_id,
