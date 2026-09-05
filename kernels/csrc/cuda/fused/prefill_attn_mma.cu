@@ -418,7 +418,10 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     float* s_l  = s_m + RQH * BM;                                    // [RQH][BM]
     float* s_corr = s_l + RQH * BM;                                  // [RQH][BM]
 
-    fragment<accumulator, 16, 16, 16, float> ofr[RQH][DPW];
+    // Plain floats, not an accumulator fragment: the PV mma below picks its own n -> dim map
+    // (see the V load), so the epilogue writes s_o itself instead of store_matrix_sync's fixed
+    // one. Element e of a lane is row (e&2 ? rhi : rlo), dim 4*(lane&3) + 2*(e&1) + (e>>2).
+    float ofr[RQH][DPW][8];
     // A 16x16 accumulator gives every lane 8 elements spread over exactly TWO query rows, so the
     // per-row P quantum and the online-softmax correction the PV epilogue applies are two values
     // per head, not eight. The map: the fragment is two m16n8 halves and in each half a lane holds
@@ -437,7 +440,9 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     #pragma unroll
     for (int h = 0; h < RQH; h++)
         #pragma unroll
-        for (int dd = 0; dd < DPW; dd++) fill_fragment(ofr[h][dd], 0.f);
+        for (int dd = 0; dd < DPW; dd++)
+            #pragma unroll
+            for (int e = 0; e < 8; e++) ofr[h][dd][e] = 0.f;
 
     // ---- load + quantize Q rows for each of the RQH heads ----
     #pragma unroll
@@ -484,6 +489,11 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     for (int h = 0; h < RQH; h++)
         qa_base[h] = (unsigned)__cvta_generic_to_shared(
             s_qi + ((size_t)h * BM + (lane & 15)) * qld + (lane >> 4) * 16);
+    // Same ldmatrix.x4 lane map over the P' plane, for the PV mma below. One base is enough:
+    // the per-head offset h*BM*pld is uniform across the warp, so it stays an immediate/uniform
+    // addend rather than the register array Q needs (Q's stride qld differs from pld).
+    const unsigned pi_base = (unsigned)__cvta_generic_to_shared(
+        s_pi + (size_t)(lane & 15) * pld + (lane >> 4) * 16);
 
     const int last_q = q_pos0 + min(qbase + BM - 1, n_tokens - 1);
     int blk_rs = 0;
@@ -782,24 +792,101 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             #undef PF_VS
             __syncthreads();
 
-            // ---- PV: load each V tile fragment ONCE, feed RQH q-heads ----
+            // ---- PV: TWO key pages per mma, feeding RQH q-heads from one V pair ----
+            // wmma's 16x16x16 s8 tile lowers to IMMA.16816, and the 8-bit tensor path is full
+            // rate only at k=32: measured on this RTX 5090 with independent accumulator chains,
+            // m16n8k16.s8 and m16n8k32.s8 cost the SAME 47.6 ns per warp instruction slot, i.e.
+            // 479 against 937 TOPS. QK has always issued the k=32 form; PV -- the other half of
+            // the attention math -- was spending a full tensor issue on half a tile.
+            //
+            // Nothing has to be repacked to fix it. A 16-row by 32-byte row-major P' tile is
+            // exactly one ldmatrix.x4, which IS the m16n8k32 A operand (rows lane>>2 and +8, k =
+            // (lane&3)*4 and +16), so one shared load now covers the two pages that used to take
+            // two matrix_a fragments; and a 16x16x16 matrix_b fragment is one B register per
+            // n-half, so two consecutive V pages concatenate in registers. int32 accumulation is
+            // exact and associative, so the int32 sums -- and every bf16 output byte -- are
+            // unchanged. The accumulator is the two n-halves back to back, which is the layout
+            // the epilogue's hi_mask already assumes.
+            //
+            // The pair loop runs over an EVEN page count so it needs no per-page bound test; the
+            // one page a causally-cut group can leave over is retired after it, against a zero
+            // second B operand. Both halves of the k=32 A operand come from a single ldmatrix,
+            // so the odd page reads 16 columns past the group -- which the zero B discards.
             #pragma unroll
             for (int dd = 0; dd < DPW; dd++) {
                 const int dt = warp * DPW + dd;
-                fragment<accumulator, 16, 16, 16, int> cf[RQH];
+                int cf[RQH][2][4];
                 #pragma unroll
-                for (int h = 0; h < RQH; h++) fill_fragment(cf[h], 0);
-                for (int ks = 0; ks < gblk; ks++) {
-                    const int pb = block_table[(k0 / BLKSZ) + ks];
-                    const signed char* vb =
-                        v_pool + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
-                    fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
-                    fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
-                    load_matrix_sync(bf, vb, KVLD);                  // V fragment: loaded once
+                for (int h = 0; h < RQH; h++)
+                    #pragma unroll
+                    for (int n2 = 0; n2 < 2; n2++)
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++) cf[h][n2][j] = 0;
+                // Row (l&3)*4 of the page, dim pair 2*(l>>2) of this warp's 16-dim slab: the
+                // B operand's k index is the key and its n index the dim, both fixed per lane.
+                const size_t vlane = (size_t)((lane & 3) * 4) * KVLD + dt * 16 + 2 * (lane >> 2);
+                const int gpair = gblk & ~1;
+                for (int ks = 0; ks < gpair; ks += 2) {
+                    const int lb0 = (k0 / BLKSZ) + ks;
+                    const int lb1 = lb0 + 1;
+                    // V, in the mma's own B layout, as HALFWORDS. The n operand index is a free
+                    // choice -- it only has to be undone once, in the epilogue -- and the natural
+                    // wmma mapping (n-half h owns dims 8h..8h+7) is the worst one: it hands a lane
+                    // dims d and d+8, eight bytes apart, so load_matrix_sync gathers a row-major
+                    // 8-bit matrix_b with EIGHT LDG.E.U8 and a PRMT chain per 16-key tile. Mapping
+                    // n-half h to dims {2c+h} instead makes a lane's two dims ADJACENT, and the
+                    // pair is one LDG.E.U16. Same bytes, same rows, half the memory instructions.
+                    const signed char* vb0 = v_pool + ((size_t)block_table[lb0] * BLKSZ
+                                             * n_kv_heads + kvh) * HEAD_DIM + vlane;
+                    const signed char* vb1 = v_pool + ((size_t)block_table[lb1] * BLKSZ
+                                             * n_kv_heads + kvh) * HEAD_DIM + vlane;
+                    unsigned B0[2], B1[2];
+                    {
+                        unsigned r0[4], r1[4];
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++) {
+                            r0[j] = *reinterpret_cast<const unsigned short*>(vb0 + (size_t)j * KVLD);
+                            r1[j] = *reinterpret_cast<const unsigned short*>(vb1 + (size_t)j * KVLD);
+                        }
+                        // {b0,b0,b1,b1} pairs, then split the two dims into their n-halves.
+                        const unsigned a0 = __byte_perm(r0[0], r0[1], 0x5140);
+                        const unsigned a1 = __byte_perm(r0[2], r0[3], 0x5140);
+                        const unsigned c0 = __byte_perm(r1[0], r1[1], 0x5140);
+                        const unsigned c1 = __byte_perm(r1[2], r1[3], 0x5140);
+                        B0[0] = __byte_perm(a0, a1, 0x5410);
+                        B0[1] = __byte_perm(a0, a1, 0x7632);
+                        B1[0] = __byte_perm(c0, c1, 0x5410);
+                        B1[1] = __byte_perm(c0, c1, 0x7632);
+                    }
                     #pragma unroll
                     for (int h = 0; h < RQH; h++) {
-                        load_matrix_sync(af, s_pi + (size_t)h * BM * pld + ks * 16, pld);
-                        mma_sync(cf[h], af, bf, cf[h]);
+                        unsigned a[4];
+                        pf_ldsm_x4(a, pi_base + (unsigned)(h * BM * pld + ks * 16));
+                        pf_mma_16832(cf[h][0], a, B0[0], B1[0]);
+                        pf_mma_16832(cf[h][1], a, B0[1], B1[1]);
+                    }
+                }
+                // A group holds an odd page only where the causal bound cuts it -- once per
+                // query tile at most. Zeroing the second B operand is what makes it exact: the
+                // upper half of the k=32 A operand then reads past the group into whatever the
+                // guarded P' store left there and multiplies it by nothing.
+                if (gblk & 1) {
+                    const signed char* vb0 = v_pool + ((size_t)block_table[(k0 / BLKSZ) + gpair]
+                                             * BLKSZ * n_kv_heads + kvh) * HEAD_DIM + vlane;
+                    unsigned r0[4];
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        r0[j] = *reinterpret_cast<const unsigned short*>(vb0 + (size_t)j * KVLD);
+                    const unsigned a0 = __byte_perm(r0[0], r0[1], 0x5140);
+                    const unsigned a1 = __byte_perm(r0[2], r0[3], 0x5140);
+                    const unsigned Bt[2] = {__byte_perm(a0, a1, 0x5410),
+                                            __byte_perm(a0, a1, 0x7632)};
+                    #pragma unroll
+                    for (int h = 0; h < RQH; h++) {
+                        unsigned a[4];
+                        pf_ldsm_x4(a, pi_base + (unsigned)(h * BM * pld + gpair * 16));
+                        pf_mma_16832(cf[h][0], a, Bt[0], 0u);
+                        pf_mma_16832(cf[h][1], a, Bt[1], 0u);
                     }
                 }
                 #pragma unroll
@@ -809,8 +896,8 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                     #pragma unroll
                     for (int e = 0; e < 8; e++) {
                         const bool up = (hi_mask >> e) & 1u;
-                        ofr[h][dd].x[e] = __fmaf_rn((float)cf[h].x[e], up ? ps_hi : ps_lo,
-                                                    __fmul_rn(ofr[h][dd].x[e], up ? cr_hi : cr_lo));
+                        ofr[h][dd][e] = __fmaf_rn((float)cf[h][e >> 2][e & 3], up ? ps_hi : ps_lo,
+                                                  __fmul_rn(ofr[h][dd][e], up ? cr_hi : cr_lo));
                     }
                 }
             }
@@ -822,8 +909,13 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     for (int h = 0; h < RQH; h++) {
         const int head = head0 + h;
         #pragma unroll
-        for (int dd = 0; dd < DPW; dd++)
-            store_matrix_sync(s_o + (warp * DPW + dd) * 16, ofr[h][dd], HEAD_DIM, mem_row_major);
+        for (int dd = 0; dd < DPW; dd++) {
+            const int cb = (warp * DPW + dd) * 16 + 4 * (lane & 3);
+            #pragma unroll
+            for (int e = 0; e < 8; e++)
+                s_o[(((e >> 1) & 1) ? rhi : rlo) * HEAD_DIM + cb + 2 * (e & 1) + (e >> 2)] =
+                    ofr[h][dd][e];
+        }
         __syncthreads();
         for (int r = 0; r < BM; r++) {
             const int qtok = qbase + r;
