@@ -961,12 +961,33 @@ __global__ void pf_gated_norm_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+// Interleaved-MRoPE axis for rotary frequency index i.
+//
+// Qwen3.5 lays the three position axes out as [T H W T H W ...] across the frequency vector
+// rather than in three contiguous chunks, which is what mrope_interleaved means. The reference
+// builds it by starting from all-T and overwriting slice(1, 3*sec_h, 3) with H and
+// slice(2, 3*sec_w, 3) with W, so the axis for index i is i%3 -- bounded, because the last few
+// indices fall outside the shorter sections' reach. With mrope_section [11,11,10] over 32
+// frequencies every i%3==2 index happens to be in range, but the bound is kept so a checkpoint
+// with a different split stays correct.
+//
+// For a text token all three positions are equal, so this selects between identical values and
+// the result is bit-identical to plain 1D RoPE. That is the property that lets MRoPE be enabled
+// without touching text-only numerics at all.
+__device__ __forceinline__ int pf_mrope_axis(int i, int sec_h, int sec_w) {
+    const int r = i % 3;
+    if (r == 1 && i < 3 * sec_h) return 1;
+    if (r == 2 && i < 3 * sec_w) return 2;
+    return 0;
+}
+
 // ============================================================================
 // Full-attention prefill: QK-norm + partial-RoPE (q,k in place) + int8 KV write into
 // the single-sequence paged pool. Mirrors qknorm_rope_kv_partial_int8_kernel (rope.cu)
 // but indexes the block table for a single sequence and grids over all N prompt tokens.
 // grid = (n_q_heads + 2*n_kv_heads, N); blockDim = head_dim.
 // ============================================================================
+template <bool MROPE>
 __global__ void pf_qknorm_rope_kv_int8_kernel(
     __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
@@ -974,7 +995,8 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
     __half* __restrict__ k_scale, __half* __restrict__ v_scale,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
-    int block_size, int max_blocks_per_seq, int pos0) {
+    int block_size, int max_blocks_per_seq, int pos0,
+    const int* __restrict__ mrope_pos, int mrope_sec_h, int mrope_sec_w) {
     const int tok  = blockIdx.x;                    // token (grid.x avoids 65535 grid.y cap)
     const int unit = blockIdx.y;
     const int t    = threadIdx.x;
@@ -1015,7 +1037,11 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
         // does this correctly via its `else { val = s_h[t]; }` arm; Q was asymmetric with it.
         if (t < rhalf) {
             const float freq = __powf(theta, -2.f * (float)t / (float)rotary_dim);
-            const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+            // Here the thread index IS the frequency index (this arm handles both halves of the
+            // pair itself), so t indexes mrope_section directly.
+            const int rp = MROPE ? mrope_pos[(size_t)tok * 3 + pf_mrope_axis(t, mrope_sec_h, mrope_sec_w)]
+                                 : pos;
+            const float ang = (float)rp * freq, c = __cosf(ang), s = __sinf(ang);
             const float x0 = s_h[t], x1 = s_h[t + rhalf];
             s_h[t]         = pf_to_f(__float2bfloat16(x0 * c - x1 * s));
             s_h[t + rhalf] = pf_to_f(__float2bfloat16(x1 * c + x0 * s));
@@ -1050,7 +1076,12 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
         if (t < rotary_dim) {
             const int i = (t < rhalf) ? t : (t - rhalf);
             const float freq = __powf(theta, -2.f * (float)i / (float)rotary_dim);
-            const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+            // MRoPE changes ONLY the angle. The block-table slot and the causal mask keep using
+            // the sequential position -- a vision token still occupies one cache slot even though
+            // its rotary position is three numbers.
+            const int rp = MROPE ? mrope_pos[(size_t)tok * 3 + pf_mrope_axis(i, mrope_sec_h, mrope_sec_w)]
+                                 : pos;
+            const float ang = (float)rp * freq, c = __cosf(ang), s = __sinf(ang);
             const float x0 = s_h[i], x1 = s_h[i + rhalf];
             val = (t < rhalf) ? (x0 * c - x1 * s) : (x1 * c + x0 * s);
         } else {
@@ -1234,6 +1265,7 @@ __global__ void pf_attn_int8_paged_kernel(
 // forward_token decode step writes when kv8 is off, so a decode continuing from this cache
 // reads a consistent one.
 // ============================================================================
+template <bool MROPE>
 __global__ void pf_qknorm_rope_kv_bf16_kernel(
     __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
@@ -1241,7 +1273,8 @@ __global__ void pf_qknorm_rope_kv_bf16_kernel(
     signed char* __restrict__ v_i8, __half* __restrict__ v_i8_scale,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
-    int block_size, int max_blocks_per_seq, int pos0) {
+    int block_size, int max_blocks_per_seq, int pos0,
+    const int* __restrict__ mrope_pos, int mrope_sec_h, int mrope_sec_w) {
     const int tok  = blockIdx.x;
     const int unit = blockIdx.y;
     const int t    = threadIdx.x;
@@ -1288,7 +1321,9 @@ __global__ void pf_qknorm_rope_kv_bf16_kernel(
             const int half = rotary_dim >> 1;
             const int i    = (t < half) ? t : (t - half);
             const float freq = __powf(theta, -2.f * (float)i / (float)rotary_dim);
-            const float ang = (float)pos * freq, c = __cosf(ang), sn = __sinf(ang);
+            const int rp = MROPE ? mrope_pos[(size_t)tok * 3 + pf_mrope_axis(i, mrope_sec_h, mrope_sec_w)]
+                                 : pos;
+            const float ang = (float)rp * freq, c = __cosf(ang), sn = __sinf(ang);
             const float x0 = s_h[i], x1 = s_h[i + half];
             out = (t < half) ? (x0 * c - x1 * sn) : (x1 * c + x0 * sn);
         }
@@ -1758,16 +1793,28 @@ void launch_prefill_qknorm_rope_kv_int8(
     signed char* k_pool, signed char* v_pool, void* k_scale, void* v_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream, int pos0) {
+    cudaStream_t stream, int pos0, const int* mrope_pos, int mrope_sec_h, int mrope_sec_w) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
-    pf_qknorm_rope_kv_int8_kernel<<<grid, head_dim, shmem, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
-        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
-        reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
-        reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
-        block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-        block_size, max_blocks_per_seq, pos0);
+    // Dispatched on a TEMPLATE parameter, not a runtime branch: with mrope_pos null the compiler
+    // emits exactly the code it emitted before this feature existed, so the scored text-only
+    // prefill path carries no extra register pressure, no extra load and no predicate.
+    if (mrope_pos)
+        pf_qknorm_rope_kv_int8_kernel<true><<<grid, head_dim, shmem, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+            reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
+            reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+            block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
+            block_size, max_blocks_per_seq, pos0, mrope_pos, mrope_sec_h, mrope_sec_w);
+    else
+        pf_qknorm_rope_kv_int8_kernel<false><<<grid, head_dim, shmem, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+            reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
+            reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+            block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
+            block_size, max_blocks_per_seq, pos0, nullptr, 0, 0);
 }
 
 // Muse Glimmer bf16-KV counterpart: QK-norm + NORMAL RoPE (rotary_dim>0) / NoPE
@@ -1794,16 +1841,27 @@ void launch_prefill_qknorm_rope_kv_bf16_vi8(
     void* k_pool, void* v_pool, signed char* v_i8, void* v_i8_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream, int pos0) {
+    cudaStream_t stream, int pos0, const int* mrope_pos, int mrope_sec_h, int mrope_sec_w) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);
     const size_t shmem = (size_t)head_dim * sizeof(float);
-    pf_qknorm_rope_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
-        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
-        reinterpret_cast<const __nv_bfloat16*>(k_w),
-        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
-        v_i8, reinterpret_cast<__half*>(v_i8_scale), block_table,
-        n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps, block_size, max_blocks_per_seq, pos0);
+    if (mrope_pos)
+        pf_qknorm_rope_kv_bf16_kernel<true><<<grid, head_dim, shmem, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+            reinterpret_cast<const __nv_bfloat16*>(k_w),
+            reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+            v_i8, reinterpret_cast<__half*>(v_i8_scale), block_table,
+            n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps, block_size,
+            max_blocks_per_seq, pos0, mrope_pos, mrope_sec_h, mrope_sec_w);
+    else
+        pf_qknorm_rope_kv_bf16_kernel<false><<<grid, head_dim, shmem, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+            reinterpret_cast<const __nv_bfloat16*>(k_w),
+            reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+            v_i8, reinterpret_cast<__half*>(v_i8_scale), block_table,
+            n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps, block_size,
+            max_blocks_per_seq, pos0, nullptr, 0, 0);
 }
 
 bool launch_prefill_attn_int8_paged(
@@ -1854,16 +1912,25 @@ void launch_prefill_qknorm_rope_kv_bf16(
     void* k_pool, void* v_pool,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream, int pos0) {
+    cudaStream_t stream, int pos0, const int* mrope_pos, int mrope_sec_h, int mrope_sec_w) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);
     const size_t shmem = (size_t)head_dim * sizeof(float);
-    pf_qknorm_rope_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
-        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
-        reinterpret_cast<const __nv_bfloat16*>(k_w),
-        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
-        nullptr, nullptr, block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-        block_size, max_blocks_per_seq, pos0);
+    if (mrope_pos)
+        pf_qknorm_rope_kv_bf16_kernel<true><<<grid, head_dim, shmem, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+            reinterpret_cast<const __nv_bfloat16*>(k_w),
+            reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+            nullptr, nullptr, block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
+            block_size, max_blocks_per_seq, pos0, mrope_pos, mrope_sec_h, mrope_sec_w);
+    else
+        pf_qknorm_rope_kv_bf16_kernel<false><<<grid, head_dim, shmem, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+            reinterpret_cast<const __nv_bfloat16*>(k_w),
+            reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+            nullptr, nullptr, block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
+            block_size, max_blocks_per_seq, pos0, nullptr, 0, 0);
 }
 
 bool launch_prefill_attn_bf16_paged(
