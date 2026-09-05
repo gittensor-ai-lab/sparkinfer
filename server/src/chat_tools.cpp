@@ -1748,6 +1748,28 @@ ParsedToolOutput parse_qwen36_tool_output(const std::string& raw, bool enable_th
         if (has_protocol_markup(out.content)) {
             return fail_tool_output(std::move(out), "malformed tool-call markup");
         }
+        // tool_choice=required / a named function is a CONTRACT, not a hint: the caller is told at
+        // least one call (or that specific call) will come back, and typically branches on
+        // tool_calls without checking. The template already instructs the model that it MUST call
+        // -- but instructing is not enforcing, and a model that answers in prose anyway was, until
+        // now, passed straight through as an ordinary assistant message. The caller then sees a
+        // successful completion with no tool_calls, which is exactly the case it was promised
+        // could not happen.
+        //
+        // Failing here routes into the same invalid_tool_output path as malformed markup, which is
+        // bounded (one retry, then a 502) rather than looping.
+        if (!request.tools.empty()) {
+            if (request.tool_choice == ToolChoiceMode::kRequired) {
+                return fail_tool_output(std::move(out),
+                                        "tool_choice=required but the model returned no tool call");
+            }
+            if (request.tool_choice == ToolChoiceMode::kNamed) {
+                return fail_tool_output(std::move(out),
+                                        "tool_choice named the function \"" +
+                                        request.required_tool_name +
+                                        "\" but the model returned no tool call");
+            }
+        }
         return out;
     }
     if (request.tools.empty() || request.tool_choice == ToolChoiceMode::kNone) {
