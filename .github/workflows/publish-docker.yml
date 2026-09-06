@@ -1,0 +1,86 @@
+# Build the serving image from a release tag and publish it to GHCR.
+#
+# Triggered by a published release, so the image is built from exactly that tag's source
+# (the Dockerfile COPYs the checked-out tree rather than cloning), and can be run by hand
+# against any ref with workflow_dispatch.
+name: publish-docker
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "git ref to build (defaults to the branch this is run from)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-docker-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      # The CUDA devel base alone is ~9 GB and the build tree adds several more; a default
+      # runner has ~14 GB free and runs out partway through the CUDA compile. Reclaiming the
+      # preinstalled toolchains buys ~25 GB and is the difference between this working and not.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.event.release.tag_name || github.ref }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/sparkinfer-qwen38
+          # `latest` only from a real release, never from a manual dispatch off a branch.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=sparkinfer-qwen38
+            org.opencontainers.image.description=SparkInfer serving Qwen3.8-27B-NVFP4 (AR + image + video) with the DSpark benchmark
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GHA cache keeps the rust/apt/CUTLASS layers warm; the CUDA compile still dominates.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo "Runs on Blackwell (sm_120). Weights download on first run into the /models volume."
+          } >> "$GITHUB_STEP_SUMMARY"

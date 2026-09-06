@@ -108,6 +108,13 @@ if(BUILD_EXAMPLES)
     add_executable(qwen3_gguf_dflash_check examples/qwen3_gguf_dflash_check.cpp)
     target_include_directories(qwen3_gguf_dflash_check PRIVATE include)
     target_link_libraries(qwen3_gguf_dflash_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    # Same DFlash measurement as qwen3_gguf_dflash_bench, but against an NVFP4 safetensors
+    # checkpoint (config.json + model-*.safetensors) rather than a GGUF -- i.e. exactly what
+    # the server serves. nlohmann_json is declared at the top-level CMakeLists.
+    add_executable(qwen38_hf_dflash_bench examples/qwen38_hf_dflash_bench.cpp)
+    target_include_directories(qwen38_hf_dflash_bench PRIVATE include examples)
+    target_link_libraries(qwen38_hf_dflash_bench PRIVATE sparkinfer_runtime CUDA::cudart nlohmann_json::nlohmann_json)
+
     add_executable(qwen3_gguf_dflash_bench examples/qwen3_gguf_dflash_bench.cpp)
     target_include_directories(qwen3_gguf_dflash_bench PRIVATE include)
     target_link_libraries(qwen3_gguf_dflash_bench PRIVATE sparkinfer_runtime CUDA::cudart)
