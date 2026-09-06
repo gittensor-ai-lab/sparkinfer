@@ -1205,6 +1205,22 @@ fi
 #
 # c=1 is measured as a FLOOR, not scored: it is what catches a PR that buys concurrency scaling by
 # slowing the single-stream path. Same role the ar-decode floors play for DSpark.
+#
+# 256 tokens per request, NOT 64. That is a noise requirement, not a preference, and it was
+# measured rather than guessed -- 16 runs of IDENTICAL code on main:
+#
+#              64 tok/req (~1-2s)          256 tok/req (14-28s)
+#   c=1        0.73% spread                 --
+#   c=2        0.43%                        --
+#   c=4        3.40% spread, -3.37% worst   0.41% spread, -0.41% worst
+#   c=8        2.97% spread, -2.94% worst   0.28% spread, -0.27% worst
+#
+# REGRESS_TOL rejects anything below -2.00%. At 64 tokens a run is under two seconds and is partly
+# measuring its own startup, so c=4 and c=8 could land at -3.4% on UNCHANGED code and hard-REJECT
+# the PR -- a spurious-rejection generator, and the same class of defect as the fail-open guards
+# fixed in #674: a gate returning a verdict its evidence does not support. At 256 tokens the
+# worst case sits 5-7x inside the reject band. Do not shorten this to save GPU time; the four runs
+# together cost ~3 minutes against the 256k row's ~65.
 wait_gpu_clear
 for CC in 1 2 4 8; do
   CB_OUT=/tmp/dspark_cb_$CC.txt
@@ -1212,7 +1228,7 @@ for CC in 1 2 4 8; do
     SPARKINFER_QWEN38_PREFILL_NVFP4=1 \
     SPARKINFER_QWEN38_DECODE_NVFP4=1 \
     SPARKINFER_KV_INT8=1 \
-    build/runtime/qwen3_gguf_cb_bench "$MODEL_DIR" "$CC" 256 64 512 > "$CB_OUT" 2>&1; then
+    build/runtime/qwen3_gguf_cb_bench "$MODEL_DIR" "$CC" 256 256 512 > "$CB_OUT" 2>&1; then
     echo "CB_CHILD_FAILED c=$CC" >&2
     tail -20 "$CB_OUT" >&2 || true
     echo "RETRYABLE_INFRA_FAILURE concurrent-decode harness exited nonzero at c=$CC" >&2

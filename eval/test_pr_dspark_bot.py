@@ -23,6 +23,11 @@ class Prefill256KEvalTests(unittest.TestCase):
         script = bot._remote_script("main", role="main")
         self.assertIn("qwen3_gguf_cb_bench", script)
         self.assertIn("for CC in 1 2 4 8; do", script)
+        # 256 tokens per request, not 64. A ~1s run measures its own startup: on identical code
+        # c=4 spread 3.40% and could land at -3.37%, hard-REJECTING a PR that changed nothing,
+        # because REGRESS_TOL rejects below -2.00%. At 256 the worst case is -0.41%. Pinned here
+        # so a later "save GPU time" edit cannot quietly reintroduce a spurious-reject generator.
+        self.assertIn('cb_bench "$MODEL_DIR" "$CC" 256 256 512', script)
         # c=1 is measured even though it is not scored -- it is the floor.
         self.assertIn("RESULT_CB${CC}_AGG", script)
         self.assertIn("RESULT_CB${CC}_ITL", script)
