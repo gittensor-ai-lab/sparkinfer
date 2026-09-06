@@ -673,7 +673,21 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             // wrote. The shipped tiers keep that byte for byte -- it is their numerics and there
             // is nothing to gain by moving them -- but the new tier is new code and is written
             // the way the sibling already does it.
-            const int pstr = (SPL == RQH) ? GN : pld;
+            // pld, unconditionally. The plane is ALLOCATED with a pld row stride (s_pi is
+            // [RQH][BM][pld], and s_s starts at s_pi + RQH*BM*pld) and every reader uses pld --
+            // the ldmatrix at the PV mma, and the base pointer above. Only this write used GN.
+            //
+            // Below 2048 tokens pad==0 so pld==GN and the two agreed, which is why this survived.
+            // At or above 2048 pad==16, so every row was written 16 columns short of where it is
+            // read: row r came back shifted by 16r, and the last row read past everything any row
+            // had written -- i.e. off the end of the initialised region, into whatever shared
+            // memory happened to hold. That is what made long-context output simultaneously WRONG
+            // and NONDETERMINISTIC under greedy decode (#976), with a cliff exactly at 2048.
+            //
+            // This was known and left in place as "their numerics". Reading uninitialised shared
+            // memory is not a numerics choice, so it is fixed rather than preserved -- it does
+            // move the shipped tiers' long-context prefill numbers, which is the honest cost.
+            const int pstr = pld;
             auto softmax_head = [&](auto FULLT, int h, int hp) {
                 constexpr bool FULL = decltype(FULLT)::value;
                 {
