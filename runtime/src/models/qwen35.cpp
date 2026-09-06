@@ -3217,7 +3217,17 @@ void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_t
     if (s.active_seq_id == seq_id) activate_session(0);
 }
 
-int Qwen35Model::max_packed_rows() { return kQwen35MaxPackedRows; }
+int Qwen35Model::max_packed_rows() {
+    // Runtime cap, so the widest packed batch can be A/B'd in ONE binary. The compile-time
+    // kQwen35MaxPackedRows still sizes every array; this only bounds what a step will pack.
+    static const int cap = [] {
+        const char* e = getenv("SPARKINFER_PACKED_MAX_ROWS");
+        int v = e ? atoi(e) : kQwen35MaxPackedRows;
+        if (v < 1) v = 1;
+        return v > kQwen35MaxPackedRows ? kQwen35MaxPackedRows : v;
+    }();
+    return cap;
+}
 
 bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
                                 const uint64_t* seq_ids, int n, int* out_sampled) {

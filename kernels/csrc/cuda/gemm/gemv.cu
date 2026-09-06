@@ -2881,7 +2881,18 @@ bool launch_gemv_rows(const void* x, const void* W, void* y,
 }
 bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, void* y1,
                        int M, int N0, int N1, int K, cudaStream_t stream) {
-    if (M < 1 || M > 8 || N0 < 1 || N1 < 1 || (K & 7)) return false;
+    if (M < 1 || N0 < 1 || N1 < 1 || (K & 7)) return false;
+    if (M > 8) {                       // chunk: see launch_gemv_nvfp4_rows_dp4a
+        for (int r0 = 0; r0 < M; r0 += 8) {
+            const int m = (M - r0) < 8 ? (M - r0) : 8;
+            if (!launch_gemv_rows2(reinterpret_cast<const __nv_bfloat16*>(x) + (size_t)r0 * K,
+                                   W0, W1,
+                                   reinterpret_cast<__nv_bfloat16*>(y0) + (size_t)r0 * N0,
+                                   reinterpret_cast<__nv_bfloat16*>(y1) + (size_t)r0 * N1,
+                                   m, N0, N1, K, stream)) return false;
+        }
+        return true;
+    }
 #ifdef _MSC_VER
     // gemv_bf16_rows_sk2_kernel is compiled out under MSVC (see #ifndef _MSC_VER above).
     // Two single-matrix launches are bit-identical to the fused path — just two grids.
@@ -3314,7 +3325,26 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
                                   int M, int N, int K, cudaStream_t stream) {
     if (!xq || !xs || !W0 || !W1 || !y0 || !y1 || N < 1 || K < 1 || (K & 15)) return false;
     if (!gemv_bf16_splitk()) return false;
-    if (M < 1 || M > 8) return false;
+    if (M < 1) return false;
+    // Wider than the instantiated row tiers: serve it as chunks of 8 rather than instantiating
+    // R=9..16. Measured on RTX 5090 at the real decode shapes, a 16-row instantiation costs
+    // t(16) = 1.002 * 2*t(8) with 495 spill stores -- `uint4 xg[GPT][R]` alone is 128 registers
+    // at R=16 -- so a wider template buys nothing over re-reading the weights, and chunking keeps
+    // every row on the tuned R<=8 kernel. Rows are the slow axis of y/xq/xs ([M,*] row-major),
+    // so a chunk is a pointer offset.
+    if (M > 8) {
+        const size_t ng = (size_t)(K >> 4);
+        for (int r0 = 0; r0 < M; r0 += 8) {
+            const int m = (M - r0) < 8 ? (M - r0) : 8;
+            if (!launch_gemv_nvfp4_rows_dp4a2(
+                    reinterpret_cast<const signed char*>(xq) + (size_t)r0 * K,
+                    reinterpret_cast<const float*>(xs) + (size_t)r0 * ng, W0, W1,
+                    reinterpret_cast<__nv_bfloat16*>(y0) + (size_t)r0 * N,
+                    reinterpret_cast<__nv_bfloat16*>(y1) + (size_t)r0 * N,
+                    m, N, K, stream)) return false;
+        }
+        return true;
+    }
     static const int nr_mode = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
                                    int v = e ? atoi(e) : 0; return (v == 1 || v == 2) ? v : 0; }();
     static const bool pair_on = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_PAIR");
@@ -3396,7 +3426,25 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
                                  int M, int N, int K, cudaStream_t stream) {
     if (!xq || !xs || !W || !y || N < 1 || K < 1 || (K & 15)) return false;
     if (!gemv_bf16_splitk()) return false;
-    if (M < 1 || M > 8) return false;
+    if (M < 1) return false;
+    // Wider than the instantiated row tiers: serve it as chunks of 8 rather than instantiating
+    // R=9..16. Measured on RTX 5090 at the real decode shapes, a 16-row instantiation costs
+    // t(16) = 1.002 * 2*t(8) with 495 spill stores -- `uint4 xg[GPT][R]` alone is 128 registers
+    // at R=16 -- so a wider template buys nothing over re-reading the weights, and chunking keeps
+    // every row on the tuned R<=8 kernel. Rows are the slow axis of y/xq/xs ([M,*] row-major),
+    // so a chunk is a pointer offset.
+    if (M > 8) {
+        const size_t ng = (size_t)(K >> 4);
+        for (int r0 = 0; r0 < M; r0 += 8) {
+            const int m = (M - r0) < 8 ? (M - r0) : 8;
+            if (!launch_gemv_nvfp4_rows_dp4a(
+                    reinterpret_cast<const signed char*>(xq) + (size_t)r0 * K,
+                    reinterpret_cast<const float*>(xs) + (size_t)r0 * ng, W,
+                    reinterpret_cast<__nv_bfloat16*>(y) + (size_t)r0 * N,
+                    m, N, K, stream)) return false;
+        }
+        return true;
+    }
     const auto* xp = reinterpret_cast<const signed char*>(xq);
     const auto* sp = reinterpret_cast<const float*>(xs);
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
@@ -3838,7 +3886,17 @@ bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
 }
 bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
                           int M, int N, int K, cudaStream_t stream) {
-    if (M < 1 || M > 8 || N < 1) return false;
+    if (M < 1 || N < 1) return false;
+    if (M > 8) {   // chunk: see launch_gemv_nvfp4_rows_dp4a. q81 rows are (K>>5) blocks apart.
+        for (int r0 = 0; r0 < M; r0 += 8) {
+            const int m = (M - r0) < 8 ? (M - r0) : 8;
+            if (!launch_mmvq_rows_f32(qtype,
+                                      reinterpret_cast<const si_block_q8_1*>(q81)
+                                          + (size_t)r0 * (size_t)(K >> 5),
+                                      W, y + (size_t)r0 * N, m, N, K, stream)) return false;
+        }
+        return true;
+    }
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const auto* w = reinterpret_cast<const unsigned char*>(W);
     // Same instantiated-width limit as launch_mmvq_q4k_rows above, and the same consequence:
