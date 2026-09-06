@@ -410,7 +410,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // ~33 MB out of a8 matters at 32k: it leaves enough free VRAM for 4096-token GDN segments
         // instead of 2048, while the alias is dead again before the next GDN layer writes gq.
         const size_t spare = (size_t)N * (s.linear_qdim - kvdim) * sizeof(bf16);
-        const size_t vi8_bytes = (size_t)N * kvdim;
+        // Whole 16-token pages: the shadow is stored page-transposed for the attention's mma B
+        // operand, and the attention reads a causally-cut group up to its page boundary -- so a
+        // prompt whose length is not a multiple of 16 needs the tail page to exist. (The old
+        // [token][head][dim] shadow was read past its end for the same reason, silently.)
+        const size_t vi8_bytes = (size_t)((N + 15) & ~15) * kvdim;
         const size_t scale_bytes = (size_t)N * c.n_kv_heads * sizeof(unsigned short);
         if (spare >= vi8_bytes + scale_bytes) {
             unsigned char* tail = reinterpret_cast<unsigned char*>(gq + (size_t)N * kvdim);
@@ -500,7 +504,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     bool moe_fp8 = moe && (!_pmfp8 || _pmfp8[0] != '0');
     Arena& a8 = arena_reuse ? keep_a8 : once_a8;
     if (attn_vi8 && !vi8) {
-        vi8 = a8.alloc<signed char>((size_t)N * kvdim);
+        vi8 = a8.alloc<signed char>((size_t)((N + 15) & ~15) * kvdim);
         vi8_scale = a8.alloc<unsigned short>((size_t)N * c.n_kv_heads);
     }
     // A_i8 holds the quantized activation. The comment below used to say the non-FFN projections

@@ -1357,7 +1357,21 @@ __global__ void pf_qknorm_rope_kv_bf16_kernel(
             }
             __syncthreads();
             const float s = s_warp[0] * (1.f / 127.f);
-            v_i8[base + t] = (signed char)(s == 0.f ? 0 : __float2int_rn(x / s));
+            // The int8 V shadow is written HERE and read by exactly one kernel --
+            // pf_attn_mma_bf16_kernel's VINT8 branch -- so its layout is not a cache format and
+            // is free to be whatever that reader wants. What it wants is the mma's own B operand:
+            // PV contracts over KEYS, and m16n8k32 hands a lane four CONSECUTIVE k values, so a
+            // [token][head][dim] shadow makes those four keys four separate strided halfword
+            // loads plus a PRMT chain to reassemble them. Storing it transposed within each
+            // 16-token page -- [page][head][dim][token-in-page] -- makes a lane's four keys four
+            // contiguous BYTES, i.e. one LDG.E.32 with no byte shuffling at all.
+            //
+            // The cost lands on this store, which goes from 256 contiguous bytes per block to 256
+            // bytes at stride 16. That is the right side to pay it: this kernel writes the shadow
+            // ONCE per prefill pass, while the attention re-reads the whole prefix from every
+            // query tile, and the 16 blocks of a page write into the same sectors back to back.
+            v_i8[((size_t)(tok >> 4) * n_kv_heads + hh) * head_dim * 16 + (size_t)t * 16 + (tok & 15)] =
+                (signed char)(s == 0.f ? 0 : __float2int_rn(x / s));
             if (t == 0) v_i8_scale[(size_t)tok * n_kv_heads + hh] = __float2half(s);
         }
     }

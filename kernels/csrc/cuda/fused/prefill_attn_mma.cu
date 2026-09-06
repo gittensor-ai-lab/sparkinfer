@@ -1263,11 +1263,22 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     float* s_ps   = s_corr + RQH * BM;                                        // [RQH][BM], VINT8
 
     fragment<accumulator, 16, 16, 16, float> ofr[RQH][DPW];
+    // The int8 PV below picks its own n -> dim map (see the V load), so its epilogue writes s_o
+    // itself rather than through store_matrix_sync's fixed one -- which means plain floats, and
+    // the row of each element resolved once from the documented accumulator layout instead of
+    // read out of a staged index fragment. Element e of a lane is row (e&2 ? rhi : rlo), dim
+    // 4*(lane&3) + 2*(e&1) + (e>>2). That retires a 256-float store, a __syncwarp, a
+    // load_matrix_sync and a live fragment across the whole key loop on the VINT8 tier.
+    constexpr int OFH = VINT8 ? RQH : 1;
+    constexpr int OFD = VINT8 ? DPW : 1;
+    float ofv[OFH][OFD][8];
+    const int rlo = lane >> 2;
+    const int rhi = rlo + 8;
     // Row index of each accumulator lane element. Built with a FLOAT accumulator so the fragment
     // layout is the one the float accumulators below actually use, rather than assuming the int
     // accumulator maps identically. Rows 0..15 are exact in float.
     fragment<accumulator, 16, 16, 16, float> idxf;
-    {
+    if constexpr (!VINT8) {
         float* tile = s_s + warp * 256;
         for (int i = lane; i < 256; i += 32) tile[i] = (float)(i >> 4);
         __syncwarp();
@@ -1276,7 +1287,24 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     #pragma unroll
     for (int h = 0; h < RQH; h++)
         #pragma unroll
-        for (int dd = 0; dd < DPW; dd++) fill_fragment(ofr[h][dd], 0.f);
+        for (int dd = 0; dd < DPW; dd++) {
+            if constexpr (VINT8) {
+                #pragma unroll
+                for (int e = 0; e < 8; e++) ofv[h][dd][e] = 0.f;
+            } else {
+                fill_fragment(ofr[h][dd], 0.f);
+            }
+        }
+    // ldmatrix.x4 lane -> address map for the m16n8k32 A operand over the int8 P' plane: the four
+    // 8x8 b16 matrices are (rows 0-7 | rows 8-15) x (bytes 0-15 | bytes 16-31) of a 16x32 tile, so
+    // lane l supplies the start of row (l & 15) at byte column (l >> 4) * 16. P' overlays the bf16
+    // s_p buffer, so its row stride in BYTES is 2*pld; the per-head offset h*BM*PSTR is uniform
+    // across the warp and stays an immediate.
+    const int PSTR = 2 * pld;
+    const unsigned pi_base = VINT8
+        ? (unsigned)__cvta_generic_to_shared(reinterpret_cast<signed char*>(s_p)
+                                             + (size_t)(lane & 15) * PSTR + (lane >> 4) * 16)
+        : 0u;
 
     // ---- stage Q rows for each of the RQH heads (no quantize: Q is already bf16) ----
     #pragma unroll
@@ -1347,6 +1375,20 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
         }
         __syncthreads();
 
+        // The V dequant scale a lane reads depends only on (lane, u) -- not on the query row and
+        // not on the q-head -- so the strided lane map re-reads the same GN/32 halves for every
+        // one of the RQH*RPW (row, head) passes. Hoisting them here is RQH*RPW times fewer shared
+        // loads for the same values and the same __half2float conversion at the same place.
+        float vsr[VINT8 ? GN / 32 : 1];
+        if constexpr (VINT8) {
+            const __half* s_vs_pad = reinterpret_cast<const __half*>(s_q);
+            #pragma unroll
+            for (int u = 0; u < GN / 32; u++) {
+                const int t = lane + u * 32, pr = t >> 3, pc = HEAD_DIM + (t & 7);
+                vsr[u] = __half2float(s_vs_pad[pr * qld + pc]);
+            }
+        }
+
         // ---- online softmax per head; write P as bf16 (no quantize) ----
         #pragma unroll
         for (int h = 0; h < RQH; h++) {
@@ -1367,8 +1409,20 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                     sc[u] = live ? s_sh[r * GN + t] * scale : -1e30f;
                     mx = fmaxf(mx, sc[u]);
                 }
-                #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                // max is exact and order-independent, so the five-step butterfly can be one
+                // warp instruction. redux.sync is integer-only; the standard total order on
+                // IEEE floats (flip the sign bit when positive, invert every bit when negative)
+                // is monotone, so the reduced key is the key of the max and this is bit-identical
+                // -- unlike the sum below, which is a float add and stays a butterfly.
+                if constexpr (VINT8) {
+                    const unsigned u = __float_as_uint(mx);
+                    const unsigned key = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+                    const unsigned r = __reduce_max_sync(0xffffffffu, key);
+                    mx = __uint_as_float((r & 0x80000000u) ? (r & 0x7fffffffu) : ~r);
+                } else {
+                    #pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                }
                 const float m_old = s_m[h * BM + r], m_new = fmaxf(m_old, mx);
                 const float corr = __expf(m_old - m_new);
                 float sum = 0.f, pamax = 0.f;
@@ -1378,9 +1432,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                     float p = 0.f;
                     if (sc[u] > -1e29f) p = __expf(sc[u] - m_new);
                     if constexpr (VINT8) {
-                        const __half* s_vs_pad = reinterpret_cast<const __half*>(s_q);
-                        const int pr = t >> 3, pc = HEAD_DIM + (t & 7);
-                        const float pv = p * __half2float(s_vs_pad[pr * qld + pc]);
+                        const float pv = p * vsr[u];
                         sc[u] = pv; pamax = fmaxf(pamax, fabsf(pv)); sum += p;
                     } else {
                         const __nv_bfloat16 hi = __float2bfloat16(p);
@@ -1393,12 +1445,13 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                         } else sum += __bfloat162float(hi);
                     }
                 }
+                // |P'| is non-negative by construction (an exp times an absmax/127), so its
+                // bit pattern orders like an unsigned int directly -- one redux.sync, and the
+                // butterfly below carries only the softmax denominator.
+                if constexpr (VINT8)
+                    pamax = __uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(pamax)));
                 #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) {
-                    sum += __shfl_xor_sync(0xffffffffu, sum, o);
-                    if constexpr (VINT8)
-                        pamax = fmaxf(pamax, __shfl_xor_sync(0xffffffffu, pamax, o));
-                }
+                for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
                 if constexpr (VINT8) {
                     const float pd = pamax * (1.f / 127.f);
                     if (lane == 0) s_ps[h * BM + r] = pd;
@@ -1452,35 +1505,98 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
                 }
         }
         } else {
+        // ---- PV: TWO key pages per mma, feeding RQH q-heads from one V pair ----
+        // wmma's 16x16x16 s8 tile lowers to IMMA.16816, and the 8-bit tensor path is full rate
+        // only at k=32: measured on this RTX 5090 with independent accumulator chains,
+        // m16n8k16.s8 and m16n8k32.s8 cost the SAME 47.6 ns per warp instruction slot, i.e. 479
+        // against 937 TOPS. This kernel's QK is bf16, where m16n8k16 IS the native shape and
+        // wmma is already optimal; its int8 P x V half was spending a full tensor issue on half
+        // a tile, exactly as the int8 sibling above did before it was converted.
+        //
+        // Nothing has to be repacked. A 16-row by 32-byte row-major P' tile is one ldmatrix.x4,
+        // which IS the m16n8k32 A operand (rows lane>>2 and +8, k = (lane&3)*4 and +16), so one
+        // shared load now covers the two pages that used to take two matrix_a fragments; and two
+        // consecutive V pages concatenate straight into the two B registers. int32 accumulation
+        // is exact and associative, so every accumulated int32 -- and every bf16 output byte --
+        // is unchanged.
+        //
+        // The pair loop runs over an EVEN page count so it needs no per-page bound test; the one
+        // page a causally-cut group can leave over is retired after it against a zero second B
+        // operand, which is also what keeps the odd page from reading V past the group.
         #pragma unroll
         for (int dd = 0; dd < DPW; dd++) {
             const int dt = warp * DPW + dd;
-            fragment<accumulator, 16, 16, 16, int> cf[RQH];
-            #pragma unroll
-            for (int h = 0; h < RQH; h++) fill_fragment(cf[h], 0);
-            for (int ks = 0; ks < gblk; ks++) {
-                const signed char* vb = v_pool_i8 +
-                    ((size_t)(k0 + ks * 16) * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
-                fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
-                fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
-                load_matrix_sync(bf, vb, KVLD);
-                #pragma unroll
-                for (int h = 0; h < RQH; h++) {
-                    load_matrix_sync(af, reinterpret_cast<signed char*>(s_p) +
-                                         (size_t)h * BM * (2 * pld) + ks * 16,
-                                     2 * pld);
-                    mma_sync(cf[h], af, bf, cf[h]);
-                }
-            }
+            int cf[RQH][2][4];
             #pragma unroll
             for (int h = 0; h < RQH; h++)
                 #pragma unroll
-                for (int e = 0; e < 8; e++) {
-                    const int r = (int)idxf.x[e];
-                    ofr[h][dd].x[e] = __fmaf_rn(
-                        ofr[h][dd].x[e], s_corr[h * BM + r],
-                        (float)cf[h].x[e] * s_ps[h * BM + r]);
+                for (int n2 = 0; n2 < 2; n2++)
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) cf[h][n2][j] = 0;
+            // The V shadow is stored [page][kv-head][dim][token-in-page] (see the write in
+            // pf_qknorm_rope_kv_bf16_kernel), so a lane's four consecutive k values -- keys
+            // 4*(l&3)..+3 of the page -- are four contiguous BYTES at dim dt*16 + 2*(l>>2) + n2.
+            // Both n-halves are one 16-byte step apart, so a page pair is four LDG.E.32 and no
+            // byte permutes at all, against eight strided LDG.E.U16 and eight PRMT out of a
+            // [token][head][dim] shadow.
+            const size_t VPG = (size_t)n_kv_heads * HEAD_DIM * 16;   // bytes per 16-token page
+            const size_t vlane = (size_t)(dt * 16 + 2 * (lane >> 2)) * 16 + 4 * (lane & 3);
+            const signed char* vbase = v_pool_i8 + ((size_t)(k0 >> 4) * n_kv_heads + kvh)
+                                     * (size_t)HEAD_DIM * 16 + vlane;
+            const int gpair = gblk & ~1;
+            // Two page-pairs in flight: the V loads of the next pair issue while the current
+            // pair's six mma's are still retiring, which is what a single block per SM (16
+            // warps, 25% occupancy) cannot hide on its own.
+            #pragma unroll 2
+            for (int ks = 0; ks < gpair; ks += 2) {
+                // The n operand index is a free choice -- it only has to be undone once, in
+                // the epilogue -- and n-half h owning dims {2c+h} is what puts a lane's two dims
+                // one 16-byte page-row apart here.
+                const signed char* vb0 = vbase + (size_t)ks * VPG;
+                const signed char* vb1 = vb0 + VPG;
+                const unsigned B0[2] = {*reinterpret_cast<const unsigned*>(vb0),
+                                        *reinterpret_cast<const unsigned*>(vb0 + 16)};
+                const unsigned B1[2] = {*reinterpret_cast<const unsigned*>(vb1),
+                                        *reinterpret_cast<const unsigned*>(vb1 + 16)};
+                #pragma unroll
+                for (int h = 0; h < RQH; h++) {
+                    unsigned a[4];
+                    pf_ldsm_x4(a, pi_base + (unsigned)(h * BM * PSTR + ks * 16));
+                    pf_mma_16832(cf[h][0], a, B0[0], B1[0]);
+                    pf_mma_16832(cf[h][1], a, B0[1], B1[1]);
                 }
+            }
+            // A group holds an odd page only where the causal bound cuts it -- once per query
+            // tile at most. The softmax zeroes P' past the group, so the upper half of the k=32
+            // A operand contributes nothing whatever B holds; zeroing the second B operand is
+            // what keeps this from reading a V page the group does not own.
+            if (gblk & 1) {
+                const signed char* vb0 = vbase + (size_t)gpair * VPG;
+                const unsigned Bt[2] = {*reinterpret_cast<const unsigned*>(vb0),
+                                        *reinterpret_cast<const unsigned*>(vb0 + 16)};
+                #pragma unroll
+                for (int h = 0; h < RQH; h++) {
+                    unsigned a[4];
+                    pf_ldsm_x4(a, pi_base + (unsigned)(h * BM * PSTR + gpair * 16));
+                    pf_mma_16832(cf[h][0], a, Bt[0], 0u);
+                    pf_mma_16832(cf[h][1], a, Bt[1], 0u);
+                }
+            }
+            // A 16x16 accumulator gives every lane 8 elements over exactly TWO query rows, so
+            // the per-row P quantum and the online-softmax correction are two values per head,
+            // not eight shared loads apiece. Same expression, same rounding, as the fragment
+            // form it replaces: fmaf(acc, corr, (float)cf * pd).
+            #pragma unroll
+            for (int h = 0; h < RQH; h++) {
+                const float ps_lo = s_ps[h * BM + rlo],   ps_hi = s_ps[h * BM + rhi];
+                const float cr_lo = s_corr[h * BM + rlo], cr_hi = s_corr[h * BM + rhi];
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const bool up = (e & 2) != 0;
+                    ofv[h][dd][e] = __fmaf_rn(ofv[h][dd][e], up ? cr_hi : cr_lo,
+                                              (float)cf[h][e >> 2][e & 3] * (up ? ps_hi : ps_lo));
+                }
+            }
         }
         }
         __syncthreads();   // s_p is rewritten by the next iteration's softmax
@@ -1490,8 +1606,20 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     #pragma unroll
     for (int h = 0; h < RQH; h++) {
         #pragma unroll
-        for (int dd = 0; dd < DPW; dd++)
-            store_matrix_sync(s_o + (warp * DPW + dd) * 16, ofr[h][dd], HEAD_DIM, mem_row_major);
+        for (int dd = 0; dd < DPW; dd++) {
+            if constexpr (VINT8) {
+                // Undo the PV n -> dim map: element e of a lane is row (e&2 ? rhi : rlo) and dim
+                // 4*(lane&3) + 2*(e&1) + (e>>2) of this warp's 16-dim slab.
+                const int cb = (warp * DPW + dd) * 16 + 4 * (lane & 3);
+                #pragma unroll
+                for (int e = 0; e < 8; e++)
+                    s_o[(((e >> 1) & 1) ? rhi : rlo) * HEAD_DIM + cb + 2 * (e & 1) + (e >> 2)] =
+                        ofv[h][dd][e];
+            } else {
+                store_matrix_sync(s_o + (warp * DPW + dd) * 16, ofr[h][dd], HEAD_DIM,
+                                  mem_row_major);
+            }
+        }
         __syncthreads();
         const int head = head0 + h;
         for (int r = 0; r < BM; r++) {
