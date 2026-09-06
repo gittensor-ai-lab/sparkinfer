@@ -3324,8 +3324,18 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
     const auto* sp = reinterpret_cast<const float*>(xs);
     auto* yp0 = reinterpret_cast<__nv_bfloat16*>(y0);
     auto* yp1 = reinterpret_cast<__nv_bfloat16*>(y1);
+    // Opt-OUT. This kernel differs from the dp4a2 branch below only in which warp owns an output
+    // element -- same split rule (N>=4096 ? S=2 : S=8), same lane-owned group walk, so every
+    // output sums the same terms in the same order and the two are bit-identical. It wins once a
+    // batch is wide: measured on RTX 5090 / Qwen3.8-27B-NVFP4 through qwen3_gguf_cb_bench,
+    // aggregate decode 464.6 -> 475.7 tok/s at concurrency 8 (four alternating pairs, every arm
+    // separated), +1.77% at 2 and +0.86% at 4. Single-stream is untouched: the branch needs M>=2
+    // and continuous-batch decode declines below two rows, so cb@c1 reads 95.0 against 95.1.
+    // DSpark's verify runs at M=2..4 and is inert -- decode@4k/16k/32k move -0.03/-0.12/+1.33%
+    // with mean-accept EXACTLY equal (1.6883, 1.7297, 1.2800) and losslessness holding at all
+    // three, which is what bit-identity looks like from outside.
     static const bool pairwise = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_PAIRWISE");
-                                     return e && e[0] == '1'; }();
+                                     return !(e && e[0] == '0'); }();
 #define SI_NVFP4_PAIRWISE(S_, R_) do {                                                        \
         constexpr int S=(S_), R=(R_), NR=1, PAIR_WPB=(S==8)?8:4, RPB=PAIR_WPB/S;              \
         gemv_nvfp4_rows_dp4a_pairwise_kernel<__nv_bfloat16,S,R,NR>                             \
