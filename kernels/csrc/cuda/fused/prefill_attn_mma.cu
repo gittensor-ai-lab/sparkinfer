@@ -1046,26 +1046,37 @@ bool launch_prefill_attn_mma(
     // GQA fusion: one block owns RQH q-heads sharing a kv-head, so each K page / V tile
     // is loaded once and fed RQH mma's instead of being re-read per q-head. RQH=1 disables.
     //
-    // DEFAULTS TO 1 (fusion off) IN DETERMINISTIC MODE. The GQA-fused tiers are both
-    // nondeterministic and materially INACCURATE once n_tokens passes ~2048 with int8 KV.
-    // Measured on an RTX 5090, Qwen3.6-35B-A3B (GQA-6), qwen3_gguf_prefill_check against the
-    // token-loop reference, mean KL over 16 teacher-forced positions:
+    // Fusion is ON by default, including in deterministic mode.
     //
-    //     prefix   1500      2000      2100      3000      4000
-    //     fused    0.00043   0.00022   0.18672   0.20657   0.23978   <- and varies run to run
-    //     RQH=1    ~0.0001   ~0.0001   ~0.0001   ~0.0001   0.00008   <- stable
+    // This used to default to 1 (fusion off) under deterministic_mode(), because the GQA-fused
+    // tiers were both nondeterministic and materially inaccurate above ~2048 tokens with int8 KV.
+    // That was real, and it was a stride bug, not a property of fusion: the P' plane was written
+    // with row stride GN while being allocated and read with pld. The two agree only while pad==0,
+    // i.e. below 2048 -- above it every row was read shifted by 16r and the last row read past all
+    // initialised shared memory. Fixed by writing with pld (#976 / PR #980).
     //
-    // The cliff is exactly at 2048 and it is not the RQH=3 tier's `n_tokens >= 2048` gate:
-    // RQH=2 is selected both below and above it and is equally wrong above, so the length
-    // dependence lives inside launch_attn_gqa itself. Only RQH=1, which skips the fused family
-    // for the per-q-head fallback, is correct there. That is a PRE-EXISTING defect independent of
-    // this mode -- it is the default serving path today, and the server enables int8 KV whenever
-    // max_seq >= 4096 -- and it is left ON by default here rather than silently changed, because
-    // turning it off moves the long-context prefill numbers the eval scores against. It is
-    // reported separately; deterministic mode simply refuses to build on top of it.
+    // Re-measured after that fix, Qwen3.8-27B ModelOpt NVFP4, int8 KV, qwen3_gguf_prefill_check
+    // against the token-loop reference on REAL token ids from bench/scripts/bench_prompt_32k.txt
+    // (the tool's synthetic default labels itself "NOISY -- smoke test only" and cannot resolve
+    // differences this small), mean KL over 16 teacher-forced positions:
+    //
+    //     prefix    1500      2000      2100      3000      4000
+    //     fused     0.00384   0.00237   0.00483   0.00675   0.01272
+    //     RQH=1     0.00580   0.00573   0.00651   0.00945   0.01475
+    //
+    // For comparison, the same table before the fix (Qwen3.6-35B-A3B, as originally recorded):
+    //
+    //     fused     0.00043   0.00022   0.18672   0.20657   0.23978   <- cliff at 2048
+    //
+    // The cliff is gone, and fused is now MORE accurate than the RQH=1 fallback at every depth --
+    // so forcing RQH=1 in deterministic mode would select a slower AND less accurate path.
+    //
+    // Determinism verified directly rather than assumed: three runs at prefix=4000 on identical
+    // ids return bit-identical TOP1 (15/16) and KL (0.01272). The reason the fused tiers were
+    // nondeterministic was the read past initialised shared memory, which no longer happens.
     static const int gqa_rqh = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_GQA_RQH");
-        const int dflt = deterministic_mode() ? 1 : 4;
+        const int dflt = 4;   // see above: fusion is deterministic and more accurate post-#980
         const int v = e ? atoi(e) : dflt;
         return (v == 1 || v == 2 || v == 3 || v == 4) ? v : dflt;
     }();
