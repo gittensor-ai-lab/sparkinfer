@@ -11,7 +11,7 @@ namespace sparkinfer {
 
 // Largest packed continuous-batch decode row count. Mirrors the verify graph tiers in
 // qwen35_prefill.cpp -- one captured graph per row count, so this bounds how many are kept.
-inline constexpr int kQwen35MaxPackedRows = 8;
+inline constexpr int kQwen35MaxPackedRows = 32;
 
 class ThermalGovernor;   // optional decode-time thermal pacing (thermal_governor.h)
 class BridgeClient;      // optional external KV cache tier (lmcache_bridge_client.h)

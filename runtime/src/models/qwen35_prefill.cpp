@@ -79,7 +79,12 @@ struct Arena {
 // Widest verify block dflash_verify_short_run accepts. Also the number of GRAPH TIERS it keeps:
 // one instantiated graph per row count, so the caller can pick the block width per step instead
 // of being locked to whatever width the single warm graph happened to be captured at.
-constexpr int kVerifyMaxRows = 8;
+// Was 8, which is DSpark's block_size 7 plus one. Continuous-batch decode reuses this same
+// forward, and there a wider batch is not a deeper speculation but more concurrent requests, so
+// the ceiling has to cover the batch the scheduler hands us. 32 rows of every arena buffer is
+// ~32 MB (the logits plane dominates at 32 x vocab x 4B) and a tier's graph is only captured if
+// that width is actually used, so unused tiers cost nothing.
+constexpr int kVerifyMaxRows = 32;
 
 struct VerifyGraphCache {
     Arena arena;
@@ -2784,6 +2789,26 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* nv_ps_a = a.alloc<float>((size_t)NA * (nv_pwide / 16) + 1);
     signed char* nv_pq_b = a.alloc<signed char>((size_t)NA * nv_pwide);
     float* nv_ps_b = a.alloc<float>((size_t)NA * (nv_pwide / 16) + 1);
+    // WIDE-BATCH FFN OPERANDS. Above a handful of rows the row-GEMV stops being the right kernel:
+    // it reads the weights once per chunk of 8, while a block-scaled GEMM reads them once for the
+    // whole batch. Measured per decode forward on RTX 5090 at the real FFN shapes, the crossover
+    // is sharp -- at 8 rows the GEMV wins 7.28 ms to 13.28, at 16 the GEMM wins 12.80 to 14.31,
+    // and at 32 the GEMM is 9.71 against 29.12 for four chunked GEMV passes. So the GEMM arm is
+    // taken only for a genuinely wide packed batch; DSpark's verify never reaches these widths.
+    // The B operands are the SAME *_fp4 / *_fp4_sf the prefill path already keeps resident, so
+    // this costs no extra weight memory -- only the A-side staging and a workspace, below.
+    const int fp4_kwide = (c.moe_ffn > H ? c.moe_ffn : H);
+    unsigned char* fp4_a = nullptr; unsigned char* fp4_asf = nullptr; unsigned char* fp4_ws = nullptr;
+    if (packed && c.dense_ffn) {
+        const size_t ab = kernels::prefill_nvfp4_data_bytes(NA, fp4_kwide);
+        const size_t sb = kernels::prefill_nvfp4_scale_bytes_a(NA, fp4_kwide);
+        size_t wb = kernels::prefill_nvfp4_workspace_bytes(NA, c.moe_ffn, H);
+        const size_t wb2 = kernels::prefill_nvfp4_workspace_bytes(NA, H, c.moe_ffn);
+        if (wb2 > wb) wb = wb2;
+        fp4_a   = a.alloc<unsigned char>(ab);
+        fp4_asf = a.alloc<unsigned char>(sb);
+        if (wb) fp4_ws = a.alloc<unsigned char>(wb);
+    }
     // DEBUG ONLY (dspark_tau_check bisection, 2026-08-17): SPARKINFER_DFLASH_VERIFY_DUMP_ROW=<row>
     // dumps that row's pre-attn-norm xn after EVERY layer, plus the post-final-norm xn, into
     // [n_layers+1, H] bf16 written to SPARKINFER_DFLASH_VERIFY_DUMP_FILE (default
@@ -2954,10 +2979,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         pf_cu(cudaEventCreateWithFlags(&ev_join_ab, cudaEventDisableTiming), "verify ab join event");
     }
     if (!ph_ids) {
-        pf_cu(cudaHostAlloc(&ph_ids, 16 * sizeof(int), cudaHostAllocDefault), "verify host ids");
-        pf_cu(cudaHostAlloc(&ph_pos, 16 * sizeof(int), cudaHostAllocDefault), "verify host pos");
-        pf_cu(cudaHostAlloc(&ph_seq, 16 * sizeof(int), cudaHostAllocDefault), "verify host lens");
-        pf_cu(cudaHostAlloc(&ph_out, 16 * sizeof(int), cudaHostAllocDefault), "verify host out");
+        // kVerifyMaxRows, not a literal. These were 16 when the widest block was 8 -- a margin
+        // that silently became an overflow the moment the ceiling was raised: the fill loop below
+        // writes ph_ids[0..N) and the upload copies N ints, so at N>16 it wrote past a pinned
+        // allocation and every copy returned "invalid argument". It shows up as a throughput
+        // cliff, not a crash, because the failed copies leave stale ids in place.
+        pf_cu(cudaHostAlloc(&ph_ids, kVerifyMaxRows * sizeof(int), cudaHostAllocDefault), "verify host ids");
+        pf_cu(cudaHostAlloc(&ph_pos, kVerifyMaxRows * sizeof(int), cudaHostAllocDefault), "verify host pos");
+        pf_cu(cudaHostAlloc(&ph_seq, kVerifyMaxRows * sizeof(int), cudaHostAllocDefault), "verify host lens");
+        pf_cu(cudaHostAlloc(&ph_out, kVerifyMaxRows * sizeof(int), cudaHostAllocDefault), "verify host out");
     }
     if (verify_head_key != s.w.lm_head && s.w.lm_head_type == 12 && H == 2048) {
         if (verify_head_i8) cudaFree(verify_head_i8);
@@ -3564,7 +3594,40 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // dp4a arm, selected by the SAME switch the decode branch reads (qwen35.cpp). One
             // quantize of hn feeds both gate and up; a second feeds down. Scratch comes from the
             // verify arena, so it is sized for N rows and released with the rest of the pass.
-            if (native_ffn && topk == 1 && kernels::qwen38_nvfp4_dp4a()) {
+            // Wide packed batch: one block-scaled GEMM per projection instead of chunked
+            // row-GEMVs. Gated on a row count the GEMM actually wants (its A-quantizer requires
+            // m % 8 == 0, and below 16 rows the GEMV is still ahead), and on the prefill fp4
+            // operands being resident -- they are whenever SPARKINFER_QWEN38_PREFILL_NVFP4 is on.
+            static const int kFfnGemmMinRows = [] {
+                const char* e = getenv("SPARKINFER_FFN_GEMM_MIN_ROWS");
+                const int v = e ? atoi(e) : 16;
+                return v < 1 ? 1 : v;
+            }();
+            const bool ffn_gemm = packed && topk == 1 && fp4_a && fp4_asf &&
+                                  N >= kFfnGemmMinRows && (N & 7) == 0 &&
+                                  w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf &&
+                                  w.down_fp4 && w.down_fp4_sf;
+            if (ffn_gemm) {
+                bool ok = kernels::launch_prefill_nvfp4_quant_a(hn, fp4_a, fp4_asf, N, H, st) &&
+                          kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.gate_fp4,
+                                                             w.gate_fp4_sf, sg, N, ffn, H,
+                                                             fp4_ws, st, w.gate_fp4_alpha) &&
+                          kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.up_fp4,
+                                                             w.up_fp4_sf, su, N, ffn, H,
+                                                             fp4_ws, st, w.up_fp4_alpha);
+                if (ok) {
+                    kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
+                    ok = kernels::launch_prefill_nvfp4_quant_a(sh, fp4_a, fp4_asf, N, ffn, st) &&
+                         kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.down_fp4,
+                                                            w.down_fp4_sf, routed, N, H, ffn,
+                                                            fp4_ws, st, w.down_fp4_alpha);
+                }
+                if (!ok) {
+                    fprintf(stderr, "[dflash-verify] wide FFN GEMM declined N=%d ffn=%d H=%d\n",
+                            N, ffn, H);
+                    supported = false; break;
+                }
+            } else if (native_ffn && topk == 1 && kernels::qwen38_nvfp4_dp4a()) {
                 signed char* xq = nv_xq;
                 float* xs = nv_xs;
                 if (!hn_nv_folded) kernels::launch_gemv_nvfp4_quant_x(hn, xq, xs, N, H, st);
