@@ -278,6 +278,17 @@ public:
     // whose prompt starts with the same token sequence. Returns false on allocation failure.
     bool cache_prefix(const std::vector<int>& tokens);
 
+    // Restore the Gated-DeltaNet recurrent state to its end-of-prefix snapshot taken by
+    // cache_prefix(). Required before reusing a cached prefix: the KV blocks survive a
+    // request, but generation advances lin_state/lin_conv_state past the prefix, and the
+    // 48 hybrid layers would otherwise carry the PREVIOUS request's history. No-op (returns
+    // false) when no prefix is installed.
+    bool restore_prefix_state();
+
+    // Logical KV blocks the installed prefix occupies, for callers that want to keep them
+    // across requests via KVCacheManager::truncate_blocks(). 0 when no prefix is active.
+    int prefix_block_count() const;
+
     // Drop the installed prefix cache and free its KV blocks.
     void clear_prefix_cache();
 

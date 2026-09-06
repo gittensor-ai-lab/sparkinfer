@@ -250,6 +250,11 @@ struct Qwen35Model::Impl {
     bf16 *nvfp4_g = nullptr, *nvfp4_u = nullptr, *nvfp4_h = nullptr;  // native NVFP4 dense-FFN decode scratch
     bf16 *lin_conv_state = nullptr;
     float* lin_state = nullptr;
+    // End-of-prefix snapshot of the hybrid recurrent state, taken by cache_prefix() and
+    // replayed by restore_prefix_state(). The prefix's KV blocks can simply be kept, but
+    // this state cannot: decoding mutates it in place.
+    float* prefix_lin_state = nullptr;
+    bf16*  prefix_lin_conv_state = nullptr;
     // "Current" session's penalty_counts (swapped by activate_session(), unconditionally, for
     // every model -- see SessionBuffers). penalty_counts_default backs session 0's entry, alloc'd
     // once at load time; sessions[seq_id].penalty_counts for every other session is alloc'd by
@@ -2765,11 +2770,56 @@ bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
         return false;
     }
     cudaDeviceSynchronize();
+    // Snapshot the recurrent state as it stands at the end of the prefix. Every later reuse
+    // replays this; without it the hybrid layers would resume from whatever the last request
+    // left behind, which is wrong output rather than a crash.
+    if (s.cfg.hybrid && s.lin_state && s.lin_conv_state) {
+        const size_t st_n = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
+                            s.cfg.linear_head_dim * s.cfg.linear_head_dim;
+        const size_t cv_n = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
+                            s.linear_qkvdim;
+        if (!s.prefix_lin_state)      s.prefix_lin_state      = s.alloc<float>(st_n);
+        if (!s.prefix_lin_conv_state) s.prefix_lin_conv_state = s.alloc<bf16>(cv_n);
+        if (!s.prefix_lin_state || !s.prefix_lin_conv_state) {
+            s.kv->free(s.active_seq_id);
+            return false;
+        }
+        cu(cudaMemcpyAsync(s.prefix_lin_state, s.lin_state, st_n * sizeof(float),
+                           cudaMemcpyDeviceToDevice, s.stream), "prefix state snapshot");
+        cu(cudaMemcpyAsync(s.prefix_lin_conv_state, s.lin_conv_state, cv_n * sizeof(bf16),
+                           cudaMemcpyDeviceToDevice, s.stream), "prefix conv snapshot");
+        cu(cudaStreamSynchronize(s.stream), "prefix snapshot sync");
+    }
     s.prefix_tokens = tokens;
     s.prefix_len = (int)tokens.size();
     s.prefix_next = next;
     s.prefix_active = true;
     return true;
+}
+
+bool Qwen35Model::restore_prefix_state() {
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    if (!s.prefix_active) return false;
+    if (!s.cfg.hybrid) return true;            // nothing recurrent to restore
+    if (!s.prefix_lin_state || !s.prefix_lin_conv_state) return false;
+    if (!s.lin_state || !s.lin_conv_state) return false;
+    const size_t st_n = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
+                        s.cfg.linear_head_dim * s.cfg.linear_head_dim;
+    const size_t cv_n = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim;
+    cu(cudaMemcpyAsync(s.lin_state, s.prefix_lin_state, st_n * sizeof(float),
+                       cudaMemcpyDeviceToDevice, s.stream), "prefix state restore");
+    cu(cudaMemcpyAsync(s.lin_conv_state, s.prefix_lin_conv_state, cv_n * sizeof(bf16),
+                       cudaMemcpyDeviceToDevice, s.stream), "prefix conv restore");
+    cu(cudaStreamSynchronize(s.stream), "prefix restore sync");
+    return true;
+}
+
+int Qwen35Model::prefix_block_count() const {
+    const Impl& s = *p_;
+    if (!s.prefix_active || s.prefix_len <= 0) return 0;
+    const int bs = s.kv->block_size();
+    return (s.prefix_len + bs - 1) / bs;
 }
 
 void Qwen35Model::clear_prefix_cache() {

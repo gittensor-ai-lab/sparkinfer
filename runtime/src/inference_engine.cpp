@@ -205,6 +205,11 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
             seq_id = 0;
             if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
             model_->activate_session(seq_id);
+            // The KV blocks survived the previous request, but its decoding advanced the hybrid
+            // recurrent state past the prefix. Replay the end-of-prefix snapshot so the 48
+            // Gated-DeltaNet layers start where the prefix ended rather than carrying the last
+            // request's history -- silently wrong output otherwise, not a crash.
+            model_->restore_prefix_state();
             model_->reset_penalty_counts(seq_id);   // session 0 is shared across unrelated requests
             model_->set_logit_bias(seq_id, job.req.logit_bias);   // same reason
         } else {
@@ -353,8 +358,19 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
             // full prompt would tell close_session a longer range is valid than actually is.
             model_->close_session(j.seq_id, j.phase != SeqPhase::PREFILL ? &j.req.prompt : nullptr);
         } else {
-            kv_->free(j.seq_id);
-            if (j.req.use_prefix_session) model_->release_prefix_session();
+            // Session 0 is the shared prefix session. Freeing it wholesale is what made the
+            // prefix cache cache nothing: prefix_cached_len() then returned 0 and the next
+            // matching request re-prefilled the entire prefix. Keep the prefix's own blocks and
+            // drop only the suffix + generated tail, so the next request reuses them. The
+            // recurrent state is NOT kept -- decoding mutated it -- and is replayed from
+            // cache_prefix()'s snapshot by restore_prefix_state() on the next reuse.
+            const int keep = j.req.use_prefix_session ? model_->prefix_block_count() : 0;
+            if (keep > 0 && kv_->truncate_blocks(j.seq_id, keep)) {
+                // prefix stays installed and active; nothing else to do
+            } else {
+                kv_->free(j.seq_id);
+                if (j.req.use_prefix_session) model_->release_prefix_session();
+            }
         }
         j.seq_id = 0;
     };
