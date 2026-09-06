@@ -806,6 +806,16 @@ bool test_schema_keywords_981() {
     CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"type":"number","multipleOf":5}}})"), request));
     CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"type":"string","format":"date-time"}}})"), request));
 
+    // A rejected keyword must stay rejected INSIDE a composition branch too. Whitelisting anyOf
+    // at the parent while never descending into its branches would let a caller smuggle $ref into
+    // one, where validate_value ignores the unknown key and the branch then matches anything --
+    // the anyOf passes trivially while the caller believes a constraint is in force.
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"anyOf":[{"$ref":"#/$defs/T"}]}}})"), request));
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"oneOf":[{"type":"string"},{"allOf":[{"type":"string"}]}]}}})"), request));
+    // Empty or non-array compositions are refused rather than silently treated as "no constraint".
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"anyOf":[]}}})"), request));
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"anyOf":{"type":"string"}}}})"), request));
+
     // Still refused, because validate_value cannot enforce them. Accepting these would be the
     // silent weakening the whole design avoids.
     CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"$ref":"#/$defs/T"}}})"), request));

@@ -482,6 +482,23 @@ bool valid_schema_node(const json& schema, const std::string& where, bool top_le
                                       " requires type number or integer");
         }
     }
+    // Composition branches are schemas too, and MUST be validated as such. Whitelisting anyOf at
+    // the parent while never descending into its branches would let a caller hide a rejected
+    // keyword inside one -- {"anyOf": [{"$ref": "..."}]} -- where validate_value() then ignores
+    // the unknown key, constrains nothing, and the branch matches anything. The anyOf would pass
+    // trivially while the caller believes a constraint is in force: exactly the silent weakening
+    // that refusing $ref at the top level exists to prevent.
+    for (const char* composition : {"anyOf", "oneOf"}) {
+        if (!schema.contains(composition)) continue;
+        const json& branches = schema[composition];
+        if (!branches.is_array() || branches.empty())
+            return set_error(err, where + "." + composition + " must be a non-empty array");
+        for (size_t i = 0; i < branches.size(); ++i) {
+            if (!valid_schema_node(branches[i],
+                                   where + "." + composition + "[" + std::to_string(i) + "]",
+                                   false, err)) return false;
+        }
+    }
     if (schema.contains("properties")) {
         if (!schema["properties"].is_object())
             return set_error(err, where + ".properties must be an object");

@@ -148,6 +148,27 @@ bool parse_double(const std::string& s, double& v) {
 }  // namespace
 
 bool video_decoder_available(std::string* detail) {
+    // Memoised. Each probe is a fork/exec, and this is called from /v1/models -- a listing
+    // endpoint that monitors and routers poll continuously -- so an un-cached implementation
+    // spawned two processes per poll and gave a burst of requests a cheap way to exhaust PIDs.
+    // Whether ffmpeg is on PATH cannot meaningfully change inside one process lifetime; if it
+    // does, a restart is the right way to pick that up.
+    struct Probe { bool ok; std::string detail; };
+    static const Probe probe = [] {
+        Probe p{true, {}};
+        std::string out, err;
+        if (!run_tool({"ffmpeg", "-version"}, nullptr, 0, out, 1 << 20, 10, err)) {
+            p.ok = false; p.detail = "ffmpeg unavailable: " + err;
+        } else if (!run_tool({"ffprobe", "-version"}, nullptr, 0, out, 1 << 20, 10, err)) {
+            p.ok = false; p.detail = "ffprobe unavailable: " + err;
+        }
+        return p;
+    }();
+    if (detail && !probe.ok) *detail = probe.detail;
+    return probe.ok;
+}
+
+bool video_decoder_available_uncached(std::string* detail) {
     std::string out, err;
     if (!run_tool({"ffmpeg", "-version"}, nullptr, 0, out, 1 << 20, 10, err)) {
         if (detail) *detail = "ffmpeg unavailable: " + err;

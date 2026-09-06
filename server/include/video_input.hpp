@@ -47,6 +47,11 @@ bool parse_video_url(const std::string& url, std::vector<unsigned char>& bytes, 
 // needs ffmpeg on PATH" instead of failing inside a pipe with an empty read.
 bool video_decoder_available(std::string* detail = nullptr);
 
+// Uncached probe. video_decoder_available() memoises, because it is called from /v1/models on
+// every poll and each probe is a fork/exec. This variant re-probes; it exists for tests and for
+// any caller that genuinely needs to observe a mid-process change.
+bool video_decoder_available_uncached(std::string* detail = nullptr);
+
 // Ceiling on one clip's encoded bytes, applied BEFORE the decoder is handed anything. Larger than
 // the image ceiling because video legitimately is, but still bounded: the decode happens before
 // any pixel budget can apply.
