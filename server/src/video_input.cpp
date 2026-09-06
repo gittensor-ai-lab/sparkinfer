@@ -197,7 +197,7 @@ bool decode_video(const unsigned char* bytes, size_t n, int max_frames, double t
         std::vector<std::string> a = {"ffprobe", "-v", "error"};
         append_hardening(a);
         a.insert(a.end(), {"-select_streams", "v:0",
-                           "-show_entries", "stream=width,height,r_frame_rate",
+                           "-show_entries", "stream=width,height,r_frame_rate:format=duration",
                            "-of", "default=noprint_wrappers=1:nokey=0",
                            "-i", "pipe:0"});
         if (!run_tool(a, bytes, n, probe, 1 << 16, kVideoDecodeTimeoutSec, err)) {
@@ -205,7 +205,7 @@ bool decode_video(const unsigned char* bytes, size_t n, int max_frames, double t
             return false;
         }
     }
-    int W = 0, H = 0; double src_fps = 0.0;
+    int W = 0, H = 0; double src_fps = 0.0, duration = 0.0;
     {
         auto field = [&](const char* key) -> std::string {
             const std::string k = std::string(key) + "=";
@@ -217,6 +217,7 @@ bool decode_video(const unsigned char* bytes, size_t n, int max_frames, double t
         W = std::atoi(field("width").c_str());
         H = std::atoi(field("height").c_str());
         if (!parse_double(field("r_frame_rate"), src_fps)) src_fps = 0.0;
+        if (!parse_double(field("duration"), duration)) duration = 0.0;
     }
     if (W <= 0 || H <= 0) { err = "video has no decodable video stream"; return false; }
     // A single frame's pixels are bounded here, before ffmpeg is asked for any. Without this a
@@ -224,7 +225,18 @@ bool decode_video(const unsigned char* bytes, size_t n, int max_frames, double t
     // save the box.
     if ((long)W * H > 8192L * 8192L) { err = "video frame dimensions are too large"; return false; }
 
-    const double fps = target_fps > 0.0 ? target_fps : (src_fps > 0.0 ? src_fps : kDefaultVideoFps);
+    // Sampling rate. The default is kDefaultVideoFps rather than the clip's own rate: at a
+    // source rate of 30fps the frame budget is spent on the first second of the clip, which is
+    // the opposite of the "2 fps over at most 32 frames" the header documents.
+    double fps = target_fps > 0.0 ? target_fps : kDefaultVideoFps;
+
+    // Spread the frame budget over the WHOLE clip. `-frames:v max_frames` below keeps the FIRST
+    // max_frames frames, so any clip longer than max_frames/fps seconds silently loses its tail:
+    // the model is asked about a video it was only shown the beginning of, and nothing in the
+    // response says so. Lowering the rate instead samples the entire clip, just more sparsely.
+    if (duration > 0.0 && fps * duration > (double)max_frames) {
+        fps = (double)max_frames / duration;
+    }
 
     // --- decode: rawvideo rgb24 at the sampling rate, capped at max_frames -------------------
     const size_t frame_bytes = (size_t)W * H * 3;

@@ -96,6 +96,30 @@ int main() {
         check(ok && v.frames.size() <= 3, "max_frames caps the sampled frames");
     }
 
+    // --- 2b. a clip longer than the frame budget is SAMPLED, not truncated ---------------------
+    {
+        // 6 s at 10fps = 60 source frames, with a budget of 8. Sampling at the source rate and
+        // keeping the first 8 frames would cover only the first 0.8 s, so the model would never
+        // see the end of the clip. The sampled indices must instead span the whole clip.
+        const std::string longpath = "/tmp/sparkinfer_video_test_long.mp4";
+        if (make_test_video(longpath, 128, 96, 10, 6)) {
+            auto lbytes = slurp(longpath);
+            DecodedVideo v;
+            const bool ok = decode_video(lbytes.data(), lbytes.size(), 8, 0.0, v, err);
+            check(ok, "long clip decodes with the default rate" + (ok ? "" : " -- " + err));
+            if (ok && !v.frame_indices.empty()) {
+                check(v.frames.size() <= 8, "budget still respected, got "
+                      + std::to_string(v.frames.size()));
+                const int last = v.frame_indices.back();
+                const int total = (int)(v.fps * 6.0);          // ~60 source frames
+                check(last > total / 2,
+                      "sampling reaches the clip's second half (last source index "
+                      + std::to_string(last) + " of ~" + std::to_string(total) + ")");
+            }
+            std::remove(longpath.c_str());
+        }
+    }
+
     // --- 3. malformed input is refused, not crashed on -----------------------------------------
     {
         DecodedVideo v;
