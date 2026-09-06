@@ -2591,7 +2591,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             [] { const char* e = getenv("SPARKINFER_Q38_ATTN_NORM_FP4");
                  return !e || e[0] != '0'; }();
         const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        if (!defer_next_attn_norm) kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
+        // The deferral is only sound for consumers that reach the normalisation through the fused
+        // rmsnorm+quantize -- the qkv/z arms do. A Gated-DeltaNet layer's ssm_alpha / ssm_beta
+        // projections do NOT: they read raw `xn` (the proj() calls in the GDN block above), and
+        // `xn` has exactly two writers in this function -- the pre-loop rmsnorm and this one. So
+        // with the deferral active, which is every layer at N >= 16384, 47 of the 48 GDN layers
+        // projected their decay gate and update rate from LAYER 0's normalisation.
+        //
+        // Refresh xn when the next layer is a GDN layer. The deferral itself is untouched, so the
+        // fused-quantize precision benefit it exists for is kept; only the raw-xn consumers stop
+        // reading a stale value. SPARKINFER_Q38_GDN_XN_FIX=0 restores the old behaviour so the
+        // two can be A/B'd in one binary.
+        static const bool gdn_xn_fix = [] {
+            const char* e = getenv("SPARKINFER_Q38_GDN_XN_FIX");
+            return !(e && e[0] == '0');
+        }();
+        const bool next_needs_raw_xn = gdn_xn_fix && nw && nw->linear_attn;
+        if (!defer_next_attn_norm || next_needs_raw_xn)
+            kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
         attn_norm_deferred = defer_next_attn_norm;
     }
 
