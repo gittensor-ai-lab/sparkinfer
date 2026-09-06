@@ -574,7 +574,8 @@ DFlashDraftModel::DFlashDraftModel(const DFlashDraftConfig& cfg) : p_(new Impl()
         p_->cfg.sliding_layers.assign(p_->cfg.n_layers, true);
         if (p_->cfg.n_layers > 0) p_->cfg.sliding_layers.back() = false;
     }
-    cudaStreamCreate(&p_->stream);
+    // Non-blocking, for the same reason as Qwen35Model's stream: see qwen35.cpp.
+    cudaStreamCreateWithFlags(&p_->stream, cudaStreamNonBlocking);
 }
 
 DFlashDraftModel::~DFlashDraftModel() {

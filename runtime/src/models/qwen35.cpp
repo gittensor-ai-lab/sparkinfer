@@ -447,12 +447,17 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->linear_qdim = cfg.linear_q_heads * cfg.linear_head_dim;
     p_->linear_vdim = cfg.linear_v_heads * cfg.linear_head_dim;
     p_->linear_qkvdim = 2 * p_->linear_qdim + p_->linear_vdim;
-    cudaStreamCreate(&p_->stream);
-    cudaStreamCreate(&p_->stream_k); cudaStreamCreate(&p_->stream_v);
+    // Non-blocking: a blocking stream implicitly synchronises with the legacy stream, so a
+    // graph capture here makes any other thread's legacy-stream work fail with "operation
+    // would make the legacy stream depend on a capturing blocking stream". That is what
+    // breaks concurrent requests -- capture is per-thread, but the implicit legacy edge is not.
+    cudaStreamCreateWithFlags(&p_->stream, cudaStreamNonBlocking);
+    cudaStreamCreateWithFlags(&p_->stream_k, cudaStreamNonBlocking);
+    cudaStreamCreateWithFlags(&p_->stream_v, cudaStreamNonBlocking);
     // Prefetch stream/events exist ONLY for Muse Glimmer, so every other architecture keeps
     // byte-for-byte the stream and event set it had before this change.
     if (cfg.muse_glimmer) {
-        cudaStreamCreate(&p_->stream_pf);
+        cudaStreamCreateWithFlags(&p_->stream_pf, cudaStreamNonBlocking);
         cudaEventCreateWithFlags(&p_->ev_pf_fork, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&p_->ev_pf_done, cudaEventDisableTiming);
     }
