@@ -81,12 +81,7 @@ int main(int argc, char** argv) {
         printf("[FAIL] cannot open %s: %s\n", path.c_str(), cperr.c_str());
         return 1;
     }
-    // Size the context to what this run ACTUALLY uses, not to the checkpoint's declared maximum.
-    // std::max() here kept whichever was larger, which is harmless for a GGUF declaring a few
-    // thousand tokens and fatal for Qwen3.8's config: max_seq 262144 sizes the paged pool at
-    // (concurrency+1) * (262144/16 + 4) blocks and exhausts VRAM before the weights load, which
-    // surfaces only as a bare load failure with no reason attached.
-    cfg.max_seq = long_prefill + max_new + 64;
+    cfg.max_seq = std::max(cfg.max_seq, long_prefill + max_new + 64);
     cfg.eos_id = -1;  // force full max_new for stable throughput accounting
 
     auto rt = sparkinfer::Runtime::create({});
