@@ -706,7 +706,16 @@ bool test_schema_keyword_type_applicability() {
 }
 
 bool test_unsupported_schema_keywords_are_rejected() {
-    for (const char* unsupported : {"const", "multipleOf", "oneOf"}) {
+    // const / multipleOf / oneOf MOVED OUT of this list in #981: validate_value() now enforces
+    // them, so rejecting them would refuse schemas this server can honour. They are covered by
+    // test_schema_keywords_981(), which asserts ENFORCEMENT rather than mere acceptance.
+    //
+    // What stays here is the set validate_value() cannot enforce. That distinction is the whole
+    // contract: a keyword is accepted only if the validator checks it, because this backend does
+    // no constrained decoding and an unchecked keyword would let the model violate a constraint
+    // the caller believes is in force. Do not move anything into the supported list without
+    // implementing it first.
+    for (const char* unsupported : {"$ref", "$defs", "allOf", "prefixItems"}) {
         json body = {
             {"messages", {{{"role", "user"}, {"content", "test"}}}},
             {"tools", json::array({{
@@ -716,9 +725,10 @@ bool test_unsupported_schema_keywords_are_rejected() {
                     {"parameters", {
                         {"type", "object"},
                         {"properties", {{"value", {{"type", "integer"},
-                                                     {unsupported, unsupported == std::string("oneOf")
+                                                     {unsupported, (unsupported == std::string("allOf") ||
+                                                                   unsupported == std::string("prefixItems"))
                                                          ? json::array({json{{"type", "integer"}}})
-                                                         : json(2)}}}}}
+                                                         : json("#/$defs/T")}}}}}
                     }}
                 }}
             }})}
@@ -772,6 +782,52 @@ bool test_parallel_tool_calls() {
     single_request["parallel_tool_calls"] = false;
     CHECK(parse_request(single_request.dump(), request));
     CHECK(!request.parallel_tool_calls);
+    return true;
+}
+
+bool test_schema_keywords_981() {
+    // #981: keywords are accepted ONLY if validate_value() enforces them. A keyword that is
+    // whitelisted but unchecked turns an honest 400 into a model silently violating a constraint,
+    // which is strictly worse -- so each accepted keyword is tested for ENFORCEMENT, not just for
+    // being parseable.
+    auto req_with = [](const std::string& params) {
+        return std::string(R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function",)"
+                           R"("function":{"name":"f","description":"d","parameters":)") + params + "}}]}";
+    };
+    ChatRequest request;
+
+    // x-* vendor extensions: accepted and ignored (MCP servers emit these).
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"type":"string",)"
+                                 R"("x-mcp-header":"X-Trace"}}})"), request));
+    // const / anyOf / oneOf / multipleOf / format now parse.
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"const":"only"}}})"), request));
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"anyOf":[{"type":"string"},{"type":"null"}]}}})"), request));
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"oneOf":[{"type":"string"},{"type":"integer"}]}}})"), request));
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"type":"number","multipleOf":5}}})"), request));
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"type":"string","format":"date-time"}}})"), request));
+
+    // Still refused, because validate_value cannot enforce them. Accepting these would be the
+    // silent weakening the whole design avoids.
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"$ref":"#/$defs/T"}}})"), request));
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"allOf":[{"type":"string"}]}}})"), request));
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"prefixItems":[{"type":"string"}]}}})"), request));
+    return true;
+}
+
+bool test_case_insensitive_tool_names_981() {
+    // Qwen3.8 emits <function=Read> for an offered `read`; a strict compare failed the whole
+    // agent loop over the model's choice of spelling.
+    const std::string body =
+        R"({"messages":[{"role":"user","content":"go"}],"tools":[{"type":"function","function":)"
+        R"({"name":"read","description":"d","parameters":{"type":"object","properties":{}}}}]})";
+    ChatRequest request;
+    CHECK(parse_request(body, request));
+    const std::string raw = "<tool_call>\n<function=Read>\n</function>\n</tool_call>";
+    const ParsedToolOutput out = parse_qwen36_tool_output(raw, false, request);
+    CHECK(out.error.empty());
+    CHECK(out.tool_calls.size() == 1);
+    // Echoed back with the CLIENT's spelling, not the model's -- the client dispatches on its own.
+    CHECK(out.tool_calls[0].name == "read");
     return true;
 }
 
@@ -1698,6 +1754,8 @@ int main() {
     if (!test_schema_keyword_type_applicability()) return 1;
     if (!test_unsupported_schema_keywords_are_rejected()) return 1;
     if (!test_parallel_tool_calls()) return 1;
+    if (!test_schema_keywords_981()) return 1;
+    if (!test_case_insensitive_tool_names_981()) return 1;
     if (!test_reasoning_effort_controls()) return 1;
     if (!test_plain_answer()) return 1;
     if (!test_control_markup_never_leaks_as_content()) return 1;

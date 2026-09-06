@@ -1,5 +1,6 @@
 #include "chat_tokenizer.hpp"
 #include "model_engine.hpp"
+#include "video_input.hpp"   // video_decoder_available() for /v1/models input_modalities
 #include "sparkinfer/kernels/deterministic.h"
 
 #include <nlohmann/json.hpp>
@@ -674,8 +675,17 @@ int main(int argc, char** argv) {
         // tower), so a listing in use today cannot be affected -- but verify against the model
         // monitor before registering a vision model.
         json input_modalities = json::array({std::move(input)});
-        if (engine.has_vision())
+        if (engine.has_vision()) {
             input_modalities.push_back({{"type", "image"}});
+            // Video is advertised only when a decoder is actually resolvable, not merely because
+            // the code path is compiled in. The whole point of this field is to let a client avoid
+            // sending something that cannot work: a deployment without ffmpeg accepts video_url
+            // parts and then fails every one of them, so advertising video there would be worse
+            // than silence. Downgrading instead makes the optional dependency discoverable up
+            // front rather than as a per-request error (#983).
+            if (sparkinfer_server::video_decoder_available(nullptr))
+                input_modalities.push_back({{"type", "video"}});
+        }
 
         json model = {
             {"schema_version", "2.4"}, {"id", g_model_name}, {"name", g_model_name},
