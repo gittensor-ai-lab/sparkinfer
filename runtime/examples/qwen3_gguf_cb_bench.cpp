@@ -18,6 +18,8 @@
 #include "sparkinfer/inference_engine.h"
 #include "sparkinfer/scheduler.h"
 #include "qwen3_gguf_config.h"
+// After qwen35.h: qwen_checkpoint.h's helpers take a Qwen35Model by reference.
+#include "qwen_checkpoint.h"
 
 #include <cuda_runtime.h>
 #include <atomic>
@@ -67,14 +69,24 @@ int main(int argc, char** argv) {
     }();
     const auto policy = parse_policy();
 
+    // Any checkpoint shape qwen3_gguf_bench accepts, not just GGUF. The eval bot scores a
+    // compressed-tensors DIRECTORY, and a concurrency dimension is only meaningful if the same
+    // tool can measure the checkpoint that is actually served -- and, more to the point, if it can
+    // measure MAIN, since every scored number here is a differential against a main baseline.
     sparkinfer::GGUF g;
-    if (!g.open(path)) {
-        printf("[FAIL] cannot open %s\n", path.c_str());
+    sparkinfer::Qwen35Config cfg;
+    QwenCheckpointKind kind{};
+    std::string cperr;
+    if (!qwen_checkpoint_open(path, cfg, g, kind, cperr)) {
+        printf("[FAIL] cannot open %s: %s\n", path.c_str(), cperr.c_str());
         return 1;
     }
-    sparkinfer::Qwen35Config cfg;
-    qwen3_config_from_gguf(g, cfg);
-    cfg.max_seq = std::max(cfg.max_seq, long_prefill + max_new + 64);
+    // Size the context to what this run ACTUALLY uses, not to the checkpoint's declared maximum.
+    // std::max() here kept whichever was larger, which is harmless for a GGUF declaring a few
+    // thousand tokens and fatal for Qwen3.8's config: max_seq 262144 sizes the paged pool at
+    // (concurrency+1) * (262144/16 + 4) blocks and exhausts VRAM before the weights load, which
+    // surfaces only as a bare load failure with no reason attached.
+    cfg.max_seq = long_prefill + max_new + 64;
     cfg.eos_id = -1;  // force full max_new for stable throughput accounting
 
     auto rt = sparkinfer::Runtime::create({});
@@ -115,8 +127,8 @@ int main(int argc, char** argv) {
            batch_tokens, getenv("SPARKINFER_PREFILL_CHUNK_TOKENS")
                              ? getenv("SPARKINFER_PREFILL_CHUNK_TOKENS")
                              : "512");
-    if (!model.load_gguf(path)) {
-        printf("[FAIL] load_gguf\n");
+    if (!qwen_checkpoint_load(model, path, kind)) {
+        printf("[FAIL] load %s (%s)\n", path.c_str(), qwen_checkpoint_kind_label(kind));
         return 1;
     }
 

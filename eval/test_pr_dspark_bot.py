@@ -10,6 +10,41 @@ class Prefill256KEvalTests(unittest.TestCase):
         self.assertIn("target-prefill@256k", bot.SCORING_DIMS)
         self.assertIn("native-nvfp4-256k-prefill", bot.EVAL_SCHEMA_VERSION)
 
+    def test_concurrency_is_scored_and_c1_is_only_a_floor(self):
+        # Every other dimension measures ONE stream. Without these, a PR that fixed aggregate
+        # throughput under concurrency scored exactly zero -- which is what #973 and #975 hit.
+        for dim in ("cb-decode@c2", "cb-decode@c4", "cb-decode@c8"):
+            self.assertIn(dim, bot.SCORING_DIMS)
+        # c=1 must NOT be scored: it is the floor that stops a PR buying concurrency scaling by
+        # slowing the single-stream path. Scoring it would let that trade earn a tier.
+        self.assertNotIn("cb-decode@c1", bot.SCORING_DIMS)
+
+    def test_remote_script_measures_the_concurrency_ladder(self):
+        script = bot._remote_script("main", role="main")
+        self.assertIn("qwen3_gguf_cb_bench", script)
+        self.assertIn("for CC in 1 2 4 8; do", script)
+        # c=1 is measured even though it is not scored -- it is the floor.
+        self.assertIn("RESULT_CB${CC}_AGG", script)
+        self.assertIn("RESULT_CB${CC}_ITL", script)
+        # A harness that runs but measures nothing must be infra, not a regression to zero:
+        # scoring 0 would REJECT the PR for the harness's own failure.
+        self.assertIn("concurrent decode produced no positive metric", script)
+        # The measuring instrument comes from main, like every other harness file.
+        self.assertIn("runtime/examples/qwen3_gguf_cb_bench.cpp", bot.HARNESS_PATHS)
+
+    def test_concurrency_results_parse_into_the_keys_the_dims_table_reads(self):
+        out = bot._parse_remote(
+            "RESULT_CB1_AGG 82.0\n"
+            "RESULT_CB2_AGG 69.2\n"
+            "RESULT_CB4_AGG 71.1\n"
+            "RESULT_CB8_AGG 71.4\n"
+            "RESULT_CB2_ITL 30.18\n")
+        self.assertEqual(out["cb1_agg"], 82.0)
+        self.assertEqual(out["cb2_agg"], 69.2)
+        self.assertEqual(out["cb4_agg"], 71.1)
+        self.assertEqual(out["cb8_agg"], 71.4)
+        self.assertEqual(out["cb2_itl"], 30.18)
+
     def test_remote_script_uses_one_pass_memory_safe_sweep(self):
         script = bot._remote_script("main", role="main")
         self.assertIn('PREFILL_CTX256=262144', script)

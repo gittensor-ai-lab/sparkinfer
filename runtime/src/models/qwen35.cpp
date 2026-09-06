@@ -4504,7 +4504,12 @@ bool Qwen35Model::load_weights(const std::string& dir) {
     s.w.embed_tokens = L("embed_tokens");
     s.w.final_norm   = L("final_norm");
     s.w.lm_head      = L("lm_head");
-    if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
+    if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) {
+        fprintf(stderr, "[compressed-tensors] top-level weights missing (embed=%d final_norm=%d "
+                "lm_head=%d)\n", s.w.embed_tokens != nullptr, s.w.final_norm != nullptr,
+                s.w.lm_head != nullptr);
+        return false;
+    }
     s.w.layers.resize(s.cfg.n_layers);
     for (int i = 0; i < s.cfg.n_layers; i++) {
         std::string pfx = "layer_" + std::to_string(i) + ".";
@@ -6044,7 +6049,10 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.ssm_alpha = plain_bf16(lb + "in_proj_a.weight", (long)c.linear_v_heads * H);
             w.ssm_beta = plain_bf16(lb + "in_proj_b.weight", (long)c.linear_v_heads * H);
             if (!w.wqkv || !w.wqkv_gate || !w.ssm_out || !w.ssm_dt || !w.ssm_a || !w.ssm_norm ||
-                !w.ssm_conv || !w.ssm_alpha || !w.ssm_beta) return false;
+                !w.ssm_conv || !w.ssm_alpha || !w.ssm_beta) {
+                fprintf(stderr, "[compressed-tensors] layer %d: linear-attn weights missing\n", i);
+                return false;
+            }
         } else {
             w.q_has_gate = c.hybrid;
             const std::string ab = b + "self_attn.";
@@ -6083,7 +6091,10 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.wo = attn_w("o_proj", H,       s.qdim,  w.wo_type, &w.wo_fp4, &w.wo_fp4_sf, &w.wo_fp4_alpha);
             w.q_norm = load_norm_plus1(ab + "q_norm.weight", c.head_dim);
             w.k_norm = load_norm_plus1(ab + "k_norm.weight", c.head_dim);
-            if (!w.wq || !w.wk || !w.wv || !w.wo || !w.q_norm || !w.k_norm) return false;
+            if (!w.wq || !w.wk || !w.wv || !w.wo || !w.q_norm || !w.k_norm) {
+                fprintf(stderr, "[compressed-tensors] layer %d: attention weights missing\n", i);
+                return false;
+            }
         }
 
         const std::string mb = b + "mlp.";
@@ -6129,7 +6140,10 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         }
         const bool native_ffn = w.gate_nv && w.up_nv && w.down_nv;
         const bool q4_ffn = w.gate_q && w.up_q && w.down_q;
-        if (!native_ffn && !q4_ffn) return false;
+        if (!native_ffn && !q4_ffn) {
+            fprintf(stderr, "[compressed-tensors] layer %d: FFN is neither native NVFP4 nor Q4_K\n", i);
+            return false;
+        }
     }
     fprintf(stderr, "[compressed-tensors] loaded %d layers, native NVFP4 prefill FFN %d/%d, "
             "decode FFN %s\n", c.n_layers, gu_ready, c.n_layers,
@@ -6161,8 +6175,12 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             for (size_t r0 = 0; r0 < rows; r0 += chunk) {
                 const size_t nr = (rows - r0 < chunk) ? (rows - r0) : chunk;
                 if (!kernels::launch_gguf_dequant_rows_i8(
-                        qtype, (const char*)src + r0 * rb, tmp, dst + r0, (int)nr, cols, s.stream))
+                        qtype, (const char*)src + r0 * rb, tmp, dst + r0, (int)nr, cols, s.stream)) {
+                    fprintf(stderr, "[compressed-tensors] dequant_rows_i8 failed "
+                            "(qtype=%d rows=%zu cols=%ld cuda=%s)\n", qtype, nr, (long)cols,
+                            cudaGetErrorString(cudaGetLastError()));
                     return false;
+                }
             }
             return true;
         };

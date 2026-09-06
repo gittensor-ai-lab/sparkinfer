@@ -87,7 +87,10 @@ if(BUILD_EXAMPLES)
     add_executable(qwen3_gguf_cb_bench examples/qwen3_gguf_cb_bench.cpp)
     target_include_directories(qwen3_gguf_cb_bench PRIVATE include)
     find_package(Threads REQUIRED)
-    target_link_libraries(qwen3_gguf_cb_bench PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
+    # nlohmann_json for the same reason qwen3_gguf_bench links it: qwen_checkpoint.h reaches
+    # qwen38_hf_config.h, which parses config.json to detect a compressed-tensors checkpoint.
+    target_link_libraries(qwen3_gguf_cb_bench PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads
+                          nlohmann_json::nlohmann_json)
     add_executable(qwen3_gguf_score examples/qwen3_gguf_score.cpp)
     target_include_directories(qwen3_gguf_score PRIVATE include)
     target_link_libraries(qwen3_gguf_score PRIVATE sparkinfer_runtime CUDA::cudart

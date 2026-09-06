@@ -143,6 +143,16 @@ SCORING_DIMS = [
     "dspark-decode@16k", "dspark-prefill@16k",
     "dspark-decode@32k", "dspark-prefill@32k",
     "target-prefill@256k", "target-decode@256k",
+    # Aggregate decode throughput with N requests in flight, through ContinuousBatchEngine --
+    # a different execution path from every dimension above, all of which measure ONE stream.
+    #
+    # Added 2026-09-06 because the gate could not see the thing two PRs were optimising. Measured
+    # on main at the same settings this bot scores: c=1 82.0, c=2 69.2, c=4 71.1, c=8 71.4 tok/s.
+    # Aggregate throughput is FLAT in concurrency and actually FALLS from 1 to 2 -- a second
+    # concurrent request makes total throughput worse -- while mean ITL grows linearly
+    # (13 -> 30 -> 55 -> 106 ms), i.e. requests queue behind one another rather than batching.
+    # A PR that fixed that scored exactly zero here, because every other dimension is bs=1.
+    "cb-decode@c2", "cb-decode@c4", "cb-decode@c8",
 ]
 SCORING_DIM = SCORING_DIMS[0]
 
@@ -176,7 +186,10 @@ MODELOPT_NEEDS_REBASE = "dspark-needs-rebase"
 # baseline moves by ~72% (dspark@4k 43.06 -> 74.05, ar@4k 47.39 -> 90.19) and every score taken
 # under v1 is incomparable -- bumping the schema forces re-evaluation instead of letting a stale
 # label sit next to a number that no longer means the same thing.
-EVAL_SCHEMA_VERSION = "v11-dspark-native-nvfp4-256k-prefill-decode"
+# v12 (2026-09-06): concurrency dimensions added (cb-decode@c2/c4/c8 scored, cb-decode@c1 as a
+# floor). Same reasoning as every prior bump -- a PR evaluated before a scoring change existed must
+# not keep a label that the current dimension set would not have produced.
+EVAL_SCHEMA_VERSION = "v12-dspark-native-nvfp4-256k-prefill-decode-concurrency"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-dspark-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -285,6 +298,7 @@ DSPARK_TAU_TOL = float(os.environ.get("DSPARK_TAU_TOL", "0.95"))
 HARNESS_PATHS = (
     "runtime/examples/dspark_tau_check.cpp",
     "runtime/examples/qwen3_gguf_bench.cpp",
+    "runtime/examples/qwen3_gguf_cb_bench.cpp",
     "runtime/examples/qwen_checkpoint.h",
     "runtime/examples/qwen3_gguf_config.h",
     "bench/scripts/bench_prompt_32k.txt",
@@ -911,7 +925,7 @@ if [ -f build/CMakeCache.txt ] && ! grep -q '^CMAKE_CUDA_COMPILER:FILEPATH=/usr/
 fi
 export CUDACXX="${{CUDACXX:-/usr/local/cuda/bin/nvcc}}"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/mopt_cmake.log 2>&1
-cmake --build build --target dspark_tau_check qwen3_gguf_score qwen3_gguf_bench -j"$(nproc)" >/tmp/mopt_build.log 2>&1 || {{
+cmake --build build --target dspark_tau_check qwen3_gguf_score qwen3_gguf_bench qwen3_gguf_cb_bench -j"$(nproc)" >/tmp/mopt_build.log 2>&1 || {{
   echo "BUILD_FAILED -- tail of /tmp/mopt_build.log:" >&2
   tail -80 /tmp/mopt_build.log >&2
   exit 1
@@ -919,6 +933,7 @@ cmake --build build --target dspark_tau_check qwen3_gguf_score qwen3_gguf_bench 
 test -x build/runtime/dspark_tau_check
 test -x build/runtime/qwen3_gguf_score
 test -x build/runtime/qwen3_gguf_bench
+test -x build/runtime/qwen3_gguf_cb_bench
 
 # --- DSpark speculative decode @ ctx=CTX ---
 # ONE process runs both legs against one loaded model: the AR reference first (on clean state --
@@ -1180,6 +1195,42 @@ if [ "$IS_PR" = "1" ]; then
 fi
 # ---------------------------------------------------------------------------------------------
 
+# --- concurrent decode (ContinuousBatchEngine) -------------------------------------------
+# Every other dimension measures ONE stream. This measures aggregate decode throughput with N
+# requests in flight, which is a different execution path (worker_loop -> step_job per sequence)
+# and was entirely unscored until 2026-09-06.
+#
+# Placed BEFORE the 256k row deliberately: these four runs cost ~4 minutes total against that
+# row's ~65, so a PR that regresses concurrency fails fast rather than after an hour of GPU time.
+#
+# c=1 is measured as a FLOOR, not scored: it is what catches a PR that buys concurrency scaling by
+# slowing the single-stream path. Same role the ar-decode floors play for DSpark.
+wait_gpu_clear
+for CC in 1 2 4 8; do
+  CB_OUT=/tmp/dspark_cb_$CC.txt
+  if ! timeout 900 env \
+    SPARKINFER_QWEN38_PREFILL_NVFP4=1 \
+    SPARKINFER_QWEN38_DECODE_NVFP4=1 \
+    SPARKINFER_KV_INT8=1 \
+    build/runtime/qwen3_gguf_cb_bench "$MODEL_DIR" "$CC" 256 64 512 > "$CB_OUT" 2>&1; then
+    echo "CB_CHILD_FAILED c=$CC" >&2
+    tail -20 "$CB_OUT" >&2 || true
+    echo "RETRYABLE_INFRA_FAILURE concurrent-decode harness exited nonzero at c=$CC" >&2
+    exit 75
+  fi
+  CB_AGG=$(sed -n 's/.*agg_tok_s=\\([0-9.]*\\).*/\\1/p' "$CB_OUT" | tail -1)
+  CB_ITL=$(sed -n 's/.*mean_itl_ms=\\([0-9.]*\\).*/\\1/p' "$CB_OUT" | tail -1)
+  echo "RESULT_CB${{CC}}_AGG ${{CB_AGG:-0}}"
+  echo "RESULT_CB${{CC}}_ITL ${{CB_ITL:-0}}"
+  # A zero here means the harness ran but measured nothing -- treat it as infra, not as a
+  # regression to 0, which would REJECT the PR for the harness's own failure.
+  if ! python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "${{CB_AGG:-0}}"; then
+    echo "RETRYABLE_INFRA_FAILURE concurrent decode produced no positive metric at c=$CC" >&2
+    tail -20 "$CB_OUT" >&2 || true
+    exit 75
+  fi
+done
+
 # --- target prefill @ 256k ---------------------------------------------------------------
 # Kept after the cheap DSpark fail-fast gates so an already-invalid PR does not burn another hour
 # of GPU time. The DSpark draft does not participate in prompt ingestion, and loading it would
@@ -1373,6 +1424,18 @@ def _parse_remote(stdout: str) -> dict:
         elif line.startswith("PARITY worst="):
             try:
                 out["parity_worst"] = float(line.split("worst=")[1].split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("RESULT_CB") and ("_AGG " in line or "_ITL " in line):
+            # RESULT_CB<N>_AGG / RESULT_CB<N>_ITL -> out["cb<N>_agg"] / out["cb<N>_itl"].
+            # Parsed generically rather than as eight hand-written branches so adding a
+            # concurrency point to the shell loop does not need a matching branch here.
+            try:
+                key, val = line.split()[0], float(line.split()[1])
+                body = key[len("RESULT_CB"):]              # e.g. "2_AGG"
+                n, field = body.split("_", 1)
+                if n.isdigit():
+                    out[f"cb{int(n)}_{field.lower()}"] = val
             except (ValueError, IndexError):
                 pass
         elif line.startswith("RESULT_DSPARK_TPS "):
@@ -1870,6 +1933,12 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         ("dspark-prefill@32k", pr["prefill_pp"], main["prefill_pp"]),
         ("target-prefill@256k", pr["prefill256_pp"], main["prefill256_pp"]),
         ("target-decode@256k",  pr["decode256_tps"], main["decode256_tps"]),
+        ("cb-decode@c2",      pr["cb2_agg"],    main["cb2_agg"]),
+        ("cb-decode@c4",      pr["cb4_agg"],    main["cb4_agg"]),
+        ("cb-decode@c8",      pr["cb8_agg"],    main["cb8_agg"]),
+        # Floor, not a scored axis: a PR must not buy concurrency scaling by slowing the
+        # single-stream continuous-batch path. Same role the ar-decode floors play for DSpark.
+        ("cb-decode@c1",      pr["cb1_agg"],    main["cb1_agg"]),
         ("ar-decode@4k",      pr["ar4_tps"],     main["ar4_tps"]),
         ("ar-decode@16k",     pr["ar_tps"],     main["ar_tps"]),
         ("ar-decode@32k",     pr["ar32_tps"],   main["ar32_tps"]),
