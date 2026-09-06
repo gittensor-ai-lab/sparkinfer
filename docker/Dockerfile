@@ -29,7 +29,9 @@ RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
  && cmake --build build --target sparkinfer_server qwen38_hf_dflash_bench -j"$(nproc)"
 RUN strip build/server/sparkinfer_server build/runtime/qwen38_hf_dflash_bench || true
 
-FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
+# base, not runtime: the server links only libcudart (see ldd). The runtime image adds ~3.1 GB
+# of cuBLAS/cuSPARSE/cuFFT/cuSOLVER/cuRAND/NPP that nothing here references.
+FROM nvidia/cuda:12.8.1-base-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 # ffmpeg is REQUIRED for video input -- the server shells out to it for frame extraction.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -40,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # The server links these two; libcudart comes from the runtime image and libnvidia-ml is
 # injected by the NVIDIA container runtime.
+COPY --from=builder /usr/local/cuda/lib64/libcudart.so.12*     /opt/sparkinfer/lib/
 COPY --from=builder /src/build/server/sparkinfer_server        /opt/sparkinfer/bin/
 COPY --from=builder /src/build/runtime/qwen38_hf_dflash_bench  /opt/sparkinfer/bin/
 COPY --from=builder /src/build/runtime/libsparkinfer_runtime.so /opt/sparkinfer/lib/
