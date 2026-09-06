@@ -73,7 +73,21 @@ by pessimising the other.
 
 Qwen3.8-27B also ships a **DSpark** draft — a five-layer semi-autoregressive block drafter that
 proposes a block per step and has the target verify it in one batched pass, so accepting *k*
-tokens costs one target forward instead of *k*:
+tokens costs one target forward instead of *k*.
+
+Across contexts, on the committed workload corpus (`bench/scripts/workloads.py`, 128-token
+outputs, greedy, batch 1, best of 3), against the autoregressive baseline measured in the same
+process and model load:
+
+| | 4K | 16K | 32K |
+|---|---:|---:|---:|
+| **mean speedup over AR** | **4.01×** | **2.97×** | **2.63×** |
+| AR reference | 91.0 tok/s | 86.4 | 81.3 |
+
+Speculative throughput depends almost entirely on how predictable the generated text is, so a
+single number is misleading in either direction. The gated regression check below runs the
+*hardest* case — long-context prose at 16k, where acceptance is lowest — and is the figure that
+must not regress:
 
 <!-- BENCH:qwen38-dspark:start -->
 
@@ -87,6 +101,9 @@ tokens costs one target forward instead of *k*:
 
 <sub>Auto-refreshed by the DSpark eval bot at `b819f2fef` — these are the numbers that PR measured on the pinned RTX 5090, which after squash-merge are main's. Regenerated on every auto-merge, so the table cannot drift behind the code.</sub>
 <!-- BENCH:qwen38-dspark:end -->
+
+The two tables measure different corpora, which is the whole point: 4.01× on a mixed workload at
+4k and 1.474× on long-context prose at 16k are both true. Quote the range, not a single figure.
 
 Speculation only pays when the verify costs less than what it replaces:
 `speedup ≈ τ / (verify cost + draft cost)`, both in target forwards. That is why τ alone is not the
