@@ -399,12 +399,22 @@ bool require_keyword_type(const json& schema, const std::string& where,
 bool valid_schema_node(const json& schema, const std::string& where, bool top_level,
                        std::string& err) {
     if (!schema.is_object()) return set_error(err, where + " must be an object");
+    // "$schema" and "$comment" carry no constraints -- they are annotations a validator is
+    // required to ignore -- so accepting and dropping them is faithful, not permissive. Clients
+    // built on @ai-sdk/openai-compatible emit "$schema" on every tool schema, and rejecting it
+    // failed the whole request. Structural "$" keywords ($ref/$defs/$id) are deliberately still
+    // refused: silently ignoring a $ref would validate the arguments against nothing.
     if (!is_allowed_key(schema,
-                        {"type", "description", "default", "title", "properties",
+                        {"$schema", "$comment",
+                         "type", "description", "default", "title", "properties",
                          "required", "additionalProperties", "items", "enum", "minimum",
                          "maximum", "exclusiveMinimum", "exclusiveMaximum", "minItems",
                          "maxItems", "minLength", "maxLength", "pattern"},
                         where, err)) return false;
+    for (const char* annotation : {"$schema", "$comment"}) {
+        if (schema.contains(annotation) && !schema[annotation].is_string())
+            return set_error(err, where + "." + annotation + " must be a string");
+    }
     for (const char* annotation : {"description", "title"}) {
         if (schema.contains(annotation) && !schema[annotation].is_string())
             return set_error(err, where + "." + annotation + " must be a string");

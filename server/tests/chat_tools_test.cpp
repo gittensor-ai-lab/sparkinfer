@@ -581,6 +581,50 @@ bool test_schema_unions_and_dynamic_properties() {
     return true;
 }
 
+bool test_schema_annotations_accepted() {
+    // Regression for #972: @ai-sdk/openai-compatible clients (Kilo and friends) put
+    // "$schema" on every tool schema, which made every tool-calling request 400.
+    const std::string body = R"JSON({
+      "messages":[{"role":"user","content":"weather in Paris?"}],
+      "tools":[{"type":"function","function":{
+        "name":"get_weather",
+        "description":"Current weather",
+        "parameters":{
+          "$schema":"https://json-schema.org/draft/2020-12/schema",
+          "$comment":"generated",
+          "type":"object",
+          "properties":{"city":{"type":"string","$comment":"nested annotations too"}},
+          "required":["city"]
+        }}}]
+    })JSON";
+    ChatRequest request;
+    CHECK(parse_request(body, request));
+
+    // The request is accepted and the tool still renders with its real constraints intact.
+    // (The annotations themselves are passed through to the prompt today; they carry no
+    // constraints, so that is cosmetic rather than incorrect.)
+    const std::string prompt = apply_qwen36_tools_template(request, false);
+    CHECK(contains(prompt, "get_weather"));
+    CHECK(contains(prompt, "\"city\""));
+
+    // A non-string annotation is still a bad schema.
+    json bad = json::parse(body);
+    bad["tools"][0]["function"]["parameters"]["$schema"] = 7;
+    ChatRequest bad_request;
+    std::string bad_error;
+    CHECK(!parse_chat_request_json(bad.dump(), bad_request, bad_error));
+
+    // Structural "$" keywords stay refused: ignoring a $ref would validate against nothing.
+    for (const char* structural : {"$ref", "$defs", "$id"}) {
+        json refused = json::parse(body);
+        refused["tools"][0]["function"]["parameters"][structural] = "#/definitions/x";
+        ChatRequest refused_request;
+        std::string refused_error;
+        CHECK(!parse_chat_request_json(refused.dump(), refused_request, refused_error));
+    }
+    return true;
+}
+
 bool test_unicode_string_lengths() {
     const std::string body = R"JSON({
       "messages":[{"role":"user","content":"Send one character."}],
@@ -1648,6 +1692,7 @@ int main() {
     if (!test_schema_constraints()) return 1;
     if (!test_schema_pattern_is_linear_time()) return 1;
     if (!test_schema_unions_and_dynamic_properties()) return 1;
+    if (!test_schema_annotations_accepted()) return 1;
     if (!test_unicode_string_lengths()) return 1;
     if (!test_large_integer_bounds_are_exact()) return 1;
     if (!test_schema_keyword_type_applicability()) return 1;
