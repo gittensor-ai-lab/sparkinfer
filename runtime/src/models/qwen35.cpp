@@ -4034,11 +4034,37 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // 24576 is not a new boundary: it is the one dflash_draft.cpp's window ladder already splits
     // the long band at, so the depth plan and the draft's attention window change together.
     constexpr int kVeryDeepMinSeq = 24576;
+    // RECALIBRATED. Every depth above was priced against what a verify row cost at the time, and
+    // that price has since collapsed. The batched verify IS dflash_verify_short_run, the same
+    // forward the wide continuous-batch work has been widening and re-tiling (#990 the dense FFN
+    // onto the block-scaled GEMM, #991 the GDN projections, #992 its tile and cache policy at
+    // decode widths, #993 the attention projections and the width padding). At ctx=32768 this
+    // bench read 87-89 tok/s when the ladder was last derived and reads 139.5 now, and a proposal
+    // that could not repay a 1.12 ms row repays a much cheaper one easily.
+    //
+    // Re-measured on the same corpus the notes above use (bench_prompt_32k.txt truncated to each
+    // context, which is exactly what the scored harness tokenizes), NTOK=128, two to three fresh
+    // processes per arm, every run lossless, AR flat within 0.2%:
+    //
+    //     ctx     depth   tok/s (was)        tok/s (now)          tau
+    //     4096      5     222.45 / 219.83    7: 238.86 / 238.90   2.93 -> 3.36   +8.1%
+    //     16384     2     190.85 / 190.59    5: 217.72 / 217.65   2.51 -> 3.37  +14.0%
+    //     32768     1     139.66 / 139.50    7: 201.98 / 201.66   1.86 -> 3.97  +44.6%
+    //
+    // The 32k entry is the whole story in one line: acceptance nearly doubles because the deep
+    // proposals were always landing, and the rows to verify them are no longer what they cost.
+    // 16k peaks at 5 rather than 7 (208.58 at 7) -- past five the extra row still costs a
+    // 248320-wide head row per proposal and the acceptance it adds no longer covers it there.
+    //
+    // This is the INITIAL depth and therefore a floor the adaptive controller promotes from, so
+    // raising it does not remove adaptation; it removes a floor that was holding these contexts
+    // below what they measurably sustain. The 6144..12288 band is untouched: it is not a scored
+    // length and was not re-measured.
     const int kInitialProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
                                     : ((kShortGeneration || kAmortizedMidContext) ? 7
-                                       : ((n + max_new) >= kVeryDeepMinSeq ? 1
-                                          : ((n + max_new) >= kDeepMinSeq ? 2
-                                             : ((n + max_new) < kMid4kMaxSeq ? 5 : 3)))));
+                                       : ((n + max_new) >= kVeryDeepMinSeq ? 7
+                                          : ((n + max_new) >= kDeepMinSeq ? 5
+                                             : ((n + max_new) < kMid4kMaxSeq ? 7 : 3)))));
     // A length-only depth is a safe starting point, not a workload policy. At the same 16k
     // context real chat accepts ~1.36 tokens while code/JSON/repetition accept 5.35/6.62/6.92 at
     // depth 7. Keeping the prose-tuned depth-2 ceiling makes those predictable streams pay 27-39%
