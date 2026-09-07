@@ -18,6 +18,26 @@
 namespace sparkinfer {
 
 namespace {
+// How many prefills one iteration may admit while the decode batch is still filling. 1 restores
+// the previous behaviour exactly, for a paired A/B out of one binary.
+int prefills_per_step() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_PREFILLS_PER_STEP");
+        const int x = e ? atoi(e) : 2;
+        return x < 1 ? 1 : x;
+    }();
+    return v;
+}
+// The decode width above which a step is no longer dominated by its fixed weight read. Defaults
+// to the packed-decode ceiling; below it a wider batch is very nearly free.
+int packed_decode_width() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_WIDE_DECODE_ROWS");
+        const int x = e ? atoi(e) : 32;
+        return x < 1 ? 1 : x;
+    }();
+    return v;
+}
 int prefill_mix_max_tokens() {
     static int v = [] {
         const char* e = getenv("SPARKINFER_PREFILL_MIX_MAX");
@@ -83,6 +103,62 @@ ScheduleBatch Scheduler::schedule(const std::vector<ScheduledSequence>& active) 
     }
     if (batch.total_tokens < budget) {
         const int mix_max = prefill_mix_max_tokens();
+        // Admitting ONE prefill per iteration is right once the decode batch is wide, and wrong
+        // while it is still filling. A packed decode step on this runtime costs a fixed weight
+        // read plus a small per-row term -- measured on RTX 5090 / Qwen3.8-27B-NVFP4 at
+        // concurrency 32, 14.85 ms fixed against 0.41 ms per row -- so a step at four rows costs
+        // 97% of what a step at thirty-two costs. Ramping one row per iteration therefore pays a
+        // full weight read for a handful of tokens, thirty-one times, and because the rows START
+        // staggered they FINISH staggered and the same waste is paid again as a drain tail.
+        //
+        // So: while the decode batch is still narrower than the width a packed step serves for
+        // that flat cost, admitting another prefill costs nothing it was not already paying.
+        // At and above that width this reverts to exactly one, which is what protects ITL in
+        // steady state -- the regime the original rule was written for.
+        // How many, though, is a trade, and TWO is where it settles. Each extra prefill admitted
+        // into one iteration adds almost exactly one prefill's duration to the worst inter-token
+        // gap, because they run back to back ahead of the next decode step. Measured at
+        // concurrency 32, decode_tokens=8200 on both arms:
+        //
+        //   admitted   agg tok/s   mean ITL   max ITL
+        //   1 (before)     981.0     27.96      75.5
+        //   2            1023.6     27.82     104.0
+        //   4           ~1037       27.9      ~155
+        //   8           ~1045       27.6      ~293
+        //
+        // Throughput saturates by two while the tail keeps climbing ~28 ms per admission, so the
+        // aggressive settings buy 1% for another 150 ms of worst-case latency -- the same ITL
+        // spike prefill_mix_max_tokens() above exists to prevent. A width-scaled taper (8 when
+        // empty, down to 1) was tried and is strictly worse than a flat two on both axes: 1025.7
+        // tok/s at 206.7 ms max ITL. Steady-state ITL is untouched either way, which is the point:
+        // this shortens the ramp, it does not change the step.
+        //
+        // The second admission also has to EARN its ~25 ms, and it only does when the ramp is
+        // deep. That cost is one prefill and is therefore flat in concurrency, while the saving
+        // grows with how many rows have to be filled -- measured, before -> after, every run at
+        // the full decode_tokens:
+        //
+        //   concurrency    2       4       8      16      32
+        //   agg tok/s   +0.8%   +1.1%   +0.5%   +3.4%   +4.3%
+        //   max ITL      none   +23ms   +24ms   +29ms   +29ms
+        //
+        // At 4 and 8 that is nearly the whole latency price for almost none of the benefit, so
+        // require a deep ramp before widening. Below it this is bit-for-bit the previous
+        // scheduler.
+        //
+        // "Deep" has to be measured against the batch this load will EVENTUALLY reach -- pending
+        // plus already-decoding -- not against the pending queue alone. The queue drains as the
+        // ramp proceeds, so a bare `pending` test closes the gate partway up and gives most of
+        // the saving back: at concurrency 16 it shut after two admissions and the gain fell from
+        // +3.4% to +0.1%. The sum is invariant across the ramp, which is the property wanted.
+        int pending = 0;
+        for (const ScheduledSequence* s : ordered)
+            if (s->phase == SeqPhase::PREFILL) ++pending;
+        const int wide = packed_decode_width();
+        const int have = (int)batch.decode_request_ids.size();
+        const bool deep_ramp = (pending + have) * 2 >= wide;
+        const int allow = (have < wide && deep_ramp) ? prefills_per_step() : 1;
+        int taken = 0;
         for (const ScheduledSequence* s : ordered) {
             if (s->phase != SeqPhase::PREFILL) continue;
             // Defer large atomic prefills while decode is in flight.
@@ -92,7 +168,7 @@ ScheduleBatch Scheduler::schedule(const std::vector<ScheduledSequence>& active) 
             }
             batch.prefill_request_ids.push_back(s->request_id);
             batch.total_tokens += 1;
-            break;
+            if (++taken >= allow || batch.total_tokens >= budget) break;
         }
     }
     return batch;

@@ -315,11 +315,15 @@ void ContinuousBatchEngine::worker_loop() {
                 if (job) any_finished = step_job(*job, /*chunked=*/false) || any_finished;
             }
         }
-        if (!prefill_ids.empty()) {
+        // The scheduler may hand back more than one prefill while the decode batch is still
+        // filling (see Scheduler::schedule). They run back to back on this thread, which is the
+        // point: each one widens the next decode step, and a decode step's cost is almost all
+        // fixed weight read.
+        for (uint64_t pid : prefill_ids) {
             Job* job = nullptr;
             {
                 std::lock_guard<std::mutex> lock(mu_);
-                auto it = jobs_.find(prefill_ids.front());
+                auto it = jobs_.find(pid);
                 if (it != jobs_.end() && !it->second->done) job = it->second.get();
             }
             if (job) any_finished = step_job(*job, /*chunked=*/mix_decode ||
