@@ -4003,9 +4003,45 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const char* e = getenv("SPARKINFER_DFLASH_VERIFY_HEAD_ROWS");
             return !(e && e[0] == '0');
         }();
-        head_ok = head_rows_on && N > 1 &&
-                  kernels::launch_mmvq_rows_f32(s.w.lm_head_type, q81, s.w.lm_head, logits,
-                                                N, c.vocab, H, st);
+        // Continuous-batch decode scores its head with the multi-row kernel instead. Same Q4_K
+        // weights, same [M, vocab] output, but one warp owns an output row and reduces with a bare
+        // shfl_xor, where si_mmvq_q4k_rows_exact_kernel spends four warps and an smem fold on two
+        // rows. That kernel's own header already measured the gap on this exact head ("0.771 ms at
+        // GRP=1 against a draft-side multi-row head that moves the same bytes in 0.578") -- it was
+        // simply never wired to anything but the draft.
+        //
+        // Chunked by 8, not by the 16 the launcher accepts: it carries exact, compile-time-bounded
+        // bodies only to M=8, and 9..16 land in a predicated MMAX=16 body at 56 registers against
+        // 39-40. Measured, the narrower chunk wins despite re-reading the head twice as often --
+        // c=16 687.6 tok/s at width 8 against 664.2 at width 16.
+        //
+        // PACKED ONLY, and that restriction is load-bearing. The multi-row kernel partitions the
+        // super-blocks across lanes differently, so its rounding differs from the rows kernel AR
+        // scores with. A continuous-batch step is a plain argmax emit and absorbs that; the
+        // speculative verify cannot, because dspark_tau_check gates on the speculative tokens being
+        // IDENTICAL to the same build's AR tokens. `packed` separates them exactly -- decode_packed
+        // sets packed_rows, DSpark's verify never does -- so every dspark-* path keeps the rows
+        // kernel and stays bit-identical. Opt out with SPARKINFER_CB_HEAD_MULTIROW=0.
+        static const bool cb_head_mr = []{ const char* e = getenv("SPARKINFER_CB_HEAD_MULTIROW");
+                                           return !(e && e[0] == '0'); }();
+        bool mr_done = false;
+        if (cb_head_mr && packed && N > 1) {
+            const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
+            bool mr_ok = true;
+            for (int r0 = 0; r0 < N && mr_ok; r0 += 8) {
+                const int m = (N - r0) < 8 ? (N - r0) : 8;
+                mr_ok = kernels::launch_gemv_q4k_dp4a_multirow_f32(
+                    static_cast<const unsigned char*>(q81) + (size_t)r0 * q81_row_bytes,
+                    s.w.lm_head, logits + (size_t)r0 * c.vocab, c.vocab, H, m, st);
+            }
+            // A partial run would have scored some rows and left the rest stale, so only a fully
+            // successful sweep may claim the head; anything else falls through and redoes all N.
+            mr_done = mr_ok;
+        }
+        head_ok = mr_done ||
+                  (head_rows_on && N > 1 &&
+                   kernels::launch_mmvq_rows_f32(s.w.lm_head_type, q81, s.w.lm_head, logits,
+                                                 N, c.vocab, H, st));
         if (!head_ok) {
             const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
             for (int r = 0; r < N; ++r) {
