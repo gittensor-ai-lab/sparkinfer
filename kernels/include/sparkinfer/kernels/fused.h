@@ -331,12 +331,16 @@ void launch_qwen36_conv_split_l2norm_fused(const void* qkv_bf16, const void* con
 // pointers (each session owns its own allocation), which also keeps the call CUDA-graph safe:
 // the graph bakes the array's address and the packer rewrites its contents per replay.
 // Returns false (launching nothing) for shapes it is not instantiated for -- head_dim != 128.
+// One-off fp32 -> compacted-bf16 conversion of a GDN state array (see qwen36.cu). `staging` must
+// hold n bf16 values; the result lands in the first half of `state`.
+bool launch_qwen36_gdn_state_to_b16(float* state, void* staging, size_t n, cudaStream_t stream);
 bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                                   const void* alpha_bf16, const void* beta_bf16,
                                   const void* dt_bf16, const void* a_bf16,
                                   float* const* states, size_t state_off, void* out_bf16,
                                   int batch, int q_heads, int v_heads, int head_dim,
-                                  bool qh_block, cudaStream_t stream = nullptr);
+                                  bool qh_block, cudaStream_t stream = nullptr,
+                                  bool state_compact_b16 = false);
 
 // Batched twin of launch_qwen36_conv_split_l2norm_fused; `conv_states` is a device array of B
 // per-session conv-state pointers, same contract as above.
@@ -351,7 +355,7 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
                           const void* dt_bf16, const void* a_bf16,
                           float* state_f32, void* out_bf16,
                           int q_heads, int v_heads, int head_dim, bool qh_block,
-                          cudaStream_t stream = nullptr);
+                          cudaStream_t stream = nullptr, bool state_compact_b16 = false);
 
 void launch_qwen36_gated_norm(const void* x_bf16, const void* z_bf16,
                               const void* weight_bf16, void* out_bf16,

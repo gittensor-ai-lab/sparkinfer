@@ -3468,7 +3468,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 if (!kernels::launch_qwen36_gdn_ar_batched(
                         gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
                         s.packed_lin_state, state_off, att,
-                        N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st)) {
+                        N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st,
+                        s.packed_state_b16)) {
                     supported = false;
                     vfail_L = L;
                     break;

@@ -260,7 +260,23 @@ __global__ void gdn_ar_kernel(const __nv_bfloat16* __restrict__ q,
 // reorders the fp32 sum — so gate by self-consistency (top1/KL) over a long sequence, not cmp.
 // HEAD_DIM is a template param so NROW is compile-time -> the r-loops fully unroll and sloc[] stays in
 // registers (a runtime head_dim would force sloc[] to local memory and defeat the register cache).
-template <int COLS, int HEAD_DIM>
+// ---- compacted bf16 recurrent state (continuous-batch decode only) -------------------------
+// The GDN state is [v_heads][HEAD_DIM][HEAD_DIM] fp32 per layer PER SEQUENCE -- 3.1 MB at this
+// model's shape -- and every element of it is read and written on every decode step. At
+// concurrency 32 that is ~9.6 GB of traffic per step: the second-largest item in the step after
+// the weight GEMMs, 15.3% of it. Halving the state halves that traffic -- measured by touching
+// only half the state, aggregate goes 1162.8 -> 1301.4 tok/s.
+//
+// SCOPED to the packed path, and the scope is load-bearing: rounding the state to bf16 costs
+// 10.1% of acceptance at ctx=16384 (tau 1.7297 -> 1.5542) against a 0.95x floor, a hard reject.
+// A continuous-batch step is a plain argmax emit with no acceptance to lose; the speculative
+// decode path has everything to lose. Only a session that has been through decode_packed is
+// converted, and DSpark's verify never is, so every dspark-* path keeps the fp32 state
+// bit-for-bit.
+//
+// The compacted array occupies the FIRST half of the same fp32 allocation, so the conversion is a
+// one-off per session and costs no VRAM.
+template <int COLS, int HEAD_DIM, bool SB16>
 __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
                                    const __nv_bfloat16* __restrict__ k,
                                    const __nv_bfloat16* __restrict__ v,
@@ -284,14 +300,16 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* qhptr = q + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* khptr = k + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* vhptr = v + (size_t)vh * HEAD_DIM;
-    float* col = state + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;   // contiguous [HEAD_DIM] rows of column j
+    const size_t col_off = ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+    float* col = state + col_off;                             // contiguous [HEAD_DIM] rows of column j
+    __nv_bfloat16* colb = reinterpret_cast<__nv_bfloat16*>(state) + col_off;
 
     float sloc[NROW];
     float part_sk = 0.f;
     #pragma unroll
     for (int r = 0; r < NROW; r++) {
         const int i = lane + r * 32;
-        const float s = col[i];                               // coalesced read
+        const float s = SB16 ? q36_to_f(colb[i]) : col[i];    // coalesced read
         sloc[r] = s;
         part_sk += s * q36_to_f(khptr[i]);
     }
@@ -302,8 +320,8 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
     for (int r = 0; r < NROW; r++) {
         const int i = lane + r * 32;
         float s_new = sloc[r] * g + q36_to_f(khptr[i]) * delta;   // S[i][j]*g + k[i]*delta
-        if (state_bf16) s_new = q36_to_f(__float2bfloat16(s_new));
-        col[i] = s_new;                                       // coalesced write
+        if (SB16) { colb[i] = __float2bfloat16(s_new); s_new = q36_to_f(colb[i]); }
+        else { if (state_bf16) s_new = q36_to_f(__float2bfloat16(s_new)); col[i] = s_new; }
         part_y += s_new * q36_to_f(qhptr[i]) * scale;
     }
     const float y = q36_wsum(part_y);
@@ -333,7 +351,7 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
 // Row b reads activation row b and state states[b]; with batch == 1 and states[0] equal to what
 // the unbatched launcher is handed, every lane does bit-identical arithmetic in the same order,
 // so a packed step and a sequential step agree exactly rather than approximately.
-template <int COLS, int HEAD_DIM>
+template <int COLS, int HEAD_DIM, bool SB16>
 __global__ void gdn_ar_fast_batched_kernel(const __nv_bfloat16* __restrict__ q,
                                            const __nv_bfloat16* __restrict__ k,
                                            const __nv_bfloat16* __restrict__ v,
@@ -367,14 +385,16 @@ __global__ void gdn_ar_fast_batched_kernel(const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* qhptr = qrow + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* khptr = krow + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* vhptr = vrow + (size_t)vh * HEAD_DIM;
-    float* col = states[b] + state_off + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+    const size_t col_off = state_off + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+    float* col = states[b] + col_off;
+    __nv_bfloat16* colb = reinterpret_cast<__nv_bfloat16*>(states[b]) + col_off;
 
     float sloc[NROW];
     float part_sk = 0.f;
     #pragma unroll
     for (int r = 0; r < NROW; r++) {
         const int i = lane + r * 32;
-        const float sv = col[i];
+        const float sv = SB16 ? q36_to_f(colb[i]) : col[i];
         sloc[r] = sv;
         part_sk += sv * q36_to_f(khptr[i]);
     }
@@ -385,8 +405,8 @@ __global__ void gdn_ar_fast_batched_kernel(const __nv_bfloat16* __restrict__ q,
     for (int r = 0; r < NROW; r++) {
         const int i = lane + r * 32;
         float s_new = sloc[r] * g + q36_to_f(khptr[i]) * delta;
-        if (state_bf16) s_new = q36_to_f(__float2bfloat16(s_new));
-        col[i] = s_new;
+        if (SB16) { colb[i] = __float2bfloat16(s_new); s_new = q36_to_f(colb[i]); }
+        else { if (state_bf16) s_new = q36_to_f(__float2bfloat16(s_new)); col[i] = s_new; }
         part_y += s_new * q36_to_f(qhptr[i]) * scale;
     }
     const float y = q36_wsum(part_y);
@@ -641,12 +661,40 @@ void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
 // as a per-row pointer array. Restricted to the fast head_dim==128 path, which is the only one
 // the packed decode path uses (Qwen3.8 linear_head_dim = 128); anything else must keep running
 // the unbatched launcher per row.
+// One-off fp32 -> compacted-bf16 conversion of a session's whole GDN state. Staged through a
+// scratch buffer rather than written in place: the destination (the first half of the same
+// allocation) overlaps the source, and a grid-wide shrink has no ordering between the block that
+// writes an element and the block that has yet to read the float underneath it.
+__global__ void gdn_state_f32_to_b16_kernel(const float* __restrict__ src,
+                                            __nv_bfloat16* __restrict__ dst, size_t n) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (size_t)gridDim.x * blockDim.x)
+        dst[i] = __float2bfloat16(src[i]);
+}
+__global__ void gdn_state_b16_copy_kernel(const __nv_bfloat16* __restrict__ src,
+                                          __nv_bfloat16* __restrict__ dst, size_t n) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (size_t)gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+bool launch_qwen36_gdn_state_to_b16(float* state, void* staging, size_t n, cudaStream_t stream) {
+    if (!state || !staging || n == 0) return false;
+    const int threads = 256;
+    int blocks = (int)((n + threads - 1) / threads);
+    if (blocks > 8192) blocks = 8192;
+    auto* stg = reinterpret_cast<__nv_bfloat16*>(staging);
+    gdn_state_f32_to_b16_kernel<<<blocks, threads, 0, stream>>>(state, stg, n);
+    gdn_state_b16_copy_kernel<<<blocks, threads, 0, stream>>>(
+        stg, reinterpret_cast<__nv_bfloat16*>(state), n);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                                   const void* alpha_bf16, const void* beta_bf16,
                                   const void* dt_bf16, const void* a_bf16,
                                   float* const* states, size_t state_off, void* out_bf16,
                                   int batch, int q_heads, int v_heads, int head_dim,
-                                  bool qh_block, cudaStream_t stream) {
+                                  bool qh_block, cudaStream_t stream, bool state_compact_b16) {
     if (batch < 1 || head_dim != 128) return false;
     static const bool state_bf16 = [] {
         const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
@@ -662,8 +710,8 @@ bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const 
     constexpr int HD = 128;
     const int c = cols;
     dim3 grid(v_heads, (HD + c - 1) / c, batch);
-#define SI_GDN_AR_B(C_)                                                                    \
-    gdn_ar_fast_batched_kernel<C_, HD><<<grid, (C_) * 32, 0, stream>>>(                    \
+#define SI_GDN_AR_B(C_, B_)                                                                \
+    gdn_ar_fast_batched_kernel<C_, HD, B_><<<grid, (C_) * 32, 0, stream>>>(                    \
         reinterpret_cast<const __nv_bfloat16*>(q_bf16),                                    \
         reinterpret_cast<const __nv_bfloat16*>(k_bf16),                                    \
         reinterpret_cast<const __nv_bfloat16*>(v_bf16),                                    \
@@ -673,9 +721,12 @@ bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const 
         reinterpret_cast<const __nv_bfloat16*>(a_bf16),                                    \
         states, state_off, reinterpret_cast<__nv_bfloat16*>(out_bf16),                     \
         q_heads, v_heads, qh_block, state_bf16)
-    if (c == 4)       SI_GDN_AR_B(4);
-    else if (c == 16) SI_GDN_AR_B(16);
-    else              SI_GDN_AR_B(8);
+#define SI_GDN_AR_B_SEL(C_)  do { if (state_compact_b16) SI_GDN_AR_B(C_, true); \
+                                  else                   SI_GDN_AR_B(C_, false); } while (0)
+    if (c == 4)       SI_GDN_AR_B_SEL(4);
+    else if (c == 16) SI_GDN_AR_B_SEL(16);
+    else              SI_GDN_AR_B_SEL(8);
+#undef SI_GDN_AR_B_SEL
 #undef SI_GDN_AR_B
     return true;
 }
@@ -685,7 +736,7 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
                           const void* dt_bf16, const void* a_bf16,
                           float* state_f32, void* out_bf16,
                           int q_heads, int v_heads, int head_dim, bool qh_block,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, bool state_compact_b16) {
     static const bool state_bf16 = [] {
         const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
         return e && e[0] == '1';
@@ -695,7 +746,9 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
     // run — the static flag guarantees that. Requires head_dim a multiple of 32 (128 -> NROW=4).
     static int fast = -1;
     if (fast < 0) { const char* e = getenv("SPARKINFER_GDN_FAST"); fast = (e && e[0] == '0') ? 0 : 1; }
-    if (fast && head_dim == 128) {                            // Qwen3.6/Qwythos linear_head_dim=128
+    // `state_compact_b16` forces the fast path: it is the only single-row kernel that understands
+    // the compacted form, and a session that holds one must never reach a kernel that does not.
+    if ((fast || state_compact_b16) && head_dim == 128) {      // Qwen3.6/Qwythos linear_head_dim=128
         static int cols = -1;
         if (cols < 0) {
             const char* e = getenv("SPARKINFER_GDN_FAST_COLS");
@@ -706,40 +759,24 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
         constexpr int HD = 128;
         const int c = cols;
         dim3 grid(v_heads, (HD + c - 1) / c);
-        if (c == 4) {
-            gdn_ar_fast_kernel<4, HD><<<grid, 4 * 32, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
-                state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
-                q_heads, v_heads, (bool)qh_block, state_bf16);
-        } else if (c == 16) {
-            gdn_ar_fast_kernel<16, HD><<<grid, 16 * 32, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
-                state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
-                q_heads, v_heads, (bool)qh_block, state_bf16);
-        } else {
-            gdn_ar_fast_kernel<8, HD><<<grid, 8 * 32, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
-                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
-                state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
-                q_heads, v_heads, (bool)qh_block, state_bf16);
-        }
+#define SI_GDN_AR_ONE(C_, B_)                                                              \
+        gdn_ar_fast_kernel<C_, HD, B_><<<grid, (C_) * 32, 0, stream>>>(                    \
+            reinterpret_cast<const __nv_bfloat16*>(q_bf16),                                \
+            reinterpret_cast<const __nv_bfloat16*>(k_bf16),                                \
+            reinterpret_cast<const __nv_bfloat16*>(v_bf16),                                \
+            reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),                            \
+            reinterpret_cast<const __nv_bfloat16*>(beta_bf16),                              \
+            reinterpret_cast<const __nv_bfloat16*>(dt_bf16),                                \
+            reinterpret_cast<const __nv_bfloat16*>(a_bf16),                                 \
+            state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),                          \
+            q_heads, v_heads, (bool)qh_block, state_bf16)
+#define SI_GDN_AR_ONE_SEL(C_) do { if (state_compact_b16) SI_GDN_AR_ONE(C_, true);         \
+                                   else                   SI_GDN_AR_ONE(C_, false); } while (0)
+        if (c == 4)       SI_GDN_AR_ONE_SEL(4);
+        else if (c == 16) SI_GDN_AR_ONE_SEL(16);
+        else              SI_GDN_AR_ONE_SEL(8);
+#undef SI_GDN_AR_ONE_SEL
+#undef SI_GDN_AR_ONE
         return;
     }
     static int warpgrid = -1;

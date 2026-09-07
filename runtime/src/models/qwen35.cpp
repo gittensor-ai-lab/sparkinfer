@@ -168,6 +168,10 @@ bool is_linear_layer(const Qwen35Config& c, int layer) {
 struct SessionBuffers {
     float* lin_state = nullptr;
     bf16* lin_conv_state = nullptr;
+    // This session's GDN state has been compacted to bf16 in the first half of lin_state (see
+    // launch_qwen36_gdn_state_to_b16). Set only for sessions that have gone through
+    // decode_packed; a speculative-decode session never has, and neither does session 0.
+    bool lin_state_b16 = false;
     // Per-request running count of how many times each vocab id has appeared in THIS session's
     // generated completion so far -- for presence_penalty/frequency_penalty. Unlike lin_state/
     // lin_conv_state (hybrid-architecture-only), this exists for EVERY model. vocab-sized, alloc'd
@@ -241,6 +245,11 @@ struct Qwen35Model::Impl {
     // The NVFP4 LM-head operand, held here rather than in `owned` because it is releasable.
     void* lm_head_fp4_payload = nullptr;
     void* lm_head_fp4_sf_buf = nullptr;
+    // Scratch for the one-off GDN state compaction; sized for one session's state, reused by all.
+    void* gdn_state_stage = nullptr;
+    // Mirrors sessions[active_seq_id].lin_state_b16, swapped by activate_session() exactly the way
+    // lin_state/lin_conv_state are.
+    bool active_lin_state_b16 = false;
     // Reusable device pointer arrays for packed decode (see Qwen35Model::decode_packed). Their
     // ADDRESSES are baked into the packed graph; their CONTENTS are rewritten every step, which
     // is what lets one graph per row count serve any set of sessions.
@@ -764,6 +773,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
 Qwen35Model::~Qwen35Model() {
     if (p_->lm_head_fp4_payload) cudaFree(p_->lm_head_fp4_payload);
     if (p_->lm_head_fp4_sf_buf) cudaFree(p_->lm_head_fp4_sf_buf);
+    if (p_->gdn_state_stage) cudaFree(p_->gdn_state_stage);
     for (void* b : p_->owned) cudaFree(b);
     cudaFree(p_->x); cudaFree(p_->xn); cudaFree(p_->q); cudaFree(p_->k); cudaFree(p_->v);
     cudaFree(p_->attn); cudaFree(p_->ao); cudaFree(p_->h); cudaFree(p_->hn);
@@ -1584,11 +1594,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_ab, 0);
             float* layer_state = s.lin_state +
                 (size_t)L * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+            // The compacted-state flag belongs to the ACTIVE session: a packed batch that declines
+            // (a tail chunk of one row) falls back to this path for rows whose state has already
+            // been converted, so the two must agree on the representation.
             kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
                                           s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
                                           layer_state, s.lin_gdn,
                                           c.linear_q_heads, c.linear_v_heads,
-                                          c.linear_head_dim, c.gdn_qh_block, st);
+                                          c.linear_head_dim, c.gdn_qh_block, st,
+                                          s.active_lin_state_b16);
             if (gdn_pipelined && !gdn_fused_proj) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
             const bool gdn_gn_q8 = s.gguf && s.use_pq && s.use_llama &&
                                    (w.ssm_out_type == 12 || w.ssm_out_type == 8) &&
@@ -3040,6 +3054,13 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                         "prefill (the scratch arena needs the VRAM more)\n", n);
         release_lm_head_fp4();
     }
+    // Batched prefill is position-0 only and writes the whole recurrent state as fp32, so a
+    // session that had been compacted is back on the fp32 form afterwards.
+    {
+        auto sit = s.sessions.find(s.active_seq_id);
+        if (sit != s.sessions.end()) sit->second.lin_state_b16 = false;
+        s.active_lin_state_b16 = false;
+    }
     auto it = s.sessions.find(s.active_seq_id);
     float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;
     bf16* lin_conv = (it != s.sessions.end()) ? it->second.lin_conv_state : s.lin_conv_state;
@@ -3334,6 +3355,41 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         s.packed_rows_valid = n;
     }
 
+    // Compact this batch's recurrent state to bf16, once per session. A packed row is by
+    // definition a continuous-batch row -- decode_packed is the only caller that sets packed_rows,
+    // and DSpark's verify never does -- so this is exactly the scope the bf16 state is safe in
+    // (see the note over gdn_ar_fast_kernel). Session 0 is excluded: it is the shared prefix
+    // session, whose state is snapshotted and replayed as fp32 by cache_prefix().
+    static const bool kGdnStateB16 = [] {
+        const char* e = getenv("SPARKINFER_CB_GDN_STATE_B16");
+        return !(e && e[0] == '0');
+    }();
+    bool packed_state_b16 = false;
+    if (kGdnStateB16 && s.cfg.hybrid) {
+        const size_t st_n = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
+                            s.cfg.linear_head_dim * s.cfg.linear_head_dim;
+        bool all_b16 = true;
+        for (int i = 0; i < n; i++) {
+            auto sit = s.sessions.find(seq_ids[i]);
+            if (sit == s.sessions.end() || seq_ids[i] == 0) { all_b16 = false; continue; }
+            if (sit->second.lin_state_b16) continue;
+            if (!s.gdn_state_stage &&
+                cudaMalloc(&s.gdn_state_stage, st_n * sizeof(bf16)) != cudaSuccess) {
+                s.gdn_state_stage = nullptr;
+                all_b16 = false;
+                break;
+            }
+            if (kernels::launch_qwen36_gdn_state_to_b16(sit->second.lin_state, s.gdn_state_stage,
+                                                        st_n, s.stream)) {
+                sit->second.lin_state_b16 = true;
+                if (seq_ids[i] == s.active_seq_id) s.active_lin_state_b16 = true;
+            } else {
+                all_b16 = false;
+            }
+        }
+        packed_state_b16 = all_b16;
+    }
+
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, seq_ids[0],
                           h_states[0], h_convs[0], s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
@@ -3344,6 +3400,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     ctx.packed_rows      = reinterpret_cast<const int* const*>(s.packed_dev_tables);
     ctx.packed_lin_state = reinterpret_cast<float* const*>(s.packed_dev_states);
     ctx.packed_lin_conv  = reinterpret_cast<void* const*>(s.packed_dev_convs);
+    ctx.packed_state_b16 = packed_state_b16;
     const int consumed = dflash_verify_short_run(ctx, tokens, n, positions[0],
                                                  nullptr, 0, nullptr, out_sampled);
     return consumed == n;
@@ -3388,6 +3445,7 @@ void Qwen35Model::activate_session(uint64_t seq_id) {
         if (s.cfg.hybrid) {
             s.lin_state = it->second.lin_state;
             s.lin_conv_state = it->second.lin_conv_state;
+            s.active_lin_state_b16 = it->second.lin_state_b16;
         }
         // penalty_counts/logit_bias swap for EVERY model (hybrid or not) -- unlike lin_state/
         // lin_conv_state above, these aren't architecture-specific, they're per-request sampling-

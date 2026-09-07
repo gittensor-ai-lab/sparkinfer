@@ -85,6 +85,8 @@ struct Qwen35PrefillCtx {
     const int* const*    packed_rows      = nullptr;
     float* const*        packed_lin_state = nullptr;
     void* const*         packed_lin_conv  = nullptr;
+    // The packed rows' recurrent state is the compacted bf16 form (see Qwen35Model::decode_packed).
+    bool                 packed_state_b16 = false;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
