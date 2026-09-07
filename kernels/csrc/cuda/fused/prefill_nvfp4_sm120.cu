@@ -467,6 +467,32 @@ bool prefer_narrow(int m, int n) {
     // grid to still fit ONE wave (2*ceil(n/128) <= sms) keeps gate/up wide and leaves wo (52 CTAs)
     // and q|gate|k|v (68) narrow. Measured cold-L2 at m=128, us: gate/up narrow 60.51 -> wide 56.19;
     // wo wide 25.02 -> narrow 21.63; qkvg wide 39.14 -> narrow 31.84.
+    // ...but only down to the widths this rule was measured at. Continuous-batch decode (#990,
+    // #991) runs these same GEMMs at m=16..32, and there the premise above is inverted. Halving N
+    // buys memory parallelism only while the kernel is bandwidth-bound, which it is at m=128. At
+    // m <= 32 the M tile is already computing 4-8x the rows the batch needs -- and it cannot be
+    // shrunk, because the NVFP4 scale-factor atom is 32x4 = 128 rows in M, so an M=64 tile fails
+    // the SFA TMA copy and M=32 fails the epilogue's MMA_TILE_M | EPI_TILE_M check. The kernel is
+    // therefore tile-throughput bound at these widths, and a narrower N tile only wastes the tile
+    // in a second dimension on top of M.
+    //
+    // Measured on RTX 5090 at concurrency 16, on the shapes this rule selects (FFN down n=5120,
+    // GDN qkv n=10240, gate n=6144, out n=5120), narrow -> wide: mean ITL 24.60 -> 22.42 ms,
+    // aggregate 600.8 -> 653.4 tok/s. The same sweep in the other direction confirms the
+    // direction is monotonic rather than a local optimum -- taking N below 64 at these widths
+    // costs far more than it gains (128x64x256 itl 25.69, 128x32x256 31.67, 128x32x128 48.61),
+    // even though each of those fills the machine with MORE CTAs than the wide tile does.
+    //
+    // The floor is kQwen35MaxPackedRows, the widest batch the packed decode can hand us, so
+    // m=128 -- Muse Glimmer's shapes and the scored ctx=128 prefill, which is what the paragraph
+    // above was tuned on -- keeps exactly the tiling it had. 0 restores the old rule for a paired
+    // A/B out of one binary.
+    static const int wide_batch_max = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_NARROW_MIN_ROWS");
+        const int v = e ? atoi(e) : 32;
+        return v < 0 ? 0 : v;
+    }();
+    if (m <= wide_batch_max) return false;
     return on && m <= 128 && sms > 0 && 2 * ((n + 127) / 128) <= sms;
 }
 
@@ -566,6 +592,20 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
         const char* e = getenv("SPARKINFER_NVFP4_EVICT_FIRST");
         return !e || atoi(e) != 0;
     }();
+    // ...but not at wide-batch decode widths, for the same reason the narrow-N rule stops there.
+    // EVICT_FIRST tells B to surrender its L2 lines first, which is right when B is a one-shot
+    // stream far larger than L2 -- a prefill pass over the whole weight set. A packed decode step
+    // issues ~5 of these GEMMs per layer back to back over 64 layers, and hinting every one of
+    // them to self-evict discards lines the next GEMM's tail still wants. Measured at
+    // decode_tokens-matched runs: c16 650.5 -> 665.1 tok/s (mean ITL 22.52 -> 21.96), c32
+    // 851.3 -> 858.1, c8 unchanged (it never enters this GEMM).
+    // Same floor as prefer_narrow, and 0 restores the old behaviour for a paired A/B.
+    static const int ef_max = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_EVICT_FIRST_MIN_ROWS");
+        const int v = e ? atoi(e) : 32;
+        return v < 0 ? 0 : v;
+    }();
+    const bool use_ef = ef && m > ef_max;
     // Long-context: a taller/wider tile than the m=128-tuned pair above. Gated on a many-CTA-tall
     // grid so the scored ctx=128 shape is untouched, and it falls through if CUTLASS cannot
     // implement the shape.
@@ -574,7 +614,7 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
         if (run_gemm<BigM>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)) return true;
 
     }
-    if (ef)
+    if (use_ef)
         return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)
                                   : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c);
     return prefer_narrow(m,n) ? run_gemm<Narrow>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)
