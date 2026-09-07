@@ -2798,6 +2798,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // The B operands are the SAME *_fp4 / *_fp4_sf the prefill path already keeps resident, so
     // this costs no extra weight memory -- only the A-side staging and a workspace, below.
     const int fp4_kwide = (c.moe_ffn > H ? c.moe_ffn : H);
+    // Wide packed batches run the SAME block-scaled NVFP4 GEMM the dense FFN already uses, for
+    // the GDN projections as well. Those are 48 of the 64 layers and ~3.1 GB of the ~4.1 GB of
+    // per-step weight traffic that is not FFN; chunked into 8s a 32-row batch reads every one of
+    // those bytes FOUR times. Same gate as the FFN arm: the A-quantizer needs m % 8 == 0, and
+    // below 16 rows the row-GEMV is still ahead (its tile wastes most of M).
+    // SPARKINFER_PROJ_GEMM_MIN_ROWS raises or disables the threshold for an A/B in one binary.
+    static const int kProjGemmMinRows = [] {
+        const char* e = getenv("SPARKINFER_PROJ_GEMM_MIN_ROWS");
+        const int v = e ? atoi(e) : 16;
+        return v < 1 ? 1 : v;
+    }();
     unsigned char* fp4_a = nullptr; unsigned char* fp4_asf = nullptr; unsigned char* fp4_ws = nullptr;
     if (packed && c.dense_ffn) {
         const size_t ab = kernels::prefill_nvfp4_data_bytes(NA, fp4_kwide);
@@ -3370,7 +3381,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 pf_cu(cudaEventRecord(ev_fork, st), "verify gdn fork");
                 pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify gdn fork wait");
             }
-            supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H);
+            // One quantize of xn feeds both in-projections, exactly as gate/up share theirs.
+            const bool gdn_in_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
+                                     (N & 7) == 0 && w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf &&
+                                     w.gdn_z_fp4 && w.gdn_z_fp4_sf;
+            if (gdn_in_gemm)
+                supported = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, N, H, st) &&
+                            kernels::launch_prefill_nvfp4_gemm(
+                                fp4_a, fp4_asf, w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf,
+                                rq, N, lqkv, H, fp4_ws, st, w.gdn_qkv_fp4_alpha);
+            else
+                supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H);
             // alpha and beta are v_heads-wide reads of the same xn — two launches whose cost is
             // almost entirely launch/graph-node latency. One fused launch, same per-row math.
             const bool ab_fused = w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
@@ -3389,7 +3410,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bool split_ok = fork_gdn && ab_fused;
             if (split_ok) pf_cu(cudaEventRecord(ev_join_ab, s.stream_k), "verify gdn ab join");
             supported = supported &&
-                        proj_on(gst, xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H) &&
+                        (gdn_in_gemm
+                         ? kernels::launch_prefill_nvfp4_gemm(
+                               fp4_a, fp4_asf, w.gdn_z_fp4, w.gdn_z_fp4_sf,
+                               lz, N, lvdim, H, fp4_ws, st, w.gdn_z_fp4_alpha)
+                         : proj_on(gst, xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H)) &&
                         (ab_fused || (proj_on(gst, xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
                                       proj_on(gst, xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H)));
             if (fork_gdn) {
@@ -3446,7 +3471,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
                                                     c.linear_head_dim, c.rms_eps, st);
             }
-            supported = proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+            const bool gdn_out_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
+                                      (N & 7) == 0 && w.gdn_out_fp4 && w.gdn_out_fp4_sf;
+            if (gdn_out_gemm)
+                supported = kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_a, fp4_asf, N, lvdim, st) &&
+                            kernels::launch_prefill_nvfp4_gemm(
+                                fp4_a, fp4_asf, w.gdn_out_fp4, w.gdn_out_fp4_sf,
+                                ao, N, H, lvdim, fp4_ws, st, w.gdn_out_fp4_alpha);
+            else
+                supported = proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
         } else {
             // Same shape of win as the GDN block: wq is 2*qdim rows and saturates, while wk and wv
             // are kvdim rows apiece and run at well under one CTA per SM.
