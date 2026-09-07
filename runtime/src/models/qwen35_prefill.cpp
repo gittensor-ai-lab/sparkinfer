@@ -2744,6 +2744,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // one, and there is no accepted-prefix commit because every row is already a real step.
     const bool packed = s.packed_rows != nullptr;
     const int H = c.hidden, N = n, qdim = s.qdim, kvdim = s.kvdim;
+    // Every block-scaled GEMM arm below used to require `(N & 7) == 0`, because
+    // launch_prefill_nvfp4_quant_a builds the A-side scale layout in groups of eight rows. The
+    // packed decode hands us whatever the scheduler has live, so any batch of 17..31 rows that is
+    // not a multiple of eight declined EVERY arm at once and fell all the way back to the chunked
+    // row-GEMV -- measured with a host timer on the engine loop, width 17 costs 35.16 ms against
+    // 23.91 for width 16, a 47% penalty for one extra row.
+    //
+    // Rounding the GEMM's m up to the next multiple of eight removes that cliff for nothing: the
+    // block-scaled M tile is 128 whatever m is (the NVFP4 scale atom is 32x4 = 128 rows, which is
+    // why no smaller tile can be built), so the padded rows ride in a tile the GEMM was already
+    // going to run. Every arena buffer here is allocated for NA = kVerifyMaxRows = 32 rows and
+    // Ng <= 32 always, so the padding is in bounds by construction; the pad rows carry whatever
+    // the previous step left and their outputs are simply never read. Scale factors are per row,
+    // so a pad row cannot perturb a real one.
+    const int Ng = (N + 7) & ~7;
     // Host-side dispatch hint for the flash-decode split (it selects the tensor-core arm on
     // seqlen > 512 and mma_chunk >= 32). Packed rows have independent lengths, so take the
     // longest: the per-row lengths the kernel actually reads still come from `seq`.
@@ -2804,6 +2819,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // those bytes FOUR times. Same gate as the FFN arm: the A-quantizer needs m % 8 == 0, and
     // below 16 rows the row-GEMV is still ahead (its tile wastes most of M).
     // SPARKINFER_PROJ_GEMM_MIN_ROWS raises or disables the threshold for an A/B in one binary.
+    // Which full-attention projections take the GEMM arm: bit 0 = wq, bit 1 = wo, bit 2 = wk/wv
+    // (bit 2 requires bit 0, since it rides wq's quantize of xn). All by default; the bits exist
+    // so each can be measured against the others out of ONE binary.
+    static const int kAttnGemm = [] {
+        const char* e = getenv("SPARKINFER_ATTN_GEMM");
+        const int v = e ? atoi(e) : 3;
+        return (v >= 0 && v <= 7) ? v : 3;
+    }();
     static const int kProjGemmMinRows = [] {
         const char* e = getenv("SPARKINFER_PROJ_GEMM_MIN_ROWS");
         const int v = e ? atoi(e) : 16;
@@ -3383,13 +3406,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }
             // One quantize of xn feeds both in-projections, exactly as gate/up share theirs.
             const bool gdn_in_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
-                                     (N & 7) == 0 && w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf &&
+                                     w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf &&
                                      w.gdn_z_fp4 && w.gdn_z_fp4_sf;
             if (gdn_in_gemm)
-                supported = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, N, H, st) &&
+                supported = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st) &&
                             kernels::launch_prefill_nvfp4_gemm(
                                 fp4_a, fp4_asf, w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf,
-                                rq, N, lqkv, H, fp4_ws, st, w.gdn_qkv_fp4_alpha);
+                                rq, Ng, lqkv, H, fp4_ws, st, w.gdn_qkv_fp4_alpha);
             else
                 supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H);
             // alpha and beta are v_heads-wide reads of the same xn — two launches whose cost is
@@ -3413,7 +3436,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                         (gdn_in_gemm
                          ? kernels::launch_prefill_nvfp4_gemm(
                                fp4_a, fp4_asf, w.gdn_z_fp4, w.gdn_z_fp4_sf,
-                               lz, N, lvdim, H, fp4_ws, st, w.gdn_z_fp4_alpha)
+                               lz, Ng, lvdim, H, fp4_ws, st, w.gdn_z_fp4_alpha)
                          : proj_on(gst, xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H)) &&
                         (ab_fused || (proj_on(gst, xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
                                       proj_on(gst, xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H)));
@@ -3472,12 +3495,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                     c.linear_head_dim, c.rms_eps, st);
             }
             const bool gdn_out_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
-                                      (N & 7) == 0 && w.gdn_out_fp4 && w.gdn_out_fp4_sf;
+                                      w.gdn_out_fp4 && w.gdn_out_fp4_sf;
             if (gdn_out_gemm)
-                supported = kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_a, fp4_asf, N, lvdim, st) &&
+                supported = kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_a, fp4_asf, Ng, lvdim, st) &&
                             kernels::launch_prefill_nvfp4_gemm(
                                 fp4_a, fp4_asf, w.gdn_out_fp4, w.gdn_out_fp4_sf,
-                                ao, N, H, lvdim, fp4_ws, st, w.gdn_out_fp4_alpha);
+                                ao, Ng, H, lvdim, fp4_ws, st, w.gdn_out_fp4_alpha);
             else
                 supported = proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
         } else {
@@ -3491,17 +3514,61 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 (w.wq_type == kernels::SI_QTYPE_NVFP4 ||
                  w.wk_type == kernels::SI_QTYPE_NVFP4 ||
                  w.wv_type == kernels::SI_QTYPE_NVFP4)) quant_nv_rows(xn, H);
-            const bool fork_attn = fork_shared && q81_src == xn && q81_k == H;
+            const bool fork_attn = fork_shared && q81_src == xn && q81_k == H &&
+                                   !((kAttnGemm & 4) && (kAttnGemm & 1) && packed && fp4_a &&
+                                     fp4_asf && N >= kProjGemmMinRows &&
+                                     w.wq_fp4 && w.wk_fp4 && w.wv_fp4);
             cudaStream_t ast = fork_attn ? s.stream_k : st;
             if (fork_attn) {
                 pf_cu(cudaEventRecord(ev_fork, st), "verify attn fork");
                 pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify attn fork wait");
             }
-            supported = proj(xn, w.wq, w.wq_type, b8, 2 * qdim, H) &&
-                        (proj_pair_nv_on(ast, xn, w.wk, w.wk_type, w.wv, w.wv_type,
-                                         kf, vf, kvdim, H) ||
-                         (proj_on(ast, xn, w.wk, w.wk_type, kf, kvdim, H) &&
-                          proj_on(ast, xn, w.wv, w.wv_type, vf, kvdim, H)));
+            // wq (and wo below) are the last projections still chunked into 8s at wide batch:
+            // #990 took the dense FFN onto the block-scaled GEMM and #991 the GDN in/out
+            // projections, but the 16 full-attention layers were left behind. At 2*qdim rows wq
+            // is 33.3 MB per layer and wo 16.7 MB, so a 16-row batch reads 0.8 GB of them TWICE
+            // per step. Same gate as both of those arms.
+            //
+            // wk and wv deliberately stay on the row-GEMV. They are kvdim = 1024 rows, which is
+            // eight CTAs of a 128-wide tile -- 5% of the machine -- so the GEMM would be far
+            // slower than the GEMV there even reading the weights once. They are also only
+            // 2.78 MB apiece, a twentieth of what wq and wo move.
+            const bool attn_q_gemm = (kAttnGemm & 1) && packed && fp4_a && fp4_asf &&
+                                     N >= kProjGemmMinRows && w.wq_fp4 && w.wq_fp4_sf;
+            // quant_nv_rows(xn, H) above still runs unconditionally, so the int8 staging that
+            // proj_pair_nv_on expects to find already cached is there whether or not wq took the
+            // GEMM arm. Skipping it is what made an earlier attempt at this look like a win on
+            // ITL and a loss on aggregate.
+            // wk/wv off the SAME quantize of xn -- the shape prefill_batched_run already runs
+            // for this checkpoint -- is instantiated but OFF by default, because it measured
+            // WORSE. At kvdim = 1024 rows each is eight CTAs of a 128-wide tile, 5% of a 170-SM
+            // machine, and that costs more than the chunked pairwise GEMV recovers even at c32
+            // where the GEMV re-reads them four times: c16 668.3 against 677.7 for wq+wo alone,
+            // c32 901.1 against a 909.8 mean. Kept behind bit 2 so the shape can be re-checked on
+            // a machine with a different SM count without a rebuild.
+            const bool attn_kv_gemm = attn_q_gemm && (kAttnGemm & 4) &&
+                                      w.wk_fp4 && w.wk_fp4_sf && w.wv_fp4 && w.wv_fp4_sf;
+            if (attn_q_gemm)
+                supported = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st) &&
+                            kernels::launch_prefill_nvfp4_gemm(
+                                fp4_a, fp4_asf, w.wq_fp4, w.wq_fp4_sf,
+                                b8, Ng, 2 * qdim, H, fp4_ws, st, w.wq_fp4_alpha);
+            else
+                supported = proj(xn, w.wq, w.wq_type, b8, 2 * qdim, H);
+            if (attn_kv_gemm)
+                supported = supported &&
+                            kernels::launch_prefill_nvfp4_gemm(
+                                fp4_a, fp4_asf, w.wk_fp4, w.wk_fp4_sf,
+                                kf, Ng, kvdim, H, fp4_ws, st, w.wk_fp4_alpha) &&
+                            kernels::launch_prefill_nvfp4_gemm(
+                                fp4_a, fp4_asf, w.wv_fp4, w.wv_fp4_sf,
+                                vf, Ng, kvdim, H, fp4_ws, st, w.wv_fp4_alpha);
+            else
+                supported = supported &&
+                            (proj_pair_nv_on(ast, xn, w.wk, w.wk_type, w.wv, w.wv_type,
+                                             kf, vf, kvdim, H) ||
+                             (proj_on(ast, xn, w.wk, w.wk_type, kf, kvdim, H) &&
+                              proj_on(ast, xn, w.wv, w.wv_type, vf, kvdim, H)));
             if (fork_attn) {
                 pf_cu(cudaEventRecord(ev_join, s.stream_k), "verify attn join");
                 pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify attn join wait");
@@ -3566,7 +3633,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (!int8_gate_fused) {
                 kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
             }
-            supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
+            const bool attn_o_gemm = (kAttnGemm & 2) && packed && fp4_a && fp4_asf &&
+                                     N >= kProjGemmMinRows && w.wo_fp4 && w.wo_fp4_sf;
+            if (attn_o_gemm)
+                supported = kernels::launch_prefill_nvfp4_quant_a(att, fp4_a, fp4_asf, Ng, qdim, st) &&
+                            kernels::launch_prefill_nvfp4_gemm(
+                                fp4_a, fp4_asf, w.wo_fp4, w.wo_fp4_sf,
+                                ao, Ng, H, qdim, fp4_ws, st, w.wo_fp4_alpha);
+            else
+                supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
         }
         if (!supported) break;
         // DEBUG ONLY: layer-0-only sub-stage capture (ao = GDN/attn output pre-residual, h =
@@ -3637,22 +3712,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 return v < 1 ? 1 : v;
             }();
             const bool ffn_gemm = packed && topk == 1 && fp4_a && fp4_asf &&
-                                  N >= kFfnGemmMinRows && (N & 7) == 0 &&
-                                  w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf &&
-                                  w.down_fp4 && w.down_fp4_sf;
+                                  N >= kFfnGemmMinRows && w.gate_fp4 && w.gate_fp4_sf &&
+                                  w.up_fp4 && w.up_fp4_sf && w.down_fp4 && w.down_fp4_sf;
             if (ffn_gemm) {
-                bool ok = kernels::launch_prefill_nvfp4_quant_a(hn, fp4_a, fp4_asf, N, H, st) &&
+                bool ok = kernels::launch_prefill_nvfp4_quant_a(hn, fp4_a, fp4_asf, Ng, H, st) &&
                           kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.gate_fp4,
-                                                             w.gate_fp4_sf, sg, N, ffn, H,
+                                                             w.gate_fp4_sf, sg, Ng, ffn, H,
                                                              fp4_ws, st, w.gate_fp4_alpha) &&
                           kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.up_fp4,
-                                                             w.up_fp4_sf, su, N, ffn, H,
+                                                             w.up_fp4_sf, su, Ng, ffn, H,
                                                              fp4_ws, st, w.up_fp4_alpha);
                 if (ok) {
-                    kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
-                    ok = kernels::launch_prefill_nvfp4_quant_a(sh, fp4_a, fp4_asf, N, ffn, st) &&
+                    kernels::launch_prefill_swiglu(sg, su, sh, (long)Ng * ffn, st);
+                    ok = kernels::launch_prefill_nvfp4_quant_a(sh, fp4_a, fp4_asf, Ng, ffn, st) &&
                          kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.down_fp4,
-                                                            w.down_fp4_sf, routed, N, H, ffn,
+                                                            w.down_fp4_sf, routed, Ng, H, ffn,
                                                             fp4_ws, st, w.down_fp4_alpha);
                 }
                 if (!ok) {
