@@ -34,6 +34,10 @@ bool launch_prefill_nvfp4_quant_b(const void* src_bf16, void* dst_fp4, void* dst
 // folded into the block-scaled GEMM rather than run as a separate full-tensor pass.
 // c_bf16 may alias d_bf16 (the in-place x += proj form); the epilogue reads each
 // output tile before it stores it.
+size_t prefill_nvfp4_workspace_bytes_f32(int m, int n, int k);
+bool launch_prefill_nvfp4_gemm_f32(const void* a, const void* sa, const void* b,
+                                   const void* sb, void* d, int m, int n, int k,
+                                   void* ws, cudaStream_t st, float alpha = 1.f);
 bool launch_prefill_nvfp4_gemm(const void* a_fp4, const void* sfa,
                                const void* b_fp4, const void* sfb,
                                void* d_bf16, int m, int n, int k,

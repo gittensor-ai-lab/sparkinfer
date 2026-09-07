@@ -2839,6 +2839,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         size_t wb = kernels::prefill_nvfp4_workspace_bytes(NA, c.moe_ffn, H);
         const size_t wb2 = kernels::prefill_nvfp4_workspace_bytes(NA, H, c.moe_ffn);
         if (wb2 > wb) wb = wb2;
+        // ...and the LM head, when this build will run it through the block-scaled GEMM. One
+        // buffer serves whichever GEMM the pass launches, so it has to cover the widest of them
+        // or initialize() fails and the head silently falls back.
+        if (s.w.lm_head_fp4) {
+            const size_t wb3 = kernels::prefill_nvfp4_workspace_bytes_f32(NA, c.vocab, H);
+            if (wb3 > wb) wb = wb3;
+        }
         fp4_a   = a.alloc<unsigned char>(ab);
         fp4_asf = a.alloc<unsigned char>(sb);
         if (wb) fp4_ws = a.alloc<unsigned char>(wb);
@@ -3967,7 +3974,42 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const char* e = getenv("SPARKINFER_DFLASH_VERIFY_HEAD_I8");
         return e && e[0] != '0';
     }();
-    if (verify_head_i8_on && verify_head_i8) {
+    // Wide packed decode: run the head as ONE block-scaled GEMM over the checkpoint's own NVFP4
+    // weights instead of chunk-of-8 Q4_K row-GEMVs over a refit of them.
+    //
+    // The Q4_K head is the single largest kernel left in a wide continuous-batch step -- 8.9% of
+    // the c16 wall and 15.5% at c32 -- and it is entirely on the critical path: forcing it onto
+    // its one-row form costs exactly the 4.60 ms/step its kernel time predicts. It reads 715 MB
+    // per launch at 670 GB/s, against the 1690 GB/s its OWN one-row twin reaches on the same
+    // bytes, and it is bound by neither of its traffic terms -- cutting the activation re-read 2x
+    // and 4x (GRP) and the weight passes 2x (MMAX=16) each measure flat, and OROWS in either
+    // direction loses. What is left is the Q4_K inner loop itself, so the way out is a different
+    // kernel, not a better shape for this one.
+    //
+    // At the vocabulary's width the GEMM is the shape CUTLASS wants: n=248320 is 1940 CTAs of the
+    // wide tile, eleven waves of a 170-SM part, where the FFN's own decode GEMMs get 40 to 136.
+    // And it collapses four chunked launches at c32 into one pass over the weights.
+    //
+    // Scoped to N >= kHeadGemmMinRows, which no speculative verify reaches (the proposal ceiling
+    // is the draft's block size, 7 here): AR decode, the verify, prefill and every accuracy and
+    // acceptance gate keep reading the Q4_K head byte for byte. This changes the wide packed
+    // decode path only.
+    static const int kHeadGemmMinRows = [] {
+        const char* e = getenv("SPARKINFER_Q38_HEAD_GEMM_MIN_ROWS");
+        const int v = e ? atoi(e) : 16;
+        return v < 1 ? 1 : v;
+    }();
+    if (packed && N >= kHeadGemmMinRows && !(N & 7) && s.w.lm_head_fp4 && s.w.lm_head_fp4_sf &&
+        fp4_a && fp4_asf) {
+        head_ok = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, N, H, st) &&
+                  kernels::launch_prefill_nvfp4_gemm_f32(fp4_a, fp4_asf, s.w.lm_head_fp4,
+                                                         s.w.lm_head_fp4_sf, logits,
+                                                         N, c.vocab, H, fp4_ws, st,
+                                                         s.w.lm_head_fp4_alpha);
+    }
+    if (head_ok) {
+        // served by the block-scaled GEMM above
+    } else if (verify_head_i8_on && verify_head_i8) {
         head_ok = kernels::launch_gemv_i8_q81_multirow_f32(
             q81, verify_head_i8, verify_head_scale, logits, c.vocab, H, N, st);
     } else if (s.w.lm_head_type == 12) {

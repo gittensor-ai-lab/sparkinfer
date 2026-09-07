@@ -124,12 +124,14 @@ struct MmaEvictFirstB : Base {
     }
 };
 
-template <class TileShape, bool EvictFirstB = false>
+template <class TileShape, bool EvictFirstB = false, class ElemD = BF>
 struct Cfg {
+    // Alignment is 128 bits / sizeof(element): 8 for bf16, 4 for float.
+    static constexpr int kAlignD = 16 / (int)sizeof(ElemD);
     using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, TileShape, Cluster,
         cutlass::epilogue::collective::EpilogueTileAuto, float, float,
-        BF, cutlass::layout::RowMajor, 8, BF, cutlass::layout::RowMajor, 8,
+        ElemD, cutlass::layout::RowMajor, kAlignD, ElemD, cutlass::layout::RowMajor, kAlignD,
         cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
     using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
         cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
@@ -167,6 +169,10 @@ using NarrowEF = Cfg<Shape<_128, _64, _256>, true>;
 // -- and non-power-of-two tiles fail cute's stride-divisibility and the epilogue's
 // MMA_TILE_M | EPI_TILE_M check, so 256x128x128 is the reachable optimum.
 using BigM = Cfg<Shape<_256, _128, _128>, true>;
+// Same wide tile, float output. The LM head is the one GEMM in this runtime whose destination is
+// the logit buffer rather than an activation, and logits are float: rounding them to bf16 would
+// put ties into argmax that the Q4_K head it replaces does not have.
+using WideF32 = Cfg<Shape<_128, _128, _256>, false, float>;
 // M is the axis that pays (256x128 beat 128x128 by 6.7% at m=16384 while 128x256 lost 14%), so
 // probe further up it. K stays >=128: at 64 the mainloop has too few elements per stage to cover
 // its own latency and the GEMM collapses (measured 2494 pp, a 4x loss).
@@ -431,9 +437,10 @@ typename C::Gemm::Arguments args(const void* a, const void* sa, const void* b, c
     // beta MUST stay 0: the epilogue skips the C load entirely on beta == 0, and a non-zero beta
     // over a null pointer faults.
     const float beta = c ? 1.f : 0.f;
+    using ED = typename C::Gemm::ElementD;
     return {cutlass::gemm::GemmUniversalMode::kGemm, shape(m,n,k),
             {static_cast<const cutlass::float_e2m1_t*>(a), as, static_cast<const cutlass::float_e2m1_t*>(b), bs, static_cast<const cutlass::float_ue4m3_t*>(sa), sfa_layout(m,n,k), static_cast<const cutlass::float_ue4m3_t*>(sb), sfb_layout(m,n,k)},
-            {{alpha, beta}, static_cast<const BF*>(c), cs, static_cast<BF*>(d), ds}};
+            {{alpha, beta}, static_cast<const ED*>(c), cs, static_cast<ED*>(d), ds}};
 }
 
 int sm_count() {
@@ -582,6 +589,20 @@ bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k
     quant_rows_dispatch(blocks,st,(const __nv_bfloat16*)s,(unsigned char*)d,
                         (cutlass::float_ue4m3_t*)sf,n,k,l);
     return cudaPeekAtLastError() == cudaSuccess;
+}
+size_t prefill_nvfp4_workspace_bytes_f32(int m, int n, int k) {
+    return WideF32::Gemm::get_workspace_size(
+        args<WideF32>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
+}
+// Float-destination twin of launch_prefill_nvfp4_gemm. One tiling only: its single caller is the
+// LM head, whose n is the vocabulary (1940 CTAs of the wide tile at 248320 columns), so the
+// machine is covered many times over and the narrow/big-tile choices below have nothing to pick
+// between.
+bool launch_prefill_nvfp4_gemm_f32(const void* a,const void* sa,const void* b,const void* sb,
+                                   void* d,int m,int n,int k,void* ws,cudaStream_t st,
+                                   float alpha) {
+    if (!a||!sa||!b||!sb||!d||!prefill_nvfp4_supported(m,n,k)) return false;
+    return run_gemm<WideF32>(a,sa,b,sb,d,m,n,k,ws,st,alpha,nullptr);
 }
 bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const void* sb,
                                void* d,int m,int n,int k,void* ws,cudaStream_t st, float alpha,
