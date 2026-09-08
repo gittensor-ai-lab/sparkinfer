@@ -316,6 +316,47 @@ bool is_valid_utf8(const std::string& s) {
     return true;
 }
 
+// Spark-X2.5's end-of-turn marker must never reach the client, streaming or not.
+//
+// The stop token is decoded to text before the splitter sees it, so a filter that knows only
+// <|im_end|> serves "answer<|end_of_sentence|>" to the user. That is what the first live chat
+// completion against this model actually returned. Covers the marker arriving whole in one piece
+// (the common case -- it is the terminal token) and split across two.
+bool test_spark25_end_marker_never_reaches_client() {
+    const std::string eos = "<\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81"
+                            "sentence" "\xef\xbd\x9c" ">";
+
+    {   // whole marker in a single piece, thinking off
+        sparkinfer_server::ThinkingStreamSplitter sp(false, false);
+        std::string got;
+        got += sp.feed("red, green, blue").content;
+        got += sp.feed(eos).content;
+        sparkinfer_server::ThinkingStreamSplitter::Delta tail;
+        sp.finish(tail);
+        got += tail.content;
+        CHECK(got == "red, green, blue");
+    }
+    {   // marker split across two pieces: the first half must be held back, not emitted
+        sparkinfer_server::ThinkingStreamSplitter sp(false, false);
+        std::string got;
+        got += sp.feed("blue").content;
+        const std::string half = eos.substr(0, 9);
+        got += sp.feed(half).content;
+        CHECK(got == "blue");                      // nothing of the marker escaped yet
+        got += sp.feed(eos.substr(9)).content;
+        sparkinfer_server::ThinkingStreamSplitter::Delta tail;
+        sp.finish(tail);
+        got += tail.content;
+        CHECK(got == "blue");
+    }
+    {   // non-streaming parser strips it off the tail too
+        const sparkinfer_server::ParsedAssistantOutput out =
+            sparkinfer_server::parse_assistant_output("red, green, blue" + eos, false, false, nullptr);
+        CHECK(out.content == "red, green, blue");
+    }
+    return true;
+}
+
 // Spark-X2.5's rendered prompt, byte for byte against chat_template.jinja.
 //
 // The point of asserting the FULL string rather than spot-checking markers: the turn envelope is
@@ -395,6 +436,7 @@ int main() {
     if (!test_gpt2_bytelevel_decode_empty_piece()) return 1;
     if (!test_gpt2_bytelevel_decode_printable_ascii_roundtrip()) return 1;
     if (!test_spark25_chat_template_renders_exact_markers()) return 1;
+    if (!test_spark25_end_marker_never_reaches_client()) return 1;
     std::printf("chat_tokenizer_test: OK\n");
     return 0;
 }

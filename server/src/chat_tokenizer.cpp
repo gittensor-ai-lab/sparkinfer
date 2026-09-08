@@ -136,6 +136,12 @@ constexpr const char* kMgMessage = "<|message|>";
 constexpr const char* kMgEot = "<|eot|>";
 constexpr const char* kMgEom = "<|eom|>";
 
+// Spark-X2.5's end-of-turn marker, U+FF5C / U+2581 as in its chat template. Split across adjacent
+// literals for the same reason apply_spark25_chat_template splits its own: "\x9cend" would lex as
+// the single escape \x9ce, since a C++ hex escape consumes every hex digit that follows it.
+constexpr const char* kSparkEos = "<\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81"
+                                  "sentence" "\xef\xbd\x9c" ">";
+
 size_t marker_prefix_len(const std::string& data, const char* marker) {
     const size_t n = strlen(marker);
     const size_t max = std::min(data.size(), n > 0 ? n - 1 : 0);
@@ -157,6 +163,30 @@ size_t marker_prefix_len(const std::string& data, const std::string& marker) {
     return 0;
 }
 
+// Scan for ANY model's end-of-turn marker in one pass.
+//
+// `pos` is the earliest position at which a COMPLETE marker starts (npos if none): everything
+// from there on is terminal and must never be emitted. `hold` is how many trailing bytes could
+// still be the start of a marker split across this chunk and the next, and so must be carried
+// rather than emitted. Taking the max hold across markers is the safe direction -- holding a byte
+// too long only delays it to the next chunk, while emitting one too early puts marker text in
+// front of the user permanently.
+//
+// Checking every known marker unconditionally, instead of switching on the model, is deliberate:
+// the streaming path is where a leaked marker is unrecoverable (the client has already rendered
+// it), and no vocabulary here contains more than one of these strings.
+struct EndMarkerScan { size_t pos; size_t hold; };
+EndMarkerScan scan_end_markers(const std::string& data) {
+    EndMarkerScan r{std::string::npos, 0};
+    for (const char* m : {kImEnd, kSparkEos}) {
+        const size_t p = data.find(m);
+        if (p < r.pos) r.pos = p;
+        const size_t k = marker_prefix_len(data, m);
+        if (k > r.hold) r.hold = k;
+    }
+    return r;
+}
+
 void trim_leading_ws(std::string& s) {
     while (!s.empty() && (s[0] == '\n' || s[0] == '\r' || s[0] == ' ' || s[0] == '\t')) s.erase(0, 1);
 }
@@ -166,9 +196,22 @@ void trim_trailing_ws(std::string& s) {
         s.pop_back();
 }
 
+// Strip whichever end-of-turn marker this model uses off the tail of a completed message.
+//
+// The stop token itself is decoded into the text before it reaches here, so without this the
+// marker is served to the client as part of the assistant's content -- which is exactly what
+// Spark-X2.5 did on its first live request ("red, green, blue<|end_of_sentence|>"). Both markers
+// are checked unconditionally rather than switched on the model: they cannot collide (no vocab
+// contains both), and a stripper that has to be told which model it is looking at is a stripper
+// that gets it wrong the next time a model is added.
 void strip_trailing_im_end(std::string& s) {
-    const size_t n = strlen(kImEnd);
-    if (s.size() >= n && s.compare(s.size() - n, n, kImEnd) == 0) s.resize(s.size() - n);
+    for (const char* marker : {kImEnd, kSparkEos}) {
+        const size_t n = strlen(marker);
+        if (s.size() >= n && s.compare(s.size() - n, n, marker) == 0) {
+            s.resize(s.size() - n);
+            break;
+        }
+    }
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
 }
 
@@ -625,12 +668,12 @@ ThinkingStreamSplitter::Delta ThinkingStreamSplitter::feed(const std::string& pi
         // string but only ran in finish(), long after a streaming client had already rendered
         // it. Search for the complete marker first and drop it (and never emit anything after
         // it -- it's the terminal marker) before falling back to the partial-suffix holdback.
-        const size_t im_end_pos = data.find(kImEnd);
-        if (im_end_pos != std::string::npos) {
-            if (im_end_pos > 0) out.content += data.substr(0, im_end_pos);
+        const EndMarkerScan scan = scan_end_markers(data);
+        if (scan.pos != std::string::npos) {
+            if (scan.pos > 0) out.content += data.substr(0, scan.pos);
             return out;
         }
-        const size_t keep = marker_prefix_len(data, kImEnd);
+        const size_t keep = scan.hold;
         const size_t emit_len = data.size() - keep;
         if (emit_len > 0) out.content += data.substr(0, emit_len);
         if (keep > 0) carry_ = data.substr(emit_len);
@@ -686,15 +729,15 @@ ThinkingStreamSplitter::Delta ThinkingStreamSplitter::feed(const std::string& pi
 
         if (phase_ == Phase::kInAnswer) {
             std::string chunk = filter_answer_chunk(carry_, data);
-            // Same fix as the !enable_thinking_ path above: a complete <|im_end|> arriving
+            // Same fix as the !enable_thinking_ path above: a complete end marker arriving
             // whole in `chunk` (the common case) was never matched by marker_prefix_len's
             // partial-suffix-only check, so it sailed straight into out.content.
-            const size_t im_end_pos = chunk.find(kImEnd);
-            if (im_end_pos != std::string::npos) {
-                if (im_end_pos > 0) out.content += chunk.substr(0, im_end_pos);
+            const EndMarkerScan scan = scan_end_markers(chunk);
+            if (scan.pos != std::string::npos) {
+                if (scan.pos > 0) out.content += chunk.substr(0, scan.pos);
                 break;
             }
-            const size_t keep = marker_prefix_len(chunk, kImEnd);
+            const size_t keep = scan.hold;
             if (keep > 0 && keep == chunk.size()) {
                 carry_ = chunk;
                 break;
