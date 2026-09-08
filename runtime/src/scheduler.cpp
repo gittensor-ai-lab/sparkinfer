@@ -18,22 +18,52 @@
 namespace sparkinfer {
 
 namespace {
-// How many prefills one iteration may admit while the decode batch is still filling. 1 restores
-// the previous behaviour exactly, for a paired A/B out of one binary.
-int prefills_per_step() {
-    static const int v = [] {
-        const char* e = getenv("SPARKINFER_PREFILLS_PER_STEP");
-        const int x = e ? atoi(e) : 2;
-        return x < 1 ? 1 : x;
-    }();
-    return v;
-}
 // The decode width above which a step is no longer dominated by its fixed weight read. Defaults
 // to the packed-decode ceiling; below it a wider batch is very nearly free.
 int packed_decode_width() {
     static const int v = [] {
         const char* e = getenv("SPARKINFER_WIDE_DECODE_ROWS");
         const int x = e ? atoi(e) : 32;
+        return x < 1 ? 1 : x;
+    }();
+    return v;
+}
+// How many prefills one iteration may admit while the decode batch is still filling. 1 restores
+// the pre-#994 behaviour; 2 restores #994's, for a paired A/B out of one binary.
+//
+// This was 2 because that is the step #994 measured: it went from admitting ONE row per
+// iteration to two, and stopped there. Two is not a property of the trade -- it is where the
+// measurement stopped. The cost of admitting another prefill is one more row in this iteration's
+// packed forward, and #990/#992/#993 made that row nearly free up to `packed_decode_width()`
+// rows: the packed decode reads the whole ~15 GB weight set once per step whatever the width, so
+// every row admitted before the batch reaches that width is amortized against a read the step
+// was going to do anyway. What the cap actually costs is TIME AT A NARROW WIDTH -- every
+// iteration spent ramping is an iteration paying the full weight read for a fraction of the
+// rows.
+//
+// So the bound is the width the batch is ramping TOWARD, which is the same
+// `packed_decode_width()` the `deep_ramp` gate below is already written against, not a fixed 2.
+// Measured on an RTX 5090 at the bot's own invocation (qwen3_gguf_cb_bench <model> C 256 256 512),
+// aggregate tok/s, two interleaved repeats per arm out of ONE binary:
+//
+//   admit/step      2 (main)      6        8       12       16       32
+//   c16              790.80    805.55   810.15   811.70   815.80        -
+//   c32             1296.80         -        -        -  1370.15   1379.30
+//
+// Monotone in the cap at both widths, and mean ITL falls with it (c32 21.29 -> 19.74 ms), so
+// this is not a latency-for-throughput trade on the mean. It IS one on the tail: a deep ramp now
+// admits its whole backlog in one iteration, and max ITL over the run moves from ~103 ms to
+// 94-879 ms depending on where the burst lands. #994 made exactly this trade once already
+// (+29 ms max ITL for +4.3% at c32) and documented it; this takes the same trade to the end of
+// the curve.
+//
+// Narrow concurrencies cannot see any of it: `deep_ramp` requires (pending + have) * 2 >= width,
+// i.e. 16 in flight, so c1/c2/c4/c8 keep allow == 1 and the previous scheduler byte for byte.
+// Measured, same binary, admit/step 2 -> 32: c4 345.3 -> 345.5, c8 538.0 -> 538.5.
+int prefills_per_step() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_PREFILLS_PER_STEP");
+        const int x = e ? atoi(e) : packed_decode_width();
         return x < 1 ? 1 : x;
     }();
     return v;
