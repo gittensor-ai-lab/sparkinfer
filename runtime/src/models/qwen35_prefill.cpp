@@ -164,7 +164,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // for the rest, and nothing downstream can tell that apart from a clean state or undo it.
     if (pos0 < 0) return -1;
     if (pos0 != 0) {
-        if (c.muse_glimmer) return -1;   // rolling-window SWA attention indexes from token 0
+        // Muse used to refuse here because its rolling-window attention took the window and the
+        // causal bound from the LOCAL row index, which is only the sequence position on a pass
+        // that starts at zero. Both Muse kernels now take q_pos0 and mask on the absolute
+        // position, so a windowed ingest is exact -- and above prefill_single_pass_max_tokens()
+        // that is the difference between the batched path and the token loop for the WHOLE prompt.
         if (s.capture_dst && s.capture_layers && s.n_capture > 0) return -1;  // DSpark capture rows
     }
 
@@ -1634,18 +1638,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     void* vscale = (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2;
                     kernels::launch_prefill_qknorm_ropenorm_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
                         kpool8, vpool8, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads,
-                        c.head_dim, muse_rot, rope_theta, eps, bs, mbs, st);
+                        c.head_dim, muse_rot, rope_theta, eps, bs, mbs, st, pos0);
                     kernels::launch_prefill_attn_swa_pure_int8(qb, kpool8, vpool8, kscale, vscale,
                         btable, att, N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
-                        win_blocks, st);
+                        win_blocks, st, pos0);
                 } else {
                     bf16* kpool_bf = (bf16*)s.kv->k_pool() + s.kv->layer_base_elems(L);
                     bf16* vpool_bf = (bf16*)s.kv->v_pool() + s.kv->layer_base_elems(L);
                     kernels::launch_prefill_qknorm_ropenorm_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
                         kpool_bf, vpool_bf, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                        muse_rot, rope_theta, eps, bs, mbs, st);
+                        muse_rot, rope_theta, eps, bs, mbs, st, pos0);
                     kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, btable, att,
-                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks, st);
+                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks,
+                        st, pos0);
                 }
             } else {
                 signed char* kpool = (signed char*)s.kv->k_pool() + s.kv->layer_base_elems(L) * kv_elem;
