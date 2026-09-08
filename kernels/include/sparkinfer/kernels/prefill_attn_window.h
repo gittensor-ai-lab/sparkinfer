@@ -44,5 +44,15 @@ void launch_prefill_attn_swa_pure_bf16(
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
     cudaStream_t stream = nullptr);
 
+// INT8-KV counterpart of the above (Muse Glimmer at ctx >= 4096, where the cache is int8). Same
+// pure-window contract: win_blocks>0 => last win_blocks blocks (SWA layers); win_blocks<=0 =>
+// full causal (global/NoPE layers).
+void launch_prefill_attn_swa_pure_int8(
+    const void* q, const signed char* k_pool, const signed char* v_pool,
+    const void* k_scale, const void* v_scale, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks,
+    cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace sparkinfer

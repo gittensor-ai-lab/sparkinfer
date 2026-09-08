@@ -105,6 +105,16 @@ void launch_rope_kv_append_partial(
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
     float theta, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
 // int8-KV variant: K/V appended as int8 (per-(token,kv_head) fp16 scale), Q RoPE'd bf16 in-place.
+// int8-KV decode append for Muse Glimmer: NORMAL (consecutive-pair) RoPE on SWA layers,
+// NoPE on the global ones (rope_normal == false). Muse's bf16 append wrote two-byte values into a
+// one-byte-per-element int8 pool, which is why ctx >= 4096 produced garbage.
+void launch_muse_kv_append_int8(void* q, const void* k, const void* v,
+                                void* k_pool, void* v_pool, void* k_scale, void* v_scale,
+                                const int* block_table, const int* positions,
+                                int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+                                float theta, bool rope_normal,
+                                int block_size, int max_blocks_per_seq, cudaStream_t stream);
+
 void launch_rope_kv_append_partial_int8(
     void* q, const void* k, const void* v, void* k_pool, void* v_pool, void* k_scale, void* v_scale,
     const int* block_table, const int* positions,

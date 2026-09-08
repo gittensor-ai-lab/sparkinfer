@@ -258,7 +258,12 @@ __global__ void win_prefill_windowed_kernel(
 // identical to the kernels above; only the schedule (and thus fp32 rounding
 // order) changes. SPARKINFER_PREFILL_ATTN_LANEPAR=0 restores the old kernels.
 // ----------------------------------------------------------------------------
-template <int HEAD_DIM, int QPW, int TK, bool WINDOWED>
+// SINK=false drops the always-attended block 0, giving a PURE sliding window -- the contract
+// Muse Glimmer's layers use (and the one win_prefill_lanepar_bf16_kernel below implements over a
+// bf16 pool). NWARP is templated for the same reason that kernel templates it: Muse's short
+// prefill wants a narrower block and more of them. Both default to today's values, so every
+// existing instantiation compiles to exactly the code it did before.
+template <int HEAD_DIM, int QPW, int TK, bool WINDOWED, bool SINK = true, int NWARP = 16>
 __global__ void win_prefill_lanepar_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
@@ -267,7 +272,6 @@ __global__ void win_prefill_lanepar_kernel(
     int block_size, int max_blocks_per_seq, float scale, int win_blocks) {
     constexpr int ELEMS = HEAD_DIM / 32;
     constexpr int KSTRIDE = HEAD_DIM + 4;   // +4 floats: lane-strided rows hit 32 banks, 16B-aligned
-    constexpr int NWARP = 16;
     constexpr int TQ = NWARP * QPW;         // queries per block
     static_assert(TK == 32, "one key per lane");
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -278,8 +282,10 @@ __global__ void win_prefill_lanepar_kernel(
     const bool active = (q0 < n_tokens) && (head < n_q_heads);
 
     auto win_start = [&](int t) -> int {
+        if (!SINK && win_blocks <= 0) return 0;          // pure-window layers: 0 => full causal
         const int n_blk_q = (t + block_size) / block_size;
-        const int rsb = (win_blocks >= n_blk_q - 1) ? 1 : (n_blk_q - win_blocks);
+        const int rsb = SINK ? ((win_blocks >= n_blk_q - 1) ? 1 : (n_blk_q - win_blocks))
+                             : ((win_blocks >= n_blk_q)     ? 0 : (n_blk_q - win_blocks));
         return rsb * block_size;
     };
 
@@ -343,7 +349,7 @@ __global__ void win_prefill_lanepar_kernel(
 #pragma unroll
                 for (int i = 0; i < QPW; i++) {
                     if (WINDOWED) {
-                        const bool insink = kpos < block_size;
+                        const bool insink = SINK && (kpos < block_size);
                         const bool inwin = (kpos >= my_rs[i]) && (kpos <= qtok[i]);
                         in[i] = live && (insink || inwin) && (qtok[i] < n_tokens);
                     } else {
@@ -418,8 +424,8 @@ __global__ void win_prefill_lanepar_kernel(
     };
 
     if (WINDOWED) {
-        if (blk_rs > block_size) run_range(0, block_size);
-        const int wlo = (blk_rs > block_size) ? blk_rs : 0;
+        if (SINK && blk_rs > block_size) run_range(0, block_size);
+        const int wlo = SINK ? ((blk_rs > block_size) ? blk_rs : 0) : blk_rs;
         run_range(wlo, last_q + 1);
     } else {
         run_range(0, last_q + 1);
@@ -911,6 +917,32 @@ void launch_prefill_attn_swa_pure_bf16(
         reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
         reinterpret_cast<__nv_bfloat16*>(attn),
         n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks);
+}
+
+// INT8-KV counterpart of launch_prefill_attn_swa_pure_bf16, for Muse Glimmer at ctx >= 4096 where
+// the cache is int8. Same pure-window contract (win_blocks>0 => last win_blocks blocks, <=0 =>
+// full causal) and the same narrow-block schedule; the work is done by the in-tree int8
+// lane-parallel kernel with its sink switched off, so the dequant, the fp32 K/V tiles and the
+// online softmax are the ones the hd256 int8 layers already run.
+void launch_prefill_attn_swa_pure_int8(
+    const void* q, const signed char* k_pool, const signed char* v_pool,
+    const void* k_scale, const void* v_scale, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks,
+    cudaStream_t stream) {
+    (void)head_dim;   // Muse Glimmer attention is hd128 only; templated below.
+    constexpr int HD = 128, TK = 32, NWARP = 8, QPW = 1, TQ = NWARP * QPW;
+    // fp32 K tile (rows padded +4) + fp32 V tile + bf16 query tile == 35,328 B, under the 48 KB
+    // default, so unlike the hd256 instantiation this needs no cudaFuncSetAttribute opt-in.
+    const size_t sm = ((size_t)TK * (HD + 4) + (size_t)TK * HD) * sizeof(float)
+                    + (size_t)TQ * HD * sizeof(__nv_bfloat16);
+    dim3 g((n_tokens + TQ - 1) / TQ, n_q_heads);
+    win_prefill_lanepar_kernel<HD, QPW, TK, /*WINDOWED=*/true, /*SINK=*/false, NWARP>
+        <<<g, NWARP * 32, sm, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
+            reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
+            block_table, reinterpret_cast<__nv_bfloat16*>(attn),
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks);
 }
 
 }  // namespace kernels

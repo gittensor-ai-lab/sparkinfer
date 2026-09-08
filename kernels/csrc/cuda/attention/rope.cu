@@ -515,6 +515,85 @@ __global__ void rope_kv_append_partial_int8_kernel(
     }
 }
 
+// int8-KV decode append for Muse Glimmer. Muse's per-layer pattern is NORMAL (consecutive-pair)
+// RoPE on the SWA layers and NoPE on the global ones, and its KV write was unconditionally bf16 --
+// two-byte stores into a one-byte-per-element pool whenever the caller asked for an int8 cache,
+// which is why ctx >= 4096 (where the example mains switch the cache to int8) produced garbage.
+// Organised exactly like rope_kv_append_partial_int8_kernel: one block per (token, head-unit) with
+// blockDim == head_dim, so a whole K/V head vector reduces in-block for the per-(token, kv_head)
+// max-abs an int8 scale needs. Same scale layout the int8 flash-decode reads.
+// rope_normal == false is the NoPE global layer: pure quantize + append, Q untouched.
+__global__ void muse_kv_append_int8_kernel(
+    __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    signed char* __restrict__ k_pool, signed char* __restrict__ v_pool,
+    __half* __restrict__ k_scale, __half* __restrict__ v_scale,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, float theta, int rope_normal,
+    int block_size, int max_blocks_per_seq
+) {
+    const int tok  = blockIdx.y;
+    const int unit = blockIdx.x;          // [0,nq)=Q rope ; [nq,nq+nkv)=K ; [nq+nkv,..)=V
+    const int t    = threadIdx.x;         // 0..head_dim-1
+    const int half = head_dim >> 1;
+    const int pos    = positions[tok];
+    const int blk    = pos / block_size, within = pos % block_size;
+    const int phys   = block_table[tok * max_blocks_per_seq + blk];
+    const size_t ctok = (size_t)(phys * block_size + within);
+
+    if (unit < n_q_heads) {               // Q: NORMAL rope in place, bf16, no quantisation
+        if (rope_normal && t < half) {
+            const float freq = __powf(theta, -2.f * (float)t / (float)head_dim);
+            const float ang = (float)pos * freq, c = __cosf(ang), sn = __sinf(ang);
+            const size_t base = ((size_t)(tok * n_q_heads + unit)) * head_dim + 2 * t;
+            const float x0 = __bfloat162float(q[base]), x1 = __bfloat162float(q[base + 1]);
+            q[base]     = __float2bfloat16(x0 * c - x1 * sn);
+            q[base + 1] = __float2bfloat16(x0 * sn + x1 * c);
+        }
+        return;
+    }
+
+    const bool is_k = unit < n_q_heads + n_kv_heads;
+    const int  hh   = is_k ? (unit - n_q_heads) : (unit - n_q_heads - n_kv_heads);
+    const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+    const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+
+    // K on an SWA layer rotates the consecutive pair (2i, 2i+1); V and every NoPE layer are raw.
+    float val;
+    if (is_k && rope_normal) {
+        const int i = t >> 1;
+        const float freq = __powf(theta, -2.f * (float)i / (float)head_dim);
+        const float ang = (float)pos * freq, c = __cosf(ang), sn = __sinf(ang);
+        const float x0 = __bfloat162float(k[base + 2 * i]);
+        const float x1 = __bfloat162float(k[base + 2 * i + 1]);
+        val = (t & 1) ? (x0 * sn + x1 * c) : (x0 * c - x1 * sn);
+    } else {
+        val = __bfloat162float((is_k ? k : v)[base + t]);
+    }
+
+    __shared__ float s_red[8];            // head_dim/32 warp partials (<=256 -> <=8)
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, m));
+    if ((t & 31) == 0) s_red[t >> 5] = amax;
+    __syncthreads();
+    if (t == 0) {
+        float a = 0.f;
+        for (int w = 0; w < (head_dim >> 5); w++) a = fmaxf(a, s_red[w]);
+        s_red[0] = a;
+    }
+    __syncthreads();
+    const float d  = s_red[0] / 127.0f;
+    const int   qi = (s_red[0] == 0.f) ? 0 : (int)roundf(val / d);
+    if (is_k) {
+        k_pool[dst + t] = (signed char)qi;
+        if (t == 0) k_scale[ctok * n_kv_heads + hh] = __float2half(d);
+    } else {
+        v_pool[dst + t] = (signed char)qi;
+        if (t == 0) v_scale[ctok * n_kv_heads + hh] = __float2half(d);
+    }
+}
+
 // Fused QK-norm + partial-RoPE + int8 KV-append for Qwen3.6 hd256 full-attn layers.
 // Replaces launch_rmsnorm_qk + launch_rope_kv_append_partial_int8 (two graph nodes).
 __global__ void qknorm_rope_kv_partial_int8_kernel(
@@ -890,6 +969,23 @@ void launch_rope_kv_append_partial_int8(void* q, const void* k, const void* v,
         reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool),
         reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
+        block_size, max_blocks_per_seq);
+}
+
+void launch_muse_kv_append_int8(void* q, const void* k, const void* v,
+                                void* k_pool, void* v_pool, void* k_scale, void* v_scale,
+                                const int* block_table, const int* positions,
+                                int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+                                float theta, bool rope_normal,
+                                int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+    // one block per (token, head-unit); blockDim == head_dim so a full K/V head vector reduces in-block.
+    dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
+    muse_kv_append_int8_kernel<<<grid, head_dim, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool),
+        reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, theta, rope_normal ? 1 : 0,
         block_size, max_blocks_per_seq);
 }
 

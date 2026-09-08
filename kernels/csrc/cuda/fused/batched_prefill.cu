@@ -1126,13 +1126,41 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
 // / launch_kv_append, so a subsequent decode reads a consistent cache.
 // grid = (N, n_q_heads + 2*n_kv_heads); blockDim = head_dim.
 // ============================================================================
-__global__ void pf_qknorm_ropenorm_kv_bf16_kernel(
+// Block-wide max-abs of one head vector (blockDim == head_dim), for the int8 KV scale. Same
+// reduce and the same amax/127 convention as pf_qknorm_rope_kv_int8_kernel above, on its own
+// shared buffer so it never races the RMSNorm reduce that runs just before it.
+__device__ __forceinline__ float pf_headvec_amax(float val, float* s_red, int t, int head_dim) {
+    float a = fabsf(val);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+    if ((t & 31) == 0) s_red[t >> 5] = a;
+    __syncthreads();
+    if (t == 0) {
+        float aa = 0.f;
+        for (int w = 0; w < (head_dim + 31) / 32; w++) aa = fmaxf(aa, s_red[w]);
+        s_red[0] = aa;
+    }
+    __syncthreads();
+    return s_red[0];
+}
+
+// INT8 == false is the original bf16 writer, unchanged. INT8 == true quantises the K/V head
+// vector to int8 with one fp16 scale per (token, kv_head) -- the layout the int8 attention and
+// flash-decode read -- so Muse can run on the int8 cache the example mains request at ctx >= 4096
+// instead of writing bf16 into it. The math above the store is shared, so the two cannot drift.
+template <bool INT8>
+__global__ void pf_qknorm_ropenorm_kv_kernel(
     __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
-    __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    void* __restrict__ k_pool_v, void* __restrict__ v_pool_v,
+    __half* __restrict__ k_scale, __half* __restrict__ v_scale,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
     int block_size, int max_blocks_per_seq, int pos0) {
+    auto* k_pool = static_cast<__nv_bfloat16*>(k_pool_v);
+    auto* v_pool = static_cast<__nv_bfloat16*>(v_pool_v);
+    auto* k_pool8 = static_cast<signed char*>(k_pool_v);
+    auto* v_pool8 = static_cast<signed char*>(v_pool_v);
     const int tok  = blockIdx.x;
     const int unit = blockIdx.y;
     const int t    = threadIdx.x;
@@ -1147,6 +1175,7 @@ __global__ void pf_qknorm_ropenorm_kv_bf16_kernel(
 
     extern __shared__ float s_h[];
     __shared__ float s_warp[32];
+    __shared__ float s_red[8];                        // int8 KV amax only; unused when !INT8
 
     const bool is_q = unit < n_q_heads;
     const bool is_k = !is_q && unit < n_q_heads + n_kv_heads;
@@ -1182,16 +1211,29 @@ __global__ void pf_qknorm_ropenorm_kv_bf16_kernel(
             out = ((t & 1) == 0) ? (x0 * c - x1 * s) : (x0 * s + x1 * c);
         }
         if (is_q) {
-            q[base + t] = __float2bfloat16(out);
+            q[base + t] = __float2bfloat16(out);      // Q is never quantised
         } else {
             const size_t dst = (ctok * n_kv_heads + hh) * head_dim;
-            k_pool[dst + t] = __float2bfloat16(out);
+            if constexpr (INT8) {
+                const float d = pf_headvec_amax(out, s_red, t, head_dim) / 127.0f;
+                k_pool8[dst + t] = (signed char)((d == 0.f) ? 0 : (int)roundf(out / d));
+                if (t == 0) k_scale[ctok * n_kv_heads + hh] = __float2half(d);
+            } else {
+                k_pool[dst + t] = __float2bfloat16(out);
+            }
         }
     } else {                                          // V: append as-is (no norm, no rope)
         const int hh = unit - n_q_heads - n_kv_heads;
         const size_t base = ((size_t)tok * n_kv_heads + hh) * head_dim;
         const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
-        v_pool[dst + t] = v[base + t];
+        if constexpr (INT8) {
+            const float val = pf_to_f(v[base + t]);
+            const float d = pf_headvec_amax(val, s_red, t, head_dim) / 127.0f;
+            v_pool8[dst + t] = (signed char)((d == 0.f) ? 0 : (int)roundf(val / d));
+            if (t == 0) v_scale[ctok * n_kv_heads + hh] = __float2half(d);
+        } else {
+            v_pool[dst + t] = v[base + t];
+        }
     }
 }
 
@@ -1841,11 +1883,31 @@ void launch_prefill_qknorm_ropenorm_kv_bf16(
     cudaStream_t stream, int pos0) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
-    pf_qknorm_ropenorm_kv_bf16_kernel<<<grid, head_dim, shmem, stream>>>(
+    pf_qknorm_ropenorm_kv_kernel<false><<<grid, head_dim, shmem, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
         reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
-        reinterpret_cast<const __nv_bfloat16*>(k_w),
-        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool, nullptr, nullptr,
+        block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
+        block_size, max_blocks_per_seq, pos0);
+}
+
+// int8-KV twin of the above: same QK-norm and NORMAL-RoPE math, but each K/V head vector is
+// quantised to int8 with one fp16 scale per (token, kv_head). Muse needs this because the
+// example mains switch the cache to int8 at ctx >= 4096, and a bf16 write into that pool is
+// both wrong and forces the whole prompt onto the token-at-a-time path.
+void launch_prefill_qknorm_ropenorm_kv_int8(
+    void* q, void* k, const void* v, const void* q_w, const void* k_w,
+    void* k_pool, void* v_pool, void* k_scale, void* v_scale,
+    const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
+    cudaStream_t stream, int pos0) {
+    dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
+    const size_t shmem = (size_t)head_dim * sizeof(float);
+    pf_qknorm_ropenorm_kv_kernel<true><<<grid, head_dim, shmem, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+        reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
+        reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
         block_size, max_blocks_per_seq, pos0);
 }

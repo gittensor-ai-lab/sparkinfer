@@ -127,12 +127,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // Its BF16 attention (windowed/full hd128) + bf16 KV write reuse the batched pipeline below
     // with muse-specific kernels; the full-attn scratch aliases (qb/qg<-gv/lnrm, kf/vf<-gq/gk) must
     // still fit, i.e. linear_vdim>=qdim and linear_qdim>=kvdim (4096>=4096, 2048>=256 for muse).
-    // Muse runs a BF16 KV cache (its decode KV write is unconditionally bf16); if the cache is
-    // int8 here the config is inconsistent -- fall back to the token loop rather than corrupt it.
+    // Muse honours whichever cache it is given: bf16, or int8 with per-(token,kv_head) fp16 scales.
+    // It used to decline an int8 cache outright, which sent the WHOLE prompt to the token loop --
+    // and the example mains ask for int8 at ctx >= 4096, so that is where every long Muse prompt
+    // went (4096: 103 pp against 4062 pp for the same prompt with the cache forced to bf16).
     if (c.muse_glimmer) {
         if (c.head_dim != 128 || !c.dense_ffn) return -1;
         if (s.linear_vdim < s.qdim || s.linear_qdim < s.kvdim) return -1;
-        if (s.kv->int8_kv()) return -1;
     } else if (c.head_dim != 256 || c.linear_head_dim != 128) {
         return -1;   // kernels specialize these
     }
@@ -1615,20 +1616,37 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
             }
             if (c.muse_glimmer) {
-                // Muse Glimmer runs a BF16 KV cache (its decode KV-write is bf16, qwen35.cpp:1065/1087),
-                // not int8. QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM) RoPE on SWA layers
-                // / NoPE on global layers, bf16 append -- the same KV a forward_token decode writes via
-                // launch_rmsnorm + launch_rope_kv_append_normal / launch_kv_append. Then pure-window
-                // attention on SWA layers, full causal on global (win_blocks<=0), over the bf16 pool.
-                bf16* kpool_bf = (bf16*)s.kv->k_pool() + s.kv->layer_base_elems(L);
-                bf16* vpool_bf = (bf16*)s.kv->v_pool() + s.kv->layer_base_elems(L);
+                // QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM) RoPE on SWA layers /
+                // NoPE on global layers, then a KV append that writes exactly what a forward_token
+                // decode writes into the same cache. Then pure-window attention on SWA layers, full
+                // causal on global (win_blocks<=0).
+                //
+                // Both halves come in a bf16 and an int8 flavour and the cache picks. The int8 pair
+                // is what lets a long Muse prompt stay on this batched path at all: the example
+                // mains switch the cache to int8 at ctx >= 4096, and this function used to decline
+                // that outright.
                 const int muse_rot = w.swa ? c.head_dim : 0;      // SWA = full NORMAL rope; global = NoPE
-                kernels::launch_prefill_qknorm_ropenorm_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
-                    kpool_bf, vpool_bf, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                    muse_rot, rope_theta, eps, bs, mbs, st);
                 const int win_blocks = w.swa ? (c.sliding_window + bs - 1) / bs : 0;  // 0 => global full causal
-                kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, btable, att,
-                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks, st);
+                if (kv8) {
+                    signed char* kpool8 = (signed char*)s.kv->k_pool() + s.kv->layer_base_elems(L);
+                    signed char* vpool8 = (signed char*)s.kv->v_pool() + s.kv->layer_base_elems(L);
+                    void* kscale = (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2;
+                    void* vscale = (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2;
+                    kernels::launch_prefill_qknorm_ropenorm_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
+                        kpool8, vpool8, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads,
+                        c.head_dim, muse_rot, rope_theta, eps, bs, mbs, st);
+                    kernels::launch_prefill_attn_swa_pure_int8(qb, kpool8, vpool8, kscale, vscale,
+                        btable, att, N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
+                        win_blocks, st);
+                } else {
+                    bf16* kpool_bf = (bf16*)s.kv->k_pool() + s.kv->layer_base_elems(L);
+                    bf16* vpool_bf = (bf16*)s.kv->v_pool() + s.kv->layer_base_elems(L);
+                    kernels::launch_prefill_qknorm_ropenorm_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
+                        kpool_bf, vpool_bf, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                        muse_rot, rope_theta, eps, bs, mbs, st);
+                    kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, btable, att,
+                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks, st);
+                }
             } else {
                 signed char* kpool = (signed char*)s.kv->k_pool() + s.kv->layer_base_elems(L) * kv_elem;
                 signed char* vpool = (signed char*)s.kv->v_pool() + s.kv->layer_base_elems(L) * kv_elem;

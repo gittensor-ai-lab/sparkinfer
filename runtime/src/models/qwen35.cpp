@@ -1775,6 +1775,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     } else if (c.muse_glimmer && !w.swa) {
                         // Global/NoPE layer: no rotation at all (Q/K are already QK-normed
                         // above) -- append K/V as-is. Every 4th layer per sliding_window_pattern.
+                        // The bf16 append below casts the pool to bf16* unconditionally, so on an
+                        // int8 cache it wrote two bytes per one-byte element: correct-looking but
+                        // corrupt, and the reason Muse produced garbage at ctx >= 4096 (where the
+                        // example mains switch the cache to int8). Quantise instead when kv8.
+                        if (kv8)
+                            kernels::launch_muse_kv_append_int8(
+                                s.q, s.k, s.v, kpool, vpool, kscale, vscale, btable, s.d_writepos, 1,
+                                c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, /*rope_normal=*/false,
+                                s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                        else
                         launch_kv_append((bf16*)kpool, (bf16*)vpool, s.k, s.v, btable, s.d_writepos, 1,
                                          c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                     } else if (partial_rope) {
@@ -1797,6 +1807,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                         // Unconditional (not gated on s.use_ropekv) so a SPARKINFER_ROPEKV=0
                         // override can't silently fall through to the NeoX plain-launch_rope
                         // path in the final else below.
+                        // Same int8 hazard as the NoPE branch above: this writes bf16 straight
+                        // into the pool, which is wrong when the cache is int8.
+                        if (kv8)
+                            kernels::launch_muse_kv_append_int8(
+                                s.q, s.k, s.v, kpool, vpool, kscale, vscale, btable, s.d_pos, 1,
+                                c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, /*rope_normal=*/true,
+                                s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                        else
                         kernels::launch_rope_kv_append_normal(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
                                                               c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
                                                               s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
