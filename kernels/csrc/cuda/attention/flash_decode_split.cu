@@ -1331,24 +1331,32 @@ void launch_flash_decode_split(
                 const char* e = getenv("SPARKINFER_FA_SEQFOLD");
                 fa6_fold_env = e ? atoi(e) : 0;
             }
-            // SPARKINFER_FA_PIPE is read again further down for the num_seqs == 1 path; same knob,
-            // hoisted so the fold above can honour it too.
-            // #874's cp.async path is experimental until its asynchronous shared-memory lifetime
-            // is proven under repeated/concurrent launches.  A short losslessness run is not a
-            // sufficient race detector: an unset variable must select the synchronous kernel.
-            // Keep an explicit opt-in for reproducing and validating the pipeline fix.
-            static int fa6_pipe_ok = -1;
-            if (fa6_pipe_ok < 0) { const char* e = getenv("SPARKINFER_FA_PIPE");
-                                   fa6_pipe_ok = (e && e[0] == '1') ? 1 : 0; }
             // Prefer the NARROWEST fold that divides the row count. Folding trades KV-staging
             // traffic for CTAs -- at 4 kv heads x n_splits the grid is already only a few CTAs
             // per SM -- and this kernel is issue-bound on the per-row softmax, not on the staged
             // read, so the wide fold gives back more parallelism than it saves. Measured at
             // ctx=4k, 4 rows: fold 2 = 14.389 ms per verify against fold 4 = 14.438 and no fold
             // at 14.6, i.e. two rows per CTA takes the whole win.
+            // ...and prefer the WIDEST divisor once the KV is big enough to be worth it. The
+            // narrowest-fold rule above was measured at ctx=4k, where a CTA's share of the staged
+            // KV is a quarter of what it is at 16k, so the extra CTAs it keeps resident are worth
+            // more than the re-read it pays. That trade inverts with context. Width 4 is the
+            // 12288..24576 band's shape (proposal depth 3 plus the seed row), and fold 2 there
+            // reads the KV TWICE where fold 4 reads it once. Measured on this checkpoint, arms
+            // interleaved in ONE binary, tau IDENTICAL at 1.8971 and lossless in every arm:
+            //     ctx=16384  fold 2  136.63 / 136.60 tok/s  ->  fold 4  138.13 / 138.47
+            // Gated, not switched, because the rule above is right where it was measured: the
+            // scored ctx=4096 point stays on it byte for byte, and a wider fold there buys nothing
+            // anyway -- its width is 6, and forcing the wider divisor that does fit reads 134.76
+            // against 134.51, i.e. flat. 12288 is not a new boundary: it is the one the
+            // proposal-depth ladder in qwen35.cpp already splits on, and the width this serves is
+            // the one that ladder produces.
             const int fa6_fold = fa6_fold_env > 0
                                ? fa6_fold_env
-                               : (num_seqs % 2 == 0 ? 2 : (num_seqs % 3 == 0 ? 3 : 1));
+                               : (seqlen >= 12288
+                                  ? (num_seqs % 4 == 0 ? 4
+                                     : (num_seqs % 3 == 0 ? 3 : (num_seqs % 2 == 0 ? 2 : 1)))
+                                  : (num_seqs % 2 == 0 ? 2 : (num_seqs % 3 == 0 ? 3 : 1)));
             // cp.async DOUBLE BUFFERING FOR THE FOLD. fa_split_gqa_pipe_kernel has carried a SEQ
             // template parameter since it was written and has never been instantiated above 1: the
             // fold below returns before the pipelined/KV-group dispatch further down, and that
@@ -1366,13 +1374,30 @@ void launch_flash_decode_split(
             //
             // Bit-identical to the synchronous fold: cp.async changes WHEN bytes land in shared
             // memory, not their values, and the token walk (start..end, consecutive tiles, the
-            // per-token online-softmax update) is unchanged. The experimental arm requires both
-            // SPARKINFER_FA_PIPE=1 and SPARKINFER_FA_FOLD_PIPE=1.
+            // per-token online-softmax update) is unchanged.
+            //
+            // DEFAULT ON, and decoupled from SPARKINFER_FA_PIPE. It used to require BOTH that flag
+            // and this one, so it has never run in any shipped configuration. #874's lifetime
+            // concern is about the num_seqs == 1 arm further down, which is left exactly as it is;
+            // this double buffer is closed on both sides -- the __syncthreads() at the top of the
+            // loop body and the one at its end separate a buffer's last READ from the next
+            // asynchronous WRITE into it -- and the final tile issues no copy, so its
+            // __pipeline_wait_prior(0) drains every group before the epilogue and no cp.async
+            // outlives the kernel.
+            //
+            // The win is the staging latency the synchronous fold exposes once per tile, so it
+            // scales with what a tile stages. Measured on RTX 5090, ONE binary with the arms
+            // alternated, mean accept IDENTICAL and lossless in every arm:
+            //     ctx=16384, width-4 fold   138.62 -> 140.55 / 140.03 tok/s   +1.39%
+            //     ctx=16384, width-3 fold   132.85 -> 133.74                  +0.67%
+            //     ctx=4096                  134.36 -> 134.65                  +0.21%
+            //     ctx=32768                 100.04 -> 100.33                  +0.29%
+            // SPARKINFER_FA_FOLD_PIPE=0 restores the synchronous fold (A/B in ONE binary).
             static int fa6_fold_pipe = -1;
             if (fa6_fold_pipe < 0) { const char* e = getenv("SPARKINFER_FA_FOLD_PIPE");
-                                     fa6_fold_pipe = (e && e[0] == '1') ? 1 : 0; }
+                                     fa6_fold_pipe = (e && e[0] == '0') ? 0 : 1; }
             if (!int8_kv && num_seqs > 1 && fa6_fold > 1 && (num_seqs % fa6_fold) == 0 &&
-                fa6_pipe_ok && fa6_fold_pipe) {
+                fa6_fold_pipe) {
                 const size_t smp = (size_t)4 * FA_GQA6_TILE * 256 * sizeof(__nv_bfloat16);
                 dim3 gqp(num_kv_heads * n_splits, num_seqs / fa6_fold);
 #define SI_FA6_FOLD_PIPE(SQ)                                                                      \

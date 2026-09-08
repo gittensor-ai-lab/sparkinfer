@@ -4132,10 +4132,30 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // 24576 is not a new boundary: it is the one dflash_draft.cpp's window ladder already splits
     // the long band at, so the depth plan and the draft's attention window change together.
     constexpr int kVeryDeepMinSeq = 24576;
+    // The 12288..24576 band's depth of 2 is STALE. The note above is anchored on a run whose arms
+    // spread 82-92 tok/s; the same sweep on today's tree runs at 124-137 and reverses the
+    // ordering -- every change since has made a verify row cheaper, which lowers the bar a third
+    // proposal has to clear. Re-measured at ctx=16384 on the first 16384 tokens of
+    // bench_prompt_32k.txt, NTOK=128, one binary with the arms alternated, every arm lossless and
+    // AR flat at 89.59-89.64:
+    //
+    //     depth   1        2 (was)   3          4
+    //     tok/s   123.80   132.88    136.60     131.54
+    //     tau     1.5176   1.7297    1.8971     1.8194
+    //
+    // Depth 3 is +2.60% end to end against the shipped band, and it gets there by ACCEPTING MORE
+    // (tau 1.7297 -> 1.8971, +9.7%), not by spending fewer verify rows -- the third proposal pays
+    // for its own row. Depth 4 turns back over (tau falls to 1.8194), so 3 is a peak and not the
+    // edge of a ramp.
+    //
+    // The band is bounded at both ends, so no other scored context moves: 4k is below kDeepMinSeq
+    // and 32k is above kVeryDeepMinSeq. Both were re-swept anyway and both keep the depth they
+    // have -- 4k reads 134.68 at 5 against 133.33/133.23 at 4/6, and 32k reads 100.01 at 1
+    // against 95.48 at 2.
     const int kInitialProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
                                     : ((kShortGeneration || kAmortizedMidContext) ? 7
                                        : ((n + max_new) >= kVeryDeepMinSeq ? 1
-                                          : ((n + max_new) >= kDeepMinSeq ? 2
+                                          : ((n + max_new) >= kDeepMinSeq ? 3
                                              : ((n + max_new) < kMid4kMaxSeq ? 5 : 3)))));
     // A length-only depth is a safe starting point, not a workload policy. At the same 16k
     // context real chat accepts ~1.36 tokens while code/JSON/repetition accept 5.35/6.62/6.92 at
