@@ -143,10 +143,22 @@ dense GQA-16 stack that alternates **three sliding-window layers (512 tokens) wi
 full-attention layer**, each kind carrying its *own* rotary parameters (sliding: θ=1e4 over all
 256 head dims; full: θ=5e6 over 64 of 256), a per-head sigmoid attention gate, and a GeGLU FFN.
 **235 tok/s decode, 6.4 GB VRAM** (Q8_0, RTX 5090). Mainline llama.cpp cannot load this
-architecture at all — it needs a fork. Correctness is checked against an independent
-implementation built from the GGUF's own bytes,
-[`bench/scripts/spark25_ref_check.py`](bench/scripts/spark25_ref_check.py), which re-derives the
-forward pass from the reference `modeling_spark.py` and shares no code with the runtime.
+architecture at all — it needs a fork.
+
+Correctness is checked against an independent implementation built from the GGUF's own bytes,
+[`bench/scripts/spark25_ref_check.py`](bench/scripts/spark25_ref_check.py) — it re-derives the
+forward pass from the reference `modeling_spark.py` and shares no code with the runtime. One
+teacher-forced pass over prompt + generation verifies every greedy step at once:
+
+| Prompt | Sliding window | Greedy steps agreeing | Disagreement margin | Median margin |
+|---|---|---|---|---|
+| 23 tokens | not engaged | **23 / 24** | 0.056 | 2.28 |
+| 1329 tokens | engaged | **10 / 11** | 0.344 | 2.80 |
+
+In each run the single disagreement is the *smallest-margin step of that run* — a near-tie the
+reference's fp32 NumPy and the runtime's bf16/Q8_0 arithmetic settle differently. A wrong rope
+theta, rotary width, window, gate or activation would disagree at large margins and across many
+steps, not at the one place the model itself was indifferent.
 
 SparkInfer focuses on the models driving the future of AI — not thousands of legacy architectures.
 
