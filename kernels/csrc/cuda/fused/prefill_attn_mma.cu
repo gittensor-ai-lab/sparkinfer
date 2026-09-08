@@ -343,13 +343,14 @@ __device__ __forceinline__ void pf_mma_16832(int (&d)[4], const unsigned (&a)[4]
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-template <int HEAD_DIM, int GROUP_BLKS, int RQH, int PLANES = 0>
+template <int HEAD_DIM, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false>
 __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 ? 2 : 1))) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
     const __half* __restrict__ v_scale, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale, int win_blocks, int qld, int pld, int q_pos0) {
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, int qld, int pld, int q_pos0,
+    const signed char* __restrict__ vT) {
     // q_pos0 is where this pass's queries START in the sequence. It was implicitly 0 while
     // prefill always ingested [0, N) in a single pass; carrying it lets a long prompt be
     // ingested in windows. Queries and outputs stay addressed by the LOCAL row, while the
@@ -720,8 +721,21 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                                 mx = fmaxf(mx, sc[u]);
                             }
                         }
-                        #pragma unroll
-                        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                        if constexpr (SPL != RQH) {
+                            // max is exact and order-independent, so the five-step butterfly is
+                            // one warp instruction. redux.sync is integer-only, but the standard
+                            // total order on IEEE floats -- flip the sign bit when positive,
+                            // invert every bit when negative -- is monotone, so the reduced key
+                            // is the key of the max and this is BIT-IDENTICAL. The bf16 sibling
+                            // has always reduced its row max this way; only this kernel had not.
+                            const unsigned ub = __float_as_uint(mx);
+                            const unsigned key = (ub & 0x80000000u) ? ~ub : (ub | 0x80000000u);
+                            const unsigned rd = __reduce_max_sync(0xffffffffu, key);
+                            mx = __uint_as_float((rd & 0x80000000u) ? (rd & 0x7fffffffu) : ~rd);
+                        } else {
+                            #pragma unroll
+                            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                        }
                         const float m_old = s_m[h * BM + r], m_new = fmaxf(m_old, mx),
                                     corr = exp2f(m_old - m_new);
                         float sum = 0.f, pamax = 0.f;
@@ -739,10 +753,21 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                             }
                             sc[u] = pv;
                         }
-                        #pragma unroll
-                        for (int o = 16; o > 0; o >>= 1) {
-                            sum   += __shfl_xor_sync(0xffffffffu, sum, o);
-                            pamax  = fmaxf(pamax, __shfl_xor_sync(0xffffffffu, pamax, o));
+                        if constexpr (SPL != RQH) {
+                            // |P'| is non-negative by construction (an exp times an absmax/127),
+                            // so its bit pattern orders like an unsigned int directly -- one
+                            // redux.sync, and the butterfly below carries only the denominator.
+                            pamax = __uint_as_float(
+                                __reduce_max_sync(0xffffffffu, __float_as_uint(pamax)));
+                            #pragma unroll
+                            for (int o = 16; o > 0; o >>= 1)
+                                sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                        } else {
+                            #pragma unroll
+                            for (int o = 16; o > 0; o >>= 1) {
+                                sum   += __shfl_xor_sync(0xffffffffu, sum, o);
+                                pamax  = fmaxf(pamax, __shfl_xor_sync(0xffffffffu, pamax, o));
+                            }
                         }
                         const float pd = pamax / 127.0f;
                         // The quantum is per row, so its reciprocal and its zero test are per row
@@ -838,24 +863,44 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                         for (int j = 0; j < 4; j++) cf[h][n2][j] = 0;
                 // Row (l&3)*4 of the page, dim pair 2*(l>>2) of this warp's 16-dim slab: the
                 // B operand's k index is the key and its n index the dim, both fixed per lane.
-                const size_t vlane = (size_t)((lane & 3) * 4) * KVLD + dt * 16 + 2 * (lane >> 2);
+                // The packed plane's lane map: a lane's four keys are four CONSECUTIVE bytes at
+                // [dim][key], and its two n-halves are adjacent dim rows 16 B apart -- so the two
+                // loads that feed one page cover one whole 32-byte sector between them.
+                constexpr size_t VTLD = (size_t)HEAD_DIM * 16;   // one page of one kv-head, packed
                 const int gpair = gblk & ~1;
                 for (int ks = 0; ks < gpair; ks += 2) {
                     const int lb0 = (k0 / BLKSZ) + ks;
                     const int lb1 = lb0 + 1;
-                    // V, in the mma's own B layout, as HALFWORDS. The n operand index is a free
-                    // choice -- it only has to be undone once, in the epilogue -- and the natural
-                    // wmma mapping (n-half h owns dims 8h..8h+7) is the worst one: it hands a lane
-                    // dims d and d+8, eight bytes apart, so load_matrix_sync gathers a row-major
-                    // 8-bit matrix_b with EIGHT LDG.E.U8 and a PRMT chain per 16-key tile. Mapping
-                    // n-half h to dims {2c+h} instead makes a lane's two dims ADJACENT, and the
-                    // pair is one LDG.E.U16. Same bytes, same rows, half the memory instructions.
-                    const signed char* vb0 = v_pool + ((size_t)block_table[lb0] * BLKSZ
-                                             * n_kv_heads + kvh) * HEAD_DIM + vlane;
-                    const signed char* vb1 = v_pool + ((size_t)block_table[lb1] * BLKSZ
-                                             * n_kv_heads + kvh) * HEAD_DIM + vlane;
+                    // V, in the mma's own B layout. The n operand index is a free choice -- it
+                    // only has to be undone once, in the epilogue -- and the natural wmma mapping
+                    // (n-half h owns dims 8h..8h+7) is the worst one: it hands a lane dims d and
+                    // d+8, eight bytes apart. Mapping n-half h to dims {2c+h} instead makes a
+                    // lane's two dims ADJACENT, which is what the paged gather below relies on.
                     unsigned B0[2], B1[2];
-                    {
+                    if constexpr (VT) {
+                        // Four plain loads. The plane already holds the operand in order, so
+                        // there is no gather across KVLD and no byte_perm chain to rebuild it,
+                        // and the two loads of a page cover one whole 32-byte sector between
+                        // them. Indexed by LOGICAL block -- pf_v_pack_kernel applied block_table.
+                        const size_t vtlane =
+                            (size_t)(dt * 16 + 2 * (lane >> 2)) * 16 + (lane & 3) * 4;
+                        const signed char* vt0 =
+                            vT + ((size_t)lb0 * n_kv_heads + kvh) * VTLD + vtlane;
+                        const signed char* vt1 =
+                            vT + ((size_t)lb1 * n_kv_heads + kvh) * VTLD + vtlane;
+                        B0[0] = *reinterpret_cast<const unsigned*>(vt0);
+                        B0[1] = *reinterpret_cast<const unsigned*>(vt0 + 16);
+                        B1[0] = *reinterpret_cast<const unsigned*>(vt1);
+                        B1[1] = *reinterpret_cast<const unsigned*>(vt1 + 16);
+                    } else {
+                        // The paged gather: EIGHT LDG.E.U16 at KVLD stride plus eight PRMT, each
+                        // instruction moving 64 B against the K load's 128.
+                        const size_t vlane =
+                            (size_t)((lane & 3) * 4) * KVLD + dt * 16 + 2 * (lane >> 2);
+                        const signed char* vb0 = v_pool + ((size_t)block_table[lb0] * BLKSZ
+                                                 * n_kv_heads + kvh) * HEAD_DIM + vlane;
+                        const signed char* vb1 = v_pool + ((size_t)block_table[lb1] * BLKSZ
+                                                 * n_kv_heads + kvh) * HEAD_DIM + vlane;
                         unsigned r0[4], r1[4];
                         #pragma unroll
                         for (int j = 0; j < 4; j++) {
@@ -885,16 +930,28 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                 // upper half of the k=32 A operand then reads past the group into whatever the
                 // guarded P' store left there and multiplies it by nothing.
                 if (gblk & 1) {
-                    const signed char* vb0 = v_pool + ((size_t)block_table[(k0 / BLKSZ) + gpair]
-                                             * BLKSZ * n_kv_heads + kvh) * HEAD_DIM + vlane;
-                    unsigned r0[4];
-                    #pragma unroll
-                    for (int j = 0; j < 4; j++)
-                        r0[j] = *reinterpret_cast<const unsigned short*>(vb0 + (size_t)j * KVLD);
-                    const unsigned a0 = __byte_perm(r0[0], r0[1], 0x5140);
-                    const unsigned a1 = __byte_perm(r0[2], r0[3], 0x5140);
-                    const unsigned Bt[2] = {__byte_perm(a0, a1, 0x5410),
-                                            __byte_perm(a0, a1, 0x7632)};
+                    const int lbt = (k0 / BLKSZ) + gpair;
+                    unsigned Bt[2];
+                    if constexpr (VT) {
+                        const size_t vtlane =
+                            (size_t)(dt * 16 + 2 * (lane >> 2)) * 16 + (lane & 3) * 4;
+                        const signed char* vt0 = vT + ((size_t)lbt * n_kv_heads + kvh) * VTLD + vtlane;
+                        Bt[0] = *reinterpret_cast<const unsigned*>(vt0);
+                        Bt[1] = *reinterpret_cast<const unsigned*>(vt0 + 16);
+                    } else {
+                        const size_t vlane =
+                            (size_t)((lane & 3) * 4) * KVLD + dt * 16 + 2 * (lane >> 2);
+                        const signed char* vb0 = v_pool + ((size_t)block_table[lbt]
+                                                 * BLKSZ * n_kv_heads + kvh) * HEAD_DIM + vlane;
+                        unsigned r0[4];
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++)
+                            r0[j] = *reinterpret_cast<const unsigned short*>(vb0 + (size_t)j * KVLD);
+                        const unsigned a0 = __byte_perm(r0[0], r0[1], 0x5140);
+                        const unsigned a1 = __byte_perm(r0[2], r0[3], 0x5140);
+                        Bt[0] = __byte_perm(a0, a1, 0x5410);
+                        Bt[1] = __byte_perm(a0, a1, 0x7632);
+                    }
                     #pragma unroll
                     for (int h = 0; h < RQH; h++) {
                         unsigned a[4];
@@ -944,12 +1001,94 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     }
 }
 
-template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0>
+// ============================================================================
+// V, repacked into the PV mma's own B-operand order.
+//
+// QK and PV read the same paged pool, but their B operands want OPPOSITE things. QK's B is K^T,
+// so a lane wants four consecutive DIMS of one key -- which is exactly what [key][dim] stores,
+// and the K load is one LDG.32 per lane moving a full 128 B per warp instruction. PV's B is V,
+// so a lane wants four consecutive KEYS of one dim; in [key][dim] those are KVLD (1024 B) apart,
+// so the same operand costs FOUR 2-byte gathers plus an 8-instruction byte_perm chain to rebuild
+// it, and each gather moves only 64 B per warp instruction against K's 128.
+//
+// Skip-probed on this checkpoint at the scored target-prefill@256k point, by stubbing each pool
+// read in turn (wrong results, right timing): stubbing V is +20.6% on the dimension against
+// +10.2% for K -- twice the cost for the same bytes -- while stubbing the QK and PV mma's is
+// +2.4% and +1.8%. The tensor cores are idle; this kernel is paying for the operand layout.
+//
+// So V is repacked once per attention pass into [logical block][kv head][dim][16 keys], where the
+// four keys a lane needs are four CONSECUTIVE bytes and its two n-halves are adjacent 16 B rows.
+// The operand is then four LDG.32 per page pair instead of eight LDG.U16 and eight PRMT, and the
+// two loads of a page cover one whole 32-byte sector between them.
+//
+// It is a REPACK, not a second pool: the same bytes in a different order, so every P'V product is
+// unchanged bit for bit. Indexing the plane by LOGICAL block is what keeps the attention kernel
+// off block_table entirely on this path -- the repack already applied it.
+//
+// The plane is one layer's prefix (256 MB at ctx=262144) and is rebuilt per pass rather than kept
+// per layer, which would be 16x that. The rebuild is ~70 GB of traffic across the whole 256k
+// prefill against a 58.6 s pass -- under 0.1% -- and it is why this is worth doing at all only
+// where the pass re-reads V many times: the six-head tier at ctx=256k reads each key's V once per
+// query tile, i.e. n_tokens/BM = 1024 times per window.
+// ============================================================================
+namespace {
+void*  g_vpack = nullptr;
+size_t g_vpack_bytes = 0;
+
+bool vpack_reserve(size_t bytes) {
+    if (bytes <= g_vpack_bytes) return true;
+    // Free BEFORE growing: the old plane is dead the moment a bigger one is wanted, and holding
+    // both at once is what would push a 256k prefill's peak past the arena it has to share with.
+    if (g_vpack) { cudaFree(g_vpack); g_vpack = nullptr; g_vpack_bytes = 0; }
+    void* p = nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) { cudaGetLastError(); return false; }
+    g_vpack = p; g_vpack_bytes = bytes;
+    return true;
+}
+
+// One block per (logical block, kv head); one thread per dim. Thread d reads its dim out of all
+// 16 keys of the page -- for a fixed key those 256 threads are 256 CONSECUTIVE bytes, so every
+// read is coalesced -- and writes them as one 16-byte store.
+__global__ void pf_v_pack_kernel(const signed char* __restrict__ v_pool,
+                                 const int* __restrict__ block_table,
+                                 signed char* __restrict__ vT, int n_kv_heads, int head_dim) {
+    const int lb = blockIdx.x, kvh = blockIdx.y, d = threadIdx.x;
+    const size_t KVLD = (size_t)n_kv_heads * head_dim;
+    const signed char* src =
+        v_pool + ((size_t)block_table[lb] * 16 * n_kv_heads + kvh) * head_dim + d;
+    __align__(16) signed char buf[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) buf[j] = src[(size_t)j * KVLD];
+    signed char* dst = vT + (((size_t)lb * n_kv_heads + kvh) * head_dim + d) * 16;
+    *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(buf);
+}
+
+// Returns the packed plane for this pass, or nullptr to keep the caller on the paged loads.
+// SPARKINFER_PREFILL_ATTN_VPACK=0 disables it (A/B in ONE binary).
+const signed char* vpack_build(const signed char* v_pool, const int* block_table,
+                               int n_blk, int n_kv_heads, int head_dim, cudaStream_t stream) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_VPACK");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || n_blk <= 0 || head_dim <= 0) return nullptr;
+    const size_t bytes = (size_t)n_blk * n_kv_heads * head_dim * 16;
+    if (!vpack_reserve(bytes)) return nullptr;
+    pf_v_pack_kernel<<<dim3(n_blk, n_kv_heads), head_dim, 0, stream>>>(
+        v_pool, block_table, reinterpret_cast<signed char*>(g_vpack), n_kv_heads, head_dim);
+    // A rejected launch would leave the plane holding the PREVIOUS pass's V, which is silently
+    // wrong attention rather than a slow one -- so a failure here falls back, it does not proceed.
+    if (cudaPeekAtLastError() != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    return reinterpret_cast<const signed char*>(g_vpack);
+}
+}  // namespace
+
+template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false>
 static bool launch_attn_gqa(const void* q, const signed char* k_pool, const signed char* v_pool,
                             const void* k_scale, const void* v_scale, const int* block_table,
                             void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
                             int block_size, int max_blocks_per_seq, float scale, int win_blocks,
-                            cudaStream_t stream, int q_pos0) {
+                            cudaStream_t stream, int q_pos0, const signed char* vT = nullptr) {
     // The kernel below takes the paged block size as a compile-time constant, so refuse anything
     // else here rather than leaning on the one caller's own guard.
     if (block_size != 16) return false;
@@ -996,17 +1135,17 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                             + (size_t)2 * GN * sizeof(__half)
                             + (size_t)5 * RQH * BM * sizeof(float);
         const cudaError_t ce = cudaFuncSetAttribute(
-            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES>,
+            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_max);
         if (ce != cudaSuccess && sm_max > 48u * 1024u) return false;  // opt-in refused where required
         cfg[dev] = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
-    pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES><<<grid, GROUP_BLKS * 32, sm, stream>>>(
+    pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT><<<grid, GROUP_BLKS * 32, sm, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
-        block_size, max_blocks_per_seq, scale, win_blocks, qld, pld, q_pos0);
+        block_size, max_blocks_per_seq, scale, win_blocks, qld, pld, q_pos0, vT);
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek —
     // rather than get — so a pre-existing sticky error is not silently cleared here.
     const bool ok = cudaPeekAtLastError() == cudaSuccess;
@@ -1021,8 +1160,8 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
     if (tier_dbg && !announced[dev]) {
         announced[dev] = true;
         fprintf(stderr,
-                "[pf-attn-tier] RQH=%d SPL=%d GB=%d GN=%d smem=%zu qld=%d pld=%d n=%d ok=%d\n",
-                RQH, SPL, GROUP_BLKS, GN, sm, qld, pld, n_tokens, (int)ok);
+                "[pf-attn-tier] RQH=%d SPL=%d GB=%d GN=%d smem=%zu qld=%d pld=%d n=%d vt=%d ok=%d\n",
+                RQH, SPL, GROUP_BLKS, GN, sm, qld, pld, n_tokens, (int)VT, (int)ok);
     }
     return ok;
 }
@@ -1165,11 +1304,23 @@ bool launch_prefill_attn_mma(
     // keeps every short-context caller -- the 4k/16k prefill dimensions and both cross-model
     // guards -- on exactly the tier, tile shape and arithmetic they have today.
     if (gqa_rqh >= 3 && gqa % 6 == 0 && wide_minkeys > 0 &&
-        (long)q_pos0 + n_tokens >= wide_minkeys && n_tokens >= 2048 && gqa_gb >= 16 &&
-        launch_attn_gqa<HD, 16, 6, 2>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
-            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks,
-            stream, q_pos0))
-        return true;
+        (long)q_pos0 + n_tokens >= wide_minkeys && n_tokens >= 2048 && gqa_gb >= 16) {
+        // Every key this pass reads lives below q_pos0 + n_tokens, so that is the plane.
+        const int n_blk = (q_pos0 + n_tokens + 15) / 16;
+        const signed char* vt =
+            vpack_build(v_pool, block_table, n_blk, n_kv_heads, HD, stream);
+        if (vt && launch_attn_gqa<HD, 16, 6, 2, true>(q, k_pool, v_pool, k_scale, v_scale,
+                block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
+                max_blocks_per_seq, scale, win_blocks, stream, q_pos0, vt))
+            return true;
+        // No plane (disabled, or the allocation did not fit beside the prefill arena) keeps the
+        // tier and its numerics -- the fallback is the SAME six-head kernel on the paged loads,
+        // not a narrower tier.
+        if (launch_attn_gqa<HD, 16, 6, 2>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+                n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks,
+                stream, q_pos0))
+            return true;
+    }
     if (gqa_rqh >= 3 && gqa % 3 == 0 && n_tokens >= 2048) {
         if (gqa_gb >= 16 &&
             launch_attn_gqa<HD, 16, 3>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
