@@ -285,6 +285,96 @@ bool test_gpt2_bytelevel_decode_printable_ascii_roundtrip() {
     return true;
 }
 
+// Strict UTF-8 validator. The tokenizer's Rust side rejects invalid UTF-8 by panicking without
+// unwinding -- it aborts the process rather than returning an error -- so the prompt has to be
+// checked here, before it ever reaches Encode().
+bool is_valid_utf8(const std::string& s) {
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        const unsigned char c = p[i];
+        size_t extra;
+        unsigned int cp;
+        if (c < 0x80) { i++; continue; }
+        else if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1Fu; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0Fu; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07u; }
+        else return false;                       // continuation byte or 5+ byte lead
+        if (i + extra >= n) return false;   // truncated sequence at end of string
+        for (size_t k = 1; k <= extra; k++) {
+            if ((p[i + k] & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (p[i + k] & 0x3Fu);
+        }
+        // Reject overlong encodings, surrogates and out-of-range code points.
+        if (extra == 1 && cp < 0x80) return false;
+        if (extra == 2 && cp < 0x800) return false;
+        if (extra == 3 && cp < 0x10000) return false;
+        if (cp > 0x10FFFF) return false;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false;
+        i += extra + 1;
+    }
+    return true;
+}
+
+// Spark-X2.5's rendered prompt, byte for byte against chat_template.jinja.
+//
+// The point of asserting the FULL string rather than spot-checking markers: the turn envelope is
+// built from hex escapes, and a C++ hex escape swallows every hex digit after it -- "\x9cend"
+// lexes as \x9ce, not \x9c followed by "end". That mistake yields a prompt that is invalid UTF-8
+// from the first end-of-sentence marker on, which the tokenizer answers with a non-unwinding Rust
+// panic (it aborts the process, so it cannot even be caught). Comparing whole strings is what
+// catches it; comparing lengths or searching for a substring would not.
+bool test_spark25_chat_template_renders_exact_markers() {
+    const std::string sos = "<\xef\xbd\x9c" "start" "\xe2\x96\x81" "of" "\xe2\x96\x81"
+                            "sentence" "\xef\xbd\x9c" ">";
+    const std::string eos = "<\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81"
+                            "sentence" "\xef\xbd\x9c" ">";
+    // Both markers must be well-formed UTF-8; the bug above makes eos specifically malformed.
+    CHECK(is_valid_utf8(sos));
+    CHECK(is_valid_utf8(eos));
+    CHECK(sos.size() == 29 && eos.size() == 27);
+
+    std::vector<sparkinfer_server::ChatMessage> messages;
+    { sparkinfer_server::ChatMessage m; m.role = "user"; m.content = "hi"; messages.push_back(m); }
+
+    // enable_thinking=false closes the reasoning block immediately in the generation prompt.
+    const std::string got = sparkinfer_server::apply_spark25_chat_template(messages, false);
+    const std::string want = sos + "<|System|>\nyou are a helpful assistant." + eos +
+                             sos + "<|User|>hi" + eos +
+                             sos + "<|Bot|></think>";
+    if (got != want) {
+        std::printf("FAIL: spark25 template\n  got:  %s\n  want: %s\n", got.c_str(), want.c_str());
+        return false;
+    }
+    CHECK(is_valid_utf8(got));
+
+    // enable_thinking=true opens it instead.
+    const std::string think = sparkinfer_server::apply_spark25_chat_template(messages, true);
+    CHECK(think == sos + "<|System|>\nyou are a helpful assistant." + eos +
+                   sos + "<|User|>hi" + eos + sos + "<|Bot|><think>");
+
+    // A leading system message is folded into the initial block (appended after the default
+    // system prompt), not emitted as its own turn -- matching the template's messages[0] handling.
+    std::vector<sparkinfer_server::ChatMessage> with_sys;
+    { sparkinfer_server::ChatMessage m; m.role = "system"; m.content = "Be terse."; with_sys.push_back(m); }
+    { sparkinfer_server::ChatMessage m; m.role = "user"; m.content = "hi"; with_sys.push_back(m); }
+    const std::string sys = sparkinfer_server::apply_spark25_chat_template(with_sys, false);
+    CHECK(sys == sos + "<|System|>\nyou are a helpful assistant.\n\nBe terse." + eos +
+                 sos + "<|User|>hi" + eos + sos + "<|Bot|></think>");
+
+    // Consecutive tool results share ONE envelope: open on the first, close after the last.
+    std::vector<sparkinfer_server::ChatMessage> tools;
+    { sparkinfer_server::ChatMessage m; m.role = "user"; m.content = "q"; tools.push_back(m); }
+    { sparkinfer_server::ChatMessage m; m.role = "tool"; m.content = "a1"; tools.push_back(m); }
+    { sparkinfer_server::ChatMessage m; m.role = "tool"; m.content = "a2"; tools.push_back(m); }
+    const std::string tl = sparkinfer_server::apply_spark25_chat_template(tools, false);
+    CHECK(tl == sos + "<|System|>\nyou are a helpful assistant." + eos +
+                sos + "<|User|>q" + eos +
+                sos + "<|Tool|><tool_response>a1</tool_response><tool_response>a2</tool_response>" + eos +
+                sos + "<|Bot|></think>");
+    return true;
+}
+
 int main() {
     if (!test_thinking_prompt_and_nonstream_parser()) return 1;
     if (!test_thinking_stream_boundaries()) return 1;
@@ -304,6 +394,7 @@ int main() {
     if (!test_gpt2_bytelevel_decode_invalid_utf8_shows_replacement()) return 1;
     if (!test_gpt2_bytelevel_decode_empty_piece()) return 1;
     if (!test_gpt2_bytelevel_decode_printable_ascii_roundtrip()) return 1;
+    if (!test_spark25_chat_template_renders_exact_markers()) return 1;
     std::printf("chat_tokenizer_test: OK\n");
     return 0;
 }

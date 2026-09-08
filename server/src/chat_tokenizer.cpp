@@ -368,8 +368,19 @@ std::string apply_qwen36_chat_template(const std::vector<ChatMessage>& messages,
 // Tool DEFINITIONS are deliberately not rendered here -- see the caller in encode_augmented.
 std::string apply_spark25_chat_template(const std::vector<ChatMessage>& messages,
                                         bool enable_thinking) {
-    static const char* kSos = "<\xef\xbd\x9cstart\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>";
-    static const char* kEos = "<\xef\xbd\x9cend\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>";
+    // U+FF5C FULLWIDTH VERTICAL LINE and U+2581 LOWER ONE EIGHTH BLOCK, written as hex escapes
+    // in ADJACENT string literals rather than one literal each.
+    //
+    // This split is load-bearing, not style. A C++ hex escape consumes every hex digit that
+    // follows it, so "\x9cend" is one escape \x9ce (out of range) plus "nd" -- not \x9c
+    // followed by "end". Writing kEos as a single literal produced a prompt that was invalid
+    // UTF-8 from its first end-of-sentence marker onward, which the tokenizer answered with a
+    // non-unwinding Rust panic that took the whole server down. kSos survived only by luck: the
+    // characters after ITS escapes ('s', 'o', '>') happen not to be hex digits.
+    static const char* kSos = "<\xef\xbd\x9c" "start" "\xe2\x96\x81" "of" "\xe2\x96\x81"
+                              "sentence" "\xef\xbd\x9c" ">";
+    static const char* kEos = "<\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81"
+                              "sentence" "\xef\xbd\x9c" ">";
     static const char* kDefaultSystem = "you are a helpful assistant.";
     std::ostringstream parts;
 
