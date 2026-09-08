@@ -1876,12 +1876,29 @@ bool launch_prefill_attn_mma_bf16(
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_PSPLIT");
         return e ? ((e[0] == '0') ? 0 : 1) : -1;
     }();
-    const int psplit = psplit_env >= 0 ? psplit_env : (n_tokens < 16384 ? 1 : 0);
+    // The 16384 cut-off above was the context this tier was first measured at, not a property of
+    // the arithmetic: it left EVERY shorter prompt paying for the hi+lo P plane, whose only cost
+    // centre is a SECOND PV mma over the same V fragment (see the PSPLIT arm of the PV loop).
+    // The scored ctx=4096 prefill is the one dimension that sat on the wrong side of it -- nsys
+    // puts its attention at 41.35 ms of a 282.51 ms pass while the 16k pass, on the single-P
+    // shape, runs the same kernel at nearly twice the mma efficiency.
+    // 2048 is not a new constant: it is the threshold the RQH=3 tier and attn_smem_pad() already
+    // use, and it is where the K/V re-read this tier exists to amortize starts to dominate. Every
+    // caller below it -- the scored ctx=128 prefill, continuous-batch decode's 256-token prefill,
+    // and the short accuracy paths -- keeps the 8-page split-P shape byte for byte, and 16k/32k/
+    // 256k are already on the >= 16384 side and are unchanged.
+    const int psplit = psplit_env >= 0 ? psplit_env : (n_tokens < 2048 ? 1 : 0);
     static const int group_blks_env = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_GROUP_BLKS");
         return e ? ((atoi(e) == 16) ? 16 : 8) : 0;
     }();
-    const int group_blks = group_blks_env ? group_blks_env : (n_tokens >= 16384 ? 16 : 8);
+    // Same cut-off, same reason: GN=256 halves the group iterations (and the two barriers and the
+    // online-softmax rescale each one carries) over GN=128. It moves with psplit rather than
+    // separately -- the wide group only reaches the RQH=3 tier when split-P is off, because the
+    // RQH=3 split-P footprint is over the device's dynamic-smem ceiling; taking it alone would
+    // drop ctx=4096 to RQH=2 and cost more sharing than the wider group buys (measured: +1.68%
+    // prefill but -2.31% on decode@4k, which is its own scored dimension).
+    const int group_blks = group_blks_env ? group_blks_env : (n_tokens >= 2048 ? 16 : 8);
     if (group_blks == 16) {
         if (!psplit && rqh_env >= 3 && gqa % 3 == 0 &&
             launch_attn_bf16_gqa<HD, 16, 3, false>(
