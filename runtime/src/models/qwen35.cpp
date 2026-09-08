@@ -5775,10 +5775,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         size_t fp4_free = 0, fp4_total = 0;
         cudaMemGetInfo(&fp4_free, &fp4_total);
         (void)fp4_free; (void)fp4_total;
-        bool down_fp4_on = c.max_seq <= 2048;
+        // These two legs used to be gated `c.max_seq <= 2048` -- a context proxy standing in for
+        // "will the per-run prefill arena still fit". It answers wrong in both directions: the
+        // ffn_down copy pays +32% at ctx=4096 (11787 -> 15498 pp) and the proxy refuses it, while
+        // at ctx=16384 the copy leaves the run 77 MB and the WHOLE prompt falls to the token loop
+        // ("[prefill] scratch alloc failed ... free=77/32110 MB", 10759 -> 98 pp). Ask the real
+        // question below instead, with a reserve that models the arena rather than a flat number.
+        bool down_fp4_on = true;
         if (fp4o_env)
             down_fp4_on = fp4o_env[0] == '1' || fp4o_env[0] == 'd';
-        wo_fp4_on = wo_fp4_on && c.max_seq <= 2048;
         // Cost EVERY copy that grows the footprint against the free VRAM that is actually there,
         // and drop legs in ascending order of what they are worth until the set fits. Only these
         // three grow it: gate/up convert and then release their native prefill copy, so they are
@@ -5792,10 +5797,22 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // A card that genuinely cannot spare it still declines here, and declines for the real
         // reason rather than for its label.
         {
-            const size_t reserve = [] {
+            // The reserve has to cover the per-run batched-prefill scratch arena, and that arena
+            // scales with the prompt -- a constant cannot separate a context where these copies
+            // pay from one where they starve the run. Model its two dominant terms at the largest
+            // single-pass prompt this session can take: the FFN staging (ffg|ffu|down, chunked at
+            // FC) and the per-token activations. Calibrated against both endpoints on this
+            // checkpoint: ~1.0 GB at ctx=4096, where the legs fit and pay, and ~3.9 GB at 16384,
+            // where they must be declined. SPARKINFER_MUSE_NVFP4_RESERVE_MB still overrides.
+            const size_t reserve = [&] {
                 const char* e = getenv("SPARKINFER_MUSE_NVFP4_RESERVE_MB");
-                long long mb = e ? atoll(e) : 384; if (mb < 0) mb = 0;
-                return (size_t)mb << 20;
+                if (e) { long long mb = atoll(e); if (mb < 0) mb = 0; return (size_t)mb << 20; }
+                const size_t n_max = (size_t)std::min(c.max_seq, prefill_single_pass_max_tokens());
+                const size_t fc_max = std::min<size_t>(n_max, 16384);   // FP4 FFN runs unchunked
+                const size_t ffn_stage = (size_t)3 * fc_max * (size_t)c.moe_ffn * sizeof(bf16);
+                const size_t act = (size_t)10 * n_max * (size_t)H * sizeof(bf16);
+                const size_t est = ffn_stage + act + ((size_t)256 << 20);
+                return est;
             }();
             const size_t want_qkvg = qkvg_fp4_on ? (size_t)c.n_layers *
                 (kernels::prefill_nvfp4_data_bytes(2 * qdim_a + 2 * kvdim_a, H) +
