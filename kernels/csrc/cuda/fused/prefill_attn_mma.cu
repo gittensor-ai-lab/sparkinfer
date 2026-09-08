@@ -335,6 +335,42 @@ __device__ __forceinline__ void pf_ldsm_x4(unsigned (&r)[4], unsigned a) {
 }
 template <int V> struct pf_int { static constexpr int value = V; };
 
+// ---------------------------------------------------------------------------
+// Wide K operand: a dim permutation shared between s_qi and the K pool read.
+//
+// The QK B operand fixes key = lane>>2, and a key's row in the paged pool is n_kv_heads*HEAD_DIM
+// = 1024 B from the next one, so a warp's 32 lanes always straddle EIGHT cache lines. At four
+// bytes per lane that is 128 B delivered for eight L1 wavefronts -- and the operand takes 32 such
+// loads per block per key group (KSTEPS x 2 key-halves x 2 k-sub-chunks). #999 fixed exactly this
+// shape for V by repacking the pool; the note it left says K needs no such thing because
+// [key][dim] is "exactly what QK's B operand wants". That is true of the BYTES and false of the
+// ACCESS: the four bytes a lane wants are contiguous, but the four lanes that share a key cover
+// only 16 of every 64, so consecutive lanes never coalesce and the eight lines stand.
+//
+// The contraction axis is a free relabeling. QK sums over dims, so permuting the dim axis by any
+// bijection changes nothing as long as Q and K are permuted the SAME way -- and Q is staged in
+// shared memory by this kernel's own prologue, where the layout costs nothing to choose. So pick
+// the permutation that makes each lane's dims contiguous IN THE POOL:
+//
+//   B operand k index    p = kk*32 + h2*16 + j*4 + i     (kk = k-step, h2 = sub-chunk, j = lane&3)
+//   pool byte offset     sigma(p) = c*64 + j*16 + m*4 + i,  where u = kk*2 + h2, c = u>>2, m = u&3
+//
+// Under it lane j's whole 64-byte share of a key is the contiguous run [j*16 + c*64, +16) over
+// c = 0..3, so the four lanes of a key cover 64 CONSECUTIVE bytes and one 16-byte-per-lane load
+// moves 512 B in four lines instead of 128 B in eight. The operand becomes 8 LDG.128 per block
+// per key group in place of 32 LDG.32: a quarter of the instructions and a quarter of the
+// wavefronts, for the same bytes.
+//
+// BIT-IDENTICAL. int32 accumulation is exact and order-independent, sigma is a bijection on
+// [0, HEAD_DIM), and every product Q[d]*K[d] is still formed exactly once -- only the order in
+// which the k axis is walked changes. pf_kperm is its inverse, applied where the prologue stores
+// a dim into s_qi.
+__device__ __forceinline__ int pf_kperm(int d) {
+    const int c = d >> 6, j = (d >> 4) & 3, m = (d >> 2) & 3, i = d & 3;
+    const int u = 4 * c + m;                       // = kk*2 + h2
+    return (u >> 1) * 32 + (u & 1) * 16 + j * 4 + i;
+}
+
 __device__ __forceinline__ void pf_mma_16832(int (&d)[4], const unsigned (&a)[4],
                                              unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -343,7 +379,7 @@ __device__ __forceinline__ void pf_mma_16832(int (&d)[4], const unsigned (&a)[4]
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-template <int HEAD_DIM, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false>
+template <int HEAD_DIM, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1>
 __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 ? 2 : 1))) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
@@ -405,6 +441,10 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     // is the whole point -- see the dispatch note on the RQH=6 tier.
     constexpr int SPL  = (PLANES > 0 && PLANES < RQH) ? PLANES : RQH;
     static_assert(RQH % SPL == 0, "the head loop must tile the score plane exactly");
+    // pf_kperm's chunking is written for a 256-byte key row, and the wide load fills the register
+    // form of the K operand -- which only exists on the rolling-plane path.
+    static_assert(!WIDEK || (HEAD_DIM == 256 && SPL != RQH),
+                  "WIDEK needs head_dim 256 and the rolling score plane");
     constexpr int SBLK = (SPL * BM * SPLD > BM * HEAD_DIM) ? SPL * BM * SPLD : BM * HEAD_DIM;
     float* s_s  = reinterpret_cast<float*>(s_pi + (size_t)RQH * BM * pld); // [SPL][BM][SPLD]
     float* s_o  = s_s;                                               // [BM][HEAD_DIM] epilogue landing
@@ -470,9 +510,12 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             // __expf(x) is `ex2.approx(x * log2e)`, and every x it is given has already been
             // multiplied by this row scale.
             if (lane == 0) s_qs[h * BM + r] = d * scale * 1.4426950408889634f;
+            // Under WIDEK the k axis is permuted so the K pool read coalesces; Q is staged
+            // through the same permutation, which is what keeps the product identical.
             #pragma unroll
             for (int e = 0; e < QE; e++)
-                s_qi[((size_t)h * BM + r) * qld + lane + e * 32] =
+                s_qi[((size_t)h * BM + r) * qld
+                     + (WIDEK ? pf_kperm(lane + e * 32) : (lane + e * 32))] =
                     (signed char)((amax == 0.f) ? 0 : (int)roundf(qv[e] / d));
         }
     }
@@ -545,7 +588,26 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                 const int pb = block_table[(k0 / BLKSZ) + warp];
                 kl = k_pool + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * HEAD_DIM
                    + (size_t)(lane >> 2) * KVLD + (lane & 3) * 4;
-                if constexpr (SPL != RQH) {
+                if constexpr (WIDEK) {
+                    // Lane j owns [j*16 + c*64, +16) of its key row, so the four lanes of a key
+                    // read 64 consecutive bytes and the load is one 16-byte-per-lane vector.
+                    // The 16 unsigneds it returns ARE kfr's 16 slots, in u = kk*2 + h2 order --
+                    // a rename, not a copy, so this costs no register over the narrow form.
+                    const signed char* kw = k_pool
+                        + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * HEAD_DIM
+                        + (size_t)(lane >> 2) * KVLD + (lane & 3) * 16;
+                    #pragma unroll
+                    for (int t = 0; t < 2; t++)
+                        #pragma unroll
+                        for (int c = 0; c < 4; c++) {
+                            const uint4 w = *reinterpret_cast<const uint4*>(
+                                kw + (size_t)t * 8 * KVLD + c * 64);
+                            kfr[(4 * c + 0) >> 1][t][(4 * c + 0) & 1] = w.x;
+                            kfr[(4 * c + 1) >> 1][t][(4 * c + 1) & 1] = w.y;
+                            kfr[(4 * c + 2) >> 1][t][(4 * c + 2) & 1] = w.z;
+                            kfr[(4 * c + 3) >> 1][t][(4 * c + 3) & 1] = w.w;
+                        }
+                } else if constexpr (SPL != RQH) {
                     #pragma unroll
                     for (int kk = 0; kk < KSTEPS; kk++)
                         #pragma unroll
@@ -868,6 +930,14 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                 // loads that feed one page cover one whole 32-byte sector between them.
                 constexpr size_t VTLD = (size_t)HEAD_DIM * 16;   // one page of one kv-head, packed
                 const int gpair = gblk & ~1;
+                // PVU=2 keeps TWO page pairs of V in flight. The pair loop's trip count is a
+                // runtime bound, so at PVU=1 ptxas has exactly one iteration's four operand loads
+                // live and every iteration pays a full L2 round trip before its twelve mma can
+                // issue; unrolling by two doubles the memory-level parallelism for eight more
+                // registers, which this kernel has only because it is not spilling (REG:128,
+                // STACK:0 either way). Four is measured identical to two (+0.01%) -- two pairs
+                // already cover the latency -- so it stays at the smaller code.
+                #pragma unroll PVU
                 for (int ks = 0; ks < gpair; ks += 2) {
                     const int lb0 = (k0 / BLKSZ) + ks;
                     const int lb1 = lb0 + 1;
@@ -1083,7 +1153,7 @@ const signed char* vpack_build(const signed char* v_pool, const int* block_table
 }
 }  // namespace
 
-template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false>
+template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1>
 static bool launch_attn_gqa(const void* q, const signed char* k_pool, const signed char* v_pool,
                             const void* k_scale, const void* v_scale, const int* block_table,
                             void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
@@ -1135,13 +1205,13 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                             + (size_t)2 * GN * sizeof(__half)
                             + (size_t)5 * RQH * BM * sizeof(float);
         const cudaError_t ce = cudaFuncSetAttribute(
-            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT>,
+            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT, WIDEK, PVU>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_max);
         if (ce != cudaSuccess && sm_max > 48u * 1024u) return false;  // opt-in refused where required
         cfg[dev] = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
-    pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT><<<grid, GROUP_BLKS * 32, sm, stream>>>(
+    pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT, WIDEK, PVU><<<grid, GROUP_BLKS * 32, sm, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
@@ -1160,8 +1230,9 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
     if (tier_dbg && !announced[dev]) {
         announced[dev] = true;
         fprintf(stderr,
-                "[pf-attn-tier] RQH=%d SPL=%d GB=%d GN=%d smem=%zu qld=%d pld=%d n=%d vt=%d ok=%d\n",
-                RQH, SPL, GROUP_BLKS, GN, sm, qld, pld, n_tokens, (int)VT, (int)ok);
+                "[pf-attn-tier] RQH=%d SPL=%d GB=%d GN=%d smem=%zu qld=%d pld=%d n=%d vt=%d "
+                "widek=%d pvu=%d ok=%d\n",
+                RQH, SPL, GROUP_BLKS, GN, sm, qld, pld, n_tokens, (int)VT, (int)WIDEK, PVU, (int)ok);
     }
     return ok;
 }
@@ -1233,6 +1304,19 @@ bool launch_prefill_attn_mma(
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_GQA6_MINKEYS");
         const long v = e ? atol(e) : 65536;
         return v < 0 ? 0 : v;
+    }();
+    // The six-head tier's operand issue path: permuted k axis + 16-byte-per-lane K operand load,
+    // and two page pairs of V in flight. The two are ONE lever -- measured separately on this
+    // checkpoint at the scored target-prefill@256k point, interleaved x2, against the same binary
+    // with both off (4813.66 pp/s): the K operand alone is +1.41%, the pair loop alone +2.30%,
+    // and together +6.20% where multiplying them predicts +3.75%. Neither is worth its own tier
+    // and both together are, because they are the same queue: unrolling the pair loop only pays
+    // if the extra loads it puts in flight have MIO slots to sit in, and the narrow K operand is
+    // what fills those slots (32 four-byte loads per key group against the wide form's 8).
+    // SPARKINFER_PREFILL_ATTN_WIDEK=0 restores both (A/B in ONE binary).
+    static const bool wide_k = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_WIDEK");
+        return !(e && e[0] == '0');
     }();
 
     if (!enabled || head_dim != HD || block_size != 16 || n_tokens < minctx) return false;
@@ -1309,16 +1393,24 @@ bool launch_prefill_attn_mma(
         const int n_blk = (q_pos0 + n_tokens + 15) / 16;
         const signed char* vt =
             vpack_build(v_pool, block_table, n_blk, n_kv_heads, HD, stream);
-        if (vt && launch_attn_gqa<HD, 16, 6, 2, true>(q, k_pool, v_pool, k_scale, v_scale,
-                block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
-                max_blocks_per_seq, scale, win_blocks, stream, q_pos0, vt))
+        if (vt && (wide_k
+                ? launch_attn_gqa<HD, 16, 6, 2, true, true, 2>(q, k_pool, v_pool, k_scale, v_scale,
+                      block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
+                      max_blocks_per_seq, scale, win_blocks, stream, q_pos0, vt)
+                : launch_attn_gqa<HD, 16, 6, 2, true, false, 1>(q, k_pool, v_pool, k_scale, v_scale,
+                      block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
+                      max_blocks_per_seq, scale, win_blocks, stream, q_pos0, vt)))
             return true;
         // No plane (disabled, or the allocation did not fit beside the prefill arena) keeps the
         // tier and its numerics -- the fallback is the SAME six-head kernel on the paged loads,
         // not a narrower tier.
-        if (launch_attn_gqa<HD, 16, 6, 2>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
-                n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks,
-                stream, q_pos0))
+        if (wide_k
+                ? launch_attn_gqa<HD, 16, 6, 2, false, true, 2>(q, k_pool, v_pool, k_scale, v_scale,
+                      block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
+                      max_blocks_per_seq, scale, win_blocks, stream, q_pos0)
+                : launch_attn_gqa<HD, 16, 6, 2, false, false, 1>(q, k_pool, v_pool, k_scale, v_scale,
+                      block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
+                      max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
             return true;
     }
     if (gqa_rqh >= 3 && gqa % 3 == 0 && n_tokens >= 2048) {
