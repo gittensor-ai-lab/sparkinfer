@@ -1346,9 +1346,26 @@ void launch_flash_decode_split(
             // read, so the wide fold gives back more parallelism than it saves. Measured at
             // ctx=4k, 4 rows: fold 2 = 14.389 ms per verify against fold 4 = 14.438 and no fold
             // at 14.6, i.e. two rows per CTA takes the whole win.
+            // ...and prefer the WIDEST divisor once the KV is big enough to be worth it. The
+            // narrowest-fold rule above was measured at ctx=4k, where a CTA's share of the staged
+            // KV is a quarter of what it is at 16k, so the extra CTAs it keeps resident are worth
+            // more than the re-read it pays. That trade inverts with context. Width 4 is the
+            // 12288..24576 band's shape (proposal depth 3 plus the seed row), and fold 2 there
+            // reads the KV TWICE where fold 4 reads it once. Measured on this checkpoint, arms
+            // interleaved in ONE binary, tau IDENTICAL at 1.8971 and lossless in every arm:
+            //     ctx=16384  fold 2  136.63 / 136.60 tok/s  ->  fold 4  138.13 / 138.47
+            // Gated, not switched, because the rule above is right where it was measured: the
+            // scored ctx=4096 point stays on it byte for byte, and a wider fold there buys nothing
+            // anyway -- its width is 6, and forcing the wider divisor that does fit reads 134.76
+            // against 134.51, i.e. flat. 12288 is not a new boundary: it is the one the
+            // proposal-depth ladder in qwen35.cpp already splits on, and the width this serves is
+            // the one that ladder produces.
             const int fa6_fold = fa6_fold_env > 0
                                ? fa6_fold_env
-                               : (num_seqs % 2 == 0 ? 2 : (num_seqs % 3 == 0 ? 3 : 1));
+                               : (seqlen >= 12288
+                                  ? (num_seqs % 4 == 0 ? 4
+                                     : (num_seqs % 3 == 0 ? 3 : (num_seqs % 2 == 0 ? 2 : 1)))
+                                  : (num_seqs % 2 == 0 ? 2 : (num_seqs % 3 == 0 ? 3 : 1)));
             // cp.async DOUBLE BUFFERING FOR THE FOLD. fa_split_gqa_pipe_kernel has carried a SEQ
             // template parameter since it was written and has never been instantiated above 1: the
             // fold below returns before the pipelined/KV-group dispatch further down, and that
