@@ -282,6 +282,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         return c;
     }();
     int FC = (N < ffn_chunk) ? N : ffn_chunk;
+    // Muse's FP4 FFN legs are correct only while the FFN runs in ONE chunk. The chunked loop
+    // still carries an FC-vs-N assumption of its own (separate from the fp4_a sizing fixed
+    // below): with FC < N it produces degenerate output, while FC == N reproduces the int8 token
+    // stream. That path had never run, because the only context Muse was allowed on FP4 was
+    // N == 128, where FC == N gives exactly one chunk anyway.
+    // Unchunking is worth +6% by itself and unlocks ~+60% of FP4 GEMM, so take it where the
+    // arena can hold the N-row staging; where it cannot, FC stays chunked and the FP4 gate below
+    // (FC == N) leaves Muse on exactly the int8 path it runs today.
+    if (c.muse_glimmer && !s.w.layers.empty() && s.w.layers[0].gate_fp4) {
+        static const int unchunk_max = [] {
+            const char* e = getenv("SPARKINFER_MUSE_FP4_UNCHUNK_MAXN");
+            return e ? atoi(e) : 16384;
+        }();
+        if (N <= unchunk_max) FC = N;
+    }
     bf16* lin_conv_state = static_cast<bf16*>(s.lin_conv_state);
 
     // ---- scratch ----
@@ -700,7 +715,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // Native block-scaled FP4 is deliberately narrow: Muse, the scored M=128 shape, and layers
     // whose eager conversion completed. One activation buffer is shared by gate/up. Down stays on
     // the higher-fidelity #808 quantized path because its error enters the residual directly.
-    const bool muse_nvfp4 = c.muse_glimmer && N == 128 && !s.w.layers.empty() &&
+    // Was `N == 128`: the scored Muse shape, and the only one the FP4 staging was correctly
+    // sized for. With that sizing fixed, the shape question is exactly what
+    // prefill_nvfp4_supported() already answers, so ask it instead of pinning one context.
+    // SPARKINFER_MUSE_NVFP4_MAXN caps it again (128 restores the old behaviour).
+    static const int muse_fp4_maxN = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_MAXN");
+        return e ? atoi(e) : (1 << 30);
+    }();
+    const bool muse_nvfp4 = c.muse_glimmer && N >= 128 && N <= muse_fp4_maxN &&
+                            FC == N &&          // chunked FP4 FFN is not correct yet; see FC above
+                            !s.w.layers.empty() &&
                             s.w.layers[0].gate_fp4 &&
                             kernels::prefill_nvfp4_supported(N, ffn, H);
     // Qwen3.8-27B's own gate/up NVFP4 (compressed-tensors checkpoint, see
