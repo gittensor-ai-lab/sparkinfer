@@ -564,18 +564,31 @@ __global__ void win_prefill_pure_bf16_kernel(
 // 32 keys in flight) instead of strictly key-sequential, exactly the way the
 // in-tree int8 lanepar kernel already differs from the int8 sequential ones.
 //
-// K/V stay bf16 in smem (the int8 kernel dequantizes to fp32 because it must):
-// 18.9 KB/block keeps the same ~5 blocks/SM the sequential kernel gets, where
-// fp32 tiles would cost 35 KB and halve occupancy. KSTRIDE pads the K row to
-// HEAD_DIM+8 bf16 = 68 words, and 68 % 32 == 4, so the eight lanes of a 16-byte
-// phase cover banks {0-3, 4-7, ... 28-31}: conflict-free.
+// K/V stay bf16 in smem: 18.9 KB/block keeps the same ~5 blocks/SM the sequential
+// kernel gets, where fp32 tiles would cost 35 KB and halve occupancy. KSTRIDE pads
+// the K row to HEAD_DIM+8 bf16 = 68 words, and 68 % 32 == 4, so the eight lanes of
+// a 16-byte phase cover banks {0-3, 4-7, ... 28-31}: conflict-free.
+//
+// INT8=true reads an int8 K/V pool and dequantizes DURING STAGING, so the tile is
+// bf16 either way and everything below the staging loop is the same code. The
+// alternative -- the hd256 int8 kernel's fp32 tile -- costs 35,328 B at this shape,
+// which caps the SM at 6 resident blocks where 18,944 B reaches the 8 that 256
+// threads/block allow; and it makes the per-lane K row 32 float4 loads instead of
+// 16 uint4, on a kernel that profiles as shared-memory-ISSUE bound. Dequantizing
+// into bf16 costs ~2^-9 relative rounding on top of the int8 step itself, which is
+// small beside the 1/254 the quantization already spends.
 // ----------------------------------------------------------------------------
-template <int HEAD_DIM, int NWARP, int QPW, int TK>
+template <int HEAD_DIM, int NWARP, int QPW, int TK, bool INT8 = false>
 __global__ void win_prefill_lanepar_bf16_kernel(
-    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
-    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pool_v,
+    const void* __restrict__ v_pool_v, const __half* __restrict__ k_scale,
+    const __half* __restrict__ v_scale, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
     int block_size, int max_blocks_per_seq, float scale, int win_blocks) {
+    auto* k_pool  = static_cast<const __nv_bfloat16*>(k_pool_v);
+    auto* v_pool  = static_cast<const __nv_bfloat16*>(v_pool_v);
+    auto* k_pool8 = static_cast<const signed char*>(k_pool_v);
+    auto* v_pool8 = static_cast<const signed char*>(v_pool_v);
     constexpr int ELEMS = HEAD_DIM / 32;
     constexpr int KSTRIDE = HEAD_DIM + 8;   // bf16 elems; see bank note above
     constexpr int TQ = NWARP * QPW;         // queries per block
@@ -640,10 +653,32 @@ __global__ void win_prefill_lanepar_bf16_kernel(
             const int phys = block_table[blk];
             const size_t ckt = (size_t)phys * block_size + within;
             const size_t off = (ckt * n_kv_heads + kv_head) * HEAD_DIM + d;
-            *reinterpret_cast<uint4*>(sK + (size_t)kk * KSTRIDE + d) =
-                *reinterpret_cast<const uint4*>(k_pool + off);
-            *reinterpret_cast<uint4*>(sV + (size_t)kk * HEAD_DIM + d) =
-                *reinterpret_cast<const uint4*>(v_pool + off);
+            if constexpr (INT8) {
+                const float ksc = __half2float(k_scale[ckt * n_kv_heads + kv_head]);
+                const float vsc = __half2float(v_scale[ckt * n_kv_heads + kv_head]);
+                const char4 ka = *reinterpret_cast<const char4*>(k_pool8 + off);
+                const char4 kb = *reinterpret_cast<const char4*>(k_pool8 + off + 4);
+                const char4 va = *reinterpret_cast<const char4*>(v_pool8 + off);
+                const char4 vb = *reinterpret_cast<const char4*>(v_pool8 + off + 4);
+                __nv_bfloat162 kt[4], vt[4];
+                kt[0] = __floats2bfloat162_rn(ka.x * ksc, ka.y * ksc);
+                kt[1] = __floats2bfloat162_rn(ka.z * ksc, ka.w * ksc);
+                kt[2] = __floats2bfloat162_rn(kb.x * ksc, kb.y * ksc);
+                kt[3] = __floats2bfloat162_rn(kb.z * ksc, kb.w * ksc);
+                vt[0] = __floats2bfloat162_rn(va.x * vsc, va.y * vsc);
+                vt[1] = __floats2bfloat162_rn(va.z * vsc, va.w * vsc);
+                vt[2] = __floats2bfloat162_rn(vb.x * vsc, vb.y * vsc);
+                vt[3] = __floats2bfloat162_rn(vb.z * vsc, vb.w * vsc);
+                *reinterpret_cast<uint4*>(sK + (size_t)kk * KSTRIDE + d) =
+                    *reinterpret_cast<const uint4*>(kt);
+                *reinterpret_cast<uint4*>(sV + (size_t)kk * HEAD_DIM + d) =
+                    *reinterpret_cast<const uint4*>(vt);
+            } else {
+                *reinterpret_cast<uint4*>(sK + (size_t)kk * KSTRIDE + d) =
+                    *reinterpret_cast<const uint4*>(k_pool + off);
+                *reinterpret_cast<uint4*>(sV + (size_t)kk * HEAD_DIM + d) =
+                    *reinterpret_cast<const uint4*>(v_pool + off);
+            }
         }
         __syncthreads();
         if (active && k0 <= qtok[QPW - 1]) {
@@ -903,9 +938,8 @@ void launch_prefill_attn_swa_pure_bf16(
         const size_t sm = (size_t)(TK * KSTRIDE + TK * HD + TQB * HD) * sizeof(__nv_bfloat16);
         dim3 g((n_tokens + TQB - 1) / TQB, n_q_heads);
         win_prefill_lanepar_bf16_kernel<HD, NWARP, QPW, TK><<<g, NWARP * 32, sm, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(q),
-            reinterpret_cast<const __nv_bfloat16*>(k_pool),
-            reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table,
+            reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
+            nullptr, nullptr, block_table,
             reinterpret_cast<__nv_bfloat16*>(attn),
             n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks);
         return;
@@ -931,13 +965,29 @@ void launch_prefill_attn_swa_pure_int8(
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
     cudaStream_t stream) {
     (void)head_dim;   // Muse Glimmer attention is hd128 only; templated below.
-    constexpr int HD = 128, TK = 32, NWARP = 8, QPW = 1, TQ = NWARP * QPW;
-    // fp32 K tile (rows padded +4) + fp32 V tile + bf16 query tile == 35,328 B, under the 48 KB
-    // default, so unlike the hd256 instantiation this needs no cudaFuncSetAttribute opt-in.
-    const size_t sm = ((size_t)TK * (HD + 4) + (size_t)TK * HD) * sizeof(float)
-                    + (size_t)TQ * HD * sizeof(__nv_bfloat16);
+    constexpr int HD = 128, TK = 32, KSTRIDE = HD + 8, NWARP = 8, QPW = 1, TQ = NWARP * QPW;
+    // The int8 pool is dequantized into a BF16 tile during staging, so this shares the schedule,
+    // the pure-window mask and the smem budget of the bf16 kernel: 18,944 B rather than the
+    // 35,328 B an fp32 tile would take. SPARKINFER_MUSE_ATTN_I8_FP32=1 selects the fp32-tile
+    // kernel instead (same result, different rounding) if that trade ever needs re-measuring.
+    static const bool fp32_tile = [] {
+        const char* e = getenv("SPARKINFER_MUSE_ATTN_I8_FP32");
+        return e && e[0] == '1';
+    }();
     dim3 g((n_tokens + TQ - 1) / TQ, n_q_heads);
-    win_prefill_lanepar_kernel<HD, QPW, TK, /*WINDOWED=*/true, /*SINK=*/false, NWARP>
+    if (fp32_tile) {
+        const size_t sm = ((size_t)TK * (HD + 4) + (size_t)TK * HD) * sizeof(float)
+                        + (size_t)TQ * HD * sizeof(__nv_bfloat16);
+        win_prefill_lanepar_kernel<HD, QPW, TK, /*WINDOWED=*/true, /*SINK=*/false, NWARP>
+            <<<g, NWARP * 32, sm, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
+                reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
+                block_table, reinterpret_cast<__nv_bfloat16*>(attn),
+                n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks);
+        return;
+    }
+    const size_t sm = (size_t)(TK * KSTRIDE + TK * HD + TQ * HD) * sizeof(__nv_bfloat16);
+    win_prefill_lanepar_bf16_kernel<HD, NWARP, QPW, TK, /*INT8=*/true>
         <<<g, NWARP * 32, sm, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
             reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
