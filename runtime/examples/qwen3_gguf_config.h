@@ -102,11 +102,73 @@ static void museglimmer_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::
         cfg.swa_layers[i] = pattern[i] != 0;
 }
 
+// Spark-X2.5 (iFlytek, 2026): dense GQA-16 transformer, 3 sliding-window layers to every 1
+// full-attention layer. Single metadata namespace, like muse-glimmer.
+static long spark25_meta_int(const sparkinfer::GGUF& g, const std::string& key, long def) {
+    return g.meta_int("spark2_5." + key, def);
+}
+static double spark25_meta_float(const sparkinfer::GGUF& g, const std::string& key, double def) {
+    return g.meta_float("spark2_5." + key, def);
+}
+
+static void spark25_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35Config& cfg) {
+    cfg.spark25 = true;
+    cfg.n_layers   = (int)spark25_meta_int(g, "block_count", 36);
+    cfg.hidden     = (int)spark25_meta_int(g, "embedding_length", 2560);
+    cfg.n_q_heads  = (int)spark25_meta_int(g, "attention.head_count", 16);
+    cfg.n_kv_heads = (int)spark25_meta_int(g, "attention.head_count_kv", 4);
+    cfg.head_dim   = (int)spark25_meta_int(g, "attention.key_length", 256);
+    cfg.rms_eps    = (float)spark25_meta_float(g, "attention.layer_norm_rms_epsilon", 1e-6f);
+    cfg.vocab      = (int)spark25_meta_int(g, "vocab_size", 131072);
+    if (const sparkinfer::GGUFTensor* emb = g.tensor("token_embd.weight"))
+        if (emb->n_dims >= 2) cfg.vocab = (int)emb->dims[1];
+    cfg.eos_id     = (int)g.meta_int("tokenizer.ggml.eos_token_id", 1);
+    cfg.eos_id2    = -1;
+
+    // Rotary: the two layer kinds carry DIFFERENT theta and DIFFERENT rotary widths, which is the
+    // one thing about this architecture no other checkpoint here needs. The unsuffixed keys are
+    // the full-attention layers' (matching config.json's rope_parameters.full_attention), the
+    // _swa-suffixed ones the sliding layers'. Spark-X2.5-4B: full = 5e6 over 64 of 256 head dims
+    // (partial_rotary_factor 0.25), sliding = 1e4 over all 256 (factor 1.0).
+    cfg.rope_theta     = (float)spark25_meta_float(g, "rope.freq_base", 5000000.f);
+    cfg.rope_theta_swa = (float)spark25_meta_float(g, "rope.freq_base_swa", 10000.f);
+    cfg.rope_dim       = (int)spark25_meta_int(g, "rope.dimension_count", 64);
+    cfg.rope_dim_swa   = (int)spark25_meta_int(g, "rope.dimension_count_swa", cfg.head_dim);
+    // Deliberately NOT normalized to 0 ("rotate everything") when the sliding layers' width
+    // equals head_dim. The partial-RoPE kernels are exact at rotary_dim == head_dim -- they pair
+    // (t, t + rotary_dim/2) and copy the head_dim - rotary_dim tail, which is empty -- so keeping
+    // 256 here lets BOTH layer kinds run the same partial kernels with only the width and theta
+    // differing. Normalizing would instead push the sliding layers onto the full-width arm, which
+    // has no int8-KV variant at all, for no gain.
+
+    cfg.sliding_window = (int)spark25_meta_int(g, "attention.sliding_window", 512);
+    // GGUF writes this as a bool array; GGUF::meta_int_array captures VT_BOOL as 0/1. true =
+    // sliding_attention, matching config.json's layer_types order.
+    std::vector<long> pattern = g.meta_int_array("spark2_5.attention.sliding_window_pattern");
+    cfg.swa_layers.assign(cfg.n_layers, false);
+    for (int i = 0; i < cfg.n_layers && i < (int)pattern.size(); i++)
+        cfg.swa_layers[i] = pattern[i] != 0;
+
+    // Dense GeGLU FFN, per-head sigmoid output gate, no QK-norm.
+    cfg.dense_ffn = true;
+    cfg.n_experts = 1; cfg.top_k = 1; cfg.n_shared = 0;
+    cfg.moe_ffn = (int)spark25_meta_int(g, "feed_forward_length", 10240);
+    cfg.ffn_gelu = true;
+    cfg.headwise_attn_gate = true;
+    cfg.no_qk_norm = true;
+
+    // Same two flags Muse Glimmer sets for the same two reasons: hybrid=true unlocks batched
+    // prefill and the attention-gate path (w.q_has_gate = c.hybrid), and full_attn_interval=0
+    // makes is_linear_layer() unconditionally false -- there are no Gated-DeltaNet layers here,
+    // only windowed or full softmax attention.
+    cfg.hybrid = true;
+    cfg.full_attn_interval = 0;
+}
+
 static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35Config& cfg) {
-    if (g.meta_str("general.architecture") == "muse-glimmer") {
-        museglimmer_config_from_gguf(g, cfg);
-        return;
-    }
+    const std::string arch = g.meta_str("general.architecture");
+    if (arch == "muse-glimmer") { museglimmer_config_from_gguf(g, cfg); return; }
+    if (arch == "spark2_5")     { spark25_config_from_gguf(g, cfg);     return; }
     cfg.n_layers   = (int)qwen3_meta_int(g, "block_count", cfg.n_layers);
     // A trailing MTP (multi-token-prediction) block ships as one extra full transformer
     // layer plus its own blk.{n}.nextn.* projection/norm tensors (Qwen3.8-27B: block_count=65,
@@ -197,6 +259,7 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
 
 static const char* qwen3_model_label(const sparkinfer::Qwen35Config& cfg) {
     if (cfg.muse_glimmer) return "Muse Glimmer 30B";
+    if (cfg.spark25) return "Spark-X2.5 dense SWA hybrid";
     if (cfg.dense_ffn) return cfg.eos_id2 == 248044 ? "Qwen3.8-27B dense hybrid" : "Qwen3.5-9B dense hybrid";
     return cfg.hybrid ? "Qwen3.5/Qwen3.6-35B-A3B hybrid" : "Qwen3-MoE";
 }

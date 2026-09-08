@@ -228,6 +228,7 @@ struct ChatTokenizer::Impl {
     std::unique_ptr<tokenizers::Tokenizer> tok;
     bool museglimmer = false;
     bool qwen38 = false;
+    bool spark25 = false;
     // Muse Glimmer harmony-format marker token ids, resolved once in set_museglimmer() (single
     // -threaded server startup, after `tok` is loaded) -- see decode()'s comment for why these
     // need special handling. Deliberately NOT lazily resolved on first decode(): decode() runs
@@ -263,6 +264,7 @@ bool ChatTokenizer::load(const std::string& tokenizer_json_path, std::string& er
 }
 
 void ChatTokenizer::set_qwen38(bool on) { impl_->qwen38 = on; }
+void ChatTokenizer::set_spark25(bool on) { impl_->spark25 = on; }
 
 void ChatTokenizer::set_museglimmer(bool on) {
     impl_->museglimmer = on;
@@ -311,9 +313,9 @@ bool parse_enable_thinking(const std::string& request_json, bool default_value) 
     return default_value;
 }
 
-bool validate_chat_request_model_support(const ChatRequest& request, bool museglimmer,
+bool validate_chat_request_model_support(const ChatRequest& request, bool no_tool_support,
                                          std::string& err) {
-    if (!museglimmer) return true;
+    if (!no_tool_support) return true;
     bool has_tool_history = false;
     for (const ChatMessage& message : request.messages) {
         if (message.role == "tool" || !message.tool_calls.empty()) {
@@ -322,11 +324,11 @@ bool validate_chat_request_model_support(const ChatRequest& request, bool musegl
         }
     }
     if (!request.tools.empty() || has_tool_history) {
-        err = "tool calling is currently supported only for Qwen3.6 models";
+        err = "tool calling is not supported for this model";
         return false;
     }
     if (request.response_format.type != ResponseFormatType::kText) {
-        err = "structured response_format is currently supported only for Qwen3.6 models";
+        err = "structured response_format is not supported for this model";
         return false;
     }
     return true;
@@ -351,6 +353,66 @@ std::string apply_qwen36_chat_template(const std::vector<ChatMessage>& messages,
 // (the upstream template only emits it when a `current_date`/`strftime_now` template var is
 // supplied, which this server doesn't provide); `knowledge_cutoff` uses the template's own
 // literal default.
+// Spark-X2.5's chat template, transcribed from chat_template.jinja in XHToken/Spark-X2.5-4B
+// (the "0826" revision). Two marker alphabets are in play and they are NOT interchangeable: the
+// turn envelope uses FULLWIDTH vertical bars and the lower-one-eighth-block word separator
+// (U+FF5C / U+2581) exactly as the checkpoint's tokenizer has them as single tokens, while the
+// role tags are plain ASCII pipes. Mixing the two produces text that still tokenizes -- into a
+// dozen junk pieces instead of one special token -- so it degrades quietly rather than failing.
+//
+// Structure: one initial <|System|> block that ALWAYS carries the default system prompt (a
+// caller-supplied system message is appended to it, not substituted for it), then one envelope
+// per turn, then the generation prompt. Thinking is selected by which tag the generation prompt
+// opens with: <think> to let the model reason, </think> to close it immediately.
+//
+// Tool DEFINITIONS are deliberately not rendered here -- see the caller in encode_augmented.
+std::string apply_spark25_chat_template(const std::vector<ChatMessage>& messages,
+                                        bool enable_thinking) {
+    static const char* kSos = "<\xef\xbd\x9cstart\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>";
+    static const char* kEos = "<\xef\xbd\x9cend\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>";
+    static const char* kDefaultSystem = "you are a helpful assistant.";
+    std::ostringstream parts;
+
+    parts << kSos << "<|System|>" << '\n' << kDefaultSystem;
+    if (!messages.empty() && messages[0].role == "system" && !messages[0].content.empty())
+        parts << "\n\n" << messages[0].content;
+    parts << kEos;
+
+    for (size_t i = 0; i < messages.size(); i++) {
+        const ChatMessage& m = messages[i];
+        std::string role = m.role;
+        for (auto& ch : role) ch = (char)tolower((unsigned char)ch);
+        if (role == "system") {
+            // messages[0]'s system content was folded into the initial block above; a system
+            // message anywhere else still gets its own envelope, matching the template's
+            // `if not loop.first` guard.
+            if (i != 0)
+                parts << kSos << "<|System|>\n" << m.content << kEos;
+        } else if (role == "user") {
+            parts << kSos << "<|User|>" << m.content << kEos;
+        } else if (role == "assistant") {
+            parts << kSos << "<|Bot|>";
+            if (!m.reasoning_content.empty())
+                parts << "<think>" << m.reasoning_content << "</think>";
+            else
+                parts << "</think>";
+            parts << m.content << kEos;
+        } else if (role == "tool") {
+            // Consecutive tool results share ONE envelope, so the opening tag is emitted only
+            // when the previous message was not also a tool result and the closing tag only when
+            // the next one is not.
+            const bool open = (i == 0) || messages[i - 1].role != "tool";
+            const bool close = (i + 1 >= messages.size()) || messages[i + 1].role != "tool";
+            if (open) parts << kSos << "<|Tool|>";
+            parts << "<tool_response>" << m.content << "</tool_response>";
+            if (close) parts << kEos;
+        }
+    }
+
+    parts << kSos << "<|Bot|>" << (enable_thinking ? "<think>" : "</think>");
+    return parts.str();
+}
+
 std::string apply_museglimmer_chat_template(const std::vector<ChatMessage>& messages,
                                              const std::string& reasoning_strength) {
     std::ostringstream parts;
@@ -706,7 +768,12 @@ bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::ve
     }
     ChatRequest request;
     if (!parse_chat_request_json(request_json, request, err)) return false;
-    if (!validate_chat_request_model_support(request, impl_->museglimmer, err)) return false;
+    // Spark-X2.5 joins Muse Glimmer on the no-tools side: its tool-call wire format
+    // (<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>) has neither a
+    // renderer nor a parser here yet, so a tools request is refused rather than answered with
+    // the tools silently dropped.
+    if (!validate_chat_request_model_support(request, impl_->museglimmer || impl_->spark25, err))
+        return false;
 
     ids = encode_augmented(request, enable_thinking);
     if (ids.empty()) {
@@ -720,7 +787,13 @@ bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::ve
 std::vector<int> ChatTokenizer::encode_augmented(const ChatRequest& request, bool enable_thinking) const {
     std::lock_guard<std::recursive_mutex> tok_lock(tok_mu_);
     if (!impl_->tok) return {};
-    const std::string prompt = impl_->museglimmer
+    // Spark-X2.5 gets its own template rather than the qwen36 tools template: no marker is
+    // shared between the two, so the fallback would render a prompt this checkpoint has never
+    // seen. Tool definitions are not rendered for it yet -- validate_chat_request_model_support
+    // rejects a tools request up front rather than silently dropping the tools.
+    const std::string prompt = impl_->spark25
+        ? apply_spark25_chat_template(request.messages, enable_thinking)
+        : impl_->museglimmer
         ? apply_museglimmer_chat_template(request.messages, enable_thinking ? "high" : "low")
         : apply_qwen36_tools_template(request, enable_thinking, impl_->qwen38);
     const std::vector<int32_t> enc = impl_->tok->Encode(prompt);

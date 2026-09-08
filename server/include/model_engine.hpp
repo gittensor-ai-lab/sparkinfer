@@ -107,6 +107,9 @@ public:
     int max_seq() const;
     bool is_museglimmer() const;
     bool is_qwen38() const;
+    // Spark-X2.5 (iFlytek, model_type "spark2_5"). Drives chat-template selection and the
+    // model id reported by /v1/models; mutually exclusive with the two above.
+    bool is_spark25() const;
     // True when the loaded checkpoint shipped a vision tower and it loaded successfully. False
     // for every text-only model, and for a vision checkpoint whose tower failed to load -- in
     // both cases a request carrying images is refused rather than answered from its text.

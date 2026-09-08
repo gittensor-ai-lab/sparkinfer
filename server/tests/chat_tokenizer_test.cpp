@@ -197,7 +197,9 @@ bool test_muse_rejects_all_tool_protocol_history() {
     })JSON";
     CHECK(sparkinfer_server::parse_chat_request_json(request, parsed, error));
     CHECK(!sparkinfer_server::validate_chat_request_model_support(parsed, true, error));
-    CHECK(error.find("supported only for Qwen3.6") != std::string::npos);
+    // The second argument is "this model has no tool-call renderer/parser" -- it covers Muse
+    // Glimmer and Spark-X2.5, so the message names neither model family.
+    CHECK(error.find("tool calling is not supported for this model") != std::string::npos);
     error.clear();
     CHECK(sparkinfer_server::validate_chat_request_model_support(parsed, false, error));
     return true;

@@ -22,6 +22,11 @@ target_link_libraries(dflash_gguf_config_cpu_test PRIVATE CUDA::cudart)
 set_target_properties(dflash_gguf_config_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME dflash_gguf_config_cpu_test COMMAND dflash_gguf_config_cpu_test)
 
+add_executable(spark25_config_cpu_test spark25_config_cpu_test.cpp ../src/gguf.cpp)
+target_link_libraries(spark25_config_cpu_test PRIVATE CUDA::cudart)
+set_target_properties(spark25_config_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME spark25_config_cpu_test COMMAND spark25_config_cpu_test)
+
 # Thermal governor — pure tiering policy (no GPU); links the runtime for classify()/pace() symbols.
 add_executable(thermal_governor_cpu_test thermal_governor_cpu_test.cpp)
 target_link_libraries(thermal_governor_cpu_test PRIVATE sparkinfer_runtime)

@@ -41,6 +41,7 @@
 #include "sparkinfer/kernels/qtype.h"
 #include "sparkinfer/kernels/proj_requant.h"
 #include "sparkinfer/kernels/prefill_nvfp4.h"
+#include "sparkinfer/kernels/spark25.h"  // GeGLU + head-wise sigmoid gate (Spark-X2.5)
 #include "sparkinfer/lmcache_bridge_client.h"
 #include "sparkinfer/lmcache_staging.h"
 
@@ -720,9 +721,16 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
                 sparse_view ? gqa_ratio : 4, p_->sparse_window, p_->sparse_window * kv->block_size(),
                 p_->sparse_min_ctx, sparse_view ? " (compact-view, decode-only)" : "");
     }
-    // Muse Glimmer: mandatory pure sliding-window view for swa-flagged layers, every step,
-    // regardless of context length (architectural, not a long-context approximation).
-    if (cfg.muse_glimmer && cfg.sliding_window > 0) {
+    // Muse Glimmer and Spark-X2.5: mandatory pure sliding-window view for swa-flagged layers,
+    // every step, regardless of context length (architectural, not a long-context approximation).
+    //
+    // The view is BLOCK-granular: it keeps the last ceil(window/block_size) KV blocks, so the keys
+    // actually visible number between window - (block_size - 1) and window, against a reference
+    // implementation's exact `window` (HF builds a per-token sliding mask). At Spark-X2.5's
+    // window of 512 and this cache's block size that is a worst case of a few keys at the far end
+    // of the window, on the 3-in-4 sliding layers only. Measured, not assumed -- see
+    // bench/scripts/spark25_ref_check.py.
+    if ((cfg.muse_glimmer || cfg.spark25) && cfg.sliding_window > 0) {
         p_->swa_budget = (cfg.sliding_window + kv->block_size() - 1) / kv->block_size();
         p_->swa_vtbl = p_->alloc<int>(p_->swa_budget);
         p_->swa_vlen = p_->alloc<int>(1);
@@ -730,8 +738,10 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         if (vs > Impl::MAX_NSPLITS) vs = Impl::MAX_NSPLITS;
         if (vs < 1) vs = 1;
         p_->swa_vsplits = vs;
-        fprintf(stderr, "[muse-glimmer] sliding-window: %d tokens (%d blocks), every-4th-layer global/NoPE\n",
-                cfg.sliding_window, p_->swa_budget);
+        fprintf(stderr, "[%s] sliding-window: %d tokens (%d blocks)\n",
+                cfg.spark25 ? "spark2_5" : "muse-glimmer", cfg.sliding_window, p_->swa_budget);
+    }
+    if (cfg.muse_glimmer) {
         // Unweighted RMSNorm applied to the token embedding before layer 0 (no learned
         // per-channel weight -- launch_rmsnorm always takes one, so fill a constant-1.0
         // buffer once at load time and reuse it as that "weight").
@@ -1329,7 +1339,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                            s.kv->block_size(), s.sparse_window, s.sparse_budget, st);
     // Muse Glimmer: pure sliding-window view for swa-flagged layers, every step (mandatory,
     // not gated by context length like the sparse-kv approximation above).
-    if (c.muse_glimmer && s.swa_vtbl)
+    if ((c.muse_glimmer || c.spark25) && s.swa_vtbl)
         kernels::launch_fa_kv_compact_view_pure(s.d_seqlen, btable, s.swa_vtbl, s.swa_vlen,
                                                 s.kv->block_size(), s.swa_budget, s.swa_budget, st);
     // Prime: xn = RMSNorm(x, layer0.input_norm). Each layer's tail then fuses the
@@ -1645,6 +1655,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 // straight to s.q and the gate straight to s.qgate -- no [q|gate] interleave to
                 // build and no split to undo it. Every other model still fuses them into s.qraw.
                 const bool sep_gate = (w.wgate != nullptr);
+                // Spark-X2.5's gate projection emits ONE scalar per head, not one per head
+                // element, so it is n_q_heads wide rather than qdim (headwise_attn_output_gate
+                // in its config.json). s.qgate is qdim-sized, which covers both.
+                const int gate_out = c.headwise_attn_gate ? c.n_q_heads : s.qdim;
                 void* q_dst = (w.q_has_gate && !sep_gate) ? s.qraw : s.q;
                 const int nq = (w.q_has_gate && !sep_gate) ? s.qdim * 2 : s.qdim;
                 // Muse Glimmer's Q and attn-gate are two separate Q4_K tensors projected
@@ -1661,7 +1675,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                                          nq, s.qdim, H, qs))
                         return;
                     proj_xn(w.wq, w.wq_type, q_dst, nq, qs);
-                    if (sep_gate) proj_xn(w.wgate, w.wgate_type, s.qgate, s.qdim, qs);
+                    if (sep_gate) proj_xn(w.wgate, w.wgate_type, s.qgate, gate_out, qs);
                 };
                 // The fused QKV kernel writes one contiguous q of width nq and knows nothing about
                 // a separate gate tensor, so it cannot serve this path.
@@ -1710,7 +1724,24 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             dbg_bf16(s.qgate, s.qdim, 12, L);  // tag 12: attn gate proj, pre-sigmoid
             dbg_bf16(s.k, s.kvdim, 13, L);     // tag 13: K, raw, pre QK-norm
 
-            if (!w.q_has_gate && !partial_rope && (s.use_attnin || kv8)) {
+            if (c.spark25) {
+                // No QK-norm to run (this checkpoint ships none), and -- unlike Muse Glimmer,
+                // the other swa_layers consumer -- BOTH layer kinds rotate. They differ only in
+                // theta and rotary width, so one arm serves both: the partial kernels are exact
+                // at rotary_dim == head_dim, which is what the sliding layers use.
+                const int   rope_d = c.rope_dim_for(L);
+                const float rope_t = c.rope_theta_for(L);
+                if (kv8)
+                    kernels::launch_rope_kv_append_partial_int8(
+                        s.q, s.k, s.v, kpool, vpool, kscale, vscale, btable, s.d_pos, 1,
+                        c.n_q_heads, c.n_kv_heads, c.head_dim, rope_d, rope_t,
+                        s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                else
+                    kernels::launch_rope_kv_append_partial(
+                        s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
+                        c.n_q_heads, c.n_kv_heads, c.head_dim, rope_d, rope_t,
+                        s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+            } else if (!w.q_has_gate && !partial_rope && (s.use_attnin || kv8)) {
                 // Qwen3-MoE frontier: fused int8 QK-norm + RoPE + KV-append (unchanged vs main)
                 kernels::launch_qknorm_rope_kv_append(s.q, s.k, s.v, w.q_norm, w.k_norm, kpool, vpool,
                                                       btable, s.d_pos, 1, c.n_q_heads, c.n_kv_heads,
@@ -1844,11 +1875,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             static int mg_gq8 = -1;
             if (mg_gq8 < 0) { const char* e = getenv("SPARKINFER_MG_ATTN_GQ8"); mg_gq8 = (e && e[0] == '0') ? 0 : 1; }
             const bool mg_gate_ok = c.muse_glimmer && mg_gq8 && c.head_dim == 128;
+            // !c.headwise_attn_gate: the fused gate-then-quantize path multiplies s.qgate into
+            // the attention output elementwise, which is wrong for a per-head scalar gate. Today
+            // this is also unreachable for Spark-X2.5 via the H test, but that is incidental.
             const bool attn_gate_q8 = attn_gq8 && w.q_has_gate && s.gguf && s.use_pq && s.use_llama
+                                      && !c.headwise_attn_gate
                                       && (H == 2048 || H == 4096 || mg_gate_ok)
                                       && (w.wo_type == 12 || w.wo_type == 8) && (s.qdim % 32 == 0);
             const bool emit_attn_q8 = !w.q_has_gate && s.use_attnin && s.gguf && s.use_pq && s.use_llama && w.wo_type == 12;
-            if (c.muse_glimmer && w.swa && s.swa_vtbl) {
+            if ((c.muse_glimmer || c.spark25) && w.swa && s.swa_vtbl) {
                 // Sliding-window layer: same dense flash-decode entry point, pointed at the
                 // per-step pure sliding-window compact view (no sink, unlike the sparse-kv
                 // path above) instead of the full KV. Mandatory every step at this context
@@ -1903,7 +1938,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             }
             dbg_bf16(s.attn, s.qdim, 30, L);   // tag 30: SDPA output, pre-gate
             if (w.q_has_gate && !attn_gate_q8) {
-                kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, s.qdim, st);
+                if (c.headwise_attn_gate)
+                    kernels::launch_spark25_mul_sigmoid_headwise(s.attn, s.qgate, 1,
+                                                                 c.n_q_heads, c.head_dim, st);
+                else
+                    kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, s.qdim, st);
             }
             dbg_bf16(s.attn, s.qdim, 31, L);   // tag 31: SDPA output, post sigmoid-gate
 
@@ -2076,7 +2115,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // single fused kernel. That is the slow-but-obviously-correct shape for an accuracy
             // experiment; if the accuracy win is real, the fusion work follows, and NVFP4's
             // decoded magnitudes are exact int8 so a dp4a path is reachable.
-            if (w.gate_nv && w.up_nv && w.down_nv && c.top_k == 1) {
+            if (c.spark25) {
+                // GeGLU, not SwiGLU: down(gelu(gate(x)) * up(x)). launch_moe_expert_ffn_q4k bakes
+                // SiLU into fourteen specialized variants, so this runs deliberately unfused --
+                // gate/up GEMVs, an elementwise GELU gate, then the down GEMV -- exactly the shape
+                // the NVFP4 accuracy path below uses, and for the same reason: a new architecture
+                // gets the obviously-correct path first. Fusing GELU into the MMVQ kernels is a
+                // measurable follow-up, not a correctness question.
+                kernels::launch_gemv_q(s.hn, w.gate_q, w.gate_qtype, s.nv_gate, c.moe_ffn, H, st);
+                kernels::launch_gemv_q(s.hn, w.up_q,   w.up_qtype,   s.nv_up,   c.moe_ffn, H, st);
+                kernels::launch_spark25_geglu(s.nv_gate, s.nv_up, s.nv_h, c.moe_ffn, st);
+                kernels::launch_gemv_q(s.nv_h, w.down_q, w.down_qtype, s.routed, H, c.moe_ffn, st);
+            } else if (w.gate_nv && w.up_nv && w.down_nv && c.top_k == 1) {
                 // dp4a NVFP4 (SPARKINFER_QWEN38_NVFP4_DP4A=0 restores the float GEMVs). The
                 // weights stay exactly what the checkpoint ships -- NVFP4 magnitudes are integers,
                 // so the group dot is an exact integer reduction -- and only the activation is
@@ -2453,6 +2503,17 @@ bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
     if (cfg.muse_glimmer) {
         static const int muse_batched = []{ const char* e = getenv("SPARKINFER_MUSE_BATCHED"); return (e && e[0] == '0') ? 0 : 1; }();
         if (!muse_batched) return false;
+    }
+    // Spark-X2.5: prefill_batched_run has no arm for this architecture yet -- it would need the
+    // per-layer-kind rotary split, the no-QK-norm path, the head-wise gate and GeGLU, none of
+    // which its kernels currently take. The sequential token loop drives the SAME decode step
+    // that does have all four, so it is correct by construction rather than by a second
+    // implementation agreeing with the first. SPARKINFER_SPARK25_BATCHED=1 opts in once the
+    // batched arm exists and has been checked against this fallback.
+    if (cfg.spark25) {
+        static const int sp_batched = []{ const char* e = getenv("SPARKINFER_SPARK25_BATCHED");
+                                          return (e && e[0] == '1') ? 1 : 0; }();
+        if (!sp_batched) return false;
     }
     return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
            n_tokens <= batched_maxctx;
@@ -4985,7 +5046,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // (full_attn_interval=0 deliberately, to keep is_linear_layer() false for every layer),
     // so skip this backfill for it rather than let full_attn_interval<=0 get overwritten to
     // 4 and misroute layer 0 into looking for attn_qkv.weight/ssm_* tensors that don't exist.
-    if ((hybrid_file || s.cfg.dense_ffn) && !s.cfg.muse_glimmer) {
+    //
+    // Spark-X2.5 is excluded for exactly the same reason, and it is a sharper trap here: its
+    // GGUF really does ship a blk.N.attn_qkv.weight, so a layer wrongly marked linear would
+    // FIND that tensor at the expected name and then fail on the ssm_* ones -- or, worse, be
+    // read as a Gated-DeltaNet q/k/v split of entirely different widths. Its own
+    // full_attn_interval=0 must survive.
+    if ((hybrid_file || s.cfg.dense_ffn) && !s.cfg.muse_glimmer && !s.cfg.spark25) {
         s.cfg.hybrid = true;
         if (dense_file) s.cfg.dense_ffn = true;
         if (s.cfg.full_attn_interval <= 0) s.cfg.full_attn_interval = 4;
@@ -5045,6 +5112,36 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         void* d = nullptr;
         if (cudaMalloc(&d, t->n_bytes) != cudaSuccess) return nullptr;
         cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice);
+        s.owned.push_back(d);
+        return d;
+    };
+    // Upload a contiguous range of OUTPUT rows of a quantized GGUF tensor as a tensor of its own.
+    //
+    // GGUF stores dims[0] fastest, so a {in, out} tensor is `out` rows of `in` elements, and every
+    // row holds a whole number of quantization blocks (blocks run along `in`) -- no block ever
+    // straddles a row boundary. Splitting along the output dimension is therefore a plain
+    // byte-range copy, which is what lets Spark-X2.5's fused attn_qkv become three separate q/k/v
+    // projections with no dequantize -> requantize round trip and no loss of the file's own bits.
+    auto dev_quant_rows = [&](const std::string& name, long row0, long nrows, int& qtype) -> const void* {
+        const GGUFTensor* t = g.tensor(name);
+        if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
+        if (t->n_dims < 2) { fprintf(stderr, "[gguf] %s is not 2-D\n", name.c_str()); return nullptr; }
+        if (!ggml_dequant_supported(t->ggml_type)) {
+            fprintf(stderr, "[gguf] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());
+            return nullptr;
+        }
+        const long out = t->dims[1];
+        if (row0 < 0 || nrows <= 0 || row0 + nrows > out || out <= 0 || t->n_bytes % out != 0) {
+            fprintf(stderr, "[gguf] bad row slice [%ld,%ld) of %s (out=%ld, bytes=%ld)\n",
+                    row0, row0 + nrows, name.c_str(), out, t->n_bytes);
+            return nullptr;
+        }
+        const size_t row_bytes = (size_t)(t->n_bytes / out);
+        qtype = t->ggml_type;
+        void* d = nullptr;
+        if (cudaMalloc(&d, row_bytes * (size_t)nrows) != cudaSuccess) return nullptr;
+        cudaMemcpy(d, (const char*)t->data + row_bytes * (size_t)row0,
+                   row_bytes * (size_t)nrows, cudaMemcpyHostToDevice);
         s.owned.push_back(d);
         return d;
     };
@@ -5422,7 +5519,29 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             w.ssm_out = attn_w(b + "ssm_out.weight", w.ssm_out_type);
         } else {
             w.q_has_gate = c.hybrid;
-            if (c.muse_glimmer) {
+            if (c.spark25) {
+                // One fused attn_qkv [H, qdim + 2*kvdim] rather than three tensors, a [H, n_heads]
+                // head-wise gate, and NO attn_q_norm/attn_k_norm at all (Spark2_5Attention
+                // normalizes neither Q nor K). The split is a row-range copy of the file's own
+                // quantized bytes -- see dev_quant_rows.
+                if (!expect_dims(b + "attn_qkv.weight", {H, s.qdim + 2 * s.kvdim}) ||
+                    !expect_dims(b + "attn_gate.weight", {H, c.n_q_heads}) ||
+                    !expect_dims(b + "attn_output.weight", {s.qdim, H})) return false;
+                w.wq = dev_quant_rows(b + "attn_qkv.weight", 0, s.qdim, w.wq_type);
+                w.wk = dev_quant_rows(b + "attn_qkv.weight", s.qdim, s.kvdim, w.wk_type);
+                w.wv = dev_quant_rows(b + "attn_qkv.weight", s.qdim + s.kvdim, s.kvdim, w.wv_type);
+                // dev_quant, not attn_w: keep the file's own Q8_0 rather than letting the
+                // Q4_K requant policy touch these. The gate is 40960 weights of 4.1B -- there is
+                // no memory to win -- and every one of its 16 outputs scales an ENTIRE head, so
+                // it is the worst tensor in the model to spend precision on. attn_output is held
+                // native for a different reason: this is a new architecture's first correct
+                // implementation, and requant is an accuracy variable better introduced (and
+                // measured) on its own rather than folded into bring-up.
+                w.wgate = dev_quant(b + "attn_gate.weight", w.wgate_type);
+                w.wo = dev_quant(b + "attn_output.weight", w.wo_type);
+                w.q_norm = nullptr;
+                w.k_norm = nullptr;
+            } else if (c.muse_glimmer) {
                 // attn_q.weight and attn_gate.weight ship as two separate [H, qdim]
                 // tensors (unlike Qwen3.6's GGUF, which pre-fuses them into one [H,
                 // qdim*2] tensor before writing the file) -- dequantize both to bf16 and
@@ -5520,7 +5639,14 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                            : dev_quant(b + "ffn_gate.weight", w.gate_qtype);
             w.up_q   = gu3 ? dev_quant_q3a(b + "ffn_up.weight", w.up_qtype, &w.prefill_up_q, &w.prefill_up_qtype)
                            : dev_quant(b + "ffn_up.weight", w.up_qtype);
-            w.down_q = dev_quant_down(b + "ffn_down.weight", w.down_qtype);
+            // Spark-X2.5 keeps ffn_down at the file's own precision. dev_quant_down requantizes
+            // Q8_0/Q6_K to Q4_K by default, which is the right trade for the models that have been
+            // measured on it -- but it would sit underneath this architecture's first correctness
+            // check and turn "my implementation disagrees with the reference" into a question about
+            // requantization error instead of an answer. SPARKINFER_DOWN_REQUANT_Q4K still governs
+            // every other model; enabling it here is a separate, measurable change.
+            w.down_q = c.spark25 ? dev_quant(b + "ffn_down.weight", w.down_qtype)
+                                 : dev_quant_down(b + "ffn_down.weight", w.down_qtype);
         } else {
             if (!expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
             // Router weight: keep Q8_0 raw if present in the GGUF (half bandwidth, on-read GEMV)
@@ -5565,7 +5691,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         const bool have_attn = w.linear_attn
             ? (w.wqkv && w.wqkv_gate && w.ssm_conv && w.ssm_dt && w.ssm_a &&
                w.ssm_beta && w.ssm_alpha && w.ssm_norm && w.ssm_out)
-            : (w.wq && w.wk && w.wv && w.wo && w.q_norm && w.k_norm);
+            : (w.wq && w.wk && w.wv && w.wo &&
+               (c.no_qk_norm ? (w.wgate != nullptr) : (w.q_norm && w.k_norm)));
         const bool have_ffn = c.dense_ffn
             ? (w.gate_q && w.up_q && w.down_q)
             : (w.router_w && w.gate_q && w.up_q && w.down_q);

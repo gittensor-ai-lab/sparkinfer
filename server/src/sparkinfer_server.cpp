@@ -679,12 +679,14 @@ int main(int argc, char** argv) {
     if (!model_name_explicit) {
         if (engine.is_qwen38()) g_model_name = "qwen3.8-27b";
         else if (engine.is_museglimmer()) g_model_name = "muse-glimmer-30b";
+        else if (engine.is_spark25()) g_model_name = "spark-x2.5-4b";
         if (g_model_name != "qwen3.6-35b-a3b")
             fprintf(stderr, "[sparkinfer-server] advertising model id: %s "
                             "(override with --model-name)\n", g_model_name.c_str());
     }
     g_tokenizer.set_museglimmer(engine.is_museglimmer());
     g_tokenizer.set_qwen38(engine.is_qwen38());
+    g_tokenizer.set_spark25(engine.is_spark25());
 
     const std::vector<int> prefix_ids = load_prefix_token_ids();
     if (!prefix_ids.empty()) {
@@ -726,7 +728,10 @@ int main(int argc, char** argv) {
             {"logit_bias", {{"type", "unknown"}}},
             {"n", {{"type", "integer"}, {"min", 1}, {"max", 8}}}
         };
-        if (!engine.is_museglimmer()) {
+        // Spark-X2.5 is advertised without tools for the same reason Muse Glimmer is: no
+        // renderer/parser for its tool-call format yet, and advertising a capability the request
+        // path then refuses is worse than not advertising it.
+        if (!engine.is_museglimmer() && !engine.is_spark25()) {
             supported["tools"] = {{"type", "boolean"}};
             supported["structured_outputs"] = {{"type", "boolean"}};
         }

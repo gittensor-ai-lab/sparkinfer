@@ -76,6 +76,51 @@ struct Qwen35Config {
     int   sliding_window = 0;          // token window for swa_layers entries (0 = disabled)
     float final_logit_softcapping = 0.f;  // 0 = disabled
     float logit_scale = 1.f;              // 1 = no-op
+
+    // Spark-X2.5 (iFlytek, model_type "spark2_5"): dense GQA transformer, 3 sliding-window
+    // layers to every 1 full-attention layer, reusing swa_layers/sliding_window above. What it
+    // does NOT share with Muse Glimmer, the other swa_layers consumer:
+    //
+    //   * BOTH layer kinds apply RoPE. Muse's non-SWA layers are NoPE; Spark's differ only in
+    //     their rotary PARAMETERS, so a `!w.swa` layer here must still rotate.
+    //   * Those parameters are per-layer-kind, which is why rope_theta/rope_dim alone cannot
+    //     describe this model -- see rope_theta_swa/rope_dim_swa below.
+    //   * No QK-norm at all (no attn_q_norm/attn_k_norm tensors; Spark2_5Attention normalizes
+    //     neither), unlike every other architecture wired up here.
+    //   * Two norms per layer (attn_norm, ffn_norm), not Muse's four-norm sandwich.
+    //   * GeGLU rather than SwiGLU -- see ffn_gelu.
+    //   * The attention output gate is one scalar PER HEAD, not per head-element -- see
+    //     headwise_attn_gate.
+    bool  spark25 = false;
+    // Rotary parameters for the sliding-window layers. rope_theta/rope_dim above stay the
+    // FULL-attention layers' values, so every model that has only one layer kind is unaffected.
+    // Spark-X2.5-4B: full = (5e6, 64 of 256 dims); sliding = (1e4, all 256). Left at 0 by every
+    // other checkpoint, which resolve_rope() then reads as "same as the full-attention layers".
+    float rope_theta_swa = 0.f;
+    int   rope_dim_swa   = 0;
+    // FFN activation: down(act(gate(x)) * up(x)) with act = GELU instead of SiLU. Spark-X2.5's
+    // config.json pins hidden_act to "gelu" and its reference MLP refuses to build with anything
+    // else. transformers' ACT2FN["gelu"] is the ERF form, not the tanh approximation.
+    bool  ffn_gelu = false;
+    // Attention output gate shape. false (Qwen3.6/Qwen3.8/Muse): the gate projection is
+    // [hidden, n_q_heads*head_dim] and multiplies the attention output elementwise. true
+    // (Spark-X2.5, config.json's headwise_attn_output_gate): it is [hidden, n_q_heads] -- ONE
+    // sigmoid scalar per head, broadcast across that head's head_dim elements.
+    bool  headwise_attn_gate = false;
+    // Some checkpoints ship no attn_q_norm/attn_k_norm (Spark-X2.5). Kept explicit rather than
+    // inferred from a null q_norm so a genuinely failed norm load still fails loudly.
+    bool  no_qk_norm = false;
+
+    // Rotary parameters actually in force on layer `i`, honouring the per-layer-kind split
+    // above. Every non-Spark model returns (rope_theta, rope_dim) for every layer.
+    float rope_theta_for(int i) const {
+        const bool sw = i >= 0 && i < (int)swa_layers.size() && swa_layers[i];
+        return (sw && rope_theta_swa > 0.f) ? rope_theta_swa : rope_theta;
+    }
+    int rope_dim_for(int i) const {
+        const bool sw = i >= 0 && i < (int)swa_layers.size() && swa_layers[i];
+        return (sw && rope_dim_swa > 0) ? rope_dim_swa : rope_dim;
+    }
 };
 
 } // namespace sparkinfer

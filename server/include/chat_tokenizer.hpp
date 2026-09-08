@@ -43,6 +43,10 @@ public:
     // once after the model's architecture is known (ModelEngine::is_qwen38()), before the first
     // request. Independent of set_museglimmer -- the two are mutually exclusive model families.
     void set_qwen38(bool on);
+    // Spark-X2.5 (model_type "spark2_5"). Set once after the model's architecture is known
+    // (ModelEngine::is_spark25()), before the first request. Mutually exclusive with the two
+    // above -- its template shares no markers with either.
+    void set_spark25(bool on);
 
     bool encode_chat_request(const std::string& request_json, std::vector<int>& ids, bool enable_thinking,
                              std::string& err, ChatRequest* parsed_request = nullptr) const;
@@ -175,11 +179,19 @@ private:
 
 bool parse_chat_messages(const std::string& request_json, std::vector<ChatMessage>& messages, std::string& err);
 bool parse_enable_thinking(const std::string& request_json, bool default_value = false);
-bool validate_chat_request_model_support(const ChatRequest& request, bool museglimmer,
+// no_tool_support: this model has no tool-call renderer/parser wired up (Muse Glimmer,
+// Spark-X2.5). Rejects tools, tool history and structured response_format for it.
+bool validate_chat_request_model_support(const ChatRequest& request, bool no_tool_support,
                                          std::string& err);
 std::string apply_qwen36_chat_template(const std::vector<ChatMessage>& messages, bool enable_thinking = false);
 std::string apply_museglimmer_chat_template(const std::vector<ChatMessage>& messages,
                                             const std::string& reasoning_strength = "high");
+// Spark-X2.5's own template (chat_template.jinja in XHToken/Spark-X2.5-4B). Distinct markers
+// from every other model here: a per-turn <|start_of_sentence|>/<|end_of_sentence|> envelope with
+// <|System|>/<|User|>/<|Bot|>/<|Tool|> role tags, and an explicit <think> or </think> opener on the
+// generation prompt rather than a separate reasoning-effort message.
+std::string apply_spark25_chat_template(const std::vector<ChatMessage>& messages,
+                                        bool enable_thinking = true);
 ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable_thinking,
                                              bool museglimmer = false,
                                              const ChatRequest* request = nullptr);

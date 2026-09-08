@@ -740,6 +740,11 @@ bool ModelEngine::is_qwen38() const {
     return impl_->ready && impl_->cfg.qwen38;
 }
 
+bool ModelEngine::is_spark25() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return impl_->ready && impl_->cfg.spark25;
+}
+
 void ModelEngine::set_prefix_tokens(const std::vector<int>& tokens) {
     std::lock_guard<std::mutex> lock(mu_);
     impl_->prefix_tokens = tokens;

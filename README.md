@@ -138,6 +138,16 @@ at 32k**. Quality parity: top-1 **0.953** · KL **0.031** · IFEval **83%** · B
 Full tables: [`bench/competitors/latest-results.md`](bench/competitors/latest-results.md) ·
 [`bench/quality/README.md`](bench/quality/README.md).
 
+**[Spark-X2.5-4B](https://huggingface.co/XHToken/Spark-X2.5-4B)** — iFlytek's `spark2_5`, a
+dense GQA-16 stack that alternates **three sliding-window layers (512 tokens) with one
+full-attention layer**, each kind carrying its *own* rotary parameters (sliding: θ=1e4 over all
+256 head dims; full: θ=5e6 over 64 of 256), a per-head sigmoid attention gate, and a GeGLU FFN.
+**235 tok/s decode, 6.4 GB VRAM** (Q8_0, RTX 5090). Mainline llama.cpp cannot load this
+architecture at all — it needs a fork. Correctness is checked against an independent
+implementation built from the GGUF's own bytes,
+[`bench/scripts/spark25_ref_check.py`](bench/scripts/spark25_ref_check.py), which re-derives the
+forward pass from the reference `modeling_spark.py` and shares no code with the runtime.
+
 SparkInfer focuses on the models driving the future of AI — not thousands of legacy architectures.
 
 ## Blackwell native
