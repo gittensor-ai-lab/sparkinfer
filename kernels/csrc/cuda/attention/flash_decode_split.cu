@@ -819,6 +819,18 @@ template __global__ void fa_split_gqa_kernel<128, 8, FA_GQA_TILE, false>(const _
 template __global__ void fa_split_gqa_kernel<128, 8, FA_GQA_TILE, true>(const __nv_bfloat16*, const void*, const void*,
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
 #endif
+// Muse Glimmer is 32 q-heads over 2 kv-heads -- a 16:1 group, the widest in the tree. It never
+// reached any shared-KV tile: the hd256 dispatch covers GQA 4/6/8 and the hd128 one only GQA 8,
+// so Muse fell through to the per-q-head kernel and re-read the same KV sixteen times. At 64k its
+// 13 global layers hold 436 MB of int8 KV, far past L2, so that redundancy is DRAM traffic.
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_kernel<128, 16, FA_GQA_TILE, false>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+#endif
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_kernel<128, 16, FA_GQA_TILE, true>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+#endif
 #ifndef _MSC_VER
 template __global__ void fa_combine_kernel<128, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 #endif
@@ -1644,6 +1656,40 @@ void launch_flash_decode_split(
     const bool mma_aligned = famma && seqlen > 512 && block_size == 16 && mma_chunk >= 32;
     const __half* ksc = reinterpret_cast<const __half*>(k_scale);
     const __half* vsc = reinterpret_cast<const __half*>(v_scale);
+    // 16:1 GQA (Muse Glimmer, 32Q/2KV). Same shared-KV tile as the 8:1 branch below: one block per
+    // (kv_head, split) stages the K/V tile once and all GQA warps reuse it, instead of one block per
+    // q-head each re-reading it. Warp count doubles to 16 (512 threads) and the tile smem is
+    // unchanged, so the block is wider but reads 16x less KV. The int8 MMA sub-branch is NOT taken
+    // here: its __launch_bounds__ asks for 5 blocks/SM, which at 512 threads would demand 2560
+    // threads per SM against a 2048 limit. SPARKINFER_FAGQA16=0 restores the per-q-head kernel.
+    static int fagqa16 = -1;
+    if (fagqa16 < 0) { const char* e = getenv("SPARKINFER_FAGQA16"); fagqa16 = (e && e[0] == '0') ? 0 : 1; }
+    if (use_gqa && fagqa16 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 16) {
+        constexpr int GQA = 16, TILE = FA_GQA_TILE;
+        dim3 gq(num_kv_heads * n_splits, num_seqs);
+        const size_t smem = (size_t)2 * TILE * 128 * sizeof(__nv_bfloat16);
+        if (int8_kv)
+            fa_split_gqa_kernel<128, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                ksc, vsc);
+        else
+            fa_split_gqa_kernel<128, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                ksc, vsc);
+        if (cudaPeekAtLastError() != cudaSuccess) goto fa_gqa16_fallthrough;
+        if (gate128)
+            fa_launch_combine_gated_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                             gate, num_q_heads, n_splits,
+                                             reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+        else
+            fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                       num_q_heads, n_splits, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+        (void)seqlen;
+        return;
+    }
+    fa_gqa16_fallthrough:
     if (use_gqa && num_kv_heads > 0 && num_q_heads == num_kv_heads * 8) {
         constexpr int GQA = 8, TILE = FA_GQA_TILE;
         dim3 gq(num_kv_heads * n_splits, num_seqs);
