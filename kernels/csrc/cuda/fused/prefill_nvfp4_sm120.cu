@@ -260,19 +260,46 @@ __global__ void quant_rows_t(const __nv_bfloat16* src, unsigned char* dst,
         }
     }
 }
-// SPARKINFER_NVFP4_QUANT_LPV=8 restores the two-values-per-lane shape (A/B in ONE binary).
-inline int nvfp4_quant_lpv() {
-    static const int v = [] {
+// LPV -- the number of LANES that cooperate on one 16-value NVFP4 block, so each lane handles
+// VPL = 16 / LPV values -- chosen by the SHAPE of the launch rather than one process-wide constant.
+//
+// LPV=2 (eight values per lane, two lanes per block) is right for a prefill quantize: it is handed
+// thousands of rows, the grid is already far wider than the device, and the wide per-lane strip
+// keeps the shuffle reduction to a single step. It is the wrong shape for a continuous-batch
+// DECODE quantize, which runs ~283 launches a step over at most kQwen35MaxPackedRows rows -- there
+// the grid cannot fill the GPU at all, and spreading each block over four times as many lanes buys
+// more than the two extra shuffle steps cost. Measured on an RTX 5090, same binary, interleaved
+// replicas on a quiet GPU: LPV=8 is +1.82% / +1.42% on cb-decode@c16/@c32 against the pinned
+// LPV=2, with LPV=4 at +1.29% on c16, i.e. monotone in the lane count. LPV=8 is the widest usable
+// value: LPV=16 would leave one value per lane and the paired-half load below has no half to
+// pair. nsys confirms the mechanism -- quant_rows_t is 3.88% of the c16 wall over 269 launches a
+// step, and those launches run at ~68 GB/s, i.e. they are launch-ramp bound, not bandwidth bound.
+//
+// Forcing LPV=8 everywhere is NOT the fix -- it costs prefill@4k -1.39% and prefill@16k/@32k
+// -0.44%/-0.55%, because those launches want the wide strip. Gating on the row count takes the
+// decode win and leaves every prefill launch on the shape it already had: measured +0.00% at
+// prefill@4k and @16k against the pinned default.
+//
+// Numerics are unchanged in either direction: LPV only regroups which lane computes which element
+// of a block, and the absmax reduction, the ue4m3 scale and the e2m1 rounding are all per
+// 16-element block. tau reads 1.6974 / 1.7297 / 1.3299 and LOSSLESS=1 at every context either way.
+//
+// SPARKINFER_NVFP4_QUANT_LPV=2|4|8 pins one shape for every launch (A/B in ONE binary); 2 is
+// exactly what this shipped with.
+static constexpr int kQuantNarrowLaneMaxRows = 64;  // decode packs <= 32; prefill hands thousands
+inline int nvfp4_quant_lpv(int rows) {
+    static const int forced = [] {
         const char* e = getenv("SPARKINFER_NVFP4_QUANT_LPV");
-        const int x = e ? atoi(e) : 2;
-        return (x == 2 || x == 4 || x == 8) ? x : 2;
+        const int x = e ? atoi(e) : 0;          // 0 = select by shape
+        return (x == 2 || x == 4 || x == 8) ? x : 0;
     }();
-    return v;
+    if (forced) return forced;
+    return (rows > 0 && rows <= kQuantNarrowLaneMaxRows) ? 8 : 2;
 }
 template <class Layout>
 void quant_rows_dispatch(int blocks, cudaStream_t st, const __nv_bfloat16* src, unsigned char* dst,
                          cutlass::float_ue4m3_t* sf, int rows, int cols, Layout layout) {
-    switch (nvfp4_quant_lpv()) {
+    switch (nvfp4_quant_lpv(rows)) {
         case 8:  quant_rows_t<8><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout); break;
         case 4:  quant_rows_t<4><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout); break;
         default: quant_rows_t<2><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout); break;
@@ -375,19 +402,23 @@ __global__ void gate_quant_rows(const __nv_bfloat16* __restrict__ src,
 
 // The down projection is the only consumer of SwiGLU. Produce the exact bf16-rounded activation
 // directly into its FP4 A operand instead of writing and rereading the 128 x 19968 bf16 tensor.
-template <class Layout>
+template <int LPG_, class Layout>
 __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
                                   const __nv_bfloat16* __restrict__ up,
                                   unsigned char* dst, cutlass::float_ue4m3_t* sf,
                                   int rows, int cols, Layout layout) {
-    // 8 values per lane instead of 2, so two lanes cover a 16-value scale group. The two operand
-    // reads become one 16-byte load each instead of four 4-byte loads, the store becomes one
-    // 4-byte store instead of four 1-byte ones, and the amax butterfly collapses from three
-    // shuffles to one. This kernel moves 11.7 MB per layer in ~12 us -- 0.98 TB/s of a 1.79 TB/s
-    // part -- so it was issue-bound on narrow accesses, not bandwidth-bound.
+    // Wide per-lane strips: at LPG=2 each lane owns 8 values, so the two operand reads are one
+    // 16-byte load each instead of four 4-byte loads and the amax butterfly is a single shuffle.
+    // This kernel moves 11.7 MB per layer in ~12 us -- 0.98 TB/s of a 1.79 TB/s part -- so at
+    // prefill widths it is issue-bound on narrow accesses, not bandwidth-bound.
     // Bit-identical: max is order-independent, so each group keeps exactly the same scale, and
     // every value keeps the same SiLU-in-float, round-once-to-bf16, x / float(qs) sequence.
-    constexpr int V = 16, VPL = 8, LPG = V / VPL;   // 2 lanes per scale group
+    // LPG -- lanes per 16-value scale group -- is chosen by the caller from the row count, for
+    // the same reason quant_rows_dispatch does it: two lanes per group is the right shape for a
+    // prefill launch that already fills the device, and the wrong one for a packed decode launch
+    // of at most 32 rows, where the grid cannot fill the GPU and the wider lane spread buys more
+    // than the extra shuffle steps cost.
+    constexpr int LPG = LPG_, VPL = 16 / LPG, V = 16;
     const int glane = threadIdx.x & (LPG - 1);
     const int groups = rows * (cols / V);
     const int stride = (gridDim.x * blockDim.x) / LPG;
@@ -409,9 +440,11 @@ __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
             x[2 * p + 1] = __bfloat162float(__float2bfloat16(gb / (1.f + __expf(-gb)) * ub));
             a = fmaxf(a, fmaxf(fabsf(x[2 * p]), fabsf(x[2 * p + 1])));
         }
-        // The scale group is exactly this lane and its odd/even partner, which are adjacent lanes
-        // in the same warp on every iteration, so a lane-1 xor is warp-safe without a group mask.
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
+        // A scale group is this lane and the LPG-1 lanes it differs from in the low bits, which
+        // are adjacent lanes in the same warp on every iteration, so the xor butterfly is
+        // warp-safe without a group mask.
+        #pragma unroll
+        for (int d = LPG >> 1; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
         cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
         unsigned char packed[VPL / 2];
         #pragma unroll
@@ -419,8 +452,8 @@ __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
             cutlass::float_e2m1_t q0(x[2 * p] / float(qs)), q1(x[2 * p + 1] / float(qs));
             packed[p] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
         }
-        *reinterpret_cast<unsigned int*>(dst + (base >> 1)) =
-            *reinterpret_cast<const unsigned int*>(packed);
+        #pragma unroll
+        for (int p = 0; p < VPL / 2; ++p) dst[(base >> 1) + p] = packed[p];
         if (glane == 0) { auto scales = cute::make_tensor(sf, layout); scales(row, k0, 0) = qs; }
     }
 }
@@ -576,9 +609,14 @@ bool launch_prefill_nvfp4_swiglu_quant_a(const void* g, const void* u, void* d, 
                                          int m, int k, cudaStream_t st) {
     if (!g || !u || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
     auto l = sfa_layout(m,128,k);
-    // 2 lanes per 16-value scale group (see swiglu_quant_rows), so one thread per 8 values.
-    int blocks = (m * (k / 16) * 2 + 255) / 256; if (blocks > 4096) blocks = 4096;
-    swiglu_quant_rows<<<blocks,256,0,st>>>((const __nv_bfloat16*)g,(const __nv_bfloat16*)u,
+    // Same shape rule as the standalone quantizer: pick the lane spread from the row count.
+    const int lpg = (m > 0 && m <= kQuantNarrowLaneMaxRows) ? 8 : 2;
+    int blocks = (m * (k / 16) * lpg + 255) / 256; if (blocks > 4096) blocks = 4096;
+    if (lpg == 8)
+        swiglu_quant_rows<8><<<blocks,256,0,st>>>((const __nv_bfloat16*)g,(const __nv_bfloat16*)u,
+                                            (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,l);
+    else
+        swiglu_quant_rows<2><<<blocks,256,0,st>>>((const __nv_bfloat16*)g,(const __nv_bfloat16*)u,
                                             (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,l);
     return cudaPeekAtLastError() == cudaSuccess;
 }

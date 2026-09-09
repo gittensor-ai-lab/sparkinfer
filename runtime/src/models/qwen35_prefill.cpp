@@ -3749,8 +3749,20 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                              w.up_fp4_sf, su, Ng, ffn, H,
                                                              fp4_ws, st, w.up_fp4_alpha);
                 if (ok) {
-                    kernels::launch_prefill_swiglu(sg, su, sh, (long)Ng * ffn, st);
-                    ok = kernels::launch_prefill_nvfp4_quant_a(sh, fp4_a, fp4_asf, Ng, ffn, st) &&
+                    // Fold the down projection's activation quantize into the SwiGLU that
+                    // produces it -- the prefill arm above already does this, and so does the
+                    // dp4a arm below (launch_prefill_swiglu_nvfp4); only the block-scaled GEMM
+                    // arm, which is the one a wide continuous-batch step takes, was left issuing
+                    // the standalone quantizer. That quantizer is a tiny kernel whose cost is
+                    // nearly all launch ramp at this width, and the packed step issues one per
+                    // layer -- on top of a full bf16 round trip of the SwiGLU output that nothing
+                    // else reads.
+                    //
+                    // Bit-identical: swiglu_quant_rows keeps the same SiLU-in-float,
+                    // round-once-to-bf16, x / float(qs) sequence and takes the absmax over the
+                    // same 16 values, so every e2m1 nibble and every ue4m3 scale is unchanged.
+                    ok = kernels::launch_prefill_nvfp4_swiglu_quant_a(sg, su, fp4_a, fp4_asf,
+                                                                      Ng, ffn, st) &&
                          kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.down_fp4,
                                                             w.down_fp4_sf, routed, Ng, H, ffn,
                                                             fp4_ws, st, w.down_fp4_alpha);
