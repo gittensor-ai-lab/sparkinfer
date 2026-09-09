@@ -202,7 +202,22 @@ SCORED_CTXS = [128, 512, 4096, 16384, 32768]
 # ~14 min, which is what makes an hourly round possible at all (the round sweeps TWICE, main and
 # PR, before the two guards and the accuracy gate). Revisit once PR #1006-style work lands: when
 # prefill stops being ~100 pp/s everywhere, long contexts get cheap and reps can go back up.
-SCORED_REPS = {128: 5, 512: 5, 4096: 3, 16384: 2, 32768: 1}
+# Grouped as (contexts, reps) TIERS, not a per-context dict, because bench_sweep_run
+# (bench/scripts/_eval_speed.sh) accepts "<ctx> <reps>" pairs but then collapses them:
+#
+#     [ "$reps" -gt "$max_reps" ] && max_reps="$reps"
+#     export SPARKINFER_BENCH_SWEEP_REPS="$max_reps"
+#
+# One reps value is applied to EVERY context in the call -- the maximum. Every other bot passes
+# the same reps for every context, so this never mattered until this bot became the first to pass
+# differing values, and the pair syntax made per-context reps look supported. Passing
+# "128 5 ... 32768 1" therefore ran 32k FIVE times (~27 min for that context alone) instead of
+# once, turning a ~14 min sweep into ~45 min and the round into ~2.5 h.
+#
+# So: one bench_sweep_run call per tier. That costs one extra model load (~1 min) and is the only
+# way to get 5 samples where a measurement is ~1s and 1 sample where it is ~330s.
+SCORED_REPS_TIERS = [([128, 512], 5), ([4096, 16384, 32768], 1)]
+SCORED_REPS = {c: r for ctxs, r in SCORED_REPS_TIERS for c in ctxs}
 # The GUARDS deliberately keep BENCH_REPS (5) even at 32k, and that is not an inconsistency with
 # SCORED_REPS above. Repeat count should follow how long ONE measurement takes, and that is a
 # property of the model, not of the context: Muse prefills 32k in ~356s (self-averaging, reps=1 is
@@ -568,8 +583,25 @@ def _remote_script(ref: str) -> str:
     # reps=5 everywhere, for the reason the long comments below record: this box cannot pin GPU
     # clocks ("current user does not have permission to change clocks"), so median-of-N is the
     # only defence against a single noisy sample hard-REJECTing a real PR.
-    scored_sweep_args = " ".join(f"{c} {SCORED_REPS.get(c, BENCH_REPS)}" for c in SCORED_CTXS)
-    scored_ctx_list = " ".join(str(c) for c in SCORED_CTXS)
+    # One shell block per reps tier; see SCORED_REPS_TIERS for why this cannot be a single call.
+    scored_blocks = []
+    for ctxs, reps in SCORED_REPS_TIERS:
+        args = " ".join(f"{c} {reps}" for c in ctxs)
+        lst = " ".join(str(c) for c in ctxs)
+        scored_blocks.append(
+            f'wait_gpu_clear\n'
+            f'if bench_sweep_run "$GGUF" "$NTOK" {args}; then\n'
+            f'  for ctx in {lst}; do\n'
+            f'    echo "MUSE $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"\n'
+            f'    if [ "$ctx" = "128" ]; then\n'
+            f'      BC_DECODE=$(_bench_sweep_get 128 decode_tps)\n'
+            f'      BC_PREFILL=$(_bench_sweep_get 128 prefill_pp)\n'
+            f'    fi\n'
+            f'  done\n'
+            f'else\n'
+            f'  MUSE_OK=0\n'
+            f'fi')
+    scored_sweep_blocks = "\n".join(scored_blocks)
     q36_sweep_args = " ".join(f"{c} {BENCH_REPS}" for c in Q36_GUARD_CTXS)
     q36_ctx_list = " ".join(str(c) for c in Q36_GUARD_CTXS)
     mo_sweep_args = " ".join(f"{c} {BENCH_REPS}" for c in MODELOPT_GUARD_CTXS)
@@ -673,18 +705,18 @@ wait_gpu_clear
 # ctx points per load). Emitting one MUSE line per context rather than two fixed RESULT_ lines
 # keeps the wire format the same shape as the guards' and lets SCORED_CTXS change without
 # touching the parser.
-if bench_sweep_run "$GGUF" "$NTOK" {scored_sweep_args}; then
-  for ctx in {scored_ctx_list}; do
-    echo "MUSE $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
-  done
-else
-  echo "MUSE_FAILED"
-fi
+MUSE_OK=1
+BC_DECODE=0
+BC_PREFILL=0
+{scored_sweep_blocks}
+[ "$MUSE_OK" = "1" ] || echo "MUSE_FAILED"
 # Back-compat: decode@128 / prefill@128 also go out under their old names. The PR comment
 # renderer, the Polaris payload and the published dashboard all read these two keys, and none of
 # them should have to change because the scoring matrix grew.
-echo "RESULT_DECODE_TPS $(_bench_sweep_get 128 decode_tps || echo 0)"
-echo "RESULT_PREFILL128_PP $(_bench_sweep_get 128 prefill_pp || echo 0)"
+# Captured during the tier that measured 128 -- _bench_sweep_get reads the LAST sweep's JSON, and
+# 128 is not in the last tier.
+echo "RESULT_DECODE_TPS ${{BC_DECODE:-0}}"
+echo "RESULT_PREFILL128_PP ${{BC_PREFILL:-0}}"
 
 # --- accuracy gate: sparkinfer teacher-forced score vs a live llama-server reference, same
 # GGUF, same eval_text.txt corpus this session already validated by hand (6d911d4) ---
