@@ -602,6 +602,28 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             if (FC != fc_before)
                 fprintf(stderr, "[prefill] ffn chunk %d -> %d (ctx=%d, free=%zu MB) to keep the "
                                 "batched pass\n", fc_before, FC, N, fb >> 20);
+            // ...but "keeping the batched pass" is not automatically the right trade. The FFN
+            // re-streams the layer's gate|up|down once per chunk, so a chunk driven far below the
+            // prompt turns this pass into N/FC passes over the weights. On a single pass at
+            // n == prefill_single_pass_max_tokens() in a session whose KV cache is sized for a
+            // longer context, that is what happens: measured on Muse Glimmer over 16k/32k/64k in
+            // ONE model load, prefill@32k runs at 923 pp while 16k does 11018 and 64k does 8045 --
+            // the boundary, not the length. The caller's windowed path sizes its arena for one
+            // window, keeps a healthy chunk, and gives 9629 pp at the same context.
+            // So when the chunk has collapsed and windowing is available, decline and let it run.
+            // Same knob and default as prefill_window_tokens() in qwen35.cpp; that one is in an
+            // anonymous namespace and so is not linkable from here.
+            static const int wtok = [] {
+                const char* e = getenv("SPARKINFER_PREFILL_WINDOW");
+                const int v = e ? atoi(e) : 16384;
+                return v < 0 ? 0 : v;
+            }();
+            if (pos0 == 0 && wtok > 0 && N > wtok && (long)FC * 4 <= (long)N) {
+                fprintf(stderr, "[prefill] ffn chunk collapsed to %d for a %d-token single pass -- "
+                                "declining so the caller can window it\n", FC, N);
+                a.free_all(); a8.free_all();
+                return -1;
+            }
         }
     }
     bf16* ffg  = ffn_alias ? b8 : a.alloc<bf16>((size_t)FC * ffn);   // ffn gate, bounded to FC tokens

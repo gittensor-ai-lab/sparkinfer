@@ -3151,9 +3151,25 @@ int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want
     // threshold, NOT the window size -- a prompt between the two is still one pass.
     if (window <= 0 || n <= prefill_single_pass_max_tokens()) {
         const int seed = prefill_batched(prompt_ids, n, want_seed_logprob);
-        if (seed < 0 || seed >= s.cfg.vocab) return -1;
-        if (out_done) *out_done = n;
-        return seed;
+        if (seed >= 0 && seed < s.cfg.vocab) {
+            if (out_done) *out_done = n;
+            return seed;
+        }
+        // The single pass declined. Returning here sends the WHOLE prompt to the token loop, and
+        // at n == prefill_single_pass_max_tokens() that is exactly what happens in a session whose
+        // KV cache is sized for a longer context: the single-pass arena cannot be allocated beside
+        // it, while the windowed path -- which the very next context up already uses successfully
+        // -- allocates one window and runs. Measured on Muse Glimmer in one model load over
+        // 16k/32k/64k (what bench_sweep_run does): prefill@32k 923 pp against 11018 at 16k and
+        // 8045 at 64k, i.e. the boundary itself, not the length. Windowing it gives 9629 pp.
+        //
+        // Try windowing before giving up. It restarts from position 0, so a single pass that had
+        // already written part of the cache is simply recomputed -- prefill is deterministic in
+        // the prompt, and pos0 == 0 resets the recurrent state the same way the original call did.
+        // Nothing here changes a context where the single pass succeeds: that returns above.
+        if (window <= 0 || n <= window) return -1;
+        fprintf(stderr, "[prefill] single pass declined at n=%d -- windowing (%d) instead of the "
+                        "token loop\n", n, window);
     }
     for (int pos = 0; pos < n; pos += window) {
         const int len = std::min(window, n - pos);
