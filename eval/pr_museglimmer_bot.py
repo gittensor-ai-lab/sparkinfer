@@ -196,9 +196,20 @@ GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
 # the prefill arena SHRINKS as windowing bounds it, offsetting the KV growth), and Muse's own
 # context_length is 131072, so 64k is well inside the model's range.
 #
-# Cost note: while main refuses the windowed path, one 64k prefill pass takes ~12 min, which
-# roughly doubles a Muse sweep. That is temporary in exactly the way the 4k/16k/32k cost was
-# before #1006 -- once the windowed path works, 64k costs ~45s and the sweep returns to ~13 min.
+# 64k gets its OWN tier, not a seat in the long tier, and that is a correctness requirement rather
+# than a cost decision. Contexts inside one bench_sweep_run share a session: KV is sized once for
+# the session's MAXIMUM context, while each context's prefill arena is sized for itself. Putting
+# 64k beside 32k therefore measures 32k under 64k-sized KV pressure, and 32k is the largest
+# single-pass context (prefill_single_pass_max_tokens = 32768), i.e. the most arena-hungry point.
+# Measured on the same main, same box, same day:
+#
+#     32k prefill, long tier ending at 32k    2080.89 pp tok/s
+#     32k prefill, long tier ending at 64k     939.13 pp tok/s     -55%
+#
+# 4k and 16k were unaffected (4128.99 / 2860.47, matching earlier rounds), so this is specifically
+# the big-arena-meets-big-KV interaction. A PR-vs-main delta stayed fair either way -- both legs saw
+# the same pressure -- but the 32k axis stopped measuring 32k serving, and the session also peaked
+# at 97.4% of VRAM. One extra model load (~1 min) buys back both.
 SCORED_CTXS = [128, 512, 4096, 16384, 32768, 65536]
 # Repeats PER CONTEXT, not one number for all five. The reps=5 rule recorded below exists because
 # a SHORT measurement is dominated by launch/dispatch jitter on a box where GPU clocks cannot be
@@ -233,7 +244,7 @@ SCORED_CTXS = [128, 512, 4096, 16384, 32768, 65536]
 #
 # So: one bench_sweep_run call per tier. That costs one extra model load (~1 min) and is the only
 # way to get 5 samples where a measurement is ~1s and 1 sample where it is ~330s.
-SCORED_REPS_TIERS = [([128, 512], 5), ([4096, 16384, 32768, 65536], 1)]
+SCORED_REPS_TIERS = [([128, 512], 5), ([4096, 16384, 32768], 1), ([65536], 1)]
 SCORED_REPS = {c: r for ctxs, r in SCORED_REPS_TIERS for c in ctxs}
 # The GUARDS deliberately keep BENCH_REPS (5) even at 32k, and that is not an inconsistency with
 # SCORED_REPS above. Repeat count should follow how long ONE measurement takes, and that is a
@@ -1283,6 +1294,12 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
     return res
 
 
+def _ctx_list_str() -> str:
+    """"128/512/4k/16k/32k/64k" from SCORED_CTXS. Derived rather than written out: the PR comment
+    twice named a context list that had gone stale behind the constant."""
+    return "/".join(SCORED_CTX_LABEL[c] for c in SCORED_CTXS)
+
+
 def _matrix_table(res: dict) -> str:
     """The full PR-vs-main matrix. Rendered from res["scored_dims"] rather than from named keys so
     it stays correct when SCORED_CTXS changes -- the previous comment hard-coded two rows and would
@@ -1383,7 +1400,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer museglimmer auto-eval — `eval-museglimmer:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-museglimmer:{lab}` |\n"
-        f"| scored at | decode + prefill @ 128/512/4k/16k/32k — every axis is also a regression floor, label is the best |\n"
+        f"| scored at | decode + prefill @ {_ctx_list_str()} — every axis is also a regression floor, label is the best |\n"
         f"| tier from | `{res.get('best_dim') or '?'}` ({res.get('delta_pct', 0):+.1f}%) |\n"
         f"{acc_row}"
         f"{main_acc_note}"
@@ -1394,9 +1411,10 @@ def format_comment(commit: str, res: dict) -> str:
         f"| commit | `{commit[:9]}` |\n\n"
         f"{_matrix_table(res)}"
         f"{res.get('reason') or ''}\n\n"
-        "<sub>Scored on the pinned eval box vs same-box `origin/main` — AR decode AND prefill at "
-        "ctx 128/512/4k/16k/32k, from one model load; ANY axis regressing is a hard REJECT, but "
-        "otherwise the reported label is the **best** measured delta across the ten — "
+        f"<sub>Scored on the pinned eval box vs same-box `origin/main` — AR decode AND prefill at "
+        f"ctx {_ctx_list_str()}; ANY axis regressing is a hard REJECT, but "
+        f"otherwise the reported label is the **best** measured delta across the "
+        f"{len(SCORING_DIMS)} — "
         "a PR that improves just one, with the rest flat, still earns credit for that. "
         "Cross-model no-regression guards run at 32k on Qwen3.6 and the ModelOpt Qwen3.8-27B "
         "NVFP4 checkpoint. This is informational, not a judgment on your PR: a `none` label just "
