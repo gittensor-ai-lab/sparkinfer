@@ -1,5 +1,9 @@
 #include "chat_tokenizer.hpp"
 #include "lmstudio_api.hpp"
+#include "ollama_api.hpp"
+
+#include <sys/stat.h>
+#include <ctime>
 #include "model_engine.hpp"
 #include "video_input.hpp"   // video_decoder_available() for /v1/models input_modalities
 #include "sparkinfer/kernels/deterministic.h"
@@ -2638,6 +2642,185 @@ int main(int argc, char** argv) {
                  text_completions_handler(req, res);
                  lmstudio_augment(res);
              });
+
+    // ---------------------------------------------------------------------------------------
+    // Ollama REST API (/api/*).
+    //
+    // Same approach as the LM Studio routes above: rewrite the request into the OpenAI shape,
+    // hand it to the SAME handler /v1/* uses, rewrite the response back. Nothing here generates
+    // or times anything. See server/include/ollama_api.hpp for the shape differences and for the
+    // streaming compromise (Ollama streams by default and uses NDJSON; a streaming request is
+    // answered as a single terminal NDJSON chunk, correct on the wire but not incremental).
+    namespace oll = sparkinfer_server::ollama;
+
+    auto ollama_entry = [&engine]() {
+        oll::ModelEntry m;
+        m.name = oll::with_latest_tag(g_model_name);
+        m.model = m.name;
+        // Size and mtime come from the checkpoint file itself. A directory checkpoint
+        // (compressed-tensors) reports 0 rather than walking the tree on every request.
+        const std::string path = engine.model_path();
+        struct stat st{};
+        if (::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+            m.size = (long long)st.st_size;
+            char buf[32];
+            std::tm tm{};
+            const std::time_t mt = st.st_mtime;
+            gmtime_r(&mt, &tm);
+            std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+            m.modified_at = buf;
+        } else {
+            m.size = 0;
+            m.modified_at = oll::rfc3339_now();
+        }
+        // digest is Ollama's CONTENT hash, used for blob dedup on pull. Computing a real sha256
+        // of a multi-GB checkpoint per request is out of the question, and a synthetic value
+        // would be a content hash that does not hash the content -- something a client could
+        // legitimately compare against another server and be misled by. Left empty: this server
+        // serves exactly one model and does not serve blobs, so nothing can act on it.
+        m.digest = "";
+        m.details.family = engine.is_qwen38()      ? "qwen3_8"
+                         : engine.is_museglimmer() ? "muse-glimmer"
+                         : engine.is_spark25()     ? "spark2_5"
+                                                   : "qwen3_6";
+        m.details.families = {m.details.family};
+        m.details.parameter_size = "";
+        m.details.quantization_level =
+            sparkinfer_server::lmstudio::quantization_from_path(engine.model_path());
+        return m;
+    };
+
+    svr.Get("/api/version", [](const httplib::Request&, httplib::Response& res) {
+        // Ollama clients version-gate features on this. Report a real Ollama-compatible version
+        // rather than a sparkinfer version string, which a client would fail to parse.
+        res.set_content(nlohmann::json{{"version", "0.5.0"}}.dump(), "application/json");
+    });
+
+    svr.Get("/api/tags", [&engine, ollama_entry](const httplib::Request& req, httplib::Response& res) {
+        if (!auth_ok(req)) { res.status = 401;
+            res.set_content("{\"error\":\"unauthorized\"}", "application/json"); return; }
+        res.set_content(oll::tags_list({ollama_entry()}).dump(), "application/json");
+    });
+
+    svr.Get("/api/ps", [&engine, ollama_entry](const httplib::Request& req, httplib::Response& res) {
+        if (!auth_ok(req)) { res.status = 401;
+            res.set_content("{\"error\":\"unauthorized\"}", "application/json"); return; }
+        // The one checkpoint this process serves is resident for the life of the process, so it
+        // is always "running" — there is no load/unload lifecycle to report.
+        res.set_content(oll::ps_list({ollama_entry()}).dump(), "application/json");
+    });
+
+    svr.Post("/api/show", [&engine, ollama_entry](const httplib::Request& req, httplib::Response& res) {
+        if (!auth_ok(req)) { res.status = 401;
+            res.set_content("{\"error\":\"unauthorized\"}", "application/json"); return; }
+        nlohmann::json in;
+        try { in = nlohmann::json::parse(req.body.empty() ? "{}" : req.body); }
+        catch (...) { res.status = 400;
+            res.set_content("{\"error\":\"invalid json\"}", "application/json"); return; }
+        const std::string want = in.value("model", in.value("name", std::string()));
+        if (!oll::model_name_matches(want, g_model_name)) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", "model '" + want + "' not found"}}.dump(),
+                            "application/json");
+            return;
+        }
+        const auto m = ollama_entry();
+        nlohmann::json mi = {{"general.architecture", m.details.family},
+                             {"general.parameter_count", (long long)0}};
+        std::vector<std::string> caps{"completion"};
+        if (engine.has_vision()) caps.push_back("vision");
+        res.set_content(oll::show_object(m, mi, caps, "").dump(), "application/json");
+    });
+
+    // Shared body for /api/chat and /api/generate. `chat` selects which handler and which
+    // translation pair; everything else is identical, including the NDJSON re-framing.
+    auto ollama_completion = [&engine, ollama_entry, chat_completions_handler,
+                              text_completions_handler](const httplib::Request& req,
+                                                        httplib::Response& res, bool chat) {
+        if (!auth_ok(req)) { res.status = 401;
+            res.set_content("{\"error\":\"unauthorized\"}", "application/json"); return; }
+        nlohmann::json in;
+        try { in = nlohmann::json::parse(req.body.empty() ? "{}" : req.body); }
+        catch (...) { res.status = 400;
+            res.set_content("{\"error\":\"invalid json\"}", "application/json"); return; }
+        const std::string want = in.value("model", std::string());
+        if (!oll::model_name_matches(want, g_model_name)) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", "model '" + want + "' not found"}}.dump(),
+                            "application/json");
+            return;
+        }
+        // Ollama omits `stream` to mean TRUE, unlike OpenAI where absent means false.
+        const bool want_stream = in.value("stream", true);
+
+        httplib::Request inner = req;
+        inner.body = (chat ? oll::chat_request_to_openai(in)
+                           : oll::generate_request_to_openai(in)).dump();
+        inner.set_header("Content-Type", "application/json");
+
+        httplib::Response inner_res;
+        if (chat) chat_completions_handler(inner, inner_res);
+        else      text_completions_handler(inner, inner_res);
+
+        // Pass a real failure through rather than dressing it as a completed Ollama response.
+        if (inner_res.status > 0 && inner_res.status != 200) {
+            res.status = inner_res.status;
+            res.set_content(inner_res.body, "application/json");
+            return;
+        }
+        nlohmann::json oai;
+        try { oai = nlohmann::json::parse(inner_res.body); }
+        catch (...) { res.status = 500;
+            res.set_content("{\"error\":\"upstream produced no JSON\"}", "application/json"); return; }
+
+        const std::string model = oll::with_latest_tag(g_model_name);
+        const std::string ts = oll::rfc3339_now();
+        const nlohmann::json out = chat ? oll::openai_to_chat_response(oai, model, ts)
+                                        : oll::openai_to_generate_response(oai, model, ts);
+        if (want_stream) {
+            // NDJSON: one JSON object per line. This is a single terminal chunk (done=true) --
+            // correct framing and fields, but the whole message at once rather than
+            // token-by-token. See ollama_api.hpp for why, and what closing that gap requires.
+            res.set_content(out.dump() + "\n", "application/x-ndjson");
+        } else {
+            res.set_content(out.dump(), "application/json");
+        }
+    };
+
+    svr.Post("/api/chat", [ollama_completion](const httplib::Request& req, httplib::Response& res) {
+        ollama_completion(req, res, /*chat=*/true);
+    });
+    svr.Post("/api/generate", [ollama_completion](const httplib::Request& req, httplib::Response& res) {
+        ollama_completion(req, res, /*chat=*/false);
+    });
+
+    // Everything Ollama exposes that this server structurally cannot do. Each is refused with a
+    // reason rather than silently 404'ing as an unknown route, so a client (or a person reading
+    // the log) learns WHY instead of suspecting a typo or a version mismatch.
+    //   embed/embeddings — no pooling path; sparkinfer is a generation runtime
+    //   pull/push/create/copy/delete/blobs — no model management; -m fixes one checkpoint
+    {
+        auto unsupported = [](const char* why) {
+            return [why](const httplib::Request&, httplib::Response& res) {
+                res.status = 501;
+                res.set_content(nlohmann::json{{"error", std::string(why)}}.dump(),
+                                "application/json");
+            };
+        };
+        const char* no_embed =
+            "this server does not support embeddings: sparkinfer is a generation runtime and has "
+            "no embedding model loaded";
+        const char* no_mgmt =
+            "this server does not manage models: it serves exactly one checkpoint given with -m "
+            "at startup, so there is nothing to pull, create, copy or delete";
+        svr.Post("/api/embed", unsupported(no_embed));
+        svr.Post("/api/embeddings", unsupported(no_embed));
+        svr.Post("/api/pull", unsupported(no_mgmt));
+        svr.Post("/api/push", unsupported(no_mgmt));
+        svr.Post("/api/create", unsupported(no_mgmt));
+        svr.Post("/api/copy", unsupported(no_mgmt));
+        svr.Delete("/api/delete", unsupported(no_mgmt));
+    }
 
     // Embeddings: refused, explicitly. sparkinfer has no pooling/embedding path at all -- it is a
     // generation runtime. Returning 501 with a reason is the honest answer; returning zeros, or
