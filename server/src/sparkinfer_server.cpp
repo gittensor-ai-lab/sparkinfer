@@ -1,4 +1,5 @@
 #include "chat_tokenizer.hpp"
+#include "lmstudio_api.hpp"
 #include "model_engine.hpp"
 #include "video_input.hpp"   // video_decoder_available() for /v1/models input_modalities
 #include "sparkinfer/kernels/deterministic.h"
@@ -1027,7 +1028,11 @@ int main(int argc, char** argv) {
         res.set_content(body.dump(), "application/json");
     });
 
-    svr.Post("/v1/chat/completions",
+    // Hoisted into a named handler so BOTH /v1/chat/completions and LM Studio's
+    // /api/v0/chat/completions are served by the SAME code rather than by two implementations
+    // that can drift apart. The v0 route wraps this one and augments its response; nothing about
+    // the v0 wire format leaks into the handler itself.
+    auto chat_completions_handler =
              [&engine](const httplib::Request& req, httplib::Response& res) {
                  if (!auth_ok(req)) {
                      res.status = 401;
@@ -2021,7 +2026,8 @@ int main(int argc, char** argv) {
                      {"model", g_model_name}, {"choices", choices}, {"usage", usage}};
                  g_requests_ok++;
                  res.set_content(body.dump(), "application/json");
-             });
+             };
+    svr.Post("/v1/chat/completions", chat_completions_handler);
 
     // Legacy pre-chat API: raw prompt string in, plain text out. No messages array, no chat
     // template, no tool-calling, no response_format, no reasoning split -- RequestControls/
@@ -2030,7 +2036,7 @@ int main(int argc, char** argv) {
     // from /v1/chat/completions above; ThinkingStreamSplitter/tool_protocol/json_mode_active have
     // no equivalent here and are deliberately not dragged in -- there is exactly ONE per-branch
     // shape, not a dispatcher between two.
-    svr.Post("/v1/completions",
+    auto text_completions_handler =
              [&engine](const httplib::Request& req, httplib::Response& res) {
                  if (!auth_ok(req)) {
                      res.status = 401;
@@ -2500,7 +2506,156 @@ int main(int argc, char** argv) {
                      {"model", g_model_name}, {"choices", choices}, {"usage", usage}};
                  g_requests_ok++;
                  res.set_content(body.dump(), "application/json");
+             };
+    svr.Post("/v1/completions", text_completions_handler);
+
+    // ---------------------------------------------------------------------------------------
+    // LM Studio REST API (/api/v0/*).
+    //
+    // Why v0 and not v1: LM Studio 0.4.0 shipped a native /api/v1/* and recommends it, but v1's
+    // additions over v0 are MCP, stateful chats, auth and MODEL MANAGEMENT -- /models/load,
+    // /unload, /download. Those assume a runtime that swaps checkpoints on demand. This server
+    // loads exactly one checkpoint from -m at startup, so a v1 implementation would have to
+    // answer half its own contract with errors. v0's five endpoints describe what this server
+    // actually is. See server/include/lmstudio_api.hpp.
+    //
+    // The two completion routes delegate to the SAME handlers /v1/* uses and then augment the
+    // response; there is no second implementation of generation here.
+    auto lmstudio_model_desc = [&engine]() {
+        sparkinfer_server::lmstudio::ModelDesc m;
+        m.id = g_model_name;
+        m.type = engine.has_vision() ? "vlm" : "llm";
+        const std::string path = engine.model_path();
+        m.publisher = sparkinfer_server::lmstudio::publisher_from_path(path);
+        if (m.publisher.empty()) m.publisher = "sparkinfer";
+        m.arch = engine.is_qwen38()      ? "qwen3_8"
+               : engine.is_museglimmer() ? "muse-glimmer"
+               : engine.is_spark25()     ? "spark2_5"
+                                         : "qwen3_6";
+        // LM Studio's vocabulary for this field is gguf|mlx only. A compressed-tensors directory
+        // is neither, and inventing a third value would break a client that switches on it, so
+        // report the closest true thing ("gguf" for a .gguf file) and leave it empty otherwise
+        // rather than claiming a format we are not serving.
+        m.compatibility_type = sparkinfer_server::lmstudio::compatibility_type_from_path(path);
+        m.quantization = sparkinfer_server::lmstudio::quantization_from_path(path);
+        m.state = engine.loaded() ? "loaded" : "not-loaded";
+        m.max_context_length = engine.max_seq();
+        m.loaded_context_length = engine.loaded() ? engine.max_seq() : 0;
+        return m;
+    };
+
+    svr.Get("/api/v0/models", [&engine, lmstudio_model_desc](const httplib::Request& req,
+                                                             httplib::Response& res) {
+        if (!auth_ok(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":{\"message\":\"unauthorized\"}}", "application/json");
+            return;
+        }
+        res.set_content(sparkinfer_server::lmstudio::models_list({lmstudio_model_desc()}).dump(),
+                        "application/json");
+    });
+
+    svr.Get(R"(/api/v0/models/(.+))", [&engine, lmstudio_model_desc](const httplib::Request& req,
+                                                                     httplib::Response& res) {
+        if (!auth_ok(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":{\"message\":\"unauthorized\"}}", "application/json");
+            return;
+        }
+        const std::string want = req.matches.size() > 1 ? req.matches[1].str() : "";
+        const auto m = lmstudio_model_desc();
+        if (want != m.id) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", {{"message", "model not found: " + want}}}}.dump(),
+                            "application/json");
+            return;
+        }
+        res.set_content(sparkinfer_server::lmstudio::model_object(m).dump(), "application/json");
+    });
+
+    // Augment a completed (non-streaming) OpenAI response with LM Studio's extra blocks. Derived
+    // ENTIRELY from the response the shared handler already produced -- ttft_ms/generation_ms/
+    // decode_tps are in its usage object and finish_reason is on the choice -- so generation is
+    // not re-run, re-timed, or measured twice.
+    //
+    // A streaming response is passed through untouched: its body is an SSE stream, not a JSON
+    // document, and rewriting chunks in flight would mean re-implementing the stream. A client
+    // that wants the stats block should use stream=false; that limitation is stated in the docs
+    // rather than papered over with an empty stats object that reads as "zero tokens/sec".
+    auto lmstudio_augment = [&engine, lmstudio_model_desc](httplib::Response& res) {
+        // httplib initialises Response::status to -1 and only substitutes 200 when it writes the
+        // response, and these handlers never set it explicitly on their success path. Testing for
+        // `status != 200` therefore rejected EVERY successful completion and this whole block
+        // silently did nothing -- the v0 responses came back well-formed but with no stats,
+        // model_info or runtime. Treat "unset" as success; only a status the handler set
+        // deliberately (4xx/5xx) is a real failure.
+        if (res.status > 0 && res.status != 200) return;
+        if (res.get_header_value("Content-Type").find("application/json") == std::string::npos) return;
+        nlohmann::json body;
+        try { body = nlohmann::json::parse(res.body); } catch (...) { return; }
+        if (!body.is_object()) return;
+
+        const auto& usage = body.value("usage", nlohmann::json::object());
+        sparkinfer_server::lmstudio::Stats st;
+        st.tokens_per_second = usage.value("decode_tps", 0.0);
+        st.time_to_first_token = usage.value("ttft_ms", 0.0) / 1000.0;   // ms -> s
+        st.generation_time = usage.value("generation_ms", 0.0) / 1000.0;
+        std::string finish;
+        if (body.contains("choices") && body["choices"].is_array() && !body["choices"].empty())
+            finish = body["choices"][0].value("finish_reason", "");
+        st.stop_reason = sparkinfer_server::lmstudio::stop_reason_from_finish(finish);
+
+        const auto m = lmstudio_model_desc();
+        sparkinfer_server::lmstudio::ModelInfo mi;
+        mi.arch = m.arch;
+        mi.quant = m.quantization;
+        mi.format = m.compatibility_type.empty() ? "compressed-tensors" : m.compatibility_type;
+        mi.context_length = m.loaded_context_length > 0 ? m.loaded_context_length : m.max_context_length;
+
+        sparkinfer_server::lmstudio::RuntimeDesc rt;
+        rt.name = "sparkinfer-linux-x86_64-nvidia-cuda-sm120";
+        // No version macro exists in this build, and inventing one that drifts from the real
+        // release would be worse than a stable honest string. LM Studio treats this as display
+        // text (it shows the runtime that served a response), not something it version-compares.
+        rt.version = "sparkinfer";
+        rt.supported_formats = {"gguf"};
+
+        body["stats"] = sparkinfer_server::lmstudio::stats_object(st);
+        body["model_info"] = sparkinfer_server::lmstudio::model_info_object(mi);
+        body["runtime"] = sparkinfer_server::lmstudio::runtime_object(rt);
+        res.set_content(body.dump(), "application/json");
+    };
+
+    svr.Post("/api/v0/chat/completions",
+             [chat_completions_handler, lmstudio_augment](const httplib::Request& req,
+                                                          httplib::Response& res) {
+                 chat_completions_handler(req, res);
+                 lmstudio_augment(res);
              });
+    svr.Post("/api/v0/completions",
+             [text_completions_handler, lmstudio_augment](const httplib::Request& req,
+                                                          httplib::Response& res) {
+                 text_completions_handler(req, res);
+                 lmstudio_augment(res);
+             });
+
+    // Embeddings: refused, explicitly. sparkinfer has no pooling/embedding path at all -- it is a
+    // generation runtime. Returning 501 with a reason is the honest answer; returning zeros, or
+    // the last hidden state dressed up as an embedding, would be silently wrong in a way a client
+    // cannot detect.
+    svr.Post("/api/v0/embeddings", [](const httplib::Request& req, httplib::Response& res) {
+        if (!auth_ok(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":{\"message\":\"unauthorized\"}}", "application/json");
+            return;
+        }
+        res.status = 501;
+        res.set_content(nlohmann::json{{"error", {
+            {"message", "this server does not support embeddings: sparkinfer is a generation "
+                        "runtime and has no embedding model loaded"},
+            {"type", "not_implemented"},
+            {"code", "embeddings_unsupported"}}}}.dump(), "application/json");
+    });
 
     // Transport-level deadlines. Defaults are generous, not aggressive: a cold 32k-context
     // prefill has been measured taking ~90s of TTFT alone (see eval/pr_dflash_bot.py's 32k
