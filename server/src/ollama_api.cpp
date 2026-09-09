@@ -2,6 +2,7 @@
 
 #include <ctime>
 #include <cmath>
+#include <cstdio>
 
 namespace sparkinfer_server {
 namespace ollama {
@@ -116,7 +117,35 @@ nlohmann::json generate_request_to_openai(const nlohmann::json& in) {
     out["model"] = in.value("model", "");
     out["prompt"] = in.value("prompt", "");
     out["stream"] = false;
-    if (in.contains("suffix")) out["suffix"] = in["suffix"];
+    // Only a NON-EMPTY suffix is forwarded. The ollama CLI sends "suffix":"" on an ordinary
+    // `ollama run`, and passing that through made /v1/completions reject the whole request with
+    // 400 "suffix is not supported" -- so every `ollama run` failed on a field the user never set.
+    if (in.contains("suffix") && in["suffix"].is_string() && !in["suffix"].get<std::string>().empty())
+        out["suffix"] = in["suffix"];
+    apply_options(in, out, "max_tokens");
+    return out;
+}
+
+bool generate_wants_raw(const nlohmann::json& in) {
+    return in.value("raw", false);
+}
+
+nlohmann::json generate_request_to_chat(const nlohmann::json& in) {
+    nlohmann::json msgs = nlohmann::json::array();
+    const std::string sys = in.value("system", std::string());
+    if (!sys.empty()) msgs.push_back({{"role", "system"}, {"content", sys}});
+    msgs.push_back({{"role", "user"}, {"content", in.value("prompt", std::string())}});
+    nlohmann::json out;
+    out["model"] = in.value("model", "");
+    out["messages"] = std::move(msgs);
+    out["stream"] = false;
+    if (in.contains("format")) {
+        if (in["format"].is_string() && in["format"] == "json")
+            out["response_format"] = {{"type", "json_object"}};
+        else if (in["format"].is_object())
+            out["response_format"] = {{"type", "json_schema"},
+                                      {"json_schema", {{"schema", in["format"]}}}};
+    }
     apply_options(in, out, "max_tokens");
     return out;
 }
@@ -187,7 +216,11 @@ nlohmann::json openai_to_generate_response(const nlohmann::json& oai, const std:
     if (oai.contains("choices") && oai["choices"].is_array() && !oai["choices"].empty()) {
         const auto& c = oai["choices"][0];
         finish = c.value("finish_reason", "");
+        // Either upstream shape: "text" from /v1/completions (raw path) or "message.content"
+        // from /v1/chat/completions (the default, template-applied path).
         text = c.value("text", "");
+        if (text.empty() && c.contains("message"))
+            text = c["message"].value("content", "");
     }
     out["response"] = text;
     out["done"] = true;
@@ -197,6 +230,27 @@ nlohmann::json openai_to_generate_response(const nlohmann::json& oai, const std:
     // send it back as if it meant something. Omitted entirely.
     add_metrics(oai, out);
     return out;
+}
+
+std::string synthetic_digest(const std::string& seed) {
+    // FNV-1a over the seed, re-run with four different offset bases to fill 64 hex characters.
+    // Not cryptographic and not claimed to be -- it only has to be stable, well-distributed
+    // enough that two checkpoints differ, and exactly the shape Ollama clients slice.
+    static const unsigned long long kBases[4] = {
+        1469598103934665603ULL, 1099511628211ULL, 14695981039346656037ULL, 1231ULL};
+    std::string out;
+    out.reserve(64);
+    for (int k = 0; k < 4; k++) {
+        unsigned long long h = kBases[k];
+        for (unsigned char c : seed) {
+            h ^= (unsigned long long)c;
+            h *= 1099511628211ULL;
+        }
+        char buf[17];
+        std::snprintf(buf, sizeof(buf), "%016llx", h);
+        out += buf;
+    }
+    return out;   // exactly 64 lowercase hex characters
 }
 
 std::string rfc3339_now() {

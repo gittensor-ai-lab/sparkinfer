@@ -79,6 +79,50 @@ int main() {
         const nlohmann::json o = generate_request_to_openai(in);
         CHECK(o["prompt"] == "hello" && o["stream"] == false && o["max_tokens"] == 8);
     }
+    // An EMPTY suffix must not be forwarded: the ollama CLI sends "suffix":"" on an ordinary
+    // `ollama run`, and passing it through made /v1/completions 400 the whole request.
+    {
+        const nlohmann::json in = {{"model","m"},{"prompt","hi"},{"suffix",""}};
+        CHECK(!generate_request_to_openai(in).contains("suffix"));
+    }
+    { // a real suffix still gets through
+        const nlohmann::json in = {{"model","m"},{"prompt","hi"},{"suffix","tail"}};
+        CHECK(generate_request_to_openai(in)["suffix"] == "tail");
+    }
+
+    // ---- /api/generate is TEMPLATE-AWARE by default, raw only on request ----
+    // Ollama applies the model's template to `prompt`; OpenAI's /v1/completions does not. Mapping
+    // one onto the other made `ollama run "Reply with exactly: OK"` answer "OK: OK: OK: OK...".
+    CHECK(!generate_wants_raw({{"model","m"},{"prompt","hi"}}));            // default = templated
+    CHECK(generate_wants_raw({{"model","m"},{"prompt","hi"},{"raw",true}}));
+    {
+        const nlohmann::json o = generate_request_to_chat({{"model","m"},{"prompt","hi"}});
+        CHECK(o.contains("messages") && !o.contains("prompt"));
+        CHECK(o["messages"].size() == 1);
+        CHECK(o["messages"][0]["role"] == "user" && o["messages"][0]["content"] == "hi");
+        CHECK(o["stream"] == false);
+    }
+    { // a system field becomes a system turn ahead of the user turn
+        const nlohmann::json o = generate_request_to_chat(
+            {{"model","m"},{"prompt","hi"},{"system","be terse"}});
+        CHECK(o["messages"].size() == 2);
+        CHECK(o["messages"][0]["role"] == "system" && o["messages"][0]["content"] == "be terse");
+        CHECK(o["messages"][1]["role"] == "user");
+    }
+    { // options still map through on the chat path
+        const nlohmann::json o = generate_request_to_chat(
+            {{"model","m"},{"prompt","hi"},{"options",{{"num_predict",12},{"temperature",0}}}});
+        CHECK(o["max_tokens"] == 12 && o["temperature"] == 0);
+    }
+    // the generate response reads EITHER upstream shape
+    {
+        const nlohmann::json from_chat = {{"choices",{{{"finish_reason","stop"},
+            {"message",{{"role","assistant"},{"content","Paris"}}}}}},{"usage",nlohmann::json::object()}};
+        CHECK(openai_to_generate_response(from_chat,"m","t")["response"] == "Paris");
+        const nlohmann::json from_text = {{"choices",{{{"finish_reason","stop"},{"text","Paris"}}}},
+                                          {"usage",nlohmann::json::object()}};
+        CHECK(openai_to_generate_response(from_text,"m","t")["response"] == "Paris");
+    }
 
     // ---- durations are NANOSECONDS ----
     CHECK(ms_to_ns(1.0) == 1000000LL);
@@ -133,6 +177,20 @@ int main() {
         // "context" is opaque conversation state this server does not keep; fabricating one would
         // invite the client to send it back as if it meant something.
         CHECK(!j.contains("context"));
+    }
+
+    // ---- digest: exactly 64 lowercase hex, stable, and NEVER empty ----
+    // `ollama list`/`ps` render digest[:12] with no length check, so an empty or short value
+    // panics the official CLI. This is the regression test for that crash.
+    {
+        const std::string d = synthetic_digest("/m/x.gguf|123|2026-01-01T00:00:00Z");
+        CHECK(d.size() == 64);
+        for (char c : d) CHECK((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+        CHECK(d.size() >= 12);                                   // the exact CLI slice
+        CHECK(synthetic_digest("/m/x.gguf|123|2026-01-01T00:00:00Z") == d);   // stable
+        CHECK(synthetic_digest("/m/y.gguf|123|2026-01-01T00:00:00Z") != d);   // path matters
+        CHECK(synthetic_digest("/m/x.gguf|999|2026-01-01T00:00:00Z") != d);   // size matters
+        CHECK(synthetic_digest("").size() == 64);                // even a degenerate seed is safe
     }
 
     // ---- created_at is RFC3339 UTC ----

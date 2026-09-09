@@ -2673,12 +2673,10 @@ int main(int argc, char** argv) {
             m.size = 0;
             m.modified_at = oll::rfc3339_now();
         }
-        // digest is Ollama's CONTENT hash, used for blob dedup on pull. Computing a real sha256
-        // of a multi-GB checkpoint per request is out of the question, and a synthetic value
-        // would be a content hash that does not hash the content -- something a client could
-        // legitimately compare against another server and be misled by. Left empty: this server
-        // serves exactly one model and does not serve blobs, so nothing can act on it.
-        m.digest = "";
+        // Stable synthetic id, NOT a content hash -- see ollama::synthetic_digest for why it
+        // cannot be a real sha256 here, and why it must not be empty (an empty digest panics
+        // `ollama list` and `ollama ps`, which slice digest[:12] with no length check).
+        m.digest = oll::synthetic_digest(path + "|" + std::to_string(m.size) + "|" + m.modified_at);
         m.details.family = engine.is_qwen38()      ? "qwen3_8"
                          : engine.is_museglimmer() ? "muse-glimmer"
                          : engine.is_spark25()     ? "spark2_5"
@@ -2690,10 +2688,27 @@ int main(int argc, char** argv) {
         return m;
     };
 
+    // Root heartbeat. The ollama CLI issues `HEAD /` before EVERY command and aborts with a
+    // generic "something went wrong" if it does not get a success -- so without this route, every
+    // ollama command fails identically and none of /api/* is ever reached. curl tests of the
+    // individual endpoints all passed while the real client could not run a single command;
+    // nothing but driving the actual CLI would have surfaced it.
+    //
+    // The body carries Ollama's own sentinel string because some tools grep for it, and it names
+    // sparkinfer too so the response is not simply pretending to be an Ollama server.
+    // Registering GET is enough: httplib dispatches HEAD through the GET handler table
+    // (Server::routing -> `req.method == "GET" || req.method == "HEAD"`), and strips the body
+    // for a HEAD response itself. A separate Head() registration does not exist in this httplib.
+    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("sparkinfer - Ollama is running", "text/plain; charset=utf-8");
+    });
+
     svr.Get("/api/version", [](const httplib::Request&, httplib::Response& res) {
-        // Ollama clients version-gate features on this. Report a real Ollama-compatible version
-        // rather than a sparkinfer version string, which a client would fail to parse.
-        res.set_content(nlohmann::json{{"version", "0.5.0"}}.dump(), "application/json");
+        // Ollama clients version-gate features on this, and warn when the server looks older
+        // than the client ("Warning: client version is X"). Tracks the client generation this was
+        // validated against (v0.33.3) rather than a sparkinfer version string, which a client
+        // would fail to parse as a semver.
+        res.set_content(nlohmann::json{{"version", "0.33.3"}}.dump(), "application/json");
     });
 
     svr.Get("/api/tags", [&engine, ollama_entry](const httplib::Request& req, httplib::Response& res) {
@@ -2729,7 +2744,15 @@ int main(int argc, char** argv) {
                              {"general.parameter_count", (long long)0}};
         std::vector<std::string> caps{"completion"};
         if (engine.has_vision()) caps.push_back("vision");
-        res.set_content(oll::show_object(m, mi, caps, "").dump(), "application/json");
+        // A NON-EMPTY template is what tells the ollama CLI this is a chat model: with an empty
+        // one it classifies the model as completion-only and routes `ollama run` to /api/generate,
+        // which bypasses chat formatting entirely and feeds the model a raw prompt. This server
+        // does apply a chat template internally (ChatTokenizer), so advertising one is accurate
+        // about the model's shape. The string itself is indicative -- the real templating happens
+        // server-side and is not driven by anything the client sends back.
+        const char* kTmpl = "{{ if .System }}{{ .System }}{{ end }}"
+                            "{{ if .Prompt }}{{ .Prompt }}{{ end }}{{ .Response }}";
+        res.set_content(oll::show_object(m, mi, caps, kTmpl).dump(), "application/json");
     });
 
     // Shared body for /api/chat and /api/generate. `chat` selects which handler and which
@@ -2753,14 +2776,24 @@ int main(int argc, char** argv) {
         // Ollama omits `stream` to mean TRUE, unlike OpenAI where absent means false.
         const bool want_stream = in.value("stream", true);
 
+        // /api/generate applies the model's template unless the request asked for raw, so the
+        // DEFAULT generate path goes to the chat handler (which templates) and only an explicit
+        // "raw": true goes to the completions handler. Mapping generate straight onto
+        // /v1/completions fed `ollama run` an unformatted prompt -- see ollama_api.hpp.
+        const bool raw = !chat && oll::generate_wants_raw(in);
+        const bool use_chat_handler = chat || !raw;
+        nlohmann::json inner_body;
+        if (chat)      inner_body = oll::chat_request_to_openai(in);
+        else if (raw)  inner_body = oll::generate_request_to_openai(in);
+        else           inner_body = oll::generate_request_to_chat(in);
+
         httplib::Request inner = req;
-        inner.body = (chat ? oll::chat_request_to_openai(in)
-                           : oll::generate_request_to_openai(in)).dump();
+        inner.body = inner_body.dump();
         inner.set_header("Content-Type", "application/json");
 
         httplib::Response inner_res;
-        if (chat) chat_completions_handler(inner, inner_res);
-        else      text_completions_handler(inner, inner_res);
+        if (use_chat_handler) chat_completions_handler(inner, inner_res);
+        else                  text_completions_handler(inner, inner_res);
 
         // Pass a real failure through rather than dressing it as a completed Ollama response.
         if (inner_res.status > 0 && inner_res.status != 200) {
