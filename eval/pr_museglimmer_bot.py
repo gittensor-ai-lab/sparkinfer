@@ -182,7 +182,24 @@ GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
 # 128 rather than 0 for the short point: qwen3_gguf_bench only emits a prefill number when ctx > 0
 # (see print_bench_block), so a 0 context can contribute decode but never prefill. Using 128 gives
 # both phases at every scored context and makes the matrix uniform.
-SCORED_CTXS = [128, 512, 4096, 16384, 32768]
+#
+# 64k added 2026-09-09. prefill_single_pass_max_tokens() defaults to 32768, so a prompt LONGER than
+# that is ingested in windows with pos0 > 0 -- a different code path that no scored context reached.
+# Measured on main (post-#1006) at that boundary:
+#
+#     ctx=32768   prefill 2080.89 pp tok/s      (single pass)
+#     ctx=49152   prefill   89.11 pp tok/s      (windowed -> refused -> token loop)
+#
+# A 23x cliff the moment windowing engages, completely invisible to a matrix that stops at 32k.
+# 64k rather than 48k because it is the round number the work in this area is reported against and
+# sits further past the boundary; VRAM is flat across the two (28.0 GB at 32k, 28.4 GB at 48k --
+# the prefill arena SHRINKS as windowing bounds it, offsetting the KV growth), and Muse's own
+# context_length is 131072, so 64k is well inside the model's range.
+#
+# Cost note: while main refuses the windowed path, one 64k prefill pass takes ~12 min, which
+# roughly doubles a Muse sweep. That is temporary in exactly the way the 4k/16k/32k cost was
+# before #1006 -- once the windowed path works, 64k costs ~45s and the sweep returns to ~13 min.
+SCORED_CTXS = [128, 512, 4096, 16384, 32768, 65536]
 # Repeats PER CONTEXT, not one number for all five. The reps=5 rule recorded below exists because
 # a SHORT measurement is dominated by launch/dispatch jitter on a box where GPU clocks cannot be
 # pinned -- prefill@128 completes in ~1s, so a single sample is meaningless there. That argument
@@ -216,7 +233,7 @@ SCORED_CTXS = [128, 512, 4096, 16384, 32768]
 #
 # So: one bench_sweep_run call per tier. That costs one extra model load (~1 min) and is the only
 # way to get 5 samples where a measurement is ~1s and 1 sample where it is ~330s.
-SCORED_REPS_TIERS = [([128, 512], 5), ([4096, 16384, 32768], 1)]
+SCORED_REPS_TIERS = [([128, 512], 5), ([4096, 16384, 32768, 65536], 1)]
 SCORED_REPS = {c: r for ctxs, r in SCORED_REPS_TIERS for c in ctxs}
 # The GUARDS deliberately keep BENCH_REPS (5) even at 32k, and that is not an inconsistency with
 # SCORED_REPS above. Repeat count should follow how long ONE measurement takes, and that is a
@@ -225,7 +242,8 @@ SCORED_REPS = {c: r for ctxs, r in SCORED_REPS_TIERS for c in ctxs}
 # jitter-prone, and exactly the shape that made PR #790's guard REJECT on a single bogus 6501
 # reading when two re-runs of the same binary both returned ~8477. A guard that can hard-REJECT a
 # real PR is the last place to economise on samples.
-SCORED_CTX_LABEL = {128: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
+SCORED_CTX_LABEL = {128: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k",
+                    65536: "64k"}
 # Order matters only for display; every entry is both a scored dimension AND a no-regression
 # floor, so a PR cannot buy a win at one context by giving one away at another.
 SCORING_DIMS = [f"muse-{phase}@{SCORED_CTX_LABEL[c]}"
