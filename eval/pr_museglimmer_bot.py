@@ -1384,8 +1384,9 @@ def format_comment(commit: str, res: dict) -> str:
         "NVFP4 checkpoint. This is informational, not a judgment on your PR: a `none` label just "
         "means no measurable Muse Glimmer speedup was verified on either metric, which is expected "
         "and fine if that isn't what your change is about. "
-        "Correctness gated against a live llama.cpp reference on the same GGUF. Also gated on a "
-        "Qwen3.6 no-regression guard (decode+prefill, ctx 0/512/4k/16k/32k, same box vs main) — "
+        "Correctness gated against a live llama.cpp reference on the same GGUF. Also gated on two "
+        "cross-model no-regression guards at 32k (decode+prefill, same box vs main): "
+        "Qwen3.6-35B-A3B and the ModelOpt Qwen3.8-27B NVFP4 checkpoint — "
         "Muse Glimmer PRs can touch code shared with other models. "
         "Automated — **not merged**; merge manually after review.</sub>\n"
     )
