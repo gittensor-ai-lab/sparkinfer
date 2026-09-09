@@ -1207,6 +1207,9 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         # Every scored axis, so the PR comment and the published log can show the whole matrix
         # rather than just the tier-winning row.
         "scored_dims": scored,
+        "best_dim": (best["dim"] if not regressed else worst["dim"]),
+        "modelopt_guard_ok": mo_ok,
+        "modelopt_guard_problems": mo_problems,
         "muse_pr": (pr.get("muse") or {}),
         "muse_main": (main.get("muse") or {}),
         "guardmo_skipped": bool(pr.get("guardmo_unavailable") or main.get("guardmo_unavailable")),
@@ -1264,6 +1267,17 @@ def format_comment(commit: str, res: dict) -> str:
         "pass": res.get("pass"),
         "accuracy_ok": res.get("accuracy_ok"),
         "q36_guard_ok": res.get("q36_guard_ok"),
+        "modelopt_guard_ok": res.get("modelopt_guard_ok"),
+        "modelopt_guard_skipped": res.get("guardmo_skipped"),
+        # WHICH axis produced delta_pct. Necessary now that the tier comes from ten axes while the
+        # marker still carries only the 128 numbers for the dashboard: without this a reader sees
+        # a headline delta that does not match either number next to it (e.g. +3900% from
+        # prefill@4k printed beside a flat decode@128).
+        "best_dim": res.get("best_dim"),
+        # The whole matrix, so a consumer that wants more than the 128 pair does not have to
+        # re-scrape the rendered table.
+        "dims": {d["dim"]: {"delta": d["delta"], "label": d["label"]}
+                 for d in (res.get("scored_dims") or [])},
     }
     marker = (
         f"<!-- sparkinfer-museglimmer-eval:{EVAL_SCHEMA_VERSION}:{commit} "
@@ -1289,11 +1303,22 @@ def format_comment(commit: str, res: dict) -> str:
                           f"kl={res.get('main_kl'):.4f} — main ALSO misses the bar (informational; "
                           "not gated on main, but check the box/corpus if this persists) |\n")
     if res.get("q36_guard_ok"):
-        q36_row = "| qwen3.6 guard | ✅ no regression (decode+prefill, ctx 0/512/4k/16k/32k) |\n"
+        q36_row = "| qwen3.6 guard | ✅ no regression (decode+prefill @ 32k) |\n"
     else:
         problems = "; ".join((res.get("q36_guard_problems") or [])[:4])
         q36_row = (f"| qwen3.6 guard | ❌ **FAILED** — {problems} — "
                     "**verdict forced to REJECT regardless of speed/accuracy** |\n")
+    if res.get("guardmo_skipped"):
+        # Say SKIPPED explicitly. A guard that silently reports nothing reads identical to one
+        # that passed, which is how an unnoticed vacuous guard survives for months.
+        mo_row = ("| modelopt guard | ⚠️ SKIPPED — checkpoint not installed on the box "
+                  "(`MODELOPT_MODEL_DIR`); shared-code regressions on Qwen3.8 were NOT checked |\n")
+    elif res.get("modelopt_guard_ok"):
+        mo_row = "| modelopt guard | ✅ no regression (decode+prefill @ 32k, Qwen3.8-27B NVFP4) |\n"
+    else:
+        mo_problems = "; ".join((res.get("modelopt_guard_problems") or [])[:4])
+        mo_row = (f"| modelopt guard | ❌ **FAILED** — {mo_problems} — "
+                  "**verdict forced to REJECT regardless of speed/accuracy** |\n")
     polaris = res.get("polaris") or {}
     receipt = polaris.get("receipt")
     if receipt:
@@ -1309,9 +1334,11 @@ def format_comment(commit: str, res: dict) -> str:
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-museglimmer:{lab}` |\n"
         f"| scored at | decode + prefill @ 128/512/4k/16k/32k — every axis is also a regression floor, label is the best |\n"
+        f"| tier from | `{res.get('best_dim') or '?'}` ({res.get('delta_pct', 0):+.1f}%) |\n"
         f"{acc_row}"
         f"{main_acc_note}"
         f"{q36_row}"
+        f"{mo_row}"
         f"| PPL sparkinfer / llama.cpp | {res.get('pr_ppl_spark') or '?'} / {res.get('pr_ppl_llama') or '?'} |\n"
         f"{polaris_row}"
         f"| commit | `{commit[:9]}` |\n\n"
