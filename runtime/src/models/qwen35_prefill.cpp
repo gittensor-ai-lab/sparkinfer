@@ -834,7 +834,52 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         ? kernels::prefill_nvfp4_data_bytes(fp4_a_rows, H) : 0;
     const size_t fp4_a_sf_bytes = gu_nvfp4
         ? kernels::prefill_nvfp4_scale_bytes_a(fp4_a_rows, H) : 0;
-    const bool muse_nvfp4_down = muse_nvfp4 && s.w.layers[0].down_fp4 &&
+    // ffn_down is the last projection Muse still runs on the int8 tensor cores, and on the FP4
+    // ones the same leg measures 2.34x (1168 TFLOPS vs 499 TOPS on this card). It has no resident
+    // FP4 copy because 52 of them are 3.89 GB that nothing can free -- decode reads the GGUF tensor
+    // directly -- and holding them starves the batched-prefill arena.
+    //
+    // So the operand is built ONE LAYER AT A TIME, and its scratch lives only as long as the pass
+    // that uses it. That second half is not a tidiness point: at max_seq 65536 the session has
+    // essentially no spare VRAM, and 341 MB held across a 64k prefill costs 85% of it -- measured
+    // with the buffers allocated and never read, so it is the footprint alone, not this path.
+    // Hence a band. Below dn_min the fixed ~31 ms of conversion (52 layers) swamps a prefill that
+    // only takes ~36 ms; above dn_max the scratch cannot be spared beside a long-context KV cache.
+    static const int dn_min = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MINN"); return e ? atoi(e) : 1024;
+    }();
+    static const int dn_max = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MAXN"); return e ? atoi(e) : 8192;
+    }();
+    static const bool dn_stream_on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_STREAM"); return !(e && e[0] == '0');
+    }();
+    // Frees on every exit path, including the two mid-function declines.
+    struct DownFp4Scratch {
+        void* tmp = nullptr; void* data = nullptr; void* sf = nullptr;
+        ~DownFp4Scratch() {
+            if (tmp) cudaFree(tmp);
+            if (data) cudaFree(data);
+            if (sf) cudaFree(sf);
+        }
+    } dn_scratch;
+    if (muse_nvfp4 && !s.w.layers[0].down_fp4 && dn_stream_on && N >= dn_min && N <= dn_max &&
+        kernels::prefill_nvfp4_supported(N, H, ffn)) {
+        const size_t need_tmp = (size_t)H * ffn * sizeof(bf16);
+        if (cudaMalloc(&dn_scratch.tmp, need_tmp) != cudaSuccess) dn_scratch.tmp = nullptr;
+        if (dn_scratch.tmp &&
+            cudaMalloc(&dn_scratch.data, kernels::prefill_nvfp4_data_bytes(H, ffn)) != cudaSuccess)
+            dn_scratch.data = nullptr;
+        if (dn_scratch.data &&
+            cudaMalloc(&dn_scratch.sf, kernels::prefill_nvfp4_scale_bytes_b(H, ffn)) != cudaSuccess)
+            dn_scratch.sf = nullptr;
+        if (!dn_scratch.sf) {   // partial failure: give it all back and keep the int8 path
+            if (dn_scratch.tmp)  { cudaFree(dn_scratch.tmp);  dn_scratch.tmp = nullptr; }
+            if (dn_scratch.data) { cudaFree(dn_scratch.data); dn_scratch.data = nullptr; }
+        }
+    }
+    const bool muse_nvfp4_down = muse_nvfp4 &&
+                                 (s.w.layers[0].down_fp4 || dn_scratch.sf) &&
                                  kernels::prefill_nvfp4_supported(N, H, ffn);
     const bool q38_nvfp4_down = q38_nvfp4 && s.w.layers[0].down_fp4 &&
                                 kernels::prefill_nvfp4_supported(N, H, ffn);
@@ -1960,6 +2005,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             const bool ffn_fp4_resid = nvfp4_resid_fuse && ffn_fp4_possible && !c.muse_glimmer &&
                                        nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
                                        fp4_down_a && fp4_down_as;
+            // The streamed operand is built ONCE per layer here and read by every chunk below,
+            // then overwritten by the next layer. It is ordered on `st` with the GEMMs that
+            // consume it, so a single buffer is correct -- a second would only overlap the
+            // conversion. A layer whose conversion declines simply keeps today's int8 path.
+            const void* dn_fp4    = w.down_fp4;
+            const void* dn_fp4_sf = w.down_fp4_sf;
+            if (!dn_fp4 && nvfp4_down && ffn_fp4_possible && dn_scratch.sf && w.down_q) {
+                kernels::launch_gguf_dequant(w.down_qtype, w.down_q,
+                                             (bf16*)dn_scratch.tmp, (long)H * ffn, st);
+                if (kernels::launch_prefill_nvfp4_quant_b(dn_scratch.tmp, dn_scratch.data,
+                                                          dn_scratch.sf, H, ffn, st)) {
+                    dn_fp4 = dn_scratch.data;
+                    dn_fp4_sf = dn_scratch.sf;
+                }
+            }
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
@@ -1980,7 +2040,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                                        w.up_fp4_alpha);
                 if (layer_fp4) {
                     bf16* xc = x + (size_t)fo * H;
-                    const bool down_swiglu_q = nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
+                    const bool down_swiglu_q = nvfp4_down && dn_fp4 && dn_fp4_sf &&
                         fp4_down_a && fp4_down_as &&
                         kernels::launch_prefill_nvfp4_swiglu_quant_a(
                             ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st);
@@ -1991,7 +2051,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     const bool down_fp4_done = down_fp4_resid ||
                         (down_swiglu_q &&
                          kernels::launch_prefill_nvfp4_gemm(
-                            fp4_down_a, fp4_down_as, w.down_fp4, w.down_fp4_sf,
+                            fp4_down_a, fp4_down_as, dn_fp4, dn_fp4_sf,
                             ao + (size_t)fo * H, fn, H, ffn, fp4_ws, st,
                             w.down_fp4_alpha));
                     if (!down_fp4_done) {
