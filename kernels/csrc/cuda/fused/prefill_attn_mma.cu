@@ -379,7 +379,10 @@ __device__ __forceinline__ void pf_mma_16832(int (&d)[4], const unsigned (&a)[4]
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-template <int HEAD_DIM, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1>
+// SINK=false drops the always-attended block 0, giving the PURE sliding window Muse Glimmer's
+// SWA layers use. Defaulted true, so every existing instantiation compiles to what it did before.
+template <int HEAD_DIM, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1,
+          bool SINK = true>
 __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 ? 2 : 1))) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
@@ -543,10 +546,11 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     int blk_rs = 0;
     if (win_blocks > 0) {
         const int n_blk_q = (q_pos0 + qbase + BLKSZ) / BLKSZ;
-        const int rsb = (win_blocks >= n_blk_q - 1) ? 1 : (n_blk_q - win_blocks);
+        const int rsb = SINK ? ((win_blocks >= n_blk_q - 1) ? 1 : (n_blk_q - win_blocks))
+                             : ((win_blocks >= n_blk_q)     ? 0 : (n_blk_q - win_blocks));
         blk_rs = rsb * BLKSZ;
     }
-    const bool split_sink = (win_blocks > 0) && (blk_rs > BLKSZ);
+    const bool split_sink = SINK && (win_blocks > 0) && (blk_rs > BLKSZ);
 
     // The sink range and the main range are the same loop over different bounds, and calling a
     // [&] lambda twice inlines its whole body twice: ~9.7k SASS instructions for this kernel,
@@ -556,7 +560,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     // bearing: without it ptxas peels the two-iteration loop straight back into two bodies.
     #pragma unroll 1
     for (int rr_ = (split_sink ? 0 : 1); rr_ < 2; rr_++) {
-        const int lo = (rr_ == 0) ? 0 : (split_sink ? blk_rs : 0);
+        const int lo = (rr_ == 0) ? 0 : (SINK ? (split_sink ? blk_rs : 0) : blk_rs);
         const int hi = (rr_ == 0) ? BLKSZ : (last_q + 1);
         for (int k0 = lo; k0 < hi; k0 += GN) {
             const int nk   = min(GN, hi - k0);
@@ -683,7 +687,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             // is the common path, not the rare one.
             const bool grp_full =
                 (nk == GN) && (qbase + BM <= n_tokens) && (k0 + GN <= q_pos0 + qbase + 1) &&
-                (win_blocks <= 0 || k0 >= blk_rs || k0 + GN <= BLKSZ);
+                (win_blocks <= 0 || k0 >= blk_rs || (SINK && k0 + GN <= BLKSZ));
 
             // ---- online softmax per head; quantize P' ----
             // Column ownership inside the warp is VECTOR, not strided. Lane `lane` used to own
@@ -777,7 +781,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                                     const bool live =
                                         (t < gblk * 16) && (gtok < hi) && (qtok < n_tokens) &&
                                         (gtok <= q_pos0 + qtok) &&
-                                        (win_blocks <= 0 || gtok < BLKSZ || gtok >= blk_rs);
+                                        (win_blocks <= 0 || (SINK && gtok < BLKSZ) || gtok >= blk_rs);
                                     sc[u] = live ? (float)rw[j] * qs * PF_KS(u) : -1e30f;
                                 }
                                 mx = fmaxf(mx, sc[u]);
@@ -1153,7 +1157,8 @@ const signed char* vpack_build(const signed char* v_pool, const int* block_table
 }
 }  // namespace
 
-template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1>
+template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1,
+          bool SINK = true>
 static bool launch_attn_gqa(const void* q, const signed char* k_pool, const signed char* v_pool,
                             const void* k_scale, const void* v_scale, const int* block_table,
                             void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
@@ -1205,13 +1210,13 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                             + (size_t)2 * GN * sizeof(__half)
                             + (size_t)5 * RQH * BM * sizeof(float);
         const cudaError_t ce = cudaFuncSetAttribute(
-            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT, WIDEK, PVU>,
+            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT, WIDEK, PVU, SINK>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_max);
         if (ce != cudaSuccess && sm_max > 48u * 1024u) return false;  // opt-in refused where required
         cfg[dev] = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
-    pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT, WIDEK, PVU><<<grid, GROUP_BLKS * 32, sm, stream>>>(
+    pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT, WIDEK, PVU, SINK><<<grid, GROUP_BLKS * 32, sm, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
@@ -1235,6 +1240,32 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                 RQH, SPL, GROUP_BLKS, GN, sm, qld, pld, n_tokens, (int)VT, (int)WIDEK, PVU, (int)ok);
     }
     return ok;
+}
+
+// Muse Glimmer (hd128, GQA 32/2, block_size 16) on the int8 wmma path. The kernel above is
+// already templated on HEAD_DIM and already carries q_pos0; what kept Muse off it was the
+// launcher's hardcoded HD=256 and the sink. GROUP_BLKS must divide both BM(16) and HEAD_DIM/16,
+// which at hd128 is 8 -- so GB=8, NOT the hd256 default of 16. RQH=4 divides the GQA group of 16.
+// Returns false if the tier declines, so the caller keeps its own kernel.
+bool launch_prefill_attn_mma_muse_hd128(
+    const void* q, const signed char* k_pool, const signed char* v_pool,
+    const void* k_scale, const void* v_scale, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream,
+    int q_pos0) {
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_MUSE_ATTN_MMA");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!enabled) return false;
+    if (head_dim != 128 || block_size != 16) return false;
+    if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
+    if (n_q_heads % 4 != 0) return false;                  // RQH=4 owns 4 q-heads per block
+    if ((n_q_heads / n_kv_heads) % 4 != 0) return false;   // ...all sharing one kv-head
+    return launch_attn_gqa<128, /*GROUP_BLKS=*/8, /*RQH=*/4, /*PLANES=*/0,
+                           /*VT=*/false, /*WIDEK=*/false, /*PVU=*/1, /*SINK=*/false>(
+        q, k_pool, v_pool, k_scale, v_scale, block_table, attn, n_tokens, n_q_heads, n_kv_heads,
+        block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0);
 }
 
 bool launch_prefill_attn_mma(

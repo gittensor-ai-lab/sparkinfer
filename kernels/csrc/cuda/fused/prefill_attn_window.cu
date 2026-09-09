@@ -972,6 +972,16 @@ void launch_prefill_attn_swa_pure_int8(
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
     cudaStream_t stream, int q_pos0) {
     (void)head_dim;   // Muse Glimmer attention is hd128 only; templated below.
+    // int8 tensor cores first: attention is 45.8% of Muse prefill at ctx=4096 and 68.9% at 16384
+    // (repeat-slope, two agreeing slopes), and the kernels below are scalar. Declines -> fall
+    // through to the lane-parallel kernel, which is what ran before.
+    // q_pos0 must be forwarded: a windowed ingest starts this pass at a nonzero sequence
+    // position, and the wmma kernel masks on the absolute position exactly as the kernels below
+    // do. Dropping it would silently mask every window against position zero.
+    if (launch_prefill_attn_mma_muse_hd128(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+            n_tokens, n_q_heads, n_kv_heads, head_dim, block_size, max_blocks_per_seq, scale,
+            win_blocks, stream, q_pos0))
+        return;
     constexpr int HD = 128, TK = 32, KSTRIDE = HD + 8, NWARP = 8, QPW = 1, TQ = NWARP * QPW;
     // The int8 pool is dequantized into a BF16 tile during staging, so this shares the schedule,
     // the pure-window mask and the smem budget of the bf16 kernel: 18,944 B rather than the

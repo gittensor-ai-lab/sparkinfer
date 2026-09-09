@@ -759,10 +759,6 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         return !(e && e[0] == '0');
     }();
     const int fp4_rows = fp4_chunk_a ? FC : N;
-    const size_t fp4_a_data_bytes = gu_nvfp4
-        ? kernels::prefill_nvfp4_data_bytes(fp4_rows, H) : 0;
-    const size_t fp4_a_sf_bytes = gu_nvfp4
-        ? kernels::prefill_nvfp4_scale_bytes_a(fp4_rows, H) : 0;
     // The attention projection group: q | gate | k | v stacked, so one GEMM covers all four. Its A
     // operand is `xn` at k = H -- the same shape gate/up already quantize -- so fp4_a/fp4_as serve
     // it unchanged; only the [N, qkvg_n] bf16 output and a possibly wider workspace are new.
@@ -778,6 +774,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                kernels::prefill_nvfp4_supported(N, H, qdim);
     const size_t fp4_ws_wo = muse_nvfp4_wo
         ? kernels::prefill_nvfp4_workspace_bytes(N, H, qdim) : 0;
+    // fp4_a/fp4_as are SHARED by legs with DIFFERENT row counts. gate/up quantizes fn <= FC from
+    // inside the token-chunked FFN loop, but the qkv leg quantizes N rows in one call
+    // (launch_prefill_nvfp4_quant_a(xn, ..., N, H)) and so does the o projection
+    // (launch_prefill_nvfp4_gate_quant_a(att, qg, ..., N, qdim)). Sizing the buffer by FC
+    // therefore overruns it by (N - FC) rows as soon as either is enabled and N > FC -- an
+    // illegal memory access, not a quiet fallback. It stayed invisible because Muse only reached
+    // the FP4 path at N == 128, where FC == N by construction, so the two row counts coincided.
+    // Size by whichever consumer is actually enabled.
+    const int fp4_a_rows = (muse_nvfp4_qkv || muse_nvfp4_wo) ? N : fp4_rows;
+    const size_t fp4_a_data_bytes = gu_nvfp4
+        ? kernels::prefill_nvfp4_data_bytes(fp4_a_rows, H) : 0;
+    const size_t fp4_a_sf_bytes = gu_nvfp4
+        ? kernels::prefill_nvfp4_scale_bytes_a(fp4_a_rows, H) : 0;
     const bool muse_nvfp4_down = muse_nvfp4 && s.w.layers[0].down_fp4 &&
                                  kernels::prefill_nvfp4_supported(N, H, ffn);
     const bool q38_nvfp4_down = q38_nvfp4 && s.w.layers[0].down_fp4 &&
