@@ -56,6 +56,16 @@ bool launch_prefill_attn_mma_muse_hd128(
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
     cudaStream_t stream = nullptr, int q_pos0 = 0);
 
+// BF16-KV counterpart of launch_prefill_attn_mma_muse_hd128, for Muse Glimmer BELOW ctx 4096
+// where the cache is still bf16 -- the scored prefill@128 and prefill@512 dimensions, which the
+// int8 tier cannot reach. Full-causal only: the caller must have established that the sliding window does not bind
+// over this pass. Returns false if the tier declines. Defined in prefill_attn_mma.cu.
+bool launch_prefill_attn_mma_bf16_muse_hd128(
+    const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale,
+    cudaStream_t stream = nullptr, int q_pos0 = 0);
+
 void launch_prefill_attn_swa_pure_int8(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,

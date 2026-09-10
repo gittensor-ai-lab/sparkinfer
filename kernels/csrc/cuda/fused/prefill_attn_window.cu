@@ -918,6 +918,28 @@ void launch_prefill_attn_swa_pure_bf16(
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
     cudaStream_t stream, int q_pos0) {
     (void)head_dim;   // Muse Glimmer attention is hd128 only; templated below.
+    // Tensor cores first, exactly as the int8 launcher does since #1009 -- that PR moved Muse's
+    // prefill attention onto the wmma kernel but could only reach it through the int8 tier, so
+    // every context below 4096 stayed on the scalar kernel below. That includes the SCORED
+    // prefill@128 and prefill@512 dimensions, and 512 is where it costs the most: attention is
+    // 26.4% of that pass on main against 9.7% here.
+    //
+    // The wmma kernel is FULL CAUSAL and takes no window, so it is only equivalent while the
+    // sliding window does not bind over this pass: every query's window start must fall at or
+    // before position 0. win_blocks <= 0 is already the full-causal (global/NoPE) contract; when
+    // a window is set, the last query of the pass sits at q_pos0 + n_tokens - 1, so requiring
+    // q_pos0 + n_tokens <= win_blocks * block_size is that condition (by one token to spare).
+    // At Muse's 2048-token window this admits the scored ctx=128 and ctx=512 and declines from
+    // 2048 up, where the cache is int8 and #1009's tier already runs. A windowed ingest carries
+    // q_pos0 > 0 and is therefore declined on its own arithmetic, not by a special case.
+    const bool win_unbound =
+        win_blocks <= 0 ||
+        (long long)q_pos0 + n_tokens <= (long long)win_blocks * block_size;
+    if (win_unbound &&
+        launch_prefill_attn_mma_bf16_muse_hd128(q, k_pool, v_pool, block_table, attn, n_tokens,
+                                                n_q_heads, n_kv_heads, head_dim, block_size,
+                                                max_blocks_per_seq, scale, stream, q_pos0))
+        return;
     // TQ=8, not 16. This kernel is one warp per query, so TQ only sets how many queries share a
     // block's K/V tile -- each warp still walks its own keys in ascending kpos, so the fp32 dot and
     // the online-softmax chain are untouched and the result is bit-identical. At Muse's prefill@128

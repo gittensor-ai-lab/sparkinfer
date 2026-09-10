@@ -2094,6 +2094,80 @@ bool launch_prefill_attn_mma_bf16(
 #undef SI_MMA_BF16_TRY
 }
 
+// Muse Glimmer's bf16-KV wmma prefill attention (hd128). #1009 put Muse's prefill attention on
+// the int8 tensor cores, but that tier is entered only from the int8 launcher, i.e. only at
+// ctx >= 4096 where the example mains switch the KV cache to int8. Below that -- which is where
+// the SCORED prefill@128 and prefill@512 dimensions live -- the cache is bf16 and attention still
+// ran the scalar lane-parallel kernel. nsys on main at prefill@512 puts
+// win_prefill_lanepar_bf16_kernel at 10.99 ms/rep over 52 launches: 26.4% of a 41.6 ms pass, for
+// an attention the same wmma kernel finishes in 3.27 ms.
+//
+// The bf16 wmma kernel is full-causal and has no window argument, so this entry point is correct
+// only when the sliding window does not bind over the whole pass; that is the caller's predicate
+// (see launch_prefill_attn_swa_pure_bf16), not something that can be checked here.
+//
+// GROUP_BLKS=8 is forced by the same divisibility rule #1009 documents for the int8 twin: it must
+// divide BM=16 and HEAD_DIM/16, which is 8 at hd128 (the hd256 default of 16 does not).
+//
+// RQH=2 rather than the int8 twin's 4, and split-P OFF. Both measured out of ONE binary on Muse
+// Glimmer against main, prefill pp:
+//
+//     RQH  PSPLIT   pp@512   pp@128
+//      2      1      15153     9594
+//      4      1      15294     9416
+//      2      0      15308     9628
+//      4      0      15312     9448
+//
+// 512 is flat across all four -- the tier is ~3.4x on attention either way -- so 128 is what picks
+// the shape, and there the grid still decides: ceil(128/16) = 8 query tiles means grid.y =
+// n_q_heads/RQH is what fills the machine, so RQH=4 leaves 8x8 = 64 blocks against 170 SMs where
+// RQH=2 gives 128. RQH above 4 is deliberately not offered: <128,8,RQH=8> is over the smem opt-in
+// and a refused launch costs the whole tier rather than one shape (measured 2660 pp at ctx=128,
+// 4325 at 512 -- a 3.5x regression, the failure mode #1018 documents for the int8 ladder).
+//
+// PSPLIT=0 is the surprising half. Carrying P as a hi+lo bf16 pair costs a second PV mma over the
+// same V fragment, and on this path it does not buy the fidelity it exists for: against the token
+// loop at prefix=512 (bf16 KV, 64 teacher-forced positions) split-P measures TOP1 37/64 /
+// KL 0.17046 while a single bf16 P measures TOP1 41/64 / KL 0.15950 -- better on both metrics AND
+// faster, so it is off by default here. SPARKINFER_MUSE_ATTN_BF16_PSPLIT=1 restores it.
+// SPARKINFER_MUSE_ATTN_BF16_RQH overrides RQH; SPARKINFER_MUSE_ATTN_BF16_MMA=0 disables the tier
+// (A/B out of one binary).
+bool launch_prefill_attn_mma_bf16_muse_hd128(
+    const void* q, const void* k_pool, const void* v_pool, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream, int q_pos0) {
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_MUSE_ATTN_BF16_MMA");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!enabled) return false;
+    if (head_dim != 128 || block_size != 16) return false;
+    if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
+    static const int rqh_env = [] {
+        const char* e = getenv("SPARKINFER_MUSE_ATTN_BF16_RQH");
+        const int v = e ? atoi(e) : 2;
+        return (v >= 1 && v <= 4) ? v : 2;
+    }();
+    static const int psplit_env = [] {
+        const char* e = getenv("SPARKINFER_MUSE_ATTN_BF16_PSPLIT");
+        return (e && e[0] == '1') ? 1 : 0;
+    }();
+    const int gqa = n_q_heads / n_kv_heads;
+    // RQH q-heads per block, all of which must share ONE kv-head: RQH has to divide the q-head
+    // count (grid.y) and the GQA group (so head0/gqa is the same kv-head for all of them).
+#define SI_MMA_MUSE_BF16_TRY(RQH_)                                                                \
+    (n_q_heads % (RQH_) == 0 && gqa % (RQH_) == 0 &&                                              \
+     (psplit_env                                                                                  \
+      ? launch_attn_bf16_gqa<128, 8, RQH_, true>(q, k_pool, v_pool, nullptr, block_table, attn,   \
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream, q_pos0)\
+      : launch_attn_bf16_gqa<128, 8, RQH_, false>(q, k_pool, v_pool, nullptr, block_table, attn,  \
+            n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream, q_pos0)))
+    if (rqh_env >= 4 && SI_MMA_MUSE_BF16_TRY(4)) return true;
+    if (rqh_env >= 2 && SI_MMA_MUSE_BF16_TRY(2)) return true;
+    return SI_MMA_MUSE_BF16_TRY(1);
+#undef SI_MMA_MUSE_BF16_TRY
+}
+
 bool launch_prefill_attn_mma_bf16_vi8(
     const void* q, const void* k_pool, const signed char* v_i8, const void* v_scale,
     const int* block_table, void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
