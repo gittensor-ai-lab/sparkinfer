@@ -1293,9 +1293,11 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
     # Also apply the AR bot's eval:* convention (same tier value) — SN74 scoring reads eval:*
     # tiers, not eval-dflash:*, and the AR bot no longer runs on cron to post them itself. Without
     # this a DFlash-verified speedup would be invisible to anything that only looks at eval:*.
-    for lab in {l for l in arb.labels_on(repo, num) if l.startswith("eval:")}:
-        arb.remove_label(repo, num, lab)
-    arb.add_label(repo, num, f"eval:{label}")
+    # Derived from every per-bot `eval-<model>:<tier>` label rather than overwritten with this
+    # bot's own verdict -- this bot only measures Qwen3.6, so writing the generic label
+    # directly let a `none` here erase another model's real tier depending purely on which
+    # staggered cron ran last. See arb.sync_generic_eval_label().
+    arb.sync_generic_eval_label(repo, num)
     arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
     if res.get("ok"):
         upload_dflash_eval_log(repo, num, title, commit, res)

@@ -1100,5 +1100,70 @@ class ExhaustedEvalCloseTest(unittest.TestCase):
         close_mock.assert_called_once()
 
 
+
+class GenericEvalLabelTest(unittest.TestCase):
+    """sync_generic_eval_label(): the generic eval:* tier SN74 reads is derived from the per-bot
+    eval-<model>:* labels, so staggered bots cannot clobber each other's verdicts."""
+
+    def _run(self, labels):
+        """Returns (chosen_tier, final_label_set) after running the sync against `labels`."""
+        state = set(labels)
+        with mock.patch.object(bot, "labels_on", return_value=set(state)), \
+             mock.patch.object(bot, "add_label", side_effect=lambda r, n, l: state.add(l)), \
+             mock.patch.object(bot, "remove_label", side_effect=lambda r, n, l: state.discard(l)):
+            got = bot.sync_generic_eval_label("o/r", 1)
+        return got, state
+
+    def test_one_bots_none_cannot_erase_anothers_tier(self):
+        # The #1018 case: a Muse PR scored L by the Muse bot, then benched by the DSpark bot
+        # against a model it does not touch. Whichever cron ran last used to win.
+        got, state = self._run({"eval-museglimmer:L", "eval-dspark:none", "eval:L"})
+        self.assertEqual(got, "L")
+        self.assertIn("eval:L", state)
+        self.assertNotIn("eval:none", state)
+
+    def test_order_independent(self):
+        # Same two verdicts, whichever bot happens to write last -> same generic label.
+        a, _ = self._run({"eval-museglimmer:L", "eval-dspark:none", "eval:none"})
+        b, _ = self._run({"eval-dspark:none", "eval-museglimmer:L", "eval:L"})
+        self.assertEqual(a, b)
+        self.assertEqual(a, "L")
+
+    def test_best_tier_wins_across_bots(self):
+        got, _ = self._run({"eval-museglimmer:S", "eval-dspark:XL", "eval-qwen38:none"})
+        self.assertEqual(got, "XL")
+
+    def test_reject_beats_any_positive_tier(self):
+        # A regression on ANY model must not advertise a positive tier from another.
+        got, state = self._run({"eval-museglimmer:XL", "eval-dspark:REJECT"})
+        self.assertEqual(got, "REJECT")
+        self.assertIn("eval:REJECT", state)
+        self.assertNotIn("eval:XL", state)
+
+    def test_a_bot_can_still_lower_its_own_score(self):
+        # Re-evaluation after a push: sole bot drops XL -> S, generic must follow it down.
+        got, _ = self._run({"eval-museglimmer:S", "eval:XL"})
+        self.assertEqual(got, "S")
+
+    def test_all_none_stays_none(self):
+        got, _ = self._run({"eval-museglimmer:none", "eval-dspark:none"})
+        self.assertEqual(got, "none")
+
+    def test_no_per_bot_labels_leaves_generic_alone(self):
+        got, state = self._run({"eval:L", "hold"})
+        self.assertIsNone(got)
+        self.assertIn("eval:L", state)
+
+    def test_generic_label_is_not_mistaken_for_a_per_bot_label(self):
+        # `eval:XL` must not feed back into its own computation.
+        got, _ = self._run({"eval:XL", "eval-dspark:none"})
+        self.assertEqual(got, "none")
+
+    def test_unknown_tier_ignored(self):
+        got, _ = self._run({"eval-dspark:bogus", "eval-museglimmer:M"})
+        self.assertEqual(got, "M")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

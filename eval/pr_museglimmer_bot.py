@@ -1645,9 +1645,11 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
     # eval:* tiers, so this makes Muse Glimmer submissions count toward that live incentive
     # mechanism. Explicit user decision, 2026-08-11 (originally deliberately NOT mirrored, given
     # Muse Glimmer's youth at the time -- see git history on this line for that reasoning).
-    for lab in {l for l in arb.labels_on(repo, num) if l.startswith("eval:")}:
-        arb.remove_label(repo, num, lab)
-    arb.add_label(repo, num, f"eval:{label}")
+    # Derived from every per-bot `eval-<model>:<tier>` label rather than overwritten with this
+    # bot's own verdict -- this bot only measures Muse Glimmer, so writing the generic label
+    # directly let a `none` here erase another model's real tier depending purely on which
+    # staggered cron ran last. See arb.sync_generic_eval_label().
+    arb.sync_generic_eval_label(repo, num)
     arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
     if res.get("ok"):
         upload_museglimmer_eval_log(repo, num, title, commit, res)

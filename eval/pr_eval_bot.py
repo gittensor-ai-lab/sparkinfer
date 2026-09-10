@@ -1093,6 +1093,52 @@ def remove_label(repo, num, label):
     return gh(["api", f"repos/{owner}/{r}/issues/{num}/labels/{label}", "--method", "DELETE"],
               quiet=True)
 
+# Tier vocabulary shared by every model bot's own `eval-<model>:<tier>` label. REJECT is not a
+# tier -- it means a gate failed (regression, accuracy, losslessness) -- so it is ranked below
+# "no measured speedup" and handled specially in sync_generic_eval_label() below.
+GENERIC_TIER_RANK = {"REJECT": -1, "none": 0, "XS": 1, "S": 2, "M": 3, "L": 4, "XL": 5}
+
+# Per-bot verdict labels: `eval-museglimmer:L`, `eval-dspark:none`, ... Deliberately does NOT match
+# the generic `eval:<tier>` label this function writes.
+_PER_BOT_EVAL_RE = re.compile(r"^eval-[a-z0-9]+:(.+)$")
+
+
+def sync_generic_eval_label(repo, num):
+    """Recompute the generic `eval:<tier>` label from every per-bot `eval-<model>:<tier>` label.
+
+    The generic label is what SN74 scoring reads, and EVERY model bot mirrors into it. Each bot
+    used to strip all `eval:*` labels and write its own verdict, which made the value
+    last-writer-wins ACROSS bots: the hourly crons are staggered (Muse :00, DSpark :30, ...), and a
+    bot only ever measures its OWN model, so a PR that optimises one model scores `none` on every
+    other bot. Whether a contributor kept their real tier therefore depended on which cron happened
+    to run last after their final push -- e.g. a Muse PR scored `eval:L` at :00 was silently
+    overwritten with `eval:none` at :30 by the DSpark bot, which had benched Qwen3.8 and correctly
+    found no change. Observed on #1018 (kept `eval:L` only because Muse ran second that round).
+
+    Derived, not overwritten: the generic tier is the BEST tier across the per-bot labels present,
+    so one bot cannot erase another's result and a bot re-running against its own model can still
+    lower its own contribution. REJECT wins outright regardless of rank -- a PR that regresses or
+    fails a gate on ANY model must not advertise a positive tier because a different model improved.
+    """
+    labs = labels_on(repo, num)
+    tiers = []
+    for lab in labs:
+        m = _PER_BOT_EVAL_RE.match(lab)
+        if m:
+            t = m.group(1).strip()
+            if t in GENERIC_TIER_RANK:
+                tiers.append(t)
+    if not tiers:
+        return None            # nothing to mirror; leave whatever is there alone
+    want = "REJECT" if "REJECT" in tiers else max(tiers, key=lambda t: GENERIC_TIER_RANK[t])
+    for lab in {l for l in labs if l.startswith("eval:")}:
+        if lab != f"eval:{want}":
+            remove_label(repo, num, lab)
+    if f"eval:{want}" not in labs:
+        add_label(repo, num, f"eval:{want}")
+    return want
+
+
 def apply_area_labels(repo, num, areas):
     want = {f"area:{a}" for a in areas}
     have = {l for l in labels_on(repo, num) if l.startswith("area:")}
