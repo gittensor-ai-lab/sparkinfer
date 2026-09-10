@@ -61,7 +61,12 @@ std::string with_latest_tag(const std::string& id) {
 }
 
 bool model_name_matches(const std::string& requested, const std::string& served_id) {
-    if (requested.empty()) return true;   // Ollama treats an absent model as "the loaded one"
+    // An EMPTY request name never matches. Ollama documents `model` as required on /api/chat and
+    // /api/generate, so an absent or null one is a malformed request, not a request for the
+    // default model. Treating it as a match made {"model": null} return 200 and generate from an
+    // empty prompt -- hiding an obvious client bug behind a successful-looking response. The
+    // caller rejects it with 400 before reaching here.
+    if (requested.empty()) return false;
     if (requested == served_id) return true;
     if (with_latest_tag(requested) == with_latest_tag(served_id)) return true;
     // "<id>:anything" also addresses this model: only one checkpoint is served, and refusing a

@@ -19,7 +19,9 @@ int main() {
     CHECK(model_name_matches("spark-x2.5-4b", "spark-x2.5-4b"));
     CHECK(model_name_matches("spark-x2.5-4b:latest", "spark-x2.5-4b"));
     CHECK(model_name_matches("spark-x2.5-4b:anything", "spark-x2.5-4b"));
-    CHECK(model_name_matches("", "spark-x2.5-4b"));          // absent == the loaded model
+    // An empty/absent name must NOT match. Ollama documents `model` as required; treating it as
+    // "the loaded model" made {"model": null} return 200 and generate from an empty prompt.
+    CHECK(!model_name_matches("", "spark-x2.5-4b"));
     CHECK(!model_name_matches("llama3.2", "spark-x2.5-4b"));
 
     // ---- /api/tags ----

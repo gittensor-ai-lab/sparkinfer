@@ -2859,6 +2859,12 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"invalid json\"}", "application/json"); return; }
         std::string want = json_str(in, "model");
         if (want.empty()) want = json_str(in, "name");
+        if (want.empty()) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", "model is required"}}.dump(),
+                            "application/json");
+            return;
+        }
         if (!oll::model_name_matches(want, g_model_name)) {
             res.status = 404;
             res.set_content(nlohmann::json{{"error", "model '" + want + "' not found"}}.dump(),
@@ -2893,6 +2899,15 @@ int main(int argc, char** argv) {
         catch (...) { res.status = 400;
             res.set_content("{\"error\":\"invalid json\"}", "application/json"); return; }
         const std::string want = json_str(in, "model");
+        if (want.empty()) {
+            // Required by Ollama on both /api/chat and /api/generate. Rejected explicitly rather
+            // than defaulted to the loaded model: a null or missing model is a client bug, and
+            // answering it with a generation makes that bug invisible.
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", "model is required"}}.dump(),
+                            "application/json");
+            return;
+        }
         if (!oll::model_name_matches(want, g_model_name)) {
             res.status = 404;
             res.set_content(nlohmann::json{{"error", "model '" + want + "' not found"}}.dump(),
