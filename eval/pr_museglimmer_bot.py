@@ -143,9 +143,19 @@ MARKER_RE = re.compile(
 # session validated Muse Glimmer support against /root/sparkinfer_mg specifically, while
 # /root/sparkinfer carries unrelated uncommitted work from a different task that must not be
 # touched or built against.
-REMOTE_REPO = os.environ.get("MUSEGLIMMER_REMOTE_REPO", "/root/sparkinfer_mg")
+# Defaults are the paths that actually exist on the current eval box, NOT historical ones.
+#
+# Both of these were stale and only worked because .env.eval overrode them -- and .env.eval is
+# gitignored, so a box rebuilt from the repo alone, or a restored copy of that file, silently
+# broke the bot. MUSEGLIMMER_GGUF pointed at "muse-glimmer-30B-kquant-17gb.gguf" while the file on
+# disk is "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf", and REMOTE_REPO at /root/sparkinfer_mg,
+# which does not exist on this box. The env vars still override; they are no longer load-bearing.
+REMOTE_REPO = os.environ.get("MUSEGLIMMER_REMOTE_REPO", "/workspace/eval/bot_repo")
+MUSEGLIMMER_MODELS_DIR = os.environ.get("MUSEGLIMMER_MODELS_DIR",
+                                        "/root/workspace/models_muse_glimmer")
 DEFAULT_GGUF = os.environ.get(
-    "MUSEGLIMMER_GGUF", "/root/workspace/models_muse_glimmer/muse-glimmer-30B-kquant-17gb.gguf"
+    "MUSEGLIMMER_GGUF",
+    os.path.join(MUSEGLIMMER_MODELS_DIR, "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf"),
 )
 DEFAULT_MODELS_DIR = os.environ.get("MUSEGLIMMER_MODELS_DIR", "/root/workspace/models_muse_glimmer")
 # Shared llama.cpp checkout used by every eval bot on this box (persists outside any repo
@@ -729,6 +739,16 @@ test -x build/runtime/qwen3_gguf_score
 source bench/scripts/_common.sh
 source bench/scripts/_eval_speed.sh
 SI_BIN="$PWD/build/runtime"; SI_LD=""
+# Fail loudly and immediately on a missing checkpoint. Without this the sweep just returns no
+# rows, the baseline comes back empty, and the round reports a measurement problem several
+# minutes later with no hint that the PATH was the issue -- which is exactly how a stale
+# MUSEGLIMMER_GGUF hid for as long as it did.
+if [ ! -f "$GGUF" ]; then
+  echo "FAIL Muse Glimmer checkpoint not found at $GGUF" >&2
+  echo "     (set MUSEGLIMMER_GGUF, or place the model in MUSEGLIMMER_MODELS_DIR)" >&2
+  ls -la "$(dirname "$GGUF")" 2>&1 | head -10 >&2
+  exit 1
+fi
 wait_gpu_clear
 # Five contexts, decode AND prefill at each, in ONE model load (bench_sweep_run sweeps all the
 # ctx points per load). Emitting one MUSE line per context rather than two fixed RESULT_ lines
@@ -1647,7 +1667,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
-        # Auto-close on "none"/"REJECT" -- same policy as pr_dflash_bot.py. Re-enabled 2026-08-11
+        # Auto-close on "REJECT" ONLY (narrowed 2026-09-09; was none/REJECT). Re-enabled 2026-08-11
         # after an explicit, informed decision: the very first supervised run of this bot closed a
         # real external contributor's unrelated PR (#768) this exact same way, since
         # arb.greenlight_status() is generic (any PR with a checked "tested" box + a decode/
@@ -1658,7 +1678,23 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         # (broad scope, matching pr_dflash_bot.py) rather than narrow evaluation to only
         # Muse-Glimmer-relevant PRs. If this causes another wrongful close, reopen + apologize the
         # same way, and reconsider the scope-narrowing alternative that was declined here.
-        if label in ("none", "REJECT"):
+        # AUTO-CLOSE ONLY ON REJECT, NEVER ON "none" (changed 2026-09-09).
+        #
+        # "none" means THIS bot measured no change on ITS axes. For a PR aimed at a different
+        # model that is the expected, uninformative outcome -- not a verdict on the PR. Closing on
+        # it destroys good work: this bot is currently the only one on cron, so every PR in the
+        # repo is scored against one model's metrics, and a genuine improvement to another model
+        # measures "none" here by construction. PR #1008 (a 15x Muse prefill win) was minutes away
+        # from being auto-closed by the DSpark bot for exactly this reason and had to be caught by
+        # hand; the same trap now points the other way.
+        #
+        # "REJECT" is different in kind and still closes: it means a measured REGRESSION on a
+        # scored axis, an accuracy-gate failure, or a cross-model guard failure. That is real,
+        # attributable harm and is worth acting on no matter what the PR was aiming at.
+        #
+        # Abandoned PRs are still handled -- by the age-based stale close, which is about
+        # inactivity rather than about a measurement.
+        if label == "REJECT":
             if not res.get("q36_guard_ok", True):
                 fail_clause = "and regressed the Qwen3.6 no-regression guard (decode/prefill on shared code)"
             elif not res.get("accuracy_ok"):
@@ -1667,7 +1703,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "and regressed 128-ctx prefill throughput specifically"
             elif res.get("decode_regressed"):
                 fail_clause = "(decode regression)"
-            elif label == "none":
+            elif label == "none":   # unreachable: see the REJECT-only guard above
                 fail_clause = "with no verified improvement on both decode and prefill"
             else:
                 fail_clause = "(regression)"

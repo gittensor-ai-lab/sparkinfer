@@ -80,7 +80,8 @@ divergence that stayed hidden until the gate's prompt corpus was lengthened enou
 run at all. Enabling it here would REJECT every PR until that is fixed.
 
 Applies `eval-dspark:<TIER>` AND mirrors it to the generic `eval:<TIER>` label (SN74 scoring reads
-eval:* tiers). Auto-close on none/REJECT is live; auto-merge stays OFF unless
+eval:* tiers). Auto-close is live for REJECT ONLY -- never for "none", which for a PR
+aimed at another model is the expected outcome rather than a verdict; auto-merge stays OFF unless
 SPARKINFER_DSPARK_AUTOMERGE=1 is explicitly set.
 
   python eval/pr_dspark_bot.py
@@ -3061,7 +3062,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
-        # Auto-close on "none"/"REJECT" -- same policy as pr_dflash_bot.py. Re-enabled 2026-08-11
+        # Auto-close on "REJECT" ONLY (narrowed 2026-09-09; was none/REJECT). Re-enabled 2026-08-11
         # after an explicit, informed decision: the very first supervised run of this bot closed a
         # real external contributor's unrelated PR (#768) this exact same way, since
         # arb.greenlight_status() is generic (any PR with a checked "tested" box + a decode/
@@ -3072,7 +3073,23 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         # (broad scope, matching pr_dflash_bot.py) rather than narrow evaluation to only
         # Muse-Glimmer-relevant PRs. If this causes another wrongful close, reopen + apologize the
         # same way, and reconsider the scope-narrowing alternative that was declined here.
-        if label in ("none", "REJECT"):
+        # AUTO-CLOSE ONLY ON REJECT, NEVER ON "none" (changed 2026-09-09).
+        #
+        # "none" means THIS bot measured no change on ITS axes. For a PR aimed at a different
+        # model that is the expected, uninformative outcome -- not a verdict on the PR. Closing on
+        # it destroys good work: this bot is currently the only one on cron, so every PR in the
+        # repo is scored against one model's metrics, and a genuine improvement to another model
+        # measures "none" here by construction. PR #1008 (a 15x Muse prefill win) was minutes away
+        # from being auto-closed by the DSpark bot for exactly this reason and had to be caught by
+        # hand; the same trap now points the other way.
+        #
+        # "REJECT" is different in kind and still closes: it means a measured REGRESSION on a
+        # scored axis, an accuracy-gate failure, or a cross-model guard failure. That is real,
+        # attributable harm and is worth acting on no matter what the PR was aiming at.
+        #
+        # Abandoned PRs are still handled -- by the age-based stale close, which is about
+        # inactivity rather than about a measurement.
+        if label == "REJECT":
             if not res.get("lossless", True) or not res.get("lossless4", True) or not res.get("lossless32", True):
                 fail_clause = "and failed exact DSpark-vs-AR losslessness at one or more contexts"
             elif not res.get("accuracy_ok"):
@@ -3083,7 +3100,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "(dspark decode@16k regression)"
             elif res.get("prefill_regressed"):
                 fail_clause = "(prefill@32k regression)"
-            elif label == "none":
+            elif label == "none":   # unreachable: see the REJECT-only guard above
                 fail_clause = "with no verified improvement on the scored 4k/16k/32k decode/prefill and 256k prefill axes"
             else:
                 fail_clause = "(regression)"
