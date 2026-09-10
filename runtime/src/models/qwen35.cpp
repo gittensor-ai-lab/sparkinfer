@@ -5802,7 +5802,30 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         bool down_fp4_on = c.max_seq <= 2048;
         if (fp4o_env)
             down_fp4_on = fp4o_env[0] == '1' || fp4o_env[0] == 'd';
-        wo_fp4_on = wo_fp4_on && c.max_seq <= 2048;
+        // The o-projection copy is worth ~2.3x on the GEMM it replaces -- nsys puts the int8 one
+        // at 7.0% of prefill@16k plus 1.1% for the row-quantize that feeds it, and it is the last
+        // dense int8 GEMM left in Muse's prefill layer. It was refused above max_seq 2048, which
+        // is a proxy for "the batched-prefill arena still fits" inherited from when wo was
+        // budgeted alongside an ffn_down copy 4.7x its size. The proxy was answering the question
+        // wrong on this card: at max_seq 32912 -- the session the scored 4096 / 16384 / 32768 axes
+        // actually run in, since bench_sweep_run loads ONE model at max(ctxs) -- the 52 copies are
+        // ~0.83 GB and the arena still allocates, measured on a 32-GB RTX 5090 at
+        // prefill 1.048x / 1.039x / 1.037x with decode flat and prefill@128 / @512 / @65536
+        // unchanged.
+        //
+        // It is still a proxy, so it is fitted to that measurement and no further: the 65536 axis
+        // loads at max_seq 65680, where the copy does NOT fit -- the arena that holds fp4_qkv and
+        // the ffn_down staging stops allocating and prefill@64k falls ~16-25% (measured both
+        // before and after #1021) -- so it stays out of the bound and keeps main's path exactly.
+        // The free-VRAM preflight below is unchanged and still has the last word.
+        // SPARKINFER_MUSE_NVFP4_WO_MAXSEQ moves the bound (2048 restores the old behaviour, for a
+        // paired A/B out of ONE binary).
+        static const int wo_maxseq = [] {
+            const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_MAXSEQ");
+            const long long v = e ? atoll(e) : 36864;
+            return (int)(v < 0 ? 0 : (v > (1 << 30) ? (1 << 30) : v));
+        }();
+        wo_fp4_on = wo_fp4_on && c.max_seq <= wo_maxseq;
         // Cost EVERY copy that grows the footprint against the free VRAM that is actually there,
         // and drop legs in ascending order of what they are worth until the set fits. Only these
         // three grow it: gate/up convert and then release their native prefill copy, so they are
