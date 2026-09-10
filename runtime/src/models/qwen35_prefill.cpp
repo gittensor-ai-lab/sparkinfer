@@ -648,8 +648,69 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // fit, and neither one bounds the other once FC and N can differ.
     const int a_wide_k = imax(H, imax(qdim, lvdim));   // widest K quantized with N rows
     const size_t a_i8_rows_n = (size_t)N * (size_t)a_wide_k;
-    const size_t a_i8_dense = (a_i8_rows_n > (size_t)FC * ffn) ? a_i8_rows_n : (size_t)FC * ffn;
+    const size_t a_i8_ffn = (size_t)FC * (size_t)ffn;
+    const size_t a_i8_full = (a_i8_rows_n > a_i8_ffn) ? a_i8_rows_n : a_i8_ffn;
+    // Moved up from the FP4 block below: the sizing right underneath has to know whether the
+    // FFN will run on FP4, and this is the knob that can refuse it.
+    static const int muse_fp4_maxN = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_MAXN");
+        return e ? atoi(e) : (1 << 30);
+    }();
+    // Does EVERY FFN chunk in this pass take the FP4 route? Muse's FP4 FFN quantizes its
+    // activation into fp4_a, folds the SwiGLU straight into fp4_down_a and lets the down GEMM
+    // read that -- A_i8 is never written at ffn width, so the FC*ffn term above is reserve for a
+    // fallback that cannot happen. All-or-nothing across layers, because ONE layer without an
+    // FP4 gate/up operand still needs the buffer.
+    const bool ffn_all_fp4 = !moe && c.muse_glimmer && !s.w.layers.empty() &&
+        FC == N && N >= 128 && N <= muse_fp4_maxN &&
+        kernels::prefill_nvfp4_supported(N, ffn, H) &&
+        [&] {
+            for (const Qwen35LayerWeights& lw : s.w.layers)
+                if (!lw.gate_fp4 || !lw.gate_fp4_sf || !lw.up_fp4 || !lw.up_fp4_sf) return false;
+            return true;
+        }();
+    // ...and that reserve is not free. The FP4 operands come out of THIS arena, after these two
+    // buffers, so where free VRAM is short they are what does not get allocated -- silently, the
+    // pointers being optional at every use site. Measured on an RTX 5090 at ctx=65536, where a
+    // 64k KV cache leaves 1001 MB once ffg/ffu are up: A_i8 and its k-tiled copy take 624 MB of
+    // it, and the qkv-gate operand (272 MB) and the ffn_down operand (156 MB) BOTH come back
+    // nullptr. Both legs drop onto the int8 GEMM -- 104 CUTLASS FP4 launches per rep where 16384
+    // and 32768, which have the VRAM, run 208 -- and nothing anywhere reports it.
+    //
+    // So drop the term, but only where it is the thing standing in the way: every context that
+    // already fits keeps today's sizing and stays bit-identical. The estimate below covers the
+    // four operands this arena hands out; the margin covers the GEMM workspace and the ffn_down
+    // conversion scratch, which are cudaMalloc'd beside it.
+    const size_t fp4_want = ffn_all_fp4
+        ? kernels::prefill_nvfp4_data_bytes(N, H) + kernels::prefill_nvfp4_scale_bytes_a(N, H) +
+          (size_t)N * (size_t)(2 * qdim + 2 * kvdim) * sizeof(bf16) +
+          kernels::prefill_nvfp4_data_bytes(FC, ffn) +
+          kernels::prefill_nvfp4_scale_bytes_a(FC, ffn)
+        : 0;
+    // SPARKINFER_PREFILL_FFN_I8_STAGE=1 keeps the ffn-wide staging unconditionally (A/B in ONE
+    // binary, and today's sizing with it).
+    static const bool ffn_i8_stage_force = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_FFN_I8_STAGE");
+        return e && e[0] == '1';
+    }();
+    bool ffn_i8_stage = true;
+    if (ffn_all_fp4 && !ffn_i8_stage_force && a_i8_full > a_i8_rows_n) {
+        size_t fb = 0, tb = 0;
+        if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
+            const size_t margin = (size_t)256 << 20;
+            if (fb <= 2 * a_i8_full + maxw + fp4_want + margin) ffn_i8_stage = false;
+        }
+    }
+    const size_t a_i8_dense = ffn_i8_stage ? a_i8_full : a_i8_rows_n;
     const size_t a_i8_sz = moe ? (size_t)N * maxAK : a_i8_dense;
+    // Every int8/fp8 activation quantize below writes R*K bytes into A_i8. With the ffn-wide
+    // term dropped it no longer covers an ffn-wide one, so ask before taking that path rather
+    // than writing past the end -- the arms that fail this simply keep the bf16 GEMM, which is
+    // what a layer without an int8 arm already does. (This is the same class of overrun the
+    // a_wide_k comment above records; asking is cheap and makes the sizing self-enforcing.)
+    auto a_i8_fits = [&](long R, long K) {
+        return (size_t)R * (size_t)K <= a_i8_sz;
+    };
     // N, not FC: sx is the per-row scale that pairs with A_i8 above, and the non-FFN projections
     // write N of them regardless of how small the FFN chunk gets. Costs N floats.
     const size_t sx_n = (size_t)N;
@@ -741,10 +802,6 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // sized for. With that sizing fixed, the shape question is exactly what
     // prefill_nvfp4_supported() already answers, so ask it instead of pinning one context.
     // SPARKINFER_MUSE_NVFP4_MAXN caps it again (128 restores the old behaviour).
-    static const int muse_fp4_maxN = [] {
-        const char* e = getenv("SPARKINFER_MUSE_NVFP4_MAXN");
-        return e ? atoi(e) : (1 << 30);
-    }();
     const bool muse_nvfp4 = c.muse_glimmer && N >= 128 && N <= muse_fp4_maxN &&
                             FC == N &&          // chunked FP4 FFN is not correct yet; see FC above
                             !s.w.layers.empty() &&
@@ -1357,6 +1414,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // projection (48 layers × qkv/z/out). Feed the packed e4m3 to the existing
         // fp8 GEMM instead. SPARKINFER_Q38_FP8_PREFILL=0 restores the requant path.
         if (!q38_fp8_prefill || !W || !A_i8 || !sx || !sw || n_out < 128) return false;
+        if (!a_i8_fits(R, K)) return false;
         a_q = nullptr; a_pk = false;
         kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, R, K, st);
         kernels::launch_prefill_fp8_wscales_bf16(W, sw, n_out, st);
@@ -1374,7 +1432,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // projections (ssm_alpha/ssm_beta, n_out == v_heads) in bf16 — they feed the GDN
         // sigmoid gates, where per-row int8 quant of a 32-wide weight costs more accuracy
         // than the negligible time it saves.
-        if (use_i8 && n_out >= 128) {
+        if (use_i8 && n_out >= 128 && a_i8_fits(R, K)) {
             quant_a_i8(A, R, K);
             // fused Q4_K/Q6_K -> int8 rows skips the dequant-to-bf16 scratch round trip
             bool w_i8_ready = kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st);
@@ -1394,7 +1452,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
             }
             gemm_i8(A_i8, W_i8, sx, sw, C, R, n_out, K, false);
-        } else if ((use_fp8_gdn || moe_fp8) && n_out >= 128) {
+        } else if ((use_fp8_gdn || moe_fp8) && n_out >= 128 && a_i8_fits(R, K)) {
             // fp8 (e4m3) tensor-core path for the long-ctx GDN projections. A_i8/W_i8 (1 byte) hold
             // the e4m3 operands; dequant the weight to bf16 scratch, then row/channel fp8-quantize.
             a_q = nullptr; a_pk = false;                // A_i8 becomes e4m3 -- invalidate the memo
@@ -1432,6 +1490,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                           int rows = 0) -> bool {
         if (!resid_fuse || !use_i8 || n_out < 128 || wtype == kernels::SI_QTYPE_FP8) return false;
         const int R = rows > 0 ? rows : N;
+        if (!a_i8_fits(R, K)) return false;
         quant_a_i8(A, R, K);
         if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st)) {
             const void* wb = dq(W, wtype, n_out, K);
@@ -1469,7 +1528,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     auto proj_fused_acc = [&](const bf16* A, const void* W, int wtype, const float* rs,
                               bf16* C, int n_out, int K, int* acc, int rows = 0) {
         const int R = rows > 0 ? rows : N;
-        if (use_i8 && rs && n_out >= 128 && kernels::pf_dense_gemm_qi8_supported(wtype)) {
+        if (use_i8 && rs && n_out >= 128 && a_i8_fits(R, K) &&
+            kernels::pf_dense_gemm_qi8_supported(wtype)) {
             quant_a_i8(A, R, K);
             if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st,
                                                        qb_partials, QB_SPLITS, acc, apk()))
@@ -1480,7 +1540,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     auto proj_fused = [&](const bf16* A, const void* W, int wtype, const float* rs,
                           bf16* C, int n_out, int K, int rows = 0) {
         const int R = rows > 0 ? rows : N;
-        if (use_i8 && rs && n_out >= 128 && kernels::pf_dense_gemm_qi8_supported(wtype)) {
+        if (use_i8 && rs && n_out >= 128 && a_i8_fits(R, K) &&
+            kernels::pf_dense_gemm_qi8_supported(wtype)) {
             quant_a_i8(A, R, K);
             if (kernels::launch_prefill_gemm_qi8_dense(wtype, A_i8, sx, W, rs, C, R, n_out, K, st,
                                                        qb_partials, QB_SPLITS, nullptr, apk()))
@@ -2009,7 +2070,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             ffn_pf(nullptr, 0, w.down_q, w.down_qtype, w.down_nv, &down_pf, &down_pf_type);
             // Per-token independent, so this is numerically identical to the full-width pass.
             // Long-ctx: selective int8 FFN (GDN/attn stay bf16) + int8 weight cache across chunks.
-            const bool ffn_i8 = use_i8_ffn && ffn_Wg_i8 != nullptr;
+            const bool ffn_i8 = use_i8_ffn && ffn_i8_stage && ffn_Wg_i8 != nullptr;
             auto dequant_w_i8 = [&](int wtype, const void* W, signed char* dst, float* scale,
                                     int n_out, int K) {
                 if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, dst, scale, n_out, K, st)) {
@@ -2017,7 +2078,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::launch_prefill_quantize_rows_i8(wb, dst, scale, n_out, K, st);
                 }
             };
-            const bool ffn_qi8 = use_i8 && w.gate_rs && w.up_rs &&
+            const bool ffn_qi8 = use_i8 && ffn_i8_stage && w.gate_rs && w.up_rs &&
                 kernels::pf_dense_gemm_qi8_supported(gate_pf_type);
             if (ffn_i8 && !ffn_qi8) {
                 dequant_w_i8(gate_pf_type, gate_pf, ffn_Wg_i8, ffn_swg, ffn, H);
@@ -2196,7 +2257,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     // Set by the grouped launcher when it folded the SwiGLU + int8 quantize into
                     // its split-K epilogue, so gate/up were never written out as bf16.
                     int ffn_fused_swiglu = 0;
-                    if (muse_ffn_group && muse_qb && use_i8 && w.gate_rs && w.up_rs &&
+                    if (muse_ffn_group && muse_qb && use_i8 && ffn_i8_stage &&
+                        w.gate_rs && w.up_rs &&
                         gate_pf_type == up_pf_type &&
                         kernels::pf_dense_gemm_qi8_supported(gate_pf_type)) {
                         const void*  Wf[2]  = { gate_pf, up_pf };
@@ -2219,7 +2281,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
                         proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   ffu, ffn, H, fn);
                     }
-                    if (use_i8) {
+                    if (use_i8 && ffn_i8_stage) {
                         // Same fused SwiGLU + per-row int8 quantize the long-ctx ffn_i8 branch
                         // runs (bit-identical to swiglu-then-quantize; both bf16-round first) --
                         // skips the ffg store + reload that proj()'s internal quantize would pay.
