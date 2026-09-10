@@ -179,6 +179,69 @@ int main() {
         CHECK(!j.contains("context"));
     }
 
+    // ---- NULL-valued fields must not throw (this crashed the server mid-stream) ----
+    // OpenAI stream chunks carry delta.content = null on the role/finish chunks and
+    // finish_reason = null on every non-final chunk. nlohmann's value() only defaults an ABSENT
+    // key; a present null throws type_error.302 and took the whole process down.
+    {
+        const nlohmann::json role_chunk = {{"object","chat.completion.chunk"},
+            {"choices",{{{"index",0},{"delta",{{"role","assistant"},{"content",nullptr}}},
+                         {"finish_reason",nullptr}}}}};
+        const nlohmann::json c = stream_chunk_from_openai(role_chunk, "m:latest", "t");
+        CHECK(c.is_null());                       // no Ollama counterpart, and no throw
+    }
+    {
+        const nlohmann::json finish_chunk = {{"choices",{{{"index",0},{"delta",nlohmann::json::object()},
+                                                          {"finish_reason","stop"}}}}};
+        CHECK(stream_chunk_from_openai(finish_chunk, "m", "t").is_null());
+    }
+    {   // a real content delta does translate
+        const nlohmann::json d = {{"choices",{{{"index",0},{"delta",{{"content","Hel"}}},
+                                               {"finish_reason",nullptr}}}}};
+        const nlohmann::json c = stream_chunk_from_openai(d, "m:latest", "ts");
+        CHECK(!c.is_null() && c["message"]["content"] == "Hel" && c["done"] == false);
+        CHECK(c["model"] == "m:latest" && c["created_at"] == "ts");
+    }
+    {   // the usage chunk becomes the single done=true terminator, with metrics
+        const nlohmann::json u = {{"choices",nlohmann::json::array()},
+            {"usage",{{"prompt_tokens",5},{"completion_tokens",7},
+                      {"ttft_ms",10.0},{"generation_ms",20.0}}}};
+        const nlohmann::json c = stream_chunk_from_openai(u, "m", "t");
+        CHECK(!c.is_null() && c["done"] == true);
+        CHECK(c["eval_count"] == 7 && c["eval_duration"] == 20000000LL);
+        CHECK(c["message"]["content"] == "");
+    }
+    {   // null-valued request fields must not throw either
+        const nlohmann::json in = {{"model",nullptr},{"prompt",nullptr},{"system",nullptr}};
+        CHECK(generate_request_to_chat(in)["messages"][0]["content"] == "");
+        CHECK(chat_request_to_openai({{"model",nullptr}})["model"] == "");
+    }
+    {   // a null content in a COMPLETED response (tool-call replies do this)
+        const nlohmann::json oai = {{"choices",{{{"finish_reason",nullptr},
+            {"message",{{"role","assistant"},{"content",nullptr}}}}}},{"usage",nlohmann::json::object()}};
+        CHECK(openai_to_chat_response(oai,"m","t")["message"]["content"] == "");
+        CHECK(openai_to_generate_response(oai,"m","t")["response"] == "");
+    }
+
+    // ---- generate streams "response", chat streams "message" -- NOT interchangeable ----
+    // Emitting the chat shape to an /api/generate client made `ollama run` print nothing at all,
+    // with no error, because it reads a key that is simply absent.
+    {
+        const nlohmann::json d = {{"choices",{{{"delta",{{"content","Par"}}},{"finish_reason",nullptr}}}}};
+        const nlohmann::json g = stream_chunk_from_openai(d, "m", "t", /*generate=*/true);
+        CHECK(g["response"] == "Par" && !g.contains("message"));
+        const nlohmann::json c = stream_chunk_from_openai(d, "m", "t", /*generate=*/false);
+        CHECK(c["message"]["content"] == "Par" && !c.contains("response"));
+    }
+    {   // the terminator too
+        const nlohmann::json u = {{"choices",nlohmann::json::array()},
+            {"usage",{{"completion_tokens",3},{"generation_ms",5.0}}}};
+        const nlohmann::json g = stream_chunk_from_openai(u, "m", "t", true);
+        CHECK(g["done"] == true && g["response"] == "" && !g.contains("message"));
+        const nlohmann::json c = stream_chunk_from_openai(u, "m", "t", false);
+        CHECK(c["done"] == true && c["message"]["content"] == "" && !c.contains("response"));
+    }
+
     // ---- digest: exactly 64 lowercase hex, stable, and NEVER empty ----
     // `ollama list`/`ps` render digest[:12] with no length check, so an empty or short value
     // panics the official CLI. This is the regression test for that crash.

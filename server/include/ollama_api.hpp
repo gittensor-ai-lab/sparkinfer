@@ -11,17 +11,16 @@
 // /api/* routes rewrite the request into the OpenAI shape, hand it to the SAME handler /v1/* uses,
 // and rewrite the response back. Nothing here generates, times, or samples anything.
 //
-// STREAMING, AND THE ONE HONEST COMPROMISE. Ollama streams by DEFAULT (`stream` is true when
-// absent), and its stream is NDJSON -- one JSON object per line -- not SSE. This server's stream
-// path is SSE-shaped end to end (write_sse_json emits "data: {...}\n\n"), and a wrapper cannot
-// re-frame it because the handler writes straight to the socket.
+// STREAMING. Ollama streams by DEFAULT (`stream` is true when absent) and its stream is NDJSON --
+// one JSON object per line -- not SSE. This is now genuinely incremental: the server's single
+// stream writer (write_sse_json) is dialect-aware, so a request marked with the Ollama dialect has
+// every chunk re-framed as NDJSON in Ollama's message/done shape on the way out. The generation
+// loop is untouched and shared with /v1.
 //
-// So a streaming Ollama request is answered as NDJSON containing a SINGLE terminal chunk:
-// correct framing, correct fields, done=true, the whole message in one object. An Ollama client
-// parses it correctly and works. What it does NOT get is token-by-token delivery -- the response
-// arrives when generation finishes. That is a real limitation, stated here and in the response's
-// own shape rather than hidden: incremental delivery needs the SSE path generalised, which is a
-// change to the generation loop, not to this file.
+// Two consequences worth knowing. The done=true terminator is built from OpenAI's USAGE chunk, so
+// include_usage is forced on for this dialect -- without it the client would wait for an end that
+// never comes. And chunks with no Ollama counterpart (the role-only opener, the finish chunk) are
+// dropped rather than emitted as empty lines, which an NDJSON reader would reject.
 //
 // Schema source: https://github.com/ollama/ollama/blob/main/docs/api.md
 
@@ -111,6 +110,21 @@ nlohmann::json openai_to_generate_response(const nlohmann::json& oai, const std:
 
 // RFC3339 UTC timestamp, the format Ollama's created_at uses.
 std::string rfc3339_now();
+
+// Translate ONE OpenAI stream chunk into its Ollama NDJSON equivalent.
+//
+// Returns a null json for a chunk that has no Ollama counterpart (the role-only opener and the
+// finish chunk), which the caller drops rather than emitting as an empty line. Ollama's stream is
+// content chunks with done=false, terminated by exactly one done=true chunk carrying the metrics
+// -- so the terminating chunk is built from OpenAI's USAGE chunk, and the caller must ensure one
+// is emitted (see the include_usage forcing at the call site).
+//
+// `generate` selects the FIELD NAME the text is carried in: /api/generate streams
+// {"response": "..."} while /api/chat streams {"message":{"role","content"}}. They are not
+// interchangeable -- emitting the chat shape to an /api/generate client makes `ollama run` render
+// nothing at all, with no error, because it reads a key that is simply absent.
+nlohmann::json stream_chunk_from_openai(const nlohmann::json& oai, const std::string& model,
+                                        const std::string& created_at, bool generate = false);
 
 // A stable 64-hex-character identifier derived from `seed`, for ModelEntry::digest.
 //

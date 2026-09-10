@@ -71,6 +71,25 @@ bool model_name_matches(const std::string& requested, const std::string& served_
 }
 
 namespace {
+void add_metrics(const nlohmann::json& oai, nlohmann::json& out);   // defined below
+
+// Null-safe string read.
+//
+// nlohmann's value() returns the default only when the key is ABSENT. A key that is present and
+// JSON-null throws type_error.302 ("type must be string, but is null") -- and OpenAI stream chunks
+// are full of exactly that: delta.content is null on the role and finish chunks, finish_reason is
+// null on every non-final chunk. Using value() directly on those crashed the whole server mid
+// stream (terminate called after throwing ... type_error.302), taking every other in-flight
+// request with it. Every string read from an upstream body goes through this.
+std::string jstr(const nlohmann::json& j, const char* key, const char* dflt = "") {
+    if (!j.is_object()) return dflt;
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_string()) return dflt;
+    return it->get<std::string>();
+}
+}  // namespace
+
+namespace {
 
 // Ollama nests sampling knobs under "options"; OpenAI puts them at the top level.
 void apply_options(const nlohmann::json& in, nlohmann::json& out, const char* max_tokens_key) {
@@ -93,7 +112,7 @@ void apply_options(const nlohmann::json& in, nlohmann::json& out, const char* ma
 
 nlohmann::json chat_request_to_openai(const nlohmann::json& in) {
     nlohmann::json out;
-    out["model"] = in.value("model", "");
+    out["model"] = jstr(in, "model");
     out["messages"] = in.value("messages", nlohmann::json::array());
     // Always false: the caller re-frames a COMPLETED response into NDJSON, so the inner handler
     // must produce a whole JSON document, not a stream. See ollama_api.hpp on streaming.
@@ -114,8 +133,8 @@ nlohmann::json chat_request_to_openai(const nlohmann::json& in) {
 
 nlohmann::json generate_request_to_openai(const nlohmann::json& in) {
     nlohmann::json out;
-    out["model"] = in.value("model", "");
-    out["prompt"] = in.value("prompt", "");
+    out["model"] = jstr(in, "model");
+    out["prompt"] = jstr(in, "prompt");
     out["stream"] = false;
     // Only a NON-EMPTY suffix is forwarded. The ollama CLI sends "suffix":"" on an ordinary
     // `ollama run`, and passing that through made /v1/completions reject the whole request with
@@ -132,11 +151,11 @@ bool generate_wants_raw(const nlohmann::json& in) {
 
 nlohmann::json generate_request_to_chat(const nlohmann::json& in) {
     nlohmann::json msgs = nlohmann::json::array();
-    const std::string sys = in.value("system", std::string());
+    const std::string sys = jstr(in, "system");
     if (!sys.empty()) msgs.push_back({{"role", "system"}, {"content", sys}});
-    msgs.push_back({{"role", "user"}, {"content", in.value("prompt", std::string())}});
+    msgs.push_back({{"role", "user"}, {"content", jstr(in, "prompt")}});
     nlohmann::json out;
-    out["model"] = in.value("model", "");
+    out["model"] = jstr(in, "model");
     out["messages"] = std::move(msgs);
     out["stream"] = false;
     if (in.contains("format")) {
@@ -192,9 +211,9 @@ nlohmann::json openai_to_chat_response(const nlohmann::json& oai, const std::str
     nlohmann::json tool_calls = nlohmann::json::array();
     if (oai.contains("choices") && oai["choices"].is_array() && !oai["choices"].empty()) {
         const auto& c = oai["choices"][0];
-        finish = c.value("finish_reason", "");
+        finish = jstr(c, "finish_reason");
         const auto msg = c.value("message", nlohmann::json::object());
-        content = msg.value("content", "");
+        content = jstr(msg, "content");
         if (msg.contains("tool_calls") && msg["tool_calls"].is_array())
             tool_calls = msg["tool_calls"];
     }
@@ -215,12 +234,12 @@ nlohmann::json openai_to_generate_response(const nlohmann::json& oai, const std:
     std::string text, finish;
     if (oai.contains("choices") && oai["choices"].is_array() && !oai["choices"].empty()) {
         const auto& c = oai["choices"][0];
-        finish = c.value("finish_reason", "");
+        finish = jstr(c, "finish_reason");
         // Either upstream shape: "text" from /v1/completions (raw path) or "message.content"
         // from /v1/chat/completions (the default, template-applied path).
-        text = c.value("text", "");
+        text = jstr(c, "text");
         if (text.empty() && c.contains("message"))
-            text = c["message"].value("content", "");
+            text = jstr(c["message"], "content");
     }
     out["response"] = text;
     out["done"] = true;
@@ -229,6 +248,40 @@ nlohmann::json openai_to_generate_response(const nlohmann::json& oai, const std:
     // This server keeps no such state, and returning a fabricated array would invite a client to
     // send it back as if it meant something. Omitted entirely.
     add_metrics(oai, out);
+    return out;
+}
+
+nlohmann::json stream_chunk_from_openai(const nlohmann::json& oai, const std::string& model,
+                                        const std::string& created_at, bool generate) {
+    nlohmann::json out;
+    out["model"] = model;
+    out["created_at"] = created_at;
+
+    // The usage chunk (choices empty, usage present) becomes Ollama's single done=true terminator.
+    const bool has_choices = oai.contains("choices") && oai["choices"].is_array()
+                             && !oai["choices"].empty();
+    if (!has_choices && oai.contains("usage")) {
+        if (generate) out["response"] = "";
+        else          out["message"] = {{"role", "assistant"}, {"content", ""}};
+        out["done"] = true;
+        out["done_reason"] = "stop";
+        add_metrics(oai, out);
+        return out;
+    }
+    if (!has_choices) return nlohmann::json();          // nothing to say
+
+    const auto& c = oai["choices"][0];
+    const auto delta = c.value("delta", nlohmann::json::object());
+    const std::string content = jstr(delta, "content");
+    if (content.empty()) {
+        // Role-only opener and the finish chunk carry no text. Ollama has no equivalent for
+        // either: an empty-content done=false chunk is legal but pure noise, and emitting
+        // done=true here would terminate the stream before the metrics chunk.
+        return nlohmann::json();
+    }
+    if (generate) out["response"] = content;
+    else          out["message"] = {{"role", "assistant"}, {"content", content}};
+    out["done"] = false;
     return out;
 }
 

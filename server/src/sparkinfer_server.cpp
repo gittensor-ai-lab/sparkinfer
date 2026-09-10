@@ -253,9 +253,41 @@ nlohmann::json stream_chunk_base(const std::string& cid, long long created,
 // into the SAME one DataSink for this one HTTP response -- every write must go through this one
 // mutex. Reads (sink.is_writable(), polled inside on_tok to detect a disconnected client) need no
 // lock; only concurrent writes are unsafe.
+// Which wire dialect this ONE response streams in.
+//
+// Every stream writer funnels through write_sse_json, so the dialect is applied there and the
+// generation loop never learns about it. That is the whole point: /v1, LM Studio and Ollama share
+// one generation path and differ only in how a chunk is framed and shaped on the way out.
+enum class StreamDialect {
+    OpenAiSse,      // data: {...}\n\n  -- the /v1 default, byte-identical to before
+    LmStudioSse,    // same framing; the usage chunk additionally carries LM Studio's stats block
+    OllamaNdjson,   // {...}\n per line, Ollama's message/done shape, no [DONE] sentinel
+};
+
+// The wrapper routes (/api/v0/*, /api/*) mark their inner request with this header so the shared
+// handler knows which dialect to stream in. A header rather than a global: it is per-request and
+// therefore correct under concurrency, and it needs no change to the handler's signature.
+constexpr const char* kStreamDialectHeader = "X-Sparkinfer-Stream-Dialect";
+
+StreamDialect stream_dialect_of(const httplib::Request& req) {
+    const std::string v = req.get_header_value(kStreamDialectHeader);
+    if (v == "ollama-ndjson" || v == "ollama-ndjson-generate") return StreamDialect::OllamaNdjson;
+    if (v == "lmstudio-sse") return StreamDialect::LmStudioSse;
+    return StreamDialect::OpenAiSse;
+}
+
 struct GuardedSink {
     httplib::DataSink& sink;
     std::mutex& mu;
+    StreamDialect dialect = StreamDialect::OpenAiSse;
+    // Ollama echoes the model name in every chunk and stamps each with a timestamp; both are
+    // fixed for the life of a response, so they are captured once here rather than recomputed
+    // per chunk.
+    std::string model_name;
+    std::string created_at;
+    // Ollama's /api/generate streams {"response": "..."} while /api/chat streams
+    // {"message":{...}}. Emitting the wrong one renders NOTHING in the client, with no error.
+    bool ollama_generate = false;
 };
 
 // SSE comments are ignored by OpenAI clients and prevent proxy idle timeouts during long prefill.
@@ -304,7 +336,29 @@ private:
 };
 
 bool write_sse_json(GuardedSink& gs, const nlohmann::json& value) {
-    const std::string event = "data: " + value.dump() + "\n\n";
+    std::string event;
+    if (gs.dialect == StreamDialect::OllamaNdjson) {
+        const nlohmann::json chunk = sparkinfer_server::ollama::stream_chunk_from_openai(
+            value, gs.model_name, gs.created_at, gs.ollama_generate);
+        // A null result means this OpenAI chunk has no Ollama counterpart (role-only opener,
+        // finish chunk). Drop it rather than writing an empty line, which would be a parse error
+        // for an NDJSON reader.
+        if (chunk.is_null()) return true;
+        event = chunk.dump() + "\n";
+    } else {
+        nlohmann::json out = value;
+        // LM Studio's stats ride on the usage chunk -- the only one that carries the timings.
+        if (gs.dialect == StreamDialect::LmStudioSse && out.contains("usage")) {
+            const auto& u = out["usage"];
+            sparkinfer_server::lmstudio::Stats st;
+            st.tokens_per_second = u.value("decode_tps", 0.0);
+            st.time_to_first_token = u.value("ttft_ms", 0.0) / 1000.0;
+            st.generation_time = u.value("generation_ms", 0.0) / 1000.0;
+            st.stop_reason = "eosFound";
+            out["stats"] = sparkinfer_server::lmstudio::stats_object(st);
+        }
+        event = "data: " + out.dump() + "\n\n";
+    }
     std::lock_guard<std::mutex> lock(gs.mu);
     return gs.sink.write(event.c_str(), event.size());
 }
@@ -470,6 +524,10 @@ nlohmann::json build_legacy_logprobs_json(const std::vector<sparkinfer_server::T
 // Only ever called once, single-threaded, after every branch has joined -- still routed through
 // the mutex for type consistency with every other writer (uncontended lock/unlock is negligible).
 bool write_stream_done(GuardedSink& gs) {
+    // "data: [DONE]" is an OpenAI-SSE sentinel. Ollama has no equivalent -- its stream ends with
+    // the done=true chunk and nothing after it -- and emitting this would be an unparseable line
+    // to an NDJSON reader.
+    if (gs.dialect == StreamDialect::OllamaNdjson) return true;
     static const std::string done = "data: [DONE]\n\n";
     std::lock_guard<std::mutex> lock(gs.mu);
     return gs.sink.write(done.c_str(), done.size());
@@ -1176,14 +1234,23 @@ int main(int argc, char** argv) {
                      res.set_header("Cache-Control", "no-cache");
                      res.set_header("X-Accel-Buffering", "no");
                      res.set_chunked_content_provider(
-                         "text/event-stream",
+                         stream_dialect_of(req) == StreamDialect::OllamaNdjson
+                             ? "application/x-ndjson" : "text/event-stream",
                          [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
                           // BY VALUE, like prompt_ids beside it: this provider runs after the
                           // handler returns, so a reference would dangle. Cheap -- PreparedImages
                           // shares its pixel buffers rather than owning them.
                           prepared,
                           chat_request, tool_protocol, json_mode_active,
-                          include_usage = controls.include_usage || always_stream_usage(), stop = controls.stop,
+                          dialect = stream_dialect_of(req),
+                          ollama_generate =
+                              req.get_header_value(kStreamDialectHeader) == "ollama-ndjson-generate",
+                          // Ollama's stream is terminated by the done=true chunk, which is built
+                          // from OpenAI's USAGE chunk -- so without usage the client would wait
+                          // for an end that never arrives. Forced on for that dialect only.
+                          include_usage = controls.include_usage || always_stream_usage()
+                                          || stream_dialect_of(req) == StreamDialect::OllamaNdjson,
+                          stop = controls.stop,
                           temperature = controls.temperature, seed = controls.seed,
                           top_k = controls.top_k, top_p = controls.top_p,
                           presence_penalty = controls.presence_penalty,
@@ -1198,7 +1265,11 @@ int main(int argc, char** argv) {
                              }
 
                              std::mutex sink_mu;
-                             GuardedSink gs{sink, sink_mu};
+                             GuardedSink gs{sink, sink_mu, dialect, g_model_name, "", ollama_generate};
+                             if (dialect == StreamDialect::OllamaNdjson) {
+                                 gs.model_name = sparkinfer_server::ollama::with_latest_tag(g_model_name);
+                                 gs.created_at = sparkinfer_server::ollama::rfc3339_now();
+                             }
                              SseHeartbeat heartbeat(gs);
 
                              for (int ci = 0; ci < n; ci++) {
@@ -2123,9 +2194,18 @@ int main(int argc, char** argv) {
                      res.set_header("Cache-Control", "no-cache");
                      res.set_header("X-Accel-Buffering", "no");
                      res.set_chunked_content_provider(
-                         "text/event-stream",
+                         stream_dialect_of(req) == StreamDialect::OllamaNdjson
+                             ? "application/x-ndjson" : "text/event-stream",
                          [&engine, prompt_ids, prompt, echo, max_tokens, cid, created,
-                          include_usage = controls.include_usage || always_stream_usage(), stop = controls.stop,
+                          dialect = stream_dialect_of(req),
+                          ollama_generate =
+                              req.get_header_value(kStreamDialectHeader) == "ollama-ndjson-generate",
+                          // Ollama's stream is terminated by the done=true chunk, which is built
+                          // from OpenAI's USAGE chunk -- so without usage the client would wait
+                          // for an end that never arrives. Forced on for that dialect only.
+                          include_usage = controls.include_usage || always_stream_usage()
+                                          || stream_dialect_of(req) == StreamDialect::OllamaNdjson,
+                          stop = controls.stop,
                           temperature = controls.temperature, seed = controls.seed,
                           top_k = controls.top_k, top_p = controls.top_p,
                           presence_penalty = controls.presence_penalty,
@@ -2140,7 +2220,11 @@ int main(int argc, char** argv) {
                              }
 
                              std::mutex sink_mu;
-                             GuardedSink gs{sink, sink_mu};
+                             GuardedSink gs{sink, sink_mu, dialect, g_model_name, "", ollama_generate};
+                             if (dialect == StreamDialect::OllamaNdjson) {
+                                 gs.model_name = sparkinfer_server::ollama::with_latest_tag(g_model_name);
+                                 gs.created_at = sparkinfer_server::ollama::rfc3339_now();
+                             }
                              SseHeartbeat heartbeat(gs);
 
                              struct BranchOutcome {
@@ -2605,8 +2689,14 @@ int main(int argc, char** argv) {
         st.time_to_first_token = usage.value("ttft_ms", 0.0) / 1000.0;   // ms -> s
         st.generation_time = usage.value("generation_ms", 0.0) / 1000.0;
         std::string finish;
-        if (body.contains("choices") && body["choices"].is_array() && !body["choices"].empty())
-            finish = body["choices"][0].value("finish_reason", "");
+        // Null-safe: nlohmann's value() returns the default only for an ABSENT key; a present
+        // null throws type_error.302. finish_reason is null on any chunk that is not the last,
+        // and that exact mistake crashed the server mid-stream on the Ollama path.
+        if (body.contains("choices") && body["choices"].is_array() && !body["choices"].empty()) {
+            const auto& c0 = body["choices"][0];
+            auto it = c0.find("finish_reason");
+            if (it != c0.end() && it->is_string()) finish = it->get<std::string>();
+        }
         st.stop_reason = sparkinfer_server::lmstudio::stop_reason_from_finish(finish);
 
         const auto m = lmstudio_model_desc();
@@ -2630,17 +2720,27 @@ int main(int argc, char** argv) {
         res.set_content(body.dump(), "application/json");
     };
 
+    // A STREAMING v0 request is passed straight through with the LM Studio dialect marked, so it
+    // streams incrementally and its usage chunk carries the stats block. Only a NON-streaming one
+    // needs the post-hoc augmentation, because only then is there a whole JSON document to amend.
+    auto v0_route = [lmstudio_augment](const httplib::Request& req, httplib::Response& res,
+                                       const std::function<void(const httplib::Request&,
+                                                                httplib::Response&)>& handler) {
+        bool streaming = false;
+        try { streaming = nlohmann::json::parse(req.body.empty() ? "{}" : req.body)
+                              .value("stream", false); } catch (...) {}
+        httplib::Request inner = req;
+        if (streaming) inner.set_header(kStreamDialectHeader, "lmstudio-sse");
+        handler(inner, res);
+        if (!streaming) lmstudio_augment(res);
+    };
     svr.Post("/api/v0/chat/completions",
-             [chat_completions_handler, lmstudio_augment](const httplib::Request& req,
-                                                          httplib::Response& res) {
-                 chat_completions_handler(req, res);
-                 lmstudio_augment(res);
+             [chat_completions_handler, v0_route](const httplib::Request& req, httplib::Response& res) {
+                 v0_route(req, res, chat_completions_handler);
              });
     svr.Post("/api/v0/completions",
-             [text_completions_handler, lmstudio_augment](const httplib::Request& req,
-                                                          httplib::Response& res) {
-                 text_completions_handler(req, res);
-                 lmstudio_augment(res);
+             [text_completions_handler, v0_route](const httplib::Request& req, httplib::Response& res) {
+                 v0_route(req, res, text_completions_handler);
              });
 
     // ---------------------------------------------------------------------------------------
@@ -2788,10 +2888,24 @@ int main(int argc, char** argv) {
         else           inner_body = oll::generate_request_to_chat(in);
 
         httplib::Request inner = req;
+        // A STREAMING request is handed to the shared handler with stream=true and the Ollama
+        // dialect marked: write_sse_json then re-frames every chunk as NDJSON in Ollama's
+        // message/done shape, so the client gets genuine token-by-token delivery rather than one
+        // terminal chunk. Only a non-streaming request needs the whole-document translation.
+        if (want_stream) inner_body["stream"] = true;
         inner.body = inner_body.dump();
         inner.set_header("Content-Type", "application/json");
+        if (want_stream)
+            inner.set_header(kStreamDialectHeader,
+                             chat ? "ollama-ndjson" : "ollama-ndjson-generate");
 
         httplib::Response inner_res;
+        if (want_stream) {
+            // Pass the handler's own response through untouched -- it IS the NDJSON stream.
+            if (use_chat_handler) chat_completions_handler(inner, res);
+            else                  text_completions_handler(inner, res);
+            return;
+        }
         if (use_chat_handler) chat_completions_handler(inner, inner_res);
         else                  text_completions_handler(inner, inner_res);
 
@@ -2810,14 +2924,7 @@ int main(int argc, char** argv) {
         const std::string ts = oll::rfc3339_now();
         const nlohmann::json out = chat ? oll::openai_to_chat_response(oai, model, ts)
                                         : oll::openai_to_generate_response(oai, model, ts);
-        if (want_stream) {
-            // NDJSON: one JSON object per line. This is a single terminal chunk (done=true) --
-            // correct framing and fields, but the whole message at once rather than
-            // token-by-token. See ollama_api.hpp for why, and what closing that gap requires.
-            res.set_content(out.dump() + "\n", "application/x-ndjson");
-        } else {
-            res.set_content(out.dump(), "application/json");
-        }
+        res.set_content(out.dump(), "application/json");
     };
 
     svr.Post("/api/chat", [ollama_completion](const httplib::Request& req, httplib::Response& res) {
