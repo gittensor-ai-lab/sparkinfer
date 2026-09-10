@@ -15,6 +15,8 @@ bool launch_prefill_nvfp4_gate_quant_a(const void*, const void*, void*, void*, i
 bool launch_prefill_nvfp4_swiglu_quant_a(const void*, const void*, void*, void*, int, int,
                                          cudaStream_t) { return false; }
 bool launch_prefill_nvfp4_quant_b(const void*, void*, void*, int, int, cudaStream_t) { return false; }
+bool launch_prefill_nvfp4_quant_b_slice(const void*, void*, void*, int, int, int, int,
+                                        cudaStream_t) { return false; }
 bool launch_prefill_nvfp4_gemm(const void*, const void*, const void*, const void*, void*, int, int,
                                int, void*, cudaStream_t, float) { return false; }
 bool launch_ct_nvfp4_pack_sfb(const void*, void*, int, int, cudaStream_t) { return false; }

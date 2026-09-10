@@ -843,20 +843,61 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // that uses it. That second half is not a tidiness point: at max_seq 65536 the session has
     // essentially no spare VRAM, and 341 MB held across a 64k prefill costs 85% of it -- measured
     // with the buffers allocated and never read, so it is the footprint alone, not this path.
-    // Hence a band. Below dn_min the fixed ~31 ms of conversion (52 layers) swamps a prefill that
-    // only takes ~36 ms; above dn_max the scratch cannot be spared beside a long-context KV cache.
+    // Hence a floor: below dn_min the fixed conversion cost (52 layers) swamps a prefill that only
+    // takes ~36 ms.
+    //
+    // There used to be a CEILING as well, at 8192, and it was the 265.8 MB bf16 staging that put it
+    // there -- 78% of that 341 MB. But the staging is a pure INTERMEDIATE: launch_gguf_dequant
+    // fills it and the quantizer drains it in the very next launch, and nothing reads it again.
+    // Only the FP4 operand (74.8 MB + its scale factors) is what the GEMM needs held. So the
+    // conversion runs a SLICE of the output rows at a time -- dequant those rows, quantize those
+    // rows into their place in the whole operand -- and the staging shrinks to one slice.
+    //
+    // 32 MB of staging (768 rows at Muse's 19968-wide FFN) puts the whole conversion at ~113 MB
+    // instead of 341 MB, which is what lets the band cover 16k/32k/64k. The slice boundary is a
+    // multiple of 128 rows -- the NVFP4 scale-factor atom is 32x4 = 128 rows in N -- so each slice
+    // writes exactly the bytes the whole-operand call wrote there and the operand is bit-identical.
+    // H is a multiple of 128 on this path (prefill_nvfp4_supported checks n & 127), so the tail
+    // slice is aligned too.
+    //
+    // The ceiling is now the allocator's to set, not a constant's: the three cudaMallocs are taken
+    // before the batched-prefill arena, so if a long-context KV cache really has left no room the
+    // conversion declines and the layer keeps today's int8 path. That is the same decline the
+    // partial-failure branch below already handled -- it just stops triggering 4x sooner.
     static const int dn_min = [] {
         const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MINN"); return e ? atoi(e) : 1024;
     }();
     static const int dn_max = [] {
-        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MAXN"); return e ? atoi(e) : 8192;
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MAXN"); return e ? atoi(e) : (1 << 30);
     }();
     static const bool dn_stream_on = [] {
         const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_STREAM"); return !(e && e[0] == '0');
     }();
+    // Bytes of bf16 staging to hold at once. SPARKINFER_MUSE_NVFP4_DOWN_STAGEMB=0 restores the
+    // whole-layer staging this shipped with (A/B in ONE binary, and the old 341 MB with it).
+    static const long dn_stage_mb = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_STAGEMB");
+        const long v = e ? atol(e) : 32;
+        return (v < 0) ? 32 : v;
+    }();
+    // Quantized bytes in one `cols`-long GGUF row, so a row slice can be read from the middle of
+    // the tensor. 0 = a type this cannot offset into, which keeps the whole-layer staging.
+    auto dn_q_row_bytes = [](int qtype, int cols) -> size_t {
+        switch (qtype) {
+            case 0:  return (size_t)cols * 4;                                  // F32
+            case 1:  return (size_t)cols * 2;                                  // F16
+            case 8:  return (cols & 31) ? 0 : (size_t)(cols >> 5) * 34;        // Q8_0
+            case 12: return (cols & 255) ? 0 : (size_t)(cols >> 8) * 144;      // Q4_K
+            case 13: return (cols & 255) ? 0 : (size_t)(cols >> 8) * 176;      // Q5_K
+            case 14: return (cols & 255) ? 0 : (size_t)(cols >> 8) * 210;      // Q6_K
+            default: return 0;
+        }
+    };
     // Frees on every exit path, including the two mid-function declines.
     struct DownFp4Scratch {
         void* tmp = nullptr; void* data = nullptr; void* sf = nullptr;
+        int rows = 0;                 // output rows staged at once; H = the whole layer
+        size_t row_bytes = 0;         // quantized bytes per row, for the sliced source offset
         ~DownFp4Scratch() {
             if (tmp) cudaFree(tmp);
             if (data) cudaFree(data);
@@ -865,7 +906,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     } dn_scratch;
     if (muse_nvfp4 && !s.w.layers[0].down_fp4 && dn_stream_on && N >= dn_min && N <= dn_max &&
         kernels::prefill_nvfp4_supported(N, H, ffn)) {
-        const size_t need_tmp = (size_t)H * ffn * sizeof(bf16);
+        const size_t rb = dn_q_row_bytes(s.w.layers[0].down_qtype, ffn);
+        int sr = H;
+        if (dn_stage_mb > 0 && rb) {
+            const size_t budget = (size_t)dn_stage_mb << 20;
+            const size_t per_row = (size_t)ffn * sizeof(bf16);
+            size_t r = budget / per_row;
+            r &= ~(size_t)127;                          // whole scale-factor atoms only
+            if (r < 128) r = 128;
+            if (r < (size_t)H) sr = (int)r;
+        }
+        dn_scratch.rows = sr;
+        dn_scratch.row_bytes = rb;
+        const size_t need_tmp = (size_t)sr * ffn * sizeof(bf16);
         if (cudaMalloc(&dn_scratch.tmp, need_tmp) != cudaSuccess) dn_scratch.tmp = nullptr;
         if (dn_scratch.tmp &&
             cudaMalloc(&dn_scratch.data, kernels::prefill_nvfp4_data_bytes(H, ffn)) != cudaSuccess)
@@ -2012,10 +2065,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             const void* dn_fp4    = w.down_fp4;
             const void* dn_fp4_sf = w.down_fp4_sf;
             if (!dn_fp4 && nvfp4_down && ffn_fp4_possible && dn_scratch.sf && w.down_q) {
-                kernels::launch_gguf_dequant(w.down_qtype, w.down_q,
-                                             (bf16*)dn_scratch.tmp, (long)H * ffn, st);
-                if (kernels::launch_prefill_nvfp4_quant_b(dn_scratch.tmp, dn_scratch.data,
-                                                          dn_scratch.sf, H, ffn, st)) {
+                // Row slices of the output, dequant then quantize, so the bf16 staging only ever
+                // holds dn_scratch.rows of them. The slices are ordered on `st` behind each other
+                // and ahead of the GEMMs that read the operand, so one staging buffer is correct.
+                // The stride is THIS layer's, not layer 0's: the staging was sized from layer 0
+                // but a layer that quantized differently would offset differently, so a slice
+                // sweep only runs when this layer's own row stride is known.
+                const size_t rb = dn_q_row_bytes(w.down_qtype, ffn);
+                const int sr = dn_scratch.rows;          // never wider than the staging buffer
+                bool dn_ok = sr > 0 && (sr >= H || rb != 0);
+                for (int r0 = 0; r0 < H && dn_ok; r0 += sr) {
+                    const int nr = (H - r0 < sr) ? (H - r0) : sr;
+                    kernels::launch_gguf_dequant(
+                        w.down_qtype,
+                        static_cast<const unsigned char*>(w.down_q) + (size_t)r0 * rb,
+                        (bf16*)dn_scratch.tmp, (long)nr * ffn, st);
+                    dn_ok = kernels::launch_prefill_nvfp4_quant_b_slice(
+                        dn_scratch.tmp, dn_scratch.data, dn_scratch.sf, H, r0, nr, ffn, st);
+                }
+                if (dn_ok) {
                     dn_fp4 = dn_scratch.data;
                     dn_fp4_sf = dn_scratch.sf;
                 }

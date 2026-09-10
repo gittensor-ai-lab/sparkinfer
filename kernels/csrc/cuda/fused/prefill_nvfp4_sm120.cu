@@ -212,7 +212,8 @@ auto sfb_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SF
 // x / float(qs) rounding. LPV is a template parameter only so the two can be A/B'd in one binary.
 template <int LPV, class Layout>
 __global__ void quant_rows_t(const __nv_bfloat16* src, unsigned char* dst,
-                             cutlass::float_ue4m3_t* sf, int rows, int cols, Layout layout) {
+                             cutlass::float_ue4m3_t* sf, int rows, int cols, Layout layout,
+                             int n0) {
     constexpr int V = 16;
     constexpr int VPL = V / LPV;      // values per lane
     constexpr int GPW = 32 / LPV;     // scale groups per warp
@@ -255,8 +256,11 @@ __global__ void quant_rows_t(const __nv_bfloat16* src, unsigned char* dst,
         #pragma unroll
         for (int i = 0; i < VPL / 2; i++) dst[(base >> 1) + i] = packed[i];
         if (sub == 0) {
+            // `layout` describes the WHOLE operand and `n0` is this launch's first row in it, so a
+            // row-sliced call writes exactly the bytes the whole-operand call would have written
+            // for those rows -- the slicing is invisible to the GEMM that reads it.
             auto scales = cute::make_tensor(sf, layout);
-            scales(row, k0, 0) = qs;
+            scales(n0 + row, k0, 0) = qs;
         }
     }
 }
@@ -298,11 +302,11 @@ inline int nvfp4_quant_lpv(int rows) {
 }
 template <class Layout>
 void quant_rows_dispatch(int blocks, cudaStream_t st, const __nv_bfloat16* src, unsigned char* dst,
-                         cutlass::float_ue4m3_t* sf, int rows, int cols, Layout layout) {
+                         cutlass::float_ue4m3_t* sf, int rows, int cols, Layout layout, int n0) {
     switch (nvfp4_quant_lpv(rows)) {
-        case 8:  quant_rows_t<8><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout); break;
-        case 4:  quant_rows_t<4><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout); break;
-        default: quant_rows_t<2><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout); break;
+        case 8:  quant_rows_t<8><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout,n0); break;
+        case 4:  quant_rows_t<4><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout,n0); break;
+        default: quant_rows_t<2><<<blocks,256,0,st>>>(src,dst,sf,rows,cols,layout,n0); break;
     }
 }
 
@@ -583,7 +587,7 @@ bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k
     auto l = sfa_layout(m,128,k);
     int blocks = (m * (k / 16) + 31) / 32; if (blocks > 4096) blocks = 4096;
     quant_rows_dispatch(blocks,st,(const __nv_bfloat16*)s,(unsigned char*)d,
-                        (cutlass::float_ue4m3_t*)sf,m,k,l);
+                        (cutlass::float_ue4m3_t*)sf,m,k,l,0);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_rmsnorm_quant_a(const void* s, const void* w, void* d, void* sf,
@@ -625,7 +629,27 @@ bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k
     auto l = sfb_layout(128,n,k);
     int blocks = (n * (k / 16) + 31) / 32; if (blocks > 4096) blocks = 4096;
     quant_rows_dispatch(blocks,st,(const __nv_bfloat16*)s,(unsigned char*)d,
-                        (cutlass::float_ue4m3_t*)sf,n,k,l);
+                        (cutlass::float_ue4m3_t*)sf,n,k,l,0);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+// Rows [n0, n0+rows) of an `n`-row B operand, quantized from a bf16 buffer holding ONLY those
+// rows. `d` and `sf` are the whole operand: the data offset is exact (n0 is a multiple of the
+// 32x4 = 128-row scale-factor atom, so n0*k nibbles are a whole number of bytes) and the scale
+// layout is the whole-operand one, indexed at n0+row. Every byte written is the byte the
+// whole-operand call would have written there, so a full sweep of slices is bit-identical to it.
+//
+// The point is the CALLER's staging buffer: the bf16 source is a pure intermediate between a
+// dequant and this quantize, so it never has to hold more than one slice, while only the FP4
+// operand -- a quarter the size -- has to be whole.
+bool launch_prefill_nvfp4_quant_b_slice(const void* s, void* d, void* sf, int n, int n0, int rows,
+                                        int k, cudaStream_t st) {
+    if (!s || !d || !sf || !prefill_nvfp4_supported(128,n,k)) return false;
+    if (n0 < 0 || rows <= 0 || n0 > n - rows || (n0 & 127) || (rows & 127)) return false;
+    auto l = sfb_layout(128,n,k);
+    int blocks = (rows * (k / 16) + 31) / 32; if (blocks > 4096) blocks = 4096;
+    quant_rows_dispatch(blocks,st,(const __nv_bfloat16*)s,
+                        (unsigned char*)d + (((size_t)n0 * k) >> 1),
+                        (cutlass::float_ue4m3_t*)sf,rows,k,l,n0);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 size_t prefill_nvfp4_workspace_bytes_f32(int m, int n, int k) {

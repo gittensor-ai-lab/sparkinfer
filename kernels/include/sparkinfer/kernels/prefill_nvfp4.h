@@ -29,6 +29,13 @@ bool launch_prefill_nvfp4_swiglu_quant_a(const void* gate_bf16, const void* up_b
                                          int m, int k, cudaStream_t stream = nullptr);
 bool launch_prefill_nvfp4_quant_b(const void* src_bf16, void* dst_fp4, void* dst_sf,
                                   int n, int k, cudaStream_t stream = nullptr);
+// Rows [n0, n0+rows) of the same `n`-row operand, read from a bf16 buffer holding ONLY those rows
+// and written into the whole-operand dst_fp4/dst_sf. n0 and rows must be multiples of the 128-row
+// scale-factor atom. A full sweep of slices is bit-identical to the whole-operand call above, so
+// the caller's bf16 staging never has to be larger than one slice.
+bool launch_prefill_nvfp4_quant_b_slice(const void* src_bf16, void* dst_fp4, void* dst_sf,
+                                        int n, int n0, int rows, int k,
+                                        cudaStream_t stream = nullptr);
 // c_bf16 is the epilogue's source operand: non-null makes this compute
 // D = alpha*(A*B) + C instead of D = alpha*(A*B), which is how a residual add is
 // folded into the block-scaled GEMM rather than run as a separate full-tensor pass.
