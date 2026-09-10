@@ -20,10 +20,11 @@ source of the incentive loop is clear: SPARKINFER is built through **SN74 on Git
 - **Correctness first.** A faster kernel that changes the model's output is worth zero.
   Every change is gated against a frozen reference (see *Accuracy gate* below).
 - **General, not overfit.** Optimizations must hold across the basket and across shapes; a win
-  on one model but a regression on another is overfitting, and the guards will catch it. The
-  live basket is **Qwen3.8-27B** (dense, the scored target) and **Qwen3.6-35B-A3B** (MoE, a
-  no-regression guard). They share `qwen35.cpp`, `qwen35_prefill.cpp` and the kernels, so a
-  change aimed at one routinely lands in the other's path.
+  on one model but a regression on another is overfitting, and the guards will catch it. The live
+  basket is **Muse Glimmer** and **Qwen3.8-27B** (both scored), with **Qwen3.6-35B-A3B** (MoE) and
+  **Qwen3.8 ModelOpt** as no-regression guards. They share `qwen35.cpp`, `qwen35_prefill.cpp` and
+  the kernels, so a change aimed at one routinely lands in another's path — which is exactly why
+  a win is scored wherever it lands and a regression anywhere is caught.
 - **Blackwell only, by design.** Targets `sm_120` (RTX 5090, RTX PRO 6000) and `sm_121`
   (RTX Spark / Jetson Thor). CUDA 12.8+ (13 works). Not `sm_100`.
 
@@ -49,8 +50,8 @@ bench/scripts/accuracy.sh --download
 top-1, currently met at ~96–99%.) If `compute-sanitizer` is available, your kernels
 must be clean (0 errors).
 
-**Speculative-decode work is held to a stricter bar.** While the DSpark scope is active, the eval
-bot additionally requires **exact token equality** against the same build with the draft disabled —
+**Speculative-decode work is held to a stricter bar.** If your PR touches speculative decoding, the
+eval bot additionally requires **exact token equality** against the same build with the draft disabled —
 not distributional agreement. If you're touching the draft or the verify path, check that locally
 (`runtime/examples/dspark_tau_check.cpp` reports `LOSSLESS`) before opening the PR, and check it
 over several repeats: a single lossless run is weak evidence, and the bot runs repeats for exactly
@@ -88,17 +89,40 @@ speedups, so they earn no reward. They are reviewed by hand, not by the eval bot
 *What gets evaluated, reviewed, or closed* below for how that lane works. (The eval/scoring
 harness is maintainer-owned — see *Maintainer-owned paths*.)
 
-**Speedups are scored against the active evaluation scope, which is narrower than "anything
-faster."** At any time the eval bot scores **one** dimension on one model pair. A genuine,
-correct speedup somewhere that dimension doesn't measure will score `none` — not because the
-work is bad, but because the harness isn't pointed at it. Check the scope below *before* you
-invest in an optimization.
+**There is no target optimization — optimize anything.** There is no single blessed model,
+kernel, context length or subsystem. Decode, prefill, attention, FFN, quantization, KV cache,
+sampling, batching, memory traffic, load time — if you can make inference genuinely faster
+without changing what it produces, that is the work, and it is scored the same wherever it lands.
+
+**If no evaluation measures your optimization yet, ask for one.** Several bots score in parallel
+(see the table below) and between them they cover a lot, but they cannot cover everything. A real
+speedup on an axis nobody measures would otherwise score `none` — not because the work is bad, but
+because nothing is pointed at it. That is a gap in the harness, not a verdict on your PR, and the
+fix is to close the gap:
+
+- **Open an issue** describing the axis — model, metric, context length, and the command that
+  measures it — with your before/after numbers. Say why the existing axes miss it.
+- A maintainer adds it to the harness (harness paths are maintainer-owned — see *Maintainer-owned
+  paths*), and your PR is then evaluated against it on the next poll.
+- You can open the PR at the same time; ask for the [`hold`](../../labels/hold) label so it is not
+  auto-closed while the axis is being added, and link the issue from the PR.
+
+Requesting an axis is a normal, welcome contribution — most of the current axes exist because
+somebody asked. What is *not* welcome is redefining what an existing axis measures in order to
+move it; see *Do not redefine what a scored dimension measures* below.
 
 **Evaluation is opt-in and proof-gated.** The RTX 5090 eval runs only when **both** hold: you tick
-**`- [x] Tested on RTX 5090`** *and* fill the template's **decode tok/s** table with a real
-end-to-end improvement (`after > before`, from `bench/scripts/bench.sh` — not an isolated-kernel
-microbenchmark). Then the bot greenlights it (**`test-on-5090`**) and evaluates on the next poll.
-- Box ticked but the decode table empty / placeholder / no gain → **`needs-benchmark`**, not evaluated
+**`- [x] Tested on RTX 5090`** *and* fill **either** the template's **decode tok/s** table **or**
+its **prefill pp tok/s** table with a real end-to-end improvement (`after > before`, from
+`bench/scripts/bench.sh` — not an isolated-kernel microbenchmark). Either table alone is enough:
+a prefill-only optimization with flat decode greenlights on its prefill numbers, and vice versa.
+Then the bot greenlights it (**`test-on-5090`**) and evaluates on the next poll.
+- **Keep the template's row labels.** The greenlight parser reads the tables by their row labels,
+  so leave `before prefill (main)` / `after prefill (this PR)` (and `before (main)` /
+  `after (this PR)`) intact and just fill in the numbers. Renaming a row — dropping the word
+  `prefill` from it, say — makes that number invisible to the gate, and a prefill-only PR then
+  looks like a decode PR with no gain and is skipped.
+- Box ticked but neither table has a real gain → **`needs-benchmark`**, not evaluated
   (fill in real numbers and it greenlights automatically).
 - Box not ticked → **auto-closed** (same as `rtx5090-required` CI). Tick the box, fill tables, and reopen to submit.
 There is **no override** — every PR is evaluated on a real RTX 5090 only after it legitimately
@@ -113,32 +137,44 @@ passes the gate (box ticked + real before<after decode numbers).
 Three lanes. Which one your PR lands in depends on **what it changes**, not on how good it is —
 so read this before you start, and say in the PR description which lane you're aiming for.
 
-### The active evaluation scope
+### What is currently measured
 
-The eval bot scores **one dimension at a time**, and it moves as the optimization target moves.
-The authoritative statement is the `SCOPE` block at the top of the bot itself
-([`eval/pr_dspark_bot.py`](eval/pr_dspark_bot.py)) — that file is the source of truth, this
-table is a summary and can lag it.
+Several bots run in parallel, each on its own hourly slot, and **any** of them can earn your PR a
+tier. A PR is evaluated by every bot whose greenlight it passes, and the tier you are paid is the
+**best** result across them — a change that helps one model and is merely neutral on another is
+not penalized for the neutral result. (A bot that does not measure your model reports `none`, which
+is an absence of evidence, not a negative finding.)
 
-| | Current (since 2026-09-03) |
-|---|---|
-| **Scored dimensions** | DSpark decode **and** DSpark-enabled batched prefill at **ctx=4k / 16k / 32k**, plus target-model prefill **and** decode at **ctx=256k** — eight dimensions, any one of which can earn the tier |
-| **Model pair** | target = Qwen3.8-27B ModelOpt NVFP4; draft = released DSpark checkpoint |
-| **Harness** | `runtime/examples/dspark_tau_check.cpp` for 4k/16k/32k — both legs in one process, one model load. The 256k rows come from a one-row `qwen3_gguf_bench` sweep. |
-| **256k is target-only** | No draft at that context: a 262,144-token KV cache needs the VRAM the draft would occupy, so `dspark-decode@256k` does not exist. Both 256k rows measure the served target model. |
-| **Not measured at all** | ctx=128 (any length below `kEngageMinSeq`=1024), batched-prefill parity |
-| **Explicitly out of scope** | replacing the DSpark drafter — including the checkpoint's MTP head. See below. |
+**A regression is not the same as a neutral result.** If any bot fails your PR on a gate — accuracy,
+losslessness, or a no-regression guard — that `REJECT` takes precedence over any tier another bot
+awarded. You cannot buy a win on one model with a regression on another.
 
-Nothing at ctx=128 has coverage any more. That was deliberate: below `kEngageMinSeq` the batched
-verify never arms, so the token loop runs one target forward per *kept* token — exactly what AR
-runs — and the only way to move the metric was to speculate less. A metric whose optimum is
-"turn the feature off" measures the wrong thing.
+The bots themselves are the source of truth (their `SCOPE` blocks); this table is a summary and
+can lag them.
 
-#### Replacing the drafter is out of scope — MTP included
+| Bot | Model | Scored axes |
+|---|---|---|
+| [`eval/pr_museglimmer_bot.py`](eval/pr_museglimmer_bot.py) | Muse Glimmer | prefill **and** decode at **ctx 128 / 512 / 4k / 16k / 32k / 64k** — twelve axes, any one of which can earn the tier |
+| [`eval/pr_dspark_bot.py`](eval/pr_dspark_bot.py) | Qwen3.8-27B ModelOpt NVFP4 + DSpark draft | DSpark decode and DSpark-enabled batched prefill at **ctx 4k / 16k / 32k**, plus target prefill and decode at **ctx 256k** |
 
-The work wanted here is **optimizing the DSpark drafter**. Swapping it for a different drafter is
-not in scope, however well it measures, and that specifically includes drafting with the
-checkpoint's own MTP head. Such a PR will be closed on scope, not on merit.
+Both bots additionally run **no-regression guards** on models they are not scoring (Qwen3.6 and
+ModelOpt), because the code is shared — see the gate table in *Lane 1*.
+
+**This list is not a menu, and it is not exhaustive.** It is what happens to be wired up today.
+If your optimization is real and lands somewhere none of these axes reach, that is a reason to
+[ask for an axis](#how-rewards-work-sn74-on-gittensor), not a reason to abandon the work.
+
+#### Do not redefine what a scored dimension measures
+
+"Optimize anything" means anything that makes inference genuinely faster. It does **not** mean
+changing what a scored axis measures so the number moves. A metric has to keep meaning the same
+thing across rounds or nobody's score means anything — including yours.
+
+The canonical case: on the DSpark axis, the work wanted is **optimizing the DSpark drafter**.
+Swapping it for a different drafter is not the same thing, however well it measures, and that
+specifically includes drafting with the checkpoint's own MTP head. Such a PR is closed on that
+basis, not on merit — and note this is a rule about *substituting the thing being measured*, not
+about which subsystems you may touch.
 
 This is a real precedent, not a hypothetical. #912 did exactly that — MTP head recursed to depth 2
 — and it was **merged and then reverted**. Its numbers were not the problem; they were the best
@@ -152,16 +188,22 @@ labels all still said "dspark". Every later round would have reported `dspark-de
 measuring MTP. Contributors optimizing that number would have been tuning the wrong component,
 and genuine DSpark drafter improvements would have scored as regressions against an MTP baseline.
 
-The general rule this stands for: **a change that redefines what the scored dimension measures is
-out of scope even when it improves the number.** If you believe the target itself should move,
-open an issue and argue it — do not land it inside a perf PR.
+The general rule this stands for: **a change that redefines what a scored axis measures is out of
+scope even when it improves the number.** That is the one real limit on "optimize anything" — and
+it has an outlet: if you think an axis should measure something different, or that a new axis
+should exist, open an issue and argue it. Do not land it inside a perf PR.
 
 ### Lane 1 — evaluated and scored
 
-Changes to `kernels/`, `runtime/`, or `moe/` that move the scored dimension, with the opt-in gate
-satisfied (box ticked + real decode numbers). These earn a tier and can auto-merge. To earn one,
-a PR must clear **every** gate below — the first failure stops that PR and the bot moves on, so
-a rejection comment names one gate, not all of them:
+Changes to `kernels/`, `runtime/`, or `moe/` that move any measured axis, with the opt-in gate
+satisfied (box ticked + a real gain in the decode **or** prefill table). These earn a tier and can
+auto-merge. To earn one, a PR must clear **every** gate the bot that scores it applies — the first
+failure stops that PR and the bot moves on, so a rejection comment names one gate, not all of them.
+
+The gates below are the DSpark bot's, the strictest set (speculative decoding needs losslessness
+and an acceptance floor that ordinary decode work does not). Other bots apply the subset that
+makes sense for what they measure — every bot runs accuracy and no-regression guards; only the
+speculative axes carry the losslessness and τ gates:
 
 | Gate | Bar | Why |
 |---|---|---|
@@ -176,11 +218,15 @@ Tiers are bands of % speedup over the frontier (`XS` 2–3.5% … `XL` >18%; und
 
 ### Lane 2 — manually reviewed, not scored
 
-Correctness fixes, refactors, tests, benchmarks, docs, tooling — **including work on code the
-current scope doesn't measure.** These score 0 by design (SN74 emits only for verified speedups),
-but scoring 0 is not the same as being unwanted, and being outside the eval scope is **not**
-grounds for closing a correctness fix. A bug is a bug whether or not the harness is currently
-pointed at it.
+Correctness fixes, refactors, tests, benchmarks, docs, tooling — **including work on code no
+current axis measures.** These score 0 by design (SN74 emits only for verified speedups), but
+scoring 0 is not the same as being unwanted, and not being measured is **not** grounds for closing
+anything. A bug is a bug whether or not a harness is pointed at it.
+
+**An optimization nobody measures yet is not a Lane 2 PR — it is a Lane 1 PR waiting for an axis.**
+Do not quietly downgrade real speed work to "unscored" because the harness has a gap. Open the
+issue asking for the axis (see *How rewards work*), ask for [`hold`](../../labels/hold) so the PR
+survives while it is added, and it is evaluated like any other once the axis lands.
 
 **Getting into this lane without tripping the auto-close.** An unticked RTX 5090 box is only safe
 for a PR that touches neither `runtime/` nor the PR template's checkbox — a docs-only change
@@ -197,13 +243,15 @@ Maintainers, members and collaborators are exempt automatically. If your fix get
 anyway, that's the gate misfiring on intent — reopen as a draft and say so; it will not count
 against you.
 
-> **This is a correction of past practice, not just a description of it.** When the scope
-> narrowed to DSpark, open PRs unrelated to DSpark were closed in bulk to clear the eval queue,
-> and at least one genuine fix — [#885](../../pull/885), a Muse Glimmer GEMV correctness fix —
-> was closed for scope rather than on its merits. That was a queue-management action applied too
-> broadly. Out-of-scope *optimizations* will still be closed (they cannot be scored, and an open
-> PR that cannot be scored is a promise the harness can't keep); out-of-scope *correctness fixes*
-> should not be, and if yours was, reopen it and say so.
+> **This is a correction of past practice, not just a description of it.** When the scope was
+> narrowed to a single target, open PRs unrelated to it were closed in bulk to clear the eval
+> queue, and at least one genuine fix — [#885](../../pull/885), a Muse Glimmer GEMV correctness
+> fix — was closed for scope rather than on its merits. That was a queue-management action applied
+> too broadly, and the narrow-scope rule it enforced is gone: **there is no target optimization
+> now, so "out of scope" is no longer a reason to close anything.** A correctness fix stays open on
+> its merits; an optimization no axis reaches yet gets an axis requested for it. The only
+> scope-shaped close left is a change that redefines what an existing axis measures. If your PR was
+> closed under the old rule, reopen it and say so.
 
 ### Lane 3 — closed
 
@@ -217,11 +265,14 @@ against you.
   clean. This is not a judgment on the work: push a commit or reopen and it's picked straight
   back up on the next cycle. `hold` and the current round winner are exempt.
 - **Repeated `none`/REJECT.** A third consecutive unscored result auto-closes; `hold` and
-  `merge-first` are exempt.
-- **Out-of-scope optimizations**, per Lane 2 above — including anything that replaces the
-  DSpark drafter rather than optimizing it (MTP head and equivalents), and more generally any
-  change that redefines what the scored dimension measures. See *Replacing the drafter is out
-  of scope* above for the #912 precedent.
+  `merge-first` are exempt. **If you are waiting on a requested axis, get the
+  [`hold`](../../labels/hold) label** — otherwise a PR that only scores `none` because nothing
+  measures it yet will be closed by this rule before the axis lands.
+- **Changes that redefine what a scored axis measures** — including anything that replaces the
+  DSpark drafter rather than optimizing it (MTP head and equivalents). See *Do not redefine what
+  a scored dimension measures* above for the #912 precedent. Note this is **not** "your
+  optimization is off-target": there is no target, and an optimization no axis reaches yet gets an
+  axis requested for it rather than a close.
 - **Maintainer-owned paths** (below) — cannot merge regardless of content.
 - **Gaming** — copycatting, sybil farming; see *Anti-gaming*.
 
@@ -250,7 +301,7 @@ score. These paths are protected:
 |---|---|
 | `eval/` | the PR-evaluation bot + GPU runner |
 | `bench/scripts/` | the on-box scoring harness (`evaluate.sh`, `label.py`, `accuracy*`, `_common.sh`, the eval prompts) |
-| `runtime/examples/dspark_tau_check.cpp` | **the measuring instrument for the current scope** — lives under `runtime/`, but is harness, not contributor surface |
+| `runtime/examples/dspark_tau_check.cpp` | **a measuring instrument** (the DSpark axes) — lives under `runtime/`, but is harness, not contributor surface |
 | `.gittensor/` | intra-repo emission weights |
 | `sparkinfer-web` `public/dashboard/data.json` | the live frontier ledger (eval bot pushes here; in-repo `dashboard/` is legacy) |
 | `.github/` | CI, `CODEOWNERS`, and this guard |
