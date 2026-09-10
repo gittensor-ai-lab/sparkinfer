@@ -267,6 +267,32 @@ enum class StreamDialect {
 // The wrapper routes (/api/v0/*, /api/*) mark their inner request with this header so the shared
 // handler knows which dialect to stream in. A header rather than a global: it is per-request and
 // therefore correct under concurrency, and it needs no change to the handler's signature.
+// Null-safe JSON readers for CLIENT-SUPPLIED bodies.
+//
+// nlohmann's value(key, default) returns the default only when the key is ABSENT. A key that is
+// present and JSON-null throws type_error.302 -- and a throw out of a request handler calls
+// terminate(), which kills the WHOLE SERVER and every other in-flight request with it, not just
+// the offending request. That is a remote denial of service reachable with a one-line body like
+// {"model": null}.
+//
+// This already happened once on the Ollama stream path (delta.content is null on the first chunk
+// of every stream). These helpers exist so it cannot happen again on anything a caller controls.
+std::string json_str(const nlohmann::json& j, const char* key, const std::string& dflt = "") {
+    if (!j.is_object()) return dflt;
+    auto it = j.find(key);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>() : dflt;
+}
+bool json_bool(const nlohmann::json& j, const char* key, bool dflt) {
+    if (!j.is_object()) return dflt;
+    auto it = j.find(key);
+    return (it != j.end() && it->is_boolean()) ? it->get<bool>() : dflt;
+}
+double json_num(const nlohmann::json& j, const char* key, double dflt = 0.0) {
+    if (!j.is_object()) return dflt;
+    auto it = j.find(key);
+    return (it != j.end() && it->is_number()) ? it->get<double>() : dflt;
+}
+
 constexpr const char* kStreamDialectHeader = "X-Sparkinfer-Stream-Dialect";
 
 StreamDialect stream_dialect_of(const httplib::Request& req) {
@@ -351,9 +377,9 @@ bool write_sse_json(GuardedSink& gs, const nlohmann::json& value) {
         if (gs.dialect == StreamDialect::LmStudioSse && out.contains("usage")) {
             const auto& u = out["usage"];
             sparkinfer_server::lmstudio::Stats st;
-            st.tokens_per_second = u.value("decode_tps", 0.0);
-            st.time_to_first_token = u.value("ttft_ms", 0.0) / 1000.0;
-            st.generation_time = u.value("generation_ms", 0.0) / 1000.0;
+            st.tokens_per_second = json_num(u, "decode_tps");
+            st.time_to_first_token = json_num(u, "ttft_ms") / 1000.0;
+            st.generation_time = json_num(u, "generation_ms") / 1000.0;
             st.stop_reason = "eosFound";
             out["stats"] = sparkinfer_server::lmstudio::stats_object(st);
         }
@@ -2682,11 +2708,12 @@ int main(int argc, char** argv) {
         try { body = nlohmann::json::parse(res.body); } catch (...) { return; }
         if (!body.is_object()) return;
 
-        const auto& usage = body.value("usage", nlohmann::json::object());
+        const nlohmann::json usage = body.contains("usage") && body["usage"].is_object()
+                                         ? body["usage"] : nlohmann::json::object();
         sparkinfer_server::lmstudio::Stats st;
-        st.tokens_per_second = usage.value("decode_tps", 0.0);
-        st.time_to_first_token = usage.value("ttft_ms", 0.0) / 1000.0;   // ms -> s
-        st.generation_time = usage.value("generation_ms", 0.0) / 1000.0;
+        st.tokens_per_second = json_num(usage, "decode_tps");
+        st.time_to_first_token = json_num(usage, "ttft_ms") / 1000.0;   // ms -> s
+        st.generation_time = json_num(usage, "generation_ms") / 1000.0;
         std::string finish;
         // Null-safe: nlohmann's value() returns the default only for an ABSENT key; a present
         // null throws type_error.302. finish_reason is null on any chunk that is not the last,
@@ -2726,8 +2753,8 @@ int main(int argc, char** argv) {
                                        const std::function<void(const httplib::Request&,
                                                                 httplib::Response&)>& handler) {
         bool streaming = false;
-        try { streaming = nlohmann::json::parse(req.body.empty() ? "{}" : req.body)
-                              .value("stream", false); } catch (...) {}
+        try { streaming = json_bool(nlohmann::json::parse(req.body.empty() ? "{}" : req.body),
+                                    "stream", false); } catch (...) {}
         httplib::Request inner = req;
         if (streaming) inner.set_header(kStreamDialectHeader, "lmstudio-sse");
         handler(inner, res);
@@ -2830,7 +2857,8 @@ int main(int argc, char** argv) {
         try { in = nlohmann::json::parse(req.body.empty() ? "{}" : req.body); }
         catch (...) { res.status = 400;
             res.set_content("{\"error\":\"invalid json\"}", "application/json"); return; }
-        const std::string want = in.value("model", in.value("name", std::string()));
+        std::string want = json_str(in, "model");
+        if (want.empty()) want = json_str(in, "name");
         if (!oll::model_name_matches(want, g_model_name)) {
             res.status = 404;
             res.set_content(nlohmann::json{{"error", "model '" + want + "' not found"}}.dump(),
@@ -2864,7 +2892,7 @@ int main(int argc, char** argv) {
         try { in = nlohmann::json::parse(req.body.empty() ? "{}" : req.body); }
         catch (...) { res.status = 400;
             res.set_content("{\"error\":\"invalid json\"}", "application/json"); return; }
-        const std::string want = in.value("model", std::string());
+        const std::string want = json_str(in, "model");
         if (!oll::model_name_matches(want, g_model_name)) {
             res.status = 404;
             res.set_content(nlohmann::json{{"error", "model '" + want + "' not found"}}.dump(),
@@ -2872,7 +2900,8 @@ int main(int argc, char** argv) {
             return;
         }
         // Ollama omits `stream` to mean TRUE, unlike OpenAI where absent means false.
-        const bool want_stream = in.value("stream", true);
+        // Ollama omits `stream` to mean TRUE, unlike OpenAI where absent means false.
+        const bool want_stream = json_bool(in, "stream", true);
 
         // /api/generate applies the model's template unless the request asked for raw, so the
         // DEFAULT generate path goes to the chat handler (which templates) and only an explicit
