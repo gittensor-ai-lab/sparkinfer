@@ -86,6 +86,15 @@ __global__ void extract_chosen_logit_kernel(const int* __restrict__ out_id,
     if (threadIdx.x == 0 && blockIdx.x == 0) *chosen_logit = sorted_logits[rank_by_id[*out_id]];
 }
 
+// By-value id variant -- see launch_extract_chosen_logit_id in fused.h for why the device-buffer
+// form must not be used outside a captured graph.
+__global__ void extract_chosen_logit_id_kernel(int token_id,
+                                               const int* __restrict__ rank_by_id,
+                                               const float* __restrict__ sorted_logits,
+                                               float* __restrict__ chosen_logit) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) *chosen_logit = sorted_logits[rank_by_id[token_id]];
+}
+
 // logits[v] -= frequency_penalty * counts[v] + presence_penalty * (counts[v] > 0 ? 1 : 0), for
 // every v in [0, vocab). OpenAI's exact presence/frequency-penalty formula (counts[v] = number of
 // times vocab id v has appeared in THIS request's generated completion so far, accumulated across
@@ -255,6 +264,13 @@ void launch_extract_chosen_logit(const int* out_id, const int* rank_by_id,
                                  const float* sorted_logits, float* chosen_logit,
                                  cudaStream_t stream) {
     extract_chosen_logit_kernel<<<1, 1, 0, stream>>>(out_id, rank_by_id, sorted_logits, chosen_logit);
+}
+
+void launch_extract_chosen_logit_id(int token_id, const int* rank_by_id,
+                                    const float* sorted_logits, float* chosen_logit,
+                                    cudaStream_t stream) {
+    extract_chosen_logit_id_kernel<<<1, 1, 0, stream>>>(token_id, rank_by_id, sorted_logits,
+                                                        chosen_logit);
 }
 
 void launch_presence_frequency_penalty(float* logits, const int* counts, int vocab,

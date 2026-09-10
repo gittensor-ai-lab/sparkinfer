@@ -211,6 +211,24 @@ void launch_extract_chosen_logit(const int* out_id, const int* rank_by_id,
                                  const float* sorted_logits, float* chosen_logit,
                                  cudaStream_t stream = nullptr);
 
+// Same lookup for a token id the HOST already knows (teacher-forced scoring, /v1/score): the id
+// travels as a by-value kernel argument instead of through a device buffer.
+//
+// This exists because the device-buffer form is unsafe OUTSIDE a captured graph. Staging the id
+// with cudaMemcpy(..., cudaMemcpyHostToDevice) enqueues the write on the LEGACY DEFAULT stream,
+// while this kernel runs on Impl::stream, created with cudaStreamNonBlocking -- which by
+// definition does not serialize against the legacy stream. For a pageable source cudaMemcpy is
+// only "synchronous" in that it returns once the bytes are staged; the device-side write is still
+// queued. So the kernel could read the PREVIOUS id and report sorted_logits[rank_by_id[wrong id]]
+// -- a confident, wrong logprob for a token whose argmax and top_logprobs were both correct
+// (issue #1001: ~22 nats at position 1, where the stale id was the token scored just before).
+//
+// A kernel argument is copied into the launch command at launch time, so there is no second
+// stream and no ordering question. Prefer this form for any host-known id.
+void launch_extract_chosen_logit_id(int token_id, const int* rank_by_id,
+                                    const float* sorted_logits, float* chosen_logit,
+                                    cudaStream_t stream = nullptr);
+
 // OpenAI-style presence_penalty/frequency_penalty: logits[v] -= frequency_penalty*counts[v] +
 // presence_penalty*(counts[v]>0), for every v in [0,vocab). `counts` is the CURRENT session's
 // running per-vocab-id generation count (Qwen35Model::Impl::penalty_counts, already swapped in

@@ -371,10 +371,12 @@ struct Qwen35Model::Impl {
     // by launch_extract_chosen_logit. See Qwen35Model::last_token_logprobs's doc comment.
     int* d_rank_by_id = nullptr;
     float* d_chosen_logit = nullptr;
-    // Device staging for token_logprob_for()'s arbitrary token id. The decode graph bakes
-    // d_out_id into its captured launch_extract_chosen_logit node, so a teacher-forced caller
-    // that wants some OTHER token's logit has to re-run that kernel against its own id buffer.
-    int* d_score_id = nullptr;
+    // NOTE: there is deliberately no device staging buffer for token_logprob_for()'s token id.
+    // The decode graph bakes d_out_id into its captured launch_extract_chosen_logit node, so a
+    // teacher-forced caller that wants some OTHER token's logit re-runs that kernel -- but it
+    // passes the id BY VALUE (launch_extract_chosen_logit_id). Staging it through a device buffer
+    // needs a host->device memcpy on the legacy default stream, which is unordered against
+    // s.stream (cudaStreamNonBlocking): the kernel could read the previous call's id. See #1001.
     // Deterministic-mode softmax normalizer (see launch_logprob_denom_det). 256 partials + total.
     float* d_denom_partials = nullptr;
     float* d_denom_det = nullptr;
@@ -619,7 +621,6 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // topk_topp_exp_kernel fully overwrites it every decode step before it is ever read.
     p_->d_rank_by_id=p_->alloc<int>(cfg.vocab);
     p_->d_chosen_logit=p_->alloc<float>(1);
-    p_->d_score_id=p_->alloc<int>(1);
     p_->d_denom_partials=p_->alloc<float>(256);
     p_->d_denom_det=p_->alloc<float>(1);
     p_->d_shared_ids=p_->alloc<int>(1); p_->d_shared_w=p_->alloc<float>(1);
@@ -794,7 +795,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->d_vocab_iota); cudaFree(p_->d_sorted_logits); cudaFree(p_->d_sorted_idx);
     cudaFree(p_->d_topk_exp); cudaFree(p_->d_topk_cumsum);
     cudaFree(p_->d_sort_temp); cudaFree(p_->d_scan_temp);
-    cudaFree(p_->d_rank_by_id); cudaFree(p_->d_chosen_logit); cudaFree(p_->d_score_id);
+    cudaFree(p_->d_rank_by_id); cudaFree(p_->d_chosen_logit);
     cudaFree(p_->d_denom_partials); cudaFree(p_->d_denom_det);
     cudaFree(p_->d_shared_ids); cudaFree(p_->d_shared_w);
     // Qwen3.6 Gated-DeltaNet buffers (allocated only for the hybrid model)
@@ -918,9 +919,16 @@ Qwen35Model::TokenLogprob Qwen35Model::token_logprob_for(int token_id, int top_n
     // instead of the argmax's. That keeps a teacher-forced score numerically IDENTICAL to what
     // /v1/chat/completions would report for the same token at the same position: same logits,
     // same fp32 logsumexp, same subtraction.
-    cudaMemcpy(s.d_score_id, &token_id, sizeof(int), cudaMemcpyHostToDevice);
-    kernels::launch_extract_chosen_logit(s.d_score_id, s.d_rank_by_id, s.d_sorted_logits,
-                                         s.d_chosen_logit, s.stream);
+    //
+    // The id travels as a by-value kernel ARGUMENT, never through a device buffer. Staging it
+    // with cudaMemcpy(..., HostToDevice) queues the write on the legacy default stream while this
+    // kernel runs on s.stream (cudaStreamNonBlocking), which does not serialize against it -- so
+    // the kernel could read the id from the PREVIOUS call and return the wrong token's logit,
+    // with the argmax and top_logprobs (which come from the sort, not from this lookup) still
+    // perfectly correct. That was issue #1001: ~22 nats of error at position 1 of every
+    // /v1/score, because the stale id was the token scored immediately before.
+    kernels::launch_extract_chosen_logit_id(token_id, s.d_rank_by_id, s.d_sorted_logits,
+                                            s.d_chosen_logit, s.stream);
     cu(cudaStreamSynchronize(s.stream), "token_logprob_for sync");
     out = last_token_logprobs(top_n);   // reads the d_chosen_logit we just rewrote
     out.token_id = token_id;            // ...whose token_id would otherwise be the argmax's
