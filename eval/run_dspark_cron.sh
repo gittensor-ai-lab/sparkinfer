@@ -121,10 +121,48 @@ GPU_LABEL="${EVAL_SSH_HOST:-ssh}"
 [ "${EVAL_TRANSPORT:-vast}" = "ssh" ] || GPU_LABEL="${VAST_INSTANCE:-?}"
 
 TS="$(date -u +%FT%TZ)"
+
+# Outage escalation. A dead box does NOT stop the hourly tick — it degrades it to --labels-only,
+# which logs one ordinary-looking line and exits 0. On 2026-09-04/05 that ran 14 consecutive times
+# (box 87.16.117.183 went unreachable an hour after its last real round) and nothing anywhere got
+# louder, so the outage was only found by someone asking why there were no new numbers. Silent
+# degradation is the right RUNTIME behaviour — never rent, never fail a tick — but it must not be
+# silent to a reader. Count consecutive down ticks and escalate.
+DOWN_FILE="${DSPARK_DOWN_FILE:-$HOME/.sparkinfer_dspark_gpu_down}"
+note_gpu_up() { rm -f "$DOWN_FILE"; }
+note_gpu_down() {
+  local n first
+  n=0; first="$TS"
+  if [ -f "$DOWN_FILE" ]; then
+    n="$(sed -n 1p "$DOWN_FILE" 2>/dev/null | tr -dc '0-9')"; n="${n:-0}"
+    first="$(sed -n 2p "$DOWN_FILE" 2>/dev/null)"; first="${first:-$TS}"
+  fi
+  n=$((n + 1))
+  printf '%s\n%s\n' "$n" "$first" >"$DOWN_FILE"
+  # Loud at the 3rd consecutive miss, then once every 6 after that, so a long outage keeps
+  # reappearing in the log instead of scrolling away behind identical one-liners.
+  # Banner to STDERR, count to STDOUT. The caller reads the count through a $(...) substitution,
+  # which would otherwise swallow the banner entirely -- the exact bug this block exists to prevent.
+  # Cron's `>> log 2>&1` puts stderr in the same log, so the banner still lands next to the tick.
+  if [ "$n" -ge 3 ] && { [ "$n" -eq 3 ] || [ $((n % 6)) -eq 0 ]; }; then
+    {
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+      echo "!! DSPARK EVAL DEGRADED: $n consecutive hourly ticks with NO GPU."
+      echo "!! Pinned box $GPU_LABEL unreachable since $first."
+      echo "!! Nothing has been measured, scored or auto-merged since then."
+      echo "!! Fix: point EVAL_SSH_HOST/EVAL_SSH_PORT in .env.eval at a live RTX 5090."
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    } >&2
+  fi
+  echo "$n"
+}
+
 if gpu_ready; then
+  note_gpu_up
   echo "[$TS] sparkinfer DSpark bot — pinned GPU $GPU_LABEL up — full eval (AUTOMERGE=${SPARKINFER_DSPARK_AUTOMERGE:-0})"
   python3 eval/pr_dspark_bot.py "${BOT_ARGS[@]}"
 else
-  echo "[$TS] sparkinfer DSpark bot — pinned GPU $GPU_LABEL down — labels only"
+  DOWN_N="$(note_gpu_down | tail -1)"
+  echo "[$TS] sparkinfer DSpark bot — pinned GPU $GPU_LABEL down (tick $DOWN_N) — labels only"
   python3 eval/pr_dspark_bot.py "${BOT_ARGS[@]}" --labels-only
 fi
