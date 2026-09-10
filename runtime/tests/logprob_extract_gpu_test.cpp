@@ -206,6 +206,60 @@ bool test_logsumexp_hand_computed() {
     return ok;
 }
 
+// Teacher-forced scoring (/v1/score) path: launch_extract_chosen_logit_id takes the token id as a
+// by-value kernel ARGUMENT rather than through a device buffer, and must agree exactly with the
+// device-buffer form for every id.
+//
+// Regression guard for #1001. token_logprob_for() used to stage the id with a cudaMemcpy on the
+// legacy default stream and then launch the kernel on Impl::stream (cudaStreamNonBlocking), which
+// does not serialize against it -- so the kernel could read the PREVIOUS call's id and return a
+// confident, wrong logprob while the argmax and top_logprobs (which come from the sort, not from
+// this lookup) stayed correct. The by-value form has no second stream to race against.
+//
+// The loop below is the part that matters: it scores a SEQUENCE of different ids back to back on
+// one non-blocking stream, exactly as scoring a completion does. Under the old pattern that is
+// the shape that lets iteration i observe iteration i-1's id; here every value must be exact.
+bool test_chosen_logit_by_value_matches_device_buffer_form() {
+    const int vocab = 4096;
+    std::vector<float> logits(vocab);
+    for (int i = 0; i < vocab; i++) logits[i] = std::sin((float)i * 0.37f) * 40.0f;
+
+    Scratch s(vocab);
+    // Populate the sort/rank scratch once, the way a forward pass leaves it.
+    auto r = run_pipeline(s, logits, /*chosen_id=*/0);
+
+    cudaStream_t st = nullptr;
+    cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+
+    bool ok = true;
+    int checked = 0;
+    // Walk a run of distinct ids back to back, no sync between the id changing and the launch --
+    // the exact call shape /v1/score produces, one lookup per completion token.
+    for (int id = 1; id < vocab; id += 7) {
+        float got = 0.f;
+        sparkinfer::kernels::launch_extract_chosen_logit_id(id, s.rank_by_id, s.sorted_logits,
+                                                            s.chosen_logit, st);
+        cudaStreamSynchronize(st);
+        cudaMemcpy(&got, s.chosen_logit, sizeof(float), cudaMemcpyDeviceToHost);
+
+        const float want = r.sorted_logits[r.rank_by_id[id]];
+        if (got != want) {
+            printf("FAIL: by-value id=%d got %.6f, expected %.6f (rank %d)%s\n",
+                   id, got, want, r.rank_by_id[id],
+                   /* the signature of the old race: we saw the PREVIOUS id's logit */
+                   (id >= 8 && got == r.sorted_logits[r.rank_by_id[id - 7]]) ? "  <-- PREVIOUS id"
+                                                                            : "");
+            ok = false;
+            break;
+        }
+        checked++;
+    }
+    cudaStreamDestroy(st);
+    if (ok) printf("[OK] by-value chosen-logit matches the sorted/rank reference for %d "
+                   "back-to-back ids\n", checked);
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -220,6 +274,7 @@ int main() {
     ok = test_chosen_logit_matches_rank0_at_greedy() && ok;
     ok = test_chosen_logit_matches_arbitrary_nonzero_rank() && ok;
     ok = test_logsumexp_hand_computed() && ok;
+    ok = test_chosen_logit_by_value_matches_device_buffer_form() && ok;
     if (!ok) return 1;
     printf("logprob_extract_gpu_test: OK\n");
     return 0;
