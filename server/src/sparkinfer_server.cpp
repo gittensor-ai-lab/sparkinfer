@@ -2618,7 +2618,6 @@ int main(int argc, char** argv) {
         if (m.publisher.empty()) m.publisher = "sparkinfer";
         m.arch = engine.is_qwen38()      ? "qwen3_8"
                : engine.is_museglimmer() ? "muse-glimmer"
-               : engine.is_spark25()     ? "spark2_5"
                                          : "qwen3_6";
         // LM Studio's vocabulary for this field is gguf|mlx only. A compressed-tensors directory
         // is neither, and inventing a third value would break a client that switches on it, so
@@ -2779,7 +2778,6 @@ int main(int argc, char** argv) {
         m.digest = oll::synthetic_digest(path + "|" + std::to_string(m.size) + "|" + m.modified_at);
         m.details.family = engine.is_qwen38()      ? "qwen3_8"
                          : engine.is_museglimmer() ? "muse-glimmer"
-                         : engine.is_spark25()     ? "spark2_5"
                                                    : "qwen3_6";
         m.details.families = {m.details.family};
         m.details.parameter_size = "";
