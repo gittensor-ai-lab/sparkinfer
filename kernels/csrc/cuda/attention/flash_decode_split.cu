@@ -906,6 +906,14 @@ template __global__ void fa_combine_gated_q8_kernel<256, FA_COMBINE_DG, 16>(
 template <int HEAD_DIM, int GQA> struct fa_mma_block_threads { static constexpr int v = GQA * 32; };
 template <> struct fa_mma_block_threads<256, 4> { static constexpr int v = 256; };
 template <> struct fa_mma_block_threads<256, 6> { static constexpr int v = 256; };
+// The 16:1 group (Muse Glimmer) also pins 8 warps. The block width here is NOT the q-head count:
+// every loop below is written for exactly 8 warps -- Q quantize gives each warp rows 2w and 2w+1
+// to cover the wmma's 16 M rows, the KV loop walks 8 physical blocks per pass with one warp each
+// (s_ks/s_vs are sized [128] = 8*16 for that), and the PV store lays 8 warps across a 128-wide
+// slab. GQA*32 would be 16 warps and would run all three off the end of those buffers. Taking 256
+// also keeps __launch_bounds__(.., 5) legal: 5*256 = 1280 threads/SM against the 2048 limit, where
+// 5*512 = 2560 is what kept this group off the tensor cores.
+template <> struct fa_mma_block_threads<128, 16> { static constexpr int v = 256; };
 
 // Tensor-core (wmma int8) GQA flash-decode split for long context. The 8 GQA q-heads of a kv-head are
 // the batch (M) dim, so S = Q·Kᵀ and O = P·V become small matmuls on the tensor cores, replacing the
@@ -1095,6 +1103,15 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_
 }
 #ifndef _MSC_VER
 template __global__ void fa_split_gqa_mma_i8_kernel<128, 8>(const __nv_bfloat16*, const signed char*,
+    const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
+    const __half*, const __half*);
+#endif
+// Muse Glimmer's 16:1 group. This is the one shape where the wmma M tile is FULLY live: the kernel
+// pads M to 16 regardless, so GQA=8 spends half of every QK/PV mma on padding rows that are then
+// discarded, while GQA=16 fills all sixteen with real q-heads. Same 8 warps and the same KV walk,
+// so the 436 MB the 13 global layers read at 64k is read once for twice the useful work.
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_mma_i8_kernel<128, 16>(const __nv_bfloat16*, const signed char*,
     const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
     const __half*, const __half*);
 #endif
@@ -1659,25 +1676,49 @@ void launch_flash_decode_split(
     // 16:1 GQA (Muse Glimmer, 32Q/2KV). Same shared-KV tile as the 8:1 branch below: one block per
     // (kv_head, split) stages the K/V tile once and all GQA warps reuse it, instead of one block per
     // q-head each re-reading it. Warp count doubles to 16 (512 threads) and the tile smem is
-    // unchanged, so the block is wider but reads 16x less KV. The int8 MMA sub-branch is NOT taken
-    // here: its __launch_bounds__ asks for 5 blocks/SM, which at 512 threads would demand 2560
-    // threads per SM against a 2048 limit. SPARKINFER_FAGQA16=0 restores the per-q-head kernel.
+    // unchanged, so the block is wider but reads 16x less KV. SPARKINFER_FAGQA16=0 restores the
+    // per-q-head kernel.
+    //
+    // The int8 MMA sub-branch WAS unreachable here, for an occupancy reason rather than a
+    // correctness one: __launch_bounds__(GQA*32, 5) at 512 threads asks for 2560 threads/SM against
+    // a 2048 limit. But GQA is the wmma M dim, not the block width -- the kernel is written for 8
+    // warps at any GQA (hd256 already pins 256 threads at GQA 4 and 6 for the same reason), so
+    // fa_mma_block_threads<128,16> takes 256 and 5*256 = 1280 fits. SPARKINFER_FAGQA16_MMA=0 keeps
+    // the tile kernel for a same-binary A/B.
     static int fagqa16 = -1;
     if (fagqa16 < 0) { const char* e = getenv("SPARKINFER_FAGQA16"); fagqa16 = (e && e[0] == '0') ? 0 : 1; }
+    static int fagqa16_mma = -1;
+    if (fagqa16_mma < 0) { const char* e = getenv("SPARKINFER_FAGQA16_MMA"); fagqa16_mma = (e && e[0] == '0') ? 0 : 1; }
     if (use_gqa && fagqa16 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 16) {
         constexpr int GQA = 16, TILE = FA_GQA_TILE;
+        constexpr int MMA_THREADS = fa_mma_block_threads<128, GQA>::v;
         dim3 gq(num_kv_heads * n_splits, num_seqs);
-        const size_t smem = (size_t)2 * TILE * 128 * sizeof(__nv_bfloat16);
-        if (int8_kv)
-            fa_split_gqa_kernel<128, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+        if (mma_aligned && int8_kv && fagqa16_mma) {
+            // Same tensor-core split the 8:1 group takes, on 8 warps (see fa_mma_block_threads
+            // <128,16>). The tile kernel above already reads each KV byte once per group; what this
+            // adds is the QK/PV dot on the int8 tensor cores instead of per-lane FMA plus the
+            // 5-shuffle reduction, and at 16:1 it does that with no wasted M rows.
+            const size_t i8_smem = (size_t)2 * 16 * 128 * sizeof(signed char)
+                                 + (size_t)(16 + GQA) * 128 * sizeof(float)   // s_s[16][HD] + s_o[GQA][HD]
+                                 + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
+            fa_split_gqa_mma_i8_kernel<128, GQA><<<gq, MMA_THREADS, i8_smem, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+                reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
                 part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
                 ksc, vsc);
-        else
-            fa_split_gqa_kernel<128, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
-                part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-                ksc, vsc);
+        } else {
+            const size_t smem = (size_t)2 * TILE * 128 * sizeof(__nv_bfloat16);
+            if (int8_kv)
+                fa_split_gqa_kernel<128, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                    ksc, vsc);
+            else
+                fa_split_gqa_kernel<128, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                    ksc, vsc);
+        }
         if (cudaPeekAtLastError() != cudaSuccess) goto fa_gqa16_fallthrough;
         if (gate128)
             fa_launch_combine_gated_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
