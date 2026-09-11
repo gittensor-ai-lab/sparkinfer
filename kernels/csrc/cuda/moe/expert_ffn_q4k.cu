@@ -1834,12 +1834,22 @@ static inline bool launch_down_q6k_mmvq_splitk(
 // Row-batched counterpart of launch_down_q4k_mmvq_splitk. Only the generic (non shape-specialized)
 // split-K kernel has a rows form, so this declines anything it does not cover and the caller falls
 // back to the per-token grid.
+// Widest chunk the row-batched down projection is instantiated for. Thirty-two, because the
+// packed scheduler hands up to kQwen35MaxPackedRows rows and every extra chunk is another full
+// pass over ffn_down's 3.9 GB -- at 32 rows, eight-row chunks read it four times.
+// Widths above sixteen exist only at S == 2: the split-K narrowing above pins S to 2 for every
+// packed width >= 5, so nothing else can reach them.
+static constexpr int kDownRowsMax = 32;
+
+static inline bool launch_down_rows_wide_ok(int S, int M) { return S == 2 || M <= 16; }
+
 static inline bool launch_down_q4k_mmvq_splitk_rows(
     int S, int M, int pdl, dim3 grid, const unsigned char* down_q, const int* expert_ids,
     const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
     int H, int F, int top_k, cudaStream_t stream
 ) {
-    if (M < 2 || M > 8) return false;
+    if (M < 2 || M > kDownRowsMax) return false;
+    if (!launch_down_rows_wide_ok(S, M)) return false;
     const dim3 block(WPB * 32);
 #define SI_DOWN_ROWS(S_, M_) do { \
         launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_rows_kernel<S_, M_>, \
@@ -1848,15 +1858,34 @@ static inline bool launch_down_q4k_mmvq_splitk_rows(
     } while (0)
 #define SI_DOWN_ROWS_M(S_) do { \
         switch (M) { \
-            case 2: SI_DOWN_ROWS(S_, 2); case 3: SI_DOWN_ROWS(S_, 3); \
-            case 4: SI_DOWN_ROWS(S_, 4); case 5: SI_DOWN_ROWS(S_, 5); \
-            case 6: SI_DOWN_ROWS(S_, 6); case 7: SI_DOWN_ROWS(S_, 7); \
-            default: SI_DOWN_ROWS(S_, 8); \
+            case 2:  SI_DOWN_ROWS(S_, 2);  case 3:  SI_DOWN_ROWS(S_, 3); \
+            case 4:  SI_DOWN_ROWS(S_, 4);  case 5:  SI_DOWN_ROWS(S_, 5); \
+            case 6:  SI_DOWN_ROWS(S_, 6);  case 7:  SI_DOWN_ROWS(S_, 7); \
+            case 8:  SI_DOWN_ROWS(S_, 8);  case 9:  SI_DOWN_ROWS(S_, 9); \
+            case 10: SI_DOWN_ROWS(S_, 10); case 11: SI_DOWN_ROWS(S_, 11); \
+            case 12: SI_DOWN_ROWS(S_, 12); case 13: SI_DOWN_ROWS(S_, 13); \
+            case 14: SI_DOWN_ROWS(S_, 14); default: SI_DOWN_ROWS(S_, 15); \
         } \
     } while (0)
+#define SI_DOWN_ROWS_WIDE do { \
+        switch (M) { \
+            case 16: SI_DOWN_ROWS(2, 16); case 17: SI_DOWN_ROWS(2, 17); \
+            case 18: SI_DOWN_ROWS(2, 18); case 19: SI_DOWN_ROWS(2, 19); \
+            case 20: SI_DOWN_ROWS(2, 20); case 21: SI_DOWN_ROWS(2, 21); \
+            case 22: SI_DOWN_ROWS(2, 22); case 23: SI_DOWN_ROWS(2, 23); \
+            case 24: SI_DOWN_ROWS(2, 24); case 25: SI_DOWN_ROWS(2, 25); \
+            case 26: SI_DOWN_ROWS(2, 26); case 27: SI_DOWN_ROWS(2, 27); \
+            case 28: SI_DOWN_ROWS(2, 28); case 29: SI_DOWN_ROWS(2, 29); \
+            case 30: SI_DOWN_ROWS(2, 30); case 31: SI_DOWN_ROWS(2, 31); \
+            default: SI_DOWN_ROWS(2, 32); \
+        } \
+    } while (0)
+    if (S == 2 && M >= 16) SI_DOWN_ROWS_WIDE;
+    if (M > 15) return false;
     if (S == 2)      SI_DOWN_ROWS_M(2);
     else if (S == 4) SI_DOWN_ROWS_M(4);
     else if (S == 8) SI_DOWN_ROWS_M(8);
+#undef SI_DOWN_ROWS_WIDE
 #undef SI_DOWN_ROWS_M
 #undef SI_DOWN_ROWS
     return false;
@@ -2371,7 +2400,16 @@ void launch_moe_expert_ffn_q4k(
             // A one-row tail has no instantiation (the launcher declines M < 2), so when the
             // remainder would be 1 the preceding chunk gives up a row and the tail runs as 2.
             if (down_rows && num_tokens >= 2 && top_k == 1) {
-                constexpr int DMAX = 8;
+                // One pass over ffn_down per chunk, so the chunk width IS the number of times
+                // a packed step re-reads 3.9 GB. Eight was the widest instantiation; the arm now
+                // reaches thirty-two, which is kQwen35MaxPackedRows.
+                // SPARKINFER_DOWN_ROWS_CHUNK=8 reproduces the previous behaviour exactly.
+                static const int DMAX = [] {
+                    const char* e = getenv("SPARKINFER_DOWN_ROWS_CHUNK");
+                    int v = e ? atoi(e) : kDownRowsMax;
+                    if (v < 2) v = 2;
+                    return v > kDownRowsMax ? kDownRowsMax : v;
+                }();
                 dim3 dnr(1, (hidden + RPB - 1) / RPB);
                 const size_t q8pb = (size_t)(ffn >> 5);
                 bool rows_ok = true;
