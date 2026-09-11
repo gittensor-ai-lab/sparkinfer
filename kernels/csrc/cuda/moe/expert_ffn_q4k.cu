@@ -2328,7 +2328,30 @@ void launch_moe_expert_ffn_q4k(
         const int q_pdl = gu_pdl && pdl;
         launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
             quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
-        const int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
+        int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
+        // The split-K factor was fitted at ONE row, where splitting hides a bs=1 occupancy stall.
+        // A packed batch already gives every block M rows of work, so the extra splits buy
+        // parallelism that is no longer scarce and pay a wider cross-warp reduction for it.
+        // Measured on Muse Glimmer's 6656x19968 FFN: at c8/c16 S=2 costs 4.3-4.8% LESS step time
+        // than the fitted 8, at c2/c4 it is neutral, and at ONE row it is a ~1.1% regression on
+        // every scored single-stream axis. So this narrows S only above the width where it
+        // measured better, and leaves single-request decode on exactly the S it has today.
+        // Scoped to this shape because that is the one the sweep covers.
+        // SPARKINFER_DOWN_SPLITK_WIDE_ROWS / _WIDE_S expose both for an A/B out of one binary;
+        // setting WIDE_ROWS above the packed cap reproduces the previous behaviour exactly.
+        if (hidden == 6656 && ffn == 19968 && top_k == 1) {
+            static const int wide_rows = [] {
+                const char* e = getenv("SPARKINFER_DOWN_SPLITK_WIDE_ROWS");
+                const int v = e ? atoi(e) : 5;
+                return v < 2 ? 2 : v;
+            }();
+            static const int wide_s = [] {
+                const char* e = getenv("SPARKINFER_DOWN_SPLITK_WIDE_S");
+                const int v = e ? atoi(e) : 2;
+                return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 2;
+            }();
+            if (num_tokens >= wide_rows && S > wide_s) S = wide_s;
+        }
         if (S > 1) {
             const int RPB = WPB / S;
             // Multi-token callers walk hidden once instead of num_tokens*hidden, reading the down
