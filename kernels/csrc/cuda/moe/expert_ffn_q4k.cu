@@ -686,6 +686,79 @@ __device__ __forceinline__ void si_vec_dot_q3_A_rows(
     }
 }
 
+// Gate and up are dotted against the SAME activation super-block at the same iqs -- the caller
+// drives both with one `vy + kbx * 8` -- but as two separate inlined calls of the helper above
+// nothing shares that side of the work. In the SASS for MMAX=4 that costs 48 activation LDG per
+// row where 24 cover it, 32 I2FP and 16 HADD2 re-converting the same `d8`, and a second copy of
+// `dot2` -- the sub-block's plain activation sum, which contains no weight at all and is therefore
+// bit-for-bit the same number for gate and for up.
+//
+// Taking both weight blocks in one pass reads the activation once, converts d8 once and computes
+// dot2 once, while each accumulator still gets its own dm.x*sumf_d - dm.y*sumf_m built from the
+// same per-i terms in the same i order as before. Removing a redundant load and a redundant copy
+// of an identical integer dot changes no value, so this is bit-identical to the pair it replaces.
+template <int MMAX>
+__device__ __forceinline__ void si_vec_dot_q3_A_rows2(
+    const si_block_q3_A* __restrict__ bg, const si_block_q3_A* __restrict__ bu,
+    const si_block_q8_1* __restrict__ bq8_1,
+    int row_blocks, int iqs, int M, float* __restrict__ accg, float* __restrict__ accu)
+{
+    const int L = iqs >> 1;
+    const int j = L >> 2, m4 = L & 3;
+
+    // ---- weight side: the same unpack as si_vec_dot_q3_A_rows, once per matrix ----
+    int v[2][2][2];                       // [matrix][i][half]
+    unsigned short aux[2][2];
+    float2 dm[2];
+    #pragma unroll
+    for (int t = 0; t < 2; t++) {
+        const si_block_q3_A* b = t ? bu : bg;
+        const int vl  = *(const int*)(b->qs + 16 * j + 4 * m4);
+        const int hlo = *(const int*)(b->qh + 8 * m4);
+        const int hhi = *(const int*)(b->qh + 8 * m4 + 4);
+        const unsigned short* scales = (const unsigned short*)b->scales;
+        if (j < 2) { aux[t][0] = scales[j] & 0x3f3f; aux[t][1] = scales[j + 2] & 0x3f3f; }
+        else { aux[t][0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+               aux[t][1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2); }
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int sb = 2 * j + i;
+            v[t][i][0] = ((vl >> (2 * i))     & 0x03030303) | (((hlo >> sb) & 0x01010101) << 2);
+            v[t][i][1] = ((vl >> (2 * i + 4)) & 0x03030303) | (((hhi >> sb) & 0x01010101) << 2);
+        }
+        dm[t] = __half22float2(b->dm);
+    }
+    const unsigned char* scg = (const unsigned char*)aux[0]; const unsigned char* mng = scg + 2;
+    const unsigned char* scu = (const unsigned char*)aux[1]; const unsigned char* mnu = scu + 2;
+
+    #pragma unroll
+    for (int r = 0; r < MMAX; r++) {
+        if (r >= M) break;
+        const si_block_q8_1* base = bq8_1 + (size_t)r * row_blocks;
+        float gd = 0.f, gm = 0.f, ud = 0.f, um = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const si_block_q8_1* bq8i = base + 2 * j + i;
+            const float d8 = __low2float(bq8i->ds);
+            const int* q8 = (const int*)bq8i->qs;
+            const int u0 = q8[2 * m4], u1 = q8[2 * m4 + 1];
+            // activation-only, so gate and up share it verbatim
+            const int dot2 = __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0));
+            const int dotg = __dp4a(v[0][i][0], u0, __dp4a(v[0][i][1], u1, 0));
+            const int dotu = __dp4a(v[1][i][0], u0, __dp4a(v[1][i][1], u1, 0));
+            gd += d8 * (dotg * scg[i]); gm += d8 * (dot2 * mng[i]);
+            ud += d8 * (dotu * scu[i]); um += d8 * (dot2 * mnu[i]);
+        }
+        // Materialized before the add for the same reason the one-matrix helper does it: folding
+        // the accumulator in lets the compiler contract `acc + dm.x*sumf_d` into an FMA and round
+        // the pair differently.
+        const float pg = dm[0].x * gd - dm[0].y * gm;
+        const float pu = dm[1].x * ud - dm[1].y * um;
+        accg[r] += pg;
+        accu[r] += pu;
+    }
+}
+
 // One CTA per output row, weights read as Q3_A. Same tiling, same accumulation order and same
 // 4-warp reduction as gate_up_mmvq2_kernel below -- only the block format differs.
 __global__ void gate_up_q3a_kernel(
@@ -764,7 +837,7 @@ template <int H, int F, int MMAX>
 __global__ void gate_up_q3a_muse_rows_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
-    float* __restrict__ h_scratch, int M, int pdl
+    float* __restrict__ h_scratch, int M, int pdl, int gu2
 ) {
     constexpr int NW = 4, NB = H >> 8, RB = H >> 5;
     const int f = blockIdx.x;
@@ -776,10 +849,17 @@ __global__ void gate_up_q3a_muse_rows_kernel(
     float tg[MMAX], tu[MMAX];
     #pragma unroll
     for (int r = 0; r < MMAX; r++) { tg[r] = 0.f; tu[r] = 0.f; }
-    #pragma unroll
-    for (int kbx = kbx0; kbx < NB; kbx += 8) {
-        si_vec_dot_q3_A_rows<MMAX>(g_row + kbx, vy + (size_t)kbx * 8, RB, kqs, M, tg);
-        si_vec_dot_q3_A_rows<MMAX>(u_row + kbx, vy + (size_t)kbx * 8, RB, kqs, M, tu);
+    if (gu2) {
+        #pragma unroll
+        for (int kbx = kbx0; kbx < NB; kbx += 8)
+            si_vec_dot_q3_A_rows2<MMAX>(g_row + kbx, u_row + kbx, vy + (size_t)kbx * 8,
+                                        RB, kqs, M, tg, tu);
+    } else {
+        #pragma unroll
+        for (int kbx = kbx0; kbx < NB; kbx += 8) {
+            si_vec_dot_q3_A_rows<MMAX>(g_row + kbx, vy + (size_t)kbx * 8, RB, kqs, M, tg);
+            si_vec_dot_q3_A_rows<MMAX>(u_row + kbx, vy + (size_t)kbx * 8, RB, kqs, M, tu);
+        }
     }
     __shared__ float sg[MMAX][NW - 1][32], su[MMAX][NW - 1][32];
     if (warp > 0) {
@@ -2583,6 +2663,14 @@ void launch_moe_expert_ffn_q4k(
                 // Chunked at the register width the multi-row body carries. Wider than 8 rows the
                 // per-row accumulators start to spill, and 8 already turns the per-token weight
                 // stream into one pass for a batch that size.
+                //
+                // SPARKINFER_MUSE_Q3A_GU2=0 restores the two-pass gate/up dot, so both arms of
+                // an A/B come out of ONE binary.
+                static int q3_gu2 = -1;
+                if (q3_gu2 < 0) {
+                    const char* e = getenv("SPARKINFER_MUSE_Q3A_GU2");
+                    q3_gu2 = (e && e[0] == '0') ? 0 : 1;
+                }
                 constexpr int MMAX = 8;
                 for (int t0 = 0; t0 < num_tokens; t0 += MMAX) {
                     const int m = (num_tokens - t0) < MMAX ? (num_tokens - t0) : MMAX;
@@ -2591,7 +2679,7 @@ void launch_moe_expert_ffn_q4k(
                         q + (size_t)t0 * (6656 >> 5),
                         reinterpret_cast<const unsigned char*>(gate_q),
                         reinterpret_cast<const unsigned char*>(up_q), expert_ids,
-                        h_scratch + (size_t)t0 * 19968, m, gu_pdl);
+                        h_scratch + (size_t)t0 * 19968, m, gu_pdl, q3_gu2);
                 }
             } else
                 launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream, gate_up_q3a_kernel,
