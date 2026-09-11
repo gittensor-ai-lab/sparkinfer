@@ -13,3 +13,11 @@ if(BUILD_NVFP4_KERNELS)
   add_test(NAME prefill_nvfp4_gpu_test COMMAND prefill_nvfp4_gpu_test)
   set_tests_properties(prefill_nvfp4_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+# The row-batched dense gate/up kernels against the per-token kernels they replace: same rows, same
+# bits. Needs a GPU and ~350 MB of it for Muse Glimmer's real 6656x19968 FFN, which is the shape
+# the kernels are specialised on and so the only shape that exercises them.
+add_executable(gate_up_rows_gpu_test gate_up_rows_gpu_test.cpp)
+target_link_libraries(gate_up_rows_gpu_test PRIVATE ${SPARKINFER_KERNEL_LIBS} CUDA::cudart)
+add_test(NAME gate_up_rows_gpu_test COMMAND gate_up_rows_gpu_test)
+set_tests_properties(gate_up_rows_gpu_test PROPERTIES SKIP_RETURN_CODE 77)

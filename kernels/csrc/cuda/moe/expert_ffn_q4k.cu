@@ -628,6 +628,61 @@ __device__ __forceinline__ float si_vec_dot_q3_A(const si_block_q3_A* bq3, const
     return dm3f.x * sumf_d - dm3f.y * sumf_m;
 }
 
+// Everything si_vec_dot_q3_A derives from the WEIGHT alone, hoisted so a row-batched kernel can
+// decode a super-block once and dot it against every row -- the Q3_A twin of si_q4k_wdec above.
+// The two 2-bit planes are already merged with their qh high bit here, because that merge reads
+// only the weight; what stays behind is the activation load and the two dp4a pairs.
+//
+// si_vec_dot_q3_A_pre(si_q3a_decode_w(b, iqs), a, iqs) is the same expressions in the same order
+// as si_vec_dot_q3_A(b, a, iqs) -- same v0/v1 construction, same dp4a nesting, same
+// sumf_d/sumf_m accumulation, same final d*sumf_d - dmin*sumf_m -- so it is bit-identical, which
+// is what lets a packed batch share the read without changing any row's output.
+struct si_q3a_wdec { int v0[2], v1[2]; unsigned char sc[2], mn[2]; float d, dmin; };
+
+__device__ __forceinline__ si_q3a_wdec si_q3a_decode_w(const si_block_q3_A* bq3, int iqs) {
+    si_q3a_wdec w;
+    const int L = iqs >> 1;
+    const int j = L >> 2, m = L & 3;
+    const int vl  = *(const int*)(bq3->qs + 16 * j + 4 * m);
+    const int hlo = *(const int*)(bq3->qh + 8 * m);
+    const int hhi = *(const int*)(bq3->qh + 8 * m + 4);
+    const unsigned short* scales = (const unsigned short*)bq3->scales;
+    unsigned short aux[2];
+    if (j < 2) { aux[0] = scales[j] & 0x3f3f; aux[1] = scales[j + 2] & 0x3f3f; }
+    else { aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+           aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2); }
+    const unsigned char* sc = (const unsigned char*)aux; const unsigned char* mn = sc + 2;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int s = 2 * j + i;                             // sub-block == q8_1 block index
+        w.v0[i] = ((vl >> (2 * i))     & 0x03030303) | (((hlo >> s) & 0x01010101) << 2);
+        w.v1[i] = ((vl >> (2 * i + 4)) & 0x03030303) | (((hhi >> s) & 0x01010101) << 2);
+        w.sc[i] = sc[i]; w.mn[i] = mn[i];
+    }
+    const float2 dm3f = __half22float2(bq3->dm);
+    w.d = dm3f.x; w.dmin = dm3f.y;
+    return w;
+}
+
+__device__ __forceinline__ float si_vec_dot_q3_A_pre(const si_q3a_wdec& w,
+                                                     const si_block_q8_1* bq8_1, int iqs) {
+    const int L = iqs >> 1;
+    const int j = L >> 2, m = L & 3;
+    float sumf_d = 0.f, sumf_m = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const si_block_q8_1* bq8i = bq8_1 + 2 * j + i;
+        const float d8 = __low2float(bq8i->ds);
+        const int* q8 = (const int*)bq8i->qs;
+        const int u0 = q8[2 * m], u1 = q8[2 * m + 1];
+        const int dot1 = __dp4a(w.v0[i], u0, __dp4a(w.v1[i], u1, 0));
+        const int dot2 = __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0));
+        sumf_d += d8 * (dot1 * w.sc[i]);
+        sumf_m += d8 * (dot2 * w.mn[i]);
+    }
+    return w.d * sumf_d - w.dmin * sumf_m;
+}
+
 // One CTA per output row, weights read as Q3_A. Same tiling, same accumulation order and same
 // 4-warp reduction as gate_up_mmvq2_kernel below -- only the block format differs.
 __global__ void gate_up_q3a_kernel(
@@ -689,6 +744,90 @@ __global__ void gate_up_q3a_muse_kernel(
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
+}
+
+// Widest batch the row-batched gate/up is instantiated for. Sixteen, not the eight the 5120x17408
+// arm and the down projection stop at, because the continuous-batch scheduler hands this forward
+// its whole live set: at concurrency 16 it hands sixteen rows, and an arm that stops at eight
+// simply declines and leaves that width reading gate/up once per token. Above it the per-token
+// grid still runs, as it does today.
+static constexpr int kGuRowsMax = 16;
+
+// Row-batched Q3_A gate/up: the Q3_A twin of gate_up_mmvq2_qwen_rows_kernel, and the reason it
+// exists is the same one. gate_up_q3a_kernel above is launched over num_tokens*TOPK*F blocks, so
+// a packed continuous-batch step pulled Muse Glimmer's gate and up out of DRAM once PER ROW --
+// and on this model those two matrices are the single largest thing decode reads. Here the token
+// index moves into the kernel and kbx stays the outer loop, so each super-block is decoded once
+// and dotted against all M rows while it is still in registers.
+//
+// Per-row arithmetic is untouched: same kbx traversal, same kqs, same si_vec_dot_q3_A expressions
+// via si_q3a_decode_w/si_vec_dot_q3_A_pre, same 4-warp shared reduce and the same ordered warp
+// reduce, so every output is bit-identical to the per-token launch it replaces.
+template <int H, int F, int M>
+__global__ void gate_up_q3a_rows_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int pdl
+) {
+    constexpr int NW = 4, WS = 32, NB = H >> 8;
+    const int f = blockIdx.x;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4, kqs = 2 * (tid & 15);
+    float tg[M], tu[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) { tg[r] = 0.f; tu[r] = 0.f; }
+    // Muse Glimmer's FFN is dense -- one expert, every row on it -- so the shared decode is the
+    // path that runs. The per-row branch is kept for the same reason the Q4_K rows kernel keeps
+    // it: a top_k==1 MoE whose rows genuinely differ stays correct, it simply has nothing to reuse.
+    const int e0 = expert_ids[0];
+    bool uniform = true;
+#pragma unroll
+    for (int r = 1; r < M; ++r) uniform &= (expert_ids[r] == e0);
+    if (uniform) {
+        const si_block_q3_A* g_row = (const si_block_q3_A*)(gate_q + ((size_t)e0 * F + f) * NB * 112);
+        const si_block_q3_A* u_row = (const si_block_q3_A*)(up_q   + ((size_t)e0 * F + f) * NB * 112);
+        for (int kbx = kbx0; kbx < NB; kbx += 8) {
+            const si_q3a_wdec gw = si_q3a_decode_w(g_row + kbx, kqs);
+            const si_q3a_wdec uw = si_q3a_decode_w(u_row + kbx, kqs);
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const si_block_q8_1* v = vy + (size_t)r * (H >> 5) + (size_t)kbx * 8;
+                tg[r] += si_vec_dot_q3_A_pre(gw, v, kqs);
+                tu[r] += si_vec_dot_q3_A_pre(uw, v, kqs);
+            }
+        }
+    } else {
+        for (int kbx = kbx0; kbx < NB; kbx += 8) {
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const int e = expert_ids[r];
+                const si_block_q3_A* g = (const si_block_q3_A*)(gate_q + ((size_t)e * F + f) * NB * 112);
+                const si_block_q3_A* u = (const si_block_q3_A*)(up_q   + ((size_t)e * F + f) * NB * 112);
+                const si_block_q8_1* v = vy + (size_t)r * (H >> 5) + (size_t)kbx * 8;
+                tg[r] += si_vec_dot_q3_A(g + kbx, v, kqs);
+                tu[r] += si_vec_dot_q3_A(u + kbx, v, kqs);
+            }
+        }
+    }
+    __shared__ float sg[M][NW - 1][WS], su[M][NW - 1][WS];
+    if (warp > 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) { sg[r][warp - 1][lane] = tg[r]; su[r][warp - 1][lane] = tu[r]; }
+    }
+    __syncthreads();
+    if (warp > 0) return;
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+#pragma unroll
+        for (int l = 0; l < NW - 1; l++) { tg[r] += sg[r][l][lane]; tu[r] += su[r][l][lane]; }
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            tg[r] += __shfl_xor_sync(0xffffffff, tg[r], m);
+            tu[r] += __shfl_xor_sync(0xffffffff, tu[r], m);
+        }
+        if (lane == 0) h_scratch[(size_t)r * F + f] = q4kf_silu(tg[r]) * tu[r];
+    }
     if (pdl) si_pdl_lc();
 }
 
@@ -2012,13 +2151,34 @@ void launch_moe_expert_ffn_q4k(
         if (gate_type == SI_QTYPE_Q3A) {
             static int q3_spec = -1;
             if (q3_spec < 0) { const char* e = getenv("SPARKINFER_MUSE_Q3A_SPEC"); q3_spec = (e && e[0] == '0') ? 0 : 1; }
+            // Multi-row callers (a packed continuous-batch decode step) take the row-batched
+            // kernel, which walks F once instead of num_tokens*F and so reads gate/up from DRAM
+            // once instead of once per token. Bit-identical per row; see the kernel.
+            // SPARKINFER_GU_ROWS=0 restores the per-token grid.
+            static int q3_rows = -1;
+            if (q3_rows < 0) { const char* e = getenv("SPARKINFER_GU_ROWS"); q3_rows = (e && e[0] == '0') ? 0 : 1; }
+#define SI_GU_Q3A_ROWS(MM) launch_pdl_kernel(gu_pdl, dim3(ffn), dim3(4 * 32), 0, stream, \
+                gate_up_q3a_rows_kernel<6656, 19968, MM>, \
+                q, reinterpret_cast<const unsigned char*>(gate_q), \
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl)
             if (q3_spec && num_tokens == 1 && top_k == 1 && hidden == 6656 && ffn == 19968)
                 launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream, gate_up_q3a_muse_kernel<6656, 19968>,
                     q, reinterpret_cast<const unsigned char*>(gate_q), reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+            else if (q3_rows && top_k == 1 && hidden == 6656 && ffn == 19968 &&
+                     num_tokens >= 2 && num_tokens <= kGuRowsMax) {
+                switch (num_tokens) {
+                    case 2: SI_GU_Q3A_ROWS(2); break; case 3: SI_GU_Q3A_ROWS(3); break; case 4: SI_GU_Q3A_ROWS(4); break; case 5: SI_GU_Q3A_ROWS(5); break;
+                    case 6: SI_GU_Q3A_ROWS(6); break; case 7: SI_GU_Q3A_ROWS(7); break; case 8: SI_GU_Q3A_ROWS(8); break; case 9: SI_GU_Q3A_ROWS(9); break;
+                    case 10: SI_GU_Q3A_ROWS(10); break; case 11: SI_GU_Q3A_ROWS(11); break; case 12: SI_GU_Q3A_ROWS(12); break; case 13: SI_GU_Q3A_ROWS(13); break;
+                    case 14: SI_GU_Q3A_ROWS(14); break; case 15: SI_GU_Q3A_ROWS(15); break;
+                    default: SI_GU_Q3A_ROWS(16); break;
+                }
+            }
             else
                 launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream, gate_up_q3a_kernel,
                     q, reinterpret_cast<const unsigned char*>(gate_q), reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
                     hidden, ffn, top_k, gu_pdl);
+#undef SI_GU_Q3A_ROWS
         } else if (num_tokens > 1 && gu_warps > 0 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8) {
             const int n_rows = num_tokens * top_k * ffn;
             launch_gate_up_warp_qwen<2048, 512, 8>(gu_warps, gu_pdl, n_rows, stream,
@@ -2075,16 +2235,37 @@ void launch_moe_expert_ffn_q4k(
         // on a 5090 at 128 decode, a pack2 arm for this shape gives back about four fifths of
         // what this arm wins, so it is deliberately absent rather than merely unwritten.
         else if (gu_spec && hidden == 6656 && ffn == 19968 && top_k == 1) {
+            // Same row-batching as the 5120x17408 arm below, for the Q4_K layers Muse Glimmer's
+            // Q3_A calibration left native. A packed step reads gate/up once for the whole batch
+            // instead of once per token; bit-identical per row. The contextual-sparsity arm keeps
+            // the per-token grid -- its whole point is a per-TOKEN decision about which up rows to
+            // read, so there is no shared read to hoist.
+            static int gu_rows_mg = -1;
+            if (gu_rows_mg < 0) { const char* e = getenv("SPARKINFER_GU_ROWS"); gu_rows_mg = (e && e[0] == '0') ? 0 : 1; }
+#define SI_GU_ROWS_MG(MM) launch_pdl_kernel(gu_pdl, dim3(ffn), dim3(4 * 32), 0, stream, \
+                gate_up_mmvq2_qwen_rows_kernel<6656, 19968, 1, MM>, \
+                q, reinterpret_cast<const unsigned char*>(gate_q), \
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl)
             if (g_mg_sparse_tau > 0.f)   // Muse Glimmer contextual-sparsity FFN (skip gated-off up reads)
                 launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
                     gate_up_mmvq2_qwen_sparse_kernel<6656, 19968, 1>,
                     q, reinterpret_cast<const unsigned char*>(gate_q),
                     reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, g_mg_sparse_tau, gu_pdl);
+            else if (gu_rows_mg && num_tokens >= 2 && num_tokens <= kGuRowsMax) {
+                switch (num_tokens) {
+                    case 2: SI_GU_ROWS_MG(2); break; case 3: SI_GU_ROWS_MG(3); break; case 4: SI_GU_ROWS_MG(4); break; case 5: SI_GU_ROWS_MG(5); break;
+                    case 6: SI_GU_ROWS_MG(6); break; case 7: SI_GU_ROWS_MG(7); break; case 8: SI_GU_ROWS_MG(8); break; case 9: SI_GU_ROWS_MG(9); break;
+                    case 10: SI_GU_ROWS_MG(10); break; case 11: SI_GU_ROWS_MG(11); break; case 12: SI_GU_ROWS_MG(12); break; case 13: SI_GU_ROWS_MG(13); break;
+                    case 14: SI_GU_ROWS_MG(14); break; case 15: SI_GU_ROWS_MG(15); break;
+                    default: SI_GU_ROWS_MG(16); break;
+                }
+            }
             else
                 launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
                     gate_up_mmvq2_qwen_kernel<6656, 19968, 1>,
                     q, reinterpret_cast<const unsigned char*>(gate_q),
                     reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+#undef SI_GU_ROWS_MG
         }
         // Qwen3.8-27B dense hybrid (hidden 5120, ffn 17408). Same recipe as Muse's 6656x19968
         // arm: F is already large enough that pack2 coarsens scheduling. Compile-time H/F
