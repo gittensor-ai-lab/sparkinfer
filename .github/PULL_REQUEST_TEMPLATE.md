@@ -32,6 +32,19 @@
 
 - [ ] Tested on **RTX 5090** (`sm_120`)
 
+**Target model(s)** — tick every model this change is meant to speed up. This decides which bots
+spend GPU time on it: a bot whose model you did **not** tick may skip your PR instead of spending a
+~20-minute round proving a change it cannot move. Tick nothing and every bot evaluates it, as before.
+
+- [ ] **Muse Glimmer**
+- [ ] **Qwen3.8-27B** (ModelOpt NVFP4 / DSpark)
+- [ ] **Shared / both** — the change is in code both models use and should help either
+
+> Tick **Shared / both** if you are unsure, or if the code you touched is shared (`qwen35.cpp`,
+> `qwen35_prefill.cpp`, most of `kernels/`). Over-ticking only costs eval time; under-ticking can
+> cost you a tier a bot would have awarded. Declaring a model you did not target in order to dodge
+> a no-regression guard is gaming, and is treated like false attestation.
+
 **Decode tok/s** (end-to-end, from `bench/scripts/bench.sh` — fill if this PR targets decode):
 
 | | decode tok/s |

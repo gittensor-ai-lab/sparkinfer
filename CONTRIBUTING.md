@@ -111,6 +111,27 @@ Requesting an axis is a normal, welcome contribution — most of the current axe
 somebody asked. What is *not* welcome is redefining what an existing axis measures in order to
 move it; see *Do not redefine what a scored dimension measures* below.
 
+**Declare which model(s) your PR targets.** The template has a **Target model(s)** block next to
+the RTX 5090 box — tick every model your change is meant to speed up. It decides which bots spend
+GPU on it:
+
+- a bot whose model you **did not** tick may skip your PR rather than spend a ~20-minute round
+  proving a change it cannot move;
+- **tick nothing and every bot evaluates it**, exactly as before this existed — the declaration can
+  only ever remove work you have said is pointless, never cause a PR to go unevaluated by accident;
+- **tick `Shared / both` when unsure**, or when you touched shared code (`qwen35.cpp`,
+  `qwen35_prefill.cpp`, most of `kernels/`) — most optimizations land there and genuinely help more
+  than one model. Over-ticking costs eval time; under-ticking can cost you a tier a bot would have
+  awarded.
+
+This exists because it was being paid for in wasted GPU: [#1025](../../pull/1025)
+(`perf(muse)`, a Muse Glimmer prefill change) consumed a full DSpark round to conclude `+0.1%` →
+`eval-dspark:none`, and [#1018](../../pull/1018) and [#1023](../../pull/1023) did the same before it.
+
+> **Declaring a model you did not target, to dodge a guard, is gaming.** The no-regression guards
+> exist because the code is shared — a change aimed at one model regularly lands in another's path.
+> Mis-declaring to route around one is treated like false attestation on the 5090 box.
+
 **Evaluation is opt-in and proof-gated.** The RTX 5090 eval runs only when **both** hold: you tick
 **`- [x] Tested on RTX 5090`** *and* fill **either** the template's **decode tok/s** table **or**
 its **prefill pp tok/s** table with a real end-to-end improvement (`after > before`, from
@@ -157,8 +178,20 @@ can lag them.
 | [`eval/pr_museglimmer_bot.py`](eval/pr_museglimmer_bot.py) | Muse Glimmer | prefill **and** decode at **ctx 128 / 512 / 4k / 16k / 32k / 64k** — twelve axes, any one of which can earn the tier |
 | [`eval/pr_dspark_bot.py`](eval/pr_dspark_bot.py) | Qwen3.8-27B ModelOpt NVFP4 + DSpark draft | DSpark decode and DSpark-enabled batched prefill at **ctx 4k / 16k / 32k**, plus target prefill and decode at **ctx 256k** |
 
-Both bots additionally run **no-regression guards** on models they are not scoring (Qwen3.6 and
-ModelOpt), because the code is shared — see the gate table in *Lane 1*.
+Both bots additionally run **no-regression guards** on models they are not scoring, because the
+code is shared — see the gate table in *Lane 1*:
+
+| Bot | Guards it runs |
+|---|---|
+| Muse Glimmer bot | Qwen3.6 **and** ModelOpt (Qwen3.8) @ ctx 32k |
+| DSpark bot | Qwen3.6 **and** Qwen3.8 @ ctx 16k |
+
+**Which bots honour your `Target model(s)` declaration follows from that table.** The DSpark bot
+skips a PR declared Muse-only, because the Muse bot's own run still guards Qwen3.8 and Qwen3.6 — so
+nothing goes unchecked. The Muse bot does **not** yet skip a PR declared Qwen3.8-only, because no
+bot currently guards Muse Glimmer from the other side; skipping there would let a Muse regression
+land unnoticed. That asymmetry is a gap in the harness, not a policy: it closes when a Muse guard
+is added to the DSpark bot.
 
 **This list is not a menu, and it is not exhaustive.** It is what happens to be wired up today.
 If your optimization is real and lands somewhere none of these axes reach, that is a reason to

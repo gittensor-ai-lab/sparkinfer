@@ -1165,5 +1165,65 @@ class GenericEvalLabelTest(unittest.TestCase):
 
 
 
+
+class DeclaredTargetModelTest(unittest.TestCase):
+    """declared_models()/model_skip_reason(): a bot may skip a PR the author says targets a
+    different model, but ONLY on an explicit declaration -- everything else evaluates."""
+
+    TICKED = ("- [x] Muse Glimmer\n"
+              "- [ ] Qwen3.8-27B (ModelOpt NVFP4 / DSpark)\n"
+              "- [ ] Shared / both\n")
+
+    def test_parses_ticked_model(self):
+        self.assertEqual(bot.declared_models(self.TICKED), {"muse"})
+
+    def test_dspark_skips_a_muse_only_pr(self):
+        # The #1025 case: perf(muse) burned a full DSpark round to score none at +0.1%.
+        why = bot.model_skip_reason(self.TICKED, "qwen38")
+        self.assertIsNotNone(why)
+        self.assertIn("muse", why)
+
+    def test_muse_bot_would_not_skip_its_own_pr(self):
+        self.assertIsNone(bot.model_skip_reason(self.TICKED, "muse"))
+
+    def test_shared_ticked_runs_everywhere(self):
+        body = ("- [x] Muse Glimmer\n- [ ] Qwen3.8-27B (ModelOpt NVFP4 / DSpark)\n"
+                "- [x] Shared / both\n")
+        self.assertIsNone(bot.model_skip_reason(body, "qwen38"))
+
+    def test_both_models_ticked_runs_everywhere(self):
+        body = "- [x] Muse Glimmer\n- [x] Qwen3.8-27B (ModelOpt NVFP4 / DSpark)\n"
+        self.assertIsNone(bot.model_skip_reason(body, "qwen38"))
+        self.assertIsNone(bot.model_skip_reason(body, "muse"))
+
+    # --- fail-open: none of these may ever cause a skip ---
+
+    def test_no_declaration_evaluates(self):
+        self.assertIsNone(bot.model_skip_reason("## Summary\nmakes it faster", "qwen38"))
+
+    def test_empty_body_evaluates(self):
+        self.assertIsNone(bot.model_skip_reason("", "qwen38"))
+        self.assertIsNone(bot.model_skip_reason(None, "qwen38"))
+
+    def test_unticked_boxes_evaluate(self):
+        body = "- [ ] Muse Glimmer\n- [ ] Qwen3.8-27B (ModelOpt NVFP4 / DSpark)\n"
+        self.assertIsNone(bot.model_skip_reason(body, "qwen38"))
+
+    def test_unrecognised_model_name_evaluates(self):
+        self.assertIsNone(bot.model_skip_reason("- [x] Some Future Model\n", "qwen38"))
+
+    def test_rtx5090_attestation_box_is_not_a_model(self):
+        # The attestation checkbox must never be read as a target declaration.
+        body = "- [x] Tested on **RTX 5090** (`sm_120`)\n"
+        self.assertEqual(bot.declared_models(body), set())
+        self.assertIsNone(bot.model_skip_reason(body, "qwen38"))
+
+    def test_dspark_and_modelopt_aliases_map_to_qwen38(self):
+        for alias in ("- [x] DSpark\n", "- [x] ModelOpt NVFP4\n", "- [x] Qwen3.8-27B\n"):
+            self.assertEqual(bot.declared_models(alias), {"qwen38"}, alias)
+            self.assertIsNone(bot.model_skip_reason(alias, "qwen38"), alias)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

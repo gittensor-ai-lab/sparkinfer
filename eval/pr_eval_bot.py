@@ -1006,6 +1006,59 @@ def rtx5090_should_close(body, areas=None):
         return True
     return rtx5090_has_checkbox(body)
 
+# --- declared target model ------------------------------------------------------------------
+#
+# The PR template asks which model(s) a change is meant to speed up. Bots use it to avoid burning
+# a ~20-minute round proving that a Muse-Glimmer prefill change does nothing for Qwen3.8 (the
+# case that motivated this: #1025, `perf(muse)`, scored `eval-dspark:none` at +0.1% after a full
+# DSpark eval; #1018 and #1023 before it).
+#
+# FAIL-OPEN BY DESIGN. A missing, empty, unparseable or ambiguous declaration means "evaluate
+# everywhere", exactly as before this existed. The declaration can only ever REMOVE work that the
+# author has explicitly said is pointless; it can never cause a PR to go unevaluated by accident.
+#
+# Skipping is only safe where some OTHER bot still guards the skipped model against regressions --
+# shared code means a change aimed at one model can break another. See model_skip_reason().
+MODEL_KEYS = {
+    "muse":    ("muse",),                       # Muse Glimmer
+    "qwen38":  ("qwen3.8", "qwen38", "dspark", "modelopt"),
+    "shared":  ("shared", "both", "all models", "any model"),
+}
+
+
+def declared_models(body):
+    """Parse the PR template's 'Target model(s)' ticked checkboxes.
+
+    Returns a set of keys from MODEL_KEYS, or an empty set when nothing is declared (or the
+    declaration cannot be read) -- callers must treat empty as "no opinion, evaluate"."""
+    out = set()
+    for ln in (body or "").splitlines():
+        m = re.match(r"\s*[-*]\s*\[\s*([xX])\s*\]\s*(.+)$", ln)
+        if not m:
+            continue
+        text = m.group(2).lower()
+        if "5090" in text:            # the attestation checkbox, not a model declaration
+            continue
+        for key, needles in MODEL_KEYS.items():
+            if any(n in text for n in needles):
+                out.add(key)
+    return out
+
+
+def model_skip_reason(body, my_model):
+    """Should a bot that scores `my_model` skip this PR on its declared target?
+
+    Returns a reason string to skip, or None to evaluate. Skips only when the author ticked a
+    specific model, did NOT tick this bot's model, and did NOT tick shared/both."""
+    declared = declared_models(body)
+    if not declared or "shared" in declared or my_model in declared:
+        return None
+    if not (declared - {"shared"}):
+        return None
+    names = ", ".join(sorted(declared))
+    return f"declared target model(s): {names} — not {my_model}"
+
+
 def greenlight_status(repo, num, pr_labels):
     """Decide whether a PR may be evaluated. Returns (status, reason):
       'ok'        — greenlit: box ticked + real decode and/or prefill before<after gain

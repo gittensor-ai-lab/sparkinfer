@@ -3185,6 +3185,20 @@ def main():
         if not args.reeval and head and head in qwen38_evaluated_commits(args.repo, num):
             print(f"PR #{num} @ {short}: already dspark-evaluated — skip")
             continue
+        # Before the greenlight and before any GPU time: did the author declare this PR targets a
+        # DIFFERENT model? A Muse-Glimmer prefill change cannot move the Qwen3.8 axes, and proving
+        # that costs a full ~20-minute round (#1025 scored `none` at +0.1%; #1018 and #1023 the
+        # same). arb.model_skip_reason() fails open — an absent or ambiguous declaration evaluates.
+        #
+        # Safe to skip here specifically because the Muse bot runs BOTH a ModelOpt (Qwen3.8) and a
+        # Qwen3.6 guard on every PR it scores, so a Muse-declared PR is still regression-checked
+        # against this bot's models. The reverse is NOT true (nothing guards Muse Glimmer from this
+        # bot's side), which is why pr_museglimmer_bot.py deliberately does not do this.
+        skip_why = arb.model_skip_reason(pr.get("body") or "", "qwen38")
+        if skip_why:
+            print(f"PR #{num}: {skip_why} — skip dspark eval (guarded by the Muse bot's "
+                  f"ModelOpt + Qwen3.6 guards)")
+            continue
         # Before the greenlight and before any GPU time: does this PR edit the measuring
         # instrument? Checked here rather than at auto-merge because a harness PR should not
         # consume a 20-minute round to produce a number that cannot be accepted either way.
