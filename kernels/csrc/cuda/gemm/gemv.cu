@@ -3833,10 +3833,29 @@ bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
     const auto* w = reinterpret_cast<const unsigned char*>(W);
     auto* out = reinterpret_cast<__nv_bfloat16*>(y);
     const int grid = (N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS;
+    // Two buckets (<=6, else 8) was as tight as this got, which is tight enough for a speculative
+    // verify -- its row count is the draft width, 6 or 8. A packed continuous-batch step is a
+    // different distribution: the scheduler hands the projections its whole live set, and at two
+    // and four live requests a 6-row instantiation carries three times and one and a half times
+    // the accumulators the block will ever touch. Those are exactly the widths where this kernel
+    // is a quarter of the step (24.6% at c2), and where nothing else is competing for the SM.
+    // Bucketing at 2/4/6/8 costs four more instantiations per K and changes no row's arithmetic:
+    // MMAX bounds tmp[]/partial[] and the predicated row bodies, nothing else.
+    // SPARKINFER_MMVQ_ROWS_EXACT=0 restores the two-bucket dispatch.
+    static const int rows_exact = [] {
+        const char* e = getenv("SPARKINFER_MMVQ_ROWS_EXACT");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
     #define SI_Q4K_ROWS_DISPATCH(KB) \
         do { \
-            if (M <= 6) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 6, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
-            else        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 8, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            if (!rows_exact) { \
+                if (M <= 6) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 6, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+                else        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 8, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            } \
+            else if (M <= 2) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 2, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            else if (M <= 4) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 4, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            else if (M <= 6) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 6, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            else             si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 8, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
         } while (0)
     if      (K == 2048) SI_Q4K_ROWS_DISPATCH(8);
     else if (K == 4096) SI_Q4K_ROWS_DISPATCH(16);

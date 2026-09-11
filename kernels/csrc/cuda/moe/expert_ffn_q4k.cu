@@ -2339,15 +2339,44 @@ void launch_moe_expert_ffn_q4k(
                 // Chunked at the register width the multi-row body carries. Wider than 8 rows the
                 // per-row accumulators start to spill, and 8 already turns the per-token weight
                 // stream into one pass for a batch that size.
+                //
+                // MMAX is the CHUNK width, but it was also the width the kernel was INSTANTIATED
+                // at, and those are not the same question. The body sizes `tg[MMAX]`, `tu[MMAX]`
+                // and -- the one that decides occupancy -- `__shared__ sg/su[MMAX][NW-1][32]`,
+                // which is 6144 B per block at MMAX=8. A chunk only ever carries `m` rows and the
+                // body already stops at `r >= M`, so at the widths where this arm is the whole
+                // step (c2 and c4 are 27.5% and 32.7% of it) every block was reserving four to
+                // eight KB of shared memory for accumulators it never touches, and an SM fits
+                // correspondingly fewer of them. Instantiating at the chunk's real width hands
+                // back 3/4 of that at two rows and 1/2 at four.
+                //
+                // Bit-identical: MMAX only bounds the unrolled loops and the array extents. With
+                // MMAX == m the `r >= M` break never fires, and every row r < m runs the same
+                // si_vec_dot_q3_A_rows arithmetic, the same shared staging and the same ordered
+                // reduction it ran before. SPARKINFER_MUSE_Q3A_EXACT_WIDTH=0 pins MMAX back to 8,
+                // so both arms of an A/B come out of ONE binary.
+                static int q3_exact = -1;
+                if (q3_exact < 0) {
+                    const char* e = getenv("SPARKINFER_MUSE_Q3A_EXACT_WIDTH");
+                    q3_exact = (e && e[0] == '0') ? 0 : 1;
+                }
                 constexpr int MMAX = 8;
                 for (int t0 = 0; t0 < num_tokens; t0 += MMAX) {
                     const int m = (num_tokens - t0) < MMAX ? (num_tokens - t0) : MMAX;
-                    launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream,
-                        gate_up_q3a_muse_rows_kernel<6656, 19968, MMAX>,
-                        q + (size_t)t0 * (6656 >> 5),
-                        reinterpret_cast<const unsigned char*>(gate_q),
-                        reinterpret_cast<const unsigned char*>(up_q), expert_ids,
-                        h_scratch + (size_t)t0 * 19968, m, gu_pdl);
+                    const si_block_q8_1* qq = q + (size_t)t0 * (6656 >> 5);
+                    float* hs = h_scratch + (size_t)t0 * 19968;
+#define SI_Q3A_ROWS(MM) launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream, \
+                        gate_up_q3a_muse_rows_kernel<6656, 19968, MM>, qq, \
+                        reinterpret_cast<const unsigned char*>(gate_q), \
+                        reinterpret_cast<const unsigned char*>(up_q), expert_ids, hs, m, gu_pdl)
+                    if (!q3_exact) { SI_Q3A_ROWS(8); continue; }
+                    switch (m) {
+                        case 1: case 2: SI_Q3A_ROWS(2); break;
+                        case 3:  SI_Q3A_ROWS(3); break;   case 4: SI_Q3A_ROWS(4); break;
+                        case 5:  SI_Q3A_ROWS(5); break;   case 6: SI_Q3A_ROWS(6); break;
+                        case 7:  SI_Q3A_ROWS(7); break;   default: SI_Q3A_ROWS(8); break;
+                    }
+#undef SI_Q3A_ROWS
                 }
             } else
                 launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream, gate_up_q3a_kernel,
