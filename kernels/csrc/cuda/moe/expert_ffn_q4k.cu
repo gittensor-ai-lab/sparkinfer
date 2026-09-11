@@ -2024,13 +2024,24 @@ __global__ void gate_up_mmvq2_qwen_sparse_kernel(
     if (pdl) si_pdl_lc();
 }
 
+// SwiGLU over a gate/up pair a CALLER produced, into the float h the Q4_K/Q6_K down GEMV below
+// already reads. The expression is the one every gate/up kernel in this file ends with --
+// q4kf_silu(g) * u, product kept in float -- so supplying the projections changes where g and u
+// came from and nothing about what `down` is handed.
+__global__ void swiglu_rows_bf16_f32_kernel(const __nv_bfloat16* __restrict__ g,
+                                            const __nv_bfloat16* __restrict__ u,
+                                            float* __restrict__ h, long n) {
+    const long i = (long)blockIdx.x * (long)blockDim.x + threadIdx.x;
+    if (i < n) h[i] = q4kf_silu(__bfloat162float(g[i])) * __bfloat162float(u[i]);
+}
+
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
     int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
     int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream,
-    bool ar_exact_splitk
+    bool ar_exact_splitk, const void* gate_bf16, const void* up_bf16
 ) {
     mg_sparse_ffn_init();
     // Qwythos dense hybrid fast path: pack2 gate/up without expert lookup + PDL-chained
@@ -2101,7 +2112,14 @@ void launch_moe_expert_ffn_q4k(
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
     const int gu_pdl = gu_mmvq_pdl();
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
-    if (mmvq && gu2 && ((gate_type == 12 && up_type == 12) ||
+    // Projections supplied by the caller: skip the whole in-projection dispatch below and go
+    // straight to the SwiGLU that feeds `down`.
+    if (gate_bf16 && up_bf16 && top_k == 1) {
+        const long n = (long)num_tokens * (long)ffn;
+        swiglu_rows_bf16_f32_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(up_bf16), h_scratch, n);
+    } else if (mmvq && gu2 && ((gate_type == 12 && up_type == 12) ||
                        (gate_type == SI_QTYPE_Q3A && up_type == SI_QTYPE_Q3A))) {   // faithful 4-warp mmvq gate/up
         const si_block_q8_1* q;
         if (input_q8) {   // pre-quantized Q8_1(hn) from the fused norm: skip the quantize node

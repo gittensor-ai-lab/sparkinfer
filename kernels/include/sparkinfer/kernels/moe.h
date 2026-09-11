@@ -82,7 +82,14 @@ void launch_moe_expert_ffn_q4k(
     // aware choice. The split count sets the reduction order, so a caller that must reproduce
     // single-token decode bit-for-bit at num_tokens > 1 has to pin it; everyone else wants the
     // faster row-count aware default.
-    bool ar_exact_splitk = false);
+    bool ar_exact_splitk = false,
+    // A caller that has ALREADY produced this batch's gate and up projections passes them here as
+    // bf16 [num_tokens, ffn] and gets only the SwiGLU and the down projection. The packed
+    // continuous-batch step is the one that does: it runs gate and up as block-scaled NVFP4 GEMMs
+    // whose cost does not grow with the batch width, while its `down` weights have no FP4 copy and
+    // stay on the GEMV below. nullptr (the default) keeps the in-projection GEMV every other
+    // caller wants. top_k must be 1 -- a routed MoE has no single [num_tokens, ffn] pair.
+    const void* gate_bf16 = nullptr, const void* up_bf16 = nullptr);
 
 // Qwen3.6 UD shared expert: Q8_0 gate/up/down via int8 dp4a MMVQ. Reuses the FNQ
 // Q8_1(hn) buffer for gate/up; overwrites h_q8_buf with Q8_1(h) for down.

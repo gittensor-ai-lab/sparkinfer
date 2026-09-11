@@ -3044,6 +3044,43 @@ static bool muse_packed_on() {
     }();
     return v;
 }
+// Row count from which a packed step runs the dense gate/up as ONE block-scaled NVFP4 GEMM per
+// projection instead of the row-batched dp4a GEMV. Fitted on an RTX 5090 against Muse Glimmer's
+// 6656x19968 FFN: the GEMV costs a fixed read plus ~0.76 ms per row across the model, the GEMM
+// 6.92 ms flat (0.0666 ms at 8 rows, 0.0668 at 16 -- it reads the same operand either way), so they
+// cross just under six rows.
+static int gu_gemm_min_rows() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_GU_GEMM_MIN_ROWS");
+        const int x = e ? atoi(e) : 6;
+        return x < 1 ? 1 : x;
+    }();
+    return v;
+}
+
+// Gate and up for `rows` packed rows through the prefill NVFP4 operands the model already holds,
+// into sg/su. Returns false when the weights, the scratch or the shape are not there, which leaves
+// the caller on the GEMV it was using.
+//
+// This is deliberately NOT gated on the DOWN operand. The block-scaled FFN arm in this function
+// requires gate, up AND down to have FP4 copies, and Muse Glimmer has exactly the first two:
+// qwen35.cpp converts gate/up on all 52 layers for prefill and refuses ffn_down, whose copy is
+// 3.9 GB the card has nowhere to put once the KV cache and the prefill arena are down. So that
+// predicate is false for the whole model -- for the sake of an operand only the third projection
+// needs -- and every packed step stayed on the GEMV.
+static bool packed_gate_up_nvfp4(const Qwen35LayerWeights& w, const void* hn, int rows,
+                                 int ffn, int H, unsigned char* fp4_a, unsigned char* fp4_asf,
+                                 unsigned char* fp4_ws, bf16* sg, bf16* su, cudaStream_t st) {
+    if (!fp4_a || !fp4_asf || !sg || !su) return false;
+    if (!w.gate_fp4 || !w.gate_fp4_sf || !w.up_fp4 || !w.up_fp4_sf) return false;
+    if (!kernels::prefill_nvfp4_supported(rows, ffn, H)) return false;
+    return kernels::launch_prefill_nvfp4_quant_a(hn, fp4_a, fp4_asf, rows, H, st) &&
+           kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.gate_fp4, w.gate_fp4_sf, sg,
+                                              rows, ffn, H, fp4_ws, st, w.gate_fp4_alpha) &&
+           kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.up_fp4, w.up_fp4_sf, su,
+                                              rows, ffn, H, fp4_ws, st, w.up_fp4_alpha);
+}
+
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax, bool capture_only) {
@@ -3846,10 +3883,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (L == 0) { vdbg_snapshot2(h, 1); vdbg_snapshot2(hn, 2); }
             // Dense SwiGLU through the same one-expert call AR decode makes, at N rows.
             quant_rows(hn, H);
+            // Wide enough to be worth a block-scaled GEMM: run gate/up through the FP4 operands
+            // this model already holds for prefill and hand the pair to the call below, which then
+            // does only the SwiGLU and the GGUF down GEMV.
+            const bool gu_gemm =
+                packed && topk == 1 && N >= gu_gemm_min_rows() &&
+                packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su, st);
             kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                expert_ids, expert_w, routed, moe_h, moe_out,
-                                               N, topk, H, ffn, q81, st);
+                                               N, topk, H, ffn, q81, st, false,
+                                               gu_gemm ? sg : nullptr, gu_gemm ? su : nullptr);
             if (L == 0) vdbg_snapshot2(routed, 3);
             // Sandwich norm (post-FFN): x = h + RMSNorm(routed) * post_ffn_norm, same 1e-8.
             kernels::launch_norm_then_add(h, routed, w.post_ffn_norm, x, N, H, 1e-8f, st);
