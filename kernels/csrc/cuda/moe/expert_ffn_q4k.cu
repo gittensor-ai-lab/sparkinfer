@@ -2064,6 +2064,166 @@ __global__ void swiglu_rows_bf16_f32_kernel(const __nv_bfloat16* __restrict__ g,
     if (i < n) h[i] = q4kf_silu(__bfloat162float(g[i])) * __bfloat162float(u[i]);
 }
 
+// Widest packed batch the row-batched sparse gate/up is instantiated for. Sixteen, because the
+// continuous-batch scheduler hands the packed forward its whole live set and sixteen is the
+// widest that fits alongside Muse Glimmer's weights on a 32 GB card.
+static constexpr int kMuseGuRowsMax = 16;
+
+// SPARKINFER_MUSE_GU_ROWS_MAX caps that width at runtime so both arms come out of ONE binary.
+// =1 declines every packed width and is exactly the per-token behaviour this replaces.
+static inline int muse_gu_rows_max() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_MUSE_GU_ROWS_MAX");
+        v = e ? atoi(e) : kMuseGuRowsMax;
+        if (v < 1) v = 1;
+        if (v > kMuseGuRowsMax) v = kMuseGuRowsMax;
+    }
+    return v;
+}
+
+// M token rows against ONE set of gate/up rows, keeping the contextual-sparsity mask.
+//
+// gate_up_mmvq2_qwen_sparse_kernel above is launched over num_tokens*TOPK*F blocks with the token
+// index in blockIdx, and the grid is token-major -- block ts*F+f -- so a packed step walks the
+// whole 149 MB of one layer's gate/up for row 0 before row 1 starts, and nothing is left in L2 to
+// reuse. Both matrices were therefore pulled from DRAM once PER ROW. Muse Glimmer keeps ten
+// calibration-selected layers on native Q4_K (the other forty-two requantise to Q3_A, which has
+// its own row-batched arm), and on a c16 step those ten layers cost 13.1 ms of a 58.2 ms step --
+// 22.6% -- scaling as 0.082 ms per row per layer off a ~zero intercept, i.e. pure per-row work.
+//
+// Here the token index moves into the kernel and kbx stays the outer loop, so each super-block is
+// decoded once and dotted against all M rows while it is still in registers.
+//
+// The sparsity mask is preserved exactly, not dropped: a packed row must decode to the same token
+// it would have alone. Phase 1 reduces the gate projection for all M rows, each row's mask is
+// taken from its OWN silu, and phase 2 skips the up dot product for every row that is gated off.
+// What changes is only that the up super-blocks are fetched when ANY row wants them rather than
+// per row -- the arithmetic skip survives, the redundant fetch does not.
+//
+// Per-row arithmetic and reduction order are untouched: same kbx traversal, same kqs, the same
+// si_vec_dot_q4_K expressions via si_q4k_decode_w/si_vec_dot_q4_K_pre, the same ordered warp
+// shuffle followed by the same ascending sum over the four warp partials. Every row's output is
+// therefore bit-identical to the per-token launch it replaces.
+template <int H, int F, int TOPK, int M>
+__global__ void gate_up_mmvq2_qwen_sparse_rows_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, float tau, int pdl
+) {
+    constexpr int NW = 4, NB = H >> 8;
+    const int f = blockIdx.x;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4, kqs = 2 * (tid & 15);
+    __shared__ float sred[NW][M];
+    __shared__ float sg[M];        // silu(gate) per row; only thread 0 reads it back
+    float t[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) t[r] = 0.f;
+    // Every row on the same expert -- always, for the dense FFN this arm serves -- lets the Q4_K
+    // weight half be decoded once per super-block and shared. Otherwise each row decodes its own,
+    // which is what a top_k==1 MoE with genuinely different experts needs; same results either
+    // way, since si_vec_dot_q4_K_pre(si_q4k_decode_w(b, iqs), a, iqs) == si_vec_dot_q4_K(b, a, iqs).
+    const int e0 = expert_ids[0];
+    bool uniform = true;
+#pragma unroll
+    for (int r = 1; r < M; ++r) uniform &= (expert_ids[r * TOPK] == e0);
+    const si_block_q4_K* g0 = (const si_block_q4_K*)(gate_q + ((size_t)e0 * F + f) * NB * 144);
+    const si_block_q4_K* u0 = (const si_block_q4_K*)(up_q   + ((size_t)e0 * F + f) * NB * 144);
+
+    // Phase 1: the gate projection for every row -> each row's own silu decides its own mask.
+    if (uniform) {
+        for (int kbx = kbx0; kbx < NB; kbx += 8) {
+            const si_q4k_wdec gw = si_q4k_decode_w(g0 + kbx, kqs);
+#pragma unroll
+            for (int r = 0; r < M; ++r)
+                t[r] += si_vec_dot_q4_K_pre(gw, vy + (size_t)r * (H >> 5) + (size_t)kbx * 8, kqs);
+        }
+    } else {
+        for (int kbx = kbx0; kbx < NB; kbx += 8) {
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const si_block_q4_K* g = (const si_block_q4_K*)(
+                    gate_q + ((size_t)expert_ids[r * TOPK] * F + f) * NB * 144);
+                t[r] += si_vec_dot_q4_K(g + kbx, vy + (size_t)r * (H >> 5) + (size_t)kbx * 8, kqs);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) t[r] += __shfl_xor_sync(0xffffffff, t[r], m);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) sred[warp][r] = t[r];
+    }
+    __syncthreads();
+    // g[] and the mask are uniform across the CTA -- every thread sums the same four partials in
+    // the same order -- so the phase-2 branch and its barriers are CTA-uniform.
+    unsigned act = 0u;
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+        float s = 0.f;
+#pragma unroll
+        for (int w = 0; w < NW; ++w) s += sred[w][r];
+        const float gr = q4kf_silu(s);
+        if (tid == 0) sg[r] = gr;
+        if (fabsf(gr) >= tau) act |= (1u << r);
+    }
+
+    // Phase 2: the up projection, fetched once for the whole batch, dotted only for active rows.
+    if (act) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) t[r] = 0.f;
+        if (uniform) {
+            for (int kbx = kbx0; kbx < NB; kbx += 8) {
+                const si_q4k_wdec uw = si_q4k_decode_w(u0 + kbx, kqs);
+#pragma unroll
+                for (int r = 0; r < M; ++r)
+                    if (act & (1u << r))
+                        t[r] += si_vec_dot_q4_K_pre(uw, vy + (size_t)r * (H >> 5) + (size_t)kbx * 8, kqs);
+            }
+        } else {
+            for (int kbx = kbx0; kbx < NB; kbx += 8) {
+#pragma unroll
+                for (int r = 0; r < M; ++r) {
+                    if (!(act & (1u << r))) continue;
+                    const si_block_q4_K* u = (const si_block_q4_K*)(
+                        up_q + ((size_t)expert_ids[r * TOPK] * F + f) * NB * 144);
+                    t[r] += si_vec_dot_q4_K(u + kbx, vy + (size_t)r * (H >> 5) + (size_t)kbx * 8, kqs);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            if (!(act & (1u << r))) continue;   // CTA-uniform, so the shuffle stays convergent
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) t[r] += __shfl_xor_sync(0xffffffff, t[r], m);
+        }
+        __syncthreads();          // sred is reused; every thread has read phase 1's partials
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < M; ++r) sred[warp][r] = t[r];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float hval = 0.f;
+            if (act & (1u << r)) {
+                float s = 0.f;
+#pragma unroll
+                for (int w = 0; w < NW; ++w) s += sred[w][r];
+                hval = sg[r] * s;
+            }
+            h_scratch[(size_t)r * F + f] = hval;
+        }
+    }
+    if (pdl) si_pdl_lc();
+}
+
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
     int gate_type, int up_type, int down_type,
@@ -2249,7 +2409,32 @@ void launch_moe_expert_ffn_q4k(
         // on a 5090 at 128 decode, a pack2 arm for this shape gives back about four fifths of
         // what this arm wins, so it is deliberately absent rather than merely unwritten.
         else if (gu_spec && hidden == 6656 && ffn == 19968 && top_k == 1) {
-            if (g_mg_sparse_tau > 0.f)   // Muse Glimmer contextual-sparsity FFN (skip gated-off up reads)
+            // A packed continuous-batch step takes the row-batched sparse kernel, which walks F
+            // once instead of num_tokens*F and so reads gate/up from DRAM once for the whole batch
+            // instead of once per row. Every row keeps its own mask, bit-for-bit; see the kernel.
+            // SPARKINFER_MUSE_GU_SPARSE_ROWS=0 restores the per-token grid, so both arms of an A/B
+            // come out of ONE binary.
+            static int gu_sparse_rows = -1;
+            if (gu_sparse_rows < 0) { const char* e = getenv("SPARKINFER_MUSE_GU_SPARSE_ROWS"); gu_sparse_rows = (e && e[0] == '0') ? 0 : 1; }
+#define SI_GU_SPARSE_ROWS_MG(MM) launch_pdl_kernel(gu_pdl, dim3(ffn), dim3(4 * 32), 0, stream, \
+                gate_up_mmvq2_qwen_sparse_rows_kernel<6656, 19968, 1, MM>, \
+                q, reinterpret_cast<const unsigned char*>(gate_q), \
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, \
+                g_mg_sparse_tau, gu_pdl)
+            if (g_mg_sparse_tau > 0.f && gu_sparse_rows && num_tokens >= 2
+                && num_tokens <= muse_gu_rows_max()) {
+                switch (num_tokens) {
+                    case 2:  SI_GU_SPARSE_ROWS_MG(2);  break;  case 3:  SI_GU_SPARSE_ROWS_MG(3);  break;
+                    case 4:  SI_GU_SPARSE_ROWS_MG(4);  break;  case 5:  SI_GU_SPARSE_ROWS_MG(5);  break;
+                    case 6:  SI_GU_SPARSE_ROWS_MG(6);  break;  case 7:  SI_GU_SPARSE_ROWS_MG(7);  break;
+                    case 8:  SI_GU_SPARSE_ROWS_MG(8);  break;  case 9:  SI_GU_SPARSE_ROWS_MG(9);  break;
+                    case 10: SI_GU_SPARSE_ROWS_MG(10); break;  case 11: SI_GU_SPARSE_ROWS_MG(11); break;
+                    case 12: SI_GU_SPARSE_ROWS_MG(12); break;  case 13: SI_GU_SPARSE_ROWS_MG(13); break;
+                    case 14: SI_GU_SPARSE_ROWS_MG(14); break;  case 15: SI_GU_SPARSE_ROWS_MG(15); break;
+                    default: SI_GU_SPARSE_ROWS_MG(16); break;
+                }
+            }
+            else if (g_mg_sparse_tau > 0.f)   // Muse Glimmer contextual-sparsity FFN (skip gated-off up reads)
                 launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
                     gate_up_mmvq2_qwen_sparse_kernel<6656, 19968, 1>,
                     q, reinterpret_cast<const unsigned char*>(gate_q),
@@ -2259,6 +2444,7 @@ void launch_moe_expert_ffn_q4k(
                     gate_up_mmvq2_qwen_kernel<6656, 19968, 1>,
                     q, reinterpret_cast<const unsigned char*>(gate_q),
                     reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+#undef SI_GU_SPARSE_ROWS_MG
         }
         // Qwen3.8-27B dense hybrid (hidden 5120, ffn 17408). Same recipe as Muse's 6656x19968
         // arm: F is already large enough that pack2 coarsens scheduling. Compile-time H/F

@@ -24,3 +24,12 @@ target_link_libraries(down_rows_chunk_gpu_test PRIVATE sparkinfer_kernels CUDA::
 set_target_properties(down_rows_chunk_gpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME down_rows_chunk_gpu_test COMMAND down_rows_chunk_gpu_test)
 set_tests_properties(down_rows_chunk_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# The row-batched contextual-sparsity gate/up against the per-token kernel it replaces: same rows,
+# same bits, at every batch width the dispatch instantiates. Needs a GPU and ~350 MB of it for Muse
+# Glimmer's real 6656x19968 FFN, which is the shape the arm is gated to.
+add_executable(sparse_gate_up_rows_gpu_test sparse_gate_up_rows_gpu_test.cpp)
+target_link_libraries(sparse_gate_up_rows_gpu_test PRIVATE sparkinfer_kernels CUDA::cudart)
+set_target_properties(sparse_gate_up_rows_gpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME sparse_gate_up_rows_gpu_test COMMAND sparse_gate_up_rows_gpu_test)
+set_tests_properties(sparse_gate_up_rows_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
