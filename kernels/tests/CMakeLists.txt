@@ -13,3 +13,11 @@ if(BUILD_NVFP4_KERNELS)
   add_test(NAME prefill_nvfp4_gpu_test COMMAND prefill_nvfp4_gpu_test)
   set_tests_properties(prefill_nvfp4_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+# The row-batched dense down projection against the per-token kernel it replaces: same rows, same
+# bits, at every batch width the dispatch instantiates. Needs a GPU and ~350 MB of it for Muse
+# Glimmer's real 6656x19968 FFN, which is the shape the arm is gated to.
+add_executable(down_rows_gpu_test down_rows_gpu_test.cpp)
+target_link_libraries(down_rows_gpu_test PRIVATE ${SPARKINFER_KERNEL_LIBS} CUDA::cudart)
+add_test(NAME down_rows_gpu_test COMMAND down_rows_gpu_test)
+set_tests_properties(down_rows_gpu_test PROPERTIES SKIP_RETURN_CODE 77)

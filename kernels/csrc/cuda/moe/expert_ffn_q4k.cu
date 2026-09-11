@@ -1831,6 +1831,26 @@ static inline bool launch_down_q6k_mmvq_splitk(
         default: return false;
     }
 }
+// Widest batch the row-batched down is instantiated for. Sixteen, not the eight this arm was
+// written with, because the continuous-batch scheduler hands the packed forward its WHOLE live
+// set: at concurrency 16 that is sixteen rows, and an arm that stops at eight simply declines and
+// leaves the whole batch reading the down projection once per token. Above it the per-token grid
+// still runs, exactly as it does today.
+static constexpr int kDownRowsMax = 16;
+
+// SPARKINFER_DOWN_ROWS_MAX caps that width at runtime, so the widths this adds can be measured
+// against the old cap out of one binary. =8 is exactly the previous behaviour.
+static inline int down_rows_max() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPARKINFER_DOWN_ROWS_MAX");
+        v = e ? atoi(e) : kDownRowsMax;
+        if (v < 2) v = 2;
+        if (v > kDownRowsMax) v = kDownRowsMax;
+    }
+    return v;
+}
+
 // Row-batched counterpart of launch_down_q4k_mmvq_splitk. Only the generic (non shape-specialized)
 // split-K kernel has a rows form, so this declines anything it does not cover and the caller falls
 // back to the per-token grid.
@@ -1839,7 +1859,7 @@ static inline bool launch_down_q4k_mmvq_splitk_rows(
     const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
     int H, int F, int top_k, cudaStream_t stream
 ) {
-    if (M < 2 || M > 8) return false;
+    if (M < 2 || M > kDownRowsMax) return false;
     const dim3 block(WPB * 32);
 #define SI_DOWN_ROWS(S_, M_) do { \
         launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_rows_kernel<S_, M_>, \
@@ -1848,10 +1868,14 @@ static inline bool launch_down_q4k_mmvq_splitk_rows(
     } while (0)
 #define SI_DOWN_ROWS_M(S_) do { \
         switch (M) { \
-            case 2: SI_DOWN_ROWS(S_, 2); case 3: SI_DOWN_ROWS(S_, 3); \
-            case 4: SI_DOWN_ROWS(S_, 4); case 5: SI_DOWN_ROWS(S_, 5); \
-            case 6: SI_DOWN_ROWS(S_, 6); case 7: SI_DOWN_ROWS(S_, 7); \
-            default: SI_DOWN_ROWS(S_, 8); \
+            case 2:  SI_DOWN_ROWS(S_, 2);  case 3:  SI_DOWN_ROWS(S_, 3); \
+            case 4:  SI_DOWN_ROWS(S_, 4);  case 5:  SI_DOWN_ROWS(S_, 5); \
+            case 6:  SI_DOWN_ROWS(S_, 6);  case 7:  SI_DOWN_ROWS(S_, 7); \
+            case 8:  SI_DOWN_ROWS(S_, 8);  case 9:  SI_DOWN_ROWS(S_, 9); \
+            case 10: SI_DOWN_ROWS(S_, 10); case 11: SI_DOWN_ROWS(S_, 11); \
+            case 12: SI_DOWN_ROWS(S_, 12); case 13: SI_DOWN_ROWS(S_, 13); \
+            case 14: SI_DOWN_ROWS(S_, 14); case 15: SI_DOWN_ROWS(S_, 15); \
+            default: SI_DOWN_ROWS(S_, 16); \
         } \
     } while (0)
     if (S == 2)      SI_DOWN_ROWS_M(2);
@@ -2336,7 +2360,7 @@ void launch_moe_expert_ffn_q4k(
             // down_q4k_mmvq_splitk_rows_kernel. SPARKINFER_DOWN_ROWS=0 restores the per-token grid.
             static int down_rows = -1;
             if (down_rows < 0) { const char* e = getenv("SPARKINFER_DOWN_ROWS"); down_rows = (e && e[0] == '0') ? 0 : 1; }
-            if (down_rows && num_tokens >= 2 && num_tokens <= 8 && top_k == 1) {
+            if (down_rows && num_tokens >= 2 && num_tokens <= down_rows_max() && top_k == 1) {
                 dim3 dnr(1, (hidden + RPB - 1) / RPB);
                 if (launch_down_q4k_mmvq_splitk_rows(S, num_tokens, pdl, dnr,
                         reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
