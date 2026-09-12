@@ -186,7 +186,34 @@ ScheduleBatch Scheduler::schedule(const std::vector<ScheduledSequence>& active) 
             if (s->phase == SeqPhase::PREFILL) ++pending;
         const int wide = packed_decode_width();
         const int have = (int)batch.decode_request_ids.size();
-        const bool deep_ramp = (pending + have) * 2 >= wide;
+        // ...and "deep" has to be measured against the batch this load will reach, not against
+        // the packed-decode ceiling. Fixed at packed_decode_width() the test needs sixteen rows
+        // in flight, which no concurrency below sixteen can ever produce -- so c2/c4/c8 keep
+        // allow == 1 and ramp one row per iteration however deep their backlog is, which is the
+        // exact regime the rule above was written to fix, unreachable by construction. The cost
+        // of the extra admission is one prefill and is flat in concurrency; the saving is the
+        // iterations not spent at a narrow width, and a narrow step is not cheap -- on Muse
+        // Glimmer a packed step is 16.73 ms of fixed weight read against 0.125 ms per row, so a
+        // two-row step costs 95% of a sixteen-row one.
+        //
+        // Measured on Muse Glimmer, box19, the bot's own invocation
+        // (qwen3_gguf_cb_bench <model> C 256 256 512), agg_tok_s, two interleaved repeats per
+        // arm out of ONE binary:
+        //
+        //   concurrency        2         4          8
+        //   before        169.7     234.3      425.8
+        //   after         170.4     236.3      437.0   (+2.6% at 8, +0.9% at 4, +0.4% at 2)
+        //
+        // and mean ITL FALLS at eight (17.71 -> 17.54 ms), so the step is not paying for it.
+        // c16/c32 already satisfied the old test and are byte-for-byte unchanged, which is also
+        // why every DSpark concurrency dim (c16/c32) is untouched.
+        // SPARKINFER_CB_RAMP_DEEP_ROWS=32 restores the previous threshold exactly.
+        static const int deep_rows = [] {
+            const char* e = getenv("SPARKINFER_CB_RAMP_DEEP_ROWS");
+            const int x = e ? atoi(e) : 2;
+            return x < 1 ? 1 : x;
+        }();
+        const bool deep_ramp = (pending + have) * 2 >= deep_rows;
         const int allow = (have < wide && deep_ramp) ? prefills_per_step() : 1;
         int taken = 0;
         for (const ScheduledSequence* s : ordered) {
