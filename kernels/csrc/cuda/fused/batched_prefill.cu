@@ -1628,6 +1628,34 @@ void launch_prefill_add(const void* a, const void* b, void* out, long n, cudaStr
         reinterpret_cast<__nv_bfloat16*>(out), n);
 }
 
+// Scatter one [rows, pitch] block-scaled GEMM output into the four tensors the layer expects.
+// The fused q|gate|k|v NVFP4 operand produces them contiguous in one row; every consumer
+// downstream (QK-norm, the KV append, the q-gate sigmoid) wants its own tight row stride.
+__global__ void pf_qkvg_unpack_kernel(const __nv_bfloat16* __restrict__ src, int pitch,
+                                      __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ g,
+                                      __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
+                                      int rows, int qdim, int kvdim) {
+    const int w = 2 * qdim + 2 * kvdim;
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * w) return;
+    const int r = (int)(i / w), c = (int)(i - (long)r * w);
+    const __nv_bfloat16 x = src[(long)r * pitch + c];
+    if (c < qdim)                  q[(long)r * qdim + c] = x;
+    else if (c < 2 * qdim)         g[(long)r * qdim + (c - qdim)] = x;
+    else if (c < 2 * qdim + kvdim) k[(long)r * kvdim + (c - 2 * qdim)] = x;
+    else                           v[(long)r * kvdim + (c - 2 * qdim - kvdim)] = x;
+}
+
+void launch_muse_qkvg_unpack(const void* src, int pitch, void* q, void* gate, void* k, void* v,
+                             int rows, int qdim, int kvdim, cudaStream_t stream) {
+    const long n = (long)rows * (2 * qdim + 2 * kvdim);
+    pf_qkvg_unpack_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(src), pitch,
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(gate),
+        reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),
+        rows, qdim, kvdim);
+}
+
 void launch_prefill_split_q_gate(const void* qraw, void* q, void* gate,
                                  int n_tokens, int n_heads, int head_dim, cudaStream_t stream) {
     const long n = (long)n_tokens * n_heads * head_dim;

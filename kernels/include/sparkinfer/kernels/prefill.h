@@ -46,6 +46,11 @@ void launch_prefill_split_q_gate(const void* qraw, void* q, void* gate,
                                  int n_tokens, int n_heads, int head_dim,
                                  cudaStream_t stream = nullptr);
 
+// Scatter a fused q|gate|k|v GEMM output -- src[rows, pitch] with pitch >= 2*qdim+2*kvdim -- into
+// the four tight-strided tensors the rest of a Muse Glimmer layer reads.
+void launch_muse_qkvg_unpack(const void* src, int pitch, void* q, void* gate, void* k, void* v,
+                             int rows, int qdim, int kvdim, cudaStream_t stream = nullptr);
+
 // Batched attn *= sigmoid(gate), elementwise over n_tokens*dim (Qwen3.6 q-gate).
 // gate_ld: row pitch of `gate` in elements when it is a column slice of a wider packed buffer.
 void launch_prefill_mul_sigmoid(void* attn, const void* gate, int n_tokens, int dim,

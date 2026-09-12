@@ -3222,6 +3222,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         return v < 1 ? 1 : v;
     }();
     unsigned char* fp4_a = nullptr; unsigned char* fp4_asf = nullptr; unsigned char* fp4_ws = nullptr;
+    // [NA, qkvg_n] bf16 landing pad for the fused q|gate|k|v block-scaled GEMM below.
+    bf16* fp4_qkv = nullptr;
+    const int qkvg_n = 2 * qdim + 2 * kvdim;
     if (packed && c.dense_ffn) {
         const size_t ab = kernels::prefill_nvfp4_data_bytes(NA, fp4_kwide);
         const size_t sb = kernels::prefill_nvfp4_scale_bytes_a(NA, fp4_kwide);
@@ -3234,6 +3237,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         if (s.w.lm_head_fp4) {
             const size_t wb3 = kernels::prefill_nvfp4_workspace_bytes_f32(NA, c.vocab, H);
             if (wb3 > wb) wb = wb3;
+        }
+        // ...and the fused attention in-projection, same rule: one buffer serves whichever GEMM
+        // the pass launches, or initialize() fails and the arm silently declines.
+        if (c.muse_glimmer && s.w.layers[0].qkvg_fp4) {
+            const size_t wb4 = kernels::prefill_nvfp4_workspace_bytes(NA, qkvg_n, H);
+            if (wb4 > wb) wb = wb4;
+            fp4_qkv = a.alloc<bf16>((size_t)NA * qkvg_n);
         }
         fp4_a   = a.alloc<unsigned char>(ab);
         fp4_asf = a.alloc<unsigned char>(sb);
@@ -3895,8 +3905,37 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 }();
                 const bool v6 = (v6_wide || !wide) && !v4 && w.wv_type == 14;
                 if (v4 || v6) { Wp[nm] = w.wv; Yp[nm] = vf; Ns[nm++] = kvdim; }
-                const bool fused = fuseable && proj_multi_q4k(xn, Wp, Yp, Ns, nm, H, v6);
-                if (fused)
+                // THE FUSED NVFP4 q|gate|k|v OPERAND IS ALREADY RESIDENT. qwen35.cpp converts
+                // it at load for prefill (`qkvg_fp4`, one [2*qdim+2*kvdim, H] block-scaled
+                // matrix), and prefill_batched_run has driven the attention in-projections
+                // through it since it was written -- but the packed decode never picked it up
+                // and still issues Q4_K: q and the gate on the int8 mma arm, k and v on the
+                // chunked row grid. Three launches, 2.14 + 0.90 ms of an 18.7 ms c16 step at
+                // 0.75 and 0.14 TB/s, against ONE block-scaled GEMM over the same 32.6 MB at the
+                // 1.10 TB/s the gate/up GEMM beside it already reaches. The operand costs no
+                // VRAM it was not already costing, and the layer's own consumers want tight row
+                // strides, so the one [N, qkvg_n] result is scattered back out.
+                // Under nine rows this stays on the Q4_K grid the narrow widths were fitted for.
+                // SPARKINFER_MUSE_QKVG_FP4=0 restores the Q4_K projections.
+                static const int qkvg_fp4_on = [] {
+                    const char* e = getenv("SPARKINFER_MUSE_QKVG_FP4");
+                    return (e && e[0] == '0') ? 0 : 1; }();
+                bool qkvg_done = false;
+                if (qkvg_fp4_on && wide && fp4_a && fp4_asf && fp4_qkv &&
+                    w.qkvg_fp4 && w.qkvg_fp4_sf && N >= kProjGemmMinRows &&
+                    kernels::prefill_nvfp4_supported(Ng, qkvg_n, H) &&
+                    kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.qkvg_fp4, w.qkvg_fp4_sf,
+                                                       fp4_qkv, Ng, qkvg_n, H, fp4_ws, st)) {
+                    kernels::launch_muse_qkvg_unpack(fp4_qkv, qkvg_n, qb, qg, kf, vf,
+                                                     N, qdim, kvdim, st);
+                    qkvg_done = true;
+                    supported = true;
+                }
+                const bool fused = !qkvg_done && fuseable &&
+                                   proj_multi_q4k(xn, Wp, Yp, Ns, nm, H, v6);
+                if (qkvg_done) { /* issued above */ }
+                else if (fused)
                     supported =
                         (!wide || (proj(xn, w.wq, w.wq_type, qb, qdim, H) &&
                                    w.wgate && proj(xn, w.wgate, w.wgate_type, qg, qdim, H))) &&
