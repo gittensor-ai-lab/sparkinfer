@@ -4203,8 +4203,9 @@ bool launch_mmvq_q4k_mma_head_f32(const void* q81, const void* W, float* y,
     return true;
 }
 
-bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
-                          int M, int N, int K, cudaStream_t stream) {
+static bool launch_mmvq_q4k_rows_impl(const void* q81, const void* W, void* y,
+                                      int M, int N, int K, cudaStream_t stream,
+                                      bool allow_exact_m2) {
     // K is templated (KB = K/256 bounds the per-thread accumulators), so only instantiated widths
     // can run. It was 2048/4096 -- Qwen3.6-35B-A3B and Qwythos. Qwen3.8-27B is hidden=5120 with a
     // 6144-wide attention output, so EVERY Q4_K attention projection in that model was refused
@@ -4223,10 +4224,22 @@ bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
     const auto* w = reinterpret_cast<const unsigned char*>(W);
     auto* out = reinterpret_cast<__nv_bfloat16*>(y);
     const int grid = (N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS;
+    // Packed two-request decode used the MMAX=6 verify body, carrying three times the row-local
+    // accumulators it can touch. Keep the specialization exact: wider requests, including an M=2
+    // tail produced while chunking M>8, retain the established 6/8 dispatch below.
+    // SPARKINFER_MMVQ_ROWS_M2=0 restores that dispatch for a same-binary A/B.
+    static const int rows_m2 = [] {
+        const char* e = getenv("SPARKINFER_MMVQ_ROWS_M2");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
     #define SI_Q4K_ROWS_DISPATCH(KB) \
         do { \
-            if (M <= 6) si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 6, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
-            else        si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 8, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            if (allow_exact_m2 && rows_m2 && M == 2) \
+                si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 2, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            else if (M <= 6) \
+                si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 6, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            else \
+                si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, KB, 8, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, out, M, N); \
         } while (0)
     if      (K == 2048) SI_Q4K_ROWS_DISPATCH(8);
     else if (K == 4096) SI_Q4K_ROWS_DISPATCH(16);
@@ -4235,6 +4248,11 @@ bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
     else                SI_Q4K_ROWS_DISPATCH(26);
     #undef SI_Q4K_ROWS_DISPATCH
     return true;
+}
+bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
+                          int M, int N, int K, cudaStream_t stream) {
+    return launch_mmvq_q4k_rows_impl(q81, W, y, M, N, K, stream,
+                                     /*allow_exact_m2=*/true);
 }
 // One grid over up to four Q4_K matrices that share an activation. Returns false (having issued
 // nothing) for any shape it does not cover, so the caller can fall back to separate projections.
@@ -4324,8 +4342,9 @@ bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
 #undef SI_Q80_ROWS
     return true;
 }
-bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
-                      int M, int N, int K, cudaStream_t stream) {
+static bool launch_mmvq_rows_impl(int qtype, const void* q81, const void* W, void* y,
+                                   int M, int N, int K, cudaStream_t stream,
+                                   bool allow_exact_m2) {
     // Every rows kernel below carries exact, compile-time-bounded row bodies only to M=8, so a
     // wider batch used to be refused outright -- and a refusal here declines the WHOLE packed
     // forward, which then decodes its rows one at a time and re-reads every weight once per row.
@@ -4359,18 +4378,28 @@ bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
     if (M > 8) {
         for (int r0 = 0; r0 < M; r0 += 8) {
             const int m = (M - r0) < 8 ? (M - r0) : 8;
-            if (!launch_mmvq_rows(qtype,
-                                  reinterpret_cast<const si_block_q8_1*>(q81)
-                                      + (size_t)r0 * (size_t)(K >> 5),
-                                  W, reinterpret_cast<__nv_bfloat16*>(y) + (size_t)r0 * N,
-                                  m, N, K, stream)) return false;
+            const auto* qr = reinterpret_cast<const si_block_q8_1*>(q81)
+                           + (size_t)r0 * (size_t)(K >> 5);
+            auto* yr = reinterpret_cast<__nv_bfloat16*>(y) + (size_t)r0 * N;
+            // A two-row tail belongs to a wider request and therefore stays on the old MMAX=6
+            // body. Only a top-level M==2 request opts into the narrow specialization.
+            // Re-enter the generic dispatcher so each chunk still gets its existing MMA
+            // attempt when the full request exceeded the MMA row or scratch limit.
+            const bool launched = launch_mmvq_rows_impl(qtype, qr, W, yr, m, N, K, stream,
+                                                         /*allow_exact_m2=*/false);
+            if (!launched) return false;
         }
         return true;
     }
-    if (qtype == 12) return launch_mmvq_q4k_rows(q81, W, y, M, N, K, stream);
+    if (qtype == 12) return launch_mmvq_q4k_rows_impl(q81, W, y, M, N, K, stream, allow_exact_m2);
     if (qtype == 14) return launch_mmvq_q6k_rows(q81, W, y, M, N, K, stream);
     if (qtype == 8)  return launch_mmvq_q80_rows(q81, W, y, M, N, K, stream);
     return false;
+}
+bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
+                      int M, int N, int K, cudaStream_t stream) {
+    return launch_mmvq_rows_impl(qtype, q81, W, y, M, N, K, stream,
+                                  /*allow_exact_m2=*/true);
 }
 bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
                           int M, int N, int K, cudaStream_t stream) {

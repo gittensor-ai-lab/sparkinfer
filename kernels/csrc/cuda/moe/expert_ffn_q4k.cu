@@ -2691,15 +2691,31 @@ void launch_moe_expert_ffn_q4k(
                     const char* e = getenv("SPARKINFER_MUSE_Q3A_GU2");
                     q3_gu2 = (e && e[0] == '0') ? 0 : 1;
                 }
-                constexpr int MMAX = 8;
-                for (int t0 = 0; t0 < num_tokens; t0 += MMAX) {
-                    const int m = (num_tokens - t0) < MMAX ? (num_tokens - t0) : MMAX;
+                // The c2 packed step used an MMAX=8 body, reserving row-local registers and
+                // shared storage for six rows it cannot touch. Specialize only a complete
+                // two-token request; an M=2 tail from a wider request remains on MMAX=8.
+                // SPARKINFER_MUSE_Q3A_ROWS_M2=0 restores the old body for a same-binary A/B.
+                static const int q3_rows_m2 = [] {
+                    const char* e = getenv("SPARKINFER_MUSE_Q3A_ROWS_M2");
+                    return (e && e[0] == '0') ? 0 : 1;
+                }();
+                if (q3_rows_m2 && num_tokens == 2) {
                     launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream,
-                        gate_up_q3a_muse_rows_kernel<6656, 19968, MMAX>,
-                        q + (size_t)t0 * (6656 >> 5),
+                        gate_up_q3a_muse_rows_kernel<6656, 19968, 2>, q,
                         reinterpret_cast<const unsigned char*>(gate_q),
                         reinterpret_cast<const unsigned char*>(up_q), expert_ids,
-                        h_scratch + (size_t)t0 * 19968, m, gu_pdl, q3_gu2);
+                        h_scratch, 2, gu_pdl, q3_gu2);
+                } else {
+                    constexpr int MMAX = 8;
+                    for (int t0 = 0; t0 < num_tokens; t0 += MMAX) {
+                        const int m = (num_tokens - t0) < MMAX ? (num_tokens - t0) : MMAX;
+                        launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream,
+                            gate_up_q3a_muse_rows_kernel<6656, 19968, MMAX>,
+                            q + (size_t)t0 * (6656 >> 5),
+                            reinterpret_cast<const unsigned char*>(gate_q),
+                            reinterpret_cast<const unsigned char*>(up_q), expert_ids,
+                            h_scratch + (size_t)t0 * 19968, m, gu_pdl, q3_gu2);
+                    }
                 }
             } else
                 launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream, gate_up_q3a_kernel,

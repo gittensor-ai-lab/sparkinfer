@@ -26,8 +26,11 @@ template <class T> T* device_copy(const std::vector<T>& h) {
 
 template <class T> bool equal_device(const T* a, const T* b, size_t n, const char* what) {
     std::vector<T> ha(n), hb(n);
-    cudaMemcpy(ha.data(), a, n * sizeof(T), cudaMemcpyDeviceToHost);
-    cudaMemcpy(hb.data(), b, n * sizeof(T), cudaMemcpyDeviceToHost);
+    if (cudaMemcpy(ha.data(), a, n * sizeof(T), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(hb.data(), b, n * sizeof(T), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        std::printf("[FAIL] %s device copy failed\n", what);
+        return false;
+    }
     if (ha == hb) return true;
     size_t i = 0;
     while (i < n && ha[i] == hb[i]) i++;
@@ -256,6 +259,42 @@ int main() {
                                               dw, ys + (size_t)m * MN, MN, MH);
     cudaDeviceSynchronize();
     ok = equal_device(ym, ys, (size_t)N * MN, "Q4_K exact rows") && ok;
+    // Keep an explicit two-row assertion: the Muse narrow-batch dispatch has its own MMAX=2
+    // specialization, while the N=4 assertion above exercises the long-standing MMAX=6 body.
+    ok = cudaMemset(ym, 0xff, (size_t)2 * MN * sizeof(uint16_t)) == cudaSuccess && ok;
+    ok = sparkinfer::kernels::launch_mmvq_q4k_rows(dq81, dw, ym, 2, MN, MH) && ok;
+    ok = cudaDeviceSynchronize() == cudaSuccess && ok;
+    ok = equal_device(ym, ys, (size_t)2 * MN, "Q4_K exact rows M2") && ok;
+    // Muse's attention output projects K=4096 to N=6656. Exercise the public dispatcher at that
+    // shape as well, with poisoned output so a successful no-op launch cannot pass.
+    {
+        constexpr int K2 = 4096, N2 = 6656, M2 = 2;
+        auto a2 = make_bf16((size_t)M2 * K2, 37, 0.2f);
+        std::vector<unsigned char> w2((size_t)N2 * (K2 / 256) * 144);
+        for (size_t b = 0; b < w2.size(); b += 144) {
+            w2[b] = 0x1f; w2[b+1] = 0x21; w2[b+2] = 0x1f; w2[b+3] = 0x21;
+            for (int i = 4; i < 144; ++i) w2[b+i] = (unsigned char)((b / 144 * 17 + i * 13) & 255);
+        }
+        uint16_t *da2 = device_copy(a2), *got2 = nullptr, *ref2 = nullptr;
+        unsigned char* dw2 = device_copy(w2);
+        void* q2 = nullptr;
+        const size_t q2_stride = sparkinfer::kernels::llama_q8_1_bytes(K2);
+        bool ok2 = da2 && dw2 && cudaMalloc(&q2, M2 * q2_stride) == cudaSuccess &&
+                   cudaMalloc(&got2, (size_t)M2 * N2 * 2) == cudaSuccess &&
+                   cudaMalloc(&ref2, (size_t)M2 * N2 * 2) == cudaSuccess;
+        if (ok2) {
+            sparkinfer::kernels::launch_quantize_q8_1_rows(da2, q2, K2, M2, K2);
+            ok2 = cudaMemset(got2, 0xff, (size_t)M2 * N2 * 2) == cudaSuccess;
+            ok2 = sparkinfer::kernels::launch_mmvq_rows(12, q2, dw2, got2, M2, N2, K2) && ok2;
+            for (int r = 0; r < M2; ++r)
+                sparkinfer::kernels::launch_mmvq_q4k((const char*)q2 + r * q2_stride,
+                                                   dw2, ref2 + (size_t)r * N2, N2, K2);
+            ok2 = cudaDeviceSynchronize() == cudaSuccess && ok2;
+            ok2 = equal_device(got2, ref2, (size_t)M2 * N2, "Q4_K exact rows M2 K4096") && ok2;
+        }
+        ok = ok2 && ok;
+        cudaFree(da2); cudaFree(dw2); cudaFree(q2); cudaFree(got2); cudaFree(ref2);
+    }
     float *yfm = nullptr, *yfs = nullptr;
     cudaMalloc(&yfm, (size_t)N * MN * sizeof(float));
     cudaMalloc(&yfs, (size_t)N * MN * sizeof(float));

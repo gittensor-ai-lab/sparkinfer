@@ -37,6 +37,11 @@ set_tests_properties(sparse_gate_up_rows_gpu_test PROPERTIES SKIP_RETURN_CODE 77
 add_executable(mmvq_mma_accuracy_gpu_test mmvq_mma_accuracy_gpu_test.cpp)
 target_link_libraries(mmvq_mma_accuracy_gpu_test PRIVATE sparkinfer_kernels CUDA::cudart)
 set_target_properties(mmvq_mma_accuracy_gpu_test PROPERTIES CXX_STANDARD 17)
+# A request larger than the MMA row limit must still let its eight-row chunks use MMA. K=8192
+# is supported by MMA but not the exact DP4A dispatcher, so bypassing MMA rejects this shape.
+add_test(NAME mmvq_mma_chunk_gpu_test COMMAND mmvq_mma_accuracy_gpu_test 40 6656 8192)
+set_tests_properties(mmvq_mma_chunk_gpu_test PROPERTIES SKIP_RETURN_CODE 77
+  ENVIRONMENT "SPARKINFER_MMVQ_MMA=1;SPARKINFER_MMVQ_MMA_MINM=8;SPARKINFER_MMVQ_MMA_MINN=2048")
 # The tensor-core down projection against the MMVQ, dumped per process so the two can be diffed.
 # Not a ctest: it needs two runs with different env to be meaningful, and ~1 GB of device memory.
 add_executable(down_mma_accuracy_gpu_test down_mma_accuracy_gpu_test.cpp)
