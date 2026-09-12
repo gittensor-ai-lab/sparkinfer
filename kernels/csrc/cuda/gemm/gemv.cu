@@ -2175,6 +2175,14 @@ template __global__ void si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, 32, 1>
     const si_block_q8_1*, const unsigned char*, const unsigned char*, const unsigned char*,
     const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
     int, int, int, int, int, int, int, int);
+template __global__ void si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, 16, 1, true>(
+    const si_block_q8_1*, const unsigned char*, const unsigned char*, const unsigned char*,
+    const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
+    int, int, int, int, int, int, int, int);
+template __global__ void si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, 32, 1, true>(
+    const si_block_q8_1*, const unsigned char*, const unsigned char*, const unsigned char*,
+    const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
+    int, int, int, int, int, int, int, int);
 template __global__ void si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, 6, SI_Q4K_OROWS>(
     const si_block_q8_1*, const unsigned char*, const unsigned char*, const unsigned char*,
     const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
@@ -3982,10 +3990,15 @@ __device__ __forceinline__ void si_am_scales(const unsigned char* sc12, int j,
 // needs to fill the grid. SPLITK=false is the single-split case and writes the caller's buffer
 // directly, so one K split costs exactly what it did before this change -- no scratch, no second
 // pass over the output.
-template <bool SPLITK, class OutT>
+// MM is the A-staging height: the width the caller actually dispatched, not SI_AM_MMAX. Same
+// shape and same reasoning as down_q4k_mma_rows_kernel in expert_ffn_q4k.cu, which carries the
+// full note -- the shared A tile (10 KB of 18.75 KB at MM=32) held the SM to five CTAs where the
+// __launch_bounds__ asks for eight, and the M-tile loop issued both m16n8k32 tiles only to
+// discard the second through `lm < M`. Bit-identical at every M.
+template <bool SPLITK, class OutT, int MM>
 __global__ __launch_bounds__(SI_AM_NW * 32, 8)
 void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned char* __restrict__ W,
-                            OutT* __restrict__ acc_out, int M, int N, int K) {
+                            OutT* __restrict__ acc_out, int M, int N, int K, int bdedup) {
     const int nblk = K >> 8;
     const int n0 = blockIdx.x * SI_AM_BN;
     // Balanced, not ceil: 26 super-blocks over 8 splits is 4,4,3,3,3,3,3,3 rather than seven 4s and
@@ -3997,47 +4010,91 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int grp = lane >> 2, tig = lane & 3, sub = lane >> 3, lrow = lane & 7;
 
-    __shared__ signed char As[SI_AM_MMAX][256];
+    __shared__ signed char As[MM][256];
     __shared__ signed char Bs[SI_AM_BN][256];
     __shared__ unsigned char Ssc[SI_AM_BN][8], Smn[SI_AM_BN][8];
     __shared__ float2 Wdm[SI_AM_BN];
-    __shared__ float Ad[SI_AM_MMAX][8], Asum[SI_AM_MMAX][8];
+    __shared__ float Ad[MM][8], Asum[MM][8];
 
-    float facc[2][4];
+    constexpr int NT = (MM + 15) / 16;   // 16-row mma tiles this width actually needs
+    float facc[NT][4];
     #pragma unroll
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < NT; i++)
         #pragma unroll
         for (int e = 0; e < 4; e++) facc[i][e] = 0.f;
 
     for (int sb = sb_lo; sb < sb_hi; sb++) {
-        for (int u = tid; u < SI_AM_BN * 16; u += SI_AM_NW * 32) {
-            const int r = u >> 4, c = u & 15;
-            const int gn = n0 + r;
-            const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
-                W + (size_t)(gn < N ? gn : N - 1) * (size_t)nblk * 144) + sb;
-            const int j = c >> 2, sc_ = c & 3;
-            const bool hi = (sc_ >> 1) & 1;
-            const unsigned* src = reinterpret_cast<const unsigned*>(b->qs + 32 * j + (sc_ & 1) * 16);
-            signed char out[16];
-            #pragma unroll
-            for (int v = 0; v < 4; v++) {
-                const unsigned x = src[v];
+        // A Q4_K byte carries TWO weights and the two land 32 int8 lanes apart in Bs. Indexing
+        // the 16 B chunk and the nibble half together (c = 0..15, hi = c>>1&1) made this loop
+        // walk the super-block's 128 B quant plane TWICE -- once fetching the low nibbles and
+        // once, from the identical addresses, the high ones. Eight units, one fetch, two stores:
+        // the same bytes reach the same shared addresses and the global load count halves.
+        // Bit-identical. SPARKINFER_MMA_BDEDUP=0 restores the two-pass loader.
+        if (bdedup) {
+            for (int u = tid; u < SI_AM_BN * 8; u += SI_AM_NW * 32) {
+                const int r = u >> 3, c = u & 7;
+                const int gn = n0 + r;
+                const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
+                    W + (size_t)(gn < N ? gn : N - 1) * (size_t)nblk * 144) + sb;
+                const int j = c >> 1, h = c & 1;
+                const unsigned* src = reinterpret_cast<const unsigned*>(b->qs + 32 * j + h * 16);
+                signed char lo[16], hi[16];
                 #pragma unroll
-                for (int t = 0; t < 4; t++) {
-                    const unsigned char qq = (unsigned char)((x >> (8 * t)) & 0xFF);
-                    out[4 * v + t] = (signed char)(hi ? (qq >> 4) : (qq & 0xF));
+                for (int v = 0; v < 4; v++) {
+                    const unsigned x = src[v];
+                    #pragma unroll
+                    for (int t = 0; t < 4; t++) {
+                        const unsigned char qq = (unsigned char)((x >> (8 * t)) & 0xFF);
+                        lo[4 * v + t] = (signed char)(qq & 0xF);
+                        hi[4 * v + t] = (signed char)(qq >> 4);
+                    }
+                }
+                const int kb = 64 * j + h * 16;
+                *reinterpret_cast<uint4*>(&Bs[r][si_am_swz(kb, r)]) =
+                    *reinterpret_cast<const uint4*>(lo);
+                *reinterpret_cast<uint4*>(&Bs[r][si_am_swz(kb + 32, r)]) =
+                    *reinterpret_cast<const uint4*>(hi);
+                if (c == 0) {
+                    Wdm[r] = __half22float2(b->dm);
+                    #pragma unroll
+                    for (int jj = 0; jj < 4; jj++) {
+                        unsigned char x0, x1, y0, y1;
+                        si_am_scales(b->scales, jj, x0, x1, y0, y1);
+                        Ssc[r][2 * jj] = x0; Ssc[r][2 * jj + 1] = x1;
+                        Smn[r][2 * jj] = y0; Smn[r][2 * jj + 1] = y1;
+                    }
                 }
             }
-            const int kb = 64 * j + (sc_ >> 1) * 32 + (sc_ & 1) * 16;
-            *reinterpret_cast<uint4*>(&Bs[r][si_am_swz(kb, r)]) = *reinterpret_cast<const uint4*>(out);
-            if (c == 0) {
-                Wdm[r] = __half22float2(b->dm);
+        } else {
+            for (int u = tid; u < SI_AM_BN * 16; u += SI_AM_NW * 32) {
+                const int r = u >> 4, c = u & 15;
+                const int gn = n0 + r;
+                const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
+                    W + (size_t)(gn < N ? gn : N - 1) * (size_t)nblk * 144) + sb;
+                const int j = c >> 2, sc_ = c & 3;
+                const bool hi = (sc_ >> 1) & 1;
+                const unsigned* src = reinterpret_cast<const unsigned*>(b->qs + 32 * j + (sc_ & 1) * 16);
+                signed char out[16];
                 #pragma unroll
-                for (int jj = 0; jj < 4; jj++) {
-                    unsigned char x0, x1, y0, y1;
-                    si_am_scales(b->scales, jj, x0, x1, y0, y1);
-                    Ssc[r][2 * jj] = x0; Ssc[r][2 * jj + 1] = x1;
-                    Smn[r][2 * jj] = y0; Smn[r][2 * jj + 1] = y1;
+                for (int v = 0; v < 4; v++) {
+                    const unsigned x = src[v];
+                    #pragma unroll
+                    for (int t = 0; t < 4; t++) {
+                        const unsigned char qq = (unsigned char)((x >> (8 * t)) & 0xFF);
+                        out[4 * v + t] = (signed char)(hi ? (qq >> 4) : (qq & 0xF));
+                    }
+                }
+                const int kb = 64 * j + (sc_ >> 1) * 32 + (sc_ & 1) * 16;
+                *reinterpret_cast<uint4*>(&Bs[r][si_am_swz(kb, r)]) = *reinterpret_cast<const uint4*>(out);
+                if (c == 0) {
+                    Wdm[r] = __half22float2(b->dm);
+                    #pragma unroll
+                    for (int jj = 0; jj < 4; jj++) {
+                        unsigned char x0, x1, y0, y1;
+                        si_am_scales(b->scales, jj, x0, x1, y0, y1);
+                        Ssc[r][2 * jj] = x0; Ssc[r][2 * jj + 1] = x1;
+                        Smn[r][2 * jj] = y0; Smn[r][2 * jj + 1] = y1;
+                    }
                 }
             }
         }
@@ -4067,9 +4124,9 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
             // Ablating this fold-in measured it at 111 us of the kernel's 169.
             const float sA = dmA.x * (float)Ssc[lnA][g],     mA = dmA.y * (float)Smn[lnA][g];
             const float sB = dmB.x * (float)Ssc[lnA + 1][g], mB = dmB.y * (float)Smn[lnA + 1][g];
-            float adv[2][2], asv[2][2];
+            float adv[NT][2], asv[NT][2];
             #pragma unroll
-            for (int ii = 0; ii < 2; ii++)
+            for (int ii = 0; ii < NT; ii++)
                 #pragma unroll
                 for (int eh = 0; eh < 2; eh++) {
                     const int lmv = ii * 16 + grp + eh * 8;
@@ -4077,18 +4134,18 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
                     asv[ii][eh] = lmv < M ? Asum[lmv][g] : 0.f;
                 }
 
-            unsigned af[2][4], bf0, bf1, bx, by;
+            unsigned af[NT][4], bf0, bf1, bx, by;
             #pragma unroll
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < NT; i++) {
                 const int row = i * 16 + (sub & 1) * 8 + lrow;
                 si_am_ldm(af[i][0], af[i][1], af[i][2], af[i][3],
-                          &As[row < SI_AM_MMAX ? row : 0][si_am_swz(kk + (sub >> 1) * 16, row)]);
+                          &As[row < MM ? row : 0][si_am_swz(kk + (sub >> 1) * 16, row)]);
             }
             const int col = warp * 8 + lrow;
             si_am_ldm(bf0, bf1, bx, by, &Bs[col][si_am_swz(kk + (sub & 1) * 16, col)]);
             (void)bx; (void)by;
             #pragma unroll
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < NT; i++) {
                 int acc[4] = {0, 0, 0, 0};
                 asm volatile(
                     "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -4112,7 +4169,7 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
     }
 
     #pragma unroll
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < NT; i++)
         #pragma unroll
         for (int e = 0; e < 4; e++) {
             const int lm = i * 16 + grp + (e >> 1) * 8;
@@ -4148,6 +4205,26 @@ static int si_am_slot_for(cudaStream_t stream) {
     return used++;
 }
 
+// Narrowest instantiation that covers M -- see the note on the kernel. SPARKINFER_MMA_ASTAGE=0
+// pins every width back to the 32-row kernel, so both arms of an A/B come out of ONE binary.
+// SPARKINFER_MMA_BDEDUP=0 restores the two-pass B loader, so both arms come out of ONE binary.
+static inline int si_am_bdedup() {
+    static const int on = [] {
+        const char* e = getenv("SPARKINFER_MMA_BDEDUP");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    return on;
+}
+
+static inline int si_am_astage(int M) {
+    static const int on = [] {
+        const char* e = getenv("SPARKINFER_MMA_ASTAGE");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (!on) return SI_AM_MMAX;
+    return M <= 8 ? 8 : (M <= 16 ? 16 : SI_AM_MMAX);
+}
+
 static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void* y,
                                             int M, int N, int K, cudaStream_t stream) {
     if (M < 2 || M > SI_AM_MMAX || (K & 255) || (N % SI_AM_BN)) return false;
@@ -4160,11 +4237,19 @@ static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void
     // One split needs no accumulator and no epilogue: straight into the caller's bf16, which is
     // what this arm did before split-K existed. SPARKINFER_MMVQ_MMA_SPLITK=1 therefore reproduces
     // the previous behaviour exactly, so both arms of an A/B come out of ONE binary.
+    const int st_ = si_am_astage(M);
+    const int bd = si_am_bdedup();
     if (nsk == 1) {
-        si_mmvq_q4k_mma_kernel<false, __nv_bfloat16>
-            <<<dim3(N / SI_AM_BN, 1), dim3(SI_AM_NW * 32), 0, stream>>>(
-            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
-            reinterpret_cast<__nv_bfloat16*>(y), M, N, K);
+        const dim3 g1(N / SI_AM_BN, 1), b1(SI_AM_NW * 32);
+        const si_block_q8_1* qa = reinterpret_cast<const si_block_q8_1*>(q81);
+        const unsigned char* wa = reinterpret_cast<const unsigned char*>(W);
+        __nv_bfloat16* ya = reinterpret_cast<__nv_bfloat16*>(y);
+        if (st_ <= 8)       si_mmvq_q4k_mma_kernel<false, __nv_bfloat16, 8>
+                                <<<g1, b1, 0, stream>>>(qa, wa, ya, M, N, K, bd);
+        else if (st_ <= 16) si_mmvq_q4k_mma_kernel<false, __nv_bfloat16, 16>
+                                <<<g1, b1, 0, stream>>>(qa, wa, ya, M, N, K, bd);
+        else                si_mmvq_q4k_mma_kernel<false, __nv_bfloat16, SI_AM_MMAX>
+                                <<<g1, b1, 0, stream>>>(qa, wa, ya, M, N, K, bd);
         return true;
     }
     const int slot = si_am_slot_for(stream);
@@ -4172,9 +4257,17 @@ static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void
     float* acc = nullptr;
     if (cudaGetSymbolAddress(reinterpret_cast<void**>(&acc), si_am_acc) != cudaSuccess) return false;
     acc += (size_t)slot * SI_AM_MMAX * 6656u;
-    si_mmvq_q4k_mma_kernel<true, float><<<dim3(N / SI_AM_BN, nsk), dim3(SI_AM_NW * 32), 0, stream>>>(
-        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
-        acc, M, N, K);
+    {
+        const dim3 gk(N / SI_AM_BN, nsk), bk(SI_AM_NW * 32);
+        const si_block_q8_1* qa = reinterpret_cast<const si_block_q8_1*>(q81);
+        const unsigned char* wa = reinterpret_cast<const unsigned char*>(W);
+        if (st_ <= 8)       si_mmvq_q4k_mma_kernel<true, float, 8>
+                                <<<gk, bk, 0, stream>>>(qa, wa, acc, M, N, K, bd);
+        else if (st_ <= 16) si_mmvq_q4k_mma_kernel<true, float, 16>
+                                <<<gk, bk, 0, stream>>>(qa, wa, acc, M, N, K, bd);
+        else                si_mmvq_q4k_mma_kernel<true, float, SI_AM_MMAX>
+                                <<<gk, bk, 0, stream>>>(qa, wa, acc, M, N, K, bd);
+    }
     const size_t n = (size_t)M * (size_t)N;
     const int thr = 256;
     si_mmvq_q4k_mma_epilogue_kernel<<<(unsigned)((n + thr - 1) / thr), thr, 0, stream>>>(
@@ -4197,9 +4290,19 @@ bool launch_mmvq_q4k_mma_head_f32(const void* q81, const void* W, float* y,
     static int head_mma_min = -1;
     if (head_mma_min < 0) { const char* e = getenv("SPARKINFER_HEAD_MMA_MINROWS"); head_mma_min = e ? atoi(e) : 8; }
     if (M < head_mma_min || M > SI_AM_MMAX || (K & 255) || (N % SI_AM_BN)) return false;
-    si_mmvq_q4k_mma_kernel<false, float><<<dim3(N / SI_AM_BN, 1), dim3(SI_AM_NW * 32), 0, stream>>>(
-        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
-        y, M, N, K);
+    {
+        const dim3 gh(N / SI_AM_BN, 1), bh(SI_AM_NW * 32);
+        const si_block_q8_1* qa = reinterpret_cast<const si_block_q8_1*>(q81);
+        const unsigned char* wa = reinterpret_cast<const unsigned char*>(W);
+        const int sth = si_am_astage(M);
+        const int bd = si_am_bdedup();
+        if (sth <= 8)       si_mmvq_q4k_mma_kernel<false, float, 8>
+                                <<<gh, bh, 0, stream>>>(qa, wa, y, M, N, K, bd);
+        else if (sth <= 16) si_mmvq_q4k_mma_kernel<false, float, 16>
+                                <<<gh, bh, 0, stream>>>(qa, wa, y, M, N, K, bd);
+        else                si_mmvq_q4k_mma_kernel<false, float, SI_AM_MMAX>
+                                <<<gh, bh, 0, stream>>>(qa, wa, y, M, N, K, bd);
+    }
     return true;
 }
 
@@ -4242,7 +4345,12 @@ bool launch_mmvq_q4k_rows_multi(const void* q81, const void* const* W, void* con
                                 const int* Ns, int nmat, int M, int K, cudaStream_t stream,
                                 bool q6_last) {
     if (nmat < 1 || nmat > 4 || M < 1 || M > 32 || K != 6656) return false;
-    if (q6_last && (nmat < 2 || M > 8)) return false;   // only the narrow, 4-wide Muse shape
+    // The Q6_K slot is width-generic (its body loops m < M under an MMAX bound and folds through
+    // the same 4-warp reduction at every width); it was simply not instantiated past eight rows,
+    // so half of Muse's layers kept paying a 256-block launch of their own at c16/c32 -- 52
+    // launches and 0.68 ms of a 19.5 ms step to move 36 MB. SPARKINFER_MUSE_V6_WIDE=0 keeps the
+    // caller off the wide q6 path entirely, so both arms come out of ONE binary.
+    if (q6_last && nmat < 2) return false;
     for (int i = 0; i < nmat; i++) if (!W[i] || !y[i] || Ns[i] < 1) return false;
     // Past eight rows launch_mmvq_rows chunks the batch into groups of eight, and every chunk
     // re-reads the whole matrix. For a 256-row projection that is the dominant cost: at 32 rows
@@ -4274,7 +4382,8 @@ bool launch_mmvq_q4k_rows_multi(const void* q81, const void* const* W, void* con
 #define SI_Q4K_MULTI6(MM, ORV) si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, MM, ORV, true> \
     <<<grid, 4 * 32, 0, stream>>>(q, w[0], w[1], w[2], w[3], o[0], o[1], o[2], o[3], \
                                   n[0], n[1], n[2], n[3], b1, b2, b3, M)
-    if (q6_last) { if (M <= 6) SI_Q4K_MULTI6(6, SI_Q4K_OROWS); else SI_Q4K_MULTI6(8, SI_Q4K_OROWS); }
+    if (q6_last && wide) { if (M <= 16) SI_Q4K_MULTI6(16, 1); else SI_Q4K_MULTI6(32, 1); }
+    else if (q6_last) { if (M <= 6) SI_Q4K_MULTI6(6, SI_Q4K_OROWS); else SI_Q4K_MULTI6(8, SI_Q4K_OROWS); }
     else if (!wide) { if (M <= 6) SI_Q4K_MULTI(6, SI_Q4K_OROWS); else SI_Q4K_MULTI(8, SI_Q4K_OROWS); }
     else if (M <= 16) SI_Q4K_MULTI(16, 1);
     else              SI_Q4K_MULTI(32, 1);

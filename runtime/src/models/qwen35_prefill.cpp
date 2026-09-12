@@ -3884,7 +3884,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 Wp[nm] = w.wk; Yp[nm] = kf; Ns[nm++] = kvdim;
                 // v joins the same grid whether it is Q4_K or Q6_K (14); a Q6_K v takes the
                 // last slot and the kernel runs the Q6_K dot for those blocks.
-                const bool v6 = !wide && !v4 && w.wv_type == 14;
+                // A Q6_K v can ride the fused grid at ANY width -- the multi kernel carries a
+                // Q6_K last slot and runs the Q6_K dot for those blocks. Restricting it to the
+                // narrow branch left half of Muse's layers issuing a 256-block launch of their
+                // own at c16/c32: 52 launches and 0.68 ms of a 19.5 ms step to move 36 MB, i.e.
+                // 0.05 TB/s -- pure launch and tail latency. SPARKINFER_MUSE_V6_WIDE=0 restores.
+                static const bool v6_wide = [] {
+                    const char* e = getenv("SPARKINFER_MUSE_V6_WIDE");
+                    return !(e && e[0] == '0');
+                }();
+                const bool v6 = (v6_wide || !wide) && !v4 && w.wv_type == 14;
                 if (v4 || v6) { Wp[nm] = w.wv; Yp[nm] = vf; Ns[nm++] = kvdim; }
                 const bool fused = fuseable && proj_multi_q4k(xn, Wp, Yp, Ns, nm, H, v6);
                 if (fused)
