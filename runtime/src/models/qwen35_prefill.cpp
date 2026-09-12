@@ -334,6 +334,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     static cudaGraph_t     g_pfb_graph = nullptr;
     static cudaGraphExec_t g_pfb_exec  = nullptr;
     static int  g_pfb_n = -1, g_pfb_warm_n = -1, g_pfb_pin_cap = 0;
+    // Set only while re-running a pass whose graph capture failed, so the retry does not try to
+    // capture again -- which is also what bounds the recursion to one level. See the
+    // capture-failure branch at the end of this function.
+    static thread_local bool g_pfb_redo = false;
     static int* g_pfb_pin = nullptr;
     static const void* g_pfb_model_key = nullptr;
     static const void* g_pfb_lin_key = nullptr;
@@ -698,8 +702,37 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (ffn_all_fp4 && !ffn_i8_stage_force && a_i8_full > a_i8_rows_n) {
         size_t fb = 0, tb = 0;
         if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
-            const size_t margin = (size_t)256 << 20;
-            if (fb <= 2 * a_i8_full + maxw + fp4_want + margin) ffn_i8_stage = false;
+            // Ask whether the ffn-wide term is the thing that does not fit -- not merely whether
+            // VRAM is tight. Everything else this arena and the FP4 legs take is allocated either
+            // way, so it belongs on BOTH sides of the question and a slack margin on top of it
+            // belongs on neither: it decides nothing about the staging and only makes the test
+            // fire earlier.
+            //
+            // That is what it did. The continuous-batch prefill runs at N = 256 with FC == N, so
+            // the ffn-wide term is 2 * (256*19968 - 256*6656) = 6.8 MB -- against a 256 MB margin.
+            // At 32 concurrent requests the KV pool leaves ~330 MB free, the old test read that as
+            // pressure and dropped 6.8 MB that could not have relieved it, and A_i8 came out too
+            // small for ffn_down's int8 arm. ffn_down has no FP4 operand at that footprint either,
+            // so it fell all the way back to dequant-to-bf16 plus pf_gemm_kernel: 1.79 s of a
+            // 8.35 s wall, 33 prefills x 52 layers, measured on an RTX 5090 (deq_q4k_coalesced
+            // 385 ms + pf_gemm 1408 ms). Concurrency 16, which has the VRAM, never took the branch
+            // and ran ffn_down on the tensor cores throughout.
+            //
+            // So drop it only when it is BOTH what does not fit and enough on its own to fix that.
+            // Where dropping it would not have made the set fit anyway, keeping it costs nothing
+            // that was not already lost and keeps the int8 down projection.
+            //
+            // SPARKINFER_PREFILL_FFN_I8_STAGE=0 restores the margin test above (A/B in ONE binary).
+            static const bool stage_margin = [] {
+                const char* e = getenv("SPARKINFER_PREFILL_FFN_I8_STAGE");
+                return e && e[0] == '0';
+            }();
+            const size_t other = maxw + fp4_want;      // taken either way
+            if (stage_margin) {
+                if (fb <= 2 * a_i8_full + other + ((size_t)256 << 20)) ffn_i8_stage = false;
+            } else if (fb <= other + 2 * a_i8_full && fb > other + 2 * a_i8_rows_n) {
+                ffn_i8_stage = false;
+            }
         }
     }
     const size_t a_i8_dense = ffn_i8_stage ? a_i8_full : a_i8_rows_n;
@@ -1350,7 +1383,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
         g_pfb_n = -1;
     }
-    if (graph_ok && !g_pfb_exec && g_pfb_warm_n == N) {
+    if (graph_ok && !g_pfb_exec && g_pfb_warm_n == N && !g_pfb_redo) {
         if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess)
             pfb_capturing = true;
     }
@@ -3003,8 +3036,29 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 return -1;
             }
         } else {
-            fprintf(stderr, "[prefill] graph capture failed -> fallback\n");
-            return -1;
+            // A failed capture RECORDED this pass; it never ran it. No device state has moved, so
+            // the pass can simply be redone without capture -- one prefill, ~30 ms.
+            //
+            // Returning -1 instead sent the caller to the token loop, and that is expensive in a
+            // way nothing here priced: measured on an RTX 5090 at 32 concurrent requests, one
+            // 256-token prompt taking that road costs 2.3 s of an 8.4 s wall. It is also the whole
+            // of what has been recorded as "muse-cb-decode@c32 is bimodal" -- every slow run
+            // prints this line and no fast run does, in both arms of every A/B. EndCapture reports
+            // cudaErrorStreamCaptureUnjoined and the capture is already torn down by the time it
+            // does, so the forked branch cannot be identified from here; it does not have to be,
+            // because a recorded pass is recoverable whatever invalidated it.
+            if (g) cudaGraphDestroy(g);
+            // SPARKINFER_PREFILL_GRAPH_REDO=0 restores the token-loop fallback (A/B in ONE binary).
+            static const bool redo_on = [] {
+                const char* e = getenv("SPARKINFER_PREFILL_GRAPH_REDO");
+                return !(e && e[0] == '0');
+            }();
+            if (!redo_on) { fprintf(stderr, "[prefill] graph capture failed -> fallback\n"); return -1; }
+            fprintf(stderr, "[prefill] graph capture failed -> redoing the pass uncaptured\n");
+            g_pfb_redo = true;
+            const int again = prefill_batched_run(s, prompt_ids, n, pos0);
+            g_pfb_redo = false;
+            return again;
         }
     }
     g_pfb_warm_n = N;
