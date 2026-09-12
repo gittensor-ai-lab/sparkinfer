@@ -3605,6 +3605,38 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // order and folds the same S partials -- only which launch carries it changes. It declines
     // (and the caller issues the singles) for any shape where a CTA could straddle the boundary.
     // Returns false when it did NOT fuse, so the caller falls back rather than skipping work.
+    // The Q4_K counterpart of proj_pair_nv_on below, over FOUR matrices instead of two.
+    // Muse Glimmer's attention block reads one `xn` for q, the separate attn_gate tensor, k and
+    // v, and issues four launches because Muse keeps the gate as its own [qdim, H] tensor rather
+    // than the [q|gate] interleave the other architectures ship. The two kvdim projections are
+    // the same "grid too small to fill the device" case the pair helper describes -- and the same
+    // one launch_mmvq_rows names where it keeps k and v off the mma path ("would launch eight
+    // blocks onto 170 SMs and the per-launch cost swamps the saved weight reads"). One grid over
+    // all four pays the activation read, the launch and the ragged k tail once instead of four
+    // times, and q and the gate are wide enough to keep it full while k and v ride along.
+    // Bit-identical to the singles: a block still owns OROWS consecutive rows of ONE matrix and
+    // runs the same body in the same order; only which grid carries it changes.
+    // Returns false, having issued nothing but the shared quantize, when it did NOT fuse.
+    // SPARKINFER_MUSE_INPROJ_FUSED=0 restores the four separate projections.
+    // qwen35.cpp's AR decode has driven Muse's sandwich tail through ONE fused kernel since it
+    // was written (launch_muse_sandwich_tail: x = residual + norm(branch), xn = rmsnorm(x), and
+    // Q8_1(xn) for the next MMVQ, in one pass). The packed path never picked it up and still
+    // issues norm_then_add + rmsnorm + quantize separately -- three launches per sandwich point,
+    // twice a layer, each on a grid of N CTAs. At the packed widths that is ~2 CTAs of a 170-SM
+    // device per launch, i.e. almost pure launch and memory latency.
+    // SPARKINFER_MUSE_PACKED_TAIL=0 restores the separate launches.
+    static const bool packed_tail = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED_TAIL");
+        return !(e && e[0] == '0');
+    }();
+    auto proj_multi_q4k = [&](const bf16* in, const void* const* Wp, void* const* Yp,
+                              const int* Ns, int nmat, int k, bool q6_last = false) -> bool {
+        static const int on = [] { const char* e = getenv("SPARKINFER_MUSE_INPROJ_FUSED");
+                                   return (e && e[0] == '0') ? 0 : 1; }();
+        if (!on) return false;
+        if (q81_src != in || q81_k != k) quant_rows(in, k);
+        return kernels::launch_mmvq_q4k_rows_multi(q81, Wp, Yp, Ns, nmat, N, k, st, q6_last);
+    };
     auto proj_pair_nv_on = [&](cudaStream_t ps, const bf16* in, const void* w0, int t0,
                                const void* w1, int t1, bf16* o0, bf16* o1, int no, int k) -> bool {
         if (t0 != kernels::SI_QTYPE_NVFP4 || t1 != kernels::SI_QTYPE_NVFP4) return false;
@@ -3829,10 +3861,43 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // Muse keeps attn_gate as its OWN [qdim, H] tensor rather than the [q|gate] interleave
             // every other architecture here ships, so Q goes straight to qb and the gate straight
             // to qg. Projecting w.wq as one 2*qdim-wide matrix would read qdim rows PAST it.
-            supported = proj(xn, w.wq, w.wq_type, qb, qdim, H) &&
-                        w.wgate && proj(xn, w.wgate, w.wgate_type, qg, qdim, H) &&
-                        proj(xn, w.wk, w.wk_type, kf, kvdim, H) &&
-                        proj(xn, w.wv, w.wv_type, vf, kvdim, H);
+            // One grid for the Q4_K ones (12 = Q4_K). A Q4_K_M file gives half of Muse's
+            // layers a Q6_K attn_v, so the fusion takes q/gate/k plus v only where v is Q4_K
+            // too, and a Q6_K v follows on its own path exactly as before.
+            {
+                const bool v4 = (w.wv_type == 12);
+                // Which projections share the grid depends on the width. Under nine rows all
+                // four want it: none of them reaches the int8 mma arm, and q and the gate are
+                // what keep the grid full while k and v ride along. From nine rows up, q and the
+                // gate DO reach that arm (launch_mmvq_rows takes it at M >= 8 for N >= 2048) and
+                // must be left to it -- but k and v never qualify on N, so they stay on the
+                // chunked dp4a path and are exactly the launches worth collapsing.
+                const bool wide = N > 8;
+                const bool fuseable = wide ? (w.wk_type == 12)
+                                           : (w.wgate && w.wq_type == 12 &&
+                                              w.wgate_type == 12 && w.wk_type == 12);
+                const void* Wp[4]; void* Yp[4]; int Ns[4]; int nm = 0;
+                if (!wide) {
+                    Wp[nm] = w.wq;    Yp[nm] = qb; Ns[nm++] = qdim;
+                    Wp[nm] = w.wgate; Yp[nm] = qg; Ns[nm++] = qdim;
+                }
+                Wp[nm] = w.wk; Yp[nm] = kf; Ns[nm++] = kvdim;
+                // v joins the same grid whether it is Q4_K or Q6_K (14); a Q6_K v takes the
+                // last slot and the kernel runs the Q6_K dot for those blocks.
+                const bool v6 = !wide && !v4 && w.wv_type == 14;
+                if (v4 || v6) { Wp[nm] = w.wv; Yp[nm] = vf; Ns[nm++] = kvdim; }
+                const bool fused = fuseable && proj_multi_q4k(xn, Wp, Yp, Ns, nm, H, v6);
+                if (fused)
+                    supported =
+                        (!wide || (proj(xn, w.wq, w.wq_type, qb, qdim, H) &&
+                                   w.wgate && proj(xn, w.wgate, w.wgate_type, qg, qdim, H))) &&
+                        (v4 || v6 || proj(xn, w.wv, w.wv_type, vf, kvdim, H));
+                else
+                    supported = proj(xn, w.wq, w.wq_type, qb, qdim, H) &&
+                                w.wgate && proj(xn, w.wgate, w.wgate_type, qg, qdim, H) &&
+                                proj(xn, w.wk, w.wk_type, kf, kvdim, H) &&
+                                proj(xn, w.wv, w.wv_type, vf, kvdim, H);
+            }
             if (!supported) break;
             // QK-norm is per HEAD vector, so N tokens is just N*heads rows of the same kernel.
             kernels::launch_rmsnorm(qb, w.q_norm, qb, N * c.n_q_heads,  c.head_dim, c.rms_eps, st);
@@ -3887,11 +3952,20 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // output is normed ALONE and then added, and that norm uses its own 1e-8 post_norm_eps
             // rather than the model's rms_eps. ffn_norm is a genuine separate pre-FFN norm here,
             // not post_attn_norm doing double duty like every other architecture in this file.
-            kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
-            kernels::launch_rmsnorm(h, w.ffn_norm, hn, N, H, c.rms_eps, st);
+            bool hn_q8_ready = false;
+            if (packed_tail) {
+                // The tail also hands the FFN its input already quantized; nothing between here
+                // and the dense FFN touches q81 on this architecture, exactly as AR relies on.
+                hn_q8_ready = kernels::launch_muse_sandwich_tail(
+                    x, ao, w.post_attn_norm, w.ffn_norm, h, hn, q81, N, H, 1e-8f, c.rms_eps, st);
+            } else {
+                kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
+                kernels::launch_rmsnorm(h, w.ffn_norm, hn, N, H, c.rms_eps, st);
+            }
             if (L == 0) { vdbg_snapshot2(h, 1); vdbg_snapshot2(hn, 2); }
             // Dense SwiGLU through the same one-expert call AR decode makes, at N rows.
-            quant_rows(hn, H);
+            if (hn_q8_ready) { q81_src = hn; q81_k = H; }
+            else quant_rows(hn, H);
             // Wide enough to be worth a block-scaled GEMM: run gate/up through the FP4 operands
             // this model already holds for prefill and hand the pair to the call below, which then
             // does only the SwiGLU and the GGUF down GEMV.
@@ -3905,13 +3979,22 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                gu_gemm ? sg : nullptr, gu_gemm ? su : nullptr);
             if (L == 0) vdbg_snapshot2(routed, 3);
             // Sandwich norm (post-FFN): x = h + RMSNorm(routed) * post_ffn_norm, same 1e-8.
-            kernels::launch_norm_then_add(h, routed, w.post_ffn_norm, x, N, H, 1e-8f, st);
             const void* nn = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-            kernels::launch_rmsnorm(x, nn, xn, N, H, c.rms_eps, st);
+            bool xn_q8_ready = false;
+            if (packed_tail) {
+                xn_q8_ready = kernels::launch_muse_sandwich_tail(
+                    h, routed, w.post_ffn_norm, nn, x, xn, q81, N, H, 1e-8f, c.rms_eps, st);
+            } else {
+                kernels::launch_norm_then_add(h, routed, w.post_ffn_norm, x, N, H, 1e-8f, st);
+                kernels::launch_rmsnorm(x, nn, xn, N, H, c.rms_eps, st);
+            }
             // The Q8_1 memo is keyed on the buffer that produced it; xn is a fresh value in the
-            // SAME buffer, so leaving the key set would hand the next layer's projections the
-            // PREVIOUS layer's quantization. Nothing here emits Q8_1(xn), so clear it outright.
-            q81_src = nullptr; q81_k = 0;
+            // SAME buffer, so leaving a STALE key would hand the next layer's projections the
+            // previous layer's quantization. Point it at xn when the tail emitted Q8_1(xn) --
+            // which is what lets those projections skip their own quantize -- and clear it
+            // otherwise, exactly as before.
+            if (xn_q8_ready) { q81_src = xn; q81_k = H; }
+            else { q81_src = nullptr; q81_k = 0; }
             capture(L);
             continue;
         }

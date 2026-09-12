@@ -2007,16 +2007,20 @@ template __global__ void si_mmvq_q4k_kfixed_kernel<float, 20>(const si_block_q8_
 // against 0.7 GB of weights. Groups inside a CTA read the same activation, so GRP of them share
 // one pull. Measured end to end at ctx=4k: the head is 0.771 ms/step at GRP=1 against a draft-side
 // multi-row head that moves the same bytes in 0.578, and that gap is what this closes.
+// Body of the kernel below, with the block index passed in rather than read from blockIdx, so
+// that one grid can cover SEVERAL weight matrices (si_mmvq_q4k_rows_multi_kernel).  Every output
+// row keeps the same thread -> (super-block, sub-block) map, the same two-stage four-warp
+// reduction and the same accumulation order it has today; only which block computes it moves.
 template <typename OutT, int NSUPER, int MMAX, int OROWS, int GRP>
-__global__ void si_mmvq_q4k_rows_exact_kernel(const si_block_q8_1* __restrict__ q,
-                                              const unsigned char* __restrict__ W,
-                                              OutT* __restrict__ y, int M, int N) {
+__device__ __forceinline__ void si_mmvq_q4k_rows_exact_body(
+        const si_block_q8_1* __restrict__ q, const unsigned char* __restrict__ W,
+        OutT* __restrict__ y, int M, int N, int bx) {
     constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
     constexpr int QPR = NSUPER * 8;
     const int grp = threadIdx.x / (NW * WS);
     const int tid = threadIdx.x - grp * (NW * WS);      // thread id WITHIN the group
     const int lane = tid & 31, warp = tid >> 5;
-    const int row0 = (blockIdx.x * GRP + grp) * OROWS;
+    const int row0 = (bx * GRP + grp) * OROWS;
     __shared__ float partial[GRP][OROWS][MMAX][NW - 1][WS];
     if (row0 < N) {
         const int orows = (N - row0 < OROWS) ? (N - row0) : OROWS;
@@ -2062,6 +2066,98 @@ __global__ void si_mmvq_q4k_rows_exact_kernel(const si_block_q8_1* __restrict__ 
         __syncthreads();   // every thread of the CTA must reach the same barrier
     }
 }
+
+template <typename OutT, int NSUPER, int MMAX, int OROWS, int GRP>
+__global__ void si_mmvq_q4k_rows_exact_kernel(const si_block_q8_1* __restrict__ q,
+                                              const unsigned char* __restrict__ W,
+                                              OutT* __restrict__ y, int M, int N) {
+    si_mmvq_q4k_rows_exact_body<OutT, NSUPER, MMAX, OROWS, GRP>(q, W, y, M, N, blockIdx.x);
+}
+
+// Up to four weight matrices that share ONE activation, in ONE grid.
+//
+// Muse Glimmer's attention block projects the same `xn` four times -- q, the separate attn_gate
+// tensor, k and v -- and because Muse keeps the gate as its own [qdim, H] tensor instead of the
+// [q|gate] interleave the other architectures ship, they cannot be merged by pointer arithmetic
+// and go out as four launches.  Two of those are the kvdim projections, and at Muse's kv width a
+// row-batched grid is only 128 blocks: less than one wave of a 170-SM device, so they are almost
+// entirely launch and tail latency rather than work.  Concatenating the four row spaces into one
+// grid pays the activation read, the launch and the ragged k tail once for all of them.
+//
+// Each matrix's row space is padded up to a whole number of blocks, so a block never straddles
+// two matrices and every block runs exactly the body above for its own (W, y, N).  Bit-identical
+// to the four separate launches, row for row.
+// Defined further down with the rest of the Q6_K path; declared here so the multi kernel can
+// carry a Q6_K slot without moving either definition.
+__device__ __forceinline__ float si_vec_dot_q6_K(const unsigned char* __restrict__ bq6,
+                                                 const si_block_q8_1* __restrict__ bq8_1, int iqs);
+
+// Q6LAST: Muse's attn_v is Q6_K on half its layers, and that is the ONLY slot that can carry a
+// different weight type. Blocks that land in the last matrix's range then run the Q6_K dot
+// instead -- one output row per block, the same map and the same 4-warp fold
+// si_mmvq_q6k_rows_exact_kernel uses, so those rows stay bit-identical to the standalone launch
+// they replace. Everything else about the grid is unchanged, so a Q6_K v rides along with q, the
+// gate and k rather than paying its own 256-block launch.
+template <typename OutT, int NSUPER, int MMAX, int OROWS, bool Q6LAST = false>
+__global__ void si_mmvq_q4k_rows_multi_kernel(
+        const si_block_q8_1* __restrict__ q,
+        const unsigned char* __restrict__ W0, const unsigned char* __restrict__ W1,
+        const unsigned char* __restrict__ W2, const unsigned char* __restrict__ W3,
+        OutT* __restrict__ y0, OutT* __restrict__ y1,
+        OutT* __restrict__ y2, OutT* __restrict__ y3,
+        int N0, int N1, int N2, int N3, int b1, int b2, int b3, int M) {
+    int bx = blockIdx.x;
+    const unsigned char* W; OutT* y; int N;
+    bool q6 = false;
+    if (bx < b1)      { W = W0; y = y0; N = N0; }
+    else if (bx < b2) { W = W1; y = y1; N = N1; bx -= b1; }
+    else if (bx < b3) { W = W2; y = y2; N = N2; bx -= b2; }
+    else              { W = W3; y = y3; N = N3; bx -= b3; q6 = Q6LAST; }
+    if (Q6LAST && q6) {
+        constexpr int NW = 4, WS = 32, vdr = 1, qi = 32;
+        constexpr int QPR = NSUPER * 8;
+        constexpr int blocks_per_iter = vdr * NW * WS / qi;
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+        __shared__ float partial6[MMAX][NW - 1][WS];
+        if (bx < N) {
+            const unsigned char* x_row = W + (size_t)bx * NSUPER * 210;
+            float tmp[MMAX];
+            #pragma unroll
+            for (int m = 0; m < MMAX; m++) tmp[m] = 0.f;
+            #pragma unroll
+            for (int kbx = tid / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
+                const int kqs = vdr * (tid % (qi / vdr));
+                #pragma unroll
+                for (int m = 0; m < MMAX; m++)
+                    if (m < M)
+                        tmp[m] += si_vec_dot_q6_K(x_row + (size_t)kbx * 210,
+                                                  q + (size_t)m * QPR + kbx * 8, kqs);
+            }
+            if (warp > 0) {
+                #pragma unroll
+                for (int m = 0; m < MMAX; m++) if (m < M) partial6[m][warp - 1][lane] = tmp[m];
+            }
+            __syncthreads();
+            if (warp == 0) {
+                #pragma unroll
+                for (int m = 0; m < MMAX; m++) {
+                    if (m >= M) break;
+                    #pragma unroll
+                    for (int l = 0; l < NW - 1; l++) tmp[m] += partial6[m][l][lane];
+                    #pragma unroll
+                    for (int sft = 16; sft > 0; sft >>= 1)
+                        tmp[m] += __shfl_xor_sync(0xffffffff, tmp[m], sft);
+                    if (lane == 0) gemv_write(y + (size_t)m * N + bx, tmp[m]);
+                }
+            }
+        } else {
+            __syncthreads();
+        }
+        return;
+    }
+    si_mmvq_q4k_rows_exact_body<OutT, NSUPER, MMAX, OROWS, 1>(q, W, y, M, N, bx);
+}
+
 #ifndef _MSC_VER
 template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 8, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
@@ -2071,6 +2167,22 @@ template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 8, 8, SI_Q4K_OROWS
     const si_block_q8_1*, const unsigned char*, float*, int, int);
 template __global__ void si_mmvq_q4k_rows_exact_kernel<float, 16, 8, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, float*, int, int);
+template __global__ void si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, 16, 1>(
+    const si_block_q8_1*, const unsigned char*, const unsigned char*, const unsigned char*,
+    const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
+    int, int, int, int, int, int, int, int);
+template __global__ void si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, 32, 1>(
+    const si_block_q8_1*, const unsigned char*, const unsigned char*, const unsigned char*,
+    const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
+    int, int, int, int, int, int, int, int);
+template __global__ void si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, 6, SI_Q4K_OROWS>(
+    const si_block_q8_1*, const unsigned char*, const unsigned char*, const unsigned char*,
+    const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
+    int, int, int, int, int, int, int, int);
+template __global__ void si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, 8, SI_Q4K_OROWS>(
+    const si_block_q8_1*, const unsigned char*, const unsigned char*, const unsigned char*,
+    const unsigned char*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
+    int, int, int, int, int, int, int, int);
 template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 6, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
 template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 16, 6, SI_Q4K_OROWS, 1>(
@@ -4122,6 +4234,52 @@ bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
     else if (K == 6144) SI_Q4K_ROWS_DISPATCH(24);
     else                SI_Q4K_ROWS_DISPATCH(26);
     #undef SI_Q4K_ROWS_DISPATCH
+    return true;
+}
+// One grid over up to four Q4_K matrices that share an activation. Returns false (having issued
+// nothing) for any shape it does not cover, so the caller can fall back to separate projections.
+bool launch_mmvq_q4k_rows_multi(const void* q81, const void* const* W, void* const* y,
+                                const int* Ns, int nmat, int M, int K, cudaStream_t stream,
+                                bool q6_last) {
+    if (nmat < 1 || nmat > 4 || M < 1 || M > 32 || K != 6656) return false;
+    if (q6_last && (nmat < 2 || M > 8)) return false;   // only the narrow, 4-wide Muse shape
+    for (int i = 0; i < nmat; i++) if (!W[i] || !y[i] || Ns[i] < 1) return false;
+    // Past eight rows launch_mmvq_rows chunks the batch into groups of eight, and every chunk
+    // re-reads the whole matrix. For a 256-row projection that is the dominant cost: at 32 rows
+    // k and v go out as eight launches of a 128-block grid -- less than one wave each -- and read
+    // their weights four times over. A wider MMAX takes the whole batch in one grid and one read.
+    // OROWS drops to 1 there because tmp[OROWS][MMAX] and the smem fold both scale with the
+    // product, and at these row counts the activation is shared across the batch, not the matrix.
+    const bool wide = M > 8;
+    const int OR = wide ? 1 : SI_Q4K_OROWS;
+    int blk[4] = {0, 0, 0, 0};
+    for (int i = 0; i < nmat; i++) blk[i] = (Ns[i] + OR - 1) / OR;
+    // A Q6_K last slot owns ONE output row per block, so its range is Ns rows wide.
+    if (q6_last) blk[nmat - 1] = Ns[nmat - 1];
+    const int b1 = blk[0], b2 = b1 + blk[1], b3 = b2 + blk[2], grid = b3 + blk[3];
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const unsigned char* w[4] = {nullptr, nullptr, nullptr, nullptr};
+    __nv_bfloat16* o[4] = {nullptr, nullptr, nullptr, nullptr};
+    int n[4] = {0, 0, 0, 0};
+    for (int i = 0; i < nmat; i++) {
+        w[i] = reinterpret_cast<const unsigned char*>(W[i]);
+        o[i] = reinterpret_cast<__nv_bfloat16*>(y[i]);
+        n[i] = Ns[i];
+    }
+    // With nmat < 4 the trailing block ranges are empty and grid == b3 (or b2), so the unused
+    // branches of the block map are unreachable rather than merely unused.
+#define SI_Q4K_MULTI(MM, ORV) si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, MM, ORV> \
+    <<<grid, 4 * 32, 0, stream>>>(q, w[0], w[1], w[2], w[3], o[0], o[1], o[2], o[3], \
+                                  n[0], n[1], n[2], n[3], b1, b2, b3, M)
+#define SI_Q4K_MULTI6(MM, ORV) si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, MM, ORV, true> \
+    <<<grid, 4 * 32, 0, stream>>>(q, w[0], w[1], w[2], w[3], o[0], o[1], o[2], o[3], \
+                                  n[0], n[1], n[2], n[3], b1, b2, b3, M)
+    if (q6_last) { if (M <= 6) SI_Q4K_MULTI6(6, SI_Q4K_OROWS); else SI_Q4K_MULTI6(8, SI_Q4K_OROWS); }
+    else if (!wide) { if (M <= 6) SI_Q4K_MULTI(6, SI_Q4K_OROWS); else SI_Q4K_MULTI(8, SI_Q4K_OROWS); }
+    else if (M <= 16) SI_Q4K_MULTI(16, 1);
+    else              SI_Q4K_MULTI(32, 1);
+#undef SI_Q4K_MULTI
+#undef SI_Q4K_MULTI6
     return true;
 }
 bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,

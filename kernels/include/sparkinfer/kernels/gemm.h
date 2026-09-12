@@ -171,6 +171,12 @@ void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K,
 // Exact short-row target verifier: M contiguous Q8_1 activations against one Q4_K matrix.
 // Preserves launch_mmvq_q4k's four-warp dot/reduction order independently for every row while
 // sharing the weight traffic within a CTA. y is row-major [M,N]. Returns false if unsupported.
+// One grid over up to four Q4_K matrices sharing one activation (Muse's q/gate/k/v).
+// False = nothing issued; the caller projects them separately.
+// q6_last: the final matrix is Q6_K (Muse's attn_v on half its layers) rather than Q4_K.
+bool launch_mmvq_q4k_rows_multi(const void* q81, const void* const* W, void* const* y,
+                                const int* Ns, int nmat, int M, int K, cudaStream_t stream,
+                                bool q6_last = false);
 bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream = nullptr);
 // Fused GDN qkv+z Q4_K MMVQ (shared Q8_1 activation). K is hidden (2048 -> NSUPER=8, 4096 -> 16).
