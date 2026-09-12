@@ -3112,10 +3112,29 @@ static bool muse_packed_on() {
 // step is still on the dp4a path -- every tensor-core arm has an eight-row floor, because an
 // m16n8k32 tile pads M to sixteen. This is the one place a narrow batch can reach the tensor cores,
 // and the fitted six was keeping it off them.
+// Row count from which a packed step runs the dense gate/up as ONE block-scaled NVFP4 GEMM per
+// projection instead of the row-batched Q3_A GEMV.
+//
+// Four was right when it was fitted, and it is not right any more. The block-scaled GEMM's cost is
+// INDEPENDENT of the row count -- its M tile is pinned at 128 rows, because the NVFP4 scale-factor
+// atom is 32x4 = 128 rows in M -- so at four rows it burns a 128-row tile to produce four. Measured
+// per gate/up launch on an RTX 5090 (N=19968, K=6656, a 74.76 MB operand) at c2/c4/c8/c16/c32:
+// 68.5 / 70.1 / 69.5 / 67.7 / 62.9 us, flat. The Q3_A arm beside it pays only for the rows it was
+// given, and at two rows it runs at 1.48 TB/s -- this box's streaming roof.
+//
+// #1051 and #1053 then changed what else is in the step, and the crossover moved with it. Measured
+// on the bot's own invocation, ABBA x2 plus a repeat: at four rows the Q3_A arm is now
+// 256.5 against 248.4 aggregate tok/s, and the sign of the earlier reading has flipped (the same
+// probe read -1.0% before those two landed). Eight rows still belongs to the GEMM (-3.0%), so this
+// moves exactly one width across and leaves every other axis on the arm it already ran:
+// c2/c8/c16/c32 within 0.1%, and all twelve single-stream axes within 0.2% -- AR decode is one row
+// and was already on the Q3_A arm.
+//
+// SPARKINFER_GU_GEMM_MIN_ROWS still overrides, so both arms come out of ONE binary.
 static int gu_gemm_min_rows() {
     static const int v = [] {
         const char* e = getenv("SPARKINFER_GU_GEMM_MIN_ROWS");
-        const int x = e ? atoi(e) : 4;
+        const int x = e ? atoi(e) : 5;
         return x < 1 ? 1 : x;
     }();
     return v;
