@@ -1980,11 +1980,10 @@ __device__ __forceinline__ void si_mma_q4k_scales(const unsigned char* sc12, int
 // things here were sized for the 32-row ceiling on EVERY launch, and a packed step narrower than
 // 32 rows paid both:
 //
-//   * the shared A tile -- As + Ad + Asum is 10 KB of the CTA's 18.75 KB at MM=32, and at 100 KB
-//     of shared per SM that 18.75 KB is what holds the kernel to five CTAs per SM. Its own
-//     __launch_bounds__ asks for eight, and the register allocator already honours that; only
-//     shared memory was standing in the way. MM=16 is 13.75 KB (seven CTAs), MM=8 is 11.25 KB
-//     (eight).
+//   * the shared A tile -- As + Ad + Asum is 10 KB at MM=32. Including the precomputed, padded
+//     B scale pairs below, total shared storage is 20.25 KB at MM=32, 15.25 KB at MM=16 and
+//     12.75 KB at MM=8. Under a 100 KB shared-memory budget these permit four, six and seven
+//     CTAs respectively (before other resource limits), instead of sizing every width for 32.
 //   * the M-tile loop, which issued BOTH m16n8k32 tiles unconditionally and then discarded the
 //     second through `lm < M`. At sixteen rows or fewer the second tile is pure waste: half the
 //     mma.sync and half the ldmatrix on As.
@@ -2015,8 +2014,11 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
 
     __shared__ signed char As[MM][256];
     __shared__ signed char Bs[SI_MMA_BN][256];
-    __shared__ unsigned char Ssc[SI_MMA_BN][8], Smn[SI_MMA_BN][8];
-    __shared__ float2 Wdm[SI_MMA_BN];
+    // Each loading lane expands one scale group, instead of c==0 serially unpacking all eight.
+    // A half times a six-bit integer fits exactly in float (at most 17 significant bits), so
+    // storing these products adds no rounding to the existing fold. The consumer reads columns
+    // spaced two rows apart; a nine-pair stride avoids their four-way shared-bank aliasing.
+    __shared__ float2 Bscale[SI_MMA_BN][9];
     __shared__ float Ad[MM][8], Asum[MM][8];
 
     constexpr int NT = (MM + 15) / 16;   // 16-row mma tiles this width actually needs
@@ -2058,16 +2060,11 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                     *reinterpret_cast<const uint4*>(lo);
                 *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb + 32, r)]) =
                     *reinterpret_cast<const uint4*>(hi);
-                if (c == 0) {
-                    Wdm[r] = __half22float2(b->dm);
-                    #pragma unroll
-                    for (int jj = 0; jj < 4; jj++) {
-                        unsigned char x0, x1, y0, y1;
-                        si_mma_q4k_scales(b->scales, jj, x0, x1, y0, y1);
-                        Ssc[r][2 * jj] = x0; Ssc[r][2 * jj + 1] = x1;
-                        Smn[r][2 * jj] = y0; Smn[r][2 * jj + 1] = y1;
-                    }
-                }
+                unsigned char x0, x1, y0, y1;
+                si_mma_q4k_scales(b->scales, c >> 1, x0, x1, y0, y1);
+                const float2 dm = __half22float2(b->dm);
+                Bscale[r][c] = make_float2(dm.x * (float)((c & 1) ? x1 : x0),
+                                          dm.y * (float)((c & 1) ? y1 : y0));
             }
         } else {
             for (int u = tid; u < SI_MMA_BN * 16; u += SI_MMA_NW * 32) {
@@ -2089,15 +2086,12 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                 }
                 const int kb = 64 * j + (sc_ >> 1) * 32 + (sc_ & 1) * 16;
                 *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = *reinterpret_cast<const uint4*>(out);
-                if (c == 0) {
-                    Wdm[r] = __half22float2(b->dm);
-                    #pragma unroll
-                    for (int jj = 0; jj < 4; jj++) {
-                        unsigned char x0, x1, y0, y1;
-                        si_mma_q4k_scales(b->scales, jj, x0, x1, y0, y1);
-                        Ssc[r][2 * jj] = x0; Ssc[r][2 * jj + 1] = x1;
-                        Smn[r][2 * jj] = y0; Smn[r][2 * jj + 1] = y1;
-                    }
+                if (c < 8) {
+                    unsigned char x0, x1, y0, y1;
+                    si_mma_q4k_scales(b->scales, c >> 1, x0, x1, y0, y1);
+                    const float2 dm = __half22float2(b->dm);
+                    Bscale[r][c] = make_float2(dm.x * (float)((c & 1) ? x1 : x0),
+                                              dm.y * (float)((c & 1) ? y1 : y0));
                 }
             }
         }
@@ -2116,7 +2110,6 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
         __syncthreads();
 
         const int lnA = warp * 8 + tig * 2;
-        const float2 dmA = Wdm[lnA], dmB = Wdm[lnA + 1];
         #pragma unroll 1
         for (int g = 0; g < 8; g++) {
             const int kk = g * 32;
@@ -2125,8 +2118,9 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
             // accumulator elements is being folded. Fetching them per element cost five shared
             // loads per output element per group; hoisting collapses that to a handful per group.
             // Ablating this fold-in measured it at 111 us of the kernel's 169.
-            const float sA = dmA.x * (float)Ssc[lnA][g],     mA = dmA.y * (float)Smn[lnA][g];
-            const float sB = dmB.x * (float)Ssc[lnA + 1][g], mB = dmB.y * (float)Smn[lnA + 1][g];
+            const float2 scaleA = Bscale[lnA][g], scaleB = Bscale[lnA + 1][g];
+            const float sA = scaleA.x, mA = scaleA.y;
+            const float sB = scaleB.x, mB = scaleB.y;
             float adv[NT][2], asv[NT][2];
             #pragma unroll
             for (int ii = 0; ii < NT; ii++)
