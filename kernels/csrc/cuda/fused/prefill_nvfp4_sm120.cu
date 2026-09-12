@@ -2,8 +2,18 @@
 #include "sparkinfer/kernels/compressed_tensors.h"
 
 #include <cuda_bf16.h>
+// arch/config.h FIRST, and specifically before float_subbyte.h. float_subbyte.h derives
+// CUDA_PTX_FP4FP6_CVT_ENABLED -- the switch that gives this translation unit the hardware FP4
+// encode instead of a software one -- from CUTLASS_ARCH_MMA_SM120A_ENABLED, and it tests that
+// macro at include time. arch/config.h is what defines it (from __CUDA_ARCH_FEAT_SM120_ALL, which
+// this build has: the TU compiles at arch=compute_120a). cutlass.h does NOT pull config.h in, it
+// includes only detail/helper_macros.hpp -- so with the old ordering the test ran against an
+// undefined macro and every FP4 encode in this file silently compiled to the software path.
+// See the fp4_pack comment below for what that cost.
+#include <cutlass/arch/config.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/float_subbyte.h>
+#include <cutlass/numeric_conversion.h>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
@@ -196,6 +206,45 @@ auto shape(int m, int n, int k) { return cute::make_shape(m, n, k, 1); }
 auto sfa_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SFA(shape(m,n,k)); }
 auto sfb_layout(int m, int n, int k) { return ScaleConfig::tile_atom_to_shape_SFB(shape(m,n,k)); }
 
+// N floats -> N/2 packed FP4 bytes, low nibble first -- the last step of every quantizer in this
+// file, and it was the most expensive one.
+//
+// What these kernels wrote was `cutlass::float_e2m1_t q(v)` per value, i.e. exmy_base.h's generic
+// EXMY constructor. It is portable C++ that walks exponent and mantissa fields, and ptxas gives it
+// a branch per value: quant_rows_t<2> alone, whose whole job is eight values a lane, compiled to
+// 214 LOP3.LUT, 149 BRA and 49 BSSY/BSYNC.RECONVERGENT pairs, with NOT ONE FP4 convert
+// instruction in its SASS -- on a part that has the encode in hardware. The neighbouring ue4m3
+// scale conversion did lower to a single F2FP.SATFINITE.E4M3.F32, which is what makes the FP4 side
+// look like an oversight rather than a limit.
+//
+// cutlass::detail::float_to_e2m1_x{2,4,8} is the intended entry point: it emits
+// `cvt.rn.satfinite.e2m1x2.f32`, two values per instruction, and for the x8 form ptxas fuses the
+// four of them plus the byte merge into one chained F2FP...PACK_AB_MERGE_C. Rounding is
+// round-to-nearest-even and saturating in both directions, and these kernels only ever encode
+// x / qs where qs is amax/6, so no input is near the format's limit and none is NaN -- the values
+// that would separate two RNE encoders cannot occur here. The token stream is unchanged.
+//
+// If CUDA_PTX_FP4FP6_CVT_ENABLED is somehow still not set, the helper falls back to CUTLASS's
+// branchless comparison ladder rather than to the branchy constructor, so the include ordering
+// above is worth performance, not correctness.
+template <int N>
+__device__ __forceinline__ void fp4_pack(const float* x, unsigned char* out) {
+    static_assert(N == 2 || N == 4 || N == 8, "FP4 nibbles are packed 2, 4 or 8 at a time");
+    cutlass::Array<float, N> a;
+    #pragma unroll
+    for (int i = 0; i < N; ++i) a[i] = x[i];
+    if constexpr (N == 8) {
+        auto r = cutlass::detail::float_to_e2m1_x8(a);
+        *reinterpret_cast<unsigned int*>(out) = reinterpret_cast<unsigned int const&>(r);
+    } else if constexpr (N == 4) {
+        auto r = cutlass::detail::float_to_e2m1_x4(a);
+        *reinterpret_cast<unsigned short*>(out) = reinterpret_cast<unsigned short const&>(r);
+    } else {
+        auto r = cutlass::detail::float_to_e2m1_x2(a);
+        *out = reinterpret_cast<unsigned char const&>(r);
+    }
+}
+
 // V is fixed by the format: one ue4m3 scale per 16 values. The mapping of lanes onto those 16 is
 // not, and it is worth a lot. One lane per value left half of every warp idle (lane < V) and stored
 // 8 bytes per warp -- 63 GB/s, 3.5% of peak. Two values per lane (LPV=8) put every lane live and
@@ -248,11 +297,10 @@ __global__ void quant_rows_t(const __nv_bfloat16* src, unsigned char* dst,
         // One packed store per lane: VPL nibbles = VPL/2 bytes, and base is a multiple of VPL so
         // base>>1 is a multiple of VPL/2 -- naturally aligned for the 2- or 4-byte case.
         unsigned char packed[VPL / 2];
+        float xq[VPL];
         #pragma unroll
-        for (int i = 0; i < VPL / 2; i++) {
-            cutlass::float_e2m1_t q0(x[2 * i] / qsf), q1(x[2 * i + 1] / qsf);
-            packed[i] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
-        }
+        for (int i = 0; i < VPL; i++) xq[i] = x[i] / qsf;
+        fp4_pack<VPL>(xq, packed);
         #pragma unroll
         for (int i = 0; i < VPL / 2; i++) dst[(base >> 1) + i] = packed[i];
         if (sub == 0) {
@@ -357,11 +405,12 @@ __global__ void rmsnorm_quant_rows(const __nv_bfloat16* __restrict__ src,
         }
         cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
         unsigned char packed[8];
+        const float qsf = float(qs);
+        float xq[16];
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            cutlass::float_e2m1_t q0(x[2*j] / float(qs)), q1(x[2*j+1] / float(qs));
-            packed[j] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
-        }
+        for (int j = 0; j < 16; ++j) xq[j] = x[j] / qsf;
+        fp4_pack<8>(xq, packed);
+        fp4_pack<8>(xq + 8, packed + 4);
         *reinterpret_cast<unsigned long long*>(dst + (base >> 1) + (k0 >> 1)) =
             *reinterpret_cast<const unsigned long long*>(packed);
         auto scales = cute::make_tensor(sf, layout);
@@ -399,8 +448,9 @@ __global__ void gate_quant_rows(const __nv_bfloat16* __restrict__ src,
         #pragma unroll
         for (int d = LPG / 2; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(gmask, a, d));
         cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
-        cutlass::float_e2m1_t q0(x0 / float(qs)), q1(x1 / float(qs));
-        dst[base >> 1] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
+        const float qsf = float(qs);
+        const float xq[2] = { x0 / qsf, x1 / qsf };
+        fp4_pack<2>(xq, &dst[base >> 1]);
         if (glane == 0) { auto scales = cute::make_tensor(sf, layout); scales(row, k0, 0) = qs; }
     }
 }
@@ -452,11 +502,11 @@ __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
         for (int d = LPG >> 1; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
         cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
         unsigned char packed[VPL / 2];
+        const float qsf = float(qs);
+        float xq[VPL];
         #pragma unroll
-        for (int p = 0; p < VPL / 2; ++p) {
-            cutlass::float_e2m1_t q0(x[2 * p] / float(qs)), q1(x[2 * p + 1] / float(qs));
-            packed[p] = (unsigned char)((q0.raw() & 15u) | ((q1.raw() & 15u) << 4));
-        }
+        for (int p = 0; p < VPL; ++p) xq[p] = x[p] / qsf;
+        fp4_pack<VPL>(xq, packed);
         #pragma unroll
         for (int p = 0; p < VPL / 2; ++p) dst[(base >> 1) + p] = packed[p];
         if (glane == 0) { auto scales = cute::make_tensor(sf, layout); scales(row, k0, 0) = qs; }
