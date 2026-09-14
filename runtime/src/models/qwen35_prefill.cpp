@@ -3979,14 +3979,19 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // 1.10 TB/s the gate/up GEMM beside it already reaches. The operand costs no
                 // VRAM it was not already costing, and the layer's own consumers want tight row
                 // strides, so the one [N, qkvg_n] result is scattered back out.
-                // Under nine rows this stays on the Q4_K grid the narrow widths were fitted for.
-                // SPARKINFER_MUSE_QKVG_FP4=0 restores the Q4_K projections.
+                // From eight rows, the GEMM's smallest width: since the transposed orientation it
+                // is ahead of the Q4_K grid there too. SPARKINFER_MUSE_QKVG_MIN_ROWS=9 restores the
+                // old bound, SPARKINFER_MUSE_QKVG_FP4=0 the Q4_K projections.
                 static const int qkvg_fp4_on = [] {
                     const char* e = getenv("SPARKINFER_MUSE_QKVG_FP4");
                     return (e && e[0] == '0') ? 0 : 1; }();
+                static const int qkvg_min_rows = [] {
+                    const char* e = getenv("SPARKINFER_MUSE_QKVG_MIN_ROWS");
+                    const int v = e ? atoi(e) : 8;
+                    return v < 1 ? 1 : v; }();
                 bool qkvg_done = false;
-                if (qkvg_fp4_on && wide && fp4_a && fp4_asf && fp4_qkv &&
-                    w.qkvg_fp4 && w.qkvg_fp4_sf && N >= kProjGemmMinRows &&
+                if (qkvg_fp4_on && N >= qkvg_min_rows && fp4_a && fp4_asf && fp4_qkv &&
+                    w.qkvg_fp4 && w.qkvg_fp4_sf &&
                     kernels::prefill_nvfp4_supported(Ng, qkvg_n, H) &&
                     kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.qkvg_fp4, w.qkvg_fp4_sf,
