@@ -95,6 +95,7 @@ struct ContinuousBatchEngine::Job {
         Qwen35Model::RecurrentStateSnapshot state;
     };
     std::vector<Checkpoint> checkpoints;
+    bool spec_tried = false;   // run_speculative has had its one chance at this job
 };
 
 ContinuousBatchEngine::ContinuousBatchEngine(Qwen35Model* model, KVCacheManager* kv,
@@ -203,6 +204,108 @@ bool ContinuousBatchEngine::apply_constraint_mask(Job& job) {
 }
 
 int ContinuousBatchEngine::max_queue_depth() const { return max_queue_depth_config(); }
+
+void ContinuousBatchEngine::enable_speculative(bool on) {
+    std::lock_guard<std::mutex> lock(mu_);
+    speculative_ = on;
+}
+
+ContinuousBatchEngine::SpecStats ContinuousBatchEngine::speculative_stats() const {
+    SpecStats s;
+    s.runs = spec_runs_.load(std::memory_order_relaxed);
+    s.tokens = spec_tokens_.load(std::memory_order_relaxed);
+    s.handoffs = spec_handoffs_.load(std::memory_order_relaxed);
+    return s;
+}
+
+bool ContinuousBatchEngine::spec_eligible(const Request& r) {
+    // Speculation is lossless only for greedy argmax, and the verify path has none of the sampler
+    // extras. Images need the vision splice ordinary prefill does; a prefix-cache hit starts past
+    // position 0, where the capture the draft reads would have a hole.
+    return !r.constraint && r.temperature <= 0.f && r.presence_penalty == 0.f && r.frequency_penalty == 0.f &&
+           r.logit_bias.empty() && !r.logprobs && r.forced_tokens.empty() && r.vision_pos.empty() &&
+           r.prefill_start == 0 && !r.use_prefix_session;
+}
+
+void ContinuousBatchEngine::run_speculative(Job& job) {
+    job.spec_tried = true;
+    const Qwen35Config& cfg = model_->config();
+    const int prompt_len = (int)job.req.prompt.size();
+    const double timeout_s = request_timeout_s_config();
+    // spec_running_ was raised, and spec_interrupt_ cleared, under mu_ when this job was picked.
+    {
+        std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+        model_->activate_session(job.seq_id);
+        model_->reset_mrope_offset();
+    }
+
+    Qwen35Model::SpecHooks hooks;
+    hooks.seq_id = job.seq_id;
+    hooks.on_tokens = [&](const int* tokens, int n) -> bool {
+        for (int i = 0; i < n; i++) {
+            const auto t_emit = std::chrono::steady_clock::now();
+            if (!job.saw_first_tok) {
+                job.t_first = t_emit;
+                job.saw_first_tok = true;
+                job.ttft_ms = std::chrono::duration<double, std::milli>(job.t_first - job.t_submit).count();
+            }
+            job.output.push_back(tokens[i]);
+            job.decode_emitted++;
+            if (job.on_token && !job.on_token(tokens[i])) {
+                job.cancelled = true;
+                return false;
+            }
+        }
+        if (timeout_s > 0.0) {
+            const double elapsed_s = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - job.t_submit).count();
+            if (elapsed_s > timeout_s) {
+                job.error = "request timeout after " + std::to_string(elapsed_s) + "s (limit " +
+                            std::to_string(timeout_s) + "s)";
+                job.timed_out = true;
+                return false;
+            }
+        }
+        return !spec_interrupt_.load(std::memory_order_relaxed);
+    };
+    Qwen35Model::SpecResume r;
+    model_->dflash_generate(job.req.prompt, job.req.max_new_tokens, nullptr, nullptr, &hooks, &r);
+    spec_running_.store(false, std::memory_order_relaxed);
+    if (!r.engaged) return;   // nothing ran: ordinary prefill picks the job up on the next iteration
+    spec_runs_.fetch_add(1, std::memory_order_relaxed);
+    spec_tokens_.fetch_add((uint64_t)job.decode_emitted, std::memory_order_relaxed);
+
+    job.prefill_pos = prompt_len;
+    job.phase = SeqPhase::DECODE;
+    auto finish = [&] {
+        job.generation_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - job.t_submit).count();
+        if (job.saw_first_tok && job.generation_ms > job.ttft_ms && job.decode_emitted > 0) {
+            const double decode_ms = std::max(job.generation_ms - job.ttft_ms, 1.0);
+            job.decode_tps = (double)job.decode_emitted * 1000.0 / decode_ms;
+        }
+        finish_job_impl(job);
+    };
+    if (job.cancelled || job.timed_out) { finish(); return; }
+    const int last = job.output.empty() ? -1 : job.output.back();
+    const bool hit_eos = last >= 0 && (last == cfg.eos_id || (cfg.eos_id2 >= 0 && last == cfg.eos_id2));
+    const bool hit_limit = job.decode_emitted >= job.req.max_new_tokens;
+    if (r.failed || r.emitted != job.decode_emitted ||
+        (!r.finished && !hit_eos && !hit_limit && r.position != prompt_len + job.decode_emitted)) {
+        job.error = "speculative decode failed; the request was aborted";
+        finish();
+        return;
+    }
+    if (r.finished || hit_eos || hit_limit) {
+        job.reached_token_limit = hit_limit && !hit_eos;
+        finish();
+        return;
+    }
+    // Another request arrived: continue as ordinary decode from the committed position. step_job
+    // emits next_token and ingests it at prompt_len + decode_emitted, which is r.position.
+    spec_handoffs_.fetch_add(1, std::memory_order_relaxed);
+    job.next_token = r.next_token;
+}
 
 void ContinuousBatchEngine::enable_prefix_cache(const PrefixCache::Limits& limits) {
     std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
@@ -326,6 +429,8 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
     auto ptr = std::make_unique<Job>(std::move(job));
     const uint64_t rid = ptr->request_id;
     jobs_[rid] = std::move(ptr);
+    // A request running speculatively yields to this one at its next step boundary.
+    if (spec_running_.load(std::memory_order_relaxed)) spec_interrupt_.store(true, std::memory_order_relaxed);
     cv_.notify_one();
     if (err_out) *err_out = EnqueueError::NONE;
     return rid;
@@ -356,6 +461,37 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
 
 void ContinuousBatchEngine::worker_loop() {
     while (true) {
+        // A request that is alone and eligible decodes speculatively (see enable_speculative). It
+        // is picked up before its prefill starts, because speculation prefills with hidden-state
+        // capture on.
+        {
+            Job* spec_job = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                if (speculative_ && running_) {
+                    int live = 0;
+                    Job* only = nullptr;
+                    for (const auto& kv : jobs_) {
+                        if (kv.second->done) continue;
+                        ++live;
+                        only = kv.second.get();
+                    }
+                    if (live == 1 && !only->spec_tried && only->phase == SeqPhase::PREFILL &&
+                        only->prefill_pos == 0 && spec_eligible(only->req)) {
+                        spec_job = only;
+                        // Raised under mu_, which submit_locked also holds: a request submitted from
+                        // here on sees it and interrupts; one submitted before made live == 2.
+                        spec_interrupt_.store(false, std::memory_order_relaxed);
+                        spec_running_.store(true, std::memory_order_relaxed);
+                    }
+                }
+            }
+            if (spec_job) {
+                run_speculative(*spec_job);
+                cv_.notify_all();
+                continue;
+            }
+        }
         std::vector<uint64_t> prefill_ids, decode_ids;
         {
             std::unique_lock<std::mutex> lock(mu_);

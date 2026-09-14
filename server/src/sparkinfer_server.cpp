@@ -876,6 +876,8 @@ int main(int argc, char** argv) {
     std::string host = "127.0.0.1";
     int port = 8080;
     std::string model_path;
+    // DSpark draft for speculative decoding; SPARKINFER_DRAFT_MODEL is the same, for containers.
+    std::string draft_model = env_string("SPARKINFER_DRAFT_MODEL");
     std::string tokenizer_json;
     bool model_name_explicit = false;   // --model-name given: never second-guess the operator
     int ctx = 0;
@@ -890,10 +892,12 @@ int main(int argc, char** argv) {
         else if (need("--api-key")) g_api_key = argv[++i];
         else if (need("--tokenizer")) tokenizer_json = argv[++i];
         else if (need("--model-name")) { g_model_name = argv[++i]; model_name_explicit = true; }
+        else if (need("--draft-model")) draft_model = argv[++i];
         else if (a == "-h" || a == "--help") {
             fprintf(stderr,
                     "usage: %s -m model.gguf [--host 127.0.0.1] [--port 8080] [--ctx N] "
-                    "[--tokenizer path/to/tokenizer.json] [--model-name ID] [--api-key KEY]\n",
+                    "[--tokenizer path/to/tokenizer.json] [--model-name ID] [--api-key KEY] "
+                    "[--draft-model DSPARK_DIR]\n",
                     argv[0]);
             return 0;
         }
@@ -954,6 +958,12 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[sparkinfer-server] tool calls: constrained decoding on (%d tokens, %zu stop ids, %.1f s)\n",
                 vocab, stops.size(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+
+    if (!draft_model.empty()) {
+        std::string derr;
+        if (!engine.load_draft(draft_model, derr))
+            fprintf(stderr, "[sparkinfer-server] speculative decoding off: %s\n", derr.c_str());
     }
 
     const std::vector<int> prefix_ids = load_prefix_token_ids();
@@ -1194,6 +1204,18 @@ int main(int argc, char** argv) {
                  << "# HELP sparkinfer_prefix_cache_host_bytes Pinned host memory held by recurrent-state snapshots\n"
                     "# TYPE sparkinfer_prefix_cache_host_bytes gauge\n"
                  << "sparkinfer_prefix_cache_host_bytes " << pc.host_bytes << "\n";
+        }
+        const auto sp = engine.speculative_stats();
+        if (sp.enabled) {
+            body << "# HELP sparkinfer_speculative_runs_total Requests decoded speculatively (DSpark)\n"
+                    "# TYPE sparkinfer_speculative_runs_total counter\n"
+                 << "sparkinfer_speculative_runs_total " << sp.runs << "\n"
+                 << "# HELP sparkinfer_speculative_tokens_total Tokens produced by speculative decoding\n"
+                    "# TYPE sparkinfer_speculative_tokens_total counter\n"
+                 << "sparkinfer_speculative_tokens_total " << sp.tokens << "\n"
+                 << "# HELP sparkinfer_speculative_handoffs_total Speculative runs handed over to ordinary decode when another request arrived\n"
+                    "# TYPE sparkinfer_speculative_handoffs_total counter\n"
+                 << "sparkinfer_speculative_handoffs_total " << sp.handoffs << "\n";
         }
         res.set_content(body.str(), "text/plain; version=0.0.4");
     });

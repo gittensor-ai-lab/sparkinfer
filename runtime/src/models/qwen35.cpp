@@ -3848,7 +3848,7 @@ int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
 void Qwen35Model::set_dflash_draft(DFlashDraftModel* draft) { p_->dflash_draft = draft; }
 
 void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows,
-                                    int context_start) {
+                                    int context_start, int context_end) {
     Impl& s = *p_;
     s.dflash_capture = on;
     s.dflash_layer_ids = target_layer_ids;
@@ -3864,9 +3864,16 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
     const size_t hidden_bytes = (size_t)s.dflash_max_rows * row_elems * sizeof(bf16);
     if (s.dflash_hidden) { cudaFree(s.dflash_hidden); s.dflash_hidden = nullptr; }
     if (s.dflash_context) { cudaFree(s.dflash_context); s.dflash_context = nullptr; }
-    s.dflash_ctx_cap = s.cfg.max_seq - s.dflash_ctx_start;
-    cu(cudaMalloc(&s.dflash_hidden, hidden_bytes), "dflash hidden");
-    cu(cudaMalloc(&s.dflash_context, (size_t)s.dflash_ctx_cap * row_elems * sizeof(bf16)), "dflash ctx");
+    const int ctx_limit = context_end > 0 ? std::min(context_end, s.cfg.max_seq) : s.cfg.max_seq;
+    s.dflash_ctx_cap = std::max(0, ctx_limit - s.dflash_ctx_start);
+    if (cudaMalloc(&s.dflash_hidden, hidden_bytes) != cudaSuccess) {
+        s.dflash_hidden = nullptr;
+        fprintf(stderr, "[dflash] capture rows: out of device memory\n");
+    }
+    if (cudaMalloc(&s.dflash_context, (size_t)s.dflash_ctx_cap * row_elems * sizeof(bf16)) != cudaSuccess) {
+        s.dflash_context = nullptr;
+        fprintf(stderr, "[dflash] capture context (%d positions): out of device memory\n", s.dflash_ctx_cap);
+    }
     if (s.cfg.hybrid && !s.spec_lin_snap) {
         const size_t ls = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
                           s.cfg.linear_head_dim * s.cfg.linear_head_dim;
@@ -3976,13 +3983,15 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
 }
 
 std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, int max_new,
-                                              DFlashStats* stats, ThermalGovernor* gov) {
+                                              DFlashStats* stats, ThermalGovernor* gov,
+                                              const SpecHooks* hooks, SpecResume* resume) {
     Impl& s = *p_;
     const bool ignore_eos = [] {
         const char* e = getenv("SPARKINFER_BENCH_IGNORE_EOS");
         return e && e[0] == '1';
     }();
     std::vector<int> out;
+    if (resume) *resume = SpecResume{};
     if (!s.dflash_draft || prompt.empty() || max_new <= 0) return out;
     DFlashDraftModel& draft = *s.dflash_draft;
     const DFlashDraftConfig& dc = draft.config();
@@ -4069,6 +4078,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                                  (n_prompt + max_new + B) < kEngageMinSeq &&
                                  compact_mode != 1;
     if (spec_never_pays) {
+        if (hooks) return out;   // the caller's ordinary decode IS the autoregressive path
         // Plain autoregressive decode, set up the way generate() sets it up: no hidden-state
         // capture, no draft KV, no verify graph. Deciding before prefill rather than falling back
         // mid-stream is what makes this reach AR's own throughput instead of approaching it -- a
@@ -4144,16 +4154,46 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     } else if ((int)prompt.size() >= 12288) {
         capture_start = (int)prompt.size() - 4096;
     }
-    set_dflash_capture(true, dc.target_layer_ids, B + 1, capture_start);
-
-    const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
-    clear_prefix_cache();
-    invalidate_decode_graph();
-    uint64_t sid = open_session(budget);
-    if (!sid) {
-        fprintf(stderr, "[dflash] KV allocate failed (need %d)\n", budget);
+    if (hooks) {
+        // The draft's KV holds the captured window plus everything generated. Past its max_seq
+        // forward_block fails mid-generation, so do not start what cannot finish.
+        const long draft_need = (long)((int)prompt.size() - capture_start) + max_new + 2L * (B + 1);
+        if (draft_need > dc.max_seq) return out;
+    }
+    // Engine-driven: requests are admitted concurrently, and admission allocates KV and opens
+    // sessions under device_mu. Everything from here to the decode loop -- growing this session's
+    // KV, the capture buffers, the prefill, the verify warmup -- changes the same allocator and
+    // session state, so it holds device_mu too. The loop then holds it per step instead, which is
+    // what lets a new request be admitted between steps and hand this one over.
+    std::unique_lock<std::recursive_mutex> engine_lock(s.device_mu, std::defer_lock);
+    if (hooks) engine_lock.lock();
+    set_dflash_capture(true, dc.target_layer_ids, B + 1, capture_start,
+                       hooks ? std::min(s.cfg.max_seq, (int)prompt.size() + max_new + B + 1) : 0);
+    if (hooks && (!dflash_context_buffer() || !dflash_hidden_buffer())) {
         set_dflash_capture(false, {}, 0);
         return out;
+    }
+
+    const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
+    uint64_t sid = 0;
+    if (hooks) {
+        // The caller's session. Grow its KV for the verify block's lookahead; leave the shared prefix
+        // session alone, since other requests may be using it.
+        sid = hooks->seq_id;
+        invalidate_decode_graph();
+        if (!s.kv->allocate(sid, budget)) {
+            set_dflash_capture(false, {}, 0);
+            return out;
+        }
+    } else {
+        clear_prefix_cache();
+        invalidate_decode_graph();
+        sid = open_session(budget);
+        if (!sid) {
+            fprintf(stderr, "[dflash] KV allocate failed (need %d)\n", budget);
+            set_dflash_capture(false, {}, 0);
+            return out;
+        }
     }
     activate_session(sid);
 
@@ -4178,7 +4218,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     }
     auto t1 = std::chrono::steady_clock::now();
     if (next < 0 || next >= s.cfg.vocab) {
-        close_session(sid);
+        if (!hooks) close_session(sid);   // an engine session is re-prefilled by the caller
         set_dflash_capture(false, {}, 0);
         return out;
     }
@@ -4474,7 +4514,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     bf16* th_scratch = nullptr;
     const int row_stride = dflash_hidden_row_stride();
     if (cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)) != cudaSuccess) {
-        close_session(sid);
+        if (hooks) {
+            // The prompt is prefilled and consistent: hand it back for ordinary decode.
+            if (resume) { resume->engaged = true; resume->position = n; resume->next_token = next; }
+        } else {
+            close_session(sid);
+        }
         set_dflash_capture(false, {}, 0);
         draft.reset();
         return out;
@@ -4489,8 +4534,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // A forced token-loop run never launches the compact verifier. Besides wasting a sizeable
     // graph-capture warmup, building those unused tiers makes the isolation mode exercise state
     // that it explicitly asked to bypass. Keep COMPACT_VERIFY=0 a true token-loop control.
-    if (compact_mode != 0)
+    if (compact_mode != 0) {
+        // Records verify graphs: with a caller that admits requests concurrently, hold the device.
+        std::unique_lock<std::recursive_mutex> warm_lock(s.device_mu, std::defer_lock);
+        if (hooks) warm_lock.lock();
         for (int t = 1; t <= kProposalDepth + 1; t++) dflash_warm_verify(t, start);
+    }
     // Verify-path cost breakdown (SPARKINFER_DSPARK_TIMING=1). The two verify implementations are
     // timed per call so their cost can be compared directly rather than inferred from end-to-end
     // throughput. Synchronises around each call -- a measurement mode, not a benchmark -- but both
@@ -4614,7 +4663,13 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     long plan_rows_sum = 0, plan_steps = 0;
     bool predictable_stream = false;
     auto t_decode0 = std::chrono::steady_clock::now();
+    bool spec_finished = false, spec_failed = false, spec_stopped = false;
+    if (hooks) engine_lock.unlock();
     while ((int)out.size() < max_new) {
+        // Engine-driven: hold the device for the whole step -- draft pass and verify -- so a request
+        // admitted concurrently allocates between steps, never inside one. Released before on_tokens.
+        std::unique_lock<std::recursive_mutex> step_lock(s.device_mu, std::defer_lock);
+        if (hooks) step_lock.lock();
         // The context bound this used to carry (SPARKINFER_DFLASH_COMPACT_MAX_SEQ, default 384)
         // existed only to keep the batched path away from contexts where it diverged from AR --
         // the #712 gap. That gap was a real defect, not a property of batching: the batched GDN
@@ -4749,6 +4804,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         }
         if (!draft_ok) {
             fprintf(stderr, "[dflash] draft forward failed at start=%d\n", start);
+            spec_failed = true;
             break;
         }
         if (!draft_idle) for (int i = 1; i <= active_proposal_depth; i++) block[i] = draft_ids[i];
@@ -4921,7 +4977,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 if (i < active_proposal_depth && block[i + 1] != p) break;
             }
         }
-        if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
+        if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); spec_failed = true; break; }
         // Climb on a full-block accept, decay on anything less. The old rule latched the score at
         // the engage threshold for any partial accept of >= 2 tokens, which kept the batched path
         // armed through low-acceptance stretches -- precisely where it costs throughput. Decaying
@@ -5035,6 +5091,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // earlier context. Hand the capture buffer over directly instead of copying it to a second
         // scratch allocation, stashing another unused full-context copy, and synchronizing again.
 
+        const size_t emitted_before = out.size();
         bool stop = false;
         for (int i = 0; i < keep && (int)out.size() < max_new; i++) {
             out.push_back(block[i]);
@@ -5044,14 +5101,23 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 break;
             }
         }
-        if (stop) break;
-        // Bonus token becomes the next block seed (emitted on the following iteration).
-        next = posterior[accept];
-        if (!ignore_eos &&
-            (next == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && next == s.cfg.eos_id2))) {
-            if ((int)out.size() < max_new) out.push_back(next);
-            break;
+        bool eos_next = false;
+        if (!stop) {
+            // Bonus token becomes the next block seed (emitted on the following iteration).
+            next = posterior[accept];
+            if (!ignore_eos &&
+                (next == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && next == s.cfg.eos_id2))) {
+                if ((int)out.size() < max_new) out.push_back(next);
+                eos_next = true;
+            }
         }
+        if (hooks) {
+            step_lock.unlock();
+            if (out.size() > emitted_before &&
+                !hooks->on_tokens(out.data() + emitted_before, (int)(out.size() - emitted_before)))
+                spec_stopped = true;
+        }
+        if (stop || eos_next) { spec_finished = true; break; }
 
         start += keep;
         accept_sum += (double)keep;
@@ -5060,6 +5126,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         th_len = keep;
         th_start = 0;
         if (gov) gov->pace();
+        if (spec_stopped) break;
     }
     auto t_end = std::chrono::steady_clock::now();
     if (stats) {
@@ -5087,13 +5154,26 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         }
         stats->decode_s = std::chrono::duration<double>(t_end - t_decode0).count();
     }
-    close_session(sid);
+    if ((int)out.size() >= max_new) spec_finished = true;
+    if (hooks) engine_lock.lock();   // the teardown below frees graphs and capture buffers
+    if (resume) {
+        resume->engaged = true;
+        resume->finished = spec_finished;
+        resume->failed = spec_failed;
+        resume->position = start;
+        resume->next_token = next;
+        resume->emitted = (int)out.size();
+    }
+    if (!hooks) close_session(sid);   // an engine session stays with its job
     if (th_scratch) cudaFree(th_scratch);
     // Verify graphs bake pointers into their request-sized arena. They are useful only for this
     // generation; retaining them steals enough VRAM from a following 32K prefill to change its
     // scratch path and, for the recurrent GDN stack, its result.
     dflash_release_verify_cache();
     set_dflash_capture(false, {}, 0);
+    // The caller continues this session with ordinary decode; nothing captured while hidden-state
+    // capture was on may be replayed by it.
+    if (hooks) invalidate_decode_graph();
     draft.reset();
     return out;
 }

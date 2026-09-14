@@ -236,6 +236,19 @@ public:
     // beyond this are rejected as overloaded before any KV allocation is attempted.
     int max_queue_depth() const;
 
+    // Speculative decoding (DSpark) for a request that runs alone. Requires a draft attached to the
+    // model (Qwen35Model::set_dflash_draft). A greedy request with no penalties, logit_bias,
+    // logprobs, images or prefix-cache hit decodes speculatively while it is the only request; the
+    // moment another is submitted it continues as ordinary decode and joins the batch. The tokens are
+    // the same either way -- speculation only changes how many target passes produce them.
+    void enable_speculative(bool on);
+    struct SpecStats {
+        uint64_t runs = 0;       // requests that decoded speculatively
+        uint64_t tokens = 0;     // tokens those runs produced before finishing or handing over
+        uint64_t handoffs = 0;   // runs that handed over to ordinary decode because another request came
+    };
+    SpecStats speculative_stats() const;
+
     // Turn on the automatic prefix cache. Off by default: benchmarks and the eval harness measure
     // prefill from zero, and a cache hit would change what they measure. Call before submitting.
     void enable_prefix_cache(const PrefixCache::Limits& limits);
@@ -262,6 +275,9 @@ private:
     // Retire a job: close/free its session and mark it done. Shared by step_job() and the packed
     // path so "job is over" has exactly one implementation.
     void finish_job_impl(Job& j);
+    // Runs job speculatively until it finishes or another request arrives; see enable_speculative.
+    void run_speculative(Job& job);
+    static bool spec_eligible(const Request& r);
 
     Qwen35Model* model_;
     KVCacheManager* kv_;
@@ -276,6 +292,10 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<Job>> jobs_;
     std::atomic<uint64_t> next_req_id_{1};
     std::unique_ptr<PrefixCache> prefix_cache_;
+    bool speculative_ = false;
+    std::atomic<bool> spec_running_{false};    // the worker is inside run_speculative
+    std::atomic<bool> spec_interrupt_{false};  // a request was submitted meanwhile: hand over
+    std::atomic<uint64_t> spec_runs_{0}, spec_tokens_{0}, spec_handoffs_{0};
 };
 
 }  // namespace sparkinfer

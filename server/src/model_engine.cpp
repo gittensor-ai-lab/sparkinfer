@@ -1,5 +1,6 @@
 #include "model_engine.hpp"
 #include "sparkinfer/kernels/deterministic.h"
+#include "sparkinfer/models/dflash_draft.h"
 #include "sparkinfer/device_health.h"
 
 #include "sparkinfer/gguf.h"
@@ -150,6 +151,9 @@ struct ModelEngine::Impl {
     std::unique_ptr<sparkinfer::KVCacheManager> kv;
     std::unique_ptr<sparkinfer::moe::MoEEngine> engine;
     std::unique_ptr<sparkinfer::Qwen35Model> model;
+    // Owned here, attached to model by pointer; declared before batch_engine so the engine, which
+    // drives it, is destroyed first.
+    std::unique_ptr<sparkinfer::DFlashDraftModel> draft;
     std::unique_ptr<sparkinfer::ContinuousBatchEngine> batch_engine;
     std::vector<int> prefix_tokens;
     bool ready = false;
@@ -199,6 +203,7 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     impl_->ready = false;
     impl_->reset_vision();
     impl_->batch_engine.reset();
+    impl_->draft.reset();
     impl_->model.reset();
     impl_->engine.reset();
     impl_->kv.reset();
@@ -805,6 +810,49 @@ int ModelEngine::free_kv_blocks() const {
 int ModelEngine::max_queue_depth() const {
     std::lock_guard<std::mutex> lock(mu_);
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->max_queue_depth() : 0;
+}
+
+bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!impl_->ready || !impl_->model || !impl_->batch_engine) {
+        err = "load the target model before the draft";
+        return false;
+    }
+    if (!impl_->cfg.qwen38) {
+        err = "speculative decoding is supported for Qwen3.8-27B targets only";
+        return false;
+    }
+    const char* e = getenv("SPARKINFER_DSPARK_MAX_CTX");
+    sparkinfer::DFlashDraftConfig dcfg;
+    dcfg.max_seq = std::min(impl_->cfg.max_seq, e ? std::max(1024, atoi(e)) : 16384);
+    auto draft = std::make_unique<sparkinfer::DFlashDraftModel>(dcfg);
+    if (!draft->load(dir)) {
+        err = "cannot load a DSpark draft from " + dir;
+        return false;
+    }
+    impl_->model->set_dflash_draft(draft.get());
+    impl_->draft = std::move(draft);
+    impl_->batch_engine->enable_speculative(true);
+    fprintf(stderr, "[sparkinfer-server] speculative decoding: DSpark draft %s (block %d, draft context %d)\n",
+            dir.c_str(), impl_->draft->config().block_size, impl_->draft->config().max_seq);
+    return true;
+}
+
+ModelEngine::SpeculativeStats ModelEngine::speculative_stats() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    SpeculativeStats out;
+    if (!impl_->draft || !impl_->batch_engine) return out;
+    const auto s = impl_->batch_engine->speculative_stats();
+    out.enabled = true;
+    out.runs = s.runs;
+    out.tokens = s.tokens;
+    out.handoffs = s.handoffs;
+    return out;
+}
+
+bool ModelEngine::speculative() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return impl_->draft != nullptr;
 }
 
 void ModelEngine::set_prefix_cache_boundary_token(int token_id) {
