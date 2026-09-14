@@ -532,6 +532,11 @@ public:
     // with the real vocab size in scope) -- the scatter kernel keeps a defensive bound check as a
     // backstop only. No-op if seq_id has no session entry.
     void set_logit_bias(uint64_t seq_id, const std::vector<std::pair<int, float>>& bias);
+    // Constrained decoding: replace the session's whole logit_bias buffer with `bias` (cfg.vocab
+    // floats: the request's own logit_bias plus a large negative value for every token the
+    // constraint rules out), marking it set so the prefill seed applies it too. Called before every
+    // sample of a constrained request; copies synchronously through a pinned staging buffer.
+    void set_logit_bias_dense(uint64_t seq_id, const float* bias);
 
     // Token budget for KV allocation: prompt + decode headroom, capped at max_seq.
     static int session_token_budget(size_t prompt_len, int max_new, int max_seq);

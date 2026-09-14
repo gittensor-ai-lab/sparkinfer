@@ -355,6 +355,9 @@ struct Qwen35Model::Impl {
     // -- the only caller -- always runs with the engine mutex held). Fixed size (kMaxLogitBiasEntries).
     int* h_logit_bias_ids = nullptr; float* h_logit_bias_vals = nullptr;
     int* d_logit_bias_ids = nullptr; float* d_logit_bias_vals = nullptr;
+    // Pinned staging for set_logit_bias_dense (cfg.vocab floats), allocated on first use: only
+    // constrained requests ever need it.
+    float* h_dense_bias = nullptr;
     float* logits;
     int *d_scalars, *d_tok, *d_out_id, *d_pos, *d_seqlen, *d_writepos, *d_shared_ids;
     int *d_cap_row = nullptr;   // dflash capture row, packed into d_scalars[4]
@@ -808,6 +811,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->logit_bias_default);
     cudaFree(p_->d_logit_bias_ids); cudaFree(p_->d_logit_bias_vals);
     cudaFreeHost(p_->h_logit_bias_ids); cudaFreeHost(p_->h_logit_bias_vals);
+    if (p_->h_dense_bias) cudaFreeHost(p_->h_dense_bias);
     // Packed decode scalars (d_tok/d_pos/d_seqlen/d_writepos alias into d_scalars — not freed separately)
     cudaFree(p_->d_scalars); cudaFree(p_->d_out_id);
     cudaFreeHost(p_->h_scalars); cudaFreeHost(p_->h_out_id);
@@ -3601,6 +3605,23 @@ void Qwen35Model::reset_penalty_counts(uint64_t seq_id) {
     if (it == s.sessions.end() || !it->second.penalty_counts) return;   // defensive; should not happen
     cu(cudaMemsetAsync(it->second.penalty_counts, 0, (size_t)s.cfg.vocab * sizeof(int), s.stream),
        "penalty_counts reset");
+}
+
+void Qwen35Model::set_logit_bias_dense(uint64_t seq_id, const float* bias) {
+    Impl& s = *p_;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    auto it = s.sessions.find(seq_id);
+    if (it == s.sessions.end() || !it->second.logit_bias || !bias) return;
+    const size_t bytes = (size_t)s.cfg.vocab * sizeof(float);
+    if (!s.h_dense_bias) cu(cudaHostAlloc(&s.h_dense_bias, bytes, cudaHostAllocDefault), "host dense logit_bias");
+    std::memcpy(s.h_dense_bias, bias, bytes);
+    cu(cudaMemcpyAsync(it->second.logit_bias, s.h_dense_bias, bytes, cudaMemcpyHostToDevice, s.stream),
+       "dense logit_bias");
+    // The staging buffer is shared by every constrained request: finish this copy before another
+    // request's mask can overwrite it.
+    cu(cudaStreamSynchronize(s.stream), "dense logit_bias sync");
+    it->second.logit_bias_set = true;
+    if (seq_id == s.active_seq_id) s.logit_bias_set = true;
 }
 
 void Qwen35Model::set_logit_bias(uint64_t seq_id, const std::vector<std::pair<int, float>>& bias) {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "sparkinfer/token_constraint.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -91,6 +93,13 @@ public:
         // `job.req = req;`, same safe-across-the-async-worker-boundary mechanism `prompt` already
         // relies on.
         std::vector<std::pair<int, float>> logit_bias;
+        // CONSTRAINED DECODING. Non-null => every sampled token, the first one out of prefill
+        // included, is drawn only from the tokens the constraint allows at that point: the engine
+        // asks it for a mask before each sample and reports each emitted token back. The mask is
+        // applied as a per-step dense logit bias on top of logit_bias, so it holds at every
+        // temperature. Shared, not deep-copied: the constraint is stateful and belongs to exactly
+        // one generation. Such a request never joins a packed decode batch, which has no per-row bias.
+        std::shared_ptr<TokenConstraint> constraint;
         // TEACHER-FORCED SCORING. Non-empty => this request does not generate: it replays exactly
         // these tokens as its output and reports what the model thought of each one. Every decode
         // step still runs a real forward pass (so KV/GDN state advances exactly as it would while
@@ -227,6 +236,10 @@ private:
     // Returns false having done NOTHING when the batch is not eligible, so the caller falls back
     // to stepping the jobs individually. `any_finished` is set if any job completed.
     bool step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished);
+    // Constrained decoding: rebuild the job's dense logit bias from its constraint's next-token mask
+    // (on top of its own logit_bias) and upload it for the next sample. False when the constraint
+    // allows no token at all.
+    bool apply_constraint_mask(Job& job);
     // Retire a job: close/free its session and mark it done. Shared by step_job() and the packed
     // path so "job is over" has exactly one implementation.
     void finish_job_impl(Job& j);

@@ -155,6 +155,25 @@ int ContinuousBatchEngine::num_active() const {
 
 int ContinuousBatchEngine::num_free_kv_blocks() const { return kv_->num_free_blocks(); }
 
+bool ContinuousBatchEngine::apply_constraint_mask(Job& job) {
+    // Far below any real logit, finite so temperature scaling and logsumexp stay finite too.
+    static constexpr float kMasked = -1.0e9f;
+    const int vocab = model_->config().vocab;
+    std::vector<uint32_t> bits((vocab + 31) / 32, 0xffffffffu);
+    job.req.constraint->fill_next_mask(bits.data(), vocab);
+    std::vector<float> bias(vocab, 0.f);
+    for (const auto& [id, value] : job.req.logit_bias)
+        if (id >= 0 && id < vocab) bias[id] = value;
+    bool any = false;
+    for (int id = 0; id < vocab; ++id) {
+        if ((bits[id / 32] >> (id % 32)) & 1) any = true;
+        else bias[id] = kMasked;
+    }
+    if (!any) return false;
+    model_->set_logit_bias_dense(job.seq_id, bias.data());
+    return true;
+}
+
 int ContinuousBatchEngine::max_queue_depth() const { return max_queue_depth_config(); }
 
 uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(int)>& on_token,
@@ -218,6 +237,15 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
             if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
             model_->reset_penalty_counts(seq_id);   // explicit, not relying on open_session's internal zero
             model_->set_logit_bias(seq_id, job.req.logit_bias);    // same reason
+        }
+        // The first token comes out of prefill, so its mask must be in place before prefill runs.
+        if (job.req.constraint) {
+            job.seq_id = seq_id;
+            if (!apply_constraint_mask(job)) {
+                if (seq_id != 0) model_->close_session(seq_id);   // session 0 is the shared prefix
+                else kv_->free(seq_id);
+                return fail(EnqueueError::BAD_REQUEST);
+            }
         }
     }
 
@@ -407,6 +435,9 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         if (j->req.temperature != 0.f) return false;
         if (j->req.top_k > 0 || j->req.top_p < 1.0f) return false;
         if (j->req.presence_penalty != 0.f || j->req.frequency_penalty != 0.f) return false;
+        // decode_packed applies no logit bias: a request with logit_bias or a constraint decodes on
+        // its own, where forward_token applies it.
+        if (!j->req.logit_bias.empty() || j->req.constraint) return false;
     }
 
     // Emit each row's pending token and run the same termination checks step_job() does. A job
@@ -698,6 +729,20 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         return true;
     }
 
+    // Constrained decoding: the token just emitted advances the constraint, and the next sample is
+    // drawn under the mask for what may follow it.
+    if (job.req.constraint) {
+        if (!job.req.constraint->accept(job.next_token)) {
+            job.error = "constrained decoding: emitted a token the constraint does not allow";
+            finish_job(job);
+            return true;
+        }
+        if (!apply_constraint_mask(job)) {
+            job.error = "constrained decoding: no token can continue the output";
+            finish_job(job);
+            return true;
+        }
+    }
     const int prompt_len = (int)job.req.prompt.size();
     const int sampled = model_->forward_token(job.next_token, prompt_len + job.decode_emitted - 1, true,
                                            job.req.temperature, job.req.seed,
