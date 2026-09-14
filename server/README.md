@@ -237,6 +237,34 @@ several. `sparkinfer_tool_calls_forced_total{step="retry"|"pick_function"}` in `
 how often that happened.
 Tool calls use the native Qwen XML protocol (Qwen3.6, Qwen3.8); Muse Glimmer uses a different
 tool protocol.
+
+Tool calls are **constrained**. Every token of a tool-calling turn is sampled under a grammar that
+only admits output the server's parser accepts:
+
+- reasoning and content free of protocol markup;
+- calls only to offered functions: at least one for `"required"`, only the named one for a named
+  choice, and at most one with `parallel_tool_calls: false`;
+- every argument in the template's exact framing, with a value its schema allows. That covers
+  enums, consts, numeric ranges, string lengths and patterns, nested objects and arrays, `$ref`,
+  and `anyOf`/`oneOf`/`allOf`.
+
+So a well-formed request cannot get an invalid tool call back. The one exception is running out of
+`max_tokens` mid-call, which returns `finish_reason: "length"`. The grammar is compiled once per
+distinct tool set, and each token's mask costs microseconds. `sparkinfer_tool_calls_constrained_total`
+counts constrained generations. `SPARKINFER_TOOL_GRAMMAR=0` turns the grammar off and falls back to the
+forced call opening and retry described above.
+
+The protocol puts a few limits on arguments:
+
+- A JSON-typed argument (object, array, or a union including non-strings) cannot hold a raw `<` inside
+  its strings; the model writes it as `\u003c`. A raw `<` there could spell a closing tag and cut
+  the call short for any Qwen tool parser.
+- A string argument with `minLength` or `maxLength` cannot contain `<`.
+- A plain string argument can contain `<`, as long as it doesn't spell protocol markup.
+
+Where the grammar cannot enforce a schema exactly, the server logs the approximation, and the
+argument is still validated after generation. This applies to `oneOf` branches that can overlap, a
+`pattern` inside a JSON value, and a non-integer or unbounded `multipleOf`.
 Muse requests containing tool definitions or tool-call history return `400`, including when
 `tool_choice` is `"none"`, so unsupported protocol data cannot be silently dropped.
 JSON Schema `pattern` uses the safe, linear-time RE2 syntax; unsupported expressions are rejected.
