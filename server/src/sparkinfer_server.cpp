@@ -3638,8 +3638,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::thread shutdown_watcher([&svr] {
+    // Set once listen() has returned, i.e. httplib has stopped accepting and its worker threads --
+    // every in-flight request -- have finished.
+    std::atomic<bool> listen_returned{false};
+    std::thread shutdown_watcher([&svr, &listen_returned] {
         while (!g_shutdown_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (listen_returned.load()) return;   // listen() ended by itself: nothing to drain
         fprintf(stderr, "[sparkinfer-server] shutdown signal received, draining in-flight requests...\n");
         svr.stop();
         // svr.stop() only closes the LISTENING socket -- it does not force-close connections
@@ -3651,7 +3655,14 @@ int main(int argc, char** argv) {
         // shape as Kubernetes' terminationGracePeriodSeconds.
         const long grace_s = getenv("SPARKINFER_SHUTDOWN_GRACE_S")
                                  ? atol(getenv("SPARKINFER_SHUTDOWN_GRACE_S")) : 30;
-        std::this_thread::sleep_for(std::chrono::seconds(grace_s));
+        // Wait for the drain, not for the clock. Sleeping the whole grace period unconditionally
+        // made every shutdown take 30 s and end in "still draining -- forcing exit" even when
+        // listen() had returned at once -- main joins this thread, so it waited too -- and under
+        // Docker's default 10 s stop timeout the container was SIGKILLed instead.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(grace_s);
+        while (!listen_returned.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (listen_returned.load()) return;
         fprintf(stderr, "[sparkinfer-server] shutdown grace period (%lds) elapsed with requests "
                         "still draining -- forcing exit\n", grace_s);
         _exit(0);  // not exit(): other threads may still be mid-flight; skip atexit/static dtors
@@ -3678,7 +3689,12 @@ int main(int argc, char** argv) {
             sparkinfer::deterministic_mode() ? "  DETERMINISTIC=1 (bit-reproducible)" : "");
 
     svr.listen_after_bind();   // bind already succeeded above; this only returns on stop()
+    listen_returned = true;
     g_shutdown_requested = true;  // unblock the watcher thread if listen() returned on its own
     shutdown_watcher.join();
-    return 0;
+    fprintf(stderr, "[sparkinfer-server] drained, exiting\n");
+    fflush(stderr);
+    // Same exit the grace-period path takes: the engine, CUDA and the tokenizer have never been torn
+    // down through static destructors, and a drained server has nothing left that needs them.
+    _exit(0);
 }
