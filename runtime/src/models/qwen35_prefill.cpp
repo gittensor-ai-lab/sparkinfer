@@ -3302,6 +3302,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (wb4 > wb) wb = wb4;
             fp4_qkv = a.alloc<bf16>((size_t)NA * qkvg_n);
         }
+        // ...and the o projection.
+        if (c.muse_glimmer && s.w.layers[0].wo_fp4) {
+            const size_t wb5 = kernels::prefill_nvfp4_workspace_bytes(NA, H, qdim);
+            if (wb5 > wb) wb = wb5;
+        }
         fp4_a   = a.alloc<unsigned char>(ab);
         fp4_asf = a.alloc<unsigned char>(sb);
         if (wb) fp4_ws = a.alloc<unsigned char>(wb);
@@ -4061,8 +4066,22 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     packed ? packed_seq_hint : start_pos + N,
                     ks, vs, kv8 ? 1 : 0);
             }
-            kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
-            supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
+            // The o projection through the block-scaled FP4 copy prefill already holds, with the
+            // gate folded into its quantize, instead of the Q4_K mma rows. Rows past N are scratch.
+            // SPARKINFER_MUSE_PACKED_WO_MIN_ROWS=33 restores the Q4_K projection.
+            static const int wo_fp4_min_rows = [] {
+                const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_MIN_ROWS");
+                const int v = e ? atoi(e) : 1;
+                return v < 1 ? 1 : v; }();
+            const bool wo_fp4_done = N >= wo_fp4_min_rows && fp4_a && fp4_asf &&
+                w.wo_fp4 && w.wo_fp4_sf && kernels::prefill_nvfp4_supported(Ng, H, qdim) &&
+                kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_asf, Ng, qdim, st) &&
+                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.wo_fp4, w.wo_fp4_sf,
+                                                   ao, Ng, H, qdim, fp4_ws, st);
+            if (!wo_fp4_done) {
+                kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
+                supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
+            }
             if (!supported) break;
             if (L == 0) vdbg_snapshot2(ao, 0);
             // Sandwich norm (post-attn): h = x + RMSNorm(ao) * post_attn_norm -- the attention
@@ -4089,11 +4108,20 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bool gu_gemm =
                 packed && topk == 1 && N >= gu_gemm_min_rows() &&
                 packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su, st);
-            kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
-                                               w.gate_qtype, w.up_qtype, w.down_qtype,
-                                               expert_ids, expert_w, routed, moe_h, moe_out,
-                                               N, topk, H, ffn, q81, st, false,
-                                               gu_gemm ? sg : nullptr, gu_gemm ? su : nullptr);
+            // ...and down through its FP4 copy when it is resident, with the SwiGLU folded into
+            // its quantize -- the arm Qwen3.8's packed FFN already takes -- instead of the Q4_K
+            // mma rows, which were a quarter of the step.
+            const bool dn_gemm = gu_gemm && w.down_fp4 && w.down_fp4_sf &&
+                kernels::launch_prefill_nvfp4_swiglu_quant_a(sg, su, fp4_a, fp4_asf, Ng, ffn, st) &&
+                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.down_fp4, w.down_fp4_sf,
+                                                   routed, Ng, H, ffn, fp4_ws, st,
+                                                   w.down_fp4_alpha);
+            if (!dn_gemm)
+                kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
+                                                   w.gate_qtype, w.up_qtype, w.down_qtype,
+                                                   expert_ids, expert_w, routed, moe_h, moe_out,
+                                                   N, topk, H, ffn, q81, st, false,
+                                                   gu_gemm ? sg : nullptr, gu_gemm ? su : nullptr);
             if (L == 0) vdbg_snapshot2(routed, 3);
             // Sandwich norm (post-FFN): x = h + RMSNorm(routed) * post_ffn_norm, same 1e-8.
             const void* nn = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;

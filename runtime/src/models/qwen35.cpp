@@ -5834,10 +5834,17 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         size_t fp4_free = 0, fp4_total = 0;
         cudaMemGetInfo(&fp4_free, &fp4_total);
         (void)fp4_free; (void)fp4_total;
-        bool down_fp4_on = c.max_seq <= 2048;
+        // The packed continuous-batch decode reads the o and down copies too, and cb serving loads
+        // at the 4096 default; the preflight below still drops them whenever the set does not fit.
+        // SPARKINFER_MUSE_NVFP4_OUTPUTS_MAXSEQ=2048 restores the old bound.
+        static const int outputs_maxseq = [] {
+            const char* e = getenv("SPARKINFER_MUSE_NVFP4_OUTPUTS_MAXSEQ");
+            return e ? atoi(e) : 4096;
+        }();
+        bool down_fp4_on = c.max_seq <= outputs_maxseq;
         if (fp4o_env)
             down_fp4_on = fp4o_env[0] == '1' || fp4o_env[0] == 'd';
-        wo_fp4_on = wo_fp4_on && c.max_seq <= 2048;
+        wo_fp4_on = wo_fp4_on && c.max_seq <= outputs_maxseq;
         // Cost EVERY copy that grows the footprint against the free VRAM that is actually there,
         // and drop legs in ascending order of what they are worth until the set fits. Only these
         // three grow it: gate/up convert and then release their native prefill copy, so they are
@@ -5900,6 +5907,39 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 return freeb > want_qkvg + (wo_fp4_on ? want_wo : 0) +
                                (down_fp4_on ? want_down : 0) + reserve;
             };
+            fprintf(stderr, "[prefill-muse] SM120 NVFP4 preflight: %.2f GB free, %d sessions, "
+                    "reserve %.2f GB\n", (double)freeb / 1e9, fp4_sessions, (double)reserve / 1e9);
+            // ffn_down is a quarter of a packed decode step on Q4_K, and below eight rows the packed
+            // decode does not use qkv-gate at all -- so where both cannot be held and the
+            // deployment cannot pack eight rows, down is the copy to keep. But it is 3.9 GB, and the reserve above under-counts what the
+            // runtime allocates after load (packed and prefill arenas, graph pools: ~2.2 GB at 16
+            // sessions against a 0.8 GB reserve), so down is admitted only with that margin on
+            // top, and otherwise dropped before anything else is weighed.
+            // SPARKINFER_MUSE_NVFP4_DOWN_RUNTIME_MB tunes the margin.
+            if (down_fp4_on) {
+                static const size_t down_runtime = [] {
+                    const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_RUNTIME_MB");
+                    long long mb = e ? atoll(e) : 2048;
+                    return (size_t)(mb < 0 ? 0 : mb) << 20;
+                }();
+                const size_t with_down = want_down + (wo_fp4_on ? want_wo : 0) + reserve +
+                                         down_runtime;
+                if (freeb <= with_down) {
+                    fprintf(stderr, "[prefill-muse] SM120 NVFP4 ffn_down skipped: %.1f GB free "
+                            "cannot hold it with a %.1f GB runtime margin\n",
+                            (double)freeb / 1e9, (double)down_runtime / 1e9);
+                    down_fp4_on = false;
+                } else if (qkvg_fp4_on && freeb <= with_down + want_qkvg) {
+                    if (fp4_sessions > 8) {
+                        fprintf(stderr, "[prefill-muse] SM120 NVFP4 ffn_down skipped: qkv-gate "
+                                "is worth more at %d sessions\n", fp4_sessions);
+                        down_fp4_on = false;
+                    } else {
+                        fprintf(stderr, "[prefill-muse] SM120 NVFP4 qkv-gate traded for ffn_down\n");
+                        qkvg_fp4_on = false;
+                    }
+                }
+            }
             if (wo_fp4_on && !fits()) {
                 fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj skipped: %.1f GB free cannot "
                         "hold qkv-gate %.1f + o %.1f + ffn_down %.1f GB + %.1f GB reserve\n",
