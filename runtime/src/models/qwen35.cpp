@@ -206,6 +206,9 @@ struct SessionBuffers {
     // decode. Exists for EVERY model, same as penalty_counts, and needs the identical per-REQUEST
     // (not per-session-slot) re-zero-then-set discipline when a session is reused (seq_id 0).
     float* logit_bias = nullptr;
+    // Whether this request's set_logit_bias had any entries. Host-side, so the prefill seed can
+    // skip the bias pass entirely for the requests (nearly all) that never set one.
+    bool logit_bias_set = false;
 };
 
 struct Qwen35Model::Impl {
@@ -346,6 +349,7 @@ struct Qwen35Model::Impl {
     // model -- mirrors penalty_counts exactly). logit_bias_default backs session 0's entry.
     float* logit_bias = nullptr;
     float* logit_bias_default = nullptr;
+    bool logit_bias_set = false;   // sessions[active_seq_id].logit_bias_set, swapped with logit_bias
     // Transient scratch for Qwen35Model::set_logit_bias's sparse (id,val) -> device scatter. NOT
     // session-scoped (purely transient staging, safe to share across requests since submit_locked
     // -- the only caller -- always runs with the engine mutex held). Fixed size (kMaxLogitBiasEntries).
@@ -3132,7 +3136,7 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.d_vision_emb, s.d_vision_pos, s.vision_n,
                           // MRoPE rotary positions, null unless set_pending_mrope ran for this prompt.
                           s.d_mrope_pos };
-    const int seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    int seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
     // Consume it. This is PER-REQUEST state, not model state: leaving it set would splice the
     // previous request's image into the next prompt, which would produce fluent, confident text
     // about an image the caller never sent. Cleared on every path out, including the failure
@@ -3140,6 +3144,21 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     clear_pending_vision();
     if (seed >= 0 && s.dflash_capture && s.dflash_context && s.dflash_n_cap > 0)
         s.dflash_ctx_len = pos0 + n;
+    // logit_bias applies to the FIRST token too. prefill_batched_run's argmax runs on the raw
+    // logits -- inside the prefill graph, which does not key on the per-session bias buffer -- so
+    // the first token of every batched-prefill response ignored logit_bias: a -100 could not keep
+    // a token out of position 0, and a +100 could not put one there. forward_token() adds the bias
+    // before its argmax; do the same here and re-pick the seed. Outside the capture (a host `if` is
+    // legal here, see below), before the seed logprob so that describes the biased distribution
+    // exactly as forward_token()'s entries do, and skipped for requests that set no bias.
+    if (seed >= 0 && s.logit_bias_set) {
+        kernels::launch_logit_bias(s.logits, s.logit_bias, s.cfg.vocab, s.stream);
+        kernels::launch_argmax(s.logits, s.d_out_id, 1, s.cfg.vocab, s.stream);
+        cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, s.stream),
+           "prefill seed logit_bias readback");
+        cu(cudaStreamSynchronize(s.stream), "prefill seed logit_bias sync");
+        seed = *s.h_out_id;
+    }
     // Seed-token logprob (see ingest_prompt_range's want_seed_logprob). prefill_batched_run's
     // LM-head tail stops at argmax -- it never runs the sort/scan that last_token_logprobs()
     // reads -- so without this the FIRST token of every response has no logprob entry and
@@ -3527,6 +3546,7 @@ void Qwen35Model::activate_session(uint64_t seq_id) {
         // control state.
         s.penalty_counts = it->second.penalty_counts;
         s.logit_bias = it->second.logit_bias;
+        s.logit_bias_set = it->second.logit_bias_set;
     }
 
     // The PREFILL and DFlash graphs are still torn down on a switch. They bake the same
@@ -3593,6 +3613,8 @@ void Qwen35Model::set_logit_bias(uint64_t seq_id, const std::vector<std::pair<in
     // requests, so a request with no logit_bias must not inherit a PRIOR request's bias.
     cu(cudaMemsetAsync(it->second.logit_bias, 0, (size_t)s.cfg.vocab * sizeof(float), s.stream),
        "logit_bias reset");
+    it->second.logit_bias_set = !bias.empty();
+    if (seq_id == s.active_seq_id) s.logit_bias_set = it->second.logit_bias_set;   // session 0 is set while active
     if (bias.empty()) return;
     const int k = (int)std::min<size_t>(bias.size(), (size_t)kMaxLogitBiasEntries);
     for (int i = 0; i < k; i++) {
