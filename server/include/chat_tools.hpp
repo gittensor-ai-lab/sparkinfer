@@ -76,6 +76,11 @@ struct ChatRequest {
     std::string reasoning_effort;
     bool reasoning_exclude = false;
     ResponseFormat response_format;
+    // Server-internal, never read from a request body: raw template text the assistant turn starts
+    // with, after the generation prompt, so the model continues from it. The server uses it to force
+    // a tool call for tool_choice=required or a named function (forced_tool_call_prefix), and
+    // prepends the same text to the model's output before parsing it.
+    std::string assistant_prefix;
 };
 
 struct ParsedToolOutput {
@@ -83,7 +88,18 @@ struct ParsedToolOutput {
     std::string content;
     std::vector<ToolCall> tool_calls;
     std::string error;
+    // tool_choice=required or a named function, and the output has no call to an offered function:
+    // no call at all, only calls to other functions, or a call to a function that does not exist.
+    // The error is set, but reasoning_content is kept: the server continues from that reasoning
+    // into a forced call rather than failing the request.
+    bool missing_required_call = false;
 };
+
+// The opening of a native Qwen tool call that forces one: "<tool_call>\n<function=NAME>\n" for a
+// named function or for tool_choice=required with a single offered function, and
+// "<tool_call>\n<function=" for required with several (the model still writes the name, and can
+// write one that is not offered). Empty for any other tool_choice.
+std::string forced_tool_call_prefix(const ChatRequest& request);
 
 bool parse_chat_request_json(const std::string& body, ChatRequest& request, std::string& err);
 

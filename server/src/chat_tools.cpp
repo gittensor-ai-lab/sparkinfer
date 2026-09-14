@@ -423,13 +423,9 @@ bool valid_schema_node(const json& schema, const std::string& where, bool top_le
     // "$schema" and "$comment" carry no constraints -- they are annotations a validator is
     // required to ignore -- so accepting and dropping them is faithful, not permissive. Clients
     // built on @ai-sdk/openai-compatible emit "$schema" on every tool schema, and rejecting it
-    // failed the whole request. Structural "$" keywords ($ref/$defs/$id) are deliberately still
-    // refused: silently ignoring a $ref would validate the arguments against nothing.
-    //
-    // allOf and prefixItems are likewise still refused. allOf needs schema intersection, which is
-    // genuinely hard in the general case; prefixItems needs positional item schemas. Neither is
-    // implemented in validate_value(), so accepting them would be exactly the silent weakening
-    // this comment warns about. A 400 naming the field is the honest answer until they are.
+    // failed the whole request. Structural "$" keywords are different: $ref and $defs are accepted
+    // only because validate_value() resolves them (local pointers only), and $id stays refused --
+    // silently ignoring a reference would validate the arguments against nothing.
     if (!is_allowed_key(schema,
                         {"$schema", "$comment",
                          "type", "description", "default", "title", "properties",
@@ -808,6 +804,17 @@ ParsedToolOutput fail_tool_output(ParsedToolOutput out, const std::string& error
     return out;
 }
 
+// tool_choice demanded a call and the output has no call to an offered function. Still a failure,
+// but one the server can act on: the reasoning is kept so the model can continue from it into a
+// forced call.
+ParsedToolOutput fail_missing_call(ParsedToolOutput out, const std::string& error) {
+    std::string reasoning = std::move(out.reasoning_content);
+    out = fail_tool_output(std::move(out), error);
+    out.reasoning_content = std::move(reasoning);
+    out.missing_required_call = true;
+    return out;
+}
+
 bool parse_scalar_from_text(const std::string& value, json& parsed) {
     std::string ignored;
     return parse_strict_json(value, parsed, ignored, "parameter value");
@@ -1094,7 +1101,10 @@ bool validate_value(const json& value, const json& schema, const std::string& pa
     return true;
 }
 
-bool parse_parameter_value(const std::string& value, const json& schema, json& parsed) {
+// root is the tool's whole parameters schema, where $defs live: a property that is a $ref (or
+// reaches one through anyOf/oneOf) resolves against it, never against the property itself.
+bool parse_parameter_value(const std::string& value, const json& schema, json& parsed,
+                           const json* root) {
     const bool allows_string = schema_allows_type(schema, "string");
     const bool allows_non_string = schema_allows_non_string(schema);
     if (allows_string && !allows_non_string) {
@@ -1105,7 +1115,7 @@ bool parse_parameter_value(const std::string& value, const json& schema, json& p
         json candidate;
         if (parse_scalar_from_text(value, candidate)) {
             std::string validation_error;
-            if (validate_value(candidate, schema, "parameter value", validation_error)) {
+            if (validate_value(candidate, schema, "parameter value", validation_error, root)) {
                 parsed = std::move(candidate);
                 return true;
             }
@@ -1166,8 +1176,9 @@ const ToolDefinition* offered_tool(const ChatRequest& request, const std::string
     return hit;
 }
 
+// `unoffered` (optional) is set when the call is well-formed but names no offered function.
 bool parse_one_xml_call(const std::string& block, const ChatRequest& request, ToolCall& call,
-                        std::string& err) {
+                        std::string& err, bool* unoffered = nullptr) {
     size_t pos = 0;
     while (pos < block.size() && std::isspace(static_cast<unsigned char>(block[pos]))) ++pos;
     if (block.compare(pos, std::char_traits<char>::length(kFunctionOpen), kFunctionOpen) != 0)
@@ -1179,7 +1190,10 @@ bool parse_one_xml_call(const std::string& block, const ChatRequest& request, To
     if (!safe_protocol_name(call.name))
         return set_error(err, "tool call has an invalid function name");
     const ToolDefinition* tool = offered_tool(request, call.name);
-    if (!tool) return set_error(err, "model called unoffered function " + call.name);
+    if (!tool) {
+        if (unoffered) *unoffered = true;
+        return set_error(err, "model called unoffered function " + call.name);
+    }
     // Echo the name back exactly as the CLIENT offered it, not as the model spelled it. The client
     // dispatches on its own spelling -- returning the model's "Read" for an offered "read" would
     // resolve here and then miss in the caller's own handler table, moving the failure somewhere
@@ -1219,9 +1233,9 @@ bool parse_one_xml_call(const std::string& block, const ChatRequest& request, To
         if (has_protocol_markup(value))
             return set_error(err, "parameter " + key + " contains reserved protocol markup");
         json parsed;
-        if (!parse_parameter_value(value, *property_schema, parsed))
+        if (!parse_parameter_value(value, *property_schema, parsed, &schema))
             return set_error(err, "parameter " + key + " is not valid for its schema type");
-        if (!validate_value(parsed, *property_schema, "parameter " + key, err)) return false;
+        if (!validate_value(parsed, *property_schema, "parameter " + key, err, &schema)) return false;
         arguments[key] = std::move(parsed);
         pos = value_end + std::char_traits<char>::length(kParameterClose);
     }
@@ -1943,7 +1957,19 @@ std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_
     out << kImStart << "assistant\n";
     if (enable_thinking) out << kThinkOpen << '\n';
     else out << kThinkOpen << "\n\n" << kThinkClose << "\n\n";
+    out << request.assistant_prefix;
     return out.str();
+}
+
+std::string forced_tool_call_prefix(const ChatRequest& request) {
+    if (request.tools.empty()) return {};
+    const std::string open = std::string(kToolCallOpen) + "\n" + kFunctionOpen;
+    if (request.tool_choice == ToolChoiceMode::kNamed) return open + request.required_tool_name + ">\n";
+    if (request.tool_choice != ToolChoiceMode::kRequired) return {};
+    // One offered function: required can only mean that one, and naming it leaves the model
+    // nothing to invent.
+    if (request.tools.size() == 1) return open + request.tools[0].name + ">\n";
+    return open;
 }
 
 ParsedToolOutput parse_qwen36_tool_output(const std::string& raw, bool enable_thinking,
@@ -2011,18 +2037,19 @@ ParsedToolOutput parse_qwen36_tool_output(const std::string& raw, bool enable_th
         // successful completion with no tool_calls, which is exactly the case it was promised
         // could not happen.
         //
-        // Failing here routes into the same invalid_tool_output path as malformed markup, which is
-        // bounded (one retry, then a 502) rather than looping.
+        // The failure is flagged (missing_required_call) rather than final: the server continues the
+        // model's own reasoning into a forced call (forced_tool_call_prefix), and only a call that
+        // still does not come back reaches the client as a 502.
         if (!request.tools.empty()) {
             if (request.tool_choice == ToolChoiceMode::kRequired) {
-                return fail_tool_output(std::move(out),
-                                        "tool_choice=required but the model returned no tool call");
+                return fail_missing_call(std::move(out),
+                                         "tool_choice=required but the model returned no tool call");
             }
             if (request.tool_choice == ToolChoiceMode::kNamed) {
-                return fail_tool_output(std::move(out),
-                                        "tool_choice named the function \"" +
-                                        request.required_tool_name +
-                                        "\" but the model returned no tool call");
+                return fail_missing_call(std::move(out),
+                                         "tool_choice named the function \"" +
+                                         request.required_tool_name +
+                                         "\" but the model returned no tool call");
             }
         }
         return out;
@@ -2061,25 +2088,35 @@ ParsedToolOutput parse_qwen36_tool_output(const std::string& raw, bool enable_th
             return fail_tool_output(std::move(out), "unterminated <tool_call> block");
         }
         ToolCall call;
-        if (!parse_one_xml_call(remaining.substr(body_start, end - body_start), request, call, out.error)) {
+        bool unoffered = false;
+        if (!parse_one_xml_call(remaining.substr(body_start, end - body_start), request, call, out.error,
+                                &unoffered)) {
             const std::string error = out.error;
+            // Under required or a named function, an invented name is a missing call, not a
+            // malformed one: the server picks an offered function and forces it. Under auto the
+            // model chose to call something that does not exist, and that stays its error.
+            if (unoffered && (request.tool_choice == ToolChoiceMode::kRequired ||
+                              request.tool_choice == ToolChoiceMode::kNamed))
+                return fail_missing_call(std::move(out), error);
             return fail_tool_output(std::move(out), error);
         }
         out.tool_calls.push_back(std::move(call));
         pos = end + std::char_traits<char>::length(kToolCallClose);
     }
-    if (!request.parallel_tool_calls && out.tool_calls.size() > 1) {
-        return fail_tool_output(std::move(out),
-                                "model emitted parallel tool calls when they were disabled");
-    }
+    // parallel_tool_calls=false promises at most one call. The first is complete and schema-valid
+    // by now, so keep it and drop the rest instead of failing a usable response.
+    if (!request.parallel_tool_calls && out.tool_calls.size() > 1) out.tool_calls.resize(1);
     if (request.tool_choice == ToolChoiceMode::kRequired && out.tool_calls.empty())
-        return fail_tool_output(std::move(out), "model did not call a required tool");
+        return fail_missing_call(std::move(out), "model did not call a required tool");
     if (request.tool_choice == ToolChoiceMode::kNamed) {
+        // A named tool_choice forces that function (OpenAI semantics), so calls to any other
+        // function are dropped; with none left it is a missing call like no call at all.
+        std::vector<ToolCall> named;
+        for (ToolCall& call : out.tool_calls)
+            if (call.name == request.required_tool_name) named.push_back(std::move(call));
+        out.tool_calls = std::move(named);
         if (out.tool_calls.empty())
-            return fail_tool_output(std::move(out), "model did not call the required function");
-        for (const ToolCall& call : out.tool_calls)
-            if (call.name != request.required_tool_name)
-                return fail_tool_output(std::move(out), "model called a function other than the required function");
+            return fail_missing_call(std::move(out), "model did not call the required function");
     }
     return out;
 }

@@ -434,6 +434,7 @@ ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable
         out.content = parsed.content;
         out.tool_calls = parsed.tool_calls;
         out.error = parsed.error;
+        out.missing_required_call = parsed.missing_required_call;
         return out;
     }
 

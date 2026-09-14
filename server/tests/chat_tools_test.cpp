@@ -20,6 +20,7 @@ using sparkinfer_server::ToolChoiceMode;
 using sparkinfer_server::ToolCall;
 using sparkinfer_server::RequestControls;
 using sparkinfer_server::apply_qwen36_tools_template;
+using sparkinfer_server::forced_tool_call_prefix;
 using sparkinfer_server::parse_chat_request_json;
 using sparkinfer_server::parse_legacy_completion_request;
 using sparkinfer_server::parse_qwen36_tool_output;
@@ -773,10 +774,13 @@ bool test_parallel_tool_calls() {
     CHECK(second["style"].is_string());
     CHECK(second["style"] == "brief");
 
+    // parallel_tool_calls=false promises at most one call. The first is complete and valid, so it is
+    // kept rather than failing a usable response with a 502.
     request.parallel_tool_calls = false;
-    const ParsedToolOutput disallowed = parse_qwen36_tool_output(raw, false, request);
-    CHECK(!disallowed.error.empty());
-    CHECK(disallowed.tool_calls.empty());
+    const ParsedToolOutput first_only = parse_qwen36_tool_output(raw, false, request);
+    CHECK(first_only.error.empty());
+    CHECK(first_only.tool_calls.size() == 1);
+    CHECK(first_only.tool_calls[0].name == "lookup_catalog");
 
     json single_request = json::parse(hermes_request());
     single_request["parallel_tool_calls"] = false;
@@ -1762,6 +1766,148 @@ bool test_parse_score_request() {
     return true;
 }
 
+bool test_ref_properties_resolve_against_parameters_root() {
+    // A property that IS a $ref (or reaches one through anyOf) resolves against the tool's whole
+    // parameters schema, where $defs lives. Per-parameter parsing used to resolve it against the
+    // property itself, found nothing, and turned every call to such a tool into a 502 -- the shape
+    // pydantic and zod emit for any nested model.
+    const std::string body = R"JSON({
+      "messages":[{"role":"user","content":"Book it."}],
+      "tools":[{"type":"function","function":{"name":"book","parameters":{
+        "type":"object",
+        "$defs":{
+          "Seats":{"type":"integer","minimum":1,"maximum":9},
+          "Guest":{"type":"object","properties":{"name":{"type":"string"}},
+                   "required":["name"],"additionalProperties":false},
+          "Cabin":{"type":"string","enum":["economy","business"]}
+        },
+        "properties":{
+          "seats":{"$ref":"#/$defs/Seats"},
+          "guest":{"$ref":"#/$defs/Guest"},
+          "cabin":{"anyOf":[{"$ref":"#/$defs/Cabin"},{"type":"null"}]}
+        },
+        "required":["seats","guest"]
+      }}}]
+    })JSON";
+    ChatRequest request;
+    CHECK(parse_request(body, request));
+    auto call = [](const std::string& seats, const std::string& guest, const std::string& cabin) {
+        return "<tool_call>\n<function=book>\n"
+               "<parameter=seats>\n" + seats + "\n</parameter>\n"
+               "<parameter=guest>\n" + guest + "\n</parameter>\n"
+               "<parameter=cabin>\n" + cabin + "\n</parameter>\n"
+               "</function>\n</tool_call>";
+    };
+    const ParsedToolOutput ok = parse_qwen36_tool_output(call("2", R"({"name":"Ada"})", "business"),
+                                                         false, request);
+    if (!ok.error.empty()) std::fprintf(stderr, "unexpected: %s\n", ok.error.c_str());
+    CHECK(ok.error.empty());
+    CHECK(ok.tool_calls.size() == 1);
+    const json args = arguments(ok.tool_calls[0]);
+    CHECK(args["seats"].is_number_integer());   // typed through the $ref, not the string "2"
+    CHECK(args["seats"] == 2);
+    CHECK(args["guest"]["name"] == "Ada");
+    CHECK(args["cabin"] == "business");
+    // The $ref targets are enforced, not just resolved.
+    CHECK(!parse_qwen36_tool_output(call("12", R"({"name":"Ada"})", "business"), false, request).error.empty());
+    CHECK(!parse_qwen36_tool_output(call("2", R"({"name":"Ada","age":3})", "business"), false, request).error.empty());
+    CHECK(!parse_qwen36_tool_output(call("2", R"({"name":"Ada"})", "first"), false, request).error.empty());
+    return true;
+}
+
+bool test_required_tool_choice_is_forced_not_just_checked() {
+    const std::string prefix = R"JSON({
+      "messages":[{"role":"user","content":"Use lookup."}],
+      "tools":[
+        {"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}}}}},
+        {"type":"function","function":{"name":"other","parameters":{"type":"object"}}}
+      ],
+      "tool_choice":)JSON";
+    // required over a single offered function names it: there is nothing else it could mean.
+    ChatRequest single;
+    CHECK(parse_request(R"JSON({"messages":[{"role":"user","content":"Hi"}],
+      "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+      "tool_choice":"required"})JSON", single));
+    CHECK(forced_tool_call_prefix(single) == "<tool_call>\n<function=lookup>\n");
+    const std::string lookup_call =
+        "lookup>\n<parameter=key>\nalpha\n</parameter>\n</function>\n</tool_call>";
+    ChatRequest request;
+
+    CHECK(parse_request(prefix + "\"auto\"}", request));
+    CHECK(forced_tool_call_prefix(request).empty());
+    // Under auto an invented name stays the model's error: nothing demanded a call.
+    const ParsedToolOutput auto_invented =
+        parse_qwen36_tool_output("<tool_call>\n<function=poem>\n</function>\n</tool_call>", false, request);
+    CHECK(!auto_invented.error.empty());
+    CHECK(!auto_invented.missing_required_call);
+    CHECK(parse_request(prefix + "\"none\"}", request));
+    CHECK(forced_tool_call_prefix(request).empty());
+
+    CHECK(parse_request(prefix + "\"required\"}", request));
+    CHECK(forced_tool_call_prefix(request) == "<tool_call>\n<function=");
+    // Thinking off: the assistant turn starts inside the call, so the output continues it.
+    request.assistant_prefix = forced_tool_call_prefix(request);
+    const std::string prompt = apply_qwen36_tools_template(request, false);
+    const std::string tail = "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=";
+    CHECK(prompt.size() > tail.size() && prompt.compare(prompt.size() - tail.size(), tail.size(), tail) == 0);
+    const ParsedToolOutput forced = parse_qwen36_tool_output(request.assistant_prefix + lookup_call, false, request);
+    CHECK(forced.error.empty());
+    CHECK(forced.tool_calls.size() == 1);
+    CHECK(forced.tool_calls[0].name == "lookup");
+    request.assistant_prefix.clear();
+
+    // Thinking on: prose after the reasoning is a missing call. It is flagged, and the reasoning is
+    // kept so the server can continue from it into a forced call.
+    const ParsedToolOutput missing =
+        parse_qwen36_tool_output("I should look it up.\n</think>\n\nThe key is alpha.", true, request);
+    CHECK(!missing.error.empty());
+    CHECK(missing.missing_required_call);
+    CHECK(contains(missing.reasoning_content, "I should look it up."));
+    CHECK(missing.content.empty());
+    CHECK(missing.tool_calls.empty());
+    // The continuation exactly as the server assembles it parses into the call.
+    const ParsedToolOutput continued = parse_qwen36_tool_output(
+        missing.reasoning_content + "\n</think>\n\n" + forced_tool_call_prefix(request) + lookup_call,
+        true, request);
+    CHECK(continued.error.empty());
+    CHECK(!continued.missing_required_call);
+    CHECK(continued.tool_calls.size() == 1);
+    CHECK(arguments(continued.tool_calls[0])["key"] == "alpha");
+    CHECK(contains(continued.reasoning_content, "I should look it up."));
+    // An invented function name under required is a missing call: the server picks an offered one.
+    const std::string invented = "<tool_call>\n<function=poem>\n</function>\n</tool_call>";
+    const ParsedToolOutput unoffered = parse_qwen36_tool_output(invented, false, request);
+    CHECK(!unoffered.error.empty());
+    CHECK(unoffered.missing_required_call);
+    // A malformed call is NOT a missing call: continuing past it would hide a real failure.
+    const ParsedToolOutput malformed = parse_qwen36_tool_output(
+        "<tool_call>\n<function=lookup>\n<parameter=key>\nalpha\n</function>\n</tool_call>", false, request);
+    CHECK(!malformed.error.empty());
+    CHECK(!malformed.missing_required_call);
+
+    // Named: the prefix names the function; calls to any other function are dropped.
+    CHECK(parse_request(prefix + R"JSON({"type":"function","function":{"name":"lookup"}})JSON" + "}", request));
+    CHECK(forced_tool_call_prefix(request) == "<tool_call>\n<function=lookup>\n");
+    const std::string other_call = "<tool_call>\n<function=other>\n</function>\n</tool_call>";
+    CHECK(parse_qwen36_tool_output("<tool_call>\n<function=poem>\n</function>\n</tool_call>", false, request)
+              .missing_required_call);
+    const ParsedToolOutput wrong = parse_qwen36_tool_output(other_call, false, request);
+    CHECK(!wrong.error.empty());
+    CHECK(wrong.missing_required_call);
+    const ParsedToolOutput mixed =
+        parse_qwen36_tool_output(other_call + "\n<tool_call>\n<function=" + lookup_call, false, request);
+    CHECK(mixed.error.empty());
+    CHECK(mixed.tool_calls.size() == 1);
+    CHECK(mixed.tool_calls[0].name == "lookup");
+    const ParsedToolOutput named_forced = parse_qwen36_tool_output(
+        forced_tool_call_prefix(request) + "<parameter=key>\nbeta\n</parameter>\n</function>\n</tool_call>",
+        false, request);
+    CHECK(named_forced.error.empty());
+    CHECK(named_forced.tool_calls.size() == 1);
+    CHECK(arguments(named_forced.tool_calls[0])["key"] == "beta");
+    return true;
+}
+
 int main() {
     if (!test_hermes_request_and_template()) return 1;
     if (!test_tool_history_round_trip()) return 1;
@@ -1781,6 +1927,8 @@ int main() {
     if (!test_parallel_tool_calls()) return 1;
     if (!test_schema_keywords_981()) return 1;
     if (!test_case_insensitive_tool_names_981()) return 1;
+    if (!test_ref_properties_resolve_against_parameters_root()) return 1;
+    if (!test_required_tool_choice_is_forced_not_just_checked()) return 1;
     if (!test_reasoning_effort_controls()) return 1;
     if (!test_plain_answer()) return 1;
     if (!test_control_markup_never_leaks_as_content()) return 1;

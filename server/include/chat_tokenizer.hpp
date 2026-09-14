@@ -108,6 +108,7 @@ struct ParsedAssistantOutput {
     std::string content;
     std::vector<ToolCall> tool_calls;
     std::string error;
+    bool missing_required_call = false;   // see ParsedToolOutput::missing_required_call
 };
 
 // Incrementally routes decoded text into reasoning vs answer for SSE streaming.
