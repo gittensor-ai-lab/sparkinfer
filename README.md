@@ -20,6 +20,20 @@ docker run --gpus all -p 8080:8080 -v qwen38:/models \
   ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest
 ```
 
+Enable DSpark speculative decoding in the API server with one additional argument:
+
+```bash
+docker run --gpus all -p 8080:8080 -v qwen38:/models \
+  ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest serve-dspark
+```
+
+The first run downloads both the target and
+[`gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4`](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4)
+into the named volume. Startup fails instead of silently serving autoregressively if the drafter
+cannot be loaded. Greedy, plain-text, single-active-request generations use DSpark; requests with
+vision, sampling, penalties, logprobs, or an overlapping concurrent request use the lossless
+autoregressive path. Inspect `sparkinfer_speculative_runs_total` at `/metrics` to verify use.
+
 ```bash
 curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen38-nvfp4",

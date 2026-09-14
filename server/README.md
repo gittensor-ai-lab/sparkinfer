@@ -44,6 +44,34 @@ export SPARKINFER_ROOT="$(pwd)"
 ./build/server/sparkinfer_server -m models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --port 8080
 ```
 
+### Serve Qwen3.8 with DSpark
+
+The release container downloads both blessed checkpoints and starts the OpenAI-compatible server
+with DSpark enabled:
+
+```bash
+docker run --gpus all -p 8080:8080 -v qwen38:/models \
+  ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest serve-dspark
+```
+
+For a source build, pass the downloaded drafter directory explicitly:
+
+```bash
+./build/server/sparkinfer_server \
+  -m models/Qwen3.8-27B-NVFP4-RTX5090 \
+  --tokenizer models/Qwen3.8-27B-NVFP4-RTX5090/tokenizer.json \
+  --draft-model models/Qwen3.8-27B-DSpark-NVFP4 \
+  --ctx 262144 --host 0.0.0.0 --port 8080
+```
+
+An explicitly requested drafter is a startup requirement: a missing or incompatible checkpoint
+terminates the server rather than quietly changing performance. DSpark is selected only for
+greedy, plain-text requests while they are the sole active request. Vision, sampling, penalties,
+logprobs, forced-token paths, prefix resumes, and requests that overlap another request stay on or
+hand off to lossless autoregressive decoding. `/metrics` exposes
+`sparkinfer_speculative_runs_total`, `sparkinfer_speculative_tokens_total`, and
+`sparkinfer_speculative_handoffs_total` so this is observable in production.
+
 ## API
 
 | Endpoint | Description |
