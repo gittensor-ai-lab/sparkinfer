@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 #include <string>
@@ -444,6 +445,12 @@ public:
     // so the caller can finish from there instead of recomputing from zero.
     int prefill_batched_chunked(const int* prompt_ids, int n, bool want_seed_logprob = false,
                                 int* out_done = nullptr);
+    // prefill_batched_chunked() for a range that does NOT start at zero: prompt_ids[start, end) at
+    // their absolute positions, continuing the KV and recurrent state already in place for
+    // [0, start) -- a prefix restored from the prefix cache. Same single-pass/window split. Returns
+    // the seed, or -1 with *out_done (when given) counting the tokens past `start` that did land.
+    int prefill_batched_resume(const int* prompt_ids, int start, int end,
+                               bool want_seed_logprob = false, int* out_done = nullptr);
 
     // Prefill prompt tokens [start, end) with the batched path when start==0 and eligible, else
     // the token loop. chunk_limit > 0 caps the token-loop path to at most chunk_limit tokens per
@@ -463,8 +470,13 @@ public:
     // the batched path's own LM-head tail stops at argmax, which is why the first token of every
     // response had no logprob entry. Off by default: a full-vocab sort is not worth paying when
     // the caller never asked for logprobs.
+    //
+    // allow_batched_resume: start > 0 continues KV and recurrent state the caller has put in place
+    // (a prefix-cache hit), so the batched path may take [start, end) rather than the token loop.
+    // Off by default: a start > 0 that is a token-loop continuation keeps its existing path.
     int ingest_prompt_range(const int* ids, int start, int end, int chunk_limit = 0,
-                            int* out_pos = nullptr, bool want_seed_logprob = false);
+                            int* out_pos = nullptr, bool want_seed_logprob = false,
+                            bool allow_batched_resume = false);
 
     // Attaches an optional external KV cache tier (docs/lmcache_bridge_protocol.md). Null (the
     // default) leaves every lookup/store call site a no-op -- existing behavior is unchanged
@@ -480,13 +492,37 @@ public:
     // simply being full, which is a normal, transient "no capacity right now" and leaves
     // *alloc_failed untouched. Callers that care about this distinction (ContinuousBatchEngine,
     // to report 503 instead of 429 -- #779) should zero-init their bool before passing it in.
-    uint64_t open_session(int num_tokens, bool* alloc_failed = nullptr);
+    // shared_prefix_blocks, when non-null and non-empty, become the session's first KV blocks
+    // (KVCacheManager::allocate_with_prefix): a cached prefix is shared, not copied. The caller
+    // restores the matching recurrent state and starts prefill after the shared blocks.
+    uint64_t open_session(int num_tokens, bool* alloc_failed = nullptr,
+                          const std::vector<int>* shared_prefix_blocks = nullptr);
     // store_tokens, when non-null and an LMCache bridge is attached, stores this session's KV
     // for [0, store_tokens->size()) to the bridge (chunk-aligned, see lmcache_maybe_store in
     // qwen35.cpp) before freeing it -- the "session close" eviction point. Most callers don't
     // have the original prompt at this call site and pass nullptr, which is a pure no-op.
     void close_session(uint64_t seq_id, const std::vector<int>* store_tokens = nullptr);
     void activate_session(uint64_t seq_id);
+
+    // PREFIX-CACHE RECURRENT STATE. A cached prefix's KV can be shared block for block, but a
+    // Gated-DeltaNet layer's state is one running value per sequence: it cannot be read back at an
+    // earlier position, only copied at the position it is at. A snapshot is that copy -- lin_state
+    // (fp32) then lin_conv_state (bf16) -- in pinned host memory, so a cached prefix costs host RAM
+    // (~205 MB on Qwen3.8-27B) rather than VRAM. A model with no linear layers has nothing
+    // recurrent to carry: its snapshot is empty and both calls succeed.
+    struct RecurrentStateSnapshot {
+        std::shared_ptr<void> host;   // pinned; state_bytes of lin_state, then conv_bytes
+        size_t state_bytes = 0;
+        size_t conv_bytes = 0;
+        size_t bytes() const { return state_bytes + conv_bytes; }
+    };
+    // Copy seq_id's recurrent state into `out`. False, leaving `out` untouched, when the session is
+    // unknown, its state was compacted to bf16 by packed decode (a prefill-time snapshot never is),
+    // or the pinned allocation fails.
+    bool snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapshot& out);
+    // Overwrite seq_id's recurrent state with `snap`, in the fp32 form prefill resumes from. False
+    // when the session is unknown or the snapshot was taken from a differently shaped model.
+    bool restore_recurrent_state(uint64_t seq_id, const RecurrentStateSnapshot& snap);
 
     // PACKED CONTINUOUS-BATCH DECODE: advance `n` INDEPENDENT sequences by one token each in ONE
     // forward, instead of one full forward per sequence.

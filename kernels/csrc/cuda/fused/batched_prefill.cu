@@ -598,7 +598,7 @@ __global__ void pf_gdn_scan_kernel(const __nv_bfloat16* __restrict__ q,
                                    float* __restrict__ state,
                                    __nv_bfloat16* __restrict__ out,
                                    int n_tokens, int q_heads, int v_heads, bool qh_block,
-                                   bool state_bf16) {
+                                   bool state_bf16, bool carry_in) {
     constexpr int NROW = HEAD_DIM / 32;
     const int vh   = blockIdx.x;
     const int j    = blockIdx.y * COLS + (threadIdx.x >> 5);
@@ -611,9 +611,13 @@ __global__ void pf_gdn_scan_kernel(const __nv_bfloat16* __restrict__ q,
     const float a_h  = pf_to_f(a[vh]);
     const float dt_h = pf_to_f(dt[vh]);
 
+    // A pass at position 0 starts the recurrence from zero. A pass that resumes mid-sequence -- a
+    // later prefill window, or a restored prefix-cache entry -- starts from the state already there:
+    // zeroing it silently discarded every Gated-DeltaNet layer's history at each window boundary.
     float sloc[NROW];
+    const float* col_in = state + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;   // transposed [vh][col][row]
     #pragma unroll
-    for (int r = 0; r < NROW; r++) sloc[r] = 0.f;   // fresh prefill: state starts at zero
+    for (int r = 0; r < NROW; r++) sloc[r] = carry_in ? col_in[lane + r * 32] : 0.f;
 
     for (int t = 0; t < n_tokens; t++) {
         const float bb = pf_sigmoid(pf_to_f(beta[(size_t)t * v_heads + vh]));
@@ -1717,7 +1721,8 @@ void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_sta
 void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              const void* alpha, const void* beta, const void* dt, const void* a,
                              float* state, void* out, int n_tokens, int q_heads, int v_heads,
-                             int head_dim, bool qh_block, cudaStream_t stream) {
+                             int head_dim, bool qh_block, cudaStream_t stream,
+                             bool carry_in) {
     static const bool state_bf16 = [] {
         const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
         return e && e[0] == '1';
@@ -1725,7 +1730,8 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
     // Chunk-parallel (WY/UT transform) scan: shortens the serial chain N -> N/C. Falls through to
     // the sequential scan below when disabled (SPARKINFER_PREFILL_GDN_CHUNK=0) or shape-unsupported.
     if (launch_prefill_gdn_chunk(q, k, v, alpha, beta, dt, a, state, out,
-                                 n_tokens, q_heads, v_heads, head_dim, qh_block, stream)) return;
+                                 n_tokens, q_heads, v_heads, head_dim, qh_block, stream,
+                                 carry_in)) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
@@ -1739,7 +1745,7 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
     if (head_dim == 128)
         pf_gdn_scan_kernel<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
             qb, kb, vb, ab, bb, db, aa, state, ob, n_tokens, q_heads, v_heads, qh_block,
-            state_bf16);
+            state_bf16, carry_in);
 }
 
 // SPARKINFER_GDN_CONV_PAR=0 keeps the serial-over-tokens kernel, for an A/B out of one binary.

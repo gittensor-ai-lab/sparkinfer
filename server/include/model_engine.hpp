@@ -34,6 +34,7 @@ struct CompletionResult {
     double ttft_ms = -1.0;
     double generation_ms = -1.0;
     double decode_tps = -1.0;
+    int cached_tokens = 0;   // prompt tokens served from the automatic prefix cache, not recomputed
 };
 
 // Images already decoded and preprocessed, ready for the vision tower. Mirrored field-by-field
@@ -235,6 +236,23 @@ public:
         uint64_t lookup_misses = 0;
     };
     LMCacheStats lmcache_stats() const;
+
+    // Automatic prefix cache (ContinuousBatchEngine::enable_prefix_cache). On by default in the
+    // server; SPARKINFER_PREFIX_CACHE=0 turns it off, and SPARKINFER_DETERMINISTIC=1 does too, since
+    // a request's output must not depend on what an earlier request left in the cache.
+    //
+    // The boundary token marks where a turn starts (<|im_start|> for these chat templates). A
+    // request's checkpoint is its LAST boundary token, rounded down to a KV block: the point where
+    // the same conversation's next request stops matching this one. Without a boundary token,
+    // requests still reuse cached prefixes but never create one.
+    void set_prefix_cache_boundary_token(int token_id);
+    struct PrefixCacheStats {
+        bool enabled = false;
+        uint64_t lookups = 0, hits = 0, tokens_reused = 0, inserts = 0, evictions = 0;
+        size_t entries = 0, host_bytes = 0;
+        int blocks = 0;
+    };
+    PrefixCacheStats prefix_cache_stats() const;
 
 private:
     struct Impl;

@@ -1,4 +1,5 @@
 #include "model_engine.hpp"
+#include "sparkinfer/kernels/deterministic.h"
 #include "sparkinfer/device_health.h"
 
 #include "sparkinfer/gguf.h"
@@ -152,6 +153,11 @@ struct ModelEngine::Impl {
     std::unique_ptr<sparkinfer::ContinuousBatchEngine> batch_engine;
     std::vector<int> prefix_tokens;
     bool ready = false;
+
+    // Automatic prefix cache: see ModelEngine::set_prefix_cache_boundary_token.
+    bool prefix_cache_on = false;
+    int prefix_cache_boundary_token = -1;
+    int prefix_cache_min_tokens = 1024;
 
     // LMCache bridge (docs/lmcache_bridge_protocol.md): the C++ socket client is owned here
     // (BridgeClient itself is declared in lmcache_bridge_client.h; Qwen35Model only holds a
@@ -384,6 +390,38 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     }
     impl_->batch_engine = std::make_unique<sparkinfer::ContinuousBatchEngine>(
         impl_->model.get(), impl_->kv.get(), batch_tokens_per_step(), policy);
+
+    // Automatic prefix cache. Chat and agent clients resend the whole conversation every turn; this
+    // is what stops the server recomputing it. Bounded three ways -- entries, pinned host memory
+    // for recurrent-state snapshots, and half the KV pool -- and evicted least-recently-used,
+    // including on demand when a new request cannot get KV blocks.
+    {
+        auto env_int = [](const char* name, long long dflt) {
+            const char* e = getenv(name);
+            return e ? atoll(e) : dflt;
+        };
+        const char* on = getenv("SPARKINFER_PREFIX_CACHE");
+        const bool wanted = !(on && on[0] == '0');
+        if (wanted && sparkinfer::deterministic_mode()) {
+            fprintf(stderr, "[sparkinfer-server] prefix cache: off (SPARKINFER_DETERMINISTIC=1 -- a "
+                            "request's output may not depend on what earlier requests cached)\n");
+        } else if (wanted) {
+            sparkinfer::PrefixCache::Limits lim;
+            lim.max_entries = (size_t)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_ENTRIES", 32));
+            lim.max_host_bytes = (size_t)std::max(0LL, env_int("SPARKINFER_PREFIX_CACHE_HOST_MB", 8192)) << 20;
+            lim.max_blocks = impl_->kv->num_total_blocks() / 2;
+            impl_->prefix_cache_min_tokens =
+                (int)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_MIN_TOKENS", 1024));
+            impl_->batch_engine->enable_prefix_cache(lim);
+            impl_->prefix_cache_on = true;
+            fprintf(stderr, "[sparkinfer-server] prefix cache: on (%zu entries, %zu MiB host, %d of %d "
+                            "KV blocks, checkpoints from %d tokens)\n",
+                    lim.max_entries, lim.max_host_bytes >> 20, lim.max_blocks,
+                    impl_->kv->num_total_blocks(), impl_->prefix_cache_min_tokens);
+        } else {
+            fprintf(stderr, "[sparkinfer-server] prefix cache: off (SPARKINFER_PREFIX_CACHE=0)\n");
+        }
+    }
 
     // Vision tower. Absence is NOT an error -- a text-only checkpoint has no vision_config and
     // has_vision() stays false -- but a tower that is present and fails to load is reported here
@@ -769,6 +807,28 @@ int ModelEngine::max_queue_depth() const {
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->max_queue_depth() : 0;
 }
 
+void ModelEngine::set_prefix_cache_boundary_token(int token_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    impl_->prefix_cache_boundary_token = token_id;
+}
+
+ModelEngine::PrefixCacheStats ModelEngine::prefix_cache_stats() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    PrefixCacheStats out;
+    if (!impl_->ready || !impl_->batch_engine || !impl_->prefix_cache_on) return out;
+    const sparkinfer::PrefixCache::Stats s = impl_->batch_engine->prefix_cache_stats();
+    out.enabled = true;
+    out.lookups = s.lookups;
+    out.hits = s.hits;
+    out.tokens_reused = s.tokens_reused;
+    out.inserts = s.inserts;
+    out.evictions = s.evictions;
+    out.entries = s.entries;
+    out.host_bytes = s.host_bytes;
+    out.blocks = s.blocks;
+    return out;
+}
+
 ModelEngine::LMCacheStats ModelEngine::lmcache_stats() const {
     std::lock_guard<std::mutex> lock(mu_);
     LMCacheStats stats;
@@ -896,6 +956,30 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
             if (!prefix_match && prefix_exclusive) impl_->model->clear_prefix_cache();
             req.prefill_start = 0;
             req.use_prefix_session = false;
+            // Automatic prefix cache. Never for a teacher-forced score (its numerics must not depend
+            // on what another request cached) or for images/video (the cache keys on token ids,
+            // and every image's placeholder tokens are the same ids).
+            const bool has_vision = images && !images->positions.empty();
+            if (impl_->prefix_cache_on && forced_tokens.empty() && !has_vision) {
+                req.prefix_cache = true;
+                if (impl_->prefix_cache_boundary_token >= 0) {
+                    // Two checkpoints: the FIRST turn boundary past the minimum -- for a chat, the
+                    // end of the system prompt, which other conversations share -- and the LAST,
+                    // the start of the final assistant turn, where this conversation's next request
+                    // stops matching. The engine skips any a cache hit already covers.
+                    const int bs = impl_->kv->block_size();
+                    int first = -1, last = -1;
+                    for (int i = 0; i < (int)prompt_ids.size(); ++i) {
+                        if (prompt_ids[i] != impl_->prefix_cache_boundary_token) continue;
+                        const int ckpt = i / bs * bs;
+                        if (ckpt < impl_->prefix_cache_min_tokens) continue;
+                        if (first < 0) first = ckpt;
+                        last = ckpt;
+                    }
+                    if (first >= 0) req.cache_checkpoints.push_back(first);
+                    if (last > first) req.cache_checkpoints.push_back(last);
+                }
+            }
         }
     }
 
@@ -928,6 +1012,7 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     out.ttft_ms = result.ttft_ms;
     out.generation_ms = result.generation_ms;
     out.decode_tps = result.decode_tps;
+    out.cached_tokens = result.cached_tokens;
     if (!result.error.empty()) {
         out.error = result.error;
         fprintf(stderr, "[sparkinfer-server] %s\n", out.error.c_str());

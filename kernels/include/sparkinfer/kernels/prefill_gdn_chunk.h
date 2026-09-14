@@ -46,7 +46,8 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               const void* dt, const void* a,
                               float* state, void* out,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
-                              bool qh_block, cudaStream_t stream = nullptr);
+                              bool qh_block, cudaStream_t stream = nullptr,
+                              bool carry_in = false);
 
 }  // namespace kernels
 }  // namespace sparkinfer

@@ -1,6 +1,8 @@
 #include "chat_tokenizer.hpp"
 #include "lmstudio_api.hpp"
 #include "ollama_api.hpp"
+#include "anthropic_api.hpp"
+#include "responses_api.hpp"
 
 #include <sys/stat.h>
 #include <ctime>
@@ -28,6 +30,7 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -181,6 +184,14 @@ bool auth_ok(const httplib::Request& req) {
            it->second.substr(prefix.size()) == g_api_key;
 }
 
+// Anthropic clients send the key as `x-api-key` (or as a Bearer token, which auth_ok already
+// accepts). Used on the /v1/messages routes only, so no other route grows a second way in.
+bool anthropic_auth_ok(const httplib::Request& req) {
+    if (auth_ok(req)) return true;
+    auto it = req.headers.find("x-api-key");
+    return it != req.headers.end() && it->second == g_api_key;
+}
+
 bool encode_messages(const std::string& body, std::vector<int>& ids, bool enable_thinking,
                      std::string& err, sparkinfer_server::ChatRequest* request = nullptr) {
     return g_tokenizer.encode_chat_request(body, ids, enable_thinking, err, request);
@@ -278,6 +289,8 @@ enum class StreamDialect {
     OpenAiSse,      // data: {...}\n\n  -- the /v1 default, byte-identical to before
     LmStudioSse,    // same framing; the usage chunk additionally carries LM Studio's stats block
     OllamaNdjson,   // {...}\n per line, Ollama's message/done shape, no [DONE] sentinel
+    AnthropicSse,   // event:+data: framing, Anthropic's numbered content blocks (stateful)
+    ResponsesSse,   // event:+data: framing, Responses output items + sequence numbers (stateful)
 };
 
 // The wrapper routes (/api/v0/*, /api/*) mark their inner request with this header so the shared
@@ -310,11 +323,17 @@ double json_num(const nlohmann::json& j, const char* key, double dflt = 0.0) {
 }
 
 constexpr const char* kStreamDialectHeader = "X-Sparkinfer-Stream-Dialect";
+// The Responses route passes the request parameters a Response object echoes back (tools,
+// instructions, text format, ...) to the shared handler's stream through this header. Compact
+// JSON never contains CR/LF, which is all httplib's set_header refuses.
+constexpr const char* kStreamContextHeader = "X-Sparkinfer-Stream-Context";
 
 StreamDialect stream_dialect_of(const httplib::Request& req) {
     const std::string v = req.get_header_value(kStreamDialectHeader);
     if (v == "ollama-ndjson" || v == "ollama-ndjson-generate") return StreamDialect::OllamaNdjson;
     if (v == "lmstudio-sse") return StreamDialect::LmStudioSse;
+    if (v == "anthropic-sse") return StreamDialect::AnthropicSse;
+    if (v == "responses-sse") return StreamDialect::ResponsesSse;
     return StreamDialect::OpenAiSse;
 }
 
@@ -330,6 +349,10 @@ struct GuardedSink {
     // Ollama's /api/generate streams {"response": "..."} while /api/chat streams
     // {"message":{...}}. Emitting the wrong one renders NOTHING in the client, with no error.
     bool ollama_generate = false;
+    // Anthropic and Responses streams are STATEFUL -- the open block or item, indices, accumulated
+    // text, sequence numbers -- so each response owns one translator, set only for those dialects.
+    std::shared_ptr<sparkinfer_server::anthropic::StreamTranslator> anthropic;
+    std::shared_ptr<sparkinfer_server::responses::StreamTranslator> responses;
 };
 
 // SSE comments are ignored by OpenAI clients and prevent proxy idle timeouts during long prefill.
@@ -378,6 +401,18 @@ private:
 };
 
 bool write_sse_json(GuardedSink& gs, const nlohmann::json& value) {
+    if (gs.dialect == StreamDialect::AnthropicSse || gs.dialect == StreamDialect::ResponsesSse) {
+        // Translate under the sink mutex, not just write under it: the translator's state has to
+        // advance in exactly the order chunks reach the wire.
+        std::lock_guard<std::mutex> lock(gs.mu);
+        std::string events;
+        if (gs.anthropic)
+            events = sparkinfer_server::anthropic::format_sse(gs.anthropic->on_chunk(value));
+        else if (gs.responses)
+            events = sparkinfer_server::responses::format_sse(gs.responses->on_chunk(value));
+        if (events.empty()) return true;
+        return gs.sink.write(events.c_str(), events.size());
+    }
     std::string event;
     if (gs.dialect == StreamDialect::OllamaNdjson) {
         const nlohmann::json chunk = sparkinfer_server::ollama::stream_chunk_from_openai(
@@ -492,7 +527,7 @@ bool write_stream_finish(GuardedSink& gs, const std::string& cid, long long crea
 bool write_stream_usage(GuardedSink& gs, const std::string& cid, long long created,
                         int prompt_tokens, int completion_tokens, double ttft_ms,
                         double generation_ms, double decode_tps,
-                        const char* object = "chat.completion.chunk") {
+                        const char* object = "chat.completion.chunk", int cached_tokens = -1) {
     auto chunk = stream_chunk_base(cid, created, object);
     chunk["choices"] = nlohmann::json::array();
     nlohmann::json usage = {{"prompt_tokens", prompt_tokens},
@@ -501,6 +536,8 @@ bool write_stream_usage(GuardedSink& gs, const std::string& cid, long long creat
     if (ttft_ms >= 0.0) usage["ttft_ms"] = ttft_ms;
     if (generation_ms >= 0.0) usage["generation_ms"] = generation_ms;
     if (decode_tps >= 0.0) usage["decode_tps"] = decode_tps;
+    // OpenAI's own field for prompt-cache hits; -1 (text completions) leaves it out.
+    if (cached_tokens >= 0) usage["prompt_tokens_details"] = {{"cached_tokens", cached_tokens}};
     chunk["usage"] = std::move(usage);
     return write_sse_json(gs, chunk);
 }
@@ -570,6 +607,9 @@ bool write_stream_done(GuardedSink& gs) {
     // the done=true chunk and nothing after it -- and emitting this would be an unparseable line
     // to an NDJSON reader.
     if (gs.dialect == StreamDialect::OllamaNdjson) return true;
+    // Neither Anthropic nor the Responses API has a [DONE] sentinel either: their streams end with
+    // message_stop / response.completed, which the translators emit from the usage chunk.
+    if (gs.dialect == StreamDialect::AnthropicSse || gs.dialect == StreamDialect::ResponsesSse) return true;
     static const std::string done = "data: [DONE]\n\n";
     std::lock_guard<std::mutex> lock(gs.mu);
     return gs.sink.write(done.c_str(), done.size());
@@ -892,6 +932,11 @@ int main(int argc, char** argv) {
     }
     g_tokenizer.set_museglimmer(engine.is_museglimmer());
     g_tokenizer.set_qwen38(engine.is_qwen38());
+    // Turn boundary for the automatic prefix cache: a request checkpoints at its last <|im_start|>.
+    {
+        const std::vector<int> ims = g_tokenizer.encode_raw("<|im_start|>");
+        if (ims.size() == 1) engine.set_prefix_cache_boundary_token(ims[0]);
+    }
 
     // The tool-call grammar needs the exact bytes of every token id. Built once: a few seconds for a
     // 248K vocabulary. Muse Glimmer has no Qwen tool protocol (tools are refused there), so none.
@@ -1125,6 +1170,30 @@ int main(int argc, char** argv) {
                     "degradation invariant, all three fall back to the same recompute path)\n"
                     "# TYPE sparkinfer_lmcache_lookup_misses_total counter\n"
                  << "sparkinfer_lmcache_lookup_misses_total " << lmc.lookup_misses << "\n";
+        }
+        const auto pc = engine.prefix_cache_stats();
+        if (pc.enabled) {
+            body << "# HELP sparkinfer_prefix_cache_lookups_total Requests that looked for a cached prefix\n"
+                    "# TYPE sparkinfer_prefix_cache_lookups_total counter\n"
+                 << "sparkinfer_prefix_cache_lookups_total " << pc.lookups << "\n"
+                 << "# HELP sparkinfer_prefix_cache_hits_total Requests that started from a cached prefix\n"
+                    "# TYPE sparkinfer_prefix_cache_hits_total counter\n"
+                 << "sparkinfer_prefix_cache_hits_total " << pc.hits << "\n"
+                 << "# HELP sparkinfer_prefix_cache_tokens_reused_total Prompt tokens served from the cache instead of prefilled\n"
+                    "# TYPE sparkinfer_prefix_cache_tokens_reused_total counter\n"
+                 << "sparkinfer_prefix_cache_tokens_reused_total " << pc.tokens_reused << "\n"
+                 << "# HELP sparkinfer_prefix_cache_evictions_total Cached prefixes evicted\n"
+                    "# TYPE sparkinfer_prefix_cache_evictions_total counter\n"
+                 << "sparkinfer_prefix_cache_evictions_total " << pc.evictions << "\n"
+                 << "# HELP sparkinfer_prefix_cache_entries Cached prefixes held\n"
+                    "# TYPE sparkinfer_prefix_cache_entries gauge\n"
+                 << "sparkinfer_prefix_cache_entries " << pc.entries << "\n"
+                 << "# HELP sparkinfer_prefix_cache_kv_blocks KV blocks held by cached prefixes\n"
+                    "# TYPE sparkinfer_prefix_cache_kv_blocks gauge\n"
+                 << "sparkinfer_prefix_cache_kv_blocks " << pc.blocks << "\n"
+                 << "# HELP sparkinfer_prefix_cache_host_bytes Pinned host memory held by recurrent-state snapshots\n"
+                    "# TYPE sparkinfer_prefix_cache_host_bytes gauge\n"
+                 << "sparkinfer_prefix_cache_host_bytes " << pc.host_bytes << "\n";
         }
         res.set_content(body.str(), "text/plain; version=0.0.4");
     });
@@ -1549,13 +1618,18 @@ int main(int argc, char** argv) {
                           chat_request, tool_protocol, json_mode_active,
                           tool_grammar, constrained_tools, format_grammar, constrained_format,
                           dialect = stream_dialect_of(req),
+                          stream_context = req.get_header_value(kStreamContextHeader),
                           ollama_generate =
                               req.get_header_value(kStreamDialectHeader) == "ollama-ndjson-generate",
                           // Ollama's stream is terminated by the done=true chunk, which is built
                           // from OpenAI's USAGE chunk -- so without usage the client would wait
                           // for an end that never arrives. Forced on for that dialect only.
+                          // Anthropic's message_delta/message_stop and the Responses API's
+                          // response.completed are built from the usage chunk the same way.
                           include_usage = controls.include_usage || always_stream_usage()
-                                          || stream_dialect_of(req) == StreamDialect::OllamaNdjson,
+                                          || stream_dialect_of(req) == StreamDialect::OllamaNdjson
+                                          || stream_dialect_of(req) == StreamDialect::AnthropicSse
+                                          || stream_dialect_of(req) == StreamDialect::ResponsesSse,
                           stop = controls.stop,
                           temperature = controls.temperature, seed = controls.seed,
                           top_k = controls.top_k, top_p = controls.top_p,
@@ -1575,6 +1649,17 @@ int main(int argc, char** argv) {
                              if (dialect == StreamDialect::OllamaNdjson) {
                                  gs.model_name = sparkinfer_server::ollama::with_latest_tag(g_model_name);
                                  gs.created_at = sparkinfer_server::ollama::rfc3339_now();
+                             } else if (dialect == StreamDialect::AnthropicSse) {
+                                 gs.anthropic = std::make_shared<sparkinfer_server::anthropic::StreamTranslator>(
+                                     random_id("msg_"), g_model_name, (long long)prompt_ids.size());
+                             } else if (dialect == StreamDialect::ResponsesSse) {
+                                 // A missing or malformed context loses only the echoed request
+                                 // parameters, never the stream itself.
+                                 nlohmann::json echo = nlohmann::json::parse(stream_context, nullptr, false);
+                                 if (echo.is_discarded() || !echo.is_object()) echo = nlohmann::json::object();
+                                 gs.responses = std::make_shared<sparkinfer_server::responses::StreamTranslator>(
+                                     random_id("resp_"), created, g_model_name, std::move(echo),
+                                     (long long)prompt_ids.size());
                              }
                              SseHeartbeat heartbeat(gs);
 
@@ -1598,6 +1683,7 @@ int main(int argc, char** argv) {
                                                     invalid_tool_output } fail = Fail::none;
                                  std::string fail_message;
                                  long long prompt_tokens = 0, completion_tokens = 0;
+                                 int cached_tokens = 0;   // prompt tokens served from the prefix cache
                                  double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                                  // Only populated on the json_mode_active/tool_protocol sub-paths
                                  // -- used to replay an already-buffered result to a deduped index
@@ -1667,7 +1753,7 @@ int main(int argc, char** argv) {
                                          frequency_penalty, logit_bias, false, 0, nullptr, {},
                                          &cur_images,
                                          grammar_constraint(constrained_format, format_grammar, g_format_constrained));
-                                     out->prompt_tokens += (long long)cur_prompt_ids.size();
+                                     out->prompt_tokens += (long long)cur_prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                      out->completion_tokens += (long long)ids.size();
                                      if (outcome.cancelled && !stopped_by_sequence) {
                                          out->fail = BranchOutcome::Fail::cancelled;
@@ -1822,7 +1908,7 @@ int main(int argc, char** argv) {
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
                                      logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob,
                                      {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained));
-                                 out->prompt_tokens = (long long)prompt_ids.size();
+                                 out->prompt_tokens = (long long)prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
                                      out->fail = BranchOutcome::Fail::cancelled;
@@ -2039,7 +2125,8 @@ int main(int argc, char** argv) {
                                  // timing isn't meaningful for a hard engine error, so omit those.
                                  if (include_usage)
                                      write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
-                                                        (int)agg_completion, -1.0, -1.0, -1.0);
+                                                        (int)agg_completion, -1.0, -1.0, -1.0,
+                                                        "chat.completion.chunk", (int)results[0].cached_tokens);
                                  heartbeat.stop();
                                  write_stream_done(gs);
                                  sink.done();
@@ -2059,7 +2146,8 @@ int main(int argc, char** argv) {
                                  // intentionally diverges from g_prompt_tokens_total above, which
                                  // sums real per-branch prefill cost; see plan for why.
                                  write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
-                                                    (int)agg_completion, ttft_min, gen_max, decode_tps_agg);
+                                                    (int)agg_completion, ttft_min, gen_max, decode_tps_agg,
+                                                    "chat.completion.chunk", (int)results[0].cached_tokens);
                              heartbeat.stop();
                              write_stream_done(gs);
                              sink.done();
@@ -2089,6 +2177,7 @@ int main(int argc, char** argv) {
                      std::string finish_reason;
                      nlohmann::json logprobs_json = nullptr;
                      long long prompt_tokens = 0, completion_tokens = 0;
+                                 int cached_tokens = 0;   // prompt tokens served from the prefix cache
                      double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                  };
 
@@ -2146,7 +2235,7 @@ int main(int argc, char** argv) {
                                  controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
                                  false, 0, nullptr, {}, &cur_images,
                                  grammar_constraint(constrained_format, format_grammar, g_format_constrained));
-                             out.prompt_tokens += (long long)cur_prompt_ids.size();
+                             out.prompt_tokens += (long long)cur_prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;
                              out.completion_tokens += (long long)ids.size();
                              if (!outcome.error.empty()) {
                                  // A hard engine fault (overloaded/alloc_failed/timed_out) is not a
@@ -2271,7 +2360,7 @@ int main(int argc, char** argv) {
                              out.http_error = decode_err;
                              return out;
                          }
-                         out.prompt_tokens = (long long)prompt_ids.size();
+                         out.prompt_tokens = (long long)prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;
                          out.completion_tokens = (long long)outcome.tokens.size();
                          if (stopped_by_sequence) {
                              size_t pos;
@@ -2457,6 +2546,7 @@ int main(int argc, char** argv) {
                  if (ttft_min >= 0.0) usage["ttft_ms"] = ttft_min;
                  if (gen_max >= 0.0) usage["generation_ms"] = gen_max;
                  if (decode_tps_agg >= 0.0) usage["decode_tps"] = decode_tps_agg;
+                 usage["prompt_tokens_details"] = {{"cached_tokens", (int)results[0].cached_tokens}};
 
                  nlohmann::json choices = nlohmann::json::array();
                  for (int i = 0; i < controls.n; i++) {
@@ -2602,6 +2692,7 @@ int main(int argc, char** argv) {
                                                     server_error } fail = Fail::none;
                                  std::string fail_message;
                                  long long prompt_tokens = 0, completion_tokens = 0;
+                                 int cached_tokens = 0;   // prompt tokens served from the prefix cache
                                  double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                              };
 
@@ -2664,7 +2755,7 @@ int main(int argc, char** argv) {
                                  const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
                                      logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob);
-                                 out->prompt_tokens = (long long)prompt_ids.size();
+                                 out->prompt_tokens = (long long)prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
                                      out->fail = BranchOutcome::Fail::cancelled;
@@ -2796,6 +2887,7 @@ int main(int argc, char** argv) {
                      std::string finish_reason;
                      nlohmann::json logprobs_json = nullptr;
                      long long prompt_tokens = 0, completion_tokens = 0;
+                                 int cached_tokens = 0;   // prompt tokens served from the prefix cache
                      double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                  };
 
@@ -2838,7 +2930,7 @@ int main(int argc, char** argv) {
                          controls.logprobs, controls.top_logprobs, maybe_on_tok_logprob);
                      if (logprob_entries.size() > outcome.tokens.size())
                          logprob_entries.resize(outcome.tokens.size());
-                     out.prompt_tokens = (long long)prompt_ids.size();
+                     out.prompt_tokens = (long long)prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;
                      out.completion_tokens = (long long)outcome.tokens.size();
                      if (!outcome.error.empty()) {
                          out.http_status = status_for_outcome(outcome);
@@ -3365,6 +3457,129 @@ int main(int argc, char** argv) {
             {"code", "embeddings_unsupported"}}}}.dump(), "application/json");
     });
 
+    // ---- Anthropic Messages API and OpenAI Responses API ----------------------------------------
+    //
+    // Translation only, like the LM Studio and Ollama routes: each request is rewritten into the
+    // chat-completions shape and served by chat_completions_handler, so tool calling, images,
+    // reasoning and every sampling control behave exactly as on /v1/chat/completions. What does
+    // not survive each translation, and why, is in anthropic_api.hpp and responses_api.hpp.
+    {
+        // The inner request goes through auth_ok, which reads only Authorization. Once the route
+        // has verified the caller (x-api-key for Anthropic), present the configured key there, and
+        // drop any client-supplied dialect headers so only the route decides the framing.
+        auto inner_request = [](const httplib::Request& req, const nlohmann::json& body) {
+            httplib::Request inner = req;
+            inner.headers.erase("Authorization");
+            inner.headers.erase(kStreamDialectHeader);
+            inner.headers.erase(kStreamContextHeader);
+            if (!g_api_key.empty()) inner.set_header("Authorization", "Bearer " + g_api_key);
+            inner.body = body.dump();
+            return inner;
+        };
+
+        namespace ant = sparkinfer_server::anthropic;
+        auto anthropic_error = [](httplib::Response& res, int status, const std::string& message) {
+            res.status = status;
+            res.set_content(ant::error_body(status, message).dump(), "application/json");
+        };
+
+        svr.Post("/v1/messages", [chat_completions_handler, anthropic_error, inner_request](
+                                     const httplib::Request& req, httplib::Response& res) {
+            if (!anthropic_auth_ok(req)) return anthropic_error(res, 401, "invalid x-api-key");
+            const nlohmann::json in = nlohmann::json::parse(req.body, nullptr, false);
+            if (in.is_discarded()) return anthropic_error(res, 400, "request body is not valid JSON");
+            nlohmann::json body;
+            std::string err;
+            if (!ant::request_to_openai(in, body, err)) return anthropic_error(res, 400, err);
+            const bool want_stream = json_bool(in, "stream", false);
+            if (want_stream) body["stream"] = true;
+            httplib::Request inner = inner_request(req, body);
+            if (want_stream) inner.set_header(kStreamDialectHeader, "anthropic-sse");
+
+            chat_completions_handler(inner, res);
+            // A request the handler refused never started a stream, so its OpenAI-shaped error is
+            // still in the body to re-shape -- on the streaming path as well.
+            if (res.status >= 400)
+                return anthropic_error(res, res.status, ant::openai_error_message(res.body));
+            if (want_stream) return;
+            const nlohmann::json oai = nlohmann::json::parse(res.body, nullptr, false);
+            if (oai.is_discarded()) return anthropic_error(res, 500, "upstream produced no JSON");
+            res.set_content(ant::openai_to_message(oai, random_id("msg_"), g_model_name).dump(),
+                            "application/json");
+        });
+
+        svr.Post("/v1/messages/count_tokens", [&engine, anthropic_error](const httplib::Request& req,
+                                                                         httplib::Response& res) {
+            if (!anthropic_auth_ok(req)) return anthropic_error(res, 401, "invalid x-api-key");
+            const nlohmann::json in = nlohmann::json::parse(req.body, nullptr, false);
+            if (in.is_discarded()) return anthropic_error(res, 400, "request body is not valid JSON");
+            nlohmann::json body;
+            std::string err;
+            if (!ant::request_to_openai(in, body, err, /*require_max_tokens=*/false))
+                return anthropic_error(res, 400, err);
+            const std::string chat_body = body.dump();
+            const bool enable_thinking =
+                sparkinfer_server::parse_enable_thinking(chat_body, engine.is_qwen38());
+            std::vector<int> ids;
+            sparkinfer_server::ChatRequest probe;
+            if (!encode_messages(chat_body, ids, enable_thinking, err, &probe))
+                return anthropic_error(res, 400, err);
+            // Same refusal as /v1/tokenize: an image costs as many tokens as its resized grid
+            // needs, which only the preprocessor knows, so a count without it would understate.
+            if (!collect_image_urls(probe).empty() || !collect_video_urls(probe).empty())
+                return anthropic_error(res, 400, "count_tokens does not support image or video "
+                                                 "content; their token cost depends on the resized grid");
+            res.set_content(nlohmann::json{{"input_tokens", ids.size()}}.dump(), "application/json");
+        });
+
+        namespace rsp = sparkinfer_server::responses;
+        auto responses_error = [](httplib::Response& res, int status, const std::string& message) {
+            res.status = status;
+            res.set_content(rsp::error_body(status, message).dump(), "application/json");
+        };
+
+        svr.Post("/v1/responses", [chat_completions_handler, responses_error, inner_request](
+                                      const httplib::Request& req, httplib::Response& res) {
+            if (!auth_ok(req)) return responses_error(res, 401, "unauthorized");
+            const nlohmann::json in = nlohmann::json::parse(req.body, nullptr, false);
+            if (in.is_discarded()) return responses_error(res, 400, "request body is not valid JSON");
+            nlohmann::json body;
+            std::string err;
+            if (!rsp::request_to_openai(in, body, err)) return responses_error(res, 400, err);
+            const bool want_stream = json_bool(in, "stream", false);
+            const nlohmann::json echo = rsp::request_echo(in);
+            if (want_stream) body["stream"] = true;
+            httplib::Request inner = inner_request(req, body);
+            if (want_stream) {
+                inner.set_header(kStreamDialectHeader, "responses-sse");
+                inner.set_header(kStreamContextHeader, echo.dump());
+            }
+
+            chat_completions_handler(inner, res);
+            if (res.status >= 400)
+                return responses_error(res, res.status, rsp::openai_error_message(res.body));
+            if (want_stream) return;
+            const nlohmann::json oai = nlohmann::json::parse(res.body, nullptr, false);
+            if (oai.is_discarded()) return responses_error(res, 500, "upstream produced no JSON");
+            const auto now = (long long)std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch()).count();
+            res.set_content(rsp::openai_to_response(oai, random_id("resp_"), now, g_model_name, echo).dump(),
+                            "application/json");
+        });
+
+        // Nothing is stored, so there is no response to fetch, cancel or delete. Say so, rather
+        // than let an unknown-route 404 suggest a typo or a version mismatch.
+        auto not_stored = [responses_error](const httplib::Request& req, httplib::Response& res) {
+            if (!auth_ok(req)) return responses_error(res, 401, "unauthorized");
+            responses_error(res, 404, "this server does not store responses, so there is nothing to "
+                                      "retrieve, cancel or delete; send the whole conversation in `input`");
+        };
+        svr.Get(R"(/v1/responses/([^/]+))", not_stored);
+        svr.Delete(R"(/v1/responses/([^/]+))", not_stored);
+        svr.Get(R"(/v1/responses/([^/]+)/input_items)", not_stored);
+        svr.Post(R"(/v1/responses/([^/]+)/cancel)", not_stored);
+    }
+
     // Transport-level deadlines. Defaults are generous, not aggressive: a cold 32k-context
     // prefill has been measured taking ~90s of TTFT alone (see eval/pr_dflash_bot.py's 32k
     // sweep), so a short default here would misfire on legitimate long-context requests.
@@ -3431,6 +3646,8 @@ int main(int argc, char** argv) {
             "  POST /v1/chat/completions\n"
             "  POST /v1/completions\n"
             "  POST /v1/score\n"
+            "  POST /v1/messages  POST /v1/messages/count_tokens  (Anthropic)\n"
+            "  POST /v1/responses  (OpenAI Responses, stateless)\n"
             "  read_timeout=%lds write_timeout=%lds max_output_tokens=%d max_queue_depth=%s%s\n",
             host.c_str(), port, read_timeout_s, write_timeout_s, max_output_tokens(),
             queue_depth_label.c_str(),

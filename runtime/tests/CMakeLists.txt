@@ -68,9 +68,21 @@ add_executable(penalty_gpu_test penalty_gpu_test.cpp)
 target_link_libraries(penalty_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME penalty_gpu_test COMMAND penalty_gpu_test)
 
+# Gated-DeltaNet state carried into a batched prefill scan that does not start at position 0: a pass
+# split at a chunk boundary must reproduce the unsplit pass bit for bit, for both scan paths.
+add_executable(gdn_prefill_carry_gpu_test gdn_prefill_carry_gpu_test.cpp)
+target_link_libraries(gdn_prefill_carry_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME gdn_prefill_carry_gpu_test COMMAND gdn_prefill_carry_gpu_test)
+
 add_executable(logit_bias_gpu_test logit_bias_gpu_test.cpp)
 target_link_libraries(logit_bias_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME logit_bias_gpu_test COMMAND logit_bias_gpu_test)
+
+# Prefix sharing in the paged KV pool (refcounted blocks) and the PrefixCache on top of it: every
+# free-block count is exact, so a leaked or prematurely freed block fails a specific line.
+add_executable(prefix_cache_gpu_test prefix_cache_gpu_test.cpp)
+target_link_libraries(prefix_cache_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME prefix_cache_gpu_test COMMAND prefix_cache_gpu_test)
 
 # Real sidecar subprocess + real KV cache + a small synthetic model on real hardware -- the one
 # place both halves of the LMCache bridge run together against the real model code path. Skips

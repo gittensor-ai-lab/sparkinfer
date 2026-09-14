@@ -62,6 +62,8 @@ add_executable(sparkinfer_server
     src/tool_grammar.cpp
     src/lmstudio_api.cpp
     src/ollama_api.cpp
+    src/anthropic_api.cpp
+    src/responses_api.cpp
 )
 
 target_include_directories(sparkinfer_server PRIVATE
@@ -147,6 +149,32 @@ if(BUILD_TESTS)
     target_link_libraries(ollama_api_test PRIVATE nlohmann_json::nlohmann_json)
     target_compile_features(ollama_api_test PRIVATE cxx_std_17)
     add_test(NAME ollama_api_test COMMAND ollama_api_test)
+
+    # Anthropic /v1/messages translation: block types and indices, stream event order, stop_reason
+    # vocabulary, and tool results moving from inside a user turn to OpenAI's tool messages.
+    add_executable(anthropic_api_test
+        tests/anthropic_api_test.cpp
+        src/anthropic_api.cpp
+    )
+    target_include_directories(anthropic_api_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(anthropic_api_test PRIVATE nlohmann_json::nlohmann_json)
+    target_compile_features(anthropic_api_test PRIVATE cxx_std_17)
+    add_test(NAME anthropic_api_test COMMAND anthropic_api_test)
+
+    # OpenAI /v1/responses translation: item types and ids, strictly increasing sequence numbers,
+    # and the stateless refusals (previous_response_id, conversation, item_reference).
+    add_executable(responses_api_test
+        tests/responses_api_test.cpp
+        src/responses_api.cpp
+    )
+    target_include_directories(responses_api_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(responses_api_test PRIVATE nlohmann_json::nlohmann_json)
+    target_compile_features(responses_api_test PRIVATE cxx_std_17)
+    add_test(NAME responses_api_test COMMAND responses_api_test)
 
     # Image input: base64, data: URL parsing, decode -- and the refusals, which are the
     # security-relevant half (no remote fetch, bounded payloads, no silent truncation).

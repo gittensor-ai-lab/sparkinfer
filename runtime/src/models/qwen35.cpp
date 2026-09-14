@@ -2824,7 +2824,8 @@ bool Qwen35Model::prompt_matches_prefix(const std::vector<int>& prompt) const {
 }
 
 int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chunk_limit,
-                                     int* out_pos, bool want_seed_logprob) {
+                                     int* out_pos, bool want_seed_logprob,
+                                     bool allow_batched_resume) {
     Impl& s = *p_;
     if (!ids || end <= start) {
         if (out_pos) *out_pos = start;
@@ -2838,6 +2839,16 @@ int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chu
     int batched_done = 0;
     if (start == 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, n)) {
         int seed = prefill_batched_chunked(ids, n, want_seed_logprob, &batched_done);
+        if (seed >= 0) {
+            if (out_pos) *out_pos = end;
+            return seed;
+        }
+    } else if (start > 0 && allow_batched_resume && batched_prefill_windowed_enabled(s.gguf, s.cfg, n)) {
+        // A prefix-cache hit: KV for [0, start) is shared in and the recurrent state at `start` is
+        // restored, which is exactly what a windowed batched pass continues from. Without this the
+        // whole remainder would take the token loop, and a cache hit would be slower than
+        // recomputing the prompt from zero.
+        int seed = prefill_batched_resume(ids, start, end, want_seed_logprob, &batched_done);
         if (seed >= 0) {
             if (out_pos) *out_pos = end;
             return seed;
@@ -3258,7 +3269,8 @@ int Qwen35Model::session_token_budget(size_t prompt_len, int max_new, int max_se
     return (int)need;
 }
 
-uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
+uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
+                                   const std::vector<int>* shared_prefix_blocks) {
     // cudaMalloc + kv->allocate (block-table copy on the legacy stream). submit_locked already
     // holds this lock around its call, but guard here too so a future caller cannot miss it --
     // the mutex is recursive, so the nested acquisition is free.
@@ -3266,7 +3278,10 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
     Impl& s = *p_;
     if (num_tokens <= 0) return 0;
     const uint64_t seq_id = s.next_session_id.fetch_add(1);
-    if (!s.kv->allocate(seq_id, num_tokens)) return 0;   // pool full -- normal, transient
+    const bool kv_ok = (shared_prefix_blocks && !shared_prefix_blocks->empty())
+                           ? s.kv->allocate_with_prefix(seq_id, *shared_prefix_blocks, num_tokens)
+                           : s.kv->allocate(seq_id, num_tokens);
+    if (!kv_ok) return 0;   // pool full -- normal, transient
     SessionBuffers buf;
     // Unconditional, every model -- unlike lin_state/lin_conv_state below (hybrid-only). This
     // fresh session serves exactly one request end-to-end before close_session() frees it (1:1
@@ -3314,6 +3329,89 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
        "logit_bias zero");
     s.sessions[seq_id] = buf;
     return seq_id;
+}
+
+int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int end,
+                                        bool want_seed_logprob, int* out_done) {
+    if (out_done) *out_done = 0;
+    if (!prompt_ids || start <= 0 || end <= start) return -1;
+    Impl& s = *p_;
+    const int n = end - start;
+    const int window = prefill_window_tokens();
+    // Same split as prefill_batched_chunked: one pass up to the single-pass threshold, windows
+    // above it. Every pass here has pos0 > 0, so each runs eager and carries the recurrence forward.
+    const int step = (window <= 0 || n <= prefill_single_pass_max_tokens()) ? n : window;
+    for (int pos = start; pos < end; pos += step) {
+        const int len = std::min(step, end - pos);
+        const bool last = (pos + len >= end);
+        const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
+        if (seed < 0) return -1;
+        if (last) {
+            if (seed >= s.cfg.vocab) return -1;
+            if (out_done) *out_done = n;
+            return seed;
+        }
+        if (out_done) *out_done = pos + len - start;
+    }
+    return -1;
+}
+
+bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapshot& out) {
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    if (!needs_linear_state(s.cfg)) {
+        out = RecurrentStateSnapshot{};
+        return true;
+    }
+    auto it = s.sessions.find(seq_id);
+    if (seq_id == 0 || it == s.sessions.end()) return false;
+    const SessionBuffers& b = it->second;
+    if (!b.lin_state || !b.lin_conv_state || b.lin_state_b16) return false;
+    const size_t st_bytes = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads * s.cfg.linear_head_dim *
+                            s.cfg.linear_head_dim * sizeof(float);
+    const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
+                            s.linear_qkvdim * sizeof(bf16);
+    void* host = nullptr;
+    if (cudaHostAlloc(&host, st_bytes + cv_bytes, cudaHostAllocDefault) != cudaSuccess || !host)
+        return false;
+    std::shared_ptr<void> owned(host, [](void* p) { cudaFreeHost(p); });
+    // Prefill may still have work queued on any of the model's streams; the state is final only
+    // once all of it has run.
+    cudaDeviceSynchronize();
+    cu(cudaMemcpyAsync(host, b.lin_state, st_bytes, cudaMemcpyDeviceToHost, s.stream),
+       "prefix-cache state snapshot");
+    cu(cudaMemcpyAsync(static_cast<char*>(host) + st_bytes, b.lin_conv_state, cv_bytes,
+                       cudaMemcpyDeviceToHost, s.stream), "prefix-cache conv snapshot");
+    if (cudaStreamSynchronize(s.stream) != cudaSuccess) return false;
+    out.host = std::move(owned);
+    out.state_bytes = st_bytes;
+    out.conv_bytes = cv_bytes;
+    return true;
+}
+
+bool Qwen35Model::restore_recurrent_state(uint64_t seq_id, const RecurrentStateSnapshot& snap) {
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    if (!needs_linear_state(s.cfg)) return true;
+    auto it = s.sessions.find(seq_id);
+    if (seq_id == 0 || it == s.sessions.end()) return false;
+    SessionBuffers& b = it->second;
+    const size_t st_bytes = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads * s.cfg.linear_head_dim *
+                            s.cfg.linear_head_dim * sizeof(float);
+    const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
+                            s.linear_qkvdim * sizeof(bf16);
+    if (!snap.host || snap.state_bytes != st_bytes || snap.conv_bytes != cv_bytes ||
+        !b.lin_state || !b.lin_conv_state)
+        return false;
+    cu(cudaMemcpyAsync(b.lin_state, snap.host.get(), st_bytes, cudaMemcpyHostToDevice, s.stream),
+       "prefix-cache state restore");
+    cu(cudaMemcpyAsync(b.lin_conv_state, static_cast<char*>(snap.host.get()) + st_bytes, cv_bytes,
+                       cudaMemcpyHostToDevice, s.stream), "prefix-cache conv restore");
+    if (cudaStreamSynchronize(s.stream) != cudaSuccess) return false;
+    // The snapshot is the fp32 form a prefill writes, whatever this session's buffer held before.
+    b.lin_state_b16 = false;
+    if (s.active_seq_id == seq_id) s.active_lin_state_b16 = false;
+    return true;
 }
 
 void Qwen35Model::set_lmcache_bridge(BridgeClient* bridge) { p_->lmcache_bridge = bridge; }
