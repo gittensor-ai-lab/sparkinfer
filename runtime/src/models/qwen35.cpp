@@ -4201,7 +4201,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // The decode graph freezes n_splits on the LAST prefill call below (the first one with
     // sample=true), not at the start of the decode loop further down -- set the hint before
     // prefill runs so that freeze already bakes in the tier the whole generation will need.
-    s.final_seqlen_hint = n + max_new;
+    //
+    // Not when the engine drives this. The server's ordinary decode sets no hint: its split tier
+    // follows the actual sequence length (32 up to 2 * split_chunk, then more). A speculative run
+    // that froze the tier for n + max_new instead would verify with different KV splits than the
+    // ordinary decode it must reproduce -- identical until an argmax near-tie, then different tokens
+    // -- and the hint is model-global, so it would also leak into every later request's decode. The
+    // loop below hands over to ordinary decode before a block would reach the next tier instead.
+    s.final_seqlen_hint = hooks ? -1 : n + max_new;
     auto t0 = std::chrono::steady_clock::now();
     int next = -1;
     int batched_done = 0;
@@ -4534,6 +4541,17 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // A forced token-loop run never launches the compact verifier. Besides wasting a sizeable
     // graph-capture warmup, building those unused tiers makes the isolation mode exercise state
     // that it explicitly asked to bypass. Keep COMPACT_VERIFY=0 a true token-loop control.
+    // Engine-driven: verify with the split count ordinary decode uses for the first generated
+    // position. Set here, before any verify graph is recorded -- they bake it in -- and never again
+    // during the run (see the tier check at the top of each step). A count left over from an earlier,
+    // longer request would otherwise be what the graphs record.
+    if (hooks && s.adaptive_splits) {
+        const int want = adaptive_nsplits_for(start + 1);
+        if (want != s.n_splits) {
+            s.n_splits = want;
+            invalidate_decode_graph();
+        }
+    }
     if (compact_mode != 0) {
         // Records verify graphs: with a caller that admits requests concurrently, hold the device.
         std::unique_lock<std::recursive_mutex> warm_lock(s.device_mu, std::defer_lock);
@@ -4663,13 +4681,24 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     long plan_rows_sum = 0, plan_steps = 0;
     bool predictable_stream = false;
     auto t_decode0 = std::chrono::steady_clock::now();
-    bool spec_finished = false, spec_failed = false, spec_stopped = false;
+    bool spec_finished = false, spec_failed = false, spec_stopped = false, spec_tier_stop = false;
     if (hooks) engine_lock.unlock();
     while ((int)out.size() < max_new) {
         // Engine-driven: hold the device for the whole step -- draft pass and verify -- so a request
         // admitted concurrently allocates between steps, never inside one. Released before on_tokens.
         std::unique_lock<std::recursive_mutex> step_lock(s.device_mu, std::defer_lock);
         if (hooks) step_lock.lock();
+        // Engine-driven: every row of a step is verified with the KV split count ordinary decode uses
+        // at its position -- adaptive_nsplits_for(p + 1) for position p; a different count computes
+        // the same attention to within rounding, enough to flip an argmax near-tie. The count was set
+        // for the first generated position before the verify graphs were recorded, and it cannot
+        // change mid-run: re-recording them here interleaves a capture with the draft's own stream
+        // work. So when this step's last row would reach the next tier, stop and hand the job to
+        // ordinary decode, which crosses the boundary exactly as it does for any request.
+        if (hooks && s.adaptive_splits && adaptive_nsplits_for(start + B + 1) != s.n_splits) {
+            spec_tier_stop = true;
+            break;
+        }
         // The context bound this used to carry (SPARKINFER_DFLASH_COMPACT_MAX_SEQ, default 384)
         // existed only to keep the batched path away from contexts where it diverged from AR --
         // the #712 gap. That gap was a real defect, not a property of batching: the batched GDN
@@ -5161,6 +5190,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         resume->finished = spec_finished;
         resume->failed = spec_failed;
         resume->position = start;
+        resume->tier_boundary = spec_tier_stop;
         resume->next_token = next;
         resume->emitted = (int)out.size();
     }

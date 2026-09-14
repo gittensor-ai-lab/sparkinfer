@@ -247,6 +247,7 @@ public:
         uint64_t runs = 0;       // requests that decoded speculatively
         uint64_t tokens = 0;     // tokens those runs produced before finishing or handing over
         uint64_t handoffs = 0;   // runs that handed over to ordinary decode because another request came
+        uint64_t tier_stops = 0;  // runs that stopped at a KV split tier boundary and finished as ordinary decode
     };
     SpecStats speculative_stats() const;
 
@@ -296,7 +297,7 @@ private:
     bool speculative_ = false;
     std::atomic<bool> spec_running_{false};    // the worker is inside run_speculative
     std::atomic<bool> spec_interrupt_{false};  // a request was submitted meanwhile: hand over
-    std::atomic<uint64_t> spec_runs_{0}, spec_tokens_{0}, spec_handoffs_{0};
+    std::atomic<uint64_t> spec_runs_{0}, spec_tokens_{0}, spec_handoffs_{0}, spec_tier_stops_{0};
 };
 
 }  // namespace sparkinfer

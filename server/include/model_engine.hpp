@@ -257,7 +257,7 @@ public:
     bool speculative() const;
     struct SpeculativeStats {
         bool enabled = false;
-        uint64_t runs = 0, tokens = 0, handoffs = 0;
+        uint64_t runs = 0, tokens = 0, handoffs = 0, tier_stops = 0;
     };
     SpeculativeStats speculative_stats() const;
     struct PrefixCacheStats {

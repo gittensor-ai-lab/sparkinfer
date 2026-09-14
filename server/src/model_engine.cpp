@@ -847,6 +847,7 @@ ModelEngine::SpeculativeStats ModelEngine::speculative_stats() const {
     out.runs = s.runs;
     out.tokens = s.tokens;
     out.handoffs = s.handoffs;
+    out.tier_stops = s.tier_stops;
     return out;
 }
 

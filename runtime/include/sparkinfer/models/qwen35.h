@@ -300,6 +300,7 @@ public:
         int position = 0;       // prompt length + committed tokens: where decode resumes
         int next_token = -1;    // the verified token at `position`, not yet emitted nor ingested
         int emitted = 0;        // tokens handed to on_tokens
+        bool tier_boundary = false;  // stopped where the next step would cross a KV split tier
     };
     std::vector<int> dflash_generate(const std::vector<int>& prompt_ids, int max_new_tokens,
                                      DFlashStats* stats = nullptr,

@@ -215,6 +215,7 @@ ContinuousBatchEngine::SpecStats ContinuousBatchEngine::speculative_stats() cons
     s.runs = spec_runs_.load(std::memory_order_relaxed);
     s.tokens = spec_tokens_.load(std::memory_order_relaxed);
     s.handoffs = spec_handoffs_.load(std::memory_order_relaxed);
+    s.tier_stops = spec_tier_stops_.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -305,7 +306,9 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
     }
     // Another request arrived: continue as ordinary decode from the committed position. step_job
     // emits next_token and ingests it at prompt_len + decode_emitted, which is r.position.
-    spec_handoffs_.fetch_add(1, std::memory_order_relaxed);
+    // Another request arrived, or the next step would have crossed a KV split tier: continue as
+    // ordinary decode from the committed position.
+    (r.tier_boundary ? spec_tier_stops_ : spec_handoffs_).fetch_add(1, std::memory_order_relaxed);
     job.next_token = r.next_token;
 }
 

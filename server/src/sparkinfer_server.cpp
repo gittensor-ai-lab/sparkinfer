@@ -1217,7 +1217,10 @@ int main(int argc, char** argv) {
                  << "sparkinfer_speculative_tokens_total " << sp.tokens << "\n"
                  << "# HELP sparkinfer_speculative_handoffs_total Speculative runs handed over to ordinary decode when another request arrived\n"
                     "# TYPE sparkinfer_speculative_handoffs_total counter\n"
-                 << "sparkinfer_speculative_handoffs_total " << sp.handoffs << "\n";
+                 << "sparkinfer_speculative_handoffs_total " << sp.handoffs << "\n"
+                 << "# HELP sparkinfer_speculative_tier_stops_total Speculative runs that stopped at a KV split tier boundary and finished as ordinary decode\n"
+                    "# TYPE sparkinfer_speculative_tier_stops_total counter\n"
+                 << "sparkinfer_speculative_tier_stops_total " << sp.tier_stops << "\n";
         }
         res.set_content(body.str(), "text/plain; version=0.0.4");
     });
