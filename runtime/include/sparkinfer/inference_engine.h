@@ -237,10 +237,11 @@ public:
     int max_queue_depth() const;
 
     // Speculative decoding (DSpark) for a request that runs alone. Requires a draft attached to the
-    // model (Qwen35Model::set_dflash_draft). A greedy request with no penalties, logit_bias,
-    // logprobs, images or prefix-cache hit decodes speculatively while it is the only request; the
-    // moment another is submitted it continues as ordinary decode and joins the batch. The tokens are
-    // the same either way -- speculation only changes how many target passes produce them.
+    // model (Qwen35Model::set_dflash_draft). A greedy request with no constraint, penalties,
+    // logit_bias, logprobs, images or prefix-cache hit decodes speculatively while it is the only
+    // request; the moment another is submitted it continues as ordinary decode and joins the batch.
+    // The tokens are the same either way -- speculation only changes how many target passes produce
+    // them.
     void enable_speculative(bool on);
     struct SpecStats {
         uint64_t runs = 0;       // requests that decoded speculatively

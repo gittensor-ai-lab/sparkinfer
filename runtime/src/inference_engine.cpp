@@ -220,11 +220,13 @@ ContinuousBatchEngine::SpecStats ContinuousBatchEngine::speculative_stats() cons
 
 bool ContinuousBatchEngine::spec_eligible(const Request& r) {
     // Speculation is lossless only for greedy argmax, and the verify path has none of the sampler
-    // extras. Images need the vision splice ordinary prefill does; a prefix-cache hit starts past
-    // position 0, where the capture the draft reads would have a hole.
-    return !r.constraint && r.temperature <= 0.f && r.presence_penalty == 0.f && r.frequency_penalty == 0.f &&
-           r.logit_bias.empty() && !r.logprobs && r.forced_tokens.empty() && r.vision_pos.empty() &&
-           r.prefill_start == 0 && !r.use_prefix_session;
+    // extras. A constraint must stay on the per-token path where its mask is applied. Images need
+    // the vision splice ordinary prefill does; a prefix-cache hit starts past position 0, where the
+    // capture the draft reads would have a hole.
+    return !r.constraint && r.temperature <= 0.f && r.presence_penalty == 0.f &&
+           r.frequency_penalty == 0.f && r.logit_bias.empty() && !r.logprobs &&
+           r.forced_tokens.empty() && r.vision_pos.empty() && r.prefill_start == 0 &&
+           !r.use_prefix_session;
 }
 
 void ContinuousBatchEngine::run_speculative(Job& job) {
