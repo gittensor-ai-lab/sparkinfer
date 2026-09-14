@@ -3270,9 +3270,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const int v = e ? atoi(e) : 3;
         return (v >= 0 && v <= 7) ? v : 3;
     }();
+    // Rows at which the packed projections leave the row-GEMVs for the block-scaled GEMM. 8 is
+    // the smallest width its A-quantizer takes (m % 8 == 0); since the transposed orientation
+    // the GEMM is ahead there too (cb-decode@c8 558.7 -> 585.0 tok/s).
     static const int kProjGemmMinRows = [] {
         const char* e = getenv("SPARKINFER_PROJ_GEMM_MIN_ROWS");
-        const int v = e ? atoi(e) : 16;
+        const int v = e ? atoi(e) : 8;
         return v < 1 ? 1 : v;
     }();
     unsigned char* fp4_a = nullptr; unsigned char* fp4_asf = nullptr; unsigned char* fp4_ws = nullptr;
