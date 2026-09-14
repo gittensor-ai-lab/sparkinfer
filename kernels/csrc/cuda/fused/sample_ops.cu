@@ -32,8 +32,12 @@ __global__ void temperature_sample_kernel(float* __restrict__ logits, int vocab,
     for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < vocab; v += gridDim.x * blockDim.x) {
         curandStatePhilox4_32_10_t st;
         curand_init(seed, (unsigned long long)((size_t)blockIdx.y * vocab + v), step, &st);
-        const float u = curand_uniform(&st);  // (0, 1]
-        const float g = -logf(-logf(u));      // Gumbel(0,1); u==1 gives a well-defined -inf, never wins
+        // curand_uniform is (0, 1], and u == 1 is not harmless: -log(1) is -0, log(-0) is -inf, and the
+        // noise comes out +inf -- that token wins the argmax whatever its logit, a logit_bias of -100
+        // or a constrained-decoding mask included. At 2^-24 per draw and 248K draws per step it hit
+        // about one sampled step in 70. Clamp to the largest float below 1 (noise ~16.6, finite).
+        const float u = fminf(curand_uniform(&st), 0.99999994f);
+        const float g = -logf(-logf(u));      // Gumbel(0,1), finite for every u in (0, 1)
         L[v] = L[v] * inv_t + g;
     }
 }
