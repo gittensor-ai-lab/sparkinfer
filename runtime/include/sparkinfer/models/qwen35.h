@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -281,9 +282,30 @@ public:
         double ttft_s = 0;
         int    steps = 0;
     };
+    //
+    // Engine-driven use. A caller that owns the session (ContinuousBatchEngine) passes hooks:
+    // dflash_generate then prefills and decodes on hooks->seq_id instead of opening a session of its
+    // own, hands each step's committed tokens to on_tokens, and leaves the session open. on_tokens
+    // returning false stops it between steps -- with the KV and the Gated-DeltaNet state exactly at
+    // the committed position, so ordinary decode can take over from SpecResume::position with
+    // SpecResume::next_token and produce what the speculative loop would have.
+    struct SpecHooks {
+        uint64_t seq_id = 0;
+        std::function<bool(const int* tokens, int n)> on_tokens;
+    };
+    struct SpecResume {
+        bool engaged = false;   // false: nothing ran -- speculation would not pay here, or could not start
+        bool finished = false;  // EOS or max_new_tokens reached
+        bool failed = false;    // a draft or verify pass failed; nothing past `position` is trustworthy
+        int position = 0;       // prompt length + committed tokens: where decode resumes
+        int next_token = -1;    // the verified token at `position`, not yet emitted nor ingested
+        int emitted = 0;        // tokens handed to on_tokens
+    };
     std::vector<int> dflash_generate(const std::vector<int>& prompt_ids, int max_new_tokens,
                                      DFlashStats* stats = nullptr,
-                                     ThermalGovernor* gov = nullptr);
+                                     ThermalGovernor* gov = nullptr,
+                                     const SpecHooks* hooks = nullptr,
+                                     SpecResume* resume = nullptr);
 
     // Prefill `tokens` and retain KV + hybrid recurrent state for reuse on the next request
     // whose prompt starts with the same token sequence. Returns false on allocation failure.
@@ -582,8 +604,11 @@ public:
 
     // DFlash: capture concat hidden states at target_layer_ids per forward step.
     // Disables CUDA-graph replay while enabled (capture needs eager layer outputs).
+    // context_end > 0 sizes the context buffer for positions below it instead of max_seq -- at a
+    // server context of 256K the unbounded buffer is tens of GB. On allocation failure the buffers
+    // are left null; check dflash_context_buffer() / dflash_hidden_buffer().
     void set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows = 16,
-                            int context_start = 0);
+                            int context_start = 0, int context_end = 0);
     void set_dflash_capture_row(int row);
     // Append the current capture-row into the growing context buffer at global_pos.
     void dflash_stash_capture(int global_pos);

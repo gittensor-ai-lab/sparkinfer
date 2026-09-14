@@ -244,6 +244,20 @@ public:
     // the same conversation's next request stops matching this one. Without a boundary token,
     // requests still reuse cached prefixes but never create one.
     void set_prefix_cache_boundary_token(int token_id);
+
+    // Speculative decoding: load a DSpark draft checkpoint (a directory with config.json and
+    // model.safetensors) for the loaded Qwen3.8-27B target. A request that runs alone then decodes
+    // speculatively, with the same tokens as ordinary greedy decode; see
+    // ContinuousBatchEngine::enable_speculative. The draft's context is capped by
+    // SPARKINFER_DSPARK_MAX_CTX (default 16384) -- its KV and projection buffers scale with it, and a
+    // request that needs more simply decodes ordinarily. Call after load().
+    bool load_draft(const std::string& dir, std::string& err);
+    bool speculative() const;
+    struct SpeculativeStats {
+        bool enabled = false;
+        uint64_t runs = 0, tokens = 0, handoffs = 0;
+    };
+    SpeculativeStats speculative_stats() const;
     struct PrefixCacheStats {
         bool enabled = false;
         uint64_t lookups = 0, hits = 0, tokens_reused = 0, inserts = 0, evictions = 0;
