@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Default: serve (AR + image + video) over an OpenAI-compatible API.
+# `serve-dspark`: download the drafter and enable DSpark for eligible requests.
 # `bench [workload]`: run the DSpark speculative benchmark instead.
 set -euo pipefail
 
@@ -21,8 +22,16 @@ if [ "${1:-}" = "bench" ]; then
        "$MODEL_DIR" "$DRAFT_DIR" "${BENCH_TOKENS:-256}" $(cat /tmp/ids.txt)
 fi
 
+if [ "${1:-}" = "serve-dspark" ]; then
+  shift
+  fetch "$DRAFT_REPO" "$DRAFT_DIR" "DSpark drafter"
+  export SPARKINFER_DRAFT_MODEL="$DRAFT_DIR"
+fi
+
 fetch "$MODEL_REPO" "$MODEL_DIR" "target"
-echo "[sparkinfer] serving $MODEL_DIR as '$MODEL_NAME' on $HOST:$PORT (ctx $CTX, max output $SPARKINFER_MAX_OUTPUT_TOKENS)"
+MODE="autoregressive"
+[ -n "${SPARKINFER_DRAFT_MODEL:-}" ] && MODE="DSpark ($SPARKINFER_DRAFT_MODEL)"
+echo "[sparkinfer] serving $MODEL_DIR as '$MODEL_NAME' on $HOST:$PORT (ctx $CTX, max output $SPARKINFER_MAX_OUTPUT_TOKENS, $MODE)"
 exec /opt/sparkinfer/bin/sparkinfer_server \
   -m "$MODEL_DIR" --tokenizer "$MODEL_DIR/tokenizer.json" \
   --model-name "$MODEL_NAME" --ctx "$CTX" --host "$HOST" --port "$PORT" "$@"

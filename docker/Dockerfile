@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 #
 # sparkinfer + Qwen3.8-27B-NVFP4, one image:
-#   serve   AR + image + video over the OpenAI-compatible API   (default)
-#   bench   DSpark speculative benchmark                        (`... bench code`)
+#   serve          AR + image + video over the OpenAI-compatible API   (default)
+#   serve-dspark   DSpark for eligible API requests
+#   bench          DSpark speculative benchmark                        (`... bench code`)
 #
 # Built from the source in this repo, so a release tag produces exactly that tag's engine.
 # Blackwell (sm_120) only. Weights download themselves on first run into the /models volume.

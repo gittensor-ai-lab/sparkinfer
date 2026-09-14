@@ -962,8 +962,10 @@ int main(int argc, char** argv) {
 
     if (!draft_model.empty()) {
         std::string derr;
-        if (!engine.load_draft(draft_model, derr))
+        if (!engine.load_draft(draft_model, derr)) {
             fprintf(stderr, "[sparkinfer-server] speculative decoding off: %s\n", derr.c_str());
+            return 1;
+        }
     }
 
     const std::vector<int> prefix_ids = load_prefix_token_ids();

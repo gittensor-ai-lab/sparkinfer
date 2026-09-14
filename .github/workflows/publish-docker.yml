@@ -74,7 +74,7 @@ jobs:
             type=sha,format=short
           labels: |
             org.opencontainers.image.title=sparkinfer-qwen38
-            org.opencontainers.image.description=SparkInfer serving Qwen3.8-27B-NVFP4 (AR + image + video) with the DSpark benchmark
+            org.opencontainers.image.description=SparkInfer serving Qwen3.8-27B-NVFP4 (AR + image + video + DSpark speculative decode)
 
       - id: build
         uses: docker/build-push-action@v6
