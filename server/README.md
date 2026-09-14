@@ -57,6 +57,9 @@ export SPARKINFER_ROOT="$(pwd)"
 | `POST /v1/completions` | Legacy OpenAI text completion (`prompt` string, `echo`, integer `logprobs`). `echo` prepends the prompt TEXT; it does not report per-prompt-token logprobs — use `/v1/score` for that. |
 | `POST /v1/score` | **Teacher-forced scoring.** Per-token logprobs of a *supplied* continuation, no generation. See below. |
 | `POST /v1/chat/completions` | Chat (JSON `messages`, optional `tools`, `tool_choice`, `stream`, `enable_thinking`, `reasoning`, or `reasoning_effort`). Responses include OpenAI `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`) plus additive GPU timing fields (`ttft_ms`, `generation_ms`, `decode_tps`) that standard OpenAI SDKs ignore. Streaming sends a final chunk with `choices:[]` + `usage` before `[DONE]` by default. A streaming client that disconnects mid-response cancels generation (checked via `DataSink::is_writable()`) instead of running to completion for nobody. Overload (no queue capacity) returns `429`; a request that exceeds `SPARKINFER_REQUEST_TIMEOUT_S` returns `504`. |
+| `POST /v1/messages` | **Anthropic Messages API**, streaming and non-streaming: text, base64 images, tool use, thinking. A translation onto `/v1/chat/completions`, so it shares that route's generation, tool validation and sampling. Auth: `x-api-key` or `Authorization: Bearer`. See [Anthropic Messages and OpenAI Responses](#anthropic-messages-and-openai-responses). |
+| `POST /v1/messages/count_tokens` | Anthropic token count for a messages body, including `system` and `tools`. Image content returns `400`, as on `/v1/tokenize`. |
+| `POST /v1/responses` | **OpenAI Responses API**, stateless: streaming and non-streaming text, images, function tools and reasoning. Nothing is stored, so `previous_response_id` and `conversation` return `400` and `GET /v1/responses/{id}` returns `404`; send the whole conversation in `input`. |
 
 ### OpenRouter provider configuration
 
@@ -214,6 +217,43 @@ device's SM count, so two *different* GPU models are not promised to agree even 
 > This is left ON by default rather than silently switched off, because disabling it moves the
 > long-context prefill throughput the eval scores against — that call belongs with whoever owns the
 > kernel. Deterministic mode simply declines to build on top of it.
+
+### Anthropic Messages and OpenAI Responses
+
+`/v1/messages` and `/v1/responses` are translation layers, like the LM Studio (`/api/v0`) and
+Ollama (`/api/*`) routes: each request is rewritten into the chat-completions shape, served by the
+same handler as `/v1/chat/completions`, and the response or stream is rewritten back. Tool calling,
+images, reasoning and every sampling control therefore behave exactly as on `/v1`.
+
+Point a client at the server:
+
+- **Anthropic SDKs and Claude Code**: base URL is the server root, e.g. `http://host:8080`. Claude
+  Code reads `ANTHROPIC_BASE_URL`, and `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` for the key.
+- **OpenAI SDKs and Responses clients**: base URL is `http://host:8080/v1`.
+
+Streams use each API's own named events (`message_start` … `message_stop`; `response.created` …
+`response.completed`) and end without `[DONE]`. Both include usage.
+
+| | Anthropic `/v1/messages` | OpenAI `/v1/responses` |
+|---|---|---|
+| Reasoning on/off | `thinking: {type: enabled \| adaptive \| disabled}` | `reasoning.effort` (`none` turns it off) |
+| Reasoning effort | `output_config.effort` | `reasoning.effort` |
+| Reasoning output | `thinking` blocks, empty `signature` | `reasoning` items with `reasoning_text` content, empty `summary` |
+| Structured output | `output_config.format` (`json_schema`) | `text.format` (`json_object`, `json_schema`) |
+| Tool choice | `auto`, `any`, `tool`, `none`; `disable_parallel_tool_use` | `auto`, `required`, `none`, `{type: function, name}` |
+
+When reasoning is not specified, the model's own default applies, the same as on `/v1`.
+
+Refused with `400` rather than silently degraded:
+
+- **Anthropic**: server tools (`web_search`, `bash`, `code_execution`, ...), which Anthropic runs
+  itself; `document` and `search_result` blocks; images inside a `tool_result`; image `file` sources.
+- **Responses**: `previous_response_id`, `conversation` and `item_reference`, since nothing is stored;
+  `background` mode; non-function tools; `input_file` and `file_id` images.
+
+Not carried across: Anthropic `stop_reason` is `end_turn` for both EOS and a stop sequence, because
+the chat handler's `finish_reason: "stop"` does not tell them apart. A `tool_result` with
+`is_error: true` reaches the model as content prefixed `Error: `.
 
 ### Function tools
 
