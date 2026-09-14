@@ -95,6 +95,24 @@ struct ParsedToolOutput {
     bool missing_required_call = false;
 };
 
+// Grammar for constrained decoding of a tool-calling assistant turn: an xgrammar structural tag
+// (JSON) that admits only output parse_qwen36_tool_output accepts for the request -- reasoning and
+// content free of protocol markup, calls only to offered functions (only the named one for a named
+// tool_choice, at least one for required, at most one when parallel_tool_calls is false), each
+// parameter in the exact template framing with a value its schema allows.
+//
+// `exact` is false when some parameter constraint could only be approximated (a pattern that cannot
+// be rewritten to match the whole value, or a pattern combined with length bounds): the grammar then
+// admits a superset for that parameter, and the parser's validation remains the final word.
+struct ToolCallGrammar {
+    std::string structural_tag;
+    bool exact = true;
+    std::string approximation;   // why exact is false
+};
+// False (err set) for a request with no tool protocol to constrain: no tools, or tool_choice=none.
+bool build_tool_call_grammar(const ChatRequest& request, bool enable_thinking, ToolCallGrammar& out,
+                             std::string& err);
+
 // The opening of a native Qwen tool call that forces one: "<tool_call>\n<function=NAME>\n" for a
 // named function or for tool_choice=required with a single offered function, and
 // "<tool_call>\n<function=" for required with several (the model still writes the name, and can

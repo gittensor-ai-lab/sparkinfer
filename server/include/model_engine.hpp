@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sparkinfer/token_constraint.h"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -207,7 +208,8 @@ public:
                                         const std::function<void(const TokenLogprob&)>&
                                             on_token_logprob = nullptr,
                                         const std::vector<int>& forced_tokens = {},
-                                        const PreparedImages* images = nullptr);
+                                        const PreparedImages* images = nullptr,
+                                        std::shared_ptr<sparkinfer::TokenConstraint> constraint = nullptr);
 
     // TEACHER-FORCED SCORING (POST /v1/score): non-empty `forced_tokens` turns the call into a
     // scoring pass instead of a generation. max_new_tokens must equal forced_tokens.size(); the

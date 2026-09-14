@@ -790,7 +790,8 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
                                                  const std::function<void(const TokenLogprob&)>&
                                                      on_token_logprob,
                                                  const std::vector<int>& forced_tokens,
-                                                 const PreparedImages* images) {
+                                                 const PreparedImages* images,
+                                                 std::shared_ptr<sparkinfer::TokenConstraint> constraint) {
     CompletionResult out;
     sparkinfer::ContinuousBatchEngine::Request req;
     req.prompt = prompt_ids;
@@ -817,6 +818,7 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     req.presence_penalty = presence_penalty;
     req.frequency_penalty = frequency_penalty;
     req.logit_bias = logit_bias;
+    req.constraint = std::move(constraint);
     req.logprobs = logprobs;
     req.top_logprobs = top_logprobs;
 

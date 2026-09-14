@@ -1,6 +1,7 @@
 #include "chat_tools.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cctype>
 #include <charconv>
@@ -9,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <re2/re2.h>
+#include <cstring>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -1959,6 +1961,391 @@ std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_
     else out << kThinkOpen << "\n\n" << kThinkClose << "\n\n";
     out << request.assistant_prefix;
     return out.str();
+}
+
+namespace {
+
+// Structural-tag JSON builders. Kept next to the parser on purpose: every string below is a
+// delimiter parse_qwen36_tool_output splits on, and the two must change together.
+json st_const(const std::string& value) { return {{"type", "const_string"}, {"value", value}}; }
+
+// Free text. Excludes exactly what has_protocol_markup rejects, so no free-text region -- reasoning,
+// content, a string argument -- can produce output the parser refuses.
+json st_free_text(int max_chars = -1) {
+    json out = {{"type", "any_text"},
+                {"excludes", {"<tool", "</tool", "<function", "</function", "<parameter", "</parameter",
+                              "<think", "</think", "<|im_"}}};
+    if (max_chars >= 0) out["max_chars"] = max_chars;
+    return out;
+}
+
+json st_tag(const std::string& begin, json content, const std::string& end) {
+    return {{"type", "tag"}, {"begin", begin}, {"content", std::move(content)}, {"end", end}};
+}
+
+json st_sequence(json elements) { return {{"type", "sequence"}, {"elements", std::move(elements)}}; }
+
+json st_regex(const std::string& pattern) { return {{"type", "regex"}, {"pattern", pattern}}; }
+
+// ---- Schema normalization for the grammar -------------------------------------------------------
+//
+// xgrammar enforces most of JSON Schema, but not all of what validate_value enforces: allOf with more
+// than one branch becomes "anything", multipleOf combined with a range is dropped, and an oneOf whose
+// branches may overlap is treated as anyOf. Rewrite those into forms it does enforce, and record an
+// approximation wherever that is not possible, so ToolCallGrammar::exact stays truthful.
+
+json resolve_refs_shallow(const json& root, const json& schema) {
+    const json* s = &schema;
+    for (int depth = 0; depth < 64 && s->is_object() && s->contains("$ref") && (*s)["$ref"].is_string(); ++depth) {
+        const json* next = resolve_local_ref(root, (*s)["$ref"].get<std::string>());
+        if (!next) break;
+        s = next;
+    }
+    return *s;
+}
+
+std::set<std::string> schema_type_set(const json& s) {
+    std::set<std::string> out;
+    if (!s.is_object() || !s.contains("type")) return {"array", "boolean", "integer", "null", "number", "object", "string"};
+    const json& type = s["type"];
+    if (type.is_string()) out.insert(type.get<std::string>());
+    else if (type.is_array())
+        for (const auto& t : type)
+            if (t.is_string()) out.insert(t.get<std::string>());
+    if (out.count("number")) out.insert("integer");
+    return out;
+}
+
+bool approximate(ToolCallGrammar& grammar, const std::string& why);
+
+json merge_all_of(const json& root, json a, const json& b_in, ToolCallGrammar& grammar, const std::string& where);
+
+json normalize_for_grammar(const json& root, const json& schema, ToolCallGrammar& grammar, const std::string& where,
+                           int depth = 0) {
+    if (!schema.is_object() || depth > 32) return schema;
+    json s = schema;
+    if (s.contains("allOf") && s["allOf"].is_array()) {
+        json branches = s["allOf"];
+        s.erase("allOf");
+        for (const auto& branch : branches)
+            s = merge_all_of(root, std::move(s), normalize_for_grammar(root, resolve_refs_shallow(root, branch), grammar, where, depth + 1), grammar, where);
+    }
+    for (const char* key : {"items", "additionalProperties"})
+        if (s.contains(key) && s[key].is_object()) s[key] = normalize_for_grammar(root, s[key], grammar, where, depth + 1);
+    for (const char* key : {"anyOf", "oneOf", "prefixItems"})
+        if (s.contains(key) && s[key].is_array())
+            for (auto& item : s[key]) item = normalize_for_grammar(root, item, grammar, where, depth + 1);
+    if (s.contains("properties") && s["properties"].is_object())
+        for (auto& item : s["properties"].items()) item.value() = normalize_for_grammar(root, item.value(), grammar, where, depth + 1);
+    // oneOf is anyOf when no value can satisfy two branches; types that cannot overlap prove it.
+    if (s.contains("oneOf") && s["oneOf"].is_array()) {
+        std::set<std::string> seen;
+        bool disjoint = true;
+        for (const auto& branch : s["oneOf"]) {
+            std::set<std::string> types = schema_type_set(resolve_refs_shallow(root, branch));
+            for (const auto& t : types)
+                if (!seen.insert(t).second) disjoint = false;
+        }
+        if (!disjoint) approximate(grammar, where + ": oneOf branches may overlap");
+    }
+    // An integer multipleOf inside a finite range is a finite set.
+    if (s.contains("multipleOf")) {
+        const json& m = s["multipleOf"];
+        const std::set<std::string> types = schema_type_set(s);
+        const bool integer_only = types.size() == 1 && types.count("integer") == 1 &&
+                                  s.contains("type");
+        long lo = LONG_MIN, hi = LONG_MAX;
+        if (s.contains("minimum") && s["minimum"].is_number()) lo = (long)std::ceil(s["minimum"].get<double>());
+        if (s.contains("exclusiveMinimum") && s["exclusiveMinimum"].is_number()) lo = std::max(lo, (long)std::floor(s["exclusiveMinimum"].get<double>()) + 1);
+        if (s.contains("maximum") && s["maximum"].is_number()) hi = (long)std::floor(s["maximum"].get<double>());
+        if (s.contains("exclusiveMaximum") && s["exclusiveMaximum"].is_number()) hi = std::min(hi, (long)std::ceil(s["exclusiveMaximum"].get<double>()) - 1);
+        if (integer_only && m.is_number_integer() && m.get<long>() > 0 && lo != LONG_MIN && hi != LONG_MAX &&
+            hi >= lo && (hi - lo) / m.get<long>() <= 1024) {
+            const long step = m.get<long>();
+            long first = lo % step == 0 ? lo : lo + ((step - lo % step) % step);
+            if (lo < 0 && lo % step != 0) first = lo - (lo % step);
+            json values = json::array();
+            for (long v = first; v <= hi; v += step)
+                if (v >= lo && v % step == 0) values.push_back(v);
+            if (s.contains("enum") || s.contains("const")) approximate(grammar, where + ": multipleOf with enum or const");
+            else s = json{{"enum", std::move(values)}};
+        } else {
+            approximate(grammar, where + ": multipleOf the grammar cannot enumerate");
+        }
+    }
+    // validate_value reads a JSON integer only when it fits 64 bits (a longer one parses as a double
+    // and fails "type": "integer"); xgrammar's integer rule has unbounded digits. Bound it where the
+    // schema does not.
+    if (s.contains("type") && !s.contains("enum") && !s.contains("const")) {
+        const std::set<std::string> types = schema_type_set(s);
+        const json& type = s["type"];
+        const bool integer_only = type.is_string() && type == "integer";
+        if (integer_only || (types.count("integer") && !(type.is_array() && std::find(type.begin(), type.end(), json("number")) != type.end()))) {
+            if (!s.contains("minimum") && !s.contains("exclusiveMinimum")) s["minimum"] = std::numeric_limits<int64_t>::min();
+            if (!s.contains("maximum") && !s.contains("exclusiveMaximum")) s["maximum"] = std::numeric_limits<int64_t>::max();
+        }
+    }
+    // Strings a JSON value would carry verbatim: markup there breaks the protocol framing.
+    for (const char* key : {"enum", "const"}) {
+        if (!s.contains(key)) continue;
+        const json values = std::string(key) == "enum" ? s[key] : json::array({s[key]});
+        for (const auto& v : values)
+            if (v.is_string() && v.get<std::string>().find('<') != std::string::npos)
+                approximate(grammar, where + ": an enum or const string contains '<'");
+    }
+    if (s.contains("pattern")) approximate(grammar, where + ": pattern inside a JSON value");
+    return s;
+}
+
+// allOf as one schema: the conjunction of each keyword. Where a conjunction has no single-keyword form
+// (two different patterns, two prefixItems) or changes meaning (additionalProperties, which each branch
+// applies to its own properties), keep the first and record the approximation.
+json merge_all_of(const json& root, json a, const json& b, ToolCallGrammar& grammar, const std::string& where) {
+    (void)root;
+    if (!b.is_object()) return a;
+    for (const auto& item : b.items()) {
+        const std::string& key = item.key();
+        const json& bv = item.value();
+        if (!a.contains(key)) {
+            a[key] = bv;
+            continue;
+        }
+        json& av = a[key];
+        if (av == bv) continue;
+        if (key == "type") {
+            std::set<std::string> ta = schema_type_set(json{{"type", av}}), tb = schema_type_set(json{{"type", bv}}), both;
+            for (const auto& t : ta)
+                if (tb.count(t)) both.insert(t);
+            if (both.count("number") && !(ta.count("number") && tb.count("number"))) both.erase("number");
+            if (both.empty()) {
+                approximate(grammar, where + ": allOf types do not intersect");
+                continue;
+            }
+            av = both.size() == 1 ? json(*both.begin()) : json(std::vector<std::string>(both.begin(), both.end()));
+        } else if (key == "minimum" || key == "exclusiveMinimum" || key == "minLength" || key == "minItems") {
+            av = std::max(av.get<double>(), bv.get<double>());
+            if (key == "minLength" || key == "minItems") av = (long)av.get<double>();
+        } else if (key == "maximum" || key == "exclusiveMaximum" || key == "maxLength" || key == "maxItems") {
+            av = std::min(av.get<double>(), bv.get<double>());
+            if (key == "maxLength" || key == "maxItems") av = (long)av.get<double>();
+        } else if (key == "required") {
+            std::set<std::string> keys;
+            for (const auto& k : av) keys.insert(k.get<std::string>());
+            for (const auto& k : bv) keys.insert(k.get<std::string>());
+            av = std::vector<std::string>(keys.begin(), keys.end());
+        } else if (key == "properties") {
+            for (const auto& prop : bv.items())
+                av[prop.key()] = av.contains(prop.key())
+                    ? merge_all_of(root, av[prop.key()], prop.value(), grammar, where)
+                    : prop.value();
+        } else if (key == "items") {
+            av = merge_all_of(root, av, bv, grammar, where);
+        } else if (key == "enum") {
+            json kept = json::array();
+            for (const auto& v : av)
+                if (std::find(bv.begin(), bv.end(), v) != bv.end()) kept.push_back(v);
+            av = kept;
+        } else if (key == "description" || key == "title" || key == "default" || key == "examples" ||
+                   key == "format" || key == "$comment" || key.rfind("x-", 0) == 0) {
+            // annotations: keep the first
+        } else if (key == "multipleOf" && av.is_number_integer() && bv.is_number_integer()) {
+            long x = av.get<long>(), y = bv.get<long>();
+            long g = x, h = y;
+            while (h) { long r = g % h; g = h; h = r; }
+            av = x / g * y;
+        } else {
+            approximate(grammar, where + ": allOf cannot combine two different " + key);
+        }
+    }
+    return a;
+}
+
+// validate_value applies a JSON Schema pattern with RE2::PartialMatch -- it may match anywhere in the
+// value -- while an xgrammar regex must match all of it. Pad each unanchored side with text that
+// cannot start protocol markup. False when the rewrite would not be exact: an anchor anywhere but the
+// two ends, or a top-level alternation mixed with anchors.
+//
+// One dialect difference is rewritten rather than refused: RE2's '.' does not match a newline and
+// xgrammar's does, so '.' outside a character class becomes [^\n].
+bool whole_value_regex(const std::string& pattern, std::string& out) {
+    int depth = 0;
+    bool in_class = false, top_level_alternation = false, inner_anchor = false;
+    std::string rewritten;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        const char c = pattern[i];
+        if (c == '\\') {
+            if (i + 1 < pattern.size() && std::strchr("AzZbB", pattern[i + 1])) inner_anchor = true;
+            rewritten.append(pattern, i, 2);
+            ++i;
+            continue;
+        }
+        if (in_class) {
+            if (c == ']') in_class = false;
+            rewritten.push_back(c);
+            continue;
+        }
+        if (c == '.') {
+            rewritten += "[^\\n]";
+            continue;
+        }
+        rewritten.push_back(c);
+        if (c == '[') in_class = true;
+        else if (c == '(') ++depth;
+        else if (c == ')') --depth;
+        else if (c == '|' && depth == 0) top_level_alternation = true;
+        else if ((c == '^' && i != 0) || (c == '$' && i + 1 != pattern.size())) inner_anchor = true;
+    }
+    const bool anchored_start = !pattern.empty() && pattern.front() == '^';
+    bool anchored_end = pattern.size() > 1 && pattern.back() == '$';
+    if (anchored_end) {   // "\$" is a literal dollar, not an anchor
+        size_t slashes = 0;
+        for (size_t i = pattern.size() - 1; i > 0 && pattern[i - 1] == '\\'; --i) ++slashes;
+        if (slashes % 2) anchored_end = false;
+    }
+    if (inner_anchor || (top_level_alternation && (anchored_start || anchored_end))) return false;
+    const std::string core = rewritten.substr(anchored_start ? 1 : 0,
+                                              rewritten.size() - (anchored_start ? 1 : 0) - (anchored_end ? 1 : 0));
+    out = (anchored_start ? "" : "[^<]*") + std::string("(?:") + core + ")" + (anchored_end ? "" : "[^<]*");
+    return true;
+}
+
+bool approximate(ToolCallGrammar& grammar, const std::string& why) {
+    if (grammar.exact) grammar.approximation = why;
+    grammar.exact = false;
+    return true;
+}
+
+// The value between "<parameter=KEY>\n" and "\n</parameter>\n", as parse_parameter_value reads it.
+bool parameter_value_format(const json& root, const json& property, const std::string& where,
+                            ToolCallGrammar& grammar, json& out, std::string& err) {
+    const json* resolved = &property;
+    for (int depth = 0; resolved->is_object() && resolved->contains("$ref"); ++depth) {
+        const json& ref = (*resolved)["$ref"];
+        const json* next = depth < 64 && ref.is_string() ? resolve_local_ref(root, ref.get<std::string>()) : nullptr;
+        if (!next) return set_error(err, where + " has an unresolvable $ref");
+        resolved = next;
+    }
+    const json& s = *resolved;
+    if (!(schema_allows_type(s, "string") && !schema_allows_non_string(s))) {
+        // Anything that may be a non-string is read as JSON first, and JSON that fails the schema is
+        // never a valid string either unless the schema also allows strings -- in which case the
+        // JSON-quoted form still parses to that string. So the JSON grammar of the schema is exact.
+        json sub = normalize_for_grammar(root, property, grammar, where);
+        for (const char* defs : {"$defs", "definitions"}) {
+            if (!root.contains(defs) || sub.contains(defs)) continue;
+            json normalized = root[defs];
+            if (normalized.is_object())
+                for (auto& item : normalized.items())
+                    item.value() = normalize_for_grammar(root, item.value(), grammar, where + " " + defs + "/" + item.key());
+            sub[defs] = std::move(normalized);
+        }
+        out = {{"type", "json_schema"}, {"json_schema", std::move(sub)}};
+        return true;
+    }
+    // A string-only parameter is its raw text.
+    if (s.contains("const") || s.contains("enum")) {
+        json values = s.contains("const") ? json::array({s["const"]}) : s["enum"];
+        json choices = json::array();
+        for (const auto& v : values)
+            if (v.is_string() && !has_protocol_markup(v.get<std::string>()))
+                choices.push_back(st_const(v.get<std::string>()));
+        if (choices.empty()) return set_error(err, where + " has no value the tool-call protocol can carry");
+        out = choices.size() == 1 ? choices[0] : json{{"type", "or"}, {"elements", std::move(choices)}};
+        return true;
+    }
+    const long min_length = s.contains("minLength") ? s["minLength"].get<long>() : 0;
+    const long max_length = s.contains("maxLength") ? s["maxLength"].get<long>() : -1;
+    if (s.contains("pattern")) {
+        std::string regex;
+        if (!whole_value_regex(s["pattern"].get<std::string>(), regex)) {
+            approximate(grammar, where + ": pattern cannot be matched against the whole value exactly");
+            out = st_free_text();
+            return true;
+        }
+        if (min_length > 0 || max_length >= 0)
+            approximate(grammar, where + ": pattern combined with length bounds");
+        out = st_regex(regex);
+        return true;
+    }
+    if (min_length == 0 && max_length < 0) {
+        out = st_free_text();
+        return true;
+    }
+    // Length bounds count code points, as validate_value does. A regex character class counts whole
+    // code points; any_text's max_chars does not -- it spends the budget on a lead byte and then
+    // refuses the continuation byte, a dead end once invalid UTF-8 is masked. Excluding '<' keeps the
+    // value free of markup, so a length-limited string cannot carry a '<'.
+    if (min_length <= 4096 && max_length <= 65536) {
+        out = st_regex("[^<]{" + std::to_string(min_length) + "," +
+                       (max_length >= 0 ? std::to_string(max_length) : std::string()) + "}");
+        return true;
+    }
+    approximate(grammar, where + ": minLength too large to expand");
+    out = st_free_text();
+    return true;
+}
+
+bool tool_call_format(const ToolDefinition& tool, ToolCallGrammar& grammar, json& out, std::string& err) {
+    const json& schema = tool.spec["function"]["parameters"];
+    const json properties = schema.value("properties", json::object());
+    std::set<std::string> required;
+    if (schema.contains("required"))
+        for (const auto& key : schema["required"]) required.insert(key.get<std::string>());
+    std::set<std::string> keys = required;
+    for (const auto& item : properties.items()) keys.insert(item.key());
+    json elements = json::array();
+    // Declared parameters in sorted order -- the order the tool schema is rendered in the prompt.
+    for (const std::string& key : keys) {
+        const json* property = property_schema_for_key(schema, properties, key);
+        if (!property) return set_error(err, "function " + tool.name + " requires undeclared parameter " + key);
+        json value;
+        if (!parameter_value_format(schema, *property, "function " + tool.name + " parameter " + key,
+                                    grammar, value, err))
+            return false;
+        // "<parameter=KEY>\n" VALUE "\n" "</parameter>\n": the template's framing, one newline on each
+        // side of the value, which parse_one_xml_call strips. The newline before the closing tag is
+        // part of the content rather than of the end string on purpose: xgrammar enforces a
+        // free-text exclusion only against an end string that begins with the excluded markup, and
+        // with "\n</parameter>\n" as the end it let a value run on past "\n</parameter>".
+        json parameter = st_tag(std::string(kParameterOpen) + key + ">\n",
+                                st_sequence({std::move(value), st_const("\n")}),
+                                std::string(kParameterClose) + "\n");
+        elements.push_back(required.count(key) ? std::move(parameter)
+                                               : json{{"type", "optional"}, {"content", std::move(parameter)}});
+    }
+    out = st_tag(std::string(kToolCallOpen) + "\n" + kFunctionOpen + tool.name + ">\n",
+                 elements.empty() ? st_const("") : st_sequence(std::move(elements)),
+                 std::string(kFunctionClose) + "\n" + kToolCallClose);
+    return true;
+}
+
+}  // namespace
+
+bool build_tool_call_grammar(const ChatRequest& request, bool enable_thinking, ToolCallGrammar& out,
+                             std::string& err) {
+    out = ToolCallGrammar{};
+    if (request.tools.empty() || request.tool_choice == ToolChoiceMode::kNone)
+        return set_error(err, "the request has no tool calls to constrain");
+    json calls = json::array();
+    for (const ToolDefinition& tool : request.tools) {
+        if (request.tool_choice == ToolChoiceMode::kNamed && tool.name != request.required_tool_name) continue;
+        json call;
+        if (!tool_call_format(tool, out, call, err)) return false;
+        calls.push_back(std::move(call));
+    }
+    if (calls.empty()) return set_error(err, "tool_choice names no offered function");
+    const bool demand = request.tool_choice == ToolChoiceMode::kRequired ||
+                        request.tool_choice == ToolChoiceMode::kNamed;
+    json call_list = {{"type", "tags_with_separator"}, {"tags", std::move(calls)}, {"separator", "\n"},
+                      {"at_least_one", true}, {"stop_after_first", !request.parallel_tool_calls}};
+    // Required and named: nothing but calls. Auto: content first, then optionally calls, and nothing
+    // after them -- the parser rejects text that follows a call.
+    json body = demand ? std::move(call_list)
+                       : st_sequence({st_free_text(), {{"type", "optional"}, {"content", std::move(call_list)}}});
+    // Thinking on: the prompt ends inside <think>; the reasoning closes as the template renders it.
+    if (enable_thinking) body = st_sequence({st_tag("", st_free_text(), std::string(kThinkClose) + "\n\n"), std::move(body)});
+    out.structural_tag = json{{"type", "structural_tag"}, {"format", std::move(body)}}.dump();
+    return true;
 }
 
 std::string forced_tool_call_prefix(const ChatRequest& request) {

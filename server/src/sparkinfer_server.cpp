@@ -12,6 +12,7 @@
 
 // Do not define CPPHTTPLIB_OPENSSL_SUPPORT — even `= 0` enables OpenSSL in httplib.
 #include "../third_party/httplib.h"
+#include "tool_grammar.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -98,6 +99,9 @@ std::string g_api_key;
 // after load() for the architectures the engine can identify, unless --model-name was given.
 std::string g_model_name = "qwen3.6-35b-a3b";
 sparkinfer_server::ChatTokenizer g_tokenizer;
+// Constrained decoding of tool calls (see build_tool_call_grammar). Null when disabled
+// (SPARKINFER_TOOL_GRAMMAR=0) or for a model without the Qwen tool protocol.
+std::unique_ptr<sparkinfer_server::GrammarEngine> g_tool_grammar;
 const auto g_start_time = std::chrono::steady_clock::now();
 
 // Request/error metrics (GET /metrics). Counters only -- no per-request content is retained.
@@ -120,6 +124,8 @@ std::atomic<uint64_t> g_requests_invalid_tool_output{0};
 // function was first picked from the offered names (pick_function). Distinct from
 // invalid_tool_output -- these requests succeeded, and a rising rate means the model is resisting
 // the forced choice, not that calls are failing.
+// Tool-calling requests decoded under the tool-call grammar (constrained decoding).
+std::atomic<uint64_t> g_tool_constrained{0};
 std::atomic<uint64_t> g_tool_forced_retry{0};
 std::atomic<uint64_t> g_tool_forced_pick{0};
 // 502 -- same rationale as g_requests_invalid_tool_output above, for response_format: the model
@@ -600,6 +606,22 @@ sparkinfer_server::ChatRequest build_retry_request(const sparkinfer_server::Chat
     return retry;
 }
 
+// A fresh constraint for one tool-calling generation -- constraints are stateful, so every branch and
+// retry gets its own. Null when the request is not constrained or its grammar fails to compile; the
+// generation then runs unconstrained, with the forced-prefix and retry fallback still in place.
+std::shared_ptr<sparkinfer::TokenConstraint> tool_call_constraint(bool active,
+                                                                  const sparkinfer_server::ToolCallGrammar& grammar) {
+    if (!active || !g_tool_grammar) return nullptr;
+    bool exact = grammar.exact;
+    std::string err;
+    auto constraint = g_tool_grammar->make_constraint(grammar.structural_tag, exact, err);
+    if (!constraint)
+        fprintf(stderr, "[sparkinfer-server] tool-call grammar failed to compile: %s\n", err.c_str());
+    else
+        g_tool_constrained++;
+    return constraint;
+}
+
 // tool_choice=required over several offered functions, and the model's attempt called none of them.
 // Picks the one the model itself ranks highest where a name starts: each step generates one token
 // with every token that can continue a still-possible name biased +100, so the pick is the model's
@@ -853,6 +875,24 @@ int main(int argc, char** argv) {
     g_tokenizer.set_museglimmer(engine.is_museglimmer());
     g_tokenizer.set_qwen38(engine.is_qwen38());
 
+    // The tool-call grammar needs the exact bytes of every token id. Built once: a few seconds for a
+    // 248K vocabulary. Muse Glimmer has no Qwen tool protocol (tools are refused there), so none.
+    if (!engine.is_museglimmer() && env_string("SPARKINFER_TOOL_GRAMMAR") != "0") {
+        const auto t0 = std::chrono::steady_clock::now();
+        const int vocab = engine.vocab();
+        std::vector<std::string> pieces(vocab);
+        std::vector<int> stops;
+        for (int id = 0; id < vocab; ++id) {
+            const sparkinfer_server::RawTokenPiece piece = g_tokenizer.id_to_raw_piece(id);
+            pieces[id].assign(piece.bytes.begin(), piece.bytes.end());
+            if (engine.is_stop_token(id)) stops.push_back(id);
+        }
+        g_tool_grammar = std::make_unique<sparkinfer_server::GrammarEngine>(pieces, vocab, stops);
+        fprintf(stderr, "[sparkinfer-server] tool calls: constrained decoding on (%d tokens, %zu stop ids, %.1f s)\n",
+                vocab, stops.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+
     const std::vector<int> prefix_ids = load_prefix_token_ids();
     if (!prefix_ids.empty()) {
         engine.set_prefix_tokens(prefix_ids);
@@ -1032,6 +1072,9 @@ int main(int argc, char** argv) {
              << g_requests_invalid_tool_output.load() << "\n"
              << "sparkinfer_requests_by_outcome_total{outcome=\"invalid_json_output\"} "
              << g_requests_invalid_json_output.load() << "\n"
+                "# HELP sparkinfer_tool_calls_constrained_total Tool-calling generations decoded under the tool-call grammar\n"
+                "# TYPE sparkinfer_tool_calls_constrained_total counter\n"
+             << "sparkinfer_tool_calls_constrained_total " << g_tool_constrained.load() << "\n"
                 "# HELP sparkinfer_tool_calls_forced_total Required/named tool calls the server forced after the model's attempt\n"
                 "# TYPE sparkinfer_tool_calls_forced_total counter\n"
              << "sparkinfer_tool_calls_forced_total{step=\"retry\"} " << g_tool_forced_retry.load() << "\n"
@@ -1344,14 +1387,31 @@ int main(int argc, char** argv) {
                                      "application/json");
                      return;
                  }
-                 // tool_choice=required or a named function is a contract: the caller branches on
-                 // tool_calls. Instructing the model is not enforcing it, so with thinking off the
-                 // assistant turn starts inside the call and the model can only complete one. (With
-                 // thinking on the model reasons first, and a call that does not come is forced
-                 // afterwards -- see force_tool_call, which also covers an invented function name.)
-                 // Before images are prepared, so their placeholders expand in the prompt that is
-                 // actually sent.
-                 if (!enable_thinking && !engine.is_museglimmer() &&
+                 // Constrained decoding: every token of a tool-calling turn is sampled under a grammar
+                 // that admits only output the parser accepts -- calls to offered functions, at least
+                 // one for required, only the named one for a named choice, arguments valid for their
+                 // schemas. Built once per request; each generation gets its own constraint.
+                 sparkinfer_server::ToolCallGrammar tool_grammar;
+                 bool constrained_tools = false;
+                 if (g_tool_grammar && !chat_request.tools.empty() &&
+                     chat_request.tool_choice != sparkinfer_server::ToolChoiceMode::kNone) {
+                     std::string gerr;
+                     constrained_tools = sparkinfer_server::build_tool_call_grammar(chat_request, enable_thinking,
+                                                                                    tool_grammar, gerr);
+                     if (!constrained_tools)
+                         fprintf(stderr, "[sparkinfer-server] tool calls unconstrained for this request: %s\n", gerr.c_str());
+                     else if (!tool_grammar.exact)
+                         fprintf(stderr, "[sparkinfer-server] tool-call grammar approximates: %s\n",
+                                 tool_grammar.approximation.c_str());
+                 }
+                 // Fallback when the grammar is unavailable. tool_choice=required or a named function
+                 // is a contract: the caller branches on tool_calls. Instructing the model is not
+                 // enforcing it, so with thinking off the assistant turn starts inside the call and the
+                 // model can only complete one. (With thinking on the model reasons first, and a call
+                 // that does not come is forced afterwards -- see force_tool_call, which also covers an
+                 // invented function name.) Before images are prepared, so their placeholders expand
+                 // in the prompt that is actually sent.
+                 if (!constrained_tools && !enable_thinking && !engine.is_museglimmer() &&
                      !sparkinfer_server::forced_tool_call_prefix(chat_request).empty()) {
                      chat_request.assistant_prefix = sparkinfer_server::forced_tool_call_prefix(chat_request);
                      prompt_ids = g_tokenizer.encode_augmented(chat_request, enable_thinking);
@@ -1451,6 +1511,7 @@ int main(int argc, char** argv) {
                           // shares its pixel buffers rather than owning them.
                           prepared,
                           chat_request, tool_protocol, json_mode_active,
+                          tool_grammar, constrained_tools,
                           dialect = stream_dialect_of(req),
                           ollama_generate =
                               req.get_header_value(kStreamDialectHeader) == "ollama-ndjson-generate",
@@ -1722,7 +1783,7 @@ int main(int argc, char** argv) {
                                  const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
                                      logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob,
-                                     {}, &prepared);
+                                     {}, &prepared, tool_call_constraint(tool_protocol && constrained_tools, tool_grammar));
                                  out->prompt_tokens = (long long)prompt_ids.size();
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
@@ -2147,7 +2208,7 @@ int main(int argc, char** argv) {
                              controls.temperature, branch_seed, controls.top_k, controls.top_p,
                              controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
                              controls.logprobs, controls.top_logprobs, maybe_nonstream_on_tok_logprob,
-                             {}, &prepared);
+                             {}, &prepared, tool_call_constraint(tool_protocol && constrained_tools, tool_grammar));
                          // Defensive clamp -- should already hold, cheap insurance against any
                          // subtle off-by-one between the two accumulation paths above.
                          if (logprob_entries.size() > outcome.tokens.size())

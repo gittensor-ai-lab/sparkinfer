@@ -25,6 +25,33 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(re2)
 
+# Constrained decoding of tool calls: xgrammar, the grammar engine vLLM, SGLang and TensorRT-LLM use.
+# Only its C++ core is needed. Its own CMake project unconditionally configures TVM-FFI Python
+# bindings, so the sources are fetched populate-only (SOURCE_SUBDIR has no CMakeLists.txt) and the
+# library is defined here. The release tarball leaves out the dlpack submodule; it is fetched at the
+# commit v0.2.6 pins.
+FetchContent_Declare(
+    xgrammar
+    URL      https://github.com/mlc-ai/xgrammar/archive/refs/tags/v0.2.6.tar.gz
+    URL_HASH SHA256=f56889426b843aa0b52e3e8202a6c690a9d4cbd86df6afdc8be5d2428a7a57c2
+    SOURCE_SUBDIR populate-only
+)
+FetchContent_Declare(
+    dlpack
+    URL      https://github.com/dmlc/dlpack/archive/bbd2f4d32427e548797929af08cfe2a9cbb3cf12.tar.gz
+    URL_HASH SHA256=f5dcb30f8a3d1a41d48b5d5b3fe1631dfce11de76f9e7e5bd22c6dc75a758885
+    SOURCE_SUBDIR populate-only
+)
+FetchContent_MakeAvailable(xgrammar dlpack)
+file(GLOB_RECURSE XGRAMMAR_SOURCES CONFIGURE_DEPENDS ${xgrammar_SOURCE_DIR}/cpp/*.cc)
+list(FILTER XGRAMMAR_SOURCES EXCLUDE REGEX ".*/cpp/tvm_ffi/.*")
+add_library(xgrammar STATIC ${XGRAMMAR_SOURCES})
+target_include_directories(xgrammar PUBLIC ${xgrammar_SOURCE_DIR}/include)
+target_include_directories(xgrammar SYSTEM PUBLIC ${xgrammar_SOURCE_DIR}/3rdparty/picojson ${dlpack_SOURCE_DIR}/include)
+target_compile_definitions(xgrammar PUBLIC XGRAMMAR_ENABLE_CPPTRACE=0)
+target_compile_features(xgrammar PUBLIC cxx_std_17)
+set_target_properties(xgrammar PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_executable(sparkinfer_server
     src/image_input.cpp
     src/video_input.cpp
@@ -32,6 +59,7 @@ add_executable(sparkinfer_server
     src/model_engine.cpp
     src/chat_tokenizer.cpp
     src/chat_tools.cpp
+    src/tool_grammar.cpp
     src/lmstudio_api.cpp
     src/ollama_api.cpp
 )
@@ -45,6 +73,7 @@ target_include_directories(sparkinfer_server PRIVATE
 )
 
 target_link_libraries(sparkinfer_server PRIVATE
+    xgrammar
     sparkinfer_runtime
     tokenizers_cpp
     nlohmann_json::nlohmann_json
@@ -72,6 +101,24 @@ if(BUILD_TESTS)
     )
     target_compile_features(chat_tools_test PRIVATE cxx_std_17)
     add_test(NAME chat_tools_test COMMAND chat_tools_test)
+
+    # Constrained tool calls: every output the grammar admits must parse. CPU-only, no model.
+    add_executable(tool_grammar_test
+        tests/tool_grammar_test.cpp
+        src/chat_tools.cpp
+        src/tool_grammar.cpp
+    )
+    target_include_directories(tool_grammar_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/include
+    )
+    target_link_libraries(tool_grammar_test PRIVATE
+        nlohmann_json::nlohmann_json
+        re2::re2
+        xgrammar
+    )
+    target_compile_features(tool_grammar_test PRIVATE cxx_std_17)
+    add_test(NAME tool_grammar_test COMMAND tool_grammar_test)
 
     # LM Studio /api/v0 response shaping: pure JSON over plain structs, no engine/CUDA, so it
     # runs on any box. The assertions are about exact field names and value vocabularies, which
