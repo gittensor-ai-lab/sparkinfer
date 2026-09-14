@@ -821,7 +821,8 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               const void* dt, const void* a,
                               float* state, void* out,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
-                              bool qh_block, cudaStream_t stream) {
+                              bool qh_block, cudaStream_t stream,
+                              bool carry_in) {
     constexpr int C = 32, HD = 128, PREP_THREADS = 256;
     // State columns per scan block. JC_S is the shape every context used before; JC_B halves the
     // grid — see use_big below for why that is the whole point at long context.
@@ -993,7 +994,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     // and allocates; each doubling cuts the launch count in half.
     const size_t total = gdnc_workspace_bytes(n_tokens, v_heads, C, HD);
     if (ws_reserve(total))
-        return run_slice(qb, kb, vb, ab, bb, ob, n_tokens, 0);
+        return run_slice(qb, kb, vb, ab, bb, ob, n_tokens, carry_in ? 1 : 0);
     cudaGetLastError();   // clear the failed grow so later peek/getinfo are clean
 
     int seg = 0;
@@ -1021,7 +1022,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         const int len = (int)((off + seg < (size_t)n_tokens) ? seg : (size_t)n_tokens - off);
         if (!run_slice(qb + off * q_dim, kb + off * q_dim, vb + off * v_dim,
                        ab + off * v_heads, bb + off * v_heads, ob + off * v_dim,
-                       len, off ? 1 : 0))
+                       len, (off || carry_in) ? 1 : 0))
             return false;
     }
     return true;

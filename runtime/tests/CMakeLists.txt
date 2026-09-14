@@ -68,6 +68,12 @@ add_executable(penalty_gpu_test penalty_gpu_test.cpp)
 target_link_libraries(penalty_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME penalty_gpu_test COMMAND penalty_gpu_test)
 
+# Gated-DeltaNet state carried into a batched prefill scan that does not start at position 0: a pass
+# split at a chunk boundary must reproduce the unsplit pass bit for bit, for both scan paths.
+add_executable(gdn_prefill_carry_gpu_test gdn_prefill_carry_gpu_test.cpp)
+target_link_libraries(gdn_prefill_carry_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME gdn_prefill_carry_gpu_test COMMAND gdn_prefill_carry_gpu_test)
+
 add_executable(logit_bias_gpu_test logit_bias_gpu_test.cpp)
 target_link_libraries(logit_bias_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME logit_bias_gpu_test COMMAND logit_bias_gpu_test)
