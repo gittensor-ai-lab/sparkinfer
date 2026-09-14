@@ -5845,6 +5845,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (fp4o_env)
             down_fp4_on = fp4o_env[0] == '1' || fp4o_env[0] == 'd';
         wo_fp4_on = wo_fp4_on && c.max_seq <= outputs_maxseq;
+        const bool down_eligible = down_fp4_on;
         // Cost EVERY copy that grows the footprint against the free VRAM that is actually there,
         // and drop legs in ascending order of what they are worth until the set fits. Only these
         // three grow it: gate/up convert and then release their native prefill copy, so they are
@@ -6015,6 +6016,31 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             if (ok && down_fp4_on &&
                 convert(lw.down_q, lw.down_qtype, H, c.moe_ffn,
                         &lw.down_fp4, &lw.down_fp4_sf)) ++down_ready;
+        }
+        // Where the whole down set cannot be held beside the legs that are worth more, hold as many
+        // layers of it as the VRAM left after everything else actually allows. The packed decode
+        // and the batched prefill both pick the down arm per layer, so a prefix set [0, n) is legal;
+        // it runs last so it can never take room a qkv-gate or o copy on a later layer needed.
+        // What it must leave is the runtime's own allocation after load, measured at ~576 MiB at 8
+        // sessions: a 512 MiB margin starves the batched-prefill scratch and halves throughput, so
+        // the default keeps 1024. SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB tunes it; 0 restores main.
+        static const long long down_keep_mb = [] {
+            const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB");
+            return e ? atoll(e) : 1024LL;
+        }();
+        if (ok && down_eligible && !down_fp4_on && down_keep_mb > 0) {
+            const size_t per_layer = kernels::prefill_nvfp4_data_bytes(H, c.moe_ffn) +
+                                     kernels::prefill_nvfp4_scale_bytes_b(H, c.moe_ffn);
+            const size_t keep = (size_t)down_keep_mb << 20;
+            const size_t tmp_bytes = tmp ? tmp_elems * sizeof(bf16) : 0;
+            for (int i = 0; i < c.n_layers; ++i) {
+                size_t f = 0, t = 0;
+                if (cudaMemGetInfo(&f, &t) != cudaSuccess || f + tmp_bytes <= per_layer + keep) break;
+                Qwen35LayerWeights& lw = s.w.layers[i];
+                if (!convert(lw.down_q, lw.down_qtype, H, c.moe_ffn, &lw.down_fp4, &lw.down_fp4_sf))
+                    break;
+                ++down_ready;
+            }
         }
         if (tmp) cudaFree(tmp);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj weights ready: %d/%d layers\n", wo_ready, c.n_layers);
