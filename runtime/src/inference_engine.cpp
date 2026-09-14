@@ -51,6 +51,11 @@ double request_timeout_s_config() {
 }  // namespace
 
 struct ContinuousBatchEngine::Job {
+    // Constrained decoding: the mask last uploaded for this job and the dense bias built from it. A
+    // step whose mask is unchanged -- most of free text -- uploads nothing.
+    std::vector<uint32_t> mask_bits;
+    std::vector<uint32_t> mask_next;
+    std::vector<float> mask_bias;
     uint64_t request_id = 0;
     Request req;
     uint64_t seq_id = 0;
@@ -159,18 +164,32 @@ bool ContinuousBatchEngine::apply_constraint_mask(Job& job) {
     // Far below any real logit, finite so temperature scaling and logsumexp stay finite too.
     static constexpr float kMasked = -1.0e9f;
     const int vocab = model_->config().vocab;
-    std::vector<uint32_t> bits((vocab + 31) / 32, 0xffffffffu);
-    job.req.constraint->fill_next_mask(bits.data(), vocab);
-    std::vector<float> bias(vocab, 0.f);
-    for (const auto& [id, value] : job.req.logit_bias)
-        if (id >= 0 && id < vocab) bias[id] = value;
+    const int words = (vocab + 31) / 32;
+    job.mask_next.assign(words, 0xffffffffu);
+    job.req.constraint->fill_next_mask(job.mask_next.data(), vocab);
+    if (vocab % 32) job.mask_next[words - 1] &= (1u << (vocab % 32)) - 1;
     bool any = false;
-    for (int id = 0; id < vocab; ++id) {
-        if ((bits[id / 32] >> (id % 32)) & 1) any = true;
-        else bias[id] = kMasked;
-    }
+    for (uint32_t w : job.mask_next)
+        if (w) { any = true; break; }
     if (!any) return false;
-    model_->set_logit_bias_dense(job.seq_id, bias.data());
+    const bool first = job.mask_bias.empty();
+    if (!first && job.mask_next == job.mask_bits) return true;   // already on the device
+    if (first) {
+        job.mask_bias.assign(vocab, 0.f);
+        job.mask_bits.assign(words, 0u);
+    }
+    // Rebuild only the words that changed: the request's own logit_bias where allowed, kMasked where not.
+    std::vector<float> user(0);
+    for (int w = 0; w < words; ++w) {
+        if (!first && job.mask_next[w] == job.mask_bits[w]) continue;
+        const int end = std::min(vocab, (w + 1) * 32);
+        for (int id = w * 32; id < end; ++id)
+            job.mask_bias[id] = ((job.mask_next[w] >> (id - w * 32)) & 1) ? 0.f : kMasked;
+    }
+    for (const auto& [id, value] : job.req.logit_bias)
+        if (id >= 0 && id < vocab && ((job.mask_next[id / 32] >> (id % 32)) & 1)) job.mask_bias[id] = value;
+    job.mask_bits.swap(job.mask_next);
+    model_->set_logit_bias_dense(job.seq_id, job.mask_bias.data());
     return true;
 }
 
