@@ -113,6 +113,21 @@ struct ToolCallGrammar {
 bool build_tool_call_grammar(const ChatRequest& request, bool enable_thinking, ToolCallGrammar& out,
                              std::string& err);
 
+// Grammar for response_format json_object / json_schema: optional reasoning, then one JSON value that
+// validate_response_format accepts for parse_plain_assistant_output's content. Same exactness
+// contract as ToolCallGrammar. False (err set) for a text response_format.
+bool build_response_format_grammar(const ChatRequest& request, bool enable_thinking, ToolCallGrammar& out,
+                                   std::string& err);
+
+// Reasoning and content of a Qwen turn without tools: with thinking on, reasoning up to the first
+// </think> and everything after it as content. parse_assistant_output's non-tool path; here so the
+// grammar that must agree with it can be tested without a tokenizer.
+struct PlainAssistantOutput {
+    std::string reasoning_content;
+    std::string content;
+};
+PlainAssistantOutput parse_plain_assistant_output(const std::string& raw, bool enable_thinking);
+
 // The opening of a native Qwen tool call that forces one: "<tool_call>\n<function=NAME>\n" for a
 // named function or for tool_choice=required with a single offered function, and
 // "<tool_call>\n<function=" for required with several (the model still writes the name, and can

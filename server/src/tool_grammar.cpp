@@ -4,6 +4,8 @@
 #include <xgrammar/xgrammar.h>
 
 #include <list>
+#include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <regex>
@@ -122,7 +124,11 @@ bool narrow_json_nodes(json& node, bool& exact, std::string& err) {
     if (node.is_object()) {
         if (node.value("type", "") == "json_schema" && node.contains("json_schema")) {
             std::string ebnf;
-            if (!json_value_ebnf(node["json_schema"].dump(), ebnf, exact, err)) return false;
+            const JsonStringGuard guard = !node.value("sparkinfer_json_mode", false) ? JsonStringGuard::kProtocolMarkup
+                                        : node.value("sparkinfer_forbid_think", false) ? JsonStringGuard::kThinkMarkers
+                                                                                       : JsonStringGuard::kNone;
+            if (!json_value_ebnf(node["json_schema"].dump(), ebnf, exact, err, guard, node.value("sparkinfer_strict", true)))
+                return false;
             node = json{{"type", "grammar"}, {"grammar", std::move(ebnf)}};
             return true;
         }
@@ -137,18 +143,87 @@ bool narrow_json_nodes(json& node, bool& exact, std::string& err) {
 
 }  // namespace
 
-bool json_value_ebnf(const std::string& schema_json, std::string& ebnf, bool& exact, std::string& err) {
+namespace {
+
+// EBNF rules for the rest of a JSON string after a raw '<', built from a trie of the guarded marker
+// suffixes: each node is the state "the string so far ends in '<' + prefix". A character that would
+// complete a marker is excluded; one that extends a marker prefix moves to that node; any other
+// character returns to the ordinary string body.
+std::string marker_guard_rules(const std::vector<std::string>& suffixes) {
+    struct Node {
+        std::string prefix;
+        std::map<char, int> children;
+        std::set<char> terminal;
+    };
+    std::vector<Node> nodes(1);
+    for (const std::string& s : suffixes) {
+        int at = 0;
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (i + 1 == s.size()) {
+                nodes[at].terminal.insert(s[i]);
+                break;
+            }
+            auto it = nodes[at].children.find(s[i]);
+            if (it == nodes[at].children.end()) {
+                nodes.push_back(Node{nodes[at].prefix + s[i], {}, {}});
+                it = nodes[at].children.emplace(s[i], (int)nodes.size() - 1).first;
+            }
+            at = it->second;
+        }
+    }
+    auto name = [](int i) { return i == 0 ? std::string("sparkinfer_lt") : "sparkinfer_lt_" + std::to_string(i); };
+    std::string out;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        std::string excluded = R"(\0-\x1f\"\\\r\n<)";
+        for (const auto& [c, _] : nodes[i].children) excluded.push_back(c);
+        for (char c : nodes[i].terminal) excluded.push_back(c);
+        out += name((int)i) + " ::= ((\"\\\"\") | (\"\\\\\" basic_escape basic_string_sub) | (\"<\" sparkinfer_lt) | ([^" +
+               excluded + "] basic_string_sub)";
+        for (const auto& [c, child] : nodes[i].children) out += " | (\"" + std::string(1, c) + "\" " + name(child) + ")";
+        out += ")\n";
+    }
+    return out;
+}
+
+}  // namespace
+
+bool json_value_ebnf(const std::string& schema_json, std::string& ebnf, bool& exact, std::string& err,
+                     JsonStringGuard guard, bool strict) {
     try {
         ebnf = xgrammar::Grammar::FromJSONSchema(schema_json, /*any_whitespace=*/true, /*indent=*/std::nullopt,
-                                                 /*separators=*/std::nullopt, /*strict_mode=*/true)
+                                                 /*separators=*/std::nullopt, /*strict_mode=*/strict)
                    .ToString();
     } catch (const std::exception& e) {
         err = std::string("schema has no grammar: ") + e.what();
         return false;
     }
+    // Numbers the strict reader can hold: a longer integer part or exponent overflows a double.
+    ebnf = replace_all(std::move(ebnf), R"(basic_number_2 ::= (("0") | ([1-9] [0-9]*)))",
+                       R"(basic_number_2 ::= (("0") | ([1-9] [0-9]{0,17})))");
+    ebnf = replace_all(std::move(ebnf), R"(basic_number_5 ::= ("" | ([eE] basic_number_4 basic_number_digits{1, -1})))",
+                       R"(basic_number_5 ::= ("" | ([eE] basic_number_4 basic_number_digits{1,2})))");
+    ebnf = replace_all(std::move(ebnf), R"(basic_integer ::= (("0") | (basic_integer_1 [1-9] [0-9]*)))",
+                       R"(basic_integer ::= (("0") | (basic_integer_1 [1-9] [0-9]{0,17})))");
     // xgrammar v0.2.6's two string character classes: unconstrained strings (which also take escapes)
-    // and length-limited ones (which take neither escapes nor, correctly, control characters).
-    ebnf = replace_all(std::move(ebnf), R"([^\0-\x1f\"\\\r\n])", R"([^\0-\x1f\"\\\r\n<])");
+    // and length-limited ones (which take no escapes but do take raw control characters).
+    if (guard == JsonStringGuard::kNone) {
+        ebnf = replace_all(std::move(ebnf), R"([^\"\\\r\n])", R"([^\0-\x1f\"\\])");
+        return true;
+    }
+    const std::vector<std::string> suffixes = guard == JsonStringGuard::kThinkMarkers
+        ? std::vector<std::string>{"think>", "/think>"}
+        : std::vector<std::string>{"tool", "/tool", "function", "/function", "parameter", "/parameter", "think",
+                                   "/think", "|im_"};
+    const std::string body_rule =
+        R"(basic_string_sub ::= (("\"") | ([^\0-\x1f\"\\\r\n] basic_string_sub) | ("\\" basic_escape basic_string_sub)))";
+    const std::string guarded_rule =
+        R"(basic_string_sub ::= (("\"") | ([^\0-\x1f\"\\\r\n<] basic_string_sub) | ("\\" basic_escape basic_string_sub) | ("<" sparkinfer_lt)))";
+    if (ebnf.find(body_rule) == std::string::npos) {
+        err = "unexpected JSON string rule in xgrammar's grammar";
+        return false;
+    }
+    ebnf = replace_all(std::move(ebnf), body_rule, guarded_rule);
+    ebnf += marker_guard_rules(suffixes);
     ebnf = replace_all(std::move(ebnf), R"([^\"\\\r\n])", R"([^\0-\x1f\"\\<])");
     // Any other negated class could still admit '<' or a control character (a pattern's, say).
     static const std::regex negated_class(R"(\[\^[^\]]*\])");

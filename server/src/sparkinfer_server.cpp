@@ -124,8 +124,10 @@ std::atomic<uint64_t> g_requests_invalid_tool_output{0};
 // function was first picked from the offered names (pick_function). Distinct from
 // invalid_tool_output -- these requests succeeded, and a rising rate means the model is resisting
 // the forced choice, not that calls are failing.
-// Tool-calling requests decoded under the tool-call grammar (constrained decoding).
+// Generations decoded under a grammar (constrained decoding): tool-calling turns, and
+// response_format json_object/json_schema output.
 std::atomic<uint64_t> g_tool_constrained{0};
+std::atomic<uint64_t> g_format_constrained{0};
 std::atomic<uint64_t> g_tool_forced_retry{0};
 std::atomic<uint64_t> g_tool_forced_pick{0};
 // 502 -- same rationale as g_requests_invalid_tool_output above, for response_format: the model
@@ -606,19 +608,20 @@ sparkinfer_server::ChatRequest build_retry_request(const sparkinfer_server::Chat
     return retry;
 }
 
-// A fresh constraint for one tool-calling generation -- constraints are stateful, so every branch and
-// retry gets its own. Null when the request is not constrained or its grammar fails to compile; the
-// generation then runs unconstrained, with the forced-prefix and retry fallback still in place.
-std::shared_ptr<sparkinfer::TokenConstraint> tool_call_constraint(bool active,
-                                                                  const sparkinfer_server::ToolCallGrammar& grammar) {
+// A fresh constraint for one generation -- constraints are stateful, so every branch and retry gets its
+// own. Null when the request is not constrained or its grammar fails to compile; the generation then
+// runs unconstrained, with the validation and retry fallbacks still in place.
+std::shared_ptr<sparkinfer::TokenConstraint> grammar_constraint(bool active,
+                                                                const sparkinfer_server::ToolCallGrammar& grammar,
+                                                                std::atomic<uint64_t>& counter) {
     if (!active || !g_tool_grammar) return nullptr;
     bool exact = grammar.exact;
     std::string err;
     auto constraint = g_tool_grammar->make_constraint(grammar.structural_tag, exact, err);
     if (!constraint)
-        fprintf(stderr, "[sparkinfer-server] tool-call grammar failed to compile: %s\n", err.c_str());
+        fprintf(stderr, "[sparkinfer-server] grammar failed to compile: %s\n", err.c_str());
     else
-        g_tool_constrained++;
+        counter++;
     return constraint;
 }
 
@@ -1075,6 +1078,9 @@ int main(int argc, char** argv) {
                 "# HELP sparkinfer_tool_calls_constrained_total Tool-calling generations decoded under the tool-call grammar\n"
                 "# TYPE sparkinfer_tool_calls_constrained_total counter\n"
              << "sparkinfer_tool_calls_constrained_total " << g_tool_constrained.load() << "\n"
+                "# HELP sparkinfer_structured_output_constrained_total response_format JSON generations decoded under a grammar\n"
+                "# TYPE sparkinfer_structured_output_constrained_total counter\n"
+             << "sparkinfer_structured_output_constrained_total " << g_format_constrained.load() << "\n"
                 "# HELP sparkinfer_tool_calls_forced_total Required/named tool calls the server forced after the model's attempt\n"
                 "# TYPE sparkinfer_tool_calls_forced_total counter\n"
              << "sparkinfer_tool_calls_forced_total{step=\"retry\"} " << g_tool_forced_retry.load() << "\n"
@@ -1404,6 +1410,21 @@ int main(int argc, char** argv) {
                          fprintf(stderr, "[sparkinfer-server] tool-call grammar approximates: %s\n",
                                  tool_grammar.approximation.c_str());
                  }
+                 // response_format json_object/json_schema under a grammar too: the output is the JSON
+                 // value validate_response_format accepts, not a hope checked afterwards.
+                 sparkinfer_server::ToolCallGrammar format_grammar;
+                 bool constrained_format = false;
+                 if (g_tool_grammar &&
+                     chat_request.response_format.type != sparkinfer_server::ResponseFormatType::kText) {
+                     std::string gerr;
+                     constrained_format = sparkinfer_server::build_response_format_grammar(
+                         chat_request, enable_thinking, format_grammar, gerr);
+                     if (!constrained_format)
+                         fprintf(stderr, "[sparkinfer-server] structured output unconstrained for this request: %s\n", gerr.c_str());
+                     else if (!format_grammar.exact)
+                         fprintf(stderr, "[sparkinfer-server] structured-output grammar approximates: %s\n",
+                                 format_grammar.approximation.c_str());
+                 }
                  // Fallback when the grammar is unavailable. tool_choice=required or a named function
                  // is a contract: the caller branches on tool_calls. Instructing the model is not
                  // enforcing it, so with thinking off the assistant turn starts inside the call and the
@@ -1511,7 +1532,7 @@ int main(int argc, char** argv) {
                           // shares its pixel buffers rather than owning them.
                           prepared,
                           chat_request, tool_protocol, json_mode_active,
-                          tool_grammar, constrained_tools,
+                          tool_grammar, constrained_tools, format_grammar, constrained_format,
                           dialect = stream_dialect_of(req),
                           ollama_generate =
                               req.get_header_value(kStreamDialectHeader) == "ollama-ndjson-generate",
@@ -1629,7 +1650,8 @@ int main(int argc, char** argv) {
                                      outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok,
                                          temperature, branch_seed, top_k, top_p, presence_penalty,
                                          frequency_penalty, logit_bias, false, 0, nullptr, {},
-                                         &cur_images);
+                                         &cur_images,
+                                         grammar_constraint(constrained_format, format_grammar, g_format_constrained));
                                      out->prompt_tokens += (long long)cur_prompt_ids.size();
                                      out->completion_tokens += (long long)ids.size();
                                      if (outcome.cancelled && !stopped_by_sequence) {
@@ -1783,7 +1805,7 @@ int main(int argc, char** argv) {
                                  const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
                                      logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob,
-                                     {}, &prepared, tool_call_constraint(tool_protocol && constrained_tools, tool_grammar));
+                                     {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained));
                                  out->prompt_tokens = (long long)prompt_ids.size();
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
@@ -2105,7 +2127,8 @@ int main(int argc, char** argv) {
                              outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok,
                                  controls.temperature, branch_seed, controls.top_k, controls.top_p,
                                  controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
-                                 false, 0, nullptr, {}, &cur_images);
+                                 false, 0, nullptr, {}, &cur_images,
+                                 grammar_constraint(constrained_format, format_grammar, g_format_constrained));
                              out.prompt_tokens += (long long)cur_prompt_ids.size();
                              out.completion_tokens += (long long)ids.size();
                              if (!outcome.error.empty()) {
@@ -2208,7 +2231,7 @@ int main(int argc, char** argv) {
                              controls.temperature, branch_seed, controls.top_k, controls.top_p,
                              controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
                              controls.logprobs, controls.top_logprobs, maybe_nonstream_on_tok_logprob,
-                             {}, &prepared, tool_call_constraint(tool_protocol && constrained_tools, tool_grammar));
+                             {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained));
                          // Defensive clamp -- should already hold, cheap insurance against any
                          // subtle off-by-one between the two accumulation paths above.
                          if (logprob_entries.size() > outcome.tokens.size())

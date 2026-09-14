@@ -2020,23 +2020,25 @@ bool approximate(ToolCallGrammar& grammar, const std::string& why);
 
 json merge_all_of(const json& root, json a, const json& b_in, ToolCallGrammar& grammar, const std::string& where);
 
+// xml_framing: the value travels inside the Qwen XML tool-call protocol, where a '<' it carries
+// verbatim can break the framing. False for response_format output, which has no framing.
 json normalize_for_grammar(const json& root, const json& schema, ToolCallGrammar& grammar, const std::string& where,
-                           int depth = 0) {
+                           int depth = 0, bool xml_framing = true) {
     if (!schema.is_object() || depth > 32) return schema;
     json s = schema;
     if (s.contains("allOf") && s["allOf"].is_array()) {
         json branches = s["allOf"];
         s.erase("allOf");
         for (const auto& branch : branches)
-            s = merge_all_of(root, std::move(s), normalize_for_grammar(root, resolve_refs_shallow(root, branch), grammar, where, depth + 1), grammar, where);
+            s = merge_all_of(root, std::move(s), normalize_for_grammar(root, resolve_refs_shallow(root, branch), grammar, where, depth + 1, xml_framing), grammar, where);
     }
     for (const char* key : {"items", "additionalProperties"})
-        if (s.contains(key) && s[key].is_object()) s[key] = normalize_for_grammar(root, s[key], grammar, where, depth + 1);
+        if (s.contains(key) && s[key].is_object()) s[key] = normalize_for_grammar(root, s[key], grammar, where, depth + 1, xml_framing);
     for (const char* key : {"anyOf", "oneOf", "prefixItems"})
         if (s.contains(key) && s[key].is_array())
-            for (auto& item : s[key]) item = normalize_for_grammar(root, item, grammar, where, depth + 1);
+            for (auto& item : s[key]) item = normalize_for_grammar(root, item, grammar, where, depth + 1, xml_framing);
     if (s.contains("properties") && s["properties"].is_object())
-        for (auto& item : s["properties"].items()) item.value() = normalize_for_grammar(root, item.value(), grammar, where, depth + 1);
+        for (auto& item : s["properties"].items()) item.value() = normalize_for_grammar(root, item.value(), grammar, where, depth + 1, xml_framing);
     // oneOf is anyOf when no value can satisfy two branches; types that cannot overlap prove it.
     if (s.contains("oneOf") && s["oneOf"].is_array()) {
         std::set<std::string> seen;
@@ -2087,13 +2089,23 @@ json normalize_for_grammar(const json& root, const json& schema, ToolCallGrammar
     }
     // Strings a JSON value would carry verbatim: markup there breaks the protocol framing.
     for (const char* key : {"enum", "const"}) {
-        if (!s.contains(key)) continue;
+        if (!xml_framing || !s.contains(key)) continue;
         const json values = std::string(key) == "enum" ? s[key] : json::array({s[key]});
         for (const auto& v : values)
             if (v.is_string() && v.get<std::string>().find('<') != std::string::npos)
                 approximate(grammar, where + ": an enum or const string contains '<'");
     }
     if (s.contains("pattern")) approximate(grammar, where + ": pattern inside a JSON value");
+    // An object that declares no properties takes any keys. xgrammar's strict mode would narrow it to
+    // {}, so allow them explicitly -- but no grammar can stop a key from repeating, which the strict
+    // JSON reader refuses.
+    if (schema_type_set(s).count("object") && s.contains("type") && !s.contains("properties") &&
+        !s.contains("additionalProperties")) {
+        s["additionalProperties"] = true;
+        approximate(grammar, where + ": a free-form object can repeat a key");
+    } else if (s.contains("additionalProperties") && !(s["additionalProperties"].is_boolean() && !s["additionalProperties"].get<bool>())) {
+        approximate(grammar, where + ": additional properties can repeat a key");
+    }
     return s;
 }
 
@@ -2344,6 +2356,110 @@ bool build_tool_call_grammar(const ChatRequest& request, bool enable_thinking, T
                        : st_sequence({st_free_text(), {{"type", "optional"}, {"content", std::move(call_list)}}});
     // Thinking on: the prompt ends inside <think>; the reasoning closes as the template renders it.
     if (enable_thinking) body = st_sequence({st_tag("", st_free_text(), std::string(kThinkClose) + "\n\n"), std::move(body)});
+    out.structural_tag = json{{"type", "structural_tag"}, {"format", std::move(body)}}.dump();
+    return true;
+}
+
+namespace {
+
+// parse_assistant_output's non-tool helpers, byte for byte.
+void plain_trim_leading(std::string& s) {
+    while (!s.empty() && (s[0] == '\n' || s[0] == '\r' || s[0] == ' ' || s[0] == '\t')) s.erase(0, 1);
+}
+
+void plain_trim_trailing(std::string& s) {
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t'))
+        s.pop_back();
+}
+
+void plain_strip_trailing_im_end(std::string& s) {
+    static const std::string kEnd = "<|im_end|>";
+    if (s.size() >= kEnd.size() && s.compare(s.size() - kEnd.size(), kEnd.size(), kEnd) == 0)
+        s.resize(s.size() - kEnd.size());
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+}
+
+std::string plain_strip_think_markers(std::string s) {
+    const size_t open_len = std::char_traits<char>::length(kThinkOpen);
+    const size_t close_len = std::char_traits<char>::length(kThinkClose);
+    for (;;) {
+        const size_t o = s.find(kThinkOpen);
+        if (o == std::string::npos) break;
+        const size_t c = s.find(kThinkClose, o + open_len);
+        if (c == std::string::npos) {
+            s.erase(o, open_len);
+            continue;
+        }
+        s.erase(o, c + close_len - o);
+    }
+    for (;;) {
+        const size_t c = s.find(kThinkClose);
+        if (c == std::string::npos) break;
+        s.erase(c, close_len);
+    }
+    return s;
+}
+
+}  // namespace
+
+PlainAssistantOutput parse_plain_assistant_output(const std::string& raw, bool enable_thinking) {
+    PlainAssistantOutput out;
+    if (!enable_thinking) {
+        out.content = raw;
+        plain_strip_trailing_im_end(out.content);
+        return out;
+    }
+    // The official Qwen3.6 generation prompt already ends in "<think>\n" when thinking is
+    // enabled, so generated text normally starts inside that block and contains only the
+    // closing marker. Accept a repeated opening marker defensively, but do not require one.
+    const size_t open = raw.find(kThinkOpen);
+    const size_t body_start = open == std::string::npos ? 0 : open + std::char_traits<char>::length(kThinkOpen);
+    const size_t close = raw.find(kThinkClose, body_start);
+    if (close != std::string::npos) {
+        out.reasoning_content = raw.substr(body_start, close - body_start);
+        out.content = raw.substr(close + std::char_traits<char>::length(kThinkClose));
+    } else {
+        out.reasoning_content = raw.substr(body_start);
+    }
+    plain_trim_leading(out.reasoning_content);
+    plain_trim_trailing(out.reasoning_content);
+    plain_trim_leading(out.content);
+    out.content = plain_strip_think_markers(std::move(out.content));
+    plain_strip_trailing_im_end(out.content);
+    return out;
+}
+
+bool build_response_format_grammar(const ChatRequest& request, bool enable_thinking, ToolCallGrammar& out,
+                                   std::string& err) {
+    out = ToolCallGrammar{};
+    const ResponseFormat& format = request.response_format;
+    if (format.type == ResponseFormatType::kText) return set_error(err, "response_format is text");
+    json value;
+    if (format.type == ResponseFormatType::kJsonObject) {
+        // Any object: json_object promises an object, and strict JSON is all validate_response_format checks.
+        value = {{"type", "json_schema"}, {"json_schema", {{"type", "object"}}},
+                 {"sparkinfer_json_mode", true}, {"sparkinfer_strict", false}, {"sparkinfer_forbid_think", enable_thinking}};
+        approximate(out, "response_format json_object: no grammar can stop an object key from repeating");
+    } else {
+        const json& root = format.schema;
+        json sub = normalize_for_grammar(root, root, out, "response_format", 0, /*xml_framing=*/false);
+        for (const char* defs : {"$defs", "definitions"}) {
+            if (!sub.contains(defs) || !sub[defs].is_object()) continue;
+            for (auto& item : sub[defs].items())
+                item.value() = normalize_for_grammar(root, item.value(), out,
+                                                     std::string("response_format ") + defs + "/" + item.key(),
+                                                     0, /*xml_framing=*/false);
+        }
+        value = {{"type", "json_schema"}, {"json_schema", std::move(sub)}, {"sparkinfer_json_mode", true},
+                 {"sparkinfer_forbid_think", enable_thinking}};
+    }
+    // Thinking on: reasoning closes as the template renders it, then the JSON value. Reasoning may not
+    // spell a think marker -- the content split keys on the first </think>.
+    json body = enable_thinking
+        ? st_sequence({st_tag("", json{{"type", "any_text"}, {"excludes", {"<think", "</think"}}},
+                              std::string(kThinkClose) + "\n\n"),
+                       std::move(value)})
+        : std::move(value);
     out.structural_tag = json{{"type", "structural_tag"}, {"format", std::move(body)}}.dump();
     return true;
 }

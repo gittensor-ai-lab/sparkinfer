@@ -438,30 +438,12 @@ ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable
         return out;
     }
 
+    // Lives in chat_tools.cpp so the response_format grammar that must agree with it is testable
+    // without a tokenizer.
+    PlainAssistantOutput plain = parse_plain_assistant_output(raw, enable_thinking);
     ParsedAssistantOutput out;
-    if (!enable_thinking) {
-        out.content = raw;
-        strip_trailing_im_end(out.content);
-        return out;
-    }
-
-    // The official Qwen3.6 generation prompt already ends in "<think>\n" when thinking is
-    // enabled, so generated text normally starts inside that block and contains only the
-    // closing marker. Accept a repeated opening marker defensively, but do not require one.
-    const size_t open = raw.find(kThinkOpen);
-    const size_t body_start = open == std::string::npos ? 0 : open + strlen(kThinkOpen);
-    const size_t close = raw.find(kThinkClose, body_start);
-    if (close != std::string::npos) {
-        out.reasoning_content = raw.substr(body_start, close - body_start);
-        out.content = raw.substr(close + strlen(kThinkClose));
-    } else {
-        out.reasoning_content = raw.substr(body_start);
-    }
-    trim_leading_ws(out.reasoning_content);
-    trim_trailing_ws(out.reasoning_content);
-    trim_leading_ws(out.content);
-    out.content = strip_think_markers(std::move(out.content));
-    strip_trailing_im_end(out.content);
+    out.reasoning_content = std::move(plain.reasoning_content);
+    out.content = std::move(plain.content);
     return out;
 }
 

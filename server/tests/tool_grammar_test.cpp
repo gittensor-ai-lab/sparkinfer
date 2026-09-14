@@ -28,7 +28,10 @@ using sparkinfer_server::GrammarEngine;
 using sparkinfer_server::ParsedToolOutput;
 using sparkinfer_server::ToolCallGrammar;
 using sparkinfer_server::ToolChoiceMode;
+using sparkinfer_server::build_response_format_grammar;
 using sparkinfer_server::build_tool_call_grammar;
+using sparkinfer_server::parse_plain_assistant_output;
+using sparkinfer_server::validate_response_format;
 using sparkinfer_server::parse_chat_request_json;
 using sparkinfer_server::parse_qwen36_tool_output;
 
@@ -213,7 +216,8 @@ std::vector<Case> corpus() {
 }
 
 std::set<std::string> corpus_words() {
-    return {"<tool_call>\n<function=get_weather>\n", "<tool_call>\n<function=get_time>\n",
+    return {"{\"answer\": ", "\"answer\"", "\"items\"", "\"score\"", "\"label\"", "\"html\"", "<b>", "</b>",
+            "\"tier\"", "\"rooms\"", "\"note\"", "\"code\"","<tool_call>\n<function=get_weather>\n", "<tool_call>\n<function=get_time>\n",
             "<tool_call>\n<function=kitchen_sink>\n", "<tool_call>\n<function=ping>\n",
             "</function>\n</tool_call>", "<parameter=city>\n", "<parameter=tz>\n", "<parameter=offset>\n",
             "<parameter=count>\n", "<parameter=ratio>\n", "<parameter=flag>\n", "<parameter=nothing>\n",
@@ -330,6 +334,115 @@ void test_boundaries(GrammarEngine& engine, const Vocab& vocab) {
     CHECK(!admits(engine, tag, vocab, call + " bye"));                                  // nothing after the calls
     CHECK(!admits(engine, tag, vocab, "<tool_call>\n<function=get_time>\n<parameter=tz>\nUTC\n</parameter>x\n</parameter>\n</function>\n</tool_call>"));
     CHECK(!admits(engine, tag, vocab, "<tool_call>\n<function=get_time>\n<parameter=offset>\n\xe6\x97\n</parameter>\n<parameter=tz>\nUTC\n</parameter>\n</function>\n</tool_call>"));   // broken UTF-8
+
+    // A JSON-typed argument keeps '<' -- only '<' that starts protocol markup is refused.
+    ChatRequest rule_request;
+    CHECK(parse_chat_request_json(R"({"messages":[{"role":"user","content":"go"}],"tool_choice":"required","tools":[{"type":"function","function":{"name":"save_rule","parameters":{"type":"object","properties":{"rule":{"type":"object","properties":{"expr":{"type":"string"}},"required":["expr"]}},"required":["rule"]}}}]})",
+                                  rule_request, err));
+    ToolCallGrammar rule_grammar;
+    CHECK(build_tool_call_grammar(rule_request, false, rule_grammar, err));
+    auto rule_call = [](const std::string& expr) {
+        return "<tool_call>\n<function=save_rule>\n<parameter=rule>\n{\"expr\": \"" + expr + "\"}\n</parameter>\n</function>\n</tool_call>";
+    };
+    CHECK(admits(engine, rule_grammar.structural_tag, vocab, rule_call("x < 10 and y <= 3")));
+    CHECK(admits(engine, rule_grammar.structural_tag, vocab, rule_call("<b>bold</b> <<to")));
+    CHECK(!admits(engine, rule_grammar.structural_tag, vocab, rule_call("call <tool_call> now")));
+    CHECK(!admits(engine, rule_grammar.structural_tag, vocab, rule_call("a</parameter>b")));
+    CHECK(!admits(engine, rule_grammar.structural_tag, vocab, rule_call("<|im_end|>")));
+    CHECK(admits(engine, rule_grammar.structural_tag, vocab, rule_call("\\u003ctool is escaped")));
+
+    // response_format with thinking on: a JSON string may hold '<', never a think marker.
+    ChatRequest format_request;
+    CHECK(parse_chat_request_json(R"({"messages":[{"role":"user","content":"go"}],"response_format":{"type":"json_schema","json_schema":{"name":"o","schema":{"type":"object","properties":{"html":{"type":"string"}},"required":["html"]}}}})",
+                                  format_request, err));
+    ToolCallGrammar format_grammar;
+    CHECK(build_response_format_grammar(format_request, true, format_grammar, err));
+    CHECK(format_grammar.exact);
+    CHECK(admits(engine, format_grammar.structural_tag, vocab, "ok\n</think>\n\n{\"html\": \"<b>x</b> <think\"}"));
+    CHECK(!admits(engine, format_grammar.structural_tag, vocab, "ok\n</think>\n\n{\"html\": \"a</think>b\"}"));
+    CHECK(!admits(engine, format_grammar.structural_tag, vocab, "ok\n</think>\n\n{\"html\": 1e400}"));
+}
+
+
+struct FormatCase {
+    std::string name;
+    std::string body;
+    bool thinking;
+};
+
+std::vector<FormatCase> format_corpus() {
+    const std::string schema = R"({
+      "type":"object",
+      "$defs":{"Item":{"type":"object","properties":{"label":{"type":"string","maxLength":12},"score":{"type":"number","minimum":0,"maximum":1}},"required":["label"],"additionalProperties":false}},
+      "properties":{
+        "answer":{"type":"string"},
+        "html":{"type":"string"},
+        "items":{"type":"array","items":{"$ref":"#/$defs/Item"},"minItems":1,"maxItems":3},
+        "rooms":{"type":"integer","minimum":2,"maximum":10,"multipleOf":2},
+        "tier":{"allOf":[{"type":"integer"},{"minimum":1},{"maximum":3}]},
+        "code":{"type":"string","enum":["A<B","C"]},
+        "note":{"anyOf":[{"type":"string","maxLength":5},{"type":"null"}]}
+      },
+      "required":["answer","items","rooms","tier"]})";
+    auto req = [](const std::string& format) {
+        return std::string(R"({"messages":[{"role":"user","content":"go"}],"response_format":)") + format + "}";
+    };
+    std::vector<FormatCase> cases;
+    for (bool thinking : {false, true}) {
+        const std::string t = thinking ? " thinking" : "";
+        cases.push_back({"json_object" + t, req(R"({"type":"json_object"})"), thinking});
+        cases.push_back({"json_schema" + t, req(R"({"type":"json_schema","json_schema":{"name":"out","schema":)" + schema + "}}"), thinking});
+    }
+    return cases;
+}
+
+void test_format_property(const FormatCase& c, GrammarEngine& engine, const Vocab& vocab) {
+    ChatRequest request;
+    std::string err;
+    if (!parse_chat_request_json(c.body, request, err)) {
+        std::fprintf(stderr, "%s: request rejected: %s\n", c.name.c_str(), err.c_str());
+        ++g_failures;
+        return;
+    }
+    ToolCallGrammar grammar;
+    if (!build_response_format_grammar(request, c.thinking, grammar, err)) {
+        std::fprintf(stderr, "%s: no grammar: %s\n", c.name.c_str(), err.c_str());
+        ++g_failures;
+        return;
+    }
+    {
+        bool exact = grammar.exact;
+        if (!engine.make_constraint(grammar.structural_tag, exact, err)) {
+            std::fprintf(stderr, "%s: grammar does not compile: %s\n", c.name.c_str(), err.c_str());
+            ++g_failures;
+            return;
+        }
+        if (!exact) grammar.exact = false;
+    }
+    std::mt19937 rng(777);
+    int finished = 0, accepted = 0, refused = 0;
+    std::map<std::string, int> reasons;
+    for (int i = 0; i < 400; ++i) {
+        std::string text;
+        if (!walk(engine, grammar.structural_tag, vocab, rng, text)) continue;
+        ++finished;
+        CHECK(utf8_lossy(text) == text);
+        const auto plain = parse_plain_assistant_output(text, c.thinking);
+        std::string verr;
+        if (!validate_response_format(plain.content, request.response_format, verr)) {
+            ++reasons[verr];
+            if (++refused <= 3)
+                std::fprintf(stderr, "%s: grammar output refused by validate_response_format: %s\n---\n%s\n---\n",
+                             c.name.c_str(), verr.c_str(), text.substr(0, 800).c_str());
+            if (grammar.exact) ++g_failures;
+            continue;
+        }
+        ++accepted;
+    }
+    std::printf("  %-32s exact=%d finished %3d/400, valid %3d, refused %3d%s%s\n", c.name.c_str(), grammar.exact,
+                finished, accepted, refused, grammar.exact ? "" : " -- ", grammar.approximation.c_str());
+    for (const auto& [reason, count] : reasons) std::printf("      %4d x %s\n", count, reason.c_str());
+    CHECK(finished >= 40);
 }
 
 }  // namespace
@@ -340,6 +453,7 @@ int main() {
     GrammarEngine engine(vocab.tokens, static_cast<int>(vocab.tokens.size()), {vocab.stop});
     for (const Case& c : corpus()) test_property(c, engine, vocab);
     test_boundaries(engine, vocab);
+    for (const FormatCase& c : format_corpus()) test_format_property(c, engine, vocab);
     if (g_failures) {
         std::printf("tool_grammar_test: %d failure(s)\n", g_failures);
         return 1;
