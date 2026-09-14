@@ -608,6 +608,21 @@ sparkinfer_server::ChatRequest build_retry_request(const sparkinfer_server::Chat
     return retry;
 }
 
+// SPARKINFER_LOG_TRUNCATED_OUTPUT=1: log the tail of a tool-calling or structured-output generation that
+// ran out of max_tokens or hit a stop sequence. Such a turn returns an empty message -- a partial call or
+// partial JSON is not an executable result -- so without this there is no way to see what the model was
+// doing when the budget ran out.
+void log_truncated_output(const char* where, const std::string& text) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_LOG_TRUNCATED_OUTPUT");
+        return e && e[0] == '1';
+    }();
+    if (!on) return;
+    const size_t keep = 1200;
+    const std::string tail = text.size() > keep ? text.substr(text.size() - keep) : text;
+    fprintf(stderr, "[sparkinfer-server] truncated %s output (%zu bytes), tail:\n%s\n[end]\n", where, text.size(), tail.c_str());
+}
+
 // A fresh constraint for one generation -- constraints are stateful, so every branch and retry gets its
 // own. Null when the request is not constrained or its grammar fails to compile; the generation then
 // runs unconstrained, with the validation and retry fallbacks still in place.
@@ -1681,6 +1696,7 @@ int main(int argc, char** argv) {
                                          text, enable_thinking, engine.is_museglimmer(), nullptr);
                                      const bool truncated = outcome.reached_token_limit || stopped_by_sequence;
                                      if (truncated) {
+                                         log_truncated_output("structured-output", text);
                                          validation_err = outcome.reached_token_limit
                                              ? "truncated: hit max_tokens before producing valid output"
                                              : "truncated: hit a stop sequence before producing valid output";
@@ -1866,6 +1882,7 @@ int main(int argc, char** argv) {
                                      }
                                      if (!out->parsed.error.empty()) {
                                          if (truncated) {
+                                             log_truncated_output("tool-call (stream)", text);
                                              // A truncated native call is not an executable result,
                                              // but token exhaustion (or a stop sequence landing mid
                                              // tool-call XML) is still a normal completion.
@@ -2161,6 +2178,7 @@ int main(int argc, char** argv) {
                              // it's a normal validation failure subject to the same retry policy.
                              const bool truncated = outcome.reached_token_limit || stopped_by_sequence;
                              if (truncated) {
+                                 log_truncated_output("structured-output", text);
                                  validation_err = outcome.reached_token_limit
                                      ? "truncated: hit max_tokens before producing valid output"
                                      : "truncated: hit a stop sequence before producing valid output";
@@ -2294,6 +2312,7 @@ int main(int argc, char** argv) {
                          }
                          if (!parsed.error.empty()) {
                              if (truncated) {
+                                 log_truncated_output("tool-call", text);
                                  // Never expose a truncated native tag sequence. A length/stop end
                                  // is a valid completion, so return an empty assistant result
                                  // instead of a hard failure.
