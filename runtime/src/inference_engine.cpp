@@ -81,6 +81,15 @@ struct ContinuousBatchEngine::Job {
     double ttft_ms = -1.0;
     double generation_ms = -1.0;
     double decode_tps = -1.0;
+
+    // Prefix cache: tokens this job started from rather than prefilled, and the recurrent-state
+    // snapshots taken at req.cache_checkpoints (offered to the cache in finish_job_impl).
+    int cached_tokens = 0;
+    struct Checkpoint {
+        int pos = 0;
+        Qwen35Model::RecurrentStateSnapshot state;
+    };
+    std::vector<Checkpoint> checkpoints;
 };
 
 ContinuousBatchEngine::ContinuousBatchEngine(Qwen35Model* model, KVCacheManager* kv,
@@ -157,6 +166,15 @@ int ContinuousBatchEngine::num_free_kv_blocks() const { return kv_->num_free_blo
 
 int ContinuousBatchEngine::max_queue_depth() const { return max_queue_depth_config(); }
 
+void ContinuousBatchEngine::enable_prefix_cache(const PrefixCache::Limits& limits) {
+    std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+    if (!prefix_cache_) prefix_cache_ = std::make_unique<PrefixCache>(kv_, limits);
+}
+
+PrefixCache::Stats ContinuousBatchEngine::prefix_cache_stats() const {
+    return prefix_cache_ ? prefix_cache_->stats() : PrefixCache::Stats{};
+}
+
 uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(int)>& on_token,
                                               const std::function<void(const Qwen35Model::TokenLogprob&)>& on_token_logprob,
                                               EnqueueError* err_out) {
@@ -213,9 +231,40 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
             model_->reset_penalty_counts(seq_id);   // session 0 is shared across unrelated requests
             model_->set_logit_bias(seq_id, job.req.logit_bias);   // same reason
         } else {
+            // Automatic prefix cache: start from the longest cached prefix of this prompt, sharing
+            // its KV blocks and restoring its recurrent state, so prefill covers only the rest.
+            const bool cache_eligible = prefix_cache_ && job.req.prefix_cache &&
+                                        job.req.forced_tokens.empty() && job.req.vision_pos.empty();
+            PrefixCache::Hit hit;
+            if (cache_eligible) hit = prefix_cache_->lookup(job.req.prompt);
             bool alloc_failed = false;
-            seq_id = model_->open_session(budget, &alloc_failed);
+            auto open = [&](const PrefixCache::Hit& h) {
+                return model_->open_session(budget, &alloc_failed, h.tokens > 0 ? &h.blocks : nullptr);
+            };
+            seq_id = open(hit);
+            if (!seq_id && !alloc_failed && prefix_cache_) {
+                // The pool is full, possibly with blocks only the cache still holds. Evict and try
+                // once more. The lookup is redone: eviction may have released the hit itself.
+                const int bs = kv_->block_size();
+                if (prefix_cache_->evict_for((budget + bs - 1) / bs)) {
+                    hit = cache_eligible ? prefix_cache_->lookup(job.req.prompt) : PrefixCache::Hit{};
+                    seq_id = open(hit);
+                }
+            }
             if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
+            if (hit.tokens > 0) {
+                if (model_->restore_recurrent_state(seq_id, hit.state)) {
+                    job.req.prefill_start = hit.tokens;
+                    job.cached_tokens = hit.tokens;
+                } else {
+                    // Shared KV with anything but its own recurrent state is wrong output, not a
+                    // slow path. Fall back to a plain session and recompute the whole prompt.
+                    model_->close_session(seq_id);
+                    alloc_failed = false;
+                    seq_id = model_->open_session(budget, &alloc_failed);
+                    if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
+                }
+            }
             model_->reset_penalty_counts(seq_id);   // explicit, not relying on open_session's internal zero
             model_->set_logit_bias(seq_id, job.req.logit_bias);    // same reason
         }
@@ -253,6 +302,7 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     out.ttft_ms = it->second->ttft_ms;
     out.generation_ms = it->second->generation_ms;
     out.decode_tps = it->second->decode_tps;
+    out.cached_tokens = it->second->cached_tokens;
     jobs_.erase(it);
     return out;
 }
@@ -338,6 +388,20 @@ void ContinuousBatchEngine::worker_loop() {
 void ContinuousBatchEngine::finish_job_impl(Job& j) {
     j.done = true;
     if (j.seq_id != 0) {
+        // Offer each checkpointed prefix before this session's own references to its blocks go.
+        // Only once prefill has finished and nothing failed: the KV for [0, checkpoint) was
+        // written before the snapshot was taken, but a job that errored may have left the device
+        // in a state not worth caching.
+        if (prefix_cache_ && !j.checkpoints.empty() && j.phase != SeqPhase::PREFILL && j.error.empty()) {
+            std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+            for (Job::Checkpoint& cp : j.checkpoints) {
+                std::vector<int> blocks = kv_->retain_prefix_blocks(j.seq_id, cp.pos / kv_->block_size());
+                if (!blocks.empty())
+                    prefix_cache_->insert(std::vector<int>(j.req.prompt.begin(), j.req.prompt.begin() + cp.pos),
+                                          std::move(blocks), std::move(cp.state));
+            }
+        }
+        j.checkpoints.clear();   // release the pinned copies now
         // Offer this session's KV to the external cache tier (docs/lmcache_bridge_protocol.md)
         // only once the full prompt has actually been ingested -- j.phase only advances past
         // PREFILL once prefill_pos reaches the prompt's end (see step_job). A job
@@ -595,8 +659,32 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         // this, a text-only request arriving after an image request on the same model would
         // inherit the image's rotary shift and silently decode at the wrong positions.
         if (job.req.mrope_pos.empty()) model_->reset_mrope_offset();
-        const int seed = model_->ingest_prompt_range(job.req.prompt.data(), job.prefill_pos, n,
-                                                      chunk_limit, &out_pos, want_seed_logprob);
+        // Prefix-cache checkpoints: prefill up to each one past the cached prefix, snapshot the
+        // recurrent state there, and continue. Entries are offered to the cache only when the job
+        // retires (finish_job_impl), once the prompt's KV is known to be complete. Every range that
+        // starts past zero continues KV and recurrent state already in place -- a restored prefix,
+        // an earlier checkpoint segment, or an earlier chunk -- so it may take the batched path.
+        int pos = job.prefill_pos;
+        if (prefix_cache_ && job.req.prefix_cache && !has_vision && job.req.forced_tokens.empty()) {
+            for (int ckpt : job.req.cache_checkpoints) {
+                if (ckpt <= pos || ckpt >= n || ckpt % kv_->block_size() != 0) continue;
+                int mid = pos;
+                model_->ingest_prompt_range(job.req.prompt.data(), pos, ckpt, 0, &mid, false,
+                                            /*allow_batched_resume=*/pos > 0);
+                pos = mid;
+                if (mid != ckpt) break;
+                Job::Checkpoint cp;
+                cp.pos = ckpt;
+                if (model_->snapshot_recurrent_state(job.seq_id, cp.state))
+                    job.checkpoints.push_back(std::move(cp));
+            }
+        }
+        out_pos = pos;
+        const int seed = model_->ingest_prompt_range(job.req.prompt.data(), pos, n, chunk_limit,
+                                                      &out_pos, want_seed_logprob,
+                                                      /*allow_batched_resume=*/pos > 0 &&
+                                                          (pos != job.prefill_pos ||
+                                                           job.cached_tokens > 0));
         if (has_vision) model_->clear_pending_vision();
         // Positions are consumed by the prefill they were staged for; the offset is not cleared
         // here, by design.

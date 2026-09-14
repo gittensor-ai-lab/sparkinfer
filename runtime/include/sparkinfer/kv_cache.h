@@ -86,6 +86,24 @@ public:
     // allocate()/free()/truncate_blocks() call for this seq_id.
     const std::vector<int>& physical_block_ids(uint64_t seq_id) const;
 
+    // PREFIX SHARING. Physical blocks are reference-counted, so one block can have several holders
+    // at once: the sequence that wrote it, a prefix-cache entry that retained it, and any later
+    // sequence that starts from that prefix. A block returns to the pool only when its last holder
+    // lets go. Shared blocks are READ-ONLY by contract -- a sequence built on a prefix starts
+    // writing at prefix.size() * block_size() -- so no copy-on-write is needed.
+    //
+    // Retain seq_id's first n_blocks physical blocks (+1 each) and return them in logical order, for
+    // a holder that is not a sequence (it takes no block-table row). Empty, retaining nothing, when
+    // seq_id is unknown or has fewer blocks.
+    std::vector<int> retain_prefix_blocks(uint64_t seq_id, int n_blocks);
+    // Drop one reference from each block; any that reach zero go back to the pool.
+    void release_blocks(const std::vector<int>& physical_ids);
+    // allocate() for a seq_id that has no blocks yet, whose first logical blocks ARE `prefix`
+    // (shared, +1 each); only the remainder of num_tokens comes from the pool. False, changing
+    // nothing, when seq_id already has blocks, a prefix block is not live, prefix is longer than
+    // num_tokens needs, or the pool cannot cover the rest.
+    bool allocate_with_prefix(uint64_t seq_id, const std::vector<int>& prefix, int num_tokens);
+
     // Device pointers to K and V storage pools (base = the first slot).
     // Per-layer pointer = (bf16*)k_pool() + layer_base_elems(layer) -- NOT layer * layer_stride,
     // which is only the same thing while the pool is uncompacted.

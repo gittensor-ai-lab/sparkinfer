@@ -294,6 +294,56 @@ Each `/v1/chat/completions` call is submitted to `ContinuousBatchEngine`, which:
 Shared prefix cache still works: when the chat prompt starts with configured prefix tokens,
 `cache_prefix()` warms session 0 and only the suffix is prefilled per request.
 
+### Automatic prefix cache
+
+Chat and agent clients resend the whole conversation on every turn. With the prefix cache on (the
+default), a request whose prompt starts with an earlier request's prompt reuses that work: its KV
+blocks are shared, not copied, and only the rest of the prompt is prefilled. Responses report the
+reused count as `usage.prompt_tokens_details.cached_tokens`.
+
+Measured on an RTX 5090, Qwen3.8-27B NVFP4, `--ctx 32768`, an 11.5K-token system prompt:
+
+| | cache on | cache off |
+|---|--:|--:|
+| time to first token, turns 2-4 of one conversation | **249-313 ms** | 834-1,592 ms |
+| 12 concurrent conversations on that system prompt | **12/12 served** | 2/12 (10 x `429`) |
+
+The second row is the KV pool: a conversation on a cached system prompt allocates blocks only for
+its own suffix, so twelve fit where two did before.
+
+How an entry is made. KV can be cut at any block, but Qwen3.8's 48 Gated-DeltaNet layers carry a
+recurrent state that exists only at the position the sequence is at. So prefill stops at up to two
+**checkpoints**, each rounded down to a 16-token KV block, and copies that state to pinned host
+memory there:
+
+- the **first** `<|im_start|>` at least `SPARKINFER_PREFIX_CACHE_MIN_TOKENS` in -- for a chat, the end
+  of the system prompt (and tool definitions), which every conversation using it shares;
+- the **last** `<|im_start|>` -- the start of the final assistant turn, where the same conversation's
+  next request stops matching.
+
+A checkpoint the request's own cache hit already covers is skipped, so a system prompt is
+snapshotted once, not per request. When the request completes, each prefix and its snapshot become
+a cache entry. Sharing the system prompt's blocks also raises how many long-prompt requests fit in
+the KV pool at once: a conversation on a cached system prompt needs blocks only for its own suffix.
+
+What is never cached: `/v1/score` (its numbers must not depend on another request) and requests
+with images or video (the cache keys on token ids, and every image's placeholder tokens are the
+same ids).
+
+Memory. Entries hold KV blocks (capped at half the pool) and snapshots in host RAM
+(`SPARKINFER_PREFIX_CACHE_HOST_MB`). When a new request cannot get KV blocks, least-recently-used
+entries are evicted before it is refused. `/metrics` reports `sparkinfer_prefix_cache_*` hits,
+reused tokens, evictions, entries, blocks and host bytes.
+
+A cached request prefills in two passes -- up to the checkpoint and after it -- instead of one. The
+second pass sits as close to the token-by-token reference as the single pass does (tail lengths
+15-4,111 tokens, same top-1 token throughout). Outputs still vary by the few tenths of a nat any two
+default-mode runs vary by (see **Determinism**); under `SPARKINFER_DETERMINISTIC=1` the cache is off,
+because a request's output must not depend on what earlier requests cached.
+`runtime/examples/prefix_resume_check.cpp` measures both, and checks a cache hit reproduces an
+uncached resume bit for bit in deterministic mode.
+
+
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SPARKINFER_BATCH_TOKENS` | `64` | Scheduler token budget per step (decode packing) |
@@ -313,6 +363,10 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_TOKENIZER_URL` | Qwen3.6-35B-A3B tokenizer | Override tokenizer download |
 | `SPARKINFER_SERVER_PREFIX_TOKEN_FILE` | — | JSON `[id,...]` warmed via `cache_prefix` each request |
 | `SPARKINFER_SERVER_PREFIX_TOKEN_IDS` | — | Comma-separated token ids (same as above) |
+| `SPARKINFER_PREFIX_CACHE` | `1` | Automatic prefix cache (see **Automatic prefix cache**). `0` disables; `SPARKINFER_DETERMINISTIC=1` also disables it. |
+| `SPARKINFER_PREFIX_CACHE_ENTRIES` | `32` | Most cached prefixes held at once; least-recently-used is evicted. |
+| `SPARKINFER_PREFIX_CACHE_HOST_MB` | `8192` | Pinned host memory for recurrent-state snapshots (~205 MB each on Qwen3.8-27B; none on Muse Glimmer). |
+| `SPARKINFER_PREFIX_CACHE_MIN_TOKENS` | `1024` | Shortest prompt position a request checkpoints at. Shorter prompts still reuse cached prefixes but do not create one. |
 | `SPARKINFER_PREFILL_BATCHED` | `1` | Batched prefill in `cache_prefix` / cold prompts |
 | `SPARKINFER_DETERMINISTIC` | `0` | `1` = bit-reproducible output (see **Determinism** above). Decode speed unchanged; TTFT +2–8%. |
 | `SPARKINFER_MAX_OUTPUT_TOKENS` | `4096` | Per-request generation cap (independent of context length, which is checked separately against the live `--ctx`) |

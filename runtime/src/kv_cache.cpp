@@ -53,6 +53,19 @@ struct KVCacheManager::Impl {
     void* v_scale = nullptr;
     int* d_block_tables = nullptr;   // [kMaxSeqs, max_blocks_per_seq]
     std::vector<int> free_list;
+    // Holders per physical block: every sequence listing it plus every retained list (prefix
+    // cache entries). A block is on free_list exactly when its count is zero.
+    std::vector<int> refs;
+
+    void unref(int b) {
+        if (b < 0 || b >= (int)refs.size() || refs[b] <= 0) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true))
+                fprintf(stderr, "[kv] released block %d that has no holder -- refcount bug\n", b);
+            return;
+        }
+        if (--refs[b] == 0) free_list.push_back(b);
+    }
     std::unordered_map<uint64_t, std::vector<int>> seq_blocks;
     std::unordered_map<uint64_t, int> seq_slot;   // seq_id -> row in d_block_tables
     std::vector<int> free_slots;
@@ -103,6 +116,7 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
 
     impl_->free_list.reserve(impl_->total_blocks);
     for (int i = impl_->total_blocks - 1; i >= 0; --i) impl_->free_list.push_back(i);
+    impl_->refs.assign(impl_->total_blocks, 0);
     for (int i = kMaxSeqs - 1; i >= 0; --i) impl_->free_slots.push_back(i);
 }
 
@@ -136,8 +150,10 @@ bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
     }
 
     for (int i = 0; i < grow; i++) {
-        blocks.push_back(impl_->free_list.back());
+        const int b = impl_->free_list.back();
         impl_->free_list.pop_back();
+        impl_->refs[b] = 1;
+        blocks.push_back(b);
     }
 
     cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * impl_->max_blocks_per_seq, blocks.data(),
@@ -163,7 +179,7 @@ bool KVCacheManager::truncate_blocks(uint64_t seq_id, int keep_blocks) {
     auto& blocks = it->second;
     if ((int)blocks.size() <= keep_blocks) return true;
     while ((int)blocks.size() > keep_blocks) {
-        impl_->free_list.push_back(blocks.back());
+        impl_->unref(blocks.back());
         blocks.pop_back();
     }
     auto sit = impl_->seq_slot.find(seq_id);
@@ -176,11 +192,60 @@ bool KVCacheManager::truncate_blocks(uint64_t seq_id, int keep_blocks) {
 void KVCacheManager::free(uint64_t seq_id) {
     auto it = impl_->seq_blocks.find(seq_id);
     if (it != impl_->seq_blocks.end()) {
-        for (int b : it->second) impl_->free_list.push_back(b);
+        for (int b : it->second) impl_->unref(b);
         impl_->seq_blocks.erase(it);
     }
     auto s = impl_->seq_slot.find(seq_id);
     if (s != impl_->seq_slot.end()) { impl_->free_slots.push_back(s->second); impl_->seq_slot.erase(s); }
+}
+
+std::vector<int> KVCacheManager::retain_prefix_blocks(uint64_t seq_id, int n_blocks) {
+    std::vector<int> out;
+    auto it = impl_->seq_blocks.find(seq_id);
+    if (n_blocks <= 0 || it == impl_->seq_blocks.end() || (int)it->second.size() < n_blocks) return out;
+    out.assign(it->second.begin(), it->second.begin() + n_blocks);
+    for (int b : out) impl_->refs[b]++;
+    return out;
+}
+
+void KVCacheManager::release_blocks(const std::vector<int>& physical_ids) {
+    for (int b : physical_ids) impl_->unref(b);
+}
+
+bool KVCacheManager::allocate_with_prefix(uint64_t seq_id, const std::vector<int>& prefix, int num_tokens) {
+    if (prefix.empty()) return allocate(seq_id, num_tokens);
+    const int need = (num_tokens + impl_->cfg.block_size - 1) / impl_->cfg.block_size;
+    if (need > impl_->max_blocks_per_seq || (int)prefix.size() > need) return false;
+    auto existing = impl_->seq_blocks.find(seq_id);
+    if (existing != impl_->seq_blocks.end() && !existing->second.empty()) return false;
+    // A block nobody holds is back on the free list and may already belong to someone else.
+    for (int b : prefix)
+        if (b < 0 || b >= impl_->total_blocks || impl_->refs[b] <= 0) return false;
+    const int grow = need - (int)prefix.size();
+    if ((int)impl_->free_list.size() < grow) return false;
+
+    int slot;
+    auto sit = impl_->seq_slot.find(seq_id);
+    if (sit != impl_->seq_slot.end()) slot = sit->second;
+    else {
+        if (impl_->free_slots.empty()) return false;
+        slot = impl_->free_slots.back();
+        impl_->free_slots.pop_back();
+        impl_->seq_slot[seq_id] = slot;
+    }
+
+    auto& blocks = impl_->seq_blocks[seq_id];
+    blocks = prefix;
+    for (int b : prefix) impl_->refs[b]++;
+    for (int i = 0; i < grow; i++) {
+        const int b = impl_->free_list.back();
+        impl_->free_list.pop_back();
+        impl_->refs[b] = 1;
+        blocks.push_back(b);
+    }
+    cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * impl_->max_blocks_per_seq, blocks.data(),
+                  blocks.size() * sizeof(int), cudaMemcpyHostToDevice), "copy shared block table");
+    return true;
 }
 
 int* KVCacheManager::block_table(uint64_t seq_id) const {

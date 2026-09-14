@@ -78,6 +78,12 @@ add_executable(logit_bias_gpu_test logit_bias_gpu_test.cpp)
 target_link_libraries(logit_bias_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME logit_bias_gpu_test COMMAND logit_bias_gpu_test)
 
+# Prefix sharing in the paged KV pool (refcounted blocks) and the PrefixCache on top of it: every
+# free-block count is exact, so a leaked or prematurely freed block fails a specific line.
+add_executable(prefix_cache_gpu_test prefix_cache_gpu_test.cpp)
+target_link_libraries(prefix_cache_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME prefix_cache_gpu_test COMMAND prefix_cache_gpu_test)
+
 # Real sidecar subprocess + real KV cache + a small synthetic model on real hardware -- the one
 # place both halves of the LMCache bridge run together against the real model code path. Skips
 # (not fails) unless SPARKINFER_LMCACHE_PYTHON/_BRIDGE_SCRIPT point at a real lmcache+torch venv

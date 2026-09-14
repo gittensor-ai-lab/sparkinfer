@@ -476,7 +476,7 @@ bool write_stream_finish(GuardedSink& gs, const std::string& cid, long long crea
 bool write_stream_usage(GuardedSink& gs, const std::string& cid, long long created,
                         int prompt_tokens, int completion_tokens, double ttft_ms,
                         double generation_ms, double decode_tps,
-                        const char* object = "chat.completion.chunk") {
+                        const char* object = "chat.completion.chunk", int cached_tokens = -1) {
     auto chunk = stream_chunk_base(cid, created, object);
     chunk["choices"] = nlohmann::json::array();
     nlohmann::json usage = {{"prompt_tokens", prompt_tokens},
@@ -485,6 +485,8 @@ bool write_stream_usage(GuardedSink& gs, const std::string& cid, long long creat
     if (ttft_ms >= 0.0) usage["ttft_ms"] = ttft_ms;
     if (generation_ms >= 0.0) usage["generation_ms"] = generation_ms;
     if (decode_tps >= 0.0) usage["decode_tps"] = decode_tps;
+    // OpenAI's own field for prompt-cache hits; -1 (text completions) leaves it out.
+    if (cached_tokens >= 0) usage["prompt_tokens_details"] = {{"cached_tokens", cached_tokens}};
     chunk["usage"] = std::move(usage);
     return write_sse_json(gs, chunk);
 }
@@ -685,6 +687,11 @@ int main(int argc, char** argv) {
     }
     g_tokenizer.set_museglimmer(engine.is_museglimmer());
     g_tokenizer.set_qwen38(engine.is_qwen38());
+    // Turn boundary for the automatic prefix cache: a request checkpoints at its last <|im_start|>.
+    {
+        const std::vector<int> ims = g_tokenizer.encode_raw("<|im_start|>");
+        if (ims.size() == 1) engine.set_prefix_cache_boundary_token(ims[0]);
+    }
 
     const std::vector<int> prefix_ids = load_prefix_token_ids();
     if (!prefix_ids.empty()) {
@@ -890,6 +897,30 @@ int main(int argc, char** argv) {
                     "degradation invariant, all three fall back to the same recompute path)\n"
                     "# TYPE sparkinfer_lmcache_lookup_misses_total counter\n"
                  << "sparkinfer_lmcache_lookup_misses_total " << lmc.lookup_misses << "\n";
+        }
+        const auto pc = engine.prefix_cache_stats();
+        if (pc.enabled) {
+            body << "# HELP sparkinfer_prefix_cache_lookups_total Requests that looked for a cached prefix\n"
+                    "# TYPE sparkinfer_prefix_cache_lookups_total counter\n"
+                 << "sparkinfer_prefix_cache_lookups_total " << pc.lookups << "\n"
+                 << "# HELP sparkinfer_prefix_cache_hits_total Requests that started from a cached prefix\n"
+                    "# TYPE sparkinfer_prefix_cache_hits_total counter\n"
+                 << "sparkinfer_prefix_cache_hits_total " << pc.hits << "\n"
+                 << "# HELP sparkinfer_prefix_cache_tokens_reused_total Prompt tokens served from the cache instead of prefilled\n"
+                    "# TYPE sparkinfer_prefix_cache_tokens_reused_total counter\n"
+                 << "sparkinfer_prefix_cache_tokens_reused_total " << pc.tokens_reused << "\n"
+                 << "# HELP sparkinfer_prefix_cache_evictions_total Cached prefixes evicted\n"
+                    "# TYPE sparkinfer_prefix_cache_evictions_total counter\n"
+                 << "sparkinfer_prefix_cache_evictions_total " << pc.evictions << "\n"
+                 << "# HELP sparkinfer_prefix_cache_entries Cached prefixes held\n"
+                    "# TYPE sparkinfer_prefix_cache_entries gauge\n"
+                 << "sparkinfer_prefix_cache_entries " << pc.entries << "\n"
+                 << "# HELP sparkinfer_prefix_cache_kv_blocks KV blocks held by cached prefixes\n"
+                    "# TYPE sparkinfer_prefix_cache_kv_blocks gauge\n"
+                 << "sparkinfer_prefix_cache_kv_blocks " << pc.blocks << "\n"
+                 << "# HELP sparkinfer_prefix_cache_host_bytes Pinned host memory held by recurrent-state snapshots\n"
+                    "# TYPE sparkinfer_prefix_cache_host_bytes gauge\n"
+                 << "sparkinfer_prefix_cache_host_bytes " << pc.host_bytes << "\n";
         }
         res.set_content(body.str(), "text/plain; version=0.0.4");
     });
@@ -1318,6 +1349,7 @@ int main(int argc, char** argv) {
                                                     invalid_tool_output } fail = Fail::none;
                                  std::string fail_message;
                                  long long prompt_tokens = 0, completion_tokens = 0;
+                                 int cached_tokens = 0;   // prompt tokens served from the prefix cache
                                  double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                                  // Only populated on the json_mode_active/tool_protocol sub-paths
                                  // -- used to replay an already-buffered result to a deduped index
@@ -1386,7 +1418,7 @@ int main(int argc, char** argv) {
                                          temperature, branch_seed, top_k, top_p, presence_penalty,
                                          frequency_penalty, logit_bias, false, 0, nullptr, {},
                                          &cur_images);
-                                     out->prompt_tokens += (long long)cur_prompt_ids.size();
+                                     out->prompt_tokens += (long long)cur_prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                      out->completion_tokens += (long long)ids.size();
                                      if (outcome.cancelled && !stopped_by_sequence) {
                                          out->fail = BranchOutcome::Fail::cancelled;
@@ -1540,7 +1572,7 @@ int main(int argc, char** argv) {
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
                                      logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob,
                                      {}, &prepared);
-                                 out->prompt_tokens = (long long)prompt_ids.size();
+                                 out->prompt_tokens = (long long)prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
                                      out->fail = BranchOutcome::Fail::cancelled;
@@ -1728,7 +1760,8 @@ int main(int argc, char** argv) {
                                  // timing isn't meaningful for a hard engine error, so omit those.
                                  if (include_usage)
                                      write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
-                                                        (int)agg_completion, -1.0, -1.0, -1.0);
+                                                        (int)agg_completion, -1.0, -1.0, -1.0,
+                                                        "chat.completion.chunk", (int)results[0].cached_tokens);
                                  heartbeat.stop();
                                  write_stream_done(gs);
                                  sink.done();
@@ -1748,7 +1781,8 @@ int main(int argc, char** argv) {
                                  // intentionally diverges from g_prompt_tokens_total above, which
                                  // sums real per-branch prefill cost; see plan for why.
                                  write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
-                                                    (int)agg_completion, ttft_min, gen_max, decode_tps_agg);
+                                                    (int)agg_completion, ttft_min, gen_max, decode_tps_agg,
+                                                    "chat.completion.chunk", (int)results[0].cached_tokens);
                              heartbeat.stop();
                              write_stream_done(gs);
                              sink.done();
@@ -1778,6 +1812,7 @@ int main(int argc, char** argv) {
                      std::string finish_reason;
                      nlohmann::json logprobs_json = nullptr;
                      long long prompt_tokens = 0, completion_tokens = 0;
+                                 int cached_tokens = 0;   // prompt tokens served from the prefix cache
                      double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                  };
 
@@ -1834,7 +1869,7 @@ int main(int argc, char** argv) {
                                  controls.temperature, branch_seed, controls.top_k, controls.top_p,
                                  controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
                                  false, 0, nullptr, {}, &cur_images);
-                             out.prompt_tokens += (long long)cur_prompt_ids.size();
+                             out.prompt_tokens += (long long)cur_prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;
                              out.completion_tokens += (long long)ids.size();
                              if (!outcome.error.empty()) {
                                  // A hard engine fault (overloaded/alloc_failed/timed_out) is not a
@@ -1958,7 +1993,7 @@ int main(int argc, char** argv) {
                              out.http_error = decode_err;
                              return out;
                          }
-                         out.prompt_tokens = (long long)prompt_ids.size();
+                         out.prompt_tokens = (long long)prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;
                          out.completion_tokens = (long long)outcome.tokens.size();
                          if (stopped_by_sequence) {
                              size_t pos;
@@ -2114,6 +2149,7 @@ int main(int argc, char** argv) {
                  if (ttft_min >= 0.0) usage["ttft_ms"] = ttft_min;
                  if (gen_max >= 0.0) usage["generation_ms"] = gen_max;
                  if (decode_tps_agg >= 0.0) usage["decode_tps"] = decode_tps_agg;
+                 usage["prompt_tokens_details"] = {{"cached_tokens", (int)results[0].cached_tokens}};
 
                  nlohmann::json choices = nlohmann::json::array();
                  for (int i = 0; i < controls.n; i++) {
@@ -2259,6 +2295,7 @@ int main(int argc, char** argv) {
                                                     server_error } fail = Fail::none;
                                  std::string fail_message;
                                  long long prompt_tokens = 0, completion_tokens = 0;
+                                 int cached_tokens = 0;   // prompt tokens served from the prefix cache
                                  double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                              };
 
@@ -2321,7 +2358,7 @@ int main(int argc, char** argv) {
                                  const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
                                      logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob);
-                                 out->prompt_tokens = (long long)prompt_ids.size();
+                                 out->prompt_tokens = (long long)prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
                                      out->fail = BranchOutcome::Fail::cancelled;
@@ -2453,6 +2490,7 @@ int main(int argc, char** argv) {
                      std::string finish_reason;
                      nlohmann::json logprobs_json = nullptr;
                      long long prompt_tokens = 0, completion_tokens = 0;
+                                 int cached_tokens = 0;   // prompt tokens served from the prefix cache
                      double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                  };
 
@@ -2495,7 +2533,7 @@ int main(int argc, char** argv) {
                          controls.logprobs, controls.top_logprobs, maybe_on_tok_logprob);
                      if (logprob_entries.size() > outcome.tokens.size())
                          logprob_entries.resize(outcome.tokens.size());
-                     out.prompt_tokens = (long long)prompt_ids.size();
+                     out.prompt_tokens = (long long)prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;
                      out.completion_tokens = (long long)outcome.tokens.size();
                      if (!outcome.error.empty()) {
                          out.http_status = status_for_outcome(outcome);

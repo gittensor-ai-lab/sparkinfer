@@ -118,6 +118,12 @@ if(BUILD_EXAMPLES)
     target_include_directories(qwen38_hf_dflash_bench PRIVATE include examples)
     target_link_libraries(qwen38_hf_dflash_bench PRIVATE sparkinfer_runtime CUDA::cudart nlohmann_json::nlohmann_json)
 
+    # Automatic prefix cache numerics: batched resume from a cached prefix against one pass and the
+    # token loop, and a real cache hit (shared blocks + restored recurrent state) against a split.
+    add_executable(prefix_resume_check examples/prefix_resume_check.cpp)
+    target_include_directories(prefix_resume_check PRIVATE include examples)
+    target_link_libraries(prefix_resume_check PRIVATE sparkinfer_runtime CUDA::cudart nlohmann_json::nlohmann_json)
+
     add_executable(qwen3_gguf_dflash_bench examples/qwen3_gguf_dflash_bench.cpp)
     target_include_directories(qwen3_gguf_dflash_bench PRIVATE include)
     target_link_libraries(qwen3_gguf_dflash_bench PRIVATE sparkinfer_runtime CUDA::cudart)

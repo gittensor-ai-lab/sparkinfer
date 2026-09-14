@@ -15,6 +15,7 @@
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/scheduler.h"
+#include "sparkinfer/prefix_cache.h"
 
 namespace sparkinfer {
 
@@ -42,6 +43,17 @@ public:
         int priority = 0;
         int prefill_start = 0;          // skip tokens already in a shared prefix cache
         bool use_prefix_session = false; // bind to session 0 (cache_prefix KV)
+        // Automatic prefix cache (enable_prefix_cache()). prefix_cache: this request may start from
+        // a cached prefix of its prompt. cache_checkpoints: ascending positions, each a whole number
+        // of KV blocks; prefill stops at each one past the cached prefix, snapshots the recurrent
+        // state there, and when the request retires each [0, checkpoint) is offered to the cache.
+        // The server passes two -- the end of a shared system prompt, so other conversations can
+        // start from it, and the start of the final turn, so this conversation's next request can.
+        // Ignored when the cache is off, for teacher-forced scoring, and for requests with images or
+        // video: the cache keys on token ids alone, and every image's placeholder tokens are the
+        // same ids.
+        bool prefix_cache = false;
+        std::vector<int> cache_checkpoints;
         // <= 0 (default) is plain greedy argmax, byte-identical to pre-sampling behavior. > 0
         // samples via Gumbel-max (Qwen35Model::forward_token). Note: the prefill-phase seed
         // token (the very first token of the response) is always greedy regardless of this
@@ -176,6 +188,7 @@ public:
         double ttft_ms = -1.0;
         double generation_ms = -1.0;
         double decode_tps = -1.0;
+        int cached_tokens = 0;   // prompt tokens served from the prefix cache, not recomputed
     };
 
     ContinuousBatchEngine(Qwen35Model* model, KVCacheManager* kv,
@@ -214,6 +227,12 @@ public:
     // beyond this are rejected as overloaded before any KV allocation is attempted.
     int max_queue_depth() const;
 
+    // Turn on the automatic prefix cache. Off by default: benchmarks and the eval harness measure
+    // prefill from zero, and a cache hit would change what they measure. Call before submitting.
+    void enable_prefix_cache(const PrefixCache::Limits& limits);
+    // All zeros while the cache is off.
+    PrefixCache::Stats prefix_cache_stats() const;
+
 private:
     struct Job;
     enum class EnqueueError { NONE, BAD_REQUEST, OVERLOADED, ALLOC_FAILED };
@@ -243,6 +262,7 @@ private:
     std::condition_variable cv_;
     std::unordered_map<uint64_t, std::unique_ptr<Job>> jobs_;
     std::atomic<uint64_t> next_req_id_{1};
+    std::unique_ptr<PrefixCache> prefix_cache_;
 };
 
 }  // namespace sparkinfer
