@@ -4520,7 +4520,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int step_no = 0;
     bf16* th_scratch = nullptr;
     const int row_stride = dflash_hidden_row_stride();
-    if (cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)) != cudaSuccess) {
+    // Rows, not proposals: a step keeps up to B + 1 tokens (a fully accepted block plus the bonus
+    // row), and the overlap stash below copies th_len = keep rows of dflash_hidden -- which is sized
+    // for B + 1 for the same reason. B rows here made that copy run past the end of th_scratch after
+    // every full-block accept on the token-loop path ("dflash overlap stash: invalid argument"), and
+    // the draft then read a stale context.
+    if (cudaMalloc(&th_scratch, (size_t)(B + 1) * row_stride * sizeof(bf16)) != cudaSuccess) {
         if (hooks) {
             // The prompt is prefilled and consistent: hand it back for ordinary decode.
             if (resume) { resume->engaged = true; resume->position = n; resume->next_token = next; }
