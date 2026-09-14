@@ -571,7 +571,6 @@ void ContinuousBatchEngine::worker_loop() {
 // Was a lambda inside step_job(); hoisted so the packed decode path retires a row through the
 // SAME code rather than a second copy that could drift from it.
 void ContinuousBatchEngine::finish_job_impl(Job& j) {
-    j.done = true;
     if (j.seq_id != 0) {
         // Offer each checkpointed prefix before this session's own references to its blocks go.
         // Only once prefill has finished and nothing failed: the KV for [0, checkpoint) was
@@ -610,6 +609,13 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
         }
     }
     j.seq_id = 0;
+    // Last, and under mu_. `done` is what lets the request's own thread (wait_locked) take the result
+    // and destroy this Job. Set first, as it used to be, that thread could wake -- any other job's
+    // finish notifies cv_ -- and erase the Job while the worker was still inside the prefix-cache
+    // insert and close_session above: a use-after-free that segfaulted the server in finish_job_impl
+    // under concurrent load with the cache on. Nothing may touch j after this line.
+    std::lock_guard<std::mutex> lock(mu_);
+    j.done = true;
 }
 
 // Packed decode: one forward for the whole decode batch.
@@ -745,7 +751,10 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     if (device_lost()) {
         job.error = "CUDA context lost (unrecoverable device error) -- request aborted; "
                     "the server requires a restart";
-        job.done = true;
+        {
+            std::lock_guard<std::mutex> lock(mu_);   // done lets the waiting thread destroy the Job
+            job.done = true;
+        }
         cv_.notify_all();
         return true;
     }
