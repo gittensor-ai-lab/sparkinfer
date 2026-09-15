@@ -4255,9 +4255,6 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                 proj(xn, w.wv, w.wv_type, vf, kvdim, H);
             }
             if (!supported) break;
-            // QK-norm is per HEAD vector, so N tokens is just N*heads rows of the same kernel.
-            kernels::launch_rmsnorm(qb, w.q_norm, qb, N * c.n_q_heads,  c.head_dim, c.rms_eps, st);
-            kernels::launch_rmsnorm(kf, w.k_norm, kf, N * c.n_kv_heads, c.head_dim, c.rms_eps, st);
             char* kp = static_cast<char*>(s.kv->k_pool()) +
                        s.kv->layer_base_elems(L) * kv_elem;
             char* vp = static_cast<char*>(s.kv->v_pool()) +
@@ -4271,7 +4268,25 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // NoPE and append K/V unrotated. Both flavours index block_table[row*max_blocks+blk]
             // and positions[row], which is what makes them correct for packed rows unchanged.
             const int* rtab = btab_rows ? btab_rows : btable;
-            if (kv8) {
+            // QK-norm, RoPE and the bf16 KV append as ONE launch instead of three per layer, with the
+            // same bytes (launch_muse_qknorm_rope_kv_rows). SPARKINFER_MUSE_PACKED_QKNORM_FUSE=0
+            // issues the three again.
+            static const bool qkn_fuse = [] {
+                const char* e = getenv("SPARKINFER_MUSE_PACKED_QKNORM_FUSE");
+                return !(e && e[0] == '0'); }();
+            const bool qkn_done = qkn_fuse && !kv8 &&
+                kernels::launch_muse_qknorm_rope_kv_rows(qb, kf, vf, w.q_norm, w.k_norm, kp, vp,
+                                                         rtab, pos, N, c.n_q_heads, c.n_kv_heads,
+                                                         c.head_dim, c.rope_theta, c.rms_eps,
+                                                         w.swa != 0, bs, mbs, st);
+            // QK-norm is per HEAD vector, so N tokens is just N*heads rows of the same kernel.
+            if (!qkn_done) {
+                kernels::launch_rmsnorm(qb, w.q_norm, qb, N * c.n_q_heads,  c.head_dim, c.rms_eps, st);
+                kernels::launch_rmsnorm(kf, w.k_norm, kf, N * c.n_kv_heads, c.head_dim, c.rms_eps, st);
+            }
+            if (qkn_done) {
+                /* normed, rotated and appended above */
+            } else if (kv8) {
                 kernels::launch_muse_kv_append_int8(
                     qb, kf, vf, kp, vp, ks, vs, rtab, pos, N,
                     c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,

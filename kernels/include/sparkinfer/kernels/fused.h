@@ -68,6 +68,16 @@ void launch_muse_qknorm_rope_kv(void* q, void* k, const void* v, const void* q_w
                                 const int* pos_angle, const int* pos_slot,
                                 int n_q_heads, int n_kv_heads, int head_dim, float theta,
                                 int block_size, float eps, bool do_rope, cudaStream_t stream = nullptr);
+// Packed-decode form: n_rows sequences, each with its own position (positions[row]) and block-table
+// row (block_table[row * max_blocks_per_seq + blk]). Replaces launch_rmsnorm(q) + launch_rmsnorm(k)
+// + launch_rope_kv_append_normal / launch_kv_append with the same bytes, bf16 KV only; k is written
+// to the pool and not back to `k`. False = nothing issued (unsupported head width).
+bool launch_muse_qknorm_rope_kv_rows(void* q, const void* k, const void* v, const void* q_w,
+                                     const void* k_w, void* k_pool, void* v_pool,
+                                     const int* block_table, const int* positions, int n_rows,
+                                     int n_q_heads, int n_kv_heads, int head_dim, float theta,
+                                     float eps, bool do_rope, int block_size,
+                                     int max_blocks_per_seq, cudaStream_t stream = nullptr);
 
 // Returns true if it also wrote Q8_1(out_xn) into out_q8, letting the caller skip the standalone
 // quantize its next MMVQ would otherwise need. Pass out_q8 = nullptr to opt out. Never assume the

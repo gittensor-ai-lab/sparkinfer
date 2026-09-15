@@ -793,6 +793,91 @@ __global__ void muse_qknorm_rope_kv_kernel(
     }
 }
 
+// Packed-decode form of the kernel above: n_rows independent sequences, each with its own position
+// and its own block-table row. It collapses what the packed step issues per layer --
+// launch_rmsnorm(q), launch_rmsnorm(k), then launch_rope_kv_append_normal (sliding-window layers)
+// or launch_kv_append (NoPE layers) -- into one launch.
+//
+// Bit-identical to those three, by construction:
+//   * the per-head RMS keeps rmsnorm_kernel's pack-of-8 accumulation and warp tree -- a head_dim
+//     row is head_dim/8 packs, all inside the first warp of either block width, so this 32-thread
+//     block reduces exactly what the 256-thread rows launch did;
+//   * the normed pack is rounded to bf16 before the rotation reads it, as the rope kernel loads it
+//     back from global, and the rotation, the cache slot and the copies are the append kernels'
+//     own expressions;
+//   * q is written normed and rotated, as before. k is written only to the pool: nothing reads the
+//     normed k buffer after the append.
+template <bool ROPE>
+__global__ void muse_qknorm_rope_kv_rows_kernel(
+    __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, float theta, float eps,
+    int block_size, int max_blocks_per_seq
+) {
+    const int hh = blockIdx.x, row = blockIdx.y, t = threadIdx.x;
+    const int npack = head_dim >> 3;
+    const int pos = positions[row];
+    const int blk = pos / block_size, within = pos % block_size;
+    const size_t ctok = (size_t)block_table[row * max_blocks_per_seq + blk] * block_size + within;
+
+    if (hh >= n_q_heads + n_kv_heads) {          // V head: straight copy, one 8-value pack per thread
+        if (t >= npack) return;
+        const int h = hh - n_q_heads - n_kv_heads;
+        const uint4* src = reinterpret_cast<const uint4*>(v + ((size_t)row * n_kv_heads + h) * head_dim);
+        uint4* dst = reinterpret_cast<uint4*>(v_pool + (ctok * n_kv_heads + h) * head_dim);
+        dst[t] = __ldg(src + t);
+        return;
+    }
+    const bool is_q = (hh < n_q_heads);
+    const int head = is_q ? hh : hh - n_q_heads;
+    const size_t base = ((size_t)row * (is_q ? n_q_heads : n_kv_heads) + head) * head_dim;
+    const uint4* x4 = reinterpret_cast<const uint4*>((is_q ? (const __nv_bfloat16*)q : k) + base);
+
+    __shared__ float s_warp[32];
+    float ss = 0.f;
+    if (t < npack) {
+        float xv[8]; rn_unpack8(__ldg(x4 + t), xv);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ss = __fmaf_rn(xv[j], xv[j], ss);
+    }
+    ss = rn_warp_sum(ss);
+    if ((t & 31) == 0) s_warp[t >> 5] = ss;
+    __syncthreads();
+    if (t < 32) {
+        float vv = (t < (blockDim.x + 31) / 32) ? s_warp[t] : 0.f;
+        vv = rn_warp_sum(vv);
+        if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+    }
+    __syncthreads();
+    if (t >= npack) return;
+    const float inv_rms = s_warp[0];
+
+    float xv[8], wv[8], ov[8];
+    rn_unpack8(__ldg(x4 + t), xv);
+    rn_unpack8(__ldg(reinterpret_cast<const uint4*>(is_q ? q_w : k_w) + t), wv);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) ov[j] = xv[j] * inv_rms * wv[j];
+    uint4 p = rn_pack8(ov);
+    if constexpr (ROPE) {                         // NORM convention: pair (2i, 2i+1), i = 4t + m
+        float nv[8]; rn_unpack8(p, nv);
+        #pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int i = 4 * t + m;
+            const float freq = __powf(theta, -2.f * (float)i / (float)head_dim);
+            const float ang = (float)pos * freq, c = __cosf(ang), sn = __sinf(ang);
+            const float x0 = nv[2 * m], x1 = nv[2 * m + 1];
+            ov[2 * m]     = x0 * c - x1 * sn;
+            ov[2 * m + 1] = x0 * sn + x1 * c;
+        }
+        p = rn_pack8(ov);
+    }
+    if (is_q) reinterpret_cast<uint4*>(q + base)[t] = p;
+    else      reinterpret_cast<uint4*>(k_pool + (ctok * n_kv_heads + head) * head_dim)[t] = p;
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
 #include <cassert>
@@ -811,6 +896,28 @@ void launch_muse_qknorm_rope_kv(void* q, void* k, const void* v, const void* q_w
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
         block_table, pos_angle, pos_slot, n_q_heads, n_kv_heads, head_dim, theta,
         block_size, eps, do_rope ? 1 : 0);
+}
+
+bool launch_muse_qknorm_rope_kv_rows(void* q, const void* k, const void* v, const void* q_w,
+                                     const void* k_w, void* k_pool, void* v_pool,
+                                     const int* block_table, const int* positions, int n_rows,
+                                     int n_q_heads, int n_kv_heads, int head_dim, float theta,
+                                     float eps, bool do_rope, int block_size,
+                                     int max_blocks_per_seq, cudaStream_t stream) {
+    // One thread per 8-value pack, and every pack inside one warp (see the kernel).
+    if (n_rows < 1 || (head_dim & 7) || (head_dim >> 3) > 32) return false;
+    const dim3 grid(n_q_heads + 2 * n_kv_heads, n_rows);
+#define SI_MUSE_QKN_ROWS(ROPE_) muse_qknorm_rope_kv_rows_kernel<ROPE_><<<grid, 32, 0, stream>>>( \
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k), \
+        reinterpret_cast<const __nv_bfloat16*>(v), \
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w), \
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool), \
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, theta, eps, block_size, \
+        max_blocks_per_seq)
+    if (do_rope) SI_MUSE_QKN_ROWS(true);
+    else         SI_MUSE_QKN_ROWS(false);
+#undef SI_MUSE_QKN_ROWS
+    return true;
 }
 
 void launch_rmsnorm_qk(void* q, void* k, const void* q_w, const void* k_w,

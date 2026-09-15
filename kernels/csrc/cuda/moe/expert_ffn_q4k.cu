@@ -336,6 +336,32 @@ __global__ void quant_h_q8_1_kernel(const float* __restrict__ h,
     if (pdl) si_pdl_lc();   // PDL: signal down after Q8_1(h) is ready
 }
 
+// quant_h_q8_1_kernel with the SwiGLU folded in, for a caller that supplied gate and up as bf16:
+// each lane forms h = silu(g) * u itself instead of reading it back from an fp32 h_scratch that
+// swiglu_rows_bf16_f32_kernel wrote one launch earlier. Same float expression, same grid, same
+// reductions and rounding, so every Q8_1 byte is the one the two launches produced.
+__global__ void swiglu_quant_h_q8_1_kernel(const __nv_bfloat16* __restrict__ g,
+                                           const __nv_bfloat16* __restrict__ u,
+                                           si_block_q8_1* __restrict__ y, int n_blocks, int pdl) {
+    if (pdl) si_pdl_sync();
+    const int warpsPB = blockDim.x >> 5;
+    const int ib = blockIdx.x * warpsPB + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (ib >= n_blocks) return;
+    const size_t e = (size_t)ib * 32 + lane;
+    float xv = q4kf_silu(__bfloat162float(g[e])) * __bfloat162float(u[e]), a = fabsf(xv);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    float d = a / 127.0f;
+    int qi = (a == 0.0f) ? 0 : (int)roundf(xv / d);
+    y[ib].qs[lane] = (signed char)qi;
+    int s = qi;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+    if (lane == 0) y[ib].ds = __floats2half2_rn(d, d * (float)s);
+    if (pdl) si_pdl_lc();
+}
+
 // Faithful llama.cpp vec_dot_q6_K_q8_1 for one 256-superblock at quant-index iqs (0..31).
 // bq6 -> ggml block_q6_K (ql[128], qh[64], int8 scales[16], fp16 d); bq8 -> that
 // superblock's 8 Q8_1 activation blocks.
@@ -2788,13 +2814,32 @@ void launch_moe_expert_ffn_q4k(
     // The tensor-core gate/up below is launched plainly and clears it.
     int gu_chain = gu_pdl;
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
+    // With the projections supplied, the int8 down arms below read only Q8_1(h), never h itself,
+    // so when one of them follows, the SwiGLU is folded into that quantize and h is never written
+    // (swiglu_quant_h_q8_1_kernel). These are the same switches the down dispatch reads.
+    // SPARKINFER_SWIGLU_QUANT_FOLD=0 issues the SwiGLU and the quantize as two launches again.
+    static const bool swiglu_fold_on = [] {
+        const char* e = getenv("SPARKINFER_SWIGLU_QUANT_FOLD");
+        return !(e && e[0] == '0');
+    }();
+    static const bool fold_down_mmvq = [] {
+        const char* e = getenv("SPARKINFER_DOWN_MMVQ");
+        return !(e && e[0] == '0');
+    }();
+    static const bool fold_down_q4k = [] {
+        const char* e = getenv("SPARKINFER_DOWN_Q4K");
+        return !(e && e[0] == '0');
+    }();
+    const bool swiglu_fold = swiglu_fold_on && gate_bf16 && up_bf16 && top_k == 1 &&
+                             fold_down_mmvq && (down_type == 14 || (fold_down_q4k && down_type == 12));
     // Projections supplied by the caller: skip the whole in-projection dispatch below and go
     // straight to the SwiGLU that feeds `down`.
     if (gate_bf16 && up_bf16 && top_k == 1) {
         const long n = (long)num_tokens * (long)ffn;
-        swiglu_rows_bf16_f32_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(up_bf16), h_scratch, n);
+        if (!swiglu_fold)
+            swiglu_rows_bf16_f32_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(up_bf16), h_scratch, n);
     } else if (mmvq && gu2 && ((gate_type == 12 && up_type == 12) ||
                        (gate_type == SI_QTYPE_Q3A && up_type == SI_QTYPE_Q3A))) {   // faithful 4-warp mmvq gate/up
         const si_block_q8_1* q;
@@ -3021,8 +3066,13 @@ void launch_moe_expert_ffn_q4k(
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
         const int q_pdl = gu_chain && pdl;
-        launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
-            quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        if (swiglu_fold)
+            launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+                swiglu_quant_h_q8_1_kernel, reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(up_bf16), hq8, nqb, q_pdl);
+        else
+            launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+                quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
         // split-K MMVQ down: S warps/row -> S*H warps in flight, hiding the bs=1
         // occupancy stall the one-warp kernel hits. Dense top-1 defaults to S=8 unless
         // an explicit split-K env override is set; routed MoE keeps its existing default.
@@ -3052,8 +3102,13 @@ void launch_moe_expert_ffn_q4k(
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
         const int q_pdl = gu_chain && pdl;
-        launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
-            quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        if (swiglu_fold)
+            launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+                swiglu_quant_h_q8_1_kernel, reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(up_bf16), hq8, nqb, q_pdl);
+        else
+            launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+                quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
         int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
         // The split-K factor was fitted at ONE row, where splitting hides a bs=1 occupancy stall.
         // A packed batch already gives every block M rows of work, so the extra splits buy
@@ -3174,8 +3229,13 @@ void launch_moe_expert_ffn_q4k(
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
         const int q_pdl = gu_chain && pdl;
-        launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
-            quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        if (swiglu_fold)
+            launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+                swiglu_quant_h_q8_1_kernel, reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(up_bf16), hq8, nqb, q_pdl);
+        else
+            launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
+                quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
         // Row-count-aware split-K: S=8 (July-2026 sweep) is tuned for 1-row AR decode; the DFlash
         // compact verify runs num_tokens=6 rows -> already high occupancy, so split-K reduction
         // overhead dominates and S=1 wins (+2.7% DFlash decode @2550, bit-exact @128, SPEC 32/32).
