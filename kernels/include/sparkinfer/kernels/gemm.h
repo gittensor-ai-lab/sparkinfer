@@ -205,6 +205,13 @@ bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, 
 
 bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
                       int M, int N, int K, cudaStream_t stream = nullptr);
+// Two or four Q4_K matrices over one Q8_1 activation on the int8 tensor cores, in one launch: y[i]
+// gets [M, Ns[i]] from W[i], as launch_mmvq_rows's tensor-core arm computes a matrix. Every Ns[i]
+// must be a multiple of 32. False = nothing issued (batch too narrow, shape unsupported, or the arm
+// is switched off); the caller projects them separately.
+bool launch_mmvq_q4k_mma_rows_n(const void* q81, const void* const* W, void* const* y,
+                                const int* Ns, int nmat, int M, int K,
+                                cudaStream_t stream = nullptr);
 // FP32-output counterpart for verifier logits. It preserves the serial decode reduction order.
 bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
                           int M, int N, int K, cudaStream_t stream = nullptr);

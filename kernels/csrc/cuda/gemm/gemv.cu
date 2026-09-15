@@ -4016,12 +4016,25 @@ __device__ __forceinline__ void si_am_scales8(const unsigned char* sc12, unsigne
 // full note -- the shared A tile (10 KB of 18.75 KB at MM=32) held the SM to five CTAs where the
 // __launch_bounds__ asks for eight, and the M-tile loop issued both m16n8k32 tiles only to
 // discard the second through `lm < M`. Bit-identical at every M.
-template <bool SPLITK, class OutT, int MM>
+// NMAT > 1 serves several matrices over one activation from one grid (launch_mmvq_q4k_mma_rows_n):
+// output rows [0, E1) read W, [E1, E2) W1, [E2, E3) W2 and [E3, N) W3. Every other launch is NMAT=1
+// and never compiles the pick in.
+template <bool SPLITK, class OutT, int MM, int NMAT = 1>
 __global__ __launch_bounds__(SI_AM_NW * 32, 8)
 void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned char* __restrict__ W,
-                            OutT* __restrict__ acc_out, int M, int N, int K, int bdedup) {
+                            OutT* __restrict__ acc_out, int M, int N, int K, int bdedup,
+                            const unsigned char* __restrict__ W1, const unsigned char* __restrict__ W2,
+                            const unsigned char* __restrict__ W3, int E1, int E2, int E3) {
     const int nblk = K >> 8;
     const int n0 = blockIdx.x * SI_AM_BN;
+    // Every matrix is a whole number of SI_AM_BN-row blocks, so all of a block's rows come from one
+    // of them and the pick is made once per block: Wb from row nb, of its Nb rows.
+    const int mi = (NMAT > 1 && n0 >= E1) + (NMAT > 2 && n0 >= E2) + (NMAT > 3 && n0 >= E3);
+    const unsigned char* const Wb = mi == 0 ? W : (mi == 1 ? W1 : (mi == 2 ? W2 : W3));
+    const int eb = mi == 0 ? 0 : (mi == 1 ? E1 : (mi == 2 ? E2 : E3));
+    const int ee = (mi + 1 >= NMAT) ? N : (mi == 0 ? E1 : (mi == 1 ? E2 : E3));
+    const int nb = n0 - eb;
+    const int Nb = ee - eb;
     // Balanced, not ceil: 26 super-blocks over 8 splits is 4,4,3,3,3,3,3,3 rather than seven 4s and
     // an idle block, and the longest split is what the launch waits for.
     const int sb_base = nblk / (int)gridDim.y, sb_extra = nblk % (int)gridDim.y;
@@ -4054,9 +4067,9 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
         if (bdedup) {
             for (int u = tid; u < SI_AM_BN * 8; u += SI_AM_NW * 32) {
                 const int r = u >> 3, c = u & 7;
-                const int gn = n0 + r;
+                const int gn = nb + r;
                 const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
-                    W + (size_t)(gn < N ? gn : N - 1) * (size_t)nblk * 144) + sb;
+                    Wb + (size_t)(gn < Nb ? gn : Nb - 1) * (size_t)nblk * 144) + sb;
                 const int j = c >> 1, h = c & 1;
                 // The 16 B chunk is one aligned word: a Q4_K block is 144 B, so qs + 32j + 16h sits on a
                 // 16 B boundary of any 16 B-aligned weight (every cudaMalloc base is 256 B aligned). One
@@ -4078,9 +4091,9 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
         } else {
             for (int u = tid; u < SI_AM_BN * 16; u += SI_AM_NW * 32) {
                 const int r = u >> 4, c = u & 15;
-                const int gn = n0 + r;
+                const int gn = nb + r;
                 const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
-                    W + (size_t)(gn < N ? gn : N - 1) * (size_t)nblk * 144) + sb;
+                    Wb + (size_t)(gn < Nb ? gn : Nb - 1) * (size_t)nblk * 144) + sb;
                 const int j = c >> 2, sc_ = c & 3;
                 const bool hi = (sc_ >> 1) & 1;
                 const unsigned* src = reinterpret_cast<const unsigned*>(b->qs + 32 * j + (sc_ & 1) * 16);
@@ -4196,6 +4209,27 @@ __global__ void si_mmvq_q4k_mma_epilogue_kernel(float* __restrict__ acc,
     acc[i] = 0.f;
 }
 
+// Multi-output form, for launch_mmvq_q4k_mma_rows_n: each accumulator row holds the outputs' columns
+// back to back, [0, E1) for y0, [E1, E2) for y1, [E2, E3) for y2 and [E3, N) for y3. One block per
+// row, so finding a column's output is a few compares rather than a division.
+__global__ void si_mmvq_q4k_mma_epilogue_n_kernel(float* __restrict__ acc,
+                                                  __nv_bfloat16* __restrict__ y0,
+                                                  __nv_bfloat16* __restrict__ y1,
+                                                  __nv_bfloat16* __restrict__ y2,
+                                                  __nv_bfloat16* __restrict__ y3,
+                                                  int M, int N, int nmat, int E1, int E2, int E3) {
+    const int r = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= M || c >= N) return;
+    const int s = (nmat > 1 && c >= E1) + (nmat > 2 && c >= E2) + (nmat > 3 && c >= E3);
+    const int lo = s == 0 ? 0 : (s == 1 ? E1 : (s == 2 ? E2 : E3));
+    const int hi = (s + 1 >= nmat) ? N : (s == 0 ? E1 : (s == 1 ? E2 : E3));
+    __nv_bfloat16* const y = s == 0 ? y0 : (s == 1 ? y1 : (s == 2 ? y2 : y3));
+    const size_t i = (size_t)r * (size_t)N + c;
+    y[(size_t)r * (size_t)(hi - lo) + (c - lo)] = __float2bfloat16(acc[i]);
+    acc[i] = 0.f;
+}
+
 // Claim this stream's slot, first call wins. The table only ever grows and holds a handful of
 // entries, so the lock is contended only on the few calls that add a stream.
 static int si_am_slot_for(cudaStream_t stream) {
@@ -4261,11 +4295,11 @@ static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void
         const unsigned char* wa = reinterpret_cast<const unsigned char*>(W);
         __nv_bfloat16* ya = reinterpret_cast<__nv_bfloat16*>(y);
         if (st_ <= 8)       si_mmvq_q4k_mma_kernel<false, __nv_bfloat16, 8>
-                                <<<g1, b1, 0, stream>>>(qa, wa, ya, M, N, K, bd);
+                                <<<g1, b1, 0, stream>>>(qa, wa, ya, M, N, K, bd, nullptr, nullptr, nullptr, 0, 0, 0);
         else if (st_ <= 16) si_mmvq_q4k_mma_kernel<false, __nv_bfloat16, 16>
-                                <<<g1, b1, 0, stream>>>(qa, wa, ya, M, N, K, bd);
+                                <<<g1, b1, 0, stream>>>(qa, wa, ya, M, N, K, bd, nullptr, nullptr, nullptr, 0, 0, 0);
         else                si_mmvq_q4k_mma_kernel<false, __nv_bfloat16, SI_AM_MMAX>
-                                <<<g1, b1, 0, stream>>>(qa, wa, ya, M, N, K, bd);
+                                <<<g1, b1, 0, stream>>>(qa, wa, ya, M, N, K, bd, nullptr, nullptr, nullptr, 0, 0, 0);
         return true;
     }
     const int slot = si_am_slot_for(stream);
@@ -4278,16 +4312,87 @@ static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void
         const si_block_q8_1* qa = reinterpret_cast<const si_block_q8_1*>(q81);
         const unsigned char* wa = reinterpret_cast<const unsigned char*>(W);
         if (st_ <= 8)       si_mmvq_q4k_mma_kernel<true, float, 8>
-                                <<<gk, bk, 0, stream>>>(qa, wa, acc, M, N, K, bd);
+                                <<<gk, bk, 0, stream>>>(qa, wa, acc, M, N, K, bd, nullptr, nullptr, nullptr, 0, 0, 0);
         else if (st_ <= 16) si_mmvq_q4k_mma_kernel<true, float, 16>
-                                <<<gk, bk, 0, stream>>>(qa, wa, acc, M, N, K, bd);
+                                <<<gk, bk, 0, stream>>>(qa, wa, acc, M, N, K, bd, nullptr, nullptr, nullptr, 0, 0, 0);
         else                si_mmvq_q4k_mma_kernel<true, float, SI_AM_MMAX>
-                                <<<gk, bk, 0, stream>>>(qa, wa, acc, M, N, K, bd);
+                                <<<gk, bk, 0, stream>>>(qa, wa, acc, M, N, K, bd, nullptr, nullptr, nullptr, 0, 0, 0);
     }
     const size_t n = (size_t)M * (size_t)N;
     const int thr = 256;
     si_mmvq_q4k_mma_epilogue_kernel<<<(unsigned)((n + thr - 1) / thr), thr, 0, stream>>>(
         acc, reinterpret_cast<__nv_bfloat16*>(y), n);
+    return true;
+}
+
+// Two or four Q4_K matrices over one Q8_1 activation in ONE tensor-core launch: output rows of W[0]
+// into y[0], then W[1]'s into y[1], and so on. This is the packed form of what AR decode already does
+// for Muse Glimmer's attention q and gate (launch_mmvq_q4k_kfixed2 under SPARKINFER_MG_QG_FUSE):
+// same-input projections issued back to back on one stream, which at 32 rows cost a launch and an
+// epilogue each. Every output element accumulates the same super-blocks through the same kernel as
+// a single-matrix launch of this arm; only which launch carries it changes. It honours the arm's own
+// switches, requires the whole group to clear the arm's width floor, and takes the split-K form only
+// -- the single-split arm writes y directly, and there is no single y here. False = nothing issued.
+bool launch_mmvq_q4k_mma_rows_n(const void* q81, const void* const* W, void* const* y,
+                                const int* Ns, int nmat, int M, int K, cudaStream_t stream) {
+    if (!q81 || !W || !y || !Ns || (nmat != 2 && nmat != 4)) return false;
+    int N = 0;
+    for (int i = 0; i < nmat; i++) {
+        if (!W[i] || !y[i] || Ns[i] <= 0 || (Ns[i] % SI_AM_BN)) return false;
+        N += Ns[i];
+    }
+    const int E1 = Ns[0], E2 = E1 + Ns[1], E3 = nmat > 3 ? E2 + Ns[2] : N;
+    static const bool mma = [] {
+        const char* e = getenv("SPARKINFER_MMVQ_MMA");
+        return !(e && e[0] == '0');
+    }();
+    static const int minm = [] {
+        const char* e = getenv("SPARKINFER_MMVQ_MMA_MINM");
+        return e ? atoi(e) : 8;
+    }();
+    static const int minn = [] {
+        const char* e = getenv("SPARKINFER_MMVQ_MMA_MINN");
+        return e ? atoi(e) : 1024;
+    }();
+    if (!mma || M < minm || M < 2 || M > SI_AM_MMAX || N < minn || (K & 255)) return false;
+    if ((size_t)M * (size_t)N > si_am_cap()) return false;
+    static const int sk = [] {
+        const char* e = getenv("SPARKINFER_MMVQ_MMA_SPLITK");
+        return e ? atoi(e) : SI_AM_SK_DEF;
+    }();
+    int nsk = sk < 1 ? 1 : sk;
+    if (nsk > (K >> 8)) nsk = K >> 8;
+    if (nsk <= 1) return false;
+    const int slot = si_am_slot_for(stream);
+    if (slot < 0) return false;
+    float* acc = nullptr;
+    if (cudaGetSymbolAddress(reinterpret_cast<void**>(&acc), si_am_acc) != cudaSuccess) return false;
+    acc += (size_t)slot * (size_t)SI_AM_MMAX * (size_t)SI_AM_NACC;
+    const int st_ = si_am_astage(M);
+    const int bd = si_am_bdedup();
+    const dim3 gk(N / SI_AM_BN, nsk), bk(SI_AM_NW * 32);
+    const si_block_q8_1* qa = reinterpret_cast<const si_block_q8_1*>(q81);
+    auto wp = [&](int i) {
+        return i < nmat ? reinterpret_cast<const unsigned char*>(W[i]) : nullptr;
+    };
+    auto yp = [&](int i) {
+        return i < nmat ? reinterpret_cast<__nv_bfloat16*>(y[i]) : nullptr;
+    };
+#define SI_AM_ROWS_N(MM_, NMAT_) \
+    si_mmvq_q4k_mma_kernel<true, float, MM_, NMAT_><<<gk, bk, 0, stream>>>( \
+        qa, wp(0), acc, M, N, K, bd, wp(1), wp(2), wp(3), E1, E2, E3)
+    if (nmat == 2) {
+        if (st_ <= 8)       SI_AM_ROWS_N(8, 2);
+        else if (st_ <= 16) SI_AM_ROWS_N(16, 2);
+        else                SI_AM_ROWS_N(SI_AM_MMAX, 2);
+    } else {
+        if (st_ <= 8)       SI_AM_ROWS_N(8, 4);
+        else if (st_ <= 16) SI_AM_ROWS_N(16, 4);
+        else                SI_AM_ROWS_N(SI_AM_MMAX, 4);
+    }
+#undef SI_AM_ROWS_N
+    si_mmvq_q4k_mma_epilogue_n_kernel<<<dim3((N + 255) / 256, M), 256, 0, stream>>>(
+        acc, yp(0), yp(1), yp(2), yp(3), M, N, nmat, E1, E2, E3);
     return true;
 }
 
@@ -4313,11 +4418,11 @@ bool launch_mmvq_q4k_mma_head_f32(const void* q81, const void* W, float* y,
         const int sth = si_am_astage(M);
         const int bd = si_am_bdedup();
         if (sth <= 8)       si_mmvq_q4k_mma_kernel<false, float, 8>
-                                <<<gh, bh, 0, stream>>>(qa, wa, y, M, N, K, bd);
+                                <<<gh, bh, 0, stream>>>(qa, wa, y, M, N, K, bd, nullptr, nullptr, nullptr, 0, 0, 0);
         else if (sth <= 16) si_mmvq_q4k_mma_kernel<false, float, 16>
-                                <<<gh, bh, 0, stream>>>(qa, wa, y, M, N, K, bd);
+                                <<<gh, bh, 0, stream>>>(qa, wa, y, M, N, K, bd, nullptr, nullptr, nullptr, 0, 0, 0);
         else                si_mmvq_q4k_mma_kernel<false, float, SI_AM_MMAX>
-                                <<<gh, bh, 0, stream>>>(qa, wa, y, M, N, K, bd);
+                                <<<gh, bh, 0, stream>>>(qa, wa, y, M, N, K, bd, nullptr, nullptr, nullptr, 0, 0, 0);
     }
     return true;
 }

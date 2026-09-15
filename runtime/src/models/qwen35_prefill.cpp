@@ -4204,17 +4204,53 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     qkvg_done = true;
                     supported = true;
                 }
-                const bool fused = !qkvg_done && fuseable &&
+                // Wide q and gate without the fused operand (c32, where it does not fit): Q4_K
+                // matrices over the same staged xn, issued back to back on this stream, so give
+                // them ONE tensor-core launch -- the packed form of AR decode's
+                // SPARKINFER_MG_QG_FUSE. Where attn_v is Q4_K too, k and v ride the same launch
+                // (8704 rows, inside the accumulator slot) instead of the row grid; a Q6_K v keeps
+                // that grid, which carries the Q6_K dot. SPARKINFER_MUSE_PACKED_QG_FUSE=0 issues
+                // every projection separately again, SPARKINFER_MUSE_PACKED_QGKV_FUSE=0 fuses only
+                // q and gate.
+                static const bool qg_fuse = [] {
+                    const char* e = getenv("SPARKINFER_MUSE_PACKED_QG_FUSE");
+                    return !(e && e[0] == '0'); }();
+                static const bool qgkv_fuse = [] {
+                    const char* e = getenv("SPARKINFER_MUSE_PACKED_QGKV_FUSE");
+                    return !(e && e[0] == '0'); }();
+                const bool qg_q4 = qg_fuse && wide && w.wgate && w.wq_type == 12 &&
+                                   w.wgate_type == 12;
+                bool qgkv_done = false;
+                if (!qkvg_done && qg_q4 && qgkv_fuse && v4 && w.wk_type == 12) {
+                    quant_rows(xn, H);
+                    const void* W4[4] = { w.wq, w.wgate, w.wk, w.wv };
+                    void* Y4[4] = { qb, qg, kf, vf };
+                    const int N4[4] = { qdim, qdim, kvdim, kvdim };
+                    qgkv_done = kernels::launch_mmvq_q4k_mma_rows_n(q81, W4, Y4, N4, 4, N, H, st);
+                }
+                auto proj_q_gate = [&]() -> bool {
+                    if (!w.wgate) return false;
+                    if (qg_q4) {
+                        quant_rows(xn, H);
+                        const void* W2[2] = { w.wq, w.wgate };
+                        void* Y2[2] = { qb, qg };
+                        const int N2[2] = { qdim, qdim };
+                        if (kernels::launch_mmvq_q4k_mma_rows_n(q81, W2, Y2, N2, 2, N, H, st))
+                            return true;
+                    }
+                    return proj(xn, w.wq, w.wq_type, qb, qdim, H) &&
+                           proj(xn, w.wgate, w.wgate_type, qg, qdim, H);
+                };
+                const bool fused = !qkvg_done && !qgkv_done && fuseable &&
                                    proj_multi_q4k(xn, Wp, Yp, Ns, nm, H, v6);
                 if (qkvg_done) { /* issued above */ }
+                else if (qgkv_done)
+                    supported = true;
                 else if (fused)
-                    supported =
-                        (!wide || (proj(xn, w.wq, w.wq_type, qb, qdim, H) &&
-                                   w.wgate && proj(xn, w.wgate, w.wgate_type, qg, qdim, H))) &&
+                    supported = (!wide || proj_q_gate()) &&
                         (v4 || v6 || proj(xn, w.wv, w.wv_type, vf, kvdim, H));
                 else
-                    supported = proj(xn, w.wq, w.wq_type, qb, qdim, H) &&
-                                w.wgate && proj(xn, w.wgate, w.wgate_type, qg, qdim, H) &&
+                    supported = proj_q_gate() &&
                                 proj(xn, w.wk, w.wk_type, kf, kvdim, H) &&
                                 proj(xn, w.wv, w.wv_type, vf, kvdim, H);
             }
