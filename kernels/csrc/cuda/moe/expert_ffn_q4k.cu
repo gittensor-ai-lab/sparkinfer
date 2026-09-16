@@ -1722,6 +1722,62 @@ __global__ void down_q4k_mmvq_splitk_qwen_kernel(
     }
 }
 
+// down_q4k_mmvq_splitk_rows_kernel for a dense FFN (top_k == 1, every row on expert_ids[0]) of a
+// fixed width: the super-block count is a constant and only the shared-decode arm exists. The
+// generic kernel carries both of its arms and runtime bounds into every packed step even though a
+// dense model only ever takes the uniform one. Each row sums the same si_vec_dot_q4_K_pre terms in
+// the same order, weighted by the same expert_weights[t], and folds and split-sums them the same
+// way, so the output is the generic kernel's.
+template <int S, int NBLK, int M>
+__global__ void down_q4k_mmvq_splitk_rows_dense_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k, int pdl
+) {
+    (void)F; (void)top_k;
+    if (pdl) si_pdl_sync();
+    constexpr int RPB = WPB / S;
+    constexpr int Q8PB = NBLK * 8;
+    constexpr int WORK = NBLK * 16;
+    __shared__ float s_part[M][RPB][S];
+    const int lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    float acc[M];
+#pragma unroll
+    for (int t = 0; t < M; ++t) acc[t] = 0.f;
+    if (hh < H) {
+        const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
+            down_q + ((size_t)expert_ids[0] * H + hh) * NBLK * 144);
+        float w[M];
+#pragma unroll
+        for (int t = 0; t < M; ++t) w[t] = expert_weights[t];
+        for (int wi = split * 32 + lane; wi < WORK; wi += S * 32) {
+            const int kbx = wi >> 4, kqs = (wi & 15) << 1;
+            const si_q4k_wdec dw = si_q4k_decode_w(drow + kbx, kqs);
+#pragma unroll
+            for (int t = 0; t < M; ++t)
+                acc[t] += w[t] * si_vec_dot_q4_K_pre(dw, hq8 + (size_t)t * Q8PB + (size_t)kbx * 8, kqs);
+        }
+#pragma unroll
+        for (int t = 0; t < M; ++t) {
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], m);
+            if (lane == 0) s_part[t][hh_local][split] = acc[t];
+        }
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+#pragma unroll
+        for (int t = 0; t < M; ++t) {
+            float o = 0.f;
+#pragma unroll
+            for (int s = 0; s < S; s++) o += s_part[t][hh_local][s];
+            output[(size_t)t * H + hh] = __float2bfloat16(o);
+        }
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
@@ -2361,6 +2417,34 @@ static inline bool launch_down_q4k_mmvq_splitk_rows(
     if (M < 2 || M > kDownRowsMax) return false;
     if (!launch_down_rows_wide_ok(S, M)) return false;
     const dim3 block(WPB * 32);
+    // Muse Glimmer's dense 6656x19968 down at the narrow packed widths. The shape gate is the one
+    // the q3a gate/up rows arm uses to assume a single expert. SPARKINFER_MUSE_DOWN_ROWS_DENSE=0
+    // keeps the generic kernel.
+    static const bool dense_on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_DOWN_ROWS_DENSE");
+        return !(e && e[0] == '0');
+    }();
+    if (dense_on && H == 6656 && F == 19968 && top_k == 1 && M <= 8 && (S == 2 || S == 4 || S == 8)) {
+#define SI_DOWN_DENSE(S_, M_) do { \
+            launch_mmvq_down_kernel(pdl, grid, block, stream, \
+                down_q4k_mmvq_splitk_rows_dense_kernel<S_, 78, M_>, \
+                down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); \
+            return true; \
+        } while (0)
+#define SI_DOWN_DENSE_M(S_) do { \
+            switch (M) { \
+                case 2: SI_DOWN_DENSE(S_, 2); case 3: SI_DOWN_DENSE(S_, 3); \
+                case 4: SI_DOWN_DENSE(S_, 4); case 5: SI_DOWN_DENSE(S_, 5); \
+                case 6: SI_DOWN_DENSE(S_, 6); case 7: SI_DOWN_DENSE(S_, 7); \
+                default: SI_DOWN_DENSE(S_, 8); \
+            } \
+        } while (0)
+        if (S == 2)      SI_DOWN_DENSE_M(2);
+        else if (S == 4) SI_DOWN_DENSE_M(4);
+        else             SI_DOWN_DENSE_M(8);
+#undef SI_DOWN_DENSE_M
+#undef SI_DOWN_DENSE
+    }
 #define SI_DOWN_ROWS(S_, M_) do { \
         launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_rows_kernel<S_, M_>, \
             down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); \
@@ -2896,14 +2980,31 @@ void launch_moe_expert_ffn_q4k(
                     q3_gu2 = (e && e[0] == '0') ? 0 : 1;
                 }
                 constexpr int MMAX = 8;
+                // The body is unrolled to its template width, so an 8-wide instantiation carries
+                // eight rows of accumulators, shared reduction and dot staging whatever the batch
+                // holds. A narrower packed batch (c2..c7) gets the instantiation of its own width:
+                // each row's dots, order and fold are the same, only the empty rows are gone.
+                // SPARKINFER_MUSE_Q3A_ROWS_EXACT=0 keeps every chunk on the 8-wide body.
+                static int q3_exact = -1;
+                if (q3_exact < 0) {
+                    const char* e = getenv("SPARKINFER_MUSE_Q3A_ROWS_EXACT");
+                    q3_exact = (e && e[0] == '0') ? 0 : 1;
+                }
                 for (int t0 = 0; t0 < num_tokens; t0 += MMAX) {
                     const int m = (num_tokens - t0) < MMAX ? (num_tokens - t0) : MMAX;
-                    launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream,
-                        gate_up_q3a_muse_rows_kernel<6656, 19968, MMAX>,
-                        q + (size_t)t0 * (6656 >> 5),
-                        reinterpret_cast<const unsigned char*>(gate_q),
-                        reinterpret_cast<const unsigned char*>(up_q), expert_ids,
-                        h_scratch + (size_t)t0 * 19968, m, gu_pdl, q3_gu2);
+#define SI_Q3A_ROWS(W_) launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream, \
+                        gate_up_q3a_muse_rows_kernel<6656, 19968, W_>, \
+                        q + (size_t)t0 * (6656 >> 5), \
+                        reinterpret_cast<const unsigned char*>(gate_q), \
+                        reinterpret_cast<const unsigned char*>(up_q), expert_ids, \
+                        h_scratch + (size_t)t0 * 19968, m, gu_pdl, q3_gu2)
+                    switch (q3_exact ? m : MMAX) {
+                        case 2: SI_Q3A_ROWS(2); break;  case 3: SI_Q3A_ROWS(3); break;
+                        case 4: SI_Q3A_ROWS(4); break;  case 5: SI_Q3A_ROWS(5); break;
+                        case 6: SI_Q3A_ROWS(6); break;  case 7: SI_Q3A_ROWS(7); break;
+                        default: SI_Q3A_ROWS(MMAX); break;
+                    }
+#undef SI_Q3A_ROWS
                 }
             } else
                 launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream, gate_up_q3a_kernel,
