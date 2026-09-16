@@ -6998,6 +6998,16 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
 
     s.w.layers.resize(c.n_layers);
     int gu_ready = 0;
+    // FP8-MLP prefill operands (see the dense FFN branch below) are extra resident copies that
+    // only make batched prefill faster, so they are built only where the deployment can hold them
+    // beside its runtime state. The KV cache is already allocated here, so free VRAM reflects the
+    // session count; what it does NOT yet reflect is the per-session packed/prefill arenas and
+    // decode graphs, measured at ~6.4 GB after load for 33 sessions. Unbudgeted, the 1.2 GB left a
+    // c32 continuous batch 12 MB free: packed decode could not allocate and fell to the token loop
+    // (1333 -> 285 tok/s). 1 GB + 256 MB per session skips c32 (8.4 GB free against 10.7 GB) and
+    // keeps them for a single-session pass (12.5 GB free against 2.5 GB).
+    // SPARKINFER_QWEN38_FP8_MLP_RESERVE_MB overrides the reserve.
+    int fp8_mlp_fp4_ok = -1;   // decided at the first FP8 MLP layer
     for (int i = 0; i < c.n_layers; i++) {
         const std::string b = "model.language_model.layers." + std::to_string(i) + ".";
         Qwen35LayerWeights& w = s.w.layers[i];
@@ -7085,12 +7095,77 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
 
         const std::string mb = b + "mlp.";
         if (!ffn_is_nvfp4(mb)) {
-            w.gate_q = requant_q4k(dequant_any(mb + "gate_proj", c.moe_ffn, H),
-                                   (long)c.moe_ffn * H, w.gate_qtype);
-            w.up_q = requant_q4k(dequant_any(mb + "up_proj", c.moe_ffn, H),
-                                 (long)c.moe_ffn * H, w.up_qtype);
-            w.down_q = requant_q4k(dequant_any(mb + "down_proj", H, c.moe_ffn),
-                                   (long)H * c.moe_ffn, w.down_qtype);
+            // The MLPs the checkpoint keeps in FP8 (unsloth/Qwen3.8-27B-NVFP4 pins layers 56-63 to
+            // group_0) have no native NVFP4 payload, so they used to get no prefill operand at all:
+            // every other layer's FFN runs the block-scaled GEMM, these eight ran the int8 GEMM over
+            // dequantized Q4_K rows -- 20.8 ms a layer against 8.3 ms at prefill@16k, ~100 ms of a
+            // 1.64 s pass. Build the same NVFP4 operand Muse builds for its GGUF FFN
+            // (launch_prefill_nvfp4_quant_b, alpha 1) from the bf16 the Q4_K requant already
+            // dequantizes, then requantize to Q4_K exactly as before: decode keeps its weights.
+            // SPARKINFER_QWEN38_FP8_MLP_PREFILL_NVFP4=0 restores the int8 prefill FFN.
+            static const bool fp8_mlp_fp4 = [] {
+                const char* e = getenv("SPARKINFER_QWEN38_FP8_MLP_PREFILL_NVFP4");
+                return !(e && e[0] == '0');
+            }();
+            if (fp8_mlp_fp4_ok < 0) {
+                int n_fp8 = 0;
+                for (int j = i; j < c.n_layers; j++)
+                    if (!ffn_is_nvfp4("model.language_model.layers." + std::to_string(j) + ".mlp."))
+                        ++n_fp8;
+                const size_t want = (size_t)n_fp8 *
+                    (2 * (kernels::prefill_nvfp4_data_bytes(c.moe_ffn, H) +
+                          kernels::prefill_nvfp4_scale_bytes_b(c.moe_ffn, H)) +
+                     kernels::prefill_nvfp4_data_bytes(H, c.moe_ffn) +
+                     kernels::prefill_nvfp4_scale_bytes_b(H, c.moe_ffn));
+                int sessions = 1;
+                if (s.kv && s.kv->block_size() > 0 && c.max_seq > 0) {
+                    const int bps = c.max_seq / s.kv->block_size() + 4;
+                    if (bps > 0) sessions = std::max(1, s.kv->num_total_blocks() / bps);
+                }
+                const size_t reserve = [&] {
+                    const char* e = getenv("SPARKINFER_QWEN38_FP8_MLP_RESERVE_MB");
+                    long long mb = e ? atoll(e) : 1024 + 256LL * sessions;
+                    return (size_t)(mb < 0 ? 0 : mb) << 20;
+                }();
+                size_t fb = 0, tb = 0;
+                if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) fb = 0;
+                fp8_mlp_fp4_ok = (fb > want + reserve) ? 1 : 0;
+                fprintf(stderr, "[compressed-tensors] FP8 MLP prefill NVFP4: %s (%d layers, %.2f GB "
+                        "free, need %.2f + reserve %.2f GB for %d sessions)\n",
+                        fp8_mlp_fp4_ok ? "on" : "skipped", n_fp8, (double)fb / 1e9,
+                        (double)want / 1e9, (double)reserve / 1e9, sessions);
+            }
+            auto fp4_then_q4k = [&](const std::string& nm, int rows, int cols, int& qtype,
+                                    const void** fp4, const void** fp4_sf) -> const void* {
+                void* bf = dequant_any(mb + nm, rows, cols);
+                if (bf && fp8_mlp_fp4 && fp8_mlp_fp4_ok == 1 &&
+                    kernels::prefill_nvfp4_supported(128, rows, cols)) {
+                    void* d = nullptr;
+                    void* sf = nullptr;
+                    const bool ok =
+                        cudaMalloc(&d, kernels::prefill_nvfp4_data_bytes(rows, cols)) == cudaSuccess &&
+                        cudaMalloc(&sf, kernels::prefill_nvfp4_scale_bytes_b(rows, cols)) == cudaSuccess &&
+                        kernels::launch_prefill_nvfp4_quant_b(bf, d, sf, rows, cols, s.stream) &&
+                        cudaStreamSynchronize(s.stream) == cudaSuccess;
+                    if (ok) {
+                        s.owned.push_back(d); s.owned.push_back(sf);
+                        *fp4 = d; *fp4_sf = sf;
+                    } else {
+                        if (d) cudaFree(d);
+                        if (sf) cudaFree(sf);
+                    }
+                }
+                return requant_q4k(bf, (long)rows * cols, qtype);
+            };
+            w.gate_q = fp4_then_q4k("gate_proj", c.moe_ffn, H, w.gate_qtype, &w.gate_fp4, &w.gate_fp4_sf);
+            w.up_q   = fp4_then_q4k("up_proj",   c.moe_ffn, H, w.up_qtype,   &w.up_fp4,   &w.up_fp4_sf);
+            w.down_q = fp4_then_q4k("down_proj", H, c.moe_ffn, w.down_qtype, &w.down_fp4, &w.down_fp4_sf);
+            // A prefill operand only makes sense as a set: the GEMM path needs gate AND up (and the
+            // down leg reads down_fp4 on its own), so a partial conversion keeps the int8 path.
+            if (!(w.gate_fp4 && w.up_fp4)) {
+                w.gate_fp4 = w.gate_fp4_sf = w.up_fp4 = w.up_fp4_sf = nullptr;
+            }
+            if (w.gate_fp4 && w.up_fp4) ++gu_ready;
         } else {
             const void* g_pay = keep_nvfp4(mb + "gate_proj", c.moe_ffn, H,
                                            &w.gate_fp4, &w.gate_fp4_sf, w.gate_fp4_alpha);
