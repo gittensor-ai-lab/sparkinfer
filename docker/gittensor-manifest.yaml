@@ -1,0 +1,89 @@
+# Gittensor compute-pool manifest for this release container (spec and schema:
+# https://github.com/entrius/gittensor-compute-template/blob/main/MANIFEST.md). Baked at /manifest.yaml; when the pool
+# runs the image its controller mounts the copy it signed over this one and pins the image digest there, so the digest
+# below is a placeholder and the measured numbers (min_vram_gb, max_load_s, profile, concurrency) are the pool's
+# qualification of a tag, not a claim this repo has to keep current. Validate: `scripts/validate` in the template repo.
+name: qwen3.8-27b-nvfp4
+version: 6
+description: Qwen3.8-27B (NVFP4) chat with the DSpark drafter on sparkinfer v0.5.8's release container, one RTX 5090 per instance
+runtime: sparkinfer
+image: ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:v0.5.8@sha256:0000000000000000000000000000000000000000000000000000000000000000  # TODO the digest once ghcr has the tag (building 9/16)
+placement:
+  gpu_types: {include: [RTX5090]}
+  cards_per_instance: 1
+  min_vram_gb: 32            # upstream 9/16: 30.1 GB peak at CTX 65536 with the drafter (30,835 MiB under 4 × 16K prompts); 30 is too tight
+  max_load_s: 90             # TODO measure: v5 loaded in 11–17 s warm; the drafter is a second load
+run:
+  env:
+    SPARKINFER_NO_DOWNLOAD: '1'       # pre-staged weights, no egress: a missing checkpoint fails loudly instead of downloading
+    SPARKINFER_MODE: serve-dspark     # the release container's drafter mode (gittensor-entrypoint.sh maps env → argument)
+    MODEL_DIR: /models/qwen38-nvfp4
+    DRAFT_DIR: /models/qwen38-dspark
+    MODEL_NAME: qwen3.8-27b           # the id the gateway republishes; the container's default is qwen38-nvfp4
+    CTX: '65536'
+    SPARKINFER_MAX_QUEUE_DEPTH: '1'   # keep equal to front_door.concurrency (TODO after re-measuring)
+    SPARKINFER_ADMISSION_WAIT_S: '0'
+    SPARKINFER_DRAIN_GRACE_S: '0'
+    SPARKINFER_DETERMINISTIC: '0'     # no output audits; on costs TTFT
+  volumes: [{name: models, mount: /models, read_only: true}]
+network:
+  egress: []                 # none: the controller pre-stages every file the entrypoint looks for
+artifacts:
+  - path: /models/qwen38-nvfp4
+    source: hf://gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090
+    revision: 8e2c0cd25468ac5c1f85f621c2b8edb15ea1f03a
+    sha256: d4382c5ebc8c9ece150aafc831910e01b6fb022ac9a72d36c3acc9715456e632   # same files as v5; the hash is over relative paths
+  - path: /models/qwen38-dspark
+    source: hf://gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4
+    revision: eba1ac5a66c74902eaa95a4000a7c5eda96d8e95
+    sha256: 506d2ebdc91de82bb5fcd8413490eafb484731d765d7b509ee7a60dad002c865
+health:
+  http: {path: /v1/models, port: 8080, expect_status: 200}
+  interval_s: 60
+  failure_threshold: 3
+entry_canary:                # one picked at random each start; sent at front_door.concurrency (warmup)
+  # Every canary is a tool call: one call proves the weights decode AND that `tools` reach the chat template. Thinking
+  # is off (Qwen3.8 thinks by default and would spend max_tokens before calling); temperature 0 so the canary does not
+  # depend on the checkpoint's generation_config.json.
+  - type: http
+    http: {method: POST, path: /v1/chat/completions, port: 8080}
+    body:
+      messages: [{role: user, content: "What is 17 × 23? Use the multiply tool."}]
+      max_tokens: 64
+      temperature: 0
+      enable_thinking: false
+      tools:
+        - type: function
+          function:
+            name: multiply
+            parameters: {type: object, properties: {a: {type: number}, b: {type: number}}, required: [a, b]}
+    # Order-free lookaheads: sparkinfer serialises "arguments" before "name", so 'multiply[\s\S]*17' never matches.
+    pass: {status: 200, regex: '(?=[\s\S]*"finish_reason":\s*"tool_calls")(?=[\s\S]*"name":\s*"multiply")(?=[\s\S]*\\"[ab]\\":\s*17\b)(?=[\s\S]*\\"[ab]\\":\s*23\b)'}
+  - type: http
+    http: {method: POST, path: /v1/chat/completions, port: 8080}
+    body:
+      messages: [{role: user, content: "What's the weather in Paris right now? Use the tool."}]
+      max_tokens: 64
+      temperature: 0
+      enable_thinking: false
+      tools:
+        - type: function
+          function:
+            name: get_weather
+            parameters: {type: object, properties: {city: {type: string}}, required: [city]}
+    pass: {status: 200, regex: '(?=[\s\S]*"finish_reason":\s*"tool_calls")(?=[\s\S]*"name":\s*"get_weather")(?=[\s\S]*\\"city\\":\s*\\"Paris)'}
+profile:                     # health and standing only, never pay. TODO re-qualify on the new tag with the drafter;
+  decode_tps_single: 94      # v5 (no drafter, 9/15): 94 tok/s single, 13k tok/s prefill, 25 GB resident
+  decode_tps_aggregate: 338
+  prefill_tps: [12500, 13000]
+  vram_gb: 30                # upstream 9/16: 30,057 MiB idle / 30,835 MiB peak at 65536 with the drafter (v5 no-drafter: 25)
+front_door:
+  type: gateway-openai
+  port: 8080
+  concurrency: 1             # TODO re-measure at agent-sized prompts: upstream fixed the case where 4 × 8k prompts were served in turn
+  routes:
+    - {path: /v1/chat/completions, method: POST, stream: true}
+    - {path: /v1/models, method: GET}
+drain:
+  type: requests
+  max_s: 240                 # the container's own 16384-token output cap at ~94 tok/s ≈ 175 s; SPARKINFER_DRAIN_GRACE_S=0 leaves the kill to us

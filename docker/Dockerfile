@@ -36,7 +36,7 @@ FROM nvidia/cuda:12.8.1-base-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 # ffmpeg is REQUIRED for video input -- the server shells out to it for frame extraction.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg python3 python3-pip ca-certificates curl \
+        ffmpeg python3 python3-pip python3-yaml ca-certificates curl \
     && pip3 install --no-cache-dir --break-system-packages "huggingface_hub[cli]" tokenizers jinja2 \
     && apt-get purge -y python3-pip && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* /root/.cache
@@ -50,8 +50,12 @@ COPY --from=builder /src/build/runtime/libsparkinfer_runtime.so /opt/sparkinfer/
 COPY --from=builder /src/build/moe/libsparkinfer_moe.so         /opt/sparkinfer/lib/
 COPY docker/entrypoint.sh /opt/sparkinfer/entrypoint.sh
 COPY docker/mkids.py      /opt/sparkinfer/mkids.py
+# Gittensor compute pool: the workload manifest (spec: github.com/entrius/gittensor-compute-template) and the
+# entrypoint that verifies pre-staged weights against it when SPARKINFER_NO_DOWNLOAD=1, then runs entrypoint.sh.
+COPY docker/gittensor-manifest.yaml /manifest.yaml
+COPY docker/gittensor-entrypoint.sh /opt/sparkinfer/gittensor-entrypoint.sh
 RUN echo /opt/sparkinfer/lib > /etc/ld.so.conf.d/sparkinfer.conf && ldconfig \
- && chmod +x /opt/sparkinfer/entrypoint.sh /opt/sparkinfer/bin/*
+ && chmod +x /opt/sparkinfer/entrypoint.sh /opt/sparkinfer/gittensor-entrypoint.sh /opt/sparkinfer/bin/*
 
 ENV MODEL_REPO=gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
     MODEL_DIR=/models/qwen38-nvfp4 \
@@ -65,4 +69,5 @@ VOLUME ["/models"]
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30m --retries=3 \
   CMD curl -fsS "http://localhost:${PORT}/health" || exit 1
-ENTRYPOINT ["/opt/sparkinfer/entrypoint.sh"]
+# gittensor-entrypoint.sh is a pass-through for everyone else: `serve`, `serve-dspark` and `bench` work as before.
+ENTRYPOINT ["/opt/sparkinfer/gittensor-entrypoint.sh"]
