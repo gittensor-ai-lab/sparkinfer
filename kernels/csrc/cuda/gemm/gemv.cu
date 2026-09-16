@@ -3989,6 +3989,22 @@ __device__ __forceinline__ void si_am_scales(const unsigned char* sc12, int j,
     const unsigned char* u = reinterpret_cast<const unsigned char*>(aux);
     a0 = u[0]; a1 = u[1]; b0 = u[2]; b1 = u[3];
 }
+// All eight (sc, m) pairs of a super-block at once. si_am_scales rebuilds them one pair at a time --
+// two 16-bit loads, masks and four byte stores per call, four calls per super-block, on every
+// super-block of every row of every CTA -- and that unpack measured ~5% of a 32-row q|gate launch.
+// Here the 12 scale bytes are three 4-byte words and each output is one word store: byte k of
+// sc/mn is exactly what si_am_scales yields for sub-block k (the low four are the stored 6-bit
+// fields; the high four OR a nibble of bytes 8..11 with the top two bits of bytes 0..3 or 4..7,
+// and neither shift can carry across a byte because the masked-off bits are zero). Bit-identical.
+__device__ __forceinline__ void si_am_scales8(const unsigned char* sc12, unsigned* sc, unsigned* mn) {
+    const unsigned* s = reinterpret_cast<const unsigned*>(sc12);
+    const unsigned u0 = s[0], u1 = s[1], u2 = s[2];
+    const unsigned m6 = 0x3f3f3f3fu, m4 = 0x0f0f0f0fu, mh = 0xc0c0c0c0u;
+    sc[0] = u0 & m6;
+    sc[1] = (u2 & m4) | ((u0 & mh) >> 2);
+    mn[0] = u1 & m6;
+    mn[1] = ((u2 >> 4) & m4) | ((u1 & mh) >> 2);
+}
 }  // namespace
 
 // SPLITK=true accumulates across blockIdx.y into an fp32 scratch, which is what a narrow output
@@ -4017,7 +4033,7 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
 
     __shared__ signed char As[MM][256];
     __shared__ signed char Bs[SI_AM_BN][256];
-    __shared__ unsigned char Ssc[SI_AM_BN][8], Smn[SI_AM_BN][8];
+    __shared__ unsigned Ssc[SI_AM_BN][2], Smn[SI_AM_BN][2];
     __shared__ float2 Wdm[SI_AM_BN];
     __shared__ float Ad[MM][8], Asum[MM][8];
 
@@ -4042,32 +4058,21 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
                 const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
                     W + (size_t)(gn < N ? gn : N - 1) * (size_t)nblk * 144) + sb;
                 const int j = c >> 1, h = c & 1;
-                const unsigned* src = reinterpret_cast<const unsigned*>(b->qs + 32 * j + h * 16);
-                signed char lo[16], hi[16];
-                #pragma unroll
-                for (int v = 0; v < 4; v++) {
-                    const unsigned x = src[v];
-                    #pragma unroll
-                    for (int t = 0; t < 4; t++) {
-                        const unsigned char qq = (unsigned char)((x >> (8 * t)) & 0xFF);
-                        lo[4 * v + t] = (signed char)(qq & 0xF);
-                        hi[4 * v + t] = (signed char)(qq >> 4);
-                    }
-                }
+                // The 16 B chunk is one aligned word: a Q4_K block is 144 B, so qs + 32j + 16h sits on a
+                // 16 B boundary of any 16 B-aligned weight (every cudaMalloc base is 256 B aligned). One
+                // uint4 load and a mask/shift per component replace four 4 B loads and the per-byte split
+                // -- the same nibbles to the same shared addresses. Bit-identical.
+                const uint4 nib = *reinterpret_cast<const uint4*>(b->qs + 32 * j + h * 16);
+                const unsigned m4 = 0x0f0f0f0fu;
+                uint4 lo, hi;
+                lo.x = nib.x & m4;        lo.y = nib.y & m4;        lo.z = nib.z & m4;        lo.w = nib.w & m4;
+                hi.x = (nib.x >> 4) & m4; hi.y = (nib.y >> 4) & m4; hi.z = (nib.z >> 4) & m4; hi.w = (nib.w >> 4) & m4;
                 const int kb = 64 * j + h * 16;
-                *reinterpret_cast<uint4*>(&Bs[r][si_am_swz(kb, r)]) =
-                    *reinterpret_cast<const uint4*>(lo);
-                *reinterpret_cast<uint4*>(&Bs[r][si_am_swz(kb + 32, r)]) =
-                    *reinterpret_cast<const uint4*>(hi);
+                *reinterpret_cast<uint4*>(&Bs[r][si_am_swz(kb, r)]) = lo;
+                *reinterpret_cast<uint4*>(&Bs[r][si_am_swz(kb + 32, r)]) = hi;
                 if (c == 0) {
                     Wdm[r] = __half22float2(b->dm);
-                    #pragma unroll
-                    for (int jj = 0; jj < 4; jj++) {
-                        unsigned char x0, x1, y0, y1;
-                        si_am_scales(b->scales, jj, x0, x1, y0, y1);
-                        Ssc[r][2 * jj] = x0; Ssc[r][2 * jj + 1] = x1;
-                        Smn[r][2 * jj] = y0; Smn[r][2 * jj + 1] = y1;
-                    }
+                    si_am_scales8(b->scales, Ssc[r], Smn[r]);
                 }
             }
         } else {
@@ -4093,13 +4098,7 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
                 *reinterpret_cast<uint4*>(&Bs[r][si_am_swz(kb, r)]) = *reinterpret_cast<const uint4*>(out);
                 if (c == 0) {
                     Wdm[r] = __half22float2(b->dm);
-                    #pragma unroll
-                    for (int jj = 0; jj < 4; jj++) {
-                        unsigned char x0, x1, y0, y1;
-                        si_am_scales(b->scales, jj, x0, x1, y0, y1);
-                        Ssc[r][2 * jj] = x0; Ssc[r][2 * jj + 1] = x1;
-                        Smn[r][2 * jj] = y0; Smn[r][2 * jj + 1] = y1;
-                    }
+                    si_am_scales8(b->scales, Ssc[r], Smn[r]);
                 }
             }
         }
@@ -4127,8 +4126,8 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
             // accumulator elements is being folded. Fetching them per element cost five shared
             // loads per output element per group; hoisting collapses that to a handful per group.
             // Ablating this fold-in measured it at 111 us of the kernel's 169.
-            const float sA = dmA.x * (float)Ssc[lnA][g],     mA = dmA.y * (float)Smn[lnA][g];
-            const float sB = dmB.x * (float)Ssc[lnA + 1][g], mB = dmB.y * (float)Smn[lnA + 1][g];
+            const float sA = dmA.x * (float)reinterpret_cast<const unsigned char*>(Ssc[lnA])[g],     mA = dmA.y * (float)reinterpret_cast<const unsigned char*>(Smn[lnA])[g];
+            const float sB = dmB.x * (float)reinterpret_cast<const unsigned char*>(Ssc[lnA + 1])[g], mB = dmB.y * (float)reinterpret_cast<const unsigned char*>(Smn[lnA + 1])[g];
             float adv[NT][2], asv[NT][2];
             #pragma unroll
             for (int ii = 0; ii < NT; ii++)
