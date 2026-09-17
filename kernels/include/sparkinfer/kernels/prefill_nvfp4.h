@@ -39,6 +39,12 @@ bool launch_prefill_nvfp4_quant_b(const void* src_bf16, void* dst_fp4, void* dst
 bool launch_prefill_nvfp4_quant_b_slice(const void* src_bf16, void* dst_fp4, void* dst_sf,
                                         int n, int n0, int rows, int k,
                                         cudaStream_t stream = nullptr);
+// The same rows read straight from GGUF Q4_K bytes (`q4k_rows` points at row n0; k must be a
+// multiple of 256). Bit-identical to launch_gguf_dequant into bf16 followed by the slice call
+// above, without the bf16 staging.
+bool launch_prefill_nvfp4_quant_b_q4k(const void* q4k_rows, void* dst_fp4, void* dst_sf,
+                                      int n, int n0, int rows, int k,
+                                      cudaStream_t stream = nullptr);
 // c_bf16 is the epilogue's source operand: non-null makes this compute
 // D = alpha*(A*B) + C instead of D = alpha*(A*B), which is how a residual add is
 // folded into the block-scaled GEMM rather than run as a separate full-tensor pass.
