@@ -4427,6 +4427,16 @@ bool launch_mmvq_q4k_mma_head_f32(const void* q81, const void* W, float* y,
     return true;
 }
 
+// Muse Glimmer's Q4_K attention and LM-head rows kernels at the batch's own width (2..5 rows)
+// instead of the 6-wide instantiation. SPARKINFER_MUSE_ROWS_EXACT=0 keeps main's dispatch.
+static bool muse_rows_exact_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_ROWS_EXACT");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
     // K is templated (KB = K/256 bounds the per-thread accumulators), so only instantiated widths
@@ -4503,7 +4513,19 @@ bool launch_mmvq_q4k_rows_multi(const void* q81, const void* const* W, void* con
 #define SI_Q4K_MULTI6(MM, ORV) si_mmvq_q4k_rows_multi_kernel<__nv_bfloat16, 26, MM, ORV, true> \
     <<<grid, 4 * 32, 0, stream>>>(q, w[0], w[1], w[2], w[3], o[0], o[1], o[2], o[3], \
                                   n[0], n[1], n[2], n[3], b1, b2, b3, M)
-    if (q6_last && wide) { if (M <= 16) SI_Q4K_MULTI6(16, 1); else SI_Q4K_MULTI6(32, 1); }
+    // MMAX sizes tmp[OROWS][MMAX], the smem fold and the unrolled row bodies, so a c2..c5 packed
+    // step on the 6-wide instantiation carries up to four empty rows through every attention
+    // grid. Each row's dots, accumulation order and fold do not depend on MMAX, so the
+    // batch-width instantiation writes the same outputs. SPARKINFER_MUSE_ROWS_EXACT=0 keeps 6.
+    if (!wide && M >= 2 && M <= 5 && muse_rows_exact_on()) {
+        switch (M) {
+            case 2: if (q6_last) SI_Q4K_MULTI6(2, SI_Q4K_OROWS); else SI_Q4K_MULTI(2, SI_Q4K_OROWS); break;
+            case 3: if (q6_last) SI_Q4K_MULTI6(3, SI_Q4K_OROWS); else SI_Q4K_MULTI(3, SI_Q4K_OROWS); break;
+            case 4: if (q6_last) SI_Q4K_MULTI6(4, SI_Q4K_OROWS); else SI_Q4K_MULTI(4, SI_Q4K_OROWS); break;
+            default: if (q6_last) SI_Q4K_MULTI6(5, SI_Q4K_OROWS); else SI_Q4K_MULTI(5, SI_Q4K_OROWS); break;
+        }
+    }
+    else if (q6_last && wide) { if (M <= 16) SI_Q4K_MULTI6(16, 1); else SI_Q4K_MULTI6(32, 1); }
     else if (q6_last) { if (M <= 6) SI_Q4K_MULTI6(6, SI_Q4K_OROWS); else SI_Q4K_MULTI6(8, SI_Q4K_OROWS); }
     else if (!wide) { if (M <= 6) SI_Q4K_MULTI(6, SI_Q4K_OROWS); else SI_Q4K_MULTI(8, SI_Q4K_OROWS); }
     else if (M <= 16) SI_Q4K_MULTI(16, 1);
@@ -4664,6 +4686,17 @@ bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
         }
         if (K == 5120 && M <= 6 && orows_env == 4) {
             si_mmvq_q4k_rows_exact_kernel<float, 20, 6, 4, 1><<<(N + 3) / 4, 4 * 32, 0, stream>>>(q, w, y, M, N);
+            return true;
+        }
+        // Muse Glimmer's LM head at the narrow packed widths: same reasoning as the Qwen3.8 4-wide
+        // head above -- a 101024-row head on the 6-wide body pays the empty rows 50512 times.
+        if (K == 6656 && M >= 2 && M <= 5 && orows_env == 0 && muse_rows_exact_on()) {
+            switch (M) {
+                case 2: si_mmvq_q4k_rows_exact_kernel<float, 26, 2, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, y, M, N); break;
+                case 3: si_mmvq_q4k_rows_exact_kernel<float, 26, 3, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, y, M, N); break;
+                case 4: si_mmvq_q4k_rows_exact_kernel<float, 26, 4, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, y, M, N); break;
+                default: si_mmvq_q4k_rows_exact_kernel<float, 26, 5, SI_Q4K_OROWS, 1><<<grid, 4 * 32, 0, stream>>>(q, w, y, M, N); break;
+            }
             return true;
         }
         #define SI_Q4K_ROWS_F32_DISPATCH(KB) \
