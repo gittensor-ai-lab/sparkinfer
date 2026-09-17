@@ -110,6 +110,16 @@ bool muse_norm_fp4_at(int n) {
     return on && n >= minn;
 }
 
+// See muse_tail_chunked in prefill_batched_run. SPARKINFER_MUSE_CHUNK_TAIL=0 restores the two
+// whole-prompt sandwich norms.
+bool muse_chunk_tail_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_CHUNK_TAIL");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
 // Muse Glimmer's FP4 FFN in token chunks (see FC in prefill_batched_run). The FC == N gate dates
 // from #1010, before the A-operand and down-operand staging were sized per consumer; with that
 // sizing the chunked pass is bit-identical to the single-chunk one (prefix-cache score at 4096
@@ -2250,6 +2260,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         }
 
         bool muse_ffn_norm_fp4 = false;   // Muse: hn left unwritten, the FP4 quantize norms h itself
+        bool muse_tail_chunked = false;   // Muse: both sandwich norms run per FFN chunk (see below)
+        int tail_rows = 0;                // rows whose post-FFN sandwich norm a chunk already ran
         const bool ffn_norm_fp4 = !c.muse_glimmer && !moe && N >= 16384 && gu_nvfp4 &&
             w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
             [] { const char* e = getenv("SPARKINFER_Q38_FFN_NORM_FP4");
@@ -2261,10 +2273,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // Sandwich (post_attn_norm/post_ffn_norm) RMSNorm uses its OWN eps 1e-8
             // (upstream post_norm_eps), NOT the model's rms_eps (1e-5) which drives
             // attn_norm/ffn_norm/q_norm/k_norm -- mirrors the decode fix (qwen35.cpp:6d911d4).
+            // A chunked FP4 FFN (FC < N) reads h one chunk at a time, so run both sandwich norms
+            // there too: the post-attn one right before the chunk's fused norm + quantize, the
+            // post-FFN one right after its down GEMM, each over rows that are still in L2 instead
+            // of a separate sweep over all N. One block per row either way, so the bytes match.
+            muse_tail_chunked = muse_chunk_tail_on() && !attn_acc && FC < N && !moe && gu_nvfp4 &&
+                muse_norm_fp4_at(N) && w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf &&
+                fp4_a && fp4_as && kernels::prefill_nvfp4_supported(N, ffn, H);
             if (attn_acc)
                 kernels::launch_norm_then_add_acc(x, qb_partials, sx, w.wo_rs, w.post_attn_norm,
                                                   h, N, H, 1e-8f, st);
-            else
+            else if (!muse_tail_chunked)
                 kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
             // hn's only consumer is the grouped FFN's row-quantize, so emit the int8 in the same
             // pass. Only when one chunk covers the prompt: a second chunk would need A_i8/sx again
@@ -2424,6 +2443,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
+                if (muse_tail_chunked)
+                    kernels::launch_norm_then_add(x + (size_t)fo * H, ao + (size_t)fo * H,
+                                                  w.post_attn_norm, h + (size_t)fo * H, fn, H,
+                                                  1e-8f, st);
                 const bool layer_fp4 = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
                     w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
                     kernels::prefill_nvfp4_supported(fn, ffn, H) &&
@@ -2468,6 +2491,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     // trailing whole-tensor add is going to be skipped, so apply them here.
                     if (ffn_fp4_resid && !down_fp4_resid)
                         kernels::launch_prefill_add(xc, ao + (size_t)fo * H, xc, (long)fn * H, st);
+                    if (muse_tail_chunked && down_fp4_done && !ffn_acc) {
+                        kernels::launch_norm_then_add(h + (size_t)fo * H, ao + (size_t)fo * H,
+                                                      w.post_ffn_norm, xc, fn, H, 1e-8f, st);
+                        tail_rows += fn;
+                    }
                     continue;
                 }
                 if (muse_ffn_norm_fp4)   // the FP4 arm declined: the arms below read the bf16 hn
@@ -2613,7 +2641,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 if (ffn_acc)
                     kernels::launch_norm_then_add_acc(h, qb_partials, sx, w.down_rs,
                                                       w.post_ffn_norm, x, N, H, 1e-8f, st);
-                else
+                else if (tail_rows != N)   // re-running rows a chunk already did is harmless
                     kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
             } else if (!ffn_fused && !ffn_fp4_resid) {
                 // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk,
