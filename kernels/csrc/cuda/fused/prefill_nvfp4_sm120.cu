@@ -806,7 +806,14 @@ bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k
 // through bf16 exactly as the dequant stores it (same d*s * nibble - dmin*m, same
 // __float2bfloat16), the amax is order-independent, and the scale, division and fp4_pack<8> are
 // quant_rows_t<2>'s.
-template <class Layout>
+//
+// SHARED (the default) is quant_rows_t<2>'s lane shape too: each lane decodes only the 8 values it
+// encodes and the two lanes of a group trade their half-amax in one shuffle. The unshared form had
+// every lane decode the whole group -- 16 unaligned byte loads and 16 bf16 round trips to use 8 --
+// and measured 25.2 ms of the 260 ms Muse prefill@4096 pass against ~17 ms for the staged
+// dequant + quantize pair it replaced. Same amax (max is order-independent), same bytes.
+// SPARKINFER_NVFP4_Q4K_SHARED_AMAX=0 restores the unshared lanes (A/B in ONE binary).
+template <bool SHARED, class Layout>
 __global__ void quant_b_q4k_kernel(const unsigned char* __restrict__ src,
                                    unsigned char* __restrict__ dst, cutlass::float_ue4m3_t* sf,
                                    int rows, int cols, Layout layout, int n0) {
@@ -841,12 +848,16 @@ __global__ void quant_b_q4k_kernel(const unsigned char* __restrict__ src,
     const unsigned char* qp = blk + 16 + jj * 32 + (g0 & 31);
     float x[16];
     float a = 0.f;
+    const int v0 = SHARED ? sub * 8 : 0;         // first value this lane decodes
+    const int nv = SHARED ? 8 : 16;
     #pragma unroll
-    for (int t = 0; t < 16; t++) {
-        const int nib = hn ? (qp[t] >> 4) : (qp[t] & 0xF);
-        x[t] = __bfloat162float(__float2bfloat16(dd * nib - mm));
-        a = fmaxf(a, fabsf(x[t]));
+    for (int t = 0; t < nv; t++) {
+        const unsigned char qb = qp[v0 + t];
+        const int nib = hn ? (qb >> 4) : (qb & 0xF);
+        x[v0 + t] = __bfloat162float(__float2bfloat16(dd * nib - mm));
+        a = fmaxf(a, fabsf(x[v0 + t]));
     }
+    if constexpr (SHARED) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
     cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
     const float qsf = float(qs);
     float xq[8];
@@ -869,9 +880,18 @@ bool launch_prefill_nvfp4_quant_b_q4k(const void* s, void* d, void* sf, int n, i
         return false;
     auto l = sfb_layout(128,n,k);
     const long warps = (long)rows * (k >> 8);
-    quant_b_q4k_kernel<<<(unsigned)((warps * 32 + 255) / 256),256,0,st>>>(
-        (const unsigned char*)s, (unsigned char*)d + (((size_t)n0 * k) >> 1),
-        (cutlass::float_ue4m3_t*)sf, rows, k, l, n0);
+    static const bool shared = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_Q4K_SHARED_AMAX"); return !(e && e[0] == '0');
+    }();
+    const unsigned blocks = (unsigned)((warps * 32 + 255) / 256);
+    if (shared)
+        quant_b_q4k_kernel<true><<<blocks,256,0,st>>>(
+            (const unsigned char*)s, (unsigned char*)d + (((size_t)n0 * k) >> 1),
+            (cutlass::float_ue4m3_t*)sf, rows, k, l, n0);
+    else
+        quant_b_q4k_kernel<false><<<blocks,256,0,st>>>(
+            (const unsigned char*)s, (unsigned char*)d + (((size_t)n0 * k) >> 1),
+            (cutlass::float_ue4m3_t*)sf, rows, k, l, n0);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 // Rows [n0, n0+rows) of an `n`-row B operand, quantized from a bf16 buffer holding ONLY those
