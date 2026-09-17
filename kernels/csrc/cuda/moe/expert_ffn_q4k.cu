@@ -2090,8 +2090,28 @@ __device__ __forceinline__ void si_mma_q4k_scales8(const unsigned char* sc12, un
 // Rows that survive compute the same products from the same operands in the same order, so the
 // output is bit-identical to the MM=32 kernel at every M -- this only stops computing the rows
 // the `lm < M` guard was already throwing away.
-template <int MM>
-__global__ __launch_bounds__(SI_MMA_NW * 32, 8)
+// CG is how many SI_MMA_BN-wide column blocks one CTA serves off a SINGLE staged A tile.
+//
+// The A tile is the reason: every CTA in the N direction stages the same M x 256 activation slice
+// out of L2, so the activation is re-read H/SI_MMA_BN times per super-block. At the real down shape
+// that is 208 re-reads -- 4.67 MB per row of M per layer against a 74.8 MB weight read, so at 32
+// rows the kernel moves 149.6 MB of activation to move 74.8 MB of weights. Measured across widths,
+// the launch sits on a flat 2.2-2.6 TB/s of TOTAL L2 read traffic (M=16: 149.6 MB / 67.9 us; M=32:
+// 224.4 MB / 94.4 us), while the weight bytes alone would be a 41.7 us DRAM read -- the ceiling it
+// hits is L2, not DRAM, and the activation is what fills L2.
+//
+// Serving CG column blocks from one staged A cuts that re-read by CG. Bs is reloaded per column
+// block rather than widened, so the shared footprint -- and with it the 5 CTAs/SM the MM=32 tile
+// allows -- is exactly what it was. Each output element still reduces its own K in the same order
+// over the same super-blocks, so only which CTA owns a column changes.
+template <int MM> struct si_mma_shm { static constexpr int B = MM * 320 + SI_MMA_BN * 280; };
+template <int MM, int CG> struct si_mma_lb {
+    static constexpr int occ = 102400 / si_mma_shm<MM>::B;
+    static constexpr int v = CG == 1 ? 8 : (occ > 8 ? 8 : occ);
+};
+
+template <int MM, int CG = 1>
+__global__ __launch_bounds__(SI_MMA_NW * 32, si_mma_lb<MM, CG>::v)
 void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                               const int* __restrict__ expert_ids,
                               const float* __restrict__ expert_weights,
@@ -2100,7 +2120,7 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                               int H, int F, int top_k, int M, int pdl, int bdedup) {
     if (pdl) si_pdl_sync();
     const int nblk = F >> 8;
-    const int n0 = blockIdx.x * SI_MMA_BN;
+    const int n0 = blockIdx.x * (SI_MMA_BN * CG);
     // Balanced, not ceil: 78 super-blocks over 8 splits is 10,10,10,10,10,10,9,9 rather than seven
     // 10s and an 8, and the launch waits for the longest split.
     const int sk = (int)gridDim.y;
@@ -2118,150 +2138,170 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
     __shared__ float Ad[MM][8], Asum[MM][8];
 
     constexpr int NT = (MM + 15) / 16;   // 16-row mma tiles this width actually needs
-    float facc[NT][4];
+    float facc[CG][NT][4];
     #pragma unroll
-    for (int i = 0; i < NT; i++)
+    for (int c = 0; c < CG; c++)
         #pragma unroll
-        for (int e = 0; e < 4; e++) facc[i][e] = 0.f;
+        for (int i = 0; i < NT; i++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) facc[c][i][e] = 0.f;
 
     for (int sb = sb_lo; sb < sb_hi; sb++) {
-        // One 16B output chunk per unit: the swizzle permutes whole 16B chunks, so addresses
-        // inside a chunk are contiguous and each unit is a single uint4 store.
-        // A Q4_K byte carries TWO weights and the two land 32 int8 lanes apart in Bs. Indexing
-        // the 16 B chunk and the nibble half together (c = 0..15, hi = c>>1&1) made this loop
-        // walk the super-block's 128 B quant plane TWICE -- once fetching the low nibbles and
-        // once, from the identical addresses, the high ones. Eight units, one fetch, two stores:
-        // the same bytes reach the same shared addresses and the global load count halves.
-        // Bit-identical. SPARKINFER_MMA_BDEDUP=0 restores the two-pass loader.
-        if (bdedup) {
-            for (int u = tid; u < SI_MMA_BN * 8; u += SI_MMA_NW * 32) {
-                const int r = u >> 3, c = u & 7;
-                const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
-                    down_q + ((size_t)e0 * H + (n0 + r)) * (size_t)nblk * 144) + sb;
-                const int j = c >> 1, h = c & 1;
-                // The 16 B chunk is one aligned word: a Q4_K block is 144 B, so qs + 32j + 16h sits on a
-                // 16 B boundary of any 16 B-aligned weight (every cudaMalloc base is 256 B aligned). One
-                // uint4 load and a mask/shift per component replace four 4 B loads and the per-byte split
-                // -- the same nibbles to the same shared addresses. Bit-identical.
-                const uint4 nib = *reinterpret_cast<const uint4*>(b->qs + 32 * j + h * 16);
-                const unsigned m4 = 0x0f0f0f0fu;
-                uint4 lo, hi;
-                lo.x = nib.x & m4;        lo.y = nib.y & m4;        lo.z = nib.z & m4;        lo.w = nib.w & m4;
-                hi.x = (nib.x >> 4) & m4; hi.y = (nib.y >> 4) & m4; hi.z = (nib.z >> 4) & m4; hi.w = (nib.w >> 4) & m4;
-                const int kb = 64 * j + h * 16;
-                *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = lo;
-                *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb + 32, r)]) = hi;
-                if (c == 0) {
-                    Wdm[r] = __half22float2(b->dm);
-                    si_mma_q4k_scales8(b->scales, Ssc[r], Smn[r]);
-                }
-            }
-        } else {
-            for (int u = tid; u < SI_MMA_BN * 16; u += SI_MMA_NW * 32) {
-                const int r = u >> 4, c = u & 15;
-                const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
-                    down_q + ((size_t)e0 * H + (n0 + r)) * (size_t)nblk * 144) + sb;
-                const int j = c >> 2, sc_ = c & 3;
-                const bool hi = (sc_ >> 1) & 1;
-                const unsigned* src = reinterpret_cast<const unsigned*>(b->qs + 32 * j + (sc_ & 1) * 16);
-                signed char out[16];
-                #pragma unroll
-                for (int v = 0; v < 4; v++) {
-                    const unsigned x = src[v];
-                    #pragma unroll
-                    for (int t = 0; t < 4; t++) {
-                        const unsigned char q = (unsigned char)((x >> (8 * t)) & 0xFF);
-                        out[4 * v + t] = (signed char)(hi ? (q >> 4) : (q & 0xF));
+        // One staged A tile, CG column blocks. Bs, its scales and dm are reloaded per block;
+        // the trailing barrier of the previous block is what makes that reuse safe.
+        //
+        // Fully unrolled, and it has to be: a rolled loop makes cg a runtime index into facc, which
+        // ptxas cannot hold in registers -- it gave the MM=32 kernel a 64 B stack frame at CG=2 and
+        // 128 B at CG=4, putting every fold-in through local memory. That arm measured 1233 tok/s
+        // at cb c32 against the CG=1 arm's 1533.
+        #pragma unroll
+        for (int cg = 0; cg < CG; cg++) {
+            const int nbase = n0 + cg * SI_MMA_BN;
+            // One 16B output chunk per unit: the swizzle permutes whole 16B chunks, so addresses
+            // inside a chunk are contiguous and each unit is a single uint4 store.
+            // A Q4_K byte carries TWO weights and the two land 32 int8 lanes apart in Bs. Indexing
+            // the 16 B chunk and the nibble half together (c = 0..15, hi = c>>1&1) made this loop
+            // walk the super-block's 128 B quant plane TWICE -- once fetching the low nibbles and
+            // once, from the identical addresses, the high ones. Eight units, one fetch, two stores:
+            // the same bytes reach the same shared addresses and the global load count halves.
+            // Bit-identical. SPARKINFER_MMA_BDEDUP=0 restores the two-pass loader.
+            if (bdedup) {
+                for (int u = tid; u < SI_MMA_BN * 8; u += SI_MMA_NW * 32) {
+                    const int r = u >> 3, c = u & 7;
+                    const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
+                        down_q + ((size_t)e0 * H + (nbase + r)) * (size_t)nblk * 144) + sb;
+                    const int j = c >> 1, h = c & 1;
+                    // The 16 B chunk is one aligned word: a Q4_K block is 144 B, so qs + 32j + 16h sits on a
+                    // 16 B boundary of any 16 B-aligned weight (every cudaMalloc base is 256 B aligned). One
+                    // uint4 load and a mask/shift per component replace four 4 B loads and the per-byte split
+                    // -- the same nibbles to the same shared addresses. Bit-identical.
+                    const uint4 nib = *reinterpret_cast<const uint4*>(b->qs + 32 * j + h * 16);
+                    const unsigned m4 = 0x0f0f0f0fu;
+                    uint4 lo, hi;
+                    lo.x = nib.x & m4;        lo.y = nib.y & m4;        lo.z = nib.z & m4;        lo.w = nib.w & m4;
+                    hi.x = (nib.x >> 4) & m4; hi.y = (nib.y >> 4) & m4; hi.z = (nib.z >> 4) & m4; hi.w = (nib.w >> 4) & m4;
+                    const int kb = 64 * j + h * 16;
+                    *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = lo;
+                    *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb + 32, r)]) = hi;
+                    if (c == 0) {
+                        Wdm[r] = __half22float2(b->dm);
+                        si_mma_q4k_scales8(b->scales, Ssc[r], Smn[r]);
                     }
                 }
-                const int kb = 64 * j + (sc_ >> 1) * 32 + (sc_ & 1) * 16;
-                *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = *reinterpret_cast<const uint4*>(out);
-                if (c == 0) {
-                    Wdm[r] = __half22float2(b->dm);
-                    si_mma_q4k_scales8(b->scales, Ssc[r], Smn[r]);
+            } else {
+                for (int u = tid; u < SI_MMA_BN * 16; u += SI_MMA_NW * 32) {
+                    const int r = u >> 4, c = u & 15;
+                    const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
+                        down_q + ((size_t)e0 * H + (nbase + r)) * (size_t)nblk * 144) + sb;
+                    const int j = c >> 2, sc_ = c & 3;
+                    const bool hi = (sc_ >> 1) & 1;
+                    const unsigned* src = reinterpret_cast<const unsigned*>(b->qs + 32 * j + (sc_ & 1) * 16);
+                    signed char out[16];
+                    #pragma unroll
+                    for (int v = 0; v < 4; v++) {
+                        const unsigned x = src[v];
+                        #pragma unroll
+                        for (int t = 0; t < 4; t++) {
+                            const unsigned char q = (unsigned char)((x >> (8 * t)) & 0xFF);
+                            out[4 * v + t] = (signed char)(hi ? (q >> 4) : (q & 0xF));
+                        }
+                    }
+                    const int kb = 64 * j + (sc_ >> 1) * 32 + (sc_ & 1) * 16;
+                    *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = *reinterpret_cast<const uint4*>(out);
+                    if (c == 0) {
+                        Wdm[r] = __half22float2(b->dm);
+                        si_mma_q4k_scales8(b->scales, Ssc[r], Smn[r]);
+                    }
                 }
             }
-        }
-        // hq8's qs sits at offset 4 of a 36B struct: 4B-aligned, never 16B. Read four uints.
-        for (int u = tid; u < M * 16; u += SI_MMA_NW * 32) {
-            const int r = u >> 4, c = u & 15;
-            const si_block_q8_1* a = hq8 + (size_t)r * (F >> 5) + sb * 8 + (c >> 1);
-            const unsigned* src = reinterpret_cast<const unsigned*>(a->qs + (c & 1) * 16);
-            uint4 v; v.x = src[0]; v.y = src[1]; v.z = src[2]; v.w = src[3];
-            *reinterpret_cast<uint4*>(&As[r][si_mma_swz(16 * c, r)]) = v;
-            if ((c & 1) == 0) {
-                const float2 ds = __half22float2(a->ds);
-                Ad[r][c >> 1] = ds.x; Asum[r][c >> 1] = ds.y;
+            // Only the first column block stages A, and it does so AFTER the weight load so the
+            // long-latency DRAM read is the one issued first -- the order the single-block kernel
+            // had. Compile-time, because the cg loop is unrolled.
+            if (cg == 0) {
+                // hq8's qs sits at offset 4 of a 36B struct: 4B-aligned, never 16B. Read four uints.
+                for (int u = tid; u < M * 16; u += SI_MMA_NW * 32) {
+                    const int r = u >> 4, c = u & 15;
+                    const si_block_q8_1* a = hq8 + (size_t)r * (F >> 5) + sb * 8 + (c >> 1);
+                    const unsigned* src = reinterpret_cast<const unsigned*>(a->qs + (c & 1) * 16);
+                    uint4 v; v.x = src[0]; v.y = src[1]; v.z = src[2]; v.w = src[3];
+                    *reinterpret_cast<uint4*>(&As[r][si_mma_swz(16 * c, r)]) = v;
+                    if ((c & 1) == 0) {
+                        const float2 ds = __half22float2(a->ds);
+                        Ad[r][c >> 1] = ds.x; Asum[r][c >> 1] = ds.y;
+                    }
+                }
             }
-        }
-        __syncthreads();
+            __syncthreads();
 
-        const int lnA = warp * 8 + tig * 2;
-        const float2 dmA = Wdm[lnA], dmB = Wdm[lnA + 1];
-        #pragma unroll 1
-        for (int g = 0; g < 8; g++) {
-            const int kk = g * 32;
-            // The (dm, sc, m) triple depends only on the output COLUMN and the scale group, and
-            // (Ad, Asum) only on the row and the group -- neither depends on which of the four
-            // accumulator elements is being folded. Fetching them per element cost five shared
-            // loads per output element per group; hoisting collapses that to a handful per group.
-            // Ablating this fold-in measured it at 111 us of the kernel's 169.
-            const float sA = dmA.x * (float)reinterpret_cast<const unsigned char*>(Ssc[lnA])[g],     mA = dmA.y * (float)reinterpret_cast<const unsigned char*>(Smn[lnA])[g];
-            const float sB = dmB.x * (float)reinterpret_cast<const unsigned char*>(Ssc[lnA + 1])[g], mB = dmB.y * (float)reinterpret_cast<const unsigned char*>(Smn[lnA + 1])[g];
-            float adv[NT][2], asv[NT][2];
-            #pragma unroll
-            for (int ii = 0; ii < NT; ii++)
+            const int lnA = warp * 8 + tig * 2;
+            const float2 dmA = Wdm[lnA], dmB = Wdm[lnA + 1];
+            #pragma unroll 1
+            for (int g = 0; g < 8; g++) {
+                const int kk = g * 32;
+                // The (dm, sc, m) triple depends only on the output COLUMN and the scale group, and
+                // (Ad, Asum) only on the row and the group -- neither depends on which of the four
+                // accumulator elements is being folded. Fetching them per element cost five shared
+                // loads per output element per group; hoisting collapses that to a handful per group.
+                // Ablating this fold-in measured it at 111 us of the kernel's 169.
+                const float sA = dmA.x * (float)reinterpret_cast<const unsigned char*>(Ssc[lnA])[g],     mA = dmA.y * (float)reinterpret_cast<const unsigned char*>(Smn[lnA])[g];
+                const float sB = dmB.x * (float)reinterpret_cast<const unsigned char*>(Ssc[lnA + 1])[g], mB = dmB.y * (float)reinterpret_cast<const unsigned char*>(Smn[lnA + 1])[g];
+                float adv[NT][2], asv[NT][2];
                 #pragma unroll
-                for (int eh = 0; eh < 2; eh++) {
-                    const int lmv = ii * 16 + grp + eh * 8;
-                    adv[ii][eh] = lmv < M ? Ad[lmv][g]   : 0.f;
-                    asv[ii][eh] = lmv < M ? Asum[lmv][g] : 0.f;
-                }
+                for (int ii = 0; ii < NT; ii++)
+                    #pragma unroll
+                    for (int eh = 0; eh < 2; eh++) {
+                        const int lmv = ii * 16 + grp + eh * 8;
+                        adv[ii][eh] = lmv < M ? Ad[lmv][g]   : 0.f;
+                        asv[ii][eh] = lmv < M ? Asum[lmv][g] : 0.f;
+                    }
 
-            unsigned af[NT][4], bf[2];
-            #pragma unroll
-            for (int i = 0; i < NT; i++) {
-                const int row = i * 16 + (sub & 1) * 8 + lrow;
-                si_mma_ldm(af[i][0], af[i][1], af[i][2], af[i][3],
-                           &As[row < MM ? row : 0][si_mma_swz(kk + (sub >> 1) * 16, row)]);
-            }
-            unsigned bx, by;
-            const int col = warp * 8 + lrow;
-            si_mma_ldm(bf[0], bf[1], bx, by, &Bs[col][si_mma_swz(kk + (sub & 1) * 16, col)]);
-            (void)bx; (void)by;
-
-            #pragma unroll
-            for (int i = 0; i < NT; i++) {
-                int acc[4] = {0, 0, 0, 0};
-                asm volatile(
-                    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                    : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
-                    : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
-                      "r"(bf[0]), "r"(bf[1]));
+                unsigned af[NT][4], bf[2];
                 #pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    const int lm = i * 16 + grp + (e >> 1) * 8;
-                    if (lm >= M) continue;
-                    // same products in the same association as the per-element form:
-                    // ((dm.x*sc)*Ad)*acc - (dm.y*m)*Asum
-                    const int ep = e & 1;
-                    const float sc = ep ? sB : sA, mn = ep ? mB : mA;
-                    facc[i][e] += sc * adv[i][e >> 1] * (float)acc[e] - mn * asv[i][e >> 1];
+                for (int i = 0; i < NT; i++) {
+                    const int row = i * 16 + (sub & 1) * 8 + lrow;
+                    si_mma_ldm(af[i][0], af[i][1], af[i][2], af[i][3],
+                               &As[row < MM ? row : 0][si_mma_swz(kk + (sub >> 1) * 16, row)]);
+                }
+                unsigned bx, by;
+                const int col = warp * 8 + lrow;
+                si_mma_ldm(bf[0], bf[1], bx, by, &Bs[col][si_mma_swz(kk + (sub & 1) * 16, col)]);
+                (void)bx; (void)by;
+
+                #pragma unroll
+                for (int i = 0; i < NT; i++) {
+                    int acc[4] = {0, 0, 0, 0};
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                        : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
+                        : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
+                          "r"(bf[0]), "r"(bf[1]));
+                    #pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        const int lm = i * 16 + grp + (e >> 1) * 8;
+                        if (lm >= M) continue;
+                        // same products in the same association as the per-element form:
+                        // ((dm.x*sc)*Ad)*acc - (dm.y*m)*Asum
+                        const int ep = e & 1;
+                        const float sc = ep ? sB : sA, mn = ep ? mB : mA;
+                        facc[cg][i][e] += sc * adv[i][e >> 1] * (float)acc[e] - mn * asv[i][e >> 1];
+                    }
                 }
             }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     #pragma unroll
-    for (int i = 0; i < NT; i++)
+    for (int c = 0; c < CG; c++)
         #pragma unroll
-        for (int e = 0; e < 4; e++) {
-            const int lm = i * 16 + grp + (e >> 1) * 8;
-            const int gn = n0 + warp * 8 + tig * 2 + (e & 1);
-            if (lm < M && gn < H) atomicAdd(&acc_out[(size_t)lm * H + gn], facc[i][e]);
-        }
+        for (int i = 0; i < NT; i++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int lm = i * 16 + grp + (e >> 1) * 8;
+                const int gn = n0 + c * SI_MMA_BN + warp * 8 + tig * 2 + (e & 1);
+                if (lm < M && gn < H) atomicAdd(&acc_out[(size_t)lm * H + gn], facc[c][i][e]);
+            }
 }
 
 // Scales by the expert weight, narrows to bf16, and re-zeroes what it consumed so the next call
@@ -2301,6 +2341,35 @@ static inline int si_mma_bdedup() {
     return on;
 }
 
+// How many SI_MMA_BN column blocks one CTA serves off a single staged A tile, and the K-split that
+// keeps the grid a whole wave once CG has divided the block count. SPARKINFER_MMA_COLGROUPS=1
+// restores the one-block-per-CTA launch, and SPARKINFER_MMA_SK pins the split, so every arm of an
+// A/B comes out of ONE binary.
+static inline int si_mma_colgroups() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_MMA_COLGROUPS");
+        const int x = e ? atoi(e) : 2;
+        return (x == 1 || x == 2 || x == 4) ? x : 2;
+    }();
+    return v;
+}
+static inline int si_mma_colgroups_minrows() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_MMA_COLGROUPS_MINROWS");
+        const int x = e ? atoi(e) : 32;
+        return x < 2 ? 2 : x;
+    }();
+    return v;
+}
+static inline int si_mma_sk_env() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_MMA_SK");
+        const int x = e ? atoi(e) : 0;
+        return (x >= 1 && x <= 64) ? x : 0;
+    }();
+    return v;
+}
+
 static inline int si_mma_astage(int M) {
     static const int on = [] {
         const char* e = getenv("SPARKINFER_MMA_ASTAGE");
@@ -2324,19 +2393,33 @@ static inline bool launch_down_q4k_mma_rows(
         return false;
     acc_scratch += (size_t)slot * SI_MMA_MMAX * 6656u;
     const int nblk = F >> 8;
-    int sk = SI_MMA_SK; if (sk > nblk) sk = nblk;   // never launch a split with nothing to reduce
+    // Folding CG column blocks into one CTA divides the grid's N extent by CG, so the split-K that
+    // kept it a whole wave has to grow with it: 208x8 becomes 104x8 at CG=2 and 52x16 at CG=4.
+    // The activation re-read the column groups remove scales with M, and so does what they cost.
+    // Below the full 32-row width the balance is no longer one-sided: at eight rows the saving is an
+    // eighth of what it is at 32 and the extra barriers are not paid for (Qwen3.8 cb c8 -0.9%), and
+    // sixteen splits the two models (Muse cb c16 +1.0%, Qwen3.8 cb c16 -0.6%). Only the width where
+    // the saving is unambiguous takes it. SPARKINFER_MMA_COLGROUPS_MINROWS pins the floor.
+    int cg = M >= si_mma_colgroups_minrows() ? si_mma_colgroups() : 1;
+    while (cg > 1 && (H % (SI_MMA_BN * cg))) cg >>= 1;
+    int sk = si_mma_sk_env() ? si_mma_sk_env() : SI_MMA_SK * (cg >= 4 ? 2 : 1);
+    if (sk > nblk) sk = nblk;   // never launch a split with nothing to reduce
     const size_t n = (size_t)M * (size_t)H;
-    const dim3 g(H / SI_MMA_BN, sk), blk(SI_MMA_NW * 32);
+    const dim3 g(H / (SI_MMA_BN * cg), sk), blk(SI_MMA_NW * 32);
     const int bd = si_mma_bdedup();
-    if (si_mma_astage(M) <= 8)
-        launch_pdl_kernel(pdl, g, blk, 0, stream, down_q4k_mma_rows_kernel<8>, down_q, expert_ids,
-                          expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd);
-    else if (si_mma_astage(M) <= 16)
-        launch_pdl_kernel(pdl, g, blk, 0, stream, down_q4k_mma_rows_kernel<16>, down_q, expert_ids,
-                          expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd);
-    else
-        launch_pdl_kernel(pdl, g, blk, 0, stream, down_q4k_mma_rows_kernel<SI_MMA_MMAX>, down_q,
-                          expert_ids, expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd);
+    const int as = si_mma_astage(M);
+#define SI_MMA_DOWN_LAUNCH(MMV, CGV)                                                              \
+    launch_pdl_kernel(pdl, g, blk, 0, stream, down_q4k_mma_rows_kernel<MMV, CGV>, down_q,          \
+                      expert_ids, expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd)
+#define SI_MMA_DOWN_BY_CG(MMV)                                                                    \
+    do { if (cg == 4) SI_MMA_DOWN_LAUNCH(MMV, 4);                                                 \
+         else if (cg == 2) SI_MMA_DOWN_LAUNCH(MMV, 2);                                            \
+         else SI_MMA_DOWN_LAUNCH(MMV, 1); } while (0)
+    if (as <= 8)       SI_MMA_DOWN_BY_CG(8);
+    else if (as <= 16) SI_MMA_DOWN_BY_CG(16);
+    else               SI_MMA_DOWN_BY_CG(SI_MMA_MMAX);
+#undef SI_MMA_DOWN_BY_CG
+#undef SI_MMA_DOWN_LAUNCH
     const int thr = 256;
     down_q4k_mma_epilogue_kernel<<<(unsigned)((n + thr - 1) / thr), thr, 0, stream>>>(
         acc_scratch, expert_weights, output, H, top_k, M);
