@@ -87,6 +87,42 @@ struct Arena {
 // that width is actually used, so unused tiers cost nothing.
 constexpr int kVerifyMaxRows = 32;
 
+// Muse Glimmer's sandwich layers read each pre-norm (ffn_norm, and the next layer's input_norm)
+// only through the FP4 A-operand quantize, yet wrote the bf16 norm first and then quantized it:
+// two passes over [N, H] per site, the first a 2 B/element store nothing else reads.
+// launch_prefill_nvfp4_rmsnorm_quant_a does both in one pass (Qwen3.8 has run it at 16k+ since
+// #941). Not byte-identical: on Muse's real layer-0 FFN activation (4096 x 6656) one e2m1 nibble in
+// 13.6 MB lands the other side of a rounding tie. Against the token loop (qwen3_gguf_prefill_check,
+// prefix 4096 with _MINN=128, SPARKINFER_MUSE_ATTN_MMA=0) it reads TOP1 15/16 KL 0.068, against
+// 14/16 KL 0.080 without it. It is worth ~1% of a 4096-token pass (the bf16 norm still fits L2
+// there) against 3% of a 16384 one, so it runs only from SPARKINFER_MUSE_NORM_FP4_MINN (8192) up:
+// every shorter pass, including the continuous-batch prefills, keeps main's exact operand. Any arm
+// that declines writes the bf16 norm after all. SPARKINFER_MUSE_NORM_FP4=0 restores the two passes.
+bool muse_norm_fp4_at(int n) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NORM_FP4");
+        return !(e && e[0] == '0');
+    }();
+    static const int minn = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NORM_FP4_MINN");
+        return e ? atoi(e) : 8192;
+    }();
+    return on && n >= minn;
+}
+
+// Muse Glimmer's FP4 FFN in token chunks (see FC in prefill_batched_run). The FC == N gate dates
+// from #1010, before the A-operand and down-operand staging were sized per consumer; with that
+// sizing the chunked pass is bit-identical to the single-chunk one (prefix-cache score at 4096
+// forced to 1024-token chunks: dump identical, 503/503). SPARKINFER_MUSE_FP4_CHUNKED=0 restores
+// the single-chunk-only FP4 FFN.
+bool muse_fp4_chunked_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_FP4_CHUNKED");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
 struct VerifyGraphCache {
     Arena arena;
     cudaGraph_t graph[kVerifyMaxRows + 1] = {};
@@ -318,18 +354,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         return c;
     }();
     int FC = (N < ffn_chunk) ? N : ffn_chunk;
-    // Muse's FP4 FFN legs are correct only while the FFN runs in ONE chunk. The chunked loop
-    // still carries an FC-vs-N assumption of its own (separate from the fp4_a sizing fixed
-    // below): with FC < N it produces degenerate output, while FC == N reproduces the int8 token
-    // stream. That path had never run, because the only context Muse was allowed on FP4 was
-    // N == 128, where FC == N gives exactly one chunk anyway.
-    // Unchunking is worth +6% by itself and unlocks ~+60% of FP4 GEMM, so take it where the
-    // arena can hold the N-row staging; where it cannot, FC stays chunked and the FP4 gate below
-    // (FC == N) leaves Muse on exactly the int8 path it runs today.
+    // Muse's FP4 FFN used to be correct only in ONE chunk, so it unchunked every pass up to 16384
+    // tokens. Now that chunks are exact (muse_fp4_chunked_on), unchunk only up to 4096: past that
+    // the [N, H] and [N, ffn] operands overflow L2, and a 16384-token pass (the 16k prompt, and
+    // every window of a 32k/64k one) measured on an RTX 5090 (nsys, one pass):
+    //
+    //     FC       16384    4096    2048    1024
+    //     pass ms   1060    1022    1044    1085      (4096-token pass: FC=N 241.7, 2048 245)
+    //
+    // the down GEMM alone going 15.0 -> 10.5 us/token. SPARKINFER_MUSE_FP4_UNCHUNK_MAXN overrides.
     if (c.muse_glimmer && !s.w.layers.empty() && s.w.layers[0].gate_fp4) {
         static const int unchunk_max = [] {
             const char* e = getenv("SPARKINFER_MUSE_FP4_UNCHUNK_MAXN");
-            return e ? atoi(e) : 16384;
+            return e ? atoi(e) : (muse_fp4_chunked_on() ? 4096 : 16384);
         }();
         if (N <= unchunk_max) FC = N;
     }
@@ -706,7 +743,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // fallback that cannot happen. All-or-nothing across layers, because ONE layer without an
     // FP4 gate/up operand still needs the buffer.
     const bool ffn_all_fp4 = !moe && c.muse_glimmer && !s.w.layers.empty() &&
-        FC == N && N >= 128 && N <= muse_fp4_maxN &&
+        (FC == N || muse_fp4_chunked_on()) && N >= 128 && N <= muse_fp4_maxN &&
         kernels::prefill_nvfp4_supported(N, ffn, H) &&
         [&] {
             for (const Qwen35LayerWeights& lw : s.w.layers)
@@ -876,7 +913,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // prefill_nvfp4_supported() already answers, so ask it instead of pinning one context.
     // SPARKINFER_MUSE_NVFP4_MAXN caps it again (128 restores the old behaviour).
     const bool muse_nvfp4 = c.muse_glimmer && N >= 128 && N <= muse_fp4_maxN &&
-                            FC == N &&          // chunked FP4 FFN is not correct yet; see FC above
+                            (FC == N || muse_fp4_chunked_on()) &&
                             !s.w.layers.empty() &&
                             s.w.layers[0].gate_fp4 &&
                             kernels::prefill_nvfp4_supported(N, ffn, H);
@@ -1121,7 +1158,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // an error anywhere: `down_fp4_done` just tests fp4_down_a and quietly falls through, so the
     // whole native-FP4 ffn_down leg was silently off at exactly the context it is worth the most,
     // leaving `down` on dequant-to-int8 + int8 GEMM (nsys: 6.0% + 12.9% of the prefill).
-    // Muse is unaffected: it only reaches here at N == 128, where FC == N.
+    // Muse chunks its FP4 FFN too above 4096 tokens (see FC), so the same FC sizing applies.
     unsigned char* fp4_down_a = nvfp4_down
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(fp4_rows, ffn)) : nullptr;
     unsigned char* fp4_down_as = nvfp4_down
@@ -1877,7 +1914,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // 2.2 MB of copy per layer against ~25 MB less weight traffic.
                 bool qkvg_fp4 = false;
                 if (muse_nvfp4_qkv && w.qkvg_fp4 && w.qkvg_fp4_sf && fp4_a && fp4_as && fp4_qkv &&
-                    kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_as, N, H, st) &&
+                    (attn_norm_deferred
+                     ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
+                           x, w.input_norm, fp4_a, fp4_as, N, H, eps, st)
+                     : kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_as, N, H, st)) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.qkvg_fp4, w.qkvg_fp4_sf,
                                                        fp4_qkv, N, qkvg_n, H, fp4_ws, st)) {
                     // q, k and v are NOT copied out: the QK-norm + RoPE + KV-append kernel below
@@ -1912,6 +1952,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         }
                     }
                 }
+                // The previous layer left xn unwritten for the fused norm above; every arm below
+                // reads the bf16 xn, so write it after all when that arm did not take the layer.
+                if (!qkvg_fp4 && attn_norm_deferred)
+                    kernels::launch_rmsnorm(x, w.input_norm, xn, N, H, eps, st);
                 if (!qkvg_fp4 && muse_group && muse_qb && use_i8 &&
                     kernels::pfm_moe_gemm_qi8_supported(w.wq_type)) {
                     const int at = w.wq_type;
@@ -2205,6 +2249,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             use_i8 = restore_i8;
         }
 
+        bool muse_ffn_norm_fp4 = false;   // Muse: hn left unwritten, the FP4 quantize norms h itself
         const bool ffn_norm_fp4 = !c.muse_glimmer && !moe && N >= 16384 && gu_nvfp4 &&
             w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
             [] { const char* e = getenv("SPARKINFER_Q38_FFN_NORM_FP4");
@@ -2243,7 +2288,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             const bool ffn_fp4_certain = ffn_i8_skip && !moe && gu_nvfp4 &&
                 w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
                 kernels::prefill_nvfp4_supported(N, ffn, H);
-            if (!ffn_fp4_certain && muse_ffn_group && muse_qb && use_i8 && FC >= N &&
+            muse_ffn_norm_fp4 = muse_norm_fp4_at(N) && !moe && gu_nvfp4 &&
+                w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
+                kernels::prefill_nvfp4_supported(N, ffn, H);
+            if (muse_ffn_norm_fp4) {
+                // hn's only reader is the FP4 A-operand quantize below, which takes the norm itself.
+            } else if (!ffn_fp4_certain && muse_ffn_group && muse_qb && use_i8 && FC >= N &&
                 kernels::launch_rmsnorm_quant_i8(h, w.ffn_norm, hn, A_i8, sx, N, H, eps, st,
                                                  A_i8p)) {
                 hn_quantized = true;
@@ -2377,7 +2427,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 const bool layer_fp4 = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
                     w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
                     kernels::prefill_nvfp4_supported(fn, ffn, H) &&
-                    (ffn_norm_fp4
+                    (muse_ffn_norm_fp4
+                     ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
+                           h + (size_t)fo * H, w.ffn_norm, fp4_a, fp4_as, fn, H, eps, st)
+                     : ffn_norm_fp4
                      ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
                            x + (size_t)fo * H, w.post_attn_norm,
                            fp4_a, fp4_as, fn, H, eps, st)
@@ -2417,6 +2470,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         kernels::launch_prefill_add(xc, ao + (size_t)fo * H, xc, (long)fn * H, st);
                     continue;
                 }
+                if (muse_ffn_norm_fp4)   // the FP4 arm declined: the arms below read the bf16 hn
+                    kernels::launch_rmsnorm(h + (size_t)fo * H, w.ffn_norm, (bf16*)hn_c, fn, H,
+                                            eps, st);
                 if (ffn_qi8) {
                     bool gu_grouped = false;
                     if (gate_pf_type == up_pf_type && w.gate_rs && w.up_rs) {
@@ -3082,10 +3138,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
              ? (gdn_nvfp4 && (gdn_fp4_mask & 1) && nw->gdn_qkv_fp4 && nw->gdn_qkv_fp4_sf &&
                 nw->gdn_z_fp4 && nw->gdn_z_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws)
              : attn_nvfp4);
-        const bool defer_next_attn_norm = L + 1 < c.n_layers && N >= 16384 &&
+        const bool defer_next_attn_norm = (L + 1 < c.n_layers && N >= 16384 &&
             !c.muse_glimmer && next_attn_fp4 &&
             [] { const char* e = getenv("SPARKINFER_Q38_ATTN_NORM_FP4");
-                 return !e || e[0] != '0'; }();
+                 return !e || e[0] != '0'; }()) ||
+            // Muse: the next layer's q|gate|k|v GEMM is the only reader of xn (see its arm).
+            (c.muse_glimmer && muse_norm_fp4_at(N) && nw && !nw->linear_attn && nw->wgate &&
+             muse_nvfp4_qkv && nw->qkvg_fp4 && nw->qkvg_fp4_sf && fp4_a && fp4_as && fp4_qkv);
         const void* next_norm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         // The deferral is only sound for consumers that reach the normalisation through the fused
         // rmsnorm+quantize -- the qkv/z arms do. A Gated-DeltaNet layer's ssm_alpha / ssm_beta
