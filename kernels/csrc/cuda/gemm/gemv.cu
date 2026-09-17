@@ -4406,10 +4406,13 @@ bool launch_mmvq_q4k_mma_head_f32(const void* q81, const void* W, float* y,
     static int head_mma = -1;
     if (head_mma < 0) { const char* e = getenv("SPARKINFER_HEAD_MMA"); head_mma = (e && e[0] == '0') ? 0 : 1; }
     if (!head_mma) return false;
-    // Same eight-row floor as the other mma arms: the tile pads M to sixteen, and below eight the
-    // dp4a kernel's cheaper setup wins back more than the tensor cores do.
+    // Four rows, not the eight the other mma arms use: the tile pads M to sixteen either way, so
+    // what the floor decides is whether the dp4a kernel's cheaper setup wins the pass back. It does
+    // at two rows (Muse cb c2 flat, so that width keeps the rows kernel bit for bit) but not at
+    // four, where the rows kernel spends 0.79 ms of an 11.7 ms step against this one's 0.51 --
+    // Muse cb c4 336.0 -> 344.8 tok/s. SPARKINFER_HEAD_MMA_MINROWS=8 restores the old floor.
     static int head_mma_min = -1;
-    if (head_mma_min < 0) { const char* e = getenv("SPARKINFER_HEAD_MMA_MINROWS"); head_mma_min = e ? atoi(e) : 8; }
+    if (head_mma_min < 0) { const char* e = getenv("SPARKINFER_HEAD_MMA_MINROWS"); head_mma_min = e ? atoi(e) : 4; }
     if (M < head_mma_min || M > SI_AM_MMAX || (K & 255) || (N % SI_AM_BN)) return false;
     {
         const dim3 gh(N / SI_AM_BN, 1), bh(SI_AM_NW * 32);
