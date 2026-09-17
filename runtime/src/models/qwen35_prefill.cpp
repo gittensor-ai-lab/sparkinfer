@@ -3541,14 +3541,20 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* nv_ps_b = a.alloc<float>((size_t)NA * (nv_pwide / 16) + 1);
     // WIDE-BATCH CHECKPOINT-FP8 PROJECTIONS. A checkpoint that ships the Gated-DeltaNet projections
     // as FP8 runs them below as row-GEMVs, which are compute-bound: every row redoes the whole
-    // dot product, so a projection costs the same per row at 32 rows as at one. Past eight rows,
+    // dot product, so a projection costs the same per row at 32 rows as at one. From eight rows,
     // run them on the FP8 tensor cores instead -- the same GEMM batched prefill already runs on
     // these weights (per-row dynamic e4m3 activation against the checkpoint's own e4m3 rows and
     // per-channel scales), whose cost is flat in the row count. DSpark's verify never reaches these
     // widths. SPARKINFER_FP8_PACKED_GEMM_MIN_ROWS sets the threshold; 0 disables the arm.
+    //
+    // Eight is where it starts paying, not nine: a c8 step spent 6.28 ms of its 16.19 ms on those
+    // row-GEMVs, and the GEMM carries the same three projections per layer for the same weight
+    // bytes (cb c8 480.3 -> 507.4 tok/s). Four rows is past the other side of it -- the GEMM's
+    // fixed per-launch cost is no longer covered there (c4 269.1 -> 254.3) -- so the floor is
+    // exactly eight. SPARKINFER_FP8_PACKED_GEMM_MIN_ROWS=9 restores main.
     static const int kFp8GemmMinRows = [] {
         const char* e = getenv("SPARKINFER_FP8_PACKED_GEMM_MIN_ROWS");
-        return e ? atoi(e) : 9;
+        return e ? atoi(e) : 8;
     }();
     const bool fp8_ckpt = [&] {
         for (int L = 0; L < c.n_layers; ++L)
