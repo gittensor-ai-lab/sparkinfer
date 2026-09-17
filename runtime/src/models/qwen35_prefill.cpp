@@ -201,6 +201,23 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             }
         }
 
+    // A CAPPED WINDOWED SLICE CANNOT SERVE AN ARBITRARILY LONG PASS. Its ring holds the window
+    // plus window_pass_tokens, because this pass appends every one of its tokens before its
+    // attention runs and the pass's FIRST query still reads a window back from itself. A longer
+    // pass would have its own early rows overwritten by its own late ones, so refuse it here --
+    // before the first kernel -- and let the caller chunk or fall back to the token loop rather
+    // than attend to wrapped garbage. The bound is published by window_pass_limit().
+    if (s.kv->windowed() && n > s.kv->window_pass_limit()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[prefill] %d-token pass exceeds the windowed-KV pass bound of %d "
+                            "tokens -> token loop (SPARKINFER_KV_SWA_CAP=0 restores full "
+                            "slices)\n", n, s.kv->window_pass_limit());
+        }
+        return -1;
+    }
+
     // Packed prompts (Qwen35PrefillCtx::multi_n): refuse anything but the fresh, text-only, dense,
     // int8-KV pass the per-prompt loops below implement, BEFORE the first kernel runs.
     const int nseg = s.multi_n;
@@ -1766,6 +1783,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     };
 
     const int* btable = s.kv->block_table(s.seq_id);
+    // Windowed layers' ring table; == btable unless this pool caps them (see kv_cache.h).
+    const int* btable_win = s.kv->block_table_win(s.seq_id);
     const int  bs = s.kv->block_size();
     const int  mbs = s.kv->max_blocks_per_seq();
     const bool kv8 = s.kv->int8_kv();
@@ -1812,6 +1831,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     bool attn_norm_deferred = false;
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
+        // A sliding-window layer reads and writes its own (possibly capped, ring-mapped) slice;
+        // a full-causal layer takes the full table. Identity on an uncapped pool.
+        const int* ltab = w.swa ? btable_win : btable;
         a_q = nullptr; a_pk = false;                   // xn/hn are refreshed in place each layer
         bool attn_fused = false;                       // post-attn residual folded into the proj?
         // Set when the o / ffn_down split-K accumulator was left un-reduced for the sandwich
@@ -2065,11 +2087,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         qkv_packed ? fp4_qkv + 2 * qdim : kf,
                         qkv_packed ? fp4_qkv + 2 * qdim + kvdim : vf,
                         w.q_norm, w.k_norm,
-                        kpool8, vpool8, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads,
+                        kpool8, vpool8, kscale, vscale, ltab, N, c.n_q_heads, c.n_kv_heads,
                         c.head_dim, muse_rot, rope_theta, eps, bs, mbs, st, pos0,
                         qkv_packed ? qb : nullptr, qkv_packed ? qkvg_n : 0);
                     kernels::launch_prefill_attn_swa_pure_int8(qb, kpool8, vpool8, kscale, vscale,
-                        btable, att, N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
+                        ltab, att, N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
                         win_blocks, st, pos0);
                 } else {
                     bf16* kpool_bf = (bf16*)s.kv->k_pool() + s.kv->layer_base_elems(L);
@@ -2079,10 +2101,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         qkv_packed ? fp4_qkv + 2 * qdim : kf,
                         qkv_packed ? fp4_qkv + 2 * qdim + kvdim : vf,
                         w.q_norm, w.k_norm,
-                        kpool_bf, vpool_bf, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                        kpool_bf, vpool_bf, ltab, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
                         muse_rot, rope_theta, eps, bs, mbs, st, pos0,
                         qkv_packed ? qb : nullptr, qkv_packed ? qkvg_n : 0);
-                    kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, btable, att,
+                    kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, ltab, att,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks,
                         st, pos0);
                 }
@@ -2113,20 +2135,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     if (vi8)
                         kernels::launch_prefill_qknorm_rope_kv_bf16_vi8(
                             qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, vi8, vi8_scale,
-                            btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                            ltab, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
                             rope_dim, rope_theta, eps, bs, mbs, st, pos0,
                             mrope_win, c.mrope_sec_h, c.mrope_sec_w);
                     else
                         kernels::launch_prefill_qknorm_rope_kv_bf16(
-                            qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, btable, N,
+                            qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, ltab, N,
                             c.n_q_heads, c.n_kv_heads, c.head_dim,
                             rope_dim, rope_theta, eps, bs, mbs, st, pos0,
                             mrope_win, c.mrope_sec_h, c.mrope_sec_w);
                     const bool vi8_done = vi8 && kernels::launch_prefill_attn_mma_bf16_vi8(
-                        qb, kf, vi8, vi8_scale, btable, att, N, c.n_q_heads, c.n_kv_heads,
+                        qb, kf, vi8, vi8_scale, ltab, att, N, c.n_q_heads, c.n_kv_heads,
                         c.head_dim, bs, mbs, attn_scale, st, pos0);
                     if (!vi8_done)
-                        if (!kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, btable, att,
+                        if (!kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, ltab, att,
                                 N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
                                 st, pos0)) {
                             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
@@ -2147,7 +2169,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     for (int i = 0; i < segs; ++i) {
                         const size_t o = multi ? (size_t)s.multi_off[i] : 0;
                         const int len = multi ? s.multi_len[i] : N;
-                        const int* bt = multi ? s.kv->block_table(s.multi_seq_ids[i]) : btable;
+                        const int* bt = multi ? (w.swa ? s.kv->block_table_win(s.multi_seq_ids[i])
+                                                       : s.kv->block_table(s.multi_seq_ids[i]))
+                                              : ltab;
                         kernels::launch_prefill_qknorm_rope_kv_int8(qb + o * qdim, kf + o * kvdim,
                             vf + o * kvdim, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, bt,
                             len, c.n_q_heads, c.n_kv_heads, c.head_dim, rope_dim, rope_theta, eps,
@@ -4119,6 +4143,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     };
 
     const int* btable = s.kv->block_table(s.seq_id);
+    // Windowed (sliding-window) layers may live in a capped ring slice with its own
+    // logical->physical map; == btable on a pool with no windowed slices (see kv_cache.h).
+    const int* btable_win = s.kv->block_table_win(s.seq_id);
     const int bs = s.kv->block_size(), mbs = s.kv->max_blocks_per_seq();
     const bool kv8 = s.kv->int8_kv();
     const int kv_elem = kv8 ? 1 : 2;
@@ -4130,6 +4157,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // row. That removes 2*(N-1) graph nodes per attention layer, and the graph is ~1000 nodes deep
     // against only ~5.6 ms of kernel time, so node count is itself a real cost here.
     int* btab_rows = (N > 1 || packed) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
+    // The same per-row gather for the windowed layers' tables. Only allocated when this pool
+    // actually caps them, so an uncapped pool carries neither the buffer nor the extra gather.
+    int* btab_rows_win = (btab_rows && s.kv->windowed()) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
     if (!a.ok) { fprintf(stderr, "[dflash-verify] block-table scratch allocation failed\n"); return -1; }
     bool supported = true;
     int  vfail_L = -1;   // layer whose stage declined, for the bailout diagnostic below
@@ -4238,6 +4268,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         else
             dflash_kernels::launch_broadcast_rows_i32(btable, btab_rows, mbs, N, st);
     }
+    if (btab_rows_win) {
+        if (packed && s.packed_rows_win)
+            dflash_kernels::launch_gather_rows_i32(s.packed_rows_win, btab_rows_win, mbs, N, st);
+        else
+            dflash_kernels::launch_broadcast_rows_i32(btable_win, btab_rows_win, mbs, N, st);
+    }
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
     if (muse) {
         // Unweighted RMSNorm of the embedding before layer 0 (emb_norm_ones is a constant-1.0
@@ -4248,8 +4284,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // block map and the view length are shared by all 39 windowed layers, only the per-layer
         // K/V pool rows differ. Inside the capture, so a replay tracks each sequence as it grows.
         kernels::launch_fa_kv_compact_view_pure_rows(
-            seq, btab_rows ? btab_rows : btable, swa_vtbl, swa_vlen,
-            bs, swa_budget, swa_budget, mbs, N, st);
+            seq, btab_rows_win ? btab_rows_win : (btab_rows ? btab_rows : btable_win),
+            swa_vtbl, swa_vlen, bs, swa_budget, swa_budget, mbs, N, st);
     }
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, c.rms_eps, st);
     for (int L = 0; L < c.n_layers && supported; ++L) {
@@ -4415,7 +4451,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // split-half pairing the rest of this file uses); the every-4th global layers are
             // NoPE and append K/V unrotated. Both flavours index block_table[row*max_blocks+blk]
             // and positions[row], which is what makes them correct for packed rows unchanged.
-            const int* rtab = btab_rows ? btab_rows : btable;
+            // Windowed layers append into their ring slice, global layers into the full one.
+            const int* rtab = w.swa ? (btab_rows_win ? btab_rows_win
+                                                     : (btab_rows ? btab_rows : btable_win))
+                                    : (btab_rows ? btab_rows : btable);
             // QK-norm, RoPE and the bf16 KV append as ONE launch instead of three per layer, with the
             // same bytes (launch_muse_qknorm_rope_kv_rows). SPARKINFER_MUSE_PACKED_QKNORM_FUSE=0
             // issues the three again.

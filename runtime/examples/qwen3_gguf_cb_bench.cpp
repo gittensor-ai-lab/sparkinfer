@@ -103,6 +103,26 @@ int main(int argc, char** argv) {
     // Only the full-attention layers get a pool slot (hybrid_kv_layer_slots): the
     // Gated-DeltaNet layers carry a recurrent state and never read paged KV.
     kvc.layer_slot = sparkinfer::hybrid_kv_layer_slots(cfg.n_layers, cfg.hybrid, cfg.full_attn_interval);
+    // WINDOWED SLICES for the sliding-window layers (Muse Glimmer: 39 of 52 layers over 2048
+    // tokens, every 4th full-causal). They only ever read the last `sliding_window` tokens, so
+    // they get a ring of that plus one prefill pass instead of a full-context slice -- which is
+    // where most of a 32-session pool went. Continuous batching prefills each prompt in one pass,
+    // so the pass bound is the longest prompt this tool submits; the runtime refuses a longer one
+    // rather than wrapping (see prefill_batched_run).
+    if (cfg.muse_glimmer && cfg.sliding_window > 0) {
+        kvc.window_tokens = cfg.sliding_window;
+        // The longest single prefill pass this tool submits. SPARKINFER_KV_SWA_PASS_TOKENS sets it
+        // explicitly (a deployment that chunks prefill wants its chunk size here); the runtime
+        // refuses a longer pass rather than wrapping, so under-sizing it costs speed, not answers.
+        kvc.window_pass_tokens = std::max(long_prefill, prompt_len) + 64;
+        if (const char* e = getenv("SPARKINFER_KV_SWA_PASS_TOKENS")) {
+            const int v = atoi(e);
+            if (v > 0) kvc.window_pass_tokens = v;
+        }
+        kvc.max_seq_tokens = cfg.max_seq;
+        kvc.slot_windowed = sparkinfer::swa_slot_flags(cfg.n_layers, kvc.layer_slot,
+                                                       cfg.swa_layers);
+    }
     const int kvL = sparkinfer::kv_slot_count(kvc.layer_slot, cfg.n_layers);
     const size_t epb = (size_t)16 * cfg.n_kv_heads * cfg.head_dim;
     // Pool for concurrency streams + one long prefill.

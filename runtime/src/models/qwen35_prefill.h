@@ -102,6 +102,10 @@ struct Qwen35PrefillCtx {
     //   packed_pos         [N] HOST array of each row's absolute position in its own sequence
     const int*           packed_pos       = nullptr;
     const int* const*    packed_rows      = nullptr;
+    // Ring tables for windowed (sliding-window) KV slices, one per row, same order as
+    // packed_rows. Equal to packed_rows when the pool has no windowed slices, so a layer can
+    // always take the table its own attention contract asks for (see KVCacheManager::windowed()).
+    const int* const*    packed_rows_win  = nullptr;
     float* const*        packed_lin_state = nullptr;
     void* const*         packed_lin_conv  = nullptr;
     // The packed rows' recurrent state is the compacted bf16 form (see Qwen35Model::decode_packed).

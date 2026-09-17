@@ -27,6 +27,33 @@ struct KVCacheConfig {
     // Qwen3.8-27B: 16 attention layers of 64). layer_slot maps a layer index to its pool slot,
     // -1 for layers with no KV; empty = identity (every layer has a slot, the old behaviour).
     std::vector<int> layer_slot;
+
+    // SLIDING-WINDOW SLOTS. A layer whose attention only ever reads the last `window_tokens`
+    // tokens does not need a full-context slice: it needs the window, plus whatever one prefill
+    // pass appends before that pass's attention runs (the pass writes every token of the pass
+    // first, and its EARLIEST query still reads `window_tokens` back from itself). Those slots get
+    // a private per-sequence RING of window_tokens + window_pass_tokens instead, which on Muse
+    // Glimmer (39 of 52 layers windowed at 2048) is where most of the pool went.
+    //
+    // Capacity is deliberately unchanged: total_blocks/max_blocks_per_seq still come out of
+    // pool_bytes as if every slot were full-context, so num_total_blocks() keeps meaning what
+    // every caller already reads it as. The windowed slices simply allocate less of the pool, and
+    // the difference shows up as free VRAM.
+    //
+    // Two things a ring cannot do, so both are refused rather than silently served:
+    //   - CROSS-SEQUENCE PREFIX SHARING. A ring slot is private to one sequence; a shared prefix
+    //     block would alias. prefix_sharing_supported() says so and allocate_with_prefix()
+    //     refuses, so the engine recomputes instead of reading someone else's window.
+    //   - A PREFILL PASS LONGER THAN window_pass_tokens. window_pass_limit() publishes the bound;
+    //     a caller past it must chunk or decline. (Re-using ONE sequence's own session across
+    //     requests is fine: its ring holds that sequence's last window, which is all a windowed
+    //     layer ever reads.)
+    // window_tokens = 0 (the default) keeps every slot full-context -- the old layout, byte for
+    // byte. SPARKINFER_KV_SWA_CAP=0 also forces it off, for an A/B out of one binary.
+    int window_tokens = 0;        // sliding window, in tokens (0 = no windowed slots)
+    int window_pass_tokens = 0;   // longest prefill pass a windowed slot must survive
+    int max_seq_tokens = 0;       // per-sequence context the pool was sized for (required to cap)
+    std::vector<char> slot_windowed;   // per POOL SLOT: 1 = windowed ring, 0 = full context
 };
 
 // Layer -> pool-slot map for the hybrid interval rule these models share: with
@@ -47,6 +74,26 @@ inline int kv_slot_count(const std::vector<int>& slot, int num_layers) {
     int n = 0;
     for (int v : slot) if (v + 1 > n) n = v + 1;
     return n;
+}
+
+// Per-slot windowed flags from the model's own per-layer contract (Qwen35Config::swa_layers:
+// true = slides over `sliding_window` tokens, false = full/global attention, which must keep a
+// full-context slice). `layer_slot` is the same map KVCacheConfig carries (empty = identity).
+// Returns an empty vector when nothing would be capped -- no windowed layer, or every one of them
+// windowed, since a single group is the cheaper layout either way -- which KVCacheManager reads as
+// "no windowed slots".
+inline std::vector<char> swa_slot_flags(int num_layers, const std::vector<int>& layer_slot,
+                                        const std::vector<bool>& swa_layers) {
+    if (num_layers <= 0 || (int)swa_layers.size() != num_layers) return {};
+    std::vector<char> win((size_t)kv_slot_count(layer_slot, num_layers), 0);
+    int n = 0;
+    for (int L = 0; L < num_layers; ++L) {
+        const int s = layer_slot.empty() ? L : (L < (int)layer_slot.size() ? layer_slot[(size_t)L] : -1);
+        if (s < 0 || s >= (int)win.size()) continue;
+        if (swa_layers[(size_t)L]) { win[(size_t)s] = 1; ++n; }
+    }
+    if (n == 0 || n == (int)win.size()) return {};   // all or nothing to cap: keep one layout
+    return win;
 }
 
 // GPU-side KV block pool.
@@ -123,6 +170,20 @@ public:
     void* k_scale_pool() const;
     void* v_scale_pool() const;
     size_t scale_layer_stride_elems() const;
+
+    // WINDOWED SLOTS (see KVCacheConfig::window_tokens). windowed() is false when this pool has
+    // none, and then every accessor below behaves exactly as the full-context ones.
+    bool windowed() const;
+    // The ring table for seq_id: [max_blocks_per_seq] entries, logical block i -> the physical
+    // block holding i's window slot, i.e. ring[i % ring_blocks]. A windowed layer passes THIS to
+    // the same append/attention kernels the full layers drive with block_table(), so no kernel
+    // learns about rings -- the repeated rows carry the wrap. Null for an unknown sequence, and
+    // block_table() itself when this pool has no windowed slots.
+    int* block_table_win(uint64_t seq_id) const;
+    // Longest prefill pass a windowed slot can serve (window_pass_tokens), or INT_MAX uncapped.
+    int window_pass_limit() const;
+    // False when a ring is in play: cross-sequence prefix blocks would alias (see the header note).
+    bool prefix_sharing_supported() const;
 
     int block_size() const;
     int max_blocks_per_seq() const;

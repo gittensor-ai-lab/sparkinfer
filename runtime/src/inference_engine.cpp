@@ -485,7 +485,13 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         } else {
             // Automatic prefix cache: start from the longest cached prefix of this prompt, sharing
             // its KV blocks and restoring its recurrent state, so prefill covers only the rest.
+            // A pool with windowed (ring) KV slices cannot lend its blocks to another sequence:
+            // a ring slot is private, so a shared prefix block does not name the borrower's
+            // window. allocate_with_prefix() refuses, and a refusal here would read as
+            // "pool full" and fail the request -- so skip the lookup instead and prefill the
+            // prompt in full, the same trade the recurrent-state mismatch below already takes.
             const bool cache_eligible = prefix_cache_ && job.req.prefix_cache &&
+                                        kv_->prefix_sharing_supported() &&
                                         job.req.forced_tokens.empty() && job.req.vision_pos.empty();
             PrefixCache::Hit hit;
             if (cache_eligible) hit = prefix_cache_->lookup(job.req.prompt);

@@ -280,6 +280,8 @@ struct Qwen35Model::Impl {
     void* packed_dev_states = nullptr;
     void* packed_dev_convs = nullptr;
     void* packed_dev_tables = nullptr;
+    void* packed_dev_tables_win = nullptr;   // ring tables for windowed slices (see kv_cache.h)
+    void* packed_host_tables_win = nullptr;
     // Pinned staging + the seq_ids the device arrays currently hold, so an unchanged row set
     // skips the upload entirely.
     void* packed_host_states = nullptr;
@@ -866,6 +868,8 @@ Qwen35Model::~Qwen35Model() {
     if (p_->packed_dev_states) cudaFree(p_->packed_dev_states);
     if (p_->packed_dev_convs) cudaFree(p_->packed_dev_convs);
     if (p_->packed_dev_tables) cudaFree(p_->packed_dev_tables);
+    if (p_->packed_dev_tables_win) cudaFree(p_->packed_dev_tables_win);
+    if (p_->packed_host_tables_win) cudaFreeHost(p_->packed_host_tables_win);
     for (auto& kv : p_->parked_graphs) {
         if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
         if (kv.second.graph) cudaGraphDestroy(kv.second.graph);
@@ -1368,6 +1372,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     dbg_bf16(s.x, H, 1, -1);   // tag 1: post emb_norm
 
     int* btable = s.kv->block_table(s.active_seq_id);
+    // The windowed layers' ring table (== btable unless this pool has capped slices).
+    int* btable_win = s.kv->block_table_win(s.active_seq_id);
     // GQA-8 sparse: materialize the sink+window compact view once per decode step (the
     // logical->physical block map and seq_len are shared by all full-attn layers; the
     // per-layer K/V pool rows for this token are appended before each layer's attention
@@ -1378,7 +1384,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // Muse Glimmer: pure sliding-window view for swa-flagged layers, every step (mandatory,
     // not gated by context length like the sparse-kv approximation above).
     if (c.muse_glimmer && s.swa_vtbl)
-        kernels::launch_fa_kv_compact_view_pure(s.d_seqlen, btable, s.swa_vtbl, s.swa_vlen,
+        kernels::launch_fa_kv_compact_view_pure(s.d_seqlen, btable_win, s.swa_vtbl, s.swa_vlen,
                                                 s.kv->block_size(), s.swa_budget, s.swa_budget, st);
     // Prime: xn = RMSNorm(x, layer0.input_norm). Each layer's tail then fuses the
     // post-MoE residual with the NEXT layer's input norm (or final_norm), so the
@@ -1460,6 +1466,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
 
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
+        // Which block table this layer's KV lives in. A sliding-window layer may sit in a capped
+        // RING slice (KVCacheConfig::window_tokens), whose logical->physical map is its own; a
+        // full-causal layer always takes the full one. block_table_win() IS block_table() on a
+        // pool with no windowed slices, so this is the identity everywhere else.
+        int* ltab = w.swa ? btable_win : btable;
         // Window 3 lands: the previous layer's post-FFN prefetch covered its sandwich tail.
         pf_join();
         // Window 1: the QKV projections are latency-bound, not bandwidth-bound (~32 MB over ~29 us
@@ -1761,7 +1772,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             if (!w.q_has_gate && !partial_rope && (s.use_attnin || kv8)) {
                 // Qwen3-MoE frontier: fused int8 QK-norm + RoPE + KV-append (unchanged vs main)
                 kernels::launch_qknorm_rope_kv_append(s.q, s.k, s.v, w.q_norm, w.k_norm, kpool, vpool,
-                                                      btable, s.d_pos, 1, c.n_q_heads, c.n_kv_heads,
+                                                      ltab, s.d_pos, 1, c.n_q_heads, c.n_kv_heads,
                                                       c.head_dim, c.rope_theta, c.rms_eps,
                                                       s.kv->block_size(), s.kv->max_blocks_per_seq(), st,
                                                       kscale, vscale, kv8 ? 1 : 0);
@@ -1771,12 +1782,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     if (s.use_qkfuse && H == 2048) {
                         if (qkgate_fuse) {
                             kernels::launch_qknorm_rope_kv_partial_int8_gated(s.qraw, s.q, s.qgate, s.k, s.v,
-                                w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, btable, s.d_pos, 1,
+                                w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, ltab, s.d_pos, 1,
                                 c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
                                 s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                         } else {
                             kernels::launch_qknorm_rope_kv_partial_int8(s.q, s.k, s.v, w.q_norm, w.k_norm,
-                                kpool, vpool, kscale, vscale, btable, s.d_pos, 1,
+                                kpool, vpool, kscale, vscale, ltab, s.d_pos, 1,
                                 c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
                                 s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                         }
@@ -1788,13 +1799,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                             kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
                         }
                         kernels::launch_rope_kv_append_partial_int8(s.q, s.k, s.v, kpool, vpool, kscale, vscale,
-                            btable, s.d_pos, 1, c.n_q_heads, c.n_kv_heads,
+                            ltab, s.d_pos, 1, c.n_q_heads, c.n_kv_heads,
                             c.head_dim, c.rope_dim, c.rope_theta,
                             s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                     }
                 } else if (partial_rope && s.use_qkfuse) {
                     kernels::launch_qknorm_rope_kv_partial(s.q, s.k, s.v, w.q_norm, w.k_norm,
-                        (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
+                        (bf16*)kpool, (bf16*)vpool, ltab, s.d_pos, 1,
                         c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim,
                         c.rope_theta, c.rms_eps, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                 } else {
@@ -1806,7 +1817,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     const bool mg_qkr_fuse = mg_qkr && c.muse_glimmer && s.use_qkfuse && !partial_rope && !kv8;
                     if (mg_qkr_fuse) {
                         kernels::launch_muse_qknorm_rope_kv(
-                            s.q, s.k, s.v, w.q_norm, w.k_norm, (bf16*)kpool, (bf16*)vpool, btable,
+                            s.q, s.k, s.v, w.q_norm, w.k_norm, (bf16*)kpool, (bf16*)vpool, ltab,
                             s.d_pos, w.swa ? s.d_pos : s.d_writepos,
                             c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
                             s.kv->block_size(), c.rms_eps, /*do_rope=*/w.swa != 0, st);
@@ -1829,14 +1840,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                         // example mains switch the cache to int8). Quantise instead when kv8.
                         if (kv8)
                             kernels::launch_muse_kv_append_int8(
-                                s.q, s.k, s.v, kpool, vpool, kscale, vscale, btable, s.d_writepos, 1,
+                                s.q, s.k, s.v, kpool, vpool, kscale, vscale, ltab, s.d_writepos, 1,
                                 c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, /*rope_normal=*/false,
                                 s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                         else
-                        launch_kv_append((bf16*)kpool, (bf16*)vpool, s.k, s.v, btable, s.d_writepos, 1,
+                        launch_kv_append((bf16*)kpool, (bf16*)vpool, s.k, s.v, ltab, s.d_writepos, 1,
                                          c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                     } else if (partial_rope) {
-                        kernels::launch_rope_kv_append_partial(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
+                        kernels::launch_rope_kv_append_partial(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, ltab, s.d_pos, 1,
                                                                c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim,
                                                                c.rope_theta, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                     } else if (c.muse_glimmer) {
@@ -1859,20 +1870,20 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                         // into the pool, which is wrong when the cache is int8.
                         if (kv8)
                             kernels::launch_muse_kv_append_int8(
-                                s.q, s.k, s.v, kpool, vpool, kscale, vscale, btable, s.d_pos, 1,
+                                s.q, s.k, s.v, kpool, vpool, kscale, vscale, ltab, s.d_pos, 1,
                                 c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, /*rope_normal=*/true,
                                 s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                         else
-                        kernels::launch_rope_kv_append_normal(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
+                        kernels::launch_rope_kv_append_normal(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, ltab, s.d_pos, 1,
                                                               c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
                                                               s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                     } else if (s.use_ropekv) {
-                        kernels::launch_rope_kv_append(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
+                        kernels::launch_rope_kv_append(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, ltab, s.d_pos, 1,
                                                        c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
                                                        s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                     } else {
                         kernels::launch_rope(s.q, s.k, s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, st);
-                        launch_kv_append((bf16*)kpool, (bf16*)vpool, s.k, s.v, btable, s.d_writepos, 1,
+                        launch_kv_append((bf16*)kpool, (bf16*)vpool, s.k, s.v, ltab, s.d_writepos, 1,
                                          c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                     }
                     dbg_bf16(s.q, s.qdim, 22, L);   // tag 22: Q, post RoPE-or-passthrough (SDPA input)
@@ -1932,7 +1943,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             } else if (sparse_on) {
                 kernels::launch_fa_kv_window_select(s.d_seqlen, s.sparse_sel, c.n_kv_heads,
                     s.kv->block_size(), s.sparse_budget, s.sparse_window, st);
-                kernels::launch_flash_decode_split_sparse(s.q, kpool, vpool, btable, s.d_seqlen,
+                kernels::launch_flash_decode_split_sparse(s.q, kpool, vpool, ltab, s.d_seqlen,
                     s.sparse_sel, s.fa_m, s.fa_l, s.fa_acc, c.n_q_heads, c.n_kv_heads, c.head_dim,
                     s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits, s.sparse_budget,
                     1.f / sqrtf((float)c.head_dim), kscale, vscale, st);
@@ -1940,7 +1951,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     s.n_splits, (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, st,
                     attn_gate_q8 ? s.qgate : nullptr);
             } else {
-            kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,
+            kernels::launch_flash_decode_split(s.q, kpool, vpool, ltab, s.d_seqlen, s.attn,
                                                s.fa_m, s.fa_l, s.fa_acc, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
                                                s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
                                                1.f / sqrtf((float)c.head_dim), st,
@@ -2528,6 +2539,21 @@ int prefill_window_tokens() {
     return w;
 }
 
+// The same window, bounded by what a capped windowed KV slice can serve in one pass. A ring holds
+// its window plus window_pass_tokens, so a prefill pass longer than that would overwrite rows its
+// own earliest query still reads -- prefill_batched_run refuses one, and clamping here keeps a long
+// prompt on the batched path (chunked into ring-sized windows) instead of the token loop.
+// Uncapped pools are unaffected: window_pass_limit() is INT_MAX there.
+int prefill_single_pass_max_tokens(const KVCacheManager* kv);
+int prefill_window_tokens(const KVCacheManager* kv) {
+    int w = prefill_window_tokens();
+    if (kv && kv->windowed()) {
+        const int lim = kv->window_pass_limit();
+        if (lim > 0 && (w <= 0 || w > lim)) w = lim;
+    }
+    return w;
+}
+
 // Largest prompt still ingested in ONE pass. Separate from the window size on purpose: windowing
 // exists to bound the arena, so below the size where a single pass demonstrably fits there is no
 // reason to pay for it (a second LM-head tail, an arena release-and-reallocate per window, and no
@@ -2548,10 +2574,21 @@ int prefill_single_pass_max_tokens() {
 // Batched-prefill eligibility for a prompt that may be windowed: every condition of
 // batched_prefill_enabled() except the context cap, which a window makes irrelevant -- what has
 // to fit is one window, not the prompt.
-bool batched_prefill_windowed_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
-    const int w = prefill_window_tokens();
+// Past the ring's reach a prompt MUST be windowed, so the single-pass bound shrinks with it.
+int prefill_single_pass_max_tokens(const KVCacheManager* kv) {
+    int m = prefill_single_pass_max_tokens();
+    if (kv && kv->windowed()) {
+        const int lim = kv->window_pass_limit();
+        if (lim > 0 && m > lim) m = lim;
+    }
+    return m;
+}
+
+bool batched_prefill_windowed_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens,
+                                      const KVCacheManager* kv = nullptr) {
+    const int w = prefill_window_tokens(kv);
     if (n_tokens <= 0) return false;
-    if (w <= 0 || n_tokens <= prefill_single_pass_max_tokens())
+    if (w <= 0 || n_tokens <= prefill_single_pass_max_tokens(kv))
         return batched_prefill_enabled(gguf, cfg, n_tokens);
     return batched_prefill_enabled(gguf, cfg, w);
 }
@@ -2687,7 +2724,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     // naive) falls back to the token loop below, which is left byte-identical to main on purpose.
     bool batched_done = false;
     if (start_pos > 0) {
-        if (batched_prefill_windowed_enabled(s.gguf, s.cfg, start_pos)) {
+        if (batched_prefill_windowed_enabled(s.gguf, s.cfg, start_pos, s.kv)) {
             std::vector<int> ids(start_pos);
             // Default is a synthetic ramp, NOT text. That is fine for a weight-bandwidth-bound
             // dense decode, but it is out-of-distribution for anything whose cost depends on token
@@ -2844,13 +2881,14 @@ int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chu
     // already is, so it has to begin where the state does -- and it always covers the whole
     // [0,end), in prefill_window_tokens()-sized windows, regardless of chunk_limit.
     int batched_done = 0;
-    if (start == 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, n)) {
+    if (start == 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, n, s.kv)) {
         int seed = prefill_batched_chunked(ids, n, want_seed_logprob, &batched_done);
         if (seed >= 0) {
             if (out_pos) *out_pos = end;
             return seed;
         }
-    } else if (start > 0 && allow_batched_resume && batched_prefill_windowed_enabled(s.gguf, s.cfg, n)) {
+    } else if (start > 0 && allow_batched_resume &&
+               batched_prefill_windowed_enabled(s.gguf, s.cfg, n, s.kv)) {
         // A prefix-cache hit: KV for [0, start) is shared in and the recurrent state at `start` is
         // restored, which is exactly what a windowed batched pass continues from. Without this the
         // whole remainder would take the token loop, and a cache hit would be slower than
@@ -3237,8 +3275,8 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         lin_state[(size_t)i] = it->second.lin_state;
         lin_conv[(size_t)i] = it->second.lin_conv_state;
     }
-    if (!batched_prefill_windowed_enabled(s.gguf, s.cfg, total) ||
-        total > prefill_single_pass_max_tokens())
+    if (!batched_prefill_windowed_enabled(s.gguf, s.cfg, total, s.kv) ||
+        total > prefill_single_pass_max_tokens(s.kv))
         return false;
     std::vector<int> ids;
     ids.reserve((size_t)total);
@@ -3273,12 +3311,12 @@ int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want
                                          int* out_done) {
     if (out_done) *out_done = 0;
     if (!prompt_ids || n <= 0) return -1;
-    const int window = prefill_window_tokens();
     Impl& s = *p_;
+    const int window = prefill_window_tokens(s.kv);
     // Short enough for one pass: run exactly the call this function replaced, so no context that
     // already worked changes kernel path, tile shape or arithmetic. The bound is the single-pass
     // threshold, NOT the window size -- a prompt between the two is still one pass.
-    if (window <= 0 || n <= prefill_single_pass_max_tokens()) {
+    if (window <= 0 || n <= prefill_single_pass_max_tokens(s.kv)) {
         const int seed = prefill_batched(prompt_ids, n, want_seed_logprob);
         if (seed >= 0 && seed < s.cfg.vocab) {
             if (out_done) *out_done = n;
@@ -3399,7 +3437,7 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     if (!prompt_ids || start <= 0 || end <= start) return -1;
     Impl& s = *p_;
     const int n = end - start;
-    const int window = prefill_window_tokens();
+    const int window = prefill_window_tokens(s.kv);
     int done = 0;
     auto run = [&](int step) -> int {
         for (int pos = start + done; pos < end; pos += step) {
@@ -3418,7 +3456,7 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     };
     // Same split as prefill_batched_chunked: one pass up to the single-pass threshold, windows
     // above it. Every pass here has pos0 > 0, so each runs eager and carries the recurrence forward.
-    const bool single = window <= 0 || n <= prefill_single_pass_max_tokens();
+    const bool single = window <= 0 || n <= prefill_single_pass_max_tokens(s.kv);
     int seed = run(single ? n : window);
     // ...and the same retry when the single pass declines. A cached prefix followed by a long
     // continuation is what an agent sends after a large tool result, and on serve-dspark at
@@ -3582,6 +3620,9 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         if (cudaMalloc(&s.packed_dev_states, np * sizeof(float*)) != cudaSuccess) return false;
         if (cudaMalloc(&s.packed_dev_convs, np * sizeof(void*)) != cudaSuccess) return false;
         if (cudaMalloc(&s.packed_dev_tables, np * sizeof(const int*)) != cudaSuccess) return false;
+        if (cudaMalloc(&s.packed_dev_tables_win, np * sizeof(const int*)) != cudaSuccess) return false;
+        if (cudaHostAlloc(&s.packed_host_tables_win, np * sizeof(const int*), cudaHostAllocDefault)
+            != cudaSuccess) return false;
         if (cudaHostAlloc(&s.packed_host_states, np * sizeof(float*), cudaHostAllocDefault)
             != cudaSuccess) return false;
         if (cudaHostAlloc(&s.packed_host_convs, np * sizeof(void*), cudaHostAllocDefault)
@@ -3594,6 +3635,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     float** h_states = static_cast<float**>(s.packed_host_states);
     void**  h_convs  = static_cast<void**>(s.packed_host_convs);
     const int** h_tables = static_cast<const int**>(s.packed_host_tables);
+    const int** h_tables_win = static_cast<const int**>(s.packed_host_tables_win);
     uint64_t* h_seqs = static_cast<uint64_t*>(s.packed_host_seqs);
 
     // Skip the upload entirely when the row set has not moved. Each session's buffers and its
@@ -3612,10 +3654,15 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
             return false;
         const int* tbl = s.kv->block_table(seq_ids[i]);
         if (!tbl) return false;
+        // The windowed layers' ring table for the same row. Equal to `tbl` on a pool with no
+        // windowed slices, so this array is always safe to hand a layer.
+        const int* tbl_win = s.kv->block_table_win(seq_ids[i]);
+        if (!tbl_win) return false;
         if (!same) {
             h_states[i] = it->second.lin_state;
             h_convs[i]  = it->second.lin_conv_state;
             h_tables[i] = tbl;
+            h_tables_win[i] = tbl_win;
             h_seqs[i]   = seq_ids[i];
         }
     }
@@ -3625,6 +3672,8 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
                            cudaMemcpyHostToDevice, s.stream), "packed states");
         cu(cudaMemcpyAsync(s.packed_dev_convs, h_convs, (size_t)n * sizeof(void*),
                            cudaMemcpyHostToDevice, s.stream), "packed convs");
+        cu(cudaMemcpyAsync(s.packed_dev_tables_win, h_tables_win, (size_t)n * sizeof(const int*),
+                           cudaMemcpyHostToDevice, s.stream), "packed ring tables");
         cu(cudaMemcpyAsync(s.packed_dev_tables, h_tables, (size_t)n * sizeof(const int*),
                            cudaMemcpyHostToDevice, s.stream), "packed tables");
         s.packed_rows_valid = n;
@@ -3673,6 +3722,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
                           nullptr, 0, nullptr, 0 };
     ctx.packed_pos       = positions;
     ctx.packed_rows      = reinterpret_cast<const int* const*>(s.packed_dev_tables);
+    ctx.packed_rows_win  = reinterpret_cast<const int* const*>(s.packed_dev_tables_win);
     ctx.packed_lin_state = reinterpret_cast<float* const*>(s.packed_dev_states);
     ctx.packed_lin_conv  = reinterpret_cast<void* const*>(s.packed_dev_convs);
     ctx.packed_state_b16 = packed_state_b16;
@@ -4304,7 +4354,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     auto t0 = std::chrono::steady_clock::now();
     int next = -1;
     int batched_done = 0;
-    if (batched_prefill_windowed_enabled(s.gguf, s.cfg, n))
+    if (batched_prefill_windowed_enabled(s.gguf, s.cfg, n, s.kv))
         next = prefill_batched_chunked(prompt.data(), n, false, &batched_done);
     if (next < 0) {
         for (int i = batched_done; i < n; i++) {
@@ -6120,6 +6170,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // leaves no room for it (see the reserve there).
         bool qkvg_fp4_on = (!fp4q_env || fp4q_env[0] != '0') &&
                            kernels::prefill_nvfp4_supported(128, 2 * qdim_a + 2 * kvdim_a, H);
+        // Whether this build/card COULD hold qkv-gate copies at all, kept across the budget below
+        // so the partial fill after the layer loop can still run when the whole set was refused.
+        const bool qkvg_eligible = qkvg_fp4_on;
         int down_ready = 0;
         auto convert = [&](const void* src, int qtype, int rows, int cols,
                            const void** data, const void** sf) -> bool {
@@ -6252,9 +6305,23 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             // The KV cache is allocated before the model is constructed, so `freeb` already
             // reflects it at this session's max_seq; the reserve only has to cover the per-run
             // batched-prefill scratch arena. Drop wo before down: down is worth ~4x more.
+            // Every leg also has to leave the RUNTIME its own post-load allocation: the decode
+            // graph pools, the packed-decode arena and the per-pass prefill scratch. `reserve`
+            // above covers the batched-prefill arena only, and at 33 sessions the rest is ~1 GB
+            // more -- without counting it the budget "fitted" 1.79 GB of qkv-gate beside 0.88 GB
+            // of o-proj copies and the graph instantiate then failed ten times over (290 tok/s,
+            // 2 MB free at peak). Counting it drops the o-proj leg first, which is the order the
+            // preflight below already intends, and keeps the qkv-gate set whole -- worth ~3x per
+            // byte at packed widths: Muse cb c32 1387 -> 1548 tok/s.
+            // SPARKINFER_MUSE_NVFP4_RUNTIME_MB tunes it; 0 restores main's budget.
+            static const size_t runtime_margin = [] {
+                const char* e = getenv("SPARKINFER_MUSE_NVFP4_RUNTIME_MB");
+                const long long mb = e ? atoll(e) : 1024LL;
+                return (size_t)(mb < 0 ? 0 : mb) << 20;
+            }();
             auto fits = [&] {
                 return freeb > want_qkvg + (wo_fp4_on ? want_wo : 0) +
-                               (down_fp4_on ? want_down : 0) + reserve;
+                               (down_fp4_on ? want_down : 0) + reserve + runtime_margin;
             };
             fprintf(stderr, "[prefill-muse] SM120 NVFP4 preflight: %.2f GB free, %d sessions, "
                     "reserve %.2f GB\n", (double)freeb / 1e9, fp4_sessions, (double)reserve / 1e9);
@@ -6373,6 +6440,44 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 convert(lw.down_q, lw.down_qtype, H, c.moe_ffn,
                         &lw.down_fp4, &lw.down_fp4_sf)) ++down_ready;
         }
+        // PARTIAL QKV-GATE FILL. The whole set is all-or-nothing above because a deployment that
+        // can hold it wants every layer; where it cannot, the layers that DO fit are still worth
+        // having -- the packed decode and the batched prefill both pick this arm per layer, so a
+        // prefix set [0, n) is legal exactly as it is for ffn_down.
+        //
+        // It fills BEFORE down because per byte it is worth about three times as much: at 32 rows
+        // the Q4_K in-projections cost ~85 us a layer against ~25 us through the block-scaled
+        // GEMM, for 34 MB, while an ffn_down copy buys ~94 -> 50 us for 83 MB. What it must leave
+        // is the runtime's own allocation after load, which at 33 sessions is ~2.4 GB: holding the
+        // full 1.79 GB set there left the graph instantiate and the prefill scratch with nothing
+        // (10x "graph instantiate: out of memory", 290 tok/s), so the same keep margin ffn_down
+        // uses guards this too. SPARKINFER_MUSE_NVFP4_QKVG_KEEP_MB tunes it; 0 restores main.
+        static const long long qkvg_keep_mb = [] {
+            const char* e = getenv("SPARKINFER_MUSE_NVFP4_QKVG_KEEP_MB");
+            return e ? atoll(e) : 1024LL;
+        }();
+        if (ok && qkvg_eligible && qkvg_ready < c.n_layers && qkvg_keep_mb > 0) {
+            const size_t per_layer =
+                kernels::prefill_nvfp4_data_bytes(2 * qdim_a + 2 * kvdim_a, H) +
+                kernels::prefill_nvfp4_scale_bytes_b(2 * qdim_a + 2 * kvdim_a, H);
+            const size_t keep = (size_t)qkvg_keep_mb << 20;
+            const size_t tmp_bytes = tmp ? tmp_elems * sizeof(bf16) : 0;
+            for (int i = 0; i < c.n_layers; ++i) {
+                Qwen35LayerWeights& lw = s.w.layers[i];
+                if (lw.qkvg_fp4) continue;
+                size_t f = 0, t = 0;
+                if (cudaMemGetInfo(&f, &t) != cudaSuccess || f + tmp_bytes <= per_layer + keep) break;
+                const void* src[4] = { lw.wq, lw.wgate, lw.wk, lw.wv };
+                const int qt[4] = { lw.wq_type, lw.wgate_type, lw.wk_type, lw.wv_type };
+                const int rows[4] = { qdim_a, qdim_a, kvdim_a, kvdim_a };
+                if (!convert_group(src, qt, rows, 4, H, &lw.qkvg_fp4, &lw.qkvg_fp4_sf)) {
+                    lw.qkvg_fp4 = lw.qkvg_fp4_sf = nullptr;
+                    break;
+                }
+                ++qkvg_ready;
+            }
+        }
+
         // Where the whole down set cannot be held beside the legs that are worth more, hold as many
         // layers of it as the VRAM left after everything else actually allows. The packed decode
         // and the batched prefill both pick the down arm per layer, so a prefix set [0, n) is legal;
