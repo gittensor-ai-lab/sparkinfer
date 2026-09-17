@@ -6258,9 +6258,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             };
             fprintf(stderr, "[prefill-muse] SM120 NVFP4 preflight: %.2f GB free, %d sessions, "
                     "reserve %.2f GB\n", (double)freeb / 1e9, fp4_sessions, (double)reserve / 1e9);
-            // ffn_down is a quarter of a packed decode step on Q4_K, and below eight rows the packed
-            // decode does not use qkv-gate at all -- so where both cannot be held and the
-            // deployment cannot pack eight rows, down is the copy to keep. But it is 3.9 GB, and the reserve above under-counts what the
+            // ffn_down is a quarter of a packed decode step on Q4_K, but where both cannot be held
+            // qkv-gate is the copy to keep (see the trade below). Down is 3.9 GB, and the reserve above under-counts what the
             // runtime allocates after load (packed and prefill arenas, graph pools: ~2.2 GB at 16
             // sessions against a 0.8 GB reserve), so down is admitted only with that margin on
             // top, and otherwise dropped before anything else is weighed.
@@ -6279,7 +6278,16 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                             (double)freeb / 1e9, (double)down_runtime / 1e9);
                     down_fp4_on = false;
                 } else if (qkvg_fp4_on && freeb <= with_down + want_qkvg) {
-                    if (fp4_sessions > 8) {
+                    // Now that the packed decode drives qkv-gate from two rows, it is worth more
+                    // than the down layers it displaces at every width: the partial down fill
+                    // below still takes back all the layers the leftover VRAM allows (46/52 at
+                    // c4, 52/52 at c2). cb c4 314.7 -> 336.0, c2 183.4 -> 190.7 tok/s.
+                    // SPARKINFER_MUSE_NVFP4_QKVG_OVER_DOWN_SESSIONS=8 restores the old trade.
+                    static const int qkvg_over_down = [] {
+                        const char* e = getenv("SPARKINFER_MUSE_NVFP4_QKVG_OVER_DOWN_SESSIONS");
+                        return e ? atoi(e) : 0;
+                    }();
+                    if (fp4_sessions > qkvg_over_down) {
                         fprintf(stderr, "[prefill-muse] SM120 NVFP4 ffn_down skipped: qkv-gate "
                                 "is worth more at %d sessions\n", fp4_sessions);
                         down_fp4_on = false;

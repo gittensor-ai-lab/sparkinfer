@@ -4329,15 +4329,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // 1.10 TB/s the gate/up GEMM beside it already reaches. The operand costs no
                 // VRAM it was not already costing, and the layer's own consumers want tight row
                 // strides, so the one [N, qkvg_n] result is scattered back out.
-                // From eight rows, the GEMM's smallest width: since the transposed orientation it
-                // is ahead of the Q4_K grid there too. SPARKINFER_MUSE_QKVG_MIN_ROWS=9 restores the
-                // old bound, SPARKINFER_MUSE_QKVG_FP4=0 the Q4_K projections.
+                // From two rows: Ng pads the A operand to the GEMM's eight-row width, and one
+                // transposed GEMM still beats the four-matrix Q4_K row grid it replaces (1.9 ms of a
+                // 12.3 ms c4 step). SPARKINFER_MUSE_QKVG_MIN_ROWS=8 restores the old bound,
+                // SPARKINFER_MUSE_QKVG_FP4=0 the Q4_K projections.
                 static const int qkvg_fp4_on = [] {
                     const char* e = getenv("SPARKINFER_MUSE_QKVG_FP4");
                     return (e && e[0] == '0') ? 0 : 1; }();
                 static const int qkvg_min_rows = [] {
                     const char* e = getenv("SPARKINFER_MUSE_QKVG_MIN_ROWS");
-                    const int v = e ? atoi(e) : 8;
+                    const int v = e ? atoi(e) : 2;
                     return v < 1 ? 1 : v; }();
                 bool qkvg_done = false;
                 if (qkvg_fp4_on && N >= qkvg_min_rows && fp4_a && fp4_asf && fp4_qkv &&
