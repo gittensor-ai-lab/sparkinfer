@@ -3,7 +3,11 @@
 
 Policy (list: .github/noise-ban-list.txt, CI: .github/workflows/noise-penalty.yml)
 --------------------------------------------------------------------------------
-An account listed for noise has every eval verdict on its PRs suspended for BAN_DAYS days:
+A listing has two levels. A first offence is `warn`: it goes on the record and parks nothing --
+the "one life" CONTRIBUTING.md promises. Only a repeat is written as `ban`, and only `ban` parks
+anything. An unmarked line defaults to `warn`, so the file fails toward leniency.
+
+A `ban` suspends every eval verdict on that account's PRs for BAN_DAYS days:
 
     eval:XL  ->  eval:XL-p        eval-qwen38:M  ->  eval-qwen38:M-p
     eval:none                     (exempt, every family)
@@ -40,6 +44,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -48,6 +53,8 @@ BAN_LIST_FILE = os.path.join(ROOT, ".github", "noise-ban-list.txt")
 DEFAULT_REPO = "gittensor-ai-lab/sparkinfer"
 
 BAN_DAYS = 3                 # a ban starting on D is active on D, D+1, D+2 and lifts on D+3
+LEVELS = ("warn", "ban")
+DEFAULT_LEVEL = "warn"       # "one life": an unmarked listing is a warning and parks nothing
 PENALTY_SUFFIX = "-p"
 EXEMPT_TIERS = {"none"}      # `eval:none` and its per-family twins are never parked
 PENALTY_COLOR = "6A737D"
@@ -154,16 +161,24 @@ def parse_ban_list(text):
             problems.append(f"line {lineno}: `{login}` has an unparseable ban-start date "
                             f"{parts[1]!r} (expected YYYY-MM-DD)")
             continue
+        level = DEFAULT_LEVEL
         if len(parts) > 2:
+            level = parts[2].lower()
+            if level not in LEVELS:
+                problems.append(f"line {lineno}: `{login}` has unknown level {parts[2]!r} "
+                                f"(expected one of {', '.join(LEVELS)})")
+                continue
+        if len(parts) > 3:
             problems.append(f"line {lineno}: `{login}` has trailing text "
-                            f"{' '.join(parts[2:])!r} — put notes after a `#`")
+                            f"{' '.join(parts[3:])!r} — put notes after a `#`")
             continue
         if login in seen:
             problems.append(f"line {lineno}: `{login}` is listed twice (first at line "
                             f"{seen[login]}) — move the date instead of adding a second ban")
             continue
         seen[login] = lineno
-        entries.append({"login": login, "start": start, "reason": reason, "line": lineno})
+        entries.append({"login": login, "start": start, "level": level,
+                        "reason": reason, "line": lineno})
     return entries, problems
 
 
@@ -180,8 +195,14 @@ def lift_date(start):
 
 
 def ban_status(entry, today):
-    """('active'|'pending'|'expired', lift_date) for this entry as of `today` (UTC)."""
+    """('active'|'pending'|'expired'|'warned', lift_date) for this entry as of `today` (UTC).
+
+    A `warn` entry is the first-offence life the guidelines promise: it is on the record, it is
+    what escalates a repeat to `ban`, and it never parks a label. Only `ban` returns 'active'.
+    """
     lift = lift_date(entry["start"])
+    if entry.get("level", DEFAULT_LEVEL) != "ban":
+        return "warned", lift
     if today < entry["start"]:
         return "pending", lift
     if today < lift:
@@ -246,17 +267,33 @@ def ensure_label(repo, name, dry_run):
 
 
 def edit_pr(repo, num, add, remove, dry_run):
+    """Swap a PR's labels over the REST issues API.
+
+    Deliberately not `gh pr edit`: that goes through GraphQL, which also resolves the PR's
+    classic-Projects fields and now fails outright against repos the deprecation touches --
+    taking the label edit down with it even though labels were the only thing being changed.
+    The REST issues endpoints below touch labels and nothing else.
+
+    Adds before removing, so a failure half-way can only ever leave a PR holding BOTH the parked
+    and the original tier (visibly odd, fixed by the next run) rather than neither (silently
+    unscored, and invisible).
+    """
     for name in add:
         ensure_label(repo, name, dry_run)
-    cmd = ["pr", "edit", str(num), "-R", repo]
-    for name in add:
-        cmd += ["--add-label", name]
-    for name in remove:
-        cmd += ["--remove-label", name]
     if dry_run:
         return True
-    out = gh(cmd)
-    return out is not None and out.returncode == 0
+    ok = True
+    if add:
+        args = ["api", f"repos/{repo}/issues/{num}/labels", "-X", "POST"]
+        for name in add:
+            args += ["-f", f"labels[]={name}"]
+        out = gh(args)
+        ok = ok and out is not None and out.returncode == 0
+    for name in remove:
+        out = gh(["api", f"repos/{repo}/issues/{num}/labels/{urllib.parse.quote(name, safe='')}",
+                  "-X", "DELETE"])
+        ok = ok and out is not None and out.returncode == 0
+    return ok
 
 
 def process_pr(repo, pr, penalize, dry_run, verb):
@@ -294,7 +331,8 @@ def main(argv=None):
         print(f"ban list: {args.list_file} — {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}")
         for e in entries:
             state, lift = ban_status(e, today)
-            print(f"  {e['login']:<24} start {e['start']}  lift {lift}  [{state}]"
+            when = "no penalty" if state == "warned" else f"lift {lift}"
+            print(f"  {e['login']:<24} {e['level']:<5} {e['start']}  {when:<12} [{state}]"
                   + (f"  # {e['reason']}" if e["reason"] else ""))
         if problems:
             print(f">> {len(problems)} problem(s) — fix the list", file=sys.stderr)
@@ -315,8 +353,11 @@ def main(argv=None):
         else:
             inactive.append((e, state))
 
-    print(f"noise penalty on {args.repo} — {today} (UTC), {len(active)} active ban(s)"
-          + (" [dry run]" if args.dry_run else ""))
+    warned = [e["login"] for e, st in inactive if st == "warned"]
+    print(f"noise penalty on {args.repo} — {today} (UTC), {len(active)} active ban(s), "
+          f"{len(warned)} on a warning" + (" [dry run]" if args.dry_run else ""))
+    if warned:
+        print(f"   warned (no penalty, escalates on a repeat): {', '.join(sorted(warned))}")
 
     edits = 0
     for login, lift in sorted(active.items()):
@@ -335,7 +376,9 @@ def main(argv=None):
             continue
         restorable = sum(1 for pr in prs if plan_labels(label_names(pr), False)[0])
         if restorable:
-            print(f" * {e['login']}: ban {state} (lifted {lift_date(e['start'])}) — restoring")
+            why = ("on a warning, not a ban" if state == "warned"
+                   else f"ban {state} (lifted {lift_date(e['start'])})")
+            print(f" * {e['login']}: {why} — restoring")
         for pr in prs:
             edits += process_pr(args.repo, pr, False, args.dry_run, "restore")
 

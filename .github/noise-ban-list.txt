@@ -17,12 +17,17 @@
 # `eval:none` is exempt in every family: it is worth nothing already, and it is the marker the
 # bots use to record "evaluated, no speedup". Parking it would only lose that record.
 #
-# Format — one ban per line:
+# TWO LEVELS. A first offence is always `warn` — on the record, nothing parked. That is the one
+# life CONTRIBUTING.md promises, and it is what makes a later `ban` fair rather than a surprise.
+# Only a repeat is written as `ban`.
 #
-#   <github-login>  <YYYY-MM-DD ban start, UTC>   # why
+# Format — one account per line:
 #
-# The date is the START of the ban and never changes; the lift is computed as start + 3 days.
-# Re-offending means updating the date to the new start, not adding a second line.
+#   <github-login>  <YYYY-MM-DD start, UTC>  <warn|ban>   # why
+#
+# The level defaults to `warn` when it is left off, so a half-written line can never penalise
+# anyone. The date is the START and never changes; a ban lifts at start + 3 days. Escalating or
+# re-offending means editing that account's line, not adding a second one.
 #
 # Leave expired entries in place — they are the record of what was done and to whom. An expired
 # entry costs nothing (the bot restores its labels once and then finds nothing to do). Deleting a
@@ -31,4 +36,4 @@
 #
 # Maintainer-only file (see CODEOWNERS), like the denylist it sits next to.
 
-widecloud  2026-09-17   # sustained off-topic PR/issue noise on the project
+widecloud  2026-09-17  warn   # off-topic noise; first offence, penalty lifted 2026-09-18 — one life

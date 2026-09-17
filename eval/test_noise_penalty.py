@@ -68,7 +68,8 @@ class LabelArithmeticTest(unittest.TestCase):
 
 
 class BanWindowTest(unittest.TestCase):
-    ENTRY = {"login": "widecloud", "start": D("2026-09-17"), "reason": "", "line": 1}
+    ENTRY = {"login": "widecloud", "start": D("2026-09-17"), "level": "ban",
+             "reason": "", "line": 1}
 
     def test_three_day_window(self):
         self.assertEqual(np.BAN_DAYS, 3)
@@ -93,11 +94,12 @@ class BanWindowTest(unittest.TestCase):
 class BanListParsingTest(unittest.TestCase):
     def test_parses_login_date_and_reason(self):
         entries, problems = np.parse_ban_list(
-            "# header\n\nwidecloud  2026-09-17   # sustained off-topic noise\n")
+            "# header\n\nwidecloud  2026-09-17  ban   # sustained off-topic noise\n")
         self.assertEqual(problems, [])
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["login"], "widecloud")
         self.assertEqual(entries[0]["start"], D("2026-09-17"))
+        self.assertEqual(entries[0]["level"], "ban")
         self.assertEqual(entries[0]["reason"], "sustained off-topic noise")
 
     def test_login_is_lowercased(self):
@@ -112,12 +114,18 @@ class BanListParsingTest(unittest.TestCase):
             self.assertEqual(len(problems), 1, text)
 
     def test_trailing_text_must_be_a_comment(self):
-        entries, problems = np.parse_ban_list("widecloud 2026-09-17 spamming\n")
+        entries, problems = np.parse_ban_list("widecloud 2026-09-17 ban spamming\n")
         self.assertEqual(entries, [])
         self.assertIn("trailing text", problems[0])
 
+    def test_unknown_level_is_rejected(self):
+        entries, problems = np.parse_ban_list("widecloud 2026-09-17 banned\n")
+        self.assertEqual(entries, [])
+        self.assertIn("unknown level", problems[0])
+
     def test_duplicate_login_is_rejected(self):
-        entries, problems = np.parse_ban_list("widecloud 2026-09-17\nwidecloud 2026-09-18\n")
+        entries, problems = np.parse_ban_list(
+            "widecloud 2026-09-17 ban\nwidecloud 2026-09-18 ban\n")
         self.assertEqual(len(entries), 1)
         self.assertIn("listed twice", problems[0])
 
@@ -129,6 +137,34 @@ class BanListParsingTest(unittest.TestCase):
         self.assertEqual(len(problems), 1)
 
 
+class OneLifeTest(unittest.TestCase):
+    """A first offence is a warning: on the record, nothing parked."""
+
+    WARN = {"login": "someone", "start": D("2026-09-17"), "level": "warn",
+            "reason": "", "line": 1}
+
+    def test_a_warning_never_becomes_active(self):
+        for day in ("2026-09-16", "2026-09-17", "2026-09-18", "2026-09-19", "2026-09-30"):
+            self.assertEqual(np.ban_status(self.WARN, D(day))[0], "warned", day)
+
+    def test_same_dates_park_under_ban_but_not_under_warn(self):
+        ban = dict(self.WARN, level="ban")
+        self.assertEqual(np.ban_status(ban, D("2026-09-18"))[0], "active")
+        self.assertEqual(np.ban_status(self.WARN, D("2026-09-18"))[0], "warned")
+
+    def test_level_defaults_to_warn(self):
+        entries, problems = np.parse_ban_list("someone 2026-09-17\n")
+        self.assertEqual(problems, [])
+        self.assertEqual(entries[0]["level"], "warn")
+        self.assertEqual(np.ban_status(entries[0], D("2026-09-17"))[0], "warned",
+                         "an unmarked line must never penalise anyone")
+
+    def test_missing_level_field_defaults_rather_than_erroring(self):
+        self.assertEqual(np.DEFAULT_LEVEL, "warn")
+        self.assertEqual(np.ban_status({"login": "x", "start": D("2026-09-17")},
+                                       D("2026-09-17"))[0], "warned")
+
+
 class ShippedBanListTest(unittest.TestCase):
     """The list that actually ships must parse, and must still name the first ban."""
 
@@ -137,9 +173,19 @@ class ShippedBanListTest(unittest.TestCase):
         self.assertEqual(problems, [], f"ban list has problems: {problems}")
         self.assertTrue(entries, "ban list parsed to nothing")
 
-    def test_widecloud_is_listed(self):
+    def test_widecloud_is_listed_as_a_warning_not_a_ban(self):
         entries, _ = np.load_ban_list()
-        self.assertIn("widecloud", {e["login"] for e in entries})
+        by_login = {e["login"]: e for e in entries}
+        self.assertIn("widecloud", by_login)
+        self.assertEqual(by_login["widecloud"]["level"], "warn")
+
+    def test_nothing_in_the_shipped_list_is_currently_parking(self):
+        """Guards the amnesty: no shipped entry may park a label on any future date."""
+        entries, _ = np.load_ban_list()
+        for e in entries:
+            for day in ("2026-09-17", "2026-09-18", "2026-09-19", "2026-09-20"):
+                self.assertNotEqual(np.ban_status(e, D(day))[0], "active",
+                                    f"{e['login']} would still be parked on {day}")
 
     def test_noise_list_and_gaming_denylist_stay_separate(self):
         """A noise ban is a 3-day timeout; the denylist is permanent. Never both."""

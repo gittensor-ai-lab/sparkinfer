@@ -333,12 +333,22 @@ The bot evaluates PRs **oldest-first** and fingerprints each diff, so gaming is 
 - **No override.** There is no way to force-evaluate around the gate — not even for a maintainer.
   Real, original, frontier-advancing work is the only thing that scores.
 
-### Noise (a 3-day parked tier)
+### Noise (a warning first, then a 3-day parked tier)
 
 Separate from gaming, and much smaller: an account that floods the project with **off-topic, spammy
-or disruptive traffic** can be listed in [`.github/noise-ban-list.txt`](.github/noise-ban-list.txt)
-for **3 days**. While listed, every `eval*:<tier>` label on that account's PRs is swapped for
-`eval*:<tier>-p` ("parked"). SN74 scores `eval:*`, so a parked tier earns nothing for the window.
+or disruptive traffic** can be listed in [`.github/noise-ban-list.txt`](.github/noise-ban-list.txt).
+
+**A first listing is always a warning.** It is written `warn`, it goes on the record, and it parks
+nothing — you keep every tier and every emission. Nobody loses score over a first offence, and an
+unmarked line defaults to `warn`, so the file can only fail toward leniency.
+
+**A repeat is written `ban`, and that is the one that costs something.** For **3 days** from the
+date on the line, every `eval*:<tier>` label on that account's PRs is swapped for `eval*:<tier>-p`
+("parked"). SN74 scores `eval:*`, so a parked tier earns nothing for the window. After 3 days the
+bot restores the original tiers automatically.
+
+The warning exists so the ban is never a surprise: you are told first, in writing, with the reason
+on the line, and you get the chance to change nothing but the behaviour.
 
 What a noise ban does **not** do:
 
@@ -352,13 +362,24 @@ What a noise ban does **not** do:
   harness error, or pointing out a mistake that benefited you is *wanted* — that is how the
   measured record stays honest, and none of it is noise.
 
-The list is maintainer-owned (see [CODEOWNERS](.github/CODEOWNERS)), one account per line with the
-UTC date the ban starts; re-offending updates that date rather than adding a line. Expired entries
-stay as the record of what was done and to whom.
+The list is maintainer-owned (see [CODEOWNERS](.github/CODEOWNERS)), one account per line:
+
+```
+<github-login>  <YYYY-MM-DD start, UTC>  <warn|ban>   # why
+```
+
+Escalating or re-offending edits that account's line rather than adding a second one. Expired
+entries stay as the record of what was done and to whom.
 
 **If you think a listing is wrong**, say so on any of your PRs or open an issue. A maintainer
-removes the line, and the next hourly sweep restores every parked label automatically — no GPU run
-and no re-evaluation is needed, so a correction costs nothing but the hour.
+removes the line or drops it back to `warn`, and the next hourly sweep restores every parked label
+automatically — no GPU run and no re-evaluation is needed, so a correction costs nothing but the
+hour. This has already happened once, and the entry was reversed; that is the intended behaviour
+of the appeal, not an exception to it.
+
+**The rule applies from the date it is written down, not before.** A penalty is only legitimate if
+this section described it at the time. If the protocol changes, the change binds what happens next
+— it is never applied backwards to conduct that predates it.
 
 This is the temporary, reversible end of the scale. The permanent end is
 [`.github/blocked-contributors.txt`](.github/blocked-contributors.txt) (sybil / emission farming),
