@@ -8,6 +8,7 @@ on:
       - ".github/workflows/eval-policy.yml"
       - ".github/workflows/rtx5090-required.yml"
       - ".github/workflows/close-stale-prs.yml"
+      - ".github/workflows/noise-penalty.yml"
   push:
     branches: [main]
     paths:
@@ -16,6 +17,7 @@ on:
       - ".github/workflows/eval-policy.yml"
       - ".github/workflows/rtx5090-required.yml"
       - ".github/workflows/close-stale-prs.yml"
+      - ".github/workflows/noise-penalty.yml"
 
 permissions:
   contents: read
@@ -49,6 +51,8 @@ jobs:
             eval/vast_eval.py \
             eval/pr_qwen38_bot.py \
             eval/test_pr_qwen38_bot.py \
+            eval/noise_penalty.py \
+            eval/test_noise_penalty.py \
             bench/scripts/accuracy_compare_pair.py
 
       - name: Eval policy tests
@@ -57,3 +61,6 @@ jobs:
           python3 bench/scripts/test_label.py
           python3 eval/test_pr_eval_bot.py
           python3 eval/test_pr_qwen38_bot.py
+          python3 eval/test_noise_penalty.py
+          # The ban list itself is policy: a malformed line must fail review, not a 3am cron.
+          python3 eval/noise_penalty.py --check

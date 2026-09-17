@@ -1,0 +1,68 @@
+name: noise-penalty
+# Enforces the noise ban list (.github/noise-ban-list.txt).
+#
+# A listed account has every eval verdict on its PRs parked for 3 days -- `eval:XL` becomes
+# `eval:XL-p`, `eval-qwen38:M` becomes `eval-qwen38:M-p`, and so on across every eval family.
+# SN74 scoring reads `eval:*`, so a parked tier earns nothing for the window. `eval:none` is
+# exempt (worth nothing already, and it is the bots' "evaluated, no speedup" record).
+#
+# When the 3 days are up this same job puts the original tiers back, exactly as measured: the
+# tier is still spelled out inside the parked label, so nothing is re-run and no GPU is spent.
+#
+# Nothing here closes, comments on, or re-scores a PR. Permanent removal for eval-gaming is a
+# different rule -- see .github/blocked-contributors.txt and eval/pr_eval_bot.py.
+#
+# Runs hourly (so a ban lands, and lifts, within the hour), on any push that edits the list, and
+# on demand. Every run re-derives the full desired state from the list plus today's UTC date, so
+# a missed run costs latency and nothing else.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  push:
+    branches: [main]
+    paths:
+      - ".github/noise-ban-list.txt"
+      - ".github/workflows/noise-penalty.yml"
+      - "eval/noise_penalty.py"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the label edits without making them"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: write     # add/remove the eval labels
+  issues: write            # create a parked label the first time a tier needs one
+
+# Two overlapping runs would fight over the same labels; let one finish.
+concurrency:
+  group: noise-penalty
+  cancel-in-progress: false
+
+jobs:
+  enforce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate the ban list
+        # A typo must fail here, loudly, rather than half-enforce: the script refuses to touch
+        # any label while the list has a problem, so a bad line would otherwise strand somebody
+        # else's tier at `-p` past their window.
+        run: python3 eval/noise_penalty.py --check
+
+      - name: Apply and lift noise penalties
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            python3 eval/noise_penalty.py --repo "$GITHUB_REPOSITORY" --dry-run
+          else
+            python3 eval/noise_penalty.py --repo "$GITHUB_REPOSITORY"
+          fi

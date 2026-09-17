@@ -68,4 +68,9 @@ gh label create "qwen38-merge-first" -R "$REPO" --color "0E8A16" \
 gh label create "qwen38-needs-rebase" -R "$REPO" --color "FBCA04" \
    --description "conflicts with main — rebase before the Qwen3.8-27B bot can evaluate it" --force >/dev/null
 
+# Noise-ban penalty labels (`eval:XL-p`, `eval-qwen38:M-p`, ...) are deliberately NOT created
+# here. eval/noise_penalty.py upserts one the first time a ban actually parks that tier, so the
+# repo only ever carries penalty labels it has really used -- which is also what keeps the
+# restore sweep cheap (it walks the penalty labels that exist). See .github/noise-ban-list.txt.
+
 echo "eval:*, eval-dflash:*, eval-museglimmer:*, eval-qwen38:*, area:*, *-context, regression-*, dflash-merge-*, museglimmer-merge-*, qwen38-merge-* labels ready on $REPO"

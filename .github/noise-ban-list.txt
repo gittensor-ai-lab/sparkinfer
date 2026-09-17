@@ -1,0 +1,34 @@
+# Accounts banned for NOISE — off-topic, spammy, or disruptive traffic aimed at this project.
+#
+# This is NOT the eval-gaming denylist. Compare the two before adding anyone:
+#
+#   .github/blocked-contributors.txt  sybil / emission farming. PERMANENT. The PR is labeled
+#                                     `flagged:gaming`, commented, CLOSED, and never evaluated.
+#   .github/noise-ban-list.txt (here) noise. TEMPORARY (3 days). Nothing is closed and no
+#                                     measurement is thrown away — the account's eval tiers are
+#                                     parked so they earn nothing for the window, then restored.
+#
+# The penalty (eval/noise_penalty.py, run hourly by .github/workflows/noise-penalty.yml):
+# every `eval*:<tier>` label on the account's PRs is swapped for `eval*:<tier>-p` for 3 days.
+# SN74 scoring reads `eval:*`, so a parked tier scores nothing. The tier stays spelled out in the
+# label, so when the ban lifts the bot puts back exactly what the eval measured — a ban costs the
+# account 3 days of emissions, never a verdict it actually earned.
+#
+# `eval:none` is exempt in every family: it is worth nothing already, and it is the marker the
+# bots use to record "evaluated, no speedup". Parking it would only lose that record.
+#
+# Format — one ban per line:
+#
+#   <github-login>  <YYYY-MM-DD ban start, UTC>   # why
+#
+# The date is the START of the ban and never changes; the lift is computed as start + 3 days.
+# Re-offending means updating the date to the new start, not adding a second line.
+#
+# Leave expired entries in place — they are the record of what was done and to whom. An expired
+# entry costs nothing (the bot restores its labels once and then finds nothing to do). Deleting a
+# line early is also safe: the bot's sweep restores any parked label whose owner is no longer
+# under an active ban.
+#
+# Maintainer-only file (see CODEOWNERS), like the denylist it sits next to.
+
+widecloud  2026-09-17   # sustained off-topic PR/issue noise on the project
