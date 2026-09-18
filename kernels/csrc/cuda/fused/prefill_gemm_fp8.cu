@@ -407,6 +407,13 @@ void launch_prefill_quantize_rows_fp8(const void* x_bf16, void* q, float* scale,
 // main byte for byte (A/B in ONE binary).
 namespace {
 constexpr int FP8_NARROW_BM = 32;
+// Lower bound, not just the 32-row upper one. The tile was measured across the packed decode
+// widths the bots score -- 8, 16 and 32 rows -- and nothing below that was ever benchmarked: a
+// prefill tail chunk of a handful of rows lands in the same launcher, and at BK=128 it has half
+// as many K-tiles to split across, so the split-K rule can hand it fewer blocks than the 64-byte
+// tile would. Below eight rows the old tile stays, which is also what every caller on the packed
+// path already gates on (kProjGemmMinRows / SPARKINFER_FFN_GEMM_MIN_ROWS default to 8).
+constexpr int FP8_NARROW_MIN_M = 8;
 bool fp8_narrow_m() {
     static const bool v = [] {
         const char* e = getenv("SPARKINFER_FP8_GEMM_NARROW_M");
@@ -462,7 +469,7 @@ static inline int fp8_tile_bk(bool narrow) { return narrow ? fp8_narrow_bk() : F
 void launch_prefill_gemm_fp8(const void* A, const void* W,
                              const float* sx, const float* sw, void* C,
                              int M, int N, int K, cudaStream_t stream) {
-    const bool narrow = M > 0 && M <= FP8_NARROW_BM && fp8_narrow_m();
+    const bool narrow = M >= FP8_NARROW_MIN_M && M <= FP8_NARROW_BM && fp8_narrow_m();
     const int bm = narrow ? FP8_NARROW_BM : FP8_BM;
     dim3 grid((N + FP8_BN - 1) / FP8_BN, (M + bm - 1) / bm);
     if (narrow) {
@@ -523,7 +530,7 @@ bool launch_prefill_gemm_fp8_splitk(const void* A, const void* W,
     if (splits <= 1) return false;
     // The split is over K, so the M tiling is the one the launcher above picks and the number of
     // blocks -- which is what fp8_sk_splits balanced -- is the same either way at these widths.
-    const bool narrow = M <= FP8_NARROW_BM && fp8_narrow_m();
+    const bool narrow = M >= FP8_NARROW_MIN_M && M <= FP8_NARROW_BM && fp8_narrow_m();
     const int bm = narrow ? FP8_NARROW_BM : FP8_BM;
     const int bk = fp8_tile_bk(narrow);
     // fp8_sk_splits balances BLOCKS, which BK does not change, but the K partition is counted in
