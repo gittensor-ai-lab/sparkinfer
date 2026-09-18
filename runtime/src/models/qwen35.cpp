@@ -1011,6 +1011,25 @@ int Qwen35Model::adaptive_nsplits_for(int seqlen) const {
     if (c.head_dim == 256 && c.n_kv_heads > 0 && want >= 128) {
         if (c.n_q_heads == c.n_kv_heads * 8)
             want = 160;
+        else if (c.n_q_heads == c.n_kv_heads * 6) {
+            // Qwen3.8-27B's 24Q/4KV full-attention shape. The 8:1 and 4:1 groups above have had an
+            // occupancy correction since #707; the 6:1 group never got one and fell through to the
+            // raw MAX_NSPLITS, which costs it a whole CTA wave.
+            //
+            // The kernel this dispatches to (fa_split_gqa_mma_i8_kernel<256,6>) holds THREE blocks
+            // per SM, so a 170-SM part runs 510 CTAs at once. The grid is n_kv_heads * n_splits, so
+            // 256 asks for 1024 CTAs -- two full waves plus a third that carries FOUR. Dropping
+            // into the two-wave band deletes that tail; the cost is a slightly longer chunk and one
+            // ragged 128-token group at its end, which is worth far less than the wave.
+            //
+            // Measured at ctx=262144 on the ModelOpt NVFP4 checkpoint, decode tok/s (3 reps each at
+            // the ends): 256 -> 55.70 · 255 -> 58.81 · 252 -> 58.86 · 250 -> 57.32 · 248 -> 58.64.
+            // 252 is the measured peak of the band, and beats 255 in every rep.
+            //
+            // Only the long-context band moves: below want == MAX_NSPLITS -- every context up to
+            // 16384, which is every concurrent-decode and short-decode path -- this is not reached.
+            if (want == Impl::MAX_NSPLITS) want = 252;
+        }
         else if (c.n_q_heads == c.n_kv_heads * 4) {
             if ((long)seqlen > 98304L)           want = 128;  // 128k decode (seqlen ~131k)
             else if ((long)seqlen > 65536L)      want = 192;  // 64k decode band
