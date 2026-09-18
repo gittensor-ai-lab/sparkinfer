@@ -928,6 +928,13 @@ template <> struct fa_mma_block_threads<128, 16> { static constexpr int v = 256;
 // Only the shape that was measured is specialized; every other instantiation keeps five.
 template <int HEAD_DIM, int GQA> struct fa_mma_min_blocks { static constexpr int v = 5; };
 template <> struct fa_mma_min_blocks<256, 6> { static constexpr int v = 3; };
+// Muse Glimmer's 16:1 group (hd128). Same leftover #1114 closed for the 6:1 hd256 kernel: five
+// blocks cannot fit. Dynamic smem is 2*16*128 B of int8 planes plus (16+16)*128 floats plus the
+// scale tail -- 21760 B -- and 5 * 21760 > the 5090's 102400 B/SM, so FOUR is the ceiling.
+// __launch_bounds__(256, 5) still pinned ptxas to 51 registers for a fifth block that cannot
+// exist. Asking for the four that do fit is the same register trade. SPARKINFER_FAGQA16_MMA=0
+// keeps the tile kernel.
+template <> struct fa_mma_min_blocks<128, 16> { static constexpr int v = 4; };
 
 // Tensor-core (wmma int8) GQA flash-decode split for long context. The 8 GQA q-heads of a kv-head are
 // the batch (M) dim, so S = Q·Kᵀ and O = P·V become small matmuls on the tensor cores, replacing the

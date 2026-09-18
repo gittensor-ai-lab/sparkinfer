@@ -6511,12 +6511,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // the last attention projection on that path, ~15 MB a layer, while down is ~75 MB and
         // the two leftover down layers the keep below currently buys are the ones Q4_K MMA
         // already covers. What it must leave is the same runtime allocation the other prefix
-        // fills guard. 1024 MiB converts 12 layers (flat vs those two down copies); 640 and
-        // below starve graph instantiate (~840 tok/s). 736 holds 30/52 layers on a 32-GB 5090
-        // at 33 sessions. SPARKINFER_MUSE_NVFP4_WO_KEEP_MB tunes it; 0 restores main's skip.
+        // fills guard. 736 MiB still reports enough free to convert 28/52 layers on a 32-GB
+        // 5090 at 33 sessions, but those copies fragment the heap: the 333 MB prefill scratch
+        // then declines with 14 MB free, graph instantiate misses, and packed c32 falls to
+        // 742 tok/s (max_itl 4.7 s). 1024 MiB is the same floor ffn_down and qkv-gate already
+        // use; it holds 10/52 layers and leaves a contiguous arena, 1566 tok/s. 0 restores
+        // main's skip. SPARKINFER_MUSE_NVFP4_WO_KEEP_MB=736 is the previous default.
         static const long long wo_keep_mb = [] {
             const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_KEEP_MB");
-            return e ? atoll(e) : 736LL;
+            return e ? atoll(e) : 1024LL;
         }();
         if (ok && wo_eligible && !wo_fp4_on && wo_keep_mb > 0) {
             const size_t per_layer = kernels::prefill_nvfp4_data_bytes(H, s.qdim) +

@@ -4494,34 +4494,54 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }
             // Windowed layer: same flash-decode entry point, pointed at this row's compact view
             // instead of the full KV. Global layer: full causal over the real table.
-            if (w.swa) {
-                kernels::launch_flash_decode_split(
-                    qb, kp, vp, swa_vtbl, swa_vlen, att, fa_m, fa_l, fa_acc,
-                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, swa_budget, swa_vsplits,
-                    1.f / sqrtf((float)c.head_dim), st, nullptr, swa_budget * bs,
-                    ks, vs, kv8 ? 1 : 0);
-            } else {
-                kernels::launch_flash_decode_split(
-                    qb, kp, vp, rtab, seq, att, fa_m, fa_l, fa_acc,
-                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns,
-                    1.f / sqrtf((float)c.head_dim), st, nullptr,
-                    packed ? packed_seq_hint : start_pos + N,
-                    ks, vs, kv8 ? 1 : 0);
-            }
-            // The o projection through the block-scaled FP4 copy prefill already holds, with the
-            // gate folded into its quantize, instead of the Q4_K mma rows. Rows past N are scratch.
-            // SPARKINFER_MUSE_PACKED_WO_MIN_ROWS=33 restores the Q4_K projection.
+            //
+            // AR decode already folds sigmoid(gate) and the o-proj Q8_1 quantize into the combine
+            // (SPARKINFER_MG_ATTN_GQ8). Packed never passed the gate or the Q8 dest, so every Q4_K
+            // o-proj still did mul_sigmoid + quantize after the combine -- 104 extra launches per
+            // step, and a second pass over the N x 4096 attn tile. After #1117 the o-proj NVFP4
+            // copy is the first thing dropped, so at c32 this is the path on the layers the prefix
+            // fill did not keep. The FP4 wo arm folds the gate into its own quantize, so the
+            // combine stays ungated there (double-gating would be wrong).
+            // SPARKINFER_MUSE_PACKED_WO_GATE_Q8=0 restores the split path.
             static const int wo_fp4_min_rows = [] {
                 const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_MIN_ROWS");
                 const int v = e ? atoi(e) : 1;
                 return v < 1 ? 1 : v; }();
-            const bool wo_fp4_done = N >= wo_fp4_min_rows && fp4_a && fp4_asf &&
-                w.wo_fp4 && w.wo_fp4_sf && kernels::prefill_nvfp4_supported(Ng, H, qdim) &&
+            static const bool packed_wo_gq8 = [] {
+                const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_GATE_Q8");
+                return !(e && e[0] == '0'); }();
+            const bool wo_want_fp4 = N >= wo_fp4_min_rows && fp4_a && fp4_asf &&
+                w.wo_fp4 && w.wo_fp4_sf && kernels::prefill_nvfp4_supported(Ng, H, qdim);
+            const bool attn_gq8 = packed_wo_gq8 && !wo_want_fp4 && qg && q81 &&
+                (w.wo_type == 12 || w.wo_type == 8) && (qdim % 32 == 0);
+            void* attn_q8 = attn_gq8 ? q81 : nullptr;
+            const void* attn_gate = attn_gq8 ? static_cast<const void*>(qg) : nullptr;
+            const int gq8_hd128 = attn_gq8 ? 1 : 0;
+            if (w.swa) {
+                kernels::launch_flash_decode_split(
+                    qb, kp, vp, swa_vtbl, swa_vlen, att, fa_m, fa_l, fa_acc,
+                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, swa_budget, swa_vsplits,
+                    1.f / sqrtf((float)c.head_dim), st, attn_q8, swa_budget * bs,
+                    ks, vs, kv8 ? 1 : 0, attn_gate, gq8_hd128);
+            } else {
+                kernels::launch_flash_decode_split(
+                    qb, kp, vp, rtab, seq, att, fa_m, fa_l, fa_acc,
+                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns,
+                    1.f / sqrtf((float)c.head_dim), st, attn_q8,
+                    packed ? packed_seq_hint : start_pos + N,
+                    ks, vs, kv8 ? 1 : 0, attn_gate, gq8_hd128);
+            }
+            // The o projection through the block-scaled FP4 copy prefill already holds, with the
+            // gate folded into its quantize, instead of the Q4_K mma rows. Rows past N are scratch.
+            // SPARKINFER_MUSE_PACKED_WO_MIN_ROWS=33 restores the Q4_K projection.
+            const bool wo_fp4_done = wo_want_fp4 &&
                 kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_asf, Ng, qdim, st) &&
                 kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.wo_fp4, w.wo_fp4_sf,
                                                    ao, Ng, H, qdim, fp4_ws, st);
             if (!wo_fp4_done) {
-                kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
+                if (!attn_gq8)
+                    kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
+                else { q81_src = att; q81_k = qdim; }
                 supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
             }
             if (!supported) break;
