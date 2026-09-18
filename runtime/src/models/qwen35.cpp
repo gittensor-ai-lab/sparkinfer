@@ -6222,12 +6222,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return true;
         };
         // The o-projection FP4 copy is decided ALL-OR-NOTHING before any layer converts, against
-        // free VRAM plus a reserve. A partial conversion is the worst outcome available: it spends
-        // the memory and still leaves most layers on int8, and if it takes the last of VRAM the
-        // batched-prefill scratch arena (allocated later, per run, and growing with the KV cache)
-        // fails and prefill drops to the token-loop path -- ~21x slower, and invisible to a bench
-        // that only covers ctx 0/128. Reserve defaults to 3 GB so the ctx-32k KV cache still fits.
-        // SPARKINFER_MUSE_NVFP4_WO=0 disables the leg; _RESERVE_MB tunes the reserve.
+        // free VRAM plus a reserve. The whole set is the right call when it fits; when it does
+        // not, refusing every layer used to leave the leftover on the table (qkv-gate and
+        // ffn_down already take a prefix in that case). The prefix fill after the layer loop
+        // does the same for wo. SPARKINFER_MUSE_NVFP4_WO=0 disables the leg; _RESERVE_MB tunes
+        // the reserve; SPARKINFER_MUSE_NVFP4_WO_KEEP_MB=0 restores the all-or-nothing skip.
         int wo_ready = 0;
         const char* fp4_wo_env = getenv("SPARKINFER_MUSE_NVFP4_WO");
         bool wo_fp4_on = (!fp4_wo_env || fp4_wo_env[0] != '0');
@@ -6246,6 +6245,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (fp4o_env)
             down_fp4_on = fp4o_env[0] == '1' || fp4o_env[0] == 'd';
         wo_fp4_on = wo_fp4_on && c.max_seq <= outputs_maxseq;
+        const bool wo_eligible = wo_fp4_on;
         const bool down_eligible = down_fp4_on;
         // Cost EVERY copy that grows the footprint against the free VRAM that is actually there,
         // and drop legs in ascending order of what they are worth until the set fits. Only these
@@ -6420,8 +6420,10 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             // reads lw.wo directly -- so its FP4 copy is a REAL +0.5625 B/value that nothing can
             // free. That is exactly why #820's ffn_down leg was reverted in #825: at 3.9 GB it left
             // no room for the KV cache plus the batched-prefill scratch arena at long context, and
-            // prefill silently fell back to the token loop. wo is 4.8x smaller (~0.8 GB), and the
-            // preflight above refuses it outright rather than converting a partial set.
+            // prefill silently fell back to the token loop. wo is 4.8x smaller (~0.8 GB). The
+            // preflight above still refuses the WHOLE set when it cannot hold every layer plus
+            // the runtime; the prefix fill after the loop takes back the layers leftover VRAM
+            // actually allows, the same way qkv-gate and ffn_down already do.
             if (ok && wo_fp4_on && lw.wo) {
                 if (convert(lw.wo, lw.wo_type, H, s.qdim, &lw.wo_fp4, &lw.wo_fp4_sf))
                     ++wo_ready;
@@ -6475,6 +6477,43 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                     break;
                 }
                 ++qkvg_ready;
+            }
+        }
+
+        // PARTIAL O-PROJ FILL. The whole set is all-or-nothing above because a 0.8 GB copy that
+        // does not leave the runtime its graph pools instantiates into "graph instantiate: out
+        // of memory" and ~10x slower packed decode (51/52 copies, 165 tok/s on a 32-GB 5090 at
+        // 33 sessions). Where the whole set cannot be held, the layers that DO fit are still
+        // worth having: packed decode and batched prefill both pick this arm per layer, and the
+        // workspace is sized from layers[0].wo_fp4, so a prefix [0, n) is the legal set.
+        //
+        // It fills BEFORE down because per byte it is worth more of a packed step than another
+        // ffn_down copy: at 32 rows the Q4_K o-proj (even with two MMA column groups) is still
+        // the last attention projection on that path, ~15 MB a layer, while down is ~75 MB and
+        // the two leftover down layers the keep below currently buys are the ones Q4_K MMA
+        // already covers. What it must leave is the same runtime allocation the other prefix
+        // fills guard. 1024 MiB converts 12 layers (flat vs those two down copies); 640 and
+        // below starve graph instantiate (~840 tok/s). 736 holds 30/52 layers on a 32-GB 5090
+        // at 33 sessions. SPARKINFER_MUSE_NVFP4_WO_KEEP_MB tunes it; 0 restores main's skip.
+        static const long long wo_keep_mb = [] {
+            const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_KEEP_MB");
+            return e ? atoll(e) : 736LL;
+        }();
+        if (ok && wo_eligible && !wo_fp4_on && wo_keep_mb > 0) {
+            const size_t per_layer = kernels::prefill_nvfp4_data_bytes(H, s.qdim) +
+                                     kernels::prefill_nvfp4_scale_bytes_b(H, s.qdim);
+            const size_t keep = (size_t)wo_keep_mb << 20;
+            const size_t tmp_bytes = tmp ? tmp_elems * sizeof(bf16) : 0;
+            for (int i = 0; i < c.n_layers; ++i) {
+                Qwen35LayerWeights& lw = s.w.layers[i];
+                if (lw.wo_fp4) continue;
+                size_t f = 0, t = 0;
+                if (cudaMemGetInfo(&f, &t) != cudaSuccess || f + tmp_bytes <= per_layer + keep) break;
+                if (!lw.wo || !convert(lw.wo, lw.wo_type, H, s.qdim, &lw.wo_fp4, &lw.wo_fp4_sf)) {
+                    lw.wo_fp4 = lw.wo_fp4_sf = nullptr;
+                    break;
+                }
+                ++wo_ready;
             }
         }
 
