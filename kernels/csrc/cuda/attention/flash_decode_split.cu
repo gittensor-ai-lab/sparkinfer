@@ -915,6 +915,20 @@ template <> struct fa_mma_block_threads<256, 6> { static constexpr int v = 256; 
 // 5*512 = 2560 is what kept this group off the tensor cores.
 template <> struct fa_mma_block_threads<128, 16> { static constexpr int v = 256; };
 
+// Blocks/SM to optimise for. This caps the register budget at 65536 / (threads * minb), so a value
+// the kernel cannot actually reach spends registers on nothing. hd256 cannot reach five: the
+// dynamic shared memory below is 2*16*HEAD_DIM bytes of int8 planes plus (16 + GQA)*HEAD_DIM floats
+// plus the scale tail -- 32000 B for the 6:1 group -- and the 5090 has 102400 B of shared memory per
+// SM, so THREE blocks is the ceiling. __launch_bounds__(256, 5) capped registers at 51 (ptxas took
+// 48) to chase a fifth block that cannot exist. Asking for the three that do fit gives REG:80 at the
+// same occupancy, and this kernel is memory-latency bound -- at ctx=262144 it is 48% of the decode
+// step and moves 8.66 GB per step at about half of DRAM peak -- so the freed registers go straight
+// into loads in flight. Measured on the 24Q/4KV group at ctx=262144: minb 5 -> 50.48 tok/s,
+// 4 -> 54.51, 3 -> 55.67, 2 -> 54.61 (2 drops to two blocks/SM and gives the win back).
+// Only the shape that was measured is specialized; every other instantiation keeps five.
+template <int HEAD_DIM, int GQA> struct fa_mma_min_blocks { static constexpr int v = 5; };
+template <> struct fa_mma_min_blocks<256, 6> { static constexpr int v = 3; };
+
 // Tensor-core (wmma int8) GQA flash-decode split for long context. The 8 GQA q-heads of a kv-head are
 // the batch (M) dim, so S = Q·Kᵀ and O = P·V become small matmuls on the tensor cores, replacing the
 // per-lane FMA + 5-shuffle fa_wsum reduction that dominates the scalar kernel at long context. K/V are
@@ -924,7 +938,8 @@ template <> struct fa_mma_block_threads<128, 16> { static constexpr int v = 256;
 // bottleneck) and uses 2x-throughput int8 tensor cores. M is padded 8->16; partials (m,l,acc) stay
 // byte-compatible with the combine kernel. sm_80+ (wmma). One block per (seq, kv_head, split); 8 warps.
 template <int HEAD_DIM, int GQA>
-__global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_split_gqa_mma_i8_kernel(
+__global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
+                                 fa_mma_min_blocks<HEAD_DIM, GQA>::v) fa_split_gqa_mma_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const int* __restrict__ block_table,
     const int* __restrict__ seq_lens,
