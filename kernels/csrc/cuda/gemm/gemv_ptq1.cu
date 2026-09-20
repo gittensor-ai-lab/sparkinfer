@@ -33,8 +33,13 @@ __device__ __forceinline__ int ptq1_trit(const unsigned char* __restrict__ qs, i
     }
     // Carriers are scaled into the whole byte rather than packed as plain base 3, so the digit
     // comes back out by multiplying up and taking the high bits -- ggml's own extraction.
-    const unsigned int pow3[5] = {1u, 3u, 9u, 27u, 81u};
-    const unsigned int q = (unsigned char)(qs[byte] * pow3[m]);
+    //
+    // The multiplier is a select chain, not a table. `m` is a runtime value that differs across
+    // the lanes of a warp, so an array indexed by it -- however it is declared -- costs either a
+    // local-memory load per trit or a serialized constant-bank access per distinct m. Every
+    // weight in the model goes through this line.
+    const unsigned int p3 = m == 0 ? 1u : m == 1 ? 3u : m == 2 ? 9u : m == 3 ? 27u : 81u;
+    const unsigned int q = (unsigned char)(qs[byte] * p3);
     return (int)((q * 3u) >> 8) - 1;
 }
 
@@ -67,12 +72,20 @@ __global__ void gemv_ptq1_kernel(const __nv_bfloat16* __restrict__ x,
     const int n_blocks = k / kBlockElems;
     const unsigned char* wrow = w + (size_t)row * n_blocks * kBlockBytes;
 
+    // The block is staged in shared memory once and read four times from there. Each lane's
+    // carrier byte is a data-dependent index into the same 28 bytes, so straight off global every
+    // one of the four passes re-issued 32 scattered byte loads that only L1 was saving.
+    __shared__ unsigned char sblk[kWarpsPerCta][kBlockBytes];
+    unsigned char* myblk = sblk[warp];
+
     float acc = 0.0f;
     for (int b = 0; b < n_blocks; ++b) {
         const unsigned char* qs = wrow + (size_t)b * kBlockBytes;
+        if (lane < kBlockBytes) myblk[lane] = qs[lane];
+        __syncwarp();
         // The scale sits in the last two bytes. Blocks are 28 bytes and rows start block-aligned,
         // so this is 2-byte aligned.
-        const __half scale_h = *reinterpret_cast<const __half*>(qs + kBlockBytes - 2);
+        const __half scale_h = *reinterpret_cast<const __half*>(myblk + kBlockBytes - 2);
         const float scale = __half2float(scale_h);
 
         const __nv_bfloat16* xb = x + (size_t)b * kBlockElems;
@@ -80,9 +93,11 @@ __global__ void gemv_ptq1_kernel(const __nv_bfloat16* __restrict__ x,
 #pragma unroll
         for (int t = 0; t < kBlockElems / 32; ++t) {
             const int idx = lane + t * 32;
-            part += (float)ptq1_trit(qs, idx) * __bfloat162float(xb[idx]);
+            part += (float)ptq1_trit(myblk, idx) * __bfloat162float(xb[idx]);
         }
         acc += scale * part;
+        // The next iteration overwrites the staging this one is still reading.
+        __syncwarp();
     }
 
 #pragma unroll
