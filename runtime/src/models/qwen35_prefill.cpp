@@ -12,6 +12,8 @@
 // shares no code with the decode path (qwen35.cpp keeps Impl private).
 
 #include "qwen35_prefill.h"
+#include "sparkinfer/kernels/ternary.h"
+#include "sparkinfer/kernels/hadamard.h"
 #include "sparkinfer/kernels/prefill.h"
 #include "sparkinfer/kernels/vision.h"
 #include "sparkinfer/kernels/prefill_attn_window.h"
@@ -1800,7 +1802,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const float attn_scale = 1.f / sqrtf((float)c.head_dim);
 
     // embed -> x, prime xn = RMSNorm(x, layer0.input_norm)
+    if (s.bonsai_embed_native) {
+        // Ternary table: decode the row, then take off the rotation it was stored in.
+        kernels::launch_embedding_ptq1(d_ids, s.w.embed_tokens, x, N, H, st);
+        kernels::launch_hadamard_unrotate_bf16(
+            x, x, static_cast<const signed char*>(s.bonsai_embed_sign),
+            (long)N * H, H, s.bonsai_block, st);
+    } else {
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
+    }
     // Image input, if any: overwrite the rows whose token is image_token_id with the vision
     // tower's merged embeddings. Strictly additive -- s.vision_emb is null for every text-only
     // request, so this branch is not taken and no vision code is referenced at all. The caller
@@ -4280,7 +4290,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         else
             dflash_kernels::launch_broadcast_rows_i32(btable_win, btab_rows_win, mbs, N, st);
     }
+    if (s.bonsai_embed_native) {
+        // Ternary table: decode the row, then take off the rotation it was stored in.
+        kernels::launch_embedding_ptq1(ids, s.w.embed_tokens, x, N, H, st);
+        kernels::launch_hadamard_unrotate_bf16(
+            x, x, static_cast<const signed char*>(s.bonsai_embed_sign),
+            (long)N * H, H, s.bonsai_block, st);
+    } else {
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
+    }
     if (muse) {
         // Unweighted RMSNorm of the embedding before layer 0 (emb_norm_ones is a constant-1.0
         // "weight"), exactly as AR decode and the batched prefill do.

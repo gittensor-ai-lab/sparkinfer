@@ -47,6 +47,12 @@ struct Qwen35PrefillCtx {
     bool                 gguf;             // native GGUF load (quantized weights)
     const void*          emb_norm_ones;    // Muse Glimmer: constant-1.0 bf16 weight for the
                                            // unweighted embedding RMSNorm (nullptr for other models)
+    // Ternary-Bonsai-2's native PTQ1_0 path. When set, w.embed_tokens is the checkpoint's own
+    // ternary table rather than a bf16 expansion, so the lookup decodes a row and takes the
+    // stored rotation back off it. Null/false for every other model.
+    bool                 bonsai_embed_native;
+    const void*          bonsai_embed_sign;   // int8[hidden] on device
+    int                  bonsai_block;
     int                  qdim, kvdim;                       // full-attn q / kv dims
     int                  linear_qdim, linear_vdim, linear_qkvdim;  // GDN dims
     // Per-row int8 scales of the routed expert weights, [layer][expert * rows], precomputed at

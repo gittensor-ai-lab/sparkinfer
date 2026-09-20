@@ -22,4 +22,11 @@ void launch_gemv_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
 void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
                           int n_rows, int k, cudaStream_t stream);
 
+// Embedding lookup from a ternary table: decodes one row per token into bf16. The row is still in
+// the stored basis, so the caller applies launch_hadamard_unrotate_bf16 before using it as the
+// residual -- token_embd is the one tensor whose rotation has to come off at runtime rather than
+// being absorbed by a matmul.
+void launch_embedding_ptq1(const int* tokens, const void* table_ptq1, void* out_bf16,
+                           int n_tokens, int k, cudaStream_t stream);
+
 }}  // namespace sparkinfer::kernels

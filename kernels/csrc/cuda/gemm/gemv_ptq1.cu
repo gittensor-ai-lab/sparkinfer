@@ -84,6 +84,23 @@ __global__ void gemv_ptq1_kernel(const __nv_bfloat16* __restrict__ x,
     if (lane == 0) store_out<OutT>(y, row, acc);
 }
 
+// Embedding lookup straight out of the ternary table: one row decoded per token. The row comes
+// out in the basis it was stored in, so the caller un-rotates it before it becomes the residual.
+__global__ void embedding_ptq1_kernel(const int* __restrict__ tok,
+                                      const unsigned char* __restrict__ table,
+                                      __nv_bfloat16* __restrict__ out, int k) {
+    const int r = blockIdx.y;
+    const int row = tok[r];
+    const int n_blocks = k / kBlockElems;
+    const unsigned char* wrow = table + (size_t)row * n_blocks * kBlockBytes;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < k; i += gridDim.x * blockDim.x) {
+        const unsigned char* qs = wrow + (size_t)(i / kBlockElems) * kBlockBytes;
+        const __half scale_h = *reinterpret_cast<const __half*>(qs + kBlockBytes - 2);
+        out[(size_t)r * k + i] =
+            __float2bfloat16((float)ptq1_trit(qs, i % kBlockElems) * __half2float(scale_h));
+    }
+}
+
 template <typename OutT>
 void launch_typed(const void* x, const void* w, OutT* y, int n_rows, int k, cudaStream_t stream) {
     if (n_rows <= 0 || k <= 0 || k % kBlockElems != 0) return;
@@ -104,6 +121,16 @@ void launch_gemv_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
 void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
                           int n_rows, int k, cudaStream_t stream) {
     launch_typed<float>(x_bf16, w_ptq1, y_f32, n_rows, k, stream);
+}
+
+void launch_embedding_ptq1(const int* tokens, const void* table_ptq1, void* out_bf16,
+                           int n_tokens, int k, cudaStream_t stream) {
+    if (n_tokens <= 0 || k <= 0 || k % kBlockElems != 0) return;
+    const int threads = 256;
+    const dim3 grid((unsigned)((k + threads - 1) / threads), (unsigned)n_tokens);
+    embedding_ptq1_kernel<<<grid, threads, 0, stream>>>(
+        tokens, reinterpret_cast<const unsigned char*>(table_ptq1),
+        reinterpret_cast<__nv_bfloat16*>(out_bf16), k);
 }
 
 }}  // namespace sparkinfer::kernels

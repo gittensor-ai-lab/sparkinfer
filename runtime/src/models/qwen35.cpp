@@ -784,6 +784,7 @@ struct Qwen35Model::Impl {
     long bonsai_block = 0;
     bf16* bonsai_rot = nullptr;                        // scratch for one rotated activation
     long bonsai_rot_elems = 0;
+    bool bonsai_embed_native = false;                  // token_embd left in its ternary blocks
 
     // DFlash speculative decoding (target-side primitives).
     DFlashDraftModel* dflash_draft = nullptr;
@@ -1671,7 +1672,17 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (capturing_graph)
         cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
 
-    kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
+    if (s.bonsai_embed_native) {
+        // The table's rows are stored rotated -- that is what made quantising them to trits
+        // survivable -- so the row comes back in that basis and the inverse comes off here.
+        kernels::launch_embedding_ptq1(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
+        const auto it = s.bonsai_sign_dev.find(H);
+        kernels::launch_hadamard_unrotate_bf16(s.x, s.x,
+                                               static_cast<const signed char*>(it->second),
+                                               H, (int)H, (int)s.bonsai_block, st);
+    } else {
+        kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
+    }
     dbg_bf16(s.x, H, 0, -1);   // tag 0: post-embedding, pre emb_norm
     if (c.muse_glimmer && s.emb_norm_ones)
         kernels::launch_rmsnorm(s.x, s.emb_norm_ones, s.x, 1, H, c.rms_eps, st);
@@ -3499,6 +3510,9 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           lin_state, lin_conv,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_embed_native ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          (int)s.bonsai_block,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           s.dflash_capture ? s.dflash_layer_ids.data() : nullptr,
@@ -3607,6 +3621,9 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
                           lin_state[0], lin_conv[0],
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_embed_native ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          (int)s.bonsai_block,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -4033,6 +4050,9 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, seq_ids[0],
                           h_states[0], h_convs[0], s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_embed_native ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          (int)s.bonsai_block,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -4406,6 +4426,9 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
                           lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_embed_native ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          (int)s.bonsai_block,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -4426,6 +4449,9 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
                           lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_embed_native ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          (int)s.bonsai_block,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -6270,7 +6296,21 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         return !g.tensor(name) || expect_dims(name, dims);
     };
 
-    s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
+    if (const GGUFTensor* emb_t = g.tensor("token_embd.weight");
+        bonsai_native && emb_t && emb_t->ggml_type == kPtq1GgmlType && s.bonsai_rot &&
+        s.bonsai_sign_dev.count(emb_t->dims[0])) {
+        void* d = nullptr;
+        if (cudaMalloc(&d, emb_t->n_bytes) == cudaSuccess &&
+            cudaMemcpy(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            s.owned.push_back(d);
+            s.w.embed_tokens = d;
+            s.bonsai_embed_native = true;              // 0.28 GB of table instead of 2.54 in bf16
+        } else {
+            cudaFree(d);
+        }
+    }
+    if (!s.bonsai_embed_native)
+        s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
     s.w.final_norm   = dense("output_norm.weight", false);
     const char* lm = g.tensor("output.weight") ? "output.weight" : "token_embd.weight";  // tied fallback
     const GGUFTensor* lm_tensor = g.tensor(lm);
