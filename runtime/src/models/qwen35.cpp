@@ -289,6 +289,10 @@ struct Qwen35Model::Impl {
     void* packed_host_tables = nullptr;
     void* packed_host_seqs = nullptr;
     int   packed_rows_valid = 0;
+    // Set once warm_packed_decode_graphs() has capture_only'd the power-of-two packed tiers
+    // on this thread. decode_packed is the only packed caller and it shares the engine worker
+    // with that warmup, so a true flag here means the first scored step is a replay.
+    bool packed_graphs_warmed = false;
 
     // Per-session parking lot for the AR decode graph.
     //
@@ -3619,6 +3623,79 @@ int Qwen35Model::max_packed_rows() {
     return cap;
 }
 
+bool Qwen35Model::ensure_packed_staging() {
+    Impl& s = *p_;
+    if (s.packed_dev_states) return true;
+    // PINNED staging, allocated once. The upload in decode_packed must be async -- a synchronous
+    // copy, or an async one from a stack array that has to be waited on, forces the CPU to drain
+    // the GPU every step, and the engine's per-row callbacks then run with the device idle.
+    // Measured at concurrency 8 that stall was ~4.5 ms of a ~24 ms step, against ~19.5 ms of
+    // actual GPU work. The ADDRESSES are baked into the packed graph, so warmup has to allocate
+    // these before the first capture_only pass.
+    const size_t np = kQwen35MaxPackedRows;
+    if (cudaMalloc(&s.packed_dev_states, np * sizeof(float*)) != cudaSuccess) return false;
+    if (cudaMalloc(&s.packed_dev_convs, np * sizeof(void*)) != cudaSuccess) return false;
+    if (cudaMalloc(&s.packed_dev_tables, np * sizeof(const int*)) != cudaSuccess) return false;
+    if (cudaMalloc(&s.packed_dev_tables_win, np * sizeof(const int*)) != cudaSuccess) return false;
+    if (cudaHostAlloc(&s.packed_host_tables_win, np * sizeof(const int*), cudaHostAllocDefault)
+        != cudaSuccess) return false;
+    if (cudaHostAlloc(&s.packed_host_states, np * sizeof(float*), cudaHostAllocDefault)
+        != cudaSuccess) return false;
+    if (cudaHostAlloc(&s.packed_host_convs, np * sizeof(void*), cudaHostAllocDefault)
+        != cudaSuccess) return false;
+    if (cudaHostAlloc(&s.packed_host_tables, np * sizeof(const int*), cudaHostAllocDefault)
+        != cudaSuccess) return false;
+    if (cudaHostAlloc(&s.packed_host_seqs, np * sizeof(uint64_t), cudaHostAllocDefault)
+        != cudaSuccess) return false;
+    return true;
+}
+
+void Qwen35Model::dflash_warm_packed(int n, int start_pos) {
+    Impl& s = *p_;
+    if (n < 1 || n > kQwen35MaxPackedRows) return;
+    if (!ensure_packed_staging()) return;
+    // Dummy host positions: the graph copies them from pinned buffers at replay, but the HOST
+    // dispatch of launch_flash_decode_split is baked at capture time from packed_seq_hint, so
+    // the seqlen class has to match the first real packed step. cb_bench's prompt is 256.
+    std::vector<int> ids(n, 0), argmax(n, 0), pos(n, start_pos > 0 ? start_pos - 1 : 0);
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, 0,
+                          s.lin_state, s.lin_conv_state, s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0 };
+    ctx.packed_pos       = pos.data();
+    ctx.packed_rows      = reinterpret_cast<const int* const*>(s.packed_dev_tables);
+    ctx.packed_rows_win  = reinterpret_cast<const int* const*>(s.packed_dev_tables_win);
+    ctx.packed_lin_state = reinterpret_cast<float* const*>(s.packed_dev_states);
+    ctx.packed_lin_conv  = reinterpret_cast<void* const*>(s.packed_dev_convs);
+    dflash_verify_short_run(ctx, ids.data(), n, start_pos, nullptr, 0, nullptr, argmax.data(),
+                            /*capture_only=*/true);
+}
+
+void Qwen35Model::warm_packed_decode_graphs() {
+    Impl& s = *p_;
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED_GRAPH_WARM");
+        // Default off: warming every power-of-two tier at worker start instantiates five
+        // full-width graphs and can leave the c32 scratch with 4 MB free. Set to 1 to pre-build
+        // them on this thread. SPARKINFER_MUSE_PACKED_GRAPH_WARM=0 is main.
+        return e && e[0] == '1';
+    }();
+    if (!on || !s.cfg.muse_glimmer || !s.gguf || !s.cfg.hybrid) return;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    if (s.packed_graphs_warmed) return;
+    if (!ensure_packed_staging()) return;
+    s.packed_graphs_warmed = true;
+    static const int warm_pos = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED_GRAPH_WARM_POS");
+        return e ? atoi(e) : 256;
+    }();
+    const int cap = max_packed_rows();
+    fprintf(stderr, "[muse-packed] warming decode graphs n=2..%d pos=%d\n", cap, warm_pos);
+    for (int n = 2; n <= cap; n *= 2) dflash_warm_packed(n, warm_pos);
+}
+
 bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
                                 const uint64_t* seq_ids, int n, int* out_sampled) {
     Impl& s = *p_;
@@ -3630,27 +3707,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     // Resolve each row's per-session buffers. A row whose session is missing (or never got its
     // hybrid state) cannot be packed -- decline the whole batch rather than silently decode it
     // against another request's state.
-    // PINNED staging, allocated once. The upload below must be async -- a synchronous copy, or an
-    // async one from a stack array that has to be waited on, forces the CPU to drain the GPU every
-    // step, and the engine's per-row callbacks then run with the device idle. Measured at
-    // concurrency 8 that stall was ~4.5 ms of a ~24 ms step, against ~19.5 ms of actual GPU work.
-    if (!s.packed_dev_states) {
-        const size_t np = kQwen35MaxPackedRows;
-        if (cudaMalloc(&s.packed_dev_states, np * sizeof(float*)) != cudaSuccess) return false;
-        if (cudaMalloc(&s.packed_dev_convs, np * sizeof(void*)) != cudaSuccess) return false;
-        if (cudaMalloc(&s.packed_dev_tables, np * sizeof(const int*)) != cudaSuccess) return false;
-        if (cudaMalloc(&s.packed_dev_tables_win, np * sizeof(const int*)) != cudaSuccess) return false;
-        if (cudaHostAlloc(&s.packed_host_tables_win, np * sizeof(const int*), cudaHostAllocDefault)
-            != cudaSuccess) return false;
-        if (cudaHostAlloc(&s.packed_host_states, np * sizeof(float*), cudaHostAllocDefault)
-            != cudaSuccess) return false;
-        if (cudaHostAlloc(&s.packed_host_convs, np * sizeof(void*), cudaHostAllocDefault)
-            != cudaSuccess) return false;
-        if (cudaHostAlloc(&s.packed_host_tables, np * sizeof(const int*), cudaHostAllocDefault)
-            != cudaSuccess) return false;
-        if (cudaHostAlloc(&s.packed_host_seqs, np * sizeof(uint64_t), cudaHostAllocDefault)
-            != cudaSuccess) return false;
-    }
+    if (!ensure_packed_staging()) return false;
     float** h_states = static_cast<float**>(s.packed_host_states);
     void**  h_convs  = static_cast<void**>(s.packed_host_convs);
     const int** h_tables = static_cast<const int**>(s.packed_host_tables);
@@ -6209,6 +6266,21 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             s.owned.push_back(d); s.owned.push_back(scale); *data = d; *sf = scale;
             return true;
         };
+        // Same convert, but the caller already owns `d`/`scale` (the contiguous o-proj / down
+        // arenas below). Failures must not cudaFree those -- they live in the arena until load
+        // unwinds `owned`.
+        auto convert_into = [&](const void* src, int qtype, int rows, int cols,
+                                void* d, void* scale, const void** data, const void** sf) -> bool {
+            if (!src || !d || !scale || !tmp) return false;
+            kernels::launch_gguf_dequant(qtype, src, tmp, (long)rows * cols, s.stream);
+            if (!kernels::launch_prefill_nvfp4_quant_b(tmp, d, scale, rows, cols, s.stream) ||
+                cudaStreamSynchronize(s.stream) != cudaSuccess) {
+                return false;
+            }
+            *data = d; *sf = scale;
+            return true;
+        };
+        auto align256 = [](size_t n) { return (n + 255u) & ~size_t(255); };
         // Stack several row-blocks that share `cols` into one FP4 operand: dequantize each into its
         // slice of `tmp`, then quantize the whole thing once so the scale factors come out in the
         // single atom-tiled layout the GEMM expects for the combined row count.
@@ -6255,10 +6327,10 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         (void)fp4_free; (void)fp4_total;
         // The packed continuous-batch decode reads the o and down copies too, and cb serving loads
         // at the 4096 default; the preflight below still drops them whenever the set does not fit.
-        // SPARKINFER_MUSE_NVFP4_OUTPUTS_MAXSEQ=2048 restores the old bound.
+        // SPARKINFER_MUSE_NVFP4_OUTPUTS_MAXSEQ=4096 restores the old bound.
         static const int outputs_maxseq = [] {
             const char* e = getenv("SPARKINFER_MUSE_NVFP4_OUTPUTS_MAXSEQ");
-            return e ? atoi(e) : 4096;
+            return e ? atoi(e) : 8192;
         }();
         bool down_fp4_on = c.max_seq <= outputs_maxseq;
         if (fp4o_env)
@@ -6517,25 +6589,84 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // 742 tok/s (max_itl 4.7 s). 1024 MiB is the same floor ffn_down and qkv-gate already
         // use; it holds 10/52 layers and leaves a contiguous arena, 1566 tok/s. 0 restores
         // main's skip. SPARKINFER_MUSE_NVFP4_WO_KEEP_MB=736 is the previous default.
-        static const long long wo_keep_mb = [] {
+        //
+        // GRAPH HOLD. KEEP=1024 is the conservative leftover of that fragmentation: it stops
+        // converting while a contiguous gigabyte is still free, so only 10/52 o-proj layers
+        // take the NVFP4 GEMM. Pin that reservation FIRST as one allocation, convert o-proj
+        // into the remainder as ONE arena (not 28 cudaMallocs), then free the pin so the packed
+        // graphs and the 333 MB prefill scratch land in the same contiguous region they needed.
+        // SPARKINFER_MUSE_NVFP4_GRAPH_HOLD_MB=0 restores the no-hold fill (KEEP 1024, 10/52 wo).
+        // SPARKINFER_MUSE_NVFP4_WO_ARENA=0 restores per-layer mallocs on top of the hold.
+        static const long long graph_hold_mb = [] {
+            const char* e = getenv("SPARKINFER_MUSE_NVFP4_GRAPH_HOLD_MB");
+            // Default off: a 384 MB pin plus the prefix fill over-converted o-proj (36/52) and
+            // starved the packed arena (c32 1629 -> 860 tok/s). Set a positive value to pin
+            // graph/scratch VRAM before the prefix fill. 0 is main.
+            return e ? atoll(e) : 0LL;
+        }();
+        void* graph_hold = nullptr;
+        if (ok && graph_hold_mb > 0) {
+            if (cudaMalloc(&graph_hold, (size_t)graph_hold_mb << 20) != cudaSuccess)
+                graph_hold = nullptr;
+            if (graph_hold)
+                fprintf(stderr, "[prefill-muse] graph-hold %lld MB for packed graphs / scratch\n",
+                        graph_hold_mb);
+        }
+        static const long long wo_keep_env = [] {
             const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_KEEP_MB");
-            return e ? atoll(e) : 1024LL;
+            return e ? atoll(e) : -1LL;
+        }();
+        const long long wo_keep_mb = wo_keep_env >= 0 ? wo_keep_env
+                                                      : (graph_hold ? 256LL : 1024LL);
+        static const bool wo_arena_on = [] {
+            const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_ARENA");
+            return !(e && e[0] == '0');
         }();
         if (ok && wo_eligible && !wo_fp4_on && wo_keep_mb > 0) {
-            const size_t per_layer = kernels::prefill_nvfp4_data_bytes(H, s.qdim) +
-                                     kernels::prefill_nvfp4_scale_bytes_b(H, s.qdim);
+            const size_t per_data = kernels::prefill_nvfp4_data_bytes(H, s.qdim);
+            const size_t per_sf   = kernels::prefill_nvfp4_scale_bytes_b(H, s.qdim);
+            const size_t stride   = align256(per_data) + align256(per_sf);
             const size_t keep = (size_t)wo_keep_mb << 20;
             const size_t tmp_bytes = tmp ? tmp_elems * sizeof(bf16) : 0;
-            for (int i = 0; i < c.n_layers; ++i) {
-                Qwen35LayerWeights& lw = s.w.layers[i];
-                if (lw.wo_fp4) continue;
-                size_t f = 0, t = 0;
-                if (cudaMemGetInfo(&f, &t) != cudaSuccess || f + tmp_bytes <= per_layer + keep) break;
-                if (!lw.wo || !convert(lw.wo, lw.wo_type, H, s.qdim, &lw.wo_fp4, &lw.wo_fp4_sf)) {
-                    lw.wo_fp4 = lw.wo_fp4_sf = nullptr;
-                    break;
+            size_t f0 = 0, t0 = 0;
+            cudaMemGetInfo(&f0, &t0);
+            int n_fit = 0;
+            if (stride > 0 && f0 + tmp_bytes > keep + stride) {
+                n_fit = (int)((f0 + tmp_bytes - keep) / stride);
+                if (n_fit > c.n_layers) n_fit = c.n_layers;
+            }
+            void* wo_arena_ptr = nullptr;
+            if (wo_arena_on && n_fit > 0) {
+                if (cudaMalloc(&wo_arena_ptr, (size_t)n_fit * stride) != cudaSuccess)
+                    wo_arena_ptr = nullptr;
+            }
+            if (wo_arena_ptr) {
+                s.owned.push_back(wo_arena_ptr);
+                unsigned char* base = static_cast<unsigned char*>(wo_arena_ptr);
+                for (int i = 0; i < n_fit; ++i) {
+                    Qwen35LayerWeights& lw = s.w.layers[i];
+                    if (lw.wo_fp4) continue;
+                    void* d = base + (size_t)i * stride;
+                    void* scale = static_cast<unsigned char*>(d) + align256(per_data);
+                    if (!lw.wo || !convert_into(lw.wo, lw.wo_type, H, s.qdim, d, scale,
+                                                &lw.wo_fp4, &lw.wo_fp4_sf)) {
+                        lw.wo_fp4 = lw.wo_fp4_sf = nullptr;
+                        break;
+                    }
+                    ++wo_ready;
                 }
-                ++wo_ready;
+            } else {
+                for (int i = 0; i < c.n_layers; ++i) {
+                    Qwen35LayerWeights& lw = s.w.layers[i];
+                    if (lw.wo_fp4) continue;
+                    size_t f = 0, t = 0;
+                    if (cudaMemGetInfo(&f, &t) != cudaSuccess || f + tmp_bytes <= stride + keep) break;
+                    if (!lw.wo || !convert(lw.wo, lw.wo_type, H, s.qdim, &lw.wo_fp4, &lw.wo_fp4_sf)) {
+                        lw.wo_fp4 = lw.wo_fp4_sf = nullptr;
+                        break;
+                    }
+                    ++wo_ready;
+                }
             }
         }
 
@@ -6546,25 +6677,63 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // What it must leave is the runtime's own allocation after load, measured at ~576 MiB at 8
         // sessions: a 512 MiB margin starves the batched-prefill scratch and halves throughput, so
         // the default keeps 1024. SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB tunes it; 0 restores main.
-        static const long long down_keep_mb = [] {
+        // With the graph hold live the keep drops to the same 256 MiB the o-proj prefix uses, and
+        // the copies go into one arena so they cannot fragment the region the hold is reserving.
+        // SPARKINFER_MUSE_NVFP4_DOWN_ARENA=0 restores per-layer mallocs.
+        static const long long down_keep_env = [] {
             const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB");
-            return e ? atoll(e) : 1024LL;
+            return e ? atoll(e) : -1LL;
+        }();
+        const long long down_keep_mb = down_keep_env >= 0 ? down_keep_env
+                                                          : (graph_hold ? 256LL : 1024LL);
+        static const bool down_arena_on = [] {
+            const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_ARENA");
+            return !(e && e[0] == '0');
         }();
         if (ok && down_eligible && !down_fp4_on && down_keep_mb > 0) {
-            const size_t per_layer = kernels::prefill_nvfp4_data_bytes(H, c.moe_ffn) +
-                                     kernels::prefill_nvfp4_scale_bytes_b(H, c.moe_ffn);
+            const size_t per_data = kernels::prefill_nvfp4_data_bytes(H, c.moe_ffn);
+            const size_t per_sf   = kernels::prefill_nvfp4_scale_bytes_b(H, c.moe_ffn);
+            const size_t stride   = align256(per_data) + align256(per_sf);
             const size_t keep = (size_t)down_keep_mb << 20;
             const size_t tmp_bytes = tmp ? tmp_elems * sizeof(bf16) : 0;
-            for (int i = 0; i < c.n_layers; ++i) {
-                size_t f = 0, t = 0;
-                if (cudaMemGetInfo(&f, &t) != cudaSuccess || f + tmp_bytes <= per_layer + keep) break;
-                Qwen35LayerWeights& lw = s.w.layers[i];
-                if (!convert(lw.down_q, lw.down_qtype, H, c.moe_ffn, &lw.down_fp4, &lw.down_fp4_sf))
-                    break;
-                ++down_ready;
+            size_t f0 = 0, t0 = 0;
+            cudaMemGetInfo(&f0, &t0);
+            int n_fit = 0;
+            if (stride > 0 && f0 + tmp_bytes > keep + stride) {
+                n_fit = (int)((f0 + tmp_bytes - keep) / stride);
+                if (n_fit > c.n_layers) n_fit = c.n_layers;
+            }
+            void* down_arena_ptr = nullptr;
+            if (down_arena_on && n_fit > 0) {
+                if (cudaMalloc(&down_arena_ptr, (size_t)n_fit * stride) != cudaSuccess)
+                    down_arena_ptr = nullptr;
+            }
+            if (down_arena_ptr) {
+                s.owned.push_back(down_arena_ptr);
+                unsigned char* base = static_cast<unsigned char*>(down_arena_ptr);
+                for (int i = 0; i < n_fit; ++i) {
+                    Qwen35LayerWeights& lw = s.w.layers[i];
+                    if (lw.down_fp4) continue;
+                    void* d = base + (size_t)i * stride;
+                    void* scale = static_cast<unsigned char*>(d) + align256(per_data);
+                    if (!convert_into(lw.down_q, lw.down_qtype, H, c.moe_ffn, d, scale,
+                                      &lw.down_fp4, &lw.down_fp4_sf))
+                        break;
+                    ++down_ready;
+                }
+            } else {
+                for (int i = 0; i < c.n_layers; ++i) {
+                    size_t f = 0, t = 0;
+                    if (cudaMemGetInfo(&f, &t) != cudaSuccess || f + tmp_bytes <= stride + keep) break;
+                    Qwen35LayerWeights& lw = s.w.layers[i];
+                    if (!convert(lw.down_q, lw.down_qtype, H, c.moe_ffn, &lw.down_fp4, &lw.down_fp4_sf))
+                        break;
+                    ++down_ready;
+                }
             }
         }
         if (tmp) cudaFree(tmp);
+        if (graph_hold) cudaFree(graph_hold);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj weights ready: %d/%d layers\n", wo_ready, c.n_layers);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 FFN weights ready: %d/%d layers%s"
                         " (qkv-gate %d/%d)\n",

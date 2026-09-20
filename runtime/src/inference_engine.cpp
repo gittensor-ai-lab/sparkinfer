@@ -578,6 +578,12 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
 }
 
 void ContinuousBatchEngine::worker_loop() {
+    // Packed decode has no DSpark-style session-setup warmup: the verify graph cache is
+    // thread_local, so a capture_only from the load thread never reaches this worker, and the
+    // first packed step of each width paid instantiate on the scored token. Opt-in via
+    // SPARKINFER_MUSE_PACKED_GRAPH_WARM=1: do it here, once, before the first job, on the
+    // thread that will actually replay. Default off is main.
+    if (model_) model_->warm_packed_decode_graphs();
     while (true) {
         // A request that is alone and eligible decodes speculatively (see enable_speculative). It
         // is picked up before its prefill starts, because speculation prefills with hidden-state

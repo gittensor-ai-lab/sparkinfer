@@ -1020,12 +1020,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // arena addresses are what
     // a captured prefill graph can safely replay. A failed arena alloc hands back nullptr
     // and the layer keeps the int8 path. SPARKINFER_MUSE_NVFP4_WO_STREAM=0 restores it (A/B in ONE
-    // binary); _WO_MINN sets the smallest prompt that converts (the down leg's 1024 by default).
+    // binary); _WO_MINN sets the smallest prompt that converts (the down leg's 512 by default).
     static const bool wo_stream_on = [] {
         const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_STREAM"); return !(e && e[0] == '0');
     }();
     static const int wo_min = [] {
-        const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_MINN"); return e ? atoi(e) : 1024;
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_MINN"); return e ? atoi(e) : 512;
     }();
     // Both streamed operands (o here, ffn_down below) convert Q4_K layers in ONE launch straight
     // from the GGUF bytes instead of dequant-to-bf16 slices plus a quantize over each: bit-identical
@@ -1064,7 +1064,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // essentially no spare VRAM, and 341 MB held across a 64k prefill costs 85% of it -- measured
     // with the buffers allocated and never read, so it is the footprint alone, not this path.
     // Hence a floor: below dn_min the fixed conversion cost (52 layers) swamps a prefill that only
-    // takes ~36 ms.
+    // takes ~16 ms. 1024 left ctx=512 on the int8 down/o path; 512 is the first scored prompt
+    // where the NVFP4 GEMM pays for the conversion (10772 -> 11921 pp tok/s on a 32-GB 5090).
+    // SPARKINFER_MUSE_NVFP4_DOWN_MINN=1024 restores the old floor.
     //
     // There used to be a CEILING as well, at 8192, and it was the 265.8 MB bf16 staging that put it
     // there -- 78% of that 341 MB. But the staging is a pure INTERMEDIATE: launch_gguf_dequant
@@ -1085,7 +1087,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // conversion declines and the layer keeps today's int8 path. That is the same decline the
     // partial-failure branch below already handled -- it just stops triggering 4x sooner.
     static const int dn_min = [] {
-        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MINN"); return e ? atoi(e) : 1024;
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MINN"); return e ? atoi(e) : 512;
     }();
     static const int dn_max = [] {
         const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MAXN"); return e ? atoi(e) : (1 << 30);
@@ -1177,6 +1179,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_b(H, qdim)) : nullptr;
     const bool wo_st_stage = wo_st_want && !(q4k_direct && wo_type0 == 12);
     bf16* wo_st_tmp = wo_st_stage ? a8.alloc<bf16>((size_t)wo_st_rows * qdim) : nullptr;
+    // OVERLAP STREAMED CONVERSION with the same layer's attention. The o-proj and ffn_down
+    // operands are built from GGUF bytes that do not depend on the activation, so they can run
+    // on stream_k while q|gate|k|v + flash-attn occupy `st`. Prefill already had the scratch;
+    // it converted on `st` after attention, so the 15+75 MB conversions sat on the critical
+    // path. A second buffer would overlap the NEXT layer's conversion with THIS layer's GEMM --
+    // extra VRAM the 64k load cannot spare. Default off: overlapping onto stream_k during a
+    // mixed cb prefill (bot path long_prefill=512) hitch the packed decode (max ITL ~840 ms).
+    // SPARKINFER_MUSE_NVFP4_OVERLAP=1 turns it on; 0 is main.
+    static const bool overlap_env = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_OVERLAP");
+        return e && e[0] == '1';
+    }();
+    const bool overlap_on = overlap_env && c.muse_glimmer && s.stream_k && s.stream_k != st &&
+                            (wo_st_data || (dn_scratch.sf != nullptr));
     // Sized by the FFN CHUNK, not the prompt. These two feed exactly one call --
     // launch_prefill_nvfp4_swiglu_quant_a(ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn) inside the
     // token-chunked FFN loop -- so they never hold more than FC rows. Sizing them by N asked for
@@ -1827,6 +1843,48 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     }
     if (moe_hide_sg)
         pf_cu(cudaEventCreateWithFlags(&moe_ev_sg, cudaEventDisableTiming), "moe ev_sg");
+    cudaEvent_t ev_ov_fork{}, ev_ov_ready{};
+    if (overlap_on) {
+        pf_cu(cudaEventCreateWithFlags(&ev_ov_fork, cudaEventDisableTiming), "ov fork");
+        pf_cu(cudaEventCreateWithFlags(&ev_ov_ready, cudaEventDisableTiming), "ov ready");
+    }
+    auto convert_wo_on = [&](const Qwen35LayerWeights& lw, cudaStream_t cs) -> bool {
+        if (!wo_st_data || !wo_st_sf || !lw.wo) return false;
+        const size_t rb = dn_q_row_bytes(lw.wo_type, qdim);
+        const bool direct = q4k_direct && lw.wo_type == 12;
+        bool ok = rb != 0 && (direct || wo_st_tmp);
+        if (ok && direct)
+            ok = kernels::launch_prefill_nvfp4_quant_b_q4k(lw.wo, wo_st_data, wo_st_sf,
+                                                           H, 0, H, qdim, cs);
+        else for (int r0 = 0; r0 < H && ok; r0 += wo_st_rows) {
+            const int nr = (H - r0 < wo_st_rows) ? (H - r0) : wo_st_rows;
+            kernels::launch_gguf_dequant(
+                lw.wo_type, static_cast<const unsigned char*>(lw.wo) + (size_t)r0 * rb,
+                wo_st_tmp, (long)nr * qdim, cs);
+            ok = kernels::launch_prefill_nvfp4_quant_b_slice(
+                wo_st_tmp, wo_st_data, wo_st_sf, H, r0, nr, qdim, cs);
+        }
+        return ok;
+    };
+    auto convert_dn_on = [&](const Qwen35LayerWeights& lw, cudaStream_t cs) -> bool {
+        if (!dn_scratch.sf || !dn_scratch.data || !lw.down_q) return false;
+        const size_t rb = dn_q_row_bytes(lw.down_qtype, ffn);
+        const int sr = dn_scratch.rows;
+        bool ok = sr > 0 && (sr >= H || rb != 0);
+        if (ok && q4k_direct && lw.down_qtype == 12)
+            ok = kernels::launch_prefill_nvfp4_quant_b_q4k(lw.down_q, dn_scratch.data,
+                                                           dn_scratch.sf, H, 0, H, ffn, cs);
+        else for (int r0 = 0; r0 < H && ok; r0 += sr) {
+            const int nr = (H - r0 < sr) ? (H - r0) : sr;
+            kernels::launch_gguf_dequant(
+                lw.down_qtype,
+                static_cast<const unsigned char*>(lw.down_q) + (size_t)r0 * rb,
+                (bf16*)dn_scratch.tmp, (long)nr * ffn, cs);
+            ok = kernels::launch_prefill_nvfp4_quant_b_slice(
+                dn_scratch.tmp, dn_scratch.data, dn_scratch.sf, H, r0, nr, ffn, cs);
+        }
+        return ok;
+    };
 
     bool attn_norm_deferred = false;
     for (int L = 0; L < c.n_layers; L++) {
@@ -1840,6 +1898,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // norm to consume directly. Per layer: qb_partials is reused by the next GEMM.
         int attn_acc = 0, ffn_acc = 0;
         bool hn_quantized = false;   // pre-FFN norm already emitted A_i8/sx for the grouped FFN
+        bool wo_ov_ok = false, dn_ov_ok = false;
         if (w.linear_attn) {
             // ---- Gated DeltaNet linear-attention layer ----
             // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
@@ -1918,6 +1977,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // Set when q|gate|k|v came out of ONE GEMM and q/k/v were left in that packed buffer
             // instead of being copied to tight arrays (see the Muse arm below).
             bool qkv_packed = false;
+            if (overlap_on) {
+                pf_cu(cudaEventRecord(ev_ov_fork, st), "ov fork");
+                pf_cu(cudaStreamWaitEvent(s.stream_k, ev_ov_fork, 0), "ov sk wait");
+                wo_ov_ok = convert_wo_on(w, s.stream_k);
+                dn_ov_ok = convert_dn_on(w, s.stream_k);
+                pf_cu(cudaEventRecord(ev_ov_ready, s.stream_k), "ov ready");
+            }
             // Long-ctx: optionally keep Q/K/V/O on int8 (no GDN recurrence here).
             const bool restore_i8 = use_i8;
             if (use_i8_attn) use_i8 = true;
@@ -2204,7 +2270,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // output through the staging, ordered on `st` ahead of the GEMM that reads it.
             const void* wo4 = w.wo_fp4;
             const void* wo4_sf = w.wo_fp4_sf;
-            if (!wo4 && wo_st_data && wo_st_sf && w.wo && c.muse_glimmer) {
+            if (overlap_on)
+                pf_cu(cudaStreamWaitEvent(st, ev_ov_ready, 0), "ov join");
+            if (wo_ov_ok) {
+                wo4 = wo_st_data;
+                wo4_sf = wo_st_sf;
+            } else if (!wo4 && wo_st_data && wo_st_sf && w.wo && c.muse_glimmer) {
                 const size_t rb = dn_q_row_bytes(w.wo_type, qdim);
                 const bool direct = q4k_direct && w.wo_type == 12;
                 bool wo_ok = rb != 0 && (direct || wo_st_tmp);
@@ -2437,7 +2508,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // conversion. A layer whose conversion declines simply keeps today's int8 path.
             const void* dn_fp4    = w.down_fp4;
             const void* dn_fp4_sf = w.down_fp4_sf;
-            if (!dn_fp4 && nvfp4_down && ffn_fp4_possible && dn_scratch.sf && w.down_q) {
+            if (dn_ov_ok) {
+                dn_fp4 = dn_scratch.data;
+                dn_fp4_sf = dn_scratch.sf;
+            } else if (!dn_fp4 && nvfp4_down && ffn_fp4_possible && dn_scratch.sf && w.down_q) {
                 // Row slices of the output, dequant then quantize, so the bf16 staging only ever
                 // holds dn_scratch.rows of them. The slices are ordered on `st` behind each other
                 // and ahead of the GEMMs that read the operand, so one staging buffer is correct.
@@ -3237,6 +3311,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     }
     if (moe_hide_sg)
         cudaEventDestroy(moe_ev_sg);
+    if (overlap_on) {
+        cudaEventDestroy(ev_ov_fork);
+        cudaEventDestroy(ev_ov_ready);
+    }
 
     // Seed for the first decode step: argmax at the last prompt position (xn already = final norm).
     // A packed pass has one per prompt, each read back as it is produced (it never captures).
@@ -4239,7 +4317,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // this tier's graph is NOT ready), so a false `recording` begins a capture that is never
     // ended and strands the stream -- every later call then fails with "operation not permitted
     // when stream is capturing". DSpark never sees that because dflash_generate warms each tier
-    // with a capture_only call during session setup; packed decode has no such warmup.
+    // with a capture_only call during session setup. Packed decode warms the same way from
+    // ContinuousBatchEngine::worker_loop (warm_packed_decode_graphs), which is the thread that
+    // owns this thread_local cache. SPARKINFER_MUSE_PACKED_GRAPH_WARM=0 skips that pass.
     recording = graph_warm || capture_only || packed;
     if (recording)
     // Dense FFN seeds: expert 0, weight 1.0 -- the same constants AR uses. Written ONCE, here,
@@ -4510,8 +4590,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             static const bool packed_wo_gq8 = [] {
                 const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_GATE_Q8");
                 return !(e && e[0] == '0'); }();
-            const bool wo_want_fp4 = N >= wo_fp4_min_rows && fp4_a && fp4_asf &&
-                w.wo_fp4 && w.wo_fp4_sf && kernels::prefill_nvfp4_supported(Ng, H, qdim);
+            const bool wo_want_fp4 = N >= wo_fp4_min_rows && fp4_a && fp4_asf && w.wo_fp4 &&
+                kernels::prefill_nvfp4_supported(Ng, H, qdim);
             const bool attn_gq8 = packed_wo_gq8 && !wo_want_fp4 && qg && q81 &&
                 (w.wo_type == 12 || w.wo_type == 8) && (qdim % 32 == 0);
             void* attn_q8 = attn_gq8 ? q81 : nullptr;
@@ -4534,9 +4614,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // The o projection through the block-scaled FP4 copy prefill already holds, with the
             // gate folded into its quantize, instead of the Q4_K mma rows. Rows past N are scratch.
             // SPARKINFER_MUSE_PACKED_WO_MIN_ROWS=33 restores the Q4_K projection.
-            const bool wo_fp4_done = wo_want_fp4 &&
+            const void* wo_b = w.wo_fp4;
+            const void* wo_bsf = w.wo_fp4_sf;
+            const bool wo_fp4_done = wo_want_fp4 && wo_b && wo_bsf &&
                 kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_asf, Ng, qdim, st) &&
-                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.wo_fp4, w.wo_fp4_sf,
+                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, wo_b, wo_bsf,
                                                    ao, Ng, H, qdim, fp4_ws, st);
             if (!wo_fp4_done) {
                 if (!attn_gq8)
@@ -4570,9 +4652,6 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bool gu_gemm =
                 packed && topk == 1 && N >= gu_gemm_min_rows() &&
                 packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su, st);
-            // ...and down through its FP4 copy when it is resident, with the SwiGLU folded into
-            // its quantize -- the arm Qwen3.8's packed FFN already takes -- instead of the Q4_K
-            // mma rows, which were a quarter of the step.
             const bool dn_gemm = gu_gemm && w.down_fp4 && w.down_fp4_sf &&
                 kernels::launch_prefill_nvfp4_swiglu_quant_a(sg, su, fp4_a, fp4_asf, Ng, ffn, st) &&
                 kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.down_fp4, w.down_fp4_sf,

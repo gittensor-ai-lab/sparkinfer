@@ -643,8 +643,18 @@ public:
     // Build the DFlash verify replay graph without running it. Stream capture records kernels
     // instead of executing them, so this leaves model state untouched -- it exists purely to keep
     // ~4.9 ms of graph construction out of the decode loop, where it landed on decode step 2 and
-    // made that token take twice as long as every other one.
+    // made that token take twice as long as every other one. Packed decode's twin is opt-in
+    // (SPARKINFER_MUSE_PACKED_GRAPH_WARM=1); default off is main.
     void dflash_warm_verify(int n, int start_pos);
+
+    // Same capture_only pass as dflash_warm_verify, for the packed continuous-batch graphs.
+    // DSpark warms every tier during session setup; packed decode never did, so the first packed
+    // step of each width paid instantiate on the scored token (cb_bench c32 first-step max_itl
+    // ~0.9 s of a ~5 s wall). Must run ON the engine worker thread -- the verify graph cache is
+    // thread_local, so a load-thread warmup is invisible to decode_packed. Default off: warming
+    // five full-width graphs at worker start can leave the c32 scratch with 4 MB free.
+    // SPARKINFER_MUSE_PACKED_GRAPH_WARM=1 turns it on.
+    void warm_packed_decode_graphs();
 
     // Batched verify entry (may fall back to verify_block). Same contract as verify_block.
     bool batched_forward(const int* token_ids, int n, int start_pos, bool resume_gdn,
@@ -656,6 +666,12 @@ private:
     // qwen35.cpp's Impl). Called by invalidate_decode_graph(), which is the "something global
     // changed" path, and as a size backstop.
     void drop_parked_decode_graphs();
+    // Device + pinned pointer arrays decode_packed rewrites every step. Allocated once; the
+    // packed graph bakes the ADDRESSES, so this must run before the first capture_only warm.
+    // SPARKINFER_MUSE_PACKED_GRAPH_WARM=1 pre-builds the packed graphs on the worker thread;
+    // default off is main (the first packed step of each width still instantiates).
+    bool ensure_packed_staging();
+    void dflash_warm_packed(int n, int start_pos);
     void dflash_maybe_capture_layer(int layer);
     // Depth-adaptive KV-split count for a given seqlen (32/128/160/256 tiers, GQA-8/hd256
     // occupancy correction). Shared by forward_token()'s normal per-token adaptation and
