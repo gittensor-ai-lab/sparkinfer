@@ -84,8 +84,47 @@ __global__ void gemv_ptq1_kernel(const __nv_bfloat16* __restrict__ x,
     if (lane == 0) store_out<OutT>(y, row, acc);
 }
 
-// Embedding lookup straight out of the ternary table: one row decoded per token. The row comes
-// out in the basis it was stored in, so the caller un-rotates it before it becomes the residual.
+// Embedding lookup and un-rotation in one pass, keeping float across the transform. Decoding to
+// bf16 first and rotating afterwards costs real accuracy -- the Hadamard sums 1024 values, so it
+// sums 1024 already-rounded ones -- which showed up as PPL 8.11 against the host path's 8.07.
+__global__ void embedding_ptq1_unrotate_kernel(const int* __restrict__ tok,
+                                               const unsigned char* __restrict__ table,
+                                               const signed char* __restrict__ sign,
+                                               __nv_bfloat16* __restrict__ out, int k, int block) {
+    extern __shared__ float sh[];
+    const int r = blockIdx.y;
+    const int base = blockIdx.x * block;
+    const int n_blocks = k / kBlockElems;
+    const unsigned char* wrow = table + (size_t)tok[r] * n_blocks * kBlockBytes;
+
+    for (int i = threadIdx.x; i < block; i += blockDim.x) {
+        const int e = base + i;
+        const unsigned char* qs = wrow + (size_t)(e / kBlockElems) * kBlockBytes;
+        const __half scale_h = *reinterpret_cast<const __half*>(qs + kBlockBytes - 2);
+        sh[i] = (float)ptq1_trit(qs, e % kBlockElems) * __half2float(scale_h);
+    }
+    __syncthreads();
+
+    for (int len = 1; len < block; len <<= 1) {
+        for (int i = threadIdx.x; i < block / 2; i += blockDim.x) {
+            const int lo = ((i / len) * 2 * len) + (i % len);
+            const int hi = lo + len;
+            const float a = sh[lo], b = sh[hi];
+            sh[lo] = a + b;
+            sh[hi] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // R^-1 = diag(s) . H: the transform, then the signs.
+    const float norm = rsqrtf((float)block);
+    for (int i = threadIdx.x; i < block; i += blockDim.x)
+        out[(size_t)r * k + base + i] =
+            __float2bfloat16(sh[i] * norm * (float)sign[base + i]);
+}
+
+// Lookup without the rotation, for a table that does not carry one.
+
 __global__ void embedding_ptq1_kernel(const int* __restrict__ tok,
                                       const unsigned char* __restrict__ table,
                                       __nv_bfloat16* __restrict__ out, int k) {
@@ -131,6 +170,16 @@ void launch_embedding_ptq1(const int* tokens, const void* table_ptq1, void* out_
     embedding_ptq1_kernel<<<grid, threads, 0, stream>>>(
         tokens, reinterpret_cast<const unsigned char*>(table_ptq1),
         reinterpret_cast<__nv_bfloat16*>(out_bf16), k);
+}
+
+void launch_embedding_ptq1_unrotate(const int* tokens, const void* table_ptq1,
+                                    const signed char* sign, void* out_bf16,
+                                    int n_tokens, int k, int block, cudaStream_t stream) {
+    if (n_tokens <= 0 || k <= 0 || block <= 0 || k % kBlockElems != 0 || k % block != 0) return;
+    const dim3 grid((unsigned)(k / block), (unsigned)n_tokens);
+    embedding_ptq1_unrotate_kernel<<<grid, 256, (size_t)block * sizeof(float), stream>>>(
+        tokens, reinterpret_cast<const unsigned char*>(table_ptq1), sign,
+        reinterpret_cast<__nv_bfloat16*>(out_bf16), k, block);
 }
 
 }}  // namespace sparkinfer::kernels

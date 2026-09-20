@@ -1675,11 +1675,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (s.bonsai_embed_native) {
         // The table's rows are stored rotated -- that is what made quantising them to trits
         // survivable -- so the row comes back in that basis and the inverse comes off here.
-        kernels::launch_embedding_ptq1(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
         const auto it = s.bonsai_sign_dev.find(H);
-        kernels::launch_hadamard_unrotate_bf16(s.x, s.x,
-                                               static_cast<const signed char*>(it->second),
-                                               H, (int)H, (int)s.bonsai_block, st);
+        kernels::launch_embedding_ptq1_unrotate(s.d_tok, s.w.embed_tokens,
+                                                static_cast<const signed char*>(it->second),
+                                                s.x, 1, H, (int)s.bonsai_block, st);
     } else {
         kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
     }

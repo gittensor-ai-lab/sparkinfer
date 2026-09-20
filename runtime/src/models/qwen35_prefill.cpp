@@ -1804,10 +1804,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // embed -> x, prime xn = RMSNorm(x, layer0.input_norm)
     if (s.bonsai_embed_native) {
         // Ternary table: decode the row, then take off the rotation it was stored in.
-        kernels::launch_embedding_ptq1(d_ids, s.w.embed_tokens, x, N, H, st);
-        kernels::launch_hadamard_unrotate_bf16(
-            x, x, static_cast<const signed char*>(s.bonsai_embed_sign),
-            (long)N * H, H, s.bonsai_block, st);
+        kernels::launch_embedding_ptq1_unrotate(
+            d_ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_embed_sign),
+            x, N, H, s.bonsai_block, st);
     } else {
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
     }
@@ -4292,10 +4291,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     }
     if (s.bonsai_embed_native) {
         // Ternary table: decode the row, then take off the rotation it was stored in.
-        kernels::launch_embedding_ptq1(ids, s.w.embed_tokens, x, N, H, st);
-        kernels::launch_hadamard_unrotate_bf16(
-            x, x, static_cast<const signed char*>(s.bonsai_embed_sign),
-            (long)N * H, H, s.bonsai_block, st);
+        kernels::launch_embedding_ptq1_unrotate(
+            ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_embed_sign),
+            x, N, H, s.bonsai_block, st);
     } else {
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
     }

@@ -29,4 +29,10 @@ void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
 void launch_embedding_ptq1(const int* tokens, const void* table_ptq1, void* out_bf16,
                            int n_tokens, int k, cudaStream_t stream);
 
+// The same, with the stored rotation taken off in the same pass. Preferred: decoding to bf16 and
+// rotating afterwards makes the transform sum 1024 already-rounded values, which is measurable.
+void launch_embedding_ptq1_unrotate(const int* tokens, const void* table_ptq1,
+                                    const signed char* sign, void* out_bf16,
+                                    int n_tokens, int k, int block, cudaStream_t stream);
+
 }}  // namespace sparkinfer::kernels
