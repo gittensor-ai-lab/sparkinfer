@@ -301,6 +301,11 @@ void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
     launch_typed<float>(x_bf16, w_ptq1, y_f32, n_rows, k, 1, stream);
 }
 
+void launch_gemm_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
+                          int n_rows, int k, int batch, cudaStream_t stream) {
+    launch_typed<float>(x_bf16, w_ptq1, y_f32, n_rows, k, batch, stream);
+}
+
 void launch_gemm_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
                       int n_rows, int k, int batch, cudaStream_t stream) {
     launch_typed<__nv_bfloat16>(x_bf16, w_ptq1, reinterpret_cast<__nv_bfloat16*>(y_bf16),

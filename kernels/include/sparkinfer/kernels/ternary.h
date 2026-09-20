@@ -28,6 +28,12 @@ void launch_gemm_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
 void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
                           int n_rows, int k, cudaStream_t stream);
 
+// Batched and f32: a packed decode step scores every row of the batch against the head, and the
+// head is the single largest weight in the model, so reading it once for the whole batch rather
+// than once per row is most of what packing buys at the output end.
+void launch_gemm_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
+                          int n_rows, int k, int batch, cudaStream_t stream);
+
 // A whole weight matrix decoded out of its ternary blocks and un-rotated into the architecture's
 // basis, as ordinary bf16. Prefill uses this rather than a ternary GEMM so its existing projection
 // branches -- FP8 GEMM, dequantize-then-requantize, plain GEMM -- keep working unchanged: they ask
