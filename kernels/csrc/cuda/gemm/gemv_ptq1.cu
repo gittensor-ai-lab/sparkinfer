@@ -38,9 +38,21 @@ __device__ __forceinline__ int ptq1_trit(const unsigned char* __restrict__ qs, i
     return (int)((q * 3u) >> 8) - 1;
 }
 
+template <typename OutT>
+__device__ __forceinline__ void store_out(OutT* y, int row, float v);
+template <>
+__device__ __forceinline__ void store_out<__nv_bfloat16>(__nv_bfloat16* y, int row, float v) {
+    y[row] = __float2bfloat16(v);
+}
+template <>
+__device__ __forceinline__ void store_out<float>(float* y, int row, float v) {
+    y[row] = v;
+}
+
+template <typename OutT>
 __global__ void gemv_ptq1_kernel(const __nv_bfloat16* __restrict__ x,
                                  const unsigned char* __restrict__ w,
-                                 __nv_bfloat16* __restrict__ y, int n_rows, int k) {
+                                 OutT* __restrict__ y, int n_rows, int k) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * kWarpsPerCta + warp;
@@ -69,19 +81,29 @@ __global__ void gemv_ptq1_kernel(const __nv_bfloat16* __restrict__ x,
 
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
-    if (lane == 0) y[row] = __float2bfloat16(acc);
+    if (lane == 0) store_out<OutT>(y, row, acc);
+}
+
+template <typename OutT>
+void launch_typed(const void* x, const void* w, OutT* y, int n_rows, int k, cudaStream_t stream) {
+    if (n_rows <= 0 || k <= 0 || k % kBlockElems != 0) return;
+    const int ctas = (n_rows + kWarpsPerCta - 1) / kWarpsPerCta;
+    gemv_ptq1_kernel<OutT><<<ctas, kWarpsPerCta * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(w),
+        y, n_rows, k);
 }
 
 }  // namespace
 
 void launch_gemv_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
                       int n_rows, int k, cudaStream_t stream) {
-    if (n_rows <= 0 || k <= 0 || k % kBlockElems != 0) return;
-    const int ctas = (n_rows + kWarpsPerCta - 1) / kWarpsPerCta;
-    gemv_ptq1_kernel<<<ctas, kWarpsPerCta * 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x_bf16),
-        reinterpret_cast<const unsigned char*>(w_ptq1),
-        reinterpret_cast<__nv_bfloat16*>(y_bf16), n_rows, k);
+    launch_typed<__nv_bfloat16>(x_bf16, w_ptq1, reinterpret_cast<__nv_bfloat16*>(y_bf16),
+                                n_rows, k, stream);
+}
+
+void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
+                          int n_rows, int k, cudaStream_t stream) {
+    launch_typed<float>(x_bf16, w_ptq1, y_f32, n_rows, k, stream);
 }
 
 }}  // namespace sparkinfer::kernels

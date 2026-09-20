@@ -34,6 +34,8 @@
 #include "sparkinfer/prism_hadamard.h"
 #include "sparkinfer/gdn_v_regroup.h"
 #include "sparkinfer/kernels/proj_requant.h"
+#include "sparkinfer/kernels/hadamard.h"
+#include "sparkinfer/kernels/ternary.h"
 #include "sparkinfer/safetensors.h"
 #include "sparkinfer/kernels/compressed_tensors.h"
 #include "sparkinfer/kernels/attention.h"
@@ -773,6 +775,15 @@ struct Qwen35Model::Impl {
     // about existing behavior changes unless a caller explicitly opts in via
     // set_lmcache_bridge().
     BridgeClient* lmcache_bridge = nullptr;
+
+    // Ternary-Bonsai-2's rotated basis, kept on the device for the native PTQ1_0 path: the
+    // weights stay in their 28-byte blocks and the ACTIVATION carries the rotation instead of
+    // the weights carrying its inverse. Empty unless the checkpoint declares prism.hadamard and
+    // SPARKINFER_BONSAI_NATIVE is on; the folded path needs none of this.
+    std::unordered_map<long, void*> bonsai_sign_dev;   // input width -> int8[width] on device
+    long bonsai_block = 0;
+    bf16* bonsai_rot = nullptr;                        // scratch for one rotated activation
+    long bonsai_rot_elems = 0;
 
     // DFlash speculative decoding (target-side primitives).
     DFlashDraftModel* dflash_draft = nullptr;
@@ -2668,6 +2679,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     else if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
         if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
         kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
+    }
+    else if (s.gguf && s.w.lm_head_type == kPtq1GgmlType && s.bonsai_rot &&
+             s.bonsai_sign_dev.count(H) != 0) {
+        // Native ternary: the weights are still in the basis they were quantized in, so the
+        // activation goes there first rather than the rotation being folded into the weights.
+        const auto it = s.bonsai_sign_dev.find(H);
+        kernels::launch_hadamard_rotate_bf16(s.xn, s.bonsai_rot,
+                                             static_cast<const signed char*>(it->second),
+                                             H, (int)H, (int)s.bonsai_block, st);
+        kernels::launch_gemv_ptq1_f32(s.bonsai_rot, s.w.lm_head, s.logits, c.vocab, H, st);
     }
     else if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
     else if (s.gguf)                kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
@@ -5711,6 +5732,30 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return false;
         }
     }
+    // Native PTQ1_0: keep the weights in their stored blocks and rotate the activation instead.
+    // Off by default -- the folded path is the one measured at PPL 8.07 -- because this trades a
+    // validated path for a much smaller one, and both arms should come out of the same binary.
+    const bool bonsai_native = had.present && [] {
+        const char* e = getenv("SPARKINFER_BONSAI_NATIVE");
+        return e && e[0] == '1';
+    }();
+    if (bonsai_native) {
+        s.bonsai_block = had.block_size;
+        for (const auto& kv : had.signs_by_width) {
+            void* d = nullptr;
+            if (cudaMalloc(&d, kv.second.size()) != cudaSuccess) continue;
+            cudaMemcpy(d, kv.second.data(), kv.second.size(), cudaMemcpyHostToDevice);
+            s.bonsai_sign_dev[kv.first] = d;
+            s.owned.push_back(d);
+            s.bonsai_rot_elems = std::max(s.bonsai_rot_elems, kv.first);
+        }
+        if (s.bonsai_rot_elems > 0 &&
+            cudaMalloc((void**)&s.bonsai_rot, (size_t)s.bonsai_rot_elems * sizeof(bf16)) == cudaSuccess)
+            s.owned.push_back(s.bonsai_rot);
+        else
+            s.bonsai_rot = nullptr;
+    }
+
     // Shared by both upload paths: is this tensor one the checkpoint rotated, and which signs?
     auto rotated_signs = [&](const GGUFTensor* t, const std::string& name)
             -> const std::vector<int8_t>* {
@@ -6150,6 +6195,19 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto lm_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         const bool q5k_ok = mg_lm_q5k && s.cfg.muse_glimmer && t && t->ggml_type == 13;
+        if (bonsai_native && t && t->ggml_type == kPtq1GgmlType && s.bonsai_rot &&
+            s.bonsai_sign_dev.count(t->dims[0])) {
+            // Straight upload: no un-rotation, no refit, 0.21875 bytes/weight.
+            void* d = nullptr;
+            if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
+                cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                s.owned.push_back(d);
+                type = kPtq1GgmlType;
+                return d;
+            }
+            cudaFree(d);
+            fprintf(stderr, "[bonsai] %s: native upload failed, falling back\n", name.c_str());
+        }
         if (qattn && t && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8 || q5k_ok))
             return dev_quant_requant_q4k(name, type, req_lm_q4 || q5k_ok, q5k_ok);
