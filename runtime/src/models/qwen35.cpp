@@ -6034,8 +6034,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         q36_ud_requant_default && !q35_dense9b_requant_default);
     const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K",
                                        q35_dense9b_requant_default || dual_dflash_lm_head);
+    // A ternary tensor arrives as Q4_K once its rotation is folded in, so it belongs on the same
+    // MMVQ kernels every other quantized checkpoint uses. Letting it fall through to dense() would
+    // expand the attention weights to bf16 -- several GB, and a GEMV path this architecture's GDN
+    // projections otherwise never take.
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
+        if (qattn && t && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
         type = 0; return dense(name, false);
@@ -6043,6 +6048,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto attn_w_opt = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { type = 0; return nullptr; }
+        if (qattn && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
         type = 0; return dense(name, false);
@@ -6059,6 +6065,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto lm_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         const bool q5k_ok = mg_lm_q5k && s.cfg.muse_glimmer && t && t->ggml_type == 13;
+        if (qattn && t && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8 || q5k_ok))
             return dev_quant_requant_q4k(name, type, req_lm_q4 || q5k_ok, q5k_ok);
         type = 0; return dense(name, false);
