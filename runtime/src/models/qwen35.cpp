@@ -6254,9 +6254,24 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             (bonsai_proj_gate_only && name.find(".attn_gate.") != std::string::npos);
         if (bonsai_native_proj && proj_name_ok && t && t->ggml_type == kPtq1GgmlType &&
             s.bonsai_rot_xn && t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0])) {
+            // The blocks go up as they are, but the GDN v-head order does NOT: everything that
+            // produces a v head stores its 48 heads transposed, and the folded path regroups them
+            // while un-rotating. Uploading verbatim skips that, which is why attn_gate (all v) was
+            // far more wrong than attn_qkv (v is one third of it). A row is a whole number of
+            // 28-byte blocks, so the regrouping is a byte-level permutation with no decoding.
+            UnrotateJob j;
+            if (!unrotate_job_init(j, t, name, *had.signs_for(t->dims[0]), had.block_size, false))
+                return nullptr;
+            if (had.gdn_v_grouped) unrotate_job_set_v_block(j, name, s.cfg);
+            const size_t row_bytes = (size_t)(j.width / kPtq1BlockElems) * kPtq1BlockBytes;
+            std::vector<uint8_t> host((size_t)t->n_bytes);
+            const auto* src = static_cast<const uint8_t*>(t->data);
+            for (long r = 0; r < j.rows; ++r)
+                std::memcpy(host.data() + (size_t)r * row_bytes,
+                            src + (size_t)unrotate_source_row(j, r) * row_bytes, row_bytes);
             void* d = nullptr;
             if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
-                cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                cudaMemcpy(d, host.data(), t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
                 s.owned.push_back(d);
                 type = kPtq1GgmlType;
                 return d;
