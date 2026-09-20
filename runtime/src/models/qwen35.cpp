@@ -1807,6 +1807,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             kernels::launch_hadamard_rotate_bf16(s.xn, s.bonsai_rot_xn,
                                                  static_cast<const signed char*>(it->second),
                                                  H, (int)H, (int)s.bonsai_block, st);
+            // tag 15: the rotated xn. R is orthogonal, so this l2 must equal tag 10's exactly --
+            // a cheap in-model check that the rotation is what the isolated test says it is.
+            dbg_bf16(s.bonsai_rot_xn, H, 15, L);
         }
         // xn_q8_ready assumes the PREVIOUS layer's tail already emitted Q8_1(this layer's xn)
         // into s.aq81 as a side effect (true for architectures whose post-MoE tail runs
