@@ -60,6 +60,44 @@ void test_every_trit_pattern_survives() {
     }
 }
 
+void test_trits_come_out_in_ggml_tq1_0_order() {
+    // The round-trip tests cannot catch a wrong trit ORDER, because they pack with whatever order
+    // they unpack. This one states the layout outright: carrier byte j of a run owns the weights
+    // at j, j+run, j+2*run, ... Reading it carrier-major instead permutes the weights inside every
+    // group of 128 -- every value correct, every one in the wrong place, which is indistinguishable
+    // from a bad rotation until you compare against the un-quantized checkpoint.
+    uint8_t block[kPtq1BlockBytes], zero_block[kPtq1BlockBytes];
+    int8_t trits[kPtq1BlockElems];
+    std::memset(trits, 0, sizeof(trits));
+    ptq1_pack_block(trits, 1.0f, zero_block);   // a zero trit is digit 1, so this is not all-zero
+
+    // A single carrier byte with trit +1 at position m and 0 elsewhere: encode_carrier's value for
+    // that is (3^m * 2) in base 3 terms, but we only care WHERE the +1 lands after unpacking.
+    for (int m = 0; m < 5; ++m) {
+        std::memset(trits, 0, sizeof(trits));
+        trits[m * kPtq1WideRuns[0] + 3] = 1;          // byte 3 of the first run, position m
+        ptq1_pack_block(trits, 1.0f, block);
+        int8_t back[kPtq1BlockElems];
+        ptq1_unpack_trits(block, back);
+        CHECK(back[m * kPtq1WideRuns[0] + 3] == 1);
+        for (int i = 0; i < kPtq1BlockElems; ++i)
+            if (i != m * kPtq1WideRuns[0] + 3) CHECK(back[i] == 0);
+        // and it must live in byte 3, not somewhere the carrier-major reading would put it
+        CHECK(block[3] != zero_block[3]);
+        for (int j = 0; j < kPtq1Wide + kPtq1Narrow; ++j)
+            if (j != 3) CHECK(block[j] == zero_block[j]);
+    }
+    // second run starts at weight 80, and the 4-trit carriers at 120
+    std::memset(trits, 0, sizeof(trits));
+    trits[80 + 2 * kPtq1WideRuns[1] + 5] = 1;         // byte 5 of the 8-byte run, position 2
+    ptq1_pack_block(trits, 1.0f, block);
+    CHECK(block[kPtq1WideRuns[0] + 5] != zero_block[kPtq1WideRuns[0] + 5]);
+    std::memset(trits, 0, sizeof(trits));
+    trits[120 + 3 * kPtq1Narrow + 1] = 1;             // second 4-trit carrier, position 3
+    ptq1_pack_block(trits, 1.0f, block);
+    CHECK(block[kPtq1Wide + 1] != zero_block[kPtq1Wide + 1]);
+}
+
 void test_carrier_alphabets_match_the_checkpoint() {
     // What identified the format in the file: byte positions 0..23 take 243 distinct values across
     // real blocks and positions 24..25 take 81. Enumerating every trit combination must reproduce
@@ -70,7 +108,11 @@ void test_carrier_alphabets_match_the_checkpoint() {
     std::memset(trits, 0, sizeof(trits));
     for (int v = 0; v < 243; ++v) {
         int x = v;
-        for (int m = 0; m < 5; ++m) { trits[m] = static_cast<int8_t>(x % 3 - 1); x /= 3; }
+        // carrier byte 0 of the 16-byte run owns weights 0, 16, 32, 48, 64 -- position-major
+        for (int m = 0; m < 5; ++m) {
+            trits[m * kPtq1WideRuns[0]] = static_cast<int8_t>(x % 3 - 1);
+            x /= 3;
+        }
         uint8_t block[kPtq1BlockBytes];
         ptq1_pack_block(trits, 1.0f, block);
         wide.insert(block[0]);
@@ -78,8 +120,9 @@ void test_carrier_alphabets_match_the_checkpoint() {
     std::memset(trits, 0, sizeof(trits));
     for (int v = 0; v < 81; ++v) {
         int x = v;
+        // the first 4-trit carrier owns weights 120, 122, 124, 126
         for (int m = 0; m < 4; ++m) {
-            trits[kPtq1Wide * 5 + m] = static_cast<int8_t>(x % 3 - 1);
+            trits[kPtq1Wide * 5 + m * kPtq1Narrow] = static_cast<int8_t>(x % 3 - 1);
             x /= 3;
         }
         uint8_t block[kPtq1BlockBytes];
@@ -220,6 +263,7 @@ void test_block_geometry() {
 int main() {
     test_round_trip();
     test_every_trit_pattern_survives();
+    test_trits_come_out_in_ggml_tq1_0_order();
     test_carrier_alphabets_match_the_checkpoint();
     test_block_geometry();
     test_q4k_transcode_keeps_the_ternary_grid();

@@ -7,6 +7,7 @@
 #include "sparkinfer/prism_hadamard.h"
 #include "sparkinfer/ternary_ptq1.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -97,9 +98,108 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 3 && std::strcmp(argv[2], "--signs") == 0) {
+        const long width = std::atol(argv[3]);
+        const std::vector<int8_t>* sign = had.signs_for(width);
+        if (!sign) { std::fprintf(stderr, "no signs for width %ld\n", width); return 1; }
+        const char* out_path = argc > 4 ? argv[4] : "/tmp/bonsai_signs.i8";
+        FILE* f = std::fopen(out_path, "wb");
+        if (!f) return 1;
+        std::fwrite(sign->data(), 1, sign->size(), f);
+        std::fclose(f);
+        std::printf("wrote %zu signs for width %ld to %s\n", sign->size(), width, out_path);
+        return 0;
+    }
+
+    if (argc > 5 && std::strcmp(argv[2], "--dump") == 0) {
+        // Writes the first N rows of a tensor as raw float32, in one of three states, so it can be
+        // compared against the un-quantized checkpoint this model was derived from.
+        //   mode 0 = stored, 1 = un-rotated with R^-1, 2 = re-rotated with R
+        const sparkinfer::GGUFTensor* w = gguf.tensor(argv[3]);
+        if (!w) { std::fprintf(stderr, "tensor %s not found\n", argv[3]); return 1; }
+        const int mode = std::atoi(argv[4]);
+        const long nrows = std::atol(argv[5]);
+        const char* out_path = argc > 6 ? argv[6] : "/tmp/bonsai_dump.f32";
+        const long width = w->dims[0];
+        const std::vector<int8_t>* sign = had.signs_for(width);
+        if (!sign && mode) { std::fprintf(stderr, "no signs for width %ld\n", width); return 1; }
+        FILE* f = std::fopen(out_path, "wb");
+        if (!f) { std::fprintf(stderr, "cannot write %s\n", out_path); return 1; }
+        std::vector<float> row((size_t)width);
+        for (long r = 0; r < nrows; ++r) {
+            const size_t blk = (size_t)r * width / sparkinfer::kPtq1BlockElems;
+            sparkinfer::ptq1_dequant(static_cast<const uint8_t*>(w->data) +
+                                     blk * sparkinfer::kPtq1BlockBytes, (size_t)width, row.data());
+            if (mode == 1)
+                sparkinfer::hadamard_unrotate_activation(row.data(), width, had.block_size, sign->data());
+            else if (mode == 2)
+                sparkinfer::hadamard_rotate_activation(row.data(), width, had.block_size, sign->data());
+            std::fwrite(row.data(), 4, (size_t)width, f);
+        }
+        std::fclose(f);
+        std::printf("wrote %ld rows x %ld to %s (mode %d)\n", nrows, width, out_path, mode);
+        return 0;
+    }
+
+    if (argc > 3 && std::strcmp(argv[2], "--cols") == 0) {
+        // A rotated weight has its outlier input channels smeared across each 1024-block, so its
+        // per-column RMS is flat. Un-rotating the right way should bring the outliers back. This
+        // tests direction, sign order, block size and the transform itself in one number.
+        const sparkinfer::GGUFTensor* w = gguf.tensor(argv[3]);
+        if (!w) { std::fprintf(stderr, "tensor %s not found\n", argv[3]); return 1; }
+        const long width = w->dims[0];
+        const long rows = std::min<long>(w->n_values / width, 4096);
+        const std::vector<int8_t>* sign = had.signs_for(width);
+        if (!sign) { std::fprintf(stderr, "no signs for width %ld\n", width); return 1; }
+        const char* label[3] = {"stored (rotated)", "un-rotated R^-1 ", "re-rotated R    "};
+        for (int mode = 0; mode < 3; ++mode) {
+            std::vector<double> sq((size_t)width, 0.0);
+            std::vector<float> row((size_t)width);
+            for (long r = 0; r < rows; ++r) {
+                const size_t blk = (size_t)r * width / sparkinfer::kPtq1BlockElems;
+                sparkinfer::ptq1_dequant(static_cast<const uint8_t*>(w->data) +
+                                         blk * sparkinfer::kPtq1BlockBytes,
+                                         (size_t)width, row.data());
+                if (mode == 1)
+                    sparkinfer::hadamard_unrotate_activation(row.data(), width, had.block_size, sign->data());
+                else if (mode == 2)
+                    sparkinfer::hadamard_rotate_activation(row.data(), width, had.block_size, sign->data());
+                for (long i = 0; i < width; ++i) sq[i] += (double)row[i] * row[i];
+            }
+            std::vector<double> rms((size_t)width);
+            for (long i = 0; i < width; ++i) rms[i] = std::sqrt(sq[i] / (double)rows);
+            std::vector<double> sorted = rms;
+            std::sort(sorted.begin(), sorted.end());
+            const double med = sorted[sorted.size() / 2], mx = sorted.back();
+            long over3 = 0;
+            for (double v : rms) if (med > 0 && v > 3 * med) ++over3;
+            std::printf("  %s  median %.5f  max %.5f  max/med %6.2f  cols>3x %ld\n",
+                        label[mode], med, mx, med > 0 ? mx / med : 0.0, over3);
+        }
+        return 0;
+    }
+
     const char* want = argc > 2 ? argv[2] : "blk.0.attn_gate.weight";
     const sparkinfer::GGUFTensor* t = gguf.tensor(want);
     if (!t) { std::fprintf(stderr, "tensor %s not found\n", want); return 1; }
+    if (t->ggml_type == 0) {   // F32: the norms. Are they all ones, i.e. folded into the linears?
+        const float* v = static_cast<const float*>(t->data);
+        double lo = v[0], hi = v[0], sum = 0, sumsq = 0;
+        long ones = 0;
+        for (long i = 0; i < t->n_values; ++i) {
+            lo = std::fmin(lo, v[i]); hi = std::fmax(hi, v[i]);
+            sum += v[i]; sumsq += (double)v[i] * v[i];
+            if (std::fabs(v[i] - 1.0f) < 1e-6f) ++ones;
+        }
+        const double mean = sum / (double)t->n_values;
+        std::printf("tensor %s: F32 n=%ld min %.6f max %.6f mean %.6f rms %.6f exactly-one %ld/%ld\n",
+                    want, t->n_values, lo, hi, mean,
+                    std::sqrt(sumsq / (double)t->n_values), ones, t->n_values);
+        std::printf("first 8         ");
+        for (long i = 0; i < 8 && i < t->n_values; ++i) std::printf("%+.5f ", v[i]);
+        std::printf("\n");
+        return 0;
+    }
     std::printf("tensor %s: type %d dims [%ld, %ld] values %ld bytes %ld\n",
                 want, t->ggml_type, t->dims[0], t->dims[1], t->n_values, t->n_bytes);
     if (t->ggml_type != sparkinfer::kPtq1GgmlType) return 0;

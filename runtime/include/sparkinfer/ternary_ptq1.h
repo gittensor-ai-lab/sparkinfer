@@ -25,6 +25,11 @@ inline constexpr int   kPtq1BlockElems = 128;
 inline constexpr int   kPtq1BlockBytes = 28;
 inline constexpr int   kPtq1Wide       = 24;   // bytes carrying 5 trits
 inline constexpr int   kPtq1Narrow     = 2;    // bytes carrying 4 trits
+// The 24 five-trit carrier bytes are walked in two runs, 16 then 8, each emitting its trits
+// POSITION-major (ggml's TQ1_0 splits its 48 carrier bytes 32+16 the same way). Getting these runs
+// wrong permutes the weights within every group of 128 while leaving every value intact -- which a
+// round-trip test cannot see, because it packs with the same wrong order it unpacks.
+inline constexpr int   kPtq1WideRuns[] = {16, 8};
 
 // One 28-byte block -> 128 floats. `out` must hold kPtq1BlockElems values.
 void ptq1_dequant_block(const uint8_t* block, float* out);

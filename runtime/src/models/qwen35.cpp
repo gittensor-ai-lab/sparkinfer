@@ -178,10 +178,13 @@ struct UnrotateJob {
     const GGUFTensor* t = nullptr;
     const std::vector<int8_t>* sign = nullptr;
     long width = 0, rows = 0, block = 0;
-    // Which way to turn the rows back. The 401 weight matrices are stored rotated by R and undo
-    // with R^-1; token_embd is what the metadata calls inverse_weight_names, stored by R^-1, so it
-    // undoes with R. Overridable because "inverse" names a direction relative to the others rather
-    // than an absolute one, and a wrong guess here is indistinguishable from a wrong format read.
+    // Every rotated tensor, token_embd included, is stored as R.row and undoes with R^-1: measured
+    // against the un-quantized checkpoint this model was derived from, that recovers the embedding
+    // at cosine 0.89, which is the ternary quantization error and nothing else. The metadata's
+    // inverse_weight_names names a RUNTIME obligation -- token_embd is the one tensor with no
+    // input activation to rotate, so a runtime that rotates activations must instead apply R^-1 to
+    // the row it reads -- not a different storage direction. Kept switchable because that
+    // distinction is easy to get backwards and a wrong guess looks exactly like a bad format read.
     bool undo_with_forward = false;
 };
 
@@ -194,7 +197,7 @@ bool bonsai_rot_forward(const char* env, bool def) {
 bool unrotate_job_init(UnrotateJob& j, const GGUFTensor* t, const std::string& name,
                        const std::vector<int8_t>& sign, long block, bool inverse_listed) {
     j.t = t; j.sign = &sign; j.block = block;
-    j.undo_with_forward = inverse_listed ? bonsai_rot_forward("SPARKINFER_BONSAI_EMB_ROT", true)
+    j.undo_with_forward = inverse_listed ? bonsai_rot_forward("SPARKINFER_BONSAI_EMB_ROT", false)
                                          : bonsai_rot_forward("SPARKINFER_BONSAI_W_ROT", false);
     j.width = t->dims[0];
     if (j.width <= 0 || t->n_values % j.width != 0) return false;

@@ -76,11 +76,22 @@ inline uint16_t float_to_fp16(float f) {
 }  // namespace
 
 void ptq1_unpack_trits(const uint8_t* block, int8_t* trits) {
+    // Trits come out POSITION-major within each run of carrier bytes, not carrier-major: run of
+    // 16 bytes -> weights 0..79 as (position 0..4) x (byte 0..15), then 8 bytes -> 80..119, then
+    // the two 4-trit carriers -> 120..127. This is ggml's TQ1_0 walk (its 256-element block splits
+    // 48 carrier bytes 32+16; a 128-element block splits 24 as 16+8), and it is not a detail: read
+    // carrier-major the weights come out permuted within every group of 128, which a round-trip
+    // test cannot see because it encodes with the same wrong order.
     int k = 0;
-    for (int j = 0; j < kPtq1Wide; ++j)
-        for (int m = 0; m < 5; ++m) trits[k++] = static_cast<int8_t>(digit(block[j], m) - 1);
-    for (int j = 0; j < kPtq1Narrow; ++j)
-        for (int m = 0; m < 4; ++m)
+    int base = 0;
+    for (int run : kPtq1WideRuns) {
+        for (int m = 0; m < 5; ++m)
+            for (int j = 0; j < run; ++j)
+                trits[k++] = static_cast<int8_t>(digit(block[base + j], m) - 1);
+        base += run;
+    }
+    for (int m = 0; m < 4; ++m)
+        for (int j = 0; j < kPtq1Narrow; ++j)
             trits[k++] = static_cast<int8_t>(digit(block[kPtq1Wide + j], m) - 1);
 }
 
@@ -161,9 +172,22 @@ void ptq1_to_q4k(const uint8_t* src, size_t n_elems, uint8_t* dst) {
 }
 
 void ptq1_pack_block(const int8_t* trits, float scale, uint8_t* block) {
-    for (int j = 0; j < kPtq1Wide; ++j) block[j] = encode_carrier(trits + j * 5, 5);
-    for (int j = 0; j < kPtq1Narrow; ++j)
-        block[kPtq1Wide + j] = encode_carrier(trits + kPtq1Wide * 5 + j * 4, 4);
+    // Gathers in the same position-major order ptq1_unpack_trits emits; see the note there.
+    int base_byte = 0, base_out = 0;
+    for (int run : kPtq1WideRuns) {
+        for (int j = 0; j < run; ++j) {
+            int8_t carrier[5];
+            for (int m = 0; m < 5; ++m) carrier[m] = trits[base_out + m * run + j];
+            block[base_byte + j] = encode_carrier(carrier, 5);
+        }
+        base_byte += run;
+        base_out += run * 5;
+    }
+    for (int j = 0; j < kPtq1Narrow; ++j) {
+        int8_t carrier[4];
+        for (int m = 0; m < 4; ++m) carrier[m] = trits[base_out + m * kPtq1Narrow + j];
+        block[kPtq1Wide + j] = encode_carrier(carrier, 4);
+    }
     const uint16_t h = float_to_fp16(scale);
     std::memcpy(block + kPtq1BlockBytes - 2, &h, sizeof(h));
 }
