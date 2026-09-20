@@ -174,7 +174,19 @@ bool GGUF::open(const std::string& path) {
         else if (vt == VT_I64) { ints_[key] = c.rd<int64_t>(); }
         else if (vt == VT_ARR) {
             uint32_t et = c.rd<uint32_t>(); uint64_t n = c.rd<uint64_t>();
-            if (et == VT_STR) { for (uint64_t k = 0; k < n && c.ok; k++) c.rd_str(); }
+            if (et == VT_STR) {
+                // Short string arrays are kept (prism.hadamard.weight_names lists the 401 rotated
+                // tensors); the tokenizer vocab -- a quarter of a million strings -- is still
+                // skipped, which is why this is bounded rather than unconditional.
+                const bool keep = n <= 4096;
+                std::vector<std::string> arr;
+                if (keep) arr.reserve((size_t)n);
+                for (uint64_t k = 0; k < n && c.ok; k++) {
+                    std::string s = c.rd_str();
+                    if (keep) arr.push_back(std::move(s));
+                }
+                if (keep && c.ok) str_arrays_[key] = std::move(arr);
+            }
             else {
                 // Fail loudly on an unsupported element type (scalar_size==0 -> a 0-byte
                 // skip would desync the cursor) or a declared span that overflows / runs
@@ -265,6 +277,11 @@ bool GGUF::open(const std::string& path) {
 long GGUF::meta_int(const std::string& k, long d) const { auto it=ints_.find(k); return it==ints_.end()?d:it->second; }
 double GGUF::meta_float(const std::string& k, double d) const { auto it=floats_.find(k); return it==floats_.end()?d:it->second; }
 std::string GGUF::meta_str(const std::string& k, const std::string& d) const { auto it=strs_.find(k); return it==strs_.end()?d:it->second; }
+std::vector<std::string> GGUF::meta_str_array(const std::string& key) const {
+    auto it = str_arrays_.find(key);
+    return it == str_arrays_.end() ? std::vector<std::string>{} : it->second;
+}
+
 std::vector<long> GGUF::meta_int_array(const std::string& k) const {
     auto it = int_arrays_.find(k);
     return it == int_arrays_.end() ? std::vector<long>{} : it->second;

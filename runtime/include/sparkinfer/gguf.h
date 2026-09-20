@@ -30,6 +30,9 @@ public:
     // Numeric metadata array (e.g. muse-glimmer.attention.sliding_window_pattern).
     // Empty vector if the key is absent or was a string array.
     std::vector<long> meta_int_array(const std::string& key) const;
+    // String metadata array, captured only for arrays of at most 4096 entries (the tokenizer
+    // vocab is skipped); empty if the key is absent, longer than that, or not a string array.
+    std::vector<std::string> meta_str_array(const std::string& key) const;
     const GGUFTensor* tensor(const std::string& name) const;
 
 private:
@@ -45,6 +48,7 @@ private:
     std::unordered_map<std::string, double>      floats_;
     std::unordered_map<std::string, std::string> strs_;
     std::unordered_map<std::string, std::vector<long>> int_arrays_;
+    std::unordered_map<std::string, std::vector<std::string>> str_arrays_;
     std::unordered_map<std::string, GGUFTensor>  tensors_;
 };
 

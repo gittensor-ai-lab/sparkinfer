@@ -126,3 +126,8 @@ add_executable(ternary_ptq1_cpu_test ternary_ptq1_cpu_test.cpp ../src/ternary_pt
 set_target_properties(ternary_ptq1_cpu_test PROPERTIES CXX_STANDARD 17)
 target_include_directories(ternary_ptq1_cpu_test PRIVATE ../include)
 add_test(NAME ternary_ptq1_cpu_test COMMAND ternary_ptq1_cpu_test)
+
+add_executable(prism_hadamard_cpu_test prism_hadamard_cpu_test.cpp ../src/prism_hadamard.cpp ../src/gguf.cpp)
+set_target_properties(prism_hadamard_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(prism_hadamard_cpu_test PRIVATE ../include)
+add_test(NAME prism_hadamard_cpu_test COMMAND prism_hadamard_cpu_test)
