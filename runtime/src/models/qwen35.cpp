@@ -6154,9 +6154,22 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     };
     // Returns null unless this checkpoint declares the transposed GDN v order, so every other
     // model keeps its existing loader untouched.
+    // SPARKINFER_BONSAI_VREGROUP lists which per-head parameters to regroup (default all four).
+    // They sit on the same transposed axis as the weights by inspection, but whether the GDN
+    // kernel indexes them the same way is a question about this runtime, not about the file.
+    static const std::string vregroup_set = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_VREGROUP");
+        return std::string(e && e[0] ? e : "a,dt,alpha,beta");
+    }();
     auto v_regroup = [&](const std::string& name) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t || !had.present || !had.gdn_v_grouped) return nullptr;
+        const char* key = name.find("ssm_a") != std::string::npos && name.find("alpha") == std::string::npos
+                              ? "a"
+                        : name.find("ssm_dt") != std::string::npos ? "dt"
+                        : name.find("alpha") != std::string::npos ? "alpha"
+                        : name.find("beta") != std::string::npos ? "beta" : "";
+        if (!key[0] || vregroup_set.find(key) == std::string::npos) return nullptr;
         void* d = upload_v_regrouped_bf16(t, name, s.cfg.linear_v_heads, s.cfg.linear_q_heads);
         if (d) s.owned.push_back(d);
         return d;
