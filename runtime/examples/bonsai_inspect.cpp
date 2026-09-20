@@ -7,7 +7,9 @@
 #include "sparkinfer/prism_hadamard.h"
 #include "sparkinfer/ternary_ptq1.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -64,5 +66,71 @@ int main(int argc, char** argv) {
     std::printf("first 8 values   ");
     for (int i = 0; i < 8; ++i) std::printf("%+.5f ", vals[i]);
     std::printf("\n");
+
+    // Transcode the whole tensor to Q4_K and compare against the direct ternary dequant. Real
+    // tensors are the test the unit test cannot be: adjacent groups there have genuinely different
+    // scales, which is exactly what Q4_K's shared six-bit grid has to absorb.
+    const long n = t->n_values;
+    if (n % sparkinfer::kQ4KBlockElems == 0) {
+        std::vector<uint8_t> q4k((size_t)(n / sparkinfer::kQ4KBlockElems) * sparkinfer::kQ4KBlockBytes);
+        sparkinfer::ptq1_to_q4k(static_cast<const uint8_t*>(t->data), (size_t)n, q4k.data());
+        std::vector<float> ref((size_t)n);
+        sparkinfer::ptq1_dequant(static_cast<const uint8_t*>(t->data), (size_t)n, ref.data());
+
+        // Error is measured in units of the group's OWN scale: a trit step. Dividing by |want| is
+        // meaningless for the third of all weights that are zero, and that -- not the packing --
+        // was what an early run's "worst relative error 9.06" was measuring.
+        double worst_lo = 0.0, worst_hi = 0.0, sum_sq_err = 0.0, sum_sq_ref = 0.0, worst_zero = 0.0;
+        long off_grid = 0;
+        for (long sb = 0; sb < n / sparkinfer::kQ4KBlockElems; ++sb) {
+            const uint8_t* blk = q4k.data() + (size_t)sb * sparkinfer::kQ4KBlockBytes;
+            uint16_t hd, hm;
+            std::memcpy(&hd, blk, 2);
+            std::memcpy(&hm, blk + 2, 2);
+            auto h2f = [](uint16_t h) -> float {
+                const uint32_t sign = (h & 0x8000u) << 16, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
+                if (exp == 0) {   // subnormal: d lives down here for any group scale below ~3.8e-3
+                    const float f = (float)man * 5.9604644775390625e-8f;
+                    return sign ? -f : f;
+                }
+                uint32_t bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+                float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+            };
+            const float d = h2f(hd), dmin = h2f(hm);
+            const uint8_t* scales = blk + 4;
+            const uint8_t* qs = blk + 16;
+            for (int j = 0; j < 8; ++j) {
+                uint8_t sc, mn;
+                if (j < 4) { sc = scales[j] & 63; mn = scales[j + 4] & 63; }
+                else {
+                    sc = (uint8_t)((scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4));
+                    mn = (uint8_t)((scales[j + 4] >> 4) | ((scales[j] >> 6) << 4));
+                }
+                for (int i = 0; i < 32; ++i) {
+                    const uint8_t byte = qs[(j / 2) * 32 + i];
+                    const int q = (j % 2) == 0 ? (byte & 0xF) : (byte >> 4);
+                    const float got = d * (float)sc * (float)q - dmin * (float)mn;
+                    const float want = ref[(size_t)sb * sparkinfer::kQ4KBlockElems + j * 32 + i];
+                    const double e = std::fabs(got - want);
+                    const size_t idx = (size_t)sb * sparkinfer::kQ4KBlockElems + j * 32 + i;
+                    const float gs = sparkinfer::ptq1_block_scale(
+                        static_cast<const uint8_t*>(t->data) +
+                        (idx / sparkinfer::kPtq1BlockElems) * sparkinfer::kPtq1BlockBytes);
+                    const double steps = gs > 0 ? e / gs : 0.0;   // error as a fraction of a trit
+                    if (want == 0.0f) worst_zero = std::fmax(worst_zero, steps);
+                    else if (j < 4) worst_lo = std::fmax(worst_lo, steps);
+                    else worst_hi = std::fmax(worst_hi, steps);
+                    sum_sq_err += e * e;
+                    sum_sq_ref += (double)want * want;
+                    if (q != 7 && q != 8 && q != 9) ++off_grid;
+                }
+            }
+        }
+        std::printf("q4k transcode    worst err (trit steps) zero %.4f  sub-block j<4 %.4f  j>=4 %.4f\n"
+                    "                 rms err/rms %.6f  off-grid nibbles %ld  size %.2f GB/27B\n",
+                    worst_zero, worst_lo, worst_hi,
+                    std::sqrt(sum_sq_err / (sum_sq_ref > 0 ? sum_sq_ref : 1)), off_grid,
+                    27e9 * sparkinfer::kQ4KBlockBytes / sparkinfer::kQ4KBlockElems / 1e9);
+    }
     return 0;
 }

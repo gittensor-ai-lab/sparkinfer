@@ -38,6 +38,23 @@ void ptq1_unpack_trits(const uint8_t* block, int8_t* trits);
 // The block's FP16 scale as a float.
 float ptq1_block_scale(const uint8_t* block);
 
+// Transcodes PTQ1_0 to Q4_K, the format this runtime's kernels already read. A ternary value sits
+// exactly on Q4_K's grid -- value = d*sc*q - dmin*m with q in {7,8,9} gives {-s, 0, +s} -- so the
+// only error is in representing the two group scales of a 256-element superblock on Q4_K's 6-bit
+// scale grid: 0.34% RMS measured across real tensors, with zero trits exact and no weight off the
+// ternary grid. The one sharp edge is that Q4_K's d is 1/63 of the scale it describes and so goes
+// subnormal in fp16 for any group below ~3.8e-3; see the clamp in ptq1_to_q4k. Where the two
+// groups of a superblock have very different scales the smaller one lands on a coarse rung, worst
+// case a few percent of a trit step. That buys a model that runs on every existing kernel at 0.5625
+// bytes per weight (~15 GB for 27B) while a native ternary kernel is written.
+//
+// `n_elems` must be a multiple of 256 (two PTQ1_0 blocks per Q4_K superblock). Writes
+// n_elems/256 * 144 bytes.
+void ptq1_to_q4k(const uint8_t* src, size_t n_elems, uint8_t* dst);
+
+inline constexpr int kQ4KBlockElems = 256;
+inline constexpr int kQ4KBlockBytes = 144;
+
 // Packs 128 trits (-1/0/+1) and a scale into a 28-byte block, inverse of ptq1_unpack_trits.
 // Only the tests need this -- the checkpoint is produced elsewhere -- but a decoder without its
 // encoder is a decoder nobody can test.

@@ -57,11 +57,20 @@ inline uint16_t float_to_fp16(float f) {
     uint32_t bits;
     std::memcpy(&bits, &f, sizeof(bits));
     const uint32_t sign = (bits >> 16) & 0x8000u;
-    int exp = static_cast<int>((bits >> 23) & 0xFFu) - 127 + 15;
-    uint32_t man = bits & 0x7FFFFFu;
-    if (exp <= 0) return static_cast<uint16_t>(sign);          // flush tiny scales to zero
+    const int exp = static_cast<int>((bits >> 23) & 0xFFu) - 127 + 15;
+    const uint32_t man = bits & 0x7FFFFFu;
     if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00u);
-    return static_cast<uint16_t>(sign | (exp << 10) | (man >> 13));
+    if (exp <= 0) {
+        // Subnormal, or zero. Shifting the implicit leading one back in is what keeps a scale of
+        // 5e-5 from becoming a scale of nothing; flushing here silently zeroed whole weight groups.
+        if (exp < -10) return static_cast<uint16_t>(sign);
+        const uint32_t full = man | 0x800000u;
+        const int shift = 14 - exp;                            // 14..24
+        const uint32_t q = (full + (1u << (shift - 1)) - 1 + ((full >> shift) & 1u)) >> shift;
+        return static_cast<uint16_t>(sign | q);
+    }
+    const uint32_t q = (man + 0x0FFFu + ((man >> 13) & 1u)) >> 13;   // round to nearest, ties to even
+    return static_cast<uint16_t>(sign | ((exp << 10) + q));          // a mantissa carry bumps exp
 }
 
 }  // namespace
@@ -92,6 +101,63 @@ void ptq1_dequant(const uint8_t* data, size_t n_elems, float* out) {
     const size_t blocks = n_elems / kPtq1BlockElems;
     for (size_t b = 0; b < blocks; ++b)
         ptq1_dequant_block(data + b * kPtq1BlockBytes, out + b * kPtq1BlockElems);
+}
+
+void ptq1_to_q4k(const uint8_t* src, size_t n_elems, uint8_t* dst) {
+    const size_t supers = n_elems / kQ4KBlockElems;
+    for (size_t sb = 0; sb < supers; ++sb) {
+        const uint8_t* b0 = src + (2 * sb) * kPtq1BlockBytes;
+        const uint8_t* b1 = b0 + kPtq1BlockBytes;
+        int8_t trits[kQ4KBlockElems];
+        ptq1_unpack_trits(b0, trits);
+        ptq1_unpack_trits(b1, trits + kPtq1BlockElems);
+        const float s0 = ptq1_block_scale(b0), s1 = ptq1_block_scale(b1);
+
+        // Q4_K stores value = d*sc[j]*q - dmin*m[j] over eight 32-element sub-blocks, with sc and m
+        // six bits each. A ternary group needs d*sc = s and dmin*m = 8s, so pick d and dmin to put
+        // both group scales as high on the 6-bit grid as they fit.
+        const float smax = s0 > s1 ? s0 : s1;
+        // d must stay a NORMAL fp16. smax/63 is 63x smaller than the weights it describes, and for
+        // this checkpoint's scales (1e-4 .. 2e-2) that lands under fp16's smallest normal for any
+        // group below ~3.8e-3 -- which is most of blk.31.ffn_down. Clamping costs rungs on the
+        // six-bit ladder for those groups and costs nothing for the rest.
+        const float kMinNormalFp16 = 6.103515625e-5f;            // 2^-14
+        float d = smax / 63.0f;
+        if (d < kMinNormalFp16) d = kMinNormalFp16;
+        const uint16_t hd = float_to_fp16(d);
+        d = fp16_to_float(hd);                                   // derive sc from the stored d, not the ideal one
+        const float dmin = 8.0f * d;                             // exact: scaling by 8 only moves the exponent
+        uint8_t sc[8], mn[8];
+        for (int j = 0; j < 8; ++j) {
+            const float s = (j < 4) ? s0 : s1;
+            const int q_sc = d > 0.0f ? (int)(s / d + 0.5f) : 0;
+            sc[j] = (uint8_t)(q_sc < 0 ? 0 : (q_sc > 63 ? 63 : q_sc));
+            // m is the SAME rung as sc, which is what makes a zero trit decode to exactly zero:
+            // d*sc*8 - dmin*m = 8*d*(sc - m) = 0. Rounding the two independently loses that.
+            mn[j] = sc[j];
+        }
+
+        uint8_t* out = dst + sb * kQ4KBlockBytes;
+        const uint16_t hm = float_to_fp16(dmin);
+        std::memcpy(out, &hd, 2);
+        std::memcpy(out + 2, &hm, 2);
+        uint8_t* scales = out + 4;
+        // ggml's six-bit pairs: j<4 keeps sc and m whole, j>=4 splits them across two bytes.
+        for (int j = 0; j < 4; ++j) { scales[j] = sc[j]; scales[j + 4] = mn[j]; }
+        for (int j = 4; j < 8; ++j) {
+            scales[j + 4] = (uint8_t)((sc[j] & 0xF) | ((mn[j] & 0xF) << 4));
+            scales[j - 4] = (uint8_t)(scales[j - 4] | ((sc[j] >> 4) << 6));
+            scales[j] = (uint8_t)(scales[j] | ((mn[j] >> 4) << 6));
+        }
+        uint8_t* qs = out + 16;
+        // Nibbles are interleaved 32 apart within each 64-element half, as ggml packs them.
+        for (int half = 0; half < 4; ++half) {
+            const int8_t* t = trits + half * 64;
+            uint8_t* q = qs + half * 32;
+            for (int i = 0; i < 32; ++i)
+                q[i] = (uint8_t)((t[i] + 8) | ((t[i + 32] + 8) << 4));
+        }
+    }
 }
 
 void ptq1_pack_block(const int8_t* trits, float scale, uint8_t* block) {
