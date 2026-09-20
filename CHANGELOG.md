@@ -71,12 +71,29 @@ against the unquantized checkpoint's 4.46 through the same runtime.
   *better* than folding -- PPL 7.89 against 8.07-8.10 -- because the trits are read as they are
   rather than refitted to Q4_K. Decode rotates the activation once per layer before the
   projections fan out across streams; prefill keeps its existing branches by getting ordinary
-  bf16 out of one `dq()` helper, so only the scratch is dense. Off by default, and the default is
-  deliberate: measured on an RTX 5090 it holds 13.6 GB against 17.9 GB and scores better, but it
-  decodes at 40.4 tok/s against 87.9 single-stream, and at four concurrent requests ~42 tok/s
-  aggregate against ~204, because the packed continuous-batch path cannot drive a ternary
-  projection and every step falls back to one forward per row. It is a memory-and-quality trade
-  for a single stream, not a serving default.
+  bf16 out of one `dq()` helper, so only the scratch is dense.
+
+  `ffn` takes the dense SwiGLU too -- the largest thing still being expanded, ~5.9 GB of the
+  checkpoint. Its decode arm is three GEMVs and an elementwise SwiGLU, the shape the NVFP4 arm
+  beside it already uses, because the fused Q4_K expert kernel cannot read type 143 at all. It
+  needs TWO rotations where a projection needs one: gate and up read the post-attention norm at
+  the residual width, down reads SwiGLU's output at the FFN width, which is a different sign
+  vector. All three legs convert together or none do -- a down leg left as Q4_K beside native
+  gate/up would read a correctly-rotated activation against un-rotated weights.
+
+  **Off by default.** Measured on an RTX 5090, every configuration answering correctly:
+
+  | `SPARKINFER_BONSAI_NATIVE` | VRAM | single-stream | 4 concurrent | PPL |
+  | --- | --- | --- | --- | --- |
+  | unset (folded) | 17.9 GB | 87.4 tok/s | 214.4 tok/s | 9.709 |
+  | `head,embed,proj` | 13.6 GB | 40.4 tok/s | 44.3 tok/s | 9.401 |
+  | `all` | **8.2 GB** | 16.0 tok/s | 17.9 tok/s | **9.187** |
+
+  So it is less than half the memory and the best-scoring of the three, at 5.5x the single-stream
+  cost and 12x at concurrency: the packed continuous-batch path cannot drive a ternary projection,
+  so every step falls back to one forward per row, and the FFN trades one fused kernel for four
+  launches on each of 64 layers. That is a real option for a card that cannot hold 18 GB at all,
+  and the wrong default for one that can.
 - **The Qwen3.8-27B family is recognised by shape** (#1122), not by the presence of an MTP block.
   A derivative without one was served under the default model name of an unrelated 35B MoE, and
   the same flag selects this family's chat-template behaviour and its second stop token (248044),
