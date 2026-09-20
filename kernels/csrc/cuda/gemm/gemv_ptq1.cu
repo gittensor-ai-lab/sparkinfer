@@ -49,6 +49,9 @@ __device__ __forceinline__ void store_out<float>(float* y, int row, float v) {
     y[row] = v;
 }
 
+// blockIdx.y selects the activation, so one launch covers a batch of them -- which is what
+// prefill needs, since it projects N tokens at once rather than one. The weight row a warp walks
+// is the same for every activation, so the batch reuses those loads within the CTA's L1.
 template <typename OutT>
 __global__ void gemv_ptq1_kernel(const __nv_bfloat16* __restrict__ x,
                                  const unsigned char* __restrict__ w,
@@ -57,6 +60,9 @@ __global__ void gemv_ptq1_kernel(const __nv_bfloat16* __restrict__ x,
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * kWarpsPerCta + warp;
     if (row >= n_rows) return;
+    const int batch = blockIdx.y;
+    x += (size_t)batch * k;
+    y += (size_t)batch * n_rows;
 
     const int n_blocks = k / kBlockElems;
     const unsigned char* wrow = w + (size_t)row * n_blocks * kBlockBytes;
@@ -141,10 +147,11 @@ __global__ void embedding_ptq1_kernel(const int* __restrict__ tok,
 }
 
 template <typename OutT>
-void launch_typed(const void* x, const void* w, OutT* y, int n_rows, int k, cudaStream_t stream) {
-    if (n_rows <= 0 || k <= 0 || k % kBlockElems != 0) return;
-    const int ctas = (n_rows + kWarpsPerCta - 1) / kWarpsPerCta;
-    gemv_ptq1_kernel<OutT><<<ctas, kWarpsPerCta * 32, 0, stream>>>(
+void launch_typed(const void* x, const void* w, OutT* y, int n_rows, int k, int batch,
+                  cudaStream_t stream) {
+    if (n_rows <= 0 || k <= 0 || batch <= 0 || k % kBlockElems != 0) return;
+    const dim3 grid((unsigned)((n_rows + kWarpsPerCta - 1) / kWarpsPerCta), (unsigned)batch);
+    gemv_ptq1_kernel<OutT><<<grid, kWarpsPerCta * 32, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(w),
         y, n_rows, k);
 }
@@ -154,12 +161,18 @@ void launch_typed(const void* x, const void* w, OutT* y, int n_rows, int k, cuda
 void launch_gemv_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
                       int n_rows, int k, cudaStream_t stream) {
     launch_typed<__nv_bfloat16>(x_bf16, w_ptq1, reinterpret_cast<__nv_bfloat16*>(y_bf16),
-                                n_rows, k, stream);
+                                n_rows, k, 1, stream);
 }
 
 void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
                           int n_rows, int k, cudaStream_t stream) {
-    launch_typed<float>(x_bf16, w_ptq1, y_f32, n_rows, k, stream);
+    launch_typed<float>(x_bf16, w_ptq1, y_f32, n_rows, k, 1, stream);
+}
+
+void launch_gemm_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
+                      int n_rows, int k, int batch, cudaStream_t stream) {
+    launch_typed<__nv_bfloat16>(x_bf16, w_ptq1, reinterpret_cast<__nv_bfloat16*>(y_bf16),
+                                n_rows, k, batch, stream);
 }
 
 void launch_embedding_ptq1(const int* tokens, const void* table_ptq1, void* out_bf16,

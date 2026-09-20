@@ -18,6 +18,12 @@ namespace sparkinfer { namespace kernels {
 void launch_gemv_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
                       int n_rows, int k, cudaStream_t stream);
 
+// A batch of activations against the same weights: y[b,n] = sum_k W[n,k] * x[b,k], x row-major
+// over the batch and y likewise. This is what prefill needs -- it projects N tokens at once, and
+// a per-token GEMV would reload the whole weight matrix for each of them.
+void launch_gemm_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
+                      int n_rows, int k, int batch, cudaStream_t stream);
+
 // The same, writing f32 -- the LM head's logits are f32 and are read as such downstream.
 void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
                           int n_rows, int k, cudaStream_t stream);

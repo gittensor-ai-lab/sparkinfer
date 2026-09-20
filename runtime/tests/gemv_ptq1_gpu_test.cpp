@@ -140,6 +140,52 @@ void test_a_single_trit_lands_where_the_host_puts_it() {
     }
 }
 
+void test_a_batch_agrees_with_one_activation_at_a_time() {
+    // Prefill projects N tokens at once. The batched launch has to give exactly what N separate
+    // GEMVs give, or prefill and decode disagree about the same weights -- which is the shape of
+    // bug that shows up as a model that generates fluently and scores badly.
+    using namespace sparkinfer;
+    const int rows = 19, k = 384, batch = 5;
+    const int blocks_per_row = k / kPtq1BlockElems;
+
+    std::vector<uint8_t> w((size_t)rows * blocks_per_row * kPtq1BlockBytes);
+    std::vector<int8_t> trits(kPtq1BlockElems);
+    uint32_t rng = 99u;
+    auto next = [&] { rng = rng * 1664525u + 1013904223u; return rng; };
+    for (int r = 0; r < rows; ++r)
+        for (int b = 0; b < blocks_per_row; ++b) {
+            for (int i = 0; i < kPtq1BlockElems; ++i) trits[i] = (int8_t)((int)(next() % 3) - 1);
+            ptq1_pack_block(trits.data(), 0.004f + (float)(next() % 50) * 0.0003f,
+                            w.data() + ((size_t)r * blocks_per_row + b) * kPtq1BlockBytes);
+        }
+
+    std::vector<uint16_t> hx((size_t)batch * k);
+    for (size_t i = 0; i < hx.size(); ++i) hx[i] = to_bf16(std::sin(0.031f * (float)i) * 1.3f);
+
+    void* dx = nullptr; void* dw = nullptr; void* dy = nullptr; void* dy1 = nullptr;
+    cudaMalloc(&dx, hx.size() * 2);
+    cudaMalloc(&dw, w.size());
+    cudaMalloc(&dy, (size_t)batch * rows * 2);
+    cudaMalloc(&dy1, (size_t)rows * 2);
+    cudaMemcpy(dx, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice);
+
+    kernels::launch_gemm_ptq1(dx, dw, dy, rows, k, batch, 0);
+    cudaDeviceSynchronize();
+    std::vector<uint16_t> hy((size_t)batch * rows);
+    cudaMemcpy(hy.data(), dy, hy.size() * 2, cudaMemcpyDeviceToHost);
+
+    for (int b = 0; b < batch; ++b) {
+        kernels::launch_gemv_ptq1(static_cast<const char*>(dx) + (size_t)b * k * 2, dw, dy1,
+                                  rows, k, 0);
+        cudaDeviceSynchronize();
+        std::vector<uint16_t> one(rows);
+        cudaMemcpy(one.data(), dy1, one.size() * 2, cudaMemcpyDeviceToHost);
+        for (int r = 0; r < rows; ++r) CHECK(hy[(size_t)b * rows + r] == one[r]);
+    }
+    cudaFree(dx); cudaFree(dw); cudaFree(dy); cudaFree(dy1);
+}
+
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
@@ -148,6 +194,7 @@ int main() {
     }
     test_gemv_matches_the_host_decoder();
     test_a_single_trit_lands_where_the_host_puts_it();
+    test_a_batch_agrees_with_one_activation_at_a_time();
     std::printf("gemv_ptq1_gpu_test: %s\n", failures ? "FAILURES" : "OK");
     return failures ? 1 : 0;
 }
