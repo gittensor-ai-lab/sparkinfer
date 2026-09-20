@@ -141,13 +141,19 @@ def main():
                     help="the un-quantised checkpoint this model was derived from")
     ap.add_argument("--tokenizer", default="/root/workspace/models_qwen38")
     ap.add_argument("--build", default="/workspace/sparkinfer/build/runtime")
-    ap.add_argument("--inspect", default="/tmp/bonsai_inspect")
-    ap.add_argument("--max-ppl", type=float, default=9.5,
-                    help="both paths measure ~7.9-8.2; this is a broken-path gate, not a tolerance")
+    ap.add_argument("--inspect", default=None,
+                    help="bonsai_inspect binary; defaults to the one in --build")
+    ap.add_argument("--max-ppl", type=float, default=11.0,
+                    help="this passage measures 9.30 native / 9.56 folded; a broken-path gate, not "
+                         "a tolerance. Do not copy a threshold from a run on a DIFFERENT passage -- "
+                         "the first version of this gate did, set 9.5 from an 8.11 measurement, and "
+                         "failed on a model that was working perfectly.")
     ap.add_argument("--min-cos", type=float, default=0.80,
                     help="correct ternary decode lands at ~0.88")
     ap.add_argument("--skip", default="", help="comma-separated: tensors,score,generate")
     a = ap.parse_args()
+    if not a.inspect:
+        a.inspect = os.path.join(a.build, "bonsai_inspect")
     a.score = os.path.join(a.build, "qwen3_gguf_score")
     a.generate = os.path.join(a.build, "qwen3_gguf_generate")
 
