@@ -35,11 +35,14 @@ against the unquantized checkpoint's 4.46 through the same runtime.
 ### Serving
 
 - **Ternary weights can be read in their stored form** (#1122), behind
-  `SPARKINFER_BONSAI_NATIVE` (`head`, `embed`, or `all`). Folding the rotation into the weights is
-  exact but leaves them dense, so a 5.95 GB checkpoint occupies ~15 GB; reading the 28-byte blocks
-  directly costs 0.21875 bytes/weight and rotates the activation instead. The LM head and the
-  embedding table take that path today, for byte-identical greedy output at 15.7 GB against the
-  folded path's 18.4 GB. Off by default while the remaining tensors follow.
+  `SPARKINFER_BONSAI_NATIVE` (`head`, `embed`, `proj`, or `all`). Folding the rotation into the
+  weights is exact but leaves them dense, so a 5.95 GB checkpoint occupies ~18 GB; reading the
+  28-byte blocks directly costs 0.21875 bytes/weight and rotates the activation instead. The LM
+  head, the embedding table and the residual-width projections take that path, and it is slightly
+  *better* than folding -- PPL 7.89 against 8.07-8.10 -- because the trits are read as they are
+  rather than refitted to Q4_K. Decode rotates the activation once per layer before the
+  projections fan out across streams; prefill keeps its existing branches by getting ordinary
+  bf16 out of one `dq()` helper, so only the scratch is dense. Off by default.
 - **The Qwen3.8-27B family is recognised by shape** (#1122), not by the presence of an MTP block.
   A derivative without one was served under the default model name of an unrelated 35B MoE, and
   the same flag selects this family's chat-template behaviour and its second stop token (248044),
