@@ -48,6 +48,9 @@ void block_info(int t, long& bytes, long& elems) {
         case 12: bytes=144; elems=256; break;   // Q4_K
         case 13: bytes=176; elems=256; break;   // Q5_K
         case 14: bytes=210; elems=256; break;   // Q6_K
+        // PTQ1_0: ternary {-1,0,+1} with one FP16 scale per 128 weights, 1.75 bits each
+        // (prism-ml Ternary-Bonsai-2; see ternary_ptq1.h for the byte layout).
+        case 143: bytes=28; elems=128; break;   // PTQ1_0
         default: bytes=0;   elems=1;   break;
     }
 }

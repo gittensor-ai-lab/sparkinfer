@@ -121,3 +121,8 @@ add_executable(qwen_vision_video_cpu_test qwen_vision_video_cpu_test.cpp
 target_include_directories(qwen_vision_video_cpu_test PRIVATE ../include)
 set_target_properties(qwen_vision_video_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME qwen_vision_video_cpu_test COMMAND qwen_vision_video_cpu_test)
+
+add_executable(ternary_ptq1_cpu_test ternary_ptq1_cpu_test.cpp ../src/ternary_ptq1.cpp)
+set_target_properties(ternary_ptq1_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(ternary_ptq1_cpu_test PRIVATE ../include)
+add_test(NAME ternary_ptq1_cpu_test COMMAND ternary_ptq1_cpu_test)
