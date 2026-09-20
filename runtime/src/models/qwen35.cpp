@@ -229,6 +229,48 @@ void unrotate_job_set_v_block(UnrotateJob& j, const std::string& name, const Qwe
     j.v_head_dim = head_dim;
 }
 
+// The same v-head transpose applies to everything else indexed by GDN v head: the per-head
+// scalars ssm_a and ssm_dt.bias, and the alpha/beta projections that emit one value per head.
+// None of those is ternary, so they never pass through the un-rotation; they are regrouped here.
+// Leaving them alone pairs each head's decay and step size with another head's values.
+void* upload_v_regrouped_bf16(const GGUFTensor* t, const std::string& name, long heads, long groups) {
+    if (heads <= 0 || groups <= 0 || heads % groups != 0) return nullptr;
+    const long row_len = t->n_dims >= 2 ? t->dims[0] : 1;
+    if (row_len <= 0 || t->n_values % row_len != 0) return nullptr;
+    if (t->n_values / row_len != heads) return nullptr;
+    if (t->ggml_type != 0 && t->ggml_type != 30) {
+        fprintf(stderr, "[bonsai] %s: cannot regroup ggml type %d\n", name.c_str(), t->ggml_type);
+        return nullptr;
+    }
+    const long per_group = heads / groups;
+    std::vector<uint16_t> host((size_t)t->n_values);
+    const auto* raw = static_cast<const uint8_t*>(t->data);
+    for (long d = 0; d < heads; ++d) {
+        const long src = (d % per_group) * groups + (d / per_group);
+        for (long i = 0; i < row_len; ++i) {
+            uint16_t bits;
+            if (t->ggml_type == 30) {
+                std::memcpy(&bits, raw + ((size_t)src * row_len + i) * 2, 2);
+            } else {
+                float f;
+                std::memcpy(&f, raw + ((size_t)src * row_len + i) * 4, 4);
+                uint32_t u;
+                std::memcpy(&u, &f, 4);
+                u += 0x7FFFu + ((u >> 16) & 1u);
+                bits = (uint16_t)(u >> 16);
+            }
+            host[(size_t)d * row_len + i] = bits;
+        }
+    }
+    void* dev = nullptr;
+    if (cudaMalloc(&dev, host.size() * 2) != cudaSuccess) return nullptr;
+    if (cudaMemcpy(dev, host.data(), host.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(dev);
+        return nullptr;
+    }
+    return dev;
+}
+
 bool unrotate_job_init(UnrotateJob& j, const GGUFTensor* t, const std::string& name,
                        const std::vector<int8_t>& sign, long block, bool inverse_listed) {
     j.t = t; j.sign = &sign; j.block = block;
@@ -6110,6 +6152,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {
         return g.tensor(name) ? dense(name, transpose) : nullptr;
     };
+    // Returns null unless this checkpoint declares the transposed GDN v order, so every other
+    // model keeps its existing loader untouched.
+    auto v_regroup = [&](const std::string& name) -> const void* {
+        const GGUFTensor* t = g.tensor(name);
+        if (!t || !had.present || !had.gdn_v_grouped) return nullptr;
+        void* d = upload_v_regrouped_bf16(t, name, s.cfg.linear_v_heads, s.cfg.linear_q_heads);
+        if (d) s.owned.push_back(d);
+        return d;
+    };
     auto expect_dims = [&](const std::string& name, std::initializer_list<long> dims) -> bool {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return false; }
@@ -6168,10 +6219,18 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             w.wqkv = attn_w(b + "attn_qkv.weight", w.wqkv_type);
             w.wqkv_gate = attn_w(b + "attn_gate.weight", w.wqkv_gate_type);
             w.ssm_conv = dense(b + "ssm_conv1d.weight", false);
-            w.ssm_dt = dense(b + "ssm_dt.bias", false);
-            w.ssm_a = dense(b + "ssm_a", false);
-            w.ssm_beta = attn_w(b + "ssm_beta.weight", w.ssm_beta_type);
-            w.ssm_alpha = attn_w(b + "ssm_alpha.weight", w.ssm_alpha_type);
+            w.ssm_dt = v_regroup(b + "ssm_dt.bias");
+            w.ssm_a = v_regroup(b + "ssm_a");
+            if (const void* bp = v_regroup(b + "ssm_beta.weight")) {
+                w.ssm_beta = bp; w.ssm_beta_type = 0;
+            } else {
+                w.ssm_beta = attn_w(b + "ssm_beta.weight", w.ssm_beta_type);
+            }
+            if (const void* ap = v_regroup(b + "ssm_alpha.weight")) {
+                w.ssm_alpha = ap; w.ssm_alpha_type = 0;
+            } else {
+                w.ssm_alpha = attn_w(b + "ssm_alpha.weight", w.ssm_alpha_type);
+            }
             w.ssm_norm = dense(b + "ssm_norm.weight", false);
             w.ssm_out = attn_w(b + "ssm_out.weight", w.ssm_out_type);
         } else {

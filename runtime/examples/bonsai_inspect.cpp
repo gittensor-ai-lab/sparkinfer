@@ -195,8 +195,9 @@ int main(int argc, char** argv) {
         std::printf("tensor %s: F32 n=%ld min %.6f max %.6f mean %.6f rms %.6f exactly-one %ld/%ld\n",
                     want, t->n_values, lo, hi, mean,
                     std::sqrt(sumsq / (double)t->n_values), ones, t->n_values);
-        std::printf("first 8         ");
-        for (long i = 0; i < 8 && i < t->n_values; ++i) std::printf("%+.5f ", v[i]);
+        const long show = t->n_values <= 64 ? t->n_values : 8;
+        std::printf("values          ");
+        for (long i = 0; i < show; ++i) std::printf("%+.5f ", v[i]);
         std::printf("\n");
         return 0;
     }
