@@ -5760,10 +5760,18 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // Native PTQ1_0: keep the weights in their stored blocks and rotate the activation instead.
     // Off by default -- the folded path is the one measured at PPL 8.07 -- because this trades a
     // validated path for a much smaller one, and both arms should come out of the same binary.
-    const bool bonsai_native = had.present && [] {
+    // SPARKINFER_BONSAI_NATIVE selects which tensors stay in their stored blocks: "1"/"all", or a
+    // list of "head" and "embed". Selectable so a fault can be attributed to one of them rather
+    // than to "the native path".
+    static const std::string bonsai_native_set = [] {
         const char* e = getenv("SPARKINFER_BONSAI_NATIVE");
-        return e && e[0] == '1';
+        std::string v(e ? e : "");
+        if (v == "1" || v == "all") v = "head,embed";
+        return v;
     }();
+    const bool bonsai_native = had.present && !bonsai_native_set.empty();
+    const bool bonsai_native_head = bonsai_native_set.find("head") != std::string::npos;
+    const bool bonsai_native_embed = bonsai_native_set.find("embed") != std::string::npos;
     if (bonsai_native) {
         s.bonsai_block = had.block_size;
         for (const auto& kv : had.signs_by_width) {
@@ -6220,7 +6228,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto lm_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         const bool q5k_ok = mg_lm_q5k && s.cfg.muse_glimmer && t && t->ggml_type == 13;
-        if (bonsai_native && t && t->ggml_type == kPtq1GgmlType && s.bonsai_rot &&
+        if (bonsai_native_head && t && t->ggml_type == kPtq1GgmlType && s.bonsai_rot &&
             s.bonsai_sign_dev.count(t->dims[0])) {
             // Straight upload: no un-rotation, no refit, 0.21875 bytes/weight.
             void* d = nullptr;
@@ -6296,7 +6304,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     };
 
     if (const GGUFTensor* emb_t = g.tensor("token_embd.weight");
-        bonsai_native && emb_t && emb_t->ggml_type == kPtq1GgmlType && s.bonsai_rot &&
+        bonsai_native_embed && emb_t && emb_t->ggml_type == kPtq1GgmlType && s.bonsai_rot &&
         s.bonsai_sign_dev.count(emb_t->dims[0])) {
         void* d = nullptr;
         if (cudaMalloc(&d, emb_t->n_bytes) == cudaSuccess &&
