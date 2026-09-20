@@ -5801,7 +5801,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     const bool bonsai_native = had.present && !bonsai_native_set.empty();
     const bool bonsai_native_head = bonsai_native_set.find("head") != std::string::npos;
     const bool bonsai_native_embed = bonsai_native_set.find("embed") != std::string::npos;
-    const bool bonsai_native_proj = bonsai_native_set.find("proj") != std::string::npos;
+    // "proj" takes every residual-width projection; "qkv" and "gate" take one family each, to
+    // attribute the projection fault to a tensor rather than to the slice.
+    const bool bonsai_proj_qkv_only = bonsai_native_set.find("qkv") != std::string::npos;
+    const bool bonsai_proj_gate_only = bonsai_native_set.find("gate") != std::string::npos;
+    const bool bonsai_native_proj = bonsai_native_set.find("proj") != std::string::npos ||
+                                    bonsai_proj_qkv_only || bonsai_proj_gate_only;
     if (bonsai_native) {
         s.bonsai_block = had.block_size;
         for (const auto& kv : had.signs_by_width) {
@@ -6240,8 +6245,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         const GGUFTensor* t = g.tensor(name);
         // Only projections whose input is the residual width: those read the once-per-layer
         // rotated xn in decode, and prefill's dq() carries the matching sign vector.
-        if (bonsai_native_proj && t && t->ggml_type == kPtq1GgmlType && s.bonsai_rot_xn &&
-            t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0])) {
+        const bool proj_name_ok =
+            (!bonsai_proj_qkv_only && !bonsai_proj_gate_only) ||
+            (bonsai_proj_qkv_only && name.find(".attn_qkv.") != std::string::npos) ||
+            (bonsai_proj_gate_only && name.find(".attn_gate.") != std::string::npos);
+        if (bonsai_native_proj && proj_name_ok && t && t->ggml_type == kPtq1GgmlType &&
+            s.bonsai_rot_xn && t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0])) {
             void* d = nullptr;
             if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
                 cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
