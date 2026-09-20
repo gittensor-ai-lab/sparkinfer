@@ -87,16 +87,23 @@ against the unquantized checkpoint's 4.46 through the same runtime.
   | --- | --- | --- | --- | --- |
   | unset (folded) | 17.9 GB | 87.4 tok/s | 214.4 tok/s | 6.946 |
   | `head,embed,proj` | 13.6 GB | 60.0 tok/s | 64.0 tok/s | 6.449 |
-  | `all` | **8.2 GB** | 29.8 tok/s | 34.3 tok/s | **6.342** |
+  | `all` | **8.2 GB** | 29.8 tok/s | 82.7 tok/s | **6.342** |
 
   (perplexities on one passage, all three from the same build so they compare; the regression
   guard scores a longer one and reads 9.709 folded against 9.187 for `all`)
 
   So it is less than half the memory and the best-scoring of the three, at 2.9x the single-stream
-  cost and 6.3x at concurrency: the packed continuous-batch path cannot drive a ternary
-  projection, so every step falls back to one forward per row, and the FFN trades one fused kernel
-  for four launches on each of 64 layers. That is a real option for a card that cannot hold 18 GB
-  at all, and the wrong default for one that can.
+  cost and 2.6x at concurrency. It is a real option for a card that cannot hold 18 GB at all, and
+  the wrong default for one that can.
+- **Packed continuous-batch decode drives the ternary path** (#1122), which took it from 34.3 to
+  82.7 tok/s at four concurrent requests. It used to decline on every step -- correct, since a
+  declined batch falls back to one forward per row, but it meant concurrency bought almost
+  nothing. Three arms were needed, because the packed path prepares activations three ways: the
+  projections, the dense FFN and the LM head. The rotation is staged once per layer ahead of the
+  stream fork and both the main- and side-stream projection helpers read it, which is the rule
+  the dp4a and fp8 activation staging beside it already follows -- a side stream rotating for
+  itself is a write racing the main stream's read. All of it goes through one batched GEMM that
+  is bit-identical per row to the single-row GEMV AR decode drives.
 - **The ternary GEMV stops paying local memory for every trit.** `pow3[m]` was a function-local
   array indexed by a value that differs across the lanes of a warp, so it could not stay in
   registers and each trit extraction took a local-memory load; and the 28-byte block was re-read
