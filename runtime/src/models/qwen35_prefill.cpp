@@ -13,6 +13,7 @@
 
 #include "qwen35_prefill.h"
 #include "sparkinfer/kernels/ternary.h"
+#include "sparkinfer/ternary_ptq1.h"
 #include "sparkinfer/kernels/hadamard.h"
 #include "sparkinfer/kernels/prefill.h"
 #include "sparkinfer/kernels/vision.h"
@@ -1805,7 +1806,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (s.bonsai_embed_native) {
         // Ternary table: decode the row, then take off the rotation it was stored in.
         kernels::launch_embedding_ptq1_unrotate(
-            d_ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_embed_sign),
+            d_ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_sign_hidden),
             x, N, H, s.bonsai_block, st);
     } else {
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
@@ -3259,6 +3260,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (s.w.lm_head_type == 12 && lm_q8 && lm_ad && lm_as) {
             kernels::launch_quantize_q8_1(xn_last, lm_q8, lm_ad, lm_as, H, st);
             kernels::launch_gemv_q_dp4a_pq_f32(lm_q8, lm_ad, lm_as, s.w.lm_head, s.logits, c.vocab, H, st);
+        } else if (s.w.lm_head_type == kPtq1GgmlType && s.bonsai_rot && s.bonsai_sign_hidden) {
+            // Ternary head: prefill's seed argmax reads it too, and launch_gemv_q_f32 does not
+            // know this type -- it would read blocks of the wrong size rather than refuse.
+            kernels::launch_hadamard_rotate_bf16(
+                xn_last, s.bonsai_rot, static_cast<const signed char*>(s.bonsai_sign_hidden),
+                H, H, s.bonsai_block, st);
+            kernels::launch_gemv_ptq1_f32(s.bonsai_rot, s.w.lm_head, s.logits, c.vocab, H, st);
         } else if (s.w.lm_head_type)
             kernels::launch_gemv_q_f32(xn_last, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
         else
@@ -4292,7 +4300,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (s.bonsai_embed_native) {
         // Ternary table: decode the row, then take off the rotation it was stored in.
         kernels::launch_embedding_ptq1_unrotate(
-            ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_embed_sign),
+            ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_sign_hidden),
             x, N, H, s.bonsai_block, st);
     } else {
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);

@@ -3512,6 +3512,7 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.bonsai_embed_native,
                           s.bonsai_embed_native ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
                           (int)s.bonsai_block,
+                          s.bonsai_rot,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           s.dflash_capture ? s.dflash_layer_ids.data() : nullptr,
@@ -3623,6 +3624,7 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
                           s.bonsai_embed_native,
                           s.bonsai_embed_native ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
                           (int)s.bonsai_block,
+                          s.bonsai_rot,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -4052,6 +4054,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
                           s.bonsai_embed_native,
                           s.bonsai_embed_native ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
                           (int)s.bonsai_block,
+                          s.bonsai_rot,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -4428,6 +4431,7 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
                           s.bonsai_embed_native,
                           s.bonsai_embed_native ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
                           (int)s.bonsai_block,
+                          s.bonsai_rot,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -4451,6 +4455,7 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
                           s.bonsai_embed_native,
                           s.bonsai_embed_native ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
                           (int)s.bonsai_block,
+                          s.bonsai_rot,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };

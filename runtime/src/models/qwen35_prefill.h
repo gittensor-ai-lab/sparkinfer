@@ -51,8 +51,9 @@ struct Qwen35PrefillCtx {
     // ternary table rather than a bf16 expansion, so the lookup decodes a row and takes the
     // stored rotation back off it. Null/false for every other model.
     bool                 bonsai_embed_native;
-    const void*          bonsai_embed_sign;   // int8[hidden] on device
+    const void*          bonsai_sign_hidden;  // int8[hidden] on device; embedding + head
     int                  bonsai_block;
+    void*                bonsai_rot;          // scratch for one rotated activation, or null
     int                  qdim, kvdim;                       // full-attn q / kv dims
     int                  linear_qdim, linear_vdim, linear_qkvdim;  // GDN dims
     // Per-row int8 scales of the routed expert weights, [layer][expert * rows], precomputed at
