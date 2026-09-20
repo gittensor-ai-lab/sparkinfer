@@ -76,6 +76,14 @@ sweep
 cd "$BOX_REPO" || exit 1
 git fetch -q origin "$BONSAI_REF" && git checkout -q FETCH_HEAD || { echo "  checkout failed"; exit 1; }
 echo "  at $(git log --oneline -1)"
+# A PRIVATE TMPDIR, not /tmp. nvcc stages every intermediate under $TMPDIR as tmpxft_<pid>_*,
+# and /tmp on this box is shared with whatever else is building -- the eval bots run hourly. Two
+# builds there are fine on their own, but anything that tidies /tmp/tmpxft_* (a person reclaiming
+# space, a sibling script) deletes the OTHER build's in-flight intermediates, which surfaces as
+# "fatbinary fatal: Could not open input file" or "cc1plus: fatal error: <file>: No such file or
+# directory" in whichever translation units lost. Own the namespace instead of racing for it.
+export TMPDIR="${TMPDIR_BONSAI:-/workspace/sparkinfer/.tmp-bonsai-guard}"
+mkdir -p "$TMPDIR" && rm -rf "${TMPDIR:?}"/* 2>/dev/null
 cd build && cmake . >/dev/null 2>&1
 # NOT -j$(nproc). The box has 64 cores and one 150 GB filesystem that runs near full, and each
 # parallel nvcc stages a few hundred MB of intermediates in /tmp: a -j64 build transiently wants
