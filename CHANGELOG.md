@@ -86,17 +86,24 @@ against the unquantized checkpoint's 4.46 through the same runtime.
   | `SPARKINFER_BONSAI_NATIVE` | VRAM | single-stream | 4 concurrent | PPL |
   | --- | --- | --- | --- | --- |
   | unset (folded) | 17.9 GB | 87.4 tok/s | 214.4 tok/s | 6.946 |
-  | `head,embed,proj` | 13.6 GB | 40.4 tok/s | 44.3 tok/s | 6.449 |
-  | `all` | **8.2 GB** | 16.0 tok/s | 17.9 tok/s | **6.342** |
+  | `head,embed,proj` | 13.6 GB | 60.0 tok/s | 64.0 tok/s | 6.449 |
+  | `all` | **8.2 GB** | 29.8 tok/s | 34.3 tok/s | **6.342** |
 
   (perplexities on one passage, all three from the same build so they compare; the regression
   guard scores a longer one and reads 9.709 folded against 9.187 for `all`)
 
-  So it is less than half the memory and the best-scoring of the three, at 5.5x the single-stream
-  cost and 12x at concurrency: the packed continuous-batch path cannot drive a ternary projection,
-  so every step falls back to one forward per row, and the FFN trades one fused kernel for four
-  launches on each of 64 layers. That is a real option for a card that cannot hold 18 GB at all,
-  and the wrong default for one that can.
+  So it is less than half the memory and the best-scoring of the three, at 2.9x the single-stream
+  cost and 6.3x at concurrency: the packed continuous-batch path cannot drive a ternary
+  projection, so every step falls back to one forward per row, and the FFN trades one fused kernel
+  for four launches on each of 64 layers. That is a real option for a card that cannot hold 18 GB
+  at all, and the wrong default for one that can.
+- **The ternary GEMV stops paying local memory for every trit.** `pow3[m]` was a function-local
+  array indexed by a value that differs across the lanes of a warp, so it could not stay in
+  registers and each trit extraction took a local-memory load; and the 28-byte block was re-read
+  from global on each of four unrolled passes as scattered, data-dependent single-byte loads. A
+  select chain and one shared-memory staging per block: 1.9x on the full native path (16.0 to 29.8
+  tok/s single-stream, 17.9 to 34.3 at four concurrent), bit-identical, which
+  `gemv_ptq1_gpu_test` checks against a host decoder and against N separate GEMVs.
 - **The Qwen3.8-27B family is recognised by shape** (#1122), not by the presence of an MTP block.
   A derivative without one was served under the default model name of an unrelated 35B MoE, and
   the same flag selects this family's chat-template behaviour and its second stop token (248044),
