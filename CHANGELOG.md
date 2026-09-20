@@ -32,6 +32,35 @@ against the unquantized checkpoint's 4.46 through the same runtime.
 - **Q4_K's `d` is kept a normal fp16** (#1122). It is 1/63 of the weights it describes, so any
   group scale below ~3.8e-3 drove it subnormal and the writer flushed it to zero.
 
+### Fixed
+
+- **A concurrent request could be served from a recurrent state read at the wrong width** (#1122).
+  Continuous-batch decode compacts a session's Gated-DeltaNet state to bf16, packed from the
+  allocation base, the first time it packs that session. Three things then disagreed with it, and
+  all three produce fluent-looking output that degenerates a few tokens in rather than an error:
+  - `launch_qwen36_gdn_ar` took a pointer the caller had already advanced to the layer's slot,
+    while its batched twin took the base pointer and a separate `state_off`. Under the compacted
+    form the slot offset counts bf16 elements, so advancing a `float*` by it landed every slot at
+    twice its byte offset — layer 0 correct, the other 47 GDN layers reading a slot they do not
+    own. Both launchers now take `(state, state_off)`.
+  - The decode CUDA graph bakes which representation its kernels read, but its validity key was
+    only `(attn_mode, sparse, n_splits)`. A request that decodes alone, joins a batch, then
+    outlives it replayed its fp32 capture over a compacted state. The representation is now part
+    of that key, and is parked and restored with the graph.
+  - A packed batch whose rows did not agree on the representation — the shared prefix session, a
+    missing one, a failed conversion, or any row once `SPARKINFER_CB_GDN_STATE_B16=0` is set on a
+    process that had already compacted some — ran one kernel instantiation over both kinds. It is
+    declined now; the per-row fallback consults each session's own flag.
+
+  None of this is specific to the ternary model that exposed it. It is reachable on the default
+  path for every hybrid model at concurrency, because the unbatched kernel serves a row whenever
+  the packed batch declines *or decays to a single row*, which is every batch as its requests
+  finish at different lengths. `gdn_batched_gpu_test` covered a non-zero slot offset and passed
+  throughout, because it only ever ran fp32; it now runs the compacted form too.
+- **A verify decline is reported once, not once per decode step** (#1122). A model the packed path
+  cannot drive declines forever, and the decline sites wrote to stderr unconditionally — two lines
+  per decode token, on top of whatever else the log was meant to show.
+
 ### Serving
 
 - **Ternary weights can be read in their stored form** (#1122), behind
@@ -42,7 +71,12 @@ against the unquantized checkpoint's 4.46 through the same runtime.
   *better* than folding -- PPL 7.89 against 8.07-8.10 -- because the trits are read as they are
   rather than refitted to Q4_K. Decode rotates the activation once per layer before the
   projections fan out across streams; prefill keeps its existing branches by getting ordinary
-  bf16 out of one `dq()` helper, so only the scratch is dense. Off by default.
+  bf16 out of one `dq()` helper, so only the scratch is dense. Off by default, and the default is
+  deliberate: measured on an RTX 5090 it holds 13.6 GB against 17.9 GB and scores better, but it
+  decodes at 40.4 tok/s against 87.9 single-stream, and at four concurrent requests ~42 tok/s
+  aggregate against ~204, because the packed continuous-batch path cannot drive a ternary
+  projection and every step falls back to one forward per row. It is a memory-and-quality trade
+  for a single stream, not a serving default.
 - **The Qwen3.8-27B family is recognised by shape** (#1122), not by the presence of an MTP block.
   A derivative without one was served under the default model name of an unrelated 35B MoE, and
   the same flag selects this family's chat-template behaviour and its second stop token (248044),
