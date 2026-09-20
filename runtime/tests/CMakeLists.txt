@@ -143,8 +143,10 @@ target_include_directories(hadamard_rotate_gpu_test PRIVATE ../include)
 target_link_libraries(hadamard_rotate_gpu_test PRIVATE si_quant CUDA::cudart)
 add_test(NAME hadamard_rotate_gpu_test COMMAND hadamard_rotate_gpu_test)
 
-add_executable(gemv_ptq1_gpu_test gemv_ptq1_gpu_test.cpp ../src/ternary_ptq1.cpp)
+# Links the whole runtime rather than si_gemm alone: si_gemm's other translation units reach
+# across to si_fused, so pulling it in on its own leaves those references undefined.
+add_executable(gemv_ptq1_gpu_test gemv_ptq1_gpu_test.cpp)
 set_target_properties(gemv_ptq1_gpu_test PROPERTIES CXX_STANDARD 17)
 target_include_directories(gemv_ptq1_gpu_test PRIVATE ../include)
-target_link_libraries(gemv_ptq1_gpu_test PRIVATE si_gemm CUDA::cudart)
+target_link_libraries(gemv_ptq1_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME gemv_ptq1_gpu_test COMMAND gemv_ptq1_gpu_test)
