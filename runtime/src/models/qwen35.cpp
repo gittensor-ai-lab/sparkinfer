@@ -186,12 +186,47 @@ struct UnrotateJob {
     // the row it reads -- not a different storage direction. Kept switchable because that
     // distinction is easy to get backwards and a wrong guess looks exactly like a bad format read.
     bool undo_with_forward = false;
+
+    // prism.hadamard.gdn_v_grouped: wherever the GDN v axis is PRODUCED -- attn_qkv's v rows and
+    // the whole of attn_gate -- this checkpoint stores its 48 v-heads transposed, as
+    // [heads_per_group][groups] rather than the [groups][heads_per_group] the architecture reads
+    // them in. ssm_out, which consumes v, is stored in ordinary order, so a loader that ignores
+    // this feeds the gate and the values of one head to another and the layer's output collapses.
+    long v_row0 = -1;        // first row of the v block, negative when the tensor has none
+    long v_rows = 0;         // n_v_heads * head_dim
+    long v_groups = 0;       // ssm.group_count
+    long v_head_dim = 0;
 };
+
+// Destination row -> the row of the stored tensor that belongs there.
+long unrotate_source_row(const UnrotateJob& j, long dst) {
+    if (j.v_row0 < 0 || dst < j.v_row0 || dst >= j.v_row0 + j.v_rows) return dst;
+    const long r = dst - j.v_row0;
+    const long head = r / j.v_head_dim, off = r % j.v_head_dim;
+    const long per_group = (j.v_rows / j.v_head_dim) / j.v_groups;
+    const long g = head / per_group, k = head % per_group;
+    return j.v_row0 + (k * j.v_groups + g) * j.v_head_dim + off;
+}
 
 bool bonsai_rot_forward(const char* env, bool def) {
     const char* v = getenv(env);
     if (!v || !v[0]) return def;
     return v[0] == 'f' || v[0] == 'F';   // "fwd" applies R, anything else applies R^-1
+}
+
+// Marks the v block of a tensor that produces GDN v, so its heads get regrouped on the way in.
+void unrotate_job_set_v_block(UnrotateJob& j, const std::string& name, const Qwen35Config& c) {
+    const long head_dim = c.linear_head_dim, v_rows = (long)c.linear_v_heads * head_dim;
+    if (head_dim <= 0 || c.linear_q_heads <= 0 || c.linear_v_heads <= 0) return;
+    if (c.linear_v_heads % c.linear_q_heads != 0) return;   // no clean group split; leave it alone
+    if (name.find(".attn_gate.weight") != std::string::npos) j.v_row0 = 0;
+    else if (name.find(".attn_qkv.weight") != std::string::npos)
+        j.v_row0 = 2 * (long)c.linear_q_heads * head_dim;   // q and k come first, then v
+    else return;
+    if (j.v_row0 + v_rows > j.rows) { j.v_row0 = -1; return; }
+    j.v_rows = v_rows;
+    j.v_groups = c.linear_q_heads;
+    j.v_head_dim = head_dim;
 }
 
 bool unrotate_job_init(UnrotateJob& j, const GGUFTensor* t, const std::string& name,
@@ -217,7 +252,7 @@ void unrotate_rows_to_bf16(const UnrotateJob& j, long r0, long nr, uint16_t* out
     auto worker = [&](long lo, long hi) {
         std::vector<float> scratch(j.width);
         for (long r = lo; r < hi; ++r) {
-            const size_t blk = (size_t)(r0 + r) * j.width / kPtq1BlockElems;
+            const size_t blk = (size_t)unrotate_source_row(j, r0 + r) * j.width / kPtq1BlockElems;
             ptq1_dequant(src + blk * kPtq1BlockBytes, (size_t)j.width, scratch.data());
             if (j.undo_with_forward)
                 hadamard_rotate_activation(scratch.data(), j.width, j.block, j.sign->data());
@@ -5713,6 +5748,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             UnrotateJob j;
             if (!unrotate_job_init(j, t, name, *sign, had.block_size,
                                    had.inverse_rotated.count(name) != 0)) return nullptr;
+            if (had.gdn_v_grouped) unrotate_job_set_v_block(j, name, s.cfg);
             void* d = unrotate_ternary_to_q4k(j, name, s.stream);
             if (!d) return nullptr;   // never fall back to the rotated bytes: they are not weights
             qtype = 12;               // Q4_K
@@ -5823,6 +5859,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             UnrotateJob j;
             if (!unrotate_job_init(j, t, name, *sign, had.block_size,
                                    had.inverse_rotated.count(name) != 0)) return nullptr;
+            if (had.gdn_v_grouped) unrotate_job_set_v_block(j, name, s.cfg);
             void* d = unrotate_ternary_to_bf16(j, name);
             if (!d) return nullptr;
             if (transpose) {
