@@ -257,6 +257,7 @@ struct Qwen35Model::Impl {
     int graph_prefill_attn_mode = -1;
     bool bench_feedback_graph = false;
     int graph_attn_mode = -1;  // host-side flash-decode dispatch class captured in cu_graph
+    bool graph_state_b16 = false;  // GDN state representation baked into cu_graph
     // Separate decode graph for DFlash verify (sample=true, dflash_capture=true). The normal
     // cu_graph/cu_exec can't be reused here because it carries the extra per-layer hidden
     // captures. Their destination row varies per call, which is handled the same way the graph
@@ -319,6 +320,11 @@ struct Qwen35Model::Impl {
         int attn_mode = -1;
         bool sparse = false;
         int n_splits = 0;
+        // Which GDN state representation the capture's kernels read. Parked with the graph for
+        // the same reason n_splits is: a session parked on the fp32 form can be compacted while
+        // it is parked, and restoring the graph without the value it was captured at would
+        // replay fp32 kernels over a bf16 state.
+        bool state_b16 = false;
     };
     std::unordered_map<uint64_t, ParkedDecodeGraph> parked_graphs;
     // Bounded purely as a leak backstop -- close_session() drops a session's entry, so in steady
@@ -1312,6 +1318,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (s.graph_ready && s.graph_sparse != sparse_on) {
         cu(cudaGraphExecDestroy(s.cu_exec), "sparse recapture destroy exec");
         cu(cudaGraphDestroy(s.cu_graph), "sparse recapture destroy graph");
+        s.cu_exec = nullptr; s.cu_graph = nullptr; s.graph_ready = false;
+    }
+    // The capture bakes WHICH GDN state representation its kernels read (launch_qwen36_gdn_ar's
+    // state_compact_b16 selects a different kernel instantiation). decode_packed compacts a
+    // session's state to bf16 the first time it packs one, which can land between two of that
+    // session's own decode steps -- and a request that decodes alone, joins a batch, then outlives
+    // it hits exactly that order. Replaying the fp32 capture over the compacted state reads every
+    // element at the wrong width. The dflash verify graph needs no equivalent: decode_packed is
+    // the only compactor and DSpark's verify never sets packed_rows, so its sessions stay fp32.
+    if (s.graph_ready && s.graph_state_b16 != s.active_lin_state_b16) {
+        cu(cudaGraphExecDestroy(s.cu_exec), "gdn state recapture destroy exec");
+        cu(cudaGraphDestroy(s.cu_graph), "gdn state recapture destroy graph");
         s.cu_exec = nullptr; s.cu_graph = nullptr; s.graph_ready = false;
     }
     if (s.dflash_graph_ready && s.dflash_graph_sparse != sparse_on) {
@@ -2463,6 +2481,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         s.graph_ready = true;
         s.graph_attn_mode = attn_graph_mode;
         s.graph_sparse = sparse_on;
+        s.graph_state_b16 = s.active_lin_state_b16;
         static int graph_dbg = -1;
         if (graph_dbg < 0) {
             const char* e = getenv("SPARKINFER_GRAPH_DEBUG");
@@ -3737,6 +3756,19 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         packed_state_b16 = all_b16;
     }
 
+    // One kernel instantiation serves the whole batch, so every row in it must hold the same
+    // representation. A row that could not be compacted -- the shared prefix session, a missing
+    // one, a conversion that failed, or any row at all once SPARKINFER_CB_GDN_STATE_B16=0 is set
+    // on a process that had already compacted some -- leaves the batch MIXED, and running it
+    // either way reads half the rows at the wrong width. Decline instead: the caller's per-row
+    // fallback consults each session's own flag and is correct for both kinds.
+    if (!packed_state_b16 && needs_linear_state(s.cfg)) {
+        for (int i = 0; i < n; i++) {
+            auto sit = s.sessions.find(seq_ids[i]);
+            if (sit != s.sessions.end() && sit->second.lin_state_b16) return false;
+        }
+    }
+
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, seq_ids[0],
                           h_states[0], h_convs[0], s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
@@ -3778,6 +3810,7 @@ void Qwen35Model::activate_session(uint64_t seq_id) {
         slot.exec = s.cu_exec;
         slot.attn_mode = s.graph_attn_mode;
         slot.sparse = s.graph_sparse;
+        slot.state_b16 = s.graph_state_b16;
         slot.n_splits = s.n_splits;
         s.cu_graph = nullptr;
         s.cu_exec = nullptr;
@@ -3834,6 +3867,7 @@ void Qwen35Model::activate_session(uint64_t seq_id) {
         s.graph_ready = s.cu_exec != nullptr;
         s.graph_attn_mode = parked->second.attn_mode;
         s.graph_sparse = parked->second.sparse;
+        s.graph_state_b16 = parked->second.state_b16;
         s.n_splits = parked->second.n_splits;
         s.parked_graphs.erase(parked);
     }
