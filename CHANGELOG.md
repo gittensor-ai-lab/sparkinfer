@@ -3,6 +3,35 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased]
+
+**Ternary-Bonsai-2-27B loads and runs**, a 1.75-bit ternary quantization of Qwen3.8-27B whose
+weights live in a rotated basis. Teacher-forced over 107 positions of prose it scores PPL 8.07
+against the unquantized checkpoint's 4.46 through the same runtime.
+
+### Models
+
+- **PTQ1_0, the ternary weight format** (#1122). Trits packed 128 to a 28-byte block with one FP16
+  scale, read in ggml's TQ1_0 order: carrier bytes are walked in two runs and each emits its trits
+  position-major. Reading them carrier-major decodes every value correctly and puts every one in
+  the wrong place, which no round-trip test can see because it packs with the order it unpacks.
+- **The checkpoint's Hadamard rotation is folded into the weights at load** (#1122). Each rotated
+  row is stored as `R.W[o]`; un-rotating with `R^-1 = diag(s).H` is the same arithmetic moved to
+  the other operand and leaves an ordinary model, so no graph needs a rotation inserted and every
+  existing kernel applies unchanged. `token_embd` un-rotates like the rest — the metadata's
+  `inverse_weight_names` describes a runtime obligation, not a storage direction.
+- **The GDN v heads are regrouped** (#1122). Everything producing a v head — `attn_qkv`'s v rows,
+  `attn_gate`, `ssm_conv1d`'s v channels, `ssm_a`, `ssm_dt.bias`, `ssm_alpha`, `ssm_beta` — stores
+  its 48 heads transposed, while `ssm_out`, which consumes them, does not. The loader puts the
+  producers back in the architecture's order, and `gdn_qh_block` now follows from the GGUF side as
+  it already did from the safetensors side: that pairing was cyclic for every GGUF of this family,
+  so each v head was driven by the wrong q/k head.
+- **BF16 tensors are sized and dequantized** (#1122). Type 30 had no entry in the GGUF block table,
+  so every BF16 tensor sized to nothing and surfaced as a device allocation failing on an unrelated
+  name much later.
+- **Q4_K's `d` is kept a normal fp16** (#1122). It is 1/63 of the weights it describes, so any
+  group scale below ~3.8e-3 drove it subnormal and the writer flushed it to zero.
+
 ## [0.5.10] — 2026-09-17
 
 **An assistant message can be sent back exactly as it arrived.** A response carries `reasoning`
