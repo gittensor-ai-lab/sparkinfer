@@ -32,6 +32,19 @@ against the unquantized checkpoint's 4.46 through the same runtime.
 - **Q4_K's `d` is kept a normal fp16** (#1122). It is 1/63 of the weights it describes, so any
   group scale below ~3.8e-3 drove it subnormal and the writer flushed it to zero.
 
+### Serving
+
+- **Ternary weights can be read in their stored form** (#1122), behind
+  `SPARKINFER_BONSAI_NATIVE` (`head`, `embed`, or `all`). Folding the rotation into the weights is
+  exact but leaves them dense, so a 5.95 GB checkpoint occupies ~15 GB; reading the 28-byte blocks
+  directly costs 0.21875 bytes/weight and rotates the activation instead. The LM head and the
+  embedding table take that path today, for byte-identical greedy output at 15.7 GB against the
+  folded path's 18.4 GB. Off by default while the remaining tensors follow.
+- **The Qwen3.8-27B family is recognised by shape** (#1122), not by the presence of an MTP block.
+  A derivative without one was served under the default model name of an unrelated 35B MoE, and
+  the same flag selects this family's chat-template behaviour and its second stop token (248044),
+  which GGUF metadata cannot carry beside the one `eos_token_id` it has room for.
+
 ## [0.5.10] — 2026-09-17
 
 **An assistant message can be sent back exactly as it arrived.** A response carries `reasoning`
