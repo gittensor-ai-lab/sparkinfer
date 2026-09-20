@@ -85,9 +85,12 @@ against the unquantized checkpoint's 4.46 through the same runtime.
 
   | `SPARKINFER_BONSAI_NATIVE` | VRAM | single-stream | 4 concurrent | PPL |
   | --- | --- | --- | --- | --- |
-  | unset (folded) | 17.9 GB | 87.4 tok/s | 214.4 tok/s | 9.709 |
-  | `head,embed,proj` | 13.6 GB | 40.4 tok/s | 44.3 tok/s | 9.401 |
-  | `all` | **8.2 GB** | 16.0 tok/s | 17.9 tok/s | **9.187** |
+  | unset (folded) | 17.9 GB | 87.4 tok/s | 214.4 tok/s | 6.946 |
+  | `head,embed,proj` | 13.6 GB | 40.4 tok/s | 44.3 tok/s | 6.449 |
+  | `all` | **8.2 GB** | 16.0 tok/s | 17.9 tok/s | **6.342** |
+
+  (perplexities on one passage, all three from the same build so they compare; the regression
+  guard scores a longer one and reads 9.709 folded against 9.187 for `all`)
 
   So it is less than half the memory and the best-scoring of the three, at 5.5x the single-stream
   cost and 12x at concurrency: the packed continuous-batch path cannot drive a ternary projection,
