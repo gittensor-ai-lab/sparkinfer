@@ -77,7 +77,11 @@ cd "$BOX_REPO" || exit 1
 git fetch -q origin "$BONSAI_REF" && git checkout -q FETCH_HEAD || { echo "  checkout failed"; exit 1; }
 echo "  at $(git log --oneline -1)"
 cd build && cmake . >/dev/null 2>&1
-nice -n 5 make -j"$(nproc)" sparkinfer_server bonsai_inspect qwen3_gguf_score qwen3_gguf_generate 2>&1 \
+# NOT -j$(nproc). The box has 64 cores and one 150 GB filesystem that runs near full, and each
+# parallel nvcc stages a few hundred MB of intermediates in /tmp: a -j64 build transiently wants
+# more scratch than the disk has, and fails as "cc1plus: cannot open <tmpxft file>" in whichever
+# translation units lost the race -- which reads like a compile error in files nobody touched.
+nice -n 5 make -j"${BONSAI_BUILD_JOBS:-12}" sparkinfer_server bonsai_inspect qwen3_gguf_score qwen3_gguf_generate 2>&1 \
   | grep -E ' error|Error [0-9]' | head -5
 export LD_LIBRARY_PATH="$BOX_REPO/build/runtime:$BOX_REPO/build/kernels:$BOX_REPO/build/moe:${LD_LIBRARY_PATH:-}"
 cd "$BOX_REPO"
