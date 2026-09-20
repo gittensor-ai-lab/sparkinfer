@@ -1670,14 +1670,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                                  c.rms_eps, st);
             }
             if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_ab, 0);
-            float* layer_state = s.lin_state +
-                (size_t)gdn_state_slot(c, L) * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+            // The layer's slot is handed over as an OFFSET, not folded into the pointer: under a
+            // compacted state it counts bf16 elements, and only the kernel knows that. Folding it
+            // in here is what made every GDN layer past the first read its slot at twice the right
+            // byte offset the moment a session had been through decode_packed.
+            const size_t state_off = (size_t)gdn_state_slot(c, L) * c.linear_v_heads *
+                                     c.linear_head_dim * c.linear_head_dim;
             // The compacted-state flag belongs to the ACTIVE session: a packed batch that declines
             // (a tail chunk of one row) falls back to this path for rows whose state has already
             // been converted, so the two must agree on the representation.
             kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
                                           s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
-                                          layer_state, s.lin_gdn,
+                                          s.lin_state, state_off, s.lin_gdn,
                                           c.linear_q_heads, c.linear_v_heads,
                                           c.linear_head_dim, c.gdn_qh_block, st,
                                           s.active_lin_state_b16);
