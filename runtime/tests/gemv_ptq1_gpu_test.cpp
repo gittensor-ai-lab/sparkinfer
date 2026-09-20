@@ -140,12 +140,17 @@ void test_a_single_trit_lands_where_the_host_puts_it() {
     }
 }
 
-void test_a_batch_agrees_with_one_activation_at_a_time() {
-    // Prefill projects N tokens at once. The batched launch has to give exactly what N separate
-    // GEMVs give, or prefill and decode disagree about the same weights -- which is the shape of
-    // bug that shows up as a model that generates fluently and scores badly.
+void test_a_batch_agrees_with_one_activation_at_a_time(int batch) {
+    // A packed decode step projects N tokens at once. The batched launch has to give exactly what
+    // N separate GEMVs give, or the packed path and the single-row path disagree about the same
+    // weights -- which is the shape of bug that shows up as a model that generates fluently and
+    // scores badly.
+    //
+    // Driven across batch widths on purpose: the launcher picks a register-width instantiation by
+    // size and chunks anything wider, so 1, the boundaries either side of each width, and a batch
+    // that spills into a second chunk are all different code paths to the same required answer.
     using namespace sparkinfer;
-    const int rows = 19, k = 384, batch = 5;
+    const int rows = 19, k = 384;
     const int blocks_per_row = k / kPtq1BlockElems;
 
     std::vector<uint8_t> w((size_t)rows * blocks_per_row * kPtq1BlockBytes);
@@ -181,7 +186,14 @@ void test_a_batch_agrees_with_one_activation_at_a_time() {
         cudaDeviceSynchronize();
         std::vector<uint16_t> one(rows);
         cudaMemcpy(one.data(), dy1, one.size() * 2, cudaMemcpyDeviceToHost);
-        for (int r = 0; r < rows; ++r) CHECK(hy[(size_t)b * rows + r] == one[r]);
+        for (int r = 0; r < rows; ++r) {
+            CHECK(hy[(size_t)b * rows + r] == one[r]);
+            if (hy[(size_t)b * rows + r] != one[r]) {
+                std::printf("  batch=%d row=%d lane=%d: batched %u, single %u\n",
+                            batch, r, b, hy[(size_t)b * rows + r], one[r]);
+                break;
+            }
+        }
     }
     cudaFree(dx); cudaFree(dw); cudaFree(dy); cudaFree(dy1);
 }
@@ -194,7 +206,8 @@ int main() {
     }
     test_gemv_matches_the_host_decoder();
     test_a_single_trit_lands_where_the_host_puts_it();
-    test_a_batch_agrees_with_one_activation_at_a_time();
+    for (int batch : {1, 2, 3, 4, 5, 7, 8, 9, 16})
+        test_a_batch_agrees_with_one_activation_at_a_time(batch);
     std::printf("gemv_ptq1_gpu_test: %s\n", failures ? "FAILURES" : "OK");
     return failures ? 1 : 0;
 }

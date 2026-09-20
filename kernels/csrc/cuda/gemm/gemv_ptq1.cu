@@ -105,6 +105,68 @@ __global__ void gemv_ptq1_kernel(const __nv_bfloat16* __restrict__ x,
     if (lane == 0) store_out<OutT>(y, row, acc);
 }
 
+// A batch of activations against ONE weight read. The previous batched launch put the batch on
+// blockIdx.y, which made every activation an independent block: it re-read and re-decoded the
+// whole weight matrix per row, so it was N GEMVs with fewer launches and no sharing at all. Here
+// a warp owns a weight row for the whole batch, so each trit is fetched and decoded once and then
+// multiplied into every activation -- the weight traffic and the unpacking are paid once rather
+// than BATCH times, which is the entire reason a packed decode step is cheaper than N single ones.
+//
+// Per row the accumulation is unchanged: the same four per-lane terms in the same order, the same
+// `acc += scale * part`, the same shuffle reduction. That is what keeps a packed step bit-identical
+// to the N separate steps it stands in for -- gemv_ptq1_gpu_test asserts exactly that.
+template <typename OutT, int BMAX>
+__global__ void gemm_ptq1_kernel(const __nv_bfloat16* __restrict__ x,
+                                 const unsigned char* __restrict__ w,
+                                 OutT* __restrict__ y, int n_rows, int k, int batch) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kWarpsPerCta + warp;
+    if (row >= n_rows) return;
+
+    const int n_blocks = k / kBlockElems;
+    const unsigned char* wrow = w + (size_t)row * n_blocks * kBlockBytes;
+
+    __shared__ unsigned char sblk[kWarpsPerCta][kBlockBytes];
+    unsigned char* myblk = sblk[warp];
+
+    float acc[BMAX];
+#pragma unroll
+    for (int j = 0; j < BMAX; ++j) acc[j] = 0.0f;
+
+    for (int b = 0; b < n_blocks; ++b) {
+        const unsigned char* qs = wrow + (size_t)b * kBlockBytes;
+        if (lane < kBlockBytes) myblk[lane] = qs[lane];
+        __syncwarp();
+        const __half scale_h = *reinterpret_cast<const __half*>(myblk + kBlockBytes - 2);
+        const float scale = __half2float(scale_h);
+
+        float part[BMAX];
+#pragma unroll
+        for (int j = 0; j < BMAX; ++j) part[j] = 0.0f;
+#pragma unroll
+        for (int t = 0; t < kBlockElems / 32; ++t) {
+            const int idx = lane + t * 32;
+            // Decoded ONCE, then applied to every activation in the batch.
+            const float tv = (float)ptq1_trit(myblk, idx);
+            const __nv_bfloat16* xt = x + (size_t)b * kBlockElems + idx;
+#pragma unroll
+            for (int j = 0; j < BMAX; ++j)
+                if (j < batch) part[j] += tv * __bfloat162float(xt[(size_t)j * k]);
+        }
+#pragma unroll
+        for (int j = 0; j < BMAX; ++j) acc[j] += scale * part[j];
+        __syncwarp();
+    }
+
+#pragma unroll
+    for (int j = 0; j < BMAX; ++j) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc[j] += __shfl_down_sync(0xffffffffu, acc[j], off);
+        if (lane == 0 && j < batch) store_out<OutT>(y + (size_t)j * n_rows, row, acc[j]);
+    }
+}
+
 // Embedding lookup and un-rotation in one pass, keeping float across the transform. Decoding to
 // bf16 first and rotating afterwards costs real accuracy -- the Hadamard sums 1024 values, so it
 // sums 1024 already-rounded ones -- which showed up as PPL 8.11 against the host path's 8.07.
@@ -202,10 +264,28 @@ template <typename OutT>
 void launch_typed(const void* x, const void* w, OutT* y, int n_rows, int k, int batch,
                   cudaStream_t stream) {
     if (n_rows <= 0 || k <= 0 || batch <= 0 || k % kBlockElems != 0) return;
-    const dim3 grid((unsigned)((n_rows + kWarpsPerCta - 1) / kWarpsPerCta), (unsigned)batch);
-    gemv_ptq1_kernel<OutT><<<grid, kWarpsPerCta * 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const unsigned char*>(w),
-        y, n_rows, k);
+    const auto* xb = reinterpret_cast<const __nv_bfloat16*>(x);
+    const auto* wb = reinterpret_cast<const unsigned char*>(w);
+    const dim3 grid((unsigned)((n_rows + kWarpsPerCta - 1) / kWarpsPerCta), 1u);
+    if (batch == 1) {
+        gemv_ptq1_kernel<OutT><<<grid, kWarpsPerCta * 32, 0, stream>>>(xb, wb, y, n_rows, k);
+        return;
+    }
+    // Chunked by the widest instantiation rather than templated on every batch: a chunk computes
+    // exactly the rows it holds, in the same order, so chunking changes nothing a caller can see.
+    // Registers bound the chunk -- acc[] and part[] are both BMAX floats per lane.
+    constexpr int kBatchChunk = 8;
+    for (int b0 = 0; b0 < batch; b0 += kBatchChunk) {
+        const int m = batch - b0 < kBatchChunk ? batch - b0 : kBatchChunk;
+        const __nv_bfloat16* xc = xb + (size_t)b0 * k;
+        OutT* yc = y + (size_t)b0 * n_rows;
+        if (m <= 2)
+            gemm_ptq1_kernel<OutT, 2><<<grid, kWarpsPerCta * 32, 0, stream>>>(xc, wb, yc, n_rows, k, m);
+        else if (m <= 4)
+            gemm_ptq1_kernel<OutT, 4><<<grid, kWarpsPerCta * 32, 0, stream>>>(xc, wb, yc, n_rows, k, m);
+        else
+            gemm_ptq1_kernel<OutT, 8><<<grid, kWarpsPerCta * 32, 0, stream>>>(xc, wb, yc, n_rows, k, m);
+    }
 }
 
 }  // namespace
