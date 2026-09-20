@@ -181,10 +181,11 @@ struct Qwen35Weights {
     const void* final_norm   = nullptr;  // [hidden]
     const void* lm_head      = nullptr;  // [hidden, vocab]  (pre-transposed)
     int lm_head_type = 0;                 // 0 = bf16; else ggml type -> on-read quantized GEMV
-    // The checkpoint's OWN NVFP4 lm_head in the block-scaled GEMM's operand layout, kept beside
-    // the Q4_K copy rather than replacing it: AR decode and the speculative verify keep reading
+    // Packed-decode NVFP4 lm_head in the block-scaled GEMM's operand layout, kept beside the
+    // Q4_K copy rather than replacing it: AR decode and the speculative verify keep reading
     // lm_head above byte for byte, and only a packed decode wide enough to want a GEMM reads
-    // these. Built only when the checkpoint actually ships an NVFP4 head and VRAM allows.
+    // these. Built from the checkpoint's own NVFP4 bytes when they exist, otherwise packed
+    // from the Q4_K refit (compressed-tensors ships the head as FP8). VRAM-gated; releasable.
     const void* lm_head_fp4 = nullptr; const void* lm_head_fp4_sf = nullptr;
     float lm_head_fp4_alpha = 1.f;
     std::vector<Qwen35LayerWeights> layers;

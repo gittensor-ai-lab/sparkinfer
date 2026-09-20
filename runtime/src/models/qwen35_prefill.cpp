@@ -5274,9 +5274,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // is the draft's block size, 7 here): AR decode, the verify, prefill and every accuracy and
     // acceptance gate keep reading the Q4_K head byte for byte. This changes the wide packed
     // decode path only.
+    //
+    // Eight, not sixteen: the A-quantizer needs m % 8 == 0, and the transposed f32 tile is the
+    // one that made the FFN/GDN GEMMs pay at eight rows (cb-decode@c8 558.7 -> 587.4). The head
+    // used the same tile at sixteen and never tried eight -- c8 stayed on the Q4_K MMA even
+    // after the operand existed. SPARKINFER_Q38_HEAD_GEMM_MIN_ROWS=16 restores that floor.
     static const int kHeadGemmMinRows = [] {
         const char* e = getenv("SPARKINFER_Q38_HEAD_GEMM_MIN_ROWS");
-        const int v = e ? atoi(e) : 16;
+        const int v = e ? atoi(e) : 8;
         return v < 1 ? 1 : v;
     }();
     if (packed && N >= kHeadGemmMinRows && !(N & 7) && s.w.lm_head_fp4 && s.w.lm_head_fp4_sf &&

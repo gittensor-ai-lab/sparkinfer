@@ -3162,6 +3162,9 @@ void Qwen35Model::release_lm_head_fp4() {
     if (s.lm_head_fp4_sf_buf) cudaFree(s.lm_head_fp4_sf_buf);
     s.lm_head_fp4_payload = nullptr;
     s.lm_head_fp4_sf_buf = nullptr;
+    // Packed verify graphs bake the operand's device pointers. Drop them so a later packed
+    // width recaptures on the Q4_K MMA head rather than launching at freed addresses.
+    dflash_release_verify_cache();
 }
 
 int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob,
@@ -3171,7 +3174,7 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     // on a 32-GB card the two do not both fit: measured at ctx=32768 the arena wants 3.6 GB and
     // the head operand's 0.81 GB is enough to make it fail, which drops the WHOLE prompt onto the
     // token loop -- a ~30x regression on a no-regression floor, to buy a win that only exists at
-    // packed widths >= 16. So hand it back before sizing the arena rather than after failing to.
+    // packed widths >= 8. So hand it back before sizing the arena rather than after failing to.
     //
     // A load-time VRAM check cannot make this call: measured free-at-load is 25.2 GB for the 32k
     // DSpark harness against 22.9 GB for the concurrency harness, i.e. the run that must NOT keep
@@ -3626,6 +3629,28 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     if (n < 1 || n > kQwen35MaxPackedRows) return false;
     if (!s.cfg.hybrid || !s.gguf) return false;
     std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+
+    // The NVFP4 head operand is 0.67-0.81 GB that a 32-session pool may need more than a
+    // packed GEMM does. Load-time free is the wrong signal (the KV cache is taken afterwards),
+    // so give it back here when the card is already under the floor rather than letting the
+    // packed graph capture fail. SPARKINFER_Q38_HEAD_NVFP4_MIN_FREE_MB=0 keeps it to the end.
+    if (s.w.lm_head_fp4) {
+        static const size_t min_free_mb = [] {
+            const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_MIN_FREE_MB");
+            const long v = e ? atol(e) : 1536;
+            return (size_t)(v < 0 ? 0 : v);
+        }();
+        if (min_free_mb) {
+            size_t hfree = 0, htotal = 0;
+            cudaMemGetInfo(&hfree, &htotal);
+            if (hfree < min_free_mb * 1024ull * 1024ull) {
+                fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released for packed decode "
+                        "(free %.0f MB < %zu MB floor)\n",
+                        hfree / 1048576.0, min_free_mb);
+                release_lm_head_fp4();
+            }
+        }
+    }
 
     // Resolve each row's per-session buffers. A row whose session is missing (or never got its
     // hybrid state) cannot be packed -- decline the whole batch rather than silently decode it
@@ -7113,41 +7138,52 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     s.w.lm_head = requant_q4k(dequant_any("lm_head", c.vocab, H), (long)c.vocab * H,
                               s.w.lm_head_type);
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
-    // ...and, when the checkpoint ships the head as NVFP4, keep its own bytes as well, in the
-    // block-scaled GEMM's operand layout. Every other big tensor already went this way (the FFN
-    // and, since the attention block above, q/k/v/o); the head was the last one still served only
-    // from a Q4_K refit of the checkpoint's own values.
+    // Packed decode's NVFP4 lm_head operand, beside the Q4_K copy rather than instead of it:
+    // AR decode and the speculative verify keep reading lm_head byte for byte, so acceptance,
+    // losslessness and the accuracy gate are untouched. Two sources, same layout:
     //
-    // BESIDE the Q4_K copy, not instead of it: AR decode and the speculative verify keep reading
-    // lm_head byte for byte, so acceptance, losslessness and the accuracy gate are untouched.
-    // keep_nvfp4 aliases the GEMM's data operand onto the payload it just uploaded, so the only
-    // NEW residency beyond that payload is the re-laid-out scale copy -- 0.0625 B/weight, 79 MB
-    // at this head's 248320x5120.
+    //   1. The checkpoint's own NVFP4 bytes, when it ships them (ModelOpt). keep_nvfp4 aliases
+    //      the GEMM's data operand onto the payload it just uploaded; the only NEW residency
+    //      is the re-laid-out scale copy -- 0.0625 B/weight, 79 MB at 248320x5120.
+    //   2. The Q4_K refit, when it does not (compressed-tensors / unsloth: the head is FP8).
+    //      launch_prefill_nvfp4_quant_b_q4k is the same converter the streamed FFN/o-proj
+    //      already uses, so the operand is the one CUTLASS already knows. Without this the
+    //      Q4_K MMA head is the single largest kernel left in a wide packed step -- 8.9% of
+    //      the c16 wall and 15.5% at c32 -- because the GEMM arm never had a B operand.
     //
-    // Gated on free VRAM with a reserve, decided here and once: this model already peaks near the
-    // card at long context, and the batched-prefill scratch arena is allocated later and per run.
-    // Spending the arena's headroom on a decode-only operand would trade a no-regression floor
-    // (prefill at 32k drops to the token loop when the arena cannot be carved) for a win that only
-    // exists at packed widths >= 16 -- which is a trade in the wrong direction, so when the
-    // reserve is not clear this simply stays off and the head keeps the path it had.
-    // SPARKINFER_Q38_HEAD_NVFP4=0 disables it; _RESERVE_MB tunes the reserve.
+    // Gated on free VRAM with a reserve, decided here and once: this model already peaks near
+    // the card at long context, and the batched-prefill scratch arena is allocated later and
+    // per run. Spending the arena's headroom on a decode-only operand would trade a
+    // no-regression floor (prefill at 32k drops to the token loop when the arena cannot be
+    // carved) for a packed-only win, so when the reserve is not clear this stays off.
+    // SPARKINFER_Q38_HEAD_NVFP4=0 disables both arms; _FROM_Q4K=0 keeps only the native one;
+    // _RESERVE_MB tunes the reserve. The operand is handed back before a long batched prefill
+    // (see release_lm_head_fp4 / SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS).
     static const bool head_fp4_on = [] {
         const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4");
         return !(e && e[0] == '0');
     }();
+    static const bool head_fp4_from_q4k = [] {
+        const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_FROM_Q4K");
+        return !(e && e[0] == '0');
+    }();
+    static const size_t head_fp4_reserve_mb = [] {
+        const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_RESERVE_MB");
+        const long v = e ? atol(e) : 3072;
+        return (size_t)(v < 0 ? 0 : v);
+    }();
     if (head_fp4_on) {
+        auto head_fp4_fits = [&](size_t need, size_t& hfree) -> bool {
+            size_t htotal = 0;
+            cudaMemGetInfo(&hfree, &htotal);
+            return hfree > need + head_fp4_reserve_mb * 1024ull * 1024ull;
+        };
         NvFp4Src head_probe{};
         if (nvfp4_src("lm_head", c.vocab, H, head_probe)) {
             const size_t need = (size_t)c.vocab * H * 5 / 8 +                    // payload
                                 kernels::prefill_nvfp4_scale_bytes_b(c.vocab, H); // SFB copy
-            static const size_t reserve_mb = [] {
-                const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_RESERVE_MB");
-                const long v = e ? atol(e) : 3072;
-                return (size_t)(v < 0 ? 0 : v);
-            }();
-            size_t hfree = 0, htotal = 0;
-            cudaMemGetInfo(&hfree, &htotal);
-            if (hfree > need + reserve_mb * 1024ull * 1024ull) {
+            size_t hfree = 0;
+            if (head_fp4_fits(need, hfree)) {
                 const size_t owned_before = s.owned.size();
                 keep_nvfp4("lm_head", c.vocab, H, &s.w.lm_head_fp4, &s.w.lm_head_fp4_sf,
                            s.w.lm_head_fp4_alpha);
@@ -7163,10 +7199,44 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             if (!s.w.lm_head_fp4)
                 fprintf(stderr, "[compressed-tensors] NVFP4 lm_head not kept "
                         "(free %.2f GB, need %.2f GB + %zu MB reserve)\n",
-                        hfree / 1073741824.0, need / 1073741824.0, reserve_mb);
+                        hfree / 1073741824.0, need / 1073741824.0, head_fp4_reserve_mb);
             else
                 fprintf(stderr, "[compressed-tensors] NVFP4 lm_head kept for wide packed decode "
                         "(%.2f GB)\n", need / 1073741824.0);
+        }
+        // Compressed-tensors (unsloth) ships the head as FP8, so the native arm above is a
+        // quiet miss and every packed width stayed on the Q4_K MMA. Pack the GEMM's B
+        // operand from that Q4_K copy -- same converter the streamed FFN already uses, same
+        // releasable lifetime as the native operand. SPARKINFER_Q38_HEAD_NVFP4_FROM_Q4K=0
+        // restores the miss.
+        if (!s.w.lm_head_fp4 && head_fp4_from_q4k && s.w.lm_head_type == 12 &&
+            kernels::prefill_nvfp4_supported(128, c.vocab, H)) {
+            const size_t data_b = kernels::prefill_nvfp4_data_bytes(c.vocab, H);
+            const size_t sf_b = kernels::prefill_nvfp4_scale_bytes_b(c.vocab, H);
+            const size_t need = data_b + sf_b;
+            size_t hfree = 0;
+            void* data = nullptr;
+            void* sf = nullptr;
+            if (head_fp4_fits(need, hfree) &&
+                cudaMalloc(&data, data_b) == cudaSuccess &&
+                cudaMalloc(&sf, sf_b) == cudaSuccess &&
+                kernels::launch_prefill_nvfp4_quant_b_q4k(
+                    s.w.lm_head, data, sf, c.vocab, 0, c.vocab, H, s.stream) &&
+                cudaStreamSynchronize(s.stream) == cudaSuccess) {
+                s.lm_head_fp4_payload = data;
+                s.lm_head_fp4_sf_buf = sf;
+                s.w.lm_head_fp4 = data;
+                s.w.lm_head_fp4_sf = sf;
+                s.w.lm_head_fp4_alpha = 1.f;
+                fprintf(stderr, "[compressed-tensors] NVFP4 lm_head packed from Q4_K for "
+                        "wide packed decode (%.2f GB)\n", need / 1073741824.0);
+            } else {
+                if (data) cudaFree(data);
+                if (sf) cudaFree(sf);
+                fprintf(stderr, "[compressed-tensors] NVFP4 lm_head not packed from Q4_K "
+                        "(free %.2f GB, need %.2f GB + %zu MB reserve)\n",
+                        hfree / 1073741824.0, need / 1073741824.0, head_fp4_reserve_mb);
+            }
         }
     }
 
