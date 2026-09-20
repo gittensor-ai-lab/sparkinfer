@@ -78,6 +78,18 @@ int main(int argc, char** argv) {
             }
             shapes[family] = buf;
         }
+        if (argc > 3) {   // a substring filter prints real names instead of collapsed families
+            std::map<std::string, std::string> hits;
+            for (const auto& kv : gguf.tensors()) {
+                if (kv.first.find(argv[3]) == std::string::npos) continue;
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "[%ld, %ld] type %d",
+                              kv.second.dims[0], kv.second.dims[1], kv.second.ggml_type);
+                hits[kv.first] = buf;
+            }
+            for (const auto& kv : hits) std::printf("  %-40s %s\n", kv.first.c_str(), kv.second.c_str());
+            return 0;
+        }
         for (const auto& kv : by_type)
             std::printf("type %-4d %5ld tensors  %7.2f GB\n", kv.first, kv.second.first, kv.second.second);
         for (const auto& kv : shapes)

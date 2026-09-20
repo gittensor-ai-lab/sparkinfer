@@ -227,10 +227,22 @@ long unrotate_rows_per_chunk(const UnrotateJob& j) {
     return std::max<long>(1, (64L << 20) / (j.width * 2));
 }
 
+// Reports a CUDA failure against the tensor that caused it. Without this an error here surfaces
+// much later as an unrelated tensor "missing", because every subsequent cudaMalloc inherits it.
+bool unrotate_cuda_ok(const char* what, const std::string& name) {
+    const cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) return true;
+    fprintf(stderr, "[bonsai] %s: %s failed: %s\n", name.c_str(), what, cudaGetErrorString(e));
+    return false;
+}
+
 // Un-rotated weight -> bf16 on device, for the embedding table.
-void* unrotate_ternary_to_bf16(const UnrotateJob& j) {
+void* unrotate_ternary_to_bf16(const UnrotateJob& j, const std::string& name) {
     void* dev = nullptr;
-    if (cudaMalloc(&dev, (size_t)j.t->n_values * 2) != cudaSuccess) return nullptr;
+    if (cudaMalloc(&dev, (size_t)j.t->n_values * 2) != cudaSuccess) {
+        unrotate_cuda_ok("bf16 alloc", name);
+        return nullptr;
+    }
     const long step = unrotate_rows_per_chunk(j);
     std::vector<uint16_t> host((size_t)std::min(j.rows, step) * j.width);
     for (long r0 = 0; r0 < j.rows; r0 += step) {
@@ -238,6 +250,7 @@ void* unrotate_ternary_to_bf16(const UnrotateJob& j) {
         unrotate_rows_to_bf16(j, r0, nr, host.data());
         if (cudaMemcpy(static_cast<char*>(dev) + (size_t)r0 * j.width * 2, host.data(),
                        (size_t)nr * j.width * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+            unrotate_cuda_ok("bf16 upload", name);
             cudaFree(dev);
             return nullptr;
         }
@@ -246,14 +259,21 @@ void* unrotate_ternary_to_bf16(const UnrotateJob& j) {
 }
 
 // Un-rotated weight -> Q4_K on device, for everything that stays quantized.
-void* unrotate_ternary_to_q4k(const UnrotateJob& j, cudaStream_t stream) {
+void* unrotate_ternary_to_q4k(const UnrotateJob& j, const std::string& name, cudaStream_t stream) {
     void* q4k = nullptr;
     const size_t q4k_bytes = (size_t)(j.t->n_values / kQ4KBlockElems) * kQ4KBlockBytes;
-    if (cudaMalloc(&q4k, q4k_bytes) != cudaSuccess) return nullptr;
+    if (cudaMalloc(&q4k, q4k_bytes) != cudaSuccess) {
+        unrotate_cuda_ok("q4k alloc", name);
+        return nullptr;
+    }
     const long step = unrotate_rows_per_chunk(j);
     std::vector<uint16_t> host((size_t)std::min(j.rows, step) * j.width);
     void* dev_bf16 = nullptr;
-    if (cudaMalloc(&dev_bf16, host.size() * 2) != cudaSuccess) { cudaFree(q4k); return nullptr; }
+    if (cudaMalloc(&dev_bf16, host.size() * 2) != cudaSuccess) {
+        unrotate_cuda_ok("staging alloc", name);
+        cudaFree(q4k);
+        return nullptr;
+    }
 
     bool ok = true;
     for (long r0 = 0; r0 < j.rows && ok; r0 += step) {
@@ -261,11 +281,14 @@ void* unrotate_ternary_to_q4k(const UnrotateJob& j, cudaStream_t stream) {
         unrotate_rows_to_bf16(j, r0, nr, host.data());
         const long n_chunk = nr * j.width;
         if (cudaMemcpy(dev_bf16, host.data(), (size_t)n_chunk * 2,
-                       cudaMemcpyHostToDevice) != cudaSuccess) { ok = false; break; }
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            ok = unrotate_cuda_ok("staging upload", name);
+            break;
+        }
         auto* dst = static_cast<char*>(q4k) +
                     (size_t)(r0 * j.width / kQ4KBlockElems) * kQ4KBlockBytes;
         kernels::launch_proj_requant_q4k_lloyd(dev_bf16, dst, n_chunk, stream);
-        if (cudaStreamSynchronize(stream) != cudaSuccess) ok = false;
+        if (cudaStreamSynchronize(stream) != cudaSuccess) ok = unrotate_cuda_ok("q4k refit", name);
     }
     cudaFree(dev_bf16);
     if (!ok) { cudaFree(q4k); return nullptr; }
@@ -5670,7 +5693,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (const std::vector<int8_t>* sign = rotated_signs(t, name)) {
             UnrotateJob j;
             if (!unrotate_job_init(j, t, name, *sign, had.block_size)) return nullptr;
-            void* d = unrotate_ternary_to_q4k(j, s.stream);
+            void* d = unrotate_ternary_to_q4k(j, name, s.stream);
             if (!d) return nullptr;   // never fall back to the rotated bytes: they are not weights
             qtype = 12;               // Q4_K
             s.owned.push_back(d);
@@ -5779,7 +5802,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             // lookup reads rows rather than multiplying by them.
             UnrotateJob j;
             if (!unrotate_job_init(j, t, name, *sign, had.block_size)) return nullptr;
-            void* d = unrotate_ternary_to_bf16(j);
+            void* d = unrotate_ternary_to_bf16(j, name);
             if (!d) return nullptr;
             if (transpose) {
                 fprintf(stderr, "[bonsai] %s: transpose of an un-rotated tensor is not wired\n",
@@ -5798,6 +5821,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         void* dq = nullptr; cudaMalloc(&dq, hb.bytes);
         cudaMemcpy(dq, hb.data, hb.bytes, cudaMemcpyHostToDevice);
         void* tmp = nullptr; cudaMalloc(&tmp, (size_t)t->n_values * 2);
+        if (!dq || !tmp) {
+            // Say so. Returning a silent nullptr here surfaces as whichever tensor the caller
+            // falls back to being reported "missing", which is a long way from the truth --
+            // especially since a sticky CUDA error from an earlier tensor lands right here.
+            fprintf(stderr, "[gguf] %s: device alloc failed (%s)\n",
+                    name.c_str(), cudaGetErrorString(cudaGetLastError()));
+            cudaFree(dq); cudaFree(tmp);
+            return nullptr;
+        }
         kernels::launch_gguf_dequant(hb.ggml_type, dq, tmp, t->n_values, s.stream);
         const void* result;
         if (transpose) {
