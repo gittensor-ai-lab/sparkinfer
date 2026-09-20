@@ -35,9 +35,11 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace sparkinfer {
@@ -46,6 +48,26 @@ namespace {
 using bf16 = unsigned short;
 inline void pf_cu(cudaError_t e, const char* what) {
     if (e != cudaSuccess) fprintf(stderr, "[prefill] %s: %s\n", what, cudaGetErrorString(e));
+}
+// A model the packed path cannot drive declines on EVERY step, forever -- a ternary Bonsai-2
+// server at concurrency 4 wrote two of these lines per decode token. Each decline site still
+// reports itself in full the first time; only its repeats are dropped. Keyed on the format
+// string's address rather than the formatted text on purpose: several of these carry a position
+// or layer index that moves every step, so deduplicating on the text would suppress nothing and
+// grow without bound.
+__attribute__((format(printf, 1, 2))) void verify_decline(const char* fmt, ...) {
+    static std::mutex mu;
+    static std::vector<const char*> seen;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        for (const char* f : seen) if (f == fmt) return;
+        seen.push_back(fmt);
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    verify_decline("[dflash-verify] (further declines from this site are suppressed)\n");
 }
 // Simple device-buffer arena: all-or-nothing allocation with one free() at the end.
 struct Arena {
@@ -3453,7 +3475,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // until this branch exists.
     const bool dense = c.dense_ffn;
     if (!token_ids || !out_argmax || n < 1 || n > kVerifyMaxRows || !s.gguf || !c.hybrid) {
-        fprintf(stderr, "[dflash-verify] base unsupported n=%d gguf=%d hybrid=%d\n",
+        verify_decline("[dflash-verify] base unsupported n=%d gguf=%d hybrid=%d\n",
                 n, (int)s.gguf, (int)c.hybrid);
         return -1;
     }
@@ -3467,7 +3489,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const bool hd_ok = (c.head_dim == 256) || muse;
     if (!hd_ok || c.linear_head_dim != 128 || c.top_k <= 0 ||
         (!dense && c.n_experts != 256)) {
-        fprintf(stderr, "[dflash-verify] shape unsupported hd=%d lhd=%d experts=%d topk=%d dense=%d\n",
+        verify_decline("[dflash-verify] shape unsupported hd=%d lhd=%d experts=%d topk=%d dense=%d\n",
                 c.head_dim, c.linear_head_dim, c.n_experts, c.top_k, (int)dense);
         return -1;
     }
@@ -3789,7 +3811,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // being full, and the prefill path's own fallback message already reports it that way.
         size_t vfree = 0, vtot = 0;
         cudaMemGetInfo(&vfree, &vtot);
-        fprintf(stderr, "[dflash-verify] scratch allocation failed (arena=%zu MB, free=%zu/%zu MB)\n",
+        verify_decline("[dflash-verify] scratch allocation failed (arena=%zu MB, free=%zu/%zu MB)\n",
                 a.total() >> 20, vfree >> 20, vtot >> 20);
         return -1;
     }
@@ -4028,7 +4050,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             return true;
         }
         if (type != 8 && type != 12 && type != 14) {
-            fprintf(stderr, "[dflash-verify] unsupported projection type=%d N=%d K=%d\n", type, no, k);
+            verify_decline("[dflash-verify] unsupported projection type=%d N=%d K=%d\n", type, no, k);
             return false;
         }
         quant_rows(in, k);
@@ -4036,7 +4058,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // Distinguishes "this weight TYPE is not implemented" (handled above, prints its own
             // message) from "the mmvq launcher refused THIS SHAPE" -- which is otherwise a silent
             // false and reads identically at the call site.
-            fprintf(stderr, "[dflash-verify] mmvq_rows refused type=%d N=%d n_out=%d K=%d\n",
+            verify_decline("[dflash-verify] mmvq_rows refused type=%d N=%d n_out=%d K=%d\n",
                     type, N, no, k);
             return false;
         }
@@ -4166,7 +4188,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // The same per-row gather for the windowed layers' tables. Only allocated when this pool
     // actually caps them, so an uncapped pool carries neither the buffer nor the extra gather.
     int* btab_rows_win = (btab_rows && s.kv->windowed()) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
-    if (!a.ok) { fprintf(stderr, "[dflash-verify] block-table scratch allocation failed\n"); return -1; }
+    if (!a.ok) { verify_decline("[dflash-verify] block-table scratch allocation failed\n"); return -1; }
     bool supported = true;
     int  vfail_L = -1;   // layer whose stage declined, for the bailout diagnostic below
     bool recording = false;
@@ -4936,7 +4958,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bool native_ffn = kDecodeNvfp4 && w.gate_nv && w.up_nv && w.down_nv;
             const bool q4_ffn = w.gate_q && w.up_q && w.down_q;
             if (!native_ffn && !q4_ffn) {
-                fprintf(stderr, "[dflash-verify] dense layer=%d missing gate/up/down\n", L);
+                verify_decline("[dflash-verify] dense layer=%d missing gate/up/down\n", L);
                 supported = false; break;
             }
             // Checkpoint-native NVFP4 FFN, matching the decode path's own branch
@@ -5016,7 +5038,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                             fp4_ws, st, w.down_fp4_alpha);
                 }
                 if (!ok) {
-                    fprintf(stderr, "[dflash-verify] wide FFN GEMM declined N=%d ffn=%d H=%d\n",
+                    verify_decline("[dflash-verify] wide FFN GEMM declined N=%d ffn=%d H=%d\n",
                             N, ffn, H);
                     supported = false; break;
                 }
@@ -5031,7 +5053,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                            N, ffn, H, st) &&
                     (!kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.gate_nv, sg, N, ffn, H, st) ||
                      !kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.up_nv, su, N, ffn, H, st))) {
-                    fprintf(stderr, "[dflash-verify] NVFP4 dp4a gate/up declined N=%d ffn=%d H=%d\n",
+                    verify_decline("[dflash-verify] NVFP4 dp4a gate/up declined N=%d ffn=%d H=%d\n",
                             N, ffn, H);
                     supported = false; break;
                 }
@@ -5041,7 +5063,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     kernels::launch_gemv_nvfp4_quant_x(sh, xq, xs, N, ffn, st);
                 }
                 if (!kernels::launch_gemv_nvfp4_rows_dp4a(xq, xs, w.down_nv, routed, N, H, ffn, st)) {
-                    fprintf(stderr, "[dflash-verify] NVFP4 dp4a down declined N=%d H=%d ffn=%d\n",
+                    verify_decline("[dflash-verify] NVFP4 dp4a down declined N=%d H=%d ffn=%d\n",
                             N, H, ffn);
                     supported = false; break;
                 }
@@ -5049,13 +5071,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 if (topk != 1 ||
                     !kernels::launch_gemv_nvfp4_rows(hn, w.gate_nv, sg, N, ffn, H, st) ||
                     !kernels::launch_gemv_nvfp4_rows(hn, w.up_nv, su, N, ffn, H, st)) {
-                    fprintf(stderr, "[dflash-verify] NVFP4 gate/up declined N=%d ffn=%d H=%d\n",
+                    verify_decline("[dflash-verify] NVFP4 gate/up declined N=%d ffn=%d H=%d\n",
                             N, ffn, H);
                     supported = false; break;
                 }
                 kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
                 if (!kernels::launch_gemv_nvfp4_rows(sh, w.down_nv, routed, N, H, ffn, st)) {
-                    fprintf(stderr, "[dflash-verify] NVFP4 down declined N=%d H=%d ffn=%d\n",
+                    verify_decline("[dflash-verify] NVFP4 down declined N=%d H=%d ffn=%d\n",
                             N, H, ffn);
                     supported = false; break;
                 }
@@ -5097,7 +5119,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         if (!w.gate_q || !w.router_w ||
             !w.shared_gate_q || !w.shared_up_q || !w.shared_down_q ||
             w.shared_gate_qtype != 8 || w.shared_up_qtype != 8 || w.shared_down_qtype != 8) {
-            fprintf(stderr, "[dflash-verify] unsupported MoE layer=%d gate=%p router=%p shared=%p/%p/%p types=%d/%d/%d\n",
+            verify_decline("[dflash-verify] unsupported MoE layer=%d gate=%p router=%p shared=%p/%p/%p types=%d/%d/%d\n",
                     L, w.gate_q, w.router_w, w.shared_gate_q, w.shared_up_q, w.shared_down_q,
                     w.shared_gate_qtype, w.shared_up_qtype, w.shared_down_qtype);
             supported = false; break;
@@ -5217,7 +5239,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // dense weights, unsupported MoE shape, unsupported projection TYPE); reaching here with
         // none of those means a kernel launcher itself returned false, which is otherwise silent
         // and indistinguishable from "this path is simply not implemented for your model".
-        fprintf(stderr, "[dflash-verify] declined at layer=%d (linear_attn=%d) N=%d start=%d\n",
+        verify_decline("[dflash-verify] declined at layer=%d (linear_attn=%d) N=%d start=%d\n",
                 vfail_L, (vfail_L >= 0 && vfail_L < (int)s.w.layers.size())
                              ? (int)s.w.layers[vfail_L].linear_attn : -1,
                 N, start_pos);
@@ -5393,7 +5415,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             s.w.lm_head_type, q81, s.w.lm_head, logits, N, c.vocab, H, st);
     }
     if (!head_ok) {
-        fprintf(stderr, "[dflash-verify] unsupported LM head type=%d H=%d\n", s.w.lm_head_type, H);
+        verify_decline("[dflash-verify] unsupported LM head type=%d H=%d\n", s.w.lm_head_type, H);
         abandon_capture();
         return -1;
     }
