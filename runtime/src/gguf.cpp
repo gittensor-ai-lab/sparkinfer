@@ -4,6 +4,7 @@
 #include "sparkinfer/gguf.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -287,5 +288,36 @@ std::vector<long> GGUF::meta_int_array(const std::string& k) const {
     return it == int_arrays_.end() ? std::vector<long>{} : it->second;
 }
 const GGUFTensor* GGUF::tensor(const std::string& n) const { auto it=tensors_.find(n); return it==tensors_.end()?nullptr:&it->second; }
+
+
+std::vector<std::pair<std::string, std::string>> GGUF::meta_all() const {
+    std::vector<std::pair<std::string, std::string>> out;
+    char buf[64];
+    for (const auto& kv : ints_) {
+        std::snprintf(buf, sizeof(buf), "%ld", kv.second);
+        out.emplace_back(kv.first, buf);
+    }
+    for (const auto& kv : floats_) {
+        std::snprintf(buf, sizeof(buf), "%g", kv.second);
+        out.emplace_back(kv.first, buf);
+    }
+    for (const auto& kv : strs_) out.emplace_back(kv.first, kv.second);
+    for (const auto& kv : int_arrays_) {
+        std::string v = "[";
+        for (size_t i = 0; i < kv.second.size() && i < 12; ++i) {
+            std::snprintf(buf, sizeof(buf), "%s%ld", i ? ", " : "", kv.second[i]);
+            v += buf;
+        }
+        if (kv.second.size() > 12) v += ", ...";
+        std::snprintf(buf, sizeof(buf), "] (%zu)", kv.second.size());
+        out.emplace_back(kv.first, v + buf);
+    }
+    for (const auto& kv : str_arrays_) {
+        std::snprintf(buf, sizeof(buf), "<%zu strings>", kv.second.size());
+        out.emplace_back(kv.first, buf);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
 
 } // namespace sparkinfer

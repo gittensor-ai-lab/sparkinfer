@@ -104,6 +104,13 @@ void hadamard_apply_sign(float* x, long n, const int8_t* sign) {
     for (long i = 0; i < n; ++i) x[i] *= (float)sign[i];
 }
 
+void hadamard_unrotate_activation(float* x, long n, long block, const int8_t* sign) {
+    // R = H . diag(s) with both factors orthogonal and symmetric, so R^-1 = R^T = diag(s) . H:
+    // the same two steps in the other order.
+    hadamard_transform(x, n, block);
+    if (sign) hadamard_apply_sign(x, n, sign);
+}
+
 void hadamard_rotate_activation(float* x, long n, long block, const int8_t* sign) {
     if (sign) hadamard_apply_sign(x, n, sign);
     hadamard_transform(x, n, block);

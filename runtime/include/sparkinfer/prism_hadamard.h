@@ -10,8 +10,11 @@
 // What the checkpoint declares (read, never assumed -- see load()):
 //   - 401 rotated weights: FFN gate/up/down, the linear-attention blocks' qkv/gate/ssm_out, the
 //     full-attention blocks' q/k/v/output, and the LM head;
-//   - token_embd.weight rotated by the INVERSE, so the residual stream is already in the rotated
-//     basis when it leaves the embedding;
+//   - token_embd.weight rotated by the INVERSE. It is a lookup, not a matmul, so it has no input
+//     activation to rotate; instead its rows are STORED rotated (which is what makes quantising
+//     them to trits survivable) and the runtime applies R^-1 to the row it reads. The residual
+//     stream therefore stays in the ordinary basis -- it could not do otherwise, since RMSNorm's
+//     per-channel weight does not commute with R;
 //   - three sign vectors, one per input width the rotated weights take (5120, 6144, 17408).
 #include <cstdint>
 #include <string>
@@ -55,5 +58,9 @@ void hadamard_apply_sign(float* x, long n, const int8_t* sign);
 // The activation-side rotation for a weight whose input width is `n`: sign first, then the
 // blockwise Hadamard -- the order that inverts a weight rotated as W . diag(s) . H.
 void hadamard_rotate_activation(float* x, long n, long block, const int8_t* sign);
+
+// The inverse, R^-1 = R^T: the Hadamard first, then the signs. Used on a row read out of the
+// inverse-rotated token_embd, which is stored in the rotated basis.
+void hadamard_unrotate_activation(float* x, long n, long block, const int8_t* sign);
 
 }  // namespace sparkinfer

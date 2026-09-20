@@ -110,12 +110,31 @@ void test_odd_sizes_are_left_alone() {
 
 }  // namespace
 
+
+void test_unrotate_undoes_rotate() {
+    // The embedding path leans on this exactly: a row stored as R.e must come back as e.
+    const long n = 2048, block = 1024;
+    std::vector<int8_t> sign(n);
+    for (long i = 0; i < n; ++i) sign[i] = (i * 7 + 3) % 5 < 2 ? -1 : 1;
+    std::vector<float> x(n), original(n);
+    for (long i = 0; i < n; ++i) x[i] = original[i] = std::sin(0.37f * (float)i) * (float)(1 + i % 11);
+
+    sparkinfer::hadamard_rotate_activation(x.data(), n, block, sign.data());
+    bool moved = false;
+    for (long i = 0; i < n; ++i) moved = moved || std::fabs(x[i] - original[i]) > 1e-3f;
+    CHECK(moved);   // guards against a rotation that quietly does nothing
+
+    sparkinfer::hadamard_unrotate_activation(x.data(), n, block, sign.data());
+    for (long i = 0; i < n; ++i) CHECK(std::fabs(x[i] - original[i]) < 1e-3f);
+}
+
 int main() {
     test_transform_is_its_own_inverse();
     test_transform_preserves_norm();
     test_blocks_are_independent();
     test_known_two_point_case();
     test_rotated_weight_times_rotated_activation_reproduces_the_original();
+    test_unrotate_undoes_rotate();
     test_odd_sizes_are_left_alone();
     if (failures) { std::printf("prism_hadamard_cpu_test: %d FAILURES\n", failures); return 1; }
     std::printf("prism_hadamard_cpu_test: OK\n");

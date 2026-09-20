@@ -23,6 +23,7 @@
 #include <atomic>
 
 #include <mutex>
+#include <thread>
 #include "sparkinfer/models/dflash_draft.h"
 #include "sparkinfer/models/dflash_kernels.h"
 #include "qwen35_prefill.h"
@@ -30,6 +31,8 @@
 #include "sparkinfer/kv_ops.h"
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/ternary_ptq1.h"
+#include "sparkinfer/prism_hadamard.h"
+#include "sparkinfer/kernels/proj_requant.h"
 #include "sparkinfer/safetensors.h"
 #include "sparkinfer/kernels/compressed_tensors.h"
 #include "sparkinfer/kernels/attention.h"
@@ -157,6 +160,116 @@ HostBlocks host_blocks_for_upload(const GGUFTensor* t, const std::string& name) 
     hb.bytes = hb.converted.size();
     hb.ggml_type = 12;   // Q4_K
     return hb;
+}
+
+// Folds Ternary-Bonsai-2's Hadamard rotation into the weights at load time.
+//
+// The checkpoint stores every rotated weight row as R.W[o], where R = H.diag(s), and expects the
+// runtime to rotate the activation entering each matmul. Un-rotating the rows instead -- W[o] =
+// R^-1.(stored row), and R^-1 = R^T = diag(s).H -- is the same arithmetic moved to the other
+// operand, and it leaves an ordinary model behind: no graph needs a rotation inserted before its
+// matmuls, and every existing kernel applies unchanged. token_embd is not a special case here;
+// it is a lookup whose rows were rotated for the same reason, so it un-rotates identically.
+//
+// The rotated rows come out dense and Gaussian-ish rather than ternary. Weights that live as
+// quantized blocks are therefore refitted to Q4_K, which spends the ternary structure to buy
+// correctness; a native ternary kernel that rotates activations instead is what keeps it.
+struct UnrotateJob {
+    const GGUFTensor* t = nullptr;
+    const std::vector<int8_t>* sign = nullptr;
+    long width = 0, rows = 0, block = 0;
+};
+
+bool unrotate_job_init(UnrotateJob& j, const GGUFTensor* t, const std::string& name,
+                       const std::vector<int8_t>& sign, long block) {
+    j.t = t; j.sign = &sign; j.block = block;
+    j.width = t->dims[0];
+    if (j.width <= 0 || t->n_values % j.width != 0) return false;
+    j.rows = t->n_values / j.width;
+    if ((long)sign.size() != j.width || j.width % block != 0 || j.width % kPtq1BlockElems != 0) {
+        fprintf(stderr, "[bonsai] %s: input width %ld does not fit sign vector / block / group\n",
+                name.c_str(), j.width);
+        return false;
+    }
+    return true;
+}
+
+// Decodes rows [r0, r0+nr) of a ternary tensor, un-rotates each, and writes them as bf16.
+void unrotate_rows_to_bf16(const UnrotateJob& j, long r0, long nr, uint16_t* out) {
+    const auto* src = static_cast<const uint8_t*>(j.t->data);
+    const unsigned hw = std::max(1u, std::min(std::thread::hardware_concurrency(), 32u));
+    auto worker = [&](long lo, long hi) {
+        std::vector<float> scratch(j.width);
+        for (long r = lo; r < hi; ++r) {
+            const size_t blk = (size_t)(r0 + r) * j.width / kPtq1BlockElems;
+            ptq1_dequant(src + blk * kPtq1BlockBytes, (size_t)j.width, scratch.data());
+            hadamard_unrotate_activation(scratch.data(), j.width, j.block, j.sign->data());
+            uint16_t* dst = out + (size_t)r * j.width;
+            for (long i = 0; i < j.width; ++i) {
+                uint32_t bits;
+                std::memcpy(&bits, &scratch[i], 4);
+                bits += 0x7FFFu + ((bits >> 16) & 1u);   // round to nearest even on the way to bf16
+                dst[i] = (uint16_t)(bits >> 16);
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    const long per = (nr + hw - 1) / hw;
+    for (unsigned k = 0; k < hw; ++k) {
+        const long lo = std::min<long>(nr, (long)k * per), hi = std::min<long>(nr, lo + per);
+        if (lo < hi) pool.emplace_back(worker, lo, hi);
+    }
+    for (auto& th : pool) th.join();
+}
+
+// Chunked so a 248k-row embedding never needs its whole bf16 expansion resident at once.
+long unrotate_rows_per_chunk(const UnrotateJob& j) {
+    return std::max<long>(1, (64L << 20) / (j.width * 2));
+}
+
+// Un-rotated weight -> bf16 on device, for the embedding table.
+void* unrotate_ternary_to_bf16(const UnrotateJob& j) {
+    void* dev = nullptr;
+    if (cudaMalloc(&dev, (size_t)j.t->n_values * 2) != cudaSuccess) return nullptr;
+    const long step = unrotate_rows_per_chunk(j);
+    std::vector<uint16_t> host((size_t)std::min(j.rows, step) * j.width);
+    for (long r0 = 0; r0 < j.rows; r0 += step) {
+        const long nr = std::min(step, j.rows - r0);
+        unrotate_rows_to_bf16(j, r0, nr, host.data());
+        if (cudaMemcpy(static_cast<char*>(dev) + (size_t)r0 * j.width * 2, host.data(),
+                       (size_t)nr * j.width * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(dev);
+            return nullptr;
+        }
+    }
+    return dev;
+}
+
+// Un-rotated weight -> Q4_K on device, for everything that stays quantized.
+void* unrotate_ternary_to_q4k(const UnrotateJob& j, cudaStream_t stream) {
+    void* q4k = nullptr;
+    const size_t q4k_bytes = (size_t)(j.t->n_values / kQ4KBlockElems) * kQ4KBlockBytes;
+    if (cudaMalloc(&q4k, q4k_bytes) != cudaSuccess) return nullptr;
+    const long step = unrotate_rows_per_chunk(j);
+    std::vector<uint16_t> host((size_t)std::min(j.rows, step) * j.width);
+    void* dev_bf16 = nullptr;
+    if (cudaMalloc(&dev_bf16, host.size() * 2) != cudaSuccess) { cudaFree(q4k); return nullptr; }
+
+    bool ok = true;
+    for (long r0 = 0; r0 < j.rows && ok; r0 += step) {
+        const long nr = std::min(step, j.rows - r0);
+        unrotate_rows_to_bf16(j, r0, nr, host.data());
+        const long n_chunk = nr * j.width;
+        if (cudaMemcpy(dev_bf16, host.data(), (size_t)n_chunk * 2,
+                       cudaMemcpyHostToDevice) != cudaSuccess) { ok = false; break; }
+        auto* dst = static_cast<char*>(q4k) +
+                    (size_t)(r0 * j.width / kQ4KBlockElems) * kQ4KBlockBytes;
+        kernels::launch_proj_requant_q4k_lloyd(dev_bf16, dst, n_chunk, stream);
+        if (cudaStreamSynchronize(stream) != cudaSuccess) ok = false;
+    }
+    cudaFree(dev_bf16);
+    if (!ok) { cudaFree(q4k); return nullptr; }
+    return q4k;
 }
 
 long qwen_moe_meta_int(const GGUF& g, const std::string& key, long def) {
@@ -5463,6 +5576,27 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     Impl& s = *p_;
     GGUF g;
     if (!g.open(path)) return false;
+    // Ternary-Bonsai-2 declares a Hadamard rotation over its weights. Read it before any tensor is
+    // uploaded: a rotated weight loaded as though it were not is not degraded, it is noise.
+    PrismHadamard had;
+    {
+        std::string had_err;
+        if (!had.load(g, had_err)) {
+            fprintf(stderr, "[bonsai] prism.hadamard metadata is unusable: %s\n", had_err.c_str());
+            return false;
+        }
+    }
+    // Shared by both upload paths: is this tensor one the checkpoint rotated, and which signs?
+    auto rotated_signs = [&](const GGUFTensor* t, const std::string& name)
+            -> const std::vector<int8_t>* {
+        if (!t || t->ggml_type != kPtq1GgmlType || !had.present) return nullptr;
+        if (!had.rotates(name) && had.inverse_rotated.count(name) == 0) return nullptr;
+        const std::vector<int8_t>* sign = had.signs_for(t->dims[0]);
+        if (!sign)
+            fprintf(stderr, "[bonsai] %s: no sign vector for input width %ld\n",
+                    name.c_str(), t->dims[0]);
+        return sign;
+    };
     const bool dense_file = g.tensor("blk.0.ffn_gate.weight") != nullptr &&
                             g.tensor("blk.0.ffn_gate_exps.weight") == nullptr;
     const bool hybrid_file = is_qwen35_or_qwen36_hybrid_moe(g) || dense_file;
@@ -5533,6 +5667,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dev_quant = [&](const std::string& name, int& qtype) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
+        if (const std::vector<int8_t>* sign = rotated_signs(t, name)) {
+            UnrotateJob j;
+            if (!unrotate_job_init(j, t, name, *sign, had.block_size)) return nullptr;
+            void* d = unrotate_ternary_to_q4k(j, s.stream);
+            if (!d) return nullptr;   // never fall back to the rotated bytes: they are not weights
+            qtype = 12;               // Q4_K
+            s.owned.push_back(d);
+            return d;
+        }
         const HostBlocks hb = host_blocks_for_upload(t, name);
         if (!ggml_dequant_supported(hb.ggml_type)) {
             fprintf(stderr, "[gguf] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());
@@ -5631,6 +5774,22 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dense = [&](const std::string& name, bool transpose) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
+        if (const std::vector<int8_t>* sign = rotated_signs(t, name)) {
+            // The embedding table: un-rotated straight to bf16, no requantization, because a
+            // lookup reads rows rather than multiplying by them.
+            UnrotateJob j;
+            if (!unrotate_job_init(j, t, name, *sign, had.block_size)) return nullptr;
+            void* d = unrotate_ternary_to_bf16(j);
+            if (!d) return nullptr;
+            if (transpose) {
+                fprintf(stderr, "[bonsai] %s: transpose of an un-rotated tensor is not wired\n",
+                        name.c_str());
+                cudaFree(d);
+                return nullptr;
+            }
+            s.owned.push_back(d);
+            return d;
+        }
         const HostBlocks hb = host_blocks_for_upload(t, name);
         if (!ggml_dequant_supported(hb.ggml_type)) {
             fprintf(stderr, "[gguf] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());

@@ -32,11 +32,32 @@ int main(int argc, char** argv) {
                 (int)had.present, had.version, had.block_size, had.transform.c_str());
     std::printf("                 rotated=%zu inverse=%zu gdn_v_grouped=%d\n",
                 had.rotated.size(), had.inverse_rotated.size(), (int)had.gdn_v_grouped);
+    for (const std::string& n : had.inverse_rotated)
+        std::printf("                 inverse-rotated %s\n", n.c_str());
+    {   // which families are rotated at all, and is the embedding among them
+        std::map<std::string, int> fam;
+        for (const std::string& n : had.rotated) {
+            std::string f = n;
+            if (f.compare(0, 4, "blk.") == 0) {
+                const size_t a = f.find('.', 4);
+                f = "blk.N" + f.substr(a);
+            }
+            fam[f]++;
+        }
+        for (const auto& kv : fam)
+            std::printf("                 rotated %-28s x%d\n", kv.first.c_str(), kv.second);
+    }
     for (const auto& kv : had.signs_by_width) {
         long plus = 0;
         for (int8_t s : kv.second) plus += (s > 0);
         std::printf("                 signs width %-6ld  +1 %ld  -1 %ld\n",
                     kv.first, plus, (long)kv.second.size() - plus);
+    }
+
+    if (argc > 2 && std::strcmp(argv[2], "--meta") == 0) {
+        for (const auto& kv : gguf.meta_all())
+            std::printf("  %-46s %s\n", kv.first.c_str(), kv.second.c_str());
+        return 0;
     }
 
     if (argc > 2 && std::strcmp(argv[2], "--list") == 0) {
