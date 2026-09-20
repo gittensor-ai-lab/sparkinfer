@@ -34,6 +34,9 @@ public:
     // vocab is skipped); empty if the key is absent, longer than that, or not a string array.
     std::vector<std::string> meta_str_array(const std::string& key) const;
     const GGUFTensor* tensor(const std::string& name) const;
+    // Every tensor in the file, for inventory and for loaders that must reason about the whole
+    // set (which types appear, which rows need rotating) rather than ask for one name at a time.
+    const std::unordered_map<std::string, GGUFTensor>& tensors() const { return tensors_; }
 
 private:
 #ifndef _WIN32

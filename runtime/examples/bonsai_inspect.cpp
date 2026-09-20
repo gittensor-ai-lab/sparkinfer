@@ -39,6 +39,31 @@ int main(int argc, char** argv) {
                     kv.first, plus, (long)kv.second.size() - plus);
     }
 
+    if (argc > 2 && std::strcmp(argv[2], "--list") == 0) {
+        std::map<int, std::pair<long, double>> by_type;   // ggml type -> (count, GB)
+        std::map<std::string, std::string> shapes;        // a representative name per shape family
+        for (const auto& kv : gguf.tensors()) {
+            auto& e = by_type[kv.second.ggml_type];
+            e.first += 1;
+            e.second += (double)kv.second.n_bytes / 1e9;
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "[%ld, %ld] type %d",
+                          kv.second.dims[0], kv.second.dims[1], kv.second.ggml_type);
+            std::string family = kv.first;
+            const size_t dot = family.find('.');
+            if (family.compare(0, 4, "blk.") == 0) {      // blk.31.ffn_down.weight -> blk.N.ffn_down.weight
+                const size_t second = family.find('.', dot + 1);
+                family = "blk.N" + family.substr(second);
+            }
+            shapes[family] = buf;
+        }
+        for (const auto& kv : by_type)
+            std::printf("type %-4d %5ld tensors  %7.2f GB\n", kv.first, kv.second.first, kv.second.second);
+        for (const auto& kv : shapes)
+            std::printf("  %-34s %s\n", kv.first.c_str(), kv.second.c_str());
+        return 0;
+    }
+
     const char* want = argc > 2 ? argv[2] : "blk.0.attn_gate.weight";
     const sparkinfer::GGUFTensor* t = gguf.tensor(want);
     if (!t) { std::fprintf(stderr, "tensor %s not found\n", want); return 1; }

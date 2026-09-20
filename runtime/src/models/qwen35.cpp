@@ -29,6 +29,7 @@
 #include "sparkinfer/thermal_governor.h"
 #include "sparkinfer/kv_ops.h"
 #include "sparkinfer/gguf.h"
+#include "sparkinfer/ternary_ptq1.h"
 #include "sparkinfer/safetensors.h"
 #include "sparkinfer/kernels/compressed_tensors.h"
 #include "sparkinfer/kernels/attention.h"
@@ -115,10 +116,47 @@ bool ggml_dequant_supported(int ggml_type) {
         case 12: // Q4_K
         case 13: // Q5_K (UD / dynamic quants mix this in)
         case 14: // Q6_K
+        case 30: // BF16 (Ternary-Bonsai-2 keeps its GDN alpha/beta projections here)
             return true;
         default:
             return false;
     }
+}
+
+// PTQ1_0 (Ternary-Bonsai-2's 1.75-bit weights) has no kernel of its own yet, so it enters the
+// runtime as Q4_K: each trit becomes a nibble either side of the zero point, at 0.34% RMS. Every
+// upload goes through here rather than each call site testing the type, because a path that forgot
+// would read 28-byte ternary blocks as 144-byte Q4_K ones and load whatever followed them.
+struct HostBlocks {
+    const void* data = nullptr;
+    size_t bytes = 0;
+    int ggml_type = 0;
+    std::vector<uint8_t> converted;   // non-empty only when a transcode actually happened
+};
+
+HostBlocks host_blocks_for_upload(const GGUFTensor* t, const std::string& name) {
+    HostBlocks hb;
+    hb.data = t->data;
+    hb.bytes = t->n_bytes;
+    hb.ggml_type = t->ggml_type;
+    if (t->ggml_type != kPtq1GgmlType) return hb;
+
+    // Two 128-trit groups make one 256-element Q4_K superblock, so a row that is a multiple of 128
+    // but not 256 would pair groups across the row boundary and shear every row after the first.
+    if (t->dims[0] % kQ4KBlockElems != 0) {
+        fprintf(stderr, "[gguf] %s: PTQ1_0 row of %ld is not a multiple of %d, cannot transcode\n",
+                name.c_str(), t->dims[0], kQ4KBlockElems);
+        hb.ggml_type = -1;   // fails ggml_dequant_supported at the call site
+        return hb;
+    }
+    const size_t supers = (size_t)t->n_values / kQ4KBlockElems;
+    hb.converted.resize(supers * kQ4KBlockBytes);
+    ptq1_to_q4k(static_cast<const uint8_t*>(t->data), (size_t)t->n_values,
+                         hb.converted.data());
+    hb.data = hb.converted.data();
+    hb.bytes = hb.converted.size();
+    hb.ggml_type = 12;   // Q4_K
+    return hb;
 }
 
 long qwen_moe_meta_int(const GGUF& g, const std::string& key, long def) {
@@ -5495,14 +5533,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dev_quant = [&](const std::string& name, int& qtype) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
-        if (!ggml_dequant_supported(t->ggml_type)) {
+        const HostBlocks hb = host_blocks_for_upload(t, name);
+        if (!ggml_dequant_supported(hb.ggml_type)) {
             fprintf(stderr, "[gguf] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());
             return nullptr;
         }
-        qtype = t->ggml_type;
+        qtype = hb.ggml_type;
         void* d = nullptr;
-        if (cudaMalloc(&d, t->n_bytes) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice);
+        if (cudaMalloc(&d, hb.bytes) != cudaSuccess) return nullptr;
+        cudaMemcpy(d, hb.data, hb.bytes, cudaMemcpyHostToDevice);
         s.owned.push_back(d);
         return d;
     };
@@ -5592,14 +5631,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dense = [&](const std::string& name, bool transpose) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
-        if (!ggml_dequant_supported(t->ggml_type)) {
+        const HostBlocks hb = host_blocks_for_upload(t, name);
+        if (!ggml_dequant_supported(hb.ggml_type)) {
             fprintf(stderr, "[gguf] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());
             return nullptr;
         }
-        void* dq = nullptr; cudaMalloc(&dq, t->n_bytes);
-        cudaMemcpy(dq, t->data, t->n_bytes, cudaMemcpyHostToDevice);
+        void* dq = nullptr; cudaMalloc(&dq, hb.bytes);
+        cudaMemcpy(dq, hb.data, hb.bytes, cudaMemcpyHostToDevice);
         void* tmp = nullptr; cudaMalloc(&tmp, (size_t)t->n_values * 2);
-        kernels::launch_gguf_dequant(t->ggml_type, dq, tmp, t->n_values, s.stream);
+        kernels::launch_gguf_dequant(hb.ggml_type, dq, tmp, t->n_values, s.stream);
         const void* result;
         if (transpose) {
             const int in = (int)t->dims[0], out = (int)t->dims[1];   // ggml ne0=in, ne1=out

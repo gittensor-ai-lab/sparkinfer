@@ -21,7 +21,8 @@ namespace sparkinfer {
 namespace kernels {
 
 // ggml type ids
-enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14 };
+enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14,
+       GGML_BF16 = 30 };
 
 __device__ __forceinline__ float gg_h2f(const unsigned char* p) {
     __half h; *((unsigned short*)&h) = *(const unsigned short*)p; return __half2float(h);
@@ -265,6 +266,15 @@ __global__ void deq_f16_kernel(const unsigned char* __restrict__ src, __nv_bfloa
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
     y[i] = __float2bfloat16(gg_h2f(src + i * 2));
 }
+
+// BF16 source, bf16 destination: the bits already line up, so this is a copy. Without it the
+// dispatcher's final else would read the tensor as F32 -- twice the bytes, none of them right.
+__global__ void deq_bf16_kernel(const unsigned char* __restrict__ src, __nv_bfloat16* __restrict__ y, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    unsigned short bits;
+    memcpy(&bits, src + i * 2, 2);
+    memcpy(&y[i], &bits, 2);
+}
 __global__ void deq_f32_kernel(const float* __restrict__ src, __nv_bfloat16* __restrict__ y, long n) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
     y[i] = __float2bfloat16(src[i]);
@@ -318,6 +328,7 @@ void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_
     else if (ggml_type == GGML_Q6_K) { long nb = n_values/256; deq_q6k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_Q8_0) { long nb = n_values/32;  deq_q8_0_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_F16)  { deq_f16_kernel<<<(n_values+T-1)/T,T,0,stream>>>(s,d,n_values); }
+    else if (ggml_type == GGML_BF16) { deq_bf16_kernel<<<(n_values+T-1)/T,T,0,stream>>>(s,d,n_values); }
     else /* F32 */                   { deq_f32_kernel<<<(n_values+T-1)/T,T,0,stream>>>(reinterpret_cast<const float*>(src),d,n_values); }
 }
 
