@@ -150,6 +150,13 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
         cfg.linear_q_heads = (int)qwen3_meta_int(g, "ssm.group_count", cfg.n_q_heads);
         cfg.linear_head_dim = (int)qwen3_meta_int(g, "ssm.state_size", cfg.linear_head_dim);
         cfg.linear_conv_kernel = (int)qwen3_meta_int(g, "ssm.conv_kernel", cfg.linear_conv_kernel);
+        // GDN v-head -> q/k-head convention. The default (cyclic) is what Qwythos/Qwen3.6-35B-A3B
+        // validated at v/q ratio 2. A checkpoint carrying prism.hadamard.gdn_v_grouped stores its
+        // v heads transposed and the loader regroups them into the architecture's own order, which
+        // is the block convention -- the same one qwen38_hf_config.h sets for this family from the
+        // safetensors side. Leaving it cyclic after regrouping pairs every v head with the wrong
+        // q/k head, which costs accuracy without breaking anything loudly.
+        if (g.meta_int("prism.hadamard.gdn_v_grouped", 0) != 0) cfg.gdn_qh_block = true;
         // linear_v_heads is derived from blk.0.attn_qkv.weight's real shape below, not read
         // from metadata directly -- no single GGUF key reliably holds it across exports (this
         // model's own v-head count lives under ssm.time_step_rank, a key the derivation below
