@@ -51,7 +51,11 @@ void block_info(int t, long& bytes, long& elems) {
         case 14: bytes=210; elems=256; break;   // Q6_K
         // PTQ1_0: ternary {-1,0,+1} with one FP16 scale per 128 weights, 1.75 bits each
         // (prism-ml Ternary-Bonsai-2; see ternary_ptq1.h for the byte layout).
+        case 30: bytes=2;   elems=1;   break;   // BF16
         case 143: bytes=28; elems=128; break;   // PTQ1_0
+        // Unknown type: zero bytes per block, so the tensor sizes to nothing. Callers must treat
+        // a zero-byte tensor as unusable rather than as an empty one -- a zero-sized allocation
+        // looks like an out-of-memory failure several tensors later.
         default: bytes=0;   elems=1;   break;
     }
 }
