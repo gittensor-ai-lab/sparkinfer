@@ -276,6 +276,12 @@ __global__ void gdn_ar_kernel(const __nv_bfloat16* __restrict__ q,
 //
 // The compacted array occupies the FIRST half of the same fp32 allocation, so the conversion is a
 // one-off per session and costs no VRAM.
+//
+// `state` is the SEQUENCE's whole state allocation and `state_off` selects the layer's slot,
+// exactly as gdn_ar_fast_batched_kernel takes them. The split is load-bearing rather than
+// cosmetic: under SB16 the slot offset has to be counted in bf16 elements, and a caller that
+// pre-applied it to the float* pointer instead landed every slot but the first at twice its
+// byte offset -- correct output from layer 0 and silent garbage from the other 47.
 template <int COLS, int HEAD_DIM, bool SB16>
 __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
                                    const __nv_bfloat16* __restrict__ k,
@@ -285,6 +291,7 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
                                    const __nv_bfloat16* __restrict__ dt,
                                    const __nv_bfloat16* __restrict__ a,
                                    float* __restrict__ state,   // TRANSPOSED [vh][col][row]
+                                   size_t state_off,            // layer slot, in STATE elements
                                    __nv_bfloat16* __restrict__ out,
                                    int q_heads, int v_heads, bool qh_block, bool state_bf16) {
     constexpr int NROW = HEAD_DIM / 32;                        // rows per lane (compile-time -> unrolls)
@@ -300,7 +307,7 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* qhptr = q + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* khptr = k + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* vhptr = v + (size_t)vh * HEAD_DIM;
-    const size_t col_off = ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+    const size_t col_off = state_off + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
     float* col = state + col_off;                             // contiguous [HEAD_DIM] rows of column j
     __nv_bfloat16* colb = reinterpret_cast<__nv_bfloat16*>(state) + col_off;
 
@@ -734,7 +741,7 @@ bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const 
 void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                           const void* alpha_bf16, const void* beta_bf16,
                           const void* dt_bf16, const void* a_bf16,
-                          float* state_f32, void* out_bf16,
+                          float* state_f32, size_t state_off, void* out_bf16,
                           int q_heads, int v_heads, int head_dim, bool qh_block,
                           cudaStream_t stream, bool state_compact_b16) {
     static const bool state_bf16 = [] {
@@ -768,7 +775,7 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
             reinterpret_cast<const __nv_bfloat16*>(beta_bf16),                              \
             reinterpret_cast<const __nv_bfloat16*>(dt_bf16),                                \
             reinterpret_cast<const __nv_bfloat16*>(a_bf16),                                 \
-            state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),                          \
+            state_f32, state_off, reinterpret_cast<__nv_bfloat16*>(out_bf16),               \
             q_heads, v_heads, (bool)qh_block, state_bf16)
 #define SI_GDN_AR_ONE_SEL(C_) do { if (state_compact_b16) SI_GDN_AR_ONE(C_, true);         \
                                    else                   SI_GDN_AR_ONE(C_, false); } while (0)
@@ -779,6 +786,9 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
 #undef SI_GDN_AR_ONE
         return;
     }
+    // Below here the state is always fp32 -- state_compact_b16 forces the branch above -- so the
+    // slot offset is plain float* arithmetic.
+    state_f32 += state_off;
     static int warpgrid = -1;
     if (warpgrid < 0) { const char* e = getenv("SPARKINFER_GDN_WARPGRID"); warpgrid = (e && e[0] == '0') ? 0 : 1; }
     if (warpgrid && head_dim == 128) {

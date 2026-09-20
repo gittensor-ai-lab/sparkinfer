@@ -378,10 +378,14 @@ void launch_qwen36_conv_split_l2norm_fused_batched(
     void* v_bf16, int batch, int q_heads, int v_heads, int head_dim,
     int conv_kernel, float eps, cudaStream_t stream = nullptr);
 
+// `state_f32` is the sequence's whole GDN state allocation and `state_off` is the layer's slot
+// within it, counted in state elements -- the same split launch_qwen36_gdn_ar_batched takes, and
+// required for the same reason: with state_compact_b16 the slot offset is a bf16-element offset,
+// so a caller cannot pre-apply it to the float* pointer.
 void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                           const void* alpha_bf16, const void* beta_bf16,
                           const void* dt_bf16, const void* a_bf16,
-                          float* state_f32, void* out_bf16,
+                          float* state_f32, size_t state_off, void* out_bf16,
                           int q_heads, int v_heads, int head_dim, bool qh_block,
                           cudaStream_t stream = nullptr, bool state_compact_b16 = false);
 

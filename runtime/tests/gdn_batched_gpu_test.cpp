@@ -52,7 +52,14 @@ std::vector<T> download(const T* d, size_t n) {
     return h;
 }
 
-bool test_gdn_ar(int B, int q_heads, int v_heads, int hd, bool qh_block, size_t off = 0) {
+// `compact` runs the pair on the COMPACTED bf16 state the continuous-batch path converts a
+// session to. It is a separate case rather than a variation because the slot offset changes
+// units with it: the compacted state is bf16 packed from the allocation base, so `off` counts
+// bf16 elements there and floats otherwise. Both launchers therefore have to be handed the base
+// pointer and the offset separately -- and until they were, the unbatched one doubled every
+// non-zero offset and this pair still passed, because it only ever ran fp32.
+bool test_gdn_ar(int B, int q_heads, int v_heads, int hd, bool qh_block, size_t off = 0,
+                 bool compact = false) {
     const size_t qdim = (size_t)q_heads * hd, vdim = (size_t)v_heads * hd;
     const size_t st_n = (size_t)v_heads * hd * hd;
 
@@ -60,7 +67,16 @@ bool test_gdn_ar(int B, int q_heads, int v_heads, int hd, bool qh_block, size_t 
     auto hv = rand_bf16(B * vdim, 33, 1.f);
     auto ha = rand_bf16(B * v_heads, 44, 1.f), hb = rand_bf16(B * v_heads, 55, 1.f);
     auto hdt = rand_bf16(v_heads, 66, 0.5f), haa = rand_bf16(v_heads, 77, -0.5f);
-    auto hst = rand_f32(st_n + off, 88, 0.1f);   // off models a per-layer slice of a session's state
+    // off models a per-layer slice of a session's state. Under `compact` the same allocation
+    // holds bf16 values from its base, so the seed is bf16 bytes laid into a float-sized buffer.
+    std::vector<float> hst;
+    if (compact) {
+        hst.assign(st_n + off, 0.f);
+        const auto seed = rand_bf16(st_n + off, 88, 0.1f);
+        memcpy(hst.data(), seed.data(), seed.size() * sizeof(uint16_t));
+    } else {
+        hst = rand_f32(st_n + off, 88, 0.1f);
+    }
 
     auto* dq = upload(hq); auto* dk = upload(hk); auto* dv = upload(hv);
     auto* da = upload(ha); auto* db = upload(hb);
@@ -77,7 +93,7 @@ bool test_gdn_ar(int B, int q_heads, int v_heads, int hd, bool qh_block, size_t 
             (const char*)dq + b * qdim * 2, (const char*)dk + b * qdim * 2,
             (const char*)dv + b * vdim * 2,
             (const char*)da + b * v_heads * 2, (const char*)db + b * v_heads * 2,
-            ddt, daa, ref_states[b] + off, out, q_heads, v_heads, hd, qh_block, nullptr);
+            ddt, daa, ref_states[b], off, out, q_heads, v_heads, hd, qh_block, nullptr, compact);
         cudaDeviceSynchronize();
         auto o = download((uint16_t*)out, vdim);
         memcpy(&ref_out[(size_t)b * vdim], o.data(), vdim * sizeof(uint16_t));
@@ -91,7 +107,7 @@ bool test_gdn_ar(int B, int q_heads, int v_heads, int hd, bool qh_block, size_t 
     void* bout = nullptr; cudaMalloc(&bout, B * vdim * sizeof(uint16_t));
     if (!sparkinfer::kernels::launch_qwen36_gdn_ar_batched(
             dq, dk, dv, da, db, ddt, daa, dstates, off, bout,
-            B, q_heads, v_heads, hd, qh_block, nullptr)) {
+            B, q_heads, v_heads, hd, qh_block, nullptr, compact)) {
         printf("FAIL: batched launcher declined hd=%d\n", hd);
         return false;
     }
@@ -106,17 +122,22 @@ bool test_gdn_ar(int B, int q_heads, int v_heads, int hd, bool qh_block, size_t 
             return false;
         }
     }
+    // Compare the slot the launch was told to advance, in ITS units. Comparing the fp32 view of a
+    // compacted state would read the wrong half of the buffer and pass on two identical wrongs.
     for (int b = 0; b < B; b++) {
-        auto rs = download(ref_states[b] + off, st_n), bs = download(bat_states[b] + off, st_n);
+        auto rs = download(ref_states[b], st_n + off), bs = download(bat_states[b], st_n + off);
+        const size_t elem = compact ? sizeof(uint16_t) : sizeof(float);
+        const char* rp = reinterpret_cast<const char*>(rs.data()) + off * elem;
+        const char* bp = reinterpret_cast<const char*>(bs.data()) + off * elem;
         for (size_t i = 0; i < st_n; i++) {
-            if (memcmp(&rs[i], &bs[i], 4) != 0) {
-                printf("FAIL: gdn_ar state row %d mismatch at %zu\n", b, i);
+            if (memcmp(rp + i * elem, bp + i * elem, elem) != 0) {
+                printf("FAIL: gdn_ar state row %d mismatch at %zu (compact=%d)\n", b, i, (int)compact);
                 return false;
             }
         }
     }
-    printf("[ok] gdn_ar B=%d qh=%d vh=%d hd=%d qh_block=%d  out+state bit-identical\n",
-           B, q_heads, v_heads, hd, (int)qh_block);
+    printf("[ok] gdn_ar B=%d qh=%d vh=%d hd=%d qh_block=%d off=%zu compact=%d  out+state bit-identical\n",
+           B, q_heads, v_heads, hd, (int)qh_block, off, (int)compact);
     return true;
 }
 
@@ -190,6 +211,13 @@ int main() {
         // the layer with state_off, so a wrong offset must not pass as a wrong answer.
         ok &= test_gdn_ar(B, 16, 48, 128, true, (size_t)48 * 128 * 128);
         ok &= test_conv(B, 16, 48, 128, 4, (size_t)3 * (2 * 16 * 128 + 48 * 128));
+        // Same pair on the compacted bf16 state, at slot 0 AND at a later slot. A session that
+        // has been through decode_packed carries this form, and the unbatched kernel is reached
+        // with it every time the packed batch declines or decays to a single row -- which on a
+        // 64-layer stack means 47 of the 48 GDN layers ran on a doubled offset.
+        ok &= test_gdn_ar(B, 16, 48, 128, true, 0, true);
+        ok &= test_gdn_ar(B, 16, 48, 128, true, (size_t)48 * 128 * 128, true);
+        ok &= test_gdn_ar(B, 16, 32, 128, false, (size_t)7 * 32 * 128 * 128, true);
     }
     printf(ok ? "[PASS] gdn_batched_gpu_test\n" : "[FAIL] gdn_batched_gpu_test\n");
     return ok ? 0 : 1;
