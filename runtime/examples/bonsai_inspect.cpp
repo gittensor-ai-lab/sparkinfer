@@ -122,6 +122,27 @@ int main(int argc, char** argv) {
         const char* out_path = argc > 6 ? argv[6] : "/tmp/bonsai_dump.f32";
         const long width = w->dims[0];
         const std::vector<int8_t>* sign = had.signs_for(width);
+        if (w->ggml_type == 0 || w->ggml_type == 30) {   // plain tensors dump as-is, no rotation
+            FILE* pf = std::fopen(argc > 6 ? argv[6] : "/tmp/bonsai_dump.f32", "wb");
+            if (!pf) return 1;
+            std::vector<float> row((size_t)width);
+            for (long r = 0; r < nrows; ++r) {
+                for (long i = 0; i < width; ++i) {
+                    const size_t at = (size_t)r * width + i;
+                    if (w->ggml_type == 0) {
+                        std::memcpy(&row[i], static_cast<const uint8_t*>(w->data) + at * 4, 4);
+                    } else {
+                        uint16_t h; std::memcpy(&h, static_cast<const uint8_t*>(w->data) + at * 2, 2);
+                        const uint32_t bits = (uint32_t)h << 16;
+                        std::memcpy(&row[i], &bits, 4);
+                    }
+                }
+                std::fwrite(row.data(), 4, (size_t)width, pf);
+            }
+            std::fclose(pf);
+            std::printf("wrote %ld rows x %ld (plain type %d)\n", nrows, width, w->ggml_type);
+            return 0;
+        }
         if (!sign && mode) { std::fprintf(stderr, "no signs for width %ld\n", width); return 1; }
         FILE* f = std::fopen(out_path, "wb");
         if (!f) { std::fprintf(stderr, "cannot write %s\n", out_path); return 1; }

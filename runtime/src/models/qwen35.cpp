@@ -233,11 +233,13 @@ void unrotate_job_set_v_block(UnrotateJob& j, const std::string& name, const Qwe
 // scalars ssm_a and ssm_dt.bias, and the alpha/beta projections that emit one value per head.
 // None of those is ternary, so they never pass through the un-rotation; they are regrouped here.
 // Leaving them alone pairs each head's decay and step size with another head's values.
-void* upload_v_regrouped_bf16(const GGUFTensor* t, const std::string& name, long heads, long groups) {
-    if (heads <= 0 || groups <= 0 || heads % groups != 0) return nullptr;
+void* upload_v_regrouped_bf16(const GGUFTensor* t, const std::string& name, long row0,
+                              long heads, long groups, long rows_per_head) {
+    if (heads <= 0 || groups <= 0 || heads % groups != 0 || rows_per_head <= 0) return nullptr;
     const long row_len = t->n_dims >= 2 ? t->dims[0] : 1;
     if (row_len <= 0 || t->n_values % row_len != 0) return nullptr;
-    if (t->n_values / row_len != heads) return nullptr;
+    const long rows = t->n_values / row_len;
+    if (row0 < 0 || row0 + heads * rows_per_head > rows) return nullptr;
     if (t->ggml_type != 0 && t->ggml_type != 30) {
         fprintf(stderr, "[bonsai] %s: cannot regroup ggml type %d\n", name.c_str(), t->ggml_type);
         return nullptr;
@@ -245,8 +247,12 @@ void* upload_v_regrouped_bf16(const GGUFTensor* t, const std::string& name, long
     const long per_group = heads / groups;
     std::vector<uint16_t> host((size_t)t->n_values);
     const auto* raw = static_cast<const uint8_t*>(t->data);
-    for (long d = 0; d < heads; ++d) {
-        const long src = (d % per_group) * groups + (d / per_group);
+    for (long d = 0; d < rows; ++d) {
+        long src = d;
+        if (d >= row0 && d < row0 + heads * rows_per_head) {
+            const long r = d - row0, h = r / rows_per_head, off = r % rows_per_head;
+            src = row0 + ((h % per_group) * groups + (h / per_group)) * rows_per_head + off;
+        }
         for (long i = 0; i < row_len; ++i) {
             uint16_t bits;
             if (t->ggml_type == 30) {
@@ -6159,7 +6165,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // kernel indexes them the same way is a question about this runtime, not about the file.
     static const std::string vregroup_set = [] {
         const char* e = getenv("SPARKINFER_BONSAI_VREGROUP");
-        return std::string(e && e[0] ? e : "a,dt,alpha,beta");
+        return std::string(e && e[0] ? e : "a,dt,alpha,beta,conv");
     }();
     auto v_regroup = [&](const std::string& name) -> const void* {
         const GGUFTensor* t = g.tensor(name);
@@ -6168,9 +6174,16 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                               ? "a"
                         : name.find("ssm_dt") != std::string::npos ? "dt"
                         : name.find("alpha") != std::string::npos ? "alpha"
-                        : name.find("beta") != std::string::npos ? "beta" : "";
+                        : name.find("beta") != std::string::npos ? "beta"
+                        : name.find("ssm_conv1d") != std::string::npos ? "conv" : "";
         if (!key[0] || vregroup_set.find(key) == std::string::npos) return nullptr;
-        void* d = upload_v_regrouped_bf16(t, name, s.cfg.linear_v_heads, s.cfg.linear_q_heads);
+        // conv1d carries q, k and then v across its channel axis; only the v channels move, and
+        // they move in blocks of the GDN head dimension rather than one row per head.
+        const bool is_conv = name.find("ssm_conv1d") != std::string::npos;
+        const long row0 = is_conv ? 2 * (long)s.cfg.linear_q_heads * s.cfg.linear_head_dim : 0;
+        const long rows_per_head = is_conv ? s.cfg.linear_head_dim : 1;
+        void* d = upload_v_regrouped_bf16(t, name, row0, s.cfg.linear_v_heads,
+                                          s.cfg.linear_q_heads, rows_per_head);
         if (d) s.owned.push_back(d);
         return d;
     };
@@ -6231,9 +6244,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 !expect_dims(b + "ssm_out.weight", {s.linear_vdim, H})) return false;
             w.wqkv = attn_w(b + "attn_qkv.weight", w.wqkv_type);
             w.wqkv_gate = attn_w(b + "attn_gate.weight", w.wqkv_gate_type);
-            w.ssm_conv = dense(b + "ssm_conv1d.weight", false);
+            w.ssm_conv = v_regroup(b + "ssm_conv1d.weight");
+            if (!w.ssm_conv) w.ssm_conv = dense(b + "ssm_conv1d.weight", false);
             w.ssm_dt = v_regroup(b + "ssm_dt.bias");
+            if (!w.ssm_dt) w.ssm_dt = dense(b + "ssm_dt.bias", false);
             w.ssm_a = v_regroup(b + "ssm_a");
+            if (!w.ssm_a) w.ssm_a = dense(b + "ssm_a", false);
             if (const void* bp = v_regroup(b + "ssm_beta.weight")) {
                 w.ssm_beta = bp; w.ssm_beta_type = 0;
             } else {
