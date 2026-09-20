@@ -52,6 +52,9 @@ struct Qwen35PrefillCtx {
     // stored rotation back off it. Null/false for every other model.
     bool                 bonsai_embed_native;
     const void*          bonsai_sign_hidden;  // int8[hidden] on device; embedding + head
+    // int8[moe_ffn] on device, or null. The dense FFN's down leg is the one ternary projection
+    // whose input is not the residual width, so dq() cannot reach it with the vector above.
+    const void*          bonsai_sign_ffn;
     int                  bonsai_block;
     void*                bonsai_rot;          // scratch for one rotated activation, or null
     int                  qdim, kvdim;                       // full-attn q / kv dims
