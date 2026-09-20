@@ -6160,9 +6160,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     };
     // Returns null unless this checkpoint declares the transposed GDN v order, so every other
     // model keeps its existing loader untouched.
-    // SPARKINFER_BONSAI_VREGROUP lists which per-head parameters to regroup (default all four).
-    // They sit on the same transposed axis as the weights by inspection, but whether the GDN
-    // kernel indexes them the same way is a question about this runtime, not about the file.
+    // Everything that PRODUCES a GDN v head is stored transposed, so all of it is regrouped: the
+    // per-head scalars, the alpha/beta projections and conv1d's v channels. The runtime has to see
+    // the architecture's own order because the q/k-to-v grouping is baked into the GDN kernel --
+    // v head r is driven by q/k head r/3 -- so leaving the file's order in place is not an option.
+    // SPARKINFER_BONSAI_VREGROUP narrows the set, which is how the missing conv1d was found.
     static const std::string vregroup_set = [] {
         const char* e = getenv("SPARKINFER_BONSAI_VREGROUP");
         return std::string(e && e[0] ? e : "a,dt,alpha,beta,conv");
