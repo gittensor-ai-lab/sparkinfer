@@ -131,3 +131,8 @@ add_executable(prism_hadamard_cpu_test prism_hadamard_cpu_test.cpp ../src/prism_
 set_target_properties(prism_hadamard_cpu_test PROPERTIES CXX_STANDARD 17)
 target_include_directories(prism_hadamard_cpu_test PRIVATE ../include)
 add_test(NAME prism_hadamard_cpu_test COMMAND prism_hadamard_cpu_test)
+
+add_executable(gdn_v_regroup_cpu_test gdn_v_regroup_cpu_test.cpp)
+set_target_properties(gdn_v_regroup_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(gdn_v_regroup_cpu_test PRIVATE ../include)
+add_test(NAME gdn_v_regroup_cpu_test COMMAND gdn_v_regroup_cpu_test)

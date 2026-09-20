@@ -32,6 +32,7 @@
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/ternary_ptq1.h"
 #include "sparkinfer/prism_hadamard.h"
+#include "sparkinfer/gdn_v_regroup.h"
 #include "sparkinfer/kernels/proj_requant.h"
 #include "sparkinfer/safetensors.h"
 #include "sparkinfer/kernels/compressed_tensors.h"
@@ -204,8 +205,7 @@ long unrotate_source_row(const UnrotateJob& j, long dst) {
     const long r = dst - j.v_row0;
     const long head = r / j.v_head_dim, off = r % j.v_head_dim;
     const long per_group = (j.v_rows / j.v_head_dim) / j.v_groups;
-    const long g = head / per_group, k = head % per_group;
-    return j.v_row0 + (k * j.v_groups + g) * j.v_head_dim + off;
+    return j.v_row0 + gdn_v_source_head(head, j.v_groups, per_group) * j.v_head_dim + off;
 }
 
 bool bonsai_rot_forward(const char* env, bool def) {
@@ -251,7 +251,7 @@ void* upload_v_regrouped_bf16(const GGUFTensor* t, const std::string& name, long
         long src = d;
         if (d >= row0 && d < row0 + heads * rows_per_head) {
             const long r = d - row0, h = r / rows_per_head, off = r % rows_per_head;
-            src = row0 + ((h % per_group) * groups + (h / per_group)) * rows_per_head + off;
+            src = row0 + gdn_v_source_head(h, groups, per_group) * rows_per_head + off;
         }
         for (long i = 0; i < row_len; ++i) {
             uint16_t bits;
