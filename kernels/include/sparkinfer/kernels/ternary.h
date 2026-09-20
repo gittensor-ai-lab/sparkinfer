@@ -28,6 +28,13 @@ void launch_gemm_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
 void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
                           int n_rows, int k, cudaStream_t stream);
 
+// A whole weight matrix decoded out of its ternary blocks and un-rotated into the architecture's
+// basis, as ordinary bf16. Prefill uses this rather than a ternary GEMM so its existing projection
+// branches -- FP8 GEMM, dequantize-then-requantize, plain GEMM -- keep working unchanged: they ask
+// for bf16 weights and get them, into scratch, while the resident copy stays ternary.
+void launch_ptq1_rows_unrotate_bf16(const void* w_ptq1, const signed char* sign, void* out_bf16,
+                                    int n_rows, int k, int block, cudaStream_t stream);
+
 // Embedding lookup from a ternary table: decodes one row per token into bf16. The row is still in
 // the stored basis, so the caller applies launch_hadamard_unrotate_bf16 before using it as the
 // residual -- token_embd is the one tensor whose rotation has to come off at runtime rather than

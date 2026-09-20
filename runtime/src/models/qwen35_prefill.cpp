@@ -1535,6 +1535,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // Dequantize a native GGUF weight [n_out,K] to bf16 scratch; return a bf16 [n_out,K] ptr.
     auto dq = [&](const void* W, int wtype, int n_out, int K) -> const void* {
         if (wtype == 0) return W;   // already bf16 dense
+        if (wtype == kPtq1GgmlType && s.bonsai_sign_hidden && K == c.hidden) {
+            // Ternary, stored rotated. Every branch below wants ordinary bf16, so decode and take
+            // the rotation off here; the resident weight stays in its 28-byte blocks. Guarded on
+            // K: the sign vector carried here is the residual width's, so a projection reading the
+            // 6144-wide attention output is not this one's to rotate.
+            kernels::launch_ptq1_rows_unrotate_bf16(
+                W, static_cast<const signed char*>(s.bonsai_sign_hidden), wbuf, n_out, K,
+                s.bonsai_block, st);
+            return wbuf;
+        }
         if (wtype == kernels::SI_QTYPE_FP8) {
             kernels::launch_ct_dequant_fp8_packed(W, wbuf, n_out, K, st);
             return wbuf;

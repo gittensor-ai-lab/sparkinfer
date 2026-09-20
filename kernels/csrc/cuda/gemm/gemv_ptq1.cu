@@ -129,6 +129,43 @@ __global__ void embedding_ptq1_unrotate_kernel(const int* __restrict__ tok,
             __float2bfloat16(sh[i] * norm * (float)sign[base + i]);
 }
 
+// A whole weight matrix out of its ternary blocks and back into the architecture's basis: decode,
+// then take the stored rotation off each row. This is what lets prefill keep its existing
+// projection branches -- they ask dq() for bf16 weights and get ordinary ones, while the resident
+// copy stays ternary. Same body as the embedding lookup, with the row chosen directly.
+__global__ void ptq1_rows_unrotate_kernel(const unsigned char* __restrict__ w,
+                                          const signed char* __restrict__ sign,
+                                          __nv_bfloat16* __restrict__ out, int k, int block) {
+    extern __shared__ float sh[];
+    const int row = blockIdx.y;
+    const int base = blockIdx.x * block;
+    const int n_blocks = k / kBlockElems;
+    const unsigned char* wrow = w + (size_t)row * n_blocks * kBlockBytes;
+
+    for (int i = threadIdx.x; i < block; i += blockDim.x) {
+        const int e = base + i;
+        const unsigned char* qs = wrow + (size_t)(e / kBlockElems) * kBlockBytes;
+        const __half scale_h = *reinterpret_cast<const __half*>(qs + kBlockBytes - 2);
+        sh[i] = (float)ptq1_trit(qs, e % kBlockElems) * __half2float(scale_h);
+    }
+    __syncthreads();
+
+    for (int len = 1; len < block; len <<= 1) {
+        for (int i = threadIdx.x; i < block / 2; i += blockDim.x) {
+            const int lo = ((i / len) * 2 * len) + (i % len);
+            const int hi = lo + len;
+            const float a = sh[lo], b = sh[hi];
+            sh[lo] = a + b;
+            sh[hi] = a - b;
+        }
+        __syncthreads();
+    }
+
+    const float norm = rsqrtf((float)block);
+    for (int i = threadIdx.x; i < block; i += blockDim.x)
+        out[(size_t)row * k + base + i] = __float2bfloat16(sh[i] * norm * (float)sign[base + i]);
+}
+
 // Lookup without the rotation, for a table that does not carry one.
 
 __global__ void embedding_ptq1_kernel(const int* __restrict__ tok,
@@ -183,6 +220,15 @@ void launch_embedding_ptq1(const int* tokens, const void* table_ptq1, void* out_
     embedding_ptq1_kernel<<<grid, threads, 0, stream>>>(
         tokens, reinterpret_cast<const unsigned char*>(table_ptq1),
         reinterpret_cast<__nv_bfloat16*>(out_bf16), k);
+}
+
+void launch_ptq1_rows_unrotate_bf16(const void* w_ptq1, const signed char* sign, void* out_bf16,
+                                    int n_rows, int k, int block, cudaStream_t stream) {
+    if (n_rows <= 0 || k <= 0 || block <= 0 || k % kBlockElems != 0 || k % block != 0) return;
+    const dim3 grid((unsigned)(k / block), (unsigned)n_rows);
+    ptq1_rows_unrotate_kernel<<<grid, 256, (size_t)block * sizeof(float), stream>>>(
+        reinterpret_cast<const unsigned char*>(w_ptq1), sign,
+        reinterpret_cast<__nv_bfloat16*>(out_bf16), k, block);
 }
 
 void launch_embedding_ptq1_unrotate(const int* tokens, const void* table_ptq1,

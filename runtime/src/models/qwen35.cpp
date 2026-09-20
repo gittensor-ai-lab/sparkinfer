@@ -785,6 +785,10 @@ struct Qwen35Model::Impl {
     bf16* bonsai_rot = nullptr;                        // scratch for one rotated activation
     long bonsai_rot_elems = 0;
     bool bonsai_embed_native = false;                  // token_embd left in its ternary blocks
+    // The layer's normed input, rotated once on the main stream before the projections fan out
+    // across stream_k/stream_v. Rotating inside each projection would race: they run concurrently
+    // and would share one scratch. Written where s.xn is, so s.xn's own visibility carries it.
+    bf16* bonsai_rot_xn = nullptr;
 
     // DFlash speculative decoding (target-side primitives).
     DFlashDraftModel* dflash_draft = nullptr;
@@ -1797,6 +1801,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         if (pf_win & 1) pf_fork_n(w.wo, nullptr, pf_wo_bytes);
         dbg_bf16(s.xn, H, 10, L);   // tag 10: pre-attn-norm output (this layer's normed input)
         dbg_xn_snapshot(s.xn, L);
+        if (s.bonsai_rot_xn) {
+            // Once, on the main stream, before the projections fan out across stream_k/stream_v.
+            const auto it = s.bonsai_sign_dev.find(H);
+            kernels::launch_hadamard_rotate_bf16(s.xn, s.bonsai_rot_xn,
+                                                 static_cast<const signed char*>(it->second),
+                                                 H, (int)H, (int)s.bonsai_block, st);
+        }
         // xn_q8_ready assumes the PREVIOUS layer's tail already emitted Q8_1(this layer's xn)
         // into s.aq81 as a side effect (true for architectures whose post-MoE tail runs
         // launch_add_rmsnorm2_q8 / add_rmsnorm3_q8). Muse Glimmer's tail is the sandwich-norm
@@ -1849,6 +1860,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                                                1, N, H, pst)))
                         kernels::launch_gemv_nvfp4(s.xn, W, y, N, H, pst);
                 }
+                else if (t == kPtq1GgmlType && s.bonsai_rot_xn)
+                    kernels::launch_gemv_ptq1(s.bonsai_rot_xn, W, y, N, H, pst);
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -5776,12 +5789,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     static const std::string bonsai_native_set = [] {
         const char* e = getenv("SPARKINFER_BONSAI_NATIVE");
         std::string v(e ? e : "");
-        if (v == "1" || v == "all") v = "head,embed";
+        if (v == "1" || v == "all") v = "head,embed,proj";
         return v;
     }();
     const bool bonsai_native = had.present && !bonsai_native_set.empty();
     const bool bonsai_native_head = bonsai_native_set.find("head") != std::string::npos;
     const bool bonsai_native_embed = bonsai_native_set.find("embed") != std::string::npos;
+    const bool bonsai_native_proj = bonsai_native_set.find("proj") != std::string::npos;
     if (bonsai_native) {
         s.bonsai_block = had.block_size;
         for (const auto& kv : had.signs_by_width) {
@@ -5797,6 +5811,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             s.owned.push_back(s.bonsai_rot);
         else
             s.bonsai_rot = nullptr;
+        if (bonsai_native_proj && s.cfg.hidden > 0 &&
+            cudaMalloc((void**)&s.bonsai_rot_xn, (size_t)s.cfg.hidden * sizeof(bf16)) == cudaSuccess)
+            s.owned.push_back(s.bonsai_rot_xn);
+        else
+            s.bonsai_rot_xn = nullptr;
     }
 
     // Shared by both upload paths: is this tensor one the checkpoint rotated, and which signs?
@@ -6213,6 +6232,20 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // projections otherwise never take.
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
+        // Only projections whose input is the residual width: those read the once-per-layer
+        // rotated xn in decode, and prefill's dq() carries the matching sign vector.
+        if (bonsai_native_proj && t && t->ggml_type == kPtq1GgmlType && s.bonsai_rot_xn &&
+            t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0])) {
+            void* d = nullptr;
+            if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
+                cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                s.owned.push_back(d);
+                type = kPtq1GgmlType;
+                return d;
+            }
+            cudaFree(d);
+            fprintf(stderr, "[bonsai] %s: native upload failed, falling back\n", name.c_str());
+        }
         if (qattn && t && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
