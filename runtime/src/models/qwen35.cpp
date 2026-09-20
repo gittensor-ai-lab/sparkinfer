@@ -5789,7 +5789,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     static const std::string bonsai_native_set = [] {
         const char* e = getenv("SPARKINFER_BONSAI_NATIVE");
         std::string v(e ? e : "");
-        if (v == "1" || v == "all") v = "head,embed,proj";
+        // "proj" is NOT in "all": the projections load and save 1.9 GB but compute wrong --
+        // layer 0's post-attention residual is 13.39 against the working path's 8.32, with the
+        // embedding and the pre-attention norm bit-identical, so the fault is in the projection
+        // itself and not upstream. Scratch sizing, the rows_i8 type gate and the stream ordering
+        // are all ruled out. Next step is to narrow it to attn_qkv or attn_gate rather than to
+        // guess again. Opt in explicitly to work on it.
+        if (v == "1" || v == "all") v = "head,embed";
         return v;
     }();
     const bool bonsai_native = had.present && !bonsai_native_set.empty();
