@@ -178,11 +178,24 @@ struct UnrotateJob {
     const GGUFTensor* t = nullptr;
     const std::vector<int8_t>* sign = nullptr;
     long width = 0, rows = 0, block = 0;
+    // Which way to turn the rows back. The 401 weight matrices are stored rotated by R and undo
+    // with R^-1; token_embd is what the metadata calls inverse_weight_names, stored by R^-1, so it
+    // undoes with R. Overridable because "inverse" names a direction relative to the others rather
+    // than an absolute one, and a wrong guess here is indistinguishable from a wrong format read.
+    bool undo_with_forward = false;
 };
 
+bool bonsai_rot_forward(const char* env, bool def) {
+    const char* v = getenv(env);
+    if (!v || !v[0]) return def;
+    return v[0] == 'f' || v[0] == 'F';   // "fwd" applies R, anything else applies R^-1
+}
+
 bool unrotate_job_init(UnrotateJob& j, const GGUFTensor* t, const std::string& name,
-                       const std::vector<int8_t>& sign, long block) {
+                       const std::vector<int8_t>& sign, long block, bool inverse_listed) {
     j.t = t; j.sign = &sign; j.block = block;
+    j.undo_with_forward = inverse_listed ? bonsai_rot_forward("SPARKINFER_BONSAI_EMB_ROT", true)
+                                         : bonsai_rot_forward("SPARKINFER_BONSAI_W_ROT", false);
     j.width = t->dims[0];
     if (j.width <= 0 || t->n_values % j.width != 0) return false;
     j.rows = t->n_values / j.width;
@@ -203,7 +216,10 @@ void unrotate_rows_to_bf16(const UnrotateJob& j, long r0, long nr, uint16_t* out
         for (long r = lo; r < hi; ++r) {
             const size_t blk = (size_t)(r0 + r) * j.width / kPtq1BlockElems;
             ptq1_dequant(src + blk * kPtq1BlockBytes, (size_t)j.width, scratch.data());
-            hadamard_unrotate_activation(scratch.data(), j.width, j.block, j.sign->data());
+            if (j.undo_with_forward)
+                hadamard_rotate_activation(scratch.data(), j.width, j.block, j.sign->data());
+            else
+                hadamard_unrotate_activation(scratch.data(), j.width, j.block, j.sign->data());
             uint16_t* dst = out + (size_t)r * j.width;
             for (long i = 0; i < j.width; ++i) {
                 uint32_t bits;
@@ -5692,7 +5708,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
         if (const std::vector<int8_t>* sign = rotated_signs(t, name)) {
             UnrotateJob j;
-            if (!unrotate_job_init(j, t, name, *sign, had.block_size)) return nullptr;
+            if (!unrotate_job_init(j, t, name, *sign, had.block_size,
+                                   had.inverse_rotated.count(name) != 0)) return nullptr;
             void* d = unrotate_ternary_to_q4k(j, name, s.stream);
             if (!d) return nullptr;   // never fall back to the rotated bytes: they are not weights
             qtype = 12;               // Q4_K
@@ -5801,7 +5818,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             // The embedding table: un-rotated straight to bf16, no requantization, because a
             // lookup reads rows rather than multiplying by them.
             UnrotateJob j;
-            if (!unrotate_job_init(j, t, name, *sign, had.block_size)) return nullptr;
+            if (!unrotate_job_init(j, t, name, *sign, had.block_size,
+                                   had.inverse_rotated.count(name) != 0)) return nullptr;
             void* d = unrotate_ternary_to_bf16(j, name);
             if (!d) return nullptr;
             if (transpose) {
