@@ -3769,6 +3769,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const bool bonsai_any = s.bonsai_sign_hidden || s.bonsai_sign_ffn;
     bf16* bonsai_rot_n = bonsai_any
         ? a.alloc<bf16>((size_t)NA * (size_t)(ffn > H ? ffn : H)) : nullptr;
+    // What bonsai_rot_n currently holds. Same convention as the dp4a/fp8 activation staging
+    // below: the rotation is issued ONCE on the main stream before the fork, and the side
+    // streams only ever read it. A side stream that rotated for itself would be writing shared
+    // scratch that the main stream is reading.
+    const bf16* bonsai_rot_src = nullptr;
+    int bonsai_rot_k = 0;
     bf16* sg = a.alloc<bf16>((size_t)NA * ffn);
     bf16* su = a.alloc<bf16>((size_t)NA * ffn);
     bf16* sh = a.alloc<bf16>((size_t)NA * ffn);
@@ -4099,9 +4105,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 verify_decline("[dflash-verify] ternary projection has no sign vector for K=%d\n", k);
                 return false;
             }
+            // Already staged for this activation (the layer body does it ahead of the fork): reuse
+            // it, both to skip the work and because re-rotating would overwrite what the side
+            // stream is reading.
+            if (bonsai_rot_src == in && bonsai_rot_k == k) {
+                kernels::launch_gemm_ptq1(bonsai_rot_n, w, out, no, k, N, st);
+                return true;
+            }
             kernels::launch_hadamard_rotate_bf16(in, bonsai_rot_n,
                                                  static_cast<const signed char*>(sgn),
                                                  (long)N * k, k, s.bonsai_block, st);
+            bonsai_rot_src = in;
+            bonsai_rot_k = k;
             kernels::launch_gemm_ptq1(bonsai_rot_n, w, out, no, k, N, st);
             return true;
         }
@@ -4181,6 +4196,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     auto proj_on = [&](cudaStream_t ps, const bf16* in, const void* w, int type, bf16* out,
                        int no, int k) -> bool {
         if (type == 0) return kernels::launch_gemv_rows(in, w, out, N, no, k, ps);
+        // Ternary reads the rotation the main stream staged for this exact activation; it never
+        // rotates here, for the reason the note below gives about shared scratch off-stream. An
+        // unstaged input declines rather than racing -- the layer body stages xn ahead of the
+        // fork, so the projections that reach this actually find it.
+        if (type == kPtq1GgmlType) {
+            if (bonsai_rot_n && bonsai_rot_src == in && bonsai_rot_k == k) {
+                kernels::launch_gemm_ptq1(bonsai_rot_n, w, out, no, k, N, ps);
+                return true;
+            }
+            verify_decline("[dflash-verify] ternary side-stream projection was not staged K=%d\n", k);
+            return false;
+        }
         if (type == kernels::SI_QTYPE_FP8 && fp8_gemm_on(ps, in, w, out, no, k)) return true;
         // Native FP8/NVFP4 touch no shared q81 scratch, so unlike the mmvq path below they are
         // safe on ANY stream and never need the fall-back to `st`.
@@ -4712,6 +4739,19 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                  w.ssm_beta_type == kernels::SI_QTYPE_NVFP4)) quant_nv_rows(xn, H);
             if (fp8_gemm && (w.wqkv_type == kernels::SI_QTYPE_FP8 ||
                              w.wqkv_gate_type == kernels::SI_QTYPE_FP8)) fp8_stage(xn, H, true);
+            // Same rule for the ternary basis: wqkv_gate and the alpha/beta projections run on
+            // the side stream, and all four read xn rotated at the residual width. Rotate it here,
+            // once, ahead of the fork -- a side stream doing its own would race the main stream's
+            // reader for the one scratch buffer.
+            if (bonsai_rot_n && s.bonsai_sign_hidden &&
+                (w.wqkv_type == kPtq1GgmlType || w.wqkv_gate_type == kPtq1GgmlType ||
+                 w.ssm_alpha_type == kPtq1GgmlType || w.ssm_beta_type == kPtq1GgmlType)) {
+                kernels::launch_hadamard_rotate_bf16(
+                    xn, bonsai_rot_n, static_cast<const signed char*>(s.bonsai_sign_hidden),
+                    (long)N * H, H, s.bonsai_block, st);
+                bonsai_rot_src = xn;
+                bonsai_rot_k = H;
+            }
             // One quantize of xn feeds both in-projections, exactly as gate/up share theirs.
             const bool gdn_in_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
                                      w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf &&
@@ -5144,6 +5184,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     verify_decline("[dflash-verify] ternary FFN without both sign vectors N=%d\n", N);
                     supported = false; break;
                 }
+                // The FFN reuses the one rotation buffer, so whatever the layer body staged in
+                // it is gone from here on. `xn` is the SAME pointer every layer, so leaving the
+                // staging marked valid would let the next layer's projections read the FFN's
+                // rotated SwiGLU output and call it a rotated xn.
+                bonsai_rot_src = nullptr;
+                bonsai_rot_k = 0;
                 kernels::launch_hadamard_rotate_bf16(
                     hn, bonsai_rot_n, static_cast<const signed char*>(s.bonsai_sign_hidden),
                     (long)N * H, H, s.bonsai_block, st);
@@ -5408,6 +5454,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             abandon_capture();
             return -1;
         }
+        bonsai_rot_src = nullptr;
+        bonsai_rot_k = 0;
         kernels::launch_hadamard_rotate_bf16(
             xn, bonsai_rot_n, static_cast<const signed char*>(s.bonsai_sign_hidden),
             (long)N * H, H, s.bonsai_block, st);
