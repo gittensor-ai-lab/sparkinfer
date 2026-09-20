@@ -174,7 +174,18 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
         // used as the detection signal for "this is the MTP-capable Qwen3.8-27B family" rather
         // than a raw architecture/name string match, since it's the same signal already read
         // above and is specific to this family (Qwythos has no MTP head).
-        if (qwen3_meta_int(g, "nextn_predict_layers", 0) > 0) {
+        // The Qwen3.8-27B family, by shape rather than by its MTP head. nextn_predict_layers was
+        // the original signal, but it only marks the checkpoints that ship an MTP block: a
+        // derivative without one -- Ternary-Bonsai-2, which quantizes the same 64-layer backbone --
+        // answered to the default model name of an unrelated 35B MoE and, worse, missed the
+        // chat-template behaviour and the second stop token that this family needs. The GGUF
+        // carries only tokenizer.ggml.eos_token_id (248046); the model's own generation_config
+        // lists 248044 beside it, and GGUF metadata has nowhere to put the second.
+        const bool qwen38_shape =
+            cfg.n_layers == 64 && cfg.hidden == 5120 && cfg.n_q_heads == 24 &&
+            cfg.n_kv_heads == 4 && cfg.head_dim == 256 && cfg.moe_ffn == 17408 &&
+            cfg.vocab == 248320;
+        if (qwen38_shape || qwen3_meta_int(g, "nextn_predict_layers", 0) > 0) {
             cfg.eos_id2 = 248044;
             cfg.qwen38 = true;
         }
