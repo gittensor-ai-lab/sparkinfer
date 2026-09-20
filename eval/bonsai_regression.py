@@ -21,12 +21,19 @@ them:
              prefill's seed-argmax path, so two of this model's bugs were invisible to scoring.
 
   serve      The same prompt at temperature 0, asked alone and then again inside a batch that
-             DECAYS to one row (three short requests beside it). Both must come back identical.
-             Everything above this line runs one request at a time and is blind to the whole
-             continuous-batch path -- which is where the worst bug this model turned up lived,
-             and it was not even ternary-specific: decode_packed compacts a session's recurrent
-             state to bf16, and a row that outlives its batch was served from that state read at
-             the wrong width. Costs a server start per path, so it is the slow check.
+             DECAYS to one row (three short requests beside it). Everything above this line runs
+             one request at a time and is blind to the whole continuous-batch path -- which is
+             where the worst bug this model turned up lived, and it was not even ternary-specific:
+             decode_packed compacts a session's recurrent state to bf16, and a row that outlives
+             its batch was served from that state read at the wrong width.
+
+             The baseline is asked TWICE, sequentially, and the batched answer has to match one of
+             them. Not pedantry: measured on the NVFP4 Qwen3.8-27B checkpoint, three sequential
+             asks with no concurrency anywhere returned 354, 354 and 362 characters, so a single
+             baseline would have failed this check nightly on a model that was working. Two
+             baselines that disagree say the checkpoint is non-deterministic at temperature 0 and
+             the comparison cannot discriminate on it -- which is reported, not silently passed.
+             Costs a server start per path, so it is the slow check.
 
 Exits non-zero on the first failed check. Thresholds are deliberately loose -- they are there to
 catch a broken path, not to police the third decimal place.
@@ -196,7 +203,10 @@ def check_serve(a, failures):
                 failures.append(f"serve: {label} server never became healthy")
                 continue
 
+            # Two sequential baselines, so non-determinism at temperature 0 is told apart from a
+            # batching fault rather than being reported as one.
             alone = []
+            _chat(port, SERVE_LONG, 220, alone)
             _chat(port, SERVE_LONG, 220, alone)
 
             # Three short rows finish early and leave the long one decoding by itself, which is
@@ -212,16 +222,26 @@ def check_serve(a, failures):
             for t in threads:
                 t.join()
 
-            if not alone or not decayed:
+            if len(alone) < 2 or not decayed:
                 failures.append(f"serve: {label} produced no completion")
                 continue
-            same = alone[0] == decayed[0]
-            print(f"  {label:8s} alone {len(alone[0]):4d} chars, after a decayed batch "
-                  f"{len(decayed[0]):4d} -- {'identical' if same else 'DIFFERENT'}")
+            stable = alone[0] == alone[1]
+            same = decayed[0] in alone
+            print(f"  {label:8s} baselines {len(alone[0])}/{len(alone[1])} chars, after a decayed "
+                  f"batch {len(decayed[0])} -- {'matches a baseline' if same else 'MATCHES NEITHER'}"
+                  f"{'' if stable else '  (baselines disagree: checkpoint is non-deterministic)'}")
             if not same:
-                print(f"      alone  : {alone[0][:120]!r}")
-                print(f"      decayed: {decayed[0][:120]!r}")
-                failures.append(f"serve: {label} row served differently alone and after a batch")
+                if not stable:
+                    # Two baselines that already disagree cannot convict the batched path: report
+                    # it as unusable here rather than as a regression in the runtime.
+                    failures.append(
+                        f"serve: {label} is non-deterministic at temperature 0 (baselines differ), "
+                        f"so this check cannot discriminate -- investigate by hand")
+                else:
+                    print(f"      baseline: {alone[0][:120]!r}")
+                    print(f"      decayed : {decayed[0][:120]!r}")
+                    failures.append(
+                        f"serve: {label} row served differently alone and after a batch")
         finally:
             try:
                 os.killpg(os.getpgid(srv.pid), signal.SIGKILL)
