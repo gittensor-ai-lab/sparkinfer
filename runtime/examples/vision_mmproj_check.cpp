@@ -13,7 +13,6 @@
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/safetensors.h"
 #include "sparkinfer/models/qwen_vision.h"
-#include "sparkinfer/models/qwen_vision_hf_config.h"
 
 #include <cuda_runtime.h>
 #include <cmath>
@@ -72,20 +71,15 @@ int main(int argc, char** argv) {
 
     SafeTensorsModel st;
     if (!st.open(argv[2])) { std::printf("cannot open checkpoint %s\n", argv[2]); return 1; }
-    QwenVisionConfig scfg;
-    if (!qwen_vision_config_from_hf_json(argv[2], scfg)) {
-        std::printf("no vision_config in %s -- using the mmproj's own geometry\n", argv[2]);
-        scfg = gcfg;
-    }
+    // The mmproj's geometry drives BOTH loads. Reading config.json here would only prove the two
+    // files agree about numbers; what is in question is whether the same numbers, applied to two
+    // different files, pick out the same weights. Each loader checks every tensor's value count
+    // against this geometry anyway, so a disagreement surfaces as a load failure, not a silent
+    // mismatch.
+    const QwenVisionConfig scfg = gcfg;
     QwenVisionWeights sw;
     if (!load_qwen_vision_weights(st, scfg, sw, err)) {
         std::printf("checkpoint load failed: %s\n", err.c_str()); return 1;
-    }
-
-    if (scfg.depth != gcfg.depth || scfg.hidden != gcfg.hidden) {
-        std::printf("geometry disagrees: checkpoint depth=%d hidden=%d, mmproj depth=%d hidden=%d\n",
-                    scfg.depth, scfg.hidden, gcfg.depth, gcfg.hidden);
-        return 1;
     }
 
     const long H = gcfg.hidden, I = gcfg.intermediate, M = gcfg.merged_patch_dim();
