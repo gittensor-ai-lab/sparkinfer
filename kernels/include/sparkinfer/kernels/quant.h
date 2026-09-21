@@ -24,6 +24,13 @@ void launch_dequant_int4_block(const unsigned char* packed, const void* scales_b
 
 // GGUF block dequant -> bf16 (natural ggml order). ggml_type: 0=F32,1=F16,
 // 8=Q8_0,12=Q4_K,14=Q6_K. Q4_K/Q6_K validated byte-exact vs the gguf reference.
+// Which ggml types launch_gguf_dequant actually decodes. Load-bearing rather than advisory: the
+// launcher's final branch treats ANYTHING it does not recognise as F32 instead of refusing, so a
+// caller that skips this check turns an unsupported type into silent garbage at load. Kept beside
+// the launcher so the two cannot drift. (qwen35.cpp keeps a deliberately stricter local list that
+// excludes the sparkinfer-internal Q3A; this one describes the kernel.)
+bool gguf_dequant_supported(int ggml_type);
+
 void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_values,
                          cudaStream_t stream = nullptr);
 

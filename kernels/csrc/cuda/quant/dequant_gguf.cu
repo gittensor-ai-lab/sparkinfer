@@ -332,6 +332,12 @@ void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_
     else /* F32 */                   { deq_f32_kernel<<<(n_values+T-1)/T,T,0,stream>>>(reinterpret_cast<const float*>(src),d,n_values); }
 }
 
+bool gguf_dequant_supported(int ggml_type) {
+    return ggml_type == GGML_F32 || ggml_type == GGML_F16 || ggml_type == GGML_BF16 ||
+           ggml_type == GGML_Q8_0 || ggml_type == GGML_Q4_K || ggml_type == GGML_Q5_K ||
+           ggml_type == GGML_Q6_K || ggml_type == SI_QTYPE_Q3A;
+}
+
 bool launch_gguf_dequant_rows_i8(int ggml_type, const void* src, signed char* q, float* scale,
                                  int rows, int cols, cudaStream_t stream) {
     // Vector-store path: 4 consecutive values per thread => 4-byte stores, 128 B per warp, and the

@@ -52,7 +52,7 @@ const void* up(const GGUF& g, const std::string& name, long want,
               std::to_string(t->n_values);
         return nullptr;
     }
-    if (!kernels::ggml_dequant_supported(t->ggml_type)) {
+    if (!kernels::gguf_dequant_supported(t->ggml_type)) {
         err = name + ": unsupported ggml type " + std::to_string(t->ggml_type);
         return nullptr;
     }
