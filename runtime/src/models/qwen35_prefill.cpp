@@ -133,6 +133,70 @@ bool muse_fp4_chunked_on() {
     return v;
 }
 
+// Quantized bytes in one `cols`-long GGUF row, so a row slice can be read from the middle of
+// the tensor. 0 = a type this cannot offset into, which keeps the whole-layer staging.
+size_t muse_gguf_row_bytes(int qtype, int cols) {
+    switch (qtype) {
+        case 0:  return (size_t)cols * 4;                                  // F32
+        case 1:  return (size_t)cols * 2;                                  // F16
+        case 8:  return (cols & 31) ? 0 : (size_t)(cols >> 5) * 34;        // Q8_0
+        case 12: return (cols & 255) ? 0 : (size_t)(cols >> 8) * 144;      // Q4_K
+        case 13: return (cols & 255) ? 0 : (size_t)(cols >> 8) * 176;      // Q5_K
+        case 14: return (cols & 255) ? 0 : (size_t)(cols >> 8) * 210;      // Q6_K
+        default: return 0;
+    }
+}
+
+bool muse_nvfp4_q4k_direct() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_Q4K_DIRECT");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+bool muse_nvfp4_q6k_direct() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_Q6K_DIRECT");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+int muse_nvfp4_q6k_direct_maxn() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_Q6K_DIRECT_MAXN");
+        return e ? atoi(e) : 1024;
+    }();
+    return v;
+}
+
+// Build one NVFP4 B operand from a GGUF tensor. Q4_K always, and Q6_K up to
+// SPARKINFER_MUSE_NVFP4_Q6K_DIRECT_MAXN (1024), go straight from the packed bytes.
+// `act_m` is the GEMM's token/batch count, not the B-operand rows; above the cap the
+// Q6_K kernel's 210-byte loads lose to the sliced dequant. 0 = no cap.
+bool muse_stream_nvfp4_b(int qtype, const void* src, int n, int k,
+                         unsigned char* dst, unsigned char* dst_sf,
+                         bf16* tmp, int tmp_rows, cudaStream_t st, int act_m = 0) {
+    if (!src || !dst || !dst_sf || n <= 0 || k <= 0) return false;
+    if (qtype == 12 && muse_nvfp4_q4k_direct())
+        return kernels::launch_prefill_nvfp4_quant_b_q4k(src, dst, dst_sf, n, 0, n, k, st);
+    if (qtype == 14 && muse_nvfp4_q6k_direct() &&
+        (act_m <= 0 || act_m <= muse_nvfp4_q6k_direct_maxn()))
+        return kernels::launch_prefill_nvfp4_quant_b_q6k(src, dst, dst_sf, n, 0, n, k, st);
+    const size_t rb = muse_gguf_row_bytes(qtype, k);
+    if (!tmp || tmp_rows <= 0 || rb == 0) return false;
+    bool ok = true;
+    for (int r0 = 0; r0 < n && ok; r0 += tmp_rows) {
+        const int nr = (n - r0 < tmp_rows) ? (n - r0) : tmp_rows;
+        kernels::launch_gguf_dequant(
+            qtype, static_cast<const unsigned char*>(src) + (size_t)r0 * rb,
+            tmp, (long)nr * k, st);
+        ok = kernels::launch_prefill_nvfp4_quant_b_slice(tmp, dst, dst_sf, n, r0, nr, k, st);
+    }
+    return ok;
+}
+
 struct VerifyGraphCache {
     Arena arena;
     cudaGraph_t graph[kVerifyMaxRows + 1] = {};
@@ -1020,22 +1084,23 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // arena addresses are what
     // a captured prefill graph can safely replay. A failed arena alloc hands back nullptr
     // and the layer keeps the int8 path. SPARKINFER_MUSE_NVFP4_WO_STREAM=0 restores it (A/B in ONE
-    // binary); _WO_MINN sets the smallest prompt that converts (the down leg's 1024 by default).
+    // binary); _WO_MINN sets the smallest prompt that converts (the down leg's 512 by default).
     static const bool wo_stream_on = [] {
         const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_STREAM"); return !(e && e[0] == '0');
     }();
     static const int wo_min = [] {
-        const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_MINN"); return e ? atoi(e) : 1024;
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_MINN"); return e ? atoi(e) : 512;
     }();
     // Both streamed operands (o here, ffn_down below) convert Q4_K layers in ONE launch straight
     // from the GGUF bytes instead of dequant-to-bf16 slices plus a quantize over each: bit-identical
     // operand, no staging. SPARKINFER_MUSE_NVFP4_Q4K_DIRECT=0 restores the staged conversion.
-    static const bool q4k_direct = [] {
-        const char* e = getenv("SPARKINFER_MUSE_NVFP4_Q4K_DIRECT"); return !(e && e[0] == '0');
-    }();
     const int wo_type0 = s.w.layers.empty() ? -1 : s.w.layers[0].wo_type;
+    // Prefix fill is [0, n): layer 0 present and the last missing means some layers still
+    // need a streamed operand. All-resident (52/52) skips the convert.
+    const bool wo_missing = s.w.layers.empty() ||
+                            !s.w.layers[0].wo_fp4 || !s.w.layers.back().wo_fp4;
     const bool wo_stream = muse_nvfp4 && wo_stream_on && N >= wo_min &&
-                           !s.w.layers[0].wo_fp4 && s.w.layers[0].wo && (qdim & 255) == 0 &&
+                           wo_missing && s.w.layers[0].wo && (qdim & 255) == 0 &&
                            (wo_type0 == 12 || wo_type0 == 13 || wo_type0 == 14);
     const bool muse_nvfp4_wo = muse_nvfp4 && (s.w.layers[0].wo_fp4 || wo_stream) &&
                                kernels::prefill_nvfp4_supported(N, H, qdim);
@@ -1064,7 +1129,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // essentially no spare VRAM, and 341 MB held across a 64k prefill costs 85% of it -- measured
     // with the buffers allocated and never read, so it is the footprint alone, not this path.
     // Hence a floor: below dn_min the fixed conversion cost (52 layers) swamps a prefill that only
-    // takes ~36 ms.
+    // takes ~36 ms. 1024 was that knee when staging was 341 MB; with the 32 MB slice the convert
+    // is cheap enough that the 2.34x GEMM already pays at the scored 512-token prompt. Set
+    // SPARKINFER_MUSE_NVFP4_{WO,DOWN}_MINN=1024 to restore main.
     //
     // There used to be a CEILING as well, at 8192, and it was the 265.8 MB bf16 staging that put it
     // there -- 78% of that 341 MB. But the staging is a pure INTERMEDIATE: launch_gguf_dequant
@@ -1080,12 +1147,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // H is a multiple of 128 on this path (prefill_nvfp4_supported checks n & 127), so the tail
     // slice is aligned too.
     //
-    // The ceiling is now the allocator's to set, not a constant's: the three cudaMallocs are taken
-    // before the batched-prefill arena, so if a long-context KV cache really has left no room the
-    // conversion declines and the layer keeps today's int8 path. That is the same decline the
-    // partial-failure branch below already handled -- it just stops triggering 4x sooner.
+    // The ceiling is now the allocator's to set, not a constant's. The operand lives in the
+    // reused a8 arena (same pointers a captured prefill graph records) so a declined alloc keeps
+    // the int8 path and replay cannot touch a cudaFree'd address -- which is what a per-call
+    // cudaMalloc/cudaFree pair did on the third sighting of N.
     static const int dn_min = [] {
-        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MINN"); return e ? atoi(e) : 1024;
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MINN"); return e ? atoi(e) : 512;
     }();
     static const int dn_max = [] {
         const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MAXN"); return e ? atoi(e) : (1 << 30);
@@ -1100,33 +1167,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         const long v = e ? atol(e) : 32;
         return (v < 0) ? 32 : v;
     }();
-    // Quantized bytes in one `cols`-long GGUF row, so a row slice can be read from the middle of
-    // the tensor. 0 = a type this cannot offset into, which keeps the whole-layer staging.
-    auto dn_q_row_bytes = [](int qtype, int cols) -> size_t {
-        switch (qtype) {
-            case 0:  return (size_t)cols * 4;                                  // F32
-            case 1:  return (size_t)cols * 2;                                  // F16
-            case 8:  return (cols & 31) ? 0 : (size_t)(cols >> 5) * 34;        // Q8_0
-            case 12: return (cols & 255) ? 0 : (size_t)(cols >> 8) * 144;      // Q4_K
-            case 13: return (cols & 255) ? 0 : (size_t)(cols >> 8) * 176;      // Q5_K
-            case 14: return (cols & 255) ? 0 : (size_t)(cols >> 8) * 210;      // Q6_K
-            default: return 0;
-        }
-    };
-    // Frees on every exit path, including the two mid-function declines.
-    struct DownFp4Scratch {
-        void* tmp = nullptr; void* data = nullptr; void* sf = nullptr;
-        int rows = 0;                 // output rows staged at once; H = the whole layer
-        size_t row_bytes = 0;         // quantized bytes per row, for the sliced source offset
-        ~DownFp4Scratch() {
-            if (tmp) cudaFree(tmp);
-            if (data) cudaFree(data);
-            if (sf) cudaFree(sf);
-        }
-    } dn_scratch;
-    if (muse_nvfp4 && !s.w.layers[0].down_fp4 && dn_stream_on && N >= dn_min && N <= dn_max &&
-        kernels::prefill_nvfp4_supported(N, H, ffn)) {
-        const size_t rb = dn_q_row_bytes(s.w.layers[0].down_qtype, ffn);
+    int dn_st_rows = 0;
+    const bool dn_missing = s.w.layers.empty() ||
+                            !s.w.layers[0].down_fp4 || !s.w.layers.back().down_fp4;
+    const bool want_dn_stream = muse_nvfp4 && dn_missing && dn_stream_on &&
+                                N >= dn_min && N <= dn_max &&
+                                kernels::prefill_nvfp4_supported(N, H, ffn);
+    if (want_dn_stream) {
+        const size_t rb = muse_gguf_row_bytes(s.w.layers[0].down_qtype, ffn);
         int sr = H;
         if (dn_stage_mb > 0 && rb) {
             const size_t budget = (size_t)dn_stage_mb << 20;
@@ -1136,23 +1184,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             if (r < 128) r = 128;
             if (r < (size_t)H) sr = (int)r;
         }
-        dn_scratch.rows = sr;
-        dn_scratch.row_bytes = rb;
-        const size_t need_tmp = (size_t)sr * ffn * sizeof(bf16);
-        if (cudaMalloc(&dn_scratch.tmp, need_tmp) != cudaSuccess) dn_scratch.tmp = nullptr;
-        if (dn_scratch.tmp &&
-            cudaMalloc(&dn_scratch.data, kernels::prefill_nvfp4_data_bytes(H, ffn)) != cudaSuccess)
-            dn_scratch.data = nullptr;
-        if (dn_scratch.data &&
-            cudaMalloc(&dn_scratch.sf, kernels::prefill_nvfp4_scale_bytes_b(H, ffn)) != cudaSuccess)
-            dn_scratch.sf = nullptr;
-        if (!dn_scratch.sf) {   // partial failure: give it all back and keep the int8 path
-            if (dn_scratch.tmp)  { cudaFree(dn_scratch.tmp);  dn_scratch.tmp = nullptr; }
-            if (dn_scratch.data) { cudaFree(dn_scratch.data); dn_scratch.data = nullptr; }
-        }
+        dn_st_rows = sr;
     }
     const bool muse_nvfp4_down = muse_nvfp4 &&
-                                 (s.w.layers[0].down_fp4 || dn_scratch.sf) &&
+                                 (s.w.layers[0].down_fp4 || want_dn_stream) &&
                                  kernels::prefill_nvfp4_supported(N, H, ffn);
     const bool q38_nvfp4_down = q38_nvfp4 && s.w.layers[0].down_fp4 &&
                                 kernels::prefill_nvfp4_supported(N, H, ffn);
@@ -1175,8 +1210,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(H, qdim)) : nullptr;
     unsigned char* wo_st_sf = wo_st_want
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_b(H, qdim)) : nullptr;
-    const bool wo_st_stage = wo_st_want && !(q4k_direct && wo_type0 == 12);
+    const bool wo_st_stage = wo_st_want &&
+        !((muse_nvfp4_q4k_direct() && wo_type0 == 12) ||
+          (muse_nvfp4_q6k_direct() && wo_type0 == 14));
     bf16* wo_st_tmp = wo_st_stage ? a8.alloc<bf16>((size_t)wo_st_rows * qdim) : nullptr;
+    // Streamed ffn_down operand: same a8 arena as o, so the captured graph keeps these addresses.
+    // Direct Q4_K conversion needs no bf16 staging. A failed alloc leaves dn_st_sf null and the
+    // layer keeps the int8 path.
+    const bool dn_st_want = want_dn_stream && muse_nvfp4_down;
+    unsigned char* dn_st_data = dn_st_want
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(H, ffn)) : nullptr;
+    unsigned char* dn_st_sf = dn_st_want
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_b(H, ffn)) : nullptr;
+    const bool dn_st_stage = dn_st_want &&
+        !((muse_nvfp4_q4k_direct() && s.w.layers[0].down_qtype == 12) ||
+          (muse_nvfp4_q6k_direct() && s.w.layers[0].down_qtype == 14 &&
+           N <= muse_nvfp4_q6k_direct_maxn()));
+    bf16* dn_st_tmp = (dn_st_stage && dn_st_rows > 0)
+        ? a8.alloc<bf16>((size_t)dn_st_rows * ffn) : nullptr;
     // Sized by the FFN CHUNK, not the prompt. These two feed exactly one call --
     // launch_prefill_nvfp4_swiglu_quant_a(ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn) inside the
     // token-chunked FFN loop -- so they never hold more than FC rows. Sizing them by N asked for
@@ -2205,21 +2256,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             const void* wo4 = w.wo_fp4;
             const void* wo4_sf = w.wo_fp4_sf;
             if (!wo4 && wo_st_data && wo_st_sf && w.wo && c.muse_glimmer) {
-                const size_t rb = dn_q_row_bytes(w.wo_type, qdim);
-                const bool direct = q4k_direct && w.wo_type == 12;
-                bool wo_ok = rb != 0 && (direct || wo_st_tmp);
-                if (wo_ok && direct)
-                    wo_ok = kernels::launch_prefill_nvfp4_quant_b_q4k(w.wo, wo_st_data, wo_st_sf,
-                                                                      H, 0, H, qdim, st);
-                else for (int r0 = 0; r0 < H && wo_ok; r0 += wo_st_rows) {
-                    const int nr = (H - r0 < wo_st_rows) ? (H - r0) : wo_st_rows;
-                    kernels::launch_gguf_dequant(
-                        w.wo_type, static_cast<const unsigned char*>(w.wo) + (size_t)r0 * rb,
-                        wo_st_tmp, (long)nr * qdim, st);
-                    wo_ok = kernels::launch_prefill_nvfp4_quant_b_slice(
-                        wo_st_tmp, wo_st_data, wo_st_sf, H, r0, nr, qdim, st);
+                if (muse_stream_nvfp4_b(w.wo_type, w.wo, H, qdim, wo_st_data, wo_st_sf,
+                                        wo_st_tmp, wo_st_rows, st, N)) {
+                    wo4 = wo_st_data;
+                    wo4_sf = wo_st_sf;
                 }
-                if (wo_ok) { wo4 = wo_st_data; wo4_sf = wo_st_sf; }
             }
             const bool wo_fp4_gated = muse_nvfp4_wo && wo4 && wo4_sf && fp4_a && fp4_as &&
                 kernels::launch_prefill_nvfp4_gate_quant_a(att, gate_src, fp4_a, fp4_as, N, qdim,
@@ -2437,31 +2478,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // conversion. A layer whose conversion declines simply keeps today's int8 path.
             const void* dn_fp4    = w.down_fp4;
             const void* dn_fp4_sf = w.down_fp4_sf;
-            if (!dn_fp4 && nvfp4_down && ffn_fp4_possible && dn_scratch.sf && w.down_q) {
-                // Row slices of the output, dequant then quantize, so the bf16 staging only ever
-                // holds dn_scratch.rows of them. The slices are ordered on `st` behind each other
-                // and ahead of the GEMMs that read the operand, so one staging buffer is correct.
-                // The stride is THIS layer's, not layer 0's: the staging was sized from layer 0
-                // but a layer that quantized differently would offset differently, so a slice
-                // sweep only runs when this layer's own row stride is known.
-                const size_t rb = dn_q_row_bytes(w.down_qtype, ffn);
-                const int sr = dn_scratch.rows;          // never wider than the staging buffer
-                bool dn_ok = sr > 0 && (sr >= H || rb != 0);
-                if (dn_ok && q4k_direct && w.down_qtype == 12)
-                    dn_ok = kernels::launch_prefill_nvfp4_quant_b_q4k(w.down_q, dn_scratch.data,
-                                                                      dn_scratch.sf, H, 0, H, ffn, st);
-                else for (int r0 = 0; r0 < H && dn_ok; r0 += sr) {
-                    const int nr = (H - r0 < sr) ? (H - r0) : sr;
-                    kernels::launch_gguf_dequant(
-                        w.down_qtype,
-                        static_cast<const unsigned char*>(w.down_q) + (size_t)r0 * rb,
-                        (bf16*)dn_scratch.tmp, (long)nr * ffn, st);
-                    dn_ok = kernels::launch_prefill_nvfp4_quant_b_slice(
-                        dn_scratch.tmp, dn_scratch.data, dn_scratch.sf, H, r0, nr, ffn, st);
-                }
-                if (dn_ok) {
-                    dn_fp4 = dn_scratch.data;
-                    dn_fp4_sf = dn_scratch.sf;
+            if (!dn_fp4 && nvfp4_down && ffn_fp4_possible && dn_st_sf && dn_st_data && w.down_q) {
+                if (muse_stream_nvfp4_b(w.down_qtype, w.down_q, H, ffn, dn_st_data, dn_st_sf,
+                                        dn_st_tmp, dn_st_rows, st, N)) {
+                    dn_fp4 = dn_st_data;
+                    dn_fp4_sf = dn_st_sf;
                 }
             }
             for (int fo = 0; fo < N; fo += FC) {
@@ -3633,14 +3654,51 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (wb4 > wb) wb = wb4;
             fp4_qkv = a.alloc<bf16>((size_t)NA * qkvg_n);
         }
-        // ...and the o projection.
-        if (c.muse_glimmer && s.w.layers[0].wo_fp4) {
+        // o GEMM workspace even when the resident copy is missing: packed stream still runs it.
+        if (c.muse_glimmer) {
             const size_t wb5 = kernels::prefill_nvfp4_workspace_bytes(NA, H, qdim);
             if (wb5 > wb) wb = wb5;
         }
         fp4_a   = a.alloc<unsigned char>(ab);
         fp4_asf = a.alloc<unsigned char>(sb);
         if (wb) fp4_ws = a.alloc<unsigned char>(wb);
+    }
+    // Packed decode's streamed o/down operands. Persistent -- never freed -- because this
+    // function is CUDA-graph captured and a later cudaFree of a recorded pointer is the
+    // illegal-memory-access the prefill path hit with a per-call scratch. Failed allocs
+    // leave the Q4_K MMA in place. SPARKINFER_MUSE_PACKED_{WO,DOWN}_STREAM=0 restores it.
+    static const bool packed_wo_stream = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_STREAM");
+        return e && e[0] == '1';
+    }();
+    static const bool packed_dn_stream = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED_DOWN_STREAM");
+        return e && e[0] == '1';
+    }();
+    static const int packed_stream_min = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED_STREAM_MINROWS");
+        const int v = e ? atoi(e) : 8;
+        return v < 1 ? 1 : v;
+    }();
+    static unsigned char* packed_wo_data = nullptr;
+    static unsigned char* packed_wo_sf = nullptr;
+    static unsigned char* packed_dn_data = nullptr;
+    static unsigned char* packed_dn_sf = nullptr;
+    static bool packed_stream_tried = false;
+    if (packed && muse && !packed_stream_tried) {
+        packed_stream_tried = true;
+        auto try_pair = [](unsigned char** data, unsigned char** sf, size_t db, size_t sb) {
+            if (cudaMalloc(data, db) != cudaSuccess) { *data = nullptr; return; }
+            if (cudaMalloc(sf, sb) != cudaSuccess) { cudaFree(*data); *data = nullptr; *sf = nullptr; }
+        };
+        if (packed_wo_stream)
+            try_pair(&packed_wo_data, &packed_wo_sf,
+                     kernels::prefill_nvfp4_data_bytes(H, qdim),
+                     kernels::prefill_nvfp4_scale_bytes_b(H, qdim));
+        if (packed_dn_stream)
+            try_pair(&packed_dn_data, &packed_dn_sf,
+                     kernels::prefill_nvfp4_data_bytes(H, ffn),
+                     kernels::prefill_nvfp4_scale_bytes_b(H, ffn));
     }
     // DEBUG ONLY (dspark_tau_check bisection, 2026-08-17): SPARKINFER_DFLASH_VERIFY_DUMP_ROW=<row>
     // dumps that row's pre-attn-norm xn after EVERY layer, plus the post-final-norm xn, into
@@ -4510,8 +4568,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             static const bool packed_wo_gq8 = [] {
                 const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_GATE_Q8");
                 return !(e && e[0] == '0'); }();
+            const void* wo4 = w.wo_fp4;
+            const void* wo4_sf = w.wo_fp4_sf;
+            if (!wo4 && packed_wo_data && packed_wo_sf && packed && N >= packed_stream_min && w.wo &&
+                kernels::prefill_nvfp4_supported(Ng, H, qdim) &&
+                muse_stream_nvfp4_b(w.wo_type, w.wo, H, qdim, packed_wo_data, packed_wo_sf,
+                                    nullptr, 0, st, N)) {
+                wo4 = packed_wo_data;
+                wo4_sf = packed_wo_sf;
+            }
             const bool wo_want_fp4 = N >= wo_fp4_min_rows && fp4_a && fp4_asf &&
-                w.wo_fp4 && w.wo_fp4_sf && kernels::prefill_nvfp4_supported(Ng, H, qdim);
+                wo4 && wo4_sf && kernels::prefill_nvfp4_supported(Ng, H, qdim);
             const bool attn_gq8 = packed_wo_gq8 && !wo_want_fp4 && qg && q81 &&
                 (w.wo_type == 12 || w.wo_type == 8) && (qdim % 32 == 0);
             void* attn_q8 = attn_gq8 ? q81 : nullptr;
@@ -4536,7 +4603,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // SPARKINFER_MUSE_PACKED_WO_MIN_ROWS=33 restores the Q4_K projection.
             const bool wo_fp4_done = wo_want_fp4 &&
                 kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_asf, Ng, qdim, st) &&
-                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.wo_fp4, w.wo_fp4_sf,
+                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, wo4, wo4_sf,
                                                    ao, Ng, H, qdim, fp4_ws, st);
             if (!wo_fp4_done) {
                 if (!attn_gq8)
@@ -4570,12 +4637,20 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bool gu_gemm =
                 packed && topk == 1 && N >= gu_gemm_min_rows() &&
                 packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su, st);
-            // ...and down through its FP4 copy when it is resident, with the SwiGLU folded into
-            // its quantize -- the arm Qwen3.8's packed FFN already takes -- instead of the Q4_K
-            // mma rows, which were a quarter of the step.
-            const bool dn_gemm = gu_gemm && w.down_fp4 && w.down_fp4_sf &&
+            // ...and down through its FP4 copy when it is resident, or a streamed Q6_K convert
+            // into the persistent operand when it is not -- the Q4_K MMA was a quarter of the step.
+            const void* dn4 = w.down_fp4;
+            const void* dn4_sf = w.down_fp4_sf;
+            if (!dn4 && gu_gemm && packed_dn_data && packed_dn_sf && N >= packed_stream_min &&
+                w.down_q && kernels::prefill_nvfp4_supported(Ng, H, ffn) &&
+                muse_stream_nvfp4_b(w.down_qtype, w.down_q, H, ffn, packed_dn_data, packed_dn_sf,
+                                    nullptr, 0, st, N)) {
+                dn4 = packed_dn_data;
+                dn4_sf = packed_dn_sf;
+            }
+            const bool dn_gemm = gu_gemm && dn4 && dn4_sf &&
                 kernels::launch_prefill_nvfp4_swiglu_quant_a(sg, su, fp4_a, fp4_asf, Ng, ffn, st) &&
-                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.down_fp4, w.down_fp4_sf,
+                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, dn4, dn4_sf,
                                                    routed, Ng, H, ffn, fp4_ws, st,
                                                    w.down_fp4_alpha);
             if (!dn_gemm)
