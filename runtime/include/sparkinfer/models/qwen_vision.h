@@ -37,6 +37,15 @@ struct QwenVisionWeights {
 // Loads model.visual.* from an already-open checkpoint onto the device.
 bool load_qwen_vision_weights(SafeTensorsModel& st, const QwenVisionConfig& cfg,
                               QwenVisionWeights& w, std::string& err);
+
+// The same tower out of a llama.cpp `mmproj` GGUF (issue #1093), which is how a GGUF-only
+// deployment ships vision. Fills the SAME struct: everything downstream -- the forward pass, the
+// preprocessing, the splice into the token stream -- is identical either way, so a bug here shows
+// up as wrong embeddings rather than as a different code path.
+class GGUF;
+bool qwen_vision_config_from_gguf(const GGUF& g, QwenVisionConfig& cfg);
+bool load_qwen_vision_weights_gguf(const GGUF& g, const QwenVisionConfig& cfg,
+                                   QwenVisionWeights& w, std::string& err);
 void free_qwen_vision_weights(QwenVisionWeights& w);
 
 // Runs the tower on one image's patches.

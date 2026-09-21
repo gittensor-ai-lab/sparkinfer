@@ -97,6 +97,10 @@ if(BUILD_EXAMPLES)
                           nlohmann_json::nlohmann_json)   # same reason as qwen3_gguf_bench above
     # Model-free NVFP4 GEMM correctness check: isolates the kernel from the loader, the KV cache
     # and 64 layers of accumulation, so a shape-dependent defect shows up on its own.
+    add_executable(vision_mmproj_check examples/vision_mmproj_check.cpp)
+    target_link_libraries(vision_mmproj_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(vision_mmproj_check PROPERTIES CXX_STANDARD 17)
+
     add_executable(bonsai_inspect examples/bonsai_inspect.cpp src/gguf.cpp src/prism_hadamard.cpp src/ternary_ptq1.cpp)
     target_include_directories(bonsai_inspect PRIVATE include)
     set_target_properties(bonsai_inspect PROPERTIES CXX_STANDARD 17)
