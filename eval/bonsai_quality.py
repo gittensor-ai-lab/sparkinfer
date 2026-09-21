@@ -78,23 +78,35 @@ def stop(p):
 
 
 def score_corpus(port, lines):
-    """Per-line teacher-forced scoring. Returns (total_logprob, n_tokens, [argmax ids])."""
+    """Per-line teacher-forced scoring. Returns (total_logprob, n_tokens, [argmax ids]).
+
+    Each line is split at its first space: the first word conditions, the rest is scored. The
+    endpoint refuses an empty prompt by design -- there is nothing to condition on -- and the
+    split is identical for every model, so the comparison is fair even though the first word is
+    not itself scored.
+
+    Response shape is parallel ARRAYS, not a list of per-token objects: `logprobs[i]` and
+    `top_logprobs[i]` line up with `token_ids[i]`.
+    """
     total, n, argmax = 0.0, 0, []
     for line in lines:
+        cut = line.find(" ")
+        if cut <= 0 or cut == len(line) - 1:
+            continue                      # nothing to condition on, or nothing left to score
+        prompt, completion = line[:cut], line[cut:]
         # Raw text, no chat template: the corpus is prose, and a template would score the
         # template's own tokens as if they were the model's opinion of the text.
-        d = post(port, "/v1/score", {"model": "m", "prompt": "", "completion": line,
+        d = post(port, "/v1/score", {"model": "m", "prompt": prompt, "completion": completion,
                                      "top_logprobs": 1})
-        for t in d.get("tokens", d.get("logprobs", [])):
-            lp = t.get("logprob")
-            if lp is None:
-                continue
-            total += lp
-            n += 1
-            alts = t.get("top_logprobs") or []
-            if alts:
-                best = max(alts, key=lambda a: a.get("logprob", -1e30))
-                argmax.append(best.get("token_id", best.get("token")))
+        lps = d.get("logprobs") or []
+        alts = d.get("top_logprobs") or []
+        total += float(d.get("sum_logprob", sum(lps)))
+        n += len(lps)
+        for i in range(len(lps)):
+            per = alts[i] if i < len(alts) else []
+            if per:
+                best = max(per, key=lambda a: a.get("logprob", -1e30))
+                argmax.append(best.get("token_id"))
             else:
                 argmax.append(None)
     return total, n, argmax
