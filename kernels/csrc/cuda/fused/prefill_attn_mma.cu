@@ -1370,9 +1370,11 @@ bool launch_prefill_attn_mma(
     }();
     // Smallest KV span (prefix + this pass's queries) that takes the six-head tier below.
     // 0 disables it and restores the RQH=3 tier everywhere.
+    // 65536 restores the previous floor (A/B in ONE binary): 16k/32k stay on RQH=3, only
+    // the 256k windows that already cleared L2 take six heads.
     static const long wide_minkeys = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_GQA6_MINKEYS");
-        const long v = e ? atol(e) : 65536;
+        const long v = e ? atol(e) : 16384;
         return v < 0 ? 0 : v;
     }();
     // The six-head tier's operand issue path: permuted k axis + 16-byte-per-lane K operand load,
@@ -1440,12 +1442,15 @@ bool launch_prefill_attn_mma(
     // (keys) x (blocks that share the kv-head), and that second factor is n_tokens/BM x gqa/RQH --
     // at GQA-6 and RQH=3 every kv-head's stream is pulled twice. Six heads pulls it once.
     //
-    // At ctx=32768 six heads is worth almost nothing and costs the GN=256 group: a kv-head's
-    // whole K+V there is 16 MB, L2 holds it, and the second read is very nearly free. At 262144
-    // that stream is 134 MB against a 96 MB L2 and it is not free at all. Skip-probed on this
-    // checkpoint at ctx=262144: stubbing the V pool read is +30.6% on the dimension and stubbing
-    // the K pool read is +23.3%, so the two streams are over half of it -- which is what makes
-    // halving them worth a tier, and why the tier is gated on length.
+    // At ctx=32768 a kv-head's whole K+V is 16 MB and L2 still holds it, so six heads vs RQH=3
+    // is a wash on the pool traffic alone -- and that is why the floor used to sit at 65536,
+    // past where the stream leaves L2. What the six-head launch also carries is the WIDEK +
+    // PVU=2 operand path (one lever, SPARKINFER_PREFILL_ATTN_WIDEK=0 restores both), which was
+    // measured at +6.2% on the 256k window and is reachable at 16k/32k the moment this floor
+    // drops. On the unsloth NVFP4 checkpoint that is the scored 16k prefill: same-binary
+    // 10208.33 -> 10632.04 pp/s at 16k and 9064.21 -> 9640.36 at 32k, decode at both lengths
+    // flat. 4k (span 4096) and every packed-decode width stay on RQH=3 -- n_tokens < 2048,
+    // or the span is under the floor. SPARKINFER_PREFILL_ATTN_GQA6_MINKEYS=65536 restores main.
     //
     // What made six heads fit is the rolling score plane: SPL=2 keeps only two heads of scores
     // live, so the plane costs 2*BM*GN floats instead of 6 and the whole block is 88,448 B rather
@@ -1454,9 +1459,8 @@ bool launch_prefill_attn_mma(
     // K three times and give the traffic straight back.
     //
     // Gated on the KV SPAN, not on n_tokens: a windowed long-prompt pass ingests 16,384 tokens at
-    // a time, so n_tokens alone cannot tell a 16k prompt from the tenth window of a 256k one. That
-    // keeps every short-context caller -- the 4k/16k prefill dimensions and both cross-model
-    // guards -- on exactly the tier, tile shape and arithmetic they have today.
+    // a time, so n_tokens alone cannot tell a 16k prompt from the tenth window of a 256k one.
+    // 4k prefill and both cross-model guards at short context stay on the RQH=3 tile they had.
     if (gqa_rqh >= 3 && gqa % 6 == 0 && wide_minkeys > 0 &&
         (long)q_pos0 + n_tokens >= wide_minkeys && n_tokens >= 2048 && gqa_gb >= 16) {
         // Every key this pass reads lives below q_pos0 + n_tokens, so that is the plane.

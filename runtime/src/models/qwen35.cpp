@@ -6962,12 +6962,24 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             const char* e = getenv("SPARKINFER_MUSE_NVFP4_OUTPUTS_MAXSEQ");
             return e ? atoi(e) : 4096;
         }();
+        // All-or-nothing still refuses the whole set above outputs_maxseq (a 3.9 GB down copy
+        // at 64k leaves the 16k prefill arena 24 MB). The prefix fill used to share that bound,
+        // so the scored 64k load kept 0/52 of both legs. Allow the prefix at long max_seq and
+        // leave a larger keep (below) for the arena. SPARKINFER_MUSE_NVFP4_PREFIX_LONG=0 restores
+        // the skip.
+        static const bool prefix_long = [] {
+            const char* e = getenv("SPARKINFER_MUSE_NVFP4_PREFIX_LONG");
+            return e && e[0] == '1';
+        }();
+        wo_fp4_on = wo_fp4_on && c.max_seq <= outputs_maxseq;
         bool down_fp4_on = c.max_seq <= outputs_maxseq;
         if (fp4o_env)
             down_fp4_on = fp4o_env[0] == '1' || fp4o_env[0] == 'd';
-        wo_fp4_on = wo_fp4_on && c.max_seq <= outputs_maxseq;
+        // o-proj prefix at 64k ate 52/52 copies (~0.8 GB) and dropped the 16k FFN chunk
+        // 4096 -> 1024. Down is worth ~4x more per byte; o stays streamed per layer from N=512.
         const bool wo_eligible = wo_fp4_on;
-        const bool down_eligible = down_fp4_on;
+        const bool down_eligible = (!fp4o_env || fp4o_env[0] != '0') &&
+                                   (down_fp4_on || prefix_long);
         // Cost EVERY copy that grows the footprint against the free VRAM that is actually there,
         // and drop legs in ascending order of what they are worth until the set fits. Only these
         // three grow it: gate/up convert and then release their native prefill copy, so they are
@@ -7219,9 +7231,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // 742 tok/s (max_itl 4.7 s). 1024 MiB is the same floor ffn_down and qkv-gate already
         // use; it holds 10/52 layers and leaves a contiguous arena, 1566 tok/s. 0 restores
         // main's skip. SPARKINFER_MUSE_NVFP4_WO_KEEP_MB=736 is the previous default.
-        static const long long wo_keep_mb = [] {
+        const long long wo_keep_mb = [&] {
             const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_KEEP_MB");
-            return e ? atoll(e) : 1024LL;
+            if (e) return atoll(e);
+            // 16k prefill scratch is ~1042 MB; at max_seq 65536 a 1024 keep left 24 MB free
+            // and the batched pass fell to the token loop. 2560 covers that arena plus the
+            // graph pools. Short sessions (cb at ~832) keep 1024 -- that is the 10/52 floor.
+            return c.max_seq >= 16384 ? 2560LL : 1024LL;
         }();
         if (ok && wo_eligible && !wo_fp4_on && wo_keep_mb > 0) {
             const size_t per_layer = kernels::prefill_nvfp4_data_bytes(H, s.qdim) +
@@ -7248,9 +7264,10 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // What it must leave is the runtime's own allocation after load, measured at ~576 MiB at 8
         // sessions: a 512 MiB margin starves the batched-prefill scratch and halves throughput, so
         // the default keeps 1024. SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB tunes it; 0 restores main.
-        static const long long down_keep_mb = [] {
+        const long long down_keep_mb = [&] {
             const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB");
-            return e ? atoll(e) : 1024LL;
+            if (e) return atoll(e);
+            return c.max_seq >= 16384 ? 2560LL : 1024LL;
         }();
         if (ok && down_eligible && !down_fp4_on && down_keep_mb > 0) {
             const size_t per_layer = kernels::prefill_nvfp4_data_bytes(H, c.moe_ffn) +

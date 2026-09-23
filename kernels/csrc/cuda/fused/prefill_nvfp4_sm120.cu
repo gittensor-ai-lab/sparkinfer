@@ -894,6 +894,93 @@ bool launch_prefill_nvfp4_quant_b_q4k(const void* s, void* d, void* sf, int n, i
             (cutlass::float_ue4m3_t*)sf, rows, k, l, n0);
     return cudaPeekAtLastError() == cudaSuccess;
 }
+// Q6_K rows straight to the B operand, same warp mapping as quant_b_q4k_kernel. Muse ffn_down is
+// type 14, 210 B per 256-value super-block -- not a multiple of 16, so every load is a byte or
+// a ushort (the d scale at +208 is 2-aligned). One warp per super-block, two lanes per 16-value
+// FP4 group; a group sits inside one Q6_K quad so one signed scale covers it.
+//
+// BIT-IDENTICAL to deq_q6k_kernel + quant_rows_t<2>: every value is d*sc[is+2*quad]*qv rounded
+// through bf16 the way the dequant stores it, the amax is order-independent, and the scale,
+// division and fp4_pack<8> are quant_rows_t<2>'s. SHARED is the Q4_K default: each lane decodes
+// the 8 values it encodes. SPARKINFER_NVFP4_Q6K_SHARED_AMAX=0 restores the unshared lanes.
+template <bool SHARED, class Layout>
+__global__ void quant_b_q6k_kernel(const unsigned char* __restrict__ src,
+                                   unsigned char* __restrict__ dst, cutlass::float_ue4m3_t* sf,
+                                   int rows, int cols, Layout layout, int n0) {
+    const long nsb  = cols >> 8;
+    const long gtid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long b    = gtid >> 5;
+    if (b >= (long)rows * nsb) return;
+    const int lane = (int)(gtid & 31);
+    const int row  = (int)(b / nsb);
+    const int sbi  = (int)(b - (long)row * nsb);
+
+    const unsigned char* blk = src + b * 210;
+    const int sub = lane & 1;
+    const int g0  = (lane >> 1) << 4;
+    const int half = g0 >> 7;
+    const int r    = g0 & 127;
+    const int quad = r >> 5;
+    const int is   = (r & 31) >> 4;
+    const unsigned char* ql = blk + half * 64;
+    const unsigned char* qh = blk + 128 + half * 32;
+    const signed char* sc = reinterpret_cast<const signed char*>(blk + 192) + half * 8;
+    __half hd;
+    *((unsigned short*)&hd) = *(const unsigned short*)(blk + 208);
+    const float dd = __half2float(hd) * (float)sc[is + 2 * quad];
+
+    float x[16];
+    float a = 0.f;
+    const int v0 = SHARED ? sub * 8 : 0;
+    const int nv = SHARED ? 8 : 16;
+    #pragma unroll
+    for (int t = 0; t < nv; t++) {
+        const int ll = (g0 + v0 + t) & 31;
+        int qv;
+        if (quad == 0)      qv = (int)((ql[ll]      & 0xF) | (((qh[ll] >> 0) & 3) << 4)) - 32;
+        else if (quad == 1) qv = (int)((ql[ll + 32] & 0xF) | (((qh[ll] >> 2) & 3) << 4)) - 32;
+        else if (quad == 2) qv = (int)((ql[ll]      >>  4) | (((qh[ll] >> 4) & 3) << 4)) - 32;
+        else                qv = (int)((ql[ll + 32] >>  4) | (((qh[ll] >> 6) & 3) << 4)) - 32;
+        x[v0 + t] = __bfloat162float(__float2bfloat16(dd * qv));
+        a = fmaxf(a, fabsf(x[v0 + t]));
+    }
+    if constexpr (SHARED) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
+    cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
+    const float qsf = float(qs);
+    float xq[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) xq[i] = x[sub * 8 + i] / qsf;
+    unsigned char packed[4];
+    fp4_pack<8>(xq, packed);
+    const size_t base = (size_t)row * cols + (size_t)sbi * 256 + g0 + sub * 8;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) dst[(base >> 1) + i] = packed[i];
+    if (sub == 0) {
+        auto scales = cute::make_tensor(sf, layout);
+        scales(n0 + row, sbi * 256 + g0, 0) = qs;
+    }
+}
+bool launch_prefill_nvfp4_quant_b_q6k(const void* s, void* d, void* sf, int n, int n0, int rows,
+                                      int k, cudaStream_t st) {
+    if (!s || !d || !sf || !prefill_nvfp4_supported(128,n,k)) return false;
+    if ((k & 255) || n0 < 0 || rows <= 0 || n0 > n - rows || (n0 & 127) || (rows & 127))
+        return false;
+    auto l = sfb_layout(128,n,k);
+    const long warps = (long)rows * (k >> 8);
+    static const bool shared = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_Q6K_SHARED_AMAX"); return !(e && e[0] == '0');
+    }();
+    const unsigned blocks = (unsigned)((warps * 32 + 255) / 256);
+    if (shared)
+        quant_b_q6k_kernel<true><<<blocks,256,0,st>>>(
+            (const unsigned char*)s, (unsigned char*)d + (((size_t)n0 * k) >> 1),
+            (cutlass::float_ue4m3_t*)sf, rows, k, l, n0);
+    else
+        quant_b_q6k_kernel<false><<<blocks,256,0,st>>>(
+            (const unsigned char*)s, (unsigned char*)d + (((size_t)n0 * k) >> 1),
+            (cutlass::float_ue4m3_t*)sf, rows, k, l, n0);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
 // Rows [n0, n0+rows) of an `n`-row B operand, quantized from a bf16 buffer holding ONLY those
 // rows. `d` and `sf` are the whole operand: the data offset is exact (n0 is a multiple of the
 // 32x4 = 128-row scale-factor atom, so n0*k nibbles are a whole number of bytes) and the scale

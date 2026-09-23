@@ -580,7 +580,41 @@ __device__ __forceinline__ float si_fp8_deq(const __nv_fp8_e4m3* row, int k, flo
     return __bfloat162float(__float2bfloat16(float(row[k]) * scale));
 }
 
-template <typename OutT, int S>
+// Same rounding as si_fp8_deq, from the stored e4m3 byte rather than a pointer+index.
+// float(__nv_fp8_e4m3) is the IEEE value of that code; the bf16 round-trip is what
+// keep_bf16 + launch_gemv stores, so this is bit-identical to indexing the row.
+__device__ __forceinline__ float si_fp8_deq_u8(unsigned char bits, float scale) {
+    __nv_fp8_e4m3 e;
+    e.__x = bits;
+    return __bfloat162float(__float2bfloat16(float(e) * scale));
+}
+
+// Eight consecutive e4m3 as one 8-byte load. launch_gemv_fp8 already requires K % 8 == 0
+// on the split-K path, so a row base n*K is 8-byte aligned for every shape that reaches
+// here (GDN in/out, qkv, lm_head). Evict-first: the weight row is streamed once per call
+// and would otherwise flush the activation that every CTA re-reads.
+__device__ __forceinline__ void si_fp8_deq8(const __nv_fp8_e4m3* row8, float scale, float* wv) {
+    const uint2 pw = __ldcs(reinterpret_cast<const uint2*>(row8));
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&pw);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) wv[j] = si_fp8_deq_u8(b[j], scale);
+}
+
+__device__ __forceinline__ void si_fp8_fma8(float& acc, const float* wv, const uint4& xv) {
+    const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const float2 xf = __bfloat1622float2(xh[j]);
+        acc += wv[2 * j] * xf.x + wv[2 * j + 1] * xf.y;
+    }
+}
+
+// VEC=true: one 8-byte weight load per K-chunk, two chunks in flight. The K walk, the
+// 8-wide association and the per-j (even * x, odd * y) adds are the same as VEC=false,
+// which is the previous byte-at-a-time kernel; only when the bytes land and how many
+// loads are in flight changes. SPARKINFER_FP8_GEMV_VEC=0 restores VEC=false (A/B in ONE
+// binary).
+template <typename OutT, int S, bool VEC>
 __global__ void gemv_fp8_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                    const void* __restrict__ packed,
                                    OutT* __restrict__ y, int N, int K) {
@@ -598,15 +632,37 @@ __global__ void gemv_fp8_sk_kernel(const __nv_bfloat16* __restrict__ x,
         // fp32 reduction matches keep_bf16 + launch_gemv up to the on-read dequant.
         const int n8 = K >> 3;
         const uint4* x4 = reinterpret_cast<const uint4*>(x);
-        for (int i = split * 32 + lane; i < n8; i += S * 32) {
+        const int stride = S * 32;
+        int i = split * 32 + lane;
+        if constexpr (VEC) {
+            // Two-group trip: issue the next weight+activation while the current dequant/FMA
+            // still occupies ALUs. Group order is i, i+stride, i+2*stride, ... -- the same
+            // sequence the one-group loop walks, so every add hits acc in the same order.
+            for (; i + stride < n8; i += 2 * stride) {
+                const uint4 xv0 = x4[i];
+                const uint4 xv1 = x4[i + stride];
+                float wv0[8], wv1[8];
+                si_fp8_deq8(row + i * 8, s, wv0);
+                si_fp8_deq8(row + (i + stride) * 8, s, wv1);
+                si_fp8_fma8(acc, wv0, xv0);
+                si_fp8_fma8(acc, wv1, xv1);
+            }
+        }
+        for (; i < n8; i += stride) {
             const uint4 xv = x4[i];
-            const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
             const int base = i * 8;
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const float2 xf = __bfloat1622float2(xh[j]);
-                acc += si_fp8_deq(row, base + 2 * j, s) * xf.x
-                    +  si_fp8_deq(row, base + 2 * j + 1, s) * xf.y;
+            if constexpr (VEC) {
+                float wv[8];
+                si_fp8_deq8(row + base, s, wv);
+                si_fp8_fma8(acc, wv, xv);
+            } else {
+                const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const float2 xf = __bfloat1622float2(xh[j]);
+                    acc += si_fp8_deq(row, base + 2 * j, s) * xf.x
+                        +  si_fp8_deq(row, base + 2 * j + 1, s) * xf.y;
+                }
             }
         }
         #pragma unroll
@@ -622,9 +678,12 @@ __global__ void gemv_fp8_sk_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 #ifndef _MSC_VER
-template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 2>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
-template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
-template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 2, true>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 4, true>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 8, true>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 2, false>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 4, false>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 8, false>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 #endif
 
 // M activation rows against one FP8 weight matrix, in a single pass over W.
@@ -642,7 +701,7 @@ template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat1
 // Bit-identical to the per-row path, which the losslessness gate requires: same 8-wide uint4
 // K-association, same per-j (even * x, odd * y) accumulation order, same ordered split sum seeded
 // from split 0. Only the number of times W is fetched changes.
-template <typename OutT, int S, int M>
+template <typename OutT, int S, int M, bool VEC>
 __global__ void gemv_fp8_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                         const void* __restrict__ packed,
                                         OutT* __restrict__ y, int N, int K) {
@@ -663,8 +722,11 @@ __global__ void gemv_fp8_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
             const int base = i * 8;
             // The one fetch-and-dequant every row then shares.
             float wv[8];
+            if constexpr (VEC) si_fp8_deq8(row + base, s, wv);
+            else {
 #pragma unroll
-            for (int j = 0; j < 8; ++j) wv[j] = si_fp8_deq(row, base + j, s);
+                for (int j = 0; j < 8; ++j) wv[j] = si_fp8_deq(row, base + j, s);
+            }
 #pragma unroll
             for (int r = 0; r < M; ++r) {
                 const uint4 xv = reinterpret_cast<const uint4*>(x + (size_t)r * K)[i];
@@ -2922,6 +2984,13 @@ static int gemv_bf16_splitk() {
     if (v < 0) { const char* e = getenv("SPARKINFER_GEMV_SK"); v = (e && e[0] == '0') ? 0 : 1; }
     return v;
 }
+// 8-byte weight load + two K-chunks in flight on the FP8 GEMV. 0 restores the
+// previous byte-at-a-time inner loop (A/B in ONE binary).
+static int gemv_fp8_vec() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPARKINFER_FP8_GEMV_VEC"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
 void launch_gemv(const void* x, const void* W, void* y, int N, int K, cudaStream_t stream) {
     // pick the smallest split S so N*S ~ 16384 warps fill the SMs (larger S = more reduction
     // overhead). N < 16384 covers every Qwen3.6 launch_gemv site (projections top out at 8192 rows);
@@ -3052,16 +3121,15 @@ void launch_gemv_fp8(const void* x, const void* W, void* y, int N, int K, cudaSt
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
     if (gemv_bf16_splitk() && (K & 7) == 0 && N < 16384) {
-        if (N >= 8192) {
-            constexpr int S = 2, RPB = GEMV_WPB / S;
-            gemv_fp8_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
-        } else if (N >= 4096) {
-            constexpr int S = 4, RPB = GEMV_WPB / S;
-            gemv_fp8_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
-        } else {
-            constexpr int S = 8, RPB = GEMV_WPB / S;
-            gemv_fp8_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
-        }
+        const bool vec = gemv_fp8_vec();
+#define SI_FP8_SK(S_, V_) do { \
+            constexpr int S = (S_), RPB = GEMV_WPB / S; \
+            gemv_fp8_sk_kernel<__nv_bfloat16, S, (V_)><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+        } while (0)
+        if (N >= 8192)      { if (vec) SI_FP8_SK(2, true); else SI_FP8_SK(2, false); }
+        else if (N >= 4096) { if (vec) SI_FP8_SK(4, true); else SI_FP8_SK(4, false); }
+        else                { if (vec) SI_FP8_SK(8, true); else SI_FP8_SK(8, false); }
+#undef SI_FP8_SK
         return;
     }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
@@ -3083,15 +3151,22 @@ bool launch_gemv_fp8_rows(const void* x, const void* W, void* y, int M, int N, i
     if (!gemv_bf16_splitk() || N >= 16384) return false;
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
-#define SI_FP8_ROWS(S_, R_) do { \
+    const bool vec = gemv_fp8_vec();
+#define SI_FP8_ROWS(S_, R_, V_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
         const dim3 grid((N + RPB - 1) / RPB); \
-        gemv_fp8_rows_sk_kernel<__nv_bfloat16, S, R><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+        gemv_fp8_rows_sk_kernel<__nv_bfloat16, S, R, (V_)><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
     } while (0)
 #define SI_FP8_ROWS_S(R_) do { \
-        if (N >= 8192)      SI_FP8_ROWS(2, R_); \
-        else if (N >= 4096) SI_FP8_ROWS(4, R_); \
-        else                SI_FP8_ROWS(8, R_); \
+        if (vec) { \
+            if (N >= 8192)      SI_FP8_ROWS(2, R_, true); \
+            else if (N >= 4096) SI_FP8_ROWS(4, R_, true); \
+            else                SI_FP8_ROWS(8, R_, true); \
+        } else { \
+            if (N >= 8192)      SI_FP8_ROWS(2, R_, false); \
+            else if (N >= 4096) SI_FP8_ROWS(4, R_, false); \
+            else                SI_FP8_ROWS(8, R_, false); \
+        } \
     } while (0)
     switch (M) {
         case 2: SI_FP8_ROWS_S(2); break;  case 3: SI_FP8_ROWS_S(3); break;

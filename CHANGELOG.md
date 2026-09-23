@@ -11,37 +11,38 @@ against the unquantized checkpoint's 4.46 through the same runtime.
 
 ### Models
 
-- **PTQ1_0, the ternary weight format** (#1122). Trits packed 128 to a 28-byte block with one FP16
+- **PTQ1_0, the ternary weight format** (#1124). Trits packed 128 to a 28-byte block with one FP16
   scale, read in ggml's TQ1_0 order: carrier bytes are walked in two runs and each emits its trits
   position-major. Reading them carrier-major decodes every value correctly and puts every one in
   the wrong place, which no round-trip test can see because it packs with the order it unpacks.
-- **The checkpoint's Hadamard rotation is folded into the weights at load** (#1122). Each rotated
+- **The checkpoint's Hadamard rotation is folded into the weights at load** (#1124). Each rotated
   row is stored as `R.W[o]`; un-rotating with `R^-1 = diag(s).H` is the same arithmetic moved to
   the other operand and leaves an ordinary model, so no graph needs a rotation inserted and every
   existing kernel applies unchanged. `token_embd` un-rotates like the rest — the metadata's
   `inverse_weight_names` describes a runtime obligation, not a storage direction.
-- **The GDN v heads are regrouped** (#1122). Everything producing a v head — `attn_qkv`'s v rows,
+- **The GDN v heads are regrouped** (#1124). Everything producing a v head — `attn_qkv`'s v rows,
   `attn_gate`, `ssm_conv1d`'s v channels, `ssm_a`, `ssm_dt.bias`, `ssm_alpha`, `ssm_beta` — stores
   its 48 heads transposed, while `ssm_out`, which consumes them, does not. The loader puts the
   producers back in the architecture's order, and `gdn_qh_block` now follows from the GGUF side as
   it already did from the safetensors side: that pairing was cyclic for every GGUF of this family,
   so each v head was driven by the wrong q/k head.
-- **BF16 tensors are sized and dequantized** (#1122). Type 30 had no entry in the GGUF block table,
+- **BF16 tensors are sized and dequantized** (#1124). Type 30 had no entry in the GGUF block table,
   so every BF16 tensor sized to nothing and surfaced as a device allocation failing on an unrelated
   name much later.
-- **Q4_K's `d` is kept a normal fp16** (#1122). It is 1/63 of the weights it describes, so any
+- **Q4_K's `d` is kept a normal fp16** (#1124). It is 1/63 of the weights it describes, so any
   group scale below ~3.8e-3 drove it subnormal and the writer flushed it to zero.
 
 ### Fixed
 
-- **A concurrent request could be served from a recurrent state read at the wrong width** (#1122).
+- **A concurrent request could be served from a recurrent state read at the wrong width** (#1123).
   Continuous-batch decode compacts a session's Gated-DeltaNet state to bf16, packed from the
-  allocation base, the first time it packs that session. Three things then disagreed with it, and
-  all three produce fluent-looking output that degenerates a few tokens in rather than an error:
+  allocation base, the first time it packs that session. Three things disagreed with that
+  representation, and all three produce fluent output that degenerates a few tokens in rather
+  than an error:
   - `launch_qwen36_gdn_ar` took a pointer the caller had already advanced to the layer's slot,
     while its batched twin took the base pointer and a separate `state_off`. Under the compacted
     form the slot offset counts bf16 elements, so advancing a `float*` by it landed every slot at
-    twice its byte offset — layer 0 correct, the other 47 GDN layers reading a slot they do not
+    twice its byte offset — layer 0 correct, every other GDN layer reading a slot it does not
     own. Both launchers now take `(state, state_off)`.
   - The decode CUDA graph bakes which representation its kernels read, but its validity key was
     only `(attn_mode, sparse, n_splits)`. A request that decodes alone, joins a batch, then
@@ -52,18 +53,19 @@ against the unquantized checkpoint's 4.46 through the same runtime.
     process that had already compacted some — ran one kernel instantiation over both kinds. It is
     declined now; the per-row fallback consults each session's own flag.
 
-  None of this is specific to the ternary model that exposed it. It is reachable on the default
-  path for every hybrid model at concurrency, because the unbatched kernel serves a row whenever
-  the packed batch declines *or decays to a single row*, which is every batch as its requests
-  finish at different lengths. `gdn_batched_gpu_test` covered a non-zero slot offset and passed
-  throughout, because it only ever ran fp32; it now runs the compacted form too.
-- **A verify decline is reported once, not once per decode step** (#1122). A model the packed path
-  cannot drive declines forever, and the decline sites wrote to stderr unconditionally — two lines
-  per decode token, on top of whatever else the log was meant to show.
+  The unbatched kernel serves a row whenever the packed batch declines **or decays to a single
+  live row**, so this is reachable on the default path for every hybrid model at concurrency, as
+  a batch's requests finish at different lengths. `gdn_batched_gpu_test` covered a non-zero slot
+  offset and passed throughout, because it only ever ran fp32; it now runs the compacted form
+  too. The reproduction is to ask one prompt at temperature 0 alone and again inside a batch that
+  decays to one row, and compare — a flat concurrent batch does not show it.
+- **A verify decline is reported once, not once per decode step** (#1123). A model the packed
+  path cannot drive declines forever, and the decline sites wrote to stderr unconditionally — two
+  lines per decode token, on top of whatever else the log was meant to show.
 
 ### Serving
 
-- **Ternary weights can be read in their stored form** (#1122), behind
+- **Ternary weights can be read in their stored form** (#1124), behind
   `SPARKINFER_BONSAI_NATIVE` (`head`, `embed`, `proj`, or `all`). Folding the rotation into the
   weights is exact but leaves them dense, so a 5.95 GB checkpoint occupies ~18 GB; reading the
   28-byte blocks directly costs 0.21875 bytes/weight and rotates the activation instead. The LM
@@ -95,7 +97,7 @@ against the unquantized checkpoint's 4.46 through the same runtime.
   So it is less than half the memory and the best-scoring of the three, at 2.9x the single-stream
   cost and 2.6x at concurrency. It is a real option for a card that cannot hold 18 GB at all, and
   the wrong default for one that can.
-- **Packed continuous-batch decode drives the ternary path** (#1122), which took it from 34.3 to
+- **Packed continuous-batch decode drives the ternary path** (#1124), which took it from 34.3 to
   82.7 tok/s at four concurrent requests. It used to decline on every step -- correct, since a
   declined batch falls back to one forward per row, but it meant concurrency bought almost
   nothing. Three arms were needed, because the packed path prepares activations three ways: the
@@ -111,7 +113,7 @@ against the unquantized checkpoint's 4.46 through the same runtime.
   select chain and one shared-memory staging per block: 1.9x on the full native path (16.0 to 29.8
   tok/s single-stream, 17.9 to 34.3 at four concurrent), bit-identical, which
   `gemv_ptq1_gpu_test` checks against a host decoder and against N separate GEMVs.
-- **The Qwen3.8-27B family is recognised by shape** (#1122), not by the presence of an MTP block.
+- **The Qwen3.8-27B family is recognised by shape** (#1124), not by the presence of an MTP block.
   A derivative without one was served under the default model name of an unrelated 35B MoE, and
   the same flag selects this family's chat-template behaviour and its second stop token (248044),
   which GGUF metadata cannot carry beside the one `eos_token_id` it has room for.
