@@ -73,7 +73,11 @@ __global__ void pf_quantize_rows_i8(const __nv_bfloat16* __restrict__ x, signed 
 // tile into P[M,N] with atomicAdd instead of storing C; a separate epilogue applies sx/sw. The
 // output is bit-identical because the accumulator is int32: integer addition is exact and
 // associative, so the reordered partial sums land on the same value the single-block loop produces.
-template <bool RESID, bool SPLITK>
+// FULL: M, N and K are exact multiples of the tile, so every stage and every epilogue store is
+// in range. The predicates are data-dependent otherwise and ptxas cannot delete them; on the
+// aligned FFN shapes they are pure issue overhead around the copies and the store. Same addresses,
+// same values. SPARKINFER_PREFILL_GEMM_I8_ALIGNED=0 keeps the checked kernel.
+template <bool RESID, bool SPLITK, bool FULL = false>
 __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
         const signed char* __restrict__ A, const signed char* __restrict__ W,
         const float* __restrict__ sx, const float* __restrict__ sw,
@@ -116,8 +120,13 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
         for (int s = tid; s < 512; s += 256) {
             const int r = s >> 2, c = s & 3, k = c << 4;
             const int gm = m0 + r, gn = n0 + r, gk = k0 + k;
-            pf_cp16(&As[buf][r][pf_swz(k, r)], &A[(size_t)gm * K + gk], gm < M && gk < K);
-            pf_cp16(&Bs[buf][r][pf_swz(k, r)], &W[(size_t)gn * K + gk], gn < N && gk < K);
+            if constexpr (FULL) {
+                __pipeline_memcpy_async(&As[buf][r][pf_swz(k, r)], &A[(size_t)gm * K + gk], 16);
+                __pipeline_memcpy_async(&Bs[buf][r][pf_swz(k, r)], &W[(size_t)gn * K + gk], 16);
+            } else {
+                pf_cp16(&As[buf][r][pf_swz(k, r)], &A[(size_t)gm * K + gk], gm < M && gk < K);
+                pf_cp16(&Bs[buf][r][pf_swz(k, r)], &W[(size_t)gn * K + gk], gn < N && gk < K);
+            }
         }
         __pipeline_commit();
     };
@@ -181,12 +190,14 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
     }
 
     // Registers straight to global: c0/c1 (and c2/c3) are adjacent columns, so each pair packs into
-    // one 4B bf16x2 store.
+    // one 4B bf16x2 store. Dead on the split-K instantiation (it returned above).
+    if constexpr (!SPLITK)
     #pragma unroll
     for (int i = 0; i < PF_MFRAG; i++) {
         #pragma unroll
         for (int j = 0; j < PF_NFRAG; j++) {
             const int gn = n0 + wn * 64 + j * 8 + tig * 2;
+            if constexpr (!FULL)
             if (gn + 1 >= N) {                        // tail: scalar path
                 #pragma unroll
                 for (int e = 0; e < 4; e++) {
@@ -206,7 +217,8 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
             #pragma unroll
             for (int h = 0; h < 2; h++) {
                 const int gm = m0 + wm * 32 + i * 16 + grp + h * 8;
-                if (gm >= M) continue;
+                if constexpr (!FULL)
+                    if (gm >= M) continue;
                 const float s = sx[gm];
                 __nv_bfloat162 v = __floats2bfloat162_rn((float)acc[i][j][h * 2] * s * w0,
                                                          (float)acc[i][j][h * 2 + 1] * s * w1);
@@ -315,12 +327,30 @@ bool launch_prefill_quantize_rows_i8(const void* x_bf16, signed char* q, float* 
     return qp == nullptr;
 }
 
+static bool pf_gemm_i8_aligned_on() {
+    static int e = -1;
+    if (e < 0) {
+        const char* v = getenv("SPARKINFER_PREFILL_GEMM_I8_ALIGNED");
+        e = (v && v[0] == '0') ? 0 : 1;
+    }
+    return e != 0;
+}
+static bool pf_gemm_i8_full_tile(int M, int N, int K) {
+    return pf_gemm_i8_aligned_on() && M > 0 && N > 0 && K > 0 &&
+           (M % PF_BM) == 0 && (N % PF_BN) == 0 && (K % PF_BK) == 0;
+}
+
 void launch_prefill_gemm_i8(const signed char* A, const signed char* W,
                             const float* sx, const float* sw, void* C,
                             int M, int N, int K, cudaStream_t stream) {
     dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
-    pf_gemm_i8_kernel<false, false><<<grid, 256, 0, stream>>>(
-        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), nullptr, M, N, K, 0);
+    auto* c = reinterpret_cast<__nv_bfloat16*>(C);
+    if (pf_gemm_i8_full_tile(M, N, K))
+        pf_gemm_i8_kernel<false, false, true><<<grid, 256, 0, stream>>>(
+            A, W, sx, sw, c, nullptr, M, N, K, 0);
+    else
+        pf_gemm_i8_kernel<false, false, false><<<grid, 256, 0, stream>>>(
+            A, W, sx, sw, c, nullptr, M, N, K, 0);
 }
 
 // Residual-fused variant: C[m,n] += bf16(acc*sx*sw) with pf_add's rounding. Passing the residual
@@ -329,8 +359,13 @@ void launch_prefill_gemm_i8_resid(const signed char* A, const signed char* W,
                                   const float* sx, const float* sw, void* C,
                                   int M, int N, int K, cudaStream_t stream) {
     dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
-    pf_gemm_i8_kernel<true, false><<<grid, 256, 0, stream>>>(
-        A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), nullptr, M, N, K, 0);
+    auto* c = reinterpret_cast<__nv_bfloat16*>(C);
+    if (pf_gemm_i8_full_tile(M, N, K))
+        pf_gemm_i8_kernel<true, false, true><<<grid, 256, 0, stream>>>(
+            A, W, sx, sw, c, nullptr, M, N, K, 0);
+    else
+        pf_gemm_i8_kernel<true, false, false><<<grid, 256, 0, stream>>>(
+            A, W, sx, sw, c, nullptr, M, N, K, 0);
 }
 
 }} // namespace sparkinfer::kernels
