@@ -831,6 +831,15 @@ struct Qwen35Model::Impl {
     // Resolved once at load rather than looked up per layer per token.
     const signed char* bonsai_sign_h = nullptr;     // int8[hidden]
     const signed char* bonsai_sign_ffn = nullptr;   // int8[moe_ffn]
+    // Decode's own view of the layers (SPARKINFER_BONSAI_DECODE_SHADOW): the folded Q4_K weights
+    // stay resident for prefill and the packed batch, and a second, ternary copy of the same
+    // tensors -- 0.21875 bytes/weight against Q4_K's 0.5625 -- is what a single-row decode step
+    // reads. Empty when off; forward_token then reads s.w.layers as before.
+    std::vector<Qwen35LayerWeights> bonsai_dec_layers;
+    const void* bonsai_dec_head = nullptr;
+    // Its allocations, held here rather than in `owned` because it is releasable: the copy is
+    // ~5.5 GB, and concurrent requests need that VRAM more (each carries ~151 MB of GDN state).
+    std::vector<void*> bonsai_dec_bufs;
 
     // DFlash speculative decoding (target-side primitives).
     DFlashDraftModel* dflash_draft = nullptr;
@@ -1143,6 +1152,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
 }
 
 Qwen35Model::~Qwen35Model() {
+    for (void* b : p_->bonsai_dec_bufs) cudaFree(b);
     if (p_->lm_head_fp4_payload) cudaFree(p_->lm_head_fp4_payload);
     if (p_->lm_head_fp4_sf_buf) cudaFree(p_->lm_head_fp4_sf_buf);
     if (p_->gdn_state_stage) cudaFree(p_->gdn_state_stage);
@@ -1841,7 +1851,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (pf_win < 0) { const char* e = getenv("SPARKINFER_MG_L2PF_WIN"); pf_win = e ? atoi(e) : 7; }
 
     for (int L = 0; L < c.n_layers; L++) {
-        const Qwen35LayerWeights& w = s.w.layers[L];
+        // The decode shadow's weights, read through the dp4a GEMV. Native residency keeps the
+        // float kernels its packed batch also runs, so a row decodes the same alone or batched.
+        const bool dec_shadow = !s.bonsai_dec_layers.empty();
+        const Qwen35LayerWeights& w = dec_shadow ? s.bonsai_dec_layers[L] : s.w.layers[L];
         // Which block table this layer's KV lives in. A sliding-window layer may sit in a capped
         // RING slice (KVCacheConfig::window_tokens), whose logical->physical map is its own; a
         // full-causal layer always takes the full one. block_table_win() IS block_table() on a
@@ -1857,12 +1870,20 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         if (pf_win & 1) pf_fork_n(w.wo, nullptr, pf_wo_bytes);
         dbg_bf16(s.xn, H, 10, L);   // tag 10: pre-attn-norm output (this layer's normed input)
         dbg_xn_snapshot(s.xn, L);
+        int xn_ptq1_q = -1;
         if (s.bonsai_rot_xn) {
             // Once, on the main stream, before the projections fan out across stream_k/stream_v.
+            // It also leaves the int8 copy every ternary projection below reads (-1: it did not,
+            // and each GEMV quantizes for itself as before).
             const auto it = s.bonsai_sign_dev.find(H);
-            kernels::launch_hadamard_rotate_bf16(s.xn, s.bonsai_rot_xn,
-                                                 static_cast<const signed char*>(it->second),
-                                                 H, (int)H, (int)s.bonsai_block, st);
+            if (dec_shadow)
+                xn_ptq1_q = kernels::launch_ptq1_rotate_quant(
+                    s.xn, s.bonsai_rot_xn, static_cast<const signed char*>(it->second), (int)H,
+                    (int)s.bonsai_block, st);
+            else
+                kernels::launch_hadamard_rotate_bf16(s.xn, s.bonsai_rot_xn,
+                                                     static_cast<const signed char*>(it->second),
+                                                     H, (int)H, (int)s.bonsai_block, st);
             // tag 15: the rotated xn. R is orthogonal, so this l2 must equal tag 10's exactly --
             // a cheap in-model check that the rotation is what the isolated test says it is.
             dbg_bf16(s.bonsai_rot_xn, H, 15, L);
@@ -1920,7 +1941,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                         kernels::launch_gemv_nvfp4(s.xn, W, y, N, H, pst);
                 }
                 else if (t == kPtq1GgmlType && s.bonsai_rot_xn)
-                    kernels::launch_gemv_ptq1(s.bonsai_rot_xn, W, y, N, H, pst);
+                    dec_shadow ? kernels::launch_gemv_ptq1_q(xn_ptq1_q, s.bonsai_rot_xn, W, y, N, H, pst)
+                               : kernels::launch_gemv_ptq1(s.bonsai_rot_xn, W, y, N, H, pst);
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -2537,18 +2559,37 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // permits aliasing, and each CTA owns its whole 1024-span.
             if (w.gate_qtype == kPtq1GgmlType && w.up_qtype == kPtq1GgmlType &&
                 w.down_qtype == kPtq1GgmlType && s.bonsai_ffn_h && c.top_k == 1) {
-                kernels::launch_hadamard_rotate_bf16(s.hn, s.bonsai_rot_hn, s.bonsai_sign_h,
-                                                     H, (int)H, (int)s.bonsai_block, st);
-                kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.gate_q, s.bonsai_ffn_gate,
-                                          c.moe_ffn, H, st);
-                kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.up_q, s.bonsai_ffn_up,
-                                          c.moe_ffn, H, st);
+                if (dec_shadow) {
+                    // Gate and up share one int8 copy of the rotated hn, made by the rotation.
+                    const int hq = kernels::launch_ptq1_rotate_quant(
+                        s.hn, s.bonsai_rot_hn, s.bonsai_sign_h, (int)H, (int)s.bonsai_block, st);
+                    kernels::launch_gemv_ptq1_q(hq, s.bonsai_rot_hn, w.gate_q, s.bonsai_ffn_gate,
+                                                c.moe_ffn, H, st);
+                    kernels::launch_gemv_ptq1_q(hq, s.bonsai_rot_hn, w.up_q, s.bonsai_ffn_up,
+                                                c.moe_ffn, H, st);
+                } else {
+                    kernels::launch_hadamard_rotate_bf16(s.hn, s.bonsai_rot_hn, s.bonsai_sign_h,
+                                                         H, (int)H, (int)s.bonsai_block, st);
+                    kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.gate_q, s.bonsai_ffn_gate,
+                                              c.moe_ffn, H, st);
+                    kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.up_q, s.bonsai_ffn_up,
+                                              c.moe_ffn, H, st);
+                }
                 kernels::launch_prefill_swiglu(s.bonsai_ffn_gate, s.bonsai_ffn_up,
                                                s.bonsai_ffn_h, c.moe_ffn, st);
-                kernels::launch_hadamard_rotate_bf16(s.bonsai_ffn_h, s.bonsai_ffn_h,
-                                                     s.bonsai_sign_ffn, c.moe_ffn,
-                                                     (int)c.moe_ffn, (int)s.bonsai_block, st);
-                kernels::launch_gemv_ptq1(s.bonsai_ffn_h, w.down_q, s.routed, H, c.moe_ffn, st);
+                if (dec_shadow) {
+                    const int fq = kernels::launch_ptq1_rotate_quant(
+                        s.bonsai_ffn_h, s.bonsai_ffn_h, s.bonsai_sign_ffn, (int)c.moe_ffn,
+                        (int)s.bonsai_block, st);
+                    kernels::launch_gemv_ptq1_q(fq, s.bonsai_ffn_h, w.down_q, s.routed, H,
+                                                c.moe_ffn, st);
+                } else {
+                    kernels::launch_hadamard_rotate_bf16(s.bonsai_ffn_h, s.bonsai_ffn_h,
+                                                         s.bonsai_sign_ffn, c.moe_ffn,
+                                                         (int)c.moe_ffn, (int)s.bonsai_block, st);
+                    kernels::launch_gemv_ptq1(s.bonsai_ffn_h, w.down_q, s.routed, H, c.moe_ffn,
+                                              st);
+                }
             } else
             if (w.gate_nv && w.up_nv && w.down_nv && c.top_k == 1) {
                 // dp4a NVFP4 (SPARKINFER_QWEN38_NVFP4_DP4A=0 restores the float GEMVs). The
@@ -2780,7 +2821,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // silently fed the LM head a stale aq81 left over from the last layer's fresh
     // prepare_xn_quant(xn) quantize (a *different*, pre-final-norm activation vector) --
     // wrong logits on every single decode step. Force a fresh quantize for muse_glimmer.
-    if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
+    if (s.bonsai_dec_head) {
+        // The decode shadow's ternary head: rotate xn into the weights' basis, as the native
+        // branch below does, and read 0.21875 bytes/weight instead of the folded head's Q4_K.
+        const int hq = kernels::launch_ptq1_rotate_quant(s.xn, s.bonsai_rot, s.bonsai_sign_h,
+                                                         (int)H, (int)s.bonsai_block, st);
+        kernels::launch_gemv_ptq1_q_f32(hq, s.bonsai_rot, s.bonsai_dec_head, s.logits, c.vocab,
+                                        H, st);
+    }
+    else if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
         if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
         kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
     }
@@ -3559,6 +3608,31 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 // Give the NVFP4 LM-head operand back. It exists only to serve a packed decode wide enough to
 // want a GEMM, and it is the one piece of weight residency in this model that a run can decide it
 // does not need.
+// Give the decode shadow's ternary copy back; decode then reads the folded weights, exactly as
+// with SPARKINFER_BONSAI_DECODE_SHADOW=0. The decode graphs have its pointers baked in, so they go
+// first and recapture on the next step. Returns whether anything was freed.
+template <class Impl>
+static bool release_bonsai_shadow(Impl& s) {
+    if (s.bonsai_dec_bufs.empty()) return false;
+    cudaGetLastError();   // clear the failed cudaMalloc that brought us here
+    cudaDeviceSynchronize();
+    if (s.graph_ready) {
+        cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph);
+        s.cu_exec = nullptr; s.cu_graph = nullptr; s.graph_ready = false;
+    }
+    if (s.dflash_graph_ready) {
+        cudaGraphExecDestroy(s.cu_dflash_exec); cudaGraphDestroy(s.cu_dflash_graph);
+        s.cu_dflash_exec = nullptr; s.cu_dflash_graph = nullptr; s.dflash_graph_ready = false;
+    }
+    s.bonsai_dec_layers.clear();
+    s.bonsai_dec_head = nullptr;
+    for (void* b : s.bonsai_dec_bufs) cudaFree(b);
+    s.bonsai_dec_bufs.clear();
+    kernels::ptq1_dp_release();
+    fprintf(stderr, "[bonsai] decode shadow released: a new session needed the VRAM\n");
+    return true;
+}
+
 void Qwen35Model::release_lm_head_fp4() {
     Impl& s = *p_;
     if (!s.lm_head_fp4_payload && !s.lm_head_fp4_sf_buf) return;
@@ -3627,7 +3701,19 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.d_vision_emb, s.d_vision_pos, s.vision_n,
                           // MRoPE rotary positions, null unless set_pending_mrope ran for this prompt.
                           s.d_mrope_pos };
+    // The Bonsai decode shadow's VRAM is decode-only -- this pass reads the folded Q4_K weights
+    // either way -- so on a scratch-alloc failure it is pure margin to give back and retry once.
+    // #1154 was rejected for exactly the failure this skips: at a long --ctx the KV pool leaves
+    // too little room for prefill's own arena once the shadow is also resident, every batched
+    // prefill falls back to the ~30x-slower token loop, and nothing ever recovered because
+    // release_bonsai_shadow only ran for a new session's state, never for this.
+    bool scratch_oom = false;
+    ctx.scratch_oom_out = &scratch_oom;
     int seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    if (seed < 0 && scratch_oom && release_bonsai_shadow(s)) {
+        scratch_oom = false;
+        seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    }
     // Consume it. This is PER-REQUEST state, not model state: leaving it set would splice the
     // previous request's image into the next prompt, which would produce fluent, confident text
     // about an image the caller never sent. Cleared on every path out, including the failure
@@ -3820,25 +3906,40 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
                            : s.kv->allocate(seq_id, num_tokens);
     if (!kv_ok) return 0;   // pool full -- normal, transient
     SessionBuffers buf;
-    // Unconditional, every model -- unlike lin_state/lin_conv_state below (hybrid-only). This
-    // fresh session serves exactly one request end-to-end before close_session() frees it (1:1
-    // lifecycle via ContinuousBatchEngine::finish_job), so a one-time zero here is sufficient --
-    // unlike session 0, which is reused across many DIFFERENT requests and needs an explicit
-    // per-request reset (see reset_penalty_counts()).
-    buf.penalty_counts = s.alloc<int>(s.cfg.vocab);
-    buf.logit_bias = s.alloc<float>(s.cfg.vocab);
-    bool alloc_ok = buf.penalty_counts != nullptr && buf.logit_bias != nullptr;
-    // Per-session recurrent state, and it is not small: n_layers * v_heads * head_dim^2 floats is
-    // 109 MB on Muse Glimmer's 52 layers. That model declares `hybrid` but has no GDN layer at
-    // all, so every concurrent request was reserving 109 MB for a recurrence it never runs -- 3.6
-    // GB at 32 requests, on a card whose FP4 prefill operands already leave it with a few hundred
-    // MB of headroom. Ask whether the stack has the layers, not whether it has the flag.
-    if (needs_linear_state(s.cfg)) {
-        buf.lin_state = s.alloc<float>((size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
-                                       s.cfg.linear_head_dim * s.cfg.linear_head_dim);
-        buf.lin_conv_state = s.alloc<bf16>((size_t)s.cfg.n_layers *
-                                           (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim);
-        alloc_ok = alloc_ok && buf.lin_state && buf.lin_conv_state;
+    bool alloc_ok = false;
+    for (int attempt = 0;; ++attempt) {
+        buf = SessionBuffers{};
+        // Unconditional, every model -- unlike lin_state/lin_conv_state below (hybrid-only). This
+        // fresh session serves exactly one request end-to-end before close_session() frees it (1:1
+        // lifecycle via ContinuousBatchEngine::finish_job), so a one-time zero here is sufficient
+        // -- unlike session 0, which is reused across many DIFFERENT requests and needs an explicit
+        // per-request reset (see reset_penalty_counts()).
+        buf.penalty_counts = s.alloc<int>(s.cfg.vocab);
+        buf.logit_bias = s.alloc<float>(s.cfg.vocab);
+        alloc_ok = buf.penalty_counts != nullptr && buf.logit_bias != nullptr;
+        // Per-session recurrent state, and it is not small: n_layers * v_heads * head_dim^2 floats
+        // is 109 MB on Muse Glimmer's 52 layers. That model declares `hybrid` but has no GDN layer
+        // at all, so every concurrent request was reserving 109 MB for a recurrence it never runs
+        // -- 3.6 GB at 32 requests, on a card whose FP4 prefill operands already leave it with a
+        // few hundred MB of headroom. Ask whether the stack has the layers, not whether it has the
+        // flag.
+        if (needs_linear_state(s.cfg)) {
+            buf.lin_state = s.alloc<float>((size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
+                                           s.cfg.linear_head_dim * s.cfg.linear_head_dim);
+            buf.lin_conv_state = s.alloc<bf16>((size_t)s.cfg.n_layers *
+                                               (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim);
+            alloc_ok = alloc_ok && buf.lin_state && buf.lin_conv_state;
+        }
+        if (alloc_ok) break;
+        if (buf.penalty_counts) cudaFree(buf.penalty_counts);
+        if (buf.logit_bias) cudaFree(buf.logit_bias);
+        if (buf.lin_state) cudaFree(buf.lin_state);
+        if (buf.lin_conv_state) cudaFree(buf.lin_conv_state);
+        buf = SessionBuffers{};
+        // The decode shadow is a cache of weights decode can also read folded: a request that
+        // cannot get its state takes the shadow's VRAM, once, rather than failing.
+        if (attempt == 0 && release_bonsai_shadow(s)) continue;
+        break;
     }
     if (!alloc_ok) {
         // A real cudaMalloc failure (already logged by alloc<T>'s cu() wrapper as
@@ -4182,6 +4283,13 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     ctx.packed_lin_state = reinterpret_cast<float* const*>(s.packed_dev_states);
     ctx.packed_lin_conv  = reinterpret_cast<void* const*>(s.packed_dev_convs);
     ctx.packed_state_b16 = packed_state_b16;
+    // SPARKINFER_BONSAI_CB_SHADOW=0 keeps the packed FFN on the folded weights, for an A/B.
+    static const bool kCbShadow = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_CB_SHADOW");
+        return !(e && e[0] == '0');
+    }();
+    if (kCbShadow && !s.bonsai_dec_layers.empty())
+        ctx.bonsai_dec_layers = s.bonsai_dec_layers.data();
     const int consumed = dflash_verify_short_run(ctx, tokens, n, positions[0],
                                                  nullptr, 0, nullptr, out_sampled);
     return consumed == n;
@@ -5914,7 +6022,27 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // non-residual width, and because it replaces a single fused Q4_K kernel with three GEMVs and
     // an elementwise SwiGLU -- a different performance question from the projections.
     const bool bonsai_native_ffn = bonsai_native_set.find("ffn") != std::string::npos;
-    if (bonsai_native) {
+    // The decode shadow: main's folded Q4_K load, unchanged, plus a ternary copy of the head, the
+    // residual-width projections and the FFN that only forward_token reads. Prefill keeps its
+    // Q4_K GEMMs and the packed batch its Q4_K kernels; single-row decode reads 2.6x fewer bytes.
+    // Off whenever SPARKINFER_BONSAI_NATIVE picks a residency explicitly.
+    static const bool bonsai_shadow_env = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_DECODE_SHADOW");
+        return !(e && e[0] == '0');
+    }();
+    const bool bonsai_shadow = had.present && bonsai_native_set.empty() && bonsai_shadow_env;
+    // Which parts get a ternary copy: "head", "proj", "ffn", comma-separated. Default: the FFN,
+    // ~70% of the weight bytes. The head and the projections add speed but each moves the
+    // logits further from the folded path's (KL vs main 0.018 FFN-only, 0.026 all three).
+    static const std::string bonsai_shadow_parts = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_SHADOW_PARTS");
+        return std::string(e ? e : "ffn");
+    }();
+    const bool shadow_head = bonsai_shadow && bonsai_shadow_parts.find("head") != std::string::npos;
+    const bool shadow_proj = bonsai_shadow && bonsai_shadow_parts.find("proj") != std::string::npos;
+    const bool shadow_ffn = bonsai_shadow && bonsai_shadow_parts.find("ffn") != std::string::npos;
+    std::unordered_map<const void*, void*> shadow_of;   // folded weight -> its ternary copy
+    if (bonsai_native || bonsai_shadow) {
         s.bonsai_block = had.block_size;
         for (const auto& kv : had.signs_by_width) {
             void* d = nullptr;
@@ -5929,7 +6057,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             s.owned.push_back(s.bonsai_rot);
         else
             s.bonsai_rot = nullptr;
-        if (bonsai_native_proj && s.cfg.hidden > 0 &&
+        if ((bonsai_native_proj || bonsai_shadow) && s.cfg.hidden > 0 &&
             cudaMalloc((void**)&s.bonsai_rot_xn, (size_t)s.cfg.hidden * sizeof(bf16)) == cudaSuccess)
             s.owned.push_back(s.bonsai_rot_xn);
         else
@@ -5944,7 +6072,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         }
         // All four or none: a half-allocated FFN scratch would leave the decode branch reading a
         // null buffer, and the folded path is a perfectly good fallback.
-        if (bonsai_native_ffn && s.cfg.hidden > 0 && s.cfg.moe_ffn > 0 &&
+        if ((bonsai_native_ffn || bonsai_shadow) && s.cfg.hidden > 0 && s.cfg.moe_ffn > 0 &&
             s.bonsai_sign_h && s.bonsai_sign_ffn) {
             const size_t hb = (size_t)s.cfg.hidden * sizeof(bf16);
             const size_t fb = (size_t)s.cfg.moe_ffn * sizeof(bf16);
@@ -6377,7 +6505,39 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // MMVQ kernels every other quantized checkpoint uses. Letting it fall through to dense() would
     // expand the attention weights to bf16 -- several GB, and a GEMV path this architecture's GDN
     // projections otherwise never take.
-    auto attn_w = [&](const std::string& name, int& type) -> const void* {
+    // A residual-width ternary projection in its stored blocks. The GDN v-head order is NOT
+    // uploaded verbatim: everything that produces a v head stores its 48 heads transposed, and the
+    // folded path regroups them while un-rotating (see the native branch below).
+    auto upload_proj_native = [&](const GGUFTensor* t, const std::string& name,
+                                  UnrotateJob& j) -> void* {
+        if (had.gdn_v_grouped) unrotate_job_set_v_block(j, name, s.cfg);
+        const size_t row_bytes = (size_t)(j.width / kPtq1BlockElems) * kPtq1BlockBytes;
+        std::vector<uint8_t> host((size_t)t->n_bytes);
+        const auto* src = static_cast<const uint8_t*>(t->data);
+        for (long r = 0; r < j.rows; ++r)
+            std::memcpy(host.data() + (size_t)r * row_bytes,
+                        src + (size_t)unrotate_source_row(j, r) * row_bytes, row_bytes);
+        void* d = nullptr;
+        if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
+            cudaMemcpy(d, host.data(), t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            s.owned.push_back(d);
+            return d;
+        }
+        cudaFree(d);
+        return nullptr;
+    };
+    // The stored blocks as they are: the FFN legs and the head carry no v-head regrouping.
+    auto upload_plain_native = [&](const GGUFTensor* t) -> void* {
+        void* d = nullptr;
+        if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
+            cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            s.owned.push_back(d);
+            return d;
+        }
+        cudaFree(d);
+        return nullptr;
+    };
+    auto attn_w_base = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         // Only projections whose input is the residual width: those read the once-per-layer
         // rotated xn in decode, and prefill's dq() carries the matching sign vector.
@@ -6395,27 +6555,31 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             UnrotateJob j;
             if (!unrotate_job_init(j, t, name, *had.signs_for(t->dims[0]), had.block_size, false))
                 return nullptr;
-            if (had.gdn_v_grouped) unrotate_job_set_v_block(j, name, s.cfg);
-            const size_t row_bytes = (size_t)(j.width / kPtq1BlockElems) * kPtq1BlockBytes;
-            std::vector<uint8_t> host((size_t)t->n_bytes);
-            const auto* src = static_cast<const uint8_t*>(t->data);
-            for (long r = 0; r < j.rows; ++r)
-                std::memcpy(host.data() + (size_t)r * row_bytes,
-                            src + (size_t)unrotate_source_row(j, r) * row_bytes, row_bytes);
-            void* d = nullptr;
-            if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
-                cudaMemcpy(d, host.data(), t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
-                s.owned.push_back(d);
+            if (void* d = upload_proj_native(t, name, j)) {
                 type = kPtq1GgmlType;
                 return d;
             }
-            cudaFree(d);
             fprintf(stderr, "[bonsai] %s: native upload failed, falling back\n", name.c_str());
         }
         if (qattn && t && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
         type = 0; return dense(name, false);
+    };
+    // attn_w_base, plus the decode shadow's ternary copy of every residual-width projection.
+    auto attn_w = [&](const std::string& name, int& type) -> const void* {
+        const GGUFTensor* t = g.tensor(name);
+        void* sh = nullptr;
+        if (shadow_proj && t && t->ggml_type == kPtq1GgmlType && s.bonsai_rot_xn &&
+            t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0])) {
+            UnrotateJob j;
+            if (unrotate_job_init(j, t, name, *had.signs_for(t->dims[0]), had.block_size, false))
+                sh = upload_proj_native(t, name, j);
+            if (sh) { s.owned.pop_back(); s.bonsai_dec_bufs.push_back(sh); }
+        }
+        const void* p = attn_w_base(name, type);
+        if (sh && p) shadow_of[p] = sh;
+        return p;
     };
     // The dense FFN's three matrices, left in their stored blocks. No v-head regrouping applies:
     // that is a property of tensors PRODUCING a GDN v head, and none of these does. Gate and up
@@ -6437,6 +6601,17 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             fprintf(stderr, "[bonsai] %s: native upload failed, falling back\n", name.c_str());
         }
         return nullptr;   // caller falls through to its existing quantized path
+    };
+    // The folded FFN leg, plus its ternary copy for the decode shadow.
+    auto ffn_q_shadow = [&](const std::string& name, const void* folded) {
+        const GGUFTensor* t = g.tensor(name);
+        if (!shadow_ffn || !folded || !s.bonsai_ffn_h || !t ||
+            t->ggml_type != kPtq1GgmlType || !s.bonsai_sign_dev.count(t->dims[0])) return;
+        if (void* d = upload_plain_native(t)) {
+            s.owned.pop_back();
+            s.bonsai_dec_bufs.push_back(d);
+            shadow_of[folded] = d;
+        }
     };
     auto attn_w_opt = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
@@ -6556,6 +6731,17 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         s.dflash_lm_head = dev_quant(lm, s.dflash_lm_head_type);
     }
     s.w.lm_head = lm_w(lm, s.w.lm_head_type);                 // native [vocab,hidden] for GEMV
+    if (shadow_head && s.w.lm_head_type != kPtq1GgmlType && s.bonsai_rot &&
+        s.bonsai_sign_dev.count(s.cfg.hidden)) {
+        const GGUFTensor* t = g.tensor(lm);
+        if (t && t->ggml_type == kPtq1GgmlType && t->dims[0] == s.cfg.hidden) {
+            if (void* d = upload_plain_native(t)) {
+                s.owned.pop_back();
+                s.bonsai_dec_bufs.push_back(d);
+                s.bonsai_dec_head = d;
+            }
+        }
+    }
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
 
     s.w.layers.resize(c.n_layers);
@@ -6706,6 +6892,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 w.up_q   = gu3 ? dev_quant_q3a(b + "ffn_up.weight", w.up_qtype, &w.prefill_up_q, &w.prefill_up_qtype)
                                : dev_quant(b + "ffn_up.weight", w.up_qtype);
                 w.down_q = dev_quant_down(b + "ffn_down.weight", w.down_qtype);
+                ffn_q_shadow(b + "ffn_gate.weight", w.gate_q);
+                ffn_q_shadow(b + "ffn_up.weight", w.up_q);
+                ffn_q_shadow(b + "ffn_down.weight", w.down_q);
             }
         } else {
             if (!expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
@@ -7365,6 +7554,75 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 qkvg_ready, c.n_layers);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 down weights ready: %d/%d layers\n",
                 down_ready, c.n_layers);
+    }
+    // The decode shadow's view: the same layers, with each folded weight that got a ternary copy
+    // swapped for it. The FFN goes over only whole -- decode's ternary SwiGLU needs all three legs
+    // in one basis -- and everything else (norms, GDN state, o-proj, ssm_out) is shared as-is.
+    // The dp4a GEMV's activation scratch belongs to the shadow: no scratch, no copy.
+    if (bonsai_shadow && !shadow_of.empty() && !kernels::ptq1_dp_reserve()) {
+        for (void* b : s.bonsai_dec_bufs) cudaFree(b);
+        s.bonsai_dec_bufs.clear();
+        s.bonsai_dec_head = nullptr;
+        shadow_of.clear();
+        fprintf(stderr, "[bonsai] decode shadow dropped: dp4a scratch alloc failed\n");
+    }
+    // #1154 was rejected on a long-context serving regression: with the KV pool already sized for
+    // the configured --ctx (it is built before load_gguf runs, see ModelEngine::load), the
+    // shadow's VRAM could leave too little free for batched prefill's own scratch arena, and every
+    // prefill on a long prompt fell back to the ~30x-slower token loop -- 479s/1056s/timeout at
+    // 60k/120k/200k tokens where main took 8.1s/19.6s/40.7s. A scratch-alloc failure during
+    // serving now releases the shadow and retries (see prefill_batched), which recovers from this
+    // regardless of the estimate below, but paying for a shadow only to immediately give it back
+    // is wasted load-time work, so skip it up front when the numbers already look this tight.
+    //
+    // "Tight" is estimated, not exact: a byte-accurate model of the arena (FP4/int8/bf16 paths,
+    // MoE vs dense, chunking) isn't worth carrying here when the retry above is the real safety
+    // net. Instead this scales the one concrete data point in the rejection -- ctx=16384,
+    // chunk=4096, 1731 MB held and still short -- to this run's own worst-case single pass (the
+    // window, or the full --ctx when windowing is off), with a 50% margin since it is only a
+    // scaled estimate.
+    if (bonsai_shadow && !shadow_of.empty()) {
+        const int win = prefill_window_tokens(s.kv);
+        int prefill_tokens = (win > 0) ? win : s.cfg.max_seq;
+        if (s.cfg.max_seq > 0 && prefill_tokens > s.cfg.max_seq) prefill_tokens = s.cfg.max_seq;
+        constexpr size_t kObservedBytes = 1731ull << 20;
+        constexpr int kObservedTokens = 16384;
+        size_t need = (size_t)((double)kObservedBytes * prefill_tokens / kObservedTokens);
+        need += need / 2;
+        size_t free_b = 0, total_b = 0;
+        if (prefill_tokens > 0 && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < need) {
+            for (void* b : s.bonsai_dec_bufs) cudaFree(b);
+            s.bonsai_dec_bufs.clear();
+            s.bonsai_dec_head = nullptr;
+            shadow_of.clear();
+            fprintf(stderr, "[bonsai] decode shadow skipped: %zu MB free leaves too little for a "
+                            "%d-token batched prefill (estimated need ~%zu MB)\n",
+                    free_b >> 20, prefill_tokens, need >> 20);
+        }
+    }
+    if (bonsai_shadow && !shadow_of.empty()) {
+        s.bonsai_dec_layers = s.w.layers;
+        int n_proj = 0, n_ffn = 0;
+        auto swap_in = [&](const void*& ptr, int& type) {
+            const auto it = shadow_of.find(ptr);
+            if (!ptr || it == shadow_of.end()) return false;
+            ptr = it->second;
+            type = kPtq1GgmlType;
+            return true;
+        };
+        for (auto& d : s.bonsai_dec_layers) {
+            n_proj += swap_in(d.wqkv, d.wqkv_type) + swap_in(d.wqkv_gate, d.wqkv_gate_type) +
+                      swap_in(d.wq, d.wq_type) + swap_in(d.wgate, d.wgate_type) +
+                      swap_in(d.wk, d.wk_type) + swap_in(d.wv, d.wv_type);
+            if (shadow_of.count(d.gate_q) && shadow_of.count(d.up_q) && shadow_of.count(d.down_q)) {
+                swap_in(d.gate_q, d.gate_qtype);
+                swap_in(d.up_q, d.up_qtype);
+                swap_in(d.down_q, d.down_qtype);
+                ++n_ffn;
+            }
+        }
+        fprintf(stderr, "[bonsai] decode shadow: %d projections, %d/%d FFNs, head %s\n",
+                n_proj, n_ffn, c.n_layers, s.bonsai_dec_head ? "yes" : "no");
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;

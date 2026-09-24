@@ -120,6 +120,10 @@ struct Qwen35PrefillCtx {
     void* const*         packed_lin_conv  = nullptr;
     // The packed rows' recurrent state is the compacted bf16 form (see Qwen35Model::decode_packed).
     bool                 packed_state_b16 = false;
+    // The Bonsai decode shadow's layers (n_layers entries), or null. A packed step reads its FFN
+    // from their ternary legs through the dp4a arithmetic single-row decode runs on them, so every
+    // row decodes bit-identically batched or alone; everything else still comes from `w`.
+    const Qwen35LayerWeights* bonsai_dec_layers = nullptr;
 
     // PACKED PROMPT PREFILL. multi_n > 0 turns the pass's N rows from ONE prompt into multi_n
     // FRESH prompts laid end to end: prompt i is rows [multi_off[i], multi_off[i] + multi_len[i])
@@ -135,6 +139,13 @@ struct Qwen35PrefillCtx {
     float* const*        multi_lin_state  = nullptr;
     void* const*         multi_lin_conv   = nullptr;
     int*                 multi_seed       = nullptr;
+
+    // Set to true (never back to false) when this call declines because a scratch allocation
+    // could not get its VRAM -- as opposed to every other reason prefill_batched_run returns -1,
+    // which is an unsupported model/config that retrying cannot fix. Left however the caller set
+    // it otherwise, so a caller that can free something (the Bonsai decode shadow, see #1154's
+    // rejection) can tell "worth retrying" from "give up now". Null is fine; nothing is recorded.
+    bool*                scratch_oom_out  = nullptr;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
