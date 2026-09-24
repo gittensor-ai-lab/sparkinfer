@@ -32,6 +32,7 @@
 // ============================================================================
 #include "sparkinfer/kernels/prefill_gemm_skinny.h"
 #include "sparkinfer/kernels/deterministic.h"
+#include "sparkinfer/kernels/scratch_epoch.h"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -234,7 +235,7 @@ __global__ void pf_gemm_skinny_reduce(const float* __restrict__ P,
         static size_t parts_n = 0;                                                          \
         const size_t need = (size_t)M * (size_t)N;                                          \
         if (parts_n < need) {                                                               \
-            if (parts) cudaFree(parts);                                                     \
+            if (parts) { cudaFree(parts); note_prefill_scratch_moved(); }                   \
             parts = nullptr; parts_n = 0;                                                   \
             if (cudaMalloc(&parts, need * sizeof(float)) != cudaSuccess) return false;      \
             parts_n = need;                                                                 \

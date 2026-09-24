@@ -7,6 +7,19 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Fixed
 
+- **A replayed prefill graph could write through freed scratch, and libcuda segfaulted on it.**
+  A short prompt's batched prefill is recorded as a CUDA graph and replayed for every later
+  prompt of the same length, with the scratch it was recorded against baked in. Passes that never
+  replay a graph -- a prefix-cache resume, a DSpark prefill that captures hidden states, an early
+  return -- can still grow that scratch, and growing frees the old buffers. The next same-length
+  prompt then replayed the graph against freed memory: its prompt-id upload fails libcuda's
+  copy-destination check with a host SIGSEGV, which is where the serve-dspark exits at
+  `libcuda.so.595.84+0x14DD6E` land, and its kernels run on freed memory. Reproduced on v0.5.10
+  with the Qwen3.8 NVFP4 checkpoint: a long prompt the prefix cache keeps, a short prompt twice, a
+  cache-hit continuation larger than anything before it, then the short prompt again. The graph
+  now records the arenas' generations and a kernel-scratch epoch at capture and is dropped when
+  either has moved, and it is dropped before its pinned id buffer is freed. On earlier releases,
+  `SPARKINFER_MUSE_PREFILL_GRAPH=0` avoids it at the cost of the graph's prefill speedup.
 - **A concurrent request could be served from a recurrent state read at the wrong width.**
   Continuous-batch decode compacts a session's Gated-DeltaNet state to bf16, packed from the
   allocation base, the first time it packs that session. Three things disagreed with that

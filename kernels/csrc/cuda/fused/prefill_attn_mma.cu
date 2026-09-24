@@ -40,6 +40,7 @@
 // ============================================================================
 #include "sparkinfer/kernels/prefill_attn_mma.h"
 #include "sparkinfer/kernels/deterministic.h"
+#include "sparkinfer/kernels/scratch_epoch.h"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -1113,7 +1114,10 @@ bool vpack_reserve(size_t bytes) {
     if (bytes <= g_vpack_bytes) return true;
     // Free BEFORE growing: the old plane is dead the moment a bigger one is wanted, and holding
     // both at once is what would push a 256k prefill's peak past the arena it has to share with.
-    if (g_vpack) { cudaFree(g_vpack); g_vpack = nullptr; g_vpack_bytes = 0; }
+    if (g_vpack) {
+        cudaFree(g_vpack); g_vpack = nullptr; g_vpack_bytes = 0;
+        note_prefill_scratch_moved();
+    }
     void* p = nullptr;
     if (cudaMalloc(&p, bytes) != cudaSuccess) { cudaGetLastError(); return false; }
     g_vpack = p; g_vpack_bytes = bytes;

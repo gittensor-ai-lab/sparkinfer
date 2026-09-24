@@ -16,6 +16,7 @@
 #include "sparkinfer/kernels/vision.h"
 #include "sparkinfer/kernels/prefill_attn_window.h"
 #include "sparkinfer/kernels/fused.h"
+#include "sparkinfer/kernels/scratch_epoch.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/qtype.h"
 #include "sparkinfer/kernels/compressed_tensors.h"
@@ -75,6 +76,9 @@ struct Arena {
     std::vector<size_t> sizes;
     size_t cursor = 0;
     bool ok = true;
+    // Advances whenever a buffer this arena handed out is freed. Anything that kept one of its
+    // pointers past a call -- the whole-prefill CUDA graph -- is stale once this has moved.
+    uint64_t gen = 0;
     template <class T> T* alloc(size_t n) {
         if (n == 0) n = 1;
         const size_t bytes = n * sizeof(T);
@@ -85,6 +89,7 @@ struct Arena {
         }
         if (cursor < bufs.size()) {
             cudaFree(bufs[cursor]);
+            ++gen;
             bufs.erase(bufs.begin() + cursor);
             sizes.erase(sizes.begin() + cursor);
         }
@@ -95,7 +100,11 @@ struct Arena {
         return static_cast<T*>(p);
     }
     void rewind() { cursor = 0; ok = true; }
-    void free_all() { for (void* b : bufs) cudaFree(b); bufs.clear(); sizes.clear(); cursor = 0; }
+    void free_all() {
+        if (!bufs.empty()) ++gen;
+        for (void* b : bufs) cudaFree(b);
+        bufs.clear(); sizes.clear(); cursor = 0;
+    }
     size_t total() const { size_t t = 0; for (size_t b : sizes) t += b; return t; }
 };
 
@@ -528,6 +537,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     static const void* g_pfb_lin_key = nullptr;
     static const void* g_pfb_conv_key = nullptr;
     static const void* g_pfb_btable_key = nullptr;
+    static uint64_t g_pfb_arena_gen[4] = {0, 0, 0, 0};   // keep_a, keep_a8, keep_am, keep_aw
+    static uint64_t g_pfb_scratch_epoch = 0;
     // DEFAULT ON: measured +5.91% on Muse prefill@128, byte-identical output (SCORE_EQ IDENTICAL,
     // TOP1 16/16). Qwen3.8-27B is the same dense-hybrid launch storm (~20 kernels/layer × 64)
     // and the same warm-arena capture is legal there — MoE stays off (host tilemaps / events).
@@ -562,12 +573,28 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                   g_pfb_lin_key == s.lin_state &&
                                   g_pfb_conv_key == s.lin_conv_state &&
                                   g_pfb_btable_key == pfb_btable;
-    if (g_pfb_exec && (multi || !graph_keys_match)) {
+    // The graph also embeds the scratch it was captured with: the four kept arenas and the
+    // kernel-level workspaces (scratch_epoch.h). A pass that never captures -- a prefix-cache
+    // resume (pos0 > 0), a DSpark prefill that captures hidden states, an early return that
+    // releases the arenas -- can still grow that scratch, and growing frees the old buffers.
+    // Replaying afterwards uploads the prompt ids into a freed buffer, which libcuda answers
+    // with a SIGSEGV in its copy-destination check, and runs every kernel against freed
+    // memory. Only a packed pass (here) and the 1 GiB release (#809) used to drop it for this.
+    const bool graph_scratch_unmoved =
+        keep_a.gen == g_pfb_arena_gen[0] && keep_a8.gen == g_pfb_arena_gen[1] &&
+        keep_am.gen == g_pfb_arena_gen[2] && keep_aw.gen == g_pfb_arena_gen[3] &&
+        kernels::prefill_scratch_epoch() == g_pfb_scratch_epoch;
+    if (g_pfb_exec && (multi || !graph_keys_match || !graph_scratch_unmoved)) {
         cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr;
         if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
         g_pfb_n = -1;
     }
     if (graph_on && N > g_pfb_pin_cap) {
+        // The graph's prompt-id upload reads this buffer, so the graph goes before the buffer
+        // does -- not later in this pass, which an early return can skip.
+        if (g_pfb_exec) { cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr; }
+        if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
+        g_pfb_n = -1;
         if (g_pfb_pin) cudaFreeHost(g_pfb_pin);
         g_pfb_pin = nullptr; g_pfb_pin_cap = 0;
         if (cudaMallocHost(&g_pfb_pin, (size_t)N * sizeof(int)) == cudaSuccess) g_pfb_pin_cap = N;
@@ -3322,6 +3349,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 g_pfb_lin_key = s.lin_state;
                 g_pfb_conv_key = s.lin_conv_state;
                 g_pfb_btable_key = pfb_btable;
+                g_pfb_arena_gen[0] = keep_a.gen;  g_pfb_arena_gen[1] = keep_a8.gen;
+                g_pfb_arena_gen[2] = keep_am.gen; g_pfb_arena_gen[3] = keep_aw.gen;
+                g_pfb_scratch_epoch = kernels::prefill_scratch_epoch();
                 pf_cu(cudaGraphLaunch(e, st), "pfb first launch");
             } else {
                 // Nothing ran (capture records, it does not execute) and there is no graph to run
