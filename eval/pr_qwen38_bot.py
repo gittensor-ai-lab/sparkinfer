@@ -614,7 +614,8 @@ def ssh_run(host, port, cmd, timeout=7200, stdin_data=None, via_stdin=False):
     )
 
 
-_EXPLICIT_FAIL_MARKERS = ("BUILD_FAILED", "LLAMACPP_CONFIGURE_FAILED", "LLAMACPP_BUILD_FAILED")
+_EXPLICIT_FAIL_MARKERS = ("BUILD_FAILED", "LLAMACPP_CONFIGURE_FAILED", "LLAMACPP_BUILD_FAILED",
+                          "MERGE_CONFLICT")
 
 
 def _crash_reason(*outputs: str) -> str | None:
@@ -682,17 +683,33 @@ def _ssh_run_resilient(host, port, script: str, label: str):
     return r
 
 
-def _remote_script(ref: str, role: str = "pr") -> str:
+def _remote_script(ref: str, role: str = "pr", onto: str | None = None) -> str:
     """Bash run on the eval box: checkout ref, build, decode+prefill@128 bench on the NVFP4
     checkpoint, teacher-forced score dump, and the Qwen3.6 no-regression guard.
 
     Run once per ref -- identical script both times so the two measurements are directly
     comparable. `role` only decides which score dump path is written and whether the
     differential accuracy compare runs (main has nothing to compare against yet; the PR run
-    compares itself against main's dump from earlier in the same round)."""
+    compares itself against main's dump from earlier in the same round).
+
+    A PR (`ref` = pull/<n>/head) is measured MERGED onto `onto`, the exact main commit the round's
+    baseline measured (arb.merged_checkout_script), with its harness pinned from that same commit.
+    GitHub's own pull/<n>/merge is not used: it can be built on an older main than the baseline
+    (#1145, 2026-09-24), which reads main's newer speedups as the PR's regressions."""
+    if role == "pr":
+        base = onto or "origin/main"
+        checkout = arb.merged_checkout_script(ref, base)
+    else:
+        base = "origin/main"
+        checkout = (f"git fetch -q origin {shlex.quote(ref)}\n"
+                    "git reset -q --hard\n"
+                    "git clean -qfd\n"
+                    "git checkout -qf FETCH_HEAD\n"
+                    'echo "REMOTE_HEAD $(git rev-parse --short HEAD)"\n'
+                    'echo "REMOTE_SHA $(git rev-parse HEAD)"\n')
+    base_q = shlex.quote(base)
     repo = shlex.quote(REMOTE_REPO)
     model_dir = shlex.quote(MODEL_DIR)
-    ref_q = shlex.quote(ref)
     ntok = BENCH_TOKENS
     topk = ACC_TOPK
     parity_bar = PARITY_BAR
@@ -771,24 +788,19 @@ BONSAI_GUARD_GGUF={bonsai_gguf}
 
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
-git fetch -q origin {ref_q}
-git reset -q --hard
-git clean -qfd
-git checkout -qf FETCH_HEAD
-HEAD=$(git rev-parse --short HEAD)
-echo "REMOTE_HEAD $HEAD"
-
-# Pin the measuring instrument to origin/main for every ref, main included (HARNESS_PATHS). A PR
-# that edits these files is skipped before it gets here, so this changes nothing for the PRs that
-# are evaluated except that a branch older than a harness change is measured with main's ruler.
+{checkout}
+# Pin the measuring instrument for every ref, main included (HARNESS_PATHS), from the main commit
+# this ref is measured against. A PR that edits these files is skipped before it gets here, so
+# this changes nothing for the PRs that are evaluated except that a branch older than a harness
+# change is measured with main's ruler -- the same ruler as its baseline.
 git fetch -q origin main
-git checkout -q origin/main -- runtime/examples/qwen3_gguf_bench.cpp \
+git checkout -q {base_q} -- runtime/examples/qwen3_gguf_bench.cpp \
   runtime/examples/qwen3_gguf_cb_bench.cpp runtime/examples/qwen_checkpoint.h \
   runtime/examples/qwen3_gguf_config.h bench/scripts 2>/dev/null || {{
-  echo "HARNESS_PIN_FAILED -- could not take the harness from origin/main" >&2
+  echo "HARNESS_PIN_FAILED -- could not take the harness from {base}" >&2
   exit 1
 }}
-echo "HARNESS_PINNED $(git rev-parse --short origin/main)"
+echo "HARNESS_PINNED $(git rev-parse --short {base_q})"
 
 test -d "$MODEL_DIR" || {{ echo "FAIL missing NVFP4 checkpoint dir $MODEL_DIR"; exit 1; }}
 test -f "$MODEL_DIR/config.json" || {{ echo "FAIL $MODEL_DIR has no config.json"; exit 1; }}
@@ -1124,6 +1136,12 @@ def _parse_remote(stdout: str) -> dict:
     for line in (stdout or "").splitlines():
         if line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
+        elif line.startswith("REMOTE_SHA "):
+            out["sha"] = line.split()[1]
+        elif line.startswith("PR_TIP "):
+            out["pr_tip"] = line.split()[1]
+        elif line.startswith("MERGED_ONTO "):
+            out["merged_onto"] = line.split()[1]
         elif line.startswith("PREFILL_PARITY_OK"):
             out["parity_ok"] = True
         elif line.startswith("PREFILL_PARITY_FAILED"):
@@ -1400,17 +1418,6 @@ def measure_main_baseline(host, port):
     return main
 
 
-def _merge_ref_exists(repo: str, num: int) -> bool:
-    """Does GitHub publish refs/pull/<num>/merge? It does for a mergeable PR, and drops it while the
-    PR conflicts with the base, so this doubles as the conflict check."""
-    try:
-        r = subprocess.run(["git", "ls-remote", f"https://github.com/{repo}", f"refs/pull/{num}/merge"],
-                           capture_output=True, text=True, timeout=60)
-    except Exception:
-        return False
-    return r.returncode == 0 and bool((r.stdout or "").strip())
-
-
 def _guard_coverage(d: dict) -> str:
     """One line naming how many rows each guard produced -- a guard that measured nothing is the
     difference between a REJECT and a retry, so the round log should not make anyone guess."""
@@ -1424,8 +1431,14 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     """Run the PR ref's speed+accuracy script on the same box and compare against `main`, an
     already-measured baseline shared across every PR in the round (see measure_main_baseline)."""
     print(f">> Qwen3.8-27B eval on box: PR ref={pr_ref}")
-    r = _ssh_run_resilient(host, port, _remote_script(pr_ref, role="pr"), "PR run")
+    r = _ssh_run_resilient(host, port, _remote_script(pr_ref, role="pr", onto=main.get("sha")), "PR run")
     if r.returncode != 0:
+        combined = (r.stdout or "") + "\n" + (r.stderr or "")
+        if "MERGE_CONFLICT" in combined:
+            # Does not merge onto the main this round measured: a rebase, not a verdict.
+            line = next((l for l in combined.splitlines() if l.startswith("MERGE_CONFLICT")), "")
+            return {"ok": False, "conflict": True,
+                    "reason": line or "PR does not merge cleanly onto the measured main"}
         tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
         crash = _crash_reason(r.stdout, r.stderr)
         reason = "PR speed/accuracy run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
@@ -1615,6 +1628,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "bonsai_guard_skipped": cross["guardbn"][2],
         "pr_head": pr.get("head"),
         "main_head": main.get("head"),
+        "pr_tip": pr.get("pr_tip"),
+        "merged_onto": pr.get("merged_onto"),
     }
     # Attestation is a RECEIPT for a measurement that has already happened, not a gate on it, so it
     # must never be able to void one. collect_polaris_attestation() already returns None on ssh
@@ -1736,7 +1751,10 @@ def format_comment(commit: str, res: dict) -> str:
         f"{cross_rows}"
         f"| PPL PR / main | {res.get('pr_ppl') or '?'} / {res.get('main_ppl') or '?'} |\n"
         f"{polaris_row}"
-        f"| commit | `{commit[:9]}` |\n\n"
+        f"| commit | `{commit[:9]}`"
+        + (f", measured merged onto `main` `{res['merged_onto']}` (this round's baseline)"
+           if res.get("merged_onto") else "")
+        + " |\n\n"
         f"{_cb_table(res)}"
         f"{res.get('reason') or ''}\n\n"
         "<sub>Scored on the pinned RTX 5090 against the same-box `origin/main`, on the upstream "
@@ -1934,6 +1952,13 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
 
 
 def apply_result(repo, num, commit, res, title="", dry_run=False):
+    if not res.get("ok") and res.get("conflict"):
+        # No verdict and no REJECT label: the PR does not merge onto the main this round measured,
+        # which says nothing about its change. Same outcome as the pre-GPU merge-conflict check.
+        print(f"PR #{num}: {res.get('reason')} — qwen38-needs-rebase, no verdict")
+        if not dry_run:
+            arb.add_label(repo, num, QWEN38_NEEDS_REBASE)
+        return
     body = format_comment(commit, res)
     label = res.get("label") if res.get("ok") else "REJECT"
     if not res.get("ok"):
@@ -2152,9 +2177,10 @@ def main():
         # change on main therefore builds main's harness against its own older headers: on
         # 2026-09-18 every PR branched before 8d55f3f ("window_tokens" in KVCacheConfig) failed with
         # BUILD_FAILED and scored eval:REJECT with no measurements at all -- #1109 among them, one
-        # commit behind. The merge ref is also the tree that would actually land. GitHub publishes
-        # it only for a mergeable PR; a conflicted one still measures at its head, as before.
-        ref = f"pull/{num}/merge" if _merge_ref_exists(args.repo, num) else f"pull/{num}/head"
+        # commit behind. The merge is built on the box, onto the exact main commit the baseline
+        # measured (_remote_script `onto`), not taken from GitHub's pull/<n>/merge, which can be
+        # built on an older main (#1145, 2026-09-24).
+        ref = f"pull/{num}/head"
         pending.append((num, head, short, ref, pr.get("title", "")))
 
     if not pending:

@@ -344,8 +344,12 @@ an OOM kill — is retried next round with nothing posted. A PR that fails to bu
 
 **Not evaluated:** PRs declared for other models only; PRs that change the harness (the files
 `pr_qwen38_bot.py` pins, plus `qwen3_gguf_score.cpp`, `qwen3_gguf_generate.cpp`,
-`qwen3_gguf_prefill_check.cpp` and `bonsai_inspect.cpp`). Every ref is measured as the PR merged
-into `main` when GitHub publishes that ref, with `main`'s harness.
+`qwen3_gguf_prefill_check.cpp` and `bonsai_inspect.cpp`). Every PR is measured as its tip merged,
+on the box, onto the exact `main` commit the round's baseline measured, with that commit's harness
+(`arb.merged_checkout_script`; the Qwen3.8 bot does the same). GitHub's own `pull/<n>/merge` is not
+used: it can be built on an older `main`, and on 2026-09-24 that scored #1145 a false REJECT — it
+was measured without #1143's prefill@16k gain. A PR that no longer merges cleanly gets
+`bonsai-needs-rebase` and no verdict.
 
 ```bash
 python eval/pr_bonsai_bot.py --dry-run                            # what would be evaluated, no GPU

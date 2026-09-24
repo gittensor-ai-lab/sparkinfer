@@ -398,7 +398,7 @@ def ssh_run(host, port, cmd, timeout=7200, stdin_data=None, via_stdin=False):
 
 
 _EXPLICIT_FAIL_MARKERS = ("BUILD_FAILED", "SCORE_FAILED", "TOKENIZE_FAILED", "HARNESS_PIN_FAILED",
-                          "MODEL_CHECK_FAILED")
+                          "MODEL_CHECK_FAILED", "MERGE_CONFLICT")
 # Markers naming the box rather than the ref: missing model files, the box's tokenizer, a fetch.
 _INFRA_MARKERS = ("RETRYABLE_INFRA_FAILURE", "MODEL_CHECK_FAILED", "TOKENIZE_FAILED",
                   "HARNESS_PIN_FAILED")
@@ -451,15 +451,31 @@ def _ssh_run_resilient(host, port, script: str, label: str):
     return r
 
 
-def _remote_script(ref: str, role: str = "pr") -> str:
+def _remote_script(ref: str, role: str = "pr", onto: str | None = None) -> str:
     """Bash run on the eval box: checkout, pin the harness, build, then every measurement.
     Identical for main and a PR; `role` only picks the score dump path and whether the
-    differential compare runs (main is the reference it compares against)."""
+    differential compare runs (main is the reference it compares against).
+
+    A PR (`ref` = pull/<n>/head) is measured MERGED onto `onto`, the exact main commit the round's
+    baseline measured (arb.merged_checkout_script), and its harness is pinned from that same
+    commit -- so the PR and the baseline differ by the PR's change and nothing else, even if main
+    moves mid-round or GitHub's own merge ref is stale."""
+    if role == "pr":
+        base = onto or "origin/main"
+        checkout = arb.merged_checkout_script(ref, base)
+    else:
+        base = "origin/main"
+        checkout = (f'git fetch -q origin {shlex.quote(ref)} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {ref} failed" >&2; exit 1; }}\n'
+                    'git reset -q --hard\n'
+                    'git clean -qfd\n'
+                    'git checkout -qf FETCH_HEAD\n'
+                    'echo "REMOTE_HEAD $(git rev-parse --short HEAD)"\n'
+                    'echo "REMOTE_SHA $(git rev-parse HEAD)"\n')
+    base_q = shlex.quote(base)
     repo = shlex.quote(REMOTE_REPO)
     gguf = shlex.quote(BONSAI_GGUF)
     tok_dir = shlex.quote(BONSAI_TOKENIZER_DIR)
     ref_dir = shlex.quote(BONSAI_REFERENCE_DIR)
-    ref_q = shlex.quote(ref)
     dump_self = shlex.quote(SCORE_DUMP_MAIN if role == "main" else SCORE_DUMP_PR)
     dump_main = shlex.quote(SCORE_DUMP_MAIN)
     is_pr = "1" if role == "pr" else "0"
@@ -542,20 +558,17 @@ if [ ! -d "$REPO/.git" ]; then
 fi
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
-git fetch -q origin {ref_q} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {ref} failed" >&2; exit 1; }}
-git reset -q --hard
-git clean -qfd
-git checkout -qf FETCH_HEAD
-echo "REMOTE_HEAD $(git rev-parse --short HEAD)"
+{checkout}
 echo "STAGE start $(date +%s)"
 
-# Pin the measuring instrument to origin/main for every ref, main included (HARNESS_PATHS).
+# Pin the measuring instrument for every ref, main included (HARNESS_PATHS) -- from the main commit
+# this ref is measured against, so a PR and its baseline always share one ruler.
 git fetch -q origin main || {{ echo "RETRYABLE_INFRA_FAILURE git fetch main failed" >&2; exit 1; }}
-git checkout -q origin/main -- {harness_pin} 2>/dev/null || {{
-  echo "HARNESS_PIN_FAILED -- could not take the harness from origin/main" >&2
+git checkout -q {base_q} -- {harness_pin} 2>/dev/null || {{
+  echo "HARNESS_PIN_FAILED -- could not take the harness from {base}" >&2
   exit 1
 }}
-echo "HARNESS_PINNED $(git rev-parse --short origin/main)"
+echo "HARNESS_PINNED $(git rev-parse --short {base_q})"
 
 # A PRIVATE TMPDIR for nvcc. Its tmpxft_* intermediates in a shared /tmp get deleted by whatever
 # else on the box tidies /tmp, which fails the build in files the PR never touched.
@@ -783,6 +796,12 @@ def _parse_remote(stdout: str) -> dict:
         try:
             if head == "REMOTE_HEAD" and len(parts) >= 2:
                 out["head"] = parts[1]
+            elif head == "REMOTE_SHA" and len(parts) >= 2:
+                out["sha"] = parts[1]
+            elif head == "PR_TIP" and len(parts) >= 2:
+                out["pr_tip"] = parts[1]
+            elif head == "MERGED_ONTO" and len(parts) >= 2:
+                out["merged_onto"] = parts[1]
             elif head == "BONSAI" and len(parts) >= 4:
                 out["bonsai"][int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
             elif head == "STAGE" and len(parts) >= 3:
@@ -1004,21 +1023,17 @@ def measure_main_baseline(host, port):
     return main
 
 
-def _merge_ref_exists(repo: str, num: int) -> bool:
-    """Does GitHub publish refs/pull/<num>/merge? It does for a mergeable PR only."""
-    try:
-        r = subprocess.run(["git", "ls-remote", f"https://github.com/{repo}", f"refs/pull/{num}/merge"],
-                           capture_output=True, text=True, timeout=60)
-    except Exception:
-        return False
-    return r.returncode == 0 and bool((r.stdout or "").strip())
-
-
 def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
     """Run the PR ref's script and score it against `main`, the round's shared baseline."""
     print(f">> Ternary-Bonsai-2-27B eval on box: PR ref={pr_ref}")
-    r = _ssh_run_resilient(host, port, _remote_script(pr_ref, role="pr"), "PR run")
+    r = _ssh_run_resilient(host, port, _remote_script(pr_ref, role="pr", onto=main.get("sha")), "PR run")
     if r.returncode != 0:
+        combined = (r.stdout or "") + "\n" + (r.stderr or "")
+        if "MERGE_CONFLICT" in combined:
+            # Does not merge onto the main this round measured: a rebase, not a verdict.
+            line = next((l for l in combined.splitlines() if l.startswith("MERGE_CONFLICT")), "")
+            return {"ok": False, "retry": True, "conflict": True, "log": "",
+                    "reason": line or "PR does not merge cleanly onto the measured main"}
         return _run_failure(r, "PR speed/accuracy run")
     pr = _parse_remote(r.stdout or "")
     log = (r.stdout or "")[-1500:]
@@ -1155,6 +1170,8 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
         "guards_main": {key: main.get(key) for key, _t, _n in GUARDS},
         "pr_head": pr.get("head"),
         "main_head": main.get("head"),
+        "pr_tip": pr.get("pr_tip"),
+        "merged_onto": pr.get("merged_onto"),
     }
     try:
         polaris = collect_polaris_attestation(host, port, res, pr_ref)
@@ -1313,7 +1330,10 @@ def format_comment(commit: str, res: dict) -> str:
         f"{acc_row}{pf_row}{reg_row}{guard_rows}"
         f"| PPL PR / main | {res.get('pr_ppl') or '?'} / {res.get('main_ppl') or '?'} |\n"
         f"{polaris_row}"
-        f"| commit | `{commit[:9]}` |\n\n"
+        f"| commit | `{commit[:9]}`"
+        + (f", measured merged onto `main` `{res['merged_onto']}` (this round's baseline)"
+           if res.get("merged_onto") else "")
+        + " |\n\n"
         f"{_matrix_table(res)}"
         f"{res.get('reason') or ''}\n\n"
         f"<sub>Measured on the pinned RTX 5090 against a same-box `origin/main` from the same round. "
@@ -1521,6 +1541,11 @@ def upload_bonsai_eval_log(repo, num, title, oid, res):
 
 
 def apply_result(repo, num, commit, res, title="", dry_run=False):
+    if not res.get("ok") and res.get("conflict"):
+        print(f"PR #{num}: {res.get('reason')} — bonsai-needs-rebase, no verdict")
+        if not dry_run:
+            arb.add_label(repo, num, BONSAI_NEEDS_REBASE)
+        return
     if not res.get("ok") and res.get("retry"):
         # Infrastructure: nothing is posted and no label changes. The next round measures again.
         print(f"PR #{num}: bonsai eval deferred — {res.get('reason')} (infra; re-evaluated next round)")
@@ -1648,9 +1673,9 @@ def main():
             print(f"PR #{num}: greenlit ({why})")
         else:
             print(f"PR #{num}: --only-prs targeted")
-        # The PR merged into main, not its tip: the harness is pinned from main, and the merge
-        # ref is what would land (pr_qwen38_bot.py, 2026-09-18).
-        ref = f"pull/{num}/merge" if _merge_ref_exists(args.repo, num) else f"pull/{num}/head"
+        # Measured as its tip merged onto the round's main baseline commit, built on the box
+        # (arb.merged_checkout_script) -- not GitHub's pull/<n>/merge, which can be stale (#1145).
+        ref = f"pull/{num}/head"
         pending.append((num, head, short, ref, pr.get("title", "")))
 
     if not pending:

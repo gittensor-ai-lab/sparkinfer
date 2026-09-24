@@ -25,6 +25,7 @@ def box_stdout(bonsai=None, cb=None, top1=1.0, kl=0.0, pf=None, reg_ok=True, reg
     out += [f"BONSAICB {c} {v} {v} {v} {v}" for c, v in cb.items()]
     out += ["RESULT_TOKEN_COUNT 1203", "SCORE_DONE 1202", "ACCURACY_STAGE_DONE"]
     if role == "main":
+        out.append("REMOTE_SHA " + "b013fc9" + "0" * 33)
         out.append("SELFCHECK top1=1.0000 kl=0.000000 ppl_pr=9.56 ppl_main=9.56")
     else:
         out.append(f"METRIC top1={top1} kl={kl} ppl_pr=9.6 ppl_main=9.56")
@@ -389,6 +390,60 @@ class ApplyResultTests(unittest.TestCase):
         self.assertEqual(res["label"], "REJECT")
         self.assertFalse(any(c[:2] == ["pr", "close"] for c in self._apply(res)))
         self.assertTrue(any(c[:2] == ["pr", "close"] for c in self._apply(res, autoclose=True)))
+
+
+class MergeOntoBaselineTests(unittest.TestCase):
+    """#1145 (2026-09-24): GitHub's pull/<n>/merge was built on a main from before #1143, so the PR
+    was measured without #1143's prefill@16k gain and read as a -3.1% regression. PRs are now merged
+    on the box onto the exact commit the round's baseline measured."""
+    SHA = "b013fc9" + "0" * 33
+
+    def test_pr_script_merges_onto_the_baseline_commit_and_pins_its_harness(self):
+        s = bot._remote_script("pull/1145/head", role="pr", onto=self.SHA)
+        self.assertIn(f"git checkout -qf {self.SHA}", s)
+        self.assertIn('merge -q --no-ff --no-edit "$PR_TIP"', s)
+        self.assertIn(f"git checkout -q {self.SHA} -- ", s)          # harness from the same commit
+        self.assertNotIn("git checkout -q origin/main -- ", s)
+        self.assertIn("MERGE_CONFLICT", s)
+        self.assertNotIn("pull/1145/merge", s)
+
+    def test_main_script_does_not_merge_and_reports_its_commit(self):
+        m = bot._remote_script("main", role="main")
+        self.assertNotIn("merge -q --no-ff", m)
+        self.assertIn('echo "REMOTE_SHA $(git rev-parse HEAD)"', m)
+        self.assertIn("git checkout -q origin/main -- ", m)
+
+    def test_the_baseline_commit_is_what_the_pr_run_merges_onto(self):
+        main = main_baseline()
+        self.assertEqual(main["sha"], self.SHA)
+        seen = {}
+
+        def fake(h, p, script, label):
+            seen["script"] = script
+            return run(box_stdout() + f"PR_TIP bc31cc9\nMERGED_ONTO {self.SHA[:9]}\n")
+        with mock.patch.object(bot, "_ssh_run_resilient", side_effect=fake), \
+                mock.patch.object(bot, "POLARIS_ENABLED", False):
+            res = bot.eval_bonsai_on_box("h", 1, "pull/1145/head", main)
+        self.assertIn(f"git checkout -qf {self.SHA}", seen["script"])
+        self.assertEqual(res["merged_onto"], self.SHA[:9])
+        self.assertIn(f"measured merged onto `main` `{self.SHA[:9]}`", bot.format_comment("a" * 40, res))
+
+    def test_a_merge_conflict_is_a_rebase_not_a_verdict(self):
+        res = evaluate("", rc=1, stderr="MERGE_CONFLICT 4927c65 does not merge cleanly onto b013fc9")
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["conflict"])
+        calls = []
+        with mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run("")), \
+                mock.patch.object(arb, "add_label", side_effect=lambda r, n, l: calls.append(["add", l])):
+            bot.apply_result("o/r", 1145, "a" * 40, res)
+        self.assertEqual(calls, [["add", bot.BONSAI_NEEDS_REBASE]])   # no comment, no REJECT
+        self.assertFalse(bot._is_infra_failure("", "MERGE_CONFLICT x does not merge cleanly onto y"))
+
+    def test_github_merge_refs_are_no_longer_used(self):
+        src = open(bot.__file__).read()
+        self.assertNotIn("_merge_ref_exists", src)
+        self.assertNotIn('f"pull/{num}/merge"', src)
+        self.assertIn('ref = f"pull/{num}/head"', src)
 
 
 class DeclarationAndSiblingGuardTests(unittest.TestCase):

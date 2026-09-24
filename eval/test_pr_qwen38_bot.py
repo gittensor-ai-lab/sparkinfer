@@ -233,3 +233,42 @@ class ConcurrencyGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergeOntoBaselineTests(unittest.TestCase):
+    """#1145 (2026-09-24): a stale GitHub pull/<n>/merge measured a PR against an older main than
+    the round's baseline. The PR is now merged on the box onto the baseline's own commit."""
+    SHA = "b013fc9" + "0" * 33
+
+    def test_pr_script_merges_onto_the_baseline_commit_and_pins_its_harness(self):
+        s = bot._remote_script("pull/1/head", role="pr", onto=self.SHA)
+        self.assertIn(f"git checkout -qf {self.SHA}", s)
+        self.assertIn('merge -q --no-ff --no-edit "$PR_TIP"', s)
+        self.assertIn(f"git checkout -q {self.SHA} -- ", s)
+        self.assertIn("MERGE_CONFLICT", s)
+        m = bot._remote_script("main", role="main")
+        self.assertNotIn("merge -q --no-ff", m)
+        self.assertIn('echo "REMOTE_SHA $(git rev-parse HEAD)"', m)
+
+    def test_the_baseline_commit_is_parsed(self):
+        p = bot._parse_remote("REMOTE_HEAD b013fc9\nREMOTE_SHA " + self.SHA + "\nMERGED_ONTO b013fc9\nPR_TIP 4927c65\n")
+        self.assertEqual((p["sha"], p["merged_onto"], p["pr_tip"]), (self.SHA, "b013fc9", "4927c65"))
+
+    def test_a_merge_conflict_labels_needs_rebase_without_a_verdict(self):
+        import types
+        from unittest import mock
+        r = types.SimpleNamespace(returncode=1, stdout="", stderr="MERGE_CONFLICT 4927c65 does not merge cleanly onto b013fc9")
+        with mock.patch.object(bot, "_ssh_run_resilient", return_value=r):
+            res = bot.eval_qwen38_on_box("h", 1, "pull/1/head", {"sha": self.SHA})
+        self.assertTrue(res["conflict"])
+        calls = []
+        with mock.patch.object(bot.arb, "gh", side_effect=lambda a: calls.append(a)), \
+                mock.patch.object(bot.arb, "add_label", side_effect=lambda rp, n, l: calls.append(["add", l])):
+            bot.apply_result("o/r", 1, "a" * 40, res)
+        self.assertEqual(calls, [["add", bot.QWEN38_NEEDS_REBASE]])
+        self.assertIsNotNone(bot._crash_reason("", "MERGE_CONFLICT x"))   # not retried as a hard kill
+
+    def test_github_merge_refs_are_no_longer_used(self):
+        src = open(bot.__file__).read()
+        self.assertNotIn("_merge_ref_exists", src)
+        self.assertIn('ref = f"pull/{num}/head"', src)

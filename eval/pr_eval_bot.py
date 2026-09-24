@@ -1166,6 +1166,39 @@ GENERIC_TIER_RANK = {"REJECT": -1, "none": 0, "XS": 1, "S": 2, "M": 3, "L": 4, "
 _PER_BOT_EVAL_RE = re.compile(r"^eval-[a-z0-9]+:(.+)$")
 
 
+def merged_checkout_script(pr_ref, onto):
+    """Bash for a model bot's remote script: check out PR `pr_ref`'s tip MERGED onto `onto`, the exact
+    main commit the round's baseline measured.
+
+    Why not GitHub's refs/pull/<n>/merge: GitHub rebuilds that ref lazily after main moves, and a bot
+    that asks for mergeability and then fetches the ref can get one built on an OLDER main than its
+    own baseline. On 2026-09-24 #1145 was scored REJECT for exactly that: its merge ref predated #1143,
+    so it was measured without #1143's +3.1% prefill@16k and read as a -3.1% regression against a
+    main that had it. Merging here pins both sides of the comparison to one commit.
+
+    A tip that does not merge cleanly prints MERGE_CONFLICT and exits 1 -- GitHub's mergeable flag
+    can be stale the same way, and such a PR needs a rebase, not a verdict. Prints PR_TIP,
+    MERGED_ONTO and REMOTE_HEAD. The merge commit is local to the box and never pushed."""
+    import shlex
+    ref_q, onto_q = shlex.quote(pr_ref), shlex.quote(onto)
+    return f"""git fetch -q origin {ref_q} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {pr_ref} failed" >&2; exit 1; }}
+PR_TIP=$(git rev-parse FETCH_HEAD)
+git fetch -q origin main || {{ echo "RETRYABLE_INFRA_FAILURE git fetch main failed" >&2; exit 1; }}
+git reset -q --hard
+git clean -qfd
+git checkout -qf {onto_q}
+if ! git -c user.name=sparkinfer-eval -c user.email=eval@sparkinfer.invalid merge -q --no-ff --no-edit "$PR_TIP" >/dev/null 2>&1; then
+  git merge --abort 2>/dev/null || true
+  echo "MERGE_CONFLICT $(git rev-parse --short "$PR_TIP") does not merge cleanly onto $(git rev-parse --short {onto_q})" >&2
+  exit 1
+fi
+echo "PR_TIP $(git rev-parse --short "$PR_TIP")"
+echo "MERGED_ONTO $(git rev-parse --short {onto_q})"
+echo "REMOTE_HEAD $(git rev-parse --short HEAD)"
+echo "REMOTE_SHA $(git rev-parse HEAD)"
+"""
+
+
 def sync_generic_eval_label(repo, num):
     """Recompute the generic `eval:<tier>` label from every per-bot `eval-<model>:<tier>` label.
 
