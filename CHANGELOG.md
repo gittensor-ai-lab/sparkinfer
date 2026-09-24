@@ -14,8 +14,9 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   `eval/bonsai_regression.py`. Two loads of one build agree on only 96–98% of top-1 on this model,
   so the score bars come from that measured spread (top-1 ≥ 0.93, KL ≤ 0.03) with perplexity within
   2% of `main` as the sharp edge. It guards Qwen3.6, both Qwen3.8 checkpoints and Muse Glimmer at
-  32k, and neither auto-merges nor auto-closes while it is new. Against the same-box `main`, #1139
-  scores `XL`: prefill@128 2,090 → 4,186 tok/s.
+  32k. It auto-merges the round's best passing speedup (`SPARKINFER_BONSAI_AUTOMERGE=1`), like the
+  sibling bots but only at the exact commit it scored; it does not auto-close. Against the same-box
+  `main`, #1139 scores `XL`: prefill@128 2,090 → 4,186 tok/s.
 - The PR template has a **Ternary-Bonsai-2-27B** target box. The Muse Glimmer and Qwen3.8 bots skip
   a PR declared for it alone, instead of scoring it `none` and closing it, and both now guard it at
   128 and 32k.

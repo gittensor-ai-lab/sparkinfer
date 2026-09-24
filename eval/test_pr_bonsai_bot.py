@@ -66,9 +66,75 @@ class ScopeTests(unittest.TestCase):
             self.assertIn(f"bonsai-cb-decode@c{c}", bot.SCORING_DIMS)
         self.assertEqual(len(bot.SCORING_DIMS), 15)
 
-    def test_new_bot_neither_merges_nor_closes_by_default(self):
+    def test_automerge_and_autoclose_default_off_and_are_env_gated(self):
+        # In the test process no env var is set, so both are off: the switches are the only thing
+        # that turns them on. Production sets SPARKINFER_BONSAI_AUTOMERGE=1 in .env.eval.
         self.assertFalse(bot.AUTO_MERGE)
         self.assertFalse(bot.AUTO_CLOSE)
+
+
+class AutoMergeGateTests(unittest.TestCase):
+    OK_INFO = {"state": "OPEN", "isDraft": False, "labels": [{"name": "eval-bonsai:XL"},
+               {"name": "bonsai-merge-first"}], "author": {"login": "dev"}, "mergeable": "MERGEABLE",
+               "files": [{"path": "kernels/foo.cu"}], "headRefOid": "a" * 40}
+
+    def _ok(self, info=None, scores=None):
+        info = info or self.OK_INFO
+        scores = self.OK_INFO if scores is None else scores
+        s = scores if isinstance(scores, dict) and "1139" in scores else {
+            "1139": {"commit": "a" * 40, "label": "XL", "pass": True}}
+        with mock.patch.object(bot.arb, "gh", return_value=run(__import__("json").dumps(info))), \
+                mock.patch.object(bot.arb, "load_denylist", return_value=set()), \
+                mock.patch.object(bot.arb, "author_penalty_until", return_value=None), \
+                mock.patch.object(bot.arb, "AUTOMERGE_SENSITIVE", ("server/",)), \
+                mock.patch.object(bot, "_load_scores", return_value=s):
+            return bot.auto_merge_ok_bonsai("o/r", 1139)
+
+    def test_scored_commit_passes(self):
+        ok, why = self._ok()
+        self.assertTrue(ok, why)
+
+    def test_a_push_after_the_verdict_blocks_merge(self):
+        # head moved to b..b, but the bot only scored a..a.
+        info = dict(self.OK_INFO, headRefOid="b" * 40)
+        ok, why = self._ok(info=info, scores={"1139": {"commit": "a" * 40, "label": "XL", "pass": True}})
+        self.assertFalse(ok)
+        self.assertIn("not the commit last scored", why)
+
+    def test_a_non_passing_recorded_verdict_blocks_merge(self):
+        ok, why = self._ok(scores={"1139": {"commit": "a" * 40, "label": "none", "pass": False}})
+        self.assertFalse(ok)
+        self.assertIn("recorded verdict", why)
+
+    def test_a_reject_from_another_bot_blocks_merge(self):
+        info = dict(self.OK_INFO, labels=self.OK_INFO["labels"] + [{"name": "eval-qwen38:REJECT"}])
+        ok, why = self._ok(info=info)
+        self.assertFalse(ok)
+        self.assertIn("REJECT from another", why)
+
+    def test_try_auto_merge_pins_the_scored_head(self):
+        calls = []
+
+        def fake_gh(a):
+            calls.append(a)
+            if a[:2] == ["pr", "view"]:
+                return run('{"headRefOid": "' + "a" * 40 + '"}')
+            return run("")
+        with mock.patch.object(bot, "auto_merge_ok_bonsai", return_value=(True, "ok")), \
+                mock.patch.object(bot.arb, "gh", side_effect=fake_gh):
+            self.assertTrue(bot.try_auto_merge_bonsai("o/r", 1139))
+        merge = next(a for a in calls if a[:2] == ["pr", "merge"])
+        self.assertIn("--match-head-commit", merge)
+        self.assertEqual(merge[merge.index("--match-head-commit") + 1], "a" * 40)
+
+    def test_policy_note_follows_the_live_switches(self):
+        with mock.patch.object(bot, "AUTO_MERGE", True), mock.patch.object(bot, "AUTO_CLOSE", False):
+            note = bot._policy_note()
+        self.assertIn("auto-merged", note)
+        self.assertIn("exact commit scored", note)
+        self.assertIn("does not close", note)
+        with mock.patch.object(bot, "AUTO_MERGE", False):
+            self.assertIn("does not auto-merge", bot._policy_note())
 
     def test_remote_script_measures_the_served_path_with_mains_harness(self):
         s = bot._remote_script("pull/1139/merge", role="pr")

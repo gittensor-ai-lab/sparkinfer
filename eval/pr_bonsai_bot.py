@@ -38,9 +38,11 @@ server uses, `SPARKINFER_BONSAI_NATIVE` unset:
      unmeasured -> infra, retried next round; measured regression -> REJECT.
 
 Policy, by explicit decision 2026-09-24: tiers mirror to the generic `eval:*` label (as the sibling
-bots do); cron every two hours at :15, between Muse's :00 and Qwen3.8's :30; auto-merge OFF until
-SPARKINFER_BONSAI_AUTOMERGE=1 -- a new bot should not merge anything on its first rounds.
-Auto-close is OFF too (SPARKINFER_BONSAI_AUTOCLOSE=1 enables it, for REJECT only). This bot
+bots do); cron every two hours at :15, between Muse's :00 and Qwen3.8's :30. Auto-merge is
+SPARKINFER_BONSAI_AUTOMERGE=1 in .env.eval, turned on the same day once #1139 had validated the bot,
+matching the sibling bots' live policy -- with one extra guard they lack: it merges only the exact
+head commit this bot scored (auto_merge_ok_bonsai). Auto-close is OFF
+(SPARKINFER_BONSAI_AUTOCLOSE=1 enables it, for REJECT only). This bot
 evaluates every PR that does not declare a different model, most of which are not aimed at this
 model and legitimately score `none` here, so `none` never closes anything -- #768 and #1082 were
 both closed by a sibling bot for exactly that.
@@ -1220,6 +1222,16 @@ def _matrix_table(res: dict) -> str:
     return out
 
 
+def _policy_note() -> str:
+    """What the bot will do with the verdict, read from the live switches -- never stated from
+    memory, so the PR comment cannot claim a policy the running config does not have."""
+    merge = ("The round's best passing speedup is auto-merged as `bonsai-merge-first` (only at the "
+             "exact commit scored); a separate comment says so." if AUTO_MERGE
+             else "This bot does not auto-merge.")
+    close = "A `REJECT` closes the PR." if AUTO_CLOSE else "It does not close PRs."
+    return f"{merge} {close}"
+
+
 def _gate_row(name: str, ok, detail_ok: str, detail_fail: str, skipped: str = "") -> str:
     if skipped:
         return f"| {name} | ⚠️ SKIPPED — {skipped} |\n"
@@ -1307,14 +1319,13 @@ def format_comment(commit: str, res: dict) -> str:
         f"<sub>Measured on the pinned RTX 5090 against a same-box `origin/main` from the same round. "
         f"Any axis regressing below {100 * REGRESS_TOL:.0f}% of main is a REJECT; otherwise the label "
         f"is the best measured delta. `none` only means no Ternary-Bonsai-2-27B speedup was "
-        f"measured, which is expected for a change aimed at another model. This bot does not "
-        f"auto-merge and does not auto-close.</sub>\n"
+        f"measured, which is expected for a change aimed at another model. {_policy_note()}</sub>\n"
     )
 
 
 def auto_merge_ok_bonsai(repo, num):
     info = json.loads(arb.gh(["pr", "view", str(num), "-R", repo, "--json",
-                              "state,isDraft,labels,author,mergeable,files"]).stdout or "{}")
+                              "state,isDraft,labels,author,mergeable,files,headRefOid"]).stdout or "{}")
     if info.get("state") != "OPEN" or info.get("isDraft"):
         return False, "not an open, non-draft PR"
     labs = {l["name"] for l in info.get("labels", [])}
@@ -1323,6 +1334,17 @@ def auto_merge_ok_bonsai(repo, num):
         return False, "no verified eval-bonsai speedup label"
     if BONSAI_MERGE_FIRST not in labs:
         return False, "not bonsai-merge-first"
+    # Merge only the exact commit this bot scored. The label and bonsai-merge-first survive a push
+    # made after the verdict, and if the next round's re-measurement fails on the box side nothing
+    # is posted and the stale label stays -- so gating on the label alone could merge unmeasured
+    # code. The sibling bots do not check this; a fresh bot with auto-merge on should.
+    head = info.get("headRefOid") or ""
+    scored = _load_scores().get(str(num)) or {}
+    if not head or scored.get("commit") != head:
+        return False, (f"head {head[:9] or '?'} is not the commit last scored "
+                       f"({(scored.get('commit') or 'none')[:9]})")
+    if scored.get("label") not in SPEEDUP_LABELS or not scored.get("pass"):
+        return False, f"recorded verdict for {head[:9]} is {scored.get('label')} (pass={scored.get('pass')})"
     # A REJECT from any other bot is a measured harm on another model.
     if any(l.endswith(":REJECT") for l in labs if l.startswith("eval")):
         return False, "carries a REJECT from another eval bot"
@@ -1348,7 +1370,22 @@ def try_auto_merge_bonsai(repo, num):
     if not ok:
         print(f">> bonsai auto-merge SKIP #{num}: {reason}")
         return False
-    r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash"])
+    # Pin the merge to the commit auto_merge_ok_bonsai just checked, so a push landing in the gap
+    # between the check and the merge cannot be what gets merged (--match-head-commit).
+    head = (json.loads(arb.gh(["pr", "view", str(num), "-R", repo, "--json", "headRefOid"]).stdout
+                       or "{}").get("headRefOid") or "")
+    args = ["pr", "merge", str(num), "-R", repo, "--squash"]
+    if head:
+        args += ["--match-head-commit", head]
+    r = arb.gh(args)
+    if r.returncode != 0 and os.environ.get("SPARKINFER_AUTOMERGE_ADMIN", "1") == "1":
+        # Same branch-policy retry as the sibling bots: a required check that is "expected" but never
+        # runs on this repo would otherwise block every auto-merge. --admin still honours
+        # --match-head-commit, so it cannot push through a commit other than the scored one.
+        err = ((r.stderr or "") + (r.stdout or "")).lower()
+        if "not mergeable" in err or "branch policy" in err or "required" in err or "prohibited" in err:
+            print(">> bonsai auto-merge: branch policy blocked — retrying with --admin")
+            r = arb.gh(args + ["--admin"])
     if r.returncode == 0:
         print(f">> BONSAI AUTO-MERGED #{num} (bonsai-merge-first)")
         arb.gh(["pr", "comment", str(num), "-R", repo, "--body",
