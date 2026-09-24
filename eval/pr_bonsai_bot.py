@@ -1428,9 +1428,17 @@ def reconcile_bonsai_merge_labels(repo, dry_run=False):
         for m in merged:
             arb.remove_label(repo, m["number"], BONSAI_MERGE_FIRST)
     scored = []
+    stale_first = []   # carries merge-first but can no longer win it
     for p in open_prs:
         labs = {l["name"] for l in p["labels"]}
-        if BONSAI_NEEDS_REBASE in labs:
+        # A PR that cannot be merged -- `hold`, needs-rebase, a penalty or copycat flag, any other
+        # AUTOMERGE_BLOCK label -- must not take merge-first either. It used to: on 2026-09-24
+        # #1154 was held for review with the round's best score, won merge-first, had its merge
+        # refused, and pushed the next-best PR to needs-rebase for a merge that never happened --
+        # every round, for as long as the hold lasted.
+        if labs & AUTOMERGE_BLOCK:
+            if BONSAI_MERGE_FIRST in labs:
+                stale_first.append(p["number"])
             continue
         tier = next((l.split(":", 1)[1] for l in labs
                      if l.startswith(EVAL_PREFIX) and l.split(":", 1)[1] in SPEEDUP_LABELS), None)
@@ -1439,6 +1447,9 @@ def reconcile_bonsai_merge_labels(repo, dry_run=False):
         entry = scores.get(str(p["number"])) or {}
         scored.append((p["number"], float(entry.get("delta_pct") or 0)))
     scored.sort(key=lambda x: x[1], reverse=True)
+    if not dry_run:
+        for num in stale_first:
+            arb.remove_label(repo, num, BONSAI_MERGE_FIRST)
     if not scored:
         print(">> bonsai round: no verified speedup PRs")
         return

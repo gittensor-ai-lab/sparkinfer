@@ -446,6 +446,40 @@ class MergeOntoBaselineTests(unittest.TestCase):
         self.assertIn('ref = f"pull/{num}/head"', src)
 
 
+class ReconcileTests(unittest.TestCase):
+    def _reconcile(self, prs, scores):
+        calls = []
+
+        def fake_gh(a):
+            if a[:2] == ["pr", "list"] and "open" in a:
+                return run(__import__("json").dumps(
+                    [{"number": n, "labels": [{"name": l} for l in labs]} for n, labs in prs.items()]))
+            return run("[]")
+        with mock.patch.object(arb, "gh", side_effect=fake_gh), \
+                mock.patch.object(arb, "add_label", side_effect=lambda r, n, l: calls.append(("add", n, l))), \
+                mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: calls.append(("rm", n, l))), \
+                mock.patch.object(bot, "_load_scores", return_value=scores), \
+                mock.patch.object(bot, "AUTO_MERGE", False):
+            bot.reconcile_bonsai_merge_labels("o/r")
+        return calls
+
+    def test_a_held_pr_neither_wins_nor_demotes_the_next_best(self):
+        # #1154 (held, XL +35.4%) must not take merge-first from #1155 or push it to needs-rebase.
+        calls = self._reconcile(
+            {1154: ["eval-bonsai:XL", "hold", "bonsai-merge-first"], 1155: ["eval-bonsai:S"]},
+            {"1154": {"delta_pct": 35.4}, "1155": {"delta_pct": 4.0}})
+        self.assertIn(("add", 1155, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertIn(("rm", 1154, bot.BONSAI_MERGE_FIRST), calls)       # stale label cleared
+        self.assertNotIn(("add", 1155, bot.BONSAI_NEEDS_REBASE), calls)
+        self.assertNotIn(("add", 1154, bot.BONSAI_MERGE_FIRST), calls)
+
+    def test_without_a_hold_the_best_still_wins(self):
+        calls = self._reconcile({1154: ["eval-bonsai:XL"], 1155: ["eval-bonsai:S"]},
+                                {"1154": {"delta_pct": 35.4}, "1155": {"delta_pct": 4.0}})
+        self.assertIn(("add", 1154, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertIn(("add", 1155, bot.BONSAI_NEEDS_REBASE), calls)
+
+
 class DeclarationAndSiblingGuardTests(unittest.TestCase):
     TEMPLATE = open(bot.os.path.join(bot.ROOT, ".github", "PULL_REQUEST_TEMPLATE.md")).read()
 
