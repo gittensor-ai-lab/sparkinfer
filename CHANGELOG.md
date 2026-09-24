@@ -7,6 +7,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Fixed
 
+- **A process whose GPU context was lost kept taking traffic.** The release manifest's health
+  probe was `/v1/models`, which answers 200 regardless of the device; it is `/health` now, which
+  answers 503 once the context is gone. `/health` could still miss it: the error check used by
+  batched prefill, packed-decode verify and the DSpark verify graphs only printed, so a fault first
+  seen there never marked the device lost. It records it now, like every other CUDA error check.
+  One serve-dspark host kept serving for 42 s after an Xid 31 before it crashed.
 - **A replayed prefill graph could write through freed scratch, and libcuda segfaulted on it.**
   A short prompt's batched prefill is recorded as a CUDA graph and replayed for every later
   prompt of the same length, with the scratch it was recorded against baked in. Passes that never
