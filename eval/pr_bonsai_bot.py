@@ -38,7 +38,7 @@ server uses, `SPARKINFER_BONSAI_NATIVE` unset:
      unmeasured -> infra, retried next round; measured regression -> REJECT.
 
 Policy, by explicit decision 2026-09-24: tiers mirror to the generic `eval:*` label (as the sibling
-bots do); cron every two hours at :15, between Muse's :00 and Qwen3.8's :30. Auto-merge is
+bots do); cron hourly at :15, between Muse's :00 and Qwen3.8's :30. Auto-merge is
 SPARKINFER_BONSAI_AUTOMERGE=1 in .env.eval, turned on the same day once #1139 had validated the bot,
 matching the sibling bots' live policy -- with one extra guard they lack: it merges only the exact
 head commit this bot scored (auto_merge_ok_bonsai). Auto-close is OFF

@@ -299,7 +299,7 @@ Qwen3.6 / Qwen3.8 shared-path guards remain mandatory. To resume it, put
 
 ## Ternary-Bonsai-2-27B PR auto-evaluation bot
 
-### `pr_bonsai_bot.py` (on cron every two hours at `:15`)
+### `pr_bonsai_bot.py` (on cron hourly at `:15`)
 
 Added 2026-09-24 for issue #1138. Ternary-Bonsai-2-27B is on `main` (#1124), but until this bot
 existed a speedup on it scored `none` on the other bots, which measure other models. #1139 was the

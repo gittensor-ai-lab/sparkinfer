@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Cron wrapper for the sparkinfer Ternary-Bonsai-2-27B PR eval bot (eval/pr_bonsai_bot.py):
 #
-#   15 */2 * * * GH_TOKEN="$(gh auth token -u <bot account>)" /path/to/sparkinfer/eval/run_bonsai_pr_cron.sh >> /tmp/sparkinfer_bonsai_bot.log 2>&1
+#   15 * * * * GH_TOKEN="$(gh auth token -u <bot account>)" /path/to/sparkinfer/eval/run_bonsai_pr_cron.sh >> /tmp/sparkinfer_bonsai_bot.log 2>&1
 #
-#   Every two hours at :15 (decision 2026-09-24), between the Muse Glimmer bot's :00 and the Qwen3.8
-#   bot's :30. A round with a pending PR holds the one GPU for well over half an hour, so an hourly
-#   third bot would keep finding the lock busy. A tick with nothing to evaluate never touches the GPU.
+#   Hourly at :15 (2026-09-24; started every two hours, moved to hourly the same day), between the
+#   Muse Glimmer bot's :00 and the Qwen3.8 bot's :30. A round with a pending PR holds the one GPU for
+#   ~40 min, so when it overlaps a sibling round this tick defers on the shared lock and retries next
+#   hour -- that is expected, not an error. A tick with nothing to evaluate never touches the GPU.
 #
 # Policy (same as the sibling wrappers):
 #   • Pinned eval box only; never rent / never start from cron when down.
