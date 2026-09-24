@@ -4127,6 +4127,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // must participate in graph reuse even when the table address itself is unchanged.
     static thread_local uint64_t graph_seq_key = UINT64_MAX;
     static thread_local int graph_ns_key = -1;
+    // The decode shadow's weights are baked into a packed graph; release_bonsai_shadow frees
+    // them, and the null this then reads as must not replay a graph that still points there.
+    static thread_local const void* graph_shadow_key = nullptr;
     static thread_local const void* verify_head_key = nullptr;
     static thread_local signed char* verify_head_i8 = nullptr;
     static thread_local float* verify_head_scale = nullptr;
@@ -4543,7 +4546,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const uint64_t seq_key  = packed ? UINT64_MAX - 1 : s.seq_id;
     if (graph_model_key != s.w.lm_head || graph_state_key != state_key ||
         graph_conv_key != conv_key || graph_capture_key != capture_dst ||
-        graph_btable_key != btable_key || graph_seq_key != seq_key || graph_ns_key != ns) {
+        graph_btable_key != btable_key || graph_seq_key != seq_key || graph_ns_key != ns ||
+        graph_shadow_key != (const void*)s.bonsai_dec_layers) {
         for (int t = 1; t <= kVerifyMaxRows; t++) {
             if (verify_exec[t]) cudaGraphExecDestroy(verify_exec[t]);
             if (verify_graph[t]) cudaGraphDestroy(verify_graph[t]);
@@ -4558,6 +4562,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_btable_key = btable_key;
         graph_seq_key = seq_key;
         graph_ns_key = ns;
+        graph_shadow_key = s.bonsai_dec_layers;
     }
     if (graph_ready_t[N] && capture_only) return 0;   // this tier is already built
     if (graph_ready_t[N]) {
@@ -5357,7 +5362,43 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bool ffn_gemm = packed && topk == 1 && fp4_a && fp4_asf &&
                                   N >= kFfnGemmMinRows && w.gate_fp4 && w.gate_fp4_sf &&
                                   w.up_fp4 && w.up_fp4_sf && w.down_fp4 && w.down_fp4_sf;
-            if (ffn_gemm) {
+            // Packed decode against the Bonsai decode shadow: the ternary legs single-row decode
+            // reads, rotated and quantized per row as it does and multiplied at its G=8 lane
+            // split, so each row is bit-identical to that row decoded alone -- and the step streams
+            // the 3.7 GB ternary FFN instead of its 9.6 GB Q4_K fold. Wider batches keep the fold:
+            // the dp4a work grows per row and the fold's mma path overtakes it.
+            static const int kCbShadowMaxRows = [] {
+                const char* e = getenv("SPARKINFER_BONSAI_CB_SHADOW_MAX_ROWS");
+                return e ? atoi(e) : 8;
+            }();
+            const Qwen35LayerWeights* dw =
+                (packed && s.bonsai_dec_layers && N <= kCbShadowMaxRows) ? &s.bonsai_dec_layers[L]
+                                                                          : nullptr;
+            int shadow_hq = -1;
+            if (dw && topk == 1 && bonsai_rot_n && s.bonsai_sign_hidden && s.bonsai_sign_ffn &&
+                dw->gate_qtype == kPtq1GgmlType && dw->up_qtype == kPtq1GgmlType &&
+                dw->down_qtype == kPtq1GgmlType)
+                shadow_hq = kernels::launch_ptq1_rotate_quant_rows(
+                    hn, bonsai_rot_n, static_cast<const signed char*>(s.bonsai_sign_hidden), H, N,
+                    s.bonsai_block, st);
+            if (shadow_hq >= 0) {
+                // The rotation buffer now holds hn's rotation, not the layer body's staging.
+                bonsai_rot_src = nullptr;
+                bonsai_rot_k = 0;
+                bool ok = kernels::launch_gemm_ptq1_q(shadow_hq, dw->gate_q, sg, ffn, H, N, st) &&
+                          kernels::launch_gemm_ptq1_q(shadow_hq, dw->up_q, su, ffn, H, N, st);
+                if (ok) {
+                    kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
+                    const int fq = kernels::launch_ptq1_rotate_quant_rows(
+                        sh, bonsai_rot_n, static_cast<const signed char*>(s.bonsai_sign_ffn), ffn,
+                        N, s.bonsai_block, st);
+                    ok = fq >= 0 && kernels::launch_gemm_ptq1_q(fq, dw->down_q, routed, H, ffn, N, st);
+                }
+                if (!ok) {
+                    verify_decline("[dflash-verify] ternary shadow FFN declined N=%d\n", N);
+                    supported = false; break;
+                }
+            } else if (ffn_gemm) {
                 // gate and up are two reads of the same quantized activation into two different
                 // outputs, with no dependence between them -- but issued back to back they run
                 // one after the other, and neither fills the machine: at these widths the

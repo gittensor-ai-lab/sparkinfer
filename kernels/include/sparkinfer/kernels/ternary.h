@@ -34,6 +34,33 @@ void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
 void launch_gemm_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
                           int n_rows, int k, int batch, cudaStream_t stream);
 
+// Decode's rotate-then-GEMV pair with the GEMV's int8 activation quantized once, in the rotation.
+// launch_ptq1_rotate_quant is launch_hadamard_rotate_bf16 (same y_bf16, bit for bit) that also
+// leaves x's quantized copy behind and returns a handle to it, or -1 when it did not (then it
+// only rotated). launch_gemv_ptq1_q / _q_f32 read that handle instead of quantizing y_bf16
+// themselves -- the same int8 values, so the same result -- and fall back to launch_gemv_ptq1 on
+// -1. Several GEMVs can share one handle (the q/k/v legs, gate and up); it stays valid until
+// about a dozen further ternary launches have gone by, i.e. within the layer that made it.
+// The dp4a scratch the calls below quantize into (~10 MB). Reserved by the model that builds a
+// decode shadow, before capturing any graph, and released with that shadow; until then, or if it
+// fails, they decline and callers take the rotation + float path. No other model carries any.
+bool ptq1_dp_reserve();
+void ptq1_dp_release();
+int launch_ptq1_rotate_quant(const void* x_bf16, void* y_bf16, const signed char* sign, int k,
+                             int block, cudaStream_t stream);
+void launch_gemv_ptq1_q(int handle, const void* x_bf16, const void* w_ptq1, void* y_bf16,
+                        int n_rows, int k, cudaStream_t stream);
+void launch_gemv_ptq1_q_f32(int handle, const void* x_bf16, const void* w_ptq1, float* y_f32,
+                            int n_rows, int k, cudaStream_t stream);
+// The same pair over `batch` rows of x (row j at x + j*k), each row rotated and quantized exactly
+// as launch_ptq1_rotate_quant does it alone, and a GEMM whose row j is bit-identical to
+// launch_gemv_ptq1_q on that row. So a packed batch can read the decode shadow and still decode
+// every row as it would alone. -1 / false: not taken (dp4a off, a shape it does not cover).
+int launch_ptq1_rotate_quant_rows(const void* x_bf16, void* y_bf16, const signed char* sign, int k,
+                                  int batch, int block, cudaStream_t stream);
+bool launch_gemm_ptq1_q(int handle, const void* w_ptq1, void* y_bf16, int n_rows, int k,
+                        int batch, cudaStream_t stream);
+
 // A whole weight matrix decoded out of its ternary blocks and un-rotated into the architecture's
 // basis, as ordinary bf16. Prefill uses this rather than a ternary GEMM so its existing projection
 // branches -- FP8 GEMM, dequantize-then-requantize, plain GEMM -- keep working unchanged: they ask
