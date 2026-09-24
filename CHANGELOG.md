@@ -3,6 +3,23 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased]
+
+### Project
+
+- **Ternary-Bonsai-2-27B has a PR eval bot** (`eval/pr_bonsai_bot.py`, #1138). It scores decode and
+  prefill at ctx 128–32k and concurrent decode at c2–c32 against a same-box `main`. llama.cpp
+  cannot read PTQ1_0, so accuracy is differential, with three gates: the teacher-forced score
+  against `main`, batched prefill against the token loop averaged over three runs a side, and
+  `eval/bonsai_regression.py`. Two loads of one build agree on only 96–98% of top-1 on this model,
+  so the score bars come from that measured spread (top-1 ≥ 0.93, KL ≤ 0.03) with perplexity within
+  2% of `main` as the sharp edge. It guards Qwen3.6, both Qwen3.8 checkpoints and Muse Glimmer at
+  32k, and neither auto-merges nor auto-closes while it is new. Against the same-box `main`, #1139
+  scores `XL`: prefill@128 2,090 → 4,186 tok/s.
+- The PR template has a **Ternary-Bonsai-2-27B** target box. The Muse Glimmer and Qwen3.8 bots skip
+  a PR declared for it alone, instead of scoring it `none` and closing it, and both now guard it at
+  128 and 32k.
+
 ## [0.5.12] — 2026-09-24
 
 **Ternary-Bonsai-2-27B loads and runs**, a 1.75-bit ternary quantization of Qwen3.8-27B whose

@@ -38,9 +38,10 @@ spend GPU time on it: a bot whose model you did **not** tick may skip your PR in
 
 - [ ] **Muse Glimmer**
 - [ ] **Qwen3.8-27B** (ModelOpt NVFP4 / DSpark)
-- [ ] **Shared / both** — the change is in code both models use and should help either
+- [ ] **Ternary-Bonsai-2-27B** (PTQ1_0 GGUF)
+- [ ] **Shared / all models** — the change is in code every model uses and should help more than one
 
-> Tick **Shared / both** if you are unsure, or if the code you touched is shared (`qwen35.cpp`,
+> Tick **Shared / all models** if you are unsure, or if the code you touched is shared (`qwen35.cpp`,
 > `qwen35_prefill.cpp`, most of `kernels/`). Over-ticking only costs eval time; under-ticking can
 > cost you a tier a bot would have awarded. Declaring a model you did not target in order to dodge
 > a no-regression guard is gaming, and is treated like false attestation.

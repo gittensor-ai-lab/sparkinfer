@@ -263,6 +263,11 @@ applies `eval-qwen38:{XL,L,M,S,XS,none,REJECT}`, derives the generic `eval:*` ti
    The reverse also holds: this bot skips PRs declared for Muse Glimmer alone. So `pr_museglimmer_bot.py`
    guards the unsloth checkpoint too, with decode + prefill at 32k beside its ModelOpt and Qwen3.6
    guards.
+   - Ternary-Bonsai-2-27B: decode + prefill at 128 and 32k on the PTQ1_0 GGUF, as
+     `pr_bonsai_bot.py` runs it (added 2026-09-24; `pr_museglimmer_bot.py` runs the same guard).
+     That bot skips PRs declared for Qwen3.8 or Muse Glimmer alone. 128 is included because the
+     dense-GGUF prefill work on that model lives at short prompts (#1139: 1.94× at 128, flat at 4k).
+     A guard run that measures nothing is retried next round, never read as a regression.
 
 **Not evaluated:**
 - PRs whose template declares a different target model (#1027).
@@ -291,6 +296,92 @@ Qwen3.6 / Qwen3.8 shared-path guards remain mandatory. To resume it, put
 `eval/run_dspark_cron.sh` back on `:30` and move `run_qwen38_cron.sh` off that slot first.
 
 `pr_modelopt_bot.py` and `pr_dflash_bot.py` are kept for reference and run by hand only.
+
+## Ternary-Bonsai-2-27B PR auto-evaluation bot
+
+### `pr_bonsai_bot.py` (on cron every two hours at `:15`)
+
+Added 2026-09-24 for issue #1138. Ternary-Bonsai-2-27B is on `main` (#1124), but until this bot
+existed a speedup on it scored `none` on the other bots, which measure other models. #1139 was the
+first such PR.
+
+Scores **same-box PR vs `origin/main`** on `prism-ml/Ternary-Bonsai-2-27B-gguf`
+(`Ternary-Bonsai-2-27B-PTQ1_0.gguf`, 5,946,648,928 bytes), default folded loader —
+`SPARKINFER_BONSAI_NATIVE` unset, as the server runs it. It applies
+`eval-bonsai:{XL,L,M,S,XS,none,REJECT}` and derives the generic `eval:*` tier. It picks
+`bonsai-merge-first`, but **neither auto-merges nor auto-closes** unless
+`SPARKINFER_BONSAI_AUTOMERGE=1` / `SPARKINFER_BONSAI_AUTOCLOSE=1` (REJECT only) are set. It
+evaluates every PR not declared for a different model, most of which are not aimed at this one, so
+`none` never closes anything here.
+
+1. **Speed.** Decode and prefill at ctx 128/512/4k/16k/32k (one `bench_sweep_run`, reps 5), plus
+   concurrent decode at c2–c32 (median of three complete runs per width, as in `pr_qwen38_bot.py`).
+   The tier is the best measured delta; any axis below 98% of `main` is a REJECT. A concurrency
+   width that fails to run is dropped, never scored as zero.
+
+2. **Accuracy — three gates.** llama.cpp cannot read PTQ1_0, so there is no external reference.
+   - *Differential score:* `qwen3_gguf_score` on the PR build and on `main` over
+     `bench/scripts/eval_corpus.txt` (~1,200 tokens), compared by `accuracy_compare_pair.py`:
+     **top1 ≥ 0.93, KL ≤ 0.03, PPL ≤ 1.02× main**. The folded path is not bit-deterministic across
+     processes, so the bars come from a measured main-against-main spread (below), not from the
+     Qwen3.8 bot's 0.99/0.01.
+   - *Prefill path:* `qwen3_gguf_score` never enters batched prefill. `qwen3_gguf_prefill_check`
+     compares batched prefill with the token loop at prefix 128 (inside the fused quantized-B
+     GEMM's M ≤ 512 window) and 1024 (outside it), 64 teacher-forced positions, three runs a side.
+     The PR's mean must stay within `max(3× main's KL, main + 0.05)` and 0.10 of main's top-1.
+   - *`eval/bonsai_regression.py`* (tensors, score, generate, serve) on the PR build. It is
+     absolute, so it rejects only when `main` passes it in the same round.
+
+3. **No-regression guards @ 32k, decode + prefill:** Qwen3.6-35B-A3B, the ModelOpt and unsloth
+   Qwen3.8-27B checkpoints, and Muse Glimmer. The Muse and Qwen3.8 bots skip PRs declared for
+   Ternary-Bonsai-2-27B alone, so these guards are the only check such PRs get against those models.
+   In the other direction, both of those bots guard Ternary-Bonsai-2-27B at 128 and 32k. A guard
+   that measures nothing is retried next round; an absent checkpoint is skipped and reported.
+
+**Failures.** A fault on the box — GPU not drained, a failed fetch, a missing model, an SSH drop,
+an OOM kill — is retried next round with nothing posted. A PR that fails to build or crashes gets
+`eval-bonsai:REJECT` once for that commit.
+
+**Not evaluated:** PRs declared for other models only; PRs that change the harness (the files
+`pr_qwen38_bot.py` pins, plus `qwen3_gguf_score.cpp`, `qwen3_gguf_generate.cpp`,
+`qwen3_gguf_prefill_check.cpp` and `bonsai_inspect.cpp`). Every ref is measured as the PR merged
+into `main` when GitHub publishes that ref, with `main`'s harness.
+
+```bash
+python eval/pr_bonsai_bot.py --dry-run                            # what would be evaluated, no GPU
+python eval/pr_bonsai_bot.py --only-prs 1139 --reeval --no-post   # measure one PR, post nothing
+python eval/pr_bonsai_bot.py --labels-only                        # no GPU, reconcile labels only
+```
+
+Box paths: `BONSAI_REMOTE_REPO` (default `/root/sparkinfer_bonsai`, its own clone because it builds
+with `-DBUILD_SERVER=ON`; not under `/workspace`, whose overlay filesystem makes cargo fail to write
+the server's `tokenizers-c` archive with `Bad address (os error 14)`), `BONSAI_GGUF`,
+`BONSAI_TOKENIZER_DIR` (the GGUF carries no `tokenizer.json`; the model shares Qwen3.8's).
+
+Measured on the eval box when the bot was added (2026-09-24, `main` `bb67474`, RTX 5090):
+
+| ctx | decode tok/s | prefill tok/s |
+|---|--:|--:|
+| 128 | 99.1 | 2,090 |
+| 512 | 98.4 | 3,882 |
+| 4k | 97.0 | 8,699 |
+| 16k | 93.7 | 8,407 |
+| 32k | 88.7 | 8,081 |
+
+Concurrent decode c2/c4/c8/c16/c32: 163 / 263 / 498 / 783 / 1,061 tok/s.
+
+- **`main` against itself:** every speed axis within ±0.9%, every gate passing, `none`. Two loads
+  of one build do not agree exactly on this model: over eight pairs of processes, top-1 0.959–0.978,
+  KL 0.0084–0.0133, PPL ratio 0.995–1.005. `SPARKINFER_DETERMINISTIC=1` does not change that. So the
+  score gate is **top1 ≥ 0.93, KL ≤ 0.03, PPL ≤ 1.02× main** — outside that spread, with the PPL
+  ratio as the sharp edge — rather than the Qwen3.8 bot's 0.99/0.01, which rejected `main` against
+  itself in the first validation round.
+- **#1139 against it:** `eval-bonsai:XL` from prefill@128, 2,090 → 4,186 tok/s (+100.3%); every
+  other axis within −0.7% / +1.5%; top-1 0.964, KL 0.0102, PPL ×1.0002; the prefill path,
+  `bonsai_regression.py` and all four guards passing.
+- **Cost:** ~20 minutes of GPU per ref (build 2–4 min, speed 1.5, concurrency 7, score 0.5, prefill
+  check 3, `bonsai_regression.py` 2.3, guards 2.7), so a round with one pending PR holds the box for
+  ~40 minutes. A round with nothing to evaluate never touches the GPU.
 
 ## DFlash PR auto-evaluation bot (retired from cron)
 

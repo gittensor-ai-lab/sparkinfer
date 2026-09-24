@@ -68,9 +68,20 @@ gh label create "qwen38-merge-first" -R "$REPO" --color "0E8A16" \
 gh label create "qwen38-needs-rebase" -R "$REPO" --color "FBCA04" \
    --description "conflicts with main — rebase before the Qwen3.8-27B bot can evaluate it" --force >/dev/null
 
+# Ternary-Bonsai-2-27B bot (eval/pr_bonsai_bot.py) — decode + prefill at 128..32k and concurrent
+# decode on the PTQ1_0 GGUF, differential accuracy gates. Mirrors its tier to eval:*.
+for k in "${!C[@]}"; do
+  gh label create "eval-bonsai:$k" -R "$REPO" --color "${C[$k]}" \
+     --description "sparkinfer Ternary-Bonsai-2-27B vs-main speed tier: $k" --force >/dev/null
+done
+gh label create "bonsai-merge-first" -R "$REPO" --color "0E8A16" \
+   --description "round winner: biggest verified Ternary-Bonsai-2-27B speedup — auto-merge candidate" --force >/dev/null
+gh label create "bonsai-needs-rebase" -R "$REPO" --color "FBCA04" \
+   --description "conflicts with main, or lost this round's bonsai-merge-first" --force >/dev/null
+
 # Noise-ban penalty labels (`eval:XL-p`, `eval-qwen38:M-p`, ...) are deliberately NOT created
 # here. eval/noise_penalty.py upserts one the first time a ban actually parks that tier, so the
 # repo only ever carries penalty labels it has really used -- which is also what keeps the
 # restore sweep cheap (it walks the penalty labels that exist). See .github/noise-ban-list.txt.
 
-echo "eval:*, eval-dflash:*, eval-museglimmer:*, eval-qwen38:*, area:*, *-context, regression-*, dflash-merge-*, museglimmer-merge-*, qwen38-merge-* labels ready on $REPO"
+echo "eval:*, eval-dflash:*, eval-museglimmer:*, eval-qwen38:*, eval-bonsai:*, area:*, *-context, regression-*, dflash-merge-*, museglimmer-merge-*, qwen38-merge-*, bonsai-* labels ready on $REPO"

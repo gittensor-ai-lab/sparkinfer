@@ -43,7 +43,7 @@ class ConcurrencyAxesTests(unittest.TestCase):
         self.assertIn("main guard coverage", src)
         self.assertIn("PR guard coverage", src)
         self.assertEqual(bot._guard_coverage({"guardmo": {32768: {}}, "guardcbmo": {16: {}, 32: {}}}),
-                         "modelopt 1 ctx / 2 cc · muse 0 ctx / 0 cc · qwen3.6 0 ctx")
+                         "modelopt 1 ctx / 2 cc · muse 0 ctx / 0 cc · qwen3.6 0 ctx · bonsai 0 ctx")
 
     def test_schema_is_bumped_so_old_verdicts_re_evaluate(self):
         self.assertNotEqual(bot.EVAL_SCHEMA_VERSION, "v1-nvfp4-decode128")

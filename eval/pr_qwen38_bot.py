@@ -76,6 +76,12 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               get against either model. A checkpoint missing from the box is skipped and reported,
               never rejected.
 
+  3c. Ternary-Bonsai-2-27B no-regression guard (2026-09-24) — decode + prefill at 128 and 32k on the
+              PTQ1_0 GGUF, default loader, same hard REJECT. pr_bonsai_bot.py skips PRs declared
+              for Qwen3.8 alone, so this is the only check they get against that model. 128 as
+              well as 32k because the dense-GGUF prefill work on that model lives at short
+              prompts (#1139: 1.94x at 128, flat at 4k); both come from one model load.
+
 Applies `eval-qwen38:<TIER>` AND mirrors it to the generic `eval:<TIER>` label (SN74 scoring reads
 eval:* tiers). Auto-close on none/REJECT is live; auto-merge stays OFF unless
 SPARKINFER_QWEN38_AUTOMERGE=1 is explicitly set.
@@ -207,7 +213,8 @@ QWEN38_NEEDS_REBASE = "qwen38-needs-rebase"
 # v2 (2026-09-15): concurrent-decode axes added (issue #1080), and the harness is taken from main.
 # v3 (2026-09-15): ModelOpt Qwen3.8 and Muse Glimmer no-regression guards added.
 # v4 (2026-09-15): those guards also cover concurrent decode at c16/c32.
-EVAL_SCHEMA_VERSION = "v5-unsloth-concurrency-cross-model-guards-cb-longctx256k"
+# v6 (2026-09-24): Ternary-Bonsai-2-27B no-regression guard added (pt. 3c).
+EVAL_SCHEMA_VERSION = "v6-unsloth-concurrency-cross-model-guards-cb-longctx256k-bonsai"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-qwen38-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -267,6 +274,10 @@ MODELOPT_GUARD_CTXS = [32768]
 MUSE_GUARD_GGUF = os.environ.get(
     "MUSEGLIMMER_GGUF", "/root/workspace/models_muse_glimmer/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf")
 MUSE_GUARD_CTXS = [32768]
+# Ternary-Bonsai-2-27B (pt. 3c), the model pr_bonsai_bot.py scores, run the way that bot runs it.
+BONSAI_GUARD_GGUF = os.environ.get(
+    "BONSAI_GGUF", "/root/workspace/models_bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf")
+BONSAI_GUARD_CTXS = [128, 32768]
 # reps=5 (median), as for the Qwen3.6 guard: a guard that hard-REJECTs must not act on one sample.
 GUARD_REPS = 5
 # Concurrent-decode guards on the same two checkpoints. The 32k guards above run ONE request, but
@@ -452,6 +463,11 @@ def check_modelopt_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
 def check_muse_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
     """Muse Glimmer 30B no-regression guard (pt. 3b), decode + prefill @ 32k."""
     return _check_model_guard(pr, main, "guardmg", "muse glimmer", tol)
+
+
+def check_bonsai_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """Ternary-Bonsai-2-27B no-regression guard (pt. 3c), decode + prefill @ 128 and 32k."""
+    return _check_model_guard(pr, main, "guardbn", "ternary-bonsai", tol)
 
 
 def check_modelopt_cb_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
@@ -700,6 +716,9 @@ def _remote_script(ref: str, role: str = "pr") -> str:
     lc_ctx, lc_reps = LONGCTX_CTX, LONGCTX_REPS
     mg_sweep_args = " ".join(f"{c} {GUARD_REPS}" for c in MUSE_GUARD_CTXS)
     mg_ctx_list = " ".join(str(c) for c in MUSE_GUARD_CTXS)
+    bonsai_gguf = shlex.quote(BONSAI_GUARD_GGUF)
+    bn_sweep_args = " ".join(f"{c} {GUARD_REPS}" for c in BONSAI_GUARD_CTXS)
+    bn_ctx_list = " ".join(str(c) for c in BONSAI_GUARD_CTXS)
     cb_guard_concs = " ".join(str(c) for c in CB_GUARD_CONCS)
     return f"""
 set -euo pipefail
@@ -748,6 +767,7 @@ Q36_GUARD_MODEL_REPO={q36_repo}
 Q36_GUARD_TOK_REPO={q36_tok}
 MODELOPT_GUARD_MODEL_DIR={mo_dir}
 MUSE_GUARD_GGUF={muse_gguf}
+BONSAI_GUARD_GGUF={bonsai_gguf}
 
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
@@ -1048,6 +1068,22 @@ else
   echo "GUARDMG_UNAVAILABLE"
 fi
 
+# --- Ternary-Bonsai-2-27B no-regression guard (decode + prefill @ 128 and 32k, pt. 3c) ---
+# The model pr_bonsai_bot.py scores, run the way that bot runs it: qwen3_gguf_bench on the GGUF, no
+# env pins. Skipped, not failed, when the GGUF is absent from the box.
+if [ -f "$BONSAI_GUARD_GGUF" ]; then
+  wait_gpu_clear
+  if bench_sweep_run "$BONSAI_GUARD_GGUF" 128 {bn_sweep_args}; then
+    for ctx in {bn_ctx_list}; do
+      echo "GUARDBN $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
+    done
+  else
+    echo "GUARDBN_FAILED"
+  fi
+else
+  echo "GUARDBN_UNAVAILABLE"
+fi
+
 # --- Concurrent-decode no-regression guards: ModelOpt and Muse Glimmer (pt. 3b) ---
 # The PRs this bot scores mostly change packed decode, which the single-stream 32k guards above never
 # enter. Each model runs the way its own bot runs it: ModelOpt with pr_dspark_bot.py's env, Muse
@@ -1083,7 +1119,7 @@ def _parse_remote(stdout: str) -> dict:
     fewer place for the two to disagree about what was measured."""
     out = {}
     guard36 = {}
-    cross_guards = {"GUARDMO": {}, "GUARDMG": {}}
+    cross_guards = {"GUARDMO": {}, "GUARDMG": {}, "GUARDBN": {}}
     cb_guards = {"GUARDCBMO": {}, "GUARDCBMG": {}}
     for line in (stdout or "").splitlines():
         if line.startswith("REMOTE_HEAD "):
@@ -1165,17 +1201,18 @@ def _parse_remote(stdout: str) -> dict:
                                                              "prefill": float(parts[3])}
                 except ValueError:
                     pass
-        elif line.strip() in ("GUARDMO_FAILED", "GUARDMG_FAILED"):
+        elif line.strip() in ("GUARDMO_FAILED", "GUARDMG_FAILED", "GUARDBN_FAILED"):
             out[line.strip().split("_")[0].lower() + "_failed"] = True
         elif line.strip() in ("LONGCTX_FAILED", "LONGCTX_UNAVAILABLE"):
             # Soft: the 256k axis is not scored this round. Never a guard failure -- a checkpoint
             # that is absent, or a sweep that could not fit, must not reject a PR (#1113).
             out["longctx_unmeasured"] = True
-        elif line.strip() in ("GUARDMO_UNAVAILABLE", "GUARDMG_UNAVAILABLE"):
+        elif line.strip() in ("GUARDMO_UNAVAILABLE", "GUARDMG_UNAVAILABLE", "GUARDBN_UNAVAILABLE"):
             out[line.strip().split("_")[0].lower() + "_unavailable"] = True
     out["guard36"] = guard36
     out["guardmo"] = cross_guards["GUARDMO"]
     out["guardmg"] = cross_guards["GUARDMG"]
+    out["guardbn"] = cross_guards["GUARDBN"]
     out["guardcbmo"] = cb_guards["GUARDCBMO"]
     out["guardcbmg"] = cb_guards["GUARDCBMG"]
     return out
@@ -1379,7 +1416,8 @@ def _guard_coverage(d: dict) -> str:
     difference between a REJECT and a retry, so the round log should not make anyone guess."""
     return (f"modelopt {len(d.get('guardmo') or {})} ctx / {len(d.get('guardcbmo') or {})} cc · "
             f"muse {len(d.get('guardmg') or {})} ctx / {len(d.get('guardcbmg') or {})} cc · "
-            f"qwen3.6 {len(d.get('guard36') or {})} ctx")
+            f"qwen3.6 {len(d.get('guard36') or {})} ctx · "
+            f"bonsai {len(d.get('guardbn') or {})} ctx")
 
 
 def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
@@ -1501,7 +1539,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     # checkpoint is a SKIP, reported as one, so a round that guarded nothing never reads as a pass.
     cross = {}
     for key, name, checks in (("guardmo", "modelopt", (check_modelopt_guard, check_modelopt_cb_guard)),
-                              ("guardmg", "muse glimmer", (check_muse_guard, check_muse_cb_guard))):
+                              ("guardmg", "muse glimmer", (check_muse_guard, check_muse_cb_guard)),
+                              ("guardbn", "ternary-bonsai", (check_bonsai_guard,))):
         skipped = bool(pr.get(f"{key}_unavailable") or main.get(f"{key}_unavailable"))
         ok, problems = True, []
         if not skipped:
@@ -1571,6 +1610,9 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "muse_guard_ok": cross["guardmg"][0],
         "muse_guard_problems": cross["guardmg"][1],
         "muse_guard_skipped": cross["guardmg"][2],
+        "bonsai_guard_ok": cross["guardbn"][0],
+        "bonsai_guard_problems": cross["guardbn"][1],
+        "bonsai_guard_skipped": cross["guardbn"][2],
         "pr_head": pr.get("head"),
         "main_head": main.get("head"),
     }
@@ -1609,6 +1651,7 @@ def format_comment(commit: str, res: dict) -> str:
         "q36_guard_ok": res.get("q36_guard_ok"),
         "modelopt_guard_ok": res.get("modelopt_guard_ok"),
         "muse_guard_ok": res.get("muse_guard_ok"),
+        "bonsai_guard_ok": res.get("bonsai_guard_ok"),
     }
     marker = (
         f"<!-- sparkinfer-qwen38-eval:{EVAL_SCHEMA_VERSION}:{commit} "
@@ -1638,15 +1681,18 @@ def format_comment(commit: str, res: dict) -> str:
         q36_row = (f"| qwen3.6 guard | ❌ **FAILED** — {problems} — "
                     "**verdict forced to REJECT regardless of speed/accuracy** |\n")
     cross_rows = ""
-    for prefix, name, what in (("modelopt", "modelopt guard", "Qwen3.8-27B NVFP4 (ModelOpt)"),
-                               ("muse", "muse glimmer guard", "Muse Glimmer 30B")):
+    cb_note = f", concurrent decode @ {'/'.join(f'c{c}' for c in CB_GUARD_CONCS)}"
+    bn_ctxs = "/".join("32k" if c == 32768 else str(c) for c in BONSAI_GUARD_CTXS)
+    for prefix, name, what, at in (
+            ("modelopt", "modelopt guard", "Qwen3.8-27B NVFP4 (ModelOpt)", f"decode+prefill @ 32k{cb_note}"),
+            ("muse", "muse glimmer guard", "Muse Glimmer 30B", f"decode+prefill @ 32k{cb_note}"),
+            ("bonsai", "ternary-bonsai guard", "Ternary-Bonsai-2-27B", f"decode+prefill @ {bn_ctxs}")):
         if res.get(f"{prefix}_guard_skipped"):
             # Say SKIPPED explicitly: a guard that reports nothing reads the same as one that passed.
             cross_rows += (f"| {name} | ⚠️ SKIPPED — checkpoint not installed on the box; "
                            f"shared-code regressions on {what} were NOT checked |\n")
         elif res.get(f"{prefix}_guard_ok"):
-            cross_rows += (f"| {name} | ✅ no regression (decode+prefill @ 32k, concurrent decode @ "
-                           f"{'/'.join(f'c{c}' for c in CB_GUARD_CONCS)}, {what}) |\n")
+            cross_rows += f"| {name} | ✅ no regression ({at}, {what}) |\n"
         else:
             probs = "; ".join((res.get(f"{prefix}_guard_problems") or [])[:4])
             cross_rows += (f"| {name} | ❌ **FAILED** — {probs} — "
@@ -1699,7 +1745,8 @@ def format_comment(commit: str, res: dict) -> str:
         "tier among prefill@16k and concurrent decode @c2–c32. Accuracy is differential: this "
         "build and `main` score the same token stream and must agree. Also gated on no-regression "
         "guards for Qwen3.6 (decode+prefill, ctx 0/512/4k/16k/32k) and for the ModelOpt Qwen3.8 "
-        "checkpoint and Muse Glimmer (decode+prefill @ 32k, concurrent decode @ c16/c32), because Qwen3.8 PRs can touch code "
+        "checkpoint and Muse Glimmer (decode+prefill @ 32k, concurrent decode @ c16/c32) and "
+        "Ternary-Bonsai-2-27B (decode+prefill @ 128 and 32k), because Qwen3.8 PRs can touch code "
         "shared with other models. A `none` label means no measurable speedup on these axes, "
         "which is expected if that is not what your change is about.</sub>\n"
     )
@@ -1754,7 +1801,7 @@ def try_auto_merge_qwen38(repo, num):
                 "<!-- sparkinfer-qwen38-automerge -->\n"
                 "Auto-merged as the round's `qwen38-merge-first` winner — verified same-box "
                 "speedup over `main` on the unsloth checkpoint, with every floor, the differential "
-                "accuracy gate and the Qwen3.6, ModelOpt and Muse Glimmer guards passing."])
+                "accuracy gate and the Qwen3.6, ModelOpt, Muse Glimmer and Ternary-Bonsai guards passing."])
         return True
     print(f">> qwen38 auto-merge BLOCKED #{num}: {(r.stderr or r.stdout or '')[:200]}")
     return False
@@ -1843,6 +1890,8 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
             "modelopt_guard_skipped": res.get("modelopt_guard_skipped"),
             "muse_guard_ok": res.get("muse_guard_ok"), "muse_guard_problems": res.get("muse_guard_problems"),
             "muse_guard_skipped": res.get("muse_guard_skipped"),
+            "bonsai_guard_ok": res.get("bonsai_guard_ok"), "bonsai_guard_problems": res.get("bonsai_guard_problems"),
+            "bonsai_guard_skipped": res.get("bonsai_guard_skipped"),
             "gpu": "pinned eval box", "date": arb.datetime.date.today().isoformat(),
         }
         if receipt:
@@ -1896,7 +1945,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
           f"top1={res.get('pr_top1')} kl={res.get('pr_kl')}  "
           f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
           f"q36_guard_ok={res.get('q36_guard_ok')}  modelopt_guard_ok={res.get('modelopt_guard_ok')}  "
-          f"muse_guard_ok={res.get('muse_guard_ok')}")
+          f"muse_guard_ok={res.get('muse_guard_ok')}  bonsai_guard_ok={res.get('bonsai_guard_ok')}")
     if dry_run:
         print(body[:500])
         return
@@ -1941,6 +1990,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "q36_guard_ok": res.get("q36_guard_ok"),
             "modelopt_guard_ok": res.get("modelopt_guard_ok"),
             "muse_guard_ok": res.get("muse_guard_ok"),
+            "bonsai_guard_ok": res.get("bonsai_guard_ok"),
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
@@ -1962,6 +2012,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "and regressed the ModelOpt Qwen3.8 no-regression guard (decode/prefill @ 32k or concurrent decode)"
             elif not res.get("muse_guard_ok", True):
                 fail_clause = "and regressed the Muse Glimmer no-regression guard (decode/prefill @ 32k or concurrent decode)"
+            elif not res.get("bonsai_guard_ok", True):
+                fail_clause = "and regressed the Ternary-Bonsai-2-27B no-regression guard (decode/prefill @ 128 or 32k)"
             elif not res.get("accuracy_ok"):
                 fail_clause = "and failed the accuracy gate"
             elif res.get("regressed_dims"):
@@ -1995,7 +2047,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                     f"Measured **{res.get('delta_pct')}%** vs the same-box `origin/main`, "
                     f"{fail_clause} — closing automatically.\n\n"
                     "Every measured axis is also a no-regression floor, and accuracy and the "
-                    "Qwen3.6, ModelOpt and Muse Glimmer guards are hard gates, so one failure closes the PR whatever it was "
+                    "Qwen3.6, ModelOpt, Muse Glimmer and Ternary-Bonsai guards are hard gates, so one failure closes the PR whatever it was "
                     "aiming at. The verdict comment above names which one. Reopen once it is "
                     "addressed and it re-evaluates on the next poll."
                 )

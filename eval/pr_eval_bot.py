@@ -1023,9 +1023,15 @@ def rtx5090_should_close(body, areas=None):
 # Exception, by explicit decision 2026-09-15: the Muse bot skips PRs declared for Qwen3.8 alone even
 # though no bot guards Muse Glimmer against them. It had auto-closed #1082, a Qwen3.8-only PR,
 # before the Qwen3.8 bot that measures its axis could score it.
+#
+# Ternary-Bonsai-2-27B (2026-09-24, pr_bonsai_bot.py): the Muse and Qwen3.8 bots skip a PR declared
+# for it alone, and pr_bonsai_bot.py guards both of their models; each of them runs a Ternary-Bonsai
+# guard in turn. Its needles must never match the other keys' -- the model is derived from
+# Qwen3.8-27B, and a template line naming that would read as a Qwen3.8 declaration.
 MODEL_KEYS = {
     "muse":    ("muse",),                       # Muse Glimmer
     "qwen38":  ("qwen3.8", "qwen38", "dspark", "modelopt"),
+    "bonsai":  ("bonsai", "ternary"),           # Ternary-Bonsai-2-27B
     "shared":  ("shared", "both", "all models", "any model"),
 }
 

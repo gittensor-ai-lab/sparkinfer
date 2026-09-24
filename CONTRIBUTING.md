@@ -21,8 +21,8 @@ source of the incentive loop is clear: SPARKINFER is built through **SN74 on Git
   Every change is gated against a frozen reference (see *Accuracy gate* below).
 - **General, not overfit.** Optimizations must hold across the basket and across shapes; a win
   on one model but a regression on another is overfitting, and the guards will catch it. The live
-  basket is **Muse Glimmer** and **Qwen3.8-27B** (both scored), with **Qwen3.6-35B-A3B** (MoE) and
-  **Qwen3.8 ModelOpt** as no-regression guards. They share `qwen35.cpp`, `qwen35_prefill.cpp` and
+  basket is **Muse Glimmer**, **Qwen3.8-27B** and **Ternary-Bonsai-2-27B** (all scored), with
+  **Qwen3.6-35B-A3B** (MoE) and **Qwen3.8 ModelOpt** as no-regression guards. They share `qwen35.cpp`, `qwen35_prefill.cpp` and
   the kernels, so a change aimed at one routinely lands in another's path — which is exactly why
   a win is scored wherever it lands and a regression anywhere is caught.
 - **Blackwell only, by design.** Targets `sm_120` (RTX 5090, RTX PRO 6000) and `sm_121`
@@ -119,7 +119,7 @@ GPU on it:
   proving a change it cannot move;
 - **tick nothing and every bot evaluates it**, exactly as before this existed — the declaration can
   only ever remove work you have said is pointless, never cause a PR to go unevaluated by accident;
-- **tick `Shared / both` when unsure**, or when you touched shared code (`qwen35.cpp`,
+- **tick `Shared / all models` when unsure**, or when you touched shared code (`qwen35.cpp`,
   `qwen35_prefill.cpp`, most of `kernels/`) — most optimizations land there and genuinely help more
   than one model. Over-ticking costs eval time; under-ticking can cost you a tier a bot would have
   awarded.
@@ -175,23 +175,25 @@ can lag them.
 
 | Bot | Model | Scored axes |
 |---|---|---|
-| [`eval/pr_museglimmer_bot.py`](eval/pr_museglimmer_bot.py) | Muse Glimmer | prefill **and** decode at **ctx 128 / 512 / 4k / 16k / 32k / 64k** — twelve axes, any one of which can earn the tier |
-| [`eval/pr_dspark_bot.py`](eval/pr_dspark_bot.py) | Qwen3.8-27B ModelOpt NVFP4 + DSpark draft | DSpark decode and DSpark-enabled batched prefill at **ctx 4k / 16k / 32k**, plus target prefill and decode at **ctx 256k** |
+| [`eval/pr_museglimmer_bot.py`](eval/pr_museglimmer_bot.py) | Muse Glimmer | prefill **and** decode at **ctx 128 / 512 / 4k / 16k / 32k / 64k**, plus concurrent decode at **c2–c32** |
+| [`eval/pr_qwen38_bot.py`](eval/pr_qwen38_bot.py) | Qwen3.8-27B (unsloth NVFP4) | prefill at **ctx 16k**, concurrent decode at **c2–c32**, and ModelOpt decode at **ctx 256k**; decode and prefill at 128 are floors |
+| [`eval/pr_bonsai_bot.py`](eval/pr_bonsai_bot.py) | Ternary-Bonsai-2-27B (PTQ1_0 GGUF) | prefill **and** decode at **ctx 128 / 512 / 4k / 16k / 32k**, plus concurrent decode at **c2–c32** |
 
-Both bots additionally run **no-regression guards** on models they are not scoring, because the
+`pr_dspark_bot.py` (DSpark decode on the ModelOpt checkpoint) is paused and runs by hand only.
+
+Every bot additionally runs **no-regression guards** on models it is not scoring, because the
 code is shared — see the gate table in *Lane 1*:
 
 | Bot | Guards it runs |
 |---|---|
-| Muse Glimmer bot | Qwen3.6 **and** ModelOpt (Qwen3.8) @ ctx 32k |
-| DSpark bot | Qwen3.6 **and** Qwen3.8 @ ctx 16k |
+| Muse Glimmer bot | Qwen3.6, ModelOpt and unsloth Qwen3.8 @ ctx 32k; Ternary-Bonsai @ ctx 128 and 32k |
+| Qwen3.8 bot | Qwen3.6 @ ctx 0–32k; ModelOpt Qwen3.8 and Muse Glimmer @ ctx 32k and concurrent decode c16/c32; Ternary-Bonsai @ ctx 128 and 32k |
+| Ternary-Bonsai bot | Qwen3.6, ModelOpt and unsloth Qwen3.8, and Muse Glimmer @ ctx 32k |
 
-**Which bots honour your `Target model(s)` declaration follows from that table.** The DSpark bot
-skips a PR declared Muse-only, because the Muse bot's own run still guards Qwen3.8 and Qwen3.6 — so
-nothing goes unchecked. The Muse bot does **not** yet skip a PR declared Qwen3.8-only, because no
-bot currently guards Muse Glimmer from the other side; skipping there would let a Muse regression
-land unnoticed. That asymmetry is a gap in the harness, not a policy: it closes when a Muse guard
-is added to the DSpark bot.
+**Which bots honour your `Target model(s)` declaration follows from that table.** A bot skips a PR
+declared only for models it does not score — and every model it then leaves unscored is still
+guarded by the bots that do evaluate the PR. Tick nothing, or `Shared / all models`, and every bot
+evaluates it.
 
 **This list is not a menu, and it is not exhaustive.** It is what happens to be wired up today.
 If your optimization is real and lands somewhere none of these axes reach, that is a reason to
@@ -247,7 +249,7 @@ speculative axes carry the losslessness and τ gates:
 | **Long-context guards** | ≥ 0.98× `main`, decode **and** prefill @ ctx=16k, on Qwen3.8 **and** Qwen3.6 | DSpark work lands in `qwen35.cpp` / shared kernels, which Qwen3.6 also uses — the exact surface through which #775 regressed a model nobody was scoring at the time. |
 
 Tiers are bands of % speedup over the frontier (`XS` 2–3.5% … `XL` >18%; under 2% is noise →
-`none`). A `none` or a failed gate is **auto-closed on the first result** — reopen after a fix and it re-evaluates. Drafts and `hold` never reach evaluation, so use one of those if the PR should stay open unscored (see *Lane 3*).
+`none`). A `none` or a failed gate is **auto-closed on the first result** — reopen after a fix and it re-evaluates. The exception is the Ternary-Bonsai bot, which is new: it labels and comments, but neither auto-closes nor auto-merges. Drafts and `hold` never reach evaluation, so use one of those if the PR should stay open unscored (see *Lane 3*).
 
 ### Lane 2 — manually reviewed, not scored
 

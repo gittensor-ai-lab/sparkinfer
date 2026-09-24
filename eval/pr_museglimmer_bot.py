@@ -50,7 +50,7 @@ after this bot's first live run wrongly auto-closed an unrelated PR (#768, reope
 apologized); the user was told the risk directly and chose to accept it rather than narrow the
 evaluation scope.
 
-  3. Cross-model no-regression guards @ 32k — decode + prefill on THREE models, same box, same PR
+  3. Cross-model no-regression guards @ 32k — decode + prefill on FOUR models, same box, same PR
               build, vs a freshly-measured origin/main:
                 * Qwen3.6-35B-A3B (Q36_GUARD_*), and
                 * the ModelOpt Qwen3.8-27B NVFP4 checkpoint (MODELOPT_MODEL_DIR) -- the one
@@ -59,9 +59,14 @@ evaluation scope.
                 * the unsloth Qwen3.8-27B NVFP4 checkpoint (QWEN38_MODEL_DIR) -- the one
                   pr_qwen38_bot.py scores (added 2026-09-15). That bot skips PRs declared for
                   Muse Glimmer alone, so without this guard nothing checked them against it.
+                * Ternary-Bonsai-2-27B (BONSAI_GGUF, added 2026-09-24) -- the one pr_bonsai_bot.py
+                  scores, at 128 as well as 32k, for the same reason. A guard run that measured
+                  nothing is retried next round rather than read as a regression (the
+                  pr_qwen38_bot.py rule since #1112/#1114); a new guard must not add a way to
+                  auto-close a PR over an infrastructure fault.
               Narrowed from the previous five-context Qwen3.6 sweep to 32k only: those extra
               points cost a model load each on models this bot does not score, and 32k is where
-              shared prefill/KV code actually breaks. All three guards share one implementation
+              shared prefill/KV code actually breaks. All the guards share one implementation
               (_check_model_guard) so they cannot drift apart. Reuses pr_dflash_bot.py's GUARD36
               sweep mechanism (bench_sweep_run, REGRESS_TOL=0.98) rather than reinventing it.
               A regression here is a hard REJECT regardless of Muse Glimmer's own speed/accuracy
@@ -136,7 +141,8 @@ MUSEGLIMMER_NEEDS_REBASE = "museglimmer-needs-rebase"
 # scored under v3 must not keep a two-dimension label forever, so the version changes and every
 # open PR is re-evaluated.
 # v6 (2026-09-15): unsloth Qwen3.8 32k guard added beside the ModelOpt and Qwen3.6 guards.
-EVAL_SCHEMA_VERSION = "v6-ctx6-prefill-decode-cbdecode-modelopt-unsloth-guards"
+# v7 (2026-09-24): Ternary-Bonsai-2-27B guard added (decode + prefill @ 128 and 32k).
+EVAL_SCHEMA_VERSION = "v7-ctx6-prefill-decode-cbdecode-modelopt-unsloth-bonsai-guards"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-museglimmer-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -328,6 +334,12 @@ MODELOPT_GUARD_MODEL_DIR = os.environ.get("MODELOPT_MODEL_DIR", "/root/workspace
 # alone, so this guard is the only check they get against it. Same env var as that bot uses.
 UNSLOTH_GUARD_MODEL_DIR = os.environ.get("QWEN38_MODEL_DIR", "/root/workspace/models_qwen38")
 UNSLOTH_GUARD_CTXS = [32768]
+# Ternary-Bonsai-2-27B, the model pr_bonsai_bot.py scores, which skips PRs declared for Muse Glimmer
+# alone. 128 as well as 32k: the dense-GGUF prefill work on that model lives at short prompts
+# (#1139: 1.94x at 128, flat at 4k). One model load either way.
+BONSAI_GUARD_GGUF = os.environ.get(
+    "BONSAI_GGUF", "/root/workspace/models_bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf")
+BONSAI_GUARD_CTXS = [128, 32768]
 
 # Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
 # shape) but OFF unless this exact env var is set — NOT set in .env.eval, so it stays fully
@@ -479,6 +491,12 @@ def check_unsloth_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
     """Unsloth Qwen3.8-27B NVFP4 no-regression guard, decode + prefill @ 32k. Same discipline and the
     same hard REJECT as the ModelOpt guard -- this is the checkpoint pr_qwen38_bot.py scores."""
     return _check_model_guard(pr, main, "guardun", "unsloth qwen3.8", tol)
+
+
+def check_bonsai_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """Ternary-Bonsai-2-27B no-regression guard, decode + prefill @ 128 and 32k -- the model
+    pr_bonsai_bot.py scores."""
+    return _check_model_guard(pr, main, "guardbn", "ternary-bonsai", tol)
 
 
 def museglimmer_evaluated_commits(repo, num):
@@ -726,6 +744,9 @@ def _remote_script(ref: str) -> str:
     un_dir = shlex.quote(UNSLOTH_GUARD_MODEL_DIR)
     un_sweep_args = " ".join(f"{c} {BENCH_REPS}" for c in UNSLOTH_GUARD_CTXS)
     un_ctx_list = " ".join(str(c) for c in UNSLOTH_GUARD_CTXS)
+    bn_gguf = shlex.quote(BONSAI_GUARD_GGUF)
+    bn_sweep_args = " ".join(f"{c} {BENCH_REPS}" for c in BONSAI_GUARD_CTXS)
+    bn_ctx_list = " ".join(str(c) for c in BONSAI_GUARD_CTXS)
     return f"""
 set -euo pipefail
 # Surface *why* a crash happened instead of dying silently — same diagnostic trap as
@@ -777,6 +798,7 @@ Q36_GUARD_MODEL_REPO={q36_repo}
 Q36_GUARD_TOK_REPO={q36_tok}
 MODELOPT_GUARD_MODEL_DIR={mo_dir}
 UNSLOTH_GUARD_MODEL_DIR={un_dir}
+BONSAI_GUARD_GGUF={bn_gguf}
 
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
@@ -1039,6 +1061,22 @@ if [ -d "$UNSLOTH_GUARD_MODEL_DIR" ]; then
 else
   echo "GUARDUN_UNAVAILABLE"
 fi
+
+# --- Ternary-Bonsai-2-27B no-regression guard (decode + prefill @ 128 and 32k) ---
+# The GGUF pr_bonsai_bot.py scores, run the way that bot runs it (no env pins). Skipped, not failed,
+# when the GGUF is absent.
+if [ -f "$BONSAI_GUARD_GGUF" ]; then
+  wait_gpu_clear
+  if bench_sweep_run "$BONSAI_GUARD_GGUF" 128 {bn_sweep_args}; then
+    for ctx in {bn_ctx_list}; do
+      echo "GUARDBN $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
+    done
+  else
+    echo "GUARDBN_FAILED"
+  fi
+else
+  echo "GUARDBN_UNAVAILABLE"
+fi
 echo "GUARD_END"
 """
 
@@ -1071,6 +1109,7 @@ def _parse_remote(stdout: str) -> dict:
     guard36 = {}
     guardmo = {}
     guardun = {}
+    guardbn = {}
     muse = {}
     muse_cb = {}
     cb_failed = set()
@@ -1166,9 +1205,21 @@ def _parse_remote(stdout: str) -> dict:
             out["guardun_failed"] = True
         elif line.strip() == "GUARDUN_UNAVAILABLE":
             out["guardun_unavailable"] = True
+        elif line.startswith("GUARDBN "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    guardbn[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.strip() == "GUARDBN_FAILED":
+            out["guardbn_failed"] = True
+        elif line.strip() == "GUARDBN_UNAVAILABLE":
+            out["guardbn_unavailable"] = True
     out["guard36"] = guard36
     out["guardmo"] = guardmo
     out["guardun"] = guardun
+    out["guardbn"] = guardbn
     out["muse"] = muse
     out["muse_cb"] = muse_cb
     out["cb_failed"] = sorted(cb_failed)
@@ -1484,6 +1535,22 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         label = "REJECT"
         passed = False
 
+    bn_ok, bn_problems = check_bonsai_guard(pr, main)
+    bn_skipped = bool(pr.get("guardbn_unavailable") or main.get("guardbn_unavailable"))
+    if bn_skipped:
+        bn_ok, bn_problems = True, []
+        print(">> ternary-bonsai guard SKIPPED — GGUF not installed (BONSAI_GGUF)")
+    if not bn_ok:
+        # Measured nothing -> infra: no verdict, re-evaluated next round (module docstring pt. 3).
+        unavailable = [p for p in bn_problems if p.endswith("measurement unavailable")]
+        if unavailable and len(unavailable) == len(bn_problems):
+            return {"ok": False, "log": "",
+                    "reason": "; ".join(unavailable) + " — infra, not a regression; the PR is "
+                              "re-evaluated next round rather than rejected"}
+        reason = "ternary-bonsai no-regression guard failed: " + "; ".join(bn_problems[:6]) + f" | {reason}"
+        label = "REJECT"
+        passed = False
+
     q36_ok, q36_problems = check_q36_guard(pr, main)
     if not q36_ok:
         # Same hard-REJECT discipline as the accuracy gate: a Muse Glimmer PR that silently
@@ -1526,6 +1593,9 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         "unsloth_guard_ok": un_ok,
         "unsloth_guard_problems": un_problems,
         "guardun_skipped": bool(pr.get("guardun_unavailable") or main.get("guardun_unavailable")),
+        "bonsai_guard_ok": bn_ok,
+        "bonsai_guard_problems": bn_problems,
+        "guardbn_skipped": bn_skipped,
         "pr_top1": pr_top1,
         "pr_kl": pr_kl,
         "pr_ppl_spark": pr.get("ppl_spark"),
@@ -1623,6 +1693,8 @@ def format_comment(commit: str, res: dict) -> str:
         "modelopt_guard_skipped": res.get("guardmo_skipped"),
         "unsloth_guard_ok": res.get("unsloth_guard_ok"),
         "unsloth_guard_skipped": res.get("guardun_skipped"),
+        "bonsai_guard_ok": res.get("bonsai_guard_ok"),
+        "bonsai_guard_skipped": res.get("guardbn_skipped"),
         # WHICH axis produced delta_pct. Necessary now that the tier comes from ten axes while the
         # marker still carries only the 128 numbers for the dashboard: without this a reader sees
         # a headline delta that does not match either number next to it (e.g. +3900% from
@@ -1682,6 +1754,15 @@ def format_comment(commit: str, res: dict) -> str:
         un_problems = "; ".join((res.get("unsloth_guard_problems") or [])[:4])
         un_row = (f"| unsloth qwen3.8 guard | ❌ **FAILED** — {un_problems} — "
                   "**verdict forced to REJECT regardless of speed/accuracy** |\n")
+    if res.get("guardbn_skipped"):
+        bn_row = ("| ternary-bonsai guard | ⚠️ SKIPPED — GGUF not installed on the box "
+                  "(`BONSAI_GGUF`); shared-code regressions on it were NOT checked |\n")
+    elif res.get("bonsai_guard_ok"):
+        bn_row = "| ternary-bonsai guard | ✅ no regression (decode+prefill @ 128 and 32k, Ternary-Bonsai-2-27B) |\n"
+    else:
+        bn_problems = "; ".join((res.get("bonsai_guard_problems") or [])[:4])
+        bn_row = (f"| ternary-bonsai guard | ❌ **FAILED** — {bn_problems} — "
+                  "**verdict forced to REJECT regardless of speed/accuracy** |\n")
     polaris = res.get("polaris") or {}
     receipt = polaris.get("receipt")
     if receipt:
@@ -1704,6 +1785,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{q36_row}"
         f"{mo_row}"
         f"{un_row}"
+        f"{bn_row}"
         f"| PPL sparkinfer / llama.cpp | {res.get('pr_ppl_spark') or '?'} / {res.get('pr_ppl_llama') or '?'} |\n"
         f"{polaris_row}"
         f"| commit | `{commit[:9]}` |\n\n"
@@ -1719,9 +1801,10 @@ def format_comment(commit: str, res: dict) -> str:
         "NVFP4 checkpoint. This is informational, not a judgment on your PR: a `none` label just "
         "means no measurable Muse Glimmer speedup was verified on either metric, which is expected "
         "and fine if that isn't what your change is about. "
-        "Correctness gated against a live llama.cpp reference on the same GGUF. Also gated on two "
-        "cross-model no-regression guards at 32k (decode+prefill, same box vs main): "
-        "Qwen3.6-35B-A3B and the ModelOpt Qwen3.8-27B NVFP4 checkpoint — "
+        "Correctness gated against a live llama.cpp reference on the same GGUF. Also gated on "
+        "cross-model no-regression guards (decode+prefill, same box vs main): Qwen3.6-35B-A3B, "
+        "the ModelOpt and unsloth Qwen3.8-27B NVFP4 checkpoints at 32k, and Ternary-Bonsai-2-27B "
+        "at 128 and 32k — "
         "Muse Glimmer PRs can touch code shared with other models. "
         "Automated. The round's best-scoring PR may be auto-merged as `merge-first` once every "
         "gate above passes; a separate comment says so explicitly when that happens.</sub>\n"
@@ -1855,6 +1938,8 @@ def upload_museglimmer_eval_log(repo, num, title, oid, res):
             "q36_guard_ok": res.get("q36_guard_ok"), "q36_guard_problems": res.get("q36_guard_problems"),
             "modelopt_guard_ok": res.get("modelopt_guard_ok"), "unsloth_guard_ok": res.get("unsloth_guard_ok"),
             "unsloth_guard_problems": res.get("unsloth_guard_problems"),
+            "bonsai_guard_ok": res.get("bonsai_guard_ok"),
+            "bonsai_guard_problems": res.get("bonsai_guard_problems"),
             "gpu": "pinned eval box", "date": arb.datetime.date.today().isoformat(),
         }
         if receipt:
@@ -1905,7 +1990,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
           f"decode PR={res.get('pr_decode_tps')} main={res.get('main_decode_tps')}  "
           f"prefill128 PR={res.get('pr_prefill128_pp')} main={res.get('main_prefill128_pp')}  "
           f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
-          f"q36_guard_ok={res.get('q36_guard_ok')}")
+          f"q36_guard_ok={res.get('q36_guard_ok')}  bonsai_guard_ok={res.get('bonsai_guard_ok')}")
     if dry_run:
         print(body[:500])
         return
@@ -1949,6 +2034,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "accuracy_ok": res.get("accuracy_ok"),
             "q36_guard_ok": res.get("q36_guard_ok"),
             "unsloth_guard_ok": res.get("unsloth_guard_ok"),
+            "bonsai_guard_ok": res.get("bonsai_guard_ok"),
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
@@ -1977,6 +2063,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "and regressed the ModelOpt Qwen3.8 no-regression guard (decode/prefill @ 32k)"
             elif not res.get("unsloth_guard_ok", True):
                 fail_clause = "and regressed the unsloth Qwen3.8 no-regression guard (decode/prefill @ 32k)"
+            elif not res.get("bonsai_guard_ok", True):
+                fail_clause = "and regressed the Ternary-Bonsai-2-27B no-regression guard (decode/prefill @ 128 or 32k)"
             elif not res.get("accuracy_ok"):
                 fail_clause = "and failed the accuracy gate"
             elif res.get("prefill_regressed"):
