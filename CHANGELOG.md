@@ -34,34 +34,14 @@ against the unquantized checkpoint's 4.46 through the same runtime.
 
 ### Fixed
 
-- **A concurrent request could be served from a recurrent state read at the wrong width** (#1123).
-  Continuous-batch decode compacts a session's Gated-DeltaNet state to bf16, packed from the
-  allocation base, the first time it packs that session. Three things disagreed with that
-  representation, and all three produce fluent output that degenerates a few tokens in rather
-  than an error:
-  - `launch_qwen36_gdn_ar` took a pointer the caller had already advanced to the layer's slot,
-    while its batched twin took the base pointer and a separate `state_off`. Under the compacted
-    form the slot offset counts bf16 elements, so advancing a `float*` by it landed every slot at
-    twice its byte offset — layer 0 correct, every other GDN layer reading a slot it does not
-    own. Both launchers now take `(state, state_off)`.
-  - The decode CUDA graph bakes which representation its kernels read, but its validity key was
-    only `(attn_mode, sparse, n_splits)`. A request that decodes alone, joins a batch, then
-    outlives it replayed its fp32 capture over a compacted state. The representation is now part
-    of that key, and is parked and restored with the graph.
-  - A packed batch whose rows did not agree on the representation — the shared prefix session, a
-    missing one, a failed conversion, or any row once `SPARKINFER_CB_GDN_STATE_B16=0` is set on a
-    process that had already compacted some — ran one kernel instantiation over both kinds. It is
-    declined now; the per-row fallback consults each session's own flag.
-
-  The unbatched kernel serves a row whenever the packed batch declines **or decays to a single
-  live row**, so this is reachable on the default path for every hybrid model at concurrency, as
-  a batch's requests finish at different lengths. `gdn_batched_gpu_test` covered a non-zero slot
-  offset and passed throughout, because it only ever ran fp32; it now runs the compacted form
-  too. The reproduction is to ask one prompt at temperature 0 alone and again inside a batch that
-  decays to one row, and compare — a flat concurrent batch does not show it.
-- **A verify decline is reported once, not once per decode step** (#1123). A model the packed
-  path cannot drive declines forever, and the decline sites wrote to stderr unconditionally — two
-  lines per decode token, on top of whatever else the log was meant to show.
+- **A failed CUDA-graph capture was marked ready, and a destroyed decode graph kept its handles.**
+  The decode, DSpark decode, prefill-position and verify graphs were marked ready even when ending
+  the capture or instantiating it failed, and a split-count change destroyed the decode graph
+  without clearing its handles. Either way a later replay, park or destroy could hand libcuda a
+  graph that no longer existed. A graph is ready now only if both steps succeeded; a failed verify
+  capture declines to the per-row path, which loses nothing because capture records rather than
+  runs. Once the CUDA context is lost, a request gets a 503 before any device work, rather than the
+  prefix-cache handling issuing graph destroys against the dead context.
 
 ### Serving
 
@@ -117,6 +97,68 @@ against the unquantized checkpoint's 4.46 through the same runtime.
   A derivative without one was served under the default model name of an unrelated 35B MoE, and
   the same flag selects this family's chat-template behaviour and its second stop token (248044),
   which GGUF metadata cannot carry beside the one `eos_token_id` it has room for.
+
+## [0.5.11] — 2026-09-24
+
+**serve-dspark no longer dies with a segfault inside libcuda.** A short prompt's prefill is replayed
+from a CUDA graph, and a prefix-cache resume or a DSpark prefill could free scratch that graph still
+pointed at; the next prompt of the same length replayed it against freed memory, and the process
+exited with SIGSEGV in libcuda's copy-destination check (`libcuda.so.595.84+0x14DD6E`). The graph is
+now dropped when its scratch moves, and `SPARKINFER_MUSE_PREFILL_GRAPH=0` is no longer needed.
+
+A process whose GPU context is lost now leaves the pool's rotation: the release manifest probes
+`/health`, which answers 503 once the context is gone. And a concurrent request can no longer be
+served from recurrent state read at the wrong width -- on the default path for every hybrid model.
+
+### Fixed
+
+- **A process whose GPU context was lost kept taking traffic** (#1135). The release manifest's
+  health probe was `/v1/models`, which answers 200 regardless of the device; it is `/health` now,
+  which answers 503 once the context is gone. `/health` could still miss it: the error check used by
+  batched prefill, packed-decode verify and the DSpark verify graphs only printed, so a fault first
+  seen there never marked the device lost. It records it now, like every other CUDA error check. One
+  serve-dspark host kept serving for 42 s after an Xid 31 before it crashed.
+- **A replayed prefill graph could write through freed scratch, and libcuda segfaulted on it**
+  (#1134). A short prompt's batched prefill is recorded as a CUDA graph and replayed for every later
+  prompt of the same length, with the scratch it was recorded against baked in. Passes that never
+  replay a graph -- a prefix-cache resume, a DSpark prefill that captures hidden states, an early
+  return -- can still grow that scratch, and growing frees the old buffers. The next same-length
+  prompt then replayed the graph against freed memory: its prompt-id upload fails libcuda's
+  copy-destination check with a host SIGSEGV, which is where the serve-dspark exits at
+  `libcuda.so.595.84+0x14DD6E` land, and its kernels run on freed memory. Reproduced on v0.5.10 with
+  the Qwen3.8 NVFP4 checkpoint: a long prompt the prefix cache keeps, a short prompt twice, a
+  cache-hit continuation larger than anything before it, then the short prompt again. The graph now
+  records the arenas' generations and a kernel-scratch epoch at capture and is dropped when either
+  has moved, and it is dropped before its pinned id buffer is freed. On earlier releases,
+  `SPARKINFER_MUSE_PREFILL_GRAPH=0` avoids it at the cost of the graph's prefill speedup.
+- **A concurrent request could be served from a recurrent state read at the wrong width** (#1123).
+  Continuous-batch decode compacts a session's Gated-DeltaNet state to bf16, packed from the
+  allocation base, the first time it packs that session. Three things disagreed with that
+  representation, and all three produce fluent output that degenerates a few tokens in rather
+  than an error:
+  - `launch_qwen36_gdn_ar` took a pointer the caller had already advanced to the layer's slot,
+    while its batched twin took the base pointer and a separate `state_off`. Under the compacted
+    form the slot offset counts bf16 elements, so advancing a `float*` by it landed every slot at
+    twice its byte offset — layer 0 correct, every other GDN layer reading a slot it does not
+    own. Both launchers now take `(state, state_off)`.
+  - The decode CUDA graph bakes which representation its kernels read, but its validity key was
+    only `(attn_mode, sparse, n_splits)`. A request that decodes alone, joins a batch, then
+    outlives it replayed its fp32 capture over a compacted state. The representation is now part
+    of that key, and is parked and restored with the graph.
+  - A packed batch whose rows did not agree on the representation — the shared prefix session, a
+    missing one, a failed conversion, or any row once `SPARKINFER_CB_GDN_STATE_B16=0` is set on a
+    process that had already compacted some — ran one kernel instantiation over both kinds. It is
+    declined now; the per-row fallback consults each session's own flag.
+
+  The unbatched kernel serves a row whenever the packed batch declines **or decays to a single
+  live row**, so this is reachable on the default path for every hybrid model at concurrency, as
+  a batch's requests finish at different lengths. `gdn_batched_gpu_test` covered a non-zero slot
+  offset and passed throughout, because it only ever ran fp32; it now runs the compacted form
+  too. The reproduction is to ask one prompt at temperature 0 alone and again inside a batch that
+  decays to one row, and compare — a flat concurrent batch does not show it.
+- **A verify decline is reported once, not once per decode step** (#1123). A model the packed path
+  cannot drive declines forever, and the decline sites wrote to stderr unconditionally — two lines
+  per decode token, on top of whatever else the log was meant to show.
 
 ## [0.5.10] — 2026-09-17
 

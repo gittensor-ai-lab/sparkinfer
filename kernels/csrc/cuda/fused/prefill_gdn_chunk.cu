@@ -56,17 +56,26 @@
 // decode gdn_ar_fast kernel expects, so this is a drop-in replacement and decode is untouched.
 // ============================================================================
 #include "sparkinfer/kernels/prefill_gdn_chunk.h"
+#include "sparkinfer/kernels/scratch_epoch.h"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
 #include <mma.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
 namespace sparkinfer {
 namespace kernels {
+
+namespace {
+std::atomic<uint64_t> g_prefill_scratch_epoch{0};
+}  // namespace
+
+uint64_t prefill_scratch_epoch() { return g_prefill_scratch_epoch.load(std::memory_order_relaxed); }
+void note_prefill_scratch_moved() { g_prefill_scratch_epoch.fetch_add(1, std::memory_order_relaxed); }
 
 namespace {
 
@@ -750,7 +759,7 @@ bool ws_reserve(size_t bytes) {
     // layer at ctx=16384 while retrying an O(N) size that never fits.
     void* p = nullptr;
     if (cudaMalloc(&p, bytes) != cudaSuccess) return false;
-    if (g_ws) cudaFree(g_ws);
+    if (g_ws) { cudaFree(g_ws); note_prefill_scratch_moved(); }
     g_ws = p;
     g_ws_bytes = bytes;
     return true;

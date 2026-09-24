@@ -38,7 +38,10 @@ artifacts:
     revision: eba1ac5a66c74902eaa95a4000a7c5eda96d8e95
     sha256: 506d2ebdc91de82bb5fcd8413490eafb484731d765d7b509ee7a60dad002c865
 health:
-  http: {path: /v1/models, port: 8080, expect_status: 200}
+  # /health, not /v1/models: /v1/models answers 200 even after the CUDA context is lost, so a pool
+  # probing it kept routing traffic to a process that could no longer serve. /health answers 503
+  # then (device_health.h), which is the signal to replace the instance.
+  http: {path: /health, port: 8080, expect_status: 200}
   interval_s: 60
   failure_threshold: 3
 entry_canary:                # one picked at random each start; sent at front_door.concurrency (warmup)
