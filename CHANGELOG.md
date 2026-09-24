@@ -15,20 +15,41 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   capture declines to the per-row path, which loses nothing because capture records rather than
   runs. Once the CUDA context is lost, a request gets a 503 before any device work, rather than the
   prefix-cache handling issuing graph destroys against the dead context.
-- **A replayed prefill graph could write through freed scratch, and libcuda segfaulted on it.**
-  A short prompt's batched prefill is recorded as a CUDA graph and replayed for every later
+
+## [0.5.11] — 2026-09-24
+
+**serve-dspark no longer dies with a segfault inside libcuda.** A short prompt's prefill is replayed
+from a CUDA graph, and a prefix-cache resume or a DSpark prefill could free scratch that graph still
+pointed at; the next prompt of the same length replayed it against freed memory, and the process
+exited with SIGSEGV in libcuda's copy-destination check (`libcuda.so.595.84+0x14DD6E`). The graph is
+now dropped when its scratch moves, and `SPARKINFER_MUSE_PREFILL_GRAPH=0` is no longer needed.
+
+A process whose GPU context is lost now leaves the pool's rotation: the release manifest probes
+`/health`, which answers 503 once the context is gone. And a concurrent request can no longer be
+served from recurrent state read at the wrong width -- on the default path for every hybrid model.
+
+### Fixed
+
+- **A process whose GPU context was lost kept taking traffic** (#1135). The release manifest's
+  health probe was `/v1/models`, which answers 200 regardless of the device; it is `/health` now,
+  which answers 503 once the context is gone. `/health` could still miss it: the error check used by
+  batched prefill, packed-decode verify and the DSpark verify graphs only printed, so a fault first
+  seen there never marked the device lost. It records it now, like every other CUDA error check. One
+  serve-dspark host kept serving for 42 s after an Xid 31 before it crashed.
+- **A replayed prefill graph could write through freed scratch, and libcuda segfaulted on it**
+  (#1134). A short prompt's batched prefill is recorded as a CUDA graph and replayed for every later
   prompt of the same length, with the scratch it was recorded against baked in. Passes that never
   replay a graph -- a prefix-cache resume, a DSpark prefill that captures hidden states, an early
   return -- can still grow that scratch, and growing frees the old buffers. The next same-length
   prompt then replayed the graph against freed memory: its prompt-id upload fails libcuda's
   copy-destination check with a host SIGSEGV, which is where the serve-dspark exits at
-  `libcuda.so.595.84+0x14DD6E` land, and its kernels run on freed memory. Reproduced on v0.5.10
-  with the Qwen3.8 NVFP4 checkpoint: a long prompt the prefix cache keeps, a short prompt twice, a
-  cache-hit continuation larger than anything before it, then the short prompt again. The graph
-  now records the arenas' generations and a kernel-scratch epoch at capture and is dropped when
-  either has moved, and it is dropped before its pinned id buffer is freed. On earlier releases,
+  `libcuda.so.595.84+0x14DD6E` land, and its kernels run on freed memory. Reproduced on v0.5.10 with
+  the Qwen3.8 NVFP4 checkpoint: a long prompt the prefix cache keeps, a short prompt twice, a
+  cache-hit continuation larger than anything before it, then the short prompt again. The graph now
+  records the arenas' generations and a kernel-scratch epoch at capture and is dropped when either
+  has moved, and it is dropped before its pinned id buffer is freed. On earlier releases,
   `SPARKINFER_MUSE_PREFILL_GRAPH=0` avoids it at the cost of the graph's prefill speedup.
-- **A concurrent request could be served from a recurrent state read at the wrong width.**
+- **A concurrent request could be served from a recurrent state read at the wrong width** (#1123).
   Continuous-batch decode compacts a session's Gated-DeltaNet state to bf16, packed from the
   allocation base, the first time it packs that session. Three things disagreed with that
   representation, and all three produce fluent output that degenerates a few tokens in rather
@@ -53,9 +74,9 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   offset and passed throughout, because it only ever ran fp32; it now runs the compacted form
   too. The reproduction is to ask one prompt at temperature 0 alone and again inside a batch that
   decays to one row, and compare — a flat concurrent batch does not show it.
-- **A verify decline is reported once, not once per decode step.** A model the packed path cannot
-  drive declines forever, and the decline sites wrote to stderr unconditionally — two lines per
-  decode token, on top of whatever else the log was meant to show.
+- **A verify decline is reported once, not once per decode step** (#1123). A model the packed path
+  cannot drive declines forever, and the decline sites wrote to stderr unconditionally — two lines
+  per decode token, on top of whatever else the log was meant to show.
 
 ## [0.5.10] — 2026-09-17
 

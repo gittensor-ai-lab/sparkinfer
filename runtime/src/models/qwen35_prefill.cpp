@@ -17,6 +17,7 @@
 #include "sparkinfer/kernels/prefill_attn_window.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/scratch_epoch.h"
+#include "sparkinfer/device_health.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/qtype.h"
 #include "sparkinfer/kernels/compressed_tensors.h"
@@ -48,7 +49,14 @@ namespace sparkinfer {
 namespace {
 using bf16 = unsigned short;
 inline void pf_cu(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) fprintf(stderr, "[prefill] %s: %s\n", what, cudaGetErrorString(e));
+    if (e == cudaSuccess) return;
+    // Same contract as every cu() helper (device_health.h): a context-killing error is recorded,
+    // so the engine refuses new work and /health answers 503. This one covers batched prefill,
+    // packed-decode verify and the DSpark verify graphs, and it only printed -- a fault first seen
+    // here left the process reporting healthy and taking traffic on a dead context.
+    const bool fatal = note_cuda_error(e);
+    fprintf(stderr, "[prefill] %s: %s%s\n", what, cudaGetErrorString(e),
+            fatal ? "  [CONTEXT LOST -- server will refuse further work]" : "");
 }
 // A model the packed path cannot drive declines on EVERY step, forever -- a ternary Bonsai-2
 // server at concurrency 4 wrote two of these lines per decode token. Each decline site still
