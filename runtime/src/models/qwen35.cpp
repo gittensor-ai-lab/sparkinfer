@@ -78,6 +78,31 @@ inline void cu(cudaError_t e, const char* what) {
     else if (n == 20)
         fprintf(stderr, "[qwen35] (further CUDA errors suppressed)\n");
 }
+// End a stream capture and instantiate it. A graph is handed back only if both steps succeeded;
+// otherwise whatever was built is destroyed and both handles are left null, so no later replay,
+// park or destroy can pass libcuda a graph that does not exist. Capture records without running,
+// so on failure the captured step's own work has not happened -- the caller decides what that means.
+inline bool finish_capture(cudaStream_t st, cudaGraph_t* graph, cudaGraphExec_t* exec, const char* what) {
+    *graph = nullptr;
+    *exec = nullptr;
+    cudaGraph_t g = nullptr;
+    cudaError_t e = cudaStreamEndCapture(st, &g);
+    if (e != cudaSuccess || !g) {
+        cu(e != cudaSuccess ? e : cudaErrorStreamCaptureInvalidated, what);
+        if (g) cudaGraphDestroy(g);
+        return false;
+    }
+    cudaGraphExec_t x = nullptr;
+    e = cudaGraphInstantiate(&x, g, 0);
+    if (e != cudaSuccess) {
+        cu(e, what);
+        cudaGraphDestroy(g);
+        return false;
+    }
+    *graph = g;
+    *exec = x;
+    return true;
+}
 // SPARKINFER_MUSE_FUSE_TAIL=0 splits Muse Glimmer's sandwich-norm tail back into the original
 // launch_norm_then_add + launch_rmsnorm pair (the two produce bit-identical output).
 inline bool muse_fuse_tail() {
@@ -1249,7 +1274,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
             if (s.graph_ready) {
-                cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false;
+                cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph);
+                s.cu_exec = nullptr; s.cu_graph = nullptr;
+                s.graph_ready = false;
             }
             if (s.graph_prefill_ready) {
                 cudaGraphExecDestroy(s.cu_prefill_exec); cudaGraphDestroy(s.cu_prefill_graph);
@@ -2387,9 +2414,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     dbg_bf16(s.xn, H, 80, -2);   // tag 80: final-norm output (lm_head input)
     dbg_xn_snapshot(s.xn, c.n_layers);   // extra slot: final-norm output, for lm_head cross-check
     if (!sample) {
-        if (capturing_graph) {
-            cu(cudaStreamEndCapture(st, &s.cu_prefill_graph), "end prefill capture");
-            cu(cudaGraphInstantiate(&s.cu_prefill_exec, s.cu_prefill_graph, 0), "prefill graph instantiate");
+        if (capturing_graph &&
+            finish_capture(st, &s.cu_prefill_graph, &s.cu_prefill_exec, "prefill graph capture")) {
             s.graph_prefill_ready = true;
             s.graph_prefill_attn_mode = attn_graph_mode;
             cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch (first)");
@@ -2460,39 +2486,39 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
     if (capturing_graph && dflash_cap) {
-        cu(cudaStreamEndCapture(st, &s.cu_dflash_graph), "end dflash capture");
-        cu(cudaGraphInstantiate(&s.cu_dflash_exec, s.cu_dflash_graph, 0), "dflash graph instantiate");
-        s.dflash_graph_ready = true;
-        s.dflash_graph_attn_mode = attn_graph_mode;
-        s.dflash_graph_sparse = sparse_on;
-        {
-            static int dbg = -1;
-            if (dbg < 0) { const char* e = getenv("SPARKINFER_GRAPH_DEBUG"); dbg = (e && e[0]=='1') ? 1 : 0; }
-            if (dbg) {
+        if (finish_capture(st, &s.cu_dflash_graph, &s.cu_dflash_exec, "dflash graph capture")) {
+            s.dflash_graph_ready = true;
+            s.dflash_graph_attn_mode = attn_graph_mode;
+            s.dflash_graph_sparse = sparse_on;
+            {
+                static int dbg = -1;
+                if (dbg < 0) { const char* e = getenv("SPARKINFER_GRAPH_DEBUG"); dbg = (e && e[0]=='1') ? 1 : 0; }
+                if (dbg) {
+                    const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
+                    fprintf(stderr, "[dflash-graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
+                            position, seqlen, s.n_splits, attn_graph_mode, mma_chunk, sparse_on ? 1 : 0);
+                }
+            }
+            cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
+        }
+    } else if (capturing_graph) {
+        if (finish_capture(st, &s.cu_graph, &s.cu_exec, "decode graph capture")) {
+            s.graph_ready = true;
+            s.graph_attn_mode = attn_graph_mode;
+            s.graph_sparse = sparse_on;
+            s.graph_state_b16 = s.active_lin_state_b16;
+            static int graph_dbg = -1;
+            if (graph_dbg < 0) {
+                const char* e = getenv("SPARKINFER_GRAPH_DEBUG");
+                graph_dbg = (e && e[0] == '1') ? 1 : 0;
+            }
+            if (graph_dbg) {
                 const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
-                fprintf(stderr, "[dflash-graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
+                fprintf(stderr, "[graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
                         position, seqlen, s.n_splits, attn_graph_mode, mma_chunk, sparse_on ? 1 : 0);
             }
+            cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
         }
-        cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
-    } else if (capturing_graph) {
-        cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
-        cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
-        s.graph_ready = true;
-        s.graph_attn_mode = attn_graph_mode;
-        s.graph_sparse = sparse_on;
-        s.graph_state_b16 = s.active_lin_state_b16;
-        static int graph_dbg = -1;
-        if (graph_dbg < 0) {
-            const char* e = getenv("SPARKINFER_GRAPH_DEBUG");
-            graph_dbg = (e && e[0] == '1') ? 1 : 0;
-        }
-        if (graph_dbg) {
-            const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
-            fprintf(stderr, "[graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
-                    position, seqlen, s.n_splits, attn_graph_mode, mma_chunk, sparse_on ? 1 : 0);
-        }
-        cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
     }
 
     cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");

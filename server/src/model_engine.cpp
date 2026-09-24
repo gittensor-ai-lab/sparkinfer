@@ -957,6 +957,14 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
             out.error = "model not loaded";
             return out;
         }
+        // A lost CUDA context (device_health.h) is permanent. Answer before any device work: the
+        // prefix handling below can clear the prefix cache, which destroys graphs and frees KV
+        // against a context that can no longer service them. /health is already 503.
+        if (sparkinfer::device_lost()) {
+            out.error = "cuda context lost (unrecoverable device error) -- restart required";
+            out.alloc_failed = true;   // 503, permanent until restart
+            return out;
+        }
         if (prompt_ids.empty()) {
             out.error = "empty prompt";
             return out;

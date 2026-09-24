@@ -5534,8 +5534,27 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     pf_cu(cudaMemcpyAsync(ph_out, out_ids, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost, st),
           "verify argmax");
     if (recording) {
-        pf_cu(cudaStreamEndCapture(st, &verify_graph[N]), "verify graph end");
-        pf_cu(cudaGraphInstantiate(&verify_exec[N], verify_graph[N], 0), "verify graph instantiate");
+        // Ready only if the graph both finished capturing and instantiated. A failed one is
+        // destroyed and its slot left empty -- marking it ready handed later replays, and the
+        // cache's own teardown, a graph libcuda no longer knows. Nothing was run (capture
+        // records), so declining leaves the model state as it was and the caller computes this
+        // step per row.
+        recording = false;
+        cudaGraph_t g = nullptr;
+        cudaError_t ge = cudaStreamEndCapture(st, &g);
+        cudaGraphExec_t x = nullptr;
+        if (ge == cudaSuccess && g) ge = cudaGraphInstantiate(&x, g, 0);
+        if (ge != cudaSuccess || !g || !x) {
+            pf_cu(ge != cudaSuccess ? ge : cudaErrorStreamCaptureInvalidated, "verify graph capture");
+            if (g) cudaGraphDestroy(g);
+            verify_graph[N] = nullptr;
+            verify_exec[N] = nullptr;
+            graph_ready_t[N] = false;
+            verify_decline("[dflash-verify] graph capture failed (N=%d) -> declined\n", N);
+            return -1;
+        }
+        verify_graph[N] = g;
+        verify_exec[N] = x;
         graph_ready_t[N] = true;
         graph_warm = true;
         // Nothing ran: capture records the kernels rather than executing them, so the model state
