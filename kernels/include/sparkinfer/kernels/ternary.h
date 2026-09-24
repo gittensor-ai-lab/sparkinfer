@@ -34,6 +34,20 @@ void launch_gemv_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
 void launch_gemm_ptq1_f32(const void* x_bf16, const void* w_ptq1, float* y_f32,
                           int n_rows, int k, int batch, cudaStream_t stream);
 
+// Decode's rotate-then-GEMV pair with the GEMV's int8 activation quantized once, in the rotation.
+// launch_ptq1_rotate_quant is launch_hadamard_rotate_bf16 (same y_bf16, bit for bit) that also
+// leaves x's quantized copy behind and returns a handle to it, or -1 when it did not (then it
+// only rotated). launch_gemv_ptq1_q / _q_f32 read that handle instead of quantizing y_bf16
+// themselves -- the same int8 values, so the same result -- and fall back to launch_gemv_ptq1 on
+// -1. Several GEMVs can share one handle (the q/k/v legs, gate and up); it stays valid until
+// about a dozen further ternary launches have gone by, i.e. within the layer that made it.
+int launch_ptq1_rotate_quant(const void* x_bf16, void* y_bf16, const signed char* sign, int k,
+                             int block, cudaStream_t stream);
+void launch_gemv_ptq1_q(int handle, const void* x_bf16, const void* w_ptq1, void* y_bf16,
+                        int n_rows, int k, cudaStream_t stream);
+void launch_gemv_ptq1_q_f32(int handle, const void* x_bf16, const void* w_ptq1, float* y_f32,
+                            int n_rows, int k, cudaStream_t stream);
+
 // A whole weight matrix decoded out of its ternary blocks and un-rotated into the architecture's
 // basis, as ordinary bf16. Prefill uses this rather than a ternary GEMM so its existing projection
 // branches -- FP8 GEMM, dequantize-then-requantize, plain GEMM -- keep working unchanged: they ask
