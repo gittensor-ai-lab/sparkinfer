@@ -258,6 +258,20 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(res["label"], "REJECT")
         self.assertEqual(res["best_dim"], "bonsai-prefill@16k")
 
+    def test_log_matrix_carries_the_raw_readings_behind_every_scored_axis(self):
+        pr = dict(MAIN_BONSAI)
+        pr[16384] = (93.0, 7866.0)        # +3.5% prefill@16k
+        cb = dict(MAIN_CB)
+        del cb[32]                        # a dropped width must not appear
+        res = evaluate(box_stdout(bonsai=pr, cb=cb))
+        m = bot._axis_matrix(res)
+        self.assertEqual(set(m), {d["dim"] for d in res["scored_dims"]})
+        self.assertNotIn("bonsai-cb-decode@c32", m)
+        self.assertEqual(m["bonsai-prefill@16k"], {"pr": 7866.0, "main": 7600.0, "delta": 3.5, "label": "S"})
+        self.assertEqual(m["bonsai-decode@128"]["pr"], 99.2)
+        self.assertEqual(m["bonsai-cb-decode@c8"], {"pr": 640.0, "main": 640.0, "delta": 0.0, "label": "none"})
+        __import__("json").dumps(m)       # JSON-serialisable as written to result.json
+
     def test_unmeasured_concurrency_drops_the_axis(self):
         cb = dict(MAIN_CB)
         del cb[32]

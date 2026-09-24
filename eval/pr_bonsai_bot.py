@@ -1435,6 +1435,28 @@ def reconcile_bonsai_merge_labels(repo, dry_run=False):
         try_auto_merge_bonsai(repo, winner)
 
 
+def _axis_matrix(res: dict) -> dict:
+    """{scored axis: {"pr", "main", "delta", "label"}} for every axis in res["scored_dims"].
+
+    The PR/main readings come from the same parsed matrices the verdict was computed from, so the
+    two can never disagree. An axis a run did not measure is simply absent."""
+    vals = {}
+    pr_m, main_m = res.get("bonsai_pr") or {}, res.get("bonsai_main") or {}
+    for ctx in SCORED_CTXS:
+        for phase in ("decode", "prefill"):
+            pv = (pr_m.get(ctx) or {}).get(phase)
+            mv = (main_m.get(ctx) or {}).get(phase)
+            vals[f"bonsai-{phase}@{SCORED_CTX_LABEL[ctx]}"] = (pv, mv)
+    cb_pr, cb_main = res.get("cb_pr") or {}, res.get("cb_main") or {}
+    for conc in CB_CONCS:
+        vals[CB_DIM_FOR[conc]] = (cb_pr.get(conc), cb_main.get(conc))
+    out = {}
+    for d in res.get("scored_dims") or []:
+        pv, mv = vals.get(d["dim"], (None, None))
+        out[d["dim"]] = {"pr": pv, "main": mv, "delta": d["delta"], "label": d["label"]}
+    return out
+
+
 def upload_bonsai_eval_log(repo, num, title, oid, res):
     """Commit the result (+ Polaris receipt) to sparkinfer-log, as the sibling bots do."""
     try:
@@ -1451,6 +1473,10 @@ def upload_bonsai_eval_log(repo, num, title, oid, res):
             "label": res.get("label"), "pass": res.get("pass"), "reason": res.get("reason"),
             "delta_pct": res.get("delta_pct"), "best_dim": res.get("best_dim"),
             "dims": {d["dim"]: d["delta"] for d in (res.get("scored_dims") or [])},
+            # Raw PR / main reading behind every scored axis. `dims` alone carries only the
+            # delta, which is not enough for a consumer that charts absolute throughput (the
+            # sparkinfer-web Ternary-Bonsai track plots the prefill@16k journey from these).
+            "matrix": _axis_matrix(res),
             "pr_decode_tps": res.get("pr_decode_tps"), "main_decode_tps": res.get("main_decode_tps"),
             "pr_prefill128_pp": res.get("pr_prefill128_pp"),
             "main_prefill128_pp": res.get("main_prefill128_pp"),
