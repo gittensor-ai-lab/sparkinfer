@@ -1015,17 +1015,25 @@ def _column_table_best_gain(body, metric):
             rcells = [c.strip() for c in row.strip("|").split("|")]
             if len(rcells) <= max(bi, ai) or re.fullmatch(r"[-:\s]*", rcells[bi]):
                 continue
-            bm = re.search(r"[-+]?\d+\.?\d*", rcells[bi])
-            am = re.search(r"[-+]?\d+\.?\d*", rcells[ai])
+            bm, am = _table_num(rcells[bi]), _table_num(rcells[ai])
             if not (bm and am):
                 continue
             try:
-                b, a = float(bm.group(0)), float(am.group(0))
+                b, a = float(bm), float(am)
             except ValueError:
                 continue
             if a > b and (a - b) > best_gain:
                 best_gain, best = (a - b), (b, a)
     return best
+
+# A tok/s figure in a PR's table: thousands separators allowed ("8,081" is 8081, not 8).
+_TABLE_NUM_RE = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d*)?|[-+]?\d+\.?\d*")
+
+
+def _table_num(cell):
+    m = _TABLE_NUM_RE.search(cell or "")
+    return m.group(0).replace(",", "") if m else None
+
 
 def _table_val(body, key, metric="decode"):
     """Pull a numeric tok/s from a PR template table row '| before… | <n> |'.
@@ -1040,9 +1048,9 @@ def _table_val(body, key, metric="decode"):
         m = re.match(rf"\s*\|\s*{key}\b[^|]*\|\s*([^|]*?)\s*\|", ln, re.I)
         if not m:
             continue
-        num = re.search(r"[-+]?\d+\.?\d*", m.group(1))
+        num = _table_num(m.group(1))
         try:
-            return float(num.group(0)) if num else None
+            return float(num) if num else None
         except ValueError:
             return None
     b, a = _column_table_best_gain(body, metric)
@@ -1536,6 +1544,28 @@ def bot_verdict_heads(repo, num):
             if meta.get("label") is not None:
                 heads.setdefault(m.group(1), set()).add(m.group(2))
     return heads
+
+
+def foreign_rejects(comments, head, own):
+    """The other bots whose latest trusted verdict marker for `head` is a REJECT (`own` is this bot's
+    name in its markers). The merge gates read other bots' verdicts from labels, and a label can be
+    gone while the verdict stands: dropped, rightly, while the head sat on another commit
+    (strip_foreign_stale_labels), then the author reset back -- and another bot merged a commit its
+    sibling had measured REJECT, before that sibling's own round could put the label back."""
+    latest = {}
+    for c in comments or ():
+        if not isinstance(c, dict) or not trusted_marker_comment(c):
+            continue
+        for m in _BOT_VERDICT_RE.finditer(c.get("body") or ""):
+            if m.group(1) == own or not head or not head.startswith(m.group(2)):
+                continue
+            try:
+                meta = json.loads(m.group(3)) if m.group(3) else {}
+            except json.JSONDecodeError:
+                meta = {}
+            if meta.get("label") is not None:
+                latest[m.group(1)] = meta["label"]
+    return sorted(b for b, lab in latest.items() if lab == "REJECT")
 
 
 def strip_foreign_stale_labels(repo, num, labels, head, my_prefix):

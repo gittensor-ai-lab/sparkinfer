@@ -2069,7 +2069,7 @@ def auto_merge_ok_qwen38(repo, num, require_merge_first=True, ranking_loss_ok=Fa
     try:
         info = json.loads(arb.gh([
             "pr", "view", str(num), "-R", repo, "--json",
-            "state,isDraft,labels,author,mergeable,files,changedFiles,headRefOid,baseRefName",
+            "state,isDraft,labels,author,mergeable,files,changedFiles,headRefOid,baseRefName,comments",
         ]).stdout or "{}")
     except json.JSONDecodeError:
         info = None
@@ -2096,6 +2096,10 @@ def auto_merge_ok_qwen38(repo, num, require_merge_first=True, ranking_loss_ok=Fa
     # A REJECT from any other bot is a measured harm on another model.
     if any(l.endswith((":REJECT", ":REJECT" + arb.NOISE_PARK_SUFFIX)) for l in labs if l.startswith("eval")):
         return False, "carries a REJECT from another eval bot"
+    # ... and a REJECT another bot measured for this very commit whose label is gone (arb.foreign_rejects).
+    rejected = arb.foreign_rejects(info.get("comments"), info.get("headRefOid") or "", "qwen38")
+    if rejected:
+        return False, f"{', '.join(rejected)} measured this commit REJECT"
     blocked = labs & (AUTOMERGE_BLOCK - ({QWEN38_NEEDS_REBASE} if ranking_loss_ok else set()))
     if blocked:
         return False, f"blocking label(s): {', '.join(sorted(blocked))}"

@@ -327,6 +327,14 @@ CB_CONCS = [2, 4, 8, 16, 32]
 # measuring its own startup, and c=4/c=8 can land several percent low on UNCHANGED code
 # -- a spurious-rejection generator on an axis that is also a no-regression floor.
 CB_TOKENS = 256
+# qwen3_gguf_cb_bench also runs one long request of this many tokens (pr_bonsai_bot.py's cb_complete).
+CB_LONG_TOKENS = 8
+# Each width is the median of CB_REPS complete runs, up to CB_MAX_ATTEMPTS attempts -- the sibling
+# bots' rule. One run whose requests stopped part-way without an error reads high (a shorter wall
+# time): scored alone, it gave a PR a false speedup or, in main's baseline, every PR a false
+# regression. pr_qwen38_bot.py records two such runs of this harness on this box.
+CB_REPS = 3
+CB_MAX_ATTEMPTS = 5
 CB_DIM_FOR = {c: f"muse-cb-decode@c{c}" for c in CB_CONCS}
 CB_DIMS = [CB_DIM_FOR[c] for c in CB_CONCS]
 
@@ -846,6 +854,7 @@ def _remote_script(ref: str, role: str = "pr", onto: str | None = None) -> str:
     mo_dir = shlex.quote(MODELOPT_GUARD_MODEL_DIR)
     cb_concs = " ".join(str(c) for c in CB_CONCS)
     cb_tokens = CB_TOKENS
+    cb_long_tokens, cb_reps, cb_max_attempts = CB_LONG_TOKENS, CB_REPS, CB_MAX_ATTEMPTS
     # bench_sweep_run takes alternating "<ctx> <reps>" pairs; the ctx-only list drives the shell
     # for-loop that reads the results back out. Both are derived from the same SCORED_CTXS /
     # *_GUARD_CTXS constants so the sweep and the read-back can never disagree about which
@@ -1037,32 +1046,79 @@ echo "RESULT_DECODE_TPS ${{BC_DECODE:-0}}"
 echo "RESULT_PREFILL128_PP ${{BC_PREFILL:-0}}"
 
 # --- concurrent decode (issue #1026) --------------------------------------------------------
-# Aggregate tok/s with N requests in flight. One model load per concurrency point, so this is
-# the expensive half of the round -- but it is the only thing here that observes the packed
+# Aggregate tok/s with N requests in flight: the median of three complete runs per concurrency
+# point (cb_median, up to five model loads each), so this is the expensive half of the round -- but it is the only thing here that observes the packed
 # multi-row forward, which no single-request axis enters.
 #
 # A failed or zero point emits MUSECB_FAILED <c> rc=<exit> and is never read as a regression to
 # zero. A width main could not measure is dropped for the round; one main measured and the PR build
 # could not is a REJECT judged over two rounds on the same commit (eval_museglimmer_on_box,
 # pr_bonsai_bot.py's rule); rc=137, the OOM killer, is the box's.
-for CC in {cb_concs}; do
-  CB_OUT=/tmp/mg_cb_$CC.txt
-  wait_gpu_clear
-  CB_RC=0
-  if timeout 1800 build/runtime/qwen3_gguf_cb_bench "$GGUF" "$CC" {cb_tokens} {cb_tokens} 512 > "$CB_OUT" 2>&1 || {{ CB_RC=$?; false; }}; then
-    CB_AGG=$(sed -n 's/.*agg_tok_s=\\([0-9.]*\\).*/\\1/p' "$CB_OUT" | tail -1)
-    if [ -n "${{CB_AGG:-}}" ] && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "${{CB_AGG:-0}}"; then
-      echo "MUSECB $CC $CB_AGG"
-    else
-      echo "MUSECB_FAILED $CC rc=0"
-      echo "concurrent decode produced no positive metric at c=$CC" >&2
-      tail -10 "$CB_OUT" >&2 || true
+# cb_complete C TOKENS ERRORS: did every request either finish or fail outright? C streams of
+# {cb_tokens} tokens plus one long request of {cb_long_tokens}; a request that logged an error
+# contributes nothing. Any other total means requests stopped part-way without an error.
+cb_complete() {{
+  local c=$1 tok=$2 err=$3 b a
+  for b in 0 1; do
+    a=$((err - b))
+    [ "$a" -ge 0 ] && [ "$a" -le "$c" ] || continue
+    [ "$tok" -eq $(( (c - a) * {cb_tokens} + (1 - b) * {cb_long_tokens} )) ] && return 0
+  done
+  return 1
+}}
+# cb_median C: CB_AGG = the median of {cb_reps} complete runs at width C, within {cb_max_attempts}
+# attempts. On failure CB_RC is 137 when the OOM killer took every failed attempt (the box's), else
+# the last other exit (0: runs that never completed, or no positive metric -- the PR's).
+cb_median() {{
+  local cc=$1 out=/tmp/mg_cb_$1.txt attempt=0 valid=0 a rc tok err all_killed=1 last_rc=0
+  CB_AGGS=""; CB_AGG=0; CB_RC=0
+  while [ "$valid" -lt {cb_reps} ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt {cb_max_attempts} ]; then
+      echo "concurrent decode at c=$cc did not complete on $((attempt - 1 - valid)) of {cb_max_attempts} runs" >&2
+      if [ "$all_killed" = 1 ] && [ "$last_rc" = 137 ]; then CB_RC=137
+      elif [ "$last_rc" = 137 ]; then CB_RC=1
+      else CB_RC=$last_rc; fi
+      return 1
     fi
+    # Not draining is the box's: the whole run stops as infrastructure, as it always did here.
+    wait_gpu_clear || exit 1
+    if timeout 1800 build/runtime/qwen3_gguf_cb_bench "$GGUF" "$cc" {cb_tokens} {cb_tokens} 512 > "$out" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [ "$rc" != 0 ]; then
+      echo "CB_EXIT c=$cc attempt=$attempt exit=$rc" >&2
+      tail -10 "$out" >&2 || true
+      last_rc=$rc
+      if [ "$rc" != 137 ]; then all_killed=0; fi
+      # A timeout is not retried: a hang repeats, and five of them would take hours.
+      if [ "$rc" = 124 ]; then CB_RC=124; return 1; fi
+      continue
+    fi
+    tok=$(sed -n 's/.*decode_tokens=\\([0-9]*\\).*/\\1/p' "$out" | tail -1)
+    err=$(grep -c "request error" "$out" || true)
+    if ! cb_complete "$cc" "${{tok:-0}}" "${{err:-0}}"; then
+      echo "CB_PARTIAL c=$cc attempt=$attempt decode_tokens=${{tok:-0}} request_errors=${{err:-0}}" >&2
+      all_killed=0
+      continue
+    fi
+    a=$(sed -n 's/.*agg_tok_s=\\([0-9.]*\\).*/\\1/p' "$out" | tail -1)
+    CB_AGGS="$CB_AGGS ${{a:-0}}"
+    valid=$((valid + 1))
+  done
+  CB_AGG=$(python3 -c "import statistics, sys; print(statistics.median(float(x) for x in sys.argv[1:]))" $CB_AGGS)
+  python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "${{CB_AGG:-0}}"
+}}
+for CC in {cb_concs}; do
+  if cb_median "$CC"; then
+    echo "MUSECB $CC $CB_AGG"
+    echo "MUSECB_RUNS $CC$CB_AGGS" >&2
   else
-    # rc=137 is SIGKILL (the host OOM killer): the box's (eval_museglimmer_on_box).
-    echo "MUSECB_FAILED $CC rc=$CB_RC"
-    echo "concurrent-decode harness exited $CB_RC at c=$CC" >&2
-    tail -10 "$CB_OUT" >&2 || true
+    # rc=137: the OOM killer took every failed attempt -- the box's (eval_museglimmer_on_box).
+    echo "MUSECB_FAILED $CC rc=${{CB_RC:-0}}"
+    echo "concurrent decode failed at c=$CC (rc=${{CB_RC:-0}})" >&2
   fi
 done
 # The concurrency sweep is the heaviest stage in the run (five model loads, the last holding
@@ -2161,7 +2217,7 @@ def auto_merge_ok_museglimmer(repo, num, require_merge_first=True, ranking_loss_
     try:
         info = json.loads(arb.gh([
             "pr", "view", str(num), "-R", repo, "--json",
-            "state,isDraft,labels,author,mergeable,files,changedFiles,headRefOid,baseRefName",
+            "state,isDraft,labels,author,mergeable,files,changedFiles,headRefOid,baseRefName,comments",
         ]).stdout or "{}")
     except json.JSONDecodeError:
         info = None
@@ -2188,6 +2244,10 @@ def auto_merge_ok_museglimmer(repo, num, require_merge_first=True, ranking_loss_
     # A REJECT from any other bot is a measured harm on another model.
     if any(l.endswith((":REJECT", ":REJECT" + arb.NOISE_PARK_SUFFIX)) for l in labs if l.startswith("eval")):
         return False, "carries a REJECT from another eval bot"
+    # ... and a REJECT another bot measured for this very commit whose label is gone (arb.foreign_rejects).
+    rejected = arb.foreign_rejects(info.get("comments"), info.get("headRefOid") or "", "museglimmer")
+    if rejected:
+        return False, f"{', '.join(rejected)} measured this commit REJECT"
     blocked = labs & (AUTOMERGE_BLOCK - ({MUSEGLIMMER_NEEDS_REBASE} if ranking_loss_ok else set()))
     if blocked:
         return False, f"blocking label(s): {', '.join(sorted(blocked))}"

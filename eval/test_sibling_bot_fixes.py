@@ -2094,7 +2094,7 @@ class Iteration5bTests(unittest.TestCase):
         self.assertEqual((q["retry"], q["strike_key"]), (True, "box"))
         # Muse keeps a killed width's exit code; Bonsai calls a failed width the run's unless the GPU
         # did not drain; the round guard stops the orphan's whole ssh session.
-        self.assertIn("|| { CB_RC=$?; false; }", muse._remote_script("pull/1/head", role="pr", onto=MAIN))
+        self.assertIn('if [ "$rc" != 137 ]; then all_killed=0; fi', muse._remote_script("pull/1/head", role="pr", onto=MAIN))
         self.assertIn("CB_WHY=run", _bonsai._remote_script("pull/1/head", role="pr", onto=MAIN))
         self.assertIn('pkill -TERM -s "$opid"', arb.round_guard_sh("qwen38"))
 
@@ -2351,6 +2351,93 @@ class Iteration8Tests(unittest.TestCase):
         self.assertIn("HANDLER True", r.stdout, r.stderr[-500:])
         self.assertIn("EXIT 143", r.stdout)
         self.assertIn("THEN True", r.stdout)
+
+
+
+class Iteration9Tests(unittest.TestCase):
+    """Fixes from the post-merge review of main 7b7a24f."""
+
+    def _bots(self):
+        return Iteration5Tests._bots(self)
+
+    @staticmethod
+    def _marker(bot, head, label):
+        return {"body": f'<!-- sparkinfer-{bot}-eval:v1:{head} {{"label":"{label}"}} -->\n## sparkinfer {bot} auto-eval',
+                "authorAssociation": "MEMBER"}
+
+    def test_only_a_siblings_latest_verdict_for_this_head_counts(self):
+        a, b = "a" * 40, "b" * 40
+        m = self._marker
+        self.assertEqual(arb.foreign_rejects([m("qwen38", a, "REJECT")], a, "museglimmer"), ["qwen38"])
+        self.assertEqual(arb.foreign_rejects([m("qwen38", a, "REJECT"), m("qwen38", a, "XL")], a, "museglimmer"), [])
+        self.assertEqual(arb.foreign_rejects([m("qwen38", b, "REJECT")], a, "museglimmer"), [])       # another head
+        self.assertEqual(arb.foreign_rejects([m("museglimmer", a, "REJECT")], a, "museglimmer"), [])  # its own
+        untrusted = dict(m("qwen38", a, "REJECT"), authorAssociation="NONE")
+        self.assertEqual(arb.foreign_rejects([untrusted], a, "museglimmer"), [])                    # pasted
+        self.assertEqual(arb.foreign_rejects(None, a, "museglimmer"), [])
+
+    def test_no_bot_merges_a_commit_a_sibling_measured_reject(self):
+        # The sibling's REJECT label was dropped while the head sat on another commit; the author reset
+        # back to the rejected commit before the sibling's next round put the label back.
+        for mod, tag, rebase, prefix, first in self._bots():
+            other = "museglimmer" if tag != "museglimmer" else "qwen38"
+
+            def gate(comments):
+                info = {"state": "OPEN", "isDraft": False, "author": {"login": "dev"}, "mergeable": "MERGEABLE",
+                        "files": [{"path": "kernels/x.cu"}], "changedFiles": 1, "headRefOid": "a" * 40,
+                        "baseRefName": "main", "labels": [{"name": prefix + "XL"}, {"name": first}],
+                        "comments": comments}
+                with mock.patch.object(arb, "gh", return_value=run(json.dumps(info))), \
+                        mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
+                        mock.patch.object(arb, "load_denylist", return_value=set()), \
+                        mock.patch.object(arb, "author_penalty_until", return_value=None), \
+                        mock.patch.object(mod, "_load_scores", return_value={"1": {
+                            "commit": "a" * 40, "label": "XL", "pass": True, "onto": MAIN}}):
+                    return getattr(mod, f"auto_merge_ok_{tag}")("o/r", 1)
+            with self.subTest(tag):
+                rejected = [self._marker(other, "a" * 40, "REJECT")]
+                self.assertEqual(gate(rejected), (False, f"{other} measured this commit REJECT"))
+                self.assertTrue(gate(rejected + [self._marker(other, "a" * 40, "L")])[0])   # re-measured since
+
+    def _muse_cb(self, mode):
+        """Muse's concurrency loop, rendered and run against a stub bench (MODE picks its behaviour)."""
+        import subprocess
+        script = muse._remote_script("pull/1/head", role="pr", onto=MAIN)
+        gpu = script[script.index("wait_gpu_clear() {"):script.index("\n}\n", script.index("wait_gpu_clear() {")) + 3]
+        cb = script[script.index("cb_complete() {"):script.index("done\n", script.index("for CC in 2 4 8 16 32; do")) + 5]
+        d = _tempfile.mkdtemp(dir=_STATE)
+        _os.makedirs(_os.path.join(d, "build/runtime"))
+        _os.makedirs(_os.path.join(d, "bin"))
+        with open(_os.path.join(d, "bin/nvidia-smi"), "w") as f:
+            f.write("#!/bin/sh\necho 0\n")
+        with open(_os.path.join(d, "build/runtime/qwen3_gguf_cb_bench"), "w") as f:
+            f.write("#!/bin/bash\nc=$2; n=$(cat cnt.$c 2>/dev/null || echo 0); n=$((n + 1)); echo $n > cnt.$c\n"
+                    'case "$MODE" in\n'
+                    "  partial) if [ $n = 1 ]; then echo \"decode_tokens=$((c * 128)) agg_tok_s=9999\"; exit 0; fi ;;\n"
+                    "  oom) exit 137 ;;\n"
+                    "  mixed) if [ $n = 1 ]; then exit 1; fi; exit 137 ;;\n"
+                    "esac\n"
+                    'echo "decode_tokens=$((c * 256 + 8)) agg_tok_s=$((100 * c + n))"\n')
+        for x in ("bin/nvidia-smi", "build/runtime/qwen3_gguf_cb_bench"):
+            _os.chmod(_os.path.join(d, x), 0o755)
+        env = dict(_os.environ, PATH=_os.path.join(d, "bin") + ":/usr/bin:/bin", MODE=mode, TMPDIR=d)
+        body = "set -euo pipefail\nGGUF=m\n" + gpu + cb.replace("/tmp/mg_cb_", d + "/mg_cb_")
+        return subprocess.run(["bash", "-c", body], cwd=d, env=env, capture_output=True, text=True, timeout=120)
+
+    def test_muse_scores_a_width_from_the_median_of_complete_runs(self):
+        ok = self._muse_cb("ok")
+        self.assertIn("MUSECB 32 3202", ok.stdout, ok.stderr[-400:])            # median of 3201/3202/3203
+        partial = self._muse_cb("partial")                                        # a run cut short reads 9999
+        self.assertIn("MUSECB 32 3203", partial.stdout, partial.stderr[-400:])  # ... and is not counted
+        self.assertIn("CB_PARTIAL c=32", partial.stderr)
+        self.assertIn("MUSECB_FAILED 32 rc=137", self._muse_cb("oom").stdout.splitlines())   # every attempt killed
+        self.assertIn("MUSECB_FAILED 32 rc=1", self._muse_cb("mixed").stdout.splitlines())   # a crash too: the PR's
+
+    def test_thousands_separators_do_not_hide_a_gain(self):
+        body = ("| | tok/s |\n|---|---|\n| before prefill (main) | 8,081 |\n| after prefill (this PR) | 8,650.5 |\n")
+        self.assertEqual(arb._table_val(body, "before", "prefill"), 8081.0)
+        self.assertEqual(arb._table_val(body, "after", "prefill"), 8650.5)
+        self.assertEqual(arb._table_num("12.5 tok/s"), "12.5")
 
 
 if __name__ == "__main__":

@@ -200,7 +200,9 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
     current head backs -- a paused or retired bot never drops its own -- so none of them can feed
     the generic label, block a merge as "a REJECT from another bot", or keep a PR from closing.
   - A bot merges only the commit it scored, and only while `main` is still the commit it was
-    measured against. Once any bot merges something else, a merge candidate nothing else stops is
+    measured against -- never one whose latest verdict from another bot is a REJECT, label or no
+    label (`arb.foreign_rejects`: a sibling's label dropped while the head sat on another commit is
+    not there when the author resets back). Once any bot merges something else, a merge candidate nothing else stops is
     measured again before it can merge. Until then it keeps its place in the ranking -- behind any
     PR that can merge now, and only while the bot's selection would actually re-measure it -- and
     nobody is sent to rebase while it waits. A PR sent to `*-needs-rebase` only for losing a ranking
@@ -261,6 +263,9 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
     regression run over two rounds instead (see its section).
   - Beside such a fault, only a gate a busy box cannot fake (accuracy; Ternary-Bonsai's prefill path
     and `bonsai_regression.py` checks) is posted; a throughput REJECT waits for a clean run.
+  - Every bot scores a concurrent-decode width from the median of three runs that completed (every
+    request finished or failed outright), within five attempts: one run whose requests stopped
+    part-way reads high. Muse Glimmer used to take a single unchecked run.
   - A concurrent-decode width `main` measured that the PR build could not complete is a REJECT
     judged over two rounds on the same commit (Muse Glimmer, Ternary-Bonsai), never dropped; on
     Qwen3.8, whose run stops at that width, a box fault charged after three.

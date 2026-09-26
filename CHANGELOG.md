@@ -117,7 +117,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     out with its close, so a closing REJECT keeps its marker and the other bots do not drop it; the
     generic-label heal leaves a noise ban's parked labels alone; Bonsai's serve check stops its
     server when the next round's guard stops an orphaned round (it kept the GPU from the other bots'
-    baselines); a linker killed for memory is the box's;
+    baselines); a linker killed for memory is the box's; no bot merges a commit another bot's
+    latest verdict calls REJECT, even when that bot's label is gone (a reset back to the rejected
+    commit); a greenlight table's thousands separators no longer hide a gain; Muse Glimmer scores
+    each concurrency width from the median of three complete runs, as the other two bots do, not one
+    unchecked run (a run cut short reads high);
   - the cron wrappers run the bots from their own `origin/main` worktree (made again if it breaks,
     and never one they did not make), refuse to run without a `GH_TOKEN` (or, with
     `SPARKINFER_BOT_LOGIN` set, with another account's; `.env.eval` never stands in for an empty
