@@ -481,6 +481,66 @@ __global__ void norm_then_add_kernel(const __nv_bfloat16* __restrict__ residual,
     }
 }
 
+// norm_then_add_kernel with every operand load issued before the reduction. The two-pass form
+// reads block_out, reduces, and only then reads block_out again with residual and weight, so each
+// thread has at most one 16-byte load in flight per pass and prefill's 4096-row launches ran at
+// ~0.9 TB/s. Here a thread holds its whole share of the row (MAXP 16-byte packs of each operand)
+// from the start. Bit-identical: the same thread owns the same packs, the square sum runs over them
+// in the same order into the same warp and block reduction, and the output expression is unchanged.
+template <int MAXP>
+__global__ void __launch_bounds__(256) norm_then_add_reg_kernel(
+    const __nv_bfloat16* __restrict__ residual, const __nv_bfloat16* __restrict__ block_out,
+    const __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ out,
+    int rows, int cols, float eps) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const size_t base = (size_t)row * cols;
+    __shared__ float s_warp[32];
+    const int npack = cols >> 3;
+    const uint4* b4 = reinterpret_cast<const uint4*>(block_out + base);
+    const uint4* r4 = reinterpret_cast<const uint4*>(residual + base);
+    const uint4* w4 = reinterpret_cast<const uint4*>(weight);
+    uint4 bp[MAXP], rp[MAXP], wp[MAXP];
+    #pragma unroll
+    for (int i = 0; i < MAXP; i++) {
+        const int p = threadIdx.x + i * 256;
+        if (p < npack) { bp[i] = __ldg(b4 + p); rp[i] = __ldg(r4 + p); wp[i] = __ldg(w4 + p); }
+    }
+    float ss = 0.f;
+    #pragma unroll
+    for (int i = 0; i < MAXP; i++) {
+        if (threadIdx.x + i * 256 < npack) {
+            float bv[8]; rn_unpack8(bp[i], bv);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ss = __fmaf_rn(bv[j], bv[j], ss);
+        }
+    }
+    ss = rn_warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        v = rn_warp_sum(v);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps);
+    }
+    __syncthreads();
+    const float inv_rms = s_warp[0];
+    uint4* o4 = reinterpret_cast<uint4*>(out + base);
+    #pragma unroll
+    for (int i = 0; i < MAXP; i++) {
+        const int p = threadIdx.x + i * 256;
+        if (p < npack) {
+            float bv[8]; rn_unpack8(bp[i], bv);
+            float rv[8]; rn_unpack8(rp[i], rv);
+            float wv[8]; rn_unpack8(wp[i], wv);
+            float ov[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ov[j] = rv[j] + bv[j] * inv_rms * wv[j];
+            o4[p] = rn_pack8(ov);
+        }
+    }
+}
+
 // Muse Glimmer's sandwich-norm tail, fused. The architecture runs it twice per layer:
 //   out_x  = residual + RMSNorm(branch, post_w, post_eps)      (launch_norm_then_add)
 //   out_xn = RMSNorm(out_x, next_w, eps)                       (launch_rmsnorm)
@@ -1278,6 +1338,19 @@ void launch_norm_then_add_acc(const void* residual, const int* acc, const float*
 
 void launch_norm_then_add(const void* residual, const void* block_out, const void* weight,
                           void* out, int rows, int cols, float eps, cudaStream_t stream) {
+    // SPARKINFER_NORM_ADD_REG=0 keeps the two-pass kernel (same bits either way).
+    static const bool reg = [] {
+        const char* e = getenv("SPARKINFER_NORM_ADD_REG");
+        return !(e && e[0] == '0');
+    }();
+    if (reg && (cols & 7) == 0 && cols <= 256 * 8 * 4) {
+        norm_then_add_reg_kernel<4><<<rows, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(residual),
+            reinterpret_cast<const __nv_bfloat16*>(block_out),
+            reinterpret_cast<const __nv_bfloat16*>(weight),
+            reinterpret_cast<__nv_bfloat16*>(out), rows, cols, eps);
+        return;
+    }
     norm_then_add_kernel<<<rows, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(residual),
         reinterpret_cast<const __nv_bfloat16*>(block_out),

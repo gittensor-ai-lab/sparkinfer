@@ -266,6 +266,10 @@ void dflash_release_verify_cache() {
     cache.arena.free_all();
 }
 
+// Set by prefill_batched_chunked while a windowed prompt has windows still to run.
+static thread_local bool g_pf_hold_arena = false;
+void prefill_hold_arena(bool hold) { g_pf_hold_arena = hold; }
+
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         int pos0) {
     const Qwen35Config& c = s.cfg;
@@ -4001,9 +4005,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     pf_cu(cudaStreamSynchronize(st), "prefill sync");
     int seed = *s.h_out_id;
 
-    // Release rather than hold when this call's scratch is too big to keep resident.
+    // Release rather than hold when this call's scratch is too big to keep resident -- unless
+    // this is a window of a longer prompt whose next window follows at once (prefill_hold_arena):
+    // it would allocate exactly what this one frees, and the free/malloc pair of a 16k window's
+    // ~37 buffers costs ~10.6 ms of idle GPU per window boundary. The last window still releases.
     if (!arena_reuse ||
-        a.total() + a8.total() + am.total() + aw.total() > kArenaKeepBytes) {
+        (!g_pf_hold_arena && a.total() + a8.total() + am.total() + aw.total() > kArenaKeepBytes)) {
         a.free_all();
         a8.free_all();
         am.free_all();

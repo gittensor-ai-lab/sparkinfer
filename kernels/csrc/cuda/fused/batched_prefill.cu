@@ -1438,6 +1438,128 @@ __global__ void pf_qknorm_ropenorm_kv_kernel(
     }
 }
 
+// pf_qknorm_ropenorm_kv_kernel for head_dim 128, one WARP per (token, head) instead of one
+// 128-thread block. The block form spends three block-wide barriers and a shared-memory round trip
+// on 256 bytes of work, 36 heads per token -- at a 16k prefill window that is ~590k tiny blocks per
+// layer, and the launch ran at ~0.7 TB/s. Here lane l holds dims l, l+32, l+64, l+96: element e of
+// lane l is exactly thread 32e+l of the block form, so each of its four per-warp butterflies is one
+// per-element butterfly here, and the cross-warp combine ((w0 + w2) + (w1 + w3), the order the
+// block form's zero-padded butterfly produces) is spelled out. Every per-element expression is
+// unchanged, the RoPE partner is lane l^1 of the same element, and max is order-free -- so the
+// output bytes are identical to the block form's.
+template <bool INT8>
+__global__ void __launch_bounds__(128) pf_qknorm_ropenorm_kv_warp_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    void* __restrict__ k_pool_v, void* __restrict__ v_pool_v,
+    __half* __restrict__ k_scale, __half* __restrict__ v_scale,
+    const int* __restrict__ block_table,
+    int n_q_heads, int n_kv_heads, int rotary_dim, float theta, float eps,
+    int block_size, int pos0, __nv_bfloat16* __restrict__ q_out, int src_ld) {
+    constexpr int HD = 128;
+    auto* k_pool = static_cast<__nv_bfloat16*>(k_pool_v);
+    auto* v_pool = static_cast<__nv_bfloat16*>(v_pool_v);
+    auto* k_pool8 = static_cast<signed char*>(k_pool_v);
+    auto* v_pool8 = static_cast<signed char*>(v_pool_v);
+    const int tok = blockIdx.x;
+    const int unit = blockIdx.y * 4 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (unit >= n_q_heads + 2 * n_kv_heads) return;
+    const int pos = pos0 + tok;
+    const int blk = pos / block_size, within = pos % block_size;
+    const int phys = block_table[blk];
+    const size_t ctok = (size_t)phys * block_size + within;
+    const bool is_q = unit < n_q_heads;
+    const bool is_k = !is_q && unit < n_q_heads + n_kv_heads;
+    float out[4];
+    if (is_q || is_k) {
+        const int hh = is_q ? unit : (unit - n_q_heads);
+        const int nh = is_q ? n_q_heads : n_kv_heads;
+        const size_t base = src_ld ? ((size_t)tok * src_ld + (size_t)hh * HD)
+                                   : ((size_t)tok * nh + hh) * HD;
+        const __nv_bfloat16* src = is_q ? q : k;
+        const __nv_bfloat16* nrm = is_q ? q_w : k_w;
+        float xv[4], ws[4];
+        #pragma unroll
+        for (int e = 0; e < 4; e++) {
+            xv[e] = pf_to_f(src[base + 32 * e + lane]);
+            float ss = xv[e] * xv[e];
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+            ws[e] = ss;
+        }
+        const float vv = (ws[0] + ws[2]) + (ws[1] + ws[3]);
+        const float inv = rsqrtf(vv / HD + eps);
+        float h[4];
+        #pragma unroll
+        for (int e = 0; e < 4; e++)
+            h[e] = pf_to_f(__float2bfloat16(xv[e] * inv * pf_to_f(nrm[32 * e + lane])));
+        #pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int t = 32 * e + lane;
+            const float other = __shfl_xor_sync(0xffffffff, h[e], 1);
+            float o = h[e];
+            if (rotary_dim > 0 && t < rotary_dim) {
+                const int i = t >> 1;
+                const float freq = __powf(theta, -2.f * (float)i / (float)rotary_dim);
+                const float ang = (float)pos * freq, c = __cosf(ang), sn = __sinf(ang);
+                const float x0 = (t & 1) ? other : h[e], x1 = (t & 1) ? h[e] : other;
+                o = ((t & 1) == 0) ? (x0 * c - x1 * sn) : (x0 * sn + x1 * c);
+            }
+            out[e] = o;
+        }
+        if (is_q) {
+            __nv_bfloat16* qo = q_out + ((size_t)tok * n_q_heads + hh) * HD;
+            #pragma unroll
+            for (int e = 0; e < 4; e++) qo[32 * e + lane] = __float2bfloat16(out[e]);
+            return;
+        }
+        const size_t dst = (ctok * n_kv_heads + hh) * HD;
+        if constexpr (INT8) {
+            float a = fmaxf(fmaxf(fabsf(out[0]), fabsf(out[1])), fmaxf(fabsf(out[2]), fabsf(out[3])));
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+            const float d = a / 127.0f;
+            #pragma unroll
+            for (int e = 0; e < 4; e++)
+                k_pool8[dst + 32 * e + lane] = (signed char)((d == 0.f) ? 0 : (int)roundf(out[e] / d));
+            if (lane == 0) k_scale[ctok * n_kv_heads + hh] = __float2half(d);
+        } else {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) k_pool[dst + 32 * e + lane] = __float2bfloat16(out[e]);
+        }
+    } else {                                          // V: append as-is (no norm, no rope)
+        const int hh = unit - n_q_heads - n_kv_heads;
+        const size_t base = src_ld ? ((size_t)tok * src_ld + (size_t)hh * HD)
+                                   : ((size_t)tok * n_kv_heads + hh) * HD;
+        const size_t dst = (ctok * n_kv_heads + hh) * HD;
+        if constexpr (INT8) {
+            float val[4], a = 0.f;
+            #pragma unroll
+            for (int e = 0; e < 4; e++) { val[e] = pf_to_f(v[base + 32 * e + lane]); a = fmaxf(a, fabsf(val[e])); }
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+            const float d = a / 127.0f;
+            #pragma unroll
+            for (int e = 0; e < 4; e++)
+                v_pool8[dst + 32 * e + lane] = (signed char)((d == 0.f) ? 0 : (int)roundf(val[e] / d));
+            if (lane == 0) v_scale[ctok * n_kv_heads + hh] = __float2half(d);
+        } else {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) v_pool[dst + 32 * e + lane] = v[base + 32 * e + lane];
+        }
+    }
+}
+
+// head_dim 128 takes the warp-per-head form above; SPARKINFER_QKNORM_WARP=0 keeps the block form.
+static bool qknorm_warp_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_QKNORM_WARP");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 // ============================================================================
 // Causal attention over the paged int8 KV pool. One warp per (token, q-head);
 // online softmax over keys 0..token. head_dim <= 256 -> ELEMS <= 8 per lane.
@@ -2186,6 +2308,16 @@ void launch_prefill_qknorm_ropenorm_kv_bf16(
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream, int pos0, void* q_out, int src_ld) {
+    if (head_dim == 128 && qknorm_warp_on()) {
+        dim3 g(n_tokens, (n_q_heads + 2 * n_kv_heads + 3) / 4);
+        pf_qknorm_ropenorm_kv_warp_kernel<false><<<g, 128, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+            reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool, nullptr, nullptr,
+            block_table, n_q_heads, n_kv_heads, rotary_dim, theta, eps, block_size, pos0,
+            reinterpret_cast<__nv_bfloat16*>(q_out ? q_out : q), src_ld);
+        return;
+    }
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
     pf_qknorm_ropenorm_kv_kernel<false><<<grid, head_dim, shmem, stream>>>(
@@ -2207,6 +2339,17 @@ void launch_prefill_qknorm_ropenorm_kv_int8(
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream, int pos0, void* q_out, int src_ld) {
+    if (head_dim == 128 && qknorm_warp_on()) {
+        dim3 g(n_tokens, (n_q_heads + 2 * n_kv_heads + 3) / 4);
+        pf_qknorm_ropenorm_kv_warp_kernel<true><<<g, 128, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+            reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
+            reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+            block_table, n_q_heads, n_kv_heads, rotary_dim, theta, eps, block_size, pos0,
+            reinterpret_cast<__nv_bfloat16*>(q_out ? q_out : q), src_ld);
+        return;
+    }
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
     pf_qknorm_ropenorm_kv_kernel<true><<<grid, head_dim, shmem, stream>>>(

@@ -413,12 +413,19 @@ __global__ void rmsnorm_quant_rows(const __nv_bfloat16* __restrict__ src,
     const int groups = cols >> 4;
     for (int g = threadIdx.x; g < groups; g += blockDim.x) {
         const int k0 = g << 4;
+        // The group's 16 source and weight values as two 16-byte loads each rather than 32 scalar
+        // bf16 loads; every value is combined exactly as before. (cols % 16 == 0, so aligned.)
+        __nv_bfloat16 sv[16], wv[16];
+        *reinterpret_cast<uint4*>(sv)     = *reinterpret_cast<const uint4*>(src + base + k0);
+        *reinterpret_cast<uint4*>(sv + 8) = *reinterpret_cast<const uint4*>(src + base + k0 + 8);
+        *reinterpret_cast<uint4*>(wv)     = __ldg(reinterpret_cast<const uint4*>(weight + k0));
+        *reinterpret_cast<uint4*>(wv + 8) = __ldg(reinterpret_cast<const uint4*>(weight + k0 + 8));
         float x[16], a = 0.f;
         #pragma unroll
         for (int j = 0; j < 16; ++j) {
             const __nv_bfloat16 nv = __float2bfloat16(
-                __bfloat162float(src[base + k0 + j]) * inv *
-                __bfloat162float(weight[k0 + j]));
+                __bfloat162float(sv[j]) * inv *
+                __bfloat162float(wv[j]));
             x[j] = __bfloat162float(nv);
             a = fmaxf(a, fabsf(x[j]));
         }

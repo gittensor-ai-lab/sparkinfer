@@ -182,6 +182,9 @@ struct Qwen35PrefillCtx {
 // Returns the argmax at the last prompt position (seed for the first decode step), or -1 if the
 // batched path is unsupported for this model/config (caller falls back to the token loop).
 // pos0: where this pass's tokens start in the sequence (0 = whole prompt in one pass).
+// Keep the batched-prefill scratch resident after the next pass even when it exceeds the
+// keep-resident budget: set while a windowed prompt has more windows to run.
+void prefill_hold_arena(bool hold);
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n, int pos0 = 0);
 
 // Exact short-block DFlash verifier. It evaluates all candidate rows from the live hybrid state,

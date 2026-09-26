@@ -4012,7 +4012,9 @@ int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want
         const bool last = (pos + len >= n);
         // Only the final window needs the seed logprob -- the earlier ones exist to fill KV and
         // carry the Gated-DeltaNet recurrence, and nothing ever reads their argmax.
+        prefill_hold_arena(!last);   // the next window reuses this one's scratch as-is
         const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
+        prefill_hold_arena(false);
         // A window that declines -- a path with no start position (Muse's rolling-window
         // attention, a DSpark capture), or a scratch allocation that failed even at window size
         // -- leaves [0, pos) correct in the cache and stops there: the caller finishes the rest
@@ -4127,7 +4129,9 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
         for (int pos = start + done; pos < end; pos += step) {
             const int len = std::min(step, end - pos);
             const bool last = (pos + len >= end);
+            prefill_hold_arena(!last);   // the next window reuses this one's scratch as-is
             const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
+            prefill_hold_arena(false);
             if (seed < 0) return -1;
             if (last) {
                 if (seed >= s.cfg.vocab) return -1;

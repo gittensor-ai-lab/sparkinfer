@@ -46,6 +46,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <cuda_pipeline.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -445,6 +446,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     // is the whole point -- see the dispatch note on the RQH=6 tier.
     constexpr int SPL  = (PLANES > 0 && PLANES < RQH) ? PLANES : RQH;
     static_assert(RQH % SPL == 0, "the head loop must tile the score plane exactly");
+    static_assert(RQH <= 8 * SPL, "the roll chain below walks at most eight head groups");
     // pf_kperm's chunking is written for a 256-byte key row, and the wide load fills the register
     // form of the K operand -- which only exists on the rolling-plane path.
     static_assert(!WIDEK || (HEAD_DIM == 256 && SPL != RQH),
@@ -894,6 +896,12 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             if constexpr (3 * SPL < RQH) roll(pf_int<3 * SPL>{});
             if constexpr (4 * SPL < RQH) roll(pf_int<4 * SPL>{});
             if constexpr (5 * SPL < RQH) roll(pf_int<5 * SPL>{});
+            // The chain was written for RQH <= 6. Muse's RQH=16 tier runs a two-head plane
+            // (SPL=2), so without the next two steps heads 12-15 of every block never ran QK or
+            // the softmax and PV read their P', quantum and correction from uninitialised shared
+            // memory -- a quarter of the heads wrong on every Muse prefill from ~2.7k tokens.
+            if constexpr (6 * SPL < RQH) roll(pf_int<6 * SPL>{});
+            if constexpr (7 * SPL < RQH) roll(pf_int<7 * SPL>{});
             #undef PF_KS
             #undef PF_VS
             __syncthreads();
@@ -1161,6 +1169,460 @@ const signed char* vpack_build(const signed char* v_pool, const int* block_table
 }
 }  // namespace
 
+// ============================================================================
+// Muse Glimmer global/SWA attention, register-resident (FlashAttention-2 schedule).
+//
+// pf_attn_mma_gqa_kernel's Muse tier (RQH=16 over a two-head rolling score plane) spends its time
+// moving scores through shared memory, not on the tensor cores: every 128-key group writes the
+// int32 QK tile to shared, reads it back for the softmax, writes P' as int8, and reads that back
+// through ldmatrix for PV -- eight times per group, one per two-head plane, with two block-wide
+// barriers each. Q is re-read from shared for every head and k-step of every group, and V comes
+// from the paged pool through 16-bit gathers.
+//
+// Here one WARP owns one query token and all sixteen q-heads of its kv-head: the sixteen heads are
+// the m16 rows of every mma. Scores, the online softmax, P' and the PV accumulator never leave
+// registers, Q's A fragments are loaded once per block, and K and V are staged per 128-key group
+// through cp.async -- K straight from the pool, V (with the group's K/V scales as floats) from a
+// per-layer transposed plane, pf_fa_pack_kernel. Warps 4-7 run one phase behind warps 0-3 (see
+// the ping-pong note in the loop), which is why V is triple-buffered and K double.
+//
+// The QK B operand is loaded in a PERMUTED key order (the ldmatrix row addresses pick it, for free)
+// so that each lane's QK accumulator holds exactly the four consecutive keys the PV A operand needs
+// from it: the P' fragment is packed from the score registers with no shuffle, and V stays in
+// natural order.
+//
+// BIT-IDENTICAL to the shipped tiers (RQH 4/8, and RQH=16 with its roll chain completed above).
+// It keeps their arithmetic, not just their algorithm: the same per-(token, head) Q quantization,
+// the same 128-key groups aligned to the same 16-token query tiles (they set the online softmax's
+// max and P' quantum), the same float expressions in the same order, exact int32 QK and PV sums,
+// and the softmax denominator summed over the same 4-column partials combined in the same butterfly
+// order. Same translation unit, so the same --use_fast_math lowering of every division and exp2.
+// ============================================================================
+namespace {
+constexpr int FA_HD = 128, FA_G = 16, FA_W = 8, FA_GN = 128;
+constexpr int FA_KLD = FA_HD + 16;                        // K / Q row stride: conflict-free ldmatrix
+constexpr int FA_K_BYTES = FA_GN * FA_KLD;                // 18,432 (double-buffered)
+constexpr int FA_V_BYTES = FA_GN * FA_HD;                 // 16,384: 8 pages x 128 dims x 16 keys (x3)
+constexpr int FA_F_BYTES = 8 * 32 * (int)sizeof(float);   // 8 pages x {16 K scales, 16 V scales} (x3)
+constexpr int FA_SMEM = 2 * FA_K_BYTES + 3 * FA_V_BYTES + 3 * FA_F_BYTES;   // 89,088
+
+// Low byte of __float2int_rn(x) for |x| <= 127.5: the FADD rounds to nearest-even exactly as
+// cvt.rni does, and leaves the integer in the low mantissa bits.
+__device__ __forceinline__ unsigned fa_f2i8(float x) {
+    return (unsigned)__float_as_int(__fadd_rn(x, 12582912.0f));   // no FMA contraction
+}
+__device__ __forceinline__ unsigned fa_pack4f(float a, float b, float c, float d) {
+    const unsigned lo = __byte_perm(fa_f2i8(a), fa_f2i8(b), 0x0040);
+    const unsigned hi = __byte_perm(fa_f2i8(c), fa_f2i8(d), 0x0040);
+    return __byte_perm(lo, hi, 0x5410);
+}
+
+// V in the PV mma's B order (the plane pf_v_pack_kernel writes) plus this pass's K / V dequant
+// scales as floats, [logical block][kv head][16 K scales | 16 V scales]. The half -> float
+// conversion is exact, so these are the values the shipped tiers multiply by.
+__global__ void pf_fa_pack_kernel(const signed char* __restrict__ v_pool,
+                                  const __half* __restrict__ k_scale,
+                                  const __half* __restrict__ v_scale,
+                                  const int* __restrict__ block_table,
+                                  signed char* __restrict__ vT, float* __restrict__ fs,
+                                  int n_kv_heads) {
+    const int lb = blockIdx.x, kvh = blockIdx.y, d = threadIdx.x;
+    const size_t KVLD = (size_t)n_kv_heads * FA_HD;
+    const int pb = block_table[lb];
+    const signed char* src = v_pool + ((size_t)pb * 16 * n_kv_heads + kvh) * FA_HD + d;
+    __align__(16) signed char buf[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) buf[j] = src[(size_t)j * KVLD];
+    *reinterpret_cast<int4*>(vT + (((size_t)lb * n_kv_heads + kvh) * FA_HD + d) * 16) =
+        *reinterpret_cast<const int4*>(buf);
+    if (d < 32) {
+        const __half* sp = (d < 16) ? k_scale : v_scale;
+        fs[((size_t)lb * n_kv_heads + kvh) * 32 + d] =
+            __half2float(sp[(size_t)(pb * 16 + (d & 15)) * n_kv_heads + kvh]);
+    }
+}
+
+__global__ __launch_bounds__(FA_W * 32, 1) void pf_attn_fa_muse_kernel(
+    const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
+    const signed char* __restrict__ vT, const float* __restrict__ fsc,
+    const int* __restrict__ block_table, __nv_bfloat16* __restrict__ attn, int n_tokens,
+    int n_q_heads, int n_kv_heads, float scale, int win_blocks, int q_pos0) {
+    extern __shared__ __align__(16) unsigned char fa_smem[];
+    constexpr int BLKSZ = 16;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
+    const int g = lane >> 2, t = lane & 3;
+    // Causal work grows with the query position, so the heaviest tiles go first.
+    const int tb = gridDim.x - 1 - blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int tok0 = tb * FA_W;
+    const int qbase = (tok0 / BLKSZ) * BLKSZ;                // the 16-token tile the groups key on
+    const int qtok = tok0 + warp;
+    const bool active = qtok < n_tokens;
+    const int head0 = kvh * FA_G;
+    const size_t KVLD = (size_t)n_kv_heads * FA_HD;
+    unsigned char* sKb = fa_smem;                             // [2][FA_K_BYTES]
+    unsigned char* sVb = fa_smem + 2 * FA_K_BYTES;            // [3][FA_V_BYTES]
+    float* sFb = reinterpret_cast<float*>(sVb + 3 * FA_V_BYTES);   // [3][8 * 32]
+
+    // Key range: the shipped tier's, for SINK=false, keyed on the 16-token tile.
+    const int last_q = q_pos0 + min(qbase + BLKSZ - 1, n_tokens - 1);
+    int blk_rs = 0;
+    if (win_blocks > 0) {
+        const int n_blk_q = (q_pos0 + qbase + BLKSZ) / BLKSZ;
+        blk_rs = ((win_blocks >= n_blk_q) ? 0 : (n_blk_q - win_blocks)) * BLKSZ;
+    }
+    const int lo = blk_rs, hi = last_q + 1;
+    const int ngrp = (hi - lo + FA_GN - 1) / FA_GN;
+    const int qpos = q_pos0 + qtok;
+
+    // Group gi -> K buffer gi%2, V / scale buffer gi%3.
+    auto stage = [&](int gi) {
+        const int k0 = lo + gi * FA_GN;
+        const int nk = min(FA_GN, hi - k0), gblk = (nk + 15) >> 4;
+        unsigned char* sK = sKb + (gi & 1) * FA_K_BYTES;
+        unsigned char* sV = sVb + (gi % 3) * FA_V_BYTES;
+        float* sF = sFb + (gi % 3) * 256;
+        const int lb0 = k0 >> 4;
+        #pragma unroll
+        for (int c = tid; c < FA_GN * 8; c += FA_W * 32) {
+            const int kk = c >> 3, ch = c & 7;
+            if ((kk >> 4) < gblk) {
+                const int pb = block_table[lb0 + (kk >> 4)];
+                __pipeline_memcpy_async(
+                    sK + kk * FA_KLD + ch * 16,
+                    k_pool + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * FA_HD + (size_t)(kk & 15) * KVLD + ch * 16,
+                    16);
+            }
+        }
+        #pragma unroll
+        for (int c = tid; c < 8 * 128; c += FA_W * 32) {
+            const int pg = c >> 7, ch = c & 127;
+            if (pg < gblk)
+                __pipeline_memcpy_async(
+                    sV + pg * 2048 + ch * 16,
+                    vT + ((size_t)(lb0 + pg) * n_kv_heads + kvh) * FA_HD * 16 + ch * 16, 16);
+        }
+        if (tid < 64) {
+            const int pg = tid >> 3, ch = tid & 7;
+            if (pg < gblk)
+                __pipeline_memcpy_async(sF + pg * 32 + ch * 4,
+                                        fsc + ((size_t)(lb0 + pg) * n_kv_heads + kvh) * 32 + ch * 4, 16);
+            else   // unloaded pages: zero V scale, so their (zero) P' never meets a stale NaN
+                *reinterpret_cast<float4*>(sF + pg * 32 + ch * 4) = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        __pipeline_commit();
+    };
+
+    stage(0);    // in flight while Q is quantized
+
+    // ---- Q: this warp's sixteen heads, quantized exactly as the shipped tier does (per-head
+    // absmax / 127, roundf of the same quotient), staged in K buffer 1, which the pipeline does not
+    // touch until every warp holds its fragments. Two lanes per head, 64 dims each: all sixteen
+    // rows arrive in one round of 16-byte loads rather than one dependent load per head. ----
+    float qs_lo, qs_hi;
+    {
+        signed char* qw = reinterpret_cast<signed char*>(sKb + FA_K_BYTES) + (size_t)warp * FA_G * FA_KLD;
+        const int r = lane >> 1, half = lane & 1;
+        float qv[64];
+        const uint4* src = reinterpret_cast<const uint4*>(
+            q + ((size_t)qtok * n_q_heads + head0 + r) * FA_HD + half * 64);
+        float amax = 0.f;
+        #pragma unroll
+        for (int c = 0; c < 8; c++) {
+            const uint4 w = active ? src[c] : make_uint4(0u, 0u, 0u, 0u);
+            const unsigned wv[4] = {w.x, w.y, w.z, w.w};
+            #pragma unroll
+            for (int x = 0; x < 4; x++) {
+                const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(&wv[x]);
+                qv[c * 8 + 2 * x] = __low2float(b2);
+                qv[c * 8 + 2 * x + 1] = __high2float(b2);
+                amax = fmaxf(amax, fmaxf(fabsf(qv[c * 8 + 2 * x]), fabsf(qv[c * 8 + 2 * x + 1])));
+            }
+        }
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        const float d = amax / 127.0f;
+        const float qsv = d * scale * 1.4426950408889634f;
+        qs_lo = __shfl_sync(0xffffffffu, qsv, 2 * g);
+        qs_hi = __shfl_sync(0xffffffffu, qsv, 2 * (g + 8));
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            unsigned pk[4];
+            #pragma unroll
+            for (int x = 0; x < 4; x++) {
+                int qi[4];
+                #pragma unroll
+                for (int y = 0; y < 4; y++) {
+                    const float v = qv[c * 16 + x * 4 + y];
+                    qi[y] = (amax == 0.f) ? 0 : (int)roundf(v / d);
+                }
+                pk[x] = (unsigned)(qi[0] & 0xff) | ((unsigned)(qi[1] & 0xff) << 8) |
+                        ((unsigned)(qi[2] & 0xff) << 16) | ((unsigned)(qi[3] & 0xff) << 24);
+            }
+            *reinterpret_cast<uint4*>(qw + r * FA_KLD + half * 64 + c * 16) =
+                make_uint4(pk[0], pk[1], pk[2], pk[3]);
+        }
+    }
+
+    __syncwarp();
+    unsigned qa[FA_HD / 32][4];
+    {
+        const unsigned qb = (unsigned)__cvta_generic_to_shared(
+            sKb + FA_K_BYTES + (size_t)warp * FA_G * FA_KLD + (lane & 15) * FA_KLD + (lane >> 4) * 16);
+        #pragma unroll
+        for (int s = 0; s < FA_HD / 32; s++) pf_ldsm_x4(qa[s], qb + s * 32);
+    }
+
+    float o[FA_HD / 8][4];
+    #pragma unroll
+    for (int d = 0; d < FA_HD / 8; d++)
+        #pragma unroll
+        for (int e = 0; e < 4; e++) o[d][e] = 0.f;
+    float m_lo = -1e30f, m_hi = -1e30f, l_lo = 0.f, l_hi = 0.f;
+    int acc[16][4];
+    unsigned pa[4][4];
+    float pd_lo = 0.f, pd_hi = 0.f, corr_lo = 1.f, corr_hi = 1.f;
+
+    // The ldmatrix row this lane addresses for QK n-tile j: key jb(j) + (r>>1)*4 + (r&1), r = lane&7.
+    const int kr = ((lane & 7) >> 1) * 4 + (lane & 1);
+    const int kmat = lane >> 3;
+    // PING-PONG. Warps 0-3 run QK(i), softmax(i), PV(i); warps 4-7 -- one per sub-partition,
+    // paired with warp w-4 -- run softmax(i-1), PV(i-1), QK(i). So on every sub-partition one warp
+    // is on the tensor cores while the other runs the exp / quantize work, instead of all eight
+    // doing the same phase between the same barriers. Each phase is ONE copy of code, picked by a
+    // warp-uniform index.
+    const int off = warp >> 2;
+
+    #pragma unroll 1
+    for (int i = 0; i <= ngrp; i++) {
+        // One barrier per group: it publishes group i (every thread's copies landed) and retires
+        // iteration i-1, whose buffers the prefetch of group i+1 then overwrites.
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        if (i + 1 < ngrp) stage(i + 1);
+        #pragma unroll 1
+        for (int ph = 0; ph < 3; ph++) {
+            int op = ph + off; if (op >= 3) op -= 3;       // 0 QK, 1 softmax, 2 PV
+            const int gi = (off && op != 0) ? i - 1 : i;
+            if (!active || gi < 0 || gi >= ngrp) continue;
+            const int k0 = lo + gi * FA_GN;
+            if (op == 0) {
+                // ---- QK ----
+                const unsigned char* sK = sKb + (gi & 1) * FA_K_BYTES;
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    #pragma unroll
+                    for (int e = 0; e < 4; e++) acc[j][e] = 0;
+                    const int jb = 32 * (j >> 2) + 16 * ((j >> 1) & 1) + 2 * (j & 1);
+                    const unsigned kb = (unsigned)__cvta_generic_to_shared(
+                        sK + (jb + kr) * FA_KLD + kmat * 16);
+                    unsigned b0[4], b1[4];
+                    pf_ldsm_x4(b0, kb);
+                    pf_ldsm_x4(b1, kb + 64);
+                    pf_mma_16832(acc[j], qa[0], b0[0], b0[1]);
+                    pf_mma_16832(acc[j], qa[1], b0[2], b0[3]);
+                    pf_mma_16832(acc[j], qa[2], b1[0], b1[1]);
+                    pf_mma_16832(acc[j], qa[3], b1[2], b1[3]);
+                }
+            } else if (op == 1) {
+                // ---- online softmax, in registers ----
+                // acc[j][e]: row g (e<2) / g+8 (e>=2), key 32*(j>>2) + 16*((j>>1)&1) + 4t + 2*(j&1) + (e&1).
+                const int nk = min(FA_GN, hi - k0);
+                const float* sF = sFb + (gi % 3) * 256;
+                float sc[16][4];
+                #pragma unroll
+                for (int s = 0; s < 4; s++)
+                    #pragma unroll
+                    for (int st2 = 0; st2 < 2; st2++) {
+                        const float4 ks4 = *reinterpret_cast<const float4*>(sF + (2 * s + st2) * 32 + 4 * t);
+                        const float ksf[4] = {ks4.x, ks4.y, ks4.z, ks4.w};
+                        #pragma unroll
+                        for (int hj = 0; hj < 2; hj++) {
+                            const int j = 4 * s + 2 * st2 + hj;
+                            #pragma unroll
+                            for (int e = 0; e < 4; e++)
+                                sc[j][e] = (float)acc[j][e] * ((e < 2) ? qs_lo : qs_hi) * ksf[2 * hj + (e & 1)];
+                        }
+                    }
+                // Every mask term is monotone in the key and this warp's rows share one query
+                // position, so the live keys of a group are exactly kl < kmax -- and only the group
+                // that reaches the diagonal (or the pass end) has any dead ones.
+                const int kmax = min(nk, qpos + 1 - k0);
+                if (kmax < FA_GN) {
+                    #pragma unroll
+                    for (int j = 0; j < 16; j++)
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            const int kl = 32 * (j >> 2) + 16 * ((j >> 1) & 1) + 4 * t + 2 * (j & 1) + (e & 1);
+                            sc[j][e] = (kl < kmax) ? sc[j][e] : -1e30f;
+                        }
+                }
+                float mx_lo = -1e30f, mx_hi = -1e30f;
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    mx_lo = fmaxf(mx_lo, fmaxf(sc[j][0], sc[j][1]));
+                    mx_hi = fmaxf(mx_hi, fmaxf(sc[j][2], sc[j][3]));
+                }
+                #pragma unroll
+                for (int o2 = 1; o2 <= 2; o2 <<= 1) {
+                    mx_lo = fmaxf(mx_lo, __shfl_xor_sync(0xffffffffu, mx_lo, o2));
+                    mx_hi = fmaxf(mx_hi, __shfl_xor_sync(0xffffffffu, mx_hi, o2));
+                }
+                const float mn_lo = fmaxf(m_lo, mx_lo), mn_hi = fmaxf(m_hi, mx_hi);
+                corr_lo = exp2f(m_lo - mn_lo); corr_hi = exp2f(m_hi - mn_hi);
+                m_lo = mn_lo; m_hi = mn_hi;
+                // p, the denominator partials (one per shipped-kernel lane: 4 consecutive keys), P'.
+                // A dead key's exp2 is exactly zero, so adding it to the denominator changes nothing.
+                float part_lo[4][2], part_hi[4][2];
+                float pa_lo = 0.f, pa_hi = 0.f;
+                #pragma unroll
+                for (int s = 0; s < 4; s++)
+                    #pragma unroll
+                    for (int st2 = 0; st2 < 2; st2++) {
+                        const float4 vs4 = *reinterpret_cast<const float4*>(sF + (2 * s + st2) * 32 + 16 + 4 * t);
+                        const float vsf[4] = {vs4.x, vs4.y, vs4.z, vs4.w};
+                        float sl = 0.f, sh = 0.f;
+                        #pragma unroll
+                        for (int kx = 0; kx < 4; kx++) {
+                            const int j = 4 * s + 2 * st2 + (kx >> 1), e = kx & 1;
+                            const float pl = exp2f(sc[j][e] - mn_lo);
+                            const float ph2 = exp2f(sc[j][e + 2] - mn_hi);
+                            sl += pl; sh += ph2;
+                            const float pvl = pl * vsf[kx], pvh = ph2 * vsf[kx];
+                            pa_lo = fmaxf(pa_lo, pvl); pa_hi = fmaxf(pa_hi, pvh);
+                            sc[j][e] = pvl; sc[j][e + 2] = pvh;
+                        }
+                        part_lo[s][st2] = sl; part_hi[s][st2] = sh;
+                    }
+                // The shipped butterfly: xor 16 pairs s with s^2, xor 8 s with s^1, xor 4 the two
+                // halves, xor 2 and 1 the quad.
+                float sum_lo = ((part_lo[0][0] + part_lo[2][0]) + (part_lo[1][0] + part_lo[3][0])) +
+                               ((part_lo[0][1] + part_lo[2][1]) + (part_lo[1][1] + part_lo[3][1]));
+                float sum_hi = ((part_hi[0][0] + part_hi[2][0]) + (part_hi[1][0] + part_hi[3][0])) +
+                               ((part_hi[0][1] + part_hi[2][1]) + (part_hi[1][1] + part_hi[3][1]));
+                sum_lo += __shfl_xor_sync(0xffffffffu, sum_lo, 2);
+                sum_hi += __shfl_xor_sync(0xffffffffu, sum_hi, 2);
+                sum_lo += __shfl_xor_sync(0xffffffffu, sum_lo, 1);
+                sum_hi += __shfl_xor_sync(0xffffffffu, sum_hi, 1);
+                #pragma unroll
+                for (int o2 = 1; o2 <= 2; o2 <<= 1) {
+                    pa_lo = fmaxf(pa_lo, __shfl_xor_sync(0xffffffffu, pa_lo, o2));
+                    pa_hi = fmaxf(pa_hi, __shfl_xor_sync(0xffffffffu, pa_hi, o2));
+                }
+                pd_lo = pa_lo / 127.0f; pd_hi = pa_hi / 127.0f;
+                const float ipd_lo = (pa_lo == 0.f) ? 0.f : 127.0f / pa_lo;
+                const float ipd_hi = (pa_hi == 0.f) ? 0.f : 127.0f / pa_hi;
+                l_lo = l_lo * corr_lo + sum_lo;
+                l_hi = l_hi * corr_hi + sum_hi;
+                // P' A fragments, straight from the score registers.
+                #pragma unroll
+                for (int s = 0; s < 4; s++) {
+                    const int j0 = 4 * s;
+                    pa[s][0] = fa_pack4f(sc[j0][0] * ipd_lo, sc[j0][1] * ipd_lo,
+                                         sc[j0 + 1][0] * ipd_lo, sc[j0 + 1][1] * ipd_lo);
+                    pa[s][1] = fa_pack4f(sc[j0][2] * ipd_hi, sc[j0][3] * ipd_hi,
+                                         sc[j0 + 1][2] * ipd_hi, sc[j0 + 1][3] * ipd_hi);
+                    pa[s][2] = fa_pack4f(sc[j0 + 2][0] * ipd_lo, sc[j0 + 2][1] * ipd_lo,
+                                         sc[j0 + 3][0] * ipd_lo, sc[j0 + 3][1] * ipd_lo);
+                    pa[s][3] = fa_pack4f(sc[j0 + 2][2] * ipd_hi, sc[j0 + 2][3] * ipd_hi,
+                                         sc[j0 + 3][2] * ipd_hi, sc[j0 + 3][3] * ipd_hi);
+                }
+            } else {
+                // ---- PV ----
+                const unsigned char* sV = sVb + (gi % 3) * FA_V_BYTES;
+                int cf[FA_HD / 8][4];
+                #pragma unroll
+                for (int d = 0; d < FA_HD / 8; d++)
+                    #pragma unroll
+                    for (int e = 0; e < 4; e++) cf[d][e] = 0;
+                // ldmatrix map: matrix m = page 2s + (m&1), dims 8*(2*d2 + (m>>1)) + row.
+                const unsigned vb = (unsigned)__cvta_generic_to_shared(
+                    sV + (kmat & 1) * 2048 + ((kmat >> 1) * 8 + (lane & 7)) * 16);
+                #pragma unroll
+                for (int s = 0; s < 4; s++)
+                    #pragma unroll
+                    for (int d2 = 0; d2 < FA_HD / 16; d2++) {
+                        unsigned b[4];
+                        pf_ldsm_x4(b, vb + s * 4096 + d2 * 256);
+                        pf_mma_16832(cf[2 * d2], pa[s], b[0], b[1]);
+                        pf_mma_16832(cf[2 * d2 + 1], pa[s], b[2], b[3]);
+                    }
+                // Once the row maxima settle every correction is exactly 1, and o * 1 is o: skip
+                // the multiply for the whole warp when none of its sixteen rows moved.
+                if (__all_sync(0xffffffffu, corr_lo == 1.f && corr_hi == 1.f)) {
+                    #pragma unroll
+                    for (int d = 0; d < FA_HD / 8; d++)
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++)
+                            o[d][e] = __fmaf_rn((float)cf[d][e], e >= 2 ? pd_hi : pd_lo, o[d][e]);
+                } else {
+                    #pragma unroll
+                    for (int d = 0; d < FA_HD / 8; d++)
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            const bool up = e >= 2;
+                            o[d][e] = __fmaf_rn((float)cf[d][e], up ? pd_hi : pd_lo,
+                                                __fmul_rn(o[d][e], up ? corr_hi : corr_lo));
+                        }
+                }
+            }
+        }
+    }
+
+    if (active) {
+        const float inv_lo = (l_lo > 0.f) ? (1.f / l_lo) : 0.f;
+        const float inv_hi = (l_hi > 0.f) ? (1.f / l_hi) : 0.f;
+        __nv_bfloat16* orow_lo = attn + ((size_t)qtok * n_q_heads + head0 + g) * FA_HD + 2 * t;
+        __nv_bfloat16* orow_hi = orow_lo + 8 * FA_HD;
+        #pragma unroll
+        for (int d = 0; d < FA_HD / 8; d++) {
+            __nv_bfloat162 lo2, hi2;
+            lo2.x = __float2bfloat16(o[d][0] * inv_lo); lo2.y = __float2bfloat16(o[d][1] * inv_lo);
+            hi2.x = __float2bfloat16(o[d][2] * inv_hi); hi2.y = __float2bfloat16(o[d][3] * inv_hi);
+            *reinterpret_cast<__nv_bfloat162*>(orow_lo + d * 8) = lo2;
+            *reinterpret_cast<__nv_bfloat162*>(orow_hi + d * 8) = hi2;
+        }
+    }
+}
+}  // namespace
+
+bool launch_prefill_attn_fa_muse(
+    const void* q, const signed char* k_pool, const signed char* v_pool,
+    const void* k_scale, const void* v_scale, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, float scale, int win_blocks, cudaStream_t stream, int q_pos0) {
+    if (head_dim != FA_HD || block_size != 16 || n_kv_heads != 2 ||
+        n_q_heads != FA_G * n_kv_heads || n_tokens <= 0)
+        return false;
+    const int n_blk = (q_pos0 + n_tokens + 15) / 16;
+    const size_t vt_bytes = (size_t)n_blk * n_kv_heads * FA_HD * 16;
+    const size_t fs_bytes = (size_t)n_blk * n_kv_heads * 32 * sizeof(float);
+    if (!vpack_reserve(vt_bytes + fs_bytes)) return false;
+    signed char* vt = reinterpret_cast<signed char*>(g_vpack);
+    float* fs = reinterpret_cast<float*>(vt + vt_bytes);
+    pf_fa_pack_kernel<<<dim3(n_blk, n_kv_heads), FA_HD, 0, stream>>>(
+        v_pool, reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
+        block_table, vt, fs, n_kv_heads);
+    if (cudaPeekAtLastError() != cudaSuccess) { cudaGetLastError(); return false; }
+    constexpr int kMaxDevices = 16;
+    static int cfg[kMaxDevices] = {0};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDevices) return false;
+    if (!cfg[dev]) {
+        if (cudaFuncSetAttribute(pf_attn_fa_muse_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 FA_SMEM) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        cfg[dev] = 1;
+    }
+    dim3 grid((n_tokens + FA_W - 1) / FA_W, n_kv_heads);
+    pf_attn_fa_muse_kernel<<<grid, FA_W * 32, FA_SMEM, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, vt, fs, block_table,
+        reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads, scale, win_blocks,
+        q_pos0);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1,
           bool SINK = true>
 static bool launch_attn_gqa(const void* q, const signed char* k_pool, const signed char* v_pool,
@@ -1265,6 +1727,18 @@ bool launch_prefill_attn_mma_muse_hd128(
     if (head_dim != 128 || block_size != 16) return false;
     if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
     if (n_q_heads % 4 != 0) return false;                  // RQH=4 owns 4 q-heads per block
+    // Register-resident tier first (see pf_attn_fa_muse_kernel): bit-identical to the tiers below.
+    // SPARKINFER_MUSE_ATTN_FA=0 keeps the shared-memory score plane.
+    static const int fa_on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_ATTN_FA");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (fa_on &&
+        launch_prefill_attn_fa_muse(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+                                    n_tokens, n_q_heads, n_kv_heads, head_dim, block_size, scale,
+                                    win_blocks, stream, q_pos0))
+        return true;
+    cudaGetLastError();
     if ((n_q_heads / n_kv_heads) % 4 != 0) return false;   // ...all sharing one kv-head
     // A block stages one kv-head's K/V tile and feeds it to RQH q-heads, so the group's K/V is
     // re-read (GQA / RQH) times per query tile. Muse Glimmer is 16:1 -- the widest group in the
