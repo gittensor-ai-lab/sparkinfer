@@ -89,6 +89,14 @@ void launch_embedding_ptq1_unrotate(const int* tokens, const void* table_ptq1,
 // shape it does not cover.
 bool launch_ptq1_rotq_bf16(const void* x_bf16, const signed char* sign, signed char* q,
                            float* qd, int* qs, int rows, int k, int block, cudaStream_t stream);
+// launch_add_rmsnorm2_q8_rows(x, residual, weight -> out_sum, out_norm, out_q8) followed by the
+// above on out_norm, in one launch: every output bit-identical to the pair. out_q8 may be null.
+// false: not taken (k past 8192, not a multiple of the span, or SPARKINFER_PTQ1_NORM_ROTQ=0).
+bool launch_ptq1_add_norm_rotq_bf16(const void* x_bf16, const void* residual_bf16,
+                                    const void* weight_bf16, void* out_sum, void* out_norm,
+                                    void* out_q8, float eps, const signed char* sign,
+                                    signed char* q, float* qd, int* qs, int rows, int k,
+                                    int block, cudaStream_t st);
 // The same applied to bf16(silu(gate) * up), the value launch_prefill_swiglu would write: the
 // down projection's activation straight from gate and up.
 bool launch_ptq1_swiglu_rotq_bf16(const void* gate_bf16, const void* up_bf16,

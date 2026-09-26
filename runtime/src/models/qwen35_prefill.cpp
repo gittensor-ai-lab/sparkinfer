@@ -5107,6 +5107,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             swa_vtbl, swa_vlen, bs, swa_budget, swa_budget, mbs, N, st);
     }
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, c.rms_eps, st);
+    // bt_q holds this layer's xn (resp. hn) rotated and quantized at the residual width: the norm
+    // that wrote it did that too (launch_ptq1_add_norm_rotq_bf16), so its first reader skips its
+    // own rotq. Cleared by the first reader; nothing writes bt_q in between.
+    // (Declared, then assigned: a goto below jumps past this point.)
+    bool xn_rq_ready, hn_rq_ready, norm_rq;
+    xn_rq_ready = hn_rq_ready = false;
+    norm_rq = packed && s.bonsai_dec_layers && bt_q && s.bonsai_sign_hidden;
     for (int L = 0; L < c.n_layers && supported; ++L) {
         // Reset the dp4a activation cache every layer. `xn` is the SAME buffer at every layer, so
         // a pointer-keyed cache that is never invalidated silently reuses layer 0's quantization
@@ -5132,13 +5139,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // The decode shadow's view of this layer, for the projections a packed step reads there.
         const Qwen35LayerWeights* tw =
             (packed && s.bonsai_dec_layers && bt_q) ? &s.bonsai_dec_layers[L] : nullptr;
+        // Whether the previous layer's norm already left this layer's xn rotated and quantized.
+        const bool xn_pre = xn_rq_ready;
+        xn_rq_ready = false;
         // A shadow projection at N rows: launch_ptq1_rotq_bf16 at the input's width, then the
         // rows kernel -- the kernels single-row decode runs, per row bit for bit.
         auto proj_t = [&](const bf16* in, const void* sgn, const void* w0, const void* w1,
                           bf16* y0, bf16* y1, int no, int k) -> bool {
+            const bool pre = xn_pre && in == xn && k == H && sgn == s.bonsai_sign_hidden;
             return sgn &&
-                   kernels::launch_ptq1_rotq_bf16(in, static_cast<const signed char*>(sgn), bt_q,
-                                                  bt_qd, bt_qs, N, k, s.bonsai_block, st) &&
+                   (pre ||
+                    kernels::launch_ptq1_rotq_bf16(in, static_cast<const signed char*>(sgn), bt_q,
+                                                   bt_qd, bt_qs, N, k, s.bonsai_block, st)) &&
                    kernels::launch_gemm_ptq1_i8_rows_bf16(bt_q, bt_qd, bt_qs, w0, w1, y0, y1, N,
                                                           no, k, st, bt_part, bt_part_cap);
         };
@@ -5504,9 +5516,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // once, so each takes its own half of the partials.
             const bool gdn_t = tw && s.bonsai_sign_hidden && tw->wqkv_type == kPtq1GgmlType &&
                                tw->wqkv_gate_type == kPtq1GgmlType &&
-                               kernels::launch_ptq1_rotq_bf16(
-                                   xn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q,
-                                   bt_qd, bt_qs, N, H, s.bonsai_block, st);
+                               (xn_pre ||
+                                kernels::launch_ptq1_rotq_bf16(
+                                    xn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q,
+                                    bt_qd, bt_qs, N, H, s.bonsai_block, st));
             const size_t bt_half = bt_part_cap / 2;
             // With the shadow's z nothing on the side stream reads q81, provided alpha/beta take
             // the bf16 pair GEMV below.
@@ -5819,7 +5832,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 hn_nv_folded = kernels::launch_add_rmsnorm2_q8_nvfp4_rows(
                     x, ao, w.post_attn_norm, h, hn, q81, nv_xq, nv_xs, N, H, c.rms_eps, st);
         }
-        if (!hn_nv_folded)
+        hn_rq_ready = false;
+        if (!hn_nv_folded && norm_rq && N > 1)
+            hn_rq_ready = kernels::launch_ptq1_add_norm_rotq_bf16(
+                x, ao, w.post_attn_norm, h, hn, q81, c.rms_eps,
+                static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q, bt_qd, bt_qs, N, H,
+                s.bonsai_block, st);
+        if (!hn_nv_folded && !hn_rq_ready)
             kernels::launch_add_rmsnorm2_q8_rows(x, ao, w.post_attn_norm, h, hn, q81,
                                                  N, H, c.rms_eps, st);
         // FIXED (2026-08-17): this used to snapshot h BEFORE this kernel wrote it -- h is an
@@ -5908,9 +5927,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 cb_shadow_tc && dw && N > 1 && topk == 1 && bt_q && s.bonsai_sign_hidden &&
                 s.bonsai_sign_ffn && dw->gate_qtype == kPtq1GgmlType &&
                 dw->up_qtype == kPtq1GgmlType && dw->down_qtype == kPtq1GgmlType &&
-                kernels::launch_ptq1_rotq_bf16(
-                    hn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q, bt_qd, bt_qs,
-                    N, H, s.bonsai_block, st) &&
+                (hn_rq_ready ||
+                 kernels::launch_ptq1_rotq_bf16(
+                     hn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q, bt_qd,
+                     bt_qs, N, H, s.bonsai_block, st)) &&
                 kernels::launch_gemm_ptq1_i8_rows_bf16(bt_q, bt_qd, bt_qs, dw->gate_q, dw->up_q,
                                                        sg, su, N, ffn, H, st) &&
                 kernels::launch_ptq1_swiglu_rotq_bf16(
@@ -6034,9 +6054,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // the same tensor-core kernel, k split across CTAs since 5120 rows are only 40 --
                 // else the folded down through the expert FFN with the projections supplied.
                 if (topk != 1 || !bt_q || !s.bonsai_sign_hidden ||
-                    !kernels::launch_ptq1_rotq_bf16(
-                        hn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q, bt_qd,
-                        bt_qs, N, H, s.bonsai_block, st) ||
+                    !(hn_rq_ready ||
+                      kernels::launch_ptq1_rotq_bf16(
+                          hn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q, bt_qd,
+                          bt_qs, N, H, s.bonsai_block, st)) ||
                     !kernels::launch_gemm_ptq1_i8_rows_bf16(bt_q, bt_qd, bt_qs, w.gate_q, w.up_q,
                                                             sg, su, N, ffn, H, st)) {
                     verify_decline("[dflash-verify] ternary gate/up declined N=%d\n", N);
@@ -6116,10 +6137,23 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // already holds the bf16-rounded xn in registers -- see the fold's own comment in
             // rmsnorm.cu. Claiming the A/B slot here keeps the alternation the standalone
             // quantizer had, so the buffer, the bytes and the reader are all unchanged.
+            //
+            // With a decode shadow the next layer's projections read xn rotated and quantized
+            // instead (no NVFP4 weight is read there), so the norm writes that copy and the NVFP4
+            // staging is not claimed.
+            if (norm_rq && N > 1 && L + 1 < c.n_layers)
+                xn_rq_ready = kernels::launch_ptq1_add_norm_rotq_bf16(
+                    h, routed, nn, x, xn, q81, c.rms_eps,
+                    static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q, bt_qd, bt_qs, N,
+                    H, s.bonsai_block, st);
             signed char* nvq = nullptr; float* nvs = nullptr;
-            if (kNormFold && kernels::qwen38_nvfp4_dp4a_proj()) quant_nv_claim(&nvq, &nvs);
-            if (nvq && kernels::launch_add_rmsnorm2_q8_nvfp4_rows(h, routed, nn, x, xn, q81,
-                                                                  nvq, nvs, N, H, c.rms_eps, st)) {
+            if (!xn_rq_ready && kNormFold && kernels::qwen38_nvfp4_dp4a_proj())
+                quant_nv_claim(&nvq, &nvs);
+            if (xn_rq_ready) {
+                // written above
+            } else if (nvq && kernels::launch_add_rmsnorm2_q8_nvfp4_rows(h, routed, nn, x, xn, q81,
+                                                                         nvq, nvs, N, H, c.rms_eps,
+                                                                         st)) {
                 nv_staged_b = (nvq == nv_pq_b);
                 nv_staged_src = xn; nv_staged_k = H;
                 quant_nv_commit(xn, H);

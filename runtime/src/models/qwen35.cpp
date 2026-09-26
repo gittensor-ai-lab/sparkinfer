@@ -834,6 +834,10 @@ struct Qwen35Model::Impl {
     signed char* bonsai_ffn_q = nullptr;
     float* bonsai_ffn_qd = nullptr;
     int* bonsai_ffn_qs = nullptr;
+    // Split-k partials of the shadow projections through the tensor-core rows kernel at one row:
+    // two slots, since z (stream_k) runs beside qkv.
+    float* bonsai_part = nullptr;
+    size_t bonsai_part_slot = 0;
     // Resolved once at load rather than looked up per layer per token.
     const signed char* bonsai_sign_h = nullptr;     // int8[hidden]
     const signed char* bonsai_sign_ffn = nullptr;   // int8[moe_ffn]
@@ -1969,9 +1973,27 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             return sg == s.bonsai_sign_dev.end() ? nullptr
                                                  : static_cast<const signed char*>(sg->second);
         };
+        // A shadow projection's product: the packed step's tensor-core rows kernel at one row --
+        // per row the int8 GEMV's arithmetic, so the same bits, but faster and at less power
+        // (decode 165.3 -> 168.8 tok/s, 528 -> 517 W) -- with the GEMV where it declines.
+        // `slot` picks the split-k partials, so concurrent launches do not share them.
+        // SPARKINFER_BONSAI_DEC_ROWS=0 keeps the GEMV.
+        static const bool kDecRows = [] {
+            const char* e = getenv("SPARKINFER_BONSAI_DEC_ROWS");
+            return !(e && e[0] == '0');
+        }();
+        auto gemv8 = [&](const void* W0, const void* W1, void* y0, void* y1, int N, int K,
+                         cudaStream_t sm, int slot) {
+            if (kDecRows && s.bonsai_part &&
+                kernels::launch_gemm_ptq1_i8_rows_bf16(
+                    s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs, W0, W1, y0, y1, 1, N, K, sm,
+                    s.bonsai_part + (size_t)slot * s.bonsai_part_slot, s.bonsai_part_slot))
+                return;
+            kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs, W0,
+                                              W1, y0, y1, N, K, sm);
+        };
         auto gemv_t = [&](const void* W, void* y, int N, int K) {
-            kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs, W,
-                                              nullptr, y, nullptr, N, K, st);
+            gemv8(W, nullptr, y, nullptr, N, K, st, 0);
         };
         auto proj_t = [&](const void* x, const void* W, void* y, int N, int K) -> bool {
             const signed char* sg = shadow_sign(kPtq1GgmlType, K);
@@ -2056,16 +2078,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     zs = s.stream_k;
                     abs_ = s.stream_v;
                 }
-                kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs,
-                                                  w.wqkv_gate, nullptr, s.lin_z, nullptr,
-                                                  (int)s.linear_vdim, (int)H, zs);
+                gemv8(w.wqkv_gate, nullptr, s.lin_z, nullptr, (int)s.linear_vdim, (int)H, zs, 1);
                 if (gdn_pipelined) cudaEventRecord(s.ev_gdn_z, s.stream_k);
                 proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, abs_);
                 proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, abs_);
                 if (gdn_pipelined) cudaEventRecord(s.ev_gdn_ab, s.stream_v);
-                kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs,
-                                                  w.wqkv, nullptr, s.lin_qkv, nullptr,
-                                                  (int)s.linear_qkvdim, (int)H, st);
+                gemv8(w.wqkv, nullptr, s.lin_qkv, nullptr, (int)s.linear_qkvdim, (int)H, st, 0);
             } else if (gdn_quad) {
                 kernels::launch_gdn_quad_mmvq_q4k(s.aq81, w.wqkv, w.wqkv_gate, w.ssm_alpha, w.ssm_beta,
                     s.lin_qkv, s.lin_z, s.lin_alpha, s.lin_beta,
@@ -2219,12 +2237,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_ptq1_rotq_bf16(s.xn, s.bonsai_sign_h, s.bonsai_ffn_q,
                                                    s.bonsai_ffn_qd, s.bonsai_ffn_qs, 1, (int)H,
                                                    (int)s.bonsai_block, st);
-                    kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd,
-                                                      s.bonsai_ffn_qs, w.wq, nullptr, q_dst,
-                                                      nullptr, nq, (int)H, st);
-                    kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd,
-                                                      s.bonsai_ffn_qs, w.wk, w.wv, s.k, s.v,
-                                                      s.kvdim, (int)H, st);
+                    gemv8(w.wq, nullptr, q_dst, nullptr, nq, (int)H, st, 0);
+                    gemv8(w.wk, w.wv, s.k, s.v, s.kvdim, (int)H, st, 0);
                 } else if (attn_qkv) {
                     kernels::launch_attn_qkv_mmvq_q4k(s.aq81, w.wq, w.wk, w.wv,
                         q_dst, s.k, s.v, nq, s.kvdim, s.kvdim, H, st);
@@ -2949,8 +2963,17 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                        s.bonsai_ffn_qs, 1, (int)H, (int)s.bonsai_block, st)) {
         // The decode shadow's ternary head through the int8-activation GEMV, the arithmetic the
         // packed step's rows kernel repeats per row: 0.28 GB a token instead of the folded 0.71.
-        kernels::launch_gemv_ptq1_i8_f32(s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs,
-                                         s.bonsai_dec_head, s.logits, c.vocab, (int)H, st);
+        static const bool kDecRowsHead = [] {
+            const char* e = getenv("SPARKINFER_BONSAI_DEC_ROWS");
+            return !(e && e[0] == '0');
+        }();
+        if (!(kDecRowsHead && s.bonsai_part &&
+              kernels::launch_gemm_ptq1_i8_rows_f32(s.bonsai_ffn_q, s.bonsai_ffn_qd,
+                                                    s.bonsai_ffn_qs, s.bonsai_dec_head, s.logits,
+                                                    1, c.vocab, (int)H, st, s.bonsai_part,
+                                                    s.bonsai_part_slot)))
+            kernels::launch_gemv_ptq1_i8_f32(s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs,
+                                             s.bonsai_dec_head, s.logits, c.vocab, (int)H, st);
     }
     else if (s.bonsai_dec_head) {
         // The same through the dp4a GEMV when the int8 arm is off (SPARKINFER_PTQ1_I8=0).
@@ -6267,6 +6290,14 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                     s.owned.push_back(s.bonsai_ffn_q);
                     s.owned.push_back(s.bonsai_ffn_qd);
                     s.owned.push_back(s.bonsai_ffn_qs);
+                    // Up to 8 splits of the widest projection's rows (attention q: 12288).
+                    const size_t slot = (size_t)8 * 16384;
+                    if (cudaMalloc((void**)&s.bonsai_part, 2 * slot * sizeof(float)) == cudaSuccess) {
+                        s.owned.push_back(s.bonsai_part);
+                        s.bonsai_part_slot = slot;
+                    } else {
+                        s.bonsai_part = nullptr;
+                    }
                 } else {
                     cudaFree(s.bonsai_ffn_q); cudaFree(s.bonsai_ffn_qd); cudaFree(s.bonsai_ffn_qs);
                     s.bonsai_ffn_q = nullptr; s.bonsai_ffn_qd = nullptr; s.bonsai_ffn_qs = nullptr;
