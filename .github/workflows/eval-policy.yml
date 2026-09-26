@@ -44,6 +44,27 @@ jobs:
           bash -n eval/run_sync_cron.sh
           bash -n eval/cron_common.sh
 
+      - name: Remote scripts render and parse
+        run: |
+          set -euo pipefail
+          # What each bot runs on the GPU box, both roles, and the files those scripts source: a
+          # syntax error here fails every round on the box, not in review.
+          bash -n bench/scripts/_eval_speed.sh
+          bash -n bench/scripts/_common.sh
+          python3 - <<'PY'
+          import subprocess, sys
+          sys.path.insert(0, "eval")
+          import pr_bonsai_bot, pr_museglimmer_bot, pr_qwen38_bot
+          bad = 0
+          for mod in (pr_bonsai_bot, pr_museglimmer_bot, pr_qwen38_bot):
+              for role, ref in (("pr", "pull/1/head"), ("main", "main")):
+                  script = mod._remote_script(ref, role=role, onto="c" * 40)
+                  r = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+                  print(mod.__name__, role, "ok" if r.returncode == 0 else r.stderr)
+                  bad += r.returncode != 0
+          sys.exit(1 if bad else 0)
+          PY
+
       - name: Python syntax
         run: |
           set -euo pipefail

@@ -35,6 +35,21 @@ _bump() {  # $1 = counter file; prints the new consecutive count
   echo "$n"
 }
 
+# Opens the shared lock on fd 9 (open_lock <bot>): a lock file this user cannot open (another user's,
+# under fs.protected_regular) used to read as "another round holds the lock" every tick.
+open_lock() {
+  # The group keeps the 2>/dev/null to the exec: a bare `exec 9>f 2>/dev/null` would also send the
+  # wrapper's own stderr -- every warning and banner -- to /dev/null for the rest of the tick.
+  { exec 9>"$LOCK_FILE"; } 2>/dev/null && return 0
+  note_refused "$1" "cannot open the lock file $LOCK_FILE"
+  return 1
+}
+
+# The crontab passes the bot account's token; a GH_TOKEN line in .env.eval must not replace it
+# (keep_cron_token before sourcing .env.eval, restore_cron_token after).
+keep_cron_token() { CRON_GH_TOKEN="${GH_TOKEN:-}"; }
+restore_cron_token() { if [ -n "${CRON_GH_TOKEN:-}" ]; then export GH_TOKEN="$CRON_GH_TOKEN"; fi; }
+
 # Consecutive ticks a bot skipped on the lock. A skip is ordinary when rounds overlap, but a run
 # that never lets go looks exactly like that in the log, one quiet line an hour.
 note_lock_skip() {
@@ -133,17 +148,17 @@ _tree_state() {  # ours | orphan | absent | foreign
   esac
 }
 _reset_tree() {
-  timeout "$STEP_TIMEOUT_S" git -C "$BOT_TREE" checkout -q -f --detach origin/main \
-    && timeout "$STEP_TIMEOUT_S" git -C "$BOT_TREE" clean -qfd
+  timeout "$STEP_TIMEOUT_S" git -C "$BOT_TREE" checkout -q -f --detach origin/main 9>&- \
+    && timeout "$STEP_TIMEOUT_S" git -C "$BOT_TREE" clean -qfd 9>&-
 }
 _make_tree() {
   # -f: a tree whose directory was deleted is still registered, and would otherwise refuse the path.
   # Marked before anything is checked out, so a tree these wrappers made always carries the mark.
-  timeout "$STEP_TIMEOUT_S" git -C "$REPO_DIR" worktree add -q -f --no-checkout --detach "$BOT_TREE" origin/main >&2 \
+  timeout "$STEP_TIMEOUT_S" git -C "$REPO_DIR" worktree add -q -f --no-checkout --detach "$BOT_TREE" origin/main >&2 9>&- \
     && : >"$(git -C "$BOT_TREE" rev-parse --absolute-git-dir)/$_TREE_MARK"
 }
 _drop_tree() {
-  timeout "$STEP_TIMEOUT_S" git -C "$REPO_DIR" worktree remove -f -f "$BOT_TREE" 2>/dev/null \
+  timeout "$STEP_TIMEOUT_S" git -C "$REPO_DIR" worktree remove -f -f "$BOT_TREE" 2>/dev/null 9>&- \
     || rm -rf -- "$BOT_TREE"
 }
 prepare_bot_tree() {
@@ -161,8 +176,15 @@ prepare_bot_tree() {
     echo "$TREE_WHY" >&2
     return 1
   fi
-  if ! timeout "$STEP_TIMEOUT_S" git -C "$REPO_DIR" fetch -q origin main 2>/dev/null; then
-    echo "WARN: git fetch origin main failed — running the last fetched origin/main" >&2
+  if timeout "$STEP_TIMEOUT_S" git -C "$REPO_DIR" fetch -q origin main 2>/dev/null 9>&-; then
+    rm -f "$HOME/.sparkinfer_fetch_failures"
+  else
+    local nf
+    nf="$(_bump "$HOME/.sparkinfer_fetch_failures")"
+    echo "WARN: git fetch origin main failed ($nf in a row) — running the last fetched origin/main" >&2
+    if _loud_now "$nf"; then
+      echo "!! BOTS RUNNING A STALE origin/main: $nf consecutive fetches failed in $REPO_DIR." >&2
+    fi
   fi
   if ! git -C "$REPO_DIR" rev-parse -q --verify origin/main >/dev/null; then
     TREE_WHY="origin/main does not resolve in $REPO_DIR"
@@ -171,7 +193,7 @@ prepare_bot_tree() {
   fi
   # REPO_DIR still follows main when it is on main, so the wrappers themselves stay current.
   if [ "$(git -C "$REPO_DIR" symbolic-ref -q --short HEAD 2>/dev/null)" = main ]; then
-    timeout "$STEP_TIMEOUT_S" git -C "$REPO_DIR" merge -q --ff-only origin/main >/dev/null 2>&1 \
+    timeout "$STEP_TIMEOUT_S" git -C "$REPO_DIR" merge -q --ff-only origin/main >/dev/null 2>&1 9>&- \
       || echo "WARN: $REPO_DIR could not fast-forward to origin/main (local changes?) — the bot runs origin/main regardless" >&2
   else
     echo "NOTE: $REPO_DIR is not on main — the bot runs origin/main from $BOT_TREE regardless, but this wrapper is that checkout's copy" >&2

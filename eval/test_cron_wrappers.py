@@ -20,7 +20,8 @@ WRAPPERS = ("cron_common.sh", "run_bonsai_pr_cron.sh", "run_museglimmer_cron.sh"
 FAKE_BOT = """import json, os, sys, time
 print("BOT " + json.dumps({"bot": os.path.basename(__file__), "cwd": os.getcwd(),
                           "marker": open("marker.txt").read().strip(), "args": sys.argv[1:],
-                          "lock_held": os.environ.get("SPARKINFER_BOT_LOCK_HELD")}))
+                          "lock_held": os.environ.get("SPARKINFER_BOT_LOCK_HELD"),
+                          "token": os.environ.get("GH_TOKEN")}))
 sys.stdout.flush()
 if os.environ.get("FAKE_BOT_SLEEP"):
     time.sleep(float(os.environ["FAKE_BOT_SLEEP"]))
@@ -244,6 +245,27 @@ class WrapperTests(unittest.TestCase):
         for _ in range(3):
             r, _ = self.tick()
         self.assertIn("Last reason: " + self.tree + " is not the bot tree these wrappers made", r.stderr)
+
+    def test_the_crontabs_token_wins_over_env_eval(self):
+        with open(os.path.join(self.repo, ".env.eval"), "w") as f:
+            f.write("GH_TOKEN=someone-elses\n")
+        r, bots = self.tick(token="bot-token")
+        self.assertEqual(bots[0]["token"], "bot-token")
+
+    def test_a_lock_file_that_cannot_be_opened_is_named_as_such(self):
+        os.makedirs(self.lock)                                       # not a file: exec 9> fails
+        r, bots = self.tick()
+        self.assertEqual((r.returncode, bots), (1, []))
+        self.assertIn("cannot open the lock file", r.stderr)
+        self.assertNotIn("another bot's round", r.stdout)
+
+    def test_repeated_fetch_failures_are_loud(self):
+        self.tick()
+        shutil.move(self.origin, self.origin + ".gone")
+        for _ in range(3):
+            r, bots = self.tick()
+            self.assertEqual(len(bots), 1)                          # still runs the last fetched main
+        self.assertIn("BOTS RUNNING A STALE origin/main: 3 consecutive fetches failed", r.stderr)
 
     def test_a_directory_that_is_not_a_worktree_is_never_removed(self):
         os.makedirs(self.tree)

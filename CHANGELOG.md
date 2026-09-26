@@ -71,6 +71,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     their own process group included, and a round started by hand takes cron's lock first;
   - the daily stale-close Action no longer closes a model bot's merge-first winner or a greenlit PR
     still waiting for its first verdict;
+  - other bots' tier and merge-first labels that no verdict on the current head backs (a paused
+    bot never drops its own) no longer feed the generic `eval:*` label, block merges or keep PRs
+    open; the Qwen3.8 bot's accuracy tool `qwen3_gguf_score.cpp` is harness there too, as on the
+    others; a PR into a branch other than `main` is not evaluated; a failed GitHub PR list exits 3
+    instead of reading "no PRs";
+  - the box checks the merged tip's files again, so a push after the bot listed a PR cannot get a
+    harness edit measured with its own ruler; no bot auto-merges a harness edit or a PR with more
+    changed files than GitHub lists; a git step failing on the box is infra; a concurrent width
+    only the PR build fails is a two-round REJECT on the Muse bot too, instead of being dropped;
   - the cron wrappers run the bots from their own `origin/main` worktree (made again if it breaks,
     and never one they did not make), refuse to run without a `GH_TOKEN` (or, with
     `SPARKINFER_BOT_LOGIN` set, with another account's), time-limit the steps before a run and the

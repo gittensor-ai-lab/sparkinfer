@@ -470,6 +470,7 @@ def pr_draft_days(repo, pr, now=None, *, draft_since=None):
 # Paths in every model bot's HARNESS_PATHS: a PR touching one is measured by no bot, so it is not
 # waiting on any (test_sibling_bot_fixes checks each bot's list still contains them).
 NEVER_MEASURED_PATHS = ("runtime/examples/qwen3_gguf_bench.cpp", "runtime/examples/qwen3_gguf_cb_bench.cpp",
+                        "runtime/examples/qwen3_gguf_score.cpp",
                         "runtime/examples/qwen_checkpoint.h", "runtime/examples/qwen3_gguf_config.h",
                         "eval/", "bench/scripts/")
 
@@ -483,10 +484,12 @@ def awaiting_any_model_verdict(repo, pr):
     """The daily stale close's form of waiting_for_first_verdict: greenlit, not conflicting, and no
     model bot has posted a verdict for the current head yet. Unknown (GitHub did not answer) keeps."""
     head = pr.get("headRefOid") or ""
-    if not head or pr_merge_conflict(pr.get("mergeable")):
+    if not head or pr_merge_conflict(pr.get("mergeable")) or (pr.get("baseRefName") or "main") != "main":
         return False
     paths = [f.get("path", "") for f in (pr.get("files") or [])]
     if any(p.startswith(h) for p in paths for h in NEVER_MEASURED_PATHS):
+        return False
+    if (pr.get("changedFiles") or 0) > len(paths):          # no bot measures what it cannot list
         return False
     labs = {l["name"] for l in pr.get("labels", [])}
     if greenlight_status(repo, pr["number"], labs)[0] not in ("ok", "unknown"):
@@ -523,7 +526,7 @@ def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False, *, drafts_only=None
         return set()
     now = datetime.datetime.now(datetime.timezone.utc)
     prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open", "--limit", str(PR_LIST_LIMIT),
-                         "--json", "number,title,updatedAt,labels,isDraft,headRefOid,mergeable,files"]).stdout
+                         "--json", "number,title,updatedAt,labels,isDraft,headRefOid,mergeable,files,baseRefName,changedFiles"]).stdout
                      or "[]")
     closed = set()
     for pr in prs:
@@ -584,7 +587,7 @@ def close_stale_draft_prs(repo, days=DRAFT_STALE_DAYS, dry_run=False):
     if days <= 0:
         return set()
     now = datetime.datetime.now(datetime.timezone.utc)
-    prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open", "--draft",
+    prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open", "--draft", "--limit", str(PR_LIST_LIMIT),
                          "--json", "number,title,createdAt,labels,isDraft"]).stdout or "[]")
     closed = set()
     for pr in prs:
@@ -695,6 +698,7 @@ def close_unchecked_rtx5090_prs(repo, dry_run=False):
     Returns PR numbers closed.
     """
     prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open",
+                         "--limit", str(PR_LIST_LIMIT),
                          "--json", "number,title,labels,isDraft,author,authorAssociation"]).stdout or "[]")
     closed = set()
     for pr in prs:
@@ -788,7 +792,7 @@ def close_exhausted_eval_prs(repo, max_none_reject=EXHAUSTED_EVAL_MAX, dry_run=F
     if max_none_reject < 0:
         return set()
     prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open",
-                         "--json", "number,title,labels,isDraft"]).stdout or "[]")
+                         "--limit", str(PR_LIST_LIMIT), "--json", "number,title,labels,isDraft"]).stdout or "[]")
     closed = set()
     for pr in prs:
         num = pr["number"]
@@ -1271,7 +1275,7 @@ GENERIC_TIER_RANK = {"REJECT": -1, "none": 0, "XS": 1, "S": 2, "M": 3, "L": 4, "
 _PER_BOT_EVAL_RE = re.compile(r"^eval-[a-z0-9]+:(.+)$")
 
 
-def merged_checkout_script(pr_ref, onto):
+def merged_checkout_script(pr_ref, onto, harness=()):
     """Bash for a model bot's remote script: check out PR `pr_ref`'s tip MERGED onto `onto`, the exact
     main commit the round's baseline measured.
 
@@ -1282,24 +1286,44 @@ def merged_checkout_script(pr_ref, onto):
     main that had it. Merging here pins both sides of the comparison to one commit.
 
     A tip that does not merge cleanly prints MERGE_CONFLICT and exits 1 -- GitHub's mergeable flag
-    can be stale the same way, and such a PR needs a rebase, not a verdict. Prints PR_TIP (the
-    full SHA actually fetched and built -- see measured_commit), MERGED_ONTO and REMOTE_HEAD. The
-    merge commit is local to the box and never pushed."""
+    can be stale the same way, and such a PR needs a rebase, not a verdict. A tip that changes any of
+    `harness` (the bot's HARNESS_PATHS) prints HARNESS_TOUCHED and exits 1: the bot checked the PR's
+    files when it listed it, and a push since then must not get measured with its own ruler. Prints
+    PR_TIP (the full SHA actually fetched and built -- see measured_commit), MERGED_ONTO and
+    REMOTE_HEAD. The merge commit is local to the box and never pushed. A git step failing on the box
+    (a network fetch, a full disk, a lock left by a killed checkout) is RETRYABLE, never the PR's."""
     import shlex
     ref_q, onto_q = shlex.quote(pr_ref), shlex.quote(onto)
-    return f"""git fetch -q origin {ref_q} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {pr_ref} failed" >&2; exit 1; }}
+    paths = " ".join(shlex.quote(p) for p in harness)
+    check = (f"""CHANGED=$(git diff --name-only {onto_q} HEAD -- {paths}) || {{ echo "RETRYABLE_INFRA_FAILURE git diff failed" >&2; exit 1; }}
+if [ -n "$CHANGED" ]; then
+  echo "HARNESS_TOUCHED $(printf '%s ' $CHANGED)" >&2
+  exit 1
+fi
+""" if harness else "")
+    return f"""timeout 600 git fetch -q origin {ref_q} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {pr_ref} failed" >&2; exit 1; }}
 PR_TIP=$(git rev-parse FETCH_HEAD)
-git fetch -q origin main || {{ echo "RETRYABLE_INFRA_FAILURE git fetch main failed" >&2; exit 1; }}
-git reset -q --hard
-git clean -qfd
-git checkout -qf {onto_q}
+timeout 600 git fetch -q origin main || {{ echo "RETRYABLE_INFRA_FAILURE git fetch main failed" >&2; exit 1; }}
+# An index lock left by a checkout that was killed (an old one: the bot lock and the round guard mean
+# no other round is running) would fail every step below.
+find .git -maxdepth 1 -name index.lock -mmin +10 -delete 2>/dev/null || true
+git reset -q --hard || {{ echo "RETRYABLE_INFRA_FAILURE git reset failed" >&2; exit 1; }}
+git clean -qfd || {{ echo "RETRYABLE_INFRA_FAILURE git clean failed" >&2; exit 1; }}
+git checkout -qf {onto_q} || {{ echo "RETRYABLE_INFRA_FAILURE git checkout {onto} failed" >&2; exit 1; }}
 if ! git -c user.name=sparkinfer-eval -c user.email=eval@sparkinfer.invalid merge -q --no-ff --no-edit "$PR_TIP" >/dev/null 2>&1; then
+  # Only unmerged paths make it a conflict (the PR's to fix); anything else (a full disk, say) is
+  # the box's -- a conflict is remembered for the head and not measured again until a push.
+  if [ -n "$(git ls-files -u 2>/dev/null | head -1)" ]; then
+    git merge --abort 2>/dev/null || true
+    echo "MERGE_CONFLICT $(git rev-parse --short "$PR_TIP") does not merge cleanly onto $(git rev-parse --short {onto_q})" >&2
+    exit 1
+  fi
   git merge --abort 2>/dev/null || true
-  echo "MERGE_CONFLICT $(git rev-parse --short "$PR_TIP") does not merge cleanly onto $(git rev-parse --short {onto_q})" >&2
+  echo "RETRYABLE_INFRA_FAILURE git merge failed without a conflict" >&2
   exit 1
 fi
 echo "PR_TIP $(git rev-parse "$PR_TIP")"
-echo "MERGED_ONTO $(git rev-parse --short {onto_q})"
+{check}echo "MERGED_ONTO $(git rev-parse --short {onto_q})"
 echo "REMOTE_HEAD $(git rev-parse --short HEAD)"
 echo "REMOTE_SHA $(git rev-parse HEAD)"
 """
@@ -1358,7 +1382,10 @@ def exception_result(e):
     every round with nothing to show. It is posted as a failed run, with a label in its marker so
     the commit counts as evaluated until the author pushes again."""
     if isinstance(e, subprocess.TimeoutExpired):
-        return {"ok": False, "retry": False, "label": "REJECT", "log": "",
+        out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        tip = next((l.split()[1] for l in out.splitlines()
+                    if l.startswith("PR_TIP ") and len(l.split()) >= 2 and _FULL_SHA_RE.match(l.split()[1])), None)
+        return {"ok": False, "retry": False, "label": "REJECT", "log": "", "pr_tip": tip,
                 "reason": f"the PR run was killed after {int(e.timeout or 0)} s — most likely a hang "
                           f"in the PR's code (main completed the same run this round)"}
     # "error": the bot's own failure. Counted like a box fault, but never charged to the PR: after
@@ -1459,6 +1486,102 @@ def failed_rc(line):
     return None
 
 
+# Every model bot's verdict marker, with the bot's name: <!-- sparkinfer-<bot>-eval:<schema>:<commit> {json} -->
+_BOT_VERDICT_RE = re.compile(r"<!-- sparkinfer-([a-z0-9]+)-eval:[^:\s]+:([0-9a-f]{7,40})(?:\s+(\{.*?\}))? -->",
+                             re.DOTALL)
+_PER_BOT_LABEL_RE = re.compile(r"^eval-([a-z0-9]+):.+$")
+_BOT_MERGE_FIRST_RE = re.compile(r"^([a-z0-9]+)-merge-first$")
+
+
+def bot_verdict_heads(repo, num):
+    """{bot: {commit, ...}} for every trusted, non-null verdict marker on the PR, or None when GitHub
+    did not answer."""
+    r = gh(["pr", "view", str(num), "-R", repo, "--json", "comments"])
+    try:
+        comments = json.loads(r.stdout or "").get("comments")
+    except (json.JSONDecodeError, AttributeError):
+        comments = None
+    if r.returncode != 0 or not isinstance(comments, list):
+        return None
+    heads = {}
+    for c in comments:
+        if not trusted_marker_comment(c):
+            continue
+        for m in _BOT_VERDICT_RE.finditer(c.get("body") or ""):
+            try:
+                meta = json.loads(m.group(3)) if m.group(3) else {}
+            except json.JSONDecodeError:
+                meta = {}
+            if meta.get("label") is not None:
+                heads.setdefault(m.group(1), set()).add(m.group(2))
+    return heads
+
+
+def strip_foreign_stale_labels(repo, num, labels, head, my_prefix):
+    """Drop OTHER bots' `eval-<bot>:<tier>` and `<bot>-merge-first` labels that no verdict of that
+    bot on the PR's current head backs. Each bot drops only its own stale tier (strip_stale_verdict_
+    labels), so a bot that is paused, retired, or simply had not run since the push left its tier on
+    a head it never measured -- feeding the generic `eval:*` label SN74 pays on, blocking merges as
+    "a REJECT from another bot", and exempting the PR from every close through its merge-first. A
+    bot none of whose markers is on the PR at all is left alone (a format this code cannot read).
+    Returns the labels it removed (an empty set: none) -- the caller subtracts them rather than
+    reading the labels again, since a failed read would look like a PR with no labels (no `hold`)."""
+    own = my_prefix[len("eval-"):].rstrip(":")
+    candidates = []
+    for lab in labels:
+        m = _PER_BOT_LABEL_RE.match(lab) or _BOT_MERGE_FIRST_RE.match(lab)
+        if m and m.group(1) != own:
+            candidates.append((lab, m.group(1)))
+    if not candidates or not head:
+        return set()
+    heads = bot_verdict_heads(repo, num)
+    if heads is None:
+        return set()
+    stale = [lab for lab, bot in candidates
+             if bot in heads and not any(head.startswith(sha) for sha in heads[bot])]
+    for lab in stale:
+        remove_label(repo, num, lab)
+    removed = set(stale)
+    if any(_PER_BOT_LABEL_RE.match(l) for l in stale) and sync_generic_eval_label(repo, num) is None:
+        for lab in labels_on(repo, num):
+            if lab.startswith("eval:") and lab[len("eval:"):] in GENERIC_TIER_RANK:
+                remove_label(repo, num, lab)
+                removed.add(lab)
+    return removed
+
+
+def open_prs_or_none(repo, fields):
+    """The open PRs with `fields`, or None when GitHub did not answer. A failed list used to read as
+    an empty queue: every bot printed "no PRs to evaluate" and exited 0, so an expired token
+    stopped them all without a banner."""
+    r = gh(["pr", "list", "-R", repo, "--state", "open", "--json", fields, "--limit", str(PR_LIST_LIMIT)])
+    try:
+        prs = json.loads(r.stdout or "")
+    except json.JSONDecodeError:
+        return None
+    return prs if r.returncode == 0 and isinstance(prs, list) else None
+
+
+def acting_account_ok():
+    """With SPARKINFER_BOT_LOGIN set, is gh acting as that account? (ok, login). A lookup GitHub does
+    not answer is not a refusal: every later gh call fails anyway, and loudly (open_prs_or_none)."""
+    want = os.environ.get("SPARKINFER_BOT_LOGIN", "").strip()
+    if not want:
+        return True, ""
+    r = gh(["api", "user", "--jq", ".login"], quiet=True)
+    login = (r.stdout or "").strip() if r.returncode == 0 else ""
+    return (not login or login == want), login
+
+
+def harness_touched_line(stdout, stderr):
+    """The HARNESS_TOUCHED line merged_checkout_script printed, or "": the tip the box fetched edits
+    the measuring harness (a push after the bot checked the PR's files)."""
+    for l in ((stderr or "") + "\n" + (stdout or "")).splitlines():
+        if l.startswith("HARNESS_TOUCHED "):
+            return l.strip()
+    return ""
+
+
 def merge_conflict_line(stdout, stderr):
     """The MERGE_CONFLICT line merged_checkout_script printed, or "" -- only when the merge is where
     the run stopped (no PR_TIP line followed), so a build log or program output that merely
@@ -1525,10 +1648,12 @@ def waiting_for_first_verdict(repo, pr, evaluated, never_paths=(), rebase_label=
         return False
     if evaluated is None:
         return True
-    if head in evaluated or pr_merge_conflict(pr.get("mergeable")):
+    if head in evaluated or pr_merge_conflict(pr.get("mergeable")) or (pr.get("baseRefName") or "main") != "main":
         return False
     paths = [f.get("path", "") for f in (pr.get("files") or [])]
     if never_paths and any(p.startswith(h) for p in paths for h in never_paths):
+        return False
+    if (pr.get("changedFiles") or 0) > len(paths):          # the bot does not measure what it cannot list
         return False
     labs = {l["name"] for l in pr.get("labels", [])}
     if rebase_label and rebase_label in labs:                  # this bot found it does not merge
@@ -2271,18 +2396,21 @@ LOG_PAGE  = "https://gittensor-ai-lab.github.io/sparkinfer-log/?run="
 
 def _ensure_log_repo():
     """Clone or update the public sparkinfer-log checkout."""
+    # Time-limited: a hung clone or pull held the shared bot lock until the wrapper's 8 h kill.
     if not os.path.isdir(os.path.join(LOG_DIR, ".git")):
-        subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
+        subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True, timeout=600)
         return
     origin = subprocess.run(
         ["git", "-C", LOG_DIR, "remote", "get-url", "origin"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=60,
     ).stdout.strip()
     if origin.rstrip("/") != LOG_REPO.rstrip("/"):
         shutil.rmtree(LOG_DIR)
-        subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
+        subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True, timeout=600)
         return
-    subprocess.run(["git", "-C", LOG_DIR, "pull", "-q", "--rebase"], check=False)
+    # A pull the timeout interrupted can leave a rebase in progress, and every later upload would fail.
+    subprocess.run(["git", "-C", LOG_DIR, "rebase", "--abort"], capture_output=True, check=False, timeout=60)
+    subprocess.run(["git", "-C", LOG_DIR, "pull", "-q", "--rebase"], check=False, timeout=300)
 
 def upload_eval_log(repo, num, title, oid, res, log_text, baseline, polaris=None):
     """Commit eval log (+ optional Polaris receipt/attestation) to sparkinfer-log.

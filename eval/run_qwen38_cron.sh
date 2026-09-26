@@ -42,17 +42,19 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=eval/cron_common.sh
 source "$REPO_DIR/eval/cron_common.sh" || exit 1
 
-exec 9>"$LOCK_FILE"
+open_lock qwen38 || exit 1
 flock -w "$LOCK_WAIT_S" 9 || { note_lock_skip qwen38; exit 0; }
 note_lock_taken qwen38
 cd "$REPO_DIR" || { note_refused qwen38 "cannot enter $REPO_DIR"; exit 1; }
 
+keep_cron_token
 if [ -f "$REPO_DIR/.env.eval" ]; then
   set -a
   # shellcheck source=/dev/null
   source "$REPO_DIR/.env.eval"
   set +a
 fi
+restore_cron_token
 export VAST_NO_AUTO_PROVISION=1
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 

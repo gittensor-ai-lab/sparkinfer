@@ -184,14 +184,23 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
 - **What is measured.** A PR's tip merged, on the box, onto the exact `main` commit the round's
   baseline measured (`arb.merged_checkout_script`). A PR that does not merge cleanly gets
   `<bot>-needs-rebase` and no verdict. The Muse bot used to measure the branch tip itself, so a
-  branch behind `main` was charged with every speedup merged since it branched.
-- **What a verdict is for.** The PR tip the box built, measured against one `main` commit. When the
-  head moves, the bot's `eval-<model>:<tier>` from the older head is removed and the generic
-  `eval:*` re-derived (dropped when no other bot's tier is left). A bot merges only the commit it
-  scored, and only while `main` is still the commit it was measured against: once any bot merges
-  something else, a merge candidate nothing else stops is measured again before it can merge. It
-  keeps its place in the ranking until then -- behind any PR that can merge now, and only while the
-  bot's selection would actually re-measure it -- and while it waits, nobody is sent to rebase.
+  branch behind `main` was charged with every speedup merged since it branched. The box checks the
+  merged tip's files again: a push since the bot listed the PR that edits the bot's harness stops
+  the run (`HARNESS_TOUCHED`), with nothing posted. A PR based on a branch other than `main` is not
+  evaluated.
+- **What a verdict is for.** The PR tip the box built, measured against one `main` commit.
+  - When the head moves, the bot's `eval-<model>:<tier>` from the older head is removed and the
+    generic `eval:*` re-derived (dropped when no other bot's tier is left).
+  - Every bot also drops other bots' tier and merge-first labels that no verdict of theirs on the
+    current head backs -- a paused or retired bot never drops its own -- so none of them can feed
+    the generic label, block a merge as "a REJECT from another bot", or keep a PR from closing.
+  - A bot merges only the commit it scored, and only while `main` is still the commit it was
+    measured against. Once any bot merges something else, a merge candidate nothing else stops is
+    measured again before it can merge. Until then it keeps its place in the ranking -- behind any
+    PR that can merge now, and only while the bot's selection would actually re-measure it -- and
+    nobody is sent to rebase while it waits.
+  - No bot auto-merges a harness edit, or a PR changing more files than GitHub lists: whatever its
+    verdict, those merge by hand.
 - **Closing.** A REJECT closes the PR. A `none` closes it only when the PR declares that bot's model
   and no other, and no other bot has scored it a speedup or made it merge-first
   (`arb.none_may_close`; its own merge-first does not count). Before, the Muse and Qwen3.8 bots
@@ -203,28 +212,34 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
   and never a greenlit PR still waiting for that bot's first verdict on its head: that wait is the
   bot's, not the author's -- as is a verified speedup the bot owes a re-measure onto a new `main`.
   A PR that conflicts with `main` (GitHub's word, or that bot's own `*-needs-rebase`, which it drops
-  once the head moves) or edits the harness is waiting on its author; so is not a PR whose head the
-  bot gave up on after its own errors. A GitHub
+  once the head moves; a conflict the box found is remembered for its head) or edits the harness is
+  waiting on its author; so is not a PR whose head the bot gave up on after its own errors. A GitHub
   read that fails is "unknown" and never closes, strips or re-measures anything. The daily
   `close-stale-prs` Action (no GitHub activity for 2 days) spares any bot's merge-first and any
   greenlit PR no model bot has posted a verdict for yet, unless GitHub says it conflicts or it edits
   paths no bot measures (`arb.NEVER_MEASURED_PATHS`).
-- **Failures.** A run that fails on the PR's side is posted once for that commit. A fault on the box
-  is retried next round with nothing posted; one that recurs at the same commit for three rounds
-  while `main`'s run passes (`arb.BOX_FAULT_STRIKES`) is then charged to the PR, which is never
-  retried for ever; several checks lost in one round count once, and an OOM kill counts as the box's
-  on every bot (the whole run, a sweep, a step or a guard); a guard that `main` measured nothing
-  for, or only zeros, skips the round. A failure of the bot itself (an exception) is
-  never charged: after three rounds at one commit the bot stops measuring that commit and waits for
-  a push, and every run that gives up on a PR exits 3, as does a round skipped because `main`'s
-  baseline is unusable, so the wrapper's failed-run banner shows both. Beside such a fault, only a gate a
-  busy box cannot fake (accuracy, Ternary-Bonsai's prefill path and `bonsai_regression.py` checks)
-  is posted; a throughput REJECT waits for a clean run.
-  Each round first stops any remote script an earlier round left running, its whole ssh session
-  (`arb.round_guard_sh`); such orphans held the GPU and failed later baselines. So a round started
-  by hand takes the same lock as cron's rounds first (`arb.hold_bot_lock`). The Muse bot skips a
-  round whose `main` misses its own accuracy gate against llama.cpp, and a llama.cpp reference
-  server that never becomes healthy is infra.
+- **Failures.** A run that fails on the PR's side is posted once for that commit.
+  - A fault on the box is retried next round with nothing posted. One that recurs at the same
+    commit for three rounds while `main`'s run passes (`arb.BOX_FAULT_STRIKES`) is then charged to
+    the PR, so nothing is retried for ever; several checks lost in one round count once.
+  - Box faults include an OOM kill (of the whole run, a sweep, a step or a guard), a GPU that never
+    drained, a run that died without a word, and a git step failing on the box (a fetch, a full
+    disk, a lock left by a killed checkout). Ternary-Bonsai judges a killed concurrency width or
+    regression run over two rounds instead (see its section).
+  - Beside such a fault, only a gate a busy box cannot fake (accuracy; Ternary-Bonsai's prefill path
+    and `bonsai_regression.py` checks) is posted; a throughput REJECT waits for a clean run.
+  - A concurrent-decode width `main` measured that the PR build could not complete is a REJECT
+    judged over two rounds on the same commit (Muse Glimmer, Ternary-Bonsai), never dropped.
+  - A guard `main` measured nothing for, or only zeros, skips the round; so does a Muse `main` that
+    misses its own accuracy gate against llama.cpp. A llama.cpp reference server that never becomes
+    healthy is infra.
+  - A failure of the bot itself (an exception) is never charged: after three rounds at one commit
+    the bot stops measuring that commit until a push. A run that gives up on a PR, or whose round
+    is skipped because `main`'s baseline is unusable, exits 3, so the wrapper's failed-run banner
+    shows it.
+  - Each round first stops any remote script an earlier round left running, its whole ssh session
+    (`arb.round_guard_sh`); such orphans held the GPU and failed later baselines. So a round started
+    by hand takes the same lock as cron's rounds first (`arb.hold_bot_lock`).
 - **Cron wrappers** (`eval/cron_common.sh`, tested by `eval/test_cron_wrappers.py`). The bots run
   from `~/.sparkinfer_bot_tree`, a worktree the wrappers make and mark as their own, reset to
   `origin/main` every tick and made again when it breaks; never from whatever the working copy has
@@ -234,10 +249,13 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
   `GH_TOKEN` is refused, since `gh` would otherwise act as the machine's active account; with
   `SPARKINFER_BOT_LOGIN` set in `.env.eval`, a token GitHub says belongs to any other account is
   refused too (the sync reads `.env.eval` as well; a lookup GitHub does not answer lets the tick
-  run). A bot's tick waits up to 300 s for the shared lock, the sync not at
+  run). A `GH_TOKEN` in `.env.eval` never replaces the crontab's. A bot's tick waits up to 300 s for the shared lock, the sync not at
   all; the git and ssh steps before a run are time-limited, and a bot run is stopped after 8 hours
   (the sync after 3 minutes). Refused ticks, a bot's lock skips, failed runs and GPU-down ticks
-  print a banner when they repeat. The wait and timeout settings come from the crontab's
+  print a banner when they repeat, as do repeated fetch failures (the bots then run the last
+  fetched `origin/main`); so does a bot whose GitHub PR list fails (it exits 3 rather
+  than reading "no PRs"). A bot started by hand with `SPARKINFER_BOT_LOGIN` set refuses to act as
+  another account too. The wait and timeout settings come from the crontab's
   environment, not `.env.eval`; `SPARKINFER_LOCK_FILE` is for the tests only (every bot and every
   other wrapper lock `/tmp/sparkinfer_bot.lock`). The other wrappers (`run_dspark_cron.sh`,
   `run_dflash_cron.sh`, `run_modelopt_cron.sh`, `run_bot_cron.sh`, `run_bonsai_cron.sh`,
@@ -334,11 +352,14 @@ closes the PR; a `none` closes it only as the shared rules above allow.
      `pr_bonsai_bot.py` runs it (added 2026-09-24; `pr_museglimmer_bot.py` runs the same guard).
      That bot skips PRs declared for Qwen3.8 or Muse Glimmer alone. 128 is included because the
      dense-GGUF prefill work on that model lives at short prompts (#1139: 1.94× at 128, flat at 4k).
-     A guard run that measures nothing is retried next round, never read as a regression.
+     A guard `main` measured nothing for skips the round, and a guard sweep the OOM killer took is
+     retried as the box's; a guard only the PR build failed to measure is a regression
+     (fail-closed; the Ternary-Bonsai bot judges that over two rounds).
 
 **Not evaluated:**
 - PRs whose template declares a different target model (#1027).
 - PRs that change the measuring harness: `qwen3_gguf_bench.cpp`, `qwen3_gguf_cb_bench.cpp`,
+  `qwen3_gguf_score.cpp` (the accuracy gate's only input),
   `qwen_checkpoint.h`, `qwen3_gguf_config.h`, `eval/` or `bench/scripts/`.
 
 Every ref, `main` included, is built with `main`'s copy of those files.

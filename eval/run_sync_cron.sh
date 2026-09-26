@@ -21,18 +21,20 @@ BOT_TIMEOUT_S="${SPARKINFER_SYNC_TIMEOUT_S:-180}"
 
 # Share the eval lock so a sync can never overlap an eval run (or another sync). Non-blocking:
 # if an eval/sync is active, skip this tick (the next one picks it up).
-exec 9>"$LOCK_FILE"
+open_lock sync || exit 1
 flock -n 9 || exit 0
 
 cd "$REPO_DIR" || { note_refused sync "cannot enter $REPO_DIR"; exit 1; }
 # .env.eval too (SPARKINFER_BOT_LOGIN, SPARKINFER_BOT_TREE): the sync closes PRs as well. It never
 # merges, whatever .env.eval says.
+keep_cron_token
 if [ -f "$REPO_DIR/.env.eval" ]; then
   set -a
   # shellcheck source=/dev/null
   source "$REPO_DIR/.env.eval"
   set +a
 fi
+restore_cron_token
 unset SPARKINFER_AUTOMERGE
 require_bot_token sync || exit 1
 prepare_bot_tree || { note_refused sync "$TREE_WHY"; exit 1; }   # never REPO_DIR's checkout

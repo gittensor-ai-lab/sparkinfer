@@ -1603,5 +1603,159 @@ class Round4SharedHelperTests(unittest.TestCase):
         self.assertLess(i, src.index("else:  # unchecked", i))
 
 
+class Iteration3SharedTests(unittest.TestCase):
+    """Fixes from the post-merge review of 2026-09-26."""
+    R = staticmethod(lambda out, rc=0: mock.Mock(returncode=rc, stdout=out, stderr=""))
+
+    def _comments(self, *markers, assoc="MEMBER"):
+        return json.dumps({"comments": [{"authorAssociation": assoc, "body": m} for m in markers]})
+
+    @staticmethod
+    def _marker(bot, sha, label="XL"):
+        return f'<!-- sparkinfer-{bot}-eval:v1:{sha} {{"label":"{label}"}} -->'
+
+    def test_other_bots_labels_count_only_for_the_head_they_measured(self):
+        labels = {"eval-bonsai:XL", "bonsai-merge-first", "eval-qwen38:none", "eval-dspark:S",
+                  "eval-museglimmer:M", "eval:XL"}
+        comments = self._comments(self._marker("bonsai", "a" * 40), self._marker("qwen38", "b" * 40, "none"))
+        removed = []
+        with mock.patch.object(bot, "gh", return_value=self.R(comments)), \
+                mock.patch.object(bot, "remove_label", side_effect=lambda r, n, l: removed.append(l)), \
+                mock.patch.object(bot, "sync_generic_eval_label", return_value="none"):
+            self.assertTrue(bot.strip_foreign_stale_labels("o/r", 1, labels, "b" * 40, "eval-museglimmer:"))
+        # Bonsai measured a, not b: its tier and merge-first go. Qwen measured b: kept. DSpark left no
+        # marker here (a format this code cannot read): left alone. The bot's own label: its own rules.
+        self.assertEqual(sorted(removed), ["bonsai-merge-first", "eval-bonsai:XL"])
+
+    def test_unread_comments_or_untrusted_markers_never_strip(self):
+        with mock.patch.object(bot, "gh", return_value=self.R("", 1)), \
+                mock.patch.object(bot, "remove_label") as rm:
+            self.assertFalse(bot.strip_foreign_stale_labels("o/r", 1, {"eval-bonsai:XL"}, "b" * 40, "eval-qwen38:"))
+            rm.assert_not_called()
+        with mock.patch.object(bot, "gh", return_value=self.R(self._comments(self._marker("bonsai", "a" * 40),
+                                                                            assoc="NONE"))):
+            self.assertEqual(bot.bot_verdict_heads("o/r", 1), {})
+
+    def test_a_failed_pr_list_is_none_not_empty(self):
+        with mock.patch.object(bot, "gh", return_value=self.R("", 1)):
+            self.assertIsNone(bot.open_prs_or_none("o/r", "number"))
+        with mock.patch.object(bot, "gh", return_value=self.R("[]")):
+            self.assertEqual(bot.open_prs_or_none("o/r", "number"), [])
+
+    def test_the_bot_account_is_checked_when_configured(self):
+        with mock.patch.dict(os.environ, {"SPARKINFER_BOT_LOGIN": "bot"}):
+            with mock.patch.object(bot, "gh", return_value=self.R("someone\n")):
+                self.assertEqual(bot.acting_account_ok(), (False, "someone"))
+            with mock.patch.object(bot, "gh", return_value=self.R("bot\n")):
+                self.assertEqual(bot.acting_account_ok(), (True, "bot"))
+            with mock.patch.object(bot, "gh", return_value=self.R("", 1)):
+                self.assertTrue(bot.acting_account_ok()[0])                  # GitHub silent: not a refusal
+        with mock.patch.dict(os.environ, {"SPARKINFER_BOT_LOGIN": ""}):
+            self.assertEqual(bot.acting_account_ok(), (True, ""))
+
+    def test_a_run_killed_at_the_ssh_limit_keeps_the_tip_it_built(self):
+        import subprocess
+        e = subprocess.TimeoutExpired("ssh", 7200, output="REMOTE_HEAD x\nPR_TIP " + "c" * 40 + "\n")
+        self.assertEqual(bot.exception_result(e)["pr_tip"], "c" * 40)
+        self.assertIsNone(bot.exception_result(subprocess.TimeoutExpired("ssh", 7200))["pr_tip"])
+
+    def test_the_daily_action_sees_every_open_pr(self):
+        for fn in (bot.close_unchecked_rtx5090_prs, bot.close_exhausted_eval_prs, bot.close_stale_draft_prs):
+            with mock.patch.object(bot, "gh", return_value=self.R("[]")) as g:
+                fn("o/r", dry_run=True)
+            args = g.call_args_list[0].args[0]
+            self.assertIn("--limit", args, fn.__name__)
+
+
+class MergeStepTests(unittest.TestCase):
+    """arb.merged_checkout_script, run for real against a throwaway repository."""
+
+    def setUp(self):
+        import subprocess
+        self.sp = subprocess
+        self.t = tempfile.mkdtemp(prefix="sparkinfer-merge-")
+        self.addCleanup(__import__("shutil").rmtree, self.t, True)
+        g = lambda *a, cwd=None: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                                cwd=cwd, check=True, capture_output=True, text=True)
+        self.g = g
+        self.origin, self.work, self.box = (os.path.join(self.t, n) for n in ("origin.git", "work", "box"))
+        g("init", "-q", "--bare", "-b", "main", self.origin)
+        g("clone", "-q", self.origin, self.work)
+        os.makedirs(os.path.join(self.work, "bench/scripts"))
+        for p, c in (("kernel.cu", "a\n"), ("bench/scripts/_eval_speed.sh", "ruler\n")):
+            with open(os.path.join(self.work, p), "w") as fh:
+                fh.write(c)
+        g("add", "-A", cwd=self.work); g("commit", "-qm", "base", cwd=self.work)
+        g("push", "-q", "origin", "HEAD:main", cwd=self.work)
+        self.main = g("rev-parse", "HEAD", cwd=self.work).stdout.strip()
+        g("clone", "-q", self.origin, self.box)
+
+    def _pr(self, path, content):
+        self.g("checkout", "-q", "-B", "pr", self.main, cwd=self.work)
+        with open(os.path.join(self.work, path), "w") as fh:
+            fh.write(content)
+        self.g("commit", "-qam", "pr", cwd=self.work)
+        self.g("push", "-qf", "origin", "HEAD:refs/pull/1/head", cwd=self.work)
+        return self.g("rev-parse", "HEAD", cwd=self.work).stdout.strip()
+
+    def _run(self):
+        script = "set -euo pipefail\n" + bot.merged_checkout_script("pull/1/head", self.main, ("bench/scripts/",))
+        return self.sp.run(["bash", "-c", script], cwd=self.box, capture_output=True, text=True, timeout=60)
+
+    def test_a_clean_merge_reports_the_tip_it_built(self):
+        tip = self._pr("kernel.cu", "b\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("PR_TIP " + tip, r.stdout)
+        self.assertEqual(bot.merge_conflict_line(r.stdout, r.stderr), "")
+
+    def test_a_tip_that_edits_the_harness_is_never_measured(self):
+        self._pr("bench/scripts/_eval_speed.sh", "forged\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("bench/scripts/_eval_speed.sh", bot.harness_touched_line(r.stdout, r.stderr))
+
+    def test_a_conflict_prints_no_tip(self):
+        self.g("checkout", "-q", "main", cwd=self.work)
+        with open(os.path.join(self.work, "kernel.cu"), "w") as fh:
+            fh.write("main-side\n")
+        self.g("commit", "-qam", "main moves", cwd=self.work)
+        self.g("push", "-q", "origin", "HEAD:main", cwd=self.work)
+        base, self.main = self.main, self.g("rev-parse", "HEAD", cwd=self.work).stdout.strip()
+        self.g("checkout", "-q", "-B", "pr", base, cwd=self.work)
+        with open(os.path.join(self.work, "kernel.cu"), "w") as fh:
+            fh.write("pr-side\n")
+        self.g("commit", "-qam", "pr", cwd=self.work)
+        self.g("push", "-qf", "origin", "HEAD:refs/pull/1/head", cwd=self.work)
+        r = self._run()
+        self.assertEqual(r.returncode, 1)
+        self.assertTrue(bot.merge_conflict_line(r.stdout, r.stderr).startswith("MERGE_CONFLICT "))
+        self.assertNotIn("PR_TIP", r.stdout)
+
+    def test_git_failing_on_the_box_is_the_boxs_and_an_old_lock_is_cleared(self):
+        self._pr("kernel.cu", "b\n")
+        lock = os.path.join(self.box, ".git", "index.lock")
+        open(lock, "w").close()                                   # a checkout killed a moment ago
+        r = self._run()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("RETRYABLE_INFRA_FAILURE git reset failed", r.stderr)
+        old = __import__("time").time() - 3600
+        os.utime(lock, (old, old))                                # ... or an hour ago: ours to clear
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class BenchSweepTests(unittest.TestCase):
+    def test_the_sweeps_exit_code_is_kept_for_the_caller(self):
+        import subprocess
+        root = os.path.dirname(os.path.dirname(os.path.abspath(bot.__file__)))
+        for rc in (137, 1, 0):
+            script = (f"set -uo pipefail\nsource {root}/bench/scripts/_eval_speed.sh\n"
+                      f"si_run() {{ echo 'SWEEP_JSON {{}}'; return {rc}; }}\ngclks=()\n"
+                      f"bench_sweep_run model 128 128 5 || true\necho RC=${{_BENCH_SWEEP_RC:-unset}}\n")
+            r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+            self.assertIn(f"RC={rc}", r.stdout, r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

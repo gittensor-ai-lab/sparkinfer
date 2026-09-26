@@ -4,9 +4,12 @@
 Sibling of pr_museglimmer_bot.py / pr_dflash_bot.py, and the ONLY scored bot once Qwen3.8-27B
 becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
 
-  1. Speed — decode @ ctx=128 on the NVFP4 checkpoint, PR vs a freshly-measured origin/main, same
-              box, same round, median of 5 reps. Same tier buckets as every other bot in this
-              directory (BUCKETS/SIG/REGRESS_TOL below — copied, not reinvented).
+  1. Speed — PR vs a freshly-measured origin/main, same box, same round. The tier is the best of
+              prefill@16k, concurrent decode @c2..c32 and ModelOpt decode@256k (SCORING_DIMS);
+              decode@128, prefill@128, prefill@256k and concurrent decode @c1 are measured as
+              no-regression floors only (the history below explains how the scored set grew).
+              Same tier buckets as every other bot in this directory (BUCKETS/SIG/REGRESS_TOL
+              below — copied, not reinvented).
 
               The scored checkpoint is the HuggingFace compressed-tensors DIRECTORY (mixed NVFP4
               FFN + FP8 attention/GDN projections, unsloth/Qwen3.8-27B-NVFP4), NOT a GGUF of the
@@ -16,7 +19,7 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               (runtime/examples/qwen_checkpoint.h, shared with the server so the two cannot
               disagree about how a checkpoint is configured).
 
-              Prefill@128 is ALSO scored, from the same sweep and the same model load (no extra
+              Prefill@128 was ALSO scored (a floor now), from the same sweep and the same model load (no extra
               GPU time -- prefill_pp was already computed alongside decode_tps and simply
               discarded). Combination rule is pr_museglimmer_bot.py's, verbatim: either dimension
               regressing is a hard REJECT, otherwise the better of the two tiers wins, so a pure
@@ -193,6 +196,9 @@ SCORING_DIMS = [SCORING_DIM] + [CB_DIM_FOR[c] for c in CB_SCORED_CONCS] + [LONGC
 HARNESS_PATHS = (
     "runtime/examples/qwen3_gguf_bench.cpp",
     "runtime/examples/qwen3_gguf_cb_bench.cpp",
+    # The accuracy gate's only input is this tool's dump: a PR editing it could print main's dump
+    # (a public path) and pass any numerics. The Muse and Bonsai bots already treat it as harness.
+    "runtime/examples/qwen3_gguf_score.cpp",
     "runtime/examples/qwen_checkpoint.h",
     "runtime/examples/qwen3_gguf_config.h",
     "eval/",
@@ -560,8 +566,8 @@ def close_stale_qwen38_prs(repo, prs, dry_run=False):
             # the wait is the bot's.
             print(f"PR #{num}: idle {age_days:.1f}d but owed a re-measure onto the new main — kept open")
             continue
-        if arb.waiting_for_first_verdict(repo, pr, qwen38_evaluated_commits(repo, num),
-                                         never_paths=HARNESS_PATHS, rebase_label=QWEN38_NEEDS_REBASE):
+        if not arb.strike_count(STRIKES_FILE, num, head, "harness") and arb.waiting_for_first_verdict(
+                repo, pr, qwen38_evaluated_commits(repo, num), never_paths=HARNESS_PATHS, rebase_label=QWEN38_NEEDS_REBASE):
             # Greenlit and still waiting for this bot to measure its head: the wait is the bot's.
             print(f"PR #{num}: idle {age_days:.1f}d but still waiting for its first qwen38 verdict — kept open")
             continue
@@ -636,7 +642,7 @@ def ssh_run(host, port, cmd, timeout=7200, stdin_data=None, via_stdin=False):
 # SCORE_FAILED is the PR's own qwen3_gguf_score crashing: an explicit `exit 1`, so without it here
 # _crash_reason found nothing and _is_box_fault read the run as a silent kill -- retried every round
 # for ever with nothing posted, instead of the REJECT a crashing forward pass earns.
-_EXPLICIT_FAIL_MARKERS = ("BUILD_FAILED", "LLAMACPP_CONFIGURE_FAILED", "LLAMACPP_BUILD_FAILED",
+_EXPLICIT_FAIL_MARKERS = ("HARNESS_TOUCHED", "BUILD_FAILED", "LLAMACPP_CONFIGURE_FAILED", "LLAMACPP_BUILD_FAILED",
                           "MERGE_CONFLICT", "SCORE_FAILED")
 
 
@@ -746,13 +752,14 @@ def _remote_script(ref: str, role: str = "pr", onto: str | None = None) -> str:
     (#1145, 2026-09-24), which reads main's newer speedups as the PR's regressions."""
     if role == "pr":
         base = onto or "origin/main"
-        checkout = arb.merged_checkout_script(ref, base)
+        checkout = arb.merged_checkout_script(ref, base, HARNESS_PATHS)
     else:
         base = "HEAD"   # main's harness is the commit just checked out, not a second fetch of main
-        checkout = (f'git fetch -q origin {shlex.quote(ref)} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {ref} failed" >&2; exit 1; }}\n'
-                    "git reset -q --hard\n"
-                    "git clean -qfd\n"
-                    "git checkout -qf FETCH_HEAD\n"
+        checkout = (f'timeout 600 git fetch -q origin {shlex.quote(ref)} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {ref} failed" >&2; exit 1; }}\n'
+                    'find .git -maxdepth 1 -name index.lock -mmin +10 -delete 2>/dev/null || true\n'
+                    'git reset -q --hard || { echo "RETRYABLE_INFRA_FAILURE git reset failed" >&2; exit 1; }\n'
+                    'git clean -qfd || { echo "RETRYABLE_INFRA_FAILURE git clean failed" >&2; exit 1; }\n'
+                    'git checkout -qf FETCH_HEAD || { echo "RETRYABLE_INFRA_FAILURE git checkout failed" >&2; exit 1; }\n'
                     'echo "REMOTE_HEAD $(git rev-parse --short HEAD)"\n'
                     'echo "REMOTE_SHA $(git rev-parse HEAD)"\n')
     base_q = shlex.quote(base)
@@ -848,9 +855,9 @@ git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/
 # this changes nothing for the PRs that are evaluated except that a branch older than a harness
 # change is measured with main's ruler -- the same ruler as its baseline. A network failure is the
 # box's, never the PR's: RETRYABLE, not the ERR trap (a sticky REJECT).
-git fetch -q origin main || {{ echo "RETRYABLE_INFRA_FAILURE git fetch main failed" >&2; exit 1; }}
+timeout 600 git fetch -q origin main || {{ echo "RETRYABLE_INFRA_FAILURE git fetch main failed" >&2; exit 1; }}
 git checkout -q {base_q} -- runtime/examples/qwen3_gguf_bench.cpp \
-  runtime/examples/qwen3_gguf_cb_bench.cpp runtime/examples/qwen_checkpoint.h \
+  runtime/examples/qwen3_gguf_cb_bench.cpp runtime/examples/qwen3_gguf_score.cpp runtime/examples/qwen_checkpoint.h \
   runtime/examples/qwen3_gguf_config.h bench/scripts 2>/dev/null || {{
   echo "HARNESS_PIN_FAILED -- could not take the harness from {base}" >&2
   exit 1
@@ -1558,6 +1565,12 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     print(f">> Qwen3.8-27B eval on box: PR ref={pr_ref}")
     r = _ssh_run_resilient(host, port, _remote_script(pr_ref, role="pr", onto=main.get("sha")), "PR run")
     if r.returncode != 0:
+        touched = arb.harness_touched_line(r.stdout, r.stderr)
+        if touched:
+            # The tip the box fetched edits the measuring harness (pushed after this round listed the
+            # PR's files): not measured, nothing posted; the next round's file check skips it.
+            return {"ok": False, "harness": True, "reason": touched,
+                    "pr_tip": _parse_remote(r.stdout or "").get("pr_tip")}
         conflict = arb.merge_conflict_line(r.stdout, r.stderr)
         if conflict:
             # Does not merge onto the main this round measured: a rebase, not a verdict.
@@ -1935,7 +1948,7 @@ def auto_merge_ok_qwen38(repo, num, require_merge_first=True):
     try:
         info = json.loads(arb.gh([
             "pr", "view", str(num), "-R", repo, "--json",
-            "state,isDraft,labels,author,mergeable,files,headRefOid",
+            "state,isDraft,labels,author,mergeable,files,changedFiles,headRefOid,baseRefName",
         ]).stdout or "{}")
     except json.JSONDecodeError:
         info = None
@@ -1970,6 +1983,16 @@ def auto_merge_ok_qwen38(repo, num, require_merge_first=True):
         return False, f"author {author} is blocked"
     if arb.author_penalty_until(author):
         return False, f"author {author} is under penalty"
+    if (info.get("baseRefName") or "main") != "main":
+        return False, f"based on {info.get('baseRefName')}, not main"
+    listed = info.get("files") or []
+    if (info.get("changedFiles") or 0) > len(listed):
+        return False, f"changes {info.get('changedFiles')} files, more than GitHub lists ({len(listed)})"
+    harness = [f["path"] for f in listed if any(f["path"].startswith(h) for h in HARNESS_PATHS)]
+    if harness:
+        # It could never have been measured with its own ruler (the box stops on HARNESS_TOUCHED);
+        # whatever verdict it carries, a harness change merges by hand.
+        return False, f"touches the eval harness: {', '.join(harness[:3])}"
     sens = [f["path"] for f in info.get("files", [])
             if any(f["path"].startswith(p) for p in arb.AUTOMERGE_SENSITIVE)]
     if sens:
@@ -2024,8 +2047,15 @@ def _unmeasurable_reason(repo, pr, labs, count_gave_up=True):
     while fresher PRs waited behind it."""
     if pr.get("isDraft"):
         return "draft"
+    if (pr.get("baseRefName") or "main") != "main":
+        return f"based on {pr.get('baseRefName')}, not main"
     if arb.HOLD_LABEL in labs:
         return "hold"
+    head = (pr.get("headRefOid") or "")[:40]
+    if arb.strike_count(STRIKES_FILE, pr["number"], head, "harness"):
+        return "edits the eval harness (found on the box)"
+    if pr.get("changedFiles") and pr["changedFiles"] > len(pr.get("files") or []):
+        return "changes more files than GitHub lists"
     if count_gave_up and arb.gave_up(STRIKES_FILE, pr["number"], (pr.get("headRefOid") or "")[:40]):
         return "the bot gave up on this commit after its own errors"
     skip = arb.model_skip_reason(pr.get("body") or "", "qwen38")
@@ -2043,10 +2073,10 @@ def _unmeasurable_reason(repo, pr, labs, count_gave_up=True):
 
 def reconcile_qwen38_merge_labels(repo, dry_run=False):
     scores = _load_scores()
-    open_prs = json.loads(arb.gh([
-        "pr", "list", "-R", repo, "--state", "open",
-        "--json", "number,labels,isDraft,body,files,mergeable,headRefOid", "--limit", str(arb.PR_LIST_LIMIT),
-    ]).stdout or "[]")
+    open_prs = arb.open_prs_or_none(repo, "number,labels,isDraft,body,files,mergeable,headRefOid,baseRefName")
+    if open_prs is None:
+        print(">> qwen38 round: GitHub did not return the open PRs — labels left as they are")
+        return
     open_labels = {p["number"]: {l["name"] for l in p["labels"]} for p in open_prs}
     open_by_num = {p["number"]: p for p in open_prs}
 
@@ -2244,12 +2274,22 @@ def _remeasure_against_new_main(repo, num, head, labs, main_now):
 
 
 def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
+    if not res.get("ok") and res.get("harness"):
+        print(f"PR #{num}: {res.get('reason')} — edits the eval harness, not evaluated")
+        if not dry_run:
+            # Remembered for this head: GitHub lists at most 100 files, so the selection's own check
+            # can miss the edit and the PR would be measured (and stopped) again every round.
+            arb.record_strike(STRIKES_FILE, num, commit, "harness")
+        return
     if not res.get("ok") and res.get("conflict"):
         # No verdict and no REJECT label: the PR does not merge onto the main this round measured,
         # which says nothing about its change. Same outcome as the pre-GPU merge-conflict check.
         print(f"PR #{num}: {res.get('reason')} — qwen38-needs-rebase, no verdict")
         if not dry_run:
             arb.add_label(repo, num, QWEN38_NEEDS_REBASE)
+            # Remembered for this head: GitHub may keep calling it mergeable, and the label would be
+            # dropped and the PR measured again every round (arb.strip_stale_verdict_labels).
+            arb.record_strike(STRIKES_FILE, num, commit, "conflict")
         return
     if not res.get("ok") and res.get("retry"):
         # The box's fault (_is_box_fault, an unmeasured guard, an exception): nothing is posted and
@@ -2314,8 +2354,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
     # staggered cron ran last. See arb.sync_generic_eval_label().
     arb.sync_generic_eval_label(repo, num)
     arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
-    if res.get("ok"):
-        upload_qwen38_eval_log(repo, num, title, commit, res)
+    # Scores first: a run that dies in the (network) log upload must not leave a posted verdict the
+    # bot can neither merge nor re-measure.
     if res.get("ok") and res.get("delta_pct") is not None:
         scores = _load_scores()
         scores[str(num)] = {
@@ -2336,6 +2376,9 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
+    if res.get("ok"):
+        upload_qwen38_eval_log(repo, num, title, commit, res)
+    if res.get("ok") and res.get("delta_pct") is not None:
         # Auto-close on "none"/"REJECT" -- same policy as pr_dflash_bot.py. Re-enabled 2026-08-11
         # after an explicit, informed decision: the very first supervised run of this bot closed a
         # real external contributor's unrelated PR (#768) this exact same way, since
@@ -2427,16 +2470,22 @@ def main():
           f"{'ssh' if ssh_box_enabled() else f'vast.ai (instance {arb.current_instance(args.instance) or args.instance})'}")
     print(f">> AUTOMERGE={int(AUTO_MERGE)}")
 
+    ok, login = arb.acting_account_ok()
+    if not ok:
+        print(f"!! gh acts as {login}, not SPARKINFER_BOT_LOGIN={os.environ.get('SPARKINFER_BOT_LOGIN')} — nothing done")
+        sys.exit(3)
     if args.labels_only:
         reconcile_qwen38_merge_labels(args.repo, dry_run=args.dry_run)
         print("done — qwen38 labels only (no GPU).")
         return
 
-    prs = json.loads(arb.gh([
-        "pr", "list", "-R", args.repo, "--state", "open",
-        "--json", "number,title,labels,isDraft,headRefOid,headRefName,mergeable,author,body,files",
-        "--limit", str(arb.PR_LIST_LIMIT),
-    ]).stdout or "[]")
+    prs = arb.open_prs_or_none(args.repo, "number,title,labels,isDraft,headRefOid,headRefName,baseRefName,"
+                                          "mergeable,author,body,files,changedFiles")
+    if prs is None:
+        # Not an empty queue: GitHub did not answer (an expired token, an outage). Exit non-zero so the
+        # wrapper's failed-run banner shows a bot that has stopped seeing PRs.
+        print("!! GitHub did not return the open PRs — nothing done this run")
+        sys.exit(3)
     prs.sort(key=lambda p: p["number"])
 
     stale_closed = close_stale_qwen38_prs(args.repo, prs, dry_run=args.dry_run) if not only else set()
@@ -2453,11 +2502,17 @@ def main():
         # A tier measured on an older head no longer describes this PR: dropped for drafts and held
         # PRs too, which the checks below skip before the selection's own drop further down.
         labs0, head0 = {l["name"] for l in pr.get("labels", [])}, (pr.get("headRefOid") or "")[:40]
+        removed = arb.strip_foreign_stale_labels(args.repo, num, labs0, head0, EVAL_PREFIX) if not args.dry_run else set()
+        if removed:
+            print(f"PR #{num} @ {head0[:9]}: dropped {', '.join(sorted(removed))} (no verdict on this head backs them)")
+            labs0 = labs0 - removed
+            pr["labels"] = [{"name": l} for l in sorted(labs0)]
         if (not args.dry_run and (pr.get("isDraft") or arb.HOLD_LABEL in labs0)
                 and any(l.startswith(EVAL_PREFIX) or l == QWEN38_NEEDS_REBASE for l in labs0)
                 and arb.strip_stale_verdict_labels(args.repo, num, labs0, EVAL_PREFIX, head0,
                                                    qwen38_evaluated_commits(args.repo, num), QWEN38_NEEDS_REBASE,
-                                                   arb.pr_merge_conflict(pr.get("mergeable")))):
+                                                   arb.pr_merge_conflict(pr.get("mergeable"))
+                or bool(arb.strike_count(STRIKES_FILE, num, (pr.get("headRefOid") or "")[:40], "conflict")))):
             print(f"PR #{num} @ {head0[:9]}: no qwen38 verdict for this head yet — dropped the old eval-qwen38 label")
         if pr.get("isDraft"):
             continue
@@ -2486,8 +2541,24 @@ def main():
         # An eval-qwen38 tier measured on an older head no longer describes this PR.
         if not args.dry_run and arb.strip_stale_verdict_labels(
                 args.repo, num, labs, EVAL_PREFIX, head, evaluated, QWEN38_NEEDS_REBASE,
-                arb.pr_merge_conflict(pr.get("mergeable"))):
+                arb.pr_merge_conflict(pr.get("mergeable"))
+                or bool(arb.strike_count(STRIKES_FILE, num, (pr.get("headRefOid") or "")[:40], "conflict"))):
             print(f"PR #{num} @ {short}: no qwen38 verdict for this head yet — dropped the old eval-qwen38 label")
+        if (pr.get("baseRefName") or "main") != "main":
+            # Measured merged onto main, it would be credited with its base branch's commits, and a
+            # merge would land in that branch, not main.
+            print(f"PR #{num}: based on {pr.get('baseRefName')}, not main — not evaluated")
+            continue
+        if not args.reeval and arb.strike_count(STRIKES_FILE, num, head, "harness"):
+            print(f"PR #{num} @ {short}: edits the eval harness (found on the box) — not evaluated until a push")
+            continue
+        if (pr.get("changedFiles") or 0) > len(pr.get("files") or []):
+            # More files than GitHub lists: the harness check cannot see them all.
+            print(f"PR #{num}: changes {pr.get('changedFiles')} files, more than GitHub lists — not evaluated")
+            continue
+        if not args.reeval and arb.strike_count(STRIKES_FILE, num, head, "conflict"):
+            print(f"PR #{num} @ {short}: does not merge onto main on the box — qwen38-needs-rebase until a push")
+            continue
         if not args.reeval and head and head in evaluated:
             if not _remeasure_against_new_main(args.repo, num, head, labs, main_now):
                 print(f"PR #{num} @ {short}: already qwen38-evaluated — skip")

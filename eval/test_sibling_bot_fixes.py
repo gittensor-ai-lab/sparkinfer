@@ -1191,5 +1191,258 @@ class Round6Tests(unittest.TestCase):
             self.assertIn(("rm", 10, first), calls)
 
 
+class Iteration3Tests(unittest.TestCase):
+    """Fixes from the post-merge review of 2026-09-26, on all three bots."""
+
+    def _bots(self):
+        return Round3Tests._bots(self)
+
+    def _run_main(self, mod, tag, prs_out, extra=(), argv=("--only-prs", "5")):
+        with mock.patch.object(mod.sys, "argv", [f"pr_{tag}_bot.py", *argv]), \
+                mock.patch.dict(_os.environ, {"SPARKINFER_BOT_LOGIN": ""}), \
+                mock.patch.object(arb, "gh", return_value=prs_out), \
+                mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
+                mock.patch.object(arb, "load_denylist", return_value=set()), \
+                mock.patch.object(arb, "pr_involved_logins", return_value=set()), \
+                mock.patch.object(mod, f"{tag}_evaluated_commits", return_value=set()), \
+                mock.patch.object(mod, "resolve_ssh", side_effect=RuntimeError("no box in tests")), \
+                mock.patch.object(mod, f"reconcile_{tag}_merge_labels"), \
+                mock.patch("builtins.print") as p:
+            ctx = [mock.patch.object(*x) for x in extra]
+            for c in ctx:
+                c.start()
+            try:
+                mod.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+            finally:
+                for c in ctx:
+                    c.stop()
+        return code, "\n".join(" ".join(str(x) for x in c.args) for c in p.call_args_list)
+
+    def test_a_failed_pr_list_or_a_wrong_account_is_loud(self):
+        for mod, tag, _r in self._bots():
+            with self.subTest(tag, case="list"):
+                code, out = self._run_main(mod, tag, run("", 1))
+                self.assertEqual(code, 3)
+                self.assertIn("GitHub did not return the open PRs", out)
+            with self.subTest(tag, case="account"):
+                code, out = self._run_main(mod, tag, run("[]"),
+                                           extra=((arb, "acting_account_ok", mock.Mock(return_value=(False, "someone"))),))
+                self.assertEqual(code, 3)
+                self.assertIn("gh acts as someone", out)
+
+    def test_a_pr_into_another_branch_is_not_evaluated(self):
+        pr = {"number": 5, "title": "t", "labels": [], "isDraft": False, "headRefOid": "a" * 40, "headRefName": "b",
+              "baseRefName": "feat/x", "mergeable": "MERGEABLE", "author": {"login": "dev"}, "body": TEMPLATE,
+              "files": [{"path": "kernels/x.cu"}]}
+        for mod, tag, _r in self._bots():
+            with self.subTest(tag):
+                code, out = self._run_main(mod, tag, run(json.dumps([pr])))
+                self.assertIn("based on feat/x, not main — not evaluated", out)
+                self.assertEqual(mod._unmeasurable_reason("o/r", pr, set()), "based on feat/x, not main")
+
+    def test_a_merge_conflict_the_box_found_stays_with_its_head(self):
+        for mod, tag, rebase in self._bots():
+            ev = {"museglimmer": "eval_museglimmer_on_box", "qwen38": "eval_qwen38_on_box",
+                  "bonsai": "eval_bonsai_on_box"}[tag]
+            res = {"ok": False, "retry": True, "conflict": True, "reason": "MERGE_CONFLICT a onto c"}
+            with self.subTest(tag), mock.patch.object(arb, "add_label"):
+                mod.apply_result("o/r", 5, "a" * 40, res)
+            self.addCleanup(arb.clear_strikes, mod.STRIKES_FILE, 5)
+            self.assertEqual(arb.strike_count(mod.STRIKES_FILE, 5, "a" * 40, "conflict"), 1)
+            pr = {"number": 5, "title": "t", "labels": [{"name": rebase}], "isDraft": False, "headRefOid": "a" * 40,
+                  "headRefName": "b", "baseRefName": "main", "mergeable": "MERGEABLE", "author": {"login": "dev"},
+                  "body": TEMPLATE, "files": [{"path": "kernels/x.cu"}]}
+            removed = []
+            with self.subTest(tag, case="selection"):
+                code, out = self._run_main(mod, tag, run(json.dumps([pr])),
+                                           extra=((arb, "remove_label", mock.Mock(side_effect=lambda r, n, l: removed.append(l))),))
+                self.assertIn("does not merge onto main on the box", out)
+                self.assertNotIn(rebase, removed)
+
+    def test_qwen38s_accuracy_tool_is_harness_on_every_bot(self):
+        import pr_bonsai_bot as bonsai
+        for mod in (qwen, muse, bonsai):
+            self.assertIn("runtime/examples/qwen3_gguf_score.cpp", mod.HARNESS_PATHS, mod.__name__)
+        s = qwen._remote_script("pull/1/head", role="pr", onto=MAIN)
+        pin = s[s.index("git checkout -q " + MAIN + " -- "):s.index("HARNESS_PINNED")]
+        self.assertIn("runtime/examples/qwen3_gguf_score.cpp", pin)
+
+    def test_the_score_is_saved_before_the_slow_log_upload(self):
+        for mod, *_ in BOTS:
+            tag = "museglimmer" if mod is muse else "qwen38"
+            order = []
+            res = {"ok": True, "label": "XL", "delta_pct": 25.0, "pass": True, "accuracy_ok": True, "onto": MAIN}
+            with self.subTest(mod.__name__), mock.patch.object(arb, "gh", return_value=run()), \
+                    mock.patch.object(arb, "add_label"), mock.patch.object(arb, "remove_label"), \
+                    mock.patch.object(arb, "sync_generic_eval_label"), mock.patch.object(mod, f"strip_{tag}_eval_labels"), \
+                    mock.patch.object(mod, f"upload_{tag}_eval_log", side_effect=lambda *a: order.append("upload")), \
+                    mock.patch.object(mod, "format_comment", return_value="c"), \
+                    mock.patch.object(mod, "_load_scores", return_value={}), \
+                    mock.patch.object(mod, "_save_scores", side_effect=lambda d: order.append("scores")):
+                mod.apply_result("o/r", 3, "a" * 40, res)
+            self.assertEqual(order, ["scores", "upload"])
+
+
+class Iteration3bTests(unittest.TestCase):
+    def _bots(self):
+        return Round3Tests._bots(self)
+
+    def test_a_harness_edit_at_the_fetched_tip_posts_nothing(self):
+        err = "HARNESS_TOUCHED bench/scripts/_eval_speed.sh "
+        for mod, tag, _r in self._bots():
+            ev = {"museglimmer": "eval_museglimmer_on_box", "qwen38": "eval_qwen38_on_box",
+                  "bonsai": "eval_bonsai_on_box"}[tag]
+            calls = []
+            with self.subTest(tag), mock.patch.object(mod, "_ssh_run_resilient", return_value=run("", 1, err)):
+                res = getattr(mod, ev)("h", 1, "pull/1/head", {"sha": MAIN})
+            self.assertTrue(res.get("harness"), res)
+            with mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run()), \
+                    mock.patch.object(arb, "add_label", side_effect=lambda *a: calls.append(a)):
+                mod.apply_result("o/r", 1, "a" * 40, res)
+            self.assertEqual(calls, [])
+            self.assertIn(f"git checkout -qf {MAIN}", mod._remote_script("pull/1/head", role="pr", onto=MAIN))
+            self.assertIn("HARNESS_TOUCHED", mod._remote_script("pull/1/head", role="pr", onto=MAIN))
+
+    def test_no_merge_gate_merges_a_harness_edit_or_files_it_cannot_see(self):
+        import pr_bonsai_bot as bonsai
+        for mod, okfn, prefix, first in ((muse, "auto_merge_ok_museglimmer", "eval-museglimmer:", muse.MUSEGLIMMER_MERGE_FIRST),
+                                          (qwen, "auto_merge_ok_qwen38", "eval-qwen38:", qwen.QWEN38_MERGE_FIRST),
+                                          (bonsai, "auto_merge_ok_bonsai", "eval-bonsai:", bonsai.BONSAI_MERGE_FIRST)):
+            base = {"state": "OPEN", "isDraft": False, "labels": [{"name": prefix + "XL"}, {"name": first}],
+                    "author": {"login": "dev"}, "mergeable": "MERGEABLE", "headRefOid": "a" * 40,
+                    "files": [{"path": "kernels/x.cu"}], "changedFiles": 1}
+            for over, why in (({"files": [{"path": "runtime/examples/qwen3_gguf_bench.cpp"}]}, "eval harness"),
+                              ({"changedFiles": 250}, "more than GitHub lists")):
+                with self.subTest(mod.__name__, why=why), \
+                        mock.patch.object(arb, "gh", return_value=run(json.dumps(dict(base, **over)))), \
+                        mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
+                        mock.patch.object(arb, "load_denylist", return_value=set()), \
+                        mock.patch.object(arb, "author_penalty_until", return_value=None), \
+                        mock.patch.object(mod, "_load_scores",
+                                          return_value={"1": {"commit": "a" * 40, "label": "XL", "pass": True, "onto": MAIN}}):
+                    ok, reason = getattr(mod, okfn)("o/r", 1)
+                    self.assertFalse(ok)
+                    self.assertIn(why, reason)
+
+    def test_git_failing_on_the_box_is_the_boxs_on_every_bot(self):
+        import pr_bonsai_bot as bonsai
+        err = "RETRYABLE_INFRA_FAILURE git reset failed"
+        self.assertTrue(muse._is_box_fault("", err))
+        self.assertTrue(qwen._is_box_fault("", err))
+        self.assertTrue(bonsai._is_infra_failure("", err))
+
+    def test_muse_a_concurrent_width_only_the_pr_failed_is_a_two_round_reject(self):
+        main = WiringTests._main(self)
+        with mock.patch.object(muse, "POLARIS_ENABLED", False), \
+                mock.patch.object(muse, "_ssh_run_resilient",
+                                  return_value=run(muse_stdout(drop=("MUSECB ",)) + "MUSECB_FAILED 32 rc=139\n")):
+            res = muse.eval_museglimmer_on_box("h", 1, "pull/1/head", main)
+        self.assertEqual((res["ok"], res["label"], res["strike_key"]), (True, "REJECT", "cb"))
+        calls = []
+        with mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run()), \
+                mock.patch.object(arb, "add_label", side_effect=lambda *a: calls.append(a)):
+            muse.apply_result("o/r", 6, "a" * 40, res)                   # round 1: nothing posted
+        self.assertEqual(calls, [])
+        self.addCleanup(arb.clear_strikes, muse.STRIKES_FILE, 6)
+        # An OOM-killed width is the box's.
+        with mock.patch.object(muse, "POLARIS_ENABLED", False), \
+                mock.patch.object(muse, "_ssh_run_resilient",
+                                  return_value=run(muse_stdout(drop=("MUSECB 32",)) + "MUSECB_FAILED 32 rc=137\n")):
+            res = muse.eval_museglimmer_on_box("h", 1, "pull/1/head", main)
+        self.assertTrue(res["retry"], res)
+
+    def test_muses_baseline_needs_prefill_too(self):
+        zero = muse_stdout().replace("MUSE 512 100.0 5000.0", "MUSE 512 100.0 0")
+        with mock.patch.object(muse, "_ssh_run_resilient", return_value=run(zero)):
+            m = muse.measure_main_baseline("h", 1)
+        self.assertFalse(m["ok"])
+
+
+class Iteration3cTests(unittest.TestCase):
+    """Fixes from the pre-merge review of iteration 3."""
+
+    def _bots(self):
+        return Round3Tests._bots(self)
+
+    def _pr(self, **over):
+        pr = {"number": 5, "title": "t", "labels": [], "isDraft": False, "headRefOid": "a" * 40, "headRefName": "b",
+              "baseRefName": "main", "mergeable": "MERGEABLE", "author": {"login": "dev"}, "body": TEMPLATE,
+              "files": [{"path": "kernels/x.cu"}], "changedFiles": 1}
+        pr.update(over)
+        return pr
+
+    def test_a_harness_edit_found_on_the_box_is_remembered_for_its_head(self):
+        for mod, tag, _r in self._bots():
+            res = {"ok": False, "harness": True, "reason": "HARNESS_TOUCHED eval/x.py", "pr_tip": "a" * 40}
+            with self.subTest(tag), mock.patch.object(arb, "gh", return_value=run()):
+                mod.apply_result("o/r", 5, "a" * 40, res)
+            self.addCleanup(arb.clear_strikes, mod.STRIKES_FILE, 5)
+            code, out = Iteration3Tests._run_main(self, mod, tag, run(json.dumps([self._pr()])))
+            self.assertIn("edits the eval harness (found on the box)", out)
+            self.assertEqual(mod._unmeasurable_reason("o/r", self._pr(), set()), "edits the eval harness (found on the box)")
+            arb.clear_strikes(mod.STRIKES_FILE, 5)
+            code, out = Iteration3Tests._run_main(self, mod, tag, run(json.dumps([self._pr(changedFiles=250)])))
+            self.assertIn("more than GitHub lists", out)
+
+    def test_a_held_pr_stays_held_after_other_bots_labels_are_dropped(self):
+        for mod, tag, _r in self._bots():
+            pr = self._pr(labels=[{"name": "hold"}, {"name": "eval-dspark:XL"}])
+            with self.subTest(tag):
+                code, out = Iteration3Tests._run_main(
+                    self, mod, tag, run(json.dumps([pr])),
+                    extra=((arb, "strip_foreign_stale_labels", mock.Mock(return_value={"eval-dspark:XL"})),
+                           (arb, "labels_on", mock.Mock(return_value=set()))),       # a failed re-read
+                    argv=("--only-prs", "5"))
+                self.assertIn("hold", out)
+                self.assertNotIn("greenlit", out)
+
+    def test_labels_only_checks_the_account_first(self):
+        for mod, tag, _r in self._bots():
+            with self.subTest(tag), mock.patch.dict(_os.environ, {"SPARKINFER_BOT_LOGIN": "bot"}), \
+                    mock.patch.object(mod.sys, "argv", [f"pr_{tag}_bot.py", "--labels-only"]), \
+                    mock.patch.object(arb, "acting_account_ok", return_value=(False, "someone")), \
+                    mock.patch.object(mod, f"reconcile_{tag}_merge_labels") as recon, \
+                    mock.patch("builtins.print"):
+                with self.assertRaises(SystemExit) as e:
+                    mod.main()
+                self.assertEqual(e.exception.code, 3)
+                recon.assert_not_called()
+
+    def test_no_merge_gate_merges_into_another_branch(self):
+        import pr_bonsai_bot as bonsai
+        for mod, okfn, prefix, first in ((muse, "auto_merge_ok_museglimmer", "eval-museglimmer:", muse.MUSEGLIMMER_MERGE_FIRST),
+                                          (qwen, "auto_merge_ok_qwen38", "eval-qwen38:", qwen.QWEN38_MERGE_FIRST),
+                                          (bonsai, "auto_merge_ok_bonsai", "eval-bonsai:", bonsai.BONSAI_MERGE_FIRST)):
+            info = {"state": "OPEN", "isDraft": False, "labels": [{"name": prefix + "XL"}, {"name": first}],
+                    "author": {"login": "dev"}, "mergeable": "MERGEABLE", "headRefOid": "a" * 40,
+                    "files": [{"path": "kernels/x.cu"}], "changedFiles": 1, "baseRefName": "feat/x"}
+            with self.subTest(mod.__name__), mock.patch.object(arb, "gh", return_value=run(json.dumps(info))), \
+                    mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
+                    mock.patch.object(arb, "load_denylist", return_value=set()), \
+                    mock.patch.object(arb, "author_penalty_until", return_value=None), \
+                    mock.patch.object(mod, "_load_scores",
+                                      return_value={"1": {"commit": "a" * 40, "label": "XL", "pass": True, "onto": MAIN}}):
+                ok, why = getattr(mod, okfn)("o/r", 1)
+            self.assertFalse(ok)
+            self.assertIn("not main", why)
+
+    def test_a_pr_no_bot_will_measure_is_not_waiting_on_one(self):
+        with mock.patch.object(arb, "greenlight_status", return_value=("ok", "x")):
+            for over in ({"baseRefName": "feat/x"}, {"changedFiles": 250}):
+                with self.subTest(over):
+                    self.assertFalse(arb.waiting_for_first_verdict("o/r", self._pr(**over), set()))
+                    with mock.patch.object(arb, "gh", return_value=run(json.dumps({"comments": []}))):
+                        self.assertFalse(arb.awaiting_any_model_verdict("o/r", self._pr(**over)))
+            self.assertTrue(arb.waiting_for_first_verdict("o/r", self._pr(), set()))
+
+    def test_only_unmerged_paths_make_a_conflict(self):
+        s = arb.merged_checkout_script("pull/1/head", MAIN)
+        self.assertIn("git ls-files -u", s)
+        self.assertIn("RETRYABLE_INFRA_FAILURE git merge failed without a conflict", s)
+
+
 if __name__ == "__main__":
     unittest.main()
