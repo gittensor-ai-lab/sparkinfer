@@ -176,6 +176,73 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 `gh` authenticated and `VAST_INSTANCE` / `VAST_DEFAULT_INSTANCE` in `.env.eval`
 (`VAST_NO_AUTO_PROVISION=1`).
 
+## Rules the model bots on cron share
+
+`pr_museglimmer_bot.py` (`:00`), `pr_bonsai_bot.py` (`:15`) and `pr_qwen38_bot.py` (`:30`) apply
+these the same way (2026-09-26). Each bot's module docstring has the details.
+
+- **What is measured.** A PR's tip merged, on the box, onto the exact `main` commit the round's
+  baseline measured (`arb.merged_checkout_script`). A PR that does not merge cleanly gets
+  `<bot>-needs-rebase` and no verdict. The Muse bot used to measure the branch tip itself, so a
+  branch behind `main` was charged with every speedup merged since it branched.
+- **What a verdict is for.** The PR tip the box built, measured against one `main` commit. When the
+  head moves, the bot's `eval-<model>:<tier>` from the older head is removed and the generic
+  `eval:*` re-derived (dropped when no other bot's tier is left). A bot merges only the commit it
+  scored, and only while `main` is still the commit it was measured against: once any bot merges
+  something else, a merge candidate nothing else stops is measured again before it can merge. It
+  keeps its place in the ranking until then -- behind any PR that can merge now, and only while the
+  bot's selection would actually re-measure it -- and while it waits, nobody is sent to rebase.
+- **Closing.** A REJECT closes the PR. A `none` closes it only when the PR declares that bot's model
+  and no other, and no other bot has scored it a speedup or made it merge-first
+  (`arb.none_may_close`; its own merge-first does not count). Before, the Muse and Qwen3.8 bots
+  closed on every `none`, including PRs ticked "Shared" or aimed at another model. A run that
+  failed never closes, and Ternary-Bonsai's two-round checks close only on their second round. No
+  bot closes a PR whose head moved after the commit it measured. The close comment asks for a new
+  commit: reopening alone does not re-run a commit that already has its verdict.
+- **Stale close.** Only PRs routed to that bot's model, never one carrying any bot's merge-first,
+  and never a greenlit PR still waiting for that bot's first verdict on its head: that wait is the
+  bot's, not the author's -- as is a verified speedup the bot owes a re-measure onto a new `main`.
+  A PR that conflicts with `main` (GitHub's word, or that bot's own `*-needs-rebase`, which it drops
+  once the head moves) or edits the harness is waiting on its author; so is not a PR whose head the
+  bot gave up on after its own errors. A GitHub
+  read that fails is "unknown" and never closes, strips or re-measures anything. The daily
+  `close-stale-prs` Action (no GitHub activity for 2 days) spares any bot's merge-first and any
+  greenlit PR no model bot has posted a verdict for yet, unless GitHub says it conflicts or it edits
+  paths no bot measures (`arb.NEVER_MEASURED_PATHS`).
+- **Failures.** A run that fails on the PR's side is posted once for that commit. A fault on the box
+  is retried next round with nothing posted; one that recurs at the same commit for three rounds
+  while `main`'s run passes (`arb.BOX_FAULT_STRIKES`) is then charged to the PR, which is never
+  retried for ever; several checks lost in one round count once, and an OOM kill counts as the box's
+  on every bot (the whole run, a sweep, a step or a guard); a guard that `main` measured nothing
+  for, or only zeros, skips the round. A failure of the bot itself (an exception) is
+  never charged: after three rounds at one commit the bot stops measuring that commit and waits for
+  a push, and every run that gives up on a PR exits 3, as does a round skipped because `main`'s
+  baseline is unusable, so the wrapper's failed-run banner shows both. Beside such a fault, only a gate a
+  busy box cannot fake (accuracy, Ternary-Bonsai's prefill path and `bonsai_regression.py` checks)
+  is posted; a throughput REJECT waits for a clean run.
+  Each round first stops any remote script an earlier round left running, its whole ssh session
+  (`arb.round_guard_sh`); such orphans held the GPU and failed later baselines. So a round started
+  by hand takes the same lock as cron's rounds first (`arb.hold_bot_lock`). The Muse bot skips a
+  round whose `main` misses its own accuracy gate against llama.cpp, and a llama.cpp reference
+  server that never becomes healthy is infra.
+- **Cron wrappers** (`eval/cron_common.sh`, tested by `eval/test_cron_wrappers.py`). The bots run
+  from `~/.sparkinfer_bot_tree`, a worktree the wrappers make and mark as their own, reset to
+  `origin/main` every tick and made again when it breaks; never from whatever the working copy has
+  checked out. The wrapper script itself is the working copy's (cron starts it there), so keep that
+  checkout on `main` and develop in another worktree; a tick says so when it is not. A tree path
+  that is not the wrappers' own is refused, never reset or removed. A tick with an empty
+  `GH_TOKEN` is refused, since `gh` would otherwise act as the machine's active account; with
+  `SPARKINFER_BOT_LOGIN` set in `.env.eval`, a token GitHub says belongs to any other account is
+  refused too (the sync reads `.env.eval` as well; a lookup GitHub does not answer lets the tick
+  run). A bot's tick waits up to 300 s for the shared lock, the sync not at
+  all; the git and ssh steps before a run are time-limited, and a bot run is stopped after 8 hours
+  (the sync after 3 minutes). Refused ticks, a bot's lock skips, failed runs and GPU-down ticks
+  print a banner when they repeat. The wait and timeout settings come from the crontab's
+  environment, not `.env.eval`; `SPARKINFER_LOCK_FILE` is for the tests only (every bot and every
+  other wrapper lock `/tmp/sparkinfer_bot.lock`). The other wrappers (`run_dspark_cron.sh`,
+  `run_dflash_cron.sh`, `run_modelopt_cron.sh`, `run_bot_cron.sh`, `run_bonsai_cron.sh`,
+  `run_stale_pr_cron.sh`) do none of this yet: they `git pull` and run the working copy.
+
 ## Qwen3.8-27B PR auto-evaluation bots
 
 > **On cron since 2026-09-15:** `pr_qwen38_bot.py` hourly at `:30` (`eval/run_qwen38_cron.sh`),
@@ -192,8 +259,8 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 Scores **same-box PR vs `origin/main`** on the upstream **`unsloth/Qwen3.8-27B-NVFP4`** checkpoint
 (a compressed-tensors directory: NVFP4 FFN, FP8 attention and Gated-DeltaNet projections). It
 applies `eval-qwen38:{XL,L,M,S,XS,none,REJECT}`, derives the generic `eval:*` tier, picks
-`qwen38-merge-first`, and auto-merges that PR when `SPARKINFER_QWEN38_AUTOMERGE=1`. A `none` or
-`REJECT` closes the PR.
+`qwen38-merge-first`, and auto-merges that PR when `SPARKINFER_QWEN38_AUTOMERGE=1`. A `REJECT`
+closes the PR; a `none` closes it only as the shared rules above allow.
 
 1. **Speed.** The tier is the best measured delta among:
    - `prefill@16k`;
@@ -293,7 +360,8 @@ prefill and decode at **256k**, and concurrent decode at c2–c32, all on the Mo
 (`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`). Every measured axis is also a no-regression
 floor; decode is lossless against same-process AR and acceptance cannot regress materially. The
 Qwen3.6 / Qwen3.8 shared-path guards remain mandatory. To resume it, put
-`eval/run_dspark_cron.sh` back on `:30` and move `run_qwen38_cron.sh` off that slot first.
+`eval/run_dspark_cron.sh` back on `:30` and move `run_qwen38_cron.sh` off that slot first. Its
+wrapper predates `eval/cron_common.sh` (see "Cron wrappers" above): move it onto that first.
 
 `pr_modelopt_bot.py` and `pr_dflash_bot.py` are kept for reference and run by hand only.
 
@@ -312,11 +380,11 @@ Scores **same-box PR vs `origin/main`** on `prism-ml/Ternary-Bonsai-2-27B-gguf`
 `bonsai-merge-first` — only among PRs auto-merge would actually accept, so a refused PR cannot hold
 it — and auto-merges it when `SPARKINFER_BONSAI_AUTOMERGE=1`, at the exact commit it scored.
 
-**Closing** (2026-09-26, as the sibling bots do; `SPARKINFER_BONSAI_AUTOCLOSE=0` turns it off): a
-measured REJECT closes the PR; a measured `none` closes it only when the PR declares
-Ternary-Bonsai-2-27B and nothing else, because this bot also evaluates every undeclared PR, most of
-which are aimed at another model; a PR routed to this model with no commits for a day
-(`BONSAI_STALE_DAYS`) closes as stale. A run that failed never closes. Each bot's stale close now
+**Closing** (the shared rules above; `SPARKINFER_BONSAI_AUTOCLOSE=0` turns it off): a measured
+REJECT closes the PR; a measured `none` closes it only when the PR declares Ternary-Bonsai-2-27B
+and nothing else, because this bot also evaluates every undeclared PR, most of which are aimed at
+another model; a PR routed to this model with no commits for a day (`BONSAI_STALE_DAYS`) closes as
+stale. A run that failed never closes. Each bot's stale close now
 touches only PRs routed to its own model and never one carrying any bot's merge-first label
 (`arb.stale_close_skip_reason`) — before, the Qwen3.8 bot closed #1157, a Bonsai PR.
 
@@ -338,28 +406,35 @@ touches only PRs routed to its own model and never one carrying any bot's merge-
    - *Prefill path:* `qwen3_gguf_score` never enters batched prefill. `qwen3_gguf_prefill_check`
      compares batched prefill with the token loop at prefix 128 (inside the fused quantized-B
      GEMM's M ≤ 512 window) and 1024 (outside it), 64 teacher-forced positions, three runs a side
-     (a crashed run is retried up to three times; a timeout is not).
-     The PR's mean must stay within `max(3× main's KL, main + 0.05)` and 0.10 of main's top-1.
+     (a crashed run is retried up to three times; a timeout is not; a run that prints NaN counts
+     as failed). The PR's mean must stay within `max(3× main's KL, main + 0.05)` and 0.10 of
+     main's top-1.
    - *`eval/bonsai_regression.py`* (tensors, score, generate, serve) on the PR build. It is
      absolute, so each check rejects only when `main` passes that same check in the round; a check
      main also fails is reported, and the others still gate; the serve check is gated per path
      (folded, native). The serve check fails only on 2 of up to 3 trials — a build equal to `main`
      failed a single trial in 2 of 8 runs on the eval box — and a trial whose two alone-baselines
      disagree is inconclusive, never a failure; a request that errors, or a server that exits, is a
-     failure. A regression run killed part-way without naming a check (its time limit, the OOM
-     killer) is judged over two rounds on the same commit, like a width only the PR fails.
+     failure. A failure of the serve check alone, and a regression run killed part-way without
+     naming a check (its time limit, the OOM killer), are judged over two rounds on the same
+     commit, like a width only the PR fails.
 
 3. **No-regression guards @ 32k, decode + prefill:** Qwen3.6-35B-A3B, the ModelOpt and unsloth
    Qwen3.8-27B checkpoints, and Muse Glimmer. The Muse and Qwen3.8 bots skip PRs declared for
    Ternary-Bonsai-2-27B alone, so these guards are the only check such PRs get against those models.
    In the other direction, both of those bots guard Ternary-Bonsai-2-27B at 128 and 32k. A guard
    that measures nothing on `main` skips the round (all three bots), rather than measuring every PR
-   only to defer it; an absent checkpoint is skipped and reported.
+   only to defer it; an absent checkpoint is skipped and reported. A guard only the PR build failed
+   to measure is judged over two rounds on the same commit; one the GPU never drained for, or the
+   OOM killer stopped, is a box fault (below).
 
 **Failures.** A fault on the box — GPU not drained, a failed fetch, a missing model, an SSH drop,
 an OOM kill, a compiler killed for memory or a full disk (rebuilt once at `-j4` first) — is retried
-next round with nothing posted; a compiler fault that recurs at one commit for three rounds is then
-charged to the PR. A PR that fails to build or crashes gets `eval-bonsai:REJECT` once for that
+next round with nothing posted; any such fault of the PR's run — a compiler fault, an OOM kill of
+the speed sweep, the score step or a guard, a GPU that never drained, a run that died with no
+diagnostic — that recurs at one commit for three rounds is then charged to the PR. Unless the run
+already failed a gate a busy box cannot fake (accuracy, the prefill path, a `bonsai_regression.py`
+check): then that REJECT is posted, naming what did not run. A PR that fails to build or crashes gets `eval-bonsai:REJECT` once for that
 commit; the verdict shows the compiler's own error lines, not the end of the log. A run killed at
 the two-hour ssh limit is a hang (main completed the same run that round): posted once, not
 retried every hour (`arb.exception_result`, all three bots).
@@ -443,7 +518,7 @@ eval/setup_labels.sh                                  # creates eval-dflash:* + 
 
 **Schedule every hour, on the hour** (shares `/tmp/sparkinfer_bot.lock` with the AR bot):
 ```bash
-crontab -l 2>/dev/null; echo "0 * * * * $PWD/eval/run_dflash_cron.sh >> /tmp/sparkinfer_dflash_bot.log 2>&1" | crontab -
+(crontab -l 2>/dev/null; echo "0 * * * * $PWD/eval/run_dflash_cron.sh >> /tmp/sparkinfer_dflash_bot.log 2>&1") | crontab -
 ```
 Pinned GPU only; never rents. If the pin is down → `--labels-only` reconcile.
 
@@ -459,7 +534,7 @@ alongside it — it syncs **any recently merged PR** that has dashboard eval dat
 frontier/journey and reconciles round labels (never evaluates, never merges), sharing the eval lock
 so the two never overlap:
 ```bash
-crontab -l 2>/dev/null; echo "*/15 * * * * $PWD/eval/run_sync_cron.sh >> /tmp/sparkinfer_sync.log 2>&1" | crontab -
+(crontab -l 2>/dev/null; echo "*/15 * * * * GH_TOKEN=\"\$(gh auth token -u <bot account>)\" $PWD/eval/run_sync_cron.sh >> /tmp/sparkinfer_sync.log 2>&1") | crontab -
 ```
 
 (For a Claude-agent flavor instead of system cron — e.g. to add LLM anti-gaming triage of the diff

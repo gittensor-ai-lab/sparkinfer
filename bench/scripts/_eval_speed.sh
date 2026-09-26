@@ -34,7 +34,7 @@ bench_sweep_run() {
     ctxs+=("$ctx")
     [ "$reps" -gt "$max_reps" ] && max_reps="$reps"
   done
-  [ ${#ctxs[@]} -eq 0 ] && { _BENCH_SWEEP_JSON=""; return 1; }
+  [ ${#ctxs[@]} -eq 0 ] && { _BENCH_SWEEP_JSON=""; _BENCH_SWEEP_RC=1; return 1; }
   local csv
   csv="$(printf '%s\n' "${ctxs[@]}" | sort -nu | paste -sd,)"
   local out rc=0
@@ -42,6 +42,7 @@ bench_sweep_run() {
   export SPARKINFER_BENCH_SWEEP_REPS="$max_reps"
   out="$(si_run qwen3_gguf_bench "$gguf" "$n_tokens" sweep 2>&1)" || rc=$?
   _BENCH_SWEEP_ERR="${out##*$'\n'}"
+  _BENCH_SWEEP_RC="$rc"   # for callers telling a killed process (137) from a failed run
   _BENCH_SWEEP_JSON="$(printf '%s\n' "$out" | sed -n 's/^SWEEP_JSON //p' | tail -1)"
   if [ "$rc" != 0 ] || [ -z "$_BENCH_SWEEP_JSON" ]; then
     echo ">> WARN: bench sweep failed (rc=$rc): ${_BENCH_SWEEP_ERR}" >&2

@@ -33,6 +33,49 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     Ternary-Bonsai PR;
   - the Muse bot no longer evaluates a PR that edits its own measuring harness;
   - a verdict marker pasted by someone without write access no longer counts.
+- **The eval bots measure, merge and close on the same terms** (Muse Glimmer, Ternary-Bonsai,
+  Qwen3.8):
+  - the Muse bot measures a PR merged onto the round's `main` commit, as the other two do, instead
+    of its branch tip, which charged a branch behind `main` with every speedup merged since;
+  - a `none` closes a PR only when it declares that bot's model alone and no other bot scored it a
+    speedup or made it merge-first; the Muse and Qwen3.8 bots closed every `none`, including PRs
+    ticked "Shared";
+  - no bot closes a PR whose head moved after the commit it measured, or a greenlit PR still
+    waiting for its first verdict as stale;
+  - a bot merges only while `main` is the commit its verdict was measured against, and measures a
+    merge candidate again once another bot has merged; until then it keeps its place, behind any
+    PR that can merge now, and only if the bot will re-measure it; a tier from an older head is
+    removed when the head moves, drafts and held PRs included;
+  - a remote script left running by an earlier round is stopped before the next one starts;
+  - the Qwen3.8 bot no longer rejects a PR whose optional 256k sweep failed, and stops as infra when
+    the GPU never frees instead of loading into it; the Muse bot skips a round whose `main` misses
+    its own accuracy gate;
+  - Ternary-Bonsai: a serve-check failure alone, or a guard only the PR build could not measure, is
+    judged over two rounds; an OOM kill of the speed sweep or a guard is infra; a NaN in the
+    prefill check counts as a failed run;
+  - a box fault that recurs at one commit for three rounds is charged to the PR instead of being
+    retried every hour for ever (several checks lost in one round count once); only a gate a busy
+    box cannot fake (accuracy, the prefill path, `bonsai_regression.py`) is posted beside one,
+    never a throughput REJECT;
+  - a GitHub read that fails is "unknown", not an empty PR: it no longer closes a PR for an
+    unticked box, stale-closes a queued one, strips its labels, or lets a `none` close it;
+  - a failure of the bot itself is never charged to a PR, and stops being retried after three
+    rounds at one commit (loudly: the run exits 3, as it does when `main`'s baseline is unusable);
+    an OOM kill is the box's on every bot, a sweep or guard included; a stale `needs-rebase` from an
+    older head no longer makes a rebased PR look abandoned; the scores and strikes files are
+    written atomically;
+  - a failed network fetch on the Qwen3.8 box, and a llama.cpp reference server dying during the
+    Muse accuracy compare, are infra rather than a REJECT; each eval-log entry names the `main`
+    commit the PR was merged onto;
+  - the round guard stops an earlier round's whole ssh session, stages `timeout` had moved into
+    their own process group included, and a round started by hand takes cron's lock first;
+  - the daily stale-close Action no longer closes a model bot's merge-first winner or a greenlit PR
+    still waiting for its first verdict;
+  - the cron wrappers run the bots from their own `origin/main` worktree (made again if it breaks,
+    and never one they did not make), refuse to run without a `GH_TOKEN` (or, with
+    `SPARKINFER_BOT_LOGIN` set, with another account's), time-limit the steps before a run and the
+    run itself, and print a banner when ticks keep being refused, skipped on the lock, failing or
+    without a GPU.
 - The PR template has a **Ternary-Bonsai-2-27B** target box. The Muse Glimmer and Qwen3.8 bots skip
   a PR declared for it alone, instead of scoring it `none` and closing it, and both now guard it at
   128 and 32k.

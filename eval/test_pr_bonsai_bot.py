@@ -1,4 +1,6 @@
+import os
 import types
+import json
 import unittest
 from unittest import mock
 
@@ -6,6 +8,20 @@ import pr_bonsai_bot as bot
 import pr_eval_bot as arb
 import pr_museglimmer_bot as muse_bot
 import pr_qwen38_bot as qwen38_bot
+
+# Nothing here may touch the controller's own state: every file the bots write goes to a temp dir.
+import atexit as _atexit
+import os as _os
+import shutil as _shutil
+import tempfile as _tempfile
+_STATE = _tempfile.mkdtemp(prefix="sparkinfer-bot-tests-")
+_atexit.register(_shutil.rmtree, _STATE, True)
+for _mod, _names in ((arb, ("INSTANCE_FILE", "PIN_FILE", "BOT_LOCK_FILE")),
+                     (bot, ("STRIKES_FILE", "SCORES_FILE")),
+                     (muse_bot, ("STRIKES_FILE", "SCORES_FILE")), (qwen38_bot, ("STRIKES_FILE", "SCORES_FILE"))):
+    for _n in _names:
+        setattr(_mod, _n, _os.path.join(_STATE, f"{_mod.__name__}.{_n}"))
+arb.PINNED_INSTANCE = ""
 
 MAIN_BONSAI = {128: (99.2, 2028.6), 512: (98.9, 5200.0), 4096: (96.9, 8432.7),
                16384: (93.0, 7600.0), 32768: (89.0, 6500.0)}
@@ -82,12 +98,15 @@ class AutoMergeGateTests(unittest.TestCase):
                {"name": "bonsai-merge-first"}], "author": {"login": "dev"}, "mergeable": "MERGEABLE",
                "files": [{"path": "kernels/foo.cu"}], "headRefOid": "a" * 40}
 
-    def _ok(self, info=None, scores=None):
+    MAIN = "c" * 40
+
+    def _ok(self, info=None, scores=None, main_now=MAIN):
         info = info or self.OK_INFO
         scores = self.OK_INFO if scores is None else scores
         s = scores if isinstance(scores, dict) and "1139" in scores else {
-            "1139": {"commit": "a" * 40, "label": "XL", "pass": True}}
+            "1139": {"commit": "a" * 40, "label": "XL", "pass": True, "onto": self.MAIN}}
         with mock.patch.object(bot.arb, "gh", return_value=run(__import__("json").dumps(info))), \
+                mock.patch.object(bot.arb, "current_main_sha", return_value=main_now), \
                 mock.patch.object(bot.arb, "load_denylist", return_value=set()), \
                 mock.patch.object(bot.arb, "author_penalty_until", return_value=None), \
                 mock.patch.object(bot.arb, "AUTOMERGE_SENSITIVE", ("server/",)), \
@@ -109,6 +128,14 @@ class AutoMergeGateTests(unittest.TestCase):
         ok, why = self._ok(scores={"1139": {"commit": "a" * 40, "label": "none", "pass": False}})
         self.assertFalse(ok)
         self.assertIn("recorded verdict", why)
+
+    def test_a_verdict_against_an_older_main_is_not_merged(self):
+        # Another bot merged since the verdict: the merge would ship a combination nobody measured.
+        ok, why = self._ok(main_now="9" * 40)
+        self.assertFalse(ok)
+        self.assertIn("re-measured before it may merge", why)
+        self.assertFalse(self._ok(scores={"1139": {"commit": "a" * 40, "label": "XL", "pass": True}})[0])
+        self.assertEqual(self._ok(main_now=""), (False, bot.arb.PR_UNREADABLE))
 
     def test_a_reject_from_another_bot_blocks_merge(self):
         info = dict(self.OK_INFO, labels=self.OK_INFO["labels"] + [{"name": "eval-qwen38:REJECT"}])
@@ -432,10 +459,15 @@ class TempStateMixin:
 
 
 class ApplyResultTests(TempStateMixin, unittest.TestCase):
-    def _apply(self, res, autoclose=False, body="", commit="abc1234"):
+    def _apply(self, res, autoclose=False, body="", commit="abc1234", head_now=None, labels=()):
         calls = []
-        with mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run("")), \
-                mock.patch.object(arb, "labels_on", return_value=set()), \
+        head_now = commit if head_now is None else head_now
+
+        def fake_gh(a):
+            calls.append(a)
+            return run(json.dumps({"headRefOid": head_now})) if a[:2] == ["pr", "view"] else run("")
+        with mock.patch.object(arb, "gh", side_effect=fake_gh), \
+                mock.patch.object(arb, "labels_on_or_none", return_value=set(labels)), \
                 mock.patch.object(arb, "add_label", side_effect=lambda r, n, l: calls.append(["add", l])), \
                 mock.patch.object(arb, "remove_label"), \
                 mock.patch.object(arb, "sync_generic_eval_label"), \
@@ -461,6 +493,19 @@ class ApplyResultTests(TempStateMixin, unittest.TestCase):
         self.assertTrue(any(c[:2] == ["pr", "close"] for c in declared))
         close_comment = next(c for c in declared if "sparkinfer-bonsai-auto-close" in " ".join(c))
         self.assertIn("not a finding that anything is wrong", " ".join(close_comment))
+        # Another bot scored it a speedup or made it merge-first: not this bot's `none` to close.
+        for lab in ("eval-qwen38:M", "qwen38-merge-first"):
+            calls = self._apply(res, autoclose=True, body=BONSAI_ONLY_BODY, labels={lab})
+            self.assertFalse(any(c[:2] == ["pr", "close"] for c in calls), lab)
+
+    def test_nothing_closes_over_a_commit_the_author_has_replaced(self):
+        pr = dict(MAIN_BONSAI)
+        pr[512] = (90.0, 5200.0)
+        res = evaluate(box_stdout(bonsai=pr))
+        self.assertEqual(res["label"], "REJECT")
+        calls = self._apply(res, autoclose=True, head_now="f" * 40)
+        self.assertFalse(any(c[:2] == ["pr", "close"] for c in calls))
+        self.assertFalse(any("sparkinfer-bonsai-auto-close" in " ".join(c) for c in calls))
 
     def test_reject_closes_unless_switched_off_and_says_why(self):
         pr = dict(MAIN_BONSAI)
@@ -484,7 +529,7 @@ class ApplyResultTests(TempStateMixin, unittest.TestCase):
         del cb[32]
         res = evaluate(box_stdout(cb=cb, extra="BONSAICB_FAILED 32 run\n"))
         self.assertEqual(self._apply(res, commit="a" * 40), [])          # strike 1: nothing posted
-        self.assertEqual(bot._load_strikes()["1139"]["count"], 1)
+        self.assertEqual(bot._load_strikes()["1139"]["counts"], {"cb": 1})
         self.assertEqual(self._apply(res, commit="b" * 40), [])          # new commit: starts again
         calls = self._apply(res, commit="b" * 40)                          # strike 2: posted
         self.assertIn(["add", "eval-bonsai:REJECT"], calls)
@@ -502,7 +547,7 @@ class MergeOntoBaselineTests(unittest.TestCase):
         self.assertIn(f"git checkout -qf {self.SHA}", s)
         self.assertIn('merge -q --no-ff --no-edit "$PR_TIP"', s)
         self.assertIn(f"git checkout -q {self.SHA} -- ", s)          # harness from the same commit
-        self.assertNotIn("git checkout -q origin/main -- ", s)
+        self.assertNotIn("git checkout -q HEAD -- ", s)
         self.assertIn("MERGE_CONFLICT", s)
         self.assertNotIn("pull/1145/merge", s)
 
@@ -510,7 +555,7 @@ class MergeOntoBaselineTests(unittest.TestCase):
         m = bot._remote_script("main", role="main")
         self.assertNotIn("merge -q --no-ff", m)
         self.assertIn('echo "REMOTE_SHA $(git rev-parse HEAD)"', m)
-        self.assertIn("git checkout -q origin/main -- ", m)
+        self.assertIn("git checkout -q HEAD -- ", m)
 
     def test_the_baseline_commit_is_what_the_pr_run_merges_onto(self):
         main = main_baseline()
@@ -596,6 +641,55 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn(("add", 1154, bot.BONSAI_MERGE_FIRST), calls)
         self.assertIn(("add", 1155, bot.BONSAI_NEEDS_REBASE), calls)
 
+    def test_a_merge_first_holder_with_no_speedup_tier_left_loses_it(self):
+        # Its head moved (the tier was dropped) or a re-measure found none: the label used to stay,
+        # exempting it from every close, next to the next winner's.
+        calls = self._reconcile({1154: ["bonsai-merge-first"], 1155: ["eval-bonsai:none", "bonsai-merge-first"],
+                                 1156: ["eval-bonsai:S"]},
+                                {"1156": {"delta_pct": 4.0}})
+        self.assertIn(("rm", 1154, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertIn(("rm", 1155, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertIn(("add", 1156, bot.BONSAI_MERGE_FIRST), calls)
+
+    def test_a_stale_winner_the_selection_would_never_re_measure_loses_its_place(self):
+        stale = arb.STALE_MAIN_PREFIX + "111111111, main is now 222222222 — re-measured before it may merge"
+        with mock.patch.object(arb, "greenlight_status", return_value=("no-bench", "table edited")):
+            calls = self._reconcile({1154: ["eval-bonsai:XL", "bonsai-merge-first"], 1155: ["eval-bonsai:S"]},
+                                    {"1154": {"delta_pct": 35.4}, "1155": {"delta_pct": 4.0}},
+                                    refused={1154: stale})
+        self.assertIn(("rm", 1154, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertIn(("add", 1155, bot.BONSAI_MERGE_FIRST), calls)
+
+    def test_a_lone_stale_winner_the_selection_would_skip_is_demoted(self):
+        stale = arb.STALE_MAIN_PREFIX + "111111111, main is now 222222222 — re-measured before it may merge"
+        with mock.patch.object(arb, "greenlight_status", return_value=("no-bench", "table edited")):
+            calls = self._reconcile({1154: ["eval-bonsai:XL", "bonsai-merge-first"]},
+                                    {"1154": {"delta_pct": 35.4}}, refused={1154: stale})
+        self.assertIn(("rm", 1154, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertNotIn(("add", 1154, bot.BONSAI_MERGE_FIRST), calls)
+
+    def test_a_winner_waiting_only_for_a_re_measure_keeps_its_place(self):
+        # Demoted, it was stale-closed the next round although the bot itself owed it a measurement.
+        stale = arb.STALE_MAIN_PREFIX + "111111111, main is now 222222222 — re-measured before it may merge"
+        calls = self._reconcile({1154: ["eval-bonsai:XL", "bonsai-merge-first"]},
+                                {"1154": {"delta_pct": 35.4}}, refused={1154: stale})
+        self.assertNotIn(("rm", 1154, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertIn(("add", 1154, bot.BONSAI_MERGE_FIRST), calls)
+
+    def test_a_pr_that_can_merge_now_outranks_one_waiting_for_its_re_measure(self):
+        stale = arb.STALE_MAIN_PREFIX + "111111111, main is now 222222222 — re-measured before it may merge"
+        calls = self._reconcile({1154: ["eval-bonsai:XL", "bonsai-merge-first"], 1155: ["eval-bonsai:S"],
+                                 1156: ["eval-bonsai:M"]},
+                                {"1154": {"delta_pct": 35.4}, "1155": {"delta_pct": 4.0}, "1156": {"delta_pct": 9.0}},
+                                refused={1154: stale, 1156: stale})
+        self.assertIn(("add", 1155, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertIn(("rm", 1154, bot.BONSAI_MERGE_FIRST), calls)
+        # With the stale ones the only candidates, nobody is sent to rebase for a merge that waits.
+        calls = self._reconcile({1154: ["eval-bonsai:XL"], 1156: ["eval-bonsai:M"]},
+                                {"1154": {"delta_pct": 35.4}, "1156": {"delta_pct": 9.0}},
+                                refused={1154: stale, 1156: stale})
+        self.assertIn(("add", 1154, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertNotIn(("add", 1156, bot.BONSAI_NEEDS_REBASE), calls)
 
 class DeclarationAndSiblingGuardTests(unittest.TestCase):
     TEMPLATE = open(bot.os.path.join(bot.ROOT, ".github", "PULL_REQUEST_TEMPLATE.md")).read()
@@ -691,6 +785,22 @@ class RegressionGatingTests(unittest.TestCase):
                                                          "after a batch (2 of 2 conclusive trials)"]))
         self.assertEqual(res["label"], "REJECT")
         self.assertIn("FAILED", bot.format_comment("a" * 40, res))
+        # Judged over two rounds like the other checks that fail a few percent of sound builds.
+        self.assertEqual(res["strike_key"], "serve")
+
+    def test_the_serve_check_alone_is_a_strike_but_with_another_check_it_rejects(self):
+        both = evaluate(box_stdout(reg_ok=False, reg_why=["serve: folded row served differently",
+                                                          "tensors: blk.0.ffn_gate.weight cosine 0.1200"]))
+        self.assertEqual(both["label"], "REJECT")
+        self.assertIsNone(both.get("strike_key"))
+
+    def test_a_serve_check_that_raised_stands_for_both_paths(self):
+        # "serve: raised X" names no path; it must still cancel against main's per-path failure.
+        self.assertEqual(bot._reg_failed_checks(False, ["serve: raised TimeoutError"]),
+                         {"serve:folded", "serve:native"})
+        main = self._main(reg_ok=False, reg_why=["serve: raised TimeoutError"])
+        res = evaluate(box_stdout(reg_ok=False, reg_why=["serve: folded row served differently alone"]), main=main)
+        self.assertNotEqual(res["label"], "REJECT")
 
     def test_a_regression_script_that_did_not_complete_on_main_gates_nothing(self):
         main = self._main(reg_ok=False)                   # no FAILED: lines -> "*"
@@ -724,6 +834,7 @@ class BuildFailureTests(unittest.TestCase):
         import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
             f.write(self.LOG)
+        self.addCleanup(os.remove, f.name)
         r = self._bash(f'report_build_failure "{f.name}"')
         errs = r.stderr.split("--- end of the build log")[0]
         self.assertIn("requires .target sm_90", errs)
@@ -741,6 +852,7 @@ class BuildFailureTests(unittest.TestCase):
                             ("x.cu(3): error: identifier \"y\" is undefined", False)):
             with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
                 f.write(line + "\n")
+            self.addCleanup(os.remove, f.name)
             self.assertEqual(self._bash(f'build_box_fault "{f.name}" >/dev/null').returncode == 0, fault, line)
 
     def test_first_build_error_prefers_the_compiler_over_make(self):
@@ -816,6 +928,15 @@ class StaleCloseTests(unittest.TestCase):
         self.assertEqual(closed, {1, 3})
         self.assertTrue(any("Ternary-Bonsai-2-27B eval queue" in " ".join(c) for c in calls))
 
+    def test_a_greenlit_pr_waiting_for_its_first_verdict_stays_open(self):
+        prs = [dict(self._pr(1, BONSAI_ONLY_BODY), headRefOid="a" * 40),
+               dict(self._pr(2, BONSAI_ONLY_BODY), headRefOid="b" * 40)]
+        with mock.patch.object(bot, "_pr_last_activity_ts", return_value=0.0), \
+                mock.patch.object(bot, "bonsai_evaluated_commits", return_value={"b" * 40}), \
+                mock.patch.object(arb, "greenlight_status", return_value=("ok", "claims a gain")), \
+                mock.patch.object(arb, "gh", return_value=run("")):
+            self.assertEqual(bot.close_stale_bonsai_prs("o/r", prs), {2})
+
     def test_the_shared_rule_protects_every_bots_merge_first(self):
         for lab in ("merge-first", "bonsai-merge-first", "qwen38-merge-first", "museglimmer-merge-first"):
             self.assertEqual(arb.stale_close_skip_reason(self._pr(1, labels=[lab]), "qwen38"), "merge-first")
@@ -846,6 +967,61 @@ class SelectionTests(unittest.TestCase):
     def test_a_report_only_run_may_still_measure_them_by_name(self):
         out = self._main(["--only-prs", "5", "--dry-run", "--no-post"], labels=["hold"])
         self.assertIn("would evaluate: #5", out)
+
+    STALE = "scored against main 999999999, main is now ccccccccc — re-measured before it may merge"
+
+    def _select(self, labels, scores, main_now, evaluated=("a" * 40,), argv=("--only-prs", "5"),
+                gate=(False, STALE)):
+        prs = [{"number": 5, "title": "t", "labels": [{"name": l} for l in labels], "isDraft": False,
+                "headRefOid": "a" * 40, "headRefName": "b", "mergeable": "MERGEABLE",
+                "author": {"login": "dev"}, "body": BONSAI_ONLY_BODY, "files": [{"path": "kernels/x.cu"}]}]
+        removed = []
+        with mock.patch.object(bot.sys, "argv", ["pr_bonsai_bot.py", *argv]), \
+                mock.patch.object(arb, "gh", return_value=run(json.dumps(prs))), \
+                mock.patch.object(arb, "current_main_sha", return_value=main_now), \
+                mock.patch.object(arb, "load_denylist", return_value=set()), \
+                mock.patch.object(arb, "pr_involved_logins", return_value=set()), \
+                mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: removed.append(l)), \
+                mock.patch.object(arb, "sync_generic_eval_label"), \
+                mock.patch.object(arb, "greenlight_status", return_value=("ok", "x")), \
+                mock.patch.object(bot, "bonsai_evaluated_commits",
+                                  return_value=None if evaluated is None else set(evaluated)), \
+                mock.patch.object(bot, "auto_merge_ok_bonsai", return_value=gate), \
+                mock.patch.object(arb, "labels_on", return_value=set()), \
+                mock.patch.object(bot, "_load_scores", return_value=scores), \
+                mock.patch.object(bot, "close_stale_bonsai_prs", return_value=set()), \
+                mock.patch.object(bot, "resolve_ssh", side_effect=RuntimeError("no box in tests")), \
+                mock.patch.object(bot, "reconcile_bonsai_merge_labels"), \
+                mock.patch("builtins.print") as p:
+            bot.main()
+        return "\n".join(str(c.args[0]) for c in p.call_args_list if c.args), removed
+
+    def test_a_merge_candidate_scored_against_an_older_main_is_measured_again(self):
+        entry = {"commit": "a" * 40, "label": "XL", "pass": True, "onto": "9" * 40}
+        out, _ = self._select(["eval-bonsai:XL"], {"5": entry}, "c" * 40)
+        self.assertIn("scored against an older main — re-measuring", out)
+        out, _ = self._select(["eval-bonsai:XL"], {"5": dict(entry, onto="c" * 40)}, "c" * 40)
+        self.assertIn("already bonsai-evaluated — skip", out)
+        out, _ = self._select(["eval-bonsai:none"], {"5": dict(entry, label="none")}, "c" * 40)
+        self.assertIn("already bonsai-evaluated — skip", out)
+        # The merge gate refuses it for something a re-measure cannot change: not measured again.
+        out, _ = self._select(["eval-bonsai:XL"], {"5": entry}, "c" * 40,
+                              gate=(False, "touches protected paths: .github/x.yml"))
+        self.assertIn("already bonsai-evaluated — skip", out)
+
+    def test_a_pr_whose_comments_could_not_be_read_is_left_alone(self):
+        out, removed = self._select(["eval-bonsai:XL"], {}, "c" * 40, evaluated=None)
+        self.assertIn("GitHub did not return its comments", out)
+        self.assertEqual(removed, [])
+
+    def test_a_tier_from_an_older_head_is_dropped_before_anything_else(self):
+        out, removed = self._select(["eval-bonsai:XL", "eval-qwen38:S"], {}, "c" * 40, evaluated=("f" * 40,))
+        self.assertEqual(removed, ["eval-bonsai:XL"])
+        self.assertIn("dropped the old eval-bonsai label", out)
+        # A report-only run changes nothing on the PR.
+        _, removed = self._select(["eval-bonsai:XL"], {}, "c" * 40, evaluated=("f" * 40,),
+                                  argv=("--only-prs", "5", "--no-post"))
+        self.assertEqual(removed, [])
 
 
 class ReviewFixTests(TempStateMixin, unittest.TestCase):
@@ -939,7 +1115,128 @@ class ReviewFixTests(TempStateMixin, unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class BoxFaultTests(TempStateMixin, unittest.TestCase):
+    """A fault that is the box's more often than the PR's is retried with nothing posted -- and, like
+    a build that exhausts the compiler, charged to the PR after BOX_FAULT_STRIKES rounds at one commit."""
+
+    def test_a_killed_speed_sweep_is_retried_then_charged(self):
+        stdout = box_stdout(bonsai={}, extra="BONSAI_FAILED 137\n")
+        res = evaluate(stdout)
+        self.assertTrue(res["retry"], res)
+        self.assertEqual(res["strike_key"], "sweep-box")
+        # Any other exit is the PR's own failure, posted at once.
+        self.assertFalse(evaluate(box_stdout(bonsai={}, extra="BONSAI_FAILED 1\n")).get("retry"))
+        calls = []
+        with mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run("")), \
+                mock.patch.object(arb, "labels_on", return_value=set()), \
+                mock.patch.object(arb, "add_label", side_effect=lambda r, n, l: calls.append(["add", l])), \
+                mock.patch.object(arb, "remove_label"), mock.patch.object(arb, "sync_generic_eval_label"), \
+                mock.patch.object(bot, "upload_bonsai_eval_log"), mock.patch.object(bot, "_save_scores"), \
+                mock.patch.object(bot, "AUTO_CLOSE", False):
+            for _ in range(bot.BOX_FAULT_STRIKES - 1):
+                bot.apply_result("o/r", 1139, "a" * 40, res)
+            self.assertEqual(calls, [])
+            bot.apply_result("o/r", 1139, "a" * 40, res)
+        self.assertIn(["add", "eval-bonsai:REJECT"], calls)
+
+    def test_a_guard_the_gpu_never_drained_for_or_the_oom_killer_took_is_retried(self):
+        guards = {"GUARD36": (150.0, 9000.0), "GUARDUN": (55.0, 6800.0), "GUARDMG": (80.0, 2000.0)}
+        for why in ("gpu", "rc=137"):
+            with self.subTest(why):
+                res = evaluate(box_stdout(guards=guards, extra=f"GUARDMO_FAILED {why}\n"))
+                self.assertTrue(res["retry"], res)
+                self.assertEqual(res["strike_key"], "guard-box")
+
+    def test_a_guard_only_the_pr_build_failed_is_judged_over_two_rounds(self):
+        guards = {"GUARD36": (150.0, 9000.0), "GUARDUN": (55.0, 6800.0), "GUARDMG": (80.0, 2000.0)}
+        res = evaluate(box_stdout(guards=guards, extra="GUARDMO_FAILED rc=1\n"))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["label"], "REJECT")
+        self.assertEqual(res["strike_key"], "guard")
+        # A guard the PR measured and regressed is a REJECT at once.
+        slow = dict(guards, GUARDMO=(30.0, 7000.0))
+        res = evaluate(box_stdout(guards=slow))
+        self.assertEqual(res["label"], "REJECT")
+        self.assertIsNone(res.get("strike_key"))
+
+    def test_only_a_hard_gate_overrides_a_box_fault(self):
+        guards = {"GUARD36": (150.0, 9000.0), "GUARDUN": (55.0, 6800.0), "GUARDMG": (80.0, 2000.0)}
+        slow = dict(MAIN_BONSAI)
+        slow[512] = (80.0, 5200.0)                                         # -19% decode@512
+        # Throughput can be faked by the same contention that kept the guard from running: deferred.
+        res = evaluate(box_stdout(bonsai=slow, guards=guards, extra="GUARDMO_FAILED gpu\n"))
+        self.assertTrue(res["retry"], res)
+        self.assertEqual(res["strike_key"], "guard-box")
+        # A failed accuracy gate cannot be: the REJECT is posted, naming what did not run.
+        res = evaluate(box_stdout(guards=guards, top1=0.2, kl=2.0, extra="GUARDMO_FAILED gpu\n"))
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["label"], "REJECT")
+        self.assertIn("not run this round", res["reason"])
+        self.assertIn("SKIPPED", bot.format_comment("a" * 40, res))      # the guard is not "FAILED"
+        # Output already wrong: a killed sweep is the PR's, said at once, not retried.
+        bad = evaluate(box_stdout(bonsai={}, top1=0.2, kl=2.0, extra="BONSAI_FAILED 137\n"))
+        self.assertFalse(bad.get("retry"))
+        self.assertIn("accuracy gate failed", bad["reason"])
+        # So is one whose prefill path already failed.
+        pf_bad = {128: [(0.10, 0.9)] * 3, 1024: [(0.93, 0.012)] * 3}
+        bad = evaluate(box_stdout(bonsai={}, pf=pf_bad, extra="BONSAI_FAILED 137\n"))
+        self.assertFalse(bad.get("retry"))
+        self.assertIn("prefill-path", bad["reason"])
+
+    def test_several_guards_the_box_kept_from_running_are_one_round(self):
+        res = evaluate(box_stdout(guards={}, extra="".join(f"{t}_FAILED gpu\n" for t in
+                                                            ("GUARD36", "GUARDMO", "GUARDUN", "GUARDMG"))))
+        self.assertEqual(res["strike_key"], "guard-box")
+        self.assertEqual(bot.record_strike(1139, "a" * 40, "guard-box+guard-box+guard-box"), 1)
+        bot.clear_strikes(1139)
+
+    def test_every_box_fault_of_the_pr_run_counts_toward_charging_it(self):
+        for stderr, key in (("RETRYABLE_INFRA_FAILURE score step killed (exit 137)", "score-box"),
+                            ("RETRYABLE_INFRA_FAILURE build: cc1plus killed", "build-box"),
+                            ("RETRYABLE_INFRA_FAILURE git fetch pull/1/head failed", "box"),
+                            ("", "box")):                                     # a hard kill
+            with self.subTest(key):
+                res = evaluate("REMOTE_HEAD abc\n", rc=1, stderr=stderr)
+                self.assertTrue(res["retry"], res)
+                self.assertEqual(res["strike_key"], key)
+
+    def test_soft_strikes_add_up_per_check_instead_of_resetting(self):
+        self.assertEqual(bot.record_strike(7, "a" * 40, "cb"), 1)
+        self.assertEqual(bot.record_strike(7, "a" * 40, "serve"), 1)
+        self.assertEqual(bot.record_strike(7, "a" * 40, "cb+reg"), 2)        # cb's second round
+        self.assertEqual(bot.record_strike(7, "b" * 40, "cb"), 1)            # a new commit
+        bot.clear_strikes(7)
+
+    def test_a_nan_accuracy_run_is_a_failed_run_not_a_dropped_one(self):
+        p = bot._parse_remote("PFCHECK 128 1 0.90 0.018\nPFCHECK 128 2 -nan 0.1\nPFCHECK 128 3 nan nan\n")
+        self.assertEqual(p["pfcheck"][128], [(0.90, 0.018)])
+        self.assertEqual(p["pfcheck_failed"][128], 2)
+
+    def test_the_verdict_records_the_main_it_was_measured_against(self):
+        self.assertEqual(evaluate(box_stdout())["onto"], "b013fc9" + "0" * 33)
+
+
 class RemoteScriptRetryTests(unittest.TestCase):
+    def test_every_round_first_reaps_what_an_earlier_round_left_on_the_box(self):
+        s = bot._remote_script("pull/1/head", role="pr", onto="b" * 40)
+        self.assertIn("/tmp/sparkinfer-bot-rounds", s)
+        self.assertLess(s.index("sparkinfer-bot-rounds"), s.index("git fetch"))
+
+    def test_the_accuracy_sed_never_captures_a_nan(self):
+        import re as _re
+        import subprocess
+        s = bot._remote_script("pull/1/head", role="pr", onto="b" * 40)
+        t_sed = _re.search(r"T=\$\(sed -n '([^']*)'", s).group(1)
+        k_sed = _re.search(r"K=\$\(sed -n '([^']*)'", s).group(1)
+        # The formats runtime/examples/qwen3_gguf_prefill_check.cpp prints.
+        for sed, line, want in ((t_sed, "TOP1  9/10 0.9000", "0.9000"), (t_sed, "TOP1  9/10 -nan", ""),
+                                (t_sed, "TOP1  9/10 nan", ""),
+                                (k_sed, "KL    0.01230 (mean over 10 positions)", "0.01230"),
+                                (k_sed, "KL    -nan (mean over 10 positions)", ""),
+                                (k_sed, "KL    nan (mean over 10 positions)", "")):
+            got = subprocess.run(["sed", "-n", sed], input=line + "\n", capture_output=True, text=True).stdout.strip()
+            self.assertEqual(got, want, (sed, line))
+
     def test_retries_are_in_the_script(self):
         s = bot._remote_script("pull/1/head", role="pr", onto="b" * 40)
         self.assertIn('echo "CB_EXIT c=$cc attempt=$attempt exit=$rc"', s)

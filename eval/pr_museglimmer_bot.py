@@ -48,7 +48,10 @@ close on none/REJECT and auto-merge on a verified speedup are both live (SPARKIN
 AUTOMERGE=1 in .env.eval) — same policy as pr_dflash_bot.py, also an explicit user decision
 after this bot's first live run wrongly auto-closed an unrelated PR (#768, reopened +
 apologized); the user was told the risk directly and chose to accept it rather than narrow the
-evaluation scope.
+evaluation scope. Narrowed 2026-09-26, with the sibling bots: a REJECT closes, but a `none` closes
+only a PR declared for Muse Glimmer alone that no other bot scored a speedup or made merge-first
+(arb.none_may_close), and nothing closes over a head that moved after the measured commit. A PR is
+measured merged onto the round's main commit (arb.merged_checkout_script), as the siblings do.
 
   3. Cross-model no-regression guards @ 32k — decode + prefill on FOUR models, same box, same PR
               build, vs a freshly-measured origin/main:
@@ -185,9 +188,9 @@ ACC_TOPK = int(os.environ.get("MUSEGLIMMER_ACC_TOPK", "128"))
 LLAMA_SERVER_PORT = int(os.environ.get("MUSEGLIMMER_LLAMA_PORT", "8097"))
 EVAL_TEXT = "bench/scripts/eval_text.txt"  # the exact known-good corpus from this session's fixes
 
-# The measuring instrument. Unlike the Qwen3.8 and Bonsai bots, this bot measures a PR with the PR's
-# OWN copy of these files (it builds the PR tip, with no harness pin), so a PR that edits them could
-# change the ruler it is scored by. Such a PR is not evaluated, as on those bots (2026-09-26).
+# The measuring instrument. Unlike the Qwen3.8 and Bonsai bots, this bot pins no harness: the PR is
+# built merged onto the round's main, so a PR that edits these files would be measured with its own
+# copy of the ruler it is scored by. Such a PR is not evaluated, as on those bots (2026-09-26).
 HARNESS_PATHS = (
     "runtime/examples/qwen3_gguf_bench.cpp",
     "runtime/examples/qwen3_gguf_cb_bench.cpp",
@@ -355,9 +358,9 @@ BONSAI_GUARD_GGUF = os.environ.get(
     "BONSAI_GGUF", "/root/workspace/models_bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf")
 BONSAI_GUARD_CTXS = [128, 32768]
 
-# Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
-# shape) but OFF unless this exact env var is set — NOT set in .env.eval, so it stays fully
-# inert until a human deliberately flips it on. Single-line change to enable later.
+# Auto-merge (the shape of pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash) is OFF
+# unless this exact env var is "1". The eval host's .env.eval sets it (explicit decision; see the
+# module docstring); the wrappers never force it.
 AUTO_MERGE = os.environ.get("SPARKINFER_MUSEGLIMMER_AUTOMERGE") == "1"
 AUTOMERGE_BLOCK = {
     "copycat", "copycat-warn", "flagged:gaming", "penalty", "needs-benchmark",
@@ -367,6 +370,12 @@ AUTOMERGE_BLOCK = {
 SCORES_FILE = os.path.expanduser(
     os.environ.get("MUSEGLIMMER_SCORES_FILE", "~/.sparkinfer_museglimmer_scores.json")
 )
+# Box faults per PR and commit (arb.record_strike): one recurring at a commit is charged to the PR.
+STRIKES_FILE = os.path.expanduser(
+    os.environ.get("MUSEGLIMMER_STRIKES_FILE", "~/.sparkinfer_museglimmer_strikes.json")
+)
+# PRs the bot gave up on this run (its own errors): the run then exits 3, so they are not silent.
+GAVE_UP = set()
 
 # Polaris verifiable-compute receipts — same policy/keys as the AR and DFlash bots (on by
 # default; TDX via POLARIS_API_KEY when configured, else Ed25519 fallback). Wired through
@@ -399,11 +408,7 @@ def _load_scores():
 
 
 def _save_scores(data):
-    try:
-        with open(SCORES_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f">> museglimmer scores save skipped: {e}")
+    arb.write_json_atomic(SCORES_FILE, data)
 
 
 def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
@@ -516,22 +521,7 @@ def check_bonsai_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
 def museglimmer_evaluated_commits(repo, num):
     """Head commits that already have a REAL scoring verdict posted — mirrors
     dflash_evaluated_commits: infra/transport failures (label:null in the marker) don't count."""
-    r = arb.gh(["pr", "view", str(num), "-R", repo, "--json", "comments"])
-    done = set()
-    for c in json.loads(r.stdout or "{}").get("comments", []):
-        body = c.get("body") or ""
-        m = MARKER_RE.search(body)
-        if not m or "sparkinfer museglimmer auto-eval" not in body or not arb.trusted_marker_comment(c):
-            continue
-        meta_raw = m.group(2)
-        try:
-            meta = json.loads(meta_raw) if meta_raw else {}
-        except json.JSONDecodeError:
-            meta = {}
-        if meta.get("label") is None:
-            continue
-        done.add(m.group(1))
-    return done
+    return arb.evaluated_commits_from(repo, num, MARKER_RE, "sparkinfer museglimmer auto-eval")
 
 
 def strip_museglimmer_eval_labels(repo, num):
@@ -570,6 +560,7 @@ def close_stale_museglimmer_prs(repo, prs, dry_run=False):
     (arb.stale_close_skip_reason) -- this used to close every idle PR in the repo."""
     closed = set()
     now = time.time()
+    main_now = None
     for pr in prs:
         num = pr["number"]
         if arb.stale_close_skip_reason(pr, "muse"):
@@ -579,6 +570,25 @@ def close_stale_museglimmer_prs(repo, prs, dry_run=False):
             continue
         age_days = (now - ts) / 86400
         if age_days < STALE_DAYS:
+            continue
+        head = (pr.get("headRefOid") or "")[:40]
+        labs = {l["name"] for l in pr.get("labels", [])}
+        if main_now is None:
+            main_now = arb.current_main_sha(repo)
+        if arb.gave_up(STRIKES_FILE, num, head) and not _unmeasurable_reason(repo, pr, labs, count_gave_up=False):
+            # The bot failed on it itself (loudly: the run exits 3). Not the author's to lose it for.
+            print(f"PR #{num}: idle {age_days:.1f}d, but the bot gave up on its head after its own errors — kept open")
+            continue
+        owed = _remeasure_state(repo, num, head, labs, main_now)
+        if owed is None or (owed and not _unmeasurable_reason(repo, pr, labs)):
+            # A verified speedup the bot owes a re-measure onto today's main (or GitHub did not say):
+            # the wait is the bot's.
+            print(f"PR #{num}: idle {age_days:.1f}d but owed a re-measure onto the new main — kept open")
+            continue
+        if arb.waiting_for_first_verdict(repo, pr, museglimmer_evaluated_commits(repo, num),
+                                         never_paths=HARNESS_PATHS, rebase_label=MUSEGLIMMER_NEEDS_REBASE):
+            # Greenlit and still waiting for this bot to measure its head: the wait is the bot's.
+            print(f"PR #{num}: idle {age_days:.1f}d but still waiting for its first museglimmer verdict — kept open")
             continue
         print(f"PR #{num}: stale ({age_days:.1f}d since last commit, threshold {STALE_DAYS}d) — closing")
         closed.add(num)
@@ -641,12 +651,15 @@ def ssh_run(host, port, cmd, timeout=7200, stdin_data=None, via_stdin=False):
             "-o", "ServerAliveCountMax=40",
             "-p", str(port), f"{user}@{host}", *remote,
         ],
-        capture_output=True, text=True, timeout=timeout,
+        # errors="replace": a stray non-UTF-8 byte in a build log raised after the whole run, and the
+        # PR was retried every round with nothing posted.
+        capture_output=True, text=True, errors="replace", timeout=timeout,
         input=cmd if via_stdin else stdin_data,
     )
 
 
-_EXPLICIT_FAIL_MARKERS = ("BUILD_FAILED", "LLAMACPP_CONFIGURE_FAILED", "LLAMACPP_BUILD_FAILED")
+_EXPLICIT_FAIL_MARKERS = ("BUILD_FAILED", "LLAMACPP_CONFIGURE_FAILED", "LLAMACPP_BUILD_FAILED",
+                          "MERGE_CONFLICT", "ACCURACY_COMPARE_FAILED")
 
 
 def _crash_reason(*outputs: str) -> str | None:
@@ -681,22 +694,31 @@ def _crash_reason(*outputs: str) -> str | None:
 
 def _is_box_fault(stdout: str, stderr: str) -> bool:
     """A failed run that is the box's rather than the PR's -- a GPU that did not drain, a failed
-    fetch, a compiler killed for memory, or a shell that died with no diagnostic before the
-    accuracy stage. Nothing is posted and no label changes; the next round measures again (as
-    pr_bonsai_bot.py does). Before, it posted `eval-museglimmer:REJECT` every round until the box
+    fetch, a compiler killed for memory, or a shell that died with no diagnostic before the run's
+    end (GUARD_END). Nothing is posted and no label changes; the next round measures again (as
+    pr_bonsai_bot.py does), and a fault recurring at one commit is charged to the PR after
+    arb.BOX_FAULT_STRIKES rounds (apply_result). Before, it posted `eval-museglimmer:REJECT` every round until the box
     recovered, which also set the generic `eval:REJECT` that SN74 scoring reads."""
     combined = (stdout or "") + "\n" + (stderr or "")
     if "RETRYABLE_INFRA_FAILURE" in combined:
+        return True
+    if "exit=137" in (_crash_reason(stdout, stderr) or ""):
+        # SIGKILL: the host OOM killer, whose trigger may be anything on the box (pr_bonsai_bot.py's
+        # rule). Recurring at one commit, it is charged to the PR after BOX_FAULT_STRIKES rounds.
         return True
     return _looks_like_hard_kill(stdout, stderr)
 
 
 def _looks_like_hard_kill(stdout: str, stderr: str) -> bool:
-    """Same hard-kill heuristic as pr_dflash_bot.py (no ERR-trap diagnostic captured at all)."""
+    """No ERR-trap diagnostic, and the run never reached its end. GUARD_END, not
+    ACCURACY_STAGE_DONE: all four guard model loads run after the accuracy stage, so a shell killed
+    during them (an ssh drop, the OOM killer, the box rebooting) used to count as the PR's failure --
+    and, recorded for its commit, as a REJECT the PR kept until its next push. pr_qwen38_bot.py
+    made the same change for the same reason."""
     combined = (stdout or "") + "\n" + (stderr or "")
     if _crash_reason(stdout, stderr):
         return False
-    return "ACCURACY_STAGE_DONE" not in combined  # never reached even the accuracy checkpoint
+    return "GUARD_END" not in combined
 
 
 def _ssh_run_resilient(host, port, script: str, label: str):
@@ -712,16 +734,31 @@ def _ssh_run_resilient(host, port, script: str, label: str):
                   "measurement once")
             r = ssh_run(host, port, script, via_stdin=True)
         elif _looks_like_hard_kill(r.stdout, r.stderr):
-            print(f">> {label}: looks like a hard kill (no ERR-trap diagnostic, no accuracy-stage "
-                  f"checkpoint reached) — retrying once")
+            print(f">> {label}: looks like a hard kill (no ERR-trap diagnostic, the run never "
+                  f"reached GUARD_END) — retrying once")
             r = ssh_run(host, port, script, via_stdin=True)
     return r
 
 
-def _remote_script(ref: str) -> str:
+def _remote_script(ref: str, role: str = "pr", onto: str | None = None) -> str:
     """Bash run on the eval box: checkout ref, build, 128-decode speed bench, accuracy gate vs
     a live llama-server reference. Run once per ref (PR, then "main") — identical script both
-    times so the two measurements are directly comparable."""
+    times so the two measurements are directly comparable.
+
+    A PR (`ref` = pull/<n>/head) is measured MERGED onto `onto`, the exact main commit the round's
+    baseline measured (arb.merged_checkout_script), as the Qwen3.8 and Bonsai bots do since #1145.
+    Measuring the branch tip itself compared a branch behind main against a newer main: every
+    speedup merged since the branch point read as the PR's own regression -- a REJECT and a close
+    -- and the branch built its own older copy of the harness."""
+    if role == "pr":
+        checkout = arb.merged_checkout_script(ref, onto or "origin/main")
+    else:
+        checkout = (f'git fetch -q origin {shlex.quote(ref)} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {ref} failed" >&2; exit 1; }}\n'
+                    'git reset -q --hard\n'
+                    'git clean -qfd\n'
+                    'git checkout -qf FETCH_HEAD\n'
+                    'echo "REMOTE_HEAD $(git rev-parse --short HEAD)"\n'
+                    'echo "REMOTE_SHA $(git rev-parse HEAD)"\n')
     repo = shlex.quote(REMOTE_REPO)
     gguf = shlex.quote(DEFAULT_GGUF)
     llamacpp_dir = shlex.quote(LLAMACPP_DIR)
@@ -762,6 +799,7 @@ def _remote_script(ref: str) -> str:
             f'  done\n'
             f'else\n'
             f'  MUSE_OK=0\n'
+            f'  MUSE_RC=${{_BENCH_SWEEP_RC:-1}}\n'
             f'fi')
     scored_sweep_blocks = "\n".join(scored_blocks)
     q36_sweep_args = " ".join(f"{c} {BENCH_REPS}" for c in Q36_GUARD_CTXS)
@@ -827,18 +865,12 @@ MODELOPT_GUARD_MODEL_DIR={mo_dir}
 UNSLOTH_GUARD_MODEL_DIR={un_dir}
 BONSAI_GUARD_GGUF={bn_gguf}
 
+{arb.round_guard_sh("museglimmer")}
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
-# A network failure is the box's, never the PR's: RETRYABLE, not the ERR trap.
-git fetch -q origin {ref_q} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {ref} failed" >&2; exit 1; }}
-git reset -q --hard
-git clean -qfd
-git checkout -qf FETCH_HEAD
-HEAD=$(git rev-parse --short HEAD)
-echo "REMOTE_HEAD $HEAD"
-# The full commit actually built: a verdict is recorded against it (arb.measured_commit).
-echo "REMOTE_SHA $(git rev-parse HEAD)"
-
+# A network failure is the box's, never the PR's: RETRYABLE, not the ERR trap. A PR is merged onto
+# the baseline commit (PR_TIP, MERGED_ONTO); main reports its commit (REMOTE_SHA).
+{checkout}
 test -f "$GGUF" || {{ echo "FAIL missing GGUF $GGUF"; exit 1; }}
 
 # Build sparkinfer's speed-bench + teacher-forced-score binaries. Always reconfigure (cheap,
@@ -918,10 +950,12 @@ wait_gpu_clear
 # keeps the wire format the same shape as the guards' and lets SCORED_CTXS change without
 # touching the parser.
 MUSE_OK=1
+MUSE_RC=0
 BC_DECODE=0
 BC_PREFILL=0
 {scored_sweep_blocks}
-[ "$MUSE_OK" = "1" ] || echo "MUSE_FAILED"
+# rc=137 is SIGKILL (the host OOM killer): the box's, not the PR's (eval_museglimmer_on_box).
+[ "$MUSE_OK" = "1" ] || echo "MUSE_FAILED rc=${{MUSE_RC:-1}}"
 # Back-compat: decode@128 / prefill@128 also go out under their old names. The PR comment
 # renderer, the Polaris payload and the published dashboard all read these two keys, and none of
 # them should have to change because the scoring matrix grew.
@@ -1024,13 +1058,31 @@ for _ in $(seq 1 120); do
   curl -s "http://localhost:$PORT/health" 2>/dev/null | grep -q '"ok"' && break
   sleep 2
 done
+# The reference is the box's own llama.cpp, which no PR touches: if it never came up, that is infra
+# (it used to fall through to a failed accuracy compare, charged to the PR).
+if ! curl -s "http://localhost:$PORT/health" 2>/dev/null | grep -q '"ok"'; then
+  echo "RETRYABLE_INFRA_FAILURE llama.cpp reference server never became healthy (the box's reference)" >&2
+  tail -20 /tmp/mg_llama_srv.log >&2 || true
+  exit 1
+fi
 echo "ACCURACY_STAGE_DONE"
 
 # /dev/null as the tokenizer-path arg is safe: accuracy_compare.py's 3rd positional arg is a
 # file of already-tokenized space-separated ids (produced above), so its all-digit check skips
 # the HF-tokenizer-load code path entirely — the tokenizer path is never opened.
-ACCOUT=$(python3 bench/scripts/accuracy_compare.py /tmp/mg_score.txt /dev/null /tmp/mg_eval_ids.txt \\
-         "http://localhost:$PORT" "$TOPK")
+if ! ACCOUT=$(python3 bench/scripts/accuracy_compare.py /tmp/mg_score.txt /dev/null /tmp/mg_eval_ids.txt \\
+         "http://localhost:$PORT" "$TOPK"); then
+  echo "$ACCOUT"
+  # The reference is the box's own llama-server: if it went down mid-compare, that is infra. If it
+  # is still up, the compare failed on the PR's score dump.
+  if ! curl -s "http://localhost:$PORT/health" 2>/dev/null | grep -q '"ok"'; then
+    echo "RETRYABLE_INFRA_FAILURE llama.cpp reference server went down during the accuracy compare" >&2
+    tail -20 /tmp/mg_llama_srv.log >&2 || true
+    exit 1
+  fi
+  echo "ACCURACY_COMPARE_FAILED -- the PR's score dump could not be compared with the reference" >&2
+  exit 1
+fi
 echo "$ACCOUT"
 kill $SRV 2>/dev/null || true
 wait $SRV 2>/dev/null || true
@@ -1078,7 +1130,7 @@ if bench_sweep_run "$Q36_GGUF" 128 {q36_sweep_args}; then
     echo "GUARD36 $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
   done
 else
-  echo "GUARD36_FAILED"
+  echo "GUARD36_FAILED rc=${{_BENCH_SWEEP_RC:-1}}"
 fi
 
 # --- ModelOpt Qwen3.8-27B NVFP4 no-regression guard (decode + prefill @ 32k) ---
@@ -1095,7 +1147,7 @@ if [ -d "$MODELOPT_GUARD_MODEL_DIR" ]; then
       echo "GUARDMO $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
     done
   else
-    echo "GUARDMO_FAILED"
+    echo "GUARDMO_FAILED rc=${{_BENCH_SWEEP_RC:-1}}"
   fi
 else
   echo "GUARDMO_UNAVAILABLE"
@@ -1111,7 +1163,7 @@ if [ -d "$UNSLOTH_GUARD_MODEL_DIR" ]; then
       echo "GUARDUN $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
     done
   else
-    echo "GUARDUN_FAILED"
+    echo "GUARDUN_FAILED rc=${{_BENCH_SWEEP_RC:-1}}"
   fi
 else
   echo "GUARDUN_UNAVAILABLE"
@@ -1127,7 +1179,7 @@ if [ -f "$BONSAI_GUARD_GGUF" ]; then
       echo "GUARDBN $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
     done
   else
-    echo "GUARDBN_FAILED"
+    echo "GUARDBN_FAILED rc=${{_BENCH_SWEEP_RC:-1}}"
   fi
 else
   echo "GUARDBN_UNAVAILABLE"
@@ -1172,8 +1224,11 @@ def _parse_remote(stdout: str) -> dict:
         if line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
         elif line.startswith("REMOTE_SHA ") and len(line.split()) >= 2:
-            # This bot builds the PR tip itself (no merge onto main), so the built commit IS the tip.
-            out["pr_tip"] = line.split()[1]
+            out["sha"] = line.split()[1]            # main's commit (role main) / the local merge
+        elif line.startswith("PR_TIP ") and len(line.split()) >= 2:
+            out["pr_tip"] = line.split()[1]         # the PR commit fetched and built (full SHA)
+        elif line.startswith("MERGED_ONTO ") and len(line.split()) >= 2:
+            out["merged_onto"] = line.split()[1]
         elif line.startswith("RESULT_DECODE_TPS "):
             try:
                 out["decode_tps"] = float(line.split()[1])
@@ -1216,8 +1271,10 @@ def _parse_remote(stdout: str) -> dict:
                     muse[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
                 except ValueError:
                     pass
-        elif line.strip() == "MUSE_FAILED":
+        elif line.split()[:1] == ["MUSE_FAILED"]:
             out["muse_failed"] = True
+            if arb.failed_rc(line) == 137:
+                out["muse_failed_box"] = True
         elif line.startswith("MUSECB "):
             parts = line.split()
             if len(parts) >= 3:
@@ -1239,8 +1296,10 @@ def _parse_remote(stdout: str) -> dict:
                     guard36[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
                 except ValueError:
                     pass
-        elif line.strip() == "GUARD36_FAILED":
+        elif line.split()[:1] == ["GUARD36_FAILED"]:
             out["guard36_failed"] = True
+            if arb.failed_rc(line) == 137:
+                out["guard36_failed_box"] = True
         elif line.startswith("GUARDMO "):
             parts = line.split()
             if len(parts) >= 4:
@@ -1248,8 +1307,10 @@ def _parse_remote(stdout: str) -> dict:
                     guardmo[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
                 except ValueError:
                     pass
-        elif line.strip() == "GUARDMO_FAILED":
+        elif line.split()[:1] == ["GUARDMO_FAILED"]:
             out["guardmo_failed"] = True
+            if arb.failed_rc(line) == 137:
+                out["guardmo_failed_box"] = True
         elif line.strip() == "GUARDMO_UNAVAILABLE":
             out["guardmo_unavailable"] = True
         elif line.startswith("GUARDUN "):
@@ -1259,8 +1320,10 @@ def _parse_remote(stdout: str) -> dict:
                     guardun[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
                 except ValueError:
                     pass
-        elif line.strip() == "GUARDUN_FAILED":
+        elif line.split()[:1] == ["GUARDUN_FAILED"]:
             out["guardun_failed"] = True
+            if arb.failed_rc(line) == 137:
+                out["guardun_failed_box"] = True
         elif line.strip() == "GUARDUN_UNAVAILABLE":
             out["guardun_unavailable"] = True
         elif line.startswith("GUARDBN "):
@@ -1270,8 +1333,10 @@ def _parse_remote(stdout: str) -> dict:
                     guardbn[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
                 except ValueError:
                     pass
-        elif line.strip() == "GUARDBN_FAILED":
+        elif line.split()[:1] == ["GUARDBN_FAILED"]:
             out["guardbn_failed"] = True
+            if arb.failed_rc(line) == 137:
+                out["guardbn_failed_box"] = True
         elif line.strip() == "GUARDBN_UNAVAILABLE":
             out["guardbn_unavailable"] = True
     out["guard36"] = guard36
@@ -1441,7 +1506,7 @@ def measure_main_baseline(host, port):
     pending PR has already been individually evaluated in main()'s loop, see call ordering
     there), so every PR in the round comparing against a freshly-remeasured main was pure
     redundant GPU/build time. Returns {"ok": True, **parsed} or {"ok": False, "reason", "log"}."""
-    r = _ssh_run_resilient(host, port, _remote_script("main"), "main run")
+    r = _ssh_run_resilient(host, port, _remote_script("main", role="main"), "main run")
     if r.returncode != 0:
         tail = arb.failure_excerpt(r.stdout, r.stderr, _EXPLICIT_FAIL_MARKERS)
         crash = _crash_reason(r.stdout, r.stderr)
@@ -1459,10 +1524,19 @@ def measure_main_baseline(host, port):
     # Every guard must have measured something unless its checkpoint is absent. Otherwise every PR
     # in the round is measured in full only to be deferred for the missing guard.
     unguarded = [key for key in ("guard36", "guardmo", "guardun", "guardbn")
-                 if not main.get(f"{key}_unavailable") and not main.get(key)]
+                 if not main.get(f"{key}_unavailable") and not arb.guard_measured(main.get(key))]
     if unguarded:
         return {"ok": False, "reason": "main measured nothing for guard(s) " + ", ".join(unguarded),
                 "log": (r.stdout or "")[-1500:]}
+    # The accuracy gate is absolute (against llama.cpp). If main misses it, the box, the reference
+    # or main itself is off, and every PR would be REJECTed -- and closed -- for it: skip the round.
+    if (main.get("top1") is None or main.get("kl") is None
+            or main["top1"] < ACC_TOP1_BAR or main["kl"] > ACC_KL_BAR):
+        return {"ok": False, "reason": f"main misses its own accuracy gate against llama.cpp "
+                                       f"(top1={main.get('top1')} kl={main.get('kl')})",
+                "log": (r.stdout or "")[-1500:]}
+    if not main.get("sha"):
+        return {"ok": False, "reason": "main run did not report its commit", "log": (r.stdout or "")[-1500:]}
     main["ok"] = True
     return main
 
@@ -1471,17 +1545,29 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
     """Run the PR ref's speed+accuracy script on the same box and compare against `main`, an
     already-measured baseline shared across every PR in the round (see measure_main_baseline)."""
     print(f">> Muse Glimmer eval on box: PR ref={pr_ref}")
-    r = _ssh_run_resilient(host, port, _remote_script(pr_ref), "PR run")
+    r = _ssh_run_resilient(host, port, _remote_script(pr_ref, role="pr", onto=main.get("sha")), "PR run")
     if r.returncode != 0:
+        conflict = arb.merge_conflict_line(r.stdout, r.stderr)
+        if conflict:
+            # Does not merge onto the main this round measured: a rebase, not a verdict.
+            return {"ok": False, "conflict": True, "reason": conflict}
         tail = arb.failure_excerpt(r.stdout, r.stderr, _EXPLICIT_FAIL_MARKERS)
         crash = _crash_reason(r.stdout, r.stderr)
         reason = "PR speed/accuracy run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
-        return {"ok": False, "retry": _is_box_fault(r.stdout, r.stderr), "reason": reason,
+        # "box": a fault recurring at one commit is charged to the PR after BOX_FAULT_STRIKES rounds.
+        return {"ok": False, "retry": _is_box_fault(r.stdout, r.stderr), "strike_key": "box", "reason": reason,
                 "log": tail, "pr_tip": _parse_remote(r.stdout or "").get("pr_tip")}
     pr = _parse_remote(r.stdout or "")
     # A missing PR-side context is NOT treated as an infra failure here -- it is scored as a
     # regression by tier_from_gain (cur=0 against a real main baseline), which is the fail-closed
     # direction. Only a wholesale sweep failure is reported as a run failure.
+    t1, kl = pr.get("top1"), pr.get("kl")
+    output_wrong = t1 is not None and kl is not None and (t1 < ACC_TOP1_BAR or kl > ACC_KL_BAR)
+    if pr.get("muse_failed_box") and not output_wrong:
+        # The speed sweep was SIGKILLed (the host OOM killer): the box's, like a build the compiler
+        # cannot finish. Charged to the PR after BOX_FAULT_STRIKES rounds at one commit.
+        return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "sweep-box", "log": "",
+                "reason": "the PR's Muse Glimmer speed sweep was killed (exit 137) — infra"}
     if pr.get("muse_failed") or not (pr.get("muse") or {}):
         # Lead with the accuracy result when it was measured and failed. A sweep that dropped
         # contexts is usually the SYMPTOM; "your change makes the model emit garbage" is the
@@ -1494,9 +1580,9 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
             why = (f"PR output is incorrect — top-1 {t1:.3f} (bar >={ACC_TOP1_BAR}), "
                    f"KL {kl:.4f} (bar <={ACC_KL_BAR}); the incomplete speed sweep is a symptom "
                    f"of that, not a harness fault")
-        return {"ok": False, "reason": why, "log": (r.stdout or "")[-1500:]}
+        return {"ok": False, "pr_tip": pr.get("pr_tip"), "reason": why, "log": (r.stdout or "")[-1500:]}
     if "top1" not in pr or "kl" not in pr:
-        return {"ok": False, "reason": "PR run missing accuracy METRIC line", "log": (r.stdout or "")[-1500:]}
+        return {"ok": False, "pr_tip": pr.get("pr_tip"), "reason": "PR run missing accuracy METRIC line", "log": (r.stdout or "")[-1500:]}
     for ctx in SCORED_CTXS:
         pv = (pr.get("muse") or {}).get(ctx) or {}
         mv = (main.get("muse") or {}).get(ctx) or {}
@@ -1581,6 +1667,14 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         label = "REJECT"
         passed = False
 
+    killed = [k for k in ("guard36", "guardmo", "guardun", "guardbn")
+              if pr.get(f"{k}_failed_box") and main.get(k)]
+    if killed and accuracy_ok:
+        # A guard sweep SIGKILLed on the PR build (the host OOM killer): the box's, not a regression.
+        # Beside a failed accuracy gate, which a busy box cannot fake, the REJECT is posted instead.
+        return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "guard-box", "log": "",
+                "reason": f"the {', '.join(killed)} guard sweep was killed on the PR build (exit 137) — infra"}
+
     mo_ok, mo_problems = check_modelopt_guard(pr, main)
     if pr.get("guardmo_unavailable") or main.get("guardmo_unavailable"):
         # Absent checkpoint is a SKIP, not a REJECT -- but say so, so a round that guarded
@@ -1599,8 +1693,9 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
     # bot closed #1112 and #1114 that way on 2026-09-18).
     for g_ok, g_problems in ((mo_ok, mo_problems), (un_ok, un_problems), (q36_ok, q36_problems)):
         unavailable = [p for p in g_problems if p.endswith("measurement unavailable")]
-        if not g_ok and unavailable and len(unavailable) == len(g_problems):
-            return {"ok": False, "retry": True, "log": "",
+        if not g_ok and unavailable and len(unavailable) == len(g_problems) and label != "REJECT":
+            # (Beside a REJECT already decided, it is posted with that REJECT instead.)
+            return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "guard-unmeasured", "log": "",
                     "reason": "; ".join(unavailable) + " — infra, not a regression; the PR is "
                               "re-evaluated next round rather than rejected"}
     if not mo_ok:
@@ -1623,9 +1718,9 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
     if not bn_ok:
         # Measured nothing -> infra: no verdict, re-evaluated next round (module docstring pt. 3).
         unavailable = [p for p in bn_problems if p.endswith("measurement unavailable")]
-        if unavailable and len(unavailable) == len(bn_problems):
+        if unavailable and len(unavailable) == len(bn_problems) and label != "REJECT":
             # retry: nothing is posted. Without it apply_result still wrote eval-museglimmer:REJECT.
-            return {"ok": False, "retry": True, "log": "",
+            return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "guard-unmeasured", "log": "",
                     "reason": "; ".join(unavailable) + " — infra, not a regression; the PR is "
                               "re-evaluated next round rather than rejected"}
         reason = "ternary-bonsai no-regression guard failed: " + "; ".join(bn_problems[:6]) + f" | {reason}"
@@ -1690,6 +1785,8 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         "pr_head": pr.get("head"),
         "main_head": main.get("head"),
         "pr_tip": pr.get("pr_tip"),
+        "merged_onto": pr.get("merged_onto"),
+        "onto": main.get("sha"),       # the full main commit this verdict was measured against
     }
     # A receipt for a measurement that has happened, never a gate on it: an exception here must not
     # discard `res` (the Qwen3.8 bot lost a measured +27.7% on #832 to exactly that).
@@ -1791,6 +1888,10 @@ def format_comment(commit: str, res: dict) -> str:
         "dims": {d["dim"]: {"delta": d["delta"], "label": d["label"]}
                  for d in (res.get("scored_dims") or [])},
     }
+    if not res.get("ok"):
+        # A failed run that reaches here is the PR's (box faults return earlier, posting nothing):
+        # recorded for this commit, so it is not rebuilt, re-run and re-posted every round.
+        meta["label"] = "REJECT"
     marker = (
         f"<!-- sparkinfer-museglimmer-eval:{EVAL_SCHEMA_VERSION}:{commit} "
         f"{json.dumps(meta, separators=(',', ':'))} -->"
@@ -1799,7 +1900,8 @@ def format_comment(commit: str, res: dict) -> str:
         return (
             f"{marker}\n## sparkinfer museglimmer auto-eval — error\n\n"
             f"**reason:** `{res.get('reason')}`\n\n"
-            f"<details><summary>log tail</summary>\n\n```\n{(res.get('log') or '')[:1800]}\n```\n</details>\n"
+            f"<details><summary>log tail</summary>\n\n```\n{(res.get('log') or '')[:1800]}\n```\n</details>\n\n"
+            f"<sub>The PR is built merged onto the round's `main`, not on its own branch: an error in a file the PR does not touch usually means it needs a rebase onto current `main`. Recorded for this commit; push a fix and it is evaluated again.</sub>\n"
         )
     lab = res["label"]
     if res.get("accuracy_ok"):
@@ -1809,11 +1911,6 @@ def format_comment(commit: str, res: dict) -> str:
         acc_row = (f"| accuracy gate | ❌ **FAILED** — top1={res.get('pr_top1', 0):.3f} "
                     f"(bar >={ACC_TOP1_BAR}) · KL={res.get('pr_kl', 0):.4f} (bar <={ACC_KL_BAR}) — "
                     "**verdict forced to REJECT regardless of speed** |\n")
-    main_acc_note = ""
-    if res.get("main_top1") is not None and (res.get("main_top1", 1) < ACC_TOP1_BAR or (res.get("main_kl") or 0) > ACC_KL_BAR):
-        main_acc_note = (f"| ⚠️ same-box main accuracy | top1={res.get('main_top1'):.3f} "
-                          f"kl={res.get('main_kl'):.4f} — main ALSO misses the bar (informational; "
-                          "not gated on main, but check the box/corpus if this persists) |\n")
     if res.get("q36_guard_ok"):
         q36_row = "| qwen3.6 guard | ✅ no regression (decode+prefill @ 32k) |\n"
     else:
@@ -1867,14 +1964,16 @@ def format_comment(commit: str, res: dict) -> str:
         f"{_cb_list_str()} — {len(SCORING_DIMS)} axes, each also a regression floor; the label is the best |\n"
         f"| tier from | `{res.get('best_dim') or '?'}` ({res.get('delta_pct', 0):+.1f}%) |\n"
         f"{acc_row}"
-        f"{main_acc_note}"
         f"{q36_row}"
         f"{mo_row}"
         f"{un_row}"
         f"{bn_row}"
         f"| PPL sparkinfer / llama.cpp | {res.get('pr_ppl_spark') or '?'} / {res.get('pr_ppl_llama') or '?'} |\n"
         f"{polaris_row}"
-        f"| commit | `{commit[:9]}` |\n\n"
+        f"| commit | `{commit[:9]}`"
+        + (f", measured merged onto `main` `{res['merged_onto']}` (this round's baseline)"
+           if res.get("merged_onto") else "")
+        + " |\n\n"
         f"{_matrix_table(res)}"
         f"{res.get('reason') or ''}\n\n"
         f"<sub>Scored on the pinned eval box vs same-box `origin/main` — AR decode AND prefill at "
@@ -1883,10 +1982,9 @@ def format_comment(commit: str, res: dict) -> str:
         f"otherwise the reported label is the **best** measured delta across all "
         f"{len(SCORING_DIMS)} — "
         "a PR that improves just one, with the rest flat, still earns credit for that. "
-        "Cross-model no-regression guards run at 32k on Qwen3.6 and the ModelOpt Qwen3.8-27B "
-        "NVFP4 checkpoint. This is informational, not a judgment on your PR: a `none` label just "
-        "means no measurable Muse Glimmer speedup was verified on either metric, which is expected "
-        "and fine if that isn't what your change is about. "
+        "This is informational, not a judgment on your PR: a `none` label just means no "
+        "measurable Muse Glimmer speedup was verified on any scored axis, which is expected and "
+        "fine if that isn't what your change is about. "
         "Correctness gated against a live llama.cpp reference on the same GGUF. Also gated on "
         "cross-model no-regression guards (decode+prefill, same box vs main): Qwen3.6-35B-A3B, "
         "the ModelOpt and unsloth Qwen3.8-27B NVFP4 checkpoints at 32k, and Ternary-Bonsai-2-27B "
@@ -1948,7 +2046,11 @@ def auto_merge_ok_museglimmer(repo, num, require_merge_first=True):
     # GitHub reports UNKNOWN for a while after main moves; that must not cost a PR the ranking.
     if info.get("mergeable") != "MERGEABLE" and require_merge_first:
         return False, f"not cleanly mergeable ({info.get('mergeable')})"
-    return True, "ok"
+    # Last: measured against the main that is there now. Once any bot has merged something else,
+    # this PR merged onto the new main is a combination nobody measured, so it is re-measured
+    # first (main()'s selection). Reconcile keeps a PR refused for this alone in the running
+    # (arb.refused_only_for_stale_main), which is why no other refusal may come after it.
+    return arb.fresh_against_main(repo, scored)
 
 
 def try_auto_merge_museglimmer(repo, num):
@@ -1973,20 +2075,47 @@ def try_auto_merge_museglimmer(repo, num):
         print(f">> MUSEGLIMMER AUTO-MERGED #{num} (museglimmer-merge-first)")
         arb.gh(["pr", "comment", str(num), "-R", repo, "--body",
                 "<!-- sparkinfer-museglimmer-automerge -->\n"
-                "Auto-merged as the round's `museglimmer-merge-first` winner — verified same-box "
-                "128-token decode speedup over `main`, accuracy-gated vs llama.cpp."])
+                "Auto-merged as the round's `museglimmer-merge-first` winner — a verified same-box "
+                "Muse Glimmer speedup over `main` on the axis the verdict names, accuracy-gated vs "
+                "llama.cpp, with every cross-model guard passing."])
         return True
     print(f">> museglimmer auto-merge BLOCKED #{num}: {(r.stderr or r.stdout or '')[:200]}")
     return False
+
+
+def _unmeasurable_reason(repo, pr, labs, count_gave_up=True):
+    """Why main()'s selection would not measure this PR now, or None: the same filters it applies
+    (keep them in step). Reconcile keeps a PR refused only for a moved main in the running solely
+    when the selection will re-measure it; one it never re-measures -- no longer greenlit, now
+    declared for another model, conflicting -- would hold its place, merge-first included, for ever
+    while fresher PRs waited behind it."""
+    if pr.get("isDraft"):
+        return "draft"
+    if arb.HOLD_LABEL in labs:
+        return "hold"
+    if count_gave_up and arb.gave_up(STRIKES_FILE, pr["number"], (pr.get("headRefOid") or "")[:40]):
+        return "the bot gave up on this commit after its own errors"
+    skip = arb.model_skip_reason(pr.get("body") or "", "muse")
+    if skip:
+        return skip
+    touched = [f.get("path", "") for f in (pr.get("files") or [])]
+    if any(t.startswith(h) for t in touched for h in HARNESS_PATHS):
+        return "touches the eval harness"
+    if arb.pr_merge_conflict(pr.get("mergeable")):
+        return "merge conflict"
+    status, why = arb.greenlight_status(repo, pr["number"], labs)
+    # "unknown" (GitHub did not answer) keeps: demoting on a non-answer takes a real winner's place.
+    return None if status in ("ok", "unknown") else f"not greenlit ({why})"
 
 
 def reconcile_museglimmer_merge_labels(repo, dry_run=False):
     scores = _load_scores()
     open_prs = json.loads(arb.gh([
         "pr", "list", "-R", repo, "--state", "open",
-        "--json", "number,labels", "--limit", str(arb.PR_LIST_LIMIT),
+        "--json", "number,labels,isDraft,body,files,mergeable,headRefOid", "--limit", str(arb.PR_LIST_LIMIT),
     ]).stdout or "[]")
     open_labels = {p["number"]: {l["name"] for l in p["labels"]} for p in open_prs}
+    open_by_num = {p["number"]: p for p in open_prs}
 
     merged = json.loads(arb.gh([
         "pr", "list", "-R", repo, "--state", "merged", "--label", MUSEGLIMMER_MERGE_FIRST,
@@ -1998,6 +2127,7 @@ def reconcile_museglimmer_merge_labels(repo, dry_run=False):
 
     scored = []
     stale_first = []   # carries merge-first but can no longer win it
+    stale_main = set()   # in the running, but its merge waits for a re-measure onto today's main
     for num, labs in open_labels.items():
         # A PR that cannot be merged -- hold, needs-rebase, penalty, any other AUTOMERGE_BLOCK
         # label, or anything else auto-merge would refuse -- must not take merge-first and push the
@@ -2009,13 +2139,28 @@ def reconcile_museglimmer_merge_labels(repo, dry_run=False):
         tiers = {l.split(":", 1)[1] for l in labs if l.startswith(EVAL_PREFIX)}
         tier = next((t for t in tiers if t in SPEEDUP_LABELS), None)
         if not tier:
+            # No speedup tier (any more): its head moved, or a re-measure found none. A merge-first
+            # left here exempted it from every close and could sit beside the next winner's.
+            if MUSEGLIMMER_MERGE_FIRST in labs:
+                stale_first.append(num)
             continue
         ok, why = auto_merge_ok_museglimmer(repo, num, require_merge_first=False)
         if not ok and why == arb.PR_UNREADABLE:
             # Not an answer: demoting on it would take merge-first from the real holder.
             print(f">> museglimmer round: GitHub did not return #{num} — labels left as they are")
             return
-        if not ok:
+        if not ok and arb.refused_only_for_stale_main(why):
+            # Nothing but a moved main stands in the way: it keeps its place and is re-measured
+            # (main()'s selection); only the merge waits for that. Demoting it here let the stale
+            # close shut a verified winner the bot itself owed a measurement. Only if the
+            # selection will re-measure it, though.
+            blocker = _unmeasurable_reason(repo, open_by_num[num], labs)
+            if blocker:
+                ok, why = False, f"{why}; not re-measured: {blocker}"
+            else:
+                print(f">> museglimmer round: #{num} stays in the running, merge waits ({why})")
+                stale_main.add(num)
+        if not ok and num not in stale_main:
             print(f">> museglimmer round: #{num} cannot be merge-first ({why})")
             if MUSEGLIMMER_MERGE_FIRST in labs:
                 stale_first.append(num)
@@ -2027,7 +2172,8 @@ def reconcile_museglimmer_merge_labels(repo, dry_run=False):
             entry = {"label": tier, "delta_pct": entry.get("delta_pct") or 0}
         scored.append((num, float(entry.get("delta_pct") or 0), entry.get("label") or tier))
 
-    scored.sort(key=lambda x: x[1], reverse=True)
+    # A PR that can merge now outranks one still waiting for its re-measure.
+    scored.sort(key=lambda x: (x[0] not in stale_main, x[1]), reverse=True)
     if not dry_run:
         for num in stale_first:
             arb.remove_label(repo, num, MUSEGLIMMER_MERGE_FIRST)
@@ -2041,7 +2187,9 @@ def reconcile_museglimmer_merge_labels(repo, dry_run=False):
     arb.add_label(repo, winner, MUSEGLIMMER_MERGE_FIRST)
     arb.remove_label(repo, winner, MUSEGLIMMER_NEEDS_REBASE)
     for num, _, _ in scored[1:]:
-        arb.add_label(repo, num, MUSEGLIMMER_NEEDS_REBASE)
+        # Nothing merges this round while the winner waits for its re-measure: no one needs a rebase.
+        if winner not in stale_main:
+            arb.add_label(repo, num, MUSEGLIMMER_NEEDS_REBASE)
         arb.remove_label(repo, num, MUSEGLIMMER_MERGE_FIRST)
     if AUTO_MERGE:
         try_auto_merge_museglimmer(repo, winner)
@@ -2060,6 +2208,9 @@ def upload_museglimmer_eval_log(repo, num, title, oid, res):
         result = {
             "id": rid, "pr": int(num), "title": title,
             "url": f"https://github.com/{repo}/pull/{num}", "commit": oid[:7],
+            # What was built: this commit merged onto that main (the Polaris receipt, whose schema
+            # has no field for it, names the PR commit alone).
+            "measured_onto": res.get("onto"),
             "eval_mode": "museglimmer-128",
             "label": res.get("label"), "pass": res.get("pass"), "reason": res.get("reason"),
             "delta_pct": res.get("delta_pct"),
@@ -2103,7 +2254,7 @@ def upload_museglimmer_eval_log(repo, num, title, oid, res):
         if commit.returncode != 0:
             print(">> museglimmer eval-log upload skipped: nothing to commit")
             return None
-        push = subprocess.run(["git", "-C", arb.LOG_DIR, "push", "-q"], check=False)
+        push = subprocess.run(["git", "-C", arb.LOG_DIR, "push", "-q"], check=False, timeout=300)
         if push.returncode != 0:
             print(f">> museglimmer eval-log push failed (rc={push.returncode})")
             return None
@@ -2115,12 +2266,72 @@ def upload_museglimmer_eval_log(repo, num, title, oid, res):
         return None
 
 
-def apply_result(repo, num, commit, res, title="", dry_run=False):
+def _head_now(repo, num):
+    try:
+        return (json.loads(arb.gh(["pr", "view", str(num), "-R", repo, "--json", "headRefOid"]).stdout
+                           or "{}").get("headRefOid") or "")
+    except (json.JSONDecodeError, AttributeError):
+        return ""
+
+
+def _remeasure_state(repo, num, head, labs, main_now):
+    """Is an already-evaluated head owed a re-measure onto today's main? True only when auto_merge_ok_museglimmer
+    refuses it for a moved main and nothing else: a passing speedup verdict for this head, measured
+    against a main other than today's. Merging it now would ship a combination nobody measured. A PR
+    the merge gate refuses for anything else (a block label, another bot's REJECT, a protected path,
+    a penalty, a conflict) is not re-measured every time main moves, since it could not merge anyway.
+    None when GitHub did not answer: unknown, which must neither re-measure nor close."""
+    entry = _load_scores().get(str(num)) or {}
+    if (entry.get("commit") != head or entry.get("label") not in SPEEDUP_LABELS
+            or not entry.get("pass") or labs & AUTOMERGE_BLOCK):
+        return False
+    if not main_now:
+        return None
+    if not arb.scored_against_stale_main(entry, main_now):
+        return False
+    ok, why = auto_merge_ok_museglimmer(repo, num, require_merge_first=False)
+    if not ok and why == arb.PR_UNREADABLE:
+        return None
+    return not ok and arb.refused_only_for_stale_main(why)
+
+
+def _remeasure_against_new_main(repo, num, head, labs, main_now):
+    """_remeasure_state, for the selection: only a definite yes spends GPU on it."""
+    return _remeasure_state(repo, num, head, labs, main_now) is True
+
+
+def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
+    if not res.get("ok") and res.get("conflict"):
+        # No verdict and no REJECT label: the PR does not merge onto the main this round measured,
+        # which says nothing about its change. Same outcome as the pre-GPU merge-conflict check.
+        print(f"PR #{num}: {res.get('reason')} — museglimmer-needs-rebase, no verdict")
+        if not dry_run:
+            arb.add_label(repo, num, MUSEGLIMMER_NEEDS_REBASE)
+        return
     if not res.get("ok") and res.get("retry"):
         # The box's fault (_is_box_fault, an unmeasured guard, an exception): nothing is posted and
-        # no label changes; the next round measures again.
-        print(f"PR #{num}: museglimmer eval deferred — {res.get('reason')} (infra; re-evaluated next round)")
-        return
+        # no label changes; the next round measures again -- except a fault of the PR's own run
+        # that recurs at one commit (while main's run passed each time), which after
+        # BOX_FAULT_STRIKES rounds is posted as a failed run. Retried for ever, such a PR never got a
+        # verdict, and being greenlit and unmeasured it is never stale either.
+        n = (arb.record_strikes(STRIKES_FILE, num, commit, res["strike_key"])
+             if res.get("strike_key") and not dry_run else 0)
+        if n < arb.BOX_FAULT_STRIKES:
+            print(f"PR #{num}: museglimmer eval deferred — {res.get('reason')} "
+                  f"({'the bot itself' if res.get('strike_key') == 'error' else 'infra'}; re-evaluated next "
+                  f"round{f', strike {n} of {arb.BOX_FAULT_STRIKES}' if n else ''})")
+            return
+        if res.get("strike_key") == "error":
+            # The bot's own failure, not the PR's: never charged. It stops measuring this commit
+            # (arb.gave_up) instead of retrying it every round for ever.
+            print(f"!! PR #{num}: the bot itself failed on {commit[:9]} {n} rounds in a row "
+                  f"({res.get('reason')}) — not measured again until a push; nothing posted")
+            GAVE_UP.add(num)
+            return
+        res = dict(res, retry=False,
+                   reason=f"{res.get('reason')} — {n} rounds at this commit, so it is charged to the PR")
+    if not dry_run:
+        arb.clear_strikes(STRIKES_FILE, num)
     body = format_comment(commit, res)
     label = res.get("label") if res.get("ok") else "REJECT"
     if not res.get("ok"):
@@ -2174,6 +2385,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "q36_guard_ok": res.get("q36_guard_ok"),
             "unsloth_guard_ok": res.get("unsloth_guard_ok"),
             "bonsai_guard_ok": res.get("bonsai_guard_ok"),
+            "onto": res.get("onto"),
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
@@ -2195,7 +2407,13 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         #
         # Abandoned PRs are still handled by the age-based stale close, which is about inactivity
         # rather than about a measurement.
-        if label in ("REJECT", "none"):
+        #
+        # Narrowed 2026-09-26: `none` closes only a PR declared for Muse Glimmer alone that no other
+        # bot scored a speedup or made merge-first (arb.none_may_close). An undeclared or "Shared"
+        # PR aimed at another model got this bot's `none` and was closed before that model's bot
+        # measured it. A REJECT is evidence of harm and still closes.
+        if label == "REJECT" or (label == "none" and arb.none_may_close(
+                pr_body, arb.labels_on_or_none(repo, num), "muse", EVAL_PREFIX)):
             if not res.get("q36_guard_ok", True):
                 fail_clause = "and regressed the Qwen3.6 no-regression guard (decode/prefill on shared code)"
             elif not res.get("modelopt_guard_ok", True):
@@ -2241,7 +2459,9 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                     "by hand; they score 0 by design. Reopen as a **draft**, or ask for `hold`, "
                     "and say so — being unscored is not grounds for closing that work.\n"
                     "- **Expected a speedup?** Re-measure against current `main` (it moves fast), "
-                    "and reopen with the new numbers — it re-evaluates on the next poll."
+                    "push the change as a new commit and reopen: the new commit is evaluated on "
+                    "the next poll (reopening alone does not re-run a commit that already has its "
+                    "verdict)."
                 )
             else:
                 close_body = (
@@ -2252,8 +2472,13 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                     "Every scored axis is also a no-regression floor, and the correctness and "
                     "cross-model guards are hard gates, so one failure closes the PR whatever it "
                     "was aiming at. The verdict comment above names which axis or gate failed. "
-                    "Reopen once it is addressed and it re-evaluates on the next poll."
+                    "Push a fix and reopen: the new commit is evaluated on the next poll "
+                    "(reopening alone does not re-run a commit that already has its verdict)."
                 )
+            # Not over a commit the author has already replaced (a push while it was measured).
+            if _head_now(repo, num) != commit:
+                print(f">> PR #{num}: not closed — its head moved since {commit[:9]} was measured")
+                return
             arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
             arb.gh(["pr", "close", str(num), "-R", repo])
             print(f">> auto-closed PR #{num} (eval-museglimmer:{label})")
@@ -2290,6 +2515,7 @@ def main():
     prs.sort(key=lambda p: p["number"])
 
     stale_closed = close_stale_museglimmer_prs(args.repo, prs, dry_run=args.dry_run) if not only else set()
+    main_now = arb.current_main_sha(args.repo)
 
     denylist = arb.load_denylist()
     pending = []
@@ -2299,6 +2525,15 @@ def main():
             continue
         if only and num not in only:
             continue
+        # A tier measured on an older head no longer describes this PR: dropped for drafts and held
+        # PRs too, which the checks below skip before the selection's own drop further down.
+        labs0, head0 = {l["name"] for l in pr.get("labels", [])}, (pr.get("headRefOid") or "")[:40]
+        if (not args.dry_run and (pr.get("isDraft") or arb.HOLD_LABEL in labs0)
+                and any(l.startswith(EVAL_PREFIX) or l == MUSEGLIMMER_NEEDS_REBASE for l in labs0)
+                and arb.strip_stale_verdict_labels(args.repo, num, labs0, EVAL_PREFIX, head0,
+                                                   museglimmer_evaluated_commits(args.repo, num), MUSEGLIMMER_NEEDS_REBASE,
+                                                   arb.pr_merge_conflict(pr.get("mergeable")))):
+            print(f"PR #{num} @ {head0[:9]}: no museglimmer verdict for this head yet — dropped the old eval-museglimmer label")
         if pr.get("isDraft"):
             continue
         # Gate — blocked contributor: never spend GPU on a flagged/sybil PR. Checks the opener
@@ -2317,9 +2552,22 @@ def main():
             continue
         head = (pr.get("headRefOid") or "")[:40]
         short = head[:9]
-        if not args.reeval and head and head in museglimmer_evaluated_commits(args.repo, num):
-            print(f"PR #{num} @ {short}: already museglimmer-evaluated — skip")
+        remeasure = False
+        evaluated = museglimmer_evaluated_commits(args.repo, num)
+        if evaluated is None:
+            # Not "no verdict yet": re-measuring, or dropping its labels, on a failed read is wrong.
+            print(f"PR #{num} @ {short}: GitHub did not return its comments — skipped this round")
             continue
+        # An eval-museglimmer tier measured on an older head no longer describes this PR.
+        if not args.dry_run and arb.strip_stale_verdict_labels(
+                args.repo, num, labs, EVAL_PREFIX, head, evaluated, MUSEGLIMMER_NEEDS_REBASE,
+                arb.pr_merge_conflict(pr.get("mergeable"))):
+            print(f"PR #{num} @ {short}: no museglimmer verdict for this head yet — dropped the old eval-museglimmer label")
+        if not args.reeval and head and head in evaluated:
+            if not _remeasure_against_new_main(args.repo, num, head, labs, main_now):
+                print(f"PR #{num} @ {short}: already museglimmer-evaluated — skip")
+                continue
+            remeasure = True
         # Did the author declare a DIFFERENT target model (#1027)? Checked before any GPU time.
         #
         # This bot used to evaluate every PR regardless, because no other bot guards Muse Glimmer.
@@ -2333,8 +2581,8 @@ def main():
         if skip_why:
             print(f"PR #{num}: {skip_why} — skip museglimmer eval")
             continue
-        # Does it edit the measuring instrument (HARNESS_PATHS)? This bot builds the PR's own copy,
-        # so a number measured with a changed ruler cannot be accepted either way.
+        # Does it edit the measuring instrument (HARNESS_PATHS)? The merged build would carry the
+        # PR's edit, so a number measured with a changed ruler cannot be accepted either way.
         touched = [f.get("path", "") for f in (pr.get("files") or [])]
         harness_hits = [t for t in touched if any(t.startswith(h) for h in HARNESS_PATHS)]
         if harness_hits:
@@ -2355,12 +2603,25 @@ def main():
         else:
             print(f"PR #{num}: --only-prs targeted")
 
+        # Measured merged onto the exact main the round's baseline measured (_remote_script `onto`).
         ref = f"pull/{num}/head"
-        pending.append((num, head, short, ref, pr.get("title", "")))
+        # Last, so only a PR the bot would otherwise measure keeps its run exiting 3.
+        if not args.reeval and arb.gave_up(STRIKES_FILE, num, head):
+            GAVE_UP.add(num)
+            print(f"PR #{num} @ {short}: the bot failed on this commit {arb.BOX_FAULT_STRIKES} rounds in a row — "
+                  f"not measured again until a push")
+            continue
+        if remeasure:
+            print(f"PR #{num} @ {short}: a merge candidate scored against an older main — re-measuring")
+        pending.append((num, head, short, ref, pr.get("title", ""), pr.get("body") or ""))
 
     if not pending:
         reconcile_museglimmer_merge_labels(args.repo, dry_run=args.dry_run)
         print("done — no museglimmer PRs to evaluate.")
+        if GAVE_UP:
+            print(f"!! museglimmer: gave up on {', '.join(f'#{n}' for n in sorted(GAVE_UP))} after the bot's own "
+                  f"errors; exiting 3 so the wrapper's failed-run banner shows it")
+            sys.exit(3)
         return
 
     if args.dry_run:
@@ -2383,6 +2644,9 @@ def main():
     _ssh_user = ssh_box_user() if ssh_box_enabled() else "root"
     print(f">> SSH {_ssh_user}@{host}:{port}")
 
+    if not arb.hold_bot_lock():
+        print(">> the shared bot lock stayed busy — nothing measured this run")
+        return
     print(">> measuring main baseline (once for this round, shared across all pending PRs) …")
     try:
         main_result = measure_main_baseline(host, port)
@@ -2396,12 +2660,14 @@ def main():
         print(f">> main baseline measurement failed: {main_result.get('reason')} — skipping round")
         reconcile_museglimmer_merge_labels(args.repo, dry_run=False)
         print("done — museglimmer round skipped (main baseline unusable).")
-        return
+        # Non-zero: a main that stays unusable stops this bot measuring anything, the PR fixing it
+        # included -- run_bot (cron_common.sh) makes a run of these loud.
+        sys.exit(3)
     print(f">> main baseline: decode={main_result['decode_tps']:.2f} "
           f"prefill128={main_result['prefill128_pp']:.2f} "
           f"top1={main_result.get('top1', 0):.3f} kl={main_result.get('kl', 99):.4f}")
 
-    for num, head, short, ref, title in pending:
+    for num, head, short, ref, title, pr_body in pending:
         print(f"PR #{num} @ {short}: evaluating Muse Glimmer '{ref}' …")
         try:
             res = eval_museglimmer_on_box(host, port, ref, main_result)
@@ -2414,10 +2680,14 @@ def main():
         commit, moved = arb.measured_commit(head, res)
         if moved:
             print(f">> PR #{num} moved during the round: listed {short}, measured {commit[:9]}")
-        apply_result(args.repo, num, commit or short, res, title=title, dry_run=False)
+        apply_result(args.repo, num, commit or short, res, title=title, dry_run=False, pr_body=pr_body)
 
     reconcile_museglimmer_merge_labels(args.repo, dry_run=False)
     print("done — museglimmer eval pass complete.")
+    if GAVE_UP:
+        print(f"!! museglimmer: gave up on {', '.join(f'#{n}' for n in sorted(GAVE_UP))} after the bot's own errors "
+              f"— see above; exiting 3 so the wrapper's failed-run banner shows it")
+        sys.exit(3)
 
 
 if __name__ == "__main__":

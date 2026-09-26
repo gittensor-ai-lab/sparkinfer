@@ -329,6 +329,19 @@ _GH_TRANSIENT_RE = re.compile(
     re.I)
 
 
+GH_TIMEOUT_S = int(os.environ.get("SPARKINFER_GH_TIMEOUT", "180"))
+
+
+def _gh_mutates(args):
+    """Does this gh call change something on GitHub (so repeating it could double it)?"""
+    a = list(args[:2])
+    if a[:1] == ["api"]:
+        return any(x in ("-X", "--method") for x in args) and not any(
+            x.upper() == "GET" for x in args)
+    return a in (["pr", "comment"], ["pr", "close"], ["pr", "merge"], ["pr", "edit"],
+                 ["pr", "reopen"], ["pr", "review"], ["issue", "comment"], ["label", "create"])
+
+
 def gh(args, retries=4, quiet=False):
     """Run `gh`, retrying transient GitHub failures and NEVER failing silently.
 
@@ -349,7 +362,16 @@ def gh(args, retries=4, quiet=False):
     """
     delay, last = 3, None
     for attempt in range(1, max(1, retries) + 1):
-        last = subprocess.run(["gh"] + args, capture_output=True, text=True)
+        # A timeout, so a hung GitHub call cannot hold the shared bot lock (and so every bot)
+        # indefinitely. It reads as a transient failure: retried, then warned about.
+        try:
+            last = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=GH_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            last = subprocess.CompletedProcess(["gh"] + args, 124, "", f"timed out after {GH_TIMEOUT_S}s")
+            if _gh_mutates(args):
+                # It may have gone through: a second comment, close or merge is worse than a
+                # warning. Read-only calls are retried as before.
+                break
         if last.returncode == 0:
             return last
         blob = (last.stderr or "") + (last.stdout or "")
@@ -386,9 +408,8 @@ def pr_involved_logins(repo, num):
     logins = set()
     info = json.loads(gh(["pr", "view", str(num), "-R", repo, "--json", "author"]).stdout or "{}")
     if info.get("author", {}).get("login"): logins.add(info["author"]["login"].lower())
-    out = subprocess.run(["gh", "api", f"repos/{owner}/{r}/pulls/{num}/commits",
-                          "--jq", ".[] | (.author.login // \"\") + \"\\n\" + (.committer.login // \"\")"],
-                         capture_output=True, text=True)
+    out = gh(["api", f"repos/{owner}/{r}/pulls/{num}/commits",
+              "--jq", ".[] | (.author.login // \"\") + \"\\n\" + (.committer.login // \"\")"])
     for l in (out.stdout or "").splitlines():
         if l.strip(): logins.add(l.strip().lower())
     return logins
@@ -446,6 +467,50 @@ def pr_draft_days(repo, pr, now=None, *, draft_since=None):
     return (now - since).total_seconds() / 86400.0
 
 
+# Paths in every model bot's HARNESS_PATHS: a PR touching one is measured by no bot, so it is not
+# waiting on any (test_sibling_bot_fixes checks each bot's list still contains them).
+NEVER_MEASURED_PATHS = ("runtime/examples/qwen3_gguf_bench.cpp", "runtime/examples/qwen3_gguf_cb_bench.cpp",
+                        "runtime/examples/qwen_checkpoint.h", "runtime/examples/qwen3_gguf_config.h",
+                        "eval/", "bench/scripts/")
+
+# A model bot's verdict marker (pr_bonsai_bot / pr_qwen38_bot / pr_museglimmer_bot ...):
+# <!-- sparkinfer-<bot>-eval:<schema>:<commit> {json} -->
+_MODEL_VERDICT_RE = re.compile(r"<!-- sparkinfer-[a-z0-9]+-eval:[^:\s]+:([0-9a-f]{7,40})(?:\s+(\{.*?\}))? -->",
+                               re.DOTALL)
+
+
+def awaiting_any_model_verdict(repo, pr):
+    """The daily stale close's form of waiting_for_first_verdict: greenlit, not conflicting, and no
+    model bot has posted a verdict for the current head yet. Unknown (GitHub did not answer) keeps."""
+    head = pr.get("headRefOid") or ""
+    if not head or pr_merge_conflict(pr.get("mergeable")):
+        return False
+    paths = [f.get("path", "") for f in (pr.get("files") or [])]
+    if any(p.startswith(h) for p in paths for h in NEVER_MEASURED_PATHS):
+        return False
+    labs = {l["name"] for l in pr.get("labels", [])}
+    if greenlight_status(repo, pr["number"], labs)[0] not in ("ok", "unknown"):
+        return False
+    r = gh(["pr", "view", str(pr["number"]), "-R", repo, "--json", "comments"])
+    try:
+        comments = json.loads(r.stdout or "").get("comments")
+    except (json.JSONDecodeError, AttributeError):
+        comments = None
+    if r.returncode != 0 or not isinstance(comments, list):
+        return True
+    for c in comments:
+        if not trusted_marker_comment(c):
+            continue
+        for m in _MODEL_VERDICT_RE.finditer(c.get("body") or ""):
+            try:
+                meta = json.loads(m.group(2)) if m.group(2) else {}
+            except json.JSONDecodeError:
+                meta = {}
+            if head.startswith(m.group(1)) and meta.get("label") is not None:
+                return False
+    return True
+
+
 def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False, *, drafts_only=None):
     """Close open PRs with no GitHub activity for more than `days` days.
 
@@ -457,8 +522,9 @@ def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False, *, drafts_only=None
     if days <= 0:
         return set()
     now = datetime.datetime.now(datetime.timezone.utc)
-    prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open",
-                         "--json", "number,title,updatedAt,labels,isDraft"]).stdout or "[]")
+    prs = json.loads(gh(["pr", "list", "-R", repo, "--state", "open", "--limit", str(PR_LIST_LIMIT),
+                         "--json", "number,title,updatedAt,labels,isDraft,headRefOid,mergeable,files"]).stdout
+                     or "[]")
     closed = set()
     for pr in prs:
         num = pr["number"]
@@ -468,10 +534,16 @@ def close_stale_prs(repo, days=STALE_PR_DAYS, dry_run=False, *, drafts_only=None
         if drafts_only is False and is_draft:
             continue
         labels = {l["name"] for l in pr.get("labels", [])}
-        if labels & STALE_CLOSE_SKIP_LABELS:
+        # Any bot's merge-first, not only the AR bot's: the model bots' round winners were closed
+        # here when their merge waited out two quiet days.
+        if labels & STALE_CLOSE_SKIP_LABELS or any(is_any_merge_first(l) for l in labels):
             continue
         inactive = pr_inactive_days(pr, now)
         if inactive is None or inactive <= days:
+            continue
+        if not is_draft and awaiting_any_model_verdict(repo, pr):
+            # Greenlit and queued: the quiet is the bots' (a backlog, a box outage), not the author's.
+            print(f"PR #{num}: idle {int(inactive)}d but still waiting for a model bot's first verdict — kept open")
             continue
         days_idle = int(inactive)
         kind = "draft stale" if is_draft else "stale"
@@ -631,8 +703,10 @@ def close_unchecked_rtx5090_prs(repo, dry_run=False):
             continue
         labels = {l["name"] for l in pr.get("labels", [])}
         legacy = NOT_TESTED_LABEL in labels
-        body = (json.loads(gh(["pr", "view", str(num), "-R", repo, "--json", "body"]).stdout or "{}")
-                .get("body") or "")
+        body = pr_body_or_none(repo, num)
+        if body is None:
+            print(f"PR #{num}: GitHub did not return its body — not judged this run")
+            continue
         areas = areas_for_pr(repo, num)
         runtime_gate = "runtime" in areas
         if not legacy and not rtx5090_should_close(body, areas):
@@ -696,6 +770,10 @@ def none_reject_eval_count(repo, num):
     r = gh(["pr", "view", str(num), "-R", repo, "--json", "comments"])
     n = 0
     for c in json.loads(r.stdout or "{}").get("comments", []):
+        # Only a verdict someone with write access posted counts: three pasted copies of the
+        # comment format used to get any PR closed by the sync cron within 15 minutes.
+        if not trusted_marker_comment(c):
+            continue
         if _eval_verdict_from_comment(c.get("body", "")) in FAIL_VERDICT_LABELS:
             n += 1
     return n
@@ -717,7 +795,7 @@ def close_exhausted_eval_prs(repo, max_none_reject=EXHAUSTED_EVAL_MAX, dry_run=F
         if pr.get("isDraft"):
             continue
         labels = {l["name"] for l in pr.get("labels", [])}
-        if labels & STALE_CLOSE_SKIP_LABELS:
+        if labels & STALE_CLOSE_SKIP_LABELS or any(is_any_merge_first(l) for l in labels):
             continue
         count = none_reject_eval_count(repo, num)
         if count <= max_none_reject:
@@ -1074,9 +1152,12 @@ def greenlight_status(repo, num, pr_labels):
       'ok'        — greenlit: box ticked + real decode and/or prefill before<after gain
       'no-bench'  — box ticked but neither table shows a claimed improvement
       'unchecked' — the 'Tested on RTX 5090' box is not ticked
+      'unknown'   — GitHub did not return the body: not greenlit this time, and never a reason
+                    to close anything (callers that close treat it as "keep")
     Checking the box is necessary but NOT sufficient — decode or prefill gain must be claimed."""
-    body = (json.loads(gh(["pr", "view", str(num), "-R", repo, "--json", "body"]).stdout or "{}")
-            .get("body") or "")
+    body = pr_body_or_none(repo, num)
+    if body is None:
+        return "unknown", "GitHub did not return the PR body"
     if not rtx5090_box_checked(body):
         return "unchecked", "RTX-5090 box unchecked"
     d_before, d_after = _decode_val(body, "before"), _decode_val(body, "after")
@@ -1103,6 +1184,19 @@ def greenlight_status(repo, num, pr_labels):
         return ("no-bench",
                 "box ticked but decode and/or prefill before/after not filled with real numbers")
     return "no-bench", "box ticked but no claimed decode or prefill improvement"
+
+def pr_body_or_none(repo, num):
+    """The PR's body ("" when it has none), or None when GitHub did not answer. A failed read used
+    to look exactly like an empty body -- an unticked box, which closes PRs."""
+    r = gh(["pr", "view", str(num), "-R", repo, "--json", "body"])
+    try:
+        data = json.loads(r.stdout or "")
+    except json.JSONDecodeError:
+        return None
+    if r.returncode != 0 or not isinstance(data, dict):
+        return None
+    return data.get("body") or ""
+
 
 def pr_merge_conflict(mergeable):
     """True when GitHub reports the PR cannot merge cleanly into its base branch."""
@@ -1143,6 +1237,17 @@ def labels_on(repo, num):
     out = gh(["api", f"repos/{owner}/{r}/issues/{num}/labels", "--jq", "[.[].name]"])
     try: return set(json.loads(out.stdout))
     except Exception: return set()
+
+def labels_on_or_none(repo, num):
+    """labels_on, but None when GitHub did not answer: a decision that must see every label (a close)
+    cannot take an unread set for an empty one."""
+    owner, r = _owner_repo(repo)
+    out = gh(["api", f"repos/{owner}/{r}/issues/{num}/labels", "--jq", "[.[].name]"])
+    try:
+        names = json.loads(out.stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return set(names) if out.returncode == 0 and isinstance(names, list) else None
 
 def add_label(repo, num, label):
     owner, r = _owner_repo(repo)
@@ -1245,7 +1350,9 @@ PR_UNREADABLE = "could not read the PR from GitHub"
 def exception_result(e):
     """What a bot records when evaluating one PR raised.
 
-    A transport failure is the box's: retried next round, nothing posted. A run killed at the ssh
+    Anything else (a transport failure, a bug in the bot) is not the PR's: retried next round with
+    nothing posted, and after BOX_FAULT_STRIKES rounds at one commit no longer measured (gave_up),
+    still never charged to the PR. A run killed at the ssh
     time limit (2 h) is different -- main completed the same script this round, so it is almost
     always a hang in the PR's own code, and retrying it would hold the shared box for two hours
     every round with nothing to show. It is posted as a failed run, with a label in its marker so
@@ -1254,7 +1361,358 @@ def exception_result(e):
         return {"ok": False, "retry": False, "label": "REJECT", "log": "",
                 "reason": f"the PR run was killed after {int(e.timeout or 0)} s — most likely a hang "
                           f"in the PR's code (main completed the same run this round)"}
-    return {"ok": False, "retry": True, "reason": f"exception: {type(e).__name__}: {e}"}
+    # "error": the bot's own failure. Counted like a box fault, but never charged to the PR: after
+    # BOX_FAULT_STRIKES rounds at one commit the bot stops measuring it (gave_up) and says so.
+    return {"ok": False, "retry": True, "strike_key": "error", "reason": f"exception: {type(e).__name__}: {e}"}
+
+
+# A fault charged to the box is retried with nothing posted. One that recurs at the same commit
+# for this many rounds -- while main's own run passed every one of them -- is charged to the PR:
+# a PR that crashes the box, or keeps it from draining, would otherwise be retried every hour for
+# ever with nothing ever posted (and, being greenlit and unmeasured, is never stale either).
+BOX_FAULT_STRIKES = 3
+
+
+def _load_strikes(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def record_strike(path, num, commit, key):
+    """Count one more round in which `key` failed for PR `num` at `commit`; returns that key's count.
+
+    Counts are kept per key, and a new commit starts them all again. Before, one entry held one key
+    and any other failure in between reset it, so a PR alternating between two kinds of failure was
+    never judged at all."""
+    data = _load_strikes(path)
+    prev = data.get(str(num)) or {}
+    counts = {}
+    if prev.get("commit") == commit:
+        counts = dict(prev.get("counts") or {})
+        if not counts and prev.get("key"):                  # an entry from before the per-key form
+            counts = {prev["key"]: int(prev.get("count") or 0)}
+    counts[key] = int(counts.get(key, 0)) + 1
+    data[str(num)] = {"commit": commit, "counts": counts,
+                      "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    write_json_atomic(path, data)
+    return counts[key]
+
+
+def strike_count(path, num, commit, key):
+    prev = _load_strikes(path).get(str(num)) or {}
+    return int((prev.get("counts") or {}).get(key, 0)) if prev.get("commit") == commit else 0
+
+
+def gave_up(path, num, commit):
+    """Has the bot stopped measuring this commit? After BOX_FAULT_STRIKES rounds in which it failed
+    on it itself (exception_result's "error") -- never charged to the PR, never retried for ever."""
+    return strike_count(path, num, commit, "error") >= BOX_FAULT_STRIKES
+
+
+def record_strikes(path, num, commit, keys):
+    """record_strike once for each distinct key of a `+`-joined set; returns the highest count.
+    Once each: four guards failing the same way in one round are one round, not four."""
+    return max(record_strike(path, num, commit, k) for k in sorted(set((keys or "").split("+"))) if k)
+
+
+def clear_strikes(path, num):
+    data = _load_strikes(path)
+    if data.pop(str(num), None) is not None:
+        write_json_atomic(path, data)
+
+
+def write_json_atomic(path, data):
+    """Write JSON so a kill mid-write leaves the old file, never an empty one: an emptied scores file
+    made every verified PR lose its merge eligibility and be measured again."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f">> save skipped ({path}): {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def guard_measured(rows):
+    """Did a guard measure anything? Rows of zeros (a sweep that printed no numbers) are nothing: a
+    main baseline of zeros made the guard compare nothing, and a PR that crashed it was retried."""
+    return any(isinstance(v, dict) and any((x or 0) > 0 for x in v.values()) for v in (rows or {}).values())
+
+
+def failed_rc(line):
+    """The exit code a remote `<TAG>_FAILED ... rc=<n>` line reports, or None. 137 is SIGKILL -- the
+    host OOM killer, whose trigger may be anything on the box -- so the bots count it as the box's."""
+    for tok in (line or "").split()[1:]:
+        if tok.startswith("rc="):
+            try:
+                return int(tok[3:])
+            except ValueError:
+                return None
+    return None
+
+
+def merge_conflict_line(stdout, stderr):
+    """The MERGE_CONFLICT line merged_checkout_script printed, or "" -- only when the merge is where
+    the run stopped (no PR_TIP line followed), so a build log or program output that merely
+    contains the word cannot turn a failed run into a rebase request."""
+    if any(l.startswith("PR_TIP ") for l in (stdout or "").splitlines()):
+        return ""
+    for l in ((stderr or "") + "\n" + (stdout or "")).splitlines():
+        if l.startswith("MERGE_CONFLICT "):
+            return l.strip()
+    return ""
+
+
+# The freshness refusal from fresh_against_main. Reconcile treats a PR refused for this alone as
+# still in the running -- it is re-measured, not demoted -- so it must be the LAST check an
+# auto_merge_ok_* makes: returned only when nothing else stands in the way of the merge.
+STALE_MAIN_PREFIX = "scored against main "
+
+
+def fresh_against_main(repo, entry):
+    """(ok, why): was this scores-file entry measured against the main that is there now?"""
+    main_now = current_main_sha(repo)
+    if not main_now:
+        return False, PR_UNREADABLE
+    if scored_against_stale_main(entry, main_now):
+        return False, (f"{STALE_MAIN_PREFIX}{((entry or {}).get('onto') or '?')[:9]}, main is now "
+                       f"{main_now[:9]} — re-measured before it may merge")
+    return True, "ok"
+
+
+def refused_only_for_stale_main(why):
+    return (why or "").startswith(STALE_MAIN_PREFIX)
+
+
+def current_main_sha(repo):
+    """The full SHA main points at now, or "" when GitHub does not say."""
+    r = gh(["api", f"repos/{repo}/commits/main", "--jq", ".sha"])
+    sha = (r.stdout or "").strip()
+    return sha if _FULL_SHA_RE.match(sha) else ""
+
+
+def scored_against_stale_main(entry, main_sha):
+    """Was this scores-file entry measured against a main other than `main_sha`?
+
+    A verdict holds for the code it measured: the PR merged onto one main commit. Once any bot has
+    merged something else, merging the PR produces a combination nobody measured -- so the PR is
+    re-measured against the new main before it may be merged (the model bots' auto_merge_ok_*, and
+    their selection). An entry without "onto" predates the check and counts as stale."""
+    return not main_sha or (entry or {}).get("onto") != main_sha
+
+
+def waiting_for_first_verdict(repo, pr, evaluated, never_paths=(), rebase_label=None):
+    """Keep a PR out of the stale close while it waits on the bot rather than on its author.
+
+    `evaluated` is the bot's set of commits with a verdict (None: GitHub did not say -- kept). A
+    greenlit PR whose current head has no verdict yet is queued: the delay is the bot's (a backlog,
+    a box outage, a baseline that keeps failing), and "not being measured is not grounds for
+    closing" (CONTRIBUTING). A PR that is not greenlit, already has its verdict, conflicts with
+    main (GitHub's word, or this bot's own `rebase_label` -- another bot's may be left from an older
+    head), or touches `never_paths` (the harness the bot will not measure a change to) is waiting on
+    its author and may go stale. A PR the box keeps failing on is bounded separately: its box
+    faults are charged to it after BOX_FAULT_STRIKES rounds (record_strike)."""
+    head = pr.get("headRefOid") or ""
+    if not head:
+        return False
+    if evaluated is None:
+        return True
+    if head in evaluated or pr_merge_conflict(pr.get("mergeable")):
+        return False
+    paths = [f.get("path", "") for f in (pr.get("files") or [])]
+    if never_paths and any(p.startswith(h) for p in paths for h in never_paths):
+        return False
+    labs = {l["name"] for l in pr.get("labels", [])}
+    if rebase_label and rebase_label in labs:                  # this bot found it does not merge
+        return False
+    return greenlight_status(repo, pr["number"], labs)[0] in ("ok", "unknown")
+
+
+def strip_stale_verdict_labels(repo, num, labels, prefix, head, evaluated, rebase_label=None,
+                               conflicting=False):
+    """A bot's `eval-<model>:<tier>` belongs to the commit it measured. Once the head has moved to a
+    commit the bot has no verdict for, drop that label and re-derive the generic `eval:*`, so a tier
+    measured on older code cannot ride along -- into the generic label SN74 reads, or into another
+    bot's merge of the new head. Returns True when something was removed."""
+    stale = [l for l in labels if l.startswith(prefix)]
+    # The bot's needs-rebase was about an older head too -- unless GitHub says this one conflicts.
+    # Left on a rebased head, it made the PR look like it waited on its author (stale-closable).
+    rebase = [rebase_label] if rebase_label and rebase_label in labels and not conflicting else []
+    if not (stale or rebase) or not head or evaluated is None or head in evaluated:
+        return False
+    for lab in stale + rebase:
+        remove_label(repo, num, lab)
+    if stale and sync_generic_eval_label(repo, num) is None:
+        # No per-bot tier is left, and sync leaves the generic label alone then: this bot's was the
+        # one it mirrored, so it goes too.
+        for lab in labels_on(repo, num):
+            if lab.startswith("eval:") and lab[len("eval:"):] in GENERIC_TIER_RANK:
+                remove_label(repo, num, lab)
+    return True
+
+
+BOT_LOCK_FILE = os.environ.get("SPARKINFER_LOCK_FILE", "/tmp/sparkinfer_bot.lock")
+_bot_lock = None
+
+
+def _inherited_bot_lock_fd():
+    """A descriptor this process inherited on BOT_LOCK_FILE, or None."""
+    target = os.path.realpath(BOT_LOCK_FILE)
+    try:
+        fds = os.listdir("/proc/self/fd")
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            if os.path.realpath(os.readlink(f"/proc/self/fd/{fd}")) == target:
+                return int(fd)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+# Taken at import, as the bot starts: only a descriptor the process was born with is its parent's.
+_INHERITED_BOT_LOCK_FD = _inherited_bot_lock_fd()
+
+
+def hold_bot_lock(wait_s=None):
+    """Hold the lock every bot's cron wrapper takes, before any GPU work. The round guard
+    (round_guard_sh) stops any earlier round still running on the box, so a round started by hand
+    beside a cron round would kill it -- and two rounds on one GPU measure nothing anyway. A run
+    started by a wrapper already holds the lock (SPARKINFER_BOT_LOCK_HELD=1): taking it again
+    would wait on its own parent. Returns False if it stayed busy for `wait_s` seconds."""
+    global _bot_lock
+    if _bot_lock is not None or os.environ.get("SPARKINFER_BOT_LOCK_HELD") == "1":
+        return True
+    import fcntl
+    # A wrapper that predates SPARKINFER_BOT_LOCK_HELD still passes its locked descriptor down (fd 9):
+    # locking that same open file succeeds at once, where a new open would wait on the parent.
+    fd = _INHERITED_BOT_LOCK_FD
+    if fd is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _bot_lock = fd
+            return True
+        except OSError:
+            pass
+    wait_s = int(os.environ.get("SPARKINFER_BOT_LOCK_WAIT_S", "3600")) if wait_s is None else wait_s
+    f = open(BOT_LOCK_FILE, "a")
+    deadline, said = time.time() + wait_s, False
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _bot_lock = f
+            return True
+        except OSError:
+            if time.time() >= deadline:
+                f.close()
+                return False
+            if not said:
+                print(f">> another bot round holds {BOT_LOCK_FILE} — waiting up to {wait_s}s for it")
+                said = True
+            time.sleep(10)
+
+
+def evaluated_commits_from(repo, num, marker_re, title):
+    """Commits that already carry this bot's verdict: its marker (`marker_re`, group 1 = commit,
+    group 2 = JSON meta) in a comment containing `title`, posted by a member or collaborator, with a
+    non-null label. None when GitHub did not answer -- unknown, not "none yet": a caller must not
+    strip labels, re-measure or stale-close on it."""
+    r = gh(["pr", "view", str(num), "-R", repo, "--json", "comments"])
+    try:
+        comments = json.loads(r.stdout or "").get("comments")
+    except (json.JSONDecodeError, AttributeError):
+        comments = None
+    if r.returncode != 0 or not isinstance(comments, list):
+        return None
+    done = set()
+    for c in comments:
+        body = c.get("body") or ""
+        m = marker_re.search(body)
+        if not m or title not in body or not trusted_marker_comment(c):
+            continue
+        try:
+            meta = json.loads(m.group(2)) if m.group(2) else {}
+        except json.JSONDecodeError:
+            meta = {}
+        if meta.get("label") is None:
+            continue
+        done.add(m.group(1))
+    return done
+
+
+def round_guard_sh(bot):
+    """Bash run first in a model bot's remote script: stop whatever a previous round left running.
+
+    A round killed at the ssh time limit, or whose controller-side process died, leaves its remote
+    script running -- it keeps starting benchmarks, holds the GPU, and fails every later baseline
+    (seen on 2026-09-25). The shared bot lock guarantees no other round is live, so any recorded
+    round still alive is an orphan. Rounds are recorded as `<pid> <start time>`, so a reused pid is
+    never mistaken for one. The whole ssh session goes when the round's shell leads it (it does:
+    the bots run `ssh ... bash -s`), so stages `timeout` moved into groups of their own go with it."""
+    return r"""
+ROUND_DIR=/tmp/sparkinfer-bot-rounds
+mkdir -p "$ROUND_DIR"
+for pf in "$ROUND_DIR"/*.pid; do
+  [ -f "$pf" ] || continue
+  opid=""; ostart=""
+  read -r opid ostart < "$pf" || true
+  if [ -n "$opid" ] && [ "$opid" != "$$" ] && [ -r "/proc/$opid/stat" ] && \
+     [ "$(awk '{print $22}' "/proc/$opid/stat" 2>/dev/null)" = "$ostart" ]; then
+    # `|| true`: the orphan may exit between the check above and this line (set -e, pipefail).
+    osid="$(ps -o sid= -p "$opid" 2>/dev/null | tr -d ' ' || true)"
+    opg="$(ps -o pgid= -p "$opid" 2>/dev/null | tr -d ' ' || true)"
+    echo "reaping a previous round left running: pid $opid ($(basename "$pf" .pid))" >&2
+    if [ -n "$osid" ] && [ "$osid" = "$opid" ]; then
+      # The round's `bash -s` leads its ssh session. By session, not process group: `timeout`
+      # moves each stage it wraps into a group of its own, and those outlived a group kill.
+      pkill -TERM -s "$opid" 2>/dev/null || true
+      sleep 5
+      pkill -KILL -s "$opid" 2>/dev/null || true
+    elif [ -n "$opg" ] && [ "$opg" = "$opid" ]; then
+      kill -TERM -- "-$opg" 2>/dev/null || true
+      sleep 5
+      kill -KILL -- "-$opg" 2>/dev/null || true
+    else
+      pkill -TERM -P "$opid" 2>/dev/null || true
+      kill -TERM "$opid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$pf"
+done
+echo "$$ $(awk '{print $22}' /proc/$$/stat)" > "$ROUND_DIR/""" + bot + r""".pid"
+"""
+
+
+_SPEEDUP_TIERS = {"XL", "L", "M", "S", "XS"}
+
+
+def none_may_close(body, labels, my_model, my_prefix):
+    """May a bot close a PR on its own `none`? Only when the PR declares this bot's model and no
+    other, and no other bot has scored it a speedup or made it merge-first.
+
+    `none` is an absence of evidence (CONTRIBUTING: a change neutral on one model "is not penalized
+    for the neutral result"; over-ticking "costs eval time"). Before 2026-09-26 the Muse and Qwen3.8
+    bots closed on it for every PR they evaluated -- undeclared, "Shared", or ticked for both -- so a
+    Muse speedup ticked Shared, as the template advises, was closed by the Qwen3.8 bot's `none`."""
+    if labels is None or declared_models(body or "") != {my_model}:     # unread labels: no close
+        return False
+    own_first = my_prefix[len("eval-"):].rstrip(":") + "-merge-first"
+    for lab in labels or ():
+        if is_any_merge_first(lab) and lab != own_first:
+            return False
+        m = _PER_BOT_EVAL_RE.match(lab)
+        if m and not lab.startswith(my_prefix) and m.group(1).strip() in _SPEEDUP_TIERS:
+            return False
+    return True
 
 
 def is_any_merge_first(label):
@@ -2979,6 +3437,9 @@ def main():
             first_time = NEEDS_BENCH_LABEL not in pr_labels
             _reconcile(NEEDS_BENCH_LABEL, [EVAL_GATE_LABEL, NOT_TESTED_LABEL])
             if first_time and not args.dry_run: post_needs_bench_comment(args.repo, num)
+        elif status == "unknown":
+            print(f"PR #{num}: {reason} — skipped this run")
+            continue
         else:  # unchecked
             if HOLD_LABEL in pr_labels:
                 print(f"PR #{num}: not greenlit ({reason}) — hold, skip close")

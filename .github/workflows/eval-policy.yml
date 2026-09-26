@@ -36,9 +36,13 @@ jobs:
           bash -n bench/scripts/warm_llamacpp.sh
           bash -n eval/run_bot_cron.sh
           bash -n eval/setup_labels.sh
-          # Qwen3.8-27B is the scored model (eval/README.md); its cron wrapper is the one that
-          # actually runs, so a syntax error here silently stops all scoring.
+          # The wrappers cron actually runs (eval/README.md): a syntax error in one silently stops
+          # that bot's scoring.
           bash -n eval/run_qwen38_cron.sh
+          bash -n eval/run_museglimmer_cron.sh
+          bash -n eval/run_bonsai_pr_cron.sh
+          bash -n eval/run_sync_cron.sh
+          bash -n eval/cron_common.sh
 
       - name: Python syntax
         run: |
@@ -51,6 +55,12 @@ jobs:
             eval/vast_eval.py \
             eval/pr_qwen38_bot.py \
             eval/test_pr_qwen38_bot.py \
+            eval/pr_museglimmer_bot.py \
+            eval/pr_bonsai_bot.py \
+            eval/bonsai_regression.py \
+            eval/test_pr_bonsai_bot.py \
+            eval/test_sibling_bot_fixes.py \
+            eval/test_cron_wrappers.py \
             eval/noise_penalty.py \
             eval/test_noise_penalty.py \
             bench/scripts/accuracy_compare_pair.py
@@ -61,6 +71,10 @@ jobs:
           python3 bench/scripts/test_label.py
           python3 eval/test_pr_eval_bot.py
           python3 eval/test_pr_qwen38_bot.py
+          python3 eval/test_pr_bonsai_bot.py
+          python3 eval/test_sibling_bot_fixes.py
+          # The cron wrappers, run for real against a throwaway origin (no GitHub, no GPU box).
+          python3 eval/test_cron_wrappers.py
           python3 eval/test_noise_penalty.py
           # The ban list itself is policy: a malformed line must fail review, not a 3am cron.
           python3 eval/noise_penalty.py --check

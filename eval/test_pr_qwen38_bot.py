@@ -2,6 +2,18 @@ import unittest
 
 import pr_qwen38_bot as bot
 
+# Nothing here may touch the controller's own state: every file the bot writes goes to a temp dir.
+import atexit as _atexit
+import os as _os
+import shutil as _shutil
+import tempfile as _tempfile
+_STATE = _tempfile.mkdtemp(prefix="sparkinfer-bot-tests-")
+_atexit.register(_shutil.rmtree, _STATE, True)
+for _mod, _names in ((bot.arb, ("INSTANCE_FILE", "PIN_FILE", "BOT_LOCK_FILE")), (bot, ("STRIKES_FILE", "SCORES_FILE"))):
+    for _n in _names:
+        setattr(_mod, _n, _os.path.join(_STATE, f"{_mod.__name__}.{_n}"))
+bot.arb.PINNED_INSTANCE = ""
+
 
 class ConcurrencyAxesTests(unittest.TestCase):
     def test_concurrency_is_scored_and_c1_is_only_a_floor(self):
@@ -231,8 +243,6 @@ class ConcurrencyGuardTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("muse glimmer concurrent guard measurement unavailable", problems)
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class MergeOntoBaselineTests(unittest.TestCase):
@@ -272,3 +282,7 @@ class MergeOntoBaselineTests(unittest.TestCase):
         src = open(bot.__file__).read()
         self.assertNotIn("_merge_ref_exists", src)
         self.assertIn('ref = f"pull/{num}/head"', src)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -3,27 +3,36 @@
 #
 #   15 * * * * GH_TOKEN="$(gh auth token -u <bot account>)" /path/to/sparkinfer/eval/run_bonsai_pr_cron.sh >> /tmp/sparkinfer_bonsai_bot.log 2>&1
 #
+#   Without GH_TOKEN every tick is refused. The bot runs origin/main from its own worktree; this
+#   script is /path/to/sparkinfer's copy, so keep that checkout on main (cron_common.sh).
+#
 #   Hourly at :15 (2026-09-24; started every two hours, moved to hourly the same day), between the
-#   Muse Glimmer bot's :00 and the Qwen3.8 bot's :30. A round with a pending PR holds the one GPU for
-#   ~40 min, so when it overlaps a sibling round this tick defers on the shared lock and retries next
-#   hour -- that is expected, not an error. A tick with nothing to evaluate never touches the GPU.
+#   Muse Glimmer bot's :00 and the Qwen3.8 bot's :30. A round holds the one GPU for ~40 min per
+#   pending PR, so when it overlaps a sibling round this tick defers on the shared lock and retries
+#   next hour -- that is expected, not an error (cron_common.sh makes a long run of skips loud). A
+#   tick with nothing to evaluate never touches the GPU.
 #
 # Policy (same as the sibling wrappers):
 #   • Pinned eval box only; never rent / never start from cron when down.
 #   • Shares /tmp/sparkinfer_bot.lock with every other bot -- they all drive the ONE pinned GPU.
+#   • Runs origin/main from its own worktree, and only with a GH_TOKEN (cron_common.sh).
 #   • GPU up → full eval; GPU down → --labels-only.
-#   • Auto-merge and auto-close stay OFF unless SPARKINFER_BONSAI_AUTOMERGE=1 /
-#     SPARKINFER_BONSAI_AUTOCLOSE=1 are set explicitly. Neither is exported here.
+#   • Auto-merge follows SPARKINFER_BONSAI_AUTOMERGE (=1 in .env.eval). Auto-close is ON unless
+#     SPARKINFER_BONSAI_AUTOCLOSE=0: a measured REJECT closes, and `none` closes only a PR declared
+#     for Ternary-Bonsai alone (pr_bonsai_bot.py). This script sets neither.
 export HOME="${HOME:-/home/autotiny}"
 export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1
 export VAST_NO_AUTO_PROVISION=1
 
-exec 9>/tmp/sparkinfer_bot.lock
-flock -w 120 9 || { echo "[$(date -u +%FT%TZ)] lock held 120s+ — previous bot run still active, skipping bonsai tick"; exit 0; }
-
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_DIR" || exit 1
+# shellcheck source=eval/cron_common.sh
+source "$REPO_DIR/eval/cron_common.sh" || exit 1
+
+exec 9>"$LOCK_FILE"
+flock -w "$LOCK_WAIT_S" 9 || { note_lock_skip bonsai; exit 0; }
+note_lock_taken bonsai
+cd "$REPO_DIR" || { note_refused bonsai "cannot enter $REPO_DIR"; exit 1; }
 
 if [ -f "$REPO_DIR/.env.eval" ]; then
   set -a
@@ -34,7 +43,11 @@ fi
 export VAST_NO_AUTO_PROVISION=1
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 
-git pull -q origin main 2>/dev/null || true
+require_bot_token bonsai || exit 1
+# The bot runs exactly origin/main, from its own worktree -- not whatever REPO_DIR has checked out.
+prepare_bot_tree || { note_refused bonsai "$TREE_WHY"; exit 1; }
+cd "$BOT_TREE" || { note_refused bonsai "cannot enter $BOT_TREE"; exit 1; }
+note_ran bonsai
 
 PIN_FILE="${VAST_PIN_FILE:-$HOME/.sparkinfer_pinned_instance}"
 INSTANCE_FILE="${VAST_INSTANCE_FILE:-$HOME/.sparkinfer_vast_instance}"
@@ -70,7 +83,7 @@ gpu_ready() {
     # ssh-agent, so without it a box whose authorized_keys only has SSH_KEY's public half (not
     # some agent identity) fails outright with "Permission denied".
     local err rc
-    err="$(ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
+    err="$(timeout 60 ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
         -o StrictHostKeyChecking=accept-new -p "$port" "$user@$host" 'true' 2>&1)"
     rc=$?
     [ "$rc" -eq 0 ] || echo "gpu_ready: ssh to $user@$host:$port failed (exit=$rc): $err" >&2
@@ -80,7 +93,7 @@ gpu_ready() {
   [ -n "$iid" ] && [ "$iid" != "0" ] || return 1
   command -v vastai >/dev/null 2>&1 || return 1
   local raw st ip port
-  raw="$(vastai show instance "$iid" --raw 2>/dev/null)" || return 1
+  raw="$(timeout 60 vastai show instance "$iid" --raw 2>/dev/null)" || return 1
   read -r st ip port < <(python3 -c "
 import json, sys
 d = json.loads(sys.stdin.read() or '{}')
@@ -91,7 +104,7 @@ p = ((ports.get('22/tcp') or [{}])[0] or {}).get('HostPort') or ''
 print(st, ip, p)
 " <<<"$raw")
   [ "$st" = "running" ] && [ -n "$ip" ] && [ -n "$port" ] || return 1
-  ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=10 \
+  timeout 60 ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=10 \
       -o StrictHostKeyChecking=accept-new -p "$port" "root@$ip" 'true' 2>/dev/null
 }
 
@@ -100,48 +113,15 @@ GPU_LABEL="${EVAL_SSH_HOST:-ssh}"
 
 TS="$(date -u +%FT%TZ)"
 
-# Outage escalation, ported verbatim from run_museglimmer_cron.sh (itself from run_dspark_cron.sh).
-# A dead box does NOT stop the tick — it degrades it to --labels-only, which
-# logs one ordinary-looking line and exits 0. On 2026-09-04/05 that ran 14 consecutive times and
-# nothing got louder, so the outage was only found by someone asking why there were no new
-# numbers; on 2026-09-08 the counter below is what made a one-tick outage visible immediately.
-# Silent degradation is the right RUNTIME behaviour — never rent, never fail a tick — but it must
-# not be silent to a reader.
+# A dead box degrades the tick to --labels-only; cron_common.sh's note_gpu_down makes the outage loud.
 DOWN_FILE="${BONSAI_DOWN_FILE:-$HOME/.sparkinfer_bonsai_gpu_down}"
-note_gpu_up() { rm -f "$DOWN_FILE"; }
-note_gpu_down() {
-  local n first
-  n=0; first="$TS"
-  if [ -f "$DOWN_FILE" ]; then
-    n="$(sed -n 1p "$DOWN_FILE" 2>/dev/null | tr -dc '0-9')"; n="${n:-0}"
-    first="$(sed -n 2p "$DOWN_FILE" 2>/dev/null)"; first="${first:-$TS}"
-  fi
-  n=$((n + 1))
-  printf '%s\n%s\n' "$n" "$first" >"$DOWN_FILE"
-  # Loud at the 3rd consecutive miss, then once every 6 after that, so a long outage keeps
-  # reappearing in the log instead of scrolling away behind identical one-liners.
-  # Banner to STDERR, count to STDOUT. The caller reads the count through a $(...) substitution,
-  # which would otherwise swallow the banner entirely -- the exact bug this block exists to prevent.
-  # Cron's `>> log 2>&1` puts stderr in the same log, so the banner still lands next to the tick.
-  if [ "$n" -ge 3 ] && { [ "$n" -eq 3 ] || [ $((n % 6)) -eq 0 ]; }; then
-    {
-      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-      echo "!! BONSAI EVAL DEGRADED: $n consecutive ticks with NO GPU."
-      echo "!! Pinned box $GPU_LABEL unreachable since $first."
-      echo "!! Nothing has been measured, scored or auto-merged since then."
-      echo "!! Fix: point EVAL_SSH_HOST/EVAL_SSH_PORT in .env.eval at a live RTX 5090."
-      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    } >&2
-  fi
-  echo "$n"
-}
 
 if gpu_ready; then
-  note_gpu_up
-  echo "[$TS] sparkinfer Ternary-Bonsai bot — pinned GPU $GPU_LABEL up — full eval (AUTOMERGE=${SPARKINFER_BONSAI_AUTOMERGE:-0} AUTOCLOSE=${SPARKINFER_BONSAI_AUTOCLOSE:-0})"
-  python3 eval/pr_bonsai_bot.py "${BOT_ARGS[@]}"
+  note_gpu_up "$DOWN_FILE"
+  echo "[$TS] sparkinfer Ternary-Bonsai bot — pinned GPU $GPU_LABEL up — full eval (AUTOMERGE=${SPARKINFER_BONSAI_AUTOMERGE:-0} AUTOCLOSE=${SPARKINFER_BONSAI_AUTOCLOSE:-1})"
+  run_bot bonsai python3 eval/pr_bonsai_bot.py "${BOT_ARGS[@]}"
 else
-  DOWN_N="$(note_gpu_down | tail -1)"
+  DOWN_N="$(note_gpu_down "$DOWN_FILE" BONSAI | tail -1)"
   echo "[$TS] sparkinfer Ternary-Bonsai bot — pinned GPU $GPU_LABEL down (tick $DOWN_N) — labels only"
-  python3 eval/pr_bonsai_bot.py "${BOT_ARGS[@]}" --labels-only
+  run_bot bonsai python3 eval/pr_bonsai_bot.py "${BOT_ARGS[@]}" --labels-only
 fi

@@ -13,6 +13,18 @@ from unittest import mock
 
 import pr_eval_bot as bot
 
+# Nothing here may touch the controller's own state: every file the bot writes goes to a temp dir.
+import atexit as _atexit
+import shutil as _shutil
+_STATE = tempfile.mkdtemp(prefix="sparkinfer-bot-tests-")
+_atexit.register(_shutil.rmtree, _STATE, True)
+for _n in ("INSTANCE_FILE", "PIN_FILE", "BOT_LOCK_FILE"):
+    setattr(bot, _n, os.path.join(_STATE, _n))
+bot.PINNED_INSTANCE = ""
+import pr_museglimmer_bot as _muse   # imported by some tests below: its state is redirected too
+for _n in ("STRIKES_FILE", "SCORES_FILE"):
+    setattr(_muse, _n, os.path.join(_STATE, "muse." + _n))
+
 
 class PrEvalBotPolicyTest(unittest.TestCase):
     def test_merge_conflict_blocks_eval(self):
@@ -48,7 +60,7 @@ class PrEvalBotPolicyTest(unittest.TestCase):
 """
 
     def _greenlight(self, body):
-        with mock.patch.object(bot, "gh", return_value=mock.Mock(stdout=json.dumps({"body": body}))):
+        with mock.patch.object(bot, "gh", return_value=mock.Mock(returncode=0, stdout=json.dumps({"body": body}))):
             return bot.greenlight_status("gittensor-ai-lab/sparkinfer", 1, set())
 
     def test_greenlight_decode_only(self):
@@ -780,7 +792,7 @@ class PrEvalBotPolicyTest(unittest.TestCase):
             if args[:3] == ["pr", "list", "-R"]:
                 return mock.Mock(stdout=json.dumps([pr]))
             if args[:4] == ["pr", "view", "10", "-R"]:
-                return mock.Mock(stdout=json.dumps({"body": body}))
+                return mock.Mock(returncode=0, stdout=json.dumps({"body": body}))
             return mock.Mock(returncode=0)
 
         with mock.patch.object(bot, "gh", side_effect=fake_gh), \
@@ -798,7 +810,7 @@ class PrEvalBotPolicyTest(unittest.TestCase):
             if args[:3] == ["pr", "list", "-R"]:
                 return mock.Mock(stdout=json.dumps([pr]))
             if args[:4] == ["pr", "view", "11", "-R"]:
-                return mock.Mock(stdout=json.dumps({"body": body}))
+                return mock.Mock(returncode=0, stdout=json.dumps({"body": body}))
             return mock.Mock(returncode=0)
 
         with mock.patch.object(bot, "gh", side_effect=fake_gh), \
@@ -815,7 +827,7 @@ class PrEvalBotPolicyTest(unittest.TestCase):
             if args[:3] == ["pr", "list", "-R"]:
                 return mock.Mock(stdout=json.dumps([pr]))
             if args[:4] == ["pr", "view", "30", "-R"]:
-                return mock.Mock(stdout=json.dumps({"body": body}))
+                return mock.Mock(returncode=0, stdout=json.dumps({"body": body}))
             return mock.Mock(returncode=0)
 
         with mock.patch.object(bot, "gh", side_effect=fake_gh), \
@@ -848,7 +860,7 @@ class PrEvalBotPolicyTest(unittest.TestCase):
             if args[:4] == ["pr", "view", num, "-R"]:
                 pr = next(p for p in prs if str(p["number"]) == num)
                 body = unchecked_body if pr["number"] == 25 else "docs-only"
-                return mock.Mock(stdout=json.dumps({"body": body}))
+                return mock.Mock(returncode=0, stdout=json.dumps({"body": body}))
             return mock.Mock(returncode=0)
 
         with mock.patch.object(bot, "gh", side_effect=fake_gh), \
@@ -1272,6 +1284,324 @@ class MuseBotUnslothGuardTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("unsloth qwen3.8 decode@32k", problems[0])
         self.assertTrue(muse._parse_remote("GUARDUN_UNAVAILABLE\n")["guardun_unavailable"])
+
+class SharedBotHelperTests(unittest.TestCase):
+    """Helpers the model bots share (pr_bonsai_bot, pr_qwen38_bot, pr_museglimmer_bot)."""
+
+    def test_a_hung_gh_call_times_out_and_only_a_read_is_retried(self):
+        import subprocess
+        for args, calls in ((["pr", "view", "1"], 3), (["pr", "comment", "1", "--body", "x"], 1),
+                            (["pr", "merge", "1", "--squash"], 1), (["pr", "close", "1"], 1),
+                            (["api", "repos/o/r/commits/main", "--jq", ".sha"], 3),
+                            (["api", "-X", "DELETE", "repos/o/r/issues/1/labels/x"], 1)):
+            with self.subTest(args[:2]), \
+                    mock.patch.object(bot.subprocess, "run", side_effect=subprocess.TimeoutExpired("gh", 1)) as r, \
+                    mock.patch.object(bot.time, "sleep"):
+                out = bot.gh(args, retries=3, quiet=True)
+                self.assertEqual(out.returncode, 124)
+                # A comment, close or merge that timed out may still have gone through: not repeated.
+                self.assertEqual(r.call_count, calls)
+                self.assertEqual(r.call_args.kwargs.get("timeout"), bot.GH_TIMEOUT_S)
+
+    def test_current_main_sha_is_a_full_sha_or_nothing(self):
+        R = lambda out: mock.Mock(returncode=0, stdout=out, stderr="")
+        with mock.patch.object(bot, "gh", return_value=R("a" * 40 + "\n")):
+            self.assertEqual(bot.current_main_sha("o/r"), "a" * 40)
+        for junk in ("", "Not Found", "[]", "a" * 39):
+            with mock.patch.object(bot, "gh", return_value=R(junk)):
+                self.assertEqual(bot.current_main_sha("o/r"), "", junk)
+
+    def test_scored_against_stale_main(self):
+        self.assertFalse(bot.scored_against_stale_main({"onto": "a" * 40}, "a" * 40))
+        self.assertTrue(bot.scored_against_stale_main({"onto": "a" * 40}, "b" * 40))
+        self.assertTrue(bot.scored_against_stale_main({}, "a" * 40))            # predates "onto"
+        self.assertTrue(bot.scored_against_stale_main({"onto": "a" * 40}, ""))   # main unknown
+
+    def test_only_trusted_verdicts_count_toward_the_exhausted_close(self):
+        verdict = self._ar_verdict("none")
+        comments = {"comments": [{"body": verdict, "authorAssociation": "NONE"}] * 3
+                    + [{"body": verdict, "authorAssociation": "MEMBER"}]}
+        with mock.patch.object(bot, "gh", return_value=mock.Mock(returncode=0, stdout=json.dumps(comments))):
+            self.assertEqual(bot.none_reject_eval_count("o/r", 1), 1)
+
+    def test_no_bots_merge_first_is_closed_as_exhausted(self):
+        prs = [{"number": n, "title": "t", "isDraft": False, "labels": [{"name": l}] if l else []}
+               for n, l in ((1, None), (2, "bonsai-merge-first"), (3, "qwen38-merge-first"), (4, "hold"))]
+        with mock.patch.object(bot, "gh", return_value=mock.Mock(returncode=0, stdout=json.dumps(prs))), \
+                mock.patch.object(bot, "none_reject_eval_count", return_value=9):
+            self.assertEqual(bot.close_exhausted_eval_prs("o/r", dry_run=True), {1})
+
+    def _ar_verdict(self, tier):
+        # The comment shape _eval_verdict_from_comment reads.
+        body = (f"<!-- sparkinfer-eval:{'a' * 40} -->\n## sparkinfer auto-eval — PR\n\n"
+                f"| **label** | `eval:{tier}` |")
+        self.assertEqual(bot._eval_verdict_from_comment(body), tier)
+        return body
+
+
+class RoundGuardTests(unittest.TestCase):
+    """arb.round_guard_sh, run for real against processes in a temp round directory."""
+
+    def _script(self, d, bot_name="t"):
+        return bot.round_guard_sh(bot_name).replace("/tmp/sparkinfer-bot-rounds", d)
+
+    def _start(self, d, name, new_group):
+        import subprocess
+        p = subprocess.Popen(["bash", "-c", "sleep 300 & sleep 300; wait"], start_new_session=new_group)
+        with open(f"/proc/{p.pid}/stat") as fh:
+            start = fh.read().split()[21]
+        with open(os.path.join(d, name + ".pid"), "w") as fh:
+            fh.write(f"{p.pid} {start}\n")
+        return p
+
+    def test_an_orphaned_round_is_stopped_and_this_round_recorded(self):
+        import subprocess
+        import time as _t
+        with tempfile.TemporaryDirectory() as d:
+            orphan = self._start(d, "old", new_group=True)
+            with open(os.path.join(d, "reused.pid"), "w") as fh:     # a pid reused by something else
+                fh.write(f"{os.getpid()} 1\n")
+            with open(os.path.join(d, "gone.pid"), "w") as fh:
+                fh.write("999999999 1\n")
+            r = subprocess.run(["bash", "-c", self._script(d)], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            for _ in range(50):
+                if orphan.poll() is not None:
+                    break
+                _t.sleep(0.1)
+            self.assertIsNotNone(orphan.poll(), "the orphaned round is still running")
+            self.assertIn("reaping a previous round", r.stderr)
+            self.assertEqual(sorted(os.listdir(d)), ["t.pid"])        # only this round's record
+            os.kill(os.getpid(), 0)                                   # the reused pid was left alone
+
+
+class Round2SharedHelperTests(unittest.TestCase):
+    """Fixes from the second review of the 2026-09-26 change."""
+
+    def test_dropping_the_last_per_bot_tier_drops_the_generic_one_it_fed(self):
+        labels = {"eval-bonsai:XL", "eval:XL"}
+        with mock.patch.object(bot, "labels_on", side_effect=lambda r, n: set(labels)), \
+                mock.patch.object(bot, "remove_label", side_effect=lambda r, n, l: labels.discard(l)), \
+                mock.patch.object(bot, "add_label", side_effect=lambda r, n, l: labels.add(l)):
+            self.assertTrue(bot.strip_stale_verdict_labels(
+                "o/r", 1, set(labels), "eval-bonsai:", "b" * 40, {"a" * 40}))
+        self.assertEqual(labels, set())
+        # Another bot's tier still there: the generic label is re-derived from it, not dropped.
+        labels = {"eval-bonsai:XL", "eval-qwen38:S", "eval:XL"}
+        with mock.patch.object(bot, "labels_on", side_effect=lambda r, n: set(labels)), \
+                mock.patch.object(bot, "remove_label", side_effect=lambda r, n, l: labels.discard(l)), \
+                mock.patch.object(bot, "add_label", side_effect=lambda r, n, l: labels.add(l)):
+            bot.strip_stale_verdict_labels("o/r", 1, set(labels), "eval-bonsai:", "b" * 40, {"a" * 40})
+        self.assertEqual(labels, {"eval-qwen38:S", "eval:S"})
+        # Unknown verdicts (GitHub did not answer) never strip.
+        self.assertFalse(bot.strip_stale_verdict_labels("o/r", 1, {"eval-bonsai:XL"}, "eval-bonsai:", "b" * 40, None))
+
+    def test_a_failed_comments_read_is_unknown_not_empty(self):
+        import re as _re
+        rx = _re.compile(r"<!-- sparkinfer-t-eval:v1:([0-9a-f]+)(?:\s+(\{.*?\}))? -->")
+        marker = '<!-- sparkinfer-t-eval:v1:' + "a" * 40 + ' {"label":"XL"} -->\n## sparkinfer t auto-eval'
+        R = lambda out, rc=0: mock.Mock(returncode=rc, stdout=out)
+        good = {"comments": [{"body": marker, "authorAssociation": "MEMBER"},
+                             {"body": marker.replace("a" * 40, "b" * 40), "authorAssociation": "NONE"}]}
+        with mock.patch.object(bot, "gh", return_value=R(json.dumps(good))):
+            self.assertEqual(bot.evaluated_commits_from("o/r", 1, rx, "sparkinfer t auto-eval"), {"a" * 40})
+        for bad in (R("", 1), R("not json"), R(json.dumps({"x": 1}))):
+            with mock.patch.object(bot, "gh", return_value=bad):
+                self.assertIsNone(bot.evaluated_commits_from("o/r", 1, rx, "sparkinfer t auto-eval"))
+
+    def test_only_a_pr_the_bot_will_measure_is_waiting_on_it(self):
+        pr = {"number": 1, "headRefOid": "a" * 40, "labels": [], "mergeable": "MERGEABLE",
+              "files": [{"path": "kernels/x.cu"}]}
+        with mock.patch.object(bot, "greenlight_status", return_value=("ok", "x")):
+            self.assertTrue(bot.waiting_for_first_verdict("o/r", pr, set()))
+            self.assertTrue(bot.waiting_for_first_verdict("o/r", pr, None))            # unknown: kept
+            self.assertFalse(bot.waiting_for_first_verdict("o/r", pr, {"a" * 40}))
+            self.assertFalse(bot.waiting_for_first_verdict("o/r", dict(pr, mergeable="CONFLICTING"), set()))
+            self.assertFalse(bot.waiting_for_first_verdict("o/r", pr, set(), never_paths=("kernels/",)))
+
+    def test_the_daily_stale_close_spares_bot_winners_and_queued_prs(self):
+        old = "2026-01-01T00:00:00Z"
+        prs = [{"number": n, "title": "t", "updatedAt": old, "isDraft": False, "headRefOid": "a" * 40,
+                "mergeable": "MERGEABLE", "labels": [{"name": l} for l in labs]}
+               for n, labs in ((1, []), (2, ["bonsai-merge-first"]), (3, ["qwen38-merge-first"]), (4, []))]
+        verdict = {"comments": [{"authorAssociation": "MEMBER",
+                                 "body": '<!-- sparkinfer-bonsai-eval:v1:' + "a" * 40 + ' {"label":"none"} -->'}]}
+
+        def fake_gh(a):
+            if a[:2] == ["pr", "list"]:
+                return mock.Mock(returncode=0, stdout=json.dumps(prs))
+            if a[:2] == ["pr", "view"]:
+                return mock.Mock(returncode=0, stdout=json.dumps(verdict if a[2] == "1" else {"comments": []}))
+            return mock.Mock(returncode=0, stdout="")
+        with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+                mock.patch.object(bot, "greenlight_status", return_value=("ok", "x")):
+            closed = bot.close_stale_prs("o/r", days=2, dry_run=True, drafts_only=False)
+        # #1 has its verdict and waits on its author; #4 is queued; #2 and #3 are round winners.
+        self.assertEqual(closed, {1})
+
+    def test_a_merge_conflict_is_where_the_run_stopped_not_a_word_in_its_output(self):
+        err = "MERGE_CONFLICT aaaaaaa does not merge cleanly onto ccccccc"
+        self.assertEqual(bot.merge_conflict_line("", err), err)
+        self.assertEqual(bot.merge_conflict_line("PR_TIP " + "a" * 40 + "\nbuilding\n",
+                                                 "x.cu:3: error: MERGE_CONFLICT is not declared"), "")
+        self.assertEqual(bot.merge_conflict_line("", "see MERGE_CONFLICT above"), "")
+
+    def test_strikes_are_counted_per_key_and_reset_by_a_new_commit(self):
+        p = os.path.join(_STATE, "strikes.json")
+        self.assertEqual(bot.record_strike(p, 1, "a", "box"), 1)
+        self.assertEqual(bot.record_strike(p, 1, "a", "cb"), 1)
+        self.assertEqual(bot.record_strike(p, 1, "a", "box"), 2)
+        self.assertEqual(bot.record_strikes(p, 1, "a", "cb+serve"), 2)
+        self.assertEqual(bot.record_strike(p, 1, "b", "box"), 1)
+        with open(p, "w") as f:                                  # the pre-2026-09-26 one-key form
+            json.dump({"1": {"commit": "a", "key": "cb", "count": 1}}, f)
+        self.assertEqual(bot.record_strike(p, 1, "a", "cb"), 2)
+        bot.clear_strikes(p, 1)
+        self.assertEqual(bot._load_strikes(p), {})
+
+    def test_freshness_is_its_own_refusal(self):
+        with mock.patch.object(bot, "current_main_sha", return_value="c" * 40):
+            self.assertEqual(bot.fresh_against_main("o/r", {"onto": "c" * 40}), (True, "ok"))
+            ok, why = bot.fresh_against_main("o/r", {"onto": "9" * 40})
+        self.assertFalse(ok)
+        self.assertTrue(bot.refused_only_for_stale_main(why))
+        self.assertFalse(bot.refused_only_for_stale_main("carries a REJECT from another eval bot"))
+        with mock.patch.object(bot, "current_main_sha", return_value=""):
+            self.assertEqual(bot.fresh_against_main("o/r", {"onto": "c" * 40}), (False, bot.PR_UNREADABLE))
+
+    def test_a_run_started_by_hand_waits_for_the_cron_rounds_lock(self):
+        import fcntl
+        with mock.patch.dict(os.environ, {"SPARKINFER_BOT_LOCK_HELD": ""}), \
+                mock.patch.object(bot, "_bot_lock", None), mock.patch.object(bot.time, "sleep"):
+            with open(bot.BOT_LOCK_FILE, "a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                self.assertFalse(bot.hold_bot_lock(wait_s=0))
+                fcntl.flock(held, fcntl.LOCK_UN)
+            self.assertTrue(bot.hold_bot_lock(wait_s=0))
+            bot._bot_lock.close()
+        with mock.patch.dict(os.environ, {"SPARKINFER_BOT_LOCK_HELD": "1"}), mock.patch.object(bot, "_bot_lock", None):
+            self.assertTrue(bot.hold_bot_lock(wait_s=0))          # a wrapper's run inherits the lock
+
+
+class RoundGuardSessionTests(unittest.TestCase):
+    def test_stages_timeout_moved_into_their_own_group_go_with_the_round(self):
+        import subprocess
+        import time as _t
+        with tempfile.TemporaryDirectory() as d:
+            # The orphan leads its session, like the `bash -s` of an ssh round; `timeout` then moves
+            # its stage into a process group of its own.
+            orphan = subprocess.Popen(["bash", "-c", "timeout 300 sleep 300; true"], start_new_session=True)
+            _t.sleep(0.5)
+            with open(f"/proc/{orphan.pid}/stat") as fh:
+                start = fh.read().split()[21]
+            with open(os.path.join(d, "old.pid"), "w") as fh:
+                fh.write(f"{orphan.pid} {start}\n")
+            script = bot.round_guard_sh("t").replace("/tmp/sparkinfer-bot-rounds", d)
+            r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            orphan.wait(timeout=10)
+            left = subprocess.run(["pgrep", "-s", str(orphan.pid)], capture_output=True, text=True).stdout
+            self.assertEqual(left.strip(), "", "a stage of the orphaned round is still running")
+
+
+class Round3SharedHelperTests(unittest.TestCase):
+    """Fixes from the third review of the 2026-09-26 change."""
+
+    R = staticmethod(lambda out, rc=0: mock.Mock(returncode=rc, stdout=out, stderr=""))
+
+    def test_a_body_github_did_not_return_is_unknown_never_unticked(self):
+        for bad in (self.R("", 1), self.R("not json")):
+            with mock.patch.object(bot, "gh", return_value=bad):
+                self.assertEqual(bot.greenlight_status("o/r", 1, set())[0], "unknown")
+        with mock.patch.object(bot, "gh", return_value=self.R(json.dumps({"body": None}))):
+            self.assertEqual(bot.greenlight_status("o/r", 1, set())[0], "unchecked")   # really empty
+
+    def test_the_unticked_box_close_never_acts_on_a_failed_read(self):
+        prs = [{"number": 1, "title": "t", "labels": [], "isDraft": False, "author": {"login": "dev"},
+                "authorAssociation": "CONTRIBUTOR"}]
+
+        def fake_gh(a):
+            if a[:2] == ["pr", "list"]:
+                return self.R(json.dumps(prs))
+            if "body" in a:
+                return self.R("", 1)                                  # GitHub hiccup
+            return self.R(json.dumps({"files": [{"path": "runtime/x.cu"}]}))
+        with mock.patch.object(bot, "gh", side_effect=fake_gh):
+            self.assertEqual(bot.close_unchecked_rtx5090_prs("o/r", dry_run=True), set())
+
+    def test_a_pr_a_bot_sent_to_rebase_is_waiting_on_its_author(self):
+        pr = {"number": 1, "headRefOid": "a" * 40, "labels": [{"name": "qwen38-needs-rebase"}],
+              "mergeable": "MERGEABLE", "files": [{"path": "kernels/x.cu"}]}
+        with mock.patch.object(bot, "greenlight_status", return_value=("ok", "x")):
+            self.assertFalse(bot.waiting_for_first_verdict("o/r", pr, set(), rebase_label="qwen38-needs-rebase"))
+            # Another bot's (the paused Bonsai's, say) may be left from an older head: not this bot's call.
+            self.assertTrue(bot.waiting_for_first_verdict("o/r", pr, set(), rebase_label="museglimmer-needs-rebase"))
+        # The daily Action goes by GitHub's own conflict state and the verdicts: a needs-rebase may be
+        # left from an older head (the bots drop their own once the head moves).
+        with mock.patch.object(bot, "greenlight_status", return_value=("ok", "x")), \
+                mock.patch.object(bot, "gh", return_value=self.R(json.dumps({"comments": []}))):
+            self.assertTrue(bot.awaiting_any_model_verdict("o/r", pr))
+            self.assertFalse(bot.awaiting_any_model_verdict("o/r", dict(pr, mergeable="CONFLICTING")))
+            self.assertFalse(bot.awaiting_any_model_verdict(
+                "o/r", dict(pr, labels=[], files=[{"path": "eval/pr_eval_bot.py"}])))   # measured by no bot
+
+    def test_a_bot_started_by_a_wrapper_never_waits_on_its_parents_lock(self):
+        import fcntl
+        import subprocess
+        import sys as _sys
+        with open(bot.BOT_LOCK_FILE, "a") as held:                      # another round holds it
+            fcntl.flock(held, fcntl.LOCK_EX)
+            with mock.patch.dict(os.environ, {"SPARKINFER_BOT_LOCK_HELD": "1"}), \
+                    mock.patch.object(bot, "_bot_lock", None):
+                self.assertTrue(bot.hold_bot_lock(wait_s=0))
+        # A wrapper from before SPARKINFER_BOT_LOCK_HELD: the bot re-locks the descriptor it inherited.
+        env = {k: v for k, v in os.environ.items() if k != "SPARKINFER_BOT_LOCK_HELD"}
+        env["SPARKINFER_LOCK_FILE"] = bot.BOT_LOCK_FILE
+        code = "import pr_eval_bot as b; print(b.hold_bot_lock(wait_s=0))"
+        r = subprocess.run(["bash", "-c", f'exec 9>"$SPARKINFER_LOCK_FILE"; flock 9; "{_sys.executable}" -c "{code}"'],
+                           cwd=os.path.dirname(os.path.abspath(bot.__file__)), env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "True", r.stderr)
+
+    def test_one_round_is_one_strike_however_many_checks_it_lost(self):
+        p = os.path.join(_STATE, "strikes-dedupe.json")
+        self.assertEqual(bot.record_strikes(p, 1, "a", "guard-box+guard-box+guard-box+cb-box"), 1)
+        self.assertEqual(bot.record_strikes(p, 1, "a", "guard-box"), 2)
+
+
+class Round4SharedHelperTests(unittest.TestCase):
+    R = staticmethod(lambda out, rc=0: mock.Mock(returncode=rc, stdout=out, stderr=""))
+
+    def test_an_unknown_greenlight_keeps_a_pr_waiting(self):
+        pr = {"number": 1, "headRefOid": "a" * 40, "labels": [], "mergeable": "MERGEABLE", "files": []}
+        with mock.patch.object(bot, "greenlight_status", return_value=("unknown", "no answer")):
+            self.assertTrue(bot.waiting_for_first_verdict("o/r", pr, set()))
+        with mock.patch.object(bot, "greenlight_status", return_value=("no-bench", "x")):
+            self.assertFalse(bot.waiting_for_first_verdict("o/r", pr, set()))
+
+    def test_the_daily_close_spares_any_bots_merge_first_even_with_a_verdict(self):
+        old = "2026-01-01T00:00:00Z"
+        prs = [{"number": n, "title": "t", "updatedAt": old, "isDraft": False, "headRefOid": "a" * 40,
+                "mergeable": "MERGEABLE", "labels": [{"name": l} for l in labs], "files": []}
+               for n, labs in ((1, []), (2, ["bonsai-merge-first"]), (3, ["museglimmer-merge-first"]))]
+        verdict = {"comments": [{"authorAssociation": "MEMBER",
+                                 "body": '<!-- sparkinfer-qwen38-eval:v6:' + "a" * 40 + ' {"label":"none"} -->'}]}
+
+        def fake_gh(a):
+            if a[:2] == ["pr", "list"]:
+                return self.R(json.dumps(prs))
+            if a[:2] == ["pr", "view"]:
+                return self.R(json.dumps(verdict))
+            return self.R("")
+        with mock.patch.object(bot, "gh", side_effect=fake_gh), \
+                mock.patch.object(bot, "greenlight_status", return_value=("ok", "x")):
+            self.assertEqual(bot.close_stale_prs("o/r", days=2, dry_run=True, drafts_only=False), {1})
+
+    def test_the_retired_ar_bot_never_closes_on_an_unknown_read(self):
+        src = open(bot.__file__).read()
+        i = src.index('elif status == "unknown":')
+        self.assertLess(i, src.index("else:  # unchecked", i))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

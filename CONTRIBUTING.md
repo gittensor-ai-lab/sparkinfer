@@ -249,7 +249,7 @@ speculative axes carry the losslessness and τ gates:
 | **Long-context guards** | ≥ 0.98× `main`, decode **and** prefill @ ctx=16k, on Qwen3.8 **and** Qwen3.6 | DSpark work lands in `qwen35.cpp` / shared kernels, which Qwen3.6 also uses — the exact surface through which #775 regressed a model nobody was scoring at the time. |
 
 Tiers are bands of % speedup over the frontier (`XS` 2–3.5% … `XL` >18%; under 2% is noise →
-`none`). A `none` or a failed gate is **auto-closed on the first result** — reopen after a fix and it re-evaluates. The Ternary-Bonsai bot closes a failed gate the same way, but closes a `none` only on a PR declared for Ternary-Bonsai-2-27B alone, because it also scores every undeclared PR. Drafts and `hold` never reach evaluation, so use one of those if the PR should stay open unscored (see *Lane 3*).
+`none`). A measured regression or failed gate is **auto-closed on the first result** — push a fix and reopen, and the new commit is evaluated. (A run that fails to build or crashes gets its REJECT but is not closed, and the Ternary-Bonsai bot judges a few checks that also fail sound builds now and then over two rounds.) A `none` closes a PR only when it declares that bot's model alone and no other bot has scored it a speedup or made it merge-first, because each bot also scores every undeclared PR. Drafts and `hold` never reach evaluation, so use one of those if the PR should stay open unscored (see *Lane 3*).
 
 ### Lane 2 — manually reviewed, not scored
 
@@ -296,13 +296,16 @@ against you.
   maintainers/members/collaborators are exempt. Box ticked but the decode table empty or showing
   no gain → `needs-benchmark`, held rather than closed; fill in real numbers and it greenlights
   automatically.
-- **Stale.** No new commits for over a day while queued → auto-closed to keep the eval queue
-  clean. This is not a judgment on the work: push a commit or reopen and it's picked straight
-  back up on the next cycle. `hold` and the current round winner are exempt.
+- **Stale.** No new commits for over a day → auto-closed to keep the eval queue clean. This is not
+  a judgment on the work: push a commit or reopen and it's picked straight back up on the next
+  cycle. `hold`, any round winner, and a greenlit PR still waiting for its first evaluation are
+  exempt.
 - **`none` or REJECT on an evaluated PR — closed on the first result, not the third.** A `none`
   means no verified speedup on any axis that bot measures; a REJECT means a measured regression or
-  a failed gate. Either closes the PR automatically. The close comment says which, and a `none`
-  close explicitly is **not** a finding that anything is wrong with the PR.
+  a failed gate. A REJECT closes the PR; a `none` closes it only when the PR declares that bot's
+  model alone and no other bot scored it a speedup or made it merge-first. The close comment says
+  which, and a `none` close explicitly is **not** a finding that anything is wrong with the PR. A
+  verdict belongs to one commit: push a new one before reopening, or it is not evaluated again.
 
   **Two things keep a PR out of this, and both are filtered before any evaluation runs:**
   - **drafts** — open it as a draft while it is not seeking a score;
