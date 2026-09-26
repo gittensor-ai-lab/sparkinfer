@@ -72,7 +72,12 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               model nobody was scoring at the time.
 
   3b. ModelOpt Qwen3.8 and Muse Glimmer no-regression guards — decode + prefill at 32k and
-              concurrent decode at c16/c32 on each, with the same hard REJECT. The 32k guards are
+              concurrent decode at c16/c32 on each, with the same hard REJECT for a regression. A
+              concurrent width main measured that the PR build could not complete (a crash, a hang,
+              runs cut short) is judged over rounds instead ("guard-cb"), as a scored width is; a
+              32k guard the PR build failed to measure still REJECTs at once. A guard run the OOM
+              killer took (every attempt, for a concurrent width) is the box's ("guard-box"),
+              retried the same way. The 32k guards are
               the pair pr_museglimmer_bot.py runs; the concurrency guards cover the packed decode
               this bot's PRs mostly change, which no single-stream guard enters. The Muse bot skips
               PRs declared for Qwen3.8 alone (since #1082), so this bot is the only check those PRs
@@ -1069,11 +1074,12 @@ cb_complete() {{
 # {cb_reps} complete runs (cb_complete). Sets CB_AGG, CB_ITL, CB_TOK, CB_ERR and CB_AGGS (the runs).
 # A crashed or cut-short run is one failed attempt of {cb_max_attempts}; a hang (124) ends it at once.
 # Returns 1, with the reason on stderr, when too few runs completed, a run hung, or nothing positive
-# was measured; CB_RC is then 137 only if the OOM killer took every failed attempt. The caller
+# was measured; CB_RC is then 137 only if the OOM killer took every failed attempt, else the last
+# other exit (0 when the others were runs cut short, or nothing positive was measured). The caller
 # decides what that means: the scored ladder fails the round as infra; a guard width main measured
 # is a fault of the PR's run judged over rounds (eval_qwen38_on_box's "guard-cb" strike).
 cb_median() {{
-  local ckpt=$1 cc=$2 out=/tmp/q38_cb.txt attempt=0 valid=0 a i all_killed=1 last_rc=0
+  local ckpt=$1 cc=$2 out=/tmp/q38_cb.txt attempt=0 valid=0 a i all_killed=1 last_rc=0 other_rc=0
   shift 2
   CB_AGGS=""; CB_ITLS=""; CB_AGG=0; CB_ITL=0; CB_TOK=0; CB_ERR=0; CB_RC=0
   while [ "$valid" -lt {cb_reps} ]; do
@@ -1081,9 +1087,7 @@ cb_median() {{
     if [ "$attempt" -gt {cb_max_attempts} ]; then
       echo "concurrent decode at c=$cc on $ckpt did not complete on $((attempt - 1 - valid)) of {cb_max_attempts} runs" >&2
       # 137 only when the OOM killer took every failed attempt (the box's); else the last other exit.
-      if [ "$all_killed" = 1 ] && [ "$last_rc" = 137 ]; then CB_RC=137
-      elif [ "$last_rc" = 137 ]; then CB_RC=1
-      else CB_RC=$last_rc; fi
+      if [ "$all_killed" = 1 ] && [ "$last_rc" = 137 ]; then CB_RC=137; else CB_RC=$other_rc; fi
       return 1
     fi
     wait_gpu_clear
@@ -1095,7 +1099,7 @@ cb_median() {{
       last_rc=$?
       echo "concurrent-decode harness exited $last_rc at c=$cc on $ckpt (attempt $attempt)" >&2
       tail -20 "$out" >&2 || true
-      if [ "$last_rc" != 137 ]; then all_killed=0; fi
+      if [ "$last_rc" != 137 ]; then all_killed=0; other_rc=$last_rc; fi
       if [ "$last_rc" = 124 ]; then CB_RC=124; return 1; fi
       continue
     fi
@@ -1404,9 +1408,14 @@ def _parse_remote(stdout: str) -> dict:
                 except ValueError:
                     pass
         elif line.split(" ", 1)[0] in ("GUARDCBMO_FAILED", "GUARDCBMG_FAILED"):
-            out[line.split(" ", 1)[0].split("_")[0].lower() + "_failed"] = True
-            if arb.failed_rc(line) == 137:
-                out[line.split(" ", 1)[0].split("_")[0].lower() + "_failed_box"] = True
+            key = line.split(" ", 1)[0].split("_")[0].lower()
+            out[key + "_failed"] = True
+            rc = arb.failed_rc(line)
+            if rc == 137:
+                out[key + "_failed_box"] = True
+            width = line.split()[1] if len(line.split()) > 2 else "?"
+            out.setdefault(key + "_failed_at", []).append(
+                f"c{width} " + {0: "too few usable runs", 124: "hung", 137: "killed"}.get(rc, f"crashed, rc={rc}"))
         elif line.split(" ", 1)[0] in cross_guards:
             parts = line.split()
             if len(parts) >= 4:
@@ -1605,12 +1614,17 @@ def measure_main_baseline(host, port):
         reason = "main run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
         return {"ok": False, "reason": reason, "log": tail}
     main = _parse_remote(r.stdout or "")
-    if "decode128_tps" not in main:
-        return {"ok": False, "reason": "main bench missing decode@128 tok/s", "log": (r.stdout or "")[-1500:]}
-    if "prefill128_pp" not in main:
-        return {"ok": False, "reason": "main bench missing prefill@128 pp", "log": (r.stdout or "")[-1500:]}
-    # Fail closed on a ZERO too, not just a missing line: a 16k KV pool that fails to allocate
-    # yields 0 rather than an error, and a 0 baseline makes tier_from_gain REJECT every PR.
+    if main.get("sweep_failed"):
+        return {"ok": False, "reason": "main speed sweep failed"
+                                       + (" (killed, exit 137 — the box's)" if main.get("sweep_failed_box") else ""),
+                "log": (r.stdout or "")[-1500:]}
+    # Fail closed on a ZERO too, not just a missing line: the script prints 0 for a width it could not
+    # measure (a 16k KV pool that fails to allocate yields 0 rather than an error), and a 0 baseline
+    # makes every PR of the round a REJECT, closed.
+    if not (main.get("decode128_tps") or 0) > 0:
+        return {"ok": False, "reason": "main bench missing/zero decode@128 tok/s", "log": (r.stdout or "")[-1500:]}
+    if not (main.get("prefill128_pp") or 0) > 0:
+        return {"ok": False, "reason": "main bench missing/zero prefill@128 pp", "log": (r.stdout or "")[-1500:]}
     if not main.get("prefill16k_pp"):
         return {"ok": False, "reason": "main bench missing/zero prefill@16k pp (KV pool alloc?)",
                 "log": (r.stdout or "")[-1500:]}
@@ -1654,6 +1668,26 @@ def _guard_coverage(d: dict) -> str:
             f"muse {len(d.get('guardmg') or {})} ctx / {len(d.get('guardcbmg') or {})} cc · "
             f"qwen3.6 {len(d.get('guard36') or {})} ctx · "
             f"bonsai {len(d.get('guardbn') or {})} ctx")
+
+
+# The guards' names in reasons and comments, by the key their remote lines use.
+_GUARD_NAMES = {"guard36": "qwen3.6", "guardmo": "modelopt 32k", "guardmg": "muse glimmer 32k",
+                "guardbn": "ternary-bonsai", "guardcbmo": "modelopt concurrent-decode",
+                "guardcbmg": "muse glimmer concurrent-decode"}
+
+
+def _cb_attempt_lines(r, pr, limit=1800):
+    """What cb_median said (its stderr) about the concurrent guard widths that did not complete: not
+    the scored ladder's lines, nor a guard width's that passed in the end. The end is kept."""
+    failed = [(path, "c=" + at.split()[0][1:] + " ")
+              for key, path in (("guardcbmo", MODELOPT_GUARD_MODEL_DIR), ("guardcbmg", MUSE_GUARD_GGUF))
+              for at in (pr.get(f"{key}_failed_at") or [])]
+    lines = [l for l in (r.stderr or "").splitlines()
+             if l.startswith(("concurrent decode at c=", "concurrent-decode harness exited", "CB_PARTIAL",
+                              "concurrent decode produced no positive metric"))
+             and any(w in l and (f" on {path} " in l + " " or f"({path})" in l) for path, w in failed)]
+    text = "\n".join(lines)
+    return text if len(text) <= limit else text[len(text) - limit:].split("\n", 1)[-1]
 
 
 def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
@@ -1799,13 +1833,13 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     # an absolute gate that main fails would reject every PR. The differential accuracy gate above
     # and the Qwen3.6 guard below still apply.
 
-    killed = [k for k in ("guard36", "guardmo", "guardmg", "guardbn", "guardcbmo", "guardcbmg")
-              if pr.get(f"{k}_failed_box") and main.get(k)]
+    killed = [k for k in _GUARD_NAMES if pr.get(f"{k}_failed_box") and main.get(k)]
     if killed and accuracy_ok:
         # A guard sweep SIGKILLed on the PR build (the host OOM killer): the box's, not a regression.
         # Beside a failed accuracy gate, which a busy box cannot fake, the REJECT is posted instead.
         return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "guard-box", "log": "",
-                "reason": f"the {', '.join(killed)} guard was killed on the PR build (exit 137) — infra"}
+                "reason": f"the {', '.join(_GUARD_NAMES[k] for k in killed)} guard was killed on the PR "
+                          "build (exit 137) — infra"}
     # Beside that failed accuracy gate, a guard the OOM killer took measured nothing: it is reported
     # as not measured, not as a regression (the close comment used to name it as the failure).
     guards_killed = []
@@ -1836,7 +1870,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     # ModelOpt and Muse Glimmer guards (pt. 3b): same discipline, same hard REJECT. An absent
     # checkpoint is a SKIP, reported as one, so a round that guarded nothing never reads as a pass.
     cross = {}
-    cb_incomplete = []
+    cb_incomplete, cb_detail = [], []
     for key, name, checks in (("guardmo", "modelopt", (check_modelopt_guard, check_modelopt_cb_guard)),
                               ("guardmg", "muse glimmer", (check_muse_guard, check_muse_cb_guard)),
                               ("guardbn", "ternary-bonsai", (check_bonsai_guard,))):
@@ -1854,6 +1888,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
                     # hang), main having measured it: judged as a fault of the PR's run, over rounds
                     # (below), as the scored widths are -- not a regression to REJECT and close on.
                     cb_incomplete.append(name)
+                    at = ", ".join(pr.get(f"{cb_key}_failed_at") or [])
+                    cb_detail.append(f"{name} ({at})" if at else name)
                     c_ok, c_problems = True, []
                 ok, problems = ok and c_ok, problems + c_problems
         if skipped:
@@ -1881,12 +1917,12 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
             passed = False
         cross[key] = (ok, problems, skipped)
     if cb_incomplete:
-        why = (f"the {', '.join(cb_incomplete)} concurrent-decode guard did not complete on the PR build "
-               f"while main's did")
+        why = (f"the {' and '.join(cb_detail)} concurrent-decode guard{'s' if len(cb_detail) > 1 else ''} "
+               f"did not complete on the PR build while main's did")
         if label != "REJECT":
             # Retried; charged to the PR, as a failed run, after BOX_FAULT_STRIKES rounds at one commit.
-            return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "guard-cb", "log": "",
-                    "reason": why + " — re-evaluated next round"}
+            return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "guard-cb",
+                    "log": _cb_attempt_lines(r, pr), "reason": why + " — re-evaluated next round"}
         reason = f"{reason} | not measured this round: {why}"
 
     res = {
@@ -2031,7 +2067,7 @@ def format_comment(commit: str, res: dict) -> str:
             cross_rows += (f"| {name} | ⚠️ SKIPPED — checkpoint not installed on the box; "
                            f"shared-code regressions on {what} were NOT checked |\n")
         elif short in killed:
-            cross_rows += f"| {name} | ⚠️ NOT MEASURED — its sweep was killed on the PR build (exit 137, the host OOM killer); the REJECT is the accuracy gate's |\n"
+            cross_rows += f"| {name} | ⚠️ NOT MEASURED — a run of it was killed on the PR build (exit 137, the host OOM killer); the REJECT is the accuracy gate's |\n"
         elif res.get(f"{prefix}_guard_ok") and short in cb_incomplete:
             cross_rows += (f"| {name} | decode+prefill @ 32k ✅ no regression ({what}){cb_missing}; "
                            "the REJECT is another gate's |\n")

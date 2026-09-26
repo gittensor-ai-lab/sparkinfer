@@ -1595,8 +1595,9 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
     soft = []
     if cb_pr_missing:
         widths = ",".join(f"c{c}" for c in cb_pr_missing)
-        soft.append(("cb", f"concurrent decode at {widths} did not complete on the PR build in "
-                           f"{CB_MAX_ATTEMPTS} attempts, while main measured it this round"))
+        soft.append(("cb", f"concurrent decode at {widths} did not complete on the PR build within "
+                           f"{CB_MAX_ATTEMPTS} attempts (a hang ends it at once), while main measured it "
+                           "this round"))
     if reg_soft_why:
         soft.append(("reg", reg_soft_why))
     if serve_soft_why:
@@ -1709,8 +1710,9 @@ def _matrix_table(res: dict) -> str:
     pr_missing = [f"c{c}" for c in (res.get("cb_pr_missing") or [])]
     missing = [f"c{c}" for c in CB_CONCS if CB_DIM_FOR[c] not in dims and f"c{c}" not in pr_missing]
     if pr_missing:
-        out += (f"<sub>Concurrency {', '.join(pr_missing)} did not complete on the PR build in "
-                f"{CB_MAX_ATTEMPTS} attempts, while main measured it this round.</sub>\n\n")
+        out += (f"<sub>Concurrency {', '.join(pr_missing)} did not complete on the PR build within "
+                f"{CB_MAX_ATTEMPTS} attempts (a hang ends it at once), while main measured it this "
+                "round.</sub>\n\n")
     if missing:
         out += (f"<sub>Concurrency {', '.join(missing)} not scored this round — main has no "
                 f"measurement for it.</sub>\n\n")

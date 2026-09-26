@@ -2444,8 +2444,9 @@ class Iteration9Tests(unittest.TestCase):
 class Iteration10Tests(unittest.TestCase):
     """Fixes from the post-merge review of main 7a69f64."""
 
-    def _qwen_cb(self, mode):
-        """Qwen3.8's cb_median, rendered and run against a stub bench (MODE picks its behaviour)."""
+    def _qwen_cb(self, mode, seq=""):
+        """Qwen3.8's cb_median, rendered and run against a stub bench (MODE picks its behaviour; with
+        MODE=seq, SEQ names each run's: crash, oom, hang, partial or good)."""
         import subprocess
         script = qwen._remote_script("pull/1/head", role="pr", onto=MAIN)
         take = lambda name: script[script.index(name + "() {"):script.index("\n}\n", script.index(name + "() {")) + 3]
@@ -2456,9 +2457,11 @@ class Iteration10Tests(unittest.TestCase):
             f.write("#!/bin/sh\necho 0\n")
         with open(_os.path.join(d, "build/runtime/qwen3_gguf_cb_bench"), "w") as f:
             f.write("#!/bin/bash\nc=$2; n=$(cat cnt 2>/dev/null || echo 0); n=$((n + 1)); echo $n > cnt\n"
-                    'case "$MODE" in\n'
+                    'm=$MODE; if [ "$MODE" = seq ]; then m=$(echo "$SEQ" | cut -d, -f$n); fi\n'
+                    'case "$m" in\n'
                     "  crash_once) if [ $n = 1 ]; then exit 1; fi ;;\n"
-                    "  crash) exit 1 ;;\n  hang) exit 124 ;;\n  oom) exit 137 ;;\n"
+                    "  crash) exit 1 ;;\n  segv) exit 139 ;;\n  hang) exit 124 ;;\n  oom) exit 137 ;;\n"
+                    '  partial) echo "decode_tokens=5 agg_tok_s=999 mean_itl_ms=5"; exit 0 ;;\n'
                     "esac\n"
                     'echo "decode_tokens=$((c * 256 + 8)) agg_tok_s=$((100 * c + n)) mean_itl_ms=5"\n')
         for x in ("bin/nvidia-smi", "build/runtime/qwen3_gguf_cb_bench"):
@@ -2466,7 +2469,7 @@ class Iteration10Tests(unittest.TestCase):
         body = ("set -euo pipefail\n" + take("wait_gpu_clear") + take("cb_complete") + take("cb_median")
                 + 'if cb_median m 16; then echo "OK $CB_AGG"; else echo "FAIL ${CB_RC:-}"; fi\ncat cnt\n')
         body = body.replace("/tmp/q38_cb.txt", _os.path.join(d, "cb.txt"))
-        env = dict(_os.environ, PATH=_os.path.join(d, "bin") + ":/usr/bin:/bin", MODE=mode, TMPDIR=d)
+        env = dict(_os.environ, PATH=_os.path.join(d, "bin") + ":/usr/bin:/bin", MODE=mode, SEQ=seq, TMPDIR=d)
         r = subprocess.run(["bash", "-c", body], cwd=d, env=env, capture_output=True, text=True, timeout=120)
         return r.stdout.split()
 
@@ -2523,6 +2526,118 @@ class Iteration10Tests(unittest.TestCase):
     def test_a_list_written_without_spaces_reads_as_its_first_value(self):
         self.assertEqual(arb._table_num("104,105,106"), "104")
         self.assertEqual(arb._table_num("8,081"), "8081")
+
+
+MUSE_GUARD = ("GUARDMG 32768 40 5000", "GUARDCBMG 16 700", "GUARDCBMG 32 900")
+
+
+class Iteration11Tests(unittest.TestCase):
+    """Fixes from the post-merge review of main 96abced, and its untested claims."""
+
+    def _pr(self, stdout, stderr="", main_drop=(), main_extra=()):
+        with mock.patch("builtins.print"), mock.patch.object(
+                qwen, "_ssh_run_resilient", return_value=run(qwen_stdout(drop=main_drop, extra=main_extra))):
+            qmain = qwen.measure_main_baseline("h", 1)
+        self.assertTrue(qmain.get("ok"), qmain.get("reason"))
+        with mock.patch.object(qwen, "POLARIS_ENABLED", False), mock.patch("builtins.print"), \
+                mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(stdout, stderr=stderr)):
+            return qwen.eval_qwen38_on_box("h", 1, "pull/1/head", qmain)
+
+    def test_qwens_concurrency_rc_is_the_boxs_only_when_every_failed_attempt_was_killed(self):
+        cb = lambda seq: Iteration10Tests._qwen_cb(self, "seq", seq)
+        # Otherwise the last exit that was not a kill (0: the others were runs cut short).
+        self.assertEqual(cb("crash,oom,oom,oom,oom"), ["FAIL", "1", "5"])
+        self.assertEqual(cb("segv,oom,oom,oom,oom"), ["FAIL", "139", "5"])
+        self.assertEqual(cb("oom,crash,crash,crash,crash"), ["FAIL", "1", "5"])
+        self.assertEqual(cb("oom,partial,oom,oom,oom"), ["FAIL", "0", "5"])
+        self.assertEqual(cb("oom,oom,oom,good,good"), ["FAIL", "137", "5"])     # two runs are not three
+        self.assertEqual(cb("partial,partial,partial,partial,partial"), ["FAIL", "0", "5"])
+        self.assertEqual(cb("partial,good,good,good")[0], "OK")
+
+    def test_an_incomplete_width_does_not_hide_a_regression_at_the_other(self):
+        res = self._pr(qwen_stdout(drop=("GUARDCBMO",), extra=("GUARDCBMO_FAILED 16 rc=1", "GUARDCBMO 32 100")))
+        self.assertEqual(res["label"], "REJECT")
+        self.assertIn("modelopt no-regression guard failed", res["reason"])
+
+    def test_the_muse_concurrent_guard_is_judged_over_rounds_too(self):
+        muse_main = ("GUARDMG_UNAVAILABLE",)
+        res = self._pr(qwen_stdout(drop=muse_main, extra=("GUARDMG 32768 40 5000", "GUARDCBMG 16 700",
+                                                          "GUARDCBMG_FAILED 32 rc=139")),
+                       main_drop=muse_main, main_extra=MUSE_GUARD)
+        self.assertEqual((res["ok"], res.get("strike_key")), (False, "guard-cb"), res.get("reason"))
+        self.assertIn("muse glimmer (c32 crashed, rc=139)", res["reason"])
+        # Measured in full, it passes.
+        ok = self._pr(qwen_stdout(drop=muse_main, extra=MUSE_GUARD), main_drop=muse_main, main_extra=MUSE_GUARD)
+        self.assertTrue(ok["ok"] and ok["muse_guard_ok"] and not ok["muse_guard_skipped"], ok.get("reason"))
+
+    def test_an_incomplete_guard_says_which_width_and_how_and_keeps_the_runs_lines(self):
+        mo, q = qwen.MODELOPT_GUARD_MODEL_DIR, qwen.MODEL_DIR
+        stderr = (f"CB_PARTIAL c=16 attempt=1 decode_tokens=5 request_errors=0 ({q})\n"      # the scored ladder's
+                  f"concurrent-decode harness exited 124 at c=16 on {mo} (attempt 1)\nsome build noise\n"
+                  f"CB_PARTIAL c=32 attempt=1 decode_tokens=5 request_errors=0 ({mo})\n"
+                  f"concurrent decode at c=32 on {mo} did not complete on 3 of 5 runs\n")
+        res = self._pr(qwen_stdout(drop=("GUARDCBMO",), extra=("GUARDCBMO_FAILED 16 rc=124",
+                                                             "GUARDCBMO_FAILED 32 rc=0")), stderr=stderr)
+        self.assertEqual(res.get("strike_key"), "guard-cb", res.get("reason"))
+        self.assertIn("the modelopt (c16 hung, c32 too few usable runs) concurrent-decode guard did", res["reason"])
+        self.assertEqual(res["log"].splitlines(), stderr.splitlines()[1:2] + stderr.splitlines()[3:])
+        # Only the end of a long one.
+        many = "".join(f"CB_PARTIAL c=32 attempt={i} decode_tokens=5 request_errors=0 ({mo})\n" for i in range(99))
+        log = self._pr(qwen_stdout(drop=("GUARDCBMO 32",), extra=("GUARDCBMO_FAILED 32 rc=0",)), stderr=many)["log"]
+        self.assertLessEqual(len(log), 1800)
+        self.assertTrue(log.startswith("CB_PARTIAL") and log.endswith("attempt=98 decode_tokens=5 "
+                                                                      f"request_errors=0 ({mo})"), log[:80])
+
+    def test_two_incomplete_guards_read_as_two(self):
+        muse_main = ("GUARDMG_UNAVAILABLE",)
+        res = self._pr(qwen_stdout(drop=muse_main + ("GUARDCBMO 16",),
+                                   extra=("GUARDMG 32768 40 5000", "GUARDCBMG 16 700", "GUARDCBMG_FAILED 32 rc=139",
+                                          "GUARDCBMO_FAILED 16 rc=1")),
+                       main_drop=muse_main, main_extra=MUSE_GUARD)
+        self.assertIn("the modelopt (c16 crashed, rc=1) and muse glimmer (c32 crashed, rc=139) concurrent-decode "
+                      "guards did not complete", res["reason"])
+
+    def test_a_killed_guard_is_named_as_the_guard(self):
+        res = self._pr(qwen_stdout(drop=("GUARDCBMO 32",), extra=("GUARDCBMO_FAILED 32 rc=137",)))
+        self.assertEqual(res.get("strike_key"), "guard-box", res.get("reason"))
+        self.assertIn("the modelopt concurrent-decode guard was killed", res["reason"])
+        self.assertNotIn("guardcbmo", res["reason"])
+
+    def test_a_zero_main_baseline_at_128_skips_the_round(self):
+        for line in ("RESULT_DECODE128_TPS", "RESULT_PREFILL128_PP"):
+            for value in ("0", "-1"):
+                with self.subTest(line, value=value), mock.patch("builtins.print"), mock.patch.object(
+                        qwen, "_ssh_run_resilient",
+                        return_value=run(qwen_stdout(drop=(line,), extra=(f"{line} {value}",)))):
+                    qmain = qwen.measure_main_baseline("h", 1)
+                self.assertFalse(qmain["ok"])
+                self.assertIn("missing/zero", qmain["reason"])
+        # A failed sweep says so, and whose it is.
+        for rc, why in (("1", "main speed sweep failed"), ("137", "main speed sweep failed (killed, exit 137")):
+            with self.subTest(rc=rc), mock.patch("builtins.print"), mock.patch.object(
+                    qwen, "_ssh_run_resilient", return_value=run(qwen_stdout(extra=(f"SWEEP_FAILED rc={rc}",)))):
+                qmain = qwen.measure_main_baseline("h", 1)
+            self.assertFalse(qmain["ok"])
+            self.assertTrue(qmain["reason"].startswith(why), qmain["reason"])
+
+    def test_every_bot_posts_a_charged_fault_without_its_retry_wording(self):
+        import pr_bonsai_bot as bonsai
+        for mod, tag in ((qwen, "qwen38"), (muse, "museglimmer"), (bonsai, "bonsai")):
+            calls = []
+            res = {"ok": False, "retry": True, "strike_key": "cb", "log": "x",
+                   "reason": "concurrent decode at c16 did not complete — re-evaluated next round"}
+            with self.subTest(tag), \
+                    mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run()), \
+                    mock.patch.object(arb, "add_label", side_effect=lambda r, n, l: calls.append(("add", l))), \
+                    mock.patch.object(arb, "remove_label"), mock.patch.object(arb, "sync_generic_eval_label"), \
+                    mock.patch.object(mod, f"strip_{tag}_eval_labels"), mock.patch("builtins.print"):
+                for _ in range(arb.BOX_FAULT_STRIKES):
+                    mod.apply_result("o/r", 9, "a" * 40, res)
+                posted = " ".join(next(a for a in calls if isinstance(a, list) and a[:2] == ["pr", "comment"]))
+                self.assertIn("did not complete — 3 rounds in a row at this commit, so it is charged to the PR",
+                              posted)
+                self.assertNotIn("re-evaluated next round", posted)
+                self.assertIn(("add", f"eval-{tag}:REJECT"), calls)
 
 
 if __name__ == "__main__":
