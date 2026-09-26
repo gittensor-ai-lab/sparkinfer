@@ -2098,6 +2098,79 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                              reinterpret_cast<float*>(qb_partials),
                                              qb_partials ? qb_partials_cap : 0, st);
     };
+    // NVFP4 operand in a scratch buffer: packed nibbles, the row-major ue4m3 scales the quantizers
+    // write, and the CUTLASS layout they are scattered into. Returns the bytes it spans.
+    auto fp4_parts = [](void* base, int rows, int k, void** d, void** srm, void** sfl,
+                        bool b_side) {
+        auto up256 = [](size_t v) { return (v + 255) & ~(size_t)255; };
+        char* p = static_cast<char*>(base);
+        const size_t db = up256((size_t)rows * k / 2), sb = up256((size_t)rows * k / 16);
+        *d = p; *srm = p + db; *sfl = p + db + sb;
+        return up256(db + sb + (b_side ? kernels::prefill_nvfp4_scale_bytes_b(rows, k)
+                                       : kernels::prefill_nvfp4_scale_bytes_a(rows, k)));
+    };
+    // The decode shadow's ternary legs past the fused GEMM's M limit (the long prompt), on the FP4
+    // tensor cores as the long-prefill FFN runs them: the leg's blocks converted to NVFP4 in W_i8
+    // (launch_ptq1_rows_nvfp4), the activation rotated into their basis and quantized to NVFP4
+    // once for every leg that reads it (tfp4_act), then the block-scaled GEMM. The first N8 rows
+    // (N rounded down to 8) run as one GEMM; a ragged tail runs as the last 8 rows through wbuf,
+    // and only its new rows are written. Where the int8 legs would read the folded Q4_K refit,
+    // these read the stored blocks. SPARKINFER_PREFILL_TERNARY_NVFP4_PROJ=0 keeps the int8 legs.
+    static const bool tfp4_proj_env = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_TERNARY_NVFP4_PROJ");
+        return !(e && e[0] == '0');
+    }();
+    const int N8 = N & ~7;
+    const bf16* f4_A = nullptr; const void* f4_sign = nullptr; int f4_K = 0;
+    auto tfp4_act = [&](const bf16* A, const void* sign, int K) -> bool {
+        f4_A = nullptr;
+        void *d, *r, *l;
+        if (!tfp4_proj_env || qb_fires || N8 < 8 || !A_i8 || !W_i8 || !wbuf || !sign ||
+            s.bonsai_block != 1024 || (K % 1024) || K > 8 * 1024 ||
+            !kernels::prefill_nvfp4_supported(N8, 128, K) ||
+            fp4_parts(A_i8, N8, K, &d, &r, &l, false) + fp4_parts(A_i8, 8, K, &d, &r, &l, false) >
+                a_i8_sz)
+            return false;
+        fp4_parts(A_i8, N8, K, &d, &r, &l, false);
+        if (!kernels::launch_ptq1_rotq_rows_nvfp4(A, nullptr, static_cast<const signed char*>(sign),
+                                                  d, nullptr, N8, K, s.bonsai_block, st, l))
+            return false;
+        a_q = nullptr; a_pk = false;   // A_i8 now holds FP4 operands: no int8 memo may reuse it
+        f4_A = A; f4_sign = sign; f4_K = K;
+        return true;
+    };
+    // One leg on tfp4_act's operand: C = A @ W^T (resid: C += it). False, before writing C, only
+    // where the leg's shape does not fit; the caller then runs its int8 legs.
+    auto tfp4_gemm = [&](const void* W, int n_out, bf16* C, bool resid) -> bool {
+        const int K = f4_K;
+        void *wd, *wr, *wl, *ad, *ar, *al;
+        if (!f4_A || !W || (n_out % 128) ||
+            fp4_parts(W_i8, n_out, K, &wd, &wr, &wl, true) > maxw ||
+            (N8 < N && (size_t)8 * n_out > maxw))
+            return false;
+        const float alpha = kernels::ptq1_nvfp4_alpha();
+        kernels::launch_ptq1_rows_nvfp4(W, wd, nullptr, n_out, K, st, wl);
+        const size_t a_main = fp4_parts(A_i8, N8, K, &ad, &ar, &al, false);
+        kernels::launch_prefill_nvfp4_gemm(ad, al, wd, wl, C, N8, n_out, K, nullptr, st, alpha,
+                                           resid ? C : nullptr);
+        if (N8 < N) {
+            const int tail = N - N8;
+            bf16* T = reinterpret_cast<bf16*>(wbuf);
+            fp4_parts(A_i8 + a_main, 8, K, &ad, &ar, &al, false);
+            kernels::launch_ptq1_rotq_rows_nvfp4(f4_A + (size_t)(N - 8) * K, nullptr,
+                                                 static_cast<const signed char*>(f4_sign), ad,
+                                                 nullptr, 8, K, s.bonsai_block, st, al);
+            kernels::launch_prefill_nvfp4_gemm(ad, al, wd, wl, T, 8, n_out, K, nullptr, st, alpha);
+            bf16* dst = C + (size_t)N8 * n_out;
+            const bf16* src = T + (size_t)(8 - tail) * n_out;
+            if (resid)
+                kernels::launch_prefill_add(dst, src, dst, (long)tail * n_out, st);
+            else
+                cudaMemcpyAsync(dst, src, (size_t)tail * n_out * sizeof(bf16),
+                                cudaMemcpyDeviceToDevice, st);
+        }
+        return true;
+    };
     // A ternary leg with the residual folded into its split-K reduce (1), or where the GEMM does
     // not split, into C for the caller's add (2). 0: nothing written, the caller runs the folded
     // leg (its quantize redoes A_i8, the memo having been cleared).
@@ -2107,6 +2180,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             void* Xc = X;
             if (sfp4_gemm(N, K, &W, &Xc, &n_out, 1, true)) return 1;
         }
+        if (W && rs && tfp4_act(A, sign, K) && tfp4_gemm(W, n_out, X, true)) return 1;
         if (!W || !rs || !trotq(A, sign, K)) return 0;
         if (kernels::launch_prefill_gemm_qi8_dense_resid(kPtq1GgmlType, A_i8, sx, W, rs, X, N,
                                                          n_out, K, st, qb_partials, QB_SPLITS,
@@ -2217,6 +2291,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }
                 // Declined: the folded arms below redo A_i8 (trotq cleared the memo).
             }
+            // Past the fused GEMM's M limit: both legs on the FP4 tensor cores, z on st as well
+            // (*z_pending stays false, so the caller does not launch it again).
+            if (gt && (tproj_mask & 8) && !norm_deferred && gt->wqkv_type == kPtq1GgmlType &&
+                gt->wqkv_gate_type == kPtq1GgmlType && tfp4_act(A, s.bonsai_sign_hidden, H) &&
+                tfp4_gemm(gt->wqkv, lqkv, b8, false) && tfp4_gemm(gt->wqkv_gate, lvdim, lz, false))
+                return;
             if (z_pending && use_i8 && w.wqkv_rs && w.wqkv_gate_rs &&
                 w.wqkv_gate_type == w.wqkv_type &&
                 kernels::pf_dense_gemm_qi8_supported(w.wqkv_type)) {
@@ -2672,6 +2752,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         qb_partials, QB_SPLITS, qb_partials_cap,
                         nullptr, nullptr, nullptr, apk());
                 }
+                if (!grouped && tl && (tproj_mask & 1) && !attn_norm_deferred &&
+                    tl->wq_type == kPtq1GgmlType && tl->wk_type == kPtq1GgmlType &&
+                    tl->wv_type == kPtq1GgmlType && tfp4_act(xn, s.bonsai_sign_hidden, H))
+                    grouped = tfp4_gemm(tl->wq, wide, b8, false) &&
+                              tfp4_gemm(tl->wk, kvdim, kf, false) &&
+                              tfp4_gemm(tl->wv, kvdim, vf, false);
                 if (!grouped && use_i8 && w.wq_rs && w.wk_rs && w.wv_rs &&
                     w.wk_type == w.wq_type && w.wv_type == w.wq_type &&
                     kernels::pf_dense_gemm_qi8_supported(w.wq_type)) {
@@ -3087,15 +3173,6 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 const char* e = getenv("SPARKINFER_PREFILL_TERNARY_NVFP4");
                 return !(e && e[0] == '0');
             }();
-            auto fp4_parts = [](void* base, int rows, int k, void** d, void** srm, void** sfl,
-                                bool b_side) {
-                auto up256 = [](size_t v) { return (v + 255) & ~(size_t)255; };
-                char* p = static_cast<char*>(base);
-                const size_t db = up256((size_t)rows * k / 2), sb = up256((size_t)rows * k / 16);
-                *d = p; *srm = p + db; *sfl = p + db + sb;
-                return db + sb + (b_side ? kernels::prefill_nvfp4_scale_bytes_b(rows, k)
-                                         : kernels::prefill_nvfp4_scale_bytes_a(rows, k));
-            };
             const int fc8 = (FC + 7) & ~7;
             // Where the three operands go: the int8 weight cache when this layer has one, else the
             // scratch that cache borrows (W_i8 and wbuf, which nothing else in the FFN touches
@@ -3124,12 +3201,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     return fp4_parts(A_i8, fc8, ffn, &d, &r, &f, false) <= a_i8_sz &&
                            fp4_parts(A_i8, fc8, H, &d, &r, &f, false) <= a_i8_sz;
                 }() &&
-                kernels::launch_ptq1_rows_nvfp4(gate_pf, tg_d, tg_r, ffn, H, st) &&
-                kernels::launch_ct_nvfp4_pack_sfb(tg_r, tg_s, ffn, H, st) &&
-                kernels::launch_ptq1_rows_nvfp4(up_pf, tu_d, tu_r, ffn, H, st) &&
-                kernels::launch_ct_nvfp4_pack_sfb(tu_r, tu_s, ffn, H, st) &&
-                kernels::launch_ptq1_rows_nvfp4(tl->down_q, td_d, td_r, H, ffn, st) &&
-                kernels::launch_ct_nvfp4_pack_sfb(td_r, td_s, H, ffn, st);
+                kernels::launch_ptq1_rows_nvfp4(gate_pf, tg_d, nullptr, ffn, H, st, tg_s) &&
+                kernels::launch_ptq1_rows_nvfp4(up_pf, tu_d, nullptr, ffn, H, st, tu_s) &&
+                kernels::launch_ptq1_rows_nvfp4(tl->down_q, td_d, nullptr, H, ffn, st, td_s);
             if (ffn_i8 && !ffn_qi8 && !tfp4) {
                 if (t_gu) {
                     kernels::launch_ptq1_rows_i8(gate_pf, ffn_Wg_i8, ffn_swg, ffn, H, st);
@@ -3473,22 +3547,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     if (m8 != fn) {
                         cudaMemsetAsync(static_cast<char*>(ad) + (size_t)fn * H / 2, 0,
                                         (size_t)(m8 - fn) * H / 2, st);
-                        cudaMemsetAsync(static_cast<char*>(ar) + (size_t)fn * H / 16, 0,
-                                        (size_t)(m8 - fn) * H / 16, st);
                     }
                     kernels::launch_ptq1_rotq_rows_nvfp4(
-                        hn_c, nullptr, static_cast<const signed char*>(s.bonsai_sign_hidden), ad, ar,
-                        fn, H, s.bonsai_block, st);
-                    kernels::launch_nvfp4_pack_sfa(ar, as, m8, H, st);
+                        hn_c, nullptr, static_cast<const signed char*>(s.bonsai_sign_hidden), ad,
+                        nullptr, fn, H, s.bonsai_block, st, as);
                     kernels::launch_prefill_nvfp4_gemm(ad, as, tg_d, tg_s, ffg, m8, ffn, H, nullptr,
                                                        st, alpha);
                     kernels::launch_prefill_nvfp4_gemm(ad, as, tu_d, tu_s, ffu, m8, ffn, H, nullptr,
                                                        st, alpha);
                     fp4_parts(A_i8, m8, ffn, &ad, &ar, &as, false);
                     kernels::launch_ptq1_rotq_rows_nvfp4(
-                        ffg, ffu, static_cast<const signed char*>(s.bonsai_sign_ffn), ad, ar, m8,
-                        ffn, s.bonsai_block, st);
-                    kernels::launch_nvfp4_pack_sfa(ar, as, m8, ffn, st);
+                        ffg, ffu, static_cast<const signed char*>(s.bonsai_sign_ffn), ad, nullptr,
+                        m8, ffn, s.bonsai_block, st, as);
                     if (m8 == fn) {
                         if (ffn_fused)
                             kernels::launch_prefill_nvfp4_gemm(ad, as, td_d, td_s, xc, fn, H, ffn,

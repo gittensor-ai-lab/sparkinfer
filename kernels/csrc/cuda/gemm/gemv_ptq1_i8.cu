@@ -47,6 +47,13 @@ __device__ __forceinline__ void pdl_wait() {
     cudaGridDependencySynchronize();
 #endif
 }
+// Byte offset of the ue4m3 scale for (row r, 16-value group g) in the CUTLASS sm1xx block-scaled
+// layout (launch_ct_nvfp4_pack_sfb / launch_nvfp4_pack_sfa's target): 128-row x 4-group atoms of
+// 512 bytes, the K atoms fastest; inside one, row r%32 strides 16, r%128/32 strides 4, g%4 is 1.
+__device__ __forceinline__ size_t sf_cutlass_off(int r, int g, int ng) {
+    return ((size_t)(r >> 7) * (size_t)(ng >> 2) + (size_t)(g >> 2)) * 512 +
+           (size_t)((r & 31) * 16 + ((r >> 5) & 3) * 4 + (g & 3));
+}
 
 // ---------------------------------------------------------------------------------------------
 // Rotate + quantize. One CTA per (1024-span, row), 256 threads holding four consecutive values
@@ -974,7 +981,8 @@ __global__ void __launch_bounds__(256)
 ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict__ sign,
                          signed char* __restrict__ q, float* __restrict__ scale,
                          signed char* __restrict__ qp, int rows, int k,
-                         const __nv_bfloat16* __restrict__ u = nullptr) {
+                         const __nv_bfloat16* __restrict__ u = nullptr,
+                         unsigned char* __restrict__ sfl = nullptr) {
     __shared__ float sh[kSpan];
     __shared__ float sred[8];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -1059,8 +1067,10 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
                 *reinterpret_cast<unsigned short*>(
                     reinterpret_cast<unsigned char*>(q) + ((size_t)row * k + e0) / 2) =
                     (unsigned short)(lo | (hi << 8));
-                if ((t & 3) == 0)
-                    reinterpret_cast<unsigned char*>(qp)[(size_t)row * (k / 16) + e0 / 16] = qb;
+                if ((t & 3) == 0) {
+                    if (sfl) sfl[sf_cutlass_off(row, e0 / 16, k / 16)] = qb;
+                    else reinterpret_cast<unsigned char*>(qp)[(size_t)row * (k / 16) + e0 / 16] = qb;
+                }
             }
         }
     }
@@ -1112,7 +1122,8 @@ __device__ __forceinline__ void ptq1_fp4_scale(float sb, unsigned& code, unsigne
 template <int WPC>
 __global__ void __launch_bounds__(WPC * 32)
 ptq1_rows_nvfp4_kernel(const unsigned char* __restrict__ w, unsigned char* __restrict__ q,
-                       unsigned char* __restrict__ sf, int rows, int nblk) {
+                       unsigned char* __restrict__ sf, int rows, int nblk,
+                       unsigned char* __restrict__ sfl) {
     extern __shared__ uint4 srow[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * WPC + warp;
@@ -1142,27 +1153,42 @@ ptq1_rows_nvfp4_kernel(const unsigned char* __restrict__ w, unsigned char* __res
             o[j >> 3] |= nib << (4 * (j & 7));
         }
         *reinterpret_cast<uint2*>(q + (size_t)row * nblk * (kBlk / 2) + g * 8) = make_uint2(o[0], o[1]);
-        sf[(size_t)row * ng + g] = sfb;
+        if (sfl) sfl[sf_cutlass_off(row, g, ng)] = sfb;
+        else sf[(size_t)row * ng + g] = sfb;
     }
 }
 
 }  // namespace
 
+// A partial last 128-row atom leaves bytes no row writes; they are zeroed as the pack does.
+static bool sf_cutlass_clear(void* sfl, int rows, int k, cudaStream_t st) {
+    if (!sfl || (rows & 127) == 0) return true;
+    return cudaMemsetAsync(sfl, 0, (size_t)((rows + 127) & ~127) * (k / 16), st) == cudaSuccess;
+}
+
 bool launch_ptq1_rows_nvfp4(const void* w_ptq1, void* q, void* sf_rowmajor, int rows, int k,
-                            cudaStream_t st) {
-    if (rows <= 0 || k <= 0 || k % kBlk != 0) return false;
-    constexpr int WPC = 4;
-    const size_t shm = (size_t)WPC * k;
-    if (shm > 96 * 1024) return false;
+                            cudaStream_t st, void* sf_cutlass) {
+    if (rows <= 0 || k <= 0 || k % kBlk != 0 || k > 96 * 1024) return false;
+    if (!sf_cutlass_clear(sf_cutlass, rows, k, st)) return false;
+    auto* sfl = static_cast<unsigned char*>(sf_cutlass);
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(ptq1_rows_nvfp4_kernel<WPC>,
+        cudaFuncSetAttribute(ptq1_rows_nvfp4_kernel<4>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+        cudaFuncSetAttribute(ptq1_rows_nvfp4_kernel<1>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
         attr = true;
     }
-    ptq1_rows_nvfp4_kernel<WPC><<<(rows + WPC - 1) / WPC, WPC * 32, shm, st>>>(
-        static_cast<const unsigned char*>(w_ptq1), static_cast<unsigned char*>(q),
-        static_cast<unsigned char*>(sf_rowmajor), rows, k / kBlk);
+    const auto* w = static_cast<const unsigned char*>(w_ptq1);
+    auto* qq = static_cast<unsigned char*>(q);
+    auto* sf = static_cast<unsigned char*>(sf_rowmajor);
+    // A row stages k bytes of shared memory: four rows a CTA at the FFN's 17408 would leave one CTA
+    // on an SM, so wide rows go one to a CTA.
+    if (k > 8192)
+        ptq1_rows_nvfp4_kernel<1><<<rows, 32, (size_t)k, st>>>(w, qq, sf, rows, k / kBlk, sfl);
+    else
+        ptq1_rows_nvfp4_kernel<4><<<(rows + 3) / 4, 128, (size_t)4 * k, st>>>(w, qq, sf, rows,
+                                                                            k / kBlk, sfl);
     return true;
 }
 float ptq1_nvfp4_alpha() { return 1.f / kFp4WScale; }
@@ -1286,23 +1312,25 @@ bool launch_ptq1_swiglu_rotq_rows_i8(const void* gate_bf16, const void* up_bf16,
 
 bool launch_ptq1_rotq_rows_nvfp4(const void* x_bf16, const void* up_bf16, const signed char* sign,
                                  void* q, void* sf_rowmajor, int rows, int k, int block,
-                                 cudaStream_t st) {
+                                 cudaStream_t st, void* sf_cutlass) {
     if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 17 * kSpan) return false;
+    if (!sf_cutlass_clear(sf_cutlass, rows, k, st)) return false;
+    auto* sfl = static_cast<unsigned char*>(sf_cutlass);
     const auto* x = static_cast<const __nv_bfloat16*>(x_bf16);
     const auto* u = static_cast<const __nv_bfloat16*>(up_bf16);
     auto* qq = static_cast<signed char*>(q);
     auto* sf = static_cast<signed char*>(sf_rowmajor);
     if (u) {
         if (k <= 8 * kSpan)
-            ptq1_rotq_rows_i8_kernel<8, true, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, u);
+            ptq1_rotq_rows_i8_kernel<8, true, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, u, sfl);
         else
-            ptq1_rotq_rows_i8_kernel<17, true, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, u);
+            ptq1_rotq_rows_i8_kernel<17, true, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, u, sfl);
     } else {
         if (k > 8 * kSpan) return false;
         if (k <= 5 * kSpan)
-            ptq1_rotq_rows_i8_kernel<5, false, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k);
+            ptq1_rotq_rows_i8_kernel<5, false, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, nullptr, sfl);
         else
-            ptq1_rotq_rows_i8_kernel<8, false, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k);
+            ptq1_rotq_rows_i8_kernel<8, false, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, nullptr, sfl);
     }
     return true;
 }
