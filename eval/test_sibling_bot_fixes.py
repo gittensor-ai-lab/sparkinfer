@@ -2640,5 +2640,73 @@ class Iteration11Tests(unittest.TestCase):
                 self.assertIn(("add", f"eval-{tag}:REJECT"), calls)
 
 
+class Iteration12Tests(unittest.TestCase):
+    """Fixes and untested claims from the post-merge review of main d27e913."""
+
+    _pr = Iteration11Tests._pr
+
+    def test_the_rc_is_the_last_exit_that_was_not_a_kill(self):
+        cb = lambda seq: Iteration10Tests._qwen_cb(self, "seq", seq)
+        self.assertEqual(cb("segv,crash,oom,oom,oom"), ["FAIL", "1", "5"])
+        self.assertEqual(cb("crash,segv,oom,oom,oom"), ["FAIL", "139", "5"])
+
+    def test_the_guard_cb_log_keeps_only_the_failed_widths_lines(self):
+        mo, mg = qwen.MODELOPT_GUARD_MODEL_DIR, qwen.MUSE_GUARD_GGUF
+        keep = [f"concurrent decode produced no positive metric at c=16 on {mo}",
+                f"concurrent-decode harness exited 139 at c=32 on {mg} (attempt 1)"]
+        drop = [f"CB_PARTIAL c=32 attempt=1 decode_tokens=5 request_errors=0 ({mo})",    # c32 passed in the end
+                f"CB_PARTIAL c=16 attempt=1 decode_tokens=5 request_errors=0 ({mg})"]    # so did Muse's c16
+        pr = {"guardcbmo_failed_at": ["c16 too few usable runs"], "guardcbmg_failed_at": ["c32 crashed, rc=139"]}
+        got = qwen._cb_attempt_lines(run(stderr="\n".join([drop[0], keep[0], drop[1], keep[1]])), pr)
+        self.assertEqual(got.splitlines(), keep)
+
+    def test_the_guard_cb_logs_tail_keeps_a_whole_first_line(self):
+        mo = qwen.MODELOPT_GUARD_MODEL_DIR
+        lines = [f"CB_PARTIAL c=32 attempt={i} decode_tokens=5 request_errors=0 ({mo})" for i in range(10, 30)]
+        pr = {"guardcbmo_failed_at": ["c32 too few usable runs"]}
+        limit = len("\n".join(lines[-3:]))                                       # exactly the last three
+        self.assertEqual(qwen._cb_attempt_lines(run(stderr="\n".join(lines)), pr, limit=limit).splitlines(),
+                         lines[-3:])
+        self.assertEqual(qwen._cb_attempt_lines(run(stderr="\n".join(lines)), pr, limit=limit + 5).splitlines(),
+                         lines[-3:])                                             # a partial line is dropped
+
+    def test_mains_prefill_at_16k_must_be_positive(self):
+        for value in ("0", "-5", "nan"):
+            with self.subTest(value=value), mock.patch("builtins.print"), mock.patch.object(
+                    qwen, "_ssh_run_resilient", return_value=run(qwen_stdout(
+                        drop=("RESULT_PREFILL16K_PP",), extra=(f"RESULT_PREFILL16K_PP {value}",)))):
+                qmain = qwen.measure_main_baseline("h", 1)
+                self.assertFalse(qmain["ok"])
+                self.assertIn("prefill@16k", qmain["reason"])
+
+    def test_a_failed_sweep_beside_wrong_output_leads_with_the_output(self):
+        zeros = ("RESULT_DECODE128_TPS 0", "RESULT_PREFILL128_PP 0", "RESULT_PREFILL16K_PP 0")
+        for rc in ("1", "137"):
+            with self.subTest(rc=rc):
+                res = self._pr(qwen_stdout(top1="0.2", kl="2.0", drop=tuple(z.split()[0] for z in zeros),
+                                           extra=zeros + (f"SWEEP_FAILED rc={rc}",)))
+                self.assertEqual((res["ok"], res.get("retry")), (False, None), res.get("reason"))
+                self.assertTrue(res["reason"].startswith("PR output is incorrect — top-1 0.200"), res["reason"])
+        # With the output right, a failed sweep is reported as before.
+        res = self._pr(qwen_stdout(drop=tuple(z.split()[0] for z in zeros), extra=zeros + ("SWEEP_FAILED rc=1",)))
+        self.assertIn("PR bench missing/zero prefill@16k", res["reason"])
+
+    def test_several_killed_guards_read_as_several(self):
+        res = self._pr(qwen_stdout(drop=("GUARD36 ", "GUARDCBMO 32"),
+                                   extra=("GUARD36_FAILED rc=137", "GUARDCBMO_FAILED 32 rc=137")))
+        self.assertEqual(res.get("strike_key"), "guard-box", res.get("reason"))
+        self.assertIn("the qwen3.6 and modelopt concurrent-decode guards were killed", res["reason"])
+        # Muse Glimmer's reads the same way, by name.
+        main = WiringTests._main(self)
+        for drop, want in ((("GUARD36 ", "GUARDMO "), "the qwen3.6 guard and the modelopt guard were killed"),
+                           (("GUARDUN ",), "the unsloth qwen3.8 guard was killed")):
+            stdout = muse_stdout(drop=drop) + "".join(f"{d.strip()}_FAILED rc=137\n" for d in drop)
+            with self.subTest(want), mock.patch.object(muse, "POLARIS_ENABLED", False), \
+                    mock.patch("builtins.print"), mock.patch.object(muse, "_ssh_run_resilient", return_value=run(stdout)):
+                res = muse.eval_museglimmer_on_box("h", 1, "pull/1/head", main)
+                self.assertEqual(res.get("strike_key"), "guard-box", res.get("reason"))
+                self.assertIn(want, res["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -128,8 +128,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     charged to the PR no longer says it will be re-evaluated next round, and one of Qwen3.8's
     names the guard widths that did not complete and how (the exit code is the last one that was
     not a kill; it read 1 for any mix), with those widths' own lines; Qwen3.8's `main` baseline
-    with a 0 at decode@128 or prefill@128, or a failed sweep, skips the round (it made every PR a
-    REJECT, closed);
+    with a 0 at decode@128 or prefill@128 skips the round (it made every PR a REJECT, closed), and
+    a failed `main` sweep says so; a failed Qwen3.8 speed sweep beside wrong output leads with the
+    output, as Muse Glimmer's does; `main`'s prefill@16k must be positive, as its 128 values must;
+    CONTRIBUTING names every check judged over rounds, not Ternary-Bonsai's alone;
   - the cron wrappers run the bots from their own `origin/main` worktree (made again if it breaks,
     and never one they did not make), refuse to run without a `GH_TOKEN` (or, with
     `SPARKINFER_BOT_LOGIN` set, with another account's; `.env.eval` never stands in for an empty

@@ -1068,7 +1068,8 @@ cb_complete() {{
 }}
 # cb_median C: CB_AGG = the median of {cb_reps} complete runs at width C, within {cb_max_attempts}
 # attempts. On failure CB_RC is 137 when the OOM killer took every failed attempt (the box's), else
-# the last other exit (0: runs that never completed, or no positive metric -- the PR's).
+# not 137 (the PR's): the last non-zero exit, as 1 if that was a kill (0 when no attempt exited
+# non-zero: runs that never completed, or no positive metric). Only the 137 is read.
 cb_median() {{
   local cc=$1 out=/tmp/mg_cb_$1.txt attempt=0 valid=0 a rc tok err all_killed=1 last_rc=0
   CB_AGGS=""; CB_AGG=0; CB_RC=0
@@ -1839,8 +1840,12 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
     if killed and accuracy_ok:
         # A guard sweep SIGKILLed on the PR build (the host OOM killer): the box's, not a regression.
         # Beside a failed accuracy gate, which a busy box cannot fake, the REJECT is posted instead.
+        names = [{"guard36": "the qwen3.6 guard", "guardmo": "the modelopt guard",
+                  "guardun": "the unsloth qwen3.8 guard", "guardbn": "the ternary-bonsai guard"}.get(
+                      k, k.replace("cb-decode@", "concurrent decode at ")) for k in killed]
         return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "guard-box", "log": "",
-                "reason": f"{', '.join(killed)} was killed on the PR build (exit 137, the OOM killer) — infra"}
+                "reason": f"{' and '.join(names)} {'were' if len(names) > 1 else 'was'} killed on the PR build "
+                          "(exit 137, the OOM killer) — infra"}
     # Beside that failed accuracy gate, a guard the OOM killer took measured nothing: it is reported
     # as not measured, not as a regression (the close comment used to name it as the failure).
     guards_killed = []

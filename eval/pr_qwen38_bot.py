@@ -1625,7 +1625,7 @@ def measure_main_baseline(host, port):
         return {"ok": False, "reason": "main bench missing/zero decode@128 tok/s", "log": (r.stdout or "")[-1500:]}
     if not (main.get("prefill128_pp") or 0) > 0:
         return {"ok": False, "reason": "main bench missing/zero prefill@128 pp", "log": (r.stdout or "")[-1500:]}
-    if not main.get("prefill16k_pp"):
+    if not (main.get("prefill16k_pp") or 0) > 0:
         return {"ok": False, "reason": "main bench missing/zero prefill@16k pp (KV pool alloc?)",
                 "log": (r.stdout or "")[-1500:]}
     missing_cb = [c for c in CB_CONCS if not main.get(f"cb{c}_agg")]
@@ -1687,7 +1687,10 @@ def _cb_attempt_lines(r, pr, limit=1800):
                               "concurrent decode produced no positive metric"))
              and any(w in l and (f" on {path} " in l + " " or f"({path})" in l) for path, w in failed)]
     text = "\n".join(lines)
-    return text if len(text) <= limit else text[len(text) - limit:].split("\n", 1)[-1]
+    if len(text) <= limit:
+        return text
+    tail = text[len(text) - limit:]
+    return tail if text[len(text) - limit - 1] == "\n" else tail.split("\n", 1)[-1]
 
 
 def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
@@ -1735,6 +1738,12 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         # cannot finish. Its zeros must not read as a regression; charged after BOX_FAULT_STRIKES.
         return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "sweep-box", "log": "",
                 "reason": "the PR's Qwen3.8 speed sweep was killed (exit 137) — infra"}
+    if pr.get("sweep_failed") and output_wrong:
+        # Lead with the accuracy result, as pr_museglimmer_bot.py does (#1037): the sweep's zeros
+        # used to be reported instead ("PR bench missing/zero prefill@16k pp").
+        return {"ok": False, "pr_tip": pr.get("pr_tip"), "log": (r.stdout or "")[-1500:],
+                "reason": (f"PR output is incorrect — top-1 {t1:.3f} (bar >={ACC_TOP1_BAR}), KL {kl:.4f} "
+                           f"(bar <={ACC_KL_BAR}); the speed sweep did not complete either")}
     if "decode128_tps" not in pr:
         return {"ok": False, "pr_tip": pr.get("pr_tip"), "reason": "PR bench missing decode@128 tok/s", "log": (r.stdout or "")[-1500:]}
     if "prefill128_pp" not in pr:
@@ -1838,8 +1847,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         # A guard sweep SIGKILLed on the PR build (the host OOM killer): the box's, not a regression.
         # Beside a failed accuracy gate, which a busy box cannot fake, the REJECT is posted instead.
         return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "guard-box", "log": "",
-                "reason": f"the {', '.join(_GUARD_NAMES[k] for k in killed)} guard was killed on the PR "
-                          "build (exit 137) — infra"}
+                "reason": f"the {' and '.join(_GUARD_NAMES[k] for k in killed)} guard"
+                          f"{'s were' if len(killed) > 1 else ' was'} killed on the PR build (exit 137) — infra"}
     # Beside that failed accuracy gate, a guard the OOM killer took measured nothing: it is reported
     # as not measured, not as a regression (the close comment used to name it as the failure).
     guards_killed = []
