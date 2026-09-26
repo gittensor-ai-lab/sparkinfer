@@ -902,6 +902,212 @@ template __global__ void fa_combine_gated_q8_kernel<256, FA_COMBINE_DG, 16>(
 #include "sparkinfer/kernels/attention.h"
 #include <mma.h>
 
+// Tensor-core split for bf16 KV at 16:1 GQA, hd128 (Muse Glimmer's packed decode rows). The 16
+// q-heads of a kv head are the mma M dim, so one warp scores 16 heads x 16 keys with 16 bf16
+// m16n8k16 MMAs and folds them into V with 48 more, where the scalar tile kernel spends a warp per
+// head, a 5-shuffle reduction and two MUFU per key. Each warp takes one 16-token physical block
+// at a time, loading K and V straight into fragment registers: a thread's dims are permuted the
+// same way in Q and K (the QK sum does not care which dim sits in which k slot), so every load
+// is a 16-byte vector and a key row is read as full sectors. P goes in as three bf16 terms
+// (hi + mid + lo, 24 bits between them), so PV keeps fp32 P against the bf16 V the scalar kernel
+// multiplies -- the sums differ from its fp32 FMA chain only in order and in the tensor core's
+// own accumulation. (Two terms left P at 16 bits and flipped twice as many bf16 outputs.) The
+// warps of a block merge their running (m, l, O) in shared memory and write ONE partial per
+// (row, q-head, split) in the scalar kernel's layout and units (natural-exp m, unnormalised O), so
+// fa_combine and the gated Q8 combine read it unchanged. Needs block_size == 16.
+#define FA16_ROWP 132   // padded f32 row stride of the merge buffer (conflict-free float4 stores)
+
+__device__ __forceinline__ void fa16_mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2,
+                                              uint32_t a3, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t fa16_pack_bf16(float lo, float hi) {
+    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+
+template <int NW>
+__global__ void __launch_bounds__(NW * 32) fa_split_gqa16_mma_bf16_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
+    const __nv_bfloat16* __restrict__ v_pool, const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens,
+    float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+    float scale, int num_q_heads, int num_kv_heads, int max_blocks, int n_splits
+) {
+    constexpr int HD = 128, GQA = 16, BS = 16;
+    const int seq = blockIdx.y, split = blockIdx.x % n_splits, kvh = blockIdx.x / n_splits;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int sl = seq_lens[seq];
+    const int nblk = (sl + BS - 1) / BS;
+    const int bps = (nblk + n_splits - 1) / n_splits;   // physical blocks per split
+    const int b0 = split * bps, b1 = min(nblk, b0 + bps);
+
+    // Q fragments: thread (g, t) holds heads g and g+8, dims {32i + 8t + [0,8) : i < 4} -- the
+    // same permutation the K loads below use, so k-step s pairs word 2s / 2s+1 of each.
+    uint32_t qa[2][16];
+    {
+        const __nv_bfloat16* qp = q + (size_t)(seq * num_q_heads + kvh * GQA) * HD;
+        #pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const uint4* src = reinterpret_cast<const uint4*>(qp + (size_t)(g + 8 * r) * HD);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const uint4 v = __ldg(src + 4 * i + t);
+                qa[r][4 * i + 0] = v.x; qa[r][4 * i + 1] = v.y; qa[r][4 * i + 2] = v.z; qa[r][4 * i + 3] = v.w;
+            }
+        }
+    }
+
+    float m[2] = {-1e30f, -1e30f}, l[2] = {0.f, 0.f};
+    float o[16][4];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) { o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f; }
+
+    const size_t tok_stride = (size_t)num_kv_heads * HD;
+    for (int b = b0 + warp; b < b1; b += NW) {
+        const int phys = block_table[(size_t)seq * max_blocks + b];
+        const size_t base = ((size_t)phys * BS * num_kv_heads + kvh) * HD;
+        const int kbase = b * BS;
+        // K: keys g (n-tile 0) and 8+g (n-tile 1), 64 contiguous bytes per load across t.
+        uint32_t kb[2][16];
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++) {
+            const uint4* src = reinterpret_cast<const uint4*>(k_pool + base + (size_t)(nt * 8 + g) * tok_stride);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const uint4 v = __ldg(src + 4 * i + t);
+                kb[nt][4 * i + 0] = v.x; kb[nt][4 * i + 1] = v.y; kb[nt][4 * i + 2] = v.z; kb[nt][4 * i + 3] = v.w;
+            }
+        }
+        // V: keys 2t, 2t+1, 2t+8, 2t+9, dims {64i + 8g + [0,8) : i < 2} (n-slot g of every n-tile).
+        uint32_t vr[4][8];
+        #pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            const int key = 2 * t + (kk & 1) + 8 * (kk >> 1);
+            const uint4* src = reinterpret_cast<const uint4*>(v_pool + base + (size_t)key * tok_stride);
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                uint4 v = __ldg(src + 8 * i + g);
+                if (kbase + key >= sl) v = make_uint4(0u, 0u, 0u, 0u);   // stale slots may hold NaN
+                vr[kk][4 * i + 0] = v.x; vr[kk][4 * i + 1] = v.y; vr[kk][4 * i + 2] = v.z; vr[kk][4 * i + 3] = v.w;
+            }
+        }
+
+        float s[2][4];
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++) {
+            s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+            #pragma unroll
+            for (int ks = 0; ks < 8; ks++)
+                fa16_mma_bf16(s[nt], qa[0][2 * ks], qa[1][2 * ks], qa[0][2 * ks + 1], qa[1][2 * ks + 1],
+                              kb[nt][2 * ks], kb[nt][2 * ks + 1]);
+        }
+        // s[nt][0..1] = head g, keys 8nt + 2t + {0,1}; s[nt][2..3] = head g+8, same keys.
+        float mx[2] = {-INFINITY, -INFINITY};
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int key = kbase + nt * 8 + 2 * t + (e & 1);
+                s[nt][e] = (key < sl) ? s[nt][e] * scale : -INFINITY;
+                mx[e >> 1] = fmaxf(mx[e >> 1], s[nt][e]);
+            }
+        float corr[2];
+        #pragma unroll
+        for (int r = 0; r < 2; r++) {
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
+            const float mn = fmaxf(m[r], mx[r]);
+            corr[r] = __expf(m[r] - mn);
+            m[r] = mn;
+            l[r] *= corr[r];
+        }
+        uint32_t ph[4], pm[4], pl[4];   // A fragments of P = hi + mid + lo (a0..a3, m16n8k16 layout)
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++)
+            #pragma unroll
+            for (int r = 0; r < 2; r++) {
+                const float p0 = __expf(s[nt][2 * r] - m[r]), p1 = __expf(s[nt][2 * r + 1] - m[r]);
+                l[r] += p0 + p1;
+                const __nv_bfloat162 h = __floats2bfloat162_rn(p0, p1);
+                const float2 hf = __bfloat1622float2(h);
+                const float r0 = p0 - hf.x, r1 = p1 - hf.y;
+                const __nv_bfloat162 md = __floats2bfloat162_rn(r0, r1);
+                const float2 mf = __bfloat1622float2(md);
+                ph[2 * nt + r] = *reinterpret_cast<const uint32_t*>(&h);
+                pm[2 * nt + r] = *reinterpret_cast<const uint32_t*>(&md);
+                pl[2 * nt + r] = fa16_pack_bf16(r0 - mf.x, r1 - mf.y);
+            }
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            o[j][0] *= corr[0]; o[j][1] *= corr[0];
+            o[j][2] *= corr[1]; o[j][3] *= corr[1];
+            const int w = 4 * (j >> 3) + ((j & 7) >> 1);
+            const uint32_t sel = (j & 1) ? 0x7632u : 0x5410u;
+            const uint32_t vb0 = __byte_perm(vr[0][w], vr[1][w], sel);
+            const uint32_t vb1 = __byte_perm(vr[2][w], vr[3][w], sel);
+            fa16_mma_bf16(o[j], pl[0], pl[1], pl[2], pl[3], vb0, vb1);
+            fa16_mma_bf16(o[j], pm[0], pm[1], pm[2], pm[3], vb0, vb1);
+            fa16_mma_bf16(o[j], ph[0], ph[1], ph[2], ph[3], vb0, vb1);
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < 2; r++) {
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 2);
+    }
+
+    // Merge the NW warps. o[j][c]: head g + 8*(c>>1), dim 64*(j>>3) + 16t + 8*(c&1) + (j&7).
+    extern __shared__ float fa16_smem[];
+    float* s_o = fa16_smem;                               // [NW][16][FA16_ROWP]
+    float* s_m = s_o + NW * 16 * FA16_ROWP;               // [NW][16]
+    float* s_l = s_m + NW * 16;                           // [NW][16]
+    {
+        float* wo = s_o + warp * 16 * FA16_ROWP;
+        #pragma unroll
+        for (int r = 0; r < 2; r++)
+            #pragma unroll
+            for (int i = 0; i < 2; i++)
+                #pragma unroll
+                for (int c = 0; c < 2; c++) {
+                    float* dst = wo + (g + 8 * r) * FA16_ROWP + 64 * i + 16 * t + 8 * c;
+                    *reinterpret_cast<float4*>(dst) =
+                        make_float4(o[8 * i + 0][2 * r + c], o[8 * i + 1][2 * r + c], o[8 * i + 2][2 * r + c], o[8 * i + 3][2 * r + c]);
+                    *reinterpret_cast<float4*>(dst + 4) =
+                        make_float4(o[8 * i + 4][2 * r + c], o[8 * i + 5][2 * r + c], o[8 * i + 6][2 * r + c], o[8 * i + 7][2 * r + c]);
+                }
+        if (t == 0) {
+            s_m[warp * 16 + g] = m[0]; s_m[warp * 16 + g + 8] = m[1];
+            s_l[warp * 16 + g] = l[0]; s_l[warp * 16 + g + 8] = l[1];
+        }
+    }
+    __syncthreads();
+    // 16 rows x 128 dims over NW*32 threads, float4 at a time.
+    for (int e4 = threadIdx.x; e4 < 16 * HD / 4; e4 += NW * 32) {
+        const int row = e4 / (HD / 4), d = (e4 % (HD / 4)) * 4;
+        float mm = -1e30f;
+        #pragma unroll
+        for (int w = 0; w < NW; w++) mm = fmaxf(mm, s_m[w * 16 + row]);
+        float ll = 0.f;
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        #pragma unroll
+        for (int w = 0; w < NW; w++) {
+            const float c = __expf(s_m[w * 16 + row] - mm);
+            ll += s_l[w * 16 + row] * c;
+            const float4 v = *reinterpret_cast<const float4*>(s_o + (w * 16 + row) * FA16_ROWP + d);
+            acc.x += v.x * c; acc.y += v.y * c; acc.z += v.z * c; acc.w += v.w * c;
+        }
+        const int idx = (seq * num_q_heads + kvh * GQA + row) * n_splits + split;
+        *reinterpret_cast<float4*>(part_acc + (size_t)idx * HD + d) = acc;
+        if (d == 0) { part_m[idx] = mm; part_l[idx] = ll; }
+    }
+}
+
 // hd256 GQA-4 MMA needs 8 warps (128-token KV groups) even though only 4 q-rows are live.
 template <int HEAD_DIM, int GQA> struct fa_mma_block_threads { static constexpr int v = GQA * 32; };
 template <> struct fa_mma_block_threads<256, 4> { static constexpr int v = 256; };
@@ -1711,6 +1917,35 @@ void launch_flash_decode_split(
     if (fagqa16 < 0) { const char* e = getenv("SPARKINFER_FAGQA16"); fagqa16 = (e && e[0] == '0') ? 0 : 1; }
     static int fagqa16_mma = -1;
     if (fagqa16_mma < 0) { const char* e = getenv("SPARKINFER_FAGQA16_MMA"); fagqa16_mma = (e && e[0] == '0') ? 0 : 1; }
+    // bf16 KV with several rows (packed continuous-batch decode): the tensor-core split above
+    // (fa_split_gqa16_mma_bf16_kernel). Its warps each take a whole 16-token block, so a split
+    // wants a few blocks per warp rather than the scalar kernel's handful of keys -- the split
+    // count is picked for the grid instead (about 128-256 blocks), and the combine folds that
+    // many. Single-row decode keeps the scalar split. SPARKINFER_FAGQA16_BF16MMA=0 restores it.
+    static int fagqa16_bf16 = -1;
+    if (fagqa16_bf16 < 0) { const char* e = getenv("SPARKINFER_FAGQA16_BF16MMA"); fagqa16_bf16 = (e && e[0] == '0') ? 0 : 1; }
+    if (fagqa16_bf16 && fagqa16 && !int8_kv && num_seqs >= 2 && head_dim == 128 && block_size == 16 &&
+        num_kv_heads > 0 && num_q_heads == num_kv_heads * 16) {
+        constexpr int NW = 4;
+        const int rows = num_seqs * num_kv_heads;
+        int ns = rows <= 8 ? 16 : rows <= 32 ? 8 : 4;
+        if (ns > n_splits) ns = n_splits;
+        const size_t smem = (size_t)(NW * 16 * FA16_ROWP + 2 * NW * 16) * sizeof(float);
+        dim3 g(num_kv_heads * ns, num_seqs);
+        fa_split_gqa16_mma_bf16_kernel<NW><<<g, NW * 32, smem, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
+            reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, seq_lens,
+            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, max_blocks, ns);
+        if (gate128)
+            fa_launch_combine_gated_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                             gate, num_q_heads, ns,
+                                             reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+        else
+            fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                       num_q_heads, ns, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+        (void)seqlen;
+        return;
+    }
     if (use_gqa && fagqa16 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 16) {
         constexpr int GQA = 16, TILE = FA_GQA_TILE;
         constexpr int MMA_THREADS = fa_mma_block_threads<128, GQA>::v;

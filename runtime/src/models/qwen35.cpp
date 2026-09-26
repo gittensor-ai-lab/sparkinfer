@@ -3920,7 +3920,15 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (!seq_ids || !prompts || !lens || !seeds || n_prompts < 2) return false;
-    if (!s.gguf || !s.cfg.hybrid || !s.cfg.dense_ffn || s.cfg.muse_glimmer) return false;
+    if (!s.gguf || !s.cfg.hybrid || !s.cfg.dense_ffn) return false;
+    // Muse Glimmer carries no recurrent state; its pack is attention and FFN only.
+    // SPARKINFER_MUSE_PACKED_INGEST=0 keeps it on one prefill per prompt (A/B in one binary).
+    static const bool muse_pack = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED_INGEST");
+        return !(e && e[0] == '0');
+    }();
+    if (s.cfg.muse_glimmer && !muse_pack) return false;
+    const bool linear = needs_linear_state(s.cfg);
     // Per-request staging belongs to exactly one prompt, so a pack cannot carry it.
     if (s.dflash_capture || s.d_vision_emb || s.d_mrope_pos) return false;
     std::vector<int> off((size_t)n_prompts);
@@ -3931,16 +3939,26 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         auto it = s.sessions.find(seq_ids[i]);
         if (it == s.sessions.end() || !prompts[i] || lens[i] <= 0) return false;
         // The pass's seed is a raw argmax; a session with a logit bias needs prefill_batched's re-pick.
-        if (!it->second.lin_state || !it->second.lin_conv_state || it->second.logit_bias_set)
+        if ((linear && (!it->second.lin_state || !it->second.lin_conv_state)) ||
+            it->second.logit_bias_set)
             return false;
         off[(size_t)i] = total;
         total += lens[i];
         lin_state[(size_t)i] = it->second.lin_state;
         lin_conv[(size_t)i] = it->second.lin_conv_state;
     }
-    if (!batched_prefill_windowed_enabled(s.gguf, s.cfg, total, s.kv) ||
-        total > prefill_single_pass_max_tokens(s.kv))
+    // Each prompt is its own pass as far as a windowed ring is concerned (prefill_batched_run
+    // checks the longest one); the pack as a whole only has to fit the single-pass arena.
+    if (s.kv->windowed()) {
+        for (int i = 0; i < n_prompts; ++i)
+            if (lens[i] > s.kv->window_pass_limit()) return false;
+        if (!batched_prefill_enabled(s.gguf, s.cfg, total) ||
+            total > prefill_single_pass_max_tokens())
+            return false;
+    } else if (!batched_prefill_windowed_enabled(s.gguf, s.cfg, total, s.kv) ||
+               total > prefill_single_pass_max_tokens(s.kv)) {
         return false;
+    }
     std::vector<int> ids;
     ids.reserve((size_t)total);
     for (int i = 0; i < n_prompts; ++i) ids.insert(ids.end(), prompts[i], prompts[i] + lens[i]);
@@ -3963,14 +3981,34 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
-    ctx.multi_n = n_prompts;
-    ctx.multi_off = off.data();
-    ctx.multi_len = lens;
-    ctx.multi_seq_ids = seq_ids;
-    ctx.multi_lin_state = lin_state.data();
-    ctx.multi_lin_conv = lin_conv.data();
-    ctx.multi_seed = seeds;
-    if (prefill_batched_run(ctx, ids.data(), total, 0) < 0) return false;
+    // Muse's continuous-batch pool leaves little VRAM beside a 32-session KV cache: a 4096-token
+    // pack's scratch either fails to allocate (and the whole pack falls back to one prefill per
+    // prompt) or, held afterwards, starves the packed decode's own arena. Run it as consecutive
+    // sub-packs instead, each within SPARKINFER_MUSE_PACK_TOKENS; every other stack runs one pass.
+    static const int muse_pack_tokens = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACK_TOKENS");
+        const int v = e ? atoi(e) : 1024;
+        return v < 1 ? 1 : v;
+    }();
+    const int limit = s.cfg.muse_glimmer ? muse_pack_tokens : total;
+    for (int b = 0; b < n_prompts;) {
+        int e = b, rows = 0;
+        while (e < n_prompts && (e == b || rows + lens[e] <= limit)) rows += lens[e++];
+        std::vector<int> sub_off((size_t)(e - b));
+        for (int i = b; i < e; ++i) sub_off[(size_t)(i - b)] = off[(size_t)i] - off[(size_t)b];
+        ctx.seq_id = seq_ids[b];
+        ctx.lin_state = lin_state[(size_t)b];
+        ctx.lin_conv_state = lin_conv[(size_t)b];
+        ctx.multi_n = e - b;
+        ctx.multi_off = sub_off.data();
+        ctx.multi_len = lens + b;
+        ctx.multi_seq_ids = seq_ids + b;
+        ctx.multi_lin_state = lin_state.data() + b;
+        ctx.multi_lin_conv = lin_conv.data() + b;
+        ctx.multi_seed = seeds + b;
+        if (prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0) < 0) return false;
+        b = e;
+    }
     for (int i = 0; i < n_prompts; ++i)
         if (seeds[i] < 0 || seeds[i] >= s.cfg.vocab) return false;
     return true;

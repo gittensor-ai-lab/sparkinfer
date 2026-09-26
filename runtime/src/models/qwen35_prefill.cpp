@@ -313,7 +313,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // pass would have its own early rows overwritten by its own late ones, so refuse it here --
     // before the first kernel -- and let the caller chunk or fall back to the token loop rather
     // than attend to wrapped garbage. The bound is published by window_pass_limit().
-    if (s.kv->windowed() && n > s.kv->window_pass_limit()) {
+    // A packed pass appends each prompt to its OWN sequence's ring, so the bound is per prompt.
+    int longest_pass = n;
+    if (s.multi_n > 0 && s.multi_len) {
+        longest_pass = 0;
+        for (int i = 0; i < s.multi_n; ++i) longest_pass = std::max(longest_pass, s.multi_len[i]);
+    }
+    if (s.kv->windowed() && longest_pass > s.kv->window_pass_limit()) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -329,10 +335,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const int nseg = s.multi_n;
     const bool multi = nseg > 0;
     if (multi) {
-        if (pos0 != 0 || moe || c.muse_glimmer || !s.kv->int8_kv()) return -1;
+        // Muse's attention branch loops its prompts itself, on either cache dtype; every other
+        // stack takes the int8 per-prompt loop further down.
+        if (pos0 != 0 || moe || (!c.muse_glimmer && !s.kv->int8_kv())) return -1;
         if (s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows) return -1;
-        if (!s.multi_off || !s.multi_len || !s.multi_seq_ids || !s.multi_lin_state ||
-            !s.multi_lin_conv || !s.multi_seed) return -1;
+        if (!s.multi_off || !s.multi_len || !s.multi_seq_ids || !s.multi_seed) return -1;
+        // Recurrent state only where the stack has Gated-DeltaNet layers to carry it.
+        const bool linear = c.hybrid && !c.muse_glimmer;
+        if (linear && (!s.multi_lin_state || !s.multi_lin_conv)) return -1;
         // Past this the pass switches to its long-context arms (the attention-norm deferral below),
         // which a pack of short prompts has no business taking.
         if (n >= 16384) return -1;
@@ -370,8 +380,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // ...but only for the window that actually starts at position zero. A windowed ingest carries
     // the recurrence forward: zeroing here on a later window would discard everything the previous
     // ones accumulated and produce a confidently wrong continuation.
-    if (multi) {
+    if (multi && s.multi_lin_state && s.multi_lin_conv) {
         for (int i = 0; i < nseg; ++i) {
+            if (!s.multi_lin_state[i] || !s.multi_lin_conv[i]) continue;
             pf_cu(cudaMemsetAsync(
                       s.multi_lin_state[i], 0,
                       (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim *
@@ -2544,36 +2555,47 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // that outright.
                 const int muse_rot = w.swa ? c.head_dim : 0;      // SWA = full NORMAL rope; global = NoPE
                 const int win_blocks = w.swa ? (c.sliding_window + bs - 1) / bs : 0;  // 0 => global full causal
-                if (kv8) {
-                    signed char* kpool8 = (signed char*)s.kv->k_pool() + s.kv->layer_base_elems(L);
-                    signed char* vpool8 = (signed char*)s.kv->v_pool() + s.kv->layer_base_elems(L);
-                    void* kscale = (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2;
-                    void* vscale = (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2;
-                    kernels::launch_prefill_qknorm_ropenorm_kv_int8(
-                        qkv_packed ? fp4_qkv : qb,
-                        qkv_packed ? fp4_qkv + 2 * qdim : kf,
-                        qkv_packed ? fp4_qkv + 2 * qdim + kvdim : vf,
-                        w.q_norm, w.k_norm,
-                        kpool8, vpool8, kscale, vscale, ltab, N, c.n_q_heads, c.n_kv_heads,
-                        c.head_dim, muse_rot, rope_theta, eps, bs, mbs, st, pos0,
-                        qkv_packed ? qb : nullptr, qkv_packed ? qkvg_n : 0);
-                    kernels::launch_prefill_attn_swa_pure_int8(qb, kpool8, vpool8, kscale, vscale,
-                        ltab, att, N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
-                        win_blocks, st, pos0);
-                } else {
-                    bf16* kpool_bf = (bf16*)s.kv->k_pool() + s.kv->layer_base_elems(L);
-                    bf16* vpool_bf = (bf16*)s.kv->v_pool() + s.kv->layer_base_elems(L);
-                    kernels::launch_prefill_qknorm_ropenorm_kv_bf16(
-                        qkv_packed ? fp4_qkv : qb,
-                        qkv_packed ? fp4_qkv + 2 * qdim : kf,
-                        qkv_packed ? fp4_qkv + 2 * qdim + kvdim : vf,
-                        w.q_norm, w.k_norm,
-                        kpool_bf, vpool_bf, ltab, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                        muse_rot, rope_theta, eps, bs, mbs, st, pos0,
-                        qkv_packed ? qb : nullptr, qkv_packed ? qkvg_n : 0);
-                    kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, ltab, att,
-                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks,
-                        st, pos0);
+                // A packed pass (multi) writes and attends one prompt at a time: its own rows, its own
+                // block table (the ring table on the SWA layers), positions from zero -- the same two
+                // calls that prompt would have made on its own. Everything else in the layer is
+                // row-parallel and runs once over the whole pack.
+                const int segs = multi ? nseg : 1;
+                for (int si = 0; si < segs; ++si) {
+                    const size_t o = multi ? (size_t)s.multi_off[si] : 0;
+                    const int len = multi ? s.multi_len[si] : N;
+                    const int* bt = multi ? (w.swa ? s.kv->block_table_win(s.multi_seq_ids[si])
+                                                   : s.kv->block_table(s.multi_seq_ids[si]))
+                                          : ltab;
+                    bf16* src_q = qkv_packed ? fp4_qkv + o * qkvg_n : qb + o * qdim;
+                    bf16* src_k = qkv_packed ? fp4_qkv + o * qkvg_n + 2 * qdim : kf + o * kvdim;
+                    bf16* src_v = qkv_packed ? fp4_qkv + o * qkvg_n + 2 * qdim + kvdim
+                                             : vf + o * kvdim;
+                    bf16* q_seg = qb + o * qdim;
+                    if (kv8) {
+                        signed char* kpool8 = (signed char*)s.kv->k_pool() + s.kv->layer_base_elems(L);
+                        signed char* vpool8 = (signed char*)s.kv->v_pool() + s.kv->layer_base_elems(L);
+                        void* kscale = (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2;
+                        void* vscale = (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2;
+                        kernels::launch_prefill_qknorm_ropenorm_kv_int8(
+                            src_q, src_k, src_v, w.q_norm, w.k_norm,
+                            kpool8, vpool8, kscale, vscale, bt, len, c.n_q_heads, c.n_kv_heads,
+                            c.head_dim, muse_rot, rope_theta, eps, bs, mbs, st, pos0,
+                            qkv_packed ? q_seg : nullptr, qkv_packed ? qkvg_n : 0);
+                        kernels::launch_prefill_attn_swa_pure_int8(q_seg, kpool8, vpool8, kscale,
+                            vscale, bt, att + o * qdim, len, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                            bs, mbs, attn_scale, win_blocks, st, pos0);
+                    } else {
+                        bf16* kpool_bf = (bf16*)s.kv->k_pool() + s.kv->layer_base_elems(L);
+                        bf16* vpool_bf = (bf16*)s.kv->v_pool() + s.kv->layer_base_elems(L);
+                        kernels::launch_prefill_qknorm_ropenorm_kv_bf16(
+                            src_q, src_k, src_v, w.q_norm, w.k_norm,
+                            kpool_bf, vpool_bf, bt, len, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                            muse_rot, rope_theta, eps, bs, mbs, st, pos0,
+                            qkv_packed ? q_seg : nullptr, qkv_packed ? qkvg_n : 0);
+                        kernels::launch_prefill_attn_swa_pure_bf16(q_seg, kpool_bf, vpool_bf, bt,
+                            att + o * qdim, len, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs,
+                            attn_scale, win_blocks, st, pos0);
+                    }
                 }
             } else {
                 signed char* kpool = (signed char*)s.kv->k_pool() + s.kv->layer_base_elems(L) * kv_elem;
@@ -4146,6 +4168,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // rather than a widening -- exactly as prefill_batched_run carries it.
     const bool muse = c.muse_glimmer && dense && c.head_dim == 128 &&
                       c.sliding_window > 0 && muse_packed_on();
+    bool muse_f16 = false;   // set before the capture (see below); declared here for the goto
     const bool hd_ok = (c.head_dim == 256) || muse;
     if (!hd_ok || c.linear_head_dim != 128 || c.top_k <= 0 ||
         (!dense && c.n_experts != 256)) {
@@ -5040,6 +5063,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         }
         goto verify_forward_done;
     }
+    // Muse's Q4_K FFN down on the fp16 tensor cores at packed widths (launch_q4k_f16_rows_swiglu):
+    // the weights dequantized in registers and the activation at fp16, so the fp32 accumulator
+    // carries the whole sum and there is no per-32 scale fold -- the fold is what bounds the int8
+    // arms at these widths. The staging has to exist before the capture below begins.
+    // Below 8 rows the int8 arm keeps it (SPARKINFER_MUSE_CB_Q4K_F16_MINROWS moves that floor;
+    // SPARKINFER_CB_Q4K_F16=0 keeps the int8 arms everywhere).
+    static const int muse_f16_min = [] {
+        const char* e = getenv("SPARKINFER_MUSE_CB_Q4K_F16_MINROWS");
+        return e ? atoi(e) : 8;
+    }();
+    muse_f16 = muse && packed && muse_f16_min > 0 && N >= muse_f16_min &&
+               kernels::q4k_f16_rows_enabled() && kernels::q4k_f16_rows_reserve(st);
     // Packed decode always records. `recording` gates the EndCapture/instantiate/launch trio at
     // the bottom, while BeginCapture below is unconditional on this path (we only get here when
     // this tier's graph is NOT ready), so a false `recording` begins a capture that is never
@@ -5421,7 +5456,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, dn4, dn4_sf,
                                                    routed, Ng, H, ffn, fp4_ws, st,
                                                    w.down_fp4_alpha);
-            if (!dn_gemm)
+            // With gate/up already in bf16 planes, the Q4_K down reads SwiGLU of them at fp16.
+            const bool dn_f16 = !dn_gemm && gu_gemm && muse_f16 && w.down_qtype == 12 &&
+                kernels::launch_q4k_f16_rows_swiglu(sg, su, w.down_q, routed, N, H, ffn, st);
+            if (!dn_gemm && !dn_f16)
                 kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
                                                    w.gate_qtype, w.up_qtype, w.down_qtype,
                                                    expert_ids, expert_w, routed, moe_h, moe_out,

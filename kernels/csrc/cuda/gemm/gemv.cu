@@ -17,6 +17,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cuda_pipeline.h>
 #ifdef SPARKINFER_DIRECT_NVFP4_IMPL
 #include <cutlass/float_subbyte.h>
 #include <cute/arch/mma_sm120.hpp>
@@ -4550,6 +4551,317 @@ bool launch_mmvq_q4k_mma_rows_n(const void* q81, const void* const* W, void* con
     si_mmvq_q4k_mma_epilogue_n_kernel<<<dim3((N + 255) / 256, M), 256, 0, stream>>>(
         acc, yp(0), yp(1), yp(2), yp(3), M, N, nmat, E1, E2, E3);
     return true;
+}
+
+// ---- Q4_K x fp16 tensor-core rows (packed decode, M <= 32) --------------------------------------
+//
+// The int8 arm above has to fold every 32-value sub-block's scale into the accumulator on its own:
+// Q8_1 gives each activation block its own scale, so sum_j d*sc_j*da_j*dot_j cannot be collapsed,
+// and at 32 rows that fold -- three ALU ops per output per sub-block -- is the kernel's bound, not
+// the weight stream (Muse Glimmer's 6656x19968 down projection: 79 us a layer at 0.94 TB/s). Here
+// the weights are dequantized to fp16 in registers instead (q*d*sc - dmin*m, one HFMA2 per two
+// values, rounded once) and the activation goes in as fp16, so the tensor core's fp32 accumulator
+// carries the whole sum and there is no fold at all: 67 us for the same projection.
+//
+// It is not the int8 arm's arithmetic -- the activation is not quantized to 8 bits here, so this
+// is the more precise of the two -- and it is only offered for packed rows, never for the
+// single-row decode the accuracy gates score.
+//
+// WARPS x 16 weight rows per CTA; NT tiles of 8 rows of activation; ST stages of one super-block
+// (256 k): the CTA's weight rows (raw Q4_K, 144 B each) and the activation for those 256 k come in
+// by cp.async. SPLIT accumulates fp32 into the stream's si_am_acc slot, which the epilogue narrows
+// and re-zeroes exactly as the int8 arm's does.
+constexpr int SI_F16_WARPS = 8, SI_F16_ST = 2, SI_F16_KMAX = 19968;
+
+__device__ __forceinline__ void si_f16_mma(float* c, unsigned a0, unsigned a1, unsigned a2,
+                                           unsigned a3, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, "
+                 "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void si_f16_ldsm_x4(unsigned (&r)[4], unsigned a) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+// Two consecutive nibbles of one sub-block (low or high halves of two bytes) -> half2 q*S - B.
+// 0x6400|q is 1024+q exactly in fp16; subtracting 1024 is exact, and the HFMA2 rounds once.
+__device__ __forceinline__ unsigned si_f16_deq2(unsigned short bytes, bool hi, __half2 S,
+                                                __half2 Bv) {
+    const unsigned v = hi ? ((bytes >> 4) & 0x0F0Fu) : (bytes & 0x0F0Fu);
+    unsigned h = (v & 0xFu) | ((v & 0xF00u) << 8) | 0x64006400u;
+    const __half2 k1024 = __halves2half2(__ushort_as_half(0x6400), __ushort_as_half(0x6400));
+    const __half2 q = __hsub2(*reinterpret_cast<__half2*>(&h), k1024);
+    const __half2 w = __hfma2(q, S, __hneg2(Bv));
+    return *reinterpret_cast<const unsigned*>(&w);
+}
+__device__ __forceinline__ void si_f16_scale_min(const unsigned char* sc, int j, int& s, int& m) {
+    if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; }
+    else { s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); }
+}
+
+template <int NT, bool SPLIT>
+__global__ void __launch_bounds__(SI_F16_WARPS * 32)
+si_q4k_f16_rows_kernel(const __half* __restrict__ X, const unsigned char* __restrict__ W,
+                       __nv_bfloat16* __restrict__ Y, float* __restrict__ acc, int M, int N, int K,
+                       int sb_per_split, const float* __restrict__ rs) {
+    constexpr int TOK = (NT < 2 ? 2 : NT) * 8, ROWS = SI_F16_WARPS * 16, XS = 256 + 8;
+    constexpr int ST = SI_F16_ST;
+    extern __shared__ __align__(16) unsigned char si_f16_smem[];
+    unsigned char* Ws = si_f16_smem;                                   // [ST][ROWS][144]
+    __half* Xs = reinterpret_cast<__half*>(Ws + ST * ROWS * 144);       // [ST][TOK][XS]
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int row0 = blockIdx.x * ROWS;
+    const int nsb = K >> 8;
+    const int sb_lo = SPLIT ? (int)blockIdx.y * sb_per_split : 0;
+    const int sb_hi = SPLIT ? min(nsb, sb_lo + sb_per_split) : nsb;
+    const int nst = sb_hi - sb_lo;
+    if (nst <= 0) return;
+    auto issue = [&](int i, int buf) {
+        const int sb = sb_lo + i;
+        for (int c = threadIdx.x; c < ROWS * 9; c += SI_F16_WARPS * 32) {
+            const int r = c / 9, u = c - r * 9;
+            __pipeline_memcpy_async(Ws + ((size_t)buf * ROWS + r) * 144 + u * 16,
+                                    W + ((size_t)(row0 + r) * nsb + sb) * 144 + u * 16, 16);
+        }
+        for (int c = threadIdx.x; c < TOK * 32; c += SI_F16_WARPS * 32) {
+            const int tk = c >> 5, u = c & 31;
+            __half* dst = Xs + ((size_t)buf * TOK + tk) * XS + u * 8;
+            if (tk < M) __pipeline_memcpy_async(dst, X + (size_t)tk * K + sb * 256 + u * 8, 16);
+            else *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
+        }
+        __pipeline_commit();
+    };
+    float c4[NT][4];
+#pragma unroll
+    for (int n = 0; n < NT; ++n) c4[n][0] = c4[n][1] = c4[n][2] = c4[n][3] = 0.f;
+#pragma unroll
+    for (int s = 0; s < ST - 1; ++s) { if (s < nst) issue(s, s); else __pipeline_commit(); }
+    // ldmatrix rows: activation row (lane & 7) + 8 * (lane >> 4), k half (lane >> 3) & 1 -- the
+    // four 8x8 matrices are (tile n, k 0-7), (tile n, k 8-15), (tile n+1, k 0-7), (tile n+1, k 8-15).
+    const unsigned xs_base = (unsigned)__cvta_generic_to_shared(Xs) +
+        (unsigned)((((lane & 7) + 8 * (lane >> 4)) * XS + 8 * ((lane >> 3) & 1)) * 2);
+    for (int i = 0; i < nst; ++i) {
+        const int buf = i % ST;
+        __pipeline_wait_prior(ST - 2);
+        __syncthreads();
+        { const int nx = i + ST - 1; if (nx < nst) issue(nx, nx % ST); else __pipeline_commit(); }
+        const unsigned char* wr[2] = { Ws + ((size_t)buf * ROWS + warp * 16 + g) * 144,
+                                       Ws + ((size_t)buf * ROWS + warp * 16 + g + 8) * 144 };
+        __half2 S[2][8], Bm[2][8];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const float d = __half2float(*reinterpret_cast<const __half*>(wr[r]));
+            const float dm = __half2float(*reinterpret_cast<const __half*>(wr[r] + 2));
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                int sc, mn;
+                si_f16_scale_min(wr[r] + 4, j, sc, mn);
+                S[r][j] = __float2half2_rn(d * (float)sc);
+                Bm[r][j] = __float2half2_rn(dm * (float)mn);
+            }
+        }
+        const unsigned xb = xs_base + (unsigned)(buf * TOK * XS * 2);
+#pragma unroll
+        for (int s = 0; s < 16; ++s) {
+            const int j = s >> 1;
+            const int boff = 16 + 32 * (j >> 1) + 16 * (s & 1) + 2 * t;
+            unsigned a[4];
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const unsigned short p0 = *reinterpret_cast<const unsigned short*>(wr[r] + boff);
+                const unsigned short p1 = *reinterpret_cast<const unsigned short*>(wr[r] + boff + 8);
+                a[r] = si_f16_deq2(p0, j & 1, S[r][j], Bm[r][j]);
+                a[2 + r] = si_f16_deq2(p1, j & 1, S[r][j], Bm[r][j]);
+            }
+#pragma unroll
+            for (int n2 = 0; n2 < NT; n2 += 2) {
+                unsigned bb[4];
+                si_f16_ldsm_x4(bb, xb + (unsigned)((n2 * 8 * XS + 16 * s) * 2));
+                si_f16_mma(c4[n2], a[0], a[1], a[2], a[3], bb[0], bb[1]);
+                if (n2 + 1 < NT) si_f16_mma(c4[n2 + 1], a[0], a[1], a[2], a[3], bb[2], bb[3]);
+            }
+        }
+    }
+    const int rA = row0 + warp * 16 + g, rB = rA + 8;
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+        const int t0 = n * 8 + 2 * t, t1 = t0 + 1;
+        if (SPLIT) {
+            if (t0 < M) { atomicAdd(acc + (size_t)t0 * N + rA, c4[n][0]); atomicAdd(acc + (size_t)t0 * N + rB, c4[n][2]); }
+            if (t1 < M) { atomicAdd(acc + (size_t)t1 * N + rA, c4[n][1]); atomicAdd(acc + (size_t)t1 * N + rB, c4[n][3]); }
+        } else {
+            if (t0 < M) { const float r = rs[t0]; Y[(size_t)t0 * N + rA] = __float2bfloat16(c4[n][0] * r); Y[(size_t)t0 * N + rB] = __float2bfloat16(c4[n][2] * r); }
+            if (t1 < M) { const float r = rs[t1]; Y[(size_t)t1 * N + rA] = __float2bfloat16(c4[n][1] * r); Y[(size_t)t1 * N + rB] = __float2bfloat16(c4[n][3] * r); }
+        }
+    }
+}
+
+// Activation staging for the kernel above: silu(gate) * up formed in fp32 from the bf16 planes and
+// written as fp16 in the stream's slot, so the down projection reads the hidden at fp16 precision
+// instead of the Q8_1 blocks the int8 arm takes. A row whose magnitude would pass fp16's range is
+// divided by a power of two first (exact) and the matmul output multiplied back by it (rs); a row
+// inside the range, i.e. every normal one, is staged unscaled.
+constexpr int SI_F16_CH = 8;   // row chunks per staging launch
+__device__ __forceinline__ float si_f16_val(const __nv_bfloat16* x, const __nv_bfloat16* u, size_t i) {
+    const float g = __bfloat162float(x[i]);
+    return g / (1.f + __expf(-g)) * __bfloat162float(u[i]);
+}
+// Pass 1: the absmax of each (row, chunk).
+__global__ void __launch_bounds__(256) si_f16_amax_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ u,
+    float* __restrict__ part, int K) {
+    const int row = blockIdx.x, ch = blockIdx.y, len = K / SI_F16_CH;
+    const size_t base = (size_t)row * K + (size_t)ch * len;
+    float a = 0.f;
+    for (int k = threadIdx.x; k < len; k += 256) a = fmaxf(a, fabsf(si_f16_val(x, u, base + k)));
+    __shared__ float red[8];
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = a;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = red[0];
+        #pragma unroll
+        for (int w = 1; w < 8; ++w) m = fmaxf(m, red[w]);
+        part[row * SI_F16_CH + ch] = m;
+    }
+}
+// Pass 2: the row's power-of-two scale (1 unless the row would pass fp16's range), and the chunk
+// written as fp16.
+__global__ void __launch_bounds__(256) si_f16_stage_rows_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ u,
+    const float* __restrict__ part, __half* __restrict__ y, float* __restrict__ rs, int K) {
+    const int row = blockIdx.x, ch = blockIdx.y, len = K / SI_F16_CH;
+    float a = part[row * SI_F16_CH];
+    #pragma unroll
+    for (int c = 1; c < SI_F16_CH; ++c) a = fmaxf(a, part[row * SI_F16_CH + c]);
+    float sc = 1.f;
+    while (a / sc > 16384.f) sc *= 2.f;
+    const float isc = 1.f / sc;
+    const size_t base = (size_t)row * K + (size_t)ch * len;
+    for (int k = threadIdx.x; k < len; k += 256)
+        y[base + k] = __float2half_rn(si_f16_val(x, u, base + k) * isc);
+    if (ch == 0 && threadIdx.x == 0) rs[row] = sc;
+}
+
+__global__ void si_f16_epilogue_kernel(float* __restrict__ acc, __nv_bfloat16* __restrict__ y,
+                                       const float* __restrict__ rs, int N, size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = __float2bfloat16(acc[i] * rs[i / N]);
+    acc[i] = 0.f;
+}
+
+static int si_f16_sms() {
+    static int n = -1;
+    if (n < 0) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || n < 1)
+            n = 170;
+    }
+    return n;
+}
+
+// The K split that finishes soonest when every CTA is one SM's whole occupancy: waves x per-CTA
+// work, ceil(R*S/SMs)/S, over S in 1..8 with at least two super-blocks per slice.
+static int si_f16_pick_split(int R, int nsb) {
+    const int sms = si_f16_sms();
+    int best = 1; double bt = 1e30;
+    for (int s = 1; s <= 8 && s <= nsb / 2; ++s) {
+        const double tt = (double)((R * s + sms - 1) / sms) / s;
+        if (tt < bt - 1e-9) { bt = tt; best = s; }
+    }
+    return best;
+}
+
+template <int NT, bool SPLIT>
+static void si_f16_launch(const __half* x, const unsigned char* w, __nv_bfloat16* y, float* acc, int M,
+                          int N, int K, int split, const float* rs, cudaStream_t st) {
+    constexpr int TOK = (NT < 2 ? 2 : NT) * 8;
+    constexpr int shm = SI_F16_ST * (SI_F16_WARPS * 16 * 144 + TOK * (256 + 8) * 2);
+    static bool attr = false;
+    if (!attr) {
+        cudaFuncSetAttribute(si_q4k_f16_rows_kernel<NT, SPLIT>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, shm);
+        attr = true;
+    }
+    const int spb = ((K >> 8) + split - 1) / split;
+    si_q4k_f16_rows_kernel<NT, SPLIT>
+        <<<dim3(N / (SI_F16_WARPS * 16), split), SI_F16_WARPS * 32, shm, st>>>(x, w, y, acc, M, N,
+                                                                              K, spb, rs);
+}
+
+// Per-stream fp16 activation staging. Allocated by q4k_f16_rows_reserve() -- which the packed step
+// calls before it begins recording its graph, since nothing can be allocated inside a capture --
+// so only a model that takes this arm pays for it.
+static __half* si_f16_xbuf[SI_AM_SLOTS] = {};
+static float* si_f16_rsbuf[SI_AM_SLOTS] = {};   // [SI_AM_MMAX] row scales, then [MMAX x CH] partials
+
+bool q4k_f16_rows_reserve(cudaStream_t stream) {
+    const int slot = si_am_slot_for(stream);
+    if (slot < 0) return false;
+    if (si_f16_xbuf[slot] && si_f16_rsbuf[slot]) return true;
+    if (!si_f16_xbuf[slot] &&
+        cudaMalloc(reinterpret_cast<void**>(&si_f16_xbuf[slot]),
+                   (size_t)SI_AM_MMAX * SI_F16_KMAX * sizeof(__half)) != cudaSuccess) {
+        si_f16_xbuf[slot] = nullptr;
+        return false;
+    }
+    if (!si_f16_rsbuf[slot] &&
+        cudaMalloc(reinterpret_cast<void**>(&si_f16_rsbuf[slot]),
+                   SI_AM_MMAX * (1 + SI_F16_CH) * sizeof(float)) !=
+            cudaSuccess) {
+        si_f16_rsbuf[slot] = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// SPARKINFER_CB_Q4K_F16=0 keeps every packed Q4_K matmul on the int8 arms (A/B in one binary).
+bool q4k_f16_rows_enabled() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_CB_Q4K_F16");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// Stage SwiGLU(gate, up) as fp16, then the fp16 tensor-core matmul.
+bool launch_q4k_f16_rows_swiglu(const void* gate, const void* up, const void* W, void* y, int M,
+                                int N, int K, cudaStream_t stream) {
+    if (!q4k_f16_rows_enabled()) return false;
+    if (M < 1 || M > SI_AM_MMAX || (K & 255) || K > SI_F16_KMAX || (N % (SI_F16_WARPS * 16)) ||
+        N > SI_AM_NACC)
+        return false;
+    const int slot = si_am_slot_for(stream);
+    if (slot < 0 || !si_f16_xbuf[slot] || !si_f16_rsbuf[slot]) return false;   // not reserved
+    __half* xs = si_f16_xbuf[slot];
+    float* rs = si_f16_rsbuf[slot];
+    float* acc = nullptr;
+    if (cudaGetSymbolAddress(reinterpret_cast<void**>(&acc), si_am_acc) != cudaSuccess) return false;
+    acc += (size_t)slot * (size_t)SI_AM_MMAX * (size_t)SI_AM_NACC;
+    float* part = rs + SI_AM_MMAX;
+    const __nv_bfloat16* gb = reinterpret_cast<const __nv_bfloat16*>(gate);
+    const __nv_bfloat16* ub = reinterpret_cast<const __nv_bfloat16*>(up);
+    const dim3 sg(M, SI_F16_CH);
+    si_f16_amax_kernel<<<sg, 256, 0, stream>>>(gb, ub, part, K);
+    si_f16_stage_rows_kernel<<<sg, 256, 0, stream>>>(gb, ub, part, xs, rs, K);
+    const int split = si_f16_pick_split(N / (SI_F16_WARPS * 16), K >> 8);
+    const int nt = M <= 8 ? 1 : (M <= 16 ? 2 : 4);
+    const unsigned char* w0 = reinterpret_cast<const unsigned char*>(W);
+    __nv_bfloat16* yb = reinterpret_cast<__nv_bfloat16*>(y);
+#define SI_F16_GO(NT_, SPL_, Y_) si_f16_launch<NT_, SPL_>(xs, w0, Y_, acc, M, N, K, split, rs, stream)
+    if (split == 1) {
+        if (nt == 1) SI_F16_GO(1, false, yb); else if (nt == 2) SI_F16_GO(2, false, yb); else SI_F16_GO(4, false, yb);
+        return cudaPeekAtLastError() == cudaSuccess;
+    }
+    if (nt == 1) SI_F16_GO(1, true, nullptr); else if (nt == 2) SI_F16_GO(2, true, nullptr); else SI_F16_GO(4, true, nullptr);
+#undef SI_F16_GO
+    const size_t n = (size_t)M * N;
+    si_f16_epilogue_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(acc, yb, rs, N, n);
+    return cudaPeekAtLastError() == cudaSuccess;
 }
 
 // The packed LM head. 202048 x 6656 Q4_K is the single largest matrix in the model and the last
