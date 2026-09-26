@@ -96,6 +96,7 @@ wrapper (run_museglimmer_cron.sh) — all three MUST share /tmp/sparkinfer_bot.l
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import re
@@ -550,12 +551,15 @@ def _pr_last_activity_ts(repo, num):
         info = json.loads(r.stdout or "{}")
     except json.JSONDecodeError:
         return None
+    # The PR's own opening counts as activity too: a PR opened from commits made days earlier used
+    # to be closed as stale before it was ever evaluated. calendar.timegm, not time.mktime: these
+    # are UTC, and mktime read them as local time (2 h early on a CEST controller).
     dates = [c.get("committedDate") for c in (info.get("commits") or []) if c.get("committedDate")]
-    ts_str = max(dates) if dates else info.get("createdAt")
-    if not ts_str:
+    dates += [info["createdAt"]] if info.get("createdAt") else []
+    if not dates:
         return None
     try:
-        return time.mktime(time.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ"))
+        return calendar.timegm(time.strptime(max(dates), "%Y-%m-%dT%H:%M:%SZ"))
     except ValueError:
         return None
 
@@ -1452,6 +1456,13 @@ def measure_main_baseline(host, port):
         return {"ok": False,
                 "reason": "main bench missing Muse Glimmer measurements at ctx " + ",".join(missing or ["(sweep failed)"]),
                 "log": (r.stdout or "")[-1500:]}
+    # Every guard must have measured something unless its checkpoint is absent. Otherwise every PR
+    # in the round is measured in full only to be deferred for the missing guard.
+    unguarded = [key for key in ("guard36", "guardmo", "guardun", "guardbn")
+                 if not main.get(f"{key}_unavailable") and not main.get(key)]
+    if unguarded:
+        return {"ok": False, "reason": "main measured nothing for guard(s) " + ", ".join(unguarded),
+                "log": (r.stdout or "")[-1500:]}
     main["ok"] = True
     return main
 
@@ -1897,8 +1908,8 @@ def auto_merge_ok_museglimmer(repo, num, require_merge_first=True):
         ]).stdout or "{}")
     except json.JSONDecodeError:
         info = None
-    if not isinstance(info, dict):
-        return False, "could not read the PR from GitHub"
+    if not isinstance(info, dict) or not info:
+        return False, arb.PR_UNREADABLE
     if info.get("state") != "OPEN" or info.get("isDraft"):
         return False, "not an open, non-draft PR"
     labs = {l["name"] for l in info.get("labels", [])}
@@ -1945,13 +1956,13 @@ def try_auto_merge_museglimmer(repo, num):
     if not ok:
         print(f">> museglimmer auto-merge SKIP #{num}: {reason}")
         return False
-    # Pinned to the commit auto_merge_ok_museglimmer just checked: a push landing in between cannot
-    # be what gets merged, --admin included.
-    head = (json.loads(arb.gh(["pr", "view", str(num), "-R", repo, "--json", "headRefOid"]).stdout
-                       or "{}").get("headRefOid") or "")
-    args = ["pr", "merge", str(num), "-R", repo, "--squash"]
-    if head:
-        args += ["--match-head-commit", head]
+    # Pinned to the SCORED commit, which auto_merge_ok_museglimmer just found equal to the head,
+    # --admin included. A second head lookup here would pin whatever a push had made the head since.
+    head = (_load_scores().get(str(num)) or {}).get("commit") or ""
+    if not arb._FULL_SHA_RE.match(head):
+        print(f">> museglimmer auto-merge SKIP #{num}: no scored commit to pin the merge to")
+        return False
+    args = ["pr", "merge", str(num), "-R", repo, "--squash", "--match-head-commit", head]
     r = arb.gh(args)
     if r.returncode != 0 and os.environ.get("SPARKINFER_AUTOMERGE_ADMIN", "1") == "1":
         err = ((r.stderr or "") + (r.stdout or "")).lower()
@@ -2000,6 +2011,10 @@ def reconcile_museglimmer_merge_labels(repo, dry_run=False):
         if not tier:
             continue
         ok, why = auto_merge_ok_museglimmer(repo, num, require_merge_first=False)
+        if not ok and why == arb.PR_UNREADABLE:
+            # Not an answer: demoting on it would take merge-first from the real holder.
+            print(f">> museglimmer round: GitHub did not return #{num} — labels left as they are")
+            return
         if not ok:
             print(f">> museglimmer round: #{num} cannot be merge-first ({why})")
             if MUSEGLIMMER_MERGE_FIRST in labs:
@@ -2391,8 +2406,9 @@ def main():
         try:
             res = eval_museglimmer_on_box(host, port, ref, main_result)
         except Exception as e:
-            # ssh timeout, transport failure: never charged to the PR (it used to be a REJECT).
-            res = {"ok": False, "retry": True, "reason": f"exception: {type(e).__name__}: {e}"}
+            # A transport failure is retried with nothing posted (it used to be a REJECT); a run killed
+            # at the 2 h ssh limit is a hang, posted once (arb.exception_result).
+            res = arb.exception_result(e)
         # Recorded against the tip the box built (arb.measured_commit): a mid-round push must not
         # leave a verdict naming a commit that was never measured (#1167).
         commit, moved = arb.measured_commit(head, res)

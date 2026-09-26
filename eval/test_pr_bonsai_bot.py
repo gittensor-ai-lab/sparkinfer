@@ -124,12 +124,23 @@ class AutoMergeGateTests(unittest.TestCase):
             if a[:2] == ["pr", "view"]:
                 return run('{"headRefOid": "' + "a" * 40 + '"}')
             return run("")
+        # Pinned to the SCORED commit: a second head lookup would pin a push that landed between
+        # the gate and the merge (here the live head has moved to b..b).
+        fake_head = lambda a: calls.append(a) or (run('{"headRefOid": "' + "b" * 40 + '"}')
+                                                  if a[:2] == ["pr", "view"] else run(""))
         with mock.patch.object(bot, "auto_merge_ok_bonsai", return_value=(True, "ok")), \
-                mock.patch.object(bot.arb, "gh", side_effect=fake_gh):
+                mock.patch.object(bot, "_load_scores", return_value={"1139": {"commit": "a" * 40}}), \
+                mock.patch.object(bot.arb, "gh", side_effect=fake_head):
             self.assertTrue(bot.try_auto_merge_bonsai("o/r", 1139))
         merge = next(a for a in calls if a[:2] == ["pr", "merge"])
         self.assertIn("--match-head-commit", merge)
         self.assertEqual(merge[merge.index("--match-head-commit") + 1], "a" * 40)
+        calls.clear()
+        with mock.patch.object(bot, "auto_merge_ok_bonsai", return_value=(True, "ok")), \
+                mock.patch.object(bot, "_load_scores", return_value={}), \
+                mock.patch.object(bot.arb, "gh", side_effect=fake_gh):
+            self.assertFalse(bot.try_auto_merge_bonsai("o/r", 1139))     # nothing to pin: no merge
+        self.assertFalse(any(a[:2] == ["pr", "merge"] for a in calls))
 
     def test_policy_note_follows_the_live_switches(self):
         with mock.patch.object(bot, "AUTO_MERGE", True), mock.patch.object(bot, "AUTO_CLOSE", False):
@@ -285,7 +296,7 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertNotIn("bonsai-cb-decode@c32", {d["dim"] for d in res["scored_dims"]})
         self.assertEqual(res["label"], "REJECT")
-        self.assertEqual(res["strike_key"], "cb:c32")
+        self.assertEqual(res["strike_key"], "cb")
         self.assertEqual(res["cb_pr_missing"], [32])
         self.assertIn("did not complete on the PR build", bot.format_comment("a" * 40, res))
 
@@ -306,13 +317,25 @@ class ScoringTests(unittest.TestCase):
         self.assertIsNone(res["strike_key"])          # posted at once, not deferred
         self.assertIn("c32 did not complete", res["reason"])
 
-    def test_main_must_measure_every_width(self):
+    def test_a_width_main_cannot_measure_is_dropped_loudly_not_a_skipped_round(self):
+        # Skipping the round would stall the bot for every PR if main itself broke at a width.
         cb = dict(MAIN_CB)
         del cb[8]
         with mock.patch.object(bot, "_ssh_run_resilient", return_value=run(box_stdout(role="main", cb=cb))):
             m = bot.measure_main_baseline("h", 1)
+        self.assertTrue(m["ok"], m)
+        res = evaluate(box_stdout(), main=m)
+        self.assertNotIn("bonsai-cb-decode@c8", {d["dim"] for d in res["scored_dims"]})
+        self.assertIsNone(res["strike_key"])
+        self.assertIn("c8 not scored this round — main has no measurement", bot.format_comment("a" * 40, res))
+
+    def test_main_must_measure_every_installed_guard(self):
+        guards = {"GUARD36": (150.0, 9000.0), "GUARDMO": (60.0, 7000.0), "GUARDUN": None,
+                  "GUARDMG": (80.0, 2000.0)}
+        with mock.patch.object(bot, "_ssh_run_resilient", return_value=run(box_stdout(role="main", guards=guards))):
+            m = bot.measure_main_baseline("h", 1)
         self.assertFalse(m["ok"])
-        self.assertIn("c8", m["reason"])
+        self.assertIn("unsloth", m["reason"])
 
     def test_accuracy_divergence_rejects(self):
         pr = dict(MAIN_BONSAI)
@@ -823,6 +846,97 @@ class SelectionTests(unittest.TestCase):
     def test_a_report_only_run_may_still_measure_them_by_name(self):
         out = self._main(["--only-prs", "5", "--dry-run", "--no-post"], labels=["hold"])
         self.assertIn("would evaluate: #5", out)
+
+
+class ReviewFixTests(TempStateMixin, unittest.TestCase):
+    """Fixes from the pre-merge review of the 2026-09-26 change."""
+
+    def _trial(self, answers, exited=False):
+        """Run one real _serve_trial against a fake server: `answers` are what _chat receives."""
+        import bonsai_regression as reg
+        seq = iter(answers)
+        srv = mock.Mock(pid=1)
+        srv.poll.return_value = 1 if exited else None
+        a = types.SimpleNamespace(server="s", model="m", tokenizer="t")
+        with mock.patch.object(reg.subprocess, "Popen", return_value=srv), \
+                mock.patch.object(reg.urllib.request, "urlopen"), \
+                mock.patch.object(reg, "_chat", side_effect=lambda port, p, n, out: out.append(next(seq))), \
+                mock.patch.object(reg.os, "killpg"), mock.patch.object(reg.os, "getpgid", return_value=1), \
+                mock.patch.object(reg.time, "sleep"), mock.patch.object(reg, "_wait_gpu_clear"), \
+                mock.patch("builtins.print"):
+            # 2 baselines, then the decayed row and 3 short rows (thread start order).
+            return reg._serve_trial(a, "folded", "")
+
+    def test_a_server_that_dies_on_its_first_request_fails_the_trial(self):
+        import bonsai_regression as reg
+        # The four batched requests run on threads, so every answer after the two baselines is
+        # the same value: which thread takes which one does not matter.
+        dead = f"{reg.FAILED_PREFIX}Connection refused>"
+        self.assertEqual(self._trial([dead] * 6)[0], "fail")                  # used to pass
+        self.assertEqual(self._trial(["x"] * 6)[0], "pass")
+        self.assertEqual(self._trial(["x"] * 6, exited=True)[0], "fail")
+        self.assertEqual(self._trial(["x", "x"] + [dead] * 4)[0], "fail")
+
+    def test_serve_is_gated_per_path(self):
+        # main's native path flakes; the PR breaks the folded path: still gated.
+        with mock.patch.object(bot, "_ssh_run_resilient", return_value=run(box_stdout(
+                role="main", reg_ok=False, reg_why=["serve: native row served differently alone and after a batch"]))):
+            main = bot.measure_main_baseline("h", 1)
+        res = evaluate(box_stdout(reg_ok=False, reg_why=["serve: folded row served differently alone and after a batch"]),
+                       main=main)
+        self.assertEqual(res["label"], "REJECT")
+        self.assertEqual(res["bonsaireg_gated_fail"], ["serve:folded"])
+
+    def test_a_killed_regression_run_is_judged_over_two_rounds(self):
+        stdout = box_stdout(reg_ok=False, reg_why=["did not complete (exit 137): Killed"],
+                            extra="BONSAIREG_EXIT 137\n")
+        res = evaluate(stdout)
+        self.assertEqual(res["label"], "REJECT")
+        self.assertEqual(res["strike_key"], "reg")
+        self.assertEqual(ApplyResultTests._apply(self, res, commit="a" * 40), [])     # strike 1
+        self.assertIn(["add", "eval-bonsai:REJECT"], ApplyResultTests._apply(self, res, commit="a" * 40))
+        # A run that failed a NAMED check is gated at once, as before.
+        res = evaluate(box_stdout(reg_ok=False, reg_why=["tensors: x cosine 0.1"], extra="BONSAIREG_EXIT 1\n"))
+        self.assertIsNone(res["strike_key"])
+
+    def test_a_recurring_box_fault_build_is_charged_after_three_rounds(self):
+        res = evaluate("", rc=1, stderr="build hit a box-side fault (x) -- rebuilding with -j4\n"
+                                        "RETRYABLE_INFRA_FAILURE build: died due to signal 9")
+        self.assertTrue(res["retry"])
+        self.assertEqual(res["strike_key"], "build-box")
+        for _ in range(bot.BOX_FAULT_STRIKES - 1):
+            self.assertEqual(ApplyResultTests._apply(self, res, commit="a" * 40), [])
+        calls = ApplyResultTests._apply(self, res, commit="a" * 40, autoclose=True)
+        self.assertIn(["add", "eval-bonsai:REJECT"], calls)
+        self.assertFalse(any(c[:2] == ["pr", "close"] for c in calls))   # a failed run never closes
+
+    def test_a_run_killed_at_the_ssh_limit_is_posted_once_and_other_exceptions_are_retried(self):
+        import subprocess
+        hang = arb.exception_result(subprocess.TimeoutExpired("ssh", 7200))
+        self.assertFalse(hang["retry"])
+        self.assertIn('"label":"REJECT"', bot.format_comment("a" * 40, hang))   # counts as evaluated
+        self.assertTrue(arb.exception_result(ConnectionResetError("reset"))["retry"])
+
+    def test_the_stale_clock_is_utc_and_counts_the_prs_opening(self):
+        import calendar
+        info = {"commits": [{"committedDate": "2026-09-20T00:00:00Z"}], "createdAt": "2026-09-25T12:00:00Z"}
+        with mock.patch.object(arb, "gh", return_value=run(__import__("json").dumps(info))):
+            ts = bot._pr_last_activity_ts("o/r", 1)
+        self.assertEqual(ts, calendar.timegm((2026, 9, 25, 12, 0, 0)))
+
+    def test_an_unreadable_pr_leaves_every_label_alone(self):
+        calls = []
+
+        def fake_gh(a):
+            if a[:2] == ["pr", "list"] and "open" in a:
+                return run('[{"number": 5, "labels": [{"name": "eval-bonsai:XL"}, {"name": "bonsai-merge-first"}]}]')
+            return run("")                                          # gh pr view returned nothing
+        with mock.patch.object(arb, "gh", side_effect=fake_gh), \
+                mock.patch.object(arb, "add_label", side_effect=lambda *a: calls.append(a)), \
+                mock.patch.object(arb, "remove_label", side_effect=lambda *a: calls.append(a)), \
+                mock.patch.object(bot, "AUTO_MERGE", False):
+            bot.reconcile_bonsai_merge_labels("o/r")
+        self.assertEqual(calls, [])
 
 
 class RemoteScriptRetryTests(unittest.TestCase):

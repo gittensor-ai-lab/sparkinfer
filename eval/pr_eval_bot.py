@@ -1237,6 +1237,26 @@ def trusted_marker_comment(comment):
     return assoc is None or assoc in _TRUSTED_ASSOCIATIONS
 
 
+# What auto_merge_ok_* returns when `gh pr view` gave nothing usable. A reconcile that sees it must
+# leave every label as it is: reading it as "not open" demoted the real merge-first holder.
+PR_UNREADABLE = "could not read the PR from GitHub"
+
+
+def exception_result(e):
+    """What a bot records when evaluating one PR raised.
+
+    A transport failure is the box's: retried next round, nothing posted. A run killed at the ssh
+    time limit (2 h) is different -- main completed the same script this round, so it is almost
+    always a hang in the PR's own code, and retrying it would hold the shared box for two hours
+    every round with nothing to show. It is posted as a failed run, with a label in its marker so
+    the commit counts as evaluated until the author pushes again."""
+    if isinstance(e, subprocess.TimeoutExpired):
+        return {"ok": False, "retry": False, "label": "REJECT", "log": "",
+                "reason": f"the PR run was killed after {int(e.timeout or 0)} s — most likely a hang "
+                          f"in the PR's code (main completed the same run this round)"}
+    return {"ok": False, "retry": True, "reason": f"exception: {type(e).__name__}: {e}"}
+
+
 def is_any_merge_first(label):
     """Any bot's merge-first label (`merge-first`, `bonsai-merge-first`, `qwen38-merge-first`, ...)."""
     return label == MERGE_FIRST_LABEL or label.endswith("-merge-first")

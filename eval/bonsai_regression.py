@@ -166,6 +166,9 @@ def check_generate(a, ids, failures):
 SERVE_LONG = "List the first 40 prime numbers, separated by commas. Answer directly."
 
 
+FAILED_PREFIX = "<request failed: "
+
+
 def _chat(port, prompt, max_tokens, out):
     body = json.dumps({"model": "b", "messages": [{"role": "user", "content": prompt}],
                        "max_tokens": max_tokens, "temperature": 0}).encode()
@@ -176,7 +179,7 @@ def _chat(port, prompt, max_tokens, out):
             m = json.load(r)["choices"][0]["message"]
             out.append(m.get("content") or m.get("reasoning") or "")
     except Exception as e:                                    # noqa: BLE001 - reported, not raised
-        out.append(f"<request failed: {e}>")
+        out.append(f"{FAILED_PREFIX}{e}>")
 
 
 def _free_port():
@@ -257,6 +260,13 @@ def _serve_trial(a, label, native):
 
         if len(alone) < 2 or not decayed:
             return "fail", "produced no completion"
+        # A request that failed is a failure, never an answer to compare: a server that dies on its
+        # first request returned two identical "connection refused" strings, which matched.
+        failed = [x for x in alone + decayed + [s[0] for s in shorts if s]
+                  if x.startswith(FAILED_PREFIX)]
+        if failed or srv.poll() is not None:
+            return "fail", ("a request failed: " + failed[0][len(FAILED_PREFIX):-1][:120] if failed
+                            else "the server exited during the check")
         stable = alone[0] == alone[1]
         same = decayed[0] in alone
         print(f"  {label:8s} baselines {len(alone[0])}/{len(alone[1])} chars, after a decayed "

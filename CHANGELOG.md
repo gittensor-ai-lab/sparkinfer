@@ -25,7 +25,9 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   - only a PR auto-merge would accept can take merge-first, so a refused one cannot block the queue;
     the Muse and Qwen3.8 bots now merge only the commit they scored, pinned to it;
   - a box fault — an unmeasured guard, a failed fetch, a compiler killed for memory, the llama.cpp
-    reference failing to build — is retried with nothing posted, instead of a REJECT;
+    reference failing to build — is retried with nothing posted, instead of a REJECT; a guard that
+    measured nothing on `main` skips the round; a run killed at the two-hour ssh limit is a hang,
+    posted once rather than retried every hour;
   - a failed build's verdict shows the compiler's error lines rather than 80 lines of `ptxas info`;
   - each bot's stale close touches only PRs for its own model: the Qwen3.8 bot had closed #1157, a
     Ternary-Bonsai PR;

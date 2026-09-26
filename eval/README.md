@@ -322,10 +322,12 @@ touches only PRs routed to its own model and never one carrying any bot's merge-
 
 1. **Speed.** Decode and prefill at ctx 128/512/4k/16k/32k (one `bench_sweep_run`, reps 5), plus
    concurrent decode at c2–c32 (median of three complete runs per width, as in `pr_qwen38_bot.py`).
-   The tier is the best measured delta; any axis below 98% of `main` is a REJECT. `main` must
-   measure every width or the round is skipped. A width only the PR build fails to complete (five
-   attempts, a crash counting as one) is a REJECT when it happens in two rounds on the same commit;
-   the first time nothing is posted. A width lost to a GPU that never drained is infra.
+   The tier is the best measured delta; any axis below 98% of `main` is a REJECT. A width `main`
+   cannot measure is dropped for that round and the verdict says so — skipping the round instead
+   would stall the bot for every PR if `main` itself broke at a width. A width only the PR build
+   fails to complete (five attempts, a crash counting as one) is a REJECT when it happens in two
+   rounds on the same commit; the first time nothing is posted. A width lost to a GPU that never
+   drained is infra.
 
 2. **Accuracy — three gates.** llama.cpp cannot read PTQ1_0, so there is no external reference.
    - *Differential score:* `qwen3_gguf_score` on the PR build and on `main` over
@@ -340,20 +342,27 @@ touches only PRs routed to its own model and never one carrying any bot's merge-
      The PR's mean must stay within `max(3× main's KL, main + 0.05)` and 0.10 of main's top-1.
    - *`eval/bonsai_regression.py`* (tensors, score, generate, serve) on the PR build. It is
      absolute, so each check rejects only when `main` passes that same check in the round; a check
-     main also fails is reported, and the others still gate. The serve check fails only on 2 of up
-     to 3 trials — a build equal to `main` failed a single trial in 2 of 8 runs on the eval box —
-     and a trial whose two alone-baselines disagree is inconclusive, never a failure.
+     main also fails is reported, and the others still gate; the serve check is gated per path
+     (folded, native). The serve check fails only on 2 of up to 3 trials — a build equal to `main`
+     failed a single trial in 2 of 8 runs on the eval box — and a trial whose two alone-baselines
+     disagree is inconclusive, never a failure; a request that errors, or a server that exits, is a
+     failure. A regression run killed part-way without naming a check (its time limit, the OOM
+     killer) is judged over two rounds on the same commit, like a width only the PR fails.
 
 3. **No-regression guards @ 32k, decode + prefill:** Qwen3.6-35B-A3B, the ModelOpt and unsloth
    Qwen3.8-27B checkpoints, and Muse Glimmer. The Muse and Qwen3.8 bots skip PRs declared for
    Ternary-Bonsai-2-27B alone, so these guards are the only check such PRs get against those models.
    In the other direction, both of those bots guard Ternary-Bonsai-2-27B at 128 and 32k. A guard
-   that measures nothing is retried next round; an absent checkpoint is skipped and reported.
+   that measures nothing on `main` skips the round (all three bots), rather than measuring every PR
+   only to defer it; an absent checkpoint is skipped and reported.
 
 **Failures.** A fault on the box — GPU not drained, a failed fetch, a missing model, an SSH drop,
 an OOM kill, a compiler killed for memory or a full disk (rebuilt once at `-j4` first) — is retried
-next round with nothing posted. A PR that fails to build or crashes gets `eval-bonsai:REJECT` once
-for that commit; the verdict shows the compiler's own error lines, not the end of the log.
+next round with nothing posted; a compiler fault that recurs at one commit for three rounds is then
+charged to the PR. A PR that fails to build or crashes gets `eval-bonsai:REJECT` once for that
+commit; the verdict shows the compiler's own error lines, not the end of the log. A run killed at
+the two-hour ssh limit is a hang (main completed the same run that round): posted once, not
+retried every hour (`arb.exception_result`, all three bots).
 
 **Commit recorded.** A verdict names the PR tip the box fetched and built, not the head seen when
 the round listed PRs: #1167 was force-pushed mid-round on 2026-09-25, and its verdict named a

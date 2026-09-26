@@ -89,15 +89,18 @@ class AutoMergeGateTests(unittest.TestCase):
                 fn = mod.auto_merge_ok_museglimmer if mod is muse else mod.auto_merge_ok_qwen38
                 self.assertFalse(fn("o/r", 1)[0])
 
-    def test_the_merge_is_pinned_to_the_checked_head(self):
+    def test_the_merge_is_pinned_to_the_scored_commit(self):
+        # Not to a second head lookup: a push landing between the gate and the merge (the live head
+        # is b..b here) must not be what gets merged.
         for mod, _p, _f, _n, ok_fn, try_fn, *_ in BOTS:
             calls = []
 
             def fake_gh(a):
                 calls.append(a)
-                return run('{"headRefOid": "' + "a" * 40 + '"}') if a[:2] == ["pr", "view"] else run("")
+                return run('{"headRefOid": "' + "b" * 40 + '"}') if a[:2] == ["pr", "view"] else run("")
             name = ok_fn.__name__
             with self.subTest(mod.__name__), mock.patch.object(mod, name, return_value=(True, "ok")), \
+                    mock.patch.object(mod, "_load_scores", return_value={"1": {"commit": "a" * 40}}), \
                     mock.patch.object(arb, "gh", side_effect=fake_gh):
                 self.assertTrue(try_fn("o/r", 1))
                 merge = next(a for a in calls if a[:2] == ["pr", "merge"])
@@ -185,13 +188,21 @@ class InfraTests(unittest.TestCase):
                                       return_value=run("", 1, "RETRYABLE_INFRA_FAILURE git fetch x failed")):
                 self.assertTrue(ev("h", 1, "pull/1/head", {"sha": "b" * 40})["retry"])
 
-    def test_an_exception_is_infra_and_the_baseline_is_guarded(self):
+    def test_exceptions_go_through_the_shared_rule_and_the_baseline_is_guarded(self):
+        import subprocess
         for mod, *_ in BOTS:
             with open(mod.__file__) as f:
                 src = f.read()
             with self.subTest(mod.__name__):
-                self.assertIn('"ok": False, "retry": True, "reason": f"exception:', src)
+                self.assertIn("res = arb.exception_result(e)", src)
                 self.assertIn("main_result = measure_main_baseline(host, port)\n    except Exception", src)
+        # A transport failure is retried; a run killed at the ssh limit is a hang, posted once with a
+        # label in its marker so it is not re-run every round.
+        self.assertTrue(arb.exception_result(ConnectionResetError("x"))["retry"])
+        hang = arb.exception_result(subprocess.TimeoutExpired("ssh", 7200))
+        self.assertFalse(hang["retry"])
+        for mod in (muse, qwen):
+            self.assertIn('"label":"REJECT"', mod.format_comment("a" * 40, hang), mod.__name__)
 
     def test_a_guard_that_measured_nothing_retries_on_muse(self):
         # Only the Ternary-Bonsai guard used to take the infra path; the ModelOpt, unsloth and
@@ -204,19 +215,22 @@ class InfraTests(unittest.TestCase):
                       "GUARDMO 32768 60.0 7000.0", "GUARDUN 32768 55.0 6800.0",
                       "GUARDBN 128 99.0 2000.0", "GUARDBN 32768 89.0 6500.0", "GUARD_END"]
             return "\n".join(l for l in lines if not any(l.startswith(d) for d in drop)) + "\n"
-        for tag in ("GUARDMO ", "GUARDUN ", "GUARD36 "):
-            # The guard measured nothing on main (so nothing on either side): infra, retried.
+        with mock.patch.object(muse, "_ssh_run_resilient", return_value=run(stdout())):
+            full = muse.measure_main_baseline("h", 1)
+        self.assertTrue(full["ok"], full)
+        for tag, key in (("GUARDMO ", "guardmo"), ("GUARDUN ", "guardun"), ("GUARD36 ", "guard36")):
+            # Main measured nothing for the guard: the round is skipped at the baseline ...
             with mock.patch.object(muse, "_ssh_run_resilient", return_value=run(stdout(drop=(tag,)))):
-                main = muse.measure_main_baseline("h", 1)
-            self.assertTrue(main["ok"], main)
+                self.assertFalse(muse.measure_main_baseline("h", 1)["ok"], tag)
+            # ... and should such a baseline reach a PR anyway, the PR is deferred, not rejected.
+            main = dict(full, **{key: {}})
             with self.subTest(tag), mock.patch.object(muse, "POLARIS_ENABLED", False), \
                     mock.patch.object(muse, "_ssh_run_resilient", return_value=run(stdout(drop=(tag,)))):
                 res = muse.eval_museglimmer_on_box("h", 1, "pull/1/head", main)
                 self.assertFalse(res["ok"])
                 self.assertTrue(res["retry"], res.get("reason"))
         # Unchanged: main measured it and only the PR's run lost it -> fail closed (a regression).
-        with mock.patch.object(muse, "_ssh_run_resilient", return_value=run(stdout())):
-            main = muse.measure_main_baseline("h", 1)
+        main = full
         with mock.patch.object(muse, "POLARIS_ENABLED", False), \
                 mock.patch.object(muse, "_ssh_run_resilient", return_value=run(stdout(drop=("GUARDMO ",)))):
             res = muse.eval_museglimmer_on_box("h", 1, "pull/1/head", main)
@@ -300,6 +314,53 @@ class SelectionTests(unittest.TestCase):
                     mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run()):
                 self.assertEqual(close_stale("o/r", prs), {1})
                 self.assertFalse(any("push a new commit / open" in " ".join(c) for c in calls))
+
+
+class ReviewFixTests(unittest.TestCase):
+    """Fixes from the pre-merge review of the 2026-09-26 change."""
+
+    def test_a_crash_in_the_prs_score_binary_is_the_prs(self):
+        # An explicit `exit 1` after SCORE_FAILED fires no ERR trap: it used to read as a silent kill
+        # and be retried every round with nothing posted.
+        err = "SCORE_FAILED -- tail of /tmp/q38_score.err:\nCUDA error: an illegal memory access was encountered"
+        self.assertFalse(qwen._is_box_fault("RESULT_DECODE128_TPS 80", err))
+        self.assertIn("illegal memory access", qwen._crash_reason("", err))
+
+    def test_qwen38_main_must_measure_every_installed_guard(self):
+        stdout = "\n".join([
+            "REMOTE_SHA " + "b" * 40, "RESULT_DECODE128_TPS 80", "RESULT_PREFILL128_PP 4000",
+            "RESULT_PREFILL16K_PP 8000"] + [f"RESULT_CB{c}_AGG {100 * c}" for c in qwen.CB_CONCS] + [
+            "GUARD36 32768 50 900", "GUARDMO 32768 60 7000", "GUARDCBMO 16 800", "GUARDCBMO 32 1000",
+            "GUARDMG_UNAVAILABLE", "GUARDBN 128 99 2000", "GUARDBN 32768 89 6500", "GUARD_END"]) + "\n"
+        with mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(stdout)):
+            self.assertTrue(qwen.measure_main_baseline("h", 1)["ok"])     # an absent checkpoint is fine
+        without = stdout.replace("GUARDBN 128 99 2000\nGUARDBN 32768 89 6500\n", "GUARDBN_FAILED\n")
+        with mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(without)):
+            m = qwen.measure_main_baseline("h", 1)
+        self.assertFalse(m["ok"])
+        self.assertIn("guardbn", m["reason"])
+
+    def test_an_unreadable_pr_leaves_every_label_alone(self):
+        for mod, prefix, first, _r, _o, _t, recon, *_ in BOTS:
+            calls = []
+
+            def fake_gh(a):
+                if a[:2] == ["pr", "list"] and "open" in a:
+                    return run(json.dumps([{"number": 5, "labels": [{"name": prefix + "XL"}, {"name": first}]}]))
+                return run("")
+            with self.subTest(mod.__name__), mock.patch.object(arb, "gh", side_effect=fake_gh), \
+                    mock.patch.object(arb, "add_label", side_effect=lambda *a: calls.append(a)), \
+                    mock.patch.object(arb, "remove_label", side_effect=lambda *a: calls.append(a)), \
+                    mock.patch.object(mod, "AUTO_MERGE", False):
+                recon("o/r")
+                self.assertEqual(calls, [])
+
+    def test_the_stale_clock_is_utc_and_counts_the_prs_opening(self):
+        import calendar
+        info = {"commits": [{"committedDate": "2026-09-20T00:00:00Z"}], "createdAt": "2026-09-25T12:00:00Z"}
+        for mod in (muse, qwen):
+            with self.subTest(mod.__name__), mock.patch.object(arb, "gh", return_value=run(json.dumps(info))):
+                self.assertEqual(mod._pr_last_activity_ts("o/r", 1), calendar.timegm((2026, 9, 25, 12, 0, 0)))
 
 
 if __name__ == "__main__":
