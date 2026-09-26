@@ -1392,4 +1392,19 @@ bool launch_ct_nvfp4_pack_sfb(const void* scale_rowmajor, void* sfb,
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
+// The A-operand twin of launch_ct_nvfp4_pack_sfb: a row-major ue4m3 scale [m, k/16] into the
+// CUTLASS SFA layout (the ternary long-prefill FFN writes its activation scales row-major).
+bool launch_nvfp4_pack_sfa(const void* scale_rowmajor, void* sfa, int m, int k, cudaStream_t st) {
+    if (!scale_rowmajor || !sfa || !prefill_nvfp4_supported(m, 128, k)) return false;
+    const size_t bytes = prefill_nvfp4_scale_bytes_a(m, k);
+    if (bytes && cudaMemsetAsync(sfa, 0, bytes, st) != cudaSuccess) return false;
+    auto l = sfa_layout(m, 128, k);
+    int blocks = (m * (k / 16) + 255) / 256;
+    if (blocks > 4096) blocks = 4096;
+    pack_sfb_rows<<<blocks, 256, 0, st>>>(
+        reinterpret_cast<const unsigned char*>(scale_rowmajor),
+        reinterpret_cast<cutlass::float_ue4m3_t*>(sfa), m, k, l);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 } // namespace sparkinfer::kernels

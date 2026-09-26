@@ -73,5 +73,8 @@ bool launch_prefill_nvfp4_gemm(const void* a_fp4, const void* sfa,
 // alpha (1/global_scale), not folded into these UE4M3 bytes.
 bool launch_ct_nvfp4_pack_sfb(const void* scale_rowmajor, void* sfb,
                               int n, int k, cudaStream_t stream = nullptr);
+// The same scatter for an A operand: row-major ue4m3 [m, k/16] into the SFA layout.
+bool launch_nvfp4_pack_sfa(const void* scale_rowmajor, void* sfa, int m, int k,
+                           cudaStream_t stream = nullptr);
 
 } // namespace sparkinfer::kernels

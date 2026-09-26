@@ -2874,7 +2874,64 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             const bool ffn_qi8 = use_i8 && ffn_i8_stage && w.gate_rs && w.up_rs &&
                 (!qb_dense_pass || FC <= kernels::pf_dense_gemm_qi8_max_m()) &&
                 kernels::pf_dense_gemm_qi8_supported(gate_pf_type);
-            if (ffn_i8 && !ffn_qi8) {
+            // Ternary-Bonsai-2's long-prefill FFN on the FP4 tensor cores. All three legs are read in
+            // their stored ternary blocks (down from the decode shadow), whose trits are exact in
+            // e2m1; each block scale becomes an e2m1 magnitude times a ue4m3 (launch_ptq1_rows_nvfp4).
+            // The activations are rotated into the blocks' basis as the int8 path rotates them and
+            // quantized to NVFP4 by prefill_nvfp4's rule, so the numerics change is the activation
+            // step, 8 bits -> 4 (per-16 scales), as in Qwen3.8's and Muse's NVFP4 prefill. The GEMM
+            // runs at ~1.35 POPS against the int8 GEMM's ~0.6 at the board's power limit. The FP4
+            // operands take the int8 weight cache's buffers (0.5625 B/weight against 1): no VRAM.
+            // Only past the fused GEMM's M limit, i.e. the chunked long prompt; short prompts keep
+            // their path. SPARKINFER_PREFILL_TERNARY_NVFP4=0 keeps the int8 FFN.
+            static const bool tfp4_env = [] {
+                const char* e = getenv("SPARKINFER_PREFILL_TERNARY_NVFP4");
+                return !(e && e[0] == '0');
+            }();
+            auto fp4_parts = [](void* base, int rows, int k, void** d, void** srm, void** sfl,
+                                bool b_side) {
+                auto up256 = [](size_t v) { return (v + 255) & ~(size_t)255; };
+                char* p = static_cast<char*>(base);
+                const size_t db = up256((size_t)rows * k / 2), sb = up256((size_t)rows * k / 16);
+                *d = p; *srm = p + db; *sfl = p + db + sb;
+                return db + sb + (b_side ? kernels::prefill_nvfp4_scale_bytes_b(rows, k)
+                                         : kernels::prefill_nvfp4_scale_bytes_a(rows, k));
+            };
+            const int fc8 = (FC + 7) & ~7;
+            // Where the three operands go: the int8 weight cache when this layer has one, else the
+            // scratch that cache borrows (W_i8 and wbuf, which nothing else in the FFN touches
+            // once this arm has the layer -- every chunk below then skips the other arms).
+            signed char* tw_g = ffn_Wg_i8;
+            signed char* tw_u = ffn_Wu_i8;
+            signed char* tw_d = ffn_Wd_i8;
+            if (!ffn_i8 && W_i8 && wbuf && (size_t)ffn * H <= maxw) {
+                tw_g = W_i8;
+                tw_u = reinterpret_cast<signed char*>(wbuf);
+                tw_d = reinterpret_cast<signed char*>(wbuf) + (size_t)ffn * H;
+            }
+            void *tg_d = nullptr, *tg_r = nullptr, *tg_s = nullptr;
+            void *tu_d = nullptr, *tu_r = nullptr, *tu_s = nullptr;
+            void *td_d = nullptr, *td_r = nullptr, *td_s = nullptr;
+            const bool tfp4 = tfp4_env && t_gu && !ffn_qi8 && !c.muse_glimmer &&
+                tw_g && tw_u && tw_d && A_i8 && tl && tl->down_q &&
+                tl->down_qtype == kPtq1GgmlType && s.bonsai_sign_ffn && (ffn % 1024) == 0 &&
+                kernels::prefill_nvfp4_supported(fc8, ffn, H) &&
+                kernels::prefill_nvfp4_supported(fc8, H, ffn) &&
+                fp4_parts(tw_g, ffn, H, &tg_d, &tg_r, &tg_s, true) <= (size_t)ffn * H &&
+                fp4_parts(tw_u, ffn, H, &tu_d, &tu_r, &tu_s, true) <= (size_t)ffn * H &&
+                fp4_parts(tw_d, H, ffn, &td_d, &td_r, &td_s, true) <= (size_t)H * ffn &&
+                [&] {
+                    void *d, *r, *f;
+                    return fp4_parts(A_i8, fc8, ffn, &d, &r, &f, false) <= a_i8_sz &&
+                           fp4_parts(A_i8, fc8, H, &d, &r, &f, false) <= a_i8_sz;
+                }() &&
+                kernels::launch_ptq1_rows_nvfp4(gate_pf, tg_d, tg_r, ffn, H, st) &&
+                kernels::launch_ct_nvfp4_pack_sfb(tg_r, tg_s, ffn, H, st) &&
+                kernels::launch_ptq1_rows_nvfp4(up_pf, tu_d, tu_r, ffn, H, st) &&
+                kernels::launch_ct_nvfp4_pack_sfb(tu_r, tu_s, ffn, H, st) &&
+                kernels::launch_ptq1_rows_nvfp4(tl->down_q, td_d, td_r, H, ffn, st) &&
+                kernels::launch_ct_nvfp4_pack_sfb(td_r, td_s, H, ffn, st);
+            if (ffn_i8 && !ffn_qi8 && !tfp4) {
                 if (t_gu) {
                     kernels::launch_ptq1_rows_i8(gate_pf, ffn_Wg_i8, ffn_swg, ffn, H, st);
                     kernels::launch_ptq1_rows_i8(up_pf,   ffn_Wu_i8, ffn_swu, ffn, H, st);
@@ -3152,6 +3209,54 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             gemm_i8(A_i8, W_i8, sx, sw, x + (size_t)fo * H, fn, H, ffn, true);
                         else
                             gemm_i8(A_i8, W_i8, sx, sw, ao + (size_t)fo * H, fn, H, ffn, false);
+                    }
+                    continue;
+                }
+                if (tfp4) {
+                    // A chunk whose rows are not a multiple of 8 (the prompt's last) runs 8-row
+                    // aligned with the tail zeroed; its down output then goes through ffu, since
+                    // the rows past the prompt have no home in x or ao.
+                    a_q = nullptr; a_pk = false;
+                    const int m8 = (fn + 7) & ~7;
+                    const float alpha = kernels::ptq1_nvfp4_alpha();
+                    bf16* xc = x + (size_t)fo * H;
+                    void *ad, *ar, *as;
+                    fp4_parts(A_i8, m8, H, &ad, &ar, &as, false);
+                    if (m8 != fn) {
+                        cudaMemsetAsync(static_cast<char*>(ad) + (size_t)fn * H / 2, 0,
+                                        (size_t)(m8 - fn) * H / 2, st);
+                        cudaMemsetAsync(static_cast<char*>(ar) + (size_t)fn * H / 16, 0,
+                                        (size_t)(m8 - fn) * H / 16, st);
+                    }
+                    kernels::launch_ptq1_rotq_rows_nvfp4(
+                        hn_c, nullptr, static_cast<const signed char*>(s.bonsai_sign_hidden), ad, ar,
+                        fn, H, s.bonsai_block, st);
+                    kernels::launch_nvfp4_pack_sfa(ar, as, m8, H, st);
+                    kernels::launch_prefill_nvfp4_gemm(ad, as, tg_d, tg_s, ffg, m8, ffn, H, nullptr,
+                                                       st, alpha);
+                    kernels::launch_prefill_nvfp4_gemm(ad, as, tu_d, tu_s, ffu, m8, ffn, H, nullptr,
+                                                       st, alpha);
+                    fp4_parts(A_i8, m8, ffn, &ad, &ar, &as, false);
+                    kernels::launch_ptq1_rotq_rows_nvfp4(
+                        ffg, ffu, static_cast<const signed char*>(s.bonsai_sign_ffn), ad, ar, m8,
+                        ffn, s.bonsai_block, st);
+                    kernels::launch_nvfp4_pack_sfa(ar, as, m8, ffn, st);
+                    if (m8 == fn) {
+                        if (ffn_fused)
+                            kernels::launch_prefill_nvfp4_gemm(ad, as, td_d, td_s, xc, fn, H, ffn,
+                                                               nullptr, st, alpha, xc);
+                        else
+                            kernels::launch_prefill_nvfp4_gemm(ad, as, td_d, td_s,
+                                                               ao + (size_t)fo * H, fn, H, ffn,
+                                                               nullptr, st, alpha);
+                    } else {
+                        kernels::launch_prefill_nvfp4_gemm(ad, as, td_d, td_s, ffu, m8, H, ffn,
+                                                           nullptr, st, alpha);
+                        if (ffn_fused)
+                            kernels::launch_prefill_add(xc, ffu, xc, (long)fn * H, st);
+                        else
+                            cudaMemcpyAsync(ao + (size_t)fo * H, ffu, (size_t)fn * H * sizeof(bf16),
+                                            cudaMemcpyDeviceToDevice, st);
                     }
                     continue;
                 }

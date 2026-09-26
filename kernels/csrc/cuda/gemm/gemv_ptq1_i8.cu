@@ -20,6 +20,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_pipeline.h>
+#include <cuda_fp8.h>
+#include <cuda_fp4.h>
 
 namespace sparkinfer { namespace kernels {
 
@@ -750,7 +752,7 @@ ptq1_rows_i8_kernel(const unsigned char* __restrict__ w, signed char* __restrict
 // SWIGLU: x is the gate and u the up projection; the row rotated is SwiGLU's output rounded to
 // bf16 exactly as launch_prefill_swiglu_quant_i8 forms it, bf16(g / (1 + exp(-g)) * u), which is
 // also what the decode shadow's down reads (launch_ptq1_swiglu_rotq_bf16).
-template <int NS, bool SWIGLU = false>
+template <int NS, bool SWIGLU = false, bool FP4 = false>
 __global__ void __launch_bounds__(256)
 ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict__ sign,
                          signed char* __restrict__ q, float* __restrict__ scale,
@@ -821,8 +823,31 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
                 v[sp][i] = sh[t * 4 + i] * 0.03125f;
                 am = fmaxf(am, fabsf(v[sp][i]));
             }
+            if constexpr (FP4) {
+                // NVFP4 instead of int8: q (the packed nibbles, k/2 bytes a row) and a row-major
+                // ue4m3 scale per 16 values in `qp`. Four lanes hold a 16-value group; the rule is
+                // prefill_nvfp4's quant_rows_t: qs = ue4m3(max(amax / 6, 2^-9)), e2m1(v / qs).
+                float ga = fmaxf(fmaxf(fabsf(v[sp][0]), fabsf(v[sp][1])),
+                                 fmaxf(fabsf(v[sp][2]), fabsf(v[sp][3])));
+                ga = fmaxf(ga, __shfl_xor_sync(0xffffffffu, ga, 1));
+                ga = fmaxf(ga, __shfl_xor_sync(0xffffffffu, ga, 2));
+                const __nv_fp8_storage_t qb =
+                    __nv_cvt_float_to_fp8(fmaxf(ga * (1.f / 6.f), 0x1p-9f), __NV_SATFINITE, __NV_E4M3);
+                const float qs = __half2float(__half(__nv_cvt_fp8_to_halfraw(qb, __NV_E4M3)));
+                const int e0 = sp * kSpan + t * 4;
+                const unsigned lo = __nv_cvt_float2_to_fp4x2(
+                    make_float2(v[sp][0] / qs, v[sp][1] / qs), __NV_E2M1, cudaRoundNearest);
+                const unsigned hi = __nv_cvt_float2_to_fp4x2(
+                    make_float2(v[sp][2] / qs, v[sp][3] / qs), __NV_E2M1, cudaRoundNearest);
+                *reinterpret_cast<unsigned short*>(
+                    reinterpret_cast<unsigned char*>(q) + ((size_t)row * k + e0) / 2) =
+                    (unsigned short)(lo | (hi << 8));
+                if ((t & 3) == 0)
+                    reinterpret_cast<unsigned char*>(qp)[(size_t)row * (k / 16) + e0 / 16] = qb;
+            }
         }
     }
+    if constexpr (FP4) return;
 #pragma unroll
     for (int o = 16; o; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
     if (lane == 0) sred[warp] = am;
@@ -849,7 +874,81 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
     }
 }
 
+// Prefill's NVFP4 B operand from the stored blocks. A trit is exact in e2m1, so the only rounding
+// is the block scale: s_b * 2^10 is written as m * sf, m one of e2m1's magnitudes {1, 1.5, 2, 3,
+// 4, 6} and sf a ue4m3, the pair closest to it (the GEMM's alpha takes the 2^-10 back off). The
+// scale range of the checkpoint (2.7e-3 .. 0.16) lands on normal ue4m3 values. Output: the packed
+// nibbles (k/2 bytes a row, low nibble first) and a row-major ue4m3 per 16 values.
+constexpr float kFp4WScale = 1024.f;
+__device__ __forceinline__ void ptq1_fp4_scale(float sb, unsigned& code, unsigned char& sfb) {
+    const float T = fabsf(sb) * kFp4WScale;
+    const float mags[6] = {1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    float best = 3.4e38f;
+    code = 2u; sfb = 0;
+#pragma unroll
+    for (int i = 0; i < 6; ++i) {
+        const __nv_fp8_storage_t f = __nv_cvt_float_to_fp8(T / mags[i], __NV_SATFINITE, __NV_E4M3);
+        const float e = fabsf(mags[i] * __half2float(__half(__nv_cvt_fp8_to_halfraw(f, __NV_E4M3))) - T);
+        if (e < best) { best = e; code = 2u + (unsigned)i; sfb = f; }
+    }
+}
+template <int WPC>
+__global__ void __launch_bounds__(WPC * 32)
+ptq1_rows_nvfp4_kernel(const unsigned char* __restrict__ w, unsigned char* __restrict__ q,
+                       unsigned char* __restrict__ sf, int rows, int nblk) {
+    extern __shared__ uint4 srow[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WPC + warp;
+    if (row >= rows) return;
+    const unsigned char* wr = w + (size_t)row * nblk * kBlkBytes;
+    signed char* buf = reinterpret_cast<signed char*>(srow) + (size_t)warp * nblk * kBlk;
+    for (int i = lane; i < 2 * nblk; i += 32) {
+        const int b = i >> 1, h = i & 1;
+        const unsigned* bw = reinterpret_cast<const unsigned*>(wr + b * kBlkBytes);
+        const unsigned tw[4] = {__ldg(bw + 2 * h), __ldg(bw + 2 * h + 1), __ldg(bw + 4 + h),
+                                (__ldg(bw + 6) & 0xFFFFu) | 0x3C000000u};   // scale 1.0: bare trits
+        t_half(tw, h, 1.f, buf + b * kBlk);
+    }
+    __syncwarp();
+    const int ng = nblk * (kBlk / 16);
+    for (int g = lane; g < ng; g += 32) {
+        const int b = g >> 3;
+        const unsigned short hs = *reinterpret_cast<const unsigned short*>(wr + b * kBlkBytes + 26);
+        unsigned code; unsigned char sfb;
+        ptq1_fp4_scale(__half2float(__ushort_as_half(hs)), code, sfb);
+        const signed char* tv = buf + g * 16;
+        unsigned o[2] = {0u, 0u};
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int tr = tv[j];
+            const unsigned nib = tr == 0 ? 0u : (code | (tr < 0 ? 8u : 0u));
+            o[j >> 3] |= nib << (4 * (j & 7));
+        }
+        *reinterpret_cast<uint2*>(q + (size_t)row * nblk * (kBlk / 2) + g * 8) = make_uint2(o[0], o[1]);
+        sf[(size_t)row * ng + g] = sfb;
+    }
+}
+
 }  // namespace
+
+bool launch_ptq1_rows_nvfp4(const void* w_ptq1, void* q, void* sf_rowmajor, int rows, int k,
+                            cudaStream_t st) {
+    if (rows <= 0 || k <= 0 || k % kBlk != 0) return false;
+    constexpr int WPC = 4;
+    const size_t shm = (size_t)WPC * k;
+    if (shm > 96 * 1024) return false;
+    static bool attr = false;
+    if (!attr) {
+        cudaFuncSetAttribute(ptq1_rows_nvfp4_kernel<WPC>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+        attr = true;
+    }
+    ptq1_rows_nvfp4_kernel<WPC><<<(rows + WPC - 1) / WPC, WPC * 32, shm, st>>>(
+        static_cast<const unsigned char*>(w_ptq1), static_cast<unsigned char*>(q),
+        static_cast<unsigned char*>(sf_rowmajor), rows, k / kBlk);
+    return true;
+}
+float ptq1_nvfp4_alpha() { return 1.f / kFp4WScale; }
 
 bool launch_ptq1_rotq_bf16(const void* x_bf16, const signed char* sign, signed char* q,
                            float* qd, int* qs, int rows, int k, int block, cudaStream_t st) {
@@ -945,6 +1044,29 @@ bool launch_ptq1_swiglu_rotq_rows_i8(const void* gate_bf16, const void* up_bf16,
         ptq1_rotq_rows_i8_kernel<8, true><<<rows, 256, 0, st>>>(g, sign, q, scale, qp, rows, k, u);
     else
         ptq1_rotq_rows_i8_kernel<17, true><<<rows, 256, 0, st>>>(g, sign, q, scale, qp, rows, k, u);
+    return true;
+}
+
+bool launch_ptq1_rotq_rows_nvfp4(const void* x_bf16, const void* up_bf16, const signed char* sign,
+                                 void* q, void* sf_rowmajor, int rows, int k, int block,
+                                 cudaStream_t st) {
+    if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 17 * kSpan) return false;
+    const auto* x = static_cast<const __nv_bfloat16*>(x_bf16);
+    const auto* u = static_cast<const __nv_bfloat16*>(up_bf16);
+    auto* qq = static_cast<signed char*>(q);
+    auto* sf = static_cast<signed char*>(sf_rowmajor);
+    if (u) {
+        if (k <= 8 * kSpan)
+            ptq1_rotq_rows_i8_kernel<8, true, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, u);
+        else
+            ptq1_rotq_rows_i8_kernel<17, true, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, u);
+    } else {
+        if (k > 8 * kSpan) return false;
+        if (k <= 5 * kSpan)
+            ptq1_rotq_rows_i8_kernel<5, false, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k);
+        else
+            ptq1_rotq_rows_i8_kernel<8, false, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k);
+    }
     return true;
 }
 

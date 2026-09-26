@@ -135,6 +135,18 @@ bool launch_gemm_ptq1_i8_rows_f32(const signed char* xq, const float* xd, const 
 // fused GEMM's PTQ1 arm decodes to. launch_ptq1_rotq_rows_i8: bf16 activation rows -> rotated,
 // then int8 with one scale per row (d = amax/127), plus the k-tiled copy when qp is non-null.
 // Only for a weight read against an activation that went through the second.
+// NVFP4 forms of the two operands above, for the long-prefill FFN on the FP4 tensor cores.
+// launch_ptq1_rows_nvfp4: weight rows -> packed e2m1 trits (k/2 bytes a row) and a row-major
+// ue4m3 scale per 16 (k/16 bytes a row), to be scattered with launch_ct_nvfp4_pack_sfb; the GEMM
+// takes ptq1_nvfp4_alpha() as its alpha. launch_ptq1_rotq_rows_nvfp4: activation rows rotated as
+// launch_ptq1_rotq_rows_i8 rotates them (bf16(silu(x) * up) first when up_bf16 is set), then
+// quantized to NVFP4 by prefill_nvfp4's rule into the same two layouts.
+bool launch_ptq1_rows_nvfp4(const void* w_ptq1, void* q, void* sf_rowmajor, int rows, int k,
+                            cudaStream_t stream = nullptr);
+float ptq1_nvfp4_alpha();
+bool launch_ptq1_rotq_rows_nvfp4(const void* x_bf16, const void* up_bf16, const signed char* sign,
+                                 void* q, void* sf_rowmajor, int rows, int k, int block,
+                                 cudaStream_t stream = nullptr);
 bool launch_ptq1_rows_i8(const void* w_ptq1, signed char* q, float* scale, int rows, int k,
                          cudaStream_t stream);
 bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,
