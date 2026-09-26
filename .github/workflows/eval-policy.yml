@@ -51,6 +51,7 @@ jobs:
           # syntax error here fails every round on the box, not in review.
           bash -n bench/scripts/_eval_speed.sh
           bash -n bench/scripts/_common.sh
+          bash -n bench/scripts/accuracy.sh
           python3 - <<'PY'
           import subprocess, sys
           sys.path.insert(0, "eval")
@@ -85,6 +86,7 @@ jobs:
             eval/_bot_test_state.py \
             eval/noise_penalty.py \
             eval/test_noise_penalty.py \
+            eval/test_copycat_guard.py \
             bench/scripts/accuracy_compare_pair.py \
             bench/scripts/accuracy_compare.py
 
@@ -99,5 +101,6 @@ jobs:
           # The cron wrappers, run for real against a throwaway origin (no GitHub, no GPU box).
           python3 eval/test_cron_wrappers.py
           python3 eval/test_noise_penalty.py
+          python3 eval/test_copycat_guard.py
           # The ban list itself is policy: a malformed line must fail review, not a 3am cron.
           python3 eval/noise_penalty.py --check

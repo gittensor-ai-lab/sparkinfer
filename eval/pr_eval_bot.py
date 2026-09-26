@@ -2050,7 +2050,7 @@ report_build_failure() {
   grep -vE '^ptxas info|^ +[0-9]+ bytes stack frame' "$1" 2>/dev/null | tail -30 >&2 || true
 }
 build_box_fault() {
-  grep -m1 -E 'Killed signal terminated program|died due to signal 9|signal 9 \(Kill signal\)|internal compiler error: Killed|virtual memory exhausted|Cannot allocate memory|No space left on device|Bad address \(os error 14\)' "$1" 2>/dev/null
+  grep -m1 -E 'Killed signal terminated program|died due to signal 9|signal 9 \(Kill signal\)|terminated with signal 9|internal compiler error: Killed|virtual memory exhausted|Cannot allocate memory|No space left on device|Bad address \(os error 14\)' "$1" 2>/dev/null
 }
 """
 

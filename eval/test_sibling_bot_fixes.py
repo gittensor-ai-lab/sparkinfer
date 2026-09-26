@@ -2269,11 +2269,21 @@ class Iteration7Tests(unittest.TestCase):
                 self.assertNotIn("already", out)                            # not skipped as measured
                 self.assertIn(prefix + "REJECT", removed)                   # H1's tier is not H0's
 
+    def test_a_close_that_carries_the_verdict_counts_as_its_marker(self):
+        import subprocess
+        failed = dict(arb.exception_result(subprocess.TimeoutExpired("ssh", 7200)), retry=False)
+        for mod, tag, *_ in self._bots():
+            carried = (mod.format_comment("a" * 40, failed) + "\n\n---\n\n"
+                       + f"<!-- sparkinfer-{tag}-auto-close -->\n## Closed: regression or failed gate")
+            comments = {"comments": [{"body": carried, "authorAssociation": "MEMBER"}]}
+            with self.subTest(tag), mock.patch.object(arb, "gh", return_value=run(json.dumps(comments))):
+                self.assertEqual(getattr(mod, f"{tag}_evaluated_commits")("o/r", 1), {"a" * 40})
+
     def test_the_heal_leaves_a_noise_ban_alone(self):
         self.assertFalse(arb.generic_label_out_of_sync({"eval-museglimmer:none", "eval-qwen38:XL-p", "eval:XL-p"}))
         self.assertTrue(arb.generic_label_out_of_sync({"eval-museglimmer:none", "eval-qwen38:XL", "eval:none"}))
 
-    def test_no_verdict_close_when_the_verdict_comment_did_not_post(self):
+    def test_a_verdict_that_did_not_post_goes_out_with_its_close(self):
         for mod, tag, *_ in self._bots():
             calls = []
 
@@ -2299,7 +2309,48 @@ class Iteration7Tests(unittest.TestCase):
                         mod.apply_result("o/r", 1, "a" * 40, res, **kw)
                 else:
                     mod.apply_result("o/r", 1, "a" * 40, res, **kw)
-            self.assertFalse(any(c[:2] == ["pr", "close"] for c in calls), tag)
+            # Closed all the same (left open, the other bots dropped its REJECT and merged it), and the
+            # close comment leads with the verdict, marker included.
+            self.assertTrue(any(c[:2] == ["pr", "close"] for c in calls), tag)
+            close = next(" ".join(c) for c in calls if "auto-close -->" in " ".join(c))
+            self.assertTrue(close.split("--body ", 1)[1].startswith("the verdict comment"), tag)
+
+
+
+class Iteration8Tests(unittest.TestCase):
+    """Fixes from the post-merge review of main 64ec2c1."""
+
+    ROOT = Iteration5bTests.ROOT
+
+    def test_a_linker_killed_for_memory_is_the_boxs(self):
+        import subprocess
+        d = _tempfile.mkdtemp(dir=_STATE)
+        log = _os.path.join(d, "build.log")
+        with open(log, "w") as f:
+            f.write("collect2: fatal error: ld terminated with signal 9 [Killed]\n")
+        r = subprocess.run(["bash", "-c", arb.BUILD_FAILURE_SH + f'\nbuild_box_fault "{log}"'],
+                           capture_output=True, text=True, timeout=30)
+        self.assertIn("terminated with signal 9", r.stdout)
+
+    def test_the_serve_checks_server_is_stopped_on_sigterm(self):
+        # The next round's guard stops an orphaned Bonsai round by session; the serve check's server
+        # runs in a session of its own, so only the script's own `finally` can stop it.
+        import signal
+        import subprocess
+        code = ("import signal, sys, os, time\n"
+                "sys.argv = ['x', '--help']\n"
+                f"sys.path.insert(0, {_os.path.join(self.ROOT, 'eval')!r})\n"
+                "import bonsai_regression as b\n"
+                "try:\n    b.main()\nexcept SystemExit:\n    pass\n"
+                "h = signal.getsignal(signal.SIGTERM)\n"
+                "print('HANDLER', h not in (signal.SIG_DFL, None))\n"
+                "try:\n    h(signal.SIGTERM, None)\nexcept SystemExit as e:\n    print('EXIT', e.code)\n"
+                # the first TERM unwinds; a second one while cleaning up is ignored, not a new exit
+                "print('THEN', signal.getsignal(signal.SIGTERM) == signal.SIG_IGN)\n")
+        r = subprocess.run(["python3", "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertIn("HANDLER True", r.stdout, r.stderr[-500:])
+        self.assertIn("EXIT 143", r.stdout)
+        self.assertIn("THEN True", r.stdout)
 
 
 if __name__ == "__main__":

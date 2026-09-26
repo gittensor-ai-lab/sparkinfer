@@ -331,6 +331,13 @@ def check_serve(a, failures, notes=None):
 
 
 def main():
+    # SIGTERM (the next round's guard stopping an orphaned one, a wrapper's timeout) unwinds like an
+    # exception, so the serve check's `finally` kills its server: that runs in a session of its own,
+    # which the guard does not reach, and it kept the GPU from the next bot's baseline.
+    def _on_term(*_):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)     # a second TERM must not cut the cleanup short
+        sys.exit(143)
+    signal.signal(signal.SIGTERM, _on_term)
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="/root/workspace/models_bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf")

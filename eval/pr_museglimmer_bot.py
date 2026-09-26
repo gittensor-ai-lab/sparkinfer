@@ -2576,8 +2576,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
     # directly let a `none` here erase another model's real tier depending purely on which
     # staggered cron ran last. See arb.sync_generic_eval_label().
     arb.sync_generic_eval_label(repo, num)
-    # Whether the verdict posted: without its marker the head is measured again next round, so it is
-    # not closed over a verdict nobody can read (the close comment points to it).
+    # Whether the verdict posted: a close carries it instead when it did not (below).
     posted = getattr(arb.gh(["pr", "comment", str(num), "-R", repo, "--body", arb.fit_comment(body)]),
                      "returncode", 0) == 0
     # Scores first: a run that dies in the (network) log upload must not leave a posted verdict the
@@ -2695,11 +2694,16 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
                 )
             # Not over a commit the author has already replaced (a push while it was measured),
             # nor over a `hold` or a draft made while the round ran.
-            why = arb.verdict_close_blocker(repo, num, commit) if posted else "its verdict comment did not post"
+            if not posted:
+                # The verdict travels with the close, marker included. Left open instead, its REJECT label
+                # without a marker read to the other bots as a tier no verdict backs: they dropped it, and
+                # one of them merged the PR.
+                close_body = body + "\n\n---\n\n" + close_body
+            why = arb.verdict_close_blocker(repo, num, commit)
             if why:
                 print(f">> PR #{num}: not closed — {why}")
                 return
-            arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
+            arb.gh(["pr", "comment", str(num), "-R", repo, "--body", arb.fit_comment(close_body)])
             arb.gh(["pr", "close", str(num), "-R", repo])
             print(f">> auto-closed PR #{num} (eval-museglimmer:{label})")
 

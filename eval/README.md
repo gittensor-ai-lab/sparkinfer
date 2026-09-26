@@ -216,6 +216,7 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
   only on their second round. No
   bot closes a PR whose head moved after the commit it measured, nor one made a draft or given
   `hold` while the round ran: the PR is read again just before closing (`arb.verdict_close_blocker`).
+  A verdict comment that failed to post goes out with the close comment, marker included.
   The close comment asks for a new commit: reopening alone does not re-run a commit that already has
   its verdict.
 - **Stale close.** Only PRs routed to that bot's model, never one carrying any bot's merge-first,
@@ -277,8 +278,10 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
     NaN is unreadable: in `main`'s dump that position is left out for everyone (it passed the self-
     check and then read as KL 0, or as a NaN perplexity every Bonsai PR failed), in a PR's it is a
     gap the coverage check fails.
-  - A PR with no history in common with `main` is a rebase request, like a conflict. Ternary-Bonsai's
-    prefill-path check killed on every attempt (exit 137) is a box fault, bounded like the others.
+  - A PR with no history in common with `main` is a rebase request, like a conflict -- in a full
+    clone; in a shallow one it is the box's. Ternary-Bonsai's prefill-path check killed on every
+    attempt (exit 137) is a box fault, bounded like the others, unless the runs that did complete
+    already fail the bars.
   - A failure of the bot itself (an exception) is never charged: after three rounds at one commit
     the bot stops measuring that commit until a push. A run that gives up on a PR, or whose round
     is skipped because `main`'s baseline is unusable, exits 3, so the wrapper's failed-run banner

@@ -2249,8 +2249,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, body=""):
     # Mirrored to the generic eval:* label (explicit decision 2026-09-24), derived from every
     # per-bot label so a `none` here cannot erase another model's real tier.
     arb.sync_generic_eval_label(repo, num)
-    # Whether the verdict posted: without its marker the head is measured again next round, so it is
-    # not closed over a verdict nobody can read (the close comment points to it).
+    # Whether the verdict posted: a close carries it instead when it did not (below).
     posted = getattr(arb.gh(["pr", "comment", str(num), "-R", repo, "--body", arb.fit_comment(comment)]),
                      "returncode", 0) == 0
     if not res.get("ok"):
@@ -2307,11 +2306,16 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, body=""):
         return
     # Not over a commit the author has already replaced (a push landing while this PR was being
     # measured gets its own evaluation next round), nor over a `hold` or a draft made meanwhile.
-    why = arb.verdict_close_blocker(repo, num, commit) if posted else "its verdict comment did not post"
+    if not posted:
+        # The verdict travels with the close, marker included. Left open instead, its REJECT label
+        # without a marker read to the other bots as a tier no verdict backs: they dropped it, and
+        # one of them merged the PR.
+        close_body = comment + "\n\n---\n\n" + close_body
+    why = arb.verdict_close_blocker(repo, num, commit)
     if why:
         print(f">> PR #{num}: not closed — {why}")
         return
-    arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
+    arb.gh(["pr", "comment", str(num), "-R", repo, "--body", arb.fit_comment(close_body)])
     arb.gh(["pr", "close", str(num), "-R", repo])
     print(f">> auto-closed PR #{num} (eval-bonsai:{label})")
 
