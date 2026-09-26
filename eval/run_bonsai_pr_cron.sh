@@ -86,7 +86,7 @@ gpu_ready() {
     # some agent identity) fails outright with "Permission denied".
     local err rc
     err="$(timeout 60 ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
-        -o StrictHostKeyChecking=accept-new -p "$port" "$user@$host" 'true' 2>&1)"
+        -o StrictHostKeyChecking=accept-new -p "$port" "$user@$host" 'true' 2>&1 9>&-)"
     rc=$?
     [ "$rc" -eq 0 ] || echo "gpu_ready: ssh to $user@$host:$port failed (exit=$rc): $err" >&2
     return "$rc"
@@ -95,7 +95,7 @@ gpu_ready() {
   [ -n "$iid" ] && [ "$iid" != "0" ] || return 1
   command -v vastai >/dev/null 2>&1 || return 1
   local raw st ip port
-  raw="$(timeout 60 vastai show instance "$iid" --raw 2>/dev/null)" || return 1
+  raw="$(timeout 60 vastai show instance "$iid" --raw 2>/dev/null 9>&-)" || return 1
   read -r st ip port < <(python3 -c "
 import json, sys
 d = json.loads(sys.stdin.read() or '{}')
@@ -107,7 +107,7 @@ print(st, ip, p)
 " <<<"$raw")
   [ "$st" = "running" ] && [ -n "$ip" ] && [ -n "$port" ] || return 1
   timeout 60 ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=10 \
-      -o StrictHostKeyChecking=accept-new -p "$port" "root@$ip" 'true' 2>/dev/null
+      -o StrictHostKeyChecking=accept-new -p "$port" "root@$ip" 'true' 2>/dev/null 9>&-
 }
 
 GPU_LABEL="${EVAL_SSH_HOST:-ssh}"

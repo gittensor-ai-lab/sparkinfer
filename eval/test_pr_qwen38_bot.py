@@ -3,16 +3,13 @@ import unittest
 import pr_qwen38_bot as bot
 
 # Nothing here may touch the controller's own state: every file the bot writes goes to a temp dir.
-import atexit as _atexit
-import os as _os
-import shutil as _shutil
-import tempfile as _tempfile
-_STATE = _tempfile.mkdtemp(prefix="sparkinfer-bot-tests-")
-_atexit.register(_shutil.rmtree, _STATE, True)
-for _mod, _names in ((bot.arb, ("INSTANCE_FILE", "PIN_FILE", "BOT_LOCK_FILE")), (bot, ("STRIKES_FILE", "SCORES_FILE"))):
-    for _n in _names:
-        setattr(_mod, _n, _os.path.join(_STATE, f"{_mod.__name__}.{_n}"))
-bot.arb.PINNED_INSTANCE = ""
+import _bot_test_state
+_STATE = _bot_test_state.new_state_dir()
+_bot_test_state.isolate(_STATE, bot.arb, bot)
+
+
+def setUpModule():
+    _bot_test_state.isolate(_STATE, bot.arb, bot)
 
 
 class ConcurrencyAxesTests(unittest.TestCase):

@@ -51,10 +51,12 @@ Closing, by explicit decision 2026-09-26, so this bot works like its siblings:
     the siblings since 2026-09-26). This bot also evaluates every undeclared PR, and most of those
     are aimed at another model and legitimately score `none` here -- #768 and #1082 were closed by
     a sibling bot for exactly that;
-  * nothing closes over a head that moved after the commit that was measured;
-  * a PR routed to this model with no commits for BONSAI_STALE_DAYS closes as stale, as the
-    siblings' own stale close does for theirs (arb.stale_close_skip_reason) -- unless it is
-    greenlit and still waiting for this bot's first verdict on its head;
+  * nothing closes over a head that moved after the commit that was measured, nor over a `hold`
+    or a draft made while the round ran (arb.verdict_close_blocker);
+  * a PR routed to this model with no commits for BONSAI_STALE_DAYS, which has also waited on its
+    author that long (arb.AuthorWaitClock), closes as stale, as the siblings' own stale close does
+    for theirs (arb.stale_close_skip_reason) -- unless it is greenlit and still waiting for this
+    bot's first verdict on its head, or a verified speedup waiting for the merge-first PR to merge;
   * a run that FAILED (build error, crash) never closes: its verdict comment says why.
 
   python eval/pr_bonsai_bot.py --only-prs 1139 --reeval --no-post
@@ -230,6 +232,10 @@ SCORES_FILE = os.path.expanduser(
 STRIKES_FILE = os.path.expanduser(
     os.environ.get("BONSAI_STRIKES_FILE", "~/.sparkinfer_bonsai_strikes.json")
 )
+# When each PR began waiting on its author, per head: the stale close's clock (arb.AuthorWaitClock).
+AUTHOR_WAIT_FILE = os.path.expanduser(
+    os.environ.get("BONSAI_AUTHOR_WAIT_FILE", "~/.sparkinfer_bonsai_author_wait.json")
+)
 # PRs the bot gave up on this run (its own errors): the run then exits 3, so they are not silent.
 GAVE_UP = set()
 STRIKES_TO_REJECT = 2
@@ -376,9 +382,7 @@ def bonsai_evaluated_commits(repo, num):
 
 
 def strip_bonsai_eval_labels(repo, num):
-    for lab in list(arb.labels_on(repo, num)):
-        if lab.startswith(EVAL_PREFIX):
-            arb.remove_label(repo, num, lab)
+    arb.strip_own_tier_labels(repo, num, EVAL_PREFIX)
 
 
 def _pr_last_activity_ts(repo, num):
@@ -428,43 +432,88 @@ def _remeasure_against_new_main(repo, num, head, labs, main_now):
     return _remeasure_state(repo, num, head, labs, main_now) is True
 
 
+def _waits_for_the_winner(pr, labs, head, main_now):
+    """A verified speedup at this head, sent to bonsai-needs-rebase only because another PR won
+    merge-first. Until that PR merges and main moves there is nothing to rebase onto, so the wait
+    is the merge's, not the author's; from then on the rebase is the author's (CONTRIBUTING), and
+    the stale clock starts. A conflict, or any other block label, is the author's at once. Kept
+    too when today's main is unknown."""
+    entry = _load_scores().get(str(pr["number"])) or {}
+    if (BONSAI_NEEDS_REBASE not in labs or labs & (AUTOMERGE_BLOCK - {BONSAI_NEEDS_REBASE})
+            or entry.get("commit") != head or entry.get("label") not in SPEEDUP_LABELS or not entry.get("pass")
+            or arb.pr_merge_conflict(pr.get("mergeable"))
+            or arb.strike_count(STRIKES_FILE, pr["number"], head, "conflict")):
+        return False
+    return not main_now or not arb.scored_against_stale_main(entry, main_now)
+
+
 def close_stale_bonsai_prs(repo, prs, dry_run=False):
     """Close PRs routed to this model with no author commit in STALE_DAYS+ days -- the siblings'
-    stale close, limited like theirs now are to the bot's own PRs (arb.stale_close_skip_reason)."""
+    stale close, limited like theirs now are to the bot's own PRs (arb.stale_close_skip_reason).
+    Idle means waiting on its author for STALE_DAYS as well (arb.AuthorWaitClock): a PR the bot kept
+    waiting is not closed the round it is handed back. STALE_DAYS <= 0 turns the stale close off, and
+    so does SPARKINFER_BONSAI_AUTOCLOSE=0, which turns every close off (module docstring)."""
     closed = set()
+    if arb.stale_close_disabled(STALE_DAYS) or not AUTO_CLOSE:
+        return closed
     now = time.time()
     main_now = None
+    clock = arb.AuthorWaitClock(AUTHOR_WAIT_FILE, [p["number"] for p in prs], now, record=not dry_run)
     for pr in prs:
         num = pr["number"]
         if arb.stale_close_skip_reason(pr, "bonsai"):
+            clock.forget(num)                  # a maintainer's, a merge's or another bot's wait
             continue
         ts = _pr_last_activity_ts(repo, num)
         if ts is None:
             continue
         age_days = (now - ts) / 86400
-        if age_days < STALE_DAYS:
-            continue
+        # Every PR is classified, not only one idle for STALE_DAYS: the clock must start the round a
+        # PR is handed back, or it would start only once the commit is that old -- twice the period.
+        note = print if age_days >= STALE_DAYS else (lambda *_: None)     # the log names idle PRs only
         head = (pr.get("headRefOid") or "")[:40]
         labs = {l["name"] for l in pr.get("labels", [])}
         if main_now is None:
             main_now = arb.current_main_sha(repo)
         if arb.gave_up(STRIKES_FILE, num, head) and not _unmeasurable_reason(repo, pr, labs, count_gave_up=False):
             # The bot failed on it itself (loudly: the run exits 3). Not the author's to lose it for.
-            print(f"PR #{num}: idle {age_days:.1f}d, but the bot gave up on its head after its own errors — kept open")
+            note(f"PR #{num}: idle {age_days:.1f}d, but the bot gave up on its head after its own errors — kept open")
+            clock.forget(num)
             continue
         owed = _remeasure_state(repo, num, head, labs, main_now)
         if owed is None or (owed and not _unmeasurable_reason(repo, pr, labs)):
             # A verified speedup the bot owes a re-measure onto today's main (or GitHub did not say):
             # the wait is the bot's.
-            print(f"PR #{num}: idle {age_days:.1f}d but owed a re-measure onto the new main — kept open")
+            note(f"PR #{num}: idle {age_days:.1f}d but owed a re-measure onto the new main — kept open")
+            if owed:
+                clock.forget(num)
+            continue
+        if _waits_for_the_winner(pr, labs, head, main_now):
+            note(f"PR #{num}: idle {age_days:.1f}d, a verified speedup waiting for the merge-first PR to merge — kept open")
+            if main_now:                       # not on an unanswered main read: unknown keeps the clock
+                clock.forget(num)
+            continue
+        evaluated = bonsai_evaluated_commits(repo, num)
+        if evaluated is None:
+            note(f"PR #{num}: idle {age_days:.1f}d; GitHub did not return its comments — kept open")
             continue
         if not arb.strike_count(STRIKES_FILE, num, head, "harness") and arb.waiting_for_first_verdict(
-                repo, pr, bonsai_evaluated_commits(repo, num), never_paths=HARNESS_PATHS, rebase_label=BONSAI_NEEDS_REBASE):
+                repo, pr, evaluated, never_paths=HARNESS_PATHS,
+                box_conflict=bool(arb.strike_count(STRIKES_FILE, num, head, "conflict"))):
             # Greenlit and still waiting for this bot to measure its head: the wait is the bot's.
-            print(f"PR #{num}: idle {age_days:.1f}d but still waiting for its first bonsai verdict — kept open")
+            note(f"PR #{num}: idle {age_days:.1f}d but still waiting for its first bonsai verdict — kept open")
+            clock.forget(num)
             continue
-        print(f"PR #{num}: stale ({age_days:.1f}d since last commit, threshold {STALE_DAYS:g}d) — closing")
+        # Waiting on its author -- counted from the first round the bot saw that, not from the commit.
+        waited = (now - max(ts, clock.since(num, head))) / 86400
+        if waited < STALE_DAYS:
+            note(f"PR #{num}: idle {age_days:.1f}d, waiting on its author for {waited:.1f}d "
+                 f"(closed at {STALE_DAYS:g}d) — kept open")
+            continue
+        print(f"PR #{num}: stale ({age_days:.1f}d since last commit, {waited:.1f}d waiting on its author, "
+              f"threshold {STALE_DAYS:g}d) — closing")
         closed.add(num)
+        clock.forget(num)
         if dry_run:
             continue
         arb.gh(["pr", "comment", str(num), "-R", repo, "--body",
@@ -475,6 +524,7 @@ def close_stale_bonsai_prs(repo, prs, dry_run=False):
                 "with it for that reason alone: push your latest work and reopen it whenever you "
                 "are ready, and it is evaluated again on the next round."])
         arb.gh(["pr", "close", str(num), "-R", repo])
+    clock.save()
     return closed
 
 
@@ -517,7 +567,7 @@ def ssh_run(host, port, cmd, timeout=7200, stdin_data=None, via_stdin=False):
 
 
 _EXPLICIT_FAIL_MARKERS = ("HARNESS_TOUCHED", "BUILD_FAILED", "SCORE_FAILED", "TOKENIZE_FAILED", "HARNESS_PIN_FAILED",
-                          "MODEL_CHECK_FAILED", "MERGE_CONFLICT")
+                          "MODEL_CHECK_FAILED", "MERGE_CONFLICT", "BASE_AHEAD")
 # Markers naming the box rather than the ref: missing model files, the box's tokenizer, a fetch.
 _INFRA_MARKERS = ("RETRYABLE_INFRA_FAILURE", "MODEL_CHECK_FAILED", "TOKENIZE_FAILED",
                   "HARNESS_PIN_FAILED")
@@ -826,8 +876,8 @@ cb_median() {{
   python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "${{CB_AGG:-0}}"
 }}
 # A width that fails is reported (BONSAICB_FAILED <c> run|gpu), never read as a regression to zero.
-# main must measure every width (measure_main_baseline); a width only the PR fails is judged in
-# eval_bonsai_on_box, over two rounds (STRIKES_TO_REJECT).
+# A width main fails is dropped for the round, loudly (measure_main_baseline does not require every
+# width); a width only the PR fails is judged in eval_bonsai_on_box, over two rounds (STRIKES_TO_REJECT).
 for CC in {cb_concs}; do
   if cb_median "$GGUF" "$CC"; then
     echo "BONSAICB $CC $CB_AGG$CB_AGGS"
@@ -1230,6 +1280,7 @@ def _run_failure(r, what: str) -> dict:
     tail = arb.failure_excerpt(r.stdout, r.stderr, _EXPLICIT_FAIL_MARKERS)
     crash = _crash_reason(r.stdout, r.stderr)
     infra = _is_infra_failure(r.stdout, r.stderr)
+    crash = crash or arb.infra_failure_line(r.stdout, r.stderr)        # the text only
     reason = f"{what} failed" + (f" — {crash}" if crash else " (no crash diagnostic captured — retried once)")
     # The tip the box fetched, when it got that far: a build failure is recorded against the
     # commit that failed to build (arb.measured_commit).
@@ -1303,7 +1354,12 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
         conflict = arb.merge_conflict_line(r.stdout, r.stderr)
         if conflict:
             # Does not merge onto the main this round measured: a rebase, not a verdict.
-            return {"ok": False, "retry": True, "conflict": True, "log": "", "reason": conflict}
+            return {"ok": False, "retry": True, "conflict": True, "log": "", "reason": conflict,
+                    "pr_tip": arb.merge_conflict_tip(r.stdout, r.stderr)}
+        ahead = arb.base_ahead_line(r.stdout, r.stderr)
+        if ahead:
+            # Rebased onto a main newer than this round's baseline: measured next round, onto it.
+            return {"ok": False, "retry": True, "log": "", "reason": ahead}
         return _run_failure(r, "PR speed/accuracy run")
     pr = _parse_remote(r.stdout or "")
     log = (r.stdout or "")[-1500:]
@@ -1402,8 +1458,8 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
         name = CB_DIM_FOR[conc]
         pr_v, main_v = _cb(pr, conc), _cb(main, conc)
         if main_v is None:
-            # measure_main_baseline refuses such a baseline; kept so a caller with a partial main
-            # still drops the axis rather than scoring it.
+            # main could not measure this width this round: the axis is dropped for the round, and
+            # the verdict table says so (measure_main_baseline does not require every width).
             cb_skipped.append(name)
             continue
         if pr_v is None:
@@ -1496,7 +1552,9 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
     if soft:
         whys = " | ".join(w for _k, w in soft)
         if label == "REJECT":
-            reason = f"{whys} | {reason}"
+            # After the REJECT's own reason: the close comment quotes the first clause, and a check
+            # that merely could not run is not what closed the PR.
+            reason = f"{reason} | {whys}"
         else:
             reject(whys)
             strike_key = "+".join(k for k, _w in soft)
@@ -1975,8 +2033,8 @@ def _axis_matrix(res: dict) -> dict:
 def upload_bonsai_eval_log(repo, num, title, oid, res):
     """Commit the result (+ Polaris receipt) to sparkinfer-log, as the sibling bots do."""
     try:
-        rid = f"bonsai-{int(num):04d}-{oid[:7]}"
         arb._ensure_log_repo()
+        rid = arb.eval_log_run_id(f"bonsai-{int(num):04d}-{oid[:7]}", res.get("onto"))
         rundir = os.path.join(arb.LOG_DIR, "runs", rid)
         os.makedirs(rundir, exist_ok=True)
         polaris = res.get("polaris") or {}
@@ -2111,7 +2169,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, body=""):
     # Mirrored to the generic eval:* label (explicit decision 2026-09-24), derived from every
     # per-bot label so a `none` here cannot erase another model's real tier.
     arb.sync_generic_eval_label(repo, num)
-    arb.gh(["pr", "comment", str(num), "-R", repo, "--body", comment])
+    arb.gh(["pr", "comment", str(num), "-R", repo, "--body", arb.fit_comment(comment)])
     if not res.get("ok"):
         return
     # Scores first: a run that dies in the (network) log upload must not leave a posted verdict the
@@ -2161,19 +2219,25 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, body=""):
             "on the next round.")
     else:
         return
-    # Not over a commit the author has already replaced: a push landing while this PR was being
-    # measured gets its own evaluation next round instead of a close for the old one.
-    try:
-        head_now = (json.loads(arb.gh(["pr", "view", str(num), "-R", repo, "--json", "headRefOid"]).stdout
-                               or "{}").get("headRefOid") or "")
-    except (json.JSONDecodeError, AttributeError):
-        head_now = ""
-    if head_now != commit:
-        print(f">> PR #{num}: not closed — head moved to {head_now[:9] or '?'} since {commit[:9]} was measured")
+    # Not over a commit the author has already replaced (a push landing while this PR was being
+    # measured gets its own evaluation next round), nor over a `hold` or a draft made meanwhile.
+    why = arb.verdict_close_blocker(repo, num, commit)
+    if why:
+        print(f">> PR #{num}: not closed — {why}")
         return
     arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
     arb.gh(["pr", "close", str(num), "-R", repo])
     print(f">> auto-closed PR #{num} (eval-bonsai:{label})")
+
+
+def _exit_if_gave_up():
+    """Exit 3 when the selection gave up on a PR after the bot's own errors (GAVE_UP), so the
+    wrapper's failed-run banner shows it -- on every way out of a run, one that then measured
+    nothing (the GPU down, the lock busy) included."""
+    if GAVE_UP:
+        print(f"!! bonsai: gave up on {', '.join(f'#{n}' for n in sorted(GAVE_UP))} after the bot's own "
+              f"errors — see above; exiting 3 so the wrapper's failed-run banner shows it")
+        sys.exit(3)
 
 
 def main():
@@ -2328,10 +2392,7 @@ def main():
     if not pending:
         reconcile_bonsai_merge_labels(args.repo, dry_run=quiet)
         print("done — no bonsai PRs to evaluate.")
-        if GAVE_UP:
-            print(f"!! bonsai: gave up on {', '.join(f'#{n}' for n in sorted(GAVE_UP))} after the bot's own "
-                  f"errors; exiting 3 so the wrapper's failed-run banner shows it")
-            sys.exit(3)
+        _exit_if_gave_up()
         return
     if args.dry_run:
         print("--- dry-run would evaluate: " + ", ".join(f"#{p[0]} ({p[3]})" for p in pending))
@@ -2347,11 +2408,13 @@ def main():
         print(f">> GPU unavailable: {e}")
         reconcile_bonsai_merge_labels(args.repo, dry_run=quiet)
         print("done — bonsai labels only (GPU down).")
+        _exit_if_gave_up()
         return
     print(f">> SSH {ssh_box_user() if ssh_box_enabled() else 'root'}@{host}:{port}")
 
     if not arb.hold_bot_lock():
         print(">> the shared bot lock stayed busy — nothing measured this run")
+        _exit_if_gave_up()
         return
     print(">> measuring main baseline (once for this round, shared across all pending PRs) …")
     try:
@@ -2378,7 +2441,7 @@ def main():
         try:
             res = eval_bonsai_on_box(host, port, ref, main_result)
         except Exception as e:
-            res = arb.exception_result(e)   # transport: retried; a 2 h hang: posted
+            res = arb.exception_result(e)   # retried; a 2 h hang charged after BOX_FAULT_STRIKES rounds
         # Recorded against the tip the box built, which a mid-round push can make differ from
         # the listed head (arb.measured_commit, #1167).
         commit, moved = arb.measured_commit(head, res)
@@ -2390,10 +2453,7 @@ def main():
 
     reconcile_bonsai_merge_labels(args.repo, dry_run=quiet)
     print("done — bonsai eval pass complete.")
-    if GAVE_UP:
-        print(f"!! bonsai: gave up on {', '.join(f'#{n}' for n in sorted(GAVE_UP))} after the bot's own errors "
-              f"— see above; exiting 3 so the wrapper's failed-run banner shows it")
-        sys.exit(3)
+    _exit_if_gave_up()
 
 
 if __name__ == "__main__":

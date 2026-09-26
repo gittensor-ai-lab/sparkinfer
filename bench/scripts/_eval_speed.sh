@@ -60,6 +60,7 @@ median_bench_metric() {
   local vals=() t rc out
   [ "${reps:-0}" -le 0 ] && { echo 0; return; }
   for _ in $(seq 1 "$reps"); do
+    rc=0                                   # per rep: one failed rep must not zero every later one
     out="$(si_run qwen3_gguf_bench "$GGUF" "$DECODE_TOKENS" "$ctx" 2>&1)" || rc=$?
     t=$(printf '%s\n' "$out" | sed -n "s/.*${pat} *: *\\([0-9.][0-9.]*\\).*/\\1/p" | tail -1 || true)
     if [ "${rc:-0}" != 0 ] || [ -z "$t" ]; then

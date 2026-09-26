@@ -26,8 +26,8 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     the Muse and Qwen3.8 bots now merge only the commit they scored, pinned to it;
   - a box fault — an unmeasured guard, a failed fetch, a compiler killed for memory, the llama.cpp
     reference failing to build — is retried with nothing posted, instead of a REJECT; a guard that
-    measured nothing on `main` skips the round; a run killed at the two-hour ssh limit is a hang,
-    posted once rather than retried every hour;
+    measured nothing on `main` skips the round; a run killed at the two-hour ssh limit is charged
+    to the PR only once it recurs at one commit, since a step of the box's own can hang too;
   - a failed build's verdict shows the compiler's error lines rather than 80 lines of `ptxas info`;
   - each bot's stale close touches only PRs for its own model: the Qwen3.8 bot had closed #1157, a
     Ternary-Bonsai PR;
@@ -80,11 +80,29 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     harness edit measured with its own ruler; no bot auto-merges a harness edit or a PR with more
     changed files than GitHub lists; a git step failing on the box is infra; a concurrent width
     only the PR build fails is a two-round REJECT on the Muse bot too, instead of being dropped;
+  - the stale clock counts a day waiting on the author, not a day since the last commit: a PR
+    queued behind the bot was closed the round it was handed back (a verdict, a `needs-rebase`, a
+    conflict someone else's merge caused), and a reopened one the next round; a `needs-rebase` left
+    from an older head, or a verified speedup waiting for the round winner to merge, no longer
+    counts as waiting on the author; `*_STALE_DAYS=0` turns the stale close off;
+  - a verdict close reads the PR again first, so a `hold` or a draft made while the round ran is
+    not closed over; one failed label read no longer drops or keeps a stale generic `eval:*`
+    label, or leaves a bot's old tier beside its new one;
+  - a PR rebased onto a newer `main` than the round's baseline is measured next round, instead of
+    merged onto the older one with `main`'s newer commits counted as its own (a false harness edit,
+    a false speedup); a conflict is remembered for the commit that conflicted; a harness marker in
+    a later step's output is not the checkout's;
+  - Qwen3.8 checks `main`'s accuracy dump against itself, so a dump the comparator cannot read
+    skips the round instead of REJECTing every PR in it, and judges a concurrency width only the
+    PR run fails over rounds; a guard the OOM killer took beside a failed accuracy gate is reported
+    as not measured, not as the failure; a re-measure keeps the earlier run's eval log; a verdict
+    comment always fits on GitHub; a run that gave up on a PR exits 3 with the GPU down too;
   - the cron wrappers run the bots from their own `origin/main` worktree (made again if it breaks,
     and never one they did not make), refuse to run without a `GH_TOKEN` (or, with
-    `SPARKINFER_BOT_LOGIN` set, with another account's), time-limit the steps before a run and the
-    run itself, and print a banner when ticks keep being refused, skipped on the lock, failing or
-    without a GPU.
+    `SPARKINFER_BOT_LOGIN` set, with another account's; `.env.eval` never stands in for an empty
+    one), time-limit the steps before a run and the run itself, keep the lock out of anything a
+    step leaves running, and print a banner when ticks keep being refused, skipped on the lock,
+    failing or without a GPU.
 - The PR template has a **Ternary-Bonsai-2-27B** target box. The Muse Glimmer and Qwen3.8 bots skip
   a PR declared for it alone, instead of scoring it `none` and closing it, and both now guard it at
   128 and 32k.

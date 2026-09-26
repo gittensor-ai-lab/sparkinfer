@@ -186,8 +186,10 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
   `<bot>-needs-rebase` and no verdict. The Muse bot used to measure the branch tip itself, so a
   branch behind `main` was charged with every speedup merged since it branched. The box checks the
   merged tip's files again: a push since the bot listed the PR that edits the bot's harness stops
-  the run (`HARNESS_TOUCHED`), with nothing posted. A PR based on a branch other than `main` is not
-  evaluated.
+  the run (`HARNESS_TOUCHED`), with nothing posted. So does a tip based on a newer `main` than the
+  round's baseline (`BASE_AHEAD`: rebased after the round measured `main`), which would otherwise
+  carry `main`'s newer commits in as its own; it is measured next round, with no strike. A PR based
+  on a branch other than `main` is not evaluated.
 - **What a verdict is for.** The PR tip the box built, measured against one `main` commit.
   - When the head moves, the bot's `eval-<model>:<tier>` from the older head is removed and the
     generic `eval:*` re-derived (dropped when no other bot's tier is left).
@@ -206,15 +208,28 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
   (`arb.none_may_close`; its own merge-first does not count). Before, the Muse and Qwen3.8 bots
   closed on every `none`, including PRs ticked "Shared" or aimed at another model. A run that
   failed never closes, and Ternary-Bonsai's two-round checks close only on their second round. No
-  bot closes a PR whose head moved after the commit it measured. The close comment asks for a new
-  commit: reopening alone does not re-run a commit that already has its verdict.
+  bot closes a PR whose head moved after the commit it measured, nor one made a draft or given
+  `hold` while the round ran: the PR is read again just before closing (`arb.verdict_close_blocker`).
+  The close comment asks for a new commit: reopening alone does not re-run a commit that already has
+  its verdict.
 - **Stale close.** Only PRs routed to that bot's model, never one carrying any bot's merge-first,
   and never a greenlit PR still waiting for that bot's first verdict on its head: that wait is the
-  bot's, not the author's -- as is a verified speedup the bot owes a re-measure onto a new `main`.
-  A PR that conflicts with `main` (GitHub's word, or that bot's own `*-needs-rebase`, which it drops
-  once the head moves; a conflict the box found is remembered for its head) or edits the harness is
-  waiting on its author; so is not a PR whose head the bot gave up on after its own errors. A GitHub
-  read that fails is "unknown" and never closes, strips or re-measures anything. The daily
+  bot's, not the author's -- as is a verified speedup the bot owes a re-measure onto a new `main`,
+  and a verified speedup sent to `*-needs-rebase` only because another PR won merge-first, until
+  that PR merges and `main` moves. A PR that conflicts with `main` (GitHub's word, or a conflict the
+  box found for this very head; a `*-needs-rebase` left from an older head is not read) or edits the
+  harness is waiting on its author; so is not a PR whose head the bot gave up on after its own
+  errors.
+  - The threshold (`*_STALE_DAYS`, a day) counts from the later of the last commit and the first
+    round the bot found the PR waiting on its author, per head (`arb.AuthorWaitClock`, in
+    `~/.sparkinfer_<bot>_author_wait.json`). A PR the bot kept waiting -- queued, then told to
+    rebase, or made to conflict by another merge -- used to close the very round it was handed back.
+    The clock restarts on a push, is dropped while the PR waits on anyone else again (the bot, a
+    `hold`, a draft, a merge-first), and ends with a close, so a reopened PR has the whole day again.
+  - `*_STALE_DAYS=0` turns the stale close off, as `SPARKINFER_STALE_PR_DAYS=0` does the daily
+    Action's; `SPARKINFER_BONSAI_AUTOCLOSE=0` turns off every Bonsai close, the stale one included.
+  - A GitHub read that fails is "unknown" and never closes, strips or re-measures anything; a label
+    read that fails changes no generic `eval:*` label. The daily
   `close-stale-prs` Action (no GitHub activity for 2 days) spares any bot's merge-first and any
   greenlit PR no model bot has posted a verdict for yet, unless GitHub says it conflicts or it edits
   paths no bot measures (`arb.NEVER_MEASURED_PATHS`).
@@ -229,7 +244,12 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
   - Beside such a fault, only a gate a busy box cannot fake (accuracy; Ternary-Bonsai's prefill path
     and `bonsai_regression.py` checks) is posted; a throughput REJECT waits for a clean run.
   - A concurrent-decode width `main` measured that the PR build could not complete is a REJECT
-    judged over two rounds on the same commit (Muse Glimmer, Ternary-Bonsai), never dropped.
+    judged over two rounds on the same commit (Muse Glimmer, Ternary-Bonsai), never dropped; on
+    Qwen3.8, whose run stops at that width, a box fault charged after three.
+  - A run killed at the two-hour ssh limit is a box fault too (a step of the box's own can hang),
+    charged to the PR as a failed run once it recurs at one commit. A guard the OOM killer took
+    beside a failed accuracy gate is reported as not measured, never as the regression that closed
+    the PR.
   - A guard `main` measured nothing for, or only zeros, skips the round; so does a Muse `main` that
     misses its own accuracy gate against llama.cpp. A llama.cpp reference server that never becomes
     healthy is infra.
@@ -249,7 +269,9 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
   `GH_TOKEN` is refused, since `gh` would otherwise act as the machine's active account; with
   `SPARKINFER_BOT_LOGIN` set in `.env.eval`, a token GitHub says belongs to any other account is
   refused too (the sync reads `.env.eval` as well; a lookup GitHub does not answer lets the tick
-  run). A `GH_TOKEN` in `.env.eval` never replaces the crontab's. A bot's tick waits up to 300 s for the shared lock, the sync not at
+  run). A `GH_TOKEN` in `.env.eval` never replaces the crontab's, nor stands in for an empty one.
+  Every git, ssh, vastai and gh step closes the lock's fd, so nothing it leaves behind (an ssh
+  ControlPersist master, a `git gc --auto`) holds the lock after the tick. A bot's tick waits up to 300 s for the shared lock, the sync not at
   all; the git and ssh steps before a run are time-limited, and a bot run is stopped after 8 hours
   (the sync after 3 minutes). Refused ticks, a bot's lock skips, failed runs and GPU-down ticks
   print a banner when they repeat, as do repeated fetch failures (the bots then run the last
@@ -404,8 +426,8 @@ it — and auto-merges it when `SPARKINFER_BONSAI_AUTOMERGE=1`, at the exact com
 **Closing** (the shared rules above; `SPARKINFER_BONSAI_AUTOCLOSE=0` turns it off): a measured
 REJECT closes the PR; a measured `none` closes it only when the PR declares Ternary-Bonsai-2-27B
 and nothing else, because this bot also evaluates every undeclared PR, most of which are aimed at
-another model; a PR routed to this model with no commits for a day (`BONSAI_STALE_DAYS`) closes as
-stale. A run that failed never closes. Each bot's stale close now
+another model; a PR routed to this model with no commits for a day (`BONSAI_STALE_DAYS`), which
+has also waited a day on its author (the shared stale clock above), closes as stale. A run that failed never closes. Each bot's stale close now
 touches only PRs routed to its own model and never one carrying any bot's merge-first label
 (`arb.stale_close_skip_reason`) — before, the Qwen3.8 bot closed #1157, a Bonsai PR.
 
@@ -457,8 +479,10 @@ diagnostic — that recurs at one commit for three rounds is then charged to the
 already failed a gate a busy box cannot fake (accuracy, the prefill path, a `bonsai_regression.py`
 check): then that REJECT is posted, naming what did not run. A PR that fails to build or crashes gets `eval-bonsai:REJECT` once for that
 commit; the verdict shows the compiler's own error lines, not the end of the log. A run killed at
-the two-hour ssh limit is a hang (main completed the same run that round): posted once, not
-retried every hour (`arb.exception_result`, all three bots).
+the two-hour ssh limit is most likely a hang in the PR (main completed the same run that round),
+but a step of the box's own can hang too, and the REJECT stays on that commit until a push: it is a
+box fault like the others, charged to the PR once it recurs at one commit for three rounds
+(`arb.exception_result`, all three bots).
 
 **Commit recorded.** A verdict names the PR tip the box fetched and built, not the head seen when
 the round listed PRs: #1167 was force-pushed mid-round on 2026-09-25, and its verdict named a

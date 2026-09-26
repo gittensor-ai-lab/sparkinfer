@@ -13,17 +13,15 @@ from unittest import mock
 
 import pr_eval_bot as bot
 
-# Nothing here may touch the controller's own state: every file the bot writes goes to a temp dir.
-import atexit as _atexit
-import shutil as _shutil
-_STATE = tempfile.mkdtemp(prefix="sparkinfer-bot-tests-")
-_atexit.register(_shutil.rmtree, _STATE, True)
-for _n in ("INSTANCE_FILE", "PIN_FILE", "BOT_LOCK_FILE"):
-    setattr(bot, _n, os.path.join(_STATE, _n))
-bot.PINNED_INSTANCE = ""
+# Nothing here may touch the controller's own state: every file the bots write goes to a temp dir.
+import _bot_test_state
 import pr_museglimmer_bot as _muse   # imported by some tests below: its state is redirected too
-for _n in ("STRIKES_FILE", "SCORES_FILE"):
-    setattr(_muse, _n, os.path.join(_STATE, "muse." + _n))
+_STATE = _bot_test_state.new_state_dir()
+_bot_test_state.isolate(_STATE, bot, _muse)
+
+
+def setUpModule():
+    _bot_test_state.isolate(_STATE, bot, _muse)
 
 
 class PrEvalBotPolicyTest(unittest.TestCase):
@@ -1120,7 +1118,7 @@ class GenericEvalLabelTest(unittest.TestCase):
     def _run(self, labels):
         """Returns (chosen_tier, final_label_set) after running the sync against `labels`."""
         state = set(labels)
-        with mock.patch.object(bot, "labels_on", return_value=set(state)), \
+        with mock.patch.object(bot, "labels_on_or_none", return_value=set(state)), \
              mock.patch.object(bot, "add_label", side_effect=lambda r, n, l: state.add(l)), \
              mock.patch.object(bot, "remove_label", side_effect=lambda r, n, l: state.discard(l)):
             got = bot.sync_generic_eval_label("o/r", 1)
@@ -1380,7 +1378,7 @@ class Round2SharedHelperTests(unittest.TestCase):
 
     def test_dropping_the_last_per_bot_tier_drops_the_generic_one_it_fed(self):
         labels = {"eval-bonsai:XL", "eval:XL"}
-        with mock.patch.object(bot, "labels_on", side_effect=lambda r, n: set(labels)), \
+        with mock.patch.object(bot, "labels_on_or_none", side_effect=lambda r, n: set(labels)), \
                 mock.patch.object(bot, "remove_label", side_effect=lambda r, n, l: labels.discard(l)), \
                 mock.patch.object(bot, "add_label", side_effect=lambda r, n, l: labels.add(l)):
             self.assertTrue(bot.strip_stale_verdict_labels(
@@ -1388,7 +1386,7 @@ class Round2SharedHelperTests(unittest.TestCase):
         self.assertEqual(labels, set())
         # Another bot's tier still there: the generic label is re-derived from it, not dropped.
         labels = {"eval-bonsai:XL", "eval-qwen38:S", "eval:XL"}
-        with mock.patch.object(bot, "labels_on", side_effect=lambda r, n: set(labels)), \
+        with mock.patch.object(bot, "labels_on_or_none", side_effect=lambda r, n: set(labels)), \
                 mock.patch.object(bot, "remove_label", side_effect=lambda r, n, l: labels.discard(l)), \
                 mock.patch.object(bot, "add_label", side_effect=lambda r, n, l: labels.add(l)):
             bot.strip_stale_verdict_labels("o/r", 1, set(labels), "eval-bonsai:", "b" * 40, {"a" * 40})
@@ -1533,9 +1531,11 @@ class Round3SharedHelperTests(unittest.TestCase):
         pr = {"number": 1, "headRefOid": "a" * 40, "labels": [{"name": "qwen38-needs-rebase"}],
               "mergeable": "MERGEABLE", "files": [{"path": "kernels/x.cu"}]}
         with mock.patch.object(bot, "greenlight_status", return_value=("ok", "x")):
-            self.assertFalse(bot.waiting_for_first_verdict("o/r", pr, set(), rebase_label="qwen38-needs-rebase"))
-            # Another bot's (the paused Bonsai's, say) may be left from an older head: not this bot's call.
-            self.assertTrue(bot.waiting_for_first_verdict("o/r", pr, set(), rebase_label="museglimmer-needs-rebase"))
+            # The bot's own merge of this head failed on the box: the rebase is the author's.
+            self.assertFalse(bot.waiting_for_first_verdict("o/r", pr, set(), box_conflict=True))
+            # A needs-rebase label alone may be left from an older head (the stale close runs before
+            # the selection drops it): a rebased PR the bot has yet to measure waits on the bot.
+            self.assertTrue(bot.waiting_for_first_verdict("o/r", pr, set()))
         # The daily Action goes by GitHub's own conflict state and the verdicts: a needs-rebase may be
         # left from an older head (the bots drop their own once the head moves).
         with mock.patch.object(bot, "greenlight_status", return_value=("ok", "x")), \
@@ -1731,6 +1731,40 @@ class MergeStepTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertTrue(bot.merge_conflict_line(r.stdout, r.stderr).startswith("MERGE_CONFLICT "))
         self.assertNotIn("PR_TIP", r.stdout)
+        # Remembered against the commit that conflicted, not the head the round listed.
+        tip = self.g("rev-parse", "HEAD", cwd=self.work).stdout.strip()
+        self.assertEqual(bot.merge_conflict_tip(r.stdout, r.stderr), tip)
+
+    def test_a_tip_based_on_a_newer_main_than_the_baseline_waits_a_round(self):
+        # The round measured main at `base`; then main moved -- a harness fix -- and the author
+        # rebased onto it before the PR's turn. Merged onto `base`, the PR would carry main's
+        # harness change in as its own (HARNESS_TOUCHED, a strike, a stale close).
+        base = self.main
+        self.g("checkout", "-q", "main", cwd=self.work)
+        with open(os.path.join(self.work, "bench/scripts/_eval_speed.sh"), "w") as fh:
+            fh.write("ruler v2\n")
+        self.g("commit", "-qam", "main moves", cwd=self.work)
+        self.g("push", "-q", "origin", "HEAD:main", cwd=self.work)
+        newer = self.g("rev-parse", "HEAD", cwd=self.work).stdout.strip()
+        self.main = newer
+        self._pr("kernel.cu", "b\n")                              # based on the newer main
+        self.main = base
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertTrue(bot.base_ahead_line(r.stdout, r.stderr).startswith("BASE_AHEAD "), r.stderr)
+        self.assertEqual(bot.harness_touched_line(r.stdout, r.stderr), "")
+        self.assertNotIn("PR_TIP", r.stdout)
+        self.main = newer                                         # the next round's baseline
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(bot.base_ahead_line(r.stdout, r.stderr), "")
+
+    def test_a_marker_in_a_later_steps_output_is_not_the_checkouts(self):
+        out = "PR_TIP " + "a" * 40 + "\nMERGED_ONTO ccccccc\nREMOTE_HEAD d\n"
+        self.assertEqual(bot.harness_touched_line(out, "HARNESS_TOUCHED eval/x.py\n"), "")
+        self.assertEqual(bot.base_ahead_line(out, "BASE_AHEAD x\n"), "")
+        self.assertEqual(bot.merge_conflict_line(out, "MERGE_CONFLICT x\n"), "")
+        self.assertTrue(bot.harness_touched_line("PR_TIP " + "a" * 40 + "\n", "HARNESS_TOUCHED eval/x.py\n"))
 
     def test_git_failing_on_the_box_is_the_boxs_and_an_old_lock_is_cleared(self):
         self._pr("kernel.cu", "b\n")
@@ -1755,6 +1789,17 @@ class BenchSweepTests(unittest.TestCase):
                       f"bench_sweep_run model 128 128 5 || true\necho RC=${{_BENCH_SWEEP_RC:-unset}}\n")
             r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
             self.assertIn(f"RC={rc}", r.stdout, r.stderr)
+
+    def test_one_failed_rep_does_not_zero_the_later_ones(self):
+        import subprocess
+        root = os.path.dirname(os.path.dirname(os.path.abspath(bot.__file__)))
+        count = os.path.join(_STATE, "reps")
+        script = (f"set -uo pipefail\nsource {root}/bench/scripts/_eval_speed.sh\n"
+                  f"si_run() {{ echo x >> {count}; [ \"$(wc -l < {count})\" -eq 1 ] && return 1; "
+                  "echo 'decode tg : 50.0'; }\ngclks=(); GGUF=m; DECODE_TOKENS=8\n"
+                  "echo MEDIAN=$(median_bench_metric 128 5 'decode tg')\n")
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertIn("MEDIAN=50.0", r.stdout, r.stderr)                 # 4 of 5 reps measured 50
 
 
 if __name__ == "__main__":

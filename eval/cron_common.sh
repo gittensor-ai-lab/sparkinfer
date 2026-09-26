@@ -36,7 +36,9 @@ _bump() {  # $1 = counter file; prints the new consecutive count
 }
 
 # Opens the shared lock on fd 9 (open_lock <bot>): a lock file this user cannot open (another user's,
-# under fs.protected_regular) used to read as "another round holds the lock" every tick.
+# under fs.protected_regular) used to read as "another round holds the lock" every tick. Every git,
+# ssh, vastai and gh step a wrapper runs closes fd 9 (9>&-): a process it leaves behind (an ssh
+# ControlPersist master, a git gc) would otherwise hold the lock after the tick and starve every bot.
 open_lock() {
   # The group keeps the 2>/dev/null to the exec: a bare `exec 9>f 2>/dev/null` would also send the
   # wrapper's own stderr -- every warning and banner -- to /dev/null for the rest of the tick.
@@ -46,9 +48,11 @@ open_lock() {
 }
 
 # The crontab passes the bot account's token; a GH_TOKEN line in .env.eval must not replace it
-# (keep_cron_token before sourcing .env.eval, restore_cron_token after).
+# (keep_cron_token before sourcing .env.eval, restore_cron_token after) -- nor stand in for an
+# empty one: `gh auth token -u <bot>` printing nothing left .env.eval's token in place, and the
+# tick ran as that account instead of being refused (require_bot_token).
 keep_cron_token() { CRON_GH_TOKEN="${GH_TOKEN:-}"; }
-restore_cron_token() { if [ -n "${CRON_GH_TOKEN:-}" ]; then export GH_TOKEN="$CRON_GH_TOKEN"; fi; }
+restore_cron_token() { export GH_TOKEN="${CRON_GH_TOKEN:-}"; }
 
 # Consecutive ticks a bot skipped on the lock. A skip is ordinary when rounds overlap, but a run
 # that never lets go looks exactly like that in the log, one quiet line an hour.
@@ -103,7 +107,7 @@ require_bot_token() {
   fi
   [ -n "${SPARKINFER_BOT_LOGIN:-}" ] || return 0
   # A failed lookup prints GitHub's error body; only a successful one is a login.
-  login="$(timeout 30 "${SPARKINFER_GH:-gh}" api user --jq .login 2>/dev/null)" || login=""
+  login="$(timeout 30 "${SPARKINFER_GH:-gh}" api user --jq .login 2>/dev/null 9>&-)" || login=""
   if [ -n "$login" ] && [ "$login" != "$SPARKINFER_BOT_LOGIN" ]; then
     note_refused "$1" "GH_TOKEN belongs to $login, not the bot account $SPARKINFER_BOT_LOGIN"
     return 1

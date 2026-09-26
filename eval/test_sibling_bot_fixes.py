@@ -14,19 +14,21 @@ import pr_museglimmer_bot as muse
 import pr_qwen38_bot as qwen
 
 # Nothing here may touch the controller's own state: every file the bots write goes to a temp dir.
-import atexit as _atexit
 import os as _os
-import shutil as _shutil
 import tempfile as _tempfile
-_STATE = _tempfile.mkdtemp(prefix="sparkinfer-bot-tests-")
-_atexit.register(_shutil.rmtree, _STATE, True)
+import _bot_test_state
 import pr_bonsai_bot as _bonsai   # imported by some tests below: its state is redirected too
-for _mod, _names in ((arb, ("INSTANCE_FILE", "PIN_FILE", "BOT_LOCK_FILE")),
-                     (muse, ("STRIKES_FILE", "SCORES_FILE")), (qwen, ("STRIKES_FILE", "SCORES_FILE")),
-                     (_bonsai, ("STRIKES_FILE", "SCORES_FILE"))):
-    for _n in _names:
-        setattr(_mod, _n, _os.path.join(_STATE, f"{_mod.__name__}.{_n}"))
-arb.PINNED_INSTANCE = ""
+_STATE = _bot_test_state.new_state_dir()
+_bot_test_state.isolate(_STATE, arb, muse, qwen, _bonsai)
+
+
+def setUpModule():
+    _bot_test_state.isolate(_STATE, arb, muse, qwen, _bonsai)
+
+
+# The author clock (arb.AuthorWaitClock) of a PR that has waited on its author since the epoch: the
+# stale-close tests below are about WHICH PRs may close; the clock has its own tests.
+_LONG_WAITED = lambda self, num, head: 0.0
 
 TEMPLATE = open(arb.os.path.join(arb.os.path.dirname(arb.os.path.dirname(arb.__file__)),
                                  ".github", "PULL_REQUEST_TEMPLATE.md")).read()
@@ -229,13 +231,14 @@ class InfraTests(unittest.TestCase):
             with self.subTest(mod.__name__):
                 self.assertIn("res = arb.exception_result(e)", src)
                 self.assertIn("main_result = measure_main_baseline(host, port)\n    except Exception", src)
-        # A transport failure is retried; a run killed at the ssh limit is a hang, posted once with a
-        # label in its marker so it is not re-run every round.
+        # A transport failure is retried; so is a run killed at the ssh limit, charged to the PR only
+        # once it recurs at one commit (a step of the box's own can hang too).
         self.assertTrue(arb.exception_result(ConnectionResetError("x"))["retry"])
         hang = arb.exception_result(subprocess.TimeoutExpired("ssh", 7200))
-        self.assertFalse(hang["retry"])
+        self.assertEqual((hang["retry"], hang["strike_key"]), (True, "timeout"))
         for mod in (muse, qwen):
-            self.assertIn('"label":"REJECT"', mod.format_comment("a" * 40, hang), mod.__name__)
+            charged = dict(hang, retry=False)
+            self.assertIn('"label":"REJECT"', mod.format_comment("a" * 40, charged), mod.__name__)
 
     def test_a_guard_that_measured_nothing_retries_on_muse(self):
         # Only the Ternary-Bonsai guard used to take the infra path; the ModelOpt, unsloth and
@@ -385,6 +388,8 @@ class SelectionTests(unittest.TestCase):
                    {"number": 4, "body": TEMPLATE, "isDraft": True, "labels": []}]
             calls = []
             with self.subTest(mod.__name__), mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
+                    mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
+                    mock.patch.object(mod, _e.__name__, return_value=set()), \
                     mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run()):
                 self.assertEqual(close_stale("o/r", prs), {1})
                 self.assertFalse(any("push a new commit / open" in " ".join(c) for c in calls))
@@ -405,7 +410,8 @@ class ReviewFixTests(unittest.TestCase):
             "REMOTE_SHA " + "b" * 40, "RESULT_DECODE128_TPS 80", "RESULT_PREFILL128_PP 4000",
             "RESULT_PREFILL16K_PP 8000"] + [f"RESULT_CB{c}_AGG {100 * c}" for c in qwen.CB_CONCS] + [
             "GUARD36 32768 50 900", "GUARDMO 32768 60 7000", "GUARDCBMO 16 800", "GUARDCBMO 32 1000",
-            "GUARDMG_UNAVAILABLE", "GUARDBN 128 99 2000", "GUARDBN 32768 89 6500", "GUARD_END"]) + "\n"
+            "GUARDMG_UNAVAILABLE", "GUARDBN 128 99 2000", "GUARDBN 32768 89 6500", "GUARD_END",
+            "SELFCHECK top1=1.000000 kl=0.000000 ppl_pr=1.0 ppl_main=1.0"]) + "\n"
         with mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(stdout)):
             self.assertTrue(qwen.measure_main_baseline("h", 1)["ok"])     # an absent checkpoint is fine
         without = stdout.replace("GUARDBN 128 99 2000\nGUARDBN 32768 89 6500\n", "GUARDBN_FAILED\n")
@@ -510,6 +516,7 @@ class StaleAndFreshnessTests(unittest.TestCase):
                    {"number": 2, "body": TEMPLATE, "isDraft": False, "labels": [], "headRefOid": "b" * 40}]
             ev = "museglimmer_evaluated_commits" if mod is muse else "qwen38_evaluated_commits"
             with self.subTest(mod.__name__), mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
+                    mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
                     mock.patch.object(mod, ev, side_effect=lambda r, n: {"b" * 40}), \
                     mock.patch.object(arb, "greenlight_status", return_value=("ok", "claims a gain")), \
                     mock.patch.object(arb, "gh", return_value=run()):
@@ -517,6 +524,7 @@ class StaleAndFreshnessTests(unittest.TestCase):
                 self.assertEqual(close_stale("o/r", prs), {2})
             with self.subTest(mod.__name__, greenlit=False), \
                     mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
+                    mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
                     mock.patch.object(mod, ev, return_value=set()), \
                     mock.patch.object(arb, "greenlight_status", return_value=("unchecked", "box not ticked")), \
                     mock.patch.object(arb, "gh", return_value=run()):
@@ -948,12 +956,14 @@ class Round3Tests(unittest.TestCase):
             prs = [{"number": 7, "body": TEMPLATE, "isDraft": False, "labels": [{"name": f"eval-{tag}:XL"}],
                     "headRefOid": "a" * 40}]
             with self.subTest(tag), mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
+                    mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
                     mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
                     mock.patch.object(mod, "_remeasure_against_new_main", return_value=True), \
                     mock.patch.object(mod, "_unmeasurable_reason", return_value=None), \
                     mock.patch.object(arb, "gh", return_value=run()):
                 self.assertEqual(getattr(mod, f"close_stale_{tag}_prs")("o/r", prs), set())
             with self.subTest(tag, case="not owed"), mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
+                    mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
                     mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
                     mock.patch.object(mod, "_remeasure_against_new_main", return_value=False), \
                     mock.patch.object(mod, f"{tag}_evaluated_commits", return_value={"a" * 40}), \
@@ -1018,13 +1028,20 @@ class Round4Tests(unittest.TestCase):
 
 
 class IsolationTests(unittest.TestCase):
-    def test_no_state_file_points_outside_this_suites_temp_dir(self):
-        # A test once recorded a strike in the controller's real ~/.sparkinfer_bonsai_strikes.json.
+    def test_no_state_path_points_at_the_controllers_state(self):
+        # A test once recorded a strike in the controller's real ~/.sparkinfer_bonsai_strikes.json,
+        # and another wrote the stale clock's file there: every state path is covered by pattern.
+        home = _os.path.expanduser("~/.sparkinfer_")
         for mod in (arb, muse, qwen, _bonsai):
-            for name in ("STRIKES_FILE", "SCORES_FILE", "INSTANCE_FILE", "PIN_FILE", "BOT_LOCK_FILE"):
-                if hasattr(mod, name):
-                    # Any suite's temp dir: run together, the last suite imported sets the shared globals.
-                    self.assertTrue(getattr(mod, name).startswith(_tempfile.gettempdir()), (mod.__name__, name))
+            for name in dir(mod):
+                value = getattr(mod, name)
+                if name.isupper() and isinstance(value, str):
+                    self.assertFalse(value.startswith(home), (mod.__name__, name, value))
+                    self.assertNotIn(value, {"/tmp/sparkinfer_bot.lock", _os.environ.get("SPARKINFER_LOCK_FILE")},
+                                     (mod.__name__, name))
+        for mod, name in ((muse, "AUTHOR_WAIT_FILE"), (qwen, "AUTHOR_WAIT_FILE"), (_bonsai, "AUTHOR_WAIT_FILE"),
+                          (arb, "LOG_DIR"), (arb, "BOT_LOCK_FILE")):
+            self.assertTrue(getattr(mod, name).startswith(_STATE), (mod.__name__, name))   # this suite's own
 
 
 class Round5Tests(unittest.TestCase):
@@ -1037,6 +1054,7 @@ class Round5Tests(unittest.TestCase):
         prs = [{"number": 7, "body": TEMPLATE, "isDraft": False, "labels": [{"name": f"eval-{tag}:XL"}],
                 "headRefOid": "a" * 40}]
         with mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
+                mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
                 mock.patch.object(arb, "gh", return_value=run()), \
                 mock.patch.object(mod, f"{tag}_evaluated_commits", return_value={"a" * 40}):
             ctx = [mock.patch.object(*p) for p in patches.get("extra", ())]
@@ -1442,6 +1460,348 @@ class Iteration3cTests(unittest.TestCase):
         s = arb.merged_checkout_script("pull/1/head", MAIN)
         self.assertIn("git ls-files -u", s)
         self.assertIn("RETRYABLE_INFRA_FAILURE git merge failed without a conflict", s)
+
+
+
+DAY = 86400.0
+BONSAI_ONLY = TEMPLATE.replace("- [ ] **Ternary-Bonsai-2-27B**", "- [x] **Ternary-Bonsai-2-27B**")
+
+
+def qwen_stdout(top1="0.999", kl="0.001", drop=(), extra=()):
+    """What a complete Qwen3.8 run prints (main's self-check included; a PR run ignores it)."""
+    lines = ["PR_TIP " + "a" * 40, "REMOTE_SHA " + MAIN, "RESULT_DECODE128_TPS 80", "RESULT_PREFILL128_PP 4000",
+             "RESULT_PREFILL16K_PP 8000"] + [f"RESULT_CB{c}_AGG {100 * c}" for c in qwen.CB_CONCS] + [
+             f"METRIC top1={top1} kl={kl} ppl_pr=1.0 ppl_main=1.0",
+             "SELFCHECK top1=1.000000 kl=0.000000 ppl_pr=1.0 ppl_main=1.0",
+             "GUARD36 32768 50 900", "GUARDMO 32768 60 7000", "GUARDCBMO 16 800", "GUARDCBMO 32 1000",
+             "GUARDMG_UNAVAILABLE", "GUARDBN 128 99 2000", "GUARDBN 32768 89 6500", "GUARD_END"]
+    return "\n".join([l for l in lines if not any(l.startswith(d) for d in drop)] + list(extra)) + "\n"
+
+
+class Iteration4Tests(unittest.TestCase):
+    """Fixes from the post-merge review of main f9150ab, on all three bots."""
+
+    def _bots(self):
+        return Round3Tests._bots(self)
+
+    def setUp(self):
+        for mod, _tag, _r in self._bots():
+            if _os.path.exists(mod.AUTHOR_WAIT_FILE):
+                _os.remove(mod.AUTHOR_WAIT_FILE)
+
+    def _pr(self, num=7, head="a" * 40, labels=(), **over):
+        pr = {"number": num, "title": "t", "labels": [{"name": l} for l in labels], "isDraft": False,
+              "headRefOid": head, "baseRefName": "main", "mergeable": "MERGEABLE", "body": TEMPLATE,
+              "files": [{"path": "kernels/x.cu"}], "changedFiles": 1}
+        pr.update(over)
+        return pr
+
+    def _stale(self, mod, tag, prs, now=10 * DAY, evaluated=(), scores=None, main=MAIN, dry_run=False):
+        """The stale close on the real clock file (this suite's temp dir); the last commit is at 0."""
+        with mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
+                mock.patch.object(mod.time, "time", return_value=now), \
+                mock.patch.object(arb, "gh", return_value=run()), \
+                mock.patch.object(arb, "current_main_sha", return_value=main), \
+                mock.patch.object(arb, "greenlight_status", return_value=("ok", "claims a gain")), \
+                mock.patch.object(mod, "_load_scores", return_value=scores or {}), \
+                mock.patch.object(mod, f"{tag}_evaluated_commits", return_value=set(evaluated)), \
+                mock.patch("builtins.print"):
+            return getattr(mod, f"close_stale_{tag}_prs")("o/r", prs, dry_run=dry_run)
+
+    def _clock(self, mod):
+        with open(mod.AUTHOR_WAIT_FILE) as f:
+            return json.load(f)
+
+    def test_an_old_heads_needs_rebase_does_not_close_a_rebased_pr_the_bot_owes_a_verdict(self):
+        for mod, tag, rebase in self._bots():
+            with self.subTest(tag), mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED):
+                pr = self._pr(labels=[rebase])       # left from an older head; the strip runs later
+                self.assertEqual(self._stale(mod, tag, [pr]), set())
+                # The box found that THIS head does not merge: the rebase is its author's.
+                arb.record_strike(mod.STRIKES_FILE, 7, "a" * 40, "conflict")
+                self.addCleanup(arb.clear_strikes, mod.STRIKES_FILE, 7)
+                self.assertEqual(self._stale(mod, tag, [pr]), {7})
+                arb.clear_strikes(mod.STRIKES_FILE, 7)
+
+    def test_the_stale_clock_starts_when_the_pr_is_handed_to_its_author(self):
+        for mod, tag, _r in self._bots():
+            with self.subTest(tag):
+                pr, done = self._pr(), {"a" * 40}   # its verdict is posted: it waits on its author
+                # Its last commit is ten days old, but it has only just been handed back.
+                self.assertEqual(self._stale(mod, tag, [pr], now=10 * DAY, evaluated=done), set())
+                self.assertEqual(self._clock(mod)["7"], {"head": "a" * 40, "since": 10 * DAY})
+                self.assertEqual(self._stale(mod, tag, [pr], now=10.9 * DAY, evaluated=done), set())
+                self.assertEqual(self._stale(mod, tag, [pr], now=11.1 * DAY, evaluated=done), {7})
+                # A close ends its clock: reopened, the PR has the whole period again.
+                self.assertNotIn("7", self._clock(mod))
+                self.assertEqual(self._stale(mod, tag, [pr], now=11.5 * DAY, evaluated=done), set())
+
+    def test_a_pr_handed_back_within_the_day_closes_a_day_later_not_two(self):
+        # The last commit is at 0. Its verdict lands in the round at 1 h; from the 2 h round on it waits
+        # on its author. The clock used to start only once the commit was a day old: closed at 48 h.
+        H = DAY / 24
+        for mod, tag, _r in self._bots():
+            with self.subTest(tag):
+                self.assertEqual(self._stale(mod, tag, [self._pr()], now=1 * H, evaluated=set()), set())
+                self.assertEqual(self._stale(mod, tag, [self._pr()], now=2 * H, evaluated={"a" * 40}), set())
+                self.assertEqual(self._clock(mod)["7"]["since"], 2 * H)
+                self.assertEqual(self._stale(mod, tag, [self._pr()], now=25 * H, evaluated={"a" * 40}), set())
+                self.assertEqual(self._stale(mod, tag, [self._pr()], now=26 * H, evaluated={"a" * 40}), {7})
+
+    def test_a_push_a_wait_on_the_bot_or_a_hold_restarts_the_clock(self):
+        for mod, tag, _r in self._bots():
+            with self.subTest(tag):
+                self._stale(mod, tag, [self._pr()], now=10 * DAY, evaluated={"a" * 40})
+                pushed = self._pr(head="b" * 40)
+                self.assertEqual(self._stale(mod, tag, [pushed], now=11.5 * DAY, evaluated={"b" * 40}), set())
+                self.assertEqual(self._clock(mod)["7"]["since"], 11.5 * DAY)       # a new head, a new clock
+                # Greenlit with no verdict on its head: back with the bot, so the clock is dropped ...
+                self.assertEqual(self._stale(mod, tag, [pushed], now=12 * DAY, evaluated=set()), set())
+                self.assertNotIn("7", self._clock(mod))
+                # ... and a `hold` drops it too.
+                self._stale(mod, tag, [pushed], now=12.5 * DAY, evaluated={"b" * 40})
+                self._stale(mod, tag, [self._pr(head="b" * 40, labels=["hold"])], now=13 * DAY, evaluated={"b" * 40})
+                self.assertNotIn("7", self._clock(mod))
+                self.assertEqual(self._stale(mod, tag, [pushed], now=13.5 * DAY, evaluated={"b" * 40}), set())
+
+    def test_the_clock_forgets_closed_prs_and_a_dry_run_writes_nothing(self):
+        for mod, tag, _r in self._bots():
+            with self.subTest(tag):
+                self._stale(mod, tag, [self._pr(), self._pr(num=8)], evaluated={"a" * 40}, dry_run=True)
+                self.assertFalse(_os.path.exists(mod.AUTHOR_WAIT_FILE))
+                self._stale(mod, tag, [self._pr(), self._pr(num=8)], evaluated={"a" * 40})
+                self.assertEqual(set(self._clock(mod)), {"7", "8"})
+                self._stale(mod, tag, [self._pr()], evaluated={"a" * 40})      # #8 is no longer open
+                self.assertEqual(set(self._clock(mod)), {"7"})
+
+    def test_a_ranking_loser_waits_for_the_winners_merge_not_on_its_author(self):
+        for mod, tag, rebase in self._bots():
+            pr = self._pr(labels=[rebase, f"eval-{tag}:L"])
+            scores = {"7": {"commit": "a" * 40, "label": "L", "pass": True, "onto": MAIN}}
+            with self.subTest(tag), mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED):
+                # Main has not moved since its verdict: there is nothing to rebase onto yet.
+                self.assertEqual(self._stale(mod, tag, [pr], evaluated={"a" * 40}, scores=scores), set())
+                # The winner merged and main moved: the rebase is its author's now.
+                self.assertEqual(self._stale(mod, tag, [pr], evaluated={"a" * 40}, scores=scores, main="d" * 40), {7})
+                # A conflict is its author's at once.
+                self.assertEqual(self._stale(mod, tag, [dict(pr, mergeable="CONFLICTING")], evaluated={"a" * 40},
+                                             scores=scores), {7})
+
+    def test_a_zero_threshold_or_autoclose_off_closes_nothing(self):
+        for mod, tag, _r in self._bots():
+            with self.subTest(tag), mock.patch.object(mod, "STALE_DAYS", 0.0), \
+                    mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED):
+                self.assertEqual(self._stale(mod, tag, [self._pr()], evaluated={"a" * 40}), set())
+        with mock.patch.object(_bonsai, "AUTO_CLOSE", False), mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED):
+            self.assertEqual(self._stale(_bonsai, "bonsai", [self._pr()], evaluated={"a" * 40}), set())
+
+    def _verdict_close(self, mod, tag, view):
+        calls = []
+
+        def fake_gh(a):
+            calls.append(a)
+            return run(json.dumps(view)) if a[:2] == ["pr", "view"] else run()
+        res = {"ok": True, "label": "REJECT", "delta_pct": -9.0, "pass": False, "accuracy_ok": True,
+               "reason": "decode@128 regressed"}
+        kw = {"body": BONSAI_ONLY} if tag == "bonsai" else {"pr_body": TEMPLATE}
+        with mock.patch.object(arb, "gh", side_effect=fake_gh), \
+                mock.patch.object(arb, "add_label"), mock.patch.object(arb, "remove_label"), \
+                mock.patch.object(arb, "sync_generic_eval_label"), \
+                mock.patch.object(arb, "labels_on_or_none", return_value=set()), \
+                mock.patch.object(mod, f"strip_{tag}_eval_labels"), \
+                mock.patch.object(mod, f"upload_{tag}_eval_log"), \
+                mock.patch.object(mod, "format_comment", return_value="the verdict comment"), \
+                mock.patch.object(mod, "_load_scores", return_value={}), \
+                mock.patch.object(mod, "_save_scores"), \
+                mock.patch("builtins.print"):
+            if tag == "bonsai":
+                with mock.patch.object(mod, "AUTO_CLOSE", True):
+                    mod.apply_result("o/r", 1, "a" * 40, res, **kw)
+            else:
+                mod.apply_result("o/r", 1, "a" * 40, res, **kw)
+        return any(c[:2] == ["pr", "close"] for c in calls)
+
+    def test_a_hold_or_draft_made_while_the_round_ran_is_not_closed_over(self):
+        base = {"headRefOid": "a" * 40, "state": "OPEN", "isDraft": False, "labels": []}
+        for mod, tag, _r in self._bots():
+            with self.subTest(tag):
+                self.assertTrue(self._verdict_close(mod, tag, base))
+                for view in (dict(base, labels=[{"name": "hold"}]), dict(base, isDraft=True),
+                             dict(base, headRefOid="b" * 40), dict(base, state="CLOSED"), {}):
+                    self.assertFalse(self._verdict_close(mod, tag, view), view)
+
+    def test_an_unread_label_set_never_changes_a_generic_label(self):
+        seen = []
+        with mock.patch.object(arb, "labels_on_or_none", return_value=None), \
+                mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: seen.append("-" + l)), \
+                mock.patch.object(arb, "add_label", side_effect=lambda r, n, l: seen.append("+" + l)):
+            self.assertIs(arb.sync_generic_eval_label("o/r", 1), False)
+        self.assertEqual(seen, [])
+        # The sync's read fails and the strip's own succeeds: eval:XL, still backed by Muse's XL, stays.
+        for strip in (lambda labs: arb.strip_stale_verdict_labels("o/r", 1, set(labs), "eval-qwen38:", "b" * 40,
+                                                                  {"a" * 40}),
+                      lambda labs: arb.strip_foreign_stale_labels("o/r", 1, set(labs), "b" * 40, "eval-bonsai:")):
+            labels = {"eval-museglimmer:XL", "eval:XL", "eval-qwen38:none"}
+            reads = iter([None, set(labels)])
+            with mock.patch.object(arb, "labels_on_or_none", side_effect=lambda r, n: next(reads)), \
+                    mock.patch.object(arb, "bot_verdict_heads", return_value={"qwen38": {"a" * 40}}), \
+                    mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: labels.discard(l)), \
+                    mock.patch.object(arb, "add_label", side_effect=lambda r, n, l: labels.add(l)):
+                strip(set(labels))
+            self.assertEqual(labels, {"eval-museglimmer:XL", "eval:XL"})
+
+    def test_a_bots_own_tier_is_removed_even_when_the_labels_cannot_be_read(self):
+        for mod, tag, _r in self._bots():
+            removed = []
+            with self.subTest(tag), mock.patch.object(arb, "labels_on_or_none", return_value=None), \
+                    mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: removed.append(l)):
+                getattr(mod, f"strip_{tag}_eval_labels")("o/r", 1)
+            self.assertEqual(set(removed), {f"eval-{tag}:{t}" for t in arb.GENERIC_TIER_RANK})
+            removed = []
+            with mock.patch.object(arb, "labels_on_or_none", return_value={f"eval-{tag}:XL", "eval:XL", "hold"}), \
+                    mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: removed.append(l)):
+                getattr(mod, f"strip_{tag}_eval_labels")("o/r", 1)
+            self.assertEqual(removed, [f"eval-{tag}:XL"])
+
+    def test_a_run_that_gave_up_on_a_pr_exits_3_with_the_gpu_down_or_the_lock_busy(self):
+        prs = [Iteration3cTests._pr(self, number=5), Iteration3cTests._pr(self, number=6, headRefOid="b" * 40)]
+        for mod, tag, _r in self._bots():
+            self.addCleanup(mod.GAVE_UP.clear)
+            self.addCleanup(arb.clear_strikes, mod.STRIKES_FILE, 5)
+            for _ in range(arb.BOX_FAULT_STRIKES):
+                arb.record_strike(mod.STRIKES_FILE, 5, "a" * 40, "error")
+            with self.subTest(tag, case="gpu down"):
+                code, out = Iteration3Tests._run_main(self, mod, tag, run(json.dumps(prs)), argv=("--only-prs", "5,6"))
+                self.assertIn("GPU down", out)
+                self.assertEqual(code, 3)
+            mod.GAVE_UP.clear()
+            with self.subTest(tag, case="lock busy"):
+                code, out = Iteration3Tests._run_main(
+                    self, mod, tag, run(json.dumps(prs)), argv=("--only-prs", "5,6"),
+                    extra=((mod, "resolve_ssh", mock.Mock(return_value=("h", 1))),
+                           (arb, "hold_bot_lock", mock.Mock(return_value=False))))
+                self.assertIn("lock stayed busy", out)
+                self.assertEqual(code, 3)
+            mod.GAVE_UP.clear()
+
+    def test_qwen38_checks_mains_score_dump_against_itself(self):
+        m = qwen._remote_script("main", role="main")
+        self.assertIn("--metric-label SELFCHECK", m)
+        self.assertIn("IS_PR=0", m)                   # main takes the self-check branch, a PR the compare
+        with mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(qwen_stdout())):
+            self.assertTrue(qwen.measure_main_baseline("h", 1)["ok"])
+        for bad in (qwen_stdout(drop=("SELFCHECK",)),
+                    qwen_stdout(drop=("SELFCHECK",), extra=("SELFCHECK top1=0 kl=99 ppl_pr=0 ppl_main=0",))):
+            with mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(bad)):
+                m = qwen.measure_main_baseline("h", 1)
+            self.assertFalse(m["ok"])
+            self.assertIn("self-comparison", m["reason"])
+
+    def test_a_guard_the_oom_killer_took_beside_a_failed_accuracy_gate_is_not_blamed(self):
+        main = WiringTests._main(self)
+        stdout = muse_stdout(top1="0.2", kl="2.0", drop=("GUARDMO ",)) + "GUARDMO_FAILED rc=137\n"
+        with mock.patch.object(muse, "POLARIS_ENABLED", False), \
+                mock.patch.object(muse, "_ssh_run_resilient", return_value=run(stdout)):
+            res = muse.eval_museglimmer_on_box("h", 1, "pull/1/head", main)
+        self.assertEqual((res["label"], res["modelopt_guard_ok"], res["guards_killed"]), ("REJECT", True, ["modelopt"]))
+        self.assertNotIn("modelopt no-regression guard failed", res["reason"])
+        self.assertIn("NOT MEASURED", muse.format_comment("a" * 40, res))
+        with mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(qwen_stdout())):
+            qmain = qwen.measure_main_baseline("h", 1)
+        stdout = qwen_stdout(top1="0.2", kl="2.0", drop=("GUARD36 ",), extra=("GUARD36_FAILED rc=137",))
+        with mock.patch.object(qwen, "POLARIS_ENABLED", False), \
+                mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(stdout)):
+            qres = qwen.eval_qwen38_on_box("h", 1, "pull/1/head", qmain)
+        self.assertEqual((qres["label"], qres["q36_guard_ok"], qres["guards_killed"]), ("REJECT", True, ["qwen3.6"]))
+        self.assertNotIn("qwen3.6 no-regression guard failed", qres["reason"])
+        self.assertIn("NOT MEASURED", qwen.format_comment("a" * 40, qres))
+        # The close comment names the accuracy gate, which is what failed.
+        for mod, tag, r in ((muse, "museglimmer", res), (qwen, "qwen38", qres)):
+            calls = []
+
+            def fake_gh(a):
+                calls.append(a)
+                return run(json.dumps({"headRefOid": "a" * 40})) if a[:2] == ["pr", "view"] else run()
+            with self.subTest(tag), mock.patch.object(arb, "gh", side_effect=fake_gh), \
+                    mock.patch.object(arb, "add_label"), mock.patch.object(arb, "remove_label"), \
+                    mock.patch.object(arb, "sync_generic_eval_label"), \
+                    mock.patch.object(mod, f"upload_{tag}_eval_log"), mock.patch.object(mod, "_save_scores"), \
+                    mock.patch("builtins.print"):
+                mod.apply_result("o/r", 1, "a" * 40, dict(r, delta_pct=r.get("delta_pct") or 0.0), pr_body=TEMPLATE)
+            close = next(" ".join(c) for c in calls if "auto-close -->" in " ".join(c))
+            self.assertIn("failed the accuracy gate", close)
+            self.assertNotIn("guard", close.split("Every")[0])
+
+    def test_bonsai_quotes_the_rejects_own_reason_first(self):
+        with open(_bonsai.__file__) as f:
+            self.assertIn('reason = f"{reason} | {whys}"', f.read())
+
+    def test_a_re_measure_onto_a_new_main_gets_its_own_eval_log_run(self):
+        with mock.patch.object(arb, "LOG_DIR", _os.path.join(_STATE, "log")):
+            base = "qwen38-0007-aaaaaaa"
+            self.assertEqual(arb.eval_log_run_id(base, MAIN), base)
+            run_dir = _os.path.join(arb.LOG_DIR, "runs", base)
+            _os.makedirs(run_dir, exist_ok=True)
+            with open(_os.path.join(run_dir, "result.json"), "w") as f:
+                json.dump({"measured_onto": MAIN}, f)
+            self.assertEqual(arb.eval_log_run_id(base, MAIN), base)                    # the same run again
+            self.assertEqual(arb.eval_log_run_id(base, "d" * 40), base + "-onddddddd")  # a re-measure
+            with open(_os.path.join(run_dir, "result.json"), "w") as f:
+                json.dump({}, f)                                                         # from before the field
+            self.assertEqual(arb.eval_log_run_id(base, "d" * 40), base)
+
+    def test_a_conflict_is_remembered_for_the_commit_that_conflicted(self):
+        err = "MERGE_CONFLICT_TIP " + "b" * 40 + "\nMERGE_CONFLICT bbbbbbb does not merge cleanly onto ccccccc\n"
+        self.assertEqual(arb.merge_conflict_tip("", err), "b" * 40)
+        self.assertEqual(arb.merge_conflict_tip("PR_TIP " + "b" * 40, err), "")          # not where it stopped
+        self.assertIn("MERGE_CONFLICT_TIP", arb.merged_checkout_script("pull/1/head", MAIN))
+        for mod, tag, _r in self._bots():
+            ev = {"museglimmer": "eval_museglimmer_on_box", "qwen38": "eval_qwen38_on_box",
+                  "bonsai": "eval_bonsai_on_box"}[tag]
+            with self.subTest(tag), mock.patch.object(mod, "_ssh_run_resilient", return_value=run("", 1, err)):
+                res = getattr(mod, ev)("h", 1, "pull/1/head", {"sha": MAIN})
+            self.assertTrue(res.get("conflict"), res)
+            self.assertEqual(arb.measured_commit("a" * 40, res), ("b" * 40, True))
+
+    def test_the_boxs_own_failures_are_read_as_the_boxs(self):
+        self.assertTrue(_bonsai._is_infra_failure("", "HARNESS_PIN_FAILED -- could not take the harness from x\n"))
+        self.assertTrue(_bonsai._is_infra_failure("", "TOKENIZE_FAILED\n"))
+        # A fault charged after BOX_FAULT_STRIKES rounds names its cause, not "no diagnostic".
+        err = "RETRYABLE_INFRA_FAILURE build: Killed signal terminated program cc1plus\n"
+        self.assertEqual(arb.infra_failure_line("", err), err.strip())
+        with mock.patch.object(muse, "_ssh_run_resilient", return_value=run("PR_TIP " + "a" * 40 + "\n", 1, err)):
+            res = muse.eval_museglimmer_on_box("h", 1, "pull/1/head", {"sha": MAIN})
+        self.assertIn("Killed signal", res["reason"])
+        # Qwen3.8: a width only the PR run could not complete is judged over rounds, not REJECTed once.
+        cb = "RETRYABLE_INFRA_FAILURE concurrent decode failed at c=32 (see above)\n"
+        with mock.patch.object(qwen, "_ssh_run_resilient", return_value=run("PR_TIP " + "a" * 40 + "\n", 75, cb)):
+            q = qwen.eval_qwen38_on_box("h", 1, "pull/1/head", {"sha": MAIN})
+        self.assertEqual((q["retry"], q["strike_key"]), (True, "cb"))
+
+    def test_a_pr_based_on_a_newer_main_waits_a_round_with_no_strike(self):
+        err = "BASE_AHEAD bbbbbbb is based on main ddddddd, newer than this round's baseline ccccccc\n"
+        for mod, tag, _r in self._bots():
+            ev = {"museglimmer": "eval_museglimmer_on_box", "qwen38": "eval_qwen38_on_box",
+                  "bonsai": "eval_bonsai_on_box"}[tag]
+            with self.subTest(tag), mock.patch.object(mod, "ssh_run", return_value=run("", 1, err)) as ssh, \
+                    mock.patch("builtins.print"):
+                res = getattr(mod, ev)("h", 1, "pull/1/head", {"sha": MAIN})
+            self.assertEqual((res["ok"], res["retry"], res.get("strike_key")), (False, True, None), res)
+            self.assertEqual(ssh.call_count, 1)             # stopped on purpose: not a hard kill to retry
+            calls = []
+            with mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run()), \
+                    mock.patch.object(arb, "add_label", side_effect=lambda *a: calls.append(a)), \
+                    mock.patch("builtins.print"):
+                mod.apply_result("o/r", 1, "a" * 40, res)
+            self.assertEqual(calls, [])
+            self.assertEqual(arb.strike_count(mod.STRIKES_FILE, 1, "a" * 40, "box"), 0)
+
+    def test_a_verdict_comment_always_fits_on_github(self):
+        body = "<!-- marker -->\n" + "x" * 100000
+        fitted = arb.fit_comment(body)
+        self.assertLessEqual(len(fitted), arb.COMMENT_LIMIT)
+        self.assertTrue(fitted.startswith("<!-- marker -->"))
+        self.assertEqual(arb.fit_comment("short"), "short")
 
 
 if __name__ == "__main__":

@@ -251,6 +251,42 @@ class WrapperTests(unittest.TestCase):
             f.write("GH_TOKEN=someone-elses\n")
         r, bots = self.tick(token="bot-token")
         self.assertEqual(bots[0]["token"], "bot-token")
+        # An empty crontab token (`gh auth token -u <bot>` printed nothing) is refused, not made
+        # up for by .env.eval's.
+        for w in ("run_bonsai_pr_cron.sh", "run_museglimmer_cron.sh", "run_qwen38_cron.sh", "run_sync_cron.sh"):
+            r, bots = self.tick(wrapper=w, token="", GH_TOKEN="")
+            self.assertEqual((r.returncode, bots), (1, []), w)
+            self.assertIn("GH_TOKEN is empty", r.stderr, w)
+            self.assertNotIn("SYNC", r.stdout, w)
+
+    def test_a_bot_tree_at_home_or_at_the_repository_is_refused(self):
+        for where in (self.home, self.repo, self.home + "/"):
+            before = sorted(os.listdir(where))
+            r, bots = self.tick(SPARKINFER_BOT_TREE=where)
+            self.assertEqual((r.returncode, bots), (1, []), where)
+            self.assertIn("SPARKINFER_BOT_TREE must be a directory of its own", r.stderr, where)
+            self.assertEqual(sorted(x for x in os.listdir(where) if not x.startswith(".sparkinfer_")),
+                             sorted(x for x in before if not x.startswith(".sparkinfer_")), where)
+
+    def test_no_step_that_can_outlive_the_tick_keeps_the_lock_open(self):
+        # A process a step leaves behind -- `git gc --auto` after a fetch or a merge, an ssh
+        # ControlPersist master -- would hold the shared lock after the tick if it inherited fd 9.
+        # Read from the sources: the wrappers put /usr/bin ahead of any shim on PATH.
+        import re
+        step = re.compile(r'(?:^|[;&|(`]\s*|\$\(\s*|timeout\s+\S+\s+|!\s+)'
+                          r'(git\b[^;|&]*\b(fetch|merge|checkout|worktree|clean)\b|ssh\s|vastai\s|"\$\{SPARKINFER_GH:-gh\}")')
+        found = 0
+        for w in WRAPPERS:
+            with open(os.path.join(HERE, w)) as f:
+                src = f.read().replace("\\\n", " ")              # continued lines as one
+            for line in src.splitlines():
+                if line.strip().startswith(("#", "echo")):
+                    continue
+                for part in re.split(r"&&|\|\||;", line):
+                    if step.search(part.strip()):
+                        found += 1
+                        self.assertIn("9>&-", part, (w, line.strip()))
+        self.assertGreaterEqual(found, 15)
 
     def test_a_lock_file_that_cannot_be_opened_is_named_as_such(self):
         os.makedirs(self.lock)                                       # not a file: exec 9> fails

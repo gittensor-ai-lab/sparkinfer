@@ -10,18 +10,20 @@ import pr_museglimmer_bot as muse_bot
 import pr_qwen38_bot as qwen38_bot
 
 # Nothing here may touch the controller's own state: every file the bots write goes to a temp dir.
-import atexit as _atexit
 import os as _os
-import shutil as _shutil
 import tempfile as _tempfile
-_STATE = _tempfile.mkdtemp(prefix="sparkinfer-bot-tests-")
-_atexit.register(_shutil.rmtree, _STATE, True)
-for _mod, _names in ((arb, ("INSTANCE_FILE", "PIN_FILE", "BOT_LOCK_FILE")),
-                     (bot, ("STRIKES_FILE", "SCORES_FILE")),
-                     (muse_bot, ("STRIKES_FILE", "SCORES_FILE")), (qwen38_bot, ("STRIKES_FILE", "SCORES_FILE"))):
-    for _n in _names:
-        setattr(_mod, _n, _os.path.join(_STATE, f"{_mod.__name__}.{_n}"))
-arb.PINNED_INSTANCE = ""
+import _bot_test_state
+_STATE = _bot_test_state.new_state_dir()
+_bot_test_state.isolate(_STATE, arb, bot, muse_bot, qwen38_bot)
+
+
+def setUpModule():
+    _bot_test_state.isolate(_STATE, arb, bot, muse_bot, qwen38_bot)
+
+
+# The author clock (arb.AuthorWaitClock) of a PR that has waited on its author since the epoch: the
+# stale-close tests below are about WHICH PRs may close; the clock has its own tests.
+_LONG_WAITED = lambda self, num, head: 0.0
 
 MAIN_BONSAI = {128: (99.2, 2028.6), 512: (98.9, 5200.0), 4096: (96.9, 8432.7),
                16384: (93.0, 7600.0), 32768: (89.0, 6500.0)}
@@ -923,6 +925,8 @@ class StaleCloseTests(unittest.TestCase):
                self._pr(5, BONSAI_ONLY_BODY, labels=["hold"]), self._pr(6, BONSAI_ONLY_BODY, draft=True)]
         calls = []
         with mock.patch.object(bot, "_pr_last_activity_ts", return_value=0.0), \
+                mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
+                mock.patch.object(bot, "bonsai_evaluated_commits", return_value=set()), \
                 mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run("")):
             closed = bot.close_stale_bonsai_prs("o/r", prs)
         self.assertEqual(closed, {1, 3})
@@ -932,6 +936,7 @@ class StaleCloseTests(unittest.TestCase):
         prs = [dict(self._pr(1, BONSAI_ONLY_BODY), headRefOid="a" * 40),
                dict(self._pr(2, BONSAI_ONLY_BODY), headRefOid="b" * 40)]
         with mock.patch.object(bot, "_pr_last_activity_ts", return_value=0.0), \
+                mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
                 mock.patch.object(bot, "bonsai_evaluated_commits", return_value={"b" * 40}), \
                 mock.patch.object(arb, "greenlight_status", return_value=("ok", "claims a gain")), \
                 mock.patch.object(arb, "gh", return_value=run("")):
@@ -1086,11 +1091,16 @@ class ReviewFixTests(TempStateMixin, unittest.TestCase):
         self.assertIn(["add", "eval-bonsai:REJECT"], calls)
         self.assertFalse(any(c[:2] == ["pr", "close"] for c in calls))   # a failed run never closes
 
-    def test_a_run_killed_at_the_ssh_limit_is_posted_once_and_other_exceptions_are_retried(self):
+    def test_a_run_killed_at_the_ssh_limit_is_a_bounded_box_fault(self):
         import subprocess
         hang = arb.exception_result(subprocess.TimeoutExpired("ssh", 7200))
-        self.assertFalse(hang["retry"])
-        self.assertIn('"label":"REJECT"', bot.format_comment("a" * 40, hang))   # counts as evaluated
+        self.assertEqual((hang["retry"], hang["strike_key"]), (True, "timeout"))
+        self.addCleanup(bot.clear_strikes, 1139)
+        for _ in range(arb.BOX_FAULT_STRIKES - 1):                             # a box step may hang too
+            self.assertEqual(ApplyResultTests._apply(self, hang, commit="a" * 40, autoclose=True), [])
+        calls = ApplyResultTests._apply(self, hang, commit="a" * 40, autoclose=True)
+        self.assertIn(["add", "eval-bonsai:REJECT"], calls)                  # then it is the PR's
+        self.assertFalse(any(c[:2] == ["pr", "close"] for c in calls))       # a failed run never closes
         self.assertTrue(arb.exception_result(ConnectionResetError("reset"))["retry"])
 
     def test_the_stale_clock_is_utc_and_counts_the_prs_opening(self):

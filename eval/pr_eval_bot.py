@@ -1286,12 +1286,14 @@ def merged_checkout_script(pr_ref, onto, harness=()):
     main that had it. Merging here pins both sides of the comparison to one commit.
 
     A tip that does not merge cleanly prints MERGE_CONFLICT and exits 1 -- GitHub's mergeable flag
-    can be stale the same way, and such a PR needs a rebase, not a verdict. A tip that changes any of
-    `harness` (the bot's HARNESS_PATHS) prints HARNESS_TOUCHED and exits 1: the bot checked the PR's
-    files when it listed it, and a push since then must not get measured with its own ruler. Prints
-    PR_TIP (the full SHA actually fetched and built -- see measured_commit), MERGED_ONTO and
-    REMOTE_HEAD. The merge commit is local to the box and never pushed. A git step failing on the box
-    (a network fetch, a full disk, a lock left by a killed checkout) is RETRYABLE, never the PR's."""
+    can be stale the same way, and such a PR needs a rebase, not a verdict. A tip based on a newer
+    main than `onto` prints BASE_AHEAD and exits 1: it is measured next round (base_ahead_line). A
+    tip that changes any of `harness` (the bot's HARNESS_PATHS) prints HARNESS_TOUCHED and exits 1:
+    the bot checked the PR's files when it listed it, and a push since then must not get measured
+    with its own ruler. Prints PR_TIP (the full SHA actually fetched and built -- see
+    measured_commit; MERGE_CONFLICT_TIP on a conflict, merge_conflict_tip), MERGED_ONTO and
+    REMOTE_HEAD. The merge commit is local to the box and never pushed. A git step failing on the
+    box (a network fetch, a full disk, a lock left by a killed checkout) is RETRYABLE, never the PR's."""
     import shlex
     ref_q, onto_q = shlex.quote(pr_ref), shlex.quote(onto)
     paths = " ".join(shlex.quote(p) for p in harness)
@@ -1304,17 +1306,27 @@ fi
     return f"""timeout 600 git fetch -q origin {ref_q} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {pr_ref} failed" >&2; exit 1; }}
 PR_TIP=$(git rev-parse FETCH_HEAD)
 timeout 600 git fetch -q origin main || {{ echo "RETRYABLE_INFRA_FAILURE git fetch main failed" >&2; exit 1; }}
+MAIN_TIP=$(git rev-parse FETCH_HEAD)
 # An index lock left by a checkout that was killed (an old one: the bot lock and the round guard mean
 # no other round is running) would fail every step below.
 find .git -maxdepth 1 -name index.lock -mmin +10 -delete 2>/dev/null || true
 git reset -q --hard || {{ echo "RETRYABLE_INFRA_FAILURE git reset failed" >&2; exit 1; }}
 git clean -qfd || {{ echo "RETRYABLE_INFRA_FAILURE git clean failed" >&2; exit 1; }}
 git checkout -qf {onto_q} || {{ echo "RETRYABLE_INFRA_FAILURE git checkout {onto} failed" >&2; exit 1; }}
+# A tip built on a newer main than the baseline (rebased, or "Update branch", after the round measured
+# main) would carry main's newer commits into the merge as its own: a harness edit it never made, a
+# speedup someone else merged. Not measured this round; the next one measures onto that main.
+FORK=$(git merge-base "$PR_TIP" "$MAIN_TIP" 2>/dev/null) || FORK=""
+if [ -n "$FORK" ] && ! git merge-base --is-ancestor "$FORK" {onto_q} 2>/dev/null; then
+  echo "BASE_AHEAD $(git rev-parse --short "$PR_TIP") is based on main $(git rev-parse --short "$FORK"), newer than this round's baseline $(git rev-parse --short {onto_q})" >&2
+  exit 1
+fi
 if ! git -c user.name=sparkinfer-eval -c user.email=eval@sparkinfer.invalid merge -q --no-ff --no-edit "$PR_TIP" >/dev/null 2>&1; then
   # Only unmerged paths make it a conflict (the PR's to fix); anything else (a full disk, say) is
   # the box's -- a conflict is remembered for the head and not measured again until a push.
   if [ -n "$(git ls-files -u 2>/dev/null | head -1)" ]; then
     git merge --abort 2>/dev/null || true
+    echo "MERGE_CONFLICT_TIP $(git rev-parse "$PR_TIP")" >&2
     echo "MERGE_CONFLICT $(git rev-parse --short "$PR_TIP") does not merge cleanly onto $(git rev-parse --short {onto_q})" >&2
     exit 1
   fi
@@ -1376,18 +1388,20 @@ def exception_result(e):
 
     Anything else (a transport failure, a bug in the bot) is not the PR's: retried next round with
     nothing posted, and after BOX_FAULT_STRIKES rounds at one commit no longer measured (gave_up),
-    still never charged to the PR. A run killed at the ssh
-    time limit (2 h) is different -- main completed the same script this round, so it is almost
-    always a hang in the PR's own code, and retrying it would hold the shared box for two hours
-    every round with nothing to show. It is posted as a failed run, with a label in its marker so
-    the commit counts as evaluated until the author pushes again."""
+    still never charged to the PR. A run killed at the ssh time limit (2 h) is most likely a hang in
+    the PR's own code -- main completed the same script this round -- but not surely: a step of the
+    box's own can hang too (a reference server that stops answering, a wedged GPU). It is treated
+    like any box fault of the PR's run: retried, and charged to the PR, as a failed run, once it
+    recurs at one commit for BOX_FAULT_STRIKES rounds. It used to be posted at once: a REJECT label
+    (and the generic `eval:REJECT` SN74 reads) kept by that commit until a push, for a hang that may
+    have been the box's."""
     if isinstance(e, subprocess.TimeoutExpired):
         out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         tip = next((l.split()[1] for l in out.splitlines()
                     if l.startswith("PR_TIP ") and len(l.split()) >= 2 and _FULL_SHA_RE.match(l.split()[1])), None)
-        return {"ok": False, "retry": False, "label": "REJECT", "log": "", "pr_tip": tip,
-                "reason": f"the PR run was killed after {int(e.timeout or 0)} s — most likely a hang "
-                          f"in the PR's code (main completed the same run this round)"}
+        return {"ok": False, "retry": True, "strike_key": "timeout", "log": "", "pr_tip": tip,
+                "reason": f"the PR run was killed after {int(e.timeout or 0)} s — a hang (main completed "
+                          f"the same run this round)"}
     # "error": the bot's own failure. Counted like a box fault, but never charged to the PR: after
     # BOX_FAULT_STRIKES rounds at one commit the bot stops measuring it (gave_up) and says so.
     return {"ok": False, "retry": True, "strike_key": "error", "reason": f"exception: {type(e).__name__}: {e}"}
@@ -1543,7 +1557,7 @@ def strip_foreign_stale_labels(repo, num, labels, head, my_prefix):
         remove_label(repo, num, lab)
     removed = set(stale)
     if any(_PER_BOT_LABEL_RE.match(l) for l in stale) and sync_generic_eval_label(repo, num) is None:
-        for lab in labels_on(repo, num):
+        for lab in labels_on_or_none(repo, num) or ():
             if lab.startswith("eval:") and lab[len("eval:"):] in GENERIC_TIER_RANK:
                 remove_label(repo, num, lab)
                 removed.add(lab)
@@ -1573,11 +1587,42 @@ def acting_account_ok():
     return (not login or login == want), login
 
 
+def infra_failure_line(stdout, stderr):
+    """The first RETRYABLE_INFRA_FAILURE line a run printed, or "". A box fault charged to the PR
+    after BOX_FAULT_STRIKES rounds was posted as "no crash diagnostic captured" when this line had
+    named the cause (a compiler killed for memory, say): the reason text falls back to it."""
+    for l in ((stderr or "") + "\n" + (stdout or "")).splitlines():
+        if l.startswith("RETRYABLE_INFRA_FAILURE "):
+            return l.strip()
+    return ""
+
+
+def _stopped_at_checkout(stdout):
+    """Did the run stop in merged_checkout_script? Its last line, MERGED_ONTO, was never printed. A
+    build log or program output that merely contains a marker cannot then be read as one."""
+    return not any(l.startswith("MERGED_ONTO ") for l in (stdout or "").splitlines())
+
+
 def harness_touched_line(stdout, stderr):
     """The HARNESS_TOUCHED line merged_checkout_script printed, or "": the tip the box fetched edits
-    the measuring harness (a push after the bot checked the PR's files)."""
+    the measuring harness (a push after the bot checked the PR's files). Only when the run stopped
+    there: such a line in a later step's output made a failed run "edits the harness" -- no verdict,
+    and then a stale close."""
+    if not _stopped_at_checkout(stdout):
+        return ""
     for l in ((stderr or "") + "\n" + (stdout or "")).splitlines():
         if l.startswith("HARNESS_TOUCHED "):
+            return l.strip()
+    return ""
+
+
+def base_ahead_line(stdout, stderr):
+    """The BASE_AHEAD line merged_checkout_script printed, or "": the tip is based on a newer main
+    than the round's baseline. Not the PR's fault and not the box's: measured next round, no strike."""
+    if any(l.startswith("PR_TIP ") for l in (stdout or "").splitlines()):
+        return ""
+    for l in ((stderr or "") + "\n" + (stdout or "")).splitlines():
+        if l.startswith("BASE_AHEAD "):
             return l.strip()
     return ""
 
@@ -1591,6 +1636,19 @@ def merge_conflict_line(stdout, stderr):
     for l in ((stderr or "") + "\n" + (stdout or "")).splitlines():
         if l.startswith("MERGE_CONFLICT "):
             return l.strip()
+    return ""
+
+
+def merge_conflict_tip(stdout, stderr):
+    """The full SHA of the tip that did not merge (MERGE_CONFLICT_TIP), or "". A conflict is
+    remembered for that commit: a push the round fetched after listing the PR conflicted and was
+    remembered against the listed head, so it was fetched and merged again the next round."""
+    if not merge_conflict_line(stdout, stderr):
+        return ""
+    for l in ((stderr or "") + "\n" + (stdout or "")).splitlines():
+        parts = l.split()
+        if len(parts) == 2 and parts[0] == "MERGE_CONFLICT_TIP" and _FULL_SHA_RE.match(parts[1]):
+            return parts[1]
     return ""
 
 
@@ -1632,17 +1690,19 @@ def scored_against_stale_main(entry, main_sha):
     return not main_sha or (entry or {}).get("onto") != main_sha
 
 
-def waiting_for_first_verdict(repo, pr, evaluated, never_paths=(), rebase_label=None):
+def waiting_for_first_verdict(repo, pr, evaluated, never_paths=(), box_conflict=False):
     """Keep a PR out of the stale close while it waits on the bot rather than on its author.
 
     `evaluated` is the bot's set of commits with a verdict (None: GitHub did not say -- kept). A
     greenlit PR whose current head has no verdict yet is queued: the delay is the bot's (a backlog,
     a box outage, a baseline that keeps failing), and "not being measured is not grounds for
     closing" (CONTRIBUTING). A PR that is not greenlit, already has its verdict, conflicts with
-    main (GitHub's word, or this bot's own `rebase_label` -- another bot's may be left from an older
-    head), or touches `never_paths` (the harness the bot will not measure a change to) is waiting on
-    its author and may go stale. A PR the box keeps failing on is bounded separately: its box
-    faults are charged to it after BOX_FAULT_STRIKES rounds (record_strike)."""
+    main (GitHub's word, or `box_conflict`: the bot's own merge of this very head failed on the
+    box), or touches `never_paths` (the harness the bot will not measure a change to) is waiting on
+    its author and may go stale. The bot's needs-rebase label is not read: the stale close runs
+    before the selection drops one left from an older head, and it closed a rebased PR the bot had
+    yet to measure. A PR the box keeps failing on is bounded separately: its box faults are
+    charged to it after BOX_FAULT_STRIKES rounds (record_strike)."""
     head = pr.get("headRefOid") or ""
     if not head:
         return False
@@ -1655,9 +1715,9 @@ def waiting_for_first_verdict(repo, pr, evaluated, never_paths=(), rebase_label=
         return False
     if (pr.get("changedFiles") or 0) > len(paths):          # the bot does not measure what it cannot list
         return False
-    labs = {l["name"] for l in pr.get("labels", [])}
-    if rebase_label and rebase_label in labs:                  # this bot found it does not merge
+    if box_conflict:                                           # this bot found it does not merge
         return False
+    labs = {l["name"] for l in pr.get("labels", [])}
     return greenlight_status(repo, pr["number"], labs)[0] in ("ok", "unknown")
 
 
@@ -1677,8 +1737,8 @@ def strip_stale_verdict_labels(repo, num, labels, prefix, head, evaluated, rebas
         remove_label(repo, num, lab)
     if stale and sync_generic_eval_label(repo, num) is None:
         # No per-bot tier is left, and sync leaves the generic label alone then: this bot's was the
-        # one it mirrored, so it goes too.
-        for lab in labels_on(repo, num):
+        # one it mirrored, so it goes too. (Not on a read that failed: sync's False.)
+        for lab in labels_on_or_none(repo, num) or ():
             if lab.startswith("eval:") and lab[len("eval:"):] in GENERIC_TIER_RANK:
                 remove_label(repo, num, lab)
     return True
@@ -1865,6 +1925,74 @@ def stale_close_skip_reason(pr, my_model):
     return None
 
 
+class AuthorWaitClock:
+    """When each PR began waiting on its author, as this bot saw it: the stale close's clock.
+
+    The age of the last commit is not how long a PR has waited on its author. A PR that waited days
+    for the bot (a backlog, a box outage) and was then left to its author -- sent to needs-rebase,
+    made to conflict by another PR's merge, or reopened on a close comment's own advice -- was
+    already "stale" by its commit date, and was closed the next round with no time to act. The
+    clock starts the first round the bot finds the PR waiting on its author, per head (a push
+    restarts it), and is dropped whenever the PR waits on anyone else again (the bot, a `hold`, a
+    draft, a merge-first) or is closed, so a reopened PR has the full period again. Entries of PRs
+    no longer open are dropped. An unreadable file restarts every clock: more time, never less."""
+
+    def __init__(self, path, open_nums, now, record=True):
+        self.path, self.now, self.record = path, now, record
+        keep = {str(n) for n in open_nums}
+        data = _load_strikes(path)                 # any JSON object file; unreadable reads as {}
+        self.data = {k: v for k, v in data.items() if k in keep and isinstance(v, dict)}
+        self.dirty = len(self.data) != len(data)
+
+    def since(self, num, head):
+        """When PR `num` at `head` began waiting on its author: now, if this is the first round."""
+        e = self.data.get(str(num)) or {}
+        if e.get("head") == head and isinstance(e.get("since"), (int, float)) and e["since"] <= self.now:
+            return e["since"]
+        self.data[str(num)] = {"head": head, "since": self.now}
+        self.dirty = True
+        return self.now
+
+    def forget(self, num):
+        if self.data.pop(str(num), None) is not None:
+            self.dirty = True
+
+    def save(self):
+        """Written once per run; never by a dry run (`record` False), whose clocks start and end in it."""
+        if self.dirty and self.record:
+            write_json_atomic(self.path, self.data)
+            self.dirty = False
+
+
+def stale_close_disabled(stale_days):
+    """A stale threshold of 0 or less turns the stale close off, as close_stale_prs reads its own
+    (SPARKINFER_STALE_PR_DAYS=0). The model bots read 0 as "close every idle PR"."""
+    return stale_days <= 0
+
+
+def verdict_close_blocker(repo, num, commit):
+    """Why a verdict close must not happen now, or None -- read fresh, just before closing. A round
+    runs for hours: a `hold` added or a draft made while it measured the PR (a maintainer stopping
+    the bot) was closed over, and so was a push, whose new commit gets its own evaluation instead.
+    A PR GitHub does not return, or one no longer open, is not closed either."""
+    r = gh(["pr", "view", str(num), "-R", repo, "--json", "headRefOid,isDraft,labels,state"])
+    try:
+        info = json.loads(r.stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        info = None
+    if r.returncode != 0 or not isinstance(info, dict) or not info.get("headRefOid"):
+        return "GitHub did not return the PR"
+    if info["headRefOid"] != commit:
+        return f"its head moved to {info['headRefOid'][:9]} since {commit[:9]} was measured"
+    if (info.get("state") or "OPEN") != "OPEN":
+        return f"it is {str(info['state']).lower()}"
+    if info.get("isDraft"):
+        return "it was made a draft"
+    if HOLD_LABEL in {l.get("name") for l in (info.get("labels") or []) if isinstance(l, dict)}:
+        return "it is on hold"
+    return None
+
+
 # Bash for a model bot's remote script (inserted verbatim, so single braces). `-v` ptxas resource
 # reports ("ptxas info : Used 38 registers ...") fill a failed build's log, and the old `tail -80`
 # showed only those: #1163's sm_89 errors ("error : Feature 'mbarrier.try_wait.parity' requires
@@ -1930,8 +2058,14 @@ def sync_generic_eval_label(repo, num):
     so one bot cannot erase another's result and a bot re-running against its own model can still
     lower its own contribution. REJECT wins outright regardless of rank -- a PR that regresses or
     fails a gate on ANY model must not advertise a positive tier because a different model improved.
+
+    Returns the tier written, None when no per-bot tier is left, and False when GitHub did not
+    return the labels -- nothing is changed then. An unread set used to read as "no tier", and the
+    strips' fallback then deleted a generic label other bots' tiers still backed.
     """
-    labs = labels_on(repo, num)
+    labs = labels_on_or_none(repo, num)
+    if labs is None:
+        return False
     tiers = []
     for lab in labs:
         m = _PER_BOT_EVAL_RE.match(lab)
@@ -1948,6 +2082,32 @@ def sync_generic_eval_label(repo, num):
     if f"eval:{want}" not in labs:
         add_label(repo, num, f"eval:{want}")
     return want
+
+
+# GitHub refuses a comment body over 65,536 characters.
+COMMENT_LIMIT = 60000
+
+
+def fit_comment(body, limit=COMMENT_LIMIT):
+    """A verdict comment GitHub will accept. One over the limit (a single compiler error line can be
+    that long) failed to post, so its marker never landed: the next round dropped the label and
+    built the PR again, every round until a push. The marker leads the body, so the end is cut."""
+    if len(body) <= limit:
+        return body
+    note = "\n\n… (truncated: the full output is in the eval log)\n"
+    return body[:limit - len(note)] + note
+
+
+def strip_own_tier_labels(repo, num, prefix):
+    """Remove this bot's `<prefix><tier>` labels before it writes a new tier. When GitHub does not
+    return the labels, every tier is removed blind (removing one that is not there is a quiet 404):
+    an unread set taken as empty left the old tier beside the new one, and sync_generic_eval_label
+    mirrored the better of the two."""
+    labs = labels_on_or_none(repo, num)
+    targets = ([l for l in labs if l.startswith(prefix)] if labs is not None
+               else [prefix + t for t in GENERIC_TIER_RANK])
+    for lab in targets:
+        remove_label(repo, num, lab)
 
 
 def apply_area_labels(repo, num, areas):
@@ -2393,6 +2553,21 @@ def push_dash(msg):
 LOG_REPO  = os.environ.get("SPARKINFER_LOG_REPO", "https://github.com/gittensor-ai-lab/sparkinfer-log.git")
 LOG_DIR   = os.path.expanduser(os.environ.get("SPARKINFER_LOG_DIR", "~/.sparkinfer_log_checkout"))
 LOG_PAGE  = "https://gittensor-ai-lab.github.io/sparkinfer-log/?run="
+
+def eval_log_run_id(base, onto):
+    """The eval-log run id of a model bot's verdict: `base` (`<bot>-<pr>-<commit7>`), unless that
+    run already holds a verdict measured onto another main -- the re-measure of a verified PR after
+    main moved -- which is then `<base>-on<main7>`. The same id overwrote the earlier run's result,
+    receipt and index entry. Call after _ensure_log_repo."""
+    try:
+        with open(os.path.join(LOG_DIR, "runs", base, "result.json")) as f:
+            prev = json.load(f)
+    except (OSError, ValueError):
+        return base
+    if not onto or not isinstance(prev, dict) or prev.get("measured_onto") in (None, onto):
+        return base
+    return f"{base}-on{onto[:7]}"
+
 
 def _ensure_log_repo():
     """Clone or update the public sparkinfer-log checkout."""
