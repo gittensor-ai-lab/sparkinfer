@@ -6212,6 +6212,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     const bool shadow_out = bonsai_shadow && bonsai_shadow_parts.find("out") != std::string::npos;
     const bool shadow_gdn = bonsai_shadow && bonsai_shadow_parts.find("gdn") != std::string::npos;
     std::unordered_map<const void*, void*> shadow_of;   // folded weight -> its ternary copy
+    std::vector<void*> shadow_gdn_bufs;                 // the GDN in-projection copies, dropped first
     if (bonsai_native || bonsai_shadow) {
         s.bonsai_block = had.block_size;
         for (const auto& kv : had.signs_by_width) {
@@ -6777,7 +6778,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             UnrotateJob j;
             if (unrotate_job_init(j, t, name, *had.signs_for(t->dims[0]), had.block_size, false))
                 sh = upload_proj_native(t, name, j);
-            if (sh) { s.owned.pop_back(); s.bonsai_dec_bufs.push_back(sh); }
+            if (sh) {
+                s.owned.pop_back();
+                s.bonsai_dec_bufs.push_back(sh);
+                if (shadow_gdn && gdn_part) shadow_gdn_bufs.push_back(sh);
+            }
         }
         const void* p = attn_w_base(name, type);
         if (sh && p) shadow_of[p] = sh;
@@ -7813,13 +7818,37 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         need += need / 2;
         size_t free_b = 0, total_b = 0;
         if (prefill_tokens > 0 && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < need) {
-            for (void* b : s.bonsai_dec_bufs) cudaFree(b);
-            s.bonsai_dec_bufs.clear();
-            s.bonsai_dec_head = nullptr;
-            shadow_of.clear();
-            fprintf(stderr, "[bonsai] decode shadow skipped: %zu MB free leaves too little for a "
-                            "%d-token batched prefill (estimated need ~%zu MB)\n",
-                    free_b >> 20, prefill_tokens, need >> 20);
+            // The GDN copies are the increment on top of a shadow that already fits. Give those
+            // back first and keep the FFN, attention q/k/v, the outputs and the head when that
+            // is enough.
+            if (!shadow_gdn_bufs.empty()) {
+                for (void* b : shadow_gdn_bufs) {
+                    cudaFree(b);
+                    s.bonsai_dec_bufs.erase(
+                        std::remove(s.bonsai_dec_bufs.begin(), s.bonsai_dec_bufs.end(), b),
+                        s.bonsai_dec_bufs.end());
+                }
+                for (auto it = shadow_of.begin(); it != shadow_of.end(); ) {
+                    if (std::find(shadow_gdn_bufs.begin(), shadow_gdn_bufs.end(), it->second) !=
+                        shadow_gdn_bufs.end())
+                        it = shadow_of.erase(it);
+                    else
+                        ++it;
+                }
+                shadow_gdn_bufs.clear();
+                cudaMemGetInfo(&free_b, &total_b);
+                fprintf(stderr, "[bonsai] GDN in-projection shadow dropped: %zu MB free\n",
+                        free_b >> 20);
+            }
+            if (free_b < need) {
+                for (void* b : s.bonsai_dec_bufs) cudaFree(b);
+                s.bonsai_dec_bufs.clear();
+                s.bonsai_dec_head = nullptr;
+                shadow_of.clear();
+                fprintf(stderr, "[bonsai] decode shadow skipped: %zu MB free leaves too little for a "
+                                "%d-token batched prefill (estimated need ~%zu MB)\n",
+                        free_b >> 20, prefill_tokens, need >> 20);
+            }
         }
     }
     if (bonsai_shadow && !shadow_of.empty()) {
