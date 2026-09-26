@@ -125,7 +125,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     five attempts, and a concurrent-decode guard width the PR build could not complete is a box
     fault judged over rounds rather than a REJECT and close in one (beside another REJECT, its
     comment row says the guard's concurrent decode was not measured, not that it passed); a fault
-    charged to the PR no longer says it will be re-evaluated next round;
+    charged to the PR no longer says it will be re-evaluated next round, and one of Qwen3.8's
+    names the guard widths that did not complete and how (the exit code is the last one that was
+    not a kill; it read 1 for any mix), with those widths' own lines; Qwen3.8's `main` baseline
+    with a 0 at decode@128 or prefill@128, or a failed sweep, skips the round (it made every PR a
+    REJECT, closed);
   - the cron wrappers run the bots from their own `origin/main` worktree (made again if it breaks,
     and never one they did not make), refuse to run without a `GH_TOKEN` (or, with
     `SPARKINFER_BOT_LOGIN` set, with another account's; `.env.eval` never stands in for an empty
