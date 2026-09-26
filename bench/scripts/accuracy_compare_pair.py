@@ -59,6 +59,12 @@ def load(path):
                 }
             except (IndexError, ValueError):
                 continue   # a truncated final line (killed process) must not abort the compare
+            if not all(math.isfinite(v) for v in (lp, *top.values())):
+                # A NaN logit makes the whole row NaN. Unreadable, like a truncated line: a NaN in
+                # main's dump used to pass its self-check and then compare as KL 0 (or a NaN
+                # perplexity every PR failed); in a PR's dump the position goes missing instead,
+                # which the bots' coverage check (n= / n_main=) fails.
+                continue
             out[pos] = {"am": am, "lp": lp, "top": top}
     return out
 

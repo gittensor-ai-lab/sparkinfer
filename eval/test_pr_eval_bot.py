@@ -1759,6 +1759,33 @@ class MergeStepTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(bot.base_ahead_line(r.stdout, r.stderr), "")
 
+    def test_a_pr_with_no_history_in_common_is_a_rebase_request(self):
+        self.g("checkout", "-q", "--orphan", "stray", cwd=self.work)
+        with open(os.path.join(self.work, "kernel.cu"), "w") as fh:
+            fh.write("unrelated\n")
+        self.g("add", "-A", cwd=self.work)
+        self.g("commit", "-qm", "stray", cwd=self.work)
+        self.g("push", "-qf", "origin", "HEAD:refs/pull/1/head", cwd=self.work)
+        r = self._run()
+        self.assertEqual(r.returncode, 1)
+        self.assertTrue(bot.merge_conflict_line(r.stdout, r.stderr).startswith("MERGE_CONFLICT "), r.stderr)
+        self.assertNotIn("RETRYABLE_INFRA_FAILURE", r.stderr)
+
+    def test_the_harness_is_compared_with_the_baseline_not_the_newest_main(self):
+        # main moved after the round measured it, with a harness change; a PR on the old base that
+        # never touched the harness is measured, not stopped as HARNESS_TOUCHED.
+        base = self.main
+        self.g("checkout", "-q", "main", cwd=self.work)
+        with open(os.path.join(self.work, "bench/scripts/_eval_speed.sh"), "w") as fh:
+            fh.write("ruler v2\n")
+        self.g("commit", "-qam", "main moves", cwd=self.work)
+        self.g("push", "-q", "origin", "HEAD:main", cwd=self.work)
+        self._pr("kernel.cu", "b\n")                              # based on `base`
+        self.main = base
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(bot.harness_touched_line(r.stdout, r.stderr), "")
+
     def test_a_marker_in_a_later_steps_output_is_not_the_checkouts(self):
         out = "PR_TIP " + "a" * 40 + "\nMERGED_ONTO ccccccc\nREMOTE_HEAD d\n"
         self.assertEqual(bot.harness_touched_line(out, "HARNESS_TOUCHED eval/x.py\n"), "")

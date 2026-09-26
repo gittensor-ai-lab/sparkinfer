@@ -237,7 +237,13 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
     Action's; `SPARKINFER_BONSAI_AUTOCLOSE=0` turns off every Bonsai close, the stale one included.
   - A GitHub read that fails is "unknown" and never closes, strips or re-measures anything; a label
     read that fails changes no generic `eval:*` label, and each bot's reconcile re-syncs the generic
-    label of a PR carrying its own tier when a failed sync left it wrong (it is what SN74 pays on). The daily
+    label of a PR carrying its own tier when a failed sync left it wrong (it is what SN74 pays on).
+    Each reconcile also puts the bot's own tier back in line with the verdict it recorded for the
+    PR's head (every posted verdict is recorded, a failed run's REJECT included), while the head
+    carries the bot's verdict marker: a label write that failed while the verdict comment posted left
+    a verified speedup unranked and then stale-closed, or a replaced tier on the PR, still paid. A
+    tier a noise ban parked (`-p`) counts as present. `bench/scripts/accuracy.sh` fails a pass that
+    did not cover every position of its stream, as the bots do. The daily
   `close-stale-prs` Action (no GitHub activity for 2 days) spares any bot's merge-first and any
   greenlit PR no model bot has posted a verdict for yet, unless GitHub says it conflicts or it edits
   paths no bot measures (`arb.NEVER_MEASURED_PATHS`).
@@ -264,7 +270,12 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
     `REFERENCE_FAILED`, exit 3), is infra.
   - The accuracy gate needs the PR's score dump to cover every position of the stream: the
     comparators judge only the positions a dump has, and report how many (`n=` beside `n_main=` or
-    `n_expected=`), so a dump that stopped early no longer passes on the few it holds.
+    `n_expected=`), so a dump that stopped early no longer passes on the few it holds. A row with a
+    NaN is unreadable: in `main`'s dump that position is left out for everyone (it passed the self-
+    check and then read as KL 0, or as a NaN perplexity every Bonsai PR failed), in a PR's it is a
+    gap the coverage check fails.
+  - A PR with no history in common with `main` is a rebase request, like a conflict. Ternary-Bonsai's
+    prefill-path check killed on every attempt (exit 137) is a box fault, bounded like the others.
   - A failure of the bot itself (an exception) is never charged: after three rounds at one commit
     the bot stops measuring that commit until a push. A run that gives up on a PR, or whose round
     is skipped because `main`'s baseline is unusable, exits 3, so the wrapper's failed-run banner

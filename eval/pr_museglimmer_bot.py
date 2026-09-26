@@ -2180,7 +2180,7 @@ def auto_merge_ok_museglimmer(repo, num, require_merge_first=True, ranking_loss_
     if scored.get("label") not in SPEEDUP_LABELS or not scored.get("pass"):
         return False, f"recorded verdict for {head[:9]} is {scored.get('label')} (pass={scored.get('pass')})"
     # A REJECT from any other bot is a measured harm on another model.
-    if any(l.endswith(":REJECT") for l in labs if l.startswith("eval")):
+    if any(l.endswith((":REJECT", ":REJECT" + arb.NOISE_PARK_SUFFIX)) for l in labs if l.startswith("eval")):
         return False, "carries a REJECT from another eval bot"
     blocked = labs & (AUTOMERGE_BLOCK - ({MUSEGLIMMER_NEEDS_REBASE} if ranking_loss_ok else set()))
     if blocked:
@@ -2261,6 +2261,9 @@ def _unmeasurable_reason(repo, pr, labs, count_gave_up=True):
     head = (pr.get("headRefOid") or "")[:40]
     if arb.strike_count(STRIKES_FILE, pr["number"], head, "harness"):
         return "edits the eval harness (found on the box)"
+    if arb.strike_count(STRIKES_FILE, pr["number"], head, "conflict"):
+        # The selection skips it until a push: kept "in the running" it held merge-first for ever.
+        return "does not merge onto main on the box (needs a rebase)"
     if pr.get("changedFiles") and pr["changedFiles"] > len(pr.get("files") or []):
         return "changes more files than GitHub lists"
     if count_gave_up and arb.gave_up(STRIKES_FILE, pr["number"], (pr.get("headRefOid") or "")[:40]):
@@ -2300,6 +2303,10 @@ def reconcile_museglimmer_merge_labels(repo, dry_run=False):
     stale_main = set()   # in the running, but its merge waits for a re-measure onto today's main
     main_now = None      # read once, for a needs-rebase that may only mean a lost ranking
     for num, labs in open_labels.items():
+        if not dry_run:
+            labs = open_labels[num] = arb.repair_own_tier(
+                repo, num, labs, EVAL_PREFIX, scores.get(str(num)), (open_by_num[num].get("headRefOid") or "")[:40],
+                lambda: museglimmer_evaluated_commits(repo, num))
         # A sync GitHub did not answer when this bot posted its verdict, healed -- on this bot's PRs
         # only: the retired AR bot's labels derive the generic one by another rule (the failing side).
         if not dry_run and any(l.startswith(EVAL_PREFIX) for l in labs) and arb.generic_label_out_of_sync(labs):
@@ -2585,6 +2592,9 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
+    else:
+        # A failed run, or no delta: recorded all the same (arb.record_posted_verdict).
+        arb.record_posted_verdict(_load_scores, _save_scores, num, commit, label, res)
     if res.get("ok"):
         upload_museglimmer_eval_log(repo, num, title, commit, res)
     if res.get("ok") and res.get("delta_pct") is not None:

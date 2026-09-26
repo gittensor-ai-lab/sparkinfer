@@ -212,22 +212,31 @@ LONG_TOP1_BAR="$LONG_TOP1_BAR" LONG_KL_BAR="$LONG_KL_BAR" python3 - /tmp/acc_sho
 import re, sys, os
 t1_bar = float(os.environ.get("LONG_TOP1_BAR", "0.875"))
 kl_bar = float(os.environ.get("LONG_KL_BAR", "1.0"))
+def short_of_stream(line):
+    # accuracy_compare.py compares only the positions a dump has (a NaN or truncated row is not
+    # one): a pass that covered fewer than its stream is incomplete, not a pass.
+    m = re.search(r' n=(\d+) n_expected=(\d+)', line)
+    return bool(m) and int(m.group(1)) < int(m.group(2))
 def grab_short(path):
     for line in open(path):
         m = re.match(r'^METRIC_SHORT top1=([\d.]+) kl=([\d.]+)', line)
-        if m: return float(m.group(1)), float(m.group(2))
+        if m: return float(m.group(1)), float(m.group(2)), short_of_stream(line)
     return None
 def grab_longs(path):
     out = []
     if os.path.exists(path):
         for line in open(path):
             m = re.match(r'^METRIC_LONG\d+ top1=([\d.]+) kl=([\d.]+)', line)
-            if m: out.append((float(m.group(1)), float(m.group(2))))
+            if m: out.append((float(m.group(1)), float(m.group(2)), short_of_stream(line)))
     return out
 short = grab_short(sys.argv[1])
 longs = grab_longs(sys.argv[2]) if len(sys.argv) > 2 else []
 if not short:
     print("METRIC top1=0 kl=99 ppl_spark=0 ppl_llama=0   (short pass produced nothing)"); sys.exit(1)
+if short[2] or any(g for _, _, g in longs):
+    print("METRIC top1=0 kl=99 ppl_spark=0 ppl_llama=0   (a pass did not cover every position of its stream)")
+    sys.exit(1)
+short, longs = short[:2], [(t, k) for t, k, _ in longs]
 t, k = short
 print(f"  short vs-llama (bf16)  top1={t:.4f} kl={k:.4f}   (gates top1>=0.90, kl<=0.20)")
 if longs:

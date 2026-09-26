@@ -72,7 +72,7 @@ clears every guard — verified speedup, clean CI, no conflicts, author in good 
 touches only `kernels`/`runtime`/`moe` (never the maintainer-owned paths); a maintainer can stop
 that with a `hold` label. Once the `merge-first` PR is merged, the others **stay `needs-rebase`** —
 **rebase your branch onto the new `main`** and push; the bot then re-runs your eval against the new
-frontier (briefly tagging [`re-evaluate`](../../labels/re-evaluate) during the re-grade), so you're
+frontier, so you're
 credited for the **marginal** gain on top of what merged (independent wins stack and keep scoring; a
 change the merge already captured drops to `none`). Until something merges, a `needs-rebase` PR
 whose verdict still stands on the same `main` stays in the running (it wins if the winner is
@@ -145,7 +145,7 @@ Then the bot greenlights it (**`test-on-5090`**) and evaluates on the next poll.
   `after (this PR)`) intact and just fill in the numbers. Renaming a row — dropping the word
   `prefill` from it, say — makes that number invisible to the gate, and a prefill-only PR then
   looks like a decode PR with no gain and is skipped.
-- Box ticked but neither table has a real gain → **`needs-benchmark`**, not evaluated
+- Box ticked but neither table has a real gain → **not greenlit**, not evaluated
   (fill in real numbers and it greenlights automatically).
 - Box not ticked → **auto-closed** (same as `rtx5090-required` CI). Tick the box, fill tables, and reopen to submit.
 There is **no override** — every PR is evaluated on a real RTX 5090 only after it legitimately
@@ -296,8 +296,8 @@ against you.
   if the PR touches `runtime/` **or** carries the template checkbox unticked. A docs-only PR
   outside `runtime/` with no checkbox is left open. Drafts, `hold`, and
   maintainers/members/collaborators are exempt. Box ticked but the decode table empty or showing
-  no gain → `needs-benchmark`, held rather than closed; fill in real numbers and it greenlights
-  automatically.
+  no gain → not greenlit: not evaluated, and not closed by the eval bots either; fill in real numbers
+  and it greenlights automatically.
 - **Stale.** No new commits for over a day, **and** a day spent waiting on you since the bot last
   handed the PR back (a verdict, a `needs-rebase`, a conflict) → auto-closed to keep the eval queue
   clean. Time the PR spent queued behind the bot never counts. This is not a judgment on the work:

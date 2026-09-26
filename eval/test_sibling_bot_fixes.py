@@ -2100,5 +2100,148 @@ class Iteration5bTests(unittest.TestCase):
         self.assertIn('pkill -TERM -s "$opid"', arb.round_guard_sh("qwen38"))
 
 
+
+class Iteration6Tests(unittest.TestCase):
+    """Fixes from the post-merge review of main 7c63687, on all three bots."""
+
+    ROOT = Iteration5bTests.ROOT
+
+    def _bots(self):
+        return Iteration5Tests._bots(self)
+
+    def _reconcile(self, mod, tag, prs, scores, evaluated=("a" * 40,)):
+        with mock.patch.object(mod, f"{tag}_evaluated_commits", return_value=set(evaluated)):
+            return Iteration5Tests._reconcile(self, mod, tag, prs, scores)
+
+    def test_a_tier_whose_label_write_failed_is_put_back_from_the_recorded_verdict(self):
+        for mod, tag, rebase, prefix, first in self._bots():
+            xl = {"commit": "a" * 40, "label": "XL", "delta_pct": 30.0, "pass": True, "onto": MAIN}
+            with self.subTest(tag, case="the add failed"):
+                calls, _ = self._reconcile(mod, tag, {5: ([], "a" * 40)}, {"5": xl})
+                self.assertIn(("add", 5, prefix + "XL"), calls)
+                self.assertIn(("add", 5, first), calls)              # ... and it is ranked again
+            with self.subTest(tag, case="a removal failed"):
+                none = dict(xl, label="none", delta_pct=0.1, **{"pass": False})
+                calls, _ = self._reconcile(mod, tag, {5: ([prefix + "XL", prefix + "none"], "a" * 40)}, {"5": none})
+                self.assertIn(("rm", 5, prefix + "XL"), calls)
+                self.assertNotIn(("add", 5, first), calls)
+            for case, labels, entry, evaluated in (
+                    ("parked by a noise ban", [prefix + "XL-p"], xl, ("a" * 40,)),
+                    # its comment failed or was deleted, or its marker is an older schema: the selection
+                    # drops the tier and measures the head again -- restoring it flipped it every round
+                    ("no verdict marker on the head", [], xl, ()),
+                    ("an entry for another commit", [], dict(xl, commit="b" * 40), ("a" * 40,))):
+                with self.subTest(tag, case=case):
+                    calls, _ = self._reconcile(mod, tag, {5: (labels, "a" * 40)}, {"5": entry}, evaluated)
+                    self.assertFalse([c for c in calls if c[2].startswith(prefix)], calls)
+
+    def test_every_posted_verdict_is_recorded_for_its_head(self):
+        for mod, tag, *_ in self._bots():
+            if True:
+                saved = {}
+                old = {"9": {"commit": "a" * 40, "label": "XL", "pass": True}}
+                with self.subTest(tag), \
+                        mock.patch.object(arb, "gh", return_value=run()), \
+                        mock.patch.object(arb, "add_label"), mock.patch.object(arb, "remove_label"), \
+                        mock.patch.object(arb, "sync_generic_eval_label"), \
+                        mock.patch.object(mod, f"strip_{tag}_eval_labels"), \
+                        mock.patch.object(mod, "format_comment", return_value="c"), \
+                        mock.patch.object(mod, "_load_scores", return_value=dict(old)), \
+                        mock.patch.object(mod, "_save_scores", side_effect=saved.update), \
+                        mock.patch("builtins.print"):
+                    # A re-measure of a verified head, charged as a failed run: the old XL must not stand.
+                    mod.apply_result("o/r", 9, "a" * 40, {"ok": False, "retry": False, "reason": "killed", "log": ""})
+                self.assertEqual((saved["9"]["commit"], saved["9"]["label"], saved["9"]["pass"]),
+                                 ("a" * 40, "REJECT", False))
+
+    def test_a_conflict_found_on_the_box_is_not_kept_in_the_running(self):
+        for mod, tag, *_ in self._bots():
+            pr = Iteration4Tests._pr(self)
+            self.addCleanup(arb.clear_strikes, mod.STRIKES_FILE, 7)
+            arb.record_strike(mod.STRIKES_FILE, 7, "a" * 40, "conflict")
+            with self.subTest(tag):
+                self.assertEqual(mod._unmeasurable_reason("o/r", pr, set()),
+                                 "does not merge onto main on the box (needs a rebase)")
+            arb.clear_strikes(mod.STRIKES_FILE, 7)
+
+    def test_a_parked_reject_still_blocks_a_merge(self):
+        for mod, tag, rebase, prefix, first in self._bots():
+            info = {"state": "OPEN", "isDraft": False, "author": {"login": "dev"}, "mergeable": "MERGEABLE",
+                    "files": [{"path": "kernels/x.cu"}], "changedFiles": 1, "headRefOid": "a" * 40,
+                    "baseRefName": "main",
+                    "labels": [{"name": prefix + "XL"}, {"name": first}, {"name": "eval-dspark:REJECT-p"}]}
+            with self.subTest(tag), mock.patch.object(arb, "gh", return_value=run(json.dumps(info))), \
+                    mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
+                    mock.patch.object(arb, "load_denylist", return_value=set()), \
+                    mock.patch.object(arb, "author_penalty_until", return_value=None), \
+                    mock.patch.object(mod, "_load_scores", return_value={"1": {
+                        "commit": "a" * 40, "label": "XL", "pass": True, "onto": MAIN}}):
+                ok, why = getattr(mod, f"auto_merge_ok_{tag}")("o/r", 1)
+            self.assertFalse(ok)
+            self.assertIn("REJECT", why)
+
+    def test_accuracy_sh_fails_a_pass_that_did_not_cover_its_stream(self):
+        import re as _re
+        import subprocess
+        with open(_os.path.join(self.ROOT, "bench/scripts/accuracy.sh")) as f:
+            py = next(b for b in _re.findall(r"<<'PY'\n(.*?)\nPY\n", f.read(), _re.S) if "grab_short" in b)
+        d = _tempfile.mkdtemp(dir=_STATE)
+
+        def gate(short, longs=""):
+            for name, text in (("s", short + "\n"), ("l", longs)):
+                with open(_os.path.join(d, name), "w") as f:
+                    f.write(text)
+            r = subprocess.run(["python3", "-", _os.path.join(d, "s"), _os.path.join(d, "l")], input=py,
+                               capture_output=True, text=True, timeout=60)
+            return r.returncode, next(l for l in r.stdout.splitlines() if l.startswith("METRIC "))
+        ok = "METRIC_SHORT top1=0.950000 kl=0.010000 ppl_spark=1 ppl_llama=1"
+        self.assertEqual(gate(ok + " n=20 n_expected=20")[0], 0)
+        self.assertEqual(gate(ok)[0], 0)                                     # a compare without counts
+        self.assertIn("did not cover", gate(ok.replace("0.95", "1.00") + " n=16 n_expected=20")[1])
+        self.assertIn("did not cover", gate(ok + " n=20 n_expected=20",
+                                            "METRIC_LONG0 top1=0.95 kl=0.1 n=10 n_expected=16\n")[1])
+
+    def test_a_secondary_rate_limit_is_retried(self):
+        self.assertTrue(arb._GH_TRANSIENT_RE.search(
+            "gh: You have exceeded a secondary rate limit. Please wait a few minutes (HTTP 403)"))
+        self.assertFalse(arb._GH_TRANSIENT_RE.search("gh: Resource not accessible by integration (HTTP 403)"))
+
+    def test_a_nan_row_is_unreadable_on_both_sides(self):
+        import subprocess
+        d = _tempfile.mkdtemp(dir=_STATE)
+        nan = "S i=5 tgt=5 am=5 lp=-nan top=5:-nan,6:-nan\n"
+        good = lambda i: f"S i={i} tgt=5 am=5 lp=-0.1 top=5:-0.1,6:-2.5\n"
+        with open(_os.path.join(d, "main.txt"), "w") as f:
+            f.write("".join(nan if i == 5 else good(i) for i in range(10)) + "S i=10 tgt=5 am")   # + a truncated line
+        with open(_os.path.join(d, "pr_ok.txt"), "w") as f:
+            f.write("".join(good(i) for i in range(10)))
+        with open(_os.path.join(d, "pr_nan.txt"), "w") as f:
+            f.write("".join(nan if i == 3 else good(i) for i in range(10)))
+        pair = _os.path.join(self.ROOT, "bench/scripts/accuracy_compare_pair.py")
+        metric = lambda a, b, *x: next(l for l in subprocess.run(
+            ["python3", pair, _os.path.join(d, a), _os.path.join(d, b), *x], capture_output=True, text=True,
+            timeout=60).stdout.splitlines() if l.startswith(("METRIC ", "SELFCHECK ")))
+        selfcheck = metric("main.txt", "main.txt", "--metric-label", "SELFCHECK")
+        self.assertIn("top1=1.000000 kl=0.000000", selfcheck)
+        self.assertNotIn("nan", selfcheck)                               # main's NaN row left out, not NaN
+        self.assertIn("n=9 n_main=9", metric("pr_ok.txt", "main.txt"))   # a clean PR: judged on the rest
+        self.assertIn("n=8 n_main=9", metric("pr_nan.txt", "main.txt"))  # a PR's NaN: coverage fails
+
+        def ok(h):
+            h.rfile.read(int(h.headers["Content-Length"]))
+            body = json.dumps({"completion_probabilities": [{"top_logprobs": [
+                {"id": 5, "logprob": -0.1}, {"id": 6, "logprob": -2.5}]}]}).encode()
+            h.send_response(200)
+            h.send_header("Content-Length", str(len(body)))
+            h.end_headers()
+            h.wfile.write(body)
+        def dump(path, positions):
+            with open(path, "w") as f:
+                f.write("".join(nan if i == 3 else good(i) for i in positions))
+        self._dump = dump                                                # the PR's dump, with a NaN row
+        r = Iteration5bTests._compare(self, Iteration5bTests._serve(self, ok), range(8))
+        self.assertIn(" n=7 n_expected=8", r.stdout)                     # Muse: a gap, not "kl=nan"
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -322,6 +322,7 @@ _GH_TRANSIENT_RE = re.compile(
     r"HTTP (?:429|5\d\d)"                     # 502/503/504 and secondary rate limits
     r"|no server is currently available"      # the 503 body GitHub actually returns
     r"|was submitted too quickly"             # secondary rate limit
+    r"|secondary rate limit"                  # ... and its 403 ("You have exceeded a secondary rate limit")
     r"|abuse detection"
     r"|temporarily unavailable"
     r"|timed? ?out"
@@ -1321,10 +1322,11 @@ if [ -n "$FORK" ] && ! git merge-base --is-ancestor "$FORK" {onto_q} 2>/dev/null
   echo "BASE_AHEAD $(git rev-parse --short "$PR_TIP") is based on main $(git rev-parse --short "$FORK"), newer than this round's baseline $(git rev-parse --short {onto_q})" >&2
   exit 1
 fi
-if ! git -c user.name=sparkinfer-eval -c user.email=eval@sparkinfer.invalid merge -q --no-ff --no-edit "$PR_TIP" >/dev/null 2>&1; then
-  # Only unmerged paths make it a conflict (the PR's to fix); anything else (a full disk, say) is
-  # the box's -- a conflict is remembered for the head and not measured again until a push.
-  if [ -n "$(git ls-files -u 2>/dev/null | head -1)" ]; then
+if ! MERGE_OUT=$(LC_ALL=C git -c user.name=sparkinfer-eval -c user.email=eval@sparkinfer.invalid merge -q --no-ff --no-edit "$PR_TIP" 2>&1); then
+  # Only unmerged paths -- or no history in common with main at all -- make it the PR's to fix (a
+  # rebase); anything else (a full disk, say) is the box's. A conflict is remembered for the head
+  # and not measured again until a push.
+  if [ -n "$(git ls-files -u 2>/dev/null | head -1)" ] || printf '%s' "$MERGE_OUT" | grep -q "unrelated histories"; then
     git merge --abort 2>/dev/null || true
     echo "MERGE_CONFLICT_TIP $(git rev-parse "$PR_TIP")" >&2
     echo "MERGE_CONFLICT $(git rev-parse --short "$PR_TIP") does not merge cleanly onto $(git rev-parse --short {onto_q})" >&2
@@ -2129,6 +2131,55 @@ def fit_comment(body, limit=COMMENT_LIMIT):
         return body
     note = "\n\n… (truncated: the full output is in the eval log)\n"
     return body[:limit - len(note)] + note
+
+
+# The suffix noise_penalty.py's ban parks a tier under (`eval-museglimmer:XL` -> `...:XL-p`).
+NOISE_PARK_SUFFIX = "-p"
+
+
+def repair_own_tier(repo, num, labels, prefix, entry, head, evaluated):
+    """Put this bot's `<prefix><tier>` back in line with the verdict it recorded for the PR's current
+    head (its scores entry, record_posted_verdict), and return the labels as they now are.
+
+    apply_result's label writes can fail while its verdict comment posts. A speedup whose tier
+    never landed was never ranked, never measured again (its head has a verdict) and then
+    stale-closed; a tier whose removal failed stayed beside the new one, paid, and read to the other
+    bots as a verified speedup. A tier parked by a noise ban counts as present, and nothing is done
+    for an entry of another commit.
+
+    Only while the head carries this bot's verdict marker (`evaluated()`, its evaluated commits,
+    read only when something is off): without one -- a comment that failed or was deleted, an older
+    schema -- the selection drops the tier and measures the head again, and restoring it here
+    flipped the label back every round."""
+    tier = (entry or {}).get("label")
+    if not head or (entry or {}).get("commit") != head or tier not in GENERIC_TIER_RANK:
+        return labels
+    want = prefix + tier
+    keep = {want, want + NOISE_PARK_SUFFIX}
+    wrong = {l for l in labels if l.startswith(prefix) and l not in keep}
+    missing = not (labels & keep)
+    if not (wrong or missing) or head not in (evaluated() or ()):
+        return labels
+    for lab in sorted(wrong):
+        remove_label(repo, num, lab)
+    if missing:
+        add_label(repo, num, want)
+    if wrong or missing:
+        print(f">> PR #{num} @ {head[:9]}: {want} restored from the recorded verdict"
+              + (f" (removed {', '.join(sorted(wrong))})" if wrong else ""))
+    return (labels - wrong) | ({want} if missing else set())
+
+
+def record_posted_verdict(load_scores, save_scores, num, commit, label, res):
+    """The scores entry of a verdict posted without the full one (a failed run -- a charged box fault
+    or timeout included -- or no delta): the head's recorded verdict must be the one on the PR. The
+    merge gate and repair_own_tier read it, and an older verdict for the same commit (a re-measure
+    charged as a failed run) otherwise stood: its passing tier would be put back."""
+    scores = load_scores()
+    scores[str(num)] = {"commit": commit, "label": label, "delta_pct": res.get("delta_pct"),
+                        "pass": bool(res.get("ok") and res.get("pass")), "onto": res.get("onto"),
+                        "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    save_scores(scores)
 
 
 def strip_own_tier_labels(repo, num, prefix):

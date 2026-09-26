@@ -1269,5 +1269,32 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(short["label"], "REJECT")
         self.assertIn("covers 3 of 149 positions", short["reason"])
 
+
+class PrefillKilledTests(unittest.TestCase):
+    def test_a_prefill_check_the_oom_killer_took_is_the_boxs(self):
+        pf = {128: [], 1024: [(0.93, 0.012)] * 3}
+        killed = evaluate(box_stdout(pf=pf) + "".join(f"PFCHECK_FAILED 128 {r} rc=137\n" for r in (1, 2, 3)))
+        self.assertTrue(killed.get("retry"), killed)
+        self.assertIn("pf-box", killed["strike_key"])
+        crashed = evaluate(box_stdout(pf=pf) + "".join(f"PFCHECK_FAILED 128 {r} rc=1\n" for r in (1, 2, 3)))
+        self.assertEqual((crashed["ok"], crashed["label"]), (True, "REJECT"))
+        # One good run and two the OOM killer took: deferred too, not passed on the one run left.
+        partial = evaluate(box_stdout(pf={128: [(0.90, 0.018)], 1024: [(0.93, 0.012)] * 3})
+                           + "PFCHECK_FAILED 128 2 rc=137\nPFCHECK_FAILED 128 3 rc=137\n")
+        self.assertTrue(partial.get("retry"), partial)
+        self.assertIn("2 of 3 runs killed", partial["reason"])
+        # rc=137 only when every attempt of the run was killed.
+        s = bot._remote_script("pull/1/head", role="pr", onto="c" * 40)
+        self.assertIn('if [ "$rc" != 137 ]; then KILLED=0; FAIL_RC=$rc; fi', s)
+        self.assertIn('echo "PFCHECK_FAILED $P $R rc=137"', s)
+
+    def test_main_needs_enough_readable_positions(self):
+        few = box_stdout(role="main").replace("SELFCHECK top1=1.0000 kl=0.000000",
+                                               "SELFCHECK top1=1.0000 kl=0.000000 n=4 n_main=4")
+        with mock.patch.object(bot, "_ssh_run_resilient", return_value=run(few)):
+            m = bot.measure_main_baseline("h", 1)
+        self.assertFalse(m["ok"])
+        self.assertIn("only 4 readable positions", m["reason"])
+
 if __name__ == "__main__":
     unittest.main()

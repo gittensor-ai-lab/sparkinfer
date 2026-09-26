@@ -354,6 +354,17 @@ def check_prefill_path(pr: dict, main: dict):
         m_k = statistics.mean(k for _, k in main_runs)
         t_bar = m_t - PF_TOP1_DROP
         k_bar = max(m_k * PF_KL_RATIO, m_k + PF_KL_ABS)
+        pr_killed = (pr.get("pfcheck_failed_box") or {}).get(p, 0)
+        if pr_killed and not pr_fail:
+            # Runs the OOM killer took on every attempt, whose trigger may be anything on the box:
+            # judged like any box fault of the PR's run (eval_bonsai_on_box's "pf-box" strike). Not
+            # REJECTed, and not dropped either -- the gate judged on the runs left used to pass.
+            problems.append(f"prefill-path check @{p}: {pr_killed} of {pr_killed + len(pr_runs)} runs "
+                            f"killed on the PR build (exit 137)")
+            rows.append({"prefix": p, "pr_runs": len(pr_runs), "main_runs": len(main_runs), "pr_top1": None,
+                         "pr_kl": None, "main_top1": m_t, "main_kl": m_k,
+                         "top1_bar": t_bar, "kl_bar": k_bar})
+            continue
         if not pr_runs:
             problems.append(f"prefill-path check @{p}: every PR run failed "
                             f"(batched prefill refused or crashed)")
@@ -367,7 +378,7 @@ def check_prefill_path(pr: dict, main: dict):
                      "pr_top1": p_t, "pr_kl": p_k, "main_top1": m_t, "main_kl": m_k,
                      "top1_bar": t_bar, "kl_bar": k_bar})
         if pr_fail:
-            problems.append(f"prefill-path check @{p}: {pr_fail} of {pr_fail + len(pr_runs)} PR "
+            problems.append(f"prefill-path check @{p}: {pr_fail} of {pr_fail + pr_killed + len(pr_runs)} PR "
                             f"runs failed (batched prefill refused or crashed)")
         if p_k > k_bar:
             problems.append(f"prefill-path check @{p}: mean KL {p_k:.4f} > bar {k_bar:.4f} "
@@ -945,7 +956,7 @@ for P in {pf_prefixes}; do
   for R in $(seq 1 {PF_RUNS}); do
     # Up to {PF_TRIES} attempts per run: one crashed process out of {PF_RUNS} used to REJECT the PR on
     # the spot. A timeout is not retried -- a hang repeats.
-    GOT=0
+    GOT=0; KILLED=1; FAIL_RC=1
     for TRY in $(seq 1 {PF_TRIES}); do
       wait_gpu_clear
       if timeout 900 build/runtime/qwen3_gguf_prefill_check "$GGUF" "$P" {PF_CONT} $IDS_P > "$PF_OUT" 2>&1; then
@@ -965,11 +976,15 @@ for P in {pf_prefixes}; do
           break
         fi
       fi
+      if [ "$rc" != 137 ]; then KILLED=0; FAIL_RC=$rc; fi
       echo "PFCHECK_RETRY $P $R attempt=$TRY exit=$rc" >&2
       tail -8 "$PF_OUT" >&2 || true
       if [ "$rc" = 124 ]; then break; fi
     done
-    if [ "$GOT" != 1 ]; then echo "PFCHECK_FAILED $P $R"; fi
+    # rc=137 only when the host OOM killer took every attempt (the box's); else the last other exit.
+    if [ "$GOT" != 1 ]; then
+      if [ "$KILLED" = 1 ]; then echo "PFCHECK_FAILED $P $R rc=137"; else echo "PFCHECK_FAILED $P $R rc=$FAIL_RC"; fi
+    fi
   done
 done
 
@@ -1076,7 +1091,7 @@ def _parse_remote(stdout: str) -> dict:
             elif head == "SELFCHECK":
                 for tok in parts[1:]:
                     k, _, v = tok.partition("=")
-                    if k in ("top1", "kl"):
+                    if k in ("top1", "kl", "n"):
                         out[f"selfcheck_{k}"] = float(v)
             elif head == "ACCURACY_NO_BASELINE":
                 out["accuracy_no_baseline"] = True
@@ -1097,7 +1112,9 @@ def _parse_remote(stdout: str) -> dict:
                     out["pfcheck"].setdefault(p, []).append((t, k))
             elif head == "PFCHECK_FAILED" and len(parts) >= 2:
                 p = int(parts[1])
-                out["pfcheck_failed"][p] = out["pfcheck_failed"].get(p, 0) + 1
+                key = "pfcheck_failed_box" if "rc=137" in parts[2:] else "pfcheck_failed"
+                out.setdefault(key, {})
+                out[key][p] = out[key].get(p, 0) + 1
             elif head == "BONSAIREG_OK":
                 out["bonsaireg_ok"] = True
             elif head == "BONSAIREG_FAILED":
@@ -1339,6 +1356,10 @@ def measure_main_baseline(host, port):
     if not main.get("score_done") or main.get("score_positions", 0) < 100:
         return {"ok": False, "reason": f"main score dump missing or short "
                                        f"({main.get('score_positions', 0)} positions)", "log": log}
+    if main.get("selfcheck_n") is not None and main["selfcheck_n"] < 100:
+        # The rows the comparator could read (a NaN row is not one): every PR is judged on these.
+        return {"ok": False, "reason": f"main score dump has only {int(main['selfcheck_n'])} readable "
+                                       f"positions", "log": log}
     if main.get("selfcheck_top1") != 1.0 or (main.get("selfcheck_kl") or 0.0) > 1e-6:
         return {"ok": False, "reason": "main score dump failed its self-comparison "
                                        f"(top1={main.get('selfcheck_top1')} kl={main.get('selfcheck_kl')})",
@@ -1410,8 +1431,13 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
                                           f"{int(pr['n_main'])} positions"))
     pf_ok, pf_problems, pf_rows = check_prefill_path(pr, main)
     if not pf_ok:
-        if all(p.endswith("measurement unavailable") for p in pf_problems):
-            deferred.append((None, "; ".join(pf_problems)))      # main's, not the PR's: no strike
+        unavailable = [p for p in pf_problems if p.endswith("measurement unavailable")]
+        killed = [p for p in pf_problems if p.endswith("killed on the PR build (exit 137)")]
+        if len(unavailable) + len(killed) == len(pf_problems):
+            if unavailable:
+                deferred.append((None, "; ".join(unavailable)))   # main's, not the PR's: no strike
+            if killed:
+                deferred.append(("pf-box", "; ".join(killed)))    # the box's, bounded by strikes
         else:
             hard.append("prefill-path accuracy gate failed: " + "; ".join(pf_problems[:4]))
 
@@ -1848,7 +1874,7 @@ def auto_merge_ok_bonsai(repo, num, require_merge_first=True, ranking_loss_ok=Fa
     if scored.get("label") not in SPEEDUP_LABELS or not scored.get("pass"):
         return False, f"recorded verdict for {head[:9]} is {scored.get('label')} (pass={scored.get('pass')})"
     # A REJECT from any other bot is a measured harm on another model.
-    if any(l.endswith(":REJECT") for l in labs if l.startswith("eval")):
+    if any(l.endswith((":REJECT", ":REJECT" + arb.NOISE_PARK_SUFFIX)) for l in labs if l.startswith("eval")):
         return False, "carries a REJECT from another eval bot"
     blocked = labs & (AUTOMERGE_BLOCK - ({BONSAI_NEEDS_REBASE} if ranking_loss_ok else set()))
     if blocked:
@@ -1932,6 +1958,9 @@ def _unmeasurable_reason(repo, pr, labs, count_gave_up=True):
     head = (pr.get("headRefOid") or "")[:40]
     if arb.strike_count(STRIKES_FILE, pr["number"], head, "harness"):
         return "edits the eval harness (found on the box)"
+    if arb.strike_count(STRIKES_FILE, pr["number"], head, "conflict"):
+        # The selection skips it until a push: kept "in the running" it held merge-first for ever.
+        return "does not merge onto main on the box (needs a rebase)"
     if pr.get("changedFiles") and pr["changedFiles"] > len(pr.get("files") or []):
         return "changes more files than GitHub lists"
     if count_gave_up and arb.gave_up(STRIKES_FILE, pr["number"], (pr.get("headRefOid") or "")[:40]):
@@ -1966,6 +1995,10 @@ def reconcile_bonsai_merge_labels(repo, dry_run=False):
     main_now = None      # read once, for a needs-rebase that may only mean a lost ranking
     for p in open_prs:
         labs = {l["name"] for l in p["labels"]}
+        if not dry_run:
+            labs = arb.repair_own_tier(repo, p["number"], labs, EVAL_PREFIX, scores.get(str(p["number"])),
+                                       (p.get("headRefOid") or "")[:40],
+                                       lambda: bonsai_evaluated_commits(repo, p["number"]))
         # A sync GitHub did not answer when this bot posted its verdict, healed -- on this bot's PRs
         # only: the retired AR bot's labels derive the generic one by another rule (the failing side).
         if not dry_run and any(l.startswith(EVAL_PREFIX) for l in labs) and arb.generic_label_out_of_sync(labs):
@@ -2208,6 +2241,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, body=""):
     arb.sync_generic_eval_label(repo, num)
     arb.gh(["pr", "comment", str(num), "-R", repo, "--body", arb.fit_comment(comment)])
     if not res.get("ok"):
+        arb.record_posted_verdict(_load_scores, _save_scores, num, commit, label, res)
         return
     # Scores first: a run that dies in the (network) log upload must not leave a posted verdict the
     # bot can neither merge nor re-measure.
@@ -2221,6 +2255,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, body=""):
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
+    else:
+        arb.record_posted_verdict(_load_scores, _save_scores, num, commit, label, res)
     upload_bonsai_eval_log(repo, num, title, commit, res)
     # Closing (module docstring): a measured REJECT closes; `none` closes only a PR declared for
     # this model alone -- this bot also scores every undeclared PR, most of them aimed elsewhere.

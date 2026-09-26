@@ -14,7 +14,7 @@
 > improvement** (`after > before`, filled from `bench/scripts/bench.sh` — *not* an isolated-kernel
 > microbenchmark). Either table alone is enough — a prefill-only PR with flat decode greenlights on
 > its prefill numbers. A ticked box with empty/placeholder tables (or no claimed gain on either
-> metric) gets `needs-benchmark` and is **not** evaluated.
+> metric) is **not** greenlit, so it is **not** evaluated.
 >
 > 📋 **Fill the tables in place — don't rename the rows.** The greenlight reads them by their row
 > labels, so keep `before prefill (main)` / `after prefill (this PR)` exactly as written and just

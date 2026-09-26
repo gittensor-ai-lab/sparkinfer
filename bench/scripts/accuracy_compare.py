@@ -108,8 +108,13 @@ def reference_dist(prefix):
 spark = {}
 for line in open(score_path):
     if not line.startswith("S "): continue
-    p = line.split(); i = int(p[1][2:]); am = int(p[3][3:]); lp = float(p[4][3:])
-    top = {int(x.split(":")[0]): float(x.split(":")[1]) for x in line.split("top=", 1)[1].split(",")}
+    try:
+        p = line.split(); i = int(p[1][2:]); am = int(p[3][3:]); lp = float(p[4][3:])
+        top = {int(x.split(":")[0]): float(x.split(":")[1]) for x in line.split("top=", 1)[1].split(",")}
+    except (IndexError, ValueError):
+        continue   # a truncated line: the position is missing, which n= / n_expected= shows
+    if not all(math.isfinite(v) for v in (lp, *top.values())):
+        continue   # a NaN row is unreadable too, not a KL of NaN nobody can parse
     spark[i] = {"am": am, "lp": lp, "top": top}
 
 match = n = 0; snll = lnll = 0.0; klsum = 0.0

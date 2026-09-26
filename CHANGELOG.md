@@ -105,7 +105,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     keeps a PR from going stale; label reads see more than 30 labels; a llama.cpp reference that
     stops answering Muse's accuracy compare is infra, not the PR's REJECT; a score dump missing
     positions fails the accuracy gate instead of passing on the positions it has; a charged box
-    fault's reason names the GPU or build cause rather than the shell line it stopped on;
+    fault's reason names the GPU or build cause rather than the shell line it stopped on; each
+    reconcile puts a bot's own tier back in line with the verdict it recorded for the head, so a
+    label write that failed no longer strands a verified speedup or keeps a replaced tier paid; a
+    conflict the box found no longer keeps a merge-first holder in the running; a NaN row in a score
+    dump is unreadable (in `main`'s, it no longer REJECTs every Bonsai PR or turns Qwen3.8's KL off
+    at that position); a parked `REJECT-p` still blocks a merge; a PR with no history in common with
+    `main` is a rebase request; Bonsai's prefill-path check killed by the OOM killer is the box's;
+    GitHub's secondary rate limit is retried;
   - the cron wrappers run the bots from their own `origin/main` worktree (made again if it breaks,
     and never one they did not make), refuse to run without a `GH_TOKEN` (or, with
     `SPARKINFER_BOT_LOGIN` set, with another account's; `.env.eval` never stands in for an empty
