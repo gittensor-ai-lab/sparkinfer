@@ -926,7 +926,7 @@ class StaleCloseTests(unittest.TestCase):
         calls = []
         with mock.patch.object(bot, "_pr_last_activity_ts", return_value=0.0), \
                 mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
-                mock.patch.object(bot, "bonsai_evaluated_commits", return_value=set()), \
+                mock.patch.object(bot, "_verdict_heads", return_value=set()), \
                 mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run("")):
             closed = bot.close_stale_bonsai_prs("o/r", prs)
         self.assertEqual(closed, {1, 3})
@@ -937,7 +937,7 @@ class StaleCloseTests(unittest.TestCase):
                dict(self._pr(2, BONSAI_ONLY_BODY), headRefOid="b" * 40)]
         with mock.patch.object(bot, "_pr_last_activity_ts", return_value=0.0), \
                 mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
-                mock.patch.object(bot, "bonsai_evaluated_commits", return_value={"b" * 40}), \
+                mock.patch.object(bot, "_verdict_heads", return_value={"b" * 40}), \
                 mock.patch.object(arb, "greenlight_status", return_value=("ok", "claims a gain")), \
                 mock.patch.object(arb, "gh", return_value=run("")):
             self.assertEqual(bot.close_stale_bonsai_prs("o/r", prs), {2})
@@ -958,7 +958,7 @@ class SelectionTests(unittest.TestCase):
                 mock.patch.object(arb, "gh", return_value=run(__import__("json").dumps(prs))), \
                 mock.patch.object(arb, "load_denylist", return_value=set()), \
                 mock.patch.object(arb, "pr_involved_logins", return_value=set()), \
-                mock.patch.object(bot, "bonsai_evaluated_commits", return_value=set()), \
+                mock.patch.object(bot, "_verdict_heads", return_value=set()), \
                 mock.patch.object(bot, "close_stale_bonsai_prs", return_value=set()), \
                 mock.patch.object(bot, "reconcile_bonsai_merge_labels"), \
                 mock.patch("builtins.print") as p:
@@ -989,7 +989,7 @@ class SelectionTests(unittest.TestCase):
                 mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: removed.append(l)), \
                 mock.patch.object(arb, "sync_generic_eval_label"), \
                 mock.patch.object(arb, "greenlight_status", return_value=("ok", "x")), \
-                mock.patch.object(bot, "bonsai_evaluated_commits",
+                mock.patch.object(bot, "_verdict_heads",
                                   return_value=None if evaluated is None else set(evaluated)), \
                 mock.patch.object(bot, "auto_merge_ok_bonsai", return_value=gate), \
                 mock.patch.object(arb, "labels_on", return_value=set()), \
@@ -1287,6 +1287,17 @@ class PrefillKilledTests(unittest.TestCase):
         s = bot._remote_script("pull/1/head", role="pr", onto="c" * 40)
         self.assertIn('if [ "$rc" != 137 ]; then KILLED=0; FAIL_RC=$rc; fi', s)
         self.assertIn('echo "PFCHECK_FAILED $P $R rc=137"', s)
+
+    def test_runs_that_completed_wrong_are_judged_beside_a_killed_one(self):
+        wrong = evaluate(box_stdout(pf={128: [(0.40, 0.9)] * 2, 1024: [(0.93, 0.012)] * 3})
+                         + "PFCHECK_FAILED 128 3 rc=137\n")
+        self.assertEqual((wrong["ok"], wrong["label"]), (True, "REJECT"), wrong.get("reason"))
+        self.assertIn("prefill-path accuracy gate failed", wrong["reason"])
+
+    def test_a_hang_is_not_retried_and_a_killed_score_step_is_the_boxs(self):
+        s = bot._remote_script("pull/1/head", role="pr", onto="c" * 40)
+        self.assertIn('if [ "$rc" = 124 ]; then break; fi', s)             # a hang repeats: not retried
+        self.assertTrue(bot._is_infra_failure("", "RETRYABLE_INFRA_FAILURE score step killed (exit 137)\n"))
 
     def test_main_needs_enough_readable_positions(self):
         few = box_stdout(role="main").replace("SELFCHECK top1=1.0000 kl=0.000000",

@@ -414,9 +414,10 @@ score. These paths are protected:
 
 ⚠️ **Two of these sit inside paths you're otherwise invited to edit.** `runtime/examples/dspark_tau_check.cpp`
 and the eval prompt corpora under `bench/scripts/` belong to the harness even though `runtime/` is
-a contributor path. A PR touching any harness path is **skipped, not closed** — the bot comments
-saying so and never spends GPU time on it, because a number produced by a modified instrument
-can't be accepted either way. Split the harness change out and the rest evaluates normally.
+a contributor path. A PR touching any harness path is **skipped** — the bot never spends GPU time on
+it, because a number produced by a modified instrument can't be accepted either way (the failing
+`sensitive-paths-guard` check below says why). It waits on you like any other PR, so the stale close
+applies. Split the harness change out and the rest evaluates normally.
 
 **Enforcement.** A required **`sensitive-paths-guard`** check automatically fails any PR from a
 non-maintainer that touches these paths, and `CODEOWNERS` requires maintainer review — so such

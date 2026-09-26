@@ -1323,10 +1323,15 @@ if [ -n "$FORK" ] && ! git merge-base --is-ancestor "$FORK" {onto_q} 2>/dev/null
   exit 1
 fi
 if ! MERGE_OUT=$(LC_ALL=C git -c user.name=sparkinfer-eval -c user.email=eval@sparkinfer.invalid merge -q --no-ff --no-edit "$PR_TIP" 2>&1); then
-  # Only unmerged paths -- or no history in common with main at all -- make it the PR's to fix (a
-  # rebase); anything else (a full disk, say) is the box's. A conflict is remembered for the head
-  # and not measured again until a push.
-  if [ -n "$(git ls-files -u 2>/dev/null | head -1)" ] || printf '%s' "$MERGE_OUT" | grep -q "unrelated histories"; then
+  printf '%s\\n' "$MERGE_OUT" | tail -5 | sed 's/^/  git: /' >&2      # never read as a marker
+  # Only unmerged paths -- or no history in common with main at all (in a full clone: a shallow one
+  # cuts history off) -- make it the PR's to fix (a rebase); anything else (a full disk, say) is the
+  # box's. A conflict is remembered for the head and not measured again until a push.
+  UNRELATED=0
+  if printf '%s' "$MERGE_OUT" | grep -q "unrelated histories" && [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = false ]; then
+    UNRELATED=1
+  fi
+  if [ -n "$(git ls-files -u 2>/dev/null | head -1)" ] || [ "$UNRELATED" = 1 ]; then
     git merge --abort 2>/dev/null || true
     echo "MERGE_CONFLICT_TIP $(git rev-parse "$PR_TIP")" >&2
     echo "MERGE_CONFLICT $(git rev-parse --short "$PR_TIP") does not merge cleanly onto $(git rev-parse --short {onto_q})" >&2
@@ -1847,6 +1852,24 @@ def evaluated_commits_from(repo, num, marker_re, title):
     return done
 
 
+def recorded_verdict_heads(evaluated, entry):
+    """Of the commits carrying a bot's verdict marker (evaluated_commits_from), the one its scores
+    file records as the PR's latest verdict (`entry`; record_posted_verdict records every posted
+    one): the set every "already measured?" question asks -- the selection, the stale close, the
+    tier strip and repair_own_tier. A head reset to a commit measured earlier (an author undoing a
+    push) kept the tier of the commit it replaced: it counted as measured, was never ranked or
+    measured again, and was stale-closed. It is measured again now. None stays None (unknown). With
+    no entry at all -- a scores file missing or never written, as on a new controller -- the markers
+    alone decide: counting every head unmeasured stripped tiers the bot would never measure again
+    (another model's PRs)."""
+    if evaluated is None:
+        return None
+    commit = (entry or {}).get("commit")
+    if not commit:
+        return set(evaluated)
+    return {c for c in evaluated if c == commit}
+
+
 def round_guard_sh(bot):
     """Bash run first in a model bot's remote script: stop whatever a previous round left running.
 
@@ -2080,6 +2103,8 @@ def generic_label_out_of_sync(labels):
     bot's reconcile re-syncs such a PR every round: a sync that failed when a verdict was posted
     (a label read or write GitHub did not answer) otherwise stayed wrong until the next verdict --
     the generic label is what SN74 pays on."""
+    if any(l.startswith("eval") and l.endswith(NOISE_PARK_SUFFIX) for l in labels):
+        return False           # a noise ban parked a tier: noise_penalty.py restores the set as a whole
     want = _derived_generic_tier(labels)
     return want is not None and {l for l in labels if l.startswith("eval:")} != {f"eval:{want}"}
 

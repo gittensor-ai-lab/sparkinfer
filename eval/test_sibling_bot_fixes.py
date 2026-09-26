@@ -361,7 +361,7 @@ class SelectionTests(unittest.TestCase):
                 mock.patch.object(arb, "gh", return_value=run(json.dumps(prs))), \
                 mock.patch.object(arb, "load_denylist", return_value=set()), \
                 mock.patch.object(arb, "pr_involved_logins", return_value=set()), \
-                mock.patch.object(muse, "museglimmer_evaluated_commits", return_value=set()), \
+                mock.patch.object(muse, "_verdict_heads", return_value=set()), \
                 mock.patch.object(muse, "reconcile_museglimmer_merge_labels"), \
                 mock.patch("builtins.print") as p:
             muse.main()
@@ -389,7 +389,7 @@ class SelectionTests(unittest.TestCase):
             calls = []
             with self.subTest(mod.__name__), mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
                     mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
-                    mock.patch.object(mod, _e.__name__, return_value=set()), \
+                    mock.patch.object(mod, "_verdict_heads", return_value=set()), \
                     mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run()):
                 self.assertEqual(close_stale("o/r", prs), {1})
                 self.assertFalse(any("push a new commit / open" in " ".join(c) for c in calls))
@@ -514,10 +514,9 @@ class StaleAndFreshnessTests(unittest.TestCase):
         for mod, _p, _f, _r, _o, _t, _rc, _e, close_stale, key in BOTS:
             prs = [{"number": 1, "body": TEMPLATE, "isDraft": False, "labels": [], "headRefOid": "a" * 40},
                    {"number": 2, "body": TEMPLATE, "isDraft": False, "labels": [], "headRefOid": "b" * 40}]
-            ev = "museglimmer_evaluated_commits" if mod is muse else "qwen38_evaluated_commits"
             with self.subTest(mod.__name__), mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
                     mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
-                    mock.patch.object(mod, ev, side_effect=lambda r, n: {"b" * 40}), \
+                    mock.patch.object(mod, "_verdict_heads", side_effect=lambda r, n: {"b" * 40}), \
                     mock.patch.object(arb, "greenlight_status", return_value=("ok", "claims a gain")), \
                     mock.patch.object(arb, "gh", return_value=run()):
                 # #1 is queued behind the bot; #2 already has its verdict and waits on its author.
@@ -525,7 +524,7 @@ class StaleAndFreshnessTests(unittest.TestCase):
             with self.subTest(mod.__name__, greenlit=False), \
                     mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
                     mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
-                    mock.patch.object(mod, ev, return_value=set()), \
+                    mock.patch.object(mod, "_verdict_heads", return_value=set()), \
                     mock.patch.object(arb, "greenlight_status", return_value=("unchecked", "box not ticked")), \
                     mock.patch.object(arb, "gh", return_value=run()):
                 # Never measured and not asking to be: not this bot's queue, left to the daily Action
@@ -674,7 +673,7 @@ class Round2ReviewTests(unittest.TestCase):
                 mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: removed.append(l)), \
                 mock.patch.object(arb, "labels_on", return_value=set()), \
                 mock.patch.object(arb, "sync_generic_eval_label"), \
-                mock.patch.object(mod, f"{tag}_evaluated_commits",
+                mock.patch.object(mod, "_verdict_heads",
                                   return_value=None if evaluated is None else set(evaluated)), \
                 mock.patch.object(mod, ok_fn.__name__, return_value=gate), \
                 mock.patch.object(mod, "_load_scores", return_value=scores), \
@@ -794,7 +793,7 @@ class WiringTests(unittest.TestCase):
                     mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
                     mock.patch.object(arb, "load_denylist", return_value=set()), \
                     mock.patch.object(arb, "pr_involved_logins", return_value=set()), \
-                    mock.patch.object(mod, f"{tag}_evaluated_commits", return_value=set()), \
+                    mock.patch.object(mod, "_verdict_heads", return_value=set()), \
                     mock.patch.object(mod, "resolve_ssh", return_value=("h", 1)), \
                     mock.patch.object(arb, "hold_bot_lock", return_value=False) as lock, \
                     mock.patch.object(mod, "measure_main_baseline") as baseline, \
@@ -968,7 +967,7 @@ class Round3Tests(unittest.TestCase):
                     mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
                     mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
                     mock.patch.object(mod, "_remeasure_against_new_main", return_value=False), \
-                    mock.patch.object(mod, f"{tag}_evaluated_commits", return_value={"a" * 40}), \
+                    mock.patch.object(mod, "_verdict_heads", return_value={"a" * 40}), \
                     mock.patch.object(arb, "gh", return_value=run()):
                 self.assertEqual(getattr(mod, f"close_stale_{tag}_prs")("o/r", prs), {7})
 
@@ -1022,7 +1021,7 @@ class Round4Tests(unittest.TestCase):
                         mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: removed.append(l)), \
                         mock.patch.object(arb, "labels_on", return_value=set()), \
                         mock.patch.object(arb, "sync_generic_eval_label"), \
-                        mock.patch.object(mod, f"{tag}_evaluated_commits", return_value={"a" * 40}), \
+                        mock.patch.object(mod, "_verdict_heads", return_value={"a" * 40}), \
                         mock.patch.object(mod, f"reconcile_{tag}_merge_labels"), \
                         mock.patch("builtins.print"):
                     mod.main()
@@ -1058,7 +1057,7 @@ class Round5Tests(unittest.TestCase):
         with mock.patch.object(mod, "_pr_last_activity_ts", return_value=0.0), \
                 mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED), \
                 mock.patch.object(arb, "gh", return_value=run()), \
-                mock.patch.object(mod, f"{tag}_evaluated_commits", return_value={"a" * 40}):
+                mock.patch.object(mod, "_verdict_heads", return_value={"a" * 40}):
             ctx = [mock.patch.object(*p) for p in patches.get("extra", ())]
             for c in ctx:
                 c.start()
@@ -1103,7 +1102,7 @@ class Round5Tests(unittest.TestCase):
                 mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
                 mock.patch.object(arb, "load_denylist", return_value=set()), \
                 mock.patch.object(arb, "pr_involved_logins", return_value=set()), \
-                mock.patch.object(mod, f"{tag}_evaluated_commits", return_value=set()), \
+                mock.patch.object(mod, "_verdict_heads", return_value=set()), \
                 mock.patch.object(mod, "resolve_ssh", return_value=("h", 1)), \
                 mock.patch.object(arb, "hold_bot_lock", return_value=True), \
                 mock.patch.object(mod, "measure_main_baseline",
@@ -1224,7 +1223,7 @@ class Iteration3Tests(unittest.TestCase):
                 mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
                 mock.patch.object(arb, "load_denylist", return_value=set()), \
                 mock.patch.object(arb, "pr_involved_logins", return_value=set()), \
-                mock.patch.object(mod, f"{tag}_evaluated_commits", return_value=set()), \
+                mock.patch.object(mod, "_verdict_heads", return_value=set()), \
                 mock.patch.object(mod, "resolve_ssh", side_effect=RuntimeError("no box in tests")), \
                 mock.patch.object(mod, f"reconcile_{tag}_merge_labels"), \
                 mock.patch("builtins.print") as p:
@@ -1506,7 +1505,7 @@ class Iteration4Tests(unittest.TestCase):
                 mock.patch.object(arb, "current_main_sha", return_value=main), \
                 mock.patch.object(arb, "greenlight_status", return_value=("ok", "claims a gain")), \
                 mock.patch.object(mod, "_load_scores", return_value=scores or {}), \
-                mock.patch.object(mod, f"{tag}_evaluated_commits", return_value=set(evaluated)), \
+                mock.patch.object(mod, "_verdict_heads", return_value=set(evaluated)), \
                 mock.patch("builtins.print"):
             return getattr(mod, f"close_stale_{tag}_prs")("o/r", prs, dry_run=dry_run)
 
@@ -1914,7 +1913,7 @@ class Iteration5Tests(unittest.TestCase):
                     mock.patch.object(mod.time, "time", return_value=10 * DAY), \
                     mock.patch.object(arb, "gh", return_value=run()), \
                     mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
-                    mock.patch.object(mod, f"{tag}_evaluated_commits", return_value={"a" * 40}), \
+                    mock.patch.object(mod, "_verdict_heads", return_value={"a" * 40}), \
                     mock.patch.object(arb.AuthorWaitClock, "since", lambda self, n, h: 8 * DAY), \
                     mock.patch("builtins.print"):
                 # Handed back at day 8: closed a day later, whatever date the commit claims.
@@ -1923,7 +1922,7 @@ class Iteration5Tests(unittest.TestCase):
                     mock.patch.object(mod.time, "time", return_value=10 * DAY), \
                     mock.patch.object(arb, "gh", return_value=run()), \
                     mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
-                    mock.patch.object(mod, f"{tag}_evaluated_commits", return_value={"a" * 40}), \
+                    mock.patch.object(mod, "_verdict_heads", return_value={"a" * 40}), \
                     mock.patch.object(arb.AuthorWaitClock, "since", lambda self, n, h: 9.5 * DAY), \
                     mock.patch("builtins.print"):
                 self.assertEqual(getattr(mod, f"close_stale_{tag}_prs")("o/r", [Iteration4Tests._pr(self)]), set())
@@ -2110,7 +2109,7 @@ class Iteration6Tests(unittest.TestCase):
         return Iteration5Tests._bots(self)
 
     def _reconcile(self, mod, tag, prs, scores, evaluated=("a" * 40,)):
-        with mock.patch.object(mod, f"{tag}_evaluated_commits", return_value=set(evaluated)):
+        with mock.patch.object(mod, "_verdict_heads", return_value=set(evaluated)):
             return Iteration5Tests._reconcile(self, mod, tag, prs, scores)
 
     def test_a_tier_whose_label_write_failed_is_put_back_from_the_recorded_verdict(self):
@@ -2209,14 +2208,15 @@ class Iteration6Tests(unittest.TestCase):
     def test_a_nan_row_is_unreadable_on_both_sides(self):
         import subprocess
         d = _tempfile.mkdtemp(dir=_STATE)
-        nan = "S i=5 tgt=5 am=5 lp=-nan top=5:-nan,6:-nan\n"
+        nan = lambda i: f"S i={i} tgt=5 am=5 lp=-nan top=5:-nan,6:-nan\n"
+        lp_nan = lambda i: f"S i={i} tgt=5 am=5 lp=nan top=5:-0.1,6:-2.5\n"      # a NaN in lp alone
         good = lambda i: f"S i={i} tgt=5 am=5 lp=-0.1 top=5:-0.1,6:-2.5\n"
         with open(_os.path.join(d, "main.txt"), "w") as f:
-            f.write("".join(nan if i == 5 else good(i) for i in range(10)) + "S i=10 tgt=5 am")   # + a truncated line
+            f.write("".join(nan(i) if i == 5 else good(i) for i in range(10)) + "S i=10 tgt=5 am")   # + truncated
         with open(_os.path.join(d, "pr_ok.txt"), "w") as f:
             f.write("".join(good(i) for i in range(10)))
         with open(_os.path.join(d, "pr_nan.txt"), "w") as f:
-            f.write("".join(nan if i == 3 else good(i) for i in range(10)))
+            f.write("".join(nan(i) if i == 3 else lp_nan(i) if i == 7 else good(i) for i in range(10)))
         pair = _os.path.join(self.ROOT, "bench/scripts/accuracy_compare_pair.py")
         metric = lambda a, b, *x: next(l for l in subprocess.run(
             ["python3", pair, _os.path.join(d, a), _os.path.join(d, b), *x], capture_output=True, text=True,
@@ -2225,7 +2225,7 @@ class Iteration6Tests(unittest.TestCase):
         self.assertIn("top1=1.000000 kl=0.000000", selfcheck)
         self.assertNotIn("nan", selfcheck)                               # main's NaN row left out, not NaN
         self.assertIn("n=9 n_main=9", metric("pr_ok.txt", "main.txt"))   # a clean PR: judged on the rest
-        self.assertIn("n=8 n_main=9", metric("pr_nan.txt", "main.txt"))  # a PR's NaN: coverage fails
+        self.assertIn("n=7 n_main=9", metric("pr_nan.txt", "main.txt"))  # a PR's NaNs: coverage fails
 
         def ok(h):
             h.rfile.read(int(h.headers["Content-Length"]))
@@ -2237,10 +2237,69 @@ class Iteration6Tests(unittest.TestCase):
             h.wfile.write(body)
         def dump(path, positions):
             with open(path, "w") as f:
-                f.write("".join(nan if i == 3 else good(i) for i in positions))
+                f.write("".join(nan(i) if i == 3 else good(i) for i in positions))
         self._dump = dump                                                # the PR's dump, with a NaN row
         r = Iteration5bTests._compare(self, Iteration5bTests._serve(self, ok), range(8))
         self.assertIn(" n=7 n_expected=8", r.stdout)                     # Muse: a gap, not "kl=nan"
+
+
+
+class Iteration7Tests(unittest.TestCase):
+    """Fixes from the post-merge review of main e73fa96, on all three bots."""
+
+    def _bots(self):
+        return Iteration5Tests._bots(self)
+
+    def test_a_head_reset_to_a_commit_measured_earlier_is_measured_again(self):
+        # H0 (a) was measured, then H1 (b) -- REJECT, recorded; the author undoes H1 with a force-push.
+        self.assertEqual(arb.recorded_verdict_heads({"a" * 40, "b" * 40}, {"commit": "b" * 40}), {"b" * 40})
+        self.assertIsNone(arb.recorded_verdict_heads(None, {"commit": "b" * 40}))
+        # No scores entry at all (a new controller, a missing file): the markers alone decide.
+        self.assertEqual(arb.recorded_verdict_heads({"a" * 40}, None), {"a" * 40})
+        for mod, tag, rebase, prefix, first in self._bots():
+            pr = Iteration3cTests._pr(self, labels=[{"name": prefix + "REJECT"}, {"name": "eval:REJECT"}])
+            removed = []
+            with self.subTest(tag):
+                code, out = Iteration3Tests._run_main(
+                    self, mod, tag, run(json.dumps([pr])),
+                    extra=((mod, f"{tag}_evaluated_commits", mock.Mock(return_value={"a" * 40, "b" * 40})),
+                           (mod, "_load_scores", mock.Mock(return_value={"5": {"commit": "b" * 40, "label": "REJECT"}})),
+                           (arb, "remove_label", mock.Mock(side_effect=lambda r, n, l: removed.append(l))),
+                           (arb, "labels_on_or_none", mock.Mock(return_value=set()))))
+                self.assertNotIn("already", out)                            # not skipped as measured
+                self.assertIn(prefix + "REJECT", removed)                   # H1's tier is not H0's
+
+    def test_the_heal_leaves_a_noise_ban_alone(self):
+        self.assertFalse(arb.generic_label_out_of_sync({"eval-museglimmer:none", "eval-qwen38:XL-p", "eval:XL-p"}))
+        self.assertTrue(arb.generic_label_out_of_sync({"eval-museglimmer:none", "eval-qwen38:XL", "eval:none"}))
+
+    def test_no_verdict_close_when_the_verdict_comment_did_not_post(self):
+        for mod, tag, *_ in self._bots():
+            calls = []
+
+            def fake_gh(a):
+                calls.append(a)
+                if a[:2] == ["pr", "comment"] and "auto-close" not in " ".join(a):
+                    return run("", 1)                                         # the verdict's comment fails
+                return run(json.dumps({"headRefOid": "a" * 40, "state": "OPEN", "isDraft": False, "labels": []}))
+            res = {"ok": True, "label": "REJECT", "delta_pct": -9.0, "pass": False, "accuracy_ok": True,
+                   "reason": "decode@128 regressed"}
+            kw = {"body": BONSAI_ONLY} if tag == "bonsai" else {"pr_body": TEMPLATE}
+            with self.subTest(tag), mock.patch.object(arb, "gh", side_effect=fake_gh), \
+                    mock.patch.object(arb, "add_label"), mock.patch.object(arb, "remove_label"), \
+                    mock.patch.object(arb, "sync_generic_eval_label"), \
+                    mock.patch.object(arb, "labels_on_or_none", return_value=set()), \
+                    mock.patch.object(mod, f"strip_{tag}_eval_labels"), \
+                    mock.patch.object(mod, f"upload_{tag}_eval_log"), \
+                    mock.patch.object(mod, "format_comment", return_value="the verdict comment"), \
+                    mock.patch.object(mod, "_load_scores", return_value={}), \
+                    mock.patch.object(mod, "_save_scores"), mock.patch("builtins.print"):
+                if tag == "bonsai":
+                    with mock.patch.object(mod, "AUTO_CLOSE", True):
+                        mod.apply_result("o/r", 1, "a" * 40, res, **kw)
+                else:
+                    mod.apply_result("o/r", 1, "a" * 40, res, **kw)
+            self.assertFalse(any(c[:2] == ["pr", "close"] for c in calls), tag)
 
 
 if __name__ == "__main__":

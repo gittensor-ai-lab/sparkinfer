@@ -112,7 +112,9 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     dump is unreadable (in `main`'s, it no longer REJECTs every Bonsai PR or turns Qwen3.8's KL off
     at that position); a parked `REJECT-p` still blocks a merge; a PR with no history in common with
     `main` is a rebase request; Bonsai's prefill-path check killed by the OOM killer is the box's;
-    GitHub's secondary rate limit is retried;
+    GitHub's secondary rate limit is retried; a head reset to a commit measured earlier is measured
+    again instead of keeping the replaced commit's tier; a REJECT is not closed over a verdict
+    comment that did not post; the generic-label heal leaves a noise ban's parked labels alone;
   - the cron wrappers run the bots from their own `origin/main` worktree (made again if it breaks,
     and never one they did not make), refuse to run without a `GH_TOKEN` (or, with
     `SPARKINFER_BOT_LOGIN` set, with another account's; `.env.eval` never stands in for an empty

@@ -1759,17 +1759,33 @@ class MergeStepTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(bot.base_ahead_line(r.stdout, r.stderr), "")
 
-    def test_a_pr_with_no_history_in_common_is_a_rebase_request(self):
+    def _orphan_pr(self):
         self.g("checkout", "-q", "--orphan", "stray", cwd=self.work)
         with open(os.path.join(self.work, "kernel.cu"), "w") as fh:
             fh.write("unrelated\n")
         self.g("add", "-A", cwd=self.work)
         self.g("commit", "-qm", "stray", cwd=self.work)
         self.g("push", "-qf", "origin", "HEAD:refs/pull/1/head", cwd=self.work)
+        return self.g("rev-parse", "HEAD", cwd=self.work).stdout.strip()
+
+    def test_a_pr_with_no_history_in_common_is_a_rebase_request(self):
+        self._orphan_pr()
         r = self._run()
         self.assertEqual(r.returncode, 1)
         self.assertTrue(bot.merge_conflict_line(r.stdout, r.stderr).startswith("MERGE_CONFLICT "), r.stderr)
         self.assertNotIn("RETRYABLE_INFRA_FAILURE", r.stderr)
+
+    def test_a_shallow_box_clone_is_the_boxs_not_a_rebase_request(self):
+        stray = self._orphan_pr()
+        shallow = os.path.join(self.t, "shallow")
+        self.g("clone", "-q", "--depth", "1", "file://" + self.origin, shallow)
+        script = "set -euo pipefail\n" + bot.merged_checkout_script("pull/1/head", self.main, ("bench/scripts/",))
+        r = self.sp.run(["bash", "-c", script], cwd=shallow, capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            return                                                  # git grafted the histories: nothing to judge
+        self.assertEqual(bot.merge_conflict_line(r.stdout, r.stderr), "", r.stderr)
+        self.assertIn("RETRYABLE_INFRA_FAILURE", r.stderr)
+        self.assertTrue(stray)
 
     def test_the_harness_is_compared_with_the_baseline_not_the_newest_main(self):
         # main moved after the round measured it, with a harness change; a PR on the old base that
@@ -1785,6 +1801,10 @@ class MergeStepTests(unittest.TestCase):
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(bot.harness_touched_line(r.stdout, r.stderr), "")
+
+    def test_gits_own_output_can_never_read_as_a_marker(self):
+        s = bot.merged_checkout_script("pull/1/head", "c" * 40, ("bench/",))
+        self.assertIn("sed 's/^/  git: /'", s)
 
     def test_a_marker_in_a_later_steps_output_is_not_the_checkouts(self):
         out = "PR_TIP " + "a" * 40 + "\nMERGED_ONTO ccccccc\nREMOTE_HEAD d\n"

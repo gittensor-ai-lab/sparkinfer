@@ -190,7 +190,10 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
   round's baseline (`BASE_AHEAD`: rebased after the round measured `main`), which would otherwise
   carry `main`'s newer commits in as its own; it is measured next round, with no strike. A PR based
   on a branch other than `main` is not evaluated.
-- **What a verdict is for.** The PR tip the box built, measured against one `main` commit.
+- **What a verdict is for.** The PR tip the box built, measured against one `main` commit. A head
+  counts as measured only while its verdict is the one the bot last recorded for the PR
+  (`arb.recorded_verdict_heads`): a head reset to a commit measured earlier (an author undoing a
+  push) is measured again, instead of keeping the replaced commit's tier and being stale-closed.
   - When the head moves, the bot's `eval-<model>:<tier>` from the older head is removed and the
     generic `eval:*` re-derived (dropped when no other bot's tier is left).
   - Every bot also drops other bots' tier and merge-first labels that no verdict of theirs on the

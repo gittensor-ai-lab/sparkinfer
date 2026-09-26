@@ -355,7 +355,11 @@ def check_prefill_path(pr: dict, main: dict):
         t_bar = m_t - PF_TOP1_DROP
         k_bar = max(m_k * PF_KL_RATIO, m_k + PF_KL_ABS)
         pr_killed = (pr.get("pfcheck_failed_box") or {}).get(p, 0)
-        if pr_killed and not pr_fail:
+        # Beside runs that completed wrong, a killed one changes nothing: a box fault cannot fake a
+        # wrong result, so the PR is judged on the runs it has (below).
+        completed_fail = bool(pr_runs) and (
+            statistics.mean(k for _, k in pr_runs) > k_bar or statistics.mean(t for t, _ in pr_runs) < t_bar)
+        if pr_killed and not pr_fail and not completed_fail:
             # Runs the OOM killer took on every attempt, whose trigger may be anything on the box:
             # judged like any box fault of the PR's run (eval_bonsai_on_box's "pf-box" strike). Not
             # REJECTed, and not dropped either -- the gate judged on the runs left used to pass.
@@ -392,6 +396,12 @@ def check_prefill_path(pr: dict, main: dict):
 def bonsai_evaluated_commits(repo, num):
     """Head commits that already carry a real verdict. A marker with label null does not count."""
     return arb.evaluated_commits_from(repo, num, MARKER_RE, "sparkinfer bonsai auto-eval")
+
+
+def _verdict_heads(repo, num):
+    """The heads this bot counts as measured: carrying its verdict marker AND recorded as the PR's
+    latest verdict (arb.recorded_verdict_heads). None when GitHub did not answer."""
+    return arb.recorded_verdict_heads(bonsai_evaluated_commits(repo, num), _load_scores().get(str(num)))
 
 
 def strip_bonsai_eval_labels(repo, num):
@@ -509,7 +519,7 @@ def close_stale_bonsai_prs(repo, prs, dry_run=False):
             if main_now:                       # not on an unanswered main read: unknown keeps the clock
                 clock.forget(num)
             continue
-        evaluated = bonsai_evaluated_commits(repo, num)
+        evaluated = _verdict_heads(repo, num)
         if evaluated is None:
             note(f"PR #{num}: idle {age_days:.1f}d; GitHub did not return its comments — kept open")
             continue
@@ -1998,7 +2008,7 @@ def reconcile_bonsai_merge_labels(repo, dry_run=False):
         if not dry_run:
             labs = arb.repair_own_tier(repo, p["number"], labs, EVAL_PREFIX, scores.get(str(p["number"])),
                                        (p.get("headRefOid") or "")[:40],
-                                       lambda: bonsai_evaluated_commits(repo, p["number"]))
+                                       lambda: _verdict_heads(repo, p["number"]))
         # A sync GitHub did not answer when this bot posted its verdict, healed -- on this bot's PRs
         # only: the retired AR bot's labels derive the generic one by another rule (the failing side).
         if not dry_run and any(l.startswith(EVAL_PREFIX) for l in labs) and arb.generic_label_out_of_sync(labs):
@@ -2239,7 +2249,10 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, body=""):
     # Mirrored to the generic eval:* label (explicit decision 2026-09-24), derived from every
     # per-bot label so a `none` here cannot erase another model's real tier.
     arb.sync_generic_eval_label(repo, num)
-    arb.gh(["pr", "comment", str(num), "-R", repo, "--body", arb.fit_comment(comment)])
+    # Whether the verdict posted: without its marker the head is measured again next round, so it is
+    # not closed over a verdict nobody can read (the close comment points to it).
+    posted = getattr(arb.gh(["pr", "comment", str(num), "-R", repo, "--body", arb.fit_comment(comment)]),
+                     "returncode", 0) == 0
     if not res.get("ok"):
         arb.record_posted_verdict(_load_scores, _save_scores, num, commit, label, res)
         return
@@ -2294,7 +2307,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, body=""):
         return
     # Not over a commit the author has already replaced (a push landing while this PR was being
     # measured gets its own evaluation next round), nor over a `hold` or a draft made meanwhile.
-    why = arb.verdict_close_blocker(repo, num, commit)
+    why = arb.verdict_close_blocker(repo, num, commit) if posted else "its verdict comment did not post"
     if why:
         print(f">> PR #{num}: not closed — {why}")
         return
@@ -2375,7 +2388,7 @@ def main():
         if (not quiet and (pr.get("isDraft") or arb.HOLD_LABEL in labs0)
                 and any(l.startswith(EVAL_PREFIX) or l == BONSAI_NEEDS_REBASE for l in labs0)
                 and arb.strip_stale_verdict_labels(args.repo, num, labs0, EVAL_PREFIX, head0,
-                                                   bonsai_evaluated_commits(args.repo, num), BONSAI_NEEDS_REBASE,
+                                                   _verdict_heads(args.repo, num), BONSAI_NEEDS_REBASE,
                                                    arb.pr_merge_conflict(pr.get("mergeable"))
                 or bool(arb.strike_count(STRIKES_FILE, num, (pr.get("headRefOid") or "")[:40], "conflict")))):
             print(f"PR #{num} @ {head0[:9]}: no bonsai verdict for this head yet — dropped the old eval-bonsai label")
@@ -2394,7 +2407,7 @@ def main():
         head = (pr.get("headRefOid") or "")[:40]
         short = head[:9]
         remeasure = False
-        evaluated = bonsai_evaluated_commits(args.repo, num)
+        evaluated = _verdict_heads(args.repo, num)
         if evaluated is None:
             # Not "no verdict yet": re-measuring, or dropping its labels, on a failed read is wrong.
             print(f"PR #{num} @ {short}: GitHub did not return its comments — skipped this round")

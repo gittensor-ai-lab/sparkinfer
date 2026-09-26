@@ -532,6 +532,12 @@ def museglimmer_evaluated_commits(repo, num):
     return arb.evaluated_commits_from(repo, num, MARKER_RE, "sparkinfer museglimmer auto-eval")
 
 
+def _verdict_heads(repo, num):
+    """The heads this bot counts as measured: carrying its verdict marker AND recorded as the PR's
+    latest verdict (arb.recorded_verdict_heads). None when GitHub did not answer."""
+    return arb.recorded_verdict_heads(museglimmer_evaluated_commits(repo, num), _load_scores().get(str(num)))
+
+
 def strip_museglimmer_eval_labels(repo, num):
     arb.strip_own_tier_labels(repo, num, EVAL_PREFIX)
 
@@ -624,7 +630,7 @@ def close_stale_museglimmer_prs(repo, prs, dry_run=False):
             if main_now:                       # not on an unanswered main read: unknown keeps the clock
                 clock.forget(num)
             continue
-        evaluated = museglimmer_evaluated_commits(repo, num)
+        evaluated = _verdict_heads(repo, num)
         if evaluated is None:
             note(f"PR #{num}: idle {age_days:.1f}d; GitHub did not return its comments — kept open")
             continue
@@ -2306,7 +2312,7 @@ def reconcile_museglimmer_merge_labels(repo, dry_run=False):
         if not dry_run:
             labs = open_labels[num] = arb.repair_own_tier(
                 repo, num, labs, EVAL_PREFIX, scores.get(str(num)), (open_by_num[num].get("headRefOid") or "")[:40],
-                lambda: museglimmer_evaluated_commits(repo, num))
+                lambda: _verdict_heads(repo, num))
         # A sync GitHub did not answer when this bot posted its verdict, healed -- on this bot's PRs
         # only: the retired AR bot's labels derive the generic one by another rule (the failing side).
         if not dry_run and any(l.startswith(EVAL_PREFIX) for l in labs) and arb.generic_label_out_of_sync(labs):
@@ -2570,7 +2576,10 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
     # directly let a `none` here erase another model's real tier depending purely on which
     # staggered cron ran last. See arb.sync_generic_eval_label().
     arb.sync_generic_eval_label(repo, num)
-    arb.gh(["pr", "comment", str(num), "-R", repo, "--body", arb.fit_comment(body)])
+    # Whether the verdict posted: without its marker the head is measured again next round, so it is
+    # not closed over a verdict nobody can read (the close comment points to it).
+    posted = getattr(arb.gh(["pr", "comment", str(num), "-R", repo, "--body", arb.fit_comment(body)]),
+                     "returncode", 0) == 0
     # Scores first: a run that dies in the (network) log upload must not leave a posted verdict the
     # bot can neither merge nor re-measure.
     if res.get("ok") and res.get("delta_pct") is not None:
@@ -2686,7 +2695,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
                 )
             # Not over a commit the author has already replaced (a push while it was measured),
             # nor over a `hold` or a draft made while the round ran.
-            why = arb.verdict_close_blocker(repo, num, commit)
+            why = arb.verdict_close_blocker(repo, num, commit) if posted else "its verdict comment did not post"
             if why:
                 print(f">> PR #{num}: not closed — {why}")
                 return
@@ -2763,7 +2772,7 @@ def main():
         if (not args.dry_run and (pr.get("isDraft") or arb.HOLD_LABEL in labs0)
                 and any(l.startswith(EVAL_PREFIX) or l == MUSEGLIMMER_NEEDS_REBASE for l in labs0)
                 and arb.strip_stale_verdict_labels(args.repo, num, labs0, EVAL_PREFIX, head0,
-                                                   museglimmer_evaluated_commits(args.repo, num), MUSEGLIMMER_NEEDS_REBASE,
+                                                   _verdict_heads(args.repo, num), MUSEGLIMMER_NEEDS_REBASE,
                                                    arb.pr_merge_conflict(pr.get("mergeable"))
                 or bool(arb.strike_count(STRIKES_FILE, num, (pr.get("headRefOid") or "")[:40], "conflict")))):
             print(f"PR #{num} @ {head0[:9]}: no museglimmer verdict for this head yet — dropped the old eval-museglimmer label")
@@ -2786,7 +2795,7 @@ def main():
         head = (pr.get("headRefOid") or "")[:40]
         short = head[:9]
         remeasure = False
-        evaluated = museglimmer_evaluated_commits(args.repo, num)
+        evaluated = _verdict_heads(args.repo, num)
         if evaluated is None:
             # Not "no verdict yet": re-measuring, or dropping its labels, on a failed read is wrong.
             print(f"PR #{num} @ {short}: GitHub did not return its comments — skipped this round")
