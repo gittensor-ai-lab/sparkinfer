@@ -2440,5 +2440,90 @@ class Iteration9Tests(unittest.TestCase):
         self.assertEqual(arb._table_num("12.5 tok/s"), "12.5")
 
 
+
+class Iteration10Tests(unittest.TestCase):
+    """Fixes from the post-merge review of main 7a69f64."""
+
+    def _qwen_cb(self, mode):
+        """Qwen3.8's cb_median, rendered and run against a stub bench (MODE picks its behaviour)."""
+        import subprocess
+        script = qwen._remote_script("pull/1/head", role="pr", onto=MAIN)
+        take = lambda name: script[script.index(name + "() {"):script.index("\n}\n", script.index(name + "() {")) + 3]
+        d = _tempfile.mkdtemp(dir=_STATE)
+        _os.makedirs(_os.path.join(d, "build/runtime"))
+        _os.makedirs(_os.path.join(d, "bin"))
+        with open(_os.path.join(d, "bin/nvidia-smi"), "w") as f:
+            f.write("#!/bin/sh\necho 0\n")
+        with open(_os.path.join(d, "build/runtime/qwen3_gguf_cb_bench"), "w") as f:
+            f.write("#!/bin/bash\nc=$2; n=$(cat cnt 2>/dev/null || echo 0); n=$((n + 1)); echo $n > cnt\n"
+                    'case "$MODE" in\n'
+                    "  crash_once) if [ $n = 1 ]; then exit 1; fi ;;\n"
+                    "  crash) exit 1 ;;\n  hang) exit 124 ;;\n  oom) exit 137 ;;\n"
+                    "esac\n"
+                    'echo "decode_tokens=$((c * 256 + 8)) agg_tok_s=$((100 * c + n)) mean_itl_ms=5"\n')
+        for x in ("bin/nvidia-smi", "build/runtime/qwen3_gguf_cb_bench"):
+            _os.chmod(_os.path.join(d, x), 0o755)
+        body = ("set -euo pipefail\n" + take("wait_gpu_clear") + take("cb_complete") + take("cb_median")
+                + 'if cb_median m 16; then echo "OK $CB_AGG"; else echo "FAIL ${CB_RC:-}"; fi\ncat cnt\n')
+        body = body.replace("/tmp/q38_cb.txt", _os.path.join(d, "cb.txt"))
+        env = dict(_os.environ, PATH=_os.path.join(d, "bin") + ":/usr/bin:/bin", MODE=mode, TMPDIR=d)
+        r = subprocess.run(["bash", "-c", body], cwd=d, env=env, capture_output=True, text=True, timeout=120)
+        return r.stdout.split()
+
+    def test_qwens_concurrency_runs_retry_a_crash_and_stop_on_a_hang(self):
+        self.assertEqual(self._qwen_cb("crash_once")[:2], ["OK", "1603.0"])      # median of runs 2-4
+        self.assertEqual(self._qwen_cb("crash"), ["FAIL", "1", "5"])              # five attempts, then the PR's
+        self.assertEqual(self._qwen_cb("hang"), ["FAIL", "124", "1"])             # a hang is not retried
+        self.assertEqual(self._qwen_cb("oom"), ["FAIL", "137", "5"])              # every attempt killed: the box's
+
+    def test_a_concurrent_guard_width_the_pr_could_not_complete_is_judged_over_rounds(self):
+        with mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(qwen_stdout())):
+            qmain = qwen.measure_main_baseline("h", 1)
+
+        def pr(stdout):
+            with mock.patch.object(qwen, "POLARIS_ENABLED", False), mock.patch("builtins.print"), \
+                    mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(stdout)):
+                return qwen.eval_qwen38_on_box("h", 1, "pull/1/head", qmain)
+        res = pr(qwen_stdout(drop=("GUARDCBMO 16",), extra=("GUARDCBMO_FAILED 16 rc=1",)))
+        self.assertEqual((res["ok"], res["retry"], res["strike_key"]), (False, True, "guard-cb"), res.get("reason"))
+        # Beside a REJECT decided on its own grounds, it is a note, not a second failure.
+        wrong = pr(qwen_stdout(top1="0.2", kl="2.0", drop=("GUARDCBMO 16",), extra=("GUARDCBMO_FAILED 16 rc=1",)))
+        self.assertEqual(wrong["label"], "REJECT")
+        self.assertIn("not measured this round", wrong["reason"])
+        self.assertNotIn("modelopt no-regression guard failed", wrong["reason"])
+        # ...and the comment says the guard's concurrent decode was not measured, not that it passed.
+        row = next(l for l in qwen.format_comment("c" * 40, wrong).splitlines() if l.startswith("| modelopt guard"))
+        self.assertIn("concurrent decode ⚠️ NOT MEASURED", row)
+        self.assertNotIn("✅ no regression (decode+prefill @ 32k, concurrent", row)
+        self.assertEqual(wrong["guards_cb_incomplete"], ["modelopt"])
+        # A real regression at a width it did measure still REJECTs at once.
+        slow = pr(qwen_stdout(drop=("GUARDCBMO 16",), extra=("GUARDCBMO 16 100",)))
+        self.assertEqual(slow["label"], "REJECT")
+        # A 32k regression at the same guard: FAILED, and its concurrent decode still reads as not measured.
+        both = pr(qwen_stdout(drop=("GUARDMO 32768", "GUARDCBMO 16"),
+                              extra=("GUARDMO 32768 20 2000", "GUARDCBMO_FAILED 16 rc=1")))
+        self.assertEqual((both["label"], both["modelopt_guard_ok"]), ("REJECT", False))
+        row = next(l for l in qwen.format_comment("c" * 40, both).splitlines() if l.startswith("| modelopt guard"))
+        self.assertIn("**FAILED**", row)
+        self.assertIn("concurrent decode ⚠️ NOT MEASURED", row)
+
+    def test_a_charged_fault_no_longer_says_it_is_re_evaluated(self):
+        self.assertEqual(arb.charged_reason("the modelopt concurrent-decode guard did not complete on the PR "
+                                            "build while main's did — re-evaluated next round", 3),
+                         "the modelopt concurrent-decode guard did not complete on the PR build while main's "
+                         "did — 3 rounds in a row at this commit, so it is charged to the PR")
+        self.assertEqual(arb.charged_reason("x measurement unavailable — infra, not a regression; the PR is "
+                                            "re-evaluated next round rather than rejected", 3),
+                         "x measurement unavailable — 3 rounds in a row at this commit, so it is charged to the PR")
+        # Bonsai joins its deferred reasons: only the tail goes.
+        self.assertEqual(arb.charged_reason("a — infra | b — infra — re-evaluated next round", 3),
+                         "a — infra | b — 3 rounds in a row at this commit, so it is charged to the PR")
+        self.assertEqual(arb.charged_reason(None, 3), " — 3 rounds in a row at this commit, so it is charged to the PR")
+
+    def test_a_list_written_without_spaces_reads_as_its_first_value(self):
+        self.assertEqual(arb._table_num("104,105,106"), "104")
+        self.assertEqual(arb._table_num("8,081"), "8081")
+
+
 if __name__ == "__main__":
     unittest.main()

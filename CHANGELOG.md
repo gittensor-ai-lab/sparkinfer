@@ -121,7 +121,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     latest verdict calls REJECT, even when that bot's label is gone (a reset back to the rejected
     commit); a greenlight table's thousands separators no longer hide a gain; Muse Glimmer scores
     each concurrency width from the median of three complete runs, as the other two bots do, not one
-    unchecked run (a run cut short reads high);
+    unchecked run (a run cut short reads high); Qwen3.8 retries a crashed concurrency run within its
+    five attempts, and a concurrent-decode guard width the PR build could not complete is a box
+    fault judged over rounds rather than a REJECT and close in one (beside another REJECT, its
+    comment row says the guard's concurrent decode was not measured, not that it passed); a fault
+    charged to the PR no longer says it will be re-evaluated next round;
   - the cron wrappers run the bots from their own `origin/main` worktree (made again if it breaks,
     and never one they did not make), refuse to run without a `GH_TOKEN` (or, with
     `SPARKINFER_BOT_LOGIN` set, with another account's; `.env.eval` never stands in for an empty

@@ -2219,9 +2219,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, body=""):
                   f"({res.get('reason')}) — not measured again until a push; nothing posted")
             GAVE_UP.add(num)
             return
-        res = dict(res, retry=False,
-                   reason=f"{res.get('reason')} — {n} rounds in a row at this commit, so it is "
-                          f"charged to the PR")
+        res = dict(res, retry=False, reason=arb.charged_reason(res.get("reason"), n))
     if res.get("ok") and res.get("strike_key"):
         # A REJECT whose only cause is a concurrency width the PR build could not complete. Judged
         # over two rounds on the same commit: the first time nothing is posted.

@@ -1032,7 +1032,14 @@ _TABLE_NUM_RE = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d*)?|[-+]?\d+\.?\d*")
 
 def _table_num(cell):
     m = _TABLE_NUM_RE.search(cell or "")
-    return m.group(0).replace(",", "") if m else None
+    if not m:
+        return None
+    num = m.group(0).replace(",", "")
+    if "," in m.group(0) and abs(float(num)) >= 100000:
+        # No tok/s figure is that large: a list written without spaces ("104,105,106"), whose first
+        # value is the one meant (the reading before separators were allowed).
+        return re.search(r"[-+]?\d+\.?\d*", cell).group(0)
+    return num
 
 
 def _table_val(body, key, metric="decode"):
@@ -1427,6 +1434,23 @@ def exception_result(e):
 # a PR that crashes the box, or keeps it from draining, would otherwise be retried every hour for
 # ever with nothing ever posted (and, being greenlit and unmeasured, is never stale either).
 BOX_FAULT_STRIKES = 3
+
+# The tails a box fault's reason ends with while it is retried. Once charged to the PR they would
+# contradict the verdict posted with them ("re-evaluated next round -- so it is charged").
+_DEFERRED_TAILS = (" — re-evaluated next round",
+                   " — infra, not a regression; the PR is re-evaluated next round rather than rejected",
+                   " — infra, not a regression; re-evaluated next round rather than rejected",
+                   " — infra")
+
+
+def charged_reason(reason, n):
+    """The reason posted for a box fault charged to the PR after `n` rounds at one commit."""
+    reason = reason or ""
+    tail = True
+    while tail:
+        tail = next((t for t in _DEFERRED_TAILS if reason.endswith(t)), "")
+        reason = reason[:len(reason) - len(tail)]
+    return f"{reason} — {n} rounds in a row at this commit, so it is charged to the PR"
 
 
 def _load_strikes(path):

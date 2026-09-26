@@ -268,7 +268,10 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
     part-way reads high. Muse Glimmer used to take a single unchecked run.
   - A concurrent-decode width `main` measured that the PR build could not complete is a REJECT
     judged over two rounds on the same commit (Muse Glimmer, Ternary-Bonsai), never dropped; on
-    Qwen3.8, whose run stops at that width, a box fault charged after three.
+    Qwen3.8, whose run stops at that width, a box fault charged after three -- and so is a width of
+    its ModelOpt or Muse Glimmer concurrent-decode guard that the PR build could not complete
+    (`guard-cb`), instead of the REJECT and close it was. A crashed run is one failed attempt of the
+    five on every bot; a hang ends the width at once.
   - A run killed at the two-hour ssh limit is a box fault too (a step of the box's own can hang),
     charged to the PR as a failed run once it recurs at one commit. A guard the OOM killer took
     beside a failed accuracy gate is reported as not measured, never as the regression that closed
@@ -409,8 +412,11 @@ closes the PR; a `none` closes it only as the shared rules above allow.
      That bot skips PRs declared for Qwen3.8 or Muse Glimmer alone. 128 is included because the
      dense-GGUF prefill work on that model lives at short prompts (#1139: 1.94× at 128, flat at 4k).
      A guard `main` measured nothing for skips the round, and a guard sweep the OOM killer took is
-     retried as the box's; a guard only the PR build failed to measure is a regression
-     (fail-closed; the Ternary-Bonsai bot judges that over two rounds).
+     retried as the box's; a single-stream guard only the PR build failed to measure is a
+     regression (fail-closed; the Ternary-Bonsai bot judges that over two rounds). A
+     concurrent-decode guard width the PR build could not complete is not: it is retried and
+     charged to the PR after three rounds at one commit (`guard-cb`), as a scored width is. Beside
+     another REJECT, the comment shows that guard's concurrent decode as not measured.
 
 **Not evaluated:**
 - PRs whose template declares a different target model (#1027).

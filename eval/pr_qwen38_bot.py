@@ -1067,32 +1067,43 @@ cb_complete() {{
 
 # cb_median CHECKPOINT C [ENV=VALUE ...]: aggregate tok/s with C requests in flight, the median of
 # {cb_reps} complete runs (cb_complete). Sets CB_AGG, CB_ITL, CB_TOK, CB_ERR and CB_AGGS (the runs).
-# Returns 1, with the reason on stderr, when the harness exits nonzero, measures nothing, or stops
-# requests part-way on too many runs. The caller decides what that means: the scored ladder fails
-# the round, a guard fails closed.
+# A crashed or cut-short run is one failed attempt of {cb_max_attempts}; a hang (124) ends it at once.
+# Returns 1, with the reason on stderr, when too few runs completed, a run hung, or nothing positive
+# was measured; CB_RC is then 137 only if the OOM killer took every failed attempt. The caller
+# decides what that means: the scored ladder fails the round as infra; a guard width main measured
+# is a fault of the PR's run judged over rounds (eval_qwen38_on_box's "guard-cb" strike).
 cb_median() {{
-  local ckpt=$1 cc=$2 out=/tmp/q38_cb.txt attempt=0 valid=0 a i
+  local ckpt=$1 cc=$2 out=/tmp/q38_cb.txt attempt=0 valid=0 a i all_killed=1 last_rc=0
   shift 2
   CB_AGGS=""; CB_ITLS=""; CB_AGG=0; CB_ITL=0; CB_TOK=0; CB_ERR=0; CB_RC=0
   while [ "$valid" -lt {cb_reps} ]; do
     attempt=$((attempt + 1))
     if [ "$attempt" -gt {cb_max_attempts} ]; then
-      echo "concurrent decode at c=$cc on $ckpt stopped requests part-way on $((attempt - 1 - valid)) of {cb_max_attempts} runs" >&2
+      echo "concurrent decode at c=$cc on $ckpt did not complete on $((attempt - 1 - valid)) of {cb_max_attempts} runs" >&2
+      # 137 only when the OOM killer took every failed attempt (the box's); else the last other exit.
+      if [ "$all_killed" = 1 ] && [ "$last_rc" = 137 ]; then CB_RC=137
+      elif [ "$last_rc" = 137 ]; then CB_RC=1
+      else CB_RC=$last_rc; fi
       return 1
     fi
     wait_gpu_clear
     if timeout 900 env "$@" build/runtime/qwen3_gguf_cb_bench "$ckpt" "$cc" {cb_tokens} {cb_tokens} 512 > "$out" 2>&1; then
       :
     else
-      CB_RC=$?
-      echo "concurrent-decode harness exited $CB_RC at c=$cc on $ckpt" >&2
+      # One failed attempt, like a run cut short -- it used to give up on the width at once, so
+      # one transient crash failed a guard (a REJECT and a close). A hang is not retried: it repeats.
+      last_rc=$?
+      echo "concurrent-decode harness exited $last_rc at c=$cc on $ckpt (attempt $attempt)" >&2
       tail -20 "$out" >&2 || true
-      return 1
+      if [ "$last_rc" != 137 ]; then all_killed=0; fi
+      if [ "$last_rc" = 124 ]; then CB_RC=124; return 1; fi
+      continue
     fi
     CB_TOK=$(sed -n 's/.*decode_tokens=\\([0-9]*\\).*/\\1/p' "$out" | tail -1)
     CB_ERR=$(grep -c "request error" "$out" || true)
     if ! cb_complete "$cc" "${{CB_TOK:-0}}" "${{CB_ERR:-0}}"; then
       echo "CB_PARTIAL c=$cc attempt=$attempt decode_tokens=${{CB_TOK:-0}} request_errors=${{CB_ERR:-0}} ($ckpt)" >&2
+      all_killed=0
       continue
     fi
     a=$(sed -n 's/.*agg_tok_s=\\([0-9.]*\\).*/\\1/p' "$out" | tail -1)
@@ -1271,8 +1282,9 @@ fi
 # --- Concurrent-decode no-regression guards: ModelOpt and Muse Glimmer (pt. 3b) ---
 # The PRs this bot scores mostly change packed decode, which the single-stream 32k guards above never
 # enter. Each model runs the way its own bot runs it: ModelOpt with pr_dspark_bot.py's env, Muse
-# Glimmer with none (pr_museglimmer_bot.py). A failed measurement prints *_FAILED and the guard fails
-# closed, as the 32k guards do; an absent checkpoint skips both of its guards.
+# Glimmer with none (pr_museglimmer_bot.py). A width the PR build could not complete prints *_FAILED;
+# unlike the 32k guards it is judged over rounds (guard-cb), as a scored width is. An absent checkpoint
+# skips both of its guards.
 if [ -d "$MODELOPT_GUARD_MODEL_DIR" ]; then
   for CC in {cb_guard_concs}; do
     if cb_median "$MODELOPT_GUARD_MODEL_DIR" "$CC" SPARKINFER_QWEN38_PREFILL_NVFP4=1 SPARKINFER_QWEN38_DECODE_NVFP4=1 SPARKINFER_KV_INT8=1; then
@@ -1824,14 +1836,25 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     # ModelOpt and Muse Glimmer guards (pt. 3b): same discipline, same hard REJECT. An absent
     # checkpoint is a SKIP, reported as one, so a round that guarded nothing never reads as a pass.
     cross = {}
+    cb_incomplete = []
     for key, name, checks in (("guardmo", "modelopt", (check_modelopt_guard, check_modelopt_cb_guard)),
                               ("guardmg", "muse glimmer", (check_muse_guard, check_muse_cb_guard)),
                               ("guardbn", "ternary-bonsai", (check_bonsai_guard,))):
         skipped = bool(pr.get(f"{key}_unavailable") or main.get(f"{key}_unavailable"))
         ok, problems = True, []
+        cb_key = key.replace("guard", "guardcb")
         if not skipped:
             for check in checks:
                 c_ok, c_problems = check(pr, main)
+                if (not c_ok and check in (check_modelopt_cb_guard, check_muse_cb_guard)
+                        and pr.get(f"{cb_key}_failed") and not pr.get(f"{cb_key}_failed_box") and main.get(cb_key)
+                        and all(p.endswith("measurement unavailable") or "PR measurement missing/zero" in p
+                                for p in c_problems)):
+                    # A concurrent width the PR build could not complete (runs cut short, a crash, a
+                    # hang), main having measured it: judged as a fault of the PR's run, over rounds
+                    # (below), as the scored widths are -- not a regression to REJECT and close on.
+                    cb_incomplete.append(name)
+                    c_ok, c_problems = True, []
                 ok, problems = ok and c_ok, problems + c_problems
         if skipped:
             print(f">> {name} guard SKIPPED — checkpoint not installed on the box")
@@ -1857,6 +1880,14 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
             label = "REJECT"
             passed = False
         cross[key] = (ok, problems, skipped)
+    if cb_incomplete:
+        why = (f"the {', '.join(cb_incomplete)} concurrent-decode guard did not complete on the PR build "
+               f"while main's did")
+        if label != "REJECT":
+            # Retried; charged to the PR, as a failed run, after BOX_FAULT_STRIKES rounds at one commit.
+            return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "guard-cb", "log": "",
+                    "reason": why + " — re-evaluated next round"}
+        reason = f"{reason} | not measured this round: {why}"
 
     res = {
         "ok": True,
@@ -1894,6 +1925,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "q36_guard_ok": q36_ok,
         "q36_guard_problems": q36_problems,
         "guards_killed": guards_killed,
+        "guards_cb_incomplete": cb_incomplete,
         "q36_guard": pr.get("guard36"),
         "q36_guard_main": main.get("guard36"),
         "modelopt_guard_ok": cross["guardmo"][0],
@@ -1986,22 +2018,30 @@ def format_comment(commit: str, res: dict) -> str:
     cross_rows = ""
     cb_note = f", concurrent decode @ {'/'.join(f'c{c}' for c in CB_GUARD_CONCS)}"
     bn_ctxs = "/".join("32k" if c == 32768 else str(c) for c in BONSAI_GUARD_CTXS)
+    # A concurrent-decode guard the PR build could not complete is posted only beside another REJECT.
+    cb_incomplete = res.get("guards_cb_incomplete") or []
+    cb_missing = " · concurrent decode ⚠️ NOT MEASURED — the PR build did not complete it (main did)"
     for prefix, name, what, at in (
             ("modelopt", "modelopt guard", "Qwen3.8-27B NVFP4 (ModelOpt)", f"decode+prefill @ 32k{cb_note}"),
             ("muse", "muse glimmer guard", "Muse Glimmer 30B", f"decode+prefill @ 32k{cb_note}"),
             ("bonsai", "ternary-bonsai guard", "Ternary-Bonsai-2-27B", f"decode+prefill @ {bn_ctxs}")):
+        short = name.replace(" guard", "")
         if res.get(f"{prefix}_guard_skipped"):
             # Say SKIPPED explicitly: a guard that reports nothing reads the same as one that passed.
             cross_rows += (f"| {name} | ⚠️ SKIPPED — checkpoint not installed on the box; "
                            f"shared-code regressions on {what} were NOT checked |\n")
-        elif name.replace(" guard", "") in killed:
+        elif short in killed:
             cross_rows += f"| {name} | ⚠️ NOT MEASURED — its sweep was killed on the PR build (exit 137, the host OOM killer); the REJECT is the accuracy gate's |\n"
+        elif res.get(f"{prefix}_guard_ok") and short in cb_incomplete:
+            cross_rows += (f"| {name} | decode+prefill @ 32k ✅ no regression ({what}){cb_missing}; "
+                           "the REJECT is another gate's |\n")
         elif res.get(f"{prefix}_guard_ok"):
             cross_rows += f"| {name} | ✅ no regression ({at}, {what}) |\n"
         else:
             probs = "; ".join((res.get(f"{prefix}_guard_problems") or [])[:4])
             cross_rows += (f"| {name} | ❌ **FAILED** — {probs} — "
-                           "**verdict forced to REJECT regardless of speed/accuracy** |\n")
+                           "**verdict forced to REJECT regardless of speed/accuracy**"
+                           f"{cb_missing if short in cb_incomplete else ''} |\n")
     polaris = res.get("polaris") or {}
     receipt = polaris.get("receipt")
     if receipt:
@@ -2337,7 +2377,6 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
                if k.startswith(("pr_cb", "main_cb")) or (k.startswith("cb") and k.endswith("_delta_pct"))},
             "speedup_vs_main": res.get("speedup_vs_main"),
             "pr_top1": res.get("pr_top1"), "pr_kl": res.get("pr_kl"),
-            "pr_top1": res.get("pr_top1"), "pr_kl": res.get("pr_kl"),
             "accuracy_ok": res.get("accuracy_ok"),
             "q36_guard_ok": res.get("q36_guard_ok"), "q36_guard_problems": res.get("q36_guard_problems"),
             "modelopt_guard_ok": res.get("modelopt_guard_ok"), "modelopt_guard_problems": res.get("modelopt_guard_problems"),
@@ -2346,6 +2385,7 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
             "muse_guard_skipped": res.get("muse_guard_skipped"),
             "bonsai_guard_ok": res.get("bonsai_guard_ok"), "bonsai_guard_problems": res.get("bonsai_guard_problems"),
             "bonsai_guard_skipped": res.get("bonsai_guard_skipped"),
+            "guards_cb_incomplete": res.get("guards_cb_incomplete") or [],
             "gpu": "pinned eval box", "date": arb.datetime.date.today().isoformat(),
         }
         if receipt:
@@ -2451,8 +2491,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
                   f"({res.get('reason')}) — not measured again until a push; nothing posted")
             GAVE_UP.add(num)
             return
-        res = dict(res, retry=False,
-                   reason=f"{res.get('reason')} — {n} rounds at this commit, so it is charged to the PR")
+        res = dict(res, retry=False, reason=arb.charged_reason(res.get("reason"), n))
     if not dry_run:
         arb.clear_strikes(STRIKES_FILE, num)
     body = format_comment(commit, res)

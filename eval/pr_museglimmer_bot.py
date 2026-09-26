@@ -2589,8 +2589,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False, pr_body=""):
                   f"({res.get('reason')}) — not measured again until a push; nothing posted")
             GAVE_UP.add(num)
             return
-        res = dict(res, retry=False,
-                   reason=f"{res.get('reason')} — {n} rounds at this commit, so it is charged to the PR")
+        res = dict(res, retry=False, reason=arb.charged_reason(res.get("reason"), n))
     if res.get("ok") and res.get("strike_key") and not dry_run:
         # A REJECT whose only cause may be the box (a width the PR build could not complete): judged
         # over STRIKES_TO_REJECT rounds on the same commit; the first time nothing is posted.
