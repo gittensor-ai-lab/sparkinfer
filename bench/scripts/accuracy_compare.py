@@ -18,9 +18,15 @@ long stream would mean ~8k HTTP round-trips. A long prefix with a short scored t
 int8-MMA and sparse-KV engagement thresholds — which is the whole point of the probe.
 
 --metric-label NAME renames the machine-readable METRIC line (e.g. METRIC_LONG), so accuracy.sh
-can emit several passes and still hand evaluate.sh exactly one unambiguous `METRIC ` line.
+can emit several passes and still hand evaluate.sh exactly one unambiguous `METRIC ` line. The line
+ends with `n=` (positions compared) and `n_expected=` (positions in the stream): a dump missing
+positions is only compared where it has them, so a caller must check the two agree.
+
+The llama.cpp server is the reference, not the thing measured: when it fails (an HTTP error, no
+answer, or its retries run out) this prints REFERENCE_FAILED and exits 3, so a caller can tell the
+reference's failure from the dump's (exit 1).
 """
-import sys, json, math, time, urllib.error, urllib.request
+import sys, json, math, time, http.client, urllib.error, urllib.request
 from tokenizers import Tokenizer
 
 argv = sys.argv[1:]
@@ -83,7 +89,21 @@ def llama_dist(prefix):
     if not data or not data.get("completion_probabilities"):
         raise RuntimeError(f"llama-server /completion failed after retries: {last_err}")
     tl = data["completion_probabilities"][0]["top_logprobs"]
+    if not tl:
+        raise RuntimeError("llama-server returned no top_logprobs")
     return {e["id"]: e["logprob"] for e in tl}
+
+REFERENCE_FAILED_EXIT = 3
+
+
+def reference_dist(prefix):
+    try:
+        return llama_dist(prefix)
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, RuntimeError, ValueError,
+            KeyError, IndexError, TypeError) as e:
+        print(f"REFERENCE_FAILED llama-server at {URL}: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(REFERENCE_FAILED_EXIT)
+
 
 spark = {}
 for line in open(score_path):
@@ -96,7 +116,7 @@ match = n = 0; snll = lnll = 0.0; klsum = 0.0
 lo = max(0, (len(ids) - 1) - TAIL) if TAIL > 0 else 0
 for i in range(lo, len(ids) - 1):
     if i not in spark: continue
-    ld = llama_dist(ids[:i + 1]); lam = max(ld, key=ld.get); n += 1
+    ld = reference_dist(ids[:i + 1]); lam = max(ld, key=ld.get); n += 1
     if spark[i]["am"] == lam: match += 1
     snll += -spark[i]["lp"]; lnll += -ld.get(ids[i + 1], FLOOR)
     sd = spark[i]["top"]; U = set(ld) | set(sd)
@@ -107,8 +127,9 @@ for i in range(lo, len(ids) - 1):
         if pp > 0: kl += pp * math.log(pp / max(qq, 1e-12))
     klsum += kl
 
+expected = (len(ids) - 1) - lo
 if n == 0:
-    print(f"{LABEL} top1=0 kl=99 ppl_spark=0 ppl_llama=0   (NO SCORED POSITIONS)")
+    print(f"{LABEL} top1=0 kl=99 ppl_spark=0 ppl_llama=0 n=0 n_expected={expected}   (NO SCORED POSITIONS)")
     sys.exit(1)
 print(f"positions             : {n}" + (f"  (tail {TAIL} of {len(ids)})" if TAIL else ""))
 print(f"scored range          : {lo}..{len(ids) - 2}  (seqlen {lo + 1}..{len(ids) - 1})")
@@ -117,4 +138,5 @@ print(f"mean KL(llama||spark) : {klsum/n:.4f} nats  (top-k approx)")
 print(f"PPL sparkinfer        : {math.exp(snll/n):.3f}  (exact, full softmax)")
 print(f"PPL llama.cpp         : {math.exp(lnll/n):.3f}  (top-{TOPK}+floor; inflated)")
 # unambiguous machine-readable line for evaluate.sh (avoid parsing the human text above)
-print(f"{LABEL} top1={match/n:.6f} kl={klsum/n:.6f} ppl_spark={math.exp(snll/n):.4f} ppl_llama={math.exp(lnll/n):.4f}")
+print(f"{LABEL} top1={match/n:.6f} kl={klsum/n:.6f} ppl_spark={math.exp(snll/n):.4f} ppl_llama={math.exp(lnll/n):.4f} "
+      f"n={n} n_expected={expected}")

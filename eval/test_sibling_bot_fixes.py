@@ -156,7 +156,7 @@ class ReconcileTests(unittest.TestCase):
                 mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: calls.append(("rm", n, l))), \
                 mock.patch.object(mod, "_load_scores", return_value=scores), \
                 mock.patch.object(mod, ok_fn.__name__,
-                                  side_effect=lambda r, n, require_merge_first=True:
+                                  side_effect=lambda r, n, require_merge_first=True, ranking_loss_ok=False:
                                   (False, "refused") if n in refused else (True, "ok")), \
                 mock.patch.object(mod, "AUTO_MERGE", False):
             recon("o/r")
@@ -528,7 +528,9 @@ class StaleAndFreshnessTests(unittest.TestCase):
                     mock.patch.object(mod, ev, return_value=set()), \
                     mock.patch.object(arb, "greenlight_status", return_value=("unchecked", "box not ticked")), \
                     mock.patch.object(arb, "gh", return_value=run()):
-                self.assertEqual(close_stale("o/r", prs), {1, 2})
+                # Never measured and not asking to be: not this bot's queue, left to the daily Action
+                # ("not being measured is not grounds for closing", CONTRIBUTING).
+                self.assertEqual(close_stale("o/r", prs), set())
 
     def test_only_a_merge_candidate_scored_against_an_older_main_is_measured_again(self):
         good = {"commit": "a" * 40, "label": "XL", "pass": True, "onto": "9" * 40}
@@ -836,7 +838,7 @@ class StaleWinnerTests(unittest.TestCase):
                 mock.patch.object(mod, "_load_scores", return_value={"10": {"label": "XL", "delta_pct": 30.0},
                                                                      "11": {"label": "S", "delta_pct": 4.0}}), \
                 mock.patch.object(mod, ok_fn.__name__,
-                                  side_effect=lambda r, n, require_merge_first=True:
+                                  side_effect=lambda r, n, require_merge_first=True, ranking_loss_ok=False:
                                   (False, self.STALE) if n == 10 else (True, "ok")), \
                 mock.patch.object(mod, "AUTO_MERGE", False):
             recon("o/r")
@@ -1802,6 +1804,300 @@ class Iteration4Tests(unittest.TestCase):
         self.assertLessEqual(len(fitted), arb.COMMENT_LIMIT)
         self.assertTrue(fitted.startswith("<!-- marker -->"))
         self.assertEqual(arb.fit_comment("short"), "short")
+
+
+
+class Iteration5Tests(unittest.TestCase):
+    """Fixes from the post-merge review of main 5edba3c, on all three bots."""
+
+    def _bots(self):
+        out = []
+        for mod, tag, rebase in Round3Tests._bots(self):
+            up = {"museglimmer": "MUSEGLIMMER", "qwen38": "QWEN38", "bonsai": "BONSAI"}[tag]
+            out.append((mod, tag, rebase, mod.EVAL_PREFIX, getattr(mod, f"{up}_MERGE_FIRST")))
+        return out
+
+    def setUp(self):
+        for mod, *_ in self._bots():
+            if _os.path.exists(mod.AUTHOR_WAIT_FILE):
+                _os.remove(mod.AUTHOR_WAIT_FILE)
+
+    def _reconcile(self, mod, tag, prs, scores, main=MAIN):
+        """prs: {num: (labels, head)}. The merge gate is mocked; it refuses a PR's own needs-rebase
+        unless reconcile says the label only records a lost ranking (ranking_loss_ok)."""
+        calls, gate = [], []
+        rebase = self._bots()[[b[1] for b in self._bots()].index(tag)][2]
+
+        def fake_gh(a):
+            if a[:2] == ["pr", "list"] and "open" in a:
+                return run(json.dumps([{"number": n, "labels": [{"name": l} for l in labs], "headRefOid": head,
+                                        "mergeable": "MERGEABLE", "isDraft": False, "body": TEMPLATE, "files": [],
+                                        "baseRefName": "main"} for n, (labs, head) in prs.items()]))
+            return run("[]")
+
+        def fake_ok(r, n, require_merge_first=True, ranking_loss_ok=False):
+            gate.append((n, ranking_loss_ok))
+            if rebase in prs[n][0] and not ranking_loss_ok:
+                return False, f"blocking label(s): {rebase}"
+            return True, "ok"
+        with mock.patch.object(arb, "gh", side_effect=fake_gh), \
+                mock.patch.object(arb, "current_main_sha", return_value=main), \
+                mock.patch.object(arb, "add_label", side_effect=lambda r, n, l: calls.append(("add", n, l))), \
+                mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: calls.append(("rm", n, l))), \
+                mock.patch.object(arb, "sync_generic_eval_label"), \
+                mock.patch.object(mod, "_load_scores", return_value=scores), \
+                mock.patch.object(mod, f"auto_merge_ok_{tag}", side_effect=fake_ok), \
+                mock.patch.object(mod, "AUTO_MERGE", False), mock.patch("builtins.print"):
+            getattr(mod, f"reconcile_{tag}_merge_labels")("o/r")
+        return calls, gate
+
+    def test_a_fresh_ranking_loser_is_still_in_the_running(self):
+        for mod, tag, rebase, prefix, first in self._bots():
+            scores = {"10": {"commit": "a" * 40, "label": "XS", "delta_pct": 2.5, "pass": True, "onto": MAIN},
+                      "11": {"commit": "b" * 40, "label": "L", "delta_pct": 12.0, "pass": True, "onto": MAIN}}
+            with self.subTest(tag, case="the winner re-measured lower"):
+                calls, gate = self._reconcile(mod, tag, {10: ([prefix + "XS", first], "a" * 40),
+                                                         11: ([prefix + "L", rebase], "b" * 40)}, scores)
+                self.assertIn((11, True), gate)
+                self.assertIn(("add", 11, first), calls)
+                self.assertIn(("rm", 11, rebase), calls)
+                self.assertIn(("add", 10, rebase), calls)
+                self.assertIn(("rm", 10, first), calls)
+            with self.subTest(tag, case="the winner was held"):
+                calls, _ = self._reconcile(mod, tag, {10: ([prefix + "XL", first, "hold"], "a" * 40),
+                                                      11: ([prefix + "L", rebase], "b" * 40)}, scores)
+                self.assertIn(("add", 11, first), calls)
+            with self.subTest(tag, case="main moved: the rebase is its author's"):
+                calls, gate = self._reconcile(mod, tag, {10: ([prefix + "XS", first], "a" * 40),
+                                                         11: ([prefix + "L", rebase], "b" * 40)}, scores,
+                                              main="d" * 40)
+                self.assertNotIn(("add", 11, first), calls)
+                self.assertNotIn(11, [n for n, _ in gate])
+            with self.subTest(tag, case="another block label"):
+                calls, _ = self._reconcile(mod, tag, {11: ([prefix + "L", rebase, "penalty"], "b" * 40)}, scores)
+                self.assertNotIn(("add", 11, first), calls)
+
+    def test_reconcile_heals_a_generic_label_a_failed_sync_left_wrong(self):
+        for mod, tag, rebase, prefix, first in self._bots():
+            with self.subTest(tag):
+                with mock.patch.object(arb, "gh", side_effect=lambda a: run(json.dumps([
+                            {"number": 5, "labels": [{"name": prefix + "L"}, {"name": "eval:none"}]},
+                            {"number": 6, "labels": [{"name": prefix + "S"}, {"name": "eval:S"}]},
+                            {"number": 7, "labels": [{"name": "eval:M"}]},
+                            # the retired AR bot's labels: its own rule (the failing side), not ours
+                            {"number": 8, "labels": [{"name": "eval-qwen35:M"}, {"name": "eval-qwen36:XL"},
+                                                     {"name": "eval:M"}]}]))
+                            if a[:2] == ["pr", "list"] and "open" in a else run("[]")), \
+                        mock.patch.object(arb, "sync_generic_eval_label") as sync, \
+                        mock.patch.object(arb, "add_label"), mock.patch.object(arb, "remove_label"), \
+                        mock.patch.object(mod, "_load_scores", return_value={}), \
+                        mock.patch.object(mod, "AUTO_MERGE", False), mock.patch("builtins.print"):
+                    getattr(mod, f"reconcile_{tag}_merge_labels")("o/r")
+                self.assertEqual([c.args[1] for c in sync.call_args_list], [5])
+        self.assertFalse(arb.generic_label_out_of_sync({"eval:M"}))                 # nothing to mirror
+        self.assertTrue(arb.generic_label_out_of_sync({"eval-qwen38:S", "eval-bonsai:REJECT", "eval:S"}))
+
+    def test_the_stale_close_leaves_another_bots_verified_speedup_alone(self):
+        for mod, tag, rebase, prefix, first in self._bots():
+            other = "eval-dspark:L"
+            with self.subTest(tag), mock.patch.object(arb.AuthorWaitClock, "since", _LONG_WAITED):
+                pr = Iteration4Tests._pr(self, labels=[other, "eval-dspark:none"])
+                self.assertEqual(Iteration4Tests._stale(self, mod, tag, [pr], evaluated={"a" * 40}), set())
+                own = Iteration4Tests._pr(self, labels=[prefix + "L"])       # its own tier protects nothing
+                self.assertEqual(Iteration4Tests._stale(self, mod, tag, [own], evaluated={"a" * 40}), {7})
+        self.assertIsNone(arb.stale_close_skip_reason({"labels": [{"name": "eval-qwen38:none"}]}, "muse",
+                                                      "eval-museglimmer:"))
+
+    def test_a_commit_dated_in_the_future_does_not_stop_the_clock(self):
+        for mod, tag, *_ in self._bots():
+            with self.subTest(tag), mock.patch.object(mod, "_pr_last_activity_ts", return_value=100 * DAY), \
+                    mock.patch.object(mod.time, "time", return_value=10 * DAY), \
+                    mock.patch.object(arb, "gh", return_value=run()), \
+                    mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
+                    mock.patch.object(mod, f"{tag}_evaluated_commits", return_value={"a" * 40}), \
+                    mock.patch.object(arb.AuthorWaitClock, "since", lambda self, n, h: 8 * DAY), \
+                    mock.patch("builtins.print"):
+                # Handed back at day 8: closed a day later, whatever date the commit claims.
+                self.assertEqual(getattr(mod, f"close_stale_{tag}_prs")("o/r", [Iteration4Tests._pr(self)]), {7})
+            with mock.patch.object(mod, "_pr_last_activity_ts", return_value=100 * DAY), \
+                    mock.patch.object(mod.time, "time", return_value=10 * DAY), \
+                    mock.patch.object(arb, "gh", return_value=run()), \
+                    mock.patch.object(arb, "current_main_sha", return_value=MAIN), \
+                    mock.patch.object(mod, f"{tag}_evaluated_commits", return_value={"a" * 40}), \
+                    mock.patch.object(arb.AuthorWaitClock, "since", lambda self, n, h: 9.5 * DAY), \
+                    mock.patch("builtins.print"):
+                self.assertEqual(getattr(mod, f"close_stale_{tag}_prs")("o/r", [Iteration4Tests._pr(self)]), set())
+
+    def test_the_clock_is_dropped_on_every_keep_path_and_never_starts_in_the_future(self):
+        clock = arb.AuthorWaitClock(_os.path.join(_STATE, "clock.json"), [7], 100.0)
+        clock.data["7"] = {"head": "a" * 40, "since": 500.0}                    # later than now: not trusted
+        self.assertEqual(clock.since(7, "a" * 40), 100.0)
+        for mod, tag, *_ in self._bots():
+            for case, extra in (("gave up", ((arb, "gave_up", mock.Mock(return_value=True)),
+                                              (mod, "_unmeasurable_reason", mock.Mock(return_value=None)))),
+                                ("owed", ((mod, "_remeasure_state", mock.Mock(return_value=True)),
+                                          (mod, "_unmeasurable_reason", mock.Mock(return_value=None))))):
+                with self.subTest(tag, case=case):
+                    Iteration4Tests._stale(self, mod, tag, [Iteration4Tests._pr(self)], evaluated={"a" * 40})
+                    self.assertIn("7", Iteration4Tests._clock(self, mod))
+                    ctx = [mock.patch.object(*x) for x in extra]
+                    for c in ctx:
+                        c.start()
+                    try:
+                        Iteration4Tests._stale(self, mod, tag, [Iteration4Tests._pr(self)], evaluated={"a" * 40})
+                    finally:
+                        for c in ctx:
+                            c.stop()
+                    self.assertNotIn("7", Iteration4Tests._clock(self, mod))
+
+    def test_only_a_ranking_loss_waits_for_the_winner(self):
+        for mod, tag, rebase, prefix, first in self._bots():
+            entry = {"7": {"commit": "a" * 40, "label": "L", "pass": True, "onto": MAIN}}
+            pr = Iteration4Tests._pr(self)
+            with self.subTest(tag), mock.patch.object(mod, "_load_scores", return_value=entry):
+                self.assertTrue(mod._waits_for_the_winner(pr, {rebase}, "a" * 40, MAIN))
+                self.assertFalse(mod._waits_for_the_winner(pr, {rebase, "penalty"}, "a" * 40, MAIN))
+                self.assertFalse(mod._waits_for_the_winner(pr, {rebase}, "a" * 40, "d" * 40))
+                self.assertFalse(mod._waits_for_the_winner(pr, {rebase}, "b" * 40, MAIN))
+
+    def test_a_pr_with_many_labels_is_read_whole(self):
+        seen = []
+        with mock.patch.object(arb, "gh", side_effect=lambda a: seen.append(a) or run("[]")):
+            arb.labels_on_or_none("o/r", 1)
+            arb.labels_on("o/r", 1)
+        self.assertTrue(all("per_page=100" in a[1] for a in seen), seen)
+
+
+
+class Iteration5bTests(unittest.TestCase):
+    """The shell side of the post-merge review of 5edba3c: the reference server, coverage, causes."""
+
+    ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(arb.__file__)))
+
+    def _dump(self, path, positions):
+        with open(path, "w") as f:
+            for i in positions:
+                f.write(f"S i={i} tgt=5 am=5 lp=-0.1 top=5:-0.1,6:-2.5\n")
+
+    def _serve(self, handler_body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                handler_body(self)
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)                               # runs first
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def _compare(self, url, positions, n_ids=9):
+        import subprocess
+        d = _tempfile.mkdtemp(dir=_STATE)
+        with open(_os.path.join(d, "tokenizers.py"), "w") as f:
+            f.write("class Tokenizer:\n    pass\n")                  # the ids file is used, not a tokenizer
+        self._dump(_os.path.join(d, "spark.txt"), positions)
+        with open(_os.path.join(d, "ids.txt"), "w") as f:
+            f.write(" ".join(str(i) for i in range(n_ids)))
+        env = dict(_os.environ, PYTHONPATH=d)
+        return subprocess.run(["python3", _os.path.join(self.ROOT, "bench/scripts/accuracy_compare.py"),
+                               _os.path.join(d, "spark.txt"), "/dev/null", _os.path.join(d, "ids.txt"), url, "8"],
+                              capture_output=True, text=True, timeout=60, env=env)
+
+    def test_the_reference_server_failing_is_told_apart_from_the_prs_dump(self):
+        def fail(h):
+            h.send_response(500)
+            h.end_headers()
+        r = self._compare(self._serve(fail), range(8))
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("REFERENCE_FAILED", r.stderr)
+
+        def empty(h):
+            h.rfile.read(int(h.headers["Content-Length"]))
+            body = json.dumps({"completion_probabilities": [{"top_logprobs": []}]}).encode()
+            h.send_response(200)
+            h.send_header("Content-Length", str(len(body)))
+            h.end_headers()
+            h.wfile.write(body)
+        r = self._compare(self._serve(empty), range(8))              # an answer with nothing in it
+        self.assertEqual(r.returncode, 3, r.stderr)
+
+        def ok(h):
+            h.rfile.read(int(h.headers["Content-Length"]))
+            body = json.dumps({"completion_probabilities": [{"top_logprobs": [
+                {"id": 5, "logprob": -0.1}, {"id": 6, "logprob": -2.5}]}]}).encode()
+            h.send_response(200)
+            h.send_header("Content-Length", str(len(body)))
+            h.end_headers()
+            h.wfile.write(body)
+        url = self._serve(ok)
+        full = self._compare(url, range(8))
+        self.assertEqual(full.returncode, 0, full.stderr)
+        self.assertIn(" n=8 n_expected=8", full.stdout)
+        short = self._compare(url, range(3))                        # a dump that stopped early
+        self.assertIn(" n=3 n_expected=8", short.stdout)
+        # Muse reads exit 3 as its reference's failure (infra), and every wait on the server is bounded.
+        s = muse._remote_script("pull/1/head", role="pr", onto=MAIN)
+        self.assertIn('[ "$ACC_RC" = 124 ] || [ "$ACC_RC" = 3 ]', s)
+        self.assertIn("ACCOUT=$(timeout 1800 python3 bench/scripts/accuracy_compare.py", s)
+        self.assertNotIn('curl -s "http', s)
+        self.assertEqual(s.count("curl -s --max-time 10"), 3)
+
+    def test_a_score_dump_missing_positions_fails_the_accuracy_gate(self):
+        import subprocess
+        d = _tempfile.mkdtemp(dir=_STATE)
+        self._dump(_os.path.join(d, "pr.txt"), range(3))
+        self._dump(_os.path.join(d, "main.txt"), range(88))
+        r = subprocess.run(["python3", _os.path.join(self.ROOT, "bench/scripts/accuracy_compare_pair.py"),
+                            _os.path.join(d, "pr.txt"), _os.path.join(d, "main.txt")],
+                           capture_output=True, text=True, timeout=60)
+        metric = next(l for l in r.stdout.splitlines() if l.startswith("METRIC "))
+        self.assertIn("top1=1.000000", metric)                      # the 3 it has agree ...
+        self.assertIn("n=3 n_main=88", metric)                     # ... but it has only 3
+        with mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(qwen_stdout())):
+            qmain = qwen.measure_main_baseline("h", 1)
+        pr = qwen_stdout(drop=("METRIC",), extra=(metric,))
+        with mock.patch.object(qwen, "POLARIS_ENABLED", False), \
+                mock.patch.object(qwen, "_ssh_run_resilient", return_value=run(pr)), mock.patch("builtins.print"):
+            res = qwen.eval_qwen38_on_box("h", 1, "pull/1/head", qmain)
+        self.assertEqual((res["label"], res["accuracy_ok"]), ("REJECT", False))
+        self.assertIn("covers 3 of 88 positions", res["reason"])
+        main = WiringTests._main(self)
+        with mock.patch.object(muse, "POLARIS_ENABLED", False), mock.patch("builtins.print"), \
+                mock.patch.object(muse, "_ssh_run_resilient",
+                                  return_value=run(muse_stdout() + "RESULT_ACC_POSITIONS 3 88\n")):
+            mres = muse.eval_museglimmer_on_box("h", 1, "pull/1/head", main)
+        self.assertEqual((mres["label"], mres["accuracy_ok"]), ("REJECT", False))
+        self.assertIn("covers 3 of 88 positions", mres["reason"])
+        # main's own dump short of the stream: the round is skipped, not every PR REJECTed.
+        with mock.patch.object(muse, "_ssh_run_resilient", return_value=run(muse_stdout() + "RESULT_ACC_POSITIONS 7 8\n")):
+            m = muse.measure_main_baseline("h", 1)
+        self.assertFalse(m["ok"])
+        self.assertIn("positions=7/8", m["reason"])
+
+    def test_a_charged_box_fault_names_its_cause(self):
+        err = ("RETRYABLE_INFRA_FAILURE GPU still holding 9000 MiB after 180s — refusing to start a load\n"
+               "REMOTE_SCRIPT_FAILED line=88 exit=1 reason=\n")
+        self.assertTrue(arb.failure_cause("REMOTE_SCRIPT_FAILED line=88 exit=1 reason=", "", err)
+                        .startswith("RETRYABLE_INFRA_FAILURE GPU still holding"))
+        self.assertEqual(arb.failure_cause("BUILD_FAILED: x.cu:1: error", "", err), "BUILD_FAILED: x.cu:1: error")
+        self.assertEqual(arb.failure_cause(None, "", ""), None)
+
+    def test_the_box_side_rules_no_other_test_pins(self):
+        # Qwen3.8: main's score dump gone when the PR compared is the box's, bounded as such.
+        with mock.patch.object(qwen, "_ssh_run_resilient",
+                               return_value=run(qwen_stdout(drop=("METRIC",)), 0, "ACCURACY_NO_BASELINE\n")):
+            q = qwen.eval_qwen38_on_box("h", 1, "pull/1/head", {"sha": MAIN})
+        self.assertEqual((q["retry"], q["strike_key"]), (True, "box"))
+        # Muse keeps a killed width's exit code; Bonsai calls a failed width the run's unless the GPU
+        # did not drain; the round guard stops the orphan's whole ssh session.
+        self.assertIn("|| { CB_RC=$?; false; }", muse._remote_script("pull/1/head", role="pr", onto=MAIN))
+        self.assertIn("CB_WHY=run", _bonsai._remote_script("pull/1/head", role="pr", onto=MAIN))
+        self.assertIn('pkill -TERM -s "$opid"', arb.round_guard_sh("qwen38"))
 
 
 if __name__ == "__main__":

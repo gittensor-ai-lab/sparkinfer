@@ -69,7 +69,7 @@ shared = sorted(set(pr) & set(ref))
 if not shared:
     # Hostile defaults, matching accuracy_compare.py: a gate that cannot measure must FAIL,
     # never silently pass.
-    print(f"{LABEL} top1=0 kl=99 ppl_pr=0 ppl_main=0   (NO SHARED POSITIONS)")
+    print(f"{LABEL} top1=0 kl=99 ppl_pr=0 ppl_main=0 n=0 n_main={len(ref)}   (NO SHARED POSITIONS)")
     sys.exit(1)
 
 match = 0
@@ -101,7 +101,9 @@ print(f"top-1 agreement       : {match}/{n} = {match / n:.3f}   (PR vs main)")
 print(f"mean KL(main||pr)     : {klsum / n:.4f} nats  (top-k union)")
 print(f"PPL PR                : {math.exp(pr_nll / n):.3f}")
 print(f"PPL main              : {math.exp(ref_nll / n):.3f}")
+# n= / n_main=: only shared positions are compared, so a PR dump missing positions would be judged
+# on the ones it has. The bots require n == n_main.
 print(
     f"{LABEL} top1={match / n:.6f} kl={klsum / n:.6f} "
-    f"ppl_pr={math.exp(pr_nll / n):.4f} ppl_main={math.exp(ref_nll / n):.4f}"
+    f"ppl_pr={math.exp(pr_nll / n):.4f} ppl_main={math.exp(ref_nll / n):.4f} n={n} n_main={len(ref)}"
 )

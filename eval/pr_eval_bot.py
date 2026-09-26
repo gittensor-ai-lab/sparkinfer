@@ -1238,7 +1238,7 @@ def _owner_repo(repo):
 # (repository.pullRequest.projectCards)", independently of any outage.
 def labels_on(repo, num):
     owner, r = _owner_repo(repo)
-    out = gh(["api", f"repos/{owner}/{r}/issues/{num}/labels", "--jq", "[.[].name]"])
+    out = gh(["api", f"repos/{owner}/{r}/issues/{num}/labels?per_page=100", "--jq", "[.[].name]"])
     try: return set(json.loads(out.stdout))
     except Exception: return set()
 
@@ -1246,7 +1246,7 @@ def labels_on_or_none(repo, num):
     """labels_on, but None when GitHub did not answer: a decision that must see every label (a close)
     cannot take an unread set for an empty one."""
     owner, r = _owner_repo(repo)
-    out = gh(["api", f"repos/{owner}/{r}/issues/{num}/labels", "--jq", "[.[].name]"])
+    out = gh(["api", f"repos/{owner}/{r}/issues/{num}/labels?per_page=100", "--jq", "[.[].name]"])
     try:
         names = json.loads(out.stdout or "")
     except (json.JSONDecodeError, TypeError):
@@ -1597,6 +1597,16 @@ def infra_failure_line(stdout, stderr):
     return ""
 
 
+def failure_cause(crash, stdout, stderr):
+    """The reason text of a failed run: `crash` (the bot's _crash_reason), with the first
+    RETRYABLE_INFRA_FAILURE line in front when that is all there is or the crash line is only the
+    ERR trap's, which names a line and an exit code but not the cause ("GPU still holding ...")."""
+    infra = infra_failure_line(stdout, stderr)
+    if infra and (not crash or crash.startswith("REMOTE_SCRIPT_FAILED")):
+        return f"{infra} | {crash}" if crash else infra
+    return crash
+
+
 def _stopped_at_checkout(stdout):
     """Did the run stop in merged_checkout_script? Its last line, MERGED_ONTO, was never printed. A
     build log or program output that merely contains a marker cannot then be read as one."""
@@ -1690,7 +1700,7 @@ def scored_against_stale_main(entry, main_sha):
     return not main_sha or (entry or {}).get("onto") != main_sha
 
 
-def waiting_for_first_verdict(repo, pr, evaluated, never_paths=(), box_conflict=False):
+def waiting_for_first_verdict(repo, pr, evaluated, never_paths=(), box_conflict=False, greenlit=None):
     """Keep a PR out of the stale close while it waits on the bot rather than on its author.
 
     `evaluated` is the bot's set of commits with a verdict (None: GitHub did not say -- kept). A
@@ -1717,8 +1727,9 @@ def waiting_for_first_verdict(repo, pr, evaluated, never_paths=(), box_conflict=
         return False
     if box_conflict:                                           # this bot found it does not merge
         return False
-    labs = {l["name"] for l in pr.get("labels", [])}
-    return greenlight_status(repo, pr["number"], labs)[0] in ("ok", "unknown")
+    if greenlit is None:                                       # the caller's greenlight_status, if read
+        greenlit = greenlight_status(repo, pr["number"], {l["name"] for l in pr.get("labels", [])})[0]
+    return greenlit in ("ok", "unknown")
 
 
 def strip_stale_verdict_labels(repo, num, labels, prefix, head, evaluated, rebase_label=None,
@@ -1905,14 +1916,16 @@ def is_any_merge_first(label):
     return label == MERGE_FIRST_LABEL or label.endswith("-merge-first")
 
 
-def stale_close_skip_reason(pr, my_model):
+def stale_close_skip_reason(pr, my_model, my_prefix=None):
     """Why a bot's age-based stale close must leave this PR alone, or None to consider it.
 
     Each bot closes only PRs routed to ITS model (arb.model_skip_reason) and never one that any
     bot's merge-first label protects. Before 2026-09-26 the Qwen3.8 and Muse bots closed EVERY idle
     PR in the repo, and only spared their own merge-first: #1157, a Ternary-Bonsai PR neither of
     them evaluates, was closed by the Qwen3.8 bot with a comment about keeping the Qwen3.8 queue
-    clean."""
+    clean. Nor one carrying another bot's verified speedup (this bot's own is `my_prefix`): that bot
+    decides when it is stale -- the Muse bot closed a Shared PR a day after its own `none` while the
+    Qwen3.8 bot held it as a verified speedup waiting for the round winner's merge."""
     labs = {l["name"] for l in pr.get("labels", [])}
     if pr.get("isDraft"):
         return "draft"
@@ -1920,6 +1933,11 @@ def stale_close_skip_reason(pr, my_model):
         return "hold"
     if any(is_any_merge_first(l) for l in labs):
         return "merge-first"
+    own = my_prefix[len("eval-"):].rstrip(":") if my_prefix else None
+    for lab in sorted(labs):
+        m = _PER_BOT_LABEL_RE.match(lab)
+        if m and m.group(1) != own and GENERIC_TIER_RANK.get(lab.split(":", 1)[1], 0) > 0:
+            return f"another bot's verified speedup ({lab})"
     if model_skip_reason(pr.get("body") or "", my_model):
         return f"not a {my_model} PR"
     return None
@@ -2042,6 +2060,28 @@ def failure_excerpt(stdout, stderr, markers, limit=3000):
     return combined[-2000:]
 
 
+def _derived_generic_tier(labels):
+    """The generic tier the per-bot `eval-<model>:<tier>` labels call for (sync_generic_eval_label),
+    or None when there is none."""
+    tiers = []
+    for lab in labels:
+        m = _PER_BOT_EVAL_RE.match(lab)
+        if m and m.group(1).strip() in GENERIC_TIER_RANK:
+            tiers.append(m.group(1).strip())
+    if not tiers:
+        return None
+    return "REJECT" if "REJECT" in tiers else max(tiers, key=lambda t: GENERIC_TIER_RANK[t])
+
+
+def generic_label_out_of_sync(labels):
+    """Does this label set's generic `eval:*` differ from what its per-bot tiers call for? Each
+    bot's reconcile re-syncs such a PR every round: a sync that failed when a verdict was posted
+    (a label read or write GitHub did not answer) otherwise stayed wrong until the next verdict --
+    the generic label is what SN74 pays on."""
+    want = _derived_generic_tier(labels)
+    return want is not None and {l for l in labels if l.startswith("eval:")} != {f"eval:{want}"}
+
+
 def sync_generic_eval_label(repo, num):
     """Recompute the generic `eval:<tier>` label from every per-bot `eval-<model>:<tier>` label.
 
@@ -2066,16 +2106,9 @@ def sync_generic_eval_label(repo, num):
     labs = labels_on_or_none(repo, num)
     if labs is None:
         return False
-    tiers = []
-    for lab in labs:
-        m = _PER_BOT_EVAL_RE.match(lab)
-        if m:
-            t = m.group(1).strip()
-            if t in GENERIC_TIER_RANK:
-                tiers.append(t)
-    if not tiers:
+    want = _derived_generic_tier(labs)
+    if want is None:
         return None            # nothing to mirror; leave whatever is there alone
-    want = "REJECT" if "REJECT" in tiers else max(tiers, key=lambda t: GENERIC_TIER_RANK[t])
     for lab in {l for l in labs if l.startswith("eval:")}:
         if lab != f"eval:{want}":
             remove_label(repo, num, lab)

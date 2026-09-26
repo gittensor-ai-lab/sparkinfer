@@ -56,7 +56,9 @@ Closing, by explicit decision 2026-09-26, so this bot works like its siblings:
   * a PR routed to this model with no commits for BONSAI_STALE_DAYS, which has also waited on its
     author that long (arb.AuthorWaitClock), closes as stale, as the siblings' own stale close does
     for theirs (arb.stale_close_skip_reason) -- unless it is greenlit and still waiting for this
-    bot's first verdict on its head, or a verified speedup waiting for the merge-first PR to merge;
+    bot's first verdict on its head, a verified speedup waiting for the merge-first PR to merge,
+    never measured here and not greenlit (left to the daily Action), or another bot's verified
+    speedup;
   * a run that FAILED (build error, crash) never closes: its verdict comment says why.
 
   python eval/pr_bonsai_bot.py --only-prs 1139 --reeval --no-post
@@ -461,13 +463,16 @@ def close_stale_bonsai_prs(repo, prs, dry_run=False):
     clock = arb.AuthorWaitClock(AUTHOR_WAIT_FILE, [p["number"] for p in prs], now, record=not dry_run)
     for pr in prs:
         num = pr["number"]
-        if arb.stale_close_skip_reason(pr, "bonsai"):
+        if arb.stale_close_skip_reason(pr, "bonsai", EVAL_PREFIX):
             clock.forget(num)                  # a maintainer's, a merge's or another bot's wait
             continue
         ts = _pr_last_activity_ts(repo, num)
         if ts is None:
             continue
-        age_days = (now - ts) / 86400
+        # A commit dated in the future (a skewed or forged clock) proves no recent work: only the bot's
+        # own clock counts for it. Taken as-is, it kept the PR from ever going stale.
+        future = ts > now
+        age_days = 0.0 if future else (now - ts) / 86400
         # Every PR is classified, not only one idle for STALE_DAYS: the clock must start the round a
         # PR is handed back, or it would start only once the commit is that old -- twice the period.
         note = print if age_days >= STALE_DAYS else (lambda *_: None)     # the log names idle PRs only
@@ -497,19 +502,30 @@ def close_stale_bonsai_prs(repo, prs, dry_run=False):
         if evaluated is None:
             note(f"PR #{num}: idle {age_days:.1f}d; GitHub did not return its comments — kept open")
             continue
+        greenlit = None
+        if head not in evaluated:
+            greenlit = arb.greenlight_status(repo, num, labs)[0]
+            if greenlit not in ("ok", "unknown"):
+                # Never measured at this head and not asking to be (docs, tooling, a ticked box with
+                # no numbers): not in this bot's queue, and "not being measured is not grounds for
+                # closing" (CONTRIBUTING). The daily close-stale-prs Action closes one left idle.
+                note(f"PR #{num}: idle {age_days:.1f}d, never measured here and not greenlit — left to the daily stale close")
+                clock.forget(num)
+                continue
         if not arb.strike_count(STRIKES_FILE, num, head, "harness") and arb.waiting_for_first_verdict(
                 repo, pr, evaluated, never_paths=HARNESS_PATHS,
-                box_conflict=bool(arb.strike_count(STRIKES_FILE, num, head, "conflict"))):
+                box_conflict=bool(arb.strike_count(STRIKES_FILE, num, head, "conflict")), greenlit=greenlit):
             # Greenlit and still waiting for this bot to measure its head: the wait is the bot's.
             note(f"PR #{num}: idle {age_days:.1f}d but still waiting for its first bonsai verdict — kept open")
             clock.forget(num)
             continue
         # Waiting on its author -- counted from the first round the bot saw that, not from the commit.
-        waited = (now - max(ts, clock.since(num, head))) / 86400
+        waited = (now - max(0.0 if future else ts, clock.since(num, head))) / 86400
         if waited < STALE_DAYS:
             note(f"PR #{num}: idle {age_days:.1f}d, waiting on its author for {waited:.1f}d "
                  f"(closed at {STALE_DAYS:g}d) — kept open")
             continue
+        age_days = max(age_days, waited)       # (the same, unless the commit was dated in the future)
         print(f"PR #{num}: stale ({age_days:.1f}d since last commit, {waited:.1f}d waiting on its author, "
               f"threshold {STALE_DAYS:g}d) — closing")
         closed.add(num)
@@ -1067,7 +1083,7 @@ def _parse_remote(stdout: str) -> dict:
             elif head == "METRIC":
                 for tok in parts[1:]:
                     k, _, v = tok.partition("=")
-                    if k in ("top1", "kl", "ppl_pr", "ppl_main"):
+                    if k in ("top1", "kl", "ppl_pr", "ppl_main", "n", "n_main"):
                         out[k] = float(v)
             elif head == "PFCHECK" and len(parts) >= 5:
                 p = int(parts[1])
@@ -1280,7 +1296,7 @@ def _run_failure(r, what: str) -> dict:
     tail = arb.failure_excerpt(r.stdout, r.stderr, _EXPLICIT_FAIL_MARKERS)
     crash = _crash_reason(r.stdout, r.stderr)
     infra = _is_infra_failure(r.stdout, r.stderr)
-    crash = crash or arb.infra_failure_line(r.stdout, r.stderr)        # the text only
+    crash = arb.failure_cause(crash, r.stdout, r.stderr)             # the text only
     reason = f"{what} failed" + (f" — {crash}" if crash else " (no crash diagnostic captured — retried once)")
     # The tip the box fetched, when it got that far: a build failure is recorded against the
     # commit that failed to build (arb.measured_commit).
@@ -1374,8 +1390,10 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
                 "reason": "accuracy_compare_pair.py could not read the PR's score dump"}
     pr_top1, pr_kl = pr["top1"], pr["kl"]
     ppl_ratio = (pr.get("ppl_pr") or 0) / pr["ppl_main"] if pr.get("ppl_main") else None
+    # Every position main's dump has, not just the ones the PR's dump has: the compare skips the rest.
+    covered = pr.get("n_main") is None or pr.get("n", 0) >= pr["n_main"]
     accuracy_ok = (pr_top1 >= ACC_TOP1_BAR and pr_kl <= ACC_KL_BAR
-                   and ppl_ratio is not None and ppl_ratio <= ACC_PPL_RATIO)
+                   and ppl_ratio is not None and ppl_ratio <= ACC_PPL_RATIO and covered)
 
     # Checks the box kept from running this round: (strike key, why). They defer the verdict --
     # unless a gate that a contended or failing box cannot fake (accuracy, the prefill path, the
@@ -1387,7 +1405,9 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
     hard = []
     if not accuracy_ok:
         hard.append(f"accuracy gate failed vs main: top1={pr_top1:.4f} (bar >={ACC_TOP1_BAR}) "
-                    f"kl={pr_kl:.5f} (bar <={ACC_KL_BAR}) ppl x{ppl_ratio or 0:.4f} (bar <={ACC_PPL_RATIO})")
+                    f"kl={pr_kl:.5f} (bar <={ACC_KL_BAR}) ppl x{ppl_ratio or 0:.4f} (bar <={ACC_PPL_RATIO})"
+                    + ("" if covered else f"; the PR's score dump covers {int(pr.get('n', 0))} of "
+                                          f"{int(pr['n_main'])} positions"))
     pf_ok, pf_problems, pf_rows = check_prefill_path(pr, main)
     if not pf_ok:
         if all(p.endswith("measurement unavailable") for p in pf_problems):
@@ -1793,12 +1813,14 @@ def format_comment(commit: str, res: dict) -> str:
     )
 
 
-def auto_merge_ok_bonsai(repo, num, require_merge_first=True):
+def auto_merge_ok_bonsai(repo, num, require_merge_first=True, ranking_loss_ok=False):
     """Can this PR be merged now? With require_merge_first=False it is the reconcile's question
     instead -- may this PR be MADE merge-first -- which must be the same test minus that one label:
     a winner whose merge would then be refused holds merge-first round after round while every
     other speedup PR is pushed to needs-rebase (#1154, 2026-09-24, for a hold; any refusal below
-    did the same until 2026-09-26)."""
+    did the same until 2026-09-26).
+    ranking_loss_ok: the bot's own bonsai-needs-rebase does not count -- reconcile's call for a PR
+    sent there only for losing an earlier ranking (_waits_for_the_winner)."""
     try:
         info = json.loads(arb.gh(["pr", "view", str(num), "-R", repo, "--json",
                                   "state,isDraft,labels,author,mergeable,files,changedFiles,headRefOid,baseRefName"]).stdout or "{}")
@@ -1828,7 +1850,7 @@ def auto_merge_ok_bonsai(repo, num, require_merge_first=True):
     # A REJECT from any other bot is a measured harm on another model.
     if any(l.endswith(":REJECT") for l in labs if l.startswith("eval")):
         return False, "carries a REJECT from another eval bot"
-    blocked = labs & AUTOMERGE_BLOCK
+    blocked = labs & (AUTOMERGE_BLOCK - ({BONSAI_NEEDS_REBASE} if ranking_loss_ok else set()))
     if blocked:
         return False, f"blocking label(s): {', '.join(sorted(blocked))}"
     author = (info.get("author") or {}).get("login", "")
@@ -1941,14 +1963,28 @@ def reconcile_bonsai_merge_labels(repo, dry_run=False):
     scored = []
     stale_first = []   # carries merge-first but can no longer win it
     stale_main = set()   # in the running, but its merge waits for a re-measure onto today's main
+    main_now = None      # read once, for a needs-rebase that may only mean a lost ranking
     for p in open_prs:
         labs = {l["name"] for l in p["labels"]}
+        # A sync GitHub did not answer when this bot posted its verdict, healed -- on this bot's PRs
+        # only: the retired AR bot's labels derive the generic one by another rule (the failing side).
+        if not dry_run and any(l.startswith(EVAL_PREFIX) for l in labs) and arb.generic_label_out_of_sync(labs):
+            arb.sync_generic_eval_label(repo, p["number"])
         # A PR that cannot be merged -- `hold`, needs-rebase, a penalty or copycat flag, any other
         # AUTOMERGE_BLOCK label -- must not take merge-first either. It used to: on 2026-09-24
         # #1154 was held for review with the round's best score, won merge-first, had its merge
         # refused, and pushed the next-best PR to needs-rebase for a merge that never happened --
         # every round, for as long as the hold lasted.
-        if labs & AUTOMERGE_BLOCK:
+        lost_only = False
+        if (labs & AUTOMERGE_BLOCK) == {BONSAI_NEEDS_REBASE}:
+            # Sent to needs-rebase only for losing an earlier ranking, with its verdict still standing
+            # on today's main: it stays in the running. Left out, a worse PR merged first once the
+            # winner was re-measured lower, and nothing merged at all once the winner was closed or
+            # held. After main moves, the rebase is its author's (CONTRIBUTING).
+            if main_now is None:
+                main_now = arb.current_main_sha(repo) or ""
+            lost_only = bool(main_now) and _waits_for_the_winner(p, labs, (p.get("headRefOid") or "")[:40], main_now)
+        if labs & AUTOMERGE_BLOCK and not lost_only:
             if BONSAI_MERGE_FIRST in labs:
                 stale_first.append(p["number"])
             continue
@@ -1962,7 +1998,8 @@ def reconcile_bonsai_merge_labels(repo, dry_run=False):
             continue
         # Everything else auto-merge would refuse -- a head that moved past the scored commit, a
         # REJECT from another bot, a penalty, a protected path, a conflict -- must not win either.
-        ok, why = auto_merge_ok_bonsai(repo, p["number"], require_merge_first=False)
+        ok, why = auto_merge_ok_bonsai(repo, p["number"], require_merge_first=False,
+                                       ranking_loss_ok=lost_only)
         if not ok and why == arb.PR_UNREADABLE:
             # Not an answer: demoting on it would take merge-first from the real holder.
             print(f">> bonsai round: GitHub did not return #{p['number']} — labels left as they are")

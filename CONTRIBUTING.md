@@ -74,8 +74,10 @@ that with a `hold` label. Once the `merge-first` PR is merged, the others **stay
 **rebase your branch onto the new `main`** and push; the bot then re-runs your eval against the new
 frontier (briefly tagging [`re-evaluate`](../../labels/re-evaluate) during the re-grade), so you're
 credited for the **marginal** gain on top of what merged (independent wins stack and keep scoring; a
-change the merge already captured drops to `none`). A `needs-rebase` PR can't win the next round
-until you actually rebase + it re-evals. Keep your branch rebased on `main`. The eval loop
+change the merge already captured drops to `none`). Until something merges, a `needs-rebase` PR
+whose verdict still stands on the same `main` stays in the running (it wins if the winner is
+re-measured lower or closed); once `main` moves it can't win until you rebase and it re-evals. Keep
+your branch rebased on `main`. The eval loop
 labels each PR **XL / L / M / S / XS** from the measured delta (or **BASELINE** for the first
 verified entry on a new model/target) — never by hand — and that tier is the payout. A speedup
 is scored the same wherever it lands (`kernels/`, `runtime/`, `moe/`); there is **no
@@ -301,7 +303,9 @@ against you.
   clean. Time the PR spent queued behind the bot never counts. This is not a judgment on the work:
   push a commit or reopen and it's picked straight back up on the next cycle; a reopened PR has the
   whole day again. `hold`, drafts, any round winner, a greenlit PR still waiting for its first
-  evaluation, and a verified speedup waiting for the round winner to merge are exempt.
+  evaluation, and a verified speedup waiting for the round winner to merge are exempt. A PR no bot
+  has measured that is not greenlit (docs, tooling, a ticked box with no numbers) is not in the eval
+  queue: only the daily stale close (no activity for two days) applies to it.
 - **`none` or REJECT on an evaluated PR — closed on the first result, not the third.** A `none`
   means no verified speedup on any axis that bot measures; a REJECT means a measured regression or
   a failed gate. A REJECT closes the PR; a `none` closes it only when the PR declares that bot's

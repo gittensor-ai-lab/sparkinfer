@@ -200,14 +200,17 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
     measured against. Once any bot merges something else, a merge candidate nothing else stops is
     measured again before it can merge. Until then it keeps its place in the ranking -- behind any
     PR that can merge now, and only while the bot's selection would actually re-measure it -- and
-    nobody is sent to rebase while it waits.
+    nobody is sent to rebase while it waits. A PR sent to `*-needs-rebase` only for losing a ranking
+    stays in the running while its verdict still stands on today's `main`: it wins if the winner is
+    re-measured lower, closed or held (before, a worse PR merged first, or nothing merged at all).
   - No bot auto-merges a harness edit, or a PR changing more files than GitHub lists: whatever its
     verdict, those merge by hand.
 - **Closing.** A REJECT closes the PR. A `none` closes it only when the PR declares that bot's model
   and no other, and no other bot has scored it a speedup or made it merge-first
   (`arb.none_may_close`; its own merge-first does not count). Before, the Muse and Qwen3.8 bots
   closed on every `none`, including PRs ticked "Shared" or aimed at another model. A run that
-  failed never closes, and Ternary-Bonsai's two-round checks close only on their second round. No
+  failed never closes, and the two-round checks (Ternary-Bonsai's, Muse's concurrency widths) close
+  only on their second round. No
   bot closes a PR whose head moved after the commit it measured, nor one made a draft or given
   `hold` while the round ran: the PR is read again just before closing (`arb.verdict_close_blocker`).
   The close comment asks for a new commit: reopening alone does not re-run a commit that already has
@@ -219,17 +222,22 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
   that PR merges and `main` moves. A PR that conflicts with `main` (GitHub's word, or a conflict the
   box found for this very head; a `*-needs-rebase` left from an older head is not read) or edits the
   harness is waiting on its author; so is not a PR whose head the bot gave up on after its own
-  errors.
+  errors. A PR the bot never measured at its head that is not greenlit (docs, tooling, a ticked box
+  without numbers) is not in its queue at all and is left to the daily Action ("not being measured
+  is not grounds for closing", CONTRIBUTING); nor does a bot close a PR carrying another bot's
+  verified speedup -- that bot decides.
   - The threshold (`*_STALE_DAYS`, a day) counts from the later of the last commit and the first
     round the bot found the PR waiting on its author, per head (`arb.AuthorWaitClock`, in
     `~/.sparkinfer_<bot>_author_wait.json`). A PR the bot kept waiting -- queued, then told to
     rebase, or made to conflict by another merge -- used to close the very round it was handed back.
     The clock restarts on a push, is dropped while the PR waits on anyone else again (the bot, a
-    `hold`, a draft, a merge-first), and ends with a close, so a reopened PR has the whole day again.
+    `hold`, a draft, a merge-first), and ends with the bot's close, so a PR reopened after it has the
+    whole day again. A commit dated in the future counts for nothing: only the clock decides.
   - `*_STALE_DAYS=0` turns the stale close off, as `SPARKINFER_STALE_PR_DAYS=0` does the daily
     Action's; `SPARKINFER_BONSAI_AUTOCLOSE=0` turns off every Bonsai close, the stale one included.
   - A GitHub read that fails is "unknown" and never closes, strips or re-measures anything; a label
-    read that fails changes no generic `eval:*` label. The daily
+    read that fails changes no generic `eval:*` label, and each bot's reconcile re-syncs the generic
+    label of a PR carrying its own tier when a failed sync left it wrong (it is what SN74 pays on). The daily
   `close-stale-prs` Action (no GitHub activity for 2 days) spares any bot's merge-first and any
   greenlit PR no model bot has posted a verdict for yet, unless GitHub says it conflicts or it edits
   paths no bot measures (`arb.NEVER_MEASURED_PATHS`).
@@ -252,7 +260,11 @@ these the same way (2026-09-26). Each bot's module docstring has the details.
     the PR.
   - A guard `main` measured nothing for, or only zeros, skips the round; so does a Muse `main` that
     misses its own accuracy gate against llama.cpp. A llama.cpp reference server that never becomes
-    healthy is infra.
+    healthy, or stops answering the compare while `/health` still does (`accuracy_compare.py`'s
+    `REFERENCE_FAILED`, exit 3), is infra.
+  - The accuracy gate needs the PR's score dump to cover every position of the stream: the
+    comparators judge only the positions a dump has, and report how many (`n=` beside `n_main=` or
+    `n_expected=`), so a dump that stopped early no longer passes on the few it holds.
   - A failure of the bot itself (an exception) is never charged: after three rounds at one commit
     the bot stops measuring that commit until a push. A run that gives up on a PR, or whose round
     is skipped because `main`'s baseline is unusable, exits 3, so the wrapper's failed-run banner
@@ -480,9 +492,9 @@ already failed a gate a busy box cannot fake (accuracy, the prefill path, a `bon
 check): then that REJECT is posted, naming what did not run. A PR that fails to build or crashes gets `eval-bonsai:REJECT` once for that
 commit; the verdict shows the compiler's own error lines, not the end of the log. A run killed at
 the two-hour ssh limit is most likely a hang in the PR (main completed the same run that round),
-but a step of the box's own can hang too, and the REJECT stays on that commit until a push: it is a
-box fault like the others, charged to the PR once it recurs at one commit for three rounds
-(`arb.exception_result`, all three bots).
+but a step of the box's own can hang too, and a REJECT posted for it would stay on that commit until
+a push: it is a box fault like the others, charged to the PR once it recurs at one commit for three
+rounds (`arb.exception_result`, all three bots).
 
 **Commit recorded.** A verdict names the PR tip the box fetched and built, not the head seen when
 the round listed PRs: #1167 was force-pushed mid-round on 2026-09-25, and its verdict named a

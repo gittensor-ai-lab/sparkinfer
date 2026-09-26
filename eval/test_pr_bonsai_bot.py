@@ -603,7 +603,7 @@ class ReconcileTests(unittest.TestCase):
                     [{"number": n, "labels": [{"name": l} for l in labs]} for n, labs in prs.items()]))
             return run("[]")
 
-        def fake_ok(repo, num, require_merge_first=True):
+        def fake_ok(repo, num, require_merge_first=True, ranking_loss_ok=False):
             self.assertFalse(require_merge_first)          # the reconcile asks without the label
             return (False, refused[num]) if num in refused else (True, "ok")
         with mock.patch.object(arb, "gh", side_effect=fake_gh), \
@@ -1256,6 +1256,18 @@ class RemoteScriptRetryTests(unittest.TestCase):
         self.assertIn("BONSAIREG_NOTE", s)
         self.assertIn("head -20", s)
 
+
+
+class CoverageTests(unittest.TestCase):
+    def test_a_pr_score_dump_missing_positions_fails_the_accuracy_gate(self):
+        # Only the positions both dumps have are compared: 3 matching positions of main's 149 read
+        # as top-1 1.000 and passed.
+        full = evaluate(box_stdout().replace("ppl_main=9.56", "ppl_main=9.56 n=149 n_main=149"))
+        self.assertTrue(full["accuracy_ok"], full.get("reason"))
+        short = evaluate(box_stdout().replace("ppl_main=9.56", "ppl_main=9.56 n=3 n_main=149"))
+        self.assertFalse(short["accuracy_ok"])
+        self.assertEqual(short["label"], "REJECT")
+        self.assertIn("covers 3 of 149 positions", short["reason"])
 
 if __name__ == "__main__":
     unittest.main()

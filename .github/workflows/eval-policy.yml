@@ -85,7 +85,8 @@ jobs:
             eval/_bot_test_state.py \
             eval/noise_penalty.py \
             eval/test_noise_penalty.py \
-            bench/scripts/accuracy_compare_pair.py
+            bench/scripts/accuracy_compare_pair.py \
+            bench/scripts/accuracy_compare.py
 
       - name: Eval policy tests
         run: |

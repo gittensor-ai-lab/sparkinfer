@@ -97,6 +97,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     PR run fails over rounds; a guard the OOM killer took beside a failed accuracy gate is reported
     as not measured, not as the failure; a re-measure keeps the earlier run's eval log; a verdict
     comment always fits on GitHub; a run that gave up on a PR exits 3 with the GPU down too;
+  - a PR sent to `needs-rebase` only for losing a ranking stays in the running while its verdict
+    stands on today's `main`, so a winner re-measured lower no longer merges first and a closed or
+    held winner no longer stops every merge; a bot's reconcile re-syncs the generic `eval:*` label of
+    its own PRs when a failed sync left it wrong; a model bot no longer stale-closes a PR it never measured that is not
+    greenlit, or one carrying another bot's verified speedup; a commit dated in the future no longer
+    keeps a PR from going stale; label reads see more than 30 labels; a llama.cpp reference that
+    stops answering Muse's accuracy compare is infra, not the PR's REJECT; a score dump missing
+    positions fails the accuracy gate instead of passing on the positions it has; a charged box
+    fault's reason names the GPU or build cause rather than the shell line it stopped on;
   - the cron wrappers run the bots from their own `origin/main` worktree (made again if it breaks,
     and never one they did not make), refuse to run without a `GH_TOKEN` (or, with
     `SPARKINFER_BOT_LOGIN` set, with another account's; `.env.eval` never stands in for an empty
