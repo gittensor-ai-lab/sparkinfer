@@ -67,11 +67,14 @@ class ScopeTests(unittest.TestCase):
             self.assertIn(f"bonsai-cb-decode@c{c}", bot.SCORING_DIMS)
         self.assertEqual(len(bot.SCORING_DIMS), 15)
 
-    def test_automerge_and_autoclose_default_off_and_are_env_gated(self):
-        # In the test process no env var is set, so both are off: the switches are the only thing
-        # that turns them on. Production sets SPARKINFER_BONSAI_AUTOMERGE=1 in .env.eval.
+    def test_automerge_is_opt_in_and_autoclose_opt_out(self):
+        # In the test process no env var is set. Auto-merge needs SPARKINFER_BONSAI_AUTOMERGE=1
+        # (production sets it in .env.eval); closing is on, like the sibling bots', unless
+        # SPARKINFER_BONSAI_AUTOCLOSE=0 (decision 2026-09-26).
         self.assertFalse(bot.AUTO_MERGE)
-        self.assertFalse(bot.AUTO_CLOSE)
+        self.assertTrue(bot.AUTO_CLOSE)
+        src = open(bot.__file__).read()
+        self.assertIn('os.environ.get("SPARKINFER_BONSAI_AUTOCLOSE", "1") != "0"', src)
 
 
 class AutoMergeGateTests(unittest.TestCase):
@@ -273,13 +276,43 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(m["bonsai-cb-decode@c8"], {"pr": 640.0, "main": 640.0, "delta": 0.0, "label": "none"})
         __import__("json").dumps(m)       # JSON-serialisable as written to result.json
 
-    def test_unmeasured_concurrency_drops_the_axis(self):
+    def test_a_width_only_the_pr_fails_is_a_strike_not_a_silent_drop(self):
+        # c32 completes on main but not on the PR: no longer dropped unscored (it hid a PR that
+        # crashes the engine at c32). Alone, it is a REJECT judged over two rounds (strike_key).
         cb = dict(MAIN_CB)
         del cb[32]
-        res = evaluate(box_stdout(cb=cb))
+        res = evaluate(box_stdout(cb=cb, extra="BONSAICB_FAILED 32 run\n"))
         self.assertTrue(res["ok"])
         self.assertNotIn("bonsai-cb-decode@c32", {d["dim"] for d in res["scored_dims"]})
-        self.assertEqual(res["label"], "none")
+        self.assertEqual(res["label"], "REJECT")
+        self.assertEqual(res["strike_key"], "cb:c32")
+        self.assertEqual(res["cb_pr_missing"], [32])
+        self.assertIn("did not complete on the PR build", bot.format_comment("a" * 40, res))
+
+    def test_a_width_lost_to_an_undrained_gpu_is_infra(self):
+        cb = dict(MAIN_CB)
+        del cb[16]
+        res = evaluate(box_stdout(cb=cb, extra="BONSAICB_FAILED 16 gpu\n"))
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["retry"])
+
+    def test_beside_another_failure_a_missing_width_is_just_a_reason(self):
+        pr = dict(MAIN_BONSAI)
+        pr[512] = (90.0, 5200.0)          # a real decode regression
+        cb = dict(MAIN_CB)
+        del cb[32]
+        res = evaluate(box_stdout(bonsai=pr, cb=cb, extra="BONSAICB_FAILED 32 run\n"))
+        self.assertEqual(res["label"], "REJECT")
+        self.assertIsNone(res["strike_key"])          # posted at once, not deferred
+        self.assertIn("c32 did not complete", res["reason"])
+
+    def test_main_must_measure_every_width(self):
+        cb = dict(MAIN_CB)
+        del cb[8]
+        with mock.patch.object(bot, "_ssh_run_resilient", return_value=run(box_stdout(role="main", cb=cb))):
+            m = bot.measure_main_baseline("h", 1)
+        self.assertFalse(m["ok"])
+        self.assertIn("c8", m["reason"])
 
     def test_accuracy_divergence_rejects(self):
         pr = dict(MAIN_BONSAI)
@@ -359,8 +392,24 @@ class ScoringTests(unittest.TestCase):
         self.assertIn("sparkinfer bonsai auto-eval", body)
 
 
-class ApplyResultTests(unittest.TestCase):
-    def _apply(self, res, autoclose=False):
+TEMPLATE = open(bot.os.path.join(bot.ROOT, ".github", "PULL_REQUEST_TEMPLATE.md")).read()
+BONSAI_ONLY_BODY = TEMPLATE.replace("- [ ] **Ternary-Bonsai-2-27B**", "- [x] **Ternary-Bonsai-2-27B**")
+
+
+class TempStateMixin:
+    """Point the strikes file at a temp path: tests must never touch the controller's real state."""
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        for name, fname in (("STRIKES_FILE", "strikes.json"), ("SCORES_FILE", "scores.json")):
+            p = mock.patch.object(bot, name, bot.os.path.join(self._tmp.name, fname))
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+
+class ApplyResultTests(TempStateMixin, unittest.TestCase):
+    def _apply(self, res, autoclose=False, body="", commit="abc1234"):
         calls = []
         with mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run("")), \
                 mock.patch.object(arb, "labels_on", return_value=set()), \
@@ -370,26 +419,53 @@ class ApplyResultTests(unittest.TestCase):
                 mock.patch.object(bot, "upload_bonsai_eval_log"), \
                 mock.patch.object(bot, "_save_scores"), \
                 mock.patch.object(bot, "AUTO_CLOSE", autoclose):
-            bot.apply_result("o/r", 1139, "abc1234", res)
+            bot.apply_result("o/r", 1139, commit, res, body=body)
         return calls
 
     def test_infra_posts_nothing(self):
         self.assertEqual(self._apply({"ok": False, "retry": True, "reason": "GPU busy"}), [])
 
-    def test_none_never_closes(self):
+    def test_none_closes_only_a_pr_declared_for_this_model_alone(self):
         res = evaluate(box_stdout())
         self.assertEqual(res["label"], "none")
-        calls = self._apply(res, autoclose=True)
-        self.assertIn(["add", "eval-bonsai:none"], calls)
-        self.assertFalse(any(c[:2] == ["pr", "close"] for c in calls))
+        undeclared = self._apply(res, autoclose=True, body=TEMPLATE)
+        self.assertIn(["add", "eval-bonsai:none"], undeclared)
+        self.assertFalse(any(c[:2] == ["pr", "close"] for c in undeclared))
+        shared = TEMPLATE.replace("- [ ] **Shared", "- [x] **Shared").replace(
+            "- [ ] **Ternary-Bonsai-2-27B**", "- [x] **Ternary-Bonsai-2-27B**")
+        self.assertFalse(any(c[:2] == ["pr", "close"] for c in self._apply(res, autoclose=True, body=shared)))
+        declared = self._apply(res, autoclose=True, body=BONSAI_ONLY_BODY)
+        self.assertTrue(any(c[:2] == ["pr", "close"] for c in declared))
+        close_comment = next(c for c in declared if "sparkinfer-bonsai-auto-close" in " ".join(c))
+        self.assertIn("not a finding that anything is wrong", " ".join(close_comment))
 
-    def test_reject_closes_only_when_switched_on(self):
+    def test_reject_closes_unless_switched_off_and_says_why(self):
         pr = dict(MAIN_BONSAI)
         pr[512] = (90.0, 5200.0)
         res = evaluate(box_stdout(bonsai=pr))
         self.assertEqual(res["label"], "REJECT")
         self.assertFalse(any(c[:2] == ["pr", "close"] for c in self._apply(res)))
-        self.assertTrue(any(c[:2] == ["pr", "close"] for c in self._apply(res, autoclose=True)))
+        calls = self._apply(res, autoclose=True)
+        self.assertTrue(any(c[:2] == ["pr", "close"] for c in calls))
+        close_comment = " ".join(next(c for c in calls if "sparkinfer-bonsai-auto-close" in " ".join(c)))
+        self.assertIn("bonsai-decode@512 regression", close_comment)
+
+    def test_a_failed_run_never_closes(self):
+        res = evaluate("", rc=1, stderr="BUILD_FAILED — errors in the build log:\nx.cu(3): error: y")
+        calls = self._apply(res, autoclose=True, body=BONSAI_ONLY_BODY)
+        self.assertIn(["add", "eval-bonsai:REJECT"], calls)
+        self.assertFalse(any(c[:2] == ["pr", "close"] for c in calls))
+
+    def test_a_pr_only_width_failure_rejects_on_the_second_round(self):
+        cb = dict(MAIN_CB)
+        del cb[32]
+        res = evaluate(box_stdout(cb=cb, extra="BONSAICB_FAILED 32 run\n"))
+        self.assertEqual(self._apply(res, commit="a" * 40), [])          # strike 1: nothing posted
+        self.assertEqual(bot._load_strikes()["1139"]["count"], 1)
+        self.assertEqual(self._apply(res, commit="b" * 40), [])          # new commit: starts again
+        calls = self._apply(res, commit="b" * 40)                          # strike 2: posted
+        self.assertIn(["add", "eval-bonsai:REJECT"], calls)
+        self.assertNotIn("1139", bot._load_strikes())                      # cleared once posted
 
 
 class MergeOntoBaselineTests(unittest.TestCase):
@@ -447,21 +523,39 @@ class MergeOntoBaselineTests(unittest.TestCase):
 
 
 class ReconcileTests(unittest.TestCase):
-    def _reconcile(self, prs, scores):
+    def _reconcile(self, prs, scores, refused=None):
         calls = []
+        refused = refused or {}
 
         def fake_gh(a):
             if a[:2] == ["pr", "list"] and "open" in a:
                 return run(__import__("json").dumps(
                     [{"number": n, "labels": [{"name": l} for l in labs]} for n, labs in prs.items()]))
             return run("[]")
+
+        def fake_ok(repo, num, require_merge_first=True):
+            self.assertFalse(require_merge_first)          # the reconcile asks without the label
+            return (False, refused[num]) if num in refused else (True, "ok")
         with mock.patch.object(arb, "gh", side_effect=fake_gh), \
                 mock.patch.object(arb, "add_label", side_effect=lambda r, n, l: calls.append(("add", n, l))), \
                 mock.patch.object(arb, "remove_label", side_effect=lambda r, n, l: calls.append(("rm", n, l))), \
                 mock.patch.object(bot, "_load_scores", return_value=scores), \
+                mock.patch.object(bot, "auto_merge_ok_bonsai", side_effect=fake_ok), \
                 mock.patch.object(bot, "AUTO_MERGE", False):
             bot.reconcile_bonsai_merge_labels("o/r")
         return calls
+
+    def test_a_winner_auto_merge_would_refuse_does_not_take_merge_first(self):
+        # #1167 (2026-09-25): its head moved past the scored commit, so auto-merge refused it; it
+        # must neither win nor push the runner-up to needs-rebase for a merge that cannot happen.
+        calls = self._reconcile(
+            {1167: ["eval-bonsai:XL", "bonsai-merge-first"], 1168: ["eval-bonsai:L"]},
+            {"1167": {"delta_pct": 19.8}, "1168": {"delta_pct": 10.8}},
+            refused={1167: "head 84a574d3f is not the commit last scored (901cef64e)"})
+        self.assertIn(("add", 1168, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertIn(("rm", 1167, bot.BONSAI_MERGE_FIRST), calls)
+        self.assertNotIn(("add", 1168, bot.BONSAI_NEEDS_REBASE), calls)
+        self.assertNotIn(("add", 1167, bot.BONSAI_NEEDS_REBASE), calls)
 
     def test_a_held_pr_neither_wins_nor_demotes_the_next_best(self):
         # #1154 (held, XL +35.4%) must not take merge-first from #1155 or push it to needs-rebase.
@@ -504,6 +598,242 @@ class DeclarationAndSiblingGuardTests(unittest.TestCase):
             ok, problems = mod.check_bonsai_guard(regressed, p)
             self.assertFalse(ok, mod.__name__)
             self.assertIn("ternary-bonsai prefill@128", problems[0])
+
+
+class ServeVerdictTests(unittest.TestCase):
+    """bonsai_regression.py's serve check decides on 2 of up to 3 conclusive trials (2026-09-26):
+    a build equal to main failed a single trial in 2 of 8 runs on the eval box."""
+    def _verdict(self, outcomes):
+        import bonsai_regression as reg
+        seq = iter(outcomes)
+        return reg.serve_verdict(lambda: next(seq))
+
+    def test_a_first_pass_is_a_pass(self):
+        self.assertEqual(self._verdict([("pass", "")])[0], "pass")
+
+    def test_one_failure_is_retried_and_does_not_convict(self):
+        out, detail = self._verdict([("fail", "row served differently"), ("pass", ""), ("pass", "")])
+        self.assertEqual(out, "pass")
+        self.assertIn("2 of 3", detail)
+
+    def test_two_failures_convict(self):
+        self.assertEqual(self._verdict([("fail", "x"), ("fail", "x")])[0], "fail")
+        self.assertEqual(self._verdict([("fail", "x"), ("pass", ""), ("fail", "x")])[0], "fail")
+
+    def test_non_deterministic_baselines_never_convict(self):
+        import bonsai_regression as reg
+        out, _ = self._verdict([("inconclusive", "baselines differ")] * reg.SERVE_MAX_TRIALS)
+        self.assertEqual(out, "inconclusive")
+        self.assertEqual(self._verdict([("inconclusive", "b"), ("pass", "")])[0], "pass")
+        self.assertEqual(self._verdict([("fail", "x")] + [("inconclusive", "b")] * 4)[0], "inconclusive")
+
+    def test_a_check_that_raises_is_a_named_failure_not_a_crash(self):
+        import bonsai_regression as reg
+        argv = ["bonsai_regression.py", "--build", "/nonexistent/build/runtime", "--skip", "score,generate,serve"]
+        with mock.patch.object(reg.sys, "argv", argv), \
+                mock.patch.object(reg, "check_tensors", side_effect=ModuleNotFoundError("No module named 'safetensors'")), \
+                mock.patch("builtins.print") as p:
+            self.assertEqual(reg.main(), 1)
+        printed = "\n".join(" ".join(str(x) for x in c.args) for c in p.call_args_list)
+        self.assertIn("tensors: raised ModuleNotFoundError", printed)
+        self.assertIn("FAILED:", printed)
+
+
+class RegressionGatingTests(unittest.TestCase):
+    """Gate 2c per check: a check main also fails cannot reject; the other checks still gate."""
+    def _main(self, reg_ok=True, reg_why=()):
+        with mock.patch.object(bot, "_ssh_run_resilient",
+                               return_value=run(box_stdout(role="main", reg_ok=reg_ok, reg_why=reg_why))):
+            m = bot.measure_main_baseline("h", 1)
+        self.assertTrue(m["ok"], m)
+        return m
+
+    def test_a_serve_failure_on_main_no_longer_ungates_the_other_checks(self):
+        main = self._main(reg_ok=False, reg_why=["serve: folded row served differently alone and after a batch"])
+        res = evaluate(box_stdout(reg_ok=False, reg_why=["tensors: blk.0.ffn_gate.weight cosine 0.1200 below 0.8"]),
+                       main=main)
+        self.assertEqual(res["label"], "REJECT")
+        self.assertEqual(res["bonsaireg_gated_fail"], ["tensors"])
+        self.assertIn("cosine", res["reason"])
+
+    def test_a_check_main_also_fails_is_not_gated(self):
+        main = self._main(reg_ok=False, reg_why=["serve: folded row served differently alone and after a batch"])
+        res = evaluate(box_stdout(reg_ok=False, reg_why=["serve: folded row served differently alone and after a batch"]),
+                       main=main)
+        self.assertEqual(res["label"], "none")
+        self.assertIn("not gated for serve", bot.format_comment("a" * 40, res))
+
+    def test_the_prs_own_serve_failure_rejects_when_main_passes(self):
+        res = evaluate(box_stdout(reg_ok=False, reg_why=["serve: folded row served differently alone and "
+                                                         "after a batch (2 of 2 conclusive trials)"]))
+        self.assertEqual(res["label"], "REJECT")
+        self.assertIn("FAILED", bot.format_comment("a" * 40, res))
+
+    def test_a_regression_script_that_did_not_complete_on_main_gates_nothing(self):
+        main = self._main(reg_ok=False)                   # no FAILED: lines -> "*"
+        res = evaluate(box_stdout(reg_ok=False, reg_why=["tensors: x"]), main=main)
+        self.assertNotEqual(res["label"], "REJECT")
+        self.assertIn("did not complete on main", bot.format_comment("a" * 40, res))
+
+    def test_notes_are_shown_not_gated(self):
+        res = evaluate(box_stdout(extra="BONSAIREG_NOTE serve: folded inconclusive -- baselines differ\n"))
+        self.assertEqual(res["label"], "none")
+        self.assertIn("inconclusive", bot.format_comment("a" * 40, res))
+
+
+class BuildFailureTests(unittest.TestCase):
+    """#1163 (2026-09-25): its verdict showed 80 lines of `ptxas info` resource reports and none of
+    the actual `error : Feature 'mbarrier.try_wait.parity' requires .target sm_90` lines."""
+    LOG = "\n".join(
+        ["ptxas info    : Compiling entry function 'k' for 'sm_89'",
+         "ptxas info    : Used 38 registers, used 1 barriers",
+         "    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads",
+         "ptxas /t/prefill_moe_q.compute_89.ptx, line 649; error   : Feature '.op_restrict' requires .target sm_90 or higher",
+         "ptxas fatal   : Ptx assembly aborted due to errors",
+         "gmake[3]: *** [x.make:227: prefill_moe_q.cu.o] Error 255"]
+        + ["ptxas info    : Used 24 registers"] * 120)
+
+    def _bash(self, script):
+        import subprocess
+        return subprocess.run(["bash", "-c", arb.BUILD_FAILURE_SH + script], capture_output=True, text=True)
+
+    def test_report_shows_the_real_errors_first(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write(self.LOG)
+        r = self._bash(f'report_build_failure "{f.name}"')
+        errs = r.stderr.split("--- end of the build log")[0]
+        self.assertIn("requires .target sm_90", errs)
+        self.assertIn("Error 255", errs)
+        self.assertNotIn("ptxas info", r.stderr)
+        self.assertEqual(bot._crash_reason("", r.stderr).split(": ", 1)[1][:4], "ptxa")
+        self.assertIn("requires .target sm_90", bot._crash_reason("", r.stderr))
+
+    def test_box_faults_are_recognised(self):
+        import tempfile
+        for line, fault in (("nvcc error   : 'cicc' died due to signal 9 (Kill signal)", True),
+                            ("c++: fatal error: Killed signal terminated program cc1plus", True),
+                            ("failed to build archive: Bad address (os error 14)", True),
+                            ("/tmp/x: No space left on device", True),
+                            ("x.cu(3): error: identifier \"y\" is undefined", False)):
+            with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+                f.write(line + "\n")
+            self.assertEqual(self._bash(f'build_box_fault "{f.name}" >/dev/null').returncode == 0, fault, line)
+
+    def test_first_build_error_prefers_the_compiler_over_make(self):
+        self.assertIn("error   : Feature", arb.first_build_error(self.LOG.splitlines()))
+        self.assertIn("Error 2", arb.first_build_error(["gmake: *** [all] Error 2", "ptxas info : x"]))
+        self.assertIsNone(arb.first_build_error(["-Werror is set", "error_code = 3", "3 errors"]))
+
+    def test_the_verdict_excerpt_starts_at_the_marker_not_the_end_of_the_log(self):
+        stderr = "noise\n" * 50 + "BUILD_FAILED — errors in the build log:\nx.cu(1): error: y\n" + "tail line\n" * 400
+        res = evaluate("", rc=1, stderr=stderr)
+        self.assertTrue(res["log"].startswith("BUILD_FAILED"))
+        self.assertIn("x.cu(1): error: y", bot.format_comment("a" * 40, res))
+
+    def test_the_remote_script_retries_a_box_fault_before_blaming_the_pr(self):
+        s = bot._remote_script("pull/1/head", role="pr", onto="b" * 40)
+        self.assertIn("report_build_failure()", s)
+        self.assertIn('build_targets 4', s)
+        self.assertIn("RETRYABLE_INFRA_FAILURE build:", s)
+        self.assertNotIn('tail -80 "$TMPDIR/build.log"', s)
+        self.assertTrue(bot._is_infra_failure("", "RETRYABLE_INFRA_FAILURE build: died due to signal 9"))
+
+
+class MeasuredCommitTests(unittest.TestCase):
+    def test_the_built_tip_is_recorded_when_the_pr_moved(self):
+        listed, built = "9" * 40, "8" * 40
+        self.assertEqual(arb.measured_commit(listed, {"pr_tip": built}), (built, True))
+        self.assertEqual(arb.measured_commit(listed, {"pr_tip": listed}), (listed, False))
+        self.assertEqual(arb.measured_commit(listed, {"pr_tip": "8888888"}), (listed, False))   # short: unusable
+        self.assertEqual(arb.measured_commit(listed, {}), (listed, False))
+
+    def test_the_box_reports_the_full_tip(self):
+        s = arb.merged_checkout_script("pull/1/head", "b" * 40)
+        self.assertIn('echo "PR_TIP $(git rev-parse "$PR_TIP")"', s)
+        self.assertNotIn('PR_TIP $(git rev-parse --short', s)
+
+    def test_a_failed_run_carries_the_tip_it_fetched(self):
+        res = evaluate(f"PR_TIP {'c' * 40}\n", rc=1, stderr="BUILD_FAILED — x\nx.cu(1): error: y")
+        self.assertEqual(res["pr_tip"], "c" * 40)
+
+    def test_polaris_attests_the_measured_tip(self):
+        seen = []
+        with mock.patch.object(bot, "POLARIS_ENABLED", True), \
+                mock.patch.object(bot, "ssh_run", side_effect=lambda *a, **k: seen.append(a[2]) or run("", rc=1)):
+            bot.collect_polaris_attestation("h", 1, {"pr_tip": "d" * 40}, "pull/1/head")
+        self.assertIn(f"git checkout -qf {'d' * 40}", seen[0])
+
+
+class MarkerTrustTests(unittest.TestCase):
+    def test_a_marker_pasted_by_the_author_does_not_count(self):
+        marker = f'<!-- sparkinfer-bonsai-eval:{bot.EVAL_SCHEMA_VERSION}:{"e" * 40} {{"label":"XL"}} -->\n' \
+                 "## sparkinfer bonsai auto-eval"
+        comments = {"comments": [{"body": marker, "authorAssociation": "NONE"},
+                                 {"body": marker.replace("e" * 40, "f" * 40), "authorAssociation": "MEMBER"},
+                                 {"body": marker.replace("e" * 40, "0" * 40)}]}
+        with mock.patch.object(arb, "gh", return_value=run(__import__("json").dumps(comments))):
+            done = bot.bonsai_evaluated_commits("o/r", 1)
+        self.assertEqual(done, {"f" * 40, "0" * 40})
+
+
+class StaleCloseTests(unittest.TestCase):
+    def _pr(self, num, body="", labels=(), draft=False):
+        return {"number": num, "body": body, "isDraft": draft, "labels": [{"name": l} for l in labels]}
+
+    def test_only_idle_prs_routed_to_this_model_and_unprotected_close(self):
+        muse_only = TEMPLATE.replace("- [ ] **Muse Glimmer**", "- [x] **Muse Glimmer**")
+        prs = [self._pr(1, BONSAI_ONLY_BODY), self._pr(2, muse_only), self._pr(3, TEMPLATE),
+               self._pr(4, BONSAI_ONLY_BODY, labels=["qwen38-merge-first"]),
+               self._pr(5, BONSAI_ONLY_BODY, labels=["hold"]), self._pr(6, BONSAI_ONLY_BODY, draft=True)]
+        calls = []
+        with mock.patch.object(bot, "_pr_last_activity_ts", return_value=0.0), \
+                mock.patch.object(arb, "gh", side_effect=lambda a: calls.append(a) or run("")):
+            closed = bot.close_stale_bonsai_prs("o/r", prs)
+        self.assertEqual(closed, {1, 3})
+        self.assertTrue(any("Ternary-Bonsai-2-27B eval queue" in " ".join(c) for c in calls))
+
+    def test_the_shared_rule_protects_every_bots_merge_first(self):
+        for lab in ("merge-first", "bonsai-merge-first", "qwen38-merge-first", "museglimmer-merge-first"):
+            self.assertEqual(arb.stale_close_skip_reason(self._pr(1, labels=[lab]), "qwen38"), "merge-first")
+        self.assertIsNotNone(arb.stale_close_skip_reason(self._pr(1, BONSAI_ONLY_BODY), "qwen38"))
+        self.assertIsNone(arb.stale_close_skip_reason(self._pr(1, BONSAI_ONLY_BODY), "bonsai"))
+
+
+class SelectionTests(unittest.TestCase):
+    def _main(self, argv, labels=(), draft=False):
+        prs = [{"number": 5, "title": "t", "labels": [{"name": l} for l in labels], "isDraft": draft,
+                "headRefOid": "a" * 40, "headRefName": "b", "mergeable": "MERGEABLE",
+                "author": {"login": "dev"}, "body": BONSAI_ONLY_BODY, "files": [{"path": "kernels/x.cu"}]}]
+        with mock.patch.object(bot.sys, "argv", ["pr_bonsai_bot.py"] + argv), \
+                mock.patch.object(arb, "gh", return_value=run(__import__("json").dumps(prs))), \
+                mock.patch.object(arb, "load_denylist", return_value=set()), \
+                mock.patch.object(arb, "pr_involved_logins", return_value=set()), \
+                mock.patch.object(bot, "bonsai_evaluated_commits", return_value=set()), \
+                mock.patch.object(bot, "close_stale_bonsai_prs", return_value=set()), \
+                mock.patch.object(bot, "reconcile_bonsai_merge_labels"), \
+                mock.patch("builtins.print") as p:
+            bot.main()
+        return "\n".join(str(c.args[0]) for c in p.call_args_list if c.args)
+
+    def test_hold_and_drafts_are_honoured_by_any_run_that_posts(self):
+        self.assertIn("hold — skip", self._main(["--only-prs", "5", "--dry-run"], labels=["hold"]))
+        self.assertNotIn("would evaluate", self._main(["--only-prs", "5", "--dry-run"], draft=True))
+
+    def test_a_report_only_run_may_still_measure_them_by_name(self):
+        out = self._main(["--only-prs", "5", "--dry-run", "--no-post"], labels=["hold"])
+        self.assertIn("would evaluate: #5", out)
+
+
+class RemoteScriptRetryTests(unittest.TestCase):
+    def test_retries_are_in_the_script(self):
+        s = bot._remote_script("pull/1/head", role="pr", onto="b" * 40)
+        self.assertIn('echo "CB_EXIT c=$cc attempt=$attempt exit=$rc"', s)
+        self.assertIn('if [ "$rc" = 124 ]; then return 1; fi', s)
+        self.assertIn("BONSAICB_FAILED $CC ${CB_WHY:-run}", s)
+        self.assertIn(f"for TRY in $(seq 1 {bot.PF_TRIES})", s)
+        self.assertIn("BONSAIREG_NOTE", s)
+        self.assertIn("head -20", s)
 
 
 if __name__ == "__main__":

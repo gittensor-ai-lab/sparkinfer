@@ -32,11 +32,20 @@ them:
              asks with no concurrency anywhere returned 354, 354 and 362 characters, so a single
              baseline would have failed this check nightly on a model that was working. Two
              baselines that disagree say the checkpoint is non-deterministic at temperature 0 and
-             the comparison cannot discriminate on it -- which is reported, not silently passed.
-             Costs a server start per path, so it is the slow check.
+             the comparison cannot discriminate on it: that trial is INCONCLUSIVE, reported as a
+             NOTE and never counted as a failure.
 
-Exits non-zero on the first failed check. Thresholds are deliberately loose -- they are there to
-catch a broken path, not to police the third decimal place.
+             One trial is not a verdict. On the eval box (2026-09-25) a build equal to main failed
+             this check in 2 runs of 8, so a single failure forced a REJECT on a sound PR about one
+             time in five. Each path now re-runs a failed trial, on a fresh server, and fails only
+             when 2 of up to 3 conclusive trials fail (SERVE_FAILS_TO_FAIL of
+             SERVE_CONCLUSIVE_TRIALS); a first trial that passes is still a pass. Costs a server
+             start per trial, so it is the slow check.
+
+Every check runs, and every failure is listed under `FAILED:` with its check's name first
+(`tensors:`, `score:`, `generate:`, `serve:`) -- the bot gates each check separately against main.
+A check that raises is a failure of that check, not a crash of the whole script. Thresholds are
+deliberately loose -- they are there to catch a broken path, not to police the third decimal place.
 """
 import argparse
 import json
@@ -176,79 +185,139 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def check_serve(a, failures):
+# A trial is conclusive when its two alone-baselines agree. Fail on SERVE_FAILS_TO_FAIL failing
+# trials out of up to SERVE_CONCLUSIVE_TRIALS; stop after SERVE_MAX_TRIALS whatever happened.
+SERVE_CONCLUSIVE_TRIALS = 3
+SERVE_FAILS_TO_FAIL = 2
+SERVE_MAX_TRIALS = 5
+
+
+def _wait_gpu_clear(limit_s=120):
+    """Poll until the previous server's memory is back (the bot's wait_gpu_clear, 1 GiB). Starting
+    the next server into a card still being freed is one way a trial goes wrong for no code reason."""
+    for _ in range(limit_s):
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
+                                  "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            if int(out.split()[0]) < 1024:
+                return
+        except Exception:                                     # noqa: BLE001 - no nvidia-smi: don't wait
+            return
+        time.sleep(1)
+
+
+def _serve_trial(a, label, native):
+    """One fresh server, two alone-baselines, one decayed batch.
+
+    Returns ("pass" | "fail" | "inconclusive", detail). "fail" covers a server that never became
+    healthy and a request that produced nothing, as well as a row served differently."""
+    port = _free_port()
+    env = dict(os.environ)
+    env["SPARKINFER_BONSAI_NATIVE"] = native
+    _wait_gpu_clear()
+    # Its own process group, so a hung server is killed with its children rather than left
+    # holding the GPU for whatever runs next.
+    srv = subprocess.Popen([a.server, "-m", a.model, "--ctx", "16384", "--port", str(port),
+                            "--tokenizer", os.path.join(a.tokenizer, "tokenizer.json")],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           env=env, start_new_session=True)
+    try:
+        up = False
+        for _ in range(200):
+            if srv.poll() is not None:
+                break
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2).read()
+                up = True
+                break
+            except Exception:                                 # noqa: BLE001 - still starting
+                time.sleep(4)
+        if not up:
+            return "fail", "server never became healthy"
+
+        # Two sequential baselines, so non-determinism at temperature 0 is told apart from a
+        # batching fault rather than being reported as one.
+        alone = []
+        _chat(port, SERVE_LONG, 220, alone)
+        _chat(port, SERVE_LONG, 220, alone)
+
+        # Three short rows finish early and leave the long one decoding by itself, which is
+        # when the unbatched kernel takes over a state the packed path has already compacted.
+        decayed = []
+        threads = [threading.Thread(target=_chat, args=(port, SERVE_LONG, 220, decayed))]
+        shorts = [[] for _ in range(3)]
+        for i, box in enumerate(shorts):
+            threads.append(threading.Thread(
+                target=_chat, args=(port, f"Write one sentence about the number {i + 1}.", 12, box)))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        if len(alone) < 2 or not decayed:
+            return "fail", "produced no completion"
+        stable = alone[0] == alone[1]
+        same = decayed[0] in alone
+        print(f"  {label:8s} baselines {len(alone[0])}/{len(alone[1])} chars, after a decayed "
+              f"batch {len(decayed[0])} -- {'matches a baseline' if same else 'MATCHES NEITHER'}"
+              f"{'' if stable else '  (baselines disagree: checkpoint is non-deterministic)'}")
+        if same:
+            return "pass", ""
+        if not stable:
+            return "inconclusive", "baselines differ at temperature 0"
+        print(f"      baseline: {alone[0][:120]!r}")
+        print(f"      decayed : {decayed[0][:120]!r}")
+        return "fail", "row served differently alone and after a batch"
+    finally:
+        try:
+            os.killpg(os.getpgid(srv.pid), signal.SIGKILL)
+        except Exception:                                     # noqa: BLE001 - already gone
+            srv.kill()
+        srv.wait(timeout=60)
+        time.sleep(5)
+
+
+def serve_verdict(trial):
+    """Run trials of one path until they decide. Returns ("pass" | "fail" | "inconclusive", detail).
+
+    A first conclusive trial that passes is a pass, as before. A failure is re-run, and the path
+    fails only on SERVE_FAILS_TO_FAIL failing conclusive trials; a pass after a failure needs a
+    third trial to settle it. Inconclusive trials (non-deterministic baselines) are re-run too but
+    can never convict: if no trial settles the question, the result is inconclusive."""
+    fails, passes, details = 0, 0, []
+    for _ in range(SERVE_MAX_TRIALS):
+        outcome, detail = trial()
+        if outcome == "inconclusive":
+            details.append(detail)
+            continue
+        if outcome == "pass":
+            passes += 1
+            if fails == 0:
+                return "pass", ""
+        else:
+            fails += 1
+            details.append(detail)
+        if fails >= SERVE_FAILS_TO_FAIL:
+            return "fail", f"{details[-1]} ({fails} of {fails + passes} conclusive trials)"
+        if fails + passes >= SERVE_CONCLUSIVE_TRIALS:
+            return "pass", f"passed {passes} of {fails + passes} conclusive trials"
+    if fails + passes == 0:
+        return "inconclusive", f"no conclusive trial in {SERVE_MAX_TRIALS}: {details[-1] if details else ''}"
+    return "inconclusive", (f"{fails} failing and {passes} passing conclusive trials in "
+                            f"{SERVE_MAX_TRIALS} -- not enough to decide")
+
+
+def check_serve(a, failures, notes=None):
     """A row that outlives its batch must decode exactly as it would have alone."""
     for label, native in (("folded", ""), ("native", "all")):
-        port = _free_port()
-        env = dict(os.environ)
-        env["SPARKINFER_BONSAI_NATIVE"] = native
-        # Its own process group, so a hung server is killed with its children rather than left
-        # holding the GPU for whatever runs next.
-        srv = subprocess.Popen([a.server, "-m", a.model, "--ctx", "16384", "--port", str(port),
-                                "--tokenizer", os.path.join(a.tokenizer, "tokenizer.json")],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               env=env, start_new_session=True)
-        try:
-            up = False
-            for _ in range(200):
-                if srv.poll() is not None:
-                    break
-                try:
-                    urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2).read()
-                    up = True
-                    break
-                except Exception:                             # noqa: BLE001 - still starting
-                    time.sleep(4)
-            if not up:
-                failures.append(f"serve: {label} server never became healthy")
-                continue
-
-            # Two sequential baselines, so non-determinism at temperature 0 is told apart from a
-            # batching fault rather than being reported as one.
-            alone = []
-            _chat(port, SERVE_LONG, 220, alone)
-            _chat(port, SERVE_LONG, 220, alone)
-
-            # Three short rows finish early and leave the long one decoding by itself, which is
-            # when the unbatched kernel takes over a state the packed path has already compacted.
-            decayed, threads = [], []
-            threads.append(threading.Thread(target=_chat, args=(port, SERVE_LONG, 220, decayed)))
-            shorts = [[] for _ in range(3)]
-            for i, box in enumerate(shorts):
-                threads.append(threading.Thread(
-                    target=_chat, args=(port, f"Write one sentence about the number {i + 1}.", 12, box)))
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-
-            if len(alone) < 2 or not decayed:
-                failures.append(f"serve: {label} produced no completion")
-                continue
-            stable = alone[0] == alone[1]
-            same = decayed[0] in alone
-            print(f"  {label:8s} baselines {len(alone[0])}/{len(alone[1])} chars, after a decayed "
-                  f"batch {len(decayed[0])} -- {'matches a baseline' if same else 'MATCHES NEITHER'}"
-                  f"{'' if stable else '  (baselines disagree: checkpoint is non-deterministic)'}")
-            if not same:
-                if not stable:
-                    # Two baselines that already disagree cannot convict the batched path: report
-                    # it as unusable here rather than as a regression in the runtime.
-                    failures.append(
-                        f"serve: {label} is non-deterministic at temperature 0 (baselines differ), "
-                        f"so this check cannot discriminate -- investigate by hand")
-                else:
-                    print(f"      baseline: {alone[0][:120]!r}")
-                    print(f"      decayed : {decayed[0][:120]!r}")
-                    failures.append(
-                        f"serve: {label} row served differently alone and after a batch")
-        finally:
-            try:
-                os.killpg(os.getpgid(srv.pid), signal.SIGKILL)
-            except Exception:                                 # noqa: BLE001 - already gone
-                srv.kill()
-            srv.wait(timeout=60)
-            time.sleep(5)
+        outcome, detail = serve_verdict(lambda: _serve_trial(a, label, native))
+        if outcome == "fail":
+            failures.append(f"serve: {label} {detail}")
+        elif outcome == "inconclusive" and notes is not None:
+            notes.append(f"serve: {label} inconclusive -- {detail}")
+        elif detail and notes is not None:
+            notes.append(f"serve: {label} {detail}")
 
 
 def main():
@@ -281,21 +350,31 @@ def main():
         a.server = os.path.join(os.path.dirname(a.build.rstrip("/")), "server", "sparkinfer_server")
 
     skip = {s.strip() for s in a.skip.split(",") if s.strip()}
-    failures = []
+    failures, notes = [], []
+    checks = (
+        ("tensors", "decoded weights against the un-quantised checkpoint",
+         lambda: check_tensors(a, failures)),
+        ("score", "perplexity, folded against native",
+         lambda: check_score(a, tokenize(a.tokenizer, PASSAGE), failures)),
+        ("generate", "greedy tokens, folded against native",
+         lambda: check_generate(a, tokenize(a.tokenizer, PROMPT), failures)),
+        ("serve", "a row that outlives its batch, against the same row asked alone",
+         lambda: check_serve(a, failures, notes)),
+    )
+    for name, what, run_check in checks:
+        if name in skip:
+            continue
+        print(f"{name}: {what}")
+        try:
+            run_check()
+        except Exception as e:                                # noqa: BLE001 - reported per check
+            # A missing module on the box (2026-09-25: safetensors) or a hung binary: a failure of
+            # THIS check, named as such, so the bot can tell it apart from the others -- main fails
+            # it too when the cause is the box, and a check main also fails is not gated.
+            failures.append(f"{name}: raised {type(e).__name__}: {str(e)[:160]}")
 
-    if "tensors" not in skip:
-        print("tensors: decoded weights against the un-quantised checkpoint")
-        check_tensors(a, failures)
-    if "score" not in skip:
-        print("score: perplexity, folded against native")
-        check_score(a, tokenize(a.tokenizer, PASSAGE), failures)
-    if "generate" not in skip:
-        print("generate: greedy tokens, folded against native")
-        check_generate(a, tokenize(a.tokenizer, PROMPT), failures)
-    if "serve" not in skip:
-        print("serve: a row that outlives its batch, against the same row asked alone")
-        check_serve(a, failures)
-
+    for n in notes:
+        print(f"NOTE: {n}")
     if failures:
         print("\nFAILED:")
         for f in failures:

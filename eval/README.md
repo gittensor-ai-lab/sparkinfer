@@ -309,15 +309,23 @@ Scores **same-box PR vs `origin/main`** on `prism-ml/Ternary-Bonsai-2-27B-gguf`
 (`Ternary-Bonsai-2-27B-PTQ1_0.gguf`, 5,946,648,928 bytes), default folded loader —
 `SPARKINFER_BONSAI_NATIVE` unset, as the server runs it. It applies
 `eval-bonsai:{XL,L,M,S,XS,none,REJECT}` and derives the generic `eval:*` tier. It picks
-`bonsai-merge-first`, but **neither auto-merges nor auto-closes** unless
-`SPARKINFER_BONSAI_AUTOMERGE=1` / `SPARKINFER_BONSAI_AUTOCLOSE=1` (REJECT only) are set. It
-evaluates every PR not declared for a different model, most of which are not aimed at this one, so
-`none` never closes anything here.
+`bonsai-merge-first` — only among PRs auto-merge would actually accept, so a refused PR cannot hold
+it — and auto-merges it when `SPARKINFER_BONSAI_AUTOMERGE=1`, at the exact commit it scored.
+
+**Closing** (2026-09-26, as the sibling bots do; `SPARKINFER_BONSAI_AUTOCLOSE=0` turns it off): a
+measured REJECT closes the PR; a measured `none` closes it only when the PR declares
+Ternary-Bonsai-2-27B and nothing else, because this bot also evaluates every undeclared PR, most of
+which are aimed at another model; a PR routed to this model with no commits for a day
+(`BONSAI_STALE_DAYS`) closes as stale. A run that failed never closes. Each bot's stale close now
+touches only PRs routed to its own model and never one carrying any bot's merge-first label
+(`arb.stale_close_skip_reason`) — before, the Qwen3.8 bot closed #1157, a Bonsai PR.
 
 1. **Speed.** Decode and prefill at ctx 128/512/4k/16k/32k (one `bench_sweep_run`, reps 5), plus
    concurrent decode at c2–c32 (median of three complete runs per width, as in `pr_qwen38_bot.py`).
-   The tier is the best measured delta; any axis below 98% of `main` is a REJECT. A concurrency
-   width that fails to run is dropped, never scored as zero.
+   The tier is the best measured delta; any axis below 98% of `main` is a REJECT. `main` must
+   measure every width or the round is skipped. A width only the PR build fails to complete (five
+   attempts, a crash counting as one) is a REJECT when it happens in two rounds on the same commit;
+   the first time nothing is posted. A width lost to a GPU that never drained is infra.
 
 2. **Accuracy — three gates.** llama.cpp cannot read PTQ1_0, so there is no external reference.
    - *Differential score:* `qwen3_gguf_score` on the PR build and on `main` over
@@ -327,10 +335,14 @@ evaluates every PR not declared for a different model, most of which are not aim
      Qwen3.8 bot's 0.99/0.01.
    - *Prefill path:* `qwen3_gguf_score` never enters batched prefill. `qwen3_gguf_prefill_check`
      compares batched prefill with the token loop at prefix 128 (inside the fused quantized-B
-     GEMM's M ≤ 512 window) and 1024 (outside it), 64 teacher-forced positions, three runs a side.
+     GEMM's M ≤ 512 window) and 1024 (outside it), 64 teacher-forced positions, three runs a side
+     (a crashed run is retried up to three times; a timeout is not).
      The PR's mean must stay within `max(3× main's KL, main + 0.05)` and 0.10 of main's top-1.
    - *`eval/bonsai_regression.py`* (tensors, score, generate, serve) on the PR build. It is
-     absolute, so it rejects only when `main` passes it in the same round.
+     absolute, so each check rejects only when `main` passes that same check in the round; a check
+     main also fails is reported, and the others still gate. The serve check fails only on 2 of up
+     to 3 trials — a build equal to `main` failed a single trial in 2 of 8 runs on the eval box —
+     and a trial whose two alone-baselines disagree is inconclusive, never a failure.
 
 3. **No-regression guards @ 32k, decode + prefill:** Qwen3.6-35B-A3B, the ModelOpt and unsloth
    Qwen3.8-27B checkpoints, and Muse Glimmer. The Muse and Qwen3.8 bots skip PRs declared for
@@ -339,8 +351,14 @@ evaluates every PR not declared for a different model, most of which are not aim
    that measures nothing is retried next round; an absent checkpoint is skipped and reported.
 
 **Failures.** A fault on the box — GPU not drained, a failed fetch, a missing model, an SSH drop,
-an OOM kill — is retried next round with nothing posted. A PR that fails to build or crashes gets
-`eval-bonsai:REJECT` once for that commit.
+an OOM kill, a compiler killed for memory or a full disk (rebuilt once at `-j4` first) — is retried
+next round with nothing posted. A PR that fails to build or crashes gets `eval-bonsai:REJECT` once
+for that commit; the verdict shows the compiler's own error lines, not the end of the log.
+
+**Commit recorded.** A verdict names the PR tip the box fetched and built, not the head seen when
+the round listed PRs: #1167 was force-pushed mid-round on 2026-09-25, and its verdict named a
+commit that was never measured. Only comments from members and collaborators count as an existing
+verdict, so a marker pasted by anyone else cannot suppress an evaluation.
 
 **Not evaluated:** PRs declared for other models only; PRs that change the harness (the files
 `pr_qwen38_bot.py` pins, plus `qwen3_gguf_score.cpp`, `qwen3_gguf_generate.cpp`,
@@ -354,6 +372,7 @@ was measured without #1143's prefill@16k gain. A PR that no longer merges cleanl
 ```bash
 python eval/pr_bonsai_bot.py --dry-run                            # what would be evaluated, no GPU
 python eval/pr_bonsai_bot.py --only-prs 1139 --reeval --no-post   # measure one PR, post nothing
+                                                                   # (even if held or draft)
 python eval/pr_bonsai_bot.py --labels-only                        # no GPU, reconcile labels only
 ```
 

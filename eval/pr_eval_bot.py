@@ -1177,8 +1177,9 @@ def merged_checkout_script(pr_ref, onto):
     main that had it. Merging here pins both sides of the comparison to one commit.
 
     A tip that does not merge cleanly prints MERGE_CONFLICT and exits 1 -- GitHub's mergeable flag
-    can be stale the same way, and such a PR needs a rebase, not a verdict. Prints PR_TIP,
-    MERGED_ONTO and REMOTE_HEAD. The merge commit is local to the box and never pushed."""
+    can be stale the same way, and such a PR needs a rebase, not a verdict. Prints PR_TIP (the
+    full SHA actually fetched and built -- see measured_commit), MERGED_ONTO and REMOTE_HEAD. The
+    merge commit is local to the box and never pushed."""
     import shlex
     ref_q, onto_q = shlex.quote(pr_ref), shlex.quote(onto)
     return f"""git fetch -q origin {ref_q} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {pr_ref} failed" >&2; exit 1; }}
@@ -1192,11 +1193,122 @@ if ! git -c user.name=sparkinfer-eval -c user.email=eval@sparkinfer.invalid merg
   echo "MERGE_CONFLICT $(git rev-parse --short "$PR_TIP") does not merge cleanly onto $(git rev-parse --short {onto_q})" >&2
   exit 1
 fi
-echo "PR_TIP $(git rev-parse --short "$PR_TIP")"
+echo "PR_TIP $(git rev-parse "$PR_TIP")"
 echo "MERGED_ONTO $(git rev-parse --short {onto_q})"
 echo "REMOTE_HEAD $(git rev-parse --short HEAD)"
 echo "REMOTE_SHA $(git rev-parse HEAD)"
 """
+
+
+# ---- helpers shared by the model bots (pr_bonsai_bot / pr_qwen38_bot / pr_museglimmer_bot) ----
+
+# `gh pr list` returns the NEWEST PRs first, so "oldest first" only ever ordered whatever fit under
+# the limit: past it, the oldest open PRs were never seen at all. Well above the open-PR count.
+PR_LIST_LIMIT = 300
+
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def measured_commit(listed_head, res):
+    """The commit a verdict must be recorded against: the PR tip the box actually fetched and built.
+
+    A round lists PRs first and measures them later -- 40 minutes per PR on the Bonsai bot -- so a
+    push can land in between. #1167 (2026-09-25) was listed at 901cef6, force-pushed at 19:13, and
+    built at 84a574d; the verdict comment, the scores file and the log all named 901cef6, a commit
+    that was never measured. The next round then re-measured the real head, and auto-merge refused
+    the winner because its head no longer matched the recorded one. Returns (commit, moved): the
+    built tip when the box reported a full SHA (PR_TIP / REMOTE_SHA), else the listed head."""
+    tip = ((res or {}).get("pr_tip") or "").strip()
+    if not _FULL_SHA_RE.match(tip):
+        return listed_head, False
+    return tip, bool(listed_head) and tip != listed_head
+
+
+# Only a comment by someone with write access can carry a bot's verdict marker. Anyone can comment
+# on a PR, so a pasted `<!-- sparkinfer-<bot>-eval:...:<sha> {"label":"XL"} -->` from the author
+# would otherwise mark their own head as already evaluated and suppress the real evaluation.
+_TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+
+
+def trusted_marker_comment(comment):
+    """Is this PR comment one whose verdict marker counts? A comment without the field (an older
+    gh, a synthetic test comment) is trusted, so a tooling change cannot trigger mass re-evaluation."""
+    assoc = (comment or {}).get("authorAssociation")
+    return assoc is None or assoc in _TRUSTED_ASSOCIATIONS
+
+
+def is_any_merge_first(label):
+    """Any bot's merge-first label (`merge-first`, `bonsai-merge-first`, `qwen38-merge-first`, ...)."""
+    return label == MERGE_FIRST_LABEL or label.endswith("-merge-first")
+
+
+def stale_close_skip_reason(pr, my_model):
+    """Why a bot's age-based stale close must leave this PR alone, or None to consider it.
+
+    Each bot closes only PRs routed to ITS model (arb.model_skip_reason) and never one that any
+    bot's merge-first label protects. Before 2026-09-26 the Qwen3.8 and Muse bots closed EVERY idle
+    PR in the repo, and only spared their own merge-first: #1157, a Ternary-Bonsai PR neither of
+    them evaluates, was closed by the Qwen3.8 bot with a comment about keeping the Qwen3.8 queue
+    clean."""
+    labs = {l["name"] for l in pr.get("labels", [])}
+    if pr.get("isDraft"):
+        return "draft"
+    if HOLD_LABEL in labs:
+        return "hold"
+    if any(is_any_merge_first(l) for l in labs):
+        return "merge-first"
+    if model_skip_reason(pr.get("body") or "", my_model):
+        return f"not a {my_model} PR"
+    return None
+
+
+# Bash for a model bot's remote script (inserted verbatim, so single braces). `-v` ptxas resource
+# reports ("ptxas info : Used 38 registers ...") fill a failed build's log, and the old `tail -80`
+# showed only those: #1163's sm_89 errors ("error : Feature 'mbarrier.try_wait.parity' requires
+# .target sm_90") never reached its verdict comment. build_box_fault names the failures that are the
+# box's -- the compiler OOM-killed, a full disk, the overlayfs EFAULT -- rather than the code's.
+BUILD_FAILURE_SH = r"""
+report_build_failure() {
+  echo "BUILD_FAILED — errors in the build log:" >&2
+  grep -E '(^|[^A-Za-z_])(error|fatal error)( |:)|undefined reference|\*\*\* ' "$1" 2>/dev/null \
+    | grep -vE '^ptxas info' | head -30 >&2 || true
+  echo "--- end of the build log (ptxas resource reports removed):" >&2
+  grep -vE '^ptxas info|^ +[0-9]+ bytes stack frame' "$1" 2>/dev/null | tail -30 >&2 || true
+}
+build_box_fault() {
+  grep -m1 -E 'Killed signal terminated program|died due to signal 9|signal 9 \(Kill signal\)|internal compiler error: Killed|virtual memory exhausted|Cannot allocate memory|No space left on device|Bad address \(os error 14\)' "$1" 2>/dev/null
+}
+"""
+
+_BUILD_ERROR_RE = re.compile(r"(?:^|[^A-Za-z_])(?:error|fatal error)(?: |:)|undefined reference")
+_MAKE_ERROR_RE = re.compile(r"\bError \d+\b")
+
+
+def first_build_error(lines):
+    """The most actionable line of a failed build: the compiler's or linker's own error, else make's
+    `*** [...] Error N`. `ptxas info` resource reports are skipped -- they are not errors."""
+    make_line = None
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("ptxas info"):
+            continue
+        if _BUILD_ERROR_RE.search(s):
+            return s
+        if make_line is None and _MAKE_ERROR_RE.search(s):
+            make_line = s
+    return make_line
+
+
+def failure_excerpt(stdout, stderr, markers, limit=3000):
+    """The part of a failed run worth showing: from the first explicit failure marker onward (its
+    error lines come first), else the last 2000 characters as before. The old `[-2000:]` of the
+    whole output kept only the END of a build log, which is where the errors are not."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    lines = combined.splitlines()
+    for i, line in enumerate(lines):
+        if any(line.startswith(m) for m in markers):
+            return "\n".join(lines[i:])[:limit]
+    return combined[-2000:]
 
 
 def sync_generic_eval_label(repo, num):

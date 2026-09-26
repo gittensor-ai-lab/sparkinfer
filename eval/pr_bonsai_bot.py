@@ -29,8 +29,9 @@ server uses, `SPARKINFER_BONSAI_NATIVE` unset:
           PR's mean falling clearly outside main's, never on a single reading.
        c. eval/bonsai_regression.py -- tensors, score, generate, serve: absolute broken-path checks
           (trit order, the v-head regrouping, native against folded, a row outliving its batch).
-          Gated only when main passes it in the same round, so a failure already on main is
-          reported but cannot reject every PR.
+          Gated per check: a check main also fails in the same round is reported but cannot
+          reject every PR, and the other checks still gate. The serve check decides on 2 of up
+          to 3 trials, because one trial fails about one time in five on a sound build.
   3. Cross-model no-regression guards @ 32k, decode + prefill: Qwen3.6-35B-A3B, the ModelOpt and
      unsloth Qwen3.8-27B NVFP4 checkpoints, and Muse Glimmer. The Muse and Qwen3.8 bots skip a PR
      declared for Ternary-Bonsai-2-27B alone (arb.model_skip_reason), so these guards are the only
@@ -40,12 +41,17 @@ server uses, `SPARKINFER_BONSAI_NATIVE` unset:
 Policy, by explicit decision 2026-09-24: tiers mirror to the generic `eval:*` label (as the sibling
 bots do); cron hourly at :15, between Muse's :00 and Qwen3.8's :30. Auto-merge is
 SPARKINFER_BONSAI_AUTOMERGE=1 in .env.eval, turned on the same day once #1139 had validated the bot,
-matching the sibling bots' live policy -- with one extra guard they lack: it merges only the exact
-head commit this bot scored (auto_merge_ok_bonsai). Auto-close is OFF
-(SPARKINFER_BONSAI_AUTOCLOSE=1 enables it, for REJECT only). This bot
-evaluates every PR that does not declare a different model, most of which are not aimed at this
-model and legitimately score `none` here, so `none` never closes anything -- #768 and #1082 were
-both closed by a sibling bot for exactly that.
+matching the sibling bots' live policy -- with one extra guard they lacked: it merges only the exact
+head commit this bot scored (auto_merge_ok_bonsai).
+
+Closing, by explicit decision 2026-09-26, so this bot works like its siblings:
+  * a measured REJECT closes the PR (SPARKINFER_BONSAI_AUTOCLOSE=0 turns closing off);
+  * a measured `none` closes it only when the PR declares Ternary-Bonsai-2-27B and nothing else.
+    This bot also evaluates every undeclared PR, and most of those are aimed at another model and
+    legitimately score `none` here -- #768 and #1082 were closed by a sibling bot for exactly that;
+  * a PR routed to this model with no commits for BONSAI_STALE_DAYS closes as stale, as the
+    siblings' own stale close does for theirs (arb.stale_close_skip_reason);
+  * a run that FAILED (build error, crash) never closes: its verdict comment says why.
 
   python eval/pr_bonsai_bot.py --only-prs 1139 --reeval --no-post
 
@@ -172,6 +178,7 @@ SCORE_DUMP_PR = "/tmp/bonsai_score_pr.txt"
 PF_PREFIXES = [128, 1024]
 PF_CONT = 64
 PF_RUNS = int(os.environ.get("BONSAI_PF_RUNS", "3"))
+PF_TRIES = 3   # attempts per run before that run counts as failed (a crash, not a hang)
 PF_TEXT = "bench/scripts/bench_prompt_4k.txt"
 # The PR's mean over PF_RUNS against main's mean over PF_RUNS. A broken batched prefill reads KL
 # in whole nats and top-1 near zero; these margins sit well inside that and well outside the
@@ -201,7 +208,9 @@ GUARDS = (
 )
 
 AUTO_MERGE = os.environ.get("SPARKINFER_BONSAI_AUTOMERGE") == "1"
-AUTO_CLOSE = os.environ.get("SPARKINFER_BONSAI_AUTOCLOSE") == "1"
+# On unless switched off (module docstring, "Closing"): the siblings close unconditionally.
+AUTO_CLOSE = os.environ.get("SPARKINFER_BONSAI_AUTOCLOSE", "1") != "0"
+STALE_DAYS = float(os.environ.get("BONSAI_STALE_DAYS", "1"))
 AUTOMERGE_BLOCK = {
     "copycat", "copycat-warn", "flagged:gaming", "penalty", "needs-benchmark",
     BONSAI_NEEDS_REBASE, arb.REEVALUATE_LABEL, arb.HOLD_LABEL, *arb.REGRESSION_LABELS,
@@ -210,6 +219,13 @@ AUTOMERGE_BLOCK = {
 SCORES_FILE = os.path.expanduser(
     os.environ.get("BONSAI_SCORES_FILE", "~/.sparkinfer_bonsai_scores.json")
 )
+# A concurrency width that completes on main but not on the PR, after every in-run attempt, is
+# probably the PR's doing -- but one round is not enough to say so. The first time, nothing is
+# posted and the next round measures again; the same failure on the same commit then REJECTs.
+STRIKES_FILE = os.path.expanduser(
+    os.environ.get("BONSAI_STRIKES_FILE", "~/.sparkinfer_bonsai_strikes.json")
+)
+STRIKES_TO_REJECT = 2
 
 POLARIS_ENABLED = os.environ.get("POLARIS", "1") != "0"
 POLARIS_API_KEY = os.environ.get("POLARIS_API_KEY", "")
@@ -241,6 +257,40 @@ def _save_scores(data):
             json.dump(data, f, indent=2)
     except Exception as e:
         print(f">> bonsai scores save skipped: {e}")
+
+
+def _load_strikes():
+    try:
+        with open(STRIKES_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_strikes(data):
+    try:
+        with open(STRIKES_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f">> bonsai strikes save skipped: {e}")
+
+
+def record_strike(num, commit, key):
+    """Count one more round in which `key` failed for this PR at this exact commit; returns the
+    count. A different commit or a different failure starts again at 1."""
+    data = _load_strikes()
+    prev = data.get(str(num)) or {}
+    count = (prev.get("count", 0) + 1) if (prev.get("commit") == commit and prev.get("key") == key) else 1
+    data[str(num)] = {"commit": commit, "key": key, "count": count,
+                      "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    _save_strikes(data)
+    return count
+
+
+def clear_strikes(num):
+    data = _load_strikes()
+    if data.pop(str(num), None) is not None:
+        _save_strikes(data)
 
 
 def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
@@ -343,7 +393,7 @@ def bonsai_evaluated_commits(repo, num):
     for c in json.loads(r.stdout or "{}").get("comments", []):
         body = c.get("body") or ""
         m = MARKER_RE.search(body)
-        if not m or "sparkinfer bonsai auto-eval" not in body:
+        if not m or "sparkinfer bonsai auto-eval" not in body or not arb.trusted_marker_comment(c):
             continue
         try:
             meta = json.loads(m.group(2)) if m.group(2) else {}
@@ -359,6 +409,54 @@ def strip_bonsai_eval_labels(repo, num):
     for lab in list(arb.labels_on(repo, num)):
         if lab.startswith(EVAL_PREFIX):
             arb.remove_label(repo, num, lab)
+
+
+def _pr_last_activity_ts(repo, num):
+    """Last real author activity (most recent commit's committedDate), not PR updatedAt: bot
+    comments and labels bump updatedAt. The sibling bots' helper."""
+    r = arb.gh(["pr", "view", str(num), "-R", repo, "--json", "commits,createdAt"])
+    try:
+        info = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    dates = [c.get("committedDate") for c in (info.get("commits") or []) if c.get("committedDate")]
+    ts_str = max(dates) if dates else info.get("createdAt")
+    if not ts_str:
+        return None
+    try:
+        return time.mktime(time.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+
+
+def close_stale_bonsai_prs(repo, prs, dry_run=False):
+    """Close PRs routed to this model with no author commit in STALE_DAYS+ days -- the siblings'
+    stale close, limited like theirs now are to the bot's own PRs (arb.stale_close_skip_reason)."""
+    closed = set()
+    now = time.time()
+    for pr in prs:
+        num = pr["number"]
+        if arb.stale_close_skip_reason(pr, "bonsai"):
+            continue
+        ts = _pr_last_activity_ts(repo, num)
+        if ts is None:
+            continue
+        age_days = (now - ts) / 86400
+        if age_days < STALE_DAYS:
+            continue
+        print(f"PR #{num}: stale ({age_days:.1f}d since last commit, threshold {STALE_DAYS:g}d) — closing")
+        closed.add(num)
+        if dry_run:
+            continue
+        arb.gh(["pr", "comment", str(num), "-R", repo, "--body",
+                "<!-- sparkinfer-bonsai-auto-close-stale -->\n"
+                f"## Closed: stale — no commits in {age_days:.1f} days\n\n"
+                f"This PR has had no new commits in over {STALE_DAYS:g} days, so it is closed to "
+                "keep the Ternary-Bonsai-2-27B eval queue to work that is moving. Nothing is wrong "
+                "with it for that reason alone: push your latest work and reopen it whenever you "
+                "are ready, and it is evaluated again on the next round."])
+        arb.gh(["pr", "close", str(num), "-R", repo])
+    return closed
 
 
 def resolve_ssh(instance_id: int):
@@ -416,9 +514,9 @@ def _crash_reason(*outputs: str) -> str | None:
         marker = next((m for m in _EXPLICIT_FAIL_MARKERS if line.startswith(m)), None)
         if not marker:
             continue
-        for follow in lines[i + 1:i + 60]:
-            if "error:" in follow or "Error " in follow:
-                return f"{marker}: {follow.strip()}"
+        err = arb.first_build_error(lines[i + 1:i + 80])
+        if err:
+            return f"{marker}: {err}"
         tail = " | ".join(l.strip() for l in lines[i + 1:i + 3] if l.strip())
         return marker + (f": {tail}" if tail else "")
     return None
@@ -588,13 +686,31 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SERVER=ON >"$TMPDIR/cmake
   tail -40 "$TMPDIR/cmake.log" >&2
   exit 1
 }}
-cmake --build build --target qwen3_gguf_bench qwen3_gguf_cb_bench qwen3_gguf_score \\
-  qwen3_gguf_generate qwen3_gguf_prefill_check bonsai_inspect sparkinfer_server \\
-  -j"$(nproc)" >"$TMPDIR/build.log" 2>&1 || {{
-  echo "BUILD_FAILED — tail of the build log:" >&2
-  tail -80 "$TMPDIR/build.log" >&2
-  exit 1
+{arb.BUILD_FAILURE_SH}
+build_targets() {{
+  cmake --build build --target qwen3_gguf_bench qwen3_gguf_cb_bench qwen3_gguf_score \\
+    qwen3_gguf_generate qwen3_gguf_prefill_check bonsai_inspect sparkinfer_server \\
+    -j"$1" >"$TMPDIR/build.log" 2>&1
 }}
+# A compiler killed for memory, a full disk or the overlayfs EFAULT is the box, not the PR: rebuild
+# once with less parallelism, and if that dies the same way, retry the round rather than blame the
+# PR. Anything else is the PR's own build error, reported with its error lines first.
+if ! build_targets "$(nproc)"; then
+  if FAULT=$(build_box_fault "$TMPDIR/build.log"); then
+    echo "build hit a box-side fault ($FAULT) -- rebuilding with -j4" >&2
+    if ! build_targets 4; then
+      if FAULT=$(build_box_fault "$TMPDIR/build.log"); then
+        echo "RETRYABLE_INFRA_FAILURE build: $FAULT" >&2
+        exit 1
+      fi
+      report_build_failure "$TMPDIR/build.log"
+      exit 1
+    fi
+  else
+    report_build_failure "$TMPDIR/build.log"
+    exit 1
+  fi
+fi
 for b in qwen3_gguf_bench qwen3_gguf_cb_bench qwen3_gguf_score qwen3_gguf_generate qwen3_gguf_prefill_check bonsai_inspect; do
   test -x "build/runtime/$b" || {{ echo "BUILD_FAILED — build/runtime/$b missing" >&2; exit 1; }}
 done
@@ -648,19 +764,29 @@ cb_complete() {{
   return 1
 }}
 cb_median() {{
-  local ckpt=$1 cc=$2 out="$TMPDIR/cb.txt" attempt=0 valid=0 a
-  CB_AGGS=""; CB_AGG=0
+  local ckpt=$1 cc=$2 out="$TMPDIR/cb.txt" attempt=0 valid=0 a rc
+  CB_AGGS=""; CB_AGG=0; CB_WHY=run
   while [ "$valid" -lt {CB_REPS} ]; do
     attempt=$((attempt + 1))
     if [ "$attempt" -gt {CB_MAX_ATTEMPTS} ]; then
-      echo "concurrent decode at c=$cc stopped requests part-way on $((attempt - 1 - valid)) of {CB_MAX_ATTEMPTS} runs" >&2
+      echo "concurrent decode at c=$cc did not complete on $((attempt - 1 - valid)) of {CB_MAX_ATTEMPTS} runs" >&2
       return 1
     fi
-    wait_gpu_clear || return 1
-    if ! timeout 900 build/runtime/qwen3_gguf_cb_bench "$ckpt" "$cc" {CB_TOKENS} {CB_TOKENS} 512 > "$out" 2>&1; then
-      echo "concurrent-decode harness exited nonzero at c=$cc" >&2
+    # The card not draining is the box's fault, never the width's: say so (BONSAICB_FAILED c gpu).
+    wait_gpu_clear || {{ CB_WHY=gpu; return 1; }}
+    # A nonzero exit is one failed attempt, like a partial run -- it used to give up on the width
+    # at once, so one crash dropped the axis for the whole round. A timeout still gives up: a hang
+    # repeats, and five of them would cost over an hour.
+    if timeout 900 build/runtime/qwen3_gguf_cb_bench "$ckpt" "$cc" {CB_TOKENS} {CB_TOKENS} 512 > "$out" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [ "$rc" != 0 ]; then
+      echo "CB_EXIT c=$cc attempt=$attempt exit=$rc" >&2
       tail -10 "$out" >&2 || true
-      return 1
+      if [ "$rc" = 124 ]; then return 1; fi
+      continue
     fi
     local tok err
     tok=$(sed -n 's/.*decode_tokens=\\([0-9]*\\).*/\\1/p' "$out" | tail -1)
@@ -676,13 +802,14 @@ cb_median() {{
   CB_AGG=$(python3 -c "import statistics, sys; print(statistics.median(float(x) for x in sys.argv[1:]))" $CB_AGGS)
   python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "${{CB_AGG:-0}}"
 }}
-# A width that fails is DROPPED from scoring (BONSAICB_FAILED), never read as a regression to zero:
-# a harness that did not run is not a slowdown.
+# A width that fails is reported (BONSAICB_FAILED <c> run|gpu), never read as a regression to zero.
+# main must measure every width (measure_main_baseline); a width only the PR fails is judged in
+# eval_bonsai_on_box, over two rounds (STRIKES_TO_REJECT).
 for CC in {cb_concs}; do
   if cb_median "$GGUF" "$CC"; then
     echo "BONSAICB $CC $CB_AGG$CB_AGGS"
   else
-    echo "BONSAICB_FAILED $CC"
+    echo "BONSAICB_FAILED $CC ${{CB_WHY:-run}}"
   fi
 done
 echo "STAGE concurrency $(date +%s)"
@@ -719,17 +846,30 @@ for P in {pf_prefixes}; do
   # cut, not head: head closes the pipe early and pipefail turns the SIGPIPE into an exit.
   IDS_P=$(printf '%s' "$PF_IDS" | cut -d' ' -f1-"$NEED")
   for R in $(seq 1 {PF_RUNS}); do
-    wait_gpu_clear
-    if timeout 900 build/runtime/qwen3_gguf_prefill_check "$GGUF" "$P" {PF_CONT} $IDS_P > "$PF_OUT" 2>&1; then
-      T=$(sed -n 's/^TOP1 *[0-9]*\\/[0-9]* *\\([0-9.]*\\).*/\\1/p' "$PF_OUT" | tail -1)
-      K=$(sed -n 's/^KL *\\([0-9.eE+-]*\\).*/\\1/p' "$PF_OUT" | tail -1)
-      if [ -n "$T" ] && [ -n "$K" ]; then
-        echo "PFCHECK $P $R $T $K"
-        continue
+    # Up to {PF_TRIES} attempts per run: one crashed process out of {PF_RUNS} used to REJECT the PR on
+    # the spot. A timeout is not retried -- a hang repeats.
+    GOT=0
+    for TRY in $(seq 1 {PF_TRIES}); do
+      wait_gpu_clear
+      if timeout 900 build/runtime/qwen3_gguf_prefill_check "$GGUF" "$P" {PF_CONT} $IDS_P > "$PF_OUT" 2>&1; then
+        rc=0
+      else
+        rc=$?
       fi
-    fi
-    echo "PFCHECK_FAILED $P $R"
-    tail -8 "$PF_OUT" >&2 || true
+      if [ "$rc" = 0 ]; then
+        T=$(sed -n 's/^TOP1 *[0-9]*\\/[0-9]* *\\([0-9.]*\\).*/\\1/p' "$PF_OUT" | tail -1)
+        K=$(sed -n 's/^KL *\\([0-9.eE+-]*\\).*/\\1/p' "$PF_OUT" | tail -1)
+        if [ -n "$T" ] && [ -n "$K" ]; then
+          echo "PFCHECK $P $R $T $K"
+          GOT=1
+          break
+        fi
+      fi
+      echo "PFCHECK_RETRY $P $R attempt=$TRY exit=$rc" >&2
+      tail -8 "$PF_OUT" >&2 || true
+      if [ "$rc" = 124 ]; then break; fi
+    done
+    if [ "$GOT" != 1 ]; then echo "PFCHECK_FAILED $P $R"; fi
   done
 done
 
@@ -744,12 +884,14 @@ if timeout 1800 python3 eval/bonsai_regression.py --model "$GGUF" --reference "$
 else
   echo "BONSAIREG_FAILED"
   if grep -q '^FAILED:' "$REG_OUT"; then
-    sed -n '/^FAILED:/,$p' "$REG_OUT" | grep -E '^ +- ' | sed 's/^ *- /BONSAIREG_WHY /' | head -8 || true
+    sed -n '/^FAILED:/,$p' "$REG_OUT" | grep -E '^ +- ' | sed 's/^ *- /BONSAIREG_WHY /' | head -20 || true
   else
     echo "BONSAIREG_WHY $(grep -v '^\\s*$' "$REG_OUT" | tail -1)"
   fi
   tail -30 "$REG_OUT" >&2
 fi
+# Inconclusive serve trials and similar: shown in the verdict, never gated.
+grep '^NOTE: ' "$REG_OUT" | sed 's/^NOTE: /BONSAIREG_NOTE /' | head -8 || true
 reap_our_servers
 echo "STAGE bonsai_regression $(date +%s)"
 
@@ -783,8 +925,8 @@ echo "GUARD_END"
 
 
 def _parse_remote(stdout: str) -> dict:
-    out = {"bonsai": {}, "bonsai_cb": {}, "cb_runs": {}, "cb_failed": [], "pfcheck": {},
-           "pfcheck_failed": {}, "bonsaireg_why": []}
+    out = {"bonsai": {}, "bonsai_cb": {}, "cb_runs": {}, "cb_failed": [], "cb_failed_gpu": [],
+           "pfcheck": {}, "pfcheck_failed": {}, "bonsaireg_why": [], "bonsaireg_notes": []}
     for key, _tag, _name in GUARDS:
         out[key] = {}
     tags = {tag: key for key, tag, _name in GUARDS}
@@ -813,6 +955,8 @@ def _parse_remote(stdout: str) -> dict:
                 out["cb_runs"][int(parts[1])] = [float(x) for x in parts[3:]]
             elif head == "BONSAICB_FAILED" and len(parts) >= 2:
                 out["cb_failed"].append(int(parts[1]))
+                if len(parts) >= 3 and parts[2] == "gpu":
+                    out["cb_failed_gpu"].append(int(parts[1]))
             elif head == "RESULT_TOKEN_COUNT" and len(parts) >= 2:
                 out["token_count"] = int(parts[1])
             elif head == "SCORE_DONE":
@@ -841,6 +985,8 @@ def _parse_remote(stdout: str) -> dict:
                 out["bonsaireg_ok"] = False
             elif head == "BONSAIREG_WHY":
                 out["bonsaireg_why"].append(line.split(" ", 1)[1].strip() if " " in line else "")
+            elif head == "BONSAIREG_NOTE" and " " in line:
+                out["bonsaireg_notes"].append(line.split(" ", 1)[1].strip())
             elif head in tags and len(parts) >= 4:
                 out[tags[head]][int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
             elif head.endswith("_FAILED") and head[:-len("_FAILED")] in tags:
@@ -870,6 +1016,23 @@ def _cb(res: dict, conc: int):
 
 def _guard_coverage(d: dict) -> str:
     return " · ".join(f"{name} {len(d.get(key) or {})} ctx" for key, _tag, name in GUARDS)
+
+
+REG_CHECKS = ("tensors", "score", "generate", "serve")
+
+
+def _reg_check_of(why: str) -> str:
+    """The bonsai_regression.py check a FAILED line belongs to ("serve: folded ..." -> "serve")."""
+    head = (why or "").split(":", 1)[0].strip()
+    return head if head in REG_CHECKS else "*"
+
+
+def _reg_failed_checks(ok, why_lines) -> set:
+    """Which checks failed: {} on a pass, {"*"} when the script failed without naming one (it
+    crashed, or was killed by its timeout) -- which then stands for every check."""
+    if ok:
+        return set()
+    return {_reg_check_of(w) for w in (why_lines or [])} or {"*"}
 
 
 def push_eval_polaris(host, port):
@@ -933,8 +1096,12 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
     shape). Never raises into the verdict: a receipt is optional, the measurement is not."""
     if not POLARIS_ENABLED:
         return None
+    # The tip that was measured, not whatever pull/<n>/head points at by now: a third fetch of the
+    # ref could attest a commit pushed after the measurement.
+    tip = res.get("pr_tip") or ""
+    target = shlex.quote(tip) if arb._FULL_SHA_RE.match(tip) else "FETCH_HEAD"
     r0 = ssh_run(host, port, f"cd {shlex.quote(REMOTE_REPO)} && git fetch -q origin "
-                             f"{shlex.quote(pr_ref)} && git checkout -qf FETCH_HEAD", timeout=120)
+                             f"{shlex.quote(pr_ref)} && git checkout -qf {target}", timeout=120)
     if r0.returncode != 0:
         print(f">> Polaris: could not checkout {pr_ref} for attestation: {(r0.stderr or '')[-300:]}")
         return None
@@ -986,11 +1153,14 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
 
 
 def _run_failure(r, what: str) -> dict:
-    tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
+    tail = arb.failure_excerpt(r.stdout, r.stderr, _EXPLICIT_FAIL_MARKERS)
     crash = _crash_reason(r.stdout, r.stderr)
     infra = _is_infra_failure(r.stdout, r.stderr)
     reason = f"{what} failed" + (f" — {crash}" if crash else " (no crash diagnostic captured — retried once)")
-    return {"ok": False, "retry": infra, "reason": reason, "log": tail}
+    # The tip the box fetched, when it got that far: a build failure is recorded against the
+    # commit that failed to build (arb.measured_commit).
+    tip = _parse_remote(r.stdout or "").get("pr_tip")
+    return {"ok": False, "retry": infra, "reason": reason, "log": tail, "pr_tip": tip}
 
 
 def measure_main_baseline(host, port):
@@ -1006,6 +1176,12 @@ def measure_main_baseline(host, port):
     if main.get("bonsai_failed") or missing:
         return {"ok": False, "reason": "main bench missing Ternary-Bonsai-2-27B measurements at ctx "
                                        + ",".join(missing or ["(sweep failed)"]), "log": log}
+    # Every concurrency width too, as pr_qwen38_bot.py requires: a width main could not measure
+    # would otherwise drop that axis for every PR in the round, unscored and unguarded.
+    cb_missing = [f"c{c}" for c in CB_CONCS if _cb(main, c) is None]
+    if cb_missing:
+        return {"ok": False, "reason": "main concurrent decode missing at " + ",".join(cb_missing),
+                "log": log}
     if not main.get("score_done") or main.get("score_positions", 0) < 100:
         return {"ok": False, "reason": f"main score dump missing or short "
                                        f"({main.get('score_positions', 0)} positions)", "log": log}
@@ -1071,17 +1247,28 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
             name = f"bonsai-{phase}@{SCORED_CTX_LABEL[ctx]}"
             lab, dlt, ok, why = tier_from_gain(_at(pr, ctx, phase), _at(main, ctx, phase), metric=name)
             scored.append({"dim": name, "label": lab, "delta": dlt, "passed": ok, "reason": why})
-    cb_skipped = []
+    cb_skipped, cb_pr_missing = [], []
     for conc in CB_CONCS:
         name = CB_DIM_FOR[conc]
         pr_v, main_v = _cb(pr, conc), _cb(main, conc)
-        if pr_v is None or main_v is None:
+        if main_v is None:
+            # measure_main_baseline refuses such a baseline; kept so a caller with a partial main
+            # still drops the axis rather than scoring it.
             cb_skipped.append(name)
+            continue
+        if pr_v is None:
+            cb_pr_missing.append(conc)
             continue
         lab, dlt, ok, why = tier_from_gain(pr_v, main_v, metric=name)
         scored.append({"dim": name, "label": lab, "delta": dlt, "passed": ok, "reason": why})
     if cb_skipped:
-        print(f">> concurrent-decode axes not scored (no paired measurement): {', '.join(cb_skipped)}")
+        print(f">> concurrent-decode axes not scored (no main measurement): {', '.join(cb_skipped)}")
+    gpu_missing = [c for c in cb_pr_missing if c in (pr.get("cb_failed_gpu") or [])]
+    if gpu_missing:
+        # The card never drained before that width: the box's fault, measured again next round.
+        return {"ok": False, "retry": True, "log": log,
+                "reason": "GPU did not drain before concurrent decode at "
+                          + ",".join(f"c{c}" for c in gpu_missing) + " — infra"}
     by_dim = {x["dim"]: x for x in scored}
 
     regressed = [x for x in scored if x["label"] == "REJECT"]
@@ -1109,15 +1296,21 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
             return {"ok": False, "retry": True, "log": log, "reason": "; ".join(pf_problems)}
         reject("prefill-path accuracy gate failed: " + "; ".join(pf_problems[:4]))
 
-    # Gate 2c is absolute, so it may only reject a PR when main passes it in the same round.
+    # Gate 2c is absolute, so a check may only reject a PR when main passes THAT check in the same
+    # round. Per check, not all-or-nothing: a serve flake on main used to switch off the tensors,
+    # score and generate checks too, for every PR in the round.
     reg_main_ok = bool(main.get("bonsaireg_ok"))
     reg_pr_ok = pr.get("bonsaireg_ok")
-    reg_gated = reg_main_ok
     if reg_pr_ok is None:
         return {"ok": False, "retry": True, "log": log, "reason": "PR bonsai_regression.py did not run"}
-    if reg_gated and not reg_pr_ok:
-        reject("bonsai_regression.py failed (main passes it): "
-               + "; ".join(pr.get("bonsaireg_why")[:3] or ["see log"]))
+    reg_main_failed = _reg_failed_checks(reg_main_ok, main.get("bonsaireg_why"))
+    reg_pr_failed = _reg_failed_checks(reg_pr_ok, pr.get("bonsaireg_why"))
+    reg_gated_fail = sorted(reg_pr_failed - reg_main_failed) if "*" not in reg_main_failed else []
+    if reg_gated_fail:
+        why = [w for w in (pr.get("bonsaireg_why") or [])
+               if "*" in reg_gated_fail or _reg_check_of(w) in reg_gated_fail]
+        reject("bonsai_regression.py failed (main passes that check): "
+               + "; ".join(why[:3] or ["see log"]))
 
     guard_results = {}
     for key, _tag, name in GUARDS:
@@ -1134,6 +1327,20 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
                                   "re-evaluated next round rather than rejected"}
             reject(f"{name} no-regression guard failed: " + "; ".join(problems[:6]))
         guard_results[key] = {"ok": ok, "problems": problems, "skipped": skipped}
+
+    # Last, so it is known whether it is the ONLY failure: a width the PR build could not complete
+    # while main did. On its own it is judged over two rounds (STRIKES_TO_REJECT, apply_result);
+    # beside another failure it is just one more reason.
+    strike_key = None
+    if cb_pr_missing:
+        widths = ",".join(f"c{c}" for c in cb_pr_missing)
+        why = (f"concurrent decode at {widths} did not complete on the PR build in "
+               f"{CB_MAX_ATTEMPTS} attempts, while main measured it this round")
+        if label == "REJECT":
+            reason = f"{why} | {reason}"
+        else:
+            reject(why)
+            strike_key = f"cb:{widths}"
 
     res = {
         "ok": True,
@@ -1165,6 +1372,12 @@ def eval_bonsai_on_box(host, port, pr_ref: str, main: dict):
         "bonsaireg_pr_ok": reg_pr_ok,
         "bonsaireg_main_ok": reg_main_ok,
         "bonsaireg_why": pr.get("bonsaireg_why") or [],
+        "bonsaireg_main_failed": sorted(reg_main_failed),
+        "bonsaireg_pr_failed": sorted(reg_pr_failed),
+        "bonsaireg_gated_fail": reg_gated_fail,
+        "bonsaireg_notes": pr.get("bonsaireg_notes") or [],
+        "cb_pr_missing": cb_pr_missing,
+        "strike_key": strike_key,
         "guards": guard_results,
         "guards_pr": {key: pr.get(key) for key, _t, _n in GUARDS},
         "guards_main": {key: main.get(key) for key, _t, _n in GUARDS},
@@ -1219,11 +1432,14 @@ def _matrix_table(res: dict) -> str:
         out += ("**Concurrent decode** — aggregate tok/s with N requests in flight, median of "
                 f"{CB_REPS} runs\n\n| concurrency | main | PR | delta |\n|---|---|---|---|\n"
                 + "\n".join(cb_rows) + "\n\n")
-    missing = [f"c{c}" for c in CB_CONCS if CB_DIM_FOR[c] not in dims]
+    pr_missing = [f"c{c}" for c in (res.get("cb_pr_missing") or [])]
+    missing = [f"c{c}" for c in CB_CONCS if CB_DIM_FOR[c] not in dims and f"c{c}" not in pr_missing]
+    if pr_missing:
+        out += (f"<sub>Concurrency {', '.join(pr_missing)} did not complete on the PR build in "
+                f"{CB_MAX_ATTEMPTS} attempts, while main measured it this round.</sub>\n\n")
     if missing:
-        out += (f"<sub>Concurrency {', '.join(missing)} not scored this round — no paired "
-                f"measurement (a width that fails to run is dropped, never counted as a "
-                f"regression).</sub>\n\n")
+        out += (f"<sub>Concurrency {', '.join(missing)} not scored this round — main has no "
+                f"measurement for it.</sub>\n\n")
     pf_rows = res.get("prefill_path_rows") or []
     if pf_rows:
         out += (f"**Prefill path** — batched prefill against the token loop, {PF_CONT} teacher-forced "
@@ -1245,8 +1461,30 @@ def _policy_note() -> str:
     merge = ("The round's best passing speedup is auto-merged as `bonsai-merge-first` (only at the "
              "exact commit scored); a separate comment says so." if AUTO_MERGE
              else "This bot does not auto-merge.")
-    close = "A `REJECT` closes the PR." if AUTO_CLOSE else "It does not close PRs."
+    close = ("A measured `REJECT` closes the PR, and so does `none` on a PR that declares "
+             "Ternary-Bonsai-2-27B alone." if AUTO_CLOSE
+             else "It does not close PRs on a verdict.")
     return f"{merge} {close}"
+
+
+def _reg_row(res: dict) -> str:
+    """The bonsai_regression.py row: which checks gated, which main also failed, and any note."""
+    main_failed = res.get("bonsaireg_main_failed") or []
+    notes = res.get("bonsaireg_notes") or []
+    note = (" · note: " + "; ".join(notes[:2])) if notes else ""
+    if res.get("bonsaireg_gated_fail"):
+        why = "; ".join((res.get("bonsaireg_why") or [])[:3]) or "see log"
+        return f"| bonsai_regression.py | ❌ **FAILED** — {why} — **verdict forced to REJECT** |\n"
+    if "*" in main_failed:
+        state = "passes" if res.get("bonsaireg_pr_ok") else "fails"
+        return (f"| bonsai_regression.py | ⚠️ not gated — it did not complete on main this round (the "
+                f"PR {state} it); a failure already on main cannot reject a PR{note} |\n")
+    if res.get("bonsaireg_pr_ok"):
+        extra = f" (main fails {', '.join(main_failed)} this round)" if main_failed else ""
+        return f"| bonsai_regression.py | ✅ tensors · score · generate · serve{extra}{note} |\n"
+    both = ", ".join(res.get("bonsaireg_pr_failed") or [])
+    return (f"| bonsai_regression.py | ⚠️ not gated for {both} — main fails it too this round, so it "
+            f"cannot reject a PR; every other check passed{note} |\n")
 
 
 def _gate_row(name: str, ok, detail_ok: str, detail_fail: str, skipped: str = "") -> str:
@@ -1294,14 +1532,7 @@ def format_comment(commit: str, res: dict) -> str:
         "prefill path vs main", res.get("prefill_path_ok"),
         f"batched prefill within main's spread at prefix {'/'.join(str(p) for p in PF_PREFIXES)}",
         "; ".join((res.get("prefill_path_problems") or [])[:3]))
-    if res.get("bonsaireg_main_ok"):
-        reg_row = _gate_row("bonsai_regression.py", res.get("bonsaireg_pr_ok"),
-                            "tensors · score · generate · serve",
-                            "; ".join((res.get("bonsaireg_why") or [])[:3]) or "see log")
-    else:
-        state = "passes" if res.get("bonsaireg_pr_ok") else "fails"
-        reg_row = (f"| bonsai_regression.py | ⚠️ not gated — main fails it this round (the PR {state} "
-                   f"it); a failure already on main cannot reject a PR |\n")
+    reg_row = _reg_row(res)
     guard_rows = ""
     for key, _tag, name in GUARDS:
         g = (res.get("guards") or {}).get(key) or {}
@@ -1343,16 +1574,26 @@ def format_comment(commit: str, res: dict) -> str:
     )
 
 
-def auto_merge_ok_bonsai(repo, num):
-    info = json.loads(arb.gh(["pr", "view", str(num), "-R", repo, "--json",
-                              "state,isDraft,labels,author,mergeable,files,headRefOid"]).stdout or "{}")
+def auto_merge_ok_bonsai(repo, num, require_merge_first=True):
+    """Can this PR be merged now? With require_merge_first=False it is the reconcile's question
+    instead -- may this PR be MADE merge-first -- which must be the same test minus that one label:
+    a winner whose merge would then be refused holds merge-first round after round while every
+    other speedup PR is pushed to needs-rebase (#1154, 2026-09-24, for a hold; any refusal below
+    did the same until 2026-09-26)."""
+    try:
+        info = json.loads(arb.gh(["pr", "view", str(num), "-R", repo, "--json",
+                                  "state,isDraft,labels,author,mergeable,files,headRefOid"]).stdout or "{}")
+    except json.JSONDecodeError:
+        info = None
+    if not isinstance(info, dict):
+        return False, "could not read the PR from GitHub"
     if info.get("state") != "OPEN" or info.get("isDraft"):
         return False, "not an open, non-draft PR"
     labs = {l["name"] for l in info.get("labels", [])}
     tiers = {l.split(":", 1)[1] for l in labs if l.startswith(EVAL_PREFIX)}
     if not (tiers & SPEEDUP_LABELS):
         return False, "no verified eval-bonsai speedup label"
-    if BONSAI_MERGE_FIRST not in labs:
+    if require_merge_first and BONSAI_MERGE_FIRST not in labs:
         return False, "not bonsai-merge-first"
     # Merge only the exact commit this bot scored. The label and bonsai-merge-first survive a push
     # made after the verdict, and if the next round's re-measurement fails on the box side nothing
@@ -1380,7 +1621,10 @@ def auto_merge_ok_bonsai(repo, num):
             if any(f["path"].startswith(p) for p in arb.AUTOMERGE_SENSITIVE)]
     if sens:
         return False, f"touches protected paths: {', '.join(sens[:3])}"
-    if info.get("mergeable") != "MERGEABLE":
+    # GitHub reports UNKNOWN for a while after main moves; that must not cost a PR the ranking
+    # (the merge itself re-checks). A conflict does.
+    if info.get("mergeable") != "MERGEABLE" and (require_merge_first
+                                                 or info.get("mergeable") == "CONFLICTING"):
         return False, f"not cleanly mergeable ({info.get('mergeable')})"
     return True, "ok"
 
@@ -1420,8 +1664,8 @@ def try_auto_merge_bonsai(repo, num):
 
 def reconcile_bonsai_merge_labels(repo, dry_run=False):
     scores = _load_scores()
-    open_prs = json.loads(arb.gh(["pr", "list", "-R", repo, "--state", "open",
-                                  "--json", "number,labels", "--limit", "80"]).stdout or "[]")
+    open_prs = json.loads(arb.gh(["pr", "list", "-R", repo, "--state", "open", "--json", "number,labels",
+                                  "--limit", str(arb.PR_LIST_LIMIT)]).stdout or "[]")
     merged = json.loads(arb.gh(["pr", "list", "-R", repo, "--state", "merged", "--label",
                                 BONSAI_MERGE_FIRST, "--json", "number", "--limit", "10"]).stdout or "[]")
     if not dry_run:
@@ -1443,6 +1687,14 @@ def reconcile_bonsai_merge_labels(repo, dry_run=False):
         tier = next((l.split(":", 1)[1] for l in labs
                      if l.startswith(EVAL_PREFIX) and l.split(":", 1)[1] in SPEEDUP_LABELS), None)
         if not tier:
+            continue
+        # Everything else auto-merge would refuse -- a head that moved past the scored commit, a
+        # REJECT from another bot, a penalty, a protected path, a conflict -- must not win either.
+        ok, why = auto_merge_ok_bonsai(repo, p["number"], require_merge_first=False)
+        if not ok:
+            print(f">> bonsai round: #{p['number']} cannot be merge-first ({why})")
+            if BONSAI_MERGE_FIRST in labs:
+                stale_first.append(p["number"])
             continue
         entry = scores.get(str(p["number"])) or {}
         scored.append((p["number"], float(entry.get("delta_pct") or 0)))
@@ -1551,7 +1803,12 @@ def upload_bonsai_eval_log(repo, num, title, oid, res):
         return None
 
 
-def apply_result(repo, num, commit, res, title="", dry_run=False):
+def _closes_on_none(body: str) -> bool:
+    """`none` closes only a PR that declares this model and no other (module docstring)."""
+    return arb.declared_models(body or "") == {"bonsai"}
+
+
+def apply_result(repo, num, commit, res, title="", dry_run=False, body=""):
     if not res.get("ok") and res.get("conflict"):
         print(f"PR #{num}: {res.get('reason')} — bonsai-needs-rebase, no verdict")
         if not dry_run:
@@ -1561,15 +1818,28 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         # Infrastructure: nothing is posted and no label changes. The next round measures again.
         print(f"PR #{num}: bonsai eval deferred — {res.get('reason')} (infra; re-evaluated next round)")
         return
+    if res.get("ok") and res.get("strike_key"):
+        # A REJECT whose only cause is a concurrency width the PR build could not complete. Judged
+        # over two rounds on the same commit: the first time nothing is posted.
+        if dry_run:
+            print(f"PR #{num}: would count a strike for {res['strike_key']} "
+                  f"(REJECT on strike {STRIKES_TO_REJECT})")
+        else:
+            n = record_strike(num, commit, res["strike_key"])
+            if n < STRIKES_TO_REJECT:
+                print(f"PR #{num}: {res.get('reason', '').split(' | ')[0]} — strike {n} of "
+                      f"{STRIKES_TO_REJECT}; nothing posted, measured again next round")
+                return
     label = res.get("label") if res.get("ok") else "REJECT"
-    body = format_comment(commit, res)
+    comment = format_comment(commit, res)
     print(f"PR #{num}: eval-bonsai:{label}  from={res.get('best_dim')} delta={res.get('delta_pct')}%  "
           f"accuracy_ok={res.get('accuracy_ok')} prefill_path_ok={res.get('prefill_path_ok')} "
           f"bonsaireg_ok={res.get('bonsaireg_pr_ok')} "
           f"guards_ok={ {k: v.get('ok') for k, v in (res.get('guards') or {}).items()} }")
     if dry_run:
-        print(body)
+        print(comment)
         return
+    clear_strikes(num)
     strip_bonsai_eval_labels(repo, num)
     if label in SPEEDUP_LABELS:
         # A fresh speedup for the current head makes this PR eligible for merge-first again
@@ -1579,7 +1849,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
     # Mirrored to the generic eval:* label (explicit decision 2026-09-24), derived from every
     # per-bot label so a `none` here cannot erase another model's real tier.
     arb.sync_generic_eval_label(repo, num)
-    arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+    arb.gh(["pr", "comment", str(num), "-R", repo, "--body", comment])
     if not res.get("ok"):
         return
     upload_bonsai_eval_log(repo, num, title, commit, res)
@@ -1592,18 +1862,41 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
-    # `none` never closes here: most PRs this bot evaluates are aimed at another model (module
-    # docstring). A measured REJECT closes only when the operator has turned auto-close on.
-    if AUTO_CLOSE and label == "REJECT":
-        arb.gh(["pr", "comment", str(num), "-R", repo, "--body",
-                "<!-- sparkinfer-bonsai-auto-close -->\n"
-                "## Closed: regression or failed gate — `eval-bonsai:REJECT`\n\n"
-                "The verdict comment above names the axis or gate that failed on "
-                "Ternary-Bonsai-2-27B. Every scored axis is a no-regression floor, and the accuracy "
-                "gates and cross-model guards are hard gates. Reopen once it is addressed and it "
-                "re-evaluates on the next poll."])
-        arb.gh(["pr", "close", str(num), "-R", repo])
-        print(f">> auto-closed PR #{num} (eval-bonsai:REJECT)")
+    # Closing (module docstring): a measured REJECT closes; `none` closes only a PR declared for
+    # this model alone -- this bot also scores every undeclared PR, most of them aimed elsewhere.
+    if not AUTO_CLOSE:
+        return
+    if label == "REJECT":
+        first = (res.get("reason") or "").split(" | ")[0]
+        close_body = (
+            "<!-- sparkinfer-bonsai-auto-close -->\n"
+            "## Closed: regression or failed gate — `eval-bonsai:REJECT`\n\n"
+            f"Measured on the pinned RTX 5090 against the same-box `origin/main`: {first}.\n\n"
+            "Every scored axis is also a no-regression floor, and the accuracy gates and "
+            "cross-model guards are hard gates, so one failure closes the PR whatever it was "
+            "aiming at. The verdict comment above has the full table. Reopen once it is addressed "
+            "and it is evaluated again on the next round.")
+    elif label == "none" and _closes_on_none(body):
+        close_body = (
+            "<!-- sparkinfer-bonsai-auto-close -->\n"
+            "## Closed: no verified speedup — `eval-bonsai:none`\n\n"
+            f"Measured on the pinned RTX 5090 against the same-box `origin/main`: "
+            f"**{res.get('delta_pct')}%** on the best of {len(SCORING_DIMS)} scored axes "
+            f"(decode + prefill @ {_ctx_list_str()}, concurrent decode @ {_cb_list_str()}).\n\n"
+            "**This is not a finding that anything is wrong with your PR.** Nothing regressed and "
+            "every correctness gate passed; the change just did not move a number this bot "
+            "measures.\n\n"
+            "- **Nothing here measures your optimization yet?** Open an issue describing the axis "
+            "you need, with your before/after numbers, then reopen and ask for the `hold` label.\n"
+            "- **Correctness fix, refactor, test or docs?** Reopen as a **draft** or ask for "
+            "`hold`; those are reviewed by hand.\n"
+            "- **Expected a speedup?** Re-measure against current `main` and reopen with the new "
+            "numbers; it is evaluated again on the next round.")
+    else:
+        return
+    arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
+    arb.gh(["pr", "close", str(num), "-R", repo])
+    print(f">> auto-closed PR #{num} (eval-bonsai:{label})")
 
 
 def main():
@@ -1616,10 +1909,13 @@ def main():
     ap.add_argument("--reeval", action="store_true")
     ap.add_argument("--labels-only", action="store_true", help="reconcile bonsai-merge-first only — no GPU")
     ap.add_argument("--only-prs", default="",
-                    help="comma-separated PR numbers (bypasses greenlight, and the draft filter)")
+                    help="comma-separated PR numbers (bypasses greenlight; with --no-post also "
+                         "the hold and draft filters, since nothing is posted)")
     args = ap.parse_args()
     only = {int(x) for x in args.only_prs.split(",") if x.strip().isdigit()}
     quiet = args.dry_run or args.no_post
+    # A held or draft PR is never acted on. A report-only run may still measure one by name.
+    look_only = bool(only) and args.no_post
 
     print(f">> bonsai eval transport: "
           f"{'ssh' if ssh_box_enabled() else f'vast.ai (instance {arb.current_instance(args.instance) or args.instance})'}")
@@ -1633,17 +1929,21 @@ def main():
     prs = json.loads(arb.gh([
         "pr", "list", "-R", args.repo, "--state", "open",
         "--json", "number,title,labels,isDraft,headRefOid,headRefName,mergeable,author,body,files",
-        "--limit", "80",
+        "--limit", str(arb.PR_LIST_LIMIT),
     ]).stdout or "[]")
     prs.sort(key=lambda p: p["number"])
+
+    stale_closed = close_stale_bonsai_prs(args.repo, prs, dry_run=quiet) if not only else set()
 
     denylist = arb.load_denylist()
     pending = []
     for pr in prs:
         num = pr["number"]
+        if num in stale_closed:
+            continue
         if only and num not in only:
             continue
-        if pr.get("isDraft") and num not in only:
+        if pr.get("isDraft") and not look_only:
             continue
         hits = arb.pr_involved_logins(args.repo, num) & denylist
         if hits:
@@ -1652,7 +1952,7 @@ def main():
                 arb.close_blocked_pr(args.repo, num, hits)
             continue
         labs = {l["name"] for l in pr.get("labels", [])}
-        if arb.HOLD_LABEL in labs and num not in only:
+        if arb.HOLD_LABEL in labs and not look_only:
             print(f"PR #{num}: hold — skip")
             continue
         head = (pr.get("headRefOid") or "")[:40]
@@ -1687,14 +1987,14 @@ def main():
         # Measured as its tip merged onto the round's main baseline commit, built on the box
         # (arb.merged_checkout_script) -- not GitHub's pull/<n>/merge, which can be stale (#1145).
         ref = f"pull/{num}/head"
-        pending.append((num, head, short, ref, pr.get("title", "")))
+        pending.append((num, head, short, ref, pr.get("title", ""), pr.get("body") or ""))
 
     if not pending:
         reconcile_bonsai_merge_labels(args.repo, dry_run=quiet)
         print("done — no bonsai PRs to evaluate.")
         return
     if args.dry_run:
-        print("--- dry-run would evaluate: " + ", ".join(f"#{n} ({ref})" for n, _h, _s, ref, _t in pending))
+        print("--- dry-run would evaluate: " + ", ".join(f"#{p[0]} ({p[3]})" for p in pending))
         return
 
     pin = arb.PINNED_INSTANCE
@@ -1728,13 +2028,20 @@ def main():
           f"{'OK' if main_result.get('bonsaireg_ok') else 'FAILED ' + str(main_result.get('bonsaireg_why'))}")
     print(f">> main guard coverage: {_guard_coverage(main_result)}")
 
-    for num, head, short, ref, title in pending:
+    for num, head, short, ref, title, body in pending:
         print(f"PR #{num} @ {short}: evaluating Ternary-Bonsai-2-27B '{ref}' …")
         try:
             res = eval_bonsai_on_box(host, port, ref, main_result)
         except Exception as e:
             res = {"ok": False, "retry": True, "reason": f"exception: {type(e).__name__}: {e}"}
-        apply_result(args.repo, num, head or short, res, title=title, dry_run=args.no_post)
+        # Recorded against the tip the box built, which a mid-round push can make differ from
+        # the listed head (arb.measured_commit, #1167).
+        commit, moved = arb.measured_commit(head, res)
+        if moved:
+            print(f">> PR #{num} moved during the round: listed {short}, measured {commit[:9]} — "
+                  f"recording {commit[:9]}")
+        apply_result(args.repo, num, commit or short, res, title=title, dry_run=args.no_post,
+                     body=body)
 
     reconcile_bonsai_merge_labels(args.repo, dry_run=quiet)
     print("done — bonsai eval pass complete.")

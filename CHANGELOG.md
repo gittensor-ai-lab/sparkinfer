@@ -15,8 +15,22 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   so the score bars come from that measured spread (top-1 ≥ 0.93, KL ≤ 0.03) with perplexity within
   2% of `main` as the sharp edge. It guards Qwen3.6, both Qwen3.8 checkpoints and Muse Glimmer at
   32k. It auto-merges the round's best passing speedup (`SPARKINFER_BONSAI_AUTOMERGE=1`), like the
-  sibling bots but only at the exact commit it scored; it does not auto-close. Against the same-box
-  `main`, #1139 scores `XL`: prefill@128 2,090 → 4,186 tok/s.
+  sibling bots but only at the exact commit it scored. It closes a measured REJECT, and a `none`
+  only on a PR declared for Ternary-Bonsai-2-27B alone. Against the same-box `main`, #1139 scores
+  `XL`: prefill@128 2,090 → 4,186 tok/s.
+- **The eval bots record, gate and close more carefully** (Ternary-Bonsai, Qwen3.8, Muse Glimmer):
+  - a verdict names the commit the box actually built, not the one listed before a mid-round push;
+  - `bonsai_regression.py`'s serve check fails only on 2 of up to 3 trials (a build equal to `main`
+    failed a single trial in 2 of 8 runs), and each of its checks is gated on its own;
+  - only a PR auto-merge would accept can take merge-first, so a refused one cannot block the queue;
+    the Muse and Qwen3.8 bots now merge only the commit they scored, pinned to it;
+  - a box fault — an unmeasured guard, a failed fetch, a compiler killed for memory, the llama.cpp
+    reference failing to build — is retried with nothing posted, instead of a REJECT;
+  - a failed build's verdict shows the compiler's error lines rather than 80 lines of `ptxas info`;
+  - each bot's stale close touches only PRs for its own model: the Qwen3.8 bot had closed #1157, a
+    Ternary-Bonsai PR;
+  - the Muse bot no longer evaluates a PR that edits its own measuring harness;
+  - a verdict marker pasted by someone without write access no longer counts.
 - The PR template has a **Ternary-Bonsai-2-27B** target box. The Muse Glimmer and Qwen3.8 bots skip
   a PR declared for it alone, instead of scoring it `none` and closing it, and both now guard it at
   128 and 32k.

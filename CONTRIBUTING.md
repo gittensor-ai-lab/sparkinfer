@@ -249,7 +249,7 @@ speculative axes carry the losslessness and τ gates:
 | **Long-context guards** | ≥ 0.98× `main`, decode **and** prefill @ ctx=16k, on Qwen3.8 **and** Qwen3.6 | DSpark work lands in `qwen35.cpp` / shared kernels, which Qwen3.6 also uses — the exact surface through which #775 regressed a model nobody was scoring at the time. |
 
 Tiers are bands of % speedup over the frontier (`XS` 2–3.5% … `XL` >18%; under 2% is noise →
-`none`). A `none` or a failed gate is **auto-closed on the first result** — reopen after a fix and it re-evaluates. The exception is the Ternary-Bonsai bot, which is new: it labels and comments, but neither auto-closes nor auto-merges. Drafts and `hold` never reach evaluation, so use one of those if the PR should stay open unscored (see *Lane 3*).
+`none`). A `none` or a failed gate is **auto-closed on the first result** — reopen after a fix and it re-evaluates. The Ternary-Bonsai bot closes a failed gate the same way, but closes a `none` only on a PR declared for Ternary-Bonsai-2-27B alone, because it also scores every undeclared PR. Drafts and `hold` never reach evaluation, so use one of those if the PR should stay open unscored (see *Lane 3*).
 
 ### Lane 2 — manually reviewed, not scored
 

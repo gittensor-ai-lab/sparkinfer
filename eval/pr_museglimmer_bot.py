@@ -184,6 +184,19 @@ ACC_TOPK = int(os.environ.get("MUSEGLIMMER_ACC_TOPK", "128"))
 LLAMA_SERVER_PORT = int(os.environ.get("MUSEGLIMMER_LLAMA_PORT", "8097"))
 EVAL_TEXT = "bench/scripts/eval_text.txt"  # the exact known-good corpus from this session's fixes
 
+# The measuring instrument. Unlike the Qwen3.8 and Bonsai bots, this bot measures a PR with the PR's
+# OWN copy of these files (it builds the PR tip, with no harness pin), so a PR that edits them could
+# change the ruler it is scored by. Such a PR is not evaluated, as on those bots (2026-09-26).
+HARNESS_PATHS = (
+    "runtime/examples/qwen3_gguf_bench.cpp",
+    "runtime/examples/qwen3_gguf_cb_bench.cpp",
+    "runtime/examples/qwen3_gguf_score.cpp",
+    "runtime/examples/qwen_checkpoint.h",
+    "runtime/examples/qwen3_gguf_config.h",
+    "eval/",
+    "bench/scripts/",
+)
+
 # Qwen3.6 no-regression guard (module docstring, pt. 3) — same env var names as pr_dflash_bot.py's
 # Q36_GUARD_* (PRIMARY36_MODEL_REPO/PRIMARY36_TOK_REPO) so one .env.eval entry covers both bots.
 # Defaults point at this box's actual layout (confirmed 2026-08-12: /root/workspace/models36),
@@ -507,7 +520,7 @@ def museglimmer_evaluated_commits(repo, num):
     for c in json.loads(r.stdout or "{}").get("comments", []):
         body = c.get("body") or ""
         m = MARKER_RE.search(body)
-        if not m or "sparkinfer museglimmer auto-eval" not in body:
+        if not m or "sparkinfer museglimmer auto-eval" not in body or not arb.trusted_marker_comment(c):
             continue
         meta_raw = m.group(2)
         try:
@@ -548,16 +561,14 @@ def _pr_last_activity_ts(repo, num):
 
 
 def close_stale_museglimmer_prs(repo, prs, dry_run=False):
-    """Close open PRs with no author commit activity in STALE_DAYS+ days. HOLD_LABEL and the
-    current museglimmer-merge-first winner are exempt."""
+    """Close open PRs routed to Muse Glimmer with no author commit activity in STALE_DAYS+ days.
+    Drafts, `hold`, other models' PRs and any bot's merge-first are exempt
+    (arb.stale_close_skip_reason) -- this used to close every idle PR in the repo."""
     closed = set()
     now = time.time()
     for pr in prs:
         num = pr["number"]
-        if pr.get("isDraft"):
-            continue
-        labs = {l["name"] for l in pr.get("labels", [])}
-        if arb.HOLD_LABEL in labs or MUSEGLIMMER_MERGE_FIRST in labs:
+        if arb.stale_close_skip_reason(pr, "muse"):
             continue
         ts = _pr_last_activity_ts(repo, num)
         if ts is None:
@@ -573,9 +584,9 @@ def close_stale_museglimmer_prs(repo, prs, dry_run=False):
             "<!-- sparkinfer-museglimmer-auto-close-stale -->\n"
             f"## Closed: stale — no commits in {age_days:.1f} days\n\n"
             f"This PR has had no new commits in over {STALE_DAYS:g} days — closing automatically "
-            "to keep the Muse Glimmer eval queue clean. Reopen (or push a new commit / open a "
-            "fresh PR) whenever you're ready to continue; it'll be picked back up on the next "
-            "eval cycle."
+            "to keep the Muse Glimmer eval queue clean. Nothing is wrong with it for that reason "
+            "alone: push your latest work and reopen it (or open a fresh PR) whenever you're "
+            "ready, and it is picked back up on the next eval cycle."
         )
         arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
         arb.gh(["pr", "close", str(num), "-R", repo])
@@ -654,14 +665,26 @@ def _crash_reason(*outputs: str) -> str | None:
         marker = next((m for m in _EXPLICIT_FAIL_MARKERS if line.startswith(m)), None)
         if not marker:
             continue
-        # The single most actionable line is usually the compiler/linker's own "error:" —
-        # prefer that over the marker's generic "tail of build.log:" header.
-        for follow in lines[i + 1:i + 60]:
-            if "error:" in follow or "Error " in follow:
-                return f"{marker}: {follow.strip()}"
+        # The single most actionable line is usually the compiler/linker's own error -- prefer
+        # that over the marker's header and over make's `*** Error N` (arb.first_build_error).
+        err = arb.first_build_error(lines[i + 1:i + 80])
+        if err:
+            return f"{marker}: {err}"
         tail = " | ".join(l.strip() for l in lines[i + 1:i + 3] if l.strip())
         return marker + (f": {tail}" if tail else "")
     return None
+
+
+def _is_box_fault(stdout: str, stderr: str) -> bool:
+    """A failed run that is the box's rather than the PR's -- a GPU that did not drain, a failed
+    fetch, a compiler killed for memory, or a shell that died with no diagnostic before the
+    accuracy stage. Nothing is posted and no label changes; the next round measures again (as
+    pr_bonsai_bot.py does). Before, it posted `eval-museglimmer:REJECT` every round until the box
+    recovered, which also set the generic `eval:REJECT` that SN74 scoring reads."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    if "RETRYABLE_INFRA_FAILURE" in combined:
+        return True
+    return _looks_like_hard_kill(stdout, stderr)
 
 
 def _looks_like_hard_kill(stdout: str, stderr: str) -> bool:
@@ -802,12 +825,15 @@ BONSAI_GUARD_GGUF={bn_gguf}
 
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
-git fetch -q origin {ref_q}
+# A network failure is the box's, never the PR's: RETRYABLE, not the ERR trap.
+git fetch -q origin {ref_q} || {{ echo "RETRYABLE_INFRA_FAILURE git fetch {ref} failed" >&2; exit 1; }}
 git reset -q --hard
 git clean -qfd
 git checkout -qf FETCH_HEAD
 HEAD=$(git rev-parse --short HEAD)
 echo "REMOTE_HEAD $HEAD"
+# The full commit actually built: a verdict is recorded against it (arb.measured_commit).
+echo "REMOTE_SHA $(git rev-parse HEAD)"
 
 test -f "$GGUF" || {{ echo "FAIL missing GGUF $GGUF"; exit 1; }}
 
@@ -816,12 +842,33 @@ test -f "$GGUF" || {{ echo "FAIL missing GGUF $GGUF"; exit 1; }}
 # a DIFFERENT PR branch's files once the checkout switched underneath it (pr_dflash_bot.py
 # #693/#694 hit exactly this).
 mkdir -p build
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/mg_cmake.log 2>&1
-cmake --build build --target qwen3_gguf_bench qwen3_gguf_score qwen3_gguf_cb_bench -j"$(nproc)" >/tmp/mg_build.log 2>&1 || {{
-  echo "BUILD_FAILED — tail of /tmp/mg_build.log:" >&2
-  tail -80 /tmp/mg_build.log >&2
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/mg_cmake.log 2>&1 || {{
+  echo "BUILD_FAILED — cmake configure; tail:" >&2
+  tail -40 /tmp/mg_cmake.log >&2
   exit 1
 }}
+{arb.BUILD_FAILURE_SH}
+build_targets() {{
+  cmake --build build --target qwen3_gguf_bench qwen3_gguf_score qwen3_gguf_cb_bench -j"$1" >/tmp/mg_build.log 2>&1
+}}
+# A compiler killed for memory, a full disk or the overlayfs EFAULT is the box: rebuild once at -j4,
+# then call it infra. Anything else is the PR's build error, errors first (arb.BUILD_FAILURE_SH).
+if ! build_targets "$(nproc)"; then
+  if FAULT=$(build_box_fault /tmp/mg_build.log); then
+    echo "build hit a box-side fault ($FAULT) -- rebuilding with -j4" >&2
+    if ! build_targets 4; then
+      if FAULT=$(build_box_fault /tmp/mg_build.log); then
+        echo "RETRYABLE_INFRA_FAILURE build: $FAULT" >&2
+        exit 1
+      fi
+      report_build_failure /tmp/mg_build.log
+      exit 1
+    fi
+  else
+    report_build_failure /tmp/mg_build.log
+    exit 1
+  fi
+fi
 test -x build/runtime/qwen3_gguf_bench
 test -x build/runtime/qwen3_gguf_score
 
@@ -936,12 +983,16 @@ cmake -S "$LLAMACPP_DIR" -B "$LLAMACPP_DIR/build" -DGGML_CUDA=ON -DCMAKE_CUDA_AR
   -DCMAKE_BUILD_TYPE=Release >/tmp/mg_llamacpp_cmake.log 2>&1 || {{
   echo "LLAMACPP_CONFIGURE_FAILED — tail:" >&2
   tail -60 /tmp/mg_llamacpp_cmake.log >&2
+  # The reference is the box's own llama.cpp checkout, which no PR can touch: infra, not the PR.
+  echo "RETRYABLE_INFRA_FAILURE llama.cpp reference configure failed (the box's checkout)" >&2
   exit 1
 }}
 cmake --build "$LLAMACPP_DIR/build" -j"$(nproc)" --target llama-server llama-tokenize \\
   >/tmp/mg_llamacpp_build.log 2>&1 || {{
-  echo "LLAMACPP_BUILD_FAILED — tail:" >&2
-  tail -80 /tmp/mg_llamacpp_build.log >&2
+  echo "LLAMACPP_BUILD_FAILED — errors, then tail:" >&2
+  grep -E '(^|[^A-Za-z_])(error|fatal error)( |:)|undefined reference' /tmp/mg_llamacpp_build.log | head -20 >&2 || true
+  tail -40 /tmp/mg_llamacpp_build.log >&2
+  echo "RETRYABLE_INFRA_FAILURE llama.cpp reference build failed (the box's checkout)" >&2
   exit 1
 }}
 test -x "$LLAMACPP_DIR/build/bin/llama-tokenize"
@@ -1116,6 +1167,9 @@ def _parse_remote(stdout: str) -> dict:
     for line in (stdout or "").splitlines():
         if line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
+        elif line.startswith("REMOTE_SHA ") and len(line.split()) >= 2:
+            # This bot builds the PR tip itself (no merge onto main), so the built commit IS the tip.
+            out["pr_tip"] = line.split()[1]
         elif line.startswith("RESULT_DECODE_TPS "):
             try:
                 out["decode_tps"] = float(line.split()[1])
@@ -1307,9 +1361,12 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
     verdict itself, only omit its receipt."""
     if not POLARIS_ENABLED:
         return None
+    # The tip that was measured, not whatever pull/<n>/head points at by now.
+    tip = res.get("pr_tip") or ""
+    target = shlex.quote(tip) if arb._FULL_SHA_RE.match(tip) else "FETCH_HEAD"
     checkout_cmd = (
         f"cd {shlex.quote(REMOTE_REPO)} && "
-        f"git fetch -q origin {shlex.quote(pr_ref)} && git checkout -qf FETCH_HEAD"
+        f"git fetch -q origin {shlex.quote(pr_ref)} && git checkout -qf {target}"
     )
     r0 = ssh_run(host, port, checkout_cmd, timeout=60)
     if r0.returncode != 0:
@@ -1382,7 +1439,7 @@ def measure_main_baseline(host, port):
     redundant GPU/build time. Returns {"ok": True, **parsed} or {"ok": False, "reason", "log"}."""
     r = _ssh_run_resilient(host, port, _remote_script("main"), "main run")
     if r.returncode != 0:
-        tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
+        tail = arb.failure_excerpt(r.stdout, r.stderr, _EXPLICIT_FAIL_MARKERS)
         crash = _crash_reason(r.stdout, r.stderr)
         reason = "main run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
         return {"ok": False, "reason": reason, "log": tail}
@@ -1405,10 +1462,11 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
     print(f">> Muse Glimmer eval on box: PR ref={pr_ref}")
     r = _ssh_run_resilient(host, port, _remote_script(pr_ref), "PR run")
     if r.returncode != 0:
-        tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
+        tail = arb.failure_excerpt(r.stdout, r.stderr, _EXPLICIT_FAIL_MARKERS)
         crash = _crash_reason(r.stdout, r.stderr)
         reason = "PR speed/accuracy run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
-        return {"ok": False, "reason": reason, "log": tail}
+        return {"ok": False, "retry": _is_box_fault(r.stdout, r.stderr), "reason": reason,
+                "log": tail, "pr_tip": _parse_remote(r.stdout or "").get("pr_tip")}
     pr = _parse_remote(r.stdout or "")
     # A missing PR-side context is NOT treated as an infra failure here -- it is scored as a
     # regression by tier_from_gain (cur=0 against a real main baseline), which is the fail-closed
@@ -1518,17 +1576,28 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         # nothing never reads as a round that guarded successfully.
         mo_ok, mo_problems = True, []
         print(">> modelopt guard SKIPPED — checkpoint not installed (MODELOPT_MODEL_DIR)")
+    un_ok, un_problems = check_unsloth_guard(pr, main)
+    if pr.get("guardun_unavailable") or main.get("guardun_unavailable"):
+        # Same SKIP-not-REJECT handling as the ModelOpt guard, and the same announcement.
+        un_ok, un_problems = True, []
+        print(">> unsloth qwen3.8 guard SKIPPED — checkpoint not installed (QWEN38_MODEL_DIR)")
+    q36_ok, q36_problems = check_q36_guard(pr, main)
+    # A guard that measured NOTHING is infra, not a regression: no verdict, re-evaluated next
+    # round. Only the Ternary-Bonsai guard below did this; the other three REJECTed -- and, a REJECT
+    # being a closing verdict, closed the PR -- over a measurement that never happened (the Qwen3.8
+    # bot closed #1112 and #1114 that way on 2026-09-18).
+    for g_ok, g_problems in ((mo_ok, mo_problems), (un_ok, un_problems), (q36_ok, q36_problems)):
+        unavailable = [p for p in g_problems if p.endswith("measurement unavailable")]
+        if not g_ok and unavailable and len(unavailable) == len(g_problems):
+            return {"ok": False, "retry": True, "log": "",
+                    "reason": "; ".join(unavailable) + " — infra, not a regression; the PR is "
+                              "re-evaluated next round rather than rejected"}
     if not mo_ok:
         mo_reason = "modelopt no-regression guard failed: " + "; ".join(mo_problems[:6])
         reason = f"{mo_reason} | {reason}"
         label = "REJECT"
         passed = False
 
-    un_ok, un_problems = check_unsloth_guard(pr, main)
-    if pr.get("guardun_unavailable") or main.get("guardun_unavailable"):
-        # Same SKIP-not-REJECT handling as the ModelOpt guard, and the same announcement.
-        un_ok, un_problems = True, []
-        print(">> unsloth qwen3.8 guard SKIPPED — checkpoint not installed (QWEN38_MODEL_DIR)")
     if not un_ok:
         un_reason = "unsloth qwen3.8 no-regression guard failed: " + "; ".join(un_problems[:6])
         reason = f"{un_reason} | {reason}"
@@ -1544,14 +1613,14 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         # Measured nothing -> infra: no verdict, re-evaluated next round (module docstring pt. 3).
         unavailable = [p for p in bn_problems if p.endswith("measurement unavailable")]
         if unavailable and len(unavailable) == len(bn_problems):
-            return {"ok": False, "log": "",
+            # retry: nothing is posted. Without it apply_result still wrote eval-museglimmer:REJECT.
+            return {"ok": False, "retry": True, "log": "",
                     "reason": "; ".join(unavailable) + " — infra, not a regression; the PR is "
                               "re-evaluated next round rather than rejected"}
         reason = "ternary-bonsai no-regression guard failed: " + "; ".join(bn_problems[:6]) + f" | {reason}"
         label = "REJECT"
         passed = False
 
-    q36_ok, q36_problems = check_q36_guard(pr, main)
     if not q36_ok:
         # Same hard-REJECT discipline as the accuracy gate: a Muse Glimmer PR that silently
         # regresses Qwen3.6 via shared code (qwen35.cpp/inference_engine.cpp) is unmergeable
@@ -1609,10 +1678,16 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         "q36_guard_main": main.get("guard36"),
         "pr_head": pr.get("head"),
         "main_head": main.get("head"),
+        "pr_tip": pr.get("pr_tip"),
     }
-    polaris = collect_polaris_attestation(host, port, res, pr_ref)
-    if polaris:
-        res["polaris"] = polaris
+    # A receipt for a measurement that has happened, never a gate on it: an exception here must not
+    # discard `res` (the Qwen3.8 bot lost a measured +27.7% on #832 to exactly that).
+    try:
+        polaris = collect_polaris_attestation(host, port, res, pr_ref)
+        if polaris:
+            res["polaris"] = polaris
+    except Exception as e:
+        print(f">> Polaris attestation failed ({type(e).__name__}: {e}) — keeping the measurement")
     return res
 
 
@@ -1811,19 +1886,40 @@ def format_comment(commit: str, res: dict) -> str:
     )
 
 
-def auto_merge_ok_museglimmer(repo, num):
-    info = json.loads(arb.gh([
-        "pr", "view", str(num), "-R", repo, "--json",
-        "state,isDraft,labels,author,mergeable,files",
-    ]).stdout or "{}")
+def auto_merge_ok_museglimmer(repo, num, require_merge_first=True):
+    """Can this PR be merged now? With require_merge_first=False: may it be MADE merge-first -- the
+    same test minus that label, so a winner whose merge would be refused cannot hold merge-first
+    while every other speedup PR is pushed to needs-rebase (pr_bonsai_bot.py, 2026-09-26)."""
+    try:
+        info = json.loads(arb.gh([
+            "pr", "view", str(num), "-R", repo, "--json",
+            "state,isDraft,labels,author,mergeable,files,headRefOid",
+        ]).stdout or "{}")
+    except json.JSONDecodeError:
+        info = None
+    if not isinstance(info, dict):
+        return False, "could not read the PR from GitHub"
     if info.get("state") != "OPEN" or info.get("isDraft"):
         return False, "not an open, non-draft PR"
     labs = {l["name"] for l in info.get("labels", [])}
     tiers = {l.split(":", 1)[1] for l in labs if l.startswith(EVAL_PREFIX)}
     if not (tiers & SPEEDUP_LABELS):
         return False, "no verified eval-museglimmer:speedup label"
-    if MUSEGLIMMER_MERGE_FIRST not in labs:
+    if require_merge_first and MUSEGLIMMER_MERGE_FIRST not in labs:
         return False, "not museglimmer-merge-first"
+    # Only the exact commit this bot scored. The labels survive a push made after the verdict, and a
+    # re-measurement that fails on the box side posts nothing -- so the label alone could merge
+    # unmeasured code (pr_bonsai_bot.py has checked this since it was written).
+    head = info.get("headRefOid") or ""
+    scored = _load_scores().get(str(num)) or {}
+    if not head or scored.get("commit") != head:
+        return False, (f"head {head[:9] or '?'} is not the commit last scored "
+                       f"({(scored.get('commit') or 'none')[:9]})")
+    if scored.get("label") not in SPEEDUP_LABELS or not scored.get("pass"):
+        return False, f"recorded verdict for {head[:9]} is {scored.get('label')} (pass={scored.get('pass')})"
+    # A REJECT from any other bot is a measured harm on another model.
+    if any(l.endswith(":REJECT") for l in labs if l.startswith("eval")):
+        return False, "carries a REJECT from another eval bot"
     blocked = labs & AUTOMERGE_BLOCK
     if blocked:
         return False, f"blocking label(s): {', '.join(sorted(blocked))}"
@@ -1838,7 +1934,8 @@ def auto_merge_ok_museglimmer(repo, num):
         return False, f"touches protected paths: {', '.join(sens[:3])}"
     if arb.pr_merge_conflict(info.get("mergeable")):
         return False, "merge conflict with base"
-    if info.get("mergeable") != "MERGEABLE":
+    # GitHub reports UNKNOWN for a while after main moves; that must not cost a PR the ranking.
+    if info.get("mergeable") != "MERGEABLE" and require_merge_first:
         return False, f"not cleanly mergeable ({info.get('mergeable')})"
     return True, "ok"
 
@@ -1848,12 +1945,19 @@ def try_auto_merge_museglimmer(repo, num):
     if not ok:
         print(f">> museglimmer auto-merge SKIP #{num}: {reason}")
         return False
-    r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash"])
+    # Pinned to the commit auto_merge_ok_museglimmer just checked: a push landing in between cannot
+    # be what gets merged, --admin included.
+    head = (json.loads(arb.gh(["pr", "view", str(num), "-R", repo, "--json", "headRefOid"]).stdout
+                       or "{}").get("headRefOid") or "")
+    args = ["pr", "merge", str(num), "-R", repo, "--squash"]
+    if head:
+        args += ["--match-head-commit", head]
+    r = arb.gh(args)
     if r.returncode != 0 and os.environ.get("SPARKINFER_AUTOMERGE_ADMIN", "1") == "1":
         err = ((r.stderr or "") + (r.stdout or "")).lower()
         if "not mergeable" in err or "branch policy" in err or "required" in err or "prohibited" in err:
             print(">> museglimmer auto-merge: branch policy blocked — retrying with --admin")
-            r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash", "--admin"])
+            r = arb.gh(args + ["--admin"])
     if r.returncode == 0:
         print(f">> MUSEGLIMMER AUTO-MERGED #{num} (museglimmer-merge-first)")
         arb.gh(["pr", "comment", str(num), "-R", repo, "--body",
@@ -1869,7 +1973,7 @@ def reconcile_museglimmer_merge_labels(repo, dry_run=False):
     scores = _load_scores()
     open_prs = json.loads(arb.gh([
         "pr", "list", "-R", repo, "--state", "open",
-        "--json", "number,labels", "--limit", "80",
+        "--json", "number,labels", "--limit", str(arb.PR_LIST_LIMIT),
     ]).stdout or "[]")
     open_labels = {p["number"]: {l["name"] for l in p["labels"]} for p in open_prs}
 
@@ -1882,12 +1986,24 @@ def reconcile_museglimmer_merge_labels(repo, dry_run=False):
             arb.remove_label(repo, m["number"], MUSEGLIMMER_MERGE_FIRST)
 
     scored = []
+    stale_first = []   # carries merge-first but can no longer win it
     for num, labs in open_labels.items():
-        if MUSEGLIMMER_NEEDS_REBASE in labs:
+        # A PR that cannot be merged -- hold, needs-rebase, penalty, any other AUTOMERGE_BLOCK
+        # label, or anything else auto-merge would refuse -- must not take merge-first and push the
+        # others to needs-rebase for a merge that never happens (pr_bonsai_bot.py, #1154).
+        if labs & AUTOMERGE_BLOCK:
+            if MUSEGLIMMER_MERGE_FIRST in labs:
+                stale_first.append(num)
             continue
         tiers = {l.split(":", 1)[1] for l in labs if l.startswith(EVAL_PREFIX)}
         tier = next((t for t in tiers if t in SPEEDUP_LABELS), None)
         if not tier:
+            continue
+        ok, why = auto_merge_ok_museglimmer(repo, num, require_merge_first=False)
+        if not ok:
+            print(f">> museglimmer round: #{num} cannot be merge-first ({why})")
+            if MUSEGLIMMER_MERGE_FIRST in labs:
+                stale_first.append(num)
             continue
         entry = scores.get(str(num)) or {}
         if entry.get("label") not in SPEEDUP_LABELS:
@@ -1897,6 +2013,9 @@ def reconcile_museglimmer_merge_labels(repo, dry_run=False):
         scored.append((num, float(entry.get("delta_pct") or 0), entry.get("label") or tier))
 
     scored.sort(key=lambda x: x[1], reverse=True)
+    if not dry_run:
+        for num in stale_first:
+            arb.remove_label(repo, num, MUSEGLIMMER_MERGE_FIRST)
     if not scored:
         print(">> museglimmer round: no verified speedup PRs")
         return
@@ -1982,6 +2101,11 @@ def upload_museglimmer_eval_log(repo, num, title, oid, res):
 
 
 def apply_result(repo, num, commit, res, title="", dry_run=False):
+    if not res.get("ok") and res.get("retry"):
+        # The box's fault (_is_box_fault, an unmeasured guard, an exception): nothing is posted and
+        # no label changes; the next round measures again.
+        print(f"PR #{num}: museglimmer eval deferred — {res.get('reason')} (infra; re-evaluated next round)")
+        return
     body = format_comment(commit, res)
     label = res.get("label") if res.get("ok") else "REJECT"
     if not res.get("ok"):
@@ -2145,8 +2269,8 @@ def main():
 
     prs = json.loads(arb.gh([
         "pr", "list", "-R", args.repo, "--state", "open",
-        "--json", "number,title,labels,isDraft,headRefOid,headRefName,mergeable,author,body",
-        "--limit", "80",
+        "--json", "number,title,labels,isDraft,headRefOid,headRefName,mergeable,author,body,files",
+        "--limit", str(arb.PR_LIST_LIMIT),
     ]).stdout or "[]")
     prs.sort(key=lambda p: p["number"])
 
@@ -2194,6 +2318,13 @@ def main():
         if skip_why:
             print(f"PR #{num}: {skip_why} — skip museglimmer eval")
             continue
+        # Does it edit the measuring instrument (HARNESS_PATHS)? This bot builds the PR's own copy,
+        # so a number measured with a changed ruler cannot be accepted either way.
+        touched = [f.get("path", "") for f in (pr.get("files") or [])]
+        harness_hits = [t for t in touched if any(t.startswith(h) for h in HARNESS_PATHS)]
+        if harness_hits:
+            print(f"PR #{num}: touches the eval harness ({', '.join(harness_hits[:3])}) — not evaluated")
+            continue
         if arb.pr_merge_conflict(pr.get("mergeable")):
             print(f"PR #{num}: merge conflict — museglimmer-needs-rebase")
             if not args.dry_run:
@@ -2238,7 +2369,10 @@ def main():
     print(f">> SSH {_ssh_user}@{host}:{port}")
 
     print(">> measuring main baseline (once for this round, shared across all pending PRs) …")
-    main_result = measure_main_baseline(host, port)
+    try:
+        main_result = measure_main_baseline(host, port)
+    except Exception as e:   # ssh timeout or transport failure: the round, not a PR
+        main_result = {"ok": False, "reason": f"exception: {type(e).__name__}: {e}"}
     if not main_result.get("ok"):
         # No usable baseline -> nothing in this round can be scored. Bail out here rather than
         # burning GPU time building N different PR branches against a baseline we already know
@@ -2257,8 +2391,14 @@ def main():
         try:
             res = eval_museglimmer_on_box(host, port, ref, main_result)
         except Exception as e:
-            res = {"ok": False, "reason": f"exception: {e}"}
-        apply_result(args.repo, num, head or short, res, title=title, dry_run=False)
+            # ssh timeout, transport failure: never charged to the PR (it used to be a REJECT).
+            res = {"ok": False, "retry": True, "reason": f"exception: {type(e).__name__}: {e}"}
+        # Recorded against the tip the box built (arb.measured_commit): a mid-round push must not
+        # leave a verdict naming a commit that was never measured (#1167).
+        commit, moved = arb.measured_commit(head, res)
+        if moved:
+            print(f">> PR #{num} moved during the round: listed {short}, measured {commit[:9]}")
+        apply_result(args.repo, num, commit or short, res, title=title, dry_run=False)
 
     reconcile_museglimmer_merge_labels(args.repo, dry_run=False)
     print("done — museglimmer eval pass complete.")
