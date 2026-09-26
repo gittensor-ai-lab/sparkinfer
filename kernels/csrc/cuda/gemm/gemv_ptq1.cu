@@ -277,26 +277,45 @@ __host__ __device__ constexpr size_t dp_xs_smem(int nb) {
     return (size_t)nb * kDpXsStride * sizeof(int4) + (size_t)nb * (sizeof(float) + sizeof(int));
 }
 
+// 32 copies of the 256-entry table, entry e of copy c at word e*32+c: lane c always hits bank
+// c, so the data-dependent lookups never conflict. Each entry is decoded once and stored to its
+// 32 copies with eight 16-byte stores; decoding every copy separately (8192 decodes a CTA) cost
+// as many instructions as the CTA's own dot products.
+template <int T>
+__device__ __forceinline__ void dp_lut_fill(unsigned* s_lut) {
+    for (int e = threadIdx.x; e < 256; e += T) {
+        const unsigned v = dp_lut_entry(e);
+        const int4 v4 = make_int4((int)v, (int)v, (int)v, (int)v);
+        int4* dst = reinterpret_cast<int4*>(s_lut + e * 32);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) dst[(i + threadIdx.x) & 7] = v4;
+    }
+}
+
 // G lanes per weight row, each taking whole 28-byte blocks b = sub, sub+G, ...
 // XS (batch 1 only): the CTA copies the quantized activation, its scales and sums into shared
 // memory once instead of every lane fetching its 128-byte block through L1 per weight block.
 // Those fetches, not the weights or the table, were the limit: 8 LDG.128 per 28 weight bytes,
 // each spread over 8 different lines. Same values, same order, so the result is bit-identical.
+//
+// The XS form is also persistent: a CTA builds its table and stages the activation once, then
+// walks row groups blockIdx.x, blockIdx.x + gridDim.x, ... -- over w0's rows and then w1's, when
+// a second matrix of the same shape reads the same activation (gate and up) -- loading each
+// block one step ahead of the one it decodes. A row's blocks, their order and the shuffle tree
+// are what they were, so every output is bit-identical to one row group per CTA.
 template <typename OutT, int G, int BMAX, bool XS = false>
 __global__ void __launch_bounds__(kDpThreads)
 gemm_ptq1_dp4a_kernel(const unsigned char* __restrict__ w, OutT* __restrict__ y,
-                      int n_rows, int k, int batch, int slot) {
-    // 32 copies of the 256-entry table, entry e of copy c at word e*32+c: lane c always hits bank
-    // c, so the data-dependent lookups never conflict.
-    __shared__ unsigned s_lut[256 * 32];
+                      int n_rows, int k, int batch, int slot,
+                      const unsigned char* __restrict__ w1 = nullptr,
+                      OutT* __restrict__ y1 = nullptr) {
+    __shared__ __align__(16) unsigned s_lut[256 * 32];
     extern __shared__ int4 s_x[];
-    for (int i = threadIdx.x; i < 256 * 32; i += kDpThreads) s_lut[i] = dp_lut_entry(i >> 5);
+    dp_lut_fill<kDpThreads>(s_lut);
 
     const int lane = threadIdx.x & 31;
     const unsigned* lut = s_lut + lane;
-    const int row = blockIdx.x * (kDpThreads / G) + threadIdx.x / G;
     const int sub = threadIdx.x % G;
-    const bool live = row < n_rows;
     const int nb = k / kBlockElems;
     const int4* xq = DP_XQ(slot);
     const float* xs = DP_XS(slot);
@@ -311,63 +330,81 @@ gemm_ptq1_dp4a_kernel(const unsigned char* __restrict__ w, OutT* __restrict__ y,
     }
     __syncthreads();
 
-    float acc[BMAX];
-#pragma unroll
-    for (int j = 0; j < BMAX; ++j) acc[j] = 0.0f;
+    const int groups = (n_rows + kDpThreads / G - 1) / (kDpThreads / G);
+    const int all_groups = w1 ? 2 * groups : groups;
+    for (int grp = blockIdx.x; grp < all_groups; grp += gridDim.x) {
+        const bool second = grp >= groups;
+        const unsigned char* W = second ? w1 : w;
+        OutT* Y = second ? y1 : y;
+        const int row = (second ? grp - groups : grp) * (kDpThreads / G) + threadIdx.x / G;
+        const bool live = row < n_rows;
 
-    if (live) {
-        const unsigned* wrow =
-            reinterpret_cast<const unsigned*>(w + (size_t)row * nb * kBlockBytes);
-        for (int b = sub; b < nb; b += G) {
-            unsigned wq[7];
+        float acc[BMAX];
 #pragma unroll
-            for (int i = 0; i < 7; ++i) wq[i] = __ldg(wrow + (size_t)b * 7 + i);
-            unsigned C[26], E[6];
+        for (int j = 0; j < BMAX; ++j) acc[j] = 0.0f;
+
+        if (live) {
+            const unsigned* wrow =
+                reinterpret_cast<const unsigned*>(W + (size_t)row * nb * kBlockBytes);
+            unsigned nw[7];
 #pragma unroll
-            for (int g = 0; g < 6; ++g) {
-                unsigned L[4];
+            for (int i = 0; i < 7; ++i) nw[i] = sub < nb ? __ldg(wrow + (size_t)sub * 7 + i) : 0u;
+            for (int b = sub; b < nb; b += G) {
+                unsigned wq[7];
 #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    L[i] = lut[((wq[g] >> (8 * i)) & 0xffu) * 32];
-                    C[4 * g + i] = L[i] & 0x03030303u;
-                }
-                const unsigned lo = __byte_perm(L[0], L[1], 0x0040);
-                const unsigned hi = __byte_perm(L[2], L[3], 0x0040);
-                E[g] = (__byte_perm(lo, hi, 0x5410) >> 2) & 0x03030303u;
-            }
-            C[24] = lut[(wq[6] & 0xffu) * 32] & 0x03030303u;
-            C[25] = lut[((wq[6] >> 8) & 0xffu) * 32] & 0x03030303u;
-            const float ws = __half2float(__ushort_as_half((unsigned short)(wq[6] >> 16)));
+                for (int i = 0; i < 7; ++i) wq[i] = nw[i];
+                const bool more = b + G < nb;
 #pragma unroll
-            for (int j = 0; j < BMAX; ++j) {
-                if (j >= batch) break;
-                const int4* xb = XS ? xq + (size_t)b * kDpXsStride
-                                    : xq + ((size_t)j * nb + b) * (kBlockElems / 16);
-                int X[32];
-#pragma unroll
-                for (int v = 0; v < 8; ++v) {
-                    const int4 t = xb[v];
-                    X[4 * v] = t.x; X[4 * v + 1] = t.y; X[4 * v + 2] = t.z; X[4 * v + 3] = t.w;
-                }
-                int dot = 0;
+                for (int i = 0; i < 7; ++i)
+                    nw[i] = more ? __ldg(wrow + (size_t)(b + G) * 7 + i) : 0u;
+                unsigned C[26], E[6];
 #pragma unroll
                 for (int g = 0; g < 6; ++g) {
+                    unsigned L[4];
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) dot = __dp4a((int)C[4 * g + i], X[5 * g + i], dot);
-                    dot = __dp4a((int)E[g], X[5 * g + 4], dot);
+                    for (int i = 0; i < 4; ++i) {
+                        L[i] = lut[((wq[g] >> (8 * i)) & 0xffu) * 32];
+                        C[4 * g + i] = L[i] & 0x03030303u;
+                    }
+                    const unsigned lo = __byte_perm(L[0], L[1], 0x0040);
+                    const unsigned hi = __byte_perm(L[2], L[3], 0x0040);
+                    E[g] = (__byte_perm(lo, hi, 0x5410) >> 2) & 0x03030303u;
                 }
-                dot = __dp4a((int)C[24], X[30], dot);
-                dot = __dp4a((int)C[25], X[31], dot);
-                acc[j] += ws * xs[j * nb + b] * (float)(dot - xsum[j * nb + b]);
+                C[24] = lut[(wq[6] & 0xffu) * 32] & 0x03030303u;
+                C[25] = lut[((wq[6] >> 8) & 0xffu) * 32] & 0x03030303u;
+                const float ws = __half2float(__ushort_as_half((unsigned short)(wq[6] >> 16)));
+#pragma unroll
+                for (int j = 0; j < BMAX; ++j) {
+                    if (j >= batch) break;
+                    const int4* xb = XS ? xq + (size_t)b * kDpXsStride
+                                        : xq + ((size_t)j * nb + b) * (kBlockElems / 16);
+                    int X[32];
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) {
+                        const int4 t = xb[v];
+                        X[4 * v] = t.x; X[4 * v + 1] = t.y; X[4 * v + 2] = t.z; X[4 * v + 3] = t.w;
+                    }
+                    int dot = 0;
+#pragma unroll
+                    for (int g = 0; g < 6; ++g) {
+#pragma unroll
+                        for (int i = 0; i < 4; ++i)
+                            dot = __dp4a((int)C[4 * g + i], X[5 * g + i], dot);
+                        dot = __dp4a((int)E[g], X[5 * g + 4], dot);
+                    }
+                    dot = __dp4a((int)C[24], X[30], dot);
+                    dot = __dp4a((int)C[25], X[31], dot);
+                    acc[j] += ws * xs[j * nb + b] * (float)(dot - xsum[j * nb + b]);
+                }
             }
         }
-    }
 #pragma unroll
-    for (int j = 0; j < BMAX; ++j) {
+        for (int j = 0; j < BMAX; ++j) {
 #pragma unroll
-        for (int off = G / 2; off > 0; off >>= 1)
-            acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], off);
-        if (live && sub == 0 && j < batch) store_out<OutT>(y + (size_t)j * n_rows, row, acc[j]);
+            for (int off = G / 2; off > 0; off >>= 1)
+                acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], off);
+            if (live && sub == 0 && j < batch) store_out<OutT>(Y + (size_t)j * n_rows, row, acc[j]);
+        }
     }
 }
 
@@ -396,29 +433,61 @@ bool ptq1_xsmem_on() {
 }
 
 // Batch 1 with the activation staged. G=8 measured best or level on every Bonsai shape but the
-// 248320-row head, where 16 wins by ~3%.
+// 248320-row head, where 16 wins by ~3%. As many CTAs as fit at once and no more: the rest of
+// the row groups are walked by the same CTAs (see the kernel), each table built once.
+int num_sms_dp() {
+    static const int sms = [] {
+        int dev = 0, n = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        return n > 0 ? n : 170;
+    }();
+    return sms;
+}
+
+// SPARKINFER_PTQ1_DP4A_PERSIST=0: one row group per CTA and gate/up as two launches, for an A/B.
+bool ptq1_dp4a_persist_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_DP4A_PERSIST");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
 template <typename OutT, int G>
 void launch_dp4a_xs_g(const unsigned char* w, OutT* y, int n_rows, int k, int slot,
-                      cudaStream_t stream) {
+                      cudaStream_t stream, const unsigned char* w1 = nullptr,
+                      OutT* y1 = nullptr) {
+    auto kern = gemm_ptq1_dp4a_kernel<OutT, G, 1, true>;
     // Opted in once, up front, for the widest input: the table plus a 17408-wide activation is
     // past the 48 KB a launch gets without asking.
-    static const bool attr = [] {
-        cudaFuncSetAttribute(gemm_ptq1_dp4a_kernel<OutT, G, 1, true>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+    static const bool attr = [&] {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)dp_xs_smem(kDpMaxK / kBlockElems));
         return true;
     }();
     (void)attr;
-    const unsigned grid = (unsigned)((n_rows + kDpThreads / G - 1) / (kDpThreads / G));
-    gemm_ptq1_dp4a_kernel<OutT, G, 1, true><<<grid, kDpThreads, dp_xs_smem(k / kBlockElems),
-                                               stream>>>(w, y, n_rows, k, 1, slot);
+    const int nb = k / kBlockElems;
+    const size_t smem = dp_xs_smem(nb);
+    // Resident CTAs per SM for this width, asked once per width (host-side, no stream work).
+    static int occ_cache[kDpMaxK / kBlockElems + 1] = {};
+    int& occ = occ_cache[nb];
+    if (occ == 0 && (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, kDpThreads, smem) !=
+                         cudaSuccess || occ < 1)) {
+        cudaGetLastError();
+        occ = 1;
+    }
+    const int groups = (n_rows + kDpThreads / G - 1) / (kDpThreads / G) * (w1 ? 2 : 1);
+    const int cap = ptq1_dp4a_persist_on() ? num_sms_dp() * occ : groups;
+    const unsigned grid = (unsigned)(groups < cap ? groups : cap);
+    kern<<<grid, kDpThreads, smem, stream>>>(w, y, n_rows, k, 1, slot, w1, y1);
 }
 
 template <typename OutT>
 void launch_dp4a_xs(const unsigned char* w, OutT* y, int n_rows, int k, int slot,
-                    cudaStream_t stream) {
-    if (n_rows > 65536) launch_dp4a_xs_g<OutT, 16>(w, y, n_rows, k, slot, stream);
-    else                launch_dp4a_xs_g<OutT, 8>(w, y, n_rows, k, slot, stream);
+                    cudaStream_t stream, const unsigned char* w1 = nullptr, OutT* y1 = nullptr) {
+    if (n_rows > 65536) launch_dp4a_xs_g<OutT, 16>(w, y, n_rows, k, slot, stream, w1, y1);
+    else                launch_dp4a_xs_g<OutT, 8>(w, y, n_rows, k, slot, stream, w1, y1);
 }
 
 // A packed batch of rows against the decode shadow: gemm_ptq1_dp4a_kernel<OutT, 8, 1, true>'s
@@ -439,13 +508,7 @@ gemm_ptq1_dp4a_rows_kernel(const unsigned char* __restrict__ w, OutT* __restrict
     extern __shared__ int4 s_x[];   // BMAX * KC staged blocks, then their scales and sums
     float* s_xs = reinterpret_cast<float*>(s_x + BMAX * KC * kDpXsStride);
     int* s_xsum = reinterpret_cast<int*>(s_xs + BMAX * KC);
-    for (int e = threadIdx.x; e < 256; e += T) {
-        const unsigned v = dp_lut_entry(e);
-        const int4 v4 = make_int4((int)v, (int)v, (int)v, (int)v);
-        int4* dst = reinterpret_cast<int4*>(s_lut + e * 32);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) dst[(i + threadIdx.x) & 7] = v4;
-    }
+    dp_lut_fill<T>(s_lut);
 
     const int lane = threadIdx.x & 31;
     const unsigned* lut = s_lut + lane;
@@ -590,25 +653,24 @@ bool launch_dp4a(const __nv_bfloat16* x, const unsigned char* w, OutT* y, int n_
 constexpr int kRqBlock = 1024;
 constexpr int kRqThreads = 256;
 
-__global__ void __launch_bounds__(kRqThreads)
-ptq1_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y,
-                         const signed char* __restrict__ sign, float norm, int k, int slot) {
-    __shared__ float sh[kRqBlock];
+// The rotation and quant of one 1024-span, from the four values thread t holds (elements 4t..4t+3
+// of the span, already rounded to bf16 as the producer stored them). Every entry point below
+// reads its span its own way and hands the same four floats here, so y and the slot are the same
+// bits whichever produced them.
+__device__ __forceinline__ void ptq1_rotate_quant_span(const float x4[4], float* sh,
+                                                       const signed char* __restrict__ sign,
+                                                       __nv_bfloat16* __restrict__ y, float norm,
+                                                       int k, int slot) {
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    // blockIdx.y is the batch row: its own k-wide span of x and y and its own run of blocks in
-    // the slot, laid out as ptq1_dp_quant_kernel lays out row j. The sign vector is shared.
     const int span = blockIdx.x * kRqBlock;
     const size_t base = (size_t)blockIdx.y * k + span;
     float v[4];
     {
-        const uint2 raw = *reinterpret_cast<const uint2*>(x + base + 4 * t);
         const char4 sg = *reinterpret_cast<const char4*>(sign + span + 4 * t);
-        const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
-        const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
-        v[0] = __low2float(lo) * (float)sg.x;
-        v[1] = __high2float(lo) * (float)sg.y;
-        v[2] = __low2float(hi) * (float)sg.z;
-        v[3] = __high2float(hi) * (float)sg.w;
+        v[0] = x4[0] * (float)sg.x;
+        v[1] = x4[1] * (float)sg.y;
+        v[2] = x4[2] * (float)sg.z;
+        v[3] = x4[3] * (float)sg.w;
     }
     // Stages 0 and 1: element 4t+r pairs with r^1, then r^2; the low index keeps a+b.
     {
@@ -671,6 +733,163 @@ ptq1_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __r
         DP_XSUM(slot)[b] = sum;
         DP_XS(slot)[b] = a / 127.f;
     }
+}
+
+__device__ __forceinline__ void ld4_bf16_f(const __nv_bfloat16* p, float v[4]) {
+    const uint2 raw = *reinterpret_cast<const uint2*>(p);
+    const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
+    const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+    v[0] = __low2float(lo); v[1] = __high2float(lo);
+    v[2] = __low2float(hi); v[3] = __high2float(hi);
+}
+
+// blockIdx.y is the batch row: its own k-wide span of x and y and its own run of blocks in the
+// slot, laid out as ptq1_dp_quant_kernel lays out row j. The sign vector is shared.
+__global__ void __launch_bounds__(kRqThreads)
+ptq1_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y,
+                         const signed char* __restrict__ sign, float norm, int k, int slot) {
+    __shared__ float sh[kRqBlock];
+    float v[4];
+    ld4_bf16_f(x + (size_t)blockIdx.y * k + blockIdx.x * kRqBlock + 4 * threadIdx.x, v);
+    ptq1_rotate_quant_span(v, sh, sign, y, norm, k, slot);
+}
+
+// launch_prefill_swiglu's value, bf16(g / (1 + exp(-g)) * u) -- the same expression in the same
+// fast-math translation-unit flags -- rotated and quantized without the round trip through h.
+__global__ void __launch_bounds__(kRqThreads)
+ptq1_swiglu_rotate_quant_kernel(const __nv_bfloat16* __restrict__ gate,
+                                const __nv_bfloat16* __restrict__ up, __nv_bfloat16* __restrict__ y,
+                                const signed char* __restrict__ sign, float norm, int k, int slot) {
+    __shared__ float sh[kRqBlock];
+    const size_t off = (size_t)blockIdx.y * k + blockIdx.x * kRqBlock + 4 * threadIdx.x;
+    float g[4], u[4], v[4];
+    ld4_bf16_f(gate + off, g);
+    ld4_bf16_f(up + off, u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        v[i] = __bfloat162float(__float2bfloat16(g[i] / (1.f + __expf(-g[i])) * u[i]));
+    ptq1_rotate_quant_span(v, sh, sign, y, norm, k, slot);
+}
+
+// launch_add_rmsnorm2_q8 (one row) and then launch_ptq1_rotate_quant of its normed output, in one
+// launch of k/1024 CTAs. Every CTA forms the row's square sum itself, exactly as the one 640-thread
+// add_rmsnorm2_q8 CTA forms it: virtual thread v owns elements 8v..8v+7 and chains its squares
+// with FMAs, virtual warps fold with the same xor tree, and the per-warp partials are folded again
+// by that tree. Then each CTA writes its own span of the sum, the norm and the Q8_1 copy -- the
+// same values the norm kernel writes -- and rotates and quantizes the normed span it holds.
+struct dp_blk_q8_1 { __half2 ds; signed char qs[32]; };
+__device__ __forceinline__ float dp_warp_sum(float v) {
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+    return v;
+}
+__device__ __forceinline__ void dp_unpack8(const uint4& p, float out[8]) {
+    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&p);
+#pragma unroll
+    for (int j = 0; j < 8; j++) out[j] = __bfloat162float(h[j]);
+}
+__global__ void __launch_bounds__(kRqThreads)
+ptq1_add_norm_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x,
+                                  const __nv_bfloat16* __restrict__ residual,
+                                  const __nv_bfloat16* __restrict__ weight,
+                                  __nv_bfloat16* __restrict__ out_sum,
+                                  __nv_bfloat16* __restrict__ out_norm,
+                                  dp_blk_q8_1* __restrict__ out_q8, float eps,
+                                  __nv_bfloat16* __restrict__ y,
+                                  const signed char* __restrict__ sign,
+                                  float norm, int k, int slot) {
+    __shared__ float sh[kRqBlock];
+    __shared__ float s_warp[32];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int nvw = k / 256;   // add_rmsnorm2_q8's warps: k/8 threads
+    constexpr int kVw = 8192 / 256 / (kRqThreads / 32);   // virtual warps per real warp, at most
+    const uint4* x8 = reinterpret_cast<const uint4*>(x);
+    const uint4* r8 = reinterpret_cast<const uint4*>(residual);
+    // Every global read this CTA makes is issued before any of them is waited on: the square sum's
+    // packs, and this thread's own four values of x, the residual and the norm weight.
+    uint4 xp[kVw], rp[kVw];
+#pragma unroll
+    for (int i = 0; i < kVw; ++i) {
+        const int vw = warp + i * (kRqThreads / 32);
+        if (vw < nvw) { xp[i] = __ldg(x8 + vw * 32 + lane); rp[i] = __ldg(r8 + vw * 32 + lane); }
+    }
+    const int e0 = blockIdx.x * kRqBlock + 4 * t;
+    float xv[4], rv[4], wv[4], bv[4], sv[4];
+    ld4_bf16_f(x + e0, xv);
+    ld4_bf16_f(residual + e0, rv);
+    ld4_bf16_f(weight + e0, wv);
+#pragma unroll
+    for (int i = 0; i < kVw; ++i) {
+        const int vw = warp + i * (kRqThreads / 32);
+        if (vw < nvw) {
+            float xs8[8], rs8[8];
+            dp_unpack8(xp[i], xs8);
+            dp_unpack8(rp[i], rs8);
+            float ss = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float v = xs8[j] + rs8[j];
+                ss = __fmaf_rn(v, v, ss);
+            }
+            ss = dp_warp_sum(ss);
+            if (lane == 0) s_warp[vw] = ss;
+        }
+    }
+    __syncthreads();
+    float red = lane < nvw ? s_warp[lane] : 0.f;
+    red = dp_warp_sum(red);
+    const float inv_rms = rsqrtf(red / k + eps);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        sv[j] = xv[j] + rv[j];
+        const float svb = __bfloat162float(__float2bfloat16(sv[j]));
+        bv[j] = __bfloat162float(__float2bfloat16(svb * inv_rms * wv[j]));
+    }
+    {
+        __nv_bfloat162 s01 = __floats2bfloat162_rn(sv[0], sv[1]);
+        __nv_bfloat162 s23 = __floats2bfloat162_rn(sv[2], sv[3]);
+        __nv_bfloat162 n01 = __floats2bfloat162_rn(bv[0], bv[1]);
+        __nv_bfloat162 n23 = __floats2bfloat162_rn(bv[2], bv[3]);
+        uint2 so, no;
+        so.x = *reinterpret_cast<unsigned*>(&s01); so.y = *reinterpret_cast<unsigned*>(&s23);
+        no.x = *reinterpret_cast<unsigned*>(&n01); no.y = *reinterpret_cast<unsigned*>(&n23);
+        *reinterpret_cast<uint2*>(out_sum + e0) = so;
+        *reinterpret_cast<uint2*>(out_norm + e0) = no;
+    }
+    if (out_q8) {
+        // Q8_1 of the bf16-rounded norm: a 32-block is 8 consecutive threads here.
+        float amax = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) amax = fmaxf(amax, fabsf(bv[j]));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+        const float d = amax / 127.0f;
+        int s = 0;
+        unsigned word = 0;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int qi = (amax == 0.0f) ? 0 : (int)roundf(bv[j] / d);
+            s += qi;
+            word |= ((unsigned)(unsigned char)(signed char)qi) << (8 * j);
+        }
+        dp_blk_q8_1* blk = out_q8 + (e0 >> 5);
+        reinterpret_cast<unsigned*>(blk->qs)[(t & 7)] = word;
+        s += __shfl_xor_sync(0xffffffffu, s, 1);
+        s += __shfl_xor_sync(0xffffffffu, s, 2);
+        s += __shfl_xor_sync(0xffffffffu, s, 4);
+        if ((t & 7) == 0) blk->ds = __floats2half2_rn(d, d * (float)s);
+    }
+    ptq1_rotate_quant_span(bv, sh, sign, y, norm, k, slot);
+}
+
+// SPARKINFER_PTQ1_FUSE=0 keeps the norm and the SwiGLU as launches of their own, for an A/B.
+bool ptq1_fuse_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_FUSE");
+        return !(e && e[0] == '0');
+    }();
+    return v;
 }
 
 // SPARKINFER_PTQ1_ROTQ=0 keeps the separate rotation and per-GEMV quant, for an A/B.
@@ -874,6 +1093,37 @@ int launch_ptq1_rotate_quant(const void* x_bf16, void* y_bf16, const signed char
     return slot;
 }
 
+int launch_ptq1_swiglu_rotate_quant(const void* gate_bf16, const void* up_bf16, void* y_bf16,
+                                    const signed char* sign, int k, int block,
+                                    cudaStream_t stream) {
+    if (!ptq1_fuse_on() || !ptq1_rotq_on() || !ptq1_dp4a_on() || !g_dp_mem ||
+        block != kRqBlock || k <= 0 || k % kRqBlock != 0 || k > kDpMaxK)
+        return -1;
+    const int slot = next_dp_slot();
+    ptq1_swiglu_rotate_quant_kernel<<<(unsigned)(k / kRqBlock), kRqThreads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(up_bf16), reinterpret_cast<__nv_bfloat16*>(y_bf16),
+        sign, rsqrtf((float)block), k, slot);
+    return slot;
+}
+
+int launch_ptq1_add_norm_rotate_quant(const void* x, const void* residual, const void* weight,
+                                      void* out_sum, void* out_norm, void* out_q8, float eps,
+                                      void* y_bf16, const signed char* sign, int k, int block,
+                                      cudaStream_t stream) {
+    // k/8 threads of add_rmsnorm2_q8 in whole warps, and at most 32 of them.
+    if (!ptq1_fuse_on() || !ptq1_rotq_on() || !ptq1_dp4a_on() || !g_dp_mem ||
+        block != kRqBlock || k <= 0 || k % kRqBlock != 0 || k > 8192)
+        return -1;
+    const int slot = next_dp_slot();
+    ptq1_add_norm_rotate_quant_kernel<<<(unsigned)(k / kRqBlock), kRqThreads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(residual),
+        reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out_sum),
+        reinterpret_cast<__nv_bfloat16*>(out_norm), reinterpret_cast<dp_blk_q8_1*>(out_q8), eps,
+        reinterpret_cast<__nv_bfloat16*>(y_bf16), sign, rsqrtf((float)block), k, slot);
+    return slot;
+}
+
 int launch_ptq1_rotate_quant_rows(const void* x_bf16, void* y_bf16, const signed char* sign, int k,
                                   int batch, int block, cudaStream_t stream) {
     if (!ptq1_rotq_on() || !ptq1_dp4a_on() || !g_dp_mem || block != kRqBlock || k <= 0 ||
@@ -909,6 +1159,23 @@ void launch_gemv_ptq1_q(int handle, const void* x_bf16, const void* w_ptq1, void
                         int n_rows, int k, cudaStream_t stream) {
     launch_gemv_q_typed<__nv_bfloat16>(handle, x_bf16, w_ptq1,
                                        reinterpret_cast<__nv_bfloat16*>(y_bf16), n_rows, k, stream);
+}
+
+void launch_gemv_ptq1_q2(int handle, const void* x_bf16, const void* w0, const void* w1,
+                         void* y0_bf16, void* y1_bf16, int n_rows, int k, cudaStream_t stream) {
+    auto* y0 = reinterpret_cast<__nv_bfloat16*>(y0_bf16);
+    auto* y1 = reinterpret_cast<__nv_bfloat16*>(y1_bf16);
+    if (handle >= 0 && k > 0 && k % kBlockElems == 0 && k <= kDpMaxK && n_rows > 0 &&
+        n_rows <= 65536 &&
+        ((reinterpret_cast<uintptr_t>(w0) | reinterpret_cast<uintptr_t>(w1)) & 3) == 0 &&
+        ptq1_xsmem_on() && ptq1_dp4a_persist_on()) {
+        launch_dp4a_xs<__nv_bfloat16>(reinterpret_cast<const unsigned char*>(w0), y0, n_rows, k,
+                                      handle, stream, reinterpret_cast<const unsigned char*>(w1),
+                                      y1);
+        return;
+    }
+    launch_gemv_q_typed<__nv_bfloat16>(handle, x_bf16, w0, y0, n_rows, k, stream);
+    launch_gemv_q_typed<__nv_bfloat16>(handle, x_bf16, w1, y1, n_rows, k, stream);
 }
 
 void launch_gemv_ptq1_q_f32(int handle, const void* x_bf16, const void* w_ptq1, float* y_f32,

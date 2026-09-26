@@ -52,6 +52,22 @@ void launch_gemv_ptq1_q(int handle, const void* x_bf16, const void* w_ptq1, void
                         int n_rows, int k, cudaStream_t stream);
 void launch_gemv_ptq1_q_f32(int handle, const void* x_bf16, const void* w_ptq1, float* y_f32,
                             int n_rows, int k, cudaStream_t stream);
+// launch_prefill_swiglu(gate, up) followed by launch_ptq1_rotate_quant of the result, in one
+// launch: y is the rotated bf16 SwiGLU and the handle is the same int8 copy. -1: not taken.
+int launch_ptq1_swiglu_rotate_quant(const void* gate_bf16, const void* up_bf16, void* y_bf16,
+                                    const signed char* sign, int k, int block,
+                                    cudaStream_t stream);
+// launch_add_rmsnorm2_q8(x, residual, weight -> out_sum, out_norm, out_q8) for one row followed by
+// launch_ptq1_rotate_quant(out_norm -> y), in one launch, every output bit-identical to the pair.
+// out_q8 may be null. -1: not taken (k past 8192 or not a multiple of the 1024 span).
+int launch_ptq1_add_norm_rotate_quant(const void* x, const void* residual, const void* weight,
+                                      void* out_sum, void* out_norm, void* out_q8, float eps,
+                                      void* y_bf16, const signed char* sign, int k, int block,
+                                      cudaStream_t stream);
+// Two matrices of one shape against the same handle (gate and up) in one launch; each output is
+// what launch_gemv_ptq1_q writes for it.
+void launch_gemv_ptq1_q2(int handle, const void* x_bf16, const void* w0, const void* w1,
+                         void* y0_bf16, void* y1_bf16, int n_rows, int k, cudaStream_t stream);
 // The same pair over `batch` rows of x (row j at x + j*k), each row rotated and quantized exactly
 // as launch_ptq1_rotate_quant does it alone, and a GEMM whose row j is bit-identical to
 // launch_gemv_ptq1_q on that row. So a packed batch can read the decode shadow and still decode

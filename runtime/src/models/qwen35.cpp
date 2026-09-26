@@ -2504,6 +2504,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             dbg_bf16(s.ao, H, 40, L);   // tag 40: attn_o_proj output (post wo)
         }
 
+        // This layer's FFN is the decode shadow's all-ternary dense SwiGLU (the branch below that
+        // reads gate, up and down through the dp4a GEMV).
+        const bool ffn_t3 = dec_shadow && c.dense_ffn && c.top_k == 1 && s.bonsai_ffn_h &&
+                            s.bonsai_rot_hn && s.bonsai_sign_h && s.bonsai_sign_ffn &&
+                            w.gate_qtype == kPtq1GgmlType && w.up_qtype == kPtq1GgmlType &&
+                            w.down_qtype == kPtq1GgmlType;
+        int ffn_hq = -1;
         if (c.muse_glimmer) {
             // Sandwich norm: h = x + RMSNorm(ao) * post_attn_norm (norm the attention
             // output alone, not the sum -- see launch_norm_then_add), then hn = RMSNorm(h,
@@ -2537,7 +2544,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // fused: h = x + ao ; hn = RMSNorm(h, post_attn_norm). When fnq, also emit
             // Q8_1(hn) into aq81 so the MoE gate/up mmvq skips its own quantize node (the
             // router below reads bf16 hn).
-            kernels::launch_add_rmsnorm2_q8(s.x, s.ao, w.post_attn_norm, s.h, s.hn, s.aq81, H, c.rms_eps, st);
+            //
+            // The decode shadow's ternary FFN reads hn rotated and quantized; the norm launch
+            // does that too, and hands the FFN its handle (same bits as the pair of launches).
+            if (ffn_t3)
+                ffn_hq = kernels::launch_ptq1_add_norm_rotate_quant(
+                    s.x, s.ao, w.post_attn_norm, s.h, s.hn, s.aq81, c.rms_eps, s.bonsai_rot_hn,
+                    s.bonsai_sign_h, (int)H, (int)s.bonsai_block, st);
+            if (ffn_hq < 0)
+                kernels::launch_add_rmsnorm2_q8(s.x, s.ao, w.post_attn_norm, s.h, s.hn, s.aq81, H,
+                                                c.rms_eps, st);
             dbg_bf16(s.h, H, 50, L);
             dbg_bf16(s.hn, H, 51, L);
         } else {
@@ -2683,13 +2699,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             if (w.gate_qtype == kPtq1GgmlType && w.up_qtype == kPtq1GgmlType &&
                 w.down_qtype == kPtq1GgmlType && s.bonsai_ffn_h && c.top_k == 1) {
                 if (dec_shadow) {
-                    // Gate and up share one int8 copy of the rotated hn, made by the rotation.
-                    const int hq = kernels::launch_ptq1_rotate_quant(
+                    // Gate and up share one int8 copy of the rotated hn, made by the rotation
+                    // (or already by the post-attention norm).
+                    const int hq = ffn_hq >= 0 ? ffn_hq : kernels::launch_ptq1_rotate_quant(
                         s.hn, s.bonsai_rot_hn, s.bonsai_sign_h, (int)H, (int)s.bonsai_block, st);
-                    kernels::launch_gemv_ptq1_q(hq, s.bonsai_rot_hn, w.gate_q, s.bonsai_ffn_gate,
-                                                c.moe_ffn, H, st);
-                    kernels::launch_gemv_ptq1_q(hq, s.bonsai_rot_hn, w.up_q, s.bonsai_ffn_up,
-                                                c.moe_ffn, H, st);
+                    kernels::launch_gemv_ptq1_q2(hq, s.bonsai_rot_hn, w.gate_q, w.up_q,
+                                                 s.bonsai_ffn_gate, s.bonsai_ffn_up, c.moe_ffn, H,
+                                                 st);
                 } else {
                     kernels::launch_hadamard_rotate_bf16(s.hn, s.bonsai_rot_hn, s.bonsai_sign_h,
                                                          H, (int)H, (int)s.bonsai_block, st);
@@ -2698,10 +2714,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.up_q, s.bonsai_ffn_up,
                                               c.moe_ffn, H, st);
                 }
-                kernels::launch_prefill_swiglu(s.bonsai_ffn_gate, s.bonsai_ffn_up,
-                                               s.bonsai_ffn_h, c.moe_ffn, st);
+                // The shadow's down reads SwiGLU's output rotated and quantized: one launch
+                // forms, rotates and quantizes it (same bits as SwiGLU and then the rotation).
+                const int fq_fused = dec_shadow ? kernels::launch_ptq1_swiglu_rotate_quant(
+                                                      s.bonsai_ffn_gate, s.bonsai_ffn_up,
+                                                      s.bonsai_ffn_h, s.bonsai_sign_ffn,
+                                                      (int)c.moe_ffn, (int)s.bonsai_block, st)
+                                                : -1;
+                if (fq_fused < 0)
+                    kernels::launch_prefill_swiglu(s.bonsai_ffn_gate, s.bonsai_ffn_up,
+                                                   s.bonsai_ffn_h, c.moe_ffn, st);
                 if (dec_shadow) {
-                    const int fq = kernels::launch_ptq1_rotate_quant(
+                    const int fq = fq_fused >= 0 ? fq_fused : kernels::launch_ptq1_rotate_quant(
                         s.bonsai_ffn_h, s.bonsai_ffn_h, s.bonsai_sign_ffn, (int)c.moe_ffn,
                         (int)s.bonsai_block, st);
                     kernels::launch_gemv_ptq1_q(fq, s.bonsai_ffn_h, w.down_q, s.routed, H,
