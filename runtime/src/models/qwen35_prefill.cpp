@@ -22,6 +22,7 @@
 #include "sparkinfer/kernels/scratch_epoch.h"
 #include "sparkinfer/device_health.h"
 #include "sparkinfer/kernels/quant.h"
+#include "sparkinfer/kernels/dequant_gguf_fast.h"
 #include "sparkinfer/kernels/qtype.h"
 #include "sparkinfer/kernels/compressed_tensors.h"
 #include "sparkinfer/kernels/gemm.h"
@@ -2233,6 +2234,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         kernels::launch_embedding_ptq1_unrotate(
             d_ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_sign_hidden),
             x, N, H, s.bonsai_block, st);
+    } else if (s.w.embed_type == 12) {
+        kernels::launch_embedding_q4k(d_ids, s.w.embed_tokens, x, N, H, st);
     } else {
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
     }
@@ -5274,6 +5277,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         kernels::launch_embedding_ptq1_unrotate(
             ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_sign_hidden),
             x, N, H, s.bonsai_block, st);
+    } else if (s.w.embed_type == 12) {
+        kernels::launch_embedding_q4k(ids, s.w.embed_tokens, x, N, H, st);
     } else {
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
     }

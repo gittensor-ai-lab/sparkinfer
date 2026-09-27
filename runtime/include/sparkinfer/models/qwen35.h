@@ -183,6 +183,7 @@ struct Qwen35LayerWeights {
 
 struct Qwen35Weights {
     const void* embed_tokens = nullptr;  // [vocab, hidden]
+    int embed_type = 0;                   // 0 = bf16 table; 12 = kept in its Q4_K blocks
     const void* final_norm   = nullptr;  // [hidden]
     const void* lm_head      = nullptr;  // [hidden, vocab]  (pre-transposed)
     int lm_head_type = 0;                 // 0 = bf16; else ggml type -> on-read quantized GEMV

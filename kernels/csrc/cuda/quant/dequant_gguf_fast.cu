@@ -63,15 +63,10 @@ __device__ __forceinline__ float dqf_h2f(const unsigned char* p) {
     __half h; *((unsigned short*)&h) = *(const unsigned short*)p; return __half2float(h);
 }
 
-// One warp per 256-value super-block; one 16-byte coalesced store per lane.
-__global__ void deq_q4k_coalesced_kernel(const unsigned char* __restrict__ src,
-                                         __nv_bfloat16* __restrict__ y, long nblocks) {
-    const long gtid = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long b    = gtid >> 5;                 // warp id == super-block index
-    if (b >= nblocks) return;
-    const int lane = (int)(gtid & 31);
-
-    const unsigned char* blk = src + b * 144;
+// Outputs [lane*8, lane*8 + 8) of one 256-value super-block, as eight packed bf16. Shared by the
+// dequant below and the embedding gather, so a row gathered from the blocks is the row this
+// dequant writes, bit for bit.
+__device__ __forceinline__ uint4 deq_q4k_lane8(const unsigned char* __restrict__ blk, int lane) {
     const float d    = dqf_h2f(blk);
     const float dmin = dqf_h2f(blk + 2);
     const unsigned char* sc = blk + 4;
@@ -102,8 +97,31 @@ __global__ void deq_q4k_coalesced_kernel(const unsigned char* __restrict__ src,
         const int nib = half ? (qb >> 4) : (qb & 0xF);
         out[t] = __float2bfloat16(dd * nib - mm);
     }
+    return *reinterpret_cast<const uint4*>(out);
+}
+
+// One warp per 256-value super-block; one 16-byte coalesced store per lane.
+__global__ void deq_q4k_coalesced_kernel(const unsigned char* __restrict__ src,
+                                         __nv_bfloat16* __restrict__ y, long nblocks) {
+    const long gtid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long b    = gtid >> 5;                 // warp id == super-block index
+    if (b >= nblocks) return;
+    const int lane = (int)(gtid & 31);
     // 16-byte aligned: y is a cudaMalloc'd base, block stride is 256 bf16 (512 B), lane stride 16 B.
-    *reinterpret_cast<uint4*>(y + b * 256 + n0) = *reinterpret_cast<const uint4*>(out);
+    *reinterpret_cast<uint4*>(y + b * 256 + lane * 8) = deq_q4k_lane8(src + b * 144, lane);
+}
+
+// out[t,:] = dequant(table row ids[t]): one warp per (token, super-block) of the gathered rows.
+__global__ void embedding_q4k_kernel(const int* __restrict__ ids,
+                                     const unsigned char* __restrict__ table,
+                                     __nv_bfloat16* __restrict__ out, int nsb, long nwarps) {
+    const long gtid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long w    = gtid >> 5;
+    if (w >= nwarps) return;
+    const int lane = (int)(gtid & 31);
+    const long t = w / nsb, sb = w - t * nsb;
+    const unsigned char* blk = table + ((size_t)ids[t] * nsb + sb) * 144;
+    *reinterpret_cast<uint4*>(out + (size_t)w * 256 + lane * 8) = deq_q4k_lane8(blk, lane);
 }
 
 }  // namespace
@@ -124,6 +142,17 @@ bool launch_gguf_dequant_fast(int ggml_type, const void* src, void* dst_bf16, lo
         reinterpret_cast<const unsigned char*>(src),
         reinterpret_cast<__nv_bfloat16*>(dst_bf16), nb);
     return true;
+}
+
+void launch_embedding_q4k(const int* ids, const void* table_q4k, void* out_bf16, int n_tokens,
+                          int hidden, cudaStream_t stream) {
+    const int nsb = hidden / 256;
+    const long nwarps = (long)n_tokens * nsb;
+    if (nwarps <= 0) return;
+    const int T = 256;
+    embedding_q4k_kernel<<<(unsigned)((nwarps * 32 + T - 1) / T), T, 0, stream>>>(
+        ids, reinterpret_cast<const unsigned char*>(table_q4k),
+        reinterpret_cast<__nv_bfloat16*>(out_bf16), nsb, nwarps);
 }
 
 }  // namespace kernels

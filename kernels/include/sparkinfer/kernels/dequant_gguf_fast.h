@@ -31,5 +31,11 @@ namespace kernels {
 bool launch_gguf_dequant_fast(int ggml_type, const void* src, void* dst_bf16, long n_values,
                               cudaStream_t stream = nullptr);
 
+// Token embedding gathered straight from a Q4_K table: out[t,:] = dequant(table row ids[t]), each
+// row bit-identical to what the dequant above writes for it. table: [vocab, hidden] in Q4_K
+// blocks, hidden % 256 == 0; out: [n_tokens, hidden] bf16, 16-byte aligned.
+void launch_embedding_q4k(const int* ids, const void* table_q4k, void* out_bf16, int n_tokens,
+                          int hidden, cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace sparkinfer

@@ -45,6 +45,7 @@
 #include "sparkinfer/kernels/deterministic.h"
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/quant.h"
+#include "sparkinfer/kernels/dequant_gguf_fast.h"
 #include "sparkinfer/kernels/qtype.h"
 #include "sparkinfer/kernels/proj_requant.h"
 #include "sparkinfer/kernels/prefill_nvfp4.h"
@@ -816,6 +817,9 @@ struct Qwen35Model::Impl {
     bf16* bonsai_rot = nullptr;                        // scratch for one rotated activation
     long bonsai_rot_elems = 0;
     bool bonsai_embed_native = false;                  // token_embd left in its ternary blocks
+    // w.embed_type != 0: the bf16 expansion of the table, made on the first embed_weights() --
+    // only a borrower that reads bf16 rows (the DFlash draft) ever asks for it.
+    void* embed_bf16 = nullptr;
     // The layer's normed input, rotated once on the main stream before the projections fan out
     // across stream_k/stream_v. Rotating inside each projection would race: they run concurrently
     // and would share one scratch. Written where s.xn is, so s.xn's own visibility carries it.
@@ -1762,6 +1766,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         kernels::launch_embedding_ptq1_unrotate(s.d_tok, s.w.embed_tokens,
                                                 static_cast<const signed char*>(it->second),
                                                 s.x, 1, H, (int)s.bonsai_block, st);
+    } else if (s.w.embed_type == 12) {
+        kernels::launch_embedding_q4k(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
     } else {
         kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
     }
@@ -4775,7 +4781,22 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     return out;
 }
 
-const void* Qwen35Model::embed_weights() const { return p_->w.embed_tokens; }
+const void* Qwen35Model::embed_weights() const {
+    auto& s = *p_;
+    if (s.w.embed_type == 0) return s.w.embed_tokens;
+    if (!s.embed_bf16) {
+        const size_t n = (size_t)s.cfg.vocab * s.cfg.hidden;
+        if (cudaMalloc(&s.embed_bf16, n * sizeof(bf16)) != cudaSuccess) {
+            s.embed_bf16 = nullptr;
+            return nullptr;
+        }
+        kernels::launch_gguf_dequant(s.w.embed_type, s.w.embed_tokens, s.embed_bf16, (long)n,
+                                     s.stream);
+        cudaStreamSynchronize(s.stream);
+        s.owned.push_back(s.embed_bf16);
+    }
+    return s.embed_bf16;
+}
 const void* Qwen35Model::lm_head_weights() const { return p_->w.lm_head; }
 int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
 
@@ -7021,7 +7042,29 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             cudaFree(d);
         }
     }
-    if (!s.bonsai_embed_native)
+    // Muse Glimmer's table stays in its Q4_K blocks: 0.76 GB instead of a 2.69 GB bf16 expansion,
+    // and the lookup dequantizes only the rows it gathers, with the load dequant's own arithmetic
+    // (same bf16 bits). The 1.93 GB it frees is what the batched prefill's kept NVFP4 down/o
+    // operands (MuseStreamCache) are sized from, so fewer layers are re-converted every pass.
+    // SPARKINFER_MUSE_EMBED_Q4K=0 restores the bf16 table (A/B in ONE binary).
+    static const bool muse_embed_q4k = [] {
+        const char* e = getenv("SPARKINFER_MUSE_EMBED_Q4K");
+        return !(e && e[0] == '0');
+    }();
+    if (const GGUFTensor* emb_t = g.tensor("token_embd.weight");
+        !s.bonsai_embed_native && muse_embed_q4k && c.muse_glimmer && emb_t &&
+        emb_t->ggml_type == 12 && emb_t->dims[0] == H && (H % 256) == 0) {
+        void* d = nullptr;
+        if (cudaMalloc(&d, emb_t->n_bytes) == cudaSuccess &&
+            cudaMemcpy(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            s.owned.push_back(d);
+            s.w.embed_tokens = d;
+            s.w.embed_type = 12;
+        } else {
+            cudaFree(d);
+        }
+    }
+    if (!s.bonsai_embed_native && !s.w.embed_type)
         s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
     s.w.final_norm   = dense("output_norm.weight", false);
     const char* lm = g.tensor("output.weight") ? "output.weight" : "token_embd.weight";  // tied fallback
