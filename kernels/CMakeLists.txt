@@ -97,7 +97,8 @@ if(BUILD_NVFP4_KERNELS)
     # rest of the build keeps the architecture list it was configured with. The entry points are
     # host functions, and prefill_nvfp4_supported() gates on cc 12.0 at runtime, so a non-Blackwell
     # device simply never calls in.
-    add_library(si_nvfp4 STATIC csrc/cuda/fused/prefill_nvfp4_sm120.cu)
+    add_library(si_nvfp4 STATIC csrc/cuda/fused/prefill_nvfp4_sm120.cu
+                         csrc/cuda/fused/prefill_ptq1_fp4_sm120.cu)
     target_include_directories(si_nvfp4 PRIVATE include
         ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
     target_compile_options(si_nvfp4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
@@ -105,7 +106,8 @@ if(BUILD_NVFP4_KERNELS)
         CUDA_ARCHITECTURES "120a"
         CUDA_SEPARABLE_COMPILATION OFF
         POSITION_INDEPENDENT_CODE ON)
-    # Compiles out the linkable fallbacks in prefill_nvfp4.cu, which si_fused owns.
+    # Compiles out the linkable fallbacks in prefill_nvfp4.cu and prefill_ptq1_fp4.cu, which si_fused
+    # owns.
     target_compile_definitions(si_fused PRIVATE SPARKINFER_BUILD_NVFP4=1)
     list(APPEND SPARKINFER_KERNEL_LIBS si_nvfp4)
 endif()

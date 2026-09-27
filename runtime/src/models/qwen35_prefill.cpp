@@ -13,6 +13,7 @@
 
 #include "qwen35_prefill.h"
 #include "sparkinfer/kernels/ternary.h"
+#include "sparkinfer/kernels/prefill_ptq1_fp4.h"
 #include "sparkinfer/ternary_ptq1.h"
 #include "sparkinfer/kernels/hadamard.h"
 #include "sparkinfer/kernels/prefill.h"
@@ -2002,11 +2003,40 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         a_q = nullptr;   // A_i8 now holds the ROTATED activation: no memo may reuse it
         return true;
     };
+    // The same ternary legs where the fused GEMM takes the pass, on the FP4 tensor cores: the input
+    // rotated as trotq rotates it but quantized to NVFP4 into A_i8 (sfp4_act; up set: SwiGLU's
+    // output, as the down leg reads it), then launch_ptq1_fp4_gemm decodes the stored blocks to
+    // e2m1 in shared memory -- twice the int8 MMA's rate, at the same 0.21875 bytes/weight.
+    // SPARKINFER_PREFILL_TERNARY_FP4_SMALL=0 keeps the int8 legs.
+    static const bool sfp4_env = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_TERNARY_FP4_SMALL");
+        return !(e && e[0] == '0');
+    }();
+    auto sfp4_act = [&](const bf16* A, const bf16* U, const void* sign, int R, int K) -> bool {
+        if (!sfp4_env || !use_i8 || !A_i8 || !sign || !qb_dense_pass ||
+            R > kernels::pf_dense_gemm_qi8_max_m() || s.bonsai_block != 1024 || (K % 1024) ||
+            kernels::ptq1_fp4_act_bytes(R, K) > a_i8_sz ||
+            !kernels::launch_ptq1_rotq_fp4(A, U, static_cast<const signed char*>(sign), A_i8, R,
+                                           K, s.bonsai_block, st))
+            return false;
+        a_q = nullptr; a_pk = false;   // A_i8 now holds FP4 operands: no int8 memo may reuse it
+        return true;
+    };
+    auto sfp4_gemm = [&](int R, int K, const void* const* W, void* const* C, const int* n, int nl,
+                         bool resid) -> bool {
+        return kernels::launch_ptq1_fp4_gemm(A_i8, R, K, W, C, n, nl, resid,
+                                             reinterpret_cast<float*>(qb_partials),
+                                             qb_partials ? qb_partials_cap : 0, st);
+    };
     // A ternary leg with the residual folded into its split-K reduce (1), or where the GEMM does
     // not split, into C for the caller's add (2). 0: nothing written, the caller runs the folded
     // leg (its quantize redoes A_i8, the memo having been cleared).
     auto tproj_resid = [&](const bf16* A, const void* sign, const void* W, const float* rs,
                            bf16* X, bf16* C, int n_out, int K) -> int {
+        if (W && sfp4_act(A, nullptr, sign, N, K)) {
+            void* Xc = X;
+            if (sfp4_gemm(N, K, &W, &Xc, &n_out, 1, true)) return 1;
+        }
         if (!W || !rs || !trotq(A, sign, K)) return 0;
         if (kernels::launch_prefill_gemm_qi8_dense_resid(kPtq1GgmlType, A_i8, sx, W, rs, X, N,
                                                          n_out, K, st, qb_partials, QB_SPLITS,
@@ -2085,6 +2115,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 return !(e && e[0] == '0');
             }();
             bool gdn_grouped = false;
+            // FP4: qkv and z in one launch (z_pending left unset, so the caller does not run z).
+            if (gt && (tproj_mask & 8) && !norm_deferred && gt->wqkv_type == kPtq1GgmlType &&
+                gt->wqkv_gate_type == kPtq1GgmlType && sfp4_act(A, nullptr, s.bonsai_sign_hidden, N, H)) {
+                const void* Wt[2] = { gt->wqkv, gt->wqkv_gate };
+                void*       Ct[2] = { b8, lz };
+                const int   nt[2] = { lqkv, lvdim };
+                if (sfp4_gemm(N, H, Wt, Ct, nt, 2, false)) return;
+            }
             if (gt && grs && grs->wqkv && grs->wqkv_gate && (tproj_mask & 8) && !norm_deferred &&
                 gt->wqkv_type == kPtq1GgmlType && gt->wqkv_gate_type == kPtq1GgmlType &&
                 trotq(A, s.bonsai_sign_hidden, H)) {
@@ -2499,6 +2537,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                                        w.wv_fp4_alpha))
                     qkv_fp4 = true;
                 bool grouped = qkv_fp4;
+                if (!grouped && tl && (tproj_mask & 1) && !attn_norm_deferred &&
+                    tl->wq_type == kPtq1GgmlType && tl->wk_type == kPtq1GgmlType &&
+                    tl->wv_type == kPtq1GgmlType && sfp4_act(xn, nullptr, s.bonsai_sign_hidden, N, H)) {
+                    const void* Wa[3] = { tl->wq, tl->wk, tl->wv };
+                    void*       Ca[3] = { b8, kf, vf };
+                    const int   na[3] = { wide, kvdim, kvdim };
+                    grouped = sfp4_gemm(N, H, Wa, Ca, na, 3, false);
+                }
                 if (!grouped && tl && (tproj_mask & 1) && !attn_norm_deferred && trs->wq &&
                     trs->wk && trs->wv && tl->wq_type == kPtq1GgmlType &&
                     tl->wk_type == kPtq1GgmlType && tl->wv_type == kPtq1GgmlType &&
@@ -2893,6 +2939,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // h = bf16(silu(g) * u) into ffg instead of gate and up separately; *h_out says it did.
             auto tgu_gate_up = [&](const bf16* hin, int rows_c, int* fused_out,
                                    bool* h_out = nullptr) {
+                if (sfp4_act(hin, nullptr, s.bonsai_sign_hidden, rows_c, H)) {
+                    const void* Wf[2] = { gate_pf, up_pf };
+                    void*       Cf[2] = { ffg, ffu };
+                    const int   nf[2] = { ffn, ffn };
+                    if (sfp4_gemm(rows_c, H, Wf, Cf, nf, 2, false)) return;
+                }
                 signed char* const qp = apk_dst(rows_c, H);
                 kernels::launch_ptq1_rotq_rows_i8(
                     hin, static_cast<const signed char*>(s.bonsai_sign_hidden), A_i8, sx, qp,
@@ -3098,6 +3150,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         const char* e = getenv("SPARKINFER_PREFILL_TERNARY_DOWN");
                         return !(e && e[0] == '0');
                     }();
+                    if (tdown_env && t_gu && !gu_fused_swiglu && fn == N && !ffn_fused &&
+                        !c.muse_glimmer && tl && tl->down_q && tl->down_qtype == kPtq1GgmlType &&
+                        sfp4_act(ffg, ffu, s.bonsai_sign_ffn, fn, ffn)) {
+                        const void* Wd = tl->down_q;
+                        void*       Cd = x;
+                        if (sfp4_gemm(fn, ffn, &Wd, &Cd, &H, 1, true)) {
+                            down_resid = true;
+                            continue;
+                        }
+                    }
                     if (tdown_env && t_gu && !gu_fused_swiglu && fn == N && !ffn_fused &&
                         !c.muse_glimmer && tl && tl->down_q && tl->down_qtype == kPtq1GgmlType &&
                         trs->down && s.bonsai_sign_ffn && s.bonsai_block == 1024 &&
