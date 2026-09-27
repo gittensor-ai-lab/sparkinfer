@@ -2333,9 +2333,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     static int mg_qkr = -1;
                     if (mg_qkr < 0) { const char* e = getenv("SPARKINFER_MG_QKR_FUSE"); mg_qkr = (e && e[0] == '0') ? 0 : 1; }
                     const bool mg_qkr_fuse = mg_qkr && c.muse_glimmer && s.use_qkfuse && !partial_rope && !kv8;
+                    // The same pair on an int8 cache (rmsnorm_qk, then the int8 quantize-append),
+                    // which every long-context decode takes, as one launch as well.
+                    const bool mg_qkr_fuse8 = mg_qkr && c.muse_glimmer && s.use_qkfuse && !partial_rope && kv8;
                     if (mg_qkr_fuse) {
                         kernels::launch_muse_qknorm_rope_kv(
                             s.q, s.k, s.v, w.q_norm, w.k_norm, (bf16*)kpool, (bf16*)vpool, ltab,
+                            s.d_pos, w.swa ? s.d_pos : s.d_writepos,
+                            c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
+                            s.kv->block_size(), c.rms_eps, /*do_rope=*/w.swa != 0, st);
+                    } else if (mg_qkr_fuse8) {
+                        kernels::launch_muse_qknorm_rope_kv_int8(
+                            s.q, s.k, s.v, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, ltab,
                             s.d_pos, w.swa ? s.d_pos : s.d_writepos,
                             c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
                             s.kv->block_size(), c.rms_eps, /*do_rope=*/w.swa != 0, st);
@@ -2347,7 +2356,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     }
                     dbg_bf16(s.q, s.qdim, 20, L);   // tag 20: Q, post QK-norm, pre-RoPE
                     dbg_bf16(s.k, s.kvdim, 21, L);  // tag 21: K, post QK-norm, pre-RoPE
-                    if (mg_qkr_fuse) {
+                    if (mg_qkr_fuse || mg_qkr_fuse8) {
                         // already done in one kernel above
                     } else if (c.muse_glimmer && !w.swa) {
                         // Global/NoPE layer: no rotation at all (Q/K are already QK-normed

@@ -72,6 +72,14 @@ void launch_muse_qknorm_rope_kv(void* q, void* k, const void* v, const void* q_w
 // row (block_table[row * max_blocks_per_seq + blk]). Replaces launch_rmsnorm(q) + launch_rmsnorm(k)
 // + launch_rope_kv_append_normal / launch_kv_append with the same bytes, bf16 KV only; k is written
 // to the pool and not back to `k`. False = nothing issued (unsupported head width).
+// int8-KV twin of launch_muse_qknorm_rope_kv: launch_rmsnorm_qk + launch_muse_kv_append_int8 in
+// one launch. Bit-identical to the pair.
+void launch_muse_qknorm_rope_kv_int8(void* q, void* k, const void* v, const void* q_w,
+                                     const void* k_w, void* k_pool, void* v_pool, void* k_scale,
+                                     void* v_scale, const int* block_table, const int* pos_angle,
+                                     const int* pos_slot, int n_q_heads, int n_kv_heads,
+                                     int head_dim, float theta, int block_size, float eps,
+                                     bool do_rope, cudaStream_t stream);
 bool launch_muse_qknorm_rope_kv_rows(void* q, const void* k, const void* v, const void* q_w,
                                      const void* k_w, void* k_pool, void* v_pool,
                                      const int* block_table, const int* positions, int n_rows,

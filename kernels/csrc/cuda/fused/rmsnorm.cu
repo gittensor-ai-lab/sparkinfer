@@ -587,16 +587,21 @@ __global__ void muse_sandwich_tail_kernel(const __nv_bfloat16* __restrict__ resi
             #pragma unroll
             for (int j = 0; j < 8; j++) ss = __fmaf_rn(bv[j], bv[j], ss);
         }
+        // Each stage's second-level sum runs on every warp rather than on warp 0 behind a second
+        // barrier: the same partials through the same xor butterfly leave the same bits in every
+        // lane, so every thread holds exactly the scale warp 0 used to publish. Two barriers for
+        // the two norms instead of five; each stage keeps its own partial array.
+        __shared__ float s_warp2[32];
         ss = rn_warp_sum(ss);
         if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss;
         __syncthreads();
-        if (threadIdx.x < 32) {
-            float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        float inv1;
+        {
+            const int ln = threadIdx.x & 31;
+            float v = (ln < (blockDim.x + 31) / 32) ? s_warp[ln] : 0.f;
             v = rn_warp_sum(v);
-            if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + post_eps);
+            inv1 = rsqrtf(v / cols + post_eps);
         }
-        __syncthreads();
-        const float inv1 = s_warp[0];
 
         float xv[8];
         float ss2 = 0.f;
@@ -611,16 +616,15 @@ __global__ void muse_sandwich_tail_kernel(const __nv_bfloat16* __restrict__ resi
             for (int j = 0; j < 8; j++) ss2 = __fmaf_rn(xv[j], xv[j], ss2);
         }
         ss2 = rn_warp_sum(ss2);
-        __syncthreads();                     // every thread has consumed inv1; s_warp is free
-        if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss2;
+        if ((threadIdx.x & 31) == 0) s_warp2[threadIdx.x >> 5] = ss2;
         __syncthreads();
-        if (threadIdx.x < 32) {
-            float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        float inv2;
+        {
+            const int ln = threadIdx.x & 31;
+            float v = (ln < (blockDim.x + 31) / 32) ? s_warp2[ln] : 0.f;
             v = rn_warp_sum(v);
-            if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps);
+            inv2 = rsqrtf(v / cols + eps);
         }
-        __syncthreads();
-        const float inv2 = s_warp[0];
         if (live) {
             float ov[8];
             #pragma unroll
@@ -853,6 +857,110 @@ __global__ void muse_qknorm_rope_kv_kernel(
     }
 }
 
+// int8-KV twin of the kernel above: launch_rmsnorm_qk followed by launch_muse_kv_append_int8,
+// the pair the int8 cache still issued per layer (104 decode-graph nodes per step), in ONE launch.
+//
+// Bit-identical to that pair, by construction:
+//   * the per-head RMS is rmsnorm_qk_kernel's exact reduction (same warp -> shared -> warp tree,
+//     blockDim == head_dim; the second level runs on every warp, which yields the same bits), and
+//     q/k are written back normed and bf16-rounded, as it stored them;
+//   * everything after reads those bf16-rounded normed values, as the append kernel loaded them
+//     back from global -- its rotation (NORMAL pairs on sliding-window layers; NoPE layers pass the
+//     normed K through), the per-(token, kv_head) max-abs scale, the int8 rounding and the stores
+//     are its own expressions, unchanged;
+//   * V is not normed: it is quantized from the input exactly as the append kernel did it.
+// `pos_angle` supplies the RoPE position and `pos_slot` the cache slot (the pair used d_pos for both
+// on sliding-window layers and d_writepos on NoPE layers).
+__global__ void muse_qknorm_rope_kv_int8_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    signed char* __restrict__ k_pool, signed char* __restrict__ v_pool,
+    __half* __restrict__ k_scale, __half* __restrict__ v_scale,
+    const int* __restrict__ block_table, const int* __restrict__ pos_angle,
+    const int* __restrict__ pos_slot, int n_q_heads, int n_kv_heads, int head_dim,
+    float theta, int block_size, float eps, int do_rope
+) {
+    const int hh = blockIdx.x, t = threadIdx.x, lane = t & 31, nw = (blockDim.x + 31) / 32;
+    const int slot = pos_slot[0];
+    const int blk = slot / block_size, within = slot - blk * block_size;
+    const size_t ctok = (size_t)((size_t)block_table[blk] * block_size + within);
+    __shared__ float s_warp[32];
+    __shared__ float s_red[8];            // head_dim/32 warp partials (<=256 -> <=8)
+
+    float val;
+    bool is_k = false;
+    int kvh = 0;
+    if (hh >= n_q_heads + n_kv_heads) {   // V head: no norm, no rope -- quantized as it comes
+        kvh = hh - n_q_heads - n_kv_heads;
+        val = __bfloat162float(v[(size_t)kvh * head_dim + t]);
+    } else {
+        const bool is_q         = (hh < n_q_heads);
+        __nv_bfloat16* x        = is_q ? q : k;
+        const __nv_bfloat16* w  = is_q ? q_w : k_w;
+        const int head          = is_q ? hh : hh - n_q_heads;
+        const size_t base       = (size_t)head * head_dim;
+
+        const float xv = __bfloat162float(x[base + t]);
+        float ss = rn_warp_sum(xv * xv);
+        if (lane == 0) s_warp[t >> 5] = ss;
+        __syncthreads();
+        // rmsnorm_qk_kernel's second level, on every warp instead of warp 0 behind one more
+        // barrier: the same partials through the same xor butterfly give the same bits in every
+        // lane, so each thread holds exactly the scale warp 0 published.
+        float vv = (lane < nw) ? s_warp[lane] : 0.f;
+        vv = rn_warp_sum(vv);
+        const float inv = rsqrtf(vv / head_dim + eps);
+        const __nv_bfloat16 nb = __float2bfloat16(xv * inv * __bfloat162float(w[t]));
+        const float nf = __bfloat162float(nb);
+        x[base + t] = nb;                 // s.q / s.k exactly as rmsnorm_qk left them
+        if (is_q) {                       // Q: NORMAL rope in place on sliding-window layers,
+            if (!do_rope) return;         // one thread per pair, in the append kernel's own form
+            __shared__ float s_h[256];
+            s_h[t] = nf;
+            __syncthreads();
+            const int half = head_dim >> 1;
+            if (t < half) {
+                const float freq = __powf(theta, -2.f * (float)t / (float)head_dim);
+                const float ang = (float)pos_angle[0] * freq, c = __cosf(ang), sn = __sinf(ang);
+                const float x0 = s_h[2 * t], x1 = s_h[2 * t + 1];
+                q[base + 2 * t]     = __float2bfloat16(x0 * c - x1 * sn);
+                q[base + 2 * t + 1] = __float2bfloat16(x0 * sn + x1 * c);
+            }
+            return;
+        }
+        is_k = true;
+        kvh = head;
+        val = nf;                         // NoPE: the normed K itself
+        if (do_rope) {                    // K rotates the pair (2i, 2i+1); the partner is the
+            const int i = t >> 1;         // neighbouring lane, so it comes by shuffle
+            const float nfp = __shfl_xor_sync(0xffffffffu, nf, 1);
+            const float x0 = (t & 1) ? nfp : nf, x1 = (t & 1) ? nf : nfp;
+            const float freq = __powf(theta, -2.f * (float)i / (float)head_dim);
+            const float ang = (float)pos_angle[0] * freq, c = __cosf(ang), sn = __sinf(ang);
+            val = (t & 1) ? (x0 * sn + x1 * c) : (x0 * c - x1 * sn);
+        }
+    }
+
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, m));
+    if (lane == 0) s_red[t >> 5] = amax;
+    __syncthreads();
+    float a = 0.f;                        // max is order-free: every thread takes it itself
+    for (int w = 0; w < (head_dim >> 5); w++) a = fmaxf(a, s_red[w]);
+    const float d  = a / 127.0f;
+    const int   qi = (a == 0.f) ? 0 : (int)roundf(val / d);
+    const size_t dst = (ctok * n_kv_heads + kvh) * head_dim;
+    if (is_k) {
+        k_pool[dst + t] = (signed char)qi;
+        if (t == 0) k_scale[ctok * n_kv_heads + kvh] = __float2half(d);
+    } else {
+        v_pool[dst + t] = (signed char)qi;
+        if (t == 0) v_scale[ctok * n_kv_heads + kvh] = __float2half(d);
+    }
+}
+
 // Packed-decode form of the kernel above: n_rows independent sequences, each with its own position
 // and its own block-table row. It collapses what the packed step issues per layer --
 // launch_rmsnorm(q), launch_rmsnorm(k), then launch_rope_kv_append_normal (sliding-window layers)
@@ -954,6 +1062,23 @@ void launch_muse_qknorm_rope_kv(void* q, void* k, const void* v, const void* q_w
         reinterpret_cast<const __nv_bfloat16*>(v),
         reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        block_table, pos_angle, pos_slot, n_q_heads, n_kv_heads, head_dim, theta,
+        block_size, eps, do_rope ? 1 : 0);
+}
+
+void launch_muse_qknorm_rope_kv_int8(void* q, void* k, const void* v, const void* q_w,
+                                     const void* k_w, void* k_pool, void* v_pool, void* k_scale,
+                                     void* v_scale, const int* block_table, const int* pos_angle,
+                                     const int* pos_slot, int n_q_heads, int n_kv_heads,
+                                     int head_dim, float theta, int block_size, float eps,
+                                     bool do_rope, cudaStream_t stream) {
+    const int blocks = n_q_heads + 2 * n_kv_heads;   // q heads, k heads, then the v heads
+    muse_qknorm_rope_kv_int8_kernel<<<blocks, head_dim, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w),
+        reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool),
+        reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, pos_angle, pos_slot, n_q_heads, n_kv_heads, head_dim, theta,
         block_size, eps, do_rope ? 1 : 0);
 }
