@@ -797,9 +797,13 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
 //
 // Declines (returning false having changed nothing) whenever a row would not decode identically
 // to what step_job would have produced: anything still prefilling, teacher-forced scoring,
-// per-token logprobs, or any sampler setting other than plain greedy -- decode_packed() returns
-// the argmax, which is exactly forward_token()'s result at temperature 0 with no truncation or
-// penalties, and nothing else. A declined batch just falls back to the sequential loop.
+// per-token logprobs, presence/frequency penalties, a logit bias or a constraint. Temperature,
+// top_k and top_p are packed: decode_packed() samples such a row from its own logits with
+// forward_token()'s kernels, seed and step, so it draws the token step_job would have drawn. They
+// used to decline too, and since requests that set no sampler take the checkpoint's
+// generation_config (temperature 1.0 on Qwen3.8), almost every server request then decoded one
+// forward per sequence: aggregate throughput stayed at single-stream speed at any concurrency.
+// A declined batch just falls back to the sequential loop.
 bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished) {
     static const bool enabled = [] {
         const char* e = getenv("SPARKINFER_PACKED_DECODE");
@@ -829,8 +833,8 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         if (j->next_token < 0 || j->next_token >= cfg.vocab) return false;
         if (!j->req.forced_tokens.empty()) return false;
         if (j->req.logprobs || j->on_token_logprob) return false;
-        if (j->req.temperature != 0.f) return false;
-        if (j->req.top_k > 0 || j->req.top_p < 1.0f) return false;
+        // Penalties read the session's running token counts, which the packed pass neither applies
+        // nor advances; such a row decodes on its own.
         if (j->req.presence_penalty != 0.f || j->req.frequency_penalty != 0.f) return false;
         // decode_packed applies no logit bias: a request with logit_bias or a constraint decodes on
         // its own, where forward_token applies it.
@@ -882,20 +886,39 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
     // a batch it cannot serve; either way those rows still have to advance, so they fall through
     // to the ordinary per-row forward. Tokens already emitted stay emitted -- this is the same
     // work by a different route, not a retry.
-    std::vector<int> toks, pos, out;
+    std::vector<int> toks, pos, out, top_k;
     std::vector<uint64_t> seqs;
+    std::vector<float> temp, top_p;
+    std::vector<unsigned long long> seed, step;
     for (size_t off = 0; off < live.size(); off += (size_t)cap) {
         const size_t m = std::min((size_t)cap, live.size() - off);
         toks.clear(); pos.clear(); seqs.clear(); out.assign(m, -1);
+        temp.clear(); seed.clear(); step.clear(); top_k.clear(); top_p.clear();
+        bool any_sampled = false;
         for (size_t i = 0; i < m; i++) {
             Job* j = live[off + i];
             toks.push_back(j->next_token);
             pos.push_back((int)j->req.prompt.size() + j->decode_emitted - 1);
             seqs.push_back(j->seq_id);
+            // step_job's arguments to forward_token, row by row.
+            temp.push_back(j->req.temperature);
+            seed.push_back((unsigned long long)j->req.seed);
+            step.push_back((unsigned long long)j->decode_emitted);
+            top_k.push_back(j->req.top_k);
+            top_p.push_back(j->req.top_p);
+            any_sampled = any_sampled || j->req.temperature > 0.f;
         }
+        // An all-greedy chunk passes no sampling at all and takes exactly the argmax path it did.
+        Qwen35Model::PackedSampling samp;
+        samp.temperature = temp.data();
+        samp.seed = seed.data();
+        samp.step = step.data();
+        samp.top_k = top_k.data();
+        samp.top_p = top_p.data();
         bool ok = false;
         if (m >= 2)
-            ok = model_->decode_packed(toks.data(), pos.data(), seqs.data(), (int)m, out.data());
+            ok = model_->decode_packed(toks.data(), pos.data(), seqs.data(), (int)m, out.data(),
+                                       any_sampled ? &samp : nullptr);
         if (!ok) {
             for (size_t i = 0; i < m; i++) {
                 Job* j = live[off + i];

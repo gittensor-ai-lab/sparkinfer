@@ -455,6 +455,26 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     fprintf(stderr, "[sparkinfer-server] continuous batching enabled (policy=%d, batch=%d)\n",
             (int)policy, batch_tokens_per_step());
     fprintf(stderr, "[sparkinfer-server] model ready: %s\n", gguf_path.c_str());
+    // Concurrent serving needs device memory beyond the weights and the KV pool: the packed decode
+    // graphs and the batched-prefill scratch are allocated at the first requests, not here. Without
+    // room for them they fail to allocate and every request decodes on its own -- measured with
+    // --ctx 262144 on a 32 GB RTX 5090 (Qwen3.8-27B NVFP4), which left ~3 GiB: aggregate throughput
+    // stayed at single-stream speed at any concurrency, and 16 concurrent 8K-token prompts stalled
+    // the server. --ctx 131072 left ~7 GiB and served them. Say so at startup, where it can be acted
+    // on, rather than letting it surface as a slow server under load.
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+        constexpr double kServingHeadroomGiB = 5.0;
+        const double free_gib = (double)free_b / (double)(1ull << 30);
+        if (free_gib < kServingHeadroomGiB)
+            fprintf(stderr, "[sparkinfer-server] WARNING: only %.1f GiB of device memory is free after "
+                            "loading with --ctx %d. Concurrent requests need about %.0f GiB for packed "
+                            "decode and batched prefill; without it they decode one at a time. Lower "
+                            "--ctx (e.g. %d) unless this server serves one long request at a time.\n",
+                    free_gib, impl_->cfg.max_seq, kServingHeadroomGiB, impl_->cfg.max_seq / 2);
+        else
+            fprintf(stderr, "[sparkinfer-server] device memory free after loading: %.1f GiB\n", free_gib);
+    }
     return true;
 }
 

@@ -446,6 +446,13 @@ Each `/v1/chat/completions` call is submitted to `ContinuousBatchEngine`, which:
   spike ITL by hundreds of ms)
 - Under `chunked` (or when decode is waiting under `continuous`), non-batched models
   advance prefills in chunks of `SPARKINFER_PREFILL_CHUNK_TOKENS` before yielding
+- Decodes the packed requests in **one forward** (`decode_packed`) rather than one per request.
+  Greedy and sampled requests (`temperature`, `top_k`, `top_p`) both pack: a sampled row is drawn
+  from its own logits with the single-request sampler, seed and step, so it gets the same token it
+  would alone. A request with `presence_penalty`/`frequency_penalty`, `logit_bias`, a tool or JSON
+  constraint, or `logprobs` decodes on its own. Sampled requests used to decode on their own too,
+  and a request that sets no sampler takes the checkpoint's `generation_config` (temperature 1.0 on
+  Qwen3.8), so concurrent throughput stayed at single-stream speed
 - Frees KV blocks when the request finishes (no cross-request KV leakage)
 - Uses per-request hybrid Gated-DeltaNet recurrent buffers when the model is hybrid
 
@@ -552,7 +559,7 @@ above. Pass them with `-e NAME=value`. Server flags appended after the image nam
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CTX` | `262144`; `131072` with `serve-dspark` | Context length, passed as `--ctx` |
+| `CTX` | `131072` | Context length, passed as `--ctx`. `262144` fits the model's full context but leaves ~3 GB on a 32 GB card, too little for concurrent requests to batch (the server warns at startup below 5 GiB free); use it for one long conversation at a time. |
 | `SPARKINFER_MAX_OUTPUT_TOKENS` | `16384` | Per-request generation cap (see the table above) |
 | `SPARKINFER_NO_DOWNLOAD` | `0` | `1` never downloads: the weights must already be in `MODEL_DIR` (and `DRAFT_DIR` for `serve-dspark`). A missing checkpoint fails immediately with what to mount, instead of attempting an egress the box may not have. |
 | `MODEL_REPO` / `MODEL_DIR` | `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` / `/models/qwen38-nvfp4` | Target checkpoint, downloaded on first run |

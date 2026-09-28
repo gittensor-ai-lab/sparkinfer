@@ -134,6 +134,11 @@ struct Qwen35PrefillCtx {
     void* const*         packed_lin_conv  = nullptr;
     // The packed rows' recurrent state is the compacted bf16 form (see Qwen35Model::decode_packed).
     bool                 packed_state_b16 = false;
+    // Where a packed pass leaves the address of its logits ([N, vocab] fp32, rows in batch order),
+    // or null. decode_packed samples its temperature/top_k/top_p rows from them once the forward has
+    // run: the buffer is carved from the verify arena, whose layout is fixed across passes, so it
+    // holds this pass's logits until the next verify pass.
+    float**              packed_logits_out = nullptr;
     // The Bonsai decode shadow's layers (n_layers entries), or null. A packed step reads its FFN
     // and its attention q/k/v and output projections from their ternary legs through the
     // arithmetic single-row decode runs on them, so every row decodes bit-identically batched or

@@ -4962,6 +4962,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // thing that stopped the shared branch from running concurrently with the routed one.
     float* shared_h = a.alloc<float>((size_t)NA * ffn);
     float* logits = a.alloc<float>((size_t)NA * c.vocab);
+    if (packed && s.packed_logits_out) *s.packed_logits_out = logits;
     int* out_ids = a.alloc<int>(NA);
     const size_t q81_stride_max = kernels::llama_q8_1_bytes(std::max(H, lvdim));
     void* q81 = a.alloc<unsigned char>((size_t)NA * q81_stride_max);

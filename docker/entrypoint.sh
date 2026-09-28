@@ -36,8 +36,13 @@ if [ "${1:-}" = "serve-dspark" ]; then
   # card (#1086), so DSpark defaults to half the context. -e CTX=... (or --ctx) still overrides.
   CTX="${CTX:-131072}"
 fi
-# Autoregressive serving fits the model's full context on one 32 GB card.
-CTX="${CTX:-262144}"
+# Autoregressive serving defaults to half the model's context too. The full 262,144-token pool
+# does load on a 32 GB card, but leaves ~3 GB for everything else, and concurrent serving needs
+# more: the packed decode graphs and batched-prefill scratch then fail to allocate, every request
+# decodes on its own, and 16 concurrent 8K-token prompts stalled the server outright (RTX 5090,
+# 2026-09-28). At 131,072 the same load leaves ~7 GB and none of that happens. A single long
+# conversation can still ask for the full context with -e CTX=262144 (or --ctx).
+CTX="${CTX:-131072}"
 
 fetch "$MODEL_REPO" "$MODEL_DIR" "target"
 MODE="autoregressive"

@@ -569,14 +569,29 @@ public:
     // once and pays only the per-row cost, which for the dominant GEMVs is a few percent because
     // they already take R rows through a single weight read.
     //
-    // tokens/positions/seq_ids are HOST arrays of n entries; out_sampled receives n token ids
-    // (greedy argmax, matching what forward_token returns at temperature 0). Returns false --
-    // having changed nothing -- when the shape is unsupported, so the caller can fall back to
-    // stepping the jobs one at a time.
+    // tokens/positions/seq_ids are HOST arrays of n entries; out_sampled receives n token ids.
+    // Returns false -- having changed nothing -- when the shape is unsupported, so the caller can
+    // fall back to stepping the jobs one at a time.
+    //
+    // Without `sampling` every row is the greedy argmax, matching what forward_token returns at
+    // temperature 0. With it, a row whose temperature is above 0 or whose top_k/top_p truncate is
+    // sampled the way forward_token samples it -- top_k/top_p mask, then Gumbel-max temperature
+    // noise from Philox(seed, vocab index, step), then argmax, on that row's own logits -- so a
+    // request draws the same token for the same seed and step whether it decodes packed or alone.
+    // Rows that do neither keep the forward's argmax untouched, and a batch with no such row costs
+    // nothing extra. Penalties, logit bias and constraints are NOT applied here: the continuous
+    // batch engine steps a row that uses them on its own.
     //
     // Every sequence must have an open session and live KV. n is capped by the packed graph tiers.
+    struct PackedSampling {
+        const float* temperature = nullptr;            // [n]; <= 0 is greedy
+        const unsigned long long* seed = nullptr;      // [n]
+        const unsigned long long* step = nullptr;      // [n]; forward_token's sample_step
+        const int* top_k = nullptr;                    // [n]; <= 0 or >= vocab is off
+        const float* top_p = nullptr;                  // [n]; >= 1 is off
+    };
     bool decode_packed(const int* tokens, const int* positions, const uint64_t* seq_ids, int n,
-                       int* out_sampled);
+                       int* out_sampled, const PackedSampling* sampling = nullptr);
     // Largest n decode_packed() accepts. Matches the packed graph tiers.
     static int max_packed_rows();
     uint64_t active_session() const;

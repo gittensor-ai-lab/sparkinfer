@@ -48,8 +48,9 @@ Build from source instead: [Quickstart](#quickstart).
 **What the endpoint serves**
 
 - **Model id** `qwen38-nvfp4`. `GET /v1/info` reports the live limits.
-- **Context** 262,144 tokens, or 131,072 with `serve-dspark`. **Output** up to 16,384 tokens per
-  request.
+- **Context** 131,072 tokens by default; `-e CTX=262144` serves the model's full context to one
+  long conversation at a time (it leaves too little device memory for concurrent requests to
+  batch). **Output** up to 16,384 tokens per request.
 - **Inputs** text, images and video, function tools, `response_format` JSON output, and reasoning on
   or off.
 - **APIs** OpenAI (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`), Anthropic

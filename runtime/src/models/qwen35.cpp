@@ -594,6 +594,20 @@ struct Qwen35Model::Impl {
     void* packed_host_tables = nullptr;
     void* packed_host_seqs = nullptr;
     int   packed_rows_valid = 0;
+    // Per-row sampling for decode_packed (see Qwen35Model::PackedSampling): one pinned block that
+    // stages each row's temperature/seed/step/top_k/top_p and receives its sampled id, and the
+    // device block the sampler kernels read one element of per row. Allocated on the first batch
+    // with a sampled row, before its forward runs, so an allocation failure still declines cleanly.
+    struct PackedSampleRows {
+        float temp[kQwen35MaxPackedRows];
+        unsigned long long seed[kQwen35MaxPackedRows];
+        unsigned long long step[kQwen35MaxPackedRows];
+        int top_k[kQwen35MaxPackedRows];
+        float top_p[kQwen35MaxPackedRows];
+        int out[kQwen35MaxPackedRows];
+    };
+    PackedSampleRows* packed_samp_host = nullptr;
+    PackedSampleRows* packed_samp_dev = nullptr;
 
     // Per-session parking lot for the AR decode graph.
     //
@@ -1231,6 +1245,8 @@ Qwen35Model::~Qwen35Model() {
     if (p_->packed_dev_tables) cudaFree(p_->packed_dev_tables);
     if (p_->packed_dev_tables_win) cudaFree(p_->packed_dev_tables_win);
     if (p_->packed_host_tables_win) cudaFreeHost(p_->packed_host_tables_win);
+    if (p_->packed_samp_host) cudaFreeHost(p_->packed_samp_host);
+    if (p_->packed_samp_dev) cudaFree(p_->packed_samp_dev);
     for (auto& kv : p_->parked_graphs) {
         if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
         if (kv.second.graph) cudaGraphDestroy(kv.second.graph);
@@ -4389,7 +4405,8 @@ int Qwen35Model::max_packed_rows() {
 }
 
 bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
-                                const uint64_t* seq_ids, int n, int* out_sampled) {
+                                const uint64_t* seq_ids, int n, int* out_sampled,
+                                const PackedSampling* sampling) {
     Impl& s = *p_;
     if (!tokens || !positions || !seq_ids || !out_sampled) return false;
     if (n < 1 || n > kQwen35MaxPackedRows) return false;
@@ -4419,6 +4436,22 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
             != cudaSuccess) return false;
         if (cudaHostAlloc(&s.packed_host_seqs, np * sizeof(uint64_t), cudaHostAllocDefault)
             != cudaSuccess) return false;
+    }
+    // Only a temperature above 0 can move a row off the argmax: top_k/top_p always keep rank 0,
+    // so a truncating row at temperature 0 is still its argmax (forward_token behaves the same).
+    bool any_sampled = false;
+    if (sampling) {
+        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
+            !sampling->top_p) return false;
+        for (int i = 0; i < n && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
+    }
+    if (any_sampled && !s.packed_samp_dev) {
+        if (cudaHostAlloc(&s.packed_samp_host, sizeof(Impl::PackedSampleRows), cudaHostAllocDefault)
+            != cudaSuccess) { s.packed_samp_host = nullptr; return false; }
+        if (cudaMalloc(&s.packed_samp_dev, sizeof(Impl::PackedSampleRows)) != cudaSuccess) {
+            s.packed_samp_dev = nullptr;
+            return false;
+        }
     }
     float** h_states = static_cast<float**>(s.packed_host_states);
     void**  h_convs  = static_cast<void**>(s.packed_host_convs);
@@ -4544,9 +4577,51 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         if (so != s.bonsai_sign_dev.end()) ctx.bonsai_sign_out = so->second;
         if (s.bonsai_ffn_q) ctx.bonsai_dec_head = s.bonsai_dec_head;
     }
+    float* packed_logits = nullptr;
+    ctx.packed_logits_out = &packed_logits;
     const int consumed = dflash_verify_short_run(ctx, tokens, n, positions[0],
                                                  nullptr, 0, nullptr, out_sampled);
-    return consumed == n;
+    if (consumed != n) return false;
+    // The forward has advanced every row's KV and recurrent state, so from here on this step must
+    // complete: returning false now would make the caller run the rows again. What is left is
+    // kernel launches on buffers that already exist.
+    if (any_sampled && packed_logits) {
+        const int vocab = s.cfg.vocab;
+        cudaStream_t st = s.stream;
+        Impl::PackedSampleRows* h = s.packed_samp_host;
+        Impl::PackedSampleRows* d = s.packed_samp_dev;
+        for (int i = 0; i < n; i++) {
+            h->temp[i] = sampling->temperature[i];
+            h->seed[i] = sampling->seed[i];
+            h->step[i] = sampling->step[i];
+            h->top_k[i] = sampling->top_k[i];
+            h->top_p[i] = sampling->top_p[i];
+        }
+        cu(cudaMemcpyAsync(d, h, sizeof(Impl::PackedSampleRows), cudaMemcpyHostToDevice, st),
+           "packed sample params");
+        // forward_token's order on each row's own logits: top_k/top_p mask, temperature noise,
+        // argmax. Launched with n_rows = 1 on the row, so the Philox counter is the vocab index
+        // exactly as in forward_token, and a request draws the same token packed or alone. The
+        // mask reuses forward_token's scratch; the rows run one after another on one stream.
+        for (int i = 0; i < n; i++) {
+            if (!(h->temp[i] > 0.f)) continue;
+            float* row = packed_logits + (size_t)i * vocab;
+            if ((h->top_k[i] > 0 && h->top_k[i] < vocab) || h->top_p[i] < 1.f)
+                kernels::launch_topk_topp_mask(row, vocab, s.d_vocab_iota, s.d_sorted_logits,
+                                               s.d_sorted_idx, s.d_topk_exp, s.d_topk_cumsum,
+                                               s.d_sort_temp, s.sort_temp_bytes, s.d_scan_temp,
+                                               s.scan_temp_bytes, &d->top_k[i], &d->top_p[i],
+                                               s.d_rank_by_id, st);
+            kernels::launch_temperature_sample(row, 1, vocab, &d->temp[i], &d->seed[i], &d->step[i], st);
+            kernels::launch_argmax(row, &d->out[i], 1, vocab, st);
+        }
+        cu(cudaMemcpyAsync(h->out, d->out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
+           "packed sampled ids");
+        cu(cudaStreamSynchronize(st), "packed sample sync");
+        for (int i = 0; i < n; i++)
+            if (h->temp[i] > 0.f) out_sampled[i] = h->out[i];
+    }
+    return true;
 }
 
 void Qwen35Model::activate_session(uint64_t seq_id) {

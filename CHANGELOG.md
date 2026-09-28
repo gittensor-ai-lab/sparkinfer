@@ -5,6 +5,23 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Serving
+
+- **Sampled requests batch again.** The continuous-batch engine's packed decode took only greedy
+  rows, and since requests that set no sampler take the checkpoint's `generation_config`
+  (temperature 1.0 on Qwen3.8), nearly every server request decoded one forward per sequence:
+  aggregate throughput stayed at single-stream speed (~90 tok/s on an RTX 5090) at any
+  concurrency. `decode_packed` now samples a row with `temperature`/`top_k`/`top_p` from its own
+  logits with the single-request sampler, seed and step, so it draws the token it would alone.
+  Penalties, `logit_bias`, constraints and `logprobs` still decode per request. Measured with
+  AIPerf on the release Qwen3.8-27B NVFP4 checkpoint (`--ctx 131072`, default sampling): 3.0x /
+  5.8x / 5.5x output throughput for 1k-token chat at 4 / 16 / 32 concurrent requests, 3.5x /
+  10.5x / 12.5x for 1k-token answers.
+- **The release container defaults to `CTX=131072`.** The full 262,144-token pool left ~3 GB on a
+  32 GB card: packed decode and batched prefill could not allocate, and 16 concurrent 8K-token
+  prompts stalled the server. `-e CTX=262144` still serves the full context to one conversation at
+  a time, and the server now warns at startup when less than 5 GiB is free after loading.
+
 ### Project
 
 - **Ternary-Bonsai-2-27B has a PR eval bot** (`eval/pr_bonsai_bot.py`, #1138). It scores decode and
