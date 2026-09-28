@@ -1150,7 +1150,7 @@ template <> struct fa_mma_min_blocks<128, 16> { static constexpr int v = 4; };
 // per-token/per-head fp16 scales are applied to the int32 results. This halves the KV global read (the
 // bottleneck) and uses 2x-throughput int8 tensor cores. M is padded 8->16; partials (m,l,acc) stay
 // byte-compatible with the combine kernel. sm_80+ (wmma). One block per (seq, kv_head, split); 8 warps.
-template <int HEAD_DIM, int GQA>
+template <int HEAD_DIM, int GQA, int WIDE = 0>
 __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
                                  fa_mma_min_blocks<HEAD_DIM, GQA>::v) fa_split_gqa_mma_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
@@ -1164,10 +1164,25 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
     constexpr int KH = HEAD_DIM / 16;
     // The changes below apply where they measured faster: hd128 at every group width and the 8:1
     // hd256 group (PV on mma.sync, staged block ids, register P', folded correction, float4
-    // partials). The 4:1 and 6:1 hd256 groups keep main's code unchanged -- the 6:1 group, whose
-    // wmma PV stays, ran slower with them on 256k splits.
+    // partials). The 4:1 hd256 group keeps the wmma form; the 6:1 group has its own (kWide).
     constexpr bool kMmaPV = HEAD_DIM == 128 || (HEAD_DIM == 256 && GQA == 8);
-    const int seq = blockIdx.y, split = blockIdx.x % n_splits, kvh = blockIdx.x / n_splits;
+    // The 6:1 group's own form (WIDE=1, Qwen3.8's full-attention layers). Its K and V were read
+    // as wmma fragments straight from global memory -- K sixteen 16-byte rows per fragment, V one
+    // BYTE per lane per load (row-major int8 B) -- so each phase ran at under 1 TB/s on its own
+    // and the group's two phases could not overlap them. Here every load is wide and coalesced:
+    // QK on mma.sync m16n8k32 from 16-byte K reads, PV on m16n8k16 from 32-bit V reads
+    // transposed in registers, both straight from the int32 accumulators (see below). The int8
+    // products and int32 sums are exact in any order, and the P' quantization, the softmax and
+    // the fold are the kMmaPV shapes' own, so the partials are the ones the wmma path writes.
+    // Block ids and scales stay read from the table: staging them measured slower on this group.
+    constexpr bool kWide = WIDE == 1 && HEAD_DIM == 256 && GQA == 6;
+    constexpr bool kRegP = kMmaPV || kWide;    // P' quantized from registers, correction folded
+    // Split-major block order on the wide path: the kv heads' CTAs for one split are adjacent, so
+    // the four readers of the same [token][kv_head][dim] rows run together rather than a wave
+    // apart (bit-identical: only which CTA runs when changes).
+    const int seq = blockIdx.y;
+    const int split = kWide ? (int)blockIdx.x / num_kv_heads : (int)blockIdx.x % n_splits;
+    const int kvh   = kWide ? (int)blockIdx.x % num_kv_heads : (int)blockIdx.x / n_splits;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
     const int sl = seq_lens[seq];
     const int chunk = (sl + n_splits - 1) / n_splits;
@@ -1250,7 +1265,49 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
         // __syncthreads below; the QK mma reads only s_qi and global KV, not the staged scales.
 
         // QK int8 mma -> int32; scale to float scores in s_s.
-        if (warp < gblk) {
+        if (kWide && warp < gblk) {
+            // The warp's 16-token block as two n8 tiles. Lane (grp, tig) reads 16 contiguous bytes
+            // of token grp (+8) per 64-dim chunk -- eight 16-byte loads in flight -- and uses them
+            // as the B fragments of two m16n8k32 mmas; Q's A fragments take the same byte
+            // permutation from s_qi, so every product pairs the same dim.
+            const int grp = lane >> 2, tig = lane & 3;
+            const int pb = blk_id(warp);
+            const signed char* kb = k_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM;
+            uint4 kv[2][HEAD_DIM / 64];
+            #pragma unroll
+            for (int t = 0; t < 2; t++)
+                #pragma unroll
+                for (int ch = 0; ch < HEAD_DIM / 64; ch++)
+                    kv[t][ch] = __ldg(reinterpret_cast<const uint4*>(
+                        kb + (size_t)(t * 8 + grp) * KVLD + ch * 64 + tig * 16));
+            int c[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+            #pragma unroll
+            for (int ch = 0; ch < HEAD_DIM / 64; ch++) {
+                const uint4 qa = *reinterpret_cast<const uint4*>(s_qi + grp * HEAD_DIM + ch * 64 + tig * 16);
+                const uint4 qb = *reinterpret_cast<const uint4*>(s_qi + (grp + 8) * HEAD_DIM + ch * 64 + tig * 16);
+                #pragma unroll
+                for (int t = 0; t < 2; t++) {
+                    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+r"(c[t][0]), "+r"(c[t][1]), "+r"(c[t][2]), "+r"(c[t][3])
+                                 : "r"(qa.x), "r"(qb.x), "r"(qa.y), "r"(qb.y),
+                                   "r"(kv[t][ch].x), "r"(kv[t][ch].y));
+                    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+r"(c[t][0]), "+r"(c[t][1]), "+r"(c[t][2]), "+r"(c[t][3])
+                                 : "r"(qa.z), "r"(qb.z), "r"(qa.w), "r"(qb.w),
+                                   "r"(kv[t][ch].z), "r"(kv[t][ch].w));
+                }
+            }
+            // The [16 rows x 128 tokens] int32 tile store_matrix_sync writes below, same layout.
+            int* ss = reinterpret_cast<int*>(s_s);
+            #pragma unroll
+            for (int t = 0; t < 2; t++) {
+                const int col = warp * 16 + t * 8 + 2 * tig;
+                ss[grp * 128 + col] = c[t][0];       ss[grp * 128 + col + 1] = c[t][1];
+                ss[(grp + 8) * 128 + col] = c[t][2]; ss[(grp + 8) * 128 + col + 1] = c[t][3];
+            }
+        } else if (!kWide && warp < gblk) {
             const int pb = blk_id(warp);
             const signed char* kb = k_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM;
             fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
@@ -1305,7 +1362,7 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
                     const float p = __expf(sc[u] - m_new);
                     sum += p; pv = p * s_vs[t]; pamax = fmaxf(pamax, fabsf(pv));
                 }
-                if constexpr (kMmaPV) pvr[u] = pv;   // P' stays in the register until it is quantized
+                if constexpr (kRegP) pvr[u] = pv;   // P' stays in the register until it is quantized
                 else s_s[r * 128 + t] = pv;          // stash P' (score no longer needed for this row)
             }
             #pragma unroll
@@ -1314,7 +1371,7 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
             if (lane == 0) { s_m[r] = m_new; s_l[r] = s_l[r] * corr + sum; s_ps[r] = pd; }
             // Only quantize the gblk*16 P' columns the PV mma actually reads (it loops ks < gblk);
             // the tail columns are never loaded, so skipping them trims the per-row roundf work.
-            if constexpr (kMmaPV) {
+            if constexpr (kRegP) {
                 // Column t = lane + 32u is the one this lane computed above, so it quantizes its
                 // own registers -- the same values the shared-memory stash handed back -- and the
                 // row's correction is applied where the PV result is accumulated.
@@ -1337,7 +1394,49 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
             s_pb[((g0 >> 3) + 1) & 1][tid] = pb_next;
         __syncthreads();
 
-        if constexpr (kMmaPV) {
+        if constexpr (kWide) {
+            // PV on mma.sync m16n8k16 (s8) in one pass: warp w owns dims [32w, 32w + 32). A lane
+            // reads four token rows x four dims -- four 32-bit loads, and the warp's covers whole
+            // 32-byte sectors -- transposes the 4x4 bytes with byte permutes, and each byte plane
+            // is the B fragment of one n8 tile: tile j holds dims 32w + 4n + j. The fold into O is
+            // the kMmaPV one, fma(c, ps, o * corr), which is what the shared-memory int32 round
+            // trip of the wmma path compiles to.
+            const int grp = lane >> 2, tig = lane & 3;
+            const int dcol = warp * 32 + 4 * grp;
+            int c[4][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
+            for (int ks = 0; ks < gblk; ks++) {
+                const signed char* vb = v_pool + ((size_t)blk_id(ks) * 16 * num_kv_heads + kvh) * HEAD_DIM
+                                      + (size_t)(tig * 4) * KVLD + dcol;
+                const unsigned w0 = __ldg(reinterpret_cast<const unsigned*>(vb));
+                const unsigned w1 = __ldg(reinterpret_cast<const unsigned*>(vb + KVLD));
+                const unsigned w2 = __ldg(reinterpret_cast<const unsigned*>(vb + 2 * KVLD));
+                const unsigned w3 = __ldg(reinterpret_cast<const unsigned*>(vb + 3 * KVLD));
+                // w_i = dims 0..3 of token tig*4 + i  ->  b[j] = dim j of tokens 0..3.
+                const unsigned t0 = __byte_perm(w0, w1, 0x5140), t1 = __byte_perm(w2, w3, 0x5140);
+                const unsigned t2 = __byte_perm(w0, w1, 0x7362), t3 = __byte_perm(w2, w3, 0x7362);
+                const unsigned b[4] = {__byte_perm(t0, t1, 0x5410), __byte_perm(t0, t1, 0x7632),
+                                       __byte_perm(t2, t3, 0x5410), __byte_perm(t2, t3, 0x7632)};
+                const unsigned a0 = *reinterpret_cast<const unsigned*>(s_pi + grp * 128 + ks * 16 + tig * 4);
+                const unsigned a1 = *reinterpret_cast<const unsigned*>(s_pi + (grp + 8) * 128 + ks * 16 + tig * 4);
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                                 : "+r"(c[j][0]), "+r"(c[j][1]), "+r"(c[j][2]), "+r"(c[j][3])
+                                 : "r"(a0), "r"(a1), "r"(b[j]));
+            }
+            // c[j][e]: row grp (e < 2) or grp + 8, n = 2*tig + (e & 1) -> dim 32w + 4n + j.
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int r = grp + (e >> 1) * 8;
+                    if (r < GQA) {
+                        float* o = &s_o[r * HEAD_DIM + warp * 32 + 4 * (2 * tig + (e & 1)) + j];
+                        *o = __fmaf_rn((float)c[j][e], s_ps[r], __fmul_rn(*o, s_corr[r]));
+                    }
+                }
+        } else if constexpr (kMmaPV) {
             // PV on mma.sync m16n8k16 (s8). Warp w owns dims [dh + 16w, +16) as two n8 tiles, tile 0
             // the even dims and tile 1 the odd ones, so the B fragment a lane needs -- one dim of
             // tokens tig*4..tig*4+3 per tile -- is two ADJACENT bytes of four token rows: four
@@ -1414,8 +1513,8 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
         }
     }
 
-    if constexpr (kMmaPV) __syncthreads();   // every warp's s_o updates land before they are read
-    if constexpr (kMmaPV) {
+    if constexpr (kRegP) __syncthreads();   // every warp's s_o updates land before they are read
+    if constexpr (kRegP) {
         // Partials: every thread stores 16 bytes at a time, across all GQA rows at once, where one
         // thread wrote both scalars and HEAD_DIM of the 256 threads a float each, row after row.
         if (tid < GQA) {
@@ -1469,6 +1568,9 @@ template __global__ void fa_split_gqa_mma_i8_kernel<256, 4>(const __nv_bfloat16*
 // Qwen3.8-27B full-attn: 24Q/4KV hd256 — same kernel again, M = 6 rows padded to the 16-row mma.
 #ifndef _MSC_VER
 template __global__ void fa_split_gqa_mma_i8_kernel<256, 6>(const __nv_bfloat16*, const signed char*,
+    const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
+    const __half*, const __half*);
+template __global__ void fa_split_gqa_mma_i8_kernel<256, 6, 1>(const __nv_bfloat16*, const signed char*,
     const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
     const __half*, const __half*);
 #endif
@@ -1668,11 +1770,24 @@ void launch_flash_decode_split(
                 const size_t i8_smem = (size_t)2 * 16 * 256 * sizeof(signed char)
                                      + (size_t)(16 + GQA) * 256 * sizeof(float)
                                      + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
-                fa_split_gqa_mma_i8_kernel<256, GQA><<<gq, MMA_THREADS, i8_smem, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
-                    reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
-                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                // The wide-load form of this group (see kWide in the kernel), bit-identical.
+                // Measured on the kernel, DRAM-cold, one row: 262144 keys at 252 splits 411.6 ->
+                // 345.7 us, 65536 125.0 -> 92.3, 16384 36.2 -> 27.7; 32 rows x 520 keys at 16
+                // splits 44.4 -> 31.5. SPARKINFER_FA6_WIDE=0 keeps the wmma form.
+                static int fa6_wide = -1;
+                if (fa6_wide < 0) { const char* e = getenv("SPARKINFER_FA6_WIDE"); fa6_wide = (e && e[0] == '0') ? 0 : 1; }
+                if (fa6_wide)
+                    fa_split_gqa_mma_i8_kernel<256, GQA, 1><<<gq, MMA_THREADS, i8_smem, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+                        reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
+                        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                        reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                else
+                    fa_split_gqa_mma_i8_kernel<256, GQA><<<gq, MMA_THREADS, i8_smem, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+                        reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
+                        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                        reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
                 combine_hd256(out_q8);
                 (void)seqlen;
                 return;
