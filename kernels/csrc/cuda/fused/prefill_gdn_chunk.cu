@@ -748,20 +748,22 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
 }
 
 // Workspace cache. The scan is called once per linear layer with the same N, so one allocation is
-// reused across all 24 layers and every subsequent prefill; it only ever grows.
-void* g_ws = nullptr;
-size_t g_ws_bytes = 0;
+// reused across all 24 layers and every subsequent prefill; it only ever grows. One per slot, so
+// scans issued on different streams at once (a prompt pack's segments) each have their own.
+constexpr int kGdncSlots = 4;
+void* g_ws[kGdncSlots] = {};
+size_t g_ws_bytes[kGdncSlots] = {};
 
-bool ws_reserve(size_t bytes) {
-    if (bytes <= g_ws_bytes) return true;
+bool ws_reserve(size_t bytes, int slot) {
+    if (bytes <= g_ws_bytes[slot]) return true;
     // Allocate the new buffer first so a failed grow keeps the working one.
     // The old free-then-malloc dropped a fitting segment workspace every
     // layer at ctx=16384 while retrying an O(N) size that never fits.
     void* p = nullptr;
     if (cudaMalloc(&p, bytes) != cudaSuccess) return false;
-    if (g_ws) { cudaFree(g_ws); note_prefill_scratch_moved(); }
-    g_ws = p;
-    g_ws_bytes = bytes;
+    if (g_ws[slot]) { cudaFree(g_ws[slot]); note_prefill_scratch_moved(); }
+    g_ws[slot] = p;
+    g_ws_bytes[slot] = bytes;
     return true;
 }
 
@@ -831,7 +833,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               float* state, void* out,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
                               bool qh_block, cudaStream_t stream,
-                              bool carry_in) {
+                              bool carry_in, int slot) {
     constexpr int C = 32, HD = 128, PREP_THREADS = 256;
     // State columns per scan block. JC_S is the shape every context used before; JC_B halves the
     // grid — see use_big below for why that is the whole point at long context.
@@ -884,6 +886,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     }();
 
     if (!enabled || head_dim != HD || n_tokens < minctx) return false;
+    if (slot < 0 || slot >= kGdncSlots) return false;
     if (q_heads <= 0 || v_heads <= 0) return false;
 
     const size_t sm_prep = (size_t)2 * C * (HD + PAD) * sizeof(__nv_bfloat16)
@@ -963,8 +966,8 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         const size_t off_w = off_m + n_m * sizeof(float);
         const size_t off_u = off_w + n_w * sizeof(__nv_bfloat16);
         const size_t total = off_u + n_w * sizeof(__nv_bfloat16);
-        if (!ws_reserve(total)) return false;
-        char* base = reinterpret_cast<char*>(g_ws);
+        if (!ws_reserve(total, slot)) return false;
+        char* base = reinterpret_cast<char*>(g_ws[slot]);
         float* g_buf = reinterpret_cast<float*>(base);
         float* m_buf = reinterpret_cast<float*>(base + off_m);
         auto* w_buf = reinterpret_cast<__nv_bfloat16*>(base + off_w);
@@ -1013,7 +1016,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     // 192-token slices (85 launches/layer). A 1024-token workspace is ~30 MB
     // and allocates; each doubling cuts the launch count in half.
     const size_t total = gdnc_workspace_bytes(n_tokens, v_heads, C, HD);
-    if (ws_reserve(total))
+    if (ws_reserve(total, slot))
         return run_slice(qb, kb, vb, ab, bb, ob, n_tokens, carry_in ? 1 : 0);
     cudaGetLastError();   // clear the failed grow so later peek/getinfo are clean
 
@@ -1021,7 +1024,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     for (int cand = n_tokens >> 1; cand >= C; cand >>= 1) {
         cand -= cand % C;
         if (cand < C) break;
-        if (ws_reserve(gdnc_workspace_bytes(cand, v_heads, C, HD))) {
+        if (ws_reserve(gdnc_workspace_bytes(cand, v_heads, C, HD), slot)) {
             seg = cand;
             break;
         }

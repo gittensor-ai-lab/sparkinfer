@@ -87,14 +87,14 @@ void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_sta
 // must pass true, matching whatever the decode-path GDN kernel uses for the same model.
 // carry_in: this pass resumes mid-sequence (a later prefill window, or a restored prefix-cache
 // entry), so the recurrence starts from `state` instead of zero. False keeps the zero start a pass
-// at position 0 has always had.
+// at position 0 has always had. slot: the chunked scan's workspace (launch_prefill_gdn_chunk).
 void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              const void* alpha, const void* beta,
                              const void* dt, const void* a,
                              float* state, void* out,
                              int n_tokens, int q_heads, int v_heads, int head_dim,
                              bool qh_block = false, cudaStream_t stream = nullptr,
-                             bool carry_in = false);
+                             bool carry_in = false, int slot = 0);
 
 // DFlash short-block variants. They start from the live decode state but leave it untouched,
 // writing a complete post-token checkpoint for every candidate row. checkpoint[t] uses the same

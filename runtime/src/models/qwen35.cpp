@@ -4161,6 +4161,22 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
+    // The decode shadow's ternary legs, handed over as prefill_batched hands them to one prompt.
+    // Without them every layer of a pack read the folded legs, so a continuous batch's prompt pack
+    // (4096 rows at c16/c32) ran the int8 FFN where the same rows as one prompt take the FP4 one.
+    // The seed head stays the folded one here: a pack forms one seed per prompt from it.
+    // SPARKINFER_BONSAI_PACK_SHADOW=0 keeps the folded legs for packs (A/B in one binary).
+    static const bool pack_shadow = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_PACK_SHADOW");
+        return !(e && e[0] == '0');
+    }();
+    if (pack_shadow && !s.bonsai_dec_layers.empty() &&
+        s.bonsai_dec_rs.size() == s.bonsai_dec_layers.size()) {
+        ctx.bonsai_pf_layers = s.bonsai_dec_layers.data();
+        ctx.bonsai_pf_rs = s.bonsai_dec_rs.data();
+        const auto so = s.bonsai_sign_dev.find(s.qdim);
+        if (so != s.bonsai_sign_dev.end()) ctx.bonsai_sign_out = so->second;
+    }
     // Muse's continuous-batch pool leaves little VRAM beside a 32-session KV cache: a 4096-token
     // pack's scratch either fails to allocate (and the whole pack falls back to one prefill per
     // prompt) or, held afterwards, starves the packed decode's own arena. Run it as consecutive

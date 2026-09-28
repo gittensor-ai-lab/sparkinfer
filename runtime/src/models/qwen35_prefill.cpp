@@ -2525,17 +2525,51 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 const size_t state_at =
                     (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
                 const int lq = s.linear_qdim;
+                // The prompts share nothing here, so they run on up to kSegStreams streams at once:
+                // a 256-token prompt's scan is a short chain of chunk steps that leaves most of the
+                // device idle, and a 16-prompt pack ran 16 of them back to back (16 x 48 conv +
+                // prep + scan launches, ~56 ms of a 4096-row pack). Each stream scans in its own
+                // workspace slot; the launches, and so every row of every prompt, are unchanged.
+                // SPARKINFER_PACK_GDN_STREAMS=1 keeps them on one stream (A/B in one binary).
+                constexpr int kSegStreams = 3;
+                static const int seg_streams = [] {
+                    const char* e = getenv("SPARKINFER_PACK_GDN_STREAMS");
+                    const int v = e ? atoi(e) : kSegStreams;
+                    return v < 1 ? 1 : v > kSegStreams ? kSegStreams : v;
+                }();
+                static cudaStream_t seg_st[kSegStreams] = {};
+                static cudaEvent_t seg_ev[kSegStreams] = {};   // [0] fork, [1..] each side's end
+                int ns = nseg > 1 ? seg_streams : 1;
+                for (int j = 0; j < ns; ++j) {
+                    if (!seg_ev[j] &&
+                        cudaEventCreateWithFlags(&seg_ev[j], cudaEventDisableTiming) != cudaSuccess)
+                        ns = 1;
+                    if (j > 0 && !seg_st[j] &&
+                        cudaStreamCreateWithFlags(&seg_st[j], cudaStreamNonBlocking) != cudaSuccess)
+                        ns = 1;
+                }
+                if (ns > 1) {
+                    pf_cu(cudaEventRecord(seg_ev[0], st), "gdn segment fork");
+                    for (int j = 1; j < ns; ++j)
+                        pf_cu(cudaStreamWaitEvent(seg_st[j], seg_ev[0], 0), "gdn segment fork wait");
+                }
                 for (int i = 0; i < nseg; ++i) {
                     const size_t o = (size_t)s.multi_off[i];
                     const int len = s.multi_len[i];
+                    const int j = i % ns;
+                    cudaStream_t ss = j ? seg_st[j] : st;
                     kernels::launch_prefill_gdn_conv(b8 + o * lqkv, w.ssm_conv,
                         static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at,
                         gq + o * lq, gk + o * lq, gv + o * lvdim, len, c.linear_q_heads, vh,
-                        c.linear_head_dim, c.linear_conv_kernel, eps, st, nullptr);
+                        c.linear_head_dim, c.linear_conv_kernel, eps, ss, nullptr);
                     kernels::launch_prefill_gdn_scan(gq + o * lq, gk + o * lq, gv + o * lvdim,
                         la + o * vh, lb + o * vh, w.ssm_dt, w.ssm_a,
                         s.multi_lin_state[i] + state_at, att + o * lvdim, len, c.linear_q_heads,
-                        vh, c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/false);
+                        vh, c.linear_head_dim, c.gdn_qh_block, ss, /*carry_in=*/false, j);
+                }
+                for (int j = 1; j < ns; ++j) {
+                    pf_cu(cudaEventRecord(seg_ev[j], seg_st[j]), "gdn segment done");
+                    pf_cu(cudaStreamWaitEvent(st, seg_ev[j], 0), "gdn segment join");
                 }
             } else if (s.ckpt_n > 0) {
                 // Prefix-cache checkpoints inside the pass: conv and scan once per segment, each
@@ -6171,7 +6205,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 return e ? atoi(e) : 16;
             }();
             const bool ab_fused = w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
-                ((packed && ab_mma_min > 0 && N >= ab_mma_min && !s.bonsai_sign_hidden &&
+                ((packed && ab_mma_min > 0 && N >= ab_mma_min &&
                   kernels::launch_gemv_rows2_mma(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H,
                                                  gst)) ||
                  kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, gst));
@@ -6433,12 +6467,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // already has N rows x kv-heads CTAs per split, so at 32 rows the 32 splits leave
             // each CTA a dozen keys and write as many partial bytes as they read KV. From 24
             // rows it takes 16 (SPARKINFER_CB_ATTN_SPLITS, 0 keeps the session's). The buffers
-            // are sized for the session's count, which is never smaller.
-            static const int cb_attn_splits = [] {
+            // are sized for the session's count, which is never smaller. Ternary-Bonsai-2's step
+            // is faster still at 8 (c32 step 11.50 -> 11.31 ms).
+            static const int cb_attn_env = [] {
                 const char* e = getenv("SPARKINFER_CB_ATTN_SPLITS");
-                return e ? atoi(e) : 16;
+                return e ? atoi(e) : -1;
             }();
-            const int ns_attn = (packed && N >= 24 && !s.bonsai_sign_hidden && cb_attn_splits > 0 &&
+            const int cb_attn_splits = cb_attn_env >= 0 ? cb_attn_env
+                                                        : (s.bonsai_sign_hidden ? 8 : 16);
+            const int ns_attn = (packed && N >= 24 && cb_attn_splits > 0 &&
                                  cb_attn_splits < ns)
                               ? cb_attn_splits : ns;
             kernels::launch_flash_decode_split(

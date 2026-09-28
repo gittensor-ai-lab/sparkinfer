@@ -24,6 +24,7 @@
 #include <cuda_fp4.h>
 
 #include <cstdlib>
+#include <mutex>
 
 namespace sparkinfer { namespace kernels {
 
@@ -92,6 +93,7 @@ ptq1_rotq_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __res
                  __nv_bfloat16* __restrict__ out_norm = nullptr,
                  i8_blk_q8_1* __restrict__ out_q8 = nullptr) {
     __shared__ float sh[kSpan];
+    pdl_wait();      // launched programmatic (rotq_launch): x and u are the kernel before's output
     pdl_trigger();   // the rows kernel after this may start fetching its weights
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const long row = blockIdx.y;
@@ -516,6 +518,13 @@ __device__ __forceinline__ void mma_u8s8(int* c, unsigned a0, unsigned a1, unsig
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+__device__ __forceinline__ void ldsm_x4(const void* p, int& r0, int& r1, int& r2, int& r3) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(a));
+}
+
 __device__ __forceinline__ void digits5(unsigned w, unsigned (&d)[5]) {
     unsigned ql = w & 0x00FF00FFu, qh = (w >> 8) & 0x00FF00FFu;
 #pragma unroll
@@ -558,8 +567,11 @@ __device__ __forceinline__ void row_frags(unsigned wt, unsigned w45, unsigned w6
 // the single-row GEMV's time for the same bytes.
 //
 // SPLIT: blockIdx.y takes steps [y*sps, (y+1)*sps) and writes f32 partials to
-// part[((mat * gridDim.y + y) * M + token) * N + row]; ptq1_split_reduce_kernel sums them in split
-// order. For the down projection, whose 5120 rows are only 40 CTAs on a 170-SM part.
+// part[((mat * gridDim.y + y) * M + token) * N + row], which are then summed in split order. For the
+// down projection, whose 5120 rows are only 40 CTAs on a 170-SM part. With `cnt` (one counter per
+// tile, zero between launches) the tile's last CTA to finish sums them and resets its counter;
+// without it ptq1_split_reduce_kernel does, as a second launch. Either way each output is
+// part[0] + part[1] + ... in split order, so which CTA finishes last changes nothing.
 //
 // WARPS is 8 (128-row tiles, which the matrix divides) except for the balanced launches in
 // launch_rows_i8, whose last tile may be short: its spare warps still stage and sync, and skip the
@@ -570,7 +582,8 @@ ptq1_mma_rows_kernel(const signed char* __restrict__ xq, const float* __restrict
                      const int* __restrict__ xs, const unsigned char* __restrict__ w0,
                      const unsigned char* __restrict__ w1, OutT* __restrict__ y0,
                      OutT* __restrict__ y1, int M, int N, int nblk, int ctas_per_mat,
-                     float* __restrict__ part = nullptr, int sps = 0) {
+                     float* __restrict__ part = nullptr, int sps = 0,
+                     unsigned* __restrict__ cnt = nullptr) {
     constexpr int TOK = NT * 8;
     constexpr int ROWB = KB * kBlk + 16;       // +16: a B-fragment load's 8 tokens hit 8 banks
     constexpr int WSEG = KB * kBlkBytes;       // one weight row's bytes per step
@@ -579,8 +592,9 @@ ptq1_mma_rows_kernel(const signed char* __restrict__ xq, const float* __restrict
     extern __shared__ __align__(16) unsigned char smem_mma[];
     unsigned char* sw = smem_mma;                                              // [ST][WROWS][WSEG]
     signed char* sx = reinterpret_cast<signed char*>(sw + ST * WROWS * WSEG);   // [ST][TOK][ROWB]
-    float* sdx = reinterpret_cast<float*>(sx + ST * TOK * ROWB);          // [ST][TOK][KB]
-    int* ssx = reinterpret_cast<int*>(sdx + ST * TOK * KB);               // [ST][TOK][KB]
+    // A token's scale and sum sit side by side, and consecutive tokens side by side, so the two
+    // tokens a thread's C fragment holds are one 16-byte load: {d0, s0, d1, s1}.
+    int* sds = reinterpret_cast<int*>(sx + ST * TOK * ROWB);              // [ST][KB][TOK][2]
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     int cta = blockIdx.x, mat = 0;
     const unsigned char* W = w0;
@@ -635,15 +649,15 @@ ptq1_mma_rows_kernel(const signed char* __restrict__ xq, const float* __restrict
         for (int j = 0; j < XJ; ++j)
             if (warp + WARPS * j < M)
                 __pipeline_memcpy_async(sxs + j * WARPS * ROWB, xstep + j * xstride, 16);
-        // A token's KB scales (and sums) are one aligned 16-byte run, since nblk and b0 are
-        // multiples of KB: copied like the rest, so no warp stalls on a load before its MMAs.
-        if (threadIdx.x < 2 * TOK) {
-            const int tok = threadIdx.x >> 1;
+        // Scales and sums are copied like the rest, so no warp stalls on a load before its MMAs,
+        // but one 4-byte value at a time into their interleaved slots (see sds).
+        for (int i = threadIdx.x; i < 2 * KB * TOK; i += NTH) {
+            const int which = i & 1, tok = i >> 1 & (TOK - 1), bb = i / (2 * TOK);
             const bool ok = tok < M;
-            const size_t src = (size_t)(ok ? tok : 0) * nblk + b0;
-            const size_t dst = ((size_t)buf * TOK + tok) * KB;
-            if (threadIdx.x & 1) __pipeline_memcpy_async(ssx + dst, xs + src, 16, ok ? 0 : 16);
-            else                 __pipeline_memcpy_async(sdx + dst, xd + src, 16, ok ? 0 : 16);
+            const size_t src = (size_t)(ok ? tok : 0) * nblk + b0 + bb;
+            int* dst = sds + (((size_t)buf * KB + bb) * TOK + tok) * 2 + which;
+            if (which) __pipeline_memcpy_async(dst, xs + src, 4, ok ? 0 : 4);
+            else       __pipeline_memcpy_async(dst, xd + src, 4, ok ? 0 : 4);
         }
     };
     auto issue = [&](int stp, int buf) {
@@ -668,6 +682,11 @@ ptq1_mma_rows_kernel(const signed char* __restrict__ xq, const float* __restrict
         __pipeline_commit();
     }
     const int o45 = 4 + (t & 1);
+    // ldmatrix row address of this lane: matrix lane / 8 of an x4 is k-step (lane / 16) of the
+    // pair, low or high 16 bytes by bit 3, row lane % 8 is the tile's token. Thread (g, t) then
+    // receives bytes 4t..4t+3 of token g's segment, which is the MMA's B fragment. The padded
+    // token rows (ROWB) put a matrix's eight rows on eight different bank groups.
+    const signed char* xl = sx + (size_t)(lane & 7) * ROWB + (lane >> 4) * 32 + (lane >> 3 & 1) * 16;
     for (int stp = s_beg; stp < s_end; ++stp) {
         const int buf = (stp - s_beg) % ST;
         __pipeline_wait_prior(ST - 2);
@@ -694,17 +713,20 @@ ptq1_mma_rows_kernel(const signed char* __restrict__ xq, const float* __restrict
 #pragma unroll
             for (int n = 0; n < NT; ++n) {
                 int cc[4] = {0, 0, 0, 0};
-                const signed char* xr = sx + ((size_t)buf * TOK + n * 8 + g) * ROWB + bb * kBlk;
+                // The four k-steps' B fragments in two ldmatrix.x4 (see xl) instead of eight
+                // 4-byte loads: at 32 tokens those loads, not the MMAs, were the kernel's limit.
+                const signed char* xn = xl + ((size_t)buf * TOK + n * 8) * ROWB + bb * kBlk;
+                int bv[4][2];
+                ldsm_x4(xn, bv[0][0], bv[0][1], bv[1][0], bv[1][1]);
+                ldsm_x4(xn + 64, bv[2][0], bv[2][1], bv[3][0], bv[3][1]);
 #pragma unroll
-                for (int s = 0; s < 4; ++s) {
-                    const int b0v = *reinterpret_cast<const int*>(xr + 32 * s + 4 * t);
-                    const int b1v = *reinterpret_cast<const int*>(xr + 32 * s + 16 + 4 * t);
-                    mma_u8s8(cc, fa[s][0], fb[s][0], fa[s][1], fb[s][1], b0v, b1v);
-                }
+                for (int s = 0; s < 4; ++s)
+                    mma_u8s8(cc, fa[s][0], fb[s][0], fa[s][1], fb[s][1], bv[s][0], bv[s][1]);
                 const int t0 = n * 8 + 2 * t;
-                const size_t o0 = ((size_t)buf * TOK + t0) * KB + bb, o1 = o0 + KB;
-                const float d0 = sdx[o0], d1 = sdx[o1];
-                const int s0 = ssx[o0], s1 = ssx[o1];
+                const int4 ds = *reinterpret_cast<const int4*>(
+                    sds + (((size_t)buf * KB + bb) * TOK + t0) * 2);
+                const float d0 = __int_as_float(ds.x), d1 = __int_as_float(ds.z);
+                const int s0 = ds.y, s1 = ds.w;
                 const float v[4] = {blk_term(swA, d0, cc[0] - s0), blk_term(swA, d1, cc[1] - s1),
                                     blk_term(swB, d0, cc[2] - s0), blk_term(swB, d1, cc[3] - s1)};
 #pragma unroll
@@ -726,6 +748,39 @@ ptq1_mma_rows_kernel(const signed char* __restrict__ xq, const float* __restrict
             if (t0 < M) { pp[(size_t)t0 * N + rA] = acc[n][0]; pp[(size_t)t0 * N + rB] = acc[n][2]; }
             if (t1 < M) { pp[(size_t)t1 * N + rA] = acc[n][1]; pp[(size_t)t1 * N + rB] = acc[n][3]; }
         }
+        // Every warp is live on a split launch (FIT), so all of them reach the barriers below.
+        if (!FIT || !cnt) return;
+        __shared__ unsigned s_last;
+        __threadfence();   // this CTA's partials are visible before its arrival is counted
+        __syncthreads();
+        unsigned* c = cnt + (size_t)mat * ctas_per_mat + cta;
+        if (threadIdx.x == 0) s_last = atomicAdd(c, 1u) == gridDim.y - 1;
+        __syncthreads();
+        if (!s_last) return;
+        __threadfence();
+        // Four consecutive rows a thread (N % 4 == 0 on a split launch), every split's load issued
+        // before the first add.
+        const size_t plane = (size_t)M * N;
+        const float* pm = part + (size_t)mat * gridDim.y * plane;
+        const int S = gridDim.y;
+        for (int i = threadIdx.x; i < M * (WROWS / 4); i += NTH) {
+            const int tok = i / (WROWS / 4);
+            const size_t o = (size_t)tok * N + row0 + 4 * (i - tok * (WROWS / 4));
+            float4 v[8];
+#pragma unroll
+            for (int q = 0; q < 8; ++q)
+                if (q < S) v[q] = __ldcg(reinterpret_cast<const float4*>(pm + q * plane + o));
+            float4 a = v[0];
+#pragma unroll
+            for (int q = 1; q < 8; ++q)
+                if (q < S) {
+                    a.x = __fadd_rn(a.x, v[q].x); a.y = __fadd_rn(a.y, v[q].y);
+                    a.z = __fadd_rn(a.z, v[q].z); a.w = __fadd_rn(a.w, v[q].w);
+                }
+            put<OutT>(y, o, a.x); put<OutT>(y, o + 1, a.y);
+            put<OutT>(y, o + 2, a.z); put<OutT>(y, o + 3, a.w);
+        }
+        if (threadIdx.x == 0) *c = 0u;
         return;
     }
 #pragma unroll
@@ -791,6 +846,35 @@ void launch_rows_pdl(bool pdl, void (*kernel)(KArgs...), dim3 grid, dim3 block, 
     cudaLaunchKernelEx(&cfg, kernel, args...);
 }
 
+// The split launches' arrival counters: one set per stream, since a stream's launches run one
+// after another (a programmatic one touches its counters only after its wait), while the side
+// stream's split launches may run beside the main stream's. Zero at load, and every launch leaves
+// them zero. SPARKINFER_ROWS_SPLIT_FUSED=0 keeps the separate reduce launch (A/B in one binary).
+constexpr int kCntSlots = 8, kCntTiles = 1024;
+__device__ unsigned g_split_cnt[kCntSlots][kCntTiles];
+
+unsigned* split_cnt_for(cudaStream_t st, int tiles) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_ROWS_SPLIT_FUSED");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || tiles > kCntTiles) return nullptr;
+    static std::mutex mu;
+    static cudaStream_t owners[kCntSlots] = {};
+    static int used = 0;
+    static unsigned* base = nullptr;
+    std::lock_guard<std::mutex> lk(mu);
+    if (!base && cudaGetSymbolAddress(reinterpret_cast<void**>(&base), g_split_cnt) != cudaSuccess) {
+        base = nullptr;
+        return nullptr;
+    }
+    for (int i = 0; i < used; ++i)
+        if (owners[i] == st) return base + (size_t)i * kCntTiles;
+    if (used >= kCntSlots) return nullptr;
+    owners[used] = st;
+    return base + (size_t)(used++) * kCntTiles;
+}
+
 template <int NT, int ST, typename OutT, bool SPLIT, int WARPS = 8>
 void launch_mma_rows_t(const signed char* xq, const float* xd, const int* xs, const void* w0,
                        const void* w1, OutT* y0, OutT* y1, int m, int n_rows, int nblk, int S,
@@ -806,11 +890,15 @@ void launch_mma_rows_t(const signed char* xq, const float* xd, const int* xs, co
     }
     const int ctas = (n_rows + 16 * WARPS - 1) / (16 * WARPS), nmat = w1 ? 2 : 1;
     const int nsteps = nblk / KB, sps = (nsteps + S - 1) / S;
+    // Not for the programmatic (8-token) launches: there the reduce launch is resident before the
+    // GEMM ends and costs next to nothing, and the last CTA's pass would only lengthen the tail
+    // (single-row decode 1% slower).
+    unsigned* cnt = SPLIT && WARPS == 8 && NT > 1 ? split_cnt_for(st, ctas * nmat) : nullptr;
     launch_rows_pdl(NT == 1, ptq1_mma_rows_kernel<NT, WARPS, KB, ST, OutT, SPLIT>,
                     dim3(ctas * nmat, SPLIT ? S : 1), dim3(WARPS * 32), shm, st, xq, xd, xs,
                     static_cast<const unsigned char*>(w0), static_cast<const unsigned char*>(w1),
-                    y0, y1, m, n_rows, nblk, ctas, part, sps);
-    if (SPLIT) {
+                    y0, y1, m, n_rows, nblk, ctas, part, sps, cnt);
+    if (SPLIT && !cnt) {
         const int mn = m * n_rows;
         launch_rows_pdl(NT == 1, ptq1_split_reduce_kernel<OutT>, dim3((mn / 4 + 255) / 256, nmat),
                         dim3(256), 0, st, (const float*)part, y0, y1, mn, S);
@@ -1193,11 +1281,28 @@ bool launch_ptq1_rows_nvfp4(const void* w_ptq1, void* q, void* sf_rowmajor, int 
 }
 float ptq1_nvfp4_alpha() { return 1.f / kFp4WScale; }
 
+// A rotation sits between two GEMMs on every leg, so its launch and CTA dispatch were paid in
+// full after the GEMM before it drained. Launched programmatic, its CTAs are resident when that
+// GEMM completes (the rows kernels trigger at their start) and wait there (pdl_wait) before
+// reading anything. SPARKINFER_ROTQ_PDL=0 launches them the ordinary way (A/B in one binary).
+template <int MODE>
+void rotq_launch(int rows, int k, cudaStream_t st, const __nv_bfloat16* x, const __nv_bfloat16* u,
+                 const __nv_bfloat16* nw, float eps, const signed char* sign, signed char* q,
+                 float* qd, int* qs, __nv_bfloat16* out_sum = nullptr,
+                 __nv_bfloat16* out_norm = nullptr, i8_blk_q8_1* out_q8 = nullptr) {
+    static const bool pdl = [] {
+        const char* e = getenv("SPARKINFER_ROTQ_PDL");
+        return !(e && e[0] == '0');
+    }();
+    launch_rows_pdl(pdl, ptq1_rotq_kernel<MODE>, dim3((unsigned)(k / kSpan), (unsigned)rows),
+                    dim3(256), 0, st, x, u, nw, eps, sign, q, qd, qs, k, out_sum, out_norm, out_q8);
+}
+
 bool launch_ptq1_rotq_bf16(const void* x_bf16, const signed char* sign, signed char* q,
                            float* qd, int* qs, int rows, int k, int block, cudaStream_t st) {
     if (rows <= 0 || block != kSpan || k % kSpan != 0) return false;
-    ptq1_rotq_kernel<kRotPlain><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
-        static_cast<const __nv_bfloat16*>(x_bf16), nullptr, nullptr, 0.f, sign, q, qd, qs, k);
+    rotq_launch<kRotPlain>(rows, k, st, static_cast<const __nv_bfloat16*>(x_bf16), nullptr,
+                           nullptr, 0.f, sign, q, qd, qs);
     return true;
 }
 
@@ -1213,11 +1318,12 @@ bool launch_ptq1_add_norm_rotq_bf16(const void* x_bf16, const void* residual_bf1
         return !(e && e[0] == '0');
     }();
     if (!on) return false;
-    ptq1_rotq_kernel<kRotAddNorm><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
-        static_cast<const __nv_bfloat16*>(x_bf16), static_cast<const __nv_bfloat16*>(residual_bf16),
-        static_cast<const __nv_bfloat16*>(weight_bf16), eps, sign, q, qd, qs, k,
-        static_cast<__nv_bfloat16*>(out_sum), static_cast<__nv_bfloat16*>(out_norm),
-        static_cast<i8_blk_q8_1*>(out_q8));
+    rotq_launch<kRotAddNorm>(rows, k, st, static_cast<const __nv_bfloat16*>(x_bf16),
+                             static_cast<const __nv_bfloat16*>(residual_bf16),
+                             static_cast<const __nv_bfloat16*>(weight_bf16), eps, sign, q, qd, qs,
+                             static_cast<__nv_bfloat16*>(out_sum),
+                             static_cast<__nv_bfloat16*>(out_norm),
+                             static_cast<i8_blk_q8_1*>(out_q8));
     return true;
 }
 
@@ -1225,9 +1331,9 @@ bool launch_ptq1_swiglu_rotq_bf16(const void* gate_bf16, const void* up_bf16,
                                   const signed char* sign, signed char* q, float* qd, int* qs,
                                   int rows, int k, int block, cudaStream_t st) {
     if (rows <= 0 || block != kSpan || k % kSpan != 0) return false;
-    ptq1_rotq_kernel<kRotSwiglu><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
-        static_cast<const __nv_bfloat16*>(gate_bf16), static_cast<const __nv_bfloat16*>(up_bf16),
-        nullptr, 0.f, sign, q, qd, qs, k);
+    rotq_launch<kRotSwiglu>(rows, k, st, static_cast<const __nv_bfloat16*>(gate_bf16),
+                            static_cast<const __nv_bfloat16*>(up_bf16), nullptr, 0.f, sign, q, qd,
+                            qs);
     return true;
 }
 
@@ -1236,9 +1342,9 @@ bool launch_ptq1_gnorm_rotq_bf16(const void* x_bf16, const void* z_bf16, const v
                                  int* qs, int rows, int k, int head_dim, int block,
                                  cudaStream_t st) {
     if (rows <= 0 || block != kSpan || k % kSpan != 0 || head_dim != kBlk) return false;
-    ptq1_rotq_kernel<kRotGnorm><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
-        static_cast<const __nv_bfloat16*>(x_bf16), static_cast<const __nv_bfloat16*>(z_bf16),
-        static_cast<const __nv_bfloat16*>(norm_bf16), eps, sign, q, qd, qs, k);
+    rotq_launch<kRotGnorm>(rows, k, st, static_cast<const __nv_bfloat16*>(x_bf16),
+                           static_cast<const __nv_bfloat16*>(z_bf16),
+                           static_cast<const __nv_bfloat16*>(norm_bf16), eps, sign, q, qd, qs);
     return true;
 }
 
@@ -1246,9 +1352,9 @@ bool launch_ptq1_gate_rotq_bf16(const void* x_bf16, const void* gate_bf16,
                                 const signed char* sign, signed char* q, float* qd, int* qs,
                                 int rows, int k, int block, cudaStream_t st) {
     if (rows <= 0 || block != kSpan || k % kSpan != 0) return false;
-    ptq1_rotq_kernel<kRotGate><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
-        static_cast<const __nv_bfloat16*>(x_bf16), static_cast<const __nv_bfloat16*>(gate_bf16),
-        nullptr, 0.f, sign, q, qd, qs, k);
+    rotq_launch<kRotGate>(rows, k, st, static_cast<const __nv_bfloat16*>(x_bf16),
+                          static_cast<const __nv_bfloat16*>(gate_bf16), nullptr, 0.f, sign, q, qd,
+                          qs);
     return true;
 }
 

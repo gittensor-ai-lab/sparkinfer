@@ -2099,7 +2099,7 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              const void* alpha, const void* beta, const void* dt, const void* a,
                              float* state, void* out, int n_tokens, int q_heads, int v_heads,
                              int head_dim, bool qh_block, cudaStream_t stream,
-                             bool carry_in) {
+                             bool carry_in, int slot) {
     static const bool state_bf16 = [] {
         const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
         return e && e[0] == '1';
@@ -2108,7 +2108,7 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
     // the sequential scan below when disabled (SPARKINFER_PREFILL_GDN_CHUNK=0) or shape-unsupported.
     if (launch_prefill_gdn_chunk(q, k, v, alpha, beta, dt, a, state, out,
                                  n_tokens, q_heads, v_heads, head_dim, qh_block, stream,
-                                 carry_in)) return;
+                                 carry_in, slot)) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
