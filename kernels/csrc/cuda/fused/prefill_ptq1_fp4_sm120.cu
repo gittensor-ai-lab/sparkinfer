@@ -193,6 +193,7 @@ struct Smem {
     unsigned bsf[NS][BN];
     unsigned lut[kLutN];
     unsigned long long mb[4 * NS];
+    int sk_c0;                 // stream-K: the first CTA of the tile being finished
 };
 
 struct Legs {
@@ -339,11 +340,25 @@ __device__ __forceinline__ void store_tile(const float (&acc)[4][4][4], const Le
         }
 }
 
+// Stream-K: with `sk_iters` set, CTA c owns the (tile, k-block) iterations [c*I/G, (c+1)*I/G) of
+// all I = tiles * nblk, so every SM gets the same work however the tile count falls against the SM
+// count. A CTA walks its range from the top tile down. A tile cut by a range edge is finished by
+// the CTA holding its last k-block, which reaches it last in its walk; each lower contributor
+// reaches its piece first, leaves the raw sums in its own slot and raises its flag. The finisher
+// adds the slots to its own sums in CTA order, and resets the flags for the next launch. It
+// waits only on lower-numbered CTAs, which are dispatched before it, so even with another kernel
+// holding SMs the wait cannot close a cycle.
+__device__ __forceinline__ int sk_lo(int c, int iters, int grid) {
+    return c * iters / grid;   // the launch keeps iters * grid below 2^31
+}
+__device__ __forceinline__ void mma_bar() { asm volatile("bar.sync 1, %0;" :: "n"(N_MMA) : "memory"); }
+
 template <bool RESID>
 __global__ void __launch_bounds__(THREADS, 1)
 ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
                      float* __restrict__ part, int nblk_split, int mtiles, int ntiles, int nitems,
-                     float alpha) {
+                     float alpha, int sk_iters, float4* __restrict__ sk_part,
+                     int* __restrict__ sk_flag) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
     const unsigned mb0 = smem_u32(&sm.mb[0]);
@@ -375,6 +390,24 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
         kb0 = z * nblk_split;
         nst = min(nblk, kb0 + nblk_split) - kb0;
     };
+    // This CTA's jobs: its strided items, or (stream-K) its range's tiles from the top down, each
+    // cut to the k-blocks [kb0, kb0 + nst) the range holds.
+    const int lo = sk_iters ? sk_lo(blockIdx.x, sk_iters, gridDim.x) : 0;
+    const int hi = sk_iters ? sk_lo(blockIdx.x + 1, sk_iters, gridDim.x) : 0;
+    const int t_hi = sk_iters ? (hi - 1) / nblk : 0;
+    const int njobs = sk_iters ? (hi > lo ? t_hi - lo / nblk + 1 : 0)
+                               : ((int)blockIdx.x < nitems
+                                      ? (nitems - (int)blockIdx.x + (int)gridDim.x - 1) / (int)gridDim.x
+                                      : 0);
+    auto job = [&](int j, int& mt, int& leg, int& n0, int& kb0, int& nst, int& tile) {
+        tile = sk_iters ? t_hi - j : (int)blockIdx.x + j * (int)gridDim.x;
+        item(tile, mt, leg, n0, kb0, nst);
+        if (sk_iters) {
+            const int b = max(lo, tile * nblk), e = min(hi, (tile + 1) * nblk);
+            kb0 = b - tile * nblk;
+            nst = e - b;
+        }
+    };
 
     if (tid >= N_MMA + N_DEC) {
         // ---------------- A warp: 16 A chunks and 4 scale chunks a lane per stage ----------------
@@ -382,9 +415,9 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
         const size_t arow = (size_t)K / 2, asrow = (size_t)K / 16;
         const unsigned char* asf_g = a + (size_t)M * arow;
         int g = 0;
-        for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
-            int mt, leg, n0, kb0, nst;
-            item(w, mt, leg, n0, kb0, nst);
+        for (int j = 0; j < njobs; j++) {
+            int mt, leg, n0, kb0, nst, tile;
+            job(j, mt, leg, n0, kb0, nst, tile);
             const int m0 = mt * BM;
             for (int i = 0; i < nst; i++, g++) {
                 const int s = g % NS;
@@ -414,9 +447,9 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
         // ---------------- decode warps: one half-block a thread per stage ----------------
         const int d = tid - N_MMA, br = d >> 1, h = d & 1;
         int g = 0;
-        for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
-            int mt, leg, n0, kb0, nst;
-            item(w, mt, leg, n0, kb0, nst);
+        for (int j = 0; j < njobs; j++) {
+            int mt, leg, n0, kb0, nst, tile;
+            job(j, mt, leg, n0, kb0, nst, tile);
             const unsigned* wrow = reinterpret_cast<const unsigned*>(
                 L.w[leg] + (size_t)(n0 + br) * nblk * kBlkBytes + (size_t)kb0 * kBlkBytes);
             // Two stages an iteration (independent decode chains), their words (2h, 2h+1, 4+h and 6
@@ -455,9 +488,9 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
     const int warp = tid >> 5, lane = tid & 31;
     const int wm = warp & 1, wn = warp >> 1;
     int g = 0;
-    for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
-        int mt, leg, n0, kb0, nst;
-        item(w, mt, leg, n0, kb0, nst);
+    for (int j = 0; j < njobs; j++) {
+        int mt, leg, n0, kb0, nst, tile;
+        job(j, mt, leg, n0, kb0, nst, tile);
         float acc[4][4][4];
 #pragma unroll
         for (int f = 0; f < 4; f++)
@@ -474,8 +507,53 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
             __syncwarp();
             if (lane == 0) { mb_arrive(emptyA(s)); mb_arrive(emptyB(s)); }
         }
-        store_tile<RESID>(acc, L, leg, part, kb0 / nblk_split, M, mt * BM, n0, wm, wn, lane,
-                          alpha);
+        if (sk_iters && kb0 + nst < nblk) {
+            // A lower piece of a cut tile: raw sums to this CTA's slot, in thread order.
+            float4* S = sk_part + (size_t)blockIdx.x * (BM * BN / 4);
+#pragma unroll
+            for (int f = 0; f < 4; f++)
+#pragma unroll
+                for (int q = 0; q < 4; q++)
+                    __stcg(S + (f * 4 + q) * N_MMA + tid,
+                           make_float4(acc[f][q][0], acc[f][q][1], acc[f][q][2], acc[f][q][3]));
+            __threadfence();
+            mma_bar();
+            if (tid == 0) atomicExch(sk_flag + blockIdx.x, 1);
+            continue;
+        }
+        if (sk_iters && kb0 > 0) {
+            // The top piece: wait for the lower pieces, then add them to its own in CTA order.
+            if (tid == 0) {
+                // The CTA holding the tile's first k-block.
+                const int x = tile * nblk;
+                int c0 = x * (int)gridDim.x / sk_iters;
+                while (c0 > 0 && sk_lo(c0, sk_iters, gridDim.x) > x) c0--;
+                while (sk_lo(c0 + 1, sk_iters, gridDim.x) <= x) c0++;
+                sm.sk_c0 = c0;
+                for (int c = c0; c < (int)blockIdx.x; c++) {
+                    int v;
+                    do {
+                        asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(sk_flag + c) : "memory");
+                    } while (v == 0);
+                    sk_flag[c] = 0;
+                }
+                __threadfence();
+            }
+            mma_bar();
+            for (int c = sm.sk_c0; c < (int)blockIdx.x; c++) {
+                const float4* S = sk_part + (size_t)c * (BM * BN / 4);
+#pragma unroll
+                for (int f = 0; f < 4; f++)
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        const float4 p = __ldcg(S + (f * 4 + q) * N_MMA + tid);
+                        acc[f][q][0] += p.x; acc[f][q][1] += p.y;
+                        acc[f][q][2] += p.z; acc[f][q][3] += p.w;
+                    }
+            }
+        }
+        store_tile<RESID>(acc, L, leg, sk_iters ? nullptr : part, sk_iters ? 0 : kb0 / nblk_split,
+                          M, mt * BM, n0, wm, wn, lane, alpha);
     }
 }
 
@@ -533,6 +611,36 @@ int pick_splits(int tiles, int nblk, size_t per_split_floats, size_t part_cap) {
     return best;
 }
 
+// Stream-K scratch: a 128x128 fp32 slot and a flag per CTA, one set per (device, stream) so
+// launches on two streams never share one. Flags start zeroed and every launch leaves them so.
+// Taken outside stream capture only; a capture that finds none keeps the plain grid.
+struct SkWs { int dev; cudaStream_t st; float4* part; int* flag; };
+bool sk_workspace(cudaStream_t st, float4** part, int** flag) {
+    constexpr int kMax = 16;
+    static SkWs ws[kMax];
+    static int n = 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    for (int i = 0; i < n; i++)
+        if (ws[i].dev == dev && ws[i].st == st) { *part = ws[i].part; *flag = ws[i].flag; return true; }
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (n == kMax || cudaStreamIsCapturing(st, &cs) != cudaSuccess ||
+        cs != cudaStreamCaptureStatusNone)
+        return false;
+    const int sms = sm_count();
+    void* p = nullptr;
+    const size_t pb = (size_t)sms * BM * BN * sizeof(float);
+    if (cudaMalloc(&p, pb + (size_t)sms * sizeof(int)) != cudaSuccess) { cudaGetLastError(); return false; }
+    if (cudaMemset(static_cast<char*>(p) + pb, 0, (size_t)sms * sizeof(int)) != cudaSuccess) {
+        cudaFree(p);
+        return false;
+    }
+    ws[n] = {dev, st, static_cast<float4*>(p), reinterpret_cast<int*>(static_cast<char*>(p) + pb)};
+    *part = ws[n].part; *flag = ws[n].flag;
+    n++;
+    return true;
+}
+
 }  // namespace
 
 bool ptq1_fp4_gemm_supported(int m, int k) {
@@ -584,13 +692,32 @@ bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, voi
     const int mtiles = (m + BM - 1) / BM;
     const int nblk = k / kBlk;
     int splits = part ? pick_splits(mtiles * tiles_n, nblk, (size_t)m * sum_n, part_cap) : 1;
+    // Stream-K where the strided grid leaves SMs idle: a ragged last round (2 of 170 CTAs busy
+    // for qkv+z at 512 rows) costs a full round, and a lone short one (128 tiles at 128 rows) has
+    // no second round to fill with split-K's slices. A grid that is one round at least 90% full
+    // keeps its items: stream-K's fix-up costs more there than the SMs it would fill.
+    // SPARKINFER_PREFILL_FP4_STREAMK=0 keeps the strided grid everywhere (A/B).
+    static const bool sk_env = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_FP4_STREAMK");
+        return !(e && e[0] == '0');
+    }();
+    const int tiles = mtiles * tiles_n;
+    const double w_old = (double)tiles * splits / sm_count();
+    const bool full = w_old / ceil(w_old) >= 0.999 || (w_old <= 1.0 && w_old >= 0.9);
+    float4* sk_part = nullptr;
+    int* sk_flag = nullptr;
+    const bool sk = sk_env && !full && (long long)tiles * nblk * sm_count() < (1LL << 31) &&
+                    sk_workspace(st, &sk_part, &sk_flag);
+    if (sk) splits = 1;
     const int per = (nblk + splits - 1) / splits;
     splits = (nblk + per - 1) / per;   // every launched slice owns at least one block
     size_t off = 0;
     for (int i = 0; i < nleg; i++) { L.poff[i] = off; off += (size_t)splits * m * n[i]; }
     const float alpha = 1.f / kWScale;
     const int nitems = mtiles * tiles_n * splits;
-    const int grid = nitems < sm_count() ? nitems : sm_count();
+    const int sk_iters = sk ? tiles * nblk : 0;
+    const int cap = sk ? sk_iters : nitems;
+    const int grid = cap < sm_count() ? cap : sm_count();
     constexpr size_t smem = sizeof(Smem);
     static bool attr = false;
     if (!attr) {
@@ -604,10 +731,12 @@ bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, voi
     float* P = splits > 1 ? part : nullptr;
     if (resid && !P)
         ptq1_fp4_gemm_kernel<true><<<grid, THREADS, smem, st>>>(A, m, k, L, P, per, mtiles,
-                                                                tiles_n, nitems, alpha);
+                                                                tiles_n, nitems, alpha, sk_iters,
+                                                                sk_part, sk_flag);
     else
         ptq1_fp4_gemm_kernel<false><<<grid, THREADS, smem, st>>>(A, m, k, L, P, per, mtiles,
-                                                                 tiles_n, nitems, alpha);
+                                                                 tiles_n, nitems, alpha, sk_iters,
+                                                                 sk_part, sk_flag);
     if (P) {
         for (int i = 0; i < nleg; i++) {
             const size_t n4 = (size_t)m * n[i] / 4;
