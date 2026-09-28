@@ -1101,6 +1101,110 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
     }
 }
 
+// float -> e2m1 nibble with cvt.rn.satfinite.e2m1x2's rounding, as seven compares. That cvt only
+// assembles for sm_100a/sm_120a, and this TU builds for plain sm_120, where __nv_cvt_float2_to_fp4x2
+// falls back to an emulation that widens to DOUBLE and rounds with 64-bit integer ops -- on a card
+// with 1/64-rate FP64 that emulation, not memory, bounds the FP4 quantizer. The thresholds are the
+// round-to-nearest-even midpoints of {0, .5, 1, 1.5, 2, 3, 4, 6} (ties to the even code), the sign
+// is kept on a zero result and NaN gives +6, as the emulation does: checked equal to
+// __nv_cvt_float_to_fp4(x, __NV_E2M1, cudaRoundNearest) on all 2^32 float bit patterns.
+__device__ __forceinline__ unsigned e2m1_rn(float x) {
+    const float a = fabsf(x);
+    if (a != a) return 7u;
+    const unsigned c = (unsigned)(a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) +
+                       (a > 2.5f) + (a >= 3.5f) + (a > 5.f);
+    return c | ((__float_as_uint(x) >> 28) & 8u);
+}
+
+// The FP4 form of the kernel above with one WARP per (1024-span, row) instead of one CTA per row.
+// NVFP4 scales every 16 values on their own, so unlike the int8 form nothing couples the spans of
+// a row: the row-per-CTA shape only serialized them (up to 17 spans, three block barriers each)
+// and left 4096 CTAs of 8 warps waiting on one another. Here lane l holds span values
+// [32l, 32l+32): the butterflies over index bits 0-4 run in registers and bits 5-9 by shuffle,
+// every bit in ascending order and each as (lo + hi, lo - hi), which is exactly the stage order
+// and arithmetic of the kernel above -- so the rotated values, and everything quantized from them,
+// are bit-identical. A lane's 32 values are two whole 16-groups: no shuffles for the group amax,
+// one 16-byte store of nibbles and one 2-byte store of scales.
+template <bool SWIGLU>
+__global__ void __launch_bounds__(256)
+ptq1_rotq_span_fp4_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict__ sign,
+                          unsigned char* __restrict__ q, unsigned char* __restrict__ sf,
+                          int rows, int k, const __nv_bfloat16* __restrict__ u,
+                          unsigned char* __restrict__ sfl) {
+    const int lane = threadIdx.x & 31;
+    const int ns = k / kSpan;
+    const long item = (long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (item >= (long)rows * ns) return;
+    const int row = (int)(item / ns), sp = (int)(item - (long)row * ns);
+    const int e0 = sp * kSpan + lane * 32;
+    const __nv_bfloat16* xr = x + (size_t)row * k + e0;
+    float r[32];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        uint4 raw = *reinterpret_cast<const uint4*>(xr + c * 8);
+        if constexpr (SWIGLU) {
+            const uint4 ur = *reinterpret_cast<const uint4*>(u + (size_t)row * k + e0 + c * 8);
+            const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&ur);
+            __nv_bfloat16 o[8];
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float g = __bfloat162float(gh[j]);
+                o[j] = __float2bfloat16(g / (1.f + __expf(-g)) * __bfloat162float(uh[j]));
+            }
+            raw = *reinterpret_cast<const uint4*>(o);
+        }
+        const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
+        const uint2 sg2 = *reinterpret_cast<const uint2*>(sign + e0 + c * 8);
+        const signed char* sg = reinterpret_cast<const signed char*>(&sg2);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) r[c * 8 + j] = __bfloat162float(h[j]) * (float)sg[j];
+    }
+#pragma unroll
+    for (int len = 1; len < 32; len <<= 1)
+#pragma unroll
+        for (int j = 0; j < 32; ++j)
+            if (!(j & len)) {
+                const float a = r[j], b = r[j + len];
+                r[j] = a + b; r[j + len] = a - b;
+            }
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+        const bool hi = lane & m;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const float p = __shfl_xor_sync(0xffffffffu, r[j], m);
+            r[j] = hi ? p - r[j] : r[j] + p;
+        }
+    }
+    unsigned nib[4];
+    unsigned char sfb[2];
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        float v[16];
+        float ga = 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) { v[j] = r[g * 16 + j] * 0.03125f; ga = fmaxf(ga, fabsf(v[j])); }
+        const __nv_fp8_storage_t qb =
+            __nv_cvt_float_to_fp8(fmaxf(ga * (1.f / 6.f), 0x1p-9f), __NV_SATFINITE, __NV_E4M3);
+        const float qs = __half2float(__half(__nv_cvt_fp8_to_halfraw(qb, __NV_E4M3)));
+        sfb[g] = qb;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const unsigned lo = e2m1_rn(v[4 * w] / qs) | (e2m1_rn(v[4 * w + 1] / qs) << 4);
+            const unsigned hi = e2m1_rn(v[4 * w + 2] / qs) | (e2m1_rn(v[4 * w + 3] / qs) << 4);
+            if (w & 1) nib[g * 2 + (w >> 1)] |= (lo | (hi << 8)) << 16;
+            else       nib[g * 2 + (w >> 1)] = lo | (hi << 8);
+        }
+    }
+    *reinterpret_cast<uint4*>(q + ((size_t)row * k + e0) / 2) =
+        make_uint4(nib[0], nib[1], nib[2], nib[3]);
+    const unsigned short s2 = (unsigned short)(sfb[0] | (sfb[1] << 8));
+    const int g0 = e0 / 16;
+    if (sfl) *reinterpret_cast<unsigned short*>(sfl + sf_cutlass_off(row, g0, k / 16)) = s2;
+    else *reinterpret_cast<unsigned short*>(sf + (size_t)row * (k / 16) + g0) = s2;
+}
+
 // Prefill's NVFP4 B operand from the stored blocks. A trit is exact in e2m1, so the only rounding
 // is the block scale: s_b * 2^10 is written as m * sf, m one of e2m1's magnitudes {1, 1.5, 2, 3,
 // 4, 6} and sf a ue4m3, the pair closest to it (the GEMM's alpha takes the 2^-10 back off). The
@@ -1320,6 +1424,22 @@ bool launch_ptq1_rotq_rows_nvfp4(const void* x_bf16, const void* up_bf16, const 
     const auto* u = static_cast<const __nv_bfloat16*>(up_bf16);
     auto* qq = static_cast<signed char*>(q);
     auto* sf = static_cast<signed char*>(sf_rowmajor);
+    // Warp per (span, row), bit-identical output. SPARKINFER_PREFILL_ROTQ_FP4_SPAN=0 restores the
+    // CTA-per-row kernel below (A/B in one binary).
+    static const bool span = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ROTQ_FP4_SPAN");
+        return !(e && e[0] == '0');
+    }();
+    if (span) {
+        if (!u && k > 8 * kSpan) return false;   // the same shapes the kernel below takes
+        const long items = (long)rows * (k / kSpan);
+        const unsigned grid = (unsigned)((items + 7) / 8);
+        auto* qu = reinterpret_cast<unsigned char*>(qq);
+        auto* su = reinterpret_cast<unsigned char*>(sf);
+        if (u) ptq1_rotq_span_fp4_kernel<true><<<grid, 256, 0, st>>>(x, sign, qu, su, rows, k, u, sfl);
+        else   ptq1_rotq_span_fp4_kernel<false><<<grid, 256, 0, st>>>(x, sign, qu, su, rows, k, nullptr, sfl);
+        return true;
+    }
     if (u) {
         if (k <= 8 * kSpan)
             ptq1_rotq_rows_i8_kernel<8, true, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, u, sfl);
