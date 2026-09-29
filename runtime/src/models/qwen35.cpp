@@ -1891,6 +1891,25 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     static int pf_win = -1;
     if (pf_win < 0) { const char* e = getenv("SPARKINFER_MG_L2PF_WIN"); pf_win = e ? atoi(e) : 7; }
 
+    // The decode shadow's xn, rotated and quantized into bonsai_ffn_q by the norm that wrote it
+    // (the previous layer's tail, launch_ptq1_add_norm_rotq_bf16), so its first reader -- the next
+    // layer's projections or the head -- skips its own rotq. Cleared by that reader.
+    // SPARKINFER_BONSAI_TAIL_ROTQ=0 keeps the norm and the rotq as two launches.
+    static const bool kTailRotq = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_TAIL_ROTQ");
+        return !(e && e[0] == '0');
+    }();
+    bool xn_rq_ready = false;
+    auto rotq_xn = [&]() -> bool {
+        if (xn_rq_ready) {
+            xn_rq_ready = false;
+            return true;
+        }
+        return kernels::launch_ptq1_rotq_bf16(s.xn, s.bonsai_sign_h, s.bonsai_ffn_q,
+                                              s.bonsai_ffn_qd, s.bonsai_ffn_qs, 1, (int)H,
+                                              (int)s.bonsai_block, st);
+    };
+
     for (int L = 0; L < c.n_layers; L++) {
         // The decode shadow's weights: the FFN read through the dp4a GEMV, the attention and output
         // projections through the int8 one. Native residency keeps the float kernels its packed
@@ -2094,10 +2113,21 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // shared), alpha/beta as before.
             const bool gdn_t = dec_shadow && s.bonsai_ffn_q && s.bonsai_sign_h &&
                                w.wqkv_type == kPtq1GgmlType && w.wqkv_gate_type == kPtq1GgmlType;
+            // Fused conv_split + l2_norm: one kernel instead of three (SPARKINFER_GDN_FUSE=0 restores split).
+            static int gdn_fuse = -1;
+            if (gdn_fuse < 0) { const char* e = getenv("SPARKINFER_GDN_FUSE"); gdn_fuse = (e && e[0] == '0') ? 0 : 1; }
+            const bool conv_fused = gdn_fuse && c.linear_head_dim == 128 && c.linear_q_heads == 16 &&
+                                    (c.linear_v_heads == 32 || c.linear_v_heads == 48);
+            // The decode shadow's qkv leaves its k-split partials for the conv to sum, which
+            // saves the reduce launch between them (the same bits: see
+            // launch_qwen36_conv_split_l2norm_part). SPARKINFER_BONSAI_QKV_PART=0 keeps the reduce.
+            static const bool kQkvPart = [] {
+                const char* e = getenv("SPARKINFER_BONSAI_QKV_PART");
+                return !(e && e[0] == '0');
+            }();
+            int qkv_splits = 0;
             if (gdn_t) {
-                kernels::launch_ptq1_rotq_bf16(s.xn, s.bonsai_sign_h, s.bonsai_ffn_q,
-                                               s.bonsai_ffn_qd, s.bonsai_ffn_qs, 1, (int)H,
-                                               (int)s.bonsai_block, st);
+                rotq_xn();
                 cudaStream_t zs = st, abs_ = st;
                 if (gdn_pipelined) {
                     cudaEventRecord(s.ev_pipe_fork, st);
@@ -2111,7 +2141,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, abs_);
                 proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, abs_);
                 if (gdn_pipelined) cudaEventRecord(s.ev_gdn_ab, s.stream_v);
-                gemv8(w.wqkv, nullptr, s.lin_qkv, nullptr, (int)s.linear_qkvdim, (int)H, st, 0);
+                if (kQkvPart && kDecRows && conv_fused && s.bonsai_part)
+                    qkv_splits = kernels::launch_gemm_ptq1_i8_row_partials(
+                        s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs, w.wqkv,
+                        (int)s.linear_qkvdim, (int)H, st, s.bonsai_part, s.bonsai_part_slot);
+                if (!qkv_splits)
+                    gemv8(w.wqkv, nullptr, s.lin_qkv, nullptr, (int)s.linear_qkvdim, (int)H, st, 0);
             } else if (gdn_quad) {
                 kernels::launch_gdn_quad_mmvq_q4k(s.aq81, w.wqkv, w.wqkv_gate, w.ssm_alpha, w.ssm_beta,
                     s.lin_qkv, s.lin_z, s.lin_alpha, s.lin_beta,
@@ -2150,16 +2185,27 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
 
             bf16* conv_state = s.lin_conv_state +
                 (size_t)L * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
-            // Fused conv_split + l2_norm: one kernel instead of three (SPARKINFER_GDN_FUSE=0 restores split).
-            static int gdn_fuse = -1;
-            if (gdn_fuse < 0) { const char* e = getenv("SPARKINFER_GDN_FUSE"); gdn_fuse = (e && e[0] == '0') ? 0 : 1; }
-            if (gdn_fuse && c.linear_head_dim == 128 && c.linear_q_heads == 16 &&
-                (c.linear_v_heads == 32 || c.linear_v_heads == 48)) {
+            // The decode shadow launches the conv and the scan programmatic: the scan's CTAs are
+            // resident while the conv runs and read their state columns then, so the scan's own
+            // state traffic overlaps it (SPARKINFER_BONSAI_GDN_PDL=0 launches both the ordinary way).
+            static const bool kGdnPdl = [] {
+                const char* e = getenv("SPARKINFER_BONSAI_GDN_PDL");
+                return !(e && e[0] == '0');
+            }();
+            const bool gdn_pdl = kGdnPdl && gdn_t;
+            if (qkv_splits > 0) {
+                kernels::launch_qwen36_conv_split_l2norm_part(s.bonsai_part, qkv_splits,
+                                                 w.ssm_conv, conv_state,
+                                                 s.lin_q, s.lin_k, s.lin_v,
+                                                 c.linear_q_heads, c.linear_v_heads,
+                                                 c.linear_head_dim, c.linear_conv_kernel,
+                                                 c.rms_eps, st, gdn_pdl);
+            } else if (conv_fused) {
                 kernels::launch_qwen36_conv_split_l2norm_fused(s.lin_qkv, w.ssm_conv, conv_state,
                                                  s.lin_q, s.lin_k, s.lin_v,
                                                  c.linear_q_heads, c.linear_v_heads,
                                                  c.linear_head_dim, c.linear_conv_kernel,
-                                                 c.rms_eps, st);
+                                                 c.rms_eps, st, gdn_pdl);
             } else {
                 kernels::launch_qwen36_conv_split_l2(s.lin_qkv, w.ssm_conv, conv_state,
                                                  s.lin_q, s.lin_k, s.lin_v,
@@ -2182,7 +2228,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                           s.lin_state, state_off, s.lin_gdn,
                                           c.linear_q_heads, c.linear_v_heads,
                                           c.linear_head_dim, c.gdn_qh_block, st,
-                                          s.active_lin_state_b16);
+                                          s.active_lin_state_b16, gdn_pdl);
             if (gdn_pipelined && !gdn_fused_proj) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
             const bool gdn_gn_q8 = s.gguf && s.use_pq && s.use_llama &&
                                    (w.ssm_out_type == 12 || w.ssm_out_type == 8) &&
@@ -2262,11 +2308,26 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                     w.wq_type == kPtq1GgmlType && w.wk_type == kPtq1GgmlType &&
                                     w.wv_type == kPtq1GgmlType;
                 if (attn_t) {
-                    kernels::launch_ptq1_rotq_bf16(s.xn, s.bonsai_sign_h, s.bonsai_ffn_q,
-                                                   s.bonsai_ffn_qd, s.bonsai_ffn_qs, 1, (int)H,
-                                                   (int)s.bonsai_block, st);
-                    gemv8(w.wq, nullptr, q_dst, nullptr, nq, (int)H, st, 0);
-                    gemv8(w.wk, w.wv, s.k, s.v, s.kvdim, (int)H, st, 0);
+                    rotq_xn();
+                    // k with v beside q on stream_k (its own partials slot), rather than after
+                    // it: alone, their 16 row tiles leave most of the device idle for a whole
+                    // launch. Same kernels, same splits, so the same bits.
+                    // SPARKINFER_BONSAI_KV_SIDE=0 keeps them after q.
+                    static const bool kv_side = [] {
+                        const char* e = getenv("SPARKINFER_BONSAI_KV_SIDE");
+                        return !(e && e[0] == '0');
+                    }();
+                    if (kv_side) {
+                        cudaEventRecord(s.ev_qkv, st);
+                        cudaStreamWaitEvent(s.stream_k, s.ev_qkv, 0);
+                        gemv8(w.wk, w.wv, s.k, s.v, s.kvdim, (int)H, s.stream_k, 1);
+                        cudaEventRecord(s.ev_k, s.stream_k);
+                        gemv8(w.wq, nullptr, q_dst, nullptr, nq, (int)H, st, 0);
+                        cudaStreamWaitEvent(st, s.ev_k, 0);
+                    } else {
+                        gemv8(w.wq, nullptr, q_dst, nullptr, nq, (int)H, st, 0);
+                        gemv8(w.wk, w.wv, s.k, s.v, s.kvdim, (int)H, st, 0);
+                    }
                 } else if (attn_qkv) {
                     kernels::launch_attn_qkv_mmvq_q4k(s.aq81, w.wq, w.wk, w.wv,
                         q_dst, s.k, s.v, nq, s.kvdim, s.kvdim, H, st);
@@ -2300,7 +2361,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             const bool partial_rope = (c.rope_dim > 0 && c.rope_dim < c.head_dim);
-            const bool qkgate_fuse = w.q_has_gate && partial_rope && kv8 && s.use_qkfuse && H == 2048;
+            // The decode shadow's hd256 layers take the one-launch gated form too (split, QK-norm,
+            // partial RoPE and the int8 append): the same arithmetic as the three launches it
+            // replaces, byte for byte. SPARKINFER_BONSAI_QK_FUSE=0 keeps the three.
+            static const bool kBonsaiQkFuse = [] {
+                const char* e = getenv("SPARKINFER_BONSAI_QK_FUSE");
+                return !(e && e[0] == '0');
+            }();
+            const bool qk_fuse_h = H == 2048 || (kBonsaiQkFuse && dec_shadow);
+            const bool qkgate_fuse = w.q_has_gate && partial_rope && kv8 && s.use_qkfuse && qk_fuse_h;
             // w.wgate != nullptr means Q and the gate were projected straight into s.q / s.qgate
             // above, so there is no interleaved s.qraw to split.
             if (w.q_has_gate && !qkgate_fuse && !w.wgate)
@@ -2319,7 +2388,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             } else {
                 // Qwen3.6 (gated / partial-rotary): fuse QK-norm + partial-RoPE + KV when enabled.
                 if (partial_rope && kv8) {
-                    if (s.use_qkfuse && H == 2048) {
+                    if (s.use_qkfuse && qk_fuse_h) {
                         if (qkgate_fuse) {
                             kernels::launch_qknorm_rope_kv_partial_int8_gated(s.qraw, s.q, s.qgate, s.k, s.v,
                                 w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, ltab, s.d_pos, 1,
@@ -2555,6 +2624,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             dbg_bf16(s.ao, H, 40, L);   // tag 40: attn_o_proj output (post wo)
         }
 
+        // Whatever this layer's projections did not consume is stale from here on: only this
+        // layer's own tail may set it again.
+        xn_rq_ready = false;
         // This layer's FFN is the decode shadow's all-ternary dense SwiGLU (the branch below that
         // reads gate, up and down through the dp4a GEMV).
         const bool ffn_t3 = dec_shadow && c.dense_ffn && c.top_k == 1 && s.bonsai_ffn_h &&
@@ -2989,9 +3061,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 kernels::launch_add_rmsnorm3_q8(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
             else
                 kernels::launch_add_rmsnorm3(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
-        } else if (fnq)
-            kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
-        else
+        } else if (fnq) {
+            // The decode shadow: the same sum, norm and Q8_1, plus xn rotated and quantized for
+            // the next layer's projections (or the head) -- one launch, the same bits.
+            xn_rq_ready = kTailRotq && dec_shadow && s.bonsai_ffn_q && s.bonsai_sign_h &&
+                          kernels::launch_ptq1_add_norm_rotq_bf16(
+                              s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, c.rms_eps,
+                              s.bonsai_sign_h, s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs,
+                              1, (int)H, (int)s.bonsai_block, st);
+            if (!xn_rq_ready)
+                kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H,
+                                                c.rms_eps, st);
+        } else
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
         dflash_maybe_capture_layer(L);
     }
@@ -3019,9 +3100,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // silently fed the LM head a stale aq81 left over from the last layer's fresh
     // prepare_xn_quant(xn) quantize (a *different*, pre-final-norm activation vector) --
     // wrong logits on every single decode step. Force a fresh quantize for muse_glimmer.
-    if (s.bonsai_dec_head && s.bonsai_ffn_q &&
-        kernels::launch_ptq1_rotq_bf16(s.xn, s.bonsai_sign_h, s.bonsai_ffn_q, s.bonsai_ffn_qd,
-                                       s.bonsai_ffn_qs, 1, (int)H, (int)s.bonsai_block, st)) {
+    if (s.bonsai_dec_head && s.bonsai_ffn_q && rotq_xn()) {
         // The decode shadow's ternary head through the int8-activation GEMV, the arithmetic the
         // packed step's rows kernel repeats per row: 0.28 GB a token instead of the folded 0.71.
         static const bool kDecRowsHead = [] {

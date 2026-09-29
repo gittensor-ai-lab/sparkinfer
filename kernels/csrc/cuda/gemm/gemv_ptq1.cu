@@ -18,6 +18,20 @@ constexpr int kBlockElems = 128;
 constexpr int kBlockBytes = 28;   // 24 five-trit carriers + 2 four-trit carriers + fp16 scale
 constexpr int kWarpsPerCta = 4;
 
+// Programmatic dependent launch: a kernel launched with it may start while the one before it on
+// the stream still runs, and does only its own work (tables, weight fetches) until the wait.
+// Both are no-ops for a kernel launched the ordinary way.
+__device__ __forceinline__ void dp_pdl_trigger() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+__device__ __forceinline__ void dp_pdl_wait() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+}
+
 // Which carrier byte and trit position a weight sits in. The 24 five-trit bytes are walked in two
 // runs -- 16 then 8 -- each emitting its trits position-major, then the two four-trit bytes. This
 // is ggml's TQ1_0 walk; reading it carrier-major instead gets every value right and every one in
@@ -317,6 +331,25 @@ gemm_ptq1_dp4a_kernel(const unsigned char* __restrict__ w, OutT* __restrict__ y,
     const unsigned* lut = s_lut + lane;
     const int sub = threadIdx.x % G;
     const int nb = k / kBlockElems;
+    const int groups = (n_rows + kDpThreads / G - 1) / (kDpThreads / G);
+    const int all_groups = w1 ? 2 * groups : groups;
+    // The table above and the first row group's first block are the kernel's own: both are in
+    // flight before the wait, so a programmatic launch (launch_dp4a_xs_g) overlaps them with the
+    // tail of the kernel that writes the activation. Same loads into the same registers.
+    unsigned nw[7];
+    {
+        const int grp = blockIdx.x;
+        const bool second = grp >= groups;
+        const int row = (second ? grp - groups : grp) * (kDpThreads / G) + threadIdx.x / G;
+        const bool live = grp < all_groups && row < n_rows;
+        const unsigned* wrow = reinterpret_cast<const unsigned*>(
+            (second ? w1 : w) + (size_t)(live ? row : 0) * nb * kBlockBytes);
+#pragma unroll
+        for (int i = 0; i < 7; ++i)
+            nw[i] = live && sub < nb ? __ldg(wrow + (size_t)sub * 7 + i) : 0u;
+    }
+    dp_pdl_wait();
+    dp_pdl_trigger();
     const int4* xq = DP_XQ(slot);
     const float* xs = DP_XS(slot);
     const int* xsum = DP_XSUM(slot);
@@ -330,8 +363,7 @@ gemm_ptq1_dp4a_kernel(const unsigned char* __restrict__ w, OutT* __restrict__ y,
     }
     __syncthreads();
 
-    const int groups = (n_rows + kDpThreads / G - 1) / (kDpThreads / G);
-    const int all_groups = w1 ? 2 * groups : groups;
+    bool first = true;
     for (int grp = blockIdx.x; grp < all_groups; grp += gridDim.x) {
         const bool second = grp >= groups;
         const unsigned char* W = second ? w1 : w;
@@ -346,9 +378,11 @@ gemm_ptq1_dp4a_kernel(const unsigned char* __restrict__ w, OutT* __restrict__ y,
         if (live) {
             const unsigned* wrow =
                 reinterpret_cast<const unsigned*>(W + (size_t)row * nb * kBlockBytes);
-            unsigned nw[7];
+            if (!first) {
 #pragma unroll
-            for (int i = 0; i < 7; ++i) nw[i] = sub < nb ? __ldg(wrow + (size_t)sub * 7 + i) : 0u;
+                for (int i = 0; i < 7; ++i)
+                    nw[i] = sub < nb ? __ldg(wrow + (size_t)sub * 7 + i) : 0u;
+            }
             for (int b = sub; b < nb; b += G) {
                 unsigned wq[7];
 #pragma unroll
@@ -398,6 +432,7 @@ gemm_ptq1_dp4a_kernel(const unsigned char* __restrict__ w, OutT* __restrict__ y,
                 }
             }
         }
+        first = false;
 #pragma unroll
         for (int j = 0; j < BMAX; ++j) {
 #pragma unroll
@@ -480,7 +515,23 @@ void launch_dp4a_xs_g(const unsigned char* w, OutT* y, int n_rows, int k, int sl
     const int groups = (n_rows + kDpThreads / G - 1) / (kDpThreads / G) * (w1 ? 2 : 1);
     const int cap = ptq1_dp4a_persist_on() ? num_sms_dp() * occ : groups;
     const unsigned grid = (unsigned)(groups < cap ? groups : cap);
-    kern<<<grid, kDpThreads, smem, stream>>>(w, y, n_rows, k, 1, slot, w1, y1);
+    // Programmatic (SPARKINFER_PTQ1_DP4A_PDL=0 launches it the ordinary way): the table and the
+    // first weights load while the activation's producer finishes.
+    static const bool pdl = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_DP4A_PDL");
+        return !(e && e[0] == '0');
+    }();
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(grid);
+    cfg.blockDim = dim3(kDpThreads);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute la{};
+    la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la.val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = &la;
+    cfg.numAttrs = pdl ? 1 : 0;
+    cudaLaunchKernelEx(&cfg, kern, w, y, n_rows, k, 1, slot, w1, y1);
 }
 
 template <typename OutT>
@@ -748,6 +799,9 @@ __device__ __forceinline__ void ld4_bf16_f(const __nv_bfloat16* p, float v[4]) {
 __global__ void __launch_bounds__(kRqThreads)
 ptq1_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y,
                          const signed char* __restrict__ sign, float norm, int k, int slot) {
+    // The dp4a GEMV after this may start its table and weight fetches (see dp_rq_launch).
+    dp_pdl_trigger();
+    dp_pdl_wait();
     __shared__ float sh[kRqBlock];
     float v[4];
     ld4_bf16_f(x + (size_t)blockIdx.y * k + blockIdx.x * kRqBlock + 4 * threadIdx.x, v);
@@ -760,6 +814,8 @@ __global__ void __launch_bounds__(kRqThreads)
 ptq1_swiglu_rotate_quant_kernel(const __nv_bfloat16* __restrict__ gate,
                                 const __nv_bfloat16* __restrict__ up, __nv_bfloat16* __restrict__ y,
                                 const signed char* __restrict__ sign, float norm, int k, int slot) {
+    dp_pdl_trigger();
+    dp_pdl_wait();
     __shared__ float sh[kRqBlock];
     const size_t off = (size_t)blockIdx.y * k + blockIdx.x * kRqBlock + 4 * threadIdx.x;
     float g[4], u[4], v[4];
@@ -798,6 +854,8 @@ ptq1_add_norm_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x,
                                   __nv_bfloat16* __restrict__ y,
                                   const signed char* __restrict__ sign,
                                   float norm, int k, int slot) {
+    dp_pdl_trigger();
+    dp_pdl_wait();
     __shared__ float sh[kRqBlock];
     __shared__ float s_warp[32];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -1079,6 +1137,28 @@ void ptq1_dp_release() {
     g_dp_mem = nullptr;
 }
 
+// The single-row rotate-and-quantize launches, programmatic: each waits for the kernel before it
+// on the stream before reading anything, and lets the dp4a GEMV after it become resident at once,
+// so that GEMV builds its table and fetches its first weights while this one runs.
+// SPARKINFER_PTQ1_RQ_PDL=0 launches them the ordinary way.
+template <typename... KArgs, typename... Args>
+void dp_rq_launch(void (*kernel)(KArgs...), dim3 grid, cudaStream_t stream, Args... args) {
+    static const bool pdl = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_RQ_PDL");
+        return !(e && e[0] == '0');
+    }();
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = dim3(kRqThreads);
+    cfg.stream = stream;
+    cudaLaunchAttribute la{};
+    la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la.val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = &la;
+    cfg.numAttrs = pdl ? 1 : 0;
+    cudaLaunchKernelEx(&cfg, kernel, args...);
+}
+
 int launch_ptq1_rotate_quant(const void* x_bf16, void* y_bf16, const signed char* sign, int k,
                              int block, cudaStream_t stream) {
     if (!ptq1_rotq_on() || !ptq1_dp4a_on() || !g_dp_mem || block != kRqBlock || k <= 0 ||
@@ -1087,9 +1167,9 @@ int launch_ptq1_rotate_quant(const void* x_bf16, void* y_bf16, const signed char
         return -1;
     }
     const int slot = next_dp_slot();
-    ptq1_rotate_quant_kernel<<<(unsigned)(k / kRqBlock), kRqThreads, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x_bf16), reinterpret_cast<__nv_bfloat16*>(y_bf16),
-        sign, rsqrtf((float)block), k, slot);
+    dp_rq_launch(ptq1_rotate_quant_kernel, dim3((unsigned)(k / kRqBlock)), stream,
+                 reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+                 reinterpret_cast<__nv_bfloat16*>(y_bf16), sign, rsqrtf((float)block), k, slot);
     return slot;
 }
 
@@ -1100,10 +1180,10 @@ int launch_ptq1_swiglu_rotate_quant(const void* gate_bf16, const void* up_bf16, 
         block != kRqBlock || k <= 0 || k % kRqBlock != 0 || k > kDpMaxK)
         return -1;
     const int slot = next_dp_slot();
-    ptq1_swiglu_rotate_quant_kernel<<<(unsigned)(k / kRqBlock), kRqThreads, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
-        reinterpret_cast<const __nv_bfloat16*>(up_bf16), reinterpret_cast<__nv_bfloat16*>(y_bf16),
-        sign, rsqrtf((float)block), k, slot);
+    dp_rq_launch(ptq1_swiglu_rotate_quant_kernel, dim3((unsigned)(k / kRqBlock)), stream,
+                 reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
+                 reinterpret_cast<const __nv_bfloat16*>(up_bf16),
+                 reinterpret_cast<__nv_bfloat16*>(y_bf16), sign, rsqrtf((float)block), k, slot);
     return slot;
 }
 
@@ -1116,13 +1196,16 @@ int launch_ptq1_add_norm_rotate_quant(const void* x, const void* residual, const
         block != kRqBlock || k <= 0 || k % kRqBlock != 0 || k > 8192)
         return -1;
     const int slot = next_dp_slot();
-    ptq1_add_norm_rotate_quant_kernel<<<(unsigned)(k / kRqBlock), kRqThreads, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(residual),
-        reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out_sum),
-        reinterpret_cast<__nv_bfloat16*>(out_norm), reinterpret_cast<dp_blk_q8_1*>(out_q8), eps,
-        reinterpret_cast<__nv_bfloat16*>(y_bf16), sign, rsqrtf((float)block), k, slot);
+    dp_rq_launch(ptq1_add_norm_rotate_quant_kernel, dim3((unsigned)(k / kRqBlock)), stream,
+                 reinterpret_cast<const __nv_bfloat16*>(x),
+                 reinterpret_cast<const __nv_bfloat16*>(residual),
+                 reinterpret_cast<const __nv_bfloat16*>(weight),
+                 reinterpret_cast<__nv_bfloat16*>(out_sum), reinterpret_cast<__nv_bfloat16*>(out_norm),
+                 reinterpret_cast<dp_blk_q8_1*>(out_q8), eps, reinterpret_cast<__nv_bfloat16*>(y_bf16),
+                 sign, rsqrtf((float)block), k, slot);
     return slot;
 }
+
 
 int launch_ptq1_rotate_quant_rows(const void* x_bf16, void* y_bf16, const signed char* sign, int k,
                                   int batch, int block, cudaStream_t stream) {

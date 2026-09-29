@@ -917,6 +917,15 @@ void launch_mma_rows(const signed char* xq, const float* xd, const int* xs, cons
                                                nullptr, st);
 }
 
+// SPARKINFER_PTQ1_ROW1_TILES=0 keeps a single row on the packed launches' tiles and stages.
+bool row1_tiles_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_ROW1_TILES");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
 template <typename OutT>
 bool launch_rows_i8(const signed char* xq, const float* xd, const int* xs, const void* w0,
                     const void* w1, OutT* y0, OutT* y1, int m, int n_rows, int k,
@@ -965,6 +974,16 @@ bool launch_rows_i8(const signed char* xq, const float* xd, const int* xs, const
             else
                 launch_mma_rows_t<4, 2, OutT, false, kBalWarps>(q, d, s, w0, w1, a, b, mc, n_rows,
                                                                 nblk, 1, nullptr, st);
+        } else if (mc == 1 && row1_tiles_on()) {
+            // One row: split launches take 64-row tiles (twice the CTAs at half the shared
+            // memory, so a split's few steps have more of them in flight per SM), and unsplit
+            // ones (the head) a third weight stage. Tiles and stages never touch a row's sums.
+            if (S > 1)
+                launch_mma_rows_t<1, 2, OutT, true, 4>(q, d, s, w0, w1, a, b, mc, n_rows, nblk,
+                                                       S, part, st);
+            else
+                launch_mma_rows_t<1, 3, OutT, false>(q, d, s, w0, w1, a, b, mc, n_rows, nblk, 1,
+                                                     nullptr, st);
         } else if (mc <= 8) {
             launch_mma_rows<1, 2, OutT>(q, d, s, w0, w1, a, b, mc, n_rows, nblk, S, part, st);
         } else if (mc <= 16) {
@@ -1384,6 +1403,41 @@ bool launch_gemm_ptq1_i8_rows_bf16(const signed char* xq, const float* xd, const
     return launch_rows_i8<__nv_bfloat16>(xq, xd, xs, w0, w1, static_cast<__nv_bfloat16*>(y0),
                                          static_cast<__nv_bfloat16*>(y1), m, n_rows, k, st, part,
                                          part_cap);
+}
+
+// launch_gemm_ptq1_i8_row_partials' kernel: launch_rows_i8's for one split row, without the
+// reduce launch after it.
+template <int WARPS>
+void launch_row_partials_t(const signed char* xq, const float* xd, const int* xs, const void* w,
+                           int n_rows, int nblk, int S, float* part, cudaStream_t st) {
+    constexpr int NT = 1, KB = kStepBlocks, ST = 2;
+    auto kern = ptq1_mma_rows_kernel<NT, WARPS, KB, ST, __nv_bfloat16, true>;
+    constexpr size_t shm = (size_t)ST * (WARPS * 16 * KB * kBlkBytes + NT * 8 * (KB * kBlk + 16) +
+                                         NT * 8 * KB * 8);
+    static const bool attr = [&] {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+        return true;
+    }();
+    (void)attr;
+    const int ctas = (n_rows + 16 * WARPS - 1) / (16 * WARPS);
+    const int nsteps = nblk / KB, sps = (nsteps + S - 1) / S;
+    launch_rows_pdl(true, kern, dim3(ctas, S), dim3(WARPS * 32), shm, st, xq, xd, xs,
+                    static_cast<const unsigned char*>(w), (const unsigned char*)nullptr,
+                    (__nv_bfloat16*)nullptr, (__nv_bfloat16*)nullptr, 1, n_rows, nblk, ctas, part,
+                    sps, (unsigned*)nullptr);   // no arrival counters: the partials are the output
+}
+
+int launch_gemm_ptq1_i8_row_partials(const signed char* xq, const float* xd, const int* xs,
+                                     const void* w, int n_rows, int k, cudaStream_t st,
+                                     float* part, size_t part_cap) {
+    if (!part || n_rows <= 0 || n_rows % 128 != 0 || k <= 0 || k % (kBlk * kStepBlocks) != 0)
+        return 0;
+    const int nblk = k / kBlk;
+    const int S = row_splits(n_rows, nblk, 1);
+    if (S < 2 || (size_t)S * n_rows > part_cap) return 0;
+    if (row1_tiles_on()) launch_row_partials_t<4>(xq, xd, xs, w, n_rows, nblk, S, part, st);
+    else                 launch_row_partials_t<8>(xq, xd, xs, w, n_rows, nblk, S, part, st);
+    return S;
 }
 
 bool launch_ptq1_rows_i8(const void* w_ptq1, signed char* q, float* scale, int rows, int k,

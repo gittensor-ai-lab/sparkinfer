@@ -4,6 +4,7 @@
 
 #include <cuda_bf16.h>
 #include <cstdio>
+#include <cstdint>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
 #endif
@@ -20,6 +21,15 @@ __global__ void embedding_kernel(const int* __restrict__ ids,
     const int id = ids[t];
     for (int h = threadIdx.x; h < hidden; h += blockDim.x)
         out[(size_t)t * hidden + h] = table[(size_t)id * hidden + h];
+}
+// The same copy 16 bytes at a time, for rows whose width is a multiple of 8 on 16-byte-aligned
+// pointers: a decode step's one row was 20 dependent two-byte copies per thread.
+__global__ void embedding_vec_kernel(const int* __restrict__ ids, const uint4* __restrict__ table,
+                                     uint4* __restrict__ out, int hidden8) {
+    const int t  = blockIdx.x;
+    const int id = ids[t];
+    for (int h = threadIdx.x; h < hidden8; h += blockDim.x)
+        out[(size_t)t * hidden8 + h] = table[(size_t)id * hidden8 + h];
 }
 
 // argmax tie-break (matches the reference): keep the smaller index on equal values.
@@ -226,6 +236,11 @@ void launch_mg_debug_f32(const float* x_f32, int n, int tag, int layer, int step
 
 void launch_embedding(const int* ids, const void* table, void* out,
                       int n_tokens, int hidden, cudaStream_t stream) {
+    if (hidden % 8 == 0 && ((reinterpret_cast<uintptr_t>(table) | reinterpret_cast<uintptr_t>(out)) & 15) == 0) {
+        embedding_vec_kernel<<<n_tokens, 256, 0, stream>>>(
+            ids, reinterpret_cast<const uint4*>(table), reinterpret_cast<uint4*>(out), hidden / 8);
+        return;
+    }
     embedding_kernel<<<n_tokens, 256, 0, stream>>>(
         ids, reinterpret_cast<const __nv_bfloat16*>(table),
         reinterpret_cast<__nv_bfloat16*>(out), hidden);

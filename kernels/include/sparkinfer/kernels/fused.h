@@ -350,10 +350,22 @@ void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
 // Fused conv_split + per-head l2_norm: one block per head, head_dim threads.
 // Eliminates the two standalone l2_norm_heads kernel launches per GDN layer.
 // SPARKINFER_GDN_FUSE=0 restores the split path for A/B.
+// `pdl`: launched programmatic, the kernel waits for the launch before it on the stream (the
+// projection writing qkv) and lets the one after it start early (launch_qwen36_gdn_ar's `pdl`).
 void launch_qwen36_conv_split_l2norm_fused(const void* qkv_bf16, const void* conv_w_bf16,
                                  void* conv_state_bf16, void* q_bf16, void* k_bf16,
                                  void* v_bf16, int q_heads, int v_heads, int head_dim,
-                                 int conv_kernel, float eps, cudaStream_t stream = nullptr);
+                                 int conv_kernel, float eps, cudaStream_t stream = nullptr,
+                                 bool pdl = false);
+
+// The same, reading the in-projection as `splits` k-split partials (split s of channel d at
+// part[s * qkv_dim + d], launch_gemm_ptq1_i8_row_partials) instead of the reduced bf16 qkv: summed
+// in split order and rounded to bf16 as the reduce would, so the output is the same bits.
+void launch_qwen36_conv_split_l2norm_part(const float* part, int splits, const void* conv_w_bf16,
+                                 void* conv_state_bf16, void* q_bf16, void* k_bf16,
+                                 void* v_bf16, int q_heads, int v_heads, int head_dim,
+                                 int conv_kernel, float eps, cudaStream_t stream = nullptr,
+                                 bool pdl = false);
 
 // qh_block: v-head -> q/k-head broadcast convention. false = cyclic (vh % q_heads), the
 // original/validated convention for Qwythos and Qwen3.6-35B-A3B's checkpoints (v_heads/q_heads
@@ -390,12 +402,15 @@ void launch_qwen36_conv_split_l2norm_fused_batched(
 // within it, counted in state elements -- the same split launch_qwen36_gdn_ar_batched takes, and
 // required for the same reason: with state_compact_b16 the slot offset is a bf16-element offset,
 // so a caller cannot pre-apply it to the float* pointer.
+// `pdl`: launched programmatic, so the fast kernel reads its state columns while the kernel
+// before it on the stream (the conv writing q/k/v) finishes, and waits for it before the rest.
 void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                           const void* alpha_bf16, const void* beta_bf16,
                           const void* dt_bf16, const void* a_bf16,
                           float* state_f32, size_t state_off, void* out_bf16,
                           int q_heads, int v_heads, int head_dim, bool qh_block,
-                          cudaStream_t stream = nullptr, bool state_compact_b16 = false);
+                          cudaStream_t stream = nullptr, bool state_compact_b16 = false,
+                          bool pdl = false);
 
 void launch_qwen36_gated_norm(const void* x_bf16, const void* z_bf16,
                               const void* weight_bf16, void* out_bf16,

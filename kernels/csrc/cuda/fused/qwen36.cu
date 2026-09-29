@@ -24,6 +24,17 @@ __device__ __forceinline__ float q36_wsum(float v) {
     for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
     return v;
 }
+// Programmatic dependent launch (see launch_qwen36_gdn_ar's `pdl`); no-ops for an ordinary launch.
+__device__ __forceinline__ void q36_pdl_trigger() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+__device__ __forceinline__ void q36_pdl_wait() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+}
 
 __global__ void split_q_gate_kernel(const __nv_bfloat16* __restrict__ qg,
                                     __nv_bfloat16* __restrict__ q,
@@ -302,8 +313,6 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
     // v-head -> q/k-head broadcast convention; see launch_qwen36_gdn_ar's own comment.
     const int qh   = qh_block ? (vh / (v_heads / q_heads)) : (vh % q_heads);
     const float scale = rsqrtf((float)HEAD_DIM);
-    const float bb = q36_sigmoid(q36_to_f(beta[vh]));
-    const float g  = __expf(q36_softplus(q36_to_f(alpha[vh]) + q36_to_f(dt[vh])) * q36_to_f(a[vh]));
     const __nv_bfloat16* qhptr = q + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* khptr = k + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* vhptr = v + (size_t)vh * HEAD_DIM;
@@ -311,14 +320,23 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
     float* col = state + col_off;                             // contiguous [HEAD_DIM] rows of column j
     __nv_bfloat16* colb = reinterpret_cast<__nv_bfloat16*>(state) + col_off;
 
+    // The state column is the kernel's own -- nothing launched before it writes it -- so it is
+    // read before the wait: launched programmatic, the read overlaps the conv producing q/k/v.
     float sloc[NROW];
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) {
+        const int i = lane + r * 32;
+        sloc[r] = SB16 ? q36_to_f(colb[i]) : col[i];          // coalesced read
+    }
+    q36_pdl_wait();
+    q36_pdl_trigger();
+    const float bb = q36_sigmoid(q36_to_f(beta[vh]));
+    const float g  = __expf(q36_softplus(q36_to_f(alpha[vh]) + q36_to_f(dt[vh])) * q36_to_f(a[vh]));
     float part_sk = 0.f;
     #pragma unroll
     for (int r = 0; r < NROW; r++) {
         const int i = lane + r * 32;
-        const float s = SB16 ? q36_to_f(colb[i]) : col[i];    // coalesced read
-        sloc[r] = s;
-        part_sk += s * q36_to_f(khptr[i]);
+        part_sk += sloc[r] * q36_to_f(khptr[i]);
     }
     const float sk = g * q36_wsum(part_sk);                   // sk = g * sum_i S[i][j]*k[i]
     const float delta = (q36_to_f(vhptr[j]) - sk) * bb;
@@ -743,7 +761,7 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
                           const void* dt_bf16, const void* a_bf16,
                           float* state_f32, size_t state_off, void* out_bf16,
                           int q_heads, int v_heads, int head_dim, bool qh_block,
-                          cudaStream_t stream, bool state_compact_b16) {
+                          cudaStream_t stream, bool state_compact_b16, bool pdl) {
     static const bool state_bf16 = [] {
         const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
         return e && e[0] == '1';
@@ -766,8 +784,19 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
         constexpr int HD = 128;
         const int c = cols;
         dim3 grid(v_heads, (HD + c - 1) / c);
+        // Programmatic when asked (`pdl`): the CTAs read their state columns while the conv that
+        // writes q/k/v still runs, and wait for it before touching them.
+        cudaLaunchConfig_t lc = {};
+        lc.gridDim = grid;
+        lc.stream = stream;
+        cudaLaunchAttribute la{};
+        la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        la.val.programmaticStreamSerializationAllowed = 1;
+        lc.attrs = &la;
+        lc.numAttrs = pdl ? 1 : 0;
 #define SI_GDN_AR_ONE(C_, B_)                                                              \
-        gdn_ar_fast_kernel<C_, HD, B_><<<grid, (C_) * 32, 0, stream>>>(                    \
+        do { lc.blockDim = dim3((C_) * 32);                                                \
+        cudaLaunchKernelEx(&lc, gdn_ar_fast_kernel<C_, HD, B_>,                            \
             reinterpret_cast<const __nv_bfloat16*>(q_bf16),                                \
             reinterpret_cast<const __nv_bfloat16*>(k_bf16),                                \
             reinterpret_cast<const __nv_bfloat16*>(v_bf16),                                \
@@ -776,7 +805,7 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
             reinterpret_cast<const __nv_bfloat16*>(dt_bf16),                                \
             reinterpret_cast<const __nv_bfloat16*>(a_bf16),                                 \
             state_f32, state_off, reinterpret_cast<__nv_bfloat16*>(out_bf16),               \
-            q_heads, v_heads, (bool)qh_block, state_bf16)
+            q_heads, v_heads, (bool)qh_block, state_bf16); } while (0)
 #define SI_GDN_AR_ONE_SEL(C_) do { if (state_compact_b16) SI_GDN_AR_ONE(C_, true);         \
                                    else                   SI_GDN_AR_ONE(C_, false); } while (0)
         if (c == 4)       SI_GDN_AR_ONE_SEL(4);
@@ -874,6 +903,10 @@ __global__ void conv_split_l2norm_fused_kernel(
     __nv_bfloat16* __restrict__ v,
     int q_heads, int v_heads, int head_dim, int conv_kernel, float eps)
 {
+    // The gdn_ar after this may start reading its state (a launch that is not programmatic
+    // ignores both); nothing here is touched before the projection that writes qkv completes.
+    q36_pdl_trigger();
+    q36_pdl_wait();
     const int h  = blockIdx.x;
     const int t  = threadIdx.x;
     const int q_dim = q_heads * head_dim;
@@ -903,6 +936,74 @@ __global__ void conv_split_l2norm_fused_kernel(
         conv_state[(size_t)p * qkv_dim + d] = conv_state[(size_t)(p + 1) * qkv_dim + d];
     if (conv_kernel > 1)
         conv_state[(size_t)(conv_kernel - 2) * qkv_dim + d] = qkv[d];
+
+    const float oy = q36_silu(y);
+
+    if (do_norm) {
+        const float ss = q36_wsum(oy * oy);
+        __shared__ float sw[32];
+        if ((t & 31) == 0) sw[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (head_dim + 31) / 32) ? sw[t] : 0.f;
+            vv = q36_wsum(vv);
+            if (t == 0) sw[0] = rsqrtf(vv + eps);
+        }
+        __syncthreads();
+        out[0] = __float2bfloat16(oy * sw[0]);
+    } else {
+        out[0] = __float2bfloat16(oy);
+    }
+}
+
+// conv_split_l2norm_fused_kernel reading the in-projection as its k-split partials
+// (launch_gemm_ptq1_i8_row_partials) instead of the reduced qkv: each thread sums its channel's
+// splits in split order and rounds to bf16 exactly as ptq1_split_reduce_kernel writes qkv, so the
+// conv, the state update and the norms see the same values -- and the reduce launch goes.
+__global__ void conv_split_l2norm_part_kernel(
+    const float* __restrict__ part, int splits,
+    const __nv_bfloat16* __restrict__ conv_w,
+    __nv_bfloat16* __restrict__ conv_state,
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    __nv_bfloat16* __restrict__ v,
+    int q_heads, int v_heads, int head_dim, int conv_kernel, float eps)
+{
+    q36_pdl_trigger();
+    q36_pdl_wait();
+    const int h  = blockIdx.x;
+    const int t  = threadIdx.x;
+    const int q_dim = q_heads * head_dim;
+    const int v_dim = v_heads * head_dim;
+    const int qkv_dim = 2 * q_dim + v_dim;
+
+    bool do_norm = false;
+    int d;
+    __nv_bfloat16* out;
+    if (h < q_heads) {
+        d = h * head_dim + t;  out = q + d;           do_norm = true;
+    } else if (h < 2 * q_heads) {
+        d = q_dim + (h - q_heads) * head_dim + t;  out = k + d - q_dim;  do_norm = true;
+    } else {
+        d = 2 * q_dim + (h - 2 * q_heads) * head_dim + t;  out = v + d - 2 * q_dim;
+    }
+    if (d >= qkv_dim) return;
+
+    float a = part[d];
+    for (int sp = 1; sp < splits; ++sp) a = __fadd_rn(a, part[(size_t)sp * qkv_dim + d]);
+    const __nv_bfloat16 xd = __float2bfloat16(a);
+
+    // 1D conv + SiLU
+    float y = 0.f;
+    for (int p = 0; p < conv_kernel - 1; p++)
+        y += q36_to_f(conv_state[(size_t)p * qkv_dim + d]) *
+             q36_to_f(conv_w[(size_t)d * conv_kernel + p]);
+    y += q36_to_f(xd) * q36_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
+
+    for (int p = 0; p < conv_kernel - 2; p++)
+        conv_state[(size_t)p * qkv_dim + d] = conv_state[(size_t)(p + 1) * qkv_dim + d];
+    if (conv_kernel > 1)
+        conv_state[(size_t)(conv_kernel - 2) * qkv_dim + d] = xd;
 
     const float oy = q36_silu(y);
 
@@ -1008,13 +1109,46 @@ void launch_qwen36_conv_split_l2norm_fused_batched(
         q_heads, v_heads, head_dim, conv_kernel, eps);
 }
 
+void launch_qwen36_conv_split_l2norm_part(
+    const float* part, int splits, const void* conv_w_bf16,
+    void* conv_state_bf16, void* q_bf16, void* k_bf16,
+    void* v_bf16, int q_heads, int v_heads, int head_dim,
+    int conv_kernel, float eps, cudaStream_t stream, bool pdl)
+{
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = dim3(2 * q_heads + v_heads);
+    lc.blockDim = dim3(head_dim);
+    lc.stream = stream;
+    cudaLaunchAttribute la{};
+    la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la.val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = &la;
+    lc.numAttrs = pdl ? 1 : 0;
+    cudaLaunchKernelEx(&lc, conv_split_l2norm_part_kernel, part, splits,
+        reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
+        reinterpret_cast<__nv_bfloat16*>(conv_state_bf16),
+        reinterpret_cast<__nv_bfloat16*>(q_bf16),
+        reinterpret_cast<__nv_bfloat16*>(k_bf16),
+        reinterpret_cast<__nv_bfloat16*>(v_bf16),
+        q_heads, v_heads, head_dim, conv_kernel, eps);
+}
+
 void launch_qwen36_conv_split_l2norm_fused(
     const void* qkv_bf16, const void* conv_w_bf16,
     void* conv_state_bf16, void* q_bf16, void* k_bf16,
     void* v_bf16, int q_heads, int v_heads, int head_dim,
-    int conv_kernel, float eps, cudaStream_t stream)
+    int conv_kernel, float eps, cudaStream_t stream, bool pdl)
 {
-    conv_split_l2norm_fused_kernel<<<2 * q_heads + v_heads, head_dim, 0, stream>>>(
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = dim3(2 * q_heads + v_heads);
+    lc.blockDim = dim3(head_dim);
+    lc.stream = stream;
+    cudaLaunchAttribute la{};
+    la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la.val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = &la;
+    lc.numAttrs = pdl ? 1 : 0;
+    cudaLaunchKernelEx(&lc, conv_split_l2norm_fused_kernel,
         reinterpret_cast<const __nv_bfloat16*>(qkv_bf16),
         reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
         reinterpret_cast<__nv_bfloat16*>(conv_state_bf16),

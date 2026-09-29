@@ -64,6 +64,7 @@ int launch_ptq1_add_norm_rotate_quant(const void* x, const void* residual, const
                                       void* out_sum, void* out_norm, void* out_q8, float eps,
                                       void* y_bf16, const signed char* sign, int k, int block,
                                       cudaStream_t stream);
+
 // Two matrices of one shape against the same handle (gate and up) in one launch; each output is
 // what launch_gemv_ptq1_q writes for it.
 void launch_gemv_ptq1_q2(int handle, const void* x_bf16, const void* w0, const void* w1,
@@ -146,6 +147,13 @@ bool launch_gemm_ptq1_i8_rows_bf16(const signed char* xq, const float* xd, const
                                    const void* w0, const void* w1, void* y0_bf16, void* y1_bf16,
                                    int m, int n_rows, int k, cudaStream_t stream,
                                    float* part = nullptr, size_t part_cap = 0);
+// One activation row against one matrix, stopped before the split reduce: the k-split partials
+// are left in part (split s of row r at part[s * n_rows + r]) for the kernel that reads the
+// result to sum, in split order, as the reduce launch would. Returns the split count, or 0 when
+// this shape does not split or part cannot hold it -- the caller then launches the ordinary way.
+int launch_gemm_ptq1_i8_row_partials(const signed char* xq, const float* xd, const int* xs,
+                                     const void* w, int n_rows, int k, cudaStream_t stream,
+                                     float* part, size_t part_cap);
 // The same two with fp32 output, for the LM head's logits: one matrix.
 bool launch_gemv_ptq1_i8_f32(const signed char* xq, const float* xd, const int* xs,
                              const void* w, float* y, int n_rows, int k, cudaStream_t stream);
