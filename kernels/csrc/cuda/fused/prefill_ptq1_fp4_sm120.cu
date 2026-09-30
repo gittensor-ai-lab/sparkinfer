@@ -46,9 +46,11 @@ __device__ __forceinline__ int fp4_perm(int q) {
 }
 
 // ---- activation: rotate, then NVFP4 ---------------------------------------------------------
-// One CTA per row, 256 threads holding four consecutive values of each 1024-span: the rotation is
-// ptq1_rotq_rows_i8_kernel's, value for value. The quantize then reads the span back in slot order,
-// so each four-lane quad owns one 16-slot group.
+// One CTA per (row, span), 256 threads holding four consecutive values of the 1024-span: the
+// rotation is ptq1_rotq_rows_i8_kernel's, value for value. The quantize then reads the span back in
+// slot order, so each four-lane quad owns one 16-slot group. Spans share nothing (the rotation, the
+// scales and the output bytes are all per span), so gridDim.y CTAs split a row's spans between
+// them; gridDim.y = 1 walks them in one CTA.
 template <bool SWIGLU>
 __global__ void __launch_bounds__(256)
 ptq1_rotq_fp4_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ u,
@@ -65,7 +67,7 @@ ptq1_rotq_fp4_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* _
         const int s = t * 4 + i;
         src[i] = (s & ~(kBlk - 1)) + fp4_perm(s & (kBlk - 1));
     }
-    for (int sp = 0; sp < k / kSpan; ++sp) {
+    for (int sp = blockIdx.y; sp < k / kSpan; sp += gridDim.y) {
         const int e0 = sp * kSpan + t * 4;
         uint2 raw = *reinterpret_cast<const uint2*>(x + (size_t)row * k + e0);
         if constexpr (SWIGLU) {
@@ -554,13 +556,23 @@ bool launch_ptq1_rotq_fp4(const void* x_bf16, const void* up_bf16, const signed 
                           void* a, int rows, int k, int block, cudaStream_t st) {
     if (rows <= 0 || block != kSpan || k % kSpan != 0 || !ptq1_fp4_gemm_supported(rows, k))
         return false;
+    // Fewer rows than SMs: a CTA per (row, span). A CTA per row walks its row's 5-17 spans back
+    // to back, and at 128 rows that is 128 CTAs on 170 SMs, each a serial chain of span latencies
+    // (the SwiGLU leg's 17 spans ran 14.2 us for 9 MB; split, 6.0 us). From the SM count up the
+    // row grid already covers the device and keeps its launch.
+    // SPARKINFER_PTQ1_ROTQ_SPANS=0 restores a CTA per row everywhere.
+    static const bool span_grid = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_ROTQ_SPANS");
+        return !(e && e[0] == '0');
+    }();
+    const dim3 grid(rows, span_grid && rows < sm_count() ? k / kSpan : 1);
     const auto* x = static_cast<const __nv_bfloat16*>(x_bf16);
     auto* q = static_cast<unsigned char*>(a);
     if (up_bf16)
-        ptq1_rotq_fp4_kernel<true><<<rows, 256, 0, st>>>(
+        ptq1_rotq_fp4_kernel<true><<<grid, 256, 0, st>>>(
             x, static_cast<const __nv_bfloat16*>(up_bf16), sign, q, rows, k);
     else
-        ptq1_rotq_fp4_kernel<false><<<rows, 256, 0, st>>>(x, nullptr, sign, q, rows, k);
+        ptq1_rotq_fp4_kernel<false><<<grid, 256, 0, st>>>(x, nullptr, sign, q, rows, k);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
