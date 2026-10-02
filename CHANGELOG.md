@@ -13,19 +13,34 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     its own.
   - **Now:** a step fills its budget (1024 prompt tokens by default) across up to 8 waiting
     prompts (`SPARKINFER_MIXED_PROMPTS`), oldest first, and a prompt that ends in the step takes its
-    first token from the same pass, as a packed prefill does. A prompt with more than 2048 tokens
-    left (`SPARKINFER_PREFILL_MIX_MAX`) keeps its own prefill pass, which is faster for it.
-    A chunk that lands on a prefix-cache checkpoint snapshots it; the old single-chunk path
-    skipped that snapshot when a chunk ended exactly on the checkpoint.
-    `SPARKINFER_MIXED_CHUNK=0` turns mixing off.
-  - **Measured** (AIPerf, RTX 5090, Qwen3.8-27B NVFP4 + DFlash2, off -> on):
-    - chat 1024/256, c16: TTFT p50 591 -> 353 ms, 861 -> 851 tok/s (vLLM 0.30: 360 ms, 753 tok/s);
-    - chat 1024/256, c32: TTFT p50 1,183 -> 369 ms, 1,239 -> 1,284 tok/s (vLLM: 356 ms, 1,031);
-    - long answer 128/1024, c32: TTFT p50 237 -> 199 ms, 2,000 -> 2,002 tok/s;
-    - the other cells are within run-to-run variance.
+    first token from the same pass, as a packed prefill does. `SPARKINFER_MIXED_CHUNK=0` turns
+    mixing off.
+    - A prompt with more than 2048 tokens left (`SPARKINFER_PREFILL_MIX_MAX`) keeps its own
+      prefill pass, which is faster for it (8K prompts chunked: -12% output tok/s at c16/c32).
+    - While no more requests are live than a speculation group takes (8), nothing is mixed: that
+      load is speculation's.
+    - A pass is always a multiple of 8 rows: an unaligned one runs every layer on the NVFP4
+      fallback (a 9-row step: 85 ms against 16-20 ms). The last few tokens before a prompt's end
+      or checkpoint take step_job's short-resume forward instead.
+    - A chunk that lands on a prefix-cache checkpoint snapshots it; the old single-chunk path
+      skipped that snapshot when a chunk ended exactly on the checkpoint.
+    - `SPARKINFER_MIXED_TRACE=1` logs every mixed step.
+  - **Measured** (AIPerf, RTX 5090, Qwen3.8-27B NVFP4 + DFlash2; off -> on, vLLM 0.30 beside):
+
+    | cell | TTFT p50 / p90 / p99 (ms) | output tok/s | vLLM TTFT p50 / p90 / p99, tok/s |
+    |---|---|---|---|
+    | chat 1024/256, c16 | 591 / 1,255 / 1,889 -> **355 / 1,240 / 1,845** | 861 -> 858 | 360 / 1,287 / 1,916, 753 |
+    | chat 1024/256, c32 | 1,183 / 2,712 / 3,372 -> **372 / 2,602 / 3,386** | 1,239 -> 1,266 | 356 / 2,811 / 3,815, 1,031 |
+    | long answer 128/1024, c16 | 180 -> 140 (p50) | 1,235 -> 1,235 | 373, 1,092 |
+
+    The other nine cells are within run-to-run variance. ITL p50 rises at chat c16/c32
+    (15.4 -> 17.8 and 18.9 -> 22.3 ms), still under vLLM's 19.8 / 29.2.
+  - **Open arrivals** (`eval/spec_open_arrivals.py`, 80 requests): mean latency 2.91 -> 2.82 s at
+    1 request/s and 4.67 -> 4.58 s at 2.
   - **Tested:** `mixed_step_check` gains `multi` and `finish` modes (a fresh chunk, one resuming
-    mid-prompt, and one finishing its prompt, beside decode rows); `eval/mixed_conc_check.py` runs
-    24 concurrent chats and their follow-up turns with mixing on and off.
+    mid-prompt, and one finishing its prompt, beside decode rows; chunks of 1 to 403 tokens);
+    `eval/mixed_conc_check.py` runs 24 concurrent chats and their follow-up turns with mixing on
+    and off (34/34 greedy answers identical, the same prefix-cache hits).
 
 ## [0.6.3] — 2026-10-02
 
