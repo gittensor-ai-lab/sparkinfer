@@ -5,6 +5,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-10-02
+
+**8K-token prompts at 4-16 concurrent requests are now faster than vLLM.**
+- **Before:** the prefix cache kept about eleven 8K-token prompts on the device, so AIPerf's
+  re-sent long prompts hit it 1% of the time (vLLM 0.30: 35%), and output tok/s at c4 / c16 was
+  147 / 165 against vLLM's 147 / 171.
+- **Now:** prompts pushed off the device stay cached in host memory (#1254): 198 / 191 tok/s.
+
 ### Serving
 
 - **The prefix cache keeps long prompts in host memory once they no longer fit on the device.**

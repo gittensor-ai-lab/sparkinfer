@@ -192,25 +192,29 @@ two with the same drafter. Output tok/s, sparkinfer / vLLM:
 
 | cell (prompt / answer tokens) | 1 request | 4 | 16 | 32 |
 |---|---:|---:|---:|---:|
-| chat (1024 / 256) | **207.0** / 82.8 | **517.1** / 260.8 | **858.3** / 752.7 | **1,265.5** / 1,030.5 |
-| long answer (128 / 1024) | **217.3** / 85.2 | **718.8** / 290.8 | **1,235.4** / 1,092.1 | **2,000.7** / 1,785.4 |
-| long prompt (8192 / 128) | **94.4** / 59.5 | **148.9** / 147.2 | 166.2 / **170.8** | 166.8 / **167.7** |
+| chat (1024 / 256) | **196.8** / 82.8 | **486.8** / 260.8 | **864.3** / 752.7 | **1,369.8** / 1,030.5 |
+| long answer (128 / 1024) | **219.5** / 85.2 | **736.2** / 290.8 | **1,237.2** / 1,092.1 | **1,993.4** / 1,785.4 |
+| long prompt (8192 / 128) | **95.0** / 59.5 | **197.5** / 147.2 | **191.2** / 170.8 | 164.2 / **167.7** |
 
 Time to first token in ms (p50 / p90 / p99):
 
 | cell | engine | 16 requests | 32 requests |
 |---|---|---|---|
-| chat (1024 / 256) | sparkinfer | **355** / **1,240** / **1,845** | 372 / **2,602** / **3,386** |
+| chat (1024 / 256) | sparkinfer | **359** / **1,043** / **1,192** | 729 / **1,718** / **2,337** |
 | | vLLM | 360 / 1,287 / 1,916 | **356** / 2,811 / 3,815 |
-| long answer (128 / 1024) | sparkinfer | **140** / 456 / 526 | **219** / 783 / 894 |
+| long answer (128 / 1024) | sparkinfer | **140** / 459 / 530 | **192** / 804 / 902 |
 | | vLLM | 373 / **381** / **381** | 379 / **500** / **503** |
 
 - **Inter-token latency:** p50 is lower than vLLM's in every cell.
 - **Chat at 16-32 requests:** prefill and decode share one forward pass (mixed steps, on by
   default; `SPARKINFER_MIXED_CHUNK=0` turns them off).
-- **Still behind: the 8K-prompt cells at 16+ requests.** AIPerf re-sends earlier cells' prompts,
-  and vLLM's larger KV pool keeps them in its prefix cache (a 35% hit rate there). Time to first
-  token there is 2.5 / 14.4 s p50 against vLLM's 1.2 / 12.4.
+- **Long prompts:** AIPerf re-sends earlier cells' prompts. The prefix cache keeps the ones that
+  no longer fit on the device in host memory (`SPARKINFER_PREFIX_CACHE_HOST_KV_MB`).
+- **Chat at 32 requests, TTFT p50:** the first wave of 32 requests finishes sooner and closer
+  together, so the next wave arrives at once and queues behind itself. Request latency p50 / p90 /
+  p99 is 5.9 / 7.2 / 7.5 s against vLLM's 7.8 / 10.3 / 11.3.
+- **Still behind:** time to first token in the 8K-prompt cells at 16+ requests, 1.6 / 14.2 s p50
+  against vLLM's 1.2 / 12.4.
 
 ### Same weights, GGUF on both sides
 
