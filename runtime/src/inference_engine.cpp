@@ -1732,7 +1732,7 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
 // generation_config (temperature 1.0 on Qwen3.8), almost every server request then decoded one
 // forward per sequence: aggregate throughput stayed at single-stream speed at any concurrency.
 // A declined batch just falls back to the sequential loop.
-// MIXED STEPS (SPARKINFER_MIXED_CHUNK=<tokens>, 0 = off, the default for now). While requests
+// MIXED STEPS (SPARKINFER_MIXED_CHUNK=<tokens> per step, default 1024, 0 = off). While requests
 // decode and prompts wait, the decode step carries chunks of those prompts in the same forward:
 // the decode rows ride the chunks' weight reads instead of stalling behind prefill passes of their
 // own. The step's prompt tokens are filled oldest prompt first, as vLLM fills its token budget --
@@ -1746,7 +1746,7 @@ void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefi
                                               std::vector<uint64_t>& unmixable) {
     static const int budget = [] {
         const char* e = getenv("SPARKINFER_MIXED_CHUNK");
-        return e ? std::max(0, atoi(e)) : 0;
+        return e ? std::max(0, atoi(e)) : 1024;
     }();
     // At most this many prompts in one step (SPARKINFER_MIXED_PROMPTS).
     static const int max_prompts = [] {

@@ -7,11 +7,11 @@ Two launches from the same binary run the same load, mixing on and off:
   wave 2   a follow-up turn for 16 of those conversations, at once: their prompts start with
            wave 1's, so they hit the prefix cache, which only has entries if the checkpoints were
            taken while the prompts were prefilled
-Checks, per launch: every request succeeds, stops at its max_tokens or end of turn, a logprobs
-request has one entry per completion token, and the prefix cache took hits in wave 2. Across the
-launches: how far each greedy answer agrees. The two launches run different pass shapes, so near
-ties may flip late; a layout slip (a prompt's tokens or state in another's slot) shows up as
-answers that disagree from the first tokens.
+Checks, per launch: every request succeeds, stops at its max_tokens or end of turn, and a logprobs
+request has one entry per completion token. Across the launches: wave 2 takes as many prefix-cache
+hits with mixing as without (the checkpoints were taken), and how far each greedy answer agrees.
+The two launches run different pass shapes, so near ties may flip late; a layout slip (a prompt's
+tokens or state in another's slot) shows up as answers that disagree from the first tokens.
 
 usage: mixed_conc_check.py <server-bin> <model-dir> [ENV=VAL ...]   (extra env for both launches)
 """
@@ -156,7 +156,8 @@ for name, (r1, r2, hits) in (("mixed", on), ("plain", off)):
     print(f"{name}: {len(bad)} problems, wave-2 prefix-cache hits {hits:.0f}/16")
     for b in bad[:10]:
         print("   ", b)
-    ok = ok and not bad and hits >= 8
+    ok = ok and not bad
+ok = ok and on[2] >= off[2] and on[2] > 0
 rows = []
 for w, (a, b) in enumerate(((on[0], off[0]), (on[1], off[1]))):
     for i, (x, y) in enumerate(zip(a, b)):

@@ -5,6 +5,28 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Serving
+
+- **Mixed prefill + decode steps are on by default, and one step carries several prompts.**
+  - **Before:** a mixed step (`SPARKINFER_MIXED_CHUNK`, opt-in) carried part of one waiting
+    prompt; the others queued behind it, and every prompt still ended with a separate forward of
+    its own.
+  - **Now:** a step fills its budget (1024 prompt tokens by default) across up to 8 waiting
+    prompts (`SPARKINFER_MIXED_PROMPTS`), oldest first, and a prompt that ends in the step takes its
+    first token from the same pass, as a packed prefill does. A prompt with more than 2048 tokens
+    left (`SPARKINFER_PREFILL_MIX_MAX`) keeps its own prefill pass, which is faster for it.
+    A chunk that lands on a prefix-cache checkpoint snapshots it; the old single-chunk path
+    skipped that snapshot when a chunk ended exactly on the checkpoint.
+    `SPARKINFER_MIXED_CHUNK=0` turns mixing off.
+  - **Measured** (AIPerf, RTX 5090, Qwen3.8-27B NVFP4 + DFlash2, off -> on):
+    - chat 1024/256, c16: TTFT p50 591 -> 353 ms, 861 -> 851 tok/s (vLLM 0.30: 360 ms, 753 tok/s);
+    - chat 1024/256, c32: TTFT p50 1,183 -> 369 ms, 1,239 -> 1,284 tok/s (vLLM: 356 ms, 1,031);
+    - long answer 128/1024, c32: TTFT p50 237 -> 199 ms, 2,000 -> 2,002 tok/s;
+    - the other cells are within run-to-run variance.
+  - **Tested:** `mixed_step_check` gains `multi` and `finish` modes (a fresh chunk, one resuming
+    mid-prompt, and one finishing its prompt, beside decode rows); `eval/mixed_conc_check.py` runs
+    24 concurrent chats and their follow-up turns with mixing on and off.
+
 ## [0.6.3] — 2026-10-02
 
 **Speculation keeps working under a continuous load.**
