@@ -2181,7 +2181,35 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     }();
     const int N8 = N & ~7;
     const bf16* f4_A = nullptr; const void* f4_sign = nullptr; int f4_K = 0;
-    auto tfp4_act = [&](const bf16* A, const void* sign, int K) -> bool {
+    // THE ROW'S PRODUCER, FOLDED INTO ITS ROTATE + QUANTIZE. A long prompt's ternary leg reads an
+    // activation that one elementwise pass has just written -- the input or pre-FFN RMSNorm, the
+    // GDN gated norm, the attention gate -- and that pass and the rotate + quantize are each a
+    // DRAM round trip of [N, K] bf16 (N*K*2 B past L2 at 16k rows). With `pre` set the rotate +
+    // quantize runs the producer itself on the row as it loads it
+    // (launch_ptq1_{norm,gated_norm,gate}_rotq_rows_nvfp4) and A is the producer's INPUT: the
+    // operand is byte for byte the two-pass one and the bf16 row in between is never stored
+    // (TPre::xn_out: it is, for a norm with other readers). Not with a ragged tail (N8 < N),
+    // whose last rows are rotated a second time from the bf16 row.
+    // SPARKINFER_PREFILL_TERNARY_PRE_FOLD: bit 1 the pre-FFN norm, 2 the gated norm, 4 the
+    // attention gate, 8 the layer's input norm (default 15; 0 keeps every pass apart, A/B).
+    struct TPre {
+        enum { kNorm = 1, kGated = 2, kGate = 3 };
+        int kind = 0;
+        const bf16* aux = nullptr;    // kGated: z, kGate: the gate, both tight like the row
+        const void* w = nullptr;      // kNorm / kGated: the norm's weight
+        float eps = 0.f;
+        bf16* xn_out = nullptr;       // kNorm: also store the bf16 norm here
+        int r0 = 0;                   // rows [r0, N) only (a multiple of 128): see tfp4_gemm
+    };
+    static const int tpre_mask = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_TERNARY_PRE_FOLD");
+        return e ? atoi(e) : 15;
+    }();
+    // Set by norm_xn when the layer's input norm already left xn's rotated FP4 operand in A_i8
+    // (the same fold, from the producer's side: xn has other readers, so it is stored too). The
+    // next tfp4_act over xn -- the layer's in-legs, its first activation quantize -- takes it.
+    bool xn_tfp4_ready = false;
+    auto tfp4_act = [&](const bf16* A, const void* sign, int K, const TPre* pre = nullptr) -> bool {
         f4_A = nullptr;
         void *d, *r, *l;
         if (!tfp4_proj_env || qb_fires || N8 < 8 || !A_i8 || !W_i8 || !wbuf || !sign ||
@@ -2190,28 +2218,71 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             fp4_parts(A_i8, N8, K, &d, &r, &l, false) + fp4_parts(A_i8, 8, K, &d, &r, &l, false) >
                 a_i8_sz)
             return false;
+        if (pre && (N8 != N || (pre->r0 & 127) || pre->r0 >= N)) return false;
+        if (!pre && xn_tfp4_ready && A == xn && K == H && sign == s.bonsai_sign_hidden) {
+            xn_tfp4_ready = false;
+            a_q = nullptr; a_pk = false;
+            f4_A = A; f4_sign = sign; f4_K = K;
+            return true;
+        }
+        xn_tfp4_ready = false;         // A_i8 is about to hold another operand
         fp4_parts(A_i8, N8, K, &d, &r, &l, false);
-        if (!kernels::launch_ptq1_rotq_rows_nvfp4(A, nullptr, static_cast<const signed char*>(sign),
-                                                  d, nullptr, N8, K, s.bonsai_block, st, l))
-            return false;
+        const auto* sg = static_cast<const signed char*>(sign);
+        // pre->r0: the operand's rows from r0 on, written where the whole operand has them (the
+        // scale layout is 128-row atoms, K atoms fastest), so tfp4_gemm reads them as its tail.
+        const int r0 = pre ? pre->r0 : 0, rows = N8 - r0;
+        const size_t ro = (size_t)r0 * K;
+        void* const dq = static_cast<char*>(d) + ro / 2;
+        void* const lq = static_cast<char*>(l) + (size_t)(r0 >> 7) * (size_t)(K >> 6) * 512;
+        const bool ok =
+            !pre ? kernels::launch_ptq1_rotq_rows_nvfp4(A, nullptr, sg, d, nullptr, N8, K,
+                                                        s.bonsai_block, st, l)
+            : pre->kind == TPre::kNorm
+                ? kernels::launch_ptq1_norm_rotq_rows_nvfp4(
+                      A + ro, pre->w, pre->eps, pre->xn_out ? pre->xn_out + ro : nullptr, sg, dq,
+                      rows, K, s.bonsai_block, st, lq)
+            : pre->kind == TPre::kGated
+                ? kernels::launch_ptq1_gated_norm_rotq_rows_nvfp4(
+                      A + ro, pre->aux + ro, pre->w, pre->eps, c.linear_head_dim, sg, dq, rows, K,
+                      s.bonsai_block, st, lq)
+                : kernels::launch_ptq1_gate_rotq_rows_nvfp4(A + ro, pre->aux + ro, sg, dq, rows, K,
+                                                            s.bonsai_block, st, lq);
+        if (!ok) return false;
         a_q = nullptr; a_pk = false;   // A_i8 now holds FP4 operands: no int8 memo may reuse it
         f4_A = A; f4_sign = sign; f4_K = K;
         return true;
     };
     // One leg on tfp4_act's operand: C = A @ W^T (resid: C += it). False, before writing C, only
     // where the leg's shape does not fit; the caller then runs its int8 legs.
-    auto tfp4_gemm = [&](const void* W, int n_out, bf16* C, bool resid) -> bool {
+    // run > 0: the leg is `n_out` of W's rows gathered in runs of `run` every `period`, from row
+    // `row0` on (launch_ptq1_rows_nvfp4_runs) -- the q rows or the gate rows of wq.
+    // a_r0 (a multiple of 128): only rows [a_r0, N) of C are produced, from the operand's tail --
+    // its scale layout is 128-row atoms, so a tail of the operand is an operand.
+    auto tfp4_gemm = [&](const void* W, int n_out, bf16* C, bool resid, int run = 0,
+                         int period = 0, int row0 = 0, int a_r0 = 0) -> bool {
         const int K = f4_K;
         void *wd, *wr, *wl, *ad, *ar, *al;
-        if (!f4_A || !W || (n_out % 128) ||
+        if (!f4_A || !W || (n_out % 128) || (a_r0 & 127) || a_r0 >= N8 ||
             fp4_parts(W_i8, n_out, K, &wd, &wr, &wl, true) > maxw ||
             (N8 < N && (size_t)8 * n_out > maxw))
             return false;
         const float alpha = kernels::ptq1_nvfp4_alpha();
-        kernels::launch_ptq1_rows_nvfp4(W, wd, nullptr, n_out, K, st, wl);
+        if (run > 0) {
+            if (!kernels::launch_ptq1_rows_nvfp4_runs(
+                    static_cast<const char*>(W) + (size_t)row0 * (K / 128) * 28, wd, n_out, K,
+                    run, period, st, wl))
+                return false;
+        } else {
+            kernels::launch_ptq1_rows_nvfp4(W, wd, nullptr, n_out, K, st, wl);
+        }
         const size_t a_main = fp4_parts(A_i8, N8, K, &ad, &ar, &al, false);
-        kernels::launch_prefill_nvfp4_gemm(ad, al, wd, wl, C, N8, n_out, K, nullptr, st, alpha,
-                                           resid ? C : nullptr);
+        {
+            bf16* const Cr = C + (size_t)a_r0 * n_out;
+            kernels::launch_prefill_nvfp4_gemm(
+                static_cast<char*>(ad) + (size_t)a_r0 * K / 2,
+                static_cast<char*>(al) + (size_t)(a_r0 >> 7) * (size_t)(K >> 6) * 512, wd, wl, Cr,
+                N8 - a_r0, n_out, K, nullptr, st, alpha, resid ? Cr : nullptr);
+        }
         if (N8 < N) {
             const int tail = N - N8;
             bf16* T = reinterpret_cast<bf16*>(wbuf);
@@ -2474,8 +2545,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             !(gdn_nvfp4 && (gdn_fp4_mask & 1) && nw->gdn_qkv_fp4 && nw->gdn_qkv_fp4_sf &&
               nw->gdn_z_fp4 && nw->gdn_z_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws);
     };
+    // The next layer's in-legs (GDN qkv/z, or attention q|gate/k/v) are ternary legs the long
+    // prompt reads through tfp4_act(xn): the norm then writes that operand as well as xn (see
+    // TPre and xn_tfp4_ready). tfp4_act itself declines every pass that arm does not take.
+    auto xn_tfp4_for = [&](const Qwen35LayerWeights* nw) {
+        if (!(tpre_mask & 8) || !nw || !s.bonsai_pf_layers || !s.bonsai_pf_rs || N8 != N)
+            return false;
+        const Qwen35LayerWeights& t = s.bonsai_pf_layers[nw - s.w.layers.data()];
+        return nw->linear_attn
+            ? (tproj_mask & 8) && t.wqkv_type == kPtq1GgmlType &&
+              t.wqkv_gate_type == kPtq1GgmlType
+            : (tproj_mask & 1) && t.wq_type == kPtq1GgmlType && t.wk_type == kPtq1GgmlType &&
+              t.wv_type == kPtq1GgmlType;
+    };
     auto norm_xn = [&](const void* nrm, const Qwen35LayerWeights* nw) {
         xn_fp8_ready = false;
+        xn_tfp4_ready = false;
         xn_fp4_ready = xn_exact_for(nw) &&
             kernels::launch_prefill_nvfp4_rmsnorm_quant_a_exact(x, nrm, xn, fp4_a, fp4_as, N, H,
                                                                 eps, st);
@@ -2483,6 +2568,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             xn_fp8_ready = xn_fp8_for(nw) &&
                 kernels::launch_rmsnorm_fp8(x, nrm, xn, A_i8, sx, N, H, eps, st);
             if (xn_fp8_ready) { a_q = nullptr; a_pk = false; }   // A_i8 now holds e4m3
+            else if (xn_tfp4_for(nw) && [&] {
+                         TPre pre;
+                         pre.kind = TPre::kNorm; pre.w = nrm; pre.eps = eps; pre.xn_out = xn;
+                         return tfp4_act(x, s.bonsai_sign_hidden, H, &pre);
+                     }())
+                xn_tfp4_ready = true;
             else kernels::launch_rmsnorm(x, nrm, xn, N, H, eps, st);
         }
     };
@@ -2528,6 +2619,36 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         int attn_acc = 0, ffn_acc = 0;
         bool hn_quantized = false;   // pre-FFN norm already emitted A_i8/sx for the grouped FFN
         bool hn_fp4_ready = false;   // pre-FFN norm already emitted gate/up's FP4 operand
+        // THE LAST LAYER'S DEAD ROWS. Nothing after the layer loop reads this pass's hidden state
+        // except at the seed row (the final norm of row N-1, see below the loop): every row's K/V
+        // goes to the cache, but a row's attention output and FFN are read only by the next layer,
+        // and the last layer has none. So when the last layer is a full-attention layer, its
+        // queries and its FFN run over the last kLastTail rows alone (`live0` is the first of
+        // them); the rows before it keep the x the layer before left them.
+        //
+        // The live rows are computed exactly as before: the attention kernel is the tier the whole
+        // pass would take (its tests are n_tokens >= 2048 and the KV span, which a tail of at
+        // least 2048 rows at q_pos0 = pos0 + live0 leaves as they were), a query tile is 16 rows
+        // and live0 is a multiple of 128, and everything after the attention is row-independent.
+        // The seed logits are bit-identical.
+        //
+        // The attention's output is in turn read only at the seed row, so what follows it (the o
+        // projection where its arm can take a row range, the FFN, the final norm) runs from
+        // `ffn0`, the last 128-row atom or two.
+        //
+        // Not on a pack (a seed row per prompt), a mixed step (decode rows at [0, R)) or a pass
+        // whose hidden states are captured for a draft. SPARKINFER_PREFILL_LAST_TAIL=0 runs every
+        // row (A/B in ONE binary).
+        constexpr int kLastTail = 2048;
+        static const bool last_tail_env = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_LAST_TAIL");
+            return !(e && e[0] == '0');
+        }();
+        const int live0 = (last_tail_env && L + 1 == c.n_layers && !w.linear_attn &&
+                           !c.muse_glimmer && !moe && !multi && R == 0 && !capture_dflash &&
+                           kv8 && N >= 2 * kLastTail)
+                              ? (N - kLastTail) & ~127 : 0;
+        const int ffn0 = live0 > 0 ? (N - 128) & ~127 : 0;
         if (w.linear_attn) {
             // ---- Gated DeltaNet linear-attention layer ----
             // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
@@ -2789,6 +2910,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 proj_fp8_native(nullptr, w.ssm_out, rf ? x : ao, N, H, lvdim, rf, /*a_ready=*/true);
                 attn_fused = rf;
                 out_fp8_done = true;
+            } else if ((tpre_mask & 2) && tl && (tproj_mask & 4) && lvdim == qdim &&
+                       tl->ssm_out_type == kPtq1GgmlType && tl->ssm_out && trs->ssm_out &&
+                       c.linear_head_dim == 128 && lvdim == vh * c.linear_head_dim &&
+                       !(gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
+                         fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws) &&
+                       [&] {
+                           // The ternary out leg rotates and quantizes the gated norm: it takes
+                           // the norm with it, and `lnrm` is not written.
+                           TPre pre;
+                           pre.kind = TPre::kGated; pre.aux = lz; pre.w = w.ssm_norm; pre.eps = eps;
+                           return tfp4_act(att, s.bonsai_sign_out, lvdim, &pre) &&
+                                  tfp4_gemm(tl->ssm_out, H, x, true);
+                       }()) {
+                attn_fused = true;
+                out_fp8_done = true;   // the projection is done: every arm below is skipped
             } else {
                 kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
                                                    c.linear_head_dim, eps, st);
@@ -2968,6 +3104,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // and run three block-scaled GEMMs off the packed nibbles. [q|gate] stays the one
                 // wide operand it already is, so the split below is untouched. A_i8/sx are not
                 // written, so the int8 activation memo stays valid for whatever runs next.
+                bool qg_direct = false;   // q and gate written by legs of their own: no split
                 bool qkv_fp4 = false;
                 if (attn_nvfp4 && (attn_fp4_mask & 1) &&
                     w.wq_fp4 && w.wq_fp4_sf && w.wk_fp4 && w.wk_fp4_sf &&
@@ -3014,10 +3151,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }
                 if (!grouped && tl && (tproj_mask & 1) && !attn_norm_deferred &&
                     tl->wq_type == kPtq1GgmlType && tl->wk_type == kPtq1GgmlType &&
-                    tl->wv_type == kPtq1GgmlType && tfp4_act(xn, s.bonsai_sign_hidden, H))
-                    grouped = tfp4_gemm(tl->wq, wide, b8, false) &&
+                    tl->wv_type == kPtq1GgmlType && tfp4_act(xn, s.bonsai_sign_hidden, H)) {
+                    // wq's rows are [q_h | gate_h] per head (pf_split_q_gate_kernel). Its q rows
+                    // and its gate rows as two legs of their own write qb and qg themselves, so
+                    // the [N, 2*qdim] plane is not written to DRAM to be read back and split: the
+                    // same dot products, each row's own. Not with decode rows aboard (R > 0), which
+                    // read the unsplit plane. SPARKINFER_PREFILL_TERNARY_QG_SPLIT=0 keeps the
+                    // one wide leg and the split (A/B).
+                    static const bool qg_split_env = [] {
+                        const char* e = getenv("SPARKINFER_PREFILL_TERNARY_QG_SPLIT");
+                        return !(e && e[0] == '0');
+                    }();
+                    const int hd = c.head_dim;
+                    // live0 (the last layer): q and gate for the rows whose queries are read.
+                    qg_direct = qg_split_env && R == 0 && qdim == c.n_q_heads * hd &&
+                                tfp4_gemm(tl->wq, qdim, qb, false, hd, 2 * hd, 0, live0) &&
+                                tfp4_gemm(tl->wq, qdim, qg, false, hd, 2 * hd, hd, live0);
+                    grouped = (qg_direct || tfp4_gemm(tl->wq, wide, b8, false)) &&
                               tfp4_gemm(tl->wk, kvdim, kf, false) &&
                               tfp4_gemm(tl->wv, kvdim, vf, false);
+                }
                 if (!grouped && use_i8 && w.wq_rs && w.wk_rs && w.wv_rs &&
                     w.wk_type == w.wq_type && w.wv_type == w.wq_type &&
                     kernels::pf_dense_gemm_qi8_supported(w.wq_type)) {
@@ -3036,7 +3189,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     proj_fused(xn, w.wk, w.wk_type, w.wk_rs, kf, kvdim, H);
                     proj_fused(xn, w.wv, w.wv_type, w.wv_rs, vf, kvdim, H);
                 }
-                kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
+                if (!(qg_direct && grouped))
+                    kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
             }
             if (c.muse_glimmer) {
                 // QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM) RoPE on SWA layers /
@@ -3175,7 +3329,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             vf + o * kvdim, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, bt,
                             len, c.n_q_heads, c.n_kv_heads, c.head_dim, rope_dim, rope_theta, eps,
                             bs, mbs, st, pos0, mrope_win, c.mrope_sec_h, c.mrope_sec_w);
-                        if (!kernels::launch_prefill_attn_int8_paged(qb + o * qdim, kpool, vpool,
+                        // live0 (the last layer): only the tail's queries are read again.
+                        const size_t ao0 = o + (size_t)live0;
+                        if (!(live0 > 0 &&
+                              kernels::launch_prefill_attn_int8_paged(qb + ao0 * qdim, kpool,
+                                  vpool, kscale, vscale, bt, att + ao0 * qdim, len - live0,
+                                  c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
+                                  win_blocks, st, pos0 + live0)) &&
+                            !kernels::launch_prefill_attn_int8_paged(qb + o * qdim, kpool, vpool,
                                 kscale, vscale, bt, att + o * qdim, len, c.n_q_heads, c.n_kv_heads,
                                 c.head_dim, bs, mbs, attn_scale, win_blocks, st, pos0)) {
                             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
@@ -3245,8 +3406,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     gate_fused = true;
                 }
             }
+            // The ternary o leg rotates and quantizes the gated `att`: it takes the gate with it
+            // (see TPre), so `att` is neither rewritten gated nor read back. Tried ahead of the
+            // gate pass; if the leg declines, `att` is still raw and is gated just below.
+            const bool wo_tfp4 = !gate_fused && !wo_fp4_done && (tpre_mask & 4) && !gate_ld &&
+                !c.muse_glimmer && tl && (tproj_mask & 2) && tl->wo_type == kPtq1GgmlType &&
+                tl->wo && trs->wo &&
+                !(attn_nvfp4 && (attn_fp4_mask & 2) && w.wo_fp4 && w.wo_fp4_sf && fp4_attn_a &&
+                  fp4_attn_as && fp4_attn_ws) &&
+                [&] {
+                    TPre pre;   // ffn0 (the last layer): o for the rows the FFN and the seed read
+                    pre.kind = TPre::kGate; pre.aux = gate_src; pre.r0 = ffn0;
+                    return tfp4_act(att, s.bonsai_sign_out, qdim, &pre) &&
+                           tfp4_gemm(tl->wo, H, x, true, 0, 0, 0, ffn0);
+                }();
             // If the fused quantize ran but the GEMM declined, `att` is still raw -- gate it here.
-            if (!gate_fused && !wo_fp4_done) {
+            if (!gate_fused && !wo_fp4_done && !wo_tfp4) {
                 kernels::launch_prefill_mul_sigmoid(att, gate_src, N, qdim, st, gate_ld);
             }
             // o off the same NVFP4 bytes, reading the already-gated `att`, with the residual taken
@@ -3272,7 +3447,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     wo_fp4_q38 = true;
                 }
             }
-            if (wo_fp4_q38) {
+            if (wo_tfp4) {
+                attn_fused = true;
+            } else if (wo_fp4_q38) {
                 attn_fused = wo_fp4_resid;
             } else if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
@@ -3299,6 +3476,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         }
         zero_for_o = false;
 
+        bool hn_deferred = false;         // hn not written yet: see the pre-FFN norm below
         bool muse_ffn_norm_fp4 = false;   // Muse: hn left unwritten, the FP4 quantize norms h itself
         bool muse_tail_chunked = false;   // Muse: both sandwich norms run per FFN chunk (see below)
         int tail_rows = 0;                // rows whose post-FFN sandwich norm a chunk already ran
@@ -3387,8 +3565,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // x += ao (post-attn residual, in-place; skipped when folded into the output proj)
             // hn = RMSNorm(x, post_attn_norm)
             if (!attn_fused) kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
-            if (!ffn_norm_fp4)
-                kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
+            // A ternary FFN on the long prompt's FP4 arm rotates and quantizes hn chunk by chunk,
+            // and takes the norm with it (see TPre): hn then waits until that arm is known to
+            // have the layer (tfp4, below), and is written here for every other.
+            hn_deferred = !ffn_norm_fp4 && (tpre_mask & 1) && !moe && tl && !qb_fires &&
+                          s.bonsai_sign_hidden && s.bonsai_block == 1024 && (H % 1024) == 0 &&
+                          H <= 8 * 1024;
+            if (!ffn_norm_fp4 && !hn_deferred)   // ffn0: the FFN reads the last layer's live rows
+                kernels::launch_rmsnorm(x + (size_t)ffn0 * H, w.post_attn_norm,
+                                        hn + (size_t)ffn0 * H, N - ffn0, H, eps, st);
         }
 
         if (!moe) {
@@ -3535,6 +3720,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 kernels::launch_ptq1_rows_nvfp4(gate_pf, tg_d, nullptr, ffn, H, st, tg_s) &&
                 kernels::launch_ptq1_rows_nvfp4(up_pf, tu_d, nullptr, ffn, H, st, tu_s) &&
                 kernels::launch_ptq1_rows_nvfp4(tl->down_q, td_d, nullptr, H, ffn, st, td_s);
+            // hn deferred to this arm: with the layer, each chunk's rotate + quantize takes the
+            // norm; without it, hn is written now, ahead of every arm that reads it.
+            const bool tfp4_norm = hn_deferred && tfp4;
+            if (hn_deferred && !tfp4)
+                kernels::launch_rmsnorm(x + (size_t)ffn0 * H, w.post_attn_norm,
+                                        hn + (size_t)ffn0 * H, N - ffn0, H, eps, st);
             if (ffn_i8 && !ffn_qi8 && !tfp4) {
                 if (t_gu) {
                     kernels::launch_ptq1_rows_i8(gate_pf, ffn_Wg_i8, ffn_swg, ffn, H, st);
@@ -3668,7 +3859,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     dn_fp4_sf = dn_st_sf;
                 }
             }
-            for (int fo = 0; fo < N; fo += FC) {
+            for (int fo = ffn0; fo < N; fo += FC) {   // ffn0: the last layer's live rows only
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
                 if (muse_tail_chunked)
@@ -3877,9 +4068,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         cudaMemsetAsync(static_cast<char*>(ad) + (size_t)fn * H / 2, 0,
                                         (size_t)(m8 - fn) * H / 2, st);
                     }
-                    kernels::launch_ptq1_rotq_rows_nvfp4(
-                        hn_c, nullptr, static_cast<const signed char*>(s.bonsai_sign_hidden), ad,
-                        nullptr, fn, H, s.bonsai_block, st, as);
+                    if (!(tfp4_norm &&
+                          kernels::launch_ptq1_norm_rotq_rows_nvfp4(
+                              xc, w.post_attn_norm, eps, nullptr,
+                              static_cast<const signed char*>(s.bonsai_sign_hidden), ad, fn, H,
+                              s.bonsai_block, st, as))) {
+                        if (tfp4_norm)   // the fold declined: this chunk's hn after all
+                            kernels::launch_rmsnorm(xc, w.post_attn_norm, const_cast<bf16*>(hn_c),
+                                                    fn, H, eps, st);
+                        kernels::launch_ptq1_rotq_rows_nvfp4(
+                            hn_c, nullptr, static_cast<const signed char*>(s.bonsai_sign_hidden),
+                            ad, nullptr, fn, H, s.bonsai_block, st, as);
+                    }
                     kernels::launch_prefill_nvfp4_gemm(ad, as, tg_d, tg_s, ffg, m8, ffn, H, nullptr,
                                                        st, alpha);
                     kernels::launch_prefill_nvfp4_gemm(ad, as, tu_d, tu_s, ffu, m8, ffn, H, nullptr,
@@ -4651,9 +4851,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             return e ? atoi(e) : 32768;
         }();
         const bool next_needs_raw_xn = gdn_xn_fix && N >= xn_fix_minctx && nw && nw->linear_attn;
+        xn_tfp4_ready = false;        // an operand the layer did not take is not the next xn's
         if (xn_done_early) {
             xn_fp4_ready = true;      // xn and its FP4 operand came out of the post-FFN pass
             xn_done_early = false;
+        } else if (live0 > 0) {
+            // The final norm, read below at the seed row: the last layer's live rows.
+            kernels::launch_rmsnorm(x + (size_t)ffn0 * H, next_norm, xn + (size_t)ffn0 * H,
+                                    N - ffn0, H, eps, st);
         } else if (!defer_next_attn_norm || next_needs_raw_xn) {
             norm_xn(next_norm, nw);
         }

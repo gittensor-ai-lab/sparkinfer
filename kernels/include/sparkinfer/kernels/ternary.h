@@ -176,10 +176,34 @@ bool launch_gemm_ptq1_i8_rows_f32(const signed char* xq, const float* xd, const 
 // quantized to NVFP4 by prefill_nvfp4's rule into the same two layouts.
 bool launch_ptq1_rows_nvfp4(const void* w_ptq1, void* q, void* sf_rowmajor, int rows, int k,
                             cudaStream_t stream = nullptr, void* sf_cutlass = nullptr);
+// launch_ptq1_rows_nvfp4 over gathered rows: operand row r is stored row (r / run) * period +
+// r % run, `w_ptq1` pointing at the first of them -- runs of `run` rows every `period`, e.g. the q
+// rows (or, offset by `run` rows, the gate rows) of a [q_h | gate_h] weight. Each row is converted
+// exactly as launch_ptq1_rows_nvfp4 converts it. k <= 8192, CUTLASS scale layout only.
+bool launch_ptq1_rows_nvfp4_runs(const void* w_ptq1, void* q, int rows, int k, int run,
+                                 int period, cudaStream_t stream, void* sf_cutlass);
 float ptq1_nvfp4_alpha();
 bool launch_ptq1_rotq_rows_nvfp4(const void* x_bf16, const void* up_bf16, const signed char* sign,
                                  void* q, void* sf_rowmajor, int rows, int k, int block,
                                  cudaStream_t stream = nullptr, void* sf_cutlass = nullptr);
+// launch_ptq1_rotq_rows_nvfp4 over a row its producer has not written: the producing pass runs
+// inside the rotate + quantize, on the row as it is loaded, and the bf16 it would have stored is
+// what gets rotated -- so the operand is byte for byte the two-pass one, with one DRAM round trip
+// of the row gone. Into the CUTLASS scale layout only (sf_cutlass). k <= 8*block.
+//   norm        RMSNorm(x; norm_w, eps), launch_rmsnorm's values. xn_out non-null: the bf16 norm
+//               is stored there as well, for a row with other readers.
+//   gated_norm  launch_prefill_gated_norm's values: per 128-wide head, x/rms(x) * norm_w * silu(z).
+//   gate        launch_prefill_mul_sigmoid's values: x * sigmoid(gate), gate tight like x.
+bool launch_ptq1_norm_rotq_rows_nvfp4(const void* x_bf16, const void* norm_w, float eps,
+                                      void* xn_out, const signed char* sign, void* q, int rows,
+                                      int k, int block, cudaStream_t stream, void* sf_cutlass);
+bool launch_ptq1_gated_norm_rotq_rows_nvfp4(const void* x_bf16, const void* z_bf16,
+                                            const void* norm_w, float eps, int head_dim,
+                                            const signed char* sign, void* q, int rows, int k,
+                                            int block, cudaStream_t stream, void* sf_cutlass);
+bool launch_ptq1_gate_rotq_rows_nvfp4(const void* x_bf16, const void* gate_bf16,
+                                      const signed char* sign, void* q, int rows, int k,
+                                      int block, cudaStream_t stream, void* sf_cutlass);
 bool launch_ptq1_rows_i8(const void* w_ptq1, signed char* q, float* scale, int rows, int k,
                          cudaStream_t stream);
 bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,

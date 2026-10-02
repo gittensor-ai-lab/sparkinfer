@@ -1083,13 +1083,30 @@ ptq1_rows_i8_kernel(const unsigned char* __restrict__ w, signed char* __restrict
 // SWIGLU: x is the gate and u the up projection; the row rotated is SwiGLU's output rounded to
 // bf16 exactly as launch_prefill_swiglu_quant_i8 forms it, bf16(g / (1 + exp(-g)) * u), which is
 // also what the decode shadow's down reads (launch_ptq1_swiglu_rotq_bf16).
-template <int NS, bool SWIGLU = false, bool FP4 = false>
+//
+// PRE: THE ROW'S PRODUCER, FOLDED IN. An activation a long prompt's ternary leg reads has just
+// been written by one elementwise pass, and that pass and this one are each a DRAM round trip of
+// the [rows, k] bf16 plane (rows*k*2 B, past L2 at 16k rows). With PRE set the producer runs
+// here, on the row as it is loaded, and the bf16 it would have stored is what is rotated --
+// operation for operation the producer's own arithmetic (this TU and theirs are built with the
+// same flags), so the operand is byte for byte the two-pass one:
+//   kPreNorm   rmsnorm_kernel<0>: x * inv_rms * nw, the row's sum of squares taken in its pack
+//              order (thread t owns the 8-wide packs t, t+256, ...) and through its two-level
+//              reduction. `xo` set: the bf16 norm is stored as well, for the row's other readers.
+//   kPreGated  pf_gated_norm_kernel: x * inv * nw * silu(u) per 128-wide head. A head is one warp
+//              of a span here; its sum of squares runs over that kernel's lanes (its lane l owns
+//              dims l, l+32, l+64, l+96), read back out of the warp's own slots of the span tile.
+//   kPreGate   pf_mul_sigmoid_kernel: x * sigmoid(u).
+constexpr int kPreNone = 0, kPreNorm = 1, kPreGated = 2, kPreGate = 3;
+template <int NS, bool SWIGLU = false, bool FP4 = false, int PRE = kPreNone>
 __global__ void __launch_bounds__(256)
 ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict__ sign,
                          signed char* __restrict__ q, float* __restrict__ scale,
                          signed char* __restrict__ qp, int rows, int k,
                          const __nv_bfloat16* __restrict__ u = nullptr,
-                         unsigned char* __restrict__ sfl = nullptr) {
+                         unsigned char* __restrict__ sfl = nullptr,
+                         const __nv_bfloat16* __restrict__ nw = nullptr, float eps = 0.f,
+                         __nv_bfloat16* __restrict__ xo = nullptr) {
     __shared__ float sh[kSpan];
     __shared__ float sred[8];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -1097,11 +1114,93 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
     const int ns = k / kSpan;
     float v[NS][4];
     float am = 0.f;
+    float inv_rms = 0.f;
+    if constexpr (PRE == kPreNorm) {
+        const int npack = k >> 3;
+        const uint4* x4 = reinterpret_cast<const uint4*>(x + (size_t)row * k);
+        float ss = 0.f;
+        for (int p = t; p < npack; p += 256) {
+            const uint4 pk = __ldg(x4 + p);
+            const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&pk);
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float xv = __bfloat162float(h[j]);
+                ss = __fmaf_rn(xv, xv, ss);
+            }
+        }
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+        if (lane == 0) sred[warp] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float r = (t < 8) ? sred[t] : 0.f;
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) r += __shfl_xor_sync(0xffffffffu, r, m);
+            if (t == 0) sred[0] = rsqrtf(r / k + eps);
+        }
+        __syncthreads();
+        inv_rms = sred[0];
+    }
 #pragma unroll
     for (int sp = 0; sp < NS; ++sp) {
         if (sp < ns) {
             const int e0 = sp * kSpan + t * 4;
             uint2 raw = *reinterpret_cast<const uint2*>(x + (size_t)row * k + e0);
+            if constexpr (PRE == kPreNorm) {
+                const uint2 wr = *reinterpret_cast<const uint2*>(nw + e0);
+                const __nv_bfloat16* xh = reinterpret_cast<const __nv_bfloat16*>(&raw);
+                const __nv_bfloat16* wh = reinterpret_cast<const __nv_bfloat16*>(&wr);
+                __nv_bfloat16 o[4];
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    o[j] = __float2bfloat16(__bfloat162float(xh[j]) * inv_rms *
+                                            __bfloat162float(wh[j]));
+                raw = *reinterpret_cast<const uint2*>(o);
+                if (xo) *reinterpret_cast<uint2*>(xo + (size_t)row * k + e0) = raw;
+            }
+            if constexpr (PRE == kPreGated) {
+                const uint2 zr = *reinterpret_cast<const uint2*>(u + (size_t)row * k + e0);
+                const uint2 wr = *reinterpret_cast<const uint2*>(nw + lane * 4);
+                const __nv_bfloat16* xh = reinterpret_cast<const __nv_bfloat16*>(&raw);
+                const __nv_bfloat16* zh = reinterpret_cast<const __nv_bfloat16*>(&zr);
+                const __nv_bfloat16* wh = reinterpret_cast<const __nv_bfloat16*>(&wr);
+                float xv[4];
+#pragma unroll
+                for (int j = 0; j < 4; j++) xv[j] = __bfloat162float(xh[j]);
+                // A warp only ever touches its own 128 slots of the span tile until the barrier
+                // below, so the head goes through them and comes back strided.
+                *reinterpret_cast<float4*>(&sh[t * 4]) = make_float4(xv[0], xv[1], xv[2], xv[3]);
+                __syncwarp();
+                float ss = 0.f;
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const float xs = sh[warp * 128 + lane + r * 32];
+                    ss += xs * xs;
+                }
+                __syncwarp();
+#pragma unroll
+                for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+                const float inv = rsqrtf(ss / 128 + eps);
+                __nv_bfloat16 o[4];
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const float zv = __bfloat162float(zh[j]);
+                    o[j] = __float2bfloat16(xv[j] * inv * __bfloat162float(wh[j]) *
+                                            (zv / (1.f + __expf(-zv))));
+                }
+                raw = *reinterpret_cast<const uint2*>(o);
+            }
+            if constexpr (PRE == kPreGate) {
+                const uint2 gr = *reinterpret_cast<const uint2*>(u + (size_t)row * k + e0);
+                const __nv_bfloat16* xh = reinterpret_cast<const __nv_bfloat16*>(&raw);
+                const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&gr);
+                __nv_bfloat16 o[4];
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    o[j] = __float2bfloat16(__bfloat162float(xh[j]) *
+                                            (1.f / (1.f + __expf(-__bfloat162float(gh[j])))));
+                raw = *reinterpret_cast<const uint2*>(o);
+            }
             if constexpr (SWIGLU) {
                 const uint2 ur = *reinterpret_cast<const uint2*>(u + (size_t)row * k + e0);
                 const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&raw);
@@ -1226,16 +1325,20 @@ __device__ __forceinline__ void ptq1_fp4_scale(float sb, unsigned& code, unsigne
         if (e < best) { best = e; code = 2u + (unsigned)i; sfb = f; }
     }
 }
+// `run` > 0 gathers the source rows: operand row r reads stored row (r / run) * period + r % run,
+// i.e. runs of `run` rows taken every `period` -- the q rows, or the gate rows, of a
+// [q_h | gate_h] weight, so each becomes an operand of its own. 0 reads the rows in order.
 template <int WPC>
 __global__ void __launch_bounds__(WPC * 32)
 ptq1_rows_nvfp4_kernel(const unsigned char* __restrict__ w, unsigned char* __restrict__ q,
                        unsigned char* __restrict__ sf, int rows, int nblk,
-                       unsigned char* __restrict__ sfl) {
+                       unsigned char* __restrict__ sfl, int run = 0, int period = 0) {
     extern __shared__ uint4 srow[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * WPC + warp;
     if (row >= rows) return;
-    const unsigned char* wr = w + (size_t)row * nblk * kBlkBytes;
+    const int srcrow = run > 0 ? (row / run) * period + row % run : row;
+    const unsigned char* wr = w + (size_t)srcrow * nblk * kBlkBytes;
     signed char* buf = reinterpret_cast<signed char*>(srow) + (size_t)warp * nblk * kBlk;
     for (int i = lane; i < 2 * nblk; i += 32) {
         const int b = i >> 1, h = i & 1;
@@ -1247,6 +1350,49 @@ ptq1_rows_nvfp4_kernel(const unsigned char* __restrict__ w, unsigned char* __res
     __syncwarp();
     const int ng = nblk * (kBlk / 16);
     for (int g = lane; g < ng; g += 32) {
+        const int b = g >> 3;
+        const unsigned short hs = *reinterpret_cast<const unsigned short*>(wr + b * kBlkBytes + 26);
+        unsigned code; unsigned char sfb;
+        ptq1_fp4_scale(__half2float(__ushort_as_half(hs)), code, sfb);
+        const signed char* tv = buf + g * 16;
+        unsigned o[2] = {0u, 0u};
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int tr = tv[j];
+            const unsigned nib = tr == 0 ? 0u : (code | (tr < 0 ? 8u : 0u));
+            o[j >> 3] |= nib << (4 * (j & 7));
+        }
+        *reinterpret_cast<uint2*>(q + (size_t)row * nblk * (kBlk / 2) + g * 8) = make_uint2(o[0], o[1]);
+        if (sfl) sfl[sf_cutlass_off(row, g, ng)] = sfb;
+        else sf[(size_t)row * ng + g] = sfb;
+    }
+}
+
+// A wide row (the FFN's down, k = 17408) one to a CTA as above -- it stages k bytes of shared
+// memory, so an SM holds five of them -- but over WPR warps instead of one: its blocks are decoded
+// and its groups packed by all of them, five times WPR warps an SM for the same shared rows. Each
+// group's nibbles and scale are formed exactly as ptq1_rows_nvfp4_kernel forms them.
+template <int WPR>
+__global__ void __launch_bounds__(WPR * 32)
+ptq1_row_nvfp4_wide_kernel(const unsigned char* __restrict__ w, unsigned char* __restrict__ q,
+                           unsigned char* __restrict__ sf, int rows, int nblk,
+                           unsigned char* __restrict__ sfl) {
+    extern __shared__ uint4 srow[];
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned char* wr = w + (size_t)row * nblk * kBlkBytes;
+    signed char* buf = reinterpret_cast<signed char*>(srow);
+    for (int i = tid; i < 2 * nblk; i += WPR * 32) {
+        const int b = i >> 1, h = i & 1;
+        const unsigned* bw = reinterpret_cast<const unsigned*>(wr + b * kBlkBytes);
+        const unsigned tw[4] = {__ldg(bw + 2 * h), __ldg(bw + 2 * h + 1), __ldg(bw + 4 + h),
+                                (__ldg(bw + 6) & 0xFFFFu) | 0x3C000000u};   // scale 1.0: bare trits
+        t_half(tw, h, 1.f, buf + b * kBlk);
+    }
+    __syncthreads();
+    const int ng = nblk * (kBlk / 16);
+    for (int g = tid; g < ng; g += WPR * 32) {
         const int b = g >> 3;
         const unsigned short hs = *reinterpret_cast<const unsigned short*>(wr + b * kBlkBytes + 26);
         unsigned code; unsigned char sfb;
@@ -1284,18 +1430,40 @@ bool launch_ptq1_rows_nvfp4(const void* w_ptq1, void* q, void* sf_rowmajor, int 
                              cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
         cudaFuncSetAttribute(ptq1_rows_nvfp4_kernel<1>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+        cudaFuncSetAttribute(ptq1_row_nvfp4_wide_kernel<4>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
         attr = true;
     }
+    // SPARKINFER_PTQ1_ROWS_WIDE_WARPS=1 keeps a wide row on one warp (A/B in ONE binary).
+    static const bool wide4 = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_ROWS_WIDE_WARPS");
+        return !(e && e[0] == '1');
+    }();
     const auto* w = static_cast<const unsigned char*>(w_ptq1);
     auto* qq = static_cast<unsigned char*>(q);
     auto* sf = static_cast<unsigned char*>(sf_rowmajor);
     // A row stages k bytes of shared memory: four rows a CTA at the FFN's 17408 would leave one CTA
     // on an SM, so wide rows go one to a CTA.
-    if (k > 8192)
+    if (k > 8192 && wide4)
+        ptq1_row_nvfp4_wide_kernel<4><<<rows, 128, (size_t)k, st>>>(w, qq, sf, rows, k / kBlk,
+                                                                    sfl);
+    else if (k > 8192)
         ptq1_rows_nvfp4_kernel<1><<<rows, 32, (size_t)k, st>>>(w, qq, sf, rows, k / kBlk, sfl);
     else
         ptq1_rows_nvfp4_kernel<4><<<(rows + 3) / 4, 128, (size_t)4 * k, st>>>(w, qq, sf, rows,
                                                                             k / kBlk, sfl);
+    return true;
+}
+bool launch_ptq1_rows_nvfp4_runs(const void* w_ptq1, void* q, int rows, int k, int run,
+                                 int period, cudaStream_t st, void* sf_cutlass) {
+    if (rows <= 0 || k <= 0 || k % kBlk != 0 || k > 8192 || run <= 0 || period < run ||
+        (rows % run) || !sf_cutlass)
+        return false;
+    if (!sf_cutlass_clear(sf_cutlass, rows, k, st)) return false;
+    // 4 * k <= 32 KB of shared rows: inside the default limit, no attribute to raise.
+    ptq1_rows_nvfp4_kernel<4><<<(rows + 3) / 4, 128, (size_t)4 * k, st>>>(
+        static_cast<const unsigned char*>(w_ptq1), static_cast<unsigned char*>(q), nullptr, rows,
+        k / kBlk, static_cast<unsigned char*>(sf_cutlass), run, period);
     return true;
 }
 float ptq1_nvfp4_alpha() { return 1.f / kFp4WScale; }
@@ -1494,6 +1662,51 @@ bool launch_ptq1_rotq_rows_nvfp4(const void* x_bf16, const void* up_bf16, const 
     }
     return true;
 }
+
+// launch_ptq1_rotq_rows_nvfp4 with the row's producer folded in (see PRE on the kernel).
+#define SI_PTQ1_PRE_ROTQ(NS_, PRE_, ...)                                                       \
+    ptq1_rotq_rows_i8_kernel<NS_, false, true, PRE_><<<rows, 256, 0, st>>>(                     \
+        static_cast<const __nv_bfloat16*>(x_bf16), sign, static_cast<signed char*>(q), nullptr, \
+        nullptr, rows, k, __VA_ARGS__)
+bool launch_ptq1_norm_rotq_rows_nvfp4(const void* x_bf16, const void* norm_w, float eps,
+                                      void* xn_out, const signed char* sign, void* q, int rows,
+                                      int k, int block, cudaStream_t st, void* sf_cutlass) {
+    if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 8 * kSpan || !x_bf16 || !norm_w ||
+        !sign || !q || !sf_cutlass)
+        return false;
+    if (!sf_cutlass_clear(sf_cutlass, rows, k, st)) return false;
+    auto* sfl = static_cast<unsigned char*>(sf_cutlass);
+    const auto* nw = static_cast<const __nv_bfloat16*>(norm_w);
+    auto* xo = static_cast<__nv_bfloat16*>(xn_out);
+    if (k <= 5 * kSpan) SI_PTQ1_PRE_ROTQ(5, kPreNorm, nullptr, sfl, nw, eps, xo);
+    else                SI_PTQ1_PRE_ROTQ(8, kPreNorm, nullptr, sfl, nw, eps, xo);
+    return true;
+}
+bool launch_ptq1_gated_norm_rotq_rows_nvfp4(const void* x_bf16, const void* z_bf16,
+                                            const void* norm_w, float eps, int head_dim,
+                                            const signed char* sign, void* q, int rows, int k,
+                                            int block, cudaStream_t st, void* sf_cutlass) {
+    if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 8 * kSpan || head_dim != 128 ||
+        !x_bf16 || !z_bf16 || !norm_w || !sign || !q || !sf_cutlass)
+        return false;
+    if (!sf_cutlass_clear(sf_cutlass, rows, k, st)) return false;
+    SI_PTQ1_PRE_ROTQ(8, kPreGated, static_cast<const __nv_bfloat16*>(z_bf16),
+                     static_cast<unsigned char*>(sf_cutlass),
+                     static_cast<const __nv_bfloat16*>(norm_w), eps, nullptr);
+    return true;
+}
+bool launch_ptq1_gate_rotq_rows_nvfp4(const void* x_bf16, const void* gate_bf16,
+                                      const signed char* sign, void* q, int rows, int k,
+                                      int block, cudaStream_t st, void* sf_cutlass) {
+    if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 8 * kSpan || !x_bf16 ||
+        !gate_bf16 || !sign || !q || !sf_cutlass)
+        return false;
+    if (!sf_cutlass_clear(sf_cutlass, rows, k, st)) return false;
+    SI_PTQ1_PRE_ROTQ(8, kPreGate, static_cast<const __nv_bfloat16*>(gate_bf16),
+                     static_cast<unsigned char*>(sf_cutlass), nullptr, 0.f, nullptr);
+    return true;
+}
+#undef SI_PTQ1_PRE_ROTQ
 
 bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,
                               float* scale, signed char* qp, int rows, int k, int block,
