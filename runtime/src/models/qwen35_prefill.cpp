@@ -412,14 +412,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // stack takes the int8 per-prompt loop further down.
         if (pos0 != 0 || moe || (!c.muse_glimmer && !s.kv->int8_kv())) return -1;
         if (s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows || s.ckpt_n > 0) return -1;
-        if (!s.multi_off || !s.multi_len || !s.multi_seq_ids || !s.multi_seed) return -1;
+        if (!s.multi_off || !s.multi_len || !s.multi_seq_ids || (!s.multi_seed && !s.multi_no_seed))
+            return -1;
+        // Segments resuming mid-prompt, or following decode rows, are a mixed step's chunks: no
+        // checkpoints inside them (the two-part conv path stages through the one shared buffer),
+        // and nothing but the int8, dense, non-Muse path the mixed rows run on.
+        bool resumed = false;
+        for (int i = 0; s.multi_pos0 && i < nseg; ++i) {
+            if (s.multi_pos0[i] < 0) return -1;
+            resumed = resumed || s.multi_pos0[i] > 0;
+        }
+        if ((resumed || s.mix_n > 0) && (c.muse_glimmer || s.multi_ckpt_row)) return -1;
         // Recurrent state only where the stack has Gated-DeltaNet layers to carry it.
         const bool linear = c.hybrid && !c.muse_glimmer;
         if (linear && (!s.multi_lin_state || !s.multi_lin_conv)) return -1;
         // Past this the pass switches to its long-context arms (the attention-norm deferral below),
         // which a pack of short prompts has no business taking.
         if (n >= 16384) return -1;
-        long rows = 0;
+        long rows = std::max(0, s.mix_n);   // a mixed step's chunks follow its decode rows
         for (int i = 0; i < nseg; ++i) {
             if (s.multi_len[i] <= 0 || s.multi_off[i] != rows) return -1;
             rows += s.multi_len[i];
@@ -432,7 +442,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const int R = s.mix_n;
     if (R < 0) return -1;
     if (R > 0) {
-        if (multi || moe || c.muse_glimmer || !s.kv->int8_kv() || s.kv->windowed() ||
+        if (moe || c.muse_glimmer || !s.kv->int8_kv() || s.kv->windowed() ||
             s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows || s.ckpt_n > 0 ||
             R >= n || !s.mix_rows || !s.mix_btab || !s.mix_pos || !s.mix_seq ||
             !s.mix_lin_state || !s.mix_lin_conv || s.mix_splits < 1 || !s.mix_fa ||
@@ -467,6 +477,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (multi && s.multi_lin_state && s.multi_lin_conv) {
         for (int i = 0; i < nseg; ++i) {
             if (!s.multi_lin_state[i] || !s.multi_lin_conv[i]) continue;
+            if (s.multi_pos0 && s.multi_pos0[i] > 0) continue;   // resumes: its state carries in
             pf_cu(cudaMemsetAsync(
                       s.multi_lin_state[i], 0,
                       (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim *
@@ -696,7 +707,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         keep_a.gen == g_pfb_arena_gen[0] && keep_a8.gen == g_pfb_arena_gen[1] &&
         keep_am.gen == g_pfb_arena_gen[2] && keep_aw.gen == g_pfb_arena_gen[3] &&
         kernels::prefill_scratch_epoch() == g_pfb_scratch_epoch;
-    if (g_pfb_exec && (multi || !graph_keys_match || !graph_scratch_unmoved)) {
+    // A packed pass of fresh prompts drops it as it always has; a mixed step's chunks (R > 0) run
+    // eager beside it every step and must not throw away the one-prompt graph each time.
+    if (g_pfb_exec && ((multi && R == 0) || !graph_keys_match || !graph_scratch_unmoved)) {
         cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr;
         if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
         g_pfb_n = -1;
@@ -752,6 +765,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // appears only on some calls would shift every later allocation's index and make each pass
     // free and re-cudaMalloc the whole chain. `cconv` below is what decides zeros vs carry-in.
     bf16* cprev = a.alloc<bf16>((size_t)(c.linear_conv_kernel - 1) * lqkv);
+    // One more per extra GDN segment stream, for a mixed step's chunks that resume mid-prompt:
+    // each copies its own session's window in on its own stream. Unconditional for the same reason.
+    bf16* cprev_seg[3] = { cprev,
+                           a.alloc<bf16>((size_t)(c.linear_conv_kernel - 1) * lqkv),
+                           a.alloc<bf16>((size_t)(c.linear_conv_kernel - 1) * lqkv) };
     // At pos0 == 0 the conv genuinely starts from zeros -- pass nullptr and the kernels take
     // exactly the arithmetic path they had before windowing existed.
     bf16* cconv = (pos0 != 0) ? cprev : nullptr;
@@ -2697,14 +2715,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     }
                     const int j = i % ns;
                     cudaStream_t ss = j ? seg_st[j] : st;
-                    kernels::launch_prefill_gdn_conv(b8 + o * lqkv, w.ssm_conv,
-                        static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at,
+                    // A chunk resuming mid-prompt carries its session's conv window and recurrence
+                    // in, as a windowed single-prompt pass does -- staged in this stream's own slot.
+                    const bool carry = s.multi_pos0 && s.multi_pos0[i] > 0;
+                    bf16* seg_conv = static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at;
+                    if (carry)
+                        pf_cu(cudaMemcpyAsync(cprev_seg[j], seg_conv,
+                                              (size_t)(c.linear_conv_kernel - 1) * lqkv * sizeof(bf16),
+                                              cudaMemcpyDeviceToDevice, ss), "gdn segment conv carry-in");
+                    kernels::launch_prefill_gdn_conv(b8 + o * lqkv, w.ssm_conv, seg_conv,
                         gq + o * lq, gk + o * lq, gv + o * lvdim, len, c.linear_q_heads, vh,
-                        c.linear_head_dim, c.linear_conv_kernel, eps, ss, nullptr);
+                        c.linear_head_dim, c.linear_conv_kernel, eps, ss, carry ? cprev_seg[j] : nullptr);
                     kernels::launch_prefill_gdn_scan(gq + o * lq, gk + o * lq, gv + o * lvdim,
                         la + o * vh, lb + o * vh, w.ssm_dt, w.ssm_a,
                         s.multi_lin_state[i] + state_at, att + o * lvdim, len, c.linear_q_heads,
-                        vh, c.linear_head_dim, c.gdn_qh_block, ss, /*carry_in=*/false, j);
+                        vh, c.linear_head_dim, c.gdn_qh_block, ss, /*carry_in=*/carry, j);
                 }
                 for (int j = 1; j < ns; ++j) {
                     pf_cu(cudaEventRecord(seg_ev[j], seg_st[j]), "gdn segment done");
@@ -3171,13 +3196,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         const int* bt = multi ? (w.swa ? s.kv->block_table_win(s.multi_seq_ids[i])
                                                        : s.kv->block_table(s.multi_seq_ids[i]))
                                               : ltab;
+                        // A mixed step's chunk appends at its own position in its own sequence.
+                        const int sp0 = (multi && s.multi_pos0) ? s.multi_pos0[i] : pos0;
                         kernels::launch_prefill_qknorm_rope_kv_int8(qb + o * qdim, kf + o * kvdim,
                             vf + o * kvdim, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, bt,
                             len, c.n_q_heads, c.n_kv_heads, c.head_dim, rope_dim, rope_theta, eps,
-                            bs, mbs, st, pos0, mrope_win, c.mrope_sec_h, c.mrope_sec_w);
+                            bs, mbs, st, sp0, mrope_win, c.mrope_sec_h, c.mrope_sec_w);
                         if (!kernels::launch_prefill_attn_int8_paged(qb + o * qdim, kpool, vpool,
                                 kscale, vscale, bt, att + o * qdim, len, c.n_q_heads, c.n_kv_heads,
-                                c.head_dim, bs, mbs, attn_scale, win_blocks, st, pos0)) {
+                                c.head_dim, bs, mbs, attn_scale, win_blocks, st, sp0)) {
                             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
                             fprintf(stderr, "[prefill] no int8 attention kernel for hd=%d win=%d "
                                             "pos0=%d\n", c.head_dim, win_blocks, pos0);
@@ -4691,7 +4718,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     }
     // Seed for the first decode step: argmax at the last prompt position (xn already = final norm).
     // A packed pass has one per prompt, each read back as it is produced (it never captures).
-    for (int si = 0; si < (multi ? nseg : 1); ++si) {
+    // A mixed step's chunks that do not finish their prompts take no seed and no head pass; with
+    // none finishing, the pass returns 0.
+    if (multi && s.multi_no_seed)
+        pf_cu(cudaMemsetAsync(s.d_out_id, 0, sizeof(int), st), "no-seed pass");
+    for (int si = 0; si < ((multi && s.multi_no_seed) ? 0 : (multi ? nseg : 1)); ++si) {
+        if (multi && s.multi_want_seed && !s.multi_want_seed[si]) continue;
         const int last_row = multi ? s.multi_off[si] + s.multi_len[si] - 1 : N - 1;
         const bf16* xn_last = xn + (size_t)last_row * H;
         // Q4_K head: quantize the activation ONCE and run the pre-quantized dp4a GEMV. gemv.cu calls

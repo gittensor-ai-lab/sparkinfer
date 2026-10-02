@@ -278,14 +278,29 @@ private:
     // Advance a whole decode batch in ONE packed forward instead of one forward per sequence.
     // Returns false having done NOTHING when the batch is not eligible, so the caller falls back
     // to stepping the jobs individually. `any_finished` is set if any job completed.
-    // With `chunk_job`, the first packed group also carries up to `chunk_max` prompt tokens of that
-    // job's prefill in the same forward (Qwen35Model::mixed_step); *chunk_done receives how many it
-    // ingested (0 when the step could not mix and decoded alone).
+    // One prompt's part of a mixed step: up to `max` tokens of `job`'s prefill from its
+    // prefill_pos; `finish` when they reach the prompt's end and the step is to produce its first
+    // token. `done` is what the step ingested (0 when it could not mix).
+    struct MixChunk {
+        Job* job = nullptr;
+        int max = 0;
+        bool finish = false;
+        int done = 0;
+    };
+    // With `chunks`, the first packed group also carries those prompts' chunks in the same forward
+    // (Qwen35Model::mixed_step_multi), each chunk's `done` set to what it ingested; a chunk that
+    // finished its prompt leaves its job in DECODE with the first token pending, as a packed
+    // prefill does.
     bool step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished,
-                          Job* chunk_job = nullptr, int chunk_max = 0, int* chunk_done = nullptr);
-    // The prompt a mixed step would carry this iteration, and how many of its tokens it may take;
-    // null when nothing is eligible or mixing is off (SPARKINFER_MIXED_CHUNK).
-    Job* pick_mixed_chunk(const std::vector<uint64_t>& prefill_ids, int* chunk_max);
+                          std::vector<MixChunk>* chunks = nullptr);
+    // The prompts a mixed step would carry this iteration (empty when nothing is eligible or
+    // mixing is off, SPARKINFER_MIXED_CHUNK), and the scheduled prefills it can never carry, which
+    // step_job runs as before.
+    void pick_mixed_chunks(const std::vector<uint64_t>& prefill_ids, std::vector<MixChunk>& chunks,
+                           std::vector<uint64_t>& unmixable);
+    bool run_mixed_chunks(const std::vector<int>& toks, const std::vector<int>& pos,
+                          const std::vector<uint64_t>& seqs, std::vector<int>& out,
+                          const Qwen35Model::PackedSampling* samp, std::vector<MixChunk>& chunks);
     // Prefill the fresh, text-only prompts among `prefill_ids` together, in packs, instead of one
     // pass each (Qwen35Model::ingest_prompts_packed). Packed jobs move to DECODE and are removed
     // from `prefill_ids`; everything else is left for step_job exactly as before.

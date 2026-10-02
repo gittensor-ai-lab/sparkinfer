@@ -5441,37 +5441,10 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     return true;
 }
 
-bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint64_t* seq_ids,
-                             int n_dec, int* out_sampled, const PackedSampling* sampling,
-                             uint64_t chunk_seq, const int* chunk_ids, int pos0, int len,
-                             int* chunk_seed) {
-    Impl& s = *p_;
-    if (!tokens || !positions || !seq_ids || !out_sampled || !chunk_ids || !chunk_seed) return false;
-    if (n_dec < 1 || n_dec > kQwen35MaxPackedRows || len < 1 || pos0 < 0) return false;
-    if (!s.cfg.hybrid || !s.gguf || !s.cfg.dense_ffn || s.cfg.muse_glimmer || s.w.lm_head_type != 12)
-        return false;
-    if (!s.kv->int8_kv() || s.kv->windowed() || s.d_vision_emb || s.d_mrope_pos || s.dflash_capture)
-        return false;
-    for (int i = 0; i < n_dec; ++i)
-        if (seq_ids[i] == chunk_seq || seq_ids[i] == 0) return false;
-    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
-    // The chunk's session: its own fp32 recurrent state (a prompt being prefilled was never
-    // compacted), no logit bias (the seed below is the raw argmax, as a pass's own is).
-    {
-        auto cit = s.sessions.find(chunk_seq);
-        if (chunk_seq == 0 || cit == s.sessions.end() || !cit->second.lin_state ||
-            !cit->second.lin_conv_state || cit->second.lin_state_b16 || cit->second.logit_bias_set)
-            return false;
-    }
-    bool any_sampled = false;
-    if (sampling) {
-        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
-            !sampling->top_p) return false;
-        for (int i = 0; i < n_dec && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
-    }
-    if (any_sampled && !ensure_packed_samp(s)) return false;
-
-    // Scratch, once (the tables grow with the pool's max blocks per sequence).
+// A mixed step's scratch, allocated once: per-row tables and positions, split-KV partials, the
+// decode rows' head input, logits and the pinned host slots (mixed_step, mixed_step_multi).
+template <class Impl>
+static bool ensure_mix_scratch(Impl& s) {
     constexpr int kRows = kQwen35MaxPackedRows;
     constexpr int kMixSplitsMax = 32;
     const int mbs = s.kv->max_blocks_per_seq();
@@ -5505,6 +5478,43 @@ bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint
         }
     }
 
+    return true;
+}
+
+bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint64_t* seq_ids,
+                             int n_dec, int* out_sampled, const PackedSampling* sampling,
+                             uint64_t chunk_seq, const int* chunk_ids, int pos0, int len,
+                             int* chunk_seed) {
+    Impl& s = *p_;
+    if (!tokens || !positions || !seq_ids || !out_sampled || !chunk_ids || !chunk_seed) return false;
+    if (n_dec < 1 || n_dec > kQwen35MaxPackedRows || len < 1 || pos0 < 0) return false;
+    if (!s.cfg.hybrid || !s.gguf || !s.cfg.dense_ffn || s.cfg.muse_glimmer || s.w.lm_head_type != 12)
+        return false;
+    if (!s.kv->int8_kv() || s.kv->windowed() || s.d_vision_emb || s.d_mrope_pos || s.dflash_capture)
+        return false;
+    for (int i = 0; i < n_dec; ++i)
+        if (seq_ids[i] == chunk_seq || seq_ids[i] == 0) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // The chunk's session: its own fp32 recurrent state (a prompt being prefilled was never
+    // compacted), no logit bias (the seed below is the raw argmax, as a pass's own is).
+    {
+        auto cit = s.sessions.find(chunk_seq);
+        if (chunk_seq == 0 || cit == s.sessions.end() || !cit->second.lin_state ||
+            !cit->second.lin_conv_state || cit->second.lin_state_b16 || cit->second.logit_bias_set)
+            return false;
+    }
+    bool any_sampled = false;
+    if (sampling) {
+        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
+            !sampling->top_p) return false;
+        for (int i = 0; i < n_dec && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
+    }
+    if (any_sampled && !ensure_packed_samp(s)) return false;
+
+    // Scratch, once (the tables grow with the pool's max blocks per sequence).
+    if (!ensure_mix_scratch(s)) return false;
+    constexpr int kRows = kQwen35MaxPackedRows;
+    constexpr int kMixSplitsMax = 32;
     // The decode rows, exactly as decode_packed resolves them.
     bool state_b16 = false;
     if (!packed_rows_prepare(s, seq_ids, n_dec, &state_b16)) return false;
@@ -5578,6 +5588,179 @@ bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint
     *chunk_seed = seed;
     // Batched prefill writes the chunk session's state as fp32; the decode rows keep theirs.
     it->second.lin_state_b16 = false;
+    s.active_lin_state_b16 = false;
+    for (int i = 0; i < n_dec; ++i) out_sampled[i] = h_out[i];
+    if (any_sampled) {
+        Impl::PackedSampleRows* h = s.packed_samp_host;
+        for (int i = 0; i < n_dec; i++) {
+            h->temp[i] = sampling->temperature[i];
+            h->seed[i] = sampling->seed[i];
+            h->step[i] = sampling->step[i];
+            h->top_k[i] = sampling->top_k[i];
+            h->top_p[i] = sampling->top_p[i];
+        }
+        sample_rows_packed(s, s.mix_logits, n_dec);
+        for (int i = 0; i < n_dec; i++)
+            if (h->temp[i] > 0.f) out_sampled[i] = h->out[i];
+    }
+    return true;
+}
+
+bool Qwen35Model::mixed_step_multi(const int* tokens, const int* positions, const uint64_t* seq_ids,
+                                   int n_dec, int* out_sampled, const PackedSampling* sampling,
+                                   int n_chunks, const uint64_t* chunk_seqs,
+                                   const int* const* chunk_ids, const int* pos0s, const int* lens,
+                                   const unsigned char* want_seed, int* chunk_seeds,
+                                   const PackedSampling* chunk_sampling) {
+    if (n_chunks < 1 || !chunk_seqs || !chunk_ids || !pos0s || !lens) return false;
+    bool any_seed = false;
+    for (int c = 0; want_seed && c < n_chunks; ++c) any_seed = any_seed || want_seed[c];
+    if (any_seed && !chunk_seeds) return false;
+    if (n_chunks == 1 && !any_seed) {   // the one-chunk step, unchanged
+        int seed = -1;
+        return mixed_step(tokens, positions, seq_ids, n_dec, out_sampled, sampling, chunk_seqs[0],
+                          chunk_ids[0], pos0s[0], lens[0], &seed);
+    }
+    Impl& s = *p_;
+    if (!tokens || !positions || !seq_ids || !out_sampled) return false;
+    if (n_dec < 1 || n_dec > kQwen35MaxPackedRows) return false;
+    if (!s.cfg.hybrid || !s.gguf || !s.cfg.dense_ffn || s.cfg.muse_glimmer || s.w.lm_head_type != 12)
+        return false;
+    if (!s.kv->int8_kv() || s.kv->windowed() || s.d_vision_emb || s.d_mrope_pos || s.dflash_capture)
+        return false;
+    int total = 0;
+    for (int c = 0; c < n_chunks; ++c) {
+        if (!chunk_ids[c] || lens[c] < 1 || pos0s[c] < 0 || chunk_seqs[c] == 0) return false;
+        for (int c2 = 0; c2 < c; ++c2) if (chunk_seqs[c2] == chunk_seqs[c]) return false;
+        for (int i = 0; i < n_dec; ++i) if (seq_ids[i] == chunk_seqs[c]) return false;
+        total += lens[c];
+    }
+    for (int i = 0; i < n_dec; ++i) if (seq_ids[i] == 0) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // Each chunk's session: fp32 recurrent state (a prompt being prefilled was never compacted),
+    // no logit bias.
+    std::vector<float*> lin_state((size_t)n_chunks);
+    std::vector<void*> lin_conv((size_t)n_chunks);
+    for (int c = 0; c < n_chunks; ++c) {
+        auto cit = s.sessions.find(chunk_seqs[c]);
+        // No logit bias: a seed here is the raw argmax (or a draw from the raw logits).
+        if (cit == s.sessions.end() || !cit->second.lin_state || !cit->second.lin_conv_state ||
+            cit->second.lin_state_b16 || cit->second.logit_bias_set)
+            return false;
+        lin_state[(size_t)c] = cit->second.lin_state;
+        lin_conv[(size_t)c] = cit->second.lin_conv_state;
+    }
+    bool any_sampled = false;
+    if (sampling) {
+        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
+            !sampling->top_p) return false;
+        for (int i = 0; i < n_dec && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
+    }
+    if (any_sampled && !ensure_packed_samp(s)) return false;
+    if (!ensure_mix_scratch(s)) return false;
+    constexpr int kRows = kQwen35MaxPackedRows;
+    constexpr int kMixSplitsMax = 32;
+    bool state_b16 = false;
+    if (!packed_rows_prepare(s, seq_ids, n_dec, &state_b16)) return false;
+    int* h_pos = s.mix_host;
+    int* h_seq = s.mix_host + kRows;
+    int* h_out = s.mix_host + 2 * kRows;
+    int hint = 0;
+    for (int i = 0; i < n_dec; ++i) {
+        h_pos[i] = positions[i];
+        h_seq[i] = positions[i] + 1;
+        hint = std::max(hint, h_seq[i]);
+    }
+    cu(cudaMemcpyAsync(s.mix_pos_d, h_pos, n_dec * sizeof(int), cudaMemcpyHostToDevice, s.stream),
+       "mixed positions");
+    cu(cudaMemcpyAsync(s.mix_seq_d, h_seq, n_dec * sizeof(int), cudaMemcpyHostToDevice, s.stream),
+       "mixed lengths");
+    const int splits = std::max(1, std::min(n_dec >= 24 ? 16 : s.n_splits, kMixSplitsMax));
+    // The first chunk's session is the pass's own, as a packed prefill's first prompt's is.
+    activate_session(chunk_seqs[0]);
+    static const int kHeadFp4YieldTokens = [] {
+        const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS");
+        const int v = e ? atoi(e) : 1024;
+        return v < 1 ? 1 : v;
+    }();
+    if (n_dec + total >= kHeadFp4YieldTokens && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf))
+        release_lm_head_fp4();
+    std::vector<int> ids((size_t)n_dec + total);
+    std::vector<int> off((size_t)n_chunks);
+    std::copy(tokens, tokens + n_dec, ids.begin());
+    for (int c = 0, o = n_dec; c < n_chunks; o += lens[c], ++c) {
+        off[(size_t)c] = o;
+        std::copy(chunk_ids[c], chunk_ids[c] + lens[c], ids.begin() + o);
+    }
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, chunk_seqs[0],
+                          lin_state[0], lin_conv[0],
+                          s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0,
+                          nullptr, nullptr, 0,
+                          nullptr };
+    ctx.mix_n = n_dec;
+    ctx.mix_rows = reinterpret_cast<const int* const*>(s.packed_dev_tables);
+    ctx.mix_btab = s.mix_btab;
+    ctx.mix_pos = s.mix_pos_d;
+    ctx.mix_seq = s.mix_seq_d;
+    ctx.mix_seq_hint = hint;
+    ctx.mix_lin_state = reinterpret_cast<float* const*>(s.packed_dev_states);
+    ctx.mix_lin_conv = reinterpret_cast<void* const*>(s.packed_dev_convs);
+    ctx.mix_state_b16 = state_b16;
+    ctx.mix_splits = splits;
+    ctx.mix_fa = s.mix_fa;
+    ctx.mix_q81 = s.mix_q81;
+    ctx.mix_logits = s.mix_logits;
+    ctx.mix_d_out = s.mix_d_out;
+    ctx.mix_out = h_out;
+    ctx.multi_n = n_chunks;
+    ctx.multi_off = off.data();
+    ctx.multi_len = lens;
+    ctx.multi_seq_ids = chunk_seqs;
+    ctx.multi_lin_state = lin_state.data();
+    ctx.multi_lin_conv = lin_conv.data();
+    ctx.multi_pos0 = pos0s;
+    // The chunks that end their prompts take a seed, drawn as ingest_prompts_packed draws one.
+    struct SeedSampler { Impl* s; const PackedSampling* samp; };
+    SeedSampler sampler{ &s, chunk_sampling };
+    if (any_seed) {
+        for (int c = 0; c < n_chunks; ++c) chunk_seeds[c] = -1;
+        ctx.multi_seed = chunk_seeds;
+        ctx.multi_want_seed = want_seed;
+        if (chunk_sampling && chunk_sampling->temperature && chunk_sampling->seed &&
+            chunk_sampling->step && chunk_sampling->top_k && chunk_sampling->top_p) {
+            ctx.multi_sample = [](void* user, int i) -> int {
+                const SeedSampler& x = *static_cast<const SeedSampler*>(user);
+                if (!(x.samp->temperature[i] > 0.f)) return -1;
+                return sample_logits_row(*x.s, x.samp->temperature[i], x.samp->seed[i],
+                                         x.samp->step[i], x.samp->top_k[i], x.samp->top_p[i]);
+            };
+            ctx.multi_sample_user = &sampler;
+        }
+    } else {
+        ctx.multi_no_seed = true;
+    }
+    bool scratch_oom = false;
+    ctx.scratch_oom_out = &scratch_oom;
+    if (prefill_batched_run(ctx, ids.data(), n_dec + total, 0) < 0) return false;
+    // The step ran (the decode rows moved): a seed that did not come back is reported as -1, for
+    // the caller to fail that request as it fails any prefill's invalid seed.
+    for (int c = 0; any_seed && c < n_chunks; ++c)
+        if (want_seed[c] && chunk_seeds[c] >= s.cfg.vocab) chunk_seeds[c] = -1;
+    // Batched prefill writes each chunk session's state as fp32; the decode rows keep theirs.
+    for (int c = 0; c < n_chunks; ++c) {
+        auto cit = s.sessions.find(chunk_seqs[c]);
+        if (cit != s.sessions.end()) cit->second.lin_state_b16 = false;
+    }
     s.active_lin_state_b16 = false;
     for (int i = 0; i < n_dec; ++i) out_sampled[i] = h_out[i];
     if (any_sampled) {

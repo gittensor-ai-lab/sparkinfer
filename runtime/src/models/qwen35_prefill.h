@@ -194,6 +194,16 @@ struct Qwen35PrefillCtx {
     void* const*         multi_ckpt_host  = nullptr;
     int                (*multi_sample)(void* user, int i) = nullptr;
     void*                multi_sample_user = nullptr;
+    // A MIXED step's prompt chunks (mix_n > 0 with multi_n > 0): the segments follow the decode
+    // rows (multi_off[0] == mix_n) and may resume mid-prompt -- multi_pos0[i] is segment i's first
+    // position (host; null = all 0): its state is reset only at 0, its conv carries the session's
+    // window in and its scan the session's recurrence, and its attention appends at that position.
+    // multi_no_seed skips the per-prompt seeds (no chunk finishes its prompt) and multi_seed may
+    // then be null; otherwise multi_want_seed (null = all) names the segments that end their
+    // prompts and take one. Qwen35Model::mixed_step_multi.
+    const int*           multi_pos0       = nullptr;
+    bool                 multi_no_seed    = false;
+    const unsigned char* multi_want_seed  = nullptr;
     // dflash_verify_short_run (not packed): when set, it replaces the verify rows' argmax with the
     // request's sampled tokens before the accepted prefix is chosen. `logits` is the device
     // [n, vocab] buffer the verify head wrote (it may be masked in place); `out_ids` is the host

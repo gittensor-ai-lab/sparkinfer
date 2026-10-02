@@ -666,6 +666,18 @@ public:
     bool mixed_step(const int* tokens, const int* positions, const uint64_t* seq_ids, int n_dec,
                     int* out_sampled, const PackedSampling* sampling, uint64_t chunk_seq,
                     const int* chunk_ids, int pos0, int len, int* chunk_seed);
+    // Several prompts' chunks in one mixed step: chunk c is chunk_ids[c][0, lens[c]) of session
+    // chunk_seqs[c] at positions pos0s[c].. (distinct sessions, none among the decode rows). The
+    // decode rows are sampled into out_sampled as mixed_step does. A chunk with want_seed[c] set
+    // ends its prompt: chunk_seeds[c] receives its first token -- the argmax, or a draw from
+    // chunk_sampling's row c as sample_seed_token would draw it. want_seed null = none (then a
+    // lone chunk takes mixed_step itself). False when the step did not run (nothing moved); a seed
+    // that did not come back is -1.
+    bool mixed_step_multi(const int* tokens, const int* positions, const uint64_t* seq_ids, int n_dec,
+                          int* out_sampled, const PackedSampling* sampling, int n_chunks,
+                          const uint64_t* chunk_seqs, const int* const* chunk_ids, const int* pos0s,
+                          const int* lens, const unsigned char* want_seed = nullptr,
+                          int* chunk_seeds = nullptr, const PackedSampling* chunk_sampling = nullptr);
     // Largest n decode_packed() accepts. Matches the packed graph tiers.
     static int max_packed_rows();
     uint64_t active_session() const;
