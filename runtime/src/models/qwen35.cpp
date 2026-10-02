@@ -5481,6 +5481,24 @@ static bool ensure_mix_scratch(Impl& s) {
     return true;
 }
 
+// A mixed step's pass reads the Bonsai decode shadow's ternary legs, as a prompt pack does
+// (ingest_prompts_packed). Without them every layer of the step read the folded legs, so its
+// 1024-row passes ran the int8 FFN and its per-pass weight conversion where the same rows as one
+// prompt take the FP4 arm. SPARKINFER_BONSAI_MIX_SHADOW=0 keeps the folded legs (A/B in one binary).
+template <class Impl>
+static void mix_shadow_legs(Impl& s, Qwen35PrefillCtx& ctx) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_MIX_SHADOW");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || s.bonsai_dec_layers.empty() || s.bonsai_dec_rs.size() != s.bonsai_dec_layers.size())
+        return;
+    ctx.bonsai_pf_layers = s.bonsai_dec_layers.data();
+    ctx.bonsai_pf_rs = s.bonsai_dec_rs.data();
+    const auto so = s.bonsai_sign_dev.find(s.qdim);
+    if (so != s.bonsai_sign_dev.end()) ctx.bonsai_sign_out = so->second;
+}
+
 bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint64_t* seq_ids,
                              int n_dec, int* out_sampled, const PackedSampling* sampling,
                              uint64_t chunk_seq, const int* chunk_ids, int pos0, int len,
@@ -5579,6 +5597,7 @@ bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint
     ctx.mix_logits = s.mix_logits;
     ctx.mix_d_out = s.mix_d_out;
     ctx.mix_out = h_out;
+    mix_shadow_legs(s, ctx);
     bool scratch_oom = false;
     ctx.scratch_oom_out = &scratch_oom;
     const int seed = prefill_batched_run(ctx, ids.data(), n_dec + len, pos0);
@@ -5729,6 +5748,7 @@ bool Qwen35Model::mixed_step_multi(const int* tokens, const int* positions, cons
     ctx.multi_lin_state = lin_state.data();
     ctx.multi_lin_conv = lin_conv.data();
     ctx.multi_pos0 = pos0s;
+    mix_shadow_legs(s, ctx);
     // The chunks that end their prompts take a seed, drawn as ingest_prompts_packed draws one.
     struct SeedSampler { Impl* s; const PackedSampling* samp; };
     SeedSampler sampler{ &s, chunk_sampling };
