@@ -20,7 +20,7 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     the packed prefill.
   - **The trade, measured** (RTX 5090, Qwen3.8-27B NVFP4; rule at N=256 vs off):
     - the continuous-batching bench, where C streams arrive together, runs 3-9% more tok/s with
-      the rule (Bonsai-2 c32 2,074 -> 2,258; ModelOpt c32 1,749 -> 1,840);
+      the rule (Bonsai-2 c32 2,074 -> 2,213-2,263; ModelOpt c32 1,749 -> 1,840-1,870);
     - AIPerf chat is better without it. Mixing the first wave in budget-sized steps staggers when
       its prompts finish, so the next waves do not arrive at once: TTFT p50 at c16 / c32
       343-348 / 364-367 ms off, against 664 / 787-1,058 with the rule, and request latency p50 at
