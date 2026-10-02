@@ -5,6 +5,27 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Speculative decoding
+
+- **Prompts longer than 16K tokens speculate.**
+  - **Before:** the drafter's context was capped at 16,384 positions
+    (`SPARKINFER_DSPARK_MAX_CTX`), a limit from before #1243 gave DFlash2 window-sized slots.
+    Any longer prompt silently decoded at plain speed.
+  - **Now:** a drafter whose every layer attends a sliding window (DFlash2) follows the target's
+    whole `--ctx`, at no extra device memory (its slots hold ~4K rows either way). DSpark keeps
+    16,384.
+  - **Measured** (single request, greedy, RTX 5090, Qwen3.8-27B NVFP4 + DFlash2, `--ctx 131072`;
+    `eval/spec_long_ctx.py`, tok/s, plain decode -> speculating):
+
+    | context | prose | code |
+    |---|---|---|
+    | 16K | 96 -> 200 | 97 -> 308 |
+    | 32K | 93 -> 173 | 93 -> 227 |
+    | 64K | 86 -> 132 | 87 -> 147 |
+
+  - **Tested:** `eval/spec_long_ctx_lossless.py`, prompts of 20K-47K tokens, greedy and
+    deterministic: 4/4 completions identical to plain decode.
+
 ## [0.6.5] — 2026-10-02
 
 **8K-token prompts at 4-16 concurrent requests are now faster than vLLM.**

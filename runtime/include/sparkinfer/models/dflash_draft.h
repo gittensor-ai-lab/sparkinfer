@@ -64,6 +64,11 @@ public:
     // Load model.safetensors (+ optional config.json) from a HF draft directory.
     bool load(const std::string& dir);
 
+    // Would the draft in `dir` get window-sized slots (every layer a sliding window, and
+    // SPARKINFER_DFLASH_SLOT_WINDOW not 0)? Such a draft's memory does not grow with
+    // DFlashDraftConfig::max_seq, so it can follow the target's whole context.
+    static bool windowed_slots(const std::string& dir);
+
     // Load a GGUF-packed draft checkpoint (e.g. Muse Glimmer's dflash-kquant.gguf). Self-contained
     // like load(): opens the file, derives config from its metadata (see
     // museglimmer_dflash_config_from_gguf in runtime/examples/dflash_gguf_config.h), and uploads

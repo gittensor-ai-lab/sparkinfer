@@ -74,10 +74,10 @@ leaves no device memory for the drafter, which is why this example and the conta
   without it.
 - **What speculates:** up to `SPARKINFER_SPEC_GROUP` (8) fresh requests at a time, greedy or
   sampled. A request speculates from its start up to the end of the drafter's context
-  (`SPARKINFER_DSPARK_MAX_CTX`, 16,384 positions). One that reaches it ends speculation for its
-  group: every member decodes on as usual, and new requests speculate once they have finished.
-  With `SPARKINFER_SPEC_GROUP=1` a request whose prompt plus `max_tokens` exceeds that context does
-  not speculate at all.
+  (`SPARKINFER_DSPARK_MAX_CTX`): the whole `--ctx` for DFlash2, whose layers all attend a sliding
+  window, and 16,384 positions for DSpark. A member that reaches it stays in its group and
+  verifies one token a step without a draft. With `SPARKINFER_SPEC_GROUP=1` a request whose prompt
+  plus `max_tokens` exceeds that context does not speculate at all.
 - **What does not:** requests with tools, `response_format` JSON schemas or other constraints,
   vision, penalties, logit bias, logprobs, forced tokens or a prefix session take the ordinary
   path, as do all requests while more are live than a group takes.
@@ -550,7 +550,7 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_DETERMINISTIC` | `0` | `1` = bit-reproducible output (see **Determinism** above). Decode speed unchanged; TTFT +2–8%. |
 | `SPARKINFER_MAX_OUTPUT_TOKENS` | `4096` (container: `16384`) | Per-request generation cap. A request without `max_tokens` generates until the model stops, up to this cap or the room its prompt leaves in the context; a larger `max_tokens` is clamped to this cap. Each request reserves KV blocks for its prompt plus `max_tokens` when it is admitted, so a cap near the full context lets one long request hold the whole pool while other requests wait for it (see `SPARKINFER_ADMISSION_WAIT_S`). |
 | `SPARKINFER_DRAFT_MODEL` | — | Drafter directory (DFlash2 or DSpark), same as `--draft-model`. The server exits if the drafter cannot be loaded, including when it does not fit in device memory. |
-| `SPARKINFER_DSPARK_MAX_CTX` | `16384` | Context the DSpark drafter attends over (its own KV cache), capped at `--ctx`. |
+| `SPARKINFER_DSPARK_MAX_CTX` | `--ctx` for a drafter whose layers all attend a sliding window (DFlash2), else `16384` | Context a request can speculate through (the drafter's positions), capped at `--ctx`. |
 | `SPARKINFER_DRAFT_OFFLOAD_MS` | `1000` | With a drafter loaded, how long live requests must stay more than a speculation group takes before the drafter's device memory (~3 GB for DFlash2) moves to pinned host memory. Nothing reads it while no group can form, and on a 32 GB card it is the headroom concurrent prefill and decode need. It comes back (~0.1 s) at the same addresses when a group can form again and the device has room for it. A prefill or a new session that runs out of memory beside an idle drafter moves it at once, whatever this is set to. `-1` turns off only the timed move; `SPARKINFER_DRAFT_OFFLOAD=0` keeps the drafter on the device always. It needs pinned host memory of ~1.25x the drafter (~3.8 GB for DFlash2). |
 | `SPARKINFER_DRAFT_OFFLOAD` | `1` | `0` allocates the drafter with plain `cudaMalloc`, so it can never leave the device (the behaviour before the offload). |
 | `SPARKINFER_DRAFT_RESTORE_HEADROOM_MB` | `1024` | Free device memory, beyond the drafter itself, required to bring it back. Below that, requests decode without speculation until there is room. |

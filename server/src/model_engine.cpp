@@ -877,9 +877,15 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
         err = "speculative decoding is supported for Qwen3.8-27B targets only";
         return false;
     }
+    // The context a request may speculate through. A draft whose every layer attends a sliding
+    // window keeps window-sized slots (#1243), so it follows the target's whole context at no extra
+    // memory; capping it at 16384 left every longer prompt on plain decode (prose at 16K / 32K /
+    // 64K tokens: 96 / 93 / 86 tok/s against 200 / 173 / 132 speculating). Any other draft's slots
+    // grow with this, and keep the 16384 default. SPARKINFER_DSPARK_MAX_CTX overrides.
     const char* e = getenv("SPARKINFER_DSPARK_MAX_CTX");
+    const int dflt = sparkinfer::DFlashDraftModel::windowed_slots(dir) ? impl_->cfg.max_seq : 16384;
     sparkinfer::DFlashDraftConfig dcfg;
-    dcfg.max_seq = std::min(impl_->cfg.max_seq, e ? std::max(1024, atoi(e)) : 16384);
+    dcfg.max_seq = std::min(impl_->cfg.max_seq, e ? std::max(1024, atoi(e)) : dflt);
     auto draft = std::make_unique<sparkinfer::DFlashDraftModel>(dcfg);
     if (!draft->load(dir)) {
         // The usual cause is device memory, not the checkpoint: the target's KV pool is sized for

@@ -1089,6 +1089,16 @@ static void compute_yarn_inv_freq(const DFlashDraftConfig& cfg, std::vector<floa
     att_scale = (float)(0.1 * std::log(factor) + 1.0);
 }
 
+bool DFlashDraftModel::windowed_slots(const std::string& dir) {
+    DFlashDraftConfig c;
+    if (!parse_config_json(dir + "/config.json", c)) return false;
+    // The same test as the slot sizing in Impl (a slot holds win_rows rows only then).
+    bool all_sliding = c.dflash2 && c.sliding_window > 0 && !c.sliding_layers.empty();
+    for (bool sl : c.sliding_layers) all_sliding = all_sliding && sl;
+    const char* e = getenv("SPARKINFER_DFLASH_SLOT_WINDOW");
+    return all_sliding && !(e && atoi(e) <= 0);
+}
+
 bool DFlashDraftModel::load(const std::string& dir) {
     Impl& s = *p_;
     const int cu_errors_before = g_cu_errors.load();
