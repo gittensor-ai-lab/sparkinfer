@@ -5,6 +5,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-10-02
+
+**Time to first token at 16-32 concurrent chats now matches vLLM.**
+- **Before:** p50 591 / 1,183 ms at 16 / 32 concurrent chats, against vLLM 0.30's 360 / 356.
+- **Now:** prefill and decode share one forward pass by default, and one pass carries several
+  waiting prompts (#1251): p50 355 / 372 ms, p90 and p99 below vLLM's, with output tok/s 14% /
+  23% above vLLM's.
+
 ### Serving
 
 - **Mixed prefill + decode steps are on by default, and one step carries several prompts.**

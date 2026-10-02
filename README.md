@@ -184,23 +184,33 @@ as packed decode does.
 
 ### Serving against vLLM
 
-[AIPerf](https://github.com/ai-dynamo/aiperf), streaming chat completions, no draft, RTX 5090,
-the ModelOpt NVFP4 checkpoint on both engines (sparkinfer int8 KV, `--ctx 131072`; vLLM 0.30.0
-fp8 KV, `--gpu-memory-utilization 0.90`), one server per engine, the same cells and seed.
-Output tok/s, sparkinfer / vLLM:
+[AIPerf](https://github.com/ai-dynamo/aiperf), streaming chat completions, RTX 5090, the ModelOpt
+NVFP4 checkpoint on both engines, one server per engine, the same cells and seed. sparkinfer runs
+as the release container ships it: DFlash2 drafter loaded, int8 KV, `--ctx 131072`. vLLM 0.30.0
+runs without a drafter (fp8 KV, `--gpu-memory-utilization 0.90`); the table above compares the
+two with the same drafter. Output tok/s, sparkinfer / vLLM:
 
 | cell (prompt / answer tokens) | 1 request | 4 | 16 | 32 |
 |---|---:|---:|---:|---:|
-| chat (1024 / 256) | **94.7** / 82.8 | **308.6** / 260.8 | **858.8** / 752.7 | **1,069.7** / 1,030.5 |
-| long answer (128 / 1024) | **99.8** / 85.2 | **352.1** / 290.8 | **1,239.3** / 1,092.1 | **2,001.9** / 1,785.4 |
-| long prompt (8192 / 128) | **66.8** / 59.5 | 127.5 / **147.2** | 165.0 / **170.8** | 165.6 / **167.7** |
+| chat (1024 / 256) | **207.0** / 82.8 | **517.1** / 260.8 | **858.3** / 752.7 | **1,265.5** / 1,030.5 |
+| long answer (128 / 1024) | **217.3** / 85.2 | **718.8** / 290.8 | **1,235.4** / 1,092.1 | **2,000.7** / 1,785.4 |
+| long prompt (8192 / 128) | **94.4** / 59.5 | **148.9** / 147.2 | 166.2 / **170.8** | 166.8 / **167.7** |
 
-Inter-token latency p50 is lower than vLLM's in every cell. Two places are still behind:
-- **Time to first token at 16 and 32 concurrent chats:** p50 553 / 1,121 ms against 360 / 356.
-  The opt-in mixed prefill + decode steps (`SPARKINFER_MIXED_CHUNK`) measured 332 ms at 32
-  (against 1,240 off, on an earlier main), for ~15% less throughput.
-- **The 8K-prompt cells at 4+ requests:** AIPerf re-sends earlier cells' prompts, and vLLM's
-  larger KV pool keeps them in its prefix cache (a 35% hit rate there).
+Time to first token in ms (p50 / p90 / p99):
+
+| cell | engine | 16 requests | 32 requests |
+|---|---|---|---|
+| chat (1024 / 256) | sparkinfer | **355** / **1,240** / **1,845** | 372 / **2,602** / **3,386** |
+| | vLLM | 360 / 1,287 / 1,916 | **356** / 2,811 / 3,815 |
+| long answer (128 / 1024) | sparkinfer | **140** / 456 / 526 | **219** / 783 / 894 |
+| | vLLM | 373 / **381** / **381** | 379 / **500** / **503** |
+
+- **Inter-token latency:** p50 is lower than vLLM's in every cell.
+- **Chat at 16-32 requests:** prefill and decode share one forward pass (mixed steps, on by
+  default; `SPARKINFER_MIXED_CHUNK=0` turns them off).
+- **Still behind: the 8K-prompt cells at 16+ requests.** AIPerf re-sends earlier cells' prompts,
+  and vLLM's larger KV pool keeps them in its prefix cache (a 35% hit rate there). Time to first
+  token there is 2.5 / 14.4 s p50 against vLLM's 1.2 / 12.4.
 
 ### Same weights, GGUF on both sides
 
