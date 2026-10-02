@@ -6236,6 +6236,20 @@ bool Qwen35Model::dflash_draft_offloaded() const {
     return p_->dflash_draft && p_->dflash_draft->offloaded();
 }
 
+// Ternary-Bonsai-2 runs no mixed steps. Its prompt rows cost far more per row in a short pass than
+// in one pass of every waiting prompt: each pass converts every layer's ternary legs for the FP4
+// GEMMs once, whatever its rows, and a 1024-token prefill runs at 9.9k tok/s against 14.5k for
+// 4096 tokens -- while its decode rows, at ~5 ms a step, lose little waiting for that one pass.
+// SPARKINFER_BONSAI_MIX_BUDGET sets its budget instead (1024 restores the engine default; a
+// negative value defers to it); SPARKINFER_MIXED_CHUNK, when set, overrides both.
+int Qwen35Model::mixed_budget_hint() const {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_MIX_BUDGET");
+        return e ? atoi(e) : 0;
+    }();
+    return p_->bonsai_block > 0 ? (v < 0 ? -1 : v) : -1;
+}
+
 void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows,
                                     int context_start, int context_end) {
     Impl& s = *p_;

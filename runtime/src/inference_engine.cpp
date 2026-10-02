@@ -1786,14 +1786,20 @@ void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefi
         const char* e = getenv("SPARKINFER_MIXED_CHUNK");
         return e ? std::max(0, atoi(e)) : -1;
     }();
-    const int budget = env_budget >= 0 ? env_budget
-                     : (model_ && model_->config().n_experts > 1 ? 4096 : 1024);
     // At most this many prompts in one step (SPARKINFER_MIXED_PROMPTS).
-    static const int max_prompts = [] {
+    static const int max_prompts_env = [] {
         const char* e = getenv("SPARKINFER_MIXED_PROMPTS");
-        const int v = e ? atoi(e) : 8;
-        return v < 1 ? 1 : v;
+        return e ? std::max(1, atoi(e)) : -1;
     }();
+    // Unset, the checkpoint's own budget where it has one (Qwen35Model::mixed_budget_hint; 0 =
+    // no mixed steps), with room for that many tokens of 128-token prompts; else the MoE / dense
+    // default above, over up to 8 prompts.
+    const int hint = model_ ? model_->mixed_budget_hint() : -1;
+    const int budget = env_budget >= 0 ? env_budget
+                     : hint >= 0 ? hint
+                     : (model_ && model_->config().n_experts > 1 ? 4096 : 1024);
+    const int max_prompts =
+        max_prompts_env > 0 ? max_prompts_env : (hint > 0 ? std::max(8, hint / 128) : 8);
     // A prompt with more than this left is a long prefill: one batched pass of its own runs it
     // faster than budget-sized chunks would (8192-token prompts at c16/c32: -12% output tok/s
     // chunked), and the scheduler already meters those one per iteration. Same knob and default

@@ -685,6 +685,9 @@ public:
                           int* chunk_seeds = nullptr, const PackedSampling* chunk_sampling = nullptr);
     // Largest n decode_packed() accepts. Matches the packed graph tiers.
     static int max_packed_rows();
+    // The prompt tokens a mixed step should carry on this checkpoint (0: no mixed steps), or -1
+    // for the engine's own default (ContinuousBatchEngine::pick_mixed_chunks).
+    int mixed_budget_hint() const;
     uint64_t active_session() const;
 
     // Zeros seq_id's running presence/frequency-penalty count buffer. MUST be called once per
