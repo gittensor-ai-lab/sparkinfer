@@ -5,6 +5,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.7] — 2026-10-03
+
+**Qwen3.6 answers concurrent requests correctly, and 3.5-4x faster.**
+- **Before:** any 2+ concurrent Qwen3.6-35B-A3B requests decoded to repeated garbage tokens, since
+  at least 0.5.14. Past 8 they were correct but decoded one forward each: 457 / 461 tok/s at 16 / 32
+  requests, below one stream.
+- **Now:** correct output at every concurrency (#1262), and 1,621 / 1,834 tok/s at c16 / c32.
+- **Also:** Bonsai-2's mixed prefill + decode steps run its FP4 FFN (#1261).
+
 ### Fixed
 
 - **Qwen3.6-35B-A3B answered 2+ concurrent requests with garbage, and decoded 9+ one at a time.**
