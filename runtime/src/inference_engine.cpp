@@ -1770,6 +1770,19 @@ void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefi
     unmixable.clear();
     if (budget < kMinBudget || !model_) return;
     std::lock_guard<std::mutex> lock(mu_);
+    // While no more requests are live than a speculation group takes, the load is speculation's
+    // (worker_loop forms a group from fresh prompts and the requests decoding beside them). A
+    // prompt part-way through mixed steps is neither, so mixing there kept groups from forming:
+    // under Poisson arrivals at 2 requests/s, mean latency 4.56 -> 5.76 s with mixing on.
+    static const bool spec_env_on = [] {
+        const char* e = getenv("SPARKINFER_SPECULATIVE");
+        return !(e && e[0] == '0');
+    }();
+    if (speculative_ && spec_env_on && spec_group_max() > 1) {
+        int live = 0;
+        for (const auto& kv : jobs_) live += !kv.second->done;
+        if (live <= spec_group_max()) return;
+    }
     int left = budget;
     for (uint64_t id : prefill_ids) {
         auto it = jobs_.find(id);
@@ -1795,7 +1808,11 @@ void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefi
             for (int ck : r.cache_checkpoints)
                 if (ck > j->prefill_pos && ck < limit && ck % kv_->block_size() == 0) limit = ck;
         const int avail = limit - j->prefill_pos;
-        if (avail < 1) {   // only the seed is left, and the pass cannot take it
+        // Under 8 tokens to go: step_job's short-resume forward takes them (about one decode
+        // step). As a chunk they could leave a pass no 8-row alignment can fix, and an unaligned
+        // mixed pass runs every layer on the NVFP4 fallback (a 9-row step: 85 ms against 16-20
+        // for aligned ones up to 88 rows).
+        if (avail < 8) {
             unmixable.push_back(id);
             continue;
         }
@@ -1827,18 +1844,20 @@ bool ContinuousBatchEngine::run_mixed_chunks(const std::vector<int>& toks, const
     for (int c = 0; c < k; ++c) total += lens[(size_t)c] = chunks[(size_t)c].max;
     std::vector<unsigned char> want((size_t)k);
     for (int c = 0; c < k; ++c) want[(size_t)c] = chunks[(size_t)c].finish ? 1 : 0;
-    int r = total % 8;
-    // Off the latest chunks first, the ones that stop short anyway before the ones that finish;
-    // a finishing chunk trimmed leaves its last tokens (and its seed) to the next step.
-    for (int pass = 0; pass < 2 && r > 0; ++pass)
-        for (int c = k - 1; c >= 0 && r > 0; --c) {
-            if (pass == 0 && want[(size_t)c]) continue;
-            const int cut = std::min(r, lens[(size_t)c] - 1);
-            if (cut <= 0) continue;
-            lens[(size_t)c] -= cut;
-            want[(size_t)c] = 0;
-            r -= cut;
-        }
+    // The remainder comes off one chunk, whole: the latest one that stops short anyway, else the
+    // latest that finishes, which leaves its last few tokens to step_job (see pick_mixed_chunks:
+    // every chunk is 8+ tokens, so one always can). An unaligned pass would run every layer on
+    // the NVFP4 fallback, so a step that cannot align does not mix.
+    const int r = total % 8;
+    if (r > 0) {
+        int at = -1;
+        for (int pass = 0; pass < 2 && at < 0; ++pass)
+            for (int c = k - 1; c >= 0 && at < 0; --c)
+                if ((pass == 1 || !want[(size_t)c]) && lens[(size_t)c] > r) at = c;
+        if (at < 0) return false;
+        lens[(size_t)at] -= r;
+        want[(size_t)at] = 0;
+    }
     std::vector<uint64_t> cs((size_t)k);
     std::vector<const int*> ci((size_t)k);
     std::vector<int> p0((size_t)k), seeds((size_t)k, -1), top_k((size_t)k);
@@ -1864,10 +1883,27 @@ bool ContinuousBatchEngine::run_mixed_chunks(const std::vector<int>& toks, const
     cs_samp.top_p = top_p.data();
     // Text-only prompts: clear the rotary decode offset, as step_job does before each.
     model_->reset_mrope_offset();
-    if (!model_->mixed_step_multi(toks.data(), pos.data(), seqs.data(), m, out.data(), samp, k,
-                                  cs.data(), ci.data(), p0.data(), lens.data(), want.data(),
-                                  seeds.data(), &cs_samp))
-        return false;
+    // SPARKINFER_MIXED_TRACE=1: one line per mixed step (rows, each chunk's length and whether it
+    // finishes, wall time).
+    static const bool trace = [] {
+        const char* e = getenv("SPARKINFER_MIXED_TRACE");
+        return e && e[0] == '1';
+    }();
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ran = model_->mixed_step_multi(toks.data(), pos.data(), seqs.data(), m, out.data(), samp,
+                                              k, cs.data(), ci.data(), p0.data(), lens.data(),
+                                              want.data(), seeds.data(), &cs_samp);
+    if (trace) {
+        int rows = m;
+        std::string cl;
+        for (int c = 0; c < k; ++c) {
+            rows += lens[(size_t)c];
+            cl += " " + std::to_string(lens[(size_t)c]) + (want[(size_t)c] ? "f" : "");
+        }
+        fprintf(stderr, "[mixed] %s %d rows (%d decode,%s) %.1f ms\n", ran ? "step" : "declined", rows, m,
+                cl.c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+    if (!ran) return false;
     bool finished_any = false;
     for (int c = 0; c < k; ++c) {
         MixChunk& mc = chunks[(size_t)c];
