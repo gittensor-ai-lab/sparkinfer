@@ -5443,6 +5443,24 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
 
 // A mixed step's scratch, allocated once: per-row tables and positions, split-KV partials, the
 // decode rows' head input, logits and the pinned host slots (mixed_step, mixed_step_multi).
+// A mixed step's FFN reads the Bonsai decode shadow's ternary legs, as a packed prompt prefill
+// does (ingest_prompts_packed) and as packed decode's rows do: without them the whole pass ran the
+// folded int8 FFN (a 1,024-row Bonsai-2 step took ~150 ms against ~80 on Qwen3.8).
+// SPARKINFER_BONSAI_PACK_SHADOW=0 keeps the folded legs, as for packs.
+template <class Impl>
+static void set_mix_shadow_legs(Impl& s, Qwen35PrefillCtx& ctx) {
+    static const bool pack_shadow = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_PACK_SHADOW");
+        return !(e && e[0] == '0');
+    }();
+    if (!pack_shadow || s.bonsai_dec_layers.empty() || s.bonsai_dec_rs.size() != s.bonsai_dec_layers.size())
+        return;
+    ctx.bonsai_pf_layers = s.bonsai_dec_layers.data();
+    ctx.bonsai_pf_rs = s.bonsai_dec_rs.data();
+    const auto so = s.bonsai_sign_dev.find(s.qdim);
+    if (so != s.bonsai_sign_dev.end()) ctx.bonsai_sign_out = so->second;
+}
+
 template <class Impl>
 static bool ensure_mix_scratch(Impl& s) {
     constexpr int kRows = kQwen35MaxPackedRows;
@@ -5579,6 +5597,7 @@ bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint
     ctx.mix_logits = s.mix_logits;
     ctx.mix_d_out = s.mix_d_out;
     ctx.mix_out = h_out;
+    set_mix_shadow_legs(s, ctx);
     bool scratch_oom = false;
     ctx.scratch_oom_out = &scratch_oom;
     const int seed = prefill_batched_run(ctx, ids.data(), n_dec + len, pos0);
@@ -5722,6 +5741,7 @@ bool Qwen35Model::mixed_step_multi(const int* tokens, const int* positions, cons
     ctx.mix_logits = s.mix_logits;
     ctx.mix_d_out = s.mix_d_out;
     ctx.mix_out = h_out;
+    set_mix_shadow_legs(s, ctx);
     ctx.multi_n = n_chunks;
     ctx.multi_off = off.data();
     ctx.multi_len = lens;

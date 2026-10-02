@@ -1609,7 +1609,7 @@ void ContinuousBatchEngine::worker_loop() {
         // original one-forward-per-sequence loop, unchanged.
         std::vector<MixChunk> mix;
         std::vector<uint64_t> unmixable;
-        if (mix_decode) pick_mixed_chunks(prefill_ids, mix, unmixable);
+        if (mix_decode) pick_mixed_chunks(prefill_ids, (int)decode_ids.size(), mix, unmixable);
         if (!step_jobs_packed(decode_ids, any_finished, mix.empty() ? nullptr : &mix)) {
             for (uint64_t id : decode_ids) {
                 Job* job = nullptr;
@@ -1747,7 +1747,7 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
 // pass cannot finish (it wants logprobs, or a constraint shapes its first token) stops one token
 // short and step_job owns its seed; a chunk also stops at the next prefix-cache checkpoint, which
 // the worker snapshots once a step lands on it.
-void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefill_ids,
+void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefill_ids, int n_decode,
                                               std::vector<MixChunk>& chunks,
                                               std::vector<uint64_t>& unmixable) {
     static const int budget = [] {
@@ -1789,7 +1789,41 @@ void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefi
         for (const auto& kv : jobs_) live += !kv.second->done;
         if (live <= spec_group_max()) return;
     }
-    int left = budget;
+    // BURSTS (opt-in, SPARKINFER_MIXED_ROW_TOKENS=<tokens per decode row>, e.g. 256): fresh prompt
+    // tokens waiting beyond decode rows x that -- a load ramping up, or a wave arriving at once --
+    // take passes of SPARKINFER_MIXED_BURST_CHUNK tokens (default 4096) and up to 16 prompts, with
+    // the decode rows riding along, or with that at 0 the packed prefill. Budget-sized passes split
+    // a burst where one packed pass is cheaper: the continuous-batching bench (C streams of 256
+    // tokens arriving together) runs 3-9% fewer tok/s mixing every step than either rule (Bonsai-2
+    // c32 2,074 against 2,263). Off by default all the same: in AIPerf chat, mixing the first wave
+    // in budget-sized steps staggers when its prompts finish, so the waves that follow do not
+    // arrive at once -- TTFT p50 at c16 / c32 343-348 / 364-367 ms, against 635-1,058 with either
+    // rule, and request latency p50 at c32 6.0-6.1 s against 6.3-7.1.
+    static const int row_tokens = [] {
+        const char* e = getenv("SPARKINFER_MIXED_ROW_TOKENS");
+        return e ? std::max(0, atoi(e)) : 0;
+    }();
+    static const int burst_budget = [] {
+        const char* e = getenv("SPARKINFER_MIXED_BURST_CHUNK");
+        return e ? std::max(0, atoi(e)) : 4096;
+    }();
+    int step_budget = budget, step_prompts = max_prompts;
+    if (row_tokens > 0) {
+        long fresh = 0;
+        for (uint64_t id : prefill_ids) {
+            auto it = jobs_.find(id);
+            if (it == jobs_.end() || it->second->done) continue;
+            const Job& j = *it->second;
+            if (j.phase == SeqPhase::PREFILL && j.mixed_tokens == 0)
+                fresh += (long)j.req.prompt.size() - j.prefill_pos;
+        }
+        if (fresh > (long)n_decode * row_tokens) {
+            if (burst_budget < kMinBudget) return;
+            step_budget = std::max(budget, burst_budget);
+            step_prompts = std::max(max_prompts, 16);
+        }
+    }
+    int left = step_budget;
     for (uint64_t id : prefill_ids) {
         auto it = jobs_.find(id);
         if (it == jobs_.end() || it->second->done) continue;
@@ -1823,7 +1857,7 @@ void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefi
             continue;
         }
         // Past the budget or the prompt count it waits a step.
-        if ((int)chunks.size() >= max_prompts) continue;
+        if ((int)chunks.size() >= step_prompts) continue;
         const int take = std::min(avail, left);
         if (take < 1 || (take < avail && take < kMinPart)) continue;
         MixChunk c;

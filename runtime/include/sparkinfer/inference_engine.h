@@ -296,7 +296,7 @@ private:
     // The prompts a mixed step would carry this iteration (empty when nothing is eligible or
     // mixing is off, SPARKINFER_MIXED_CHUNK), and the scheduled prefills it can never carry, which
     // step_job runs as before.
-    void pick_mixed_chunks(const std::vector<uint64_t>& prefill_ids, std::vector<MixChunk>& chunks,
+    void pick_mixed_chunks(const std::vector<uint64_t>& prefill_ids, int n_decode, std::vector<MixChunk>& chunks,
                            std::vector<uint64_t>& unmixable);
     bool run_mixed_chunks(const std::vector<int>& toks, const std::vector<int>& pos,
                           const std::vector<uint64_t>& seqs, std::vector<int>& out,

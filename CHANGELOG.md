@@ -5,6 +5,27 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Serving
+
+- **Bonsai-2's mixed steps run its FP4 FFN.** A mixed prefill + decode pass did not hand the
+  prefill its decode shadow's ternary legs, as a packed prompt prefill does, so every layer ran the
+  folded int8 FFN: a 1,024-row step took ~150 ms against ~86 now. Continuous-batching bench
+  (`qwen3_gguf_cb_bench`, 256/256, plus a 512-token prompt arriving mid-decode), Bonsai-2 c16 /
+  c32: 1,437 / 1,870 -> 1,550 / 2,074 tok/s. `eval/mixed_conc_check.py` on Bonsai-2: 34/34
+  greedy answers identical with mixing on and off.
+- **Mixing a burst is a choice now: `SPARKINFER_MIXED_ROW_TOKENS`** (off by default).
+  - **What it does:** set to N, fresh prompt tokens waiting beyond decode rows x N count as a
+    burst, a load ramping up or a wave arriving at once. A burst then takes passes of
+    `SPARKINFER_MIXED_BURST_CHUNK` tokens (default 4096) and up to 16 prompts, or with that at 0
+    the packed prefill.
+  - **The trade, measured** (RTX 5090, Qwen3.8-27B NVFP4; rule at N=256 vs off):
+    - the continuous-batching bench, where C streams arrive together, runs 3-9% more tok/s with
+      the rule (Bonsai-2 c32 2,074 -> 2,258; ModelOpt c32 1,749 -> 1,840);
+    - AIPerf chat is better without it. Mixing the first wave in budget-sized steps staggers when
+      its prompts finish, so the next waves do not arrive at once: TTFT p50 at c16 / c32
+      343-348 / 364-367 ms off, against 664 / 787-1,058 with the rule, and request latency p50 at
+      c32 6.0-6.1 s against 6.3-7.1.
+
 ## [0.6.6] — 2026-10-02
 
 **Prompts longer than 16K tokens speculate.**

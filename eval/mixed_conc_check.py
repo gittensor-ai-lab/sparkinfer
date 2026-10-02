@@ -13,7 +13,8 @@ hits with mixing as without (the checkpoints were taken), and how far each greed
 The two launches run different pass shapes, so near ties may flip late; a layout slip (a prompt's
 tokens or state in another's slot) shows up as answers that disagree from the first tokens.
 
-usage: mixed_conc_check.py <server-bin> <model-dir> [ENV=VAL ...]   (extra env for both launches)
+usage: mixed_conc_check.py <server-bin> <model-dir-or-gguf> [ENV=VAL ...]   (extra env for both)
+MCC_TOKENIZER=<tokenizer.json> for a model that does not ship one beside it (a GGUF file).
 """
 import json, os, signal, subprocess, sys, threading, time, urllib.request
 
@@ -27,7 +28,8 @@ WORDS = ("river stone lantern copper meadow signal harbor quiet engine paper orb
 def launch(mixed):
     env = dict(os.environ, **extra, SPARKINFER_PREFIX_CACHE="1",
                SPARKINFER_MIXED_CHUNK="1024" if mixed else "0")
-    p = subprocess.Popen([server, "-m", model, "--tokenizer", os.path.join(model, "tokenizer.json"),
+    tok = os.environ.get("MCC_TOKENIZER") or os.path.join(model, "tokenizer.json")
+    p = subprocess.Popen([server, "-m", model, "--tokenizer", tok,
                           "--model-name", "q", "--ctx", "32768", "--host", "127.0.0.1", "--port", str(PORT)],
                          stdout=open(f"/tmp/mcc_{int(mixed)}.log", "w"), stderr=subprocess.STDOUT, env=env,
                          start_new_session=True)
