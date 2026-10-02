@@ -15,6 +15,8 @@ tokens or state in another's slot) shows up as answers that disagree from the fi
 
 usage: mixed_conc_check.py <server-bin> <model-dir-or-gguf> [ENV=VAL ...]   (extra env for both)
 MCC_TOKENIZER=<tokenizer.json> for a model that does not ship one beside it (a GGUF file).
+MCC_ON / MCC_OFF=<VAR=VAL[,VAR=VAL]> replace the toggle (default SPARKINFER_MIXED_CHUNK=1024 / 0),
+e.g. SPARKINFER_PACKED_DECODE=1 / 0 to check packed decode against one forward per request.
 """
 import json, os, signal, subprocess, sys, threading, time, urllib.request
 
@@ -25,9 +27,14 @@ WORDS = ("river stone lantern copper meadow signal harbor quiet engine paper orb
          "thunder ladder silver market candle forest bridge").split()
 
 
+def toggle(spec):
+    return dict(kv.split("=", 1) for kv in spec.split(",") if kv)
+
+
 def launch(mixed):
-    env = dict(os.environ, **extra, SPARKINFER_PREFIX_CACHE="1",
-               SPARKINFER_MIXED_CHUNK="1024" if mixed else "0")
+    env = dict(os.environ, **extra, SPARKINFER_PREFIX_CACHE="1")
+    env.update(toggle(os.environ.get("MCC_ON", "SPARKINFER_MIXED_CHUNK=1024") if mixed
+                      else os.environ.get("MCC_OFF", "SPARKINFER_MIXED_CHUNK=0")))
     tok = os.environ.get("MCC_TOKENIZER") or os.path.join(model, "tokenizer.json")
     p = subprocess.Popen([server, "-m", model, "--tokenizer", tok,
                           "--model-name", "q", "--ctx", "32768", "--host", "127.0.0.1", "--port", str(PORT)],

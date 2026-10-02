@@ -3090,7 +3090,19 @@ void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K, cudaS
 template <typename T, int S>
 static bool launch_gemv_rows_t(const void* x, const void* W, T* y,
                                int M, int N, int K, cudaStream_t stream) {
-    if (M < 1 || M > 8 || N < 1 || (K & 7)) return false;
+    if (M < 1 || N < 1 || (K & 7)) return false;
+    // More than eight rows go in launches of eight. A row's sum does not depend on how many rows
+    // share the launch (launch_gemv_rows2 relies on the same), so every row is what a lone launch
+    // of it computes. Declining instead turned away every packed batch of 9+ rows whose bf16
+    // projection or MoE router reads this -- Qwen3.6-35B-A3B decoded 16 / 32 concurrent requests
+    // one forward each, below a single stream's aggregate (~460 against ~500 tok/s).
+    if (M > 8) {
+        for (int r0 = 0; r0 < M; r0 += 8)
+            if (!launch_gemv_rows_t<T, S>(static_cast<const __nv_bfloat16*>(x) + (size_t)r0 * K, W,
+                                          y + (size_t)r0 * N, M - r0 < 8 ? M - r0 : 8, N, K, stream))
+                return false;
+        return true;
+    }
     constexpr int RPB = GEMV_WPB / S;
     dim3 grid((N + RPB - 1) / RPB);
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);

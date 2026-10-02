@@ -6862,11 +6862,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
                         c.rms_eps, bs, mbs, st);
             }
-            // Match the autoregressive decode path exactly. Its fused int8 attention gate is
-            // enabled only for the 2048/4096-wide layouts; Qwen3.8 (H=5120) applies sigmoid(g)
-            // in a separate kernel. Using the fused accumulation here changed verifier logits
-            // after the first speculative token even though both paths consumed the same KV.
-            const bool int8_gate_fused = kv8 && (H == 2048 || H == 4096);
+            // The gate stays a separate kernel here. launch_flash_decode_split applies an
+            // attn_gate only in its gated combine, which runs only beside a Q8 output (out_q8, as
+            // the autoregressive step passes it); this call passes none, so a gate handed to it
+            // was dropped -- and handing it over also skipped launch_qwen36_mul_sigmoid below.
+            // That left Qwen3.6-35B-A3B (H=2048) ungated in every packed step: garbage output for
+            // any 2+ concurrent requests (packed_decode_check: 0% argmax agreement with one
+            // forward per row, from the first full-attention layer).
+            const bool int8_gate_fused = false;
             // The session's split count is sized for ONE row walking its context; a packed step
             // already has N rows x kv-heads CTAs per split, so at 32 rows the 32 splits leave
             // each CTA a dozen keys and write as many partial bytes as they read KV. From 24

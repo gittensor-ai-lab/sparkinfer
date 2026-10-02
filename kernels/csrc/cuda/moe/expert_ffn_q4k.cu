@@ -3542,7 +3542,19 @@ void launch_shared_expert_q8_mmvq_rows(
     const float* dw, void* output, float* h_scratch, void* h_q8_buf,
     int hidden, int ffn, int rows, cudaStream_t stream) {
     if (!input_q8 || !gate_q || !up_q || !down_q || !dw || !output || !h_scratch ||
-        !h_q8_buf || hidden != 2048 || ffn != 512 || rows < 1 || rows > 8) return;
+        !h_q8_buf || hidden != 2048 || ffn != 512 || rows < 1) return;
+    // More than eight rows go eight at a time (each row is computed alone either way; the
+    // scratch is reused, the launches being in order on one stream). This returned without a
+    // word for 9+ rows, so a packed Qwen3.6 step of 9-32 rows added a stale shared expert.
+    if (rows > 8) {
+        for (int r0 = 0; r0 < rows; r0 += 8)
+            launch_shared_expert_q8_mmvq_rows(
+                reinterpret_cast<const si_block_q8_1*>(input_q8) + (size_t)r0 * (hidden >> 5),
+                gate_q, up_q, down_q, dw + r0,
+                reinterpret_cast<__nv_bfloat16*>(output) + (size_t)r0 * hidden, h_scratch, h_q8_buf,
+                hidden, ffn, rows - r0 < 8 ? rows - r0 : 8, stream);
+        return;
+    }
     const auto* q = reinterpret_cast<const si_block_q8_1*>(input_q8);
     auto* hq = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
     auto* out = reinterpret_cast<__nv_bfloat16*>(output);

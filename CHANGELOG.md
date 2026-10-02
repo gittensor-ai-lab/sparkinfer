@@ -5,6 +5,30 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Fixed
+
+- **Qwen3.6-35B-A3B answered 2+ concurrent requests with garbage, and decoded 9+ one at a time.**
+  Three faults in the packed decode step, the path every batch of concurrent requests takes.
+  None of them affects Qwen3.8, Bonsai-2 or Muse Glimmer.
+  - **The attention output gate was dropped.** `launch_flash_decode_split` applies an
+    `attn_gate` only in a gated combine that runs beside a Q8 output, which the packed step does
+    not pass. Handing it the gate also skipped the step's own sigmoid. Every packed step of a
+    model with hidden size 2048 or 4096 (Qwen3.6) ran its full-attention layers ungated. The
+    output was repeated tokens ("The capital petró fác dó fác fác ..."); this has been the case
+    since at least 0.5.14.
+  - **The shared expert returned without computing for more than 8 rows**
+    (`launch_shared_expert_q8_mmvq_rows`). It now goes 8 rows at a time.
+  - **bf16 row GEMVs refused more than 8 rows** (`launch_gemv_rows`, the MoE router among them).
+    That declined every packed step of 9+ rows, so 16 or 32 concurrent requests decoded one
+    forward each, below one stream's aggregate. They now go 8 rows at a time.
+  - **Measured** (RTX 5090, `qwen3_gguf_cb_bench` 256/256): Qwen3.6 c16 / c32 457 / 461 ->
+    1,621 / 1,834 tok/s, now with correct output; one stream is ~500 tok/s.
+  - **Tested:** the new `packed_decode_check` decodes the same prompts one forward per row
+    (reference), in packed steps, and one forward per row again (control), teacher-forced, and
+    compares argmax agreement. Qwen3.6 at 1 / 4 / 16 / 32 rows: packed 100 / 99.6 / 99.1 / 99.0%
+    against control 100 / 99.2 / 99.6 / 98.8% (before: 0%). Short prompts (24-128 tokens) and a
+    switch from packed to one-row steps mid-stream also pass.
+
 ### Serving
 
 - **Bonsai-2's mixed steps run its FP4 FFN.** A mixed prefill + decode pass did not hand the

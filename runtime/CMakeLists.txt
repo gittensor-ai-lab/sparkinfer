@@ -91,6 +91,10 @@ if(BUILD_EXAMPLES)
     # qwen38_hf_config.h, which parses config.json to detect a compressed-tensors checkpoint.
     target_link_libraries(qwen3_gguf_cb_bench PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads
                           nlohmann_json::nlohmann_json)
+    add_executable(packed_decode_check examples/packed_decode_check.cpp)
+    target_include_directories(packed_decode_check PRIVATE include)
+    target_link_libraries(packed_decode_check PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
     add_executable(qwen3_gguf_score examples/qwen3_gguf_score.cpp)
     target_include_directories(qwen3_gguf_score PRIVATE include)
     target_link_libraries(qwen3_gguf_score PRIVATE sparkinfer_runtime CUDA::cudart
