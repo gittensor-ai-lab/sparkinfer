@@ -5,6 +5,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-10-02
+
+**Prompts longer than 16K tokens speculate.**
+- **Before:** the drafter's context was capped at 16,384 positions, so every longer prompt
+  silently decoded at plain speed (prose at 16K / 32K / 64K tokens: 96 / 93 / 86 tok/s).
+- **Now:** DFlash2 follows the whole `--ctx` (#1258): 184-200 / 173-188 / 132 tok/s, at the same
+  device memory.
+
 ### Speculative decoding
 
 - **Prompts longer than 16K tokens speculate.**

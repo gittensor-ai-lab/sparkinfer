@@ -168,6 +168,18 @@ Sampled requests through the server (`eval/spec_sampled_check.py`, 6 prompts × 
 T=0.7 175.9 tok/s against DSpark's 154.2, T=1.0 177.0 against 154.8, plain decode ~98.7. The
 8K–32K prompts are this repository's own docs and sources, so their τ is higher than prose.
 
+Long prompts through the server, one request at a time, greedy (`eval/spec_long_ctx.py`, prose
+from this repository's docs and code from its C++ sources, `--ctx 131072`), tok/s:
+
+| context | prose: plain / DFlash2 | code: plain / DFlash2 |
+|---:|---:|---:|
+| 16K | 96 / **184–200** | 97 / **308–317** |
+| 32K | 93 / **173–188** | 93 / **190–227** |
+| 64K | 86 / **132** | 87 / **147** |
+
+Before 0.6.6 a request speculated only within the drafter's first 16,384 positions, so every
+longer prompt ran at the plain-decode speed.
+
 Concurrent requests speculate together: up to eight share one draft pass and one verify forward
 (`SPARKINFER_SPEC_GROUP`, default 8). Aggregate decode tok/s with DFlash2 on real chat prompts
 (256-token answers, top_k 20, top_p 0.95), against vLLM 0.30.0 serving the same checkpoint and
