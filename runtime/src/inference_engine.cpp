@@ -1754,6 +1754,15 @@ void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefi
         const int v = e ? atoi(e) : 8;
         return v < 1 ? 1 : v;
     }();
+    // A prompt with more than this left is a long prefill: one batched pass of its own runs it
+    // faster than budget-sized chunks would (8192-token prompts at c16/c32: -12% output tok/s
+    // chunked), and the scheduler already meters those one per iteration. Same knob and default
+    // as the scheduler's prefill_mix_max_tokens(); 0 mixes every length.
+    static const int long_prompt = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_MIX_MAX");
+        const int v = e ? atoi(e) : 2048;
+        return v >= 0 ? v : 2048;
+    }();
     // A budget below this does not make a mixed step; and the smallest part of a prompt the budget
     // is split down to (a prompt that fits whole is taken whole, however small).
     static constexpr int kMinBudget = 128, kMinPart = 64;
@@ -1774,6 +1783,10 @@ void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefi
             continue;
         }
         const int n = (int)r.prompt.size();
+        if (long_prompt > 0 && j->mixed_tokens == 0 && n - j->prefill_pos > long_prompt) {
+            unmixable.push_back(id);
+            continue;
+        }
         const bool finishable = !r.logprobs && !r.constraint;
         // Up to the next prefix-cache checkpoint step_job would snapshot, else the prompt's end
         // (one token short of it for a prompt the pass cannot finish).
