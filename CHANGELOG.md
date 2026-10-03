@@ -5,6 +5,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.14] — 2026-10-04
+
+**Qwen3.6 short-prompt prefill another +12% / +8%: Q8_0 weights quantize in place.**
+- **Now:** 6,615 / 15,396 tok/s at 128 / 512 tokens (0.6.10: 4,284 / 11,092, so +54% / +39% in
+  five releases; llama.cpp on the same GGUF: 3,499 / 9,638). Bit-identical output.
+
 ### Performance
 
 - **Qwen3.6 short-prompt prefill +12% / +8% more (128 / 512 tokens): Q8_0 weights quantize in
