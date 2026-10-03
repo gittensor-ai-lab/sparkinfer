@@ -256,6 +256,18 @@ at 32k**. Quality parity: top-1 **0.953** · KL **0.031** · IFEval **83%** · B
 Full tables: [`bench/competitors/latest-results.md`](bench/competitors/latest-results.md) ·
 [`bench/quality/README.md`](bench/quality/README.md).
 
+Serving the same GGUF to concurrent requests (AIPerf, streaming chat 1024 / 256, RTX 5090,
+sparkinfer 0.6.7 against `llama-server` at llama.cpp `bed0a85`, `-np 32 -fa on`):
+
+| requests | output tok/s | TTFT p50 (ms) | ITL p50 (ms) |
+|---:|---:|---:|---:|
+| | **sparkinfer** / llama.cpp | **sparkinfer** / llama.cpp | **sparkinfer** / llama.cpp |
+| 4 | **675** / 349 | **80** / 1,169 | **4.2** / 7.1 |
+| 16 | **1,269** / 409 | **335** / 2,775 | **10.2** / 29.9 |
+| 32 | **1,390** / 411 | **1,270** / 2,640 | **15.1** / 64.9 |
+
+Before 0.6.7, two or more concurrent Qwen3.6 requests decoded to garbage (see the CHANGELOG).
+
 SparkInfer focuses on the models driving the future of AI — not thousands of legacy architectures.
 
 ## Blackwell native
