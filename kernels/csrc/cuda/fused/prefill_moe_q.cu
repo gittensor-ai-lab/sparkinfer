@@ -626,8 +626,13 @@ void dispatch_qi8(const signed char* A_i8, const float* sx, const void* W_q, con
 constexpr int QM_BM16 = 16;
 constexpr int QM_BN16 = 128;
 
-template <int QT, bool A_INDIRECT, bool C_SCATTER>
-__global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
+// BN (weight rows per block) is 64 by default, or QM_BN16 = 128: 64 halves the B tile in shared memory
+// (17 KB instead of 35), so four or more blocks reside per SM instead of two and their weight loads
+// hide each other's DRAM latency -- the kernel loads a super-block, then waits on it, with nothing
+// else in flight. Threads = 2 per weight row either way, so every per-value decode, MMA and
+// epilogue is the 128-row kernel's, only fewer rows per block: bit-identical output.
+template <int QT, bool A_INDIRECT, bool C_SCATTER, int BN = QM_BN16>
+__global__ __launch_bounds__(2 * BN, BN == QM_BN16 ? 2 : 5) void pfm_moe_gemm_qi8_bm16_kernel(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
         const unsigned char* __restrict__ W_q, const float* __restrict__ row_scale,
         const int* __restrict__ pair_tok, const float* __restrict__ pair_w,
@@ -644,10 +649,10 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
     const int p0  = offsets[e] + mt * QM_BM16;
     const int cnt = offsets[e + 1] - offsets[e];
     const int M   = min(QM_BM16, cnt - mt * QM_BM16);
-    const int n0  = blockIdx.x * QM_BN16;
+    const int n0  = blockIdx.x * BN;
     const int nsb = K >> 8;
 
-    __shared__ __align__(16) signed char Bs[QM_BN16][QM_LD];
+    __shared__ __align__(16) signed char Bs[BN][QM_LD];
     __shared__ __align__(16) signed char As[2][QM_BM16][QM_BK];
     __shared__ int s_tok[QM_BM16];
 
@@ -660,7 +665,7 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
     for (int r = tid; r < QM_BM16; r += blockDim.x)
         s_tok[r] = (r < M) ? (A_INDIRECT ? pair_tok[p0 + r] : (p0 + r)) : -1;
 
-    // 2 threads per weight row (covers all QM_BN16=128 rows); each decodes 2 of the 4 j64 groups
+    // 2 threads per weight row (covers all BN rows); each decodes 2 of the 4 j64 groups
     // of the super-block (dj, dj+2) instead of the BM=128 kernel's 1-of-4 (4 threads/row). Same
     // qm_decode_j64 primitive, same bit-identical per-value math -- only the thread->work mapping
     // changes to cover twice the rows with the same 256 threads.
@@ -747,8 +752,30 @@ void dispatch_qi8_bm16(const signed char* A_i8, const float* sx, const void* W_q
                        const int* tilemap, const int* d_ntiles,
                        __nv_bfloat16* C, float* out_f32, int n_out, int K, int max_tiles,
                        bool a_indirect, bool c_scatter, cudaStream_t stream) {
-    dim3 grid((n_out + QM_BN16 - 1) / QM_BN16, max_tiles);
+    // The narrow 64-row blocks by default (see the kernel): Qwen3.6-35B-A3B prefill +5% at 128
+    // tokens and +7% at 512. SPARKINFER_QM_BM16_BN=128 restores the 128-row blocks.
+    static const int bn = [] {
+        const char* e = getenv("SPARKINFER_QM_BM16_BN");
+        return (e && atoi(e) == 128) ? QM_BN16 : 64;
+    }();
     const auto* W = reinterpret_cast<const unsigned char*>(W_q);
+    if (bn == 64) {
+        dim3 g64((n_out + 63) / 64, max_tiles);
+        if (a_indirect && !c_scatter)
+            pfm_moe_gemm_qi8_bm16_kernel<QT, true, false, 64><<<g64, 128, 0, stream>>>(
+                A_i8, sx, W, row_scale, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, n_out, K);
+        else if (!a_indirect && c_scatter)
+            pfm_moe_gemm_qi8_bm16_kernel<QT, false, true, 64><<<g64, 128, 0, stream>>>(
+                A_i8, sx, W, row_scale, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, n_out, K);
+        else if (a_indirect && c_scatter)
+            pfm_moe_gemm_qi8_bm16_kernel<QT, true, true, 64><<<g64, 128, 0, stream>>>(
+                A_i8, sx, W, row_scale, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, n_out, K);
+        else
+            pfm_moe_gemm_qi8_bm16_kernel<QT, false, false, 64><<<g64, 128, 0, stream>>>(
+                A_i8, sx, W, row_scale, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, n_out, K);
+        return;
+    }
+    dim3 grid((n_out + QM_BN16 - 1) / QM_BN16, max_tiles);
     if (a_indirect && !c_scatter)
         pfm_moe_gemm_qi8_bm16_kernel<QT, true, false><<<grid, 256, 0, stream>>>(
             A_i8, sx, W, row_scale, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, n_out, K);
@@ -1720,8 +1747,19 @@ static bool qm_tall_on() {
 
 } // namespace
 
+// Q6_K experts too: llama.cpp's UD quants give a few MoE layers a Q6_K ffn_down_exps (Qwen3.6-35B-A3B
+// UD-Q4_K_M: 3 of 40), and each of those materialized its whole int8 expert pool on every prefill
+// (deq_rows_i8<Q6_K>: 0.91 ms a layer at 512 tokens, 6% of the pass). The decode is the dense
+// path's qm_decode_j64<Q6_K> (ushort loads: a 210-byte block is only 2-byte aligned), and the
+// per-row scales come from the same load-time precompute (launch_gguf_dequant_rows_i8 decodes Q6_K),
+// so the fused GEMM produces the materialize path's int8 bytes exactly.
+// SPARKINFER_PFM_Q6K=0 sends Q6_K experts back to the materialize path (A/B).
 bool pfm_moe_gemm_qi8_supported(int ggml_type) {
-    return ggml_type == QMQ_Q4_K || ggml_type == QMQ_Q5_K;
+    static const bool q6k = [] {
+        const char* e = getenv("SPARKINFER_PFM_Q6K");
+        return !(e && e[0] == '0');
+    }();
+    return ggml_type == QMQ_Q4_K || ggml_type == QMQ_Q5_K || (q6k && ggml_type == QMQ_Q6_K);
 }
 
 // The DENSE fused GEMM additionally decodes Q6_K (see qm_decode_j64). Kept separate from the
@@ -1776,8 +1814,11 @@ bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float
         if (ggml_type == QMQ_Q4_K)
             dispatch_qi8_bm16<QMQ_Q4_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
                                         d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
-        else
+        else if (ggml_type == QMQ_Q5_K)
             dispatch_qi8_bm16<QMQ_Q5_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
+                                        d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+        else
+            dispatch_qi8_bm16<QMQ_Q6_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
                                         d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
         return true;
     }
@@ -1785,8 +1826,11 @@ bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float
     if (ggml_type == QMQ_Q4_K)
         dispatch_qi8<QMQ_Q4_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
                                d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
-    else
+    else if (ggml_type == QMQ_Q5_K)
         dispatch_qi8<QMQ_Q5_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
+                               d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+    else
+        dispatch_qi8<QMQ_Q6_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
                                d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
     return true;
 }

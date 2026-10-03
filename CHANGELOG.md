@@ -5,6 +5,24 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Qwen3.6 short-prompt prefill +20% / +16% (128 / 512 tokens).** Three changes to the routed MoE
+  prefill:
+  - the short-N fused quantized GEMM runs 64-row blocks instead of 128 (half the shared memory,
+    so ~2.5x the resident blocks hide each other's weight loads; `SPARKINFER_QM_BM16_BN=128`
+    restores the old width);
+  - Q6_K experts take the fused GEMM too (UD files give 3 of 40 layers a Q6_K ffn_down_exps,
+    which materialized its whole int8 expert pool every prefill: 0.9 ms a layer;
+    `SPARKINFER_PFM_Q6K=0` restores that);
+  - the expert tile map is built by a parallel block scan instead of one thread (34 us a layer).
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 4,284 / 11,092 / 18,051 / 29,568
+    -> 5,136 / 12,921 / 19,381 / 30,315 tok/s at 128 / 512 / 1K / 4K tokens; llama.cpp on the same
+    file 3,499 / 9,638 at 128 / 512. Decode unchanged.
+  - **Tested:** `qwen3_gguf_prefill_check` at 128 / 512 / 2,048 tokens: top-1 16/16, KL 0.0013 /
+    0.013 / 0.00001 (the 512-token baseline varies 0.010-0.015 run to run); UD-Q4_K_XL / UD-IQ4_XS
+    15/16; server `mixed_conc_check` PASS, 0 problems.
+
 ## [0.6.10] — 2026-10-03
 
 **Qwen3.6 answers with its real router: perplexity 15-18 -> 5.47, the same on every launch.**

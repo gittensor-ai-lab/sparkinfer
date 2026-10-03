@@ -52,23 +52,45 @@ __global__ void pfm_scan_tiles_kernel(const int* __restrict__ counts,
                                       int* __restrict__ offsets, int* __restrict__ cursors,
                                       int* __restrict__ tilemap, int* __restrict__ d_ntiles,
                                       int n_experts, int bm) {
-    // single block, n_experts <= 1024 threads; simple shared-memory scan
-    __shared__ int s_off[1025];
-    const int t = threadIdx.x;
-    if (t == 0) {
-        int run = 0;
-        for (int e = 0; e < n_experts; e++) { s_off[e] = run; run += counts[e]; }
-        s_off[n_experts] = run;
-        int nt = 0;
-        for (int e = 0; e < n_experts; e++) {
-            const int tiles = (counts[e] + bm - 1) / bm;
-            for (int i = 0; i < tiles; i++) { tilemap[2 * nt] = e; tilemap[2 * nt + 1] = i; nt++; }
+    // Single block, one thread per expert plus one for the totals, rounded up to whole warps
+    // (<= 1024). Both prefix sums --
+    // pairs (offsets) and tiles (tilemap slots) -- are exclusive scans across the block: a warp
+    // shuffle scan, then the per-warp totals scanned by warp 0. Each expert then writes its own
+    // tiles. Same offsets and the same tilemap order (expert-major, tile-minor) as the serial loop
+    // thread 0 used to run, which took ~34 us a layer on its own (one thread, ~300 global stores).
+    __shared__ int s_wc[32], s_wt[32];
+    const int t = threadIdx.x, lane = t & 31, w = t >> 5;
+    const int c = (t < n_experts) ? counts[t] : 0;
+    const int nt_e = (c + bm - 1) / bm;
+    int ic = c, it = nt_e;                       // inclusive scans within the warp
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const int uc = __shfl_up_sync(0xffffffffu, ic, d);
+        const int ut = __shfl_up_sync(0xffffffffu, it, d);
+        if (lane >= d) { ic += uc; it += ut; }
+    }
+    if (lane == 31) { s_wc[w] = ic; s_wt[w] = it; }
+    __syncthreads();
+    if (w == 0) {
+        const int nw = (blockDim.x + 31) >> 5;
+        int vc = lane < nw ? s_wc[lane] : 0, vt = lane < nw ? s_wt[lane] : 0;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const int uc = __shfl_up_sync(0xffffffffu, vc, d);
+            const int ut = __shfl_up_sync(0xffffffffu, vt, d);
+            if (lane >= d) { vc += uc; vt += ut; }
         }
-        d_ntiles[0] = nt;
+        if (lane < nw) { s_wc[lane] = vc; s_wt[lane] = vt; }   // inclusive warp totals
     }
     __syncthreads();
-    if (t <= n_experts) offsets[t] = s_off[t];
-    if (t < n_experts) cursors[t] = 0;
+    const int base_c = (w > 0 ? s_wc[w - 1] : 0) + ic - c;     // exclusive
+    const int base_t = (w > 0 ? s_wt[w - 1] : 0) + it - nt_e;
+    if (t <= n_experts) offsets[t] = base_c;                   // t == n_experts: the total
+    if (t < n_experts) {
+        cursors[t] = 0;
+        for (int i = 0; i < nt_e; i++) { tilemap[2 * (base_t + i)] = t; tilemap[2 * (base_t + i) + 1] = i; }
+    }
+    if (t == n_experts) d_ntiles[0] = base_t;
 }
 
 __global__ void pfm_scatter_kernel(const int* __restrict__ expert_ids,
@@ -843,7 +865,8 @@ void launch_pfm_bucket_pairs_bm(const int* expert_ids, const float* expert_weigh
                                 int* tilemap, int* d_ntiles,
                                 int n_tokens, int n_experts, int top_k, int bm,
                                 cudaStream_t stream, int* pair_orig) {
-    pfm_scan_tiles_kernel<<<1, n_experts + 1, 0, stream>>>(counts, offsets, cursors,
+    // Whole warps: the scan shuffles with a full mask (threads past n_experts contribute zeros).
+    pfm_scan_tiles_kernel<<<1, ((n_experts + 32) / 32) * 32, 0, stream>>>(counts, offsets, cursors,
                                                            tilemap, d_ntiles, n_experts, bm);
     const int P = n_tokens * top_k;
     pfm_scatter_kernel<<<(P + 255) / 256, 256, 0, stream>>>(
