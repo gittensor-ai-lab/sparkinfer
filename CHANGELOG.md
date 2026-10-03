@@ -5,6 +5,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.13] — 2026-10-03
+
+**Qwen3.6 short-prompt prefill another +6.5% / +4.3%: the router GEMM splits K.**
+- **Now:** 5,898 / 14,287 tok/s at 128 / 512 tokens (0.6.10: 4,284 / 11,092; llama.cpp on the same
+  GGUF: 3,499 / 9,638).
+
 ### Performance
 
 - **Qwen3.6 short-prompt prefill +6.5% / +4.3% more (128 / 512 tokens): the router GEMM splits K.**
