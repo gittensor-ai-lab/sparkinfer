@@ -8,6 +8,7 @@
 // to the pool base, not the table).
 
 #include "sparkinfer/kv_cache.h"
+#include "sparkinfer/cuda_h2d.h"
 #include "sparkinfer/device_health.h"
 #include <algorithm>
 #include <atomic>
@@ -100,7 +101,7 @@ struct KVCacheManager::Impl {
         }
         std::vector<int> row((size_t)max_blocks_per_seq);
         for (int i = 0; i < max_blocks_per_seq; ++i) row[(size_t)i] = ring[(size_t)(i % ring_blocks)];
-        cu(cudaMemcpy(d_win_tables + (size_t)slot * max_blocks_per_seq, row.data(),
+        cu(si_h2d_complete(d_win_tables + (size_t)slot * max_blocks_per_seq, row.data(),
                       row.size() * sizeof(int), cudaMemcpyHostToDevice), "copy ring table");
         return true;
     }
@@ -281,7 +282,7 @@ bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
         blocks.push_back(b);
     }
 
-    cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * impl_->max_blocks_per_seq, blocks.data(),
+    cu(si_h2d_complete(impl_->d_block_tables + (size_t)slot * impl_->max_blocks_per_seq, blocks.data(),
                   blocks.size() * sizeof(int), cudaMemcpyHostToDevice), "copy block table");
     return true;
 }
@@ -309,7 +310,7 @@ bool KVCacheManager::truncate_blocks(uint64_t seq_id, int keep_blocks) {
     }
     auto sit = impl_->seq_slot.find(seq_id);
     if (sit == impl_->seq_slot.end()) return false;
-    cu(cudaMemcpy(impl_->d_block_tables + (size_t)sit->second * impl_->max_blocks_per_seq, blocks.data(),
+    cu(si_h2d_complete(impl_->d_block_tables + (size_t)sit->second * impl_->max_blocks_per_seq, blocks.data(),
                   blocks.size() * sizeof(int), cudaMemcpyHostToDevice), "truncate block table");
     return true;
 }
@@ -380,7 +381,7 @@ bool KVCacheManager::allocate_with_prefix(uint64_t seq_id, const std::vector<int
         impl_->refs[b] = 1;
         blocks.push_back(b);
     }
-    cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * impl_->max_blocks_per_seq, blocks.data(),
+    cu(si_h2d_complete(impl_->d_block_tables + (size_t)slot * impl_->max_blocks_per_seq, blocks.data(),
                   blocks.size() * sizeof(int), cudaMemcpyHostToDevice), "copy shared block table");
     return true;
 }
