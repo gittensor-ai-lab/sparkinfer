@@ -867,6 +867,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         return !(e && e[0] == '0');
     }();
     if (long_bf16) use_i8 = false;
+    // A mixed step's decode rows ride this pass, and the int8 projections quantize each row's
+    // activation per row and the k-quant weight per row: fine for a prompt, but a decode row
+    // takes its next token from it. On Qwen3.8-27B-UD-Q4_K_M those rows agreed with one forward
+    // per row 0.926-0.949 against a control's 0.947-0.975 (packed_decode_check, mixed mode);
+    // with bf16 projections, 0.992 against 0.981. So a pass carrying decode rows of a dense
+    // k-quant GGUF takes the bf16 GEMMs. Muse, MoE (already bf16) and ternary Bonsai keep theirs.
+    // SPARKINFER_MIXED_BF16_PROJ=0 restores int8 for those passes.
+    static const bool mixed_bf16_proj = [] {
+        const char* e = getenv("SPARKINFER_MIXED_BF16_PROJ");
+        return !(e && e[0] == '0');
+    }();
+    if (mixed_bf16_proj && !_pi8 && s.mix_n > 0 && dense_qb && s.bonsai_block == 0) use_i8 = false;
     const char* _pi8ffn = getenv("SPARKINFER_PREFILL_I8_FFN");
     bool use_i8_ffn = long_bf16 && (!_pi8ffn || _pi8ffn[0] != '0');
     // Full-attn Q/K/V/O are also per-token (no GDN recurrence). Keep them on int8 at long ctx

@@ -9197,15 +9197,25 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             if (!w.ssm_dt) w.ssm_dt = dense(b + "ssm_dt.bias", false);
             w.ssm_a = v_regroup(b + "ssm_a");
             if (!w.ssm_a) w.ssm_a = dense(b + "ssm_a", false);
+            // alpha/beta are [H, v_heads] (48 outputs): every batched path (packed decode, the
+            // verify, mixed steps) reads them as bf16 through the fused two-projection GEMV, and
+            // Q8_0 has no 48-wide row kernel there, so a UD GGUF that ships them as Q8_0 declined
+            // every packed step at layer 0. Prefill already dequantizes them to bf16 for accuracy
+            // (they feed the GDN sigmoid gates); load them that way. 0.5 MB per layer.
+            auto ab_w = [&](const std::string& name, int& type) -> const void* {
+                const GGUFTensor* t = g.tensor(name);
+                if (t && t->ggml_type == 8) { type = 0; return dense(name, false); }
+                return attn_w(name, type);
+            };
             if (const void* bp = v_regroup(b + "ssm_beta.weight")) {
                 w.ssm_beta = bp; w.ssm_beta_type = 0;
             } else {
-                w.ssm_beta = attn_w(b + "ssm_beta.weight", w.ssm_beta_type);
+                w.ssm_beta = ab_w(b + "ssm_beta.weight", w.ssm_beta_type);
             }
             if (const void* ap = v_regroup(b + "ssm_alpha.weight")) {
                 w.ssm_alpha = ap; w.ssm_alpha_type = 0;
             } else {
-                w.ssm_alpha = attn_w(b + "ssm_alpha.weight", w.ssm_alpha_type);
+                w.ssm_alpha = ab_w(b + "ssm_alpha.weight", w.ssm_alpha_type);
             }
             w.ssm_norm = dense(b + "ssm_norm.weight", false);
             w.ssm_out = attn_w(b + "ssm_out.weight", w.ssm_out_type);

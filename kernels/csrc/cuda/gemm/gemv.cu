@@ -5325,7 +5325,11 @@ bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
     // attn_v, so without this width every one of those layers refuses the multi-row path -- and
     // refuses it SILENTLY, since a false here is indistinguishable at the call site from "this
     // weight type is not implemented". Same reason 20/24 were added to the Q4_K launcher above.
-    if (M < 1 || M > 8 || N < 1 || (K != 2048 && K != 4096 && K != 6656)) return false;
+    // 20 / 24 (5120 / 6144): Qwen3.8-27B's residual and GDN widths. llama.cpp "UD" GGUFs put Q6_K
+    // (and Q8_0, below) on some of its attention matrices, and each such layer declined the packed
+    // step the same silent way.
+    if (M < 1 || M > 8 || N < 1 ||
+        (K != 2048 && K != 4096 && K != 5120 && K != 6144 && K != 6656)) return false;
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const auto* w = reinterpret_cast<const unsigned char*>(W);
     auto* out = reinterpret_cast<__nv_bfloat16*>(y);
@@ -5336,13 +5340,16 @@ bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
         } while (0)
     if      (K == 2048) SI_Q6K_ROWS_DISPATCH(8);
     else if (K == 4096) SI_Q6K_ROWS_DISPATCH(16);
+    else if (K == 5120) SI_Q6K_ROWS_DISPATCH(20);
+    else if (K == 6144) SI_Q6K_ROWS_DISPATCH(24);
     else                SI_Q6K_ROWS_DISPATCH(26);
     #undef SI_Q6K_ROWS_DISPATCH
     return true;
 }
 bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
-    if (M < 1 || M > 8 || N < 1 || (K != 512 && K != 2048 && K != 4096)) return false;
+    if (M < 1 || M > 8 || N < 1 ||
+        (K != 512 && K != 2048 && K != 4096 && K != 5120 && K != 6144)) return false;
     // The 6-row instantiations already exist (and the Q4_K launcher below picks them); this one
     // always asked for the 8-row body, so a 6-row block ran two predicated rows of tmp[]/partial[]
     // and the reduction over them for nothing.
@@ -5357,7 +5364,9 @@ bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
     } while (0)
     if (K == 512)       SI_Q80_ROWS(16);
     else if (K == 2048) SI_Q80_ROWS(64);
-    else                SI_Q80_ROWS(128);
+    else if (K == 4096) SI_Q80_ROWS(128);
+    else if (K == 5120) SI_Q80_ROWS(160);
+    else                SI_Q80_ROWS(192);
 #undef SI_Q80_ROWS
     return true;
 }
@@ -5500,20 +5509,28 @@ bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
         #undef SI_Q4K_ROWS_F32_DISPATCH
         return true;
     }
-    if (qtype == 14 && (K == 2048 || K == 4096)) {
+    if (qtype == 14 && (K == 2048 || K == 4096 || K == 5120 || K == 6144)) {
         if (K == 2048)
             si_mmvq_q6k_rows_exact_kernel<float, 8, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
-        else
+        else if (K == 4096)
             si_mmvq_q6k_rows_exact_kernel<float, 16, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else if (K == 5120)
+            si_mmvq_q6k_rows_exact_kernel<float, 20, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else
+            si_mmvq_q6k_rows_exact_kernel<float, 24, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         return true;
     }
-    if (qtype == 8 && (K == 512 || K == 2048 || K == 4096)) {
+    if (qtype == 8 && (K == 512 || K == 2048 || K == 4096 || K == 5120 || K == 6144)) {
         if (K == 512)
             si_mmvq_q80_rows_exact_kernel<float, 16, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         else if (K == 2048)
             si_mmvq_q80_rows_exact_kernel<float, 64, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
-        else
+        else if (K == 4096)
             si_mmvq_q80_rows_exact_kernel<float, 128, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else if (K == 5120)
+            si_mmvq_q80_rows_exact_kernel<float, 160, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else
+            si_mmvq_q80_rows_exact_kernel<float, 192, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         return true;
     }
     return false;
