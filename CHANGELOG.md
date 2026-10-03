@@ -5,6 +5,18 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Qwen3.6 short-prompt prefill +6.5% / +4.3% more (128 / 512 tokens): the router GEMM splits K.**
+  At 512 tokens the tensor-core router-logits GEMM was 16 blocks on 170 SMs, each walking all
+  2,048 of K serially: 43 us a layer. Up to 2,048 tokens it now splits K eight ways into the
+  zeroed logits (128 blocks). The atomic accumulation varies the summation order run to run, so
+  `SPARKINFER_DETERMINISTIC=1` keeps the single pass; `SPARKINFER_ROUTER_SPLITK=1` restores it too.
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 5,536 / 13,700 / 19,228 / 24,581
+    -> 5,898 / 14,287 / 19,744 / 25,075 tok/s at 128 / 512 / 1K / 2K tokens.
+  - **Tested:** `qwen3_gguf_prefill_check` at 128 / 512 / 2,048 tokens: top-1 16/16, KL 0.0005 /
+    0.0075 / 0.00001.
+
 ## [0.6.12] — 2026-10-03
 
 **Qwen3.6 short-prompt prefill another +7% / +6%: the fused MoE GEMM prefetches its weights.**

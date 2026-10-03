@@ -36,6 +36,7 @@
 // projection GEMM) and the grid at 32k is 512x2 = 1024 blocks on 170 SMs.
 // ============================================================================
 #include "sparkinfer/kernels/prefill_router_mma.h"
+#include "sparkinfer/kernels/deterministic.h"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -55,7 +56,7 @@ constexpr int RT_LD = RT_BK + 8;   // smem row stride (elements): breaks bank co
 
 __global__ __launch_bounds__(256) void pfr_logits_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ W,
-    float* __restrict__ logits, int n_tokens, int n_experts, int H) {
+    float* __restrict__ logits, int n_tokens, int n_experts, int H, int k_len, int split_atomic) {
     using namespace nvcuda::wmma;
 
     __shared__ __nv_bfloat16 s_a[2][RT_BM][RT_LD];
@@ -66,6 +67,9 @@ __global__ __launch_bounds__(256) void pfr_logits_mma_kernel(
     const int row0 = blockIdx.x * RT_BM;     // first token of this block
     const int col0 = blockIdx.y * RT_BN;     // first expert of this block
     const bool tail = row0 + RT_BM > n_tokens;
+    // Split-K (blockIdx.z): this block reduces K slice [k_begin, k_begin + k_len) and adds it into
+    // logits atomically; the caller zeroed them. k_len == H with z = 0 is the unsplit kernel.
+    const int k_begin = blockIdx.z * k_len, k_end = k_begin + k_len;
 
     // warp (wr, wc) owns rows [wr*32, +32) x cols [wc*32, +32) of the C tile
     const int wr = warp >> 2, wc = warp & 3;
@@ -98,11 +102,11 @@ __global__ __launch_bounds__(256) void pfr_logits_mma_kernel(
         __pipeline_commit();
     };
 
-    stage(0, 0);
-    for (int kb = 0, p = 0; kb < H; kb += RT_BK, p ^= 1) {
+    stage(k_begin, 0);
+    for (int kb = k_begin, p = 0; kb < k_end; kb += RT_BK, p ^= 1) {
         __pipeline_wait_prior(0);
         __syncthreads();
-        if (kb + RT_BK < H) stage(kb + RT_BK, p ^ 1);
+        if (kb + RT_BK < k_end) stage(kb + RT_BK, p ^ 1);
 
         #pragma unroll
         for (int kt = 0; kt < RT_BK; kt += 16) {
@@ -124,7 +128,7 @@ __global__ __launch_bounds__(256) void pfr_logits_mma_kernel(
     }
 
     // ---- store: fp32 accumulators straight to the fp32 logits ----
-    if (!tail) {
+    if (!tail && !split_atomic) {
         #pragma unroll
         for (int i = 0; i < 2; i++)
             #pragma unroll
@@ -133,7 +137,7 @@ __global__ __launch_bounds__(256) void pfr_logits_mma_kernel(
                                          + col0 + wc * 32 + j * 16,
                                   acc[i][j], n_experts, mem_row_major);
     } else {
-        // tail block: bounce each fragment through smem and write row-guarded
+        // tail block (or split-K): bounce each fragment through smem and write row-guarded
         float* s_t = reinterpret_cast<float*>(&s_a[0][0][0]) + warp * 256;
         #pragma unroll
         for (int i = 0; i < 2; i++) {
@@ -144,9 +148,11 @@ __global__ __launch_bounds__(256) void pfr_logits_mma_kernel(
                 const int gr0 = row0 + wr * 32 + i * 16;
                 for (int e = lane; e < 256; e += 32) {
                     const int r = e >> 4, c = e & 15;
-                    if (gr0 + r < n_tokens)
-                        logits[(size_t)(gr0 + r) * n_experts + col0 + wc * 32 + j * 16 + c] =
-                            s_t[r * 16 + c];
+                    if (gr0 + r < n_tokens) {
+                        float* dst = &logits[(size_t)(gr0 + r) * n_experts + col0 + wc * 32 + j * 16 + c];
+                        if (split_atomic) atomicAdd(dst, s_t[r * 16 + c]);
+                        else              *dst = s_t[r * 16 + c];
+                    }
                 }
                 __syncwarp();
             }
@@ -167,10 +173,27 @@ bool launch_pfm_router_logits_mma(const void* x, const void* W, float* logits,
     // dot -- below ~2 row tiles the GEMV's launch is cheaper than the GEMM's.
     if (!enabled || n_experts % RT_BN != 0 || H % RT_BK != 0 || n_tokens < 128)
         return false;
-    dim3 grid((n_tokens + RT_BM - 1) / RT_BM, n_experts / RT_BN);
+    // A short prompt is a handful of tiles (512 tokens x 256 experts: 16 blocks on 170 SMs), each
+    // walking all of H serially -- 43 us a layer on Qwen3.6, occupancy-bound. Split K eight ways
+    // into the zeroed logits there (128 blocks). Atomic accumulation makes the summation order vary
+    // run to run, so SPARKINFER_DETERMINISTIC keeps the single pass; SPARKINFER_ROUTER_SPLITK=1 too.
+    static const int splitk_env = [] {
+        const char* e = getenv("SPARKINFER_ROUTER_SPLITK");
+        return e ? atoi(e) : 8;
+    }();
+    int splits = 1;
+    if (!deterministic_mode() && splitk_env > 1 && n_tokens <= 2048) {
+        splits = splitk_env;
+        while (splits > 1 && (H % (splits * RT_BK)) != 0) splits >>= 1;
+    }
+    dim3 grid((n_tokens + RT_BM - 1) / RT_BM, n_experts / RT_BN, splits);
+    if (splits > 1 &&
+        cudaMemsetAsync(logits, 0, (size_t)n_tokens * n_experts * sizeof(float), stream) != cudaSuccess)
+        return false;
     pfr_logits_mma_kernel<<<grid, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x),
-        reinterpret_cast<const __nv_bfloat16*>(W), logits, n_tokens, n_experts, H);
+        reinterpret_cast<const __nv_bfloat16*>(W), logits, n_tokens, n_experts, H, H / splits,
+        splits > 1 ? 1 : 0);
     return true;
 }
 
