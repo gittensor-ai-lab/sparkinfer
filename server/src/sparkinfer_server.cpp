@@ -1707,6 +1707,16 @@ int main(int argc, char** argv) {
                  // rejects tools + response_format together at request time.
                  const bool json_mode_active =
                      chat_request.response_format.type != sparkinfer_server::ResponseFormatType::kText;
+                 // A JSON response ends where its grammar does: past the closing brace only end-of-turn
+                 // tokens are allowed, so generating on to max_tokens would emit nothing but those and
+                 // fail the output's validation. Refused rather than silently ignored.
+                 if (json_mode_active && controls.ignore_eos) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"ignore_eos cannot be combined with "
+                                     "response_format\"}}", "application/json");
+                     return;
+                 }
                  if (!max_tokens_set)
                      max_tokens = std::max(1, std::min(max_tokens, engine.max_seq() - (int)prompt_ids.size()));
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {

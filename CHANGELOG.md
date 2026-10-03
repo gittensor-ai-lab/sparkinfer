@@ -24,7 +24,8 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 - **Nothing is mixed while 8 or fewer requests are live, with or without a drafter.** A prompt's
   own pass is the faster first token at that load: Qwen3.6 at c4 TTFT p50 80 -> 148 ms mixed.
 - **`ignore_eos`** (request field, as in vLLM and llama.cpp): generate `max_tokens` whatever the
-  model emits, for benchmarks that want a fixed output length. Such a request does not speculate.
+  model emits, for benchmarks that want a fixed output length. Such a request does not speculate;
+  combined with `response_format` it is refused (400), since a JSON answer ends with its grammar.
 
 ## [0.6.7] — 2026-10-03
 
