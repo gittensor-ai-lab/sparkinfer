@@ -953,8 +953,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // to be free. It also hands back 285 MB at ctx=16384 (1.1 GB against the old FC=N default).
     // MoE keeps real buffers: its grouped FFN has its own scratch and its shared-expert leg runs on
     // forked streams, a liveness argument this has not been checked against.
-    const bool ffn_alias = !moe && (size_t)FC * (size_t)ffn <= (size_t)N * (size_t)wide
-                                && (size_t)FC * (size_t)ffn <= (size_t)N * (size_t)lvdim;
+    // Rows the gate/up planes hold: FC rounded up to 8, since the ternary FFN's FP4 arm runs a
+    // ragged chunk 8-row aligned -- its GEMMs write, and the down leg's quantize reads, up to 7
+    // rows past FC (a 1011-row prompt read 5 rows past ffg/ffu and could fault).
+    const size_t fc_rows = ((size_t)FC + 7) & ~(size_t)7;
+    const bool ffn_alias = !moe && fc_rows * (size_t)ffn <= (size_t)N * (size_t)wide
+                                && fc_rows * (size_t)ffn <= (size_t)N * (size_t)lvdim;
     // An explicit SPARKINFER_PREFILL_FFN_CHUNK is an operator decision -- honour it as given.
     if (!ffn_alias && !moe && !getenv("SPARKINFER_PREFILL_FFN_CHUNK")) {
         size_t fb = 0, tb = 0;
@@ -1017,8 +1021,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             }
         }
     }
-    bf16* ffg  = ffn_alias ? b8 : a.alloc<bf16>((size_t)FC * ffn);   // ffn gate, bounded to FC tokens
-    bf16* ffu  = ffn_alias ? lz : a.alloc<bf16>((size_t)FC * ffn);   // ffn up,   bounded to FC tokens
+    const size_t fc_alloc = ((size_t)FC + 7) & ~(size_t)7;   // FC as finally sized, see fc_rows
+    bf16* ffg  = ffn_alias ? b8 : a.alloc<bf16>(fc_alloc * ffn);   // ffn gate, bounded to FC tokens
+    bf16* ffu  = ffn_alias ? lz : a.alloc<bf16>(fc_alloc * ffn);   // ffn up,   bounded to FC tokens
     bf16* ffh  = ffg;                                    // SwiGLU computed in-place into ffg (down reads it)
     bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
     int*  d_ids = a.alloc<int>((size_t)N);
