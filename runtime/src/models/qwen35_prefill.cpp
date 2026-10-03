@@ -30,6 +30,7 @@
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/prefill_i8.h"
 #include "sparkinfer/kernels/prefill_fp8.h"
+#include "sparkinfer/kernels/prefill_quant_rows.h"
 #include "sparkinfer/kernels/prefill_gemm_skinny.h"
 #include "sparkinfer/kernels/prefill_moe.h"
 #include "sparkinfer/kernels/deterministic.h"
@@ -1984,6 +1985,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     static_cast<const char*>(W) + hdr,
                     static_cast<const float*>(W), W_i8, sw, n_out, K, st);
             }
+            // Q8_0 (Qwen3.6's shared experts): quantize the stored blocks straight to int8 rows.
+            if (!w_i8_ready && wtype == 8)
+                w_i8_ready = kernels::launch_prefill_quant_rows_q80(W, W_i8, sw, n_out, K, st);
             if (!w_i8_ready) {
                 const void* wb = dq(W, wtype, n_out, K);
                 kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
@@ -1994,8 +1998,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // the e4m3 operands; dequant the weight to bf16 scratch, then row/channel fp8-quantize.
             a_q = nullptr; a_pk = false;                // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, R, K, st);
-            const void* wb = dq(W, wtype, n_out, K);
-            kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, n_out, K, st);
+            if (!kernels::launch_prefill_quantize_rows_fp8_gguf(wtype, W, W_i8, sw, n_out, K, st)) {
+                const void* wb = dq(W, wtype, n_out, K);
+                kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, n_out, K, st);
+            }
             kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, C, R, n_out, K, st);
         } else {
             // mma.sync bf16 GEMM only for dense-hybrid long prefill (the >96k int8→bf16 fallback).
@@ -2332,11 +2338,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         } else if (fp8_shareq) {
             a_q = nullptr; a_pk = false;                // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);   // xn -> e4m3 once
-            const void* wb = dq(w.wqkv, w.wqkv_type, lqkv, H);
-            kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lqkv, H, st);
+            // Q8_0 weights quantize to e4m3 in place (launch_prefill_quantize_rows_fp8_gguf); other
+            // types still go through a bf16 dequant first.
+            if (!kernels::launch_prefill_quantize_rows_fp8_gguf(w.wqkv_type, w.wqkv, W_i8, sw, lqkv, H, st))
+                kernels::launch_prefill_quantize_rows_fp8(dq(w.wqkv, w.wqkv_type, lqkv, H), W_i8, sw, lqkv, H, st);
             kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, b8, N, lqkv, H, st);
-            wb = dq(w.wqkv_gate, w.wqkv_gate_type, lvdim, H);
-            kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lvdim, H, st);
+            if (!kernels::launch_prefill_quantize_rows_fp8_gguf(w.wqkv_gate_type, w.wqkv_gate, W_i8, sw, lvdim, H, st))
+                kernels::launch_prefill_quantize_rows_fp8(dq(w.wqkv_gate, w.wqkv_gate_type, lvdim, H), W_i8, sw, lvdim, H, st);
             kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, lz, N, lvdim, H, st);
         } else {
             // Fused quantized-B when the row scales exist (proj_fused falls back to proj when they

@@ -33,5 +33,10 @@ bool launch_prefill_quant_rows_fast(const void* x, signed char* q, float* scale,
                                     int rows, int cols, cudaStream_t stream = nullptr,
                                     signed char* qp = nullptr);
 
+// Q8_0 weight -> per-row int8, bit-identical to launch_gguf_dequant (Q8_0) followed by
+// launch_prefill_quant_rows_fast, without the bf16 round trip. False (nothing launched) otherwise.
+bool launch_prefill_quant_rows_q80(const void* w, signed char* q, float* scale,
+                                   int rows, int cols, cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace sparkinfer

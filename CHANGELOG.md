@@ -5,6 +5,20 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Qwen3.6 short-prompt prefill +12% / +8% more (128 / 512 tokens): Q8_0 weights quantize in
+  place.** Every prefill dequantized each Q8_0 projection weight (the GDN / attention projections
+  and the shared experts, 140 tensors) to a bf16 copy and then quantized that copy to fp8 or int8
+  rows. Two new kernels read the Q8_0 blocks directly and produce the same bf16 values in
+  registers, then the same row scale and rounding (`launch_prefill_quantize_rows_fp8_gguf`,
+  `launch_prefill_quant_rows_q80`): with `SPARKINFER_DETERMINISTIC=1` the prefill check's KL is
+  identical to the bit with them on or off.
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 5,886 / 14,309 / 19,931 / 30,297
+    -> 6,615 / 15,396 / 20,953 / 30,863 tok/s at 128 / 512 / 1K / 4K tokens (llama.cpp on the same
+    file: 3,499 / 9,638 at 128 / 512). `SPARKINFER_FP8_QUANT_GGUF=0` /
+    `SPARKINFER_PREFILL_QUANT_GGUF=0` restore the bf16 round trips.
+
 ## [0.6.13] — 2026-10-03
 
 **Qwen3.6 short-prompt prefill another +6.5% / +4.3%: the router GEMM splits K.**

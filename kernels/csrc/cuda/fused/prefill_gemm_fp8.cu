@@ -554,6 +554,90 @@ __global__ __launch_bounds__(BLOCK) void pf_quantize_rows_fp8_fast_kernel(
     }
 }
 
+// pf_quantize_rows_fp8_fast_kernel reading a Q8_0 weight in place. Thread slot p owns values
+// [8p, 8p+8): quarter (p & 3) of 34-byte block p >> 2. Each value is __float2bfloat16(d * q) --
+// deq_q8_0_kernel's expression, so the same bf16 -- and from there the row max, d = amax / FP8_TGT
+// and the e4m3 conversion are the fast kernel's, line for line. Q8_0 blocks are only 2-byte aligned
+// (34 B), so the quants come in as four 16-bit loads.
+template <int BLOCK, int SLOTS>
+__global__ __launch_bounds__(BLOCK) void pf_quantize_rows_fp8_q80_kernel(
+        const unsigned char* __restrict__ w, __nv_fp8_e4m3* __restrict__ q,
+        float* __restrict__ scale, int rows, int cols) {
+    constexpr int VEC = 8;
+    const int r   = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (r >= rows) return;
+    const unsigned char* row = w + (size_t)r * (size_t)(cols / 32) * 34;
+    const size_t base = (size_t)r * cols;
+
+    __nv_bfloat16 reg[SLOTS][VEC];
+    float amax = 0.f;
+    #pragma unroll
+    for (int s = 0; s < SLOTS; s++) {
+        const int p = tid + s * BLOCK;
+        if (p * VEC < cols) {
+            const unsigned char* blk = row + (size_t)(p >> 2) * 34;
+            const unsigned short dh = *reinterpret_cast<const unsigned short*>(blk);
+            const float d = __half2float(__ushort_as_half(dh));
+            const unsigned short* qs = reinterpret_cast<const unsigned short*>(blk + 2 + (p & 3) * 8);
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const unsigned short two = qs[k];
+                const signed char q0 = (signed char)(two & 0xFFu), q1 = (signed char)(two >> 8);
+                reg[s][2 * k]     = __float2bfloat16(d * q0);
+                reg[s][2 * k + 1] = __float2bfloat16(d * q1);
+            }
+            #pragma unroll
+            for (int v = 0; v < VEC; v++) amax = fmaxf(amax, fabsf(__bfloat162float(reg[s][v])));
+        }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    __shared__ float sred[BLOCK / 32];
+    if ((tid & 31) == 0) sred[tid >> 5] = amax;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < BLOCK / 32) ? sred[tid] : 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (tid == 0) sred[0] = v;
+    }
+    __syncthreads();
+    const float d = (sred[0] == 0.f) ? 1.f : (sred[0] / FP8_TGT);
+    if (tid == 0) scale[r] = d;
+    #pragma unroll
+    for (int s = 0; s < SLOTS; s++) {
+        const int c = (tid + s * BLOCK) * VEC;
+        if (c < cols) {
+            __nv_fp8_e4m3 out[VEC];
+            #pragma unroll
+            for (int v = 0; v < VEC; v++) out[v] = __nv_fp8_e4m3(__bfloat162float(reg[s][v]) / d);
+            *reinterpret_cast<uint2*>(&q[base + c]) = *reinterpret_cast<const uint2*>(out);
+        }
+    }
+}
+
+bool launch_prefill_quantize_rows_fp8_gguf(int ggml_type, const void* w, void* q, float* scale,
+                                           int rows, int cols, cudaStream_t stream) {
+    // SPARKINFER_FP8_QUANT_GGUF=0 sends every weight back through dequantize + quantize (A/B).
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_FP8_QUANT_GGUF");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || ggml_type != 8 || rows <= 0 || cols <= 0 || (cols % 32) != 0) return false;
+    constexpr int BLOCK = 256;
+    const int vecs = cols / 8;
+    const auto* wb = reinterpret_cast<const unsigned char*>(w);
+    auto* qb = reinterpret_cast<__nv_fp8_e4m3*>(q);
+    if (vecs <= BLOCK * 1)       pf_quantize_rows_fp8_q80_kernel<BLOCK, 1><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
+    else if (vecs <= BLOCK * 2)  pf_quantize_rows_fp8_q80_kernel<BLOCK, 2><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
+    else if (vecs <= BLOCK * 3)  pf_quantize_rows_fp8_q80_kernel<BLOCK, 3><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
+    else if (vecs <= BLOCK * 4)  pf_quantize_rows_fp8_q80_kernel<BLOCK, 4><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
+    else if (vecs <= BLOCK * 8)  pf_quantize_rows_fp8_q80_kernel<BLOCK, 8><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
+    else return false;
+    return true;
+}
+
 void launch_prefill_quantize_rows_fp8(const void* x_bf16, void* q, float* scale,
                                       int rows, int cols, cudaStream_t stream) {
     static const bool fast = [] {

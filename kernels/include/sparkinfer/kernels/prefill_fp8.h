@@ -23,6 +23,13 @@ namespace sparkinfer { namespace kernels {
 void launch_prefill_quantize_rows_fp8(const void* x_bf16, void* q, float* scale,
                                       int rows, int cols, cudaStream_t stream = nullptr);
 
+// The same per-row e4m3 quantize, of a GGUF weight read in place: the values are the bf16 that
+// launch_gguf_dequant would have written (same expression, same rounding), so the bytes and scales
+// match dequantize-then-launch_prefill_quantize_rows_fp8 exactly, without the bf16 round trip
+// through memory. Q8_0 only; returns false (nothing launched) for any other type or shape.
+bool launch_prefill_quantize_rows_fp8_gguf(int ggml_type, const void* w, void* q, float* scale,
+                                           int rows, int cols, cudaStream_t stream = nullptr);
+
 // Checkpoint SI_QTYPE_FP8 stores per-row scales as bf16. The GEMM epilogue wants fp32 sw[N]
 // with the same multiply convention (W_bf16 = e4m3 * scale).
 void launch_prefill_fp8_wscales_bf16(const void* scale_bf16, float* sw, int n,
