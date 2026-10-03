@@ -5,6 +5,38 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+**llama.cpp "UD" dynamic-quant GGUFs load: unsloth's Qwen3.8-27B GGUFs work again.**
+- **Before:** unsloth now publishes only UD quants of Qwen3.8-27B. They mix in Q3_K, IQ4_NL, IQ3_S
+  and IQ4_XS, which sparkinfer could neither size nor decode, so `Qwen3.8-27B-UD-Q4_K_M.gguf`
+  failed to load.
+- **Now:** it loads, and against llama.cpp on the same file and GPU: decode 83.4 vs 83.1 tok/s,
+  prefill 3,885 vs 2,809 at 128 tokens and 8,685 vs 3,839 at 4K.
+
+### Models
+
+- **GGUF types Q3_K, IQ4_NL, IQ3_S and IQ4_XS.** The reader knows their block sizes and the GPU
+  dequantizer decodes them (ported from ggml, MIT). No matmul kernel reads them, so the loader
+  refits each such tensor to Q4_K at load (Lloyd fit).
+  - **Tested:** `eval/gguf_dequant_check.py` (new; `runtime/examples/gguf_dequant_check`)
+    dequantizes a real tensor of every type in the file on the GPU and compares it with gguf-py:
+    all eight types bit-identical.
+- **Q5_K projections are refit to Q4_K at load** instead of being dequantized to bf16. UD files
+  store most GDN / attention matrices as Q5_K and no projection kernel reads it; read as bf16
+  (2 bytes/weight) they held Qwen3.8-27B-UD-Q4_K_M to 71.1 tok/s decode. `SPARKINFER_GGUF_Q5K_PROJ`
+  picks the format: `q4k` (default), `q8` (a Q8_0 refit) or `bf16` (the old behaviour).
+  - **Measured** (RTX 5090; accuracy vs `llama-server` on the same file, 275-token prompt and the
+    last 128 positions of an 8,448-token one):
+
+    | `SPARKINFER_GGUF_Q5K_PROJ` | decode | prefill @128 | top-1 / KL | perplexity |
+    |---|---:|---:|---|---:|
+    | `bf16` (before) | 71.1 | — | 0.949 / 0.0213 | 4.374 |
+    | `q8` | 78.8 | 1,888 | 0.956 / 0.0209 | 4.376 |
+    | `q4k` (default) | 83.4 | 3,885 | 0.956 / 0.0255 | 4.428 |
+
+    At 8K all three agree with llama.cpp on 94.5-96.1% of positions.
+  - **Unaffected:** Qwen3.6-35B-A3B-UD-Q4_K_M (its Q5_K tensors are experts) and Muse Glimmer
+    (its Q5_K head has its own path) load nothing differently.
+
 ## [0.6.8] — 2026-10-03
 
 **Qwen3.6 mixes prefill and decode: first token at 16-32 concurrent requests ~40% sooner.**

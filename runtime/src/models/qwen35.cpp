@@ -8888,11 +8888,14 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         return nullptr;
     };
     // Q5_K projections (llama.cpp "UD" quants use it for most GDN/attention matrices) have no
-    // kernel of their own. SPARKINFER_GGUF_Q5K_PROJ picks how they enter: bf16 (dequantized,
-    // 2 B/weight), q8 (Q8_0 refit, 1.06 B/weight, near-lossless) or q4k (Lloyd Q4_K refit).
+    // kernel of their own. SPARKINFER_GGUF_Q5K_PROJ picks how they enter:
+    //   q4k  (default) Lloyd Q4_K refit, 0.56 B/weight. On Qwen3.8-27B-UD-Q4_K_M: decode 83.4
+    //        tok/s, prefill@128 3,885; KL vs llama.cpp 0.0255, perplexity +1.2% vs bf16.
+    //   q8   Q8_0 refit, 1.06 B/weight, near-lossless (KL 0.0209); decode 78.8, prefill@128 1,888.
+    //   bf16 dequantized, 2 B/weight (the behaviour before the refit existed); decode 71.1.
     static const std::string q5k_proj_mode = [] {
         const char* e = getenv("SPARKINFER_GGUF_Q5K_PROJ");
-        return std::string(e ? e : "bf16");
+        return std::string(e ? e : "q4k");
     }();
     auto q5k_proj = [&](const std::string& name, int& type) -> const void* {
         if (q5k_proj_mode == "q4k") return dev_quant_requant_q4k(name, type, true, true);

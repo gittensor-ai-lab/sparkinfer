@@ -230,22 +230,24 @@ Time to first token in ms (p50 / p90 / p99):
 
 ### Same weights, GGUF on both sides
 
-To make the engine comparison fair, the same `Q4_K_M` GGUF
-([unsloth](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)) through both engines. RTX 5090,
-greedy bs=1, sparkinfer `d8e1c74` vs `llama.cpp d8df12e`:
+To make the engine comparison fair, the same GGUF goes through both engines:
+`Qwen3.8-27B-UD-Q4_K_M` ([unsloth](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF); its
+dynamic quant mixes Q3_K, IQ3_S, IQ4_NL, IQ4_XS, Q4_K, Q5_K, Q6_K and Q8_0). RTX 5090, greedy
+bs=1, sparkinfer 0.6.9 (`qwen3_gguf_bench`) vs llama.cpp `436f6f8` (`llama-bench -fa 1`):
 
 | context | decode | | prefill | |
 |---:|---:|---:|---:|---:|
 | | **SparkInfer** | llama.cpp | **SparkInfer** | llama.cpp |
-| 128 | **86.9** (+8.4%) | 80.2 | 2,033 (−26.9%) | **2,782** |
-| 4k | **85.2** (+10.6%) | 77.0 | **7,548** (+105.7%) | 3,670 |
-| 16k | **82.3** (+11.5%) | 73.9 | **7,596** (+117.2%) | 3,496 |
+| 128 | **83.4** (+0.3%) | 83.1 | **3,885** (+38%) | 2,809 |
+| 512 | **83.0** | — | **6,724** (+73%) | 3,894 |
+| 4k | **82.3** (+0.4%) | 82.0 | **8,685** (+126%) | 3,839 |
+| 16k | **80.5** (+2.2%) | 78.7 | **8,677** (+141%) | 3,606 |
 
-Prefill crosses over at ~512 tokens. The short-prompt loss is published rather than omitted, and it
-has a cause: reading a Q4_K_M GGUF means dequantizing Q4_K into the GEMM operand on every pass, a
-fixed cost 128 tokens cannot amortize but 4k easily does. It is a live optimisation target, tracked
-by the same automated eval that gates every PR. sparkinfer's own NVFP4 checkpoints do not pay that
-dequant and reach 5,031–6,942 pp at the same ctx=128.
+Decode is at parity, not ahead: sparkinfer reads every one of those types as Q4_K (it refits the
+rest at load, see the 0.6.9 changelog), while llama.cpp reads the smaller IQ4_XS blocks natively.
+Accuracy against llama.cpp on the same file: top-1 0.956, KL 0.026 (bar 0.90); the Q5_K-to-Q4_K
+refit costs 1.2% perplexity, and `SPARKINFER_GGUF_Q5K_PROJ=q8` trades it back for 79 tok/s decode.
+sparkinfer's own NVFP4 checkpoints skip the GGUF dequant entirely and decode at ~96 tok/s.
 
 ## Other models
 
