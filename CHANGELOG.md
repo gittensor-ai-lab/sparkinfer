@@ -5,6 +5,13 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.11] — 2026-10-03
+
+**Qwen3.6 short-prompt prefill +20% / +16% at 128 / 512 tokens.**
+- **Before:** with correct routing (0.6.10), half of a short Qwen3.6 prefill was the routed MoE
+  GEMMs at under half the GPU's bandwidth; 4,284 / 11,092 tok/s at 128 / 512 tokens.
+- **Now:** 5,136 / 12,921 tok/s (llama.cpp on the same GGUF: 3,499 / 9,638). Decode unchanged.
+
 ### Performance
 
 - **Qwen3.6 short-prompt prefill +20% / +16% (128 / 512 tokens).** Three changes to the routed MoE
