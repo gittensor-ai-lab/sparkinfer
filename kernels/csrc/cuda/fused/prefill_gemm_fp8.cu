@@ -658,7 +658,7 @@ static inline int fp8_tile_bk(bool narrow) { return narrow ? fp8_narrow_bk() : F
 void launch_prefill_gemm_fp8(const void* A, const void* W,
                              const float* sx, const float* sw, void* C,
                              int M, int N, int K, cudaStream_t stream, const void* sw_bf16,
-                             bool resid) {
+                             bool resid, bool beside_prev) {
     const __nv_bfloat16* swb = reinterpret_cast<const __nv_bfloat16*>(sw_bf16);
     const int rs = resid ? 1 : 0;
     const bool narrow = M >= FP8_NARROW_MIN_M && M <= FP8_NARROW_BM && fp8_narrow_m();
@@ -693,7 +693,7 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
                 ? n : 170;
         }();
         const bool mtail = (M % FP8_BM) != 0;
-        if ((N % (2 * FP8_BN)) == 0 && (long)tm * (N / (2 * FP8_BN)) >= 4L * sms) {
+        if (!beside_prev && (N % (2 * FP8_BN)) == 0 && (long)tm * (N / (2 * FP8_BN)) >= 4L * sms) {
             constexpr size_t smem = (size_t)FP8_W64_ST * (FP8_BM + 2 * FP8_BN) * FP8_BK;   // 72 KB
             static const bool ok = [&] {
                 return cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<4, 2, 4, false>,
@@ -724,6 +724,25 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
         }();
         (void)attr;
         const int blocks = tm * (N / FP8_BN);
+        if (beside_prev) {
+            cudaLaunchConfig_t cfg = {};
+            cfg.gridDim = dim3(blocks);
+            cfg.blockDim = dim3(128);
+            cfg.dynamicSmemBytes = smem;
+            cfg.stream = stream;
+            cudaLaunchAttribute at{};
+            at.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            at.val.programmaticStreamSerializationAllowed = 1;
+            cfg.attrs = &at;
+            cfg.numAttrs = 1;
+            if (mtail)
+                cudaLaunchKernelEx(&cfg, pf_gemm_fp8_w64_kernel<8, 2, 2, true>,
+                                   Ae, We, sx, sw, Cb, M, N, K, swb, rs);
+            else
+                cudaLaunchKernelEx(&cfg, pf_gemm_fp8_w64_kernel<8, 2, 2, false>,
+                                   Ae, We, sx, sw, Cb, M, N, K, swb, rs);
+            return;
+        }
         if (mtail)
             pf_gemm_fp8_w64_kernel<8, 2, 2, true><<<blocks, 128, smem, stream>>>(
                 Ae, We, sx, sw, Cb, M, N, K, swb, rs);

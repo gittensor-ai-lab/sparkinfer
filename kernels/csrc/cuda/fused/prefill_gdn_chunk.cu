@@ -97,8 +97,14 @@ constexpr int PAD = 8;
 // Rows past the end of a short final chunk get b = 0 and log-gate 0, which makes W^, U0 and M
 // vanish there, so the scan kernel needs no tail special-casing beyond bounds-checking its writes.
 // ---------------------------------------------------------------------------
-template <int C, int HD>
-__global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
+// FAST is the shape for a grid of several waves (a long prompt), where the kernel is throughput-
+// bound: K/Q/V staged 16 bytes at a time instead of 2, V staged by the seven warps the forward
+// substitution leaves idle, the wmma staging overlaid on Q's dead tile, and so four blocks an SM
+// instead of three. Qwen3.8-27B, us per launch, plain -> FAST: 768 tokens 55.4 -> 49.8, 1024
+// 75.1 -> 68.5, 4096 285.4 -> 243.8, 16384 1105 -> 932. Below two waves the plain shape is faster
+// (512 tokens: 39.0 against 40.9), so the launcher keeps it there. Same bits in either shape.
+template <int C, int HD, bool FAST>
+__device__ __forceinline__ void gdnc_prep_body(const __nv_bfloat16* __restrict__ q,
                                     const __nv_bfloat16* __restrict__ k,
                                     const __nv_bfloat16* __restrict__ v,
                                     const __nv_bfloat16* __restrict__ alpha,
@@ -153,11 +159,29 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     for (int i = tid; i < len; i += nthr) g_buf[(size_t)(t0 + i) * v_heads + h] = s_g[i];
 
     // ---- stage K and Q ----
-    for (int e = tid; e < C * HD; e += nthr) {
-        const int i = e / HD, d = e - i * HD;
-        const bool live = i < len;
-        s_k[i * (HD + PAD) + d] = live ? k[(size_t)(t0 + i) * q_dim + qh * HD + d] : __float2bfloat16(0.f);
-        s_x[i * (HD + PAD) + d] = live ? q[(size_t)(t0 + i) * q_dim + qh * HD + d] : __float2bfloat16(0.f);
+    // FAST: eight bf16 per load. A row's HD values are contiguous in the source and in the padded
+    // tile (row stride (HD+PAD)*2 = 272 B), so one 16-byte move replaces eight 2-byte ones -- the
+    // same bytes to the same places. The scan's cp.async already reads these rows 16 B at a time.
+    static_assert(HD % 8 == 0 && ((HD + PAD) * sizeof(__nv_bfloat16)) % 16 == 0,
+                  "16-byte staging needs 8-aligned rows");
+    if constexpr (FAST) {
+        for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
+            const int i = e8 / (HD / 8), d = (e8 % (HD / 8)) * 8;
+            uint4 kv = make_uint4(0u, 0u, 0u, 0u), qv = kv;       // bf16 zero is all-zero bits
+            if (i < len) {
+                kv = *reinterpret_cast<const uint4*>(k + (size_t)(t0 + i) * q_dim + qh * HD + d);
+                qv = *reinterpret_cast<const uint4*>(q + (size_t)(t0 + i) * q_dim + qh * HD + d);
+            }
+            *reinterpret_cast<uint4*>(s_k + i * (HD + PAD) + d) = kv;
+            *reinterpret_cast<uint4*>(s_x + i * (HD + PAD) + d) = qv;
+        }
+    } else {
+        for (int e = tid; e < C * HD; e += nthr) {
+            const int i = e / HD, d = e - i * HD;
+            const bool live = i < len;
+            s_k[i * (HD + PAD) + d] = live ? k[(size_t)(t0 + i) * q_dim + qh * HD + d] : __float2bfloat16(0.f);
+            s_x[i * (HD + PAD) + d] = live ? q[(size_t)(t0 + i) * q_dim + qh * HD + d] : __float2bfloat16(0.f);
+        }
     }
     __syncthreads();
 
@@ -183,7 +207,18 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
             wmma::load_matrix_sync(bf, s_k + (size_t)tj * (HD + PAD) + d, HD + PAD);  // col_major => K^T
             wmma::mma_sync(cf, af, bf, cf);
         }
-        __shared__ float sD[8][16][16];
+        // FAST overlays the staging on Q's tile, dead once every warp's loads above are done: the
+        // 8 KB it saves is what fits a fourth block on an SM.
+        float (*sD)[16][16];
+        if constexpr (FAST) {
+            static_assert((size_t)C * (HD + PAD) * sizeof(__nv_bfloat16) >= 8 * 16 * 16 * sizeof(float),
+                          "sD must fit in s_x");
+            sD = reinterpret_cast<float (*)[16][16]>(s_x);
+            __syncthreads();
+        } else {
+            __shared__ float sD_own[8][16][16];
+            sD = sD_own;
+        }
         wmma::store_matrix_sync(&sD[warp][0][0], cf, 16, wmma::mem_row_major);
         __syncthreads();
 
@@ -222,6 +257,19 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     // BIT-IDENTICAL: `acc` still starts at A[i][j] and still accumulates m in ASCENDING order
     // over exactly the same index set (m > j && m < i), so every output is the same float. The
     // predicate replaces the loop bounds; it does not reassociate the sum.
+    // FAST: Q is dead once A and M are formed (the barrier above) and the solve below occupies
+    // only warp 0, so the other seven warps stage V into Q's tile meanwhile rather than all eight
+    // doing it after W^. Same values in the same places; only when they are loaded changes.
+    const bool v_early = FAST && C == 32 && warp_inv && nthr > 32;
+    auto stage_v = [&](int first, int stride) {
+        for (int e8 = first; e8 < (C * HD) / 8; e8 += stride) {
+            const int i = e8 / (HD / 8), d = (e8 % (HD / 8)) * 8;
+            uint4 vv = make_uint4(0u, 0u, 0u, 0u);
+            if (i < len) vv = *reinterpret_cast<const uint4*>(v + (size_t)(t0 + i) * v_dim + h * HD + d);
+            *reinterpret_cast<uint4*>(s_x + i * (HD + PAD) + d) = vv;
+        }
+    };
+    if (v_early && tid >= 32) stage_v(tid - 32, nthr - 32);
     if constexpr (C == 32) if (warp_inv) {
         if (tid < C) {
             const int j = tid;
@@ -305,12 +353,17 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     }
     __syncthreads();
 
-    // ---- reuse the Q tile for V, then U0 = T . (b_m v_m) ----
-    for (int e = tid; e < C * HD; e += nthr) {
-        const int i = e / HD, d = e - i * HD;
-        s_x[i * (HD + PAD) + d] = (i < len) ? v[(size_t)(t0 + i) * v_dim + h * HD + d] : __float2bfloat16(0.f);
+    // ---- reuse the Q tile for V (FAST: already staged beside the solve), then U0 = T . (b_m v_m) ----
+    if (FAST && !v_early) {
+        stage_v(tid, nthr);
+        __syncthreads();
+    } else if (!FAST) {
+        for (int e = tid; e < C * HD; e += nthr) {
+            const int i = e / HD, d = e - i * HD;
+            s_x[i * (HD + PAD) + d] = (i < len) ? v[(size_t)(t0 + i) * v_dim + h * HD + d] : __float2bfloat16(0.f);
+        }
+        __syncthreads();
     }
-    __syncthreads();
     {
         // Same m-outermost form as W^ above (bit-identical), store guarded by i < len (#604/#608).
         constexpr int NTHR = 256;
@@ -340,6 +393,42 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
                 u_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] = __float2bfloat16(acc[si]);
         }
     }
+}
+
+// The plain kernel carries no __launch_bounds__, exactly as before FAST existed: bounds of three
+// blocks an SM (its real occupancy) changed its register allocation and measured 16% slower at a
+// single wave (Ternary-Bonsai-2 prefill@128, 20.4 -> 22.7 us a launch).
+template <int C, int HD>
+__global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
+                                    const __nv_bfloat16* __restrict__ k,
+                                    const __nv_bfloat16* __restrict__ v,
+                                    const __nv_bfloat16* __restrict__ alpha,
+                                    const __nv_bfloat16* __restrict__ beta,
+                                    const __nv_bfloat16* __restrict__ dt,
+                                    const __nv_bfloat16* __restrict__ a,
+                                    float* __restrict__ g_buf,
+                                    __nv_bfloat16* __restrict__ w_buf,
+                                    __nv_bfloat16* __restrict__ u_buf,
+                                    float* __restrict__ m_buf,
+                                    int n_tokens, int q_heads, int v_heads, bool qh_block,
+                                    bool warp_inv) {
+    gdnc_prep_body<C, HD, false>(q, k, v, alpha, beta, dt, a, g_buf, w_buf, u_buf, m_buf, n_tokens, q_heads, v_heads, qh_block, warp_inv);
+}
+template <int C, int HD>
+__global__ __launch_bounds__(256, 4) void pf_gdnc_prep_fast_kernel(const __nv_bfloat16* __restrict__ q,
+                                    const __nv_bfloat16* __restrict__ k,
+                                    const __nv_bfloat16* __restrict__ v,
+                                    const __nv_bfloat16* __restrict__ alpha,
+                                    const __nv_bfloat16* __restrict__ beta,
+                                    const __nv_bfloat16* __restrict__ dt,
+                                    const __nv_bfloat16* __restrict__ a,
+                                    float* __restrict__ g_buf,
+                                    __nv_bfloat16* __restrict__ w_buf,
+                                    __nv_bfloat16* __restrict__ u_buf,
+                                    float* __restrict__ m_buf,
+                                    int n_tokens, int q_heads, int v_heads, bool qh_block,
+                                    bool warp_inv) {
+    gdnc_prep_body<C, HD, true>(q, k, v, alpha, beta, dt, a, g_buf, w_buf, u_buf, m_buf, n_tokens, q_heads, v_heads, qh_block, warp_inv);
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +513,13 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     const int j0   = blockIdx.y * JC;
     const int tid  = threadIdx.x;
     const int nthr = blockDim.x;
+
+    // The whole grid is resident at once and then walks a serial chain that leaves most of the
+    // device idle, so let a kernel launched programmatic behind this one start now: work that
+    // does not read this scan's output fills the SMs beside it (Qwen3.8's GDN z projection, see
+    // qwen35_prefill.cpp). A dependent that does read it still waits for this grid to complete
+    // (griddepcontrol.wait), and an ordinary launch after it is untouched.
+    asm volatile("griddepcontrol.launch_dependents;");
 
     const int qh    = qh_block ? (h / (v_heads / q_heads)) : (h % q_heads);
     const int q_dim = q_heads * HD;
@@ -920,6 +1016,10 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
             pf_gdnc_prep_kernel<C, HD>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_prep);
         if (ce_prep != cudaSuccess && sm_prep > 48u * 1024u) return false;
+        const cudaError_t ce_fast = cudaFuncSetAttribute(
+            pf_gdnc_prep_fast_kernel<C, HD>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_prep);
+        if (ce_fast != cudaSuccess && sm_prep > 48u * 1024u) return false;
         cfg[dev] = 1;
     }
     if (!gdnc_scan_smem_ok<C, HD, JC_S>(dev)) return false;
@@ -947,6 +1047,13 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         const char* e = getenv("SPARKINFER_PREFILL_GDN_SCAN_REGS_MINCTX");
         return e ? atoi(e) : 128;
     }();
+    // The prep grid is (chunks, v_heads); FAST (see pf_gdnc_prep_kernel) once it is two full waves
+    // of the plain shape's three blocks an SM. SPARKINFER_PREFILL_GDN_PREP_FAST=0 keeps the plain one.
+    static const bool prep_fast = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_PREP_FAST");
+        return !(e && e[0] == '0');
+    }();
+    const long prep_fast_blocks = 2L * 3 * (sms > 0 ? sms : 170);
     const bool use_regs = regs_on && spills && n_tokens >= regs_minctx &&
                           2 * sm_regs <= (size_t)102400 &&
                           gdnc_scan_smem_ok<C, HD, JC_S, true>(dev);
@@ -985,9 +1092,14 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         auto* w_buf = reinterpret_cast<__nv_bfloat16*>(base + off_w);
         auto* u_buf = reinterpret_cast<__nv_bfloat16*>(base + off_u);
         dim3 gprep(n_chunks, v_heads);
-        pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
-            qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
-            len, q_heads, v_heads, qh_block, prep_warp_inv);
+        if (prep_fast && (long)n_chunks * v_heads >= prep_fast_blocks)
+            pf_gdnc_prep_fast_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
+                qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
+                len, q_heads, v_heads, qh_block, prep_warp_inv);
+        else
+            pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
+                qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
+                len, q_heads, v_heads, qh_block, prep_warp_inv);
         if (use_regs) {
             pf_gdnc_scan_kernel<C, HD, JC_S, true>
                 <<<dim3(v_heads, HD / JC_S), (C * JC_S) / 4,

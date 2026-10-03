@@ -2287,9 +2287,27 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // (gdn_qkv_z). Set only by norm_xn (further down) and cleared by that consumer, at the top of
     // the next layer that is not GDN, and wherever the GDN block ends -- so it never outlives xn.
     bool xn_fp8_ready = false;
+    // Qwen3.8's GDN z is a checkpoint FP8 weight, and the fp8 arm below ran it straight after qkv,
+    // in front of conv, prep and the chunked scan -- none of which read it: only the gated norm
+    // does. The scan is a serial chain of 192 register-resident blocks (two on 22 SMs, one on the
+    // other 148) that leaves most of the device idle for ~2.6 ms a layer at 16k, while z is ~1.8 ms
+    // of fp8 GEMM. So past split-K's rows the arm launches only qkv, and the GDN block launches z
+    // right behind the scan, programmatic (launch_prefill_gemm_fp8's beside_prev): the scan
+    // triggers its dependents as it starts, and z's 128x128 blocks fill the SMs beside it. The
+    // gated norm after it is an ordinary launch and waits for both. One stream: a second stream
+    // here cost every later decode step in the process ~1.7% (+0.3 us per kernel boundary, whether
+    // or not the kernels overlapped). z reads A_i8/sx (written before the scan, rewritten only by
+    // the gated norm) and the checkpoint's bf16 row scales in place, so sw is not needed; each lz
+    // element keeps its k32 order and fp16 flush in either block, so lz is byte-identical.
+    // SPARKINFER_Q38_Z_BESIDE_SCAN=0 keeps z behind qkv.
+    static const bool q38_z_beside = [] {
+        const char* e = getenv("SPARKINFER_Q38_Z_BESIDE_SCAN");
+        return !(e && e[0] == '0');
+    }();
     auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w, bool norm_deferred,
                          bool* z_pending = nullptr, const Qwen35LayerWeights* gt = nullptr,
-                         const BonsaiShadowRs* grs = nullptr, bool* z_tern = nullptr) {
+                         const BonsaiShadowRs* grs = nullptr, bool* z_tern = nullptr,
+                         bool* z_deferred = nullptr) {
         // Checkpoint-native NVFP4: quantize xn to FP4 ONCE (both projections read it) and run two
         // block-scaled GEMMs straight off the packed nibbles. A_i8/sx are not touched, so the int8
         // activation memo stays valid for whatever runs next in the layer.
@@ -2323,6 +2341,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     A_i8, Wq, sx, sw, b8, N, lqkv, H,
                     reinterpret_cast<float*>(sk_p), st)))
                 kernels::launch_prefill_gemm_fp8(A_i8, Wq, sx, sw, b8, N, lqkv, H, st);
+            if (z_deferred && q38_z_beside && !sk_p) {   // the GDN block runs z beside the scan
+                *z_deferred = true;
+                return;
+            }
             kernels::launch_prefill_fp8_wscales_bf16(w.wqkv_gate, sw, lvdim, st);
             const void* Wz = static_cast<const char*>(w.wqkv_gate) + (size_t)lvdim * 2;
             if (!(sk_p && kernels::launch_prefill_gemm_fp8_splitk(
@@ -2593,6 +2615,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     return true;
                 }();
             bool z_pending = false;    // z is running on the side stream; join before the gated norm
+            bool z_deferred = false;   // the fp8 arm left z for after the scan (q38_z_beside)
             if (gdn_ov) {
                 cudaStream_t sk = s.stream_k;
                 const bool ab_mma = !moe && (N > bf16_minctx || dense_bf16_mma);
@@ -2625,7 +2648,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 if (z_on_st)
                     proj_fused(xn, w.wqkv_gate, w.wqkv_gate_type, w.wqkv_gate_rs, lz, lvdim, H);
             } else {
-                gdn_qkv_z(xn, w, attn_norm_deferred, nullptr, tl, trs);   // qkv + z gate (fp8: fused)
+                gdn_qkv_z(xn, w, attn_norm_deferred, nullptr, tl, trs, nullptr,   // qkv + z gate
+                          &z_deferred);
                 // bf16 alpha/beta both reach launch_prefill_gemm_skinny through proj(); past its
                 // split-K rows they share one pass over xn (bit-identical to the two launches).
                 if (!(w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
@@ -2802,6 +2826,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
             }
             if (z_pending) pf_cu(cudaStreamWaitEvent(st, gdn_ev[3], 0), "gdn z join");
+            if (z_deferred)   // the kernel before it on st is the scan (or, off the chunked arm,
+                              // whatever ran last -- then z simply follows it)
+                kernels::launch_prefill_gemm_fp8(A_i8,
+                    static_cast<const char*>(w.wqkv_gate) + (size_t)lvdim * 2, sx, nullptr, lz,
+                    N, lvdim, H, st, w.wqkv_gate, /*resid=*/false, /*beside_prev=*/true);
             // Qwen3.8's out_proj is a checkpoint FP8 weight, and proj_fp8_native reads the gated
             // norm only as its per-row e4m3 rows. When the arms below are certain to reach that
             // GEMM, the norm quantizes itself into A_i8/sx and the bf16 lnrm is never written:
