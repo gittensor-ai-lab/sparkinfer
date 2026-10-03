@@ -1352,6 +1352,7 @@ namespace {
 bool dflash_gguf_dequant_supported(int ggml_type) {
     switch (ggml_type) {
         case 0: case 1: case 8: case 12: case 13: case 14: return true;
+        case 11: case 20: case 21: case 23: return true;   // Q3_K, IQ4_NL, IQ3_S, IQ4_XS
         default: return false;
     }
 }

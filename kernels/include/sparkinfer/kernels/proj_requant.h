@@ -10,4 +10,9 @@ namespace sparkinfer { namespace kernels {
 void launch_proj_requant_q4k_lloyd(const void* src_bf16, void* dst_q4k, long n_values,
                                    cudaStream_t stream = nullptr);
 
+// bf16 -> Q8_0 (ggml layout: fp16 d = amax/127, then 32 int8), rounded as ggml's
+// quantize_row_q8_0 does. n_values must be a multiple of 32.
+void launch_requant_q8_0(const void* src_bf16, void* dst_q8_0, long n_values,
+                         cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

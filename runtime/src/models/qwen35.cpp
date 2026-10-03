@@ -140,8 +140,8 @@ constexpr int kDFlashDeferred = INT_MIN;
 // bound for scratch-buffer sizing, NOT an OpenAI-documented limit.
 constexpr int kMaxLogitBiasEntries = 1024;
 
-// launch_gguf_dequant only implements F32/F16/Q8_0/Q4_K/Q6_K. Reject anything
-// else at load time so Q5_K (etc.) cannot silently fall through as F32.
+// The types launch_gguf_dequant implements. Reject anything else at load time so an
+// unknown type cannot silently fall through as F32.
 bool ggml_dequant_supported(int ggml_type) {
     switch (ggml_type) {
         case 0:  // F32
@@ -151,10 +151,22 @@ bool ggml_dequant_supported(int ggml_type) {
         case 13: // Q5_K (UD / dynamic quants mix this in)
         case 14: // Q6_K
         case 30: // BF16 (Ternary-Bonsai-2 keeps its GDN alpha/beta projections here)
+        // The low-bit types llama.cpp's "UD" dynamic quants mix in. No matmul reads them:
+        // dev_quant() refits them to Q4_K at load (ggml_requant_to_q4k).
+        case 11: // Q3_K
+        case 20: // IQ4_NL
+        case 21: // IQ3_S
+        case 23: // IQ4_XS
             return true;
         default:
             return false;
     }
+}
+
+// Types that are only dequantized, never read by a matmul: dev_quant() turns them into Q4_K
+// (dequant to bf16, then the Lloyd-max Q4_K fit), so every projection kernel sees a type it has.
+bool ggml_requant_to_q4k(int ggml_type) {
+    return ggml_type == 11 || ggml_type == 20 || ggml_type == 21 || ggml_type == 23;
 }
 
 // PTQ1_0 (Ternary-Bonsai-2's 1.75-bit weights) has no kernel of its own yet, so it enters the
@@ -8511,6 +8523,27 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         void* d = nullptr;
         if (cudaMalloc(&d, hb.bytes) != cudaSuccess) return nullptr;
         cudaMemcpy(d, hb.data, hb.bytes, cudaMemcpyHostToDevice);
+        if (ggml_requant_to_q4k(qtype)) {
+            const long nv = t->n_values;
+            void* deq = nullptr;
+            void* q4 = nullptr;
+            if (nv % 256 != 0 || t->dims[0] % 256 != 0 ||
+                cudaMalloc(&deq, (size_t)nv * 2) != cudaSuccess ||
+                cudaMalloc(&q4, (size_t)(nv / 256) * 144) != cudaSuccess) {
+                fprintf(stderr, "[gguf] %s: cannot refit ggml type %d to Q4_K (row %ld)\n",
+                        name.c_str(), qtype, (long)t->dims[0]);
+                cudaFree(deq); cudaFree(d);
+                return nullptr;
+            }
+            kernels::launch_gguf_dequant(qtype, d, deq, nv, s.stream);
+            kernels::launch_proj_requant_q4k_lloyd(deq, q4, nv, s.stream);
+            cudaStreamSynchronize(s.stream);
+            cudaFree(deq);
+            cudaFree(d);
+            s.owned.push_back(q4);
+            qtype = 12;
+            return q4;
+        }
         s.owned.push_back(d);
         return d;
     };
@@ -8854,6 +8887,33 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         cudaFree(d);
         return nullptr;
     };
+    // Q5_K projections (llama.cpp "UD" quants use it for most GDN/attention matrices) have no
+    // kernel of their own. SPARKINFER_GGUF_Q5K_PROJ picks how they enter: bf16 (dequantized,
+    // 2 B/weight), q8 (Q8_0 refit, 1.06 B/weight, near-lossless) or q4k (Lloyd Q4_K refit).
+    static const std::string q5k_proj_mode = [] {
+        const char* e = getenv("SPARKINFER_GGUF_Q5K_PROJ");
+        return std::string(e ? e : "bf16");
+    }();
+    auto q5k_proj = [&](const std::string& name, int& type) -> const void* {
+        if (q5k_proj_mode == "q4k") return dev_quant_requant_q4k(name, type, true, true);
+        if (q5k_proj_mode != "q8") return nullptr;
+        const GGUFTensor* t = g.tensor(name);
+        const long nv = t->n_values;
+        const void* src = dev_quant(name, type);
+        if (!src || type != 13) return src;
+        void* deq = nullptr;
+        void* q8 = nullptr;
+        if (cudaMalloc(&deq, (size_t)nv * 2) != cudaSuccess) return src;
+        if (cudaMalloc(&q8, (size_t)(nv / 32) * 34) != cudaSuccess) { cudaFree(deq); return src; }
+        kernels::launch_gguf_dequant(13, src, deq, nv, s.stream);
+        kernels::launch_requant_q8_0(deq, q8, nv, s.stream);
+        cudaStreamSynchronize(s.stream);
+        cudaFree(deq);
+        if (!s.owned.empty() && s.owned.back() == src) { s.owned.pop_back(); cudaFree((void*)src); }
+        s.owned.push_back(q8);
+        type = 8;
+        return q8;
+    };
     auto attn_w_base = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         // Only projections whose input is the residual width: those read the once-per-layer
@@ -8881,6 +8941,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (qattn && t && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
+        if (qattn && t && ggml_requant_to_q4k(t->ggml_type)) return dev_quant(name, type);
+        if (qattn && t && t->ggml_type == 13)
+            if (const void* p = q5k_proj(name, type)) return p;
         type = 0; return dense(name, false);
     };
     // attn_w_base, plus the decode shadow's ternary copy of the projections its parts name.
@@ -8952,6 +9015,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (qattn && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
+        if (qattn && ggml_requant_to_q4k(t->ggml_type)) return dev_quant(name, type);
+        if (qattn && t->ggml_type == 13)
+            if (const void* p = q5k_proj(name, type)) return p;
         type = 0; return dense(name, false);
     };
     // Muse Glimmer ships output.weight as Q5_K -- the only Q5_K tensor in the file -- and Q5_K was

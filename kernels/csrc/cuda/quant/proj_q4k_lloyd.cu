@@ -206,4 +206,30 @@ void launch_proj_requant_q4k_lloyd(const void* src_bf16, void* dst_q4k, long n_v
         reinterpret_cast<pql_q4k_block*>(dst_q4k), n_super, refine);
 }
 
+__global__ void requant_q8_0_kernel(const __nv_bfloat16* __restrict__ src,
+                                    unsigned char* __restrict__ dst, long n_blocks) {
+    const long b = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const __nv_bfloat16* x = src + b * 32;
+    float amax = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(__bfloat162float(x[i])));
+    const float d = amax / 127.f;
+    const float id = d ? 1.f / d : 0.f;
+    unsigned char* o = dst + b * 34;
+    const __half dh = __float2half(d);
+    *reinterpret_cast<unsigned short*>(o) = *reinterpret_cast<const unsigned short*>(&dh);
+    #pragma unroll
+    for (int i = 0; i < 32; ++i)
+        o[2 + i] = (unsigned char)(signed char)roundf(__bfloat162float(x[i]) * id);
+}
+
+void launch_requant_q8_0(const void* src_bf16, void* dst_q8_0, long n_values, cudaStream_t stream) {
+    const long n_blocks = n_values / 32;
+    const int threads = 128;
+    requant_q8_0_kernel<<<(unsigned)((n_blocks + threads - 1) / threads), threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(src_bf16), reinterpret_cast<unsigned char*>(dst_q8_0),
+        n_blocks);
+}
+
 }} // namespace sparkinfer::kernels

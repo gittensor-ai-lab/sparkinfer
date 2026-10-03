@@ -22,8 +22,9 @@ void launch_dequant_int4_block(const unsigned char* packed, const void* scales_b
                                void* out_bf16, int n, int block,
                                cudaStream_t stream = nullptr);
 
-// GGUF block dequant -> bf16 (natural ggml order). ggml_type: 0=F32,1=F16,
-// 8=Q8_0,12=Q4_K,14=Q6_K. Q4_K/Q6_K validated byte-exact vs the gguf reference.
+// GGUF block dequant -> bf16 (natural ggml order). ggml_type: 0=F32, 1=F16, 8=Q8_0,
+// 11=Q3_K, 12=Q4_K, 13=Q5_K, 14=Q6_K, 20=IQ4_NL, 21=IQ3_S, 23=IQ4_XS, 30=BF16. The k-quant
+// and i-quant decoders match gguf-py bit-exactly (eval/gguf_dequant_check.py).
 void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_values,
                          cudaStream_t stream = nullptr);
 
