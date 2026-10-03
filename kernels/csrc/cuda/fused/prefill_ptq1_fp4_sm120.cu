@@ -173,8 +173,8 @@ __device__ __forceinline__ unsigned fp4_lut_entry(int v, unsigned x) {
 
 // ---- the GEMM ---------------------------------------------------------------------------------
 // 128x128 output tile, K staged one PTQ1 block (128 values = 64 FP4 bytes a row) at a time. The
-// roles run concurrently, synchronized by mbarriers as pf_dense_gemm_qi8_ws_kernel does it: one A
-// warp streams A stages into a ring with cp.async, eight decode warps turn the weight blocks into
+// roles run concurrently, synchronized by mbarriers as pf_dense_gemm_qi8_ws_kernel does it: two A
+// warps stream A stages into a ring with cp.async, eight decode warps turn the weight blocks into
 // e2m1 stages of a second ring (a half-block a thread, two stages an iteration, the words a pair
 // ahead), and eight MMA warps (2 x 4, 64x32 each) only wait, ldmatrix and mma. The grid is
 // persistent over (M-tile, N-tile, K-slice) items, so every role walks the same item list and the
@@ -183,8 +183,7 @@ __device__ __forceinline__ unsigned fp4_lut_entry(int v, unsigned x) {
 // mbarriers: fullA[NS] (A lanes' cp.async arrivals), emptyA[NS] and emptyB[NS] (one per MMA
 // warp), fullB[NS] (every decode thread).
 constexpr int BM = 128, BN = 128, BKB = 64, MAX_LEGS = 3;
-constexpr int NS = 4, N_MMA = 256, N_DEC = 256, N_AW = 32;
-constexpr int THREADS = N_MMA + N_DEC + N_AW;
+constexpr int NS = 4, N_MMA = 256, N_DEC = 256;
 
 struct Smem {
     unsigned char a[NS][BM * BKB];
@@ -339,8 +338,8 @@ __device__ __forceinline__ void store_tile(const float (&acc)[4][4][4], const Le
         }
 }
 
-template <bool RESID>
-__global__ void __launch_bounds__(THREADS, 1)
+template <bool RESID, int AW>
+__global__ void __launch_bounds__(N_MMA + N_DEC + AW, 1)
 ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
                      float* __restrict__ part, int nblk_split, int mtiles, int ntiles, int nitems,
                      float alpha) {
@@ -352,10 +351,10 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
     auto fullB  = [&](int s) { return mb0 + 8u * (unsigned)(2 * NS + s); };
     auto emptyB = [&](int s) { return mb0 + 8u * (unsigned)(3 * NS + s); };
     const int tid = threadIdx.x;
-    for (int e = tid; e < kLutN; e += THREADS) sm.lut[e] = fp4_lut_entry(e >> 8, e & 0xFF);
+    for (int e = tid; e < kLutN; e += blockDim.x) sm.lut[e] = fp4_lut_entry(e >> 8, e & 0xFF);
     if (tid == 0) {
         for (int s = 0; s < NS; s++) {
-            mb_init(fullA(s), N_AW);
+            mb_init(fullA(s), AW);
             mb_init(emptyA(s), N_MMA / 32);
             mb_init(fullB(s), N_DEC);
             mb_init(emptyB(s), N_MMA / 32);
@@ -377,7 +376,8 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
     };
 
     if (tid >= N_MMA + N_DEC) {
-        // ---------------- A warp: 16 A chunks and 4 scale chunks a lane per stage ----------------
+        static_assert(AW > 0 && (BM * (BKB / 16)) % AW == 0 && BM % AW == 0, "AW covers A");
+        // AW threads cover the stage's 512 data chunks and 128 scale rows. AW=32 is one warp.
         const int lane = tid - (N_MMA + N_DEC);
         const size_t arow = (size_t)K / 2, asrow = (size_t)K / 16;
         const unsigned char* asf_g = a + (size_t)M * arow;
@@ -391,16 +391,16 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
                 if (g >= NS) mb_wait(emptyA(s), ((g / NS) - 1) & 1);
                 const int kb = kb0 + i;
 #pragma unroll
-                for (int u = 0; u < 16; u++) {
-                    const int c = lane + 32 * u, r = c >> 2, ch = c & 3;
+                for (int u = 0; u < (BM * (BKB / 16)) / AW; u++) {
+                    const int c = lane + AW * u, r = c >> 2, ch = c & 3;
                     const bool ok = m0 + r < M;
                     cp16(smem_u32(&sm.a[s][swz(r, ch)]),
                          a + (size_t)(ok ? m0 + r : 0) * arow + (size_t)kb * BKB + ch * 16,
                          ok ? 16 : 0);
                 }
 #pragma unroll
-                for (int u = 0; u < 4; u++) {
-                    const int r = lane + 32 * u;
+                for (int u = 0; u < BM / AW; u++) {
+                    const int r = lane + AW * u;
                     const bool ok = m0 + r < M;
                     cp8(smem_u32(&sm.asf[s][r * 8]),
                         asf_g + (size_t)(ok ? m0 + r : 0) * asrow + (size_t)kb * 8, ok ? 8 : 0);
@@ -594,20 +594,35 @@ bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, voi
     constexpr size_t smem = sizeof(Smem);
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<true>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<false>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        auto optin = [&](auto kernel) {
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        };
+        optin(ptq1_fp4_gemm_kernel<true, 32>);
+        optin(ptq1_fp4_gemm_kernel<false, 32>);
+        optin(ptq1_fp4_gemm_kernel<true, 64>);
+        optin(ptq1_fp4_gemm_kernel<false, 64>);
         attr = true;
     }
     const auto* A = static_cast<const unsigned char*>(a);
     float* P = splits > 1 ? part : nullptr;
-    if (resid && !P)
-        ptq1_fp4_gemm_kernel<true><<<grid, THREADS, smem, st>>>(A, m, k, L, P, per, mtiles,
-                                                                tiles_n, nitems, alpha);
-    else
-        ptq1_fp4_gemm_kernel<false><<<grid, THREADS, smem, st>>>(A, m, k, L, P, per, mtiles,
-                                                                 tiles_n, nitems, alpha);
+    // Two warps copy each stage's activation. One warp issued all 8 KB of cp.async, and the MMA
+    // warps waited out that copy. Four warps is slower (they crowd the MMA). SPARKINFER_PTQ1_FP4_AW=32
+    // restores the single warp.
+    static const int aw = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_FP4_AW");
+        return (e && atoi(e) == 32) ? 32 : 64;
+    }();
+    auto go = [&](auto kernel, int threads) {
+        kernel<<<grid, threads, smem, st>>>(A, m, k, L, P, per, mtiles, tiles_n, nitems, alpha);
+    };
+    if (aw == 64) {
+        if (resid && !P) go(ptq1_fp4_gemm_kernel<true, 64>, N_MMA + N_DEC + 64);
+        else             go(ptq1_fp4_gemm_kernel<false, 64>, N_MMA + N_DEC + 64);
+    } else if (resid && !P) {
+        go(ptq1_fp4_gemm_kernel<true, 32>, N_MMA + N_DEC + 32);
+    } else {
+        go(ptq1_fp4_gemm_kernel<false, 32>, N_MMA + N_DEC + 32);
+    }
     if (P) {
         for (int i = 0; i < nleg; i++) {
             const size_t n4 = (size_t)m * n[i] / 4;
