@@ -3447,11 +3447,12 @@ void launch_moe_expert_ffn_q4k(
                 const int m = (num_tokens - t0) < 16 ? (num_tokens - t0) : 16;                       \
                 const si_block_q8_1* qr = q + (size_t)t0 * (hidden >> 5);                            \
                 float* hr = h_scratch + (size_t)t0 * ffn;                                            \
+                const int* er = expert_ids + t0;                                                     \
                 if (m <= 8) launch_pdl_kernel(gu_pdl, dim3(ffn), block, 0, stream,                   \
-                                gate_up_mmvq2_kq_rows_kernel<G_, U_, 8>, qr, gq, uq, expert_ids, hr,  \
+                                gate_up_mmvq2_kq_rows_kernel<G_, U_, 8>, qr, gq, uq, er, hr,          \
                                 hidden, ffn, m, gu_pdl);                                             \
                 else        launch_pdl_kernel(gu_pdl, dim3(ffn), block, 0, stream,                   \
-                                gate_up_mmvq2_kq_rows_kernel<G_, U_, 16>, qr, gq, uq, expert_ids, hr, \
+                                gate_up_mmvq2_kq_rows_kernel<G_, U_, 16>, qr, gq, uq, er, hr,        \
                                 hidden, ffn, m, gu_pdl);                                             \
             }                                                                                        \
         } while (0)
