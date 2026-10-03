@@ -565,6 +565,8 @@ struct Qwen35Model::Impl {
     // Guards the capture window against legacy-default-stream work issued by other threads.
     // See Qwen35Model::device_mutex() in the header for why this is required.
     std::recursive_mutex device_mu;
+    // Set while forward_token re-runs a step eagerly because its graph could not be captured.
+    bool capture_off = false;
     // CUDA-graph capture of the decode compute (captured once, replayed each token)
     cudaGraph_t cu_graph{};
     cudaGraphExec_t cu_exec{};
@@ -1829,7 +1831,25 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // always safe to (re)capture -- either the plain decode graph (dflash_cap false) or the
     // dflash decode graph (dflash_cap true, via the row-independent stage buffer); only the
     // prefill/prompt path (sample=false) still avoids capturing while dflash_cap is on.
-    const bool capturing_graph = sample || !dflash_cap;
+    const bool capturing_graph = (sample || !dflash_cap) && !s.capture_off;
+    // A captured step's kernels are recorded, not run: if the graph then fails to end or
+    // instantiate (out of memory, say), nothing has executed -- no KV append, no recurrent-state
+    // update, no token. Returning as if it had ran the NEXT step on stale state and handed back the
+    // previous token (packed_decode_check at 24 rows with 1 MB free decoded garbage). Run the step
+    // again with capture off instead; everything above this point is idempotent host-side setup.
+    auto run_eager = [&]() -> int {
+        static bool said = false;   // once: under memory pressure every step can land here
+        if (!said) {
+            said = true;
+            fprintf(stderr, "[qwen35] graph capture failed at position %d; running steps eagerly\n",
+                    position);
+        }
+        s.capture_off = true;
+        const int r = forward_token(token_id, position, sample, temperature, seed, sample_step,
+                                    top_k, top_p, presence_penalty, frequency_penalty);
+        s.capture_off = false;
+        return r;
+    };
     if (capturing_graph)
         cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
 
@@ -3176,8 +3196,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     dbg_bf16(s.xn, H, 80, -2);   // tag 80: final-norm output (lm_head input)
     dbg_xn_snapshot(s.xn, c.n_layers);   // extra slot: final-norm output, for lm_head cross-check
     if (!sample) {
-        if (capturing_graph &&
-            finish_capture(st, &s.cu_prefill_graph, &s.cu_prefill_exec, "prefill graph capture")) {
+        if (capturing_graph) {
+            if (!finish_capture(st, &s.cu_prefill_graph, &s.cu_prefill_exec, "prefill graph capture"))
+                return run_eager();
             s.graph_prefill_ready = true;
             s.graph_prefill_attn_mode = attn_graph_mode;
             cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch (first)");
@@ -3280,7 +3301,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
     if (capturing_graph && dflash_cap) {
-        if (finish_capture(st, &s.cu_dflash_graph, &s.cu_dflash_exec, "dflash graph capture")) {
+        if (!finish_capture(st, &s.cu_dflash_graph, &s.cu_dflash_exec, "dflash graph capture"))
+            return run_eager();
+        {
             s.dflash_graph_ready = true;
             s.dflash_graph_attn_mode = attn_graph_mode;
             s.dflash_graph_sparse = sparse_on;
@@ -3296,7 +3319,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
         }
     } else if (capturing_graph) {
-        if (finish_capture(st, &s.cu_graph, &s.cu_exec, "decode graph capture")) {
+        if (!finish_capture(st, &s.cu_graph, &s.cu_exec, "decode graph capture"))
+            return run_eager();
+        {
             s.graph_ready = true;
             s.graph_attn_mode = attn_graph_mode;
             s.graph_sparse = sparse_on;
