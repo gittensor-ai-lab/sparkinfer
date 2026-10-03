@@ -13,6 +13,7 @@
 
 #include "qwen35_prefill.h"
 #include "sparkinfer/kernels/ternary.h"
+#include "sparkinfer/cuda_h2d.h"
 #include "sparkinfer/kernels/prefill_ptq1_fp4.h"
 #include "sparkinfer/ternary_ptq1.h"
 #include "sparkinfer/kernels/hadamard.h"
@@ -6079,7 +6080,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (dense && expert_ids && expert_w) {
         std::vector<float> ones((size_t)N * topk, 1.0f);
         pf_cu(cudaMemset(expert_ids, 0, (size_t)N * topk * sizeof(int)), "dense expert ids seed");
-        pf_cu(cudaMemcpy(expert_w, ones.data(), ones.size() * sizeof(float),
+        pf_cu(si_h2d_complete(expert_w, ones.data(), ones.size() * sizeof(float),
                          cudaMemcpyHostToDevice), "dense expert w seed");
     }
     if (recording)
@@ -7778,8 +7779,8 @@ verify_forward_done:
         if (!ids.empty() &&
             cudaMalloc(&d_gdn_layers, ids.size() * sizeof(int)) == cudaSuccess &&
             cudaMalloc(&d_gdn_w, wts.size() * sizeof(dflash_kernels::GdnCommitLayer)) == cudaSuccess) {
-            cudaMemcpy(d_gdn_layers, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_gdn_w, wts.data(), wts.size() * sizeof(dflash_kernels::GdnCommitLayer),
+            si_h2d_complete(d_gdn_layers, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice);
+            si_h2d_complete(d_gdn_w, wts.data(), wts.size() * sizeof(dflash_kernels::GdnCommitLayer),
                        cudaMemcpyHostToDevice);
             n_gdn = (int)ids.size();
             gdn_tbl_key = &s.w;

@@ -1,5 +1,6 @@
 // DFlash draft runtime: safetensors load + GGUF load + block-parallel forward.
 #include "sparkinfer/models/dflash_draft.h"
+#include "sparkinfer/cuda_h2d.h"
 #include "vmm_arena.h"
 
 #include <cstddef>
@@ -838,7 +839,7 @@ struct DFlashDraftModel::Impl {
             }
         }
         bf16* out = alloc<bf16>((size_t)rows * cols);
-        cu(cudaMemcpy(out, host.data(), host.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+        cu(si_h2d_complete(out, host.data(), host.size() * sizeof(bf16), cudaMemcpyHostToDevice),
            "upload nvfp4");
         return out;
     }
@@ -846,14 +847,14 @@ struct DFlashDraftModel::Impl {
     bf16* upload(const TensorView& tv) {
         bf16* d = alloc<bf16>(tv.nbytes / sizeof(bf16));
         if (tv.nbytes % sizeof(bf16) == 0) {
-            cu(cudaMemcpy(d, tv.data, tv.nbytes, cudaMemcpyHostToDevice), "upload bf16");
+            cu(si_h2d_complete(d, tv.data, tv.nbytes, cudaMemcpyHostToDevice), "upload bf16");
         } else {
             // F32 -> BF16
             size_t n = tv.nbytes / sizeof(float);
             std::vector<bf16> tmp(n);
             const float* src = (const float*)tv.data;
             for (size_t i = 0; i < n; i++) tmp[i] = __float2bfloat16(src[i]);
-            cu(cudaMemcpy(d, tmp.data(), n * sizeof(bf16), cudaMemcpyHostToDevice), "upload f32");
+            cu(si_h2d_complete(d, tmp.data(), n * sizeof(bf16), cudaMemcpyHostToDevice), "upload f32");
         }
         return d;
     }
@@ -1152,7 +1153,7 @@ bool DFlashDraftModel::load(const std::string& dir) {
         std::vector<float> ifreq;
         compute_yarn_inv_freq(s.cfg, ifreq, s.yarn_att_scale);
         if (cudaMalloc(&s.d_yarn_inv_freq, ifreq.size() * sizeof(float)) == cudaSuccess) {
-            cudaMemcpy(s.d_yarn_inv_freq, ifreq.data(), ifreq.size() * sizeof(float),
+            si_h2d_complete(s.d_yarn_inv_freq, ifreq.data(), ifreq.size() * sizeof(float),
                        cudaMemcpyHostToDevice);
             fprintf(stderr, "[dflash] YaRN: factor=%.1f orig_max=%d att_scale=%.4f "
                             "(inv_freq[0]=%.3e inv_freq[%d]=%.3e)\n",
@@ -1394,7 +1395,7 @@ bool DFlashDraftModel::load_gguf(const std::string& path) {
         }
         void* raw = nullptr;
         cu(cudaMalloc(&raw, t->n_bytes), "gguf raw malloc");
-        cu(cudaMemcpy(raw, t->data, t->n_bytes, cudaMemcpyHostToDevice), "gguf raw upload");
+        cu(si_h2d_complete(raw, t->data, t->n_bytes, cudaMemcpyHostToDevice), "gguf raw upload");
         bf16* dst = s.alloc<bf16>(t->n_values);
         kernels::launch_gguf_dequant(t->ggml_type, raw, dst, t->n_values, s.stream);
         cu(cudaStreamSynchronize(s.stream), "gguf dequant sync");

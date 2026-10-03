@@ -19,6 +19,7 @@
 // respect those forks, and anything captured into the decode graph has to capture them too.
 
 #include "sparkinfer/models/qwen35.h"
+#include "sparkinfer/cuda_h2d.h"
 #include "sparkinfer/device_health.h"
 #include <atomic>
 
@@ -312,7 +313,7 @@ void* upload_v_regrouped_bf16(const GGUFTensor* t, const std::string& name, long
     }
     void* dev = nullptr;
     if (cudaMalloc(&dev, host.size() * 2) != cudaSuccess) return nullptr;
-    if (cudaMemcpy(dev, host.data(), host.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (si_h2d_complete(dev, host.data(), host.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaFree(dev);
         return nullptr;
     }
@@ -392,7 +393,7 @@ void* unrotate_ternary_to_bf16(const UnrotateJob& j, const std::string& name) {
     for (long r0 = 0; r0 < j.rows; r0 += step) {
         const long nr = std::min(step, j.rows - r0);
         unrotate_rows_to_bf16(j, r0, nr, host.data());
-        if (cudaMemcpy(static_cast<char*>(dev) + (size_t)r0 * j.width * 2, host.data(),
+        if (si_h2d_complete(static_cast<char*>(dev) + (size_t)r0 * j.width * 2, host.data(),
                        (size_t)nr * j.width * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
             unrotate_cuda_ok("bf16 upload", name);
             cudaFree(dev);
@@ -424,7 +425,7 @@ void* unrotate_ternary_to_q4k(const UnrotateJob& j, const std::string& name, cud
         const long nr = std::min(step, j.rows - r0);
         unrotate_rows_to_bf16(j, r0, nr, host.data());
         const long n_chunk = nr * j.width;
-        if (cudaMemcpy(dev_bf16, host.data(), (size_t)n_chunk * 2,
+        if (si_h2d_complete(dev_bf16, host.data(), (size_t)n_chunk * 2,
                        cudaMemcpyHostToDevice) != cudaSuccess) {
             ok = unrotate_cuda_ok("staging upload", name);
             break;
@@ -1078,8 +1079,8 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->d_denom_det=p_->alloc<float>(1);
     p_->d_shared_ids=p_->alloc<int>(1); p_->d_shared_w=p_->alloc<float>(1);
     int zero=0; float one=1.f;
-    cu(cudaMemcpy(p_->d_shared_ids,&zero,sizeof(int),cudaMemcpyHostToDevice),"shared ids");
-    cu(cudaMemcpy(p_->d_shared_w,&one,sizeof(float),cudaMemcpyHostToDevice),"shared w");
+    cu(si_h2d_complete(p_->d_shared_ids,&zero,sizeof(int),cudaMemcpyHostToDevice),"shared ids");
+    cu(si_h2d_complete(p_->d_shared_w,&one,sizeof(float),cudaMemcpyHostToDevice),"shared w");
     // Fused-expert + flash-decoding decode scratch (batch 1). Allocated here so
     // EVERY load path (set_weights / load_weights / load_gguf) has it — not just
     // GGUF. (fa_* NULL here is what crashed flash_decode_split on the non-GGUF path.)
@@ -1106,8 +1107,8 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         p_->nv_ps_b = p_->alloc<float>(pw / 16 + 1);
     }
     if (cfg.dense_ffn && cfg.top_k > 0) {
-        cu(cudaMemcpy(p_->mf_ids, &zero, sizeof(int), cudaMemcpyHostToDevice), "dense expert id");
-        cu(cudaMemcpy(p_->mf_weights, &one, sizeof(float), cudaMemcpyHostToDevice), "dense expert w");
+        cu(si_h2d_complete(p_->mf_ids, &zero, sizeof(int), cudaMemcpyHostToDevice), "dense expert id");
+        cu(si_h2d_complete(p_->mf_weights, &one, sizeof(float), cudaMemcpyHostToDevice), "dense expert w");
     }
     if (cfg.n_shared > 0) {
         p_->sx_h  = p_->alloc<float>(cfg.moe_ffn);
@@ -1198,7 +1199,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         // buffer once at load time and reuse it as that "weight").
         p_->emb_norm_ones = p_->alloc<bf16>(H);
         std::vector<bf16> ones(H, (bf16)0x3F80u);   // bf16 bit pattern for 1.0f
-        cudaMemcpy(p_->emb_norm_ones, ones.data(), (size_t)H * sizeof(bf16), cudaMemcpyHostToDevice);
+        si_h2d_complete(p_->emb_norm_ones, ones.data(), (size_t)H * sizeof(bf16), cudaMemcpyHostToDevice);
     }
     const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
     p_->aq8   = p_->alloc<signed char>(kmax);
@@ -1490,8 +1491,8 @@ bool Qwen35Model::set_pending_vision(const float* emb, const int* positions, int
     if (cudaMalloc((void**)&s.d_vision_pos, (size_t)n_img * sizeof(int)) != cudaSuccess) {
         cudaFree(s.d_vision_emb); s.d_vision_emb = nullptr; return false;
     }
-    if (cudaMemcpy(s.d_vision_emb, h.data(), n * sizeof(bf16), cudaMemcpyHostToDevice) != cudaSuccess
-     || cudaMemcpy(s.d_vision_pos, positions, (size_t)n_img * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (si_h2d_complete(s.d_vision_emb, h.data(), n * sizeof(bf16), cudaMemcpyHostToDevice) != cudaSuccess
+     || si_h2d_complete(s.d_vision_pos, positions, (size_t)n_img * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
         clear_pending_vision(); return false;
     }
     s.vision_n = n_img;
@@ -1511,7 +1512,7 @@ bool Qwen35Model::set_pending_mrope(const int* positions, int n_tokens, int deco
     if (!positions || n_tokens <= 0) return false;
     const size_t n = (size_t)n_tokens * 3;
     if (cudaMalloc((void**)&s.d_mrope_pos, n * sizeof(int)) != cudaSuccess) return false;
-    if (cudaMemcpy(s.d_mrope_pos, positions, n * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (si_h2d_complete(s.d_mrope_pos, positions, n * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
         clear_pending_mrope();
         return false;
     }
@@ -8273,7 +8274,7 @@ void* load_bin(const std::string& path, std::vector<void*>& owned) {
     f.read(host.data(), n);
     void* d = nullptr;
     if (cudaMalloc(&d, n) != cudaSuccess) return nullptr;
-    cudaMemcpy(d, host.data(), n, cudaMemcpyHostToDevice);
+    si_h2d_complete(d, host.data(), n, cudaMemcpyHostToDevice);
     owned.push_back(d);
     return d;
 }
@@ -8397,7 +8398,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         for (const auto& kv : had.signs_by_width) {
             void* d = nullptr;
             if (cudaMalloc(&d, kv.second.size()) != cudaSuccess) continue;
-            cudaMemcpy(d, kv.second.data(), kv.second.size(), cudaMemcpyHostToDevice);
+            si_h2d_complete(d, kv.second.data(), kv.second.size(), cudaMemcpyHostToDevice);
             s.bonsai_sign_dev[kv.first] = d;
             s.owned.push_back(d);
             s.bonsai_rot_elems = std::max(s.bonsai_rot_elems, kv.first);
@@ -8568,7 +8569,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         qtype = hb.ggml_type;
         void* d = nullptr;
         if (cudaMalloc(&d, hb.bytes) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, hb.data, hb.bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(d, hb.data, hb.bytes, cudaMemcpyHostToDevice);
         if (ggml_requant_to_q4k(qtype)) {
             const long nv = t->n_values;
             void* deq = nullptr;
@@ -8703,7 +8704,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return nullptr;
         }
         void* dq = nullptr; cudaMalloc(&dq, hb.bytes);
-        cudaMemcpy(dq, hb.data, hb.bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(dq, hb.data, hb.bytes, cudaMemcpyHostToDevice);
         void* tmp = nullptr; cudaMalloc(&tmp, (size_t)t->n_values * 2);
         if (!dq || !tmp) {
             // Say so. Returning a silent nullptr here surfaces as whichever tensor the caller
@@ -8915,7 +8916,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                         src + (size_t)unrotate_source_row(j, r) * row_bytes, row_bytes);
         void* d = nullptr;
         if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
-            cudaMemcpy(d, host.data(), t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            si_h2d_complete(d, host.data(), t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
             s.owned.push_back(d);
             return d;
         }
@@ -8926,7 +8927,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto upload_plain_native = [&](const GGUFTensor* t) -> void* {
         void* d = nullptr;
         if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
-            cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            si_h2d_complete(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
             s.owned.push_back(d);
             return d;
         }
@@ -9037,7 +9038,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             s.bonsai_sign_dev.count(t->dims[0])) {
             void* d = nullptr;
             if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
-                cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                si_h2d_complete(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
                 s.owned.push_back(d);
                 type = kPtq1GgmlType;
                 return d;
@@ -9086,7 +9087,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             // Straight upload: no un-rotation, no refit, 0.21875 bytes/weight.
             void* d = nullptr;
             if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
-                cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                si_h2d_complete(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
                 s.owned.push_back(d);
                 type = kPtq1GgmlType;
                 return d;
@@ -9161,7 +9162,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         s.bonsai_sign_dev.count(emb_t->dims[0])) {
         void* d = nullptr;
         if (cudaMalloc(&d, emb_t->n_bytes) == cudaSuccess &&
-            cudaMemcpy(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            si_h2d_complete(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
             s.owned.push_back(d);
             s.w.embed_tokens = d;
             s.bonsai_embed_native = true;              // 0.28 GB of table instead of 2.54 in bf16
@@ -9183,7 +9184,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         emb_t->ggml_type == 12 && emb_t->dims[0] == H && (H % 256) == 0) {
         void* d = nullptr;
         if (cudaMalloc(&d, emb_t->n_bytes) == cudaSuccess &&
-            cudaMemcpy(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            si_h2d_complete(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
             s.owned.push_back(d);
             s.w.embed_tokens = d;
             s.w.embed_type = 12;
@@ -10252,7 +10253,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         }
         void* d = nullptr;
         if (cudaMalloc(&d, (size_t)n_values * 2) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, t->data, (size_t)n_values * 2, cudaMemcpyHostToDevice);
+        si_h2d_complete(d, t->data, (size_t)n_values * 2, cudaMemcpyHostToDevice);
         s.owned.push_back(d);
         return d;
     };
@@ -10286,7 +10287,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         }
         void* d = nullptr;
         if (cudaMalloc(&d, (size_t)n_values * 2) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, transformed.data(), (size_t)n_values * 2, cudaMemcpyHostToDevice);
+        si_h2d_complete(d, transformed.data(), (size_t)n_values * 2, cudaMemcpyHostToDevice);
         s.owned.push_back(d);
         return d;
     };
@@ -10326,7 +10327,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         }
         void* d = nullptr;
         if (cudaMalloc(&d, (size_t)n_values * 2) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, transformed.data(), (size_t)n_values * 2, cudaMemcpyHostToDevice);
+        si_h2d_complete(d, transformed.data(), (size_t)n_values * 2, cudaMemcpyHostToDevice);
         s.owned.push_back(d);
         return d;
     };
@@ -10353,8 +10354,8 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         if (cudaMalloc(&wd, (size_t)rows * cols) != cudaSuccess) return nullptr;
         if (cudaMalloc(&scd, (size_t)rows * 2) != cudaSuccess) { cudaFree(wd); return nullptr; }
         if (cudaMalloc(&out, (size_t)rows * cols * 2) != cudaSuccess) { cudaFree(wd); cudaFree(scd); return nullptr; }
-        cudaMemcpy(wd, w->data, (size_t)rows * cols, cudaMemcpyHostToDevice);
-        cudaMemcpy(scd, sc->data, (size_t)rows * 2, cudaMemcpyHostToDevice);
+        si_h2d_complete(wd, w->data, (size_t)rows * cols, cudaMemcpyHostToDevice);
+        si_h2d_complete(scd, sc->data, (size_t)rows * 2, cudaMemcpyHostToDevice);
         kernels::launch_ct_dequant_fp8(wd, scd, out, rows, cols, s.stream);
         cudaStreamSynchronize(s.stream);
         cudaFree(wd); cudaFree(scd);
@@ -10379,8 +10380,8 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         const size_t w_bytes = (size_t)rows * (size_t)cols;
         void* packed = nullptr;
         if (cudaMalloc(&packed, scale_bytes + w_bytes) != cudaSuccess) return nullptr;
-        cudaMemcpy(packed, sc->data, scale_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(packed) + scale_bytes, w->data, w_bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(packed, sc->data, scale_bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(static_cast<char*>(packed) + scale_bytes, w->data, w_bytes, cudaMemcpyHostToDevice);
         s.owned.push_back(packed);
         qtype = kernels::SI_QTYPE_FP8;
         return packed;
@@ -10499,9 +10500,9 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         void* payload = nullptr;
         if (cudaMalloc(&payload, hdr + scale_bytes + packed_bytes) != cudaSuccess) return nullptr;
         cudaMemset(payload, 0, hdr);
-        cudaMemcpy(payload, &global_scale, 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(payload) + hdr, src.group, scale_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
+        si_h2d_complete(payload, &global_scale, 4, cudaMemcpyHostToDevice);
+        si_h2d_complete(static_cast<char*>(payload) + hdr, src.group, scale_bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
                    cudaMemcpyHostToDevice);
         // SPARKINFER_QWEN38_PREFILL_NVFP4=0 drops the checkpoint-native NVFP4 copies once they
         // have been consumed to build the Q4_K decode weights. In the default configuration they
@@ -10582,8 +10583,8 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         if (cudaMalloc(&out, (size_t)rows * cols * 2) != cudaSuccess) {
             cudaFree(pd); cudaFree(gd); return nullptr;
         }
-        cudaMemcpy(pd, src.packed, packed_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(gd, src.group, scale_bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(pd, src.packed, packed_bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(gd, src.group, scale_bytes, cudaMemcpyHostToDevice);
         kernels::launch_ct_dequant_nvfp4(pd, gd, src.global, out, rows, cols, s.stream);
         // CHECKED, because an unchecked failure here is invisible in the worst possible way: the
         // output buffer is left as cudaMalloc returned it and the caller requantizes that into a
@@ -10627,7 +10628,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         }
         void* d = nullptr;
         if (cudaMalloc(&d, (size_t)rows * cols * 2) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, w->data, (size_t)rows * cols * 2, cudaMemcpyHostToDevice);
+        si_h2d_complete(d, w->data, (size_t)rows * cols * 2, cudaMemcpyHostToDevice);
         return d;   // caller owns, same contract as dequant_fp8 / dequant_nvfp4
     };
 
@@ -10680,10 +10681,10 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         void* payload = nullptr;
         if (cudaMalloc(&payload, hdr + scale_bytes + packed_bytes) != cudaSuccess) return nullptr;
         cudaMemset(payload, 0, hdr);
-        cudaMemcpy(payload, &src.global, 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(payload) + hdr, src.group, scale_bytes,
+        si_h2d_complete(payload, &src.global, 4, cudaMemcpyHostToDevice);
+        si_h2d_complete(static_cast<char*>(payload) + hdr, src.group, scale_bytes,
                    cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
+        si_h2d_complete(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
                    cudaMemcpyHostToDevice);
         s.owned.push_back(payload);
         qtype = kernels::SI_QTYPE_NVFP4;

@@ -5,6 +5,25 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Fixes
+
+- **Qwen3.6-35B-A3B's MoE router loaded corrupted in most launches.** A synchronous `cudaMemcpy`
+  from pageable memory can return before its DMA lands, and the models' streams are non-blocking,
+  so the load-time dequant of the 2 MB F32 router read a run-dependent tail of zeros. Layer 0 then
+  routed every token to the experts those zeros made the top 8. This is the "Qwen3.6 is not
+  reproducible across launches" behaviour; present since at least 0.5.14. Every host-to-device
+  upload in the model code now waits for its copy.
+  - **Measured** (teacher-forced, 275-token prompt, RTX 5090): perplexity 15-18 (different every
+    launch) -> 5.47 (identical every launch); against `llama-server` on the same GGUF, top-1
+    0.58 -> 0.92, KL 1.43 -> 0.057. UD-Q4_K_XL and UD-IQ4_XS: top-1 0.92 / 0.94.
+  - **Speed:** decode unchanged; prefill at 512 tokens 12.1K -> 11.0K tok/s, because tokens now
+    spread over the experts the router really picks (the corrupt router sent them to the same
+    few). Against llama.cpp on the same file: decode 490 / 467 / 475 vs 284 / 276 / 248 tok/s at
+    128 / 4K / 32K, prefill 10.7K / 29.3K / 26.0K vs 9.6K / 9.5K / 8.6K at 512 / 4K / 32K.
+- **A decode step whose CUDA graph fails to capture runs eagerly** (#1269). Out of memory, the step
+  used to return the previous token with no KV or state update, and every later step decoded from
+  that stale state.
+
 ## [0.6.9] — 2026-10-03
 
 **llama.cpp "UD" dynamic-quant GGUFs load: unsloth's Qwen3.8-27B GGUFs work again.**

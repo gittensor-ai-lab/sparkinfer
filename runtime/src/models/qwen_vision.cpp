@@ -4,6 +4,7 @@
 // weights and the transformers reference (see the stage commits on this branch). The reference is
 // the contract: if this file and vision_ref.py disagree, this file is wrong.
 #include "sparkinfer/models/qwen_vision.h"
+#include "sparkinfer/cuda_h2d.h"
 
 #include <cmath>
 #include <cstdio>
@@ -45,7 +46,7 @@ const void* upload(SafeTensorsModel& st, const std::string& name, long want_valu
     void* d = nullptr;
     if (!cu_ok(cudaMalloc(&d, (size_t)t->n_values * sizeof(bf16)), ("cudaMalloc " + name).c_str(), err))
         return nullptr;
-    if (!cu_ok(cudaMemcpy(d, t->data, (size_t)t->n_values * sizeof(bf16), cudaMemcpyHostToDevice),
+    if (!cu_ok(si_h2d_complete(d, t->data, (size_t)t->n_values * sizeof(bf16), cudaMemcpyHostToDevice),
                ("upload " + name).c_str(), err)) { cudaFree(d); return nullptr; }
     w.owned.push_back(d);
     return d;
@@ -155,7 +156,7 @@ bool qwen_vision_forward(const QwenVisionWeights& w, const QwenVisionConfig& cfg
     {
         std::vector<bf16> hp((size_t)N * patch_in);
         for (size_t i = 0; i < hp.size(); i++) hp[i] = f32_to_bf16(pixels_host[i]);
-        if (!cu_ok(cudaMemcpy(d_pix, hp.data(), hp.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+        if (!cu_ok(si_h2d_complete(d_pix, hp.data(), hp.size() * sizeof(bf16), cudaMemcpyHostToDevice),
                    "upload pixels", err)) { cleanup(); return false; }
     }
     kernels::launch_prefill_gemm(d_pix, w.patch_w, d_x, N, H, patch_in, s);
@@ -185,7 +186,7 @@ bool qwen_vision_forward(const QwenVisionWeights& w, const QwenVisionConfig& cfg
                                        + p10[d] * wy * (1 - wx) + p11[d] * wy * wx);
             }
         }
-        if (!cu_ok(cudaMemcpy(d_h, hp.data(), hp.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+        if (!cu_ok(si_h2d_complete(d_h, hp.data(), hp.size() * sizeof(bf16), cudaMemcpyHostToDevice),
                    "upload pos embed", err)) { cleanup(); return false; }
     }
     kernels::launch_vision_residual_add(d_x, d_h, (long)N * H, s);
@@ -212,9 +213,9 @@ bool qwen_vision_forward(const QwenVisionWeights& w, const QwenVisionConfig& cfg
                     hs[t * half + j] = (float)std::sin(f);
                 }
             }
-        if (!cu_ok(cudaMemcpy(d_cos, hc.data(), hc.size() * sizeof(float), cudaMemcpyHostToDevice),
+        if (!cu_ok(si_h2d_complete(d_cos, hc.data(), hc.size() * sizeof(float), cudaMemcpyHostToDevice),
                    "upload rope cos", err) ||
-            !cu_ok(cudaMemcpy(d_sin, hs.data(), hs.size() * sizeof(float), cudaMemcpyHostToDevice),
+            !cu_ok(si_h2d_complete(d_sin, hs.data(), hs.size() * sizeof(float), cudaMemcpyHostToDevice),
                    "upload rope sin", err)) { cleanup(); return false; }
     }
 
@@ -294,9 +295,9 @@ bool qwen_vision_splice_embeddings(void* d_x, const int* token_ids, int n_tokens
     std::vector<bf16> hemb((size_t)n_img * hidden);
     for (size_t i = 0; i < hemb.size(); i++) hemb[i] = f32_to_bf16(vision_emb[i]);
 
-    bool ok = cu_ok(cudaMemcpy(d_pos, pos.data(), pos.size() * sizeof(int), cudaMemcpyHostToDevice),
+    bool ok = cu_ok(si_h2d_complete(d_pos, pos.data(), pos.size() * sizeof(int), cudaMemcpyHostToDevice),
                     "upload splice positions", err)
-           && cu_ok(cudaMemcpy(d_emb, hemb.data(), hemb.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+           && cu_ok(si_h2d_complete(d_emb, hemb.data(), hemb.size() * sizeof(bf16), cudaMemcpyHostToDevice),
                     "upload vision embeddings", err);
     if (ok) {
         kernels::launch_vision_splice(d_x, (const int*)d_pos, d_emb, n_img, hidden, nullptr);

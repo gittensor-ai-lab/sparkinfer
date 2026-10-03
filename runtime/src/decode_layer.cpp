@@ -3,6 +3,7 @@
 // full layer (and a full model, looped) is CUDA-graph capturable.
 
 #include "sparkinfer/decode.h"
+#include "sparkinfer/cuda_h2d.h"
 #include "sparkinfer/device_health.h"
 #include <atomic>
 #include "sparkinfer/kv_ops.h"
@@ -83,8 +84,8 @@ void DecodeRunner::begin_step(const std::vector<int>& seq_lens_before) {
     }
     std::vector<int> after(n);
     for (int i = 0; i < n; i++) after[i] = seq_lens_before[i] + 1;   // include the new token
-    cu(cudaMemcpy(p_->d_write_pos, seq_lens_before.data(), n * sizeof(int), cudaMemcpyHostToDevice), "wpos");
-    cu(cudaMemcpy(p_->d_seq_lens,  after.data(),           n * sizeof(int), cudaMemcpyHostToDevice), "slens");
+    cu(si_h2d_complete(p_->d_write_pos, seq_lens_before.data(), n * sizeof(int), cudaMemcpyHostToDevice), "wpos");
+    cu(si_h2d_complete(p_->d_seq_lens,  after.data(),           n * sizeof(int), cudaMemcpyHostToDevice), "slens");
 }
 
 void DecodeRunner::decode_layer(int layer, void* x, int num_seqs,
