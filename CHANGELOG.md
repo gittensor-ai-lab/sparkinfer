@@ -48,6 +48,25 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     `SPARKINFER_GU_KQ_MIXED=0` restores the fallback.
   - **Accuracy** vs `llama-server`: top-1 0.956 (unchanged), KL 0.0255 -> 0.0253, perplexity
     4.428 -> 4.419; over the 8K tail 0.938 / 0.196, within the three refit modes' spread.
+- **Concurrent requests on a UD GGUF decode packed.** Qwen3.8-27B-UD-Q4_K_M declined every packed
+  step, so each concurrent request ran its own forward: its Q8_0 `ssm_alpha` / `ssm_beta` had no
+  48-wide row kernel (they now load as bf16, as prefill already read them), and the Q6_K / Q8_0 row
+  GEMVs lacked its 5120 / 6144 widths. Packed, its mixed-type FFN then re-read the weights per row:
+  gate/up and Q5_K down gained row-batched kernels, and the tensor-core rows kernel reads Q5_K.
+  - **Measured** (`qwen3_gguf_cb_bench`): c16 283 -> 535, c32 327 -> 777 tok/s. Decode alone
+    (rows / step time) 608 / 938 tok/s against `llama-batched-bench` on the same file 621 / 763.
+  - **Tested:** `packed_decode_check` at 4-23 rows matches one forward per row; the server's
+    `mixed_conc_check` with packed decode on / off: 33 of 34 greedy answers identical.
+
+### Fixes
+
+- **Dense k-quant GGUFs no longer mix prefill and decode.** Their batched prefill runs int8
+  projections, and a mixed step's decode rows took their next token from it: Qwythos-9B Q4_K_M's
+  rows agreed with one forward per row 0.897-0.932 against a control's 0.966-0.979
+  (`packed_decode_check`, mixed mode), Qwen3.8-27B-UD-Q4_K_M's 0.926-0.949 against 0.947-0.975.
+  Such a model now prefills prompts in passes of their own, as before 0.6.4; `qwen3_gguf_cb_bench`
+  is no slower (Qwythos c16 / c32 1,531 / 2,288 -> 1,584 / 2,342 tok/s). NVFP4, MoE, Muse and
+  Bonsai models keep mixing. `SPARKINFER_MIXED_KQUANT=1` restores it.
 
 ## [0.6.8] — 2026-10-03
 

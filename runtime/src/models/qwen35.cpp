@@ -5481,6 +5481,25 @@ static bool mix_head_ok(const Impl& s) {
            ((s.w.lm_head_type == 14 || s.w.lm_head_type == 8) && (H == 2048 || H == 4096));
 }
 
+// A dense k-quant GGUF (per-row weight scales placed for the fused int8 prefill GEMMs; not Muse,
+// not MoE, not ternary Bonsai) does not mix. Its batched prefill runs int8 projections, which put a
+// mixed step's decode rows 1.5-4 points below one forward per row (packed_decode_check, mixed mode,
+// Qwen3.8-27B-UD-Q4_K_M); bf16 projections match it but made the passes so slow that mixing lost to
+// not mixing (qwen3_gguf_cb_bench c16 400 vs 535 tok/s). Such a model keeps packed decode and
+// prefills prompts in passes of their own, as it did before it could decode packed at all.
+// SPARKINFER_MIXED_KQUANT=1 lets it mix with the int8 projections.
+template <class Impl>
+static bool mix_kquant_ok(const Impl& s) {
+    static const bool allow = [] {
+        const char* e = getenv("SPARKINFER_MIXED_KQUANT");
+        return e && e[0] == '1';
+    }();
+    if (allow || !s.cfg.dense_ffn || s.cfg.muse_glimmer || s.bonsai_block != 0) return true;
+    for (const auto& w : s.w.layers)
+        if (w.gate_rs || w.down_rs || w.wqkv_rs || w.wq_rs) return false;
+    return true;
+}
+
 template <class Impl>
 static bool ensure_mix_scratch(Impl& s) {
     constexpr int kRows = kQwen35MaxPackedRows;
@@ -5526,7 +5545,8 @@ bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint
     Impl& s = *p_;
     if (!tokens || !positions || !seq_ids || !out_sampled || !chunk_ids || !chunk_seed) return false;
     if (n_dec < 1 || n_dec > kQwen35MaxPackedRows || len < 1 || pos0 < 0) return false;
-    if (!s.cfg.hybrid || !s.gguf || s.cfg.muse_glimmer || !mix_head_ok(s)) return false;
+    if (!s.cfg.hybrid || !s.gguf || s.cfg.muse_glimmer || !mix_head_ok(s) || !mix_kquant_ok(s))
+        return false;
     if (!s.kv->int8_kv() || s.kv->windowed() || s.d_vision_emb || s.d_mrope_pos || s.dflash_capture)
         return false;
     for (int i = 0; i < n_dec; ++i)
@@ -5662,7 +5682,8 @@ bool Qwen35Model::mixed_step_multi(const int* tokens, const int* positions, cons
     Impl& s = *p_;
     if (!tokens || !positions || !seq_ids || !out_sampled) return false;
     if (n_dec < 1 || n_dec > kQwen35MaxPackedRows) return false;
-    if (!s.cfg.hybrid || !s.gguf || s.cfg.muse_glimmer || !mix_head_ok(s)) return false;
+    if (!s.cfg.hybrid || !s.gguf || s.cfg.muse_glimmer || !mix_head_ok(s) || !mix_kquant_ok(s))
+        return false;
     if (!s.kv->int8_kv() || s.kv->windowed() || s.d_vision_emb || s.d_mrope_pos || s.dflash_capture)
         return false;
     int total = 0;
