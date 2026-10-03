@@ -5,6 +5,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.12] — 2026-10-03
+
+**Qwen3.6 short-prompt prefill another +7% / +6%: the fused MoE GEMM prefetches its weights.**
+- **Now:** 5,518 / 13,607 tok/s at 128 / 512 tokens (0.6.10: 4,284 / 11,092; llama.cpp on the same
+  GGUF: 3,499 / 9,638). Bit-identical output.
+
 ### Performance
 
 - **Qwen3.6 short-prompt prefill +7% / +6% more (128 / 512 tokens): the fused MoE GEMM prefetches
