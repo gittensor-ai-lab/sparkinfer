@@ -211,7 +211,8 @@ public:
                                             on_token_logprob = nullptr,
                                         const std::vector<int>& forced_tokens = {},
                                         const PreparedImages* images = nullptr,
-                                        std::shared_ptr<sparkinfer::TokenConstraint> constraint = nullptr);
+                                        std::shared_ptr<sparkinfer::TokenConstraint> constraint = nullptr,
+                                        bool ignore_eos = false);
 
     // TEACHER-FORCED SCORING (POST /v1/score): non-empty `forced_tokens` turns the call into a
     // scoring pass instead of a generation. max_new_tokens must equal forced_tokens.size(); the

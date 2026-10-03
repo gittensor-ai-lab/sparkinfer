@@ -5,6 +5,27 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Serving
+
+- **Mixed prefill + decode steps for MoE models (Qwen3.6-35B-A3B).** A mixed pass declined any
+  model without a dense FFN or a Q4_K head. The routed FFN is row-wise like the dense one, so the
+  decode rows now take the prompt's MoE path, and their head may also be Q6_K or Q8_0 (Qwen3.6's
+  GGUF head) at hidden size 2048 / 4096.
+  - **Measured** (AIPerf chat 1024/256 with `ignore_eos`, RTX 5090, mixing off -> on):
+    - c16: TTFT p50 / p90 509 / 974 -> 312 / 598 ms, 1,328 -> 1,282 tok/s, ITL p50 9.5 -> 11.2 ms;
+    - c32: TTFT p50 / p90 1,135 / 4,545 -> 709 / 3,863 ms, 1,465 -> 1,496 tok/s, request latency
+      p90 8.56 -> 7.84 s;
+    - `qwen3_gguf_cb_bench` c16 / c32: 1,671 / 1,775 -> 1,757 / 2,071 tok/s, max ITL 497 / 1,016
+      -> 73 / 75 ms.
+  - **Tested:** `packed_decode_check` gains a mixed mode (every step the decode rows plus the next
+    chunk of another prompt, teacher-forced): Qwen3.6 at 4 / 16 rows, decode-row argmax agreement
+    98.4-100% against a control's 98.4-100%, and the chunk-prefilled prompt agrees with a one-pass
+    prefill over its seed and 16 steps (0.94-1.0). `mixed_step_check` loads a GGUF too.
+- **Nothing is mixed while 8 or fewer requests are live, with or without a drafter.** A prompt's
+  own pass is the faster first token at that load: Qwen3.6 at c4 TTFT p50 80 -> 148 ms mixed.
+- **`ignore_eos`** (request field, as in vLLM and llama.cpp): generate `max_tokens` whatever the
+  model emits, for benchmarks that want a fixed output length. Such a request does not speculate.
+
 ## [0.6.7] — 2026-10-03
 
 **Qwen3.6 answers concurrent requests correctly, and 3.5-4x faster.**

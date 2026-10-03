@@ -43,6 +43,9 @@ class ContinuousBatchEngine {
 public:
     struct Request {
         std::vector<int> prompt;
+        // Generate all max_new_tokens whatever the model emits (end-of-turn tokens included), as
+        // benchmark clients ask for a fixed output length. Such a request does not speculate.
+        bool ignore_eos = false;
         int max_new_tokens = 0;
         int priority = 0;
         int prefill_start = 0;          // skip tokens already in a shared prefix cache

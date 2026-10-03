@@ -1770,6 +1770,7 @@ int main(int argc, char** argv) {
                           top_k = controls.top_k, top_p = controls.top_p,
                           presence_penalty = controls.presence_penalty,
                           frequency_penalty = controls.frequency_penalty,
+                          ignore_eos = controls.ignore_eos,
                           logit_bias = controls.logit_bias,
                           logprobs = controls.logprobs, top_logprobs = controls.top_logprobs,
                           n = controls.n]
@@ -2070,7 +2071,8 @@ int main(int argc, char** argv) {
                                  const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
                                      logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob,
-                                     {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained));
+                                     {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained),
+                                     ignore_eos);
                                  out->prompt_tokens = (long long)prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
@@ -2519,7 +2521,8 @@ int main(int argc, char** argv) {
                              controls.temperature, branch_seed, controls.top_k, controls.top_p,
                              controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
                              controls.logprobs, controls.top_logprobs, maybe_nonstream_on_tok_logprob,
-                             {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained));
+                             {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained),
+                             controls.ignore_eos);
                          // Defensive clamp -- should already hold, cheap insurance against any
                          // subtle off-by-one between the two accumulation paths above.
                          if (logprob_entries.size() > outcome.tokens.size())
@@ -2863,6 +2866,7 @@ int main(int argc, char** argv) {
                           top_k = controls.top_k, top_p = controls.top_p,
                           presence_penalty = controls.presence_penalty,
                           frequency_penalty = controls.frequency_penalty,
+                          ignore_eos = controls.ignore_eos,
                           logit_bias = controls.logit_bias,
                           logprobs = controls.logprobs, top_logprobs = controls.top_logprobs,
                           n = controls.n]
@@ -2948,7 +2952,8 @@ int main(int argc, char** argv) {
                                               : nullptr;
                                  const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
-                                     logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob);
+                                     logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob,
+                                     {}, nullptr, nullptr, ignore_eos);
                                  out->prompt_tokens = (long long)prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
@@ -3125,7 +3130,8 @@ int main(int argc, char** argv) {
                      const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                          controls.temperature, branch_seed, controls.top_k, controls.top_p,
                          controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
-                         controls.logprobs, controls.top_logprobs, maybe_on_tok_logprob);
+                         controls.logprobs, controls.top_logprobs, maybe_on_tok_logprob, {}, nullptr, nullptr,
+                         controls.ignore_eos);
                      if (logprob_entries.size() > outcome.tokens.size())
                          logprob_entries.resize(outcome.tokens.size());
                      out.prompt_tokens = (long long)prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;

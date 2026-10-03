@@ -986,11 +986,13 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
                                                      on_token_logprob,
                                                  const std::vector<int>& forced_tokens,
                                                  const PreparedImages* images,
-                                                 std::shared_ptr<sparkinfer::TokenConstraint> constraint) {
+                                                 std::shared_ptr<sparkinfer::TokenConstraint> constraint,
+                                                 bool ignore_eos) {
     CompletionResult out;
     sparkinfer::ContinuousBatchEngine::Request req;
     req.prompt = prompt_ids;
     req.max_new_tokens = max_new_tokens;
+    req.ignore_eos = ignore_eos;
     req.forced_tokens = forced_tokens;
     if (images && !images->mrope_pos.empty()) {
         // Carried whenever the checkpoint declares an mrope_section, independently of whether this

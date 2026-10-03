@@ -410,7 +410,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (multi) {
         // Muse's attention branch loops its prompts itself, on either cache dtype; every other
         // stack takes the int8 per-prompt loop further down.
-        if (pos0 != 0 || moe || (!c.muse_glimmer && !s.kv->int8_kv())) return -1;
+        // An MoE stack packs only as a mixed step's chunks (ingest_prompts_packed wants a dense FFN):
+        // the routed FFN is row-wise, so a pack's rows need nothing of it the one-prompt pass does
+        // not already do.
+        if (pos0 != 0 || (moe && s.mix_n <= 0) || (!c.muse_glimmer && !s.kv->int8_kv())) return -1;
         if (s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows || s.ckpt_n > 0) return -1;
         if (!s.multi_off || !s.multi_len || !s.multi_seq_ids || (!s.multi_seed && !s.multi_no_seed))
             return -1;
@@ -442,11 +445,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const int R = s.mix_n;
     if (R < 0) return -1;
     if (R > 0) {
-        if (moe || c.muse_glimmer || !s.kv->int8_kv() || s.kv->windowed() ||
+        // The decode rows' head: Q4_K, or the Q6_K / Q8_0 heads launch_mmvq_rows_f32 serves at
+        // these widths (Qwen3.6's GGUF head). The MoE FFN is row-wise like the dense one, so the
+        // decode rows take the prompt's routed experts the way the prompt rows do.
+        const bool head_ok = s.w.lm_head_type == 12 ||
+                             ((s.w.lm_head_type == 14 || s.w.lm_head_type == 8) &&
+                              (c.hidden == 2048 || c.hidden == 4096));
+        if (c.muse_glimmer || !s.kv->int8_kv() || s.kv->windowed() ||
             s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows || s.ckpt_n > 0 ||
             R >= n || !s.mix_rows || !s.mix_btab || !s.mix_pos || !s.mix_seq ||
             !s.mix_lin_state || !s.mix_lin_conv || s.mix_splits < 1 || !s.mix_fa ||
-            !s.mix_q81 || !s.mix_logits || !s.mix_d_out || !s.mix_out || s.w.lm_head_type != 12)
+            !s.mix_q81 || !s.mix_logits || !s.mix_d_out || !s.mix_out || !head_ok)
             return -1;
     }
 
@@ -4702,10 +4711,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // with the seed below.
     if (R > 0) {
         kernels::launch_quantize_q8_1_rows(xn, s.mix_q81, H, R, H, st);
-        if (!kernels::launch_mmvq_q4k_mma_head_f32(s.mix_q81, s.w.lm_head, s.mix_logits, R, c.vocab,
-                                                   H, st) &&
+        const bool q4k_head = s.w.lm_head_type == 12;
+        if (!(q4k_head && kernels::launch_mmvq_q4k_mma_head_f32(s.mix_q81, s.w.lm_head, s.mix_logits,
+                                                                R, c.vocab, H, st)) &&
             !kernels::launch_mmvq_rows_f32(s.w.lm_head_type, s.mix_q81, s.w.lm_head, s.mix_logits,
-                                           R, c.vocab, H, st)) {
+                                           R, c.vocab, H, st) && q4k_head) {
             const size_t q81_row = kernels::llama_q8_1_bytes(H);
             for (int r = 0; r < R; ++r)
                 kernels::launch_mmvq_q4k_f32(static_cast<const unsigned char*>(s.mix_q81) + r * q81_row,

@@ -403,7 +403,7 @@ bool ContinuousBatchEngine::spec_eligible(const Request& r) {
         const char* e = getenv("SPARKINFER_SPEC_SAMPLED");
         return !(e && e[0] == '0');
     }();
-    return !r.constraint && (r.temperature <= 0.f || sampled_on) && r.presence_penalty == 0.f &&
+    return !r.constraint && !r.ignore_eos && (r.temperature <= 0.f || sampled_on) && r.presence_penalty == 0.f &&
            r.frequency_penalty == 0.f && r.logit_bias.empty() && !r.logprobs &&
            r.forced_tokens.empty() && r.vision_pos.empty() && !r.use_prefix_session &&
            (r.prefill_start == 0 || prefix_hit_spec_on());
@@ -1776,18 +1776,16 @@ void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefi
     unmixable.clear();
     if (budget < kMinBudget || !model_) return;
     std::lock_guard<std::mutex> lock(mu_);
-    // While no more requests are live than a speculation group takes, the load is speculation's
-    // (worker_loop forms a group from fresh prompts and the requests decoding beside them). A
-    // prompt part-way through mixed steps is neither, so mixing there kept groups from forming:
-    // under Poisson arrivals at 2 requests/s, mean latency 4.56 -> 5.76 s with mixing on.
-    static const bool spec_env_on = [] {
-        const char* e = getenv("SPARKINFER_SPECULATIVE");
-        return !(e && e[0] == '0');
-    }();
-    if (speculative_ && spec_env_on && spec_group_max() > 1) {
+    // Nothing is mixed while 8 or fewer requests are live. With a drafter that load is
+    // speculation's (worker_loop forms a group from fresh prompts and the requests decoding beside
+    // them); a prompt part-way through mixed steps is neither, so mixing there kept groups from
+    // forming (Poisson arrivals at 2 requests/s: mean latency 4.56 -> 5.76 s). Without one, a
+    // prompt's own pass beside a handful of decode rows is the faster first token: Qwen3.6 at c4
+    // TTFT p50 80 -> 148 ms mixed, since its whole 1K prompt is one ~35 ms pass.
+    {
         int live = 0;
         for (const auto& kv : jobs_) live += !kv.second->done;
-        if (live <= spec_group_max()) return;
+        if (live <= std::max(8, spec_group_max())) return;
     }
     // BURSTS (opt-in, SPARKINFER_MIXED_ROW_TOKENS=<tokens per decode row>, e.g. 256): fresh prompt
     // tokens waiting beyond decode rows x that -- a load ramping up, or a wave arriving at once --
@@ -2028,8 +2026,9 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
             any_finished = true;
             continue;
         }
-        const bool hit_eos = j->next_token == cfg.eos_id ||
-                             (cfg.eos_id2 >= 0 && j->next_token == cfg.eos_id2);
+        const bool hit_eos = !j->req.ignore_eos &&
+                             (j->next_token == cfg.eos_id ||
+                              (cfg.eos_id2 >= 0 && j->next_token == cfg.eos_id2));
         const bool hit_limit = j->decode_emitted >= j->req.max_new_tokens;
         if (hit_eos || hit_limit) {
             j->reached_token_limit = hit_limit && !hit_eos;
@@ -2499,7 +2498,7 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
 
     // EOS never ends a teacher-forced score: the caller asked about a specific token sequence and
     // is owed a logprob for every token in it, even if it contains an end marker.
-    const bool hit_eos = job.req.forced_tokens.empty() &&
+    const bool hit_eos = job.req.forced_tokens.empty() && !job.req.ignore_eos &&
                          (job.next_token == cfg.eos_id ||
                           (cfg.eos_id2 >= 0 && job.next_token == cfg.eos_id2));
     const bool hit_token_limit = job.decode_emitted >= job.req.max_new_tokens;

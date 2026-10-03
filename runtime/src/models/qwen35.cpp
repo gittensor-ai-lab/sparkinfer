@@ -5461,6 +5461,14 @@ static void set_mix_shadow_legs(Impl& s, Qwen35PrefillCtx& ctx) {
     if (so != s.bonsai_sign_dev.end()) ctx.bonsai_sign_out = so->second;
 }
 
+// A head a mixed step's decode rows can score (prefill_batched_run takes the same set).
+template <class Impl>
+static bool mix_head_ok(const Impl& s) {
+    const int H = s.cfg.hidden;
+    return s.w.lm_head_type == 12 ||
+           ((s.w.lm_head_type == 14 || s.w.lm_head_type == 8) && (H == 2048 || H == 4096));
+}
+
 template <class Impl>
 static bool ensure_mix_scratch(Impl& s) {
     constexpr int kRows = kQwen35MaxPackedRows;
@@ -5506,8 +5514,7 @@ bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint
     Impl& s = *p_;
     if (!tokens || !positions || !seq_ids || !out_sampled || !chunk_ids || !chunk_seed) return false;
     if (n_dec < 1 || n_dec > kQwen35MaxPackedRows || len < 1 || pos0 < 0) return false;
-    if (!s.cfg.hybrid || !s.gguf || !s.cfg.dense_ffn || s.cfg.muse_glimmer || s.w.lm_head_type != 12)
-        return false;
+    if (!s.cfg.hybrid || !s.gguf || s.cfg.muse_glimmer || !mix_head_ok(s)) return false;
     if (!s.kv->int8_kv() || s.kv->windowed() || s.d_vision_emb || s.d_mrope_pos || s.dflash_capture)
         return false;
     for (int i = 0; i < n_dec; ++i)
@@ -5643,8 +5650,7 @@ bool Qwen35Model::mixed_step_multi(const int* tokens, const int* positions, cons
     Impl& s = *p_;
     if (!tokens || !positions || !seq_ids || !out_sampled) return false;
     if (n_dec < 1 || n_dec > kQwen35MaxPackedRows) return false;
-    if (!s.cfg.hybrid || !s.gguf || !s.cfg.dense_ffn || s.cfg.muse_glimmer || s.w.lm_head_type != 12)
-        return false;
+    if (!s.cfg.hybrid || !s.gguf || s.cfg.muse_glimmer || !mix_head_ok(s)) return false;
     if (!s.kv->int8_kv() || s.kv->windowed() || s.d_vision_emb || s.d_mrope_pos || s.dflash_capture)
         return false;
     int total = 0;

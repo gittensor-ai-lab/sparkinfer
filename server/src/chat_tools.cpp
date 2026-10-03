@@ -1618,6 +1618,13 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
         }
         out.frequency_penalty = static_cast<float>(f);
     }
+    if (root.contains("ignore_eos") && !root["ignore_eos"].is_null()) {
+        if (!root["ignore_eos"].is_boolean()) {
+            err = "ignore_eos must be a boolean";
+            return false;
+        }
+        out.ignore_eos = root["ignore_eos"].get<bool>();
+    }
     if (root.contains("logprobs") && !root["logprobs"].is_null()) {
         if (legacy_logprobs) {
             // Legacy /v1/completions: logprobs itself is an integer ("how many top logprobs per

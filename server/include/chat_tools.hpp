@@ -183,6 +183,9 @@ struct RequestControls {
     // loops that top_k/top_p already reach but logprobs/top_logprobs do not.
     float presence_penalty = 0.f;
     float frequency_penalty = 0.f;
+    // ignore_eos (vLLM / llama.cpp extension): generate max_tokens whatever the model emits, for
+    // benchmarks that want a fixed output length.
+    bool ignore_eos = false;
     // logprobs=false (default) attaches no logprobs field anywhere in the response. top_logprobs
     // is only meaningful when logprobs is true -- unlike top_k/top_p, this IS cross-validated
     // against a sibling field: parse_request_controls rejects top_logprobs supplied without

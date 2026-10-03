@@ -22,7 +22,9 @@
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
-#include "qwen38_hf_config.h"
+#include "sparkinfer/gguf.h"
+#include "qwen3_gguf_config.h"
+#include "qwen_checkpoint.h"
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>
@@ -69,7 +71,10 @@ int main(int argc, char** argv) {
 
     sparkinfer::Qwen35Config cfg;
     std::string err;
-    if (!qwen38_config_from_hf_json(model_dir, cfg, err)) { printf("[FAIL] config: %s\n", err.c_str()); return 1; }
+    // Any checkpoint qwen_checkpoint_open takes: the compressed-tensors directory or a GGUF file.
+    sparkinfer::GGUF g;
+    QwenCheckpointKind kind{};
+    if (!qwen_checkpoint_open(model_dir, cfg, g, kind, err)) { printf("[FAIL] open: %s\n", err.c_str()); return 1; }
     cfg.max_seq = 2048;
 
     auto rt = sparkinfer::Runtime::create({});
@@ -93,7 +98,7 @@ int main(int argc, char** argv) {
     mc.num_layers = cfg.n_layers;
     auto engine = sparkinfer::moe::MoEEngine::create(mc);
     sparkinfer::Qwen35Model model(cfg, &kv, engine.get());
-    if (!model.load_compressed_tensors(model_dir)) { printf("[FAIL] load_compressed_tensors\n"); return 1; }
+    if (!qwen_checkpoint_load(model, model_dir, kind)) { printf("[FAIL] load %s\n", model_dir.c_str()); return 1; }
 
     auto run = [&](bool mixed, Run& out) -> bool {
         const uint64_t sA = model.open_session(lenA + steps + 8);
