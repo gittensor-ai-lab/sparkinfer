@@ -266,7 +266,10 @@ sparkinfer 0.6.7 against `llama-server` at llama.cpp `bed0a85`, `-np 32 -fa on`)
 | 16 | **1,269** / 409 | **335** / 2,775 | **10.2** / 29.9 |
 | 32 | **1,390** / 411 | **1,270** / 2,640 | **15.1** / 64.9 |
 
-Before 0.6.7, two or more concurrent Qwen3.6 requests decoded to garbage (see the CHANGELOG).
+sparkinfer's answers end at the end of turn (216-229 of the 256 tokens on average) where
+llama-server's ran all 256, which favours llama.cpp's output tok/s; in requests completed it is
+3.1 / 5.5 / 6.4 against 1.4 / 1.6 / 1.6 per second. Before 0.6.7, two or more concurrent Qwen3.6
+requests decoded to garbage (see the CHANGELOG).
 
 SparkInfer focuses on the models driving the future of AI — not thousands of legacy architectures.
 
