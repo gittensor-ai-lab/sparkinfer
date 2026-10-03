@@ -5,6 +5,17 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.10] — 2026-10-03
+
+**Qwen3.6 answers with its real router: perplexity 15-18 -> 5.47, the same on every launch.**
+- **Before:** in most launches Qwen3.6-35B-A3B's layer-0 router loaded with a tail of zero rows (a
+  host-to-device copy raced the dequant that read it), so every token went to the same arbitrary
+  experts. Against llama.cpp on the same GGUF: top-1 0.58, KL 1.43. Present since at least 0.5.14.
+- **Now:** every upload completes before a stream reads it; top-1 0.92, KL 0.057, and the result is
+  identical launch to launch. Still +69-91% decode and +201-207% prefill at 4K-32K over llama.cpp.
+- **Also:** a decode step whose CUDA graph cannot be captured (out of memory) runs eagerly instead
+  of returning a stale token.
+
 ### Fixes
 
 - **Qwen3.6-35B-A3B's MoE router loaded corrupted in most launches.** A synchronous `cudaMemcpy`

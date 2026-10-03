@@ -142,9 +142,11 @@ def problems(results, bodies_max):
         if c.get("finish_reason") == "length" and toks != bodies_max[i]:
             bad.append(f"{i}: length stop at {toks} of {bodies_max[i]}")
         if kind(i) == "logprobs":
+            # completion_tokens counts an end-of-turn token; logprobs carry no entry for it.
             n = len((c.get("logprobs") or {}).get("content") or [])
-            if n != toks:
-                bad.append(f"{i}: {n} logprobs for {toks} tokens")
+            want = toks - 1 if c.get("finish_reason") == "stop" else toks
+            if n != want:
+                bad.append(f"{i}: {n} logprobs for {toks} tokens ({c.get('finish_reason')})")
     return bad
 
 
