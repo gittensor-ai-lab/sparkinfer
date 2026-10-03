@@ -238,15 +238,15 @@ bs=1, sparkinfer 0.6.9 (`qwen3_gguf_bench`) vs llama.cpp `436f6f8` (`llama-bench
 | context | decode | | prefill | |
 |---:|---:|---:|---:|---:|
 | | **SparkInfer** | llama.cpp | **SparkInfer** | llama.cpp |
-| 128 | **83.4** (+0.3%) | 83.1 | **3,885** (+38%) | 2,809 |
-| 512 | **83.0** | — | **6,724** (+73%) | 3,894 |
-| 4k | **82.3** (+0.4%) | 82.0 | **8,685** (+126%) | 3,839 |
-| 16k | **80.5** (+2.2%) | 78.7 | **8,677** (+141%) | 3,606 |
+| 128 | **94.7** (+14%) | 83.1 | **4,538** (+62%) | 2,809 |
+| 512 | **94.2** | — | **7,168** (+84%) | 3,894 |
+| 4k | **93.2** (+14%) | 82.0 | **8,756** (+128%) | 3,839 |
+| 16k | **90.9** (+15%) | 78.7 | **8,718** (+142%) | 3,606 |
 
-Decode is at parity, not ahead: sparkinfer reads every one of those types as Q4_K (it refits the
-rest at load, see the 0.6.9 changelog), while llama.cpp reads the smaller IQ4_XS blocks natively.
-Accuracy against llama.cpp on the same file: top-1 0.956, KL 0.026 (bar 0.90); the Q5_K-to-Q4_K
-refit costs 1.2% perplexity, and `SPARKINFER_GGUF_Q5K_PROJ=q8` trades it back for 79 tok/s decode.
+sparkinfer refits the file's IQ4_XS / IQ3_S / IQ4_NL / Q3_K tensors and its Q5_K attention-side
+matrices to Q4_K at load (see the 0.6.9 changelog). Accuracy against llama.cpp on the same file:
+top-1 0.956, KL 0.025 (bar 0.90); the Q5_K refit costs 1.2% perplexity, and
+`SPARKINFER_GGUF_Q5K_PROJ=q8` keeps those matrices near-lossless for ~10% less decode speed.
 sparkinfer's own NVFP4 checkpoints skip the GGUF dequant entirely and decode at ~96 tok/s.
 
 ## Other models

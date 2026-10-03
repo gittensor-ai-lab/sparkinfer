@@ -1111,6 +1111,59 @@ __global__ void gate_up_mmvq2_qwen_kernel(
     if (pdl) si_pdl_lc();
 }
 
+// gate/up of a k-quant pair that is not Q4_K/Q4_K. llama.cpp "UD" GGUFs give a layer's gate and
+// up different types (Q4_K beside Q5_K, the odd Q6_K), and every mmvq arm above hard-codes the
+// 144-byte Q4_K block, so such a layer fell through to gate_up_q4k_kernel, which dequantizes in
+// fp32 at well under half the bandwidth (Qwen3.8-27B-UD-Q4_K_M: 149 vs 65 us per layer, 19 of its
+// 64 layers). Same 4-warp tiling as gate_up_mmvq2_qwen_kernel -- 8 super-blocks in flight, 16
+// threads per super-block, each covering 16 of its values -- with the dot picked per tensor:
+// Q4_K and Q5_K share the position index kqs; Q6_K's index counts 8 values, so it takes two.
+template <int T>
+__device__ __forceinline__ float si_gu_kq_dot(const unsigned char* row, int kbx,
+                                              const si_block_q8_1* vb, int kqs) {
+    if constexpr (T == 12)
+        return si_vec_dot_q4_K((const si_block_q4_K*)row + kbx, vb, kqs);
+    else if constexpr (T == 13)
+        return si_vec_dot_q5_K((const si_block_q5_K*)row + kbx, vb, kqs);
+    else
+        return si_vec_dot_q6_K(row + (size_t)kbx * 210, vb, kqs) +
+               si_vec_dot_q6_K(row + (size_t)kbx * 210, vb, kqs + 1);
+}
+template <int T> __host__ __device__ constexpr int si_gu_kq_bytes() { return T == 12 ? 144 : T == 13 ? 176 : 210; }
+
+template <int GT, int UT>
+__global__ void gate_up_mmvq2_kq_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int H, int F, int top_k, int pdl
+) {
+    constexpr int NW = 4, WS = 32;
+    const int row = blockIdx.x, ts = row / F, f = row - ts * F, tok = ts / top_k;
+    const int e = expert_ids[ts];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4;
+    const int kqs = 2 * (tid & 15);
+    const int NB = H >> 8;
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    const unsigned char* g_row = gate_q + ((size_t)e * F + f) * NB * si_gu_kq_bytes<GT>();
+    const unsigned char* u_row = up_q   + ((size_t)e * F + f) * NB * si_gu_kq_bytes<UT>();
+    float tg = 0.f, tu = 0.f;
+    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+        tg += si_gu_kq_dot<GT>(g_row, kbx, vrow + (size_t)kbx * 8, kqs);
+        tu += si_gu_kq_dot<UT>(u_row, kbx, vrow + (size_t)kbx * 8, kqs);
+    }
+    __shared__ float sg[NW - 1][WS], su[NW - 1][WS];
+    if (warp > 0) { sg[warp - 1][lane] = tg; su[warp - 1][lane] = tu; }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) { tg += sg[l][lane]; tu += su[l][lane]; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+    if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
+}
+
 // M token rows against ONE set of gate/up rows, in a single pass over those weights.
 //
 // gate_up_mmvq2_qwen_kernel above is launched with a grid of num_tokens*TOPK*F blocks, so the
@@ -2991,6 +3044,10 @@ void launch_moe_expert_ffn_q4k(
     if (gu_spec < 0) { const char* gs = getenv("SPARKINFER_GU_SPEC"); gu_spec = (gs && gs[0] == '0') ? 0 : 1; }
     static int gu_pack2 = -1;
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
+    static const bool gu_kq_mixed = [] {
+        const char* e = getenv("SPARKINFER_GU_KQ_MIXED");
+        return !(e && e[0] == '0');
+    }();
     const int gu_pdl = gu_mmvq_pdl();
     // Whether the gate/up launch is programmatic, so the quantize that follows it may chain on it.
     // The tensor-core gate/up below is launched plainly and clears it.
@@ -3236,6 +3293,38 @@ void launch_moe_expert_ffn_q4k(
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
                 hidden, ffn, top_k, gu_pdl);
+    } else if (mmvq && gu2 && gu_kq_mixed && (hidden & 255) == 0 &&
+               (gate_type == 12 || gate_type == 13 || gate_type == 14) &&
+               (up_type == 12 || up_type == 13 || up_type == 14)) {
+        // A mixed k-quant pair (Q4_K/Q5_K/Q6_K, not both Q4_K): int8 mmvq instead of the fp
+        // fallback below. SPARKINFER_GU_KQ_MIXED=0 restores the fallback.
+        const si_block_q8_1* q;
+        if (input_q8) {
+            q = reinterpret_cast<const si_block_q8_1*>(input_q8);
+        } else {
+            si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(out_scratch);
+            const int nqb = num_tokens * (hidden >> 5);
+            si_quant_bf16_q8_1<<<nqb, 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
+            q = qbuf;
+        }
+        const dim3 grid(num_tokens * top_k * ffn), block(4 * 32);
+        const auto* gq = reinterpret_cast<const unsigned char*>(gate_q);
+        const auto* uq = reinterpret_cast<const unsigned char*>(up_q);
+#define SI_GU_KQ(G_, U_) launch_pdl_kernel(gu_pdl, grid, block, 0, stream, gate_up_mmvq2_kq_kernel<G_, U_>, \
+            q, gq, uq, expert_ids, h_scratch, hidden, ffn, top_k, gu_pdl)
+        switch (gate_type * 16 + up_type) {
+            case 12 * 16 + 13: SI_GU_KQ(12, 13); break;
+            case 12 * 16 + 14: SI_GU_KQ(12, 14); break;
+            case 13 * 16 + 12: SI_GU_KQ(13, 12); break;
+            case 13 * 16 + 13: SI_GU_KQ(13, 13); break;
+            case 13 * 16 + 14: SI_GU_KQ(13, 14); break;
+            case 14 * 16 + 12: SI_GU_KQ(14, 12); break;
+            case 14 * 16 + 13: SI_GU_KQ(14, 13); break;
+            case 14 * 16 + 14: SI_GU_KQ(14, 14); break;
+            default:           SI_GU_KQ(12, 12); break;   // unreachable: Q4_K/Q4_K takes the arm above
+        }
+#undef SI_GU_KQ
     } else if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
         size_t sm = 2 * (size_t)(hidden >> 5) * sizeof(float) + (size_t)hidden;  // s_xd+s_xs+s_xq8
         launch_pdl_kernel(gu_pdl, gu, dim3(WPB * 32), sm, stream, gate_up_q4k_mmvq_kernel,

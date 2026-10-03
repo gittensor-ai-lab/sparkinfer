@@ -9,8 +9,8 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 - **Before:** unsloth now publishes only UD quants of Qwen3.8-27B. They mix in Q3_K, IQ4_NL, IQ3_S
   and IQ4_XS, which sparkinfer could neither size nor decode, so `Qwen3.8-27B-UD-Q4_K_M.gguf`
   failed to load.
-- **Now:** it loads, and against llama.cpp on the same file and GPU: decode 83.4 vs 83.1 tok/s,
-  prefill 3,885 vs 2,809 at 128 tokens and 8,685 vs 3,839 at 4K.
+- **Now:** it loads, and against llama.cpp on the same file and GPU: decode 94.7 vs 83.1 tok/s
+  (+14%), prefill 4,538 vs 2,809 at 128 tokens and 8,756 vs 3,839 at 4K.
 
 ### Models
 
@@ -36,6 +36,18 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     At 8K all three agree with llama.cpp on 94.5-96.1% of positions.
   - **Unaffected:** Qwen3.6-35B-A3B-UD-Q4_K_M (its Q5_K tensors are experts) and Muse Glimmer
     (its Q5_K head has its own path) load nothing differently.
+
+### Performance
+
+- **A dense FFN whose gate and up are different k-quants decodes through int8 mmvq.** UD files
+  give a layer's gate and up different types (Q4_K beside Q5_K, the odd Q6_K); every fast gate/up
+  kernel assumed Q4_K for both, so 19 of Qwen3.8-27B-UD-Q4_K_M's 64 layers fell back to an fp32
+  dequantizing kernel at 149 us per layer instead of 65. The new `gate_up_mmvq2_kq_kernel` takes
+  any Q4_K / Q5_K / Q6_K pair with the same int8 dot llama.cpp uses.
+  - **Measured:** decode 84.0 -> 95.2 tok/s at ctx 0; prefill at 128 tokens 3,885 -> 4,538.
+    `SPARKINFER_GU_KQ_MIXED=0` restores the fallback.
+  - **Accuracy** vs `llama-server`: top-1 0.956 (unchanged), KL 0.0255 -> 0.0253, perplexity
+    4.428 -> 4.419; over the 8K tail 0.938 / 0.196, within the three refit modes' spread.
 
 ## [0.6.8] — 2026-10-03
 
