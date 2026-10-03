@@ -5,6 +5,18 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Qwen3.6 short-prompt prefill +7% / +6% more (128 / 512 tokens): the fused MoE GEMM prefetches
+  its weights.** The short-N fused quantized GEMM decoded a super-block, waited on it, multiplied,
+  and only then loaded the next, so each super-block paid a DRAM round trip with little else in
+  flight. Each thread now loads the next super-block's raw Q4_K / Q5_K bytes into registers right
+  after decoding the current one, and the load overlaps the tensor-core phase. The decode is the
+  same arithmetic on registers instead of memory: with `SPARKINFER_DETERMINISTIC=1` the prefill
+  check's KL is identical to the bit (0.01253) with the prefetch on or off.
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 5,136 / 12,846 -> 5,518 / 13,607
+    tok/s at 128 / 512 tokens (llama.cpp 3,499 / 9,638). `SPARKINFER_QM_PREFETCH=0` turns it off.
+
 ## [0.6.11] — 2026-10-03
 
 **Qwen3.6 short-prompt prefill +20% / +16% at 128 / 512 tokens.**
