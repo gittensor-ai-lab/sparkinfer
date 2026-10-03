@@ -5,6 +5,17 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.8] — 2026-10-03
+
+**Qwen3.6 mixes prefill and decode: first token at 16-32 concurrent requests ~40% sooner.**
+- **Before:** MoE models could not take mixed prefill + decode steps; a Qwen3.6 prompt waited for
+  its own pass beside the decoding requests (AIPerf chat TTFT p50 509 / 1,135 ms at c16 / c32).
+- **Now:** its decode rows ride the prompt chunks' pass (#1265): 312 / 709 ms. Against llama.cpp on
+  the same GGUF at 32 requests: 1,496 vs 413 tok/s, TTFT p50 709 vs 2,629 ms.
+- **Also:** the server takes `ignore_eos` for fixed-length benchmarks, and no model mixes while 8
+  or fewer requests are live.
+
+
 ### Serving
 
 - **Mixed prefill + decode steps for MoE models (Qwen3.6-35B-A3B).** A mixed pass declined any
