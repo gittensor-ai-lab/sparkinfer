@@ -2710,7 +2710,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             kernels::launch_prefill_gdn_scan(gq + po * lq, gk + po * lq, gv + po * lvdim,
                                 la + po * vh, lb + po * vh, w.ssm_dt, w.ssm_a, layer_state,
                                 att + po * lvdim, plen, c.linear_q_heads, vh, c.linear_head_dim,
-                                c.gdn_qh_block, st, /*carry_in=*/part != 0, 0);
+                                c.gdn_qh_block, st, /*carry_in=*/part != 0, 0, /*alone=*/ns == 1);
                             if (!part) {
                                 char* host = static_cast<char*>(s.multi_ckpt_host[i]);
                                 pf_cu(cudaMemcpyAsync(host + (size_t)gdn_state_slot(c, L) * state_elems * sizeof(float),
@@ -2739,7 +2739,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::launch_prefill_gdn_scan(gq + o * lq, gk + o * lq, gv + o * lvdim,
                         la + o * vh, lb + o * vh, w.ssm_dt, w.ssm_a,
                         s.multi_lin_state[i] + state_at, att + o * lvdim, len, c.linear_q_heads,
-                        vh, c.linear_head_dim, c.gdn_qh_block, ss, /*carry_in=*/carry, j);
+                        vh, c.linear_head_dim, c.gdn_qh_block, ss, /*carry_in=*/carry, j,
+                        /*alone=*/ns == 1);
                 }
                 for (int j = 1; j < ns; ++j) {
                     pf_cu(cudaEventRecord(seg_ev[j], seg_st[j]), "gdn segment done");
