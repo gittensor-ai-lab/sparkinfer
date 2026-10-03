@@ -182,10 +182,31 @@ __device__ __forceinline__ unsigned fp4_lut_entry(int v, unsigned x) {
 // (row/2)&3, so every ldmatrix phase (8 rows, one chunk) hits 32 distinct banks.
 // mbarriers: fullA[NS] (A lanes' cp.async arrivals), emptyA[NS] and emptyB[NS] (one per MMA
 // warp), fullB[NS] (every decode thread).
+//
+// FOLD: the A stages are loaded by the decode threads instead of a warp of their own. The
+// dedicated A warp is the block's seventeenth, and seventeen warps put five on one of the SM's four
+// schedulers, whose quarter of the register file (16384) then caps EVERY thread at 96 registers:
+// the MMA warps' 64 accumulators and their fragments spill (ptxas: 32 B stores, 48 B loads per
+// thread) inside the stage loop. At sixteen warps the cap is 128 and nothing spills. The A stage
+// needs no loader of its own: it is released by the same MMA-warp arrival that releases the B stage
+// (emptyB), so the thread that is about to decode a B stage issues its share of the A stage's
+// cp.asyncs first, and fullA counts every decode thread's cp.async arrival. Three stages, not
+// four, because three measured fastest (sweep below); the likely reason is that the ring's shared
+// memory is carved out of the same array as L1, which the decode threads' trit loads go through.
+// Every stage holds the same bytes and every MMA the same operands in the same order, so the output
+// is bit-identical. Isolated GEMMs with DRAM-cold weights, us, main -> FOLD (NS 2 / 3 / 4 / 5):
+//   M=128  gate/up 74.4 -> 59.7, down 38.9 -> 33.1, qkv+z 36.5 -> 30.8, out 22.6 -> 20.5
+//          sum 172.4 -> 165.8 / 144.1 / 151.9 / 150.5
+//   M=512  sum 536.2 -> 531.5 / 461.0 / 476.0 / 473.1
+// SPARKINFER_PTQ1_FP4_FOLD_A=0 keeps the separate A warp (A/B in one binary).
 constexpr int BM = 128, BN = 128, BKB = 64, MAX_LEGS = 3;
-constexpr int NS = 4, N_MMA = 256, N_DEC = 256, N_AW = 32;
-constexpr int THREADS = N_MMA + N_DEC + N_AW;
+constexpr int N_MMA = 256, N_DEC = 256, N_AW = 32;
+template <bool FOLD> struct Ring {
+    static constexpr int NS = FOLD ? 3 : 4;
+    static constexpr int THREADS = N_MMA + N_DEC + (FOLD ? 0 : N_AW);
+};
 
+template <int NS>
 struct Smem {
     unsigned char a[NS][BM * BKB];
     unsigned char asf[NS][BM * 8];
@@ -339,13 +360,14 @@ __device__ __forceinline__ void store_tile(const float (&acc)[4][4][4], const Le
         }
 }
 
-template <bool RESID>
-__global__ void __launch_bounds__(THREADS, 1)
+template <bool RESID, bool FOLD>
+__global__ void __launch_bounds__(Ring<FOLD>::THREADS, 1)
 ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
                      float* __restrict__ part, int nblk_split, int mtiles, int ntiles, int nitems,
                      float alpha) {
+    constexpr int NS = Ring<FOLD>::NS, THREADS = Ring<FOLD>::THREADS;
     extern __shared__ __align__(128) unsigned char smem_raw[];
-    Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
+    Smem<NS>& sm = *reinterpret_cast<Smem<NS>*>(smem_raw);
     const unsigned mb0 = smem_u32(&sm.mb[0]);
     auto fullA  = [&](int s) { return mb0 + 8u * (unsigned)s; };
     auto emptyA = [&](int s) { return mb0 + 8u * (unsigned)(NS + s); };
@@ -355,7 +377,7 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
     for (int e = tid; e < kLutN; e += THREADS) sm.lut[e] = fp4_lut_entry(e >> 8, e & 0xFF);
     if (tid == 0) {
         for (int s = 0; s < NS; s++) {
-            mb_init(fullA(s), N_AW);
+            mb_init(fullA(s), FOLD ? N_DEC : N_AW);
             mb_init(emptyA(s), N_MMA / 32);
             mb_init(fullB(s), N_DEC);
             mb_init(emptyB(s), N_MMA / 32);
@@ -376,7 +398,7 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
         nst = min(nblk, kb0 + nblk_split) - kb0;
     };
 
-    if (tid >= N_MMA + N_DEC) {
+    if (!FOLD && tid >= N_MMA + N_DEC) {
         // ---------------- A warp: 16 A chunks and 4 scale chunks a lane per stage ----------------
         const int lane = tid - (N_MMA + N_DEC);
         const size_t arow = (size_t)K / 2, asrow = (size_t)K / 16;
@@ -413,10 +435,31 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
     if (tid >= N_MMA) {
         // ---------------- decode warps: one half-block a thread per stage ----------------
         const int d = tid - N_MMA, br = d >> 1, h = d & 1;
+        // FOLD: this thread's share of an A stage -- two of its 512 16-byte chunks, and one of its
+        // 128 scale rows -- in the A warp's addressing, then its cp.async arrival on fullA.
+        const size_t arow = (size_t)K / 2, asrow = (size_t)K / 16;
+        const unsigned char* asf_g = a + (size_t)M * arow;
+        auto load_a = [&](int s, int kb, int m0) {
+#pragma unroll
+            for (int u = 0; u < (BM * 4) / N_DEC; u++) {
+                const int c = d + N_DEC * u, r = c >> 2, ch = c & 3;
+                const bool ok = m0 + r < M;
+                cp16(smem_u32(&sm.a[s][swz(r, ch)]),
+                     a + (size_t)(ok ? m0 + r : 0) * arow + (size_t)kb * BKB + ch * 16,
+                     ok ? 16 : 0);
+            }
+            if (d < BM) {
+                const bool ok = m0 + d < M;
+                cp8(smem_u32(&sm.asf[s][d * 8]),
+                    asf_g + (size_t)(ok ? m0 + d : 0) * asrow + (size_t)kb * 8, ok ? 8 : 0);
+            }
+            mb_cp_arrive(fullA(s));
+        };
         int g = 0;
         for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
             int mt, leg, n0, kb0, nst;
             item(w, mt, leg, n0, kb0, nst);
+            const int m0 = mt * BM;
             const unsigned* wrow = reinterpret_cast<const unsigned*>(
                 L.w[leg] + (size_t)(n0 + br) * nblk * kBlkBytes + (size_t)kb0 * kBlkBytes);
             // Two stages an iteration (independent decode chains), their words (2h, 2h+1, 4+h and 6
@@ -439,6 +482,10 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
                 const int s0 = g % NS, s1 = (g + 1) % NS;
                 if (g >= NS) mb_wait(emptyB(s0), ((g / NS) - 1) & 1);
                 if (two && g + 1 >= NS) mb_wait(emptyB(s1), (((g + 1) / NS) - 1) & 1);
+                if constexpr (FOLD) {
+                    load_a(s0, kb0 + i, m0);
+                    if (two) load_a(s1, kb0 + i + 1, m0);
+                }
                 decode_half(tw[0], h, br, sm.lut, sm.b[s0], &sm.bsf[s0][br]);
                 if (two) decode_half(tw[1], h, br, sm.lut, sm.b[s1], &sm.bsf[s1][br]);
                 mb_arrive(fullB(s0));
@@ -472,7 +519,8 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
             mb_wait(fullA(s), par);
             mma_stage(sm.a[s], sm.asf[s], sm.b[s], sm.bsf[s], wm, wn, lane, acc);
             __syncwarp();
-            if (lane == 0) { mb_arrive(emptyA(s)); mb_arrive(emptyB(s)); }
+            // FOLD: emptyB alone releases the stage to the threads that refill both A and B.
+            if (lane == 0) { if (!FOLD) mb_arrive(emptyA(s)); mb_arrive(emptyB(s)); }
         }
         store_tile<RESID>(acc, L, leg, part, kb0 / nblk_split, M, mt * BM, n0, wm, wn, lane,
                           alpha);
@@ -591,23 +639,32 @@ bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, voi
     const float alpha = 1.f / kWScale;
     const int nitems = mtiles * tiles_n * splits;
     const int grid = nitems < sm_count() ? nitems : sm_count();
-    constexpr size_t smem = sizeof(Smem);
+    static const bool fold = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_FP4_FOLD_A");
+        return !(e && e[0] == '0');
+    }();
+    constexpr size_t smem_f = sizeof(Smem<Ring<true>::NS>), smem_s = sizeof(Smem<Ring<false>::NS>);
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<true>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<false>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<true, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_f);
+        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<false, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_f);
+        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<true, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_s);
+        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<false, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_s);
         attr = true;
     }
     const auto* A = static_cast<const unsigned char*>(a);
     float* P = splits > 1 ? part : nullptr;
-    if (resid && !P)
-        ptq1_fp4_gemm_kernel<true><<<grid, THREADS, smem, st>>>(A, m, k, L, P, per, mtiles,
-                                                                tiles_n, nitems, alpha);
-    else
-        ptq1_fp4_gemm_kernel<false><<<grid, THREADS, smem, st>>>(A, m, k, L, P, per, mtiles,
-                                                                 tiles_n, nitems, alpha);
+    const bool rk = resid && !P;
+#define PTQ1_FP4_GO(R_, F_)                                                                   \
+    ptq1_fp4_gemm_kernel<R_, F_><<<grid, Ring<F_>::THREADS, F_ ? smem_f : smem_s, st>>>(      \
+        A, m, k, L, P, per, mtiles, tiles_n, nitems, alpha)
+    if (fold) { if (rk) PTQ1_FP4_GO(true, true);  else PTQ1_FP4_GO(false, true);  }
+    else      { if (rk) PTQ1_FP4_GO(true, false); else PTQ1_FP4_GO(false, false); }
+#undef PTQ1_FP4_GO
     if (P) {
         for (int i = 0; i < nleg; i++) {
             const size_t n4 = (size_t)m * n[i] / 4;
