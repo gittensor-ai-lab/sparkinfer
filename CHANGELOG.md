@@ -5,12 +5,19 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.9] — 2026-10-03
+
 **llama.cpp "UD" dynamic-quant GGUFs load: unsloth's Qwen3.8-27B GGUFs work again.**
 - **Before:** unsloth now publishes only UD quants of Qwen3.8-27B. They mix in Q3_K, IQ4_NL, IQ3_S
   and IQ4_XS, which sparkinfer could neither size nor decode, so `Qwen3.8-27B-UD-Q4_K_M.gguf`
   failed to load.
 - **Now:** it loads, and against llama.cpp on the same file and GPU: decode 94.7 vs 83.1 tok/s
-  (+14%), prefill 4,538 vs 2,809 at 128 tokens and 8,756 vs 3,839 at 4K.
+  (+14%), prefill 4,538 vs 2,809 at 128 tokens and 8,756 vs 3,839 at 4K. Concurrent requests
+  decode packed: 608 / 938 tok/s of decode at 16 / 32 rows against llama.cpp's 621 / 763.
+- **Also fixed:** dense k-quant GGUFs (Qwythos-9B) no longer mix prefill and decode; since 0.6.4
+  their mixed steps' decode rows were less faithful than one forward per row (0.90-0.93 vs
+  0.97-0.98 agreement).
+
 
 ### Models
 
