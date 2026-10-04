@@ -5,6 +5,18 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Qwen3.6 batched decode +10% / +7% at 16 / 32 concurrent requests: the shared expert runs its
+  rows in one pass.** A packed step's shared expert went eight rows at a time -- at 32 rows four
+  launch triples (gate/up, quantize, down) per layer, each re-reading the shared expert's weights
+  and paying its own setup: 2.8 ms of a 14 ms step. It now takes one 16 / 24 / 32-row triple for
+  the bulk and the exact small kernels for the rest. Each row's dots are computed alone, in the
+  same order, so every output is unchanged. `SPARKINFER_SHEXP_ROWS_WIDE=0` restores the 8-row
+  chunks; `SPARKINFER_SHEXP_ROWS_MAX=16|24` caps the width.
+  - **Measured** (`qwen3_gguf_cb_bench`, Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): c16 1,938 -> 2,138,
+    c32 2,196 -> 2,340 tok/s; `packed_decode_check` at 16 / 24 rows matches one forward per row.
+
 ## [0.6.16] — 2026-10-04
 
 **Qwen3.6 short-prompt prefill another +5% at 128 tokens: Q4_K weights quantize in place too.**

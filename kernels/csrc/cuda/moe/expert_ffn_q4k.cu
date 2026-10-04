@@ -3812,19 +3812,60 @@ void launch_shared_expert_q8_mmvq_rows(
     int hidden, int ffn, int rows, cudaStream_t stream) {
     if (!input_q8 || !gate_q || !up_q || !down_q || !dw || !output || !h_scratch ||
         !h_q8_buf || hidden != 2048 || ffn != 512 || rows < 1) return;
-    // More than eight rows go eight at a time (each row is computed alone either way; the
-    // scratch is reused, the launches being in order on one stream). This returned without a
-    // word for 9+ rows, so a packed Qwen3.6 step of 9-32 rows added a stale shared expert.
+    // More than eight rows: one 16 / 24 / 32-row launch triple for the bulk, the exact <=8-row
+    // kernels for the rest. Each row's dots are computed alone, in the same order, whatever R is,
+    // so a row's result is the same in any chunk. Eight-row chunks were four launch triples at 32
+    // rows, each re-reading the shared expert and paying its own setup: 2.8 ms of a 14 ms packed
+    // Qwen3.6 step. SPARKINFER_SHEXP_ROWS_WIDE=0 restores the eight-row chunks.
+    static const bool wide = [] {
+        const char* e = getenv("SPARKINFER_SHEXP_ROWS_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    static const int wide_max = [] {
+        const char* e = getenv("SPARKINFER_SHEXP_ROWS_MAX");
+        const int v = e ? atoi(e) : 32;
+        return (v == 16 || v == 24) ? v : 32;
+    }();
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(input_q8);
     if (rows > 8) {
-        for (int r0 = 0; r0 < rows; r0 += 8)
+        const int cap = wide_max;
+        const int big = !wide ? 8 : (rows >= 32 && cap >= 32) ? 32 : (rows >= 24 && cap >= 24) ? 24
+                                  : rows >= 16 ? 16 : 8;
+        int r0 = 0;
+        if (big > 8) {
+            auto* hq0 = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
+            auto* out0 = reinterpret_cast<__nv_bfloat16*>(output);
+#define SI_SHARED_WIDE(R) do { \
+    shared_gate_up_q8_mmvq_rows_kernel<2048, 512, R><<<512, si_shexp_nw<2048, 32>() * 32, 0, stream>>>( \
+        q, reinterpret_cast<const unsigned char*>(gate_q), \
+        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch); \
+    quant_h_q8_1_kernel<<<((R * (512 >> 5)) + 7) / 8, 8 * 32, 0, stream>>>( \
+        h_scratch, hq0, R * (512 >> 5), 0); \
+    shared_down_q8_mmvq_rows_kernel<2048, 512, R><<<(2048 + WPB * 2 - 1) / (WPB * 2), WPB * 32, 0, stream>>>( \
+        hq0, reinterpret_cast<const unsigned char*>(down_q), out0); \
+} while (0)
+            if (big == 32) SI_SHARED_WIDE(32);
+            else if (big == 24) SI_SHARED_WIDE(24);
+            else SI_SHARED_WIDE(16);
+#undef SI_SHARED_WIDE
+            r0 = big;
+        }
+        if (r0 > 0 && rows - r0 > 8) {
+            // What a capped chunk left over goes round again (a 32-row step at cap 16: 16 + 16).
             launch_shared_expert_q8_mmvq_rows(
-                reinterpret_cast<const si_block_q8_1*>(input_q8) + (size_t)r0 * (hidden >> 5),
+                q + (size_t)r0 * (hidden >> 5), gate_q, up_q, down_q, dw + r0,
+                reinterpret_cast<__nv_bfloat16*>(output) + (size_t)r0 * hidden, h_scratch, h_q8_buf,
+                hidden, ffn, rows - r0, stream);
+            return;
+        }
+        for (; r0 < rows; r0 += 8)
+            launch_shared_expert_q8_mmvq_rows(
+                q + (size_t)r0 * (hidden >> 5),
                 gate_q, up_q, down_q, dw + r0,
                 reinterpret_cast<__nv_bfloat16*>(output) + (size_t)r0 * hidden, h_scratch, h_q8_buf,
                 hidden, ffn, rows - r0 < 8 ? rows - r0 : 8, stream);
         return;
     }
-    const auto* q = reinterpret_cast<const si_block_q8_1*>(input_q8);
     auto* hq = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
     auto* out = reinterpret_cast<__nv_bfloat16*>(output);
 #define SI_SHARED_ROWS(R) do { \
