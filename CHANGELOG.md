@@ -5,6 +5,22 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Qwen3.6's routed MoE reads each expert's weights about once per batched decode step, not once
+  per token routed to it.** At 32 concurrent requests a step's 256 (token, slot) pairs land on ~84
+  distinct experts in served chat traffic, but the gate/up and down kernels gave every pair its own
+  warps, so an expert's rows came from DRAM about three times. From 20 rows a step, one small
+  kernel counting-sorts the pairs by expert; the gate/up then runs a warp per (expert, 4 rows) over
+  all of that expert's pairs, and the Q5_K down does the same and sums each token's eight weighted
+  terms in slot order in a separate pass. Per layer at c32 (`cb_bench` corpus routing): gate/up
+  117 -> 95 us, down 69 -> 62 + 2 us; `cb_bench` c32 ITL 13.02 -> 11.62 ms. Served chat c32
+  1,772 -> 1,868 output tok/s; c4 / c16 and 8K prompts unchanged. The gate/up output is
+  bit-identical to the per-pair kernel; the down sums the same terms in another order (within bf16
+  rounding, deterministic). New GPU test `moe_gate_up_group_gpu_test`.
+  `SPARKINFER_MOE_GU_ROWS_MIN` (default 20) sets the row floor, `SPARKINFER_MOE_GU_SORT=0` /
+  `SPARKINFER_MOE_DOWN_GROUP=0` keep the per-pair kernels.
+
 ## [0.6.21] — 2026-10-04
 
 **Batched decode on Q4_K GGUFs: the dense projections run ~1.3-1.5x faster at 16-32 rows.**
