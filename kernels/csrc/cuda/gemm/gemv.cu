@@ -4468,6 +4468,116 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
             }
 }
 
+// ---- Q4_K x Q8_1 rows on the int8 tensor cores, register-direct ----
+// si_mmvq_q4k_mma_kernel stages each CTA's activation and weight tile through shared memory for a
+// single super-block and synchronises around it; at 32 rows that staging alone measured ~75% of
+// the kernel (q4k_rows_bench: 15.5 of ~20 us on an 8192 x 2048 projection with the math removed),
+// and the kernel reached 360-480 GB/s. Here each warp owns 16 weight rows -- the mma A operand --
+// for every token (8-row B tiles) across a run of whole super-blocks, and loads both operands
+// straight into registers: one 32-bit word of a Q4_K quant plane carries two sub-blocks' nibbles
+// for four K values, so a mask or a shift is the int8 operand, and the activations are the same
+// ~70 KB every warp reads, so they come from L1. No shared memory, no block barrier, and warps are
+// independent, so split-K buys the parallelism that hides the DRAM latency. Same fold-in as the
+// staged kernel: ((dm.x * sc) * Ad) * dot - (dm.y * m) * Asum per 32-value group. Partials go to
+// the same split-K accumulator and epilogue.
+template <int NT8, int RT>
+__global__ __launch_bounds__(128) void si_q4k_rows_mma2_kernel(
+    const si_block_q8_1* __restrict__ q, const unsigned char* __restrict__ W,
+    float* __restrict__ acc_out, int M, int N, int K) {
+    // RT 16-row weight tiles per warp: every activation fragment and scale a warp loads feeds RT
+    // mma instead of one.
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    const int n0 = (blockIdx.x * 4 + warp) * 16 * RT;
+    if (n0 >= N) return;
+    const int nsb = K >> 8, nb32 = K >> 5;
+    const int S = (int)gridDim.y, sp = (int)blockIdx.y;
+    const int sb_lo = (nsb * sp) / S, sb_hi = (nsb * (sp + 1)) / S;
+    const si_block_q4_K* wr[RT][2];
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = n0 + r * 16 + grp + h * 8;
+            wr[r][h] = reinterpret_cast<const si_block_q4_K*>(W + (size_t)(row < N ? row : N - 1) * nsb * 144);
+        }
+    float facc[RT][NT8][4];
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+        for (int t = 0; t < NT8; ++t) facc[r][t][0] = facc[r][t][1] = facc[r][t][2] = facc[r][t][3] = 0.f;
+    for (int sb = sb_lo; sb < sb_hi; ++sb) {
+        unsigned qw[RT][2][4][2];
+        float2 dm[RT][2];
+        unsigned sc[RT][2][2], mn[RT][2][2];
+#pragma unroll
+        for (int r = 0; r < RT; ++r)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const si_block_q4_K* bk = wr[r][h] + sb;
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    qw[r][h][p][0] = *reinterpret_cast<const unsigned*>(bk->qs + 32 * p + tig * 4);
+                    qw[r][h][p][1] = *reinterpret_cast<const unsigned*>(bk->qs + 32 * p + 16 + tig * 4);
+                }
+                dm[r][h] = __half22float2(bk->dm);
+                si_am_scales8(bk->scales, sc[r][h], mn[r][h]);
+            }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int p = j >> 1, sh = (j & 1) * 4, bs = 8 * (j & 3);
+            const unsigned m4 = 0x0f0f0f0fu;
+            const int kb = sb * 8 + j;
+#pragma unroll
+            for (int t = 0; t < NT8; ++t) {
+                const int tok = t * 8 + grp;
+                unsigned bf0 = 0, bf1 = 0;
+                if (tok < M) {
+                    const si_block_q8_1* x = q + (size_t)tok * nb32 + kb;
+                    bf0 = *reinterpret_cast<const unsigned*>(x->qs + tig * 4);
+                    bf1 = *reinterpret_cast<const unsigned*>(x->qs + 16 + tig * 4);
+                }
+                const int ta = t * 8 + tig * 2, tb = ta + 1;
+                float2 da = make_float2(0.f, 0.f), db = make_float2(0.f, 0.f);
+                if (ta < M) da = __half22float2((q + (size_t)ta * nb32 + kb)->ds);
+                if (tb < M) db = __half22float2((q + (size_t)tb * nb32 + kb)->ds);
+#pragma unroll
+                for (int r = 0; r < RT; ++r) {
+                    const unsigned a0 = (qw[r][0][p][0] >> sh) & m4, a1 = (qw[r][1][p][0] >> sh) & m4;
+                    const unsigned a2 = (qw[r][0][p][1] >> sh) & m4, a3 = (qw[r][1][p][1] >> sh) & m4;
+                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, "
+                                 "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bf0), "r"(bf1));
+                    const float sw0 = dm[r][0].x * (float)((sc[r][0][j >> 2] >> bs) & 0xFFu);
+                    const float mw0 = dm[r][0].y * (float)((mn[r][0][j >> 2] >> bs) & 0xFFu);
+                    const float sw1 = dm[r][1].x * (float)((sc[r][1][j >> 2] >> bs) & 0xFFu);
+                    const float mw1 = dm[r][1].y * (float)((mn[r][1][j >> 2] >> bs) & 0xFFu);
+                    facc[r][t][0] += sw0 * da.x * (float)c0 - mw0 * da.y;
+                    facc[r][t][1] += sw0 * db.x * (float)c1 - mw0 * db.y;
+                    facc[r][t][2] += sw1 * da.x * (float)c2 - mw1 * da.y;
+                    facc[r][t][3] += sw1 * db.x * (float)c3 - mw1 * db.y;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+        for (int t = 0; t < NT8; ++t) {
+            const int ta = t * 8 + tig * 2, tb = ta + 1;
+            const int ra = n0 + r * 16 + grp, rb = ra + 8;
+            if (ra < N) {
+                if (ta < M) atomicAdd(acc_out + (size_t)ta * N + ra, facc[r][t][0]);
+                if (tb < M) atomicAdd(acc_out + (size_t)tb * N + ra, facc[r][t][1]);
+            }
+            if (rb < N) {
+                if (ta < M) atomicAdd(acc_out + (size_t)ta * N + rb, facc[r][t][2]);
+                if (tb < M) atomicAdd(acc_out + (size_t)tb * N + rb, facc[r][t][3]);
+            }
+        }
+}
+
 // Narrows the split-K accumulator into the caller's bf16 output and re-zeroes what it consumed,
 // which is what lets the accumulator be a static buffer with no per-call memset.
 __global__ void si_mmvq_q4k_mma_epilogue_kernel(float* __restrict__ acc,
@@ -4604,6 +4714,47 @@ static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void
     float* acc = nullptr;
     if (cudaGetSymbolAddress(reinterpret_cast<void**>(&acc), si_am_acc) != cudaSuccess) return false;
     acc += (size_t)slot * (size_t)SI_AM_MMAX * (size_t)SI_AM_NACC;
+    // Register-direct arm (si_q4k_rows_mma2_kernel). Split K so the device holds ~16 warps an SM.
+    // SPARKINFER_Q4K_MMA2=0 keeps the staged kernel; SPARKINFER_Q4K_MMA2_SPLITS pins the split.
+    static const int mma2 = [] {
+        const char* e = getenv("SPARKINFER_Q4K_MMA2");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    static const int mma2_splits = [] {
+        const char* e = getenv("SPARKINFER_Q4K_MMA2_SPLITS");
+        return e ? atoi(e) : 0;
+    }();
+    static const int mma2_rt = [] {
+        const char* e = getenv("SPARKINFER_Q4K_MMA2_RT");
+        const int v = e ? atoi(e) : 2;
+        return (v == 1 || v == 4) ? v : 2;
+    }();
+    static const int mma2_target = [] {
+        const char* e = getenv("SPARKINFER_Q4K_MMA2_WARPS");
+        const int v = e ? atoi(e) : 1024;
+        return v > 0 ? v : 1024;
+    }();
+    if (mma2 && !(N % (16 * mma2_rt))) {
+        const int warps = N / (16 * mma2_rt);
+        int S = mma2_splits > 0 ? mma2_splits : (mma2_target + warps - 1) / warps;
+        if (S < 1) S = 1;
+        if (S > nblk) S = nblk;
+        const dim3 g((warps + 3) / 4, S), b(128);
+        const si_block_q8_1* qa = reinterpret_cast<const si_block_q8_1*>(q81);
+        const unsigned char* wa = reinterpret_cast<const unsigned char*>(W);
+#define SI_MMA2(NT8_) do { if (mma2_rt == 2) si_q4k_rows_mma2_kernel<NT8_, 2><<<g, b, 0, stream>>>(qa, wa, acc, M, N, K); \
+                          else if (mma2_rt == 4) si_q4k_rows_mma2_kernel<NT8_, 4><<<g, b, 0, stream>>>(qa, wa, acc, M, N, K); \
+                          else si_q4k_rows_mma2_kernel<NT8_, 1><<<g, b, 0, stream>>>(qa, wa, acc, M, N, K); } while (0)
+        if (M <= 8)       SI_MMA2(1);
+        else if (M <= 16) SI_MMA2(2);
+        else if (M <= 24) SI_MMA2(3);
+        else              SI_MMA2(4);
+#undef SI_MMA2
+        const size_t n = (size_t)M * (size_t)N;
+        si_mmvq_q4k_mma_epilogue_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(
+            acc, reinterpret_cast<__nv_bfloat16*>(y), n);
+        return true;
+    }
     {
         // The split that kept the grid a whole wave has to grow as CG divides its N extent.
         const int nsk2 = (cg >= 4 && nsk * 2 <= (K >> 8)) ? nsk * 2 : nsk;

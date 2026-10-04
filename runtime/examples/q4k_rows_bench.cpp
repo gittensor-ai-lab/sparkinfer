@@ -18,6 +18,8 @@
 #include <cstring>
 #include <random>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 namespace {
 struct Shape { const char* name; int n, k; };
@@ -78,6 +80,31 @@ int main(int argc, char** argv) {
             cudaMalloc(&da, ha.size()); cudaMemcpy(da, ha.data(), ha.size(), cudaMemcpyHostToDevice);
             cudaMalloc(&dy, (size_t)m * s.n * 2);
             bool ok = true;
+            // Q4K_BENCH_CHECK=1: the timed arm's output against the exact MMVQ rows kernel (rows
+            // issued four at a time, under the tensor-core floor), as max |diff| / max |ref|.
+            if (getenv("Q4K_BENCH_CHECK")) {
+                void* dref = nullptr; cudaMalloc(&dref, (size_t)m * s.n * 2);
+                const size_t row_q81 = (size_t)(s.k / 32) * 36;
+                for (int r0 = 0; r0 < m; r0 += 4)
+                    ok = ok && sparkinfer::kernels::launch_mmvq_rows(
+                                   12, static_cast<char*>(da) + r0 * row_q81, dw[0],
+                                   static_cast<char*>(dref) + (size_t)r0 * s.n * 2,
+                                   m - r0 < 4 ? m - r0 : 4, s.n, s.k, st);
+                ok = ok && sparkinfer::kernels::launch_mmvq_rows(12, da, dw[0], dy, m, s.n, s.k, st);
+                cudaStreamSynchronize(st);
+                std::vector<__half> hr((size_t)m * s.n), hy((size_t)m * s.n);
+                std::vector<unsigned short> br((size_t)m * s.n), by((size_t)m * s.n);
+                cudaMemcpy(br.data(), dref, br.size() * 2, cudaMemcpyDeviceToHost);
+                cudaMemcpy(by.data(), dy, by.size() * 2, cudaMemcpyDeviceToHost);
+                auto bf = [](unsigned short v) { unsigned u = (unsigned)v << 16; float f; memcpy(&f, &u, 4); return f; };
+                double md = 0, mr = 0;
+                for (size_t i = 0; i < br.size(); ++i) {
+                    md = std::max(md, (double)fabsf(bf(br[i]) - bf(by[i])));
+                    mr = std::max(mr, (double)fabsf(bf(br[i])));
+                }
+                printf("  %-11s M=%-3d check: max|diff| %.4g  max|ref| %.4g  rel %.2e\n", s.name, m, md, mr, md / (mr > 0 ? mr : 1));
+                cudaFree(dref);
+            }
             for (int i = 0; i < copies; ++i)
                 ok = ok && sparkinfer::kernels::launch_mmvq_rows(12, da, dw[i], dy, m, s.n, s.k, st);
             cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
