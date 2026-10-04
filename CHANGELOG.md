@@ -5,6 +5,20 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.19] — 2026-10-04
+
+**Fix: a request with token ids outside the model's vocabulary no longer takes the server down.**
+
+### Fixes
+
+- **Out-of-vocabulary token ids are refused with a 400 instead of losing the CUDA context**
+  (#1292). The embedding kernels index the table by token id unchecked, so an id past the last
+  row read beyond it: an illegal address that killed the device context, after which every
+  request failed until a restart. A server started with another model's tokenizer hits it on
+  the first request -- Muse Glimmer (202,048 rows) with Qwen3.8's tokenizer (248K ids) crashed
+  on AIPerf's first prompt. Requests are now checked against the vocabulary when they are
+  submitted; the offending one gets `400`, the server keeps serving.
+
 ## [0.6.18] — 2026-10-04
 
 **Qwen3.8 serving: the KV pool takes the device memory left free after startup. 16 concurrent
