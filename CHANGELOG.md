@@ -5,6 +5,34 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.20] — 2026-10-04
+
+**Qwen3.6 serving at 16 / 32 concurrent requests +12% / +13%: bigger mixed steps for MoE models and
+the shared expert on the int8 tensor cores.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, a distinct prompt set per cell,
+  Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): 906 / 1,517 / 1,716 output tok/s at 4 / 16 / 32 requests
+  (0.6.19: 902 / 1,355 / 1,523). vLLM 0.30.0 on nvidia/Qwen3.6-35B-A3B-NVFP4, same workload:
+  666 / 1,686 / 2,367 -- it still leads at 16 and 32 requests; sparkinfer leads at 4 and on
+  8K-token prompts at 4 (494 vs 450).
+
+### Performance
+
+- **An MoE model's mixed steps carry up to 4096 prompt tokens** (#1294). A mixed step's prompt
+  chunk routes to nearly every expert, so the step streams the whole expert set (~19.5 GB on
+  Qwen3.6) whatever its size; at the 1024-token budget that was paid per 1K prompt tokens. Dense
+  models keep 1024; `SPARKINFER_MIXED_CHUNK` overrides both. Chat c16 / c32 1,355 / 1,523 ->
+  1,468 / 1,654 tok/s.
+- **Qwen3.6's Q8_0 shared expert runs a packed step's 9-32 rows on the int8 tensor cores**
+  (#1295). The rows kernels walked every row's activation past each weight block one dependent dot
+  at a time -- ~110 us a layer, 4.4 ms of GPU time in a 32-row step. `mma.m16n8k32` takes 16 rows x
+  8 outputs x one Q8_0 block per instruction; the block dots are exact and the split-K partials sum
+  in a fixed order. `cb_bench` c32 ITL 13.0 -> 12.2 ms; serving c16 / c32 1,468 / 1,654 -> 1,517 /
+  1,716. `SPARKINFER_SHEXP_MMA=0` keeps the rows kernels.
+- **The prefill arena is kept up to 2 GB** (#1296), so those 4096-token mixed passes (up to ~1.8 GB
+  of scratch on Qwen3.6) stop handing it back and re-allocating it every pass: 130 of 461 passes
+  did, ~1,800 device-syncing `cudaFree` calls a run. `SPARKINFER_PREFILL_ARENA_KEEP_MB` moves the
+  limit.
+
 ## [0.6.19] — 2026-10-04
 
 **Fix: a request with token ids outside the model's vocabulary no longer takes the server down.**
