@@ -1690,6 +1690,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (getenv("SPARKINFER_PREFILL_MOE_FUSED") || getenv("SPARKINFER_PREFILL_MOE_SERIAL")) return false;
         // The 32 / 64-row tiles exist only in the kernel's 64-row-block form.
         if (const char* bn = getenv("SPARKINFER_QM_BM16_BN")) if (atoi(bn) == 128) return false;
+        // ... and only while the fused GEMM runs at all: past SPARKINFER_PREFILL_MOE_QB_MAXCTX
+        // (moe_qb_avail below) the prefill materializes, and those kernels read 16 / 128-row maps.
+        const char* mc = getenv("SPARKINFER_PREFILL_MOE_QB_MAXCTX");
+        const int maxctx = (mc && atoi(mc) > 0) ? atoi(mc) : 8192;
+        if (N > maxctx) return false;
         auto qt_ok = [](int t) { return t == 12 || t == 13 || t == 14; };
         for (const Qwen35LayerWeights& lw : s.w.layers)
             if (!qt_ok(lw.gate_qtype) || !qt_ok(lw.up_qtype) || !qt_ok(lw.down_qtype)) return false;

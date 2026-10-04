@@ -10,6 +10,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdio>
 #include <cuda_pipeline.h>
 #include <mma.h>
 
@@ -935,6 +936,13 @@ void launch_pfm_moe_gemm_i8_bm_base(const signed char* A_i8, const float* sx,
                                     void* C_bf16, float* out_f32,
                                     int N_out, int K, int max_tiles, int bm, int e_base,
                                     bool a_indirect, bool c_scatter, cudaStream_t stream) {
+    // Only 16- and 128-row tilemaps exist for these kernels (the 32 / 64-row ones feed only the
+    // fused quantized-B GEMM, prefill_moe_q.cu). Anything else would be indexed as 128-row tiles,
+    // i.e. read the wrong tokens; refuse loudly instead.
+    if (bm != PM_BM_SHORT && bm != PM_BM) {
+        fprintf(stderr, "[prefill-moe] launch_pfm_moe_gemm_i8_bm: unsupported tile height %d\n", bm);
+        return;
+    }
     dim3 grid((N_out + PM_BN - 1) / PM_BN, max_tiles);
     auto* C = reinterpret_cast<__nv_bfloat16*>(C_bf16);
     if (bm == PM_BM_SHORT) {
