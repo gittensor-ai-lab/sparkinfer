@@ -227,6 +227,10 @@ Time to first token in ms (p50 / p90 / p99):
   p99 is 5.9 / 7.2 / 7.5 s against vLLM's 7.8 / 10.3 / 11.3.
 - **Still behind:** time to first token in the 8K-prompt cells at 16+ requests, 1.6 / 14.2 s p50
   against vLLM's 1.2 / 12.4.
+- **Smaller `--ctx`:** the KV pool grows into the memory left free after startup (0.6.18), so it
+  no longer caps concurrency at one `--ctx` of tokens. At `--ctx 32768` without a drafter, 0.6.18
+  against vLLM 0.30.0: chat 321 / 900 / 1,260 vs 271 / 862 / 1,239 tok/s at 4 / 16 / 32 requests,
+  8K prompts 204 / 303 vs 187 / 306 at 4 / 16.
 
 ### Same weights, GGUF on both sides
 

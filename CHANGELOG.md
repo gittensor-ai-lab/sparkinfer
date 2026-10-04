@@ -5,6 +5,36 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.18] — 2026-10-04
+
+**Qwen3.8 serving: the KV pool takes the device memory left free after startup. 16 concurrent
+8K-token prompts 159 -> 303 tok/s (TTFT p50 21.4 -> 1.6 s); chat at 32 requests 1,027 -> 1,260.**
+- **Now** (AIPerf streaming, `ignore_eos`, 256-token answers, Qwen3.8-27B NVFP4, `--ctx 32768`,
+  no speculation either side, RTX 5090), output tok/s against vLLM 0.30.0 on the same checkpoint:
+  chat (1K prompts) 321 / 900 / 1,260 vs 271 / 862 / 1,239 at 4 / 16 / 32 requests; 8K prompts
+  204 / 303 vs 187 / 306 at 4 / 16.
+
+### Performance
+
+- **The server's KV pool grows into the device memory left free once the target, draft and
+  vision tower are loaded** (#1290). It was sized to exactly one `--ctx` -- 32K tokens at
+  `--ctx 32768` -- which admits about three concurrent 8K-token requests while ~10 GiB of a 32 GB
+  card sits unused, so 16 concurrent 8K prompts queued for over 20 s. The idle pool is re-sized
+  before the first request to leave `SPARKINFER_KV_HEADROOM_GIB` (default 6) free for the
+  packed-decode graphs and batched-prefill scratch, and the prefix cache is rebuilt around it:
+  32,896 -> 153,904 tokens on Qwen3.8-27B at `--ctx 32768`. `SPARKINFER_KV_GROW=0` keeps the
+  `--ctx`-sized pool. A 4 GiB headroom (215K tokens) measured no better and peaked at 32.1 GB.
+  - **Measured** (before -> after, tok/s): chat c16 829 -> 900, c32 1,027 -> 1,260 (TTFT p50
+    1,358 -> 370 ms); 8K c4 153 -> 204, c16 159 -> 303.
+
+### Tools
+
+- **`SPARKINFER_CB_BENCH_DISTINCT=1`** gives every `qwen3_gguf_cb_bench` stream its own prompt
+  (#1289). With the shared prompt, greedy decoding keeps all rows identical, so an MoE step routes
+  every row to the same experts and looks cheaper than real traffic (Qwen3.6 c16 2,246 vs 1,946
+  tok/s). **`NVFP4_BENCH=1 nvfp4_gemm_check`** times the block-scaled GEMM at Qwen3.8's shapes with
+  DRAM-cold weights.
+
 ## [0.6.17] — 2026-10-04
 
 **Qwen3.6 batched decode +10% / +7% at 16 / 32 concurrent requests: the shared expert runs a
