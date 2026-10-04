@@ -1758,8 +1758,9 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
 // generation_config (temperature 1.0 on Qwen3.8), almost every server request then decoded one
 // forward per sequence: aggregate throughput stayed at single-stream speed at any concurrency.
 // A declined batch just falls back to the sequential loop.
-// MIXED STEPS (SPARKINFER_MIXED_CHUNK=<tokens> per step, default 1024, 0 = off). While requests
-// decode and prompts wait, the decode step carries chunks of those prompts in the same forward:
+// MIXED STEPS (SPARKINFER_MIXED_CHUNK=<tokens> per step, default 1024 and 4096 on an MoE model,
+// 0 = off). While requests decode and prompts wait, the decode step carries chunks of those
+// prompts in the same forward:
 // the decode rows ride the chunks' weight reads instead of stalling behind prefill passes of their
 // own. The step's prompt tokens are filled oldest prompt first, as vLLM fills its token budget --
 // one prompt at a time left the rest queued behind it, which is what set the TTFT tail at c16/c32.
@@ -1770,10 +1771,19 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
 void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefill_ids, int n_decode,
                                               std::vector<MixChunk>& chunks,
                                               std::vector<uint64_t>& unmixable) {
-    static const int budget = [] {
+    // An MoE model takes 4096. Its step's chunk routes to nearly every expert, so each mixed step
+    // streams the whole expert set whatever the chunk size: at 1024 tokens that was ~24 ms of
+    // grouped MoE GEMM per 1K prompt tokens, and fewer, larger steps carry the same prompts for a
+    // fraction of the weight traffic. Measured on Qwen3.6-35B-A3B UD-Q4_K_M, AIPerf chat (1024 /
+    // 256, distinct prompts): c16 1,355 -> 1,476, c32 1,523 -> 1,648 output tok/s; 8K prompts c16
+    // 556 -> 578; c4 (no mixing) unchanged. 8192 measured the same as 4096 with a slower first
+    // token. Dense models keep 1024.
+    static const int env_budget = [] {
         const char* e = getenv("SPARKINFER_MIXED_CHUNK");
-        return e ? std::max(0, atoi(e)) : 1024;
+        return e ? std::max(0, atoi(e)) : -1;
     }();
+    const int budget = env_budget >= 0 ? env_budget
+                     : (model_ && model_->config().n_experts > 1 ? 4096 : 1024);
     // At most this many prompts in one step (SPARKINFER_MIXED_PROMPTS).
     static const int max_prompts = [] {
         const char* e = getenv("SPARKINFER_MIXED_PROMPTS");
