@@ -275,18 +275,18 @@ Full tables: [`bench/competitors/latest-results.md`](bench/competitors/latest-re
 [`bench/quality/README.md`](bench/quality/README.md).
 
 Serving concurrent requests (AIPerf, streaming chat 1024 / 256 with `ignore_eos`, a distinct
-prompt set per cell, RTX 5090). sparkinfer 0.6.20 serves the UD-Q4_K_M GGUF, `llama-server`
+prompt set per cell, RTX 5090). sparkinfer 0.6.21 serves the UD-Q4_K_M GGUF, `llama-server`
 (llama.cpp `436f6f8`, `-np 32 -fa on`, measured on 0.6.17's run) the same file, and vLLM 0.30.0
 its best format on this card, `nvidia/Qwen3.6-35B-A3B-NVFP4`:
 
 | requests | output tok/s | TTFT p50 (ms) | ITL p50 (ms) |
 |---:|---:|---:|---:|
 | | **sparkinfer** / llama.cpp / vLLM | **sparkinfer** / llama.cpp / vLLM | **sparkinfer** / llama.cpp / vLLM |
-| 4 | **906** / 339 / 666 | 182 / 1,329 / **176** | **3.8** / 7.2 / 5.3 |
-| 16 | 1,517 / 372 / **1,686** | **321** / 2,493 / 398 | 9.4 / 33.2 / **7.9** |
-| 32 | 1,716 / 404 / **2,367** | **449** / 2,436 / 521 | 17.3 / 69.0 / **11.6** |
+| 4 | **903** / 339 / 666 | **154** / 1,329 / 176 | **3.8** / 7.2 / 5.3 |
+| 16 | 1,564 / 372 / **1,686** | **314** / 2,493 / 398 | 9.1 / 33.2 / **7.9** |
+| 32 | 1,773 / 404 / **2,367** | **412** / 2,436 / 521 | 16.9 / 69.0 / **11.6** |
 
-8K-token prompts, 4 / 16 requests: sparkinfer **494** / 584 tok/s, vLLM 450 / **652**. vLLM
+8K-token prompts, 4 / 16 requests: sparkinfer **501** / 599 tok/s, vLLM 450 / **652**. vLLM
 still leads Qwen3.6 at 16+ concurrent requests: a step that admits waiting prompts costs
 sparkinfer several decode steps, which is where the remaining gap is being worked on.
 

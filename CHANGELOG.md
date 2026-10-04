@@ -5,6 +5,33 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.21] — 2026-10-04
+
+**Batched decode on Q4_K GGUFs: the dense projections run ~1.3-1.5x faster at 16-32 rows.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 903 / 1,564 / 1,773 output tok/s at 4 / 16 / 32 requests (0.6.20: 906 /
+  1,517 / 1,716; vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 / 2,367); 8K-token prompts 501 / 599 at
+  4 / 16 (vLLM 450 / 652).
+
+### Performance
+
+- **Packed Q4_K row projections load both operands straight into registers, 32 weight rows a
+  warp** (#1299). The tensor-core rows kernel staged each CTA's tiles through shared memory for a
+  single super-block -- ~75% of its time at 32 rows -- and ran at 360-480 GB/s. The new kernel
+  keeps two m16n8k32 weight tiles per warp across whole super-blocks with no shared memory or block
+  barrier: 8192 x 2048 at 32 rows 19.7 -> 13.3 us, 2048 x 4096 13.2 -> 8.7 us; faster at 8-32 rows.
+  Same fold-in and accumulator, output within bf16 rounding of the exact MMVQ.
+  `cb_bench` c32 ITL: Qwen3.6 12.28 -> 11.87 ms, Qwen3.8 UD GGUF 26.04 -> 25.02 ms.
+  `SPARKINFER_Q4K_MMA2=0` keeps the staged kernel.
+- **The tensor-core split-K slot covers a 32-row FFN gate / up** (#1300): Qwen3.8's 17408-wide and
+  Muse Glimmer's 19968-wide projections ran as two 16-row launches, each reading the weight; now one
+  (17408 x 5120 at 32 rows: 76 -> 55.5 us).
+
+### Tools
+
+- **`q4k_rows_bench`** (#1298) times the packed-decode Q4_K row projections DRAM-cold at Qwen3.6
+  or Qwen3.8 (`Q4K_BENCH_SHAPES=q38`) shapes; `Q4K_BENCH_CHECK=1` compares against the exact MMVQ.
+
 ## [0.6.20] — 2026-10-04
 
 **Qwen3.6 serving at 16 / 32 concurrent requests +12% / +13%: bigger mixed steps for MoE models and
