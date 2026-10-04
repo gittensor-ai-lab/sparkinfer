@@ -849,7 +849,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     constexpr int C = 32, HD = 128, PREP_THREADS = 256;
     // State columns per scan block. JC_S is the shape every context used before; JC_B halves the
     // grid — see use_big below for why that is the whole point at long context.
-    constexpr int JC_S = 32, JC_B = 64;
+    constexpr int JC_S = 32, JC_B = 64, JC_T = 16;
 
     static const int enabled = [] {
         const char* e = getenv("SPARKINFER_PREFILL_GDN_CHUNK");
@@ -952,6 +952,16 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                           gdnc_scan_smem_ok<C, HD, JC_S, true>(dev);
     const bool use_big = !use_regs && spills && n_tokens >= bigjc_minctx &&
                          gdnc_scan_smem_ok<C, HD, JC_B>(dev);
+    // The opposite case: the JC_S grid does not even fill the device once (Qwen3.6-35B-A3B: 32
+    // v-heads x 4 = 128 blocks on 170 SMs), and each block walks every chunk serially. Halving the
+    // state columns per block doubles the blocks; a column's arithmetic does not depend on which
+    // block owns it. SPARKINFER_PREFILL_GDN_SCAN_THIN=0 keeps JC_S.
+    static const bool thin_on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_SCAN_THIN");
+        return !(e && e[0] == '0');
+    }();
+    const bool use_thin = thin_on && !use_regs && !use_big && sms > 0 &&
+                          v_heads * (HD / JC_S) < sms && gdnc_scan_smem_ok<C, HD, JC_T>(dev);
 
     auto db = reinterpret_cast<const __nv_bfloat16*>(dt);
     auto aa = reinterpret_cast<const __nv_bfloat16*>(a);
@@ -963,6 +973,8 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     static_assert(C * JC_S == (C * JC_S / 4) * 4 && HD * JC_S == (C * JC_S / 4) * 16, "JC_S tiling");
     static_assert(C * JC_B == (C * JC_B / 4) * 4 && HD * JC_B == (C * JC_B / 4) * 16, "JC_B tiling");
     static_assert(HD % JC_S == 0 && HD % JC_B == 0, "JC must divide the state rows");
+    static_assert(C * JC_T == (C * JC_T / 4) * 4 && HD * JC_T == (C * JC_T / 4) * 16 && HD % JC_T == 0,
+                  "JC_T tiling");
 
     // One sequence-slice: workspace is O(len). carry=0 zeros S (fresh prefill);
     // carry=1 reloads the state the previous slice wrote.
@@ -992,6 +1004,12 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
             pf_gdnc_scan_kernel<C, HD, JC_S, true>
                 <<<dim3(v_heads, HD / JC_S), (C * JC_S) / 4,
                    gdnc_scan_smem<C, HD, JC_S, true>(), stream>>>(
+                    qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
+                    len, q_heads, v_heads, n_chunks, qh_block, carry);
+        } else if (use_thin) {
+            pf_gdnc_scan_kernel<C, HD, JC_T>
+                <<<dim3(v_heads, HD / JC_T), (C * JC_T) / 4,
+                   gdnc_scan_smem<C, HD, JC_T>(), stream>>>(
                     qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
                     len, q_heads, v_heads, n_chunks, qh_block, carry);
         } else if (use_big) {
