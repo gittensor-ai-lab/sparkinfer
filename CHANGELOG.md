@@ -5,6 +5,20 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Qwen3.6 prefill +7% at 512 tokens and +12% at 1K: MoE tiles sized to the experts' load.** The
+  routed MoE GEMM gave each expert one block per 16 of its tokens (one per 128 above 512 tokens),
+  and every block decodes and reads that expert's whole weight slice. At 512 tokens an expert
+  averages 16 tokens, so ~43% of experts took two blocks and read their weights twice. The fused
+  quantized GEMM now runs 32-row tiles up to 512 tokens and 64-row tiles up to 3,072 -- two or four
+  16-row MMA tiles sharing every decoded super-block -- whenever it covers all three weights of
+  every layer (otherwise the 16 / 128-row paths are unchanged). Per-row arithmetic is the same: with
+  `SPARKINFER_DETERMINISTIC=1` the prefill check's KL is identical to the bit.
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 15,396 / 20,953 / ~26,300 ->
+    16,540 / 23,370 / 27,342 tok/s at 512 / 1K / 2K tokens; 128 and 4K+ unchanged.
+    `SPARKINFER_PREFILL_MOE_BM=16|32|64|128` pins the height.
+
 ## [0.6.14] — 2026-10-04
 
 **Qwen3.6 short-prompt prefill another +12% / +8%: Q8_0 weights quantize in place.**

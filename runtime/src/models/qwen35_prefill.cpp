@@ -1680,10 +1680,30 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const int P = moe ? N * topk : 0;                          // routed (token, expert) pairs
     // Short-N: BM=16 fills the tile (avg pairs/expert = N*8/256 = N/32; at 512 → 16).
     // Long-N: BM=128. Override with SPARKINFER_PREFILL_MOE_BM={16,128}.
+    // 32-row tiles (prefill_moe_q.cu's bm16 kernel at BM = 32) only feed the fused quantized-B
+    // GEMM; every other routed path reads a 16- or 128-row tilemap. So they need that GEMM to take
+    // all three weights of every layer: the row scales present, the default all-weights mask, and
+    // only types it decodes.
+    const bool moe_bm32_ok = moe && s.moe_rs_gate && s.moe_rs_up && s.moe_rs_down && [&]{
+        const char* m = getenv("SPARKINFER_PREFILL_MOE_QB");
+        if (m && atoi(m) != 7) return false;
+        if (getenv("SPARKINFER_PREFILL_MOE_FUSED") || getenv("SPARKINFER_PREFILL_MOE_SERIAL")) return false;
+        auto qt_ok = [](int t) { return t == 12 || t == 13 || t == 14; };
+        for (const Qwen35LayerWeights& lw : s.w.layers)
+            if (!qt_ok(lw.gate_qtype) || !qt_ok(lw.up_qtype) || !qt_ok(lw.down_qtype)) return false;
+        return true;
+    }();
     const int moe_bm = [&]{
         if (!moe) return 128;
         const char* e = getenv("SPARKINFER_PREFILL_MOE_BM");
-        if (e) { int v = atoi(e); return (v == 16) ? 16 : 128; }
+        if (e) {
+            const int v = atoi(e);
+            return (v == 16) ? 16 : ((v == 32 || v == 64) && moe_bm32_ok) ? v : 128;
+        }
+        // With the fused GEMM covering every weight, the tile height follows the pairs per expert
+        // (N * top_k / E: 16 at 512 tokens on Qwen3.6): 32-row tiles up to 512 tokens, 64-row up to
+        // 3072 (measured crossover against the 128-row kernel), 128 beyond.
+        if (moe_bm32_ok && N <= 3072) return (N <= 512) ? 32 : 64;
         return (N <= 512) ? 16 : 128;
     }();
     const int max_tiles = moe ? (P + moe_bm - 1) / moe_bm + E : 0;
@@ -1738,7 +1758,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (sparkinfer::deterministic_mode()) return false;
         const char* e = getenv("SPARKINFER_PREFILL_MOE_SERIAL");
         if (e) return e[0] != '0';
-        if (moe_bm == 16 && moe_qb_avail) return false;
+        if (moe_bm != 128 && moe_qb_avail) return false;
         return N <= 512;
     }();
     const bool moe_qb = moe_qb_avail && !moe_serial;
