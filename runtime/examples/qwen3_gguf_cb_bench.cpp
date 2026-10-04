@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -220,12 +221,32 @@ int main(int argc, char** argv) {
     long_ttft_us.store(-1);
     long_done_us.store(-1);
 
+    // SPARKINFER_CB_BENCH_DISTINCT=1 gives every stream its own prompt (seeded random token ids).
+    // The default hands all of them the same prompt, and greedy decoding then keeps every row
+    // identical for the whole run -- harmless for a dense model's weight stream, but an MoE step
+    // then routes all its rows to the same top-k experts, which no real batch does and which
+    // makes the routed expert kernels look several times cheaper than they are under traffic.
+    static const bool distinct = [] {
+        const char* e = getenv("SPARKINFER_CB_BENCH_DISTINCT");
+        return e && atoi(e) != 0;
+    }();
+    std::vector<std::vector<int>> prompts((size_t)concurrency, short_prompt);
+    if (distinct) {
+        const int vocab = model.config().vocab > 0 ? model.config().vocab : 32000;
+        const int hi = std::min(vocab, 150000) - 1;
+        for (int i = 0; i < concurrency; i++) {
+            std::mt19937 rng(1000u + (unsigned)i);
+            std::uniform_int_distribution<int> tok(1000, hi);
+            for (int& t : prompts[(size_t)i]) t = tok(rng);
+        }
+    }
+
     std::vector<std::thread> workers;
     workers.reserve((size_t)concurrency + 1);
     const auto t_run = clock::now();
     for (int i = 0; i < concurrency; i++) {
         workers.emplace_back([&, i] {
-            run_stream(short_prompt, max_new, /*track_itl=*/true, /*measure_long=*/false);
+            run_stream(prompts[(size_t)i], max_new, /*track_itl=*/true, /*measure_long=*/false);
         });
     }
     // Inject long prefill shortly after decode streams start.
@@ -247,8 +268,9 @@ int main(int argc, char** argv) {
         long_ttft_us.load() > 0 ? 1e-6 * (double)long_ttft_us.load() : 0.0;
     const double long_pp =
         long_ttft_s > 0 ? (double)long_prefill / long_ttft_s : 0.0;
-    printf("cb_bench policy=%s concurrency=%d prompt=%d max_new=%d long_prefill=%d\n",
-           policy_name(policy), concurrency, prompt_len, max_new, long_prefill);
+    printf("cb_bench policy=%s concurrency=%d prompt=%d max_new=%d long_prefill=%d%s\n",
+           policy_name(policy), concurrency, prompt_len, max_new, long_prefill,
+           distinct ? " distinct" : "");
     printf("wall_s=%.3f decode_tokens=%d agg_tok_s=%.1f mean_itl_ms=%.2f max_itl_ms=%.2f\n",
            wall_s, toks, wall_s > 0 ? toks / wall_s : 0.0, itl_ms, max_itl_ms);
     printf("long_ttft_s=%.3f long_prefill_pp=%.1f tokens_while_long_active=%d\n", long_ttft_s,

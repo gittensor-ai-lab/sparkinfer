@@ -14,6 +14,7 @@
 // the prefill corruption is in how this leg is INTEGRATED, not in the kernel it calls.
 //
 // Usage: nvfp4_gemm_check [m]        (default: sweeps m = 8, 32, 128, 512)
+//        NVFP4_BENCH=1 nvfp4_gemm_check [m]   timing only, DRAM-cold weights (default m = 16, 32)
 
 #include "sparkinfer/kernels/prefill_nvfp4.h"
 #include "sparkinfer/kernels/gemm.h"
@@ -150,9 +151,64 @@ static void cpu_selftest() {
     for (void* p : {dA, dW, dRef, dOut, qa, sa, qb, sb, ws}) if (p) cudaFree(p);
 }
 
+// NVFP4_BENCH=1: time the GEMM alone at Qwen3.8's projection shapes, weights DRAM-cold. The
+// quantized weight is replicated into enough copies to overflow L2 and the copies are cycled, so
+// every launch streams its operand from DRAM the way a decode step does. Prints us and the
+// effective weight bandwidth. The tiling under test is whatever the SPARKINFER_NVFP4_* knobs pick.
+static int bench(int m) {
+    struct B { const char* name; int n, k; };
+    const B shapes[] = {
+        {"down", 5120, 17408}, {"gate|up", 17408, 5120}, {"gdn_qkv", 10240, 5120},
+        {"gdn_z", 6144, 5120}, {"gdn_out", 5120, 6144}, {"attn_q|g", 12288, 5120},
+        {"attn_kv", 1024, 5120}, {"attn_o", 5120, 6144},
+    };
+    for (const B& s : shapes) {
+        const int n = s.n, k = s.k;
+        const size_t wb = sparkinfer::kernels::prefill_nvfp4_data_bytes(n, k);
+        const size_t sbb = sparkinfer::kernels::prefill_nvfp4_scale_bytes_b(n, k);
+        const int copies = (int)((512ull << 20) / (wb + sbb)) + 1;
+        std::vector<void*> qb(copies), sb(copies);
+        void *qa = nullptr, *sa = nullptr, *out = nullptr, *ws = nullptr, *dA = nullptr;
+        cudaMalloc(&dA, (size_t)m * k * 2); cudaMemset(dA, 0, (size_t)m * k * 2);
+        cudaMalloc(&qa, sparkinfer::kernels::prefill_nvfp4_data_bytes(m, k));
+        cudaMalloc(&sa, sparkinfer::kernels::prefill_nvfp4_scale_bytes_a(m, k));
+        cudaMalloc(&out, (size_t)m * n * 2);
+        const size_t wsb = sparkinfer::kernels::prefill_nvfp4_workspace_bytes(m, n, k);
+        if (wsb) cudaMalloc(&ws, wsb);
+        sparkinfer::kernels::launch_prefill_nvfp4_quant_a(dA, qa, sa, m, k, nullptr);
+        for (int i = 0; i < copies; i++) {
+            cudaMalloc(&qb[i], wb); cudaMalloc(&sb[i], sbb);
+            cudaMemset(qb[i], 0x11 * (i & 7), wb); cudaMemset(sb[i], 0x38, sbb);
+        }
+        bool ok = true;
+        for (int i = 0; i < copies; i++)   // warm-up, one pass over every copy
+            ok = ok && sparkinfer::kernels::launch_prefill_nvfp4_gemm(qa, sa, qb[i], sb[i], out,
+                                                                      m, n, k, ws, nullptr, 1.f);
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        const int iters = copies * 8;
+        cudaEventRecord(e0);
+        for (int i = 0; i < iters; i++)
+            ok = ok && sparkinfer::kernels::launch_prefill_nvfp4_gemm(
+                           qa, sa, qb[i % copies], sb[i % copies], out, m, n, k, ws, nullptr, 1.f);
+        cudaEventRecord(e1); cudaEventSynchronize(e1);
+        float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+        const double us = 1e3 * ms / iters;
+        printf("  %-9s m=%-3d n=%-6d k=%-6d %8.2f us  %6.0f GB/s  ws=%zu %s\n", s.name, m, n, k, us,
+               (wb + sbb) / (us * 1e3), wsb, ok && cudaGetLastError() == cudaSuccess ? "" : "FAILED");
+        for (int i = 0; i < copies; i++) { cudaFree(qb[i]); cudaFree(sb[i]); }
+        for (void* p : {qa, sa, out, ws, dA}) if (p) cudaFree(p);
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
+    if (getenv("NVFP4_BENCH")) {
+        if (argc > 1) return bench(atoi(argv[1]));
+        return bench(16) || bench(32);
+    }
     cpu_selftest();
     const Shape shapes[] = {
         {"qwen3.8 gate/up", 17408, 5120},   // the broken model's FFN in-projection
