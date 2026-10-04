@@ -5,7 +5,17 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.16] — 2026-10-04
+
+**Qwen3.6 short-prompt prefill another +5% at 128 tokens: Q4_K weights quantize in place too.**
+- **Now:** 6,963 / 16,903 / 23,578 tok/s at 128 / 512 / 1K tokens (0.6.10: 4,284 / 11,092 /
+  18,051; llama.cpp on the same GGUF: 3,499 / 9,438 at 128 / 512). Bit-identical output.
+
 ### Performance
+
+- **The GDN chunk scan uses 16-column blocks when the 32-column grid does not fill the device**
+  (#1284): Qwen3.6's 32 v-heads x 4 = 128 blocks left a quarter of the 170 SMs idle. Bit-identical;
+  +0.4-0.9% prefill. `SPARKINFER_PREFILL_GDN_SCAN_THIN=0` keeps the old shape.
 
 - **Qwen3.6 short-prompt prefill +5% / +2% more (128 / 512 tokens): Q4_K weights also quantize to
   fp8 in place.** The fp8 projection path still dequantized its Q4_K weights (Qwen3.6's attention
