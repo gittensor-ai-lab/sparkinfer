@@ -3806,6 +3806,144 @@ void launch_shared_expert_q8_mmvq(
     }
 }
 
+// ---- The Q8_0 shared expert on the int8 tensor cores, for a packed step's 16-32 rows ----
+// The rows kernels above give each thread one Q8_0 block and walk every row's activation block
+// past it, one dot after another: at 32 rows that is a chain of 64 dependent L1/L2 loads per
+// thread, and the shared expert -- 3.3 MB of weights a layer -- took ~110 us of a Qwen3.6 layer
+// (4.4 ms of GPU time in a 14.4 ms 32-row step), stealing SMs from the routed experts it runs
+// beside. Here m16n8k32 takes 16 rows x 8 outputs x one whole Q8_0 block per instruction: the
+// int32 block dot is exact, as the dp4a one is, and d_w * d_a folds in per block in fp32. Only the
+// fp32 summation order across blocks differs from the rows kernels, so this is gated to wide
+// steps (SPARKINFER_SHEXP_MMA=0 keeps them).
+//
+// One warp owns 8 output columns for every row and a K range; gate/up split K so the 1024-column
+// pair fills the GPU, and write fixed per-split slots that shexp_q8_gu_reduce_kernel sums in
+// split order -- deterministic, no atomics. Down (K = 512) runs unsplit and writes bf16.
+constexpr int SHEXP_MMA_SPLITS = 8;
+constexpr int SHEXP_MMA_MMAX = 32;
+// Per-split gate/up partials. Static, like si_am_acc: decode captures CUDA graphs and a cudaMalloc
+// reached during capture would invalidate them. The shared expert has one call site, on one stream
+// per step, so one buffer is never in use twice at once.
+__device__ float si_shexp_part[SHEXP_MMA_SPLITS * SHEXP_MMA_MMAX * 1024];
+
+template <int MT>
+__global__ __launch_bounds__(128) void shexp_q8_mma_kernel(
+    const si_block_q8_1* __restrict__ act, int K,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ W1, int N0,
+    int M, int N, float* __restrict__ part, __nv_bfloat16* __restrict__ out) {
+    const int nblk = K >> 5;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    const int n0 = (blockIdx.x * 4 + warp) * 8;
+    if (n0 >= N) return;
+    const int S = (int)gridDim.y, sp = (int)blockIdx.y;
+    const int kb_lo = (nblk * sp) / S, kb_hi = (nblk * (sp + 1)) / S;
+    auto wrow = [&](int n) {
+        return n < N0 ? W0 + (size_t)n * nblk * 34 : W1 + (size_t)(n - N0) * nblk * 34;
+    };
+    const unsigned char* wb = wrow(n0 + grp);            // this lane's B-fragment column
+    const unsigned char* wc0 = wrow(n0 + tig * 2);       // its two accumulator columns
+    const unsigned char* wc1 = wrow(n0 + tig * 2 + 1);
+    float acc[MT][4];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+    for (int kb = kb_lo; kb < kb_hi; ++kb) {
+        const unsigned char* qw = wb + (size_t)kb * 34 + 2;
+        const unsigned b0 = (unsigned)si_ld4(qw + tig * 4), b1 = (unsigned)si_ld4(qw + 16 + tig * 4);
+        const float dw0 = q4kf_h2f(wc0 + (size_t)kb * 34), dw1 = q4kf_h2f(wc1 + (size_t)kb * 34);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            const int ra = t * 16 + grp, rb = ra + 8;
+            unsigned a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            float da = 0.f, db = 0.f;
+            if (ra < M) {
+                const si_block_q8_1* x = act + (size_t)ra * nblk + kb;
+                a0 = *reinterpret_cast<const unsigned*>(x->qs + tig * 4);
+                a2 = *reinterpret_cast<const unsigned*>(x->qs + 16 + tig * 4);
+                da = __low2float(x->ds);
+            }
+            if (rb < M) {
+                const si_block_q8_1* x = act + (size_t)rb * nblk + kb;
+                a1 = *reinterpret_cast<const unsigned*>(x->qs + tig * 4);
+                a3 = *reinterpret_cast<const unsigned*>(x->qs + 16 + tig * 4);
+                db = __low2float(x->ds);
+            }
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, "
+                         "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                         : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            acc[t][0] += (float)c0 * (da * dw0);
+            acc[t][1] += (float)c1 * (da * dw1);
+            acc[t][2] += (float)c2 * (db * dw0);
+            acc[t][3] += (float)c3 * (db * dw1);
+        }
+    }
+    const int c = n0 + tig * 2;
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        const int ra = t * 16 + grp, rb = ra + 8;
+        if (part) {
+            float* pp = part + (size_t)sp * M * N;
+            if (ra < M) { pp[(size_t)ra * N + c] = acc[t][0]; pp[(size_t)ra * N + c + 1] = acc[t][1]; }
+            if (rb < M) { pp[(size_t)rb * N + c] = acc[t][2]; pp[(size_t)rb * N + c + 1] = acc[t][3]; }
+        } else {
+            if (ra < M) {
+                out[(size_t)ra * N + c] = __float2bfloat16(acc[t][0]);
+                out[(size_t)ra * N + c + 1] = __float2bfloat16(acc[t][1]);
+            }
+            if (rb < M) {
+                out[(size_t)rb * N + c] = __float2bfloat16(acc[t][2]);
+                out[(size_t)rb * N + c + 1] = __float2bfloat16(acc[t][3]);
+            }
+        }
+    }
+}
+
+// Sums the gate/up splits in split order and applies the same dw * silu(g) * u the rows kernel
+// writes, into the same h_scratch layout, so the quantize and down that follow are unchanged.
+__global__ void shexp_q8_gu_reduce_kernel(const float* __restrict__ part, int S, int M, int F,
+                                          const float* __restrict__ dw, float* __restrict__ h) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= M * F) return;
+    const int r = i / F, f = i - r * F, N = 2 * F;
+    float g = 0.f, u = 0.f;
+    for (int s = 0; s < S; ++s) {
+        const float* pp = part + ((size_t)s * M + r) * N;
+        g += pp[f];
+        u += pp[F + f];
+    }
+    h[(size_t)r * F + f] = __ldg(dw + r) * q4kf_silu(g) * u;
+}
+
+// The 2048 / 512 shared expert at 9-32 rows on the tensor cores; false (nothing launched) when the
+// arm is off or the shape is not the one it was written for.
+static bool launch_shared_expert_q8_mma(const si_block_q8_1* q, const void* gate_q, const void* up_q,
+                                        const void* down_q, const float* dw, __nv_bfloat16* out,
+                                        float* h_scratch, si_block_q8_1* hq, int hidden, int ffn,
+                                        int rows, cudaStream_t stream) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_SHEXP_MMA");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || hidden != 2048 || ffn != 512 || rows < 9 || rows > SHEXP_MMA_MMAX) return false;
+    float* part = nullptr;
+    if (cudaGetSymbolAddress(reinterpret_cast<void**>(&part), si_shexp_part) != cudaSuccess)
+        return false;
+    const auto* g = reinterpret_cast<const unsigned char*>(gate_q);
+    const auto* u = reinterpret_cast<const unsigned char*>(up_q);
+    const auto* d = reinterpret_cast<const unsigned char*>(down_q);
+    const dim3 ggu((2 * ffn) / 32, SHEXP_MMA_SPLITS), gdn(hidden / 32, 1);
+    if (rows <= 16) shexp_q8_mma_kernel<1><<<ggu, 128, 0, stream>>>(q, hidden, g, u, ffn, rows, 2 * ffn, part, nullptr);
+    else            shexp_q8_mma_kernel<2><<<ggu, 128, 0, stream>>>(q, hidden, g, u, ffn, rows, 2 * ffn, part, nullptr);
+    shexp_q8_gu_reduce_kernel<<<(rows * ffn + 255) / 256, 256, 0, stream>>>(
+        part, SHEXP_MMA_SPLITS, rows, ffn, dw, h_scratch);
+    quant_h_q8_1_kernel<<<((rows * (ffn >> 5)) + 7) / 8, 8 * 32, 0, stream>>>(
+        h_scratch, hq, rows * (ffn >> 5), 0);
+    if (rows <= 16) shexp_q8_mma_kernel<1><<<gdn, 128, 0, stream>>>(hq, ffn, d, d, hidden, rows, hidden, nullptr, out);
+    else            shexp_q8_mma_kernel<2><<<gdn, 128, 0, stream>>>(hq, ffn, d, d, hidden, rows, hidden, nullptr, out);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 void launch_shared_expert_q8_mmvq_rows(
     const void* input_q8, const void* gate_q, const void* up_q, const void* down_q,
     const float* dw, void* output, float* h_scratch, void* h_q8_buf,
@@ -3827,6 +3965,11 @@ void launch_shared_expert_q8_mmvq_rows(
         return (v == 16 || v == 24) ? v : 32;
     }();
     const auto* q = reinterpret_cast<const si_block_q8_1*>(input_q8);
+    if (rows > 8 && launch_shared_expert_q8_mma(
+                        q, gate_q, up_q, down_q, dw, reinterpret_cast<__nv_bfloat16*>(output),
+                        h_scratch, reinterpret_cast<si_block_q8_1*>(h_q8_buf), hidden, ffn, rows,
+                        stream))
+        return;
     if (rows > 8) {
         const int cap = wide_max;
         const int big = !wide ? 8 : (rows >= 32 && cap >= 32) ? 32 : (rows >= 24 && cap >= 24) ? 24
