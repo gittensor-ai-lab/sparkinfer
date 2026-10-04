@@ -58,14 +58,24 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) ms.push_back(atoi(argv[i]));
     if (ms.empty()) ms = {16, 32};
     // Qwen3.6-35B-A3B's dense projections: GDN qkv, z / out, attention q|gate and o.
-    const Shape shapes[] = {
+    const Shape q36[] = {
         {"gdn_qkv", 8192, 2048}, {"gdn_z", 4096, 2048}, {"gdn_out", 2048, 4096},
         {"attn_qg", 8192, 2048}, {"attn_o", 2048, 4096}, {"n4096k2048", 4096, 2048},
     };
+    // Q4K_BENCH_SHAPES=q38: Qwen3.8-27B's (FFN gate / up, down, GDN qkv / z / out, attention q|gate).
+    const Shape q38[] = {
+        {"ffn_gate", 17408, 5120}, {"ffn_down", 5120, 17408}, {"gdn_qkv", 10240, 5120},
+        {"gdn_z", 6144, 5120}, {"gdn_out", 5120, 6144}, {"attn_qg", 12288, 5120},
+    };
+    const char* set = getenv("Q4K_BENCH_SHAPES");
+    const bool use38 = set && strcmp(set, "q38") == 0;
+    const Shape* shapes = use38 ? q38 : q36;
+    const int nshapes = 6;
     std::mt19937 rng(42);
     cudaStream_t st; cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
     for (int m : ms) {
-        for (const Shape& s : shapes) {
+        for (int si = 0; si < nshapes; ++si) {
+            const Shape& s = shapes[si];
             std::vector<unsigned char> hw, ha;
             fill_q4k(hw, s.n, s.k, rng);
             fill_q81(ha, m, s.k, rng);

@@ -4194,7 +4194,10 @@ constexpr int SI_AM_SK_DEF = 8;
 // SI_AM_NACC is the widest projection a packed step hands this arm: Qwen3.8's 12288-row q|gate. At
 // 6656 -- Muse Glimmer's widest -- a 32-row q|gate overflowed the slot and had to be split into two
 // 16-row launches, each re-reading the whole 35 MB weight. 32 x 12288 floats is 1.5 MB a slot.
-constexpr int SI_AM_NACC = 12288;
+// 20480 now: a 32-row FFN gate / up on Qwen3.8-27B (17408) or Muse Glimmer (19968) overran 12288
+// and ran as two 16-row launches, each streaming the whole 50 MB weight (q4k_rows_bench:
+// 17408 x 5120 at 32 rows 76 us, i.e. 656 GB/s). 32 x 20480 floats is 2.6 MB a slot.
+constexpr int SI_AM_NACC = 20480;
 constexpr int SI_AM_SLOTS = 4;
 __device__ float si_am_acc[SI_AM_SLOTS][SI_AM_MMAX * SI_AM_NACC];
 
