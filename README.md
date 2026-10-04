@@ -271,16 +271,19 @@ Full tables: [`bench/competitors/latest-results.md`](bench/competitors/latest-re
 [`bench/quality/README.md`](bench/quality/README.md).
 
 Serving the same GGUF to concurrent requests (AIPerf, streaming chat 1024 / 256 with
-`ignore_eos`, RTX 5090, against `llama-server` at llama.cpp `bed0a85`, `-np 32 -fa on`):
+`ignore_eos`, RTX 5090, sparkinfer 0.6.16 against `llama-server` at llama.cpp `436f6f8`,
+`-np 32 -fa on`):
 
 | requests | output tok/s | TTFT p50 (ms) | ITL p50 (ms) |
 |---:|---:|---:|---:|
 | | **sparkinfer** / llama.cpp | **sparkinfer** / llama.cpp | **sparkinfer** / llama.cpp |
-| 4 | **886** / 345 | **226** / 1,201 | **3.7** / 7.1 |
-| 16 | **1,282** / 409 | **312** / 2,798 | **11.2** / 29.8 |
-| 32 | **1,496** / 413 | **709** / 2,629 | **15.4** / 64.7 |
+| 4 | **917** / 339 | **181** / 1,329 | **3.8** / 7.2 |
+| 16 | **1,251** / 372 | **216** / 2,493 | **12.0** / 33.2 |
+| 32 | **1,332** / 404 | **918** / 2,436 | **17.6** / 69.0 |
 
-Before 0.6.7, two or more concurrent Qwen3.6 requests decoded to garbage (see the CHANGELOG).
+Before 0.6.7, two or more concurrent Qwen3.6 requests decoded to garbage, and before 0.6.10 the
+router loaded corrupted in most launches -- this table's earlier, higher c32 figure (1,496 tok/s)
+was measured with every token routed to the same few experts (see the CHANGELOG).
 
 SparkInfer focuses on the models driving the future of AI — not thousands of legacy architectures.
 
