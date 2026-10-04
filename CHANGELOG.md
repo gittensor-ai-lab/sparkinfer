@@ -5,6 +5,13 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.17] — 2026-10-04
+
+**Qwen3.6 batched decode +10% / +7% at 16 / 32 concurrent requests: the shared expert runs a
+packed step's rows in one pass.**
+- **Now:** AIPerf streaming chat (1024 / 256, `ignore_eos`) 1,294 / 1,374 output tok/s at 16 / 32
+  requests (0.6.16: 1,251 / 1,332; llama-server on the same GGUF: 372 / 404). Outputs unchanged.
+
 ### Performance
 
 - **Qwen3.6 batched decode +10% / +7% at 16 / 32 concurrent requests: the shared expert runs its
